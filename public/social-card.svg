@@ -1,0 +1,26 @@
+<svg width="1200" height="630" viewBox="0 0 1200 630" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1200" height="630" fill="#F6F0E8"/>
+  <rect x="36" y="36" width="1128" height="558" rx="32" fill="url(#paint0_linear)"/>
+  <circle cx="1052" cy="118" r="160" fill="#D9E4DC"/>
+  <circle cx="182" cy="548" r="220" fill="#E8D6C2"/>
+  <rect x="90" y="98" width="118" height="118" rx="28" fill="#FFFFFF" fill-opacity="0.72"/>
+  <path d="M126 126H152V182L180 210H152L126 184V126Z" fill="#18211D"/>
+  <path d="M170 126H196V182L170 210L156 196L170 182V126Z" fill="#173126"/>
+  <text fill="#18211D" font-family="Arial, sans-serif" font-size="32" font-weight="700" letter-spacing="0.28em">
+    <tspan x="242" y="160">UCKELE GROUP</tspan>
+  </text>
+  <text fill="#173126" font-family="Georgia, serif" font-size="66" font-weight="600">
+    <tspan x="90" y="300">A thoughtful long-term home</tspan>
+    <tspan x="90" y="376">for a great small business</tspan>
+  </text>
+  <text fill="#425049" font-family="Arial, sans-serif" font-size="30">
+    <tspan x="90" y="462">Mathew Uckele is seeking one strong small business to buy and operate</tspan>
+    <tspan x="90" y="506">for the long term with continuity, care, and respect for seller legacy.</tspan>
+  </text>
+  <defs>
+    <linearGradient id="paint0_linear" x1="600" y1="36" x2="600" y2="594" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFCF8"/>
+      <stop offset="1" stop-color="#F7F3EC"/>
+    </linearGradient>
+  </defs>
+</svg>

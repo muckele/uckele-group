@@ -1,0 +1,18 @@
+<svg width="960" height="1120" viewBox="0 0 960 1120" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="960" height="1120" rx="48" fill="#F8F4ED"/>
+  <rect x="40" y="40" width="880" height="1040" rx="36" fill="url(#paint0_linear)"/>
+  <circle cx="480" cy="360" r="152" fill="#E7DCCB"/>
+  <path d="M242 872C242 705.101 377.101 570 544 570H416C582.899 570 718 705.101 718 872V906H242V872Z" fill="#D6CCBE"/>
+  <path d="M330 362C330 278.605 397.605 211 481 211C564.395 211 632 278.605 632 362V415C632 498.395 564.395 566 481 566C397.605 566 330 498.395 330 415V362Z" fill="#EDE3D5"/>
+  <path d="M347 390C347 285.066 432.066 200 537 200H555C625.14 200 682 256.86 682 327V379C682 343.895 653.53 315.425 618.425 315.425H604.88C559.705 315.425 516.378 297.478 484.431 265.531L456 237.1L435.261 278.578C416.31 316.481 382.565 345.985 342.5 359.625L347 390Z" fill="#253F33"/>
+  <path d="M268 930H692C769.32 930 832 992.68 832 1070H128C128 992.68 190.68 930 268 930Z" fill="#253F33"/>
+  <text fill="#5B665F" font-family="Arial, sans-serif" font-size="34" font-weight="700" letter-spacing="0.18em">
+    <tspan x="274" y="1008">PROFESSIONAL HEADSHOT PLACEHOLDER</tspan>
+  </text>
+  <defs>
+    <linearGradient id="paint0_linear" x1="480" y1="40" x2="480" y2="1080" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FCFAF7"/>
+      <stop offset="1" stop-color="#F1E9DC"/>
+    </linearGradient>
+  </defs>
+</svg>
