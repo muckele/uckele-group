@@ -1,0 +1,49 @@
+app = "uckele-group"
+primary_region = "ewr"
+
+[build]
+  dockerfile = "Dockerfile"
+
+  [build.args]
+    VITE_PUBLIC_SITE_URL = "https://www.uckelegroup.com"
+    VITE_PUBLIC_CONTACT_EMAIL = "mathew@uckelegroup.com"
+    VITE_PUBLIC_CONTACT_PHONE = "914.361.9153"
+    VITE_PUBLIC_LINKEDIN_URL = "https://www.linkedin.com/in/mathew-uckele"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "8787"
+  PUBLIC_SITE_URL = "https://www.uckelegroup.com"
+  VITE_PUBLIC_SITE_URL = "https://www.uckelegroup.com"
+  STORAGE_PROVIDER = "sqlite"
+  SQLITE_PATH = "/data/uckele-group.sqlite"
+  SECURE_DOCUMENTS_STORAGE_DIR = "/data/secure-documents"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = false
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 25
+    hard_limit = 50
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval = "15s"
+    method = "GET"
+    timeout = "5s"
+    path = "/api/health"
+
+[[mounts]]
+  source = "uckele_group_data"
+  destination = "/data"
+
+[vm]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "512mb"

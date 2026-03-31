@@ -89,7 +89,7 @@ export function createApp() {
   app.post(
     '/api/admin/magic-link/request',
     asyncRoute(async (request, response) => {
-      const result = await requestAdminMagicLink(request.body.email || '');
+      const result = await requestAdminMagicLink(request.body.email || '', request);
 
       if (!result.ok) {
         response.status(400).json({ success: false, error: result.reason });
@@ -224,6 +224,7 @@ export function createApp() {
         requestedBy: session.username,
         note: String(request.body.note || ''),
         sendEmail: request.body.sendEmail !== false,
+        request,
       });
 
       if (!result.ok) {

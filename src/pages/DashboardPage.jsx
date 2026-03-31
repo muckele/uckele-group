@@ -24,6 +24,10 @@ const leadTypes = ['seller', 'broker', 'referral', 'advisor', 'other'];
 const sbaOptions = ['unknown', 'yes', 'no'];
 const dailyDealUpdateUrl =
   'https://docs.google.com/spreadsheets/d/1d2mC6oKDY7DFQiaNQnF947Ro5CBwjIcAw_fwya7bpBc/edit?usp=sharing';
+const primaryActionButtonClass =
+  'inline-flex w-full items-center justify-center gap-2 rounded-full border border-moss bg-moss px-5 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50 sm:w-auto';
+const secondaryActionButtonClass =
+  'inline-flex w-full items-center justify-center gap-2 rounded-full border border-ink/10 bg-white px-5 py-3 text-sm font-semibold text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50 sm:w-auto';
 
 function toDateTimeLocal(value) {
   if (!value) {
@@ -127,12 +131,12 @@ function StatCard({ icon: Icon, label, value, tone = 'default' }) {
   };
 
   return (
-    <div className="panel p-6">
+    <div className="panel p-5 sm:p-6">
       <div className={`flex h-12 w-12 items-center justify-center rounded-2xl ${tones[tone]}`}>
         <Icon className="h-5 w-5" />
       </div>
       <p className="mt-5 text-sm font-semibold uppercase tracking-[0.18em] text-moss/80">{label}</p>
-      <p className="mt-2 text-3xl font-semibold text-ink">{value}</p>
+      <p className="mt-2 text-2xl font-semibold text-ink sm:text-3xl">{value}</p>
     </div>
   );
 }
@@ -641,7 +645,7 @@ export default function DashboardPage() {
               <form className="space-y-5" onSubmit={handleMagicLinkRequest}>
                 <div>
                   <SectionLabel>Magic-Link Sign In</SectionLabel>
-                  <h2 className="mt-3 text-3xl font-semibold text-ink">Secure access without a shared password</h2>
+                  <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Secure access without a shared password</h2>
                   <p className="mt-3 text-base leading-7 text-ink/72">
                     Use the admin email address to request a time-limited sign-in link{authState.adminEmailHint ? ` (${authState.adminEmailHint})` : ''}.
                   </p>
@@ -668,7 +672,7 @@ export default function DashboardPage() {
                 ) : null}
 
                 <button
-                  className="inline-flex items-center justify-center rounded-full border border-moss bg-moss px-6 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50"
+                  className={primaryActionButtonClass}
                   disabled={magicLinkPending || !authState.magicLinkEnabled}
                   type="submit"
                 >
@@ -681,7 +685,7 @@ export default function DashboardPage() {
               <form className="space-y-5" onSubmit={handlePasswordLogin}>
                 <div>
                   <SectionLabel>Fallback Access</SectionLabel>
-                  <h2 className="mt-3 text-3xl font-semibold text-ink">Password sign-in</h2>
+                  <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Password sign-in</h2>
                   <p className="mt-3 text-base leading-7 text-ink/72">
                     This is primarily for local development or temporary fallback use. In production, the preferred path is the emailed magic link.
                   </p>
@@ -705,7 +709,7 @@ export default function DashboardPage() {
                 ) : null}
 
                 <button
-                  className="inline-flex items-center justify-center rounded-full border border-ink/10 bg-white px-6 py-3 text-sm font-semibold text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50"
+                  className={secondaryActionButtonClass}
                   disabled={loginPending || !authState.passwordEnabled}
                   type="submit"
                 >
@@ -734,15 +738,15 @@ export default function DashboardPage() {
           <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Signed in as {authState.username}</p>
-              <h2 className="mt-3 text-3xl font-semibold text-ink">Broker and seller CRM</h2>
+              <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Broker and seller CRM</h2>
               <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
                 This is no longer just a submissions inbox. It now tracks sourced opportunities, broker conversations, seller follow-ups, deal notes, and secure document requests in one place.
               </p>
             </div>
 
-            <div className="flex flex-wrap gap-3">
+            <div className="grid w-full gap-3 sm:flex sm:w-auto sm:flex-wrap">
               <button
-                className="inline-flex items-center justify-center gap-2 rounded-full border border-moss bg-moss px-5 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine"
+                className={primaryActionButtonClass}
                 onClick={() => setCreateOpen((current) => !current)}
                 type="button"
               >
@@ -750,14 +754,14 @@ export default function DashboardPage() {
                 {createOpen ? 'Close New Record' : 'New CRM Record'}
               </button>
               <a
-                className="inline-flex items-center justify-center gap-2 rounded-full border border-ink/10 bg-white px-5 py-3 text-sm font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
+                className={secondaryActionButtonClass}
                 href="/api/admin/submissions/export"
               >
                 <Download className="h-4 w-4" />
                 Export CSV
               </a>
               <a
-                className="inline-flex items-center justify-center gap-2 rounded-full border border-ink/10 bg-white px-5 py-3 text-sm font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
+                className={secondaryActionButtonClass}
                 href={dailyDealUpdateUrl}
                 rel="noreferrer"
                 target="_blank"
@@ -766,7 +770,7 @@ export default function DashboardPage() {
                 Daily Deal Update
               </a>
               <button
-                className="inline-flex items-center justify-center gap-2 rounded-full border border-ink/10 bg-white px-5 py-3 text-sm font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
+                className={secondaryActionButtonClass}
                 onClick={handleLogout}
                 type="button"
               >
@@ -779,7 +783,7 @@ export default function DashboardPage() {
       </section>
 
       <section className="section-shell mt-8">
-        <div className="grid gap-6 md:grid-cols-2 xl:grid-cols-6">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
           <StatCard icon={Inbox} label="Total Records" value={summary.total} />
           <StatCard icon={BellRing} label="Action Items" value={summary.actionItems} tone={summary.actionItems > 0 ? 'warning' : 'default'} />
           <StatCard icon={CalendarClock} label="Overdue" value={summary.overdue} tone={summary.overdue > 0 ? 'danger' : 'default'} />
@@ -795,7 +799,7 @@ export default function DashboardPage() {
             <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
               <div>
                 <SectionLabel>Follow-Up Notifications</SectionLabel>
-                <h2 className="mt-3 text-3xl font-semibold text-ink">Who needs a follow-up next</h2>
+                <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Who needs a follow-up next</h2>
                 <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
                   These prompts are generated from status, lead type, reminder dates, and document activity so you can keep seller and broker conversations moving without guessing.
                 </p>
@@ -834,11 +838,11 @@ export default function DashboardPage() {
 
       {createOpen ? (
         <section className="section-shell mt-8">
-          <Reveal className="panel p-7 sm:p-8">
+          <Reveal className="panel p-6 sm:p-8">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
               <div>
                 <SectionLabel>New CRM Record</SectionLabel>
-                <h2 className="mt-3 text-3xl font-semibold text-ink">Add a broker or seller opportunity manually</h2>
+                <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Add a broker or seller opportunity manually</h2>
                 <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
                   Use this for broker listings, direct outreach, referrals, or any deal you want in the pipeline before it comes through the website form.
                 </p>
@@ -846,7 +850,7 @@ export default function DashboardPage() {
             </div>
 
             <form className="mt-8 space-y-8" onSubmit={handleCreateSubmission}>
-              <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
+              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                 <InputField
                   label="Company / Business"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, company: event.target.value }))}
@@ -871,7 +875,7 @@ export default function DashboardPage() {
                 />
               </div>
 
-              <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
+              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                 <InputField
                   label="Listing URL"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, listing_url: event.target.value }))}
@@ -894,7 +898,7 @@ export default function DashboardPage() {
                 />
               </div>
 
-              <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-5">
+              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-5">
                 <InputField
                   label="TTM Revenue"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, ttm_revenue: event.target.value }))}
@@ -922,7 +926,7 @@ export default function DashboardPage() {
                 />
               </div>
 
-              <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
+              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                 <SelectField
                   label="Priority"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, priority: event.target.value }))}
@@ -951,7 +955,7 @@ export default function DashboardPage() {
                 />
               </div>
 
-              <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-3">
+              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
                 <InputField
                   label="Broker name"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, broker_name: event.target.value }))}
@@ -970,7 +974,7 @@ export default function DashboardPage() {
                 />
               </div>
 
-              <div className="grid gap-5 lg:grid-cols-2 xl:grid-cols-3">
+              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
                 <InputField
                   label="Seller name"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, seller_name: event.target.value }))}
@@ -1010,7 +1014,7 @@ export default function DashboardPage() {
 
               <div className="flex flex-wrap gap-3">
                 <button
-                  className="inline-flex items-center justify-center gap-2 rounded-full border border-moss bg-moss px-5 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50"
+                  className={primaryActionButtonClass}
                   disabled={createPending}
                   type="submit"
                 >
@@ -1025,7 +1029,7 @@ export default function DashboardPage() {
 
       <section className="section-shell mt-8">
         <Reveal className="panel p-6 sm:p-7">
-          <div className="grid gap-4 lg:grid-cols-[1fr_220px]">
+          <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_220px]">
             <input
               className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
               onChange={(event) => {
@@ -1077,11 +1081,11 @@ export default function DashboardPage() {
             const followUpPrompt = submission.follow_up_prompt;
 
             return (
-              <Reveal className="panel p-6 sm:p-8" delay={index * 50} key={submission.id}>
+              <Reveal className="panel p-5 sm:p-8" delay={index * 50} key={submission.id}>
                 <div className="flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
                   <div className="max-w-4xl">
                     <div className="flex flex-wrap items-center gap-3">
-                      <h2 className="text-2xl font-semibold text-ink">{submission.company || submission.name}</h2>
+                      <h2 className="text-xl font-semibold text-ink sm:text-2xl">{submission.company || submission.name}</h2>
                       <Pill tone={submission.status === 'spam' ? 'danger' : submission.status === 'contacted' ? 'success' : 'status'}>
                         {submission.status}
                       </Pill>
@@ -1105,7 +1109,7 @@ export default function DashboardPage() {
 
                     <LinksRow submission={submission} />
 
-                    <div className="mt-6 grid gap-5 md:grid-cols-2 xl:grid-cols-5">
+                    <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
                       <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
                         <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Asking Price</p>
                         <p className="mt-3 text-base font-semibold text-ink">{submission.asking_price || 'Not set'}</p>
@@ -1145,7 +1149,7 @@ export default function DashboardPage() {
                     ) : null}
                   </div>
 
-                  <div className="xl:w-[320px]">
+                  <div className="w-full xl:w-[320px]">
                     <div className="rounded-[24px] border border-line/80 bg-fog/70 p-5">
                       <SectionLabel>Routing</SectionLabel>
                       <div className="mt-4 space-y-2 text-sm leading-6 text-ink/72">
@@ -1176,7 +1180,7 @@ export default function DashboardPage() {
                   </div>
                 </div>
 
-                <div className="mt-8 grid gap-5 lg:grid-cols-2 xl:grid-cols-6">
+                <div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-6">
                   <SelectField
                     label="Status"
                     onChange={(event) =>
@@ -1251,7 +1255,7 @@ export default function DashboardPage() {
                   </Field>
                 </div>
 
-                <div className="mt-5 grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
+                <div className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                   <InputField
                     label="Company / Business"
                     onChange={(event) =>
@@ -1294,7 +1298,7 @@ export default function DashboardPage() {
                   />
                 </div>
 
-                <div className="mt-5 grid gap-5 lg:grid-cols-2 xl:grid-cols-6">
+                <div className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-6">
                   <InputField
                     label="Asking price"
                     onChange={(event) =>
@@ -1357,7 +1361,7 @@ export default function DashboardPage() {
                   />
                 </div>
 
-                <div className="mt-5 grid gap-5 lg:grid-cols-2 xl:grid-cols-4">
+                <div className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                   <SelectField
                     label="SBA Eligible?"
                     onChange={(event) =>
@@ -1382,7 +1386,7 @@ export default function DashboardPage() {
                   />
                 </div>
 
-                <div className="mt-5 grid gap-5 lg:grid-cols-2 xl:grid-cols-3">
+                <div className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
                   <InputField
                     label="Broker name"
                     onChange={(event) =>
@@ -1416,7 +1420,7 @@ export default function DashboardPage() {
                   />
                 </div>
 
-                <div className="mt-5 grid gap-5 lg:grid-cols-2 xl:grid-cols-3">
+                <div className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
                   <InputField
                     label="Seller name"
                     onChange={(event) =>
@@ -1511,9 +1515,9 @@ export default function DashboardPage() {
                   </div>
                 </div>
 
-                <div className="mt-6 flex flex-wrap gap-3">
+                <div className="mt-6 grid gap-3 sm:flex sm:flex-wrap">
                   <button
-                    className="inline-flex items-center justify-center gap-2 rounded-full border border-moss bg-moss px-5 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50"
+                    className={primaryActionButtonClass}
                     disabled={isSaving}
                     onClick={() => handleSave(submission.id)}
                     type="button"
@@ -1523,7 +1527,7 @@ export default function DashboardPage() {
                   </button>
 
                   <button
-                    className="inline-flex items-center justify-center gap-2 rounded-full border border-ink/10 bg-white px-5 py-3 text-sm font-semibold text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50"
+                    className={secondaryActionButtonClass}
                     disabled={isCreatingUpload}
                     onClick={() => handleCreateUploadRequest(submission.id)}
                     type="button"

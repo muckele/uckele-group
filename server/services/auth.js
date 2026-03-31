@@ -1,5 +1,6 @@
 import { getConfig } from '../config.js';
 import { clearCookie, parseCookies, serializeCookie } from '../utils/cookies.js';
+import { getRequestOrigin } from '../utils/http.js';
 import { safeCompareText, signPayload, verifySignedPayload } from '../utils/security.js';
 import { sendAdminMagicLinkEmail } from './delivery.js';
 
@@ -88,7 +89,7 @@ export function loginAdmin(username, password) {
   };
 }
 
-export async function requestAdminMagicLink(email) {
+export async function requestAdminMagicLink(email, request) {
   const config = getConfig();
 
   if (!config.admin.email || !config.admin.magicLinkSecret) {
@@ -118,7 +119,8 @@ export async function requestAdminMagicLink(email) {
     },
     config.admin.magicLinkSecret,
   );
-  const magicLinkUrl = `${config.server.origin}/admin?admin_token=${encodeURIComponent(token)}`;
+  const publicOrigin = getRequestOrigin(request, config.server.origin);
+  const magicLinkUrl = `${publicOrigin}/admin?admin_token=${encodeURIComponent(token)}`;
   const deliveryResult = await sendAdminMagicLinkEmail({
     to: config.admin.email,
     magicLinkUrl,

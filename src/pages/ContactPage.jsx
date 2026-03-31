@@ -1,6 +1,7 @@
 import { ArrowRight, Mail, Phone, ShieldCheck } from 'lucide-react';
 import ButtonLink from '../components/ButtonLink';
 import ContactForm from '../components/ContactForm';
+import LinkedInIcon from '../components/LinkedInIcon';
 import PageHero from '../components/PageHero';
 import Reveal from '../components/Reveal';
 import SectionHeading from '../components/SectionHeading';
@@ -37,8 +38,31 @@ export default function ContactPage() {
                   <h2 className="mt-5 text-2xl font-semibold text-ink">{panel.title}</h2>
                   <ul className="mt-5 space-y-4 text-sm leading-7 text-ink/72">
                     {panel.items.map((item) => (
-                      <li className="rounded-2xl border border-line/80 bg-fog/70 px-4 py-3" key={item}>
-                        {item}
+                      <li
+                        className="rounded-2xl border border-line/80 bg-fog/70 px-4 py-3"
+                        key={typeof item === 'string' ? item : `${item.kind}-${item.value}`}
+                      >
+                        {typeof item === 'string' ? (
+                          item
+                        ) : item.kind === 'linkedin' ? (
+                          <a
+                            aria-label="LinkedIn profile"
+                            className="inline-flex h-11 w-11 items-center justify-center rounded-full border border-moss/15 bg-white text-moss transition hover:border-moss/30 hover:bg-moss/5"
+                            href={item.href}
+                            rel="noreferrer"
+                            target="_blank"
+                          >
+                            <LinkedInIcon className="h-5 w-5" />
+                          </a>
+                        ) : item.href ? (
+                          <a className="transition hover:text-moss" href={item.href}>
+                            <span className="font-semibold text-ink">{item.label}:</span> {item.value}
+                          </a>
+                        ) : (
+                          <>
+                            <span className="font-semibold text-ink">{item.label}:</span> {item.value}
+                          </>
+                        )}
                       </li>
                     ))}
                   </ul>

@@ -26,9 +26,12 @@ export default function HomePage() {
 
       <section className="section-shell pt-10 sm:pt-16">
         <div className="grid gap-8 lg:grid-cols-[1.1fr_0.9fr] lg:items-stretch">
-          <Reveal className="panel px-7 py-12 sm:px-10 sm:py-14 lg:px-12">
+          <Reveal className="panel overflow-hidden px-7 py-12 sm:px-10 sm:py-14 lg:px-12">
+            <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(185,137,82,0.14),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(40,70,56,0.12),transparent_34%)]" />
+            <div className="surface-grid pointer-events-none absolute right-[-8%] top-0 h-full w-[45%] opacity-[0.15]" />
+            <div className="relative">
             <span className="eyebrow">{homePage.hero.eyebrow}</span>
-            <h1 className="mt-6 max-w-3xl font-display text-4xl leading-tight text-ink sm:text-5xl lg:text-[4.25rem]">
+            <h1 className="mt-6 max-w-3xl font-display text-4xl leading-[0.96] tracking-[-0.04em] text-ink sm:text-5xl lg:text-[4.45rem]">
               {homePage.hero.title}
             </h1>
             <p className="mt-6 max-w-2xl text-lg leading-8 text-ink/74">{homePage.hero.description}</p>
@@ -42,11 +45,12 @@ export default function HomePage() {
 
             <div className="mt-10 grid gap-3 sm:grid-cols-2">
               {homePage.hero.signals.map((signal) => (
-                <div className="flex items-start gap-3 rounded-2xl border border-line/80 bg-fog/75 px-4 py-4" key={signal}>
+                <div className="flex items-start gap-3 rounded-2xl border border-white/[0.90] bg-white/[0.72] px-4 py-4 shadow-[0_16px_30px_rgba(24,33,29,0.05)]" key={signal}>
                   <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-moss" />
                   <p className="text-sm leading-6 text-ink/74">{signal}</p>
                 </div>
               ))}
+            </div>
             </div>
           </Reveal>
 
@@ -69,7 +73,7 @@ export default function HomePage() {
 
               <div className="mt-8 space-y-4">
                 {homePage.hero.founderCard.points.map((point) => (
-                  <div className="rounded-2xl border border-line/80 bg-white/78 px-4 py-4" key={point}>
+                  <div className="rounded-2xl border border-white/[0.85] bg-white/[0.82] px-4 py-4 shadow-[0_14px_30px_rgba(24,33,29,0.05)]" key={point}>
                     <p className="text-sm font-medium leading-6 text-ink/76">{point}</p>
                   </div>
                 ))}
@@ -92,7 +96,7 @@ export default function HomePage() {
             const Icon = trustIcons[index];
 
             return (
-              <Reveal className="panel p-6 sm:p-7" delay={index * 80} key={item.title}>
+              <Reveal className="panel p-6 transition duration-300 hover:-translate-y-1 hover:shadow-[0_32px_70px_rgba(24,33,29,0.12)] sm:p-7" delay={index * 80} key={item.title}>
                 <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-moss/8 text-moss">
                   <Icon className="h-5 w-5" />
                 </div>
@@ -117,7 +121,7 @@ export default function HomePage() {
             const Icon = whyIcons[index];
 
             return (
-              <Reveal className="panel p-7 sm:p-8" delay={index * 90} key={card.title}>
+              <Reveal className="panel p-7 transition duration-300 hover:-translate-y-1 hover:shadow-[0_32px_70px_rgba(24,33,29,0.12)] sm:p-8" delay={index * 90} key={card.title}>
                 <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-clay/12 text-clay">
                   <Icon className="h-5 w-5" />
                 </div>
@@ -130,10 +134,10 @@ export default function HomePage() {
       </section>
 
       <section className="section-shell mt-20">
-        <Reveal className="panel overflow-hidden lg:grid lg:grid-cols-[0.92fr_1.08fr]">
-          <div className="bg-pine px-8 py-10 text-white sm:px-10 sm:py-12">
-            <span className="eyebrow border-white/15 bg-white/10 text-white">{homePage.letter.eyebrow}</span>
-            <h2 className="mt-6 font-display text-3xl leading-tight text-white sm:text-[2.5rem]">{homePage.letter.title}</h2>
+          <Reveal className="panel overflow-hidden lg:grid lg:grid-cols-[0.92fr_1.08fr]">
+            <div className="bg-pine px-8 py-10 text-white sm:px-10 sm:py-12">
+              <span className="eyebrow border-white/15 bg-white/10 text-white">{homePage.letter.eyebrow}</span>
+              <h2 className="mt-6 font-display text-3xl leading-tight text-white sm:text-[2.5rem]">{homePage.letter.title}</h2>
             <p className="mt-6 max-w-md text-base leading-8 text-white/80">{homePage.letter.body[0]}</p>
             <p className="mt-6 text-sm font-semibold uppercase tracking-[0.18em] text-white/66">{homePage.letter.signature}</p>
           </div>
@@ -283,24 +287,26 @@ export default function HomePage() {
         </Reveal>
         <div className="mt-8 grid gap-6 md:grid-cols-3">
           {homePage.references.items.map((item, index) => (
-            <Reveal className="panel p-7 sm:p-8" delay={index * 90} key={item.label}>
+            <Reveal className="panel overflow-hidden p-7 sm:p-8" delay={index * 90} key={item.label}>
+              <div className="pointer-events-none absolute right-0 top-0 h-24 w-24 rounded-full bg-clay/8 blur-2xl" />
               <p className="text-sm font-semibold uppercase tracking-[0.18em] text-clay">{item.label}</p>
-              <p className="mt-4 text-base leading-7 text-ink/72">{item.text}</p>
+              <p className="relative mt-4 text-base leading-7 text-ink/72">{item.text}</p>
             </Reveal>
           ))}
         </div>
       </section>
 
       <section className="section-shell mt-20 pb-4">
-        <Reveal className="panel overflow-hidden bg-moss px-7 py-10 text-white sm:px-10 sm:py-12">
+        <Reveal className="panel overflow-hidden bg-[linear-gradient(135deg,#173126_0%,#284638_58%,#305243_100%)] px-7 py-10 text-white sm:px-10 sm:py-12">
+          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(255,255,255,0.14),transparent_30%),radial-gradient(circle_at_bottom_left,rgba(185,137,82,0.14),transparent_34%)]" />
           <div className="flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
-            <div className="max-w-2xl">
+            <div className="relative max-w-2xl">
               <span className="eyebrow border-white/15 bg-white/10 text-white">Ready When You Are</span>
               <h2 className="mt-5 font-display text-3xl leading-tight text-white sm:text-[2.5rem]">{homePage.contactCta.title}</h2>
               <p className="mt-4 text-base leading-8 text-white/80">{homePage.contactCta.description}</p>
             </div>
 
-            <div className="flex flex-wrap gap-3">
+            <div className="relative flex flex-wrap gap-3">
               <ButtonLink className="bg-white text-pine hover:bg-sand" href={homePage.contactCta.primaryCta.href}>
                 {homePage.contactCta.primaryCta.label}
               </ButtonLink>

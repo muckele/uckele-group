@@ -131,8 +131,8 @@ export default function ContactForm() {
   }
 
   return (
-    <form className="panel p-7 sm:p-8" onSubmit={handleSubmit}>
-      <div className="grid gap-5 sm:grid-cols-2">
+    <form className="panel p-6 sm:p-8" onSubmit={handleSubmit}>
+      <div className="grid gap-5 md:grid-cols-2">
         <label className="flex flex-col gap-2 text-sm font-medium text-ink">
           Name
           <input
@@ -183,7 +183,7 @@ export default function ContactForm() {
           />
         </label>
 
-        <label className="flex flex-col gap-2 text-sm font-medium text-ink sm:col-span-2">
+        <label className="flex flex-col gap-2 text-sm font-medium text-ink md:col-span-2">
           I am reaching out as
           <select
             className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
@@ -204,7 +204,7 @@ export default function ContactForm() {
           <input id="website" name="website" onChange={handleChange} tabIndex="-1" type="text" value={formData.website} />
         </label>
 
-        <label className="flex flex-col gap-2 text-sm font-medium text-ink sm:col-span-2">
+        <label className="flex flex-col gap-2 text-sm font-medium text-ink md:col-span-2">
           Message
           <textarea
             required
@@ -217,8 +217,10 @@ export default function ContactForm() {
         </label>
 
         {turnstileSiteKey ? (
-          <div className="sm:col-span-2">
-            <div ref={turnstileContainerRef} />
+          <div className="md:col-span-2">
+            <div className="overflow-x-auto">
+              <div ref={turnstileContainerRef} />
+            </div>
             <p className="mt-2 text-xs leading-6 text-ink/60">Anti-spam verification is enabled for inbound inquiries.</p>
           </div>
         ) : null}
@@ -230,7 +232,7 @@ export default function ContactForm() {
         </p>
 
         <button
-          className="inline-flex items-center justify-center rounded-full border border-moss bg-moss px-6 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:cursor-not-allowed disabled:opacity-50"
+          className="inline-flex w-full items-center justify-center rounded-full border border-moss bg-moss px-6 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
           disabled={!isComplete || submitting}
           type="submit"
         >

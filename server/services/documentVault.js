@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
+import { getRequestOrigin } from '../utils/http.js';
 import { signPayload, verifySignedPayload } from '../utils/security.js';
 import { sendDocumentUploadNotificationEmail, sendSecureUploadInviteEmail } from './delivery.js';
 
@@ -60,7 +61,7 @@ function validateDocumentPayload(document) {
   return errors;
 }
 
-export async function createSecureUploadRequest({ submissionId, requestedBy, note = '', sendEmail = true }) {
+export async function createSecureUploadRequest({ submissionId, requestedBy, note = '', sendEmail = true, request }) {
   const config = getConfig();
   const storage = getStorage();
   const submission = await storage.getSubmission(submissionId);
@@ -99,7 +100,8 @@ export async function createSecureUploadRequest({ submissionId, requestedBy, not
     exp: Date.now() + config.secureDocuments.requestTtlMs,
   });
 
-  const uploadUrl = `${config.server.origin}/secure-documents?token=${encodeURIComponent(accessToken)}`;
+  const publicOrigin = getRequestOrigin(request, config.server.origin);
+  const uploadUrl = `${publicOrigin}/secure-documents?token=${encodeURIComponent(accessToken)}`;
   let emailResult = { status: 'skipped', error: '' };
 
   if (sendEmail) {

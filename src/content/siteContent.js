@@ -16,9 +16,34 @@ function toAbsoluteUrl(path) {
 }
 
 const contactDetailItems = [
-  publicEmail ? `Email: ${publicEmail}` : 'Use the contact form for a confidential reply',
-  publicPhone ? `Phone: ${publicPhone}` : null,
-  publicLinkedin ? `LinkedIn: ${publicLinkedin}` : null,
+  publicEmail
+    ? {
+        kind: 'email',
+        label: 'Email',
+        value: publicEmail,
+        href: `mailto:${publicEmail}`,
+      }
+    : {
+        kind: 'text',
+        label: 'Contact',
+        value: 'Use the contact form for a confidential reply',
+      },
+  publicPhone
+    ? {
+        kind: 'phone',
+        label: 'Phone',
+        value: publicPhone,
+        href: `tel:${publicPhone.replace(/[^\d+]/g, '')}`,
+      }
+    : null,
+  publicLinkedin
+    ? {
+        kind: 'linkedin',
+        label: 'LinkedIn',
+        value: 'LinkedIn',
+        href: publicLinkedin,
+      }
+    : null,
 ].filter(Boolean);
 
 export const siteConfig = {

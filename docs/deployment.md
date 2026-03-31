@@ -1,59 +1,106 @@
 # Deployment
 
-This project is prepared to deploy to Vercel with the custom domain:
+This project is prepared to deploy to Fly.io with the custom domain:
 
 `https://www.uckelegroup.com`
 
-## Production Environment Variables
+The Fly configuration is committed in [fly.toml](/Users/Matt/Documents/uckele-group/fly.toml) and uses:
 
-Set these in your hosting provider before going live:
+- one app machine
+- one mounted Fly volume at `/data`
+- SQLite at `/data/uckele-group.sqlite`
+- secure document storage at `/data/secure-documents`
+
+## Included Files
+
+- [Dockerfile](/Users/Matt/Documents/uckele-group/Dockerfile)
+- [fly.toml](/Users/Matt/Documents/uckele-group/fly.toml)
+- [.dockerignore](/Users/Matt/Documents/uckele-group/.dockerignore)
+
+## Production Secrets
+
+Set these in Fly before the first deploy:
 
 ```bash
-PUBLIC_SITE_URL=https://www.uckelegroup.com
-VITE_PUBLIC_SITE_URL=https://www.uckelegroup.com
-
-VITE_PUBLIC_CONTACT_EMAIL=
-VITE_PUBLIC_CONTACT_PHONE=
-VITE_PUBLIC_LINKEDIN_URL=
-
-DELIVERY_PROVIDER=resend
-LEAD_NOTIFICATION_EMAIL=
-RESEND_API_KEY=
-RESEND_FROM_EMAIL=
-RESEND_REPLY_TO=
-
-ADMIN_AUTH_MODE=magic-link
-ADMIN_EMAIL=
-ADMIN_USERNAME=admin
-ADMIN_PASSWORD=
-ADMIN_SESSION_SECRET=
-ADMIN_MAGIC_LINK_SECRET=
-
-SECURE_DOCUMENTS_TOKEN_SECRET=
-TURNSTILE_SECRET_KEY=
-VITE_TURNSTILE_SITE_KEY=
+fly secrets set \
+  DELIVERY_PROVIDER=resend \
+  LEAD_NOTIFICATION_EMAIL=mathew@uckelegroup.com \
+  RESEND_API_KEY=... \
+  RESEND_FROM_EMAIL="Uckele Group <mathew@uckelegroup.com>" \
+  RESEND_REPLY_TO=mathew@uckelegroup.com \
+  ADMIN_AUTH_MODE=magic-link \
+  ADMIN_EMAIL=mathew@uckelegroup.com \
+  ADMIN_SESSION_SECRET=... \
+  ADMIN_MAGIC_LINK_SECRET=... \
+  SECURE_DOCUMENTS_TOKEN_SECRET=... \
+  TURNSTILE_SECRET_KEY=...
 ```
 
-## Recommended Production Choices
+Optional overrides:
 
-- Use `DELIVERY_PROVIDER=resend`
-- Use `ADMIN_AUTH_MODE=magic-link`
-- Keep the CRM at `/admin`
-- Keep `/secure-documents` private and unindexed
-- Turn on Turnstile in production
+```bash
+fly secrets set \
+  CRM_WEBHOOK_URL=... \
+  CRM_WEBHOOK_SECRET=... \
+  DEFAULT_LEAD_ASSIGNEE="Mathew Uckele" \
+  DEFAULT_FOLLOW_UP_DELAY_HOURS=24
+```
 
-## Vercel Notes
+If you enable Turnstile, add the public site key in [fly.toml](/Users/Matt/Documents/uckele-group/fly.toml) under `[build.args]` before deploying:
 
-- `vercel.json` is included for SPA routing, API functions, and production headers
-- `api/[...path].js` serves the backend API as a serverless function
-- Public marketing routes resolve through the Vite SPA
-- `/admin` remains private and requires login
+```toml
+[build.args]
+  VITE_TURNSTILE_SITE_KEY = "your-public-turnstile-site-key"
+```
+
+## First-Time Fly Setup
+
+1. Install Fly CLI and log in.
+2. Create the app if it does not already exist:
+
+```bash
+fly apps create uckele-group
+```
+
+3. Create the persistent volume in the same region defined in `fly.toml`:
+
+```bash
+fly volumes create uckele_group_data --region ewr --size 3
+```
+
+4. Set the production secrets.
+5. Deploy:
+
+```bash
+fly deploy
+```
+
+## Custom Domain
+
+After the first successful deploy:
+
+```bash
+fly certs add www.uckelegroup.com
+fly certs add uckelegroup.com
+```
+
+Then update DNS:
+
+- point `www.uckelegroup.com` to `uckele-group.fly.dev` with a `CNAME`
+- point the apex `uckelegroup.com` to the Fly IPs shown by `fly ips list`
+
+## Operational Notes
+
+- Keep this app as a single machine while it uses local SQLite and the mounted `/data` volume.
+- `ADMIN_AUTH_MODE=magic-link` is the recommended production mode.
+- `/admin` is private and requires authentication.
+- `/secure-documents` is token-protected and should remain unindexed.
+- Turnstile should be enabled in production.
 
 ## Before Go-Live
 
-- Replace public contact blanks with your real email, phone, and LinkedIn if you want them visible on the site
-- Confirm the contact form is delivering to your real inbox
-- Set a strong `ADMIN_SESSION_SECRET`
-- Set a strong `ADMIN_MAGIC_LINK_SECRET`
-- Verify your custom domain in the hosting provider
-- Confirm `robots.txt` and `sitemap.xml` are live on the production domain
+- Confirm the contact form is delivering to `mathew@uckelegroup.com`
+- Confirm magic-link sign-in emails are being delivered
+- Verify `/api/health` returns `200` on the Fly URL
+- Confirm uploaded secure documents are written under the mounted volume
+- Confirm `robots.txt` and `sitemap.xml` are live on `https://www.uckelegroup.com`
