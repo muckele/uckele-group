@@ -5,6 +5,7 @@ import { getConfig } from './config.js';
 import {
   getAdminAuthState,
   getAdminSession,
+  enforceAdminAuthRateLimit,
   loginAdmin,
   logoutAdmin,
   requestAdminMagicLink,
@@ -14,6 +15,8 @@ import {
 import {
   createSecureUploadRequest,
   getSecureUploadContext,
+  serializePublicSecureDocument,
+  serializePublicSecureUploadRequest,
   uploadSecureDocuments,
 } from './services/documentVault.js';
 import {
@@ -56,7 +59,7 @@ export function createApp() {
   app.post(
     '/api/contact',
     asyncRoute(async (request, response) => {
-      const result = await submitContactLead(request.body, request);
+      const result = await submitContactLead(request.body || {}, request);
       response.status(result.status).json(result.body);
     }),
   );
@@ -71,25 +74,44 @@ export function createApp() {
     });
   });
 
-  app.post('/api/admin/session', (request, response) => {
-    const result = loginAdmin(request.body.username || '', request.body.password || '');
+  app.post(
+    '/api/admin/session',
+    asyncRoute(async (request, response) => {
+      const body = request.body || {};
+      const rateLimit = await enforceAdminAuthRateLimit(request, 'password', body.username || '');
 
-    if (!result.ok) {
-      response.status(401).json({ success: false, error: result.reason });
-      return;
-    }
+      if (rateLimit.blocked) {
+        response.status(rateLimit.status).json({ success: false, error: rateLimit.error });
+        return;
+      }
 
-    response.setHeader('Set-Cookie', result.cookie);
-    response.json({
-      success: true,
-      username: result.session.username,
-    });
-  });
+      const result = loginAdmin(body.username || '', body.password || '');
+
+      if (!result.ok) {
+        response.status(401).json({ success: false, error: result.reason });
+        return;
+      }
+
+      response.setHeader('Set-Cookie', result.cookie);
+      response.json({
+        success: true,
+        username: result.session.username,
+      });
+    }),
+  );
 
   app.post(
     '/api/admin/magic-link/request',
     asyncRoute(async (request, response) => {
-      const result = await requestAdminMagicLink(request.body.email || '', request);
+      const body = request.body || {};
+      const rateLimit = await enforceAdminAuthRateLimit(request, 'magic-link', body.email || '');
+
+      if (rateLimit.blocked) {
+        response.status(rateLimit.status).json({ success: false, error: rateLimit.error });
+        return;
+      }
+
+      const result = await requestAdminMagicLink(body.email || '', request);
 
       if (!result.ok) {
         response.status(400).json({ success: false, error: result.reason });
@@ -105,7 +127,8 @@ export function createApp() {
   );
 
   app.post('/api/admin/magic-link/verify', (request, response) => {
-    const result = verifyAdminMagicLink(request.body.token || '');
+    const body = request.body || {};
+    const result = verifyAdminMagicLink(body.token || '');
 
     if (!result.ok) {
       response.status(401).json({ success: false, error: result.reason });
@@ -219,11 +242,12 @@ export function createApp() {
         return;
       }
 
+      const body = request.body || {};
       const result = await createSecureUploadRequest({
         submissionId: request.params.id,
         requestedBy: session.username,
-        note: String(request.body.note || ''),
-        sendEmail: request.body.sendEmail !== false,
+        note: String(body.note || ''),
+        sendEmail: body.sendEmail !== false,
         request,
       });
 
@@ -253,13 +277,13 @@ export function createApp() {
 
       response.json({
         success: true,
-        request: result.request,
+        request: serializePublicSecureUploadRequest(result.request),
         submission: {
           id: result.submission.id,
           name: result.submission.name,
           company: result.submission.company,
         },
-        documents: result.documents,
+        documents: result.documents.map(serializePublicSecureDocument),
       });
     }),
   );
@@ -267,11 +291,12 @@ export function createApp() {
   app.post(
     '/api/secure-documents/upload',
     asyncRoute(async (request, response) => {
+      const body = request.body || {};
       const result = await uploadSecureDocuments({
-        token: request.body.token,
-        ndaAccepted: Boolean(request.body.ndaAccepted),
-        note: String(request.body.note || ''),
-        documents: Array.isArray(request.body.documents) ? request.body.documents : [],
+        token: body.token,
+        ndaAccepted: Boolean(body.ndaAccepted),
+        note: String(body.note || ''),
+        documents: Array.isArray(body.documents) ? body.documents : [],
       });
 
       if (!result.ok) {
@@ -281,13 +306,13 @@ export function createApp() {
 
       response.json({
         success: true,
-        request: result.request,
+        request: serializePublicSecureUploadRequest(result.request),
         submission: {
           id: result.submission.id,
           name: result.submission.name,
           company: result.submission.company,
         },
-        documents: result.documents,
+        documents: result.documents.map(serializePublicSecureDocument),
       });
     }),
   );

@@ -1,7 +1,8 @@
 import { getConfig } from '../config.js';
+import { getStorage } from '../storage/index.js';
 import { clearCookie, parseCookies, serializeCookie } from '../utils/cookies.js';
-import { getRequestOrigin } from '../utils/http.js';
-import { safeCompareText, signPayload, verifySignedPayload } from '../utils/security.js';
+import { getClientIp, getRequestOrigin } from '../utils/http.js';
+import { hashIp, safeCompareText, signPayload, verifySignedPayload } from '../utils/security.js';
 import { sendAdminMagicLinkEmail } from './delivery.js';
 
 function createSessionCookie(session) {
@@ -34,6 +35,47 @@ function createAdminSession(username) {
     username,
     exp: Date.now() + getConfig().admin.sessionMaxAgeMs,
   };
+}
+
+function getPublicOrigin(request) {
+  const config = getConfig();
+  return config.isProduction ? config.server.origin : getRequestOrigin(request, config.server.origin);
+}
+
+function normalizeRateLimitPart(value) {
+  return (
+    String(value || 'unknown')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9@._:-]+/g, '-')
+      .slice(0, 160) || 'unknown'
+  );
+}
+
+export async function enforceAdminAuthRateLimit(request, action, identifier = '') {
+  const config = getConfig();
+  const storage = getStorage();
+  const clientIp = getClientIp(request, { trustProxy: config.server.trustProxy });
+  const nowIso = new Date().toISOString();
+  const windowStartIso = new Date(Date.now() - config.admin.rateLimitWindowMs).toISOString();
+  const normalizedAction = normalizeRateLimitPart(action);
+  const normalizedIdentifier = normalizeRateLimitPart(identifier);
+  const buckets = [
+    `admin-auth:${normalizedAction}:ip:${hashIp(clientIp)}`,
+    `admin-auth:${normalizedAction}:id:${hashIp(normalizedIdentifier)}`,
+  ];
+  const counts = await Promise.all(buckets.map((bucket) => storage.countRateLimitEvents(bucket, windowStartIso)));
+
+  if (counts.some((count) => count >= config.admin.rateLimitMax)) {
+    return {
+      blocked: true,
+      status: 429,
+      error: 'Too many admin sign-in attempts. Please wait a few minutes and try again.',
+    };
+  }
+
+  await Promise.all(buckets.map((bucket) => storage.addRateLimitEvent(bucket, nowIso)));
+  return { blocked: false };
 }
 
 export function getAdminSession(request) {
@@ -119,7 +161,7 @@ export async function requestAdminMagicLink(email, request) {
     },
     config.admin.magicLinkSecret,
   );
-  const publicOrigin = getRequestOrigin(request, config.server.origin);
+  const publicOrigin = getPublicOrigin(request);
   const magicLinkUrl = `${publicOrigin}/admin?admin_token=${encodeURIComponent(token)}`;
   const deliveryResult = await sendAdminMagicLinkEmail({
     to: config.admin.email,

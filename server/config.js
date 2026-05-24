@@ -40,6 +40,7 @@ export function getConfig() {
     server: {
       port: numberFromEnv(process.env.PORT, 8787),
       origin: process.env.PUBLIC_SITE_URL || defaultPublicOrigin,
+      trustProxy: booleanFromEnv(process.env.TRUST_PROXY, false),
     },
     storage: {
       provider: process.env.STORAGE_PROVIDER || 'sqlite',
@@ -76,6 +77,8 @@ export function getConfig() {
       sessionSecret,
       magicLinkSecret: process.env.ADMIN_MAGIC_LINK_SECRET || sessionSecret,
       magicLinkTtlMs: numberFromEnv(process.env.ADMIN_MAGIC_LINK_TTL_MS, 1000 * 60 * 20),
+      rateLimitWindowMs: numberFromEnv(process.env.ADMIN_AUTH_RATE_LIMIT_WINDOW_MS, 1000 * 60 * 10),
+      rateLimitMax: numberFromEnv(process.env.ADMIN_AUTH_RATE_LIMIT_MAX, 5),
       allowPasswordAuth:
         adminAuthMode === 'password' ||
         adminAuthMode === 'hybrid' ||

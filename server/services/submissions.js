@@ -401,7 +401,8 @@ export async function submitContactLead(body, request) {
     };
   }
 
-  const ipHash = hashIp(getClientIp(request));
+  const clientIp = getClientIp(request, { trustProxy: config.server.trustProxy });
+  const ipHash = hashIp(clientIp);
   const rateLimitResult = await enforceRateLimit(storage, ipHash);
 
   if (rateLimitResult.blocked) {
@@ -411,7 +412,7 @@ export async function submitContactLead(body, request) {
     };
   }
 
-  const turnstileResult = await verifyTurnstileToken(input.turnstileToken, getClientIp(request));
+  const turnstileResult = await verifyTurnstileToken(input.turnstileToken, clientIp);
 
   if (!turnstileResult.success) {
     return {

@@ -10,6 +10,7 @@ The site now includes:
 - Stored submissions
 - Private admin CRM at `/admin`
 - Email magic-link admin auth with optional password fallback
+- Admin auth rate limiting for password and magic-link requests
 - Workflow fields for assignee, notes, tags, priority, follow-up state, and next action date
 - Secure upload request generation and a seller-facing upload page at `/secure-documents`
 - Spam protection with honeypot, time-to-submit checks, rate limiting, message heuristics, and optional Cloudflare Turnstile
@@ -136,6 +137,14 @@ Use:
 - `ADMIN_PASSWORD`
 - `ADMIN_SESSION_SECRET`
 - `ADMIN_MAGIC_LINK_SECRET`
+- `ADMIN_AUTH_RATE_LIMIT_WINDOW_MS`
+- `ADMIN_AUTH_RATE_LIMIT_MAX`
+
+If the app is deployed behind a trusted proxy that provides a canonical client-IP header, set:
+
+- `TRUST_PROXY=true`
+
+On Fly.io this uses `Fly-Client-IP` for rate limiting and Turnstile validation.
 
 The admin CRM supports:
 

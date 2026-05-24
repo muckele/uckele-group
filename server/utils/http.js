@@ -1,25 +1,24 @@
-export function getClientIp(request) {
-  const forwardedFor = request.headers['x-forwarded-for'];
-
-  if (typeof forwardedFor === 'string' && forwardedFor.length > 0) {
-    return forwardedFor.split(',')[0].trim();
-  }
-
-  const realIp = request.headers['x-real-ip'];
-
-  if (typeof realIp === 'string' && realIp.length > 0) {
-    return realIp.trim();
-  }
-
-  return request.ip || request.socket?.remoteAddress || 'unknown';
-}
-
 function firstHeaderValue(value) {
   if (typeof value !== 'string' || value.length === 0) {
     return '';
   }
 
   return value.split(',')[0].trim();
+}
+
+export function getClientIp(request, { trustProxy = false } = {}) {
+  if (trustProxy) {
+    const trustedProxyIp =
+      firstHeaderValue(request.headers['fly-client-ip']) ||
+      firstHeaderValue(request.headers['cf-connecting-ip']) ||
+      firstHeaderValue(request.headers['x-real-ip']);
+
+    if (trustedProxyIp) {
+      return trustedProxyIp;
+    }
+  }
+
+  return request.ip || request.socket?.remoteAddress || 'unknown';
 }
 
 export function getRequestOrigin(request, fallbackOrigin = '') {

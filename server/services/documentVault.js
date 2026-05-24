@@ -41,6 +41,11 @@ function verifyAccessToken(token) {
   return verifySignedPayload(token, config.secureDocuments.tokenSecret);
 }
 
+function getPublicOrigin(request) {
+  const config = getConfig();
+  return config.isProduction ? config.server.origin : getRequestOrigin(request, config.server.origin);
+}
+
 function normalizeDocumentType(value) {
   const normalized = String(value || 'other').trim().toLowerCase();
   const allowed = ['teaser', 'cim', 'financials', 'tax-returns', 'contracts', 'customer-summary', 'other'];
@@ -59,6 +64,33 @@ function validateDocumentPayload(document) {
   }
 
   return errors;
+}
+
+export function serializePublicSecureUploadRequest(requestRecord) {
+  return {
+    id: requestRecord.id,
+    created_at: requestRecord.created_at,
+    updated_at: requestRecord.updated_at,
+    email: requestRecord.email,
+    contact_name: requestRecord.contact_name,
+    status: requestRecord.status,
+    expires_at: requestRecord.expires_at,
+    nda_required: Boolean(requestRecord.nda_required),
+    nda_accepted_at: requestRecord.nda_accepted_at,
+    last_uploaded_at: requestRecord.last_uploaded_at,
+  };
+}
+
+export function serializePublicSecureDocument(document) {
+  return {
+    id: document.id,
+    created_at: document.created_at,
+    document_type: document.document_type,
+    original_name: document.original_name,
+    mime_type: document.mime_type,
+    size_bytes: document.size_bytes,
+    nda_accepted_at: document.nda_accepted_at,
+  };
 }
 
 export async function createSecureUploadRequest({ submissionId, requestedBy, note = '', sendEmail = true, request }) {
@@ -100,7 +132,7 @@ export async function createSecureUploadRequest({ submissionId, requestedBy, not
     exp: Date.now() + config.secureDocuments.requestTtlMs,
   });
 
-  const publicOrigin = getRequestOrigin(request, config.server.origin);
+  const publicOrigin = getPublicOrigin(request);
   const uploadUrl = `${publicOrigin}/secure-documents?token=${encodeURIComponent(accessToken)}`;
   let emailResult = { status: 'skipped', error: '' };
 
