@@ -307,6 +307,7 @@ export default function DashboardPage() {
   const [dealHunterForm, setDealHunterForm] = useState({ subject: 'SMB Deal Hunter daily email', text: '', sendDigest: true });
   const [dealHunterLoading, setDealHunterLoading] = useState(false);
   const [dealHunterPending, setDealHunterPending] = useState(false);
+  const [dealHunterImportPending, setDealHunterImportPending] = useState(false);
   const [dealHunterError, setDealHunterError] = useState('');
   const [dealHunterMessage, setDealHunterMessage] = useState('');
   const deferredSearch = useDeferredValue(filters.search);
@@ -696,6 +697,44 @@ export default function DashboardPage() {
     }
   }
 
+  async function handleDealHunterSheetImport() {
+    setDealHunterImportPending(true);
+    setDealHunterError('');
+    setDealHunterMessage('');
+
+    try {
+      const response = await fetch('/api/admin/deal-hunter/import-sheet', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ sendDigest: dealHunterForm.sendDigest }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to import the Google Sheet.');
+      }
+
+      setDealHunter((current) => ({
+        ...current,
+        criteria: result.criteria || current.criteria,
+        latestRun: result.run,
+        runs: [result.run, ...(current.runs || []).filter((run) => run.id !== result.run.id)].slice(0, 8),
+        candidates: result.candidates || [],
+      }));
+      setDealHunterMessage(
+        `Imported ${result.sheet?.rowCount || 0} sheet row(s). ${result.run.qualified_count} qualified and ${result.run.watch_count} watchlisted.`,
+      );
+    } catch (error) {
+      setDealHunterError(error.message || 'Unable to import the Google Sheet.');
+    } finally {
+      setDealHunterImportPending(false);
+    }
+  }
+
   const summary = dashboardData.summary || {
     total: 0,
     lastSevenDays: 0,
@@ -898,7 +937,7 @@ export default function DashboardPage() {
               <SectionLabel>Deal Hunter</SectionLabel>
               <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Daily deal-list review and scoring</h2>
               <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
-                Paste the SMB Deal Hunter Pro email here to score each listing for recession resistance, AI resistance, fit with your search criteria, and hard exclusions.
+                Import the daily Google Sheet or paste SMB Deal Hunter Pro listings to score recession resistance, AI resistance, fit with your search criteria, and hard exclusions.
               </p>
             </div>
             {dealHunter.latestRun ? (
@@ -945,6 +984,27 @@ export default function DashboardPage() {
             </div>
 
             <form className="space-y-5" onSubmit={handleDealHunterReview}>
+              <div className="flex flex-col gap-3 sm:flex-row">
+                <button
+                  className={secondaryActionButtonClass}
+                  disabled={dealHunterImportPending || dealHunterPending}
+                  onClick={handleDealHunterSheetImport}
+                  type="button"
+                >
+                  <Download className="h-4 w-4" />
+                  {dealHunterImportPending ? 'Importing Sheet...' : 'Import Latest Sheet'}
+                </button>
+                <a
+                  className={secondaryActionButtonClass}
+                  href={dailyDealUpdateUrl}
+                  rel="noreferrer"
+                  target="_blank"
+                >
+                  <Link2 className="h-4 w-4" />
+                  Open Sheet
+                </a>
+              </div>
+
               <InputField
                 label="Email subject"
                 onChange={(event) => setDealHunterForm((current) => ({ ...current, subject: event.target.value }))}
@@ -970,7 +1030,7 @@ export default function DashboardPage() {
 
               <button
                 className={primaryActionButtonClass}
-                disabled={dealHunterPending || !dealHunterForm.text.trim()}
+                disabled={dealHunterPending || dealHunterImportPending || !dealHunterForm.text.trim()}
                 type="submit"
               >
                 <MailCheck className="h-4 w-4" />
@@ -1034,6 +1094,54 @@ export default function DashboardPage() {
                     {candidate.status}
                   </Pill>
                   <span className="hidden md:block">{formatMoney(candidate.annual_profit)}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {dealHunterCandidates.length > 0 ? (
+            <div className="mt-6 grid gap-4 lg:grid-cols-2">
+              {dealHunterCandidates.slice(0, 6).map((candidate) => (
+                <div className="rounded-[24px] border border-line/80 bg-white/75 p-5" key={`guidance-${candidate.id}`}>
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="text-lg font-semibold text-ink">{candidate.company}</p>
+                      <p className="mt-1 text-sm text-ink/62">{candidate.location || 'Location not listed'} | {formatMoney(candidate.annual_profit)}</p>
+                    </div>
+                    <Pill tone={candidate.status === 'qualified' ? 'success' : candidate.status === 'watch' ? 'warning' : 'danger'}>
+                      {candidate.score}
+                    </Pill>
+                  </div>
+
+                  {(candidate.notes || []).length > 0 ? (
+                    <div className="mt-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Notes</p>
+                      <ul className="mt-2 space-y-2 text-sm leading-6 text-ink/72">
+                        {(candidate.notes || []).slice(0, 3).map((note) => (
+                          <li key={note}>{note}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+
+                  <div className="mt-4 grid gap-4 md:grid-cols-2">
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Ask broker</p>
+                      <ul className="mt-2 space-y-2 text-sm leading-6 text-ink/72">
+                        {(candidate.broker_questions || []).slice(0, 3).map((question) => (
+                          <li key={question}>{question}</li>
+                        ))}
+                      </ul>
+                    </div>
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Ask owner</p>
+                      <ul className="mt-2 space-y-2 text-sm leading-6 text-ink/72">
+                        {(candidate.owner_questions || []).slice(0, 3).map((question) => (
+                          <li key={question}>{question}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
                 </div>
               ))}
             </div>

@@ -22,6 +22,7 @@ import {
 import {
   getDealHunterOverview,
   reviewDealHunterEmail,
+  reviewDealHunterSheetImport,
   reviewDealHunterWebhook,
   updateDealHunterCriteria,
 } from './services/dealHunter.js';
@@ -256,6 +257,29 @@ export function createApp() {
         subject: body.subject || '',
         text: body.text || '',
         source: 'manual-admin-import',
+        requestedBy: session.username,
+        sendDigest: body.sendDigest !== false,
+      });
+
+      response.json({
+        success: true,
+        ...result,
+      });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/import-sheet',
+    asyncRoute(async (request, response) => {
+      const session = requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const body = request.body || {};
+      const result = await reviewDealHunterSheetImport({
         requestedBy: session.username,
         sendDigest: body.sendDigest !== false,
       });

@@ -312,6 +312,177 @@ function parseMoney(value) {
   return Math.round(base);
 }
 
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let value = '';
+  let quoted = false;
+  const csv = String(text || '');
+
+  for (let index = 0; index < csv.length; index += 1) {
+    const character = csv[index];
+    const nextCharacter = csv[index + 1];
+
+    if (character === '"') {
+      if (quoted && nextCharacter === '"') {
+        value += '"';
+        index += 1;
+      } else {
+        quoted = !quoted;
+      }
+      continue;
+    }
+
+    if (character === ',' && !quoted) {
+      row.push(value.trim());
+      value = '';
+      continue;
+    }
+
+    if ((character === '\n' || character === '\r') && !quoted) {
+      if (character === '\r' && nextCharacter === '\n') {
+        index += 1;
+      }
+
+      row.push(value.trim());
+      rows.push(row);
+      row = [];
+      value = '';
+      continue;
+    }
+
+    value += character;
+  }
+
+  row.push(value.trim());
+  rows.push(row);
+
+  return rows.filter((csvRow) => csvRow.some(Boolean));
+}
+
+function normalizeHeader(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function headerMatches(header, aliases) {
+  const normalizedHeader = normalizeHeader(header);
+  return aliases.some((alias) => normalizedHeader.includes(alias));
+}
+
+function getRowValue(row, headers, aliases, usedIndexes) {
+  const index = headers.findIndex((header) => headerMatches(header, aliases));
+
+  if (index === -1) {
+    return '';
+  }
+
+  usedIndexes.add(index);
+  return row[index] || '';
+}
+
+function findCsvHeaderIndex(rows) {
+  let best = { index: -1, score: 0 };
+
+  rows.slice(0, 20).forEach((row, index) => {
+    const score = row.reduce((total, cell) => {
+      const header = normalizeHeader(cell);
+
+      if (/company|business|listing|title|name/.test(header)) {
+        return total + 2;
+      }
+
+      if (/location|city|state|county|market|industry|category|sector|profit|sde|cash flow|ebitda|revenue|sales|asking|price|broker|description|summary|url|link/.test(header)) {
+        return total + 1;
+      }
+
+      return total;
+    }, 0);
+
+    if (score > best.score) {
+      best = { index, score };
+    }
+  });
+
+  return best.score >= 3 ? best.index : -1;
+}
+
+function csvRowToListingBlock(row, headers, index) {
+  const usedIndexes = new Set();
+  const company = getRowValue(row, headers, ['company', 'business name', 'business', 'listing title', 'title', 'name'], usedIndexes);
+  const directLocation = getRowValue(row, headers, ['location', 'city state', 'market', 'county'], usedIndexes);
+  const city = directLocation ? '' : getRowValue(row, headers, ['city'], usedIndexes);
+  const state = directLocation ? '' : getRowValue(row, headers, ['state'], usedIndexes);
+  const location = directLocation || [city, state].filter(Boolean).join(', ');
+  const industry = getRowValue(row, headers, ['industry', 'category', 'sector'], usedIndexes);
+  const profit = getRowValue(row, headers, ['annual profit', 'cash flow', 'sde', 'ebitda', 'profit'], usedIndexes);
+  const revenue = getRowValue(row, headers, ['annual revenue', 'gross revenue', 'revenue', 'sales'], usedIndexes);
+  const asking = getRowValue(row, headers, ['asking price', 'purchase price', 'asking', 'price'], usedIndexes);
+  const years = getRowValue(row, headers, ['years in business', 'years', 'established', 'founded'], usedIndexes);
+  const broker = getRowValue(row, headers, ['broker', 'advisor', 'listed by'], usedIndexes);
+  const url = getRowValue(row, headers, ['listing url', 'source url', 'url', 'link'], usedIndexes);
+  const description = getRowValue(row, headers, ['description', 'summary', 'overview', 'notes', 'memo'], usedIndexes);
+  const extra = headers
+    .map((header, headerIndex) => ({ header, value: row[headerIndex] || '', headerIndex }))
+    .filter(({ header, value, headerIndex }) => header && value && !usedIndexes.has(headerIndex))
+    .slice(0, 12)
+    .map(({ header, value }) => `${header}: ${value}`);
+  const lines = [
+    `Company: ${company || `Sheet Listing ${index + 1}`}`,
+    location ? `Location: ${location}` : '',
+    industry ? `Industry: ${industry}` : '',
+    profit ? `Annual Profit: ${profit}` : '',
+    revenue ? `Revenue: ${revenue}` : '',
+    asking ? `Asking Price: ${asking}` : '',
+    years ? `Years in business: ${years}` : '',
+    broker ? `Broker: ${broker}` : '',
+    url ? `URL: ${url}` : '',
+    description ? `Description: ${description}` : '',
+    ...extra,
+  ].filter(Boolean);
+
+  return lines.join('\n');
+}
+
+function csvToListingText(csv) {
+  const rows = parseCsv(csv);
+  const headerIndex = findCsvHeaderIndex(rows);
+
+  if (headerIndex === -1) {
+    const fallbackBlocks = rows
+      .map((row, index) => {
+        const values = row.filter(Boolean);
+        return values.length >= 3 ? [`Company: Sheet Listing ${index + 1}`, `Description: ${values.join(' | ')}`].join('\n') : '';
+      })
+      .filter((block) => block.length >= 80);
+
+    return {
+      text: fallbackBlocks.join('\n\n'),
+      rowCount: fallbackBlocks.length,
+      headerRowFound: false,
+      headers: [],
+    };
+  }
+
+  const headers = rows[headerIndex].map((header, index) => header || `Column ${index + 1}`);
+  const blocks = rows
+    .slice(headerIndex + 1)
+    .filter((row) => row.filter(Boolean).length >= 2)
+    .map((row, index) => csvRowToListingBlock(row, headers, index))
+    .filter((block) => block.length >= 60)
+    .slice(0, 120);
+
+  return {
+    text: blocks.join('\n\n'),
+    rowCount: blocks.length,
+    headerRowFound: true,
+    headers,
+  };
+}
+
 function extractField(block, labels) {
   const escaped = labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
   const pattern = new RegExp(`(?:^|\\n)\\s*(?:${escaped})\\s*:?\\s*([^\\n]+)`, 'i');
@@ -433,6 +604,62 @@ function addSignalScore(text, signals, pointsPerSignal, maxPoints) {
   };
 }
 
+function buildCandidateGuidance({ candidate, status, score, reasons, risks, excludedReasons, matchedKeywords }) {
+  const notes = [];
+  const brokerQuestions = [
+    'Can you send the CIM, trailing 12-month P&L, tax returns, and add-back schedule?',
+    'What percentage of revenue is recurring, contract-based, or repeat customer work?',
+    'What customer concentration exists in the top 5 and top 10 accounts?',
+  ];
+  const ownerQuestions = [
+    'What work still depends directly on the owner each week?',
+    'What would break first if the owner stepped away for 30 days?',
+    'Which services, customers, or jobs are least profitable today?',
+  ];
+
+  if (status === 'qualified') {
+    notes.push(`Priority follow-up. Score ${score} with ${reasons.length} positive signal(s).`);
+  } else if (status === 'watch') {
+    notes.push('Watchlist item. Worth a quick broker screen if the missing risks can be cleared fast.');
+  } else {
+    notes.push('Rejected by current profile. Revisit only if the listing is misclassified or the economics are materially stronger than shown.');
+  }
+
+  if (excludedReasons.length > 0) {
+    notes.push(`Hard exclusion hit: ${excludedReasons.join(' ')}`);
+  }
+
+  if (candidate.annual_profit === null) {
+    notes.push('Profit was not detected, so financial fit needs manual verification.');
+    brokerQuestions.unshift('What is the verified annual SDE/EBITDA and how was it calculated?');
+  }
+
+  if (risks.length > 0) {
+    notes.push(`Risk checks: ${risks.slice(0, 3).join(' ')}`);
+  }
+
+  if (matchedKeywords.includes('service contracts') || matchedKeywords.includes('recurring revenue')) {
+    brokerQuestions.push('Can you break revenue into recurring contracts, repeat work, and one-time projects?');
+  }
+
+  if (matchedKeywords.includes('management in place')) {
+    ownerQuestions.push('Which manager would run day-to-day operations after close, and what retention plan is realistic?');
+  } else {
+    ownerQuestions.push('Who besides the owner can quote jobs, schedule work, manage employees, and handle customer escalations?');
+  }
+
+  if (/technician|field service|licensed|regulated|inspection|testing|repair/i.test(candidate.raw_text)) {
+    brokerQuestions.push('Which licenses, certifications, or technician relationships must transfer at closing?');
+    ownerQuestions.push('How hard is it to recruit, train, and retain qualified field staff?');
+  }
+
+  return {
+    notes: [...new Set(notes)].slice(0, 5),
+    broker_questions: [...new Set(brokerQuestions)].slice(0, 6),
+    owner_questions: [...new Set(ownerQuestions)].slice(0, 6),
+  };
+}
+
 function scoreCandidate(candidate, criteria) {
   const text = `${candidate.company} ${candidate.industry} ${candidate.location} ${candidate.description} ${candidate.raw_text}`.toLowerCase();
   const reasons = [];
@@ -534,10 +761,20 @@ function scoreCandidate(candidate, criteria) {
         : score >= config.dealHunter.watchScore
           ? 'watch'
           : 'rejected';
+  const finalScore = Math.max(0, score);
+  const guidance = buildCandidateGuidance({
+    candidate,
+    status,
+    score: finalScore,
+    reasons,
+    risks,
+    excludedReasons,
+    matchedKeywords,
+  });
 
   return {
     ...candidate,
-    score: Math.max(0, score),
+    score: finalScore,
     recession_score,
     ai_resistance_score,
     criteria_score,
@@ -546,6 +783,9 @@ function scoreCandidate(candidate, criteria) {
     risks,
     matched_keywords: matchedKeywords,
     excluded_reasons: excludedReasons,
+    notes: guidance.notes,
+    broker_questions: guidance.broker_questions,
+    owner_questions: guidance.owner_questions,
   };
 }
 
@@ -731,6 +971,73 @@ export async function reviewDealHunterEmail({ subject = '', text = '', source = 
     recommendations,
     criteria,
   };
+}
+
+export async function reviewDealHunterSheetCsv({
+  subject = 'SMB Deal Hunter Google Sheet import',
+  csv = '',
+  source = 'google-sheet-import',
+  requestedBy = '',
+  sendDigest = true,
+} = {}) {
+  const converted = csvToListingText(csv);
+  const result = await reviewDealHunterEmail({
+    subject,
+    text: converted.text,
+    source,
+    requestedBy,
+    sendDigest,
+  });
+
+  return {
+    ...result,
+    sheet: {
+      rowCount: converted.rowCount,
+      headerRowFound: converted.headerRowFound,
+      headers: converted.headers,
+    },
+  };
+}
+
+async function fetchDealHunterSheetCsv(sheetCsvUrl) {
+  const url = normalizeText(sheetCsvUrl, 2000);
+
+  if (!url) {
+    throw new Error('Deal Hunter sheet CSV URL is not configured.');
+  }
+
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'text/csv,text/plain,*/*',
+      'User-Agent': 'UckeleGroupDealHunter/1.0',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(20000),
+  });
+  const csv = await response.text();
+
+  if (!response.ok) {
+    throw new Error(`Google Sheet import failed with ${response.status}.`);
+  }
+
+  if (/^\s*</.test(csv) || /Page Not Found|unable to open the file|requested does not exist/i.test(csv)) {
+    throw new Error('Google Sheet did not return CSV. Configure DEAL_HUNTER_SHEET_CSV_URL with the exact public CSV export URL for the deal tab.');
+  }
+
+  return csv;
+}
+
+export async function reviewDealHunterSheetImport({ requestedBy = '', sendDigest = true } = {}) {
+  const config = getConfig();
+  const csv = await fetchDealHunterSheetCsv(config.dealHunter.sheetCsvUrl);
+
+  return reviewDealHunterSheetCsv({
+    subject: 'SMB Deal Hunter Google Sheet import',
+    csv,
+    source: 'google-sheet-import',
+    requestedBy,
+    sendDigest,
+  });
 }
 
 export async function reviewDealHunterWebhook({ secret = '', subject = '', text = '', html = '' }) {

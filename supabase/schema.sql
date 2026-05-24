@@ -165,8 +165,15 @@ create table if not exists public.deal_hunter_candidates (
   reasons jsonb not null default '[]'::jsonb,
   risks jsonb not null default '[]'::jsonb,
   matched_keywords jsonb not null default '[]'::jsonb,
-  excluded_reasons jsonb not null default '[]'::jsonb
+  excluded_reasons jsonb not null default '[]'::jsonb,
+  notes jsonb not null default '[]'::jsonb,
+  broker_questions jsonb not null default '[]'::jsonb,
+  owner_questions jsonb not null default '[]'::jsonb
 );
+
+alter table public.deal_hunter_candidates add column if not exists notes jsonb not null default '[]'::jsonb;
+alter table public.deal_hunter_candidates add column if not exists broker_questions jsonb not null default '[]'::jsonb;
+alter table public.deal_hunter_candidates add column if not exists owner_questions jsonb not null default '[]'::jsonb;
 
 create index if not exists idx_deal_hunter_candidates_run_id on public.deal_hunter_candidates (run_id, score desc);
 create index if not exists idx_deal_hunter_candidates_status on public.deal_hunter_candidates (status, score desc);

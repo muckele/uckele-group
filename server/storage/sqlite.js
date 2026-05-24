@@ -67,6 +67,9 @@ function normalizeDealHunterCandidateRow(row) {
         risks: parseJsonColumn(row.risks, []),
         matched_keywords: parseJsonColumn(row.matched_keywords, []),
         excluded_reasons: parseJsonColumn(row.excluded_reasons, []),
+        notes: parseJsonColumn(row.notes, []),
+        broker_questions: parseJsonColumn(row.broker_questions, []),
+        owner_questions: parseJsonColumn(row.owner_questions, []),
       }
     : null;
 }
@@ -232,7 +235,10 @@ export function createSqliteStorage(config) {
       reasons TEXT NOT NULL DEFAULT '[]',
       risks TEXT NOT NULL DEFAULT '[]',
       matched_keywords TEXT NOT NULL DEFAULT '[]',
-      excluded_reasons TEXT NOT NULL DEFAULT '[]'
+      excluded_reasons TEXT NOT NULL DEFAULT '[]',
+      notes TEXT NOT NULL DEFAULT '[]',
+      broker_questions TEXT NOT NULL DEFAULT '[]',
+      owner_questions TEXT NOT NULL DEFAULT '[]'
     );
 
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_runs_created_at ON deal_hunter_runs(created_at DESC);
@@ -265,6 +271,9 @@ export function createSqliteStorage(config) {
   ensureColumn(database, 'contact_submissions', 'seller_name', 'TEXT');
   ensureColumn(database, 'contact_submissions', 'seller_email', 'TEXT');
   ensureColumn(database, 'contact_submissions', 'seller_phone', 'TEXT');
+  ensureColumn(database, 'deal_hunter_candidates', 'notes', "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn(database, 'deal_hunter_candidates', 'broker_questions', "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn(database, 'deal_hunter_candidates', 'owner_questions', "TEXT NOT NULL DEFAULT '[]'");
 
   const insertSubmissionStatement = database.prepare(`
     INSERT INTO contact_submissions (
@@ -504,7 +513,10 @@ export function createSqliteStorage(config) {
       reasons,
       risks,
       matched_keywords,
-      excluded_reasons
+      excluded_reasons,
+      notes,
+      broker_questions,
+      owner_questions
     ) VALUES (
       @id,
       @run_id,
@@ -528,7 +540,10 @@ export function createSqliteStorage(config) {
       @reasons,
       @risks,
       @matched_keywords,
-      @excluded_reasons
+      @excluded_reasons,
+      @notes,
+      @broker_questions,
+      @owner_questions
     )
   `);
 
@@ -786,6 +801,9 @@ export function createSqliteStorage(config) {
             risks: JSON.stringify(candidate.risks || []),
             matched_keywords: JSON.stringify(candidate.matched_keywords || []),
             excluded_reasons: JSON.stringify(candidate.excluded_reasons || []),
+            notes: JSON.stringify(candidate.notes || []),
+            broker_questions: JSON.stringify(candidate.broker_questions || []),
+            owner_questions: JSON.stringify(candidate.owner_questions || []),
           });
         });
       });

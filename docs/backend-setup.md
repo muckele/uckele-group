@@ -198,24 +198,37 @@ Uploads are currently stored on the local filesystem under the configured secure
 
 ## Deal Hunter
 
-The private admin CRM includes a Deal Hunter panel for daily SMB Deal Hunter Pro emails. Paste the full email into `/admin` to score listings for:
+The private admin CRM includes a Deal Hunter panel for daily SMB Deal Hunter Pro emails and the SMB Deal Hunter Pro Google Sheet. Use `/admin` to import the latest sheet rows or paste email text manually, then score listings for:
 
 - recession resistance
 - AI resistance
 - fit with the updated search criteria
 - hard exclusions such as food, beverage, hospitality, restaurants, retail, SaaS, and online businesses
+- broker and owner follow-up questions
 
 Set:
 
 - `DEAL_HUNTER_DIGEST_EMAIL`
+- `DEAL_HUNTER_SHEET_URL`
+- `DEAL_HUNTER_SHEET_CSV_URL`
 - `DEAL_HUNTER_MINIMUM_QUALIFIED_SCORE`
 - `DEAL_HUNTER_WATCH_SCORE`
+
+`DEAL_HUNTER_SHEET_URL` is the human-facing Google Sheet link used from the admin dashboard. `DEAL_HUNTER_SHEET_CSV_URL` must point to the exact deal tab export URL for imports, for example:
+
+```text
+https://docs.google.com/spreadsheets/d/<sheet-id>/gviz/tq?tqx=out:csv&gid=<deal-tab-gid>
+```
+
+The SMB Deal Hunter Pro document's first tab may be a resource guide. Open the deal tab in Google Sheets, copy its `gid` from the browser URL, and use that `gid` in `DEAL_HUNTER_SHEET_CSV_URL`.
 
 Optional inbound automation:
 
 - `DEAL_HUNTER_WEBHOOK_SECRET`
 
 When the webhook secret is set, an email-forwarding tool can POST the daily email body to `/api/deal-hunter/inbound` with the secret in `X-Deal-Hunter-Secret`. Viewing results remains admin-only.
+
+The current scoring is deterministic and auditable. AI can be layered in later for narrative memo writing or deeper diligence prompts, but the first-pass score intentionally avoids sending deal data to a third-party model provider.
 
 ## Production Paths
 

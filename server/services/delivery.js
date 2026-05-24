@@ -322,6 +322,13 @@ export async function sendDealHunterDigestEmail({ to, run, criteria, candidates,
         )
       : ['No companies cleared the qualified or watchlist thresholds.']),
     '',
+    'Broker questions to ask:',
+    ...(topCandidates.length > 0
+      ? topCandidates
+          .flatMap((candidate) => (candidate.broker_questions || []).slice(0, 2).map((question) => `- ${candidate.company}: ${question}`))
+          .slice(0, 12)
+      : ['No broker questions generated.']),
+    '',
     'Criteria recommendations:',
     ...(recommendations.length > 0
       ? recommendations.map((recommendation) => `- ${recommendation.title}: ${recommendation.recommendation}`)
@@ -347,6 +354,16 @@ export async function sendDealHunterDigestEmail({ to, run, criteria, candidates,
                     <div>Score ${candidate.score} | Recession ${candidate.recession_score} | AI resistance ${candidate.ai_resistance_score}</div>
                     <div>${escapeHtml(candidate.location || 'Location not listed')} | Profit ${escapeHtml(formatDealHunterMoney(candidate.annual_profit))}</div>
                     <div>${escapeHtml(candidate.reasons?.[0] || 'Review manually')}</div>
+                    ${
+                      candidate.notes?.length
+                        ? `<div style="color:#51615A;">${escapeHtml(candidate.notes[0])}</div>`
+                        : ''
+                    }
+                    ${
+                      candidate.broker_questions?.length
+                        ? `<div><strong>Ask broker:</strong> ${escapeHtml(candidate.broker_questions[0])}</div>`
+                        : ''
+                    }
                   </li>
                 `,
               )

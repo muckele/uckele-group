@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
 const isProduction = process.env.NODE_ENV === 'production';
+const defaultDealHunterSheetId = '1d2mC6oKDY7DFQiaNQnF947Ro5CBwjIcAw_fwya7bpBc';
+const defaultDealHunterSheetUrl = `https://docs.google.com/spreadsheets/d/${defaultDealHunterSheetId}/edit?usp=sharing`;
 
 function numberFromEnv(value, fallback) {
   const parsed = Number(value);
@@ -99,6 +101,8 @@ export function getConfig() {
     dealHunter: {
       digestRecipient: process.env.DEAL_HUNTER_DIGEST_EMAIL || adminEmail,
       webhookSecret: process.env.DEAL_HUNTER_WEBHOOK_SECRET || '',
+      sheetUrl: process.env.DEAL_HUNTER_SHEET_URL || defaultDealHunterSheetUrl,
+      sheetCsvUrl: process.env.DEAL_HUNTER_SHEET_CSV_URL || '',
       minimumQualifiedScore: numberFromEnv(process.env.DEAL_HUNTER_MINIMUM_QUALIFIED_SCORE, 72),
       watchScore: numberFromEnv(process.env.DEAL_HUNTER_WATCH_SCORE, 58),
     },

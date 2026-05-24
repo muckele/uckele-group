@@ -49,6 +49,9 @@ function normalizeDealHunterCandidateRow(row) {
         risks: Array.isArray(row.risks) ? row.risks : [],
         matched_keywords: Array.isArray(row.matched_keywords) ? row.matched_keywords : [],
         excluded_reasons: Array.isArray(row.excluded_reasons) ? row.excluded_reasons : [],
+        notes: Array.isArray(row.notes) ? row.notes : [],
+        broker_questions: Array.isArray(row.broker_questions) ? row.broker_questions : [],
+        owner_questions: Array.isArray(row.owner_questions) ? row.owner_questions : [],
       }
     : null;
 }
