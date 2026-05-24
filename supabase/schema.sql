@@ -115,3 +115,58 @@ create table if not exists public.secure_documents (
 
 create index if not exists idx_secure_documents_request_id on public.secure_documents (request_id, created_at desc);
 create index if not exists idx_secure_documents_submission_id on public.secure_documents (submission_id, created_at desc);
+
+create table if not exists public.deal_hunter_criteria (
+  id text primary key,
+  updated_at timestamptz not null,
+  updated_by text,
+  criteria jsonb not null default '{}'::jsonb
+);
+
+create table if not exists public.deal_hunter_runs (
+  id uuid primary key,
+  created_at timestamptz not null,
+  source text not null,
+  subject text,
+  raw_text text,
+  criteria_snapshot jsonb not null default '{}'::jsonb,
+  qualified_count integer not null default 0,
+  watch_count integer not null default 0,
+  rejected_count integer not null default 0,
+  recommendation_count integer not null default 0,
+  digest_status text not null,
+  digest_error text,
+  recommendations jsonb not null default '[]'::jsonb,
+  requested_by text
+);
+
+create index if not exists idx_deal_hunter_runs_created_at on public.deal_hunter_runs (created_at desc);
+
+create table if not exists public.deal_hunter_candidates (
+  id uuid primary key,
+  run_id uuid not null references public.deal_hunter_runs(id) on delete cascade,
+  created_at timestamptz not null,
+  company text not null,
+  location text,
+  industry text,
+  description text,
+  asking_price bigint,
+  annual_profit bigint,
+  annual_revenue bigint,
+  years_in_business integer,
+  source_url text,
+  broker text,
+  raw_text text,
+  score integer not null,
+  recession_score integer not null,
+  ai_resistance_score integer not null,
+  criteria_score integer not null,
+  status text not null,
+  reasons jsonb not null default '[]'::jsonb,
+  risks jsonb not null default '[]'::jsonb,
+  matched_keywords jsonb not null default '[]'::jsonb,
+  excluded_reasons jsonb not null default '[]'::jsonb
+);
+
+create index if not exists idx_deal_hunter_candidates_run_id on public.deal_hunter_candidates (run_id, score desc);
+create index if not exists idx_deal_hunter_candidates_status on public.deal_hunter_candidates (status, score desc);

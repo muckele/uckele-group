@@ -21,6 +21,38 @@ function normalizeUploadRequestRow(row) {
     : null;
 }
 
+function normalizeDealHunterCriteriaRow(row) {
+  return row
+    ? {
+        ...row,
+        criteria: typeof row.criteria === 'object' && row.criteria !== null ? row.criteria : {},
+      }
+    : null;
+}
+
+function normalizeDealHunterRunRow(row) {
+  return row
+    ? {
+        ...row,
+        criteria_snapshot:
+          typeof row.criteria_snapshot === 'object' && row.criteria_snapshot !== null ? row.criteria_snapshot : {},
+        recommendations: Array.isArray(row.recommendations) ? row.recommendations : [],
+      }
+    : null;
+}
+
+function normalizeDealHunterCandidateRow(row) {
+  return row
+    ? {
+        ...row,
+        reasons: Array.isArray(row.reasons) ? row.reasons : [],
+        risks: Array.isArray(row.risks) ? row.risks : [],
+        matched_keywords: Array.isArray(row.matched_keywords) ? row.matched_keywords : [],
+        excluded_reasons: Array.isArray(row.excluded_reasons) ? row.excluded_reasons : [],
+      }
+    : null;
+}
+
 export function createSupabaseStorage(config) {
   if (!config.storage.supabaseUrl || !config.storage.supabaseServiceRoleKey) {
     throw new Error('Supabase storage provider requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.');
@@ -268,6 +300,110 @@ export function createSupabaseStorage(config) {
       }
 
       return data || [];
+    },
+
+    async getDealHunterCriteria(id = 'default') {
+      const { data, error } = await client.from('deal_hunter_criteria').select('*').eq('id', id).maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      return normalizeDealHunterCriteriaRow(data);
+    },
+
+    async upsertDealHunterCriteria(record) {
+      const { data, error } = await client.from('deal_hunter_criteria').upsert(record).select().single();
+
+      if (error) {
+        throw error;
+      }
+
+      return normalizeDealHunterCriteriaRow(data);
+    },
+
+    async insertDealHunterRun(run, candidates = []) {
+      const { data, error } = await client.from('deal_hunter_runs').insert(run).select().single();
+
+      if (error) {
+        throw error;
+      }
+
+      if (candidates.length > 0) {
+        const { error: candidatesError } = await client.from('deal_hunter_candidates').insert(
+          candidates.map((candidate) => ({
+            ...candidate,
+            run_id: run.id,
+          })),
+        );
+
+        if (candidatesError) {
+          throw candidatesError;
+        }
+      }
+
+      return normalizeDealHunterRunRow(data);
+    },
+
+    async updateDealHunterRun(id, values) {
+      const { data, error } = await client.from('deal_hunter_runs').update(values).eq('id', id).select().single();
+
+      if (error) {
+        throw error;
+      }
+
+      return normalizeDealHunterRunRow(data);
+    },
+
+    async getDealHunterRun(id) {
+      const { data, error } = await client.from('deal_hunter_runs').select('*').eq('id', id).maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      return normalizeDealHunterRunRow(data);
+    },
+
+    async listDealHunterRuns({ limit = 8 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 8, 50));
+      const { data, error } = await client
+        .from('deal_hunter_runs')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(safeLimit);
+
+      if (error) {
+        throw error;
+      }
+
+      return (data || []).map(normalizeDealHunterRunRow);
+    },
+
+    async listDealHunterCandidates({ runId, status = '', limit = 50 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 200));
+      let query = client
+        .from('deal_hunter_candidates')
+        .select('*')
+        .order('score', { ascending: false })
+        .order('created_at', { ascending: false })
+        .limit(safeLimit);
+
+      if (runId) {
+        query = query.eq('run_id', runId);
+      }
+
+      if (status) {
+        query = query.eq('status', status);
+      }
+
+      const { data, error } = await query;
+
+      if (error) {
+        throw error;
+      }
+
+      return (data || []).map(normalizeDealHunterCandidateRow);
     },
   };
 }

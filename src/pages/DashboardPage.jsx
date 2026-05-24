@@ -63,6 +63,16 @@ function formatDateTime(value) {
   return Number.isNaN(date.getTime()) ? 'Not set' : date.toLocaleString();
 }
 
+function formatMoney(value) {
+  const numberValue = Number(value);
+
+  if (!Number.isFinite(numberValue) || numberValue <= 0) {
+    return 'Not listed';
+  }
+
+  return `$${numberValue.toLocaleString()}`;
+}
+
 function buildDraft(submission) {
   return {
     status: submission.status || 'review',
@@ -293,6 +303,12 @@ export default function DashboardPage() {
   const [createDraft, setCreateDraft] = useState(blankRecordDraft());
   const [createPending, setCreatePending] = useState(false);
   const [createError, setCreateError] = useState('');
+  const [dealHunter, setDealHunter] = useState({ criteria: null, runs: [], latestRun: null, candidates: [] });
+  const [dealHunterForm, setDealHunterForm] = useState({ subject: 'SMB Deal Hunter daily email', text: '', sendDigest: true });
+  const [dealHunterLoading, setDealHunterLoading] = useState(false);
+  const [dealHunterPending, setDealHunterPending] = useState(false);
+  const [dealHunterError, setDealHunterError] = useState('');
+  const [dealHunterMessage, setDealHunterMessage] = useState('');
   const deferredSearch = useDeferredValue(filters.search);
 
   async function checkSession() {
@@ -386,6 +402,39 @@ export default function DashboardPage() {
     }
   }
 
+  async function loadDealHunter() {
+    setDealHunterLoading(true);
+    setDealHunterError('');
+
+    try {
+      const response = await fetch('/api/admin/deal-hunter', {
+        credentials: 'same-origin',
+      });
+
+      if (response.status === 401) {
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '' }));
+        return;
+      }
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to load Deal Hunter.');
+      }
+
+      setDealHunter({
+        criteria: result.criteria,
+        runs: result.runs || [],
+        latestRun: result.latestRun || null,
+        candidates: result.candidates || [],
+      });
+    } catch (error) {
+      setDealHunterError(error.message || 'Unable to load Deal Hunter.');
+    } finally {
+      setDealHunterLoading(false);
+    }
+  }
+
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get('admin_token');
 
@@ -402,6 +451,12 @@ export default function DashboardPage() {
       loadDashboard(filters.status, deferredSearch.trim());
     }
   }, [authState.authenticated, deferredSearch, filters.status]);
+
+  useEffect(() => {
+    if (authState.authenticated) {
+      loadDealHunter();
+    }
+  }, [authState.authenticated]);
 
   async function handleMagicLinkRequest(event) {
     event.preventDefault();
@@ -601,6 +656,46 @@ export default function DashboardPage() {
     }
   }
 
+  async function handleDealHunterReview(event) {
+    event.preventDefault();
+    setDealHunterPending(true);
+    setDealHunterError('');
+    setDealHunterMessage('');
+
+    try {
+      const response = await fetch('/api/admin/deal-hunter/review', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(dealHunterForm),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to review the deal email.');
+      }
+
+      setDealHunter((current) => ({
+        ...current,
+        criteria: result.criteria || current.criteria,
+        latestRun: result.run,
+        runs: [result.run, ...(current.runs || []).filter((run) => run.id !== result.run.id)].slice(0, 8),
+        candidates: result.candidates || [],
+      }));
+      setDealHunterForm((current) => ({ ...current, text: '' }));
+      setDealHunterMessage(
+        `Reviewed ${Number(result.run.qualified_count) + Number(result.run.watch_count) + Number(result.run.rejected_count)} listings. ${result.run.qualified_count} qualified and ${result.run.watch_count} watchlisted.`,
+      );
+    } catch (error) {
+      setDealHunterError(error.message || 'Unable to review the deal email.');
+    } finally {
+      setDealHunterPending(false);
+    }
+  }
+
   const summary = dashboardData.summary || {
     total: 0,
     lastSevenDays: 0,
@@ -618,6 +713,9 @@ export default function DashboardPage() {
 
   const submissions = useMemo(() => dashboardData.submissions || [], [dashboardData.submissions]);
   const notifications = useMemo(() => dashboardData.notifications || [], [dashboardData.notifications]);
+  const dealHunterCriteria = dealHunter.criteria || {};
+  const dealHunterCandidates = useMemo(() => dealHunter.candidates || [], [dealHunter.candidates]);
+  const dealHunterRecommendations = dealHunter.latestRun?.recommendations || [];
 
   if (!authState.checked) {
     return (
@@ -791,6 +889,156 @@ export default function DashboardPage() {
           <StatCard icon={MailCheck} label="Last 7 Days" value={summary.lastSevenDays} />
           <StatCard icon={ShieldAlert} label="Spam" value={summary.spam} />
         </div>
+      </section>
+
+      <section className="section-shell mt-8">
+        <Reveal className="panel p-6 sm:p-8">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+            <div>
+              <SectionLabel>Deal Hunter</SectionLabel>
+              <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Daily deal-list review and scoring</h2>
+              <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
+                Paste the SMB Deal Hunter Pro email here to score each listing for recession resistance, AI resistance, fit with your search criteria, and hard exclusions.
+              </p>
+            </div>
+            {dealHunter.latestRun ? (
+              <Pill tone={dealHunter.latestRun.qualified_count > 0 ? 'success' : 'warning'}>
+                {dealHunter.latestRun.qualified_count} qualified
+              </Pill>
+            ) : null}
+          </div>
+
+          <div className="mt-6 grid gap-6 xl:grid-cols-[0.9fr_1.1fr]">
+            <div className="space-y-5">
+              <div className="rounded-[24px] border border-line/80 bg-fog/70 p-5">
+                <div className="flex items-center gap-3">
+                  <ClipboardList className="h-5 w-5 text-moss" />
+                  <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Active scoring profile</p>
+                </div>
+                <div className="mt-4 grid gap-3 text-sm leading-7 text-ink/74 sm:grid-cols-2">
+                  <p><strong>Profit:</strong> {formatMoney(dealHunterCriteria.minAnnualProfit)} - {formatMoney(dealHunterCriteria.maxAnnualProfit)}</p>
+                  <p><strong>States:</strong> {(dealHunterCriteria.targetStates || []).join(', ') || 'Not set'}</p>
+                  <p><strong>Years:</strong> {dealHunterCriteria.minYearsInBusiness || 5}+ minimum</p>
+                  <p><strong>Franchises:</strong> {dealHunterCriteria.includeFranchises ? 'Included' : 'Excluded'}</p>
+                </div>
+                <div className="mt-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Priority industries</p>
+                  <p className="mt-2 text-sm leading-7 text-ink/72">{(dealHunterCriteria.includedIndustries || []).slice(0, 8).join(', ')}</p>
+                </div>
+                <div className="mt-4">
+                  <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Hard exclusions</p>
+                  <p className="mt-2 text-sm leading-7 text-ink/72">{(dealHunterCriteria.excludeKeywords || []).slice(0, 18).join(', ')}</p>
+                </div>
+              </div>
+
+              {dealHunter.latestRun ? (
+                <div className="rounded-[24px] border border-line/80 bg-white/70 p-5">
+                  <SectionLabel>Latest run</SectionLabel>
+                  <div className="mt-4 grid gap-3 text-sm leading-7 text-ink/74 sm:grid-cols-2">
+                    <p><strong>Reviewed:</strong> {formatDateTime(dealHunter.latestRun.created_at)}</p>
+                    <p><strong>Digest:</strong> {dealHunter.latestRun.digest_status}</p>
+                    <p><strong>Watchlist:</strong> {dealHunter.latestRun.watch_count}</p>
+                    <p><strong>Rejected:</strong> {dealHunter.latestRun.rejected_count}</p>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <form className="space-y-5" onSubmit={handleDealHunterReview}>
+              <InputField
+                label="Email subject"
+                onChange={(event) => setDealHunterForm((current) => ({ ...current, subject: event.target.value }))}
+                value={dealHunterForm.subject}
+              />
+
+              <TextAreaField
+                label="Paste daily email"
+                onChange={(event) => setDealHunterForm((current) => ({ ...current, text: event.target.value }))}
+                placeholder="Paste the full SMB Deal Hunter Pro email body here."
+                value={dealHunterForm.text}
+              />
+
+              <label className="flex items-start gap-3 rounded-[22px] border border-line/80 bg-fog/70 px-4 py-4 text-sm leading-7 text-ink/74">
+                <input
+                  checked={dealHunterForm.sendDigest}
+                  className="mt-1 h-4 w-4"
+                  onChange={(event) => setDealHunterForm((current) => ({ ...current, sendDigest: event.target.checked }))}
+                  type="checkbox"
+                />
+                <span>Email me the Deal Hunter digest after scoring this list.</span>
+              </label>
+
+              <button
+                className={primaryActionButtonClass}
+                disabled={dealHunterPending || !dealHunterForm.text.trim()}
+                type="submit"
+              >
+                <MailCheck className="h-4 w-4" />
+                {dealHunterPending ? 'Reviewing Deals...' : 'Review Deal Email'}
+              </button>
+            </form>
+          </div>
+
+          {dealHunterMessage ? (
+            <p className="mt-5 rounded-2xl border border-moss/20 bg-moss/8 px-4 py-3 text-sm font-medium text-moss">{dealHunterMessage}</p>
+          ) : null}
+
+          {dealHunterError ? (
+            <p className="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{dealHunterError}</p>
+          ) : null}
+
+          {dealHunterLoading ? (
+            <p className="mt-5 rounded-2xl border border-line/80 bg-fog/70 px-4 py-3 text-sm text-ink/70">Loading Deal Hunter history...</p>
+          ) : null}
+
+          {dealHunterRecommendations.length > 0 ? (
+            <div className="mt-6 grid gap-4 lg:grid-cols-2">
+              {dealHunterRecommendations.map((recommendation) => (
+                <div
+                  className={`rounded-[24px] border p-5 ${
+                    recommendation.severity === 'warning'
+                      ? 'border-amber-200 bg-amber-50 text-amber-800'
+                      : 'border-sky-200 bg-sky-50 text-sky-800'
+                  }`}
+                  key={`${recommendation.title}-${recommendation.recommendation}`}
+                >
+                  <p className="text-sm font-semibold uppercase tracking-[0.14em]">{recommendation.title}</p>
+                  <p className="mt-3 text-sm leading-7">{recommendation.recommendation}</p>
+                  <p className="mt-3 text-xs leading-6 opacity-80">{recommendation.rationale}</p>
+                </div>
+              ))}
+            </div>
+          ) : null}
+
+          {dealHunterCandidates.length > 0 ? (
+            <div className="mt-6 overflow-hidden rounded-[24px] border border-line/80">
+              <div className="grid grid-cols-[1fr_88px_120px] gap-3 bg-fog/80 px-4 py-3 text-xs font-semibold uppercase tracking-[0.14em] text-moss/80 md:grid-cols-[1.2fr_0.7fr_88px_120px_120px]">
+                <span>Company</span>
+                <span className="hidden md:block">Location</span>
+                <span>Score</span>
+                <span>Status</span>
+                <span className="hidden md:block">Profit</span>
+              </div>
+              {dealHunterCandidates.slice(0, 12).map((candidate) => (
+                <div
+                  className="grid grid-cols-[1fr_88px_120px] gap-3 border-t border-line/80 px-4 py-4 text-sm text-ink/74 md:grid-cols-[1.2fr_0.7fr_88px_120px_120px]"
+                  key={candidate.id}
+                >
+                  <div>
+                    <p className="font-semibold text-ink">{candidate.company}</p>
+                    <p className="mt-1 line-clamp-2 text-xs leading-5 text-ink/62">{candidate.reasons?.[0] || candidate.risks?.[0] || 'Review manually.'}</p>
+                  </div>
+                  <span className="hidden md:block">{candidate.location || 'Not listed'}</span>
+                  <span className="font-semibold text-ink">{candidate.score}</span>
+                  <Pill tone={candidate.status === 'qualified' ? 'success' : candidate.status === 'watch' ? 'warning' : 'danger'}>
+                    {candidate.status}
+                  </Pill>
+                  <span className="hidden md:block">{formatMoney(candidate.annual_profit)}</span>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </Reveal>
       </section>
 
       {notifications.length > 0 ? (

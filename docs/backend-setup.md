@@ -13,6 +13,7 @@ The site now includes:
 - Admin auth rate limiting for password and magic-link requests
 - Workflow fields for assignee, notes, tags, priority, follow-up state, and next action date
 - Secure upload request generation and a seller-facing upload page at `/secure-documents`
+- Admin-only Deal Hunter review for scoring daily SMB Deal Hunter Pro emails
 - Spam protection with honeypot, time-to-submit checks, rate limiting, message heuristics, and optional Cloudflare Turnstile
 - Serverless support through [api/[...path].js](/Users/Matt/Documents/Uckele Group/api/[...path].js)
 
@@ -194,6 +195,27 @@ Optional config:
 - `SECURE_DOCUMENTS_STORAGE_DIR`
 
 Uploads are currently stored on the local filesystem under the configured secure documents directory. That is a good fit for local development or a single Node deployment. For serverless production, you should plan to swap file storage to object storage.
+
+## Deal Hunter
+
+The private admin CRM includes a Deal Hunter panel for daily SMB Deal Hunter Pro emails. Paste the full email into `/admin` to score listings for:
+
+- recession resistance
+- AI resistance
+- fit with the updated search criteria
+- hard exclusions such as food, beverage, hospitality, restaurants, retail, SaaS, and online businesses
+
+Set:
+
+- `DEAL_HUNTER_DIGEST_EMAIL`
+- `DEAL_HUNTER_MINIMUM_QUALIFIED_SCORE`
+- `DEAL_HUNTER_WATCH_SCORE`
+
+Optional inbound automation:
+
+- `DEAL_HUNTER_WEBHOOK_SECRET`
+
+When the webhook secret is set, an email-forwarding tool can POST the daily email body to `/api/deal-hunter/inbound` with the secret in `X-Deal-Hunter-Secret`. Viewing results remains admin-only.
 
 ## Production Paths
 

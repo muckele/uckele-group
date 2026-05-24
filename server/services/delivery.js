@@ -286,6 +286,102 @@ export async function sendSecureUploadInviteEmail({ to, contactName, uploadUrl, 
   });
 }
 
+function formatDealHunterMoney(value) {
+  const numberValue = Number(value);
+
+  if (!Number.isFinite(numberValue) || numberValue <= 0) {
+    return 'Not listed';
+  }
+
+  return `$${numberValue.toLocaleString()}`;
+}
+
+export async function sendDealHunterDigestEmail({ to, run, criteria, candidates, recommendations }) {
+  if (!to) {
+    return { status: 'skipped', error: 'Deal Hunter digest recipient is not configured.' };
+  }
+
+  const qualified = candidates.filter((candidate) => candidate.status === 'qualified');
+  const watch = candidates.filter((candidate) => candidate.status === 'watch');
+  const subject = `Deal Hunter review: ${qualified.length} qualified, ${watch.length} watchlist`;
+  const topCandidates = [...qualified, ...watch].sort((left, right) => right.score - left.score).slice(0, 12);
+  const text = [
+    'Daily Deal Hunter review',
+    '',
+    `Subject: ${run.subject || 'Imported deal list'}`,
+    `Qualified: ${run.qualified_count}`,
+    `Watchlist: ${run.watch_count}`,
+    `Rejected: ${run.rejected_count}`,
+    `Criteria: $${Number(criteria.minAnnualProfit).toLocaleString()}-$${Number(criteria.maxAnnualProfit).toLocaleString()} annual profit`,
+    '',
+    'Top companies:',
+    ...(topCandidates.length > 0
+      ? topCandidates.map(
+          (candidate, index) =>
+            `${index + 1}. ${candidate.company} | Score ${candidate.score} | ${candidate.location || 'Location not listed'} | Profit ${formatDealHunterMoney(candidate.annual_profit)} | ${candidate.reasons?.[0] || 'Review manually'}`,
+        )
+      : ['No companies cleared the qualified or watchlist thresholds.']),
+    '',
+    'Criteria recommendations:',
+    ...(recommendations.length > 0
+      ? recommendations.map((recommendation) => `- ${recommendation.title}: ${recommendation.recommendation}`)
+      : ['No criteria changes recommended from this batch.']),
+  ].join('\n');
+  const html = `
+    <div style="font-family: Arial, sans-serif; color: #18211D; line-height: 1.6;">
+      <h2>Daily Deal Hunter review</h2>
+      <p><strong>${escapeHtml(run.subject || 'Imported deal list')}</strong></p>
+      <table cellpadding="0" cellspacing="0" style="border-collapse: collapse; margin: 16px 0;">
+        <tr><td style="padding: 4px 16px 4px 0;"><strong>Qualified</strong></td><td>${run.qualified_count}</td></tr>
+        <tr><td style="padding: 4px 16px 4px 0;"><strong>Watchlist</strong></td><td>${run.watch_count}</td></tr>
+        <tr><td style="padding: 4px 16px 4px 0;"><strong>Rejected</strong></td><td>${run.rejected_count}</td></tr>
+      </table>
+      <h3>Top companies</h3>
+      ${
+        topCandidates.length > 0
+          ? `<ol>${topCandidates
+              .map(
+                (candidate) => `
+                  <li style="margin-bottom: 14px;">
+                    <strong>${escapeHtml(candidate.company)}</strong>
+                    <div>Score ${candidate.score} | Recession ${candidate.recession_score} | AI resistance ${candidate.ai_resistance_score}</div>
+                    <div>${escapeHtml(candidate.location || 'Location not listed')} | Profit ${escapeHtml(formatDealHunterMoney(candidate.annual_profit))}</div>
+                    <div>${escapeHtml(candidate.reasons?.[0] || 'Review manually')}</div>
+                  </li>
+                `,
+              )
+              .join('')}</ol>`
+          : '<p>No companies cleared the qualified or watchlist thresholds.</p>'
+      }
+      <h3>Criteria recommendations</h3>
+      ${
+        recommendations.length > 0
+          ? `<ul>${recommendations
+              .map(
+                (recommendation) => `
+                  <li style="margin-bottom: 12px;">
+                    <strong>${escapeHtml(recommendation.title)}</strong>
+                    <div>${escapeHtml(recommendation.recommendation)}</div>
+                    <div style="color:#51615A;">${escapeHtml(recommendation.rationale)}</div>
+                  </li>
+                `,
+              )
+              .join('')}</ul>`
+          : '<p>No criteria changes recommended from this batch.</p>'
+      }
+    </div>
+  `;
+
+  return sendMessage({
+    kind: 'deal-hunter-digest',
+    to,
+    subject,
+    headline: 'Daily Deal Hunter review',
+    text,
+    html,
+  });
+}
+
 export async function sendDocumentUploadNotificationEmail({ submission, request, documents }) {
   const config = getConfig();
   const subject = `Documents uploaded for ${submission.company || submission.name}`;

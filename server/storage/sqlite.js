@@ -35,6 +35,42 @@ function normalizeUploadRequestRow(row) {
     : null;
 }
 
+function normalizeDealHunterCriteriaRow(row) {
+  return row
+    ? {
+        ...row,
+        criteria: parseJsonColumn(row.criteria, {}),
+      }
+    : null;
+}
+
+function normalizeDealHunterRunRow(row) {
+  return row
+    ? {
+        ...row,
+        criteria_snapshot: parseJsonColumn(row.criteria_snapshot, {}),
+        recommendations: parseJsonColumn(row.recommendations, []),
+      }
+    : null;
+}
+
+function normalizeDealHunterCandidateRow(row) {
+  return row
+    ? {
+        ...row,
+        annual_profit: row.annual_profit === null || row.annual_profit === undefined ? null : Number(row.annual_profit),
+        annual_revenue: row.annual_revenue === null || row.annual_revenue === undefined ? null : Number(row.annual_revenue),
+        asking_price: row.asking_price === null || row.asking_price === undefined ? null : Number(row.asking_price),
+        years_in_business:
+          row.years_in_business === null || row.years_in_business === undefined ? null : Number(row.years_in_business),
+        reasons: parseJsonColumn(row.reasons, []),
+        risks: parseJsonColumn(row.risks, []),
+        matched_keywords: parseJsonColumn(row.matched_keywords, []),
+        excluded_reasons: parseJsonColumn(row.excluded_reasons, []),
+      }
+    : null;
+}
+
 function ensureColumn(database, tableName, columnName, definition) {
   const columns = database.prepare(`PRAGMA table_info(${tableName})`).all();
   const hasColumn = columns.some((column) => column.name === columnName);
@@ -148,6 +184,60 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_secure_upload_requests_submission_id ON secure_upload_requests(submission_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_secure_documents_submission_id ON secure_documents(submission_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_secure_documents_request_id ON secure_documents(request_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS deal_hunter_criteria (
+      id TEXT PRIMARY KEY,
+      updated_at TEXT NOT NULL,
+      updated_by TEXT,
+      criteria TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS deal_hunter_runs (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      source TEXT NOT NULL,
+      subject TEXT,
+      raw_text TEXT,
+      criteria_snapshot TEXT NOT NULL,
+      qualified_count INTEGER NOT NULL DEFAULT 0,
+      watch_count INTEGER NOT NULL DEFAULT 0,
+      rejected_count INTEGER NOT NULL DEFAULT 0,
+      recommendation_count INTEGER NOT NULL DEFAULT 0,
+      digest_status TEXT NOT NULL,
+      digest_error TEXT,
+      recommendations TEXT NOT NULL DEFAULT '[]',
+      requested_by TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS deal_hunter_candidates (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      company TEXT NOT NULL,
+      location TEXT,
+      industry TEXT,
+      description TEXT,
+      asking_price INTEGER,
+      annual_profit INTEGER,
+      annual_revenue INTEGER,
+      years_in_business INTEGER,
+      source_url TEXT,
+      broker TEXT,
+      raw_text TEXT,
+      score INTEGER NOT NULL,
+      recession_score INTEGER NOT NULL,
+      ai_resistance_score INTEGER NOT NULL,
+      criteria_score INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      reasons TEXT NOT NULL DEFAULT '[]',
+      risks TEXT NOT NULL DEFAULT '[]',
+      matched_keywords TEXT NOT NULL DEFAULT '[]',
+      excluded_reasons TEXT NOT NULL DEFAULT '[]'
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_runs_created_at ON deal_hunter_runs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_candidates_run_id ON deal_hunter_candidates(run_id, score DESC);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_candidates_status ON deal_hunter_candidates(status, score DESC);
   `);
 
   ensureColumn(database, 'contact_submissions', 'lead_type', "TEXT NOT NULL DEFAULT 'owner'");
@@ -335,6 +425,110 @@ export function createSqliteStorage(config) {
       @uploaded_by_email,
       @note,
       @nda_accepted_at
+    )
+  `);
+
+  const upsertDealHunterCriteriaStatement = database.prepare(`
+    INSERT INTO deal_hunter_criteria (
+      id,
+      updated_at,
+      updated_by,
+      criteria
+    ) VALUES (
+      @id,
+      @updated_at,
+      @updated_by,
+      @criteria
+    )
+    ON CONFLICT(id) DO UPDATE SET
+      updated_at = excluded.updated_at,
+      updated_by = excluded.updated_by,
+      criteria = excluded.criteria
+  `);
+
+  const insertDealHunterRunStatement = database.prepare(`
+    INSERT INTO deal_hunter_runs (
+      id,
+      created_at,
+      source,
+      subject,
+      raw_text,
+      criteria_snapshot,
+      qualified_count,
+      watch_count,
+      rejected_count,
+      recommendation_count,
+      digest_status,
+      digest_error,
+      recommendations,
+      requested_by
+    ) VALUES (
+      @id,
+      @created_at,
+      @source,
+      @subject,
+      @raw_text,
+      @criteria_snapshot,
+      @qualified_count,
+      @watch_count,
+      @rejected_count,
+      @recommendation_count,
+      @digest_status,
+      @digest_error,
+      @recommendations,
+      @requested_by
+    )
+  `);
+
+  const insertDealHunterCandidateStatement = database.prepare(`
+    INSERT INTO deal_hunter_candidates (
+      id,
+      run_id,
+      created_at,
+      company,
+      location,
+      industry,
+      description,
+      asking_price,
+      annual_profit,
+      annual_revenue,
+      years_in_business,
+      source_url,
+      broker,
+      raw_text,
+      score,
+      recession_score,
+      ai_resistance_score,
+      criteria_score,
+      status,
+      reasons,
+      risks,
+      matched_keywords,
+      excluded_reasons
+    ) VALUES (
+      @id,
+      @run_id,
+      @created_at,
+      @company,
+      @location,
+      @industry,
+      @description,
+      @asking_price,
+      @annual_profit,
+      @annual_revenue,
+      @years_in_business,
+      @source_url,
+      @broker,
+      @raw_text,
+      @score,
+      @recession_score,
+      @ai_resistance_score,
+      @criteria_score,
+      @status,
+      @reasons,
+      @risks,
+      @matched_keywords,
+      @excluded_reasons
     )
   `);
 
@@ -560,6 +754,94 @@ export function createSqliteStorage(config) {
       return database
         .prepare('SELECT * FROM secure_documents WHERE submission_id = ? ORDER BY created_at DESC')
         .all(submissionId);
+    },
+
+    async getDealHunterCriteria(id = 'default') {
+      const row = database.prepare('SELECT * FROM deal_hunter_criteria WHERE id = ?').get(id);
+      return normalizeDealHunterCriteriaRow(row);
+    },
+
+    async upsertDealHunterCriteria(record) {
+      upsertDealHunterCriteriaStatement.run({
+        ...record,
+        criteria: JSON.stringify(record.criteria || {}),
+      });
+
+      return this.getDealHunterCriteria(record.id);
+    },
+
+    async insertDealHunterRun(run, candidates = []) {
+      const insertRunWithCandidates = database.transaction(() => {
+        insertDealHunterRunStatement.run({
+          ...run,
+          criteria_snapshot: JSON.stringify(run.criteria_snapshot || {}),
+          recommendations: JSON.stringify(run.recommendations || []),
+        });
+
+        candidates.forEach((candidate) => {
+          insertDealHunterCandidateStatement.run({
+            ...candidate,
+            run_id: run.id,
+            reasons: JSON.stringify(candidate.reasons || []),
+            risks: JSON.stringify(candidate.risks || []),
+            matched_keywords: JSON.stringify(candidate.matched_keywords || []),
+            excluded_reasons: JSON.stringify(candidate.excluded_reasons || []),
+          });
+        });
+      });
+
+      insertRunWithCandidates();
+      return this.getDealHunterRun(run.id);
+    },
+
+    async updateDealHunterRun(id, values) {
+      updateRecord(
+        'deal_hunter_runs',
+        id,
+        values,
+        ['digest_status', 'digest_error', 'recommendations'],
+        ['recommendations'],
+      );
+
+      return this.getDealHunterRun(id);
+    },
+
+    async getDealHunterRun(id) {
+      const row = database.prepare('SELECT * FROM deal_hunter_runs WHERE id = ?').get(id);
+      return normalizeDealHunterRunRow(row);
+    },
+
+    async listDealHunterRuns({ limit = 8 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 8, 50));
+      return database
+        .prepare('SELECT * FROM deal_hunter_runs ORDER BY created_at DESC LIMIT ?')
+        .all(safeLimit)
+        .map(normalizeDealHunterRunRow);
+    },
+
+    async listDealHunterCandidates({ runId, status = '', limit = 50 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 200));
+
+      if (runId && status) {
+        return database
+          .prepare(
+            'SELECT * FROM deal_hunter_candidates WHERE run_id = ? AND status = ? ORDER BY score DESC, created_at DESC LIMIT ?',
+          )
+          .all(runId, status, safeLimit)
+          .map(normalizeDealHunterCandidateRow);
+      }
+
+      if (runId) {
+        return database
+          .prepare('SELECT * FROM deal_hunter_candidates WHERE run_id = ? ORDER BY score DESC, created_at DESC LIMIT ?')
+          .all(runId, safeLimit)
+          .map(normalizeDealHunterCandidateRow);
+      }
+
+      return database
+        .prepare('SELECT * FROM deal_hunter_candidates ORDER BY created_at DESC LIMIT ?')
+        .all(safeLimit)
+        .map(normalizeDealHunterCandidateRow);
     },
   };
 }

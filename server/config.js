@@ -96,6 +96,12 @@ export function getConfig() {
       maxUploadBytes: numberFromEnv(process.env.SECURE_DOCUMENTS_MAX_UPLOAD_BYTES, 8 * 1024 * 1024),
       storageDir: process.env.SECURE_DOCUMENTS_STORAGE_DIR || path.join(rootDir, 'data', 'secure-documents'),
     },
+    dealHunter: {
+      digestRecipient: process.env.DEAL_HUNTER_DIGEST_EMAIL || adminEmail,
+      webhookSecret: process.env.DEAL_HUNTER_WEBHOOK_SECRET || '',
+      minimumQualifiedScore: numberFromEnv(process.env.DEAL_HUNTER_MINIMUM_QUALIFIED_SCORE, 72),
+      watchScore: numberFromEnv(process.env.DEAL_HUNTER_WATCH_SCORE, 58),
+    },
     protection: {
       rateLimitWindowMs: numberFromEnv(process.env.RATE_LIMIT_WINDOW_MS, 1000 * 60 * 10),
       rateLimitMax: numberFromEnv(process.env.RATE_LIMIT_MAX, 6),

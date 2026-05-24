@@ -20,6 +20,12 @@ import {
   uploadSecureDocuments,
 } from './services/documentVault.js';
 import {
+  getDealHunterOverview,
+  reviewDealHunterEmail,
+  reviewDealHunterWebhook,
+  updateDealHunterCriteria,
+} from './services/dealHunter.js';
+import {
   createManualSubmission,
   exportDashboardSubmissionsCsv,
   listDashboardSubmissions,
@@ -61,6 +67,39 @@ export function createApp() {
     asyncRoute(async (request, response) => {
       const result = await submitContactLead(request.body || {}, request);
       response.status(result.status).json(result.body);
+    }),
+  );
+
+  app.post(
+    '/api/deal-hunter/inbound',
+    asyncRoute(async (request, response) => {
+      const body = request.body || {};
+      const result = await reviewDealHunterWebhook({
+        secret: request.headers['x-deal-hunter-secret'] || body.secret || '',
+        subject: body.subject || '',
+        text: body.text || body.body || '',
+        html: body.html || '',
+      });
+
+      if (!result.ok) {
+        response.status(result.status).json({ success: false, error: result.error });
+        return;
+      }
+
+      response.json({
+        success: true,
+        run: {
+          id: result.result.run.id,
+          created_at: result.result.run.created_at,
+          qualified_count: result.result.run.qualified_count,
+          watch_count: result.result.run.watch_count,
+          rejected_count: result.result.run.rejected_count,
+          digest_status: result.result.run.digest_status,
+        },
+        qualifiedCount: result.result.run.qualified_count,
+        watchCount: result.result.run.watch_count,
+        rejectedCount: result.result.run.rejected_count,
+      });
     }),
   );
 
@@ -159,6 +198,66 @@ export function createApp() {
         page: Number(request.query.page) || 1,
         search: String(request.query.search || ''),
         status: String(request.query.status || 'all'),
+      });
+
+      response.json({
+        success: true,
+        ...result,
+      });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter',
+    asyncRoute(async (request, response) => {
+      if (!requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const overview = await getDealHunterOverview();
+      response.json({
+        success: true,
+        ...overview,
+      });
+    }),
+  );
+
+  app.patch(
+    '/api/admin/deal-hunter/criteria',
+    asyncRoute(async (request, response) => {
+      const session = requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const criteria = await updateDealHunterCriteria(request.body || {}, session.username);
+      response.json({
+        success: true,
+        criteria: criteria.criteria,
+      });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/review',
+    asyncRoute(async (request, response) => {
+      const session = requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const body = request.body || {};
+      const result = await reviewDealHunterEmail({
+        subject: body.subject || '',
+        text: body.text || '',
+        source: 'manual-admin-import',
+        requestedBy: session.username,
+        sendDigest: body.sendDigest !== false,
       });
 
       response.json({
