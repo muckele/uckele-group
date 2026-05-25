@@ -57,6 +57,9 @@ export const defaultDealHunterCriteria = {
     'customer-diversified',
     'owner retiring',
     'management in place',
+    'general manager',
+    'management team',
+    'operator in place',
     'repeat customers',
     'low customer concentration',
   ],
@@ -98,7 +101,7 @@ export const defaultDealHunterCriteria = {
     'customer concentration',
     'declining revenue',
   ],
-  includeRemote: false,
+  includeRemote: true,
   minYearsInBusiness: 5,
   preferYearsInBusiness: 10,
   includeFranchises: false,
@@ -368,6 +371,10 @@ function normalizeHeader(value) {
     .trim();
 }
 
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function headerMatches(header, aliases) {
   const normalizedHeader = normalizeHeader(header);
   return aliases.some((alias) => normalizedHeader.includes(alias));
@@ -485,14 +492,14 @@ function csvToListingText(csv) {
 }
 
 function extractField(block, labels) {
-  const escaped = labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  const escaped = [...labels].sort((left, right) => right.length - left.length).map(escapeRegExp).join('|');
   const pattern = new RegExp(`(?:^|\\n)\\s*(?:${escaped})\\s*:?\\s*([^\\n]+)`, 'i');
   const match = block.match(pattern);
   return match ? match[1].trim() : '';
 }
 
 function extractMoneyNear(block, labels) {
-  const escaped = labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  const escaped = [...labels].sort((left, right) => right.length - left.length).map(escapeRegExp).join('|');
   const pattern = new RegExp(`(?:${escaped})[^\\n$\\d]{0,40}(\\$?\\s*[\\d,.]+\\s*[kKmM]?)`, 'i');
   const match = block.match(pattern);
   return match ? parseMoney(match[1]) : null;
@@ -612,7 +619,17 @@ function splitListingBlocks(text) {
 
 function keywordMatches(text, keywords) {
   const lower = text.toLowerCase();
-  return keywords.filter((keyword) => lower.includes(keyword.toLowerCase()));
+  return keywords.filter((keyword) => {
+    const normalizedKeyword = String(keyword || '').trim().toLowerCase();
+
+    if (!normalizedKeyword) {
+      return false;
+    }
+
+    const pattern = escapeRegExp(normalizedKeyword).replace(/\s+/g, '\\s+');
+    const regex = new RegExp(`(^|[^a-z0-9])${pattern}($|[^a-z0-9])`, 'i');
+    return regex.test(lower);
+  });
 }
 
 function addSignalScore(text, signals, pointsPerSignal, maxPoints) {
@@ -621,6 +638,44 @@ function addSignalScore(text, signals, pointsPerSignal, maxPoints) {
     matches,
     score: Math.min(maxPoints, matches.length * pointsPerSignal),
   };
+}
+
+function hasManagementDepth(text) {
+  return /\b(management in place|general manager|gm|operations manager|operator in place|manager[-\s]?run|management team|key employees|trained staff|day[-\s]?to[-\s]?day manager|supervisor)\b/i.test(
+    text,
+  );
+}
+
+function hasRemoteAbsenteeSignal(rawText) {
+  const lines = normalizeText(rawText)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  return lines.some((line) => {
+    const normalizedLine = line.toLowerCase();
+    const structuredRemoteMatch = normalizedLine.match(/(?:remote|relocatable|absentee)[^:]{0,80}:\s*(.+)$/i);
+
+    if (structuredRemoteMatch) {
+      const value = structuredRemoteMatch[1].trim();
+
+      if (/^(no|false|n|not\s+available|none)\b/i.test(value)) {
+        return false;
+      }
+
+      if (/^(yes|true|y|available|included|open)\b/i.test(value)) {
+        return true;
+      }
+
+      return /\b(semi[-\s]?absentee|absentee[-\s]?(run|owner|ownership)|remote[-\s]?run|relocatable|work from anywhere)\b/i.test(
+        value,
+      );
+    }
+
+    return /\b(semi[-\s]?absentee|absentee[-\s]?(run|owner|ownership)|remote[-\s]?run|relocatable|work from anywhere)\b/i.test(
+      normalizedLine,
+    );
+  });
 }
 
 function buildCandidateGuidance({ candidate, status, score, reasons, risks, excludedReasons, matchedKeywords }) {
@@ -695,8 +750,13 @@ function scoreCandidate(candidate, criteria) {
     excludedReasons.push('Franchise listing.');
   }
 
-  if (!criteria.includeRemote && /\b(absentee|remote|relocatable|work from anywhere)\b/i.test(text) && !/management in place|general manager/i.test(text)) {
-    risks.push('Remote or absentee language without clear management depth.');
+  const remoteAbsenteeSignal = hasRemoteAbsenteeSignal(candidate.raw_text);
+  const managementDepth = hasManagementDepth(text);
+
+  if (remoteAbsenteeSignal && managementDepth) {
+    reasons.push('Remote or absentee setup appears supported by management depth.');
+  } else if (remoteAbsenteeSignal) {
+    risks.push('Remote or absentee setup needs proof of day-to-day management depth.');
   }
 
   if (candidate.annual_profit !== null) {
@@ -755,11 +815,17 @@ function scoreCandidate(candidate, criteria) {
     criteria_score += Math.min(20, matchedKeywords.length * 4);
   }
 
+  if (remoteAbsenteeSignal && managementDepth) {
+    criteria_score += 12;
+  } else if (remoteAbsenteeSignal) {
+    criteria_score -= 8;
+  }
+
   if (excludedReasons.length === 0) {
     criteria_score += 10;
   }
 
-  criteria_score = Math.min(100, criteria_score);
+  criteria_score = Math.max(0, Math.min(100, criteria_score));
 
   let score = Math.round(recession_score * 0.35 + ai_resistance_score * 0.35 + criteria_score * 0.3);
 
