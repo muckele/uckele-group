@@ -1,3 +1,11 @@
+function safeDecodeURIComponent(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 export function parseCookies(cookieHeader = '') {
   return cookieHeader
     .split(';')
@@ -10,8 +18,8 @@ export function parseCookies(cookieHeader = '') {
         return accumulator;
       }
 
-      const key = decodeURIComponent(pair.slice(0, separator));
-      const value = decodeURIComponent(pair.slice(separator + 1));
+      const key = safeDecodeURIComponent(pair.slice(0, separator));
+      const value = safeDecodeURIComponent(pair.slice(separator + 1));
       accumulator[key] = value;
       return accumulator;
     }, {});

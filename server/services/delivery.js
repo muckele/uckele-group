@@ -40,6 +40,7 @@ async function sendViaResend(message) {
       text: message.text,
       reply_to: message.replyTo || undefined,
     }),
+    signal: AbortSignal.timeout(15000),
   });
 
   if (!response.ok) {
@@ -82,6 +83,7 @@ async function sendViaEmailJs(message) {
         reply_to: message.replyTo || '',
       },
     }),
+    signal: AbortSignal.timeout(15000),
   });
 
   if (!response.ok) {
@@ -116,6 +118,7 @@ async function sendViaFormspree(message) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(message.formspreePayload),
+    signal: AbortSignal.timeout(15000),
   });
 
   if (!response.ok) {
@@ -132,16 +135,23 @@ async function sendViaFormspree(message) {
 async function sendMessage(message) {
   const config = getConfig();
 
-  switch (config.delivery.provider) {
-    case 'resend':
-      return sendViaResend(message);
-    case 'emailjs':
-      return sendViaEmailJs(message);
-    case 'formspree':
-      return sendViaFormspree(message);
-    case 'console':
-    default:
-      return sendViaConsole(message);
+  try {
+    switch (config.delivery.provider) {
+      case 'resend':
+        return sendViaResend(message);
+      case 'emailjs':
+        return sendViaEmailJs(message);
+      case 'formspree':
+        return sendViaFormspree(message);
+      case 'console':
+      default:
+        return sendViaConsole(message);
+    }
+  } catch (error) {
+    return {
+      status: 'failed',
+      error: `${config.delivery.provider} delivery failed: ${error.message || 'Unknown delivery error.'}`.slice(0, 500),
+    };
   }
 }
 

@@ -64,6 +64,15 @@ alter table public.contact_submissions add column if not exists broker_phone tex
 alter table public.contact_submissions add column if not exists seller_name text;
 alter table public.contact_submissions add column if not exists seller_email text;
 alter table public.contact_submissions add column if not exists seller_phone text;
+alter table public.contact_submissions add column if not exists lead_type text not null default 'owner';
+alter table public.contact_submissions add column if not exists priority text not null default 'normal';
+alter table public.contact_submissions add column if not exists tags jsonb not null default '[]'::jsonb;
+alter table public.contact_submissions add column if not exists assigned_to text;
+alter table public.contact_submissions add column if not exists notes text;
+alter table public.contact_submissions add column if not exists follow_up_state text not null default 'needs-response';
+alter table public.contact_submissions add column if not exists next_action_at timestamptz;
+alter table public.contact_submissions add column if not exists last_contacted_at timestamptz;
+alter table public.contact_submissions add column if not exists metadata jsonb not null default '{}'::jsonb;
 
 create index if not exists idx_contact_submissions_created_at on public.contact_submissions (created_at desc);
 create index if not exists idx_contact_submissions_status on public.contact_submissions (status);

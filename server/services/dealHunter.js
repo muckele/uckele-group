@@ -374,7 +374,7 @@ function headerMatches(header, aliases) {
 }
 
 function getRowValue(row, headers, aliases, usedIndexes) {
-  const index = headers.findIndex((header) => headerMatches(header, aliases));
+  const index = headers.findIndex((header, headerIndex) => !usedIndexes.has(headerIndex) && headerMatches(header, aliases));
 
   if (index === -1) {
     return '';
@@ -413,10 +413,11 @@ function findCsvHeaderIndex(rows) {
 function csvRowToListingBlock(row, headers, index) {
   const usedIndexes = new Set();
   const company = getRowValue(row, headers, ['company', 'business name', 'business', 'listing title', 'title', 'name'], usedIndexes);
-  const directLocation = getRowValue(row, headers, ['location', 'city state', 'market', 'county'], usedIndexes);
+  const directLocation = getRowValue(row, headers, ['location', 'city state', 'geography'], usedIndexes);
   const city = directLocation ? '' : getRowValue(row, headers, ['city'], usedIndexes);
+  const county = directLocation ? '' : getRowValue(row, headers, ['county'], usedIndexes);
   const state = directLocation ? '' : getRowValue(row, headers, ['state'], usedIndexes);
-  const location = directLocation || [city, state].filter(Boolean).join(', ');
+  const location = directLocation || [city, county, state].filter(Boolean).join(', ');
   const industry = getRowValue(row, headers, ['industry', 'category', 'sector'], usedIndexes);
   const profit = getRowValue(row, headers, ['annual profit', 'cash flow', 'sde', 'ebitda', 'profit'], usedIndexes);
   const revenue = getRowValue(row, headers, ['annual revenue', 'gross revenue', 'revenue', 'sales'], usedIndexes);
@@ -498,6 +499,24 @@ function extractMoneyNear(block, labels) {
 }
 
 function extractYearsInBusiness(block) {
+  const explicit = extractField(block, ['Years in business', 'Years Established', 'Business Age', 'Age']);
+  const explicitMatch = explicit.match(/\d{1,3}/);
+
+  if (explicitMatch) {
+    return Number(explicitMatch[0]);
+  }
+
+  const foundedMatch = block.match(/(?:established|founded|since)\s*(?:in\s*)?(19\d{2}|20\d{2})/i);
+
+  if (foundedMatch) {
+    const foundedYear = Number(foundedMatch[1]);
+    const years = new Date().getFullYear() - foundedYear;
+
+    if (years >= 0 && years <= 200) {
+      return years;
+    }
+  }
+
   const match = block.match(/(\d{1,3})\+?\s*(?:years|yrs)\s*(?:in business|old|operating)?/i);
   return match ? Number(match[1]) : null;
 }

@@ -19,17 +19,28 @@ export async function verifyTurnstileToken(token, remoteIp) {
     };
   }
 
-  const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: new URLSearchParams({
-      secret: config.turnstile.secretKey,
-      response: token,
-      remoteip: remoteIp,
-    }),
-  });
+  let response;
+
+  try {
+    response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        secret: config.turnstile.secretKey,
+        response: token,
+        remoteip: remoteIp,
+      }),
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch {
+    return {
+      enabled: true,
+      success: false,
+      error: 'Anti-spam verification could not be validated.',
+    };
+  }
 
   if (!response.ok) {
     return {

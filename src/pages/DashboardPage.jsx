@@ -313,45 +313,74 @@ export default function DashboardPage() {
   const deferredSearch = useDeferredValue(filters.search);
 
   async function checkSession() {
-    const response = await fetch('/api/admin/session', { credentials: 'same-origin' });
-    const result = await response.json();
+    try {
+      const response = await fetch('/api/admin/session', { credentials: 'same-origin' });
+      const result = await response.json();
 
-    setAuthState({
-      checked: true,
-      authenticated: Boolean(result.authenticated),
-      username: result.username || '',
-      authMode: result.authMode || 'hybrid',
-      magicLinkEnabled: Boolean(result.magicLinkEnabled),
-      passwordEnabled: Boolean(result.passwordEnabled),
-      adminEmailHint: result.adminEmailHint || '',
-    });
+      setAuthState({
+        checked: true,
+        authenticated: Boolean(result.authenticated),
+        username: result.username || '',
+        authMode: result.authMode || 'hybrid',
+        magicLinkEnabled: Boolean(result.magicLinkEnabled),
+        passwordEnabled: Boolean(result.passwordEnabled),
+        adminEmailHint: result.adminEmailHint || '',
+      });
+    } catch {
+      setAuthState((current) => ({
+        ...current,
+        checked: true,
+        authenticated: false,
+        username: '',
+      }));
+    }
   }
 
   async function verifyMagicLink(token) {
-    const response = await fetch('/api/admin/magic-link/verify', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ token }),
-    });
+    try {
+      const response = await fetch('/api/admin/magic-link/verify', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ token }),
+      });
 
-    const result = await response.json();
+      const result = await response.json();
 
-    if (!response.ok || !result.success) {
+      if (!response.ok || !result.success) {
+        setAuthState((current) => ({
+          ...current,
+          checked: true,
+          authenticated: false,
+          username: '',
+        }));
+        setMagicLinkFeedback({
+          error: result.error || 'That sign-in link is invalid or has expired.',
+          message: '',
+          previewUrl: '',
+        });
+        return;
+      }
+
+      const url = new URL(window.location.href);
+      url.searchParams.delete('admin_token');
+      window.history.replaceState({}, '', url.toString());
+      await checkSession();
+    } catch {
+      setAuthState((current) => ({
+        ...current,
+        checked: true,
+        authenticated: false,
+        username: '',
+      }));
       setMagicLinkFeedback({
-        error: result.error || 'That sign-in link is invalid or has expired.',
+        error: 'Unable to verify that sign-in link. Please request a new one.',
         message: '',
         previewUrl: '',
       });
-      return;
     }
-
-    const url = new URL(window.location.href);
-    url.searchParams.delete('admin_token');
-    window.history.replaceState({}, '', url.toString());
-    await checkSession();
   }
 
   async function loadDashboard(status, search) {

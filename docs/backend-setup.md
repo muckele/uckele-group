@@ -220,7 +220,13 @@ Set:
 https://docs.google.com/spreadsheets/d/<sheet-id>/gviz/tq?tqx=out:csv&gid=<deal-tab-gid>
 ```
 
-The SMB Deal Hunter Pro document's first tab may be a resource guide. Open the deal tab in Google Sheets, copy its `gid` from the browser URL, and use that `gid` in `DEAL_HUNTER_SHEET_CSV_URL`.
+For the current SMB Deal Hunter Pro sheet, the deal tab is `On-Market` with `gid=697021806`:
+
+```text
+https://docs.google.com/spreadsheets/d/1d2mC6oKDY7DFQiaNQnF947Ro5CBwjIcAw_fwya7bpBc/gviz/tq?tqx=out:csv&gid=697021806
+```
+
+The SMB Deal Hunter Pro document's first tab is a resource guide. If the team later adds a new active deal tab, open that deal tab in Google Sheets, copy its `gid` from the browser URL, and use that `gid` in `DEAL_HUNTER_SHEET_CSV_URL`.
 
 Optional inbound automation:
 

@@ -54,12 +54,13 @@ function normalizeDocumentType(value) {
 
 function validateDocumentPayload(document) {
   const errors = [];
+  const mimeType = String(document.mimeType || '').trim().toLowerCase();
 
   if (!document.name || !document.contentBase64) {
     errors.push('Each uploaded file must include a name and file content.');
   }
 
-  if (document.mimeType && !allowedMimeTypes.has(document.mimeType)) {
+  if (!mimeType || !allowedMimeTypes.has(mimeType)) {
     errors.push(`${document.name || 'A file'} uses a file type that is not allowed.`);
   }
 
@@ -174,6 +175,11 @@ export async function getSecureUploadContext(token) {
   }
 
   const submission = await storage.getSubmission(requestRecord.submission_id);
+
+  if (!submission) {
+    return { ok: false, error: 'The submission for this secure document request could not be found.' };
+  }
+
   const documents = await storage.listSecureDocumentsByRequest(requestRecord.id);
 
   return {
@@ -238,7 +244,7 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
       document_type: normalizeDocumentType(document.documentType),
       file_name: safeStoredName,
       original_name: safeOriginalName,
-      mime_type: String(document.mimeType || 'application/octet-stream'),
+      mime_type: String(document.mimeType || '').trim().toLowerCase(),
       size_bytes: buffer.byteLength,
       storage_path: storagePath,
       uploaded_by_email: context.request.email,
