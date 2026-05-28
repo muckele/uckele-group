@@ -306,6 +306,61 @@ function formatDealHunterMoney(value) {
   return `$${numberValue.toLocaleString()}`;
 }
 
+function buildDealHunterRemovalReason(candidate, criteria, config) {
+  if (candidate.status !== 'rejected') {
+    return '';
+  }
+
+  const excludedReasons = Array.isArray(candidate.excluded_reasons) ? candidate.excluded_reasons : [];
+  const risks = Array.isArray(candidate.risks) ? candidate.risks : [];
+  const annualProfit = Number(candidate.annual_profit);
+  const minProfit = Number(criteria.minAnnualProfit);
+  const maxProfit = Number(criteria.maxAnnualProfit);
+
+  if (excludedReasons.length > 0) {
+    return `Hard exclusion: ${excludedReasons.join(' ')} This conflicts with your buying strategy, so I would remove it from future updates.`;
+  }
+
+  if (Number.isFinite(annualProfit) && Number.isFinite(minProfit) && annualProfit < minProfit) {
+    return `Below target profit: ${formatDealHunterMoney(annualProfit)} vs your ${formatDealHunterMoney(minProfit)} floor. The business is likely too small for the strategy.`;
+  }
+
+  if (Number.isFinite(annualProfit) && Number.isFinite(maxProfit) && annualProfit > maxProfit) {
+    return `Above target profit: ${formatDealHunterMoney(annualProfit)} vs your ${formatDealHunterMoney(maxProfit)} ceiling. It is likely outside your acquisition size range.`;
+  }
+
+  if (Number(candidate.ai_resistance_score) < 45) {
+    return `Weak AI-resistance fit: AI resistance score ${candidate.ai_resistance_score}. I would remove it unless the listing proves durable field-service or regulated work.`;
+  }
+
+  if (Number(candidate.recession_score) < 45) {
+    return `Weak recession-resilience fit: recession score ${candidate.recession_score}. It does not show enough essential, recurring, or contract-based demand.`;
+  }
+
+  if (risks.length >= 3) {
+    return `Too many diligence risks for the current profile: ${risks.slice(0, 3).join(' ')} I would remove it unless the broker can quickly disprove these issues.`;
+  }
+
+  if (Number(candidate.score) < config.dealHunter.watchScore) {
+    return `Low strategy fit: score ${candidate.score}, below the watchlist threshold of ${config.dealHunter.watchScore}. It is not close enough to spend time on.`;
+  }
+
+  return '';
+}
+
+function getDealHunterRemovalCandidates(candidates, criteria) {
+  const config = getConfig();
+
+  return candidates
+    .map((candidate) => ({
+      ...candidate,
+      removal_reason: buildDealHunterRemovalReason(candidate, criteria, config),
+    }))
+    .filter((candidate) => candidate.removal_reason)
+    .sort((left, right) => left.score - right.score)
+    .slice(0, 10);
+}
+
 export async function sendDealHunterDigestEmail({ to, run, criteria, candidates, recommendations }) {
   if (!to) {
     return { status: 'skipped', error: 'Deal Hunter digest recipient is not configured.' };
@@ -315,6 +370,7 @@ export async function sendDealHunterDigestEmail({ to, run, criteria, candidates,
   const watch = candidates.filter((candidate) => candidate.status === 'watch');
   const subject = `Deal Hunter review: ${qualified.length} qualified, ${watch.length} watchlist`;
   const topCandidates = [...qualified, ...watch].sort((left, right) => right.score - left.score).slice(0, 12);
+  const removalCandidates = getDealHunterRemovalCandidates(candidates, criteria);
   const text = [
     'Daily Deal Hunter review',
     '',
@@ -338,6 +394,14 @@ export async function sendDealHunterDigestEmail({ to, run, criteria, candidates,
           .flatMap((candidate) => (candidate.broker_questions || []).slice(0, 2).map((question) => `- ${candidate.company}: ${question}`))
           .slice(0, 12)
       : ['No broker questions generated.']),
+    '',
+    'Suggested removals from next update:',
+    ...(removalCandidates.length > 0
+      ? removalCandidates.map(
+          (candidate, index) =>
+            `${index + 1}. ${candidate.company} | Score ${candidate.score} | ${candidate.location || 'Location not listed'} | Profit ${formatDealHunterMoney(candidate.annual_profit)} | ${candidate.removal_reason}`,
+        )
+      : ['No high-confidence removals from this batch.']),
     '',
     'Criteria recommendations:',
     ...(recommendations.length > 0
@@ -379,6 +443,23 @@ export async function sendDealHunterDigestEmail({ to, run, criteria, candidates,
               )
               .join('')}</ol>`
           : '<p>No companies cleared the qualified or watchlist thresholds.</p>'
+      }
+      <h3>Suggested removals from next update</h3>
+      <p style="color:#51615A;">These are rejected deals I would exclude from future SMB Deal Hunter updates because they conflict with your buying strategy.</p>
+      ${
+        removalCandidates.length > 0
+          ? `<ul>${removalCandidates
+              .map(
+                (candidate) => `
+                  <li style="margin-bottom: 12px;">
+                    <strong>${escapeHtml(candidate.company)}</strong>
+                    <div>Score ${candidate.score} | ${escapeHtml(candidate.location || 'Location not listed')} | Profit ${escapeHtml(formatDealHunterMoney(candidate.annual_profit))}</div>
+                    <div>${escapeHtml(candidate.removal_reason)}</div>
+                  </li>
+                `,
+              )
+              .join('')}</ul>`
+          : '<p>No high-confidence removals from this batch.</p>'
       }
       <h3>Criteria recommendations</h3>
       ${

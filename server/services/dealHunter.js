@@ -645,6 +645,21 @@ function keywordMatches(text, keywords) {
   });
 }
 
+function uniqueKeywordMatches(matches) {
+  const seen = new Set();
+
+  return matches.filter((keyword) => {
+    const normalizedKeyword = String(keyword || '').trim().toLowerCase();
+
+    if (!normalizedKeyword || seen.has(normalizedKeyword)) {
+      return false;
+    }
+
+    seen.add(normalizedKeyword);
+    return true;
+  });
+}
+
 function softRiskMatches(text, keywords) {
   return keywordMatches(text, keywords).filter((keyword) => {
     if (keyword === 'customer concentration' && /\b(low|limited|diversified|no)\s+customer concentration\b/i.test(text)) {
@@ -821,7 +836,7 @@ function scoreCandidate(candidate, criteria) {
   const excludedReasons = [];
   const matchedKeywords = keywordMatches(text, criteria.includeKeywords);
   const matchedIndustries = keywordMatches(`${candidate.industry} ${candidate.description}`, criteria.includedIndustries);
-  const excludedKeywordMatches = keywordMatches(text, [...criteria.excludeKeywords, ...criteria.excludedIndustries]);
+  const excludedKeywordMatches = uniqueKeywordMatches(keywordMatches(text, [...criteria.excludeKeywords, ...criteria.excludedIndustries]));
   const matchedSoftRisks = softRiskMatches(text, criteria.softRiskKeywords);
   const profitInRange =
     candidate.annual_profit !== null &&
