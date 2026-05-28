@@ -10,12 +10,14 @@ export const defaultDealHunterCriteria = {
   minAnnualProfit: 500000,
   maxAnnualProfit: 1500000,
   targetStates: ['NY', 'NJ', 'CT', 'PA', 'MA', 'AZ', 'NV', 'CA'],
-  targetCities: [],
-  targetCounties: [],
+  targetCities: ['New York, NY', 'Fontana, CA', 'West Covina, CA', 'Rancho Cucamonga, CA', 'San Diego, CA'],
+  targetCounties: ['Orange, CA', 'San Bernardino, CA', 'Los Angeles, CA', 'New York, NY', 'Westchester, NY', 'Hudson, NJ', 'Kings, NY', 'Queens, NY'],
   includedIndustries: [
     'Home and Property Services',
     'Business and Professional Services',
     'Healthcare Services',
+    'Healthcare',
+    'Medical',
     'Commercial Services',
     'Industrial Services',
     'Facility Services',
@@ -23,6 +25,15 @@ export const defaultDealHunterCriteria = {
     'Environmental Services',
     'Testing, Inspection, and Compliance',
     'Repair and Maintenance Services',
+    'Building & Construction',
+    'HVAC',
+    'Plumbing',
+    'Electrical',
+    'Roofing',
+    'Fire Safety',
+    'Commercial Cleaning',
+    'Pest Control',
+    'Landscaping',
   ],
   excludedIndustries: [
     'Food and Beverage',
@@ -34,7 +45,6 @@ export const defaultDealHunterCriteria = {
     'Software',
     'IT Services',
     'Online Business',
-    'Fitness',
   ],
   includeKeywords: [
     'recurring revenue',
@@ -82,7 +92,6 @@ export const defaultDealHunterCriteria = {
     'luxury',
     'dropshipping',
     'amazon fba',
-    'franchise',
     'startup',
     'saas',
     'software',
@@ -94,10 +103,13 @@ export const defaultDealHunterCriteria = {
     'recruiting',
     'real estate brokerage',
     'insurance agency',
+  ],
+  softRiskKeywords: [
     'high capex',
     'heavy inventory',
     'project-based',
     'one customer',
+    'high customer concentration',
     'customer concentration',
     'declining revenue',
   ],
@@ -282,6 +294,7 @@ function normalizeCriteria(input = {}) {
     excludedIndustries: normalizeList(input.excludedIndustries || defaultDealHunterCriteria.excludedIndustries),
     includeKeywords: normalizeList(input.includeKeywords || defaultDealHunterCriteria.includeKeywords).map((item) => item.toLowerCase()),
     excludeKeywords: normalizeList(input.excludeKeywords || defaultDealHunterCriteria.excludeKeywords).map((item) => item.toLowerCase()),
+    softRiskKeywords: normalizeList(input.softRiskKeywords || defaultDealHunterCriteria.softRiskKeywords).map((item) => item.toLowerCase()),
     includeRemote: normalizeBoolean(input.includeRemote, defaultDealHunterCriteria.includeRemote),
     minYearsInBusiness: Number(input.minYearsInBusiness) || defaultDealHunterCriteria.minYearsInBusiness,
     preferYearsInBusiness: Number(input.preferYearsInBusiness) || defaultDealHunterCriteria.preferYearsInBusiness,
@@ -632,6 +645,16 @@ function keywordMatches(text, keywords) {
   });
 }
 
+function softRiskMatches(text, keywords) {
+  return keywordMatches(text, keywords).filter((keyword) => {
+    if (keyword === 'customer concentration' && /\b(low|limited|diversified|no)\s+customer concentration\b/i.test(text)) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
 function addSignalScore(text, signals, pointsPerSignal, maxPoints) {
   const matches = keywordMatches(text, signals);
   return {
@@ -644,6 +667,42 @@ function hasManagementDepth(text) {
   return /\b(management in place|general manager|gm|operations manager|operator in place|manager[-\s]?run|management team|key employees|trained staff|day[-\s]?to[-\s]?day manager|supervisor)\b/i.test(
     text,
   );
+}
+
+function hasFranchiseSignal(rawText) {
+  const lines = normalizeText(rawText)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  let foundStructuredNo = false;
+  let foundUnstructuredSignal = false;
+
+  for (const line of lines) {
+    const structuredFranchiseMatch = line.match(/(?:franchise|franchises|franchisee)[^:]{0,80}:\s*(.+)$/i);
+
+    if (structuredFranchiseMatch) {
+      const value = structuredFranchiseMatch[1].trim();
+
+      if (/^(no|false|n|not\s+available|none)\b/i.test(value)) {
+        foundStructuredNo = true;
+        continue;
+      }
+
+      if (/^(yes|true|y|available|included|franchise)\b/i.test(value)) {
+        return true;
+      }
+
+      continue;
+    }
+
+    if (/\b(no|not a|non[-\s]?franchise)\b/i.test(line)) {
+      continue;
+    }
+
+    foundUnstructuredSignal = foundUnstructuredSignal || /\b(franchise|franchisee|franchisor)\b/i.test(line);
+  }
+
+  return !foundStructuredNo && foundUnstructuredSignal;
 }
 
 function hasRemoteAbsenteeSignal(rawText) {
@@ -675,6 +734,27 @@ function hasRemoteAbsenteeSignal(rawText) {
     return /\b(semi[-\s]?absentee|absentee[-\s]?(run|owner|ownership)|remote[-\s]?run|relocatable|work from anywhere)\b/i.test(
       normalizedLine,
     );
+  });
+}
+
+function normalizeLocationForMatch(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function locationMatches(location, targets) {
+  const normalizedLocation = normalizeLocationForMatch(location);
+
+  if (!normalizedLocation) {
+    return [];
+  }
+
+  return targets.filter((target) => {
+    const normalizedTarget = normalizeLocationForMatch(target);
+    return normalizedTarget && normalizedLocation.includes(normalizedTarget);
   });
 }
 
@@ -740,14 +820,20 @@ function scoreCandidate(candidate, criteria) {
   const risks = [];
   const excludedReasons = [];
   const matchedKeywords = keywordMatches(text, criteria.includeKeywords);
+  const matchedIndustries = keywordMatches(`${candidate.industry} ${candidate.description}`, criteria.includedIndustries);
   const excludedKeywordMatches = keywordMatches(text, [...criteria.excludeKeywords, ...criteria.excludedIndustries]);
+  const matchedSoftRisks = softRiskMatches(text, criteria.softRiskKeywords);
 
   if (excludedKeywordMatches.length > 0) {
     excludedReasons.push(`Excluded terms: ${excludedKeywordMatches.slice(0, 5).join(', ')}`);
   }
 
-  if (!criteria.includeFranchises && /\bfranchise\b/i.test(text)) {
+  if (!criteria.includeFranchises && hasFranchiseSignal(candidate.raw_text)) {
     excludedReasons.push('Franchise listing.');
+  }
+
+  if (matchedSoftRisks.length > 0) {
+    risks.push(`Diligence risk terms: ${matchedSoftRisks.slice(0, 4).join(', ')}.`);
   }
 
   const remoteAbsenteeSignal = hasRemoteAbsenteeSignal(candidate.raw_text);
@@ -781,8 +867,23 @@ function scoreCandidate(candidate, criteria) {
     risks.push('Location/state was not detected.');
   }
 
+  const matchedCities = locationMatches(candidate.location, criteria.targetCities);
+  const matchedCounties = locationMatches(candidate.location, criteria.targetCounties);
+
+  if (matchedCities.length > 0) {
+    reasons.push(`Located in target city: ${matchedCities[0]}.`);
+  }
+
+  if (matchedCounties.length > 0) {
+    reasons.push(`Located in target county: ${matchedCounties[0]}.`);
+  }
+
   if (matchedKeywords.length > 0) {
     reasons.push(`Matched durable-service terms: ${matchedKeywords.slice(0, 5).join(', ')}.`);
+  }
+
+  if (matchedIndustries.length > 0) {
+    reasons.push(`Matched preferred industry: ${matchedIndustries.slice(0, 3).join(', ')}.`);
   }
 
   const years = candidate.years_in_business;
@@ -811,6 +912,14 @@ function scoreCandidate(candidate, criteria) {
     criteria_score += 15;
   }
 
+  if (matchedCities.length > 0 || matchedCounties.length > 0) {
+    criteria_score += 10;
+  }
+
+  if (matchedIndustries.length > 0) {
+    criteria_score += Math.min(12, matchedIndustries.length * 4);
+  }
+
   if (matchedKeywords.length > 0) {
     criteria_score += Math.min(20, matchedKeywords.length * 4);
   }
@@ -828,16 +937,20 @@ function scoreCandidate(candidate, criteria) {
   criteria_score = Math.max(0, Math.min(100, criteria_score));
 
   let score = Math.round(recession_score * 0.35 + ai_resistance_score * 0.35 + criteria_score * 0.3);
+  const config = getConfig();
 
   if (excludedReasons.length > 0) {
     score = Math.min(score, 42);
+  }
+
+  if (remoteAbsenteeSignal && !managementDepth) {
+    score = Math.min(score, config.dealHunter.minimumQualifiedScore - 1);
   }
 
   if (risks.length >= 3) {
     score -= 8;
   }
 
-  const config = getConfig();
   const status =
     excludedReasons.length > 0
       ? 'rejected'
