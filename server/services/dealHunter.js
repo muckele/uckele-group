@@ -1032,6 +1032,7 @@ function buildRecommendations(candidates, criteria) {
   const total = candidates.length || 1;
   const qualified = candidates.filter((candidate) => candidate.status === 'qualified');
   const rejected = candidates.filter((candidate) => candidate.status === 'rejected');
+  const hardExcluded = candidates.filter((candidate) => candidate.excluded_reasons.length > 0);
   const excludedFoodOrHospitality = candidates.filter((candidate) =>
     candidate.excluded_reasons.some((reason) => /food|beverage|hospitality|restaurant|bar|hotel|lodging/i.test(reason)),
   );
@@ -1054,12 +1055,21 @@ function buildRecommendations(candidates, criteria) {
   }
 
   if (qualified.length === 0) {
-    recommendations.push({
-      severity: 'warning',
-      title: 'No companies cleared the qualified score',
-      recommendation: 'Keep the industry exclusions, but widen annual profit to $400,000-$1,750,000 for two weeks and remove city-level filters.',
-      rationale: 'The current profile may be too narrow if every imported listing is rejected or only watchlisted.',
-    });
+    if (hardExcluded.length / total > 0.5) {
+      recommendations.push({
+        severity: 'warning',
+        title: 'Batch is dominated by hard exclusions',
+        recommendation: 'Do not widen profit or location filters based on this batch. Remove the flagged businesses and tighten negative keywords around the excluded sectors that keep appearing.',
+        rationale: `${hardExcluded.length} listing(s) were rejected because they conflict with hard buying-strategy exclusions.`,
+      });
+    } else {
+      recommendations.push({
+        severity: 'warning',
+        title: 'No companies cleared the qualified score',
+        recommendation: 'Keep the industry exclusions, but widen annual profit to $400,000-$1,750,000 for two weeks and remove city-level filters.',
+        rationale: 'The current profile may be too narrow if every imported listing is rejected or only watchlisted.',
+      });
+    }
   }
 
   if (excludedFoodOrHospitality.length / total > 0.2) {
@@ -1259,10 +1269,13 @@ export async function hasDealHunterDailyRunForDate(date = new Date()) {
   const storage = getStorage();
   const dateKey = getDealHunterLocalDateKey(date, config.dealHunter.dailyImportTimeZone);
   const runs = await storage.listDealHunterRuns({ limit: 50 });
+  const sheetImportSources = new Set(['google-sheet-daily-import', 'google-sheet-import']);
+  const completedDigestStatuses = new Set(['pending', 'sent', 'logged']);
 
   return runs.some(
     (run) =>
-      run.source === 'google-sheet-daily-import' &&
+      sheetImportSources.has(run.source) &&
+      completedDigestStatuses.has(run.digest_status) &&
       getDealHunterLocalDateKey(new Date(run.created_at), config.dealHunter.dailyImportTimeZone) === dateKey,
   );
 }

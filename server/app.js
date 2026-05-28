@@ -166,21 +166,24 @@ export function createApp() {
     }),
   );
 
-  app.post('/api/admin/magic-link/verify', (request, response) => {
-    const body = request.body || {};
-    const result = verifyAdminMagicLink(body.token || '');
+  app.post(
+    '/api/admin/magic-link/verify',
+    asyncRoute(async (request, response) => {
+      const body = request.body || {};
+      const result = await verifyAdminMagicLink(body.token || '');
 
-    if (!result.ok) {
-      response.status(401).json({ success: false, error: result.reason });
-      return;
-    }
+      if (!result.ok) {
+        response.status(401).json({ success: false, error: result.reason });
+        return;
+      }
 
-    response.setHeader('Set-Cookie', result.cookie);
-    response.json({
-      success: true,
-      username: result.session.username,
-    });
-  });
+      response.setHeader('Set-Cookie', result.cookie);
+      response.json({
+        success: true,
+        username: result.session.username,
+      });
+    }),
+  );
 
   app.delete('/api/admin/session', (_request, response) => {
     response.setHeader('Set-Cookie', logoutAdmin());

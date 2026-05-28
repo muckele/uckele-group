@@ -147,6 +147,14 @@ export function createSqliteStorage(config) {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS admin_magic_links (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS secure_upload_requests (
       id TEXT PRIMARY KEY,
       submission_id TEXT NOT NULL,
@@ -184,6 +192,7 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_email ON contact_submissions(email);
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_ip_hash ON contact_submissions(ip_hash);
     CREATE INDEX IF NOT EXISTS idx_contact_rate_limit_events_bucket ON contact_rate_limit_events(bucket, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_admin_magic_links_email ON admin_magic_links(email, expires_at DESC);
     CREATE INDEX IF NOT EXISTS idx_secure_upload_requests_submission_id ON secure_upload_requests(submission_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_secure_documents_submission_id ON secure_documents(submission_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_secure_documents_request_id ON secure_documents(request_id, created_at DESC);
@@ -436,6 +445,33 @@ export function createSqliteStorage(config) {
       @nda_accepted_at
     )
   `);
+
+  const insertAdminMagicLinkStatement = database.prepare(`
+    INSERT INTO admin_magic_links (
+      id,
+      email,
+      created_at,
+      expires_at,
+      used_at
+    ) VALUES (
+      @id,
+      @email,
+      @created_at,
+      @expires_at,
+      @used_at
+    )
+  `);
+
+  const consumeAdminMagicLinkStatement = database.prepare(`
+    UPDATE admin_magic_links
+    SET used_at = @used_at
+    WHERE id = @id
+      AND email = @email
+      AND used_at IS NULL
+      AND expires_at >= @used_at
+  `);
+
+  const getAdminMagicLinkStatement = database.prepare('SELECT * FROM admin_magic_links WHERE id = ?');
 
   const upsertDealHunterCriteriaStatement = database.prepare(`
     INSERT INTO deal_hunter_criteria (
@@ -724,6 +760,25 @@ export function createSqliteStorage(config) {
           .prepare('SELECT COUNT(*) AS count FROM contact_rate_limit_events WHERE bucket = ? AND created_at >= ?')
           .get(bucket, sinceIso)?.count || 0
       );
+    },
+
+    async insertAdminMagicLink(record) {
+      insertAdminMagicLinkStatement.run(record);
+      return record;
+    },
+
+    async consumeAdminMagicLink({ id, email, usedAt }) {
+      const consumeLink = database.transaction(() => {
+        const result = consumeAdminMagicLinkStatement.run({ id, email, used_at: usedAt });
+
+        if (result.changes !== 1) {
+          return null;
+        }
+
+        return getAdminMagicLinkStatement.get(id) || null;
+      });
+
+      return consumeLink();
     },
 
     async insertSecureUploadRequest(requestRecord) {

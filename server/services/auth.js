@@ -1,8 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { clearCookie, parseCookies, serializeCookie } from '../utils/cookies.js';
 import { getClientIp, getRequestOrigin } from '../utils/http.js';
-import { hashIp, safeCompareText, signPayload, verifySignedPayload } from '../utils/security.js';
+import { hashIp, safeCompareText, sha256, signPayload, verifySignedPayload } from '../utils/security.js';
 import { sendAdminMagicLinkEmail } from './delivery.js';
 
 function createSessionCookie(session) {
@@ -133,6 +134,7 @@ export function loginAdmin(username, password) {
 
 export async function requestAdminMagicLink(email, request) {
   const config = getConfig();
+  const storage = getStorage();
 
   if (!config.admin.email || !config.admin.magicLinkSecret) {
     return { ok: false, reason: 'Magic-link sign-in is not configured.' };
@@ -153,16 +155,25 @@ export async function requestAdminMagicLink(email, request) {
   }
 
   const expiresAt = new Date(Date.now() + config.admin.magicLinkTtlMs).toISOString();
+  const magicLinkId = randomUUID();
   const token = signPayload(
     {
       type: 'admin-magic-link',
       email: expectedEmail,
+      jti: magicLinkId,
       exp: Date.now() + config.admin.magicLinkTtlMs,
     },
     config.admin.magicLinkSecret,
   );
   const publicOrigin = getPublicOrigin(request);
   const magicLinkUrl = `${publicOrigin}/admin?admin_token=${encodeURIComponent(token)}`;
+  await storage.insertAdminMagicLink({
+    id: sha256(magicLinkId),
+    email: expectedEmail,
+    created_at: new Date().toISOString(),
+    expires_at: expiresAt,
+    used_at: null,
+  });
   const deliveryResult = await sendAdminMagicLinkEmail({
     to: config.admin.email,
     magicLinkUrl,
@@ -180,12 +191,23 @@ export async function requestAdminMagicLink(email, request) {
   };
 }
 
-export function verifyAdminMagicLink(token) {
+export async function verifyAdminMagicLink(token) {
   const config = getConfig();
+  const storage = getStorage();
   const payload = verifySignedPayload(token, config.admin.magicLinkSecret);
 
-  if (!payload || payload.type !== 'admin-magic-link' || payload.email !== config.admin.email.trim().toLowerCase()) {
+  if (!payload || payload.type !== 'admin-magic-link' || payload.email !== config.admin.email.trim().toLowerCase() || !payload.jti) {
     return { ok: false, reason: 'That sign-in link is invalid or has expired.' };
+  }
+
+  const consumedLink = await storage.consumeAdminMagicLink({
+    id: sha256(payload.jti),
+    email: payload.email,
+    usedAt: new Date().toISOString(),
+  });
+
+  if (!consumedLink) {
+    return { ok: false, reason: 'That sign-in link is invalid, expired, or has already been used.' };
   }
 
   const session = createAdminSession(config.admin.email);

@@ -88,6 +88,16 @@ create table if not exists public.contact_rate_limit_events (
 
 create index if not exists idx_contact_rate_limit_events_bucket on public.contact_rate_limit_events (bucket, created_at desc);
 
+create table if not exists public.admin_magic_links (
+  id text primary key,
+  email text not null,
+  created_at timestamptz not null,
+  expires_at timestamptz not null,
+  used_at timestamptz
+);
+
+create index if not exists idx_admin_magic_links_email on public.admin_magic_links (email, expires_at desc);
+
 create table if not exists public.secure_upload_requests (
   id uuid primary key,
   submission_id uuid not null references public.contact_submissions(id) on delete cascade,

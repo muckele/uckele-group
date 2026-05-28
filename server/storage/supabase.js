@@ -216,6 +216,34 @@ export function createSupabaseStorage(config) {
       return count || 0;
     },
 
+    async insertAdminMagicLink(record) {
+      const { data, error } = await client.from('admin_magic_links').insert(record).select().single();
+
+      if (error) {
+        throw error;
+      }
+
+      return data;
+    },
+
+    async consumeAdminMagicLink({ id, email, usedAt }) {
+      const { data, error } = await client
+        .from('admin_magic_links')
+        .update({ used_at: usedAt })
+        .eq('id', id)
+        .eq('email', email)
+        .is('used_at', null)
+        .gte('expires_at', usedAt)
+        .select()
+        .maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      return data || null;
+    },
+
     async insertSecureUploadRequest(requestRecord) {
       const { data, error } = await client.from('secure_upload_requests').insert(requestRecord).select().single();
 
