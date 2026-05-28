@@ -846,7 +846,7 @@ function scoreCandidate(candidate, criteria) {
   if (remoteAbsenteeSignal && managementDepth) {
     reasons.push('Remote or absentee setup appears supported by management depth.');
   } else if (remoteAbsenteeSignal) {
-    risks.push('Remote or absentee setup needs proof of day-to-day management depth.');
+    risks.push('Management depth is not shown; verify owner dependence and day-to-day operating coverage.');
   }
 
   if (candidate.annual_profit !== null) {
@@ -930,8 +930,6 @@ function scoreCandidate(candidate, criteria) {
 
   if (remoteAbsenteeSignal && managementDepth) {
     criteria_score += 12;
-  } else if (remoteAbsenteeSignal) {
-    criteria_score -= 8;
   }
 
   if (excludedReasons.length === 0) {
@@ -948,10 +946,6 @@ function scoreCandidate(candidate, criteria) {
   }
 
   if (!profitInRange) {
-    score = Math.min(score, config.dealHunter.minimumQualifiedScore - 1);
-  }
-
-  if (remoteAbsenteeSignal && !managementDepth) {
     score = Math.min(score, config.dealHunter.minimumQualifiedScore - 1);
   }
 
