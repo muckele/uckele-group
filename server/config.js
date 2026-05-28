@@ -105,6 +105,11 @@ export function getConfig() {
       sheetCsvUrl: process.env.DEAL_HUNTER_SHEET_CSV_URL || '',
       minimumQualifiedScore: numberFromEnv(process.env.DEAL_HUNTER_MINIMUM_QUALIFIED_SCORE, 72),
       watchScore: numberFromEnv(process.env.DEAL_HUNTER_WATCH_SCORE, 58),
+      dailyImportEnabled: booleanFromEnv(process.env.DEAL_HUNTER_DAILY_IMPORT_ENABLED, false),
+      dailyImportTime: process.env.DEAL_HUNTER_DAILY_IMPORT_TIME || '08:00',
+      dailyImportTimeZone: process.env.DEAL_HUNTER_DAILY_IMPORT_TIME_ZONE || 'America/New_York',
+      dailyImportSendDigest: booleanFromEnv(process.env.DEAL_HUNTER_DAILY_IMPORT_SEND_DIGEST, true),
+      dailyImportCatchUpOnStart: booleanFromEnv(process.env.DEAL_HUNTER_DAILY_IMPORT_CATCH_UP_ON_START, true),
     },
     protection: {
       rateLimitWindowMs: numberFromEnv(process.env.RATE_LIMIT_WINDOW_MS, 1000 * 60 * 10),

@@ -1112,17 +1112,74 @@ async function fetchDealHunterSheetCsv(sheetCsvUrl) {
   return csv;
 }
 
-export async function reviewDealHunterSheetImport({ requestedBy = '', sendDigest = true } = {}) {
+export function getDealHunterLocalDateKey(date = new Date(), timeZone = getConfig().dealHunter.dailyImportTimeZone) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    day: '2-digit',
+    month: '2-digit',
+    timeZone,
+    year: 'numeric',
+  }).formatToParts(date);
+  const valueByType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+
+  return `${valueByType.year}-${valueByType.month}-${valueByType.day}`;
+}
+
+export async function hasDealHunterDailyRunForDate(date = new Date()) {
+  const config = getConfig();
+  const storage = getStorage();
+  const dateKey = getDealHunterLocalDateKey(date, config.dealHunter.dailyImportTimeZone);
+  const runs = await storage.listDealHunterRuns({ limit: 50 });
+
+  return runs.some(
+    (run) =>
+      run.source === 'google-sheet-daily-import' &&
+      getDealHunterLocalDateKey(new Date(run.created_at), config.dealHunter.dailyImportTimeZone) === dateKey,
+  );
+}
+
+export async function reviewDealHunterSheetImport({
+  requestedBy = '',
+  sendDigest = true,
+  source = 'google-sheet-import',
+  subject = 'SMB Deal Hunter Google Sheet import',
+} = {}) {
   const config = getConfig();
   const csv = await fetchDealHunterSheetCsv(config.dealHunter.sheetCsvUrl);
 
   return reviewDealHunterSheetCsv({
-    subject: 'SMB Deal Hunter Google Sheet import',
+    subject,
     csv,
-    source: 'google-sheet-import',
+    source,
     requestedBy,
     sendDigest,
   });
+}
+
+export async function reviewDealHunterDailySheetImport({ force = false, requestedBy = 'deal-hunter-scheduler' } = {}) {
+  const config = getConfig();
+  const runDate = new Date();
+  const dateKey = getDealHunterLocalDateKey(runDate, config.dealHunter.dailyImportTimeZone);
+
+  if (!force && (await hasDealHunterDailyRunForDate(runDate))) {
+    return {
+      skipped: true,
+      reason: `Daily Deal Hunter import already ran for ${dateKey}.`,
+      dateKey,
+    };
+  }
+
+  const result = await reviewDealHunterSheetImport({
+    requestedBy,
+    sendDigest: config.dealHunter.dailyImportSendDigest,
+    source: 'google-sheet-daily-import',
+    subject: `SMB Deal Hunter On-Market daily import - ${dateKey}`,
+  });
+
+  return {
+    skipped: false,
+    dateKey,
+    ...result,
+  };
 }
 
 export async function reviewDealHunterWebhook({ secret = '', subject = '', text = '', html = '' }) {

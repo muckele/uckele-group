@@ -213,6 +213,11 @@ Set:
 - `DEAL_HUNTER_SHEET_CSV_URL`
 - `DEAL_HUNTER_MINIMUM_QUALIFIED_SCORE`
 - `DEAL_HUNTER_WATCH_SCORE`
+- `DEAL_HUNTER_DAILY_IMPORT_ENABLED`
+- `DEAL_HUNTER_DAILY_IMPORT_TIME`
+- `DEAL_HUNTER_DAILY_IMPORT_TIME_ZONE`
+- `DEAL_HUNTER_DAILY_IMPORT_SEND_DIGEST`
+- `DEAL_HUNTER_DAILY_IMPORT_CATCH_UP_ON_START`
 
 `DEAL_HUNTER_SHEET_URL` is the human-facing Google Sheet link used from the admin dashboard. `DEAL_HUNTER_SHEET_CSV_URL` must point to the exact deal tab export URL for imports, for example:
 
@@ -227,6 +232,16 @@ https://docs.google.com/spreadsheets/d/1d2mC6oKDY7DFQiaNQnF947Ro5CBwjIcAw_fwya7b
 ```
 
 The SMB Deal Hunter Pro document's first tab is a resource guide. If the team later adds a new active deal tab, open that deal tab in Google Sheets, copy its `gid` from the browser URL, and use that `gid` in `DEAL_HUNTER_SHEET_CSV_URL`.
+
+Daily sheet automation:
+
+- Set `DEAL_HUNTER_DAILY_IMPORT_ENABLED=true` to run the On-Market sheet import automatically once per day.
+- `DEAL_HUNTER_DAILY_IMPORT_TIME` uses 24-hour `HH:mm` format.
+- `DEAL_HUNTER_DAILY_IMPORT_TIME_ZONE` controls the local morning schedule, for example `America/New_York`.
+- `DEAL_HUNTER_DAILY_IMPORT_SEND_DIGEST=true` emails the daily scoring digest after the scheduled run.
+- `DEAL_HUNTER_DAILY_IMPORT_CATCH_UP_ON_START=true` runs one catch-up import after restart if today's scheduled time already passed and no daily run was recorded.
+
+On Fly.io, the app is configured to run this at 8:00 AM America/New_York against the `On-Market` tab.
 
 Optional inbound automation:
 

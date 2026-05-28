@@ -19,6 +19,11 @@ primary_region = "ewr"
   STORAGE_PROVIDER = "sqlite"
   SQLITE_PATH = "/data/uckele-group.sqlite"
   SECURE_DOCUMENTS_STORAGE_DIR = "/data/secure-documents"
+  DEAL_HUNTER_DAILY_IMPORT_ENABLED = "true"
+  DEAL_HUNTER_DAILY_IMPORT_TIME = "08:00"
+  DEAL_HUNTER_DAILY_IMPORT_TIME_ZONE = "America/New_York"
+  DEAL_HUNTER_DAILY_IMPORT_SEND_DIGEST = "true"
+  DEAL_HUNTER_DAILY_IMPORT_CATCH_UP_ON_START = "true"
 
 [http_service]
   internal_port = 8787
