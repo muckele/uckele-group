@@ -823,6 +823,10 @@ function scoreCandidate(candidate, criteria) {
   const matchedIndustries = keywordMatches(`${candidate.industry} ${candidate.description}`, criteria.includedIndustries);
   const excludedKeywordMatches = keywordMatches(text, [...criteria.excludeKeywords, ...criteria.excludedIndustries]);
   const matchedSoftRisks = softRiskMatches(text, criteria.softRiskKeywords);
+  const profitInRange =
+    candidate.annual_profit !== null &&
+    candidate.annual_profit >= criteria.minAnnualProfit &&
+    candidate.annual_profit <= criteria.maxAnnualProfit;
 
   if (excludedKeywordMatches.length > 0) {
     excludedReasons.push(`Excluded terms: ${excludedKeywordMatches.slice(0, 5).join(', ')}`);
@@ -904,7 +908,7 @@ function scoreCandidate(candidate, criteria) {
   const ai_resistance_score = Math.max(0, Math.min(100, 40 + aiSignalsFound.score - aiExposure.score));
   let criteria_score = 35;
 
-  if (candidate.annual_profit !== null && candidate.annual_profit >= criteria.minAnnualProfit && candidate.annual_profit <= criteria.maxAnnualProfit) {
+  if (profitInRange) {
     criteria_score += 20;
   }
 
@@ -941,6 +945,10 @@ function scoreCandidate(candidate, criteria) {
 
   if (excludedReasons.length > 0) {
     score = Math.min(score, 42);
+  }
+
+  if (!profitInRange) {
+    score = Math.min(score, config.dealHunter.minimumQualifiedScore - 1);
   }
 
   if (remoteAbsenteeSignal && !managementDepth) {
