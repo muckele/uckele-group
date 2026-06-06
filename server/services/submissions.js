@@ -521,7 +521,7 @@ export async function submitContactLead(body, request) {
     body: {
       success: true,
       id: submission.id,
-      message: 'Thanks. Your message has been received and routed.',
+      message: 'Thanks. Your message has been received.',
     },
   };
 }

@@ -59,7 +59,12 @@ export default function HomePage() {
             <div className="surface-grid absolute inset-0 opacity-40" />
             <div className="relative">
               <div className="flex items-center gap-4">
-                <img alt={`${siteConfig.personName} headshot placeholder`} className="h-20 w-20 rounded-3xl object-cover shadow-lg" src="/headshot-placeholder.svg" />
+                <div
+                  aria-label={siteConfig.personName}
+                  className="flex h-20 w-20 shrink-0 items-center justify-center rounded-3xl border border-moss/12 bg-[linear-gradient(135deg,#173126,#284638)] text-white shadow-lg"
+                >
+                  <span className="text-xl font-semibold tracking-[0.16em]">MU</span>
+                </div>
                 <div>
                   <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">{siteConfig.personName}</p>
                   <p className="mt-2 max-w-xs text-sm leading-6 text-ink/70">
@@ -182,9 +187,9 @@ export default function HomePage() {
               ))}
             </div>
             <div className="mt-8 rounded-[28px] border border-line/80 bg-white/72 p-6">
-              <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Search Themes Covered</p>
+              <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Durability Signals</p>
               <p className="mt-3 text-base leading-7 text-ink/74">
-                Small business buyer. Individual business buyer. Long-term business buyer. Search fund alternative. Preserve business legacy after sale.
+                Repeat customers, service contracts, essential local demand, licensed or regulated work, and a team with knowledge worth preserving.
               </p>
             </div>
             <div className="mt-6 rounded-[28px] border border-line/80 bg-white/72 p-6">

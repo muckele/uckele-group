@@ -59,6 +59,7 @@ export default function Header() {
           </div>
 
           <button
+            aria-controls="mobile-navigation"
             aria-expanded={menuOpen}
             aria-label={menuOpen ? 'Close menu' : 'Open menu'}
             className="inline-flex h-11 w-11 items-center justify-center rounded-full border border-white/[0.80] bg-white/[0.78] text-ink shadow-[0_14px_26px_rgba(24,33,29,0.06)] transition hover:border-moss/18 hover:text-moss lg:hidden"
@@ -70,31 +71,32 @@ export default function Header() {
         </div>
       </div>
 
-      <div
-        className={`mx-auto mt-3 max-w-7xl overflow-hidden rounded-[28px] border border-white/[0.80] bg-[linear-gradient(180deg,rgba(255,255,255,0.98),rgba(248,244,237,0.94))] shadow-panel backdrop-blur-xl transition duration-300 lg:hidden ${
-          menuOpen ? 'pointer-events-auto max-h-[520px] opacity-100' : 'pointer-events-none max-h-0 opacity-0'
-        }`}
-      >
-        <div className="grid gap-1 p-4">
-          {navigation.map((item) => (
-            <NavLink
-              key={item.path}
-              className={({ isActive }) =>
-                `rounded-2xl px-4 py-3 text-sm font-medium transition ${
-                  isActive ? 'bg-moss text-white' : 'text-ink/75 hover:bg-fog hover:text-ink'
-                }`
-              }
-              to={item.path}
-            >
-              {item.label}
-            </NavLink>
-          ))}
+      {menuOpen ? (
+        <div
+          className="mx-auto mt-3 max-w-7xl overflow-hidden rounded-[28px] border border-white/[0.80] bg-[linear-gradient(180deg,rgba(255,255,255,0.98),rgba(248,244,237,0.94))] shadow-panel backdrop-blur-xl lg:hidden"
+          id="mobile-navigation"
+        >
+          <div className="grid gap-1 p-4">
+            {navigation.map((item) => (
+              <NavLink
+                key={item.path}
+                className={({ isActive }) =>
+                  `rounded-2xl px-4 py-3 text-sm font-medium transition ${
+                    isActive ? 'bg-moss text-white' : 'text-ink/75 hover:bg-fog hover:text-ink'
+                  }`
+                }
+                to={item.path}
+              >
+                {item.label}
+              </NavLink>
+            ))}
 
-          <ButtonLink className="mt-3" href="/contact">
-            Start A Conversation
-          </ButtonLink>
+            <ButtonLink className="mt-3" href="/contact">
+              Start A Conversation
+            </ButtonLink>
+          </div>
         </div>
-      </div>
+      ) : null}
     </header>
   );
 }

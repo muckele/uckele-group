@@ -80,7 +80,7 @@ export const seoContent = {
   about: {
     title: 'About Mathew Uckele | Uckele Group',
     description:
-      'Learn about Mathew Uckele, his background in business administration, sales, operations, and technical problem solving, and why he wants to buy and operate one great small business.',
+      'Learn about Mathew Uckele, his background in sales, business development, solution engineering, operations, and technical problem solving, and why he wants to buy and operate one great small business.',
     keywords:
       'about mathew uckele, small business buyer background, operator buyer, individual acquisition entrepreneur',
   },
@@ -178,7 +178,7 @@ export const homePage = {
       {
         title: 'My background is broad and execution-oriented',
         description:
-          'I bring experience across business administration, sales, operations, business development, and software or technical problem solving.',
+          'I bring 10+ years of experience across sales, business development, solution engineering, operations, and technical problem solving.',
       },
       {
         title: 'The process should feel steady and low-drama',
@@ -202,14 +202,20 @@ export const homePage = {
     description:
       'I am most interested in businesses with a strong reputation, loyal customers, and operating models that can be learned, supported, and improved over time.',
     list: [
-      'Stable, profitable small businesses',
-      'Recurring or repeat customer relationships',
-      'Clear and understandable business models',
-      'Strong local reputation and dependable customer service',
-      'Owners preparing for retirement, transition, or reduced day-to-day involvement',
-      'Flexible on location for the right opportunity',
+      '$500,000 to $1,500,000 in annual SDE or EBITDA',
+      'Recurring revenue, service contracts, or repeat customer relationships',
+      'Clear, understandable operations with durable local or commercial demand',
+      'Strong reputation, dependable service quality, and customer trust',
+      'Owner preparing for retirement, transition, succession, or reduced day-to-day involvement',
+      'Preferred markets include California, select Northeast states, Arizona, and Nevada',
     ],
-    industries: ['Home services', 'B2B services', 'Niche local services', 'Operationally solid small businesses'],
+    industries: [
+      'Home and property services',
+      'B2B and commercial services',
+      'Healthcare services',
+      'Testing, inspection, and compliance',
+      'Repair, maintenance, and specialty trades',
+    ],
   },
   transitionApproach: {
     eyebrow: 'My Approach To Transition',
@@ -289,22 +295,22 @@ export const homePage = {
     ],
   },
   references: {
-    eyebrow: 'Future Social Proof',
-    title: 'Reference and testimonial blocks are ready for real seller and advisor feedback',
+    eyebrow: 'How I Show Up',
+    title: 'Signals of a serious, prepared buyer',
     description:
-      'The cards below are intentionally marked as placeholders. They are included so the design has a dedicated space for future seller, broker, or advisor references without fabricating anything today.',
+      'Before a seller shares sensitive details, the process should make it clear who they are speaking with, what kind of business fits, and how the conversation will be handled.',
     items: [
       {
-        label: 'Seller Testimonial Placeholder',
-        text: 'Add a future note from an owner describing the process as respectful, clear, and aligned with continuity.',
+        label: 'Direct Accountability',
+        text: 'You speak with the individual buyer who intends to own and operate the business, not a rotating deal team.',
       },
       {
-        label: 'Broker Testimonial Placeholder',
-        text: 'Add a future note from an intermediary highlighting professionalism, responsiveness, and realistic deal execution.',
+        label: 'Clear Criteria',
+        text: 'The search is focused on durable service businesses with repeat demand, steady earnings, and operations that can be responsibly learned.',
       },
       {
-        label: 'Advisor Reference Placeholder',
-        text: 'Add a future endorsement from an attorney, lender, or accountant who has seen Mathew operate thoughtfully and follow through.',
+        label: 'Prepared Process',
+        text: 'Conversations can move from introductory call to protected information review, diligence, financing, and transition planning without pressure.',
       },
     ],
   },
@@ -322,21 +328,50 @@ export const aboutPage = {
     eyebrow: 'About',
     title: 'A grounded buyer who wants to own and operate a real business for the long term',
     description:
-      'My name is Mathew Uckele. I am looking to buy and operate a strong small business with the intention of preserving what the owner built and growing it thoughtfully over time.',
+      'My name is Mathew Uckele. I am a Southern California-based individual buyer looking to buy and operate a strong small business with the intention of preserving what the owner built and growing it thoughtfully over time.',
   },
   shortBio: {
     title: 'Short Bio',
     body: [
-      'I come from a business-oriented background with experience spanning business administration, sales, operations, business development, and software or technical problem solving.',
+      'I bring 10+ years of experience across sales, business development, solution engineering, operations, and technical problem solving, with prior roles at Tripadvisor, Wayfair, and Better Mortgage.',
+      'I also have technical training through General Assembly and current operating exposure through Golden Behavior Connection, a New York-based ABA practice that I help support remotely.',
       'What ties those experiences together is a bias toward practical execution: understanding how things work, building trusted relationships, and solving problems in a way that improves the business over time.',
       'I am not looking to buy a business to flip it. I am looking for one good company that I can commit to, operate responsibly, and grow for the long term.',
+    ],
+  },
+  proof: {
+    eyebrow: 'Relevant Background',
+    title: 'A practical mix of commercial, technical, and operating experience',
+    description:
+      'The experience below is included because it is directly relevant to evaluating, acquiring, and operating a small service business responsibly.',
+    items: [
+      {
+        title: 'Commercial execution',
+        description:
+          '10+ years across sales, business development, and solution engineering, including experience at Tripadvisor, Wayfair, and Better Mortgage.',
+      },
+      {
+        title: 'Operating exposure',
+        description:
+          'Current operating exposure through Golden Behavior Connection, a New York-based ABA practice supported remotely from Southern California.',
+      },
+      {
+        title: 'Technical problem solving',
+        description:
+          'Software engineering training through General Assembly, with a practical focus on systems, process improvement, and analytical problem solving.',
+      },
+      {
+        title: 'Transferable strengths',
+        description:
+          'Relationship building, negotiation, structured analysis, and clear communication in settings where trust and execution matter.',
+      },
     ],
   },
   story: {
     title: 'My Story',
     paragraphs: [
       'I have always been drawn to businesses that are quietly strong: companies with dependable customers, solid operations, and owners who built something valuable through consistency rather than hype. Those are often the businesses that matter most in their communities and industries, even if they do not draw a lot of attention.',
-      'My background has given me exposure to sales, operations, business development, administration, and technical work. That combination has shaped how I think. I value clear communication, practical systems, and the daily discipline required to keep a business healthy. I am comfortable learning how a company works end to end and doing the work required to support growth.',
+      'My background has given me exposure to sales, business development, solution engineering, operations, administration, and technical work. That combination has shaped how I think. I value clear communication, practical systems, and the daily discipline required to keep a business healthy. I am comfortable learning how a company works end to end and doing the work required to support growth.',
       'Buying and operating a small business is appealing to me because it combines responsibility with long-term stewardship. I want to carry forward something real, support the team and customer relationships already in place, and create durable value over time rather than chase quick financial outcomes.',
     ],
   },
@@ -384,9 +419,11 @@ export const criteriaPage = {
   fit: {
     title: 'A strong fit typically looks like this',
     items: [
+      '$500,000 to $1,500,000 in annual SDE or EBITDA',
       'Stable and profitable with healthy fundamentals',
-      'Recurring revenue or repeat customer relationships preferred',
+      'Recurring revenue, service contracts, or repeat customer relationships preferred',
       'Simple, understandable operating model',
+      'Recession-resistant and AI-resistant demand, often tied to physical, regulated, or relationship-driven work',
       'Strong reputation, loyal customers, and quality service',
       'Solid team, dependable processes, or institutional knowledge worth preserving',
       'Owner exploring retirement, transition, succession, or reduced day-to-day involvement',
@@ -395,19 +432,22 @@ export const criteriaPage = {
   specifics: [
     {
       label: 'Industries of interest',
-      value: 'Home services, B2B services, niche local services, and other operationally solid small businesses',
+      value:
+        'Home and property services, B2B and commercial services, healthcare services, facility services, testing, inspection, compliance, repair, maintenance, and specialty trades',
     },
     {
       label: 'Location preference',
-      value: 'Flexible. Open to strong opportunities, including businesses that can be supported with a combination of local leadership and hands-on involvement.',
+      value:
+        'Primary focus on California, especially Southern California and nearby markets. Also reviewing strong opportunities in NY, NJ, CT, PA, MA, AZ, and NV where local leadership and hands-on owner involvement can be supported.',
     },
     {
-      label: 'SDE / EBITDA range',
-      value: '$[Insert lower range] to $[Insert upper range]',
+      label: 'Target SDE / EBITDA',
+      value: '$500,000 to $1,500,000 in annual SDE or EBITDA, with flexibility for an especially durable fit.',
     },
     {
-      label: 'Revenue range',
-      value: '$[Insert lower range] to $[Insert upper range]',
+      label: 'Revenue profile',
+      value:
+        'Enough revenue to support the target earnings range, with attention to margin quality, customer mix, recurring demand, and concentration risk.',
     },
   ],
   situations: {
@@ -424,8 +464,10 @@ export const criteriaPage = {
     title: 'What I Am Not Looking For',
     items: [
       'Highly speculative startups or venture-style bets',
+      'Restaurants, hospitality, retail, ecommerce, SaaS, software, or online businesses',
       'Businesses dependent on one unstable customer or one fragile relationship',
       'Distressed situations that require turnaround capital or emergency restructuring',
+      'Heavy inventory, high-capex, or project-only models without repeat demand',
       'Businesses with major unresolved legal, regulatory, or compliance issues',
       'Business models I cannot understand well enough to operate responsibly',
     ],
@@ -548,7 +590,7 @@ export const faqItems = [
   {
     question: 'What size businesses are you looking for?',
     answer:
-      'I am focused on stable, profitable small businesses with strong customer relationships and understandable operations. The criteria page includes placeholder financial ranges that can be updated as your target size becomes more specific.',
+      'I am primarily focused on businesses generating roughly $500,000 to $1,500,000 in annual SDE or EBITDA, with durable demand, understandable operations, and strong customer relationships. I can be flexible for an especially strong fit.',
   },
   {
     question: 'Will you keep my employees?',

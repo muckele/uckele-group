@@ -221,14 +221,14 @@ export default function ContactForm() {
             <div className="overflow-x-auto">
               <div ref={turnstileContainerRef} />
             </div>
-            <p className="mt-2 text-xs leading-6 text-ink/60">Anti-spam verification is enabled for inbound inquiries.</p>
+            <p className="mt-2 text-xs leading-6 text-ink/60">This helps protect the form from automated submissions.</p>
           </div>
         ) : null}
       </div>
 
       <div className="mt-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <p className="max-w-xl text-sm leading-6 text-ink/70">
-          Confidential conversations are welcome. This form now submits through the backend pipeline, where inquiries can be routed to email providers, a CRM webhook, and the private admin CRM.
+          Your message goes directly to Mathew for a confidential first review. Share only what feels appropriate at this stage; detailed materials can wait until there is mutual fit and the right protections are in place.
         </p>
 
         <button
