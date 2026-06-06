@@ -5,76 +5,116 @@ import { safeCompareText } from '../utils/security.js';
 import { sendDealHunterDigestEmail } from './delivery.js';
 
 const DEFAULT_CRITERIA_ID = 'default';
+const sheetImportSources = new Set(['google-sheet-daily-import', 'google-sheet-import']);
 
 export const defaultDealHunterCriteria = {
-  minAnnualProfit: 500000,
-  maxAnnualProfit: 1500000,
-  targetStates: ['NY', 'NJ', 'CT', 'PA', 'MA', 'AZ', 'NV', 'CA'],
+  minAnnualProfit: 350000,
+  maxAnnualProfit: 900000,
+  targetStates: ['NY', 'CA', 'NJ', 'AZ', 'NV', 'CT'],
   targetCities: ['New York, NY', 'Fontana, CA', 'West Covina, CA', 'Rancho Cucamonga, CA', 'San Diego, CA'],
   targetCounties: ['Orange, CA', 'San Bernardino, CA', 'Los Angeles, CA', 'New York, NY', 'Westchester, NY', 'Hudson, NJ', 'Kings, NY', 'Queens, NY'],
   includedIndustries: [
     'Home and Property Services',
     'Business and Professional Services',
-    'Healthcare Services',
-    'Healthcare',
-    'Medical',
-    'Commercial Services',
-    'Industrial Services',
-    'Facility Services',
-    'Specialty Trade Services',
-    'Environmental Services',
-    'Testing, Inspection, and Compliance',
-    'Repair and Maintenance Services',
     'Building & Construction',
+    'Machinery',
+    'Commercial Services',
+    'Facility Services',
+    'Industrial Services',
+    'Specialty Trade Services',
+    'Repair and Maintenance Services',
+    'Testing, Inspection, and Compliance',
+    'Environmental Services',
+    'Restoration and Remediation',
+    'Equipment Repair',
+    'Industrial Maintenance',
     'HVAC',
     'Plumbing',
     'Electrical',
-    'Roofing',
     'Fire Safety',
+    'Life Safety',
     'Commercial Cleaning',
     'Pest Control',
-    'Landscaping',
   ],
   excludedIndustries: [
+    'Healthcare, Medical, & Fitness',
+    'Healthcare Services',
+    'Healthcare',
+    'Medical',
+    'Beauty & Personal Care',
     'Food and Beverage',
+    'Food & Beverage',
     'Hospitality',
     'Restaurants',
     'Retail',
+    'Retail Stores',
     'Ecommerce',
+    'E-Commerce',
     'SaaS',
     'Software',
     'IT Services',
+    'IT and Tech Services',
     'Online Business',
+    'Online & Technology',
+    'Moving, Storage, & Delivery',
+    'Transportation',
   ],
   includeKeywords: [
     'recurring revenue',
+    'recurring maintenance',
     'service contracts',
+    'service agreements',
+    'maintenance contracts',
+    'commercial contracts',
     'commercial customers',
     'b2b',
-    'route-based',
-    'maintenance',
-    'repair',
+    'repeat customers',
+    'customer-diversified',
+    'low customer concentration',
+    'essential service',
+    'non-discretionary',
+    'mission-critical',
     'compliance',
     'inspection',
     'testing',
+    'regulated compliance',
+    'maintenance',
+    'repair',
     'remediation',
     'restoration',
     'installation',
     'field service',
-    'essential service',
-    'regulated',
-    'licensed',
-    'customer-diversified',
+    'field technicians',
+    'licensed technicians',
+    'facility maintenance',
+    'commercial maintenance',
+    'industrial maintenance',
+    'equipment repair',
+    'commercial cleaning',
+    'janitorial contracts',
+    'fire safety',
+    'fire protection',
+    'life safety',
+    'pest control',
+    'hvac maintenance',
+    'plumbing service',
+    'electrical service',
+    'environmental services',
+    'remediation services',
+    'restoration services',
+    'testing and inspection',
     'owner retiring',
+    'seller financing',
+    'sba eligible',
+    'sba pre-qualified',
     'management in place',
     'general manager',
-    'management team',
-    'operator in place',
-    'repeat customers',
-    'low customer concentration',
+    'operations manager',
+    'trained staff',
   ],
   excludeKeywords: [
     'restaurant',
+    'restaurants',
     'hospitality',
     'food',
     'beverage',
@@ -88,10 +128,12 @@ export const defaultDealHunterCriteria = {
     'lodging',
     'retail',
     'ecommerce',
+    'e-commerce',
     'fashion',
     'luxury',
     'dropshipping',
     'amazon fba',
+    'amazon f.b.a',
     'startup',
     'saas',
     'software',
@@ -103,6 +145,70 @@ export const defaultDealHunterCriteria = {
     'recruiting',
     'real estate brokerage',
     'insurance agency',
+    'fedex',
+    'fed ex',
+    'fedex ground',
+    'fedex route',
+    'amazon dsp',
+    'amazon route',
+    'dsp route',
+    'delivery route',
+    'delivery routes',
+    'package route',
+    'package routes',
+    'linehaul',
+    'p&d',
+    'pickup and delivery',
+    'last mile',
+    'courier route',
+    'transportation route',
+    'logistics route',
+    'logistics provider',
+    'isp routes',
+    'bread route',
+    'vending route',
+    'medical practice',
+    'physician practice',
+    'physician-owned',
+    'doctor-owned',
+    'must be a physician',
+    'licensed physician required',
+    'clinical practice',
+    'medical clinic',
+    'healthcare practice',
+    'outpatient clinic',
+    'surgery center',
+    'ambulatory surgery center',
+    'primary care',
+    'urgent care',
+    'family medicine',
+    'internal medicine',
+    'dermatology',
+    'cosmetic surgery',
+    'dental practice',
+    'dental office',
+    'dentist',
+    'dds',
+    'dmd',
+    'orthodontic',
+    'oral surgery',
+    'optometry',
+    'ophthalmology',
+    'chiropractic',
+    'physical therapy',
+    'med spa',
+    'medspa',
+    'veterinary practice',
+    'gym',
+    'fitness center',
+    'yoga studio',
+    'pilates',
+    'personal training',
+    'wellness center',
+    'salon',
+    'spa',
+    'tanning',
+    'aesthetics',
   ],
   softRiskKeywords: [
     'high capex',
@@ -129,11 +235,8 @@ const recessionSignals = [
   'inspection',
   'testing',
   'regulated',
-  'healthcare',
-  'medical',
   'commercial',
   'b2b',
-  'route',
   'restoration',
   'remediation',
   'waste',
@@ -151,7 +254,6 @@ const aiResistantSignals = [
   'testing',
   'licensed',
   'regulated',
-  'route',
   'technician',
   'commercial',
   'local',
@@ -610,7 +712,7 @@ function splitListingBlocks(text) {
     .filter((block) => block.length >= 60);
 
   if (blocks.length > 1) {
-    return blocks.slice(0, 80);
+    return blocks.slice(0, 120);
   }
 
   const lines = normalized
@@ -627,7 +729,7 @@ function splitListingBlocks(text) {
     }
   }
 
-  return grouped.slice(0, 80);
+  return grouped.slice(0, 120);
 }
 
 function keywordMatches(text, keywords) {
@@ -1066,8 +1168,8 @@ function buildRecommendations(candidates, criteria) {
       recommendations.push({
         severity: 'warning',
         title: 'No companies cleared the qualified score',
-        recommendation: 'Keep the industry exclusions, but widen annual profit to $400,000-$1,750,000 for two weeks and remove city-level filters.',
-        rationale: 'The current profile may be too narrow if every imported listing is rejected or only watchlisted.',
+        recommendation: 'Keep the hard exclusions and current $350,000-$900,000 profit range. If this repeats for two weeks, review the highest-scoring watchlist deals before changing the profile.',
+        rationale: 'One weak batch should not push the search outside your current acquisition-size strategy.',
       });
     }
   }
@@ -1103,12 +1205,58 @@ function buildRecommendations(candidates, criteria) {
     recommendations.push({
       severity: 'warning',
       title: 'Profit range is filtering too aggressively',
-      recommendation: 'Test a broader $400,000-$1,750,000 annual profit range, then let the scorer prioritize the most durable service businesses.',
+      recommendation: 'Do not widen automatically. First check whether the out-of-range listings are durable service businesses; if they are, test a modest $300,000-$1,000,000 range for one week.',
       rationale: `${outsideProfit.length} listing(s) were outside the current profit band.`,
     });
   }
 
   return recommendations;
+}
+
+function isSheetImportSource(source) {
+  return sheetImportSources.has(source);
+}
+
+function normalizeCandidateIdentity(candidate) {
+  const sourceUrl = String(candidate.source_url || '').trim().toLowerCase();
+
+  if (sourceUrl) {
+    return `url:${sourceUrl}`;
+  }
+
+  return `company:${String(candidate.company || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()}`;
+}
+
+async function listPreviousSheetImportCandidates(storage, source) {
+  if (!isSheetImportSource(source)) {
+    return [];
+  }
+
+  const runs = await storage.listDealHunterRuns({ limit: 20 });
+  const previousRun = runs.find((run) => isSheetImportSource(run.source));
+
+  if (!previousRun) {
+    return [];
+  }
+
+  return storage.listDealHunterCandidates({ runId: previousRun.id, limit: 200 });
+}
+
+function getNewSheetImportCandidates(candidates, previousCandidates) {
+  if (previousCandidates.length === 0) {
+    return [];
+  }
+
+  const previousIdentities = new Set(previousCandidates.map(normalizeCandidateIdentity).filter(Boolean));
+
+  return candidates.filter((candidate) => {
+    const identity = normalizeCandidateIdentity(candidate);
+    return identity && !previousIdentities.has(identity);
+  });
 }
 
 async function getActiveCriteria() {
@@ -1150,8 +1298,10 @@ export async function reviewDealHunterEmail({ subject = '', text = '', source = 
   const config = getConfig();
   const storage = getStorage();
   const criteria = await getActiveCriteria();
+  const previousSheetCandidates = await listPreviousSheetImportCandidates(storage, source);
   const rawText = normalizeText(text);
   const scoredCandidates = parseCandidates(rawText).map((candidate) => scoreCandidate(candidate, criteria));
+  const newCandidates = getNewSheetImportCandidates(scoredCandidates, previousSheetCandidates);
   const recommendations = buildRecommendations(scoredCandidates, criteria);
   const now = new Date().toISOString();
   const run = {
@@ -1181,6 +1331,7 @@ export async function reviewDealHunterEmail({ subject = '', text = '', source = 
       run,
       criteria,
       candidates: scoredCandidates,
+      newCandidates,
       recommendations,
     });
 
@@ -1193,6 +1344,7 @@ export async function reviewDealHunterEmail({ subject = '', text = '', source = 
   return {
     run: updatedRun,
     candidates: scoredCandidates,
+    newCandidates,
     recommendations,
     criteria,
   };
@@ -1269,7 +1421,6 @@ export async function hasDealHunterDailyRunForDate(date = new Date()) {
   const storage = getStorage();
   const dateKey = getDealHunterLocalDateKey(date, config.dealHunter.dailyImportTimeZone);
   const runs = await storage.listDealHunterRuns({ limit: 50 });
-  const sheetImportSources = new Set(['google-sheet-daily-import', 'google-sheet-import']);
   const completedDigestStatuses = new Set(['pending', 'sent', 'logged']);
 
   return runs.some(

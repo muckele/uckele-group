@@ -361,15 +361,32 @@ function getDealHunterRemovalCandidates(candidates, criteria) {
     .slice(0, 10);
 }
 
-export async function sendDealHunterDigestEmail({ to, run, criteria, candidates, recommendations }) {
+function sortDealHunterCandidatesByScore(candidates) {
+  return [...candidates].sort((left, right) => Number(right.score || 0) - Number(left.score || 0));
+}
+
+function getDealHunterCandidateSummary(candidate) {
+  if (candidate.status === 'rejected') {
+    return candidate.excluded_reasons?.[0] || candidate.risks?.[0] || 'Rejected by the current buying profile.';
+  }
+
+  return candidate.reasons?.[0] || candidate.risks?.[0] || 'Review manually.';
+}
+
+function formatDealHunterCandidateLine(candidate, index) {
+  return `${index + 1}. ${candidate.company} | ${candidate.status} | Score ${candidate.score} | ${candidate.location || 'Location not listed'} | Profit ${formatDealHunterMoney(candidate.annual_profit)} | ${getDealHunterCandidateSummary(candidate)}`;
+}
+
+export async function sendDealHunterDigestEmail({ to, run, criteria, candidates, newCandidates = [], recommendations }) {
   if (!to) {
     return { status: 'skipped', error: 'Deal Hunter digest recipient is not configured.' };
   }
 
   const qualified = candidates.filter((candidate) => candidate.status === 'qualified');
   const watch = candidates.filter((candidate) => candidate.status === 'watch');
-  const subject = `Deal Hunter review: ${qualified.length} qualified, ${watch.length} watchlist`;
-  const topCandidates = [...qualified, ...watch].sort((left, right) => right.score - left.score).slice(0, 12);
+  const visibleNewCandidates = sortDealHunterCandidatesByScore(newCandidates);
+  const subject = `Deal Hunter review: ${qualified.length} qualified, ${watch.length} watchlist, ${newCandidates.length} new`;
+  const topCandidates = sortDealHunterCandidatesByScore([...qualified, ...watch]).slice(0, 12);
   const removalCandidates = getDealHunterRemovalCandidates(candidates, criteria);
   const text = [
     'Daily Deal Hunter review',
@@ -378,7 +395,13 @@ export async function sendDealHunterDigestEmail({ to, run, criteria, candidates,
     `Qualified: ${run.qualified_count}`,
     `Watchlist: ${run.watch_count}`,
     `Rejected: ${run.rejected_count}`,
+    `New since previous import: ${newCandidates.length}`,
     `Criteria: $${Number(criteria.minAnnualProfit).toLocaleString()}-$${Number(criteria.maxAnnualProfit).toLocaleString()} annual profit`,
+    '',
+    'New since previous import:',
+    ...(visibleNewCandidates.length > 0
+      ? visibleNewCandidates.map(formatDealHunterCandidateLine)
+      : ['No newly added businesses were detected compared with the previous sheet import.']),
     '',
     'Top companies:',
     ...(topCandidates.length > 0
@@ -416,7 +439,30 @@ export async function sendDealHunterDigestEmail({ to, run, criteria, candidates,
         <tr><td style="padding: 4px 16px 4px 0;"><strong>Qualified</strong></td><td>${run.qualified_count}</td></tr>
         <tr><td style="padding: 4px 16px 4px 0;"><strong>Watchlist</strong></td><td>${run.watch_count}</td></tr>
         <tr><td style="padding: 4px 16px 4px 0;"><strong>Rejected</strong></td><td>${run.rejected_count}</td></tr>
+        <tr><td style="padding: 4px 16px 4px 0;"><strong>New since previous import</strong></td><td>${newCandidates.length}</td></tr>
       </table>
+      <h3>New since previous import</h3>
+      ${
+        visibleNewCandidates.length > 0
+          ? `<ol>${visibleNewCandidates
+              .map(
+                (candidate) => `
+                  <li style="margin-bottom: 14px;">
+                    <strong>${escapeHtml(candidate.company)}</strong>
+                    <div>${escapeHtml(candidate.status)} | Score ${candidate.score} | Recession ${candidate.recession_score} | AI resistance ${candidate.ai_resistance_score}</div>
+                    <div>${escapeHtml(candidate.location || 'Location not listed')} | Profit ${escapeHtml(formatDealHunterMoney(candidate.annual_profit))}</div>
+                    <div>${escapeHtml(getDealHunterCandidateSummary(candidate))}</div>
+                    ${
+                      candidate.broker_questions?.length
+                        ? `<div><strong>Ask broker:</strong> ${escapeHtml(candidate.broker_questions[0])}</div>`
+                        : ''
+                    }
+                  </li>
+                `,
+              )
+              .join('')}</ol>`
+          : '<p>No newly added businesses were detected compared with the previous sheet import.</p>'
+      }
       <h3>Top companies</h3>
       ${
         topCandidates.length > 0
