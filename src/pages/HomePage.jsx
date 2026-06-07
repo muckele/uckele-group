@@ -19,38 +19,55 @@ import { homePage, seoContent, siteConfig } from '../content/siteContent';
 const trustIcons = [Compass, ShieldCheck, Handshake];
 const whyIcons = [Users, BadgeCheck, BriefcaseBusiness, Building2];
 
+function renderHeroTitle(title) {
+  const phrase = 'long-term';
+  const parts = title.split(phrase);
+
+  if (parts.length === 1) {
+    return title;
+  }
+
+  return (
+    <>
+      {parts[0]}
+      <span className="whitespace-nowrap">{phrase}</span>
+      {parts.slice(1).join(phrase)}
+    </>
+  );
+}
+
 export default function HomePage() {
   return (
     <>
       <Seo {...seoContent.home} />
 
-      <section className="section-shell pt-10 sm:pt-16">
-        <div className="grid gap-8 lg:grid-cols-[1.1fr_0.9fr] lg:items-stretch">
-          <Reveal className="panel overflow-hidden px-7 py-12 sm:px-10 sm:py-14 lg:px-12">
+      <section className="section-shell pt-8 sm:pt-14">
+        <div className="grid gap-8 xl:grid-cols-[1.08fr_0.92fr] xl:items-stretch">
+          <Reveal className="panel overflow-hidden px-5 py-9 sm:px-8 sm:py-12 lg:px-10 xl:px-12">
             <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(185,137,82,0.14),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(40,70,56,0.12),transparent_34%)]" />
             <div className="surface-grid pointer-events-none absolute right-[-8%] top-0 h-full w-[45%] opacity-[0.15]" />
             <div className="relative">
-            <span className="eyebrow">{homePage.hero.eyebrow}</span>
-            <h1 className="mt-6 max-w-3xl font-display text-4xl leading-[0.96] tracking-[-0.04em] text-ink sm:text-5xl lg:text-[4.45rem]">
-              {homePage.hero.title}
-            </h1>
-            <p className="mt-6 max-w-2xl text-lg leading-8 text-ink/74">{homePage.hero.description}</p>
+              <span className="eyebrow max-w-full">{homePage.hero.eyebrow}</span>
+              <h1 className="mt-6 max-w-[12ch] text-balance font-display text-[2.45rem] leading-[1.04] text-ink sm:max-w-[17ch] sm:text-[3.05rem] lg:text-[3.55rem] xl:max-w-[14ch] xl:text-[3.7rem] 2xl:max-w-[15ch] 2xl:text-[4rem]">
+                {renderHeroTitle(homePage.hero.title)}
+              </h1>
+              <p className="mt-6 max-w-2xl text-lg leading-8 text-ink/74">{homePage.hero.description}</p>
 
-            <div className="mt-8 flex flex-wrap gap-3">
-              <ButtonLink href={homePage.hero.primaryCta.href}>{homePage.hero.primaryCta.label}</ButtonLink>
-              <ButtonLink href={homePage.hero.secondaryCta.href} variant="secondary">
-                {homePage.hero.secondaryCta.label}
-              </ButtonLink>
-            </div>
+              <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:flex-wrap">
+                <ButtonLink href={homePage.hero.primaryCta.href}>{homePage.hero.primaryCta.label}</ButtonLink>
+                <ButtonLink href={homePage.hero.secondaryCta.href} variant="secondary">
+                  {homePage.hero.secondaryCta.label}
+                </ButtonLink>
+              </div>
 
-            <div className="mt-10 grid gap-3 sm:grid-cols-2">
-              {homePage.hero.signals.map((signal) => (
-                <div className="flex items-start gap-3 rounded-2xl border border-white/[0.90] bg-white/[0.72] px-4 py-4 shadow-[0_16px_30px_rgba(24,33,29,0.05)]" key={signal}>
-                  <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-moss" />
-                  <p className="text-sm leading-6 text-ink/74">{signal}</p>
-                </div>
-              ))}
-            </div>
+              <div className="mt-10 grid gap-3 sm:grid-cols-2">
+                {homePage.hero.signals.map((signal) => (
+                  <div className="flex items-start gap-3 rounded-2xl border border-white/[0.90] bg-white/[0.72] px-4 py-4 shadow-[0_16px_30px_rgba(24,33,29,0.05)]" key={signal}>
+                    <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-moss" />
+                    <p className="text-sm leading-6 text-ink/74">{signal}</p>
+                  </div>
+                ))}
+              </div>
             </div>
           </Reveal>
 
