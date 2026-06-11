@@ -406,6 +406,256 @@ async function copyText(value) {
   document.body.removeChild(textarea);
 }
 
+function hostLabel(value) {
+  try {
+    return new URL(value).hostname.replace(/^www\./, '');
+  } catch {
+    return value || 'source';
+  }
+}
+
+function sameId(left, right) {
+  return Boolean(left && right && String(left) === String(right));
+}
+
+function isReportForAudit(report, audit) {
+  return sameId(report?.id, audit?.report_id) || sameId(report?.audit_id, audit?.id);
+}
+
+function isDocumentForAudit(document, audit, report) {
+  return sameId(document?.audit_id, audit?.id) || sameId(document?.report_id, report?.id) || sameId(document?.report_id, audit?.report_id);
+}
+
+function compactText(value, fallback = '') {
+  return String(value || fallback)
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function reportExcerpt(content, maxLength = 2600) {
+  const text = String(content || '');
+
+  if (text.length <= maxLength) {
+    return text;
+  }
+
+  return `${text.slice(0, maxLength).trimEnd()}\n\n[Report preview truncated. Use Show Full Report to review the full generated report.]`;
+}
+
+function buildAuditEmailPersonalization(submission, audit, report) {
+  const findings = audit?.findings || [];
+  const primaryFinding = findings.find((finding) => finding.severity === 'high') || findings[0];
+  const competitorChange = (audit?.competitor_insights || []).find((insight) => insight.changes?.length > 0);
+  const businessName = submission.company || audit?.business_name || submission.name || 'the business';
+  const notes = [];
+
+  if (primaryFinding) {
+    const findingTitle = compactText(primaryFinding.title, 'the top audit finding');
+    const impact = compactText(primaryFinding.impact, 'This issue can reduce visitor trust or lead conversion.');
+    const recommendation = compactText(primaryFinding.recommendation, 'Walk through the fastest practical improvement.');
+
+    notes.push(`Lead with ${findingTitle.toLowerCase()} because it directly affects calls, form fills, or visitor trust.`);
+    notes.push(`Use this owner-friendly impact line: ${impact}`);
+    notes.push(`Offer to walk through the recommended fix: ${recommendation}`);
+  } else {
+    notes.push(`Position the outreach as a quick review of ${businessName}'s online presence and lead flow.`);
+    notes.push('Lead with monitoring, trust signals, and conversion polish rather than a critical issue.');
+  }
+
+  if (audit?.website_url) {
+    notes.push(`Reference the exact website reviewed: ${hostLabel(audit.website_url)}.`);
+  }
+
+  if (competitorChange) {
+    notes.push(`Mention that a competitor snapshot changed: ${competitorChange.changes.join(', ')}.`);
+  }
+
+  if (report?.summary && report.summary !== audit?.summary) {
+    notes.push(`Use the report summary as a secondary proof point: ${report.summary}`);
+  }
+
+  notes.push('CTA: invite them to schedule a 15-minute walkthrough before proposing any paid work.');
+
+  return notes;
+}
+
+function AuditResearchReview({ submission, audit, reports = [], documents = [] }) {
+  const [reportExpanded, setReportExpanded] = useState(false);
+
+  if (!audit) {
+    return null;
+  }
+
+  const findings = audit.findings || [];
+  const sources = audit.sources || [];
+  const competitorInsights = audit.competitor_insights || [];
+  const report = reports.find((item) => isReportForAudit(item, audit)) || null;
+  const reportContent = report?.content || report?.summary || '';
+  const auditDocuments = documents.filter((document) => isDocumentForAudit(document, audit, report));
+  const reportPreviewLength = 2600;
+  const reportPreview = reportExpanded ? reportContent : reportExcerpt(reportContent, reportPreviewLength);
+  const reportIsLong = reportContent.length > reportPreviewLength;
+  const personalizationNotes = buildAuditEmailPersonalization(submission, audit, report);
+  const personalizationCopy = personalizationNotes.map((note) => `- ${note}`).join('\n');
+
+  return (
+    <div className="mt-6 rounded-[24px] border border-line/80 bg-fog/70 p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <SectionLabel>Research Review</SectionLabel>
+          <h3 className="mt-3 text-xl font-semibold text-ink">{audit.business_name}</h3>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Pill tone={auditScoreTone(audit.score || 0)}>Score {audit.score ?? 0}</Pill>
+          <Pill>{audit.status}</Pill>
+          {report ? <Pill tone="success">Report ready</Pill> : null}
+        </div>
+      </div>
+
+      <p className="mt-4 text-sm leading-7 text-ink/74">{audit.summary}</p>
+
+      <div className="mt-6 border-t border-line/80 pt-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h4 className="text-sm font-semibold uppercase tracking-[0.16em] text-moss">Audit Findings</h4>
+          <Pill tone={findings.length ? 'warning' : 'success'}>{findings.length} finding(s)</Pill>
+        </div>
+
+        {findings.length > 0 ? (
+          <div className="mt-4 divide-y divide-line/80">
+            {findings.map((finding, findingIndex) => (
+              <div className="py-4 text-sm leading-7 text-ink/74" key={`${audit.id}-${finding.title}-${findingIndex}`}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="font-semibold text-ink">{finding.title}</p>
+                  <Pill tone={finding.severity === 'high' ? 'danger' : finding.severity === 'medium' ? 'warning' : 'default'}>
+                    {finding.severity}
+                  </Pill>
+                  <Pill>{finding.category}</Pill>
+                </div>
+                <p className="mt-2"><strong>Impact:</strong> {finding.impact}</p>
+                <p><strong>Recommended fix:</strong> {finding.recommendation}</p>
+                {finding.evidence ? <p><strong>Evidence:</strong> {finding.evidence}</p> : null}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="mt-4 rounded-2xl border border-moss/20 bg-white/70 px-4 py-3 text-sm leading-7 text-moss">
+            No material lead-reducing issues were found in the latest homepage audit.
+          </p>
+        )}
+      </div>
+
+      <div className="mt-6 grid gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+        <div className="border-t border-line/80 pt-5">
+          <h4 className="text-sm font-semibold uppercase tracking-[0.16em] text-moss">Sources Checked</h4>
+          {sources.length > 0 ? (
+            <div className="mt-4 divide-y divide-line/80">
+              {sources.map((source, sourceIndex) => (
+                <div className="py-3 text-sm leading-6 text-ink/74" key={`${audit.id}-source-${source.url}-${sourceIndex}`}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <a
+                      className="inline-flex items-center gap-2 font-semibold text-ink transition hover:text-moss"
+                      href={source.url}
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      <Link2 className="h-3.5 w-3.5" />
+                      {hostLabel(source.url)}
+                    </a>
+                    <Pill>{source.type}</Pill>
+                    <Pill tone={Number(source.status) >= 400 || source.status === 'error' ? 'danger' : 'success'}>{source.status || 'checked'}</Pill>
+                  </div>
+                  {source.note ? <p className="mt-1">{source.note}</p> : null}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="mt-4 text-sm leading-7 text-ink/68">No source records were saved for this audit.</p>
+          )}
+        </div>
+
+        <div className="border-t border-line/80 pt-5">
+          <h4 className="text-sm font-semibold uppercase tracking-[0.16em] text-moss">Email Personalization</h4>
+          <ul className="mt-4 list-disc space-y-2 pl-5 text-sm leading-7 text-ink/74">
+            {personalizationNotes.map((note) => (
+              <li key={note}>{note}</li>
+            ))}
+          </ul>
+          <button
+            className="mt-4 inline-flex items-center gap-2 rounded-full border border-ink/10 bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
+            onClick={() => copyText(personalizationCopy)}
+            type="button"
+          >
+            <Copy className="h-3.5 w-3.5" />
+            Copy Email Notes
+          </button>
+        </div>
+      </div>
+
+      {competitorInsights.length > 0 ? (
+        <div className="mt-6 border-t border-line/80 pt-5">
+          <h4 className="text-sm font-semibold uppercase tracking-[0.16em] text-moss">Competitor Snapshot</h4>
+          <div className="mt-4 divide-y divide-line/80">
+            {competitorInsights.map((insight, insightIndex) => (
+              <div className="py-3 text-sm leading-6 text-ink/74" key={`${audit.id}-competitor-${insight.url}-${insightIndex}`}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <a className="font-semibold text-ink transition hover:text-moss" href={insight.url} rel="noreferrer" target="_blank">
+                    {hostLabel(insight.url)}
+                  </a>
+                  <Pill tone={insight.changes?.length ? 'warning' : insight.status === 'checked' ? 'success' : 'default'}>{insight.status}</Pill>
+                </div>
+                <p className="mt-1">{insight.summary}</p>
+                {insight.changes?.length ? <p className="mt-1"><strong>Changes:</strong> {insight.changes.join(', ')}</p> : null}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      <div className="mt-6 border-t border-line/80 pt-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <h4 className="text-sm font-semibold uppercase tracking-[0.16em] text-moss">Generated Report</h4>
+          <div className="flex flex-wrap gap-2">
+            {auditDocuments.length > 0 ? <Pill>{auditDocuments.length} artifact(s)</Pill> : null}
+            {report ? <Pill>{report.format}</Pill> : null}
+          </div>
+        </div>
+        {report ? (
+          <>
+            <div className="mt-4 flex flex-col gap-3 text-sm text-ink/74 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="font-semibold text-ink">{report.title}</p>
+                <p className="mt-1 text-xs uppercase tracking-[0.14em] text-moss/70">{formatDateTime(report.created_at)}</p>
+              </div>
+              <button
+                className="inline-flex items-center gap-2 rounded-full border border-ink/10 bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
+                onClick={() => copyText(reportContent)}
+                type="button"
+              >
+                <Copy className="h-3.5 w-3.5" />
+                Copy Report
+              </button>
+              {reportIsLong ? (
+                <button
+                  className="inline-flex items-center gap-2 rounded-full border border-ink/10 bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
+                  onClick={() => setReportExpanded((current) => !current)}
+                  type="button"
+                >
+                  {reportExpanded ? 'Show Preview' : 'Show Full Report'}
+                </button>
+              ) : null}
+            </div>
+            <pre className="mt-4 max-h-80 overflow-auto whitespace-pre-wrap rounded-2xl border border-line/80 bg-white/80 p-4 text-xs leading-6 text-ink/74">
+              {reportPreview || 'No report content was saved for this audit.'}
+            </pre>
+          </>
+        ) : (
+          <p className="mt-4 text-sm leading-7 text-ink/68">No generated report is attached to this audit yet.</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function DashboardPage() {
   const [authState, setAuthState] = useState({
     checked: false,
@@ -1503,7 +1753,6 @@ export default function DashboardPage() {
             const latestAudit = submission.latest_prospect_audit;
             const generatedReports = submission.generated_market_reports || [];
             const generatedReportDocuments = submission.generated_report_documents || [];
-            const topAuditFindings = latestAudit?.findings?.slice(0, 3) || [];
             const isSaving = savingSubmissionId === submission.id;
             const isCreatingUpload = creatingUploadForId === submission.id;
             const isAuditing = auditingSubmissionId === submission.id;
@@ -1589,65 +1838,12 @@ export default function DashboardPage() {
                       </div>
                     ) : null}
 
-                    {latestAudit ? (
-                      <div className="mt-6 rounded-[24px] border border-line/80 bg-fog/70 p-5">
-                        <div className="flex flex-wrap items-center justify-between gap-3">
-                          <div>
-                            <SectionLabel>Website Research Audit</SectionLabel>
-                            <h3 className="mt-3 text-xl font-semibold text-ink">{latestAudit.business_name}</h3>
-                          </div>
-                          <div className="flex flex-wrap gap-2">
-                            <Pill tone={auditScoreTone(latestAudit.score || 0)}>Score {latestAudit.score ?? 0}</Pill>
-                            <Pill>{latestAudit.status}</Pill>
-                          </div>
-                        </div>
-
-                        <p className="mt-4 text-sm leading-7 text-ink/74">{latestAudit.summary}</p>
-
-                        {topAuditFindings.length > 0 ? (
-                          <div className="mt-4 grid gap-3 lg:grid-cols-3">
-                            {topAuditFindings.map((finding) => (
-                              <div className="rounded-2xl border border-line/80 bg-white/80 px-4 py-3 text-sm leading-6 text-ink/74" key={`${latestAudit.id}-${finding.title}`}>
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <p className="font-semibold text-ink">{finding.title}</p>
-                                  <Pill tone={finding.severity === 'high' ? 'danger' : finding.severity === 'medium' ? 'warning' : 'default'}>
-                                    {finding.severity}
-                                  </Pill>
-                                </div>
-                                <p className="mt-2">{finding.recommendation}</p>
-                              </div>
-                            ))}
-                          </div>
-                        ) : (
-                          <p className="mt-4 rounded-2xl border border-moss/20 bg-white/70 px-4 py-3 text-sm leading-7 text-moss">
-                            No material lead-reducing issues were found in the latest homepage audit.
-                          </p>
-                        )}
-
-                        {generatedReports.length > 0 ? (
-                          <div className="mt-4 space-y-3">
-                            {generatedReports.slice(0, 2).map((report) => (
-                              <div className="flex flex-col gap-3 rounded-2xl border border-line/80 bg-white/80 px-4 py-3 text-sm text-ink/74 sm:flex-row sm:items-center sm:justify-between" key={report.id}>
-                                <div>
-                                  <p className="font-semibold text-ink">{report.title}</p>
-                                  <p className="mt-1 text-xs uppercase tracking-[0.14em] text-moss/70">
-                                    {report.format} | {formatDateTime(report.created_at)}
-                                  </p>
-                                </div>
-                                <button
-                                  className="inline-flex items-center gap-2 rounded-full border border-ink/10 bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
-                                  onClick={() => copyText(report.content || report.summary || '')}
-                                  type="button"
-                                >
-                                  <Copy className="h-3.5 w-3.5" />
-                                  Copy Report
-                                </button>
-                              </div>
-                            ))}
-                          </div>
-                        ) : null}
-                      </div>
-                    ) : null}
+                    <AuditResearchReview
+                      audit={latestAudit}
+                      documents={generatedReportDocuments}
+                      reports={generatedReports}
+                      submission={submission}
+                    />
                   </div>
 
                   <div className="w-full xl:w-[320px]">
