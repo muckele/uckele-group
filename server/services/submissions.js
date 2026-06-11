@@ -5,6 +5,7 @@ import { getClientIp } from '../utils/http.js';
 import { hashIp } from '../utils/security.js';
 import { forwardToCrm } from './crmForwarder.js';
 import { deliverSubmission } from './delivery.js';
+import { summarizeEmailEngagement } from './emailEvents.js';
 import { evaluateSubmissionSpam } from './spamProtection.js';
 import { verifyTurnstileToken } from './turnstile.js';
 import {
@@ -17,6 +18,7 @@ import {
 } from './workflow.js';
 
 const allowedStatuses = ['new', 'review', 'contacted', 'archived', 'spam'];
+const enrichmentLookupBatchSize = 250;
 
 const dealFieldNormalizers = {
   company: (value) => normalizeField(value, 160),
@@ -250,6 +252,9 @@ function buildCsv(submissions) {
     'Assigned To',
     'Follow-Up State',
     'Next Action',
+    'Email Engagement Score',
+    'Last Email Event',
+    'Email Follow-Up Signal',
     'Notification',
     'Follow-Up Prompt',
     'Source',
@@ -290,6 +295,9 @@ function buildCsv(submissions) {
         submission.assigned_to,
         submission.follow_up_state,
         submission.next_action_at,
+        submission.email_engagement?.score ?? 0,
+        submission.email_engagement?.last_event_at || '',
+        submission.email_engagement?.action || '',
         followUpPrompt?.title || '',
         followUpPrompt?.prompt || '',
         submission.source,
@@ -303,16 +311,102 @@ function buildCsv(submissions) {
   return lines.join('\n');
 }
 
-async function enrichSubmission(submission, storage, nowValue = new Date()) {
-  const [uploadRequest, documents] = await Promise.all([
-    storage.getLatestSecureUploadRequestForSubmission(submission.id),
-    storage.listSecureDocumentsForSubmission(submission.id),
-  ]);
+function collectContactEmails(submission) {
+  return [submission.email, submission.broker_email, submission.seller_email]
+    .map((value) => normalizeEmail(value, 200))
+    .filter(Boolean)
+    .filter((value, index, list) => list.indexOf(value) === index);
+}
 
+function dedupeEmailEvents(events) {
+  const seen = new Set();
+
+  return events.filter((event) => {
+    const key = event.id || `${event.message_id || ''}:${event.event_type || ''}:${event.created_at || ''}:${event.recipient_email || ''}`;
+
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function groupBy(items, keyGetter) {
+  return items.reduce((accumulator, item) => {
+    const key = keyGetter(item);
+
+    if (!key) {
+      return accumulator;
+    }
+
+    if (!accumulator.has(key)) {
+      accumulator.set(key, []);
+    }
+
+    accumulator.get(key).push(item);
+    return accumulator;
+  }, new Map());
+}
+
+function firstBy(items, keyGetter) {
+  return items.reduce((accumulator, item) => {
+    const key = keyGetter(item);
+
+    if (key && !accumulator.has(key)) {
+      accumulator.set(key, item);
+    }
+
+    return accumulator;
+  }, new Map());
+}
+
+function uniqueValues(values = []) {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function chunkValues(values = [], size = enrichmentLookupBatchSize) {
+  const chunks = [];
+
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+
+  return chunks;
+}
+
+async function listInBatches(values, listFn) {
+  const unique = uniqueValues(values);
+
+  if (unique.length === 0) {
+    return [];
+  }
+
+  const results = [];
+
+  for (const chunk of chunkValues(unique)) {
+    results.push(...(await listFn(chunk)));
+  }
+
+  return results;
+}
+
+function enrichSubmissionWithRelatedData(
+  submission,
+  { uploadRequest = null, documents = [], emailEvents = [], prospectAudits = [], marketReports = [], reportDocuments = [] } = {},
+  nowValue = new Date(),
+) {
+  const emailEngagement = summarizeEmailEngagement(dedupeEmailEvents(emailEvents));
   const enriched = {
     ...submission,
     latest_upload_request: uploadRequest,
     secure_documents: documents,
+    prospect_audits: prospectAudits,
+    latest_prospect_audit: prospectAudits[0] || null,
+    generated_market_reports: marketReports,
+    generated_report_documents: reportDocuments,
+    email_engagement: emailEngagement,
     status_updated_at: submission.status_updated_at || submission.updated_at,
     days_since_added: daysAgoFrom(submission.created_at, nowValue),
   };
@@ -323,7 +417,98 @@ async function enrichSubmission(submission, storage, nowValue = new Date()) {
   };
 }
 
-function buildNotificationSummary(summary, submissions) {
+async function enrichSubmission(submission, storage, nowValue = new Date()) {
+  const contactEmails = collectContactEmails(submission);
+  const emailEventQueries = storage.listEmailEvents
+    ? [
+        storage.listEmailEvents({ submissionId: submission.id, limit: 100 }),
+        ...contactEmails.map((recipientEmail) => storage.listEmailEvents({ recipientEmail, limit: 100 })),
+      ]
+    : [];
+  const researchQueries = [
+    storage.listProspectAudits ? storage.listProspectAudits({ submissionId: submission.id, limit: 10 }) : Promise.resolve([]),
+    storage.listGeneratedMarketReports ? storage.listGeneratedMarketReports({ submissionId: submission.id, limit: 10 }) : Promise.resolve([]),
+    storage.listGeneratedReportDocuments ? storage.listGeneratedReportDocuments({ submissionId: submission.id, limit: 20 }) : Promise.resolve([]),
+  ];
+  const [uploadRequest, documents, prospectAudits, marketReports, reportDocuments, ...emailEventResults] = await Promise.all([
+    storage.getLatestSecureUploadRequestForSubmission(submission.id),
+    storage.listSecureDocumentsForSubmission(submission.id),
+    ...researchQueries,
+    ...emailEventQueries,
+  ]);
+
+  return enrichSubmissionWithRelatedData(
+    submission,
+    {
+      uploadRequest,
+      documents,
+      prospectAudits,
+      marketReports,
+      reportDocuments,
+      emailEvents: emailEventResults.flat(),
+    },
+    nowValue,
+  );
+}
+
+async function enrichSubmissions(submissions, storage, nowValue = new Date()) {
+  if (submissions.length === 0) {
+    return [];
+  }
+
+  if (
+    !storage.listLatestSecureUploadRequestsForSubmissions ||
+    !storage.listSecureDocumentsForSubmissions ||
+    !storage.listEmailEventsForSubmissions ||
+    !storage.listEmailEventsForRecipients ||
+    !storage.listProspectAuditsForSubmissions ||
+    !storage.listGeneratedMarketReportsForSubmissions ||
+    !storage.listGeneratedReportDocumentsForSubmissions
+  ) {
+    return Promise.all(submissions.map((submission) => enrichSubmission(submission, storage, nowValue)));
+  }
+
+  const submissionIds = submissions.map((submission) => submission.id);
+  const contactEmails = submissions.flatMap(collectContactEmails);
+  const [uploadRequests, documents, submissionEmailEvents, recipientEmailEvents, prospectAudits, marketReports, reportDocuments] = await Promise.all([
+    listInBatches(submissionIds, (ids) => storage.listLatestSecureUploadRequestsForSubmissions(ids)),
+    listInBatches(submissionIds, (ids) => storage.listSecureDocumentsForSubmissions(ids)),
+    listInBatches(submissionIds, (ids) => storage.listEmailEventsForSubmissions(ids)),
+    listInBatches(contactEmails, (emails) => storage.listEmailEventsForRecipients(emails)),
+    listInBatches(submissionIds, (ids) => storage.listProspectAuditsForSubmissions(ids)),
+    listInBatches(submissionIds, (ids) => storage.listGeneratedMarketReportsForSubmissions(ids)),
+    listInBatches(submissionIds, (ids) => storage.listGeneratedReportDocumentsForSubmissions(ids)),
+  ]);
+  const latestUploadBySubmission = firstBy(uploadRequests, (request) => request.submission_id);
+  const documentsBySubmission = groupBy(documents, (document) => document.submission_id);
+  const eventsBySubmission = groupBy(submissionEmailEvents, (event) => event.submission_id);
+  const eventsByRecipient = groupBy(recipientEmailEvents, (event) => normalizeEmail(event.recipient_email, 200));
+  const auditsBySubmission = groupBy(prospectAudits, (audit) => audit.submission_id);
+  const reportsBySubmission = groupBy(marketReports, (report) => report.submission_id);
+  const reportDocumentsBySubmission = groupBy(reportDocuments, (document) => document.submission_id);
+
+  return submissions.map((submission) => {
+    const emailEvents = [
+      ...(eventsBySubmission.get(submission.id) || []),
+      ...collectContactEmails(submission).flatMap((email) => eventsByRecipient.get(email) || []),
+    ];
+
+    return enrichSubmissionWithRelatedData(
+      submission,
+      {
+        uploadRequest: latestUploadBySubmission.get(submission.id) || null,
+        documents: documentsBySubmission.get(submission.id) || [],
+        prospectAudits: auditsBySubmission.get(submission.id) || [],
+        marketReports: reportsBySubmission.get(submission.id) || [],
+        reportDocuments: reportDocumentsBySubmission.get(submission.id) || [],
+        emailEvents,
+      },
+      nowValue,
+    );
+  });
+}
+
+function buildNotificationSummary(summary, submissions, emailTriage = []) {
   const actionItems = submissions.filter((submission) => submission.follow_up_prompt);
   const notificationSummary = actionItems.reduce(
     (accumulator, submission) => {
@@ -355,6 +540,8 @@ function buildNotificationSummary(summary, submissions) {
     overdue: notificationSummary.overdue,
     dueSoon: notificationSummary.dueSoon,
     missingNextAction: notificationSummary.missingNextAction,
+    emailEngaged: emailTriage.length,
+    hotLeads: emailTriage.filter((submission) => submission.email_engagement?.hot).length,
   };
 }
 
@@ -653,7 +840,7 @@ export async function listDashboardSubmissions({ page, search, status }) {
     storage.listSubmissions({ page, search, status }),
   ]);
   const now = new Date();
-  const enriched = await Promise.all(submissions.rows.map((submission) => enrichSubmission(submission, storage, now)));
+  const enriched = await enrichSubmissions(submissions.rows, storage, now);
   const notifications = enriched
     .filter((submission) => submission.follow_up_prompt)
     .sort((left, right) => {
@@ -666,10 +853,31 @@ export async function listDashboardSubmissions({ page, search, status }) {
 
       return Date.parse(right.created_at || '') - Date.parse(left.created_at || '');
     });
+  const emailTriage = enriched
+    .filter(
+      (submission) =>
+        submission.email_engagement?.actionable ||
+        submission.email_engagement?.bounced ||
+        submission.email_engagement?.complained ||
+        submission.email_engagement?.failed ||
+        submission.email_engagement?.unsubscribed,
+    )
+    .sort((left, right) => {
+      const scoreDifference = (right.email_engagement?.score || 0) - (left.email_engagement?.score || 0);
+
+      if (scoreDifference !== 0) {
+        return scoreDifference;
+      }
+
+      const rightLastEventAt = Date.parse(right.email_engagement?.last_event_at || '') || 0;
+      const leftLastEventAt = Date.parse(left.email_engagement?.last_event_at || '') || 0;
+      return rightLastEventAt - leftLastEventAt;
+    });
 
   return {
-    summary: buildNotificationSummary(baseSummary, enriched),
+    summary: buildNotificationSummary(baseSummary, enriched, emailTriage),
     notifications,
+    emailTriage,
     submissions: enriched,
     total: submissions.total,
   };
@@ -782,6 +990,6 @@ export async function exportDashboardSubmissionsCsv() {
   const storage = getStorage();
   const now = new Date();
   const result = await storage.listSubmissions({ limit: 5000, page: 1, status: 'all' });
-  const enriched = await Promise.all(result.rows.map((submission) => enrichSubmission(submission, storage, now)));
+  const enriched = await enrichSubmissions(result.rows, storage, now);
   return buildCsv(enriched);
 }

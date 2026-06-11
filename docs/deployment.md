@@ -28,6 +28,16 @@ fly secrets set \
   RESEND_API_KEY=... \
   RESEND_FROM_EMAIL="Uckele Group <mathew@uckelegroup.com>" \
   RESEND_REPLY_TO=mathew@uckelegroup.com \
+  RESEND_WEBHOOK_SECRET=... \
+  PUBLIC_SCHEDULING_URL=https://calendly.com/your-calendar/15min \
+  PUBLIC_CONTACT_FORM_URL=https://www.uckelegroup.com/contact \
+  PUBLIC_UNSUBSCRIBE_URL=https://www.uckelegroup.com/unsubscribe \
+  OUTREACH_COMPANY_NAME="Uckele Group" \
+  OUTREACH_SENDER_NAME="Mathew Uckele" \
+  DEAL_HUNTER_EMAIL_RECIPIENT=mathew@uckelegroup.com \
+  DEAL_HUNTER_CRON_SECRET=... \
+  DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL="https://airtable.com/appEGxhjno0HTpEco/shrUhtbnzZTPaR4Lk/tblACIQ9QNiVmoWSK?viewControls=on" \
+  DEAL_HUNTER_SHEET_CSV_URL="https://docs.google.com/spreadsheets/d/.../gviz/tq?tqx=out:csv&gid=..." \
   ADMIN_AUTH_MODE=magic-link \
   ADMIN_EMAIL=mathew@uckelegroup.com \
   ADMIN_SESSION_SECRET=... \
@@ -42,6 +52,11 @@ Optional overrides:
 fly secrets set \
   CRM_WEBHOOK_URL=... \
   CRM_WEBHOOK_SECRET=... \
+  OUTREACH_MAILING_ADDRESS="Your business mailing address" \
+  DEAL_HUNTER_AIRTABLE_TOKEN=... \
+  DEAL_HUNTER_AIRTABLE_BASE_ID=appEGxhjno0HTpEco \
+  DEAL_HUNTER_AIRTABLE_TABLE_ID=tblACIQ9QNiVmoWSK \
+  DEAL_HUNTER_AIRTABLE_VIEW_ID=viw4OORhKKWPUsWa4 \
   DEFAULT_LEAD_ASSIGNEE="Mathew Uckele" \
   DEFAULT_FOLLOW_UP_DELAY_HOURS=24
 ```
@@ -96,11 +111,17 @@ Then update DNS:
 - `/admin` is private and requires authentication.
 - `/secure-documents` is token-protected and should remain unindexed.
 - Turnstile should be enabled in production.
+- Configure Resend webhooks to post email events to `/api/webhooks/resend`; use the same signing secret in `RESEND_WEBHOOK_SECRET`.
 
 ## Before Go-Live
 
 - Confirm the contact form is delivering to `mathew@uckelegroup.com`
+- Confirm the branded prospect email template includes booking, website, form, and unsubscribe links
+- Confirm `/admin` can run Deal Hunter scoring and send the daily email
+- Confirm the scheduler posts to `/api/deal-hunter/daily-email` with `Authorization: Bearer DEAL_HUNTER_CRON_SECRET`
+- Confirm the first successful daily email creates Deal Hunter history rows so later emails can separate newly seen matches from already reviewed listings
 - Confirm magic-link sign-in emails are being delivered
+- Confirm Resend webhook events create email engagement records in the admin CRM
 - Verify `/api/health` returns `200` on the Fly URL
 - Confirm uploaded secure documents are written under the mounted volume
 - Confirm `robots.txt` and `sitemap.xml` are live on `https://www.uckelegroup.com`

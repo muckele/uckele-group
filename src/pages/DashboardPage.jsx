@@ -10,7 +10,9 @@ import {
   LogOut,
   MailCheck,
   Plus,
+  RefreshCw,
   Save,
+  Send,
   ShieldAlert,
 } from 'lucide-react';
 import PageHero from '../components/PageHero';
@@ -61,6 +63,98 @@ function formatDateTime(value) {
 
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? 'Not set' : date.toLocaleString();
+}
+
+function pluralize(count, label) {
+  return `${count} ${label}${count === 1 ? '' : 's'}`;
+}
+
+function emailEngagementTone(engagement) {
+  if (!engagement?.total) {
+    return 'default';
+  }
+
+  if (engagement.tone === 'danger') {
+    return 'danger';
+  }
+
+  if (engagement.tone === 'success') {
+    return 'success';
+  }
+
+  if (engagement.tone === 'warning') {
+    return 'warning';
+  }
+
+  if (engagement.tone === 'info') {
+    return 'info';
+  }
+
+  return 'default';
+}
+
+function formatEmailEngagement(engagement) {
+  if (!engagement?.total) {
+    return 'No tracked email activity yet.';
+  }
+
+  const parts = [];
+
+  if (engagement.opened) {
+    parts.push(pluralize(engagement.opened, 'open'));
+  }
+
+  if (engagement.clicked) {
+    parts.push(pluralize(engagement.clicked, 'click'));
+  }
+
+  if (engagement.replied) {
+    parts.push(pluralize(engagement.replied, 'reply'));
+  }
+
+  if (engagement.bounced || engagement.complained || engagement.failed || engagement.unsubscribed) {
+    parts.push(pluralize(engagement.bounced + engagement.complained + engagement.failed + engagement.unsubscribed, 'delivery issue'));
+  }
+
+  if (parts.length === 0) {
+    parts.push(pluralize(engagement.sent + engagement.delivered, 'sent email'));
+  }
+
+  return `${parts.join(', ')}. Last event: ${formatLabel(engagement.latest_event_type)} at ${formatDateTime(engagement.last_event_at)}.`;
+}
+
+function auditScoreTone(score) {
+  if (score >= 85) {
+    return 'success';
+  }
+
+  if (score >= 65) {
+    return 'warning';
+  }
+
+  return 'danger';
+}
+
+function dealScoreTone(score) {
+  if (score >= 70) {
+    return 'success';
+  }
+
+  if (score >= 55) {
+    return 'warning';
+  }
+
+  return 'danger';
+}
+
+function formatMoney(value) {
+  return Number.isFinite(value)
+    ? new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: 'USD',
+        maximumFractionDigits: 0,
+      }).format(value)
+    : 'Not disclosed';
 }
 
 function buildDraft(submission) {
@@ -252,6 +346,52 @@ function LinksRow({ submission }) {
   );
 }
 
+function DealHunterCard({ deal, mode = 'fit' }) {
+  const detailItems = mode === 'remove' ? deal.removeReasons || deal.concerns || [] : deal.strengths || [];
+  const meta = [
+    deal.industry,
+    deal.location,
+    deal.annualProfit ? `Profit ${formatMoney(deal.annualProfit)}` : '',
+    deal.askingPrice ? `Ask ${formatMoney(deal.askingPrice)}` : '',
+    deal.profitMultiple ? `${deal.profitMultiple}x profit` : '',
+  ].filter(Boolean);
+
+  return (
+    <div className={`rounded-[24px] border p-5 ${notificationToneClasses(mode === 'remove' ? 'danger' : mode === 'watch' ? 'warning' : 'info')}`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <Pill tone={dealScoreTone(deal.score)}>Score {deal.score}</Pill>
+        {deal.isNew ? <Pill tone="success">New</Pill> : null}
+        <Pill>{deal.sourceName}</Pill>
+      </div>
+      <h3 className="mt-3 text-lg font-semibold leading-snug">{deal.name}</h3>
+      {meta.length > 0 ? <p className="mt-2 text-sm leading-6">{meta.join(' | ')}</p> : null}
+      {deal.recommendation ? <p className="mt-3 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-6">{deal.recommendation}</p> : null}
+      {detailItems.length > 0 ? (
+        <ul className="mt-3 list-disc space-y-1 pl-5 text-sm leading-6">
+          {detailItems.slice(0, 3).map((item) => (
+            <li key={`${deal.id}-${item}`}>{item}</li>
+          ))}
+        </ul>
+      ) : null}
+      {deal.questions?.length > 0 ? (
+        <div className="mt-4 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-6">
+          <p className="font-semibold uppercase tracking-[0.14em]">Questions</p>
+          <ul className="mt-2 list-disc space-y-1 pl-5">
+            {deal.questions.slice(0, 2).map((question) => (
+              <li key={`${deal.id}-${question}`}>{question}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {deal.listingUrl ? (
+        <a className="mt-4 inline-flex text-sm font-semibold text-moss underline" href={deal.listingUrl} rel="noreferrer" target="_blank">
+          View listing
+        </a>
+      ) : null}
+    </div>
+  );
+}
+
 async function copyText(value) {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(value);
@@ -283,16 +423,21 @@ export default function DashboardPage() {
   const [loginError, setLoginError] = useState('');
   const [loginPending, setLoginPending] = useState(false);
   const [filters, setFilters] = useState({ search: '', status: 'all' });
-  const [dashboardData, setDashboardData] = useState({ summary: null, submissions: [], notifications: [], total: 0 });
+  const [dashboardData, setDashboardData] = useState({ summary: null, submissions: [], notifications: [], emailTriage: [], total: 0 });
   const [drafts, setDrafts] = useState({});
   const [loading, setLoading] = useState(false);
   const [actionError, setActionError] = useState('');
   const [savingSubmissionId, setSavingSubmissionId] = useState('');
   const [creatingUploadForId, setCreatingUploadForId] = useState('');
+  const [auditingSubmissionId, setAuditingSubmissionId] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
   const [createDraft, setCreateDraft] = useState(blankRecordDraft());
   const [createPending, setCreatePending] = useState(false);
   const [createError, setCreateError] = useState('');
+  const [dealHunterReview, setDealHunterReview] = useState(null);
+  const [dealHunterLoading, setDealHunterLoading] = useState(false);
+  const [dealHunterSending, setDealHunterSending] = useState(false);
+  const [dealHunterFeedback, setDealHunterFeedback] = useState({ error: '', message: '' });
   const deferredSearch = useDeferredValue(filters.search);
 
   async function checkSession() {
@@ -371,6 +516,7 @@ export default function DashboardPage() {
         summary: result.summary,
         submissions: result.submissions,
         notifications: result.notifications || [],
+        emailTriage: result.emailTriage || [],
         total: result.total,
       });
       setDrafts(
@@ -511,6 +657,9 @@ export default function DashboardPage() {
         notifications: current.notifications.map((submission) =>
           submission.id === submissionId ? result.submission : submission,
         ),
+        emailTriage: current.emailTriage.map((submission) =>
+          submission.id === submissionId ? result.submission : submission,
+        ),
       }));
       setDrafts((current) => ({
         ...current,
@@ -601,6 +750,89 @@ export default function DashboardPage() {
     }
   }
 
+  async function handleRunResearchAudit(submissionId) {
+    const draft = drafts[submissionId] || {};
+    const url = draft.business_website || '';
+
+    if (!url) {
+      setActionError('Add a website URL before running the audit.');
+      return;
+    }
+
+    setAuditingSubmissionId(submissionId);
+    setActionError('');
+
+    try {
+      const response = await fetch(`/api/admin/submissions/${submissionId}/research-audit`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ url }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to run the website audit.');
+      }
+
+      await loadDashboard(filters.status, deferredSearch.trim());
+    } catch (error) {
+      setActionError(error.message || 'Unable to run the website audit.');
+    } finally {
+      setAuditingSubmissionId('');
+    }
+  }
+
+  async function handleLoadDealHunterReview() {
+    setDealHunterLoading(true);
+    setDealHunterFeedback({ error: '', message: '' });
+
+    try {
+      const response = await fetch('/api/admin/deal-hunter/review', {
+        credentials: 'same-origin',
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to review daily deals.');
+      }
+
+      setDealHunterReview(result.review);
+      setDealHunterFeedback({ error: '', message: `Reviewed ${result.review?.totals?.reviewedDeals || 0} recent deals.` });
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to review daily deals.', message: '' });
+    } finally {
+      setDealHunterLoading(false);
+    }
+  }
+
+  async function handleSendDealHunterEmail() {
+    setDealHunterSending(true);
+    setDealHunterFeedback({ error: '', message: '' });
+
+    try {
+      const response = await fetch('/api/admin/deal-hunter/send', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.emailResult?.error || result.error || 'Unable to send the daily deal email.');
+      }
+
+      setDealHunterReview(result.review);
+      setDealHunterFeedback({ error: '', message: 'Daily deal email sent.' });
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to send the daily deal email.', message: '' });
+    } finally {
+      setDealHunterSending(false);
+    }
+  }
+
   const summary = dashboardData.summary || {
     total: 0,
     lastSevenDays: 0,
@@ -609,6 +841,8 @@ export default function DashboardPage() {
     overdue: 0,
     dueSoon: 0,
     missingNextAction: 0,
+    emailEngaged: 0,
+    hotLeads: 0,
     new: 0,
     review: 0,
     contacted: 0,
@@ -618,6 +852,7 @@ export default function DashboardPage() {
 
   const submissions = useMemo(() => dashboardData.submissions || [], [dashboardData.submissions]);
   const notifications = useMemo(() => dashboardData.notifications || [], [dashboardData.notifications]);
+  const emailTriage = useMemo(() => dashboardData.emailTriage || [], [dashboardData.emailTriage]);
 
   if (!authState.checked) {
     return (
@@ -783,14 +1018,160 @@ export default function DashboardPage() {
       </section>
 
       <section className="section-shell mt-8">
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
           <StatCard icon={Inbox} label="Total Records" value={summary.total} />
           <StatCard icon={BellRing} label="Action Items" value={summary.actionItems} tone={summary.actionItems > 0 ? 'warning' : 'default'} />
           <StatCard icon={CalendarClock} label="Overdue" value={summary.overdue} tone={summary.overdue > 0 ? 'danger' : 'default'} />
           <StatCard icon={ClipboardList} label="Due Soon" value={summary.dueSoon} tone={summary.dueSoon > 0 ? 'warning' : 'default'} />
+          <StatCard icon={MailCheck} label="Warm Leads" value={summary.emailEngaged} tone={summary.emailEngaged > 0 ? 'warning' : 'default'} />
           <StatCard icon={MailCheck} label="Last 7 Days" value={summary.lastSevenDays} />
           <StatCard icon={ShieldAlert} label="Spam" value={summary.spam} />
         </div>
+      </section>
+
+      <section className="section-shell mt-8">
+        <Reveal className="panel p-7 sm:p-8">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <SectionLabel>Deal Hunter Scoring</SectionLabel>
+              <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Daily source review</h2>
+              <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
+                Pulls the SMB Deal Hunter sheet and the larger Airtable business list, scores recent listings against your acquisition profile, and flags removals for tomorrow's update.
+              </p>
+            </div>
+
+            <div className="grid w-full gap-3 sm:flex sm:w-auto sm:flex-wrap">
+              <button
+                className={secondaryActionButtonClass}
+                disabled={dealHunterLoading || dealHunterSending}
+                onClick={handleLoadDealHunterReview}
+                type="button"
+              >
+                <RefreshCw className={`h-4 w-4 ${dealHunterLoading ? 'animate-spin' : ''}`} />
+                {dealHunterLoading ? 'Reviewing...' : 'Review Sources'}
+              </button>
+              <button
+                className={primaryActionButtonClass}
+                disabled={dealHunterLoading || dealHunterSending}
+                onClick={handleSendDealHunterEmail}
+                type="button"
+              >
+                <Send className="h-4 w-4" />
+                {dealHunterSending ? 'Sending...' : 'Send Daily Email'}
+              </button>
+            </div>
+          </div>
+
+          {dealHunterFeedback.error ? (
+            <p className="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{dealHunterFeedback.error}</p>
+          ) : null}
+          {dealHunterFeedback.message ? (
+            <p className="mt-5 rounded-2xl border border-moss/20 bg-moss/8 px-4 py-3 text-sm font-medium text-moss">{dealHunterFeedback.message}</p>
+          ) : null}
+
+          {dealHunterReview ? (
+            <div className="mt-7 space-y-7">
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
+                <StatCard icon={ClipboardList} label="Reviewed" value={dealHunterReview.totals?.reviewedDeals || 0} />
+                <StatCard icon={BellRing} label="New Fits" value={dealHunterReview.totals?.newMatches || 0} tone={dealHunterReview.totals?.newMatches > 0 ? 'warning' : 'default'} />
+                <StatCard icon={MailCheck} label="High Fit" value={dealHunterReview.totals?.qualified || 0} tone={dealHunterReview.totals?.qualified > 0 ? 'warning' : 'default'} />
+                <StatCard icon={Inbox} label="Watchlist" value={dealHunterReview.totals?.watchlist || 0} />
+                <StatCard icon={ShieldAlert} label="Remove" value={dealHunterReview.totals?.removalCandidates || 0} tone={dealHunterReview.totals?.removalCandidates > 0 ? 'danger' : 'default'} />
+                <StatCard icon={CalendarClock} label="Lookback" value={`${dealHunterReview.lookbackDays || 0}d`} />
+              </div>
+
+              <div className="grid gap-4 lg:grid-cols-2">
+                <div className="rounded-[24px] border border-line/80 bg-fog/70 p-5">
+                  <SectionLabel>Sources</SectionLabel>
+                  <div className="mt-4 space-y-3">
+                    {(dealHunterReview.sources || []).map((source) => (
+                      <div className="rounded-2xl border border-line/80 bg-white/75 px-4 py-3 text-sm leading-6 text-ink/74" key={source.id}>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="font-semibold text-ink">{source.name}</p>
+                          <Pill tone={source.fetched ? 'success' : 'danger'}>{source.fetched ? `${source.rowCount || 0} rows` : 'failed'}</Pill>
+                          <Pill>{source.mode}</Pill>
+                        </div>
+                        {source.error ? <p className="mt-2 text-red-700">{source.error}</p> : null}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="rounded-[24px] border border-line/80 bg-white/70 p-5">
+                  <SectionLabel>Criteria Notes</SectionLabel>
+                  {dealHunterReview.criteriaRecommendations?.length > 0 ? (
+                    <ul className="mt-4 list-disc space-y-2 pl-5 text-sm leading-7 text-ink/74">
+                      {dealHunterReview.criteriaRecommendations.map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mt-4 text-sm leading-7 text-ink/68">No criteria changes recommended from the latest run.</p>
+                  )}
+                </div>
+              </div>
+
+              {dealHunterReview.newlySeenMatches?.length > 0 ? (
+                <div>
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <SectionLabel>Newly Seen Fits</SectionLabel>
+                    <Pill tone="success">{dealHunterReview.newlySeenMatches.length}</Pill>
+                  </div>
+                  <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
+                    {dealHunterReview.newlySeenMatches.slice(0, 6).map((deal) => (
+                      <DealHunterCard deal={deal} key={`new-${deal.sourceName}-${deal.dealKey || deal.id || deal.listingUrl}`} />
+                    ))}
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="grid gap-5 xl:grid-cols-3">
+                <div>
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <SectionLabel>High Fit</SectionLabel>
+                    <Pill tone="success">{dealHunterReview.qualified?.length || 0}</Pill>
+                  </div>
+                  <div className="space-y-4">
+                    {(dealHunterReview.qualified || []).slice(0, 4).map((deal) => (
+                      <DealHunterCard deal={deal} key={`qualified-${deal.sourceName}-${deal.id || deal.listingUrl}`} />
+                    ))}
+                    {dealHunterReview.qualified?.length === 0 ? <p className="text-sm leading-7 text-ink/68">No high-fit recent listings found.</p> : null}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <SectionLabel>Watchlist</SectionLabel>
+                    <Pill tone="warning">{dealHunterReview.watchlist?.length || 0}</Pill>
+                  </div>
+                  <div className="space-y-4">
+                    {(dealHunterReview.watchlist || []).slice(0, 4).map((deal) => (
+                      <DealHunterCard deal={deal} key={`watch-${deal.sourceName}-${deal.id || deal.listingUrl}`} mode="watch" />
+                    ))}
+                    {dealHunterReview.watchlist?.length === 0 ? <p className="text-sm leading-7 text-ink/68">No watchlist listings found.</p> : null}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="mb-3 flex items-center justify-between gap-3">
+                    <SectionLabel>Remove</SectionLabel>
+                    <Pill tone="danger">{dealHunterReview.removalCandidates?.length || 0}</Pill>
+                  </div>
+                  <div className="space-y-4">
+                    {(dealHunterReview.removalCandidates || []).slice(0, 4).map((deal) => (
+                      <DealHunterCard deal={deal} key={`remove-${deal.sourceName}-${deal.id || deal.listingUrl}`} mode="remove" />
+                    ))}
+                    {dealHunterReview.removalCandidates?.length === 0 ? <p className="text-sm leading-7 text-ink/68">No removal candidates found.</p> : null}
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <p className="mt-6 rounded-[24px] border border-line/80 bg-fog/70 px-5 py-4 text-sm leading-7 text-ink/70">
+              No source review loaded yet.
+            </p>
+          )}
+        </Reveal>
       </section>
 
       {notifications.length > 0 ? (
@@ -831,6 +1212,49 @@ export default function DashboardPage() {
                   </p>
                 </div>
               ))}
+            </div>
+          </Reveal>
+        </section>
+      ) : null}
+
+      {emailTriage.length > 0 ? (
+        <section className="section-shell mt-8">
+          <Reveal className="panel p-7 sm:p-8">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+              <div>
+                <SectionLabel>Email Follow-Up Triage</SectionLabel>
+                <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Leads showing email engagement</h2>
+                <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
+                  These records have opens, clicks, replies, or delivery issues that should change the follow-up plan.
+                </p>
+              </div>
+              <Pill tone={summary.hotLeads > 0 ? 'success' : 'warning'}>{summary.hotLeads} hot lead(s)</Pill>
+            </div>
+
+            <div className="mt-6 grid gap-4 lg:grid-cols-2">
+              {emailTriage.slice(0, 6).map((submission) => {
+                const engagement = submission.email_engagement;
+
+                return (
+                  <div
+                    className={`rounded-[24px] border p-5 ${notificationToneClasses(engagement?.tone === 'danger' ? 'danger' : engagement?.tone === 'warning' ? 'warning' : 'info')}`}
+                    key={`email-triage-${submission.id}`}
+                  >
+                    <div className="flex flex-wrap items-center gap-3">
+                      <p className="text-lg font-semibold">{submission.company || submission.name}</p>
+                      <Pill tone={emailEngagementTone(engagement)}>Score {engagement?.score || 0}</Pill>
+                      {engagement?.latest_event_type ? <Pill tone={emailEngagementTone(engagement)}>{engagement.latest_event_type}</Pill> : null}
+                    </div>
+                    <p className="mt-3 text-sm leading-7">{formatEmailEngagement(engagement)}</p>
+                    {engagement?.action ? (
+                      <p className="mt-3 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-7">{engagement.action}</p>
+                    ) : null}
+                    <p className="mt-3 text-xs font-semibold uppercase tracking-[0.14em]">
+                      Next action: {formatDateTime(submission.next_action_at)}
+                    </p>
+                  </div>
+                );
+              })}
             </div>
           </Reveal>
         </section>
@@ -1076,8 +1500,13 @@ export default function DashboardPage() {
             const draft = drafts[submission.id] || buildDraft(submission);
             const latestUploadRequest = submission.latest_upload_request;
             const documents = submission.secure_documents || [];
+            const latestAudit = submission.latest_prospect_audit;
+            const generatedReports = submission.generated_market_reports || [];
+            const generatedReportDocuments = submission.generated_report_documents || [];
+            const topAuditFindings = latestAudit?.findings?.slice(0, 3) || [];
             const isSaving = savingSubmissionId === submission.id;
             const isCreatingUpload = creatingUploadForId === submission.id;
+            const isAuditing = auditingSubmissionId === submission.id;
             const followUpPrompt = submission.follow_up_prompt;
 
             return (
@@ -1098,6 +1527,18 @@ export default function DashboardPage() {
                           {followUpPrompt.kind}
                         </Pill>
                       ) : null}
+                      {submission.email_engagement?.actionable ? (
+                        <Pill tone={emailEngagementTone(submission.email_engagement)}>
+                          Email score {submission.email_engagement.score}
+                        </Pill>
+                      ) : null}
+                      {submission.email_engagement?.bounced ||
+                      submission.email_engagement?.complained ||
+                      submission.email_engagement?.failed ||
+                      submission.email_engagement?.unsubscribed ? (
+                        <Pill tone="danger">Email issue</Pill>
+                      ) : null}
+                      {latestAudit ? <Pill tone={auditScoreTone(latestAudit.score || 0)}>Audit {latestAudit.score ?? 0}</Pill> : null}
                     </div>
 
                     <div className="mt-4 grid gap-3 text-sm leading-7 text-ink/74 sm:grid-cols-2 xl:grid-cols-4">
@@ -1147,6 +1588,66 @@ export default function DashboardPage() {
                         <p className="mt-3 whitespace-pre-wrap text-sm leading-7 text-ink/76">{submission.message}</p>
                       </div>
                     ) : null}
+
+                    {latestAudit ? (
+                      <div className="mt-6 rounded-[24px] border border-line/80 bg-fog/70 p-5">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <SectionLabel>Website Research Audit</SectionLabel>
+                            <h3 className="mt-3 text-xl font-semibold text-ink">{latestAudit.business_name}</h3>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <Pill tone={auditScoreTone(latestAudit.score || 0)}>Score {latestAudit.score ?? 0}</Pill>
+                            <Pill>{latestAudit.status}</Pill>
+                          </div>
+                        </div>
+
+                        <p className="mt-4 text-sm leading-7 text-ink/74">{latestAudit.summary}</p>
+
+                        {topAuditFindings.length > 0 ? (
+                          <div className="mt-4 grid gap-3 lg:grid-cols-3">
+                            {topAuditFindings.map((finding) => (
+                              <div className="rounded-2xl border border-line/80 bg-white/80 px-4 py-3 text-sm leading-6 text-ink/74" key={`${latestAudit.id}-${finding.title}`}>
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <p className="font-semibold text-ink">{finding.title}</p>
+                                  <Pill tone={finding.severity === 'high' ? 'danger' : finding.severity === 'medium' ? 'warning' : 'default'}>
+                                    {finding.severity}
+                                  </Pill>
+                                </div>
+                                <p className="mt-2">{finding.recommendation}</p>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="mt-4 rounded-2xl border border-moss/20 bg-white/70 px-4 py-3 text-sm leading-7 text-moss">
+                            No material lead-reducing issues were found in the latest homepage audit.
+                          </p>
+                        )}
+
+                        {generatedReports.length > 0 ? (
+                          <div className="mt-4 space-y-3">
+                            {generatedReports.slice(0, 2).map((report) => (
+                              <div className="flex flex-col gap-3 rounded-2xl border border-line/80 bg-white/80 px-4 py-3 text-sm text-ink/74 sm:flex-row sm:items-center sm:justify-between" key={report.id}>
+                                <div>
+                                  <p className="font-semibold text-ink">{report.title}</p>
+                                  <p className="mt-1 text-xs uppercase tracking-[0.14em] text-moss/70">
+                                    {report.format} | {formatDateTime(report.created_at)}
+                                  </p>
+                                </div>
+                                <button
+                                  className="inline-flex items-center gap-2 rounded-full border border-ink/10 bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
+                                  onClick={() => copyText(report.content || report.summary || '')}
+                                  type="button"
+                                >
+                                  <Copy className="h-3.5 w-3.5" />
+                                  Copy Report
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </div>
 
                   <div className="w-full xl:w-[320px]">
@@ -1175,6 +1676,25 @@ export default function DashboardPage() {
                           <p>{submission.seller_email || 'No email'}</p>
                           <p>{submission.seller_phone || 'No phone'}</p>
                         </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-5 rounded-[24px] border border-line/80 bg-fog/70 p-5">
+                      <SectionLabel>Email Engagement</SectionLabel>
+                      <div className="mt-4 space-y-3 text-sm leading-7 text-ink/74">
+                        <p>{formatEmailEngagement(submission.email_engagement)}</p>
+                        {submission.email_engagement?.action ? (
+                          <p className="rounded-2xl border border-line/80 bg-white/70 px-4 py-3">{submission.email_engagement.action}</p>
+                        ) : null}
+                      </div>
+                    </div>
+
+                    <div className="mt-5 rounded-[24px] border border-line/80 bg-white/70 p-5">
+                      <SectionLabel>Research</SectionLabel>
+                      <div className="mt-4 space-y-2 text-sm leading-6 text-ink/72">
+                        <p>Latest audit: {latestAudit ? `${latestAudit.score ?? 0}/100` : 'Not run'}</p>
+                        <p>Reports: {generatedReports.length}</p>
+                        <p>Artifacts: {generatedReportDocuments.length}</p>
                       </div>
                     </div>
                   </div>
@@ -1534,6 +2054,16 @@ export default function DashboardPage() {
                   >
                     <Link2 className="h-4 w-4" />
                     {isCreatingUpload ? 'Creating Link...' : 'Create Secure Upload Link'}
+                  </button>
+
+                  <button
+                    className={secondaryActionButtonClass}
+                    disabled={isAuditing || !draft.business_website}
+                    onClick={() => handleRunResearchAudit(submission.id)}
+                    type="button"
+                  >
+                    <ClipboardList className="h-4 w-4" />
+                    {isAuditing ? 'Running Audit...' : 'Run Website Audit'}
                   </button>
                 </div>
               </Reveal>

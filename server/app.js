@@ -16,6 +16,9 @@ import {
   getSecureUploadContext,
   uploadSecureDocuments,
 } from './services/documentVault.js';
+import { recordEmailEventsFromWebhook } from './services/emailEvents.js';
+import { reviewDailyDeals, sendDailyDealHunterReview } from './services/dealHunter.js';
+import { runManualResearchAudit } from './services/researchAudits.js';
 import {
   createManualSubmission,
   exportDashboardSubmissionsCsv,
@@ -24,16 +27,69 @@ import {
   updateSubmissionWorkflow,
 } from './services/submissions.js';
 import { asyncRoute } from './utils/http.js';
+import { safeCompareText } from './utils/security.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.resolve(__dirname, '../dist');
+
+function extractBearerSecret(request) {
+  const authorization = String(request.headers.authorization || '');
+
+  if (authorization.toLowerCase().startsWith('bearer ')) {
+    return authorization.slice(7).trim();
+  }
+
+  return String(request.headers['x-deal-hunter-secret'] || request.headers['x-cron-secret'] || '').trim();
+}
+
+function requireDealHunterCron(request, config) {
+  const providedSecret = extractBearerSecret(request);
+
+  return Boolean(config.dealHunter.cronSecret && providedSecret && safeCompareText(providedSecret, config.dealHunter.cronSecret));
+}
+
+function publicSecureDocument(document) {
+  return {
+    id: document.id,
+    created_at: document.created_at,
+    document_type: document.document_type,
+    original_name: document.original_name,
+    mime_type: document.mime_type,
+    size_bytes: document.size_bytes,
+    note: document.note || '',
+    nda_accepted_at: document.nda_accepted_at || '',
+  };
+}
+
+function publicSecureUploadRequest(requestRecord) {
+  return {
+    id: requestRecord.id,
+    created_at: requestRecord.created_at,
+    updated_at: requestRecord.updated_at,
+    email: requestRecord.email,
+    contact_name: requestRecord.contact_name,
+    status: requestRecord.status,
+    expires_at: requestRecord.expires_at,
+    nda_required: Boolean(requestRecord.nda_required),
+    nda_accepted_at: requestRecord.nda_accepted_at || '',
+    last_uploaded_at: requestRecord.last_uploaded_at || '',
+    note: requestRecord.note || '',
+  };
+}
 
 export function createApp() {
   const config = getConfig();
   const app = express();
 
   app.disable('x-powered-by');
-  app.use(express.json({ limit: '25mb' }));
+  app.use(
+    express.json({
+      limit: '25mb',
+      verify: (request, _response, buffer) => {
+        request.rawBody = buffer.toString('utf8');
+      },
+    }),
+  );
   app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
   app.use((request, response, next) => {
@@ -58,6 +114,23 @@ export function createApp() {
     asyncRoute(async (request, response) => {
       const result = await submitContactLead(request.body, request);
       response.status(result.status).json(result.body);
+    }),
+  );
+
+  app.post(
+    '/api/webhooks/resend',
+    asyncRoute(async (request, response) => {
+      const result = await recordEmailEventsFromWebhook(request);
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error });
+        return;
+      }
+
+      response.status(result.status || 201).json({
+        success: true,
+        count: result.events.length,
+      });
     }),
   );
 
@@ -187,6 +260,54 @@ export function createApp() {
     }),
   );
 
+  app.get(
+    '/api/admin/deal-hunter/review',
+    asyncRoute(async (request, response) => {
+      if (!requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const review = await reviewDailyDeals();
+      response.json({
+        success: true,
+        review,
+      });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/send',
+    asyncRoute(async (request, response) => {
+      if (!requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await sendDailyDealHunterReview();
+      response.status(result.emailResult.status === 'failed' ? 502 : 200).json({
+        success: result.emailResult.status !== 'failed',
+        ...result,
+      });
+    }),
+  );
+
+  app.post(
+    '/api/deal-hunter/daily-email',
+    asyncRoute(async (request, response) => {
+      if (!requireDealHunterCron(request, config)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await sendDailyDealHunterReview();
+      response.status(result.emailResult.status === 'failed' ? 502 : 200).json({
+        success: result.emailResult.status !== 'failed',
+        ...result,
+      });
+    }),
+  );
+
   app.patch(
     '/api/admin/submissions/:id',
     asyncRoute(async (request, response) => {
@@ -241,6 +362,76 @@ export function createApp() {
     }),
   );
 
+  app.post(
+    '/api/admin/submissions/:id/research-audit',
+    asyncRoute(async (request, response) => {
+      const session = requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await runManualResearchAudit({
+        submissionId: request.params.id,
+        url: String(request.body.url || ''),
+        requestedBy: session.username,
+      });
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error, run: result.run, audit: result.audit });
+        return;
+      }
+
+      response.status(result.status || 201).json({
+        success: true,
+        run: result.run,
+        audit: result.audit,
+        report: result.report,
+        document: result.document,
+      });
+    }),
+  );
+
+  app.post(
+    '/api/admin/research-audits',
+    asyncRoute(async (request, response) => {
+      const session = requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await runManualResearchAudit({
+        url: String(request.body.url || ''),
+        requestedBy: session.username,
+        prospect: {
+          businessName: String(request.body.businessName || ''),
+          contactName: String(request.body.contactName || ''),
+          contactEmail: String(request.body.contactEmail || ''),
+          phone: String(request.body.phone || ''),
+          industry: String(request.body.industry || ''),
+          location: String(request.body.location || ''),
+          competitorUrls: request.body.competitorUrls || request.body.competitors || [],
+        },
+      });
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error, run: result.run, audit: result.audit });
+        return;
+      }
+
+      response.status(result.status || 201).json({
+        success: true,
+        run: result.run,
+        audit: result.audit,
+        report: result.report,
+        document: result.document,
+      });
+    }),
+  );
+
   app.get(
     '/api/secure-documents/request',
     asyncRoute(async (request, response) => {
@@ -251,16 +442,16 @@ export function createApp() {
         return;
       }
 
-      response.json({
-        success: true,
-        request: result.request,
-        submission: {
-          id: result.submission.id,
-          name: result.submission.name,
-          company: result.submission.company,
-        },
-        documents: result.documents,
-      });
+	        response.json({
+	          success: true,
+	          request: publicSecureUploadRequest(result.request),
+	          submission: {
+	            id: result.submission.id,
+	            name: result.submission.name,
+	            company: result.submission.company,
+	          },
+	          documents: result.documents.map(publicSecureDocument),
+	        });
     }),
   );
 
@@ -279,16 +470,16 @@ export function createApp() {
         return;
       }
 
-      response.json({
-        success: true,
-        request: result.request,
-        submission: {
-          id: result.submission.id,
-          name: result.submission.name,
-          company: result.submission.company,
-        },
-        documents: result.documents,
-      });
+	      response.json({
+	        success: true,
+	        request: publicSecureUploadRequest(result.request),
+	        submission: {
+	          id: result.submission.id,
+	          name: result.submission.name,
+	          company: result.submission.company,
+	        },
+	        documents: result.documents.map(publicSecureDocument),
+	      });
     }),
   );
 

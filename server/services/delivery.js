@@ -1,4 +1,5 @@
 import { getConfig } from '../config.js';
+import { recordEmailEvent } from './emailEvents.js';
 
 function escapeHtml(value = '') {
   return String(value)
@@ -13,10 +14,149 @@ function normalizeRecipients(to) {
   return Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
 }
 
+function normalizeText(value = '', maxLength = 1000) {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength);
+}
+
+function normalizeUrl(value = '') {
+  const normalized = normalizeText(value, 1000);
+  return /^https?:\/\//i.test(normalized) ? normalized : '';
+}
+
+function paragraphHtml(paragraphs = []) {
+  return paragraphs
+    .filter(Boolean)
+    .map(
+      (paragraph) =>
+        `<p style="margin: 0 0 16px; color: #33443B; font-size: 16px; line-height: 1.65;">${escapeHtml(paragraph)}</p>`,
+    )
+    .join('');
+}
+
+function detailTableHtml(rows = []) {
+  const safeRows = rows.filter((row) => row?.label && row?.value);
+
+  if (safeRows.length === 0) {
+    return '';
+  }
+
+  return `
+    <table cellpadding="0" cellspacing="0" role="presentation" style="width: 100%; border-collapse: collapse; margin: 20px 0 0;">
+      ${safeRows
+        .map(
+          (row) => `
+            <tr>
+              <td style="padding: 8px 14px 8px 0; color: #6A756F; font-size: 13px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; vertical-align: top; width: 155px;">${escapeHtml(row.label)}</td>
+              <td style="padding: 8px 0; color: #18211D; font-size: 15px; line-height: 1.55; vertical-align: top;">${escapeHtml(row.value)}</td>
+            </tr>
+          `,
+        )
+        .join('')}
+    </table>
+  `;
+}
+
+function ctaHtml(ctas = []) {
+  const safeCtas = ctas.filter((cta) => cta?.label && normalizeUrl(cta.href));
+
+  if (safeCtas.length === 0) {
+    return '';
+  }
+
+  return `
+    <table cellpadding="0" cellspacing="0" role="presentation" style="margin: 26px 0 8px;">
+      <tr>
+        ${safeCtas
+          .map((cta, index) => {
+            const primary = index === 0;
+            const background = primary ? '#284638' : '#FFFFFF';
+            const color = primary ? '#FFFFFF' : '#284638';
+            const border = primary ? '#284638' : '#D6CCBE';
+
+            return `
+              <td style="padding: 0 10px 10px 0;">
+                <a href="${escapeHtml(normalizeUrl(cta.href))}" style="display: inline-block; border: 1px solid ${border}; border-radius: 999px; background: ${background}; color: ${color}; font-size: 14px; font-weight: 700; line-height: 1; padding: 14px 18px; text-decoration: none;">${escapeHtml(cta.label)}</a>
+              </td>
+            `;
+          })
+          .join('')}
+      </tr>
+    </table>
+  `;
+}
+
+function brandedEmailHtml({ preheader = '', eyebrow = '', title, paragraphs = [], bodyHtml = '', details = [], ctas = [], footerNote = '' }) {
+  const config = getConfig();
+  const websiteUrl = normalizeUrl(config.outreach.websiteUrl || config.server.origin);
+  const mailingAddress = normalizeText(config.outreach.mailingAddress, 260);
+  const footerLines = [
+    footerNote ? { value: footerNote, isHtml: true } : null,
+    mailingAddress ? { value: `${config.outreach.companyName} | ${mailingAddress}`, isHtml: false } : null,
+    websiteUrl
+      ? {
+          value: `<a href="${escapeHtml(websiteUrl)}" style="color: #284638; text-decoration: underline;">${escapeHtml(websiteUrl)}</a>`,
+          isHtml: true,
+        }
+      : null,
+  ].filter(Boolean);
+
+  return `
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>${escapeHtml(title)}</title>
+      </head>
+      <body style="margin: 0; padding: 0; background: #F8F4ED; color: #18211D; font-family: Arial, Helvetica, sans-serif;">
+        ${preheader ? `<div style="display: none; max-height: 0; overflow: hidden; opacity: 0;">${escapeHtml(preheader)}</div>` : ''}
+        <table cellpadding="0" cellspacing="0" role="presentation" style="width: 100%; border-collapse: collapse; background: #F8F4ED;">
+          <tr>
+            <td style="padding: 32px 16px;">
+              <table cellpadding="0" cellspacing="0" role="presentation" style="width: 100%; max-width: 660px; margin: 0 auto; border-collapse: collapse;">
+                <tr>
+                  <td style="padding: 0 0 14px;">
+                    <table cellpadding="0" cellspacing="0" role="presentation" style="width: 100%; border-collapse: collapse;">
+                      <tr>
+                        <td>
+                          <div style="display: inline-block; height: 40px; width: 40px; border-radius: 10px; background: #284638; color: #FFFFFF; font-size: 14px; font-weight: 800; line-height: 40px; text-align: center;">UG</div>
+                          <span style="display: inline-block; margin-left: 10px; color: #18211D; font-size: 18px; font-weight: 800; vertical-align: middle;">${escapeHtml(config.outreach.companyName)}</span>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="border: 1px solid #E3D9CA; border-radius: 18px; background: #FFFFFF; padding: 34px;">
+                    ${eyebrow ? `<p style="margin: 0 0 12px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase;">${escapeHtml(eyebrow)}</p>` : ''}
+                    <h1 style="margin: 0 0 18px; color: #18211D; font-size: 28px; line-height: 1.22;">${escapeHtml(title)}</h1>
+                    ${paragraphHtml(paragraphs)}
+                    ${bodyHtml}
+                    ${detailTableHtml(details)}
+                    ${ctaHtml(ctas)}
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 18px 4px 0; color: #6A756F; font-size: 12px; line-height: 1.6;">
+                    ${footerLines.map((line) => `<div style="margin: 0 0 6px;">${line.isHtml ? line.value : escapeHtml(line.value)}</div>`).join('')}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+    </html>
+  `;
+}
+
 async function sendViaConsole(message) {
   console.log(`[mail:${message.kind}] to=${normalizeRecipients(message.to).join(', ')} subject=${message.subject}`);
   console.log(message.text);
-  return { status: 'logged', error: '' };
+  return { status: 'logged', error: '', providerMessageId: '' };
 }
 
 async function sendViaResend(message) {
@@ -39,6 +179,8 @@ async function sendViaResend(message) {
       html: message.html,
       text: message.text,
       reply_to: message.replyTo || undefined,
+      headers: message.headers || undefined,
+      tags: Array.isArray(message.tags) && message.tags.length > 0 ? message.tags : undefined,
     }),
   });
 
@@ -50,7 +192,9 @@ async function sendViaResend(message) {
     };
   }
 
-  return { status: 'sent', error: '' };
+  const data = await response.json().catch(() => ({}));
+
+  return { status: 'sent', error: '', providerMessageId: data.id || data.email_id || '' };
 }
 
 async function sendViaEmailJs(message) {
@@ -92,7 +236,7 @@ async function sendViaEmailJs(message) {
     };
   }
 
-  return { status: 'sent', error: '' };
+  return { status: 'sent', error: '', providerMessageId: '' };
 }
 
 async function sendViaFormspree(message) {
@@ -126,23 +270,71 @@ async function sendViaFormspree(message) {
     };
   }
 
-  return { status: 'sent', error: '' };
+  return { status: 'sent', error: '', providerMessageId: '' };
+}
+
+async function recordTrackedEmailDelivery(message, result) {
+  if (!message.tracking || !['sent', 'logged'].includes(result.status)) {
+    return;
+  }
+
+  const config = getConfig();
+  const recipients = normalizeRecipients(message.to);
+
+  try {
+    await Promise.all(
+      recipients.map((recipient) =>
+        recordEmailEvent({
+          provider: config.delivery.provider,
+          event_type: 'sent',
+          message_id: result.providerMessageId || '',
+          recipient_email: recipient,
+          subject: message.subject,
+          submission_id: message.tracking.submissionId || '',
+          source: message.kind,
+          metadata: {
+            deliveryStatus: result.status,
+            kind: message.kind,
+            tracking: message.tracking,
+          },
+        }),
+      ),
+    );
+  } catch (error) {
+    console.warn(`[mail:${message.kind}] email event tracking failed: ${error.message}`);
+  }
 }
 
 async function sendMessage(message) {
   const config = getConfig();
+  let result;
 
-  switch (config.delivery.provider) {
-    case 'resend':
-      return sendViaResend(message);
-    case 'emailjs':
-      return sendViaEmailJs(message);
-    case 'formspree':
-      return sendViaFormspree(message);
-    case 'console':
-    default:
-      return sendViaConsole(message);
+  try {
+    switch (config.delivery.provider) {
+      case 'resend':
+        result = await sendViaResend(message);
+        break;
+      case 'emailjs':
+        result = await sendViaEmailJs(message);
+        break;
+      case 'formspree':
+        result = await sendViaFormspree(message);
+        break;
+      case 'console':
+      default:
+        result = await sendViaConsole(message);
+        break;
+    }
+  } catch (error) {
+    result = {
+      status: 'failed',
+      error: `${config.delivery.provider} delivery failed: ${error.message}`,
+      providerMessageId: '',
+    };
   }
+
+  await recordTrackedEmailDelivery(message, result);
+  return result;
 }
 
 function buildSubmissionMessage(submission) {
@@ -214,6 +406,343 @@ export async function deliverSubmission(submission) {
   return sendMessage(buildSubmissionMessage(submission));
 }
 
+function normalizeFindings(findings = []) {
+  return (Array.isArray(findings) ? findings : [])
+    .map((finding) => ({
+      title: normalizeText(finding.title || finding.issue, 140),
+      impact: normalizeText(finding.impact || finding.reason, 260),
+      recommendation: normalizeText(finding.recommendation || finding.fix, 260),
+    }))
+    .filter((finding) => finding.title || finding.impact || finding.recommendation)
+    .slice(0, 3);
+}
+
+function findingsHtml(findings = []) {
+  if (findings.length === 0) {
+    return '';
+  }
+
+  return `
+    <div style="margin: 22px 0 4px; border: 1px solid #E3D9CA; border-radius: 16px; background: #F8F4ED; padding: 18px;">
+      <p style="margin: 0 0 12px; color: #284638; font-size: 13px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase;">What stood out</p>
+      ${findings
+        .map(
+          (finding) => `
+            <div style="margin: 0 0 14px;">
+              <p style="margin: 0 0 5px; color: #18211D; font-size: 15px; font-weight: 800;">${escapeHtml(finding.title || 'Lead-generation opportunity')}</p>
+              ${finding.impact ? `<p style="margin: 0 0 5px; color: #33443B; font-size: 14px; line-height: 1.55;">${escapeHtml(finding.impact)}</p>` : ''}
+              ${finding.recommendation ? `<p style="margin: 0; color: #51615A; font-size: 14px; line-height: 1.55;"><strong>Suggested next step:</strong> ${escapeHtml(finding.recommendation)}</p>` : ''}
+            </div>
+          `,
+        )
+        .join('')}
+    </div>
+  `;
+}
+
+export function buildProspectAuditEmail({
+  to,
+  prospect = {},
+  audit = {},
+  unsubscribeUrl = '',
+  sequenceStep = 1,
+} = {}) {
+  const config = getConfig();
+  const businessName = normalizeText(prospect.businessName || prospect.company || prospect.name, 120) || 'your business';
+  const contactName = normalizeText(prospect.contactName || prospect.ownerName || prospect.firstName, 80);
+  const senderName = normalizeText(config.outreach.senderName, 120);
+  const companyName = normalizeText(config.outreach.companyName, 120) || 'Uckele Group';
+  const websiteUrl = normalizeUrl(prospect.websiteUrl || prospect.url);
+  const industry = normalizeText(prospect.industry || prospect.category, 100);
+  const location = normalizeText(prospect.location || prospect.city, 100);
+  const findings = normalizeFindings(audit.findings);
+  const topFinding = findings[0]?.title || normalizeText(audit.summary, 140) || 'a quick website lead opportunity';
+  const subjectPrefix = sequenceStep > 1 ? 'Following up' : 'Quick website lead idea';
+  const subject = `${subjectPrefix} for ${businessName}`;
+  const scheduleUrl = normalizeUrl(config.outreach.schedulingUrl);
+  const contactFormUrl = normalizeUrl(config.outreach.contactFormUrl);
+  const companyWebsiteUrl = normalizeUrl(config.outreach.websiteUrl || config.server.origin);
+  const primaryCta = scheduleUrl
+    ? { label: 'Schedule 15 minutes', href: scheduleUrl }
+    : { label: 'Request the 3-point audit', href: contactFormUrl };
+  const ctas = [
+    primaryCta,
+    companyWebsiteUrl ? { label: 'View Uckele Group', href: companyWebsiteUrl } : null,
+    scheduleUrl && contactFormUrl ? { label: 'Fill out the form', href: contactFormUrl } : null,
+  ].filter(Boolean);
+  const greeting = contactName ? `Hi ${contactName},` : 'Hi,';
+  const contextLine = [
+    websiteUrl ? `I reviewed ${websiteUrl}` : `I reviewed ${businessName}'s online presence`,
+    industry ? `for a ${industry} business` : '',
+    location ? `in ${location}` : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+  const paragraphs = [
+    greeting,
+    `${contextLine}, and ${topFinding.toLowerCase().startsWith('i ') ? topFinding : `noticed ${topFinding}`}.`,
+    'My work is focused on helping local businesses remove the small website, trust, mobile, and contact-flow issues that quietly reduce calls and form submissions.',
+    'If useful, I can walk you through the short audit and the highest-leverage fixes in a 15-minute call.',
+  ];
+  const detailRows = [
+    { label: 'Business', value: businessName },
+    websiteUrl ? { label: 'Website checked', value: websiteUrl } : null,
+    audit.competitorInsight ? { label: 'Market note', value: normalizeText(audit.competitorInsight, 260) } : null,
+  ].filter(Boolean);
+  const safeUnsubscribeUrl = normalizeUrl(unsubscribeUrl || config.outreach.unsubscribeBaseUrl);
+  const unsubscribeText = safeUnsubscribeUrl
+    ? `No longer want these website audit notes? <a href="${escapeHtml(safeUnsubscribeUrl)}" style="color: #284638; text-decoration: underline;">Unsubscribe here</a>.`
+    : 'No longer want these website audit notes? Reply "unsubscribe" and I will remove you.';
+  const signatureHtml = senderName
+    ? `<p style="margin: 20px 0 0; color: #33443B; font-size: 15px; line-height: 1.6;">Best,<br><strong style="color: #18211D;">${escapeHtml(senderName)}</strong><br>${escapeHtml(companyName)}</p>`
+    : '';
+  const html = brandedEmailHtml({
+    preheader: `A quick lead-generation audit note for ${businessName}.`,
+    eyebrow: 'Website Lead Audit',
+    title: `${businessName}: one quick lead-generation opportunity`,
+    paragraphs,
+    bodyHtml: `${findingsHtml(findings)}${signatureHtml}`,
+    details: detailRows,
+    ctas,
+    footerNote: unsubscribeText,
+  });
+  const text = [
+    `${greeting}`,
+    '',
+    `${contextLine}, and ${topFinding.toLowerCase().startsWith('i ') ? topFinding : `noticed ${topFinding}`}.`,
+    '',
+    ...findings.flatMap((finding, index) => [
+      `${index + 1}. ${finding.title || 'Lead-generation opportunity'}`,
+      finding.impact ? `Impact: ${finding.impact}` : '',
+      finding.recommendation ? `Suggested next step: ${finding.recommendation}` : '',
+      '',
+    ]),
+    'If useful, I can walk you through the short audit and the highest-leverage fixes in a 15-minute call.',
+    '',
+    senderName ? `Best,\n${senderName}\n${companyName}` : '',
+    '',
+    scheduleUrl ? `Schedule 15 minutes: ${scheduleUrl}` : '',
+    companyWebsiteUrl ? `View Uckele Group: ${companyWebsiteUrl}` : '',
+    contactFormUrl ? `Fill out the form: ${contactFormUrl}` : '',
+    '',
+    safeUnsubscribeUrl ? `Unsubscribe: ${safeUnsubscribeUrl}` : 'Reply "unsubscribe" and I will remove you.',
+  ]
+    .join('\n');
+
+  return {
+    kind: 'prospect-audit-outreach',
+    to,
+    subject,
+    headline: 'Website lead audit',
+    text,
+    html,
+    tags: [
+      { name: 'source', value: 'prospect-audit-outreach' },
+      prospect.id ? { name: 'prospect_id', value: String(prospect.id).slice(0, 240) } : null,
+    ].filter(Boolean),
+    tracking: {
+      source: 'prospect-audit-outreach',
+      prospectId: prospect.id || '',
+      recipientEmail: to,
+      businessName,
+      sequenceStep,
+    },
+  };
+}
+
+export async function sendProspectAuditEmail(options) {
+  return sendMessage(buildProspectAuditEmail(options));
+}
+
+function formatMoney(value) {
+  return Number.isFinite(value)
+    ? new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: 'USD',
+        maximumFractionDigits: 0,
+      }).format(value)
+    : 'Not disclosed';
+}
+
+function dealHunterMetaLine(deal) {
+  return [
+    deal.industry,
+    deal.location,
+    deal.annualProfit ? `Profit ${formatMoney(deal.annualProfit)}` : '',
+    deal.askingPrice ? `Ask ${formatMoney(deal.askingPrice)}` : '',
+    deal.profitMultiple ? `${deal.profitMultiple}x profit` : '',
+  ]
+    .filter(Boolean)
+    .join(' | ');
+}
+
+function dealHunterDealHtml(deal, { tone = 'success', showRemoveReasons = false } = {}) {
+  const border = tone === 'danger' ? '#FECACA' : tone === 'warning' ? '#FDE68A' : '#C9D8CF';
+  const background = tone === 'danger' ? '#FEF2F2' : tone === 'warning' ? '#FFFBEB' : '#F4F8F5';
+  const badgeColor = tone === 'danger' ? '#B91C1C' : tone === 'warning' ? '#92400E' : '#284638';
+  const detailItems = showRemoveReasons ? deal.removeReasons || deal.concerns || [] : deal.strengths || [];
+  const questionItems = deal.questions || [];
+
+  return `
+    <div style="margin: 18px 0; border: 1px solid ${border}; border-radius: 16px; background: ${background}; padding: 18px;">
+      <div style="margin: 0 0 8px;">
+        <span style="display: inline-block; border-radius: 999px; background: #FFFFFF; color: ${badgeColor}; font-size: 12px; font-weight: 800; padding: 6px 10px;">Score ${escapeHtml(String(deal.score ?? 0))}</span>
+        <span style="display: inline-block; margin-left: 8px; color: #51615A; font-size: 12px; font-weight: 700;">${escapeHtml(deal.sourceName || 'Deal source')}</span>
+      </div>
+      <h3 style="margin: 0 0 8px; color: #18211D; font-size: 18px; line-height: 1.35;">${escapeHtml(deal.name || 'Unnamed business')}</h3>
+      ${dealHunterMetaLine(deal) ? `<p style="margin: 0 0 12px; color: #33443B; font-size: 14px; line-height: 1.55;">${escapeHtml(dealHunterMetaLine(deal))}</p>` : ''}
+      ${deal.recommendation ? `<p style="margin: 0 0 12px; color: #18211D; font-size: 14px; line-height: 1.55;"><strong>Note:</strong> ${escapeHtml(deal.recommendation)}</p>` : ''}
+      ${
+        detailItems.length > 0
+          ? `<ul style="margin: 0 0 12px 18px; padding: 0; color: #33443B; font-size: 14px; line-height: 1.55;">${detailItems
+              .slice(0, 4)
+              .map((item) => `<li>${escapeHtml(item)}</li>`)
+              .join('')}</ul>`
+          : ''
+      }
+      ${
+        questionItems.length > 0
+          ? `<p style="margin: 12px 0 6px; color: #18211D; font-size: 13px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;">Questions to ask</p><ul style="margin: 0 0 12px 18px; padding: 0; color: #33443B; font-size: 14px; line-height: 1.55;">${questionItems
+              .slice(0, 3)
+              .map((item) => `<li>${escapeHtml(item)}</li>`)
+              .join('')}</ul>`
+          : ''
+      }
+      ${deal.listingUrl ? `<a href="${escapeHtml(deal.listingUrl)}" style="color: #284638; font-size: 14px; font-weight: 800; text-decoration: underline;">View listing</a>` : ''}
+    </div>
+  `;
+}
+
+function dealHunterSectionHtml(title, intro, deals, options = {}) {
+  if (!Array.isArray(deals) || deals.length === 0) {
+    return '';
+  }
+
+  return `
+    <div style="margin: 26px 0 0;">
+      <p style="margin: 0 0 8px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase;">${escapeHtml(title)}</p>
+      ${intro ? `<p style="margin: 0 0 12px; color: #33443B; font-size: 15px; line-height: 1.6;">${escapeHtml(intro)}</p>` : ''}
+      ${deals.map((deal) => dealHunterDealHtml(deal, options)).join('')}
+    </div>
+  `;
+}
+
+export function buildDailyDealHunterEmail({ to, review = {} } = {}) {
+  const generatedLabel = review.generatedAt ? new Date(review.generatedAt).toLocaleString() : new Date().toLocaleString();
+  const sourceSummary = (review.sources || [])
+    .map((source) => `${source.name}: ${source.fetched ? `${source.rowCount || 0} rows` : `failed (${source.error || 'unknown error'})`}`)
+    .join('\n');
+  const recommendations = review.criteriaRecommendations || [];
+  const bodyHtml = `
+    ${dealHunterSectionHtml(
+      'Newly Seen Fits',
+      'These listings were not in the prior Deal Hunter history and deserve the first look today.',
+      review.newlySeenMatches || [],
+      { tone: 'success' },
+    )}
+    ${dealHunterSectionHtml(
+      'High-Fit Deals',
+      'These are the strongest matches for recession-resistant, AI-resistant, long-term small business ownership.',
+      review.qualified || [],
+      { tone: 'success' },
+    )}
+    ${dealHunterSectionHtml(
+      'Watchlist',
+      'These may fit if broker diligence confirms recurring revenue, customer diversity, management depth, and financeable terms.',
+      review.watchlist || [],
+      { tone: 'warning' },
+    )}
+    ${dealHunterSectionHtml(
+      'Remove From Next Update',
+      'These should be excluded from tomorrow\'s source list because they conflict with the buying strategy or score too poorly.',
+      review.removalCandidates || [],
+      { tone: 'danger', showRemoveReasons: true },
+    )}
+    ${
+      recommendations.length > 0
+        ? `<div style="margin: 26px 0 0; border-top: 1px solid #E3D9CA; padding-top: 18px;"><p style="margin: 0 0 8px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase;">Criteria Notes</p><ul style="margin: 0 0 0 18px; padding: 0; color: #33443B; font-size: 14px; line-height: 1.6;">${recommendations
+            .map((item) => `<li>${escapeHtml(item)}</li>`)
+            .join('')}</ul></div>`
+        : ''
+    }
+  `;
+	  const html = brandedEmailHtml({
+	    preheader: `${review.totals?.newMatches || 0} new fit(s), ${review.totals?.qualified || 0} high-fit deals, and ${review.totals?.removalCandidates || 0} removals from today\'s deal sources.`,
+    eyebrow: 'Daily Deal Hunter',
+    title: 'Daily acquisition deal review',
+    paragraphs: [
+      `Generated ${generatedLabel}. Reviewed ${review.totals?.reviewedDeals || 0} recent deals from ${review.sources?.length || 0} source(s).`,
+      'The scoring profile favors essential B2B and field-service companies with recurring or repeat revenue, recession resistance, AI resistance, and financeable acquisition size. Management in place is preferred but not required.',
+    ],
+    bodyHtml,
+    details: [
+	      { label: 'High-fit deals', value: String(review.totals?.qualified || 0) },
+	      { label: 'New fit(s)', value: String(review.totals?.newMatches || 0) },
+	      { label: 'Watchlist', value: String(review.totals?.watchlist || 0) },
+      { label: 'Remove flags', value: String(review.totals?.removalCandidates || 0) },
+      { label: 'Lookback', value: `${review.lookbackDays || 0} day(s)` },
+    ],
+  });
+  const text = [
+    'Daily acquisition deal review',
+    '',
+    `Generated: ${generatedLabel}`,
+    `Reviewed deals: ${review.totals?.reviewedDeals || 0}`,
+    '',
+	    'Sources:',
+	    sourceSummary || 'No sources configured.',
+	    '',
+	    'Newly seen fits:',
+	    ...(review.newlySeenMatches || []).flatMap((deal, index) => [
+	      `${index + 1}. ${deal.name} (${deal.score}/100)`,
+	      dealHunterMetaLine(deal),
+	      deal.recommendation || '',
+	      deal.listingUrl || '',
+	      '',
+	    ]),
+	    '',
+	    'High-fit deals:',
+    ...(review.qualified || []).flatMap((deal, index) => [
+      `${index + 1}. ${deal.name} (${deal.score}/100)`,
+      dealHunterMetaLine(deal),
+      deal.recommendation || '',
+      deal.listingUrl || '',
+      '',
+    ]),
+    'Watchlist:',
+    ...(review.watchlist || []).flatMap((deal, index) => [
+      `${index + 1}. ${deal.name} (${deal.score}/100)`,
+      dealHunterMetaLine(deal),
+      deal.recommendation || '',
+      deal.listingUrl || '',
+      '',
+    ]),
+    'Remove from next update:',
+    ...(review.removalCandidates || []).flatMap((deal, index) => [
+      `${index + 1}. ${deal.name} (${deal.score}/100)`,
+      (deal.removeReasons || deal.concerns || []).join('; '),
+      deal.listingUrl || '',
+      '',
+    ]),
+    'Criteria notes:',
+    ...recommendations.map((item) => `- ${item}`),
+  ].join('\n');
+
+  return {
+	    kind: 'daily-deal-hunter',
+	    to,
+	    subject: `Daily deal review: ${review.totals?.newMatches || 0} new fit, ${review.totals?.removalCandidates || 0} remove`,
+    headline: 'Daily acquisition deal review',
+    text,
+    html,
+    tags: [{ name: 'source', value: 'daily-deal-hunter' }],
+  };
+}
+
+export async function sendDailyDealHunterEmail(options) {
+  return sendMessage(buildDailyDealHunterEmail(options));
+}
+
 export async function sendAdminMagicLinkEmail({ to, magicLinkUrl, expiresAt }) {
   const expiryLabel = new Date(expiresAt).toLocaleString();
   const subject = 'Your Uckele Group admin sign-in link';
@@ -283,6 +812,15 @@ export async function sendSecureUploadInviteEmail({ to, contactName, uploadUrl, 
     headline: 'Secure document request',
     text,
     html,
+    tags: [
+      { name: 'source', value: 'secure-upload-invite' },
+      { name: 'submission_id', value: submission.id },
+    ],
+    tracking: {
+      submissionId: submission.id,
+      recipientEmail: to,
+      source: 'secure-upload-invite',
+    },
   });
 }
 

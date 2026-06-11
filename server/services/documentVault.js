@@ -85,7 +85,7 @@ export async function createSecureUploadRequest({ submissionId, requestedBy, not
     requested_by: requestedBy || config.workflow.defaultAssignee,
     status: 'awaiting-documents',
     expires_at: new Date(Date.now() + config.secureDocuments.requestTtlMs).toISOString(),
-    nda_required: 1,
+    nda_required: true,
     nda_accepted_at: null,
     last_uploaded_at: null,
     note,

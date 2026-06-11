@@ -19,6 +19,13 @@ function booleanFromEnv(value, fallback) {
   return ['1', 'true', 'yes', 'on'].includes(normalized);
 }
 
+function listFromEnv(value) {
+  return String(value || '')
+    .split(/[,\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
 let cachedConfig;
 
 export function getConfig() {
@@ -53,12 +60,22 @@ export function getConfig() {
       resendApiKey: process.env.RESEND_API_KEY || '',
       resendFromEmail: process.env.RESEND_FROM_EMAIL || '',
       resendReplyTo: process.env.RESEND_REPLY_TO || '',
+      emailWebhookSecret: process.env.EMAIL_WEBHOOK_SECRET || process.env.RESEND_WEBHOOK_SECRET || '',
       formspreeEndpoint: process.env.FORMSPREE_ENDPOINT || '',
       emailjsServiceId: process.env.EMAILJS_SERVICE_ID || '',
       emailjsTemplateId: process.env.EMAILJS_TEMPLATE_ID || '',
       emailjsPublicKey: process.env.EMAILJS_PUBLIC_KEY || '',
       emailjsPrivateKey: process.env.EMAILJS_PRIVATE_KEY || '',
       emailjsRateLimitMs: numberFromEnv(process.env.EMAILJS_RATE_LIMIT_MS, 1000),
+    },
+    outreach: {
+      companyName: process.env.OUTREACH_COMPANY_NAME || 'Uckele Group',
+      senderName: process.env.OUTREACH_SENDER_NAME || 'Mathew Uckele',
+      schedulingUrl: process.env.PUBLIC_SCHEDULING_URL || process.env.CALENDLY_URL || '',
+      contactFormUrl: process.env.PUBLIC_CONTACT_FORM_URL || `${process.env.PUBLIC_SITE_URL || defaultPublicOrigin}/contact`,
+      websiteUrl: process.env.PUBLIC_SITE_URL || defaultPublicOrigin,
+      mailingAddress: process.env.OUTREACH_MAILING_ADDRESS || '',
+      unsubscribeBaseUrl: process.env.PUBLIC_UNSUBSCRIBE_URL || '',
     },
     crm: {
       webhookUrl: process.env.CRM_WEBHOOK_URL || '',
@@ -86,6 +103,20 @@ export function getConfig() {
     workflow: {
       defaultAssignee: process.env.DEFAULT_LEAD_ASSIGNEE || 'Mathew Uckele',
       defaultFollowUpDelayHours: numberFromEnv(process.env.DEFAULT_FOLLOW_UP_DELAY_HOURS, 24),
+    },
+    dealHunter: {
+      recipient: process.env.DEAL_HUNTER_EMAIL_RECIPIENT || adminEmail,
+      cronSecret: process.env.DEAL_HUNTER_CRON_SECRET || '',
+      sheetCsvUrls: listFromEnv(process.env.DEAL_HUNTER_SHEET_CSV_URLS || process.env.DEAL_HUNTER_SHEET_CSV_URL),
+      airtableSharedViewUrl:
+        process.env.DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL ||
+        'https://airtable.com/appEGxhjno0HTpEco/shrUhtbnzZTPaR4Lk/tblACIQ9QNiVmoWSK?viewControls=on',
+      airtableToken: process.env.DEAL_HUNTER_AIRTABLE_TOKEN || process.env.AIRTABLE_TOKEN || '',
+      airtableBaseId: process.env.DEAL_HUNTER_AIRTABLE_BASE_ID || 'appEGxhjno0HTpEco',
+      airtableTableId: process.env.DEAL_HUNTER_AIRTABLE_TABLE_ID || 'tblACIQ9QNiVmoWSK',
+      airtableViewId: process.env.DEAL_HUNTER_AIRTABLE_VIEW_ID || 'viw4OORhKKWPUsWa4',
+      lookbackDays: numberFromEnv(process.env.DEAL_HUNTER_LOOKBACK_DAYS, 4),
+      maxSourceRecords: numberFromEnv(process.env.DEAL_HUNTER_MAX_SOURCE_RECORDS, 40000),
     },
     secureDocuments: {
       tokenSecret: process.env.SECURE_DOCUMENTS_TOKEN_SECRET || sessionSecret,

@@ -64,6 +64,14 @@ alter table public.contact_submissions add column if not exists broker_phone tex
 alter table public.contact_submissions add column if not exists seller_name text;
 alter table public.contact_submissions add column if not exists seller_email text;
 alter table public.contact_submissions add column if not exists seller_phone text;
+alter table public.contact_submissions add column if not exists lead_type text not null default 'owner';
+alter table public.contact_submissions add column if not exists priority text not null default 'normal';
+alter table public.contact_submissions add column if not exists tags jsonb not null default '[]'::jsonb;
+alter table public.contact_submissions add column if not exists assigned_to text;
+alter table public.contact_submissions add column if not exists notes text;
+alter table public.contact_submissions add column if not exists follow_up_state text not null default 'needs-response';
+alter table public.contact_submissions add column if not exists next_action_at timestamptz;
+alter table public.contact_submissions add column if not exists last_contacted_at timestamptz;
 
 create index if not exists idx_contact_submissions_created_at on public.contact_submissions (created_at desc);
 create index if not exists idx_contact_submissions_status on public.contact_submissions (status);
@@ -115,3 +123,148 @@ create table if not exists public.secure_documents (
 
 create index if not exists idx_secure_documents_request_id on public.secure_documents (request_id, created_at desc);
 create index if not exists idx_secure_documents_submission_id on public.secure_documents (submission_id, created_at desc);
+
+create table if not exists public.email_events (
+  id uuid primary key,
+  created_at timestamptz not null,
+  provider text not null,
+  event_type text not null,
+  message_id text,
+  provider_event_id text,
+  event_key text,
+  recipient_email text,
+  subject text,
+  submission_id uuid references public.contact_submissions(id) on delete set null,
+  source text not null,
+  metadata jsonb not null default '{}'::jsonb
+);
+
+alter table public.email_events add column if not exists provider_event_id text;
+alter table public.email_events add column if not exists event_key text;
+
+create index if not exists idx_email_events_submission_id on public.email_events (submission_id, created_at desc);
+create index if not exists idx_email_events_recipient_email on public.email_events (recipient_email, created_at desc);
+create index if not exists idx_email_events_message_id on public.email_events (message_id);
+create index if not exists idx_email_events_event_type on public.email_events (event_type, created_at desc);
+create unique index if not exists idx_email_events_event_key on public.email_events (event_key);
+
+create table if not exists public.research_runs (
+  id uuid primary key,
+  created_at timestamptz not null,
+  updated_at timestamptz not null,
+  status text not null,
+  run_type text not null,
+  source text not null,
+  query text,
+  location text,
+  industry text,
+  requested_by text,
+  started_at timestamptz,
+  completed_at timestamptz,
+  total_candidates integer not null default 0,
+  total_audited integer not null default 0,
+  total_reports integer not null default 0,
+  error text,
+  metadata jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_research_runs_created_at on public.research_runs (created_at desc);
+create index if not exists idx_research_runs_status on public.research_runs (status, created_at desc);
+create index if not exists idx_research_runs_run_type on public.research_runs (run_type, created_at desc);
+
+create table if not exists public.prospect_audits (
+  id uuid primary key,
+  run_id uuid references public.research_runs(id) on delete set null,
+  submission_id uuid references public.contact_submissions(id) on delete set null,
+  created_at timestamptz not null,
+  updated_at timestamptz not null,
+  status text not null,
+  business_name text not null,
+  website_url text,
+  contact_name text,
+  contact_email text,
+  phone text,
+  location text,
+  industry text,
+  score integer,
+  summary text,
+  findings jsonb not null default '[]'::jsonb,
+  competitor_insights jsonb not null default '[]'::jsonb,
+  sources jsonb not null default '[]'::jsonb,
+  report_id uuid,
+  error text,
+  metadata jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_prospect_audits_run_id on public.prospect_audits (run_id, created_at desc);
+create index if not exists idx_prospect_audits_submission_id on public.prospect_audits (submission_id, created_at desc);
+create index if not exists idx_prospect_audits_website_url on public.prospect_audits (website_url);
+create index if not exists idx_prospect_audits_status on public.prospect_audits (status, created_at desc);
+
+create table if not exists public.generated_market_reports (
+  id uuid primary key,
+  run_id uuid references public.research_runs(id) on delete set null,
+  audit_id uuid references public.prospect_audits(id) on delete set null,
+  submission_id uuid references public.contact_submissions(id) on delete set null,
+  created_at timestamptz not null,
+  updated_at timestamptz not null,
+  report_type text not null,
+  title text not null,
+  format text not null,
+  status text not null,
+  storage_path text,
+  content text,
+  summary text,
+  metadata jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_generated_market_reports_run_id on public.generated_market_reports (run_id, created_at desc);
+create index if not exists idx_generated_market_reports_audit_id on public.generated_market_reports (audit_id, created_at desc);
+create index if not exists idx_generated_market_reports_submission_id on public.generated_market_reports (submission_id, created_at desc);
+
+create table if not exists public.generated_report_documents (
+  id uuid primary key,
+  report_id uuid references public.generated_market_reports(id) on delete cascade,
+  run_id uuid references public.research_runs(id) on delete set null,
+  audit_id uuid references public.prospect_audits(id) on delete set null,
+  submission_id uuid references public.contact_submissions(id) on delete set null,
+  created_at timestamptz not null,
+  updated_at timestamptz not null,
+  document_type text not null,
+  title text not null,
+  file_name text,
+  mime_type text,
+  size_bytes bigint not null default 0,
+  storage_path text,
+  checksum text,
+  status text not null,
+  metadata jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_generated_report_documents_report_id on public.generated_report_documents (report_id, created_at desc);
+create index if not exists idx_generated_report_documents_run_id on public.generated_report_documents (run_id, created_at desc);
+create index if not exists idx_generated_report_documents_audit_id on public.generated_report_documents (audit_id, created_at desc);
+create index if not exists idx_generated_report_documents_submission_id on public.generated_report_documents (submission_id, created_at desc);
+
+create table if not exists public.deal_hunter_seen_deals (
+  id text primary key,
+  first_seen_at timestamptz not null,
+  last_seen_at timestamptz not null,
+  source_id text,
+  source_name text,
+  source_mode text,
+  external_id text,
+  listing_url text,
+  name text not null,
+  industry text,
+  location text,
+  annual_profit numeric,
+  annual_revenue numeric,
+  asking_price numeric,
+  score integer,
+  should_remove boolean not null default false,
+  metadata jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_deal_hunter_seen_deals_last_seen_at on public.deal_hunter_seen_deals (last_seen_at desc);
+create index if not exists idx_deal_hunter_seen_deals_source_id on public.deal_hunter_seen_deals (source_id, last_seen_at desc);

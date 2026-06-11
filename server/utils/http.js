@@ -23,6 +23,15 @@ function firstHeaderValue(value) {
 }
 
 export function getRequestOrigin(request, fallbackOrigin = '') {
+  if (process.env.NODE_ENV === 'production' && fallbackOrigin) {
+    try {
+      const url = new URL(fallbackOrigin);
+      return url.origin;
+    } catch {
+      return fallbackOrigin.replace(/\/+$/, '');
+    }
+  }
+
   const forwardedProto = firstHeaderValue(request.headers['x-forwarded-proto']);
   const forwardedHost = firstHeaderValue(request.headers['x-forwarded-host']);
   const host = forwardedHost || firstHeaderValue(request.headers.host);

@@ -12,6 +12,10 @@ The site now includes:
 - Email magic-link admin auth with optional password fallback
 - Workflow fields for assignee, notes, tags, priority, follow-up state, and next action date
 - Secure upload request generation and a seller-facing upload page at `/secure-documents`
+- Email engagement event tracking and follow-up triage via `/api/webhooks/resend`
+- Branded prospect outreach email templates with scheduling, website, and contact-form CTAs
+- Research tables for automated lead searches, prospect audits, and generated market reports
+- Manual website audit workflow from the admin CRM
 - Spam protection with honeypot, time-to-submit checks, rate limiting, message heuristics, and optional Cloudflare Turnstile
 - Serverless support through [api/[...path].js](/Users/Matt/Documents/Uckele Group/api/[...path].js)
 
@@ -36,6 +40,69 @@ This starts:
 
 Vite proxies `/api/*` requests to the backend during development.
 
+## Branded Outreach Email Settings
+
+Set these before sending prospecting emails:
+
+- `PUBLIC_SCHEDULING_URL` for Calendly or another booking page
+- `PUBLIC_CONTACT_FORM_URL` for the website form CTA
+- `PUBLIC_SITE_URL` for the company website CTA
+- `PUBLIC_UNSUBSCRIBE_URL` for the commercial email unsubscribe CTA
+- `OUTREACH_COMPANY_NAME`
+- `OUTREACH_SENDER_NAME`
+- `OUTREACH_MAILING_ADDRESS` for the commercial email footer
+
+The prospect audit template can use automated research fields such as business name, website URL, industry, location, audit findings, and competitor insight to personalize each message.
+
+## Manual Research Audits
+
+The first research workflow is intentionally manual. From `/admin`, add or open a CRM record with a website URL and run **Run Website Audit**.
+
+The backend will:
+
+- create a `research_runs` record
+- fetch the homepage
+- check uptime, HTTPS, title/meta description, contact paths, CTA visibility, mobile viewport, internal broken links, page size, response time, trust signals, and freshness signals
+- save findings in `prospect_audits`
+- generate a Markdown report in `generated_market_reports`
+- register the generated report artifact in `generated_report_documents`
+
+There is also an admin-only URL endpoint at `/api/admin/research-audits` for auditing a URL that is not yet tied to a CRM record.
+
+## Daily Deal Hunter Review
+
+The private admin CRM includes a Deal Hunter scoring panel that can pull the SMB Deal Hunter Google Sheet CSV and the larger Airtable shared business list, score recent listings, and send the daily email.
+
+Configure:
+
+- `DEAL_HUNTER_EMAIL_RECIPIENT`
+- `DEAL_HUNTER_SHEET_CSV_URL` or `DEAL_HUNTER_SHEET_CSV_URLS`
+- `DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL`
+- `DEAL_HUNTER_CRON_SECRET` for the scheduled endpoint
+
+Optional Airtable API mode:
+
+- `DEAL_HUNTER_AIRTABLE_TOKEN` with `data.records:read`
+- `DEAL_HUNTER_AIRTABLE_BASE_ID`
+- `DEAL_HUNTER_AIRTABLE_TABLE_ID`
+- `DEAL_HUNTER_AIRTABLE_VIEW_ID`
+
+Admin endpoints:
+
+- `GET /api/admin/deal-hunter/review`
+- `POST /api/admin/deal-hunter/send`
+
+Scheduler endpoint:
+
+```text
+POST /api/deal-hunter/daily-email
+Authorization: Bearer DEAL_HUNTER_CRON_SECRET
+```
+
+The scoring profile treats management in place as preferred, not required. It flags food/beverage, hospitality, retail/ecommerce, SaaS/software, marketing, staffing, franchises, delivery routes, FedEx/Amazon route listings, and owner-license medical practices for removal from the next daily update.
+
+The send path records Deal Hunter listing history in `deal_hunter_seen_deals`, so future daily emails can identify newly seen matches instead of repeatedly treating the same source rows as new. Admin-only source reviews show the current new/seen status without marking listings as seen; sending the daily email marks that reviewed batch as seen after delivery succeeds.
+
 ## Delivery Provider Options
 
 ### Resend
@@ -46,6 +113,7 @@ Set:
 - `RESEND_API_KEY`
 - `RESEND_FROM_EMAIL`
 - `LEAD_NOTIFICATION_EMAIL`
+- `RESEND_WEBHOOK_SECRET` if you want open/click/bounce tracking in the admin CRM
 
 Resend is the strongest fit if you want:
 
@@ -53,6 +121,15 @@ Resend is the strongest fit if you want:
 - admin magic-link sign-in
 - secure document invite emails
 - upload notifications
+- email open/click/bounce events for follow-up triage
+
+Configure the Resend webhook URL as:
+
+```text
+https://your-domain.com/api/webhooks/resend
+```
+
+Use the Resend signing secret as `RESEND_WEBHOOK_SECRET`.
 
 ### Formspree
 
@@ -110,6 +187,13 @@ Default and works locally with no extra infrastructure:
 
 The database is created automatically under `./data`.
 
+SQLite also creates the research tables automatically on startup:
+
+- `research_runs`
+- `prospect_audits`
+- `generated_market_reports`
+- `generated_report_documents`
+
 ### Supabase
 
 Recommended for serverless deployments:
@@ -119,6 +203,8 @@ Recommended for serverless deployments:
    - `SUPABASE_URL`
    - `SUPABASE_SERVICE_ROLE_KEY`
 2. Run the SQL in [schema.sql](/Users/Matt/Documents/Uckele Group/supabase/schema.sql)
+
+For production, rerun the schema SQL after this phase so Supabase has the same research tables as local SQLite.
 
 ## Dashboard
 
@@ -145,6 +231,7 @@ The admin CRM supports:
 - CSV export
 - secure upload link generation
 - basic lead metrics
+- email engagement scoring and warm follow-up triage
 - delivery visibility
 - spam flag visibility
 
