@@ -394,7 +394,7 @@ async function listInBatches(values, listFn) {
 
 function enrichSubmissionWithRelatedData(
   submission,
-  { uploadRequest = null, documents = [], emailEvents = [], prospectAudits = [], marketReports = [], reportDocuments = [] } = {},
+  { uploadRequest = null, documents = [], emailEvents = [] } = {},
   nowValue = new Date(),
 ) {
   const emailEngagement = summarizeEmailEngagement(dedupeEmailEvents(emailEvents));
@@ -402,10 +402,6 @@ function enrichSubmissionWithRelatedData(
     ...submission,
     latest_upload_request: uploadRequest,
     secure_documents: documents,
-    prospect_audits: prospectAudits,
-    latest_prospect_audit: prospectAudits[0] || null,
-    generated_market_reports: marketReports,
-    generated_report_documents: reportDocuments,
     email_engagement: emailEngagement,
     status_updated_at: submission.status_updated_at || submission.updated_at,
     days_since_added: daysAgoFrom(submission.created_at, nowValue),
@@ -425,15 +421,9 @@ async function enrichSubmission(submission, storage, nowValue = new Date()) {
         ...contactEmails.map((recipientEmail) => storage.listEmailEvents({ recipientEmail, limit: 100 })),
       ]
     : [];
-  const researchQueries = [
-    storage.listProspectAudits ? storage.listProspectAudits({ submissionId: submission.id, limit: 10 }) : Promise.resolve([]),
-    storage.listGeneratedMarketReports ? storage.listGeneratedMarketReports({ submissionId: submission.id, limit: 10 }) : Promise.resolve([]),
-    storage.listGeneratedReportDocuments ? storage.listGeneratedReportDocuments({ submissionId: submission.id, limit: 20 }) : Promise.resolve([]),
-  ];
-  const [uploadRequest, documents, prospectAudits, marketReports, reportDocuments, ...emailEventResults] = await Promise.all([
+  const [uploadRequest, documents, ...emailEventResults] = await Promise.all([
     storage.getLatestSecureUploadRequestForSubmission(submission.id),
     storage.listSecureDocumentsForSubmission(submission.id),
-    ...researchQueries,
     ...emailEventQueries,
   ]);
 
@@ -442,9 +432,6 @@ async function enrichSubmission(submission, storage, nowValue = new Date()) {
     {
       uploadRequest,
       documents,
-      prospectAudits,
-      marketReports,
-      reportDocuments,
       emailEvents: emailEventResults.flat(),
     },
     nowValue,
@@ -460,32 +447,23 @@ async function enrichSubmissions(submissions, storage, nowValue = new Date()) {
     !storage.listLatestSecureUploadRequestsForSubmissions ||
     !storage.listSecureDocumentsForSubmissions ||
     !storage.listEmailEventsForSubmissions ||
-    !storage.listEmailEventsForRecipients ||
-    !storage.listProspectAuditsForSubmissions ||
-    !storage.listGeneratedMarketReportsForSubmissions ||
-    !storage.listGeneratedReportDocumentsForSubmissions
+    !storage.listEmailEventsForRecipients
   ) {
     return Promise.all(submissions.map((submission) => enrichSubmission(submission, storage, nowValue)));
   }
 
   const submissionIds = submissions.map((submission) => submission.id);
   const contactEmails = submissions.flatMap(collectContactEmails);
-  const [uploadRequests, documents, submissionEmailEvents, recipientEmailEvents, prospectAudits, marketReports, reportDocuments] = await Promise.all([
+  const [uploadRequests, documents, submissionEmailEvents, recipientEmailEvents] = await Promise.all([
     listInBatches(submissionIds, (ids) => storage.listLatestSecureUploadRequestsForSubmissions(ids)),
     listInBatches(submissionIds, (ids) => storage.listSecureDocumentsForSubmissions(ids)),
     listInBatches(submissionIds, (ids) => storage.listEmailEventsForSubmissions(ids)),
     listInBatches(contactEmails, (emails) => storage.listEmailEventsForRecipients(emails)),
-    listInBatches(submissionIds, (ids) => storage.listProspectAuditsForSubmissions(ids)),
-    listInBatches(submissionIds, (ids) => storage.listGeneratedMarketReportsForSubmissions(ids)),
-    listInBatches(submissionIds, (ids) => storage.listGeneratedReportDocumentsForSubmissions(ids)),
   ]);
   const latestUploadBySubmission = firstBy(uploadRequests, (request) => request.submission_id);
   const documentsBySubmission = groupBy(documents, (document) => document.submission_id);
   const eventsBySubmission = groupBy(submissionEmailEvents, (event) => event.submission_id);
   const eventsByRecipient = groupBy(recipientEmailEvents, (event) => normalizeEmail(event.recipient_email, 200));
-  const auditsBySubmission = groupBy(prospectAudits, (audit) => audit.submission_id);
-  const reportsBySubmission = groupBy(marketReports, (report) => report.submission_id);
-  const reportDocumentsBySubmission = groupBy(reportDocuments, (document) => document.submission_id);
 
   return submissions.map((submission) => {
     const emailEvents = [
@@ -498,9 +476,6 @@ async function enrichSubmissions(submissions, storage, nowValue = new Date()) {
       {
         uploadRequest: latestUploadBySubmission.get(submission.id) || null,
         documents: documentsBySubmission.get(submission.id) || [],
-        prospectAudits: auditsBySubmission.get(submission.id) || [],
-        marketReports: reportsBySubmission.get(submission.id) || [],
-        reportDocuments: reportDocumentsBySubmission.get(submission.id) || [],
         emailEvents,
       },
       nowValue,

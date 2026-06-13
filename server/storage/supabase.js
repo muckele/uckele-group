@@ -30,45 +30,6 @@ function normalizeEmailEventRow(row) {
     : null;
 }
 
-function normalizeResearchRunRow(row) {
-  return row
-    ? {
-        ...row,
-        metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
-      }
-    : null;
-}
-
-function normalizeProspectAuditRow(row) {
-  return row
-    ? {
-        ...row,
-        findings: Array.isArray(row.findings) ? row.findings : [],
-        competitor_insights: Array.isArray(row.competitor_insights) ? row.competitor_insights : [],
-        sources: Array.isArray(row.sources) ? row.sources : [],
-        metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
-      }
-    : null;
-}
-
-function normalizeMarketReportRow(row) {
-  return row
-    ? {
-        ...row,
-        metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
-      }
-    : null;
-}
-
-function normalizeGeneratedReportDocumentRow(row) {
-  return row
-    ? {
-        ...row,
-        metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
-      }
-    : null;
-}
-
 function normalizeDealHunterSeenDealRow(row) {
   return row
     ? {
@@ -444,7 +405,7 @@ export function createSupabaseStorage(config) {
       return normalizeEmailEventRow(data);
     },
 
-    async listEmailEvents({ submissionId = '', recipientEmail = '', limit = 100 } = {}) {
+    async listEmailEvents({ submissionId = '', recipientEmail = '', source = '', limit = 100 } = {}) {
       const safeLimit = Math.max(1, Math.min(limit, 500));
       let query = client
         .from('email_events')
@@ -458,6 +419,10 @@ export function createSupabaseStorage(config) {
 
       if (recipientEmail) {
         query = query.eq('recipient_email', String(recipientEmail).trim().toLowerCase());
+      }
+
+      if (source) {
+        query = query.eq('source', String(source).trim());
       }
 
       const { data, error } = await query;
@@ -513,424 +478,49 @@ export function createSupabaseStorage(config) {
       return (data || []).map(normalizeEmailEventRow);
     },
 
-    async insertResearchRun(run) {
-      const record = {
-        query: '',
-        location: '',
-        industry: '',
-        requested_by: '',
-        started_at: null,
-        completed_at: null,
-        total_candidates: 0,
-        total_audited: 0,
-        total_reports: 0,
-        error: '',
-        metadata: {},
-        ...run,
-        status: run.status || 'queued',
-        run_type: run.run_type || 'manual-audit',
-        source: run.source || 'manual',
-      };
-      const { data, error } = await client.from('research_runs').insert(record).select().single();
+    async listDealHunterSeenDeals({ limit = 100000 } = {}) {
+      const safeLimit = Math.max(1, Math.min(limit, 100000));
+      const rows = [];
+      const pageSize = 1000;
 
-      if (error) {
-        throw error;
+      for (let from = 0; from < safeLimit; from += pageSize) {
+        const to = Math.min(from + pageSize - 1, safeLimit - 1);
+        const { data, error } = await client
+          .from('deal_hunter_seen_deals')
+          .select('*')
+          .order('last_seen_at', { ascending: false })
+          .range(from, to);
+
+        if (error) {
+          throw error;
+        }
+
+        rows.push(...(data || []));
+
+        if (!data || data.length < pageSize) {
+          break;
+        }
       }
 
-      return normalizeResearchRunRow(data);
+      return rows.map(normalizeDealHunterSeenDealRow);
     },
 
-    async updateResearchRun(id, values) {
-      const { data, error } = await client.from('research_runs').update(values).eq('id', id).select().single();
+    async upsertDealHunterSeenDeals(records = []) {
+      const safeRecords = Array.isArray(records) ? records.filter((record) => record?.id) : [];
 
-      if (error) {
-        throw error;
-      }
-
-      return normalizeResearchRunRow(data);
-    },
-
-    async getResearchRun(id) {
-      const { data, error } = await client.from('research_runs').select('*').eq('id', id).maybeSingle();
-
-      if (error) {
-        return null;
-      }
-
-      return normalizeResearchRunRow(data);
-    },
-
-    async listResearchRuns({ status = 'all', runType = '', limit = 50 } = {}) {
-      const safeLimit = Math.max(1, Math.min(limit, 500));
-      let query = client
-        .from('research_runs')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(safeLimit);
-
-      if (status && status !== 'all') {
-        query = query.eq('status', status);
-      }
-
-      if (runType) {
-        query = query.eq('run_type', runType);
-      }
-
-      const { data, error } = await query;
-
-      if (error) {
-        throw error;
-      }
-
-      return (data || []).map(normalizeResearchRunRow);
-    },
-
-    async insertProspectAudit(audit) {
-      const record = {
-        run_id: null,
-        submission_id: null,
-        website_url: '',
-        contact_name: '',
-        contact_email: '',
-        phone: '',
-        location: '',
-        industry: '',
-        score: null,
-        summary: '',
-        findings: [],
-        competitor_insights: [],
-        sources: [],
-        report_id: null,
-        error: '',
-        metadata: {},
-        ...audit,
-        status: audit.status || 'queued',
-        business_name: audit.business_name || 'Unknown business',
-      };
-      const { data, error } = await client.from('prospect_audits').insert(record).select().single();
-
-      if (error) {
-        throw error;
-      }
-
-      return normalizeProspectAuditRow(data);
-    },
-
-    async updateProspectAudit(id, values) {
-      const { data, error } = await client.from('prospect_audits').update(values).eq('id', id).select().single();
-
-      if (error) {
-        throw error;
-      }
-
-      return normalizeProspectAuditRow(data);
-    },
-
-    async getProspectAudit(id) {
-      const { data, error } = await client.from('prospect_audits').select('*').eq('id', id).maybeSingle();
-
-      if (error) {
-        return null;
-      }
-
-      return normalizeProspectAuditRow(data);
-    },
-
-    async listProspectAudits({ submissionId = '', runId = '', status = 'all', limit = 100 } = {}) {
-      const safeLimit = Math.max(1, Math.min(limit, 500));
-      let query = client
-        .from('prospect_audits')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(safeLimit);
-
-      if (submissionId) {
-        query = query.eq('submission_id', submissionId);
-      }
-
-      if (runId) {
-        query = query.eq('run_id', runId);
-      }
-
-      if (status && status !== 'all') {
-        query = query.eq('status', status);
-      }
-
-      const { data, error } = await query;
-
-      if (error) {
-        throw error;
-      }
-
-      return (data || []).map(normalizeProspectAuditRow);
-    },
-
-    async listProspectAuditsForSubmissions(submissionIds = [], limit = 5000) {
-      const ids = normalizeList(submissionIds);
-
-      if (ids.length === 0) {
+      if (safeRecords.length === 0) {
         return [];
       }
 
-      const safeLimit = Math.max(1, Math.min(limit, 10000));
-      const { data, error } = await client
-        .from('prospect_audits')
-        .select('*')
-        .in('submission_id', ids)
-        .order('created_at', { ascending: false })
-        .limit(safeLimit);
+      for (const chunk of chunkValues(safeRecords, 500)) {
+        const { error } = await client.from('deal_hunter_seen_deals').upsert(chunk, { onConflict: 'id' });
 
-      if (error) {
-        throw error;
+        if (error) {
+          throw error;
+        }
       }
 
-      return (data || []).map(normalizeProspectAuditRow);
+      return safeRecords;
     },
-
-    async insertGeneratedMarketReport(report) {
-      const record = {
-        run_id: null,
-        audit_id: null,
-        submission_id: null,
-        storage_path: '',
-        content: '',
-        summary: '',
-        metadata: {},
-        ...report,
-        report_type: report.report_type || 'prospect-audit',
-        title: report.title || 'Generated market report',
-        format: report.format || 'markdown',
-        status: report.status || 'draft',
-      };
-      const { data, error } = await client.from('generated_market_reports').insert(record).select().single();
-
-      if (error) {
-        throw error;
-      }
-
-      return normalizeMarketReportRow(data);
-    },
-
-    async updateGeneratedMarketReport(id, values) {
-      const { data, error } = await client.from('generated_market_reports').update(values).eq('id', id).select().single();
-
-      if (error) {
-        throw error;
-      }
-
-      return normalizeMarketReportRow(data);
-    },
-
-    async getGeneratedMarketReport(id) {
-      const { data, error } = await client.from('generated_market_reports').select('*').eq('id', id).maybeSingle();
-
-      if (error) {
-        return null;
-      }
-
-      return normalizeMarketReportRow(data);
-    },
-
-    async listGeneratedMarketReports({ submissionId = '', auditId = '', runId = '', limit = 100 } = {}) {
-      const safeLimit = Math.max(1, Math.min(limit, 500));
-      let query = client
-        .from('generated_market_reports')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(safeLimit);
-
-      if (submissionId) {
-        query = query.eq('submission_id', submissionId);
-      }
-
-      if (auditId) {
-        query = query.eq('audit_id', auditId);
-      }
-
-      if (runId) {
-        query = query.eq('run_id', runId);
-      }
-
-      const { data, error } = await query;
-
-      if (error) {
-        throw error;
-      }
-
-      return (data || []).map(normalizeMarketReportRow);
-    },
-
-    async listGeneratedMarketReportsForSubmissions(submissionIds = [], limit = 5000) {
-      const ids = normalizeList(submissionIds);
-
-      if (ids.length === 0) {
-        return [];
-      }
-
-      const safeLimit = Math.max(1, Math.min(limit, 10000));
-      const { data, error } = await client
-        .from('generated_market_reports')
-        .select('*')
-        .in('submission_id', ids)
-        .order('created_at', { ascending: false })
-        .limit(safeLimit);
-
-      if (error) {
-        throw error;
-      }
-
-      return (data || []).map(normalizeMarketReportRow);
-    },
-
-    async insertGeneratedReportDocument(document) {
-      const record = {
-        report_id: null,
-        run_id: null,
-        audit_id: null,
-        submission_id: null,
-        file_name: '',
-        mime_type: '',
-        size_bytes: 0,
-        storage_path: '',
-        checksum: '',
-        metadata: {},
-        ...document,
-        document_type: document.document_type || 'report',
-        title: document.title || document.file_name || 'Generated report document',
-        status: document.status || 'ready',
-      };
-      const { data, error } = await client.from('generated_report_documents').insert(record).select().single();
-
-      if (error) {
-        throw error;
-      }
-
-      return normalizeGeneratedReportDocumentRow(data);
-    },
-
-    async updateGeneratedReportDocument(id, values) {
-      const { data, error } = await client
-        .from('generated_report_documents')
-        .update(values)
-        .eq('id', id)
-        .select()
-        .single();
-
-      if (error) {
-        throw error;
-      }
-
-      return normalizeGeneratedReportDocumentRow(data);
-    },
-
-    async getGeneratedReportDocument(id) {
-      const { data, error } = await client.from('generated_report_documents').select('*').eq('id', id).maybeSingle();
-
-      if (error) {
-        return null;
-      }
-
-      return normalizeGeneratedReportDocumentRow(data);
-    },
-
-    async listGeneratedReportDocuments({ reportId = '', submissionId = '', auditId = '', runId = '', limit = 100 } = {}) {
-      const safeLimit = Math.max(1, Math.min(limit, 500));
-      let query = client
-        .from('generated_report_documents')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(safeLimit);
-
-      if (reportId) {
-        query = query.eq('report_id', reportId);
-      }
-
-      if (submissionId) {
-        query = query.eq('submission_id', submissionId);
-      }
-
-      if (auditId) {
-        query = query.eq('audit_id', auditId);
-      }
-
-      if (runId) {
-        query = query.eq('run_id', runId);
-      }
-
-      const { data, error } = await query;
-
-      if (error) {
-        throw error;
-      }
-
-      return (data || []).map(normalizeGeneratedReportDocumentRow);
-    },
-
-	    async listGeneratedReportDocumentsForSubmissions(submissionIds = [], limit = 5000) {
-	      const ids = normalizeList(submissionIds);
-
-      if (ids.length === 0) {
-        return [];
-      }
-
-      const safeLimit = Math.max(1, Math.min(limit, 10000));
-      const { data, error } = await client
-        .from('generated_report_documents')
-        .select('*')
-        .in('submission_id', ids)
-        .order('created_at', { ascending: false })
-        .limit(safeLimit);
-
-      if (error) {
-        throw error;
-      }
-
-	      return (data || []).map(normalizeGeneratedReportDocumentRow);
-	    },
-
-	    async listDealHunterSeenDeals({ limit = 100000 } = {}) {
-	      const safeLimit = Math.max(1, Math.min(limit, 100000));
-	      const rows = [];
-	      const pageSize = 1000;
-
-	      for (let from = 0; from < safeLimit; from += pageSize) {
-	        const to = Math.min(from + pageSize - 1, safeLimit - 1);
-	        const { data, error } = await client
-	          .from('deal_hunter_seen_deals')
-	          .select('*')
-	          .order('last_seen_at', { ascending: false })
-	          .range(from, to);
-
-	        if (error) {
-	          throw error;
-	        }
-
-	        rows.push(...(data || []));
-
-	        if (!data || data.length < pageSize) {
-	          break;
-	        }
-	      }
-
-	      return rows.map(normalizeDealHunterSeenDealRow);
-	    },
-
-	    async upsertDealHunterSeenDeals(records = []) {
-	      const safeRecords = Array.isArray(records) ? records.filter((record) => record?.id) : [];
-
-	      if (safeRecords.length === 0) {
-	        return [];
-	      }
-
-	      for (const chunk of chunkValues(safeRecords, 500)) {
-	        const { error } = await client.from('deal_hunter_seen_deals').upsert(chunk, { onConflict: 'id' });
-
-	        if (error) {
-	          throw error;
-	        }
-	      }
-
-	      return safeRecords;
-	    },
-	  };
-	}
+  };
+}

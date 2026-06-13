@@ -90,11 +90,11 @@ function ctaHtml(ctas = []) {
 
 function brandedEmailHtml({ preheader = '', eyebrow = '', title, paragraphs = [], bodyHtml = '', details = [], ctas = [], footerNote = '' }) {
   const config = getConfig();
-  const websiteUrl = normalizeUrl(config.outreach.websiteUrl || config.server.origin);
-  const mailingAddress = normalizeText(config.outreach.mailingAddress, 260);
+  const websiteUrl = normalizeUrl(config.brand.websiteUrl || config.server.origin);
+  const mailingAddress = normalizeText(config.brand.mailingAddress, 260);
   const footerLines = [
     footerNote ? { value: footerNote, isHtml: true } : null,
-    mailingAddress ? { value: `${config.outreach.companyName} | ${mailingAddress}`, isHtml: false } : null,
+    mailingAddress ? { value: `${config.brand.companyName} | ${mailingAddress}`, isHtml: false } : null,
     websiteUrl
       ? {
           value: `<a href="${escapeHtml(websiteUrl)}" style="color: #284638; text-decoration: underline;">${escapeHtml(websiteUrl)}</a>`,
@@ -123,7 +123,7 @@ function brandedEmailHtml({ preheader = '', eyebrow = '', title, paragraphs = []
                       <tr>
                         <td>
                           <div style="display: inline-block; height: 40px; width: 40px; border-radius: 10px; background: #284638; color: #FFFFFF; font-size: 14px; font-weight: 800; line-height: 40px; text-align: center;">UG</div>
-                          <span style="display: inline-block; margin-left: 10px; color: #18211D; font-size: 18px; font-weight: 800; vertical-align: middle;">${escapeHtml(config.outreach.companyName)}</span>
+                          <span style="display: inline-block; margin-left: 10px; color: #18211D; font-size: 18px; font-weight: 800; vertical-align: middle;">${escapeHtml(config.brand.companyName)}</span>
                         </td>
                       </tr>
                     </table>
@@ -406,154 +406,6 @@ export async function deliverSubmission(submission) {
   return sendMessage(buildSubmissionMessage(submission));
 }
 
-function normalizeFindings(findings = []) {
-  return (Array.isArray(findings) ? findings : [])
-    .map((finding) => ({
-      title: normalizeText(finding.title || finding.issue, 140),
-      impact: normalizeText(finding.impact || finding.reason, 260),
-      recommendation: normalizeText(finding.recommendation || finding.fix, 260),
-    }))
-    .filter((finding) => finding.title || finding.impact || finding.recommendation)
-    .slice(0, 3);
-}
-
-function findingsHtml(findings = []) {
-  if (findings.length === 0) {
-    return '';
-  }
-
-  return `
-    <div style="margin: 22px 0 4px; border: 1px solid #E3D9CA; border-radius: 16px; background: #F8F4ED; padding: 18px;">
-      <p style="margin: 0 0 12px; color: #284638; font-size: 13px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase;">What stood out</p>
-      ${findings
-        .map(
-          (finding) => `
-            <div style="margin: 0 0 14px;">
-              <p style="margin: 0 0 5px; color: #18211D; font-size: 15px; font-weight: 800;">${escapeHtml(finding.title || 'Lead-generation opportunity')}</p>
-              ${finding.impact ? `<p style="margin: 0 0 5px; color: #33443B; font-size: 14px; line-height: 1.55;">${escapeHtml(finding.impact)}</p>` : ''}
-              ${finding.recommendation ? `<p style="margin: 0; color: #51615A; font-size: 14px; line-height: 1.55;"><strong>Suggested next step:</strong> ${escapeHtml(finding.recommendation)}</p>` : ''}
-            </div>
-          `,
-        )
-        .join('')}
-    </div>
-  `;
-}
-
-export function buildProspectAuditEmail({
-  to,
-  prospect = {},
-  audit = {},
-  unsubscribeUrl = '',
-  sequenceStep = 1,
-} = {}) {
-  const config = getConfig();
-  const businessName = normalizeText(prospect.businessName || prospect.company || prospect.name, 120) || 'your business';
-  const contactName = normalizeText(prospect.contactName || prospect.ownerName || prospect.firstName, 80);
-  const senderName = normalizeText(config.outreach.senderName, 120);
-  const companyName = normalizeText(config.outreach.companyName, 120) || 'Uckele Group';
-  const websiteUrl = normalizeUrl(prospect.websiteUrl || prospect.url);
-  const industry = normalizeText(prospect.industry || prospect.category, 100);
-  const location = normalizeText(prospect.location || prospect.city, 100);
-  const findings = normalizeFindings(audit.findings);
-  const topFinding = findings[0]?.title || normalizeText(audit.summary, 140) || 'a quick website lead opportunity';
-  const subjectPrefix = sequenceStep > 1 ? 'Following up' : 'Quick website lead idea';
-  const subject = `${subjectPrefix} for ${businessName}`;
-  const scheduleUrl = normalizeUrl(config.outreach.schedulingUrl);
-  const contactFormUrl = normalizeUrl(config.outreach.contactFormUrl);
-  const companyWebsiteUrl = normalizeUrl(config.outreach.websiteUrl || config.server.origin);
-  const primaryCta = scheduleUrl
-    ? { label: 'Schedule 15 minutes', href: scheduleUrl }
-    : { label: 'Request the 3-point audit', href: contactFormUrl };
-  const ctas = [
-    primaryCta,
-    companyWebsiteUrl ? { label: 'View Uckele Group', href: companyWebsiteUrl } : null,
-    scheduleUrl && contactFormUrl ? { label: 'Fill out the form', href: contactFormUrl } : null,
-  ].filter(Boolean);
-  const greeting = contactName ? `Hi ${contactName},` : 'Hi,';
-  const contextLine = [
-    websiteUrl ? `I reviewed ${websiteUrl}` : `I reviewed ${businessName}'s online presence`,
-    industry ? `for a ${industry} business` : '',
-    location ? `in ${location}` : '',
-  ]
-    .filter(Boolean)
-    .join(' ');
-  const paragraphs = [
-    greeting,
-    `${contextLine}, and ${topFinding.toLowerCase().startsWith('i ') ? topFinding : `noticed ${topFinding}`}.`,
-    'My work is focused on helping local businesses remove the small website, trust, mobile, and contact-flow issues that quietly reduce calls and form submissions.',
-    'If useful, I can walk you through the short audit and the highest-leverage fixes in a 15-minute call.',
-  ];
-  const detailRows = [
-    { label: 'Business', value: businessName },
-    websiteUrl ? { label: 'Website checked', value: websiteUrl } : null,
-    audit.competitorInsight ? { label: 'Market note', value: normalizeText(audit.competitorInsight, 260) } : null,
-  ].filter(Boolean);
-  const safeUnsubscribeUrl = normalizeUrl(unsubscribeUrl || config.outreach.unsubscribeBaseUrl);
-  const unsubscribeText = safeUnsubscribeUrl
-    ? `No longer want these website audit notes? <a href="${escapeHtml(safeUnsubscribeUrl)}" style="color: #284638; text-decoration: underline;">Unsubscribe here</a>.`
-    : 'No longer want these website audit notes? Reply "unsubscribe" and I will remove you.';
-  const signatureHtml = senderName
-    ? `<p style="margin: 20px 0 0; color: #33443B; font-size: 15px; line-height: 1.6;">Best,<br><strong style="color: #18211D;">${escapeHtml(senderName)}</strong><br>${escapeHtml(companyName)}</p>`
-    : '';
-  const html = brandedEmailHtml({
-    preheader: `A quick lead-generation audit note for ${businessName}.`,
-    eyebrow: 'Website Lead Audit',
-    title: `${businessName}: one quick lead-generation opportunity`,
-    paragraphs,
-    bodyHtml: `${findingsHtml(findings)}${signatureHtml}`,
-    details: detailRows,
-    ctas,
-    footerNote: unsubscribeText,
-  });
-  const text = [
-    `${greeting}`,
-    '',
-    `${contextLine}, and ${topFinding.toLowerCase().startsWith('i ') ? topFinding : `noticed ${topFinding}`}.`,
-    '',
-    ...findings.flatMap((finding, index) => [
-      `${index + 1}. ${finding.title || 'Lead-generation opportunity'}`,
-      finding.impact ? `Impact: ${finding.impact}` : '',
-      finding.recommendation ? `Suggested next step: ${finding.recommendation}` : '',
-      '',
-    ]),
-    'If useful, I can walk you through the short audit and the highest-leverage fixes in a 15-minute call.',
-    '',
-    senderName ? `Best,\n${senderName}\n${companyName}` : '',
-    '',
-    scheduleUrl ? `Schedule 15 minutes: ${scheduleUrl}` : '',
-    companyWebsiteUrl ? `View Uckele Group: ${companyWebsiteUrl}` : '',
-    contactFormUrl ? `Fill out the form: ${contactFormUrl}` : '',
-    '',
-    safeUnsubscribeUrl ? `Unsubscribe: ${safeUnsubscribeUrl}` : 'Reply "unsubscribe" and I will remove you.',
-  ]
-    .join('\n');
-
-  return {
-    kind: 'prospect-audit-outreach',
-    to,
-    subject,
-    headline: 'Website lead audit',
-    text,
-    html,
-    tags: [
-      { name: 'source', value: 'prospect-audit-outreach' },
-      prospect.id ? { name: 'prospect_id', value: String(prospect.id).slice(0, 240) } : null,
-    ].filter(Boolean),
-    tracking: {
-      source: 'prospect-audit-outreach',
-      prospectId: prospect.id || '',
-      recipientEmail: to,
-      businessName,
-      sequenceStep,
-    },
-  };
-}
-
-export async function sendProspectAuditEmail(options) {
-  return sendMessage(buildProspectAuditEmail(options));
-}
-
 function formatMoney(value) {
   return Number.isFinite(value)
     ? new Intl.NumberFormat('en-US', {
@@ -728,14 +580,19 @@ export function buildDailyDealHunterEmail({ to, review = {} } = {}) {
     ...recommendations.map((item) => `- ${item}`),
   ].join('\n');
 
-  return {
-	    kind: 'daily-deal-hunter',
-	    to,
-	    subject: `Daily deal review: ${review.totals?.newMatches || 0} new fit, ${review.totals?.removalCandidates || 0} remove`,
+	  return {
+		    kind: 'daily-deal-hunter',
+		    to,
+		    subject: `Daily deal review: ${review.totals?.newMatches || 0} new fit, ${review.totals?.removalCandidates || 0} remove`,
     headline: 'Daily acquisition deal review',
     text,
     html,
     tags: [{ name: 'source', value: 'daily-deal-hunter' }],
+    tracking: {
+      source: 'daily-deal-hunter',
+      generatedAt: review.generatedAt || '',
+      totals: review.totals || {},
+    },
   };
 }
 

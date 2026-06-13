@@ -18,7 +18,6 @@ import {
 } from './services/documentVault.js';
 import { recordEmailEventsFromWebhook } from './services/emailEvents.js';
 import { reviewDailyDeals, sendDailyDealHunterReview } from './services/dealHunter.js';
-import { runManualResearchAudit } from './services/researchAudits.js';
 import {
   createManualSubmission,
   exportDashboardSubmissionsCsv,
@@ -165,7 +164,7 @@ export function createApp() {
       const result = await requestAdminMagicLink(request.body.email || '', request);
 
       if (!result.ok) {
-        response.status(400).json({ success: false, error: result.reason });
+        response.status(result.status || 400).json({ success: false, error: result.reason });
         return;
       }
 
@@ -358,76 +357,6 @@ export function createApp() {
         uploadUrl: result.uploadUrl,
         request: result.request,
         emailResult: result.emailResult,
-      });
-    }),
-  );
-
-  app.post(
-    '/api/admin/submissions/:id/research-audit',
-    asyncRoute(async (request, response) => {
-      const session = requireAdmin(request);
-
-      if (!session) {
-        response.status(401).json({ success: false, error: 'Unauthorized.' });
-        return;
-      }
-
-      const result = await runManualResearchAudit({
-        submissionId: request.params.id,
-        url: String(request.body.url || ''),
-        requestedBy: session.username,
-      });
-
-      if (!result.ok) {
-        response.status(result.status || 400).json({ success: false, error: result.error, run: result.run, audit: result.audit });
-        return;
-      }
-
-      response.status(result.status || 201).json({
-        success: true,
-        run: result.run,
-        audit: result.audit,
-        report: result.report,
-        document: result.document,
-      });
-    }),
-  );
-
-  app.post(
-    '/api/admin/research-audits',
-    asyncRoute(async (request, response) => {
-      const session = requireAdmin(request);
-
-      if (!session) {
-        response.status(401).json({ success: false, error: 'Unauthorized.' });
-        return;
-      }
-
-      const result = await runManualResearchAudit({
-        url: String(request.body.url || ''),
-        requestedBy: session.username,
-        prospect: {
-          businessName: String(request.body.businessName || ''),
-          contactName: String(request.body.contactName || ''),
-          contactEmail: String(request.body.contactEmail || ''),
-          phone: String(request.body.phone || ''),
-          industry: String(request.body.industry || ''),
-          location: String(request.body.location || ''),
-          competitorUrls: request.body.competitorUrls || request.body.competitors || [],
-        },
-      });
-
-      if (!result.ok) {
-        response.status(result.status || 400).json({ success: false, error: result.error, run: result.run, audit: result.audit });
-        return;
-      }
-
-      response.status(result.status || 201).json({
-        success: true,
-        run: result.run,
-        audit: result.audit,
-        report: result.report,
-        document: result.document,
       });
     }),
   );

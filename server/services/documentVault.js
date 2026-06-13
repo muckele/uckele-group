@@ -21,6 +21,7 @@ const allowedMimeTypes = new Set([
   'application/zip',
   'application/x-zip-compressed',
 ]);
+const maxDocumentsPerUpload = 5;
 
 function sanitizeFileName(fileName) {
   const cleaned = String(fileName || 'document')
@@ -47,11 +48,40 @@ function normalizeDocumentType(value) {
   return allowed.includes(normalized) ? normalized : 'other';
 }
 
-function validateDocumentPayload(document) {
+function normalizeBase64(value = '') {
+  return String(value || '')
+    .replace(/^data:[^;]+;base64,/i, '')
+    .replace(/\s+/g, '');
+}
+
+function estimateBase64DecodedBytes(value = '') {
+  const normalized = normalizeBase64(value);
+
+  if (!normalized || normalized.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)) {
+    return null;
+  }
+
+  const padding = normalized.endsWith('==') ? 2 : normalized.endsWith('=') ? 1 : 0;
+  return Math.max(0, Math.floor((normalized.length * 3) / 4) - padding);
+}
+
+function validateDocumentPayload(document = {}, config) {
+  document = document || {};
   const errors = [];
+  const decodedBytes = estimateBase64DecodedBytes(document.contentBase64);
 
   if (!document.name || !document.contentBase64) {
     errors.push('Each uploaded file must include a name and file content.');
+  }
+
+  if (decodedBytes === null) {
+    errors.push(`${document.name || 'A file'} has invalid file content.`);
+  } else if (decodedBytes > config.secureDocuments.maxUploadBytes) {
+    errors.push(
+      `${document.name || 'A file'} exceeds the maximum upload size of ${Math.round(
+        config.secureDocuments.maxUploadBytes / (1024 * 1024),
+      )} MB.`,
+    );
   }
 
   if (document.mimeType && !allowedMimeTypes.has(document.mimeType)) {
@@ -169,7 +199,11 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
     return { ok: false, error: 'Please choose at least one file to upload.' };
   }
 
-  const validationErrors = documents.flatMap(validateDocumentPayload);
+  if (documents.length > maxDocumentsPerUpload) {
+    return { ok: false, error: `Please upload no more than ${maxDocumentsPerUpload} files at a time.` };
+  }
+
+  const validationErrors = documents.flatMap((document) => validateDocumentPayload(document, config));
 
   if (validationErrors.length > 0) {
     return { ok: false, error: validationErrors[0] };
@@ -181,16 +215,7 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
   const savedDocuments = [];
 
   for (const document of documents) {
-    const buffer = Buffer.from(String(document.contentBase64 || ''), 'base64');
-
-    if (buffer.byteLength > config.secureDocuments.maxUploadBytes) {
-      return {
-        ok: false,
-        error: `${document.name} exceeds the maximum upload size of ${Math.round(
-          config.secureDocuments.maxUploadBytes / (1024 * 1024),
-        )} MB.`,
-      };
-    }
+    const buffer = Buffer.from(normalizeBase64(document.contentBase64), 'base64');
 
     const documentId = randomUUID();
     const safeOriginalName = sanitizeFileName(document.name);

@@ -44,45 +44,6 @@ function normalizeEmailEventRow(row) {
     : null;
 }
 
-function normalizeResearchRunRow(row) {
-  return row
-    ? {
-        ...row,
-        metadata: parseJsonColumn(row.metadata, {}),
-      }
-    : null;
-}
-
-function normalizeProspectAuditRow(row) {
-  return row
-    ? {
-        ...row,
-        findings: parseJsonColumn(row.findings, []),
-        competitor_insights: parseJsonColumn(row.competitor_insights, []),
-        sources: parseJsonColumn(row.sources, []),
-        metadata: parseJsonColumn(row.metadata, {}),
-      }
-    : null;
-}
-
-function normalizeMarketReportRow(row) {
-  return row
-    ? {
-        ...row,
-        metadata: parseJsonColumn(row.metadata, {}),
-      }
-    : null;
-}
-
-function normalizeGeneratedReportDocumentRow(row) {
-  return row
-    ? {
-        ...row,
-        metadata: parseJsonColumn(row.metadata, {}),
-      }
-    : null;
-}
-
 function normalizeDealHunterSeenDealRow(row) {
   return row
     ? {
@@ -115,37 +76,6 @@ function serializeEmailEvent(event) {
   return {
     ...event,
     metadata: JSON.stringify(event.metadata || {}),
-  };
-}
-
-function serializeResearchRun(run) {
-  return {
-    ...run,
-    metadata: JSON.stringify(run.metadata || {}),
-  };
-}
-
-function serializeProspectAudit(audit) {
-  return {
-    ...audit,
-    findings: JSON.stringify(audit.findings || []),
-    competitor_insights: JSON.stringify(audit.competitor_insights || []),
-    sources: JSON.stringify(audit.sources || []),
-    metadata: JSON.stringify(audit.metadata || {}),
-  };
-}
-
-function serializeMarketReport(report) {
-  return {
-    ...report,
-    metadata: JSON.stringify(report.metadata || {}),
-  };
-}
-
-function serializeGeneratedReportDocument(document) {
-  return {
-    ...document,
-    metadata: JSON.stringify(document.metadata || {}),
   };
 }
 
@@ -273,105 +203,25 @@ export function createSqliteStorage(config) {
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
-    CREATE TABLE IF NOT EXISTS research_runs (
+    CREATE TABLE IF NOT EXISTS deal_hunter_seen_deals (
       id TEXT PRIMARY KEY,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      status TEXT NOT NULL,
-      run_type TEXT NOT NULL,
-      source TEXT NOT NULL,
-      query TEXT,
-      location TEXT,
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      source_id TEXT,
+      source_name TEXT,
+      source_mode TEXT,
+      external_id TEXT,
+      listing_url TEXT,
+      name TEXT NOT NULL,
       industry TEXT,
-      requested_by TEXT,
-      started_at TEXT,
-      completed_at TEXT,
-      total_candidates INTEGER NOT NULL DEFAULT 0,
-      total_audited INTEGER NOT NULL DEFAULT 0,
-      total_reports INTEGER NOT NULL DEFAULT 0,
-      error TEXT,
-      metadata TEXT NOT NULL DEFAULT '{}'
-    );
-
-    CREATE TABLE IF NOT EXISTS prospect_audits (
-      id TEXT PRIMARY KEY,
-      run_id TEXT,
-      submission_id TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      status TEXT NOT NULL,
-      business_name TEXT NOT NULL,
-      website_url TEXT,
-      contact_name TEXT,
-      contact_email TEXT,
-      phone TEXT,
       location TEXT,
-      industry TEXT,
+      annual_profit REAL,
+      annual_revenue REAL,
+      asking_price REAL,
       score INTEGER,
-      summary TEXT,
-      findings TEXT NOT NULL DEFAULT '[]',
-      competitor_insights TEXT NOT NULL DEFAULT '[]',
-      sources TEXT NOT NULL DEFAULT '[]',
-      report_id TEXT,
-      error TEXT,
+      should_remove INTEGER NOT NULL DEFAULT 0,
       metadata TEXT NOT NULL DEFAULT '{}'
     );
-
-    CREATE TABLE IF NOT EXISTS generated_market_reports (
-      id TEXT PRIMARY KEY,
-      run_id TEXT,
-      audit_id TEXT,
-      submission_id TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      report_type TEXT NOT NULL,
-      title TEXT NOT NULL,
-      format TEXT NOT NULL,
-      status TEXT NOT NULL,
-      storage_path TEXT,
-      content TEXT,
-      summary TEXT,
-      metadata TEXT NOT NULL DEFAULT '{}'
-    );
-
-	    CREATE TABLE IF NOT EXISTS generated_report_documents (
-	      id TEXT PRIMARY KEY,
-      report_id TEXT,
-      run_id TEXT,
-      audit_id TEXT,
-      submission_id TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      document_type TEXT NOT NULL,
-      title TEXT NOT NULL,
-      file_name TEXT,
-      mime_type TEXT,
-      size_bytes INTEGER NOT NULL DEFAULT 0,
-      storage_path TEXT,
-      checksum TEXT,
-      status TEXT NOT NULL,
-	      metadata TEXT NOT NULL DEFAULT '{}'
-	    );
-
-	    CREATE TABLE IF NOT EXISTS deal_hunter_seen_deals (
-	      id TEXT PRIMARY KEY,
-	      first_seen_at TEXT NOT NULL,
-	      last_seen_at TEXT NOT NULL,
-	      source_id TEXT,
-	      source_name TEXT,
-	      source_mode TEXT,
-	      external_id TEXT,
-	      listing_url TEXT,
-	      name TEXT NOT NULL,
-	      industry TEXT,
-	      location TEXT,
-	      annual_profit REAL,
-	      annual_revenue REAL,
-	      asking_price REAL,
-	      score INTEGER,
-	      should_remove INTEGER NOT NULL DEFAULT 0,
-	      metadata TEXT NOT NULL DEFAULT '{}'
-	    );
 
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_created_at ON contact_submissions(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_status ON contact_submissions(status);
@@ -385,23 +235,9 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_email_events_recipient_email ON email_events(recipient_email, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_email_events_message_id ON email_events(message_id);
     CREATE INDEX IF NOT EXISTS idx_email_events_event_type ON email_events(event_type, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_research_runs_created_at ON research_runs(created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_research_runs_status ON research_runs(status, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_research_runs_run_type ON research_runs(run_type, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_prospect_audits_run_id ON prospect_audits(run_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_prospect_audits_submission_id ON prospect_audits(submission_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_prospect_audits_website_url ON prospect_audits(website_url);
-    CREATE INDEX IF NOT EXISTS idx_prospect_audits_status ON prospect_audits(status, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_generated_market_reports_run_id ON generated_market_reports(run_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_generated_market_reports_audit_id ON generated_market_reports(audit_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_generated_market_reports_submission_id ON generated_market_reports(submission_id, created_at DESC);
-	    CREATE INDEX IF NOT EXISTS idx_generated_report_documents_report_id ON generated_report_documents(report_id, created_at DESC);
-	    CREATE INDEX IF NOT EXISTS idx_generated_report_documents_run_id ON generated_report_documents(run_id, created_at DESC);
-	    CREATE INDEX IF NOT EXISTS idx_generated_report_documents_audit_id ON generated_report_documents(audit_id, created_at DESC);
-	    CREATE INDEX IF NOT EXISTS idx_generated_report_documents_submission_id ON generated_report_documents(submission_id, created_at DESC);
-	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_last_seen_at ON deal_hunter_seen_deals(last_seen_at DESC);
-	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_source_id ON deal_hunter_seen_deals(source_id, last_seen_at DESC);
-	  `);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_last_seen_at ON deal_hunter_seen_deals(last_seen_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_source_id ON deal_hunter_seen_deals(source_id, last_seen_at DESC);
+  `);
 
   ensureColumn(database, 'contact_submissions', 'lead_type', "TEXT NOT NULL DEFAULT 'owner'");
   ensureColumn(database, 'contact_submissions', 'priority', "TEXT NOT NULL DEFAULT 'normal'");
@@ -625,224 +461,64 @@ export function createSqliteStorage(config) {
   `);
   const getEmailEventByKeyStatement = database.prepare('SELECT * FROM email_events WHERE event_key = ? LIMIT 1');
 
-  const insertResearchRunStatement = database.prepare(`
-    INSERT INTO research_runs (
+  const upsertDealHunterSeenDealStatement = database.prepare(`
+    INSERT INTO deal_hunter_seen_deals (
       id,
-      created_at,
-      updated_at,
-      status,
-      run_type,
-      source,
-      query,
-      location,
+      first_seen_at,
+      last_seen_at,
+      source_id,
+      source_name,
+      source_mode,
+      external_id,
+      listing_url,
+      name,
       industry,
-      requested_by,
-      started_at,
-      completed_at,
-      total_candidates,
-      total_audited,
-      total_reports,
-      error,
-      metadata
-    ) VALUES (
-      @id,
-      @created_at,
-      @updated_at,
-      @status,
-      @run_type,
-      @source,
-      @query,
-      @location,
-      @industry,
-      @requested_by,
-      @started_at,
-      @completed_at,
-      @total_candidates,
-      @total_audited,
-      @total_reports,
-      @error,
-      @metadata
-    )
-  `);
-
-  const insertProspectAuditStatement = database.prepare(`
-    INSERT INTO prospect_audits (
-      id,
-      run_id,
-      submission_id,
-      created_at,
-      updated_at,
-      status,
-      business_name,
-      website_url,
-      contact_name,
-      contact_email,
-      phone,
       location,
-      industry,
+      annual_profit,
+      annual_revenue,
+      asking_price,
       score,
-      summary,
-      findings,
-      competitor_insights,
-      sources,
-      report_id,
-      error,
+      should_remove,
       metadata
     ) VALUES (
       @id,
-      @run_id,
-      @submission_id,
-      @created_at,
-      @updated_at,
-      @status,
-      @business_name,
-      @website_url,
-      @contact_name,
-      @contact_email,
-      @phone,
-      @location,
+      @first_seen_at,
+      @last_seen_at,
+      @source_id,
+      @source_name,
+      @source_mode,
+      @external_id,
+      @listing_url,
+      @name,
       @industry,
+      @location,
+      @annual_profit,
+      @annual_revenue,
+      @asking_price,
       @score,
-      @summary,
-      @findings,
-      @competitor_insights,
-      @sources,
-      @report_id,
-      @error,
+      @should_remove,
       @metadata
     )
+    ON CONFLICT(id) DO UPDATE SET
+      last_seen_at = excluded.last_seen_at,
+      source_id = excluded.source_id,
+      source_name = excluded.source_name,
+      source_mode = excluded.source_mode,
+      external_id = excluded.external_id,
+      listing_url = excluded.listing_url,
+      name = excluded.name,
+      industry = excluded.industry,
+      location = excluded.location,
+      annual_profit = excluded.annual_profit,
+      annual_revenue = excluded.annual_revenue,
+      asking_price = excluded.asking_price,
+      score = excluded.score,
+      should_remove = excluded.should_remove,
+      metadata = excluded.metadata
   `);
-
-  const insertMarketReportStatement = database.prepare(`
-    INSERT INTO generated_market_reports (
-      id,
-      run_id,
-      audit_id,
-      submission_id,
-      created_at,
-      updated_at,
-      report_type,
-      title,
-      format,
-      status,
-      storage_path,
-      content,
-      summary,
-      metadata
-    ) VALUES (
-      @id,
-      @run_id,
-      @audit_id,
-      @submission_id,
-      @created_at,
-      @updated_at,
-      @report_type,
-      @title,
-      @format,
-      @status,
-      @storage_path,
-      @content,
-      @summary,
-      @metadata
-    )
-  `);
-
-	  const insertGeneratedReportDocumentStatement = database.prepare(`
-    INSERT INTO generated_report_documents (
-      id,
-      report_id,
-      run_id,
-      audit_id,
-      submission_id,
-      created_at,
-      updated_at,
-      document_type,
-      title,
-      file_name,
-      mime_type,
-      size_bytes,
-      storage_path,
-      checksum,
-      status,
-      metadata
-    ) VALUES (
-      @id,
-      @report_id,
-      @run_id,
-      @audit_id,
-      @submission_id,
-      @created_at,
-      @updated_at,
-      @document_type,
-      @title,
-      @file_name,
-      @mime_type,
-      @size_bytes,
-      @storage_path,
-      @checksum,
-      @status,
-      @metadata
-    )
-	  `);
-
-	  const upsertDealHunterSeenDealStatement = database.prepare(`
-	    INSERT INTO deal_hunter_seen_deals (
-	      id,
-	      first_seen_at,
-	      last_seen_at,
-	      source_id,
-	      source_name,
-	      source_mode,
-	      external_id,
-	      listing_url,
-	      name,
-	      industry,
-	      location,
-	      annual_profit,
-	      annual_revenue,
-	      asking_price,
-	      score,
-	      should_remove,
-	      metadata
-	    ) VALUES (
-	      @id,
-	      @first_seen_at,
-	      @last_seen_at,
-	      @source_id,
-	      @source_name,
-	      @source_mode,
-	      @external_id,
-	      @listing_url,
-	      @name,
-	      @industry,
-	      @location,
-	      @annual_profit,
-	      @annual_revenue,
-	      @asking_price,
-	      @score,
-	      @should_remove,
-	      @metadata
-	    )
-	    ON CONFLICT(id) DO UPDATE SET
-	      last_seen_at = excluded.last_seen_at,
-	      source_id = excluded.source_id,
-	      source_name = excluded.source_name,
-	      source_mode = excluded.source_mode,
-	      external_id = excluded.external_id,
-	      listing_url = excluded.listing_url,
-	      name = excluded.name,
-	      industry = excluded.industry,
-	      location = excluded.location,
-	      annual_profit = excluded.annual_profit,
-	      annual_revenue = excluded.annual_revenue,
-	      asking_price = excluded.asking_price,
-	      score = excluded.score,
-	      should_remove = excluded.should_remove,
-	      metadata = excluded.metadata
-	  `);
-	  const upsertDealHunterSeenDealsTransaction = database.transaction((records) => {
-	    records.forEach((record) => upsertDealHunterSeenDealStatement.run(serializeDealHunterSeenDeal(record)));
-	  });
+  const upsertDealHunterSeenDealsTransaction = database.transaction((records) => {
+    records.forEach((record) => upsertDealHunterSeenDealStatement.run(serializeDealHunterSeenDeal(record)));
+  });
 
   function updateRecord(tableName, id, values, allowedFields, jsonFields = []) {
     const updates = Object.entries(values).filter(([key]) => allowedFields.includes(key));
@@ -1138,7 +814,7 @@ export function createSqliteStorage(config) {
       return event;
     },
 
-    async listEmailEvents({ submissionId = '', recipientEmail = '', limit = 100 } = {}) {
+    async listEmailEvents({ submissionId = '', recipientEmail = '', source = '', limit = 100 } = {}) {
       const clauses = [];
       const params = [];
 
@@ -1150,6 +826,11 @@ export function createSqliteStorage(config) {
       if (recipientEmail) {
         clauses.push("LOWER(COALESCE(recipient_email, '')) = ?");
         params.push(String(recipientEmail).trim().toLowerCase());
+      }
+
+      if (source) {
+        clauses.push('source = ?');
+        params.push(String(source).trim());
       }
 
       const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -1209,433 +890,6 @@ export function createSqliteStorage(config) {
         .all(...emails, safeLimit)
         .map(normalizeEmailEventRow);
     },
-
-    async insertResearchRun(run) {
-      const record = {
-        query: '',
-        location: '',
-        industry: '',
-        requested_by: '',
-        started_at: null,
-        completed_at: null,
-        total_candidates: 0,
-        total_audited: 0,
-        total_reports: 0,
-        error: '',
-        metadata: {},
-        ...run,
-        status: run.status || 'queued',
-        run_type: run.run_type || 'manual-audit',
-        source: run.source || 'manual',
-      };
-
-      insertResearchRunStatement.run(serializeResearchRun(record));
-      return this.getResearchRun(record.id);
-    },
-
-    async updateResearchRun(id, values) {
-      updateRecord(
-        'research_runs',
-        id,
-        values,
-        [
-          'updated_at',
-          'status',
-          'run_type',
-          'source',
-          'query',
-          'location',
-          'industry',
-          'requested_by',
-          'started_at',
-          'completed_at',
-          'total_candidates',
-          'total_audited',
-          'total_reports',
-          'error',
-          'metadata',
-        ],
-        ['metadata'],
-      );
-
-      return this.getResearchRun(id);
-    },
-
-    async getResearchRun(id) {
-      const row = database.prepare('SELECT * FROM research_runs WHERE id = ?').get(id);
-      return normalizeResearchRunRow(row);
-    },
-
-    async listResearchRuns({ status = 'all', runType = '', limit = 50 } = {}) {
-      const clauses = [];
-      const params = [];
-
-      if (status && status !== 'all') {
-        clauses.push('status = ?');
-        params.push(status);
-      }
-
-      if (runType) {
-        clauses.push('run_type = ?');
-        params.push(runType);
-      }
-
-      const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-      const safeLimit = Math.max(1, Math.min(limit, 500));
-
-      return database
-        .prepare(
-          `
-            SELECT * FROM research_runs
-            ${whereClause}
-            ORDER BY created_at DESC
-            LIMIT ?
-          `,
-        )
-        .all(...params, safeLimit)
-        .map(normalizeResearchRunRow);
-    },
-
-    async insertProspectAudit(audit) {
-      const record = {
-        run_id: null,
-        submission_id: null,
-        website_url: '',
-        contact_name: '',
-        contact_email: '',
-        phone: '',
-        location: '',
-        industry: '',
-        score: null,
-        summary: '',
-        findings: [],
-        competitor_insights: [],
-        sources: [],
-        report_id: null,
-        error: '',
-        metadata: {},
-        ...audit,
-        status: audit.status || 'queued',
-        business_name: audit.business_name || 'Unknown business',
-      };
-
-      insertProspectAuditStatement.run(serializeProspectAudit(record));
-      return this.getProspectAudit(record.id);
-    },
-
-    async updateProspectAudit(id, values) {
-      updateRecord(
-        'prospect_audits',
-        id,
-        values,
-        [
-          'run_id',
-          'submission_id',
-          'updated_at',
-          'status',
-          'business_name',
-          'website_url',
-          'contact_name',
-          'contact_email',
-          'phone',
-          'location',
-          'industry',
-          'score',
-          'summary',
-          'findings',
-          'competitor_insights',
-          'sources',
-          'report_id',
-          'error',
-          'metadata',
-        ],
-        ['findings', 'competitor_insights', 'sources', 'metadata'],
-      );
-
-      return this.getProspectAudit(id);
-    },
-
-    async getProspectAudit(id) {
-      const row = database.prepare('SELECT * FROM prospect_audits WHERE id = ?').get(id);
-      return normalizeProspectAuditRow(row);
-    },
-
-    async listProspectAudits({ submissionId = '', runId = '', status = 'all', limit = 100 } = {}) {
-      const clauses = [];
-      const params = [];
-
-      if (submissionId) {
-        clauses.push('submission_id = ?');
-        params.push(submissionId);
-      }
-
-      if (runId) {
-        clauses.push('run_id = ?');
-        params.push(runId);
-      }
-
-      if (status && status !== 'all') {
-        clauses.push('status = ?');
-        params.push(status);
-      }
-
-      const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-      const safeLimit = Math.max(1, Math.min(limit, 500));
-
-      return database
-        .prepare(
-          `
-            SELECT * FROM prospect_audits
-            ${whereClause}
-            ORDER BY created_at DESC
-            LIMIT ?
-          `,
-        )
-        .all(...params, safeLimit)
-        .map(normalizeProspectAuditRow);
-    },
-
-    async listProspectAuditsForSubmissions(submissionIds = [], limit = 5000) {
-      const ids = normalizeList(submissionIds);
-
-      if (ids.length === 0) {
-        return [];
-      }
-
-      const safeLimit = Math.max(1, Math.min(limit, 10000));
-      return database
-        .prepare(
-          `
-            SELECT * FROM prospect_audits
-            WHERE submission_id IN (${placeholders(ids.length)})
-            ORDER BY created_at DESC
-            LIMIT ?
-          `,
-        )
-        .all(...ids, safeLimit)
-        .map(normalizeProspectAuditRow);
-    },
-
-    async insertGeneratedMarketReport(report) {
-      const record = {
-        run_id: null,
-        audit_id: null,
-        submission_id: null,
-        storage_path: '',
-        content: '',
-        summary: '',
-        metadata: {},
-        ...report,
-        report_type: report.report_type || 'prospect-audit',
-        title: report.title || 'Generated market report',
-        format: report.format || 'markdown',
-        status: report.status || 'draft',
-      };
-
-      insertMarketReportStatement.run(serializeMarketReport(record));
-      return this.getGeneratedMarketReport(record.id);
-    },
-
-    async updateGeneratedMarketReport(id, values) {
-      updateRecord(
-        'generated_market_reports',
-        id,
-        values,
-        [
-          'run_id',
-          'audit_id',
-          'submission_id',
-          'updated_at',
-          'report_type',
-          'title',
-          'format',
-          'status',
-          'storage_path',
-          'content',
-          'summary',
-          'metadata',
-        ],
-        ['metadata'],
-      );
-
-      return this.getGeneratedMarketReport(id);
-    },
-
-    async getGeneratedMarketReport(id) {
-      const row = database.prepare('SELECT * FROM generated_market_reports WHERE id = ?').get(id);
-      return normalizeMarketReportRow(row);
-    },
-
-    async listGeneratedMarketReports({ submissionId = '', auditId = '', runId = '', limit = 100 } = {}) {
-      const clauses = [];
-      const params = [];
-
-      if (submissionId) {
-        clauses.push('submission_id = ?');
-        params.push(submissionId);
-      }
-
-      if (auditId) {
-        clauses.push('audit_id = ?');
-        params.push(auditId);
-      }
-
-      if (runId) {
-        clauses.push('run_id = ?');
-        params.push(runId);
-      }
-
-      const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-      const safeLimit = Math.max(1, Math.min(limit, 500));
-
-      return database
-        .prepare(
-          `
-            SELECT * FROM generated_market_reports
-            ${whereClause}
-            ORDER BY created_at DESC
-            LIMIT ?
-          `,
-        )
-        .all(...params, safeLimit)
-        .map(normalizeMarketReportRow);
-    },
-
-    async listGeneratedMarketReportsForSubmissions(submissionIds = [], limit = 5000) {
-      const ids = normalizeList(submissionIds);
-
-      if (ids.length === 0) {
-        return [];
-      }
-
-      const safeLimit = Math.max(1, Math.min(limit, 10000));
-      return database
-        .prepare(
-          `
-            SELECT * FROM generated_market_reports
-            WHERE submission_id IN (${placeholders(ids.length)})
-            ORDER BY created_at DESC
-            LIMIT ?
-          `,
-        )
-        .all(...ids, safeLimit)
-        .map(normalizeMarketReportRow);
-    },
-
-    async insertGeneratedReportDocument(document) {
-      const record = {
-        report_id: null,
-        run_id: null,
-        audit_id: null,
-        submission_id: null,
-        file_name: '',
-        mime_type: '',
-        size_bytes: 0,
-        storage_path: '',
-        checksum: '',
-        metadata: {},
-        ...document,
-        document_type: document.document_type || 'report',
-        title: document.title || document.file_name || 'Generated report document',
-        status: document.status || 'ready',
-      };
-
-      insertGeneratedReportDocumentStatement.run(serializeGeneratedReportDocument(record));
-      return this.getGeneratedReportDocument(record.id);
-    },
-
-    async updateGeneratedReportDocument(id, values) {
-      updateRecord(
-        'generated_report_documents',
-        id,
-        values,
-        [
-          'report_id',
-          'run_id',
-          'audit_id',
-          'submission_id',
-          'updated_at',
-          'document_type',
-          'title',
-          'file_name',
-          'mime_type',
-          'size_bytes',
-          'storage_path',
-          'checksum',
-          'status',
-          'metadata',
-        ],
-        ['metadata'],
-      );
-
-      return this.getGeneratedReportDocument(id);
-    },
-
-    async getGeneratedReportDocument(id) {
-      const row = database.prepare('SELECT * FROM generated_report_documents WHERE id = ?').get(id);
-      return normalizeGeneratedReportDocumentRow(row);
-    },
-
-    async listGeneratedReportDocuments({ reportId = '', submissionId = '', auditId = '', runId = '', limit = 100 } = {}) {
-      const clauses = [];
-      const params = [];
-
-      if (reportId) {
-        clauses.push('report_id = ?');
-        params.push(reportId);
-      }
-
-      if (submissionId) {
-        clauses.push('submission_id = ?');
-        params.push(submissionId);
-      }
-
-      if (auditId) {
-        clauses.push('audit_id = ?');
-        params.push(auditId);
-      }
-
-      if (runId) {
-        clauses.push('run_id = ?');
-        params.push(runId);
-      }
-
-      const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-      const safeLimit = Math.max(1, Math.min(limit, 500));
-
-      return database
-        .prepare(
-          `
-            SELECT * FROM generated_report_documents
-            ${whereClause}
-            ORDER BY created_at DESC
-            LIMIT ?
-          `,
-        )
-        .all(...params, safeLimit)
-        .map(normalizeGeneratedReportDocumentRow);
-    },
-
-	    async listGeneratedReportDocumentsForSubmissions(submissionIds = [], limit = 5000) {
-	      const ids = normalizeList(submissionIds);
-
-      if (ids.length === 0) {
-        return [];
-      }
-
-      const safeLimit = Math.max(1, Math.min(limit, 10000));
-      return database
-        .prepare(
-          `
-            SELECT * FROM generated_report_documents
-            WHERE submission_id IN (${placeholders(ids.length)})
-            ORDER BY created_at DESC
-            LIMIT ?
-          `,
-        )
-	        .all(...ids, safeLimit)
-	        .map(normalizeGeneratedReportDocumentRow);
-	    },
 
 	    async listDealHunterSeenDeals({ limit = 100000 } = {}) {
 	      const safeLimit = Math.max(1, Math.min(limit, 100000));

@@ -40,6 +40,8 @@ export function getConfig() {
     process.env.ADMIN_SESSION_SECRET || (isProduction ? '' : 'local-development-session-secret');
   const adminAuthMode = process.env.ADMIN_AUTH_MODE || (isProduction ? 'magic-link' : 'hybrid');
   const adminEmail = process.env.ADMIN_EMAIL || process.env.LEAD_NOTIFICATION_EMAIL || (isProduction ? '' : 'mathew@example.com');
+  const sqlitePath = process.env.SQLITE_PATH || path.join(rootDir, 'data', 'uckele-group.sqlite');
+  const defaultDataDir = path.dirname(sqlitePath);
 
   cachedConfig = {
     rootDir,
@@ -50,7 +52,7 @@ export function getConfig() {
     },
     storage: {
       provider: process.env.STORAGE_PROVIDER || 'sqlite',
-      sqlitePath: process.env.SQLITE_PATH || path.join(rootDir, 'data', 'uckele-group.sqlite'),
+      sqlitePath,
       supabaseUrl: process.env.SUPABASE_URL || '',
       supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || '',
     },
@@ -68,14 +70,10 @@ export function getConfig() {
       emailjsPrivateKey: process.env.EMAILJS_PRIVATE_KEY || '',
       emailjsRateLimitMs: numberFromEnv(process.env.EMAILJS_RATE_LIMIT_MS, 1000),
     },
-    outreach: {
-      companyName: process.env.OUTREACH_COMPANY_NAME || 'Uckele Group',
-      senderName: process.env.OUTREACH_SENDER_NAME || 'Mathew Uckele',
-      schedulingUrl: process.env.PUBLIC_SCHEDULING_URL || process.env.CALENDLY_URL || '',
-      contactFormUrl: process.env.PUBLIC_CONTACT_FORM_URL || `${process.env.PUBLIC_SITE_URL || defaultPublicOrigin}/contact`,
+    brand: {
+      companyName: process.env.EMAIL_BRAND_COMPANY_NAME || 'Uckele Group',
       websiteUrl: process.env.PUBLIC_SITE_URL || defaultPublicOrigin,
-      mailingAddress: process.env.OUTREACH_MAILING_ADDRESS || '',
-      unsubscribeBaseUrl: process.env.PUBLIC_UNSUBSCRIBE_URL || '',
+      mailingAddress: process.env.EMAIL_BRAND_MAILING_ADDRESS || '',
     },
     crm: {
       webhookUrl: process.env.CRM_WEBHOOK_URL || '',
@@ -116,7 +114,16 @@ export function getConfig() {
       airtableTableId: process.env.DEAL_HUNTER_AIRTABLE_TABLE_ID || 'tblACIQ9QNiVmoWSK',
       airtableViewId: process.env.DEAL_HUNTER_AIRTABLE_VIEW_ID || 'viw4OORhKKWPUsWa4',
       lookbackDays: numberFromEnv(process.env.DEAL_HUNTER_LOOKBACK_DAYS, 4),
-      maxSourceRecords: numberFromEnv(process.env.DEAL_HUNTER_MAX_SOURCE_RECORDS, 40000),
+      maxSourceRecords: numberFromEnv(process.env.DEAL_HUNTER_MAX_SOURCE_RECORDS, 8000),
+      airtableSharedMaxPayloadBytes: numberFromEnv(process.env.DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES, 12 * 1024 * 1024),
+      dailyEmail: {
+        enabled: booleanFromEnv(process.env.DEAL_HUNTER_DAILY_EMAIL_ENABLED, isProduction),
+        time: process.env.DEAL_HUNTER_DAILY_EMAIL_TIME || '10:15',
+        timezone: process.env.DEAL_HUNTER_DAILY_EMAIL_TIMEZONE || 'America/Los_Angeles',
+        checkIntervalMs: numberFromEnv(process.env.DEAL_HUNTER_DAILY_EMAIL_CHECK_INTERVAL_MS, 1000 * 60),
+        retryIntervalMs: numberFromEnv(process.env.DEAL_HUNTER_DAILY_EMAIL_RETRY_INTERVAL_MS, 1000 * 60 * 30),
+        markerDir: process.env.DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR || path.join(defaultDataDir, 'deal-hunter-daily-email'),
+      },
     },
     secureDocuments: {
       tokenSecret: process.env.SECURE_DOCUMENTS_TOKEN_SECRET || sessionSecret,

@@ -13,9 +13,6 @@ The site now includes:
 - Workflow fields for assignee, notes, tags, priority, follow-up state, and next action date
 - Secure upload request generation and a seller-facing upload page at `/secure-documents`
 - Email engagement event tracking and follow-up triage via `/api/webhooks/resend`
-- Branded prospect outreach email templates with scheduling, website, and contact-form CTAs
-- Research tables for automated lead searches, prospect audits, and generated market reports
-- Manual website audit workflow from the admin CRM
 - Spam protection with honeypot, time-to-submit checks, rate limiting, message heuristics, and optional Cloudflare Turnstile
 - Serverless support through [api/[...path].js](/Users/Matt/Documents/Uckele Group/api/[...path].js)
 
@@ -40,35 +37,6 @@ This starts:
 
 Vite proxies `/api/*` requests to the backend during development.
 
-## Branded Outreach Email Settings
-
-Set these before sending prospecting emails:
-
-- `PUBLIC_SCHEDULING_URL` for Calendly or another booking page
-- `PUBLIC_CONTACT_FORM_URL` for the website form CTA
-- `PUBLIC_SITE_URL` for the company website CTA
-- `PUBLIC_UNSUBSCRIBE_URL` for the commercial email unsubscribe CTA
-- `OUTREACH_COMPANY_NAME`
-- `OUTREACH_SENDER_NAME`
-- `OUTREACH_MAILING_ADDRESS` for the commercial email footer
-
-The prospect audit template can use automated research fields such as business name, website URL, industry, location, audit findings, and competitor insight to personalize each message.
-
-## Manual Research Audits
-
-The first research workflow is intentionally manual. From `/admin`, add or open a CRM record with a website URL and run **Run Website Audit**.
-
-The backend will:
-
-- create a `research_runs` record
-- fetch the homepage
-- check uptime, HTTPS, title/meta description, contact paths, CTA visibility, mobile viewport, internal broken links, page size, response time, trust signals, and freshness signals
-- save findings in `prospect_audits`
-- generate a Markdown report in `generated_market_reports`
-- register the generated report artifact in `generated_report_documents`
-
-There is also an admin-only URL endpoint at `/api/admin/research-audits` for auditing a URL that is not yet tied to a CRM record.
-
 ## Daily Deal Hunter Review
 
 The private admin CRM includes a Deal Hunter scoring panel that can pull the SMB Deal Hunter Google Sheet CSV and the larger Airtable shared business list, score recent listings, and send the daily email.
@@ -78,7 +46,11 @@ Configure:
 - `DEAL_HUNTER_EMAIL_RECIPIENT`
 - `DEAL_HUNTER_SHEET_CSV_URL` or `DEAL_HUNTER_SHEET_CSV_URLS`
 - `DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL`
-- `DEAL_HUNTER_CRON_SECRET` for the scheduled endpoint
+- `DEAL_HUNTER_DAILY_EMAIL_ENABLED`
+- `DEAL_HUNTER_DAILY_EMAIL_TIME`
+- `DEAL_HUNTER_DAILY_EMAIL_TIMEZONE`
+- `DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR` if you want to override the default durable send-marker directory
+- `DEAL_HUNTER_CRON_SECRET` if you also want to trigger the protected endpoint externally
 
 Optional Airtable API mode:
 
@@ -87,12 +59,16 @@ Optional Airtable API mode:
 - `DEAL_HUNTER_AIRTABLE_TABLE_ID`
 - `DEAL_HUNTER_AIRTABLE_VIEW_ID`
 
+Use Airtable API mode for the larger business list in production. The unauthenticated shared-view payload is guarded by `DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES`; if Airtable returns an oversized JSON payload, the source is marked failed instead of crashing the daily email job.
+
 Admin endpoints:
 
 - `GET /api/admin/deal-hunter/review`
 - `POST /api/admin/deal-hunter/send`
 
-Scheduler endpoint:
+The production Fly machine runs the in-app scheduler once daily at the configured local time. The scheduler records successful Daily Deal Hunter sends in `email_events` and also writes a local send marker under the configured data directory, so a server restart does not resend the same day's email.
+
+Optional external scheduler endpoint:
 
 ```text
 POST /api/deal-hunter/daily-email
@@ -187,13 +163,6 @@ Default and works locally with no extra infrastructure:
 
 The database is created automatically under `./data`.
 
-SQLite also creates the research tables automatically on startup:
-
-- `research_runs`
-- `prospect_audits`
-- `generated_market_reports`
-- `generated_report_documents`
-
 ### Supabase
 
 Recommended for serverless deployments:
@@ -203,8 +172,6 @@ Recommended for serverless deployments:
    - `SUPABASE_URL`
    - `SUPABASE_SERVICE_ROLE_KEY`
 2. Run the SQL in [schema.sql](/Users/Matt/Documents/Uckele Group/supabase/schema.sql)
-
-For production, rerun the schema SQL after this phase so Supabase has the same research tables as local SQLite.
 
 ## Dashboard
 

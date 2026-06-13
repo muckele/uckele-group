@@ -1,8 +1,12 @@
 import { getConfig } from '../config.js';
+import { getStorage } from '../storage/index.js';
 import { clearCookie, parseCookies, serializeCookie } from '../utils/cookies.js';
-import { getRequestOrigin } from '../utils/http.js';
-import { safeCompareText, signPayload, verifySignedPayload } from '../utils/security.js';
+import { getClientIp, getRequestOrigin } from '../utils/http.js';
+import { hashIp, safeCompareText, sha256, signPayload, verifySignedPayload } from '../utils/security.js';
 import { sendAdminMagicLinkEmail } from './delivery.js';
+
+const magicLinkRateLimitEvents = new Map();
+const magicLinkGenericMessage = 'If that email is allowed for admin access, a sign-in link has been sent.';
 
 function createSessionCookie(session) {
   const config = getConfig();
@@ -34,6 +38,62 @@ function createAdminSession(username) {
     username,
     exp: Date.now() + getConfig().admin.sessionMaxAgeMs,
   };
+}
+
+function buildMagicLinkRateLimitBuckets(email, request) {
+  const normalizedEmail = String(email || '').trim().toLowerCase() || 'empty';
+  return [
+    `admin-magic-link:ip:${hashIp(getClientIp(request))}`,
+    `admin-magic-link:email:${sha256(normalizedEmail).slice(0, 24)}`,
+  ];
+}
+
+function enforceInMemoryMagicLinkRateLimit(buckets, windowMs, maxAttempts) {
+  const now = Date.now();
+  const cutoff = now - windowMs;
+  const snapshots = buckets.map((bucket) => ({
+    bucket,
+    timestamps: (magicLinkRateLimitEvents.get(bucket) || []).filter((timestamp) => timestamp >= cutoff),
+  }));
+
+  if (snapshots.some((snapshot) => snapshot.timestamps.length >= maxAttempts)) {
+    return { blocked: true };
+  }
+
+  for (const snapshot of snapshots) {
+    magicLinkRateLimitEvents.set(snapshot.bucket, [...snapshot.timestamps, now]);
+  }
+
+  return { blocked: false };
+}
+
+async function enforceMagicLinkRateLimit(email, request) {
+  const config = getConfig();
+  const buckets = buildMagicLinkRateLimitBuckets(email, request);
+  const maxAttempts = Math.max(1, Math.min(config.protection.rateLimitMax, 3));
+  const windowMs = config.protection.rateLimitWindowMs;
+  const blockedResult = {
+    ok: false,
+    status: 429,
+    reason: 'Too many sign-in link requests. Please wait a few minutes and try again.',
+  };
+
+  try {
+    const storage = getStorage();
+    const windowStartIso = new Date(Date.now() - windowMs).toISOString();
+    const counts = await Promise.all(buckets.map((bucket) => storage.countRateLimitEvents(bucket, windowStartIso)));
+
+    if (counts.some((count) => count >= maxAttempts)) {
+      return blockedResult;
+    }
+
+    const nowIso = new Date().toISOString();
+    await Promise.all(buckets.map((bucket) => storage.addRateLimitEvent(bucket, nowIso)));
+    return { ok: true };
+  } catch (error) {
+    console.warn(`[admin-auth] magic-link rate limit storage failed: ${error.message}`);
+    return enforceInMemoryMagicLinkRateLimit(buckets, windowMs, maxAttempts).blocked ? blockedResult : { ok: true };
+  }
 }
 
 export function getAdminSession(request) {
@@ -102,11 +162,16 @@ export async function requestAdminMagicLink(email, request) {
 
   const normalizedEmail = String(email || '').trim().toLowerCase();
   const expectedEmail = config.admin.email.trim().toLowerCase();
+  const rateLimitResult = await enforceMagicLinkRateLimit(normalizedEmail, request);
+
+  if (!rateLimitResult.ok) {
+    return rateLimitResult;
+  }
 
   if (!normalizedEmail || normalizedEmail !== expectedEmail) {
     return {
       ok: true,
-      message: 'If that email is allowed for admin access, a sign-in link has been sent.',
+      message: magicLinkGenericMessage,
     };
   }
 

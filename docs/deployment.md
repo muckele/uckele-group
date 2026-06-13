@@ -10,6 +10,7 @@ The Fly configuration is committed in [fly.toml](/Users/Matt/Documents/uckele-gr
 - one mounted Fly volume at `/data`
 - SQLite at `/data/uckele-group.sqlite`
 - secure document storage at `/data/secure-documents`
+- Node 22 in the Docker build/runtime image
 
 ## Included Files
 
@@ -29,13 +30,8 @@ fly secrets set \
   RESEND_FROM_EMAIL="Uckele Group <mathew@uckelegroup.com>" \
   RESEND_REPLY_TO=mathew@uckelegroup.com \
   RESEND_WEBHOOK_SECRET=... \
-  PUBLIC_SCHEDULING_URL=https://calendly.com/your-calendar/15min \
-  PUBLIC_CONTACT_FORM_URL=https://www.uckelegroup.com/contact \
-  PUBLIC_UNSUBSCRIBE_URL=https://www.uckelegroup.com/unsubscribe \
-  OUTREACH_COMPANY_NAME="Uckele Group" \
-  OUTREACH_SENDER_NAME="Mathew Uckele" \
+  EMAIL_BRAND_COMPANY_NAME="Uckele Group" \
   DEAL_HUNTER_EMAIL_RECIPIENT=mathew@uckelegroup.com \
-  DEAL_HUNTER_CRON_SECRET=... \
   DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL="https://airtable.com/appEGxhjno0HTpEco/shrUhtbnzZTPaR4Lk/tblACIQ9QNiVmoWSK?viewControls=on" \
   DEAL_HUNTER_SHEET_CSV_URL="https://docs.google.com/spreadsheets/d/.../gviz/tq?tqx=out:csv&gid=..." \
   ADMIN_AUTH_MODE=magic-link \
@@ -52,7 +48,12 @@ Optional overrides:
 fly secrets set \
   CRM_WEBHOOK_URL=... \
   CRM_WEBHOOK_SECRET=... \
-  OUTREACH_MAILING_ADDRESS="Your business mailing address" \
+  EMAIL_BRAND_MAILING_ADDRESS="Your business mailing address" \
+  DEAL_HUNTER_CRON_SECRET=... \
+  DEAL_HUNTER_DAILY_EMAIL_TIME=10:15 \
+  DEAL_HUNTER_DAILY_EMAIL_TIMEZONE=America/Los_Angeles \
+  DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR=/data/deal-hunter-daily-email \
+  DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES=12582912 \
   DEAL_HUNTER_AIRTABLE_TOKEN=... \
   DEAL_HUNTER_AIRTABLE_BASE_ID=appEGxhjno0HTpEco \
   DEAL_HUNTER_AIRTABLE_TABLE_ID=tblACIQ9QNiVmoWSK \
@@ -116,9 +117,9 @@ Then update DNS:
 ## Before Go-Live
 
 - Confirm the contact form is delivering to `mathew@uckelegroup.com`
-- Confirm the branded prospect email template includes booking, website, form, and unsubscribe links
 - Confirm `/admin` can run Deal Hunter scoring and send the daily email
-- Confirm the scheduler posts to `/api/deal-hunter/daily-email` with `Authorization: Bearer DEAL_HUNTER_CRON_SECRET`
+- Confirm the in-app scheduler logs `deal-hunter:scheduler` startup and sends after the configured Pacific time
+- If using an external scheduler, confirm it posts to `/api/deal-hunter/daily-email` with `Authorization: Bearer DEAL_HUNTER_CRON_SECRET`
 - Confirm the first successful daily email creates Deal Hunter history rows so later emails can separate newly seen matches from already reviewed listings
 - Confirm magic-link sign-in emails are being delivered
 - Confirm Resend webhook events create email engagement records in the admin CRM

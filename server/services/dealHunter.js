@@ -622,7 +622,59 @@ function parseCsvRows(csvText = '') {
   );
 }
 
-async function fetchText(url, { headers = {}, timeoutMs = defaultTimeoutMs } = {}) {
+function formatPayloadLimitError(byteLength, maxBytes) {
+  const sizeMb = (byteLength / (1024 * 1024)).toFixed(1);
+  const limitMb = (maxBytes / (1024 * 1024)).toFixed(1);
+  return new Error(
+    `Airtable shared view payload is ${sizeMb} MB, above the ${limitMb} MB safety limit. Add DEAL_HUNTER_AIRTABLE_TOKEN to use paged Airtable API mode.`,
+  );
+}
+
+async function readResponseText(response, maxBytes = Infinity) {
+  const contentLength = Number(response.headers.get('content-length') || 0);
+
+  if (Number.isFinite(maxBytes) && contentLength > maxBytes) {
+    throw formatPayloadLimitError(contentLength, maxBytes);
+  }
+
+  if (!Number.isFinite(maxBytes) || !response.body?.getReader) {
+    const text = await response.text();
+    const byteLength = Buffer.byteLength(text, 'utf8');
+
+    if (Number.isFinite(maxBytes) && byteLength > maxBytes) {
+      throw formatPayloadLimitError(byteLength, maxBytes);
+    }
+
+    return text;
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks = [];
+  let byteLength = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      break;
+    }
+
+    byteLength += value.byteLength;
+
+    if (byteLength > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw formatPayloadLimitError(byteLength, maxBytes);
+    }
+
+    chunks.push(decoder.decode(value, { stream: true }));
+  }
+
+  chunks.push(decoder.decode());
+  return chunks.join('');
+}
+
+async function fetchText(url, { headers = {}, timeoutMs = defaultTimeoutMs, maxBytes = Infinity } = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -633,18 +685,24 @@ async function fetchText(url, { headers = {}, timeoutMs = defaultTimeoutMs } = {
     });
 
     if (!response.ok) {
-      const text = await response.text().catch(() => '');
+      const text = await readResponseText(response, 16 * 1024).catch(() => '');
       throw new Error(`Fetch failed with ${response.status}: ${text.slice(0, 180)}`);
     }
 
-    return response.text();
+    return await readResponseText(response, maxBytes);
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error(`Fetch timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+    }
+
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function fetchJson(url, { headers = {}, timeoutMs = defaultTimeoutMs } = {}) {
-  const text = await fetchText(url, { headers, timeoutMs });
+async function fetchJson(url, { headers = {}, timeoutMs = defaultTimeoutMs, maxBytes = Infinity } = {}) {
+  const text = await fetchText(url, { headers, timeoutMs, maxBytes });
   return JSON.parse(text);
 }
 
@@ -742,7 +800,7 @@ function mapAirtableSharedPayload(payload, source, maxRecords = Infinity) {
   });
 }
 
-async function fetchAirtableSharedDeals(url, maxRecords) {
+async function fetchAirtableSharedDeals(url, maxRecords, maxPayloadBytes) {
   const embedUrl = buildAirtableEmbedUrl(url);
   const html = await fetchText(embedUrl);
   const dataPath = extractAirtableSharedDataPath(html);
@@ -752,14 +810,18 @@ async function fetchAirtableSharedDeals(url, maxRecords) {
     throw new Error('Airtable shared view did not expose a readable shared-view data endpoint.');
   }
 
-  const payload = await fetchJson(new URL(dataPath, 'https://airtable.com').toString(), {
-    headers: {
-      'x-requested-with': 'XMLHttpRequest',
-      'x-user-locale': 'en',
-      'x-time-zone': 'America/Los_Angeles',
-      ...(applicationId ? { 'x-airtable-application-id': applicationId } : {}),
+  const payload = await fetchJson(
+    new URL(dataPath, 'https://airtable.com').toString(),
+    {
+      headers: {
+        'x-requested-with': 'XMLHttpRequest',
+        'x-user-locale': 'en',
+        'x-time-zone': 'America/Los_Angeles',
+        ...(applicationId ? { 'x-airtable-application-id': applicationId } : {}),
+      },
+      maxBytes: maxPayloadBytes,
     },
-  });
+  );
   const source = {
     id: 'airtable-shared',
     name: payload?.data?.sharedModelName || 'Airtable Biz List',
@@ -861,7 +923,13 @@ async function collectSources(config) {
     }
   } else if (config.dealHunter.airtableSharedViewUrl) {
     try {
-      sourceResults.push(await fetchAirtableSharedDeals(config.dealHunter.airtableSharedViewUrl, config.dealHunter.maxSourceRecords));
+      sourceResults.push(
+        await fetchAirtableSharedDeals(
+          config.dealHunter.airtableSharedViewUrl,
+          config.dealHunter.maxSourceRecords,
+          config.dealHunter.airtableSharedMaxPayloadBytes,
+        ),
+      );
     } catch (error) {
       sourceResults.push({
         source: {
