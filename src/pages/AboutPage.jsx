@@ -33,9 +33,9 @@ export default function AboutPage() {
               ))}
             </div>
             <div className="mt-8 flex flex-wrap gap-3">
-              <ButtonLink href="/contact">Start A Conversation</ButtonLink>
-              <ButtonLink href="/criteria" variant="secondary">
-                View Criteria <ArrowRight className="h-4 w-4" />
+              <ButtonLink href="/contact">Request An Audit</ButtonLink>
+              <ButtonLink href="/services" variant="secondary">
+                View Services <ArrowRight className="h-4 w-4" />
               </ButtonLink>
             </div>
           </Reveal>
@@ -78,7 +78,7 @@ export default function AboutPage() {
 
       <section className="section-shell mt-20">
         <Reveal className="panel px-7 py-10 sm:px-10 sm:py-12">
-          <SectionHeading eyebrow="Intent" title={aboutPage.whyBuy.title} />
+          <SectionHeading eyebrow="Partnership" title={aboutPage.whyBuy.title} />
           <div className="mt-6 grid gap-6 lg:grid-cols-2">
             {aboutPage.whyBuy.paragraphs.map((paragraph) => (
               <p className="text-base leading-8 text-ink/74" key={paragraph}>

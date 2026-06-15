@@ -17,9 +17,21 @@ export default function ButtonLink({ href, children, variant = 'primary', classN
     variant,
   )} ${className}`;
 
-  if (href?.startsWith('http') || href?.startsWith('/downloads') || props.download) {
+  const isExternal = /^https?:\/\//i.test(href || '');
+
+  if (isExternal || href?.startsWith('/downloads') || props.download) {
+    const linkProps = {
+      ...props,
+      ...(isExternal
+        ? {
+            rel: props.rel || 'noreferrer',
+            target: props.target || '_blank',
+          }
+        : {}),
+    };
+
     return (
-      <a className={classes} href={href} {...props}>
+      <a className={classes} href={href} {...linkProps}>
         {children}
       </a>
     );

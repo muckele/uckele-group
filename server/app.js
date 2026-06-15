@@ -13,11 +13,19 @@ import {
 } from './services/auth.js';
 import {
   createSecureUploadRequest,
+  getSecureDocumentDownload,
   getSecureUploadContext,
   uploadSecureDocuments,
 } from './services/documentVault.js';
 import { recordEmailEventsFromWebhook } from './services/emailEvents.js';
-import { reviewDailyDeals, sendDailyDealHunterReview } from './services/dealHunter.js';
+import {
+  approveOutreachCadence,
+  previewOutreachUnsubscribe,
+  recordWebsiteVisit,
+  runProspectAutomation,
+  sendDueOutreachMessages,
+  unsubscribeOutreachRecipient,
+} from './services/prospectAutomation.js';
 import {
   createManualSubmission,
   exportDashboardSubmissionsCsv,
@@ -26,25 +34,17 @@ import {
   updateSubmissionWorkflow,
 } from './services/submissions.js';
 import { asyncRoute } from './utils/http.js';
-import { safeCompareText } from './utils/security.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.resolve(__dirname, '../dist');
 
-function extractBearerSecret(request) {
-  const authorization = String(request.headers.authorization || '');
-
-  if (authorization.toLowerCase().startsWith('bearer ')) {
-    return authorization.slice(7).trim();
-  }
-
-  return String(request.headers['x-deal-hunter-secret'] || request.headers['x-cron-secret'] || '').trim();
-}
-
-function requireDealHunterCron(request, config) {
-  const providedSecret = extractBearerSecret(request);
-
-  return Boolean(config.dealHunter.cronSecret && providedSecret && safeCompareText(providedSecret, config.dealHunter.cronSecret));
+function escapeHtml(value = '') {
+  return String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }
 
 function publicSecureDocument(document) {
@@ -74,6 +74,41 @@ function publicSecureUploadRequest(requestRecord) {
     last_uploaded_at: requestRecord.last_uploaded_at || '',
     note: requestRecord.note || '',
   };
+}
+
+function unsubscribePage({ ok, token = '', error = '', confirmed = false }) {
+  const heading = confirmed ? 'You are unsubscribed.' : ok ? 'Confirm unsubscribe' : 'We could not process that link.';
+  const message = confirmed
+    ? 'You will no longer receive website audit outreach emails at this address.'
+    : ok
+      ? 'Use the button below to stop website audit outreach emails from Uckele Group.'
+      : error || 'The unsubscribe link is invalid or expired.';
+  const form = ok && !confirmed
+    ? `
+      <form method="post" action="/unsubscribe/${encodeURIComponent(token)}" style="margin-top:24px;">
+        <button type="submit" style="border:1px solid #284638;border-radius:999px;background:#284638;color:#fff;font-size:15px;font-weight:700;padding:13px 18px;">Unsubscribe</button>
+      </form>
+    `
+    : '';
+
+  return `
+    <!doctype html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>${escapeHtml(heading)} | Uckele Group</title>
+      </head>
+      <body style="margin:0;background:#f8f4ed;color:#18211d;font-family:Arial,Helvetica,sans-serif;">
+        <main style="max-width:620px;margin:12vh auto;padding:32px;">
+          <p style="margin:0 0 10px;color:#7a5a3b;font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;">Uckele Group</p>
+          <h1 style="margin:0 0 16px;font-size:32px;line-height:1.2;">${escapeHtml(heading)}</h1>
+          <p style="margin:0;color:#33443b;font-size:16px;line-height:1.7;">${escapeHtml(message)}</p>
+          ${form}
+        </main>
+      </body>
+    </html>
+  `;
 }
 
 export function createApp() {
@@ -130,6 +165,40 @@ export function createApp() {
         success: true,
         count: result.events.length,
       });
+    }),
+  );
+
+  app.post(
+    '/api/track/visit',
+    asyncRoute(async (request, response) => {
+      const result = await recordWebsiteVisit(request.body || {}, request);
+      response.status(result.ok ? 201 : 400).json(result);
+    }),
+  );
+
+  app.get(
+    '/unsubscribe/:token',
+    asyncRoute(async (request, response) => {
+      const result = previewOutreachUnsubscribe(request.params.token);
+      response
+        .status(result.ok ? 200 : result.status || 400)
+        .type('html')
+        .send(unsubscribePage({ ok: result.ok, token: request.params.token, error: result.error }));
+    }),
+  );
+
+  app.post(
+    '/unsubscribe/:token',
+    asyncRoute(async (request, response) => {
+      const result = await unsubscribeOutreachRecipient(request.params.token, request);
+      const status = result.ok ? 200 : result.status || 400;
+
+      if (request.accepts('html') && !request.accepts('json')) {
+        response.status(status).type('html').send(unsubscribePage({ ok: result.ok, confirmed: result.ok, error: result.error }));
+        return;
+      }
+
+      response.status(status).json(result);
     }),
   );
 
@@ -259,54 +328,6 @@ export function createApp() {
     }),
   );
 
-  app.get(
-    '/api/admin/deal-hunter/review',
-    asyncRoute(async (request, response) => {
-      if (!requireAdmin(request)) {
-        response.status(401).json({ success: false, error: 'Unauthorized.' });
-        return;
-      }
-
-      const review = await reviewDailyDeals();
-      response.json({
-        success: true,
-        review,
-      });
-    }),
-  );
-
-  app.post(
-    '/api/admin/deal-hunter/send',
-    asyncRoute(async (request, response) => {
-      if (!requireAdmin(request)) {
-        response.status(401).json({ success: false, error: 'Unauthorized.' });
-        return;
-      }
-
-      const result = await sendDailyDealHunterReview();
-      response.status(result.emailResult.status === 'failed' ? 502 : 200).json({
-        success: result.emailResult.status !== 'failed',
-        ...result,
-      });
-    }),
-  );
-
-  app.post(
-    '/api/deal-hunter/daily-email',
-    asyncRoute(async (request, response) => {
-      if (!requireDealHunterCron(request, config)) {
-        response.status(401).json({ success: false, error: 'Unauthorized.' });
-        return;
-      }
-
-      const result = await sendDailyDealHunterReview();
-      response.status(result.emailResult.status === 'failed' ? 502 : 200).json({
-        success: result.emailResult.status !== 'failed',
-        ...result,
-      });
-    }),
-  );
-
   app.patch(
     '/api/admin/submissions/:id',
     asyncRoute(async (request, response) => {
@@ -358,6 +379,95 @@ export function createApp() {
         request: result.request,
         emailResult: result.emailResult,
       });
+    }),
+  );
+
+  app.post(
+    '/api/admin/submissions/:id/automation/run',
+    asyncRoute(async (request, response) => {
+      const session = requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await runProspectAutomation({
+        submissionId: request.params.id,
+        requestedBy: session.username,
+      });
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error });
+        return;
+      }
+
+      response.status(201).json({ success: true, ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/submissions/:id/outreach/approve',
+    asyncRoute(async (request, response) => {
+      const session = requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await approveOutreachCadence({
+        submissionId: request.params.id,
+        approvedBy: session.username,
+      });
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error, reasons: result.reasons || [] });
+        return;
+      }
+
+      response.json({ success: true, ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/outreach/send-due',
+    asyncRoute(async (request, response) => {
+      if (!requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await sendDueOutreachMessages({
+        limit: Number(request.body?.limit) || undefined,
+      });
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error });
+        return;
+      }
+
+      response.json({ success: true, ...result });
+    }),
+  );
+
+  app.get(
+    '/api/admin/secure-documents/:id/download',
+    asyncRoute(async (request, response) => {
+      if (!requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await getSecureDocumentDownload(request.params.id);
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error });
+        return;
+      }
+
+      response.setHeader('Content-Type', result.document.mime_type || 'application/octet-stream');
+      response.download(result.filePath, result.document.original_name || result.document.file_name);
     }),
   );
 

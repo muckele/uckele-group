@@ -4,61 +4,52 @@
 
 - Home
 - About
-- What I’m Looking For
-- Why Sell To Me
+- Services
 - Process
+- Why Partner
 - FAQ
 - Contact
 
 ## Brand Positioning Summary
 
-Uckele Group is positioned as the personal acquisition platform of Mathew Uckele, a serious individual buyer seeking one durable small business to own and operate for the long term. The tone is calm, credible, warm, and operator-focused. The site is deliberately framed as a thoughtful alternative to private equity, emphasizing continuity, relationships, confidentiality, and respect for seller legacy.
+Uckele Group is positioned as a practical online presence partner for local service businesses. The site should help owners quickly understand that they can get website updates, contact-flow improvements, local SEO basics, CRM support, and monthly help without managing every technical detail themselves.
+
+The tone should be direct, useful, and owner-friendly. Avoid broad agency language. The offer should feel like a hands-on partner who can find lead leaks, fix obvious website friction, and maintain the online presence month after month.
 
 ## Homepage Wireframe
 
-1. Sticky navigation with direct CTA
+1. Sticky navigation with a direct audit CTA
 2. Hero
-   - Long-term buyer headline
-   - Trust-building subheadline
-   - Primary CTA: Start a Conversation
-   - Secondary CTA: What I’m Looking For
-   - Founder credibility panel with confidentiality message
-3. Quick trust strip
-   - Operator-focused
-   - Confidential
-   - Relationship-driven
-4. Why work with me
-5. Founder letter
-6. Criteria preview
-7. Transition approach
-8. Why owners often prefer an individual buyer
+   - Online presence management headline
+   - Short promise around websites, lead capture, and follow-up
+   - Primary CTA: Request An Audit
+   - Secondary CTA: View Services
+3. Trust strip
+   - Website updates
+   - Contact flow
+   - Local SEO basics
+4. Service overview
+5. Founder/approach section
+6. Package preview
+7. Process overview
+8. Why partner section
 9. FAQ preview
-10. Placeholder testimonial / reference blocks
-11. Final contact CTA
-12. Footer with navigation, contact placeholders, and criteria download
+10. Final audit CTA
+11. Footer with navigation and contact details
 
 ## Homepage Copy Snapshot
 
 ### Hero Headline
 
-A thoughtful long-term home for a great small business
+Website support that helps local businesses turn visitors into leads
 
 ### Hero Supporting Copy
 
-Uckele Group is the acquisition platform of Mathew Uckele. I am looking to acquire and operate a strong small business for the long term with continuity, care, and respect for the people who built it.
+Uckele Group helps local businesses improve their websites, contact flow, local search basics, and follow-up systems so owners can stop losing leads to outdated pages, confusing calls to action, or broken forms.
 
 ### Core Trust Points
 
-- Direct conversation with the future owner
-- Long-term mindset, not a flip
-- Confidential and respectful outreach
-- Flexible transition approach
-
-## Brand Name Ideas
-
-The current implementation uses **Uckele Group**, which matches the visual identity you provided. If you want alternatives later, strong options would be:
-
-- Uckele Group
-- Uckele Operating Group
-- Uckele Legacy Holdings
-- Uckele Business Group
+- Practical website updates without agency overhead
+- Clearer calls, forms, and scheduling flows
+- Monthly support for changes, content, and reporting
+- CRM-backed follow-up so lead activity does not get lost

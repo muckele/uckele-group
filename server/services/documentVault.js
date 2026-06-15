@@ -44,7 +44,16 @@ function verifyAccessToken(token) {
 
 function normalizeDocumentType(value) {
   const normalized = String(value || 'other').trim().toLowerCase();
-  const allowed = ['teaser', 'cim', 'financials', 'tax-returns', 'contracts', 'customer-summary', 'other'];
+  const allowed = [
+    'website-assets',
+    'brand-assets',
+    'domain-dns',
+    'cms-access',
+    'analytics',
+    'marketing-materials',
+    'contracts',
+    'other',
+  ];
   return allowed.includes(normalized) ? normalized : 'other';
 }
 
@@ -89,6 +98,49 @@ function validateDocumentPayload(document = {}, config) {
   }
 
   return errors;
+}
+
+function isPathInsideDirectory(filePath, directoryPath) {
+  const relativePath = path.relative(directoryPath, filePath);
+  return Boolean(relativePath) && !relativePath.startsWith('..') && !path.isAbsolute(relativePath);
+}
+
+export async function getSecureDocumentDownload(documentId) {
+  const config = getConfig();
+  const storage = getStorage();
+
+  if (!storage.getSecureDocument) {
+    return { ok: false, status: 500, error: 'Secure document lookup is not available.' };
+  }
+
+  const document = await storage.getSecureDocument(documentId);
+
+  if (!document) {
+    return { ok: false, status: 404, error: 'Secure document not found.' };
+  }
+
+  const storageRoot = path.resolve(config.secureDocuments.storageDir);
+  const filePath = path.resolve(document.storage_path || '');
+
+  if (!isPathInsideDirectory(filePath, storageRoot)) {
+    return { ok: false, status: 400, error: 'Secure document path is invalid.' };
+  }
+
+  try {
+    const stat = await fs.stat(filePath);
+
+    if (!stat.isFile()) {
+      return { ok: false, status: 404, error: 'Secure document file is not available.' };
+    }
+  } catch {
+    return { ok: false, status: 404, error: 'Secure document file is not available.' };
+  }
+
+  return {
+    ok: true,
+    document,
+    filePath,
+  };
 }
 
 export async function createSecureUploadRequest({ submissionId, requestedBy, note = '', sendEmail = true, request }) {

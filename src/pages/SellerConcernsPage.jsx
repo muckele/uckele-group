@@ -3,26 +3,26 @@ import ButtonLink from '../components/ButtonLink';
 import PageHero from '../components/PageHero';
 import Reveal from '../components/Reveal';
 import Seo from '../components/Seo';
-import { sellerConcernsPage, seoContent } from '../content/siteContent';
+import { seoContent, whyPartnerPage } from '../content/siteContent';
 
 const concernIcons = [Building2, Users, HandHeart, TimerReset, Lock, WalletCards, ShieldCheck, MessagesSquare];
 
 export default function SellerConcernsPage() {
   return (
     <>
-      <Seo {...seoContent.sellerConcerns} />
+      <Seo {...seoContent.whyPartner} />
 
-      <PageHero {...sellerConcernsPage.hero} />
+      <PageHero {...whyPartnerPage.hero} />
 
       <section className="section-shell mt-10">
         <Reveal className="panel px-7 py-9 sm:px-10">
-          <p className="max-w-4xl text-lg leading-8 text-ink/74">{sellerConcernsPage.intro}</p>
+          <p className="max-w-4xl text-lg leading-8 text-ink/74">{whyPartnerPage.intro}</p>
         </Reveal>
       </section>
 
       <section className="section-shell mt-12">
         <div className="grid gap-6 md:grid-cols-2">
-          {sellerConcernsPage.concerns.map((concern, index) => {
+          {whyPartnerPage.concerns.map((concern, index) => {
             const Icon = concernIcons[index];
 
             return (
@@ -46,11 +46,11 @@ export default function SellerConcernsPage() {
           </div>
           <div className="px-8 py-10 sm:px-10 sm:py-12">
             <p className="text-base leading-8 text-ink/74">
-              The strongest seller relationships are built when both sides can speak plainly about what matters most. That usually includes legacy, people, customers, timing, confidentiality, and a realistic plan for the handoff. Those concerns are legitimate, and they should be central to the process.
+              The strongest working relationships are built when priorities are clear. That usually means knowing what should be fixed now, what can wait, who owns the next step, and how each update supports trust, leads, or customer clarity.
             </p>
             <div className="mt-8 flex flex-wrap gap-3">
               <ButtonLink href="/contact">
-                Start A Conversation <ArrowRight className="h-4 w-4" />
+                Request An Audit <ArrowRight className="h-4 w-4" />
               </ButtonLink>
               <ButtonLink href="/process" variant="secondary">
                 View The Process

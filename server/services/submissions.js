@@ -6,6 +6,7 @@ import { hashIp } from '../utils/security.js';
 import { forwardToCrm } from './crmForwarder.js';
 import { deliverSubmission } from './delivery.js';
 import { summarizeEmailEngagement } from './emailEvents.js';
+import { summarizeAutomationState } from './prospectAutomation.js';
 import { evaluateSubmissionSpam } from './spamProtection.js';
 import { verifyTurnstileToken } from './turnstile.js';
 import {
@@ -19,12 +20,56 @@ import {
 
 const allowedStatuses = ['new', 'review', 'contacted', 'archived', 'spam'];
 const enrichmentLookupBatchSize = 250;
+const urlFieldLabels = {
+  listing_url: 'Lead source URL',
+  business_website: 'Business website',
+};
+const dealFieldAliasMap = {
+  company: 'company',
+  role: 'role',
+  lead_source_url: 'listing_url',
+  listing_url: 'listing_url',
+  business_website: 'business_website',
+  website: 'business_website',
+  service_interest: 'prospectus_url',
+  prospectus_url: 'prospectus_url',
+  prospectus_cim: 'prospectus_url',
+  package_budget: 'asking_price',
+  asking_price: 'asking_price',
+  monthly_lead_value: 'ttm_revenue',
+  ttm_revenue: 'ttm_revenue',
+  lead_goal: 'ttm_ebitda',
+  ttm_ebitda: 'ttm_ebitda',
+  current_provider: 'ebitda_multiple',
+  ebitda_multiple: 'ebitda_multiple',
+  conversion_issue: 'net_margin',
+  net_margin: 'net_margin',
+  business_age: 'business_age',
+  age: 'business_age',
+  priority_fit: 'sba_eligible',
+  sba_eligible: 'sba_eligible',
+  partner_name: 'broker_name',
+  broker_name: 'broker_name',
+  partner_email: 'broker_email',
+  broker_email: 'broker_email',
+  partner_phone: 'broker_phone',
+  broker_phone: 'broker_phone',
+  broker_phone_number: 'broker_phone',
+  primary_contact_name: 'seller_name',
+  seller_name: 'seller_name',
+  primary_contact_email: 'seller_email',
+  seller_email: 'seller_email',
+  primary_contact_phone: 'seller_phone',
+  seller_phone: 'seller_phone',
+  seller_phone_number: 'seller_phone',
+  lead_type: 'lead_type',
+};
 
 const dealFieldNormalizers = {
   company: (value) => normalizeField(value, 160),
   role: (value) => normalizeField(value, 80),
-  listing_url: (value) => normalizeField(value, 500),
-  business_website: (value) => normalizeField(value, 500),
+  listing_url: (value) => normalizeHttpUrl(value, 500),
+  business_website: (value) => normalizeHttpUrl(value, 500),
   prospectus_url: (value) => normalizeField(value, 500),
   asking_price: (value) => normalizeField(value, 80),
   ttm_revenue: (value) => normalizeField(value, 80),
@@ -39,7 +84,7 @@ const dealFieldNormalizers = {
   seller_name: (value) => normalizeField(value, 120),
   seller_email: (value) => normalizeEmail(value, 200),
   seller_phone: (value) => normalizeField(value, 40),
-  lead_type: (value) => normalizeLeadType(value, 'seller'),
+  lead_type: (value) => normalizeLeadType(value, 'prospect'),
 };
 
 function hasOwn(object, key) {
@@ -62,6 +107,31 @@ function normalizeMessage(value, maxLength = 5000) {
     .trim()
     .replace(/\r\n/g, '\n')
     .slice(0, maxLength);
+}
+
+function normalizeHttpUrl(value, maxLength = 500) {
+  const rawValue = normalizeField(value, maxLength);
+
+  if (!rawValue) {
+    return '';
+  }
+
+  const withProtocol = /^[a-z][a-z\d+\-.]*:\/\//i.test(rawValue) ? rawValue : `https://${rawValue}`;
+
+  try {
+    const url = new URL(withProtocol);
+    const protocol = url.protocol.toLowerCase();
+
+    if (!['http:', 'https:'].includes(protocol) || !url.hostname || !url.hostname.includes('.')) {
+      return '';
+    }
+
+    url.protocol = protocol;
+    url.hash = '';
+    return url.toString().slice(0, maxLength);
+  } catch {
+    return '';
+  }
 }
 
 function normalizeTags(value) {
@@ -122,46 +192,34 @@ function collectDealFieldUpdates(raw = {}) {
   }, {});
 }
 
-function collectAliasedDealFieldUpdates(source = {}) {
-  const raw = {};
-  const aliasMap = {
-    company: 'company',
-    role: 'role',
-    listing_url: 'listing_url',
-    business_website: 'business_website',
-    website: 'business_website',
-    prospectus_url: 'prospectus_url',
-    prospectus_cim: 'prospectus_url',
-    asking_price: 'asking_price',
-    ttm_revenue: 'ttm_revenue',
-    ttm_ebitda: 'ttm_ebitda',
-    ebitda_multiple: 'ebitda_multiple',
-    net_margin: 'net_margin',
-    business_age: 'business_age',
-    age: 'business_age',
-    sba_eligible: 'sba_eligible',
-    broker_name: 'broker_name',
-    broker_email: 'broker_email',
-    broker_phone: 'broker_phone',
-    broker_phone_number: 'broker_phone',
-    seller_name: 'seller_name',
-    seller_email: 'seller_email',
-    seller_phone: 'seller_phone',
-    seller_phone_number: 'seller_phone',
-    lead_type: 'lead_type',
-  };
+function validateUrlFields(rawFields, errors) {
+  Object.entries(urlFieldLabels).forEach(([field, label]) => {
+    const rawValue = normalizeField(rawFields[field], 500);
 
-  Object.entries(aliasMap).forEach(([sourceKey, targetKey]) => {
+    if (hasOwn(rawFields, field) && rawValue && !normalizeHttpUrl(rawValue, 500)) {
+      errors.push(`${label} must be a valid http or https URL.`);
+    }
+  });
+}
+
+function collectAliasedDealFieldUpdates(source = {}) {
+  return collectDealFieldUpdates(collectAliasedRawDealFields(source));
+}
+
+function collectAliasedRawDealFields(source = {}) {
+  const raw = {};
+
+  Object.entries(dealFieldAliasMap).forEach(([sourceKey, targetKey]) => {
     if (hasOwn(source, sourceKey)) {
       raw[targetKey] = source[sourceKey];
     }
   });
 
-  return collectDealFieldUpdates(raw);
+  return raw;
 }
 
 function derivePrimaryContact(fields) {
-  const leadType = normalizeLeadType(fields.lead_type, 'seller');
+  const leadType = normalizeLeadType(fields.lead_type, 'prospect');
   const seller = {
     name: normalizeField(fields.seller_name, 120),
     email: normalizeEmail(fields.seller_email, 200),
@@ -178,7 +236,7 @@ function derivePrimaryContact(fields) {
     phone: normalizeField(fields.phone, 40),
   };
   const preferBroker =
-    leadType === 'broker' ||
+    leadType === 'partner' ||
     (!(seller.name || seller.email || seller.phone) && Boolean(broker.name || broker.email || broker.phone));
   const primary = preferBroker ? broker : seller;
   const secondary = preferBroker ? seller : broker;
@@ -203,6 +261,18 @@ function validateWebsiteSubmission(input) {
     errors.push('Email must be valid.');
   }
 
+  if (!normalizeField(input.company, 160)) {
+    errors.push('Business name is required.');
+  }
+
+  if (!normalizeField(input.businessWebsite, 500)) {
+    errors.push('Business website is required.');
+  }
+
+  if (normalizeField(input.businessWebsite, 500) && !normalizeHttpUrl(input.businessWebsite, 500)) {
+    errors.push('Business website must be a valid website URL.');
+  }
+
   if (!normalizeMessage(input.message, 5000)) {
     errors.push('Message is required.');
   }
@@ -210,15 +280,16 @@ function validateWebsiteSubmission(input) {
   return errors;
 }
 
-function validateManualSubmission(input) {
+function validateManualSubmission(input, rawInput = input) {
   const errors = [];
 
   if (!input.company && !input.seller_name && !input.broker_name) {
-    errors.push('Add a company/business name or at least one broker or seller contact.');
+    errors.push('Add a company/business name or at least one primary or partner contact.');
   }
 
-  validateOptionalEmail(input.broker_email, 'Broker email', errors);
-  validateOptionalEmail(input.seller_email, 'Seller email', errors);
+  validateOptionalEmail(input.broker_email, 'Partner email', errors);
+  validateOptionalEmail(input.seller_email, 'Primary contact email', errors);
+  validateUrlFields(rawInput, errors);
 
   return errors;
 }
@@ -230,23 +301,23 @@ function buildCsv(submissions) {
     'Status',
     'Last Edit (Status)',
     'Days Ago',
-    'Listing URL',
+    'Lead Source URL',
     'Website',
-    'Prospectus / CIM',
-    'Asking Price',
-    'TTM Revenue',
-    'TTM EBITDA',
-    'EBITDA Multiple',
-    'Net Margin',
-    'Age',
-    'SBA Eligible?',
-    'Broker Name',
-    'Broker Email',
-    'Broker Phone Number',
-    'Seller Name',
-    'Seller Email',
-    'Seller Phone Number',
-    'Deal Notes',
+    'Service Interest',
+    'Package / Budget',
+    'Monthly Revenue Impact',
+    'Lead Goal',
+    'Current Provider',
+    'Conversion Issue',
+    'Business Age',
+    'Priority Fit?',
+    'Partner Name',
+    'Partner Email',
+    'Partner Phone Number',
+    'Primary Contact Name',
+    'Primary Contact Email',
+    'Primary Contact Phone Number',
+    'CRM Notes',
     'Lead Type',
     'Priority',
     'Assigned To',
@@ -312,10 +383,30 @@ function buildCsv(submissions) {
 }
 
 function collectContactEmails(submission) {
-  return [submission.email, submission.broker_email, submission.seller_email]
+  return [submission.email, submission.partner_email || submission.broker_email, submission.primary_contact_email || submission.seller_email]
     .map((value) => normalizeEmail(value, 200))
     .filter(Boolean)
     .filter((value, index, list) => list.indexOf(value) === index);
+}
+
+function withCrmAliases(submission) {
+  return {
+    ...submission,
+    lead_source_url: submission.lead_source_url || submission.listing_url || '',
+    service_interest: submission.service_interest || submission.prospectus_url || '',
+    package_budget: submission.package_budget || submission.asking_price || '',
+    monthly_lead_value: submission.monthly_lead_value || submission.ttm_revenue || '',
+    lead_goal: submission.lead_goal || submission.ttm_ebitda || '',
+    current_provider: submission.current_provider || submission.ebitda_multiple || '',
+    conversion_issue: submission.conversion_issue || submission.net_margin || '',
+    priority_fit: normalizeSbaEligibility(submission.priority_fit || submission.sba_eligible, 'unknown'),
+    partner_name: submission.partner_name || submission.broker_name || '',
+    partner_email: submission.partner_email || submission.broker_email || '',
+    partner_phone: submission.partner_phone || submission.broker_phone || '',
+    primary_contact_name: submission.primary_contact_name || submission.seller_name || '',
+    primary_contact_email: submission.primary_contact_email || submission.seller_email || '',
+    primary_contact_phone: submission.primary_contact_phone || submission.seller_phone || '',
+  };
 }
 
 function dedupeEmailEvents(events) {
@@ -394,17 +485,40 @@ async function listInBatches(values, listFn) {
 
 function enrichSubmissionWithRelatedData(
   submission,
-  { uploadRequest = null, documents = [], emailEvents = [] } = {},
+  {
+    uploadRequest = null,
+    documents = [],
+    emailEvents = [],
+    researchRuns = [],
+    audits = [],
+    reports = [],
+    outreachMessages = [],
+    websiteVisits = [],
+  } = {},
   nowValue = new Date(),
 ) {
   const emailEngagement = summarizeEmailEngagement(dedupeEmailEvents(emailEvents));
+  const normalizedSubmission = withCrmAliases(submission);
+  const latestRun = researchRuns[0] || null;
+  const latestAudit = audits[0] || null;
+  const latestReport = reports[0] || null;
+  const automation = summarizeAutomationState({
+    latestRun,
+    latestAudit,
+    latestReport,
+    outreachMessages,
+    visits: websiteVisits,
+    emailEngagement,
+    submission: normalizedSubmission,
+  });
   const enriched = {
-    ...submission,
+    ...normalizedSubmission,
     latest_upload_request: uploadRequest,
     secure_documents: documents,
     email_engagement: emailEngagement,
-    status_updated_at: submission.status_updated_at || submission.updated_at,
-    days_since_added: daysAgoFrom(submission.created_at, nowValue),
+    automation,
+    status_updated_at: normalizedSubmission.status_updated_at || normalizedSubmission.updated_at,
+    days_since_added: daysAgoFrom(normalizedSubmission.created_at, nowValue),
   };
 
   return {
@@ -433,6 +547,11 @@ async function enrichSubmission(submission, storage, nowValue = new Date()) {
       uploadRequest,
       documents,
       emailEvents: emailEventResults.flat(),
+      researchRuns: storage.listResearchRunsForSubmission ? await storage.listResearchRunsForSubmission(submission.id, 5) : [],
+      audits: storage.listProspectAuditsForSubmission ? await storage.listProspectAuditsForSubmission(submission.id, 5) : [],
+      reports: storage.listGeneratedReportsForSubmission ? await storage.listGeneratedReportsForSubmission(submission.id, 5) : [],
+      outreachMessages: storage.listOutreachMessagesForSubmission ? await storage.listOutreachMessagesForSubmission(submission.id, 20) : [],
+      websiteVisits: storage.listWebsiteVisitsForSubmission ? await storage.listWebsiteVisitsForSubmission(submission.id, 50) : [],
     },
     nowValue,
   );
@@ -447,23 +566,48 @@ async function enrichSubmissions(submissions, storage, nowValue = new Date()) {
     !storage.listLatestSecureUploadRequestsForSubmissions ||
     !storage.listSecureDocumentsForSubmissions ||
     !storage.listEmailEventsForSubmissions ||
-    !storage.listEmailEventsForRecipients
+    !storage.listEmailEventsForRecipients ||
+    !storage.listResearchRunsForSubmissions ||
+    !storage.listProspectAuditsForSubmissions ||
+    !storage.listGeneratedReportsForSubmissions ||
+    !storage.listOutreachMessagesForSubmissions ||
+    !storage.listWebsiteVisitsForSubmissions
   ) {
     return Promise.all(submissions.map((submission) => enrichSubmission(submission, storage, nowValue)));
   }
 
   const submissionIds = submissions.map((submission) => submission.id);
   const contactEmails = submissions.flatMap(collectContactEmails);
-  const [uploadRequests, documents, submissionEmailEvents, recipientEmailEvents] = await Promise.all([
+  const [
+    uploadRequests,
+    documents,
+    submissionEmailEvents,
+    recipientEmailEvents,
+    researchRuns,
+    audits,
+    reports,
+    outreachMessages,
+    websiteVisits,
+  ] = await Promise.all([
     listInBatches(submissionIds, (ids) => storage.listLatestSecureUploadRequestsForSubmissions(ids)),
     listInBatches(submissionIds, (ids) => storage.listSecureDocumentsForSubmissions(ids)),
     listInBatches(submissionIds, (ids) => storage.listEmailEventsForSubmissions(ids)),
     listInBatches(contactEmails, (emails) => storage.listEmailEventsForRecipients(emails)),
+    listInBatches(submissionIds, (ids) => storage.listResearchRunsForSubmissions(ids)),
+    listInBatches(submissionIds, (ids) => storage.listProspectAuditsForSubmissions(ids)),
+    listInBatches(submissionIds, (ids) => storage.listGeneratedReportsForSubmissions(ids)),
+    listInBatches(submissionIds, (ids) => storage.listOutreachMessagesForSubmissions(ids)),
+    listInBatches(submissionIds, (ids) => storage.listWebsiteVisitsForSubmissions(ids)),
   ]);
   const latestUploadBySubmission = firstBy(uploadRequests, (request) => request.submission_id);
   const documentsBySubmission = groupBy(documents, (document) => document.submission_id);
   const eventsBySubmission = groupBy(submissionEmailEvents, (event) => event.submission_id);
   const eventsByRecipient = groupBy(recipientEmailEvents, (event) => normalizeEmail(event.recipient_email, 200));
+  const runsBySubmission = groupBy(researchRuns, (run) => run.submission_id);
+  const auditsBySubmission = groupBy(audits, (audit) => audit.submission_id);
+  const reportsBySubmission = groupBy(reports, (report) => report.submission_id);
+  const outreachBySubmission = groupBy(outreachMessages, (message) => message.submission_id);
+  const visitsBySubmission = groupBy(websiteVisits, (visit) => visit.submission_id);
 
   return submissions.map((submission) => {
     const emailEvents = [
@@ -477,13 +621,18 @@ async function enrichSubmissions(submissions, storage, nowValue = new Date()) {
         uploadRequest: latestUploadBySubmission.get(submission.id) || null,
         documents: documentsBySubmission.get(submission.id) || [],
         emailEvents,
+        researchRuns: runsBySubmission.get(submission.id) || [],
+        audits: auditsBySubmission.get(submission.id) || [],
+        reports: reportsBySubmission.get(submission.id) || [],
+        outreachMessages: outreachBySubmission.get(submission.id) || [],
+        websiteVisits: visitsBySubmission.get(submission.id) || [],
       },
       nowValue,
     );
   });
 }
 
-function buildNotificationSummary(summary, submissions, emailTriage = []) {
+function buildNotificationSummary(summary, submissions, emailTriage = [], automationTriage = []) {
   const actionItems = submissions.filter((submission) => submission.follow_up_prompt);
   const notificationSummary = actionItems.reduce(
     (accumulator, submission) => {
@@ -517,6 +666,9 @@ function buildNotificationSummary(summary, submissions, emailTriage = []) {
     missingNextAction: notificationSummary.missingNextAction,
     emailEngaged: emailTriage.length,
     hotLeads: emailTriage.filter((submission) => submission.email_engagement?.hot).length,
+    tierA: automationTriage.filter((submission) => submission.automation?.tier === 'A').length,
+    tierB: automationTriage.filter((submission) => submission.automation?.tier === 'B').length,
+    websiteVisits: submissions.reduce((total, submission) => total + (submission.automation?.visit_count || 0), 0),
   };
 }
 
@@ -547,6 +699,9 @@ export async function submitContactLead(body, request) {
     phone: normalizeField(body.phone, 40),
     company: normalizeField(body.company, 160),
     role: normalizeField(body.role, 80),
+    businessWebsite: normalizeField(body.businessWebsite || body.business_website || body.businessUrl, 500),
+    serviceInterest: normalizeField(body.serviceInterest || body.service_interest, 160),
+    timeline: normalizeField(body.timeline, 120),
     message: normalizeMessage(body.message, 5000),
     source: normalizeField(body.source, 80) || 'website-contact-form',
     website: normalizeField(body.website, 120),
@@ -555,6 +710,7 @@ export async function submitContactLead(body, request) {
   };
 
   const errors = validateWebsiteSubmission(input);
+  const normalizedBusinessWebsite = normalizeHttpUrl(input.businessWebsite, 500);
 
   if (errors.length > 0) {
     return {
@@ -590,8 +746,8 @@ export async function submitContactLead(body, request) {
     source: input.source,
     submittedAt: now,
   });
-  const sellerDetails =
-    workflowDefaults.leadType === 'broker'
+  const contactDetails =
+    workflowDefaults.leadType === 'partner'
       ? { seller_name: '', seller_email: '', seller_phone: '', broker_name: input.name, broker_email: input.email, broker_phone: input.phone }
       : { seller_name: input.name, seller_email: input.email, seller_phone: input.phone, broker_name: '', broker_email: '', broker_phone: '' };
 
@@ -618,8 +774,8 @@ export async function submitContactLead(body, request) {
     role: input.role,
     message: input.message,
     listing_url: '',
-    business_website: '',
-    prospectus_url: '',
+    business_website: normalizedBusinessWebsite,
+    prospectus_url: input.serviceInterest,
     asking_price: '',
     ttm_revenue: '',
     ttm_ebitda: '',
@@ -627,7 +783,7 @@ export async function submitContactLead(body, request) {
     net_margin: '',
     business_age: '',
     sba_eligible: 'unknown',
-    ...sellerDetails,
+    ...contactDetails,
     lead_type: workflowDefaults.leadType,
     priority: workflowDefaults.priority,
     tags: workflowDefaults.tags,
@@ -638,6 +794,8 @@ export async function submitContactLead(body, request) {
     last_contacted_at: null,
     metadata: {
       elapsedMs,
+      serviceInterest: input.serviceInterest,
+      timeline: input.timeline,
       turnstileEnabled: turnstileResult.enabled,
       turnstileValidated: turnstileResult.success,
     },
@@ -694,33 +852,36 @@ export async function createManualSubmission(body, adminUsername = '') {
   const roleSeed =
     normalizeField(body.role, 80) ||
     normalizeField(body.lead_type, 80) ||
-    (normalizeField(body.broker_name, 120) || normalizeField(body.broker_email, 200) ? 'broker' : 'seller');
+    (normalizeField(body.partner_name || body.broker_name, 120) || normalizeField(body.partner_email || body.broker_email, 200)
+      ? 'partner'
+      : 'prospect');
   const workflowDefaults = deriveWorkflowDefaults({
     role: roleSeed,
     source: 'manual-crm-entry',
     submittedAt: now,
   });
-  const dealFields = normalizeDealFields({
+  const rawDealFields = {
     company: body.company,
     role: body.role || roleSeed,
-    listing_url: body.listing_url,
+    listing_url: body.lead_source_url || body.listing_url,
     business_website: body.business_website || body.website,
-    prospectus_url: body.prospectus_url || body.prospectus_cim,
-    asking_price: body.asking_price,
-    ttm_revenue: body.ttm_revenue,
-    ttm_ebitda: body.ttm_ebitda,
-    ebitda_multiple: body.ebitda_multiple,
-    net_margin: body.net_margin,
+    prospectus_url: body.service_interest || body.prospectus_url || body.prospectus_cim,
+    asking_price: body.package_budget || body.asking_price,
+    ttm_revenue: body.monthly_lead_value || body.ttm_revenue,
+    ttm_ebitda: body.lead_goal || body.ttm_ebitda,
+    ebitda_multiple: body.current_provider || body.ebitda_multiple,
+    net_margin: body.conversion_issue || body.net_margin,
     business_age: body.business_age || body.age,
-    sba_eligible: body.sba_eligible,
-    broker_name: body.broker_name,
-    broker_email: body.broker_email,
-    broker_phone: body.broker_phone || body.broker_phone_number,
-    seller_name: body.seller_name,
-    seller_email: body.seller_email,
-    seller_phone: body.seller_phone || body.seller_phone_number,
+    sba_eligible: body.priority_fit || body.sba_eligible,
+    broker_name: body.partner_name || body.broker_name,
+    broker_email: body.partner_email || body.broker_email,
+    broker_phone: body.partner_phone || body.broker_phone || body.broker_phone_number,
+    seller_name: body.primary_contact_name || body.seller_name,
+    seller_email: body.primary_contact_email || body.seller_email,
+    seller_phone: body.primary_contact_phone || body.seller_phone || body.seller_phone_number,
     lead_type: body.lead_type || workflowDefaults.leadType,
-  });
+  };
+  const dealFields = normalizeDealFields(rawDealFields);
   const notes = normalizeMessage(body.notes || body.deal_notes, 4000);
   const tags = normalizeTags(body.tags || `manual, ${dealFields.lead_type}`);
   const contact = derivePrimaryContact({
@@ -730,7 +891,7 @@ export async function createManualSubmission(body, adminUsername = '') {
     email: body.email,
     phone: body.phone,
   });
-  const errors = validateManualSubmission(dealFields);
+  const errors = validateManualSubmission(dealFields, rawDealFields);
 
   if (errors.length > 0) {
     return {
@@ -766,7 +927,7 @@ export async function createManualSubmission(body, adminUsername = '') {
     email: contact.email,
     phone: contact.phone,
     company: dealFields.company,
-    role: dealFields.role || (dealFields.lead_type === 'broker' ? 'Broker' : 'Seller'),
+    role: dealFields.role || (dealFields.lead_type === 'partner' ? 'Partner' : 'Business Owner'),
     message,
     listing_url: dealFields.listing_url,
     business_website: dealFields.business_website,
@@ -848,11 +1009,25 @@ export async function listDashboardSubmissions({ page, search, status }) {
       const leftLastEventAt = Date.parse(left.email_engagement?.last_event_at || '') || 0;
       return rightLastEventAt - leftLastEventAt;
     });
+  const automationTriage = enriched
+    .filter((submission) => submission.automation?.score > 0)
+    .sort((left, right) => {
+      const scoreDifference = (right.automation?.score || 0) - (left.automation?.score || 0);
+
+      if (scoreDifference !== 0) {
+        return scoreDifference;
+      }
+
+      const rightVisitAt = Date.parse(right.automation?.latest_visit_at || '') || 0;
+      const leftVisitAt = Date.parse(left.automation?.latest_visit_at || '') || 0;
+      return rightVisitAt - leftVisitAt;
+    });
 
   return {
-    summary: buildNotificationSummary(baseSummary, enriched, emailTriage),
+    summary: buildNotificationSummary(baseSummary, enriched, emailTriage, automationTriage),
     notifications,
     emailTriage,
+    automationTriage,
     submissions: enriched,
     total: submissions.total,
   };
@@ -907,11 +1082,13 @@ export async function updateSubmissionWorkflow(id, fields) {
     updates.tags = normalizeTags(fields.tags);
   }
 
-  const dealFieldUpdates = collectAliasedDealFieldUpdates(fields);
+  const rawDealFieldUpdates = collectAliasedRawDealFields(fields);
+  const dealFieldUpdates = collectDealFieldUpdates(rawDealFieldUpdates);
 
   const emailErrors = [];
-  validateOptionalEmail(dealFieldUpdates.broker_email, 'Broker email', emailErrors);
-  validateOptionalEmail(dealFieldUpdates.seller_email, 'Seller email', emailErrors);
+  validateOptionalEmail(dealFieldUpdates.broker_email, 'Partner email', emailErrors);
+  validateOptionalEmail(dealFieldUpdates.seller_email, 'Primary contact email', emailErrors);
+  validateUrlFields(rawDealFieldUpdates, emailErrors);
 
   if (emailErrors.length > 0) {
     return null;
@@ -940,7 +1117,7 @@ export async function updateSubmissionWorkflow(id, fields) {
     updates.email = contact.email;
     updates.phone = contact.phone;
     updates.company = merged.company;
-    updates.role = merged.role || (merged.lead_type === 'broker' ? 'Broker' : 'Seller');
+    updates.role = merged.role || (merged.lead_type === 'partner' ? 'Partner' : 'Business Owner');
   }
 
   if (updates.status === 'contacted') {

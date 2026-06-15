@@ -38,8 +38,8 @@ export default function HomePage() {
 
             <div className="mt-8 flex flex-wrap gap-3">
               <ButtonLink href={homePage.hero.primaryCta.href}>{homePage.hero.primaryCta.label}</ButtonLink>
-              <ButtonLink href={homePage.hero.secondaryCta.href} variant="secondary">
-                {homePage.hero.secondaryCta.label}
+              <ButtonLink href={homePage.hero.bookingCta.href} variant="secondary">
+                {homePage.hero.bookingCta.label}
               </ButtonLink>
             </div>
 
@@ -63,7 +63,7 @@ export default function HomePage() {
                 <div>
                   <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">{siteConfig.personName}</p>
                   <p className="mt-2 max-w-xs text-sm leading-6 text-ink/70">
-                    Business-minded operator seeking a durable small business to own and grow with care.
+                    Practical website and online presence partner for local service businesses.
                   </p>
                 </div>
               </div>
@@ -80,9 +80,9 @@ export default function HomePage() {
               </div>
 
               <div className="mt-8 rounded-[26px] border border-moss/12 bg-moss px-5 py-5 text-white">
-                <p className="text-sm font-semibold uppercase tracking-[0.18em] text-white/72">Confidential Conversations Welcome</p>
+                <p className="text-sm font-semibold uppercase tracking-[0.18em] text-white/72">Quick Website Reviews Welcome</p>
                 <p className="mt-3 text-sm leading-7 text-white/84">
-                  Owners, brokers, and referrals are all welcome to reach out directly. Early conversations should feel calm, private, and useful.
+                  Send the website URL, the main customer action you want more of, and any updates you already know are overdue.
                 </p>
               </div>
             </div>
@@ -149,7 +149,7 @@ export default function HomePage() {
               </p>
             ))}
             <ButtonLink className="mt-8" href="/about" variant="secondary">
-              Read More About Mathew <ArrowRight className="h-4 w-4" />
+              Read More About The Approach <ArrowRight className="h-4 w-4" />
             </ButtonLink>
           </div>
         </Reveal>
@@ -184,17 +184,17 @@ export default function HomePage() {
             <div className="mt-8 rounded-[28px] border border-line/80 bg-white/72 p-6">
               <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Search Themes Covered</p>
               <p className="mt-3 text-base leading-7 text-ink/74">
-                Small business buyer. Individual business buyer. Long-term business buyer. Search fund alternative. Preserve business legacy after sale.
+                Website support. Local SEO basics. Lead flow. Monthly updates. Contact forms. Online trust signals.
               </p>
             </div>
             <div className="mt-6 rounded-[28px] border border-line/80 bg-white/72 p-6">
               <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Open To A Conversation If</p>
               <p className="mt-3 text-base leading-7 text-ink/74">
-                You have a solid small business, care about continuity, and want to explore a fair transition without the feel of a corporate process.
+                Your website is outdated, contact flow is unclear, updates are piling up, or you want a practical audit before committing to monthly support.
               </p>
             </div>
-            <ButtonLink className="mt-8" href="/criteria">
-              View Full Criteria <ArrowRight className="h-4 w-4" />
+            <ButtonLink className="mt-8" href="/services">
+              View Services <ArrowRight className="h-4 w-4" />
             </ButtonLink>
           </Reveal>
         </div>
@@ -248,7 +248,7 @@ export default function HomePage() {
             <SectionHeading
               description={homePage.faqPreview.title}
               eyebrow={homePage.faqPreview.eyebrow}
-              title="Questions owners often ask before responding"
+              title="Questions owners often ask before starting"
             />
             <div className="mt-6">
               <FaqAccordion items={homePage.faqPreview.items} />
@@ -256,13 +256,13 @@ export default function HomePage() {
           </Reveal>
 
           <Reveal className="panel p-7 sm:p-8" delay={120}>
-            <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">A Better First Conversation</p>
-            <h2 className="mt-4 font-display text-3xl leading-tight text-ink">Serious, calm, and built around fit</h2>
+            <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">A Useful First Review</p>
+            <h2 className="mt-4 font-display text-3xl leading-tight text-ink">Clear, practical, and tied to leads</h2>
             <p className="mt-4 text-base leading-7 text-ink/72">
-              If there is mutual fit, the next steps can be structured. If there is not, the conversation should still feel respectful and worthwhile. That is the standard I am aiming for.
+              If the audit surfaces meaningful issues, we can decide what to fix first. If it does not, you still get a clearer view of what is working.
             </p>
             <div className="mt-6 space-y-3">
-              {['No aggressive sales language', 'No private equity positioning', 'No pressure to overshare too early'].map((item) => (
+              {['No vague vanity metrics', 'No pressure to rebuild everything', 'No technical jargon without owner-level context'].map((item) => (
                 <div className="flex items-start gap-3 rounded-2xl border border-line/80 bg-fog/70 px-4 py-4" key={item}>
                   <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-moss" />
                   <p className="text-sm leading-6 text-ink/74">{item}</p>

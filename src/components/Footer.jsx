@@ -5,6 +5,10 @@ import ButtonLink from './ButtonLink';
 import LinkedInIcon from './LinkedInIcon';
 import LogoMark from './LogoMark';
 
+function externalLinkProps(href) {
+  return /^https?:\/\//i.test(href || '') ? { rel: 'noreferrer', target: '_blank' } : {};
+}
+
 export default function Footer() {
   const contactItems = siteConfig.contactDetailItems?.length
     ? siteConfig.contactDetailItems
@@ -17,18 +21,17 @@ export default function Footer() {
           <div className="space-y-5">
             <LogoMark light />
             <p className="max-w-md text-sm leading-7 text-white/78">
-              {siteConfig.personName} is seeking one strong small business to own and operate for the long term with continuity, care, and respect for what the seller built.
+              {siteConfig.personName} helps local businesses keep websites current, improve contact flow, and manage the online details that affect trust and leads.
             </p>
             <div className="flex flex-wrap gap-3">
-              <ButtonLink className="w-full bg-white text-pine hover:bg-sand sm:w-auto" href="/contact">
-                Start A Conversation
+              <ButtonLink className="w-full bg-white text-pine hover:bg-sand sm:w-auto" href={siteConfig.bookingCta.href}>
+                {siteConfig.bookingCta.label}
               </ButtonLink>
               <ButtonLink
                 className="w-full border-white/20 bg-white/10 text-white hover:border-white/30 hover:bg-white/15 sm:w-auto"
-                download
-                href={siteConfig.downloadHref}
+                href={siteConfig.schedulingUrl ? '/contact' : '/services'}
               >
-                Download Criteria
+                {siteConfig.schedulingUrl ? 'Request An Audit' : 'View Services'}
               </ButtonLink>
             </div>
           </div>
@@ -56,7 +59,12 @@ export default function Footer() {
                 .filter((item) => item.kind !== 'linkedin')
                 .map((item) =>
                   item.href ? (
-                    <a className="block transition hover:text-white" href={item.href} key={`${item.kind}-${item.value}`}>
+                    <a
+                      className="block transition hover:text-white"
+                      href={item.href}
+                      key={`${item.kind}-${item.value}`}
+                      {...externalLinkProps(item.href)}
+                    >
                       <span className="font-medium text-white/56">{item.label}:</span> {item.value}
                     </a>
                   ) : (
@@ -85,15 +93,23 @@ export default function Footer() {
               </div>
             ) : null}
             <p className="text-sm leading-7 text-white/62">
-              Owners, brokers, and referral partners are welcome. Early conversations should be confidential, direct, and low-pressure.
+              Share your website URL and the customer action you want more of. The first review stays practical, direct, and focused on lead flow.
             </p>
           </div>
         </div>
 
-        <div className="mt-12 border-t border-white/12 pt-6 text-sm text-white/52">
+        <div className="mt-12 flex flex-col gap-4 border-t border-white/12 pt-6 text-sm text-white/52 md:flex-row md:items-center md:justify-between">
           <p>
-            © {new Date().getFullYear()} {siteConfig.siteName}. Built for thoughtful business succession conversations.
+            © {new Date().getFullYear()} {siteConfig.siteName}. Built for local business online presence management.
           </p>
+          <div className="flex flex-wrap gap-4">
+            <Link className="transition hover:text-white" to="/privacy">
+              Privacy
+            </Link>
+            <Link className="transition hover:text-white" to="/terms">
+              Terms
+            </Link>
+          </div>
         </div>
       </div>
     </footer>

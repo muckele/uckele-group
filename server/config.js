@@ -19,13 +19,6 @@ function booleanFromEnv(value, fallback) {
   return ['1', 'true', 'yes', 'on'].includes(normalized);
 }
 
-function listFromEnv(value) {
-  return String(value || '')
-    .split(/[,\n]/)
-    .map((item) => item.trim())
-    .filter(Boolean);
-}
-
 let cachedConfig;
 
 export function getConfig() {
@@ -73,6 +66,7 @@ export function getConfig() {
     brand: {
       companyName: process.env.EMAIL_BRAND_COMPANY_NAME || 'Uckele Group',
       websiteUrl: process.env.PUBLIC_SITE_URL || defaultPublicOrigin,
+      schedulingUrl: process.env.PUBLIC_SCHEDULING_URL || process.env.VITE_PUBLIC_SCHEDULING_URL || '',
       mailingAddress: process.env.EMAIL_BRAND_MAILING_ADDRESS || '',
     },
     crm: {
@@ -102,28 +96,20 @@ export function getConfig() {
       defaultAssignee: process.env.DEFAULT_LEAD_ASSIGNEE || 'Mathew Uckele',
       defaultFollowUpDelayHours: numberFromEnv(process.env.DEFAULT_FOLLOW_UP_DELAY_HOURS, 24),
     },
-    dealHunter: {
-      recipient: process.env.DEAL_HUNTER_EMAIL_RECIPIENT || adminEmail,
-      cronSecret: process.env.DEAL_HUNTER_CRON_SECRET || '',
-      sheetCsvUrls: listFromEnv(process.env.DEAL_HUNTER_SHEET_CSV_URLS || process.env.DEAL_HUNTER_SHEET_CSV_URL),
-      airtableSharedViewUrl:
-        process.env.DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL ||
-        'https://airtable.com/appEGxhjno0HTpEco/shrUhtbnzZTPaR4Lk/tblACIQ9QNiVmoWSK?viewControls=on',
-      airtableToken: process.env.DEAL_HUNTER_AIRTABLE_TOKEN || process.env.AIRTABLE_TOKEN || '',
-      airtableBaseId: process.env.DEAL_HUNTER_AIRTABLE_BASE_ID || 'appEGxhjno0HTpEco',
-      airtableTableId: process.env.DEAL_HUNTER_AIRTABLE_TABLE_ID || 'tblACIQ9QNiVmoWSK',
-      airtableViewId: process.env.DEAL_HUNTER_AIRTABLE_VIEW_ID || 'viw4OORhKKWPUsWa4',
-      lookbackDays: numberFromEnv(process.env.DEAL_HUNTER_LOOKBACK_DAYS, 4),
-      maxSourceRecords: numberFromEnv(process.env.DEAL_HUNTER_MAX_SOURCE_RECORDS, 8000),
-      airtableSharedMaxPayloadBytes: numberFromEnv(process.env.DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES, 12 * 1024 * 1024),
-      dailyEmail: {
-        enabled: booleanFromEnv(process.env.DEAL_HUNTER_DAILY_EMAIL_ENABLED, isProduction),
-        time: process.env.DEAL_HUNTER_DAILY_EMAIL_TIME || '10:15',
-        timezone: process.env.DEAL_HUNTER_DAILY_EMAIL_TIMEZONE || 'America/Los_Angeles',
-        checkIntervalMs: numberFromEnv(process.env.DEAL_HUNTER_DAILY_EMAIL_CHECK_INTERVAL_MS, 1000 * 60),
-        retryIntervalMs: numberFromEnv(process.env.DEAL_HUNTER_DAILY_EMAIL_RETRY_INTERVAL_MS, 1000 * 60 * 30),
-        markerDir: process.env.DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR || path.join(defaultDataDir, 'deal-hunter-daily-email'),
-      },
+    outreach: {
+      enabled: booleanFromEnv(process.env.OUTREACH_AUTOMATION_ENABLED, false),
+      schedulerEnabled: booleanFromEnv(process.env.OUTREACH_SCHEDULER_ENABLED, false),
+      schedulerIntervalMs: numberFromEnv(process.env.OUTREACH_SCHEDULER_INTERVAL_MS, 1000 * 60 * 15),
+      autoScheduleAfterResearch: booleanFromEnv(process.env.OUTREACH_AUTO_SCHEDULE_AFTER_RESEARCH, false),
+      dailySendLimit: numberFromEnv(process.env.OUTREACH_DAILY_SEND_LIMIT, 25),
+      websiteFetchTimeoutMs: numberFromEnv(process.env.OUTREACH_WEBSITE_FETCH_TIMEOUT_MS, 8000),
+      websiteFetchMaxBytes: numberFromEnv(process.env.OUTREACH_WEBSITE_FETCH_MAX_BYTES, 1200000),
+      unsubscribeSecret: process.env.OUTREACH_UNSUBSCRIBE_SECRET || process.env.ADMIN_SESSION_SECRET || 'local-outreach-unsubscribe-secret',
+      cadenceDays: (process.env.OUTREACH_CADENCE_DAYS || '0,3,7,14')
+        .split(',')
+        .map((value) => Number(value.trim()))
+        .filter((value) => Number.isFinite(value) && value >= 0)
+        .slice(0, 6),
     },
     secureDocuments: {
       tokenSecret: process.env.SECURE_DOCUMENTS_TOKEN_SECRET || sessionSecret,

@@ -1,6 +1,7 @@
 import { Outlet } from 'react-router-dom';
 import Footer from './Footer';
 import Header from './Header';
+import VisitTracker from './VisitTracker';
 
 export default function Layout() {
   return (
@@ -10,6 +11,7 @@ export default function Layout() {
       <div className="pointer-events-none absolute inset-x-0 top-[14rem] -z-10 mx-auto h-[1px] w-[min(92%,72rem)] bg-gradient-to-r from-transparent via-line/70 to-transparent" />
 
       <Header />
+      <VisitTracker />
 
       <main>
         <Outlet />

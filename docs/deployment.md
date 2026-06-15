@@ -12,6 +12,10 @@ The Fly configuration is committed in [fly.toml](/Users/Matt/Documents/uckele-gr
 - secure document storage at `/data/secure-documents`
 - Node 22 in the Docker build/runtime image
 
+Before launching, complete the production checklist in [production-readiness.md](/Users/Matt/Documents/uckele-group/docs/production-readiness.md).
+
+Local builds require Node.js `20.19+` or `22.12+`. Run `nvm use` before local backend testing, then run `npm ci` or `npm run rebuild:native` after changing Node versions so the native SQLite dependency matches the active runtime.
+
 ## Included Files
 
 - [Dockerfile](/Users/Matt/Documents/uckele-group/Dockerfile)
@@ -31,9 +35,6 @@ fly secrets set \
   RESEND_REPLY_TO=mathew@uckelegroup.com \
   RESEND_WEBHOOK_SECRET=... \
   EMAIL_BRAND_COMPANY_NAME="Uckele Group" \
-  DEAL_HUNTER_EMAIL_RECIPIENT=mathew@uckelegroup.com \
-  DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL="https://airtable.com/appEGxhjno0HTpEco/shrUhtbnzZTPaR4Lk/tblACIQ9QNiVmoWSK?viewControls=on" \
-  DEAL_HUNTER_SHEET_CSV_URL="https://docs.google.com/spreadsheets/d/.../gviz/tq?tqx=out:csv&gid=..." \
   ADMIN_AUTH_MODE=magic-link \
   ADMIN_EMAIL=mathew@uckelegroup.com \
   ADMIN_SESSION_SECRET=... \
@@ -49,15 +50,14 @@ fly secrets set \
   CRM_WEBHOOK_URL=... \
   CRM_WEBHOOK_SECRET=... \
   EMAIL_BRAND_MAILING_ADDRESS="Your business mailing address" \
-  DEAL_HUNTER_CRON_SECRET=... \
-  DEAL_HUNTER_DAILY_EMAIL_TIME=10:15 \
-  DEAL_HUNTER_DAILY_EMAIL_TIMEZONE=America/Los_Angeles \
-  DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR=/data/deal-hunter-daily-email \
-  DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES=12582912 \
-  DEAL_HUNTER_AIRTABLE_TOKEN=... \
-  DEAL_HUNTER_AIRTABLE_BASE_ID=appEGxhjno0HTpEco \
-  DEAL_HUNTER_AIRTABLE_TABLE_ID=tblACIQ9QNiVmoWSK \
-  DEAL_HUNTER_AIRTABLE_VIEW_ID=viw4OORhKKWPUsWa4 \
+  PUBLIC_SCHEDULING_URL="https://cal.com/your-username/15-minute-website-audit" \
+  OUTREACH_AUTOMATION_ENABLED=false \
+  OUTREACH_SCHEDULER_ENABLED=false \
+  OUTREACH_SCHEDULER_INTERVAL_MS=900000 \
+  OUTREACH_AUTO_SCHEDULE_AFTER_RESEARCH=false \
+  OUTREACH_DAILY_SEND_LIMIT=25 \
+  OUTREACH_CADENCE_DAYS=0,3,7,14 \
+  OUTREACH_UNSUBSCRIBE_SECRET=... \
   DEFAULT_LEAD_ASSIGNEE="Mathew Uckele" \
   DEFAULT_FOLLOW_UP_DELAY_HOURS=24
 ```
@@ -68,6 +68,17 @@ If you enable Turnstile, add the public site key in [fly.toml](/Users/Matt/Docum
 [build.args]
   VITE_TURNSTILE_SITE_KEY = "your-public-turnstile-site-key"
 ```
+
+Hosted Cal.com booking links are also frontend build-time values. After creating the Cal.com event for a 15-minute website audit call, add the public booking URL to [fly.toml](/Users/Matt/Documents/uckele-group/fly.toml):
+
+```toml
+[build.args]
+  VITE_PUBLIC_SCHEDULING_URL = "https://cal.com/your-username/15-minute-website-audit"
+```
+
+Redeploy after changing this value so the public booking CTAs are rebuilt with the new URL.
+
+For email-generated booking links, also set `PUBLIC_SCHEDULING_URL` at runtime so generated outreach emails point to the same Cal.com event.
 
 ## First-Time Fly Setup
 
@@ -117,10 +128,11 @@ Then update DNS:
 ## Before Go-Live
 
 - Confirm the contact form is delivering to `mathew@uckelegroup.com`
-- Confirm `/admin` can run Deal Hunter scoring and send the daily email
-- Confirm the in-app scheduler logs `deal-hunter:scheduler` startup and sends after the configured Pacific time
-- If using an external scheduler, confirm it posts to `/api/deal-hunter/daily-email` with `Authorization: Bearer DEAL_HUNTER_CRON_SECRET`
-- Confirm the first successful daily email creates Deal Hunter history rows so later emails can separate newly seen matches from already reviewed listings
+- Confirm the Cal.com booking CTA opens the correct 15-minute website audit event when `VITE_PUBLIC_SCHEDULING_URL` is configured
+- Confirm `/admin` can view inbound audit requests, notes, follow-up state, uploaded document metadata, and email engagement
+- Confirm automated research can run on a test CRM record and creates an audit, report, tier score, and outreach cadence
+- Keep `OUTREACH_AUTOMATION_ENABLED=false` and `OUTREACH_SCHEDULER_ENABLED=false` until sending domain DNS, unsubscribe/suppression handling, cadence review, and daily limits have been reviewed
+- Confirm `/privacy` and `/terms` are live and linked in the footer
 - Confirm magic-link sign-in emails are being delivered
 - Confirm Resend webhook events create email engagement records in the admin CRM
 - Verify `/api/health` returns `200` on the Fly URL

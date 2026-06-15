@@ -8,9 +8,11 @@ import CriteriaPage from './pages/CriteriaPage';
 import DashboardPage from './pages/DashboardPage';
 import FaqPage from './pages/FaqPage';
 import HomePage from './pages/HomePage';
+import PrivacyPage from './pages/PrivacyPage';
 import ProcessPage from './pages/ProcessPage';
 import SecureDocumentsPage from './pages/SecureDocumentsPage';
 import SellerConcernsPage from './pages/SellerConcernsPage';
+import TermsPage from './pages/TermsPage';
 
 function ScrollToTop() {
   const location = useLocation();
@@ -31,11 +33,13 @@ export default function App() {
         <Route element={<Layout />} path="/">
           <Route element={<HomePage />} index />
           <Route element={<AboutPage />} path="about" />
-          <Route element={<CriteriaPage />} path="criteria" />
-          <Route element={<SellerConcernsPage />} path="why-sell-to-me" />
+          <Route element={<CriteriaPage />} path="services" />
+          <Route element={<SellerConcernsPage />} path="why-partner" />
           <Route element={<ProcessPage />} path="process" />
           <Route element={<FaqPage />} path="faq" />
           <Route element={<ContactPage />} path="contact" />
+          <Route element={<PrivacyPage />} path="privacy" />
+          <Route element={<TermsPage />} path="terms" />
           <Route element={<SecureDocumentsPage />} path="secure-documents" />
         </Route>
 
@@ -43,6 +47,8 @@ export default function App() {
           <Route element={<DashboardPage />} index />
         </Route>
 
+        <Route element={<Navigate replace to="/services" />} path="criteria" />
+        <Route element={<Navigate replace to="/why-partner" />} path="why-sell-to-me" />
         <Route element={<Navigate replace to="/admin" />} path="dashboard" />
 
         <Route element={<Navigate replace to="/" />} path="*" />

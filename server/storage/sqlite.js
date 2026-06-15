@@ -18,7 +18,21 @@ function parseJsonColumn(value, fallback) {
 function normalizeSubmissionRow(row) {
   return {
     ...row,
-    lead_type: normalizeLeadType(row.lead_type, 'seller'),
+    lead_source_url: row.listing_url || '',
+    service_interest: row.prospectus_url || '',
+    package_budget: row.asking_price || '',
+    monthly_lead_value: row.ttm_revenue || '',
+    lead_goal: row.ttm_ebitda || '',
+    current_provider: row.ebitda_multiple || '',
+    conversion_issue: row.net_margin || '',
+    priority_fit: normalizeSbaEligibility(row.sba_eligible, 'unknown'),
+    partner_name: row.broker_name || '',
+    partner_email: row.broker_email || '',
+    partner_phone: row.broker_phone || '',
+    primary_contact_name: row.seller_name || '',
+    primary_contact_email: row.seller_email || '',
+    primary_contact_phone: row.seller_phone || '',
+    lead_type: normalizeLeadType(row.lead_type, 'prospect'),
     sba_eligible: normalizeSbaEligibility(row.sba_eligible, 'unknown'),
     spam_reasons: parseJsonColumn(row.spam_reasons, []),
     metadata: parseJsonColumn(row.metadata, {}),
@@ -44,14 +58,18 @@ function normalizeEmailEventRow(row) {
     : null;
 }
 
-function normalizeDealHunterSeenDealRow(row) {
-  return row
-    ? {
-        ...row,
-        should_remove: Boolean(row.should_remove),
-        metadata: parseJsonColumn(row.metadata, {}),
-      }
-    : null;
+function normalizeJsonRecordRow(row, jsonFields = []) {
+  if (!row) {
+    return null;
+  }
+
+  return jsonFields.reduce(
+    (record, field) => ({
+      ...record,
+      [field]: parseJsonColumn(record[field], Array.isArray(record[field]) ? [] : {}),
+    }),
+    { ...row },
+  );
 }
 
 function ensureColumn(database, tableName, columnName, definition) {
@@ -79,12 +97,14 @@ function serializeEmailEvent(event) {
   };
 }
 
-function serializeDealHunterSeenDeal(deal) {
-  return {
-    ...deal,
-    should_remove: deal.should_remove ? 1 : 0,
-    metadata: JSON.stringify(deal.metadata || {}),
-  };
+function serializeJsonRecord(record, jsonFields = []) {
+  return jsonFields.reduce(
+    (payload, field) => ({
+      ...payload,
+      [field]: JSON.stringify(payload[field] || (field.endsWith('s') ? [] : {})),
+    }),
+    { ...record },
+  );
 }
 
 function normalizeList(values, maxLength = 5000) {
@@ -203,23 +223,104 @@ export function createSqliteStorage(config) {
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
-    CREATE TABLE IF NOT EXISTS deal_hunter_seen_deals (
+    CREATE TABLE IF NOT EXISTS research_runs (
       id TEXT PRIMARY KEY,
-      first_seen_at TEXT NOT NULL,
-      last_seen_at TEXT NOT NULL,
-      source_id TEXT,
-      source_name TEXT,
-      source_mode TEXT,
-      external_id TEXT,
-      listing_url TEXT,
-      name TEXT NOT NULL,
-      industry TEXT,
-      location TEXT,
-      annual_profit REAL,
-      annual_revenue REAL,
-      asking_price REAL,
-      score INTEGER,
-      should_remove INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      submission_id TEXT,
+      run_type TEXT NOT NULL,
+      status TEXT NOT NULL,
+      requested_by TEXT,
+      started_at TEXT,
+      completed_at TEXT,
+      error TEXT,
+      source_url TEXT,
+      score INTEGER NOT NULL DEFAULT 0,
+      tier TEXT,
+      summary TEXT,
+      source_data TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS prospect_audits (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      submission_id TEXT,
+      created_at TEXT NOT NULL,
+      website_url TEXT,
+      uptime_status TEXT,
+      http_status INTEGER,
+      ssl_status TEXT,
+      page_title TEXT,
+      meta_description TEXT,
+      has_contact_form INTEGER NOT NULL DEFAULT 0,
+      has_phone_link INTEGER NOT NULL DEFAULT 0,
+      has_booking_link INTEGER NOT NULL DEFAULT 0,
+      has_mobile_viewport INTEGER NOT NULL DEFAULT 0,
+      cta_count INTEGER NOT NULL DEFAULT 0,
+      broken_link_count INTEGER NOT NULL DEFAULT 0,
+      page_size_bytes INTEGER NOT NULL DEFAULT 0,
+      load_time_ms INTEGER NOT NULL DEFAULT 0,
+      findings TEXT NOT NULL DEFAULT '[]',
+      source_links TEXT NOT NULL DEFAULT '[]',
+      raw_snapshot TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS generated_reports (
+      id TEXT PRIMARY KEY,
+      run_id TEXT,
+      submission_id TEXT,
+      created_at TEXT NOT NULL,
+      report_type TEXT NOT NULL,
+      status TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT,
+      content_markdown TEXT,
+      personalization TEXT NOT NULL DEFAULT '{}',
+      recommended_email_subject TEXT,
+      recommended_email_body TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS outreach_messages (
+      id TEXT PRIMARY KEY,
+      submission_id TEXT,
+      report_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      cadence_name TEXT NOT NULL,
+      cadence_step INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      scheduled_at TEXT,
+      sent_at TEXT,
+      recipient_email TEXT,
+      subject TEXT NOT NULL,
+      body_text TEXT NOT NULL,
+      body_html TEXT,
+      provider_message_id TEXT,
+      error TEXT,
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS website_visits (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      submission_id TEXT,
+      session_id TEXT,
+      page_path TEXT NOT NULL,
+      full_url TEXT,
+      referrer TEXT,
+      source TEXT,
+      ip_hash TEXT,
+      user_agent TEXT,
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS email_suppressions (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      email TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      source TEXT,
+      submission_id TEXT,
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
@@ -235,11 +336,16 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_email_events_recipient_email ON email_events(recipient_email, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_email_events_message_id ON email_events(message_id);
     CREATE INDEX IF NOT EXISTS idx_email_events_event_type ON email_events(event_type, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_last_seen_at ON deal_hunter_seen_deals(last_seen_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_source_id ON deal_hunter_seen_deals(source_id, last_seen_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_research_runs_submission_id ON research_runs(submission_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_prospect_audits_submission_id ON prospect_audits(submission_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_generated_reports_submission_id ON generated_reports(submission_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_outreach_messages_submission_id ON outreach_messages(submission_id, scheduled_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_outreach_messages_status_due ON outreach_messages(status, scheduled_at);
+    CREATE INDEX IF NOT EXISTS idx_website_visits_submission_id ON website_visits(submission_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_email_suppressions_email ON email_suppressions(email);
   `);
 
-  ensureColumn(database, 'contact_submissions', 'lead_type', "TEXT NOT NULL DEFAULT 'owner'");
+  ensureColumn(database, 'contact_submissions', 'lead_type', "TEXT NOT NULL DEFAULT 'prospect'");
   ensureColumn(database, 'contact_submissions', 'priority', "TEXT NOT NULL DEFAULT 'normal'");
   ensureColumn(database, 'contact_submissions', 'tags', "TEXT NOT NULL DEFAULT '[]'");
   ensureColumn(database, 'contact_submissions', 'assigned_to', 'TEXT');
@@ -461,64 +567,63 @@ export function createSqliteStorage(config) {
   `);
   const getEmailEventByKeyStatement = database.prepare('SELECT * FROM email_events WHERE event_key = ? LIMIT 1');
 
-  const upsertDealHunterSeenDealStatement = database.prepare(`
-    INSERT INTO deal_hunter_seen_deals (
-      id,
-      first_seen_at,
-      last_seen_at,
-      source_id,
-      source_name,
-      source_mode,
-      external_id,
-      listing_url,
-      name,
-      industry,
-      location,
-      annual_profit,
-      annual_revenue,
-      asking_price,
-      score,
-      should_remove,
-      metadata
+  const insertResearchRunStatement = database.prepare(`
+    INSERT INTO research_runs (
+      id, created_at, updated_at, submission_id, run_type, status, requested_by, started_at, completed_at,
+      error, source_url, score, tier, summary, source_data
     ) VALUES (
-      @id,
-      @first_seen_at,
-      @last_seen_at,
-      @source_id,
-      @source_name,
-      @source_mode,
-      @external_id,
-      @listing_url,
-      @name,
-      @industry,
-      @location,
-      @annual_profit,
-      @annual_revenue,
-      @asking_price,
-      @score,
-      @should_remove,
-      @metadata
+      @id, @created_at, @updated_at, @submission_id, @run_type, @status, @requested_by, @started_at, @completed_at,
+      @error, @source_url, @score, @tier, @summary, @source_data
     )
-    ON CONFLICT(id) DO UPDATE SET
-      last_seen_at = excluded.last_seen_at,
-      source_id = excluded.source_id,
-      source_name = excluded.source_name,
-      source_mode = excluded.source_mode,
-      external_id = excluded.external_id,
-      listing_url = excluded.listing_url,
-      name = excluded.name,
-      industry = excluded.industry,
-      location = excluded.location,
-      annual_profit = excluded.annual_profit,
-      annual_revenue = excluded.annual_revenue,
-      asking_price = excluded.asking_price,
-      score = excluded.score,
-      should_remove = excluded.should_remove,
-      metadata = excluded.metadata
   `);
-  const upsertDealHunterSeenDealsTransaction = database.transaction((records) => {
-    records.forEach((record) => upsertDealHunterSeenDealStatement.run(serializeDealHunterSeenDeal(record)));
-  });
+
+  const insertProspectAuditStatement = database.prepare(`
+    INSERT INTO prospect_audits (
+      id, run_id, submission_id, created_at, website_url, uptime_status, http_status, ssl_status,
+      page_title, meta_description, has_contact_form, has_phone_link, has_booking_link, has_mobile_viewport,
+      cta_count, broken_link_count, page_size_bytes, load_time_ms, findings, source_links, raw_snapshot
+    ) VALUES (
+      @id, @run_id, @submission_id, @created_at, @website_url, @uptime_status, @http_status, @ssl_status,
+      @page_title, @meta_description, @has_contact_form, @has_phone_link, @has_booking_link, @has_mobile_viewport,
+      @cta_count, @broken_link_count, @page_size_bytes, @load_time_ms, @findings, @source_links, @raw_snapshot
+    )
+  `);
+
+  const insertGeneratedReportStatement = database.prepare(`
+    INSERT INTO generated_reports (
+      id, run_id, submission_id, created_at, report_type, status, title, summary,
+      content_markdown, personalization, recommended_email_subject, recommended_email_body
+    ) VALUES (
+      @id, @run_id, @submission_id, @created_at, @report_type, @status, @title, @summary,
+      @content_markdown, @personalization, @recommended_email_subject, @recommended_email_body
+    )
+  `);
+
+  const insertOutreachMessageStatement = database.prepare(`
+    INSERT INTO outreach_messages (
+      id, submission_id, report_id, created_at, updated_at, cadence_name, cadence_step, status, scheduled_at,
+      sent_at, recipient_email, subject, body_text, body_html, provider_message_id, error, metadata
+    ) VALUES (
+      @id, @submission_id, @report_id, @created_at, @updated_at, @cadence_name, @cadence_step, @status, @scheduled_at,
+      @sent_at, @recipient_email, @subject, @body_text, @body_html, @provider_message_id, @error, @metadata
+    )
+  `);
+
+  const insertWebsiteVisitStatement = database.prepare(`
+    INSERT INTO website_visits (
+      id, created_at, submission_id, session_id, page_path, full_url, referrer, source, ip_hash, user_agent, metadata
+    ) VALUES (
+      @id, @created_at, @submission_id, @session_id, @page_path, @full_url, @referrer, @source, @ip_hash, @user_agent, @metadata
+    )
+  `);
+
+  const insertEmailSuppressionStatement = database.prepare(`
+    INSERT INTO email_suppressions (
+      id, created_at, email, reason, source, submission_id, metadata
+    ) VALUES (
+      @id, @created_at, @email, @reason, @source, @submission_id, @metadata
+    )
+  `);
 
   function updateRecord(tableName, id, values, allowedFields, jsonFields = []) {
     const updates = Object.entries(values).filter(([key]) => allowedFields.includes(key));
@@ -774,6 +879,10 @@ export function createSqliteStorage(config) {
       return document;
     },
 
+    async getSecureDocument(id) {
+      return database.prepare('SELECT * FROM secure_documents WHERE id = ?').get(id);
+    },
+
     async listSecureDocumentsByRequest(requestId) {
       return database
         .prepare('SELECT * FROM secure_documents WHERE request_id = ? ORDER BY created_at DESC')
@@ -891,28 +1000,281 @@ export function createSqliteStorage(config) {
         .map(normalizeEmailEventRow);
     },
 
-	    async listDealHunterSeenDeals({ limit = 100000 } = {}) {
-	      const safeLimit = Math.max(1, Math.min(limit, 100000));
+    async insertResearchRun(run) {
+      insertResearchRunStatement.run(serializeJsonRecord(run, ['source_data']));
+      return run;
+    },
 
-	      return database
-	        .prepare(
-	          `
-	            SELECT * FROM deal_hunter_seen_deals
-	            ORDER BY last_seen_at DESC
-	            LIMIT ?
-	          `,
-	        )
-	        .all(safeLimit)
-	        .map(normalizeDealHunterSeenDealRow);
-	    },
+    async updateResearchRun(id, values) {
+      updateRecord(
+        'research_runs',
+        id,
+        values,
+        ['updated_at', 'status', 'started_at', 'completed_at', 'error', 'source_url', 'score', 'tier', 'summary', 'source_data'],
+        ['source_data'],
+      );
 
-	    async upsertDealHunterSeenDeals(records = []) {
-	      if (!Array.isArray(records) || records.length === 0) {
-	        return [];
-	      }
+      return this.getResearchRun(id);
+    },
 
-	      upsertDealHunterSeenDealsTransaction(records);
-	      return records;
-	    },
-	  };
-	}
+    async getResearchRun(id) {
+      const row = database.prepare('SELECT * FROM research_runs WHERE id = ?').get(id);
+      return normalizeJsonRecordRow(row, ['source_data']);
+    },
+
+    async listResearchRunsForSubmission(submissionId, limit = 10) {
+      return database
+        .prepare('SELECT * FROM research_runs WHERE submission_id = ? ORDER BY created_at DESC LIMIT ?')
+        .all(submissionId, Math.max(1, Math.min(limit, 100)))
+        .map((row) => normalizeJsonRecordRow(row, ['source_data']));
+    },
+
+    async listResearchRunsForSubmissions(submissionIds = [], limit = 5000) {
+      const ids = normalizeList(submissionIds);
+
+      if (ids.length === 0) {
+        return [];
+      }
+
+      return database
+        .prepare(
+          `
+            SELECT * FROM research_runs
+            WHERE submission_id IN (${placeholders(ids.length)})
+            ORDER BY created_at DESC
+            LIMIT ?
+          `,
+        )
+        .all(...ids, Math.max(1, Math.min(limit, 10000)))
+        .map((row) => normalizeJsonRecordRow(row, ['source_data']));
+    },
+
+    async insertProspectAudit(audit) {
+      const payload = {
+        ...audit,
+        has_contact_form: audit.has_contact_form ? 1 : 0,
+        has_phone_link: audit.has_phone_link ? 1 : 0,
+        has_booking_link: audit.has_booking_link ? 1 : 0,
+        has_mobile_viewport: audit.has_mobile_viewport ? 1 : 0,
+      };
+      insertProspectAuditStatement.run(serializeJsonRecord(payload, ['findings', 'source_links', 'raw_snapshot']));
+      return audit;
+    },
+
+    async listProspectAuditsForSubmission(submissionId, limit = 10) {
+      return database
+        .prepare('SELECT * FROM prospect_audits WHERE submission_id = ? ORDER BY created_at DESC LIMIT ?')
+        .all(submissionId, Math.max(1, Math.min(limit, 100)))
+        .map((row) => {
+          const audit = normalizeJsonRecordRow(row, ['findings', 'source_links', 'raw_snapshot']);
+          return audit
+            ? {
+                ...audit,
+                has_contact_form: Boolean(audit.has_contact_form),
+                has_phone_link: Boolean(audit.has_phone_link),
+                has_booking_link: Boolean(audit.has_booking_link),
+                has_mobile_viewport: Boolean(audit.has_mobile_viewport),
+              }
+            : null;
+        });
+    },
+
+    async listProspectAuditsForSubmissions(submissionIds = [], limit = 5000) {
+      const ids = normalizeList(submissionIds);
+
+      if (ids.length === 0) {
+        return [];
+      }
+
+      return database
+        .prepare(
+          `
+            SELECT * FROM prospect_audits
+            WHERE submission_id IN (${placeholders(ids.length)})
+            ORDER BY created_at DESC
+            LIMIT ?
+          `,
+        )
+        .all(...ids, Math.max(1, Math.min(limit, 10000)))
+        .map((row) => {
+          const audit = normalizeJsonRecordRow(row, ['findings', 'source_links', 'raw_snapshot']);
+          return {
+            ...audit,
+            has_contact_form: Boolean(audit.has_contact_form),
+            has_phone_link: Boolean(audit.has_phone_link),
+            has_booking_link: Boolean(audit.has_booking_link),
+            has_mobile_viewport: Boolean(audit.has_mobile_viewport),
+          };
+        });
+    },
+
+    async insertGeneratedReport(report) {
+      insertGeneratedReportStatement.run(serializeJsonRecord(report, ['personalization']));
+      return report;
+    },
+
+    async listGeneratedReportsForSubmission(submissionId, limit = 10) {
+      return database
+        .prepare('SELECT * FROM generated_reports WHERE submission_id = ? ORDER BY created_at DESC LIMIT ?')
+        .all(submissionId, Math.max(1, Math.min(limit, 100)))
+        .map((row) => normalizeJsonRecordRow(row, ['personalization']));
+    },
+
+    async listGeneratedReportsForSubmissions(submissionIds = [], limit = 5000) {
+      const ids = normalizeList(submissionIds);
+
+      if (ids.length === 0) {
+        return [];
+      }
+
+      return database
+        .prepare(
+          `
+            SELECT * FROM generated_reports
+            WHERE submission_id IN (${placeholders(ids.length)})
+            ORDER BY created_at DESC
+            LIMIT ?
+          `,
+        )
+        .all(...ids, Math.max(1, Math.min(limit, 10000)))
+        .map((row) => normalizeJsonRecordRow(row, ['personalization']));
+    },
+
+    async insertOutreachMessage(message) {
+      insertOutreachMessageStatement.run(serializeJsonRecord(message, ['metadata']));
+      return message;
+    },
+
+    async updateOutreachMessage(id, values) {
+      updateRecord(
+        'outreach_messages',
+        id,
+        values,
+        ['updated_at', 'status', 'scheduled_at', 'sent_at', 'provider_message_id', 'error', 'metadata'],
+        ['metadata'],
+      );
+
+      const row = database.prepare('SELECT * FROM outreach_messages WHERE id = ?').get(id);
+      return normalizeJsonRecordRow(row, ['metadata']);
+    },
+
+    async claimOutreachMessageForSending(id, { now = new Date().toISOString() } = {}) {
+      const row = database
+        .prepare(
+          `
+            UPDATE outreach_messages
+            SET updated_at = ?, status = 'sending'
+            WHERE id = ? AND status = 'scheduled'
+            RETURNING *
+          `,
+        )
+        .get(now, id);
+
+      return normalizeJsonRecordRow(row, ['metadata']);
+    },
+
+    async listOutreachMessagesForSubmission(submissionId, limit = 20) {
+      return database
+        .prepare('SELECT * FROM outreach_messages WHERE submission_id = ? ORDER BY scheduled_at ASC, created_at ASC LIMIT ?')
+        .all(submissionId, Math.max(1, Math.min(limit, 200)))
+        .map((row) => normalizeJsonRecordRow(row, ['metadata']));
+    },
+
+    async listOutreachMessagesForSubmissions(submissionIds = [], limit = 5000) {
+      const ids = normalizeList(submissionIds);
+
+      if (ids.length === 0) {
+        return [];
+      }
+
+      return database
+        .prepare(
+          `
+            SELECT * FROM outreach_messages
+            WHERE submission_id IN (${placeholders(ids.length)})
+            ORDER BY scheduled_at ASC, created_at ASC
+            LIMIT ?
+          `,
+        )
+        .all(...ids, Math.max(1, Math.min(limit, 10000)))
+        .map((row) => normalizeJsonRecordRow(row, ['metadata']));
+    },
+
+    async listDueOutreachMessages({ now = new Date().toISOString(), limit = 25 } = {}) {
+      return database
+        .prepare(
+          `
+            SELECT * FROM outreach_messages
+            WHERE status = 'scheduled' AND scheduled_at IS NOT NULL AND scheduled_at <= ?
+            ORDER BY scheduled_at ASC
+            LIMIT ?
+          `,
+        )
+        .all(now, Math.max(1, Math.min(limit, 250)))
+        .map((row) => normalizeJsonRecordRow(row, ['metadata']));
+    },
+
+    async countSentOutreachMessagesSince(sinceIso) {
+      return (
+        database
+          .prepare(
+            `
+              SELECT COUNT(*) AS count FROM outreach_messages
+              WHERE (status = 'sent' AND sent_at IS NOT NULL AND sent_at >= ?)
+                OR (status = 'sending' AND updated_at >= ?)
+            `,
+          )
+          .get(sinceIso, sinceIso)?.count || 0
+      );
+    },
+
+    async insertWebsiteVisit(visit) {
+      insertWebsiteVisitStatement.run(serializeJsonRecord(visit, ['metadata']));
+      return visit;
+    },
+
+    async listWebsiteVisitsForSubmission(submissionId, limit = 50) {
+      return database
+        .prepare('SELECT * FROM website_visits WHERE submission_id = ? ORDER BY created_at DESC LIMIT ?')
+        .all(submissionId, Math.max(1, Math.min(limit, 500)))
+        .map((row) => normalizeJsonRecordRow(row, ['metadata']));
+    },
+
+    async listWebsiteVisitsForSubmissions(submissionIds = [], limit = 5000) {
+      const ids = normalizeList(submissionIds);
+
+      if (ids.length === 0) {
+        return [];
+      }
+
+      return database
+        .prepare(
+          `
+            SELECT * FROM website_visits
+            WHERE submission_id IN (${placeholders(ids.length)})
+            ORDER BY created_at DESC
+            LIMIT ?
+          `,
+        )
+        .all(...ids, Math.max(1, Math.min(limit, 10000)))
+        .map((row) => normalizeJsonRecordRow(row, ['metadata']));
+    },
+
+    async insertEmailSuppression(suppression) {
+      insertEmailSuppressionStatement.run(serializeJsonRecord(suppression, ['metadata']));
+      return suppression;
+    },
+
+    async getEmailSuppression(email) {
+      const normalizedEmail = String(email || '').trim().toLowerCase();
+
+      if (!normalizedEmail) {
+        return null;
+      }
+
+      const row = database.prepare('SELECT * FROM email_suppressions WHERE email = ? ORDER BY created_at DESC LIMIT 1').get(normalizedEmail);
+      return normalizeJsonRecordRow(row, ['metadata']);
+    },
+
+  };
+}

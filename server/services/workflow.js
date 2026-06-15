@@ -1,6 +1,6 @@
 import { getConfig } from '../config.js';
 
-export const leadTypes = ['seller', 'broker', 'referral', 'advisor', 'other'];
+export const leadTypes = ['prospect', 'client', 'referral', 'partner', 'other'];
 export const priorities = ['low', 'normal', 'medium', 'high', 'urgent'];
 export const followUpStates = ['needs-response', 'scheduled', 'waiting-on-owner', 'completed'];
 export const sbaEligibilityOptions = ['yes', 'no', 'unknown'];
@@ -11,53 +11,53 @@ function addHours(timestamp, hours) {
 
 function buildPromptLine({ counterpart, company, status, followUpState, hasPendingUploadRequest }) {
   if (status === 'new') {
-    return `Send an initial reply to the ${counterpart}, confirm confidentiality, and propose a short introductory call about ${company}.`;
+    return `Send an initial reply to the ${counterpart}, reference their website, and propose a short audit review call about ${company}.`;
   }
 
   if (followUpState === 'waiting-on-owner') {
-    return `Send a brief check-in on ${company}, restate interest, and ask whether the ${counterpart} has any questions or timeline updates.`;
+    return `Send a brief check-in on ${company}, restate the recommended next step, and ask whether the ${counterpart} has any questions or timeline updates.`;
   }
 
   if (hasPendingUploadRequest) {
-    return `Follow up on the secure document request for ${company} and ask whether the ${counterpart} needs anything from you before sharing materials.`;
+    return `Follow up on the secure onboarding request for ${company} and ask whether the ${counterpart} needs help sharing website assets or account details.`;
   }
 
-  if (counterpart === 'broker') {
-    return `Check in with the broker on ${company}, ask about timing, and confirm whether there is a clear next step or additional information to review.`;
+  if (counterpart === 'partner') {
+    return `Check in with the partner on ${company}, ask about timing, and confirm whether there is a clear next step or additional information to review.`;
   }
 
-  return `Reach back out on ${company} with a concise update, confirm continued interest, and suggest the next concrete step.`;
+  return `Reach back out on ${company} with a concise audit or support update, confirm continued interest, and suggest the next concrete step.`;
 }
 
 export function normalizeRoleToLeadType(role) {
   const normalized = String(role || '').trim().toLowerCase();
 
-  if (normalized.includes('broker') || normalized.includes('intermediary')) {
-    return 'broker';
+  if (normalized.includes('client') || normalized.includes('customer')) {
+    return 'client';
+  }
+
+  if (normalized.includes('agency') || normalized.includes('consultant') || normalized.includes('partner')) {
+    return 'partner';
   }
 
   if (normalized.includes('referral')) {
     return 'referral';
   }
 
-  if (normalized.includes('advisor')) {
-    return 'advisor';
-  }
-
-  if (normalized.includes('owner') || normalized.includes('seller')) {
-    return 'seller';
+  if (normalized.includes('owner') || normalized.includes('manager') || normalized.includes('prospect')) {
+    return 'prospect';
   }
 
   return 'other';
 }
 
-export function normalizeLeadType(value, fallback = 'seller') {
+export function normalizeLeadType(value, fallback = 'prospect') {
   const normalized = String(value || '')
     .trim()
     .toLowerCase();
 
-  if (normalized === 'owner') {
-    return 'seller';
+  if (['owner', 'business-owner', 'seller', 'broker', 'advisor'].includes(normalized)) {
+    return normalized === 'broker' || normalized === 'advisor' ? 'partner' : 'prospect';
   }
 
   return leadTypes.includes(normalized) ? normalized : fallback;
@@ -70,14 +70,15 @@ export function deriveWorkflowDefaults({ role, source, submittedAt }) {
   const tags = ['inbound', sourceLabel];
   let priority = 'normal';
 
-  if (leadType === 'seller') {
+  if (leadType === 'prospect') {
     priority = 'high';
-    tags.push('seller');
-  } else if (leadType === 'broker' || leadType === 'referral') {
+    tags.push('prospect');
+  } else if (leadType === 'client') {
+    priority = 'urgent';
+    tags.push('client');
+  } else if (leadType === 'partner' || leadType === 'referral') {
     priority = 'medium';
     tags.push(leadType);
-  } else if (leadType === 'advisor') {
-    priority = 'medium';
   }
 
   return {
@@ -126,11 +127,11 @@ export function buildFollowUpPrompt(submission, nowValue = new Date()) {
     return null;
   }
 
-  const leadType = normalizeLeadType(submission.lead_type, 'seller');
+  const leadType = normalizeLeadType(submission.lead_type, 'prospect');
   const company = String(
     submission.company || submission.seller_name || submission.broker_name || submission.name || 'this opportunity',
   ).trim();
-  const counterpart = leadType === 'broker' ? 'broker' : leadType === 'advisor' ? 'advisor' : 'seller';
+  const counterpart = leadType === 'partner' ? 'partner' : leadType === 'client' ? 'client' : 'prospect';
   const nextActionTimestamp = Date.parse(submission.next_action_at || '');
   const hasNextAction = Number.isFinite(nextActionTimestamp);
   const now = nowValue instanceof Date ? nowValue.getTime() : Date.parse(nowValue);

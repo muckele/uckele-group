@@ -28,7 +28,7 @@ export default function SecureDocumentsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [ndaAccepted, setNdaAccepted] = useState(false);
-  const [documentType, setDocumentType] = useState('financials');
+  const [documentType, setDocumentType] = useState('website-assets');
   const [note, setNote] = useState('');
   const [files, setFiles] = useState([]);
   const [submitting, setSubmitting] = useState(false);
@@ -126,12 +126,12 @@ export default function SecureDocumentsPage() {
 
   return (
     <>
-      <Seo description="Secure document handoff for Uckele Group." keywords="secure document upload" noindex title="Secure Documents | Uckele Group" />
+      <Seo description="Secure onboarding asset handoff for Uckele Group." keywords="secure onboarding upload" noindex title="Secure Upload | Uckele Group" />
 
       <PageHero
-        description="Use this page to share sensitive business materials through a private upload request. This page is intended for confidential seller documents only."
-        eyebrow="Secure Document Handoff"
-        title="Confidential uploads for business review"
+        description="Use this page to share website assets, account exports, brand files, and onboarding materials through a private upload request."
+        eyebrow="Secure Onboarding Handoff"
+        title="Confidential uploads for website support"
       />
 
       <section className="section-shell mt-10 pb-8">
@@ -163,7 +163,7 @@ export default function SecureDocumentsPage() {
                 <div className="flex items-start gap-3">
                   <ShieldCheck className="mt-1 h-5 w-5 shrink-0 text-moss" />
                   <p className="text-sm leading-7 text-ink/74">
-                    By uploading documents here, you confirm they are being shared in confidence for business review purposes only. This request records NDA acknowledgement when files are submitted.
+                    By uploading files here, you confirm they are being shared in confidence for website support, audit, or onboarding purposes only. This request records confidentiality acknowledgement when files are submitted.
                   </p>
                 </div>
               </div>
@@ -191,9 +191,9 @@ export default function SecureDocumentsPage() {
                   <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-clay/12 text-clay">
                     <FileUp className="h-5 w-5" />
                   </div>
-                  <h2 className="mt-5 text-2xl font-semibold text-ink">Upload documents</h2>
+                  <h2 className="mt-5 text-2xl font-semibold text-ink">Upload onboarding files</h2>
                   <p className="mt-3 text-base leading-7 text-ink/72">
-                    Typical files include a teaser, CIM, recent financials, customer summaries, contracts, or other supporting materials relevant to the conversation.
+                    Typical files include brand assets, website photos, service lists, analytics exports, DNS notes, CMS instructions, marketing materials, or current website copy.
                   </p>
                 </div>
 
@@ -208,12 +208,13 @@ export default function SecureDocumentsPage() {
                     onChange={(event) => setDocumentType(event.target.value)}
                     value={documentType}
                   >
-                    <option value="financials">Financials</option>
-                    <option value="teaser">Teaser</option>
-                    <option value="cim">CIM / overview</option>
-                    <option value="tax-returns">Tax returns</option>
-                    <option value="contracts">Contracts</option>
-                    <option value="customer-summary">Customer summary</option>
+                    <option value="website-assets">Website assets</option>
+                    <option value="brand-assets">Brand assets</option>
+                    <option value="domain-dns">Domain / DNS notes</option>
+                    <option value="cms-access">CMS / platform instructions</option>
+                    <option value="analytics">Analytics / Search Console exports</option>
+                    <option value="marketing-materials">Marketing materials</option>
+                    <option value="contracts">Agreements / contracts</option>
                     <option value="other">Other</option>
                   </select>
                 </label>
@@ -240,7 +241,7 @@ export default function SecureDocumentsPage() {
 
                 <label className="flex items-start gap-3 rounded-[24px] border border-line/80 bg-fog/70 px-4 py-4 text-sm leading-7 text-ink/74">
                   <input checked={ndaAccepted} className="mt-1 h-4 w-4" onChange={(event) => setNdaAccepted(event.target.checked)} type="checkbox" />
-                  <span>I confirm these documents are being shared confidentially for business review and I acknowledge the NDA / confidentiality terms associated with this request.</span>
+                  <span>I confirm these files are being shared confidentially for website support, audit, or onboarding work and I acknowledge the confidentiality terms associated with this request.</span>
                 </label>
 
                 <button
@@ -248,7 +249,7 @@ export default function SecureDocumentsPage() {
                   disabled={submitting}
                   type="submit"
                 >
-                  {submitting ? 'Uploading...' : 'Upload Documents'}
+                  {submitting ? 'Uploading...' : 'Upload Files'}
                 </button>
               </form>
             </Reveal>

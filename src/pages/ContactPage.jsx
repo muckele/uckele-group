@@ -1,4 +1,4 @@
-import { ArrowRight, Mail, Phone, ShieldCheck } from 'lucide-react';
+import { ArrowRight, CalendarDays, Mail, ShieldCheck } from 'lucide-react';
 import ButtonLink from '../components/ButtonLink';
 import ContactForm from '../components/ContactForm';
 import LinkedInIcon from '../components/LinkedInIcon';
@@ -10,6 +10,10 @@ import { contactPage, seoContent } from '../content/siteContent';
 
 const sideIcons = [ShieldCheck, Mail];
 
+function externalLinkProps(href) {
+  return /^https?:\/\//i.test(href || '') ? { rel: 'noreferrer', target: '_blank' } : {};
+}
+
 export default function ContactPage() {
   return (
     <>
@@ -20,7 +24,7 @@ export default function ContactPage() {
       <section className="section-shell mt-10">
         <div className="grid gap-8 lg:grid-cols-[1.15fr_0.85fr]">
           <Reveal>
-            <SectionHeading description={contactPage.contactIntro} eyebrow="Confidential Conversations" title="Share the basics and I’ll take it from there" />
+            <SectionHeading description={contactPage.contactIntro} eyebrow="Website Audit Requests" title="Share the basics and I’ll take it from there" />
             <div className="mt-6" id="contact-form">
               <ContactForm />
             </div>
@@ -55,7 +59,7 @@ export default function ContactPage() {
                             <LinkedInIcon className="h-5 w-5" />
                           </a>
                         ) : item.href ? (
-                          <a className="transition hover:text-moss" href={item.href}>
+                          <a className="transition hover:text-moss" href={item.href} {...externalLinkProps(item.href)}>
                             <span className="font-semibold text-ink">{item.label}:</span> {item.value}
                           </a>
                         ) : (
@@ -72,13 +76,18 @@ export default function ContactPage() {
 
             <Reveal className="panel p-7 sm:p-8" delay={180}>
               <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-clay/12 text-clay">
-                <Phone className="h-5 w-5" />
+                <CalendarDays className="h-5 w-5" />
               </div>
-              <h2 className="mt-5 text-2xl font-semibold text-ink">{contactPage.brokerNote.title}</h2>
-              <p className="mt-4 text-base leading-7 text-ink/72">{contactPage.brokerNote.description}</p>
-              <ButtonLink className="mt-6" href="/criteria" variant="secondary">
-                Review Criteria <ArrowRight className="h-4 w-4" />
-              </ButtonLink>
+              <h2 className="mt-5 text-2xl font-semibold text-ink">{contactPage.callNote.title}</h2>
+              <p className="mt-4 text-base leading-7 text-ink/72">{contactPage.callNote.description}</p>
+              <div className="mt-6 flex flex-wrap gap-3">
+                <ButtonLink href={contactPage.callNote.primaryCta.href}>
+                  {contactPage.callNote.primaryCta.label} <ArrowRight className="h-4 w-4" />
+                </ButtonLink>
+                <ButtonLink href={contactPage.callNote.secondaryCta.href} variant="secondary">
+                  {contactPage.callNote.secondaryCta.label}
+                </ButtonLink>
+              </div>
             </Reveal>
           </div>
         </div>

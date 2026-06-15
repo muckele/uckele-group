@@ -305,7 +305,7 @@ async function recordTrackedEmailDelivery(message, result) {
   }
 }
 
-async function sendMessage(message) {
+export async function sendMessage(message) {
   const config = getConfig();
   let result;
 
@@ -338,15 +338,20 @@ async function sendMessage(message) {
 }
 
 function buildSubmissionMessage(submission) {
-  const subject = `New acquisition inquiry from ${submission.name}`;
+  const serviceInterest = submission.prospectus_url || submission.metadata?.serviceInterest || 'Not provided';
+  const timeline = submission.metadata?.timeline || 'Not provided';
+  const subject = `New website audit request from ${submission.name}`;
   const text = [
-    'New inbound acquisition inquiry',
+    'New inbound website audit request',
     '',
     `Name: ${submission.name}`,
     `Email: ${submission.email}`,
     `Phone: ${submission.phone || 'Not provided'}`,
     `Company: ${submission.company || 'Not provided'}`,
+    `Website: ${submission.business_website || 'Not provided'}`,
     `Role: ${submission.role || 'Not provided'}`,
+    `Service interest: ${serviceInterest}`,
+    `Timeline: ${timeline}`,
     `Lead type: ${submission.lead_type}`,
     `Priority: ${submission.priority}`,
     `Source: ${submission.source}`,
@@ -359,13 +364,16 @@ function buildSubmissionMessage(submission) {
 
   const html = `
     <div style="font-family: Arial, sans-serif; color: #18211D; line-height: 1.6;">
-      <h2 style="margin-bottom: 16px;">New inbound acquisition inquiry</h2>
+      <h2 style="margin-bottom: 16px;">New inbound website audit request</h2>
       <table cellpadding="0" cellspacing="0" style="border-collapse: collapse;">
         <tr><td style="padding: 4px 12px 4px 0;"><strong>Name</strong></td><td>${escapeHtml(submission.name)}</td></tr>
         <tr><td style="padding: 4px 12px 4px 0;"><strong>Email</strong></td><td>${escapeHtml(submission.email)}</td></tr>
         <tr><td style="padding: 4px 12px 4px 0;"><strong>Phone</strong></td><td>${escapeHtml(submission.phone || 'Not provided')}</td></tr>
         <tr><td style="padding: 4px 12px 4px 0;"><strong>Company</strong></td><td>${escapeHtml(submission.company || 'Not provided')}</td></tr>
+        <tr><td style="padding: 4px 12px 4px 0;"><strong>Website</strong></td><td>${escapeHtml(submission.business_website || 'Not provided')}</td></tr>
         <tr><td style="padding: 4px 12px 4px 0;"><strong>Role</strong></td><td>${escapeHtml(submission.role || 'Not provided')}</td></tr>
+        <tr><td style="padding: 4px 12px 4px 0;"><strong>Service interest</strong></td><td>${escapeHtml(serviceInterest)}</td></tr>
+        <tr><td style="padding: 4px 12px 4px 0;"><strong>Timeline</strong></td><td>${escapeHtml(timeline)}</td></tr>
         <tr><td style="padding: 4px 12px 4px 0;"><strong>Lead type</strong></td><td>${escapeHtml(submission.lead_type)}</td></tr>
         <tr><td style="padding: 4px 12px 4px 0;"><strong>Priority</strong></td><td>${escapeHtml(submission.priority)}</td></tr>
         <tr><td style="padding: 4px 12px 4px 0;"><strong>Source</strong></td><td>${escapeHtml(submission.source)}</td></tr>
@@ -383,7 +391,7 @@ function buildSubmissionMessage(submission) {
     to: getConfig().delivery.fallbackRecipient,
     replyTo: submission.email || getConfig().delivery.resendReplyTo || '',
     subject,
-    headline: 'New inbound acquisition inquiry',
+    headline: 'New inbound website audit request',
     text,
     html,
     formspreePayload: {
@@ -391,7 +399,10 @@ function buildSubmissionMessage(submission) {
       email: submission.email,
       phone: submission.phone,
       company: submission.company,
+      business_website: submission.business_website,
       role: submission.role,
+      service_interest: serviceInterest,
+      timeline,
       message: submission.message,
       source: submission.source,
       lead_type: submission.lead_type,
@@ -404,200 +415,6 @@ function buildSubmissionMessage(submission) {
 
 export async function deliverSubmission(submission) {
   return sendMessage(buildSubmissionMessage(submission));
-}
-
-function formatMoney(value) {
-  return Number.isFinite(value)
-    ? new Intl.NumberFormat('en-US', {
-        style: 'currency',
-        currency: 'USD',
-        maximumFractionDigits: 0,
-      }).format(value)
-    : 'Not disclosed';
-}
-
-function dealHunterMetaLine(deal) {
-  return [
-    deal.industry,
-    deal.location,
-    deal.annualProfit ? `Profit ${formatMoney(deal.annualProfit)}` : '',
-    deal.askingPrice ? `Ask ${formatMoney(deal.askingPrice)}` : '',
-    deal.profitMultiple ? `${deal.profitMultiple}x profit` : '',
-  ]
-    .filter(Boolean)
-    .join(' | ');
-}
-
-function dealHunterDealHtml(deal, { tone = 'success', showRemoveReasons = false } = {}) {
-  const border = tone === 'danger' ? '#FECACA' : tone === 'warning' ? '#FDE68A' : '#C9D8CF';
-  const background = tone === 'danger' ? '#FEF2F2' : tone === 'warning' ? '#FFFBEB' : '#F4F8F5';
-  const badgeColor = tone === 'danger' ? '#B91C1C' : tone === 'warning' ? '#92400E' : '#284638';
-  const detailItems = showRemoveReasons ? deal.removeReasons || deal.concerns || [] : deal.strengths || [];
-  const questionItems = deal.questions || [];
-
-  return `
-    <div style="margin: 18px 0; border: 1px solid ${border}; border-radius: 16px; background: ${background}; padding: 18px;">
-      <div style="margin: 0 0 8px;">
-        <span style="display: inline-block; border-radius: 999px; background: #FFFFFF; color: ${badgeColor}; font-size: 12px; font-weight: 800; padding: 6px 10px;">Score ${escapeHtml(String(deal.score ?? 0))}</span>
-        <span style="display: inline-block; margin-left: 8px; color: #51615A; font-size: 12px; font-weight: 700;">${escapeHtml(deal.sourceName || 'Deal source')}</span>
-      </div>
-      <h3 style="margin: 0 0 8px; color: #18211D; font-size: 18px; line-height: 1.35;">${escapeHtml(deal.name || 'Unnamed business')}</h3>
-      ${dealHunterMetaLine(deal) ? `<p style="margin: 0 0 12px; color: #33443B; font-size: 14px; line-height: 1.55;">${escapeHtml(dealHunterMetaLine(deal))}</p>` : ''}
-      ${deal.recommendation ? `<p style="margin: 0 0 12px; color: #18211D; font-size: 14px; line-height: 1.55;"><strong>Note:</strong> ${escapeHtml(deal.recommendation)}</p>` : ''}
-      ${
-        detailItems.length > 0
-          ? `<ul style="margin: 0 0 12px 18px; padding: 0; color: #33443B; font-size: 14px; line-height: 1.55;">${detailItems
-              .slice(0, 4)
-              .map((item) => `<li>${escapeHtml(item)}</li>`)
-              .join('')}</ul>`
-          : ''
-      }
-      ${
-        questionItems.length > 0
-          ? `<p style="margin: 12px 0 6px; color: #18211D; font-size: 13px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;">Questions to ask</p><ul style="margin: 0 0 12px 18px; padding: 0; color: #33443B; font-size: 14px; line-height: 1.55;">${questionItems
-              .slice(0, 3)
-              .map((item) => `<li>${escapeHtml(item)}</li>`)
-              .join('')}</ul>`
-          : ''
-      }
-      ${deal.listingUrl ? `<a href="${escapeHtml(deal.listingUrl)}" style="color: #284638; font-size: 14px; font-weight: 800; text-decoration: underline;">View listing</a>` : ''}
-    </div>
-  `;
-}
-
-function dealHunterSectionHtml(title, intro, deals, options = {}) {
-  if (!Array.isArray(deals) || deals.length === 0) {
-    return '';
-  }
-
-  return `
-    <div style="margin: 26px 0 0;">
-      <p style="margin: 0 0 8px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase;">${escapeHtml(title)}</p>
-      ${intro ? `<p style="margin: 0 0 12px; color: #33443B; font-size: 15px; line-height: 1.6;">${escapeHtml(intro)}</p>` : ''}
-      ${deals.map((deal) => dealHunterDealHtml(deal, options)).join('')}
-    </div>
-  `;
-}
-
-export function buildDailyDealHunterEmail({ to, review = {} } = {}) {
-  const generatedLabel = review.generatedAt ? new Date(review.generatedAt).toLocaleString() : new Date().toLocaleString();
-  const sourceSummary = (review.sources || [])
-    .map((source) => `${source.name}: ${source.fetched ? `${source.rowCount || 0} rows` : `failed (${source.error || 'unknown error'})`}`)
-    .join('\n');
-  const recommendations = review.criteriaRecommendations || [];
-  const bodyHtml = `
-    ${dealHunterSectionHtml(
-      'Newly Seen Fits',
-      'These listings were not in the prior Deal Hunter history and deserve the first look today.',
-      review.newlySeenMatches || [],
-      { tone: 'success' },
-    )}
-    ${dealHunterSectionHtml(
-      'High-Fit Deals',
-      'These are the strongest matches for recession-resistant, AI-resistant, long-term small business ownership.',
-      review.qualified || [],
-      { tone: 'success' },
-    )}
-    ${dealHunterSectionHtml(
-      'Watchlist',
-      'These may fit if broker diligence confirms recurring revenue, customer diversity, management depth, and financeable terms.',
-      review.watchlist || [],
-      { tone: 'warning' },
-    )}
-    ${dealHunterSectionHtml(
-      'Remove From Next Update',
-      'These should be excluded from tomorrow\'s source list because they conflict with the buying strategy or score too poorly.',
-      review.removalCandidates || [],
-      { tone: 'danger', showRemoveReasons: true },
-    )}
-    ${
-      recommendations.length > 0
-        ? `<div style="margin: 26px 0 0; border-top: 1px solid #E3D9CA; padding-top: 18px;"><p style="margin: 0 0 8px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase;">Criteria Notes</p><ul style="margin: 0 0 0 18px; padding: 0; color: #33443B; font-size: 14px; line-height: 1.6;">${recommendations
-            .map((item) => `<li>${escapeHtml(item)}</li>`)
-            .join('')}</ul></div>`
-        : ''
-    }
-  `;
-	  const html = brandedEmailHtml({
-	    preheader: `${review.totals?.newMatches || 0} new fit(s), ${review.totals?.qualified || 0} high-fit deals, and ${review.totals?.removalCandidates || 0} removals from today\'s deal sources.`,
-    eyebrow: 'Daily Deal Hunter',
-    title: 'Daily acquisition deal review',
-    paragraphs: [
-      `Generated ${generatedLabel}. Reviewed ${review.totals?.reviewedDeals || 0} recent deals from ${review.sources?.length || 0} source(s).`,
-      'The scoring profile favors essential B2B and field-service companies with recurring or repeat revenue, recession resistance, AI resistance, and financeable acquisition size. Management in place is preferred but not required.',
-    ],
-    bodyHtml,
-    details: [
-	      { label: 'High-fit deals', value: String(review.totals?.qualified || 0) },
-	      { label: 'New fit(s)', value: String(review.totals?.newMatches || 0) },
-	      { label: 'Watchlist', value: String(review.totals?.watchlist || 0) },
-      { label: 'Remove flags', value: String(review.totals?.removalCandidates || 0) },
-      { label: 'Lookback', value: `${review.lookbackDays || 0} day(s)` },
-    ],
-  });
-  const text = [
-    'Daily acquisition deal review',
-    '',
-    `Generated: ${generatedLabel}`,
-    `Reviewed deals: ${review.totals?.reviewedDeals || 0}`,
-    '',
-	    'Sources:',
-	    sourceSummary || 'No sources configured.',
-	    '',
-	    'Newly seen fits:',
-	    ...(review.newlySeenMatches || []).flatMap((deal, index) => [
-	      `${index + 1}. ${deal.name} (${deal.score}/100)`,
-	      dealHunterMetaLine(deal),
-	      deal.recommendation || '',
-	      deal.listingUrl || '',
-	      '',
-	    ]),
-	    '',
-	    'High-fit deals:',
-    ...(review.qualified || []).flatMap((deal, index) => [
-      `${index + 1}. ${deal.name} (${deal.score}/100)`,
-      dealHunterMetaLine(deal),
-      deal.recommendation || '',
-      deal.listingUrl || '',
-      '',
-    ]),
-    'Watchlist:',
-    ...(review.watchlist || []).flatMap((deal, index) => [
-      `${index + 1}. ${deal.name} (${deal.score}/100)`,
-      dealHunterMetaLine(deal),
-      deal.recommendation || '',
-      deal.listingUrl || '',
-      '',
-    ]),
-    'Remove from next update:',
-    ...(review.removalCandidates || []).flatMap((deal, index) => [
-      `${index + 1}. ${deal.name} (${deal.score}/100)`,
-      (deal.removeReasons || deal.concerns || []).join('; '),
-      deal.listingUrl || '',
-      '',
-    ]),
-    'Criteria notes:',
-    ...recommendations.map((item) => `- ${item}`),
-  ].join('\n');
-
-	  return {
-		    kind: 'daily-deal-hunter',
-		    to,
-		    subject: `Daily deal review: ${review.totals?.newMatches || 0} new fit, ${review.totals?.removalCandidates || 0} remove`,
-    headline: 'Daily acquisition deal review',
-    text,
-    html,
-    tags: [{ name: 'source', value: 'daily-deal-hunter' }],
-    tracking: {
-      source: 'daily-deal-hunter',
-      generatedAt: review.generatedAt || '',
-      totals: review.totals || {},
-    },
-  };
-}
-
-export async function sendDailyDealHunterEmail(options) {
-  return sendMessage(buildDailyDealHunterEmail(options));
 }
 
 export async function sendAdminMagicLinkEmail({ to, magicLinkUrl, expiresAt }) {
@@ -635,30 +452,30 @@ export async function sendAdminMagicLinkEmail({ to, magicLinkUrl, expiresAt }) {
 
 export async function sendSecureUploadInviteEmail({ to, contactName, uploadUrl, expiresAt, submission, note }) {
   const expiryLabel = new Date(expiresAt).toLocaleDateString();
-  const subject = 'Secure document request from Uckele Group';
+  const subject = 'Secure onboarding upload request from Uckele Group';
   const text = [
     `Hello ${contactName || 'there'},`,
     '',
-    'A secure document upload link has been prepared for your business transition conversation with Uckele Group.',
+    'A secure upload link has been prepared for your website support or onboarding conversation with Uckele Group.',
     `Upload link: ${uploadUrl}`,
     `This link expires on: ${expiryLabel}`,
     '',
-    note ? `Message from the buyer:\n${note}\n` : '',
-    'You can use the link to review the confidentiality acknowledgement and share documents such as a teaser, CIM, financials, or supporting files.',
+    note ? `Message from Mathew:\n${note}\n` : '',
+    'You can use the link to review the confidentiality acknowledgement and share files such as website assets, brand files, service lists, analytics exports, or platform notes.',
     '',
     `Reference: ${submission.company || submission.name}`,
   ].join('\n');
   const html = `
     <div style="font-family: Arial, sans-serif; color: #18211D; line-height: 1.6;">
-      <h2>Secure document request</h2>
+      <h2>Secure onboarding upload request</h2>
       <p>Hello ${escapeHtml(contactName || 'there')},</p>
-      <p>A secure document upload link has been prepared for your conversation with Uckele Group.</p>
+      <p>A secure upload link has been prepared for your website support or onboarding conversation with Uckele Group.</p>
       ${note ? `<p><strong>Message:</strong> ${escapeHtml(note)}</p>` : ''}
       <p style="margin: 24px 0;">
         <a href="${escapeHtml(uploadUrl)}" style="display: inline-block; background: #284638; color: #FFFFFF; text-decoration: none; padding: 12px 18px; border-radius: 999px; font-weight: 700;">Open secure upload</a>
       </p>
       <p>This link expires on <strong>${escapeHtml(expiryLabel)}</strong>.</p>
-      <p>You can use it to share files such as a teaser, CIM, financials, or supporting transition documents.</p>
+      <p>You can use it to share website assets, brand files, service lists, analytics exports, platform notes, or other onboarding materials.</p>
     </div>
   `;
 
@@ -666,7 +483,7 @@ export async function sendSecureUploadInviteEmail({ to, contactName, uploadUrl, 
     kind: 'secure-upload-invite',
     to,
     subject,
-    headline: 'Secure document request',
+    headline: 'Secure onboarding upload request',
     text,
     html,
     tags: [

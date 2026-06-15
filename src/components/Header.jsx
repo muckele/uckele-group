@@ -1,7 +1,7 @@
 import { Menu, X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Link, NavLink, useLocation } from 'react-router-dom';
-import { navigation } from '../content/siteContent';
+import { navigation, siteConfig } from '../content/siteContent';
 import ButtonLink from './ButtonLink';
 import LogoMark from './LogoMark';
 
@@ -17,6 +17,9 @@ export default function Header() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [scrolled, setScrolled] = useState(false);
   const location = useLocation();
+  const headerCta = siteConfig.schedulingUrl
+    ? { label: 'Book A Call', href: siteConfig.schedulingUrl }
+    : siteConfig.bookingCta;
 
   useEffect(() => {
     setMenuOpen(false);
@@ -55,7 +58,7 @@ export default function Header() {
           </nav>
 
           <div className="hidden lg:block">
-            <ButtonLink href="/contact">Start A Conversation</ButtonLink>
+            <ButtonLink href={headerCta.href}>{headerCta.label}</ButtonLink>
           </div>
 
           <button
@@ -90,8 +93,8 @@ export default function Header() {
             </NavLink>
           ))}
 
-          <ButtonLink className="mt-3" href="/contact">
-            Start A Conversation
+          <ButtonLink className="mt-3" href={headerCta.href}>
+            {headerCta.label}
           </ButtonLink>
         </div>
       </div>

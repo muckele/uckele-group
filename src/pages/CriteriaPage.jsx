@@ -1,10 +1,10 @@
-import { ArrowDownToLine, ArrowRight, BriefcaseBusiness, CircleDollarSign, Compass, MapPinned } from 'lucide-react';
+import { ArrowRight, BriefcaseBusiness, CircleDollarSign, Compass, MapPinned } from 'lucide-react';
 import ButtonLink from '../components/ButtonLink';
 import PageHero from '../components/PageHero';
 import Reveal from '../components/Reveal';
 import SectionHeading from '../components/SectionHeading';
 import Seo from '../components/Seo';
-import { criteriaPage, seoContent, siteConfig } from '../content/siteContent';
+import { criteriaPage, seoContent } from '../content/siteContent';
 
 const detailIcons = [BriefcaseBusiness, MapPinned, CircleDollarSign, Compass];
 
@@ -76,19 +76,19 @@ export default function CriteriaPage() {
         <Reveal className="panel px-7 py-10 sm:px-10 sm:py-12">
           <div className="flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
             <div className="max-w-2xl">
-              <span className="eyebrow">Downloadable Summary</span>
-              <h2 className="mt-5 font-display text-3xl leading-tight text-ink sm:text-[2.4rem]">One-page acquisition criteria summary</h2>
+              <span className="eyebrow">Package Guidance</span>
+              <h2 className="mt-5 font-display text-3xl leading-tight text-ink sm:text-[2.4rem]">Not sure which level fits?</h2>
               <p className="mt-4 text-base leading-7 text-ink/72">
-                A clean text version of the criteria is included so brokers, referral partners, or owners can download and share it easily.
+                Send the website URL and the main customer action you want more of. I can recommend whether you need an audit sprint, monthly care, or fuller growth support.
               </p>
             </div>
 
             <div className="flex flex-wrap gap-3">
-              <ButtonLink download href={siteConfig.downloadHref}>
-                Download Criteria <ArrowDownToLine className="h-4 w-4" />
+              <ButtonLink href="/contact">
+                Request Guidance <ArrowRight className="h-4 w-4" />
               </ButtonLink>
-              <ButtonLink href="/contact" variant="secondary">
-                Start A Conversation <ArrowRight className="h-4 w-4" />
+              <ButtonLink href="/process" variant="secondary">
+                See The Process
               </ButtonLink>
             </div>
           </div>

@@ -2,6 +2,10 @@ const publicSiteUrl = (import.meta.env.VITE_PUBLIC_SITE_URL || 'https://www.ucke
 const publicEmail = String(import.meta.env.VITE_PUBLIC_CONTACT_EMAIL || 'mathew@uckelegroup.com').trim();
 const publicPhone = String(import.meta.env.VITE_PUBLIC_CONTACT_PHONE || '914.361.9153').trim();
 const publicLinkedin = String(import.meta.env.VITE_PUBLIC_LINKEDIN_URL || 'https://www.linkedin.com/in/mathew-uckele').trim();
+const schedulingUrl = String(import.meta.env.VITE_PUBLIC_SCHEDULING_URL || '').trim();
+const bookingCta = schedulingUrl
+  ? { label: 'Book A 15-Minute Call', href: schedulingUrl }
+  : { label: 'Request An Audit', href: '/contact' };
 
 function toAbsoluteUrl(path) {
   if (!path) {
@@ -26,7 +30,7 @@ const contactDetailItems = [
     : {
         kind: 'text',
         label: 'Contact',
-        value: 'Use the contact form for a confidential reply',
+        value: 'Use the audit request form for a direct reply',
       },
   publicPhone
     ? {
@@ -34,6 +38,14 @@ const contactDetailItems = [
         label: 'Phone',
         value: publicPhone,
         href: `tel:${publicPhone.replace(/[^\d+]/g, '')}`,
+      }
+    : null,
+  schedulingUrl
+    ? {
+        kind: 'schedule',
+        label: 'Book a call',
+        value: 'Schedule online',
+        href: schedulingUrl,
       }
     : null,
   publicLinkedin
@@ -53,434 +65,452 @@ export const siteConfig = {
   email: publicEmail,
   phone: publicPhone,
   linkedin: publicLinkedin,
+  schedulingUrl,
+  bookingCta,
   contactDetailItems,
-  downloadHref: '/downloads/uckele-group-acquisition-criteria.txt',
+  downloadHref: '/downloads/uckele-group-online-presence-services.txt',
   socialImage: '/social-card.svg',
   socialImageUrl: toAbsoluteUrl('/social-card.svg'),
 };
 
 export const navigation = [
   { label: 'Home', path: '/' },
-  { label: 'About', path: '/about' },
-  { label: 'What I’m Looking For', path: '/criteria' },
-  { label: 'Why Sell To Me', path: '/why-sell-to-me' },
+  { label: 'Services', path: '/services' },
   { label: 'Process', path: '/process' },
+  { label: 'Why Partner', path: '/why-partner' },
   { label: 'FAQ', path: '/faq' },
   { label: 'Contact', path: '/contact' },
 ];
 
 export const seoContent = {
   home: {
-    title: 'Uckele Group | Long-Term Small Business Buyer',
+    title: 'Uckele Group | Online Presence Management For Local Businesses',
     description:
-      'Mathew Uckele is an individual buyer seeking to acquire and operate a strong small business for the long term with continuity, care, and respect for seller legacy.',
+      'Website updates, conversion fixes, local SEO basics, contact-flow cleanup, and monthly online presence management for service businesses.',
     keywords:
-      'small business buyer, individual business buyer, long-term business buyer, acquire my business, sell my small business, business succession buyer, operator buyer, search fund alternative, not private equity business buyer',
+      'online presence management, local business website support, website updates, local SEO, conversion optimization, small business marketing support',
   },
   about: {
-    title: 'About Mathew Uckele | Uckele Group',
+    title: 'About | Uckele Group',
     description:
-      'Learn about Mathew Uckele, his background in business administration, sales, operations, and technical problem solving, and why he wants to buy and operate one great small business.',
+      'Learn how Uckele Group helps local businesses keep websites current, improve lead flow, and manage practical online presence work without agency complexity.',
     keywords:
-      'about mathew uckele, small business buyer background, operator buyer, individual acquisition entrepreneur',
+      'about online presence manager, local business website help, small business marketing operations',
   },
   criteria: {
-    title: 'What I’m Looking For | Uckele Group',
+    title: 'Services And Packages | Uckele Group',
     description:
-      'Review the types of small businesses Mathew Uckele is looking to acquire, including stable profitable companies with recurring customer relationships and strong reputations.',
+      'Review website management, audit, update, local SEO, and monthly support packages for local businesses.',
     keywords:
-      'what business am I looking for, acquisition criteria, small business acquisition criteria, business succession buyer criteria',
+      'website management packages, local SEO packages, website update service, small business marketing packages',
   },
-  sellerConcerns: {
-    title: 'Why Sell To Me | Uckele Group',
+  whyPartner: {
+    title: 'Why Partner | Uckele Group',
     description:
-      'A thoughtful alternative to private equity for business owners who care about legacy, employees, customer relationships, and a fair transition process.',
+      'A practical website and online presence partner for local businesses that need steady updates, better contact flow, and clearer customer trust signals.',
     keywords:
-      'sell to an individual buyer, not private equity business buyer, preserve business legacy after sale, business transition buyer',
+      'why hire website manager, local business marketing partner, website maintenance partner',
   },
   process: {
-    title: 'Acquisition Process | Uckele Group',
+    title: 'Process | Uckele Group',
     description:
-      'See the respectful, straightforward acquisition process Mathew Uckele uses for confidential small business purchase conversations and smooth ownership transitions.',
+      'A simple process for auditing, fixing, and managing a local business website and online presence.',
     keywords:
-      'small business acquisition process, sell my business process, confidential business sale discussion',
+      'website audit process, online presence management process, local business website onboarding',
   },
   faq: {
     title: 'FAQ | Uckele Group',
     description:
-      'Answers to common questions business owners ask about selling to Mathew Uckele, including confidentiality, employees, timing, brokers, and deal structure.',
+      'Answers to common questions about website updates, local SEO basics, monthly retainers, audits, and online presence support.',
     keywords:
-      'small business buyer faq, sell my business faq, individual buyer questions, operator buyer faq',
+      'website management faq, local SEO support faq, small business website maintenance questions',
   },
   contact: {
-    title: 'Contact | Uckele Group',
+    title: 'Request A Website Audit | Uckele Group',
     description:
-      'Start a confidential conversation with Mathew Uckele about selling your business, succession planning, or a referral opportunity.',
+      'Request a quick website audit or book a short call to discuss website updates, lead flow, and online presence management.',
     keywords:
-      'contact small business buyer, confidential business sale conversation, broker referral small business buyer',
+      'request website audit, book website consultation, local business website help',
+  },
+  privacy: {
+    title: 'Privacy Policy | Uckele Group',
+    description:
+      'How Uckele Group handles website audit requests, CRM information, uploaded document metadata, and business contact details.',
+    keywords:
+      'privacy policy, website audit privacy, CRM data privacy',
+  },
+  terms: {
+    title: 'Terms | Uckele Group',
+    description:
+      'Service terms and expectations for website audits, online presence management, CRM support, invoices, and business outreach.',
+    keywords:
+      'service terms, website audit terms, online presence management terms',
   },
 };
 
 export const homePage = {
   hero: {
-    eyebrow: 'Long-Term Small Business Buyer',
-    title: 'A thoughtful long-term home for a great small business',
+    eyebrow: 'Online Presence Management For Local Businesses',
+    title: 'Keep your website current, trustworthy, and built to bring in leads',
     description:
-      'Uckele Group is the acquisition platform of Mathew Uckele. I am looking to acquire and operate a strong small business for the long term with continuity, care, and respect for the people who built it.',
-    primaryCta: { label: 'Start a Conversation', href: '/contact' },
-    secondaryCta: { label: 'What I’m Looking For', href: '/criteria' },
+      'I help local service businesses maintain their website, fix lead-reducing issues, improve contact flow, and keep their online presence from going stale.',
+    primaryCta: { label: 'Request A Website Audit', href: '/contact' },
+    secondaryCta: { label: 'View Services', href: '/services' },
     signals: [
-      'Direct conversation with the future owner',
-      'Long-term mindset, not a flip',
-      'Confidential and respectful outreach',
-      'Flexible transition approach',
+      'Website updates and maintenance',
+      'Contact forms, calls to action, and lead flow',
+      'Local SEO and trust-signal cleanup',
+      'Monthly support without a bloated agency process',
     ],
     founderCard: {
-      title: 'Why owners respond',
-      body: 'If you are considering succession, retirement, or simply the next chapter, this should feel like a serious but human conversation. The goal is a practical transition that protects what is already working.',
+      title: 'A practical partner for the work owners do not have time to chase',
+      body: 'Most local businesses do not need a massive marketing department. They need someone reliable to keep the website useful, make obvious fixes, and turn online interest into calls or form fills.',
       points: [
-        'Continuity for employees and customers',
-        'A calm process without games or pressure',
-        'A buyer who values relationships and reputation',
+        'Clear monthly priorities and notes',
+        'Fast fixes to broken pages, outdated copy, and confusing contact paths',
+        'Reports written in plain English, not agency jargon',
       ],
     },
+    bookingCta: schedulingUrl ? bookingCta : { label: 'View Services', href: '/services' },
   },
   quickTrust: [
     {
-      title: 'Operator-focused',
-      description: 'Built around long-term ownership and hands-on stewardship, not financial engineering.',
+      title: 'Lead-flow focused',
+      description: 'The goal is not just a nicer website. It is a site that makes it easy for customers to trust you and contact you.',
     },
     {
-      title: 'Confidential',
-      description: 'Discreet conversations for owners, brokers, and referral partners from the first call onward.',
+      title: 'Built for busy owners',
+      description: 'You get practical updates, issue tracking, and clear recommendations without needing to manage every detail yourself.',
     },
     {
-      title: 'Relationship-driven',
-      description: 'Respect for employees, customers, and the reputation you spent years building.',
+      title: 'Steady monthly support',
+      description: 'Websites, Google profiles, landing pages, and customer-facing copy need care after launch. That is the monthly work.',
     },
   ],
   whyWorkWithMe: {
-    eyebrow: 'Why Work With Me',
-    title: 'A serious buyer with a practical, people-first mindset',
+    eyebrow: 'What I Manage',
+    title: 'The online presence basics that quietly cost local businesses leads',
     description:
-      'The best seller-buyer relationships begin with trust. This site is designed to answer the questions owners reasonably ask before taking a conversation.',
+      'Small issues compound: broken links, outdated services, weak calls to action, slow pages, missing trust signals, and forms that are hard to use on mobile.',
     cards: [
       {
-        title: 'You deal directly with the future owner',
+        title: 'Website updates and fixes',
         description:
-          'You are not getting passed between a fund, a junior team, and a temporary operator. You speak with the person who wants to own and run the business.',
+          'Update services, photos, staff, hours, pricing notes, pages, links, forms, and content so the site reflects the business today.',
       },
       {
-        title: 'I am looking for one strong business to commit to',
+        title: 'Conversion and contact flow',
         description:
-          'The objective is long-term ownership, not a quick resale. I want to preserve what already works and build on it thoughtfully over time.',
+          'Make calls, forms, booking links, and quote requests obvious on desktop and mobile so visitors know what to do next.',
       },
       {
-        title: 'My background is broad and execution-oriented',
+        title: 'Local SEO basics',
         description:
-          'I bring experience across business administration, sales, operations, business development, and software or technical problem solving.',
+          'Improve titles, descriptions, service pages, internal links, location signals, and practical content that supports local search.',
       },
       {
-        title: 'The process should feel steady and low-drama',
+        title: 'Audit reports and follow-up',
         description:
-          'Good transactions rely on clarity, professionalism, and realistic expectations. I value straightforward communication and respectful timelines.',
+          'Run recurring checks for broken links, page speed, mobile layout, visible changes, and competitor updates, then turn findings into action.',
       },
     ],
   },
   letter: {
     eyebrow: 'A Note From Mathew',
-    title: 'Business succession is personal. It should be treated that way.',
+    title: 'Most local business websites need steady attention, not another one-time redesign.',
     body: [
-      'If you have spent years building a business, the decision to sell is about far more than a purchase price. It is about employees, customers, relationships, reputation, and the legacy of your work.',
-      'That is exactly why I want to buy and operate a small business. I respect what owner-operators build over time, and I want to continue that work responsibly. My goal is not to force a playbook onto a company. It is to understand how the business works, preserve the strengths already in place, and help lead the next chapter with care.',
+      'I built this service for owners who know their online presence matters but do not have time to manage every website update, broken form, old service page, or missed follow-up.',
+      'The goal is simple: keep your business easier to trust, easier to contact, and easier to find. I focus on practical work that supports leads, reputation, and customer confidence.',
     ],
     signature: 'Mathew Uckele',
   },
   criteriaPreview: {
-    eyebrow: 'What I’m Looking For',
-    title: 'Simple, understandable, durable small businesses',
+    eyebrow: 'Service Packages',
+    title: 'Start with the level of support your business actually needs',
     description:
-      'I am most interested in businesses with a strong reputation, loyal customers, and operating models that can be learned, supported, and improved over time.',
+      'Each package is designed around practical owner needs: a quick audit, ongoing updates, or a more complete monthly online presence partner.',
     list: [
-      'Stable, profitable small businesses',
-      'Recurring or repeat customer relationships',
-      'Clear and understandable business models',
-      'Strong local reputation and dependable customer service',
-      'Owners preparing for retirement, transition, or reduced day-to-day involvement',
-      'Flexible on location for the right opportunity',
+      'Website audit with top lead-reducing issues',
+      'Monthly website updates and maintenance',
+      'Contact form and call-to-action improvements',
+      'Local SEO basics and service-page cleanup',
+      'Competitor and website change monitoring',
+      'Plain-English monthly recommendations',
     ],
-    industries: ['Home services', 'B2B services', 'Niche local services', 'Operationally solid small businesses'],
+    industries: ['Home services', 'Medical and wellness', 'Local contractors', 'Professional services', 'Specialty retail'],
   },
   transitionApproach: {
-    eyebrow: 'My Approach To Transition',
-    title: 'Protect the core of what made the business worth buying',
+    eyebrow: 'How It Works',
+    title: 'Audit, prioritize, fix, and keep improving',
     description:
-      'A transition works best when it is planned around continuity, communication, and the specific realities of the business.',
+      'The work starts with a focused review of the current site and turns into a short list of improvements that can be handled in a steady monthly rhythm.',
     steps: [
       {
-        title: 'Listen before changing anything',
+        title: 'Review the current online presence',
         description:
-          'The first priority is understanding how the company actually works, what customers value, and what the team relies on day to day.',
+          'I check the website, contact paths, mobile experience, page titles, calls to action, trust signals, and obvious competitor movement.',
       },
       {
-        title: 'Preserve the parts that create trust',
+        title: 'Prioritize the highest-impact fixes',
         description:
-          'That usually means protecting the reputation, customer relationships, service standards, and employee stability that have already been earned.',
+          'You get a short list of issues that are easy to understand and tied directly to leads, trust, speed, or customer clarity.',
       },
       {
-        title: 'Build a transition plan that fits your timeline',
+        title: 'Handle updates on a cadence',
         description:
-          'Some owners want a quick handoff. Others want a measured transition or a continued advisory role. I am open to practical arrangements that support continuity.',
+          'Once priorities are clear, I can manage updates, pages, forms, content, reports, and follow-up items on a monthly basis.',
       },
     ],
   },
   individualBuyer: {
-    eyebrow: 'Why Owners Often Prefer An Individual Buyer',
-    title: 'A more personal alternative to the private equity playbook',
+    eyebrow: 'Why This Matters',
+    title: 'Your website is often the first employee customers meet',
     description:
-      'For many sellers, the right outcome is not just a transaction. It is confidence in who will own the business next and how they will treat the people around it.',
+      'If that first impression is outdated, slow, confusing, or hard to contact from, good referrals and search traffic can leak away.',
     cards: [
       {
-        title: 'Direct accountability',
+        title: 'Trust before the first call',
         description:
-          'You know who is making decisions, who is learning the business, and who will be responsible after closing.',
+          'Customers look for clear services, current information, reviews, photos, and signs that the business is active and reliable.',
       },
       {
-        title: 'More continuity, less churn',
+        title: 'Less friction for customers',
         description:
-          'An individual buyer is often better positioned to focus on preserving relationships rather than imposing immediate portfolio-wide changes.',
+          'Stronger calls to action, simpler forms, and better mobile layout make it easier for customers to take the next step.',
       },
       {
-        title: 'Flexible transition structures',
+        title: 'Better follow-up discipline',
         description:
-          'Seller support, phased handoffs, and practical involvement after closing can all be explored where they make sense.',
+          'Tracking leads, notes, emails, calls, and next actions keeps interested prospects from being forgotten.',
       },
       {
-        title: 'A calmer process',
+        title: 'A site that changes with the business',
         description:
-          'The best deals are thoughtful and fair. They do not need artificial deadlines, pressure tactics, or unnecessary noise.',
+          'New services, seasonal offers, staff updates, and customer questions should make it onto the website quickly.',
       },
     ],
   },
   faqPreview: {
     eyebrow: 'Frequently Asked Questions',
-    title: 'Common questions from business owners',
+    title: 'Common questions before starting',
     items: [
       {
-        question: 'Are you a private equity firm?',
+        question: 'Do I need a full redesign?',
         answer:
-          'No. Uckele Group is centered on Mathew Uckele as an individual buyer and future operator. The goal is long-term ownership of one strong business, not a roll-up strategy.',
+          'Not always. Many businesses need practical fixes first: better contact flow, current service pages, cleaner mobile layout, stronger trust signals, and faster updates.',
       },
       {
-        question: 'Will our conversations be confidential?',
+        question: 'Can you work with my current website?',
         answer:
-          'Yes. Discretion matters. Initial conversations are handled carefully, and more detailed information should only be shared when there is mutual interest and an appropriate process in place.',
+          'Usually, yes. The first step is reviewing the platform, access, current issues, and what updates are realistic without rebuilding everything.',
       },
       {
-        question: 'Can I stay involved after the sale?',
+        question: 'What happens after the audit?',
         answer:
-          'Yes, if that is useful. Some owners prefer a clean transition, while others want to remain involved for a period of time as an advisor, trainer, or relationship bridge.',
+          'You get a short, plain-English list of recommended fixes. From there we can schedule a call, choose priorities, and decide whether monthly support makes sense.',
       },
       {
-        question: 'Do you work with brokers?',
+        question: 'Do you replace my marketing agency?',
         answer:
-          'Yes. Brokers, intermediaries, and referral partners are welcome to reach out if they have a business that fits the criteria and values outlined here.',
+          'Not necessarily. This can complement an existing agency or fill the gap for businesses that need hands-on website and online presence operations.',
       },
     ],
   },
   references: {
-    eyebrow: 'Future Social Proof',
-    title: 'Reference and testimonial blocks are ready for real seller and advisor feedback',
+    eyebrow: 'Proof To Add Over Time',
+    title: 'Results and testimonials can live here as the service grows',
     description:
-      'The cards below are intentionally marked as placeholders. They are included so the design has a dedicated space for future seller, broker, or advisor references without fabricating anything today.',
+      'This section is reserved for future client quotes, before-and-after examples, audit wins, and measurable improvements.',
     items: [
       {
-        label: 'Seller Testimonial Placeholder',
-        text: 'Add a future note from an owner describing the process as respectful, clear, and aligned with continuity.',
+        label: 'Website Fix Placeholder',
+        text: 'Add a future example of a broken form, mobile issue, or outdated service page that was corrected.',
       },
       {
-        label: 'Broker Testimonial Placeholder',
-        text: 'Add a future note from an intermediary highlighting professionalism, responsiveness, and realistic deal execution.',
+        label: 'Lead Flow Placeholder',
+        text: 'Add a future note about clearer calls to action, better contact paths, or improved booking flow.',
       },
       {
-        label: 'Advisor Reference Placeholder',
-        text: 'Add a future endorsement from an attorney, lender, or accountant who has seen Mathew operate thoughtfully and follow through.',
+        label: 'Client Testimonial Placeholder',
+        text: 'Add a future quote from a business owner describing the monthly support experience.',
       },
     ],
   },
   contactCta: {
-    title: 'Confidential conversations welcome',
+    title: 'Want to know what is costing your website leads?',
     description:
-      'If you own a business and are considering a future transition, or if you represent an opportunity that may be a fit, I would welcome the conversation.',
-    primaryCta: { label: 'Contact Mathew', href: '/contact' },
-    secondaryCta: { label: 'See The Process', href: '/process' },
+      'Send the website URL and I will review the obvious issues before a short call.',
+    primaryCta: bookingCta,
+    secondaryCta: schedulingUrl
+      ? { label: 'Request An Audit Instead', href: '/contact' }
+      : { label: 'See The Process', href: '/process' },
   },
 };
 
 export const aboutPage = {
   hero: {
     eyebrow: 'About',
-    title: 'A grounded buyer who wants to own and operate a real business for the long term',
+    title: 'A practical online presence partner for local business owners',
     description:
-      'My name is Mathew Uckele. I am looking to buy and operate a strong small business with the intention of preserving what the owner built and growing it thoughtfully over time.',
+      'I help small businesses keep websites current, improve lead flow, and turn online presence problems into manageable monthly work.',
   },
   shortBio: {
     title: 'Short Bio',
     body: [
-      'I come from a business-oriented background with experience spanning business administration, sales, operations, business development, and software or technical problem solving.',
-      'What ties those experiences together is a bias toward practical execution: understanding how things work, building trusted relationships, and solving problems in a way that improves the business over time.',
-      'I am not looking to buy a business to flip it. I am looking for one good company that I can commit to, operate responsibly, and grow for the long term.',
+      'My background spans business administration, sales, operations, business development, and technical problem solving.',
+      'That mix matters for local businesses because the best website work is not only design. It is understanding customers, operations, trust, and the owner’s time.',
+      'I focus on practical improvements: make the website easier to use, easier to update, and more useful for generating real conversations.',
     ],
   },
   story: {
-    title: 'My Story',
+    title: 'Why This Service Exists',
     paragraphs: [
-      'I have always been drawn to businesses that are quietly strong: companies with dependable customers, solid operations, and owners who built something valuable through consistency rather than hype. Those are often the businesses that matter most in their communities and industries, even if they do not draw a lot of attention.',
-      'My background has given me exposure to sales, operations, business development, administration, and technical work. That combination has shaped how I think. I value clear communication, practical systems, and the daily discipline required to keep a business healthy. I am comfortable learning how a company works end to end and doing the work required to support growth.',
-      'Buying and operating a small business is appealing to me because it combines responsibility with long-term stewardship. I want to carry forward something real, support the team and customer relationships already in place, and create durable value over time rather than chase quick financial outcomes.',
+      'Many good local businesses have websites that slowly fall behind the actual business. Services change, teams change, offers change, and small issues go unnoticed until a customer cannot get through.',
+      'Owners often know something needs attention, but they do not have time to chase every update or decode every technical recommendation. This service is designed to be a steady operating partner for that gap.',
+      'The work is intentionally practical: find the issues that reduce trust or leads, fix them in order, and keep the online presence moving as the business changes.',
     ],
   },
   values: {
-    title: 'Values And Principles',
+    title: 'How I Work',
     items: [
       {
-        title: 'Respect what already works',
+        title: 'Start with the customer path',
         description:
-          'Strong businesses usually have good reasons for the way they operate. The first job is to understand the strengths before trying to improve anything.',
+          'Every recommendation should connect back to what a customer sees, trusts, clicks, reads, or submits.',
       },
       {
-        title: 'Take people seriously',
+        title: 'Keep the owner informed',
         description:
-          'Employees, customers, vendors, and long-standing relationships should never be treated as secondary to the transaction itself.',
+          'Updates and reports should be clear enough that a busy owner can understand what changed and why it matters.',
       },
       {
-        title: 'Solve problems practically',
+        title: 'Fix practical issues first',
         description:
-          'I value clear thinking, operational follow-through, and decisions grounded in the reality of how the business runs.',
+          'Broken links, bad forms, weak calls to action, outdated information, and mobile problems usually come before cosmetic polish.',
       },
       {
-        title: 'Think in years, not quarters',
+        title: 'Build a steady cadence',
         description:
-          'The objective is to be a stable long-term owner who helps the company remain strong for employees, customers, and the next chapter of growth.',
+          'Online presence work is strongest when it is maintained over time instead of ignored between redesigns.',
       },
     ],
   },
   whyBuy: {
-    title: 'Why I Want To Buy A Business',
+    title: 'Why Partner With Me',
     paragraphs: [
-      'I want the responsibility of ownership. Not ownership in the abstract, but the real responsibility that comes with leading a company, protecting relationships, and making careful decisions over time.',
-      'I am especially interested in acquiring from an owner who cares deeply about continuity. If you have spent years building a reputation, taking care of customers, and creating opportunity for employees, I understand why choosing the next owner matters. My goal is to be the kind of buyer who deserves that trust.',
+      'Local businesses need someone who can understand both the business and the website. I care about how leads actually arrive, how owners follow up, and where trust breaks down online.',
+      'The goal is to become a reliable partner for updates, audits, fixes, and practical growth support, not another vendor adding complexity.',
     ],
   },
 };
 
 export const criteriaPage = {
   hero: {
-    eyebrow: 'Acquisition Criteria',
-    title: 'What I’m Looking For',
+    eyebrow: 'Services And Packages',
+    title: 'Website and online presence support that fits the stage of the business',
     description:
-      'I am focused on stable, understandable small businesses with a strong reputation, repeat customer relationships, and a clear path to long-term ownership.',
+      'Choose a focused audit, monthly update support, or a fuller online presence management package.',
   },
   fit: {
-    title: 'A strong fit typically looks like this',
+    title: 'What the service can cover',
     items: [
-      'Stable and profitable with healthy fundamentals',
-      'Recurring revenue or repeat customer relationships preferred',
-      'Simple, understandable operating model',
-      'Strong reputation, loyal customers, and quality service',
-      'Solid team, dependable processes, or institutional knowledge worth preserving',
-      'Owner exploring retirement, transition, succession, or reduced day-to-day involvement',
+      'Website updates, page edits, service changes, and seasonal announcements',
+      'Contact forms, phone links, booking links, and calls to action',
+      'Mobile usability review and obvious layout fixes',
+      'Page titles, meta descriptions, local SEO basics, and service-page clarity',
+      'Broken links, slow or unusually large pages, and outdated content checks',
+      'CRM notes, follow-up reminders, audit reports, and outreach personalization',
     ],
   },
   specifics: [
     {
-      label: 'Industries of interest',
-      value: 'Home services, B2B services, niche local services, and other operationally solid small businesses',
+      label: 'Audit Sprint',
+      value: 'One-time website review with top issues, screenshots or notes, and a prioritized fix list.',
     },
     {
-      label: 'Location preference',
-      value: 'Flexible. Open to strong opportunities, including businesses that can be supported with a combination of local leadership and hands-on involvement.',
+      label: 'Monthly Care',
+      value: 'Recurring website updates, broken-link checks, copy edits, contact-flow fixes, and light reporting.',
     },
     {
-      label: 'SDE / EBITDA range',
-      value: '$[Insert lower range] to $[Insert upper range]',
+      label: 'Growth Partner',
+      value: 'Monthly website support plus local SEO improvements, landing pages, competitor monitoring, and lead tracking.',
     },
     {
-      label: 'Revenue range',
-      value: '$[Insert lower range] to $[Insert upper range]',
+      label: 'Best fit',
+      value: 'Local service businesses that rely on calls, quote requests, booking forms, referrals, and trust-building content.',
     },
   ],
   situations: {
-    title: 'Seller situations that often make sense',
+    title: 'Good situations for a first call',
     items: [
-      'Retirement or succession planning',
-      'Owner wants to step back from daily operations',
-      'Business has momentum but needs a new long-term owner',
-      'Seller wants continuity for employees and customers',
-      'Transition can benefit from flexible timing or ongoing seller involvement',
+      'Your website is outdated but a full redesign feels like too much',
+      'Customers ask questions that the website should already answer',
+      'Forms, phone links, or booking paths are hard to use on mobile',
+      'You need regular updates but do not want to manage freelancers each time',
+      'You want a short audit before deciding what to fix',
     ],
   },
   notLookingFor: {
-    title: 'What I Am Not Looking For',
+    title: 'Not the right fit',
     items: [
-      'Highly speculative startups or venture-style bets',
-      'Businesses dependent on one unstable customer or one fragile relationship',
-      'Distressed situations that require turnaround capital or emergency restructuring',
-      'Businesses with major unresolved legal, regulatory, or compliance issues',
-      'Business models I cannot understand well enough to operate responsibly',
+      'Businesses looking for overnight ranking guarantees',
+      'Projects that require fake reviews, spam outreach, or misleading claims',
+      'Teams that want strategy decks but no practical implementation',
+      'Large enterprise projects that need a full agency department',
+      'One-time design requests with no access to make or verify changes',
     ],
   },
 };
 
-export const sellerConcernsPage = {
+export const whyPartnerPage = {
   hero: {
-    eyebrow: 'Why Sell To Me',
-    title: 'A buyer who understands the real concerns behind a sale',
+    eyebrow: 'Why Partner',
+    title: 'A steady partner for the website work that keeps slipping',
     description:
-      'Selling a business is rarely just about price. It is also about legacy, employees, customers, confidentiality, and the confidence that the next owner will be a good steward.',
+      'Most owners do not need more dashboards. They need someone who can find the online issues, explain them clearly, and keep the website moving.',
   },
   intro:
-    'Those are exactly the issues I think about. My approach is built around preserving what matters, communicating clearly, and avoiding the kind of pressure that makes owners distrust the process.',
+    'The partnership should make your business easier to trust and easier to contact while reducing the amount of website management sitting on your plate.',
   concerns: [
     {
-      title: 'Protecting your legacy',
+      title: 'Clear priorities',
       description:
-        'The value of your business is not only in the financial statements. It is also in the reputation, relationships, and standards you built over time. I want to preserve that foundation.',
+        'You get a short list of what matters most instead of a long technical backlog with no connection to leads.',
     },
     {
-      title: 'Taking care of employees',
+      title: 'Less owner follow-up',
       description:
-        'Employees often carry the experience, customer trust, and operational knowledge that make a business work. Continuity for the team is an important part of any transition.',
+        'Updates, checks, notes, and reminders live in one workflow so you are not chasing scattered website tasks.',
     },
     {
-      title: 'Maintaining customer relationships',
+      title: 'Better customer trust',
       description:
-        'Customers stay because they trust the business. That trust should be handled carefully during ownership changes, not treated like an afterthought.',
+        'Fresh services, current contact information, reviews, proof points, and useful pages all help customers feel confident.',
     },
     {
-      title: 'Flexible transition timelines',
+      title: 'Flexible monthly cadence',
       description:
-        'Some sellers want a fast process. Others want time to hand off relationships or remain involved temporarily. I am open to practical structures that support a smooth transition.',
+        'Some months are maintenance-heavy. Others need campaign pages, seasonal updates, or competitor research. The work can adapt.',
     },
     {
-      title: 'Confidentiality and professionalism',
+      title: 'Secure access handling',
       description:
-        'Discretion matters, especially early. Conversations should be respectful, limited to the right people, and paced appropriately for the sensitivity of the situation.',
+        'Client files, website assets, and account details should move through a safer handoff process than email threads.',
     },
     {
-      title: 'Fair and thoughtful process',
+      title: 'Plain-English reporting',
       description:
-        'A good process should be clear, professional, and grounded in the realities of the business. It should not feel performative, chaotic, or overly aggressive.',
+        'Reports should tell you what changed, what was found, what is next, and why it matters for leads.',
     },
     {
-      title: 'No private equity playbook',
+      title: 'No bloated agency process',
       description:
-        'This is not about buying a company to fold it into a portfolio or force a short-term formula onto it. The goal is long-term ownership and careful stewardship.',
+        'This is designed for practical implementation and owner clarity, not layers of account management.',
     },
     {
-      title: 'No rush, pressure, or games',
+      title: 'Built around leads',
       description:
-        'Owners deserve time to evaluate fit, ask questions, and think through the right outcome. I prefer calm, honest conversations over artificial urgency.',
+        'The point is to make it easier for real customers to call, book, request a quote, or submit a form.',
     },
   ],
 };
@@ -488,136 +518,132 @@ export const sellerConcernsPage = {
 export const processPage = {
   hero: {
     eyebrow: 'Process',
-    title: 'A clear, respectful acquisition process',
+    title: 'A simple path from website audit to monthly support',
     description:
-      'Good transactions do not need drama. The goal is straightforward communication, appropriate discretion, and a pace that fits the business and the owner.',
+      'Start with a focused review, decide what matters, and turn the highest-impact fixes into a manageable cadence.',
   },
   steps: [
     {
       step: '01',
-      title: 'Introductory conversation',
+      title: 'Submit the business website',
       description:
-        'A brief initial discussion to understand your goals, timing, and the business at a high level. This should feel simple and pressure-free.',
+        'Send the website URL, business type, and what you want more of: calls, bookings, quote requests, form fills, or clearer customer trust.',
     },
     {
       step: '02',
-      title: 'High-level fit review',
+      title: 'Run a practical lead-flow audit',
       description:
-        'If there is mutual interest, I will evaluate whether the company fits my criteria and whether a deeper conversation makes sense.',
+        'I check uptime, SSL, broken links, mobile layout, speed, page titles, calls to action, contact flow, and obvious trust gaps.',
     },
     {
       step: '03',
-      title: 'Confidential information review',
+      title: 'Review the highest-impact findings',
       description:
-        'With the right protections in place, I review key business information carefully and work to understand the operation, not just the numbers. When appropriate, sensitive materials can move through a secure document request and upload flow.',
+        'You get plain-English notes focused on issues a business owner can understand and decide on quickly.',
     },
     {
       step: '04',
-      title: 'Letter of intent or offer',
+      title: 'Choose the right support level',
       description:
-        'If the business is a fit, I move toward a clear indication of interest or letter of intent with practical terms and thoughtful communication.',
+        'We decide whether you need a one-time fix sprint, monthly website care, or fuller online presence management.',
     },
     {
       step: '05',
-      title: 'Diligence and transition planning',
+      title: 'Make updates and track follow-up',
       description:
-        'This stage is about confirming details, aligning on expectations, and planning how to protect employees, customers, and continuity after closing.',
+        'Website work, client notes, emails, calls, tasks, and invoices are kept organized so next steps do not get lost.',
     },
     {
       step: '06',
-      title: 'Closing and handoff',
+      title: 'Keep improving monthly',
       description:
-        'Once the work is done and both sides are comfortable, the transaction closes and the ownership transition is carried out carefully and professionally.',
+        'The site gets checked, updated, and improved as services, offers, competitors, and customer needs change.',
     },
   ],
   principles: [
-    'Confidentiality where it matters',
-    'Transparent communication',
-    'Respect for your advisors and team',
-    'No artificial deadlines or pressure tactics',
-    'A practical focus on continuity after closing',
+    'Lead flow first',
+    'Clear owner communication',
+    'Practical fixes before polish',
+    'Mobile usability matters',
+    'Monthly consistency',
   ],
 };
 
 export const faqItems = [
   {
-    question: 'Are you a private equity firm?',
+    question: 'Do I need a full new website?',
     answer:
-      'No. I am an individual buyer seeking to acquire and operate one strong small business for the long term. The goal is to be a stable future owner, not a fund manager or consolidator.',
+      'Not always. Many local businesses can get meaningful improvement from updates, contact-flow cleanup, mobile fixes, better service pages, and stronger calls to action.',
   },
   {
-    question: 'What size businesses are you looking for?',
+    question: 'Can you work with my current platform?',
     answer:
-      'I am focused on stable, profitable small businesses with strong customer relationships and understandable operations. The criteria page includes placeholder financial ranges that can be updated as your target size becomes more specific.',
+      'Usually, yes. The first review looks at your current CMS or site builder, access, hosting, forms, analytics, and what can be safely changed.',
   },
   {
-    question: 'Will you keep my employees?',
+    question: 'What does the audit include?',
     answer:
-      'Continuity for good employees is a priority. Every business is different, but my approach is to preserve the team and institutional knowledge that make the company valuable whenever possible.',
+      'The audit checks uptime, SSL, broken links, mobile layout, title and meta basics, contact flow, missing calls to action, speed concerns, outdated visible content, and obvious trust gaps.',
   },
   {
-    question: 'Will you change the business name?',
+    question: 'How do monthly packages work?',
     answer:
-      'Not by default. If the business name carries trust in the market, preserving it often makes sense. Any changes should be thoughtful and rooted in what best serves customers and the company over time.',
+      'Monthly support is built around a fixed cadence of updates, checks, recommendations, and follow-up. The exact scope depends on the package and the level of activity your business needs.',
   },
   {
-    question: 'Can I stay involved after the sale?',
+    question: 'Can you help with local SEO?',
     answer:
-      'Yes. Many owners prefer a phased transition or limited ongoing involvement after closing. I am open to practical arrangements that help support continuity and reduce risk.',
+      'Yes, for practical basics: service-page clarity, title and meta improvements, internal links, location signals, Google Business Profile recommendations, and content ideas tied to customer questions.',
   },
   {
-    question: 'How quickly can you move?',
+    question: 'Do you track leads and follow-up?',
     answer:
-      'That depends on fit, information availability, financing, and your preferred timeline. Some opportunities move quickly, while others benefit from a more measured process. I do not believe in rushing for the sake of appearances.',
+      'Yes. The CRM tracks prospects, notes, calls, emails, next actions, website audit reports, and email engagement so follow-up can be prioritized.',
   },
   {
-    question: 'Will our conversations be confidential?',
+    question: 'Can I book a short call first?',
     answer:
-      'Yes. Early conversations are handled discreetly, and sensitive information should only be shared when there is mutual interest and an appropriate process in place.',
+      'Yes. Send the form or use the scheduling link when it is enabled. A short call is the best way to decide whether the audit or monthly support makes sense.',
   },
   {
-    question: 'Do you work with brokers?',
+    question: 'What access do you need?',
     answer:
-      'Yes. Brokers, intermediaries, and referral partners are welcome. If you are representing a strong business that fits the criteria, I would be glad to connect.',
-  },
-  {
-    question: 'Are you open to creative deal structures?',
-    answer:
-      'Yes, where they make sense. Seller support, phased transitions, and other practical structures can be part of a thoughtful transaction if they help align interests and support continuity.',
-  },
-  {
-    question: 'What happens after I reach out?',
-    answer:
-      'You should expect a direct response, a simple introductory conversation, and an honest discussion about fit. If the opportunity makes sense, the next steps become more structured, including a secure path for sharing confidential materials when appropriate. If it does not, the process should still feel respectful and straightforward.',
+      'That depends on the work. Common access includes website admin, domain or DNS, analytics, Search Console, booking tools, form tools, and brand assets. Sensitive details should be shared through secure handoff.',
   },
 ];
 
 export const contactPage = {
   hero: {
-    eyebrow: 'Contact',
-    title: 'Start a confidential conversation',
+    eyebrow: 'Request An Audit',
+    title: 'Find out what your website may be costing you in leads',
     description:
-      'If you are an owner considering succession, a broker with a relevant opportunity, or a referral partner who knows a strong business, I would welcome the conversation.',
+      'Send your business website and a short note. I will review the obvious online presence issues and follow up with next steps or a short call.',
   },
   contactIntro:
-    'This form is designed for early, respectful conversations. Share as much or as little detail as is appropriate at this stage.',
+    'Use this form to request a website audit, ask about monthly support, or share what you want your online presence to do better.',
   sidePanels: [
     {
       title: 'What to expect',
       items: [
         'A direct reply from Mathew Uckele',
-        'A confidential, no-pressure introduction',
-        'A practical discussion about fit and next steps',
+        'A short review of your website and contact flow',
+        'Plain-English recommendations tied to leads, trust, and usability',
       ],
     },
     {
-      title: 'Contact details',
+      title: 'Contact and scheduling',
       items: contactDetailItems,
     },
   ],
-  brokerNote: {
-    title: 'Brokers and referral partners',
+  callNote: {
+    title: 'Prefer a quick call?',
     description:
-      'Relevant introductions are welcome. If you represent a durable small business or know an owner exploring a future transition, feel free to reach out directly through the same form.',
+      schedulingUrl
+        ? 'Use the scheduling link above to book a short conversation. Bring the website URL and the main customer action you want more of.'
+        : 'Send the form with your website URL and preferred times. I will follow up to schedule a short conversation.',
+    primaryCta: bookingCta,
+    secondaryCta: schedulingUrl
+      ? { label: 'Use The Form Instead', href: '#contact-form' }
+      : { label: 'View Services', href: '/services' },
   },
 };

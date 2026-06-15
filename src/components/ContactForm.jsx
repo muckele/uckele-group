@@ -7,6 +7,9 @@ function createInitialState() {
     phone: '',
     company: '',
     role: 'Business Owner',
+    businessWebsite: '',
+    serviceInterest: 'Website audit',
+    timeline: 'This month',
     message: '',
     website: '',
     turnstileToken: '',
@@ -25,8 +28,16 @@ export default function ContactForm() {
   const turnstileSiteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY;
 
   const isComplete = useMemo(
-    () => Boolean(formData.name && formData.email && formData.message && (!turnstileSiteKey || formData.turnstileToken)),
-    [formData.email, formData.message, formData.name, formData.turnstileToken, turnstileSiteKey],
+    () =>
+      Boolean(
+        formData.name &&
+          formData.email &&
+          formData.company &&
+          formData.businessWebsite &&
+          formData.message &&
+          (!turnstileSiteKey || formData.turnstileToken),
+      ),
+    [formData.businessWebsite, formData.company, formData.email, formData.message, formData.name, formData.turnstileToken, turnstileSiteKey],
   );
 
   useEffect(() => {
@@ -103,10 +114,10 @@ export default function ContactForm() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          ...formData,
-          source: 'website-contact-form',
-        }),
+          body: JSON.stringify({
+            ...formData,
+            source: 'website-audit-request',
+          }),
       });
 
       const result = await response.json();
@@ -172,12 +183,13 @@ export default function ContactForm() {
         </label>
 
         <label className="flex flex-col gap-2 text-sm font-medium text-ink">
-          Business / Firm
+          Business name
           <input
+            required
             className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
             name="company"
             onChange={handleChange}
-            placeholder="Company name"
+            placeholder="Company or practice name"
             type="text"
             value={formData.company}
           />
@@ -192,10 +204,56 @@ export default function ContactForm() {
             value={formData.role}
           >
             <option>Business Owner</option>
-            <option>Broker / Intermediary</option>
+            <option>Marketing Manager</option>
+            <option>Office Manager</option>
             <option>Referral Partner</option>
-            <option>Advisor</option>
+            <option>Agency / Consultant</option>
             <option>Other</option>
+          </select>
+        </label>
+
+        <label className="flex flex-col gap-2 text-sm font-medium text-ink">
+          Business website
+          <input
+            required
+            className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            name="businessWebsite"
+            onChange={handleChange}
+            placeholder="yourbusiness.com"
+            type="text"
+            value={formData.businessWebsite}
+          />
+        </label>
+
+        <label className="flex flex-col gap-2 text-sm font-medium text-ink">
+          Service interest
+          <select
+            className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            name="serviceInterest"
+            onChange={handleChange}
+            value={formData.serviceInterest}
+          >
+            <option>Website audit</option>
+            <option>Website updates and maintenance</option>
+            <option>Local SEO basics</option>
+            <option>Contact form and lead-flow fixes</option>
+            <option>Monthly online presence support</option>
+            <option>Not sure yet</option>
+          </select>
+        </label>
+
+        <label className="flex flex-col gap-2 text-sm font-medium text-ink md:col-span-2">
+          Timeline
+          <select
+            className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            name="timeline"
+            onChange={handleChange}
+            value={formData.timeline}
+          >
+            <option>This month</option>
+            <option>Next 30-60 days</option>
+            <option>Planning ahead</option>
+            <option>Urgent issue</option>
           </select>
         </label>
 
@@ -205,13 +263,13 @@ export default function ContactForm() {
         </label>
 
         <label className="flex flex-col gap-2 text-sm font-medium text-ink md:col-span-2">
-          Message
+          What should the website do better?
           <textarea
             required
             className="min-h-[180px] rounded-3xl border border-line bg-white px-4 py-4 text-sm text-ink outline-none transition focus:border-moss"
             name="message"
             onChange={handleChange}
-            placeholder="Share a bit about the business, your timing, or the opportunity."
+            placeholder="Examples: get more quote requests, update services, fix a form, improve mobile layout, clean up local SEO, add pages, or review competitors."
             value={formData.message}
           />
         </label>
@@ -228,7 +286,7 @@ export default function ContactForm() {
 
       <div className="mt-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <p className="max-w-xl text-sm leading-6 text-ink/70">
-          Confidential conversations are welcome. This form now submits through the backend pipeline, where inquiries can be routed to email providers, a CRM webhook, and the private admin CRM.
+          This request routes into the private CRM so audit notes, follow-up, email activity, and next steps can be tracked in one place.
         </p>
 
         <button
@@ -236,7 +294,7 @@ export default function ContactForm() {
           disabled={!isComplete || submitting}
           type="submit"
         >
-          {submitting ? 'Sending...' : 'Send Inquiry'}
+          {submitting ? 'Sending...' : 'Request Audit'}
         </button>
       </div>
 

@@ -50,10 +50,10 @@ export default function ProcessPage() {
           </div>
           <div className="mt-8 flex flex-wrap gap-3">
             <ButtonLink href="/contact">
-              Start A Conversation <ArrowRight className="h-4 w-4" />
+              Request An Audit <ArrowRight className="h-4 w-4" />
             </ButtonLink>
-            <ButtonLink href="/why-sell-to-me" variant="secondary">
-              Why Sell To Me
+            <ButtonLink href="/why-partner" variant="secondary">
+              Why Partner
             </ButtonLink>
           </div>
         </Reveal>

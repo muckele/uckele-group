@@ -1,19 +1,17 @@
 import { startTransition, useDeferredValue, useEffect, useMemo, useState } from 'react';
 import {
   BellRing,
+  BarChart3,
   CalendarClock,
   ClipboardList,
-  Copy,
   Download,
   Inbox,
   Link2,
   LogOut,
   MailCheck,
   Plus,
-  RefreshCw,
+  Rocket,
   Save,
-  Send,
-  ShieldAlert,
 } from 'lucide-react';
 import PageHero from '../components/PageHero';
 import Reveal from '../components/Reveal';
@@ -22,10 +20,8 @@ import Seo from '../components/Seo';
 const statuses = ['new', 'review', 'contacted', 'archived', 'spam'];
 const priorities = ['low', 'normal', 'medium', 'high', 'urgent'];
 const followUpStates = ['needs-response', 'scheduled', 'waiting-on-owner', 'completed'];
-const leadTypes = ['seller', 'broker', 'referral', 'advisor', 'other'];
-const sbaOptions = ['unknown', 'yes', 'no'];
-const dailyDealUpdateUrl =
-  'https://docs.google.com/spreadsheets/d/1d2mC6oKDY7DFQiaNQnF947Ro5CBwjIcAw_fwya7bpBc/edit?usp=sharing';
+const leadTypes = ['prospect', 'client', 'referral', 'partner', 'other'];
+const priorityFitOptions = ['unknown', 'yes', 'no'];
 const primaryActionButtonClass =
   'inline-flex w-full items-center justify-center gap-2 rounded-full border border-moss bg-moss px-5 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50 sm:w-auto';
 const secondaryActionButtonClass =
@@ -93,6 +89,38 @@ function emailEngagementTone(engagement) {
   return 'default';
 }
 
+function automationTierTone(tier) {
+  if (tier === 'A') {
+    return 'success';
+  }
+
+  if (tier === 'B') {
+    return 'warning';
+  }
+
+  if (tier === 'D') {
+    return 'default';
+  }
+
+  return 'info';
+}
+
+function formatAutomationSummary(automation) {
+  if (!automation?.latest_report && !automation?.latest_audit) {
+    return 'No automated research has been generated yet.';
+  }
+
+  const parts = [
+    automation.tier_label ? `${automation.tier_label} (${automation.score}/100)` : '',
+    automation.latest_audit?.findings?.length ? pluralize(automation.latest_audit.findings.length, 'finding') : '',
+    automation.sent_count ? pluralize(automation.sent_count, 'sent email') : '',
+    automation.scheduled_count ? pluralize(automation.scheduled_count, 'scheduled email') : '',
+    automation.visit_count ? pluralize(automation.visit_count, 'site visit') : '',
+  ].filter(Boolean);
+
+  return parts.join(' · ') || 'Research generated.';
+}
+
 function formatEmailEngagement(engagement) {
   if (!engagement?.total) {
     return 'No tracked email activity yet.';
@@ -123,55 +151,33 @@ function formatEmailEngagement(engagement) {
   return `${parts.join(', ')}. Last event: ${formatLabel(engagement.latest_event_type)} at ${formatDateTime(engagement.last_event_at)}.`;
 }
 
-function dealScoreTone(score) {
-  if (score >= 70) {
-    return 'success';
-  }
-
-  if (score >= 55) {
-    return 'warning';
-  }
-
-  return 'danger';
-}
-
-function formatMoney(value) {
-  return Number.isFinite(value)
-    ? new Intl.NumberFormat('en-US', {
-        style: 'currency',
-        currency: 'USD',
-        maximumFractionDigits: 0,
-      }).format(value)
-    : 'Not disclosed';
-}
-
 function buildDraft(submission) {
   return {
     status: submission.status || 'review',
     priority: submission.priority || 'normal',
     assigned_to: submission.assigned_to || '',
-    lead_type: submission.lead_type || 'seller',
+    lead_type: submission.lead_type || 'prospect',
     follow_up_state: submission.follow_up_state || 'needs-response',
     next_action_at: toDateTimeLocal(submission.next_action_at),
     tags: (submission.tags || []).join(', '),
     notes: submission.notes || '',
     company: submission.company || '',
-    listing_url: submission.listing_url || '',
+    lead_source_url: submission.lead_source_url || '',
     business_website: submission.business_website || '',
-    prospectus_url: submission.prospectus_url || '',
-    asking_price: submission.asking_price || '',
-    ttm_revenue: submission.ttm_revenue || '',
-    ttm_ebitda: submission.ttm_ebitda || '',
-    ebitda_multiple: submission.ebitda_multiple || '',
-    net_margin: submission.net_margin || '',
+    service_interest: submission.service_interest || '',
+    package_budget: submission.package_budget || '',
+    monthly_lead_value: submission.monthly_lead_value || '',
+    lead_goal: submission.lead_goal || '',
+    current_provider: submission.current_provider || '',
+    conversion_issue: submission.conversion_issue || '',
     business_age: submission.business_age || '',
-    sba_eligible: submission.sba_eligible || 'unknown',
-    broker_name: submission.broker_name || '',
-    broker_email: submission.broker_email || '',
-    broker_phone: submission.broker_phone || '',
-    seller_name: submission.seller_name || '',
-    seller_email: submission.seller_email || '',
-    seller_phone: submission.seller_phone || '',
+    priority_fit: submission.priority_fit || 'unknown',
+    partner_name: submission.partner_name || '',
+    partner_email: submission.partner_email || '',
+    partner_phone: submission.partner_phone || '',
+    primary_contact_name: submission.primary_contact_name || '',
+    primary_contact_email: submission.primary_contact_email || '',
+    primary_contact_phone: submission.primary_contact_phone || '',
   };
 }
 
@@ -181,27 +187,27 @@ function blankRecordDraft() {
     status: 'review',
     priority: 'normal',
     assigned_to: 'Mathew Uckele',
-    lead_type: 'seller',
+    lead_type: 'prospect',
     follow_up_state: 'needs-response',
     next_action_at: '',
     tags: 'manual',
     notes: '',
-    listing_url: '',
+    lead_source_url: '',
     business_website: '',
-    prospectus_url: '',
-    asking_price: '',
-    ttm_revenue: '',
-    ttm_ebitda: '',
-    ebitda_multiple: '',
-    net_margin: '',
+    service_interest: '',
+    package_budget: '',
+    monthly_lead_value: '',
+    lead_goal: '',
+    current_provider: '',
+    conversion_issue: '',
     business_age: '',
-    sba_eligible: 'unknown',
-    broker_name: '',
-    broker_email: '',
-    broker_phone: '',
-    seller_name: '',
-    seller_email: '',
-    seller_phone: '',
+    priority_fit: 'unknown',
+    partner_name: '',
+    partner_email: '',
+    partner_phone: '',
+    primary_contact_name: '',
+    primary_contact_email: '',
+    primary_contact_phone: '',
   };
 }
 
@@ -306,15 +312,31 @@ function TextAreaField({ label, value, onChange, placeholder = '' }) {
   );
 }
 
+function safeExternalHref(value) {
+  const rawValue = String(value || '').trim();
+
+  if (!rawValue) {
+    return '';
+  }
+
+  try {
+    const url = new URL(rawValue);
+    return ['http:', 'https:'].includes(url.protocol.toLowerCase()) ? url.toString() : '';
+  } catch {
+    return '';
+  }
+}
+
 function LinksRow({ submission }) {
+  const leadSourceHref = safeExternalHref(submission.lead_source_url);
+  const websiteHref = safeExternalHref(submission.business_website);
   const links = [
-    submission.listing_url ? { href: submission.listing_url, label: 'Listing URL' } : null,
-    submission.business_website ? { href: submission.business_website, label: 'Website' } : null,
-    submission.prospectus_url ? { href: submission.prospectus_url, label: 'Prospectus / CIM' } : null,
+    leadSourceHref ? { href: leadSourceHref, label: 'Lead Source' } : null,
+    websiteHref ? { href: websiteHref, label: 'Website' } : null,
   ].filter(Boolean);
 
   if (links.length === 0) {
-    return <p className="mt-4 text-sm leading-7 text-ink/68">No listing or company links added yet.</p>;
+    return <p className="mt-4 text-sm leading-7 text-ink/68">No website or source links added yet.</p>;
   }
 
   return (
@@ -330,52 +352,6 @@ function LinksRow({ submission }) {
           {link.label}
         </a>
       ))}
-    </div>
-  );
-}
-
-function DealHunterCard({ deal, mode = 'fit' }) {
-  const detailItems = mode === 'remove' ? deal.removeReasons || deal.concerns || [] : deal.strengths || [];
-  const meta = [
-    deal.industry,
-    deal.location,
-    deal.annualProfit ? `Profit ${formatMoney(deal.annualProfit)}` : '',
-    deal.askingPrice ? `Ask ${formatMoney(deal.askingPrice)}` : '',
-    deal.profitMultiple ? `${deal.profitMultiple}x profit` : '',
-  ].filter(Boolean);
-
-  return (
-    <div className={`rounded-[24px] border p-5 ${notificationToneClasses(mode === 'remove' ? 'danger' : mode === 'watch' ? 'warning' : 'info')}`}>
-      <div className="flex flex-wrap items-center gap-2">
-        <Pill tone={dealScoreTone(deal.score)}>Score {deal.score}</Pill>
-        {deal.isNew ? <Pill tone="success">New</Pill> : null}
-        <Pill>{deal.sourceName}</Pill>
-      </div>
-      <h3 className="mt-3 text-lg font-semibold leading-snug">{deal.name}</h3>
-      {meta.length > 0 ? <p className="mt-2 text-sm leading-6">{meta.join(' | ')}</p> : null}
-      {deal.recommendation ? <p className="mt-3 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-6">{deal.recommendation}</p> : null}
-      {detailItems.length > 0 ? (
-        <ul className="mt-3 list-disc space-y-1 pl-5 text-sm leading-6">
-          {detailItems.slice(0, 3).map((item) => (
-            <li key={`${deal.id}-${item}`}>{item}</li>
-          ))}
-        </ul>
-      ) : null}
-      {deal.questions?.length > 0 ? (
-        <div className="mt-4 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-6">
-          <p className="font-semibold uppercase tracking-[0.14em]">Questions</p>
-          <ul className="mt-2 list-disc space-y-1 pl-5">
-            {deal.questions.slice(0, 2).map((question) => (
-              <li key={`${deal.id}-${question}`}>{question}</li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-      {deal.listingUrl ? (
-        <a className="mt-4 inline-flex text-sm font-semibold text-moss underline" href={deal.listingUrl} rel="noreferrer" target="_blank">
-          View listing
-        </a>
-      ) : null}
     </div>
   );
 }
@@ -411,20 +387,26 @@ export default function DashboardPage() {
   const [loginError, setLoginError] = useState('');
   const [loginPending, setLoginPending] = useState(false);
   const [filters, setFilters] = useState({ search: '', status: 'all' });
-  const [dashboardData, setDashboardData] = useState({ summary: null, submissions: [], notifications: [], emailTriage: [], total: 0 });
+  const [dashboardData, setDashboardData] = useState({
+    summary: null,
+    submissions: [],
+    notifications: [],
+    emailTriage: [],
+    automationTriage: [],
+    total: 0,
+  });
   const [drafts, setDrafts] = useState({});
   const [loading, setLoading] = useState(false);
   const [actionError, setActionError] = useState('');
   const [savingSubmissionId, setSavingSubmissionId] = useState('');
   const [creatingUploadForId, setCreatingUploadForId] = useState('');
+  const [runningAutomationForId, setRunningAutomationForId] = useState('');
+  const [approvingOutreachForId, setApprovingOutreachForId] = useState('');
+  const [sendingOutreach, setSendingOutreach] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [createDraft, setCreateDraft] = useState(blankRecordDraft());
   const [createPending, setCreatePending] = useState(false);
   const [createError, setCreateError] = useState('');
-  const [dealHunterReview, setDealHunterReview] = useState(null);
-  const [dealHunterLoading, setDealHunterLoading] = useState(false);
-  const [dealHunterSending, setDealHunterSending] = useState(false);
-  const [dealHunterFeedback, setDealHunterFeedback] = useState({ error: '', message: '' });
   const deferredSearch = useDeferredValue(filters.search);
 
   async function checkSession() {
@@ -504,6 +486,7 @@ export default function DashboardPage() {
         submissions: result.submissions,
         notifications: result.notifications || [],
         emailTriage: result.emailTriage || [],
+        automationTriage: result.automationTriage || [],
         total: result.total,
       });
       setDrafts(
@@ -737,50 +720,84 @@ export default function DashboardPage() {
     }
   }
 
-  async function handleLoadDealHunterReview() {
-    setDealHunterLoading(true);
-    setDealHunterFeedback({ error: '', message: '' });
+  async function handleRunAutomation(submissionId) {
+    setRunningAutomationForId(submissionId);
+    setActionError('');
 
     try {
-      const response = await fetch('/api/admin/deal-hunter/review', {
+      const response = await fetch(`/api/admin/submissions/${submissionId}/automation/run`, {
+        method: 'POST',
         credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({}),
       });
       const result = await response.json();
 
       if (!response.ok || !result.success) {
-        throw new Error(result.error || 'Unable to review daily deals.');
+        throw new Error(result.error || 'Unable to run automated research.');
       }
 
-      setDealHunterReview(result.review);
-      setDealHunterFeedback({ error: '', message: `Reviewed ${result.review?.totals?.reviewedDeals || 0} recent deals.` });
+      await loadDashboard(filters.status, deferredSearch.trim());
     } catch (error) {
-      setDealHunterFeedback({ error: error.message || 'Unable to review daily deals.', message: '' });
+      setActionError(error.message || 'Unable to run automated research.');
     } finally {
-      setDealHunterLoading(false);
+      setRunningAutomationForId('');
     }
   }
 
-  async function handleSendDealHunterEmail() {
-    setDealHunterSending(true);
-    setDealHunterFeedback({ error: '', message: '' });
+  async function handleApproveOutreach(submissionId) {
+    setApprovingOutreachForId(submissionId);
+    setActionError('');
 
     try {
-      const response = await fetch('/api/admin/deal-hunter/send', {
+      const response = await fetch(`/api/admin/submissions/${submissionId}/outreach/approve`, {
         method: 'POST',
         credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({}),
       });
       const result = await response.json();
 
       if (!response.ok || !result.success) {
-        throw new Error(result.emailResult?.error || result.error || 'Unable to send the daily deal email.');
+        throw new Error(result.error || 'Unable to approve the outreach cadence.');
       }
 
-      setDealHunterReview(result.review);
-      setDealHunterFeedback({ error: '', message: 'Daily deal email sent.' });
+      await loadDashboard(filters.status, deferredSearch.trim());
     } catch (error) {
-      setDealHunterFeedback({ error: error.message || 'Unable to send the daily deal email.', message: '' });
+      setActionError(error.message || 'Unable to approve the outreach cadence.');
     } finally {
-      setDealHunterSending(false);
+      setApprovingOutreachForId('');
+    }
+  }
+
+  async function handleSendDueOutreach() {
+    setSendingOutreach(true);
+    setActionError('');
+
+    try {
+      const response = await fetch('/api/admin/outreach/send-due', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({}),
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to send due outreach.');
+      }
+
+      await loadDashboard(filters.status, deferredSearch.trim());
+    } catch (error) {
+      setActionError(error.message || 'Unable to send due outreach.');
+    } finally {
+      setSendingOutreach(false);
     }
   }
 
@@ -794,6 +811,9 @@ export default function DashboardPage() {
     missingNextAction: 0,
     emailEngaged: 0,
     hotLeads: 0,
+    tierA: 0,
+    tierB: 0,
+    websiteVisits: 0,
     new: 0,
     review: 0,
     contacted: 0,
@@ -804,6 +824,7 @@ export default function DashboardPage() {
   const submissions = useMemo(() => dashboardData.submissions || [], [dashboardData.submissions]);
   const notifications = useMemo(() => dashboardData.notifications || [], [dashboardData.notifications]);
   const emailTriage = useMemo(() => dashboardData.emailTriage || [], [dashboardData.emailTriage]);
+  const automationTriage = useMemo(() => dashboardData.automationTriage || [], [dashboardData.automationTriage]);
 
   if (!authState.checked) {
     return (
@@ -820,7 +841,7 @@ export default function DashboardPage() {
         <Seo description="Private admin CRM for Uckele Group." keywords="private admin crm" noindex title="Admin | Uckele Group" />
 
         <PageHero
-          description="Secure admin access for the private acquisition CRM, follow-up workflow, and secure document requests."
+          description="Secure admin access for the private online presence CRM, follow-up workflow, and secure onboarding requests."
           eyebrow="Private Admin"
           title="Authorized CRM access"
         />
@@ -911,12 +932,12 @@ export default function DashboardPage() {
 
   return (
     <>
-      <Seo description="Private admin CRM for Uckele Group." keywords="private admin crm" noindex title="Admin | Uckele Group" />
+      <Seo description="Private CRM for website audit requests, online presence leads, outreach, and follow-up." keywords="private admin crm" noindex title="Admin | Uckele Group" />
 
       <PageHero
-        description="Private admin area for tracking broker and seller opportunities, internal notes, and follow-up priorities."
+        description="Private admin area for tracking website audit requests, local business prospects, client notes, email engagement, and follow-up priorities."
         eyebrow="Admin CRM"
-        title="Acquisition pipeline, notes, and follow-up prompts"
+        title="Online presence pipeline, notes, and follow-up prompts"
       />
 
       <section className="section-shell mt-10">
@@ -924,9 +945,9 @@ export default function DashboardPage() {
           <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Signed in as {authState.username}</p>
-              <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Broker and seller CRM</h2>
+              <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Prospect and client CRM</h2>
               <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
-                This is no longer just a submissions inbox. It now tracks sourced opportunities, broker conversations, seller follow-ups, deal notes, and secure document requests in one place.
+                Track audit requests, client conversations, website notes, service packages, email engagement, and secure onboarding requests in one place.
               </p>
             </div>
 
@@ -946,15 +967,15 @@ export default function DashboardPage() {
                 <Download className="h-4 w-4" />
                 Export CSV
               </a>
-              <a
+              <button
                 className={secondaryActionButtonClass}
-                href={dailyDealUpdateUrl}
-                rel="noreferrer"
-                target="_blank"
+                disabled={sendingOutreach}
+                onClick={handleSendDueOutreach}
+                type="button"
               >
-                <ClipboardList className="h-4 w-4" />
-                Daily Deal Update
-              </a>
+                <Rocket className="h-4 w-4" />
+                {sendingOutreach ? 'Sending Due...' : 'Send Due Outreach'}
+              </button>
               <button
                 className={secondaryActionButtonClass}
                 onClick={handleLogout}
@@ -969,160 +990,17 @@ export default function DashboardPage() {
       </section>
 
       <section className="section-shell mt-8">
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-9">
           <StatCard icon={Inbox} label="Total Records" value={summary.total} />
           <StatCard icon={BellRing} label="Action Items" value={summary.actionItems} tone={summary.actionItems > 0 ? 'warning' : 'default'} />
           <StatCard icon={CalendarClock} label="Overdue" value={summary.overdue} tone={summary.overdue > 0 ? 'danger' : 'default'} />
           <StatCard icon={ClipboardList} label="Due Soon" value={summary.dueSoon} tone={summary.dueSoon > 0 ? 'warning' : 'default'} />
           <StatCard icon={MailCheck} label="Warm Leads" value={summary.emailEngaged} tone={summary.emailEngaged > 0 ? 'warning' : 'default'} />
+          <StatCard icon={BarChart3} label="Tier A" value={summary.tierA} tone={summary.tierA > 0 ? 'warning' : 'default'} />
+          <StatCard icon={BarChart3} label="Tier B" value={summary.tierB} />
+          <StatCard icon={Rocket} label="Site Visits" value={summary.websiteVisits} tone={summary.websiteVisits > 0 ? 'warning' : 'default'} />
           <StatCard icon={MailCheck} label="Last 7 Days" value={summary.lastSevenDays} />
-          <StatCard icon={ShieldAlert} label="Spam" value={summary.spam} />
         </div>
-      </section>
-
-      <section className="section-shell mt-8">
-        <Reveal className="panel p-7 sm:p-8">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-            <div>
-              <SectionLabel>Deal Hunter Scoring</SectionLabel>
-              <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Daily source review</h2>
-              <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
-                Pulls the SMB Deal Hunter sheet and the larger Airtable business list, scores recent listings against your acquisition profile, and flags removals for tomorrow's update.
-              </p>
-            </div>
-
-            <div className="grid w-full gap-3 sm:flex sm:w-auto sm:flex-wrap">
-              <button
-                className={secondaryActionButtonClass}
-                disabled={dealHunterLoading || dealHunterSending}
-                onClick={handleLoadDealHunterReview}
-                type="button"
-              >
-                <RefreshCw className={`h-4 w-4 ${dealHunterLoading ? 'animate-spin' : ''}`} />
-                {dealHunterLoading ? 'Reviewing...' : 'Review Sources'}
-              </button>
-              <button
-                className={primaryActionButtonClass}
-                disabled={dealHunterLoading || dealHunterSending}
-                onClick={handleSendDealHunterEmail}
-                type="button"
-              >
-                <Send className="h-4 w-4" />
-                {dealHunterSending ? 'Sending...' : 'Send Daily Email'}
-              </button>
-            </div>
-          </div>
-
-          {dealHunterFeedback.error ? (
-            <p className="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{dealHunterFeedback.error}</p>
-          ) : null}
-          {dealHunterFeedback.message ? (
-            <p className="mt-5 rounded-2xl border border-moss/20 bg-moss/8 px-4 py-3 text-sm font-medium text-moss">{dealHunterFeedback.message}</p>
-          ) : null}
-
-          {dealHunterReview ? (
-            <div className="mt-7 space-y-7">
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
-                <StatCard icon={ClipboardList} label="Reviewed" value={dealHunterReview.totals?.reviewedDeals || 0} />
-                <StatCard icon={BellRing} label="New Fits" value={dealHunterReview.totals?.newMatches || 0} tone={dealHunterReview.totals?.newMatches > 0 ? 'warning' : 'default'} />
-                <StatCard icon={MailCheck} label="High Fit" value={dealHunterReview.totals?.qualified || 0} tone={dealHunterReview.totals?.qualified > 0 ? 'warning' : 'default'} />
-                <StatCard icon={Inbox} label="Watchlist" value={dealHunterReview.totals?.watchlist || 0} />
-                <StatCard icon={ShieldAlert} label="Remove" value={dealHunterReview.totals?.removalCandidates || 0} tone={dealHunterReview.totals?.removalCandidates > 0 ? 'danger' : 'default'} />
-                <StatCard icon={CalendarClock} label="Lookback" value={`${dealHunterReview.lookbackDays || 0}d`} />
-              </div>
-
-              <div className="grid gap-4 lg:grid-cols-2">
-                <div className="rounded-[24px] border border-line/80 bg-fog/70 p-5">
-                  <SectionLabel>Sources</SectionLabel>
-                  <div className="mt-4 space-y-3">
-                    {(dealHunterReview.sources || []).map((source) => (
-                      <div className="rounded-2xl border border-line/80 bg-white/75 px-4 py-3 text-sm leading-6 text-ink/74" key={source.id}>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <p className="font-semibold text-ink">{source.name}</p>
-                          <Pill tone={source.fetched ? 'success' : 'danger'}>{source.fetched ? `${source.rowCount || 0} rows` : 'failed'}</Pill>
-                          <Pill>{source.mode}</Pill>
-                        </div>
-                        {source.error ? <p className="mt-2 text-red-700">{source.error}</p> : null}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="rounded-[24px] border border-line/80 bg-white/70 p-5">
-                  <SectionLabel>Criteria Notes</SectionLabel>
-                  {dealHunterReview.criteriaRecommendations?.length > 0 ? (
-                    <ul className="mt-4 list-disc space-y-2 pl-5 text-sm leading-7 text-ink/74">
-                      {dealHunterReview.criteriaRecommendations.map((item) => (
-                        <li key={item}>{item}</li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="mt-4 text-sm leading-7 text-ink/68">No criteria changes recommended from the latest run.</p>
-                  )}
-                </div>
-              </div>
-
-              {dealHunterReview.newlySeenMatches?.length > 0 ? (
-                <div>
-                  <div className="mb-3 flex items-center justify-between gap-3">
-                    <SectionLabel>Newly Seen Fits</SectionLabel>
-                    <Pill tone="success">{dealHunterReview.newlySeenMatches.length}</Pill>
-                  </div>
-                  <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
-                    {dealHunterReview.newlySeenMatches.slice(0, 6).map((deal) => (
-                      <DealHunterCard deal={deal} key={`new-${deal.sourceName}-${deal.dealKey || deal.id || deal.listingUrl}`} />
-                    ))}
-                  </div>
-                </div>
-              ) : null}
-
-              <div className="grid gap-5 xl:grid-cols-3">
-                <div>
-                  <div className="mb-3 flex items-center justify-between gap-3">
-                    <SectionLabel>High Fit</SectionLabel>
-                    <Pill tone="success">{dealHunterReview.qualified?.length || 0}</Pill>
-                  </div>
-                  <div className="space-y-4">
-                    {(dealHunterReview.qualified || []).slice(0, 4).map((deal) => (
-                      <DealHunterCard deal={deal} key={`qualified-${deal.sourceName}-${deal.id || deal.listingUrl}`} />
-                    ))}
-                    {dealHunterReview.qualified?.length === 0 ? <p className="text-sm leading-7 text-ink/68">No high-fit recent listings found.</p> : null}
-                  </div>
-                </div>
-
-                <div>
-                  <div className="mb-3 flex items-center justify-between gap-3">
-                    <SectionLabel>Watchlist</SectionLabel>
-                    <Pill tone="warning">{dealHunterReview.watchlist?.length || 0}</Pill>
-                  </div>
-                  <div className="space-y-4">
-                    {(dealHunterReview.watchlist || []).slice(0, 4).map((deal) => (
-                      <DealHunterCard deal={deal} key={`watch-${deal.sourceName}-${deal.id || deal.listingUrl}`} mode="watch" />
-                    ))}
-                    {dealHunterReview.watchlist?.length === 0 ? <p className="text-sm leading-7 text-ink/68">No watchlist listings found.</p> : null}
-                  </div>
-                </div>
-
-                <div>
-                  <div className="mb-3 flex items-center justify-between gap-3">
-                    <SectionLabel>Remove</SectionLabel>
-                    <Pill tone="danger">{dealHunterReview.removalCandidates?.length || 0}</Pill>
-                  </div>
-                  <div className="space-y-4">
-                    {(dealHunterReview.removalCandidates || []).slice(0, 4).map((deal) => (
-                      <DealHunterCard deal={deal} key={`remove-${deal.sourceName}-${deal.id || deal.listingUrl}`} mode="remove" />
-                    ))}
-                    {dealHunterReview.removalCandidates?.length === 0 ? <p className="text-sm leading-7 text-ink/68">No removal candidates found.</p> : null}
-                  </div>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <p className="mt-6 rounded-[24px] border border-line/80 bg-fog/70 px-5 py-4 text-sm leading-7 text-ink/70">
-              No source review loaded yet.
-            </p>
-          )}
-        </Reveal>
       </section>
 
       {notifications.length > 0 ? (
@@ -1133,7 +1011,7 @@ export default function DashboardPage() {
                 <SectionLabel>Follow-Up Notifications</SectionLabel>
                 <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Who needs a follow-up next</h2>
                 <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
-                  These prompts are generated from status, lead type, reminder dates, and document activity so you can keep seller and broker conversations moving without guessing.
+                  These prompts are generated from status, lead type, reminder dates, and document activity so you can keep prospect and client conversations moving without guessing.
                 </p>
               </div>
               <Pill tone={summary.overdue > 0 ? 'danger' : 'warning'}>{summary.actionItems} active prompts</Pill>
@@ -1211,15 +1089,60 @@ export default function DashboardPage() {
         </section>
       ) : null}
 
+      {automationTriage.length > 0 ? (
+        <section className="section-shell mt-8">
+          <Reveal className="panel p-7 sm:p-8">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+              <div>
+                <SectionLabel>Automation Triage</SectionLabel>
+                <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Best prospects to prioritize</h2>
+                <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
+                  These tiers combine website-audit findings, outreach engagement, and tracked website visits so follow-up time goes to the strongest opportunities first.
+                </p>
+              </div>
+              <Pill tone={summary.tierA > 0 ? 'success' : 'warning'}>{summary.tierA} Tier A</Pill>
+            </div>
+
+            <div className="mt-6 grid gap-4 lg:grid-cols-2">
+              {automationTriage.slice(0, 6).map((submission) => {
+                const automation = submission.automation;
+
+                return (
+                  <div
+                    className={`rounded-[24px] border p-5 ${notificationToneClasses(automation?.tier === 'A' ? 'warning' : 'info')}`}
+                    key={`automation-triage-${submission.id}`}
+                  >
+                    <div className="flex flex-wrap items-center gap-3">
+                      <p className="text-lg font-semibold">{submission.company || submission.name}</p>
+                      <Pill tone={automationTierTone(automation?.tier)}>{automation?.tier_label || 'Not scored'}</Pill>
+                      <Pill>Score {automation?.score || 0}</Pill>
+                    </div>
+                    <p className="mt-3 text-sm leading-7">{formatAutomationSummary(automation)}</p>
+                    {automation?.score_reasons?.length > 0 ? (
+                      <p className="mt-3 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-7">
+                        {automation.score_reasons.slice(0, 3).join(' · ')}
+                      </p>
+                    ) : null}
+                    <p className="mt-3 text-xs font-semibold uppercase tracking-[0.14em]">
+                      Latest visit: {formatDateTime(automation?.latest_visit_at)}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          </Reveal>
+        </section>
+      ) : null}
+
       {createOpen ? (
         <section className="section-shell mt-8">
           <Reveal className="panel p-6 sm:p-8">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
               <div>
                 <SectionLabel>New CRM Record</SectionLabel>
-                <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Add a broker or seller opportunity manually</h2>
+                <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Add a prospect or client record manually</h2>
                 <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
-                  Use this for broker listings, direct outreach, referrals, or any deal you want in the pipeline before it comes through the website form.
+                  Use this for direct outreach, referrals, client onboarding, or any website-support lead you want in the pipeline before it comes through the public form.
                 </p>
               </div>
             </div>
@@ -1252,9 +1175,9 @@ export default function DashboardPage() {
 
               <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                 <InputField
-                  label="Listing URL"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, listing_url: event.target.value }))}
-                  value={createDraft.listing_url}
+                  label="Lead source URL"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, lead_source_url: event.target.value }))}
+                  value={createDraft.lead_source_url}
                 />
                 <InputField
                   label="Website"
@@ -1262,37 +1185,37 @@ export default function DashboardPage() {
                   value={createDraft.business_website}
                 />
                 <InputField
-                  label="Prospectus / CIM"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, prospectus_url: event.target.value }))}
-                  value={createDraft.prospectus_url}
+                  label="Service interest"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, service_interest: event.target.value }))}
+                  value={createDraft.service_interest}
                 />
                 <InputField
-                  label="Asking price"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, asking_price: event.target.value }))}
-                  value={createDraft.asking_price}
+                  label="Package / budget"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, package_budget: event.target.value }))}
+                  value={createDraft.package_budget}
                 />
               </div>
 
               <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-5">
                 <InputField
-                  label="TTM Revenue"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, ttm_revenue: event.target.value }))}
-                  value={createDraft.ttm_revenue}
+                  label="Monthly lead value"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, monthly_lead_value: event.target.value }))}
+                  value={createDraft.monthly_lead_value}
                 />
                 <InputField
-                  label="TTM EBITDA"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, ttm_ebitda: event.target.value }))}
-                  value={createDraft.ttm_ebitda}
+                  label="Lead goal"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, lead_goal: event.target.value }))}
+                  value={createDraft.lead_goal}
                 />
                 <InputField
-                  label="EBITDA Multiple"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, ebitda_multiple: event.target.value }))}
-                  value={createDraft.ebitda_multiple}
+                  label="Current provider"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, current_provider: event.target.value }))}
+                  value={createDraft.current_provider}
                 />
                 <InputField
-                  label="Net Margin"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, net_margin: event.target.value }))}
-                  value={createDraft.net_margin}
+                  label="Conversion issue"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, conversion_issue: event.target.value }))}
+                  value={createDraft.conversion_issue}
                 />
                 <InputField
                   label="Age"
@@ -1323,48 +1246,48 @@ export default function DashboardPage() {
                   />
                 </Field>
                 <SelectField
-                  label="SBA Eligible?"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, sba_eligible: event.target.value }))}
-                  options={sbaOptions}
-                  value={createDraft.sba_eligible}
+                  label="Priority fit?"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, priority_fit: event.target.value }))}
+                  options={priorityFitOptions}
+                  value={createDraft.priority_fit}
                 />
               </div>
 
               <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
                 <InputField
-                  label="Broker name"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, broker_name: event.target.value }))}
-                  value={createDraft.broker_name}
+                  label="Partner name"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, partner_name: event.target.value }))}
+                  value={createDraft.partner_name}
                 />
                 <InputField
-                  label="Broker email"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, broker_email: event.target.value }))}
+                  label="Partner email"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, partner_email: event.target.value }))}
                   type="email"
-                  value={createDraft.broker_email}
+                  value={createDraft.partner_email}
                 />
                 <InputField
-                  label="Broker phone"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, broker_phone: event.target.value }))}
-                  value={createDraft.broker_phone}
+                  label="Partner phone"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, partner_phone: event.target.value }))}
+                  value={createDraft.partner_phone}
                 />
               </div>
 
               <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
                 <InputField
-                  label="Seller name"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, seller_name: event.target.value }))}
-                  value={createDraft.seller_name}
+                  label="Primary contact name"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, primary_contact_name: event.target.value }))}
+                  value={createDraft.primary_contact_name}
                 />
                 <InputField
-                  label="Seller email"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, seller_email: event.target.value }))}
+                  label="Primary contact email"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, primary_contact_email: event.target.value }))}
                   type="email"
-                  value={createDraft.seller_email}
+                  value={createDraft.primary_contact_email}
                 />
                 <InputField
-                  label="Seller phone"
-                  onChange={(event) => setCreateDraft((current) => ({ ...current, seller_phone: event.target.value }))}
-                  value={createDraft.seller_phone}
+                  label="Primary contact phone"
+                  onChange={(event) => setCreateDraft((current) => ({ ...current, primary_contact_phone: event.target.value }))}
+                  value={createDraft.primary_contact_phone}
                 />
               </div>
 
@@ -1372,13 +1295,13 @@ export default function DashboardPage() {
                 <InputField
                   label="Tags"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, tags: event.target.value }))}
-                  placeholder="manual, broker, inbound"
+                  placeholder="manual, audit, inbound"
                   value={createDraft.tags}
                 />
                 <TextAreaField
-                  label="Deal notes"
+                  label="CRM notes"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, notes: event.target.value }))}
-                  placeholder="Internal notes, context, next steps, or anything from the broker or seller."
+                  placeholder="Internal notes, context, next steps, package fit, website issues, or client preferences."
                   value={createDraft.notes}
                 />
               </div>
@@ -1413,7 +1336,7 @@ export default function DashboardPage() {
                   setFilters((current) => ({ ...current, search: value }));
                 });
               }}
-              placeholder="Search by company, seller, broker, notes, listing URL, website, or email"
+              placeholder="Search by company, contact, partner, notes, source URL, website, or email"
               type="search"
               value={filters.search}
             />
@@ -1453,7 +1376,15 @@ export default function DashboardPage() {
             const documents = submission.secure_documents || [];
             const isSaving = savingSubmissionId === submission.id;
             const isCreatingUpload = creatingUploadForId === submission.id;
+            const isRunningAutomation = runningAutomationForId === submission.id;
+            const isApprovingOutreach = approvingOutreachForId === submission.id;
             const followUpPrompt = submission.follow_up_prompt;
+            const automation = submission.automation || {};
+            const latestAudit = automation.latest_audit;
+            const latestReport = automation.latest_report;
+            const outreachMessages = automation.outreach_messages || [];
+            const websiteVisits = automation.website_visits || [];
+            const hasDraftOutreach = outreachMessages.some((message) => message.status === 'draft');
 
             return (
               <Reveal className="panel p-5 sm:p-8" delay={index * 50} key={submission.id}>
@@ -1484,6 +1415,11 @@ export default function DashboardPage() {
                       submission.email_engagement?.unsubscribed ? (
                         <Pill tone="danger">Email issue</Pill>
                       ) : null}
+                      {automation.score ? (
+                        <Pill tone={automationTierTone(automation.tier)}>
+                          {automation.tier} · {automation.score}
+                        </Pill>
+                      ) : null}
                     </div>
 
                     <div className="mt-4 grid gap-3 text-sm leading-7 text-ink/74 sm:grid-cols-2 xl:grid-cols-4">
@@ -1497,24 +1433,24 @@ export default function DashboardPage() {
 
                     <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
                       <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
-                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Asking Price</p>
-                        <p className="mt-3 text-base font-semibold text-ink">{submission.asking_price || 'Not set'}</p>
+                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Service Interest</p>
+                        <p className="mt-3 text-base font-semibold text-ink">{submission.service_interest || 'Not set'}</p>
                       </div>
                       <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
-                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">TTM Revenue</p>
-                        <p className="mt-3 text-base font-semibold text-ink">{submission.ttm_revenue || 'Not set'}</p>
+                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Package / Budget</p>
+                        <p className="mt-3 text-base font-semibold text-ink">{submission.package_budget || 'Not set'}</p>
                       </div>
                       <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
-                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">TTM EBITDA</p>
-                        <p className="mt-3 text-base font-semibold text-ink">{submission.ttm_ebitda || 'Not set'}</p>
+                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Monthly Lead Value</p>
+                        <p className="mt-3 text-base font-semibold text-ink">{submission.monthly_lead_value || 'Not set'}</p>
                       </div>
                       <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
-                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">EBITDA Multiple</p>
-                        <p className="mt-3 text-base font-semibold text-ink">{submission.ebitda_multiple || 'Not set'}</p>
+                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Lead Goal</p>
+                        <p className="mt-3 text-base font-semibold text-ink">{submission.lead_goal || 'Not set'}</p>
                       </div>
                       <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
-                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">SBA Eligible?</p>
-                        <p className="mt-3 text-base font-semibold text-ink">{formatLabel(submission.sba_eligible || 'unknown')}</p>
+                        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Current Provider</p>
+                        <p className="mt-3 text-base font-semibold text-ink">{submission.current_provider || 'Not set'}</p>
                       </div>
                     </div>
 
@@ -1551,16 +1487,16 @@ export default function DashboardPage() {
                       <SectionLabel>Contacts</SectionLabel>
                       <div className="mt-4 space-y-5 text-sm leading-7 text-ink/74">
                         <div>
-                          <p className="font-semibold text-ink">Broker</p>
-                          <p>{submission.broker_name || 'Not set'}</p>
-                          <p>{submission.broker_email || 'No email'}</p>
-                          <p>{submission.broker_phone || 'No phone'}</p>
+                          <p className="font-semibold text-ink">Partner</p>
+                          <p>{submission.partner_name || 'Not set'}</p>
+                          <p>{submission.partner_email || 'No email'}</p>
+                          <p>{submission.partner_phone || 'No phone'}</p>
                         </div>
                         <div>
-                          <p className="font-semibold text-ink">Seller</p>
-                          <p>{submission.seller_name || 'Not set'}</p>
-                          <p>{submission.seller_email || 'No email'}</p>
-                          <p>{submission.seller_phone || 'No phone'}</p>
+                          <p className="font-semibold text-ink">Primary contact</p>
+                          <p>{submission.primary_contact_name || 'Not set'}</p>
+                          <p>{submission.primary_contact_email || 'No email'}</p>
+                          <p>{submission.primary_contact_phone || 'No phone'}</p>
                         </div>
                       </div>
                     </div>
@@ -1575,7 +1511,109 @@ export default function DashboardPage() {
                       </div>
                     </div>
 
+                    <div className="mt-5 rounded-[24px] border border-line/80 bg-white/70 p-5">
+                      <SectionLabel>Automation Score</SectionLabel>
+                      <div className="mt-4 space-y-3 text-sm leading-7 text-ink/74">
+                        <div className="flex flex-wrap gap-2">
+                          <Pill tone={automationTierTone(automation.tier)}>{automation.tier_label || 'Not scored'}</Pill>
+                          <Pill>Score {automation.score || 0}</Pill>
+                        </div>
+                        <p>{formatAutomationSummary(automation)}</p>
+                        {automation.latest_run?.status ? (
+                          <p>Research run: {formatLabel(automation.latest_run.status)} at {formatDateTime(automation.latest_run.completed_at || automation.latest_run.created_at)}</p>
+                        ) : null}
+                      </div>
+                    </div>
+
                   </div>
+                </div>
+
+                <div className="mt-8 rounded-[24px] border border-line/80 bg-white/70 p-5 sm:p-6">
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                    <div>
+                      <SectionLabel>Automated Research And Outreach</SectionLabel>
+                      <h3 className="mt-3 text-xl font-semibold text-ink">Audit report, personalization, and cadence</h3>
+                      <p className="mt-3 max-w-3xl text-sm leading-7 text-ink/72">
+                        {latestReport?.summary || 'Run the automation to create a website audit snapshot, owner-facing report, and personalized outreach sequence.'}
+                      </p>
+                    </div>
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      <button
+                        className={secondaryActionButtonClass}
+                        disabled={isRunningAutomation || !submission.business_website}
+                        onClick={() => handleRunAutomation(submission.id)}
+                        type="button"
+                      >
+                        <Rocket className="h-4 w-4" />
+                        {isRunningAutomation ? 'Running...' : 'Run Research + Cadence'}
+                      </button>
+                      <button
+                        className={primaryActionButtonClass}
+                        disabled={isApprovingOutreach || !hasDraftOutreach}
+                        onClick={() => handleApproveOutreach(submission.id)}
+                        type="button"
+                      >
+                        <MailCheck className="h-4 w-4" />
+                        {isApprovingOutreach ? 'Approving...' : 'Approve Cadence'}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 grid gap-5 lg:grid-cols-3">
+                    <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Top Findings</p>
+                      {latestAudit?.findings?.length > 0 ? (
+                        <ul className="mt-3 space-y-2 text-sm leading-6 text-ink/74">
+                          {latestAudit.findings.slice(0, 4).map((finding) => (
+                            <li key={`${finding.category}-${finding.title}`}>
+                              <strong className="text-ink">{finding.category}:</strong> {finding.title}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="mt-3 text-sm leading-6 text-ink/68">No audit findings saved yet.</p>
+                      )}
+                    </div>
+
+                    <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Personalized Email Cadence</p>
+                      {outreachMessages.length > 0 ? (
+                        <div className="mt-3 space-y-2 text-sm leading-6 text-ink/74">
+                          {outreachMessages.slice(0, 4).map((message) => (
+                            <div className="rounded-2xl border border-line/80 bg-white/70 px-3 py-2" key={message.id}>
+                              <p className="font-semibold text-ink">Step {message.cadence_step}: {message.subject}</p>
+                              <p>{formatLabel(message.status)} · {formatDateTime(message.scheduled_at)}</p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="mt-3 text-sm leading-6 text-ink/68">No outreach messages generated yet.</p>
+                      )}
+                    </div>
+
+                    <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Tracked Site Visits</p>
+                      {websiteVisits.length > 0 ? (
+                        <div className="mt-3 space-y-2 text-sm leading-6 text-ink/74">
+                          {websiteVisits.slice(0, 4).map((visit) => (
+                            <div className="rounded-2xl border border-line/80 bg-white/70 px-3 py-2" key={visit.id}>
+                              <p className="font-semibold text-ink">{visit.page_path}</p>
+                              <p>{formatDateTime(visit.created_at)} · {visit.source || 'direct'}</p>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="mt-3 text-sm leading-6 text-ink/68">No tracked visits yet.</p>
+                      )}
+                    </div>
+                  </div>
+
+                  {latestReport?.recommended_email_body ? (
+                    <div className="mt-5 rounded-[22px] border border-line/80 bg-fog/70 p-4">
+                      <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Recommended Personalization</p>
+                      <p className="mt-3 whitespace-pre-wrap text-sm leading-7 text-ink/74">{latestReport.recommended_email_body}</p>
+                    </div>
+                  ) : null}
                 </div>
 
                 <div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-6">
@@ -1665,14 +1703,14 @@ export default function DashboardPage() {
                     value={draft.company}
                   />
                   <InputField
-                    label="Listing URL"
+                    label="Lead source URL"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, listing_url: event.target.value },
+                        [submission.id]: { ...draft, lead_source_url: event.target.value },
                       }))
                     }
-                    value={draft.listing_url}
+                    value={draft.lead_source_url}
                   />
                   <InputField
                     label="Website"
@@ -1685,67 +1723,67 @@ export default function DashboardPage() {
                     value={draft.business_website}
                   />
                   <InputField
-                    label="Prospectus / CIM"
+                    label="Service interest"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, prospectus_url: event.target.value },
+                        [submission.id]: { ...draft, service_interest: event.target.value },
                       }))
                     }
-                    value={draft.prospectus_url}
+                    value={draft.service_interest}
                   />
                 </div>
 
                 <div className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-6">
                   <InputField
-                    label="Asking price"
+                    label="Package / budget"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, asking_price: event.target.value },
+                        [submission.id]: { ...draft, package_budget: event.target.value },
                       }))
                     }
-                    value={draft.asking_price}
+                    value={draft.package_budget}
                   />
                   <InputField
-                    label="TTM Revenue"
+                    label="Monthly lead value"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, ttm_revenue: event.target.value },
+                        [submission.id]: { ...draft, monthly_lead_value: event.target.value },
                       }))
                     }
-                    value={draft.ttm_revenue}
+                    value={draft.monthly_lead_value}
                   />
                   <InputField
-                    label="TTM EBITDA"
+                    label="Lead goal"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, ttm_ebitda: event.target.value },
+                        [submission.id]: { ...draft, lead_goal: event.target.value },
                       }))
                     }
-                    value={draft.ttm_ebitda}
+                    value={draft.lead_goal}
                   />
                   <InputField
-                    label="EBITDA Multiple"
+                    label="Current provider"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, ebitda_multiple: event.target.value },
+                        [submission.id]: { ...draft, current_provider: event.target.value },
                       }))
                     }
-                    value={draft.ebitda_multiple}
+                    value={draft.current_provider}
                   />
                   <InputField
-                    label="Net Margin"
+                    label="Conversion issue"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, net_margin: event.target.value },
+                        [submission.id]: { ...draft, conversion_issue: event.target.value },
                       }))
                     }
-                    value={draft.net_margin}
+                    value={draft.conversion_issue}
                   />
                   <InputField
                     label="Age"
@@ -1761,15 +1799,15 @@ export default function DashboardPage() {
 
                 <div className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                   <SelectField
-                    label="SBA Eligible?"
+                    label="Priority fit?"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, sba_eligible: event.target.value },
+                        [submission.id]: { ...draft, priority_fit: event.target.value },
                       }))
                     }
-                    options={sbaOptions}
-                    value={draft.sba_eligible}
+                    options={priorityFitOptions}
+                    value={draft.priority_fit}
                   />
                   <InputField
                     label="Tags"
@@ -1779,82 +1817,82 @@ export default function DashboardPage() {
                         [submission.id]: { ...draft, tags: event.target.value },
                       }))
                     }
-                    placeholder="seller, broker, inbound"
+                    placeholder="audit, prospect, client"
                     value={draft.tags}
                   />
                 </div>
 
                 <div className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
                   <InputField
-                    label="Broker name"
+                    label="Partner name"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, broker_name: event.target.value },
+                        [submission.id]: { ...draft, partner_name: event.target.value },
                       }))
                     }
-                    value={draft.broker_name}
+                    value={draft.partner_name}
                   />
                   <InputField
-                    label="Broker email"
+                    label="Partner email"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, broker_email: event.target.value },
+                        [submission.id]: { ...draft, partner_email: event.target.value },
                       }))
                     }
                     type="email"
-                    value={draft.broker_email}
+                    value={draft.partner_email}
                   />
                   <InputField
-                    label="Broker phone"
+                    label="Partner phone"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, broker_phone: event.target.value },
+                        [submission.id]: { ...draft, partner_phone: event.target.value },
                       }))
                     }
-                    value={draft.broker_phone}
+                    value={draft.partner_phone}
                   />
                 </div>
 
                 <div className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
                   <InputField
-                    label="Seller name"
+                    label="Primary contact name"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, seller_name: event.target.value },
+                        [submission.id]: { ...draft, primary_contact_name: event.target.value },
                       }))
                     }
-                    value={draft.seller_name}
+                    value={draft.primary_contact_name}
                   />
                   <InputField
-                    label="Seller email"
+                    label="Primary contact email"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, seller_email: event.target.value },
+                        [submission.id]: { ...draft, primary_contact_email: event.target.value },
                       }))
                     }
                     type="email"
-                    value={draft.seller_email}
+                    value={draft.primary_contact_email}
                   />
                   <InputField
-                    label="Seller phone"
+                    label="Primary contact phone"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
-                        [submission.id]: { ...draft, seller_phone: event.target.value },
+                        [submission.id]: { ...draft, primary_contact_phone: event.target.value },
                       }))
                     }
-                    value={draft.seller_phone}
+                    value={draft.primary_contact_phone}
                   />
                 </div>
 
                 <div className="mt-5 grid gap-5 lg:grid-cols-[1.2fr_0.8fr]">
                   <TextAreaField
-                    label="Deal notes"
+                    label="CRM notes"
                     onChange={(event) =>
                       setDrafts((current) => ({
                         ...current,
@@ -1894,14 +1932,13 @@ export default function DashboardPage() {
                                   <p className="font-semibold text-ink">{document.original_name}</p>
                                   <p className="mt-1 text-xs uppercase tracking-[0.14em] text-moss/70">{document.document_type}</p>
                                 </div>
-                                <button
+                                <a
                                   className="inline-flex items-center gap-2 rounded-full border border-ink/10 bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
-                                  onClick={() => copyText(document.original_name)}
-                                  type="button"
+                                  href={`/api/admin/secure-documents/${document.id}/download`}
                                 >
-                                  <Copy className="h-3.5 w-3.5" />
-                                  Copy Name
-                                </button>
+                                  <Download className="h-3.5 w-3.5" />
+                                  Download
+                                </a>
                               </div>
                             </div>
                           ))}

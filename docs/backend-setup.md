@@ -11,7 +11,7 @@ The site now includes:
 - Private admin CRM at `/admin`
 - Email magic-link admin auth with optional password fallback
 - Workflow fields for assignee, notes, tags, priority, follow-up state, and next action date
-- Secure upload request generation and a seller-facing upload page at `/secure-documents`
+- Secure upload request generation and a client onboarding upload page at `/secure-documents`
 - Email engagement event tracking and follow-up triage via `/api/webhooks/resend`
 - Spam protection with honeypot, time-to-submit checks, rate limiting, message heuristics, and optional Cloudflare Turnstile
 - Serverless support through [api/[...path].js](/Users/Matt/Documents/Uckele Group/api/[...path].js)
@@ -37,47 +37,64 @@ This starts:
 
 Vite proxies `/api/*` requests to the backend during development.
 
-## Daily Deal Hunter Review
+## Research And Audit Workflow
 
-The private admin CRM includes a Deal Hunter scoring panel that can pull the SMB Deal Hunter Google Sheet CSV and the larger Airtable shared business list, score recent listings, and send the daily email.
+The private admin CRM is oriented around website audit requests, lead follow-up, secure onboarding files, and email engagement tracking. Manual prospect research and audit records should be saved to the CRM before any automated outreach cadence is enabled, so findings can be reviewed before they are used in client-facing emails.
 
-Configure:
+Current backend support includes:
 
-- `DEAL_HUNTER_EMAIL_RECIPIENT`
-- `DEAL_HUNTER_SHEET_CSV_URL` or `DEAL_HUNTER_SHEET_CSV_URLS`
-- `DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL`
-- `DEAL_HUNTER_DAILY_EMAIL_ENABLED`
-- `DEAL_HUNTER_DAILY_EMAIL_TIME`
-- `DEAL_HUNTER_DAILY_EMAIL_TIMEZONE`
-- `DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR` if you want to override the default durable send-marker directory
-- `DEAL_HUNTER_CRON_SECRET` if you also want to trigger the protected endpoint externally
+- inbound website audit requests through `/api/contact`
+- private CRM records at `/admin`
+- secure onboarding file requests through `/secure-documents`
+- Resend webhook event tracking for opens, clicks, bounces, complaints, and unsubscribes
+- durable storage for contact notes, follow-up state, tags, uploaded document metadata, and email events
 
-Optional Airtable API mode:
+The CRM API exposes production-facing field aliases such as `lead_source_url`, `service_interest`, `package_budget`, `partner_email`, and `primary_contact_email`. The underlying storage still keeps some older compatibility columns so existing records remain readable until a formal database migration is scheduled.
 
-- `DEAL_HUNTER_AIRTABLE_TOKEN` with `data.records:read`
-- `DEAL_HUNTER_AIRTABLE_BASE_ID`
-- `DEAL_HUNTER_AIRTABLE_TABLE_ID`
-- `DEAL_HUNTER_AIRTABLE_VIEW_ID`
+## Cal.com Scheduling Link
 
-Use Airtable API mode for the larger business list in production. The unauthenticated shared-view payload is guarded by `DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES`; if Airtable returns an oversized JSON payload, the source is marked failed instead of crashing the daily email job.
+Use hosted Cal.com for prospect scheduling. Create an event such as `15-minute website audit call`, connect your calendar in Cal.com, then set:
+
+```bash
+PUBLIC_SCHEDULING_URL=https://cal.com/your-username/15-minute-website-audit
+VITE_PUBLIC_SCHEDULING_URL=https://cal.com/your-username/15-minute-website-audit
+```
+
+When this value is present, the public site changes booking CTAs from the contact-form fallback to the Cal.com booking link. Because this is a Vite frontend variable, rebuild and redeploy after changing it.
+The runtime `PUBLIC_SCHEDULING_URL` is used when generating personalized outreach emails.
+
+## Prospect Automation
+
+The CRM stores automated prospect work in durable tables:
+
+- `research_runs`
+- `prospect_audits`
+- `generated_reports`
+- `outreach_messages`
+- `website_visits`
+- `email_suppressions`
 
 Admin endpoints:
 
-- `GET /api/admin/deal-hunter/review`
-- `POST /api/admin/deal-hunter/send`
+- `POST /api/admin/submissions/:id/automation/run` runs website research for one CRM record, saves findings, creates a report, scores the prospect into Tier A-D, and generates a personalized outreach cadence.
+- `POST /api/admin/submissions/:id/outreach/approve` moves reviewed draft outreach messages into the scheduled queue after compliance and research-quality checks pass.
+- `POST /api/admin/outreach/send-due` sends due scheduled outreach messages only when `OUTREACH_AUTOMATION_ENABLED=true`.
+- `POST /api/track/visit` records visits from tracked outreach links back to the CRM record.
+- `GET|POST /unsubscribe/:token` suppresses a recipient from future outreach and blocks remaining draft/scheduled messages for that CRM record.
 
-The production Fly machine runs the in-app scheduler once daily at the configured local time. The scheduler records successful Daily Deal Hunter sends in `email_events` and also writes a local send marker under the configured data directory, so a server restart does not resend the same day's email.
+Recommended launch defaults:
 
-Optional external scheduler endpoint:
-
-```text
-POST /api/deal-hunter/daily-email
-Authorization: Bearer DEAL_HUNTER_CRON_SECRET
+```bash
+OUTREACH_AUTOMATION_ENABLED=false
+OUTREACH_SCHEDULER_ENABLED=false
+OUTREACH_SCHEDULER_INTERVAL_MS=900000
+OUTREACH_AUTO_SCHEDULE_AFTER_RESEARCH=false
+OUTREACH_DAILY_SEND_LIMIT=25
+OUTREACH_CADENCE_DAYS=0,3,7,14
+OUTREACH_UNSUBSCRIBE_SECRET=replace-with-a-random-secret
 ```
 
-The scoring profile treats management in place as preferred, not required. It flags food/beverage, hospitality, retail/ecommerce, SaaS/software, marketing, staffing, franchises, delivery routes, FedEx/Amazon route listings, and owner-license medical practices for removal from the next daily update.
-
-The send path records Deal Hunter listing history in `deal_hunter_seen_deals`, so future daily emails can identify newly seen matches instead of repeatedly treating the same source rows as new. Admin-only source reviews show the current new/seen status without marking listings as seen; sending the daily email marks that reviewed batch as seen after delivery succeeds.
+Keep broad sending disabled until the sending domain, physical mailing address, unsubscribe/suppression process, and review workflow are ready.
 
 ## Delivery Provider Options
 
