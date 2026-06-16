@@ -3,6 +3,10 @@ import express from 'express';
 import { fileURLToPath } from 'node:url';
 import { getConfig } from './config.js';
 import {
+  getAcquisitionCommandCenter,
+  updateAcquisitionCommandCenterRecord,
+} from './services/acquisitionCommandCenter.js';
+import {
   getAdminAuthState,
   getAdminSession,
   loginAdmin,
@@ -207,6 +211,53 @@ export function createApp() {
     response.setHeader('Set-Cookie', logoutAdmin());
     response.json({ success: true });
   });
+
+  app.get(
+    '/api/admin/acquisition-command-center',
+    asyncRoute(async (request, response) => {
+      if (!requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const commandCenter = await getAcquisitionCommandCenter();
+      response.json({
+        success: true,
+        commandCenter,
+      });
+    }),
+  );
+
+  app.post(
+    '/api/admin/acquisition-command-center/:id',
+    asyncRoute(async (request, response) => {
+      const session = requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await updateAcquisitionCommandCenterRecord({
+        submissionId: request.params.id,
+        pipelineStage: request.body?.pipelineStage || '',
+        passReason: request.body?.passReason || '',
+        fitFeedback: request.body?.fitFeedback || '',
+        feedbackNote: request.body?.feedbackNote || '',
+        updatedBy: session.username || 'admin',
+      });
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error });
+        return;
+      }
+
+      response.json({
+        success: true,
+        ...result,
+      });
+    }),
+  );
 
   app.get(
     '/api/admin/submissions',

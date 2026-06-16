@@ -1,10 +1,13 @@
 import { startTransition, useDeferredValue, useEffect, useMemo, useState } from 'react';
 import {
+  Activity,
   BellRing,
   CalendarClock,
+  CheckCircle2,
   ClipboardList,
   Copy,
   Download,
+  Gauge,
   Inbox,
   Link2,
   LogOut,
@@ -16,6 +19,8 @@ import {
   Search,
   Send,
   ShieldAlert,
+  Target,
+  XCircle,
 } from 'lucide-react';
 import PageHero from '../components/PageHero';
 import Reveal from '../components/Reveal';
@@ -37,6 +42,29 @@ const diligenceStages = [
   'passed',
 ];
 const diligenceDecisions = ['undecided', 'advance', 'pause', 'pass'];
+const acquisitionPipelineStages = [
+  'new-fit',
+  'cim-requested',
+  'broker-replied',
+  'docs-received',
+  'diligence',
+  'loi-candidate',
+  'passed',
+];
+const acquisitionPassReasons = [
+  'fedex-route',
+  'physician-owner-required',
+  'too-small',
+  'too-expensive',
+  'customer-concentration',
+  'weak-recurring-revenue',
+  'poor-management-transition',
+  'food-or-hospitality',
+  'high-capex',
+  'low-ai-recession-resistance',
+  'seller-financing-gap',
+  'other',
+];
 const diligenceChecklistItems = [
   { id: 'cim', label: 'CIM / teaser' },
   { id: 'nda', label: 'NDA' },
@@ -82,6 +110,39 @@ function formatLabel(value) {
   return String(value || '')
     .replace(/[-_]/g, ' ')
     .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function formatPipelineStage(value) {
+  const labels = {
+    'new-fit': 'New fit',
+    'cim-requested': 'CIM requested',
+    'broker-replied': 'Broker replied',
+    'docs-received': 'Docs received',
+    diligence: 'Diligence',
+    'loi-candidate': 'LOI candidate',
+    passed: 'Passed',
+  };
+
+  return labels[value] || formatLabel(value || 'new-fit');
+}
+
+function formatPassReason(value) {
+  const labels = {
+    'fedex-route': 'FedEx route',
+    'physician-owner-required': 'Physician-owner required',
+    'too-small': 'Too small',
+    'too-expensive': 'Too expensive',
+    'customer-concentration': 'Customer concentration',
+    'weak-recurring-revenue': 'Weak recurring revenue',
+    'poor-management-transition': 'Poor management transition',
+    'food-or-hospitality': 'Food or hospitality',
+    'high-capex': 'High capex',
+    'low-ai-recession-resistance': 'Low AI/recession resistance',
+    'seller-financing-gap': 'Seller financing gap',
+    other: 'Other',
+  };
+
+  return labels[value] || formatLabel(value || '');
 }
 
 function formatLeadTier(value) {
@@ -197,6 +258,38 @@ function dealScoreTone(score) {
   }
 
   if (score >= 55) {
+    return 'warning';
+  }
+
+  return 'danger';
+}
+
+function commandCenterTone(value) {
+  if (value === 'danger') {
+    return 'danger';
+  }
+
+  if (value === 'warning') {
+    return 'warning';
+  }
+
+  if (value === 'success') {
+    return 'success';
+  }
+
+  if (value === 'info') {
+    return 'info';
+  }
+
+  return 'default';
+}
+
+function diligenceReadinessTone(score = 0) {
+  if (score >= 80) {
+    return 'success';
+  }
+
+  if (score >= 50) {
     return 'warning';
   }
 
@@ -618,6 +711,153 @@ function DealHunterCard({ deal, mode = 'fit', onSendCimRequest, requestingCim = 
   );
 }
 
+function CommandCenterActionItem({ action }) {
+  const record = action.record;
+
+  return (
+    <div className={`rounded-[24px] border p-4 ${notificationToneClasses(action.priority)}`}>
+      <div className="flex flex-wrap items-center gap-2">
+        <Pill tone={commandCenterTone(action.priority)}>{formatLabel(action.type)}</Pill>
+        {record?.score ? <Pill tone={dealScoreTone(record.score)}>Score {record.score}</Pill> : null}
+      </div>
+      <p className="mt-3 text-sm font-semibold uppercase tracking-[0.14em]">{action.title}</p>
+      <p className="mt-2 text-sm leading-6">{action.message}</p>
+      {record ? (
+        <p className="mt-2 text-xs font-semibold uppercase tracking-[0.14em]">
+          {record.company} | {formatPipelineStage(record.pipelineStage)}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function CommandCenterRecordCard({ record, updating, onUpdate }) {
+  const missingReadiness = record.readiness?.missing || [];
+  const contactEmail = record.brokerEmail || record.sellerEmail || '';
+  const isPassed = record.pipelineStage === 'passed';
+  const feedbackTone = record.fitFeedback === 'good-fit' ? 'success' : record.fitFeedback === 'false-positive' ? 'danger' : 'default';
+
+  return (
+    <div className="rounded-[24px] border border-line/80 bg-white/80 p-5 text-sm leading-6 text-ink/74">
+      <div className="flex flex-wrap items-center gap-2">
+        <Pill tone={dealScoreTone(record.score)}>Score {record.score}</Pill>
+        <Pill tone={commandCenterTone(record.pipelineTone)}>{formatPipelineStage(record.pipelineStage)}</Pill>
+        <Pill tone={diligenceReadinessTone(record.readiness?.score || 0)}>Ready {record.readiness?.score || 0}%</Pill>
+        <Pill tone={feedbackTone}>{record.fitFeedback === 'neutral' ? 'No feedback' : formatLabel(record.fitFeedback)}</Pill>
+      </div>
+
+      <h3 className="mt-3 text-lg font-semibold leading-snug text-ink">{record.company}</h3>
+      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+        <p><strong>Contact:</strong> {contactEmail || 'No broker/seller email'}</p>
+        <p><strong>Next action:</strong> {formatDateTime(record.nextActionAt)}</p>
+        <p><strong>Ask:</strong> {record.askingPrice || 'Not disclosed'}</p>
+        <p><strong>TTM EBITDA:</strong> {record.ttmEbitda || 'Not disclosed'}</p>
+      </div>
+
+      {record.recommendation ? (
+        <p className="mt-4 rounded-2xl border border-line/80 bg-fog/70 px-4 py-3">{record.recommendation}</p>
+      ) : null}
+
+      {record.concerns?.length > 0 ? (
+        <div className="mt-4">
+          <p className="font-semibold uppercase tracking-[0.14em] text-moss">Watch items</p>
+          <ul className="mt-2 list-disc space-y-1 pl-5">
+            {record.concerns.slice(0, 3).map((concern) => (
+              <li key={`${record.id}-${concern}`}>{concern}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {missingReadiness.length > 0 ? (
+        <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-amber-800">
+          <p className="font-semibold uppercase tracking-[0.14em]">Diligence gaps</p>
+          <p className="mt-2">{missingReadiness.slice(0, 3).map((item) => item.label).join(', ')}</p>
+        </div>
+      ) : null}
+
+      {record.passReason ? (
+        <p className="mt-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 font-medium text-red-700">
+          Passed: {formatPassReason(record.passReason)}
+        </p>
+      ) : null}
+
+      <div className="mt-5 flex flex-wrap gap-2">
+        <button
+          className="inline-flex items-center justify-center gap-2 rounded-full border border-moss/20 bg-moss/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-moss transition hover:border-moss disabled:opacity-50"
+          disabled={updating}
+          onClick={() => onUpdate(record, { fitFeedback: 'good-fit' })}
+          type="button"
+        >
+          <CheckCircle2 className="h-4 w-4" />
+          Good Fit
+        </button>
+        <button
+          className="inline-flex items-center justify-center gap-2 rounded-full border border-red-200 bg-red-50 px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-red-700 transition hover:border-red-300 disabled:opacity-50"
+          disabled={updating}
+          onClick={() => onUpdate(record, { fitFeedback: 'false-positive' })}
+          type="button"
+        >
+          <XCircle className="h-4 w-4" />
+          False Positive
+        </button>
+        {!isPassed ? (
+          <>
+            <button
+              className="inline-flex items-center justify-center rounded-full border border-ink/10 bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50"
+              disabled={updating}
+              onClick={() => onUpdate(record, { pipelineStage: 'diligence' })}
+              type="button"
+            >
+              Move To Diligence
+            </button>
+            <button
+              className="inline-flex items-center justify-center rounded-full border border-ink/10 bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50"
+              disabled={updating}
+              onClick={() => onUpdate(record, { pipelineStage: 'loi-candidate', fitFeedback: 'good-fit' })}
+              type="button"
+            >
+              LOI Candidate
+            </button>
+          </>
+        ) : null}
+      </div>
+
+      <div className="mt-4">
+        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss">Quick pass</p>
+        <div className="mt-2 flex flex-wrap gap-2">
+          {acquisitionPassReasons.map((reason) => (
+            <button
+              className="inline-flex items-center justify-center rounded-full border border-red-200 bg-white px-3 py-2 text-xs font-semibold text-red-700 transition hover:bg-red-50 disabled:opacity-50"
+              disabled={updating}
+              key={`${record.id}-${reason}`}
+              onClick={() => onUpdate(record, { pipelineStage: 'passed', passReason: reason, fitFeedback: 'false-positive' })}
+              type="button"
+            >
+              {formatPassReason(reason)}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="mt-4 flex flex-wrap gap-3">
+        {record.listingUrl ? (
+          <a className="inline-flex items-center gap-2 text-sm font-semibold text-moss underline" href={record.listingUrl} rel="noreferrer" target="_blank">
+            <Link2 className="h-4 w-4" />
+            Listing
+          </a>
+        ) : null}
+        {record.prospectusUrl ? (
+          <a className="inline-flex items-center gap-2 text-sm font-semibold text-moss underline" href={record.prospectusUrl} rel="noreferrer" target="_blank">
+            <ClipboardList className="h-4 w-4" />
+            Documents
+          </a>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 async function copyText(value) {
   if (navigator.clipboard?.writeText) {
     await navigator.clipboard.writeText(value);
@@ -665,6 +905,10 @@ export default function DashboardPage() {
   const [dealHunterFollowUpRunning, setDealHunterFollowUpRunning] = useState(false);
   const [requestingCimDealKey, setRequestingCimDealKey] = useState('');
   const [dealHunterFeedback, setDealHunterFeedback] = useState({ error: '', message: '' });
+  const [commandCenter, setCommandCenter] = useState(null);
+  const [commandCenterLoading, setCommandCenterLoading] = useState(false);
+  const [commandCenterUpdatingId, setCommandCenterUpdatingId] = useState('');
+  const [commandCenterFeedback, setCommandCenterFeedback] = useState({ error: '', message: '' });
   const [prospectDiscovery, setProspectDiscovery] = useState({
     config: null,
     summary: null,
@@ -773,6 +1017,34 @@ export default function DashboardPage() {
     }
   }
 
+  async function loadCommandCenter() {
+    setCommandCenterLoading(true);
+    setCommandCenterFeedback((current) => ({ ...current, error: '' }));
+
+    try {
+      const response = await fetch('/api/admin/acquisition-command-center', {
+        credentials: 'same-origin',
+      });
+
+      if (response.status === 401) {
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '' }));
+        return;
+      }
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to load the acquisition command center.');
+      }
+
+      setCommandCenter(result.commandCenter);
+    } catch (error) {
+      setCommandCenterFeedback({ error: error.message || 'Unable to load the acquisition command center.', message: '' });
+    } finally {
+      setCommandCenterLoading(false);
+    }
+  }
+
   async function loadProspectDiscovery() {
     setProspectDiscoveryLoading(true);
 
@@ -828,9 +1100,15 @@ export default function DashboardPage() {
   useEffect(() => {
     if (authState.authenticated) {
       loadDashboard(filters.status, deferredSearch.trim());
-      loadProspectDiscovery();
     }
   }, [authState.authenticated, deferredSearch, filters.status]);
+
+  useEffect(() => {
+    if (authState.authenticated) {
+      loadCommandCenter();
+      loadProspectDiscovery();
+    }
+  }, [authState.authenticated]);
 
   async function handleMagicLinkRequest(event) {
     event.preventDefault();
@@ -945,11 +1223,49 @@ export default function DashboardPage() {
         ...current,
         [submissionId]: buildDraft(result.submission),
       }));
-      await loadDashboard(filters.status, deferredSearch.trim());
+      await Promise.all([
+        loadDashboard(filters.status, deferredSearch.trim()),
+        loadCommandCenter(),
+      ]);
     } catch (error) {
       setActionError(error.message || 'Unable to update submission.');
     } finally {
       setSavingSubmissionId('');
+    }
+  }
+
+  async function handleCommandCenterUpdate(record, payload) {
+    if (!record?.id) {
+      return;
+    }
+
+    setCommandCenterUpdatingId(record.id);
+    setCommandCenterFeedback({ error: '', message: '' });
+
+    try {
+      const response = await fetch(`/api/admin/acquisition-command-center/${record.id}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to update the command center record.');
+      }
+
+      setCommandCenterFeedback({ error: '', message: `${record.company} updated.` });
+      await Promise.all([
+        loadCommandCenter(),
+        loadDashboard(filters.status, deferredSearch.trim()),
+      ]);
+    } catch (error) {
+      setCommandCenterFeedback({ error: error.message || 'Unable to update the command center record.', message: '' });
+    } finally {
+      setCommandCenterUpdatingId('');
     }
   }
 
@@ -976,7 +1292,10 @@ export default function DashboardPage() {
 
       setCreateDraft(blankRecordDraft());
       setCreateOpen(false);
-      await loadDashboard(filters.status, deferredSearch.trim());
+      await Promise.all([
+        loadDashboard(filters.status, deferredSearch.trim()),
+        loadCommandCenter(),
+      ]);
     } catch (error) {
       setCreateError(error.message || 'Unable to create the CRM record.');
     } finally {
@@ -1059,6 +1378,7 @@ export default function DashboardPage() {
 
       setDealHunterReview(result.review);
       setDealHunterFeedback({ error: '', message: `Reviewed ${result.review?.totals?.reviewedDeals || 0} recent deals.` });
+      await loadCommandCenter();
     } catch (error) {
       setDealHunterFeedback({ error: error.message || 'Unable to review daily deals.', message: '' });
     } finally {
@@ -1087,6 +1407,10 @@ export default function DashboardPage() {
         ? ` CRM sync: ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped.`
         : '';
       setDealHunterFeedback({ error: '', message: `Daily deal email sent.${crmMessage}` });
+      await Promise.all([
+        loadCommandCenter(),
+        loadDashboard(filters.status, deferredSearch.trim()),
+      ]);
     } catch (error) {
       setDealHunterFeedback({ error: error.message || 'Unable to send the daily deal email.', message: '' });
     } finally {
@@ -1150,6 +1474,10 @@ export default function DashboardPage() {
         error: '',
         message: result.alreadySent ? `CIM request was already sent to ${recipient}.` : `CIM request sent to ${recipient}.`,
       });
+      await Promise.all([
+        loadCommandCenter(),
+        loadDashboard(filters.status, deferredSearch.trim()),
+      ]);
     } catch (error) {
       setDealHunterFeedback({ error: error.message || 'Unable to send the CIM request.', message: '' });
     } finally {
@@ -1178,6 +1506,10 @@ export default function DashboardPage() {
 
       const message = `CIM follow-up check complete: ${result.sent || 0} sent, ${result.responded || 0} replied, ${result.stopped || 0} stopped, ${result.failed || 0} failed.`;
       await handleLoadDealHunterReview();
+      await Promise.all([
+        loadCommandCenter(),
+        loadDashboard(filters.status, deferredSearch.trim()),
+      ]);
       setDealHunterFeedback({ error: '', message });
     } catch (error) {
       setDealHunterFeedback({ error: error.message || 'Unable to run CIM follow-ups.', message: '' });
@@ -1225,6 +1557,7 @@ export default function DashboardPage() {
       await Promise.all([
         loadProspectDiscovery(),
         loadDashboard(filters.status, deferredSearch.trim()),
+        loadCommandCenter(),
       ]);
     } catch (error) {
       setProspectDiscoveryFeedback({ error: error.message || 'Unable to run prospect discovery.', message: '' });
@@ -1253,6 +1586,17 @@ export default function DashboardPage() {
   const submissions = useMemo(() => dashboardData.submissions || [], [dashboardData.submissions]);
   const notifications = useMemo(() => dashboardData.notifications || [], [dashboardData.notifications]);
   const emailTriage = useMemo(() => dashboardData.emailTriage || [], [dashboardData.emailTriage]);
+  const commandSummary = commandCenter?.summary || {
+    totalRecords: 0,
+    score75Plus: 0,
+    activeConversations: 0,
+    actionItems: 0,
+    sourceIssues: 0,
+    lowReadiness: 0,
+  };
+  const commandPipeline = commandCenter?.pipeline || acquisitionPipelineStages.map((stage) => ({ id: stage, count: 0, records: [] }));
+  const commandSourceHealth = commandCenter?.sourceHealth || { healthy: true, issues: [], sources: [], totals: {} };
+  const commandFeedback = commandCenter?.feedback || { goodFit: 0, falsePositive: 0, falsePositiveReasons: {}, recommendations: [] };
 
   if (!authState.checked) {
     return (
@@ -1427,6 +1771,175 @@ export default function DashboardPage() {
           <StatCard icon={MailCheck} label="Last 7 Days" value={summary.lastSevenDays} />
           <StatCard icon={ShieldAlert} label="Spam" value={summary.spam} />
         </div>
+      </section>
+
+      <section className="section-shell mt-8">
+        <Reveal className="panel p-7 sm:p-8">
+          <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <SectionLabel>Acquisition Command Center</SectionLabel>
+              <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">75+ deal pipeline and active broker conversations</h2>
+              <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
+                Focused view for high-fit opportunities, CIM conversations, pass decisions, diligence readiness, and source health across the full CRM.
+              </p>
+            </div>
+
+            <button
+              className={secondaryActionButtonClass}
+              disabled={commandCenterLoading}
+              onClick={loadCommandCenter}
+              type="button"
+            >
+              <RefreshCw className={`h-4 w-4 ${commandCenterLoading ? 'animate-spin' : ''}`} />
+              {commandCenterLoading ? 'Refreshing...' : 'Refresh Command Center'}
+            </button>
+          </div>
+
+          {commandCenterFeedback.error ? (
+            <p className="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{commandCenterFeedback.error}</p>
+          ) : null}
+          {commandCenterFeedback.message ? (
+            <p className="mt-5 rounded-2xl border border-moss/20 bg-moss/8 px-4 py-3 text-sm font-medium text-moss">{commandCenterFeedback.message}</p>
+          ) : null}
+
+          <div className="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
+            <StatCard icon={Target} label="75+ Deals" value={commandSummary.score75Plus} tone={commandSummary.score75Plus > 0 ? 'success' : 'default'} />
+            <StatCard icon={MailCheck} label="Active Talks" value={commandSummary.activeConversations} tone={commandSummary.activeConversations > 0 ? 'warning' : 'default'} />
+            <StatCard icon={BellRing} label="Queue" value={commandSummary.actionItems} tone={commandSummary.actionItems > 0 ? 'warning' : 'default'} />
+            <StatCard icon={Activity} label="Source Issues" value={commandSummary.sourceIssues} tone={commandSummary.sourceIssues > 0 ? 'danger' : 'success'} />
+            <StatCard icon={Gauge} label="Low Readiness" value={commandSummary.lowReadiness} tone={commandSummary.lowReadiness > 0 ? 'warning' : 'default'} />
+            <StatCard icon={CheckCircle2} label="Good Fits" value={commandFeedback.goodFit || 0} tone="success" />
+          </div>
+
+          <div className="mt-7 grid gap-5 xl:grid-cols-[0.95fr_1.05fr]">
+            <div className="rounded-[24px] border border-line/80 bg-fog/70 p-5">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <SectionLabel>Source Health</SectionLabel>
+                <Pill tone={commandSourceHealth.healthy ? 'success' : 'warning'}>
+                  {commandSourceHealth.healthy ? 'Healthy' : 'Needs review'}
+                </Pill>
+              </div>
+              <p className="mt-3 text-sm leading-6 text-ink/68">Last checked: {formatDateTime(commandSourceHealth.generatedAt)}</p>
+              <div className="mt-4 space-y-3">
+                {(commandSourceHealth.sources || []).map((source) => (
+                  <div className="rounded-2xl border border-line/80 bg-white/75 px-4 py-3 text-sm leading-6 text-ink/74" key={source.id}>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="font-semibold text-ink">{source.name || source.id}</p>
+                      <Pill tone={commandCenterTone(source.tone)}>{source.fetched ? `${source.rowCount || 0} rows` : 'failed'}</Pill>
+                      {source.previousRowCount ? (
+                        <Pill tone={source.rowDelta < 0 ? 'warning' : 'default'}>
+                          {source.rowDelta >= 0 ? '+' : ''}{source.rowDelta}
+                        </Pill>
+                      ) : null}
+                    </div>
+                    {source.error ? <p className="mt-2 text-red-700">{source.error}</p> : null}
+                  </div>
+                ))}
+                {commandSourceHealth.sources?.length === 0 ? (
+                  <p className="text-sm leading-7 text-ink/68">No source health data loaded yet.</p>
+                ) : null}
+              </div>
+              {commandSourceHealth.issues?.length > 0 ? (
+                <div className="mt-4 space-y-2">
+                  {commandSourceHealth.issues.map((issue) => (
+                    <p className={`rounded-2xl border px-4 py-3 text-sm font-medium ${notificationToneClasses(issue.tone)}`} key={`${issue.sourceId}-${issue.message}`}>
+                      {issue.title}: {issue.message}
+                    </p>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+
+            <div className="rounded-[24px] border border-line/80 bg-white/70 p-5">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <SectionLabel>Global Action Queue</SectionLabel>
+                <Pill tone={commandSummary.actionItems > 0 ? 'warning' : 'success'}>{commandSummary.actionItems}</Pill>
+              </div>
+              <div className="mt-4 grid gap-3 lg:grid-cols-2">
+                {(commandCenter?.actionQueue || []).map((action) => (
+                  <CommandCenterActionItem action={action} key={action.id} />
+                ))}
+                {commandCenter?.actionQueue?.length === 0 ? (
+                  <p className="text-sm leading-7 text-ink/68">No command-center action items right now.</p>
+                ) : null}
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-7 rounded-[24px] border border-line/80 bg-fog/70 p-5">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <SectionLabel>Score Feedback Loop</SectionLabel>
+                <p className="mt-3 text-sm leading-7 text-ink/72">
+                  Good-fit and false-positive decisions feed the criteria recommendations below so the source profile can learn from actual pass/advance decisions.
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Pill tone="success">{commandFeedback.goodFit || 0} good fits</Pill>
+                <Pill tone={(commandFeedback.falsePositive || 0) > 0 ? 'danger' : 'default'}>{commandFeedback.falsePositive || 0} false positives</Pill>
+              </div>
+            </div>
+
+            <div className="mt-5 grid gap-5 lg:grid-cols-2">
+              <div className="rounded-2xl border border-line/80 bg-white/75 p-4">
+                <p className="text-sm font-semibold uppercase tracking-[0.14em] text-moss">Recommended criteria changes</p>
+                {commandFeedback.recommendations?.length > 0 ? (
+                  <ul className="mt-3 list-disc space-y-2 pl-5 text-sm leading-7 text-ink/74">
+                    {commandFeedback.recommendations.map((item) => (
+                      <li key={item}>{item}</li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="mt-3 text-sm leading-7 text-ink/68">No criteria changes recommended from your decisions yet.</p>
+                )}
+              </div>
+              <div className="rounded-2xl border border-line/80 bg-white/75 p-4">
+                <p className="text-sm font-semibold uppercase tracking-[0.14em] text-moss">False-positive reasons</p>
+                {Object.entries(commandFeedback.falsePositiveReasons || {}).length > 0 ? (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {Object.entries(commandFeedback.falsePositiveReasons || {}).map(([reason, count]) => (
+                      <Pill key={reason} tone="danger">{formatPassReason(reason)}: {count}</Pill>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="mt-3 text-sm leading-7 text-ink/68">No false positives marked yet.</p>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-7">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <SectionLabel>Pipeline Stages</SectionLabel>
+              <Pill>{commandSummary.totalRecords} command records</Pill>
+            </div>
+            <div className="mt-4 grid gap-5 xl:grid-cols-3">
+              {commandPipeline.map((stage) => (
+                <div className="rounded-[24px] border border-line/80 bg-white/70 p-5" key={stage.id}>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <h3 className="text-lg font-semibold text-ink">{formatPipelineStage(stage.id)}</h3>
+                    <Pill tone={stage.id === 'passed' ? 'danger' : stage.count > 0 ? 'info' : 'default'}>{stage.count}</Pill>
+                  </div>
+                  <div className="mt-4 space-y-4">
+                    {(stage.records || []).slice(0, 3).map((record) => (
+                      <CommandCenterRecordCard
+                        key={record.id}
+                        onUpdate={handleCommandCenterUpdate}
+                        record={record}
+                        updating={commandCenterUpdatingId === record.id}
+                      />
+                    ))}
+                    {stage.records?.length === 0 ? (
+                      <p className="rounded-2xl border border-line/80 bg-fog/70 px-4 py-3 text-sm leading-7 text-ink/68">
+                        No records in this stage.
+                      </p>
+                    ) : null}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </Reveal>
       </section>
 
       <section className="section-shell mt-8">

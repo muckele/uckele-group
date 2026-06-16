@@ -13,6 +13,7 @@ The site now includes:
 - Workflow fields for assignee, notes, tags, priority, follow-up state, and next action date
 - Secure upload request generation and a seller-facing upload page at `/secure-documents`
 - Email engagement event tracking and follow-up triage via `/api/webhooks/resend`
+- Acquisition Command Center for 75+ deals, active CIM conversations, pass reasons, source health, and diligence readiness
 - Spam protection with honeypot, time-to-submit checks, rate limiting, message heuristics, and optional Cloudflare Turnstile
 - Serverless support through [api/[...path].js](/Users/Matt/Documents/Uckele Group/api/[...path].js)
 
@@ -50,6 +51,7 @@ Configure:
 - `DEAL_HUNTER_DAILY_EMAIL_TIME`
 - `DEAL_HUNTER_DAILY_EMAIL_TIMEZONE`
 - `DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR` if you want to override the default durable send-marker directory
+- `ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH` if you want to override where the source-health row-count snapshot is stored
 - `DEAL_HUNTER_CRON_SECRET` if you also want to trigger the protected endpoint externally
 
 Optional Airtable API mode:
@@ -67,6 +69,8 @@ Admin endpoints:
 - `POST /api/admin/deal-hunter/send`
 - `POST /api/admin/deal-hunter/cim-request`
 - `POST /api/admin/deal-hunter/cim-follow-ups/run`
+- `GET /api/admin/acquisition-command-center`
+- `POST /api/admin/acquisition-command-center/:id`
 
 The production Fly machine runs the in-app scheduler once daily at the configured local time. The scheduler records successful Daily Deal Hunter sends in `email_events` and also writes a local send marker under the configured data directory, so a server restart does not resend the same day's email.
 
@@ -80,6 +84,8 @@ Authorization: Bearer DEAL_HUNTER_CRON_SECRET
 The scoring profile treats management in place as preferred, not required. It flags food/beverage, hospitality, retail/ecommerce, SaaS/software, marketing, staffing, franchises, delivery routes, FedEx/Amazon route listings, and owner-license medical practices for removal from the next daily update.
 
 The send path imports every non-removal 75+ Deal Hunter listing into the protected CRM as a `deal-hunter-daily-review` record, including score notes, listing details, broker contact fields, strengths, concerns, questions, and structured metadata. Listing URL duplicate detection prevents the same deal from creating a new CRM card every day. The send path also records Deal Hunter listing history in `deal_hunter_seen_deals`, so future daily emails can identify newly seen matches instead of repeatedly treating the same source rows as new. Admin-only source reviews show the current new/seen status without marking listings as seen; sending the daily email marks that reviewed batch as seen after delivery succeeds.
+
+The Acquisition Command Center is an admin-only view over CRM records that scored 75+ or have active acquisition conversation data. It groups records into New fit, CIM requested, Broker replied, Docs received, Diligence, LOI candidate, and Passed stages; provides one-click pass reasons; records good-fit or false-positive feedback under `contact_submissions.metadata.acquisitionCommand`; and flags source failures, row-count drops, and no-new-deal checks after the normal daily update window.
 
 ### CIM Requests And Broker Follow-Ups
 
