@@ -22,6 +22,7 @@ const allowedMimeTypes = new Set([
   'application/x-zip-compressed',
 ]);
 const maxDocumentsPerUpload = 5;
+const maxDocumentsPerRequest = maxDocumentsPerUpload;
 
 function sanitizeFileName(fileName) {
   const cleaned = String(fileName || 'document')
@@ -89,6 +90,10 @@ function validateDocumentPayload(document = {}, config) {
   }
 
   return errors;
+}
+
+function sumSecureDocumentBytes(documents = []) {
+  return documents.reduce((sum, document) => sum + Number(document.size_bytes || 0), 0);
 }
 
 export async function createSecureUploadRequest({ submissionId, requestedBy, note = '', sendEmail = true, request }) {
@@ -191,6 +196,13 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
     return context;
   }
 
+  if (context.request.status !== 'awaiting-documents') {
+    return {
+      ok: false,
+      error: 'Documents have already been received for this request. Please ask for a new secure upload link before sending more files.',
+    };
+  }
+
   if (!ndaAccepted) {
     return { ok: false, error: 'Please confirm the NDA and confidentiality acknowledgement before uploading.' };
   }
@@ -207,6 +219,26 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
 
   if (validationErrors.length > 0) {
     return { ok: false, error: validationErrors[0] };
+  }
+
+  const existingDocumentCount = context.documents.length;
+  const incomingDocumentCount = documents.length;
+
+  if (existingDocumentCount + incomingDocumentCount > maxDocumentsPerRequest) {
+    return {
+      ok: false,
+      error: `This request can receive no more than ${maxDocumentsPerRequest} total files. Please ask for a new secure upload link before sending more files.`,
+    };
+  }
+
+  const incomingBytes = documents.reduce((sum, document) => sum + estimateBase64DecodedBytes(document.contentBase64), 0);
+  const maxTotalBytes = config.secureDocuments.maxUploadBytes * maxDocumentsPerRequest;
+
+  if (sumSecureDocumentBytes(context.documents) + incomingBytes > maxTotalBytes) {
+    return {
+      ok: false,
+      error: `This request can receive no more than ${Math.round(maxTotalBytes / (1024 * 1024))} MB total. Please ask for a new secure upload link before sending more files.`,
+    };
   }
 
   const requestDirectory = path.join(config.secureDocuments.storageDir, context.request.id);

@@ -152,20 +152,23 @@ export function createApp() {
     });
   });
 
-  app.post('/api/admin/session', (request, response) => {
-    const result = loginAdmin(request.body.username || '', request.body.password || '');
+  app.post(
+    '/api/admin/session',
+    asyncRoute(async (request, response) => {
+      const result = await loginAdmin(request.body.username || '', request.body.password || '', request);
 
-    if (!result.ok) {
-      response.status(401).json({ success: false, error: result.reason });
-      return;
-    }
+      if (!result.ok) {
+        response.status(result.status || 401).json({ success: false, error: result.reason });
+        return;
+      }
 
-    response.setHeader('Set-Cookie', result.cookie);
-    response.json({
-      success: true,
-      username: result.session.username,
-    });
-  });
+      response.setHeader('Set-Cookie', result.cookie);
+      response.json({
+        success: true,
+        username: result.session.username,
+      });
+    }),
+  );
 
   app.post(
     '/api/admin/magic-link/request',

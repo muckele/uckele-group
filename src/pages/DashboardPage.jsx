@@ -26,6 +26,32 @@ const priorities = ['low', 'normal', 'medium', 'high', 'urgent'];
 const followUpStates = ['needs-response', 'scheduled', 'waiting-on-owner', 'completed'];
 const leadTypes = ['prospect', 'seller', 'broker', 'referral', 'advisor', 'other'];
 const sbaOptions = ['unknown', 'yes', 'no'];
+const diligenceStages = [
+  'not-started',
+  'cim-requested',
+  'nda-sent',
+  'cim-received',
+  'financial-review',
+  'lender-review',
+  'loi-candidate',
+  'passed',
+];
+const diligenceDecisions = ['undecided', 'advance', 'pause', 'pass'];
+const diligenceChecklistItems = [
+  { id: 'cim', label: 'CIM / teaser' },
+  { id: 'nda', label: 'NDA' },
+  { id: 'p_and_l', label: 'P&L' },
+  { id: 'tax_returns', label: 'Tax returns' },
+  { id: 'balance_sheet', label: 'Balance sheet' },
+  { id: 'customer_concentration', label: 'Customer concentration' },
+  { id: 'payroll', label: 'Payroll' },
+  { id: 'lease', label: 'Lease' },
+  { id: 'contracts', label: 'Contracts' },
+  { id: 'equipment', label: 'Equipment' },
+  { id: 'owner_role', label: 'Owner role' },
+  { id: 'management_depth', label: 'Management depth' },
+  { id: 'sba_fit', label: 'SBA fit' },
+];
 const dailyDealUpdateUrl =
   'https://docs.google.com/spreadsheets/d/1d2mC6oKDY7DFQiaNQnF947Ro5CBwjIcAw_fwya7bpBc/edit?usp=sharing';
 const primaryActionButtonClass =
@@ -187,6 +213,107 @@ function formatMoney(value) {
     : 'Not disclosed';
 }
 
+function defaultDiligence() {
+  return {
+    stage: 'not-started',
+    decision: 'undecided',
+    checklist: diligenceChecklistItems.reduce((accumulator, item) => {
+      accumulator[item.id] = false;
+      return accumulator;
+    }, {}),
+    financing: {
+      estimated_down_payment: '',
+      seller_note: '',
+      investor_gap: '',
+      sba_lender_status: '',
+    },
+    questions: '',
+    memo: '',
+    updated_at: '',
+  };
+}
+
+function normalizeDiligence(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const defaults = defaultDiligence();
+  const checklist = source.checklist && typeof source.checklist === 'object' && !Array.isArray(source.checklist) ? source.checklist : {};
+  const financing = source.financing && typeof source.financing === 'object' && !Array.isArray(source.financing) ? source.financing : {};
+  const stage = diligenceStages.includes(source.stage) ? source.stage : defaults.stage;
+  const decision = diligenceDecisions.includes(source.decision) ? source.decision : defaults.decision;
+
+  return {
+    ...defaults,
+    stage,
+    decision,
+    checklist: diligenceChecklistItems.reduce((accumulator, item) => {
+      accumulator[item.id] = Boolean(checklist[item.id]);
+      return accumulator;
+    }, {}),
+    financing: {
+      estimated_down_payment: financing.estimated_down_payment || '',
+      seller_note: financing.seller_note || '',
+      investor_gap: financing.investor_gap || '',
+      sba_lender_status: financing.sba_lender_status || '',
+    },
+    questions: source.questions || '',
+    memo: source.memo || '',
+    updated_at: source.updated_at || '',
+  };
+}
+
+function diligenceChecklistProgress(diligence) {
+  const normalized = normalizeDiligence(diligence);
+  const complete = diligenceChecklistItems.filter((item) => normalized.checklist[item.id]).length;
+
+  return {
+    complete,
+    total: diligenceChecklistItems.length,
+  };
+}
+
+function comparableDiligence(value) {
+  const normalized = normalizeDiligence(value);
+  const { updated_at: _updatedAt, ...comparable } = normalized;
+  return comparable;
+}
+
+function diligenceHasContent(value) {
+  const diligence = normalizeDiligence(value);
+
+  return (
+    diligence.stage !== 'not-started' ||
+    diligence.decision !== 'undecided' ||
+    diligenceChecklistItems.some((item) => diligence.checklist[item.id]) ||
+    Object.values(diligence.financing).some(Boolean) ||
+    Boolean(diligence.questions.trim()) ||
+    Boolean(diligence.memo.trim())
+  );
+}
+
+function shouldSubmitDiligence(draftDiligence, existingDiligence) {
+  const hasExisting = Boolean(existingDiligence && typeof existingDiligence === 'object' && !Array.isArray(existingDiligence));
+
+  if (!hasExisting && !diligenceHasContent(draftDiligence)) {
+    return false;
+  }
+
+  return JSON.stringify(comparableDiligence(draftDiligence)) !== JSON.stringify(comparableDiligence(existingDiligence));
+}
+
+function buildSubmissionPayload(draft, existingSubmission = null) {
+  const payload = {
+    ...draft,
+    next_action_at: fromDateTimeLocal(draft.next_action_at),
+    tags: draft.tags,
+  };
+
+  if (!shouldSubmitDiligence(draft.diligence, existingSubmission?.metadata?.diligence)) {
+    delete payload.diligence;
+  }
+
+  return payload;
+}
+
 function buildDraft(submission) {
   return {
     status: submission.status || 'review',
@@ -214,6 +341,7 @@ function buildDraft(submission) {
     seller_name: submission.seller_name || '',
     seller_email: submission.seller_email || '',
     seller_phone: submission.seller_phone || '',
+    diligence: normalizeDiligence(submission.metadata?.diligence),
   };
 }
 
@@ -244,6 +372,7 @@ function blankRecordDraft() {
     seller_name: '',
     seller_email: '',
     seller_phone: '',
+    diligence: defaultDiligence(),
   };
 }
 
@@ -784,17 +913,14 @@ export default function DashboardPage() {
 
     try {
       const draft = drafts[submissionId];
+      const existingSubmission = dashboardData.submissions.find((submission) => submission.id === submissionId);
       const response = await fetch(`/api/admin/submissions/${submissionId}`, {
         method: 'PATCH',
         credentials: 'same-origin',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          ...draft,
-          next_action_at: fromDateTimeLocal(draft.next_action_at),
-          tags: draft.tags,
-        }),
+        body: JSON.stringify(buildSubmissionPayload(draft, existingSubmission)),
       });
 
       const result = await response.json();
@@ -839,10 +965,7 @@ export default function DashboardPage() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          ...createDraft,
-          next_action_at: fromDateTimeLocal(createDraft.next_action_at),
-        }),
+        body: JSON.stringify(buildSubmissionPayload(createDraft)),
       });
 
       const result = await response.json();
@@ -902,6 +1025,22 @@ export default function DashboardPage() {
     } finally {
       setCreatingUploadForId('');
     }
+  }
+
+  function updateDiligenceDraft(submissionId, fallbackDraft, updater) {
+    setDrafts((current) => {
+      const currentDraft = current[submissionId] || fallbackDraft;
+      const currentDiligence = normalizeDiligence(currentDraft.diligence);
+      const nextDiligence = typeof updater === 'function' ? updater(currentDiligence) : updater;
+
+      return {
+        ...current,
+        [submissionId]: {
+          ...currentDraft,
+          diligence: normalizeDiligence(nextDiligence),
+        },
+      };
+    });
   }
 
   async function handleLoadDealHunterReview() {
@@ -1937,6 +2076,9 @@ export default function DashboardPage() {
             const isSaving = savingSubmissionId === submission.id;
             const isCreatingUpload = creatingUploadForId === submission.id;
             const followUpPrompt = submission.follow_up_prompt;
+            const diligence = normalizeDiligence(draft.diligence);
+            const diligenceProgress = diligenceChecklistProgress(diligence);
+            const diligenceProgressTone = diligenceProgress.complete === diligenceProgress.total ? 'success' : diligenceProgress.complete > 0 ? 'info' : 'default';
 
             return (
               <Reveal className="panel p-5 sm:p-8" delay={index * 50} key={submission.id}>
@@ -2333,6 +2475,152 @@ export default function DashboardPage() {
                     }
                     value={draft.seller_phone}
                   />
+                </div>
+
+                <div className="mt-5 rounded-[24px] border border-line/80 bg-white/75 p-5 sm:p-6">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <SectionLabel>Diligence & Decisioning</SectionLabel>
+                      {diligence.updated_at ? (
+                        <p className="mt-2 text-sm leading-7 text-ink/64">Updated {formatDateTime(diligence.updated_at)}</p>
+                      ) : null}
+                    </div>
+                    <Pill tone={diligenceProgressTone}>
+                      {diligenceProgress.complete}/{diligenceProgress.total} complete
+                    </Pill>
+                  </div>
+
+                  <div className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
+                    <SelectField
+                      label="Diligence stage"
+                      onChange={(event) =>
+                        updateDiligenceDraft(submission.id, draft, (current) => ({
+                          ...current,
+                          stage: event.target.value,
+                        }))
+                      }
+                      options={diligenceStages}
+                      value={diligence.stage}
+                    />
+                    <SelectField
+                      label="Internal decision"
+                      onChange={(event) =>
+                        updateDiligenceDraft(submission.id, draft, (current) => ({
+                          ...current,
+                          decision: event.target.value,
+                        }))
+                      }
+                      options={diligenceDecisions}
+                      value={diligence.decision}
+                    />
+                    <InputField
+                      label="Estimated down payment"
+                      onChange={(event) =>
+                        updateDiligenceDraft(submission.id, draft, (current) => ({
+                          ...current,
+                          financing: {
+                            ...current.financing,
+                            estimated_down_payment: event.target.value,
+                          },
+                        }))
+                      }
+                      placeholder="$100K-$110K available"
+                      value={diligence.financing.estimated_down_payment}
+                    />
+                    <InputField
+                      label="Seller note target"
+                      onChange={(event) =>
+                        updateDiligenceDraft(submission.id, draft, (current) => ({
+                          ...current,
+                          financing: {
+                            ...current.financing,
+                            seller_note: event.target.value,
+                          },
+                        }))
+                      }
+                      placeholder="10%-20% if available"
+                      value={diligence.financing.seller_note}
+                    />
+                  </div>
+
+                  <div className="mt-5 grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
+                    <InputField
+                      label="Investor gap"
+                      onChange={(event) =>
+                        updateDiligenceDraft(submission.id, draft, (current) => ({
+                          ...current,
+                          financing: {
+                            ...current.financing,
+                            investor_gap: event.target.value,
+                          },
+                        }))
+                      }
+                      placeholder="Amount or status"
+                      value={diligence.financing.investor_gap}
+                    />
+                    <InputField
+                      label="SBA lender status"
+                      onChange={(event) =>
+                        updateDiligenceDraft(submission.id, draft, (current) => ({
+                          ...current,
+                          financing: {
+                            ...current.financing,
+                            sba_lender_status: event.target.value,
+                          },
+                        }))
+                      }
+                      placeholder="Not reviewed, pre-screened, approved"
+                      value={diligence.financing.sba_lender_status}
+                    />
+                  </div>
+
+                  <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                    {diligenceChecklistItems.map((item) => (
+                      <label
+                        className="flex min-h-12 items-center gap-3 rounded-2xl border border-line/80 bg-fog/60 px-4 py-3 text-sm font-medium text-ink"
+                        key={item.id}
+                      >
+                        <input
+                          checked={Boolean(diligence.checklist[item.id])}
+                          className="h-4 w-4 accent-moss"
+                          onChange={(event) =>
+                            updateDiligenceDraft(submission.id, draft, (current) => ({
+                              ...current,
+                              checklist: {
+                                ...current.checklist,
+                                [item.id]: event.target.checked,
+                              },
+                            }))
+                          }
+                          type="checkbox"
+                        />
+                        <span>{item.label}</span>
+                      </label>
+                    ))}
+                  </div>
+
+                  <div className="mt-5 grid gap-5 lg:grid-cols-2">
+                    <TextAreaField
+                      label="Broker / seller questions"
+                      onChange={(event) =>
+                        updateDiligenceDraft(submission.id, draft, (current) => ({
+                          ...current,
+                          questions: event.target.value,
+                        }))
+                      }
+                      value={diligence.questions}
+                    />
+                    <TextAreaField
+                      label="Go / no-go memo"
+                      onChange={(event) =>
+                        updateDiligenceDraft(submission.id, draft, (current) => ({
+                          ...current,
+                          memo: event.target.value,
+                        }))
+                      }
+                      value={diligence.memo}
+                    />
+                  </div>
                 </div>
 
                 <div className="mt-5 grid gap-5 lg:grid-cols-[1.2fr_0.8fr]">

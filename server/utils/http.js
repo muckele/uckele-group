@@ -1,25 +1,56 @@
 export function getClientIp(request) {
-  const forwardedFor = request.headers['x-forwarded-for'];
+  const headers = request?.headers || {};
+  const trustedHeaders = [
+    headers['fly-client-ip'],
+    headers['cf-connecting-ip'],
+    headers['x-real-ip'],
+    headers['x-vercel-forwarded-for'],
+  ];
 
-  if (typeof forwardedFor === 'string' && forwardedFor.length > 0) {
-    return forwardedFor.split(',')[0].trim();
+  for (const header of trustedHeaders) {
+    const value = firstHeaderValue(header);
+
+    if (value) {
+      return value;
+    }
   }
 
-  const realIp = request.headers['x-real-ip'];
+  const forwardedFor = lastHeaderValue(headers['x-forwarded-for']);
 
-  if (typeof realIp === 'string' && realIp.length > 0) {
-    return realIp.trim();
+  if (forwardedFor) {
+    return forwardedFor;
   }
 
-  return request.ip || request.socket?.remoteAddress || 'unknown';
+  return sanitizeHeaderValue(request?.ip || request?.socket?.remoteAddress || 'unknown') || 'unknown';
 }
 
 function firstHeaderValue(value) {
+  if (Array.isArray(value)) {
+    return firstHeaderValue(value[0]);
+  }
+
   if (typeof value !== 'string' || value.length === 0) {
     return '';
   }
 
-  return value.split(',')[0].trim();
+  return sanitizeHeaderValue(value.split(',')[0]);
+}
+
+function lastHeaderValue(value) {
+  if (Array.isArray(value)) {
+    return lastHeaderValue(value[value.length - 1]);
+  }
+
+  if (typeof value !== 'string' || value.length === 0) {
+    return '';
+  }
+
+  const parts = value.split(',').map((part) => sanitizeHeaderValue(part)).filter(Boolean);
+  return parts.at(-1) || '';
+}
+
+function sanitizeHeaderValue(value) {
+  return String(value || '').trim();
 }
 
 export function getRequestOrigin(request, fallbackOrigin = '') {

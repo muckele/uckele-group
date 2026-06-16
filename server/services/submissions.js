@@ -18,6 +18,32 @@ import {
 } from './workflow.js';
 
 const allowedStatuses = ['new', 'review', 'contacted', 'archived', 'spam'];
+const diligenceStages = [
+  'not-started',
+  'cim-requested',
+  'nda-sent',
+  'cim-received',
+  'financial-review',
+  'lender-review',
+  'loi-candidate',
+  'passed',
+];
+const diligenceDecisions = ['undecided', 'advance', 'pause', 'pass'];
+const diligenceChecklistIds = [
+  'cim',
+  'nda',
+  'p_and_l',
+  'tax_returns',
+  'balance_sheet',
+  'customer_concentration',
+  'payroll',
+  'lease',
+  'contracts',
+  'equipment',
+  'owner_role',
+  'management_depth',
+  'sba_fit',
+];
 const enrichmentLookupBatchSize = 250;
 
 const dealFieldNormalizers = {
@@ -77,6 +103,63 @@ function normalizeTags(value) {
     .map((item) => item.trim().toLowerCase())
     .filter(Boolean)
     .slice(0, 12);
+}
+
+function normalizeAllowedOption(value, allowedValues, fallback) {
+  const normalized = normalizeField(value, 60).toLowerCase();
+  return allowedValues.includes(normalized) ? normalized : fallback;
+}
+
+function normalizeDiligenceFinancing(raw = {}, fallback = {}) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const existing = fallback && typeof fallback === 'object' && !Array.isArray(fallback) ? fallback : {};
+
+  return {
+    estimated_down_payment: normalizeField(
+      hasOwn(source, 'estimated_down_payment') ? source.estimated_down_payment : existing.estimated_down_payment,
+      120,
+    ),
+    seller_note: normalizeField(hasOwn(source, 'seller_note') ? source.seller_note : existing.seller_note, 120),
+    investor_gap: normalizeField(hasOwn(source, 'investor_gap') ? source.investor_gap : existing.investor_gap, 120),
+    sba_lender_status: normalizeField(
+      hasOwn(source, 'sba_lender_status') ? source.sba_lender_status : existing.sba_lender_status,
+      200,
+    ),
+  };
+}
+
+export function normalizeDiligenceReview(raw = {}, fallback = {}, options = {}) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const existing = fallback && typeof fallback === 'object' && !Array.isArray(fallback) ? fallback : {};
+  const existingStage = normalizeAllowedOption(existing.stage, diligenceStages, 'not-started');
+  const existingDecision = normalizeAllowedOption(existing.decision, diligenceDecisions, 'undecided');
+  const sourceChecklist = source.checklist && typeof source.checklist === 'object' && !Array.isArray(source.checklist) ? source.checklist : {};
+  const existingChecklist =
+    existing.checklist && typeof existing.checklist === 'object' && !Array.isArray(existing.checklist) ? existing.checklist : {};
+  const checklist = diligenceChecklistIds.reduce((accumulator, key) => {
+    accumulator[key] = Boolean(hasOwn(sourceChecklist, key) ? sourceChecklist[key] : existingChecklist[key]);
+    return accumulator;
+  }, {});
+
+  return {
+    stage: normalizeAllowedOption(source.stage, diligenceStages, existingStage),
+    decision: normalizeAllowedOption(source.decision, diligenceDecisions, existingDecision),
+    checklist,
+    financing: normalizeDiligenceFinancing(source.financing, existing.financing),
+    questions: normalizeMessage(hasOwn(source, 'questions') ? source.questions : existing.questions, 3000),
+    memo: normalizeMessage(hasOwn(source, 'memo') ? source.memo : existing.memo, 3000),
+    updated_at: normalizeField(options.now || existing.updated_at, 80),
+  };
+}
+
+function comparableDiligenceReview(value) {
+  const normalized = normalizeDiligenceReview(value);
+  const { updated_at: _updatedAt, ...comparable } = normalized;
+  return comparable;
+}
+
+export function diligenceReviewsEqual(left, right) {
+  return JSON.stringify(comparableDiligenceReview(left)) === JSON.stringify(comparableDiligenceReview(right));
 }
 
 function normalizeStatus(value, fallback = 'new') {
@@ -745,6 +828,16 @@ export async function createManualSubmission(body, adminUsername = '', options =
     normalizeMessage(body.message, 5000) ||
     notes ||
     'Manual CRM record created from the Uckele Group admin CRM.';
+  const metadata = body.metadata && typeof body.metadata === 'object' && !Array.isArray(body.metadata) ? { ...body.metadata } : {};
+  const rawDiligence = body.diligence !== undefined ? body.diligence : metadata.diligence;
+
+  if (rawDiligence !== undefined) {
+    if (diligenceReviewsEqual(rawDiligence, {})) {
+      delete metadata.diligence;
+    } else {
+      metadata.diligence = normalizeDiligenceReview(rawDiligence, {}, { now });
+    }
+  }
 
   const submission = {
     id: randomUUID(),
@@ -793,7 +886,7 @@ export async function createManualSubmission(body, adminUsername = '', options =
     next_action_at: normalizeField(body.next_action_at, 80) || workflowDefaults.nextActionAt,
     last_contacted_at: status === 'contacted' ? now : null,
     metadata: {
-      ...(body.metadata && typeof body.metadata === 'object' ? body.metadata : {}),
+      ...metadata,
       manualEntry: true,
       createdBy: adminUsername || 'admin',
     },
@@ -906,6 +999,18 @@ export async function updateSubmissionWorkflow(id, fields) {
 
   if (fields.tags !== undefined) {
     updates.tags = normalizeTags(fields.tags);
+  }
+
+  if (fields.diligence !== undefined) {
+    const metadata = existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata) ? existing.metadata : {};
+    const normalizedDiligence = normalizeDiligenceReview(fields.diligence, metadata.diligence, { now });
+
+    if (!diligenceReviewsEqual(normalizedDiligence, metadata.diligence)) {
+      updates.metadata = {
+        ...metadata,
+        diligence: normalizedDiligence,
+      };
+    }
   }
 
   const dealFieldUpdates = collectAliasedDealFieldUpdates(fields);

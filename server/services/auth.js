@@ -5,7 +5,7 @@ import { getClientIp, getRequestOrigin } from '../utils/http.js';
 import { hashIp, safeCompareText, sha256, signPayload, verifySignedPayload } from '../utils/security.js';
 import { sendAdminMagicLinkEmail } from './delivery.js';
 
-const magicLinkRateLimitEvents = new Map();
+const adminAuthRateLimitEvents = new Map();
 const magicLinkGenericMessage = 'If that email is allowed for admin access, a sign-in link has been sent.';
 
 function createSessionCookie(session) {
@@ -48,12 +48,20 @@ function buildMagicLinkRateLimitBuckets(email, request) {
   ];
 }
 
-function enforceInMemoryMagicLinkRateLimit(buckets, windowMs, maxAttempts) {
+function buildPasswordLoginRateLimitBuckets(username, request) {
+  const normalizedUsername = String(username || '').trim().toLowerCase() || 'empty';
+  return [
+    `admin-password:ip:${hashIp(getClientIp(request))}`,
+    `admin-password:username:${sha256(normalizedUsername).slice(0, 24)}`,
+  ];
+}
+
+function enforceInMemoryRateLimit(buckets, windowMs, maxAttempts) {
   const now = Date.now();
   const cutoff = now - windowMs;
   const snapshots = buckets.map((bucket) => ({
     bucket,
-    timestamps: (magicLinkRateLimitEvents.get(bucket) || []).filter((timestamp) => timestamp >= cutoff),
+    timestamps: (adminAuthRateLimitEvents.get(bucket) || []).filter((timestamp) => timestamp >= cutoff),
   }));
 
   if (snapshots.some((snapshot) => snapshot.timestamps.length >= maxAttempts)) {
@@ -61,21 +69,17 @@ function enforceInMemoryMagicLinkRateLimit(buckets, windowMs, maxAttempts) {
   }
 
   for (const snapshot of snapshots) {
-    magicLinkRateLimitEvents.set(snapshot.bucket, [...snapshot.timestamps, now]);
+    adminAuthRateLimitEvents.set(snapshot.bucket, [...snapshot.timestamps, now]);
   }
 
   return { blocked: false };
 }
 
-async function enforceMagicLinkRateLimit(email, request) {
-  const config = getConfig();
-  const buckets = buildMagicLinkRateLimitBuckets(email, request);
-  const maxAttempts = Math.max(1, Math.min(config.protection.rateLimitMax, 3));
-  const windowMs = config.protection.rateLimitWindowMs;
+async function enforceAdminRateLimit({ buckets, maxAttempts, windowMs, blockedReason, logLabel }) {
   const blockedResult = {
     ok: false,
     status: 429,
-    reason: 'Too many sign-in link requests. Please wait a few minutes and try again.',
+    reason: blockedReason,
   };
 
   try {
@@ -91,9 +95,31 @@ async function enforceMagicLinkRateLimit(email, request) {
     await Promise.all(buckets.map((bucket) => storage.addRateLimitEvent(bucket, nowIso)));
     return { ok: true };
   } catch (error) {
-    console.warn(`[admin-auth] magic-link rate limit storage failed: ${error.message}`);
-    return enforceInMemoryMagicLinkRateLimit(buckets, windowMs, maxAttempts).blocked ? blockedResult : { ok: true };
+    console.warn(`[admin-auth] ${logLabel} rate limit storage failed: ${error.message}`);
+    return enforceInMemoryRateLimit(buckets, windowMs, maxAttempts).blocked ? blockedResult : { ok: true };
   }
+}
+
+async function enforceMagicLinkRateLimit(email, request) {
+  const config = getConfig();
+  return enforceAdminRateLimit({
+    buckets: buildMagicLinkRateLimitBuckets(email, request),
+    maxAttempts: Math.max(1, Math.min(config.protection.rateLimitMax, 3)),
+    windowMs: config.protection.rateLimitWindowMs,
+    blockedReason: 'Too many sign-in link requests. Please wait a few minutes and try again.',
+    logLabel: 'magic-link',
+  });
+}
+
+async function enforcePasswordLoginRateLimit(username, request) {
+  const config = getConfig();
+  return enforceAdminRateLimit({
+    buckets: buildPasswordLoginRateLimitBuckets(username, request),
+    maxAttempts: Math.max(1, Math.min(config.protection.rateLimitMax, 5)),
+    windowMs: config.protection.rateLimitWindowMs,
+    blockedReason: 'Too many password sign-in attempts. Please wait a few minutes and try again.',
+    logLabel: 'password',
+  });
 }
 
 export function getAdminSession(request) {
@@ -125,7 +151,7 @@ export function getAdminAuthState() {
   };
 }
 
-export function loginAdmin(username, password) {
+export async function loginAdmin(username, password, request) {
   const config = getConfig();
 
   if (!config.admin.allowPasswordAuth) {
@@ -134,6 +160,12 @@ export function loginAdmin(username, password) {
 
   if (!config.admin.username || !config.admin.password || !config.admin.sessionSecret) {
     return { ok: false, reason: 'Admin credentials are not configured.' };
+  }
+
+  const rateLimitResult = await enforcePasswordLoginRateLimit(username, request);
+
+  if (!rateLimitResult.ok) {
+    return rateLimitResult;
   }
 
   if (!safeCompareText(username, config.admin.username) || !safeCompareText(password, config.admin.password)) {

@@ -93,6 +93,12 @@ Automatic follow-ups are controlled by:
 
 The recommended cadence is three professional touches: first follow-up after 48 hours, second follow-up 72 hours later, and final follow-up 168 hours after that. The follow-up job checks for Resend inbound `email.received` webhook events before sending and stores them internally as replies. Configure the delivery provider webhook with `EMAIL_WEBHOOK_SECRET` or `RESEND_WEBHOOK_SECRET`; without inbound reply webhook events, the app can send due follow-ups but cannot automatically know when a broker responded. The job stops follow-ups on replies, bounces, complaints, failures, or unsubscribes.
 
+### Diligence And Decisioning
+
+The protected admin CRM includes a Phase 2 diligence panel on each record. It tracks diligence stage, internal decision, document checklist progress, financing structure, broker or seller questions, and a go/no-go memo.
+
+This data is stored under `contact_submissions.metadata.diligence`, so it works with the existing SQLite and Supabase storage paths without an additional schema migration. The admin update endpoint only accepts a whitelisted diligence payload and merges it into the existing metadata object, preserving Deal Hunter source metadata and import history.
+
 ## Prospect Discovery And Import
 
 The private admin CRM also includes a Prospect Discovery panel for finding local businesses through Google Places Text Search, saving each result, scoring it, tiering it, and optionally importing it as a CRM record.
