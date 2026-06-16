@@ -115,6 +115,19 @@ function serializeSubmission(submission) {
   };
 }
 
+function serializeUploadRequest(request) {
+  return {
+    ...request,
+    nda_required: request.nda_required ? 1 : 0,
+  };
+}
+
+function serializeUploadRequestValues(values) {
+  return Object.fromEntries(
+    Object.entries(values || {}).map(([key, value]) => [key, key === 'nda_required' ? (value ? 1 : 0) : value]),
+  );
+}
+
 function serializeEmailEvent(event) {
   return {
     ...event,
@@ -1332,7 +1345,7 @@ export function createSqliteStorage(config) {
     },
 
     async insertSecureUploadRequest(requestRecord) {
-      insertSecureUploadRequestStatement.run(requestRecord);
+      insertSecureUploadRequestStatement.run(serializeUploadRequest(requestRecord));
       return requestRecord;
     },
 
@@ -1340,11 +1353,34 @@ export function createSqliteStorage(config) {
       updateRecord(
         'secure_upload_requests',
         id,
-        values,
+        serializeUploadRequestValues(values),
         ['updated_at', 'status', 'expires_at', 'nda_required', 'nda_accepted_at', 'last_uploaded_at', 'note'],
       );
 
       return this.getSecureUploadRequest(id);
+    },
+
+    async claimSecureUploadRequest(id, values) {
+      const updates = Object.entries(serializeUploadRequestValues(values)).filter(([key]) =>
+        ['updated_at', 'status', 'nda_accepted_at', 'last_uploaded_at', 'note'].includes(key),
+      );
+
+      if (updates.length === 0) {
+        return null;
+      }
+
+      const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
+      const payload = updates.reduce((accumulator, [key, value]) => {
+        accumulator[key] = value;
+        return accumulator;
+      }, {});
+
+      payload.id = id;
+      const result = database
+        .prepare(`UPDATE secure_upload_requests SET ${fields} WHERE id = @id AND status = 'awaiting-documents'`)
+        .run(payload);
+
+      return result.changes > 0 ? this.getSecureUploadRequest(id) : null;
     },
 
     async getSecureUploadRequest(id) {

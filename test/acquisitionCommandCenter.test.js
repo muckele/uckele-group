@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 import {
   buildActionQueue,
@@ -6,6 +9,7 @@ import {
   buildNextSourceSnapshot,
   calculateDiligenceReadiness,
   deriveAcquisitionPipelineStage,
+  getSourceHealth,
   updateAcquisitionCommandCenterRecord,
 } from '../server/services/acquisitionCommandCenter.js';
 
@@ -190,6 +194,46 @@ test('source health snapshot preserves last healthy row count when a source drop
 
   assert.equal(nextSnapshot.sources['sheet-0'].rowCount, 100);
   assert.equal(nextSnapshot.sources['sheet-0'].checkedAt, '2026-06-15T18:00:00.000Z');
+});
+
+test('read-only source health checks do not persist source snapshots', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-source-health-'));
+  const snapshotPath = path.join(tempDir, 'source-health.json');
+  const previousSnapshotPath = process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH;
+  process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH = snapshotPath;
+
+  try {
+    const sourceHealth = await getSourceHealth(
+      {},
+      {
+        persistSnapshot: false,
+        review: {
+          generatedAt: '2026-06-16T18:00:00.000Z',
+          totals: {
+            newDeals: 2,
+          },
+          sources: [
+            {
+              id: 'sheet-0',
+              name: 'SMB Deal Hunter Google Sheet',
+              mode: 'csv',
+              fetched: true,
+              rowCount: 100,
+            },
+          ],
+        },
+      },
+    );
+
+    assert.equal(sourceHealth.sources[0].rowCount, 100);
+    assert.equal(fs.existsSync(snapshotPath), false);
+  } finally {
+    if (previousSnapshotPath === undefined) {
+      delete process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH;
+    } else {
+      process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH = previousSnapshotPath;
+    }
+  }
 });
 
 test('command center action queue ignores passed records', () => {

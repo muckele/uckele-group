@@ -6,7 +6,7 @@ import { hashIp, safeCompareText, sha256, signPayload, verifySignedPayload } fro
 import { sendAdminMagicLinkEmail } from './delivery.js';
 
 const adminAuthRateLimitEvents = new Map();
-const magicLinkGenericMessage = 'If that email is allowed for admin access, a sign-in link has been sent.';
+const magicLinkGenericMessage = 'If that email is allowed for private access, a sign-in link has been sent.';
 
 function createSessionCookie(session) {
   const config = getConfig();
@@ -32,12 +32,21 @@ function maskEmail(value) {
   return `${localPart.slice(0, 2)}***@${domain}`;
 }
 
-function createAdminSession(username) {
+function createAdminSession(username, role = 'admin') {
   return {
-    role: 'admin',
+    role,
     username,
     exp: Date.now() + getConfig().admin.sessionMaxAgeMs,
   };
+}
+
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function getViewerEmailMatch(email, config) {
+  const normalizedEmail = normalizeEmail(email);
+  return (config.admin.viewerEmails || []).find((viewerEmail) => normalizeEmail(viewerEmail) === normalizedEmail) || '';
 }
 
 function buildMagicLinkRateLimitBuckets(email, request) {
@@ -126,7 +135,13 @@ export function getAdminSession(request) {
   const config = getConfig();
   const cookies = parseCookies(request.headers.cookie);
   const token = cookies[config.admin.sessionCookieName];
-  return verifySignedPayload(token, config.admin.sessionSecret);
+  const session = verifySignedPayload(token, config.admin.sessionSecret);
+
+  if (!session || !['admin', 'viewer'].includes(session.role)) {
+    return null;
+  }
+
+  return session;
 }
 
 export function requireAdmin(request) {
@@ -139,15 +154,29 @@ export function requireAdmin(request) {
   return session;
 }
 
+export function requireAdminAccess(request) {
+  const session = getAdminSession(request);
+
+  if (!session || !['admin', 'viewer'].includes(session.role)) {
+    return null;
+  }
+
+  return session;
+}
+
 export function getAdminAuthState() {
   const config = getConfig();
   const outboundMagicLinkSupported = config.delivery.provider !== 'formspree';
+  const adminPasswordEnabled = Boolean(config.admin.username && config.admin.password);
+  const viewerPasswordEnabled = Boolean(config.admin.viewerUsername && config.admin.viewerPassword);
+  const viewerMagicLinkEnabled = Boolean(config.admin.viewerEmails?.length);
 
   return {
     authMode: config.admin.authMode,
-    magicLinkEnabled: Boolean(config.admin.email && config.admin.magicLinkSecret && outboundMagicLinkSupported),
-    passwordEnabled: Boolean(config.admin.allowPasswordAuth && config.admin.username && config.admin.password),
+    magicLinkEnabled: Boolean((config.admin.email || viewerMagicLinkEnabled) && config.admin.magicLinkSecret && outboundMagicLinkSupported),
+    passwordEnabled: Boolean(config.admin.allowPasswordAuth && (adminPasswordEnabled || viewerPasswordEnabled)),
     adminEmailHint: maskEmail(config.admin.email),
+    viewerAccessEnabled: Boolean(viewerMagicLinkEnabled || viewerPasswordEnabled),
   };
 }
 
@@ -158,7 +187,7 @@ export async function loginAdmin(username, password, request) {
     return { ok: false, reason: 'Password sign-in is disabled. Use the magic-link flow instead.' };
   }
 
-  if (!config.admin.username || !config.admin.password || !config.admin.sessionSecret) {
+  if (!config.admin.sessionSecret) {
     return { ok: false, reason: 'Admin credentials are not configured.' };
   }
 
@@ -168,23 +197,42 @@ export async function loginAdmin(username, password, request) {
     return rateLimitResult;
   }
 
-  if (!safeCompareText(username, config.admin.username) || !safeCompareText(password, config.admin.password)) {
-    return { ok: false, reason: 'Invalid credentials.' };
+  if (config.admin.username && config.admin.password && safeCompareText(username, config.admin.username) && safeCompareText(password, config.admin.password)) {
+    const session = createAdminSession(config.admin.username, 'admin');
+
+    return {
+      ok: true,
+      session,
+      cookie: createSessionCookie(session),
+    };
   }
 
-  const session = createAdminSession(config.admin.username);
+  if (
+    config.admin.viewerUsername &&
+    config.admin.viewerPassword &&
+    safeCompareText(username, config.admin.viewerUsername) &&
+    safeCompareText(password, config.admin.viewerPassword)
+  ) {
+    const session = createAdminSession(config.admin.viewerUsername, 'viewer');
 
-  return {
-    ok: true,
-    session,
-    cookie: createSessionCookie(session),
-  };
+    return {
+      ok: true,
+      session,
+      cookie: createSessionCookie(session),
+    };
+  }
+
+  if (!config.admin.username && !config.admin.viewerUsername) {
+    return { ok: false, reason: 'Admin credentials are not configured.' };
+  }
+
+  return { ok: false, reason: 'Invalid credentials.' };
 }
 
 export async function requestAdminMagicLink(email, request) {
   const config = getConfig();
 
-  if (!config.admin.email || !config.admin.magicLinkSecret) {
+  if ((!config.admin.email && !config.admin.viewerEmails?.length) || !config.admin.magicLinkSecret) {
     return { ok: false, reason: 'Magic-link sign-in is not configured.' };
   }
 
@@ -192,15 +240,16 @@ export async function requestAdminMagicLink(email, request) {
     return { ok: false, reason: 'Magic-link emails require Resend, EmailJS, or console delivery. Formspree only handles inbound lead routing.' };
   }
 
-  const normalizedEmail = String(email || '').trim().toLowerCase();
-  const expectedEmail = config.admin.email.trim().toLowerCase();
+  const normalizedEmail = normalizeEmail(email);
+  const expectedEmail = normalizeEmail(config.admin.email);
+  const matchedViewerEmail = getViewerEmailMatch(normalizedEmail, config);
   const rateLimitResult = await enforceMagicLinkRateLimit(normalizedEmail, request);
 
   if (!rateLimitResult.ok) {
     return rateLimitResult;
   }
 
-  if (!normalizedEmail || normalizedEmail !== expectedEmail) {
+  if (!normalizedEmail || (normalizedEmail !== expectedEmail && !matchedViewerEmail)) {
     return {
       ok: true,
       message: magicLinkGenericMessage,
@@ -208,10 +257,12 @@ export async function requestAdminMagicLink(email, request) {
   }
 
   const expiresAt = new Date(Date.now() + config.admin.magicLinkTtlMs).toISOString();
+  const role = normalizedEmail === expectedEmail ? 'admin' : 'viewer';
   const token = signPayload(
     {
       type: 'admin-magic-link',
-      email: expectedEmail,
+      email: role === 'admin' ? expectedEmail : normalizeEmail(matchedViewerEmail),
+      role,
       exp: Date.now() + config.admin.magicLinkTtlMs,
     },
     config.admin.magicLinkSecret,
@@ -219,9 +270,10 @@ export async function requestAdminMagicLink(email, request) {
   const publicOrigin = getRequestOrigin(request, config.server.origin);
   const magicLinkUrl = `${publicOrigin}/admin?admin_token=${encodeURIComponent(token)}`;
   const deliveryResult = await sendAdminMagicLinkEmail({
-    to: config.admin.email,
+    to: role === 'admin' ? config.admin.email : matchedViewerEmail,
     magicLinkUrl,
     expiresAt,
+    role,
   });
 
   if (deliveryResult.status === 'failed') {
@@ -230,7 +282,7 @@ export async function requestAdminMagicLink(email, request) {
 
   return {
     ok: true,
-    message: 'A secure sign-in link has been sent to the admin email address.',
+    message: magicLinkGenericMessage,
     previewUrl: config.isProduction ? '' : magicLinkUrl,
   };
 }
@@ -238,12 +290,14 @@ export async function requestAdminMagicLink(email, request) {
 export function verifyAdminMagicLink(token) {
   const config = getConfig();
   const payload = verifySignedPayload(token, config.admin.magicLinkSecret);
+  const role = payload?.role === 'viewer' ? 'viewer' : 'admin';
+  const expectedEmail = role === 'admin' ? normalizeEmail(config.admin.email) : normalizeEmail(getViewerEmailMatch(payload?.email, config));
 
-  if (!payload || payload.type !== 'admin-magic-link' || payload.email !== config.admin.email.trim().toLowerCase()) {
+  if (!payload || payload.type !== 'admin-magic-link' || normalizeEmail(payload.email) !== expectedEmail) {
     return { ok: false, reason: 'That sign-in link is invalid or has expired.' };
   }
 
-  const session = createAdminSession(config.admin.email);
+  const session = createAdminSession(payload.email, role);
 
   return {
     ok: true,

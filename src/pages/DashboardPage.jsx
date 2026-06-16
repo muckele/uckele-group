@@ -600,7 +600,7 @@ function LinksRow({ submission }) {
   );
 }
 
-function DealHunterCard({ deal, mode = 'fit', onSendCimRequest, requestingCim = false }) {
+function DealHunterCard({ deal, mode = 'fit', onSendCimRequest, requestingCim = false, readOnly = false }) {
   const detailItems = mode === 'remove' ? deal.removeReasons || deal.concerns || [] : deal.strengths || [];
   const meta = [
     deal.industry,
@@ -672,7 +672,7 @@ function DealHunterCard({ deal, mode = 'fit', onSendCimRequest, requestingCim = 
           <p className="font-semibold uppercase tracking-[0.14em]">CIM Request</p>
           <p className="mt-2">{cimDescription}</p>
           {cimRequest.deliveryError ? <p className="mt-2 text-red-700">{cimRequest.deliveryError}</p> : null}
-          {cimRequest.canRequest && onSendCimRequest ? (
+          {cimRequest.canRequest && onSendCimRequest && !readOnly ? (
             <button
               className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-full border border-moss bg-moss px-4 py-2.5 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50"
               disabled={requestingCim}
@@ -683,6 +683,7 @@ function DealHunterCard({ deal, mode = 'fit', onSendCimRequest, requestingCim = 
               {requestingCim ? 'Sending...' : 'Send CIM Request'}
             </button>
           ) : null}
+          {cimRequest.canRequest && readOnly ? <p className="mt-2 text-xs font-semibold uppercase tracking-[0.12em]">Read-only access</p> : null}
         </div>
       ) : null}
       {detailItems.length > 0 ? (
@@ -731,7 +732,7 @@ function CommandCenterActionItem({ action }) {
   );
 }
 
-function CommandCenterRecordCard({ record, updating, onUpdate }) {
+function CommandCenterRecordCard({ record, updating, onUpdate, readOnly = false }) {
   const missingReadiness = record.readiness?.missing || [];
   const contactEmail = record.brokerEmail || record.sellerEmail || '';
   const isPassed = record.pipelineStage === 'passed';
@@ -782,63 +783,67 @@ function CommandCenterRecordCard({ record, updating, onUpdate }) {
         </p>
       ) : null}
 
-      <div className="mt-5 flex flex-wrap gap-2">
-        <button
-          className="inline-flex min-h-10 flex-1 items-center justify-center gap-2 rounded-full border border-moss/20 bg-moss/10 px-3 py-2 text-center text-xs font-semibold uppercase tracking-[0.1em] text-moss transition hover:border-moss disabled:opacity-50 sm:flex-none sm:px-4"
-          disabled={updating}
-          onClick={() => onUpdate(record, { fitFeedback: 'good-fit' })}
-          type="button"
-        >
-          <CheckCircle2 className="h-4 w-4" />
-          Good Fit
-        </button>
-        <button
-          className="inline-flex min-h-10 flex-1 items-center justify-center gap-2 rounded-full border border-red-200 bg-red-50 px-3 py-2 text-center text-xs font-semibold uppercase tracking-[0.1em] text-red-700 transition hover:border-red-300 disabled:opacity-50 sm:flex-none sm:px-4"
-          disabled={updating}
-          onClick={() => onUpdate(record, { fitFeedback: 'false-positive' })}
-          type="button"
-        >
-          <XCircle className="h-4 w-4" />
-          False Positive
-        </button>
-        {!isPassed ? (
-          <>
+      {!readOnly ? (
+        <>
+          <div className="mt-5 flex flex-wrap gap-2">
             <button
-              className="inline-flex min-h-10 flex-1 items-center justify-center rounded-full border border-ink/10 bg-white px-3 py-2 text-center text-xs font-semibold uppercase tracking-[0.1em] text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50 sm:flex-none sm:px-4"
+              className="inline-flex min-h-10 flex-1 items-center justify-center gap-2 rounded-full border border-moss/20 bg-moss/10 px-3 py-2 text-center text-xs font-semibold uppercase tracking-[0.1em] text-moss transition hover:border-moss disabled:opacity-50 sm:flex-none sm:px-4"
               disabled={updating}
-              onClick={() => onUpdate(record, { pipelineStage: 'diligence' })}
+              onClick={() => onUpdate(record, { fitFeedback: 'good-fit' })}
               type="button"
             >
-              Move To Diligence
+              <CheckCircle2 className="h-4 w-4" />
+              Good Fit
             </button>
             <button
-              className="inline-flex min-h-10 flex-1 items-center justify-center rounded-full border border-ink/10 bg-white px-3 py-2 text-center text-xs font-semibold uppercase tracking-[0.1em] text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50 sm:flex-none sm:px-4"
+              className="inline-flex min-h-10 flex-1 items-center justify-center gap-2 rounded-full border border-red-200 bg-red-50 px-3 py-2 text-center text-xs font-semibold uppercase tracking-[0.1em] text-red-700 transition hover:border-red-300 disabled:opacity-50 sm:flex-none sm:px-4"
               disabled={updating}
-              onClick={() => onUpdate(record, { pipelineStage: 'loi-candidate', fitFeedback: 'good-fit' })}
+              onClick={() => onUpdate(record, { fitFeedback: 'false-positive' })}
               type="button"
             >
-              LOI Candidate
+              <XCircle className="h-4 w-4" />
+              False Positive
             </button>
-          </>
-        ) : null}
-      </div>
+            {!isPassed ? (
+              <>
+                <button
+                  className="inline-flex min-h-10 flex-1 items-center justify-center rounded-full border border-ink/10 bg-white px-3 py-2 text-center text-xs font-semibold uppercase tracking-[0.1em] text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50 sm:flex-none sm:px-4"
+                  disabled={updating}
+                  onClick={() => onUpdate(record, { pipelineStage: 'diligence' })}
+                  type="button"
+                >
+                  Move To Diligence
+                </button>
+                <button
+                  className="inline-flex min-h-10 flex-1 items-center justify-center rounded-full border border-ink/10 bg-white px-3 py-2 text-center text-xs font-semibold uppercase tracking-[0.1em] text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50 sm:flex-none sm:px-4"
+                  disabled={updating}
+                  onClick={() => onUpdate(record, { pipelineStage: 'loi-candidate', fitFeedback: 'good-fit' })}
+                  type="button"
+                >
+                  LOI Candidate
+                </button>
+              </>
+            ) : null}
+          </div>
 
-      <div className="mt-4">
-        <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss">Quick pass</p>
-        <div className="mt-2 flex flex-wrap gap-2">
-          {acquisitionPassReasons.map((reason) => (
-            <button
-              className="inline-flex min-h-10 flex-1 items-center justify-center rounded-full border border-red-200 bg-white px-3 py-2 text-center text-xs font-semibold text-red-700 transition hover:bg-red-50 disabled:opacity-50 sm:flex-none"
-              disabled={updating}
-              key={`${record.id}-${reason}`}
-              onClick={() => onUpdate(record, { pipelineStage: 'passed', passReason: reason, fitFeedback: 'false-positive' })}
-              type="button"
-            >
-              {formatPassReason(reason)}
-            </button>
-          ))}
-        </div>
-      </div>
+          <div className="mt-4">
+            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss">Quick pass</p>
+            <div className="mt-2 flex flex-wrap gap-2">
+              {acquisitionPassReasons.map((reason) => (
+                <button
+                  className="inline-flex min-h-10 flex-1 items-center justify-center rounded-full border border-red-200 bg-white px-3 py-2 text-center text-xs font-semibold text-red-700 transition hover:bg-red-50 disabled:opacity-50 sm:flex-none"
+                  disabled={updating}
+                  key={`${record.id}-${reason}`}
+                  onClick={() => onUpdate(record, { pipelineStage: 'passed', passReason: reason, fitFeedback: 'false-positive' })}
+                  type="button"
+                >
+                  {formatPassReason(reason)}
+                </button>
+              ))}
+            </div>
+          </div>
+        </>
+      ) : null}
 
       <div className="mt-4 flex flex-wrap gap-3">
         {record.listingUrl ? (
@@ -877,10 +882,12 @@ export default function DashboardPage() {
     checked: false,
     authenticated: false,
     username: '',
+    role: '',
     authMode: 'hybrid',
     magicLinkEnabled: false,
     passwordEnabled: false,
     adminEmailHint: '',
+    viewerAccessEnabled: false,
   });
   const [magicLinkForm, setMagicLinkForm] = useState({ email: '' });
   const [magicLinkFeedback, setMagicLinkFeedback] = useState({ error: '', message: '', previewUrl: '' });
@@ -924,6 +931,7 @@ export default function DashboardPage() {
   const [prospectDiscoveryRunning, setProspectDiscoveryRunning] = useState(false);
   const [prospectDiscoveryFeedback, setProspectDiscoveryFeedback] = useState({ error: '', message: '' });
   const deferredSearch = useDeferredValue(filters.search);
+  const isReadOnly = authState.role === 'viewer';
 
   async function checkSession() {
     const response = await fetch('/api/admin/session', { credentials: 'same-origin' });
@@ -933,10 +941,12 @@ export default function DashboardPage() {
       checked: true,
       authenticated: Boolean(result.authenticated),
       username: result.username || '',
+      role: result.role || '',
       authMode: result.authMode || 'hybrid',
       magicLinkEnabled: Boolean(result.magicLinkEnabled),
       passwordEnabled: Boolean(result.passwordEnabled),
       adminEmailHint: result.adminEmailHint || '',
+      viewerAccessEnabled: Boolean(result.viewerAccessEnabled),
     });
   }
 
@@ -987,7 +997,7 @@ export default function DashboardPage() {
       });
 
       if (response.status === 401) {
-        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '' }));
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
         return;
       }
 
@@ -1027,7 +1037,7 @@ export default function DashboardPage() {
       });
 
       if (response.status === 401) {
-        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '' }));
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
         return;
       }
 
@@ -1054,7 +1064,7 @@ export default function DashboardPage() {
       });
 
       if (response.status === 401) {
-        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '' }));
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
         return;
       }
 
@@ -1182,10 +1192,15 @@ export default function DashboardPage() {
       credentials: 'same-origin',
     });
 
-    setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '' }));
+    setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
   }
 
   async function handleSave(submissionId) {
+    if (isReadOnly) {
+      setActionError('Read-only users can view CRM records but cannot save changes.');
+      return;
+    }
+
     setSavingSubmissionId(submissionId);
     setActionError('');
 
@@ -1235,6 +1250,11 @@ export default function DashboardPage() {
   }
 
   async function handleCommandCenterUpdate(record, payload) {
+    if (isReadOnly) {
+      setCommandCenterFeedback({ error: 'Read-only users can view the command center but cannot update records.', message: '' });
+      return;
+    }
+
     if (!record?.id) {
       return;
     }
@@ -1271,6 +1291,12 @@ export default function DashboardPage() {
 
   async function handleCreateSubmission(event) {
     event.preventDefault();
+
+    if (isReadOnly) {
+      setCreateError('Read-only users cannot create CRM records.');
+      return;
+    }
+
     setCreatePending(true);
     setCreateError('');
 
@@ -1304,6 +1330,11 @@ export default function DashboardPage() {
   }
 
   async function handleCreateUploadRequest(submissionId) {
+    if (isReadOnly) {
+      setActionError('Read-only users cannot create secure upload requests.');
+      return;
+    }
+
     setCreatingUploadForId(submissionId);
     setActionError('');
 
@@ -1387,6 +1418,11 @@ export default function DashboardPage() {
   }
 
   async function handleSendDealHunterEmail() {
+    if (isReadOnly) {
+      setDealHunterFeedback({ error: 'Read-only users cannot send daily deal emails.', message: '' });
+      return;
+    }
+
     setDealHunterSending(true);
     setDealHunterFeedback({ error: '', message: '' });
 
@@ -1442,6 +1478,11 @@ export default function DashboardPage() {
   }
 
   async function handleSendCimRequest(deal) {
+    if (isReadOnly) {
+      setDealHunterFeedback({ error: 'Read-only users cannot send CIM requests.', message: '' });
+      return;
+    }
+
     if (!deal?.dealKey) {
       setDealHunterFeedback({ error: 'Deal key is missing for this listing.', message: '' });
       return;
@@ -1486,6 +1527,11 @@ export default function DashboardPage() {
   }
 
   async function handleRunCimFollowUps() {
+    if (isReadOnly) {
+      setDealHunterFeedback({ error: 'Read-only users cannot run CIM follow-ups.', message: '' });
+      return;
+    }
+
     setDealHunterFollowUpRunning(true);
     setDealHunterFeedback({ error: '', message: '' });
 
@@ -1520,6 +1566,12 @@ export default function DashboardPage() {
 
   async function handleRunProspectDiscovery(event) {
     event.preventDefault();
+
+    if (isReadOnly) {
+      setProspectDiscoveryFeedback({ error: 'Read-only users cannot run prospect discovery.', message: '' });
+      return;
+    }
+
     setProspectDiscoveryRunning(true);
     setProspectDiscoveryFeedback({ error: '', message: '' });
 
@@ -1626,12 +1678,12 @@ export default function DashboardPage() {
                   <SectionLabel>Magic-Link Sign In</SectionLabel>
                   <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Secure access without a shared password</h2>
                   <p className="mt-3 text-base leading-7 text-ink/72">
-                    Use the admin email address to request a time-limited sign-in link{authState.adminEmailHint ? ` (${authState.adminEmailHint})` : ''}.
+                    Use an approved admin or read-only viewer email address to request a time-limited sign-in link{authState.adminEmailHint ? ` (${authState.adminEmailHint})` : ''}.
                   </p>
                 </div>
 
                 <InputField
-                  label="Admin email"
+                  label="Email"
                   onChange={(event) => setMagicLinkForm({ email: event.target.value })}
                   type="email"
                   value={magicLinkForm.email}
@@ -1666,7 +1718,7 @@ export default function DashboardPage() {
                   <SectionLabel>Fallback Access</SectionLabel>
                   <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Password sign-in</h2>
                   <p className="mt-3 text-base leading-7 text-ink/72">
-                    This is primarily for local development or temporary fallback use. In production, the preferred path is the emailed magic link.
+                    Admin credentials have full access. Viewer credentials can inspect the CRM and deal data but cannot make changes.
                   </p>
                 </div>
 
@@ -1716,29 +1768,40 @@ export default function DashboardPage() {
         <Reveal className="panel px-5 py-7 sm:px-9 sm:py-8">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
             <div>
-              <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Signed in as {authState.username}</p>
+              <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">
+                Signed in as {authState.username}{isReadOnly ? ' · Read-only viewer' : ''}
+              </p>
               <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Broker and seller CRM</h2>
               <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
                 This is no longer just a submissions inbox. It now tracks sourced opportunities, broker conversations, seller follow-ups, deal notes, and secure document requests in one place.
               </p>
+              {isReadOnly ? (
+                <p className="mt-4 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-medium leading-6 text-sky-800">
+                  Read-only access is enabled for this session. You can view records, Deal Hunter scoring, source health, and conversations, but create, edit, email, import, export, CIM, and upload actions are disabled.
+                </p>
+              ) : null}
             </div>
 
             <div className="grid w-full gap-3 sm:flex sm:w-auto sm:flex-wrap">
-              <button
-                className={primaryActionButtonClass}
-                onClick={() => setCreateOpen((current) => !current)}
-                type="button"
-              >
-                <Plus className="h-4 w-4" />
-                {createOpen ? 'Close New Record' : 'New CRM Record'}
-              </button>
-              <a
-                className={secondaryActionButtonClass}
-                href="/api/admin/submissions/export"
-              >
-                <Download className="h-4 w-4" />
-                Export CSV
-              </a>
+              {!isReadOnly ? (
+                <>
+                  <button
+                    className={primaryActionButtonClass}
+                    onClick={() => setCreateOpen((current) => !current)}
+                    type="button"
+                  >
+                    <Plus className="h-4 w-4" />
+                    {createOpen ? 'Close New Record' : 'New CRM Record'}
+                  </button>
+                  <a
+                    className={secondaryActionButtonClass}
+                    href="/api/admin/submissions/export"
+                  >
+                    <Download className="h-4 w-4" />
+                    Export CSV
+                  </a>
+                </>
+              ) : null}
               <a
                 className={secondaryActionButtonClass}
                 href={dailyDealUpdateUrl}
@@ -1925,6 +1988,7 @@ export default function DashboardPage() {
                       <CommandCenterRecordCard
                         key={record.id}
                         onUpdate={handleCommandCenterUpdate}
+                        readOnly={isReadOnly}
                         record={record}
                         updating={commandCenterUpdatingId === record.id}
                       />
@@ -1969,39 +2033,45 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          <form className="mt-6 grid gap-4 lg:grid-cols-[minmax(0,1fr)_140px_auto]" onSubmit={handleRunProspectDiscovery}>
-            <InputField
-              label="Search query"
-              onChange={(event) => setProspectDiscoveryForm((current) => ({ ...current, query: event.target.value }))}
-              placeholder="Example: plumbers near New Rochelle NY"
-              value={prospectDiscoveryForm.query}
-            />
-            <InputField
-              label="Max results"
-              onChange={(event) => setProspectDiscoveryForm((current) => ({ ...current, maxResults: event.target.value }))}
-              type="number"
-              value={prospectDiscoveryForm.maxResults}
-            />
-            <div className="flex flex-col justify-end gap-3">
-              <label className="flex items-center gap-2 text-sm font-semibold text-ink">
-                <input
-                  checked={prospectDiscoveryForm.autoImport}
-                  className="h-4 w-4 rounded border-line text-moss"
-                  onChange={(event) => setProspectDiscoveryForm((current) => ({ ...current, autoImport: event.target.checked }))}
-                  type="checkbox"
-                />
-                Auto-import
-              </label>
-              <button
-                className={primaryActionButtonClass}
-                disabled={prospectDiscoveryRunning || prospectDiscoveryLoading || !prospectDiscoveryForm.query}
-                type="submit"
-              >
-                <Search className="h-4 w-4" />
-                {prospectDiscoveryRunning ? 'Discovering...' : 'Run Discovery'}
-              </button>
-            </div>
-          </form>
+          {!isReadOnly ? (
+            <form className="mt-6 grid gap-4 lg:grid-cols-[minmax(0,1fr)_140px_auto]" onSubmit={handleRunProspectDiscovery}>
+              <InputField
+                label="Search query"
+                onChange={(event) => setProspectDiscoveryForm((current) => ({ ...current, query: event.target.value }))}
+                placeholder="Example: plumbers near New Rochelle NY"
+                value={prospectDiscoveryForm.query}
+              />
+              <InputField
+                label="Max results"
+                onChange={(event) => setProspectDiscoveryForm((current) => ({ ...current, maxResults: event.target.value }))}
+                type="number"
+                value={prospectDiscoveryForm.maxResults}
+              />
+              <div className="flex flex-col justify-end gap-3">
+                <label className="flex items-center gap-2 text-sm font-semibold text-ink">
+                  <input
+                    checked={prospectDiscoveryForm.autoImport}
+                    className="h-4 w-4 rounded border-line text-moss"
+                    onChange={(event) => setProspectDiscoveryForm((current) => ({ ...current, autoImport: event.target.checked }))}
+                    type="checkbox"
+                  />
+                  Auto-import
+                </label>
+                <button
+                  className={primaryActionButtonClass}
+                  disabled={prospectDiscoveryRunning || prospectDiscoveryLoading || !prospectDiscoveryForm.query}
+                  type="submit"
+                >
+                  <Search className="h-4 w-4" />
+                  {prospectDiscoveryRunning ? 'Discovering...' : 'Run Discovery'}
+                </button>
+              </div>
+            </form>
+          ) : (
+            <p className="mt-6 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-medium text-sky-800">
+              Prospect discovery runs are hidden for read-only users. Existing discoveries and recent runs remain visible below.
+            </p>
+          )}
 
           {!prospectDiscovery.config?.enabled || !prospectDiscovery.config?.hasGooglePlacesApiKey ? (
             <p className="mt-5 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
@@ -2110,24 +2180,28 @@ export default function DashboardPage() {
                 <RefreshCw className={`h-4 w-4 ${dealHunterLoading ? 'animate-spin' : ''}`} />
                 {dealHunterLoading ? 'Reviewing...' : 'Review Sources'}
               </button>
-              <button
-                className={secondaryActionButtonClass}
-                disabled={dealHunterLoading || dealHunterSending || dealHunterFollowUpRunning}
-                onClick={handleRunCimFollowUps}
-                type="button"
-              >
-                <MailCheck className={`h-4 w-4 ${dealHunterFollowUpRunning ? 'animate-pulse' : ''}`} />
-                {dealHunterFollowUpRunning ? 'Checking...' : 'Run CIM Follow-Ups'}
-              </button>
-              <button
-                className={primaryActionButtonClass}
-                disabled={dealHunterLoading || dealHunterSending || dealHunterFollowUpRunning}
-                onClick={handleSendDealHunterEmail}
-                type="button"
-              >
-                <Send className="h-4 w-4" />
-                {dealHunterSending ? 'Sending...' : 'Send Daily Email'}
-              </button>
+              {!isReadOnly ? (
+                <>
+                  <button
+                    className={secondaryActionButtonClass}
+                    disabled={dealHunterLoading || dealHunterSending || dealHunterFollowUpRunning}
+                    onClick={handleRunCimFollowUps}
+                    type="button"
+                  >
+                    <MailCheck className={`h-4 w-4 ${dealHunterFollowUpRunning ? 'animate-pulse' : ''}`} />
+                    {dealHunterFollowUpRunning ? 'Checking...' : 'Run CIM Follow-Ups'}
+                  </button>
+                  <button
+                    className={primaryActionButtonClass}
+                    disabled={dealHunterLoading || dealHunterSending || dealHunterFollowUpRunning}
+                    onClick={handleSendDealHunterEmail}
+                    type="button"
+                  >
+                    <Send className="h-4 w-4" />
+                    {dealHunterSending ? 'Sending...' : 'Send Daily Email'}
+                  </button>
+                </>
+              ) : null}
             </div>
           </div>
 
@@ -2193,6 +2267,7 @@ export default function DashboardPage() {
                         deal={deal}
                         key={`new-${deal.sourceName}-${deal.dealKey || deal.id || deal.listingUrl}`}
                         onSendCimRequest={handleSendCimRequest}
+                        readOnly={isReadOnly}
                         requestingCim={requestingCimDealKey === deal.dealKey}
                       />
                     ))}
@@ -2212,6 +2287,7 @@ export default function DashboardPage() {
                         deal={deal}
                         key={`qualified-${deal.sourceName}-${deal.id || deal.listingUrl}`}
                         onSendCimRequest={handleSendCimRequest}
+                        readOnly={isReadOnly}
                         requestingCim={requestingCimDealKey === deal.dealKey}
                       />
                     ))}
@@ -2231,6 +2307,7 @@ export default function DashboardPage() {
                         key={`watch-${deal.sourceName}-${deal.id || deal.listingUrl}`}
                         mode="watch"
                         onSendCimRequest={handleSendCimRequest}
+                        readOnly={isReadOnly}
                         requestingCim={requestingCimDealKey === deal.dealKey}
                       />
                     ))}
@@ -2346,7 +2423,7 @@ export default function DashboardPage() {
         </section>
       ) : null}
 
-      {createOpen ? (
+      {createOpen && !isReadOnly ? (
         <section className="section-shell mt-8">
           <Reveal className="panel p-6 sm:p-8">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
@@ -2716,18 +2793,19 @@ export default function DashboardPage() {
                   </div>
                 </div>
 
-                <div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-6">
-                  <SelectField
-                    label="Status"
-                    onChange={(event) =>
-                      setDrafts((current) => ({
-                        ...current,
-                        [submission.id]: { ...draft, status: event.target.value },
-                      }))
-                    }
-                    options={statuses}
-                    value={draft.status}
-                  />
+                <fieldset className={isReadOnly ? 'opacity-75' : ''} disabled={isReadOnly}>
+                  <div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-6">
+                    <SelectField
+                      label="Status"
+                      onChange={(event) =>
+                        setDrafts((current) => ({
+                          ...current,
+                          [submission.id]: { ...draft, status: event.target.value },
+                        }))
+                      }
+                      options={statuses}
+                      value={draft.status}
+                    />
 
                   <SelectField
                     label="Priority"
@@ -3193,32 +3271,35 @@ export default function DashboardPage() {
                       ) : (
                         <p className="mt-4 text-sm leading-7 text-ink/68">No files uploaded yet.</p>
                       )}
+                      </div>
                     </div>
                   </div>
-                </div>
+                </fieldset>
 
-                <div className="mt-6 grid gap-3 sm:flex sm:flex-wrap">
-                  <button
-                    className={primaryActionButtonClass}
-                    disabled={isSaving}
-                    onClick={() => handleSave(submission.id)}
-                    type="button"
-                  >
-                    <Save className="h-4 w-4" />
-                    {isSaving ? 'Saving...' : 'Save Updates'}
-                  </button>
+                {!isReadOnly ? (
+                  <div className="mt-6 grid gap-3 sm:flex sm:flex-wrap">
+                    <button
+                      className={primaryActionButtonClass}
+                      disabled={isSaving}
+                      onClick={() => handleSave(submission.id)}
+                      type="button"
+                    >
+                      <Save className="h-4 w-4" />
+                      {isSaving ? 'Saving...' : 'Save Updates'}
+                    </button>
 
-                  <button
-                    className={secondaryActionButtonClass}
-                    disabled={isCreatingUpload}
-                    onClick={() => handleCreateUploadRequest(submission.id)}
-                    type="button"
-                  >
-                    <Link2 className="h-4 w-4" />
-                    {isCreatingUpload ? 'Creating Link...' : 'Create Secure Upload Link'}
-                  </button>
+                    <button
+                      className={secondaryActionButtonClass}
+                      disabled={isCreatingUpload}
+                      onClick={() => handleCreateUploadRequest(submission.id)}
+                      type="button"
+                    >
+                      <Link2 className="h-4 w-4" />
+                      {isCreatingUpload ? 'Creating Link...' : 'Create Secure Upload Link'}
+                    </button>
 
-                </div>
+                  </div>
+                ) : null}
               </Reveal>
             );
           })}

@@ -72,6 +72,13 @@ Admin endpoints:
 - `GET /api/admin/acquisition-command-center`
 - `POST /api/admin/acquisition-command-center/:id`
 
+Read-only viewer access can be enabled for the SMB Deal Hunter team without granting write permissions:
+
+- `ADMIN_VIEWER_EMAILS=person1@example.com,person2@example.com` allows magic-link viewer sign-in.
+- `ADMIN_VIEWER_USERNAME` and `ADMIN_VIEWER_PASSWORD` allow password viewer sign-in when password auth is enabled.
+
+Viewer sessions can load the protected CRM, Acquisition Command Center, Deal Hunter source review, and prospect discovery dashboard. They cannot create or edit CRM records, export CSVs, send daily emails, send CIM requests, run CIM follow-ups, run prospect discovery imports, create secure upload links, or update command-center feedback.
+
 The production Fly machine runs the in-app scheduler once daily at the configured local time. The scheduler records successful Daily Deal Hunter sends in `email_events` and also writes a local send marker under the configured data directory, so a server restart does not resend the same day's email.
 
 Optional external scheduler endpoint:

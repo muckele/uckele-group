@@ -574,6 +574,22 @@ export function createSupabaseStorage(config) {
       return normalizeUploadRequestRow(data);
     },
 
+    async claimSecureUploadRequest(id, values) {
+      const { data, error } = await client
+        .from('secure_upload_requests')
+        .update(values)
+        .eq('id', id)
+        .eq('status', 'awaiting-documents')
+        .select()
+        .maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      return normalizeUploadRequestRow(data);
+    },
+
     async getSecureUploadRequest(id) {
       const { data, error } = await client.from('secure_upload_requests').select('*').eq('id', id).single();
 

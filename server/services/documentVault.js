@@ -3,8 +3,8 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
-import { getRequestOrigin } from '../utils/http.js';
-import { signPayload, verifySignedPayload } from '../utils/security.js';
+import { getClientIp, getRequestOrigin } from '../utils/http.js';
+import { hashIp, sha256, signPayload, verifySignedPayload } from '../utils/security.js';
 import { sendDocumentUploadNotificationEmail, sendSecureUploadInviteEmail } from './delivery.js';
 
 const allowedMimeTypes = new Set([
@@ -23,6 +23,7 @@ const allowedMimeTypes = new Set([
 ]);
 const maxDocumentsPerUpload = 5;
 const maxDocumentsPerRequest = maxDocumentsPerUpload;
+const secureUploadRateLimitEvents = new Map();
 
 function sanitizeFileName(fileName) {
   const cleaned = String(fileName || 'document')
@@ -66,10 +67,71 @@ function estimateBase64DecodedBytes(value = '') {
   return Math.max(0, Math.floor((normalized.length * 3) / 4) - padding);
 }
 
-function validateDocumentPayload(document = {}, config) {
+function startsWithBytes(buffer, bytes) {
+  return bytes.every((byte, index) => buffer[index] === byte);
+}
+
+function hasZipSignature(buffer) {
+  return (
+    startsWithBytes(buffer, [0x50, 0x4b, 0x03, 0x04]) ||
+    startsWithBytes(buffer, [0x50, 0x4b, 0x05, 0x06]) ||
+    startsWithBytes(buffer, [0x50, 0x4b, 0x07, 0x08])
+  );
+}
+
+function hasOleSignature(buffer) {
+  return startsWithBytes(buffer, [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+}
+
+function hasTextSignature(buffer) {
+  return buffer.length > 0 && !buffer.subarray(0, Math.min(buffer.length, 4096)).includes(0);
+}
+
+function bufferMatchesMimeType(buffer, mimeType) {
+  if (mimeType === 'application/pdf') {
+    return buffer.subarray(0, 5).toString('ascii') === '%PDF-';
+  }
+
+  if (mimeType === 'image/png') {
+    return startsWithBytes(buffer, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  }
+
+  if (mimeType === 'image/jpeg') {
+    return startsWithBytes(buffer, [0xff, 0xd8, 0xff]);
+  }
+
+  if (mimeType === 'image/webp') {
+    return buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+  }
+
+  if (
+    [
+      'application/zip',
+      'application/x-zip-compressed',
+      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    ].includes(mimeType)
+  ) {
+    return hasZipSignature(buffer);
+  }
+
+  if (['application/vnd.ms-excel', 'application/msword'].includes(mimeType)) {
+    return hasOleSignature(buffer);
+  }
+
+  if (['text/csv', 'text/plain'].includes(mimeType)) {
+    return hasTextSignature(buffer);
+  }
+
+  return false;
+}
+
+function prepareDocumentPayload(document = {}, config) {
   document = document || {};
   const errors = [];
   const decodedBytes = estimateBase64DecodedBytes(document.contentBase64);
+  const mimeType = String(document.mimeType || '').trim().toLowerCase();
+  let buffer = null;
 
   if (!document.name || !document.contentBase64) {
     errors.push('Each uploaded file must include a name and file content.');
@@ -85,15 +147,104 @@ function validateDocumentPayload(document = {}, config) {
     );
   }
 
-  if (document.mimeType && !allowedMimeTypes.has(document.mimeType)) {
+  if (!mimeType) {
+    errors.push(`${document.name || 'A file'} must include a file type.`);
+  } else if (!allowedMimeTypes.has(mimeType)) {
     errors.push(`${document.name || 'A file'} uses a file type that is not allowed.`);
   }
 
-  return errors;
+  if (errors.length === 0) {
+    buffer = Buffer.from(normalizeBase64(document.contentBase64), 'base64');
+
+    if (!bufferMatchesMimeType(buffer, mimeType)) {
+      errors.push(`${document.name || 'A file'} does not match the selected file type.`);
+    }
+  }
+
+  return {
+    document,
+    mimeType,
+    buffer,
+    errors,
+  };
 }
 
 function sumSecureDocumentBytes(documents = []) {
   return documents.reduce((sum, document) => sum + Number(document.size_bytes || 0), 0);
+}
+
+function enforceInMemoryRateLimit(buckets, windowMs, maxAttempts) {
+  const now = Date.now();
+  const cutoff = now - windowMs;
+  const snapshots = buckets.map((bucket) => ({
+    bucket,
+    timestamps: (secureUploadRateLimitEvents.get(bucket) || []).filter((timestamp) => timestamp >= cutoff),
+  }));
+
+  if (snapshots.some((snapshot) => snapshot.timestamps.length >= maxAttempts)) {
+    return { blocked: true };
+  }
+
+  for (const snapshot of snapshots) {
+    secureUploadRateLimitEvents.set(snapshot.bucket, [...snapshot.timestamps, now]);
+  }
+
+  return { blocked: false };
+}
+
+async function enforceSecureUploadRateLimit({ buckets, maxAttempts, requestLabel }) {
+  const config = getConfig();
+  const storage = getStorage();
+  const windowMs = config.protection.rateLimitWindowMs;
+  const blocked = {
+    ok: false,
+    status: 429,
+    error: 'Too many secure upload attempts. Please wait a few minutes and try again.',
+  };
+
+  try {
+    const windowStartIso = new Date(Date.now() - windowMs).toISOString();
+    const counts = await Promise.all(buckets.map((bucket) => storage.countRateLimitEvents(bucket, windowStartIso)));
+
+    if (counts.some((count) => count >= maxAttempts)) {
+      return blocked;
+    }
+
+    const nowIso = new Date().toISOString();
+    await Promise.all(buckets.map((bucket) => storage.addRateLimitEvent(bucket, nowIso)));
+    return { ok: true };
+  } catch (error) {
+    console.warn(`[secure-documents] ${requestLabel} rate limit storage failed: ${error.message}`);
+    return enforceInMemoryRateLimit(buckets, windowMs, maxAttempts).blocked ? blocked : { ok: true };
+  }
+}
+
+function secureUploadIpBucket(request, prefix) {
+  return `${prefix}:ip:${hashIp(getClientIp(request))}`;
+}
+
+export async function enforceSecureUploadBodyRateLimit(request) {
+  const config = getConfig();
+
+  return enforceSecureUploadRateLimit({
+    buckets: [secureUploadIpBucket(request, 'secure-documents-upload-body')],
+    maxAttempts: Math.max(1, config.protection.rateLimitMax),
+    requestLabel: 'body',
+  });
+}
+
+async function enforceSecureUploadAttemptRateLimit({ token, request }) {
+  const config = getConfig();
+  const normalizedToken = String(token || '').trim() || 'empty';
+
+  return enforceSecureUploadRateLimit({
+    buckets: [
+      secureUploadIpBucket(request, 'secure-documents-upload'),
+      `secure-documents-upload:token:${sha256(normalizedToken).slice(0, 24)}`,
+    ],
+    maxAttempts: Math.max(1, config.protection.rateLimitMax),
+    requestLabel: 'attempt',
+  });
 }
 
 export async function createSecureUploadRequest({ submissionId, requestedBy, note = '', sendEmail = true, request }) {
@@ -187,9 +338,15 @@ export async function getSecureUploadContext(token) {
   };
 }
 
-export async function uploadSecureDocuments({ token, ndaAccepted, note = '', documents }) {
+export async function uploadSecureDocuments({ token, ndaAccepted, note = '', documents, request }) {
   const config = getConfig();
   const storage = getStorage();
+  const rateLimitResult = await enforceSecureUploadAttemptRateLimit({ token, request });
+
+  if (!rateLimitResult.ok) {
+    return rateLimitResult;
+  }
+
   const context = await getSecureUploadContext(token);
 
   if (!context.ok) {
@@ -215,7 +372,8 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
     return { ok: false, error: `Please upload no more than ${maxDocumentsPerUpload} files at a time.` };
   }
 
-  const validationErrors = documents.flatMap((document) => validateDocumentPayload(document, config));
+  const preparedDocuments = documents.map((document) => prepareDocumentPayload(document, config));
+  const validationErrors = preparedDocuments.flatMap((document) => document.errors);
 
   if (validationErrors.length > 0) {
     return { ok: false, error: validationErrors[0] };
@@ -231,7 +389,7 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
     };
   }
 
-  const incomingBytes = documents.reduce((sum, document) => sum + estimateBase64DecodedBytes(document.contentBase64), 0);
+  const incomingBytes = preparedDocuments.reduce((sum, document) => sum + document.buffer.byteLength, 0);
   const maxTotalBytes = config.secureDocuments.maxUploadBytes * maxDocumentsPerRequest;
 
   if (sumSecureDocumentBytes(context.documents) + incomingBytes > maxTotalBytes) {
@@ -241,14 +399,33 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
     };
   }
 
+  const uploadStartedAt = new Date().toISOString();
+  const claimedRequest = storage.claimSecureUploadRequest
+    ? await storage.claimSecureUploadRequest(context.request.id, {
+        updated_at: uploadStartedAt,
+        status: 'uploading',
+        nda_accepted_at: context.request.nda_accepted_at || uploadStartedAt,
+      })
+    : await storage.updateSecureUploadRequest(context.request.id, {
+        updated_at: uploadStartedAt,
+        status: 'uploading',
+        nda_accepted_at: context.request.nda_accepted_at || uploadStartedAt,
+      });
+
+  if (!claimedRequest) {
+    return {
+      ok: false,
+      error: 'Documents are already being uploaded for this request. Please refresh before trying again.',
+    };
+  }
+
   const requestDirectory = path.join(config.secureDocuments.storageDir, context.request.id);
   await fs.mkdir(requestDirectory, { recursive: true });
 
   const savedDocuments = [];
 
-  for (const document of documents) {
-    const buffer = Buffer.from(normalizeBase64(document.contentBase64), 'base64');
-
+  for (const preparedDocument of preparedDocuments) {
+    const { document, buffer, mimeType } = preparedDocument;
     const documentId = randomUUID();
     const safeOriginalName = sanitizeFileName(document.name);
     const safeStoredName = `${documentId}-${safeOriginalName}`;
@@ -263,10 +440,10 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
       document_type: normalizeDocumentType(document.documentType),
       file_name: safeStoredName,
       original_name: safeOriginalName,
-      mime_type: String(document.mimeType || 'application/octet-stream'),
+      mime_type: mimeType,
       size_bytes: buffer.byteLength,
       storage_path: storagePath,
-      uploaded_by_email: context.request.email,
+      uploaded_by_email: claimedRequest.email,
       note: String(note || '').trim(),
       nda_accepted_at: new Date().toISOString(),
     };
@@ -278,7 +455,7 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
   const updatedRequest = await storage.updateSecureUploadRequest(context.request.id, {
     updated_at: new Date().toISOString(),
     status: 'documents-received',
-    nda_accepted_at: context.request.nda_accepted_at || new Date().toISOString(),
+    nda_accepted_at: claimedRequest.nda_accepted_at || new Date().toISOString(),
     last_uploaded_at: new Date().toISOString(),
   });
 

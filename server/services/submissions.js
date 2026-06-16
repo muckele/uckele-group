@@ -306,7 +306,7 @@ function validateManualSubmission(input) {
   return errors;
 }
 
-function buildCsv(submissions) {
+export function buildCsv(submissions) {
   const headers = [
     'Company/Business',
     'Date Added',
@@ -344,7 +344,15 @@ function buildCsv(submissions) {
     'ID',
   ];
 
-  const escapeCell = (value) => `"${String(value ?? '').replaceAll('"', '""')}"`;
+  const escapeCell = (value) => {
+    let text = String(value ?? '');
+
+    if (/^\s*[=+\-@]/.test(text)) {
+      text = `'${text}`;
+    }
+
+    return `"${text.replaceAll('"', '""')}"`;
+  };
   const lines = [
     headers.join(','),
     ...submissions.map((submission) => {

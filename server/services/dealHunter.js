@@ -1967,7 +1967,7 @@ function emailSubjectLooksLikeCimReply(event, request) {
   return /\b(cim|nda|teaser|confidential|financial|package)\b/.test(subject);
 }
 
-function eventMatchesCimRequest(event, request) {
+export function eventMatchesCimRequest(event, request) {
   const eventMessageId = normalizeText(event?.message_id, 240);
   const messageIds = getCimRequestProviderMessageIds(request);
 
@@ -1986,13 +1986,6 @@ function eventMatchesCimRequest(event, request) {
   ) {
     if (emailSubjectLooksLikeCimReply(event, request)) {
       return true;
-    }
-
-    const eventCreatedAt = Date.parse(event?.created_at || '');
-    const requestCreatedAt = Date.parse(request?.created_at || request?.updated_at || '');
-
-    if (Number.isFinite(eventCreatedAt) && Number.isFinite(requestCreatedAt)) {
-      return eventCreatedAt >= requestCreatedAt - 5 * 60 * 1000;
     }
   }
 

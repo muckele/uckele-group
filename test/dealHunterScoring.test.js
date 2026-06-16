@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { scoreDeal } from '../server/services/dealHunter.js';
+import { eventMatchesCimRequest, scoreDeal } from '../server/services/dealHunter.js';
 
 function baseDeal(overrides = {}) {
   const fullText = [
@@ -93,4 +93,32 @@ test('scoring does not treat non-recurring language as recurring revenue strengt
 
   assert.equal(scored.strengths.some((strength) => /Recurring or repeat revenue signals/i.test(strength)), false);
   assert.equal(scored.concerns.some((concern) => /Financial quality risk language found/i.test(concern)), true);
+});
+
+test('CIM response matching ignores unrelated replies from the same broker', () => {
+  const request = {
+    id: 'cim-request-1',
+    deal_key: 'commercial-hvac-maintenance-co',
+    deal_name: 'Commercial HVAC Maintenance Co',
+    recipient_email: 'broker@example.com',
+    provider_message_id: 'request-message-1',
+    created_at: '2026-06-16T16:00:00.000Z',
+    metadata: {
+      providerMessageIds: ['request-message-1'],
+    },
+  };
+  const unrelatedReply = {
+    event_type: 'replied',
+    recipient_email: 'broker@example.com',
+    from_email: 'broker@example.com',
+    subject: 'Re: different opportunity',
+    created_at: '2026-06-16T17:00:00.000Z',
+  };
+  const trackedReply = {
+    ...unrelatedReply,
+    subject: 'Re: CIM / NDA request for Commercial HVAC Maintenance Co',
+  };
+
+  assert.equal(eventMatchesCimRequest(unrelatedReply, request), false);
+  assert.equal(eventMatchesCimRequest(trackedReply, request), true);
 });

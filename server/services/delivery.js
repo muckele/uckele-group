@@ -857,11 +857,13 @@ export async function sendDealHunterCimFollowUpEmail(options) {
   return sendMessage(buildDealHunterCimFollowUpEmail(options));
 }
 
-export async function sendAdminMagicLinkEmail({ to, magicLinkUrl, expiresAt }) {
+export async function sendAdminMagicLinkEmail({ to, magicLinkUrl, expiresAt, role = 'admin' }) {
   const expiryLabel = new Date(expiresAt).toLocaleString();
-  const subject = 'Your Uckele Group admin sign-in link';
+  const isViewer = role === 'viewer';
+  const accessLabel = isViewer ? 'read-only' : 'admin';
+  const subject = `Your Uckele Group ${accessLabel} sign-in link`;
   const text = [
-    'An admin sign-in link was requested for Uckele Group.',
+    `A ${accessLabel} sign-in link was requested for Uckele Group.`,
     '',
     `Open this link to sign in: ${magicLinkUrl}`,
     `This link expires at: ${expiryLabel}`,
@@ -870,10 +872,10 @@ export async function sendAdminMagicLinkEmail({ to, magicLinkUrl, expiresAt }) {
   ].join('\n');
   const html = `
     <div style="font-family: Arial, sans-serif; color: #18211D; line-height: 1.6;">
-      <h2>Admin sign-in link</h2>
-      <p>Use the button below to securely sign in to the private Uckele Group admin area.</p>
+      <h2>${isViewer ? 'Read-only' : 'Admin'} sign-in link</h2>
+      <p>Use the button below to securely sign in to the private Uckele Group ${isViewer ? 'viewer area' : 'admin area'}.</p>
       <p style="margin: 24px 0;">
-        <a href="${escapeHtml(magicLinkUrl)}" style="display: inline-block; background: #284638; color: #FFFFFF; text-decoration: none; padding: 12px 18px; border-radius: 999px; font-weight: 700;">Open admin</a>
+        <a href="${escapeHtml(magicLinkUrl)}" style="display: inline-block; background: #284638; color: #FFFFFF; text-decoration: none; padding: 12px 18px; border-radius: 999px; font-weight: 700;">Open ${isViewer ? 'viewer access' : 'admin'}</a>
       </p>
       <p>This link expires at <strong>${escapeHtml(expiryLabel)}</strong>.</p>
       <p>If you did not request this email, you can ignore it.</p>
@@ -884,7 +886,7 @@ export async function sendAdminMagicLinkEmail({ to, magicLinkUrl, expiresAt }) {
     kind: 'admin-magic-link',
     to,
     subject,
-    headline: 'Admin sign-in link',
+    headline: `${isViewer ? 'Read-only' : 'Admin'} sign-in link`,
     text,
     html,
   });

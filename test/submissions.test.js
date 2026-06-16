@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { diligenceReviewsEqual, normalizeDiligenceReview } from '../server/services/submissions.js';
+import { buildCsv, diligenceReviewsEqual, normalizeDiligenceReview } from '../server/services/submissions.js';
 
 test('diligence review normalizer whitelists fields and preserves existing partial state', () => {
   const normalized = normalizeDiligenceReview(
@@ -75,4 +75,24 @@ test('diligence comparison ignores timestamp-only differences', () => {
   assert.equal(diligenceReviewsEqual(submitted, existing), true);
   assert.equal(diligenceReviewsEqual({ ...submitted, decision: 'pause' }, existing), false);
   assert.equal(diligenceReviewsEqual({}, undefined), true);
+});
+
+test('CSV export neutralizes spreadsheet formula starters', () => {
+  const csv = buildCsv([
+    {
+      id: 'submission-1',
+      company: '=IMPORTXML("https://example.com","//a")',
+      created_at: '2026-06-16T12:00:00.000Z',
+      status: 'review',
+      updated_at: '2026-06-16T12:00:00.000Z',
+      broker_email: '+broker@example.com',
+      notes: '@malicious',
+      source: '-feed',
+    },
+  ]);
+
+  assert.match(csv, /"'=IMPORTXML/);
+  assert.match(csv, /"'\+broker@example\.com"/);
+  assert.match(csv, /"'@malicious"/);
+  assert.match(csv, /"'-feed"/);
 });

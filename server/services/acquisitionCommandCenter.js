@@ -939,14 +939,17 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
   };
 }
 
-async function getSourceHealth(storage) {
+export async function getSourceHealth(storage, { persistSnapshot = true, review = null } = {}) {
   const config = getConfig();
   const previousSnapshot = await readSourceSnapshot(config);
 
   try {
-    const review = await reviewDailyDeals({ markSeen: false, storage });
-    const sourceHealth = buildAcquisitionSourceHealth({ review, previousSnapshot, config });
-    await writeSourceSnapshot(config, buildNextSourceSnapshot(sourceHealth, previousSnapshot));
+    const sourceReview = review || await reviewDailyDeals({ markSeen: false, storage });
+    const sourceHealth = buildAcquisitionSourceHealth({ review: sourceReview, previousSnapshot, config });
+
+    if (persistSnapshot) {
+      await writeSourceSnapshot(config, buildNextSourceSnapshot(sourceHealth, previousSnapshot));
+    }
 
     return sourceHealth;
   } catch (error) {
@@ -967,7 +970,7 @@ async function getSourceHealth(storage) {
   }
 }
 
-export async function getAcquisitionCommandCenter({ storage = getStorage() } = {}) {
+export async function getAcquisitionCommandCenter({ storage = getStorage(), persistSourceHealth = true } = {}) {
   const submissionsResult = await storage.listSubmissions({ limit: commandCenterLimit, page: 1, status: 'all' });
   const submissions = submissionsResult.rows || [];
   const related = await loadRelatedSubmissionData(storage, submissions);
@@ -995,7 +998,7 @@ export async function getAcquisitionCommandCenter({ storage = getStorage() } = {
         now,
       });
     });
-  const sourceHealth = await getSourceHealth(storage);
+  const sourceHealth = await getSourceHealth(storage, { persistSnapshot: persistSourceHealth });
   const pipeline = buildPipeline(records);
   const actionQueue = buildActionQueue(records, sourceHealth);
 

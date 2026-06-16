@@ -48,6 +48,9 @@ export function getConfig() {
     process.env.ADMIN_SESSION_SECRET || (isProduction ? '' : 'local-development-session-secret');
   const adminAuthMode = process.env.ADMIN_AUTH_MODE || (isProduction ? 'magic-link' : 'hybrid');
   const adminEmail = process.env.ADMIN_EMAIL || process.env.LEAD_NOTIFICATION_EMAIL || (isProduction ? '' : 'mathew@example.com');
+  const viewerUsername = process.env.ADMIN_VIEWER_USERNAME || process.env.SMB_DEAL_HUNTER_VIEWER_USERNAME || (isProduction ? '' : 'smb-deal-hunter');
+  const viewerPassword = process.env.ADMIN_VIEWER_PASSWORD || process.env.SMB_DEAL_HUNTER_VIEWER_PASSWORD || (isProduction ? '' : 'view-only-local');
+  const viewerEmails = listFromEnv(process.env.ADMIN_VIEWER_EMAILS || process.env.SMB_DEAL_HUNTER_VIEWER_EMAILS);
   const sqlitePath = process.env.SQLITE_PATH || path.join(rootDir, 'data', 'uckele-group.sqlite');
   const defaultDataDir = path.dirname(sqlitePath);
 
@@ -96,6 +99,9 @@ export function getConfig() {
       email: adminEmail,
       username: adminUsername,
       password: adminPassword,
+      viewerEmails,
+      viewerUsername,
+      viewerPassword,
       sessionSecret,
       magicLinkSecret: process.env.ADMIN_MAGIC_LINK_SECRET || sessionSecret,
       magicLinkTtlMs: numberFromEnv(process.env.ADMIN_MAGIC_LINK_TTL_MS, 1000 * 60 * 20),

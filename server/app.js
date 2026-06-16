@@ -8,6 +8,7 @@ import {
 } from './services/acquisitionCommandCenter.js';
 import {
   getAdminAuthState,
+  requireAdminAccess,
   getAdminSession,
   loginAdmin,
   logoutAdmin,
@@ -17,6 +18,7 @@ import {
 } from './services/auth.js';
 import {
   createSecureUploadRequest,
+  enforceSecureUploadBodyRateLimit,
   getSecureUploadContext,
   uploadSecureDocuments,
 } from './services/documentVault.js';
@@ -94,6 +96,25 @@ export function createApp() {
   const app = express();
 
   app.disable('x-powered-by');
+  app.use('/api/secure-documents/upload', async (request, response, next) => {
+    if (request.method !== 'POST') {
+      next();
+      return;
+    }
+
+    try {
+      const result = await enforceSecureUploadBodyRateLimit(request);
+
+      if (!result.ok) {
+        response.status(result.status || 429).json({ success: false, error: result.error });
+        return;
+      }
+
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
   app.use(
     express.json({
       limit: '25mb',
@@ -152,6 +173,7 @@ export function createApp() {
     response.json({
       authenticated: Boolean(session),
       username: session?.username || '',
+      role: session?.role || '',
       ...getAdminAuthState(),
     });
   });
@@ -170,6 +192,7 @@ export function createApp() {
       response.json({
         success: true,
         username: result.session.username,
+        role: result.session.role,
       });
     }),
   );
@@ -204,6 +227,7 @@ export function createApp() {
     response.json({
       success: true,
       username: result.session.username,
+      role: result.session.role,
     });
   });
 
@@ -215,12 +239,16 @@ export function createApp() {
   app.get(
     '/api/admin/acquisition-command-center',
     asyncRoute(async (request, response) => {
-      if (!requireAdmin(request)) {
+      const session = requireAdminAccess(request);
+
+      if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
 
-      const commandCenter = await getAcquisitionCommandCenter();
+      const commandCenter = await getAcquisitionCommandCenter({
+        persistSourceHealth: session.role === 'admin',
+      });
       response.json({
         success: true,
         commandCenter,
@@ -262,7 +290,7 @@ export function createApp() {
   app.get(
     '/api/admin/submissions',
     asyncRoute(async (request, response) => {
-      if (!requireAdmin(request)) {
+      if (!requireAdminAccess(request)) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
@@ -325,7 +353,7 @@ export function createApp() {
   app.get(
     '/api/admin/deal-hunter/review',
     asyncRoute(async (request, response) => {
-      if (!requireAdmin(request)) {
+      if (!requireAdminAccess(request)) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
@@ -414,7 +442,7 @@ export function createApp() {
   app.get(
     '/api/admin/prospect-discovery',
     asyncRoute(async (request, response) => {
-      if (!requireAdmin(request)) {
+      if (!requireAdminAccess(request)) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
@@ -535,10 +563,11 @@ export function createApp() {
         ndaAccepted: Boolean(request.body.ndaAccepted),
         note: String(request.body.note || ''),
         documents: Array.isArray(request.body.documents) ? request.body.documents : [],
+        request,
       });
 
       if (!result.ok) {
-        response.status(400).json({ success: false, error: result.error });
+        response.status(result.status || 400).json({ success: false, error: result.error });
         return;
       }
 
