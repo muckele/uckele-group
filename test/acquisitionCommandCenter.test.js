@@ -14,9 +14,15 @@ test('diligence readiness scores complete core acquisition checks', () => {
     submission: {
       sba_eligible: 'yes',
       prospectus_url: 'https://example.com/cim.pdf',
+      asking_price: '$1,400,000',
+      ttm_ebitda: '$450,000',
+      ebitda_multiple: '3.1x',
       metadata: {
         diligence: {
           checklist: {
+            p_and_l: true,
+            tax_returns: true,
+            balance_sheet: true,
             owner_role: true,
             management_depth: true,
             customer_concentration: true,
@@ -25,15 +31,45 @@ test('diligence readiness scores complete core acquisition checks', () => {
             seller_note: 'Seller is open to a 15% seller note.',
             sba_lender_status: 'SBA lender reviewed and supportive.',
           },
+          memo: 'Recurring maintenance contracts with commercial customers and scheduled maintenance revenue.',
         },
       },
     },
-    documents: [{ id: 'doc-1' }],
+    documents: [{ id: 'doc-1', original_name: 'CIM P&L tax returns balance sheet.pdf' }],
   });
 
   assert.equal(readiness.score, 100);
   assert.equal(readiness.complete, readiness.total);
   assert.deepEqual(readiness.missing, []);
+});
+
+test('generated Deal Hunter notes do not count as completed diligence evidence', () => {
+  const readiness = calculateDiligenceReadiness({
+    submission: {
+      asking_price: '$1,400,000',
+      ttm_ebitda: '$450,000',
+      notes: [
+        'Deal Hunter generated notes',
+        'Questions to ask broker or seller',
+        '- Would the seller consider seller financing, an earnout, or other structure?',
+        '- What customer concentration exists in the top 5 and top 10 accounts?',
+        '- How much revenue is recurring, contracted, or repeat customer work?',
+        'End Deal Hunter generated notes',
+        '',
+        'User notes',
+      ].join('\n'),
+      metadata: {
+        diligence: {},
+      },
+    },
+    documents: [],
+  });
+
+  const completedIds = readiness.items.filter((item) => item.complete).map((item) => item.id);
+
+  assert.equal(completedIds.includes('seller-financing-fit'), false);
+  assert.equal(completedIds.includes('customer-concentration'), false);
+  assert.equal(completedIds.includes('revenue-quality'), false);
 });
 
 test('acquisition pipeline derives stage from command override, CIM response, and documents', () => {

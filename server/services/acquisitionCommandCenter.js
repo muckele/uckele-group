@@ -304,68 +304,200 @@ function checklistComplete(diligence, key) {
   return Boolean(diligence?.checklist?.[key]);
 }
 
+function documentsText(documents = []) {
+  return documents
+    .map((document) =>
+      [
+        document.document_type,
+        document.original_name,
+        document.name,
+        document.filename,
+        document.note,
+      ].join(' '),
+    )
+    .join(' ');
+}
+
+function parseFinancialNumber(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  const normalized = normalizeText(value, 100)
+    .toLowerCase()
+    .replace(/[$,%]/g, '')
+    .replace(/,/g, '');
+  const match = normalized.match(/-?\d+(?:\.\d+)?\s*(billion|bn|b|million|mm|m|thousand|k|x)?/);
+
+  if (!match) {
+    return null;
+  }
+
+  const parsed = Number(match[0].match(/-?\d+(?:\.\d+)?/)?.[0]);
+
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  const suffix = match[1] || '';
+
+  if (suffix === 'x') {
+    return parsed;
+  }
+
+  const multiplier =
+    suffix === 'billion' || suffix === 'bn' || suffix === 'b'
+      ? 1_000_000_000
+      : suffix === 'million' || suffix === 'mm' || suffix === 'm'
+        ? 1_000_000
+        : suffix === 'thousand' || suffix === 'k'
+          ? 1_000
+          : 1;
+
+  return parsed * multiplier;
+}
+
+function valuationMultiple(submission = {}) {
+  const explicitMultiple = parseFinancialNumber(submission.ebitda_multiple);
+
+  if (explicitMultiple && explicitMultiple > 0 && explicitMultiple < 25) {
+    return explicitMultiple;
+  }
+
+  const askingPrice = parseFinancialNumber(submission.asking_price);
+  const earnings = parseFinancialNumber(submission.ttm_ebitda);
+
+  if (askingPrice && earnings && askingPrice > 0 && earnings > 0) {
+    return askingPrice / earnings;
+  }
+
+  return null;
+}
+
+function readinessItem({ id, label, weight, complete, risk }) {
+  return {
+    id,
+    label,
+    weight,
+    complete: Boolean(complete),
+    risk: complete ? '' : risk,
+  };
+}
+
 export function calculateDiligenceReadiness({ submission = {}, documents = [], latestUploadRequest = null } = {}) {
   const diligence = diligenceMetadata(submission);
-  const notesText = [
-    submission.notes,
-    submission.message,
-    diligence.questions,
+  const documentText = documentsText(documents);
+  const evidenceText = [
+    submission.ttm_revenue,
+    submission.ttm_ebitda,
+    submission.ebitda_multiple,
+    submission.asking_price,
+    documentText,
     diligence.memo,
     diligence.financing?.seller_note,
     diligence.financing?.sba_lender_status,
   ].join(' ');
-  const hasDocuments =
-    documents.length > 0 ||
-    latestUploadRequest?.status === 'documents-received' ||
+  const hasCimOrTeaser =
     Boolean(submission.prospectus_url) ||
     checklistComplete(diligence, 'cim') ||
-    checklistComplete(diligence, 'p_and_l');
+    textIncludes(evidenceText, ['cim', 'teaser', 'confidential information memorandum', 'nda', 'prospectus']);
+  const hasFinancialPackage =
+    checklistComplete(diligence, 'p_and_l') ||
+    checklistComplete(diligence, 'tax_returns') ||
+    checklistComplete(diligence, 'balance_sheet') ||
+    textIncludes(evidenceText, ['p&l', 'p and l', 'profit and loss', 'tax return', 'tax returns', 'balance sheet', 'financial package', 'financials']);
+  const multiple = valuationMultiple(submission);
+  const hasValuationSupport = Number.isFinite(multiple) ? multiple > 0 && multiple <= 4.25 : false;
+  const hasRevenueQuality =
+    textIncludes(evidenceText, [
+      'recurring revenue',
+      'recurring maintenance',
+      'service contract',
+      'service contracts',
+      'maintenance contract',
+      'repeat customers',
+      'commercial customers',
+      'contracted revenue',
+      'scheduled maintenance',
+    ]) && !textIncludes(evidenceText, ['project-based', 'project based', 'one-time projects', 'non-recurring']);
   const items = [
-    {
-      id: 'documents-received',
-      label: 'Documents received',
-      complete: hasDocuments,
-      risk: hasDocuments ? '' : 'No CIM, teaser, financials, or secure upload received yet.',
-    },
-    {
+    readinessItem({
+      id: 'cim-or-teaser',
+      label: 'CIM / teaser received',
+      weight: 10,
+      complete: hasCimOrTeaser,
+      risk: 'No CIM, teaser, NDA package, prospectus link, or secure upload received yet.',
+    }),
+    readinessItem({
+      id: 'financial-package',
+      label: 'Financial package received',
+      weight: 18,
+      complete: hasFinancialPackage,
+      risk: 'P&L, tax returns, balance sheet, or detailed financial package still needs to be reviewed.',
+    }),
+    readinessItem({
+      id: 'valuation-fit',
+      label: 'Valuation fit',
+      weight: 14,
+      complete: hasValuationSupport,
+      risk: multiple ? `Valuation multiple is ${Number(multiple.toFixed(2))}x and needs stronger support.` : 'Asking price and earnings do not yet support a financeable multiple.',
+    }),
+    readinessItem({
       id: 'seller-financing-fit',
       label: 'Seller financing fit',
-      complete: Boolean(diligence.financing?.seller_note) || textIncludes(notesText, ['seller note', 'seller financing', 'seller finance']),
+      weight: 12,
+      complete: Boolean(diligence.financing?.seller_note) || textIncludes(evidenceText, ['seller note', 'seller financing', 'seller finance', 'owner financing']),
       risk: 'Seller note or structure still needs confirmation.',
-    },
-    {
+    }),
+    readinessItem({
       id: 'sba-fit',
       label: 'SBA fit',
+      weight: 12,
       complete:
+        checklistComplete(diligence, 'sba_fit') ||
         submission.sba_eligible === 'yes' ||
         textIncludes(diligence.financing?.sba_lender_status, ['approved', 'pre-screened', 'prescreened', 'reviewed', 'sba']),
       risk: 'SBA lender fit has not been confirmed.',
-    },
-    {
+    }),
+    readinessItem({
       id: 'owner-role-risk',
       label: 'Owner role risk',
-      complete: checklistComplete(diligence, 'owner_role') || textIncludes(notesText, ['owner role', 'owner duties', 'transition plan']),
+      weight: 10,
+      complete: checklistComplete(diligence, 'owner_role') || textIncludes(evidenceText, ['owner role', 'owner duties', 'transition plan']),
       risk: 'Owner duties and transition risk still need diligence.',
-    },
-    {
+    }),
+    readinessItem({
       id: 'management-depth',
       label: 'Management depth',
-      complete: checklistComplete(diligence, 'management_depth') || textIncludes(notesText, ['general manager', 'manager', 'management depth', 'trained staff']),
+      weight: 8,
+      complete: checklistComplete(diligence, 'management_depth') || textIncludes(evidenceText, ['general manager', 'manager', 'management depth', 'trained staff']),
       risk: 'Management depth is not yet confirmed.',
-    },
-    {
+    }),
+    readinessItem({
       id: 'customer-concentration',
       label: 'Customer concentration',
-      complete: checklistComplete(diligence, 'customer_concentration') || textIncludes(notesText, ['customer concentration', 'top 5', 'top five', 'top 10', 'top ten']),
+      weight: 10,
+      complete: checklistComplete(diligence, 'customer_concentration') || textIncludes(evidenceText, ['customer concentration', 'top 5', 'top five', 'top 10', 'top ten']),
       risk: 'Customer concentration has not been reviewed.',
-    },
-  ].map((item) => ({ ...item, risk: item.complete ? '' : item.risk }));
+    }),
+    readinessItem({
+      id: 'revenue-quality',
+      label: 'Recurring revenue quality',
+      weight: 6,
+      complete: hasRevenueQuality,
+      risk: 'Recurring, contracted, scheduled, repeat, or commercial revenue quality still needs confirmation.',
+    }),
+  ];
   const complete = items.filter((item) => item.complete).length;
+  const totalWeight = items.reduce((sum, item) => sum + item.weight, 0);
+  const completeWeight = items.filter((item) => item.complete).reduce((sum, item) => sum + item.weight, 0);
 
   return {
-    score: Math.round((complete / items.length) * 100),
+    score: Math.round((completeWeight / totalWeight) * 100),
     complete,
     total: items.length,
+    completeWeight,
+    totalWeight,
     items,
     missing: items.filter((item) => !item.complete),
   };

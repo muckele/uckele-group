@@ -6,8 +6,8 @@ import { createManualSubmission } from './submissions.js';
 
 const defaultTimeoutMs = 45000;
 const cimRequestScoreThreshold = 75;
-const highFitScoreThreshold = 70;
-const watchlistScoreThreshold = 55;
+const highFitScoreThreshold = 75;
+const watchlistScoreThreshold = 60;
 const cimRequestSentStatuses = ['sent', 'logged'];
 const cimRequestActiveStatuses = ['sent', 'logged', 'failed', 'follow_up_failed', 'follow_up_pending'];
 const cimRequestTerminalStatuses = ['sent', 'logged', 'responded', 'delivery_issue', 'follow_up_failed', 'follow_up_pending'];
@@ -70,6 +70,48 @@ const profile = {
     'general manager',
     'operations manager',
     'trained staff',
+  ],
+  recurringRevenueKeywords: [
+    'recurring revenue',
+    'recurring maintenance',
+    'recurring service',
+    'recurring work',
+    'repeat customers',
+    'repeat revenue',
+    'maintenance contract',
+    'maintenance contracts',
+    'service contract',
+    'service contracts',
+    'service agreement',
+    'service agreements',
+    'contracted revenue',
+    'contract revenue',
+    'membership',
+    'subscription',
+    'route density',
+    'scheduled maintenance',
+    'preventive maintenance',
+    'preventative maintenance',
+    'ongoing service',
+    'retainer',
+  ],
+  commercialCustomerKeywords: [
+    'commercial customers',
+    'commercial contracts',
+    'commercial accounts',
+    'b2b',
+    'business-to-business',
+    'facility',
+    'facilities',
+    'industrial',
+    'municipal',
+    'government',
+    'property manager',
+    'property managers',
+    'hoa',
+    'office',
+    'warehouse',
+    'manufacturing facility',
   ],
   excludedKeywords: [
     'restaurant',
@@ -214,6 +256,55 @@ const profile = {
     'high capex',
     'capex',
     'manufacturing equipment',
+  ],
+  financeableKeywords: [
+    'sba eligible',
+    'sba prequalified',
+    'sba pre-qualified',
+    'seller financing',
+    'seller finance',
+    'seller note',
+    'owner financing',
+    'lender prequalified',
+    'prequalified for financing',
+  ],
+  ownerDependencyRiskKeywords: [
+    'owner operator',
+    'owner-operated',
+    'owner operated',
+    'owner dependent',
+    'seller works full time',
+    'owner works full time',
+    'requires owner involvement',
+    'owner must stay',
+    'hands-on owner',
+    'key person risk',
+  ],
+  customerConcentrationRiskKeywords: [
+    'customer concentration',
+    'client concentration',
+    'one customer',
+    'single customer',
+    'major customer',
+    'top customer',
+    'customer accounts for',
+    'client accounts for',
+  ],
+  financialRiskKeywords: [
+    'declining revenue',
+    'revenue decline',
+    'sales decline',
+    'negative trend',
+    'project-based',
+    'project based',
+    'one-time projects',
+    'non-recurring',
+    'seasonal',
+    'heavy inventory',
+    'working capital intensive',
+    'high capex',
+    'customer concentration',
+    'one customer',
   ],
 };
 
@@ -479,19 +570,46 @@ function buildQuestions(deal, matches, concerns) {
   return [...new Set(questions)].slice(0, 5);
 }
 
-function scoreDeal(deal) {
+function addScoreCap(caps, cap, reason) {
+  caps.push({ cap, reason });
+}
+
+function applyScoreCaps(score, caps, concerns) {
+  let cappedScore = score;
+
+  for (const item of caps) {
+    if (cappedScore > item.cap) {
+      cappedScore = item.cap;
+    }
+
+    if (item.reason) {
+      concerns.push(item.reason);
+    }
+  }
+
+  return cappedScore;
+}
+
+export function scoreDeal(deal) {
   const matches = {
     excluded: containsAny(deal.fullText, profile.excludedKeywords),
     preferred: containsAny(deal.fullText, profile.preferredKeywords),
+    recurring: containsAny(deal.fullText, profile.recurringRevenueKeywords),
+    commercial: containsAny(deal.fullText, profile.commercialCustomerKeywords),
     recession: containsAny(deal.fullText, profile.recessionProofKeywords),
     aiProof: containsAny(deal.fullText, profile.aiProofKeywords),
     management: containsAny(deal.fullText, profile.managementKeywords),
     capex: containsAny(deal.fullText, profile.capexKeywords),
+    financeable: containsAny(deal.fullText, profile.financeableKeywords),
+    ownerDependency: containsAny(deal.fullText, profile.ownerDependencyRiskKeywords),
+    concentrationRisk: containsAny(deal.fullText, profile.customerConcentrationRiskKeywords),
+    financialRisk: containsAny(deal.fullText, profile.financialRiskKeywords),
   };
   const strengths = [];
   const concerns = [];
   const removeReasons = [];
-  let score = 35;
+  const scoreCaps = [];
+  let score = 28;
 
   if (matches.excluded.length > 0) {
     removeReasons.push(`Excluded category match: ${matches.excluded.slice(0, 4).join(', ')}`);
@@ -503,19 +621,25 @@ function scoreDeal(deal) {
 
   if (deal.annualProfit !== null) {
     if (deal.annualProfit >= profile.minAnnualProfit && deal.annualProfit <= profile.maxAnnualProfit) {
-      score += 20;
+      score += 18;
       strengths.push('Annual profit is inside the target $300k-$750k range.');
     } else if (deal.annualProfit >= 200000 && deal.annualProfit < profile.minAnnualProfit) {
-      score += 6;
-      concerns.push('Profit is below the target floor, but close enough to review if the deal quality is strong.');
+      score += 2;
+      concerns.push('Profit is below the target floor; review only if recurring revenue and management depth are unusually strong.');
     } else if (deal.annualProfit < 200000) {
-      score -= 16;
+      score -= 22;
+      addScoreCap(scoreCaps, 52, 'Profit is well below the current acquisition target and should not qualify as a high-fit deal.');
       concerns.push('Profit is well below the current acquisition target.');
+    } else if (deal.annualProfit > 1000000) {
+      score -= 12;
+      addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Profit is materially above the target band and likely requires a different capital structure.');
+      concerns.push('Profit is materially above the current target band and likely needs a larger equity check.');
     } else {
-      score -= 6;
+      score -= 4;
       concerns.push('Profit is above the current target band and may require a larger equity check.');
     }
   } else {
+    addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Annual profit is missing, so the listing cannot qualify as high fit yet.');
     concerns.push('Annual profit is missing.');
   }
 
@@ -533,21 +657,37 @@ function scoreDeal(deal) {
   }
 
   if (deal.profitMultiple !== null) {
-    if (deal.profitMultiple > 0 && deal.profitMultiple <= 3.5) {
-      score += 10;
+    if (deal.profitMultiple > 0 && deal.profitMultiple <= 3.25) {
+      score += 12;
       strengths.push('Profit multiple appears financeable for a self-funded/SBA-style acquisition.');
+    } else if (deal.profitMultiple > 3.25 && deal.profitMultiple <= 4) {
+      score += 5;
+      strengths.push('Profit multiple may be workable if SBA, seller note, or investor structure checks out.');
+    } else if (deal.profitMultiple > 4 && deal.profitMultiple <= 5) {
+      score -= 8;
+      addScoreCap(scoreCaps, 82, 'Profit multiple is above the preferred range; require strong financing and growth evidence.');
+      concerns.push('Profit multiple is above the preferred range for the current buying strategy.');
     } else if (deal.profitMultiple > 5) {
-      score -= 12;
+      score -= 16;
+      addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Profit multiple is too high for a high-fit rating without exceptional structure.');
       concerns.push('Profit multiple is high for the current buying strategy.');
     }
   } else if (deal.askingPrice && deal.annualProfit) {
     const impliedMultiple = deal.askingPrice / deal.annualProfit;
 
-    if (impliedMultiple <= 3.5) {
-      score += 8;
+    if (impliedMultiple <= 3.25) {
+      score += 10;
       strengths.push('Implied asking-price-to-profit multiple looks reasonable.');
+    } else if (impliedMultiple <= 4) {
+      score += 4;
+      strengths.push('Implied multiple may be workable if financing terms are favorable.');
+    } else if (impliedMultiple <= 5) {
+      score -= 8;
+      addScoreCap(scoreCaps, 82, 'Implied multiple is above the preferred range; require stronger diligence before advancing.');
+      concerns.push('Implied asking-price-to-profit multiple is above the preferred range.');
     } else if (impliedMultiple > 5) {
-      score -= 10;
+      score -= 16;
+      addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Implied multiple is too expensive for a high-fit rating.');
       concerns.push('Implied asking-price-to-profit multiple looks expensive.');
     }
   }
@@ -557,29 +697,47 @@ function scoreDeal(deal) {
       score += 7;
       strengths.push('Asking price is within a plausible range for ROBS cash plus SBA, seller note, or investors.');
     } else if (deal.askingPrice > 2000000) {
-      score -= 9;
+      score -= 14;
+      addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Asking price likely requires outside equity or unusually favorable seller financing.');
       concerns.push('Asking price likely needs outside equity or unusually favorable seller financing.');
     } else if (deal.askingPrice < 250000) {
+      score -= 5;
+      addScoreCap(scoreCaps, 66, 'Small asking price may indicate a smaller owner-operator opportunity.');
       concerns.push('Small asking price may indicate a smaller owner-operator opportunity.');
     }
   }
 
   if (matches.preferred.length > 0) {
-    score += Math.min(12, matches.preferred.length * 2);
+    score += Math.min(10, matches.preferred.length * 2);
     strengths.push(`Matches preferred search themes: ${matches.preferred.slice(0, 5).join(', ')}.`);
   }
 
+  if (matches.recurring.length > 0) {
+    score += Math.min(14, matches.recurring.length * 3);
+    strengths.push(`Recurring or repeat revenue signals: ${matches.recurring.slice(0, 4).join(', ')}.`);
+  } else {
+    addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'No explicit recurring, contracted, scheduled, or repeat revenue signal.');
+    concerns.push('No explicit recurring, contracted, scheduled, or repeat revenue signal.');
+  }
+
+  if (matches.commercial.length > 0) {
+    score += Math.min(8, matches.commercial.length * 2);
+    strengths.push(`Commercial or institutional customer signals: ${matches.commercial.slice(0, 4).join(', ')}.`);
+  }
+
   if (matches.recession.length > 0) {
-    score += Math.min(10, matches.recession.length * 2);
+    score += Math.min(12, matches.recession.length * 3);
     strengths.push(`Recession-resistant indicators: ${matches.recession.slice(0, 4).join(', ')}.`);
   } else {
+    addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'No clear recession-resistant indicator in the listing text.');
     concerns.push('No clear recession-resistant indicator in the listing text.');
   }
 
   if (matches.aiProof.length > 0) {
-    score += Math.min(10, matches.aiProof.length * 2);
+    score += Math.min(12, matches.aiProof.length * 3);
     strengths.push(`AI-resistant operating work: ${matches.aiProof.slice(0, 4).join(', ')}.`);
   } else {
+    addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'No clear physical, field-service, regulated, or relationship-heavy work signal.');
     concerns.push('No clear physical, field-service, regulated, or relationship-heavy work signal.');
   }
 
@@ -591,8 +749,31 @@ function scoreDeal(deal) {
   }
 
   if (matches.capex.length > 0) {
-    score -= Math.min(10, matches.capex.length * 2);
+    score -= Math.min(12, matches.capex.length * 3);
+    addScoreCap(scoreCaps, 82, 'Capex or asset-heavy language requires extra diligence before high conviction.');
     concerns.push(`Possible capex or asset-heavy concern: ${matches.capex.slice(0, 4).join(', ')}.`);
+  }
+
+  if (matches.financeable.length > 0) {
+    score += Math.min(6, matches.financeable.length * 2);
+    strengths.push(`Financing support signals: ${matches.financeable.slice(0, 3).join(', ')}.`);
+  }
+
+  if (matches.ownerDependency.length > 0) {
+    score -= Math.min(12, matches.ownerDependency.length * 4);
+    addScoreCap(scoreCaps, highFitScoreThreshold - 1, `Owner-dependency risk language found: ${matches.ownerDependency.slice(0, 3).join(', ')}.`);
+  }
+
+  if (matches.concentrationRisk.length > 0) {
+    score -= Math.min(12, matches.concentrationRisk.length * 4);
+    addScoreCap(scoreCaps, highFitScoreThreshold - 1, `Customer concentration risk language found: ${matches.concentrationRisk.slice(0, 3).join(', ')}.`);
+  }
+
+  const nonCapexFinancialRisks = matches.financialRisk.filter((term) => !matches.capex.includes(term) && !matches.concentrationRisk.includes(term));
+
+  if (nonCapexFinancialRisks.length > 0) {
+    score -= Math.min(10, nonCapexFinancialRisks.length * 3);
+    addScoreCap(scoreCaps, 72, `Financial quality risk language found: ${nonCapexFinancialRisks.slice(0, 3).join(', ')}.`);
   }
 
   if (deal.state && profile.targetStates.includes(deal.state)) {
@@ -609,19 +790,20 @@ function scoreDeal(deal) {
     score = Math.min(score, highFitScoreThreshold - 1);
   }
 
+  score = applyScoreCaps(score, scoreCaps, concerns);
   score = Math.max(0, Math.min(100, Math.round(score)));
   const shouldRemove = removeReasons.length > 0 || score < 45;
   const recommendation = shouldRemove
     ? 'Remove from tomorrow\'s daily update unless there is a specific strategic reason to keep it.'
     : score >= highFitScoreThreshold
-      ? 'High fit. Review the listing and ask the broker diligence questions.'
-      : 'Watchlist. Worth reviewing only if the broker confirms recurring revenue, management depth, and clean financing terms.';
+      ? 'High fit. Request the CIM/NDA process and validate financial quality before advancing.'
+      : 'Watchlist. Worth reviewing only if the broker confirms recurring revenue, AI/recession resistance, management depth, and clean financing terms.';
 
   return {
     ...deal,
     score,
-    strengths: strengths.slice(0, 5),
-    concerns: concerns.slice(0, 5),
+    strengths: [...new Set(strengths)].slice(0, 6),
+    concerns: [...new Set(concerns)].slice(0, 7),
     removeReasons: removeReasons.length > 0 ? removeReasons : score < 45 ? concerns.slice(0, 3) : [],
     questions: buildQuestions(deal, matches, concerns),
     recommendation,
