@@ -460,16 +460,16 @@ export function createApp() {
         return;
       }
 
-	        response.json({
-	          success: true,
-	          request: publicSecureUploadRequest(result.request),
-	          submission: {
-	            id: result.submission.id,
-	            name: result.submission.name,
-	            company: result.submission.company,
-	          },
-	          documents: result.documents.map(publicSecureDocument),
-	        });
+      response.json({
+        success: true,
+        request: publicSecureUploadRequest(result.request),
+        submission: {
+          id: result.submission.id,
+          name: result.submission.name,
+          company: result.submission.company,
+        },
+        documents: result.documents.map(publicSecureDocument),
+      });
     }),
   );
 
@@ -488,16 +488,16 @@ export function createApp() {
         return;
       }
 
-	      response.json({
-	        success: true,
-	        request: publicSecureUploadRequest(result.request),
-	        submission: {
-	          id: result.submission.id,
-	          name: result.submission.name,
-	          company: result.submission.company,
-	        },
-	        documents: result.documents.map(publicSecureDocument),
-	      });
+      response.json({
+        success: true,
+        request: publicSecureUploadRequest(result.request),
+        submission: {
+          id: result.submission.id,
+          name: result.submission.name,
+          company: result.submission.company,
+        },
+        documents: result.documents.map(publicSecureDocument),
+      });
     }),
   );
 

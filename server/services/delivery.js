@@ -159,8 +159,11 @@ function brandedEmailHtml({ preheader = '', eyebrow = '', title, paragraphs = []
 }
 
 async function sendViaConsole(message) {
-  console.log(`[mail:${message.kind}] to=${normalizeRecipients(message.to).join(', ')} subject=${message.subject}`);
-  console.log(message.text);
+  const textBytes = Buffer.byteLength(String(message.text || ''), 'utf8');
+  const htmlBytes = Buffer.byteLength(String(message.html || ''), 'utf8');
+  console.log(
+    `[mail:${message.kind}] to=${normalizeRecipients(message.to).join(', ')} subject=${message.subject} textBytes=${textBytes} htmlBytes=${htmlBytes}`,
+  );
   return { status: 'logged', error: '', providerMessageId: '' };
 }
 
