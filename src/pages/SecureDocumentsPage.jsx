@@ -140,7 +140,7 @@ export default function SecureDocumentsPage() {
         ) : null}
 
         {error ? (
-          <Reveal className="rounded-[28px] border border-red-200 bg-red-50 p-7 text-sm font-medium leading-7 text-red-700">
+          <Reveal className="rounded-2xl border border-red-200 bg-red-50 p-5 text-sm font-medium leading-7 text-red-700 sm:p-7">
             {error}
           </Reveal>
         ) : null}
@@ -159,7 +159,7 @@ export default function SecureDocumentsPage() {
                 <p><strong>Contact:</strong> {context.request.contact_name || context.request.email}</p>
               </div>
 
-              <div className="mt-8 rounded-[24px] border border-line/80 bg-fog/70 p-5">
+              <div className="mt-8 rounded-2xl border border-line/80 bg-fog/70 p-5">
                 <div className="flex items-start gap-3">
                   <ShieldCheck className="mt-1 h-5 w-5 shrink-0 text-moss" />
                   <p className="text-sm leading-7 text-ink/74">
@@ -204,7 +204,7 @@ export default function SecureDocumentsPage() {
                 <label className="flex flex-col gap-2 text-sm font-medium text-ink">
                   Document category
                   <select
-                    className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+                    className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
                     onChange={(event) => setDocumentType(event.target.value)}
                     value={documentType}
                   >
@@ -221,7 +221,7 @@ export default function SecureDocumentsPage() {
                 <label className="flex flex-col gap-2 text-sm font-medium text-ink">
                   Files
                   <input
-                    className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink"
+                    className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink"
                     multiple
                     onChange={(event) => setFiles(Array.from(event.target.files || []))}
                     type="file"
@@ -231,20 +231,20 @@ export default function SecureDocumentsPage() {
                 <label className="flex flex-col gap-2 text-sm font-medium text-ink">
                   Note
                   <textarea
-                    className="min-h-[140px] rounded-3xl border border-line bg-white px-4 py-4 text-sm text-ink outline-none transition focus:border-moss"
+                    className="min-h-[140px] rounded-2xl border border-line bg-white px-4 py-4 text-sm text-ink outline-none transition focus:border-moss"
                     onChange={(event) => setNote(event.target.value)}
                     placeholder="Optional context about the files you are sharing"
                     value={note}
                   />
                 </label>
 
-                <label className="flex items-start gap-3 rounded-[24px] border border-line/80 bg-fog/70 px-4 py-4 text-sm leading-7 text-ink/74">
+                <label className="flex items-start gap-3 rounded-2xl border border-line/80 bg-fog/70 px-4 py-4 text-sm leading-7 text-ink/74">
                   <input checked={ndaAccepted} className="mt-1 h-4 w-4" onChange={(event) => setNdaAccepted(event.target.checked)} type="checkbox" />
                   <span>I confirm these documents are being shared confidentially for business review and I acknowledge the NDA / confidentiality terms associated with this request.</span>
                 </label>
 
                 <button
-                  className="inline-flex items-center justify-center rounded-full border border-moss bg-moss px-6 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50"
+                  className="inline-flex w-full items-center justify-center rounded-full border border-moss bg-moss px-6 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50 sm:w-auto"
                   disabled={submitting}
                   type="submit"
                 >

@@ -137,7 +137,7 @@ export default function ContactForm() {
           Name
           <input
             required
-            className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
             name="name"
             onChange={handleChange}
             placeholder="Your name"
@@ -150,7 +150,7 @@ export default function ContactForm() {
           Email
           <input
             required
-            className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
             name="email"
             onChange={handleChange}
             placeholder="you@example.com"
@@ -162,7 +162,7 @@ export default function ContactForm() {
         <label className="flex flex-col gap-2 text-sm font-medium text-ink">
           Phone
           <input
-            className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
             name="phone"
             onChange={handleChange}
             placeholder="Optional"
@@ -174,7 +174,7 @@ export default function ContactForm() {
         <label className="flex flex-col gap-2 text-sm font-medium text-ink">
           Business / Firm
           <input
-            className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
             name="company"
             onChange={handleChange}
             placeholder="Company name"
@@ -186,7 +186,7 @@ export default function ContactForm() {
         <label className="flex flex-col gap-2 text-sm font-medium text-ink md:col-span-2">
           I am reaching out as
           <select
-            className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
             name="role"
             onChange={handleChange}
             value={formData.role}
@@ -208,7 +208,7 @@ export default function ContactForm() {
           Message
           <textarea
             required
-            className="min-h-[180px] rounded-3xl border border-line bg-white px-4 py-4 text-sm text-ink outline-none transition focus:border-moss"
+            className="min-h-[180px] rounded-2xl border border-line bg-white px-4 py-4 text-sm text-ink outline-none transition focus:border-moss"
             name="message"
             onChange={handleChange}
             placeholder="Share a bit about the business, your timing, or the opportunity."
@@ -218,7 +218,7 @@ export default function ContactForm() {
 
         {turnstileSiteKey ? (
           <div className="md:col-span-2">
-            <div className="overflow-x-auto">
+            <div className="max-w-full overflow-x-auto">
               <div ref={turnstileContainerRef} />
             </div>
             <p className="mt-2 text-xs leading-6 text-ink/60">Anti-spam verification is enabled for inbound inquiries.</p>

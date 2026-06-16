@@ -48,11 +48,11 @@ export default function SellerConcernsPage() {
             <p className="text-base leading-8 text-ink/74">
               The strongest seller relationships are built when both sides can speak plainly about what matters most. That usually includes legacy, people, customers, timing, confidentiality, and a realistic plan for the handoff. Those concerns are legitimate, and they should be central to the process.
             </p>
-            <div className="mt-8 flex flex-wrap gap-3">
-              <ButtonLink href="/contact">
+            <div className="mt-8 grid gap-3 sm:flex sm:flex-wrap">
+              <ButtonLink className="w-full sm:w-auto" href="/contact">
                 Start A Conversation <ArrowRight className="h-4 w-4" />
               </ButtonLink>
-              <ButtonLink href="/process" variant="secondary">
+              <ButtonLink className="w-full sm:w-auto" href="/process" variant="secondary">
                 View The Process
               </ButtonLink>
             </div>

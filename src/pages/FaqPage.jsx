@@ -34,7 +34,7 @@ export default function FaqPage() {
               </p>
             </div>
 
-            <ButtonLink href="/contact">
+            <ButtonLink className="w-full sm:w-auto" href="/contact">
               Start A Conversation <ArrowRight className="h-4 w-4" />
             </ButtonLink>
           </div>

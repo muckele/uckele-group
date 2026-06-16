@@ -20,7 +20,7 @@ export default function AboutPage() {
           <Reveal className="panel overflow-hidden">
             <img
               alt={`${siteConfig.personName} headshot placeholder`}
-              className="h-full min-h-[420px] w-full object-cover"
+              className="h-full min-h-[280px] w-full object-cover sm:min-h-[420px]"
               src="/headshot-placeholder.svg"
             />
           </Reveal>
@@ -32,9 +32,9 @@ export default function AboutPage() {
                 <p key={paragraph}>{paragraph}</p>
               ))}
             </div>
-            <div className="mt-8 flex flex-wrap gap-3">
-              <ButtonLink href="/contact">Start A Conversation</ButtonLink>
-              <ButtonLink href="/criteria" variant="secondary">
+            <div className="mt-8 grid gap-3 sm:flex sm:flex-wrap">
+              <ButtonLink className="w-full sm:w-auto" href="/contact">Start A Conversation</ButtonLink>
+              <ButtonLink className="w-full sm:w-auto" href="/criteria" variant="secondary">
                 View Criteria <ArrowRight className="h-4 w-4" />
               </ButtonLink>
             </div>

@@ -83,11 +83,11 @@ export default function CriteriaPage() {
               </p>
             </div>
 
-            <div className="flex flex-wrap gap-3">
-              <ButtonLink download href={siteConfig.downloadHref}>
+            <div className="grid gap-3 sm:flex sm:flex-wrap">
+              <ButtonLink className="w-full sm:w-auto" download href={siteConfig.downloadHref}>
                 Download Criteria <ArrowDownToLine className="h-4 w-4" />
               </ButtonLink>
-              <ButtonLink href="/contact" variant="secondary">
+              <ButtonLink className="w-full sm:w-auto" href="/contact" variant="secondary">
                 Start A Conversation <ArrowRight className="h-4 w-4" />
               </ButtonLink>
             </div>

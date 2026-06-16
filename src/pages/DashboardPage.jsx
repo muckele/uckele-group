@@ -83,9 +83,9 @@ const diligenceChecklistItems = [
 const dailyDealUpdateUrl =
   'https://docs.google.com/spreadsheets/d/1d2mC6oKDY7DFQiaNQnF947Ro5CBwjIcAw_fwya7bpBc/edit?usp=sharing';
 const primaryActionButtonClass =
-  'inline-flex w-full items-center justify-center gap-2 rounded-full border border-moss bg-moss px-5 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50 sm:w-auto';
+  'inline-flex min-h-[46px] w-full min-w-0 items-center justify-center gap-2 rounded-full border border-moss bg-moss px-4 py-2.5 text-center text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50 sm:w-auto sm:px-5 sm:py-3';
 const secondaryActionButtonClass =
-  'inline-flex w-full items-center justify-center gap-2 rounded-full border border-ink/10 bg-white px-5 py-3 text-sm font-semibold text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50 sm:w-auto';
+  'inline-flex min-h-[46px] w-full min-w-0 items-center justify-center gap-2 rounded-full border border-ink/10 bg-white px-4 py-2.5 text-center text-sm font-semibold text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50 sm:w-auto sm:px-5 sm:py-3';
 
 function toDateTimeLocal(value) {
   if (!value) {
@@ -479,11 +479,11 @@ function StatCard({ icon: Icon, label, value, tone = 'default' }) {
   };
 
   return (
-    <div className="panel p-5 sm:p-6">
+    <div className="panel p-4 sm:p-5">
       <div className={`flex h-12 w-12 items-center justify-center rounded-2xl ${tones[tone]}`}>
         <Icon className="h-5 w-5" />
       </div>
-      <p className="mt-5 text-sm font-semibold uppercase tracking-[0.18em] text-moss/80">{label}</p>
+      <p className="mt-4 text-xs font-semibold uppercase leading-5 tracking-[0.14em] text-moss/80 sm:text-sm sm:tracking-[0.18em]">{label}</p>
       <p className="mt-2 text-2xl font-semibold text-ink sm:text-3xl">{value}</p>
     </div>
   );
@@ -499,7 +499,7 @@ function Pill({ children, tone = 'default' }) {
     info: 'border-sky-200 bg-sky-50 text-sky-700',
   };
 
-  return <span className={`inline-flex rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.14em] ${tones[tone]}`}>{children}</span>;
+  return <span className={`inline-flex max-w-full min-w-0 whitespace-normal break-words rounded-full border px-3 py-1 text-center text-xs font-semibold uppercase leading-5 tracking-[0.1em] sm:tracking-[0.14em] ${tones[tone]}`}>{children}</span>;
 }
 
 function notificationToneClasses(severity) {
@@ -515,12 +515,12 @@ function notificationToneClasses(severity) {
 }
 
 function SectionLabel({ children }) {
-  return <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">{children}</p>;
+  return <p className="text-xs font-semibold uppercase leading-5 tracking-[0.14em] text-moss sm:text-sm sm:tracking-[0.18em]">{children}</p>;
 }
 
 function Field({ label, children }) {
   return (
-    <label className="flex flex-col gap-2 text-sm font-medium text-ink">
+    <label className="flex min-w-0 flex-col gap-2 text-sm font-medium text-ink">
       {label}
       {children}
     </label>
@@ -531,7 +531,7 @@ function InputField({ label, value, onChange, placeholder = '', type = 'text' })
   return (
     <Field label={label}>
       <input
-        className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+        className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
         onChange={onChange}
         placeholder={placeholder}
         type={type}
@@ -545,7 +545,7 @@ function SelectField({ label, value, onChange, options }) {
   return (
     <Field label={label}>
       <select
-        className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+        className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
         onChange={onChange}
         value={value}
       >
@@ -563,7 +563,7 @@ function TextAreaField({ label, value, onChange, placeholder = '' }) {
   return (
     <Field label={label}>
       <textarea
-        className="min-h-[132px] rounded-3xl border border-line bg-white px-4 py-4 text-sm text-ink outline-none transition focus:border-moss"
+        className="min-h-[132px] w-full rounded-2xl border border-line bg-white px-4 py-4 text-sm text-ink outline-none transition focus:border-moss"
         onChange={onChange}
         placeholder={placeholder}
         value={value}
@@ -657,7 +657,7 @@ function DealHunterCard({ deal, mode = 'fit', onSendCimRequest, requestingCim = 
             : cimRequest.reason || 'No broker or contact email is available for this listing.';
 
   return (
-    <div className={`rounded-[24px] border p-5 ${notificationToneClasses(mode === 'remove' ? 'danger' : mode === 'watch' ? 'warning' : 'info')}`}>
+    <div className={`min-w-0 rounded-2xl border p-4 sm:p-5 ${notificationToneClasses(mode === 'remove' ? 'danger' : mode === 'watch' ? 'warning' : 'info')}`}>
       <div className="flex flex-wrap items-center gap-2">
         <Pill tone={dealScoreTone(deal.score)}>Score {deal.score}</Pill>
         {deal.isNew ? <Pill tone="success">New</Pill> : null}
@@ -715,7 +715,7 @@ function CommandCenterActionItem({ action }) {
   const record = action.record;
 
   return (
-    <div className={`rounded-[24px] border p-4 ${notificationToneClasses(action.priority)}`}>
+    <div className={`min-w-0 rounded-2xl border p-4 ${notificationToneClasses(action.priority)}`}>
       <div className="flex flex-wrap items-center gap-2">
         <Pill tone={commandCenterTone(action.priority)}>{formatLabel(action.type)}</Pill>
         {record?.score ? <Pill tone={dealScoreTone(record.score)}>Score {record.score}</Pill> : null}
@@ -738,7 +738,7 @@ function CommandCenterRecordCard({ record, updating, onUpdate }) {
   const feedbackTone = record.fitFeedback === 'good-fit' ? 'success' : record.fitFeedback === 'false-positive' ? 'danger' : 'default';
 
   return (
-    <div className="rounded-[24px] border border-line/80 bg-white/80 p-5 text-sm leading-6 text-ink/74">
+    <div className="min-w-0 rounded-2xl border border-line/80 bg-white/80 p-4 text-sm leading-6 text-ink/74 sm:p-5">
       <div className="flex flex-wrap items-center gap-2">
         <Pill tone={dealScoreTone(record.score)}>Score {record.score}</Pill>
         <Pill tone={commandCenterTone(record.pipelineTone)}>{formatPipelineStage(record.pipelineStage)}</Pill>
@@ -784,7 +784,7 @@ function CommandCenterRecordCard({ record, updating, onUpdate }) {
 
       <div className="mt-5 flex flex-wrap gap-2">
         <button
-          className="inline-flex items-center justify-center gap-2 rounded-full border border-moss/20 bg-moss/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-moss transition hover:border-moss disabled:opacity-50"
+          className="inline-flex min-h-10 flex-1 items-center justify-center gap-2 rounded-full border border-moss/20 bg-moss/10 px-3 py-2 text-center text-xs font-semibold uppercase tracking-[0.1em] text-moss transition hover:border-moss disabled:opacity-50 sm:flex-none sm:px-4"
           disabled={updating}
           onClick={() => onUpdate(record, { fitFeedback: 'good-fit' })}
           type="button"
@@ -793,7 +793,7 @@ function CommandCenterRecordCard({ record, updating, onUpdate }) {
           Good Fit
         </button>
         <button
-          className="inline-flex items-center justify-center gap-2 rounded-full border border-red-200 bg-red-50 px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-red-700 transition hover:border-red-300 disabled:opacity-50"
+          className="inline-flex min-h-10 flex-1 items-center justify-center gap-2 rounded-full border border-red-200 bg-red-50 px-3 py-2 text-center text-xs font-semibold uppercase tracking-[0.1em] text-red-700 transition hover:border-red-300 disabled:opacity-50 sm:flex-none sm:px-4"
           disabled={updating}
           onClick={() => onUpdate(record, { fitFeedback: 'false-positive' })}
           type="button"
@@ -804,7 +804,7 @@ function CommandCenterRecordCard({ record, updating, onUpdate }) {
         {!isPassed ? (
           <>
             <button
-              className="inline-flex items-center justify-center rounded-full border border-ink/10 bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50"
+              className="inline-flex min-h-10 flex-1 items-center justify-center rounded-full border border-ink/10 bg-white px-3 py-2 text-center text-xs font-semibold uppercase tracking-[0.1em] text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50 sm:flex-none sm:px-4"
               disabled={updating}
               onClick={() => onUpdate(record, { pipelineStage: 'diligence' })}
               type="button"
@@ -812,7 +812,7 @@ function CommandCenterRecordCard({ record, updating, onUpdate }) {
               Move To Diligence
             </button>
             <button
-              className="inline-flex items-center justify-center rounded-full border border-ink/10 bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50"
+              className="inline-flex min-h-10 flex-1 items-center justify-center rounded-full border border-ink/10 bg-white px-3 py-2 text-center text-xs font-semibold uppercase tracking-[0.1em] text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50 sm:flex-none sm:px-4"
               disabled={updating}
               onClick={() => onUpdate(record, { pipelineStage: 'loi-candidate', fitFeedback: 'good-fit' })}
               type="button"
@@ -828,7 +828,7 @@ function CommandCenterRecordCard({ record, updating, onUpdate }) {
         <div className="mt-2 flex flex-wrap gap-2">
           {acquisitionPassReasons.map((reason) => (
             <button
-              className="inline-flex items-center justify-center rounded-full border border-red-200 bg-white px-3 py-2 text-xs font-semibold text-red-700 transition hover:bg-red-50 disabled:opacity-50"
+              className="inline-flex min-h-10 flex-1 items-center justify-center rounded-full border border-red-200 bg-white px-3 py-2 text-center text-xs font-semibold text-red-700 transition hover:bg-red-50 disabled:opacity-50 sm:flex-none"
               disabled={updating}
               key={`${record.id}-${reason}`}
               onClick={() => onUpdate(record, { pipelineStage: 'passed', passReason: reason, fitFeedback: 'false-positive' })}
@@ -1620,7 +1620,7 @@ export default function DashboardPage() {
 
         <section className="section-shell mt-10">
           <div className="grid gap-8 lg:grid-cols-2">
-            <Reveal className="panel p-7 sm:p-9">
+            <Reveal className="panel p-5 sm:p-9">
               <form className="space-y-5" onSubmit={handleMagicLinkRequest}>
                 <div>
                   <SectionLabel>Magic-Link Sign In</SectionLabel>
@@ -1660,7 +1660,7 @@ export default function DashboardPage() {
               </form>
             </Reveal>
 
-            <Reveal className="panel p-7 sm:p-9" delay={120}>
+            <Reveal className="panel p-5 sm:p-9" delay={120}>
               <form className="space-y-5" onSubmit={handlePasswordLogin}>
                 <div>
                   <SectionLabel>Fallback Access</SectionLabel>
@@ -1713,7 +1713,7 @@ export default function DashboardPage() {
       />
 
       <section className="section-shell mt-10">
-        <Reveal className="panel px-7 py-8 sm:px-9">
+        <Reveal className="panel px-5 py-7 sm:px-9 sm:py-8">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Signed in as {authState.username}</p>
@@ -1774,7 +1774,7 @@ export default function DashboardPage() {
       </section>
 
       <section className="section-shell mt-8">
-        <Reveal className="panel p-7 sm:p-8">
+        <Reveal className="panel p-5 sm:p-8">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
             <div>
               <SectionLabel>Acquisition Command Center</SectionLabel>
@@ -1812,7 +1812,7 @@ export default function DashboardPage() {
           </div>
 
           <div className="mt-7 grid gap-5 xl:grid-cols-[0.95fr_1.05fr]">
-            <div className="rounded-[24px] border border-line/80 bg-fog/70 p-5">
+            <div className="rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <SectionLabel>Source Health</SectionLabel>
                 <Pill tone={commandSourceHealth.healthy ? 'success' : 'warning'}>
@@ -1850,7 +1850,7 @@ export default function DashboardPage() {
               ) : null}
             </div>
 
-            <div className="rounded-[24px] border border-line/80 bg-white/70 p-5">
+            <div className="rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <SectionLabel>Global Action Queue</SectionLabel>
                 <Pill tone={commandSummary.actionItems > 0 ? 'warning' : 'success'}>{commandSummary.actionItems}</Pill>
@@ -1866,7 +1866,7 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          <div className="mt-7 rounded-[24px] border border-line/80 bg-fog/70 p-5">
+          <div className="mt-7 rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
               <div>
                 <SectionLabel>Score Feedback Loop</SectionLabel>
@@ -1915,7 +1915,7 @@ export default function DashboardPage() {
             </div>
             <div className="mt-4 grid gap-5 xl:grid-cols-3">
               {commandPipeline.map((stage) => (
-                <div className="rounded-[24px] border border-line/80 bg-white/70 p-5" key={stage.id}>
+                <div className="rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5" key={stage.id}>
                   <div className="flex flex-wrap items-center justify-between gap-3">
                     <h3 className="text-lg font-semibold text-ink">{formatPipelineStage(stage.id)}</h3>
                     <Pill tone={stage.id === 'passed' ? 'danger' : stage.count > 0 ? 'info' : 'default'}>{stage.count}</Pill>
@@ -1943,7 +1943,7 @@ export default function DashboardPage() {
       </section>
 
       <section className="section-shell mt-8">
-        <Reveal className="panel p-7 sm:p-8">
+        <Reveal className="panel p-5 sm:p-8">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
             <div>
               <SectionLabel>Prospect Discovery</SectionLabel>
@@ -2025,7 +2025,7 @@ export default function DashboardPage() {
           </div>
 
           <div className="mt-7 grid gap-5 xl:grid-cols-[1.2fr_0.8fr]">
-            <div className="rounded-[24px] border border-line/80 bg-fog/70 p-5">
+            <div className="rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5">
               <SectionLabel>Recent Prospects</SectionLabel>
               {prospectDiscovery.discoveries?.length > 0 ? (
                 <div className="mt-4 space-y-3">
@@ -2065,7 +2065,7 @@ export default function DashboardPage() {
               )}
             </div>
 
-            <div className="rounded-[24px] border border-line/80 bg-white/70 p-5">
+            <div className="rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5">
               <SectionLabel>Recent Runs</SectionLabel>
               {prospectDiscovery.runs?.length > 0 ? (
                 <div className="mt-4 space-y-3">
@@ -2090,7 +2090,7 @@ export default function DashboardPage() {
       </section>
 
       <section className="section-shell mt-8">
-        <Reveal className="panel p-7 sm:p-8">
+        <Reveal className="panel p-5 sm:p-8">
           <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
             <div>
               <SectionLabel>Deal Hunter Scoring</SectionLabel>
@@ -2151,7 +2151,7 @@ export default function DashboardPage() {
               </div>
 
               <div className="grid gap-4 lg:grid-cols-2">
-                <div className="rounded-[24px] border border-line/80 bg-fog/70 p-5">
+                <div className="rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5">
                   <SectionLabel>Sources</SectionLabel>
                   <div className="mt-4 space-y-3">
                     {(dealHunterReview.sources || []).map((source) => (
@@ -2167,7 +2167,7 @@ export default function DashboardPage() {
                   </div>
                 </div>
 
-                <div className="rounded-[24px] border border-line/80 bg-white/70 p-5">
+                <div className="rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5">
                   <SectionLabel>Criteria Notes</SectionLabel>
                   {dealHunterReview.criteriaRecommendations?.length > 0 ? (
                     <ul className="mt-4 list-disc space-y-2 pl-5 text-sm leading-7 text-ink/74">
@@ -2253,7 +2253,7 @@ export default function DashboardPage() {
               </div>
             </div>
           ) : (
-            <p className="mt-6 rounded-[24px] border border-line/80 bg-fog/70 px-5 py-4 text-sm leading-7 text-ink/70">
+            <p className="mt-6 rounded-2xl border border-line/80 bg-fog/70 px-4 py-4 text-sm leading-7 text-ink/70 sm:px-5">
               No source review loaded yet.
             </p>
           )}
@@ -2262,7 +2262,7 @@ export default function DashboardPage() {
 
       {notifications.length > 0 ? (
         <section className="section-shell mt-8">
-          <Reveal className="panel p-7 sm:p-8">
+          <Reveal className="panel p-5 sm:p-8">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
               <div>
                 <SectionLabel>Follow-Up Notifications</SectionLabel>
@@ -2277,7 +2277,7 @@ export default function DashboardPage() {
             <div className="mt-6 grid gap-4 lg:grid-cols-2">
               {notifications.slice(0, 6).map((submission) => (
                 <div
-                  className={`rounded-[24px] border p-5 ${notificationToneClasses(submission.follow_up_prompt?.severity)}`}
+                  className={`rounded-2xl border p-4 sm:p-5 ${notificationToneClasses(submission.follow_up_prompt?.severity)}`}
                   key={`notification-${submission.id}`}
                 >
                   <div className="flex flex-wrap items-center gap-3">
@@ -2305,7 +2305,7 @@ export default function DashboardPage() {
 
       {emailTriage.length > 0 ? (
         <section className="section-shell mt-8">
-          <Reveal className="panel p-7 sm:p-8">
+          <Reveal className="panel p-5 sm:p-8">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
               <div>
                 <SectionLabel>Email Follow-Up Triage</SectionLabel>
@@ -2323,7 +2323,7 @@ export default function DashboardPage() {
 
                 return (
                   <div
-                    className={`rounded-[24px] border p-5 ${notificationToneClasses(engagement?.tone === 'danger' ? 'danger' : engagement?.tone === 'warning' ? 'warning' : 'info')}`}
+                    className={`rounded-2xl border p-4 sm:p-5 ${notificationToneClasses(engagement?.tone === 'danger' ? 'danger' : engagement?.tone === 'warning' ? 'warning' : 'info')}`}
                     key={`email-triage-${submission.id}`}
                   >
                     <div className="flex flex-wrap items-center gap-3">
@@ -2451,7 +2451,7 @@ export default function DashboardPage() {
                 />
                 <Field label="Next action">
                   <input
-                    className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+                    className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
                     onChange={(event) => setCreateDraft((current) => ({ ...current, next_action_at: event.target.value }))}
                     type="datetime-local"
                     value={createDraft.next_action_at}
@@ -2541,7 +2541,7 @@ export default function DashboardPage() {
         <Reveal className="panel p-6 sm:p-7">
           <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_220px]">
             <input
-              className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+              className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
               onChange={(event) => {
                 const value = event.target.value;
                 startTransition(() => {
@@ -2554,7 +2554,7 @@ export default function DashboardPage() {
             />
 
             <select
-              className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+              className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
               onChange={(event) => {
                 const value = event.target.value;
                 startTransition(() => {
@@ -2596,7 +2596,7 @@ export default function DashboardPage() {
             return (
               <Reveal className="panel p-5 sm:p-8" delay={index * 50} key={submission.id}>
                 <div className="flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
-                  <div className="max-w-4xl">
+                  <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-3">
                       <h2 className="text-xl font-semibold text-ink sm:text-2xl">{submission.company || submission.name}</h2>
                       <Pill tone={submission.status === 'spam' ? 'danger' : submission.status === 'contacted' ? 'success' : 'status'}>
@@ -2634,30 +2634,30 @@ export default function DashboardPage() {
                     <LinksRow submission={submission} />
 
                     <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
-                      <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
+                      <div className="rounded-2xl border border-line/80 bg-fog/70 p-4">
                         <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">Asking Price</p>
                         <p className="mt-3 text-base font-semibold text-ink">{submission.asking_price || 'Not set'}</p>
                       </div>
-                      <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
+                      <div className="rounded-2xl border border-line/80 bg-fog/70 p-4">
                         <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">TTM Revenue</p>
                         <p className="mt-3 text-base font-semibold text-ink">{submission.ttm_revenue || 'Not set'}</p>
                       </div>
-                      <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
+                      <div className="rounded-2xl border border-line/80 bg-fog/70 p-4">
                         <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">TTM EBITDA</p>
                         <p className="mt-3 text-base font-semibold text-ink">{submission.ttm_ebitda || 'Not set'}</p>
                       </div>
-                      <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
+                      <div className="rounded-2xl border border-line/80 bg-fog/70 p-4">
                         <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">EBITDA Multiple</p>
                         <p className="mt-3 text-base font-semibold text-ink">{submission.ebitda_multiple || 'Not set'}</p>
                       </div>
-                      <div className="rounded-[22px] border border-line/80 bg-fog/70 p-4">
+                      <div className="rounded-2xl border border-line/80 bg-fog/70 p-4">
                         <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss/80">SBA Eligible?</p>
                         <p className="mt-3 text-base font-semibold text-ink">{formatLabel(submission.sba_eligible || 'unknown')}</p>
                       </div>
                     </div>
 
                     {followUpPrompt ? (
-                      <div className={`mt-6 rounded-[24px] border p-5 ${notificationToneClasses(followUpPrompt.severity)}`}>
+                      <div className={`mt-6 rounded-2xl border p-4 sm:p-5 ${notificationToneClasses(followUpPrompt.severity)}`}>
                         <p className="text-sm font-semibold uppercase tracking-[0.18em]">Follow-up prompt</p>
                         <h3 className="mt-3 text-xl font-semibold">{followUpPrompt.title}</h3>
                         <p className="mt-3 text-sm leading-7">{followUpPrompt.message}</p>
@@ -2666,7 +2666,7 @@ export default function DashboardPage() {
                     ) : null}
 
                     {submission.message ? (
-                      <div className="mt-6 rounded-[24px] border border-line/80 bg-white/70 p-5">
+                      <div className="mt-6 rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5">
                         <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Original message</p>
                         <p className="mt-3 whitespace-pre-wrap text-sm leading-7 text-ink/76">{submission.message}</p>
                       </div>
@@ -2674,8 +2674,8 @@ export default function DashboardPage() {
 
                   </div>
 
-                  <div className="w-full xl:w-[320px]">
-                    <div className="rounded-[24px] border border-line/80 bg-fog/70 p-5">
+                  <div className="w-full min-w-0 xl:w-[22rem] xl:shrink-0">
+                    <div className="rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5">
                       <SectionLabel>Routing</SectionLabel>
                       <div className="mt-4 space-y-2 text-sm leading-6 text-ink/72">
                         <p>Email delivery: {submission.delivery_status}</p>
@@ -2685,7 +2685,7 @@ export default function DashboardPage() {
                       </div>
                     </div>
 
-                    <div className="mt-5 rounded-[24px] border border-line/80 bg-white/70 p-5">
+                    <div className="mt-5 rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5">
                       <SectionLabel>Contacts</SectionLabel>
                       <div className="mt-4 space-y-5 text-sm leading-7 text-ink/74">
                         <div>
@@ -2703,7 +2703,7 @@ export default function DashboardPage() {
                       </div>
                     </div>
 
-                    <div className="mt-5 rounded-[24px] border border-line/80 bg-fog/70 p-5">
+                    <div className="mt-5 rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5">
                       <SectionLabel>Email Engagement</SectionLabel>
                       <div className="mt-4 space-y-3 text-sm leading-7 text-ink/74">
                         <p>{formatEmailEngagement(submission.email_engagement)}</p>
@@ -2778,7 +2778,7 @@ export default function DashboardPage() {
 
                   <Field label="Next action">
                     <input
-                      className="rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+                      className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
                       onChange={(event) =>
                         setDrafts((current) => ({
                           ...current,
@@ -2990,7 +2990,7 @@ export default function DashboardPage() {
                   />
                 </div>
 
-                <div className="mt-5 rounded-[24px] border border-line/80 bg-white/75 p-5 sm:p-6">
+                <div className="mt-5 rounded-2xl border border-line/80 bg-white/75 p-4 sm:p-6">
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                     <div>
                       <SectionLabel>Diligence & Decisioning</SectionLabel>
@@ -3149,7 +3149,7 @@ export default function DashboardPage() {
                   />
 
                   <div className="space-y-5">
-                    <div className="rounded-[24px] border border-line/80 bg-fog/70 p-5">
+                    <div className="rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5">
                       <SectionLabel>Secure upload request</SectionLabel>
                       {latestUploadRequest ? (
                         <div className="mt-4 space-y-2 text-sm leading-7 text-ink/72">
@@ -3163,7 +3163,7 @@ export default function DashboardPage() {
                       )}
                     </div>
 
-                    <div className="rounded-[24px] border border-line/80 bg-white/70 p-5">
+                    <div className="rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5">
                       <div className="flex items-center justify-between gap-4">
                         <SectionLabel>Uploaded documents</SectionLabel>
                         <Pill>{documents.length} file(s)</Pill>

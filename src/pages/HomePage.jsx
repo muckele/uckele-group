@@ -24,43 +24,43 @@ export default function HomePage() {
     <>
       <Seo {...seoContent.home} />
 
-      <section className="section-shell pt-10 sm:pt-16">
+      <section className="section-shell pt-7 sm:pt-14">
         <div className="grid gap-8 lg:grid-cols-[1.1fr_0.9fr] lg:items-stretch">
-          <Reveal className="panel overflow-hidden px-7 py-12 sm:px-10 sm:py-14 lg:px-12">
-            <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,rgba(185,137,82,0.14),transparent_30%),radial-gradient(circle_at_bottom_right,rgba(40,70,56,0.12),transparent_34%)]" />
-            <div className="surface-grid pointer-events-none absolute right-[-8%] top-0 h-full w-[45%] opacity-[0.15]" />
+          <Reveal className="panel overflow-hidden px-5 py-9 sm:px-10 sm:py-14 lg:px-12">
+            <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(135deg,rgba(185,137,82,0.12),transparent_34%),linear-gradient(315deg,rgba(40,70,56,0.10),transparent_38%)]" />
+            <div className="surface-grid pointer-events-none absolute right-0 top-0 hidden h-full w-[45%] opacity-[0.15] sm:block" />
             <div className="relative">
-            <span className="eyebrow">{homePage.hero.eyebrow}</span>
-            <h1 className="mt-6 max-w-3xl font-display text-4xl leading-[0.96] tracking-[-0.04em] text-ink sm:text-5xl lg:text-[4.45rem]">
-              {homePage.hero.title}
-            </h1>
-            <p className="mt-6 max-w-2xl text-lg leading-8 text-ink/74">{homePage.hero.description}</p>
+              <span className="eyebrow">{homePage.hero.eyebrow}</span>
+              <h1 className="mt-5 max-w-3xl font-display text-[2.55rem] leading-[1.03] tracking-normal text-ink sm:mt-6 sm:text-5xl lg:text-[4.1rem]">
+                {homePage.hero.title}
+              </h1>
+              <p className="mt-5 max-w-2xl text-base leading-7 text-ink/74 sm:mt-6 sm:text-lg sm:leading-8">{homePage.hero.description}</p>
 
-            <div className="mt-8 flex flex-wrap gap-3">
-              <ButtonLink href={homePage.hero.primaryCta.href}>{homePage.hero.primaryCta.label}</ButtonLink>
-              <ButtonLink href={homePage.hero.secondaryCta.href} variant="secondary">
-                {homePage.hero.secondaryCta.label}
-              </ButtonLink>
-            </div>
+              <div className="mt-8 grid gap-3 sm:flex sm:flex-wrap">
+                <ButtonLink className="w-full sm:w-auto" href={homePage.hero.primaryCta.href}>{homePage.hero.primaryCta.label}</ButtonLink>
+                <ButtonLink className="w-full sm:w-auto" href={homePage.hero.secondaryCta.href} variant="secondary">
+                  {homePage.hero.secondaryCta.label}
+                </ButtonLink>
+              </div>
 
-            <div className="mt-10 grid gap-3 sm:grid-cols-2">
-              {homePage.hero.signals.map((signal) => (
-                <div className="flex items-start gap-3 rounded-2xl border border-white/[0.90] bg-white/[0.72] px-4 py-4 shadow-[0_16px_30px_rgba(24,33,29,0.05)]" key={signal}>
-                  <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-moss" />
-                  <p className="text-sm leading-6 text-ink/74">{signal}</p>
-                </div>
-              ))}
-            </div>
+              <div className="mt-8 grid gap-3 sm:mt-10 sm:grid-cols-2">
+                {homePage.hero.signals.map((signal) => (
+                  <div className="flex items-start gap-3 rounded-2xl border border-white/[0.90] bg-white/[0.72] px-4 py-4 shadow-[0_16px_30px_rgba(24,33,29,0.05)]" key={signal}>
+                    <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-moss" />
+                    <p className="text-sm leading-6 text-ink/74">{signal}</p>
+                  </div>
+                ))}
+              </div>
             </div>
           </Reveal>
 
-          <Reveal className="panel relative overflow-hidden px-7 py-10 sm:px-9 sm:py-12" delay={120}>
+          <Reveal className="panel relative overflow-hidden px-5 py-9 sm:px-9 sm:py-12" delay={120}>
             <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-clay via-moss to-pine" />
             <div className="surface-grid absolute inset-0 opacity-40" />
             <div className="relative">
               <div className="flex items-center gap-4">
-                <img alt={`${siteConfig.personName} headshot placeholder`} className="h-20 w-20 rounded-3xl object-cover shadow-lg" src="/headshot-placeholder.svg" />
-                <div>
+                <img alt={`${siteConfig.personName} headshot placeholder`} className="h-16 w-16 shrink-0 rounded-2xl object-cover shadow-lg sm:h-20 sm:w-20 sm:rounded-3xl" src="/headshot-placeholder.svg" />
+                <div className="min-w-0">
                   <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">{siteConfig.personName}</p>
                   <p className="mt-2 max-w-xs text-sm leading-6 text-ink/70">
                     Business-minded operator seeking a durable small business to own and grow with care.
@@ -79,7 +79,7 @@ export default function HomePage() {
                 ))}
               </div>
 
-              <div className="mt-8 rounded-[26px] border border-moss/12 bg-moss px-5 py-5 text-white">
+              <div className="mt-8 rounded-2xl border border-moss/12 bg-moss px-5 py-5 text-white">
                 <p className="text-sm font-semibold uppercase tracking-[0.18em] text-white/72">Confidential Conversations Welcome</p>
                 <p className="mt-3 text-sm leading-7 text-white/84">
                   Owners, brokers, and referrals are all welcome to reach out directly. Early conversations should feel calm, private, and useful.
@@ -181,13 +181,13 @@ export default function HomePage() {
                 </span>
               ))}
             </div>
-            <div className="mt-8 rounded-[28px] border border-line/80 bg-white/72 p-6">
+            <div className="mt-8 rounded-2xl border border-line/80 bg-white/72 p-5 sm:p-6">
               <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Search Themes Covered</p>
               <p className="mt-3 text-base leading-7 text-ink/74">
                 Small business buyer. Individual business buyer. Long-term business buyer. Search fund alternative. Preserve business legacy after sale.
               </p>
             </div>
-            <div className="mt-6 rounded-[28px] border border-line/80 bg-white/72 p-6">
+            <div className="mt-6 rounded-2xl border border-line/80 bg-white/72 p-5 sm:p-6">
               <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Open To A Conversation If</p>
               <p className="mt-3 text-base leading-7 text-ink/74">
                 You have a solid small business, care about continuity, and want to explore a fair transition without the feel of a corporate process.
@@ -288,7 +288,7 @@ export default function HomePage() {
         <div className="mt-8 grid gap-6 md:grid-cols-3">
           {homePage.references.items.map((item, index) => (
             <Reveal className="panel overflow-hidden p-7 sm:p-8" delay={index * 90} key={item.label}>
-              <div className="pointer-events-none absolute right-0 top-0 h-24 w-24 rounded-full bg-clay/8 blur-2xl" />
+              <div className="pointer-events-none absolute inset-x-0 top-0 h-1 bg-clay/40" />
               <p className="text-sm font-semibold uppercase tracking-[0.18em] text-clay">{item.label}</p>
               <p className="relative mt-4 text-base leading-7 text-ink/72">{item.text}</p>
             </Reveal>
@@ -297,8 +297,8 @@ export default function HomePage() {
       </section>
 
       <section className="section-shell mt-20 pb-4">
-        <Reveal className="panel overflow-hidden bg-[linear-gradient(135deg,#173126_0%,#284638_58%,#305243_100%)] px-7 py-10 text-white sm:px-10 sm:py-12">
-          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_right,rgba(255,255,255,0.14),transparent_30%),radial-gradient(circle_at_bottom_left,rgba(185,137,82,0.14),transparent_34%)]" />
+        <Reveal className="panel overflow-hidden bg-[linear-gradient(135deg,#173126_0%,#284638_58%,#305243_100%)] px-5 py-9 text-white sm:px-10 sm:py-12">
+          <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(135deg,rgba(255,255,255,0.10),transparent_36%),linear-gradient(315deg,rgba(185,137,82,0.12),transparent_40%)]" />
           <div className="flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
             <div className="relative max-w-2xl">
               <span className="eyebrow border-white/15 bg-white/10 text-white">Ready When You Are</span>
@@ -306,12 +306,12 @@ export default function HomePage() {
               <p className="mt-4 text-base leading-8 text-white/80">{homePage.contactCta.description}</p>
             </div>
 
-            <div className="relative flex flex-wrap gap-3">
-              <ButtonLink className="bg-white text-pine hover:bg-sand" href={homePage.contactCta.primaryCta.href}>
+            <div className="relative grid gap-3 sm:flex sm:flex-wrap">
+              <ButtonLink className="w-full bg-white text-pine hover:bg-sand sm:w-auto" href={homePage.contactCta.primaryCta.href}>
                 {homePage.contactCta.primaryCta.label}
               </ButtonLink>
               <ButtonLink
-                className="border-white/18 bg-white/10 text-white hover:border-white/28 hover:bg-white/14"
+                className="w-full border-white/18 bg-white/10 text-white hover:border-white/28 hover:bg-white/14 sm:w-auto"
                 href={homePage.contactCta.secondaryCta.href}
               >
                 {homePage.contactCta.secondaryCta.label}

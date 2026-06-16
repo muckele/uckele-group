@@ -11,15 +11,15 @@ export default function Footer() {
     : [{ kind: 'text', label: 'Contact', value: 'Use the contact form for confidential inquiries.' }];
 
   return (
-    <footer className="mt-24 border-t border-ink/8 bg-[#173126] text-white">
-      <div className="section-shell py-16">
+    <footer className="mt-20 border-t border-ink/8 bg-[#173126] text-white sm:mt-24">
+      <div className="section-shell py-12 sm:py-16">
         <div className="grid gap-12 lg:grid-cols-[1.2fr_0.9fr_0.9fr]">
-          <div className="space-y-5">
+          <div className="min-w-0 space-y-5">
             <LogoMark light />
             <p className="max-w-md text-sm leading-7 text-white/78">
               {siteConfig.personName} is seeking one strong small business to own and operate for the long term with continuity, care, and respect for what the seller built.
             </p>
-            <div className="flex flex-wrap gap-3">
+            <div className="grid gap-3 sm:flex sm:flex-wrap">
               <ButtonLink className="w-full bg-white text-pine hover:bg-sand sm:w-auto" href="/contact">
                 Start A Conversation
               </ButtonLink>
@@ -56,11 +56,11 @@ export default function Footer() {
                 .filter((item) => item.kind !== 'linkedin')
                 .map((item) =>
                   item.href ? (
-                    <a className="block transition hover:text-white" href={item.href} key={`${item.kind}-${item.value}`}>
+                    <a className="block break-words transition hover:text-white" href={item.href} key={`${item.kind}-${item.value}`}>
                       <span className="font-medium text-white/56">{item.label}:</span> {item.value}
                     </a>
                   ) : (
-                    <p key={`${item.kind}-${item.value}`}>
+                    <p className="break-words" key={`${item.kind}-${item.value}`}>
                       <span className="font-medium text-white/56">{item.label}:</span> {item.value}
                     </p>
                   ),

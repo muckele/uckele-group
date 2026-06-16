@@ -22,12 +22,12 @@ export default function ProcessPage() {
 
             return (
               <Reveal className="panel p-7 sm:p-8" delay={index * 60} key={step.title}>
-                <div className="grid gap-6 lg:grid-cols-[0.16fr_0.16fr_1fr] lg:items-start">
+                <div className="grid gap-5 sm:grid-cols-[auto_1fr] lg:grid-cols-[0.16fr_0.16fr_1fr] lg:items-start">
                   <p className="text-sm font-semibold uppercase tracking-[0.24em] text-moss">{step.step}</p>
                   <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-moss/8 text-moss">
                     <Icon className="h-5 w-5" />
                   </div>
-                  <div>
+                  <div className="min-w-0 sm:col-span-2 lg:col-span-1">
                     <h2 className="text-2xl font-semibold text-ink">{step.title}</h2>
                     <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">{step.description}</p>
                   </div>
@@ -48,11 +48,11 @@ export default function ProcessPage() {
               </div>
             ))}
           </div>
-          <div className="mt-8 flex flex-wrap gap-3">
-            <ButtonLink href="/contact">
+          <div className="mt-8 grid gap-3 sm:flex sm:flex-wrap">
+            <ButtonLink className="w-full sm:w-auto" href="/contact">
               Start A Conversation <ArrowRight className="h-4 w-4" />
             </ButtonLink>
-            <ButtonLink href="/why-sell-to-me" variant="secondary">
+            <ButtonLink className="w-full sm:w-auto" href="/why-sell-to-me" variant="secondary">
               Why Sell To Me
             </ButtonLink>
           </div>
