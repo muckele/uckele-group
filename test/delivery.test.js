@@ -53,7 +53,7 @@ test('CIM request email keeps internal score and deal economics out of broker-vi
 
   assert.equal(message.kind, 'deal-hunter-cim-request');
   assert.match(message.subject, /CIM \/ NDA request/);
-  assert.match(message.text, /Could you please send over the CIM, teaser, NDA, or available financial package\?/);
+  assert.match(message.text, /Could you please send over the CIM or teaser, or let me know the NDA process\?/);
   assert.match(message.html, /View Listing/);
   assertBrokerEmailHidesInternalDetails(message);
 });
