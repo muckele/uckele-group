@@ -118,11 +118,17 @@ Then update DNS:
 
 - Confirm the contact form is delivering to `mathew@uckelegroup.com`
 - Confirm `/admin` can run Deal Hunter scoring and send the daily email
+- Confirm `/admin` can send a 75+ Deal Hunter CIM request and run the CIM follow-up check
+- Confirm `/admin` can run Prospect Discovery manually with a small Google Places query
+- Confirm discovered prospects are saved in `prospect_discoveries` with `lead_tier`, `business_quality_score`, `presence_gap_score`, and imported CRM records link back to the discovery source
+- Confirm DNP prospects are saved as `not-prioritized` instead of being imported into the active CRM follow-up queue
 - Confirm the in-app scheduler logs `deal-hunter:scheduler` startup and sends after the configured Pacific time
+- Confirm the in-app scheduler logs `prospect-discovery:scheduler` startup only after `PROSPECT_DISCOVERY_SCHEDULER_ENABLED=true`
 - If using an external scheduler, confirm it posts to `/api/deal-hunter/daily-email` with `Authorization: Bearer DEAL_HUNTER_CRON_SECRET`
 - Confirm the first successful daily email creates Deal Hunter history rows so later emails can separate newly seen matches from already reviewed listings
 - Confirm magic-link sign-in emails are being delivered
 - Confirm Resend webhook events create email engagement records in the admin CRM
+- Confirm Resend inbound `email.received` webhook events stop CIM follow-ups before enabling `DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED=true`
 - Verify `/api/health` returns `200` on the Fly URL
 - Confirm uploaded secure documents are written under the mounted volume
 - Confirm `robots.txt` and `sitemap.xml` are live on `https://www.uckelegroup.com`

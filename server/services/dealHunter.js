@@ -1,8 +1,26 @@
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
-import { sendDailyDealHunterEmail } from './delivery.js';
+import { sha256 } from '../utils/security.js';
+import { sendDailyDealHunterEmail, sendDealHunterCimFollowUpEmail, sendDealHunterCimRequestEmail } from './delivery.js';
+import { createManualSubmission } from './submissions.js';
 
 const defaultTimeoutMs = 45000;
+const cimRequestScoreThreshold = 75;
+const highFitScoreThreshold = 70;
+const watchlistScoreThreshold = 55;
+const cimRequestSentStatuses = ['sent', 'logged'];
+const cimRequestActiveStatuses = ['sent', 'logged', 'failed', 'follow_up_failed', 'follow_up_pending'];
+const cimRequestTerminalStatuses = ['sent', 'logged', 'responded', 'delivery_issue', 'follow_up_failed', 'follow_up_pending'];
+const replyEventTypes = new Set(['replied', 'received']);
+const stopFollowUpEventTypes = new Set(['bounced', 'complained', 'failed', 'unsubscribed']);
+const cimClaimStaleMinutes = 30;
+const cimRequestSendLocks = new Set();
+const cimFollowUpLocks = new Set();
+const dealHunterCrmNotesHeading = 'Deal Hunter scoring profile';
+const dealHunterCrmUserNotesHeading = 'User notes';
+const dealHunterCrmGeneratedStartMarker = 'Deal Hunter generated notes';
+const dealHunterCrmGeneratedEndMarker = 'End Deal Hunter generated notes';
+const dealHunterCrmImportPendingStaleMinutes = 30;
 
 const profile = {
   minAnnualProfit: 300000,
@@ -222,6 +240,21 @@ function normalizeText(value = '', maxLength = 5000) {
     .slice(0, maxLength);
 }
 
+function normalizeEmail(value = '') {
+  return normalizeText(value, 320).toLowerCase();
+}
+
+function normalizeComparableText(value = '') {
+  return normalizeText(value, 1000)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function isValidEmail(value = '') {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeEmail(value));
+}
+
 function normalizeKey(value = '') {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
@@ -240,6 +273,33 @@ function normalizeUrl(value = '') {
     return ['http:', 'https:'].includes(url.protocol) ? url.toString() : '';
   } catch {
     return '';
+  }
+}
+
+function normalizeListingIdentity(value = '') {
+  const normalized = normalizeText(value, 1000).toLowerCase();
+
+  if (!normalized) {
+    return '';
+  }
+
+  const withProtocol = /^[a-z][a-z\d+\-.]*:\/\//i.test(normalized) ? normalized : `https://${normalized}`;
+
+  try {
+    const url = new URL(withProtocol);
+
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      return '';
+    }
+
+    const params = Array.from(url.searchParams.entries())
+      .filter(([key]) => !/^utm_/i.test(key) && !['fbclid', 'gclid', 'mc_cid', 'mc_eid'].includes(key.toLowerCase()))
+      .sort(([left], [right]) => left.localeCompare(right));
+    const query = params.length > 0 ? `?${new URLSearchParams(params).toString()}` : '';
+
+    return `${url.hostname.replace(/^www\./i, '').toLowerCase()}${url.pathname.replace(/\/+$/, '') || '/'}${query}`;
+  } catch {
+    return normalized.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/#.*$/, '').replace(/[?&]utm_[^&]*/gi, '');
   }
 }
 
@@ -545,13 +605,15 @@ function scoreDeal(deal) {
 
   if (removeReasons.length > 0) {
     score = Math.min(score, 34);
+  } else if (deal.annualProfit === null) {
+    score = Math.min(score, highFitScoreThreshold - 1);
   }
 
   score = Math.max(0, Math.min(100, Math.round(score)));
   const shouldRemove = removeReasons.length > 0 || score < 45;
   const recommendation = shouldRemove
     ? 'Remove from tomorrow\'s daily update unless there is a specific strategic reason to keep it.'
-    : score >= 70
+    : score >= highFitScoreThreshold
       ? 'High fit. Review the listing and ask the broker diligence questions.'
       : 'Watchlist. Worth reviewing only if the broker confirms recurring revenue, management depth, and clean financing terms.';
 
@@ -1042,7 +1104,7 @@ function summarizeCriteria(scoredDeals) {
     .slice(0, 5)
     .map(([label, count]) => `${label} (${count})`);
   const recommendations = [];
-  const highFitCount = scoredDeals.filter((deal) => !deal.shouldRemove && deal.score >= 70).length;
+  const highFitCount = scoredDeals.filter((deal) => !deal.shouldRemove && deal.score >= highFitScoreThreshold).length;
 
   if (mostCommonExclusions.length > 0) {
     recommendations.push(`Keep excluding these recurring non-fit categories: ${mostCommonExclusions.join(', ')}.`);
@@ -1094,6 +1156,7 @@ function publicDeal(deal) {
     questions: deal.questions,
     recommendation: deal.recommendation,
     shouldRemove: deal.shouldRemove,
+    cimRequest: deal.cimRequest || null,
   };
 }
 
@@ -1158,6 +1221,965 @@ async function persistDealHunterHistory(storage, scoredDeals) {
   await storage.upsertDealHunterSeenDeals(records);
 }
 
+function formatCurrencyForCrm(value) {
+  return Number.isFinite(value)
+    ? new Intl.NumberFormat('en-US', {
+        style: 'currency',
+        currency: 'USD',
+        maximumFractionDigits: 0,
+      }).format(value)
+    : '';
+}
+
+function formatMultipleForCrm(value) {
+  return Number.isFinite(value) && value > 0 ? `${Number(value.toFixed(2))}x` : '';
+}
+
+function formatYearsForCrm(value) {
+  return Number.isFinite(value) && value > 0 ? `${Number(value.toFixed(1))} years` : '';
+}
+
+function listLines(label, values = []) {
+  const safeValues = values.map((value) => normalizeText(value, 500)).filter(Boolean);
+
+  if (safeValues.length === 0) {
+    return [];
+  }
+
+  return [label, ...safeValues.map((value) => `- ${value}`)];
+}
+
+function dealHunterCrmNotes(deal) {
+  const lines = [
+    dealHunterCrmNotesHeading,
+    `Deal key: ${deal.dealKey || 'Not set'}`,
+    `Score: ${deal.score}/100`,
+    `Source: ${deal.sourceName || 'Deal Hunter'}${deal.sourceMode ? ` (${deal.sourceMode})` : ''}`,
+    deal.firstSeenAt ? `First seen: ${deal.firstSeenAt}` : '',
+    deal.lastSeenAt ? `Last seen: ${deal.lastSeenAt}` : '',
+    deal.recommendation ? `Recommendation: ${deal.recommendation}` : '',
+    '',
+    'Listing details',
+    deal.name ? `Business: ${deal.name}` : '',
+    deal.industry ? `Industry: ${deal.industry}` : '',
+    deal.location ? `Location: ${deal.location}` : '',
+    deal.annualProfit ? `Annual profit / SDE: ${formatCurrencyForCrm(deal.annualProfit)}` : '',
+    deal.annualRevenue ? `Annual revenue: ${formatCurrencyForCrm(deal.annualRevenue)}` : '',
+    deal.askingPrice ? `Asking price: ${formatCurrencyForCrm(deal.askingPrice)}` : '',
+    deal.profitMultiple ? `Profit multiple: ${formatMultipleForCrm(deal.profitMultiple)}` : '',
+    deal.yearsEstablished ? `Years established: ${formatYearsForCrm(deal.yearsEstablished)}` : '',
+    deal.remoteFlag ? `Remote / absentee / relocatable: ${deal.remoteFlag}` : '',
+    deal.listingUrl ? `Listing URL: ${deal.listingUrl}` : '',
+    '',
+    'Broker / contact',
+    deal.brokerName ? `Broker name: ${deal.brokerName}` : '',
+    deal.brokerCompany ? `Broker company: ${deal.brokerCompany}` : '',
+    deal.brokerEmail ? `Broker email: ${deal.brokerEmail}` : '',
+    deal.brokerContact ? `Broker phone/contact: ${deal.brokerContact}` : '',
+    '',
+    ...listLines('Strengths', deal.strengths || []),
+    '',
+    ...listLines('Concerns / diligence points', deal.concerns || []),
+    '',
+    ...listLines('Questions to ask broker or seller', deal.questions || []),
+  ];
+
+  return lines.filter((line, index, list) => line || list[index - 1]).join('\n').trim();
+}
+
+function wrapDealHunterCrmGeneratedNotes(notes = '') {
+  const generatedNotes = String(notes || '').trim();
+
+  if (
+    generatedNotes.includes(dealHunterCrmGeneratedStartMarker) &&
+    generatedNotes.includes(dealHunterCrmGeneratedEndMarker)
+  ) {
+    return generatedNotes;
+  }
+
+  return [
+    dealHunterCrmGeneratedStartMarker,
+    generatedNotes,
+    dealHunterCrmGeneratedEndMarker,
+  ].filter(Boolean).join('\n').trim();
+}
+
+function ensureDealHunterUserNotesSection(notes = '') {
+  const currentNotes = String(notes || '').trim();
+  const userNotesMarker = `\n\n${dealHunterCrmUserNotesHeading}\n`;
+
+  return currentNotes.includes(userNotesMarker)
+    ? currentNotes
+    : `${currentNotes}${userNotesMarker}`.trimEnd();
+}
+
+function mergeDealHunterCrmNotes(existingNotes = '', freshNotes = '') {
+  const currentNotes = String(existingNotes || '').trim();
+  const nextNotes = wrapDealHunterCrmGeneratedNotes(freshNotes);
+
+  if (!currentNotes || currentNotes === nextNotes) {
+    return ensureDealHunterUserNotesSection(nextNotes);
+  }
+
+  const userNotesMarker = `\n\n${dealHunterCrmUserNotesHeading}\n`;
+  const startIndex = currentNotes.indexOf(dealHunterCrmGeneratedStartMarker);
+  const endIndex = currentNotes.indexOf(dealHunterCrmGeneratedEndMarker);
+
+  if (startIndex >= 0 && endIndex > startIndex) {
+    const afterGeneratedIndex = endIndex + dealHunterCrmGeneratedEndMarker.length;
+    const beforeGenerated = currentNotes.slice(0, startIndex).trim();
+    const afterGenerated = currentNotes.slice(afterGeneratedIndex).trim();
+    return ensureDealHunterUserNotesSection([beforeGenerated, nextNotes, afterGenerated].filter(Boolean).join('\n\n'));
+  }
+
+  if (currentNotes.includes(userNotesMarker)) {
+    return `${nextNotes}${userNotesMarker}${currentNotes.split(userNotesMarker).slice(1).join(userNotesMarker).trim()}`;
+  }
+
+  if (currentNotes.startsWith(dealHunterCrmNotesHeading)) {
+    return `${nextNotes}${userNotesMarker}${currentNotes}`;
+  }
+
+  return `${nextNotes}${userNotesMarker}${currentNotes}`;
+}
+
+function dealHunterCrmMetadata(deal, options = {}) {
+  const managed = options.managed !== false;
+  const generatedNotes = dealHunterCrmNotes(deal);
+
+  return {
+    dealHunter: {
+      managed,
+      linkedToExistingCrmRecord: Boolean(options.linkedToExistingCrmRecord),
+      dealKey: deal.dealKey || '',
+      score: deal.score,
+      sourceName: deal.sourceName || '',
+      sourceMode: deal.sourceMode || '',
+      sourceId: deal.sourceId || '',
+      externalId: deal.id || '',
+      firstSeenAt: deal.firstSeenAt || '',
+      lastSeenAt: deal.lastSeenAt || '',
+      isNew: Boolean(deal.isNew),
+      shouldRemove: Boolean(deal.shouldRemove),
+      recommendation: deal.recommendation || '',
+      strengths: deal.strengths || [],
+      concerns: deal.concerns || [],
+      removeReasons: deal.removeReasons || [],
+      questions: deal.questions || [],
+      generatedNotes,
+      raw: deal.raw || {},
+    },
+  };
+}
+
+function dealHunterCrmPayload(deal, options = {}) {
+  const hasBrokerContact = Boolean(deal.brokerName || deal.brokerEmail || deal.brokerContact);
+  const sourceTag = normalizeComparableText(deal.sourceName || 'deal-hunter').replace(/\s+/g, '-').slice(0, 40);
+  const generatedNotes = dealHunterCrmNotes(deal);
+
+  return {
+    company: deal.name || 'Unnamed Deal Hunter business',
+    role: hasBrokerContact ? 'Broker' : 'Prospect',
+    listing_url: deal.listingUrl || '',
+    asking_price: formatCurrencyForCrm(deal.askingPrice),
+    ttm_revenue: formatCurrencyForCrm(deal.annualRevenue),
+    ttm_ebitda: formatCurrencyForCrm(deal.annualProfit),
+    ebitda_multiple: formatMultipleForCrm(deal.profitMultiple),
+    business_age: formatYearsForCrm(deal.yearsEstablished),
+    broker_name: deal.brokerName || deal.brokerCompany || '',
+    broker_email: deal.brokerEmail || '',
+    broker_phone: deal.brokerContact || '',
+    lead_type: hasBrokerContact ? 'broker' : 'prospect',
+    status: 'review',
+    priority: deal.score >= 85 ? 'urgent' : 'high',
+    follow_up_state: 'needs-response',
+    source: 'deal-hunter-daily-review',
+    tags: ['deal-hunter', 'score-75-plus', 'high-fit', sourceTag].filter(Boolean),
+    notes: mergeDealHunterCrmNotes('', generatedNotes),
+    message: `High-fit Deal Hunter listing imported into the CRM with score ${deal.score}/100.`,
+    metadata: dealHunterCrmMetadata(deal, options),
+  };
+}
+
+async function findExistingDealHunterSubmission(storage, deal) {
+  if (deal.listingUrl && storage.getSubmissionByListingUrl) {
+    const existingByListingUrl = await storage.getSubmissionByListingUrl(deal.listingUrl);
+
+    if (existingByListingUrl) {
+      return existingByListingUrl;
+    }
+  }
+
+  if (deal.dealKey && storage.listSubmissions) {
+    const result = await storage.listSubmissions({ limit: 10, page: 1, search: deal.dealKey, status: 'all' });
+    const rows = result?.rows || [];
+    return rows.find((row) => row?.metadata?.dealHunter?.dealKey === deal.dealKey || String(row?.notes || '').includes(deal.dealKey)) || null;
+  }
+
+  return null;
+}
+
+function isDealHunterManagedSubmission(existing = {}) {
+  return existing.source === 'deal-hunter-daily-review' || existing.metadata?.dealHunter?.managed === true;
+}
+
+function chooseDealHunterCrmValue(existing, payload, field, preserveExistingFields) {
+  return preserveExistingFields
+    ? existing[field] || payload[field] || ''
+    : payload[field] || existing[field] || '';
+}
+
+function dealHunterCrmUpdate(existing, deal, options = {}) {
+  const preserveExistingFields = Boolean(options.preserveExistingFields);
+  const managed = !preserveExistingFields;
+  const payload = dealHunterCrmPayload(deal, {
+    managed,
+    linkedToExistingCrmRecord: preserveExistingFields,
+  });
+  const existingTags = Array.isArray(existing.tags) ? existing.tags : [];
+  const existingPriority = normalizeText(existing.priority, 80);
+
+  return {
+    updated_at: new Date().toISOString(),
+    listing_url: chooseDealHunterCrmValue(existing, payload, 'listing_url', preserveExistingFields),
+    asking_price: chooseDealHunterCrmValue(existing, payload, 'asking_price', preserveExistingFields),
+    ttm_revenue: chooseDealHunterCrmValue(existing, payload, 'ttm_revenue', preserveExistingFields),
+    ttm_ebitda: chooseDealHunterCrmValue(existing, payload, 'ttm_ebitda', preserveExistingFields),
+    ebitda_multiple: chooseDealHunterCrmValue(existing, payload, 'ebitda_multiple', preserveExistingFields),
+    business_age: chooseDealHunterCrmValue(existing, payload, 'business_age', preserveExistingFields),
+    broker_name: chooseDealHunterCrmValue(existing, payload, 'broker_name', preserveExistingFields),
+    broker_email: chooseDealHunterCrmValue(existing, payload, 'broker_email', preserveExistingFields),
+    broker_phone: chooseDealHunterCrmValue(existing, payload, 'broker_phone', preserveExistingFields),
+    priority: preserveExistingFields && existingPriority && existingPriority !== 'normal' ? existingPriority : payload.priority,
+    tags: Array.from(new Set([...existingTags, ...payload.tags])),
+    notes: mergeDealHunterCrmNotes(existing.notes, payload.notes),
+    metadata: {
+      ...(existing.metadata || {}),
+      ...payload.metadata,
+    },
+  };
+}
+
+function buildDealHunterCrmImportRecord(deal, submissionId = '', status = 'pending') {
+  const listingIdentity = normalizeListingIdentity(deal.listingUrl);
+  const importIdentity = listingIdentity || deal.dealKey || normalizeIdentityPart([deal.sourceName, deal.name, deal.location].join('|'), 1000);
+  const now = new Date().toISOString();
+
+  return {
+    id: sha256(`deal-hunter-crm-import:${importIdentity}`),
+    created_at: now,
+    updated_at: now,
+    deal_key: deal.dealKey || importIdentity,
+    listing_identity: listingIdentity,
+    listing_url: deal.listingUrl || '',
+    submission_id: submissionId || '',
+    status,
+    source_name: deal.sourceName || '',
+    metadata: {
+      score: deal.score,
+      name: deal.name || '',
+      sourceMode: deal.sourceMode || '',
+      sourceId: deal.sourceId || '',
+    },
+  };
+}
+
+async function updateDealHunterCrmImport(storage, importRecord, values = {}) {
+  if (!storage.updateDealHunterCrmImport || !importRecord?.id) {
+    return null;
+  }
+
+  try {
+    return await storage.updateDealHunterCrmImport(importRecord.id, {
+      updated_at: new Date().toISOString(),
+      ...values,
+    });
+  } catch (error) {
+    console.warn(`[deal-hunter] CRM import bookkeeping update failed: ${error.message}`);
+    return null;
+  }
+}
+
+async function syncHighFitDealsToCrm(scoredDeals = [], storage = getStorage()) {
+  const candidates = scoredDeals.filter(
+    (deal) => !deal.shouldRemove && deal.score >= cimRequestScoreThreshold && deal.annualProfit !== null,
+  );
+  const summary = {
+    reviewed: candidates.length,
+    created: 0,
+    enriched: 0,
+    updated: 0,
+    skipped: 0,
+    failed: 0,
+    results: [],
+  };
+
+  for (const deal of candidates) {
+    let importRecord = null;
+
+    try {
+      const pendingCutoff = new Date(Date.now() - dealHunterCrmImportPendingStaleMinutes * 60 * 1000).toISOString();
+      const proposedImportRecord = buildDealHunterCrmImportRecord(deal);
+
+      if (storage.claimDealHunterCrmImport) {
+        let claim = null;
+
+        try {
+          claim = await storage.claimDealHunterCrmImport(proposedImportRecord, { pendingCutoff });
+        } catch (error) {
+          console.warn(`[deal-hunter] CRM import claim failed; continuing without duplicate claim: ${error.message}`);
+        }
+
+        importRecord = claim?.importRecord || proposedImportRecord;
+
+        if (claim && !claim.claimed) {
+          const claimedSubmission = importRecord?.submission_id && storage.getSubmission
+            ? await storage.getSubmission(importRecord.submission_id)
+            : null;
+
+          if (claimedSubmission && storage.updateSubmission) {
+            const preserveExistingFields = !isDealHunterManagedSubmission(claimedSubmission);
+            const updated = await storage.updateSubmission(
+              claimedSubmission.id,
+              dealHunterCrmUpdate(claimedSubmission, deal, { preserveExistingFields }),
+            );
+            const status = preserveExistingFields ? 'enriched' : 'updated';
+            summary[status] += 1;
+            summary.results.push({ dealKey: deal.dealKey, status, submissionId: updated?.id || claimedSubmission.id });
+          } else {
+            summary.skipped += 1;
+            summary.results.push({ dealKey: deal.dealKey, status: 'duplicate-in-progress', submissionId: importRecord?.submission_id || '' });
+          }
+
+          continue;
+        }
+      } else {
+        importRecord = proposedImportRecord;
+      }
+
+      const existing = await findExistingDealHunterSubmission(storage, deal);
+
+      if (existing) {
+        if (storage.updateSubmission) {
+          const preserveExistingFields = !isDealHunterManagedSubmission(existing);
+          const updated = await storage.updateSubmission(
+            existing.id,
+            dealHunterCrmUpdate(existing, deal, { preserveExistingFields }),
+          );
+          const status = preserveExistingFields ? 'enriched' : 'updated';
+          summary[status] += 1;
+          summary.results.push({ dealKey: deal.dealKey, status, submissionId: updated?.id || existing.id });
+          await updateDealHunterCrmImport(storage, importRecord, {
+            submission_id: updated?.id || existing.id,
+            status,
+          });
+        } else {
+          summary.skipped += 1;
+          summary.results.push({ dealKey: deal.dealKey, status: 'duplicate-no-update', submissionId: existing.id });
+        }
+
+        continue;
+      }
+
+      const created = await createManualSubmission(
+        dealHunterCrmPayload(deal),
+        'deal-hunter-daily-review',
+        { storage },
+      );
+
+      if (!created.ok) {
+        summary.failed += 1;
+        summary.results.push({ dealKey: deal.dealKey, status: 'failed', error: (created.errors || []).join(' ') || 'CRM record was not created.' });
+        await updateDealHunterCrmImport(storage, importRecord, {
+          status: 'failed',
+          metadata: {
+            ...(importRecord?.metadata || {}),
+            error: (created.errors || []).join(' ') || 'CRM record was not created.',
+          },
+        });
+        continue;
+      }
+
+      summary.created += 1;
+      summary.results.push({ dealKey: deal.dealKey, status: 'created', submissionId: created.submission?.id || '' });
+      await updateDealHunterCrmImport(storage, importRecord, {
+        submission_id: created.submission?.id || '',
+        status: 'created',
+      });
+    } catch (error) {
+      summary.failed += 1;
+      summary.results.push({ dealKey: deal.dealKey, status: 'failed', error: error.message });
+      await updateDealHunterCrmImport(storage, importRecord, {
+        status: 'failed',
+        metadata: {
+          ...(importRecord?.metadata || {}),
+          error: error.message,
+        },
+      });
+    }
+  }
+
+  return summary;
+}
+
+function buildCimRequestId(dealKey, recipientEmail) {
+  return sha256(`deal-hunter-cim-request:${dealKey}:${normalizeEmail(recipientEmail)}`);
+}
+
+function isCompletedCimStatus(status = '') {
+  return cimRequestTerminalStatuses.includes(status);
+}
+
+function normalizeEventType(value = '') {
+  return normalizeText(value, 80).toLowerCase().replace(/^email[._-]/, '').replace(/[._-]/g, '_');
+}
+
+function isRecentPendingCimRequest(request) {
+  if (request?.status !== 'pending') {
+    return false;
+  }
+
+  const updatedAt = Date.parse(request.updated_at || '');
+  return Number.isFinite(updatedAt) && updatedAt > Date.now() - 10 * 60 * 1000;
+}
+
+function getCimFollowUpSettings() {
+  const config = getConfig();
+  return config.dealHunter?.cimFollowUp || {
+    enabled: false,
+    firstDelayHours: 48,
+    intervalHours: 72,
+    maxCount: 3,
+    delaySequenceHours: [48, 72, 168],
+  };
+}
+
+function acquireLock(lockSet, key) {
+  if (!key || lockSet.has(key)) {
+    return false;
+  }
+
+  lockSet.add(key);
+  return true;
+}
+
+function releaseLock(lockSet, key) {
+  if (key) {
+    lockSet.delete(key);
+  }
+}
+
+function buildCimRequestLockKey(dealKey, recipientEmail) {
+  return `${normalizeText(dealKey, 1000)}|${normalizeEmail(recipientEmail)}`;
+}
+
+function addHoursIso(value, hours) {
+  const baseMs = Date.parse(value || '');
+
+  if (!Number.isFinite(baseMs)) {
+    return '';
+  }
+
+  return new Date(baseMs + Math.max(0, Number(hours) || 0) * 60 * 60 * 1000).toISOString();
+}
+
+function subtractMinutesIso(value, minutes) {
+  const baseMs = Date.parse(value || '');
+
+  if (!Number.isFinite(baseMs)) {
+    return '';
+  }
+
+  return new Date(baseMs - Math.max(1, Number(minutes) || 1) * 60 * 1000).toISOString();
+}
+
+function nextCimFollowUpAt({ status = '', followUpCount = 0, lastTouchAt = '' } = {}) {
+  const settings = getCimFollowUpSettings();
+  const safeCount = Number(followUpCount || 0);
+
+  if (!cimRequestSentStatuses.includes(status) || settings.maxCount <= 0 || safeCount >= settings.maxCount) {
+    return null;
+  }
+
+  const delaySequence = Array.isArray(settings.delaySequenceHours) && settings.delaySequenceHours.length > 0
+    ? settings.delaySequenceHours
+    : [settings.firstDelayHours, settings.intervalHours];
+  const delayHours = delaySequence[safeCount] || settings.intervalHours;
+  return addHoursIso(lastTouchAt, delayHours) || null;
+}
+
+function getCimRequestProviderMessageIds(request = {}) {
+  const metadata = request.metadata && typeof request.metadata === 'object' ? request.metadata : {};
+  return Array.from(
+    new Set(
+      [
+        request.provider_message_id,
+        ...(Array.isArray(metadata.providerMessageIds) ? metadata.providerMessageIds : []),
+        ...(Array.isArray(metadata.followUps) ? metadata.followUps.map((item) => item.providerMessageId) : []),
+      ]
+        .map((value) => normalizeText(value, 240))
+        .filter(Boolean),
+    ),
+  );
+}
+
+function getEmailEventTagValue(event, key) {
+  const tags = event?.metadata?.tags;
+
+  if (Array.isArray(tags)) {
+    for (const tag of tags) {
+      if (typeof tag === 'string') {
+        const [tagKey, ...rest] = tag.split('=');
+
+        if (normalizeText(tagKey, 80) === key) {
+          return normalizeText(rest.join('='), 240);
+        }
+      } else if (tag && typeof tag === 'object' && normalizeText(tag.name || tag.key, 80) === key) {
+        return normalizeText(tag.value, 240);
+      }
+    }
+  }
+
+  if (tags && typeof tags === 'object' && !Array.isArray(tags)) {
+    return normalizeText(tags[key], 240);
+  }
+
+  return '';
+}
+
+function getEmailEventContactEmail(event) {
+  return normalizeEmail(
+    event?.metadata?.fromEmail ||
+      event?.metadata?.senderEmail ||
+      event?.metadata?.from ||
+      event?.recipient_email ||
+      '',
+  );
+}
+
+function emailSubjectLooksLikeCimReply(event, request) {
+  const subject = normalizeComparableText(event?.subject || '');
+
+  if (!subject) {
+    return false;
+  }
+
+  const dealName = normalizeComparableText(request?.deal_name || '');
+
+  if (dealName && subject.includes(dealName)) {
+    return true;
+  }
+
+  const stopWords = new Set(['and', 'the', 'for', 'llc', 'inc', 'co', 'company', 'business', 'service', 'services']);
+  const dealTokens = dealName.split(' ').filter((token) => token.length >= 4 && !stopWords.has(token));
+  const matchingTokenCount = dealTokens.filter((token) => subject.includes(token)).length;
+
+  if (dealTokens.length >= 2 && matchingTokenCount >= 2) {
+    return true;
+  }
+
+  if (dealTokens.length === 1 && matchingTokenCount === 1 && /\b(cim|nda|teaser|financial|package|request)\b/.test(subject)) {
+    return true;
+  }
+
+  return /\b(cim|nda|teaser|confidential|financial|package)\b/.test(subject);
+}
+
+function eventMatchesCimRequest(event, request) {
+  const eventMessageId = normalizeText(event?.message_id, 240);
+  const messageIds = getCimRequestProviderMessageIds(request);
+
+  if (eventMessageId && messageIds.includes(eventMessageId)) {
+    return true;
+  }
+
+  const eventRecipient = normalizeEmail(event?.recipient_email || '');
+  const requestRecipient = normalizeEmail(request?.recipient_email || '');
+  const eventType = normalizeEventType(event?.event_type);
+
+  if (
+    replyEventTypes.has(eventType) &&
+    requestRecipient &&
+    getEmailEventContactEmail(event) === requestRecipient
+  ) {
+    if (emailSubjectLooksLikeCimReply(event, request)) {
+      return true;
+    }
+
+    const eventCreatedAt = Date.parse(event?.created_at || '');
+    const requestCreatedAt = Date.parse(request?.created_at || request?.updated_at || '');
+
+    if (Number.isFinite(eventCreatedAt) && Number.isFinite(requestCreatedAt)) {
+      return eventCreatedAt >= requestCreatedAt - 5 * 60 * 1000;
+    }
+  }
+
+  const eventDealKey = event?.metadata?.tracking?.dealKey || event?.metadata?.dealKey || getEmailEventTagValue(event, 'deal_key');
+  const eventRequestId = event?.metadata?.tracking?.cimRequestId || event?.metadata?.cimRequestId || getEmailEventTagValue(event, 'cim_request_id');
+
+  return Boolean(
+    eventRecipient &&
+      eventRecipient === requestRecipient &&
+      ((eventDealKey && eventDealKey === request.deal_key) || (eventRequestId && eventRequestId === request.id)),
+  );
+}
+
+function findCimReplyEvent(request, events = []) {
+  return events
+    .filter((event) => replyEventTypes.has(normalizeEventType(event.event_type)) && eventMatchesCimRequest(event, request))
+    .sort((left, right) => Date.parse(right.created_at || '') - Date.parse(left.created_at || ''))[0] || null;
+}
+
+function findCimStopEvent(request, events = []) {
+  return events
+    .filter((event) => stopFollowUpEventTypes.has(normalizeEventType(event.event_type)) && eventMatchesCimRequest(event, request))
+    .sort((left, right) => Date.parse(right.created_at || '') - Date.parse(left.created_at || ''))[0] || null;
+}
+
+function getCimRequestUnavailableReason(deal, recipientEmail) {
+  if (!deal?.dealKey) {
+    return 'Deal tracking key is missing.';
+  }
+
+  if (deal.shouldRemove) {
+    return 'Deal is marked for removal and should not receive outreach.';
+  }
+
+  if (deal.score < cimRequestScoreThreshold) {
+    return `Score must be ${cimRequestScoreThreshold}+ before requesting a CIM.`;
+  }
+
+  if (deal.annualProfit === null) {
+    return 'Annual profit is missing; confirm trailing SDE or EBITDA before requesting a CIM.';
+  }
+
+  if (!recipientEmail) {
+    return 'No broker or contact email is available for this listing.';
+  }
+
+  if (!isValidEmail(recipientEmail)) {
+    return 'Broker or contact email is not valid.';
+  }
+
+  return '';
+}
+
+function mapCimRequestsByDealRecipient(requests = []) {
+  return requests.reduce((accumulator, request) => {
+    const dealKey = request?.deal_key || '';
+    const recipientEmail = normalizeEmail(request?.recipient_email || '');
+
+    if (dealKey && recipientEmail) {
+      accumulator.set(`${dealKey}|${recipientEmail}`, request);
+    }
+
+    return accumulator;
+  }, new Map());
+}
+
+function attachCimRequestStatus(scoredDeals, requests = []) {
+  const requestsByDealRecipient = mapCimRequestsByDealRecipient(requests);
+
+  return scoredDeals.map((deal) => {
+    const recipientEmail = normalizeEmail(deal.brokerEmail);
+    const existingRequest = requestsByDealRecipient.get(`${deal.dealKey}|${recipientEmail}`);
+    const reason = getCimRequestUnavailableReason(deal, recipientEmail);
+    const eligible = reason === '';
+    const completed = isCompletedCimStatus(existingRequest?.status);
+
+    return {
+      ...deal,
+      cimRequest: {
+        eligible,
+        canRequest: eligible && !completed && !isRecentPendingCimRequest(existingRequest),
+        status: existingRequest?.status || (eligible ? 'ready' : 'unavailable'),
+        reason,
+        recipientEmail,
+        requestedAt: existingRequest?.updated_at || '',
+        requestedBy: existingRequest?.requested_by || '',
+        deliveryError: existingRequest?.delivery_error || '',
+        providerMessageId: existingRequest?.provider_message_id || '',
+        subject: existingRequest?.subject || '',
+        followUpCount: Number(existingRequest?.follow_up_count || 0),
+        lastFollowUpAt: existingRequest?.last_follow_up_at || '',
+        nextFollowUpAt: existingRequest?.next_follow_up_at || '',
+        respondedAt: existingRequest?.responded_at || '',
+      },
+    };
+  });
+}
+
+async function loadDealHunterCimRequests(storage, dealKeys) {
+  if (!storage.listDealHunterCimRequests) {
+    return [];
+  }
+
+  try {
+    return await storage.listDealHunterCimRequests({ dealKeys, limit: 5000 });
+  } catch (error) {
+    console.warn(`[deal-hunter] CIM request history lookup failed: ${error.message}`);
+    return [];
+  }
+}
+
+function buildCimRequestRecord({ deal, recipientEmail, requestedBy = '', emailResult = {}, existingRequest = null }) {
+  const now = new Date().toISOString();
+  const businessName = normalizeText(deal.name || 'Unnamed business', 220);
+  const status = emailResult.status || 'pending';
+  const followUpCount = Number(existingRequest?.follow_up_count || 0);
+  const providerMessageIds = Array.from(
+    new Set(
+      [
+        ...getCimRequestProviderMessageIds(existingRequest || {}),
+        emailResult.providerMessageId,
+      ]
+        .map((value) => normalizeText(value, 240))
+        .filter(Boolean),
+    ),
+  );
+  const existingMetadata = existingRequest?.metadata && typeof existingRequest.metadata === 'object' ? existingRequest.metadata : {};
+  const nextFollowUpAt = nextCimFollowUpAt({
+    status,
+    followUpCount,
+    lastTouchAt: now,
+  });
+
+  return {
+    id: buildCimRequestId(deal.dealKey, recipientEmail),
+    created_at: existingRequest?.created_at || now,
+    updated_at: now,
+    deal_key: deal.dealKey,
+    recipient_email: normalizeEmail(recipientEmail),
+    requested_by: normalizeText(requestedBy, 160),
+    status,
+    delivery_error: emailResult.error || '',
+    provider_message_id: emailResult.providerMessageId || '',
+    subject: `CIM / NDA request for ${businessName}`,
+    deal_name: businessName,
+    source_name: deal.sourceName || '',
+    listing_url: deal.listingUrl || '',
+    score: deal.score,
+    follow_up_count: followUpCount,
+    last_follow_up_at: existingRequest?.last_follow_up_at || null,
+    next_follow_up_at: nextFollowUpAt,
+    responded_at: existingRequest?.responded_at || null,
+    metadata: {
+      ...existingMetadata,
+      industry: deal.industry || '',
+      location: deal.location || '',
+      annualProfit: deal.annualProfit,
+      annualRevenue: deal.annualRevenue,
+      askingPrice: deal.askingPrice,
+      profitMultiple: deal.profitMultiple,
+      brokerName: deal.brokerName || '',
+      brokerCompany: deal.brokerCompany || '',
+      brokerContact: deal.brokerContact || '',
+      recommendation: deal.recommendation || '',
+      strengths: deal.strengths || [],
+      concerns: deal.concerns || [],
+      questions: deal.questions || [],
+      providerMessageIds,
+    },
+  };
+}
+
+function dedupeEmailEvents(events = []) {
+  const seen = new Set();
+
+  return events.filter((event) => {
+    const key = event.id || event.event_key || `${event.message_id || ''}:${event.event_type || ''}:${event.created_at || ''}:${event.recipient_email || ''}`;
+
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+async function loadCimRequestEvents(storage, request) {
+  const queries = [];
+  const messageIds = getCimRequestProviderMessageIds(request);
+
+  if (messageIds.length > 0 && storage.listEmailEventsByMessageIds) {
+    queries.push(storage.listEmailEventsByMessageIds(messageIds, 1000));
+  }
+
+  if (request.recipient_email && storage.listEmailEvents) {
+    queries.push(storage.listEmailEvents({ recipientEmail: request.recipient_email, limit: 500 }));
+  }
+
+  if (queries.length === 0) {
+    return [];
+  }
+
+  const results = await Promise.all(queries);
+  return dedupeEmailEvents(results.flat());
+}
+
+function buildCimRequestStorageUpdate(request, updates = {}) {
+  return {
+    ...request,
+    ...updates,
+    updated_at: updates.updated_at || new Date().toISOString(),
+    metadata: {
+      ...(request.metadata || {}),
+      ...(updates.metadata || {}),
+    },
+  };
+}
+
+async function markCimRequestResponded(storage, request, replyEvent) {
+  const respondedAt = replyEvent.created_at || new Date().toISOString();
+  return storage.upsertDealHunterCimRequest(
+    buildCimRequestStorageUpdate(request, {
+      status: 'responded',
+      delivery_error: '',
+      responded_at: respondedAt,
+      next_follow_up_at: null,
+      metadata: {
+        responseEventId: replyEvent.id || '',
+        responseMessageId: replyEvent.message_id || '',
+        responseSubject: replyEvent.subject || '',
+      },
+    }),
+  );
+}
+
+async function markCimRequestDeliveryIssue(storage, request, stopEvent) {
+  const eventType = normalizeEventType(stopEvent.event_type);
+  return storage.upsertDealHunterCimRequest(
+    buildCimRequestStorageUpdate(request, {
+      status: 'delivery_issue',
+      delivery_error: `Follow-ups stopped because the email event was ${eventType}.`,
+      next_follow_up_at: null,
+      metadata: {
+        deliveryIssueEventId: stopEvent.id || '',
+        deliveryIssueMessageId: stopEvent.message_id || '',
+        deliveryIssueType: eventType,
+      },
+    }),
+  );
+}
+
+function buildCimFollowUpUpdate(request, emailResult, followUpNumber, sentAt) {
+  const settings = getCimFollowUpSettings();
+  const sent = ['sent', 'logged'].includes(emailResult.status);
+  const existingMetadata = request.metadata && typeof request.metadata === 'object' ? request.metadata : {};
+  const existingFollowUps = Array.isArray(existingMetadata.followUps) ? existingMetadata.followUps : [];
+  const followUpCount = sent ? Number(request.follow_up_count || 0) + 1 : Number(request.follow_up_count || 0);
+  const status = sent ? (cimRequestSentStatuses.includes(request.status) ? request.status : emailResult.status) : 'follow_up_failed';
+  const nextFollowUpAt = sent
+    ? nextCimFollowUpAt({ status, followUpCount, lastTouchAt: sentAt })
+    : addHoursIso(sentAt, settings.intervalHours) || null;
+  const providerMessageIds = Array.from(
+    new Set(
+      [
+        ...getCimRequestProviderMessageIds(request),
+        emailResult.providerMessageId,
+      ]
+        .map((value) => normalizeText(value, 240))
+        .filter(Boolean),
+    ),
+  );
+
+  return buildCimRequestStorageUpdate(request, {
+    status,
+    delivery_error: emailResult.error || '',
+    provider_message_id: emailResult.providerMessageId || request.provider_message_id || '',
+    follow_up_count: followUpCount,
+    last_follow_up_at: sent ? sentAt : request.last_follow_up_at || null,
+    next_follow_up_at: nextFollowUpAt,
+    metadata: {
+      providerMessageIds,
+      followUps: [
+        ...existingFollowUps,
+        {
+          number: followUpNumber,
+          attemptedAt: sentAt,
+          status: emailResult.status,
+          providerMessageId: emailResult.providerMessageId || '',
+          error: emailResult.error || '',
+        },
+      ],
+    },
+  });
+}
+
+async function processCimFollowUpRequest(storage, request, nowIso) {
+  const lockKey = request?.id || buildCimRequestLockKey(request?.deal_key, request?.recipient_email);
+
+  if (!acquireLock(cimFollowUpLocks, lockKey)) {
+    return { status: 'locked', request };
+  }
+
+  try {
+    const events = await loadCimRequestEvents(storage, request);
+    const replyEvent = findCimReplyEvent(request, events);
+
+    if (replyEvent) {
+      const updatedRequest = await markCimRequestResponded(storage, request, replyEvent);
+      return { status: 'responded', request: updatedRequest };
+    }
+
+    const stopEvent = findCimStopEvent(request, events);
+
+    if (stopEvent) {
+      const updatedRequest = await markCimRequestDeliveryIssue(storage, request, stopEvent);
+      return { status: 'stopped', request: updatedRequest };
+    }
+
+    const settings = getCimFollowUpSettings();
+    const followUpCount = Number(request.follow_up_count || 0);
+
+    if (followUpCount >= settings.maxCount) {
+      const updatedRequest = await storage.upsertDealHunterCimRequest(
+        buildCimRequestStorageUpdate(request, {
+          next_follow_up_at: null,
+        }),
+      );
+      return { status: 'maxed', request: updatedRequest };
+    }
+
+    let claimedRequest = request;
+
+    if (storage.claimDealHunterCimFollowUpRequest) {
+      const claimResult = await storage.claimDealHunterCimFollowUpRequest({
+        id: request.id,
+        dueBefore: nowIso,
+        staleBefore: subtractMinutesIso(nowIso, cimClaimStaleMinutes),
+        nowIso,
+      });
+
+      if (!claimResult?.claimed) {
+        return { status: 'locked', request: claimResult?.request || request };
+      }
+
+      claimedRequest = claimResult.request || request;
+    }
+
+    const followUpNumber = followUpCount + 1;
+    const emailResult = await sendDealHunterCimFollowUpEmail({
+      to: claimedRequest.recipient_email,
+      request: claimedRequest,
+      followUpNumber,
+      requestedBy: claimedRequest.requested_by || '',
+    });
+    const updatedRequest = await storage.upsertDealHunterCimRequest(
+      buildCimFollowUpUpdate(claimedRequest, emailResult, followUpNumber, nowIso),
+    );
+
+    return {
+      status: emailResult.status === 'failed' ? 'failed' : 'sent',
+      request: updatedRequest,
+      emailResult,
+    };
+  } finally {
+    releaseLock(cimFollowUpLocks, lockKey);
+  }
+}
+
 async function buildDailyDealReview({ storage = getStorage() } = {}) {
   const config = getConfig();
   const generatedAt = new Date().toISOString();
@@ -1166,21 +2188,23 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
   const recentDeals = allDeals.filter((deal) => isRecentDeal(deal, config.dealHunter.lookbackDays));
   const candidateDeals = recentDeals.length > 0 ? recentDeals : allDeals;
   const seenDeals = await loadDealHunterHistory(storage);
-  const scoredDeals = attachHistory(candidateDeals.map(scoreDeal), seenDeals, generatedAt);
+  const scoredDealsWithHistory = attachHistory(candidateDeals.map(scoreDeal), seenDeals, generatedAt);
+  const cimRequests = await loadDealHunterCimRequests(
+    storage,
+    scoredDealsWithHistory.map((deal) => deal.dealKey).filter(Boolean),
+  );
+  const scoredDeals = attachCimRequestStatus(scoredDealsWithHistory, cimRequests);
   const newlySeenMatches = scoredDeals
-    .filter((deal) => deal.isNew && !deal.shouldRemove && deal.score >= 55)
+    .filter((deal) => deal.isNew && !deal.shouldRemove && deal.score >= watchlistScoreThreshold)
     .sort(sortBestDeals)
-    .slice(0, 12)
     .map(publicDeal);
   const qualified = scoredDeals
-    .filter((deal) => !deal.shouldRemove && deal.score >= 70)
+    .filter((deal) => !deal.shouldRemove && deal.score >= highFitScoreThreshold)
     .sort(sortNewThenBest)
-    .slice(0, 12)
     .map(publicDeal);
   const watchlist = scoredDeals
-    .filter((deal) => !deal.shouldRemove && deal.score >= 55 && deal.score < 70)
+    .filter((deal) => !deal.shouldRemove && deal.score >= watchlistScoreThreshold && deal.score < highFitScoreThreshold)
     .sort(sortNewThenBest)
-    .slice(0, 10)
     .map(publicDeal);
   const removalCandidates = scoredDeals
     .filter((deal) => deal.shouldRemove)
@@ -1188,7 +2212,6 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
       const dateDifference = (Date.parse(right.dateAdded || right.lastUpdated || '') || 0) - (Date.parse(left.dateAdded || left.lastUpdated || '') || 0);
       return dateDifference || left.score - right.score;
     })
-    .slice(0, 12)
     .map(publicDeal);
 
   const review = {
@@ -1212,6 +2235,7 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
       qualified: qualified.length,
       watchlist: watchlist.length,
       removalCandidates: removalCandidates.length,
+      cimReady: scoredDeals.filter((deal) => deal.cimRequest?.canRequest).length,
     },
     criteriaRecommendations: summarizeCriteria(scoredDeals),
     newlySeenMatches,
@@ -1237,6 +2261,10 @@ export async function sendDailyDealHunterReview() {
   const result = await buildDailyDealReview();
   const { review, scoredDeals, storage } = result;
   const config = getConfig();
+  const crmSync = await syncHighFitDealsToCrm(scoredDeals, storage);
+
+  review.crmSync = crmSync;
+
   const emailResult = await sendDailyDealHunterEmail({
     to: config.dealHunter.recipient || config.delivery.fallbackRecipient,
     review,
@@ -1249,5 +2277,251 @@ export async function sendDailyDealHunterReview() {
   return {
     review,
     emailResult,
+    crmSync,
   };
+}
+
+export async function sendDealHunterCimRequest({ dealKey = '', requestedBy = '', storage = getStorage() } = {}) {
+  const normalizedDealKey = normalizeText(dealKey, 1000);
+
+  if (!normalizedDealKey) {
+    return { ok: false, status: 400, error: 'Deal key is required.' };
+  }
+
+  if (!storage.getDealHunterCimRequest || !storage.upsertDealHunterCimRequest) {
+    return { ok: false, status: 500, error: 'CIM request tracking storage is not configured.' };
+  }
+
+  const result = await buildDailyDealReview({ storage });
+  const deal = result.scoredDeals.find((candidate) => candidate.dealKey === normalizedDealKey);
+
+  if (!deal) {
+    return { ok: false, status: 404, error: 'Deal was not found in the latest Deal Hunter review.' };
+  }
+
+  const recipientEmail = normalizeEmail(deal.brokerEmail);
+  const unavailableReason = getCimRequestUnavailableReason(deal, recipientEmail);
+
+  if (unavailableReason) {
+    return {
+      ok: false,
+      status: 400,
+      error: unavailableReason,
+      deal: publicDeal(attachCimRequestStatus([deal], [])[0]),
+    };
+  }
+
+  const lockKey = buildCimRequestLockKey(deal.dealKey, recipientEmail);
+
+  if (!acquireLock(cimRequestSendLocks, lockKey)) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'A CIM request for this deal is already in progress. Please wait a few minutes before retrying.',
+      deal: publicDeal(attachCimRequestStatus([deal], [])[0]),
+    };
+  }
+
+  try {
+    const existingRequest = await storage.getDealHunterCimRequest({
+      dealKey: deal.dealKey,
+      recipientEmail,
+    });
+
+    if (isCompletedCimStatus(existingRequest?.status)) {
+      return {
+        ok: true,
+        status: 200,
+        alreadySent: true,
+        request: existingRequest,
+        deal: publicDeal(attachCimRequestStatus([deal], [existingRequest])[0]),
+        emailResult: {
+          status: existingRequest.status,
+          error: '',
+          providerMessageId: existingRequest.provider_message_id || '',
+        },
+      };
+    }
+
+    if (isRecentPendingCimRequest(existingRequest)) {
+      return {
+        ok: false,
+        status: 409,
+        error: 'A CIM request for this deal is already in progress. Please wait a few minutes before retrying.',
+        request: existingRequest,
+        deal: publicDeal(attachCimRequestStatus([deal], [existingRequest])[0]),
+      };
+    }
+
+    const pendingRecord = buildCimRequestRecord({
+      deal,
+      recipientEmail,
+      requestedBy,
+      emailResult: { status: 'pending', error: '', providerMessageId: '' },
+      existingRequest,
+    });
+    const claimResult = storage.claimDealHunterCimRequest
+      ? await storage.claimDealHunterCimRequest(pendingRecord, {
+          pendingCutoff: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+        })
+      : null;
+    const pendingRequest = claimResult
+      ? claimResult.request
+      : await storage.upsertDealHunterCimRequest(pendingRecord);
+
+    if (claimResult && !claimResult.claimed) {
+      const currentRequest = pendingRequest || existingRequest;
+
+      if (isCompletedCimStatus(currentRequest?.status)) {
+        return {
+          ok: true,
+          status: 200,
+          alreadySent: true,
+          request: currentRequest,
+          deal: publicDeal(attachCimRequestStatus([deal], [currentRequest])[0]),
+          emailResult: {
+            status: currentRequest.status,
+            error: '',
+            providerMessageId: currentRequest.provider_message_id || '',
+          },
+        };
+      }
+
+      return {
+        ok: false,
+        status: 409,
+        error: 'A CIM request for this deal is already in progress. Please wait a few minutes before retrying.',
+        request: currentRequest,
+        deal: publicDeal(attachCimRequestStatus([deal], currentRequest ? [currentRequest] : [])[0]),
+      };
+    }
+
+    const emailResult = await sendDealHunterCimRequestEmail({
+      to: recipientEmail,
+      deal,
+      requestedBy,
+    });
+    const savedRequest = await storage.upsertDealHunterCimRequest(
+      buildCimRequestRecord({
+        deal,
+        recipientEmail,
+        requestedBy,
+        emailResult,
+        existingRequest: pendingRequest,
+      }),
+    );
+    const publicUpdatedDeal = publicDeal(attachCimRequestStatus([deal], [savedRequest])[0]);
+
+    return {
+      ok: emailResult.status !== 'failed',
+      status: emailResult.status === 'failed' ? 502 : 201,
+      alreadySent: false,
+      request: savedRequest,
+      deal: publicUpdatedDeal,
+      emailResult,
+      error: emailResult.status === 'failed' ? emailResult.error || 'CIM request email failed.' : '',
+    };
+  } finally {
+    releaseLock(cimRequestSendLocks, lockKey);
+  }
+}
+
+export async function runDealHunterCimFollowUps({ storage = getStorage(), limit = 50, now = new Date() } = {}) {
+  if (!storage.listDealHunterCimRequests || !storage.upsertDealHunterCimRequest) {
+    return {
+      ok: false,
+      status: 500,
+      error: 'CIM request tracking storage is not configured.',
+    };
+  }
+
+  const settings = getCimFollowUpSettings();
+
+  if (!settings.enabled) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'CIM follow-ups are disabled. Set DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED=true before running live follow-ups.',
+      reviewed: 0,
+      sent: 0,
+      responded: 0,
+      stopped: 0,
+      failed: 0,
+      skipped: 0,
+      results: [],
+    };
+  }
+
+  if (settings.maxCount <= 0) {
+    return {
+      ok: true,
+      status: 200,
+      reviewed: 0,
+      sent: 0,
+      responded: 0,
+      stopped: 0,
+      failed: 0,
+      skipped: 0,
+      message: 'CIM follow-ups are disabled because max follow-up count is 0.',
+      results: [],
+    };
+  }
+
+  const nowIso = now.toISOString();
+  const requests = await storage.listDealHunterCimRequests({
+    statuses: cimRequestActiveStatuses,
+    dueBefore: nowIso,
+    limit,
+  });
+  const summary = {
+    ok: true,
+    status: 200,
+    reviewed: requests.length,
+    sent: 0,
+    responded: 0,
+    stopped: 0,
+    failed: 0,
+    skipped: 0,
+    results: [],
+  };
+
+  for (const request of requests) {
+    try {
+      const result = await processCimFollowUpRequest(storage, request, nowIso);
+      summary.results.push({
+        id: result.request?.id || request.id,
+        dealKey: request.deal_key,
+        dealName: request.deal_name,
+        recipientEmail: request.recipient_email,
+        status: result.status,
+        followUpCount: result.request?.follow_up_count ?? request.follow_up_count,
+        nextFollowUpAt: result.request?.next_follow_up_at || '',
+        emailResult: result.emailResult || null,
+      });
+
+      if (result.status === 'sent') {
+        summary.sent += 1;
+      } else if (result.status === 'responded') {
+        summary.responded += 1;
+      } else if (result.status === 'stopped') {
+        summary.stopped += 1;
+      } else if (result.status === 'failed') {
+        summary.failed += 1;
+      } else {
+        summary.skipped += 1;
+      }
+    } catch (error) {
+      summary.failed += 1;
+      summary.results.push({
+        id: request.id,
+        dealKey: request.deal_key,
+        dealName: request.deal_name,
+        recipientEmail: request.recipient_email,
+        status: 'failed',
+        error: error.message,
+      });
+    }
+  }
+
+  return summary;
 }

@@ -65,6 +65,8 @@ Admin endpoints:
 
 - `GET /api/admin/deal-hunter/review`
 - `POST /api/admin/deal-hunter/send`
+- `POST /api/admin/deal-hunter/cim-request`
+- `POST /api/admin/deal-hunter/cim-follow-ups/run`
 
 The production Fly machine runs the in-app scheduler once daily at the configured local time. The scheduler records successful Daily Deal Hunter sends in `email_events` and also writes a local send marker under the configured data directory, so a server restart does not resend the same day's email.
 
@@ -77,7 +79,49 @@ Authorization: Bearer DEAL_HUNTER_CRON_SECRET
 
 The scoring profile treats management in place as preferred, not required. It flags food/beverage, hospitality, retail/ecommerce, SaaS/software, marketing, staffing, franchises, delivery routes, FedEx/Amazon route listings, and owner-license medical practices for removal from the next daily update.
 
-The send path records Deal Hunter listing history in `deal_hunter_seen_deals`, so future daily emails can identify newly seen matches instead of repeatedly treating the same source rows as new. Admin-only source reviews show the current new/seen status without marking listings as seen; sending the daily email marks that reviewed batch as seen after delivery succeeds.
+The send path imports every non-removal 75+ Deal Hunter listing into the protected CRM as a `deal-hunter-daily-review` record, including score notes, listing details, broker contact fields, strengths, concerns, questions, and structured metadata. Listing URL duplicate detection prevents the same deal from creating a new CRM card every day. The send path also records Deal Hunter listing history in `deal_hunter_seen_deals`, so future daily emails can identify newly seen matches instead of repeatedly treating the same source rows as new. Admin-only source reviews show the current new/seen status without marking listings as seen; sending the daily email marks that reviewed batch as seen after delivery succeeds.
+
+### CIM Requests And Broker Follow-Ups
+
+Deal Hunter deals scoring 75+ can be approved from the protected admin dashboard with the `Send CIM Request` button. Each request is stored in `deal_hunter_cim_requests`, including the broker email, provider message id, follow-up count, next follow-up date, and response status.
+
+Automatic follow-ups are controlled by:
+
+- `DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED=true`
+- `DEAL_HUNTER_CIM_FOLLOW_UP_DELAYS_HOURS=48,72,168`
+- `DEAL_HUNTER_CIM_FOLLOW_UP_MAX_COUNT=3`
+
+The recommended cadence is three professional touches: first follow-up after 48 hours, second follow-up 72 hours later, and final follow-up 168 hours after that. The follow-up job checks for Resend inbound `email.received` webhook events before sending and stores them internally as replies. Configure the delivery provider webhook with `EMAIL_WEBHOOK_SECRET` or `RESEND_WEBHOOK_SECRET`; without inbound reply webhook events, the app can send due follow-ups but cannot automatically know when a broker responded. The job stops follow-ups on replies, bounces, complaints, failures, or unsubscribes.
+
+## Prospect Discovery And Import
+
+The private admin CRM also includes a Prospect Discovery panel for finding local businesses through Google Places Text Search, saving each result, scoring it, tiering it, and optionally importing it as a CRM record.
+
+Configure:
+
+- `PROSPECT_DISCOVERY_ENABLED=true`
+- `PROSPECT_DISCOVERY_PROVIDER=google-places`
+- `GOOGLE_PLACES_API_KEY`
+- `PROSPECT_DISCOVERY_QUERIES`, separated with `|`, for example `plumbers near New Rochelle NY|HVAC contractors near White Plains NY`
+- `PROSPECT_DISCOVERY_AUTO_IMPORT=true` if discovered businesses should become CRM records automatically
+- `PROSPECT_DISCOVERY_WEBSITE_CHECK_ENABLED=true` to run a lightweight homepage check for obvious conversion gaps
+- `PROSPECT_DISCOVERY_WEBSITE_CHECK_TIMEOUT_MS=8000`
+- `PROSPECT_DISCOVERY_WEBSITE_CHECK_MAX_BYTES=750000` to cap how much homepage HTML is inspected per business
+- `PROSPECT_DISCOVERY_SCHEDULER_ENABLED=true` only after the manual admin run produces useful results
+
+Lead tiers:
+
+- `Tier A`: established local business signals with no dedicated website, a social/listing-only web presence, or a broken/unreachable website.
+- `Tier B`: established business with a website that shows obvious conversion gaps such as missing HTTPS, thin SEO metadata, no contact form, no CTA, slow response, or an unusually large page.
+- `Tier C`: established business with a real web presence that is better suited for ongoing SEO, reviews, tracking, website updates, and automation.
+- `DNP`: do not prioritize. The result is saved for audit history but is not auto-imported into the CRM follow-up queue.
+
+Admin endpoints:
+
+- `GET /api/admin/prospect-discovery`
+- `POST /api/admin/prospect-discovery/run`
+
+The scheduler runs the configured queries on a long-running Node deployment. Keep it disabled on serverless deployments unless an external cron or background worker calls the discovery endpoint intentionally.
 
 ## Delivery Provider Options
 
@@ -89,7 +133,7 @@ Set:
 - `RESEND_API_KEY`
 - `RESEND_FROM_EMAIL`
 - `LEAD_NOTIFICATION_EMAIL`
-- `RESEND_WEBHOOK_SECRET` if you want open/click/bounce tracking in the admin CRM
+- `RESEND_WEBHOOK_SECRET` if you want open/click/bounce/reply tracking in the admin CRM
 
 Resend is the strongest fit if you want:
 
@@ -97,7 +141,7 @@ Resend is the strongest fit if you want:
 - admin magic-link sign-in
 - secure document invite emails
 - upload notifications
-- email open/click/bounce events for follow-up triage
+- email open/click/bounce/reply events for follow-up triage
 
 Configure the Resend webhook URL as:
 

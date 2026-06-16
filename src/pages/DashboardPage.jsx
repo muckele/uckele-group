@@ -9,9 +9,11 @@ import {
   Link2,
   LogOut,
   MailCheck,
+  MapPin,
   Plus,
   RefreshCw,
   Save,
+  Search,
   Send,
   ShieldAlert,
 } from 'lucide-react';
@@ -22,7 +24,7 @@ import Seo from '../components/Seo';
 const statuses = ['new', 'review', 'contacted', 'archived', 'spam'];
 const priorities = ['low', 'normal', 'medium', 'high', 'urgent'];
 const followUpStates = ['needs-response', 'scheduled', 'waiting-on-owner', 'completed'];
-const leadTypes = ['seller', 'broker', 'referral', 'advisor', 'other'];
+const leadTypes = ['prospect', 'seller', 'broker', 'referral', 'advisor', 'other'];
 const sbaOptions = ['unknown', 'yes', 'no'];
 const dailyDealUpdateUrl =
   'https://docs.google.com/spreadsheets/d/1d2mC6oKDY7DFQiaNQnF947Ro5CBwjIcAw_fwya7bpBc/edit?usp=sharing';
@@ -56,6 +58,26 @@ function formatLabel(value) {
     .replace(/\b\w/g, (character) => character.toUpperCase());
 }
 
+function formatLeadTier(value) {
+  if (value === 'tier_a') {
+    return 'Tier A';
+  }
+
+  if (value === 'tier_b') {
+    return 'Tier B';
+  }
+
+  if (value === 'tier_c') {
+    return 'Tier C';
+  }
+
+  if (value === 'dnp') {
+    return 'DNP';
+  }
+
+  return formatLabel(value || 'unclassified');
+}
+
 function formatDateTime(value) {
   if (!value) {
     return 'Not set';
@@ -67,6 +89,26 @@ function formatDateTime(value) {
 
 function pluralize(count, label) {
   return `${count} ${label}${count === 1 ? '' : 's'}`;
+}
+
+function leadTierTone(value) {
+  if (value === 'tier_a') {
+    return 'success';
+  }
+
+  if (value === 'tier_b') {
+    return 'warning';
+  }
+
+  if (value === 'tier_c') {
+    return 'info';
+  }
+
+  if (value === 'dnp') {
+    return 'danger';
+  }
+
+  return 'default';
 }
 
 function emailEngagementTone(engagement) {
@@ -208,8 +250,10 @@ function blankRecordDraft() {
 function StatCard({ icon: Icon, label, value, tone = 'default' }) {
   const tones = {
     default: 'bg-moss/8 text-moss',
+    success: 'bg-moss/10 text-moss',
     warning: 'bg-amber-100 text-amber-700',
     danger: 'bg-red-100 text-red-700',
+    info: 'bg-sky-100 text-sky-700',
   };
 
   return (
@@ -334,7 +378,7 @@ function LinksRow({ submission }) {
   );
 }
 
-function DealHunterCard({ deal, mode = 'fit' }) {
+function DealHunterCard({ deal, mode = 'fit', onSendCimRequest, requestingCim = false }) {
   const detailItems = mode === 'remove' ? deal.removeReasons || deal.concerns || [] : deal.strengths || [];
   const meta = [
     deal.industry,
@@ -343,17 +387,82 @@ function DealHunterCard({ deal, mode = 'fit' }) {
     deal.askingPrice ? `Ask ${formatMoney(deal.askingPrice)}` : '',
     deal.profitMultiple ? `${deal.profitMultiple}x profit` : '',
   ].filter(Boolean);
+  const cimRequest = deal.cimRequest || {};
+  const showCimRequest = mode !== 'remove' && deal.score >= 75;
+  const cimRequestComplete = ['sent', 'logged', 'follow_up_failed', 'delivery_issue', 'follow_up_pending'].includes(cimRequest.status);
+  const cimTone =
+    cimRequest.status === 'failed' || cimRequest.status === 'follow_up_failed' || cimRequest.status === 'delivery_issue'
+      ? 'danger'
+      : cimRequest.status === 'pending' || cimRequest.status === 'follow_up_pending'
+        ? 'warning'
+        : cimRequest.status === 'responded' || cimRequestComplete
+          ? 'success'
+          : 'info';
+  const cimLabel =
+    cimRequest.status === 'responded'
+      ? 'Broker replied'
+      : cimRequest.status === 'delivery_issue'
+        ? 'Delivery issue'
+        : cimRequest.status === 'follow_up_failed'
+          ? 'Follow-up failed'
+          : cimRequest.status === 'follow_up_pending'
+            ? 'Follow-up pending'
+            : cimRequest.status === 'sent'
+              ? 'CIM requested'
+              : cimRequest.status === 'logged'
+                ? 'CIM logged'
+                : cimRequest.status === 'failed'
+                  ? 'CIM failed'
+                  : cimRequest.status === 'pending'
+                    ? 'CIM pending'
+                    : cimRequest.eligible
+                      ? 'CIM ready'
+                      : 'CIM blocked';
+  const followUpSummary =
+    cimRequest.followUpCount > 0
+      ? ` ${cimRequest.followUpCount} follow-up${cimRequest.followUpCount === 1 ? '' : 's'} sent.`
+      : '';
+  const nextFollowUpSummary = cimRequest.nextFollowUpAt ? ` Next follow-up: ${formatDateTime(cimRequest.nextFollowUpAt)}.` : '';
+  const cimDescription =
+    cimRequest.status === 'responded'
+      ? `Reply recorded ${formatDateTime(cimRequest.respondedAt)}.`
+      : cimRequest.status === 'follow_up_pending'
+        ? `A CIM follow-up send is in progress for ${cimRequest.recipientEmail}.${nextFollowUpSummary}`
+        : cimRequestComplete
+          ? `Requested ${formatDateTime(cimRequest.requestedAt)}${cimRequest.recipientEmail ? ` to ${cimRequest.recipientEmail}` : ''}.${followUpSummary}${nextFollowUpSummary}`
+          : cimRequest.eligible
+            ? `Ready to request the CIM from ${cimRequest.recipientEmail}.`
+            : cimRequest.reason || 'No broker or contact email is available for this listing.';
 
   return (
     <div className={`rounded-[24px] border p-5 ${notificationToneClasses(mode === 'remove' ? 'danger' : mode === 'watch' ? 'warning' : 'info')}`}>
       <div className="flex flex-wrap items-center gap-2">
         <Pill tone={dealScoreTone(deal.score)}>Score {deal.score}</Pill>
         {deal.isNew ? <Pill tone="success">New</Pill> : null}
+        {showCimRequest ? <Pill tone={cimTone}>{cimLabel}</Pill> : null}
         <Pill>{deal.sourceName}</Pill>
       </div>
       <h3 className="mt-3 text-lg font-semibold leading-snug">{deal.name}</h3>
       {meta.length > 0 ? <p className="mt-2 text-sm leading-6">{meta.join(' | ')}</p> : null}
       {deal.recommendation ? <p className="mt-3 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-6">{deal.recommendation}</p> : null}
+      {showCimRequest ? (
+        <div className="mt-4 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-6">
+          <p className="font-semibold uppercase tracking-[0.14em]">CIM Request</p>
+          <p className="mt-2">{cimDescription}</p>
+          {cimRequest.deliveryError ? <p className="mt-2 text-red-700">{cimRequest.deliveryError}</p> : null}
+          {cimRequest.canRequest && onSendCimRequest ? (
+            <button
+              className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-full border border-moss bg-moss px-4 py-2.5 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50"
+              disabled={requestingCim}
+              onClick={() => onSendCimRequest(deal)}
+              type="button"
+            >
+              <Send className="h-4 w-4" />
+              {requestingCim ? 'Sending...' : 'Send CIM Request'}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       {detailItems.length > 0 ? (
         <ul className="mt-3 list-disc space-y-1 pl-5 text-sm leading-6">
           {detailItems.slice(0, 3).map((item) => (
@@ -424,7 +533,23 @@ export default function DashboardPage() {
   const [dealHunterReview, setDealHunterReview] = useState(null);
   const [dealHunterLoading, setDealHunterLoading] = useState(false);
   const [dealHunterSending, setDealHunterSending] = useState(false);
+  const [dealHunterFollowUpRunning, setDealHunterFollowUpRunning] = useState(false);
+  const [requestingCimDealKey, setRequestingCimDealKey] = useState('');
   const [dealHunterFeedback, setDealHunterFeedback] = useState({ error: '', message: '' });
+  const [prospectDiscovery, setProspectDiscovery] = useState({
+    config: null,
+    summary: null,
+    runs: [],
+    discoveries: [],
+  });
+  const [prospectDiscoveryForm, setProspectDiscoveryForm] = useState({
+    query: '',
+    maxResults: '10',
+    autoImport: true,
+  });
+  const [prospectDiscoveryLoading, setProspectDiscoveryLoading] = useState(false);
+  const [prospectDiscoveryRunning, setProspectDiscoveryRunning] = useState(false);
+  const [prospectDiscoveryFeedback, setProspectDiscoveryFeedback] = useState({ error: '', message: '' });
   const deferredSearch = useDeferredValue(filters.search);
 
   async function checkSession() {
@@ -519,6 +644,47 @@ export default function DashboardPage() {
     }
   }
 
+  async function loadProspectDiscovery() {
+    setProspectDiscoveryLoading(true);
+
+    try {
+      const response = await fetch('/api/admin/prospect-discovery', {
+        credentials: 'same-origin',
+      });
+
+      if (response.status === 401) {
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '' }));
+        return;
+      }
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to load prospect discovery.');
+      }
+
+      setProspectDiscovery({
+        config: result.config,
+        summary: result.summary,
+        runs: result.runs || [],
+        discoveries: result.discoveries || [],
+      });
+
+      if (!prospectDiscoveryForm.query && result.config?.queries?.[0]) {
+        setProspectDiscoveryForm((current) => ({
+          ...current,
+          query: result.config.queries[0],
+          maxResults: String(result.config.maxResultsPerQuery || 10),
+          autoImport: Boolean(result.config.autoImport),
+        }));
+      }
+    } catch (error) {
+      setProspectDiscoveryFeedback({ error: error.message || 'Unable to load prospect discovery.', message: '' });
+    } finally {
+      setProspectDiscoveryLoading(false);
+    }
+  }
+
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get('admin_token');
 
@@ -533,6 +699,7 @@ export default function DashboardPage() {
   useEffect(() => {
     if (authState.authenticated) {
       loadDashboard(filters.status, deferredSearch.trim());
+      loadProspectDiscovery();
     }
   }, [authState.authenticated, deferredSearch, filters.status]);
 
@@ -776,11 +943,154 @@ export default function DashboardPage() {
       }
 
       setDealHunterReview(result.review);
-      setDealHunterFeedback({ error: '', message: 'Daily deal email sent.' });
+      const crmSync = result.crmSync || result.review?.crmSync;
+      const crmMessage = crmSync?.reviewed
+        ? ` CRM sync: ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped.`
+        : '';
+      setDealHunterFeedback({ error: '', message: `Daily deal email sent.${crmMessage}` });
     } catch (error) {
       setDealHunterFeedback({ error: error.message || 'Unable to send the daily deal email.', message: '' });
     } finally {
       setDealHunterSending(false);
+    }
+  }
+
+  function replaceDealHunterDeal(updatedDeal) {
+    if (!updatedDeal?.dealKey) {
+      return;
+    }
+
+    setDealHunterReview((current) => {
+      if (!current) {
+        return current;
+      }
+
+      const replaceDeals = (deals = []) =>
+        deals.map((deal) => (deal.dealKey === updatedDeal.dealKey ? { ...deal, ...updatedDeal } : deal));
+
+      return {
+        ...current,
+        newlySeenMatches: replaceDeals(current.newlySeenMatches),
+        qualified: replaceDeals(current.qualified),
+        watchlist: replaceDeals(current.watchlist),
+        removalCandidates: replaceDeals(current.removalCandidates),
+      };
+    });
+  }
+
+  async function handleSendCimRequest(deal) {
+    if (!deal?.dealKey) {
+      setDealHunterFeedback({ error: 'Deal key is missing for this listing.', message: '' });
+      return;
+    }
+
+    setRequestingCimDealKey(deal.dealKey);
+    setDealHunterFeedback({ error: '', message: '' });
+
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-request', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ dealKey: deal.dealKey }),
+      });
+      const result = await response.json();
+
+      if (result.deal) {
+        replaceDealHunterDeal(result.deal);
+      }
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.emailResult?.error || result.error || 'Unable to send the CIM request.');
+      }
+
+      const recipient = result.deal?.cimRequest?.recipientEmail || deal.brokerEmail || 'the broker';
+      setDealHunterFeedback({
+        error: '',
+        message: result.alreadySent ? `CIM request was already sent to ${recipient}.` : `CIM request sent to ${recipient}.`,
+      });
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to send the CIM request.', message: '' });
+    } finally {
+      setRequestingCimDealKey('');
+    }
+  }
+
+  async function handleRunCimFollowUps() {
+    setDealHunterFollowUpRunning(true);
+    setDealHunterFeedback({ error: '', message: '' });
+
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-follow-ups/run', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ limit: 50 }),
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to run CIM follow-ups.');
+      }
+
+      const message = `CIM follow-up check complete: ${result.sent || 0} sent, ${result.responded || 0} replied, ${result.stopped || 0} stopped, ${result.failed || 0} failed.`;
+      await handleLoadDealHunterReview();
+      setDealHunterFeedback({ error: '', message });
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to run CIM follow-ups.', message: '' });
+    } finally {
+      setDealHunterFollowUpRunning(false);
+    }
+  }
+
+  async function handleRunProspectDiscovery(event) {
+    event.preventDefault();
+    setProspectDiscoveryRunning(true);
+    setProspectDiscoveryFeedback({ error: '', message: '' });
+
+    try {
+      const response = await fetch('/api/admin/prospect-discovery/run', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: prospectDiscoveryForm.query,
+          maxResults: Number(prospectDiscoveryForm.maxResults) || undefined,
+          autoImport: prospectDiscoveryForm.autoImport,
+        }),
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to run prospect discovery.');
+      }
+
+      const tierCounts = (result.discoveries || []).reduce(
+        (accumulator, discovery) => ({
+          ...accumulator,
+          [discovery.lead_tier || 'unclassified']: (accumulator[discovery.lead_tier || 'unclassified'] || 0) + 1,
+        }),
+        { tier_a: 0, tier_b: 0, tier_c: 0, dnp: 0 },
+      );
+
+      setProspectDiscoveryFeedback({
+        error: '',
+        message: `Classified ${result.count || 0} businesses: ${tierCounts.tier_a || 0} Tier A, ${tierCounts.tier_b || 0} Tier B, ${tierCounts.tier_c || 0} Tier C, ${tierCounts.dnp || 0} DNP. Imported ${result.importedCount || 0} CRM record${result.importedCount === 1 ? '' : 's'}.`,
+      });
+      await Promise.all([
+        loadProspectDiscovery(),
+        loadDashboard(filters.status, deferredSearch.trim()),
+      ]);
+    } catch (error) {
+      setProspectDiscoveryFeedback({ error: error.message || 'Unable to run prospect discovery.', message: '' });
+    } finally {
+      setProspectDiscoveryRunning(false);
     }
   }
 
@@ -982,6 +1292,153 @@ export default function DashboardPage() {
 
       <section className="section-shell mt-8">
         <Reveal className="panel p-7 sm:p-8">
+          <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <SectionLabel>Prospect Discovery</SectionLabel>
+              <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Find and import local business prospects</h2>
+              <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
+                Search Google Places for target business categories, score operating strength and online presence gaps, then import Tier A/B/C prospects for follow-up.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              <Pill tone={prospectDiscovery.config?.enabled ? 'success' : 'danger'}>
+                {prospectDiscovery.config?.enabled ? 'Enabled' : 'Disabled'}
+              </Pill>
+              <Pill tone={prospectDiscovery.config?.hasGooglePlacesApiKey ? 'success' : 'warning'}>
+                {prospectDiscovery.config?.provider || 'google-places'}
+              </Pill>
+              <Pill tone={prospectDiscovery.config?.autoImport ? 'warning' : 'default'}>
+                {prospectDiscovery.config?.autoImport ? 'Auto Import' : 'Review Only'}
+              </Pill>
+              <Pill tone={prospectDiscovery.config?.websiteCheckEnabled ? 'success' : 'default'}>
+                {prospectDiscovery.config?.websiteCheckEnabled ? 'Website Check' : 'Listing Signals Only'}
+              </Pill>
+            </div>
+          </div>
+
+          <form className="mt-6 grid gap-4 lg:grid-cols-[minmax(0,1fr)_140px_auto]" onSubmit={handleRunProspectDiscovery}>
+            <InputField
+              label="Search query"
+              onChange={(event) => setProspectDiscoveryForm((current) => ({ ...current, query: event.target.value }))}
+              placeholder="Example: plumbers near New Rochelle NY"
+              value={prospectDiscoveryForm.query}
+            />
+            <InputField
+              label="Max results"
+              onChange={(event) => setProspectDiscoveryForm((current) => ({ ...current, maxResults: event.target.value }))}
+              type="number"
+              value={prospectDiscoveryForm.maxResults}
+            />
+            <div className="flex flex-col justify-end gap-3">
+              <label className="flex items-center gap-2 text-sm font-semibold text-ink">
+                <input
+                  checked={prospectDiscoveryForm.autoImport}
+                  className="h-4 w-4 rounded border-line text-moss"
+                  onChange={(event) => setProspectDiscoveryForm((current) => ({ ...current, autoImport: event.target.checked }))}
+                  type="checkbox"
+                />
+                Auto-import
+              </label>
+              <button
+                className={primaryActionButtonClass}
+                disabled={prospectDiscoveryRunning || prospectDiscoveryLoading || !prospectDiscoveryForm.query}
+                type="submit"
+              >
+                <Search className="h-4 w-4" />
+                {prospectDiscoveryRunning ? 'Discovering...' : 'Run Discovery'}
+              </button>
+            </div>
+          </form>
+
+          {!prospectDiscovery.config?.enabled || !prospectDiscovery.config?.hasGooglePlacesApiKey ? (
+            <p className="mt-5 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
+              Configure `PROSPECT_DISCOVERY_ENABLED=true`, `GOOGLE_PLACES_API_KEY`, and `PROSPECT_DISCOVERY_QUERIES` before running live discovery.
+            </p>
+          ) : null}
+
+          {prospectDiscoveryFeedback.error ? (
+            <p className="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{prospectDiscoveryFeedback.error}</p>
+          ) : null}
+          {prospectDiscoveryFeedback.message ? (
+            <p className="mt-5 rounded-2xl border border-moss/20 bg-moss/8 px-4 py-3 text-sm font-medium text-moss">{prospectDiscoveryFeedback.message}</p>
+          ) : null}
+
+          <div className="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+            <StatCard icon={MapPin} label="Discovered" value={prospectDiscovery.summary?.total || 0} />
+            <StatCard icon={Plus} label="Tier A" value={prospectDiscovery.summary?.byTier?.tier_a || 0} tone="success" />
+            <StatCard icon={ClipboardList} label="Tier B" value={prospectDiscovery.summary?.byTier?.tier_b || 0} tone="warning" />
+            <StatCard icon={ShieldAlert} label="Tier C" value={prospectDiscovery.summary?.byTier?.tier_c || 0} tone="info" />
+            <StatCard icon={RefreshCw} label="DNP" value={prospectDiscovery.summary?.byTier?.dnp || 0} tone={(prospectDiscovery.summary?.byTier?.dnp || 0) > 0 ? 'danger' : 'default'} />
+          </div>
+
+          <div className="mt-7 grid gap-5 xl:grid-cols-[1.2fr_0.8fr]">
+            <div className="rounded-[24px] border border-line/80 bg-fog/70 p-5">
+              <SectionLabel>Recent Prospects</SectionLabel>
+              {prospectDiscovery.discoveries?.length > 0 ? (
+                <div className="mt-4 space-y-3">
+                  {prospectDiscovery.discoveries.slice(0, 8).map((discovery) => (
+                    <div className="rounded-2xl border border-line/80 bg-white/75 px-4 py-3 text-sm leading-6 text-ink/74" key={discovery.id}>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <p className="font-semibold text-ink">{discovery.business_name}</p>
+                        <Pill tone={leadTierTone(discovery.lead_tier)}>
+                          {formatLeadTier(discovery.lead_tier)}
+                        </Pill>
+                        <Pill tone={discovery.status === 'imported' ? 'success' : discovery.status === 'duplicate' ? 'warning' : discovery.status === 'not-prioritized' ? 'danger' : 'info'}>
+                          {formatLabel(discovery.status)}
+                        </Pill>
+                        <Pill>Score {discovery.score || 0}</Pill>
+                      </div>
+                      <p className="mt-2">
+                        {[discovery.category, discovery.address, discovery.review_count ? `${discovery.review_count} reviews` : ''].filter(Boolean).join(' | ')}
+                      </p>
+                      <p className="mt-2">
+                        Quality {discovery.business_quality_score || 0}/100 | Presence gap {discovery.presence_gap_score || 0}/100
+                      </p>
+                      {discovery.recommended_action ? <p className="mt-2 font-medium text-ink">{discovery.recommended_action}</p> : null}
+                      {discovery.outreach_angle ? <p className="mt-2">{discovery.outreach_angle}</p> : null}
+                      <div className="mt-2 flex flex-wrap gap-3">
+                        {discovery.website_url ? (
+                          <a className="font-semibold text-moss underline" href={discovery.website_url} rel="noreferrer" target="_blank">Website</a>
+                        ) : null}
+                        {discovery.source_data?.googleMapsUri ? (
+                          <a className="font-semibold text-moss underline" href={discovery.source_data.googleMapsUri} rel="noreferrer" target="_blank">Google Maps</a>
+                        ) : null}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="mt-4 text-sm leading-7 text-ink/68">No prospects discovered yet.</p>
+              )}
+            </div>
+
+            <div className="rounded-[24px] border border-line/80 bg-white/70 p-5">
+              <SectionLabel>Recent Runs</SectionLabel>
+              {prospectDiscovery.runs?.length > 0 ? (
+                <div className="mt-4 space-y-3">
+                  {prospectDiscovery.runs.slice(0, 5).map((run) => (
+                    <div className="rounded-2xl border border-line/80 bg-fog/70 px-4 py-3 text-sm leading-6 text-ink/74" key={run.id}>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Pill tone={run.status === 'completed' ? 'success' : run.status === 'failed' ? 'danger' : 'warning'}>{formatLabel(run.status)}</Pill>
+                        <Pill>{run.provider}</Pill>
+                      </div>
+                      <p className="mt-2 font-semibold text-ink">{run.query}</p>
+                      <p className="mt-1">{formatDateTime(run.created_at)} | Imported {run.imported_count || 0}</p>
+                      {run.error ? <p className="mt-2 text-red-700">{run.error}</p> : null}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="mt-4 text-sm leading-7 text-ink/68">No discovery runs yet.</p>
+              )}
+            </div>
+          </div>
+        </Reveal>
+      </section>
+
+      <section className="section-shell mt-8">
+        <Reveal className="panel p-7 sm:p-8">
           <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
             <div>
               <SectionLabel>Deal Hunter Scoring</SectionLabel>
@@ -994,7 +1451,7 @@ export default function DashboardPage() {
             <div className="grid w-full gap-3 sm:flex sm:w-auto sm:flex-wrap">
               <button
                 className={secondaryActionButtonClass}
-                disabled={dealHunterLoading || dealHunterSending}
+                disabled={dealHunterLoading || dealHunterSending || dealHunterFollowUpRunning}
                 onClick={handleLoadDealHunterReview}
                 type="button"
               >
@@ -1002,8 +1459,17 @@ export default function DashboardPage() {
                 {dealHunterLoading ? 'Reviewing...' : 'Review Sources'}
               </button>
               <button
+                className={secondaryActionButtonClass}
+                disabled={dealHunterLoading || dealHunterSending || dealHunterFollowUpRunning}
+                onClick={handleRunCimFollowUps}
+                type="button"
+              >
+                <MailCheck className={`h-4 w-4 ${dealHunterFollowUpRunning ? 'animate-pulse' : ''}`} />
+                {dealHunterFollowUpRunning ? 'Checking...' : 'Run CIM Follow-Ups'}
+              </button>
+              <button
                 className={primaryActionButtonClass}
-                disabled={dealHunterLoading || dealHunterSending}
+                disabled={dealHunterLoading || dealHunterSending || dealHunterFollowUpRunning}
                 onClick={handleSendDealHunterEmail}
                 type="button"
               >
@@ -1022,10 +1488,11 @@ export default function DashboardPage() {
 
           {dealHunterReview ? (
             <div className="mt-7 space-y-7">
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
+              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-7">
                 <StatCard icon={ClipboardList} label="Reviewed" value={dealHunterReview.totals?.reviewedDeals || 0} />
                 <StatCard icon={BellRing} label="New Fits" value={dealHunterReview.totals?.newMatches || 0} tone={dealHunterReview.totals?.newMatches > 0 ? 'warning' : 'default'} />
                 <StatCard icon={MailCheck} label="High Fit" value={dealHunterReview.totals?.qualified || 0} tone={dealHunterReview.totals?.qualified > 0 ? 'warning' : 'default'} />
+                <StatCard icon={Send} label="CIM Ready" value={dealHunterReview.totals?.cimReady || 0} tone={dealHunterReview.totals?.cimReady > 0 ? 'warning' : 'default'} />
                 <StatCard icon={Inbox} label="Watchlist" value={dealHunterReview.totals?.watchlist || 0} />
                 <StatCard icon={ShieldAlert} label="Remove" value={dealHunterReview.totals?.removalCandidates || 0} tone={dealHunterReview.totals?.removalCandidates > 0 ? 'danger' : 'default'} />
                 <StatCard icon={CalendarClock} label="Lookback" value={`${dealHunterReview.lookbackDays || 0}d`} />
@@ -1070,7 +1537,12 @@ export default function DashboardPage() {
                   </div>
                   <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
                     {dealHunterReview.newlySeenMatches.slice(0, 6).map((deal) => (
-                      <DealHunterCard deal={deal} key={`new-${deal.sourceName}-${deal.dealKey || deal.id || deal.listingUrl}`} />
+                      <DealHunterCard
+                        deal={deal}
+                        key={`new-${deal.sourceName}-${deal.dealKey || deal.id || deal.listingUrl}`}
+                        onSendCimRequest={handleSendCimRequest}
+                        requestingCim={requestingCimDealKey === deal.dealKey}
+                      />
                     ))}
                   </div>
                 </div>
@@ -1084,7 +1556,12 @@ export default function DashboardPage() {
                   </div>
                   <div className="space-y-4">
                     {(dealHunterReview.qualified || []).slice(0, 4).map((deal) => (
-                      <DealHunterCard deal={deal} key={`qualified-${deal.sourceName}-${deal.id || deal.listingUrl}`} />
+                      <DealHunterCard
+                        deal={deal}
+                        key={`qualified-${deal.sourceName}-${deal.id || deal.listingUrl}`}
+                        onSendCimRequest={handleSendCimRequest}
+                        requestingCim={requestingCimDealKey === deal.dealKey}
+                      />
                     ))}
                     {dealHunterReview.qualified?.length === 0 ? <p className="text-sm leading-7 text-ink/68">No high-fit recent listings found.</p> : null}
                   </div>
@@ -1097,7 +1574,13 @@ export default function DashboardPage() {
                   </div>
                   <div className="space-y-4">
                     {(dealHunterReview.watchlist || []).slice(0, 4).map((deal) => (
-                      <DealHunterCard deal={deal} key={`watch-${deal.sourceName}-${deal.id || deal.listingUrl}`} mode="watch" />
+                      <DealHunterCard
+                        deal={deal}
+                        key={`watch-${deal.sourceName}-${deal.id || deal.listingUrl}`}
+                        mode="watch"
+                        onSendCimRequest={handleSendCimRequest}
+                        requestingCim={requestingCimDealKey === deal.dealKey}
+                      />
                     ))}
                     {dealHunterReview.watchlist?.length === 0 ? <p className="text-sm leading-7 text-ink/68">No watchlist listings found.</p> : null}
                   </div>

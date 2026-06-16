@@ -687,9 +687,9 @@ export async function submitContactLead(body, request) {
   };
 }
 
-export async function createManualSubmission(body, adminUsername = '') {
+export async function createManualSubmission(body, adminUsername = '', options = {}) {
   const config = getConfig();
-  const storage = getStorage();
+  const storage = options.storage || getStorage();
   const now = new Date().toISOString();
   const roleSeed =
     normalizeField(body.role, 80) ||
@@ -793,6 +793,7 @@ export async function createManualSubmission(body, adminUsername = '') {
     next_action_at: normalizeField(body.next_action_at, 80) || workflowDefaults.nextActionAt,
     last_contacted_at: status === 'contacted' ? now : null,
     metadata: {
+      ...(body.metadata && typeof body.metadata === 'object' ? body.metadata : {}),
       manualEntry: true,
       createdBy: adminUsername || 'admin',
     },

@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
-import { sendDailyDealHunterReview } from './dealHunter.js';
+import { runDealHunterCimFollowUps, sendDailyDealHunterReview } from './dealHunter.js';
 
 const dailyEmailSource = 'daily-deal-hunter';
 
@@ -69,6 +69,7 @@ async function writeSentDailyEmailMarker(markerDir, dateKey, result) {
         emailStatus: result.emailResult.status,
         providerMessageId: result.emailResult.providerMessageId || '',
         totals: result.review?.totals || {},
+        crmSync: result.crmSync || result.review?.crmSync || {},
       },
       null,
       2,
@@ -202,6 +203,76 @@ export function startDealHunterDailyEmailScheduler() {
   }
 
   console.log(`[deal-hunter:scheduler] enabled for ${schedule.time} ${schedule.timezone}`);
+  scheduleNext(1000);
+
+  return {
+    stop() {
+      stopped = true;
+
+      if (timer) {
+        clearTimeout(timer);
+      }
+    },
+  };
+}
+
+export function startDealHunterCimFollowUpScheduler() {
+  const config = getConfig();
+  const schedule = config.dealHunter.cimFollowUp;
+
+  if (!schedule.enabled) {
+    console.log('[deal-hunter:cim-follow-up] scheduler disabled');
+    return { stop() {} };
+  }
+
+  let stopped = false;
+  let timer = null;
+  let inFlight = false;
+
+  async function tick() {
+    if (stopped || inFlight) {
+      return;
+    }
+
+    inFlight = true;
+
+    try {
+      const result = await runDealHunterCimFollowUps();
+
+      if (!result.ok) {
+        console.error(`[deal-hunter:cim-follow-up] failed: ${result.error || 'unknown error'}`);
+        return;
+      }
+
+      if (result.reviewed > 0 || result.sent > 0 || result.responded > 0 || result.stopped > 0 || result.failed > 0) {
+        console.log(
+          `[deal-hunter:cim-follow-up] reviewed=${result.reviewed} sent=${result.sent} responded=${result.responded} stopped=${result.stopped} failed=${result.failed}`,
+        );
+      }
+    } catch (error) {
+      console.error(`[deal-hunter:cim-follow-up] crashed: ${error.message}`);
+    } finally {
+      inFlight = false;
+    }
+  }
+
+  function scheduleNext(delayMs = schedule.checkIntervalMs) {
+    timer = setTimeout(async () => {
+      await tick();
+
+      if (!stopped) {
+        scheduleNext();
+      }
+    }, delayMs);
+
+    if (timer.unref) {
+      timer.unref();
+    }
+  }
+
+  console.log(
+    `[deal-hunter:cim-follow-up] enabled every ${Math.round(schedule.checkIntervalMs / 60000)} minute(s), max ${schedule.maxCount} follow-up(s)`,
+  );
   scheduleNext(1000);
 
   return {

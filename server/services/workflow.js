@@ -1,6 +1,6 @@
 import { getConfig } from '../config.js';
 
-export const leadTypes = ['seller', 'broker', 'referral', 'advisor', 'other'];
+export const leadTypes = ['prospect', 'seller', 'broker', 'referral', 'advisor', 'other'];
 export const priorities = ['low', 'normal', 'medium', 'high', 'urgent'];
 export const followUpStates = ['needs-response', 'scheduled', 'waiting-on-owner', 'completed'];
 export const sbaEligibilityOptions = ['yes', 'no', 'unknown'];
@@ -31,6 +31,10 @@ function buildPromptLine({ counterpart, company, status, followUpState, hasPendi
 
 export function normalizeRoleToLeadType(role) {
   const normalized = String(role || '').trim().toLowerCase();
+
+  if (normalized.includes('prospect')) {
+    return 'prospect';
+  }
 
   if (normalized.includes('broker') || normalized.includes('intermediary')) {
     return 'broker';
@@ -70,7 +74,10 @@ export function deriveWorkflowDefaults({ role, source, submittedAt }) {
   const tags = ['inbound', sourceLabel];
   let priority = 'normal';
 
-  if (leadType === 'seller') {
+  if (leadType === 'prospect') {
+    priority = 'medium';
+    tags.push('prospect');
+  } else if (leadType === 'seller') {
     priority = 'high';
     tags.push('seller');
   } else if (leadType === 'broker' || leadType === 'referral') {

@@ -17,7 +17,16 @@ import {
   uploadSecureDocuments,
 } from './services/documentVault.js';
 import { recordEmailEventsFromWebhook } from './services/emailEvents.js';
-import { reviewDailyDeals, sendDailyDealHunterReview } from './services/dealHunter.js';
+import {
+  reviewDailyDeals,
+  runDealHunterCimFollowUps,
+  sendDailyDealHunterReview,
+  sendDealHunterCimRequest,
+} from './services/dealHunter.js';
+import {
+  getProspectDiscoveryDashboard,
+  runProspectDiscovery,
+} from './services/prospectDiscovery.js';
 import {
   createManualSubmission,
   exportDashboardSubmissionsCsv,
@@ -292,6 +301,47 @@ export function createApp() {
   );
 
   app.post(
+    '/api/admin/deal-hunter/cim-request',
+    asyncRoute(async (request, response) => {
+      const session = requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await sendDealHunterCimRequest({
+        dealKey: request.body?.dealKey || '',
+        requestedBy: session.username || 'admin',
+      });
+
+      response.status(result.status || (result.ok ? 200 : 400)).json({
+        success: Boolean(result.ok),
+        ...result,
+      });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-follow-ups/run',
+    asyncRoute(async (request, response) => {
+      if (!requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await runDealHunterCimFollowUps({
+        limit: Number(request.body?.limit) || undefined,
+      });
+
+      response.status(result.status || (result.ok ? 200 : 400)).json({
+        success: Boolean(result.ok),
+        ...result,
+      });
+    }),
+  );
+
+  app.post(
     '/api/deal-hunter/daily-email',
     asyncRoute(async (request, response) => {
       if (!requireDealHunterCron(request, config)) {
@@ -304,6 +354,45 @@ export function createApp() {
         success: result.emailResult.status !== 'failed',
         ...result,
       });
+    }),
+  );
+
+  app.get(
+    '/api/admin/prospect-discovery',
+    asyncRoute(async (request, response) => {
+      if (!requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await getProspectDiscoveryDashboard();
+      response.json({ success: true, ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/prospect-discovery/run',
+    asyncRoute(async (request, response) => {
+      const session = requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await runProspectDiscovery({
+        query: String(request.body.query || ''),
+        maxResults: Number(request.body.maxResults) || undefined,
+        autoImport: request.body.autoImport,
+        requestedBy: session.username,
+      });
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error });
+        return;
+      }
+
+      response.status(201).json({ success: true, ...result });
     }),
   );
 

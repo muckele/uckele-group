@@ -54,6 +54,49 @@ function normalizeDealHunterSeenDealRow(row) {
     : null;
 }
 
+function normalizeDealHunterCimRequestRow(row) {
+  return row
+    ? {
+        ...row,
+        follow_up_count: Number(row.follow_up_count || 0),
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
+function normalizeDealHunterCrmImportRow(row) {
+  return row
+    ? {
+        ...row,
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
+function normalizeProspectDiscoveryRunRow(row) {
+  return row
+    ? {
+        ...row,
+        source_data: parseJsonColumn(row.source_data, {}),
+      }
+    : null;
+}
+
+function normalizeProspectDiscoveryRow(row) {
+  return row
+    ? {
+        ...row,
+        rating: row.rating === null || row.rating === undefined ? null : Number(row.rating),
+        review_count: Number(row.review_count || 0),
+        score: Number(row.score || 0),
+        business_quality_score: Number(row.business_quality_score || 0),
+        presence_gap_score: Number(row.presence_gap_score || 0),
+        reasons: parseJsonColumn(row.reasons, []),
+        source_data: parseJsonColumn(row.source_data, {}),
+      }
+    : null;
+}
+
 function ensureColumn(database, tableName, columnName, definition) {
   const columns = database.prepare(`PRAGMA table_info(${tableName})`).all();
   const hasColumn = columns.some((column) => column.name === columnName);
@@ -87,6 +130,45 @@ function serializeDealHunterSeenDeal(deal) {
   };
 }
 
+function serializeDealHunterCimRequest(request) {
+  return {
+    ...request,
+    recipient_email: String(request.recipient_email || '').trim().toLowerCase(),
+    follow_up_count: Number(request.follow_up_count || 0),
+    last_follow_up_at: request.last_follow_up_at || null,
+    next_follow_up_at: request.next_follow_up_at || null,
+    responded_at: request.responded_at || null,
+    metadata: JSON.stringify(request.metadata || {}),
+  };
+}
+
+function serializeDealHunterCrmImport(record) {
+  return {
+    ...record,
+    metadata: JSON.stringify(record.metadata || {}),
+  };
+}
+
+function serializeProspectDiscoveryRun(run) {
+  return {
+    ...run,
+    source_data: JSON.stringify(run.source_data || {}),
+  };
+}
+
+function serializeProspectDiscovery(discovery) {
+  return {
+    ...discovery,
+    lead_tier: discovery.lead_tier || 'unclassified',
+    business_quality_score: Number(discovery.business_quality_score || 0),
+    presence_gap_score: Number(discovery.presence_gap_score || 0),
+    recommended_action: discovery.recommended_action || '',
+    outreach_angle: discovery.outreach_angle || '',
+    reasons: JSON.stringify(discovery.reasons || []),
+    source_data: JSON.stringify(discovery.source_data || {}),
+  };
+}
+
 function normalizeList(values, maxLength = 5000) {
   return Array.from(
     new Set(
@@ -95,6 +177,80 @@ function normalizeList(values, maxLength = 5000) {
         .filter(Boolean),
     ),
   ).slice(0, maxLength);
+}
+
+const sharedWebsiteDomains = [
+  'facebook.com',
+  'instagram.com',
+  'yelp.com',
+  'yellowpages.com',
+  'angi.com',
+  'homeadvisor.com',
+  'thumbtack.com',
+  'nextdoor.com',
+  'linktr.ee',
+  'business.site',
+  'sites.google.com',
+  'square.site',
+  'wixsite.com',
+];
+
+function isSharedWebsiteDomain(hostname = '') {
+  return sharedWebsiteDomains.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+}
+
+function canonicalWebsiteIdentity(value = '') {
+  const rawValue = String(value || '').trim().toLowerCase();
+
+  if (!rawValue) {
+    return '';
+  }
+
+  const withProtocol = /^[a-z][a-z\d+\-.]*:\/\//i.test(rawValue) ? rawValue : `https://${rawValue}`;
+
+  try {
+    const url = new URL(withProtocol);
+
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      return '';
+    }
+
+    const hostname = url.hostname.replace(/^www\./i, '').toLowerCase();
+    const pathname = url.pathname.replace(/\/+$/, '');
+    return isSharedWebsiteDomain(hostname) && pathname ? `${hostname}${pathname}` : hostname;
+  } catch {
+    return rawValue
+      .replace(/^https?:\/\//, '')
+      .replace(/^www\./, '')
+      .split(/[/?#]/)[0]
+      .replace(/:\d+$/, '');
+  }
+}
+
+function canonicalListingIdentity(value = '') {
+  const rawValue = String(value || '').trim().toLowerCase();
+
+  if (!rawValue) {
+    return '';
+  }
+
+  const withProtocol = /^[a-z][a-z\d+\-.]*:\/\//i.test(rawValue) ? rawValue : `https://${rawValue}`;
+
+  try {
+    const url = new URL(withProtocol);
+
+    if (!['http:', 'https:'].includes(url.protocol)) {
+      return '';
+    }
+
+    const params = Array.from(url.searchParams.entries())
+      .filter(([key]) => !/^utm_/i.test(key) && !['fbclid', 'gclid', 'mc_cid', 'mc_eid'].includes(key.toLowerCase()))
+      .sort(([left], [right]) => left.localeCompare(right));
+    const query = params.length > 0 ? `?${new URLSearchParams(params).toString()}` : '';
+    return `${url.hostname.replace(/^www\./i, '').toLowerCase()}${url.pathname.replace(/\/+$/, '') || '/'}${query}`;
+  } catch {
+    return rawValue.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/#.*$/, '').replace(/[?&]utm_[^&]*/gi, '');
+  }
 }
 
 function placeholders(count) {
@@ -203,6 +359,48 @@ export function createSqliteStorage(config) {
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
+    CREATE TABLE IF NOT EXISTS prospect_discovery_runs (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      status TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      query TEXT NOT NULL,
+      requested_by TEXT,
+      max_results INTEGER NOT NULL DEFAULT 0,
+      imported_count INTEGER NOT NULL DEFAULT 0,
+      skipped_count INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      source_data TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS prospect_discoveries (
+      id TEXT PRIMARY KEY,
+      run_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      source_id TEXT,
+      business_name TEXT NOT NULL,
+      website_url TEXT,
+      phone TEXT,
+      address TEXT,
+      category TEXT,
+      rating REAL,
+      review_count INTEGER NOT NULL DEFAULT 0,
+      search_query TEXT,
+      status TEXT NOT NULL,
+      lead_tier TEXT NOT NULL DEFAULT 'unclassified',
+      business_quality_score INTEGER NOT NULL DEFAULT 0,
+      presence_gap_score INTEGER NOT NULL DEFAULT 0,
+      recommended_action TEXT,
+      outreach_angle TEXT,
+      score INTEGER NOT NULL DEFAULT 0,
+      reasons TEXT NOT NULL DEFAULT '[]',
+      submission_id TEXT,
+      source_data TEXT NOT NULL DEFAULT '{}'
+    );
+
     CREATE TABLE IF NOT EXISTS deal_hunter_seen_deals (
       id TEXT PRIMARY KEY,
       first_seen_at TEXT NOT NULL,
@@ -223,6 +421,41 @@ export function createSqliteStorage(config) {
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
+	    CREATE TABLE IF NOT EXISTS deal_hunter_cim_requests (
+	      id TEXT PRIMARY KEY,
+	      created_at TEXT NOT NULL,
+	      updated_at TEXT NOT NULL,
+      deal_key TEXT NOT NULL,
+      recipient_email TEXT NOT NULL,
+      requested_by TEXT,
+      status TEXT NOT NULL,
+      delivery_error TEXT,
+      provider_message_id TEXT,
+      subject TEXT,
+      deal_name TEXT,
+      source_name TEXT,
+      listing_url TEXT,
+      score INTEGER,
+      follow_up_count INTEGER NOT NULL DEFAULT 0,
+      last_follow_up_at TEXT,
+      next_follow_up_at TEXT,
+      responded_at TEXT,
+	      metadata TEXT NOT NULL DEFAULT '{}'
+	    );
+
+	    CREATE TABLE IF NOT EXISTS deal_hunter_crm_imports (
+	      id TEXT PRIMARY KEY,
+	      created_at TEXT NOT NULL,
+	      updated_at TEXT NOT NULL,
+	      deal_key TEXT NOT NULL,
+	      listing_identity TEXT,
+	      listing_url TEXT,
+	      submission_id TEXT,
+	      status TEXT NOT NULL,
+	      source_name TEXT,
+	      metadata TEXT NOT NULL DEFAULT '{}'
+	    );
+
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_created_at ON contact_submissions(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_status ON contact_submissions(status);
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_email ON contact_submissions(email);
@@ -235,9 +468,18 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_email_events_recipient_email ON email_events(recipient_email, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_email_events_message_id ON email_events(message_id);
     CREATE INDEX IF NOT EXISTS idx_email_events_event_type ON email_events(event_type, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_prospect_discovery_runs_created_at ON prospect_discovery_runs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_prospect_discoveries_run_id ON prospect_discoveries(run_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_prospect_discoveries_status ON prospect_discoveries(status, created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_prospect_discoveries_source ON prospect_discoveries(provider, source_id) WHERE source_id IS NOT NULL AND source_id <> '';
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_last_seen_at ON deal_hunter_seen_deals(last_seen_at DESC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_source_id ON deal_hunter_seen_deals(source_id, last_seen_at DESC);
-  `);
+	    CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_deal_recipient ON deal_hunter_cim_requests(deal_key, recipient_email);
+	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_deal_key ON deal_hunter_cim_requests(deal_key, updated_at DESC);
+	    CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_deal_key ON deal_hunter_crm_imports(deal_key);
+	    CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_listing_identity ON deal_hunter_crm_imports(listing_identity) WHERE listing_identity IS NOT NULL AND listing_identity <> '';
+	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_submission_id ON deal_hunter_crm_imports(submission_id);
+	  `);
 
   ensureColumn(database, 'contact_submissions', 'lead_type', "TEXT NOT NULL DEFAULT 'owner'");
   ensureColumn(database, 'contact_submissions', 'priority', "TEXT NOT NULL DEFAULT 'normal'");
@@ -266,7 +508,21 @@ export function createSqliteStorage(config) {
   ensureColumn(database, 'contact_submissions', 'seller_phone', 'TEXT');
   ensureColumn(database, 'email_events', 'provider_event_id', 'TEXT');
   ensureColumn(database, 'email_events', 'event_key', 'TEXT');
+  ensureColumn(database, 'prospect_discoveries', 'lead_tier', "TEXT NOT NULL DEFAULT 'unclassified'");
+  ensureColumn(database, 'prospect_discoveries', 'business_quality_score', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(database, 'prospect_discoveries', 'presence_gap_score', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(database, 'prospect_discoveries', 'recommended_action', 'TEXT');
+  ensureColumn(database, 'prospect_discoveries', 'outreach_angle', 'TEXT');
   database.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_email_events_event_key ON email_events(event_key)');
+  database.exec('CREATE INDEX IF NOT EXISTS idx_prospect_discoveries_lead_tier ON prospect_discoveries(lead_tier, score DESC)');
+  ensureColumn(database, 'deal_hunter_cim_requests', 'follow_up_count', 'INTEGER NOT NULL DEFAULT 0');
+	  ensureColumn(database, 'deal_hunter_cim_requests', 'last_follow_up_at', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_cim_requests', 'next_follow_up_at', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_cim_requests', 'responded_at', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_crm_imports', 'listing_identity', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_crm_imports', 'listing_url', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_crm_imports', 'submission_id', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_crm_imports', 'source_name', 'TEXT');
 
   const insertSubmissionStatement = database.prepare(`
     INSERT INTO contact_submissions (
@@ -461,6 +717,90 @@ export function createSqliteStorage(config) {
   `);
   const getEmailEventByKeyStatement = database.prepare('SELECT * FROM email_events WHERE event_key = ? LIMIT 1');
 
+  const insertProspectDiscoveryRunStatement = database.prepare(`
+    INSERT INTO prospect_discovery_runs (
+      id,
+      created_at,
+      updated_at,
+      status,
+      provider,
+      query,
+      requested_by,
+      max_results,
+      imported_count,
+      skipped_count,
+      error,
+      source_data
+    ) VALUES (
+      @id,
+      @created_at,
+      @updated_at,
+      @status,
+      @provider,
+      @query,
+      @requested_by,
+      @max_results,
+      @imported_count,
+      @skipped_count,
+      @error,
+      @source_data
+    )
+  `);
+
+  const insertProspectDiscoveryStatement = database.prepare(`
+    INSERT OR IGNORE INTO prospect_discoveries (
+      id,
+      run_id,
+      created_at,
+      updated_at,
+      provider,
+      source_id,
+      business_name,
+      website_url,
+      phone,
+      address,
+      category,
+      rating,
+      review_count,
+      search_query,
+      status,
+      lead_tier,
+      business_quality_score,
+      presence_gap_score,
+      recommended_action,
+      outreach_angle,
+      score,
+      reasons,
+      submission_id,
+      source_data
+    ) VALUES (
+      @id,
+      @run_id,
+      @created_at,
+      @updated_at,
+      @provider,
+      @source_id,
+      @business_name,
+      @website_url,
+      @phone,
+      @address,
+      @category,
+      @rating,
+      @review_count,
+      @search_query,
+      @status,
+      @lead_tier,
+      @business_quality_score,
+      @presence_gap_score,
+      @recommended_action,
+      @outreach_angle,
+      @score,
+      @reasons,
+      @submission_id,
+      @source_data
+    )
+  `);
+
   const upsertDealHunterSeenDealStatement = database.prepare(`
     INSERT INTO deal_hunter_seen_deals (
       id,
@@ -519,6 +859,199 @@ export function createSqliteStorage(config) {
   const upsertDealHunterSeenDealsTransaction = database.transaction((records) => {
     records.forEach((record) => upsertDealHunterSeenDealStatement.run(serializeDealHunterSeenDeal(record)));
   });
+
+  const upsertDealHunterCimRequestStatement = database.prepare(`
+    INSERT INTO deal_hunter_cim_requests (
+      id,
+      created_at,
+      updated_at,
+      deal_key,
+      recipient_email,
+      requested_by,
+      status,
+      delivery_error,
+      provider_message_id,
+      subject,
+      deal_name,
+      source_name,
+      listing_url,
+      score,
+      follow_up_count,
+      last_follow_up_at,
+      next_follow_up_at,
+      responded_at,
+      metadata
+    ) VALUES (
+      @id,
+      @created_at,
+      @updated_at,
+      @deal_key,
+      @recipient_email,
+      @requested_by,
+      @status,
+      @delivery_error,
+      @provider_message_id,
+      @subject,
+      @deal_name,
+      @source_name,
+      @listing_url,
+      @score,
+      @follow_up_count,
+      @last_follow_up_at,
+      @next_follow_up_at,
+      @responded_at,
+      @metadata
+    )
+    ON CONFLICT(deal_key, recipient_email) DO UPDATE SET
+      id = excluded.id,
+      updated_at = excluded.updated_at,
+      requested_by = excluded.requested_by,
+      status = excluded.status,
+      delivery_error = excluded.delivery_error,
+      provider_message_id = excluded.provider_message_id,
+      subject = excluded.subject,
+      deal_name = excluded.deal_name,
+      source_name = excluded.source_name,
+      listing_url = excluded.listing_url,
+      score = excluded.score,
+      follow_up_count = excluded.follow_up_count,
+      last_follow_up_at = excluded.last_follow_up_at,
+      next_follow_up_at = excluded.next_follow_up_at,
+      responded_at = excluded.responded_at,
+      metadata = excluded.metadata
+  `);
+  const insertDealHunterCimRequestStatement = database.prepare(`
+    INSERT INTO deal_hunter_cim_requests (
+      id,
+      created_at,
+      updated_at,
+      deal_key,
+      recipient_email,
+      requested_by,
+      status,
+      delivery_error,
+      provider_message_id,
+      subject,
+      deal_name,
+      source_name,
+      listing_url,
+      score,
+      follow_up_count,
+      last_follow_up_at,
+      next_follow_up_at,
+      responded_at,
+      metadata
+    ) VALUES (
+      @id,
+      @created_at,
+      @updated_at,
+      @deal_key,
+      @recipient_email,
+      @requested_by,
+      @status,
+      @delivery_error,
+      @provider_message_id,
+      @subject,
+      @deal_name,
+      @source_name,
+      @listing_url,
+      @score,
+      @follow_up_count,
+      @last_follow_up_at,
+      @next_follow_up_at,
+      @responded_at,
+      @metadata
+    )
+  `);
+  const claimDealHunterCimRequestStatement = database.prepare(`
+    UPDATE deal_hunter_cim_requests SET
+      id = @id,
+      updated_at = @updated_at,
+      requested_by = @requested_by,
+      status = @status,
+      delivery_error = @delivery_error,
+      provider_message_id = @provider_message_id,
+      subject = @subject,
+      deal_name = @deal_name,
+      source_name = @source_name,
+      listing_url = @listing_url,
+      score = @score,
+      follow_up_count = @follow_up_count,
+      last_follow_up_at = @last_follow_up_at,
+      next_follow_up_at = @next_follow_up_at,
+      responded_at = @responded_at,
+      metadata = @metadata
+    WHERE deal_key = @deal_key
+      AND LOWER(recipient_email) = @recipient_email
+      AND (
+        status = 'failed'
+        OR (status = 'pending' AND @pending_cutoff != '' AND updated_at <= @pending_cutoff)
+      )
+  `);
+	  const claimDealHunterCimFollowUpRequestStatement = database.prepare(`
+	    UPDATE deal_hunter_cim_requests SET
+	      status = 'follow_up_pending',
+	      delivery_error = '',
+      updated_at = @now_iso
+    WHERE id = @id
+      AND next_follow_up_at IS NOT NULL
+      AND next_follow_up_at <= @due_before
+      AND (
+        status IN ('sent', 'logged', 'failed', 'follow_up_failed')
+        OR (status = 'follow_up_pending' AND @stale_before != '' AND updated_at <= @stale_before)
+	      )
+	  `);
+
+	  const insertDealHunterCrmImportStatement = database.prepare(`
+	    INSERT INTO deal_hunter_crm_imports (
+	      id,
+	      created_at,
+	      updated_at,
+	      deal_key,
+	      listing_identity,
+	      listing_url,
+	      submission_id,
+	      status,
+	      source_name,
+	      metadata
+	    ) VALUES (
+	      @id,
+	      @created_at,
+	      @updated_at,
+	      @deal_key,
+	      @listing_identity,
+	      @listing_url,
+	      @submission_id,
+	      @status,
+	      @source_name,
+	      @metadata
+	    )
+	  `);
+	  const claimDealHunterCrmImportStatement = database.prepare(`
+	    UPDATE deal_hunter_crm_imports SET
+	      updated_at = @updated_at,
+	      listing_identity = @listing_identity,
+	      listing_url = @listing_url,
+	      status = @status,
+	      source_name = @source_name,
+	      metadata = @metadata
+	    WHERE id = @id
+	      AND (
+	        status = 'failed'
+	        OR (status = 'pending' AND @pending_cutoff != '' AND updated_at <= @pending_cutoff)
+	      )
+	  `);
+	  const updateDealHunterCrmImportStatement = database.prepare(`
+	    UPDATE deal_hunter_crm_imports SET
+	      updated_at = COALESCE(@updated_at, updated_at),
+	      listing_identity = COALESCE(@listing_identity, listing_identity),
+	      listing_url = COALESCE(@listing_url, listing_url),
+	      submission_id = COALESCE(@submission_id, submission_id),
+	      status = COALESCE(@status, status),
+	      source_name = COALESCE(@source_name, source_name),
+	      metadata = COALESCE(@metadata, metadata)
+	    WHERE id = @id
+	  `);
 
   function updateRecord(tableName, id, values, allowedFields, jsonFields = []) {
     const updates = Object.entries(values).filter(([key]) => allowedFields.includes(key));
@@ -623,6 +1156,82 @@ export function createSqliteStorage(config) {
         .get(normalizedEmail, normalizedEmail, normalizedEmail);
 
       return row ? normalizeSubmissionRow(row) : null;
+    },
+
+    async getSubmissionByBusinessWebsite(websiteUrl) {
+      const normalizedUrl = String(websiteUrl || '').trim().toLowerCase();
+      const websiteIdentity = canonicalWebsiteIdentity(websiteUrl);
+
+      if (!normalizedUrl || !websiteIdentity) {
+        return null;
+      }
+
+      const row = database
+        .prepare(
+          `
+            SELECT * FROM contact_submissions
+            WHERE LOWER(COALESCE(business_website, '')) = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+          `,
+        )
+        .get(normalizedUrl);
+
+      if (row) {
+        return normalizeSubmissionRow(row);
+      }
+
+      const rows = database
+        .prepare(
+          `
+            SELECT * FROM contact_submissions
+            WHERE TRIM(COALESCE(business_website, '')) <> ''
+            ORDER BY created_at DESC
+            LIMIT 10000
+          `,
+        )
+        .all();
+      const matchedRow = rows.find((candidate) => canonicalWebsiteIdentity(candidate.business_website) === websiteIdentity);
+
+      return matchedRow ? normalizeSubmissionRow(matchedRow) : null;
+    },
+
+    async getSubmissionByListingUrl(listingUrl) {
+      const normalizedUrl = String(listingUrl || '').trim().toLowerCase();
+      const listingIdentity = canonicalListingIdentity(listingUrl);
+
+      if (!normalizedUrl || !listingIdentity) {
+        return null;
+      }
+
+      const row = database
+        .prepare(
+          `
+            SELECT * FROM contact_submissions
+            WHERE LOWER(COALESCE(listing_url, '')) = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+          `,
+        )
+        .get(normalizedUrl);
+
+      if (row) {
+        return normalizeSubmissionRow(row);
+      }
+
+      const rows = database
+        .prepare(
+          `
+            SELECT * FROM contact_submissions
+            WHERE TRIM(COALESCE(listing_url, '')) <> ''
+            ORDER BY created_at DESC
+            LIMIT 10000
+          `,
+        )
+        .all();
+      const matchedRow = rows.find((candidate) => canonicalListingIdentity(candidate.listing_url) === listingIdentity);
+
+      return matchedRow ? normalizeSubmissionRow(matchedRow) : null;
     },
 
     async listSubmissions({ limit = 50, page = 1, search = '', status = 'all' } = {}) {
@@ -891,6 +1500,179 @@ export function createSqliteStorage(config) {
         .map(normalizeEmailEventRow);
     },
 
+    async listEmailEventsByMessageIds(messageIds = [], limit = 5000) {
+      const ids = normalizeList(messageIds);
+
+      if (ids.length === 0) {
+        return [];
+      }
+
+      const safeLimit = Math.max(1, Math.min(limit, 10000));
+      return database
+        .prepare(
+          `
+            SELECT * FROM email_events
+            WHERE message_id IN (${placeholders(ids.length)})
+            ORDER BY created_at DESC
+            LIMIT ?
+          `,
+        )
+        .all(...ids, safeLimit)
+        .map(normalizeEmailEventRow);
+    },
+
+    async insertProspectDiscoveryRun(run) {
+      insertProspectDiscoveryRunStatement.run(serializeProspectDiscoveryRun(run));
+      return run;
+    },
+
+    async updateProspectDiscoveryRun(id, values) {
+      updateRecord(
+        'prospect_discovery_runs',
+        id,
+        values,
+        ['updated_at', 'status', 'imported_count', 'skipped_count', 'error', 'source_data'],
+        ['source_data'],
+      );
+
+      const row = database.prepare('SELECT * FROM prospect_discovery_runs WHERE id = ?').get(id);
+      return normalizeProspectDiscoveryRunRow(row);
+    },
+
+    async listProspectDiscoveryRuns({ limit = 20 } = {}) {
+      const safeLimit = Math.max(1, Math.min(limit, 100));
+      return database
+        .prepare(
+          `
+            SELECT * FROM prospect_discovery_runs
+            ORDER BY created_at DESC
+            LIMIT ?
+          `,
+        )
+        .all(safeLimit)
+        .map(normalizeProspectDiscoveryRunRow);
+    },
+
+    async getProspectDiscoveryBySource(provider, sourceId) {
+      const normalizedProvider = String(provider || '').trim();
+      const normalizedSourceId = String(sourceId || '').trim();
+
+      if (!normalizedProvider || !normalizedSourceId) {
+        return null;
+      }
+
+      const row = database
+        .prepare(
+          `
+            SELECT * FROM prospect_discoveries
+            WHERE provider = ? AND source_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+          `,
+        )
+        .get(normalizedProvider, normalizedSourceId);
+
+      return normalizeProspectDiscoveryRow(row);
+    },
+
+    async insertProspectDiscovery(discovery) {
+      const serialized = serializeProspectDiscovery(discovery);
+      const result = insertProspectDiscoveryStatement.run(serialized);
+
+      if (result.changes === 0 && discovery.source_id) {
+        return this.getProspectDiscoveryBySource(discovery.provider, discovery.source_id);
+      }
+
+      return discovery;
+    },
+
+    async updateProspectDiscovery(id, values) {
+      updateRecord(
+        'prospect_discoveries',
+        id,
+        values,
+        [
+          'updated_at',
+          'status',
+          'lead_tier',
+          'business_quality_score',
+          'presence_gap_score',
+          'recommended_action',
+          'outreach_angle',
+          'score',
+          'reasons',
+          'submission_id',
+          'source_data',
+        ],
+        ['reasons', 'source_data'],
+      );
+
+      const row = database.prepare('SELECT * FROM prospect_discoveries WHERE id = ?').get(id);
+      return normalizeProspectDiscoveryRow(row);
+    },
+
+    async listProspectDiscoveries({ runId = '', status = '', limit = 50 } = {}) {
+      const clauses = [];
+      const params = [];
+
+      if (runId) {
+        clauses.push('run_id = ?');
+        params.push(runId);
+      }
+
+      if (status && status !== 'all') {
+        clauses.push('status = ?');
+        params.push(status);
+      }
+
+      const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+      const safeLimit = Math.max(1, Math.min(limit, 500));
+      return database
+        .prepare(
+          `
+            SELECT * FROM prospect_discoveries
+            ${whereClause}
+            ORDER BY created_at DESC
+            LIMIT ?
+          `,
+        )
+        .all(...params, safeLimit)
+        .map(normalizeProspectDiscoveryRow);
+    },
+
+    async getProspectDiscoverySummary() {
+      const rows = database
+        .prepare(
+          `
+            SELECT status, lead_tier, COUNT(*) AS count
+            FROM prospect_discoveries
+            GROUP BY status, lead_tier
+          `,
+        )
+        .all();
+      const summary = {
+        total: 0,
+        imported: 0,
+        discovered: 0,
+        duplicate: 0,
+        'import-error': 0,
+        'not-prioritized': 0,
+        byTier: { tier_a: 0, tier_b: 0, tier_c: 0, dnp: 0, unclassified: 0 },
+      };
+
+      for (const row of rows) {
+        const count = Number(row.count || 0);
+        const status = row.status || 'discovered';
+        const leadTier = row.lead_tier || 'unclassified';
+
+        summary.total += count;
+        summary[status] = (summary[status] || 0) + count;
+        summary.byTier[leadTier] = (summary.byTier[leadTier] || 0) + count;
+      }
+
+      return summary;
+    },
+
 	    async listDealHunterSeenDeals({ limit = 100000 } = {}) {
 	      const safeLimit = Math.max(1, Math.min(limit, 100000));
 
@@ -906,13 +1688,214 @@ export function createSqliteStorage(config) {
 	        .map(normalizeDealHunterSeenDealRow);
 	    },
 
-	    async upsertDealHunterSeenDeals(records = []) {
-	      if (!Array.isArray(records) || records.length === 0) {
-	        return [];
+		    async upsertDealHunterSeenDeals(records = []) {
+		      if (!Array.isArray(records) || records.length === 0) {
+		        return [];
+		      }
+
+		      upsertDealHunterSeenDealsTransaction(records);
+		      return records;
+		    },
+
+	    async getDealHunterCrmImport({ id = '', dealKey = '', listingIdentity = '' } = {}) {
+	      if (!id && !dealKey && !listingIdentity) {
+	        return null;
 	      }
 
-	      upsertDealHunterSeenDealsTransaction(records);
-	      return records;
+	      const row = database
+	        .prepare(
+	          `
+	            SELECT * FROM deal_hunter_crm_imports
+	            WHERE id = ?
+	              OR deal_key = ?
+	              OR (? <> '' AND listing_identity = ?)
+	            ORDER BY updated_at DESC
+	            LIMIT 1
+	          `,
+	        )
+	        .get(id || '', dealKey || '', listingIdentity || '', listingIdentity || '');
+
+	      return normalizeDealHunterCrmImportRow(row);
+	    },
+
+	    async claimDealHunterCrmImport(record = {}, { pendingCutoff = '' } = {}) {
+	      const serializedRecord = serializeDealHunterCrmImport(record);
+
+	      try {
+	        insertDealHunterCrmImportStatement.run(serializedRecord);
+	      } catch (error) {
+	        if (error?.code !== 'SQLITE_CONSTRAINT_UNIQUE' && error?.code !== 'SQLITE_CONSTRAINT_PRIMARYKEY') {
+	          throw error;
+	        }
+
+	        const existingImport = await this.getDealHunterCrmImport({
+	          id: record.id,
+	          dealKey: record.deal_key,
+	          listingIdentity: record.listing_identity,
+	        });
+	        const claimTarget = existingImport
+	          ? { ...serializedRecord, id: existingImport.id, pending_cutoff: pendingCutoff || '' }
+	          : { ...serializedRecord, pending_cutoff: pendingCutoff || '' };
+	        const updateResult = existingImport
+	          ? claimDealHunterCrmImportStatement.run(claimTarget)
+	          : { changes: 0 };
+	        const currentImport = await this.getDealHunterCrmImport({
+	          id: existingImport?.id || record.id,
+	          dealKey: record.deal_key,
+	          listingIdentity: record.listing_identity,
+	        });
+
+	        return {
+	          claimed: updateResult.changes > 0,
+	          importRecord: currentImport,
+	        };
+	      }
+
+	      return {
+	        claimed: true,
+	        importRecord: await this.getDealHunterCrmImport({
+	          id: record.id,
+	          dealKey: record.deal_key,
+	          listingIdentity: record.listing_identity,
+	        }),
+	      };
+	    },
+
+	    async updateDealHunterCrmImport(id, values = {}) {
+	      if (!id) {
+	        return null;
+	      }
+
+	      updateDealHunterCrmImportStatement.run({
+	        id,
+	        updated_at: values.updated_at || null,
+	        listing_identity: values.listing_identity || null,
+	        listing_url: values.listing_url || null,
+	        submission_id: values.submission_id || null,
+	        status: values.status || null,
+	        source_name: values.source_name || null,
+	        metadata: values.metadata ? JSON.stringify(values.metadata) : null,
+	      });
+
+	      return this.getDealHunterCrmImport({ id });
+	    },
+
+    async getDealHunterCimRequest({ dealKey = '', recipientEmail = '' } = {}) {
+      const normalizedEmail = String(recipientEmail || '').trim().toLowerCase();
+
+      if (!dealKey || !normalizedEmail) {
+        return null;
+      }
+
+      const row = database
+        .prepare(
+          `
+            SELECT * FROM deal_hunter_cim_requests
+            WHERE deal_key = ? AND LOWER(recipient_email) = ?
+            ORDER BY updated_at DESC
+            LIMIT 1
+          `,
+        )
+        .get(dealKey, normalizedEmail);
+
+      return normalizeDealHunterCimRequestRow(row);
+    },
+
+    async listDealHunterCimRequests({ dealKeys = [], statuses = [], dueBefore = '', limit = 1000 } = {}) {
+      const keys = normalizeList(dealKeys);
+      const safeStatuses = normalizeList(statuses);
+      const clauses = [];
+      const params = [];
+
+      if (keys.length > 0) {
+        clauses.push(`deal_key IN (${placeholders(keys.length)})`);
+        params.push(...keys);
+      }
+
+      if (safeStatuses.length > 0) {
+        clauses.push(`status IN (${placeholders(safeStatuses.length)})`);
+        params.push(...safeStatuses);
+      }
+
+      if (dueBefore) {
+        clauses.push('next_follow_up_at IS NOT NULL AND next_follow_up_at <= ?');
+        params.push(dueBefore);
+      }
+
+      const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+      const safeLimit = Math.max(1, Math.min(limit, 5000));
+      return database
+        .prepare(
+          `
+            SELECT * FROM deal_hunter_cim_requests
+            ${whereClause}
+            ORDER BY updated_at DESC
+            LIMIT ?
+          `,
+        )
+        .all(...params, safeLimit)
+        .map(normalizeDealHunterCimRequestRow);
+    },
+
+	    async upsertDealHunterCimRequest(request = {}) {
+	      upsertDealHunterCimRequestStatement.run(serializeDealHunterCimRequest(request));
+	      return this.getDealHunterCimRequest({
+	        dealKey: request.deal_key,
+	        recipientEmail: request.recipient_email,
+	      });
+	    },
+
+	    async claimDealHunterCimRequest(request = {}, { pendingCutoff = '' } = {}) {
+	      const serializedRequest = serializeDealHunterCimRequest(request);
+
+	      try {
+	        insertDealHunterCimRequestStatement.run(serializedRequest);
+	      } catch (error) {
+	        if (error?.code !== 'SQLITE_CONSTRAINT_UNIQUE' && error?.code !== 'SQLITE_CONSTRAINT_PRIMARYKEY') {
+	          throw error;
+	        }
+
+	        const updateResult = claimDealHunterCimRequestStatement.run({
+	          ...serializedRequest,
+	          pending_cutoff: pendingCutoff || '',
+	        });
+	        const currentRequest = await this.getDealHunterCimRequest({
+	          dealKey: request.deal_key,
+	          recipientEmail: request.recipient_email,
+	        });
+
+	        return {
+	          claimed: updateResult.changes > 0,
+	          request: currentRequest,
+	        };
+	      }
+
+	      return {
+	        claimed: true,
+	        request: await this.getDealHunterCimRequest({
+	          dealKey: request.deal_key,
+	          recipientEmail: request.recipient_email,
+	        }),
+	      };
+	    },
+
+	    async claimDealHunterCimFollowUpRequest({ id = '', dueBefore = '', staleBefore = '', nowIso = '' } = {}) {
+	      if (!id || !dueBefore || !nowIso) {
+	        return { claimed: false, request: null };
+	      }
+
+	      const updateResult = claimDealHunterCimFollowUpRequestStatement.run({
+	        id,
+	        due_before: dueBefore,
+	        stale_before: staleBefore || '',
+	        now_iso: nowIso,
+	      });
+	      const row = database.prepare('SELECT * FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1').get(id);
+
+	      return {
+	        claimed: updateResult.changes > 0,
+	        request: normalizeDealHunterCimRequestRow(row),
+	      };
 	    },
 	  };
 	}

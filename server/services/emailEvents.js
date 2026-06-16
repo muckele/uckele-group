@@ -15,6 +15,7 @@ const eventAliases = {
   'email.bounced': 'bounced',
   'email.complained': 'complained',
   'email.failed': 'failed',
+  'email.received': 'replied',
   'email.replied': 'replied',
   'email.unsubscribed': 'unsubscribed',
   open: 'opened',
@@ -29,6 +30,7 @@ const eventAliases = {
   'delivery.delayed': 'delayed',
   sent: 'sent',
   failed: 'failed',
+  received: 'replied',
   reply: 'replied',
   replied: 'replied',
   unsubscribe: 'unsubscribed',
@@ -79,7 +81,10 @@ function firstEmail(value) {
     return firstEmail(value.email || value.address || value.value || value.to);
   }
 
-  return normalizeEmail(String(value || '').split(',')[0]);
+  const firstValue = normalizeText(String(value || '').split(',')[0], 500);
+  const angleAddress = firstValue.match(/<([^<>@\s]+@[^<>\s]+)>/);
+  const plainAddress = firstValue.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  return normalizeEmail(angleAddress?.[1] || plainAddress?.[0] || firstValue);
 }
 
 function extractWebhookSecret(request) {
@@ -225,15 +230,20 @@ function buildEventInputFromWebhook(payload) {
   const data = payload?.data || payload || {};
   const tags = extractTags(payload, data);
   const rawType = normalizeText(payload?.type || data?.type || payload?.event || data?.event || payload?.event_type || data?.event_type, 80);
-  const recipientEmail = firstEmail(
+  const eventType = normalizeEmailEventType(rawType);
+  const outboundRecipientEmail = firstEmail(
     data.to || data.recipient || data.recipient_email || data.email || payload?.recipient || payload?.email,
   );
+  const inboundSenderEmail = firstEmail(data.from || data.sender || data.reply_to || data.replyTo || payload?.from);
+  const recipientEmail = rawType === 'email.received' || eventType === 'replied'
+    ? inboundSenderEmail || outboundRecipientEmail
+    : outboundRecipientEmail;
   const clickUrl = normalizeText(data.url || data.link?.url || data.link || data.click_url || data.clicked_url, 1000);
 
   return {
     created_at: data.created_at || data.createdAt || payload?.created_at || payload?.createdAt,
     provider: normalizeText(payload?.provider || data.provider || 'resend', 60),
-    event_type: normalizeEmailEventType(rawType),
+    event_type: eventType,
     message_id: normalizeText(
       data.email_id || data.emailId || data.email?.id || data.message_id || data.messageId || payload?.email_id,
       240,
@@ -248,6 +258,13 @@ function buildEventInputFromWebhook(payload) {
       providerEventId: normalizeText(payload?.id, 240),
       tags,
       clickUrl,
+      from: normalizeText(data.from || payload?.from, 500),
+      fromEmail: inboundSenderEmail,
+      to: data.to || payload?.to || '',
+      toEmail: outboundRecipientEmail,
+      replyTo: normalizeText(data.reply_to || data.replyTo || payload?.reply_to || payload?.replyTo, 500),
+      inboundMessageId: normalizeText(data.message_id || data.messageId, 240),
+      resendEmailId: normalizeText(data.email_id || data.emailId || data.email?.id, 240),
       userAgent: normalizeText(data.user_agent || data.userAgent, 300),
     },
   };

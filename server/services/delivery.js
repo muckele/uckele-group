@@ -14,6 +14,11 @@ function normalizeRecipients(to) {
   return Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
 }
 
+function hasOnlyValidEmailRecipients(to) {
+  const recipients = normalizeRecipients(to).map((recipient) => String(recipient).trim());
+  return recipients.length > 0 && recipients.every((recipient) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient));
+}
+
 function normalizeText(value = '', maxLength = 1000) {
   return String(value || '')
     .replace(/\s+/g, ' ')
@@ -470,17 +475,48 @@ function dealHunterSectionHtml(title, intro, deals, options = {}) {
     return '';
   }
 
+  const sectionLimit = Number.isFinite(options.limit) ? Math.max(1, options.limit) : 8;
+  const visibleDeals = deals.slice(0, sectionLimit);
+  const omittedCount = Math.max(0, deals.length - visibleDeals.length);
+
   return `
     <div style="margin: 26px 0 0;">
       <p style="margin: 0 0 8px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase;">${escapeHtml(title)}</p>
       ${intro ? `<p style="margin: 0 0 12px; color: #33443B; font-size: 15px; line-height: 1.6;">${escapeHtml(intro)}</p>` : ''}
-      ${deals.map((deal) => dealHunterDealHtml(deal, options)).join('')}
+      ${visibleDeals.map((deal) => dealHunterDealHtml(deal, options)).join('')}
+      ${omittedCount > 0 ? `<p style="margin: 12px 0 0; color: #6C756F; font-size: 13px; line-height: 1.5;">Showing top ${visibleDeals.length} of ${deals.length}. Review the protected CRM dashboard for the full scored list.</p>` : ''}
     </div>
   `;
 }
 
+function dealHunterTextSection(title, deals = [], options = {}) {
+  const safeDeals = Array.isArray(deals) ? deals : [];
+  const sectionLimit = Number.isFinite(options.limit) ? Math.max(1, options.limit) : 8;
+  const visibleDeals = safeDeals.slice(0, sectionLimit);
+  const omittedCount = Math.max(0, safeDeals.length - visibleDeals.length);
+  const lines = [
+    `${title}:`,
+    ...visibleDeals.flatMap((deal, index) => [
+      `${index + 1}. ${deal.name} (${deal.score}/100)`,
+      options.showRemoveReasons ? (deal.removeReasons || deal.concerns || []).join('; ') : dealHunterMetaLine(deal),
+      options.showRemoveReasons ? '' : (deal.recommendation || ''),
+      deal.listingUrl || '',
+      '',
+    ]),
+  ];
+
+  if (omittedCount > 0) {
+    lines.push(`Showing top ${visibleDeals.length} of ${safeDeals.length}. Review the protected CRM dashboard for the full scored list.`, '');
+  }
+
+  return lines;
+}
+
 export function buildDailyDealHunterEmail({ to, review = {} } = {}) {
   const generatedLabel = review.generatedAt ? new Date(review.generatedAt).toLocaleString() : new Date().toLocaleString();
+  const crmSync = review.crmSync || {};
+  const emailSectionLimit = 8;
+  const removalSectionLimit = 12;
   const sourceSummary = (review.sources || [])
     .map((source) => `${source.name}: ${source.fetched ? `${source.rowCount || 0} rows` : `failed (${source.error || 'unknown error'})`}`)
     .join('\n');
@@ -490,25 +526,25 @@ export function buildDailyDealHunterEmail({ to, review = {} } = {}) {
       'Newly Seen Fits',
       'These listings were not in the prior Deal Hunter history and deserve the first look today.',
       review.newlySeenMatches || [],
-      { tone: 'success' },
+      { tone: 'success', limit: emailSectionLimit },
     )}
     ${dealHunterSectionHtml(
       'High-Fit Deals',
       'These are the strongest matches for recession-resistant, AI-resistant, long-term small business ownership.',
       review.qualified || [],
-      { tone: 'success' },
+      { tone: 'success', limit: emailSectionLimit },
     )}
     ${dealHunterSectionHtml(
       'Watchlist',
       'These may fit if broker diligence confirms recurring revenue, customer diversity, management depth, and financeable terms.',
       review.watchlist || [],
-      { tone: 'warning' },
+      { tone: 'warning', limit: emailSectionLimit },
     )}
     ${dealHunterSectionHtml(
       'Remove From Next Update',
       'These should be excluded from tomorrow\'s source list because they conflict with the buying strategy or score too poorly.',
       review.removalCandidates || [],
-      { tone: 'danger', showRemoveReasons: true },
+      { tone: 'danger', showRemoveReasons: true, limit: removalSectionLimit },
     )}
     ${
       recommendations.length > 0
@@ -525,57 +561,35 @@ export function buildDailyDealHunterEmail({ to, review = {} } = {}) {
     paragraphs: [
       `Generated ${generatedLabel}. Reviewed ${review.totals?.reviewedDeals || 0} recent deals from ${review.sources?.length || 0} source(s).`,
       'The scoring profile favors essential B2B and field-service companies with recurring or repeat revenue, recession resistance, AI resistance, and financeable acquisition size. Management in place is preferred but not required.',
+      crmSync.reviewed ? `CRM sync checked ${crmSync.reviewed} score-75-plus deal(s): ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped.` : '',
     ],
     bodyHtml,
     details: [
-	      { label: 'High-fit deals', value: String(review.totals?.qualified || 0) },
-	      { label: 'New fit(s)', value: String(review.totals?.newMatches || 0) },
-	      { label: 'Watchlist', value: String(review.totals?.watchlist || 0) },
+      { label: 'High-fit deals', value: String(review.totals?.qualified || 0) },
+      { label: 'New fit(s)', value: String(review.totals?.newMatches || 0) },
+      { label: 'Watchlist', value: String(review.totals?.watchlist || 0) },
       { label: 'Remove flags', value: String(review.totals?.removalCandidates || 0) },
+      crmSync.reviewed ? { label: 'CRM created', value: String(crmSync.created || 0) } : null,
+      crmSync.reviewed ? { label: 'CRM enriched', value: String(crmSync.enriched || 0) } : null,
+      crmSync.reviewed ? { label: 'CRM updated', value: String(crmSync.updated || 0) } : null,
       { label: 'Lookback', value: `${review.lookbackDays || 0} day(s)` },
-    ],
+    ].filter(Boolean),
   });
   const text = [
     'Daily acquisition deal review',
     '',
     `Generated: ${generatedLabel}`,
     `Reviewed deals: ${review.totals?.reviewedDeals || 0}`,
+    crmSync.reviewed ? `CRM sync: ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped, ${crmSync.failed || 0} failed.` : '',
     '',
 	    'Sources:',
 	    sourceSummary || 'No sources configured.',
 	    '',
-	    'Newly seen fits:',
-	    ...(review.newlySeenMatches || []).flatMap((deal, index) => [
-	      `${index + 1}. ${deal.name} (${deal.score}/100)`,
-	      dealHunterMetaLine(deal),
-	      deal.recommendation || '',
-	      deal.listingUrl || '',
-	      '',
-	    ]),
-	    '',
-	    'High-fit deals:',
-    ...(review.qualified || []).flatMap((deal, index) => [
-      `${index + 1}. ${deal.name} (${deal.score}/100)`,
-      dealHunterMetaLine(deal),
-      deal.recommendation || '',
-      deal.listingUrl || '',
-      '',
-    ]),
-    'Watchlist:',
-    ...(review.watchlist || []).flatMap((deal, index) => [
-      `${index + 1}. ${deal.name} (${deal.score}/100)`,
-      dealHunterMetaLine(deal),
-      deal.recommendation || '',
-      deal.listingUrl || '',
-      '',
-    ]),
-    'Remove from next update:',
-    ...(review.removalCandidates || []).flatMap((deal, index) => [
-      `${index + 1}. ${deal.name} (${deal.score}/100)`,
-      (deal.removeReasons || deal.concerns || []).join('; '),
-      deal.listingUrl || '',
-      '',
-    ]),
+		    ...dealHunterTextSection('Newly seen fits', review.newlySeenMatches || [], { limit: emailSectionLimit }),
+		    '',
+		    ...dealHunterTextSection('High-fit deals', review.qualified || [], { limit: emailSectionLimit }),
+	    ...dealHunterTextSection('Watchlist', review.watchlist || [], { limit: emailSectionLimit }),
+	    ...dealHunterTextSection('Remove from next update', review.removalCandidates || [], { limit: removalSectionLimit, showRemoveReasons: true }),
     'Criteria notes:',
     ...recommendations.map((item) => `- ${item}`),
   ].join('\n');
@@ -598,6 +612,234 @@ export function buildDailyDealHunterEmail({ to, review = {} } = {}) {
 
 export async function sendDailyDealHunterEmail(options) {
   return sendMessage(buildDailyDealHunterEmail(options));
+}
+
+export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = '' } = {}) {
+  const config = getConfig();
+  const businessName = normalizeText(deal.name || 'the listed business', 160);
+  const subject = `CIM / NDA request for ${businessName}`;
+  const requester = normalizeText(requestedBy || config.workflow?.defaultAssignee || 'Mathew Uckele', 120);
+  const listingUrl = normalizeUrl(deal.listingUrl || '');
+  const details = [
+    { label: 'Business', value: businessName },
+    deal.industry ? { label: 'Industry', value: deal.industry } : null,
+    deal.location ? { label: 'Location', value: deal.location } : null,
+    deal.annualProfit ? { label: 'Profit', value: formatMoney(deal.annualProfit) } : null,
+    deal.askingPrice ? { label: 'Asking Price', value: formatMoney(deal.askingPrice) } : null,
+    deal.score ? { label: 'Internal Fit Score', value: `${deal.score}/100` } : null,
+  ].filter(Boolean);
+  const paragraphs = [
+    `Hello${deal.brokerName ? ` ${deal.brokerName}` : ''},`,
+    `I am reaching out regarding ${businessName}. I am evaluating long-term acquisition opportunities in durable service businesses, and this listing appears potentially aligned.`,
+    'Could you please send the CIM, teaser, or available financial package? If an NDA is required first, please send it over and I will review it promptly.',
+    'I would also appreciate any available detail on trailing 12-month financials, owner responsibilities, customer concentration, recurring or repeat revenue, and openness to SBA financing or seller financing.',
+    'I will treat all materials confidentially.',
+    'Best,',
+    requester,
+    'Uckele Group',
+  ];
+  const text = [
+    `Hello${deal.brokerName ? ` ${deal.brokerName}` : ''},`,
+    '',
+    `I am reaching out regarding ${businessName}. I am evaluating long-term acquisition opportunities in durable service businesses, and this listing appears potentially aligned.`,
+    '',
+    'Could you please send the CIM, teaser, or available financial package? If an NDA is required first, please send it over and I will review it promptly.',
+    '',
+    'I would also appreciate any available detail on trailing 12-month financials, owner responsibilities, customer concentration, recurring or repeat revenue, and openness to SBA financing or seller financing.',
+    '',
+    'I will treat all materials confidentially.',
+    '',
+    'Deal details:',
+    ...details.map((item) => `- ${item.label}: ${item.value}`),
+    listingUrl ? `- Listing: ${listingUrl}` : '',
+    '',
+    'Best,',
+    requester,
+    'Uckele Group',
+  ]
+    .filter((line) => line !== '')
+    .join('\n');
+  const html = brandedEmailHtml({
+    preheader: `Requesting the CIM or teaser for ${businessName}.`,
+    eyebrow: 'CIM Request',
+    title: subject,
+    paragraphs,
+    details,
+    ctas: listingUrl ? [{ label: 'View Listing', href: listingUrl }] : [],
+  });
+
+  return {
+    kind: 'deal-hunter-cim-request',
+    to,
+    replyTo: config.delivery.resendReplyTo || config.delivery.fallbackRecipient || '',
+    subject,
+    headline: subject,
+    text,
+    html,
+    tags: [
+      { name: 'source', value: 'deal-hunter-cim-request' },
+      { name: 'deal_key', value: normalizeText(deal.dealKey || '', 250) },
+    ],
+    tracking: {
+      source: 'deal-hunter-cim-request',
+      dealKey: deal.dealKey || '',
+      dealName: businessName,
+      score: deal.score || 0,
+      requestedBy,
+    },
+  };
+}
+
+export async function sendDealHunterCimRequestEmail(options) {
+  if (!hasOnlyValidEmailRecipients(options?.to)) {
+    return {
+      status: 'failed',
+      error: 'A valid broker or contact email is required before sending a CIM request.',
+      providerMessageId: '',
+    };
+  }
+
+  return sendMessage(buildDealHunterCimRequestEmail(options));
+}
+
+function buildCimFollowUpCopy({ businessName, followUpNumber }) {
+  if (followUpNumber >= 3) {
+    return {
+      subjectPrefix: 'Final follow-up',
+      preheader: `Final follow-up on the CIM or NDA for ${businessName}.`,
+      paragraphs: [
+        `I wanted to send one final follow-up on my request for the CIM, teaser, or NDA for ${businessName}.`,
+        'If the opportunity is still active and available for review, please send the materials when convenient. If it is no longer available or not a fit for a buyer like me, a quick note would be appreciated so I can close the loop.',
+        'Thank you for your time.',
+      ],
+      textLines: [
+        `I wanted to send one final follow-up on my request for the CIM, teaser, or NDA for ${businessName}.`,
+        '',
+        'If the opportunity is still active and available for review, please send the materials when convenient. If it is no longer available or not a fit for a buyer like me, a quick note would be appreciated so I can close the loop.',
+        '',
+        'Thank you for your time.',
+      ],
+    };
+  }
+
+  if (followUpNumber === 2) {
+    return {
+      subjectPrefix: 'Second follow-up',
+      preheader: `Second follow-up on the CIM or NDA for ${businessName}.`,
+      paragraphs: [
+        `I am following up again on ${businessName}. I remain interested in reviewing the CIM, teaser, or financial package if the opportunity is still available.`,
+        'If an NDA is required, please send it over and I will review it promptly. I am especially focused on recurring or repeat revenue, owner transition requirements, and financing structure.',
+        'Please let me know either way when you have a chance.',
+      ],
+      textLines: [
+        `I am following up again on ${businessName}. I remain interested in reviewing the CIM, teaser, or financial package if the opportunity is still available.`,
+        '',
+        'If an NDA is required, please send it over and I will review it promptly. I am especially focused on recurring or repeat revenue, owner transition requirements, and financing structure.',
+        '',
+        'Please let me know either way when you have a chance.',
+      ],
+    };
+  }
+
+  return {
+    subjectPrefix: 'Following up',
+    preheader: `Following up on the CIM or NDA for ${businessName}.`,
+    paragraphs: [
+      `I wanted to follow up on my request for the CIM, teaser, or NDA for ${businessName}.`,
+      'The listing appears potentially aligned with my acquisition search, and I would appreciate the chance to review the materials if the opportunity is still active.',
+      'Happy to complete an NDA first if that is the next step.',
+    ],
+    textLines: [
+      `I wanted to follow up on my request for the CIM, teaser, or NDA for ${businessName}.`,
+      '',
+      'The listing appears potentially aligned with my acquisition search, and I would appreciate the chance to review the materials if the opportunity is still active.',
+      '',
+      'Happy to complete an NDA first if that is the next step.',
+    ],
+  };
+}
+
+export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumber = 1, requestedBy = '' } = {}) {
+  const config = getConfig();
+  const metadata = request.metadata && typeof request.metadata === 'object' ? request.metadata : {};
+  const businessName = normalizeText(request.deal_name || 'the listed business', 160);
+  const requester = normalizeText(requestedBy || request.requested_by || config.workflow?.defaultAssignee || 'Mathew Uckele', 120);
+  const listingUrl = normalizeUrl(request.listing_url || '');
+  const copy = buildCimFollowUpCopy({ businessName, followUpNumber });
+  const subject = `${copy.subjectPrefix}: CIM / NDA request for ${businessName}`;
+  const details = [
+    { label: 'Business', value: businessName },
+    metadata.industry ? { label: 'Industry', value: metadata.industry } : null,
+    metadata.location ? { label: 'Location', value: metadata.location } : null,
+    request.score ? { label: 'Internal Fit Score', value: `${request.score}/100` } : null,
+    { label: 'Follow-Up', value: `#${followUpNumber}` },
+  ].filter(Boolean);
+  const paragraphs = [
+    'Hello,',
+    ...copy.paragraphs,
+    'Best,',
+    requester,
+    'Uckele Group',
+  ];
+  const text = [
+    'Hello,',
+    '',
+    ...copy.textLines,
+    '',
+    'Deal details:',
+    ...details.map((item) => `- ${item.label}: ${item.value}`),
+    listingUrl ? `- Listing: ${listingUrl}` : '',
+    '',
+    'Best,',
+    requester,
+    'Uckele Group',
+  ]
+    .filter((line) => line !== '')
+    .join('\n');
+  const html = brandedEmailHtml({
+    preheader: copy.preheader,
+    eyebrow: 'CIM Follow-Up',
+    title: subject,
+    paragraphs,
+    details,
+    ctas: listingUrl ? [{ label: 'View Listing', href: listingUrl }] : [],
+  });
+
+  return {
+    kind: 'deal-hunter-cim-follow-up',
+    to,
+    replyTo: config.delivery.resendReplyTo || config.delivery.fallbackRecipient || '',
+    subject,
+    headline: subject,
+    text,
+    html,
+    tags: [
+      { name: 'source', value: 'deal-hunter-cim-follow-up' },
+      { name: 'deal_key', value: normalizeText(request.deal_key || '', 250) },
+      { name: 'cim_request_id', value: normalizeText(request.id || '', 250) },
+      { name: 'follow_up_number', value: String(followUpNumber) },
+    ],
+    tracking: {
+      source: 'deal-hunter-cim-follow-up',
+      dealKey: request.deal_key || '',
+      dealName: businessName,
+      cimRequestId: request.id || '',
+      followUpNumber,
+      requestedBy: requester,
+    },
+  };
+}
+
+export async function sendDealHunterCimFollowUpEmail(options) {
+  if (!hasOnlyValidEmailRecipients(options?.to)) {
+    return {
+      status: 'failed',
+      error: 'A valid broker or contact email is required before sending a CIM follow-up.',
+      providerMessageId: '',
+    };
+  }
+
+  return sendMessage(buildDealHunterCimFollowUpEmail(options));
 }
 
 export async function sendAdminMagicLinkEmail({ to, magicLinkUrl, expiresAt }) {

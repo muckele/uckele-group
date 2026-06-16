@@ -26,6 +26,14 @@ function listFromEnv(value) {
     .filter(Boolean);
 }
 
+function numberListFromEnv(value, fallback = []) {
+  const values = listFromEnv(value)
+    .map((item) => Number(item))
+    .filter((item) => Number.isFinite(item) && item > 0);
+
+  return values.length > 0 ? values : fallback;
+}
+
 let cachedConfig;
 
 export function getConfig() {
@@ -124,6 +132,33 @@ export function getConfig() {
         retryIntervalMs: numberFromEnv(process.env.DEAL_HUNTER_DAILY_EMAIL_RETRY_INTERVAL_MS, 1000 * 60 * 30),
         markerDir: process.env.DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR || path.join(defaultDataDir, 'deal-hunter-daily-email'),
       },
+      cimFollowUp: {
+        enabled: booleanFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED, false),
+        checkIntervalMs: numberFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_CHECK_INTERVAL_MS, 1000 * 60 * 60),
+        firstDelayHours: numberFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_FIRST_DELAY_HOURS, 48),
+        intervalHours: numberFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_INTERVAL_HOURS, 72),
+        maxCount: Math.max(0, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_MAX_COUNT, 3), 10)),
+        delaySequenceHours: numberListFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_DELAYS_HOURS, [48, 72, 168]).slice(0, 10),
+      },
+    },
+    prospectDiscovery: {
+      enabled: booleanFromEnv(process.env.PROSPECT_DISCOVERY_ENABLED, false),
+      schedulerEnabled: booleanFromEnv(process.env.PROSPECT_DISCOVERY_SCHEDULER_ENABLED, false),
+      schedulerIntervalMs: numberFromEnv(process.env.PROSPECT_DISCOVERY_SCHEDULER_INTERVAL_MS, 1000 * 60 * 60 * 24),
+      provider: process.env.PROSPECT_DISCOVERY_PROVIDER || 'google-places',
+      googlePlacesApiKey: process.env.GOOGLE_PLACES_API_KEY || '',
+      queries: (process.env.PROSPECT_DISCOVERY_QUERIES || '')
+        .split('|')
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .slice(0, 20),
+      maxResultsPerQuery: Math.max(1, Math.min(numberFromEnv(process.env.PROSPECT_DISCOVERY_MAX_RESULTS_PER_QUERY, 10), 20)),
+      maxQueriesPerRun: Math.max(1, Math.min(numberFromEnv(process.env.PROSPECT_DISCOVERY_MAX_QUERIES_PER_RUN, 5), 20)),
+      autoImport: booleanFromEnv(process.env.PROSPECT_DISCOVERY_AUTO_IMPORT, true),
+      minimumReviewCount: Math.max(0, numberFromEnv(process.env.PROSPECT_DISCOVERY_MIN_REVIEW_COUNT, 0)),
+      websiteCheckEnabled: booleanFromEnv(process.env.PROSPECT_DISCOVERY_WEBSITE_CHECK_ENABLED, true),
+      websiteCheckTimeoutMs: Math.max(1500, Math.min(numberFromEnv(process.env.PROSPECT_DISCOVERY_WEBSITE_CHECK_TIMEOUT_MS, 8000), 20000)),
+      websiteCheckMaxBytes: Math.max(64 * 1024, Math.min(numberFromEnv(process.env.PROSPECT_DISCOVERY_WEBSITE_CHECK_MAX_BYTES, 750000), 2 * 1024 * 1024)),
     },
     secureDocuments: {
       tokenSecret: process.env.SECURE_DOCUMENTS_TOKEN_SECRET || sessionSecret,
