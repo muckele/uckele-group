@@ -23,7 +23,23 @@ const allowedMimeTypes = new Set([
 ]);
 const maxDocumentsPerUpload = 5;
 const maxDocumentsPerRequest = maxDocumentsPerUpload;
+const staleUploadingRequestMs = 15 * 60 * 1000;
 const secureUploadRateLimitEvents = new Map();
+
+const mimeTypesByExtension = new Map([
+  ['.pdf', 'application/pdf'],
+  ['.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+  ['.xls', 'application/vnd.ms-excel'],
+  ['.csv', 'text/csv'],
+  ['.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+  ['.doc', 'application/msword'],
+  ['.txt', 'text/plain'],
+  ['.png', 'image/png'],
+  ['.jpg', 'image/jpeg'],
+  ['.jpeg', 'image/jpeg'],
+  ['.webp', 'image/webp'],
+  ['.zip', 'application/zip'],
+]);
 
 function sanitizeFileName(fileName) {
   const cleaned = String(fileName || 'document')
@@ -48,6 +64,16 @@ function normalizeDocumentType(value) {
   const normalized = String(value || 'other').trim().toLowerCase();
   const allowed = ['teaser', 'cim', 'financials', 'tax-returns', 'contracts', 'customer-summary', 'other'];
   return allowed.includes(normalized) ? normalized : 'other';
+}
+
+function inferMimeType(document = {}) {
+  const supplied = String(document.mimeType || '').trim().toLowerCase();
+
+  if (supplied && supplied !== 'application/octet-stream') {
+    return supplied;
+  }
+
+  return mimeTypesByExtension.get(path.extname(String(document.name || '')).toLowerCase()) || '';
 }
 
 function normalizeBase64(value = '') {
@@ -130,7 +156,7 @@ function prepareDocumentPayload(document = {}, config) {
   document = document || {};
   const errors = [];
   const decodedBytes = estimateBase64DecodedBytes(document.contentBase64);
-  const mimeType = String(document.mimeType || '').trim().toLowerCase();
+  const mimeType = inferMimeType(document);
   let buffer = null;
 
   if (!document.name || !document.contentBase64) {
@@ -171,6 +197,26 @@ function prepareDocumentPayload(document = {}, config) {
 
 function sumSecureDocumentBytes(documents = []) {
   return documents.reduce((sum, document) => sum + Number(document.size_bytes || 0), 0);
+}
+
+function isStaleUploadingRequest(requestRecord) {
+  if (requestRecord?.status !== 'uploading') {
+    return false;
+  }
+
+  const updatedAt = Date.parse(requestRecord.updated_at || requestRecord.created_at || '');
+  return Number.isFinite(updatedAt) && Date.now() - updatedAt > staleUploadingRequestMs;
+}
+
+async function recoverStaleUploadRequest(storage, requestRecord) {
+  if (!isStaleUploadingRequest(requestRecord)) {
+    return requestRecord;
+  }
+
+  return storage.updateSecureUploadRequest(requestRecord.id, {
+    updated_at: new Date().toISOString(),
+    status: 'awaiting-documents',
+  });
 }
 
 function enforceInMemoryRateLimit(buckets, windowMs, maxAttempts) {
@@ -353,10 +399,14 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
     return context;
   }
 
+  context.request = await recoverStaleUploadRequest(storage, context.request);
+
   if (context.request.status !== 'awaiting-documents') {
     return {
       ok: false,
-      error: 'Documents have already been received for this request. Please ask for a new secure upload link before sending more files.',
+      error: context.request.status === 'uploading'
+        ? 'Documents are already being uploaded for this request. Please wait a few minutes before trying again.'
+        : 'Documents have already been received for this request. Please ask for a new secure upload link before sending more files.',
     };
   }
 
@@ -405,6 +455,8 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
         updated_at: uploadStartedAt,
         status: 'uploading',
         nda_accepted_at: context.request.nda_accepted_at || uploadStartedAt,
+      }, {
+        staleBefore: new Date(Date.now() - staleUploadingRequestMs).toISOString(),
       })
     : await storage.updateSecureUploadRequest(context.request.id, {
         updated_at: uploadStartedAt,
@@ -419,37 +471,48 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
     };
   }
 
-  const requestDirectory = path.join(config.secureDocuments.storageDir, context.request.id);
-  await fs.mkdir(requestDirectory, { recursive: true });
-
   const savedDocuments = [];
 
-  for (const preparedDocument of preparedDocuments) {
-    const { document, buffer, mimeType } = preparedDocument;
-    const documentId = randomUUID();
-    const safeOriginalName = sanitizeFileName(document.name);
-    const safeStoredName = `${documentId}-${safeOriginalName}`;
-    const storagePath = path.join(requestDirectory, safeStoredName);
-    await fs.writeFile(storagePath, buffer);
+  try {
+    const requestDirectory = path.join(config.secureDocuments.storageDir, context.request.id);
+    await fs.mkdir(requestDirectory, { recursive: true });
 
-    const record = {
-      id: documentId,
-      request_id: context.request.id,
-      submission_id: context.submission.id,
-      created_at: new Date().toISOString(),
-      document_type: normalizeDocumentType(document.documentType),
-      file_name: safeStoredName,
-      original_name: safeOriginalName,
-      mime_type: mimeType,
-      size_bytes: buffer.byteLength,
-      storage_path: storagePath,
-      uploaded_by_email: claimedRequest.email,
-      note: String(note || '').trim(),
-      nda_accepted_at: new Date().toISOString(),
-    };
+    for (const preparedDocument of preparedDocuments) {
+      const { document, buffer, mimeType } = preparedDocument;
+      const documentId = randomUUID();
+      const safeOriginalName = sanitizeFileName(document.name);
+      const safeStoredName = `${documentId}-${safeOriginalName}`;
+      const storagePath = path.join(requestDirectory, safeStoredName);
+      await fs.writeFile(storagePath, buffer);
 
-    await storage.insertSecureDocument(record);
-    savedDocuments.push(record);
+      const record = {
+        id: documentId,
+        request_id: context.request.id,
+        submission_id: context.submission.id,
+        created_at: new Date().toISOString(),
+        document_type: normalizeDocumentType(document.documentType),
+        file_name: safeStoredName,
+        original_name: safeOriginalName,
+        mime_type: mimeType,
+        size_bytes: buffer.byteLength,
+        storage_path: storagePath,
+        uploaded_by_email: claimedRequest.email,
+        note: String(note || '').trim(),
+        nda_accepted_at: new Date().toISOString(),
+      };
+
+      await storage.insertSecureDocument(record);
+      savedDocuments.push(record);
+    }
+  } catch (error) {
+    if (savedDocuments.length === 0) {
+      await storage.updateSecureUploadRequest(context.request.id, {
+        updated_at: new Date().toISOString(),
+        status: 'awaiting-documents',
+      }).catch(() => {});
+    }
+
+    throw error;
   }
 
   const updatedRequest = await storage.updateSecureUploadRequest(context.request.id, {

@@ -1360,7 +1360,7 @@ export function createSqliteStorage(config) {
       return this.getSecureUploadRequest(id);
     },
 
-    async claimSecureUploadRequest(id, values) {
+    async claimSecureUploadRequest(id, values, options = {}) {
       const updates = Object.entries(serializeUploadRequestValues(values)).filter(([key]) =>
         ['updated_at', 'status', 'nda_accepted_at', 'last_uploaded_at', 'note'].includes(key),
       );
@@ -1376,8 +1376,18 @@ export function createSqliteStorage(config) {
       }, {});
 
       payload.id = id;
+      payload.stale_before = options.staleBefore || '';
       const result = database
-        .prepare(`UPDATE secure_upload_requests SET ${fields} WHERE id = @id AND status = 'awaiting-documents'`)
+        .prepare(
+          `
+            UPDATE secure_upload_requests SET ${fields}
+            WHERE id = @id
+              AND (
+                status = 'awaiting-documents'
+                OR (status = 'uploading' AND @stale_before != '' AND updated_at <= @stale_before)
+              )
+          `,
+        )
         .run(payload);
 
       return result.changes > 0 ? this.getSecureUploadRequest(id) : null;

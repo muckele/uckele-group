@@ -79,7 +79,7 @@ test('secure upload request claims are atomic', async () => {
   assert.equal(secondClaim, null);
 });
 
-test('secure upload requires verified file type metadata', async () => {
+test('secure upload rejects files without a recognizable type', async () => {
   const { token } = await createUploadToken('mime-test@example.com');
   const result = await uploadSecureDocuments({
     token,
@@ -87,7 +87,7 @@ test('secure upload requires verified file type metadata', async () => {
     request: requestFromIp('192.0.2.20'),
     documents: [
       {
-        name: 'financials.txt',
+        name: 'financials.unknown',
         contentBase64: Buffer.from('Plain text financials').toString('base64'),
       },
     ],
@@ -95,6 +95,56 @@ test('secure upload requires verified file type metadata', async () => {
 
   assert.equal(result.ok, false);
   assert.match(result.error, /file type/i);
+});
+
+test('secure upload infers allowed MIME type when browsers send octet-stream', async () => {
+  const storage = getStorage();
+  const { request, token } = await createUploadToken('octet-stream-test@example.com');
+  const result = await uploadSecureDocuments({
+    token,
+    ndaAccepted: true,
+    request: requestFromIp('192.0.2.40'),
+    documents: [
+      {
+        name: 'financials.csv',
+        mimeType: 'application/octet-stream',
+        contentBase64: Buffer.from('year,revenue,profit\n2025,1800000,450000\n').toString('base64'),
+      },
+    ],
+  });
+  const documents = await storage.listSecureDocumentsByRequest(request.id);
+
+  assert.equal(result.ok, true);
+  assert.equal(documents.length, 1);
+  assert.equal(documents[0].mime_type, 'text/csv');
+});
+
+test('secure upload recovers stale uploading requests before accepting files', async () => {
+  const storage = getStorage();
+  const { request, token } = await createUploadToken('stale-upload-test@example.com');
+  const staleTimestamp = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+
+  await storage.updateSecureUploadRequest(request.id, {
+    updated_at: staleTimestamp,
+    status: 'uploading',
+  });
+
+  const result = await uploadSecureDocuments({
+    token,
+    ndaAccepted: true,
+    request: requestFromIp('192.0.2.50'),
+    documents: [
+      {
+        name: 'financials.txt',
+        mimeType: '',
+        contentBase64: Buffer.from('Plain text financials').toString('base64'),
+      },
+    ],
+  });
+  const updatedRequest = await storage.getSecureUploadRequest(request.id);
+
+  assert.equal(result.ok, true);
+  assert.equal(updatedRequest.status, 'documents-received');
 });
 
 test('secure upload attempts are rate limited by token and source', async () => {

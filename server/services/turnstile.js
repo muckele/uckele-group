@@ -19,17 +19,27 @@ export async function verifyTurnstileToken(token, remoteIp) {
     };
   }
 
-  const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    body: new URLSearchParams({
-      secret: config.turnstile.secretKey,
-      response: token,
-      remoteip: remoteIp,
-    }),
-  });
+  let response;
+
+  try {
+    response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        secret: config.turnstile.secretKey,
+        response: token,
+        remoteip: remoteIp,
+      }),
+    });
+  } catch {
+    return {
+      enabled: true,
+      success: false,
+      error: 'Anti-spam verification could not be validated.',
+    };
+  }
 
   if (!response.ok) {
     return {
@@ -39,11 +49,11 @@ export async function verifyTurnstileToken(token, remoteIp) {
     };
   }
 
-  const result = await response.json();
+  const result = await response.json().catch(() => null);
 
   return {
     enabled: true,
-    success: Boolean(result.success),
-    error: result.success ? '' : 'Anti-spam verification failed. Please try again.',
+    success: Boolean(result?.success),
+    error: result?.success ? '' : 'Anti-spam verification failed. Please try again.',
   };
 }

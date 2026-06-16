@@ -574,8 +574,8 @@ export function createSupabaseStorage(config) {
       return normalizeUploadRequestRow(data);
     },
 
-    async claimSecureUploadRequest(id, values) {
-      const { data, error } = await client
+    async claimSecureUploadRequest(id, values, options = {}) {
+      const activeClaim = await client
         .from('secure_upload_requests')
         .update(values)
         .eq('id', id)
@@ -583,11 +583,32 @@ export function createSupabaseStorage(config) {
         .select()
         .maybeSingle();
 
-      if (error) {
-        throw error;
+      if (activeClaim.error) {
+        throw activeClaim.error;
       }
 
-      return normalizeUploadRequestRow(data);
+      if (activeClaim.data) {
+        return normalizeUploadRequestRow(activeClaim.data);
+      }
+
+      if (!options.staleBefore) {
+        return null;
+      }
+
+      const staleClaim = await client
+        .from('secure_upload_requests')
+        .update(values)
+        .eq('id', id)
+        .eq('status', 'uploading')
+        .lte('updated_at', options.staleBefore)
+        .select()
+        .maybeSingle();
+
+      if (staleClaim.error) {
+        throw staleClaim.error;
+      }
+
+      return normalizeUploadRequestRow(staleClaim.data);
     },
 
     async getSecureUploadRequest(id) {

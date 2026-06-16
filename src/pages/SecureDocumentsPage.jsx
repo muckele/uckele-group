@@ -4,6 +4,21 @@ import PageHero from '../components/PageHero';
 import Reveal from '../components/Reveal';
 import Seo from '../components/Seo';
 
+const acceptedDocumentTypes = [
+  '.pdf',
+  '.xlsx',
+  '.xls',
+  '.csv',
+  '.docx',
+  '.doc',
+  '.txt',
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.webp',
+  '.zip',
+].join(',');
+
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -12,7 +27,7 @@ function fileToBase64(file) {
       const base64 = result.includes(',') ? result.split(',')[1] : result;
       resolve({
         name: file.name,
-        mimeType: file.type || 'application/octet-stream',
+        mimeType: file.type || '',
         sizeBytes: file.size,
         contentBase64: base64,
       });
@@ -221,6 +236,7 @@ export default function SecureDocumentsPage() {
                 <label className="flex flex-col gap-2 text-sm font-medium text-ink">
                   Files
                   <input
+                    accept={acceptedDocumentTypes}
                     className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink"
                     multiple
                     onChange={(event) => setFiles(Array.from(event.target.files || []))}

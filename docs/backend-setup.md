@@ -61,7 +61,7 @@ Optional Airtable API mode:
 - `DEAL_HUNTER_AIRTABLE_TABLE_ID`
 - `DEAL_HUNTER_AIRTABLE_VIEW_ID`
 
-Use Airtable API mode for the larger business list in production. The unauthenticated shared-view payload is guarded by `DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES`; if Airtable returns an oversized JSON payload, the source is marked failed instead of crashing the daily email job.
+Use Airtable API mode for the larger business list in production. The unauthenticated shared-view payload is guarded by `DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES`; if Airtable returns an oversized JSON payload, the source is marked failed instead of crashing the daily email job. Google Sheet CSV imports are similarly capped by `DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES` and `DEAL_HUNTER_MAX_SOURCE_RECORDS` before records are normalized.
 
 Admin endpoints:
 

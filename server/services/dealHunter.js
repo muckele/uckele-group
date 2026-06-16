@@ -950,20 +950,34 @@ async function fetchJson(url, { headers = {}, timeoutMs = defaultTimeoutMs, maxB
   return JSON.parse(text);
 }
 
-async function fetchSheetCsvDeals(url, sourceIndex) {
-  const csv = await fetchText(url);
-  const rows = parseCsvRows(csv);
+export function parseSheetCsvDeals(csv, sourceIndex = 0, maxRecords = Infinity) {
+  const safeMaxRecords = Number.isFinite(maxRecords) ? Math.max(0, maxRecords) : Infinity;
+  const rows = parseCsvRows(csv).slice(0, safeMaxRecords);
 
   return {
     source: {
       id: `sheet-${sourceIndex}`,
       name: sourceIndex === 0 ? 'SMB Deal Hunter Google Sheet' : `Google Sheet ${sourceIndex + 1}`,
       mode: 'csv',
-      url,
       fetched: true,
       rowCount: rows.length,
     },
     deals: rows.map((row, index) => normalizeDealRecord(row, { id: `sheet-${sourceIndex}`, name: 'SMB Deal Hunter Google Sheet', mode: 'csv', rowId: String(index + 1) })),
+  };
+}
+
+async function fetchSheetCsvDeals(url, sourceIndex, config) {
+  const csv = await fetchText(url, {
+    maxBytes: config.dealHunter.sheetCsvMaxPayloadBytes,
+  });
+  const result = parseSheetCsvDeals(csv, sourceIndex, config.dealHunter.maxSourceRecords);
+
+  return {
+    ...result,
+    source: {
+      ...result.source,
+      url,
+    },
   };
 }
 
@@ -1131,7 +1145,7 @@ async function collectSources(config) {
 
   for (const [index, url] of config.dealHunter.sheetCsvUrls.entries()) {
     try {
-      sourceResults.push(await fetchSheetCsvDeals(url, index));
+      sourceResults.push(await fetchSheetCsvDeals(url, index, config));
     } catch (error) {
       sourceResults.push({
         source: {

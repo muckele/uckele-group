@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { eventMatchesCimRequest, scoreDeal } from '../server/services/dealHunter.js';
+import { eventMatchesCimRequest, parseSheetCsvDeals, scoreDeal } from '../server/services/dealHunter.js';
 
 function baseDeal(overrides = {}) {
   const fullText = [
@@ -121,4 +121,19 @@ test('CIM response matching ignores unrelated replies from the same broker', () 
 
   assert.equal(eventMatchesCimRequest(unrelatedReply, request), false);
   assert.equal(eventMatchesCimRequest(trackedReply, request), true);
+});
+
+test('Google Sheet CSV parsing caps rows before normalizing source deals', () => {
+  const csv = [
+    'Business Name,Industry,Location,Profit,Asking Price',
+    'Commercial HVAC Maintenance Co,Commercial HVAC maintenance,"San Diego, CA","$450,000","$1,400,000"',
+    'Commercial Plumbing Service,Commercial plumbing,"Los Angeles, CA","$420,000","$1,350,000"',
+    'Fire Safety Inspection Co,Life safety,"New York, NY","$390,000","$1,250,000"',
+  ].join('\n');
+  const result = parseSheetCsvDeals(csv, 0, 2);
+
+  assert.equal(result.source.rowCount, 2);
+  assert.equal(result.deals.length, 2);
+  assert.equal(result.deals[0].name, 'Commercial HVAC Maintenance Co');
+  assert.equal(result.deals[1].name, 'Commercial Plumbing Service');
 });
