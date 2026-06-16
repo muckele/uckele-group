@@ -781,7 +781,6 @@ export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumb
     { label: 'Business', value: businessName },
     metadata.industry ? { label: 'Industry', value: metadata.industry } : null,
     metadata.location ? { label: 'Location', value: metadata.location } : null,
-    { label: 'Follow-Up', value: `#${followUpNumber}` },
   ].filter(Boolean);
   const paragraphs = [
     'Hello,',

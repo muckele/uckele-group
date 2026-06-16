@@ -55,6 +55,7 @@ test('CIM request email keeps internal score and deal economics out of broker-vi
   assert.match(message.subject, /CIM \/ NDA request/);
   assert.match(message.text, /Could you please send over the CIM or teaser, or let me know the NDA process\?/);
   assert.match(message.html, /View Listing/);
+  assert.equal(brokerVisibleContent(message).includes('Follow-Up'), false);
   assertBrokerEmailHidesInternalDetails(message);
 });
 
@@ -81,7 +82,12 @@ test('CIM follow-up emails keep internal score and deal economics out of broker-
 
     assert.equal(message.kind, 'deal-hunter-cim-follow-up');
     assert.match(message.subject, /CIM \/ NDA request/);
-    assert.match(message.text, new RegExp(`Follow-Up: #${followUpNumber}`));
+    assert.equal(message.tracking.followUpNumber, followUpNumber);
+    assert.equal(message.tags.some((tag) => tag.name === 'follow_up_number' && tag.value === String(followUpNumber)), true);
+    assert.equal(brokerVisibleContent(message).includes(`Follow-Up: #${followUpNumber}`), false);
+    assert.equal(message.text.includes(`#${followUpNumber}`), false);
+    assert.equal(message.html.includes('>Follow-Up</td>'), false);
+    assert.equal(message.html.includes(`>#${followUpNumber}</td>`), false);
     assertBrokerEmailHidesInternalDetails(message);
   }
 });
