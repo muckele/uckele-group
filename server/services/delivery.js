@@ -93,7 +93,17 @@ function ctaHtml(ctas = []) {
   `;
 }
 
-function brandedEmailHtml({ preheader = '', eyebrow = '', title, paragraphs = [], bodyHtml = '', details = [], ctas = [], footerNote = '' }) {
+function brandedEmailHtml({
+  preheader = '',
+  eyebrow = '',
+  title,
+  showTitle = true,
+  paragraphs = [],
+  bodyHtml = '',
+  details = [],
+  ctas = [],
+  footerNote = '',
+}) {
   const config = getConfig();
   const websiteUrl = normalizeUrl(config.brand.websiteUrl || config.server.origin);
   const mailingAddress = normalizeText(config.brand.mailingAddress, 260);
@@ -137,7 +147,7 @@ function brandedEmailHtml({ preheader = '', eyebrow = '', title, paragraphs = []
                 <tr>
                   <td style="border: 1px solid #E3D9CA; border-radius: 18px; background: #FFFFFF; padding: 34px;">
                     ${eyebrow ? `<p style="margin: 0 0 12px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .16em; text-transform: uppercase;">${escapeHtml(eyebrow)}</p>` : ''}
-                    <h1 style="margin: 0 0 18px; color: #18211D; font-size: 28px; line-height: 1.22;">${escapeHtml(title)}</h1>
+                    ${showTitle && title ? `<h1 style="margin: 0 0 18px; color: #18211D; font-size: 28px; line-height: 1.22;">${escapeHtml(title)}</h1>` : ''}
                     ${paragraphHtml(paragraphs)}
                     ${bodyHtml}
                     ${detailTableHtml(details)}
@@ -668,8 +678,8 @@ export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = ''
     .join('\n');
   const html = brandedEmailHtml({
     preheader: `Requesting the CIM or teaser for ${businessName}.`,
-    eyebrow: 'CIM Request',
     title: subject,
+    showTitle: false,
     paragraphs,
     details,
     ctas: listingUrl ? [{ label: 'View Listing', href: listingUrl }] : [],
@@ -803,8 +813,8 @@ export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumb
     .join('\n');
   const html = brandedEmailHtml({
     preheader: copy.preheader,
-    eyebrow: 'CIM Request',
     title: subject,
+    showTitle: false,
     paragraphs,
     details,
     ctas: listingUrl ? [{ label: 'View Listing', href: listingUrl }] : [],
