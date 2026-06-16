@@ -16,6 +16,16 @@ const sensitiveBrokerDetails = [
   'Asking Price',
 ];
 
+const visibleFollowUpSequenceLabels = [
+  'Follow-Up',
+  'follow-up',
+  'Following up',
+  'following up',
+  'Second follow-up',
+  'Final follow-up',
+  'final follow-up',
+];
+
 const sampleDeal = {
   dealKey: 'commercial-hvac-maintenance-co',
   name: 'Commercial HVAC Maintenance Co',
@@ -44,6 +54,18 @@ function assertBrokerEmailHidesInternalDetails(message) {
   }
 }
 
+function assertBrokerEmailHidesFollowUpSequenceLabels(message) {
+  const visibleContent = brokerVisibleContent(message);
+
+  for (const label of visibleFollowUpSequenceLabels) {
+    assert.equal(
+      visibleContent.includes(label),
+      false,
+      `Broker email should not expose follow-up sequence label "${label}"`,
+    );
+  }
+}
+
 test('CIM request email keeps internal score and deal economics out of broker-visible content', () => {
   const message = buildDealHunterCimRequestEmail({
     to: 'broker@example.com',
@@ -55,7 +77,7 @@ test('CIM request email keeps internal score and deal economics out of broker-vi
   assert.match(message.subject, /CIM \/ NDA request/);
   assert.match(message.text, /Could you please send over the CIM or teaser, or let me know the NDA process\?/);
   assert.match(message.html, /View Listing/);
-  assert.equal(brokerVisibleContent(message).includes('Follow-Up'), false);
+  assertBrokerEmailHidesFollowUpSequenceLabels(message);
   assertBrokerEmailHidesInternalDetails(message);
 });
 
@@ -81,10 +103,10 @@ test('CIM follow-up emails keep internal score and deal economics out of broker-
     });
 
     assert.equal(message.kind, 'deal-hunter-cim-follow-up');
-    assert.match(message.subject, /CIM \/ NDA request/);
+    assert.match(message.subject, /^Re: CIM \/ NDA request/);
     assert.equal(message.tracking.followUpNumber, followUpNumber);
     assert.equal(message.tags.some((tag) => tag.name === 'follow_up_number' && tag.value === String(followUpNumber)), true);
-    assert.equal(brokerVisibleContent(message).includes(`Follow-Up: #${followUpNumber}`), false);
+    assertBrokerEmailHidesFollowUpSequenceLabels(message);
     assert.equal(message.text.includes(`#${followUpNumber}`), false);
     assert.equal(message.html.includes('>Follow-Up</td>'), false);
     assert.equal(message.html.includes(`>#${followUpNumber}</td>`), false);

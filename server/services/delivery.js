@@ -712,16 +712,15 @@ export async function sendDealHunterCimRequestEmail(options) {
 function buildCimFollowUpCopy({ businessName, followUpNumber }) {
   if (followUpNumber >= 3) {
     return {
-      subjectPrefix: 'Final follow-up',
-      preheader: `Final follow-up on the CIM or NDA for ${businessName}.`,
+      preheader: `Checking in on the CIM or NDA process for ${businessName}.`,
       paragraphs: [
-        `I wanted to send one final follow-up on ${businessName}. I remain interested in reviewing the opportunity if it is still active.`,
+        `I wanted to check in on ${businessName}. I remain interested in reviewing the opportunity if it is still active.`,
         'If you are able to share the CIM or teaser, or let me know the NDA process, I would appreciate it. I am prepared to review materials promptly and can provide proof of funds or lender context if helpful.',
         'If the opportunity is no longer available, under LOI, or not a fit for my buyer profile, a quick note is completely fine and I will close the loop.',
         'Thank you again for your time.',
       ],
       textLines: [
-        `I wanted to send one final follow-up on ${businessName}. I remain interested in reviewing the opportunity if it is still active.`,
+        `I wanted to check in on ${businessName}. I remain interested in reviewing the opportunity if it is still active.`,
         '',
         'If you are able to share the CIM or teaser, or let me know the NDA process, I would appreciate it. I am prepared to review materials promptly and can provide proof of funds or lender context if helpful.',
         '',
@@ -734,15 +733,14 @@ function buildCimFollowUpCopy({ businessName, followUpNumber }) {
 
   if (followUpNumber === 2) {
     return {
-      subjectPrefix: 'Second follow-up',
-      preheader: `Second follow-up on the CIM or NDA for ${businessName}.`,
+      preheader: `Checking in on the CIM or NDA process for ${businessName}.`,
       paragraphs: [
-        `I am following up again on ${businessName}. The business appears potentially aligned with my acquisition search, and I would like to review it if the process is still open.`,
+        `I wanted to check in on ${businessName}. The business appears potentially aligned with my acquisition search, and I would like to review it if the process is still open.`,
         'I am focused on durable service businesses with repeat demand, clear transition requirements, and a path to continued growth. If the CIM or teaser is available, please send it over, or let me know the NDA process and I will review it promptly.',
         'If there is a better next step or a buyer questionnaire you would like me to complete first, please send it my way.',
       ],
       textLines: [
-        `I am following up again on ${businessName}. The business appears potentially aligned with my acquisition search, and I would like to review it if the process is still open.`,
+        `I wanted to check in on ${businessName}. The business appears potentially aligned with my acquisition search, and I would like to review it if the process is still open.`,
         '',
         'I am focused on durable service businesses with repeat demand, clear transition requirements, and a path to continued growth. If the CIM or teaser is available, please send it over, or let me know the NDA process and I will review it promptly.',
         '',
@@ -752,15 +750,14 @@ function buildCimFollowUpCopy({ businessName, followUpNumber }) {
   }
 
   return {
-    subjectPrefix: 'Following up',
-    preheader: `Following up on the CIM or NDA for ${businessName}.`,
+    preheader: `Checking in on the CIM or NDA process for ${businessName}.`,
     paragraphs: [
-      `I wanted to follow up on my note regarding ${businessName}. I am still interested in learning more and would appreciate the opportunity to review the CIM or teaser, or complete the NDA process.`,
+      `I wanted to check in on my note regarding ${businessName}. I am still interested in learning more and would appreciate the opportunity to review the CIM or teaser, or complete the NDA process.`,
       'The business appears potentially aligned with my focus on cash-flowing service companies with durable demand and a thoughtful owner transition.',
       'If the opportunity is still active, please send the materials or let me know the next step in your process. I am happy to complete an NDA first.',
     ],
     textLines: [
-      `I wanted to follow up on my note regarding ${businessName}. I am still interested in learning more and would appreciate the opportunity to review the CIM or teaser, or complete the NDA process.`,
+      `I wanted to check in on my note regarding ${businessName}. I am still interested in learning more and would appreciate the opportunity to review the CIM or teaser, or complete the NDA process.`,
       '',
       'The business appears potentially aligned with my focus on cash-flowing service companies with durable demand and a thoughtful owner transition.',
       '',
@@ -776,7 +773,7 @@ export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumb
   const requester = normalizeText(requestedBy || request.requested_by || config.workflow?.defaultAssignee || 'Mathew Uckele', 120);
   const listingUrl = normalizeUrl(request.listing_url || '');
   const copy = buildCimFollowUpCopy({ businessName, followUpNumber });
-  const subject = `${copy.subjectPrefix}: CIM / NDA request for ${businessName}`;
+  const subject = `Re: CIM / NDA request for ${businessName}`;
   const details = [
     { label: 'Business', value: businessName },
     metadata.industry ? { label: 'Industry', value: metadata.industry } : null,
@@ -806,7 +803,7 @@ export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumb
     .join('\n');
   const html = brandedEmailHtml({
     preheader: copy.preheader,
-    eyebrow: 'CIM Follow-Up',
+    eyebrow: 'CIM Request',
     title: subject,
     paragraphs,
     details,
