@@ -626,7 +626,6 @@ export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = ''
     deal.location ? { label: 'Location', value: deal.location } : null,
     deal.annualProfit ? { label: 'Profit', value: formatMoney(deal.annualProfit) } : null,
     deal.askingPrice ? { label: 'Asking Price', value: formatMoney(deal.askingPrice) } : null,
-    deal.score ? { label: 'Internal Fit Score', value: `${deal.score}/100` } : null,
   ].filter(Boolean);
   const paragraphs = [
     `Hello${deal.brokerName ? ` ${deal.brokerName}` : ''},`,
@@ -771,7 +770,6 @@ export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumb
     { label: 'Business', value: businessName },
     metadata.industry ? { label: 'Industry', value: metadata.industry } : null,
     metadata.location ? { label: 'Location', value: metadata.location } : null,
-    request.score ? { label: 'Internal Fit Score', value: `${request.score}/100` } : null,
     { label: 'Follow-Up', value: `#${followUpNumber}` },
   ].filter(Boolean);
   const paragraphs = [
