@@ -54,7 +54,7 @@ export const siteConfig = {
   phone: publicPhone,
   linkedin: publicLinkedin,
   contactDetailItems,
-  downloadHref: '/downloads/uckele-group-acquisition-criteria.txt',
+  downloadHref: '/downloads/uckele-group-acquisition-criteria.pdf',
   socialImage: '/social-card.svg',
   socialImageUrl: toAbsoluteUrl('/social-card.svg'),
 };
