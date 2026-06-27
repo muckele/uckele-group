@@ -1,7 +1,12 @@
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { sha256 } from '../utils/security.js';
-import { sendDailyDealHunterEmail, sendDealHunterCimFollowUpEmail, sendDealHunterCimRequestEmail } from './delivery.js';
+import {
+  normalizeResendTagToken,
+  sendDailyDealHunterEmail,
+  sendDealHunterCimFollowUpEmail,
+  sendDealHunterCimRequestEmail,
+} from './delivery.js';
 import { createManualSubmission } from './submissions.js';
 
 const defaultTimeoutMs = 45000;
@@ -1962,6 +1967,18 @@ function getEmailEventContactEmail(event) {
   );
 }
 
+function emailEventTagMatchesValue(eventValue, expectedValue) {
+  const normalizedEventValue = normalizeText(eventValue, 260);
+  const normalizedExpectedValue = normalizeText(expectedValue, 260);
+
+  return Boolean(
+    normalizedEventValue &&
+      normalizedExpectedValue &&
+      (normalizedEventValue === normalizedExpectedValue ||
+        normalizedEventValue === normalizeResendTagToken(normalizedExpectedValue)),
+  );
+}
+
 function emailSubjectLooksLikeCimReply(event, request) {
   const subject = normalizeComparableText(event?.subject || '');
 
@@ -2018,7 +2035,8 @@ export function eventMatchesCimRequest(event, request) {
   return Boolean(
     eventRecipient &&
       eventRecipient === requestRecipient &&
-      ((eventDealKey && eventDealKey === request.deal_key) || (eventRequestId && eventRequestId === request.id)),
+      ((eventDealKey && emailEventTagMatchesValue(eventDealKey, request.deal_key)) ||
+        (eventRequestId && emailEventTagMatchesValue(eventRequestId, request.id))),
   );
 }
 

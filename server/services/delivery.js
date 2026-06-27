@@ -27,6 +27,49 @@ function normalizeText(value = '', maxLength = 1000) {
     .slice(0, maxLength);
 }
 
+export function normalizeResendTagToken(value = '', fallback = '') {
+  const normalized = normalizeText(value, 256)
+    .normalize('NFKD')
+    .replace(/[^\x00-\x7F]/g, '')
+    .replace(/[^A-Za-z0-9_-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-_]+|[-_]+$/g, '')
+    .slice(0, 256)
+    .replace(/^[-_]+|[-_]+$/g, '');
+
+  return normalized || fallback;
+}
+
+export function normalizeResendTags(tags = []) {
+  if (!Array.isArray(tags)) {
+    return [];
+  }
+
+  const seen = new Set();
+  const normalizedTags = [];
+
+  for (const tag of tags) {
+    const rawName = typeof tag === 'string' ? tag.split('=')[0] : tag?.name || tag?.key || '';
+    const rawValue = typeof tag === 'string' ? tag.split('=').slice(1).join('=') : tag?.value;
+    const name = normalizeResendTagToken(rawName);
+    const value = normalizeResendTagToken(rawValue);
+
+    if (!name || !value) {
+      continue;
+    }
+
+    const key = `${name}:${value}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    normalizedTags.push({ name, value });
+  }
+
+  return normalizedTags;
+}
+
 function normalizeUrl(value = '') {
   const normalized = normalizeText(value, 1000);
   return /^https?:\/\//i.test(normalized) ? normalized : '';
@@ -185,6 +228,7 @@ async function sendViaResend(message) {
     return { status: 'failed', error: 'Resend is selected but RESEND_API_KEY or RESEND_FROM_EMAIL is missing.' };
   }
 
+  const tags = normalizeResendTags(message.tags);
   const response = await fetchWithTimeout('https://api.resend.com/emails', {
     method: 'POST',
     timeoutMs: config.server.outboundRequestTimeoutMs,
@@ -201,7 +245,7 @@ async function sendViaResend(message) {
       text: message.text,
       reply_to: message.replyTo || undefined,
       headers: message.headers || undefined,
-      tags: Array.isArray(message.tags) && message.tags.length > 0 ? message.tags : undefined,
+      tags: tags.length > 0 ? tags : undefined,
     }),
   });
 

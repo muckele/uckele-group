@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   buildDealHunterCimFollowUpEmail,
   buildDealHunterCimRequestEmail,
+  normalizeResendTags,
 } from '../server/services/delivery.js';
 
 const sensitiveBrokerDetails = [
@@ -93,6 +94,27 @@ test('CIM request email keeps internal score and deal economics out of broker-vi
   assertBrokerEmailOmitsBodyHeadline(message);
   assertBrokerEmailHidesFollowUpSequenceLabels(message);
   assertBrokerEmailHidesInternalDetails(message);
+});
+
+test('CIM request email tags are safe for Resend when deal keys contain punctuation', () => {
+  const message = buildDealHunterCimRequestEmail({
+    to: 'broker@example.com',
+    deal: {
+      ...sampleDeal,
+      dealKey: 'SMB Deal Hunter Google Sheet | 20+ Year HVAC Company w/ strong earnings | erin@powerofpluck.com',
+    },
+    requestedBy: 'Mathew Uckele',
+  });
+  const tags = normalizeResendTags(message.tags);
+  const dealKeyTag = tags.find((tag) => tag.name === 'deal_key');
+
+  assert.ok(dealKeyTag);
+  assert.match(dealKeyTag.value, /^[A-Za-z0-9_-]+$/);
+  assert.equal(
+    dealKeyTag.value,
+    'SMB-Deal-Hunter-Google-Sheet-20-Year-HVAC-Company-w-strong-earnings-erin-powerofpluck-com',
+  );
+  assert.equal(tags.every((tag) => /^[A-Za-z0-9_-]+$/.test(tag.name) && /^[A-Za-z0-9_-]+$/.test(tag.value)), true);
 });
 
 test('CIM follow-up emails keep internal score and deal economics out of broker-visible content', () => {

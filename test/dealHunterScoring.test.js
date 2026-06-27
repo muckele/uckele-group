@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { eventMatchesCimRequest, parseSheetCsvDeals, scoreDeal } from '../server/services/dealHunter.js';
+import { normalizeResendTagToken } from '../server/services/delivery.js';
 
 function baseDeal(overrides = {}) {
   const fullText = [
@@ -121,6 +122,26 @@ test('CIM response matching ignores unrelated replies from the same broker', () 
 
   assert.equal(eventMatchesCimRequest(unrelatedReply, request), false);
   assert.equal(eventMatchesCimRequest(trackedReply, request), true);
+});
+
+test('CIM event matching accepts Resend-normalized deal key tags', () => {
+  const request = {
+    id: 'cim-request-1',
+    deal_key: 'SMB Deal Hunter Google Sheet | 20+ Year HVAC Company w/ strong earnings | erin@powerofpluck.com',
+    deal_name: '20+ Year HVAC Company w/ strong earnings',
+    recipient_email: 'broker@example.com',
+    created_at: '2026-06-16T16:00:00.000Z',
+  };
+  const deliveryEvent = {
+    event_type: 'delivered',
+    recipient_email: 'broker@example.com',
+    subject: 'CIM / NDA request for 20+ Year HVAC Company w/ strong earnings',
+    metadata: {
+      tags: [{ name: 'deal_key', value: normalizeResendTagToken(request.deal_key) }],
+    },
+  };
+
+  assert.equal(eventMatchesCimRequest(deliveryEvent, request), true);
 });
 
 test('Google Sheet CSV parsing caps rows before normalizing source deals', () => {
