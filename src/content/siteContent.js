@@ -1,7 +1,21 @@
 const publicSiteUrl = (import.meta.env.VITE_PUBLIC_SITE_URL || 'https://www.uckelegroup.com').replace(/\/+$/, '');
 const publicEmail = String(import.meta.env.VITE_PUBLIC_CONTACT_EMAIL || 'mathew@uckelegroup.com').trim();
 const publicPhone = String(import.meta.env.VITE_PUBLIC_CONTACT_PHONE || '914.361.9153').trim();
-const publicLinkedin = String(import.meta.env.VITE_PUBLIC_LINKEDIN_URL || 'https://www.linkedin.com/in/mathew-uckele').trim();
+const rawPublicLinkedin = String(import.meta.env.VITE_PUBLIC_LINKEDIN_URL || 'https://www.linkedin.com/in/mathew-uckele').trim();
+
+function toExternalUrl(url) {
+  if (!url) {
+    return '';
+  }
+
+  if (/^https?:\/\//i.test(url)) {
+    return url;
+  }
+
+  return `https://${url.replace(/^\/+/, '')}`;
+}
+
+const publicLinkedin = toExternalUrl(rawPublicLinkedin);
 
 function toAbsoluteUrl(path) {
   if (!path) {

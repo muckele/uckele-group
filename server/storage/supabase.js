@@ -314,6 +314,40 @@ export function createSupabaseStorage(config) {
       return normalizeSubmissionRow(data);
     },
 
+    async deleteSubmission(id) {
+      const existing = await this.getSubmission(id);
+
+      if (!existing) {
+        return null;
+      }
+
+      const nowIso = new Date().toISOString();
+      const relatedUpdates = await Promise.all([
+        client.from('email_events').delete().eq('submission_id', id),
+        client
+          .from('prospect_discoveries')
+          .update({ submission_id: null, status: 'crm-deleted', updated_at: nowIso })
+          .eq('submission_id', id),
+        client
+          .from('deal_hunter_crm_imports')
+          .update({ submission_id: null, status: 'crm-deleted', updated_at: nowIso })
+          .eq('submission_id', id),
+      ]);
+      const relatedError = relatedUpdates.find((result) => result.error)?.error;
+
+      if (relatedError) {
+        throw relatedError;
+      }
+
+      const { error } = await client.from('contact_submissions').delete().eq('id', id);
+
+      if (error) {
+        throw error;
+      }
+
+      return existing;
+    },
+
     async getSubmissionByContactEmail(email) {
       const normalizedEmail = String(email || '').trim().toLowerCase();
 
@@ -528,6 +562,17 @@ export function createSupabaseStorage(config) {
     },
 
     async addRateLimitEvent(bucket, createdAt) {
+      const retentionMs = Math.max(0, Number(config.protection?.rateLimitRetentionMs) || 0);
+
+      if (retentionMs > 0) {
+        const cutoffIso = new Date(Date.now() - retentionMs).toISOString();
+        const { error: pruneError } = await client.from('contact_rate_limit_events').delete().lt('created_at', cutoffIso);
+
+        if (pruneError) {
+          throw pruneError;
+        }
+      }
+
       const { error } = await client.from('contact_rate_limit_events').insert({ bucket, created_at: createdAt });
 
       if (error) {

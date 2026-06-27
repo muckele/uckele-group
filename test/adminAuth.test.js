@@ -144,15 +144,26 @@ test('viewer credentials create read-only admin access', async () => {
   assert.equal(readResponse.statusCode, 200);
   assert.equal(readResponse.body.success, true);
 
+  const followUpsResponse = await invokeRoute(app, {
+    method: 'get',
+    routePath: '/api/admin/follow-ups',
+    cookie: viewerCookie,
+  });
+
+  assert.equal(followUpsResponse.statusCode, 200);
+  assert.equal(followUpsResponse.body.success, true);
+
   const blockedRoutes = [
     { method: 'post', routePath: '/api/admin/acquisition-command-center/:id', params: { id: 'submission-1' }, body: { pipelineStage: 'passed' } },
     { method: 'post', routePath: '/api/admin/submissions', body: { name: 'Viewer Attempt' } },
     { method: 'get', routePath: '/api/admin/submissions/export' },
     { method: 'post', routePath: '/api/admin/deal-hunter/send' },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-request', body: { dealKey: 'deal-1' } },
+    { method: 'post', routePath: '/api/admin/deal-hunter/cim-requests/send-ready' },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-follow-ups/run' },
     { method: 'post', routePath: '/api/admin/prospect-discovery/run', body: { query: 'plumbers near New York NY' } },
     { method: 'patch', routePath: '/api/admin/submissions/:id', params: { id: 'submission-1' }, body: { status: 'review' } },
+    { method: 'delete', routePath: '/api/admin/submissions/:id', params: { id: 'submission-1' } },
     { method: 'post', routePath: '/api/admin/submissions/:id/upload-request', params: { id: 'submission-1' } },
   ];
 
@@ -165,4 +176,44 @@ test('viewer credentials create read-only admin access', async () => {
     assert.equal(response.statusCode, 401, `${route.method.toUpperCase()} ${route.routePath} should reject viewer access`);
     assert.equal(response.body.error, 'Unauthorized.');
   }
+
+  const createResponse = await invokeRoute(app, {
+    method: 'post',
+    routePath: '/api/admin/submissions',
+    cookie: adminLogin.cookie,
+    body: {
+      company: 'Delete Test Company',
+      seller_name: 'Delete Test Seller',
+      seller_email: 'delete-test@example.com',
+      message: 'Manual CRM record created for delete route coverage.',
+      lead_type: 'seller',
+    },
+  });
+
+  assert.equal(createResponse.statusCode, 201);
+  assert.equal(createResponse.body.success, true);
+  assert.ok(createResponse.body.submission.id);
+
+  const deleteResponse = await invokeRoute(app, {
+    method: 'delete',
+    routePath: '/api/admin/submissions/:id',
+    cookie: adminLogin.cookie,
+    params: { id: createResponse.body.submission.id },
+  });
+
+  assert.equal(deleteResponse.statusCode, 200);
+  assert.equal(deleteResponse.body.success, true);
+  assert.equal(deleteResponse.body.submission.id, createResponse.body.submission.id);
+
+  const listResponse = await invokeRoute(app, {
+    method: 'get',
+    routePath: '/api/admin/submissions',
+    cookie: adminLogin.cookie,
+  });
+
+  assert.equal(listResponse.statusCode, 200);
+  assert.equal(
+    listResponse.body.submissions.some((submission) => submission.id === createResponse.body.submission.id),
+    false,
+  );
 });

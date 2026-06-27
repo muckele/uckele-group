@@ -1149,6 +1149,31 @@ export function createSqliteStorage(config) {
       return row ? normalizeSubmissionRow(row) : null;
     },
 
+    async deleteSubmission(id) {
+      const existing = await this.getSubmission(id);
+
+      if (!existing) {
+        return null;
+      }
+
+      const transaction = database.transaction((submissionId) => {
+        database.prepare('DELETE FROM secure_documents WHERE submission_id = ?').run(submissionId);
+        database.prepare('DELETE FROM secure_upload_requests WHERE submission_id = ?').run(submissionId);
+        database.prepare('DELETE FROM email_events WHERE submission_id = ?').run(submissionId);
+        database
+          .prepare("UPDATE prospect_discoveries SET submission_id = NULL, status = 'crm-deleted', updated_at = ? WHERE submission_id = ?")
+          .run(new Date().toISOString(), submissionId);
+        database
+          .prepare("UPDATE deal_hunter_crm_imports SET submission_id = NULL, status = 'crm-deleted', updated_at = ? WHERE submission_id = ?")
+          .run(new Date().toISOString(), submissionId);
+        database.prepare('DELETE FROM contact_submissions WHERE id = ?').run(submissionId);
+      });
+
+      transaction(id);
+
+      return existing;
+    },
+
     async getSubmissionByContactEmail(email) {
       const normalizedEmail = String(email || '').trim().toLowerCase();
 
@@ -1334,6 +1359,13 @@ export function createSqliteStorage(config) {
     },
 
     async addRateLimitEvent(bucket, createdAt) {
+      const retentionMs = Math.max(0, Number(config.protection?.rateLimitRetentionMs) || 0);
+
+      if (retentionMs > 0) {
+        const cutoffIso = new Date(Date.now() - retentionMs).toISOString();
+        database.prepare('DELETE FROM contact_rate_limit_events WHERE created_at < ?').run(cutoffIso);
+      }
+
       database.prepare('INSERT INTO contact_rate_limit_events (bucket, created_at) VALUES (?, ?)').run(bucket, createdAt);
     },
 

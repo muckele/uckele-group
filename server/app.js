@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { getConfig } from './config.js';
 import {
   getAcquisitionCommandCenter,
+  getSourceHealth,
   updateAcquisitionCommandCenterRecord,
 } from './services/acquisitionCommandCenter.js';
 import {
@@ -29,6 +30,7 @@ import {
   runDealHunterCimFollowUps,
   sendDailyDealHunterReview,
   sendDealHunterCimRequest,
+  sendDealHunterReadyCimRequests,
 } from './services/dealHunter.js';
 import {
   getProspectDiscoveryDashboard,
@@ -36,9 +38,12 @@ import {
 } from './services/prospectDiscovery.js';
 import {
   createManualSubmission,
+  enforceContactBodyRateLimit,
   exportDashboardSubmissionsCsv,
+  listDashboardFollowUps,
   listDashboardSubmissions,
   submitContactLead,
+  deleteDashboardSubmission,
   updateSubmissionWorkflow,
 } from './services/submissions.js';
 import { asyncRoute } from './utils/http.js';
@@ -154,13 +159,55 @@ export function createApp() {
     }
   });
   app.use('/api/secure-documents/upload', express.json(jsonParserOptions(getSecureUploadJsonLimitBytes(config))));
+  app.use('/api/contact', async (request, response, next) => {
+    if (request.method !== 'POST') {
+      next();
+      return;
+    }
+
+    try {
+      const result = await enforceContactBodyRateLimit(request);
+
+      if (!result.ok) {
+        response.status(result.status || 429).json({ success: false, error: result.error });
+        return;
+      }
+
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.use('/api/contact', express.json(jsonParserOptions(config.protection.contactJsonLimit)));
   app.use(express.json(jsonParserOptions('25mb')));
   app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
   app.use((request, response, next) => {
     response.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
     response.setHeader('X-Content-Type-Options', 'nosniff');
+    response.setHeader('X-Frame-Options', 'DENY');
     response.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+    response.setHeader(
+      'Content-Security-Policy',
+      [
+        "default-src 'self'",
+        "base-uri 'self'",
+        "connect-src 'self' https://challenges.cloudflare.com",
+        "font-src 'self' data: https://fonts.gstatic.com",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+        "frame-src https://challenges.cloudflare.com",
+        "img-src 'self' data: blob:",
+        "object-src 'none'",
+        "script-src 'self' https://challenges.cloudflare.com",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      ].join('; '),
+    );
+
+    if (config.isProduction) {
+      response.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+    }
+
     next();
   });
 
@@ -174,6 +221,7 @@ export function createApp() {
     response.json({
       success: true,
       turnstileSiteKey: config.turnstile.siteKey,
+      turnstileEnabled: Boolean(config.turnstile.siteKey && config.turnstile.secretKey),
     });
   });
 
@@ -343,6 +391,23 @@ export function createApp() {
     }),
   );
 
+  app.get(
+    '/api/admin/follow-ups',
+    asyncRoute(async (request, response) => {
+      if (!requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await listDashboardFollowUps();
+
+      response.json({
+        success: true,
+        ...result,
+      });
+    }),
+  );
+
   app.post(
     '/api/admin/submissions',
     asyncRoute(async (request, response) => {
@@ -388,12 +453,19 @@ export function createApp() {
   app.get(
     '/api/admin/deal-hunter/review',
     asyncRoute(async (request, response) => {
-      if (!requireAdminAccess(request)) {
+      const session = requireAdminAccess(request);
+
+      if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
 
       const review = await reviewDailyDeals();
+      await getSourceHealth(undefined, {
+        persistSnapshot: session.role === 'admin',
+        refresh: true,
+        review,
+      });
       response.json({
         success: true,
         review,
@@ -430,6 +502,29 @@ export function createApp() {
       const result = await sendDealHunterCimRequest({
         dealKey: request.body?.dealKey || '',
         requestedBy: session.username || 'admin',
+      });
+
+      response.status(result.status || (result.ok ? 200 : 400)).json({
+        success: Boolean(result.ok),
+        ...result,
+      });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-requests/send-ready',
+    asyncRoute(async (request, response) => {
+      const session = requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await sendDealHunterReadyCimRequests({
+        requestedBy: session.username || 'admin',
+        limit: request.body?.limit,
+        selections: request.body?.selections,
       });
 
       response.status(result.status || (result.ok ? 200 : 400)).json({
@@ -531,6 +626,28 @@ export function createApp() {
       response.json({
         success: true,
         submission: updated,
+      });
+    }),
+  );
+
+  app.delete(
+    '/api/admin/submissions/:id',
+    asyncRoute(async (request, response) => {
+      if (!requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const deleted = await deleteDashboardSubmission(request.params.id);
+
+      if (!deleted) {
+        response.status(404).json({ success: false, error: 'CRM record not found.' });
+        return;
+      }
+
+      response.json({
+        success: true,
+        submission: deleted,
       });
     }),
   );

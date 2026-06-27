@@ -33,12 +33,14 @@ fly secrets set \
   EMAIL_BRAND_COMPANY_NAME="Uckele Group" \
   DEAL_HUNTER_EMAIL_RECIPIENT=mathew@uckelegroup.com \
   DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL="https://airtable.com/appEGxhjno0HTpEco/shrUhtbnzZTPaR4Lk/tblACIQ9QNiVmoWSK?viewControls=on" \
+  DEAL_HUNTER_AIRTABLE_TOKEN=... \
   DEAL_HUNTER_SHEET_CSV_URL="https://docs.google.com/spreadsheets/d/.../gviz/tq?tqx=out:csv&gid=..." \
   ADMIN_AUTH_MODE=magic-link \
   ADMIN_EMAIL=mathew@uckelegroup.com \
   ADMIN_SESSION_SECRET=... \
   ADMIN_MAGIC_LINK_SECRET=... \
   SECURE_DOCUMENTS_TOKEN_SECRET=... \
+  TURNSTILE_SITE_KEY=... \
   TURNSTILE_SECRET_KEY=...
 ```
 
@@ -56,7 +58,6 @@ fly secrets set \
   ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH=/data/acquisition-command-center-source-health.json \
   DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES=8388608 \
   DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES=12582912 \
-  DEAL_HUNTER_AIRTABLE_TOKEN=... \
   DEAL_HUNTER_AIRTABLE_BASE_ID=appEGxhjno0HTpEco \
   DEAL_HUNTER_AIRTABLE_TABLE_ID=tblACIQ9QNiVmoWSK \
   DEAL_HUNTER_AIRTABLE_VIEW_ID=viw4OORhKKWPUsWa4 \

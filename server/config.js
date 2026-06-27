@@ -175,7 +175,9 @@ export function getConfig() {
       storageDir: process.env.SECURE_DOCUMENTS_STORAGE_DIR || path.join(rootDir, 'data', 'secure-documents'),
     },
     protection: {
+      contactJsonLimit: process.env.CONTACT_JSON_LIMIT || '64kb',
       rateLimitWindowMs: numberFromEnv(process.env.RATE_LIMIT_WINDOW_MS, 1000 * 60 * 10),
+      rateLimitRetentionMs: numberFromEnv(process.env.RATE_LIMIT_RETENTION_MS, 1000 * 60 * 60 * 24 * 30),
       rateLimitMax: numberFromEnv(process.env.RATE_LIMIT_MAX, 6),
       minSubmitTimeMs: numberFromEnv(process.env.MIN_SUBMIT_TIME_MS, 4000),
       spamScoreThreshold: numberFromEnv(process.env.SPAM_SCORE_THRESHOLD, 50),

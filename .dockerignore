@@ -7,6 +7,8 @@
 node_modules
 dist
 data
+dev-ops
+tmp
 coverage
 npm-debug.log*
 fly.toml.local

@@ -865,7 +865,59 @@ export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}
   return {
     generatedAt,
     dateKey: sourceHealth.dateKey || previousSnapshot.dateKey || '',
+    issues: sourceHealth.issues || [],
+    totals: sourceHealth.totals || {},
     sources: nextSources,
+  };
+}
+
+function buildCachedSourceHealth(previousSnapshot = {}, now = new Date(), config = getConfig()) {
+  const sourceSnapshots = objectValue(previousSnapshot.sources);
+  const sources = Object.entries(sourceSnapshots).map(([id, source]) => ({
+    id,
+    name: source.name || id,
+    mode: source.mode || 'cached',
+    fetched: true,
+    rowCount: Number(source.rowCount || 0),
+    previousRowCount: Number(source.rowCount || 0),
+    rowDelta: 0,
+    tone: 'success',
+    error: '',
+    requiresConfiguration: false,
+    configurationKey: '',
+    checkedAt: source.checkedAt || previousSnapshot.generatedAt || '',
+  }));
+  const issues = Array.isArray(previousSnapshot.issues) ? previousSnapshot.issues : [];
+
+  if (sources.length === 0) {
+    return {
+      generatedAt: previousSnapshot.generatedAt || now.toISOString(),
+      dateKey: previousSnapshot.dateKey || getZonedParts(now, config.dealHunter.dailyEmail.timezone).dateKey,
+      afterDailyUpdateWindow: false,
+      healthy: false,
+      issues: [
+        {
+          sourceId: 'source-health-cache',
+          tone: 'warning',
+          title: 'Source health has not been checked yet',
+          message: 'Use Deal Hunter > Review Sources to refresh source health before relying on source status.',
+        },
+      ],
+      sources: [],
+      totals: previousSnapshot.totals || {},
+      cached: true,
+    };
+  }
+
+  return {
+    generatedAt: previousSnapshot.generatedAt || now.toISOString(),
+    dateKey: previousSnapshot.dateKey || getZonedParts(now, config.dealHunter.dailyEmail.timezone).dateKey,
+    afterDailyUpdateWindow: false,
+    healthy: issues.length === 0,
+    issues,
+    sources,
+    totals: previousSnapshot.totals || {},
+    cached: true,
   };
 }
 
@@ -878,16 +930,18 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
   const zoned = getZonedParts(now, schedule.timezone);
   const updateWindowMinute = scheduled.hour * 60 + scheduled.minute + sourceHealthUpdateBufferMinutes;
   const afterDailyUpdateWindow = zoned.minutesSinceMidnight >= updateWindowMinute;
+  const allSourcesFetched = sources.length > 0 && sources.every((source) => source.fetched);
   const sourceStatuses = sources.map((source) => {
     const previous = objectValue(sourceSnapshots[source.id]);
     const rowCount = Number(source.rowCount || 0);
     const previousRowCount = Number(previous.rowCount || 0);
     const rowDelta = previousRowCount ? rowCount - previousRowCount : 0;
-    let tone = source.fetched ? 'success' : 'danger';
+    const requiresConfiguration = Boolean(source.requiresConfiguration);
+    let tone = source.fetched ? 'success' : requiresConfiguration ? 'warning' : 'danger';
     const sourceIssues = [];
 
     if (!source.fetched) {
-      tone = 'danger';
+      tone = requiresConfiguration ? 'warning' : 'danger';
       sourceIssues.push(source.error || 'Source failed to fetch.');
     } else if (rowCount === 0) {
       tone = 'danger';
@@ -916,10 +970,12 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
       rowDelta,
       tone,
       error: source.error || '',
+      requiresConfiguration,
+      configurationKey: source.configurationKey || '',
     };
   });
 
-  if (afterDailyUpdateWindow && review && (review.totals?.newDeals || 0) === 0 && sources.some((source) => source.fetched)) {
+  if (afterDailyUpdateWindow && review && allSourcesFetched && (review.totals?.newDeals || 0) === 0) {
     issues.push({
       sourceId: 'daily-update-window',
       tone: 'warning',
@@ -939,9 +995,13 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
   };
 }
 
-export async function getSourceHealth(storage, { persistSnapshot = true, review = null } = {}) {
+export async function getSourceHealth(storage = getStorage(), { persistSnapshot = true, review = null, refresh = false } = {}) {
   const config = getConfig();
   const previousSnapshot = await readSourceSnapshot(config);
+
+  if (!review && !refresh) {
+    return buildCachedSourceHealth(previousSnapshot, new Date(), config);
+  }
 
   try {
     const sourceReview = review || await reviewDailyDeals({ markSeen: false, storage });
@@ -970,7 +1030,7 @@ export async function getSourceHealth(storage, { persistSnapshot = true, review 
   }
 }
 
-export async function getAcquisitionCommandCenter({ storage = getStorage(), persistSourceHealth = true } = {}) {
+export async function getAcquisitionCommandCenter({ storage = getStorage(), persistSourceHealth = true, refreshSourceHealth = false } = {}) {
   const submissionsResult = await storage.listSubmissions({ limit: commandCenterLimit, page: 1, status: 'all' });
   const submissions = submissionsResult.rows || [];
   const related = await loadRelatedSubmissionData(storage, submissions);
@@ -998,7 +1058,7 @@ export async function getAcquisitionCommandCenter({ storage = getStorage(), pers
         now,
       });
     });
-  const sourceHealth = await getSourceHealth(storage, { persistSnapshot: persistSourceHealth });
+  const sourceHealth = await getSourceHealth(storage, { persistSnapshot: persistSourceHealth, refresh: refreshSourceHealth });
   const pipeline = buildPipeline(records);
   const actionQueue = buildActionQueue(records, sourceHealth);
 

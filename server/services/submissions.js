@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs/promises';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { getClientIp } from '../utils/http.js';
@@ -18,6 +19,7 @@ import {
 } from './workflow.js';
 
 const allowedStatuses = ['new', 'review', 'contacted', 'archived', 'spam'];
+const turnstileTokenMaxLength = 2048;
 const diligenceStages = [
   'not-started',
   'cim-requested',
@@ -182,6 +184,17 @@ export function diligenceReviewsEqual(left, right) {
 function normalizeStatus(value, fallback = 'new') {
   const normalized = normalizeField(value, 40).toLowerCase();
   return allowedStatuses.includes(normalized) ? normalized : fallback;
+}
+
+function resultFromSettled(settledResult, fallbackPrefix) {
+  if (settledResult.status === 'fulfilled') {
+    return settledResult.value;
+  }
+
+  return {
+    status: 'failed',
+    error: `${fallbackPrefix}: ${settledResult.reason?.message || 'Unknown error'}`,
+  };
 }
 
 function isValidEmail(value) {
@@ -646,6 +659,33 @@ async function enforceRateLimit(storage, ipHash) {
   return { blocked: false };
 }
 
+async function enforceContactRateLimitForRequest(request, storage = getStorage()) {
+  const ipHash = hashIp(getClientIp(request));
+  const rateLimitResult = await enforceRateLimit(storage, ipHash);
+
+  return {
+    ...rateLimitResult,
+    ipHash,
+  };
+}
+
+export async function enforceContactBodyRateLimit(request) {
+  const rateLimitResult = await enforceContactRateLimitForRequest(request);
+
+  if (rateLimitResult.blocked) {
+    return {
+      ok: false,
+      status: 429,
+      error: rateLimitResult.error,
+    };
+  }
+
+  request.contactIpHash = rateLimitResult.ipHash;
+  request.contactRateLimitChecked = true;
+
+  return { ok: true };
+}
+
 export async function submitContactLead(body, request) {
   const config = getConfig();
   const storage = getStorage();
@@ -658,7 +698,7 @@ export async function submitContactLead(body, request) {
     message: normalizeMessage(body.message, 5000),
     source: normalizeField(body.source, 80) || 'website-contact-form',
     website: normalizeField(body.website, 120),
-    turnstileToken: normalizeField(body.turnstileToken, 600),
+    turnstileToken: normalizeField(body.turnstileToken, turnstileTokenMaxLength),
     startedAt: Number(body.startedAt) || Date.now(),
   };
 
@@ -671,14 +711,18 @@ export async function submitContactLead(body, request) {
     };
   }
 
-  const ipHash = hashIp(getClientIp(request));
-  const rateLimitResult = await enforceRateLimit(storage, ipHash);
+  let ipHash = request.contactIpHash || hashIp(getClientIp(request));
 
-  if (rateLimitResult.blocked) {
-    return {
-      status: 429,
-      body: { success: false, errors: [rateLimitResult.error] },
-    };
+  if (!request.contactRateLimitChecked) {
+    const rateLimitResult = await enforceContactRateLimitForRequest(request, storage);
+    ipHash = rateLimitResult.ipHash;
+
+    if (rateLimitResult.blocked) {
+      return {
+        status: 429,
+        body: { success: false, errors: [rateLimitResult.error] },
+      };
+    }
   }
 
   const turnstileResult = await verifyTurnstileToken(input.turnstileToken, getClientIp(request));
@@ -772,8 +816,13 @@ export async function submitContactLead(body, request) {
   let crmResult = { status: 'skipped', error: '' };
 
   if (!spamAssessment.isSpam) {
-    deliveryResult = await deliverSubmission(submission);
-    crmResult = await forwardToCrm(submission);
+    const [settledDelivery, settledCrm] = await Promise.allSettled([
+      deliverSubmission(submission),
+      forwardToCrm(submission),
+    ]);
+
+    deliveryResult = resultFromSettled(settledDelivery, 'Delivery failed');
+    crmResult = resultFromSettled(settledCrm, 'CRM webhook failed');
   }
 
   await storage.updateSubmission(submission.id, {
@@ -927,14 +976,7 @@ export async function createManualSubmission(body, adminUsername = '', options =
   };
 }
 
-export async function listDashboardSubmissions({ page, search, status }) {
-  const storage = getStorage();
-  const [baseSummary, submissions] = await Promise.all([
-    storage.getSummary(),
-    storage.listSubmissions({ page, search, status }),
-  ]);
-  const now = new Date();
-  const enriched = await enrichSubmissions(submissions.rows, storage, now);
+function buildFollowUpQueues(enriched = []) {
   const notifications = enriched
     .filter((submission) => submission.follow_up_prompt)
     .sort((left, right) => {
@@ -968,11 +1010,42 @@ export async function listDashboardSubmissions({ page, search, status }) {
       return rightLastEventAt - leftLastEventAt;
     });
 
+  return { notifications, emailTriage };
+}
+
+export async function listDashboardSubmissions({ page, search, status }) {
+  const storage = getStorage();
+  const [baseSummary, submissions] = await Promise.all([
+    storage.getSummary(),
+    storage.listSubmissions({ page, search, status }),
+  ]);
+  const now = new Date();
+  const enriched = await enrichSubmissions(submissions.rows, storage, now);
+  const { notifications, emailTriage } = buildFollowUpQueues(enriched);
+
   return {
     summary: buildNotificationSummary(baseSummary, enriched, emailTriage),
     notifications,
     emailTriage,
     submissions: enriched,
+    total: submissions.total,
+  };
+}
+
+export async function listDashboardFollowUps() {
+  const storage = getStorage();
+  const [baseSummary, submissions] = await Promise.all([
+    storage.getSummary(),
+    storage.listSubmissions({ limit: 5000, page: 1, status: 'all' }),
+  ]);
+  const now = new Date();
+  const enriched = await enrichSubmissions(submissions.rows, storage, now);
+  const { notifications, emailTriage } = buildFollowUpQueues(enriched);
+
+  return {
+    summary: buildNotificationSummary(baseSummary, enriched, emailTriage),
+    notifications,
+    emailTriage,
     total: submissions.total,
   };
 }
@@ -1090,6 +1163,47 @@ export async function updateSubmissionWorkflow(id, fields) {
   }
 
   return enrichSubmission(updated, storage);
+}
+
+export async function deleteDashboardSubmission(id) {
+  const storage = getStorage();
+  const submissionId = String(id || '').trim();
+
+  if (!submissionId || !storage.deleteSubmission) {
+    return null;
+  }
+
+  const existing = await storage.getSubmission(submissionId);
+
+  if (!existing) {
+    return null;
+  }
+
+  const documents = storage.listSecureDocumentsForSubmission
+    ? await storage.listSecureDocumentsForSubmission(submissionId)
+    : [];
+  const deleted = await storage.deleteSubmission(submissionId);
+
+  if (!deleted) {
+    return null;
+  }
+
+  await Promise.all(
+    (documents || [])
+      .map((document) => document?.storage_path)
+      .filter(Boolean)
+      .map(async (filePath) => {
+        try {
+          await fs.unlink(filePath);
+        } catch (error) {
+          if (error.code !== 'ENOENT') {
+            console.warn(`[crm] failed to remove secure document file ${filePath}: ${error.message}`);
+          }
+        }
+      }),
+  );
+
+  return existing;
 }
 
 export async function exportDashboardSubmissionsCsv() {

@@ -81,6 +81,7 @@ test('public config only exposes browser-safe settings', async () => {
   assert.deepEqual(response.body, {
     success: true,
     turnstileSiteKey: 'public-turnstile-test-key',
+    turnstileEnabled: false,
   });
 });
 

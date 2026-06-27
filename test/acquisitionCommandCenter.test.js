@@ -151,6 +151,53 @@ test('source health flags row drops and missing post-window updates', () => {
   assert.equal(health.issues.some((issue) => issue.sourceId === 'daily-update-window'), true);
 });
 
+test('source health suppresses no-new-deals warning when a configured source fails', () => {
+  const health = buildAcquisitionSourceHealth({
+    now: new Date('2026-06-16T18:00:00.000Z'),
+    config: {
+      dealHunter: {
+        dailyEmail: {
+          time: '10:15',
+          timezone: 'America/Los_Angeles',
+        },
+      },
+    },
+    review: {
+      generatedAt: '2026-06-16T18:00:00.000Z',
+      totals: {
+        newDeals: 0,
+      },
+      sources: [
+        {
+          id: 'sheet-0',
+          name: 'SMB Deal Hunter Google Sheet',
+          mode: 'csv',
+          fetched: true,
+          rowCount: 982,
+        },
+        {
+          id: 'airtable-shared',
+          name: 'Airtable Biz List',
+          mode: 'shared-view',
+          fetched: false,
+          rowCount: 0,
+          error: 'Airtable shared view is too large to import safely.',
+          requiresConfiguration: true,
+          configurationKey: 'DEAL_HUNTER_AIRTABLE_TOKEN',
+        },
+      ],
+    },
+  });
+  const airtableStatus = health.sources.find((source) => source.id === 'airtable-shared');
+
+  assert.equal(health.healthy, false);
+  assert.equal(airtableStatus.tone, 'warning');
+  assert.equal(airtableStatus.requiresConfiguration, true);
+  assert.equal(airtableStatus.configurationKey, 'DEAL_HUNTER_AIRTABLE_TOKEN');
+  assert.equal(health.issues.some((issue) => issue.sourceId === 'airtable-shared'), true);
+  assert.equal(health.issues.some((issue) => issue.sourceId === 'daily-update-window'), false);
+});
+
 test('source health snapshot preserves last healthy row count when a source drops', () => {
   const previousSnapshot = {
     dateKey: '2026-06-15',
@@ -227,6 +274,52 @@ test('read-only source health checks do not persist source snapshots', async () 
 
     assert.equal(sourceHealth.sources[0].rowCount, 100);
     assert.equal(fs.existsSync(snapshotPath), false);
+  } finally {
+    if (previousSnapshotPath === undefined) {
+      delete process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH;
+    } else {
+      process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH = previousSnapshotPath;
+    }
+  }
+});
+
+test('source health uses cached snapshot unless explicitly refreshed', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-source-health-cache-'));
+  const snapshotPath = path.join(tempDir, 'source-health.json');
+  const previousSnapshotPath = process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH;
+  process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH = snapshotPath;
+  fs.writeFileSync(
+    snapshotPath,
+    JSON.stringify({
+      generatedAt: '2026-06-16T18:00:00.000Z',
+      dateKey: '2026-06-16',
+      issues: [],
+      totals: { reviewedDeals: 42 },
+      sources: {
+        'sheet-0': {
+          rowCount: 982,
+          name: 'SMB Deal Hunter Google Sheet',
+          mode: 'csv',
+          checkedAt: '2026-06-16T18:00:00.000Z',
+        },
+      },
+    }),
+  );
+
+  try {
+    const sourceHealth = await getSourceHealth(
+      {
+        async listDealHunterSeenDeals() {
+          throw new Error('live source review should not run');
+        },
+      },
+      { persistSnapshot: true },
+    );
+
+    assert.equal(sourceHealth.cached, true);
+    assert.equal(sourceHealth.healthy, true);
+    assert.equal(sourceHealth.sources[0].rowCount, 982);
+    assert.equal(sourceHealth.totals.reviewedDeals, 42);
   } finally {
     if (previousSnapshotPath === undefined) {
       delete process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH;

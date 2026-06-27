@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 
 process.env.ADMIN_SESSION_SECRET = 'turnstile-session-secret';
+process.env.TURNSTILE_SITE_KEY = 'turnstile-site-key';
 process.env.TURNSTILE_SECRET_KEY = 'turnstile-secret';
 
 const originalFetch = global.fetch;

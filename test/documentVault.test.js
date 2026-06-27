@@ -15,7 +15,7 @@ process.env.SECURE_DOCUMENTS_STORAGE_DIR = path.join(tempDir, 'secure-documents'
 process.env.SQLITE_PATH = path.join(tempDir, 'document-vault.sqlite');
 
 const { createSecureUploadRequest, uploadSecureDocuments } = await import('../server/services/documentVault.js');
-const { createManualSubmission } = await import('../server/services/submissions.js');
+const { createManualSubmission, deleteDashboardSubmission } = await import('../server/services/submissions.js');
 const { getStorage } = await import('../server/storage/index.js');
 
 after(() => {
@@ -117,6 +117,52 @@ test('secure upload infers allowed MIME type when browsers send octet-stream', a
   assert.equal(result.ok, true);
   assert.equal(documents.length, 1);
   assert.equal(documents[0].mime_type, 'text/csv');
+});
+
+test('deleting a CRM record removes secure upload data, email events, and stored files', async () => {
+  const storage = getStorage();
+  const { request, submission, token } = await createUploadToken('delete-cleanup-test@example.com');
+  const result = await uploadSecureDocuments({
+    token,
+    ndaAccepted: true,
+    request: requestFromIp('192.0.2.45'),
+    documents: [
+      {
+        name: 'financials.txt',
+        mimeType: 'text/plain',
+        contentBase64: Buffer.from('Plain text financials').toString('base64'),
+      },
+    ],
+  });
+  const documents = await storage.listSecureDocumentsByRequest(request.id);
+
+  assert.equal(result.ok, true);
+  assert.equal(documents.length, 1);
+  assert.equal(fs.existsSync(documents[0].storage_path), true);
+
+  await storage.insertEmailEvent({
+    id: 'delete-cleanup-email-event',
+    created_at: new Date().toISOString(),
+    provider: 'test',
+    event_type: 'delivered',
+    message_id: 'delete-cleanup-message',
+    provider_event_id: 'delete-cleanup-provider-event',
+    event_key: 'delete-cleanup-event-key',
+    recipient_email: 'delete-cleanup-test@example.com',
+    subject: 'Delete cleanup test',
+    submission_id: submission.id,
+    source: 'test',
+    metadata: {},
+  });
+
+  const deleted = await deleteDashboardSubmission(submission.id);
+
+  assert.equal(deleted.id, submission.id);
+  assert.equal(await storage.getSubmission(submission.id), null);
+  assert.equal(await storage.getSecureUploadRequest(request.id), null);
+  assert.deepEqual(await storage.listSecureDocumentsByRequest(request.id), []);
+  assert.deepEqual(await storage.listEmailEvents({ submissionId: submission.id }), []);
+  assert.equal(fs.existsSync(documents[0].storage_path), false);
 });
 
 test('secure upload recovers stale uploading requests before accepting files', async () => {

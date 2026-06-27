@@ -13,6 +13,7 @@ const cimRequestActiveStatuses = ['sent', 'logged', 'failed', 'follow_up_failed'
 const cimRequestTerminalStatuses = ['sent', 'logged', 'responded', 'delivery_issue', 'follow_up_failed', 'follow_up_pending'];
 const replyEventTypes = new Set(['replied', 'received']);
 const stopFollowUpEventTypes = new Set(['bounced', 'complained', 'failed', 'unsubscribed']);
+const cimBulkRequestMax = 25;
 const cimClaimStaleMinutes = 30;
 const cimRequestSendLocks = new Set();
 const cimFollowUpLocks = new Set();
@@ -869,9 +870,15 @@ function parseCsvRows(csvText = '') {
 function formatPayloadLimitError(byteLength, maxBytes) {
   const sizeMb = (byteLength / (1024 * 1024)).toFixed(1);
   const limitMb = (maxBytes / (1024 * 1024)).toFixed(1);
-  return new Error(
-    `Airtable shared view payload is ${sizeMb} MB, above the ${limitMb} MB safety limit. Add DEAL_HUNTER_AIRTABLE_TOKEN to use paged Airtable API mode.`,
+  const error = new Error(
+    `Airtable shared view is too large to import safely (${sizeMb} MB, limit ${limitMb} MB). Set DEAL_HUNTER_AIRTABLE_TOKEN so the app can use Airtable's paged API instead of the oversized shared view.`,
   );
+
+  error.code = 'AIRTABLE_SHARED_VIEW_PAYLOAD_LIMIT';
+  error.requiresConfiguration = true;
+  error.configurationKey = 'DEAL_HUNTER_AIRTABLE_TOKEN';
+
+  return error;
 }
 
 async function readResponseText(response, maxBytes = Infinity) {
@@ -1198,6 +1205,8 @@ async function collectSources(config) {
           fetched: false,
           rowCount: 0,
           error: error.message,
+          requiresConfiguration: Boolean(error.requiresConfiguration),
+          configurationKey: error.configurationKey || '',
         },
         deals: [],
       });
@@ -2470,22 +2479,9 @@ export async function sendDailyDealHunterReview() {
   };
 }
 
-export async function sendDealHunterCimRequest({ dealKey = '', requestedBy = '', storage = getStorage() } = {}) {
-  const normalizedDealKey = normalizeText(dealKey, 1000);
-
-  if (!normalizedDealKey) {
-    return { ok: false, status: 400, error: 'Deal key is required.' };
-  }
-
+async function sendCimRequestForScoredDeal({ deal, requestedBy = '', storage = getStorage() } = {}) {
   if (!storage.getDealHunterCimRequest || !storage.upsertDealHunterCimRequest) {
     return { ok: false, status: 500, error: 'CIM request tracking storage is not configured.' };
-  }
-
-  const result = await buildDailyDealReview({ storage });
-  const deal = result.scoredDeals.find((candidate) => candidate.dealKey === normalizedDealKey);
-
-  if (!deal) {
-    return { ok: false, status: 404, error: 'Deal was not found in the latest Deal Hunter review.' };
   }
 
   const recipientEmail = normalizeEmail(deal.brokerEmail);
@@ -2613,6 +2609,165 @@ export async function sendDealHunterCimRequest({ dealKey = '', requestedBy = '',
   } finally {
     releaseLock(cimRequestSendLocks, lockKey);
   }
+}
+
+export async function sendDealHunterCimRequest({ dealKey = '', requestedBy = '', storage = getStorage() } = {}) {
+  const normalizedDealKey = normalizeText(dealKey, 1000);
+
+  if (!normalizedDealKey) {
+    return { ok: false, status: 400, error: 'Deal key is required.' };
+  }
+
+  const result = await buildDailyDealReview({ storage });
+  const deal = result.scoredDeals.find((candidate) => candidate.dealKey === normalizedDealKey);
+
+  if (!deal) {
+    return { ok: false, status: 404, error: 'Deal was not found in the latest Deal Hunter review.' };
+  }
+
+  return sendCimRequestForScoredDeal({ deal, requestedBy, storage });
+}
+
+function normalizeCimRequestSelections(selections = []) {
+  if (!Array.isArray(selections)) {
+    return [];
+  }
+
+  const seen = new Set();
+  const normalizedSelections = [];
+
+  for (const selection of selections) {
+    const dealKey = normalizeText(selection?.dealKey || selection?.deal_key, 1000);
+    const recipientEmail = normalizeEmail(selection?.recipientEmail || selection?.recipient_email);
+    const key = `${dealKey}|${recipientEmail}`;
+
+    if (!dealKey || !recipientEmail || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    normalizedSelections.push({ dealKey, recipientEmail });
+  }
+
+  return normalizedSelections.slice(0, cimBulkRequestMax);
+}
+
+function buildSelectionFailure(selection, error) {
+  return {
+    ok: false,
+    alreadySent: false,
+    status: 409,
+    dealKey: selection.dealKey,
+    dealName: '',
+    recipientEmail: selection.recipientEmail,
+    error,
+    deal: null,
+  };
+}
+
+export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit = cimBulkRequestMax, selections = [], storage = getStorage() } = {}) {
+  if (!storage.getDealHunterCimRequest || !storage.upsertDealHunterCimRequest) {
+    return { ok: false, status: 500, error: 'CIM request tracking storage is not configured.' };
+  }
+
+  const safeLimit = Math.max(1, Math.min(Number(limit) || cimBulkRequestMax, cimBulkRequestMax));
+  const result = await buildDailyDealReview({ storage });
+  const selectedRecipients = normalizeCimRequestSelections(selections);
+  const allReadyDeals = result.scoredDeals
+    .filter((deal) => deal.cimRequest?.canRequest)
+    .sort(sortNewThenBest);
+  let readyDeals = allReadyDeals.slice(0, safeLimit);
+
+  if (selectedRecipients.length > 0) {
+    const readyByDealRecipient = new Map(
+      allReadyDeals.map((deal) => [`${deal.dealKey}|${normalizeEmail(deal.brokerEmail)}`, deal]),
+    );
+    const validationFailures = [];
+
+    readyDeals = selectedRecipients.map((selection) => {
+      const deal = readyByDealRecipient.get(`${selection.dealKey}|${selection.recipientEmail}`);
+
+      if (!deal) {
+        validationFailures.push(
+          buildSelectionFailure(
+            selection,
+            'This deal is no longer CIM-ready for the confirmed broker email. Review sources again before sending.',
+          ),
+        );
+      }
+
+      return deal;
+    }).filter(Boolean);
+
+    if (validationFailures.length > 0) {
+      return {
+        ok: false,
+        status: 409,
+        error: 'The CIM-ready list changed after the preview. Review sources again before sending broker emails.',
+        review: result.review,
+        results: validationFailures,
+        sent: 0,
+        alreadySent: 0,
+        failed: validationFailures.length,
+        totalReady: allReadyDeals.length,
+        totalRequested: selectedRecipients.length,
+        limited: false,
+        limit: safeLimit,
+      };
+    }
+  }
+
+  if (readyDeals.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'No CIM-ready 75+ deals are available. Review sources and confirm each deal has annual profit and a valid broker email.',
+      review: result.review,
+      results: [],
+      sent: 0,
+      alreadySent: 0,
+      failed: 0,
+      totalReady: allReadyDeals.length,
+      totalRequested: selectedRecipients.length,
+    };
+  }
+
+  const results = [];
+
+  for (const deal of readyDeals) {
+    const sendResult = await sendCimRequestForScoredDeal({ deal, requestedBy, storage });
+    results.push({
+      ok: Boolean(sendResult.ok),
+      alreadySent: Boolean(sendResult.alreadySent),
+      status: sendResult.status || (sendResult.ok ? 200 : 400),
+      dealKey: deal.dealKey,
+      dealName: deal.name,
+      recipientEmail: normalizeEmail(deal.brokerEmail),
+      error: sendResult.error || sendResult.emailResult?.error || '',
+      deal: sendResult.deal || null,
+    });
+  }
+
+  const sent = results.filter((item) => item.ok && !item.alreadySent).length;
+  const alreadySent = results.filter((item) => item.ok && item.alreadySent).length;
+  const failed = results.filter((item) => !item.ok).length;
+  const hasSuccessfulOutcome = sent + alreadySent > 0;
+  const allFailed = failed > 0 && !hasSuccessfulOutcome;
+
+  return {
+    ok: !allFailed,
+    status: allFailed ? 502 : 200,
+    error: allFailed ? 'No CIM request emails were sent. Review the failed results before retrying.' : '',
+    review: result.review,
+    results,
+    sent,
+    alreadySent,
+    failed,
+    totalReady: readyDeals.length,
+    totalRequested: selectedRecipients.length,
+    limited: selectedRecipients.length === 0 && result.review?.totals?.cimReady > readyDeals.length,
+    limit: safeLimit,
+  };
 }
 
 export async function runDealHunterCimFollowUps({ storage = getStorage(), limit = 50, now = new Date() } = {}) {

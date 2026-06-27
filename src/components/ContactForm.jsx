@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
+const turnstileScriptLoadTimeoutMs = 10000;
+
 function createInitialState() {
   return {
     name: '',
@@ -22,13 +24,52 @@ export default function ContactForm() {
   const [submitting, setSubmitting] = useState(false);
   const turnstileContainerRef = useRef(null);
   const turnstileWidgetIdRef = useRef(null);
+  const lastRenderedSiteKeyRef = useRef('');
   const buildTurnstileSiteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY || '';
-  const [turnstileSiteKey, setTurnstileSiteKey] = useState(buildTurnstileSiteKey);
+  const [turnstileConfigLoaded, setTurnstileConfigLoaded] = useState(false);
+  const [turnstileLoadError, setTurnstileLoadError] = useState('');
+  const [turnstileSiteKey, setTurnstileSiteKey] = useState('');
+  const turnstileRequired = turnstileConfigLoaded && Boolean(turnstileSiteKey);
 
   const isComplete = useMemo(
-    () => Boolean(formData.name && formData.email && formData.message && (!turnstileSiteKey || formData.turnstileToken)),
-    [formData.email, formData.message, formData.name, formData.turnstileToken, turnstileSiteKey],
+    () => Boolean(formData.name && formData.email && formData.message && turnstileConfigLoaded && (!turnstileRequired || formData.turnstileToken)),
+    [formData.email, formData.message, formData.name, formData.turnstileToken, turnstileConfigLoaded, turnstileRequired],
   );
+
+  function clearTurnstileToken() {
+    setFormData((current) => ({ ...current, turnstileToken: '' }));
+  }
+
+  function resetTurnstileWidget() {
+    clearTurnstileToken();
+
+    if (window.turnstile && turnstileWidgetIdRef.current !== null) {
+      try {
+        window.turnstile.reset(turnstileWidgetIdRef.current);
+      } catch {
+        turnstileWidgetIdRef.current = null;
+      }
+    }
+  }
+
+  function removeTurnstileWidget() {
+    clearTurnstileToken();
+
+    if (window.turnstile && turnstileWidgetIdRef.current !== null) {
+      try {
+        window.turnstile.remove(turnstileWidgetIdRef.current);
+      } catch {
+        // Cloudflare can throw if the widget was already removed during navigation.
+      }
+    }
+
+    turnstileWidgetIdRef.current = null;
+    lastRenderedSiteKeyRef.current = '';
+
+    if (turnstileContainerRef.current) {
+      turnstileContainerRef.current.innerHTML = '';
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -38,12 +79,17 @@ export default function ContactForm() {
         const response = await fetch('/api/public-config');
         const result = await response.json();
 
-        if (!cancelled && response.ok && result.success) {
-          setTurnstileSiteKey(String(result.turnstileSiteKey || buildTurnstileSiteKey));
+        if (!cancelled) {
+          const runtimeSiteKey = response.ok && result.success && result.turnstileEnabled
+            ? String(result.turnstileSiteKey || buildTurnstileSiteKey)
+            : '';
+          setTurnstileSiteKey(runtimeSiteKey);
+          setTurnstileConfigLoaded(true);
         }
       } catch {
         if (!cancelled) {
           setTurnstileSiteKey(buildTurnstileSiteKey);
+          setTurnstileConfigLoaded(true);
         }
       }
     }
@@ -56,26 +102,48 @@ export default function ContactForm() {
   }, [buildTurnstileSiteKey]);
 
   useEffect(() => {
-    if (!turnstileSiteKey || !turnstileContainerRef.current) {
+    if (!turnstileConfigLoaded || !turnstileContainerRef.current) {
+      return undefined;
+    }
+
+    if (!turnstileSiteKey) {
+      removeTurnstileWidget();
+      setTurnstileLoadError('');
       return undefined;
     }
 
     let intervalId;
+    let timeoutId;
+
+    if (lastRenderedSiteKeyRef.current && lastRenderedSiteKeyRef.current !== turnstileSiteKey) {
+      removeTurnstileWidget();
+    }
 
     function renderWidget() {
-      if (!window.turnstile || !turnstileContainerRef.current || turnstileWidgetIdRef.current !== null) {
+      if (!window.turnstile || !turnstileContainerRef.current || lastRenderedSiteKeyRef.current === turnstileSiteKey) {
         return;
       }
 
       turnstileWidgetIdRef.current = window.turnstile.render(turnstileContainerRef.current, {
         sitekey: turnstileSiteKey,
         callback: (token) => {
+          setTurnstileLoadError('');
           setFormData((current) => ({ ...current, turnstileToken: token }));
         },
         'expired-callback': () => {
-          setFormData((current) => ({ ...current, turnstileToken: '' }));
+          clearTurnstileToken();
+        },
+        'error-callback': () => {
+          clearTurnstileToken();
+          setTurnstileLoadError('Anti-spam verification could not be completed. Please try the checkbox again.');
+        },
+        'timeout-callback': () => {
+          clearTurnstileToken();
+          setTurnstileLoadError('Anti-spam verification timed out. Please try the checkbox again.');
         },
       });
+      lastRenderedSiteKeyRef.current = turnstileSiteKey;
+      setTurnstileLoadError('');
     }
 
     if (!window.turnstile) {
@@ -87,15 +155,25 @@ export default function ContactForm() {
         script.async = true;
         script.defer = true;
         script.dataset.turnstileScript = 'true';
+        script.onerror = () => {
+          setTurnstileLoadError('Anti-spam verification could not load. Please refresh the page or contact me directly by email.');
+        };
         document.head.appendChild(script);
       }
 
       intervalId = window.setInterval(() => {
         if (window.turnstile) {
           window.clearInterval(intervalId);
+          window.clearTimeout(timeoutId);
           renderWidget();
         }
       }, 150);
+      timeoutId = window.setTimeout(() => {
+        if (!window.turnstile) {
+          window.clearInterval(intervalId);
+          setTurnstileLoadError('Anti-spam verification could not load. Please refresh the page or contact me directly by email.');
+        }
+      }, turnstileScriptLoadTimeoutMs);
     } else {
       renderWidget();
     }
@@ -104,8 +182,11 @@ export default function ContactForm() {
       if (intervalId) {
         window.clearInterval(intervalId);
       }
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
     };
-  }, [turnstileSiteKey]);
+  }, [turnstileConfigLoaded, turnstileSiteKey]);
 
   function handleChange(event) {
     const { name, value } = event.target;
@@ -144,13 +225,11 @@ export default function ContactForm() {
       setSubmitted(true);
       setSubmitMessage(result.message || 'Your message has been received.');
       setFormData(createInitialState());
-
-      if (window.turnstile && turnstileWidgetIdRef.current !== null) {
-        window.turnstile.reset(turnstileWidgetIdRef.current);
-      }
+      resetTurnstileWidget();
     } catch (error) {
       setSubmitted(false);
       setSubmitError(error.message || 'Unable to send your inquiry right now.');
+      resetTurnstileWidget();
     } finally {
       setSubmitting(false);
     }
@@ -242,19 +321,24 @@ export default function ContactForm() {
           />
         </label>
 
-        {turnstileSiteKey ? (
+        {turnstileRequired ? (
           <div className="md:col-span-2">
             <div className="max-w-full overflow-x-auto">
               <div ref={turnstileContainerRef} />
             </div>
             <p className="mt-2 text-xs leading-6 text-ink/60">Anti-spam verification is enabled for inbound inquiries.</p>
+            {turnstileLoadError ? (
+              <p aria-live="polite" className="mt-2 text-xs font-medium leading-6 text-red-700">
+                {turnstileLoadError}
+              </p>
+            ) : null}
           </div>
         ) : null}
       </div>
 
       <div className="mt-6 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <p className="max-w-xl text-sm leading-6 text-ink/70">
-          Confidential conversations are welcome. This form now submits through the backend pipeline, where inquiries can be routed to email providers, a CRM webhook, and the private admin CRM.
+          Confidential conversations are welcome. This form submits through a private backend pipeline for email notification and the private admin CRM.
         </p>
 
         <button

@@ -1,4 +1,5 @@
-import { startTransition, useDeferredValue, useEffect, useMemo, useState } from 'react';
+import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import { Navigate, NavLink, useParams } from 'react-router-dom';
 import {
   Activity,
   BellRing,
@@ -20,6 +21,7 @@ import {
   Send,
   ShieldAlert,
   Target,
+  Trash2,
   XCircle,
 } from 'lucide-react';
 import PageHero from '../components/PageHero';
@@ -82,6 +84,15 @@ const diligenceChecklistItems = [
 ];
 const dailyDealUpdateUrl =
   'https://docs.google.com/spreadsheets/d/1d2mC6oKDY7DFQiaNQnF947Ro5CBwjIcAw_fwya7bpBc/edit?usp=sharing';
+const adminSections = [
+  { id: 'overview', label: 'Overview', href: '/admin', icon: Activity },
+  { id: 'crm', label: 'CRM Records', href: '/admin/crm', icon: Inbox },
+  { id: 'command-center', label: 'Command Center', href: '/admin/command-center', icon: Target },
+  { id: 'deal-hunter', label: 'Deal Hunter', href: '/admin/deal-hunter', icon: ClipboardList },
+  { id: 'prospecting', label: 'Prospecting', href: '/admin/prospecting', icon: MapPin },
+  { id: 'follow-ups', label: 'Follow-Ups', href: '/admin/follow-ups', icon: BellRing },
+  { id: 'new-record', label: 'New Record', href: '/admin/new-record', icon: Plus },
+];
 const primaryActionButtonClass =
   'inline-flex min-h-[46px] w-full min-w-0 items-center justify-center gap-2 rounded-full border border-moss bg-moss px-4 py-2.5 text-center text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50 sm:w-auto sm:px-5 sm:py-3';
 const secondaryActionButtonClass =
@@ -535,6 +546,70 @@ function SectionLabel({ children }) {
   return <p className="text-xs font-semibold uppercase leading-5 tracking-[0.14em] text-moss sm:text-sm sm:tracking-[0.18em]">{children}</p>;
 }
 
+function getCimReadyDealsFromReview(review, limit = 25) {
+  const seen = new Set();
+  const readyDeals = [];
+  const sections = [
+    ...(review?.qualified || []),
+    ...(review?.newlySeenMatches || []),
+    ...(review?.watchlist || []),
+  ];
+
+  for (const deal of sections) {
+    const recipientEmail = deal?.cimRequest?.recipientEmail || deal?.brokerEmail || '';
+    const key = `${deal?.dealKey || ''}|${recipientEmail.toLowerCase()}`;
+
+    if (!deal?.dealKey || !deal?.cimRequest?.canRequest || !recipientEmail || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    readyDeals.push({ ...deal, confirmedRecipientEmail: recipientEmail });
+
+    if (readyDeals.length >= limit) {
+      break;
+    }
+  }
+
+  return readyDeals;
+}
+
+function AdminSectionNav({ activeSection, isReadOnly }) {
+  const visibleSections = adminSections.filter((section) => !isReadOnly || section.id !== 'new-record');
+
+  return (
+    <aside className="admin-section-nav">
+      <nav className="admin-section-nav-card">
+        <div className="hidden px-2 pb-2 pt-1 xl:block">
+          <p className="text-[11px] font-semibold uppercase tracking-normal text-moss/75">Admin</p>
+        </div>
+        <div className="flex gap-2 overflow-x-auto overscroll-x-contain pb-1 xl:max-h-[calc(100vh-8rem)] xl:flex-col xl:overflow-y-auto xl:pb-0">
+          {visibleSections.map((section) => {
+            const Icon = section.icon;
+            const isActive = section.id === activeSection;
+
+            return (
+              <NavLink
+                className={`inline-flex min-h-10 shrink-0 items-center justify-center gap-2 rounded-full px-3.5 py-2 text-sm font-semibold transition xl:w-full xl:justify-start xl:rounded-xl ${
+                  isActive
+                    ? 'bg-moss text-white shadow-sm'
+                    : 'border border-transparent text-ink/72 hover:border-moss/20 hover:bg-moss/8 hover:text-moss'
+                }`}
+                end={section.id === 'overview'}
+                key={section.id}
+                to={section.href}
+              >
+                <Icon className="h-4 w-4" />
+                {section.label}
+              </NavLink>
+            );
+          })}
+        </div>
+      </nav>
+    </aside>
+  );
+}
+
 function Field({ label, children }) {
   return (
     <label className="flex min-w-0 flex-col gap-2 text-sm font-medium text-ink">
@@ -901,6 +976,9 @@ async function copyText(value) {
 }
 
 export default function DashboardPage() {
+  const { section = 'overview' } = useParams();
+  const validSectionIds = useMemo(() => new Set(adminSections.map((item) => item.id)), []);
+  const activeSection = validSectionIds.has(section) ? section : 'overview';
   const [authState, setAuthState] = useState({
     checked: false,
     authenticated: false,
@@ -920,18 +998,22 @@ export default function DashboardPage() {
   const [loginPending, setLoginPending] = useState(false);
   const [filters, setFilters] = useState({ search: '', status: 'all' });
   const [dashboardData, setDashboardData] = useState({ summary: null, submissions: [], notifications: [], emailTriage: [], total: 0 });
+  const [followUpData, setFollowUpData] = useState({ summary: null, notifications: [], emailTriage: [], total: 0 });
+  const [followUpError, setFollowUpError] = useState('');
+  const [followUpLoading, setFollowUpLoading] = useState(false);
   const [drafts, setDrafts] = useState({});
   const [loading, setLoading] = useState(false);
   const [actionError, setActionError] = useState('');
   const [savingSubmissionId, setSavingSubmissionId] = useState('');
   const [creatingUploadForId, setCreatingUploadForId] = useState('');
-  const [createOpen, setCreateOpen] = useState(false);
+  const [deletingSubmissionId, setDeletingSubmissionId] = useState('');
   const [createDraft, setCreateDraft] = useState(blankRecordDraft());
   const [createPending, setCreatePending] = useState(false);
   const [createError, setCreateError] = useState('');
   const [dealHunterReview, setDealHunterReview] = useState(null);
   const [dealHunterLoading, setDealHunterLoading] = useState(false);
   const [dealHunterSending, setDealHunterSending] = useState(false);
+  const [dealHunterBulkCimSending, setDealHunterBulkCimSending] = useState(false);
   const [dealHunterFollowUpRunning, setDealHunterFollowUpRunning] = useState(false);
   const [requestingCimDealKey, setRequestingCimDealKey] = useState('');
   const [dealHunterFeedback, setDealHunterFeedback] = useState({ error: '', message: '' });
@@ -953,6 +1035,8 @@ export default function DashboardPage() {
   const [prospectDiscoveryLoading, setProspectDiscoveryLoading] = useState(false);
   const [prospectDiscoveryRunning, setProspectDiscoveryRunning] = useState(false);
   const [prospectDiscoveryFeedback, setProspectDiscoveryFeedback] = useState({ error: '', message: '' });
+  const dashboardRequestRef = useRef({ controller: null, id: 0 });
+  const followUpRequestRef = useRef({ controller: null, id: 0 });
   const deferredSearch = useDeferredValue(filters.search);
   const isReadOnly = authState.role === 'viewer';
 
@@ -1000,7 +1084,12 @@ export default function DashboardPage() {
     await checkSession();
   }
 
-  async function loadDashboard(status, search) {
+  async function loadDashboard(status, search, options = {}) {
+    const requestId = dashboardRequestRef.current.id + 1;
+    const controller = new AbortController();
+
+    dashboardRequestRef.current.controller?.abort();
+    dashboardRequestRef.current = { controller, id: requestId };
     setLoading(true);
     setActionError('');
 
@@ -1017,7 +1106,12 @@ export default function DashboardPage() {
 
       const response = await fetch(`/api/admin/submissions?${query.toString()}`, {
         credentials: 'same-origin',
+        signal: controller.signal,
       });
+
+      if (dashboardRequestRef.current.id !== requestId) {
+        return;
+      }
 
       if (response.status === 401) {
         setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
@@ -1044,13 +1138,76 @@ export default function DashboardPage() {
         }, {}),
       );
     } catch (error) {
+      if (error.name === 'AbortError') {
+        return;
+      }
+
+      if (options.throwOnError) {
+        throw error;
+      }
+
       setActionError(error.message || 'Unable to load submissions.');
     } finally {
-      setLoading(false);
+      if (dashboardRequestRef.current.id === requestId) {
+        setLoading(false);
+      }
     }
   }
 
-  async function loadCommandCenter() {
+  async function loadFollowUps(options = {}) {
+    const requestId = followUpRequestRef.current.id + 1;
+    const controller = new AbortController();
+
+    followUpRequestRef.current.controller?.abort();
+    followUpRequestRef.current = { controller, id: requestId };
+    setFollowUpLoading(true);
+    setFollowUpError('');
+
+    try {
+      const response = await fetch('/api/admin/follow-ups', {
+        credentials: 'same-origin',
+        signal: controller.signal,
+      });
+
+      if (followUpRequestRef.current.id !== requestId) {
+        return;
+      }
+
+      if (response.status === 401) {
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
+        return;
+      }
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to load follow-ups.');
+      }
+
+      setFollowUpData({
+        summary: result.summary,
+        notifications: result.notifications || [],
+        emailTriage: result.emailTriage || [],
+        total: result.total,
+      });
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        return;
+      }
+
+      if (options.throwOnError) {
+        throw error;
+      }
+
+      setFollowUpError(error.message || 'Unable to load follow-ups.');
+    } finally {
+      if (followUpRequestRef.current.id === requestId) {
+        setFollowUpLoading(false);
+      }
+    }
+  }
+
+  async function loadCommandCenter(options = {}) {
     setCommandCenterLoading(true);
     setCommandCenterFeedback((current) => ({ ...current, error: '' }));
 
@@ -1072,6 +1229,10 @@ export default function DashboardPage() {
 
       setCommandCenter(result.commandCenter);
     } catch (error) {
+      if (options.throwOnError) {
+        throw error;
+      }
+
       setCommandCenterFeedback({ error: error.message || 'Unable to load the acquisition command center.', message: '' });
     } finally {
       setCommandCenterLoading(false);
@@ -1131,17 +1292,44 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
-    if (authState.authenticated) {
-      loadDashboard(filters.status, deferredSearch.trim());
+    if (!authState.authenticated) {
+      return;
     }
-  }, [authState.authenticated, deferredSearch, filters.status]);
+
+    if (activeSection === 'overview' || activeSection === 'crm') {
+      loadDashboard(filters.status, deferredSearch.trim());
+      return;
+    }
+
+    dashboardRequestRef.current.controller?.abort();
+    setLoading(false);
+  }, [activeSection, authState.authenticated, deferredSearch, filters.status]);
 
   useEffect(() => {
-    if (authState.authenticated) {
+    if (!authState.authenticated) {
+      return;
+    }
+
+    if (activeSection === 'overview' || activeSection === 'command-center') {
       loadCommandCenter();
+    }
+
+    if (activeSection === 'overview' || activeSection === 'follow-ups') {
+      loadFollowUps();
+    } else {
+      followUpRequestRef.current.controller?.abort();
+      setFollowUpLoading(false);
+    }
+
+    if (activeSection === 'prospecting') {
       loadProspectDiscovery();
     }
-  }, [authState.authenticated]);
+  }, [activeSection, authState.authenticated]);
+
+  useEffect(() => () => {
+    dashboardRequestRef.current.controller?.abort();
+    followUpRequestRef.current.controller?.abort();
+  }, []);
 
   async function handleMagicLinkRequest(event) {
     event.preventDefault();
@@ -1272,6 +1460,68 @@ export default function DashboardPage() {
     }
   }
 
+  async function handleDeleteSubmission(submission) {
+    if (isReadOnly) {
+      setActionError('Read-only users can view CRM records but cannot delete records.');
+      return;
+    }
+
+    if (!submission?.id) {
+      return;
+    }
+
+    const label = submission.company || submission.name || 'this CRM record';
+    const confirmed = window.confirm(
+      `Delete ${label}? This permanently removes the CRM record, related upload requests, documents, and email events. Use Archive instead if you want to keep it for history.`,
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletingSubmissionId(submission.id);
+    setActionError('');
+
+    try {
+      const response = await fetch(`/api/admin/submissions/${submission.id}`, {
+        method: 'DELETE',
+        credentials: 'same-origin',
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to delete CRM record.');
+      }
+
+      setDashboardData((current) => ({
+        ...current,
+        submissions: current.submissions.filter((item) => item.id !== submission.id),
+        notifications: current.notifications.filter((item) => item.id !== submission.id),
+        emailTriage: current.emailTriage.filter((item) => item.id !== submission.id),
+        total: Math.max(0, Number(current.total || 0) - 1),
+      }));
+      setDrafts((current) => {
+        const next = { ...current };
+        delete next[submission.id];
+        return next;
+      });
+      const refreshResults = await Promise.allSettled([
+        loadDashboard(filters.status, deferredSearch.trim(), { throwOnError: true }),
+        loadCommandCenter({ throwOnError: true }),
+        loadFollowUps({ throwOnError: true }),
+      ]);
+      const refreshFailed = refreshResults.some((result) => result.status === 'rejected');
+
+      if (refreshFailed) {
+        setActionError('CRM record deleted, but one admin section did not refresh. Reload the admin page if anything looks stale.');
+      }
+    } catch (error) {
+      setActionError(error.message || 'Unable to delete CRM record.');
+    } finally {
+      setDeletingSubmissionId('');
+    }
+  }
+
   async function handleCommandCenterUpdate(record, payload) {
     if (isReadOnly) {
       setCommandCenterFeedback({ error: 'Read-only users can view the command center but cannot update records.', message: '' });
@@ -1340,7 +1590,6 @@ export default function DashboardPage() {
       }
 
       setCreateDraft(blankRecordDraft());
-      setCreateOpen(false);
       await Promise.all([
         loadDashboard(filters.status, deferredSearch.trim()),
         loadCommandCenter(),
@@ -1549,6 +1798,93 @@ export default function DashboardPage() {
     }
   }
 
+  async function handleSendReadyCimRequests() {
+    if (isReadOnly) {
+      setDealHunterFeedback({ error: 'Read-only users cannot send CIM requests.', message: '' });
+      return;
+    }
+
+    if (!dealHunterReview) {
+      setDealHunterFeedback({
+        error: 'Review sources first, then send CIM requests from the confirmed preview list.',
+        message: '',
+      });
+      return;
+    }
+
+    const readyDeals = getCimReadyDealsFromReview(dealHunterReview);
+
+    if (readyDeals.length === 0) {
+      setDealHunterFeedback({
+        error: 'No CIM-ready 75+ deals are available in the loaded review. Confirm each deal has annual profit and a valid broker email.',
+        message: '',
+      });
+      return;
+    }
+
+    const previewLines = readyDeals
+      .slice(0, 10)
+      .map((deal) => `- ${deal.name || 'Unnamed deal'} -> ${deal.confirmedRecipientEmail}`)
+      .join('\n');
+    const additionalCount = readyDeals.length > 10 ? `\n...and ${readyDeals.length - 10} more.` : '';
+    const confirmed = window.confirm(
+      `Send CIM request emails to these ${readyDeals.length} confirmed broker recipient${readyDeals.length === 1 ? '' : 's'}?\n\n${previewLines}${additionalCount}\n\nThis will email brokers directly.`,
+    );
+
+    if (!confirmed) {
+      return;
+    }
+
+    setDealHunterBulkCimSending(true);
+    setDealHunterFeedback({ error: '', message: '' });
+
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-requests/send-ready', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          limit: readyDeals.length,
+          selections: readyDeals.map((deal) => ({
+            dealKey: deal.dealKey,
+            recipientEmail: deal.confirmedRecipientEmail,
+          })),
+        }),
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        setDealHunterReview(result.review || dealHunterReview);
+        throw new Error(result.error || 'Unable to send CIM requests.');
+      }
+
+      (result.results || []).forEach((item) => {
+        if (item.deal) {
+          replaceDealHunterDeal(item.deal);
+        }
+      });
+
+      await handleLoadDealHunterReview();
+      await Promise.all([
+        loadCommandCenter(),
+        loadDashboard(filters.status, deferredSearch.trim()),
+      ]);
+
+      const limitedMessage = result.limited ? ` Limited to ${result.limit || 25} sends this run.` : '';
+      const failedMessage = result.failed ? ` ${result.failed} failed and should be reviewed.` : '';
+      setDealHunterFeedback({
+        error: result.failed ? failedMessage.trim() : '',
+        message: `CIM request run complete: ${result.sent || 0} sent, ${result.alreadySent || 0} already sent, ${result.failed || 0} failed.${limitedMessage}`,
+      });
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to send CIM requests.', message: '' });
+    } finally {
+      setDealHunterBulkCimSending(false);
+    }
+  }
+
   async function handleRunCimFollowUps() {
     if (isReadOnly) {
       setDealHunterFeedback({ error: 'Read-only users cannot run CIM follow-ups.', message: '' });
@@ -1659,8 +1995,18 @@ export default function DashboardPage() {
   };
 
   const submissions = useMemo(() => dashboardData.submissions || [], [dashboardData.submissions]);
-  const notifications = useMemo(() => dashboardData.notifications || [], [dashboardData.notifications]);
-  const emailTriage = useMemo(() => dashboardData.emailTriage || [], [dashboardData.emailTriage]);
+  const followUpSummary = followUpData.summary || {};
+  const notifications = useMemo(() => followUpData.notifications || [], [followUpData.notifications]);
+  const emailTriage = useMemo(() => followUpData.emailTriage || [], [followUpData.emailTriage]);
+  const adminSummary = {
+    ...summary,
+    actionItems: followUpSummary.actionItems ?? summary.actionItems,
+    overdue: followUpSummary.overdue ?? summary.overdue,
+    dueSoon: followUpSummary.dueSoon ?? summary.dueSoon,
+    missingNextAction: followUpSummary.missingNextAction ?? summary.missingNextAction,
+    emailEngaged: followUpSummary.emailEngaged ?? summary.emailEngaged,
+    hotLeads: followUpSummary.hotLeads ?? summary.hotLeads,
+  };
   const commandSummary = commandCenter?.summary || {
     totalRecords: 0,
     score75Plus: 0,
@@ -1672,6 +2018,14 @@ export default function DashboardPage() {
   const commandPipeline = commandCenter?.pipeline || acquisitionPipelineStages.map((stage) => ({ id: stage, count: 0, records: [] }));
   const commandSourceHealth = commandCenter?.sourceHealth || { healthy: true, issues: [], sources: [], totals: {} };
   const commandFeedback = commandCenter?.feedback || { goodFit: 0, falsePositive: 0, falsePositiveReasons: {}, recommendations: [] };
+
+  if (!validSectionIds.has(section)) {
+    return <Navigate replace to="/admin" />;
+  }
+
+  if (authState.authenticated && isReadOnly && activeSection === 'new-record') {
+    return <Navigate replace to="/admin/crm" />;
+  }
 
   if (!authState.checked) {
     return (
@@ -1781,43 +2135,48 @@ export default function DashboardPage() {
     <>
       <Seo description="Private admin CRM for Uckele Group." keywords="private admin crm" noindex title="Admin | Uckele Group" />
 
-      <PageHero
-        description="Private admin area for tracking broker and seller opportunities, internal notes, and follow-up priorities."
-        eyebrow="Admin CRM"
-        title="Acquisition pipeline, notes, and follow-up prompts"
-      />
-
-      <section className="section-shell mt-10">
-        <Reveal className="panel px-5 py-7 sm:px-9 sm:py-8">
-          <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-            <div>
-              <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">
-                Signed in as {authState.username}{isReadOnly ? ' · Read-only viewer' : ''}
+      <section className="admin-page-header">
+        <Reveal className="admin-page-header-card">
+          <div className="flex flex-col gap-5 xl:flex-row xl:items-center xl:justify-between">
+            <div className="min-w-0">
+              <p className="text-[11px] font-semibold uppercase tracking-normal text-moss">Private Admin</p>
+              <h1 className="mt-2 text-3xl font-semibold leading-tight text-ink sm:text-4xl">Admin workspace</h1>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-ink/68 sm:text-base">
+                CRM records, Deal Hunter scoring, prospecting, and follow-up work are split into focused views so daily admin work stays readable.
               </p>
-              <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Broker and seller CRM</h2>
-              <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
-                This is no longer just a submissions inbox. It now tracks sourced opportunities, broker conversations, seller follow-ups, deal notes, and secure document requests in one place.
-              </p>
-              {isReadOnly ? (
-                <p className="mt-4 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-medium leading-6 text-sky-800">
-                  Read-only access is enabled for this session. You can view records, Deal Hunter scoring, source health, and conversations, but create, edit, email, import, export, CIM, and upload actions are disabled.
-                </p>
-              ) : null}
             </div>
 
-            <div className="grid w-full gap-3 sm:flex sm:w-auto sm:flex-wrap">
+            <div className="admin-session-panel">
+              <p className="text-xs font-semibold uppercase tracking-normal text-moss/75">Signed in</p>
+              <p className="mt-1 text-sm font-semibold text-ink">
+                {authState.username}{isReadOnly ? ' · Read-only viewer' : ''}
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-5 flex flex-col gap-4 border-t border-line/80 pt-4 lg:flex-row lg:items-center lg:justify-between">
+            {isReadOnly ? (
+              <p className="rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-medium leading-6 text-sky-800">
+                Read-only access is enabled. You can view CRM records, scoring, source health, and conversations, but write actions are disabled.
+              </p>
+            ) : (
+              <p className="text-sm leading-6 text-ink/68">
+                Use the navigation to move between focused admin workspaces.
+              </p>
+            )}
+
+            <div className="admin-action-row">
               {!isReadOnly ? (
                 <>
-                  <button
-                    className={primaryActionButtonClass}
-                    onClick={() => setCreateOpen((current) => !current)}
-                    type="button"
+                  <NavLink
+                    className={`${primaryActionButtonClass} admin-action-button`}
+                    to="/admin/new-record"
                   >
                     <Plus className="h-4 w-4" />
-                    {createOpen ? 'Close New Record' : 'New CRM Record'}
-                  </button>
+                    New CRM Record
+                  </NavLink>
                   <a
-                    className={secondaryActionButtonClass}
+                    className={`${secondaryActionButtonClass} admin-action-button`}
                     href="/api/admin/submissions/export"
                   >
                     <Download className="h-4 w-4" />
@@ -1826,7 +2185,7 @@ export default function DashboardPage() {
                 </>
               ) : null}
               <a
-                className={secondaryActionButtonClass}
+                className={`${secondaryActionButtonClass} admin-action-button`}
                 href={dailyDealUpdateUrl}
                 rel="noreferrer"
                 target="_blank"
@@ -1835,7 +2194,7 @@ export default function DashboardPage() {
                 Daily Deal Update
               </a>
               <button
-                className={secondaryActionButtonClass}
+                className={`${secondaryActionButtonClass} admin-action-button`}
                 onClick={handleLogout}
                 type="button"
               >
@@ -1847,18 +2206,70 @@ export default function DashboardPage() {
         </Reveal>
       </section>
 
+      <section className="admin-workspace-shell mt-5 pb-8">
+        <div className="admin-workspace-grid">
+          <AdminSectionNav activeSection={activeSection} isReadOnly={isReadOnly} />
+
+          <div className="admin-content-with-side-nav">
+      {activeSection === 'overview' ? (
+      <>
       <section className="section-shell mt-8">
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
           <StatCard icon={Inbox} label="Total Records" value={summary.total} />
-          <StatCard icon={BellRing} label="Action Items" value={summary.actionItems} tone={summary.actionItems > 0 ? 'warning' : 'default'} />
-          <StatCard icon={CalendarClock} label="Overdue" value={summary.overdue} tone={summary.overdue > 0 ? 'danger' : 'default'} />
-          <StatCard icon={ClipboardList} label="Due Soon" value={summary.dueSoon} tone={summary.dueSoon > 0 ? 'warning' : 'default'} />
-          <StatCard icon={MailCheck} label="Warm Leads" value={summary.emailEngaged} tone={summary.emailEngaged > 0 ? 'warning' : 'default'} />
+          <StatCard icon={BellRing} label="Action Items" value={adminSummary.actionItems} tone={adminSummary.actionItems > 0 ? 'warning' : 'default'} />
+          <StatCard icon={CalendarClock} label="Overdue" value={adminSummary.overdue} tone={adminSummary.overdue > 0 ? 'danger' : 'default'} />
+          <StatCard icon={ClipboardList} label="Due Soon" value={adminSummary.dueSoon} tone={adminSummary.dueSoon > 0 ? 'warning' : 'default'} />
+          <StatCard icon={MailCheck} label="Warm Leads" value={adminSummary.emailEngaged} tone={adminSummary.emailEngaged > 0 ? 'warning' : 'default'} />
           <StatCard icon={MailCheck} label="Last 7 Days" value={summary.lastSevenDays} />
           <StatCard icon={ShieldAlert} label="Spam" value={summary.spam} />
         </div>
       </section>
+      <section className="section-shell mt-5">
+        <Reveal className="panel p-5 sm:p-6">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+            <div>
+              <SectionLabel>Admin Areas</SectionLabel>
+              <h2 className="mt-2 text-xl font-semibold text-ink sm:text-2xl">Choose a focused workspace</h2>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-ink/68">
+                Each admin workflow now has its own page so daily review, CRM editing, prospecting, and follow-up work stay separated.
+              </p>
+            </div>
+          </div>
+          <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {adminSections
+              .filter((item) => item.id !== 'overview' && (!isReadOnly || item.id !== 'new-record'))
+              .map((item) => {
+                const Icon = item.icon;
+                const descriptions = {
+                  crm: 'Search, edit, diligence-check, and manage broker or seller CRM records.',
+                  'command-center': 'Review the 75+ pipeline, source health, action queue, and pass decisions.',
+                  'deal-hunter': 'Run source scoring, send daily deal emails, and manage CIM follow-ups.',
+                  prospecting: 'Run local business discovery and review imported prospect leads.',
+                  'follow-ups': 'Work the generated follow-up prompts and email engagement triage queue.',
+                  'new-record': 'Create a manual broker, seller, referral, or prospect record.',
+                };
 
+                return (
+                  <NavLink
+                    className="admin-workspace-link"
+                    key={item.id}
+                    to={item.href}
+                  >
+                    <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-moss/10 text-moss">
+                      <Icon className="h-5 w-5" />
+                    </div>
+                    <h3 className="mt-3 text-base font-semibold text-ink">{item.label}</h3>
+                    <p className="mt-1.5 text-sm leading-6 text-ink/68">{descriptions[item.id]}</p>
+                  </NavLink>
+                );
+              })}
+          </div>
+        </Reveal>
+      </section>
+      </>
+      ) : null}
+
+      {activeSection === 'command-center' ? (
       <section className="section-shell mt-8">
         <Reveal className="panel p-5 sm:p-8">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
@@ -1902,16 +2313,21 @@ export default function DashboardPage() {
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <SectionLabel>Source Health</SectionLabel>
                 <Pill tone={commandSourceHealth.healthy ? 'success' : 'warning'}>
-                  {commandSourceHealth.healthy ? 'Healthy' : 'Needs review'}
+                  {commandSourceHealth.cached ? 'Cached' : commandSourceHealth.healthy ? 'Healthy' : 'Needs review'}
                 </Pill>
               </div>
-              <p className="mt-3 text-sm leading-6 text-ink/68">Last checked: {formatDateTime(commandSourceHealth.generatedAt)}</p>
+              <p className="mt-3 text-sm leading-6 text-ink/68">
+                {commandSourceHealth.cached ? 'Last source review' : 'Last checked'}: {formatDateTime(commandSourceHealth.generatedAt)}
+              </p>
               <div className="mt-4 space-y-3">
                 {(commandSourceHealth.sources || []).map((source) => (
                   <div className="rounded-2xl border border-line/80 bg-white/75 px-4 py-3 text-sm leading-6 text-ink/74" key={source.id}>
                     <div className="flex flex-wrap items-center gap-2">
                       <p className="font-semibold text-ink">{source.name || source.id}</p>
-                      <Pill tone={commandCenterTone(source.tone)}>{source.fetched ? `${source.rowCount || 0} rows` : 'failed'}</Pill>
+                      <Pill tone={commandCenterTone(source.tone)}>
+                        {source.fetched ? `${source.rowCount || 0} rows` : source.requiresConfiguration ? 'setup needed' : 'failed'}
+                      </Pill>
+                      {source.configurationKey ? <Pill tone="warning">{source.configurationKey}</Pill> : null}
                       {source.previousRowCount ? (
                         <Pill tone={source.rowDelta < 0 ? 'warning' : 'default'}>
                           {source.rowDelta >= 0 ? '+' : ''}{source.rowDelta}
@@ -1922,7 +2338,7 @@ export default function DashboardPage() {
                   </div>
                 ))}
                 {commandSourceHealth.sources?.length === 0 ? (
-                  <p className="text-sm leading-7 text-ink/68">No source health data loaded yet.</p>
+                  <p className="text-sm leading-7 text-ink/68">No cached source health data loaded yet. Use Deal Hunter &gt; Review Sources to refresh source status.</p>
                 ) : null}
               </div>
               {commandSourceHealth.issues?.length > 0 ? (
@@ -2028,7 +2444,9 @@ export default function DashboardPage() {
           </div>
         </Reveal>
       </section>
+      ) : null}
 
+      {activeSection === 'prospecting' ? (
       <section className="section-shell mt-8">
         <Reveal className="panel p-5 sm:p-8">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
@@ -2186,22 +2604,24 @@ export default function DashboardPage() {
           </div>
         </Reveal>
       </section>
+      ) : null}
 
-      <section className="section-shell mt-8">
-        <Reveal className="panel p-5 sm:p-8">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+      {activeSection === 'deal-hunter' ? (
+      <section className="section-shell mt-5">
+        <Reveal className="panel p-5 sm:p-6">
+          <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
             <div>
               <SectionLabel>Deal Hunter Scoring</SectionLabel>
-              <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Daily source review</h2>
-              <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
+              <h2 className="mt-2 text-xl font-semibold text-ink sm:text-2xl">Daily source review</h2>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-ink/68 sm:text-base sm:leading-7">
                 Pulls the SMB Deal Hunter sheet and the larger Airtable business list, scores recent listings against your acquisition profile, and flags removals for tomorrow's update.
               </p>
             </div>
 
-            <div className="grid w-full gap-3 sm:flex sm:w-auto sm:flex-wrap">
+            <div className="admin-action-row xl:justify-end">
               <button
-                className={secondaryActionButtonClass}
-                disabled={dealHunterLoading || dealHunterSending || dealHunterFollowUpRunning}
+                className={`${secondaryActionButtonClass} admin-action-button`}
+                disabled={dealHunterLoading || dealHunterSending || dealHunterBulkCimSending || dealHunterFollowUpRunning}
                 onClick={handleLoadDealHunterReview}
                 type="button"
               >
@@ -2211,8 +2631,17 @@ export default function DashboardPage() {
               {!isReadOnly ? (
                 <>
                   <button
-                    className={secondaryActionButtonClass}
-                    disabled={dealHunterLoading || dealHunterSending || dealHunterFollowUpRunning}
+                    className={`${primaryActionButtonClass} admin-action-button`}
+                    disabled={dealHunterLoading || dealHunterSending || dealHunterBulkCimSending || dealHunterFollowUpRunning}
+                    onClick={handleSendReadyCimRequests}
+                    type="button"
+                  >
+                    <Send className="h-4 w-4" />
+                    {dealHunterBulkCimSending ? 'Sending CIMs...' : 'Send CIM Requests'}
+                  </button>
+                  <button
+                    className={`${secondaryActionButtonClass} admin-action-button`}
+                    disabled={dealHunterLoading || dealHunterSending || dealHunterBulkCimSending || dealHunterFollowUpRunning}
                     onClick={handleRunCimFollowUps}
                     type="button"
                   >
@@ -2220,8 +2649,8 @@ export default function DashboardPage() {
                     {dealHunterFollowUpRunning ? 'Checking...' : 'Run CIM Follow-Ups'}
                   </button>
                   <button
-                    className={primaryActionButtonClass}
-                    disabled={dealHunterLoading || dealHunterSending || dealHunterFollowUpRunning}
+                    className={`${secondaryActionButtonClass} admin-action-button`}
+                    disabled={dealHunterLoading || dealHunterSending || dealHunterBulkCimSending || dealHunterFollowUpRunning}
                     onClick={handleSendDealHunterEmail}
                     type="button"
                   >
@@ -2359,13 +2788,28 @@ export default function DashboardPage() {
             </div>
           ) : (
             <p className="mt-6 rounded-2xl border border-line/80 bg-fog/70 px-4 py-4 text-sm leading-7 text-ink/70 sm:px-5">
-              No source review loaded yet.
+              No source review loaded yet. Use Review Sources to preview scored deals before sending CIM requests. Send Daily Email only sends the internal review to you.
             </p>
           )}
         </Reveal>
       </section>
+      ) : null}
 
-      {notifications.length > 0 ? (
+      {activeSection === 'follow-ups' && followUpError ? (
+        <section className="section-shell mt-8">
+          <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{followUpError}</div>
+        </section>
+      ) : null}
+
+      {activeSection === 'follow-ups' && followUpLoading ? (
+        <section className="section-shell mt-8">
+          <Reveal className="panel p-7 text-sm leading-7 text-ink/70">
+            Loading follow-up prompts and email triage...
+          </Reveal>
+        </section>
+      ) : null}
+
+      {activeSection === 'follow-ups' && !followUpLoading && notifications.length > 0 ? (
         <section className="section-shell mt-8">
           <Reveal className="panel p-5 sm:p-8">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
@@ -2376,7 +2820,7 @@ export default function DashboardPage() {
                   These prompts are generated from status, lead type, reminder dates, and document activity so you can keep seller and broker conversations moving without guessing.
                 </p>
               </div>
-              <Pill tone={summary.overdue > 0 ? 'danger' : 'warning'}>{summary.actionItems} active prompts</Pill>
+              <Pill tone={adminSummary.overdue > 0 ? 'danger' : 'warning'}>{adminSummary.actionItems} active prompts</Pill>
             </div>
 
             <div className="mt-6 grid gap-4 lg:grid-cols-2">
@@ -2408,7 +2852,7 @@ export default function DashboardPage() {
         </section>
       ) : null}
 
-      {emailTriage.length > 0 ? (
+      {activeSection === 'follow-ups' && !followUpLoading && emailTriage.length > 0 ? (
         <section className="section-shell mt-8">
           <Reveal className="panel p-5 sm:p-8">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
@@ -2419,7 +2863,7 @@ export default function DashboardPage() {
                   These records have opens, clicks, replies, or delivery issues that should change the follow-up plan.
                 </p>
               </div>
-              <Pill tone={summary.hotLeads > 0 ? 'success' : 'warning'}>{summary.hotLeads} hot lead(s)</Pill>
+              <Pill tone={adminSummary.hotLeads > 0 ? 'success' : 'warning'}>{adminSummary.hotLeads} hot lead(s)</Pill>
             </div>
 
             <div className="mt-6 grid gap-4 lg:grid-cols-2">
@@ -2451,7 +2895,15 @@ export default function DashboardPage() {
         </section>
       ) : null}
 
-      {createOpen && !isReadOnly ? (
+      {activeSection === 'follow-ups' && !followUpLoading && !followUpError && notifications.length === 0 && emailTriage.length === 0 ? (
+        <section className="section-shell mt-8">
+          <Reveal className="panel p-7 text-sm leading-7 text-ink/70">
+            No follow-up prompts or email engagement triage items need attention right now.
+          </Reveal>
+        </section>
+      ) : null}
+
+      {activeSection === 'new-record' && !isReadOnly ? (
         <section className="section-shell mt-8">
           <Reveal className="panel p-6 sm:p-8">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
@@ -2642,6 +3094,7 @@ export default function DashboardPage() {
         </section>
       ) : null}
 
+      {activeSection === 'crm' ? (
       <section className="section-shell mt-8">
         <Reveal className="panel p-6 sm:p-7">
           <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_220px]">
@@ -2678,13 +3131,15 @@ export default function DashboardPage() {
           </div>
         </Reveal>
       </section>
+      ) : null}
 
-      {actionError ? (
+      {activeSection === 'crm' && actionError ? (
         <section className="section-shell mt-6">
           <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{actionError}</div>
         </section>
       ) : null}
 
+      {activeSection === 'crm' ? (
       <section className="section-shell mt-8 pb-8">
         <div className="space-y-6">
           {submissions.map((submission, index) => {
@@ -2693,6 +3148,7 @@ export default function DashboardPage() {
             const documents = submission.secure_documents || [];
             const isSaving = savingSubmissionId === submission.id;
             const isCreatingUpload = creatingUploadForId === submission.id;
+            const isDeleting = deletingSubmissionId === submission.id;
             const followUpPrompt = submission.follow_up_prompt;
             const diligence = normalizeDiligence(draft.diligence);
             const diligenceProgress = diligenceChecklistProgress(diligence);
@@ -3326,6 +3782,15 @@ export default function DashboardPage() {
                       {isCreatingUpload ? 'Creating Link...' : 'Create Secure Upload Link'}
                     </button>
 
+                    <button
+                      className="inline-flex min-h-[46px] w-full min-w-0 items-center justify-center gap-2 rounded-full border border-red-200 bg-red-50 px-4 py-2.5 text-center text-sm font-semibold text-red-700 transition hover:border-red-300 hover:bg-red-100 disabled:opacity-50 sm:w-auto sm:px-5 sm:py-3"
+                      disabled={isDeleting}
+                      onClick={() => handleDeleteSubmission(submission)}
+                      type="button"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                      {isDeleting ? 'Deleting...' : 'Delete Record'}
+                    </button>
                   </div>
                 ) : null}
               </Reveal>
@@ -3337,6 +3802,10 @@ export default function DashboardPage() {
           ) : null}
 
           {loading ? <Reveal className="panel p-7 text-sm leading-7 text-ink/70">Loading CRM records...</Reveal> : null}
+        </div>
+      </section>
+      ) : null}
+          </div>
         </div>
       </section>
     </>

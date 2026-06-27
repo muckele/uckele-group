@@ -46,11 +46,12 @@ export default function ContactPage() {
                           item
                         ) : item.kind === 'linkedin' ? (
                           <a
-                            aria-label="LinkedIn profile"
+                            aria-label="Mathew Uckele LinkedIn profile"
                             className="inline-flex h-11 w-11 items-center justify-center rounded-full border border-moss/15 bg-white text-moss transition hover:border-moss/30 hover:bg-moss/5"
                             href={item.href}
                             rel="noreferrer"
                             target="_blank"
+                            title="Mathew Uckele on LinkedIn"
                           >
                             <LinkedInIcon className="h-5 w-5" />
                           </a>

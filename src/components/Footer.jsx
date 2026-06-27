@@ -72,12 +72,13 @@ export default function Footer() {
                   .filter((item) => item.kind === 'linkedin')
                   .map((item) => (
                     <a
-                      aria-label="LinkedIn profile"
+                      aria-label="Mathew Uckele LinkedIn profile"
                       className="inline-flex h-11 w-11 items-center justify-center rounded-full border border-white/18 bg-white/10 text-white transition hover:border-white/30 hover:bg-white/16"
                       href={item.href}
                       key={`${item.kind}-${item.href}`}
                       rel="noreferrer"
                       target="_blank"
+                      title="Mathew Uckele on LinkedIn"
                     >
                       <LinkedInIcon className="h-5 w-5" />
                     </a>

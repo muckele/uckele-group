@@ -3,8 +3,9 @@ import { fetchWithTimeout } from '../utils/http.js';
 
 export async function verifyTurnstileToken(token, remoteIp) {
   const config = getConfig();
+  const enabled = Boolean(config.turnstile.siteKey && config.turnstile.secretKey);
 
-  if (!config.turnstile.secretKey) {
+  if (!enabled) {
     return {
       enabled: false,
       success: true,
@@ -36,7 +37,8 @@ export async function verifyTurnstileToken(token, remoteIp) {
         remoteip: remoteIp,
       }),
     });
-  } catch {
+  } catch (error) {
+    console.warn(`[turnstile] provider request failed: ${error.message}`);
     return {
       enabled: true,
       success: false,
@@ -53,10 +55,17 @@ export async function verifyTurnstileToken(token, remoteIp) {
   }
 
   const result = await response.json().catch(() => null);
+  const success = Boolean(result?.success);
+
+  if (!success) {
+    const errorCodes = Array.isArray(result?.['error-codes']) ? result['error-codes'].join(',') : 'unknown';
+    const hostname = result?.hostname || 'unknown';
+    console.warn(`[turnstile] verification failed codes=${errorCodes} hostname=${hostname}`);
+  }
 
   return {
     enabled: true,
-    success: Boolean(result?.success),
-    error: result?.success ? '' : 'Anti-spam verification failed. Please try again.',
+    success,
+    error: success ? '' : 'Anti-spam verification failed. Please try again.',
   };
 }
