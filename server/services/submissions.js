@@ -49,9 +49,9 @@ const enrichmentLookupBatchSize = 250;
 const dealFieldNormalizers = {
   company: (value) => normalizeField(value, 160),
   role: (value) => normalizeField(value, 80),
-  listing_url: (value) => normalizeField(value, 500),
-  business_website: (value) => normalizeField(value, 500),
-  prospectus_url: (value) => normalizeField(value, 500),
+  listing_url: (value) => normalizeCrmUrl(value, 500),
+  business_website: (value) => normalizeCrmUrl(value, 500),
+  prospectus_url: (value) => normalizeCrmUrl(value, 500),
   asking_price: (value) => normalizeField(value, 80),
   ttm_revenue: (value) => normalizeField(value, 80),
   ttm_ebitda: (value) => normalizeField(value, 80),
@@ -77,6 +77,23 @@ function normalizeField(value, maxLength = 5000) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, maxLength);
+}
+
+export function normalizeCrmUrl(value, maxLength = 500) {
+  const normalized = normalizeField(value, maxLength);
+
+  if (!normalized) {
+    return '';
+  }
+
+  const withProtocol = /^[a-z][a-z\d+\-.]*:/i.test(normalized) ? normalized : `https://${normalized}`;
+
+  try {
+    const url = new URL(withProtocol);
+    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : '';
+  } catch {
+    return '';
+  }
 }
 
 function normalizeEmail(value, maxLength = 200) {

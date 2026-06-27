@@ -60,6 +60,7 @@ export function getConfig() {
     server: {
       port: numberFromEnv(process.env.PORT, 8787),
       origin: process.env.PUBLIC_SITE_URL || defaultPublicOrigin,
+      outboundRequestTimeoutMs: numberFromEnv(process.env.OUTBOUND_HTTP_TIMEOUT_MS, 1000 * 10),
     },
     storage: {
       provider: process.env.STORAGE_PROVIDER || 'sqlite',
@@ -91,7 +92,7 @@ export function getConfig() {
       webhookSecret: process.env.CRM_WEBHOOK_SECRET || '',
     },
     turnstile: {
-      siteKey: process.env.VITE_TURNSTILE_SITE_KEY || '',
+      siteKey: process.env.TURNSTILE_SITE_KEY || process.env.VITE_TURNSTILE_SITE_KEY || '',
       secretKey: process.env.TURNSTILE_SECRET_KEY || '',
     },
     admin: {

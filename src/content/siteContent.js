@@ -178,7 +178,7 @@ export const homePage = {
       {
         title: 'My background is broad and execution-oriented',
         description:
-          'I bring experience across business administration, sales, operations, business development, and software or technical problem solving.',
+          'I bring hands-on operating experience from healthcare services, sales and growth leadership, process implementation, and prior roles at Tripadvisor, Better Mortgage, and Wayfair.',
       },
       {
         title: 'The process should feel steady and low-drama',
@@ -207,9 +207,9 @@ export const homePage = {
       'Clear and understandable business models',
       'Strong local reputation and dependable customer service',
       'Owners preparing for retirement, transition, or reduced day-to-day involvement',
-      'Flexible on location for the right opportunity',
+      'Southern California preferred, with flexibility nationwide for the right opportunity',
     ],
-    industries: ['Home services', 'B2B services', 'Niche local services', 'Operationally solid small businesses'],
+    industries: ['Professional services', 'Healthcare services', 'Home services', 'Environmental and waste services', 'Pet care and veterinary-related services'],
   },
   transitionApproach: {
     eyebrow: 'My Approach To Transition',
@@ -288,26 +288,6 @@ export const homePage = {
       },
     ],
   },
-  references: {
-    eyebrow: 'Future Social Proof',
-    title: 'Reference and testimonial blocks are ready for real seller and advisor feedback',
-    description:
-      'The cards below are intentionally marked as placeholders. They are included so the design has a dedicated space for future seller, broker, or advisor references without fabricating anything today.',
-    items: [
-      {
-        label: 'Seller Testimonial Placeholder',
-        text: 'Add a future note from an owner describing the process as respectful, clear, and aligned with continuity.',
-      },
-      {
-        label: 'Broker Testimonial Placeholder',
-        text: 'Add a future note from an intermediary highlighting professionalism, responsiveness, and realistic deal execution.',
-      },
-      {
-        label: 'Advisor Reference Placeholder',
-        text: 'Add a future endorsement from an attorney, lender, or accountant who has seen Mathew operate thoughtfully and follow through.',
-      },
-    ],
-  },
   contactCta: {
     title: 'Confidential conversations welcome',
     description:
@@ -322,21 +302,21 @@ export const aboutPage = {
     eyebrow: 'About',
     title: 'A grounded buyer who wants to own and operate a real business for the long term',
     description:
-      'My name is Mathew Uckele. I am looking to buy and operate a strong small business with the intention of preserving what the owner built and growing it thoughtfully over time.',
+      'My name is Mathew Uckele. I am a Los Angeles-based operator and acquisition entrepreneur focused on acquiring and growing an established service business for the long term.',
   },
   shortBio: {
     title: 'Short Bio',
     body: [
-      'I come from a business-oriented background with experience spanning business administration, sales, operations, business development, and software or technical problem solving.',
-      'What ties those experiences together is a bias toward practical execution: understanding how things work, building trusted relationships, and solving problems in a way that improves the business over time.',
-      'I am not looking to buy a business to flip it. I am looking for one good company that I can commit to, operate responsibly, and grow for the long term.',
+      'I am the co-founder and President of Golden Behavior Connection, an ABA healthcare services practice. That work has given me direct experience with operations, staffing, compliance, revenue cycle management, sales execution, and financial performance.',
+      'Earlier in my career, I held senior operating and commercial roles at Tripadvisor, Better Mortgage, and Wayfair, where I worked on scaling teams, improving processes, training, and growth initiatives.',
+      'I launched Uckele Group as my acquisition platform to buy and operate a durable, cash-flowing service business where I can bring disciplined management, operational support, and long-term ownership.',
     ],
   },
   story: {
     title: 'My Story',
     paragraphs: [
       'I have always been drawn to businesses that are quietly strong: companies with dependable customers, solid operations, and owners who built something valuable through consistency rather than hype. Those are often the businesses that matter most in their communities and industries, even if they do not draw a lot of attention.',
-      'My background has given me exposure to sales, operations, business development, administration, and technical work. That combination has shaped how I think. I value clear communication, practical systems, and the daily discipline required to keep a business healthy. I am comfortable learning how a company works end to end and doing the work required to support growth.',
+      'My background combines healthcare services operations, sales and growth leadership, software and process implementation, and team-building experience. That combination has shaped how I think: practical systems, clear communication, steady follow-through, and respect for the details that keep a business healthy.',
       'Buying and operating a small business is appealing to me because it combines responsibility with long-term stewardship. I want to carry forward something real, support the team and customer relationships already in place, and create durable value over time rather than chase quick financial outcomes.',
     ],
   },
@@ -395,19 +375,19 @@ export const criteriaPage = {
   specifics: [
     {
       label: 'Industries of interest',
-      value: 'Home services, B2B services, niche local services, and other operationally solid small businesses',
+      value: 'Professional services, healthcare services, tech-enabled operations, home services, environmental or waste services, pet care, and veterinary-related services',
     },
     {
       label: 'Location preference',
-      value: 'Flexible. Open to strong opportunities, including businesses that can be supported with a combination of local leadership and hands-on involvement.',
+      value: 'Southern California preferred. Open nationwide for a strong business with the right fundamentals, team, and transition plan.',
     },
     {
       label: 'SDE / EBITDA range',
-      value: '$[Insert lower range] to $[Insert upper range]',
+      value: '$250K to $750K+, with flexibility up to roughly $2M for the right opportunity',
     },
     {
       label: 'Revenue range',
-      value: '$[Insert lower range] to $[Insert upper range]',
+      value: 'Approximately $1M to $5M',
     },
   ],
   situations: {
@@ -548,7 +528,7 @@ export const faqItems = [
   {
     question: 'What size businesses are you looking for?',
     answer:
-      'I am focused on stable, profitable small businesses with strong customer relationships and understandable operations. The criteria page includes placeholder financial ranges that can be updated as your target size becomes more specific.',
+      'My typical target is a business with approximately $1M to $5M in revenue and $250K to $750K+ in SDE or EBITDA. I am open to larger opportunities up to roughly $2M in SDE or EBITDA where there is a strong fit, durable cash flow, and a clear path to financing.',
   },
   {
     question: 'Will you keep my employees?',

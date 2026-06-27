@@ -667,6 +667,14 @@ export function createSupabaseStorage(config) {
       return data;
     },
 
+    async deleteSecureDocument(id) {
+      const { error } = await client.from('secure_documents').delete().eq('id', id);
+
+      if (error) {
+        throw error;
+      }
+    },
+
     async listSecureDocumentsByRequest(requestId) {
       const { data, error } = await client
         .from('secure_documents')

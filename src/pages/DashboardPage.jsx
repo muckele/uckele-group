@@ -222,6 +222,23 @@ function emailEngagementTone(engagement) {
   return 'default';
 }
 
+function safeExternalHref(value) {
+  const rawValue = String(value || '').trim();
+
+  if (!rawValue) {
+    return '';
+  }
+
+  const withProtocol = /^[a-z][a-z\d+\-.]*:/i.test(rawValue) ? rawValue : `https://${rawValue}`;
+
+  try {
+    const url = new URL(withProtocol);
+    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : '';
+  } catch {
+    return '';
+  }
+}
+
 function formatEmailEngagement(engagement) {
   if (!engagement?.total) {
     return 'No tracked email activity yet.';
@@ -573,10 +590,13 @@ function TextAreaField({ label, value, onChange, placeholder = '' }) {
 }
 
 function LinksRow({ submission }) {
+  const listingHref = safeExternalHref(submission.listing_url);
+  const websiteHref = safeExternalHref(submission.business_website);
+  const prospectusHref = safeExternalHref(submission.prospectus_url);
   const links = [
-    submission.listing_url ? { href: submission.listing_url, label: 'Listing URL' } : null,
-    submission.business_website ? { href: submission.business_website, label: 'Website' } : null,
-    submission.prospectus_url ? { href: submission.prospectus_url, label: 'Prospectus / CIM' } : null,
+    listingHref ? { href: listingHref, label: 'Listing URL' } : null,
+    websiteHref ? { href: websiteHref, label: 'Website' } : null,
+    prospectusHref ? { href: prospectusHref, label: 'Prospectus / CIM' } : null,
   ].filter(Boolean);
 
   if (links.length === 0) {
@@ -602,6 +622,7 @@ function LinksRow({ submission }) {
 
 function DealHunterCard({ deal, mode = 'fit', onSendCimRequest, requestingCim = false, readOnly = false }) {
   const detailItems = mode === 'remove' ? deal.removeReasons || deal.concerns || [] : deal.strengths || [];
+  const listingHref = safeExternalHref(deal.listingUrl);
   const meta = [
     deal.industry,
     deal.location,
@@ -703,8 +724,8 @@ function DealHunterCard({ deal, mode = 'fit', onSendCimRequest, requestingCim = 
           </ul>
         </div>
       ) : null}
-      {deal.listingUrl ? (
-        <a className="mt-4 inline-flex text-sm font-semibold text-moss underline" href={deal.listingUrl} rel="noreferrer" target="_blank">
+      {listingHref ? (
+        <a className="mt-4 inline-flex text-sm font-semibold text-moss underline" href={listingHref} rel="noreferrer" target="_blank">
           View listing
         </a>
       ) : null}
@@ -737,6 +758,8 @@ function CommandCenterRecordCard({ record, updating, onUpdate, readOnly = false 
   const contactEmail = record.brokerEmail || record.sellerEmail || '';
   const isPassed = record.pipelineStage === 'passed';
   const feedbackTone = record.fitFeedback === 'good-fit' ? 'success' : record.fitFeedback === 'false-positive' ? 'danger' : 'default';
+  const listingHref = safeExternalHref(record.listingUrl);
+  const prospectusHref = safeExternalHref(record.prospectusUrl);
 
   return (
     <div className="min-w-0 rounded-2xl border border-line/80 bg-white/80 p-4 text-sm leading-6 text-ink/74 sm:p-5">
@@ -846,14 +869,14 @@ function CommandCenterRecordCard({ record, updating, onUpdate, readOnly = false 
       ) : null}
 
       <div className="mt-4 flex flex-wrap gap-3">
-        {record.listingUrl ? (
-          <a className="inline-flex items-center gap-2 text-sm font-semibold text-moss underline" href={record.listingUrl} rel="noreferrer" target="_blank">
+        {listingHref ? (
+          <a className="inline-flex items-center gap-2 text-sm font-semibold text-moss underline" href={listingHref} rel="noreferrer" target="_blank">
             <Link2 className="h-4 w-4" />
             Listing
           </a>
         ) : null}
-        {record.prospectusUrl ? (
-          <a className="inline-flex items-center gap-2 text-sm font-semibold text-moss underline" href={record.prospectusUrl} rel="noreferrer" target="_blank">
+        {prospectusHref ? (
+          <a className="inline-flex items-center gap-2 text-sm font-semibold text-moss underline" href={prospectusHref} rel="noreferrer" target="_blank">
             <ClipboardList className="h-4 w-4" />
             Documents
           </a>
@@ -2099,36 +2122,41 @@ export default function DashboardPage() {
               <SectionLabel>Recent Prospects</SectionLabel>
               {prospectDiscovery.discoveries?.length > 0 ? (
                 <div className="mt-4 space-y-3">
-                  {prospectDiscovery.discoveries.slice(0, 8).map((discovery) => (
-                    <div className="rounded-2xl border border-line/80 bg-white/75 px-4 py-3 text-sm leading-6 text-ink/74" key={discovery.id}>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <p className="font-semibold text-ink">{discovery.business_name}</p>
-                        <Pill tone={leadTierTone(discovery.lead_tier)}>
-                          {formatLeadTier(discovery.lead_tier)}
-                        </Pill>
-                        <Pill tone={discovery.status === 'imported' ? 'success' : discovery.status === 'duplicate' ? 'warning' : discovery.status === 'not-prioritized' ? 'danger' : 'info'}>
-                          {formatLabel(discovery.status)}
-                        </Pill>
-                        <Pill>Score {discovery.score || 0}</Pill>
+                  {prospectDiscovery.discoveries.slice(0, 8).map((discovery) => {
+                    const websiteHref = safeExternalHref(discovery.website_url);
+                    const googleMapsHref = safeExternalHref(discovery.source_data?.googleMapsUri);
+
+                    return (
+                      <div className="rounded-2xl border border-line/80 bg-white/75 px-4 py-3 text-sm leading-6 text-ink/74" key={discovery.id}>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="font-semibold text-ink">{discovery.business_name}</p>
+                          <Pill tone={leadTierTone(discovery.lead_tier)}>
+                            {formatLeadTier(discovery.lead_tier)}
+                          </Pill>
+                          <Pill tone={discovery.status === 'imported' ? 'success' : discovery.status === 'duplicate' ? 'warning' : discovery.status === 'not-prioritized' ? 'danger' : 'info'}>
+                            {formatLabel(discovery.status)}
+                          </Pill>
+                          <Pill>Score {discovery.score || 0}</Pill>
+                        </div>
+                        <p className="mt-2">
+                          {[discovery.category, discovery.address, discovery.review_count ? `${discovery.review_count} reviews` : ''].filter(Boolean).join(' | ')}
+                        </p>
+                        <p className="mt-2">
+                          Quality {discovery.business_quality_score || 0}/100 | Presence gap {discovery.presence_gap_score || 0}/100
+                        </p>
+                        {discovery.recommended_action ? <p className="mt-2 font-medium text-ink">{discovery.recommended_action}</p> : null}
+                        {discovery.outreach_angle ? <p className="mt-2">{discovery.outreach_angle}</p> : null}
+                        <div className="mt-2 flex flex-wrap gap-3">
+                          {websiteHref ? (
+                            <a className="font-semibold text-moss underline" href={websiteHref} rel="noreferrer" target="_blank">Website</a>
+                          ) : null}
+                          {googleMapsHref ? (
+                            <a className="font-semibold text-moss underline" href={googleMapsHref} rel="noreferrer" target="_blank">Google Maps</a>
+                          ) : null}
+                        </div>
                       </div>
-                      <p className="mt-2">
-                        {[discovery.category, discovery.address, discovery.review_count ? `${discovery.review_count} reviews` : ''].filter(Boolean).join(' | ')}
-                      </p>
-                      <p className="mt-2">
-                        Quality {discovery.business_quality_score || 0}/100 | Presence gap {discovery.presence_gap_score || 0}/100
-                      </p>
-                      {discovery.recommended_action ? <p className="mt-2 font-medium text-ink">{discovery.recommended_action}</p> : null}
-                      {discovery.outreach_angle ? <p className="mt-2">{discovery.outreach_angle}</p> : null}
-                      <div className="mt-2 flex flex-wrap gap-3">
-                        {discovery.website_url ? (
-                          <a className="font-semibold text-moss underline" href={discovery.website_url} rel="noreferrer" target="_blank">Website</a>
-                        ) : null}
-                        {discovery.source_data?.googleMapsUri ? (
-                          <a className="font-semibold text-moss underline" href={discovery.source_data.googleMapsUri} rel="noreferrer" target="_blank">Google Maps</a>
-                        ) : null}
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               ) : (
                 <p className="mt-4 text-sm leading-7 text-ink/68">No prospects discovered yet.</p>

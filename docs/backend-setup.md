@@ -284,7 +284,7 @@ The backend always applies:
 
 Optional Turnstile support:
 
-- `VITE_TURNSTILE_SITE_KEY`
+- `TURNSTILE_SITE_KEY`
 - `TURNSTILE_SECRET_KEY`
 
 ## Secure Documents

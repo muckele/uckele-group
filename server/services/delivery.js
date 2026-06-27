@@ -1,4 +1,5 @@
 import { getConfig } from '../config.js';
+import { fetchWithTimeout } from '../utils/http.js';
 import { recordEmailEvent } from './emailEvents.js';
 
 function escapeHtml(value = '') {
@@ -184,8 +185,10 @@ async function sendViaResend(message) {
     return { status: 'failed', error: 'Resend is selected but RESEND_API_KEY or RESEND_FROM_EMAIL is missing.' };
   }
 
-  const response = await fetch('https://api.resend.com/emails', {
+  const response = await fetchWithTimeout('https://api.resend.com/emails', {
     method: 'POST',
+    timeoutMs: config.server.outboundRequestTimeoutMs,
+    timeoutMessage: 'Resend delivery timed out.',
     headers: {
       Authorization: `Bearer ${config.delivery.resendApiKey}`,
       'Content-Type': 'application/json',
@@ -225,8 +228,10 @@ async function sendViaEmailJs(message) {
     };
   }
 
-  const response = await fetch('https://api.emailjs.com/api/v1.0/email/send', {
+  const response = await fetchWithTimeout('https://api.emailjs.com/api/v1.0/email/send', {
     method: 'POST',
+    timeoutMs: config.server.outboundRequestTimeoutMs,
+    timeoutMessage: 'EmailJS delivery timed out.',
     headers: {
       'Content-Type': 'application/json',
     },
@@ -271,8 +276,10 @@ async function sendViaFormspree(message) {
     return { status: 'failed', error: 'Formspree is selected but FORMSPREE_ENDPOINT is missing.' };
   }
 
-  const response = await fetch(config.delivery.formspreeEndpoint, {
+  const response = await fetchWithTimeout(config.delivery.formspreeEndpoint, {
     method: 'POST',
+    timeoutMs: config.server.outboundRequestTimeoutMs,
+    timeoutMessage: 'Formspree delivery timed out.',
     headers: {
       Accept: 'application/json',
       'Content-Type': 'application/json',

@@ -25,6 +25,8 @@ const maxDocumentsPerUpload = 5;
 const maxDocumentsPerRequest = maxDocumentsPerUpload;
 const staleUploadingRequestMs = 15 * 60 * 1000;
 const secureUploadRateLimitEvents = new Map();
+const base64ExpansionRatio = 4 / 3;
+const jsonUploadEnvelopeBytes = 1024 * 1024;
 
 const mimeTypesByExtension = new Map([
   ['.pdf', 'application/pdf'],
@@ -80,6 +82,13 @@ function normalizeBase64(value = '') {
   return String(value || '')
     .replace(/^data:[^;]+;base64,/i, '')
     .replace(/\s+/g, '');
+}
+
+export function getSecureUploadJsonLimitBytes(config = getConfig()) {
+  return Math.ceil(
+    config.secureDocuments.maxUploadBytes * maxDocumentsPerUpload * base64ExpansionRatio
+      + jsonUploadEnvelopeBytes,
+  );
 }
 
 function estimateBase64DecodedBytes(value = '') {
@@ -197,6 +206,37 @@ function prepareDocumentPayload(document = {}, config) {
 
 function sumSecureDocumentBytes(documents = []) {
   return documents.reduce((sum, document) => sum + Number(document.size_bytes || 0), 0);
+}
+
+async function cleanupPartialUploadAttempt({ storage, requestId, savedDocuments, writtenFilePaths }) {
+  for (const document of savedDocuments) {
+    if (!storage.deleteSecureDocument) {
+      continue;
+    }
+
+    try {
+      await storage.deleteSecureDocument(document.id);
+    } catch (error) {
+      console.warn(`[secure-documents] failed to remove partial document record ${document.id}: ${error.message}`);
+    }
+  }
+
+  for (const filePath of writtenFilePaths) {
+    try {
+      await fs.unlink(filePath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        console.warn(`[secure-documents] failed to remove partial upload file ${filePath}: ${error.message}`);
+      }
+    }
+  }
+
+  await storage.updateSecureUploadRequest(requestId, {
+    updated_at: new Date().toISOString(),
+    status: 'awaiting-documents',
+  }).catch((error) => {
+    console.warn(`[secure-documents] failed to reset partial upload request ${requestId}: ${error.message}`);
+  });
 }
 
 function isStaleUploadingRequest(requestRecord) {
@@ -472,6 +512,8 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
   }
 
   const savedDocuments = [];
+  const writtenFilePaths = [];
+  let updatedRequest;
 
   try {
     const requestDirectory = path.join(config.secureDocuments.storageDir, context.request.id);
@@ -484,6 +526,7 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
       const safeStoredName = `${documentId}-${safeOriginalName}`;
       const storagePath = path.join(requestDirectory, safeStoredName);
       await fs.writeFile(storagePath, buffer);
+      writtenFilePaths.push(storagePath);
 
       const record = {
         id: documentId,
@@ -504,23 +547,27 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
       await storage.insertSecureDocument(record);
       savedDocuments.push(record);
     }
-  } catch (error) {
-    if (savedDocuments.length === 0) {
-      await storage.updateSecureUploadRequest(context.request.id, {
-        updated_at: new Date().toISOString(),
-        status: 'awaiting-documents',
-      }).catch(() => {});
+
+    updatedRequest = await storage.updateSecureUploadRequest(context.request.id, {
+      updated_at: new Date().toISOString(),
+      status: 'documents-received',
+      nda_accepted_at: claimedRequest.nda_accepted_at || new Date().toISOString(),
+      last_uploaded_at: new Date().toISOString(),
+    });
+
+    if (!updatedRequest) {
+      throw new Error('Secure upload request could not be finalized.');
     }
+  } catch (error) {
+    await cleanupPartialUploadAttempt({
+      storage,
+      requestId: context.request.id,
+      savedDocuments,
+      writtenFilePaths,
+    });
 
     throw error;
   }
-
-  const updatedRequest = await storage.updateSecureUploadRequest(context.request.id, {
-    updated_at: new Date().toISOString(),
-    status: 'documents-received',
-    nda_accepted_at: claimedRequest.nda_accepted_at || new Date().toISOString(),
-    last_uploaded_at: new Date().toISOString(),
-  });
 
   await sendDocumentUploadNotificationEmail({
     submission: context.submission,

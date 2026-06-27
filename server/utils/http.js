@@ -75,6 +75,45 @@ export function getRequestOrigin(request, fallbackOrigin = '') {
   return `${protocol}://${host}`;
 }
 
+export async function fetchWithTimeout(url, options = {}) {
+  const {
+    timeoutMs = 10000,
+    timeoutMessage = `Request timed out after ${Math.round(timeoutMs / 1000)} seconds.`,
+    signal,
+    ...fetchOptions
+  } = options;
+  const controller = new AbortController();
+  const safeTimeoutMs = Math.max(1, Number(timeoutMs) || 10000);
+  const timeout = setTimeout(() => controller.abort(), safeTimeoutMs);
+  let removeAbortListener = () => {};
+
+  if (signal) {
+    if (signal.aborted) {
+      controller.abort();
+    } else {
+      const abort = () => controller.abort();
+      signal.addEventListener('abort', abort, { once: true });
+      removeAbortListener = () => signal.removeEventListener('abort', abort);
+    }
+  }
+
+  try {
+    return await fetch(url, {
+      ...fetchOptions,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error(timeoutMessage);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    removeAbortListener();
+  }
+}
+
 export function asyncRoute(handler) {
   return async (request, response, next) => {
     try {

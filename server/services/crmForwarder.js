@@ -1,4 +1,5 @@
 import { getConfig } from '../config.js';
+import { fetchWithTimeout } from '../utils/http.js';
 
 export async function forwardToCrm(submission) {
   const config = getConfig();
@@ -13,8 +14,10 @@ export async function forwardToCrm(submission) {
   let response;
 
   try {
-    response = await fetch(config.crm.webhookUrl, {
+    response = await fetchWithTimeout(config.crm.webhookUrl, {
       method: 'POST',
+      timeoutMs: config.server.outboundRequestTimeoutMs,
+      timeoutMessage: 'CRM webhook timed out.',
       headers: {
         'Content-Type': 'application/json',
         ...(config.crm.webhookSecret ? { 'X-Webhook-Secret': config.crm.webhookSecret } : {}),

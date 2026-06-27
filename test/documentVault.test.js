@@ -147,6 +147,58 @@ test('secure upload recovers stale uploading requests before accepting files', a
   assert.equal(updatedRequest.status, 'documents-received');
 });
 
+test('secure upload cleans up partial files and records after a mid-upload failure', async () => {
+  const storage = getStorage();
+  const { request, token } = await createUploadToken('partial-failure-test@example.com');
+  const originalInsertSecureDocument = storage.insertSecureDocument.bind(storage);
+  let insertCount = 0;
+
+  storage.insertSecureDocument = async (document) => {
+    insertCount += 1;
+
+    if (insertCount === 2) {
+      throw new Error('forced secure document insert failure');
+    }
+
+    return originalInsertSecureDocument(document);
+  };
+
+  try {
+    await assert.rejects(
+      () =>
+        uploadSecureDocuments({
+          token,
+          ndaAccepted: true,
+          request: requestFromIp('192.0.2.60'),
+          documents: [
+            {
+              name: 'financials-1.txt',
+              mimeType: 'text/plain',
+              contentBase64: Buffer.from('Plain text financials one').toString('base64'),
+            },
+            {
+              name: 'financials-2.txt',
+              mimeType: 'text/plain',
+              contentBase64: Buffer.from('Plain text financials two').toString('base64'),
+            },
+          ],
+        }),
+      /forced secure document insert failure/,
+    );
+  } finally {
+    storage.insertSecureDocument = originalInsertSecureDocument;
+  }
+
+  const documents = await storage.listSecureDocumentsByRequest(request.id);
+  const updatedRequest = await storage.getSecureUploadRequest(request.id);
+  const requestDirectory = path.join(process.env.SECURE_DOCUMENTS_STORAGE_DIR, request.id);
+  const remainingFiles = fs.existsSync(requestDirectory) ? fs.readdirSync(requestDirectory) : [];
+
+  assert.equal(documents.length, 0);
+  assert.equal(updatedRequest.status, 'awaiting-documents');
+  assert.deepEqual(remainingFiles, []);
+});
+
 test('secure upload attempts are rate limited by token and source', async () => {
   const request = requestFromIp('192.0.2.30');
   const body = {

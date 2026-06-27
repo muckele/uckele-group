@@ -1,4 +1,5 @@
 import { getConfig } from '../config.js';
+import { fetchWithTimeout } from '../utils/http.js';
 
 export async function verifyTurnstileToken(token, remoteIp) {
   const config = getConfig();
@@ -22,8 +23,10 @@ export async function verifyTurnstileToken(token, remoteIp) {
   let response;
 
   try {
-    response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+    response = await fetchWithTimeout('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
+      timeoutMs: config.server.outboundRequestTimeoutMs,
+      timeoutMessage: 'Anti-spam verification timed out.',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
       },

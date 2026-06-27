@@ -3,6 +3,7 @@ import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
+import { fetchWithTimeout } from '../utils/http.js';
 import { createManualSubmission } from './submissions.js';
 
 const googlePlacesTextSearchUrl = 'https://places.googleapis.com/v1/places:searchText';
@@ -644,8 +645,10 @@ async function searchGooglePlaces({ query, maxResults, config }) {
     throw new Error('GOOGLE_PLACES_API_KEY is required for Google Places prospect discovery.');
   }
 
-  const response = await fetch(googlePlacesTextSearchUrl, {
+  const response = await fetchWithTimeout(googlePlacesTextSearchUrl, {
     method: 'POST',
+    timeoutMs: config.server.outboundRequestTimeoutMs,
+    timeoutMessage: 'Google Places discovery timed out.',
     headers: {
       'Content-Type': 'application/json',
       'X-Goog-Api-Key': config.prospectDiscovery.googlePlacesApiKey,

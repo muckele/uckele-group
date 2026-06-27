@@ -698,6 +698,7 @@ export function createSqliteStorage(config) {
       @nda_accepted_at
     )
   `);
+  const deleteSecureDocumentStatement = database.prepare('DELETE FROM secure_documents WHERE id = ?');
 
   const insertEmailEventStatement = database.prepare(`
     INSERT OR IGNORE INTO email_events (
@@ -1427,6 +1428,10 @@ export function createSqliteStorage(config) {
     async insertSecureDocument(document) {
       insertSecureDocumentStatement.run(document);
       return document;
+    },
+
+    async deleteSecureDocument(id) {
+      deleteSecureDocumentStatement.run(id);
     },
 
     async listSecureDocumentsByRequest(requestId) {

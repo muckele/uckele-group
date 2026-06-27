@@ -64,11 +64,12 @@ fly secrets set \
   DEFAULT_FOLLOW_UP_DELAY_HOURS=24
 ```
 
-If you enable Turnstile, add the public site key in [fly.toml](/Users/Matt/Documents/uckele-group/fly.toml) under `[build.args]` before deploying:
+If you enable Turnstile, configure the public site key and secret at runtime. The site key is browser-safe and is exposed through `/api/public-config`; the secret stays server-only:
 
-```toml
-[build.args]
-  VITE_TURNSTILE_SITE_KEY = "your-public-turnstile-site-key"
+```bash
+fly secrets set \
+  TURNSTILE_SITE_KEY=your-public-turnstile-site-key \
+  TURNSTILE_SECRET_KEY=your-private-turnstile-secret
 ```
 
 ## First-Time Fly Setup

@@ -59,7 +59,7 @@ export default function HomePage() {
             <div className="surface-grid absolute inset-0 opacity-40" />
             <div className="relative">
               <div className="flex items-center gap-4">
-                <img alt={`${siteConfig.personName} headshot placeholder`} className="h-16 w-16 shrink-0 rounded-2xl object-cover shadow-lg sm:h-20 sm:w-20 sm:rounded-3xl" src="/headshot-placeholder.svg" />
+                <img alt={`${siteConfig.personName} headshot`} className="h-16 w-16 shrink-0 rounded-2xl object-cover shadow-lg sm:h-20 sm:w-20 sm:rounded-3xl" src="/mathew-uckele-headshot.jpeg" />
                 <div className="min-w-0">
                   <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">{siteConfig.personName}</p>
                   <p className="mt-2 max-w-xs text-sm leading-6 text-ink/70">
@@ -273,26 +273,6 @@ export default function HomePage() {
               Read All FAQs <ArrowRight className="h-4 w-4" />
             </ButtonLink>
           </Reveal>
-        </div>
-      </section>
-
-      <section className="section-shell mt-20">
-        <Reveal>
-          <SectionHeading
-            align="center"
-            description={homePage.references.description}
-            eyebrow={homePage.references.eyebrow}
-            title={homePage.references.title}
-          />
-        </Reveal>
-        <div className="mt-8 grid gap-6 md:grid-cols-3">
-          {homePage.references.items.map((item, index) => (
-            <Reveal className="panel overflow-hidden p-7 sm:p-8" delay={index * 90} key={item.label}>
-              <div className="pointer-events-none absolute inset-x-0 top-0 h-1 bg-clay/40" />
-              <p className="text-sm font-semibold uppercase tracking-[0.18em] text-clay">{item.label}</p>
-              <p className="relative mt-4 text-base leading-7 text-ink/72">{item.text}</p>
-            </Reveal>
-          ))}
         </div>
       </section>
 

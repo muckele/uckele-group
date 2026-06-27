@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildCsv, diligenceReviewsEqual, normalizeDiligenceReview } from '../server/services/submissions.js';
+import { buildCsv, diligenceReviewsEqual, normalizeCrmUrl, normalizeDiligenceReview } from '../server/services/submissions.js';
 
 test('diligence review normalizer whitelists fields and preserves existing partial state', () => {
   const normalized = normalizeDiligenceReview(
@@ -95,4 +95,13 @@ test('CSV export neutralizes spreadsheet formula starters', () => {
   assert.match(csv, /"'\+broker@example\.com"/);
   assert.match(csv, /"'@malicious"/);
   assert.match(csv, /"'-feed"/);
+});
+
+test('CRM URL normalizer only keeps HTTP(S) links', () => {
+  assert.equal(normalizeCrmUrl('example.com/listing'), 'https://example.com/listing');
+  assert.equal(normalizeCrmUrl('https://example.com/listing'), 'https://example.com/listing');
+  assert.equal(normalizeCrmUrl('http://example.com/listing'), 'http://example.com/listing');
+  assert.equal(normalizeCrmUrl('javascript:alert(1)'), '');
+  assert.equal(normalizeCrmUrl('data:text/html,<script>alert(1)</script>'), '');
+  assert.equal(normalizeCrmUrl('Discovery query: plumbers near New Rochelle NY'), '');
 });

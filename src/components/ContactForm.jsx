@@ -22,12 +22,38 @@ export default function ContactForm() {
   const [submitting, setSubmitting] = useState(false);
   const turnstileContainerRef = useRef(null);
   const turnstileWidgetIdRef = useRef(null);
-  const turnstileSiteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY;
+  const buildTurnstileSiteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY || '';
+  const [turnstileSiteKey, setTurnstileSiteKey] = useState(buildTurnstileSiteKey);
 
   const isComplete = useMemo(
     () => Boolean(formData.name && formData.email && formData.message && (!turnstileSiteKey || formData.turnstileToken)),
     [formData.email, formData.message, formData.name, formData.turnstileToken, turnstileSiteKey],
   );
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadPublicConfig() {
+      try {
+        const response = await fetch('/api/public-config');
+        const result = await response.json();
+
+        if (!cancelled && response.ok && result.success) {
+          setTurnstileSiteKey(String(result.turnstileSiteKey || buildTurnstileSiteKey));
+        }
+      } catch {
+        if (!cancelled) {
+          setTurnstileSiteKey(buildTurnstileSiteKey);
+        }
+      }
+    }
+
+    loadPublicConfig();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [buildTurnstileSiteKey]);
 
   useEffect(() => {
     if (!turnstileSiteKey || !turnstileContainerRef.current) {

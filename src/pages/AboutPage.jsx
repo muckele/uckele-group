@@ -19,9 +19,9 @@ export default function AboutPage() {
         <div className="grid gap-8 lg:grid-cols-[0.8fr_1.2fr]">
           <Reveal className="panel overflow-hidden">
             <img
-              alt={`${siteConfig.personName} headshot placeholder`}
+              alt={`${siteConfig.personName} headshot`}
               className="h-full min-h-[280px] w-full object-cover sm:min-h-[420px]"
-              src="/headshot-placeholder.svg"
+              src="/mathew-uckele-headshot.jpeg"
             />
           </Reveal>
 

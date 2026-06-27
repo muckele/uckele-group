@@ -19,6 +19,7 @@ import {
 import {
   createSecureUploadRequest,
   enforceSecureUploadBodyRateLimit,
+  getSecureUploadJsonLimitBytes,
   getSecureUploadContext,
   uploadSecureDocuments,
 } from './services/documentVault.js';
@@ -60,6 +61,43 @@ function requireDealHunterCron(request, config) {
   const providedSecret = extractBearerSecret(request);
 
   return Boolean(config.dealHunter.cronSecret && providedSecret && safeCompareText(providedSecret, config.dealHunter.cronSecret));
+}
+
+function captureRawBody(request, _response, buffer) {
+  request.rawBody = buffer.toString('utf8');
+}
+
+function jsonParserOptions(limit) {
+  return {
+    limit,
+    verify: captureRawBody,
+  };
+}
+
+export function handleAppError(error, _request, response, next) {
+  if (response.headersSent) {
+    next(error);
+    return;
+  }
+
+  const explicitStatus = Number(error?.status || error?.statusCode);
+  const status = explicitStatus >= 400 && explicitStatus < 600 ? explicitStatus : 500;
+  const message = status === 413
+    ? 'Request body is too large.'
+    : status === 400 && error?.expose
+      ? 'Invalid request body.'
+      : 'Something went wrong while processing the request.';
+
+  if (status >= 500) {
+    console.error(error);
+  } else {
+    console.warn(error?.message || error);
+  }
+
+  response.status(status).json({
+    success: false,
+    error: message,
+  });
 }
 
 function publicSecureDocument(document) {
@@ -115,14 +153,8 @@ export function createApp() {
       next(error);
     }
   });
-  app.use(
-    express.json({
-      limit: '25mb',
-      verify: (request, _response, buffer) => {
-        request.rawBody = buffer.toString('utf8');
-      },
-    }),
-  );
+  app.use('/api/secure-documents/upload', express.json(jsonParserOptions(getSecureUploadJsonLimitBytes(config))));
+  app.use(express.json(jsonParserOptions('25mb')));
   app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
   app.use((request, response, next) => {
@@ -135,10 +167,13 @@ export function createApp() {
   app.get('/api/health', (_request, response) => {
     response.json({
       ok: true,
-      storageProvider: config.storage.provider,
-      deliveryProvider: config.delivery.provider,
-      turnstileEnabled: Boolean(config.turnstile.secretKey),
-      adminAuthMode: config.admin.authMode,
+    });
+  });
+
+  app.get('/api/public-config', (_request, response) => {
+    response.json({
+      success: true,
+      turnstileSiteKey: config.turnstile.siteKey,
     });
   });
 
@@ -592,13 +627,7 @@ export function createApp() {
     });
   }
 
-  app.use((error, _request, response, _next) => {
-    console.error(error);
-    response.status(500).json({
-      success: false,
-      error: 'Something went wrong while processing the request.',
-    });
-  });
+  app.use(handleAppError);
 
   return app;
 }
