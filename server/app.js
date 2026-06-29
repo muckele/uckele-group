@@ -22,6 +22,7 @@ import {
   enforceSecureUploadBodyRateLimit,
   getSecureUploadJsonLimitBytes,
   getSecureUploadContext,
+  getSecureDocumentDownload,
   uploadSecureDocuments,
 } from './services/documentVault.js';
 import { recordEmailEventsFromWebhook } from './services/emailEvents.js';
@@ -40,6 +41,7 @@ import {
   createManualSubmission,
   enforceContactBodyRateLimit,
   exportDashboardSubmissionsCsv,
+  getDashboardSubmission,
   listDashboardFollowUps,
   listDashboardSubmissions,
   submitContactLead,
@@ -451,6 +453,28 @@ export function createApp() {
   );
 
   app.get(
+    '/api/admin/submissions/:id',
+    asyncRoute(async (request, response) => {
+      if (!requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const submission = await getDashboardSubmission(request.params.id);
+
+      if (!submission) {
+        response.status(404).json({ success: false, error: 'CRM record not found.' });
+        return;
+      }
+
+      response.json({
+        success: true,
+        submission,
+      });
+    }),
+  );
+
+  app.get(
     '/api/admin/deal-hunter/review',
     asyncRoute(async (request, response) => {
       const session = requireAdminAccess(request);
@@ -501,6 +525,7 @@ export function createApp() {
 
       const result = await sendDealHunterCimRequest({
         dealKey: request.body?.dealKey || '',
+        snapshotToken: request.body?.snapshotToken || request.body?.deal?.cimRequest?.snapshotToken || '',
         requestedBy: session.username || 'admin',
       });
 
@@ -638,16 +663,24 @@ export function createApp() {
         return;
       }
 
-      const deleted = await deleteDashboardSubmission(request.params.id);
+      const deleteResult = await deleteDashboardSubmission(request.params.id);
 
-      if (!deleted) {
+      if (!deleteResult) {
         response.status(404).json({ success: false, error: 'CRM record not found.' });
+        return;
+      }
+
+      if (deleteResult.ok === false) {
+        response.status(deleteResult.status || 500).json({
+          success: false,
+          error: deleteResult.error || 'Unable to delete CRM record.',
+        });
         return;
       }
 
       response.json({
         success: true,
-        submission: deleted,
+        submission: deleteResult.submission || deleteResult,
       });
     }),
   );
@@ -680,6 +713,32 @@ export function createApp() {
         uploadUrl: result.uploadUrl,
         request: result.request,
         emailResult: result.emailResult,
+      });
+    }),
+  );
+
+  app.get(
+    '/api/admin/secure-documents/:id/download',
+    asyncRoute(async (request, response) => {
+      if (!requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await getSecureDocumentDownload(request.params.id);
+
+      if (!result.ok) {
+        response.status(result.status || 404).json({ success: false, error: result.error || 'Secure document was not found.' });
+        return;
+      }
+
+      const downloadName = result.document.original_name || result.document.file_name || 'secure-document';
+      response.setHeader('Content-Type', result.document.mime_type || 'application/octet-stream');
+      response.setHeader('Content-Length', String(result.sizeBytes || 0));
+      response.download(result.filePath, downloadName, (error) => {
+        if (error && !response.headersSent) {
+          response.status(500).json({ success: false, error: 'Secure document download failed.' });
+        }
       });
     }),
   );

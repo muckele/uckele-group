@@ -14,7 +14,7 @@ process.env.SECURE_DOCUMENTS_MAX_UPLOAD_BYTES = '1024';
 process.env.SECURE_DOCUMENTS_STORAGE_DIR = path.join(tempDir, 'secure-documents');
 process.env.SQLITE_PATH = path.join(tempDir, 'document-vault.sqlite');
 
-const { createSecureUploadRequest, uploadSecureDocuments } = await import('../server/services/documentVault.js');
+const { createSecureUploadRequest, getSecureDocumentDownload, uploadSecureDocuments } = await import('../server/services/documentVault.js');
 const { createManualSubmission, deleteDashboardSubmission } = await import('../server/services/submissions.js');
 const { getStorage } = await import('../server/storage/index.js');
 
@@ -119,6 +119,49 @@ test('secure upload infers allowed MIME type when browsers send octet-stream', a
   assert.equal(documents[0].mime_type, 'text/csv');
 });
 
+test('secure document download resolves stored file metadata', async () => {
+  const storage = getStorage();
+  const { request, token } = await createUploadToken('download-test@example.com');
+  const result = await uploadSecureDocuments({
+    token,
+    ndaAccepted: true,
+    request: requestFromIp('192.0.2.42'),
+    documents: [
+      {
+        name: 'download-financials.txt',
+        mimeType: 'text/plain',
+        contentBase64: Buffer.from('Downloadable diligence file').toString('base64'),
+      },
+    ],
+  });
+  const documents = await storage.listSecureDocumentsByRequest(request.id);
+  const download = await getSecureDocumentDownload(documents[0].id);
+
+  assert.equal(result.ok, true);
+  assert.equal(download.ok, true);
+  assert.equal(download.document.id, documents[0].id);
+  assert.equal(download.sizeBytes, Buffer.byteLength('Downloadable diligence file'));
+  assert.equal(fs.existsSync(download.filePath), true);
+});
+
+test('secure document download rejects paths outside the document vault', async () => {
+  const download = await getSecureDocumentDownload('outside-path-document', {
+    async getSecureDocument(id) {
+      return {
+        id,
+        file_name: 'outside.txt',
+        mime_type: 'text/plain',
+        original_name: 'outside.txt',
+        storage_path: path.join(tempDir, 'outside.txt'),
+      };
+    },
+  });
+
+  assert.equal(download.ok, false);
+  assert.equal(download.status, 500);
+  assert.match(download.error, /file path is invalid/i);
+});
+
 test('deleting a CRM record removes secure upload data, email events, and stored files', async () => {
   const storage = getStorage();
   const { request, submission, token } = await createUploadToken('delete-cleanup-test@example.com');
@@ -155,14 +198,72 @@ test('deleting a CRM record removes secure upload data, email events, and stored
     metadata: {},
   });
 
-  const deleted = await deleteDashboardSubmission(submission.id);
+  const deleteResult = await deleteDashboardSubmission(submission.id);
+  const deleted = deleteResult.submission;
 
+  assert.equal(deleteResult.ok, true);
   assert.equal(deleted.id, submission.id);
   assert.equal(await storage.getSubmission(submission.id), null);
   assert.equal(await storage.getSecureUploadRequest(request.id), null);
   assert.deepEqual(await storage.listSecureDocumentsByRequest(request.id), []);
   assert.deepEqual(await storage.listEmailEvents({ submissionId: submission.id }), []);
   assert.equal(fs.existsSync(documents[0].storage_path), false);
+});
+
+test('dashboard submission delete keeps CRM record when secure file cleanup fails', async () => {
+  let deleteCalled = false;
+  const result = await deleteDashboardSubmission('cleanup-failure-submission', {
+    storage: {
+      async getSubmission(id) {
+        return { id };
+      },
+      async listSecureDocumentsForSubmission() {
+        return [{ storage_path: path.join(process.env.SECURE_DOCUMENTS_STORAGE_DIR, 'secure-document-that-cannot-be-removed.pdf') }];
+      },
+      async deleteSubmission() {
+        deleteCalled = true;
+        return true;
+      },
+    },
+    async unlinkFile() {
+      const error = new Error('permission denied');
+      error.code = 'EACCES';
+      throw error;
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 500);
+  assert.match(result.error, /cleanup failed/i);
+  assert.equal(deleteCalled, false);
+});
+
+test('dashboard submission delete rejects secure document paths outside the vault', async () => {
+  let deleteCalled = false;
+  let unlinkCalled = false;
+  const result = await deleteDashboardSubmission('outside-vault-submission', {
+    storage: {
+      async getSubmission(id) {
+        return { id };
+      },
+      async listSecureDocumentsForSubmission() {
+        return [{ storage_path: path.join(tempDir, 'outside-vault.pdf') }];
+      },
+      async deleteSubmission() {
+        deleteCalled = true;
+        return true;
+      },
+    },
+    async unlinkFile() {
+      unlinkCalled = true;
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 500);
+  assert.match(result.cleanupFailures[0].message, /outside/i);
+  assert.equal(unlinkCalled, false);
+  assert.equal(deleteCalled, false);
 });
 
 test('secure upload recovers stale uploading requests before accepting files', async () => {

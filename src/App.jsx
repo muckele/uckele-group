@@ -77,6 +77,14 @@ export default function App() {
                 <DashboardPage />
               </Suspense>
             }
+            path="crm/:submissionId"
+          />
+          <Route
+            element={
+              <Suspense fallback={<RouteFallback />}>
+                <DashboardPage />
+              </Suspense>
+            }
             path=":section"
           />
         </Route>

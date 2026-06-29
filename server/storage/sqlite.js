@@ -1466,6 +1466,11 @@ export function createSqliteStorage(config) {
       deleteSecureDocumentStatement.run(id);
     },
 
+    async getSecureDocument(id) {
+      const row = database.prepare('SELECT * FROM secure_documents WHERE id = ? LIMIT 1').get(id);
+      return row || null;
+    },
+
     async listSecureDocumentsByRequest(requestId) {
       return database
         .prepare('SELECT * FROM secure_documents WHERE request_id = ? ORDER BY created_at DESC')

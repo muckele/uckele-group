@@ -165,6 +165,7 @@ test('viewer credentials create read-only admin access', async () => {
     { method: 'patch', routePath: '/api/admin/submissions/:id', params: { id: 'submission-1' }, body: { status: 'review' } },
     { method: 'delete', routePath: '/api/admin/submissions/:id', params: { id: 'submission-1' } },
     { method: 'post', routePath: '/api/admin/submissions/:id/upload-request', params: { id: 'submission-1' } },
+    { method: 'get', routePath: '/api/admin/secure-documents/:id/download', params: { id: 'document-1' } },
   ];
 
   for (const route of blockedRoutes) {

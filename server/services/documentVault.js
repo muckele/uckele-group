@@ -52,6 +52,17 @@ function sanitizeFileName(fileName) {
   return cleaned || 'document';
 }
 
+export function resolveSecureStoragePath(filePath, storageDir) {
+  const resolvedRoot = path.resolve(storageDir);
+  const resolvedPath = path.resolve(String(filePath || ''));
+
+  if (!resolvedPath || (resolvedPath !== resolvedRoot && !resolvedPath.startsWith(`${resolvedRoot}${path.sep}`))) {
+    return '';
+  }
+
+  return resolvedPath;
+}
+
 function buildAccessToken(payload) {
   const config = getConfig();
   return signPayload(payload, config.secureDocuments.tokenSecret);
@@ -422,6 +433,69 @@ export async function getSecureUploadContext(token) {
     submission,
     documents,
   };
+}
+
+export async function getSecureDocumentDownload(documentId, storage = getStorage()) {
+  const config = getConfig();
+  const id = String(documentId || '').trim();
+
+  if (!id || !storage.getSecureDocument) {
+    return {
+      ok: false,
+      status: 404,
+      error: 'Secure document was not found.',
+    };
+  }
+
+  const document = await storage.getSecureDocument(id);
+
+  if (!document) {
+    return {
+      ok: false,
+      status: 404,
+      error: 'Secure document was not found.',
+    };
+  }
+
+  const filePath = resolveSecureStoragePath(document.storage_path, config.secureDocuments.storageDir);
+
+  if (!filePath) {
+    console.warn(`[secure-documents] blocked download outside storage directory for document ${id}`);
+    return {
+      ok: false,
+      status: 500,
+      error: 'Secure document file path is invalid.',
+    };
+  }
+
+  try {
+    const stat = await fs.stat(filePath);
+
+    if (!stat.isFile()) {
+      return {
+        ok: false,
+        status: 404,
+        error: 'Secure document file is unavailable.',
+      };
+    }
+
+    return {
+      ok: true,
+      document,
+      filePath,
+      sizeBytes: stat.size,
+    };
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.warn(`[secure-documents] failed to access document file ${id}: ${error.message}`);
+    }
+
+    return {
+      ok: false,
+      status: 404,
+      error: 'Secure document file is unavailable.',
+    };
+  }
 }
 
 export async function uploadSecureDocuments({ token, ndaAccepted, note = '', documents, request }) {

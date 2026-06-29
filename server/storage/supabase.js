@@ -720,6 +720,16 @@ export function createSupabaseStorage(config) {
       }
     },
 
+    async getSecureDocument(id) {
+      const { data, error } = await client.from('secure_documents').select('*').eq('id', id).maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      return data || null;
+    },
+
     async listSecureDocumentsByRequest(requestId) {
       const { data, error } = await client
         .from('secure_documents')

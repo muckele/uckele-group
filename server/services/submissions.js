@@ -17,6 +17,7 @@ import {
   normalizePriority,
   normalizeSbaEligibility,
 } from './workflow.js';
+import { resolveSecureStoragePath } from './documentVault.js';
 
 const allowedStatuses = ['new', 'review', 'contacted', 'archived', 'spam'];
 const turnstileTokenMaxLength = 2048;
@@ -1032,6 +1033,23 @@ export async function listDashboardSubmissions({ page, search, status }) {
   };
 }
 
+export async function getDashboardSubmission(id) {
+  const storage = getStorage();
+  const submissionId = String(id || '').trim();
+
+  if (!submissionId) {
+    return null;
+  }
+
+  const submission = await storage.getSubmission(submissionId);
+
+  if (!submission) {
+    return null;
+  }
+
+  return enrichSubmission(submission, storage);
+}
+
 export async function listDashboardFollowUps() {
   const storage = getStorage();
   const [baseSummary, submissions] = await Promise.all([
@@ -1165,8 +1183,47 @@ export async function updateSubmissionWorkflow(id, fields) {
   return enrichSubmission(updated, storage);
 }
 
-export async function deleteDashboardSubmission(id) {
-  const storage = getStorage();
+async function removeSecureDocumentFiles(documents = [], unlinkFile = fs.unlink, storageDir = getConfig().secureDocuments.storageDir) {
+  const paths = Array.from(
+    new Set(
+      (documents || [])
+        .map((document) => document?.storage_path)
+        .filter(Boolean),
+    ),
+  );
+  const failures = [];
+
+  await Promise.all(
+    paths.map(async (filePath) => {
+      const resolvedPath = resolveSecureStoragePath(filePath, storageDir);
+
+      if (!resolvedPath) {
+        failures.push({
+          filePath,
+          message: 'Secure document file path is outside the configured document vault.',
+        });
+        return;
+      }
+
+      try {
+        await unlinkFile(resolvedPath);
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          failures.push({
+            filePath,
+            message: error.message || 'Unable to remove secure document file.',
+          });
+        }
+      }
+    }),
+  );
+
+  return failures;
+}
+
+export async function deleteDashboardSubmission(id, options = {}) {
+  const storage = options.storage || getStorage();
+  const unlinkFile = options.unlinkFile || fs.unlink;
   const submissionId = String(id || '').trim();
 
   if (!submissionId || !storage.deleteSubmission) {
@@ -1182,28 +1239,30 @@ export async function deleteDashboardSubmission(id) {
   const documents = storage.listSecureDocumentsForSubmission
     ? await storage.listSecureDocumentsForSubmission(submissionId)
     : [];
-  const deleted = await storage.deleteSubmission(submissionId);
+  const cleanupFailures = await removeSecureDocumentFiles(documents, unlinkFile);
 
+  if (cleanupFailures.length > 0) {
+    console.warn(
+      `[crm] blocked deletion for ${submissionId}; secure document cleanup failed for ${cleanupFailures.length} file(s).`,
+    );
+
+    return {
+      ok: false,
+      status: 500,
+      error: 'Secure document cleanup failed. The CRM record was kept so deletion can be retried.',
+      cleanupFailures,
+    };
+  }
+
+  const deleted = await storage.deleteSubmission(submissionId);
   if (!deleted) {
     return null;
   }
 
-  await Promise.all(
-    (documents || [])
-      .map((document) => document?.storage_path)
-      .filter(Boolean)
-      .map(async (filePath) => {
-        try {
-          await fs.unlink(filePath);
-        } catch (error) {
-          if (error.code !== 'ENOENT') {
-            console.warn(`[crm] failed to remove secure document file ${filePath}: ${error.message}`);
-          }
-        }
-      }),
-  );
-
-  return existing;
+  return {
+    ok: true,
+    submission: existing,
+  };
 }
 
 export async function exportDashboardSubmissionsCsv() {

@@ -1,6 +1,6 @@
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
-import { sha256 } from '../utils/security.js';
+import { sha256, signPayload, verifySignedPayload } from '../utils/security.js';
 import {
   normalizeResendTagToken,
   sendDailyDealHunterEmail,
@@ -20,6 +20,7 @@ const replyEventTypes = new Set(['replied', 'received']);
 const stopFollowUpEventTypes = new Set(['bounced', 'complained', 'failed', 'unsubscribed']);
 const cimBulkRequestMax = 25;
 const cimClaimStaleMinutes = 30;
+const cimSnapshotTtlMs = 1000 * 60 * 60 * 2;
 const cimRequestSendLocks = new Set();
 const cimFollowUpLocks = new Set();
 const dealHunterCrmNotesHeading = 'Deal Hunter scoring profile';
@@ -1337,6 +1338,7 @@ function publicDeal(deal) {
   return {
     id: deal.id,
     dealKey: deal.dealKey,
+    sourceId: deal.sourceId,
     sourceName: deal.sourceName,
     sourceMode: deal.sourceMode,
     name: deal.name,
@@ -1368,6 +1370,105 @@ function publicDeal(deal) {
     shouldRemove: deal.shouldRemove,
     cimRequest: deal.cimRequest || null,
   };
+}
+
+function normalizeTextArray(value = [], maxItems = 12, maxLength = 500) {
+  const source = Array.isArray(value) ? value : [value];
+
+  return source
+    .map((item) => normalizeText(item, maxLength))
+    .filter(Boolean)
+    .slice(0, maxItems);
+}
+
+function normalizeCimDealSnapshot(snapshot = null) {
+  if (!snapshot || typeof snapshot !== 'object') {
+    return null;
+  }
+
+  const cimRequest = snapshot.cimRequest && typeof snapshot.cimRequest === 'object' ? snapshot.cimRequest : {};
+  const dealKey = normalizeText(snapshot.dealKey || snapshot.deal_key, 1000);
+  const brokerEmail = normalizeEmail(
+    snapshot.confirmedRecipientEmail ||
+      snapshot.confirmed_recipient_email ||
+      cimRequest.recipientEmail ||
+      cimRequest.recipient_email ||
+      snapshot.brokerEmail ||
+      snapshot.broker_email,
+  );
+
+  if (!dealKey) {
+    return null;
+  }
+
+  return {
+    id: normalizeText(snapshot.id || dealKey, 1000),
+    dealKey,
+    sourceId: normalizeText(snapshot.sourceId || snapshot.source_id, 200),
+    sourceName: normalizeText(snapshot.sourceName || snapshot.source_name, 200),
+    sourceMode: normalizeText(snapshot.sourceMode || snapshot.source_mode, 100),
+    name: normalizeText(snapshot.name || snapshot.businessName || snapshot.business_name || 'Unnamed deal', 300),
+    isNew: Boolean(snapshot.isNew || snapshot.is_new),
+    firstSeenAt: normalizeText(snapshot.firstSeenAt || snapshot.first_seen_at, 100),
+    lastSeenAt: normalizeText(snapshot.lastSeenAt || snapshot.last_seen_at, 100),
+    score: Math.round(parseNumber(snapshot.score) || 0),
+    industry: normalizeText(snapshot.industry, 220),
+    location: normalizeText(snapshot.location, 220),
+    annualProfit: parseNumber(snapshot.annualProfit ?? snapshot.annual_profit),
+    annualRevenue: parseNumber(snapshot.annualRevenue ?? snapshot.annual_revenue),
+    askingPrice: parseNumber(snapshot.askingPrice ?? snapshot.asking_price),
+    profitMultiple: parseNumber(snapshot.profitMultiple ?? snapshot.profit_multiple),
+    yearsEstablished: parseNumber(snapshot.yearsEstablished ?? snapshot.years_established),
+    remoteFlag: normalizeText(snapshot.remoteFlag || snapshot.remote_flag, 100),
+    franchiseFlag: normalizeText(snapshot.franchiseFlag || snapshot.franchise_flag, 100),
+    brokerName: normalizeText(snapshot.brokerName || snapshot.broker_name, 220),
+    brokerCompany: normalizeText(snapshot.brokerCompany || snapshot.broker_company, 220),
+    brokerContact: normalizeText(snapshot.brokerContact || snapshot.broker_contact, 500),
+    brokerEmail,
+    listingUrl: normalizeUrl(snapshot.listingUrl || snapshot.listing_url),
+    dateAdded: normalizeText(snapshot.dateAdded || snapshot.date_added, 100),
+    lastUpdated: normalizeText(snapshot.lastUpdated || snapshot.last_updated, 100),
+    strengths: normalizeTextArray(snapshot.strengths),
+    concerns: normalizeTextArray(snapshot.concerns),
+    removeReasons: normalizeTextArray(snapshot.removeReasons || snapshot.remove_reasons),
+    questions: normalizeTextArray(snapshot.questions),
+    recommendation: normalizeText(snapshot.recommendation, 1000),
+    shouldRemove: Boolean(snapshot.shouldRemove || snapshot.should_remove),
+  };
+}
+
+function getCimSnapshotSecret() {
+  const config = getConfig();
+  return config.admin.sessionSecret || config.secureDocuments.tokenSecret;
+}
+
+function signCimDealSnapshot(deal = null) {
+  const snapshot = normalizeCimDealSnapshot(deal);
+  const secret = getCimSnapshotSecret();
+
+  if (!snapshot || !secret) {
+    return '';
+  }
+
+  return signPayload(
+    {
+      typ: 'deal-hunter-cim-snapshot',
+      version: 1,
+      exp: Date.now() + cimSnapshotTtlMs,
+      deal: snapshot,
+    },
+    secret,
+  );
+}
+
+function verifyCimDealSnapshotToken(token = '') {
+  const payload = verifySignedPayload(String(token || ''), getCimSnapshotSecret());
+
+  if (payload?.typ !== 'deal-hunter-cim-snapshot' || payload.version !== 1) {
+    return null;
+  }
+
+  return normalizeCimDealSnapshot(payload.deal);
 }
 
 function attachHistory(scoredDeals, seenDeals = [], generatedAt) {
@@ -2111,6 +2212,7 @@ function attachCimRequestStatus(scoredDeals, requests = []) {
         status: existingRequest?.status || (eligible ? 'ready' : 'unavailable'),
         reason,
         recipientEmail,
+        snapshotToken: eligible ? signCimDealSnapshot(deal) : '',
         requestedAt: existingRequest?.updated_at || '',
         requestedBy: existingRequest?.requested_by || '',
         deliveryError: existingRequest?.delivery_error || '',
@@ -2629,17 +2731,35 @@ async function sendCimRequestForScoredDeal({ deal, requestedBy = '', storage = g
   }
 }
 
-export async function sendDealHunterCimRequest({ dealKey = '', requestedBy = '', storage = getStorage() } = {}) {
+export async function sendDealHunterCimRequest({ dealKey = '', snapshotToken = '', requestedBy = '', storage = getStorage() } = {}) {
   const normalizedDealKey = normalizeText(dealKey, 1000);
 
   if (!normalizedDealKey) {
     return { ok: false, status: 400, error: 'Deal key is required.' };
   }
 
-  const result = await buildDailyDealReview({ storage });
+  let result = null;
+
+  try {
+    result = await buildDailyDealReview({ storage });
+  } catch {
+    return {
+      ok: false,
+      status: 503,
+      error: 'Deal Hunter sources could not be reviewed. Review sources again before sending this CIM request.',
+    };
+  }
+
   const deal = result.scoredDeals.find((candidate) => candidate.dealKey === normalizedDealKey);
 
   if (!deal) {
+    const snapshotDeal = verifyCimDealSnapshotToken(snapshotToken);
+
+    if (snapshotDeal?.dealKey === normalizedDealKey && sourceFailureMatchesDeal(snapshotDeal, result.review)) {
+      console.warn('[deal-hunter] using confirmed CIM snapshot because one or more review sources failed.');
+      return sendCimRequestForScoredDeal({ deal: snapshotDeal, requestedBy, storage });
+    }
+
     return { ok: false, status: 404, error: 'Deal was not found in the latest Deal Hunter review.' };
   }
 
@@ -2657,6 +2777,8 @@ function normalizeCimRequestSelections(selections = []) {
   for (const selection of selections) {
     const dealKey = normalizeText(selection?.dealKey || selection?.deal_key, 1000);
     const recipientEmail = normalizeEmail(selection?.recipientEmail || selection?.recipient_email);
+    const snapshotToken = selection?.snapshotToken || selection?.snapshot_token || selection?.deal?.cimRequest?.snapshotToken || '';
+    const deal = verifyCimDealSnapshotToken(snapshotToken);
     const key = `${dealKey}|${recipientEmail}`;
 
     if (!dealKey || !recipientEmail || seen.has(key)) {
@@ -2664,7 +2786,7 @@ function normalizeCimRequestSelections(selections = []) {
     }
 
     seen.add(key);
-    normalizedSelections.push({ dealKey, recipientEmail });
+    normalizedSelections.push({ dealKey, recipientEmail, deal });
   }
 
   return normalizedSelections.slice(0, cimBulkRequestMax);
@@ -2683,33 +2805,126 @@ function buildSelectionFailure(selection, error) {
   };
 }
 
+function reviewHasSourceFailures(review = null) {
+  return (review?.sources || []).some((source) => source?.fetched === false || source?.error);
+}
+
+function sourceFailureMatchesDeal(deal = null, review = null) {
+  if (!deal || !reviewHasSourceFailures(review)) {
+    return false;
+  }
+
+  const dealSourceId = normalizeText(deal.sourceId || deal.source_id, 200);
+  const dealSourceName = normalizeComparableText(deal.sourceName || deal.source_name || '');
+  const dealSourceMode = normalizeComparableText(deal.sourceMode || deal.source_mode || '');
+
+  return (review?.sources || []).some((source) => {
+    if (source?.fetched !== false && !source?.error) {
+      return false;
+    }
+
+    const sourceId = normalizeText(source.id, 200);
+    const sourceName = normalizeComparableText(source.name || '');
+    const sourceMode = normalizeComparableText(source.mode || '');
+
+    if (dealSourceId && sourceId && dealSourceId === sourceId) {
+      return true;
+    }
+
+    return Boolean(
+      dealSourceName &&
+        dealSourceName === sourceName &&
+        (!dealSourceMode || !sourceMode || dealSourceMode === sourceMode),
+    );
+  });
+}
+
+function buildReadyDealsFromConfirmedSnapshots(selectedRecipients = []) {
+  const validationFailures = [];
+  const readyDeals = selectedRecipients.map((selection) => {
+    const deal = selection.deal;
+
+    if (!deal || deal.dealKey !== selection.dealKey) {
+      validationFailures.push(buildSelectionFailure(selection, 'Confirmed deal details are missing. Review sources again before sending.'));
+      return null;
+    }
+
+    if (normalizeEmail(deal.brokerEmail) !== selection.recipientEmail) {
+      validationFailures.push(
+        buildSelectionFailure(selection, 'Confirmed broker email does not match the selected deal. Review sources again before sending.'),
+      );
+      return null;
+    }
+
+    const unavailableReason = getCimRequestUnavailableReason(deal, selection.recipientEmail);
+
+    if (unavailableReason) {
+      validationFailures.push(buildSelectionFailure(selection, unavailableReason));
+      return null;
+    }
+
+    return deal;
+  }).filter(Boolean);
+
+  return { readyDeals, validationFailures };
+}
+
 export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit = cimBulkRequestMax, selections = [], storage = getStorage() } = {}) {
   if (!storage.getDealHunterCimRequest || !storage.upsertDealHunterCimRequest) {
     return { ok: false, status: 500, error: 'CIM request tracking storage is not configured.' };
   }
 
   const safeLimit = Math.max(1, Math.min(Number(limit) || cimBulkRequestMax, cimBulkRequestMax));
-  const result = await buildDailyDealReview({ storage });
   const selectedRecipients = normalizeCimRequestSelections(selections);
-  const allReadyDeals = result.scoredDeals
-    .filter((deal) => deal.cimRequest?.canRequest)
-    .sort(sortNewThenBest);
-  let readyDeals = allReadyDeals.slice(0, safeLimit);
+  let result = null;
+  let allReadyDeals = [];
+  let readyDeals = [];
+
+  try {
+    result = await buildDailyDealReview({ storage });
+    allReadyDeals = result.scoredDeals
+      .filter((deal) => deal.cimRequest?.canRequest)
+      .sort(sortNewThenBest);
+    readyDeals = allReadyDeals.slice(0, safeLimit);
+  } catch {
+    return {
+      ok: false,
+      status: 503,
+      error: 'Deal Hunter sources could not be reviewed. Review sources again before sending bulk CIM requests.',
+      review: null,
+      results: [],
+      sent: 0,
+      alreadySent: 0,
+      failed: 0,
+      totalReady: 0,
+      totalRequested: selectedRecipients.length,
+    };
+  }
 
   if (selectedRecipients.length > 0) {
     const readyByDealRecipient = new Map(
       allReadyDeals.map((deal) => [`${deal.dealKey}|${normalizeEmail(deal.brokerEmail)}`, deal]),
     );
+    const readyByDealKey = new Map(allReadyDeals.map((deal) => [deal.dealKey, deal]));
     const validationFailures = [];
+    const missingFromReadyList = [];
 
     readyDeals = selectedRecipients.map((selection) => {
       const deal = readyByDealRecipient.get(`${selection.dealKey}|${selection.recipientEmail}`);
 
       if (!deal) {
+        const latestDeal = readyByDealKey.get(selection.dealKey);
+
+        if (!latestDeal) {
+          missingFromReadyList.push(selection);
+        }
+
         validationFailures.push(
           buildSelectionFailure(
             selection,
-            'This deal is no longer CIM-ready for the confirmed broker email. Review sources again before sending.',
+            latestDeal
+              ? 'This deal is no longer CIM-ready for the confirmed broker email. Review sources again before sending.'
+              : 'This deal was not available in the latest source review. Review sources again before sending.',
           ),
         );
       }
@@ -2718,20 +2933,47 @@ export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit =
     }).filter(Boolean);
 
     if (validationFailures.length > 0) {
-      return {
-        ok: false,
-        status: 409,
-        error: 'The CIM-ready list changed after the preview. Review sources again before sending broker emails.',
-        review: result.review,
-        results: validationFailures,
-        sent: 0,
-        alreadySent: 0,
-        failed: validationFailures.length,
-        totalReady: allReadyDeals.length,
-        totalRequested: selectedRecipients.length,
-        limited: false,
-        limit: safeLimit,
-      };
+      if (
+        missingFromReadyList.length === validationFailures.length &&
+        missingFromReadyList.every((selection) => sourceFailureMatchesDeal(selection.deal, result?.review))
+      ) {
+        const snapshotValidation = buildReadyDealsFromConfirmedSnapshots(selectedRecipients);
+
+        if (snapshotValidation.validationFailures.length === 0) {
+          console.warn('[deal-hunter] using confirmed CIM snapshots because one or more review sources failed.');
+          readyDeals = snapshotValidation.readyDeals;
+        } else {
+          return {
+            ok: false,
+            status: 400,
+            error: 'Deal Hunter source review was incomplete and the confirmed CIM selections were not valid enough to send.',
+            review: result?.review || null,
+            results: snapshotValidation.validationFailures,
+            sent: 0,
+            alreadySent: 0,
+            failed: snapshotValidation.validationFailures.length,
+            totalReady: allReadyDeals.length,
+            totalRequested: selectedRecipients.length,
+            limited: false,
+            limit: safeLimit,
+          };
+        }
+      } else {
+        return {
+          ok: false,
+          status: 409,
+          error: 'The CIM-ready list changed after the preview. Review sources again before sending broker emails.',
+          review: result?.review || null,
+          results: validationFailures,
+          sent: 0,
+          alreadySent: 0,
+          failed: validationFailures.length,
+          totalReady: allReadyDeals.length,
+          totalRequested: selectedRecipients.length,
+          limited: false,
+          limit: safeLimit,
+        };
+      }
     }
   }
 
@@ -2740,7 +2982,7 @@ export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit =
       ok: false,
       status: 400,
       error: 'No CIM-ready 75+ deals are available. Review sources and confirm each deal has annual profit and a valid broker email.',
-      review: result.review,
+      review: result?.review || null,
       results: [],
       sent: 0,
       alreadySent: 0,
@@ -2776,14 +3018,14 @@ export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit =
     ok: !allFailed,
     status: allFailed ? 502 : 200,
     error: allFailed ? 'No CIM request emails were sent. Review the failed results before retrying.' : '',
-    review: result.review,
+    review: result?.review || null,
     results,
     sent,
     alreadySent,
     failed,
     totalReady: readyDeals.length,
     totalRequested: selectedRecipients.length,
-    limited: selectedRecipients.length === 0 && result.review?.totals?.cimReady > readyDeals.length,
+    limited: selectedRecipients.length === 0 && (result?.review?.totals?.cimReady || 0) > readyDeals.length,
     limit: safeLimit,
   };
 }

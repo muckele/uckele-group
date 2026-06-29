@@ -1,5 +1,5 @@
 import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { Navigate, NavLink, useParams } from 'react-router-dom';
+import { Navigate, NavLink, useNavigate, useParams } from 'react-router-dom';
 import {
   Activity,
   BellRing,
@@ -574,6 +574,10 @@ function getCimReadyDealsFromReview(review, limit = 25) {
   return readyDeals;
 }
 
+function getCimSnapshotToken(deal = {}) {
+  return deal.cimRequest?.snapshotToken || '';
+}
+
 function AdminSectionNav({ activeSection, isReadOnly }) {
   const visibleSections = adminSections.filter((section) => !isReadOnly || section.id !== 'new-record');
 
@@ -976,9 +980,11 @@ async function copyText(value) {
 }
 
 export default function DashboardPage() {
-  const { section = 'overview' } = useParams();
+  const { section = 'overview', submissionId = '' } = useParams();
+  const navigate = useNavigate();
   const validSectionIds = useMemo(() => new Set(adminSections.map((item) => item.id)), []);
-  const activeSection = validSectionIds.has(section) ? section : 'overview';
+  const isCrmDetailView = Boolean(submissionId);
+  const activeSection = isCrmDetailView ? 'crm' : validSectionIds.has(section) ? section : 'overview';
   const [authState, setAuthState] = useState({
     checked: false,
     authenticated: false,
@@ -1154,6 +1160,69 @@ export default function DashboardPage() {
     }
   }
 
+  async function loadSubmissionDetail(id, options = {}) {
+    const requestId = dashboardRequestRef.current.id + 1;
+    const controller = new AbortController();
+
+    dashboardRequestRef.current.controller?.abort();
+    dashboardRequestRef.current = { controller, id: requestId };
+    setLoading(true);
+    setActionError('');
+
+    try {
+      const response = await fetch(`/api/admin/submissions/${id}`, {
+        credentials: 'same-origin',
+        signal: controller.signal,
+      });
+
+      if (dashboardRequestRef.current.id !== requestId) {
+        return;
+      }
+
+      if (response.status === 401) {
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
+        return;
+      }
+
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to load this CRM record.');
+      }
+
+      setDashboardData((current) => ({
+        ...current,
+        submissions: [result.submission],
+        notifications: result.submission.follow_up_prompt ? [result.submission] : [],
+        emailTriage: result.submission.email_engagement?.actionable ? [result.submission] : [],
+        total: 1,
+      }));
+      setDrafts({
+        [result.submission.id]: buildDraft(result.submission),
+      });
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        return;
+      }
+
+      if (options.throwOnError) {
+        throw error;
+      }
+
+      setActionError(error.message || 'Unable to load this CRM record.');
+    } finally {
+      if (dashboardRequestRef.current.id === requestId) {
+        setLoading(false);
+      }
+    }
+  }
+
+  function refreshCurrentCrmView(options = {}) {
+    return isCrmDetailView
+      ? loadSubmissionDetail(submissionId, options)
+      : loadDashboard(filters.status, deferredSearch.trim(), options);
+  }
+
   async function loadFollowUps(options = {}) {
     const requestId = followUpRequestRef.current.id + 1;
     const controller = new AbortController();
@@ -1296,6 +1365,11 @@ export default function DashboardPage() {
       return;
     }
 
+    if (isCrmDetailView) {
+      loadSubmissionDetail(submissionId);
+      return;
+    }
+
     if (activeSection === 'overview' || activeSection === 'crm') {
       loadDashboard(filters.status, deferredSearch.trim());
       return;
@@ -1303,7 +1377,7 @@ export default function DashboardPage() {
 
     dashboardRequestRef.current.controller?.abort();
     setLoading(false);
-  }, [activeSection, authState.authenticated, deferredSearch, filters.status]);
+  }, [activeSection, authState.authenticated, deferredSearch, filters.status, isCrmDetailView, submissionId]);
 
   useEffect(() => {
     if (!authState.authenticated) {
@@ -1450,7 +1524,7 @@ export default function DashboardPage() {
         [submissionId]: buildDraft(result.submission),
       }));
       await Promise.all([
-        loadDashboard(filters.status, deferredSearch.trim()),
+        refreshCurrentCrmView(),
         loadCommandCenter(),
       ]);
     } catch (error) {
@@ -1505,8 +1579,14 @@ export default function DashboardPage() {
         delete next[submission.id];
         return next;
       });
+
+      if (isCrmDetailView) {
+        navigate('/admin/crm', { replace: true });
+        return;
+      }
+
       const refreshResults = await Promise.allSettled([
-        loadDashboard(filters.status, deferredSearch.trim(), { throwOnError: true }),
+        refreshCurrentCrmView({ throwOnError: true }),
         loadCommandCenter({ throwOnError: true }),
         loadFollowUps({ throwOnError: true }),
       ]);
@@ -1770,7 +1850,10 @@ export default function DashboardPage() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ dealKey: deal.dealKey }),
+        body: JSON.stringify({
+          dealKey: deal.dealKey,
+          snapshotToken: getCimSnapshotToken(deal),
+        }),
       });
       const result = await response.json();
 
@@ -1850,6 +1933,7 @@ export default function DashboardPage() {
           selections: readyDeals.map((deal) => ({
             dealKey: deal.dealKey,
             recipientEmail: deal.confirmedRecipientEmail,
+            snapshotToken: getCimSnapshotToken(deal),
           })),
         }),
       });
@@ -3094,7 +3178,7 @@ export default function DashboardPage() {
         </section>
       ) : null}
 
-      {activeSection === 'crm' ? (
+      {activeSection === 'crm' && !isCrmDetailView ? (
       <section className="section-shell mt-8">
         <Reveal className="panel p-6 sm:p-7">
           <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_220px]">
@@ -3128,6 +3212,22 @@ export default function DashboardPage() {
                 </option>
               ))}
             </select>
+          </div>
+        </Reveal>
+      </section>
+      ) : null}
+
+      {activeSection === 'crm' && isCrmDetailView ? (
+      <section className="section-shell mt-8">
+        <Reveal className="panel p-5 sm:p-7">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <SectionLabel>Diligence Deal Room</SectionLabel>
+              <h2 className="mt-2 text-2xl font-semibold text-ink">CRM record detail</h2>
+            </div>
+            <NavLink className={secondaryActionButtonClass} to="/admin/crm">
+              Back To CRM
+            </NavLink>
           </div>
         </Reveal>
       </section>
@@ -3182,6 +3282,15 @@ export default function DashboardPage() {
                       submission.email_engagement?.failed ||
                       submission.email_engagement?.unsubscribed ? (
                         <Pill tone="danger">Email issue</Pill>
+                      ) : null}
+                      {!isCrmDetailView ? (
+                        <NavLink
+                          className="inline-flex min-h-[38px] items-center justify-center gap-2 rounded-full border border-ink/10 bg-white px-4 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
+                          to={`/admin/crm/${encodeURIComponent(submission.id)}`}
+                        >
+                          <Target className="h-3.5 w-3.5" />
+                          Open Deal Room
+                        </NavLink>
                       ) : null}
                     </div>
 
@@ -3740,14 +3849,25 @@ export default function DashboardPage() {
                                   <p className="font-semibold text-ink">{document.original_name}</p>
                                   <p className="mt-1 text-xs uppercase tracking-[0.14em] text-moss/70">{document.document_type}</p>
                                 </div>
-                                <button
-                                  className="inline-flex items-center gap-2 rounded-full border border-ink/10 bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
-                                  onClick={() => copyText(document.original_name)}
-                                  type="button"
-                                >
-                                  <Copy className="h-3.5 w-3.5" />
-                                  Copy Name
-                                </button>
+                                <div className="flex flex-wrap items-center gap-2">
+                                  {!isReadOnly ? (
+                                    <a
+                                      className="inline-flex items-center gap-2 rounded-full border border-moss/20 bg-white px-3 py-2 text-xs font-semibold text-moss transition hover:border-moss hover:bg-moss hover:text-white"
+                                      href={`/api/admin/secure-documents/${encodeURIComponent(document.id)}/download`}
+                                    >
+                                      <Download className="h-3.5 w-3.5" />
+                                      Download
+                                    </a>
+                                  ) : null}
+                                  <button
+                                    className="inline-flex items-center gap-2 rounded-full border border-ink/10 bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
+                                    onClick={() => copyText(document.original_name)}
+                                    type="button"
+                                  >
+                                    <Copy className="h-3.5 w-3.5" />
+                                    Copy Name
+                                  </button>
+                                </div>
                               </div>
                             </div>
                           ))}
