@@ -152,6 +152,8 @@ test('viewer credentials create read-only admin access', async () => {
 
   assert.equal(followUpsResponse.statusCode, 200);
   assert.equal(followUpsResponse.body.success, true);
+  assert.equal(routeLayer(app, 'get', '/api/admin/prospect-discovery'), undefined);
+  assert.equal(routeLayer(app, 'post', '/api/admin/prospect-discovery/run'), undefined);
 
   const blockedRoutes = [
     { method: 'post', routePath: '/api/admin/acquisition-command-center/:id', params: { id: 'submission-1' }, body: { pipelineStage: 'passed' } },
@@ -161,7 +163,6 @@ test('viewer credentials create read-only admin access', async () => {
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-request', body: { dealKey: 'deal-1' } },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-requests/send-ready' },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-follow-ups/run' },
-    { method: 'post', routePath: '/api/admin/prospect-discovery/run', body: { query: 'plumbers near New York NY' } },
     { method: 'patch', routePath: '/api/admin/submissions/:id', params: { id: 'submission-1' }, body: { status: 'review' } },
     { method: 'delete', routePath: '/api/admin/submissions/:id', params: { id: 'submission-1' } },
     { method: 'post', routePath: '/api/admin/submissions/:id/upload-request', params: { id: 'submission-1' } },

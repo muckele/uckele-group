@@ -34,10 +34,6 @@ import {
   sendDealHunterReadyCimRequests,
 } from './services/dealHunter.js';
 import {
-  getProspectDiscoveryDashboard,
-  runProspectDiscovery,
-} from './services/prospectDiscovery.js';
-import {
   createManualSubmission,
   enforceContactBodyRateLimit,
   exportDashboardSubmissionsCsv,
@@ -591,45 +587,6 @@ export function createApp() {
         success: result.emailResult.status !== 'failed',
         ...result,
       });
-    }),
-  );
-
-  app.get(
-    '/api/admin/prospect-discovery',
-    asyncRoute(async (request, response) => {
-      if (!requireAdminAccess(request)) {
-        response.status(401).json({ success: false, error: 'Unauthorized.' });
-        return;
-      }
-
-      const result = await getProspectDiscoveryDashboard();
-      response.json({ success: true, ...result });
-    }),
-  );
-
-  app.post(
-    '/api/admin/prospect-discovery/run',
-    asyncRoute(async (request, response) => {
-      const session = requireAdmin(request);
-
-      if (!session) {
-        response.status(401).json({ success: false, error: 'Unauthorized.' });
-        return;
-      }
-
-      const result = await runProspectDiscovery({
-        query: String(request.body.query || ''),
-        maxResults: Number(request.body.maxResults) || undefined,
-        autoImport: request.body.autoImport,
-        requestedBy: session.username,
-      });
-
-      if (!result.ok) {
-        response.status(result.status || 400).json({ success: false, error: result.error });
-        return;
-      }
-
-      response.status(201).json({ success: true, ...result });
     }),
   );
 

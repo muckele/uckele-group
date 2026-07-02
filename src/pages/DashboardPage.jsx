@@ -13,11 +13,9 @@ import {
   Link2,
   LogOut,
   MailCheck,
-  MapPin,
   Plus,
   RefreshCw,
   Save,
-  Search,
   Send,
   ShieldAlert,
   Target,
@@ -89,7 +87,6 @@ const adminSections = [
   { id: 'crm', label: 'CRM Records', href: '/admin/crm', icon: Inbox },
   { id: 'command-center', label: 'Command Center', href: '/admin/command-center', icon: Target },
   { id: 'deal-hunter', label: 'Deal Hunter', href: '/admin/deal-hunter', icon: ClipboardList },
-  { id: 'prospecting', label: 'Prospecting', href: '/admin/prospecting', icon: MapPin },
   { id: 'follow-ups', label: 'Follow-Ups', href: '/admin/follow-ups', icon: BellRing },
   { id: 'new-record', label: 'New Record', href: '/admin/new-record', icon: Plus },
 ];
@@ -156,26 +153,6 @@ function formatPassReason(value) {
   return labels[value] || formatLabel(value || '');
 }
 
-function formatLeadTier(value) {
-  if (value === 'tier_a') {
-    return 'Tier A';
-  }
-
-  if (value === 'tier_b') {
-    return 'Tier B';
-  }
-
-  if (value === 'tier_c') {
-    return 'Tier C';
-  }
-
-  if (value === 'dnp') {
-    return 'DNP';
-  }
-
-  return formatLabel(value || 'unclassified');
-}
-
 function formatDateTime(value) {
   if (!value) {
     return 'Not set';
@@ -187,26 +164,6 @@ function formatDateTime(value) {
 
 function pluralize(count, label) {
   return `${count} ${label}${count === 1 ? '' : 's'}`;
-}
-
-function leadTierTone(value) {
-  if (value === 'tier_a') {
-    return 'success';
-  }
-
-  if (value === 'tier_b') {
-    return 'warning';
-  }
-
-  if (value === 'tier_c') {
-    return 'info';
-  }
-
-  if (value === 'dnp') {
-    return 'danger';
-  }
-
-  return 'default';
 }
 
 function emailEngagementTone(engagement) {
@@ -1027,20 +984,6 @@ export default function DashboardPage() {
   const [commandCenterLoading, setCommandCenterLoading] = useState(false);
   const [commandCenterUpdatingId, setCommandCenterUpdatingId] = useState('');
   const [commandCenterFeedback, setCommandCenterFeedback] = useState({ error: '', message: '' });
-  const [prospectDiscovery, setProspectDiscovery] = useState({
-    config: null,
-    summary: null,
-    runs: [],
-    discoveries: [],
-  });
-  const [prospectDiscoveryForm, setProspectDiscoveryForm] = useState({
-    query: '',
-    maxResults: '10',
-    autoImport: true,
-  });
-  const [prospectDiscoveryLoading, setProspectDiscoveryLoading] = useState(false);
-  const [prospectDiscoveryRunning, setProspectDiscoveryRunning] = useState(false);
-  const [prospectDiscoveryFeedback, setProspectDiscoveryFeedback] = useState({ error: '', message: '' });
   const dashboardRequestRef = useRef({ controller: null, id: 0 });
   const followUpRequestRef = useRef({ controller: null, id: 0 });
   const deferredSearch = useDeferredValue(filters.search);
@@ -1308,47 +1251,6 @@ export default function DashboardPage() {
     }
   }
 
-  async function loadProspectDiscovery() {
-    setProspectDiscoveryLoading(true);
-
-    try {
-      const response = await fetch('/api/admin/prospect-discovery', {
-        credentials: 'same-origin',
-      });
-
-      if (response.status === 401) {
-        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
-        return;
-      }
-
-      const result = await response.json();
-
-      if (!response.ok || !result.success) {
-        throw new Error(result.error || 'Unable to load prospect discovery.');
-      }
-
-      setProspectDiscovery({
-        config: result.config,
-        summary: result.summary,
-        runs: result.runs || [],
-        discoveries: result.discoveries || [],
-      });
-
-      if (!prospectDiscoveryForm.query && result.config?.queries?.[0]) {
-        setProspectDiscoveryForm((current) => ({
-          ...current,
-          query: result.config.queries[0],
-          maxResults: String(result.config.maxResultsPerQuery || 10),
-          autoImport: Boolean(result.config.autoImport),
-        }));
-      }
-    } catch (error) {
-      setProspectDiscoveryFeedback({ error: error.message || 'Unable to load prospect discovery.', message: '' });
-    } finally {
-      setProspectDiscoveryLoading(false);
-    }
-  }
-
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get('admin_token');
 
@@ -1393,10 +1295,6 @@ export default function DashboardPage() {
     } else {
       followUpRequestRef.current.controller?.abort();
       setFollowUpLoading(false);
-    }
-
-    if (activeSection === 'prospecting') {
-      loadProspectDiscovery();
     }
   }, [activeSection, authState.authenticated]);
 
@@ -2007,60 +1905,6 @@ export default function DashboardPage() {
     }
   }
 
-  async function handleRunProspectDiscovery(event) {
-    event.preventDefault();
-
-    if (isReadOnly) {
-      setProspectDiscoveryFeedback({ error: 'Read-only users cannot run prospect discovery.', message: '' });
-      return;
-    }
-
-    setProspectDiscoveryRunning(true);
-    setProspectDiscoveryFeedback({ error: '', message: '' });
-
-    try {
-      const response = await fetch('/api/admin/prospect-discovery/run', {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          query: prospectDiscoveryForm.query,
-          maxResults: Number(prospectDiscoveryForm.maxResults) || undefined,
-          autoImport: prospectDiscoveryForm.autoImport,
-        }),
-      });
-      const result = await response.json();
-
-      if (!response.ok || !result.success) {
-        throw new Error(result.error || 'Unable to run prospect discovery.');
-      }
-
-      const tierCounts = (result.discoveries || []).reduce(
-        (accumulator, discovery) => ({
-          ...accumulator,
-          [discovery.lead_tier || 'unclassified']: (accumulator[discovery.lead_tier || 'unclassified'] || 0) + 1,
-        }),
-        { tier_a: 0, tier_b: 0, tier_c: 0, dnp: 0 },
-      );
-
-      setProspectDiscoveryFeedback({
-        error: '',
-        message: `Classified ${result.count || 0} businesses: ${tierCounts.tier_a || 0} Tier A, ${tierCounts.tier_b || 0} Tier B, ${tierCounts.tier_c || 0} Tier C, ${tierCounts.dnp || 0} DNP. Imported ${result.importedCount || 0} CRM record${result.importedCount === 1 ? '' : 's'}.`,
-      });
-      await Promise.all([
-        loadProspectDiscovery(),
-        loadDashboard(filters.status, deferredSearch.trim()),
-        loadCommandCenter(),
-      ]);
-    } catch (error) {
-      setProspectDiscoveryFeedback({ error: error.message || 'Unable to run prospect discovery.', message: '' });
-    } finally {
-      setProspectDiscoveryRunning(false);
-    }
-  }
-
   const summary = dashboardData.summary || {
     total: 0,
     lastSevenDays: 0,
@@ -2226,7 +2070,7 @@ export default function DashboardPage() {
               <p className="text-[11px] font-semibold uppercase tracking-normal text-moss">Private Admin</p>
               <h1 className="mt-2 text-3xl font-semibold leading-tight text-ink sm:text-4xl">Admin workspace</h1>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-ink/68 sm:text-base">
-                CRM records, Deal Hunter scoring, prospecting, and follow-up work are split into focused views so daily admin work stays readable.
+                CRM records, Deal Hunter scoring, and follow-up work are split into focused views so daily admin work stays readable.
               </p>
             </div>
 
@@ -2315,7 +2159,7 @@ export default function DashboardPage() {
               <SectionLabel>Admin Areas</SectionLabel>
               <h2 className="mt-2 text-xl font-semibold text-ink sm:text-2xl">Choose a focused workspace</h2>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-ink/68">
-                Each admin workflow now has its own page so daily review, CRM editing, prospecting, and follow-up work stay separated.
+                Each admin workflow now has its own page so daily review, CRM editing, and follow-up work stay separated.
               </p>
             </div>
           </div>
@@ -2328,7 +2172,6 @@ export default function DashboardPage() {
                   crm: 'Search, edit, diligence-check, and manage broker or seller CRM records.',
                   'command-center': 'Review the 75+ pipeline, source health, action queue, and pass decisions.',
                   'deal-hunter': 'Run source scoring, send daily deal emails, and manage CIM follow-ups.',
-                  prospecting: 'Run local business discovery and review imported prospect leads.',
                   'follow-ups': 'Work the generated follow-up prompts and email engagement triage queue.',
                   'new-record': 'Create a manual broker, seller, referral, or prospect record.',
                 };
@@ -2524,166 +2367,6 @@ export default function DashboardPage() {
                   </div>
                 </div>
               ))}
-            </div>
-          </div>
-        </Reveal>
-      </section>
-      ) : null}
-
-      {activeSection === 'prospecting' ? (
-      <section className="section-shell mt-8">
-        <Reveal className="panel p-5 sm:p-8">
-          <div className="flex flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
-            <div>
-              <SectionLabel>Prospect Discovery</SectionLabel>
-              <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Find and import local business prospects</h2>
-              <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
-                Search Google Places for target business categories, score operating strength and online presence gaps, then import Tier A/B/C prospects for follow-up.
-              </p>
-            </div>
-
-            <div className="flex flex-wrap gap-2">
-              <Pill tone={prospectDiscovery.config?.enabled ? 'success' : 'danger'}>
-                {prospectDiscovery.config?.enabled ? 'Enabled' : 'Disabled'}
-              </Pill>
-              <Pill tone={prospectDiscovery.config?.hasGooglePlacesApiKey ? 'success' : 'warning'}>
-                {prospectDiscovery.config?.provider || 'google-places'}
-              </Pill>
-              <Pill tone={prospectDiscovery.config?.autoImport ? 'warning' : 'default'}>
-                {prospectDiscovery.config?.autoImport ? 'Auto Import' : 'Review Only'}
-              </Pill>
-              <Pill tone={prospectDiscovery.config?.websiteCheckEnabled ? 'success' : 'default'}>
-                {prospectDiscovery.config?.websiteCheckEnabled ? 'Website Check' : 'Listing Signals Only'}
-              </Pill>
-            </div>
-          </div>
-
-          {!isReadOnly ? (
-            <form className="mt-6 grid gap-4 lg:grid-cols-[minmax(0,1fr)_140px_auto]" onSubmit={handleRunProspectDiscovery}>
-              <InputField
-                label="Search query"
-                onChange={(event) => setProspectDiscoveryForm((current) => ({ ...current, query: event.target.value }))}
-                placeholder="Example: plumbers near New Rochelle NY"
-                value={prospectDiscoveryForm.query}
-              />
-              <InputField
-                label="Max results"
-                onChange={(event) => setProspectDiscoveryForm((current) => ({ ...current, maxResults: event.target.value }))}
-                type="number"
-                value={prospectDiscoveryForm.maxResults}
-              />
-              <div className="flex flex-col justify-end gap-3">
-                <label className="flex items-center gap-2 text-sm font-semibold text-ink">
-                  <input
-                    checked={prospectDiscoveryForm.autoImport}
-                    className="h-4 w-4 rounded border-line text-moss"
-                    onChange={(event) => setProspectDiscoveryForm((current) => ({ ...current, autoImport: event.target.checked }))}
-                    type="checkbox"
-                  />
-                  Auto-import
-                </label>
-                <button
-                  className={primaryActionButtonClass}
-                  disabled={prospectDiscoveryRunning || prospectDiscoveryLoading || !prospectDiscoveryForm.query}
-                  type="submit"
-                >
-                  <Search className="h-4 w-4" />
-                  {prospectDiscoveryRunning ? 'Discovering...' : 'Run Discovery'}
-                </button>
-              </div>
-            </form>
-          ) : (
-            <p className="mt-6 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-medium text-sky-800">
-              Prospect discovery runs are hidden for read-only users. Existing discoveries and recent runs remain visible below.
-            </p>
-          )}
-
-          {!prospectDiscovery.config?.enabled || !prospectDiscovery.config?.hasGooglePlacesApiKey ? (
-            <p className="mt-5 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
-              Configure `PROSPECT_DISCOVERY_ENABLED=true`, `GOOGLE_PLACES_API_KEY`, and `PROSPECT_DISCOVERY_QUERIES` before running live discovery.
-            </p>
-          ) : null}
-
-          {prospectDiscoveryFeedback.error ? (
-            <p className="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{prospectDiscoveryFeedback.error}</p>
-          ) : null}
-          {prospectDiscoveryFeedback.message ? (
-            <p className="mt-5 rounded-2xl border border-moss/20 bg-moss/8 px-4 py-3 text-sm font-medium text-moss">{prospectDiscoveryFeedback.message}</p>
-          ) : null}
-
-          <div className="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
-            <StatCard icon={MapPin} label="Discovered" value={prospectDiscovery.summary?.total || 0} />
-            <StatCard icon={Plus} label="Tier A" value={prospectDiscovery.summary?.byTier?.tier_a || 0} tone="success" />
-            <StatCard icon={ClipboardList} label="Tier B" value={prospectDiscovery.summary?.byTier?.tier_b || 0} tone="warning" />
-            <StatCard icon={ShieldAlert} label="Tier C" value={prospectDiscovery.summary?.byTier?.tier_c || 0} tone="info" />
-            <StatCard icon={RefreshCw} label="DNP" value={prospectDiscovery.summary?.byTier?.dnp || 0} tone={(prospectDiscovery.summary?.byTier?.dnp || 0) > 0 ? 'danger' : 'default'} />
-          </div>
-
-          <div className="mt-7 grid gap-5 xl:grid-cols-[1.2fr_0.8fr]">
-            <div className="rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5">
-              <SectionLabel>Recent Prospects</SectionLabel>
-              {prospectDiscovery.discoveries?.length > 0 ? (
-                <div className="mt-4 space-y-3">
-                  {prospectDiscovery.discoveries.slice(0, 8).map((discovery) => {
-                    const websiteHref = safeExternalHref(discovery.website_url);
-                    const googleMapsHref = safeExternalHref(discovery.source_data?.googleMapsUri);
-
-                    return (
-                      <div className="rounded-2xl border border-line/80 bg-white/75 px-4 py-3 text-sm leading-6 text-ink/74" key={discovery.id}>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <p className="font-semibold text-ink">{discovery.business_name}</p>
-                          <Pill tone={leadTierTone(discovery.lead_tier)}>
-                            {formatLeadTier(discovery.lead_tier)}
-                          </Pill>
-                          <Pill tone={discovery.status === 'imported' ? 'success' : discovery.status === 'duplicate' ? 'warning' : discovery.status === 'not-prioritized' ? 'danger' : 'info'}>
-                            {formatLabel(discovery.status)}
-                          </Pill>
-                          <Pill>Score {discovery.score || 0}</Pill>
-                        </div>
-                        <p className="mt-2">
-                          {[discovery.category, discovery.address, discovery.review_count ? `${discovery.review_count} reviews` : ''].filter(Boolean).join(' | ')}
-                        </p>
-                        <p className="mt-2">
-                          Quality {discovery.business_quality_score || 0}/100 | Presence gap {discovery.presence_gap_score || 0}/100
-                        </p>
-                        {discovery.recommended_action ? <p className="mt-2 font-medium text-ink">{discovery.recommended_action}</p> : null}
-                        {discovery.outreach_angle ? <p className="mt-2">{discovery.outreach_angle}</p> : null}
-                        <div className="mt-2 flex flex-wrap gap-3">
-                          {websiteHref ? (
-                            <a className="font-semibold text-moss underline" href={websiteHref} rel="noreferrer" target="_blank">Website</a>
-                          ) : null}
-                          {googleMapsHref ? (
-                            <a className="font-semibold text-moss underline" href={googleMapsHref} rel="noreferrer" target="_blank">Google Maps</a>
-                          ) : null}
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              ) : (
-                <p className="mt-4 text-sm leading-7 text-ink/68">No prospects discovered yet.</p>
-              )}
-            </div>
-
-            <div className="rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5">
-              <SectionLabel>Recent Runs</SectionLabel>
-              {prospectDiscovery.runs?.length > 0 ? (
-                <div className="mt-4 space-y-3">
-                  {prospectDiscovery.runs.slice(0, 5).map((run) => (
-                    <div className="rounded-2xl border border-line/80 bg-fog/70 px-4 py-3 text-sm leading-6 text-ink/74" key={run.id}>
-                      <div className="flex flex-wrap items-center gap-2">
-                        <Pill tone={run.status === 'completed' ? 'success' : run.status === 'failed' ? 'danger' : 'warning'}>{formatLabel(run.status)}</Pill>
-                        <Pill>{run.provider}</Pill>
-                      </div>
-                      <p className="mt-2 font-semibold text-ink">{run.query}</p>
-                      <p className="mt-1">{formatDateTime(run.created_at)} | Imported {run.imported_count || 0}</p>
-                      {run.error ? <p className="mt-2 text-red-700">{run.error}</p> : null}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="mt-4 text-sm leading-7 text-ink/68">No discovery runs yet.</p>
-              )}
             </div>
           </div>
         </Reveal>
