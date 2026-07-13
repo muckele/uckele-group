@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { FileUp, LockKeyhole, ShieldCheck } from 'lucide-react';
 import PageHero from '../components/PageHero';
 import Reveal from '../components/Reveal';
@@ -41,7 +41,8 @@ export default function SecureDocumentsPage() {
   const [token] = useState(() => new URLSearchParams(window.location.search).get('token') || '');
   const [context, setContext] = useState(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState('');
+  const [contextError, setContextError] = useState('');
+  const [submissionError, setSubmissionError] = useState('');
   const [ndaAccepted, setNdaAccepted] = useState(false);
   const [documentType, setDocumentType] = useState('financials');
   const [note, setNote] = useState('');
@@ -49,15 +50,15 @@ export default function SecureDocumentsPage() {
   const [submitting, setSubmitting] = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
 
-  async function loadContext() {
+  const loadContext = useCallback(async () => {
     if (!token) {
-      setError('This secure document link is missing a token.');
+      setContextError('This secure document link is missing a token.');
       setLoading(false);
       return;
     }
 
     setLoading(true);
-    setError('');
+    setContextError('');
 
     try {
       const response = await fetch(`/api/secure-documents/request?token=${encodeURIComponent(token)}`);
@@ -69,15 +70,15 @@ export default function SecureDocumentsPage() {
 
       setContext(result);
     } catch (loadError) {
-      setError(loadError.message || 'Unable to verify this secure document request.');
+      setContextError(loadError.message || 'Unable to verify this secure document request.');
     } finally {
       setLoading(false);
     }
-  }
+  }, [token]);
 
   useEffect(() => {
     loadContext();
-  }, [token]);
+  }, [loadContext]);
 
   const companyLabel = useMemo(() => context?.submission?.company || context?.submission?.name || 'this opportunity', [context]);
 
@@ -85,17 +86,17 @@ export default function SecureDocumentsPage() {
     event.preventDefault();
 
     if (files.length === 0) {
-      setError('Please choose at least one file to upload.');
+      setSubmissionError('Please choose at least one file to upload.');
       return;
     }
 
     if (!ndaAccepted) {
-      setError('Please confirm the NDA and confidentiality acknowledgement before uploading.');
+      setSubmissionError('Please confirm the confidentiality acknowledgement before uploading.');
       return;
     }
 
     setSubmitting(true);
-    setError('');
+    setSubmissionError('');
     setSuccessMessage('');
 
     try {
@@ -113,6 +114,7 @@ export default function SecureDocumentsPage() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'X-Secure-Upload-Token': token,
         },
         body: JSON.stringify({
           token,
@@ -131,9 +133,10 @@ export default function SecureDocumentsPage() {
       setContext(result);
       setFiles([]);
       setNote('');
+      setNdaAccepted(false);
       setSuccessMessage('Your documents were uploaded successfully.');
     } catch (submitError) {
-      setError(submitError.message || 'Unable to upload the selected files.');
+      setSubmissionError(submitError.message || 'Unable to upload the selected files.');
     } finally {
       setSubmitting(false);
     }
@@ -154,13 +157,22 @@ export default function SecureDocumentsPage() {
           <Reveal className="panel p-7 text-sm leading-7 text-ink/70">Verifying secure upload request...</Reveal>
         ) : null}
 
-        {error ? (
+        {contextError ? (
           <Reveal className="rounded-2xl border border-red-200 bg-red-50 p-5 text-sm font-medium leading-7 text-red-700 sm:p-7">
-            {error}
+            <p role="alert">{contextError}</p>
+            {token ? (
+              <button
+                className="mt-4 inline-flex min-h-[44px] items-center justify-center rounded-full border border-red-300 bg-white px-5 py-2 text-sm font-semibold text-red-800"
+                onClick={loadContext}
+                type="button"
+              >
+                Try Again
+              </button>
+            ) : null}
           </Reveal>
         ) : null}
 
-        {!loading && !error && context ? (
+        {!loading && !contextError && context ? (
           <div className="grid gap-8 lg:grid-cols-[0.92fr_1.08fr]">
             <Reveal className="panel p-7 sm:p-8">
               <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-moss/8 text-moss">
@@ -201,6 +213,17 @@ export default function SecureDocumentsPage() {
             </Reveal>
 
             <Reveal className="panel p-7 sm:p-8" delay={120}>
+              {context.request.status === 'documents-received' ? (
+                <div className="space-y-4">
+                  <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-moss/8 text-moss">
+                    <ShieldCheck className="h-5 w-5" />
+                  </div>
+                  <h2 className="text-2xl font-semibold text-ink">Documents received</h2>
+                  <p className="text-sm leading-7 text-ink/72">
+                    This secure request is complete. Please contact Uckele Group if you need a new upload link for additional files.
+                  </p>
+                </div>
+              ) : (
               <form className="space-y-5" onSubmit={handleSubmit}>
                 <div>
                   <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-clay/12 text-clay">
@@ -213,7 +236,13 @@ export default function SecureDocumentsPage() {
                 </div>
 
                 {successMessage ? (
-                  <p className="rounded-2xl border border-moss/20 bg-moss/8 px-4 py-3 text-sm font-medium text-moss">{successMessage}</p>
+                  <p aria-live="polite" className="rounded-2xl border border-moss/20 bg-moss/8 px-4 py-3 text-sm font-medium text-moss">{successMessage}</p>
+                ) : null}
+
+                {submissionError ? (
+                  <p className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700" role="alert">
+                    {submissionError}
+                  </p>
                 ) : null}
 
                 <label className="flex flex-col gap-2 text-sm font-medium text-ink">
@@ -239,7 +268,10 @@ export default function SecureDocumentsPage() {
                     accept={acceptedDocumentTypes}
                     className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink"
                     multiple
-                    onChange={(event) => setFiles(Array.from(event.target.files || []))}
+                    onChange={(event) => {
+                      setFiles(Array.from(event.target.files || []));
+                      setSubmissionError('');
+                    }}
                     type="file"
                   />
                 </label>
@@ -255,8 +287,16 @@ export default function SecureDocumentsPage() {
                 </label>
 
                 <label className="flex items-start gap-3 rounded-2xl border border-line/80 bg-fog/70 px-4 py-4 text-sm leading-7 text-ink/74">
-                  <input checked={ndaAccepted} className="mt-1 h-4 w-4" onChange={(event) => setNdaAccepted(event.target.checked)} type="checkbox" />
-                  <span>I confirm these documents are being shared confidentially for business review and I acknowledge the NDA / confidentiality terms associated with this request.</span>
+                  <input
+                    checked={ndaAccepted}
+                    className="mt-1 h-4 w-4"
+                    onChange={(event) => {
+                      setNdaAccepted(event.target.checked);
+                      setSubmissionError('');
+                    }}
+                    type="checkbox"
+                  />
+                  <span>I confirm these documents are being shared confidentially for business review and acknowledge this confidentiality notice.</span>
                 </label>
 
                 <button
@@ -267,6 +307,7 @@ export default function SecureDocumentsPage() {
                   {submitting ? 'Uploading...' : 'Upload Documents'}
                 </button>
               </form>
+              )}
             </Reveal>
           </div>
         ) : null}

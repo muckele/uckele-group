@@ -206,12 +206,12 @@ function safeDealHunterCrmImport(record = {}) {
   };
 }
 
-export function createSupabaseStorage(config) {
-  if (!config.storage.supabaseUrl || !config.storage.supabaseServiceRoleKey) {
+export function createSupabaseStorage(config, { client: clientOverride } = {}) {
+  if (!clientOverride && (!config.storage.supabaseUrl || !config.storage.supabaseServiceRoleKey)) {
     throw new Error('Supabase storage provider requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.');
   }
 
-  const client = createClient(config.storage.supabaseUrl, config.storage.supabaseServiceRoleKey, {
+  const client = clientOverride || createClient(config.storage.supabaseUrl, config.storage.supabaseServiceRoleKey, {
     auth: { persistSession: false },
   });
 
@@ -284,6 +284,14 @@ export function createSupabaseStorage(config) {
   }
 
   return {
+    async checkHealth() {
+      const { error } = await client.from('contact_submissions').select('id').limit(1);
+      if (error) {
+        throw error;
+      }
+      return { ok: true };
+    },
+
     async insertSubmission(submission) {
       const { data, error } = await client.from('contact_submissions').insert(submission).select().single();
 
@@ -302,6 +310,22 @@ export function createSupabaseStorage(config) {
       }
 
       return normalizeSubmissionRow(data);
+    },
+
+    async updateSubmissionIfCurrent(id, expectedUpdatedAt, values) {
+      const { data, error } = await client
+        .from('contact_submissions')
+        .update(values)
+        .eq('id', id)
+        .eq('updated_at', expectedUpdatedAt)
+        .select()
+        .maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      return data ? normalizeSubmissionRow(data) : null;
     },
 
     async getSubmission(id) {
@@ -1174,17 +1198,25 @@ export function createSupabaseStorage(config) {
         .from('deal_hunter_crm_imports')
         .update(reclaimPayload)
         .eq('id', existingImport.id)
+        .eq('status', existingImport.status)
+        .eq('updated_at', existingImport.updated_at)
         .select()
-        .single();
+        .maybeSingle();
 
       if (claimError) {
         throw claimError;
       }
 
-      return {
-        claimed: true,
-        importRecord: normalizeDealHunterCrmImportRow(claimedData),
-      };
+      return claimedData
+        ? { claimed: true, importRecord: normalizeDealHunterCrmImportRow(claimedData) }
+        : {
+            claimed: false,
+            importRecord: await getDealHunterCrmImportRecord({
+              id: existingImport.id,
+              dealKey: safeRecord.deal_key,
+              listingIdentity: safeRecord.listing_identity,
+            }),
+          };
     },
 
     async updateDealHunterCrmImport(id, values = {}) {
@@ -1443,5 +1475,193 @@ export function createSupabaseStorage(config) {
 	        request: normalizeDealHunterCimRequestRow(data),
 	      };
 	    },
+
+    async claimScheduledJob({ jobKey = '', jobName = '', triggeredBy = '', nowIso = '', staleBefore = '', metadata = {} } = {}) {
+      if (!jobKey || !jobName || !nowIso) {
+        return { claimed: false, run: null };
+      }
+
+      const record = {
+        job_key: jobKey,
+        job_name: jobName,
+        created_at: nowIso,
+        updated_at: nowIso,
+        started_at: nowIso,
+        completed_at: null,
+        status: 'pending',
+        triggered_by: triggeredBy,
+        attempt_count: 1,
+        provider_message_id: null,
+        last_error: null,
+        metadata: metadata || {},
+      };
+      const inserted = await client.from('scheduled_job_runs').insert(record).select().single();
+
+      if (!inserted.error) {
+        return { claimed: true, run: inserted.data };
+      }
+
+      if (!isUniqueViolation(inserted.error)) {
+        throw inserted.error;
+      }
+
+      const reclaimPayload = {
+        updated_at: nowIso,
+        started_at: nowIso,
+        completed_at: null,
+        status: 'pending',
+        triggered_by: triggeredBy,
+        provider_message_id: null,
+        last_error: null,
+        metadata: metadata || {},
+      };
+      const failedClaim = await client
+        .from('scheduled_job_runs')
+        .update(reclaimPayload)
+        .eq('job_key', jobKey)
+        .eq('status', 'failed')
+        .select()
+        .maybeSingle();
+
+      if (failedClaim.error) {
+        throw failedClaim.error;
+      }
+
+      let claimedData = failedClaim.data;
+
+      if (!claimedData && staleBefore) {
+        const staleClaim = await client
+          .from('scheduled_job_runs')
+          .update(reclaimPayload)
+          .eq('job_key', jobKey)
+          .eq('status', 'pending')
+          .lte('updated_at', staleBefore)
+          .select()
+          .maybeSingle();
+
+        if (staleClaim.error) {
+          throw staleClaim.error;
+        }
+
+        claimedData = staleClaim.data;
+      }
+
+      if (claimedData) {
+        const attemptCount = Number(claimedData.attempt_count || 1) + 1;
+        const updated = await client
+          .from('scheduled_job_runs')
+          .update({ attempt_count: attemptCount })
+          .eq('job_key', jobKey)
+          .select()
+          .single();
+
+        if (updated.error) {
+          throw updated.error;
+        }
+
+        return { claimed: true, run: updated.data };
+      }
+
+      const existing = await client.from('scheduled_job_runs').select('*').eq('job_key', jobKey).maybeSingle();
+      if (existing.error) {
+        throw existing.error;
+      }
+      return { claimed: false, run: existing.data || null };
+    },
+
+    async completeScheduledJob(jobKey, values = {}) {
+      const completedAt = values.completed_at || new Date().toISOString();
+      const { data, error } = await client
+        .from('scheduled_job_runs')
+        .update({
+          updated_at: completedAt,
+          completed_at: completedAt,
+          status: values.status || 'completed',
+          provider_message_id: values.provider_message_id || null,
+          last_error: values.last_error || null,
+          metadata: values.metadata || {},
+        })
+        .eq('job_key', jobKey)
+        .select()
+        .single();
+      if (error) {
+        throw error;
+      }
+      return data;
+    },
+
+    async getScheduledJob(jobKey) {
+      const { data, error } = await client.from('scheduled_job_runs').select('*').eq('job_key', jobKey).maybeSingle();
+      if (error) {
+        throw error;
+      }
+      return data || null;
+    },
+
+    async insertAdminAuditEvent(event) {
+      const { data, error } = await client.from('admin_audit_events').insert(event).select().single();
+      if (error) {
+        throw error;
+      }
+      return data;
+    },
+
+    async listAdminAuditEvents({ requestId = '', limit = 100 } = {}) {
+      let query = client
+        .from('admin_audit_events')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(Math.max(1, Math.min(Number(limit) || 100, 500)));
+      if (requestId) {
+        query = query.eq('request_id', requestId);
+      }
+      const { data, error } = await query;
+      if (error) {
+        throw error;
+      }
+      return data || [];
+    },
+
+    async insertSecureDocumentCleanupJob(job) {
+      const { data, error } = await client.from('secure_document_cleanup_jobs').insert(job).select().single();
+      if (error) {
+        throw error;
+      }
+      return data;
+    },
+
+    async updateSecureDocumentCleanupJob(id, values = {}) {
+      const { data, error } = await client
+        .from('secure_document_cleanup_jobs')
+        .update(values)
+        .eq('id', id)
+        .select()
+        .maybeSingle();
+      if (error) {
+        throw error;
+      }
+      return data || null;
+    },
+
+    async getSecureDocumentCleanupJob(id) {
+      const { data, error } = await client.from('secure_document_cleanup_jobs').select('*').eq('id', id).maybeSingle();
+      if (error) {
+        throw error;
+      }
+      return data || null;
+    },
+
+    async listPendingSecureDocumentCleanupJobs(limit = 100) {
+      const { data, error } = await client
+        .from('secure_document_cleanup_jobs')
+        .select('*')
+        .not('status', 'in', '(completed,restored)')
+        .order('created_at', { ascending: true })
+        .limit(Math.max(1, Math.min(Number(limit) || 100, 500)));
+      if (error) {
+        throw error;
+      }
+      return data || [];
+    },
 	  };
-	}
+}

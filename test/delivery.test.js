@@ -3,8 +3,18 @@ import { test } from 'node:test';
 import {
   buildDealHunterCimFollowUpEmail,
   buildDealHunterCimRequestEmail,
+  buildDailyDealHunterEmail,
   normalizeResendTags,
 } from '../server/services/delivery.js';
+
+test('daily Deal Hunter email carries its deterministic provider idempotency key', () => {
+  const message = buildDailyDealHunterEmail({
+    to: 'admin@example.com',
+    idempotencyKey: 'daily-deal-hunter-email:2026-07-12',
+    review: { totals: {}, sources: [], criteriaRecommendations: [] },
+  });
+  assert.equal(message.idempotencyKey, 'daily-deal-hunter-email:2026-07-12');
+});
 
 const sensitiveBrokerDetails = [
   'Internal Fit Score',

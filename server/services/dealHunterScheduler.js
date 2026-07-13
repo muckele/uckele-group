@@ -5,6 +5,8 @@ import { getStorage } from '../storage/index.js';
 import { runDealHunterCimFollowUps, sendDailyDealHunterReview } from './dealHunter.js';
 
 const dailyEmailSource = 'daily-deal-hunter';
+const dailyEmailJobName = 'daily-deal-hunter-email';
+const dailyEmailClaimStaleMs = 60 * 60 * 1000;
 
 function parseScheduleTime(value = '10:15') {
   const match = String(value || '').trim().match(/^(\d{1,2}):(\d{2})$/);
@@ -119,9 +121,139 @@ async function hasSentDailyEmailForDate(storage, dateKey, timezone, markerDir) {
   }
 }
 
-export function startDealHunterDailyEmailScheduler() {
+export async function runClaimedDailyDealHunterEmail({
+  triggeredBy = 'admin',
+  now = new Date(),
+  storage = getStorage(),
+  sendReview = sendDailyDealHunterReview,
+  markerDir,
+} = {}) {
   const config = getConfig();
   const schedule = config.dealHunter.dailyEmail;
+  const effectiveMarkerDir = markerDir === undefined ? schedule.markerDir : markerDir;
+  const { dateKey } = shouldRunDailyDealHunterEmail({
+    now,
+    timezone: schedule.timezone,
+    scheduleTime: schedule.time,
+  });
+  const jobKey = `${dailyEmailJobName}:${dateKey}`;
+
+  if (await hasSentDailyEmailForDate(storage, dateKey, schedule.timezone, effectiveMarkerDir)) {
+    let jobRun = null;
+
+    try {
+      const existingRun = await storage.getScheduledJob?.(jobKey);
+      jobRun = existingRun?.status === 'completed'
+        ? existingRun
+        : await storage.completeScheduledJob?.(jobKey, {
+            status: 'completed',
+            provider_message_id: existingRun?.provider_message_id || '',
+            metadata: {
+              ...(existingRun?.metadata || {}),
+              dateKey,
+              timezone: schedule.timezone,
+              reconciledFromDeliveryEvidence: true,
+            },
+          });
+    } catch (error) {
+      console.warn(`[deal-hunter:scheduler] sent-email reconciliation failed: ${error.message}`);
+    }
+
+    return {
+      alreadySent: true,
+      jobKey,
+      jobRun,
+      emailResult: { status: 'already-sent', error: '', providerMessageId: '' },
+      review: null,
+    };
+  }
+
+  const nowIso = now.toISOString();
+  const claim = await storage.claimScheduledJob({
+    jobKey,
+    jobName: dailyEmailJobName,
+    triggeredBy,
+    nowIso,
+    staleBefore: new Date(now.getTime() - dailyEmailClaimStaleMs).toISOString(),
+    metadata: { dateKey, timezone: schedule.timezone },
+  });
+
+  if (!claim.claimed) {
+    return {
+      alreadySent: claim.run?.status === 'completed',
+      inProgress: claim.run?.status === 'pending',
+      jobKey,
+      jobRun: claim.run,
+      emailResult: {
+        status: claim.run?.status === 'completed' ? 'already-sent' : 'in-progress',
+        error: '',
+        providerMessageId: claim.run?.provider_message_id || '',
+      },
+      review: null,
+    };
+  }
+
+  let result;
+  let deliveryConfirmed = false;
+
+  try {
+    result = await sendReview({ idempotencyKey: jobKey });
+    const failed = result.emailResult.status === 'failed';
+    deliveryConfirmed = !failed;
+
+    if (deliveryConfirmed) {
+      await writeSentDailyEmailMarker(effectiveMarkerDir, dateKey, result).catch((error) => {
+        console.warn(`[deal-hunter:scheduler] daily email marker write failed: ${error.message}`);
+      });
+    }
+
+    const completedAt = new Date().toISOString();
+    const jobRun = await storage.completeScheduledJob(jobKey, {
+      completed_at: completedAt,
+      status: failed ? 'failed' : 'completed',
+      provider_message_id: result.emailResult.providerMessageId || '',
+      last_error: result.emailResult.error || '',
+      metadata: {
+        dateKey,
+        timezone: schedule.timezone,
+        totals: result.review?.totals || {},
+        crmSync: result.crmSync || result.review?.crmSync || {},
+      },
+    });
+
+    return { ...result, jobKey, jobRun, alreadySent: false };
+  } catch (error) {
+    if (!deliveryConfirmed) {
+      await storage.completeScheduledJob(jobKey, {
+        status: 'failed',
+        last_error: error.message || 'Daily Deal Hunter email failed.',
+        metadata: { dateKey, timezone: schedule.timezone },
+      }).catch(() => {});
+    } else {
+      error.deliveryConfirmed = true;
+    }
+    throw error;
+  }
+}
+
+export async function getDailyDealHunterJobStatus(now = new Date()) {
+  const config = getConfig();
+  const { dateKey } = shouldRunDailyDealHunterEmail({
+    now,
+    timezone: config.dealHunter.dailyEmail.timezone,
+    scheduleTime: config.dealHunter.dailyEmail.time,
+  });
+  return getStorage().getScheduledJob(`${dailyEmailJobName}:${dateKey}`);
+}
+
+export function startDealHunterDailyEmailScheduler({
+  getNow = () => new Date(),
+  runEmail = runClaimedDailyDealHunterEmail,
+  scheduleTimer = setTimeout,
+  scheduleOverride = {},
+} = {}) {
+  const config = getConfig();
+  const schedule = { ...config.dealHunter.dailyEmail, ...scheduleOverride };
 
   if (!schedule.enabled) {
     console.log('[deal-hunter:scheduler] daily email scheduler disabled');
@@ -140,7 +272,7 @@ export function startDealHunterDailyEmailScheduler() {
       return;
     }
 
-    const now = new Date();
+    const now = getNow();
     const { dateKey, due } = shouldRunDailyDealHunterEmail({
       now,
       timezone: schedule.timezone,
@@ -161,15 +293,17 @@ export function startDealHunterDailyEmailScheduler() {
     lastAttemptAt = nowMs;
 
     try {
-      const storage = getStorage();
+      console.log(`[deal-hunter:scheduler] sending daily email for ${dateKey} at ${schedule.time} ${schedule.timezone}`);
+      const result = await runEmail({ triggeredBy: 'scheduler', now });
 
-      if (await hasSentDailyEmailForDate(storage, dateKey, schedule.timezone, schedule.markerDir)) {
+      if (result.alreadySent) {
         sentDates.add(dateKey);
         return;
       }
 
-      console.log(`[deal-hunter:scheduler] sending daily email for ${dateKey} at ${schedule.time} ${schedule.timezone}`);
-      const result = await sendDailyDealHunterReview();
+      if (result.inProgress) {
+        return;
+      }
 
       if (result.emailResult.status === 'failed') {
         console.error(`[deal-hunter:scheduler] daily email failed: ${result.emailResult.error || 'unknown error'}`);
@@ -177,9 +311,6 @@ export function startDealHunterDailyEmailScheduler() {
       }
 
       sentDates.add(dateKey);
-      await writeSentDailyEmailMarker(schedule.markerDir, dateKey, result).catch((error) => {
-        console.warn(`[deal-hunter:scheduler] daily email marker write failed: ${error.message}`);
-      });
       console.log(`[deal-hunter:scheduler] daily email ${result.emailResult.status} for ${dateKey}`);
     } catch (error) {
       console.error(`[deal-hunter:scheduler] daily email crashed: ${error.message}`);
@@ -189,7 +320,7 @@ export function startDealHunterDailyEmailScheduler() {
   }
 
   function scheduleNext(delayMs = schedule.checkIntervalMs) {
-    timer = setTimeout(async () => {
+    timer = scheduleTimer(async () => {
       await tick();
 
       if (!stopped) {
@@ -206,6 +337,7 @@ export function startDealHunterDailyEmailScheduler() {
   scheduleNext(1000);
 
   return {
+    tick,
     stop() {
       stopped = true;
 

@@ -186,6 +186,8 @@ export default function ContactForm() {
         window.clearTimeout(timeoutId);
       }
     };
+  // Widget helpers operate only on stable refs; config changes are the intended rerender boundary.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [turnstileConfigLoaded, turnstileSiteKey]);
 
   function handleChange(event) {

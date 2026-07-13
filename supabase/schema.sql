@@ -265,3 +265,53 @@ create unique index if not exists idx_deal_hunter_crm_imports_listing_identity
   where listing_identity is not null and listing_identity <> '';
 create index if not exists idx_deal_hunter_crm_imports_submission_id
   on public.deal_hunter_crm_imports (submission_id);
+
+create table if not exists public.scheduled_job_runs (
+  job_key text primary key,
+  job_name text not null,
+  created_at timestamptz not null,
+  updated_at timestamptz not null,
+  started_at timestamptz not null,
+  completed_at timestamptz,
+  status text not null,
+  triggered_by text,
+  attempt_count integer not null default 1,
+  provider_message_id text,
+  last_error text,
+  metadata jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_scheduled_job_runs_name_updated_at
+  on public.scheduled_job_runs (job_name, updated_at desc);
+
+create table if not exists public.admin_audit_events (
+  id uuid primary key,
+  created_at timestamptz not null,
+  request_id text,
+  actor text not null,
+  role text not null,
+  method text not null,
+  path text not null,
+  status_code integer not null,
+  metadata jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_admin_audit_events_created_at
+  on public.admin_audit_events (created_at desc);
+
+create table if not exists public.secure_document_cleanup_jobs (
+  id uuid primary key,
+  submission_id uuid not null,
+  created_at timestamptz not null,
+  updated_at timestamptz not null,
+  completed_at timestamptz,
+  status text not null,
+  trash_directory text,
+  files jsonb not null default '[]'::jsonb,
+  attempt_count integer not null default 0,
+  last_error text,
+  metadata jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_secure_document_cleanup_jobs_status
+  on public.secure_document_cleanup_jobs (status, updated_at);

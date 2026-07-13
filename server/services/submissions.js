@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
+import path from 'node:path';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { getClientIp } from '../utils/http.js';
@@ -1076,8 +1077,28 @@ export async function updateSubmissionWorkflow(id, fields) {
     return null;
   }
 
+  const expectedUpdatedAt = normalizeField(fields.expected_updated_at, 80);
+
+  if (!expectedUpdatedAt) {
+    return {
+      conflict: true,
+      current: await enrichSubmission(existing, storage),
+      missingExpectedVersion: true,
+    };
+  }
+
+  if (expectedUpdatedAt && existing.updated_at && expectedUpdatedAt !== existing.updated_at) {
+    return {
+      conflict: true,
+      current: await enrichSubmission(existing, storage),
+    };
+  }
+
   const updates = {};
-  const now = new Date().toISOString();
+  const generatedNow = new Date().toISOString();
+  const now = Date.parse(generatedNow) <= Date.parse(existing.updated_at || '')
+    ? new Date(Date.parse(existing.updated_at) + 1).toISOString()
+    : generatedNow;
 
   if (fields.status !== undefined) {
     const nextStatus = normalizeStatus(fields.status, '');
@@ -1174,16 +1195,31 @@ export async function updateSubmissionWorkflow(id, fields) {
   }
 
   updates.updated_at = now;
-  const updated = await storage.updateSubmission(id, updates);
+  const updated = storage.updateSubmissionIfCurrent
+    ? await storage.updateSubmissionIfCurrent(id, expectedUpdatedAt, updates)
+    : await storage.updateSubmission(id, updates);
 
   if (!updated) {
-    return null;
+    const current = await storage.getSubmission(id);
+
+    return current
+      ? { conflict: true, current: await enrichSubmission(current, storage) }
+      : null;
   }
 
   return enrichSubmission(updated, storage);
 }
 
-async function removeSecureDocumentFiles(documents = [], unlinkFile = fs.unlink, storageDir = getConfig().secureDocuments.storageDir) {
+async function stageSecureDocumentFiles(
+  documents = [],
+  {
+    mkdir = fs.mkdir,
+    renameFile = fs.rename,
+    storageDir = getConfig().secureDocuments.storageDir,
+    operationId = randomUUID(),
+    onPrepared,
+  } = {},
+) {
   const paths = Array.from(
     new Set(
       (documents || [])
@@ -1191,39 +1227,205 @@ async function removeSecureDocumentFiles(documents = [], unlinkFile = fs.unlink,
         .filter(Boolean),
     ),
   );
+  const trashDirectory = path.join(storageDir, '.trash', operationId);
+  const stagedFiles = [];
   const failures = [];
 
-  await Promise.all(
-    paths.map(async (filePath) => {
-      const resolvedPath = resolveSecureStoragePath(filePath, storageDir);
+  if (paths.length === 0) {
+    return { failures, stagedFiles, trashDirectory: '' };
+  }
 
-      if (!resolvedPath) {
-        failures.push({
-          filePath,
-          message: 'Secure document file path is outside the configured document vault.',
-        });
-        return;
+  const plannedFiles = [];
+  for (const [index, filePath] of paths.entries()) {
+    const resolvedPath = resolveSecureStoragePath(filePath, storageDir);
+
+    if (!resolvedPath) {
+      failures.push({
+        filePath,
+        message: 'Secure document file path is outside the configured document vault.',
+      });
+      return { failures, stagedFiles, trashDirectory, plannedFiles };
+    }
+
+    const stagedPath = path.join(trashDirectory, `${index}-${path.basename(resolvedPath)}`);
+    plannedFiles.push({ originalPath: resolvedPath, stagedPath });
+  }
+
+  if (onPrepared) {
+    await onPrepared({ plannedFiles, trashDirectory });
+  }
+
+  await mkdir(trashDirectory, { recursive: true });
+
+  for (const file of plannedFiles) {
+    try {
+      await renameFile(file.originalPath, file.stagedPath);
+      stagedFiles.push(file);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        continue;
       }
+      failures.push({
+        filePath: file.originalPath,
+        message: error.message || 'Unable to stage secure document file for deletion.',
+      });
+      break;
+    }
+  }
 
-      try {
-        await unlinkFile(resolvedPath);
-      } catch (error) {
-        if (error.code !== 'ENOENT') {
-          failures.push({
-            filePath,
-            message: error.message || 'Unable to remove secure document file.',
-          });
+  return { failures, stagedFiles, trashDirectory, plannedFiles };
+}
+
+async function restoreStagedDocumentFiles(
+  stagedFiles = [],
+  renameFile = fs.rename,
+  { accessFile = fs.access, storageDir = getConfig().secureDocuments.storageDir } = {},
+) {
+  const failures = [];
+  const trashRoot = path.join(path.resolve(storageDir), '.trash');
+
+  for (const file of [...stagedFiles].reverse()) {
+    const originalPath = resolveSecureStoragePath(file.originalPath, storageDir);
+    const stagedPath = path.resolve(String(file.stagedPath || ''));
+
+    if (!originalPath || (stagedPath !== trashRoot && !stagedPath.startsWith(`${trashRoot}${path.sep}`))) {
+      failures.push({ filePath: file.originalPath || file.stagedPath, message: 'Cleanup path is outside the secure document vault.' });
+      continue;
+    }
+
+    try {
+      await renameFile(stagedPath, originalPath);
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        try {
+          await accessFile(originalPath);
+          continue;
+        } catch {
+          // Neither copy exists, so retain a durable cleanup failure.
         }
       }
-    }),
-  );
+      failures.push({ filePath: originalPath, message: error.message || 'Unable to restore secure document file.' });
+    }
+  }
 
   return failures;
+}
+
+async function purgeStagedDocumentFiles(
+  stagedFiles = [],
+  unlinkFile = fs.unlink,
+  storageDir = getConfig().secureDocuments.storageDir,
+) {
+  const failures = [];
+  const trashRoot = path.join(path.resolve(storageDir), '.trash');
+
+  for (const file of stagedFiles) {
+    const stagedPath = path.resolve(String(file.stagedPath || ''));
+    if (stagedPath !== trashRoot && !stagedPath.startsWith(`${trashRoot}${path.sep}`)) {
+      failures.push({ filePath: file.stagedPath, message: 'Cleanup path is outside the secure document trash directory.' });
+      continue;
+    }
+
+    try {
+      await unlinkFile(stagedPath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        failures.push({ filePath: file.stagedPath, message: error.message || 'Unable to purge staged secure document file.' });
+      }
+    }
+  }
+
+  return failures;
+}
+
+async function removeCleanupDirectory(directory, rmdir = fs.rmdir, storageDir = getConfig().secureDocuments.storageDir) {
+  if (!directory) {
+    return;
+  }
+  const trashRoot = path.join(path.resolve(storageDir), '.trash');
+  const resolvedDirectory = path.resolve(directory);
+  if (!resolvedDirectory.startsWith(`${trashRoot}${path.sep}`)) {
+    throw new Error('Cleanup directory is outside the secure document trash directory.');
+  }
+  try {
+    await rmdir(resolvedDirectory);
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      throw error;
+    }
+  }
+}
+
+export async function reconcileSecureDocumentCleanupJobs(options = {}) {
+  const storage = options.storage || getStorage();
+  if (!storage.listPendingSecureDocumentCleanupJobs || !storage.updateSecureDocumentCleanupJob) {
+    return { reviewed: 0, completed: 0, restored: 0, failed: 0 };
+  }
+  const jobs = await storage.listPendingSecureDocumentCleanupJobs(options.limit || 100);
+  const summary = { reviewed: jobs.length, completed: 0, restored: 0, failed: 0 };
+
+  for (const job of jobs) {
+    const now = new Date().toISOString();
+    try {
+      const submission = await storage.getSubmission(job.submission_id);
+      const failures = submission
+        ? await restoreStagedDocumentFiles(job.files, options.renameFile || fs.rename, {
+            accessFile: options.accessFile || fs.access,
+            storageDir: options.storageDir,
+          })
+        : await purgeStagedDocumentFiles(job.files, options.unlinkFile || fs.unlink, options.storageDir);
+
+      if (failures.length > 0) {
+        summary.failed += 1;
+        await storage.updateSecureDocumentCleanupJob(job.id, {
+          updated_at: now,
+          status: submission ? 'restore-failed' : 'cleanup-failed',
+          attempt_count: Number(job.attempt_count || 0) + 1,
+          last_error: failures.map((failure) => failure.message).join('; ').slice(0, 2000),
+        });
+        continue;
+      }
+
+      await removeCleanupDirectory(job.trash_directory, options.rmdir || fs.rmdir, options.storageDir);
+      const status = submission ? 'restored' : 'completed';
+      await storage.updateSecureDocumentCleanupJob(job.id, {
+        updated_at: now,
+        completed_at: now,
+        status,
+        attempt_count: Number(job.attempt_count || 0) + 1,
+        last_error: null,
+      });
+      summary[status] += 1;
+    } catch (error) {
+      summary.failed += 1;
+      await storage.updateSecureDocumentCleanupJob(job.id, {
+        updated_at: now,
+        status: 'cleanup-failed',
+        attempt_count: Number(job.attempt_count || 0) + 1,
+        last_error: String(error.message || error).slice(0, 2000),
+      }).catch(() => {});
+    }
+  }
+
+  return summary;
+}
+
+export function startSecureDocumentCleanupScheduler({ intervalMs = 60 * 60 * 1000 } = {}) {
+  const timer = setInterval(() => {
+    reconcileSecureDocumentCleanupJobs().catch((error) => {
+      console.error(`[secure-documents:cleanup] reconciliation failed: ${error.message}`);
+    });
+  }, intervalMs);
+  timer.unref?.();
+  return { stop: () => clearInterval(timer) };
 }
 
 export async function deleteDashboardSubmission(id, options = {}) {
   const storage = options.storage || getStorage();
   const unlinkFile = options.unlinkFile || fs.unlink;
+  const renameFile = options.renameFile || fs.rename;
+  const mkdir = options.mkdir || fs.mkdir;
+  const rmdir = options.rmdir || fs.rmdir;
   const submissionId = String(id || '').trim();
 
   if (!submissionId || !storage.deleteSubmission) {
@@ -1239,29 +1441,156 @@ export async function deleteDashboardSubmission(id, options = {}) {
   const documents = storage.listSecureDocumentsForSubmission
     ? await storage.listSecureDocumentsForSubmission(submissionId)
     : [];
-  const cleanupFailures = await removeSecureDocumentFiles(documents, unlinkFile);
+  const cleanupId = randomUUID();
+  let cleanupJob = null;
+  const staged = await stageSecureDocumentFiles(documents, {
+    mkdir,
+    renameFile,
+    operationId: cleanupId,
+    onPrepared: async ({ plannedFiles, trashDirectory }) => {
+      if (plannedFiles.length === 0 || !storage.insertSecureDocumentCleanupJob) {
+        return;
+      }
+      const now = new Date().toISOString();
+      cleanupJob = await storage.insertSecureDocumentCleanupJob({
+        id: cleanupId,
+        submission_id: submissionId,
+        created_at: now,
+        updated_at: now,
+        completed_at: null,
+        status: 'staging',
+        trash_directory: trashDirectory,
+        files: plannedFiles,
+        attempt_count: 0,
+        last_error: null,
+        metadata: {},
+      });
+    },
+  });
 
-  if (cleanupFailures.length > 0) {
+  if (staged.failures.length > 0) {
+    const restoreFailures = await restoreStagedDocumentFiles(staged.stagedFiles, renameFile);
+    if (restoreFailures.length === 0) {
+      await removeCleanupDirectory(staged.trashDirectory, rmdir).catch((error) => {
+        restoreFailures.push({ filePath: staged.trashDirectory, message: error.message });
+      });
+    }
+    if (cleanupJob) {
+      const now = new Date().toISOString();
+      await storage.updateSecureDocumentCleanupJob(cleanupJob.id, {
+        updated_at: now,
+        completed_at: restoreFailures.length === 0 ? now : null,
+        status: restoreFailures.length === 0 ? 'restored' : 'restore-failed',
+        attempt_count: 1,
+        last_error: restoreFailures.map((failure) => failure.message).join('; ') || null,
+      });
+    }
     console.warn(
-      `[crm] blocked deletion for ${submissionId}; secure document cleanup failed for ${cleanupFailures.length} file(s).`,
+      `[crm] blocked deletion for ${submissionId}; secure document staging failed for ${staged.failures.length} file(s).`,
     );
 
     return {
       ok: false,
       status: 500,
-      error: 'Secure document cleanup failed. The CRM record was kept so deletion can be retried.',
-      cleanupFailures,
+      error: 'Secure document cleanup could not be prepared. The CRM record and document files were kept so deletion can be retried.',
+      cleanupFailures: [...staged.failures, ...restoreFailures],
     };
   }
 
-  const deleted = await storage.deleteSubmission(submissionId);
+  let deleted;
+
+  try {
+    deleted = await storage.deleteSubmission(submissionId);
+  } catch {
+    const restoreFailures = await restoreStagedDocumentFiles(staged.stagedFiles, renameFile);
+    if (restoreFailures.length === 0) {
+      await removeCleanupDirectory(staged.trashDirectory, rmdir).catch((error) => {
+        restoreFailures.push({ filePath: staged.trashDirectory, message: error.message });
+      });
+    }
+    if (cleanupJob) {
+      const now = new Date().toISOString();
+      await storage.updateSecureDocumentCleanupJob(cleanupJob.id, {
+        updated_at: now,
+        completed_at: restoreFailures.length === 0 ? now : null,
+        status: restoreFailures.length === 0 ? 'restored' : 'restore-failed',
+        attempt_count: 1,
+        last_error: restoreFailures.map((failure) => failure.message).join('; ') || null,
+      }).catch(() => {});
+    }
+
+    if (restoreFailures.length > 0) {
+      console.error(`[crm] database deletion failed for ${submissionId}; ${restoreFailures.length} staged file(s) could not be restored.`);
+    }
+
+    return {
+      ok: false,
+      status: 500,
+      error: restoreFailures.length === 0
+        ? 'CRM deletion failed. Document files were restored so the deletion can be retried.'
+        : 'CRM deletion failed, and some staged document files could not be restored. Cleanup has been queued for retry.',
+      cleanupFailures: restoreFailures,
+    };
+  }
+
   if (!deleted) {
-    return null;
+    const restoreFailures = await restoreStagedDocumentFiles(staged.stagedFiles, renameFile);
+    if (restoreFailures.length === 0) {
+      await removeCleanupDirectory(staged.trashDirectory, rmdir).catch((error) => {
+        restoreFailures.push({ filePath: staged.trashDirectory, message: error.message });
+      });
+    }
+    if (cleanupJob) {
+      const now = new Date().toISOString();
+      await storage.updateSecureDocumentCleanupJob(cleanupJob.id, {
+        updated_at: now,
+        completed_at: restoreFailures.length === 0 ? now : null,
+        status: restoreFailures.length === 0 ? 'restored' : 'restore-failed',
+        attempt_count: 1,
+        last_error: restoreFailures.map((failure) => failure.message).join('; ') || null,
+      }).catch(() => {});
+    }
+    return restoreFailures.length === 0
+      ? null
+      : { ok: false, status: 500, error: 'CRM record was not deleted, and staged documents could not be fully restored.', cleanupFailures: restoreFailures };
+  }
+
+  if (cleanupJob) {
+    await storage.updateSecureDocumentCleanupJob(cleanupJob.id, {
+      updated_at: new Date().toISOString(),
+      status: 'pending-purge',
+    }).catch(() => {});
+  }
+  const purgeFailures = await purgeStagedDocumentFiles(staged.plannedFiles || staged.stagedFiles, unlinkFile);
+
+  if (purgeFailures.length > 0) {
+    console.warn(`[crm] deleted ${submissionId}; ${purgeFailures.length} staged secure file(s) remain for cleanup.`);
+  }
+
+  if (cleanupJob && purgeFailures.length === 0) {
+    const completedAt = new Date().toISOString();
+    await removeCleanupDirectory(staged.trashDirectory, rmdir).catch(() => {});
+    await storage.updateSecureDocumentCleanupJob(cleanupJob.id, {
+      updated_at: completedAt,
+      completed_at: completedAt,
+      status: 'completed',
+      attempt_count: 1,
+      last_error: null,
+    }).catch(() => {});
+  } else if (cleanupJob) {
+    await storage.updateSecureDocumentCleanupJob(cleanupJob.id, {
+      updated_at: new Date().toISOString(),
+      status: 'cleanup-failed',
+      attempt_count: 1,
+      last_error: purgeFailures.map((failure) => failure.message).join('; ').slice(0, 2000),
+    }).catch(() => {});
   }
 
   return {
     ok: true,
     submission: existing,
+    cleanupPending: purgeFailures.length > 0,
+    cleanupFailures: purgeFailures,
   };
 }
 

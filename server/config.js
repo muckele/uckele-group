@@ -149,29 +149,12 @@ export function getConfig() {
         delaySequenceHours: numberListFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_DELAYS_HOURS, [48, 72, 168]).slice(0, 10),
       },
     },
-    prospectDiscovery: {
-      enabled: booleanFromEnv(process.env.PROSPECT_DISCOVERY_ENABLED, false),
-      schedulerEnabled: booleanFromEnv(process.env.PROSPECT_DISCOVERY_SCHEDULER_ENABLED, false),
-      schedulerIntervalMs: numberFromEnv(process.env.PROSPECT_DISCOVERY_SCHEDULER_INTERVAL_MS, 1000 * 60 * 60 * 24),
-      provider: process.env.PROSPECT_DISCOVERY_PROVIDER || 'google-places',
-      googlePlacesApiKey: process.env.GOOGLE_PLACES_API_KEY || '',
-      queries: (process.env.PROSPECT_DISCOVERY_QUERIES || '')
-        .split('|')
-        .map((item) => item.trim())
-        .filter(Boolean)
-        .slice(0, 20),
-      maxResultsPerQuery: Math.max(1, Math.min(numberFromEnv(process.env.PROSPECT_DISCOVERY_MAX_RESULTS_PER_QUERY, 10), 20)),
-      maxQueriesPerRun: Math.max(1, Math.min(numberFromEnv(process.env.PROSPECT_DISCOVERY_MAX_QUERIES_PER_RUN, 5), 20)),
-      autoImport: booleanFromEnv(process.env.PROSPECT_DISCOVERY_AUTO_IMPORT, true),
-      minimumReviewCount: Math.max(0, numberFromEnv(process.env.PROSPECT_DISCOVERY_MIN_REVIEW_COUNT, 0)),
-      websiteCheckEnabled: booleanFromEnv(process.env.PROSPECT_DISCOVERY_WEBSITE_CHECK_ENABLED, true),
-      websiteCheckTimeoutMs: Math.max(1500, Math.min(numberFromEnv(process.env.PROSPECT_DISCOVERY_WEBSITE_CHECK_TIMEOUT_MS, 8000), 20000)),
-      websiteCheckMaxBytes: Math.max(64 * 1024, Math.min(numberFromEnv(process.env.PROSPECT_DISCOVERY_WEBSITE_CHECK_MAX_BYTES, 750000), 2 * 1024 * 1024)),
-    },
     secureDocuments: {
       tokenSecret: process.env.SECURE_DOCUMENTS_TOKEN_SECRET || sessionSecret,
       requestTtlMs: numberFromEnv(process.env.SECURE_DOCUMENTS_REQUEST_TTL_MS, 1000 * 60 * 60 * 24 * 14),
       maxUploadBytes: numberFromEnv(process.env.SECURE_DOCUMENTS_MAX_UPLOAD_BYTES, 8 * 1024 * 1024),
+      maxTotalUploadBytes: numberFromEnv(process.env.SECURE_DOCUMENTS_MAX_TOTAL_UPLOAD_BYTES, 24 * 1024 * 1024),
+      maxConcurrentUploads: Math.max(1, numberFromEnv(process.env.SECURE_DOCUMENTS_MAX_CONCURRENT_UPLOADS, 2)),
       storageDir: process.env.SECURE_DOCUMENTS_STORAGE_DIR || path.join(rootDir, 'data', 'secure-documents'),
     },
     protection: {
@@ -185,4 +168,142 @@ export function getConfig() {
   };
 
   return cachedConfig;
+}
+
+export function validateConfig(config = getConfig()) {
+  const errors = [];
+  const warnings = [];
+  const requireValue = (value, label) => {
+    if (!String(value || '').trim()) {
+      errors.push(`${label} is required.`);
+    }
+  };
+  const requirePositiveNumber = (value, label, { integer = false } = {}) => {
+    if (value === undefined) {
+      return;
+    }
+    if (!Number.isFinite(Number(value)) || Number(value) <= 0 || (integer && !Number.isInteger(Number(value)))) {
+      errors.push(`${label} must be a positive${integer ? ' integer' : ''}.`);
+    }
+  };
+
+  if (!['sqlite', 'supabase'].includes(config.storage.provider)) {
+    errors.push('STORAGE_PROVIDER must be sqlite or supabase.');
+  }
+
+  if (!['console', 'resend', 'emailjs', 'formspree'].includes(config.delivery.provider)) {
+    errors.push('DELIVERY_PROVIDER must be console, resend, emailjs, or formspree.');
+  }
+
+  if (!['password', 'magic-link', 'hybrid'].includes(config.admin.authMode)) {
+    errors.push('ADMIN_AUTH_MODE must be password, magic-link, or hybrid.');
+  }
+
+  if (Boolean(config.turnstile.siteKey) !== Boolean(config.turnstile.secretKey)) {
+    errors.push('TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY must be configured together.');
+  }
+
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: config.dealHunter.dailyEmail.timezone }).format();
+  } catch {
+    errors.push('DEAL_HUNTER_DAILY_EMAIL_TIMEZONE is not a valid IANA timezone.');
+  }
+
+  if (config.storage.provider === 'supabase') {
+    requireValue(config.storage.supabaseUrl, 'SUPABASE_URL');
+    requireValue(config.storage.supabaseServiceRoleKey, 'SUPABASE_SERVICE_ROLE_KEY');
+  }
+
+  if (config.delivery.provider === 'resend') {
+    requireValue(config.delivery.resendApiKey, 'RESEND_API_KEY');
+    requireValue(config.delivery.resendFromEmail, 'RESEND_FROM_EMAIL');
+    requireValue(config.delivery.fallbackRecipient, 'LEAD_NOTIFICATION_EMAIL');
+  }
+
+  if (config.delivery.provider === 'emailjs') {
+    requireValue(config.delivery.emailjsServiceId, 'EMAILJS_SERVICE_ID');
+    requireValue(config.delivery.emailjsTemplateId, 'EMAILJS_TEMPLATE_ID');
+    requireValue(config.delivery.emailjsPublicKey, 'EMAILJS_PUBLIC_KEY');
+    requireValue(config.delivery.fallbackRecipient, 'LEAD_NOTIFICATION_EMAIL');
+  }
+
+  if (config.delivery.provider === 'formspree') {
+    requireValue(config.delivery.formspreeEndpoint, 'FORMSPREE_ENDPOINT');
+  }
+
+  const scheduledTime = String(config.dealHunter.dailyEmail.time || '10:15');
+  const scheduledTimeMatch = scheduledTime.match(/^(\d{1,2}):(\d{2})$/);
+  if (!scheduledTimeMatch || Number(scheduledTimeMatch[1]) > 23 || Number(scheduledTimeMatch[2]) > 59) {
+    errors.push('DEAL_HUNTER_DAILY_EMAIL_TIME must use a valid 24-hour HH:MM value.');
+  }
+
+  requirePositiveNumber(config.server?.port, 'PORT', { integer: true });
+  requirePositiveNumber(config.server?.outboundRequestTimeoutMs, 'OUTBOUND_HTTP_TIMEOUT_MS');
+  requirePositiveNumber(config.admin.magicLinkTtlMs, 'ADMIN_MAGIC_LINK_TTL_MS');
+  requirePositiveNumber(config.admin.sessionMaxAgeMs, 'ADMIN_SESSION_MAX_AGE_MS');
+  requirePositiveNumber(config.secureDocuments.requestTtlMs, 'SECURE_DOCUMENTS_REQUEST_TTL_MS');
+  requirePositiveNumber(config.secureDocuments.maxUploadBytes, 'SECURE_DOCUMENTS_MAX_UPLOAD_BYTES', { integer: true });
+  requirePositiveNumber(config.secureDocuments.maxTotalUploadBytes, 'SECURE_DOCUMENTS_MAX_TOTAL_UPLOAD_BYTES', { integer: true });
+  requirePositiveNumber(config.secureDocuments.maxConcurrentUploads, 'SECURE_DOCUMENTS_MAX_CONCURRENT_UPLOADS', { integer: true });
+  requirePositiveNumber(config.dealHunter.dailyEmail.checkIntervalMs, 'DEAL_HUNTER_DAILY_EMAIL_CHECK_INTERVAL_MS');
+  requirePositiveNumber(config.dealHunter.dailyEmail.retryIntervalMs, 'DEAL_HUNTER_DAILY_EMAIL_RETRY_INTERVAL_MS');
+  requirePositiveNumber(config.protection?.rateLimitWindowMs, 'RATE_LIMIT_WINDOW_MS');
+  requirePositiveNumber(config.protection?.rateLimitMax, 'RATE_LIMIT_MAX', { integer: true });
+
+  if (config.isProduction) {
+    requireValue(config.admin.email, 'ADMIN_EMAIL');
+
+    if (String(config.admin.sessionSecret || '').length < 32) {
+      errors.push('ADMIN_SESSION_SECRET must contain at least 32 characters in production.');
+    }
+
+    if (['magic-link', 'hybrid'].includes(config.admin.authMode) && String(config.admin.magicLinkSecret || '').length < 32) {
+      errors.push('ADMIN_MAGIC_LINK_SECRET must contain at least 32 characters when magic-link authentication is enabled.');
+    }
+
+    if (String(config.secureDocuments.tokenSecret || '').length < 32) {
+      errors.push('SECURE_DOCUMENTS_TOKEN_SECRET must contain at least 32 characters in production.');
+    }
+
+    if (config.secureDocuments.tokenSecret === config.admin.sessionSecret) {
+      errors.push('SECURE_DOCUMENTS_TOKEN_SECRET must be different from ADMIN_SESSION_SECRET in production.');
+    }
+
+    if (config.delivery.provider === 'console') {
+      errors.push('DELIVERY_PROVIDER=console is not allowed in production.');
+    }
+
+    if (config.delivery.provider === 'formspree') {
+      errors.push('DELIVERY_PROVIDER=formspree is inbound-only and cannot support production admin or Deal Hunter email. Use resend or emailjs.');
+    }
+
+    const magicLinkUsable = ['magic-link', 'hybrid'].includes(config.admin.authMode)
+      && Boolean(config.admin.email && config.admin.magicLinkSecret)
+      && !['console', 'formspree'].includes(config.delivery.provider);
+    const passwordUsable = ['password', 'hybrid'].includes(config.admin.authMode)
+      && Boolean(config.admin.allowPasswordAuth && config.admin.username && config.admin.password);
+    if (!magicLinkUsable && !passwordUsable) {
+      errors.push('Production configuration must provide at least one usable admin authentication path.');
+    }
+
+    if (config.dealHunter.cimFollowUp.enabled && !config.delivery.emailWebhookSecret) {
+      errors.push('RESEND_WEBHOOK_SECRET or EMAIL_WEBHOOK_SECRET is required when CIM follow-ups are enabled.');
+    }
+  } else if (config.admin.password === 'change-me-now') {
+    warnings.push('The local admin account is using the documented development password.');
+  }
+
+  return { ok: errors.length === 0, errors, warnings };
+}
+
+export function assertValidConfig(config = getConfig()) {
+  const validation = validateConfig(config);
+
+  if (!validation.ok) {
+    const error = new Error(`Invalid application configuration:\n- ${validation.errors.join('\n- ')}`);
+    error.name = 'ConfigurationError';
+    throw error;
+  }
+
+  return validation;
 }

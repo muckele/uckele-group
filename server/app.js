@@ -1,7 +1,9 @@
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import express from 'express';
 import { fileURLToPath } from 'node:url';
 import { getConfig } from './config.js';
+import { getStorage } from './storage/index.js';
 import {
   getAcquisitionCommandCenter,
   getSourceHealth,
@@ -26,13 +28,14 @@ import {
   uploadSecureDocuments,
 } from './services/documentVault.js';
 import { recordEmailEventsFromWebhook } from './services/emailEvents.js';
+import { checkReadiness } from './services/readiness.js';
 import {
   reviewDailyDeals,
   runDealHunterCimFollowUps,
-  sendDailyDealHunterReview,
   sendDealHunterCimRequest,
   sendDealHunterReadyCimRequests,
 } from './services/dealHunter.js';
+import { getDailyDealHunterJobStatus, runClaimedDailyDealHunterEmail } from './services/dealHunterScheduler.js';
 import {
   createManualSubmission,
   enforceContactBodyRateLimit,
@@ -77,7 +80,82 @@ function jsonParserOptions(limit) {
   };
 }
 
-export function handleAppError(error, _request, response, next) {
+function setProtectedResponseHeaders(_request, response, next) {
+  response.setHeader('Cache-Control', 'no-store, private');
+  response.setHeader('Pragma', 'no-cache');
+  next();
+}
+
+function protectMutationOrigin(config) {
+  return (request, response, next) => {
+    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) {
+      next();
+      return;
+    }
+
+    const origin = String(request.headers.origin || '').replace(/\/+$/, '');
+    const expectedOrigin = String(config.server.origin || '').replace(/\/+$/, '');
+    const fetchSite = String(request.headers['sec-fetch-site'] || '').toLowerCase();
+
+    if ((origin && expectedOrigin && origin !== expectedOrigin) || fetchSite === 'cross-site') {
+      response.status(403).json({ success: false, error: 'Cross-site request rejected.' });
+      return;
+    }
+
+    next();
+  };
+}
+
+async function auditAdminMutation(request, response, next) {
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method)) {
+    next();
+    return;
+  }
+
+  const storage = getStorage();
+  const initialSession = getAdminSession(request);
+  const eventBase = {
+    request_id: request.id || '',
+    method: request.method,
+    path: String(request.originalUrl || request.path || '').slice(0, 500),
+  };
+
+  try {
+    await storage.insertAdminAuditEvent({
+      id: randomUUID(),
+      created_at: new Date().toISOString(),
+      ...eventBase,
+      actor: initialSession?.username || 'anonymous',
+      role: initialSession?.role || 'anonymous',
+      status_code: 0,
+      metadata: { state: 'started' },
+    });
+  } catch (error) {
+    console.error(`[request:${request.id || 'unknown'}] admin audit prewrite failed: ${error.message}`);
+    response.status(503).json({ success: false, error: 'Administrative audit storage is unavailable. No change was made.' });
+    return;
+  }
+
+  response.once('finish', () => {
+    const session = request.adminSession || initialSession;
+
+    Promise.resolve(storage.insertAdminAuditEvent({
+      id: randomUUID(),
+      created_at: new Date().toISOString(),
+      ...eventBase,
+      actor: session?.username || 'anonymous',
+      role: session?.role || 'anonymous',
+      status_code: response.statusCode,
+      metadata: { state: 'completed' },
+    })).catch((error) => {
+      console.warn(`[request:${request.id || 'unknown'}] admin audit completion write failed: ${error.message}`);
+    });
+  });
+
+  next();
+}
+
+export function handleAppError(error, request, response, next) {
   if (response.headersSent) {
     next(error);
     return;
@@ -92,9 +170,9 @@ export function handleAppError(error, _request, response, next) {
       : 'Something went wrong while processing the request.';
 
   if (status >= 500) {
-    console.error(error);
+    console.error(`[request:${request.id || 'unknown'}]`, error);
   } else {
-    console.warn(error?.message || error);
+    console.warn(`[request:${request.id || 'unknown'}] ${error?.message || error}`);
   }
 
   response.status(status).json({
@@ -135,8 +213,21 @@ function publicSecureUploadRequest(requestRecord) {
 export function createApp() {
   const config = getConfig();
   const app = express();
+  let activeSecureUploads = 0;
 
   app.disable('x-powered-by');
+  app.use((request, response, next) => {
+    const providedId = String(request.headers['x-request-id'] || '').trim();
+    request.id = /^[A-Za-z0-9._-]{1,100}$/.test(providedId) ? providedId : randomUUID();
+    response.setHeader('X-Request-ID', request.id);
+    next();
+  });
+  app.use('/api/admin', setProtectedResponseHeaders);
+  app.use('/api/admin', protectMutationOrigin(config));
+  app.use('/api/admin', (request, response, next) => {
+    auditAdminMutation(request, response, next).catch(next);
+  });
+  app.use('/api/secure-documents', setProtectedResponseHeaders);
   app.use('/api/secure-documents/upload', async (request, response, next) => {
     if (request.method !== 'POST') {
       next();
@@ -155,6 +246,62 @@ export function createApp() {
     } catch (error) {
       next(error);
     }
+  });
+  app.use('/api/secure-documents/upload', async (request, response, next) => {
+    if (request.method !== 'POST') {
+      next();
+      return;
+    }
+
+    try {
+      const token = String(request.headers['x-secure-upload-token'] || '').trim();
+      const context = await getSecureUploadContext(token, { recoverStale: true });
+
+      if (!context.ok) {
+        response.status(400).json({ success: false, error: context.error });
+        return;
+      }
+
+      if (context.request.status !== 'awaiting-documents') {
+        response.status(409).json({
+          success: false,
+          error: context.request.status === 'uploading'
+            ? 'Documents are already being uploaded for this request. Please wait a few minutes before trying again.'
+            : 'Documents have already been received for this request. Please ask for a new secure upload link before sending more files.',
+        });
+        return;
+      }
+
+      request.secureUploadToken = token;
+      request.secureUploadContext = context;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.use('/api/secure-documents/upload', (request, response, next) => {
+    if (request.method !== 'POST') {
+      next();
+      return;
+    }
+
+    if (activeSecureUploads >= config.secureDocuments.maxConcurrentUploads) {
+      response.setHeader('Retry-After', '30');
+      response.status(503).json({ success: false, error: 'Secure upload capacity is temporarily full. Please try again shortly.' });
+      return;
+    }
+
+    activeSecureUploads += 1;
+    let released = false;
+    const release = () => {
+      if (!released) {
+        released = true;
+        activeSecureUploads = Math.max(0, activeSecureUploads - 1);
+      }
+    };
+    response.once('finish', release);
+    response.once('close', release);
+    next();
   });
   app.use('/api/secure-documents/upload', express.json(jsonParserOptions(getSecureUploadJsonLimitBytes(config))));
   app.use('/api/contact', async (request, response, next) => {
@@ -177,8 +324,9 @@ export function createApp() {
     }
   });
   app.use('/api/contact', express.json(jsonParserOptions(config.protection.contactJsonLimit)));
-  app.use(express.json(jsonParserOptions('25mb')));
-  app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+  app.use('/api/webhooks/resend', express.json(jsonParserOptions('1mb')));
+  app.use(express.json(jsonParserOptions('512kb')));
+  app.use(express.urlencoded({ extended: true, limit: '64kb' }));
 
   app.use((request, response, next) => {
     response.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
@@ -214,6 +362,14 @@ export function createApp() {
       ok: true,
     });
   });
+
+  app.get(
+    '/api/ready',
+    asyncRoute(async (_request, response) => {
+      const readiness = await checkReadiness();
+      response.status(readiness.ok ? 200 : 503).json(readiness);
+    }),
+  );
 
   app.get('/api/public-config', (_request, response) => {
     response.json({
@@ -269,6 +425,7 @@ export function createApp() {
         return;
       }
 
+      request.adminSession = result.session;
       response.setHeader('Set-Cookie', result.cookie);
       response.json({
         success: true,
@@ -304,6 +461,7 @@ export function createApp() {
       return;
     }
 
+    request.adminSession = result.session;
     response.setHeader('Set-Cookie', result.cookie);
     response.json({
       success: true,
@@ -312,7 +470,8 @@ export function createApp() {
     });
   });
 
-  app.delete('/api/admin/session', (_request, response) => {
+  app.delete('/api/admin/session', (request, response) => {
+    getAdminSession(request);
     response.setHeader('Set-Cookie', logoutAdmin());
     response.json({ success: true });
   });
@@ -481,6 +640,7 @@ export function createApp() {
       }
 
       const review = await reviewDailyDeals();
+      review.dailyEmailJob = await getDailyDealHunterJobStatus();
       await getSourceHealth(undefined, {
         persistSnapshot: session.role === 'admin',
         refresh: true,
@@ -496,14 +656,19 @@ export function createApp() {
   app.post(
     '/api/admin/deal-hunter/send',
     asyncRoute(async (request, response) => {
-      if (!requireAdmin(request)) {
+      const session = requireAdmin(request);
+
+      if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
 
-      const result = await sendDailyDealHunterReview();
-      response.status(result.emailResult.status === 'failed' ? 502 : 200).json({
-        success: result.emailResult.status !== 'failed',
+      const result = await runClaimedDailyDealHunterEmail({ triggeredBy: session.username || 'admin' });
+      if (result.review) {
+        result.review.dailyEmailJob = result.jobRun || await getDailyDealHunterJobStatus();
+      }
+      response.status(result.emailResult.status === 'failed' ? 502 : result.inProgress ? 409 : 200).json({
+        success: !['failed', 'in-progress'].includes(result.emailResult.status),
         ...result,
       });
     }),
@@ -582,9 +747,9 @@ export function createApp() {
         return;
       }
 
-      const result = await sendDailyDealHunterReview();
-      response.status(result.emailResult.status === 'failed' ? 502 : 200).json({
-        success: result.emailResult.status !== 'failed',
+      const result = await runClaimedDailyDealHunterEmail({ triggeredBy: 'external-cron' });
+      response.status(result.emailResult.status === 'failed' ? 502 : result.inProgress ? 409 : 200).json({
+        success: !['failed', 'in-progress'].includes(result.emailResult.status),
         ...result,
       });
     }),
@@ -602,6 +767,15 @@ export function createApp() {
 
       if (!updated) {
         response.status(400).json({ success: false, error: 'Invalid submission update payload.' });
+        return;
+      }
+
+      if (updated.conflict) {
+        response.status(409).json({
+          success: false,
+          error: 'This CRM record changed after you opened it. Reload the latest version before saving again.',
+          submission: updated.current,
+        });
         return;
       }
 
@@ -638,6 +812,8 @@ export function createApp() {
       response.json({
         success: true,
         submission: deleteResult.submission || deleteResult,
+        cleanupPending: Boolean(deleteResult.cleanupPending),
+        cleanupFailures: deleteResult.cleanupFailures || [],
       });
     }),
   );
@@ -690,6 +866,7 @@ export function createApp() {
       }
 
       const downloadName = result.document.original_name || result.document.file_name || 'secure-document';
+      response.setHeader('Cache-Control', 'no-store, private');
       response.setHeader('Content-Type', result.document.mime_type || 'application/octet-stream');
       response.setHeader('Content-Length', String(result.sizeBytes || 0));
       response.download(result.filePath, downloadName, (error) => {
@@ -727,7 +904,7 @@ export function createApp() {
     '/api/secure-documents/upload',
     asyncRoute(async (request, response) => {
       const result = await uploadSecureDocuments({
-        token: request.body.token,
+        token: request.secureUploadToken || request.body.token,
         ndaAccepted: Boolean(request.body.ndaAccepted),
         note: String(request.body.note || ''),
         documents: Array.isArray(request.body.documents) ? request.body.documents : [],

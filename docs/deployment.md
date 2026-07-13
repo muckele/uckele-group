@@ -117,23 +117,24 @@ Then update DNS:
 - `/secure-documents` is token-protected and should remain unindexed.
 - Turnstile should be enabled in production.
 - Configure Resend webhooks to post email events to `/api/webhooks/resend`; use the same signing secret in `RESEND_WEBHOOK_SECRET`.
+- Apply every committed Supabase migration before deploying code when `STORAGE_PROVIDER=supabase` is enabled.
+- Keep the secure document `.trash` directory on the persistent volume; startup and hourly cleanup reconciliation depend on it.
 
 ## Before Go-Live
 
 - Confirm the contact form is delivering to `mathew@uckelegroup.com`
 - Confirm `/admin` can run Deal Hunter scoring and send the daily email
 - Confirm `/admin` can send a 75+ Deal Hunter CIM request and run the CIM follow-up check
-- Confirm `/admin` can run Prospect Discovery manually with a small Google Places query
-- Confirm discovered prospects are saved in `prospect_discoveries` with `lead_tier`, `business_quality_score`, `presence_gap_score`, and imported CRM records link back to the discovery source
-- Confirm DNP prospects are saved as `not-prioritized` instead of being imported into the active CRM follow-up queue
 - Confirm the in-app scheduler logs `deal-hunter:scheduler` startup and sends after the configured Pacific time
-- Confirm the in-app scheduler logs `prospect-discovery:scheduler` startup only after `PROSPECT_DISCOVERY_SCHEDULER_ENABLED=true`
 - If using an external scheduler, confirm it posts to `/api/deal-hunter/daily-email` with `Authorization: Bearer DEAL_HUNTER_CRON_SECRET`
 - Confirm the first successful daily email creates Deal Hunter history rows so later emails can separate newly seen matches from already reviewed listings
 - Confirm magic-link sign-in emails are being delivered
 - If SMB Deal Hunter viewer access is needed, configure `ADMIN_VIEWER_EMAILS` or `ADMIN_VIEWER_USERNAME` / `ADMIN_VIEWER_PASSWORD` and verify a viewer cannot save, export, send emails, or run imports
 - Confirm Resend webhook events create email engagement records in the admin CRM
 - Confirm Resend inbound `email.received` webhook events stop CIM follow-ups before enabling `DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED=true`
-- Verify `/api/health` returns `200` on the Fly URL
+- Verify `/api/health` returns `200` for process liveness and `/api/ready` returns `200` for storage and document-vault readiness on the Fly URL
 - Confirm uploaded secure documents are written under the mounted volume
+- Delete a staging CRM record with a secure document and confirm its `secure_document_cleanup_jobs` row reaches `completed`
+- Confirm an authenticated admin mutation creates `started` and `completed` rows in `admin_audit_events`
+- Confirm a stale CRM tab receives `409` and keeps its unsaved draft until the user reloads
 - Confirm `robots.txt` and `sitemap.xml` are live on `https://www.uckelegroup.com`

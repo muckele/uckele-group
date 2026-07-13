@@ -1,15 +1,44 @@
 import 'dotenv/config';
 import { app } from './app.js';
-import { getConfig } from './config.js';
+import { assertValidConfig, getConfig } from './config.js';
 import { startDealHunterCimFollowUpScheduler, startDealHunterDailyEmailScheduler } from './services/dealHunterScheduler.js';
-import { startProspectDiscoveryScheduler } from './services/prospectDiscoveryScheduler.js';
+import { reconcileSecureDocumentCleanupJobs, startSecureDocumentCleanupScheduler } from './services/submissions.js';
 
 const config = getConfig();
 const host = process.env.HOST || '0.0.0.0';
+let schedulers = [];
 
-app.listen(config.server.port, host, () => {
+assertValidConfig(config);
+const cleanupSummary = await reconcileSecureDocumentCleanupJobs();
+if (cleanupSummary.reviewed > 0) {
+  console.log(`[secure-documents:cleanup] startup reconciliation reviewed=${cleanupSummary.reviewed} completed=${cleanupSummary.completed} restored=${cleanupSummary.restored} failed=${cleanupSummary.failed}`);
+}
+
+const server = app.listen(config.server.port, host, () => {
   console.log(`Uckele Group backend listening on ${host}:${config.server.port}`);
-  startDealHunterDailyEmailScheduler();
-  startDealHunterCimFollowUpScheduler();
-  startProspectDiscoveryScheduler();
+  schedulers = [
+    startDealHunterDailyEmailScheduler(),
+    startDealHunterCimFollowUpScheduler(),
+    startSecureDocumentCleanupScheduler(),
+  ];
 });
+
+function shutdown(signal) {
+  console.log(`[server] ${signal} received; stopping schedulers and HTTP server`);
+  schedulers.forEach((scheduler) => scheduler.stop());
+  server.close((error) => {
+    if (error) {
+      console.error(`[server] shutdown failed: ${error.message}`);
+      process.exitCode = 1;
+    }
+  });
+
+  const forceExitTimer = setTimeout(() => {
+    console.error('[server] graceful shutdown timed out');
+    process.exit(1);
+  }, 10_000);
+  forceExitTimer.unref();
+}
+
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));

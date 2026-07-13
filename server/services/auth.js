@@ -141,6 +141,7 @@ export function getAdminSession(request) {
     return null;
   }
 
+  request.adminSession = session;
   return session;
 }
 

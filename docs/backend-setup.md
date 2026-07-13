@@ -15,7 +15,6 @@ The site now includes:
 - Email engagement event tracking and follow-up triage via `/api/webhooks/resend`
 - Acquisition Command Center for 75+ deals, active CIM conversations, pass reasons, source health, and diligence readiness
 - Spam protection with honeypot, time-to-submit checks, rate limiting, message heuristics, and optional Cloudflare Turnstile
-- Serverless support through [api/[...path].js](/Users/Matt/Documents/Uckele Group/api/[...path].js)
 
 ## Local Development
 
@@ -77,9 +76,13 @@ Read-only viewer access can be enabled for the SMB Deal Hunter team without gran
 - `ADMIN_VIEWER_EMAILS=person1@example.com,person2@example.com` allows magic-link viewer sign-in.
 - `ADMIN_VIEWER_USERNAME` and `ADMIN_VIEWER_PASSWORD` allow password viewer sign-in when password auth is enabled.
 
-Viewer sessions can load the protected CRM, Acquisition Command Center, Deal Hunter source review, and prospect discovery dashboard. They cannot create or edit CRM records, export CSVs, send daily emails, send CIM requests, run CIM follow-ups, run prospect discovery imports, create secure upload links, or update command-center feedback.
+Viewer sessions can load the protected CRM, Acquisition Command Center, and Deal Hunter source review. They cannot create or edit CRM records, export CSVs, send daily emails, send CIM requests, run CIM follow-ups, create secure upload links, or update command-center feedback.
 
 The production Fly machine runs the in-app scheduler once daily at the configured local time. The scheduler records successful Daily Deal Hunter sends in `email_events` and also writes a local send marker under the configured data directory, so a server restart does not resend the same day's email.
+
+Phase 15 also records an atomic daily job claim in `scheduled_job_runs`. Admin, in-process scheduler, and external cron triggers share the same date-keyed claim, preventing overlapping triggers from sending duplicate daily emails. Successful provider delivery uses a deterministic idempotency key, local delivery evidence is written before completion bookkeeping, and stale in-progress claims remain retryable.
+
+Apply all committed Supabase migrations before deploying this version when `STORAGE_PROVIDER=supabase` is used. Phase 15 adds `scheduled_job_runs`, append-only `admin_audit_events`, and `secure_document_cleanup_jobs`.
 
 Optional external scheduler endpoint:
 
@@ -111,36 +114,6 @@ The recommended cadence is three professional touches: first follow-up after 48 
 The protected admin CRM includes a Phase 2 diligence panel on each record. It tracks diligence stage, internal decision, document checklist progress, financing structure, broker or seller questions, and a go/no-go memo.
 
 This data is stored under `contact_submissions.metadata.diligence`, so it works with the existing SQLite and Supabase storage paths without an additional schema migration. The admin update endpoint only accepts a whitelisted diligence payload and merges it into the existing metadata object, preserving Deal Hunter source metadata and import history.
-
-## Prospect Discovery And Import
-
-The private admin CRM also includes a Prospect Discovery panel for finding local businesses through Google Places Text Search, saving each result, scoring it, tiering it, and optionally importing it as a CRM record.
-
-Configure:
-
-- `PROSPECT_DISCOVERY_ENABLED=true`
-- `PROSPECT_DISCOVERY_PROVIDER=google-places`
-- `GOOGLE_PLACES_API_KEY`
-- `PROSPECT_DISCOVERY_QUERIES`, separated with `|`, for example `plumbers near New Rochelle NY|HVAC contractors near White Plains NY`
-- `PROSPECT_DISCOVERY_AUTO_IMPORT=true` if discovered businesses should become CRM records automatically
-- `PROSPECT_DISCOVERY_WEBSITE_CHECK_ENABLED=true` to run a lightweight homepage check for obvious conversion gaps
-- `PROSPECT_DISCOVERY_WEBSITE_CHECK_TIMEOUT_MS=8000`
-- `PROSPECT_DISCOVERY_WEBSITE_CHECK_MAX_BYTES=750000` to cap how much homepage HTML is inspected per business
-- `PROSPECT_DISCOVERY_SCHEDULER_ENABLED=true` only after the manual admin run produces useful results
-
-Lead tiers:
-
-- `Tier A`: established local business signals with no dedicated website, a social/listing-only web presence, or a broken/unreachable website.
-- `Tier B`: established business with a website that shows obvious conversion gaps such as missing HTTPS, thin SEO metadata, no contact form, no CTA, slow response, or an unusually large page.
-- `Tier C`: established business with a real web presence that is better suited for ongoing SEO, reviews, tracking, website updates, and automation.
-- `DNP`: do not prioritize. The result is saved for audit history but is not auto-imported into the CRM follow-up queue.
-
-Admin endpoints:
-
-- `GET /api/admin/prospect-discovery`
-- `POST /api/admin/prospect-discovery/run`
-
-The scheduler runs the configured queries on a long-running Node deployment. Keep it disabled on serverless deployments unless an external cron or background worker calls the discovery endpoint intentionally.
 
 ## Delivery Provider Options
 
@@ -183,7 +156,7 @@ Use your Formspree endpoint in the format:
 https://formspree.io/f/your-form-id
 ```
 
-Formspree works for inbound lead routing, but it is not used for outbound admin magic-link emails or secure upload invite emails. For those, use Resend or keep password fallback enabled.
+Formspree works only for inbound lead routing. Production startup rejects it as the application-wide delivery provider because it cannot deliver admin magic links, Deal Hunter email, or secure upload invitations. Use Resend or EmailJS for the production application.
 
 ### EmailJS
 
@@ -228,13 +201,13 @@ The database is created automatically under `./data`.
 
 ### Supabase
 
-Recommended for serverless deployments:
+Available as an alternative managed database adapter:
 
 1. Set:
    - `STORAGE_PROVIDER=supabase`
    - `SUPABASE_URL`
    - `SUPABASE_SERVICE_ROLE_KEY`
-2. Run the SQL in [schema.sql](/Users/Matt/Documents/Uckele Group/supabase/schema.sql)
+2. Run the SQL in [schema.sql](/Users/Matt/Documents/uckele-group/supabase/schema.sql), or apply every committed file under `supabase/migrations` in timestamp order.
 
 ## Dashboard
 
@@ -299,20 +272,23 @@ Optional config:
 
 - `SECURE_DOCUMENTS_REQUEST_TTL_MS`
 - `SECURE_DOCUMENTS_MAX_UPLOAD_BYTES`
+- `SECURE_DOCUMENTS_MAX_TOTAL_UPLOAD_BYTES`
+- `SECURE_DOCUMENTS_MAX_CONCURRENT_UPLOADS`
 - `SECURE_DOCUMENTS_STORAGE_DIR`
 
-Uploads are currently stored on the local filesystem under the configured secure documents directory. That is a good fit for local development or a single Node deployment. For serverless production, you should plan to swap file storage to object storage.
+Uploads are stored on the local filesystem under the configured secure documents directory and require a persistent mounted volume.
 
-## Production Paths
+CRM deletion first records a durable cleanup job, then stages document files under `.trash`. Startup and hourly reconciliation restores staged files if the CRM record still exists or purges them if deletion committed. Failed purges remain visible through `secure_document_cleanup_jobs` and are retried instead of being silently abandoned.
 
-You now have two deployment paths:
+Admin mutations use append-only audit events. The API writes a `started` event before allowing a mutation and fails closed with `503` if that durable prewrite is unavailable; a second event records the final HTTP status and authenticated actor.
 
-1. Node server:
-   - `npm run build`
-   - `npm start`
+Production startup validates provider credentials, supported admin authentication modes, at least one usable admin sign-in path, secret separation, timezones and schedule times, and positive upload/rate-limit/TTL settings.
 
-2. Serverless:
-   - deploy the Vite frontend plus [api/[...path].js](/Users/Matt/Documents/Uckele Group/api/[...path].js)
-   - use `STORAGE_PROVIDER=supabase`
-   - configure the same environment variables in your platform
-   - note that the current secure document implementation writes files to local disk, so for serverless production you should replace that storage path with object storage before launch
+## Production Runtime
+
+The supported production path is the long-running Node server deployed through the committed Fly configuration:
+
+- `npm run build`
+- `npm start`
+- a persistent volume for SQLite and secure document files
+- one app machine while SQLite and in-process schedulers are enabled

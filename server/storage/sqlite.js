@@ -469,6 +469,47 @@ export function createSqliteStorage(config) {
 	      metadata TEXT NOT NULL DEFAULT '{}'
 	    );
 
+    CREATE TABLE IF NOT EXISTS scheduled_job_runs (
+      job_key TEXT PRIMARY KEY,
+      job_name TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      status TEXT NOT NULL,
+      triggered_by TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 1,
+      provider_message_id TEXT,
+      last_error TEXT,
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_audit_events (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      request_id TEXT,
+      actor TEXT NOT NULL,
+      role TEXT NOT NULL,
+      method TEXT NOT NULL,
+      path TEXT NOT NULL,
+      status_code INTEGER NOT NULL,
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS secure_document_cleanup_jobs (
+      id TEXT PRIMARY KEY,
+      submission_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT,
+      status TEXT NOT NULL,
+      trash_directory TEXT,
+      files TEXT NOT NULL DEFAULT '[]',
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_created_at ON contact_submissions(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_status ON contact_submissions(status);
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_email ON contact_submissions(email);
@@ -492,6 +533,9 @@ export function createSqliteStorage(config) {
 	    CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_deal_key ON deal_hunter_crm_imports(deal_key);
 	    CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_listing_identity ON deal_hunter_crm_imports(listing_identity) WHERE listing_identity IS NOT NULL AND listing_identity <> '';
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_submission_id ON deal_hunter_crm_imports(submission_id);
+    CREATE INDEX IF NOT EXISTS idx_scheduled_job_runs_name_updated_at ON scheduled_job_runs(job_name, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_admin_audit_events_created_at ON admin_audit_events(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_secure_document_cleanup_jobs_status ON secure_document_cleanup_jobs(status, updated_at);
 	  `);
 
   ensureColumn(database, 'contact_submissions', 'lead_type', "TEXT NOT NULL DEFAULT 'owner'");
@@ -1067,11 +1111,56 @@ export function createSqliteStorage(config) {
 	    WHERE id = @id
 	  `);
 
-  function updateRecord(tableName, id, values, allowedFields, jsonFields = []) {
+  const submissionUpdateFields = [
+    'updated_at',
+    'status',
+    'spam_score',
+    'spam_reasons',
+    'delivery_provider',
+    'delivery_status',
+    'delivery_error',
+    'crm_status',
+    'crm_error',
+    'name',
+    'email',
+    'phone',
+    'company',
+    'role',
+    'message',
+    'status_updated_at',
+    'listing_url',
+    'business_website',
+    'prospectus_url',
+    'asking_price',
+    'ttm_revenue',
+    'ttm_ebitda',
+    'ebitda_multiple',
+    'net_margin',
+    'business_age',
+    'sba_eligible',
+    'broker_name',
+    'broker_email',
+    'broker_phone',
+    'seller_name',
+    'seller_email',
+    'seller_phone',
+    'metadata',
+    'lead_type',
+    'priority',
+    'tags',
+    'assigned_to',
+    'notes',
+    'follow_up_state',
+    'next_action_at',
+    'last_contacted_at',
+  ];
+  const submissionJsonFields = ['spam_reasons', 'metadata', 'tags'];
+
+  function updateRecord(tableName, id, values, allowedFields, jsonFields = [], expectedUpdatedAt = '') {
     const updates = Object.entries(values).filter(([key]) => allowedFields.includes(key));
 
     if (updates.length === 0) {
-      return;
+      return { changes: 0 };
     }
 
     const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
@@ -1081,10 +1170,17 @@ export function createSqliteStorage(config) {
     }, {});
 
     payload.id = id;
-    database.prepare(`UPDATE ${tableName} SET ${fields} WHERE id = @id`).run(payload);
+    payload.expected_updated_at = expectedUpdatedAt;
+    const versionPredicate = expectedUpdatedAt ? ' AND updated_at = @expected_updated_at' : '';
+    return database.prepare(`UPDATE ${tableName} SET ${fields} WHERE id = @id${versionPredicate}`).run(payload);
   }
 
   return {
+    async checkHealth() {
+      database.prepare('SELECT 1 AS ok').get();
+      return { ok: true };
+    },
+
     async insertSubmission(submission) {
       insertSubmissionStatement.run(serializeSubmission(submission));
       return submission;
@@ -1095,53 +1191,24 @@ export function createSqliteStorage(config) {
         'contact_submissions',
         id,
         values,
-        [
-          'updated_at',
-          'status',
-          'spam_score',
-          'spam_reasons',
-          'delivery_provider',
-          'delivery_status',
-          'delivery_error',
-          'crm_status',
-          'crm_error',
-          'name',
-          'email',
-          'phone',
-          'company',
-          'role',
-          'message',
-          'status_updated_at',
-          'listing_url',
-          'business_website',
-          'prospectus_url',
-          'asking_price',
-          'ttm_revenue',
-          'ttm_ebitda',
-          'ebitda_multiple',
-          'net_margin',
-          'business_age',
-          'sba_eligible',
-          'broker_name',
-          'broker_email',
-          'broker_phone',
-          'seller_name',
-          'seller_email',
-          'seller_phone',
-          'metadata',
-          'lead_type',
-          'priority',
-          'tags',
-          'assigned_to',
-          'notes',
-          'follow_up_state',
-          'next_action_at',
-          'last_contacted_at',
-        ],
-        ['spam_reasons', 'metadata', 'tags'],
+        submissionUpdateFields,
+        submissionJsonFields,
       );
 
       return this.getSubmission(id);
+    },
+
+    async updateSubmissionIfCurrent(id, expectedUpdatedAt, values) {
+      const result = updateRecord(
+        'contact_submissions',
+        id,
+        values,
+        submissionUpdateFields,
+        submissionJsonFields,
+        expectedUpdatedAt,
+      );
+
+      return result.changes > 0 ? this.getSubmission(id) : null;
     },
 
     async getSubmission(id) {
@@ -1985,5 +2052,167 @@ export function createSqliteStorage(config) {
 	        request: normalizeDealHunterCimRequestRow(row),
 	      };
 	    },
+
+    async claimScheduledJob({ jobKey = '', jobName = '', triggeredBy = '', nowIso = '', staleBefore = '', metadata = {} } = {}) {
+      if (!jobKey || !jobName || !nowIso) {
+        return { claimed: false, run: null };
+      }
+
+      const insertResult = database
+        .prepare(`
+          INSERT OR IGNORE INTO scheduled_job_runs (
+            job_key, job_name, created_at, updated_at, started_at, status, triggered_by, attempt_count, metadata
+          ) VALUES (?, ?, ?, ?, ?, 'pending', ?, 1, ?)
+        `)
+        .run(jobKey, jobName, nowIso, nowIso, nowIso, triggeredBy, JSON.stringify(metadata || {}));
+      let reclaimed = false;
+
+      if (insertResult.changes === 0) {
+        const updateResult = database
+          .prepare(`
+            UPDATE scheduled_job_runs SET
+              updated_at = ?, started_at = ?, completed_at = NULL, status = 'pending',
+              triggered_by = ?, attempt_count = attempt_count + 1,
+              provider_message_id = NULL, last_error = NULL, metadata = ?
+            WHERE job_key = ?
+              AND (status = 'failed' OR (status = 'pending' AND ? <> '' AND updated_at <= ?))
+          `)
+          .run(nowIso, nowIso, triggeredBy, JSON.stringify(metadata || {}), jobKey, staleBefore, staleBefore);
+        reclaimed = updateResult.changes > 0;
+      }
+
+      const run = database.prepare('SELECT * FROM scheduled_job_runs WHERE job_key = ?').get(jobKey);
+      return {
+        claimed: insertResult.changes > 0 || reclaimed,
+        run: run ? { ...run, metadata: parseJsonColumn(run.metadata, {}) } : null,
+      };
+    },
+
+    async completeScheduledJob(jobKey, values = {}) {
+      const completedAt = values.completed_at || new Date().toISOString();
+      database
+        .prepare(`
+          UPDATE scheduled_job_runs SET
+            updated_at = ?, completed_at = ?, status = ?, provider_message_id = ?, last_error = ?, metadata = ?
+          WHERE job_key = ?
+        `)
+        .run(
+          completedAt,
+          completedAt,
+          values.status || 'completed',
+          values.provider_message_id || null,
+          values.last_error || null,
+          JSON.stringify(values.metadata || {}),
+          jobKey,
+        );
+      return this.getScheduledJob(jobKey);
+    },
+
+    async getScheduledJob(jobKey) {
+      const run = database.prepare('SELECT * FROM scheduled_job_runs WHERE job_key = ?').get(jobKey);
+      return run ? { ...run, metadata: parseJsonColumn(run.metadata, {}) } : null;
+    },
+
+    async insertAdminAuditEvent(event) {
+      database
+        .prepare(`
+          INSERT INTO admin_audit_events (
+            id, created_at, request_id, actor, role, method, path, status_code, metadata
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          event.id,
+          event.created_at,
+          event.request_id || null,
+          event.actor,
+          event.role,
+          event.method,
+          event.path,
+          Number(event.status_code || 0),
+          JSON.stringify(event.metadata || {}),
+        );
+      return event;
+    },
+
+    async listAdminAuditEvents({ requestId = '', limit = 100 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 500));
+      const rows = requestId
+        ? database.prepare('SELECT * FROM admin_audit_events WHERE request_id = ? ORDER BY created_at ASC LIMIT ?').all(requestId, safeLimit)
+        : database.prepare('SELECT * FROM admin_audit_events ORDER BY created_at DESC LIMIT ?').all(safeLimit);
+      return rows.map((row) => ({ ...row, metadata: parseJsonColumn(row.metadata, {}) }));
+    },
+
+    async insertSecureDocumentCleanupJob(job) {
+      database
+        .prepare(`
+          INSERT INTO secure_document_cleanup_jobs (
+            id, submission_id, created_at, updated_at, completed_at, status,
+            trash_directory, files, attempt_count, last_error, metadata
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(
+          job.id,
+          job.submission_id,
+          job.created_at,
+          job.updated_at,
+          job.completed_at || null,
+          job.status,
+          job.trash_directory || null,
+          JSON.stringify(job.files || []),
+          Number(job.attempt_count || 0),
+          job.last_error || null,
+          JSON.stringify(job.metadata || {}),
+        );
+      return job;
+    },
+
+    async updateSecureDocumentCleanupJob(id, values = {}) {
+      const existing = database.prepare('SELECT * FROM secure_document_cleanup_jobs WHERE id = ?').get(id);
+      if (!existing) {
+        return null;
+      }
+      const next = {
+        ...existing,
+        ...values,
+        files: values.files === undefined ? parseJsonColumn(existing.files, []) : values.files,
+        metadata: values.metadata === undefined ? parseJsonColumn(existing.metadata, {}) : values.metadata,
+      };
+      database
+        .prepare(`
+          UPDATE secure_document_cleanup_jobs SET
+            updated_at = ?, completed_at = ?, status = ?, trash_directory = ?, files = ?,
+            attempt_count = ?, last_error = ?, metadata = ?
+          WHERE id = ?
+        `)
+        .run(
+          next.updated_at,
+          next.completed_at || null,
+          next.status,
+          next.trash_directory || null,
+          JSON.stringify(next.files || []),
+          Number(next.attempt_count || 0),
+          next.last_error || null,
+          JSON.stringify(next.metadata || {}),
+          id,
+        );
+      return this.getSecureDocumentCleanupJob(id);
+    },
+
+    async getSecureDocumentCleanupJob(id) {
+      const row = database.prepare('SELECT * FROM secure_document_cleanup_jobs WHERE id = ?').get(id);
+      return row ? { ...row, files: parseJsonColumn(row.files, []), metadata: parseJsonColumn(row.metadata, {}) } : null;
+    },
+
+    async listPendingSecureDocumentCleanupJobs(limit = 100) {
+      return database
+        .prepare(`
+          SELECT * FROM secure_document_cleanup_jobs
+          WHERE status NOT IN ('completed', 'restored')
+          ORDER BY created_at ASC
+          LIMIT ?
+        `)
+        .all(Math.max(1, Math.min(Number(limit) || 100, 500)))
+        .map((row) => ({ ...row, files: parseJsonColumn(row.files, []), metadata: parseJsonColumn(row.metadata, {}) }));
+    },
 	  };
-	}
+}

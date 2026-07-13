@@ -45,7 +45,7 @@ primary_region = "ewr"
     interval = "15s"
     method = "GET"
     timeout = "5s"
-    path = "/api/health"
+    path = "/api/ready"
 
 [[mounts]]
   source = "uckele_group_data"

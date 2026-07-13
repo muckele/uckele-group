@@ -30,7 +30,7 @@ function normalizeText(value = '', maxLength = 1000) {
 export function normalizeResendTagToken(value = '', fallback = '') {
   const normalized = normalizeText(value, 256)
     .normalize('NFKD')
-    .replace(/[^\x00-\x7F]/g, '')
+    .replace(/[^\p{ASCII}]/gu, '')
     .replace(/[^A-Za-z0-9_-]+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^[-_]+|[-_]+$/g, '')
@@ -236,6 +236,7 @@ async function sendViaResend(message) {
     headers: {
       Authorization: `Bearer ${config.delivery.resendApiKey}`,
       'Content-Type': 'application/json',
+      ...(message.idempotencyKey ? { 'Idempotency-Key': message.idempotencyKey } : {}),
     },
     body: JSON.stringify({
       from: config.delivery.resendFromEmail,
@@ -576,7 +577,7 @@ function dealHunterTextSection(title, deals = [], options = {}) {
   return lines;
 }
 
-export function buildDailyDealHunterEmail({ to, review = {} } = {}) {
+export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = '' } = {}) {
   const generatedLabel = review.generatedAt ? new Date(review.generatedAt).toLocaleString() : new Date().toLocaleString();
   const crmSync = review.crmSync || {};
   const emailSectionLimit = 8;
@@ -619,7 +620,7 @@ export function buildDailyDealHunterEmail({ to, review = {} } = {}) {
     }
   `;
 	  const html = brandedEmailHtml({
-	    preheader: `${review.totals?.newMatches || 0} new fit(s), ${review.totals?.qualified || 0} high-fit deals, and ${review.totals?.removalCandidates || 0} removals from today\'s deal sources.`,
+	    preheader: `${review.totals?.newMatches || 0} new fit(s), ${review.totals?.qualified || 0} high-fit deals, and ${review.totals?.removalCandidates || 0} removals from today's deal sources.`,
     eyebrow: 'Daily Deal Hunter',
     title: 'Daily acquisition deal review',
     paragraphs: [
@@ -658,8 +659,9 @@ export function buildDailyDealHunterEmail({ to, review = {} } = {}) {
     ...recommendations.map((item) => `- ${item}`),
   ].join('\n');
 
-	  return {
-		    kind: 'daily-deal-hunter',
+		  return {
+			    kind: 'daily-deal-hunter',
+			    idempotencyKey,
 		    to,
 		    subject: `Daily deal review: ${review.totals?.newMatches || 0} new fit, ${review.totals?.removalCandidates || 0} remove`,
     headline: 'Daily acquisition deal review',

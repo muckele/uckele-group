@@ -15,7 +15,7 @@ process.env.SECURE_DOCUMENTS_STORAGE_DIR = path.join(tempDir, 'secure-documents'
 process.env.SQLITE_PATH = path.join(tempDir, 'document-vault.sqlite');
 
 const { createSecureUploadRequest, getSecureDocumentDownload, uploadSecureDocuments } = await import('../server/services/documentVault.js');
-const { createManualSubmission, deleteDashboardSubmission } = await import('../server/services/submissions.js');
+const { createManualSubmission, deleteDashboardSubmission, reconcileSecureDocumentCleanupJobs } = await import('../server/services/submissions.js');
 const { getStorage } = await import('../server/storage/index.js');
 
 after(() => {
@@ -210,7 +210,7 @@ test('deleting a CRM record removes secure upload data, email events, and stored
   assert.equal(fs.existsSync(documents[0].storage_path), false);
 });
 
-test('dashboard submission delete keeps CRM record when secure file cleanup fails', async () => {
+test('dashboard submission delete keeps CRM record when secure file staging fails', async () => {
   let deleteCalled = false;
   const result = await deleteDashboardSubmission('cleanup-failure-submission', {
     storage: {
@@ -225,7 +225,7 @@ test('dashboard submission delete keeps CRM record when secure file cleanup fail
         return true;
       },
     },
-    async unlinkFile() {
+    async renameFile() {
       const error = new Error('permission denied');
       error.code = 'EACCES';
       throw error;
@@ -234,8 +234,35 @@ test('dashboard submission delete keeps CRM record when secure file cleanup fail
 
   assert.equal(result.ok, false);
   assert.equal(result.status, 500);
-  assert.match(result.error, /cleanup failed/i);
+  assert.match(result.error, /cleanup could not be prepared/i);
   assert.equal(deleteCalled, false);
+});
+
+test('dashboard submission delete restores staged files when database deletion fails', async () => {
+  const storageDir = process.env.SECURE_DOCUMENTS_STORAGE_DIR;
+  const documentPath = path.join(storageDir, 'database-failure-document.txt');
+  fs.mkdirSync(storageDir, { recursive: true });
+  fs.writeFileSync(documentPath, 'recoverable diligence document');
+
+  const result = await deleteDashboardSubmission('database-failure-submission', {
+    storage: {
+      async getSubmission(id) {
+        return { id };
+      },
+      async listSecureDocumentsForSubmission() {
+        return [{ storage_path: documentPath }];
+      },
+      async deleteSubmission() {
+        throw new Error('database unavailable');
+      },
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 500);
+  assert.match(result.error, /restored/i);
+  assert.equal(fs.existsSync(documentPath), true);
+  assert.equal(fs.readFileSync(documentPath, 'utf8'), 'recoverable diligence document');
 });
 
 test('dashboard submission delete rejects secure document paths outside the vault', async () => {
@@ -264,6 +291,129 @@ test('dashboard submission delete rejects secure document paths outside the vaul
   assert.match(result.cleanupFailures[0].message, /outside/i);
   assert.equal(unlinkCalled, false);
   assert.equal(deleteCalled, false);
+});
+
+test('failed post-delete purges are persisted and reconciled later', async () => {
+  const storageDir = process.env.SECURE_DOCUMENTS_STORAGE_DIR;
+  const documentPath = path.join(storageDir, 'queued-cleanup-document.txt');
+  fs.mkdirSync(storageDir, { recursive: true });
+  fs.writeFileSync(documentPath, 'confidential cleanup payload');
+  let submission = { id: 'queued-cleanup-submission' };
+  let cleanupJob = null;
+  const storage = {
+    async getSubmission() {
+      return submission;
+    },
+    async listSecureDocumentsForSubmission() {
+      return [{ storage_path: documentPath }];
+    },
+    async deleteSubmission() {
+      const deleted = submission;
+      submission = null;
+      return deleted;
+    },
+    async insertSecureDocumentCleanupJob(job) {
+      cleanupJob = { ...job };
+      return cleanupJob;
+    },
+    async updateSecureDocumentCleanupJob(_id, values) {
+      cleanupJob = { ...cleanupJob, ...values };
+      return cleanupJob;
+    },
+    async listPendingSecureDocumentCleanupJobs() {
+      return ['completed', 'restored'].includes(cleanupJob?.status) ? [] : [cleanupJob];
+    },
+  };
+  const result = await deleteDashboardSubmission('queued-cleanup-submission', {
+    storage,
+    async unlinkFile() {
+      const error = new Error('temporary filesystem failure');
+      error.code = 'EIO';
+      throw error;
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.cleanupPending, true);
+  assert.equal(cleanupJob.status, 'cleanup-failed');
+  assert.equal(fs.existsSync(documentPath), false);
+  assert.equal(fs.existsSync(cleanupJob.files[0].stagedPath), true);
+
+  const reconciliation = await reconcileSecureDocumentCleanupJobs({ storage });
+  assert.deepEqual(reconciliation, { reviewed: 1, completed: 1, restored: 0, failed: 0 });
+  assert.equal(cleanupJob.status, 'completed');
+  assert.equal(fs.existsSync(cleanupJob.files[0].stagedPath), false);
+  assert.equal(fs.existsSync(cleanupJob.trash_directory), false);
+});
+
+test('a missing secure file does not prevent later files from being staged and purged', async () => {
+  const storageDir = process.env.SECURE_DOCUMENTS_STORAGE_DIR;
+  const existingPath = path.join(storageDir, 'second-delete-document.txt');
+  fs.mkdirSync(storageDir, { recursive: true });
+  fs.writeFileSync(existingPath, 'second confidential document');
+  const result = await deleteDashboardSubmission('missing-first-file-submission', {
+    storage: {
+      async getSubmission(id) {
+        return { id };
+      },
+      async listSecureDocumentsForSubmission() {
+        return [
+          { storage_path: path.join(storageDir, 'already-missing-document.txt') },
+          { storage_path: existingPath },
+        ];
+      },
+      async deleteSubmission(id) {
+        return { id };
+      },
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(fs.existsSync(existingPath), false);
+});
+
+test('falsey database deletion reports a restore failure instead of a 404', async () => {
+  const storageDir = process.env.SECURE_DOCUMENTS_STORAGE_DIR;
+  const documentPath = path.join(storageDir, 'falsey-delete-document.txt');
+  fs.mkdirSync(storageDir, { recursive: true });
+  fs.writeFileSync(documentPath, 'must be restored');
+  let renameCount = 0;
+  let cleanupJob = null;
+  const result = await deleteDashboardSubmission('falsey-delete-submission', {
+    storage: {
+      async getSubmission(id) {
+        return { id };
+      },
+      async listSecureDocumentsForSubmission() {
+        return [{ storage_path: documentPath }];
+      },
+      async insertSecureDocumentCleanupJob(job) {
+        cleanupJob = { ...job };
+        return cleanupJob;
+      },
+      async updateSecureDocumentCleanupJob(_id, values) {
+        cleanupJob = { ...cleanupJob, ...values };
+        return cleanupJob;
+      },
+      async deleteSubmission() {
+        return null;
+      },
+    },
+    async renameFile(from, to) {
+      renameCount += 1;
+      if (renameCount > 1) {
+        const error = new Error('restore denied');
+        error.code = 'EACCES';
+        throw error;
+      }
+      await fs.promises.rename(from, to);
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 500);
+  assert.match(result.error, /could not be fully restored/i);
+  assert.equal(cleanupJob.status, 'restore-failed');
 });
 
 test('secure upload recovers stale uploading requests before accepting files', async () => {

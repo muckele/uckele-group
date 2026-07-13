@@ -2575,7 +2575,7 @@ export async function reviewDailyDeals({ markSeen = false, storage = getStorage(
   return result.review;
 }
 
-export async function sendDailyDealHunterReview() {
+export async function sendDailyDealHunterReview({ idempotencyKey = '' } = {}) {
   const result = await buildDailyDealReview();
   const { review, scoredDeals, storage } = result;
   const config = getConfig();
@@ -2586,6 +2586,7 @@ export async function sendDailyDealHunterReview() {
   const emailResult = await sendDailyDealHunterEmail({
     to: config.dealHunter.recipient || config.delivery.fallbackRecipient,
     review,
+    idempotencyKey,
   });
 
   if (emailResult.status !== 'failed') {

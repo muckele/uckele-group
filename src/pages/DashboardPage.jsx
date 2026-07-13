@@ -378,12 +378,14 @@ function shouldSubmitDiligence(draftDiligence, existingDiligence) {
   return JSON.stringify(comparableDiligence(draftDiligence)) !== JSON.stringify(comparableDiligence(existingDiligence));
 }
 
-function buildSubmissionPayload(draft, existingSubmission = null) {
+export function buildSubmissionPayload(draft, existingSubmission = null) {
   const payload = {
     ...draft,
+    expected_updated_at: draft?._expected_updated_at || existingSubmission?.updated_at || '',
     next_action_at: fromDateTimeLocal(draft.next_action_at),
     tags: draft.tags,
   };
+  delete payload._expected_updated_at;
 
   if (!shouldSubmitDiligence(draft.diligence, existingSubmission?.metadata?.diligence)) {
     delete payload.diligence;
@@ -392,8 +394,9 @@ function buildSubmissionPayload(draft, existingSubmission = null) {
   return payload;
 }
 
-function buildDraft(submission) {
+export function buildDraft(submission) {
   return {
+    _expected_updated_at: submission.updated_at || '',
     status: submission.status || 'review',
     priority: submission.priority || 'normal',
     assigned_to: submission.assigned_to || '',
@@ -1260,6 +1263,8 @@ export default function DashboardPage() {
     }
 
     checkSession();
+  // Authentication bootstrap is intentionally performed once; subsequent session checks are explicit actions.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -1401,6 +1406,16 @@ export default function DashboardPage() {
 
       const result = await response.json();
 
+      if (response.status === 409 && result.submission) {
+        setDashboardData((current) => ({
+          ...current,
+          submissions: current.submissions.map((submission) =>
+            submission.id === submissionId ? result.submission : submission,
+          ),
+        }));
+        throw new Error('This CRM record changed after you opened it. Your unsaved edits were kept; reload the record to discard them or review the latest values before saving again.');
+      }
+
       if (!response.ok || !result.success) {
         throw new Error(result.error || 'Unable to update submission.');
       }
@@ -1477,8 +1492,14 @@ export default function DashboardPage() {
         delete next[submission.id];
         return next;
       });
+      const cleanupNotice = result.cleanupPending
+        ? 'CRM record deleted. Secure document purge is queued and will be retried automatically; the files remain isolated in the protected trash directory until cleanup completes.'
+        : '';
 
       if (isCrmDetailView) {
+        if (cleanupNotice) {
+          setActionError(cleanupNotice);
+        }
         navigate('/admin/crm', { replace: true });
         return;
       }
@@ -1490,7 +1511,9 @@ export default function DashboardPage() {
       ]);
       const refreshFailed = refreshResults.some((result) => result.status === 'rejected');
 
-      if (refreshFailed) {
+      if (cleanupNotice) {
+        setActionError(cleanupNotice);
+      } else if (refreshFailed) {
         setActionError('CRM record deleted, but one admin section did not refresh. Reload the admin page if anything looks stale.');
       }
     } catch (error) {
@@ -1657,7 +1680,9 @@ export default function DashboardPage() {
         throw new Error(result.error || 'Unable to review daily deals.');
       }
 
-      setDealHunterReview(result.review);
+      if (result.review) {
+        setDealHunterReview(result.review);
+      }
       setDealHunterFeedback({ error: '', message: `Reviewed ${result.review?.totals?.reviewedDeals || 0} recent deals.` });
       await loadCommandCenter();
     } catch (error) {
@@ -1692,7 +1717,10 @@ export default function DashboardPage() {
       const crmMessage = crmSync?.reviewed
         ? ` CRM sync: ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped.`
         : '';
-      setDealHunterFeedback({ error: '', message: `Daily deal email sent.${crmMessage}` });
+      setDealHunterFeedback({
+        error: '',
+        message: result.alreadySent ? 'The daily deal email was already sent for today.' : `Daily deal email sent.${crmMessage}`,
+      });
       await Promise.all([
         loadCommandCenter(),
         loadDashboard(filters.status, deferredSearch.trim()),
@@ -2447,6 +2475,17 @@ export default function DashboardPage() {
                 <StatCard icon={ShieldAlert} label="Remove" value={dealHunterReview.totals?.removalCandidates || 0} tone={dealHunterReview.totals?.removalCandidates > 0 ? 'danger' : 'default'} />
                 <StatCard icon={CalendarClock} label="Lookback" value={`${dealHunterReview.lookbackDays || 0}d`} />
               </div>
+
+              {dealHunterReview.dailyEmailJob ? (
+                <div className="rounded-2xl border border-line/80 bg-fog/70 px-4 py-3 text-sm leading-7 text-ink/74">
+                  <strong>Today's daily email:</strong>{' '}
+                  {formatLabel(dealHunterReview.dailyEmailJob.status)} · attempt {dealHunterReview.dailyEmailJob.attempt_count || 1}
+                  {dealHunterReview.dailyEmailJob.completed_at
+                    ? ` · completed ${formatDateTime(dealHunterReview.dailyEmailJob.completed_at)}`
+                    : ''}
+                  {dealHunterReview.dailyEmailJob.last_error ? ` · ${dealHunterReview.dailyEmailJob.last_error}` : ''}
+                </div>
+              ) : null}
 
               <div className="grid gap-4 lg:grid-cols-2">
                 <div className="rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5">

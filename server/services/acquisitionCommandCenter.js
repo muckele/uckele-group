@@ -384,7 +384,7 @@ function readinessItem({ id, label, weight, complete, risk }) {
   };
 }
 
-export function calculateDiligenceReadiness({ submission = {}, documents = [], latestUploadRequest = null } = {}) {
+export function calculateDiligenceReadiness({ submission = {}, documents = [] } = {}) {
   const diligence = diligenceMetadata(submission);
   const documentText = documentsText(documents);
   const evidenceText = [

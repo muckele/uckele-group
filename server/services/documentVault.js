@@ -97,7 +97,10 @@ function normalizeBase64(value = '') {
 
 export function getSecureUploadJsonLimitBytes(config = getConfig()) {
   return Math.ceil(
-    config.secureDocuments.maxUploadBytes * maxDocumentsPerUpload * base64ExpansionRatio
+    Math.min(
+      config.secureDocuments.maxUploadBytes * maxDocumentsPerUpload,
+      config.secureDocuments.maxTotalUploadBytes,
+    ) * base64ExpansionRatio
       + jsonUploadEnvelopeBytes,
   );
 }
@@ -406,7 +409,7 @@ export async function createSecureUploadRequest({ submissionId, requestedBy, not
   };
 }
 
-export async function getSecureUploadContext(token) {
+export async function getSecureUploadContext(token, { recoverStale = false } = {}) {
   const storage = getStorage();
   const payload = verifyAccessToken(token);
 
@@ -414,7 +417,7 @@ export async function getSecureUploadContext(token) {
     return { ok: false, error: 'This secure document link is invalid or has expired.' };
   }
 
-  const requestRecord = await storage.getSecureUploadRequest(payload.requestId);
+  let requestRecord = await storage.getSecureUploadRequest(payload.requestId);
 
   if (!requestRecord) {
     return { ok: false, error: 'This secure document request could not be found.' };
@@ -422,6 +425,10 @@ export async function getSecureUploadContext(token) {
 
   if (new Date(requestRecord.expires_at).getTime() < Date.now()) {
     return { ok: false, error: 'This secure document request has expired.' };
+  }
+
+  if (recoverStale) {
+    requestRecord = await recoverStaleUploadRequest(storage, requestRecord);
   }
 
   const submission = await storage.getSubmission(requestRecord.submission_id);
@@ -525,7 +532,7 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
   }
 
   if (!ndaAccepted) {
-    return { ok: false, error: 'Please confirm the NDA and confidentiality acknowledgement before uploading.' };
+    return { ok: false, error: 'Please confirm the confidentiality acknowledgement before uploading.' };
   }
 
   if (!Array.isArray(documents) || documents.length === 0) {
@@ -554,7 +561,10 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
   }
 
   const incomingBytes = preparedDocuments.reduce((sum, document) => sum + document.buffer.byteLength, 0);
-  const maxTotalBytes = config.secureDocuments.maxUploadBytes * maxDocumentsPerRequest;
+  const maxTotalBytes = Math.min(
+    config.secureDocuments.maxUploadBytes * maxDocumentsPerRequest,
+    config.secureDocuments.maxTotalUploadBytes,
+  );
 
   if (sumSecureDocumentBytes(context.documents) + incomingBytes > maxTotalBytes) {
     return {
