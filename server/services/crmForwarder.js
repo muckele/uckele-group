@@ -20,6 +20,7 @@ export async function forwardToCrm(submission) {
       timeoutMessage: 'CRM webhook timed out.',
       headers: {
         'Content-Type': 'application/json',
+        'Idempotency-Key': `contact-submission:${submission.id}`,
         ...(config.crm.webhookSecret ? { 'X-Webhook-Secret': config.crm.webhookSecret } : {}),
       },
       body: JSON.stringify({

@@ -2,6 +2,7 @@ import { createHmac, randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { safeCompareText } from '../utils/security.js';
+import { commitCrmActivityMutation } from './activity.js';
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -318,7 +319,34 @@ export async function recordEmailEvent(input) {
 
   event.event_key = normalizeText(input.event_key || input.eventKey, 700) || buildEventKey(event);
 
-  return storage.insertEmailEvent(event);
+  let storedEvent;
+
+  if (event.submission_id) {
+    const mutation = await commitCrmActivityMutation({
+      storage,
+      operation: 'insert_email_event',
+      payload: { event },
+      activity: {
+        submissionId: event.submission_id,
+        eventType: `email.${event.event_type}`,
+        summary: `Email ${event.event_type}${event.subject ? `: ${event.subject}` : '.'}`,
+        actor: event.recipient_email || event.provider,
+        role: event.event_type === 'replied' ? 'contact' : 'email-provider',
+        createdAt: event.created_at,
+        metadata: {
+          emailEventId: event.id,
+          provider: event.provider,
+          messageId: event.message_id,
+          subject: event.subject,
+        },
+      },
+    });
+    storedEvent = mutation.record;
+  } else {
+    storedEvent = await storage.insertEmailEvent(event);
+  }
+
+  return storedEvent;
 }
 
 export async function recordEmailEventsFromWebhook(request) {

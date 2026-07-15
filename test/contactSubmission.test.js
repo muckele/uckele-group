@@ -62,6 +62,19 @@ test('contact submission sends the full Turnstile token to verification', async 
   assert.equal(verifiedToken, longToken);
   assert.equal(result.status, 200);
   assert.equal(result.body.success, true);
+
+  const storage = getStorage();
+  const submission = await storage.getSubmission(result.body.id);
+  const activity = await storage.listCrmActivityEvents({ submissionId: result.body.id, limit: 20 });
+  const routingEvent = activity.find((event) => event.event_type === 'submission.routing-updated');
+  assert.equal(submission.delivery_status, 'logged');
+  assert.equal(submission.crm_status, 'skipped');
+  assert.ok(routingEvent, 'the final delivery and CRM routing result should be durable activity');
+  assert.equal(routingEvent.metadata.routingKey, `contact-submission:${result.body.id}`);
+  assert.deepEqual(routingEvent.metadata.changedFields.sort(), [
+    'crm_status',
+    'delivery_status',
+  ]);
 });
 
 test('pre-body contact rate limit is not counted twice by submission handling', async () => {

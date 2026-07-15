@@ -7,6 +7,7 @@ import CriteriaPage from './pages/CriteriaPage';
 import FaqPage from './pages/FaqPage';
 import HomePage from './pages/HomePage';
 import ProcessPage from './pages/ProcessPage';
+import PrivacyPage from './pages/PrivacyPage';
 import SellerConcernsPage from './pages/SellerConcernsPage';
 
 const AdminLayout = lazy(() => import('./components/AdminLayout'));
@@ -25,7 +26,8 @@ function ScrollToTop() {
   const location = useLocation();
 
   useEffect(() => {
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    window.scrollTo({ top: 0, behavior: reduceMotion ? 'auto' : 'smooth' });
   }, [location.pathname]);
 
   return null;
@@ -45,6 +47,7 @@ export default function App() {
           <Route element={<ProcessPage />} path="process" />
           <Route element={<FaqPage />} path="faq" />
           <Route element={<ContactPage />} path="contact" />
+          <Route element={<PrivacyPage />} path="privacy" />
           <Route
             element={
               <Suspense fallback={<RouteFallback />}>

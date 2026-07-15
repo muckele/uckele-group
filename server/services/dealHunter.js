@@ -2,12 +2,15 @@ import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { sha256, signPayload, verifySignedPayload } from '../utils/security.js';
 import {
+  buildCimReplyToAddress,
   normalizeResendTagToken,
   sendDailyDealHunterEmail,
   sendDealHunterCimFollowUpEmail,
   sendDealHunterCimRequestEmail,
 } from './delivery.js';
 import { createManualSubmission } from './submissions.js';
+import { commitCrmActivityMutation } from './activity.js';
+import { getEmailReadiness } from './emailReadiness.js';
 
 const defaultTimeoutMs = 45000;
 const cimRequestScoreThreshold = 75;
@@ -1670,6 +1673,8 @@ function dealHunterCrmMetadata(deal, options = {}) {
       externalId: deal.id || '',
       firstSeenAt: deal.firstSeenAt || '',
       lastSeenAt: deal.lastSeenAt || '',
+      dateAdded: deal.dateAdded || '',
+      lastUpdated: deal.lastUpdated || '',
       isNew: Boolean(deal.isNew),
       shouldRemove: Boolean(deal.shouldRemove),
       recommendation: deal.recommendation || '',
@@ -1730,6 +1735,37 @@ async function findExistingDealHunterSubmission(storage, deal) {
   return null;
 }
 
+async function upsertCimRequestWithActivity(storage, request, { eventType, summary, actor, metadata = {} } = {}) {
+  const submission = await findExistingDealHunterSubmission(storage, {
+    dealKey: request.dealKey || request.deal_key,
+    listingUrl: request.listingUrl || request.listing_url,
+  });
+
+  if (!submission) {
+    return storage.upsertDealHunterCimRequest(request);
+  }
+
+  const mutation = await commitCrmActivityMutation({
+    storage,
+    operation: 'upsert_deal_hunter_cim_request',
+    payload: { request },
+    activity: {
+      submissionId: submission.id,
+      eventType,
+      summary,
+      actor: actor || 'deal-hunter',
+      role: 'admin',
+      metadata: { cimRequestId: request.id, ...metadata },
+    },
+  });
+
+  if (!mutation.applied || !mutation.record) {
+    throw new Error('CIM request state changed before its activity could be saved.');
+  }
+
+  return mutation.record;
+}
+
 function isDealHunterManagedSubmission(existing = {}) {
   return existing.source === 'deal-hunter-daily-review' || existing.metadata?.dealHunter?.managed === true;
 }
@@ -1769,6 +1805,35 @@ function dealHunterCrmUpdate(existing, deal, options = {}) {
       ...payload.metadata,
     },
   };
+}
+
+async function updateDealHunterCrmSubmission(storage, existing, deal, { preserveExistingFields = false } = {}) {
+  const values = dealHunterCrmUpdate(existing, deal, { preserveExistingFields });
+  const mutation = await commitCrmActivityMutation({
+    storage,
+    operation: 'update_submission',
+    payload: { id: existing.id, values },
+    activity: {
+      submissionId: existing.id,
+      eventType: 'submission.deal-hunter-synced',
+      summary: preserveExistingFields
+        ? 'Existing CRM record enriched from Deal Hunter.'
+        : 'Deal Hunter CRM record refreshed from its listing.',
+      actor: 'deal-hunter',
+      role: 'system',
+      metadata: {
+        dealKey: deal.dealKey || '',
+        listingUrl: deal.listingUrl || '',
+        changedFields: Object.keys(values).filter((field) => field !== 'updated_at'),
+      },
+    },
+  });
+
+  if (!mutation.applied || !mutation.record) {
+    throw new Error('Deal Hunter CRM record changed before its activity could be saved.');
+  }
+
+  return mutation.record;
 }
 
 function buildDealHunterCrmImportRecord(deal, submissionId = '', status = 'pending') {
@@ -1850,10 +1915,7 @@ async function syncHighFitDealsToCrm(scoredDeals = [], storage = getStorage()) {
 
           if (claimedSubmission && storage.updateSubmission) {
             const preserveExistingFields = !isDealHunterManagedSubmission(claimedSubmission);
-            const updated = await storage.updateSubmission(
-              claimedSubmission.id,
-              dealHunterCrmUpdate(claimedSubmission, deal, { preserveExistingFields }),
-            );
+            const updated = await updateDealHunterCrmSubmission(storage, claimedSubmission, deal, { preserveExistingFields });
             const status = preserveExistingFields ? 'enriched' : 'updated';
             summary[status] += 1;
             summary.results.push({ dealKey: deal.dealKey, status, submissionId: updated?.id || claimedSubmission.id });
@@ -1873,10 +1935,7 @@ async function syncHighFitDealsToCrm(scoredDeals = [], storage = getStorage()) {
       if (existing) {
         if (storage.updateSubmission) {
           const preserveExistingFields = !isDealHunterManagedSubmission(existing);
-          const updated = await storage.updateSubmission(
-            existing.id,
-            dealHunterCrmUpdate(existing, deal, { preserveExistingFields }),
-          );
+          const updated = await updateDealHunterCrmSubmission(storage, existing, deal, { preserveExistingFields });
           const status = preserveExistingFields ? 'enriched' : 'updated';
           summary[status] += 1;
           summary.results.push({ dealKey: deal.dealKey, status, submissionId: updated?.id || existing.id });
@@ -1961,8 +2020,29 @@ function getCimFollowUpSettings() {
     firstDelayHours: 48,
     intervalHours: 72,
     maxCount: 3,
-    delaySequenceHours: [48, 72, 168],
+    delaySequenceHours: [48, 72, 96],
+    weekdaysOnly: true,
+    timezone: 'America/Los_Angeles',
   };
+}
+
+export function isCimFollowUpSendDay({ now = new Date(), settings = getCimFollowUpSettings() } = {}) {
+  if (!settings.weekdaysOnly) {
+    return true;
+  }
+
+  const date = now instanceof Date ? now : new Date(now);
+
+  if (Number.isNaN(date.getTime())) {
+    return false;
+  }
+
+  const weekday = new Intl.DateTimeFormat('en-US', {
+    timeZone: settings.timezone || 'America/Los_Angeles',
+    weekday: 'short',
+  }).format(date);
+
+  return weekday !== 'Sat' && weekday !== 'Sun';
 }
 
 function acquireLock(lockSet, key) {
@@ -2004,8 +2084,12 @@ function subtractMinutesIso(value, minutes) {
   return new Date(baseMs - Math.max(1, Number(minutes) || 1) * 60 * 1000).toISOString();
 }
 
-function nextCimFollowUpAt({ status = '', followUpCount = 0, lastTouchAt = '' } = {}) {
-  const settings = getCimFollowUpSettings();
+export function nextCimFollowUpAt({
+  status = '',
+  followUpCount = 0,
+  lastTouchAt = '',
+  settings = getCimFollowUpSettings(),
+} = {}) {
   const safeCount = Number(followUpCount || 0);
 
   if (!cimRequestSentStatuses.includes(status) || settings.maxCount <= 0 || safeCount >= settings.maxCount) {
@@ -2059,13 +2143,57 @@ function getEmailEventTagValue(event, key) {
 }
 
 function getEmailEventContactEmail(event) {
-  return normalizeEmail(
-    event?.metadata?.fromEmail ||
-      event?.metadata?.senderEmail ||
-      event?.metadata?.from ||
-      event?.recipient_email ||
-      '',
+  return getEmailAddress(
+    event?.metadata?.fromEmail,
+    event?.metadata?.senderEmail,
+    event?.metadata?.from,
+    event?.from_email,
+    event?.recipient_email,
   );
+}
+
+function getEmailAddress(...inputs) {
+  const values = inputs.flatMap((value) => (Array.isArray(value) ? value : [value]));
+
+  for (const item of values) {
+    const match = normalizeText(item, 500).match(/<?([^<>\s]+@[^<>\s]+)>?/);
+
+    if (match?.[1]) {
+      return normalizeEmail(match[1]);
+    }
+  }
+
+  return '';
+}
+
+function getEmailEventInboundRecipient(event) {
+  return getEmailAddress(
+    event?.metadata?.toEmail,
+    event?.metadata?.to,
+    event?.to_email,
+  );
+}
+
+function getCimRequestReplyToAddress(request) {
+  const storedAddress = getEmailAddress(request?.metadata?.replyToAddress || '');
+
+  if (storedAddress) {
+    return storedAddress;
+  }
+
+  return getEmailAddress(
+    buildCimReplyToAddress({
+      requestId: request?.id || '',
+      replyTo: getConfig().delivery.resendReplyTo || '',
+    }),
+  );
+}
+
+function emailEventOccurredAfterRequest(event, request) {
+  const eventTime = Date.parse(event?.created_at || '');
+  const requestTime = Date.parse(request?.created_at || '');
+
+  return Number.isFinite(eventTime) && Number.isFinite(requestTime) && eventTime >= requestTime;
 }
 
 function emailEventTagMatchesValue(eventValue, expectedValue) {
@@ -2087,25 +2215,9 @@ function emailSubjectLooksLikeCimReply(event, request) {
     return false;
   }
 
-  const dealName = normalizeComparableText(request?.deal_name || '');
+  const dealName = normalizeComparableText(normalizeText(request?.deal_name || '', 160));
 
-  if (dealName && subject.includes(dealName)) {
-    return true;
-  }
-
-  const stopWords = new Set(['and', 'the', 'for', 'llc', 'inc', 'co', 'company', 'business', 'service', 'services']);
-  const dealTokens = dealName.split(' ').filter((token) => token.length >= 4 && !stopWords.has(token));
-  const matchingTokenCount = dealTokens.filter((token) => subject.includes(token)).length;
-
-  if (dealTokens.length >= 2 && matchingTokenCount >= 2) {
-    return true;
-  }
-
-  if (dealTokens.length === 1 && matchingTokenCount === 1 && /\b(cim|nda|teaser|financial|package|request)\b/.test(subject)) {
-    return true;
-  }
-
-  return /\b(cim|nda|teaser|confidential|financial|package)\b/.test(subject);
+  return Boolean(dealName && subject.includes(dealName));
 }
 
 export function eventMatchesCimRequest(event, request) {
@@ -2123,8 +2235,16 @@ export function eventMatchesCimRequest(event, request) {
   if (
     replyEventTypes.has(eventType) &&
     requestRecipient &&
-    getEmailEventContactEmail(event) === requestRecipient
+    getEmailEventContactEmail(event) === requestRecipient &&
+    emailEventOccurredAfterRequest(event, request)
   ) {
+    const inboundRecipient = getEmailEventInboundRecipient(event);
+    const requestReplyTo = getCimRequestReplyToAddress(request);
+
+    if (inboundRecipient && requestReplyTo && inboundRecipient === requestReplyTo) {
+      return true;
+    }
+
     if (emailSubjectLooksLikeCimReply(event, request)) {
       return true;
     }
@@ -2256,6 +2376,11 @@ function buildCimRequestRecord({ deal, recipientEmail, requestedBy = '', emailRe
     ),
   );
   const existingMetadata = existingRequest?.metadata && typeof existingRequest.metadata === 'object' ? existingRequest.metadata : {};
+  const requestId = buildCimRequestId(deal.dealKey, recipientEmail);
+  const replyToAddress = buildCimReplyToAddress({
+    requestId,
+    replyTo: getConfig().delivery.resendReplyTo || '',
+  });
   const nextFollowUpAt = nextCimFollowUpAt({
     status,
     followUpCount,
@@ -2263,7 +2388,7 @@ function buildCimRequestRecord({ deal, recipientEmail, requestedBy = '', emailRe
   });
 
   return {
-    id: buildCimRequestId(deal.dealKey, recipientEmail),
+    id: requestId,
     created_at: existingRequest?.created_at || now,
     updated_at: now,
     deal_key: deal.dealKey,
@@ -2296,6 +2421,7 @@ function buildCimRequestRecord({ deal, recipientEmail, requestedBy = '', emailRe
       strengths: deal.strengths || [],
       concerns: deal.concerns || [],
       questions: deal.questions || [],
+      replyToAddress: existingMetadata.replyToAddress || replyToAddress,
       providerMessageIds,
     },
   };
@@ -2350,8 +2476,7 @@ function buildCimRequestStorageUpdate(request, updates = {}) {
 
 async function markCimRequestResponded(storage, request, replyEvent) {
   const respondedAt = replyEvent.created_at || new Date().toISOString();
-  return storage.upsertDealHunterCimRequest(
-    buildCimRequestStorageUpdate(request, {
+  const updatedRequest = buildCimRequestStorageUpdate(request, {
       status: 'responded',
       delivery_error: '',
       responded_at: respondedAt,
@@ -2361,14 +2486,18 @@ async function markCimRequestResponded(storage, request, replyEvent) {
         responseMessageId: replyEvent.message_id || '',
         responseSubject: replyEvent.subject || '',
       },
-    }),
-  );
+    });
+  return upsertCimRequestWithActivity(storage, updatedRequest, {
+    eventType: 'cim.response-received',
+    summary: 'Broker response received for the CIM request.',
+    actor: replyEvent.recipient_email || request.recipient_email || 'broker',
+    metadata: { emailEventId: replyEvent.id || '', messageId: replyEvent.message_id || '' },
+  });
 }
 
 async function markCimRequestDeliveryIssue(storage, request, stopEvent) {
   const eventType = normalizeEventType(stopEvent.event_type);
-  return storage.upsertDealHunterCimRequest(
-    buildCimRequestStorageUpdate(request, {
+  const updatedRequest = buildCimRequestStorageUpdate(request, {
       status: 'delivery_issue',
       delivery_error: `Follow-ups stopped because the email event was ${eventType}.`,
       next_follow_up_at: null,
@@ -2377,8 +2506,12 @@ async function markCimRequestDeliveryIssue(storage, request, stopEvent) {
         deliveryIssueMessageId: stopEvent.message_id || '',
         deliveryIssueType: eventType,
       },
-    }),
-  );
+    });
+  return upsertCimRequestWithActivity(storage, updatedRequest, {
+    eventType: 'cim.delivery-issue',
+    summary: `CIM follow-ups stopped after an email ${eventType} event.`,
+    metadata: { emailEventId: stopEvent.id || '', messageId: stopEvent.message_id || '', deliveryIssueType: eventType },
+  });
 }
 
 function buildCimFollowUpUpdate(request, emailResult, followUpNumber, sentAt) {
@@ -2401,6 +2534,10 @@ function buildCimFollowUpUpdate(request, emailResult, followUpNumber, sentAt) {
         .filter(Boolean),
     ),
   );
+  const replyToAddress = buildCimReplyToAddress({
+    requestId: request.id,
+    replyTo: getConfig().delivery.resendReplyTo || '',
+  });
 
   return buildCimRequestStorageUpdate(request, {
     status,
@@ -2411,6 +2548,7 @@ function buildCimFollowUpUpdate(request, emailResult, followUpNumber, sentAt) {
     next_follow_up_at: nextFollowUpAt,
     metadata: {
       providerMessageIds,
+      replyToAddress: existingMetadata.replyToAddress || replyToAddress,
       followUps: [
         ...existingFollowUps,
         {
@@ -2452,10 +2590,17 @@ async function processCimFollowUpRequest(storage, request, nowIso) {
     const followUpCount = Number(request.follow_up_count || 0);
 
     if (followUpCount >= settings.maxCount) {
-      const updatedRequest = await storage.upsertDealHunterCimRequest(
+      const updatedRequest = await upsertCimRequestWithActivity(
+        storage,
         buildCimRequestStorageUpdate(request, {
           next_follow_up_at: null,
         }),
+        {
+          eventType: 'cim.follow-ups-completed',
+          summary: 'CIM follow-up sequence completed without a response.',
+          actor: request.requested_by || 'deal-hunter',
+          metadata: { followUpCount },
+        },
       );
       return { status: 'maxed', request: updatedRequest };
     }
@@ -2484,8 +2629,21 @@ async function processCimFollowUpRequest(storage, request, nowIso) {
       followUpNumber,
       requestedBy: claimedRequest.requested_by || '',
     });
-    const updatedRequest = await storage.upsertDealHunterCimRequest(
+    const updatedRequest = await upsertCimRequestWithActivity(
+      storage,
       buildCimFollowUpUpdate(claimedRequest, emailResult, followUpNumber, nowIso),
+      {
+        eventType: emailResult.status === 'failed' ? 'cim.follow-up-failed' : 'cim.follow-up-sent',
+        summary: emailResult.status === 'failed'
+          ? `CIM follow-up ${followUpNumber} delivery failed.`
+          : `CIM follow-up ${followUpNumber} sent.`,
+        actor: claimedRequest.requested_by || 'deal-hunter',
+        metadata: {
+          followUpNumber,
+          deliveryStatus: emailResult.status,
+          providerMessageId: emailResult.providerMessageId || '',
+        },
+      },
     );
 
     return {
@@ -2706,8 +2864,10 @@ async function sendCimRequestForScoredDeal({ deal, requestedBy = '', storage = g
       to: recipientEmail,
       deal,
       requestedBy,
+      cimRequestId: pendingRequest?.id || pendingRecord.id,
     });
-    const savedRequest = await storage.upsertDealHunterCimRequest(
+    const savedRequest = await upsertCimRequestWithActivity(
+      storage,
       buildCimRequestRecord({
         deal,
         recipientEmail,
@@ -2715,6 +2875,16 @@ async function sendCimRequestForScoredDeal({ deal, requestedBy = '', storage = g
         emailResult,
         existingRequest: pendingRequest,
       }),
+      {
+        eventType: emailResult.status === 'failed' ? 'cim.request-failed' : 'cim.request-sent',
+        summary: emailResult.status === 'failed' ? 'CIM request delivery failed.' : 'CIM and NDA request sent to the broker.',
+        actor: requestedBy,
+        metadata: {
+          recipientEmail,
+          deliveryStatus: emailResult.status,
+          providerMessageId: emailResult.providerMessageId || '',
+        },
+      },
     );
     const publicUpdatedDeal = publicDeal(attachCimRequestStatus([deal], [savedRequest])[0]);
 
@@ -3031,7 +3201,12 @@ export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit =
   };
 }
 
-export async function runDealHunterCimFollowUps({ storage = getStorage(), limit = 50, now = new Date() } = {}) {
+export async function runDealHunterCimFollowUps({
+  storage = getStorage(),
+  limit = 50,
+  now = new Date(),
+  settings = getCimFollowUpSettings(),
+} = {}) {
   if (!storage.listDealHunterCimRequests || !storage.upsertDealHunterCimRequest) {
     return {
       ok: false,
@@ -3039,8 +3214,6 @@ export async function runDealHunterCimFollowUps({ storage = getStorage(), limit 
       error: 'CIM request tracking storage is not configured.',
     };
   }
-
-  const settings = getCimFollowUpSettings();
 
   if (!settings.enabled) {
     return {
@@ -3057,6 +3230,26 @@ export async function runDealHunterCimFollowUps({ storage = getStorage(), limit 
     };
   }
 
+  if (getConfig().isProduction) {
+    const emailReadiness = await getEmailReadiness({ storage });
+
+    if (!emailReadiness.followUpsSafe) {
+      return {
+        ok: false,
+        status: 409,
+        error: 'CIM follow-ups are blocked until signed delivery webhooks and an end-to-end inbound reply test are verified.',
+        reviewed: 0,
+        sent: 0,
+        responded: 0,
+        stopped: 0,
+        failed: 0,
+        skipped: 0,
+        results: [],
+        emailReadiness,
+      };
+    }
+  }
+
   if (settings.maxCount <= 0) {
     return {
       ok: true,
@@ -3068,6 +3261,22 @@ export async function runDealHunterCimFollowUps({ storage = getStorage(), limit 
       failed: 0,
       skipped: 0,
       message: 'CIM follow-ups are disabled because max follow-up count is 0.',
+      results: [],
+    };
+  }
+
+  if (!isCimFollowUpSendDay({ now, settings })) {
+    return {
+      ok: true,
+      status: 200,
+      reviewed: 0,
+      sent: 0,
+      responded: 0,
+      stopped: 0,
+      failed: 0,
+      skipped: 0,
+      deferred: true,
+      message: `CIM follow-ups are deferred until the next weekday in ${settings.timezone || 'America/Los_Angeles'}.`,
       results: [],
     };
   }

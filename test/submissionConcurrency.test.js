@@ -107,3 +107,69 @@ test('Supabase compare-and-set predicates the write on id and updated_at', async
   assert.equal(result.notes, 'updated');
   assert.deepEqual(predicates, [['id', 'supabase-cas'], ['updated_at', expected]]);
 });
+
+test('SQLite strict submission lookup distinguishes confirmed absence from query failure', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-strict-submission-'));
+  const storage = createSqliteStorage({
+    storage: { sqlitePath: path.join(tempDir, 'crm.sqlite') },
+    protection: { rateLimitRetentionMs: 0 },
+  });
+  const record = submission('strict-sqlite', '2026-07-12T11:00:00.000Z');
+
+  try {
+    await storage.insertSubmission(record);
+    assert.equal((await storage.getSubmissionStrict(record.id)).id, record.id);
+    assert.equal(await storage.getSubmissionStrict('confirmed-missing'), null);
+
+    storage.close();
+    await assert.rejects(
+      () => storage.getSubmissionStrict(record.id),
+      /database.*(?:open|closed)|connection.*(?:open|closed)/i,
+    );
+  } finally {
+    try {
+      storage.close();
+    } catch {
+      // The failure assertion intentionally closes the database first.
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('Supabase strict submission lookup returns null only for a confirmed empty result', async () => {
+  const expected = submission('strict-supabase', '2026-07-12T11:00:00.000Z');
+  const results = [
+    { data: expected, error: null },
+    { data: null, error: null },
+    { data: null, error: new Error('simulated Supabase transport failure') },
+  ];
+  const predicates = [];
+  const query = {
+    select() {
+      return this;
+    },
+    eq(field, value) {
+      predicates.push([field, value]);
+      return this;
+    },
+    async maybeSingle() {
+      return results.shift();
+    },
+  };
+  const storage = createSupabaseStorage(
+    { storage: { supabaseUrl: '', supabaseServiceRoleKey: '' } },
+    { client: { from: () => query } },
+  );
+
+  assert.equal((await storage.getSubmissionStrict(expected.id)).id, expected.id);
+  assert.equal(await storage.getSubmissionStrict('confirmed-missing'), null);
+  await assert.rejects(
+    () => storage.getSubmissionStrict('lookup-error'),
+    /simulated Supabase transport failure/,
+  );
+  assert.deepEqual(predicates, [
+    ['id', expected.id],
+    ['id', 'confirmed-missing'],
+    ['id', 'lookup-error'],
+  ]);
+});

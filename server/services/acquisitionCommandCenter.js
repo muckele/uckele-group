@@ -1,11 +1,13 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { summarizeEmailEngagement } from './emailEvents.js';
 import { reviewDailyDeals } from './dealHunter.js';
 import { normalizeDiligenceReview } from './submissions.js';
 import { buildFollowUpPrompt } from './workflow.js';
+import { commitCrmActivityMutation } from './activity.js';
 
 export const acquisitionPipelineStages = [
   'new-fit',
@@ -255,12 +257,6 @@ function hasAcquisitionDealFields(submission = {}) {
 
 function isAcquisitionCandidate(submission = {}) {
   if (['archived', 'spam'].includes(submission.status) && getDealScore(submission) < 75) {
-    return false;
-  }
-
-  const source = normalizeText(submission.source, 120).toLowerCase();
-
-  if (source.startsWith('prospect-discovery') && !getDealKey(submission)) {
     return false;
   }
 
@@ -1009,6 +1005,16 @@ export async function getSourceHealth(storage = getStorage(), { persistSnapshot 
 
     if (persistSnapshot) {
       await writeSourceSnapshot(config, buildNextSourceSnapshot(sourceHealth, previousSnapshot));
+      if (storage.insertSourceHealthSnapshot) {
+        await storage.insertSourceHealthSnapshot({
+          id: randomUUID(),
+          created_at: sourceHealth.generatedAt || new Date().toISOString(),
+          healthy: Boolean(sourceHealth.healthy),
+          source_count: sourceHealth.sources?.length || 0,
+          issue_count: sourceHealth.issues?.length || 0,
+          snapshot: sourceHealth,
+        });
+      }
     }
 
     return sourceHealth;
@@ -1161,12 +1167,34 @@ export async function updateAcquisitionCommandCenterRecord({
         : {}),
     },
   };
-  const updated = await storage.updateSubmission(existing.id, updates);
+  const mutation = await commitCrmActivityMutation({
+    storage,
+    operation: 'update_submission',
+    payload: { id: existing.id, values: updates },
+    activity: {
+      submissionId: existing.id,
+      eventType: 'diligence.command-center-updated',
+      summary: normalizedPassReason
+        ? `Deal passed: ${normalizedPassReason}.`
+        : `Operations pipeline updated${nextStage ? ` to ${nextStage}` : ''}.`,
+      actor: acquisitionCommand.updatedBy,
+      role: 'admin',
+      metadata: {
+        pipelineStage: nextStage,
+        passReason: normalizedPassReason,
+        fitFeedback: nextFeedback,
+      },
+    },
+  });
+
+  if (!mutation.applied || !mutation.record) {
+    return { ok: false, status: 409, error: 'The CRM record changed before the command center update could be saved.' };
+  }
 
   return {
     ok: true,
     status: 200,
-    submission: updated,
+    submission: mutation.record,
     acquisitionCommand,
   };
 }

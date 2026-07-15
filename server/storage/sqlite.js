@@ -31,6 +31,8 @@ function normalizeUploadRequestRow(row) {
     ? {
         ...row,
         nda_required: Boolean(row.nda_required),
+        requested_documents: parseJsonColumn(row.requested_documents, []),
+        upload_batch_count: Number(row.upload_batch_count || 0),
       }
     : null;
 }
@@ -42,6 +44,142 @@ function normalizeEmailEventRow(row) {
         metadata: parseJsonColumn(row.metadata, {}),
       }
     : null;
+}
+
+function normalizeCrmActivityEventRow(row) {
+  return row
+    ? {
+        ...row,
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
+function normalizeSecureDocumentCleanupJobRow(row) {
+  return row
+    ? {
+        ...row,
+        files: parseJsonColumn(row.files, []),
+        metadata: parseJsonColumn(row.metadata, {}),
+        attempt_count: Number(row.attempt_count || 0),
+        lease_claimed_at: row.lease_claimed_at || null,
+        lease_expires_at: row.lease_expires_at || null,
+        lease_token: row.lease_token || null,
+      }
+    : null;
+}
+
+const cleanupLeaseTokenPattern = /^[A-Za-z0-9_-]{16,200}$/;
+const canonicalUtcIsoPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const maxCleanupJobLeaseMs = 24 * 60 * 60 * 1000;
+const cleanupJobUpdateFields = new Set([
+  'updated_at',
+  'completed_at',
+  'status',
+  'trash_directory',
+  'files',
+  'attempt_count',
+  'last_error',
+  'metadata',
+  'lease_claimed_at',
+  'lease_expires_at',
+  'lease_token',
+]);
+
+function normalizeCleanupLeaseToken(value) {
+  if (typeof value !== 'string' || value.trim() !== value || !cleanupLeaseTokenPattern.test(value)) {
+    throw new Error('Cleanup-job lease token must be a 16-200 character URL-safe opaque value.');
+  }
+  return value;
+}
+
+function normalizeCleanupLeaseDuration(value) {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maxCleanupJobLeaseMs) {
+    throw new Error('Cleanup-job lease duration must be an integer between 1 millisecond and 24 hours.');
+  }
+  return value;
+}
+
+function normalizeCanonicalUtcIso(value, fieldName) {
+  if (
+    typeof value !== 'string' ||
+    !canonicalUtcIsoPattern.test(value) ||
+    !Number.isFinite(Date.parse(value)) ||
+    new Date(value).toISOString() !== value
+  ) {
+    throw new Error(`${fieldName} must be a canonical UTC ISO timestamp.`);
+  }
+  return value;
+}
+
+function normalizeSecureDocumentCleanupLease({ claimedAt, leaseExpiresAt, leaseToken } = {}) {
+  const normalizedClaimedAt = normalizeCanonicalUtcIso(claimedAt, 'Cleanup-job lease claim time');
+  const normalizedLeaseExpiresAt = normalizeCanonicalUtcIso(leaseExpiresAt, 'Cleanup-job lease expiry');
+  const claimedAtMs = Date.parse(normalizedClaimedAt);
+  const leaseExpiresAtMs = Date.parse(normalizedLeaseExpiresAt);
+
+  if (leaseExpiresAtMs <= claimedAtMs) {
+    throw new Error('Cleanup-job lease expiry must be later than its claim time.');
+  }
+
+  const durationMs = leaseExpiresAtMs - claimedAtMs;
+  normalizeCleanupLeaseDuration(durationMs);
+
+  return {
+    claimedAt: normalizedClaimedAt,
+    leaseExpiresAt: normalizedLeaseExpiresAt,
+    leaseToken: normalizeCleanupLeaseToken(leaseToken),
+    durationMs,
+  };
+}
+
+function normalizeSecureDocumentCleanupJobUpdate(values = {}) {
+  if (!values || typeof values !== 'object' || Array.isArray(values)) {
+    throw new Error('Cleanup-job lease update values must be an object.');
+  }
+
+  const entries = Object.entries(values);
+  if (entries.length === 0) {
+    throw new Error('Cleanup-job lease update must include at least one field.');
+  }
+
+  for (const [field, value] of entries) {
+    if (!cleanupJobUpdateFields.has(field)) {
+      throw new Error(`Unsupported cleanup-job lease update field: ${field}`);
+    }
+
+    if (['updated_at', 'completed_at', 'lease_claimed_at', 'lease_expires_at'].includes(field) && value !== null) {
+      normalizeCanonicalUtcIso(value, `Cleanup-job ${field}`);
+    }
+  }
+
+  if (Object.hasOwn(values, 'lease_token') && values.lease_token !== null) {
+    throw new Error('A cleanup-job lease update may only clear its lease token.');
+  }
+
+  const normalized = { ...values };
+  if (Object.hasOwn(normalized, 'lease_token')) {
+    normalized.lease_token = null;
+    normalized.lease_claimed_at = null;
+    normalized.lease_expires_at = null;
+  }
+  if (Object.hasOwn(normalized, 'files')) {
+    if (!Array.isArray(normalized.files)) throw new Error('Cleanup-job files must be an array.');
+    normalized.files = JSON.stringify(normalized.files);
+  }
+  if (Object.hasOwn(normalized, 'metadata')) {
+    if (!normalized.metadata || typeof normalized.metadata !== 'object' || Array.isArray(normalized.metadata)) {
+      throw new Error('Cleanup-job metadata must be an object.');
+    }
+    normalized.metadata = JSON.stringify(normalized.metadata);
+  }
+  if (Object.hasOwn(normalized, 'attempt_count')) {
+    if (!Number.isSafeInteger(normalized.attempt_count) || normalized.attempt_count < 0) {
+      throw new Error('Cleanup-job attempt count must be a non-negative integer.');
+    }
+  }
+
+  return normalized;
 }
 
 function normalizeDealHunterSeenDealRow(row) {
@@ -73,30 +211,6 @@ function normalizeDealHunterCrmImportRow(row) {
     : null;
 }
 
-function normalizeProspectDiscoveryRunRow(row) {
-  return row
-    ? {
-        ...row,
-        source_data: parseJsonColumn(row.source_data, {}),
-      }
-    : null;
-}
-
-function normalizeProspectDiscoveryRow(row) {
-  return row
-    ? {
-        ...row,
-        rating: row.rating === null || row.rating === undefined ? null : Number(row.rating),
-        review_count: Number(row.review_count || 0),
-        score: Number(row.score || 0),
-        business_quality_score: Number(row.business_quality_score || 0),
-        presence_gap_score: Number(row.presence_gap_score || 0),
-        reasons: parseJsonColumn(row.reasons, []),
-        source_data: parseJsonColumn(row.source_data, {}),
-      }
-    : null;
-}
-
 function ensureColumn(database, tableName, columnName, definition) {
   const columns = database.prepare(`PRAGMA table_info(${tableName})`).all();
   const hasColumn = columns.some((column) => column.name === columnName);
@@ -119,16 +233,27 @@ function serializeUploadRequest(request) {
   return {
     ...request,
     nda_required: request.nda_required ? 1 : 0,
+    requested_documents: JSON.stringify(request.requested_documents || []),
   };
 }
 
 function serializeUploadRequestValues(values) {
   return Object.fromEntries(
-    Object.entries(values || {}).map(([key, value]) => [key, key === 'nda_required' ? (value ? 1 : 0) : value]),
+    Object.entries(values || {}).map(([key, value]) => [
+      key,
+      key === 'nda_required' ? (value ? 1 : 0) : key === 'requested_documents' ? JSON.stringify(value || []) : value,
+    ]),
   );
 }
 
 function serializeEmailEvent(event) {
+  return {
+    ...event,
+    metadata: JSON.stringify(event.metadata || {}),
+  };
+}
+
+function serializeCrmActivityEvent(event) {
   return {
     ...event,
     metadata: JSON.stringify(event.metadata || {}),
@@ -159,26 +284,6 @@ function serializeDealHunterCrmImport(record) {
   return {
     ...record,
     metadata: JSON.stringify(record.metadata || {}),
-  };
-}
-
-function serializeProspectDiscoveryRun(run) {
-  return {
-    ...run,
-    source_data: JSON.stringify(run.source_data || {}),
-  };
-}
-
-function serializeProspectDiscovery(discovery) {
-  return {
-    ...discovery,
-    lead_tier: discovery.lead_tier || 'unclassified',
-    business_quality_score: Number(discovery.business_quality_score || 0),
-    presence_gap_score: Number(discovery.presence_gap_score || 0),
-    recommended_action: discovery.recommended_action || '',
-    outreach_angle: discovery.outreach_angle || '',
-    reasons: JSON.stringify(discovery.reasons || []),
-    source_data: JSON.stringify(discovery.source_data || {}),
   };
 }
 
@@ -266,6 +371,29 @@ function canonicalListingIdentity(value = '') {
   }
 }
 
+function migrateLegacyAdminMagicLinksTable(database) {
+  const existingTable = database
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'admin_magic_links'")
+    .get();
+
+  if (!existingTable) return;
+
+  const columns = database.prepare('PRAGMA table_info(admin_magic_links)').all().map((column) => column.name);
+  if (columns.includes('token_hash')) return;
+
+  let version = 1;
+  let legacyTableName = `admin_magic_links_legacy_v${version}`;
+  while (database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(legacyTableName)) {
+    version += 1;
+    legacyTableName = `admin_magic_links_legacy_v${version}`;
+  }
+
+  database.transaction(() => {
+    database.exec('DROP INDEX IF EXISTS idx_admin_magic_links_expires_at');
+    database.exec(`ALTER TABLE admin_magic_links RENAME TO ${legacyTableName}`);
+  })();
+}
+
 function placeholders(count) {
   return Array.from({ length: count }, () => '?').join(', ');
 }
@@ -276,6 +404,7 @@ export function createSqliteStorage(config) {
 
   const database = new Database(config.storage.sqlitePath);
   database.pragma('journal_mode = WAL');
+  migrateLegacyAdminMagicLinksTable(database);
 
   database.exec(`
     CREATE TABLE IF NOT EXISTS contact_submissions (
@@ -338,7 +467,11 @@ export function createSqliteStorage(config) {
       nda_required INTEGER NOT NULL DEFAULT 1,
       nda_accepted_at TEXT,
       last_uploaded_at TEXT,
-      note TEXT
+      note TEXT,
+      requested_documents TEXT NOT NULL DEFAULT '[]',
+      revoked_at TEXT,
+      closed_at TEXT,
+      upload_batch_count INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS secure_documents (
@@ -372,46 +505,15 @@ export function createSqliteStorage(config) {
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
-    CREATE TABLE IF NOT EXISTS prospect_discovery_runs (
+    CREATE TABLE IF NOT EXISTS crm_activity_events (
       id TEXT PRIMARY KEY,
+      submission_id TEXT NOT NULL,
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      status TEXT NOT NULL,
-      provider TEXT NOT NULL,
-      query TEXT NOT NULL,
-      requested_by TEXT,
-      max_results INTEGER NOT NULL DEFAULT 0,
-      imported_count INTEGER NOT NULL DEFAULT 0,
-      skipped_count INTEGER NOT NULL DEFAULT 0,
-      error TEXT,
-      source_data TEXT NOT NULL DEFAULT '{}'
-    );
-
-    CREATE TABLE IF NOT EXISTS prospect_discoveries (
-      id TEXT PRIMARY KEY,
-      run_id TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      provider TEXT NOT NULL,
-      source_id TEXT,
-      business_name TEXT NOT NULL,
-      website_url TEXT,
-      phone TEXT,
-      address TEXT,
-      category TEXT,
-      rating REAL,
-      review_count INTEGER NOT NULL DEFAULT 0,
-      search_query TEXT,
-      status TEXT NOT NULL,
-      lead_tier TEXT NOT NULL DEFAULT 'unclassified',
-      business_quality_score INTEGER NOT NULL DEFAULT 0,
-      presence_gap_score INTEGER NOT NULL DEFAULT 0,
-      recommended_action TEXT,
-      outreach_angle TEXT,
-      score INTEGER NOT NULL DEFAULT 0,
-      reasons TEXT NOT NULL DEFAULT '[]',
-      submission_id TEXT,
-      source_data TEXT NOT NULL DEFAULT '{}'
+      actor TEXT NOT NULL,
+      role TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      metadata TEXT NOT NULL DEFAULT '{}'
     );
 
     CREATE TABLE IF NOT EXISTS deal_hunter_seen_deals (
@@ -507,6 +609,43 @@ export function createSqliteStorage(config) {
       files TEXT NOT NULL DEFAULT '[]',
       attempt_count INTEGER NOT NULL DEFAULT 0,
       last_error TEXT,
+      metadata TEXT NOT NULL DEFAULT '{}',
+      lease_claimed_at TEXT,
+      lease_expires_at TEXT,
+      lease_token TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS source_health_snapshots (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      healthy INTEGER NOT NULL DEFAULT 0,
+      source_count INTEGER NOT NULL DEFAULT 0,
+      issue_count INTEGER NOT NULL DEFAULT 0,
+      snapshot TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_magic_links (
+      token_hash TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      consumed_at TEXT,
+      email TEXT NOT NULL,
+      role TEXT NOT NULL,
+      requested_ip_hash TEXT,
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_sessions (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      revoked_at TEXT,
+      username TEXT NOT NULL,
+      principal_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      created_ip_hash TEXT,
+      user_agent TEXT,
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
@@ -522,10 +661,8 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_email_events_recipient_email ON email_events(recipient_email, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_email_events_message_id ON email_events(message_id);
     CREATE INDEX IF NOT EXISTS idx_email_events_event_type ON email_events(event_type, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_prospect_discovery_runs_created_at ON prospect_discovery_runs(created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_prospect_discoveries_run_id ON prospect_discoveries(run_id, created_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_prospect_discoveries_status ON prospect_discoveries(status, created_at DESC);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_prospect_discoveries_source ON prospect_discoveries(provider, source_id) WHERE source_id IS NOT NULL AND source_id <> '';
+    CREATE INDEX IF NOT EXISTS idx_crm_activity_submission_created ON crm_activity_events(submission_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_crm_activity_type_created ON crm_activity_events(event_type, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_last_seen_at ON deal_hunter_seen_deals(last_seen_at DESC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_source_id ON deal_hunter_seen_deals(source_id, last_seen_at DESC);
 	    CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_deal_recipient ON deal_hunter_cim_requests(deal_key, recipient_email);
@@ -536,6 +673,10 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_scheduled_job_runs_name_updated_at ON scheduled_job_runs(job_name, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_admin_audit_events_created_at ON admin_audit_events(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_secure_document_cleanup_jobs_status ON secure_document_cleanup_jobs(status, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_source_health_snapshots_created_at ON source_health_snapshots(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_admin_magic_links_expires_at ON admin_magic_links(expires_at);
+    CREATE INDEX IF NOT EXISTS idx_admin_sessions_username ON admin_sessions(username, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at);
 	  `);
 
   ensureColumn(database, 'contact_submissions', 'lead_type', "TEXT NOT NULL DEFAULT 'owner'");
@@ -546,6 +687,14 @@ export function createSqliteStorage(config) {
   ensureColumn(database, 'contact_submissions', 'follow_up_state', "TEXT NOT NULL DEFAULT 'needs-response'");
   ensureColumn(database, 'contact_submissions', 'next_action_at', 'TEXT');
   ensureColumn(database, 'contact_submissions', 'last_contacted_at', 'TEXT');
+  ensureColumn(database, 'secure_upload_requests', 'requested_documents', "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn(database, 'secure_upload_requests', 'revoked_at', 'TEXT');
+  ensureColumn(database, 'secure_upload_requests', 'closed_at', 'TEXT');
+  ensureColumn(database, 'secure_upload_requests', 'upload_batch_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(database, 'secure_document_cleanup_jobs', 'lease_claimed_at', 'TEXT');
+  ensureColumn(database, 'secure_document_cleanup_jobs', 'lease_expires_at', 'TEXT');
+  ensureColumn(database, 'secure_document_cleanup_jobs', 'lease_token', 'TEXT');
+  database.exec('CREATE INDEX IF NOT EXISTS idx_secure_document_cleanup_jobs_lease ON secure_document_cleanup_jobs(status, lease_expires_at)');
   ensureColumn(database, 'contact_submissions', 'status_updated_at', 'TEXT');
   ensureColumn(database, 'contact_submissions', 'listing_url', 'TEXT');
   ensureColumn(database, 'contact_submissions', 'business_website', 'TEXT');
@@ -565,13 +714,19 @@ export function createSqliteStorage(config) {
   ensureColumn(database, 'contact_submissions', 'seller_phone', 'TEXT');
   ensureColumn(database, 'email_events', 'provider_event_id', 'TEXT');
   ensureColumn(database, 'email_events', 'event_key', 'TEXT');
-  ensureColumn(database, 'prospect_discoveries', 'lead_tier', "TEXT NOT NULL DEFAULT 'unclassified'");
-  ensureColumn(database, 'prospect_discoveries', 'business_quality_score', 'INTEGER NOT NULL DEFAULT 0');
-  ensureColumn(database, 'prospect_discoveries', 'presence_gap_score', 'INTEGER NOT NULL DEFAULT 0');
-  ensureColumn(database, 'prospect_discoveries', 'recommended_action', 'TEXT');
-  ensureColumn(database, 'prospect_discoveries', 'outreach_angle', 'TEXT');
   database.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_email_events_event_key ON email_events(event_key)');
-  database.exec('CREATE INDEX IF NOT EXISTS idx_prospect_discoveries_lead_tier ON prospect_discoveries(lead_tier, score DESC)');
+  ensureColumn(database, 'admin_sessions', 'principal_id', 'TEXT');
+  database.exec(`
+    UPDATE admin_sessions
+    SET principal_id = CASE
+      WHEN role = 'admin' THEN 'admin:primary'
+      ELSE 'viewer:identity:' || lower(trim(username))
+    END
+    WHERE principal_id IS NULL OR trim(principal_id) = '';
+
+    CREATE INDEX IF NOT EXISTS idx_admin_sessions_principal
+      ON admin_sessions(principal_id, created_at DESC);
+  `);
   ensureColumn(database, 'deal_hunter_cim_requests', 'follow_up_count', 'INTEGER NOT NULL DEFAULT 0');
 	  ensureColumn(database, 'deal_hunter_cim_requests', 'last_follow_up_at', 'TEXT');
 	  ensureColumn(database, 'deal_hunter_cim_requests', 'next_follow_up_at', 'TEXT');
@@ -693,7 +848,11 @@ export function createSqliteStorage(config) {
       nda_required,
       nda_accepted_at,
       last_uploaded_at,
-      note
+      note,
+      requested_documents,
+      revoked_at,
+      closed_at,
+      upload_batch_count
     ) VALUES (
       @id,
       @submission_id,
@@ -707,7 +866,11 @@ export function createSqliteStorage(config) {
       @nda_required,
       @nda_accepted_at,
       @last_uploaded_at,
-      @note
+      @note,
+      @requested_documents,
+      @revoked_at,
+      @closed_at,
+      @upload_batch_count
     )
   `);
 
@@ -745,7 +908,7 @@ export function createSqliteStorage(config) {
   const deleteSecureDocumentStatement = database.prepare('DELETE FROM secure_documents WHERE id = ?');
 
   const insertEmailEventStatement = database.prepare(`
-    INSERT OR IGNORE INTO email_events (
+    INSERT INTO email_events (
       id,
       created_at,
       provider,
@@ -772,90 +935,14 @@ export function createSqliteStorage(config) {
       @source,
       @metadata
     )
+    ON CONFLICT(event_key) DO NOTHING
   `);
   const getEmailEventByKeyStatement = database.prepare('SELECT * FROM email_events WHERE event_key = ? LIMIT 1');
-
-  const insertProspectDiscoveryRunStatement = database.prepare(`
-    INSERT INTO prospect_discovery_runs (
-      id,
-      created_at,
-      updated_at,
-      status,
-      provider,
-      query,
-      requested_by,
-      max_results,
-      imported_count,
-      skipped_count,
-      error,
-      source_data
+  const insertCrmActivityEventStatement = database.prepare(`
+    INSERT INTO crm_activity_events (
+      id, submission_id, created_at, actor, role, event_type, summary, metadata
     ) VALUES (
-      @id,
-      @created_at,
-      @updated_at,
-      @status,
-      @provider,
-      @query,
-      @requested_by,
-      @max_results,
-      @imported_count,
-      @skipped_count,
-      @error,
-      @source_data
-    )
-  `);
-
-  const insertProspectDiscoveryStatement = database.prepare(`
-    INSERT OR IGNORE INTO prospect_discoveries (
-      id,
-      run_id,
-      created_at,
-      updated_at,
-      provider,
-      source_id,
-      business_name,
-      website_url,
-      phone,
-      address,
-      category,
-      rating,
-      review_count,
-      search_query,
-      status,
-      lead_tier,
-      business_quality_score,
-      presence_gap_score,
-      recommended_action,
-      outreach_angle,
-      score,
-      reasons,
-      submission_id,
-      source_data
-    ) VALUES (
-      @id,
-      @run_id,
-      @created_at,
-      @updated_at,
-      @provider,
-      @source_id,
-      @business_name,
-      @website_url,
-      @phone,
-      @address,
-      @category,
-      @rating,
-      @review_count,
-      @search_query,
-      @status,
-      @lead_tier,
-      @business_quality_score,
-      @presence_gap_score,
-      @recommended_action,
-      @outreach_angle,
-      @score,
-      @reasons,
-      @submission_id,
-      @source_data
+      @id, @submission_id, @created_at, @actor, @role, @event_type, @summary, @metadata
     )
   `);
 
@@ -1175,10 +1262,165 @@ export function createSqliteStorage(config) {
     return database.prepare(`UPDATE ${tableName} SET ${fields} WHERE id = @id${versionPredicate}`).run(payload);
   }
 
+  function insertCrmActivityEvent(event) {
+    insertCrmActivityEventStatement.run(serializeCrmActivityEvent(event));
+    return normalizeCrmActivityEventRow(serializeCrmActivityEvent(event));
+  }
+
+  const mutateWithCrmActivityTransaction = database.transaction(({ operation, payload, activity }) => {
+    let record = null;
+
+    if (operation === 'insert_submission') {
+      insertSubmissionStatement.run(serializeSubmission(payload.submission));
+      record = payload.submission;
+    } else if (operation === 'update_submission') {
+      const result = updateRecord(
+        'contact_submissions',
+        payload.id,
+        payload.values || {},
+        submissionUpdateFields,
+        submissionJsonFields,
+        payload.expectedUpdatedAt || '',
+      );
+
+      if (result.changes === 0) {
+        const current = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(payload.id);
+        return { applied: false, record: current ? normalizeSubmissionRow(current) : null, activity: null };
+      }
+
+      record = normalizeSubmissionRow(database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(payload.id));
+    } else if (operation === 'insert_secure_upload_request') {
+      insertSecureUploadRequestStatement.run(serializeUploadRequest(payload.request));
+      record = payload.request;
+    } else if (operation === 'finalize_secure_document_upload') {
+      const values = serializeUploadRequestValues(payload.values || {});
+      const allowedFields = [
+        'updated_at',
+        'status',
+        'nda_accepted_at',
+        'last_uploaded_at',
+        'closed_at',
+        'upload_batch_count',
+      ];
+      const updates = Object.entries(values).filter(([key]) => allowedFields.includes(key));
+
+      if (updates.length === 0) {
+        throw new Error('Secure upload finalization did not include request updates.');
+      }
+
+      const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
+      const parameters = Object.fromEntries(updates);
+      parameters.id = payload.requestId;
+      const result = database
+        .prepare(`UPDATE secure_upload_requests SET ${fields} WHERE id = @id AND status = 'uploading'`)
+        .run(parameters);
+
+      if (result.changes === 0) {
+        const current = database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(payload.requestId);
+        return { applied: false, record: normalizeUploadRequestRow(current), activity: null };
+      }
+
+      for (const document of payload.documents || []) {
+        insertSecureDocumentStatement.run(document);
+      }
+
+      record = normalizeUploadRequestRow(
+        database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(payload.requestId),
+      );
+    } else if (operation === 'update_secure_upload_request') {
+      const values = serializeUploadRequestValues(payload.values || {});
+      const allowedFields = [
+        'updated_at',
+        'status',
+        'expires_at',
+        'nda_required',
+        'nda_accepted_at',
+        'last_uploaded_at',
+        'note',
+        'requested_documents',
+        'revoked_at',
+        'closed_at',
+        'upload_batch_count',
+      ];
+      const updates = Object.entries(values).filter(([key]) => allowedFields.includes(key));
+
+      if (updates.length === 0) {
+        throw new Error('Secure upload request mutation did not include updates.');
+      }
+
+      const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
+      const parameters = Object.fromEntries(updates);
+      parameters.id = payload.id;
+      const expectedStatuses = normalizeList(payload.expectedStatuses, 10);
+      const statusPredicate = expectedStatuses.length > 0
+        ? ` AND status IN (${expectedStatuses.map((_, index) => `@expected_status_${index}`).join(', ')})`
+        : '';
+      expectedStatuses.forEach((status, index) => {
+        parameters[`expected_status_${index}`] = status;
+      });
+      const result = database
+        .prepare(`UPDATE secure_upload_requests SET ${fields} WHERE id = @id${statusPredicate}`)
+        .run(parameters);
+
+      if (result.changes === 0) {
+        const current = database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(payload.id);
+        return { applied: false, record: normalizeUploadRequestRow(current), activity: null };
+      }
+
+      record = normalizeUploadRequestRow(database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(payload.id));
+    } else if (operation === 'delete_secure_document') {
+      const existing = database.prepare('SELECT * FROM secure_documents WHERE id = ?').get(payload.id);
+
+      if (!existing) {
+        return { applied: false, record: null, activity: null };
+      }
+
+      deleteSecureDocumentStatement.run(payload.id);
+      record = existing;
+    } else if (operation === 'insert_email_event') {
+      const result = insertEmailEventStatement.run(serializeEmailEvent(payload.event));
+
+      if (result.changes === 0) {
+        const existing = payload.event.event_key ? getEmailEventByKeyStatement.get(payload.event.event_key) : null;
+        return { applied: false, record: normalizeEmailEventRow(existing), activity: null };
+      }
+
+      record = payload.event;
+    } else if (operation === 'upsert_deal_hunter_cim_request') {
+      const request = serializeDealHunterCimRequest(payload.request);
+      upsertDealHunterCimRequestStatement.run(request);
+      record = normalizeDealHunterCimRequestRow(
+        database
+          .prepare('SELECT * FROM deal_hunter_cim_requests WHERE deal_key = ? AND LOWER(recipient_email) = ? LIMIT 1')
+          .get(request.deal_key, request.recipient_email),
+      );
+    } else {
+      throw new Error(`Unsupported atomic CRM activity operation: ${operation || 'unknown'}.`);
+    }
+
+    const storedActivity = insertCrmActivityEvent(activity);
+    return { applied: true, record, activity: storedActivity };
+  });
+
   return {
+    provider: 'sqlite',
+
+    async createApplicationBackup(destination) {
+      await database.backup(destination);
+      return destination;
+    },
+
+    close() {
+      database.close();
+    },
+
     async checkHealth() {
       database.prepare('SELECT 1 AS ok').get();
       return { ok: true };
+    },
+
+    async mutateWithCrmActivity(mutation) {
+      return mutateWithCrmActivityTransaction(mutation);
     },
 
     async insertSubmission(submission) {
@@ -1216,6 +1458,11 @@ export function createSqliteStorage(config) {
       return row ? normalizeSubmissionRow(row) : null;
     },
 
+    async getSubmissionStrict(id) {
+      const row = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(id);
+      return row ? normalizeSubmissionRow(row) : null;
+    },
+
     async deleteSubmission(id) {
       const existing = await this.getSubmission(id);
 
@@ -1227,9 +1474,7 @@ export function createSqliteStorage(config) {
         database.prepare('DELETE FROM secure_documents WHERE submission_id = ?').run(submissionId);
         database.prepare('DELETE FROM secure_upload_requests WHERE submission_id = ?').run(submissionId);
         database.prepare('DELETE FROM email_events WHERE submission_id = ?').run(submissionId);
-        database
-          .prepare("UPDATE prospect_discoveries SET submission_id = NULL, status = 'crm-deleted', updated_at = ? WHERE submission_id = ?")
-          .run(new Date().toISOString(), submissionId);
+        database.prepare('DELETE FROM crm_activity_events WHERE submission_id = ?').run(submissionId);
         database
           .prepare("UPDATE deal_hunter_crm_imports SET submission_id = NULL, status = 'crm-deleted', updated_at = ? WHERE submission_id = ?")
           .run(new Date().toISOString(), submissionId);
@@ -1340,7 +1585,7 @@ export function createSqliteStorage(config) {
       return matchedRow ? normalizeSubmissionRow(matchedRow) : null;
     },
 
-    async listSubmissions({ limit = 50, page = 1, search = '', status = 'all' } = {}) {
+    async listSubmissions({ limit = 50, page = 1, search = '', status = 'all', createdAfter = '', sort = 'created_at', direction = 'desc' } = {}) {
       const clauses = [];
       const params = [];
 
@@ -1349,9 +1594,14 @@ export function createSqliteStorage(config) {
         params.push(status);
       }
 
+      if (createdAfter) {
+        clauses.push('created_at >= ?');
+        params.push(createdAfter);
+      }
+
       if (search) {
         clauses.push(`
-          LOWER(
+          INSTR(LOWER(
             COALESCE(name, '') || ' ' ||
             COALESCE(email, '') || ' ' ||
             COALESCE(company, '') || ' ' ||
@@ -1364,20 +1614,39 @@ export function createSqliteStorage(config) {
             COALESCE(broker_email, '') || ' ' ||
             COALESCE(seller_name, '') || ' ' ||
             COALESCE(seller_email, '')
-          ) LIKE ?
+          ), ?) > 0
         `);
-        params.push(`%${search.toLowerCase()}%`);
+        params.push(String(search).toLowerCase());
       }
 
       const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-      const safeLimit = Math.max(1, Math.min(limit, 5000));
-      const offset = Math.max(0, page - 1) * safeLimit;
+      const requestedLimit = Number(limit);
+      const requestedPage = Number(page);
+      const safeLimit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(Math.trunc(requestedLimit), 5000))
+        : 50;
+      const safePage = Number.isFinite(requestedPage)
+        ? Math.max(1, Math.min(Math.trunc(requestedPage), 1_000_000))
+        : 1;
+      const offset = (safePage - 1) * safeLimit;
+      const sortExpressions = {
+        created_at: 'created_at',
+        updated_at: 'updated_at',
+        company: "LOWER(COALESCE(company, name, ''))",
+        next_action_at: "CASE WHEN next_action_at IS NULL OR next_action_at = '' THEN 1 ELSE 0 END, next_action_at",
+        priority: "CASE priority WHEN 'urgent' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3 WHEN 'normal' THEN 2 WHEN 'low' THEN 1 ELSE 0 END",
+        deal_score: "CASE WHEN json_extract(metadata, '$.dealHunter.score') IS NULL THEN 1 ELSE 0 END ASC, CAST(json_extract(metadata, '$.dealHunter.score') AS REAL)",
+        listing_date: "CASE WHEN COALESCE(NULLIF(json_extract(metadata, '$.dealHunter.dateAdded'), ''), NULLIF(json_extract(metadata, '$.dealHunter.firstSeenAt'), '')) IS NULL THEN 1 ELSE 0 END ASC, COALESCE(NULLIF(json_extract(metadata, '$.dealHunter.dateAdded'), ''), NULLIF(json_extract(metadata, '$.dealHunter.firstSeenAt'), ''))",
+        status: 'status',
+      };
+      const sortExpression = sortExpressions[sort] || sortExpressions.created_at;
+      const sortDirection = String(direction).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
       const rows = database
         .prepare(
           `
             SELECT * FROM contact_submissions
             ${whereClause}
-            ORDER BY created_at DESC
+            ORDER BY ${sortExpression} ${sortDirection}, created_at DESC, id ASC
             LIMIT ?
             OFFSET ?
           `,
@@ -1454,15 +1723,34 @@ export function createSqliteStorage(config) {
         'secure_upload_requests',
         id,
         serializeUploadRequestValues(values),
-        ['updated_at', 'status', 'expires_at', 'nda_required', 'nda_accepted_at', 'last_uploaded_at', 'note'],
+        ['updated_at', 'status', 'expires_at', 'nda_required', 'nda_accepted_at', 'last_uploaded_at', 'note', 'requested_documents', 'revoked_at', 'closed_at', 'upload_batch_count'],
       );
 
       return this.getSecureUploadRequest(id);
     },
 
+    async resetSecureUploadRequestIfUploading(id, values) {
+      const updates = Object.entries(serializeUploadRequestValues(values)).filter(([key]) =>
+        ['updated_at', 'status'].includes(key),
+      );
+
+      if (updates.length === 0) {
+        return null;
+      }
+
+      const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
+      const payload = Object.fromEntries(updates);
+      payload.id = id;
+      const result = database
+        .prepare(`UPDATE secure_upload_requests SET ${fields} WHERE id = @id AND status = 'uploading'`)
+        .run(payload);
+
+      return result.changes > 0 ? this.getSecureUploadRequest(id) : null;
+    },
+
     async claimSecureUploadRequest(id, values, options = {}) {
       const updates = Object.entries(serializeUploadRequestValues(values)).filter(([key]) =>
-        ['updated_at', 'status', 'nda_accepted_at', 'last_uploaded_at', 'note'].includes(key),
+        ['updated_at', 'status', 'nda_accepted_at', 'last_uploaded_at', 'note', 'closed_at', 'upload_batch_count'].includes(key),
       );
 
       if (updates.length === 0) {
@@ -1483,7 +1771,7 @@ export function createSqliteStorage(config) {
             UPDATE secure_upload_requests SET ${fields}
             WHERE id = @id
               AND (
-                status = 'awaiting-documents'
+                status IN ('awaiting-documents', 'open', 'partially-received')
                 OR (status = 'uploading' AND @stale_before != '' AND updated_at <= @stale_before)
               )
           `,
@@ -1676,157 +1964,44 @@ export function createSqliteStorage(config) {
         .map(normalizeEmailEventRow);
     },
 
-    async insertProspectDiscoveryRun(run) {
-      insertProspectDiscoveryRunStatement.run(serializeProspectDiscoveryRun(run));
-      return run;
+    async insertCrmActivityEvent(event) {
+      return insertCrmActivityEvent(event);
     },
 
-    async updateProspectDiscoveryRun(id, values) {
-      updateRecord(
-        'prospect_discovery_runs',
-        id,
-        values,
-        ['updated_at', 'status', 'imported_count', 'skipped_count', 'error', 'source_data'],
-        ['source_data'],
-      );
-
-      const row = database.prepare('SELECT * FROM prospect_discovery_runs WHERE id = ?').get(id);
-      return normalizeProspectDiscoveryRunRow(row);
-    },
-
-    async listProspectDiscoveryRuns({ limit = 20 } = {}) {
-      const safeLimit = Math.max(1, Math.min(limit, 100));
-      return database
-        .prepare(
-          `
-            SELECT * FROM prospect_discovery_runs
-            ORDER BY created_at DESC
-            LIMIT ?
-          `,
-        )
-        .all(safeLimit)
-        .map(normalizeProspectDiscoveryRunRow);
-    },
-
-    async getProspectDiscoveryBySource(provider, sourceId) {
-      const normalizedProvider = String(provider || '').trim();
-      const normalizedSourceId = String(sourceId || '').trim();
-
-      if (!normalizedProvider || !normalizedSourceId) {
-        return null;
-      }
-
-      const row = database
-        .prepare(
-          `
-            SELECT * FROM prospect_discoveries
-            WHERE provider = ? AND source_id = ?
-            ORDER BY created_at DESC
-            LIMIT 1
-          `,
-        )
-        .get(normalizedProvider, normalizedSourceId);
-
-      return normalizeProspectDiscoveryRow(row);
-    },
-
-    async insertProspectDiscovery(discovery) {
-      const serialized = serializeProspectDiscovery(discovery);
-      const result = insertProspectDiscoveryStatement.run(serialized);
-
-      if (result.changes === 0 && discovery.source_id) {
-        return this.getProspectDiscoveryBySource(discovery.provider, discovery.source_id);
-      }
-
-      return discovery;
-    },
-
-    async updateProspectDiscovery(id, values) {
-      updateRecord(
-        'prospect_discoveries',
-        id,
-        values,
-        [
-          'updated_at',
-          'status',
-          'lead_tier',
-          'business_quality_score',
-          'presence_gap_score',
-          'recommended_action',
-          'outreach_angle',
-          'score',
-          'reasons',
-          'submission_id',
-          'source_data',
-        ],
-        ['reasons', 'source_data'],
-      );
-
-      const row = database.prepare('SELECT * FROM prospect_discoveries WHERE id = ?').get(id);
-      return normalizeProspectDiscoveryRow(row);
-    },
-
-    async listProspectDiscoveries({ runId = '', status = '', limit = 50 } = {}) {
+    async listCrmActivityEvents({ submissionId = '', eventTypes = [], limit = 200, before = '' } = {}) {
       const clauses = [];
       const params = [];
+      const safeTypes = normalizeList(eventTypes, 25);
 
-      if (runId) {
-        clauses.push('run_id = ?');
-        params.push(runId);
+      if (submissionId) {
+        clauses.push('submission_id = ?');
+        params.push(String(submissionId));
       }
 
-      if (status && status !== 'all') {
-        clauses.push('status = ?');
-        params.push(status);
+      if (safeTypes.length > 0) {
+        clauses.push(`event_type IN (${placeholders(safeTypes.length)})`);
+        params.push(...safeTypes);
+      }
+
+      if (before) {
+        clauses.push('created_at < ?');
+        params.push(String(before));
       }
 
       const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
-      const safeLimit = Math.max(1, Math.min(limit, 500));
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 200, 500));
       return database
-        .prepare(
-          `
-            SELECT * FROM prospect_discoveries
-            ${whereClause}
-            ORDER BY created_at DESC
-            LIMIT ?
-          `,
-        )
+        .prepare(`
+          SELECT * FROM crm_activity_events
+          ${whereClause}
+          ORDER BY created_at DESC, id DESC
+          LIMIT ?
+        `)
         .all(...params, safeLimit)
-        .map(normalizeProspectDiscoveryRow);
+        .map(normalizeCrmActivityEventRow);
     },
 
-    async getProspectDiscoverySummary() {
-      const rows = database
-        .prepare(
-          `
-            SELECT status, lead_tier, COUNT(*) AS count
-            FROM prospect_discoveries
-            GROUP BY status, lead_tier
-          `,
-        )
-        .all();
-      const summary = {
-        total: 0,
-        imported: 0,
-        discovered: 0,
-        duplicate: 0,
-        'import-error': 0,
-        'not-prioritized': 0,
-        byTier: { tier_a: 0, tier_b: 0, tier_c: 0, dnp: 0, unclassified: 0 },
-      };
 
-      for (const row of rows) {
-        const count = Number(row.count || 0);
-        const status = row.status || 'discovered';
-        const leadTier = row.lead_tier || 'unclassified';
-
-        summary.total += count;
-        summary[status] = (summary[status] || 0) + count;
-        summary.byTier[leadTier] = (summary.byTier[leadTier] || 0) + count;
-      }
-
-      return summary;
-    },
 
 	    async listDealHunterSeenDeals({ limit = 100000 } = {}) {
 	      const safeLimit = Math.max(1, Math.min(limit, 100000));
@@ -2113,6 +2288,26 @@ export function createSqliteStorage(config) {
       return run ? { ...run, metadata: parseJsonColumn(run.metadata, {}) } : null;
     },
 
+    async listScheduledJobs({ limit = 100 } = {}) {
+      return database
+        .prepare('SELECT * FROM scheduled_job_runs ORDER BY updated_at DESC LIMIT ?')
+        .all(Math.max(1, Math.min(Number(limit) || 100, 500)))
+        .map((run) => ({ ...run, metadata: parseJsonColumn(run.metadata, {}) }));
+    },
+
+    async getDatabaseStatus() {
+      const pageCount = Number(database.pragma('page_count', { simple: true }) || 0);
+      const pageSize = Number(database.pragma('page_size', { simple: true }) || 0);
+      return {
+        provider: 'sqlite',
+        integrity: String(database.pragma('quick_check', { simple: true }) || ''),
+        journalMode: String(database.pragma('journal_mode', { simple: true }) || ''),
+        pageCount,
+        pageSize,
+        databaseBytes: pageCount * pageSize,
+      };
+    },
+
     async insertAdminAuditEvent(event) {
       database
         .prepare(`
@@ -2142,13 +2337,105 @@ export function createSqliteStorage(config) {
       return rows.map((row) => ({ ...row, metadata: parseJsonColumn(row.metadata, {}) }));
     },
 
+    async insertSourceHealthSnapshot(snapshot) {
+      database.prepare(`
+        INSERT INTO source_health_snapshots (
+          id, created_at, healthy, source_count, issue_count, snapshot
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        snapshot.id,
+        snapshot.created_at,
+        snapshot.healthy ? 1 : 0,
+        Number(snapshot.source_count || 0),
+        Number(snapshot.issue_count || 0),
+        JSON.stringify(snapshot.snapshot || {}),
+      );
+      return snapshot;
+    },
+
+    async listSourceHealthSnapshots({ limit = 30 } = {}) {
+      return database
+        .prepare('SELECT * FROM source_health_snapshots ORDER BY created_at DESC LIMIT ?')
+        .all(Math.max(1, Math.min(Number(limit) || 30, 365)))
+        .map((row) => ({ ...row, healthy: Boolean(row.healthy), snapshot: parseJsonColumn(row.snapshot, {}) }));
+    },
+
+    async insertAdminMagicLink(record) {
+      database.prepare(`
+        INSERT INTO admin_magic_links (
+          token_hash, created_at, expires_at, consumed_at, email, role, requested_ip_hash, metadata
+        ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+      `).run(record.token_hash, record.created_at, record.expires_at, record.email, record.role, record.requested_ip_hash || null, JSON.stringify(record.metadata || {}));
+      return record;
+    },
+
+    async consumeAdminMagicLink(tokenHash, consumedAt) {
+      const transaction = database.transaction(() => {
+        const result = database.prepare(`
+          UPDATE admin_magic_links SET consumed_at = ?
+          WHERE token_hash = ? AND consumed_at IS NULL AND expires_at > ?
+        `).run(consumedAt, tokenHash, consumedAt);
+        if (result.changes === 0) return null;
+        return database.prepare('SELECT * FROM admin_magic_links WHERE token_hash = ?').get(tokenHash);
+      });
+      const row = transaction();
+      return row ? { ...row, metadata: parseJsonColumn(row.metadata, {}) } : null;
+    },
+
+    async insertAdminSession(session) {
+      database.prepare(`
+        INSERT INTO admin_sessions (
+          id, created_at, expires_at, last_seen_at, revoked_at, username, principal_id, role,
+          created_ip_hash, user_agent, metadata
+        ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+      `).run(
+        session.id, session.created_at, session.expires_at, session.last_seen_at,
+        session.username, session.principal_id, session.role, session.created_ip_hash || null, session.user_agent || null,
+        JSON.stringify(session.metadata || {}),
+      );
+      return session;
+    },
+
+    async getAdminSession(id) {
+      const row = database.prepare('SELECT * FROM admin_sessions WHERE id = ?').get(id);
+      return row ? { ...row, metadata: parseJsonColumn(row.metadata, {}) } : null;
+    },
+
+    async touchAdminSession(id, lastSeenAt) {
+      database.prepare(`
+        UPDATE admin_sessions SET last_seen_at = ?
+        WHERE id = ? AND revoked_at IS NULL AND expires_at > ?
+      `).run(lastSeenAt, id, lastSeenAt);
+    },
+
+    async revokeAdminSession(id, revokedAt) {
+      const result = database.prepare(`
+        UPDATE admin_sessions SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL
+      `).run(revokedAt, id);
+      return result.changes > 0;
+    },
+
+    async revokeAdminSessionsForPrincipal(principalId, revokedAt) {
+      const result = database.prepare(`
+        UPDATE admin_sessions SET revoked_at = ? WHERE principal_id = ? AND revoked_at IS NULL
+      `).run(revokedAt, principalId);
+      return result.changes;
+    },
+
+    async cleanupExpiredAuthRecords(nowIso) {
+      const magicLinks = database.prepare('DELETE FROM admin_magic_links WHERE expires_at <= ? OR consumed_at IS NOT NULL').run(nowIso).changes;
+      const sessions = database.prepare('DELETE FROM admin_sessions WHERE expires_at <= ? OR revoked_at IS NOT NULL').run(nowIso).changes;
+      return { magicLinks, sessions };
+    },
+
     async insertSecureDocumentCleanupJob(job) {
       database
         .prepare(`
           INSERT INTO secure_document_cleanup_jobs (
             id, submission_id, created_at, updated_at, completed_at, status,
-            trash_directory, files, attempt_count, last_error, metadata
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            trash_directory, files, attempt_count, last_error, metadata,
+            lease_claimed_at, lease_expires_at, lease_token
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(
           job.id,
@@ -2162,45 +2449,90 @@ export function createSqliteStorage(config) {
           Number(job.attempt_count || 0),
           job.last_error || null,
           JSON.stringify(job.metadata || {}),
+          job.lease_claimed_at || null,
+          job.lease_expires_at || null,
+          job.lease_token || null,
         );
-      return job;
+      return this.getSecureDocumentCleanupJob(job.id);
     },
 
     async updateSecureDocumentCleanupJob(id, values = {}) {
-      const existing = database.prepare('SELECT * FROM secure_document_cleanup_jobs WHERE id = ?').get(id);
-      if (!existing) {
-        return null;
+      if (['lease_claimed_at', 'lease_expires_at', 'lease_token'].some((field) => Object.hasOwn(values, field))) {
+        throw new Error('Cleanup-job lease fields require a token-fenced update.');
       }
-      const next = {
-        ...existing,
-        ...values,
-        files: values.files === undefined ? parseJsonColumn(existing.files, []) : values.files,
-        metadata: values.metadata === undefined ? parseJsonColumn(existing.metadata, {}) : values.metadata,
-      };
-      database
-        .prepare(`
-          UPDATE secure_document_cleanup_jobs SET
-            updated_at = ?, completed_at = ?, status = ?, trash_directory = ?, files = ?,
-            attempt_count = ?, last_error = ?, metadata = ?
-          WHERE id = ?
-        `)
-        .run(
-          next.updated_at,
-          next.completed_at || null,
-          next.status,
-          next.trash_directory || null,
-          JSON.stringify(next.files || []),
-          Number(next.attempt_count || 0),
-          next.last_error || null,
-          JSON.stringify(next.metadata || {}),
-          id,
-        );
-      return this.getSecureDocumentCleanupJob(id);
+      const normalizedValues = normalizeSecureDocumentCleanupJobUpdate(values);
+      const assignments = Object.keys(normalizedValues).map((field) => `${field} = @${field}`).join(', ');
+      const row = database.prepare(`
+        UPDATE secure_document_cleanup_jobs
+        SET ${assignments}
+        WHERE id = @id AND lease_token IS NULL
+        RETURNING *
+      `).get({ ...normalizedValues, id });
+
+      return normalizeSecureDocumentCleanupJobRow(row);
+    },
+
+    async claimSecureDocumentCleanupJob(id, lease = {}) {
+      const { claimedAt, leaseExpiresAt, leaseToken } = normalizeSecureDocumentCleanupLease(lease);
+      const row = database.prepare(`
+        UPDATE secure_document_cleanup_jobs
+        SET updated_at = ?, lease_claimed_at = ?, lease_expires_at = ?, lease_token = ?
+        WHERE id = ?
+          AND status IN ('staging', 'pending-purge', 'cleanup-pending', 'reconciliation-pending', 'cleanup-failed', 'restore-failed')
+          AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+        RETURNING *
+      `).get(claimedAt, claimedAt, leaseExpiresAt, leaseToken, id, claimedAt);
+
+      return normalizeSecureDocumentCleanupJobRow(row);
+    },
+
+    async renewSecureDocumentCleanupJobLease(id, leaseToken, durationMs) {
+      const expectedLeaseToken = normalizeCleanupLeaseToken(leaseToken);
+      const normalizedDurationMs = normalizeCleanupLeaseDuration(durationMs);
+      const row = database.prepare(`
+        UPDATE secure_document_cleanup_jobs
+        SET
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+          lease_expires_at = strftime(
+            '%Y-%m-%dT%H:%M:%fZ',
+            julianday('now') + (@durationMs / 86400000.0)
+          )
+        WHERE id = @id
+          AND lease_token = @expectedLeaseToken
+          AND julianday(lease_expires_at) > julianday('now')
+        RETURNING *
+      `).get({
+        id,
+        expectedLeaseToken,
+        durationMs: normalizedDurationMs,
+      });
+
+      return normalizeSecureDocumentCleanupJobRow(row);
+    },
+
+    async updateSecureDocumentCleanupJobIfLeased(id, leaseToken, values = {}) {
+      const expectedLeaseToken = normalizeCleanupLeaseToken(leaseToken);
+      const normalizedValues = normalizeSecureDocumentCleanupJobUpdate(values);
+      const assignments = Object.keys(normalizedValues).map((field) => `${field} = @${field}`).join(', ');
+      const row = database.prepare(`
+        UPDATE secure_document_cleanup_jobs
+        SET ${assignments}
+        WHERE id = @id
+          AND lease_token = @expectedLeaseToken
+          AND julianday(lease_expires_at) > julianday('now')
+        RETURNING *
+      `).get({
+        ...normalizedValues,
+        id,
+        expectedLeaseToken,
+      });
+
+      return normalizeSecureDocumentCleanupJobRow(row);
     },
 
     async getSecureDocumentCleanupJob(id) {
       const row = database.prepare('SELECT * FROM secure_document_cleanup_jobs WHERE id = ?').get(id);
-      return row ? { ...row, files: parseJsonColumn(row.files, []), metadata: parseJsonColumn(row.metadata, {}) } : null;
+      return normalizeSecureDocumentCleanupJobRow(row);
     },
 
     async listPendingSecureDocumentCleanupJobs(limit = 100) {
@@ -2212,7 +2544,14 @@ export function createSqliteStorage(config) {
           LIMIT ?
         `)
         .all(Math.max(1, Math.min(Number(limit) || 100, 500)))
-        .map((row) => ({ ...row, files: parseJsonColumn(row.files, []), metadata: parseJsonColumn(row.metadata, {}) }));
+        .map(normalizeSecureDocumentCleanupJobRow);
+    },
+
+    async listSecureDocumentCleanupJobs({ limit = 100 } = {}) {
+      return database
+        .prepare('SELECT * FROM secure_document_cleanup_jobs ORDER BY updated_at DESC LIMIT ?')
+        .all(Math.max(1, Math.min(Number(limit) || 100, 500)))
+        .map(normalizeSecureDocumentCleanupJobRow);
     },
 	  };
 }

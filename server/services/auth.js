@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { clearCookie, parseCookies, serializeCookie } from '../utils/cookies.js';
@@ -7,10 +8,16 @@ import { sendAdminMagicLinkEmail } from './delivery.js';
 
 const adminAuthRateLimitEvents = new Map();
 const magicLinkGenericMessage = 'If that email is allowed for private access, a sign-in link has been sent.';
+const primaryAdminPrincipalId = 'admin:primary';
 
 function createSessionCookie(session) {
   const config = getConfig();
-  const token = signPayload(session, config.admin.sessionSecret);
+  const token = signPayload({
+    sid: session.id,
+    role: session.role,
+    username: session.username,
+    exp: Date.parse(session.expires_at),
+  }, config.admin.sessionSecret);
 
   return serializeCookie(config.admin.sessionCookieName, token, {
     httpOnly: true,
@@ -32,12 +39,31 @@ function maskEmail(value) {
   return `${localPart.slice(0, 2)}***@${domain}`;
 }
 
-function createAdminSession(username, role = 'admin') {
-  return {
+function getSessionPrincipalId(username, role) {
+  if (role === 'admin') {
+    return primaryAdminPrincipalId;
+  }
+
+  return `viewer:identity:${normalizeEmail(username)}`;
+}
+
+async function issueAdminSession(username, role = 'admin', authMethod = 'password', request = {}, storage = getStorage()) {
+  const now = new Date();
+  const record = {
+    id: randomUUID(),
     role,
     username,
-    exp: Date.now() + getConfig().admin.sessionMaxAgeMs,
+    principal_id: getSessionPrincipalId(username, role),
+    created_at: now.toISOString(),
+    expires_at: new Date(now.getTime() + getConfig().admin.sessionMaxAgeMs).toISOString(),
+    last_seen_at: now.toISOString(),
+    revoked_at: null,
+    created_ip_hash: hashIp(getClientIp(request)),
+    user_agent: String(request.headers?.['user-agent'] || '').slice(0, 300),
+    metadata: { auth_method: authMethod },
   };
+  const session = await storage.insertAdminSession(record);
+  return { session, cookie: createSessionCookie(session) };
 }
 
 function normalizeEmail(value) {
@@ -131,22 +157,38 @@ async function enforcePasswordLoginRateLimit(username, request) {
   });
 }
 
-export function getAdminSession(request) {
+export async function getAdminSession(request, { storage = getStorage() } = {}) {
+  if (request.adminSession) return request.adminSession;
   const config = getConfig();
   const cookies = parseCookies(request.headers.cookie);
   const token = cookies[config.admin.sessionCookieName];
-  const session = verifySignedPayload(token, config.admin.sessionSecret);
+  const payload = verifySignedPayload(token, config.admin.sessionSecret);
 
-  if (!session || !['admin', 'viewer'].includes(session.role)) {
+  if (!payload?.sid || !['admin', 'viewer'].includes(payload.role)) {
     return null;
   }
 
-  request.adminSession = session;
-  return session;
+  try {
+    const session = await storage.getAdminSession(payload.sid);
+    const now = new Date().toISOString();
+    if (
+      !session || session.revoked_at || session.expires_at <= now ||
+      session.username !== payload.username || session.role !== payload.role
+    ) {
+      return null;
+    }
+    request.adminSession = session;
+    await storage.touchAdminSession?.(session.id, now);
+    session.last_seen_at = now;
+    return session;
+  } catch (error) {
+    console.warn(`[admin-auth] session lookup failed: ${error.message}`);
+    return null;
+  }
 }
 
-export function requireAdmin(request) {
-  const session = getAdminSession(request);
+export async function requireAdmin(request) {
+  const session = await getAdminSession(request);
 
   if (!session || session.role !== 'admin') {
     return null;
@@ -155,8 +197,8 @@ export function requireAdmin(request) {
   return session;
 }
 
-export function requireAdminAccess(request) {
-  const session = getAdminSession(request);
+export async function requireAdminAccess(request) {
+  const session = await getAdminSession(request);
 
   if (!session || !['admin', 'viewer'].includes(session.role)) {
     return null;
@@ -199,12 +241,9 @@ export async function loginAdmin(username, password, request) {
   }
 
   if (config.admin.username && config.admin.password && safeCompareText(username, config.admin.username) && safeCompareText(password, config.admin.password)) {
-    const session = createAdminSession(config.admin.username, 'admin');
-
     return {
       ok: true,
-      session,
-      cookie: createSessionCookie(session),
+      ...(await issueAdminSession(config.admin.username, 'admin', 'password', request)),
     };
   }
 
@@ -214,12 +253,9 @@ export async function loginAdmin(username, password, request) {
     safeCompareText(username, config.admin.viewerUsername) &&
     safeCompareText(password, config.admin.viewerPassword)
   ) {
-    const session = createAdminSession(config.admin.viewerUsername, 'viewer');
-
     return {
       ok: true,
-      session,
-      cookie: createSessionCookie(session),
+      ...(await issueAdminSession(config.admin.viewerUsername, 'viewer', 'password', request)),
     };
   }
 
@@ -259,9 +295,11 @@ export async function requestAdminMagicLink(email, request) {
 
   const expiresAt = new Date(Date.now() + config.admin.magicLinkTtlMs).toISOString();
   const role = normalizedEmail === expectedEmail ? 'admin' : 'viewer';
+  const tokenId = randomUUID();
   const token = signPayload(
     {
       type: 'admin-magic-link',
+      jti: tokenId,
       email: role === 'admin' ? expectedEmail : normalizeEmail(matchedViewerEmail),
       role,
       exp: Date.now() + config.admin.magicLinkTtlMs,
@@ -270,6 +308,16 @@ export async function requestAdminMagicLink(email, request) {
   );
   const publicOrigin = getRequestOrigin(request, config.server.origin);
   const magicLinkUrl = `${publicOrigin}/admin?admin_token=${encodeURIComponent(token)}`;
+  const storage = getStorage();
+  await storage.insertAdminMagicLink({
+    token_hash: sha256(tokenId),
+    created_at: new Date().toISOString(),
+    expires_at: expiresAt,
+    email: role === 'admin' ? expectedEmail : normalizeEmail(matchedViewerEmail),
+    role,
+    requested_ip_hash: hashIp(getClientIp(request)),
+    metadata: {},
+  });
   const deliveryResult = await sendAdminMagicLinkEmail({
     to: role === 'admin' ? config.admin.email : matchedViewerEmail,
     magicLinkUrl,
@@ -278,6 +326,7 @@ export async function requestAdminMagicLink(email, request) {
   });
 
   if (deliveryResult.status === 'failed') {
+    await storage.consumeAdminMagicLink(sha256(tokenId), new Date().toISOString()).catch(() => {});
     return { ok: false, reason: deliveryResult.error };
   }
 
@@ -288,30 +337,60 @@ export async function requestAdminMagicLink(email, request) {
   };
 }
 
-export function verifyAdminMagicLink(token) {
+export async function verifyAdminMagicLink(token) {
   const config = getConfig();
   const payload = verifySignedPayload(token, config.admin.magicLinkSecret);
   const role = payload?.role === 'viewer' ? 'viewer' : 'admin';
   const expectedEmail = role === 'admin' ? normalizeEmail(config.admin.email) : normalizeEmail(getViewerEmailMatch(payload?.email, config));
 
-  if (!payload || payload.type !== 'admin-magic-link' || normalizeEmail(payload.email) !== expectedEmail) {
+  if (!payload?.jti || payload.type !== 'admin-magic-link' || normalizeEmail(payload.email) !== expectedEmail) {
     return { ok: false, reason: 'That sign-in link is invalid or has expired.' };
   }
 
-  const session = createAdminSession(payload.email, role);
+  const storage = getStorage();
+  const consumed = await storage.consumeAdminMagicLink(sha256(payload.jti), new Date().toISOString());
+  if (!consumed || consumed.email !== normalizeEmail(payload.email) || consumed.role !== role) {
+    return { ok: false, reason: 'That sign-in link is invalid, expired, or has already been used.' };
+  }
 
   return {
     ok: true,
-    session,
-    cookie: createSessionCookie(session),
+    ...(await issueAdminSession(payload.email, role, 'magic-link', {}, storage)),
   };
 }
 
-export function logoutAdmin() {
+export async function logoutAdmin(request) {
   const config = getConfig();
+  const session = await getAdminSession(request);
+  if (session) await getStorage().revokeAdminSession(session.id, new Date().toISOString());
   return clearCookie(config.admin.sessionCookieName, {
     path: '/',
     sameSite: 'Lax',
     secure: config.isProduction,
   });
+}
+
+export async function revokeAllAdminSessions(request) {
+  const session = await requireAdminAccess(request);
+  if (!session) return { ok: false, status: 401, reason: 'Unauthorized.' };
+  const revoked = await getStorage().revokeAdminSessionsForPrincipal(session.principal_id, new Date().toISOString());
+  return {
+    ok: true,
+    revoked,
+    cookie: clearCookie(getConfig().admin.sessionCookieName, {
+      path: '/', sameSite: 'Lax', secure: getConfig().isProduction,
+    }),
+  };
+}
+
+export async function cleanupExpiredAuthRecords(storage = getStorage(), now = new Date()) {
+  return storage.cleanupExpiredAuthRecords?.(now.toISOString()) || { magicLinks: 0, sessions: 0 };
+}
+
+export function startAuthCleanupScheduler({ storage = getStorage(), scheduleTimer = setInterval } = {}) {
+  const interval = scheduleTimer(() => {
+    cleanupExpiredAuthRecords(storage).catch((error) => console.warn(`[admin-auth] cleanup failed: ${error.message}`));
+  }, 6 * 60 * 60 * 1000);
+  interval.unref?.();
+  return { stop() { clearInterval(interval); } };
 }

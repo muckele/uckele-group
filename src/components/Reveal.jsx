@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 export default function Reveal({ as: Tag = 'div', children, className = '', delay = 0 }) {
   const ref = useRef(null);

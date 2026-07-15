@@ -104,10 +104,12 @@ Deal Hunter deals scoring 75+ can be approved from the protected admin dashboard
 Automatic follow-ups are controlled by:
 
 - `DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED=true`
-- `DEAL_HUNTER_CIM_FOLLOW_UP_DELAYS_HOURS=48,72,168`
+- `DEAL_HUNTER_CIM_FOLLOW_UP_DELAYS_HOURS=48,72,96`
 - `DEAL_HUNTER_CIM_FOLLOW_UP_MAX_COUNT=3`
+- `DEAL_HUNTER_CIM_FOLLOW_UP_WEEKDAYS_ONLY=true`
+- `DEAL_HUNTER_CIM_FOLLOW_UP_TIMEZONE=America/Los_Angeles`
 
-The recommended cadence is three professional touches: first follow-up after 48 hours, second follow-up 72 hours later, and final follow-up 168 hours after that. The follow-up job checks for Resend inbound `email.received` webhook events before sending and stores them internally as replies. Configure the delivery provider webhook with `EMAIL_WEBHOOK_SECRET` or `RESEND_WEBHOOK_SECRET`; without inbound reply webhook events, the app can send due follow-ups but cannot automatically know when a broker responded. The job stops follow-ups on replies, bounces, complaints, failures, or unsubscribes.
+The production cadence is three persistent touches: first follow-up after 48 hours, second follow-up 72 hours later, and final follow-up 96 hours after that. With weekday-only delivery enabled, a follow-up that becomes due on Saturday or Sunday remains queued until the next scheduler check on a weekday in the configured timezone. The follow-up job checks for Resend inbound `email.received` webhook events before sending and stores them internally as replies. Configure the delivery provider webhook with `EMAIL_WEBHOOK_SECRET` or `RESEND_WEBHOOK_SECRET`; without inbound reply webhook events, the app can send due follow-ups but cannot automatically know when a broker responded. The job stops follow-ups on replies, bounces, complaints, failures, or unsubscribes.
 
 ### Diligence And Decisioning
 

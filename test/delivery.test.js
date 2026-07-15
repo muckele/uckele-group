@@ -1,11 +1,27 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  buildCimEmailIdempotencyKey,
+  buildCimReplyToAddress,
   buildDealHunterCimFollowUpEmail,
   buildDealHunterCimRequestEmail,
   buildDailyDealHunterEmail,
+  buildAdminEmailTestEmail,
   normalizeResendTags,
 } from '../server/services/delivery.js';
+
+test('controlled email test is clearly marked and asks for an unchanged-subject reply', () => {
+  const message = buildAdminEmailTestEmail({
+    to: 'admin@example.com',
+    requestedBy: 'Admin',
+    sentAt: new Date('2026-07-14T20:00:00.000Z'),
+  });
+
+  assert.equal(message.kind, 'admin-email-test');
+  assert.match(message.subject, /^\[TEST\] Uckele Group email delivery verification/);
+  assert.match(message.text, /reply to this message without changing the subject/i);
+  assert.equal(message.tags.some((tag) => tag.name === 'source' && tag.value === 'admin-email-test'), true);
+});
 
 test('daily Deal Hunter email carries its deterministic provider idempotency key', () => {
   const message = buildDailyDealHunterEmail({
@@ -14,6 +30,32 @@ test('daily Deal Hunter email carries its deterministic provider idempotency key
     review: { totals: {}, sources: [], criteriaRecommendations: [] },
   });
   assert.equal(message.idempotencyKey, 'daily-deal-hunter-email:2026-07-12');
+});
+
+test('CIM touch identifiers are deterministic and isolated by request and follow-up number', () => {
+  const initialKey = buildCimEmailIdempotencyKey({ requestId: 'request-1' });
+
+  assert.equal(initialKey, 'deal-hunter-cim-request-1-initial');
+  assert.equal(buildCimEmailIdempotencyKey({ requestId: 'request-1' }), initialKey);
+  assert.equal(
+    buildCimEmailIdempotencyKey({ requestId: 'request-1', followUpNumber: 1 }),
+    'deal-hunter-cim-request-1-follow-up-1',
+  );
+  assert.notEqual(
+    buildCimEmailIdempotencyKey({ requestId: 'request-1', followUpNumber: 1 }),
+    buildCimEmailIdempotencyKey({ requestId: 'request-1', followUpNumber: 2 }),
+  );
+  assert.equal(buildCimEmailIdempotencyKey(), '');
+});
+
+test('CIM requests get stable request-specific reply addresses on the configured inbound domain', () => {
+  assert.equal(
+    buildCimReplyToAddress({
+      requestId: 'A'.repeat(64),
+      replyTo: 'Uckele Deals <deals@inbound.example.com>',
+    }),
+    `cim-${'a'.repeat(32)}@inbound.example.com`,
+  );
 });
 
 const sensitiveBrokerDetails = [
@@ -95,9 +137,11 @@ test('CIM request email keeps internal score and deal economics out of broker-vi
     to: 'broker@example.com',
     deal: sampleDeal,
     requestedBy: 'Mathew Uckele',
+    cimRequestId: 'request-1',
   });
 
   assert.equal(message.kind, 'deal-hunter-cim-request');
+  assert.equal(message.idempotencyKey, 'deal-hunter-cim-request-1-initial');
   assert.match(message.subject, /CIM \/ NDA request/);
   assert.match(message.text, /Could you please send over the CIM or teaser, or let me know the NDA process\?/);
   assert.match(message.html, /View Listing/);
@@ -149,6 +193,7 @@ test('CIM follow-up emails keep internal score and deal economics out of broker-
     });
 
     assert.equal(message.kind, 'deal-hunter-cim-follow-up');
+    assert.equal(message.idempotencyKey, `deal-hunter-cim-request-1-follow-up-${followUpNumber}`);
     assert.match(message.subject, /^Re: CIM \/ NDA request/);
     assert.equal(message.tracking.followUpNumber, followUpNumber);
     assert.equal(message.tags.some((tag) => tag.name === 'follow_up_number' && tag.value === String(followUpNumber)), true);

@@ -114,7 +114,7 @@ test('completed secure upload requests are rejected before parsing the JSON payl
     });
     const result = await response.json();
     assert.equal(response.status, 409);
-    assert.match(result.error, /already been received/i);
+    assert.match(result.error, /request is closed/i);
   });
 });
 

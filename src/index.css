@@ -41,6 +41,30 @@ a {
   text-decoration: none;
 }
 
+:where(a, button, input, select, textarea, summary):focus-visible {
+  outline: 3px solid #b98952;
+  outline-offset: 3px;
+}
+
+.skip-link {
+  position: fixed;
+  left: 1rem;
+  top: 1rem;
+  z-index: 100;
+  transform: translateY(-180%);
+  border-radius: 0.75rem;
+  background: #173126;
+  color: #fff;
+  padding: 0.75rem 1rem;
+  font-weight: 700;
+  box-shadow: 0 12px 30px rgba(24, 33, 29, 0.24);
+  transition: transform 150ms ease;
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
 img {
   display: block;
   max-width: 100%;
@@ -52,6 +76,10 @@ select,
 textarea {
   max-width: 100%;
   font: inherit;
+}
+
+.form-control {
+  @apply w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus-visible:border-moss focus-visible:ring-2 focus-visible:ring-moss/20;
 }
 
 p,
@@ -296,5 +324,25 @@ textarea {
   .admin-workspace-shell,
   .admin-page-header {
     max-width: 82rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+
+  .reveal {
+    opacity: 1;
+    transform: none;
   }
 }

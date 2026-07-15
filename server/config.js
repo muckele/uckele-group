@@ -68,12 +68,22 @@ export function getConfig() {
       supabaseUrl: process.env.SUPABASE_URL || '',
       supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || '',
     },
+    backup: {
+      enabled: booleanFromEnv(process.env.BACKUP_ENABLED, isProduction && (process.env.STORAGE_PROVIDER || 'sqlite') === 'sqlite'),
+      directory: process.env.BACKUP_DIRECTORY || path.join(defaultDataDir, 'backups'),
+      retentionDays: Math.max(1, numberFromEnv(process.env.BACKUP_RETENTION_DAYS, 14)),
+      retentionCount: Math.max(1, numberFromEnv(process.env.BACKUP_RETENTION_COUNT, 14)),
+      time: process.env.BACKUP_DAILY_TIME || '03:30',
+      timezone: process.env.BACKUP_TIMEZONE || 'America/Los_Angeles',
+      checkIntervalMs: Math.max(60_000, numberFromEnv(process.env.BACKUP_CHECK_INTERVAL_MS, 1000 * 60 * 15)),
+    },
     delivery: {
       provider: process.env.DELIVERY_PROVIDER || 'console',
       fallbackRecipient: process.env.LEAD_NOTIFICATION_EMAIL || (isProduction ? '' : 'mathew@example.com'),
       resendApiKey: process.env.RESEND_API_KEY || '',
       resendFromEmail: process.env.RESEND_FROM_EMAIL || '',
       resendReplyTo: process.env.RESEND_REPLY_TO || '',
+      resendInboundDomain: process.env.RESEND_INBOUND_DOMAIN || '',
       emailWebhookSecret: process.env.EMAIL_WEBHOOK_SECRET || process.env.RESEND_WEBHOOK_SECRET || '',
       formspreeEndpoint: process.env.FORMSPREE_ENDPOINT || '',
       emailjsServiceId: process.env.EMAILJS_SERVICE_ID || '',
@@ -146,7 +156,9 @@ export function getConfig() {
         firstDelayHours: numberFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_FIRST_DELAY_HOURS, 48),
         intervalHours: numberFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_INTERVAL_HOURS, 72),
         maxCount: Math.max(0, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_MAX_COUNT, 3), 10)),
-        delaySequenceHours: numberListFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_DELAYS_HOURS, [48, 72, 168]).slice(0, 10),
+        delaySequenceHours: numberListFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_DELAYS_HOURS, [48, 72, 96]).slice(0, 10),
+        weekdaysOnly: booleanFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_WEEKDAYS_ONLY, true),
+        timezone: process.env.DEAL_HUNTER_CIM_FOLLOW_UP_TIMEZONE || 'America/Los_Angeles',
       },
     },
     secureDocuments: {
@@ -209,6 +221,20 @@ export function validateConfig(config = getConfig()) {
     errors.push('DEAL_HUNTER_DAILY_EMAIL_TIMEZONE is not a valid IANA timezone.');
   }
 
+  try {
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: config.dealHunter.cimFollowUp?.timezone || config.dealHunter.dailyEmail.timezone,
+    }).format();
+  } catch {
+    errors.push('DEAL_HUNTER_CIM_FOLLOW_UP_TIMEZONE is not a valid IANA timezone.');
+  }
+
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: config.backup?.timezone || 'America/Los_Angeles' }).format();
+  } catch {
+    errors.push('BACKUP_TIMEZONE is not a valid IANA timezone.');
+  }
+
   if (config.storage.provider === 'supabase') {
     requireValue(config.storage.supabaseUrl, 'SUPABASE_URL');
     requireValue(config.storage.supabaseServiceRoleKey, 'SUPABASE_SERVICE_ROLE_KEY');
@@ -237,6 +263,12 @@ export function validateConfig(config = getConfig()) {
     errors.push('DEAL_HUNTER_DAILY_EMAIL_TIME must use a valid 24-hour HH:MM value.');
   }
 
+  const backupTime = String(config.backup?.time || '03:30');
+  const backupTimeMatch = backupTime.match(/^(\d{1,2}):(\d{2})$/);
+  if (!backupTimeMatch || Number(backupTimeMatch[1]) > 23 || Number(backupTimeMatch[2]) > 59) {
+    errors.push('BACKUP_DAILY_TIME must use a valid 24-hour HH:MM value.');
+  }
+
   requirePositiveNumber(config.server?.port, 'PORT', { integer: true });
   requirePositiveNumber(config.server?.outboundRequestTimeoutMs, 'OUTBOUND_HTTP_TIMEOUT_MS');
   requirePositiveNumber(config.admin.magicLinkTtlMs, 'ADMIN_MAGIC_LINK_TTL_MS');
@@ -247,8 +279,12 @@ export function validateConfig(config = getConfig()) {
   requirePositiveNumber(config.secureDocuments.maxConcurrentUploads, 'SECURE_DOCUMENTS_MAX_CONCURRENT_UPLOADS', { integer: true });
   requirePositiveNumber(config.dealHunter.dailyEmail.checkIntervalMs, 'DEAL_HUNTER_DAILY_EMAIL_CHECK_INTERVAL_MS');
   requirePositiveNumber(config.dealHunter.dailyEmail.retryIntervalMs, 'DEAL_HUNTER_DAILY_EMAIL_RETRY_INTERVAL_MS');
+  requirePositiveNumber(config.dealHunter.cimFollowUp?.checkIntervalMs, 'DEAL_HUNTER_CIM_FOLLOW_UP_CHECK_INTERVAL_MS');
   requirePositiveNumber(config.protection?.rateLimitWindowMs, 'RATE_LIMIT_WINDOW_MS');
   requirePositiveNumber(config.protection?.rateLimitMax, 'RATE_LIMIT_MAX', { integer: true });
+  requirePositiveNumber(config.backup?.retentionDays, 'BACKUP_RETENTION_DAYS', { integer: true });
+  requirePositiveNumber(config.backup?.retentionCount, 'BACKUP_RETENTION_COUNT', { integer: true });
+  requirePositiveNumber(config.backup?.checkIntervalMs, 'BACKUP_CHECK_INTERVAL_MS');
 
   if (config.isProduction) {
     requireValue(config.admin.email, 'ADMIN_EMAIL');
@@ -286,8 +322,22 @@ export function validateConfig(config = getConfig()) {
       errors.push('Production configuration must provide at least one usable admin authentication path.');
     }
 
-    if (config.dealHunter.cimFollowUp.enabled && !config.delivery.emailWebhookSecret) {
-      errors.push('RESEND_WEBHOOK_SECRET or EMAIL_WEBHOOK_SECRET is required when CIM follow-ups are enabled.');
+    if (config.dealHunter.cimFollowUp.enabled) {
+      if (config.delivery.provider !== 'resend') {
+        errors.push('DELIVERY_PROVIDER=resend is required when CIM follow-ups are enabled.');
+      }
+      if (!config.delivery.emailWebhookSecret) {
+        errors.push('RESEND_WEBHOOK_SECRET or EMAIL_WEBHOOK_SECRET is required when CIM follow-ups are enabled.');
+      }
+      requireValue(config.delivery.resendReplyTo, 'RESEND_REPLY_TO');
+      requireValue(config.delivery.resendInboundDomain, 'RESEND_INBOUND_DOMAIN');
+
+      const replyAddress = String(config.delivery.resendReplyTo || '').match(/<?([^<>\s]+@[^<>\s]+)>?/)?.[1] || '';
+      const replyDomain = replyAddress.split('@')[1]?.toLowerCase().replace(/\.+$/, '') || '';
+      const inboundDomain = String(config.delivery.resendInboundDomain || '').trim().toLowerCase().replace(/^@/, '').replace(/\.+$/, '');
+      if (replyAddress && inboundDomain && replyDomain !== inboundDomain) {
+        errors.push('RESEND_REPLY_TO must use the RESEND_INBOUND_DOMAIN when CIM follow-ups are enabled.');
+      }
     }
   } else if (config.admin.password === 'change-me-now') {
     warnings.push('The local admin account is using the documented development password.');

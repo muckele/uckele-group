@@ -70,6 +70,37 @@ export function normalizeResendTags(tags = []) {
   return normalizedTags;
 }
 
+function extractEmailAddress(value = '') {
+  const normalized = normalizeText(value, 320);
+  return normalized.match(/<?([^<>\s]+@[^<>\s]+)>?/)?.[1] || '';
+}
+
+export function buildCimReplyToAddress({ requestId = '', replyTo = '' } = {}) {
+  const address = extractEmailAddress(replyTo);
+  const separatorIndex = address.lastIndexOf('@');
+  const domain = separatorIndex >= 0 ? address.slice(separatorIndex + 1).toLowerCase() : '';
+  const requestToken = normalizeResendTagToken(requestId).toLowerCase().slice(0, 32);
+
+  if (!domain || !requestToken) {
+    return address || normalizeText(replyTo, 320);
+  }
+
+  return `cim-${requestToken}@${domain}`;
+}
+
+export function buildCimEmailIdempotencyKey({ requestId = '', followUpNumber = 0 } = {}) {
+  const requestToken = normalizeResendTagToken(requestId).slice(0, 160);
+
+  if (!requestToken) {
+    return '';
+  }
+
+  const normalizedFollowUpNumber = Math.max(0, Math.trunc(Number(followUpNumber) || 0));
+  const touchToken = normalizedFollowUpNumber > 0 ? `follow-up-${normalizedFollowUpNumber}` : 'initial';
+
+  return `deal-hunter-cim-${requestToken}-${touchToken}`.slice(0, 256);
+}
+
 function normalizeUrl(value = '') {
   const normalized = normalizeText(value, 1000);
   return /^https?:\/\//i.test(normalized) ? normalized : '';
@@ -450,6 +481,7 @@ function buildSubmissionMessage(submission) {
 
   return {
     kind: 'submission',
+    idempotencyKey: `contact-submission:${submission.id}`,
     to: getConfig().delivery.fallbackRecipient,
     replyTo: submission.email || getConfig().delivery.resendReplyTo || '',
     subject,
@@ -680,7 +712,7 @@ export async function sendDailyDealHunterEmail(options) {
   return sendMessage(buildDailyDealHunterEmail(options));
 }
 
-export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = '' } = {}) {
+export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = '', cimRequestId = '' } = {}) {
   const config = getConfig();
   const businessName = normalizeText(deal.name || 'the listed business', 160);
   const subject = `CIM / NDA request for ${businessName}`;
@@ -740,8 +772,11 @@ export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = ''
 
   return {
     kind: 'deal-hunter-cim-request',
+    idempotencyKey: buildCimEmailIdempotencyKey({ requestId: cimRequestId }),
     to,
-    replyTo: config.delivery.resendReplyTo || config.delivery.fallbackRecipient || '',
+    replyTo: config.delivery.resendReplyTo
+      ? buildCimReplyToAddress({ requestId: cimRequestId, replyTo: config.delivery.resendReplyTo })
+      : config.delivery.fallbackRecipient || '',
     subject,
     headline: subject,
     text,
@@ -749,11 +784,13 @@ export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = ''
     tags: [
       { name: 'source', value: 'deal-hunter-cim-request' },
       { name: 'deal_key', value: normalizeText(deal.dealKey || '', 250) },
+      { name: 'cim_request_id', value: normalizeText(cimRequestId, 250) },
     ],
     tracking: {
       source: 'deal-hunter-cim-request',
       dealKey: deal.dealKey || '',
       dealName: businessName,
+      cimRequestId,
       score: deal.score || 0,
       requestedBy,
     },
@@ -875,8 +912,11 @@ export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumb
 
   return {
     kind: 'deal-hunter-cim-follow-up',
+    idempotencyKey: buildCimEmailIdempotencyKey({ requestId: request.id, followUpNumber }),
     to,
-    replyTo: config.delivery.resendReplyTo || config.delivery.fallbackRecipient || '',
+    replyTo: config.delivery.resendReplyTo
+      ? buildCimReplyToAddress({ requestId: request.id, replyTo: config.delivery.resendReplyTo })
+      : config.delivery.fallbackRecipient || '',
     subject,
     headline: subject,
     text,
@@ -908,6 +948,67 @@ export async function sendDealHunterCimFollowUpEmail(options) {
   }
 
   return sendMessage(buildDealHunterCimFollowUpEmail(options));
+}
+
+export function buildAdminEmailTestEmail({ to, requestedBy = '', sentAt = new Date() } = {}) {
+  const config = getConfig();
+  const timestamp = sentAt instanceof Date ? sentAt.toISOString() : new Date(sentAt).toISOString();
+  const requester = normalizeText(requestedBy || config.workflow?.defaultAssignee || 'admin', 120);
+  const subject = `[TEST] Uckele Group email delivery verification ${timestamp}`;
+  const text = [
+    'This is a controlled Uckele Group email delivery test.',
+    '',
+    `Requested by: ${requester}`,
+    `Sent at: ${timestamp}`,
+    `Reply-to address: ${config.delivery.resendReplyTo || 'not configured'}`,
+    '',
+    'To verify inbound reply tracking, reply to this message without changing the subject.',
+  ].join('\n');
+  const html = brandedEmailHtml({
+    preheader: 'Controlled Uckele Group email delivery and reply-tracking test.',
+    eyebrow: 'Email Readiness Test',
+    title: 'Verify delivery and reply tracking',
+    paragraphs: [
+      'This is a controlled Uckele Group email delivery test.',
+      `Requested by ${requester} at ${timestamp}.`,
+      'To verify inbound reply tracking, reply to this message without changing the subject.',
+    ],
+    details: [
+      { label: 'Recipient', value: to },
+      { label: 'Reply-to', value: config.delivery.resendReplyTo || 'Not configured' },
+    ],
+  });
+
+  return {
+    kind: 'admin-email-test',
+    to,
+    replyTo: config.delivery.resendReplyTo || '',
+    subject,
+    headline: 'Email delivery verification',
+    text,
+    html,
+    tags: [
+      { name: 'source', value: 'admin-email-test' },
+      { name: 'requested_by', value: requester },
+    ],
+    tracking: {
+      source: 'admin-email-test',
+      requestedBy: requester,
+      sentAt: timestamp,
+    },
+  };
+}
+
+export async function sendAdminEmailTestEmail(options) {
+  if (!hasOnlyValidEmailRecipients(options?.to)) {
+    return {
+      status: 'failed',
+      error: 'A configured internal test recipient is required.',
+      providerMessageId: '',
+    };
+  }
+
+  return sendMessage(buildAdminEmailTestEmail(options));
 }
 
 export async function sendAdminMagicLinkEmail({ to, magicLinkUrl, expiresAt, role = 'admin' }) {

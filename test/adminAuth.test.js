@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 
 function routeLayer(app, method, routePath) {
   return app._router.stack.find((layer) => layer.route?.path === routePath && layer.route.methods[method]);
@@ -73,15 +74,46 @@ test('viewer credentials create read-only admin access', async () => {
   process.env.ADMIN_SESSION_SECRET = 'test-session-secret';
   process.env.ADMIN_MAGIC_LINK_SECRET = 'test-magic-secret';
   process.env.DELIVERY_PROVIDER = 'console';
-  process.env.SQLITE_PATH = path.join(tempDir, 'auth.sqlite');
+  const sqlitePath = path.join(tempDir, 'auth.sqlite');
+  process.env.SQLITE_PATH = sqlitePath;
+
+  const legacyDatabase = new Database(sqlitePath);
+  const legacyCreatedAt = new Date().toISOString();
+  const legacyExpiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  legacyDatabase.exec(`
+    CREATE TABLE admin_sessions (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      revoked_at TEXT,
+      username TEXT NOT NULL,
+      role TEXT NOT NULL,
+      created_ip_hash TEXT,
+      user_agent TEXT,
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+  `);
+  const insertLegacySession = legacyDatabase.prepare(`
+    INSERT INTO admin_sessions (
+      id, created_at, expires_at, last_seen_at, revoked_at, username, role,
+      created_ip_hash, user_agent, metadata
+    ) VALUES (?, ?, ?, ?, NULL, ?, ?, '', 'legacy-test', '{}')
+  `);
+  insertLegacySession.run('legacy-admin-password', legacyCreatedAt, legacyExpiresAt, legacyCreatedAt, 'admin-test', 'admin');
+  insertLegacySession.run('legacy-admin-magic-link', legacyCreatedAt, legacyExpiresAt, legacyCreatedAt, 'admin@example.com', 'admin');
+  legacyDatabase.close();
 
   const {
+    cleanupExpiredAuthRecords,
     getAdminAuthState,
     loginAdmin,
     requestAdminMagicLink,
     requireAdmin,
     requireAdminAccess,
+    verifyAdminMagicLink,
   } = await import('../server/services/auth.js');
+  const { getStorage } = await import('../server/storage/index.js');
   const { signPayload } = await import('../server/utils/security.js');
   const { createApp } = await import('../server/app.js');
   const request = { headers: {}, ip: '127.0.0.1' };
@@ -89,14 +121,16 @@ test('viewer credentials create read-only admin access', async () => {
   const adminLogin = await loginAdmin('admin-test', 'admin-password', request);
   assert.equal(adminLogin.ok, true);
   assert.equal(adminLogin.session.role, 'admin');
-  assert.equal(requireAdmin({ headers: { cookie: adminLogin.cookie } })?.role, 'admin');
-  assert.equal(requireAdminAccess({ headers: { cookie: adminLogin.cookie } })?.role, 'admin');
+  assert.equal(adminLogin.session.username, 'admin-test');
+  assert.equal(adminLogin.session.metadata.auth_method, 'password');
+  assert.equal((await requireAdmin({ headers: { cookie: adminLogin.cookie } }))?.role, 'admin');
+  assert.equal((await requireAdminAccess({ headers: { cookie: adminLogin.cookie } }))?.role, 'admin');
 
   const viewerLogin = await loginAdmin('viewer-test', 'viewer-password', request);
   assert.equal(viewerLogin.ok, true);
   assert.equal(viewerLogin.session.role, 'viewer');
-  assert.equal(requireAdmin({ headers: { cookie: viewerLogin.cookie } }), null);
-  assert.equal(requireAdminAccess({ headers: { cookie: viewerLogin.cookie } })?.role, 'viewer');
+  assert.equal(await requireAdmin({ headers: { cookie: viewerLogin.cookie } }), null);
+  assert.equal((await requireAdminAccess({ headers: { cookie: viewerLogin.cookie } }))?.role, 'viewer');
 
   const authState = getAdminAuthState();
   assert.equal(authState.passwordEnabled, true);
@@ -115,6 +149,61 @@ test('viewer credentials create read-only admin access', async () => {
 
   assert.equal(viewerMagicLink.ok, true);
   assert.equal(unknownMagicLink.message, viewerMagicLink.message);
+
+  const magicToken = new URL(viewerMagicLink.previewUrl).searchParams.get('admin_token');
+  const firstMagicVerification = await verifyAdminMagicLink(magicToken);
+  const replayedMagicVerification = await verifyAdminMagicLink(magicToken);
+  assert.equal(firstMagicVerification.ok, true);
+  assert.equal(firstMagicVerification.session.role, 'viewer');
+  assert.equal(replayedMagicVerification.ok, false);
+  assert.match(replayedMagicVerification.reason, /already been used|invalid/i);
+
+  let adminMagicLink;
+  try {
+    console.log = () => {};
+    adminMagicLink = await requestAdminMagicLink('admin@example.com', request);
+  } finally {
+    console.log = originalConsoleLog;
+  }
+
+  assert.equal(adminMagicLink.ok, true);
+  const adminMagicToken = new URL(adminMagicLink.previewUrl).searchParams.get('admin_token');
+  const adminMagicVerification = await verifyAdminMagicLink(adminMagicToken);
+  assert.equal(adminMagicVerification.ok, true);
+  assert.equal(adminMagicVerification.session.role, 'admin');
+  assert.equal(adminMagicVerification.session.username, 'admin@example.com');
+  assert.equal(adminMagicVerification.session.metadata.auth_method, 'magic-link');
+  assert.equal(adminMagicVerification.session.principal_id, adminLogin.session.principal_id);
+
+  const storage = getStorage();
+  assert.equal((await storage.getAdminSession('legacy-admin-password')).principal_id, 'admin:primary');
+  assert.equal((await storage.getAdminSession('legacy-admin-magic-link')).principal_id, 'admin:primary');
+  const expiredAt = new Date(Date.now() - 60_000).toISOString();
+  await storage.insertAdminSession({
+    id: 'expired-session-test',
+    created_at: expiredAt,
+    expires_at: expiredAt,
+    last_seen_at: expiredAt,
+    username: 'viewer-test',
+    principal_id: 'viewer:identity:viewer-test',
+    role: 'viewer',
+    created_ip_hash: '',
+    user_agent: 'test',
+    metadata: {},
+  });
+  await storage.insertAdminMagicLink({
+    token_hash: 'expired-magic-link-test',
+    created_at: expiredAt,
+    expires_at: expiredAt,
+    email: 'viewer@example.com',
+    role: 'viewer',
+    requested_ip_hash: '',
+    metadata: {},
+  });
+  const cleanupResult = await cleanupExpiredAuthRecords(storage);
+  assert.ok(cleanupResult.sessions >= 1);
+  assert.ok(cleanupResult.magicLinks >= 2, 'expired and consumed magic links should be removed');
+  assert.equal(await storage.getAdminSession('expired-session-test'), null);
 
   const app = createApp();
   const viewerCookie = viewerLogin.cookie;
@@ -163,10 +252,12 @@ test('viewer credentials create read-only admin access', async () => {
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-request', body: { dealKey: 'deal-1' } },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-requests/send-ready' },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-follow-ups/run' },
+    { method: 'post', routePath: '/api/admin/email/test' },
     { method: 'patch', routePath: '/api/admin/submissions/:id', params: { id: 'submission-1' }, body: { status: 'review' } },
     { method: 'delete', routePath: '/api/admin/submissions/:id', params: { id: 'submission-1' } },
     { method: 'post', routePath: '/api/admin/submissions/:id/upload-request', params: { id: 'submission-1' } },
     { method: 'get', routePath: '/api/admin/secure-documents/:id/download', params: { id: 'document-1' } },
+    { method: 'get', routePath: '/api/admin/operations' },
   ];
 
   for (const route of blockedRoutes) {
@@ -176,7 +267,7 @@ test('viewer credentials create read-only admin access', async () => {
     });
 
     assert.equal(response.statusCode, 401, `${route.method.toUpperCase()} ${route.routePath} should reject viewer access`);
-    assert.equal(response.body.error, 'Unauthorized.');
+    assert.match(response.body.error, /Unauthorized|Administrator access is required/);
   }
 
   const createResponse = await invokeRoute(app, {
@@ -218,4 +309,36 @@ test('viewer credentials create read-only admin access', async () => {
     listResponse.body.submissions.some((submission) => submission.id === createResponse.body.submission.id),
     false,
   );
+
+  const secondViewerLogin = await loginAdmin('viewer-test', 'viewer-password', request);
+  const revokeAllResponse = await invokeRoute(app, {
+    method: 'post',
+    routePath: '/api/admin/sessions/revoke-all',
+    cookie: viewerCookie,
+  });
+  assert.equal(revokeAllResponse.statusCode, 200);
+  assert.ok(revokeAllResponse.body.revoked >= 2);
+  assert.equal(await requireAdminAccess({ headers: { cookie: viewerCookie } }), null);
+  assert.equal(await requireAdminAccess({ headers: { cookie: secondViewerLogin.cookie } }), null);
+  assert.equal((await requireAdminAccess({ headers: { cookie: firstMagicVerification.cookie } }))?.username, 'viewer@example.com');
+
+  const revokeAllAdminResponse = await invokeRoute(app, {
+    method: 'post',
+    routePath: '/api/admin/sessions/revoke-all',
+    cookie: adminMagicVerification.cookie,
+  });
+  assert.equal(revokeAllAdminResponse.statusCode, 200);
+  assert.ok(revokeAllAdminResponse.body.revoked >= 4);
+  assert.equal(await requireAdminAccess({ headers: { cookie: adminLogin.cookie } }), null);
+  assert.equal(await requireAdminAccess({ headers: { cookie: adminMagicVerification.cookie } }), null);
+  assert.equal((await requireAdminAccess({ headers: { cookie: firstMagicVerification.cookie } }))?.role, 'viewer');
+
+  const logoutResponse = await invokeRoute(app, {
+    method: 'delete',
+    routePath: '/api/admin/session',
+    cookie: adminLogin.cookie,
+  });
+  assert.equal(logoutResponse.statusCode, 200);
+  assert.match(logoutResponse.headers['set-cookie'], /Max-Age=0/);
+  assert.equal(await requireAdminAccess({ headers: { cookie: adminLogin.cookie } }), null);
 });

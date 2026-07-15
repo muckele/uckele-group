@@ -19,9 +19,28 @@ import {
   normalizeSbaEligibility,
 } from './workflow.js';
 import { resolveSecureStoragePath } from './documentVault.js';
+import { commitCrmActivityMutation, summarizeSubmissionChanges } from './activity.js';
+import {
+  isSecureDocumentCleanupIntentActive,
+  listSecureDocumentCleanupSidecars,
+  persistSecureDocumentCleanupJob,
+  removeSecureDocumentCleanupSidecar,
+  secureDocumentCleanupSettlementMs,
+  updateSecureDocumentCleanupJobState,
+} from './secureDocumentCleanupState.js';
 
 const allowedStatuses = ['new', 'review', 'contacted', 'archived', 'spam'];
 const turnstileTokenMaxLength = 2048;
+const cleanupWriteAheadGraceMs = secureDocumentCleanupSettlementMs;
+const cleanupLeaseMs = secureDocumentCleanupSettlementMs;
+let activeCleanupReconciliation = null;
+
+class CleanupLeaseLostError extends Error {
+  constructor() {
+    super('Secure-document cleanup lease expired or was reclaimed.');
+    this.name = 'CleanupLeaseLostError';
+  }
+}
 const diligenceStages = [
   'not-started',
   'cim-requested',
@@ -197,6 +216,85 @@ function resultFromSettled(settledResult, fallbackPrefix) {
     status: 'failed',
     error: `${fallbackPrefix}: ${settledResult.reason?.message || 'Unknown error'}`,
   };
+}
+
+function nextVersionTimestamp(previousValue = '') {
+  const generated = new Date().toISOString();
+  const previousTimestamp = Date.parse(previousValue);
+  return Number.isFinite(previousTimestamp) && Date.parse(generated) <= previousTimestamp
+    ? new Date(previousTimestamp + 1).toISOString()
+    : generated;
+}
+
+function routingOutcomeMatches(record, updates) {
+  return Boolean(record) && [
+    'delivery_status',
+    'delivery_error',
+    'crm_status',
+    'crm_error',
+    'status',
+  ].every((field) => (record[field] || '') === (updates[field] || ''));
+}
+
+async function persistSubmissionRoutingOutcome({ storage, submission, deliveryResult, crmResult, isSpam }) {
+  const routingKey = `contact-submission:${submission.id}`;
+  const deliveryStatus = normalizeField(deliveryResult?.status, 80) || 'failed';
+  const deliveryError = normalizeMessage(deliveryResult?.error, 2000);
+  const crmStatus = normalizeField(crmResult?.status, 80) || 'failed';
+  const crmError = normalizeMessage(crmResult?.error, 2000);
+  const outcome = {
+    delivery_status: deliveryStatus,
+    delivery_error: deliveryError,
+    crm_status: crmStatus,
+    crm_error: crmError,
+    status: isSpam ? 'spam' : 'new',
+  };
+  let current = submission;
+  let lastError = null;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const updates = { ...outcome, updated_at: nextVersionTimestamp(current.updated_at) };
+    const changes = summarizeSubmissionChanges(current, updates);
+
+    try {
+      const mutation = await commitCrmActivityMutation({
+        storage,
+        operation: 'update_submission',
+        payload: { id: submission.id, expectedUpdatedAt: current.updated_at, values: updates },
+        activity: {
+          submissionId: submission.id,
+          eventType: 'submission.routing-updated',
+          summary: `Inquiry routing completed: notification ${deliveryStatus}, CRM ${crmStatus}.`,
+          actor: 'submission-router',
+          role: 'system',
+          metadata: {
+            routingKey,
+            deliveryStatus,
+            crmStatus,
+            changes,
+            changedFields: changes.map((change) => change.field),
+          },
+        },
+      });
+
+      if (mutation.applied && mutation.record) {
+        return mutation.record;
+      }
+
+      current = mutation.record || await storage.getSubmission(submission.id);
+      if (routingOutcomeMatches(current, outcome)) {
+        return current;
+      }
+    } catch (error) {
+      lastError = error;
+      current = await storage.getSubmission(submission.id).catch(() => current);
+      if (routingOutcomeMatches(current, outcome)) {
+        return current;
+      }
+    }
+  }
+
+  throw lastError || new Error(`Routing outcome ${routingKey} could not be persisted without overwriting a newer CRM version.`);
 }
 
 function isValidEmail(value) {
@@ -801,7 +899,17 @@ export async function submitContactLead(body, request) {
     submission.status = 'spam';
     submission.delivery_status = 'skipped';
     submission.crm_status = 'skipped';
-    await storage.insertSubmission(submission);
+    await commitCrmActivityMutation({
+      storage,
+      operation: 'insert_submission',
+      payload: { submission },
+      activity: {
+        submissionId: submission.id,
+        eventType: 'submission.created',
+        summary: 'Website inquiry received and quarantined by spam protection.',
+        metadata: { source: submission.source, spamScore: submission.spam_score },
+      },
+    });
 
     return {
       status: 200,
@@ -812,7 +920,19 @@ export async function submitContactLead(body, request) {
     };
   }
 
-  await storage.insertSubmission(submission);
+  await commitCrmActivityMutation({
+    storage,
+    operation: 'insert_submission',
+    payload: { submission },
+    activity: {
+      submissionId: submission.id,
+      eventType: 'submission.created',
+      summary: 'Website inquiry created a new CRM record.',
+      actor: submission.name || 'website visitor',
+      role: 'contact',
+      metadata: { source: submission.source, company: submission.company },
+    },
+  });
 
   let deliveryResult = { status: 'skipped', error: '' };
   let crmResult = { status: 'skipped', error: '' };
@@ -827,13 +947,12 @@ export async function submitContactLead(body, request) {
     crmResult = resultFromSettled(settledCrm, 'CRM webhook failed');
   }
 
-  await storage.updateSubmission(submission.id, {
-    updated_at: new Date().toISOString(),
-    delivery_status: deliveryResult.status,
-    delivery_error: deliveryResult.error,
-    crm_status: crmResult.status,
-    crm_error: crmResult.error,
-    status: spamAssessment.isSpam ? 'spam' : 'new',
+  await persistSubmissionRoutingOutcome({
+    storage,
+    submission,
+    deliveryResult,
+    crmResult,
+    isSpam: spamAssessment.isSpam,
   });
 
   return {
@@ -968,7 +1087,19 @@ export async function createManualSubmission(body, adminUsername = '', options =
     },
   };
 
-  await storage.insertSubmission(submission);
+  await commitCrmActivityMutation({
+    storage,
+    operation: 'insert_submission',
+    payload: { submission },
+    activity: {
+      submissionId: submission.id,
+      eventType: 'submission.created',
+      summary: 'CRM record created manually.',
+      actor: adminUsername || 'admin',
+      role: 'admin',
+      metadata: { source: submission.source, company: submission.company },
+    },
+  });
   const enriched = await enrichSubmission(submission, storage);
 
   return {
@@ -1015,12 +1146,40 @@ function buildFollowUpQueues(enriched = []) {
   return { notifications, emailTriage };
 }
 
-export async function listDashboardSubmissions({ page, search, status }) {
+export async function listDashboardSubmissions({ page, pageSize, search, status, created, sort, direction }) {
   const storage = getStorage();
-  const [baseSummary, submissions] = await Promise.all([
+  const safePageSize = [10, 25, 50, 100].includes(Number(pageSize)) ? Number(pageSize) : 25;
+  const requestedPage = Number(page);
+  const safePage = Number.isFinite(requestedPage)
+    ? Math.max(1, Math.min(Math.trunc(requestedPage), 1_000_000))
+    : 1;
+  const safeSort = ['created_at', 'updated_at', 'company', 'next_action_at', 'priority', 'status', 'deal_score', 'listing_date'].includes(sort)
+    ? sort
+    : 'created_at';
+  const safeDirection = String(direction).toLowerCase() === 'asc' ? 'asc' : 'desc';
+  const createdAfter = created === 'last-7-days'
+    ? new Date(Date.now() - 1000 * 60 * 60 * 24 * 7).toISOString()
+    : '';
+  const query = {
+    limit: safePageSize,
+    page: safePage,
+    search,
+    status,
+    createdAfter,
+    sort: safeSort,
+    direction: safeDirection,
+  };
+  let [baseSummary, submissions] = await Promise.all([
     storage.getSummary(),
-    storage.listSubmissions({ page, search, status }),
+    storage.listSubmissions(query),
   ]);
+  const totalPages = Math.max(1, Math.ceil(submissions.total / safePageSize));
+  const resolvedPage = Math.min(safePage, totalPages);
+
+  if (resolvedPage !== safePage) {
+    submissions = await storage.listSubmissions({ ...query, page: resolvedPage });
+  }
+
   const now = new Date();
   const enriched = await enrichSubmissions(submissions.rows, storage, now);
   const { notifications, emailTriage } = buildFollowUpQueues(enriched);
@@ -1031,6 +1190,11 @@ export async function listDashboardSubmissions({ page, search, status }) {
     emailTriage,
     submissions: enriched,
     total: submissions.total,
+    page: resolvedPage,
+    pageSize: safePageSize,
+    totalPages,
+    sort: safeSort,
+    direction: safeDirection,
   };
 }
 
@@ -1069,8 +1233,8 @@ export async function listDashboardFollowUps() {
   };
 }
 
-export async function updateSubmissionWorkflow(id, fields) {
-  const storage = getStorage();
+export async function updateSubmissionWorkflow(id, fields, options = {}) {
+  const storage = options.storage || getStorage();
   const existing = await storage.getSubmission(id);
 
   if (!existing) {
@@ -1195,12 +1359,35 @@ export async function updateSubmissionWorkflow(id, fields) {
   }
 
   updates.updated_at = now;
-  const updated = storage.updateSubmissionIfCurrent
-    ? await storage.updateSubmissionIfCurrent(id, expectedUpdatedAt, updates)
-    : await storage.updateSubmission(id, updates);
+  const changes = summarizeSubmissionChanges(existing, updates);
+
+  if (changes.length === 0) {
+    return enrichSubmission(existing, storage);
+  }
+
+  const diligenceChanged = changes.some((change) => change.field === 'metadata' && fields.diligence !== undefined);
+  const mutation = await commitCrmActivityMutation({
+    storage,
+    operation: 'update_submission',
+    payload: { id, expectedUpdatedAt, values: updates },
+    activity: {
+      submissionId: id,
+      eventType: diligenceChanged ? 'diligence.updated' : 'submission.updated',
+      summary: diligenceChanged
+        ? 'Diligence review and checklist updated.'
+        : `${changes.length} CRM field${changes.length === 1 ? '' : 's'} updated.`,
+      actor: options.actor || 'admin',
+      role: options.role || 'admin',
+      metadata: {
+        changes,
+        changedFields: changes.map((change) => change.field),
+      },
+    },
+  });
+  const updated = mutation.applied ? mutation.record : null;
 
   if (!updated) {
-    const current = await storage.getSubmission(id);
+    const current = mutation.record || await storage.getSubmission(id);
 
     return current
       ? { conflict: true, current: await enrichSubmission(current, storage) }
@@ -1279,7 +1466,11 @@ async function stageSecureDocumentFiles(
 async function restoreStagedDocumentFiles(
   stagedFiles = [],
   renameFile = fs.rename,
-  { accessFile = fs.access, storageDir = getConfig().secureDocuments.storageDir } = {},
+  {
+    accessFile = fs.access,
+    storageDir = getConfig().secureDocuments.storageDir,
+    beforeMutation = null,
+  } = {},
 ) {
   const failures = [];
   const trashRoot = path.join(path.resolve(storageDir), '.trash');
@@ -1288,11 +1479,12 @@ async function restoreStagedDocumentFiles(
     const originalPath = resolveSecureStoragePath(file.originalPath, storageDir);
     const stagedPath = path.resolve(String(file.stagedPath || ''));
 
-    if (!originalPath || (stagedPath !== trashRoot && !stagedPath.startsWith(`${trashRoot}${path.sep}`))) {
+    if (!originalPath || !stagedPath.startsWith(`${trashRoot}${path.sep}`)) {
       failures.push({ filePath: file.originalPath || file.stagedPath, message: 'Cleanup path is outside the secure document vault.' });
       continue;
     }
 
+    await beforeMutation?.(file);
     try {
       await renameFile(stagedPath, originalPath);
     } catch (error) {
@@ -1315,27 +1507,163 @@ async function purgeStagedDocumentFiles(
   stagedFiles = [],
   unlinkFile = fs.unlink,
   storageDir = getConfig().secureDocuments.storageDir,
+  { beforeMutation = null } = {},
 ) {
   const failures = [];
   const trashRoot = path.join(path.resolve(storageDir), '.trash');
 
   for (const file of stagedFiles) {
     const stagedPath = path.resolve(String(file.stagedPath || ''));
-    if (stagedPath !== trashRoot && !stagedPath.startsWith(`${trashRoot}${path.sep}`)) {
+    if (!stagedPath.startsWith(`${trashRoot}${path.sep}`)) {
       failures.push({ filePath: file.stagedPath, message: 'Cleanup path is outside the secure document trash directory.' });
       continue;
     }
 
+    await beforeMutation?.(file);
     try {
       await unlinkFile(stagedPath);
     } catch (error) {
-      if (error.code !== 'ENOENT') {
+      if (error.code === 'ENOENT' && file.purgeOriginalIfStagedMissing) {
+        const originalPath = resolveSecureStoragePath(file.originalPath, storageDir);
+
+        if (!originalPath) {
+          failures.push({ filePath: file.originalPath, message: 'Original cleanup path is outside the secure document vault.' });
+          continue;
+        }
+
+        await beforeMutation?.(file);
+        try {
+          await unlinkFile(originalPath);
+        } catch (originalError) {
+          if (originalError.code !== 'ENOENT') {
+            failures.push({ filePath: originalPath, message: originalError.message || 'Unable to purge retained secure document file.' });
+          }
+        }
+      } else if (error.code !== 'ENOENT') {
         failures.push({ filePath: file.stagedPath, message: error.message || 'Unable to purge staged secure document file.' });
       }
     }
   }
 
   return failures;
+}
+
+function validateCleanupJobPaths(job, storageDir = getConfig().secureDocuments.storageDir) {
+  const trashRoot = path.join(path.resolve(storageDir), '.trash');
+  const trashDirectory = path.resolve(String(job.trash_directory || ''));
+  if (!trashDirectory.startsWith(`${trashRoot}${path.sep}`) || path.basename(trashDirectory) !== String(job.id || '')) {
+    throw new Error('Cleanup job directory is outside its secure document operation directory.');
+  }
+
+  const files = (job.files || []).map((file) => {
+    const originalPath = resolveSecureStoragePath(file.originalPath, storageDir);
+    const stagedPath = path.resolve(String(file.stagedPath || ''));
+    if (!originalPath || originalPath === path.resolve(storageDir) || originalPath === trashRoot || originalPath.startsWith(`${trashRoot}${path.sep}`)) {
+      throw new Error('Cleanup job original path is outside the canonical secure document vault.');
+    }
+    if (path.dirname(stagedPath) !== trashDirectory) {
+      throw new Error('Cleanup job staged path is outside its exact operation directory.');
+    }
+    return { ...file, originalPath, stagedPath };
+  });
+
+  return { ...job, trash_directory: trashDirectory, files };
+}
+
+async function getSubmissionStrictly(storage, submissionId) {
+  const strictLookup = storage.getSubmissionStrict;
+  if (strictLookup) {
+    return strictLookup.call(storage, submissionId);
+  }
+  if (storage.provider === 'supabase') {
+    throw new Error('Strict submission lookup is required for Supabase cleanup reconciliation.');
+  }
+  if (!storage.getSubmission) {
+    throw new Error('Submission lookup is required for cleanup reconciliation.');
+  }
+  return storage.getSubmission(submissionId);
+}
+
+function cleanupJobIsSettling(job, nowMs = Date.now()) {
+  if (!job.metadata?.writeAheadIntent) {
+    return false;
+  }
+  if (isSecureDocumentCleanupIntentActive(job.id)) {
+    return true;
+  }
+
+  const explicitReconcileAfter = Date.parse(job.metadata?.reconcileAfter || '');
+  if (Number.isFinite(explicitReconcileAfter)) {
+    return nowMs < explicitReconcileAfter;
+  }
+
+  const intentCreatedAt = Date.parse(job.created_at || '');
+  return Number.isFinite(intentCreatedAt) && nowMs - intentCreatedAt < cleanupWriteAheadGraceMs;
+}
+
+async function partitionCleanupJobFiles(storage, job, storageDir = getConfig().secureDocuments.storageDir) {
+  const reason = String(job.metadata?.reason || '');
+
+  if (reason === 'individual-document-deletion') {
+    if (!storage.getSecureDocument) {
+      throw new Error('Secure document lookup is required to reconcile an individual deletion.');
+    }
+
+    const documentId = job.metadata?.documentId || job.files?.[0]?.documentId;
+    if (!documentId) {
+      throw new Error('Individual document cleanup job is missing its document ID.');
+    }
+    if (job.files?.length !== 1 || job.files[0].documentId !== documentId) {
+      throw new Error('Individual document cleanup job does not match its file identity.');
+    }
+
+    const document = await storage.getSecureDocument(documentId);
+    if (document) {
+      const file = job.files[0];
+      const documentPath = resolveSecureStoragePath(document.storage_path, storageDir);
+      if (!file || !documentPath || documentPath !== file.originalPath) {
+        throw new Error('Individual cleanup destination does not match the secure document record.');
+      }
+    }
+    return document
+      ? { restoreFiles: job.files || [], purgeFiles: [] }
+      : { restoreFiles: [], purgeFiles: job.files || [] };
+  }
+
+  if (reason === 'ambiguous-secure-upload-finalization') {
+    if (!storage.getSecureDocument) {
+      throw new Error('Secure document lookup is required to reconcile an ambiguous upload.');
+    }
+
+    const documentIds = Array.isArray(job.metadata?.documentIds) ? job.metadata.documentIds : [];
+    const dispositions = await Promise.all((job.files || []).map(async (file, index) => {
+      const documentId = documentIds[index];
+      if (!documentId || file.documentId !== documentId) {
+        throw new Error('Ambiguous upload cleanup job is missing a document ID.');
+      }
+      const document = await storage.getSecureDocument(documentId);
+      if (document) {
+        const documentPath = resolveSecureStoragePath(document.storage_path, storageDir);
+        if (!documentPath || documentPath !== file.originalPath) {
+          throw new Error(`Cleanup destination for secure document ${documentId} does not match its database record.`);
+        }
+      }
+      return { file, document };
+    }));
+
+    return dispositions.reduce(
+      (result, disposition) => {
+        result[disposition.document ? 'restoreFiles' : 'purgeFiles'].push(disposition.file);
+        return result;
+      },
+      { restoreFiles: [], purgeFiles: [] },
+    );
+  }
+
+  const submission = await getSubmissionStrictly(storage, job.submission_id);
+  return submission
+    ? { restoreFiles: job.files || [], purgeFiles: [] }
+    : { restoreFiles: [], purgeFiles: job.files || [] };
 }
 
 async function removeCleanupDirectory(directory, rmdir = fs.rmdir, storageDir = getConfig().secureDocuments.storageDir) {
@@ -1356,58 +1684,288 @@ async function removeCleanupDirectory(directory, rmdir = fs.rmdir, storageDir = 
   }
 }
 
-export async function reconcileSecureDocumentCleanupJobs(options = {}) {
+async function importSecureDocumentCleanupSidecars(storage, options = {}) {
+  const discovery = await listSecureDocumentCleanupSidecars({
+    storageDir: options.storageDir,
+    fileSystem: options.fileSystem || fs,
+  });
+  const jobs = [];
+  const errors = [...discovery.errors];
+
+  for (const sidecar of discovery.sidecars) {
+    let durableJob = null;
+    let lastError = null;
+
+    if (storage.getSecureDocumentCleanupJob) {
+      try {
+        durableJob = await storage.getSecureDocumentCleanupJob(sidecar.job.id);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (!durableJob && storage.insertSecureDocumentCleanupJob) {
+      try {
+        durableJob = await storage.insertSecureDocumentCleanupJob(sidecar.job);
+      } catch (error) {
+        lastError = error;
+
+        // The insert may have committed even when its response was lost. A
+        // second read makes sidecar import idempotent without issuing a
+        // duplicate mutation.
+        if (storage.getSecureDocumentCleanupJob) {
+          try {
+            durableJob = await storage.getSecureDocumentCleanupJob(sidecar.job.id);
+          } catch (inspectionError) {
+            lastError = inspectionError;
+          }
+        }
+      }
+    }
+
+    if (!durableJob) {
+      errors.push({
+        path: sidecar.path,
+        error: lastError || new Error('Cleanup storage did not confirm the recovered sidecar job.'),
+      });
+      continue;
+    }
+
+    if (
+      path.resolve(String(durableJob.trash_directory || '')) !== sidecar.job.trash_directory ||
+      String(durableJob.submission_id || '') !== String(sidecar.job.submission_id || '')
+    ) {
+      errors.push({
+        path: sidecar.path,
+        error: new Error('Cleanup sidecar does not match the durable job with the same identity.'),
+      });
+      continue;
+    }
+
+    try {
+      await removeSecureDocumentCleanupSidecar(sidecar.path, {
+        storageDir: options.storageDir,
+        fileSystem: options.fileSystem || fs,
+      });
+      if (['completed', 'restored'].includes(durableJob.status)) {
+        await removeCleanupDirectory(
+          durableJob.trash_directory,
+          options.rmdir || fs.rmdir,
+          options.storageDir,
+        );
+      }
+    } catch (error) {
+      if (['completed', 'restored'].includes(durableJob.status)) {
+        errors.push({ path: sidecar.path, error });
+      } else {
+        // Keep processing the durable pending job. Its normal directory
+        // removal will retry the sidecar cleanup and record one job failure if
+        // the filesystem problem remains.
+        console.warn(`[secure-documents] cleanup sidecar removal will be retried for job ${durableJob.id}: ${error.message}`);
+      }
+    }
+
+    if (!['completed', 'restored'].includes(durableJob.status)) {
+      jobs.push(durableJob);
+    }
+  }
+
+  return { jobs, errors, discovered: discovery.sidecars.length + discovery.errors.length };
+}
+
+async function runSecureDocumentCleanupReconciliation(options = {}) {
   const storage = options.storage || getStorage();
+  const reconciliationNowMs = options.now === undefined ? Date.now() : Date.parse(String(options.now));
+  if (!Number.isFinite(reconciliationNowMs)) {
+    throw new Error('Secure document cleanup reconciliation time is invalid.');
+  }
   if (!storage.listPendingSecureDocumentCleanupJobs || !storage.updateSecureDocumentCleanupJob) {
     return { reviewed: 0, completed: 0, restored: 0, failed: 0 };
   }
-  const jobs = await storage.listPendingSecureDocumentCleanupJobs(options.limit || 100);
-  const summary = { reviewed: jobs.length, completed: 0, restored: 0, failed: 0 };
+  const recovered = await importSecureDocumentCleanupSidecars(storage, options);
+  const persistedJobs = await storage.listPendingSecureDocumentCleanupJobs(options.limit || 100);
+  const jobsById = new Map();
+  for (const job of [...persistedJobs, ...recovered.jobs]) jobsById.set(job.id, job);
+  const jobs = [...jobsById.values()];
+  const summary = {
+    reviewed: jobs.length + Math.max(0, recovered.discovered - recovered.jobs.length),
+    completed: 0,
+    restored: 0,
+    failed: recovered.errors.length,
+  };
+
+  for (const failure of recovered.errors) {
+    console.error(`[secure-documents] cleanup sidecar recovery failed: ${failure.error?.message || failure.error}`);
+  }
 
   for (const job of jobs) {
-    const now = new Date().toISOString();
+    const now = new Date(reconciliationNowMs).toISOString();
+    let leaseToken = null;
+    const updateReconciliationState = async (values) => {
+      if (leaseToken && storage.updateSecureDocumentCleanupJobIfLeased) {
+        return storage.updateSecureDocumentCleanupJobIfLeased(job.id, leaseToken, values);
+      }
+      return storage.updateSecureDocumentCleanupJob(job.id, values);
+    };
+
     try {
-      const submission = await storage.getSubmission(job.submission_id);
-      const failures = submission
-        ? await restoreStagedDocumentFiles(job.files, options.renameFile || fs.rename, {
-            accessFile: options.accessFile || fs.access,
-            storageDir: options.storageDir,
-          })
-        : await purgeStagedDocumentFiles(job.files, options.unlinkFile || fs.unlink, options.storageDir);
+      let claimedJob = job;
+      if (cleanupJobIsSettling(claimedJob, reconciliationNowMs)) {
+        continue;
+      }
+
+      if (storage.claimSecureDocumentCleanupJob) {
+        const requestedLeaseToken = randomUUID();
+        if (
+          !storage.updateSecureDocumentCleanupJobIfLeased ||
+          !storage.renewSecureDocumentCleanupJobLease
+        ) {
+          throw new Error('Cleanup-job claims require token-fenced updates and server-timed lease renewal.');
+        }
+        // Retain the token even if the claim response is lost. A fenced
+        // cleanup-failure update can then affect only a claim that actually
+        // committed for this worker.
+        leaseToken = requestedLeaseToken;
+        claimedJob = await storage.claimSecureDocumentCleanupJob(job.id, {
+          claimedAt: now,
+          leaseExpiresAt: new Date(Date.parse(now) + cleanupLeaseMs).toISOString(),
+          leaseToken: requestedLeaseToken,
+        });
+        if (!claimedJob) {
+          continue;
+        }
+        if (leaseToken && claimedJob.lease_token !== leaseToken) {
+          throw new Error('Cleanup job claim returned a different lease owner.');
+        }
+      }
+
+      let safeJob = validateCleanupJobPaths(claimedJob, options.storageDir);
+      const renewReconciliationLease = async () => {
+        if (!leaseToken) {
+          return safeJob;
+        }
+        const renewedJob = await storage.renewSecureDocumentCleanupJobLease(
+          job.id,
+          leaseToken,
+          cleanupLeaseMs,
+        );
+        if (!renewedJob) {
+          throw new CleanupLeaseLostError();
+        }
+        safeJob = validateCleanupJobPaths(renewedJob, options.storageDir);
+        return safeJob;
+      };
+
+      if (storage.claimSecureDocumentCleanupJob) {
+        if (cleanupJobIsSettling(safeJob, reconciliationNowMs)) {
+          await updateReconciliationState({
+            lease_claimed_at: null,
+            lease_expires_at: null,
+            lease_token: null,
+          });
+          continue;
+        }
+      }
+
+      const { restoreFiles, purgeFiles } = await partitionCleanupJobFiles(storage, safeJob, options.storageDir);
+      if (leaseToken) {
+        await renewReconciliationLease();
+      }
+
+      const restoreFailures = await restoreStagedDocumentFiles(restoreFiles, options.renameFile || fs.rename, {
+        accessFile: options.accessFile || fs.access,
+        storageDir: options.storageDir,
+        beforeMutation: leaseToken ? renewReconciliationLease : null,
+      });
+      const purgeFailures = await purgeStagedDocumentFiles(
+        purgeFiles,
+        options.unlinkFile || fs.unlink,
+        options.storageDir,
+        { beforeMutation: leaseToken ? renewReconciliationLease : null },
+      );
+      const failures = [...restoreFailures, ...purgeFailures];
 
       if (failures.length > 0) {
         summary.failed += 1;
-        await storage.updateSecureDocumentCleanupJob(job.id, {
+        await updateReconciliationState({
           updated_at: now,
-          status: submission ? 'restore-failed' : 'cleanup-failed',
+          status: restoreFiles.length > 0 ? 'restore-failed' : 'cleanup-failed',
           attempt_count: Number(job.attempt_count || 0) + 1,
           last_error: failures.map((failure) => failure.message).join('; ').slice(0, 2000),
+          lease_claimed_at: null,
+          lease_expires_at: null,
+          lease_token: null,
         });
         continue;
       }
 
-      await removeCleanupDirectory(job.trash_directory, options.rmdir || fs.rmdir, options.storageDir);
-      const status = submission ? 'restored' : 'completed';
-      await storage.updateSecureDocumentCleanupJob(job.id, {
+      if (
+        safeJob.metadata?.reason === 'ambiguous-secure-upload-finalization' &&
+        restoreFiles.length === 0 &&
+        safeJob.metadata?.requestId
+      ) {
+        const resetRequest = storage.resetSecureUploadRequestIfUploading || storage.updateSecureUploadRequest;
+        if (resetRequest) {
+          await renewReconciliationLease();
+          await resetRequest.call(storage, safeJob.metadata.requestId, {
+            updated_at: now,
+            status: safeJob.metadata.resetStatus || 'open',
+          });
+        }
+      }
+
+      await renewReconciliationLease();
+      await removeCleanupDirectory(safeJob.trash_directory, options.rmdir || fs.rmdir, options.storageDir);
+      const status = restoreFiles.length > 0 ? 'restored' : 'completed';
+      const terminalJob = await updateReconciliationState({
         updated_at: now,
         completed_at: now,
         status,
         attempt_count: Number(job.attempt_count || 0) + 1,
         last_error: null,
+        lease_claimed_at: null,
+        lease_expires_at: null,
+        lease_token: null,
       });
+      if (!terminalJob && leaseToken) {
+        summary.failed += 1;
+        continue;
+      }
       summary[status] += 1;
     } catch (error) {
+      if (error instanceof CleanupLeaseLostError) {
+        continue;
+      }
       summary.failed += 1;
-      await storage.updateSecureDocumentCleanupJob(job.id, {
+      await updateReconciliationState({
         updated_at: now,
         status: 'cleanup-failed',
         attempt_count: Number(job.attempt_count || 0) + 1,
         last_error: String(error.message || error).slice(0, 2000),
+        lease_claimed_at: null,
+        lease_expires_at: null,
+        lease_token: null,
       }).catch(() => {});
     }
   }
 
   return summary;
+}
+
+export async function reconcileSecureDocumentCleanupJobs(options = {}) {
+  if (activeCleanupReconciliation) {
+    return activeCleanupReconciliation;
+  }
+
+  const execution = runSecureDocumentCleanupReconciliation(options);
+  activeCleanupReconciliation = execution;
+  try {
+    return await execution;
+  } finally {
+    if (activeCleanupReconciliation === execution) {
+      activeCleanupReconciliation = null;
+    }
+  }
 }
 
 export function startSecureDocumentCleanupScheduler({ intervalMs = 60 * 60 * 1000 } = {}) {
@@ -1432,7 +1990,7 @@ export async function deleteDashboardSubmission(id, options = {}) {
     return null;
   }
 
-  const existing = await storage.getSubmission(submissionId);
+  const existing = await getSubmissionStrictly(storage, submissionId);
 
   if (!existing) {
     return null;
@@ -1443,16 +2001,22 @@ export async function deleteDashboardSubmission(id, options = {}) {
     : [];
   const cleanupId = randomUUID();
   let cleanupJob = null;
+  const updateCleanupState = async (values) => {
+    if (!cleanupJob) return null;
+    const result = await updateSecureDocumentCleanupJobState(storage, cleanupJob, values);
+    cleanupJob = result.job;
+    return result;
+  };
   const staged = await stageSecureDocumentFiles(documents, {
     mkdir,
     renameFile,
     operationId: cleanupId,
     onPrepared: async ({ plannedFiles, trashDirectory }) => {
-      if (plannedFiles.length === 0 || !storage.insertSecureDocumentCleanupJob) {
+      if (plannedFiles.length === 0) {
         return;
       }
       const now = new Date().toISOString();
-      cleanupJob = await storage.insertSecureDocumentCleanupJob({
+      const persistence = await persistSecureDocumentCleanupJob(storage, {
         id: cleanupId,
         submission_id: submissionId,
         created_at: now,
@@ -1463,8 +2027,12 @@ export async function deleteDashboardSubmission(id, options = {}) {
         files: plannedFiles,
         attempt_count: 0,
         last_error: null,
-        metadata: {},
+        metadata: {
+          reconcileAfter: new Date(Date.parse(now) + secureDocumentCleanupSettlementMs).toISOString(),
+          writeAheadIntent: true,
+        },
       });
+      cleanupJob = persistence.job;
     },
   });
 
@@ -1477,7 +2045,7 @@ export async function deleteDashboardSubmission(id, options = {}) {
     }
     if (cleanupJob) {
       const now = new Date().toISOString();
-      await storage.updateSecureDocumentCleanupJob(cleanupJob.id, {
+      await updateCleanupState({
         updated_at: now,
         completed_at: restoreFailures.length === 0 ? now : null,
         status: restoreFailures.length === 0 ? 'restored' : 'restore-failed',
@@ -1498,67 +2066,103 @@ export async function deleteDashboardSubmission(id, options = {}) {
   }
 
   let deleted;
+  let deletionError = null;
 
   try {
     deleted = await storage.deleteSubmission(submissionId);
-  } catch {
-    const restoreFailures = await restoreStagedDocumentFiles(staged.stagedFiles, renameFile);
-    if (restoreFailures.length === 0) {
-      await removeCleanupDirectory(staged.trashDirectory, rmdir).catch((error) => {
-        restoreFailures.push({ filePath: staged.trashDirectory, message: error.message });
-      });
-    }
+  } catch (error) {
+    deletionError = error;
+  }
+
+  if (deletionError) {
+    const message = String(deletionError.message || deletionError).slice(0, 2000);
     if (cleanupJob) {
-      const now = new Date().toISOString();
-      await storage.updateSecureDocumentCleanupJob(cleanupJob.id, {
-        updated_at: now,
-        completed_at: restoreFailures.length === 0 ? now : null,
-        status: restoreFailures.length === 0 ? 'restored' : 'restore-failed',
+      await updateCleanupState({
+        updated_at: new Date().toISOString(),
+        status: 'reconciliation-pending',
         attempt_count: 1,
-        last_error: restoreFailures.map((failure) => failure.message).join('; ') || null,
+        last_error: message,
+        metadata: { ...cleanupJob.metadata, ambiguousDelete: true },
       }).catch(() => {});
     }
-
-    if (restoreFailures.length > 0) {
-      console.error(`[crm] database deletion failed for ${submissionId}; ${restoreFailures.length} staged file(s) could not be restored.`);
-    }
-
+    console.error(`[crm] deletion outcome for ${submissionId} is unknown; staged documents were retained for reconciliation.`);
     return {
       ok: false,
-      status: 500,
-      error: restoreFailures.length === 0
-        ? 'CRM deletion failed. Document files were restored so the deletion can be retried.'
-        : 'CRM deletion failed, and some staged document files could not be restored. Cleanup has been queued for retry.',
-      cleanupFailures: restoreFailures,
+      status: 503,
+      error: 'CRM deletion could not be confirmed. Document files remain securely staged while the database outcome is reconciled.',
+      cleanupPending: staged.stagedFiles.length > 0,
+      cleanupFailures: [{ message }],
     };
   }
 
   if (!deleted) {
-    const restoreFailures = await restoreStagedDocumentFiles(staged.stagedFiles, renameFile);
-    if (restoreFailures.length === 0) {
-      await removeCleanupDirectory(staged.trashDirectory, rmdir).catch((error) => {
-        restoreFailures.push({ filePath: staged.trashDirectory, message: error.message });
-      });
+    let currentSubmission;
+    let inspectionError = null;
+
+    try {
+      currentSubmission = await getSubmissionStrictly(storage, submissionId);
+    } catch (error) {
+      inspectionError = error;
     }
-    if (cleanupJob) {
-      const now = new Date().toISOString();
-      await storage.updateSecureDocumentCleanupJob(cleanupJob.id, {
-        updated_at: now,
-        completed_at: restoreFailures.length === 0 ? now : null,
-        status: restoreFailures.length === 0 ? 'restored' : 'restore-failed',
-        attempt_count: 1,
-        last_error: restoreFailures.map((failure) => failure.message).join('; ') || null,
-      }).catch(() => {});
+
+    if (inspectionError) {
+      const message = String(inspectionError.message || inspectionError).slice(0, 2000);
+      if (cleanupJob) {
+        await updateCleanupState({
+          updated_at: new Date().toISOString(),
+          status: 'reconciliation-pending',
+          attempt_count: 1,
+          last_error: message,
+          metadata: { ...cleanupJob.metadata, ambiguousDelete: true },
+        }).catch(() => {});
+      }
+      console.error(`[crm] deletion outcome for ${submissionId} is unknown; staged documents were retained for reconciliation.`);
+      return {
+        ok: false,
+        status: 503,
+        error: 'CRM deletion could not be confirmed. Document files remain securely staged while the database outcome is reconciled.',
+        cleanupPending: staged.stagedFiles.length > 0,
+        cleanupFailures: [{ message }],
+      };
     }
-    return restoreFailures.length === 0
-      ? null
-      : { ok: false, status: 500, error: 'CRM record was not deleted, and staged documents could not be fully restored.', cleanupFailures: restoreFailures };
+
+    if (!currentSubmission) {
+      // A strict read confirmed that the database deletion committed even
+      // though its response was lost. Continue with the purge path.
+      deleted = existing;
+    } else {
+      const restoreFailures = await restoreStagedDocumentFiles(staged.stagedFiles, renameFile);
+      if (restoreFailures.length === 0) {
+        await removeCleanupDirectory(staged.trashDirectory, rmdir).catch((error) => {
+          restoreFailures.push({ filePath: staged.trashDirectory, message: error.message });
+        });
+      }
+      if (cleanupJob) {
+        const now = new Date().toISOString();
+        await updateCleanupState({
+          updated_at: now,
+          completed_at: restoreFailures.length === 0 ? now : null,
+          status: restoreFailures.length === 0 ? 'restored' : 'restore-failed',
+          attempt_count: 1,
+          last_error: restoreFailures.map((failure) => failure.message).join('; ') || null,
+        }).catch(() => {});
+      }
+      return restoreFailures.length === 0
+        ? null
+        : { ok: false, status: 500, error: 'CRM record was not deleted, and staged documents could not be fully restored.', cleanupFailures: restoreFailures };
+    }
   }
 
   if (cleanupJob) {
-    await storage.updateSecureDocumentCleanupJob(cleanupJob.id, {
-      updated_at: new Date().toISOString(),
+    const deletionConfirmedAt = new Date().toISOString();
+    await updateCleanupState({
+      updated_at: deletionConfirmedAt,
       status: 'pending-purge',
+      metadata: {
+        ...cleanupJob.metadata,
+        deletionConfirmedAt,
+        writeAheadIntent: false,
+      },
     }).catch(() => {});
   }
   const purgeFailures = await purgeStagedDocumentFiles(staged.plannedFiles || staged.stagedFiles, unlinkFile);
@@ -1570,7 +2174,7 @@ export async function deleteDashboardSubmission(id, options = {}) {
   if (cleanupJob && purgeFailures.length === 0) {
     const completedAt = new Date().toISOString();
     await removeCleanupDirectory(staged.trashDirectory, rmdir).catch(() => {});
-    await storage.updateSecureDocumentCleanupJob(cleanupJob.id, {
+    await updateCleanupState({
       updated_at: completedAt,
       completed_at: completedAt,
       status: 'completed',
@@ -1578,7 +2182,7 @@ export async function deleteDashboardSubmission(id, options = {}) {
       last_error: null,
     }).catch(() => {});
   } else if (cleanupJob) {
-    await storage.updateSecureDocumentCleanupJob(cleanupJob.id, {
+    await updateCleanupState({
       updated_at: new Date().toISOString(),
       status: 'cleanup-failed',
       attempt_count: 1,

@@ -14,6 +14,8 @@ function productionConfig() {
       provider: 'resend',
       resendApiKey: 'resend-test-key',
       resendFromEmail: 'Uckele Group <test@example.com>',
+      resendReplyTo: 'deals@replies.example.com',
+      resendInboundDomain: 'replies.example.com',
       fallbackRecipient: 'admin@example.com',
       emailWebhookSecret: 'webhook-secret',
     },
@@ -39,7 +41,11 @@ function productionConfig() {
     },
     dealHunter: {
       dailyEmail: { timezone: 'America/Los_Angeles', time: '10:15', checkIntervalMs: 60_000, retryIntervalMs: 60_000 },
-      cimFollowUp: { enabled: true },
+      cimFollowUp: {
+        enabled: true,
+        checkIntervalMs: 3_600_000,
+        timezone: 'America/Los_Angeles',
+      },
     },
   };
 }
@@ -57,6 +63,8 @@ test('production configuration rejects missing and shared security secrets', () 
   config.secureDocuments.tokenSecret = 'short';
   config.turnstile.secretKey = '';
   config.delivery.emailWebhookSecret = '';
+  config.delivery.resendReplyTo = '';
+  config.delivery.resendInboundDomain = '';
 
   const result = validateConfig(config);
   assert.equal(result.ok, false);
@@ -65,6 +73,17 @@ test('production configuration rejects missing and shared security secrets', () 
   assert.ok(result.errors.some((error) => error.includes('SECURE_DOCUMENTS_TOKEN_SECRET')));
   assert.ok(result.errors.some((error) => error.includes('TURNSTILE_SITE_KEY')));
   assert.ok(result.errors.some((error) => error.includes('WEBHOOK_SECRET')));
+  assert.ok(result.errors.some((error) => error.includes('RESEND_REPLY_TO')));
+  assert.ok(result.errors.some((error) => error.includes('RESEND_INBOUND_DOMAIN')));
+});
+
+test('production follow-ups require the reply-to address to use the receiving domain', () => {
+  const config = productionConfig();
+  config.delivery.resendReplyTo = 'mathew@example.com';
+
+  const result = validateConfig(config);
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes('must use the RESEND_INBOUND_DOMAIN')));
 });
 
 test('production configuration validates EmailJS and Formspree provider requirements', () => {
@@ -101,6 +120,15 @@ test('production configuration rejects unsupported auth modes and unsafe numeric
   config.secureDocuments.maxTotalUploadBytes = 0;
   config.secureDocuments.maxConcurrentUploads = 1.5;
   config.dealHunter.dailyEmail.time = '29:99';
+  config.dealHunter.cimFollowUp.checkIntervalMs = 0;
+  config.dealHunter.cimFollowUp.timezone = 'Not/A-Timezone';
+  config.backup = {
+    time: '25:90',
+    timezone: 'Not/A-Timezone',
+    retentionDays: 0,
+    retentionCount: 1.5,
+    checkIntervalMs: -1,
+  };
 
   const result = validateConfig(config);
   assert.equal(result.ok, false);
@@ -109,6 +137,13 @@ test('production configuration rejects unsupported auth modes and unsafe numeric
   assert.ok(result.errors.some((error) => error.includes('MAX_TOTAL_UPLOAD_BYTES')));
   assert.ok(result.errors.some((error) => error.includes('MAX_CONCURRENT_UPLOADS')));
   assert.ok(result.errors.some((error) => error.includes('DAILY_EMAIL_TIME')));
+  assert.ok(result.errors.some((error) => error.includes('CIM_FOLLOW_UP_CHECK_INTERVAL_MS')));
+  assert.ok(result.errors.some((error) => error.includes('CIM_FOLLOW_UP_TIMEZONE')));
+  assert.ok(result.errors.some((error) => error.includes('BACKUP_DAILY_TIME')));
+  assert.ok(result.errors.some((error) => error.includes('BACKUP_TIMEZONE')));
+  assert.ok(result.errors.some((error) => error.includes('BACKUP_RETENTION_DAYS')));
+  assert.ok(result.errors.some((error) => error.includes('BACKUP_RETENTION_COUNT')));
+  assert.ok(result.errors.some((error) => error.includes('BACKUP_CHECK_INTERVAL_MS')));
   assert.ok(result.errors.some((error) => error.includes('authentication path')));
 });
 

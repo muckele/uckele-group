@@ -5,3 +5,6 @@ dist
 data
 dev-ops
 tmp
+test-results
+playwright-report
+blob-report

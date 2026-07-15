@@ -17,6 +17,8 @@ function normalizeUploadRequestRow(row) {
     ? {
         ...row,
         nda_required: Boolean(row.nda_required),
+        requested_documents: Array.isArray(row.requested_documents) ? row.requested_documents : [],
+        upload_batch_count: Number(row.upload_batch_count || 0),
       }
     : null;
 }
@@ -28,6 +30,142 @@ function normalizeEmailEventRow(row) {
         metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
       }
     : null;
+}
+
+function normalizeCrmActivityEventRow(row) {
+  return row
+    ? {
+        ...row,
+        metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
+      }
+    : null;
+}
+
+function normalizeSecureDocumentCleanupJobRow(row) {
+  return row
+    ? {
+        ...row,
+        files: Array.isArray(row.files) ? row.files : [],
+        metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
+        attempt_count: Number(row.attempt_count || 0),
+        lease_claimed_at: row.lease_claimed_at || null,
+        lease_expires_at: row.lease_expires_at || null,
+        lease_token: row.lease_token || null,
+      }
+    : null;
+}
+
+const cleanupLeaseTokenPattern = /^[A-Za-z0-9_-]{16,200}$/;
+const canonicalUtcIsoPattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const maxCleanupJobLeaseMs = 24 * 60 * 60 * 1000;
+const cleanupJobUpdateFields = new Set([
+  'updated_at',
+  'completed_at',
+  'status',
+  'trash_directory',
+  'files',
+  'attempt_count',
+  'last_error',
+  'metadata',
+  'lease_claimed_at',
+  'lease_expires_at',
+  'lease_token',
+]);
+
+function normalizeCleanupLeaseToken(value) {
+  if (typeof value !== 'string' || value.trim() !== value || !cleanupLeaseTokenPattern.test(value)) {
+    throw new Error('Cleanup-job lease token must be a 16-200 character URL-safe opaque value.');
+  }
+  return value;
+}
+
+function normalizeCleanupLeaseDuration(value) {
+  if (!Number.isSafeInteger(value) || value <= 0 || value > maxCleanupJobLeaseMs) {
+    throw new Error('Cleanup-job lease duration must be an integer between 1 millisecond and 24 hours.');
+  }
+  return value;
+}
+
+function normalizeCanonicalUtcIso(value, fieldName) {
+  if (
+    typeof value !== 'string' ||
+    !canonicalUtcIsoPattern.test(value) ||
+    !Number.isFinite(Date.parse(value)) ||
+    new Date(value).toISOString() !== value
+  ) {
+    throw new Error(`${fieldName} must be a canonical UTC ISO timestamp.`);
+  }
+  return value;
+}
+
+function normalizeSecureDocumentCleanupLease({ claimedAt, leaseExpiresAt, leaseToken } = {}) {
+  const normalizedClaimedAt = normalizeCanonicalUtcIso(claimedAt, 'Cleanup-job lease claim time');
+  const normalizedLeaseExpiresAt = normalizeCanonicalUtcIso(leaseExpiresAt, 'Cleanup-job lease expiry');
+  const claimedAtMs = Date.parse(normalizedClaimedAt);
+  const leaseExpiresAtMs = Date.parse(normalizedLeaseExpiresAt);
+
+  if (leaseExpiresAtMs <= claimedAtMs) {
+    throw new Error('Cleanup-job lease expiry must be later than its claim time.');
+  }
+
+  const durationMs = leaseExpiresAtMs - claimedAtMs;
+  normalizeCleanupLeaseDuration(durationMs);
+
+  return {
+    claimedAt: normalizedClaimedAt,
+    leaseExpiresAt: normalizedLeaseExpiresAt,
+    leaseToken: normalizeCleanupLeaseToken(leaseToken),
+    durationMs,
+  };
+}
+
+function normalizeSecureDocumentCleanupJobUpdate(values = {}) {
+  if (!values || typeof values !== 'object' || Array.isArray(values)) {
+    throw new Error('Cleanup-job lease update values must be an object.');
+  }
+
+  const entries = Object.entries(values);
+  if (entries.length === 0) {
+    throw new Error('Cleanup-job lease update must include at least one field.');
+  }
+
+  for (const [field, value] of entries) {
+    if (!cleanupJobUpdateFields.has(field)) {
+      throw new Error(`Unsupported cleanup-job lease update field: ${field}`);
+    }
+
+    if (['updated_at', 'completed_at', 'lease_claimed_at', 'lease_expires_at'].includes(field) && value !== null) {
+      normalizeCanonicalUtcIso(value, `Cleanup-job ${field}`);
+    }
+  }
+
+  if (Object.hasOwn(values, 'lease_token') && values.lease_token !== null) {
+    throw new Error('A cleanup-job lease update may only clear its lease token.');
+  }
+
+  if (Object.hasOwn(values, 'files') && !Array.isArray(values.files)) {
+    throw new Error('Cleanup-job files must be an array.');
+  }
+  if (
+    Object.hasOwn(values, 'metadata') &&
+    (!values.metadata || typeof values.metadata !== 'object' || Array.isArray(values.metadata))
+  ) {
+    throw new Error('Cleanup-job metadata must be an object.');
+  }
+  if (
+    Object.hasOwn(values, 'attempt_count') &&
+    (!Number.isSafeInteger(values.attempt_count) || values.attempt_count < 0)
+  ) {
+    throw new Error('Cleanup-job attempt count must be a non-negative integer.');
+  }
+
+  const normalized = { ...values };
+  if (Object.hasOwn(normalized, 'lease_token')) {
+    normalized.lease_token = null;
+    normalized.lease_claimed_at = null;
+    normalized.lease_expires_at = null;
+  }
+  return normalized;
 }
 
 function normalizeDealHunterSeenDealRow(row) {
@@ -59,28 +197,27 @@ function normalizeDealHunterCrmImportRow(row) {
     : null;
 }
 
-function normalizeProspectDiscoveryRunRow(row) {
-  return row
-    ? {
-        ...row,
-        source_data: typeof row.source_data === 'object' && row.source_data !== null ? row.source_data : {},
-      }
-    : null;
-}
+function normalizeAtomicMutationResult(operation, data) {
+  if (!data || typeof data !== 'object') {
+    return { applied: false, record: null, activity: null };
+  }
 
-function normalizeProspectDiscoveryRow(row) {
-  return row
-    ? {
-        ...row,
-        rating: row.rating === null || row.rating === undefined ? null : Number(row.rating),
-        review_count: Number(row.review_count || 0),
-        score: Number(row.score || 0),
-        business_quality_score: Number(row.business_quality_score || 0),
-        presence_gap_score: Number(row.presence_gap_score || 0),
-        reasons: Array.isArray(row.reasons) ? row.reasons : [],
-        source_data: typeof row.source_data === 'object' && row.source_data !== null ? row.source_data : {},
-      }
-    : null;
+  const normalizers = {
+    insert_submission: normalizeSubmissionRow,
+    update_submission: normalizeSubmissionRow,
+    insert_secure_upload_request: normalizeUploadRequestRow,
+    finalize_secure_document_upload: normalizeUploadRequestRow,
+    update_secure_upload_request: normalizeUploadRequestRow,
+    insert_email_event: normalizeEmailEventRow,
+    upsert_deal_hunter_cim_request: normalizeDealHunterCimRequestRow,
+  };
+  const normalizeRecord = normalizers[operation] || ((record) => record);
+
+  return {
+    applied: Boolean(data.applied),
+    record: data.record ? normalizeRecord(data.record) : null,
+    activity: data.activity ? normalizeCrmActivityEventRow(data.activity) : null,
+  };
 }
 
 function normalizeList(values, maxLength = 5000) {
@@ -284,12 +421,32 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
   }
 
   return {
+    provider: 'supabase',
+
+    async createApplicationBackup() {
+      throw new Error('Application-managed backups are only available for SQLite storage. Use Supabase managed backups for this provider.');
+    },
+
     async checkHealth() {
       const { error } = await client.from('contact_submissions').select('id').limit(1);
       if (error) {
         throw error;
       }
       return { ok: true };
+    },
+
+    async mutateWithCrmActivity({ operation, payload, activity }) {
+      const { data, error } = await client.rpc('mutate_with_crm_activity', {
+        p_operation: operation,
+        p_payload: payload || {},
+        p_activity: activity,
+      });
+
+      if (error) {
+        throw error;
+      }
+
+      return normalizeAtomicMutationResult(operation, data);
     },
 
     async insertSubmission(submission) {
@@ -338,6 +495,16 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeSubmissionRow(data);
     },
 
+    async getSubmissionStrict(id) {
+      const { data, error } = await client.from('contact_submissions').select('*').eq('id', id).maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      return data ? normalizeSubmissionRow(data) : null;
+    },
+
     async deleteSubmission(id) {
       const existing = await this.getSubmission(id);
 
@@ -348,10 +515,6 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       const nowIso = new Date().toISOString();
       const relatedUpdates = await Promise.all([
         client.from('email_events').delete().eq('submission_id', id),
-        client
-          .from('prospect_discoveries')
-          .update({ submission_id: null, status: 'crm-deleted', updated_at: nowIso })
-          .eq('submission_id', id),
         client
           .from('deal_hunter_crm_imports')
           .update({ submission_id: null, status: 'crm-deleted', updated_at: nowIso })
@@ -500,36 +663,35 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return null;
     },
 
-    async listSubmissions({ limit = 50, page = 1, search = '', status = 'all' } = {}) {
-      const safeLimit = Math.max(1, Math.min(limit, 5000));
-      const from = Math.max(0, page - 1) * safeLimit;
-      const to = from + safeLimit - 1;
-      let query = client
-        .from('contact_submissions')
-        .select('*', { count: 'exact' })
-        .order('created_at', { ascending: false })
-        .range(from, to);
-
-      if (status && status !== 'all') {
-        query = query.eq('status', status);
-      }
-
-      if (search) {
-        const term = search.replace(/[,%()]/g, ' ').trim();
-        query = query.or(
-          `name.ilike.%${term}%,email.ilike.%${term}%,company.ilike.%${term}%,message.ilike.%${term}%,notes.ilike.%${term}%,listing_url.ilike.%${term}%,business_website.ilike.%${term}%,prospectus_url.ilike.%${term}%,broker_name.ilike.%${term}%,broker_email.ilike.%${term}%,seller_name.ilike.%${term}%,seller_email.ilike.%${term}%`,
-        );
-      }
-
-      const { data, error, count } = await query;
+    async listSubmissions({ limit = 50, page = 1, search = '', status = 'all', createdAfter = '', sort = 'created_at', direction = 'desc' } = {}) {
+      const requestedLimit = Number(limit);
+      const requestedPage = Number(page);
+      const safeLimit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(Math.trunc(requestedLimit), 5000))
+        : 50;
+      const safePage = Number.isFinite(requestedPage)
+        ? Math.max(1, Math.min(Math.trunc(requestedPage), 1_000_000))
+        : 1;
+      const sortColumns = new Set(['created_at', 'updated_at', 'company', 'next_action_at', 'priority', 'status', 'deal_score', 'listing_date']);
+      const sortColumn = sortColumns.has(sort) ? sort : 'created_at';
+      const safeDirection = String(direction).toLowerCase() === 'asc' ? 'asc' : 'desc';
+      const { data, error } = await client.rpc('list_submissions_page', {
+        p_limit: safeLimit,
+        p_page: safePage,
+        p_search: String(search || '').trim(),
+        p_status: status && status !== 'all' ? String(status) : '',
+        p_created_after: String(createdAfter || ''),
+        p_sort: sortColumn,
+        p_direction: safeDirection,
+      });
 
       if (error) {
         throw error;
       }
 
       return {
-        rows: (data || []).map(normalizeSubmissionRow),
-        total: count || 0,
+        rows: (data?.rows || []).map(normalizeSubmissionRow),
+        total: Number(data?.total || 0),
       };
     },
 
@@ -643,12 +805,28 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeUploadRequestRow(data);
     },
 
+    async resetSecureUploadRequestIfUploading(id, values) {
+      const { data, error } = await client
+        .from('secure_upload_requests')
+        .update(values)
+        .eq('id', id)
+        .eq('status', 'uploading')
+        .select()
+        .maybeSingle();
+
+      if (error) {
+        throw error;
+      }
+
+      return normalizeUploadRequestRow(data);
+    },
+
     async claimSecureUploadRequest(id, values, options = {}) {
       const activeClaim = await client
         .from('secure_upload_requests')
         .update(values)
         .eq('id', id)
-        .eq('status', 'awaiting-documents')
+        .in('status', ['awaiting-documents', 'open', 'partially-received'])
         .select()
         .maybeSingle();
 
@@ -931,123 +1109,34 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return (data || []).map(normalizeEmailEventRow);
     },
 
-    async insertProspectDiscoveryRun(run) {
-      const { data, error } = await client.from('prospect_discovery_runs').insert(run).select().single();
+    async insertCrmActivityEvent(event) {
+      const { data, error } = await client.from('crm_activity_events').insert(event).select().single();
 
       if (error) {
         throw error;
       }
 
-      return normalizeProspectDiscoveryRunRow(data);
+      return normalizeCrmActivityEventRow(data);
     },
 
-    async updateProspectDiscoveryRun(id, values) {
-      const { data, error } = await client
-        .from('prospect_discovery_runs')
-        .update(values)
-        .eq('id', id)
-        .select()
-        .single();
-
-      if (error) {
-        throw error;
-      }
-
-      return normalizeProspectDiscoveryRunRow(data);
-    },
-
-    async listProspectDiscoveryRuns({ limit = 20 } = {}) {
-      const safeLimit = Math.max(1, Math.min(limit, 100));
-      const { data, error } = await client
-        .from('prospect_discovery_runs')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(safeLimit);
-
-      if (error) {
-        throw error;
-      }
-
-      return (data || []).map(normalizeProspectDiscoveryRunRow);
-    },
-
-    async getProspectDiscoveryBySource(provider, sourceId) {
-      const normalizedProvider = String(provider || '').trim();
-      const normalizedSourceId = String(sourceId || '').trim();
-
-      if (!normalizedProvider || !normalizedSourceId) {
-        return null;
-      }
-
-      const { data, error } = await client
-        .from('prospect_discoveries')
-        .select('*')
-        .eq('provider', normalizedProvider)
-        .eq('source_id', normalizedSourceId)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (error) {
-        throw error;
-      }
-
-      return normalizeProspectDiscoveryRow(data);
-    },
-
-    async insertProspectDiscovery(discovery) {
-      if (discovery.source_id) {
-        const { data, error } = await client
-          .from('prospect_discoveries')
-          .upsert(discovery, { onConflict: 'provider,source_id', ignoreDuplicates: true })
-          .select()
-          .maybeSingle();
-
-        if (error) {
-          throw error;
-        }
-
-        return normalizeProspectDiscoveryRow(data) || this.getProspectDiscoveryBySource(discovery.provider, discovery.source_id);
-      }
-
-      const { data, error } = await client.from('prospect_discoveries').insert(discovery).select().single();
-
-      if (error) {
-        throw error;
-      }
-
-      return normalizeProspectDiscoveryRow(data);
-    },
-
-    async updateProspectDiscovery(id, values) {
-      const { data, error } = await client
-        .from('prospect_discoveries')
-        .update(values)
-        .eq('id', id)
-        .select()
-        .single();
-
-      if (error) {
-        throw error;
-      }
-
-      return normalizeProspectDiscoveryRow(data);
-    },
-
-    async listProspectDiscoveries({ runId = '', status = '', limit = 50 } = {}) {
-      const safeLimit = Math.max(1, Math.min(limit, 500));
+    async listCrmActivityEvents({ submissionId = '', eventTypes = [], limit = 200, before = '' } = {}) {
       let query = client
-        .from('prospect_discoveries')
+        .from('crm_activity_events')
         .select('*')
         .order('created_at', { ascending: false })
-        .limit(safeLimit);
+        .limit(Math.max(1, Math.min(Number(limit) || 200, 500)));
 
-      if (runId) {
-        query = query.eq('run_id', runId);
+      if (submissionId) {
+        query = query.eq('submission_id', submissionId);
       }
 
-      if (status && status !== 'all') {
-        query = query.eq('status', status);
+      const safeTypes = normalizeList(eventTypes, 25);
+      if (safeTypes.length > 0) {
+        query = query.in('event_type', safeTypes);
+      }
+
+      if (before) {
+        query = query.lt('created_at', before);
       }
 
       const { data, error } = await query;
@@ -1056,48 +1145,10 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         throw error;
       }
 
-      return (data || []).map(normalizeProspectDiscoveryRow);
+      return (data || []).map(normalizeCrmActivityEventRow);
     },
 
-    async getProspectDiscoverySummary() {
-      const summary = {
-        total: 0,
-        imported: 0,
-        discovered: 0,
-        duplicate: 0,
-        'import-error': 0,
-        'not-prioritized': 0,
-        byTier: { tier_a: 0, tier_b: 0, tier_c: 0, dnp: 0, unclassified: 0 },
-      };
-      const pageSize = 1000;
 
-      for (let from = 0; ; from += pageSize) {
-        const to = from + pageSize - 1;
-        const { data, error } = await client
-          .from('prospect_discoveries')
-          .select('status, lead_tier')
-          .range(from, to);
-
-        if (error) {
-          throw error;
-        }
-
-        for (const row of data || []) {
-          const status = row.status || 'discovered';
-          const leadTier = row.lead_tier || 'unclassified';
-
-          summary.total += 1;
-          summary[status] = (summary[status] || 0) + 1;
-          summary.byTier[leadTier] = (summary.byTier[leadTier] || 0) + 1;
-        }
-
-        if (!data || data.length < pageSize) {
-          break;
-        }
-      }
-
-      return summary;
-    },
 
     async listDealHunterSeenDeals({ limit = 100000 } = {}) {
       const safeLimit = Math.max(1, Math.min(limit, 100000));
@@ -1598,6 +1649,21 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return data || null;
     },
 
+    async listScheduledJobs({ limit = 100 } = {}) {
+      const { data, error } = await client
+        .from('scheduled_job_runs')
+        .select('*')
+        .order('updated_at', { ascending: false })
+        .limit(Math.max(1, Math.min(Number(limit) || 100, 500)));
+      if (error) throw error;
+      return data || [];
+    },
+
+    async getDatabaseStatus() {
+      await this.checkHealth();
+      return { provider: 'supabase', integrity: 'remote-provider-healthy', journalMode: 'managed', databaseBytes: null };
+    },
+
     async insertAdminAuditEvent(event) {
       const { data, error } = await client.from('admin_audit_events').insert(event).select().single();
       if (error) {
@@ -1622,25 +1688,144 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return data || [];
     },
 
+    async insertSourceHealthSnapshot(snapshot) {
+      const { data, error } = await client.from('source_health_snapshots').insert(snapshot).select().single();
+      if (error) throw error;
+      return data;
+    },
+
+    async listSourceHealthSnapshots({ limit = 30 } = {}) {
+      const { data, error } = await client
+        .from('source_health_snapshots')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(Math.max(1, Math.min(Number(limit) || 30, 365)));
+      if (error) throw error;
+      return data || [];
+    },
+
+    async insertAdminMagicLink(record) {
+      const { data, error } = await client.from('admin_magic_links').insert(record).select().single();
+      if (error) throw error;
+      return data;
+    },
+
+    async consumeAdminMagicLink(tokenHash, consumedAt) {
+      const { data, error } = await client
+        .from('admin_magic_links')
+        .update({ consumed_at: consumedAt })
+        .eq('token_hash', tokenHash)
+        .is('consumed_at', null)
+        .gt('expires_at', consumedAt)
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+      return data || null;
+    },
+
+    async insertAdminSession(session) {
+      const { data, error } = await client.from('admin_sessions').insert(session).select().single();
+      if (error) throw error;
+      return data;
+    },
+
+    async getAdminSession(id) {
+      const { data, error } = await client.from('admin_sessions').select('*').eq('id', id).maybeSingle();
+      if (error) throw error;
+      return data || null;
+    },
+
+    async touchAdminSession(id, lastSeenAt) {
+      const { error } = await client.from('admin_sessions').update({ last_seen_at: lastSeenAt }).eq('id', id).is('revoked_at', null).gt('expires_at', lastSeenAt);
+      if (error) throw error;
+    },
+
+    async revokeAdminSession(id, revokedAt) {
+      const { data, error } = await client.from('admin_sessions').update({ revoked_at: revokedAt }).eq('id', id).is('revoked_at', null).select('id');
+      if (error) throw error;
+      return (data || []).length > 0;
+    },
+
+    async revokeAdminSessionsForPrincipal(principalId, revokedAt) {
+      const { data, error } = await client.from('admin_sessions').update({ revoked_at: revokedAt }).eq('principal_id', principalId).is('revoked_at', null).select('id');
+      if (error) throw error;
+      return (data || []).length;
+    },
+
+    async cleanupExpiredAuthRecords(nowIso) {
+      const [magicLinks, sessions] = await Promise.all([
+        client.from('admin_magic_links').delete().or(`expires_at.lte.${nowIso},consumed_at.not.is.null`).select('token_hash'),
+        client.from('admin_sessions').delete().or(`expires_at.lte.${nowIso},revoked_at.not.is.null`).select('id'),
+      ]);
+      if (magicLinks.error) throw magicLinks.error;
+      if (sessions.error) throw sessions.error;
+      return { magicLinks: magicLinks.data?.length || 0, sessions: sessions.data?.length || 0 };
+    },
+
     async insertSecureDocumentCleanupJob(job) {
       const { data, error } = await client.from('secure_document_cleanup_jobs').insert(job).select().single();
       if (error) {
         throw error;
       }
-      return data;
+      return normalizeSecureDocumentCleanupJobRow(data);
     },
 
     async updateSecureDocumentCleanupJob(id, values = {}) {
+      if (['lease_claimed_at', 'lease_expires_at', 'lease_token'].some((field) => Object.hasOwn(values, field))) {
+        throw new Error('Cleanup-job lease fields require a token-fenced update.');
+      }
       const { data, error } = await client
         .from('secure_document_cleanup_jobs')
         .update(values)
         .eq('id', id)
+        .is('lease_token', null)
         .select()
         .maybeSingle();
       if (error) {
         throw error;
       }
-      return data || null;
+      return normalizeSecureDocumentCleanupJobRow(data);
+    },
+
+    async claimSecureDocumentCleanupJob(id, lease = {}) {
+      const { durationMs, leaseToken } = normalizeSecureDocumentCleanupLease(lease);
+      const { data, error } = await client.rpc('claim_secure_document_cleanup_job', {
+        p_id: id,
+        p_lease_duration_ms: durationMs,
+        p_lease_token: leaseToken,
+      });
+      if (error) {
+        throw error;
+      }
+      return normalizeSecureDocumentCleanupJobRow(data);
+    },
+
+    async renewSecureDocumentCleanupJobLease(id, leaseToken, durationMs) {
+      const normalizedLeaseToken = normalizeCleanupLeaseToken(leaseToken);
+      const normalizedDurationMs = normalizeCleanupLeaseDuration(durationMs);
+      const { data, error } = await client.rpc('renew_secure_document_cleanup_job_lease', {
+        p_id: id,
+        p_lease_token: normalizedLeaseToken,
+        p_lease_duration_ms: normalizedDurationMs,
+      });
+      if (error) {
+        throw error;
+      }
+      return normalizeSecureDocumentCleanupJobRow(data);
+    },
+
+    async updateSecureDocumentCleanupJobIfLeased(id, leaseToken, values = {}) {
+      const normalizedLeaseToken = normalizeCleanupLeaseToken(leaseToken);
+      const normalizedValues = normalizeSecureDocumentCleanupJobUpdate(values);
+      const { data, error } = await client.rpc('update_secure_document_cleanup_job_if_leased', {
+        p_id: id,
+        p_lease_token: normalizedLeaseToken,
+        p_values: normalizedValues,
+      });
+      if (error) {
+        throw error;
+      }
+      return normalizeSecureDocumentCleanupJobRow(data);
     },
 
     async getSecureDocumentCleanupJob(id) {
@@ -1648,7 +1833,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       if (error) {
         throw error;
       }
-      return data || null;
+      return normalizeSecureDocumentCleanupJobRow(data);
     },
 
     async listPendingSecureDocumentCleanupJobs(limit = 100) {
@@ -1661,7 +1846,17 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       if (error) {
         throw error;
       }
-      return data || [];
+      return (data || []).map(normalizeSecureDocumentCleanupJobRow);
+    },
+
+    async listSecureDocumentCleanupJobs({ limit = 100 } = {}) {
+      const { data, error } = await client
+        .from('secure_document_cleanup_jobs')
+        .select('*')
+        .order('updated_at', { ascending: false })
+        .limit(Math.max(1, Math.min(Number(limit) || 100, 500)));
+      if (error) throw error;
+      return (data || []).map(normalizeSecureDocumentCleanupJobRow);
     },
 	  };
 }

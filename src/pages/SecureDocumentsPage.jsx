@@ -19,6 +19,14 @@ const acceptedDocumentTypes = [
   '.zip',
 ].join(',');
 
+const documentCategories = [
+  ['financials', 'Financials'], ['teaser', 'Teaser'], ['cim', 'CIM / overview'], ['nda', 'NDA'],
+  ['p_and_l', 'P&L'], ['tax_returns', 'Tax returns'], ['balance_sheet', 'Balance sheet'],
+  ['customer_concentration', 'Customer concentration'], ['payroll', 'Payroll'], ['lease', 'Lease'],
+  ['contracts', 'Contracts'], ['equipment', 'Equipment'], ['owner_role', 'Owner role'],
+  ['management_depth', 'Management depth'], ['sba_fit', 'SBA fit'], ['other', 'Other'],
+];
+
 function fileToBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -45,6 +53,8 @@ export default function SecureDocumentsPage() {
   const [submissionError, setSubmissionError] = useState('');
   const [ndaAccepted, setNdaAccepted] = useState(false);
   const [documentType, setDocumentType] = useState('financials');
+  const [fileCategories, setFileCategories] = useState({});
+  const [completeRequest, setCompleteRequest] = useState(false);
   const [note, setNote] = useState('');
   const [files, setFiles] = useState([]);
   const [submitting, setSubmitting] = useState(false);
@@ -101,11 +111,11 @@ export default function SecureDocumentsPage() {
 
     try {
       const documents = await Promise.all(
-        files.map(async (file) => {
+        files.map(async (file, index) => {
           const payload = await fileToBase64(file);
           return {
             ...payload,
-            documentType,
+            documentType: fileCategories[index] || documentType,
           };
         }),
       );
@@ -121,6 +131,7 @@ export default function SecureDocumentsPage() {
           ndaAccepted,
           note,
           documents,
+          completeRequest,
         }),
       });
 
@@ -132,9 +143,11 @@ export default function SecureDocumentsPage() {
 
       setContext(result);
       setFiles([]);
+      setFileCategories({});
+      setCompleteRequest(false);
       setNote('');
       setNdaAccepted(false);
-      setSuccessMessage('Your documents were uploaded successfully.');
+      setSuccessMessage(completeRequest ? 'Your documents were uploaded and this request is now complete.' : 'Your documents were uploaded. You can add another batch or finish the request when ready.');
     } catch (submitError) {
       setSubmissionError(submitError.message || 'Unable to upload the selected files.');
     } finally {
@@ -190,10 +203,24 @@ export default function SecureDocumentsPage() {
                 <div className="flex items-start gap-3">
                   <ShieldCheck className="mt-1 h-5 w-5 shrink-0 text-moss" />
                   <p className="text-sm leading-7 text-ink/74">
-                    By uploading documents here, you confirm they are being shared in confidence for business review purposes only. This request records NDA acknowledgement when files are submitted.
+                    Access is restricted to authorized Uckele Group administrators. Files are used only to evaluate the potential transaction, retained while the opportunity and applicable legal obligations require them, and then deleted from the active vault under the secure retention process. Access-controlled backup copies expire under the backup retention schedule. This request records your confidentiality acknowledgement with each batch.
                   </p>
                 </div>
               </div>
+
+              {context.request.requested_checklist?.length ? (
+                <div className="mt-8">
+                  <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Requested-document checklist</p>
+                  <ul className="mt-4 space-y-2">
+                    {context.request.requested_checklist.map((item) => (
+                      <li className="flex items-center justify-between rounded-2xl border border-line/80 bg-fog/60 px-4 py-3 text-sm" key={item.category}>
+                        <span className="font-medium text-ink">{item.label}</span>
+                        <span className={item.received ? 'text-emerald-700' : 'text-amber-700'}>{item.received ? `Received (${item.receivedCount})` : 'Requested'}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
 
               <div className="mt-8">
                 <p className="text-sm font-semibold uppercase tracking-[0.18em] text-moss">Files already uploaded</p>
@@ -213,14 +240,16 @@ export default function SecureDocumentsPage() {
             </Reveal>
 
             <Reveal className="panel p-7 sm:p-8" delay={120}>
-              {context.request.status === 'documents-received' ? (
+              {['documents-received', 'completed', 'revoked'].includes(context.request.status) ? (
                 <div className="space-y-4">
                   <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-moss/8 text-moss">
                     <ShieldCheck className="h-5 w-5" />
                   </div>
-                  <h2 className="text-2xl font-semibold text-ink">Documents received</h2>
+                  <h2 className="text-2xl font-semibold text-ink">{context.request.status === 'revoked' ? 'Upload link revoked' : 'Documents received'}</h2>
                   <p className="text-sm leading-7 text-ink/72">
-                    This secure request is complete. Please contact Uckele Group if you need a new upload link for additional files.
+                    {context.request.status === 'revoked'
+                      ? 'This link is no longer active. Please contact Uckele Group if you need a replacement request.'
+                      : 'This secure request is complete. Please contact Uckele Group if you need a new upload link for additional files.'}
                   </p>
                 </div>
               ) : (
@@ -248,17 +277,11 @@ export default function SecureDocumentsPage() {
                 <label className="flex flex-col gap-2 text-sm font-medium text-ink">
                   Document category
                   <select
-                    className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+                    className="form-control"
                     onChange={(event) => setDocumentType(event.target.value)}
                     value={documentType}
                   >
-                    <option value="financials">Financials</option>
-                    <option value="teaser">Teaser</option>
-                    <option value="cim">CIM / overview</option>
-                    <option value="tax-returns">Tax returns</option>
-                    <option value="contracts">Contracts</option>
-                    <option value="customer-summary">Customer summary</option>
-                    <option value="other">Other</option>
+                    {documentCategories.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                   </select>
                 </label>
 
@@ -269,12 +292,35 @@ export default function SecureDocumentsPage() {
                     className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink"
                     multiple
                     onChange={(event) => {
-                      setFiles(Array.from(event.target.files || []));
+                      const selectedFiles = Array.from(event.target.files || []);
+                      setFiles(selectedFiles);
+                      setFileCategories(Object.fromEntries(selectedFiles.map((_, index) => [index, documentType])));
                       setSubmissionError('');
                     }}
                     type="file"
                   />
                 </label>
+
+                {files.length > 0 ? (
+                  <div className="space-y-3" aria-label="Per-file categories">
+                    {files.map((file, index) => (
+                      <label className="grid gap-2 rounded-2xl border border-line/80 bg-fog/60 p-4 text-sm font-medium text-ink sm:grid-cols-[1fr_15rem] sm:items-center" key={`${file.name}-${file.lastModified}-${index}`}>
+                        <span className="min-w-0 truncate">{file.name}</span>
+                        <span>
+                          <span className="sr-only">Category for {file.name}</span>
+                          <select
+                            aria-label={`Category for ${file.name}`}
+                            className="form-control"
+                            onChange={(event) => setFileCategories((current) => ({ ...current, [index]: event.target.value }))}
+                            value={fileCategories[index] || documentType}
+                          >
+                            {documentCategories.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                          </select>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                ) : null}
 
                 <label className="flex flex-col gap-2 text-sm font-medium text-ink">
                   Note
@@ -297,6 +343,11 @@ export default function SecureDocumentsPage() {
                     type="checkbox"
                   />
                   <span>I confirm these documents are being shared confidentially for business review and acknowledge this confidentiality notice.</span>
+                </label>
+
+                <label className="flex items-start gap-3 rounded-2xl border border-moss/20 bg-moss/5 px-4 py-4 text-sm leading-7 text-ink/74">
+                  <input checked={completeRequest} className="mt-1 h-4 w-4 accent-moss" onChange={(event) => setCompleteRequest(event.target.checked)} type="checkbox" />
+                  <span><strong>Finish this request after this batch.</strong> Leave this unchecked if you plan to return with more files using the same link.</span>
                 </label>
 
                 <button

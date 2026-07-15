@@ -124,6 +124,65 @@ test('CIM response matching ignores unrelated replies from the same broker', () 
   assert.equal(eventMatchesCimRequest(trackedReply, request), true);
 });
 
+test('CIM response matching rejects generic and pre-request replies from the same broker', () => {
+  const request = {
+    id: 'cim-request-2',
+    deal_key: 'fire-safety-inspection-co',
+    deal_name: 'Fire Safety Inspection Co',
+    recipient_email: 'broker@example.com',
+    created_at: '2026-06-16T16:00:00.000Z',
+  };
+  const genericReply = {
+    event_type: 'received',
+    recipient_email: 'broker@example.com',
+    subject: 'Re: CIM / NDA request',
+    created_at: '2026-06-16T17:00:00.000Z',
+  };
+  const oldExactReply = {
+    ...genericReply,
+    subject: 'Re: CIM / NDA request for Fire Safety Inspection Co',
+    created_at: '2026-06-15T17:00:00.000Z',
+  };
+
+  assert.equal(eventMatchesCimRequest(genericReply, request), false);
+  assert.equal(eventMatchesCimRequest(oldExactReply, request), false);
+});
+
+test('CIM response matching uses the request-specific inbound address even when the broker changes the subject', () => {
+  const firstRequest = {
+    id: 'cim-request-first',
+    deal_key: 'commercial-hvac-maintenance-co',
+    deal_name: 'Commercial HVAC Maintenance Co',
+    recipient_email: 'broker@example.com',
+    created_at: '2026-06-16T16:00:00.000Z',
+    metadata: {
+      replyToAddress: 'cim-request-first@inbound.example.com',
+    },
+  };
+  const secondRequest = {
+    ...firstRequest,
+    id: 'cim-request-second',
+    deal_key: 'commercial-plumbing-service',
+    deal_name: 'Commercial Plumbing Service',
+    metadata: {
+      replyToAddress: 'cim-request-second@inbound.example.com',
+    },
+  };
+  const reply = {
+    event_type: 'received',
+    recipient_email: 'broker@example.com',
+    subject: 'Requested materials attached',
+    created_at: '2026-06-16T17:00:00.000Z',
+    metadata: {
+      fromEmail: 'broker@example.com',
+      toEmail: 'cim-request-first@inbound.example.com',
+    },
+  };
+
+  assert.equal(eventMatchesCimRequest(reply, firstRequest), true);
+  assert.equal(eventMatchesCimRequest(reply, secondRequest), false);
+});
+
 test('CIM event matching accepts Resend-normalized deal key tags', () => {
   const request = {
     id: 'cim-request-1',

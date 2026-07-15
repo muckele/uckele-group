@@ -10,6 +10,7 @@ The Fly configuration is committed in [fly.toml](/Users/Matt/Documents/uckele-gr
 - one mounted Fly volume at `/data`
 - SQLite at `/data/uckele-group.sqlite`
 - secure document storage at `/data/secure-documents`
+- verified application backup bundles at `/data/backups`
 - Node 22 in the Docker build/runtime image
 
 ## Included Files
@@ -28,7 +29,8 @@ fly secrets set \
   LEAD_NOTIFICATION_EMAIL=mathew@uckelegroup.com \
   RESEND_API_KEY=... \
   RESEND_FROM_EMAIL="Uckele Group <mathew@uckelegroup.com>" \
-  RESEND_REPLY_TO=mathew@uckelegroup.com \
+  RESEND_REPLY_TO=deals@replies.uckelegroup.com \
+  RESEND_INBOUND_DOMAIN=replies.uckelegroup.com \
   RESEND_WEBHOOK_SECRET=... \
   EMAIL_BRAND_COMPANY_NAME="Uckele Group" \
   DEAL_HUNTER_EMAIL_RECIPIENT=mathew@uckelegroup.com \
@@ -116,9 +118,13 @@ Then update DNS:
 - `/admin` is private and requires authentication.
 - `/secure-documents` is token-protected and should remain unindexed.
 - Turnstile should be enabled in production.
-- Configure Resend webhooks to post email events to `/api/webhooks/resend`; use the same signing secret in `RESEND_WEBHOOK_SECRET`.
+- Configure Resend webhooks to post `email.sent`, `email.delivered`, `email.delivery_delayed`, `email.failed`, `email.bounced`, `email.complained`, `email.opened`, `email.clicked`, and `email.received` events to `/api/webhooks/resend`; store that webhook's signing secret in `RESEND_WEBHOOK_SECRET`.
+- Configure a Resend receiving subdomain such as `replies.uckelegroup.com`, set `RESEND_INBOUND_DOMAIN` to that domain, and set `RESEND_REPLY_TO` to an address on it. Do not replace the root domain's existing MX records.
+- Keep `DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED=false` until the Operations email-readiness panel shows a verified inbound reply from the controlled test email. When enabling it, set the intended delay sequence, maximum count, weekday policy, and timezone explicitly.
 - Apply every committed Supabase migration before deploying code when `STORAGE_PROVIDER=supabase` is enabled.
-- Keep the secure document `.trash` directory on the persistent volume; startup and hourly cleanup reconciliation depend on it.
+- Keep the secure document `.trash` directory on the persistent volume; startup and hourly cleanup reconciliation depend on it. Every file-mutating upload or deletion records a write-ahead cleanup intent before its first write or move. When database persistence cannot be confirmed, a private local `.reconciliation.json` sidecar preserves the intent until it can be imported safely; atomic temporary writes and directory syncing allow a valid intent to be recovered after abrupt process loss. Ambiguous mutations remain staged for the settlement window. A reconciler must then acquire the job's opaque, expiring lease token. The database clock renews a still-valid token before every filesystem mutation (including each file in a batch), and token-fenced state transitions reject expired leases. Reconciliation rejects paths outside the intent's exact operation directory, destinations inconsistent with the corresponding secure-document record, and filesystem or state changes from stale lease owners.
+- Application-consistent SQLite backups run daily at `03:30 America/Los_Angeles`, retain 14 verified bundles/days by default, and are visible in the admin-only Operations page.
+- Fly volume snapshots and application backup bundles are complementary. Follow [sqlite-recovery.md](/Users/Matt/Documents/uckele-group/docs/sqlite-recovery.md) for verification and restore drills.
 
 ## Before Go-Live
 
@@ -132,9 +138,12 @@ Then update DNS:
 - If SMB Deal Hunter viewer access is needed, configure `ADMIN_VIEWER_EMAILS` or `ADMIN_VIEWER_USERNAME` / `ADMIN_VIEWER_PASSWORD` and verify a viewer cannot save, export, send emails, or run imports
 - Confirm Resend webhook events create email engagement records in the admin CRM
 - Confirm Resend inbound `email.received` webhook events stop CIM follow-ups before enabling `DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED=true`
+- Confirm weekend-due CIM follow-ups are deferred when `DEAL_HUNTER_CIM_FOLLOW_UP_WEEKDAYS_ONLY=true`
 - Verify `/api/health` returns `200` for process liveness and `/api/ready` returns `200` for storage and document-vault readiness on the Fly URL
 - Confirm uploaded secure documents are written under the mounted volume
 - Delete a staging CRM record with a secure document and confirm its `secure_document_cleanup_jobs` row reaches `completed`
 - Confirm an authenticated admin mutation creates `started` and `completed` rows in `admin_audit_events`
+- Confirm Operations shows a healthy SQLite `quick_check`, sufficient disk space, source and scheduler history, and a verified backup newer than 36 hours
+- Run `npm run backup:verify` inside the deployed Machine and rehearse the latest bundle into `/tmp` before accepting confidential production files
 - Confirm a stale CRM tab receives `409` and keeps its unsaved draft until the user reloads
 - Confirm `robots.txt` and `sitemap.xml` are live on `https://www.uckelegroup.com`

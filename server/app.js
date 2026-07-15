@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import express from 'express';
@@ -17,6 +18,7 @@ import {
   logoutAdmin,
   requestAdminMagicLink,
   requireAdmin,
+  revokeAllAdminSessions,
   verifyAdminMagicLink,
 } from './services/auth.js';
 import {
@@ -25,9 +27,13 @@ import {
   getSecureUploadJsonLimitBytes,
   getSecureUploadContext,
   getSecureDocumentDownload,
+  deleteSecureDocument,
+  revokeSecureUploadRequest,
   uploadSecureDocuments,
 } from './services/documentVault.js';
 import { recordEmailEventsFromWebhook } from './services/emailEvents.js';
+import { getEmailReadiness } from './services/emailReadiness.js';
+import { sendAdminEmailTestEmail } from './services/delivery.js';
 import { checkReadiness } from './services/readiness.js';
 import {
   reviewDailyDeals,
@@ -49,6 +55,8 @@ import {
 } from './services/submissions.js';
 import { asyncRoute } from './utils/http.js';
 import { safeCompareText } from './utils/security.js';
+import { listCrmActivity } from './services/activity.js';
+import { getOperationsCenter } from './services/operations.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.resolve(__dirname, '../dist');
@@ -113,7 +121,7 @@ async function auditAdminMutation(request, response, next) {
   }
 
   const storage = getStorage();
-  const initialSession = getAdminSession(request);
+  const initialSession = await getAdminSession(request);
   const eventBase = {
     request_id: request.id || '',
     method: request.method,
@@ -207,6 +215,11 @@ function publicSecureUploadRequest(requestRecord) {
     nda_accepted_at: requestRecord.nda_accepted_at || '',
     last_uploaded_at: requestRecord.last_uploaded_at || '',
     note: requestRecord.note || '',
+    requested_documents: requestRecord.requested_documents || [],
+    requested_checklist: requestRecord.requested_checklist || [],
+    revoked_at: requestRecord.revoked_at || '',
+    closed_at: requestRecord.closed_at || '',
+    upload_batch_count: Number(requestRecord.upload_batch_count || 0),
   };
 }
 
@@ -262,12 +275,12 @@ export function createApp() {
         return;
       }
 
-      if (context.request.status !== 'awaiting-documents') {
+      if (!['awaiting-documents', 'open', 'partially-received'].includes(context.request.status)) {
         response.status(409).json({
           success: false,
           error: context.request.status === 'uploading'
             ? 'Documents are already being uploaded for this request. Please wait a few minutes before trying again.'
-            : 'Documents have already been received for this request. Please ask for a new secure upload link before sending more files.',
+            : 'This secure document request is closed. Please ask for a new upload link before sending more files.',
         });
         return;
       }
@@ -404,8 +417,8 @@ export function createApp() {
     }),
   );
 
-  app.get('/api/admin/session', (request, response) => {
-    const session = getAdminSession(request);
+  app.get('/api/admin/session', asyncRoute(async (request, response) => {
+    const session = await getAdminSession(request);
 
     response.json({
       authenticated: Boolean(session),
@@ -413,7 +426,7 @@ export function createApp() {
       role: session?.role || '',
       ...getAdminAuthState(),
     });
-  });
+  }));
 
   app.post(
     '/api/admin/session',
@@ -453,8 +466,8 @@ export function createApp() {
     }),
   );
 
-  app.post('/api/admin/magic-link/verify', (request, response) => {
-    const result = verifyAdminMagicLink(request.body.token || '');
+  app.post('/api/admin/magic-link/verify', asyncRoute(async (request, response) => {
+    const result = await verifyAdminMagicLink(request.body.token || '');
 
     if (!result.ok) {
       response.status(401).json({ success: false, error: result.reason });
@@ -468,18 +481,27 @@ export function createApp() {
       username: result.session.username,
       role: result.session.role,
     });
-  });
+  }));
 
-  app.delete('/api/admin/session', (request, response) => {
-    getAdminSession(request);
-    response.setHeader('Set-Cookie', logoutAdmin());
+  app.delete('/api/admin/session', asyncRoute(async (request, response) => {
+    response.setHeader('Set-Cookie', await logoutAdmin(request));
     response.json({ success: true });
-  });
+  }));
+
+  app.post('/api/admin/sessions/revoke-all', asyncRoute(async (request, response) => {
+    const result = await revokeAllAdminSessions(request);
+    if (!result.ok) {
+      response.status(result.status || 401).json({ success: false, error: result.reason });
+      return;
+    }
+    response.setHeader('Set-Cookie', result.cookie);
+    response.json({ success: true, revoked: result.revoked });
+  }));
 
   app.get(
     '/api/admin/acquisition-command-center',
     asyncRoute(async (request, response) => {
-      const session = requireAdminAccess(request);
+      const session = await requireAdminAccess(request);
 
       if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
@@ -496,10 +518,63 @@ export function createApp() {
     }),
   );
 
+  app.get(
+    '/api/admin/operations',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      response.json({ success: true, operations: await getOperationsCenter() });
+    }),
+  );
+
+  app.post(
+    '/api/admin/email/test',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const readiness = await getEmailReadiness();
+      const requestedRecipient = String(request.body?.recipient || readiness.testRecipient || '').trim().toLowerCase();
+      const allowedRecipient = readiness.allowedTestRecipients.includes(requestedRecipient);
+
+      if (!readiness.outboundConfigured) {
+        response.status(409).json({ success: false, error: 'Resend outbound delivery is not fully configured.', readiness });
+        return;
+      }
+
+      if (!requestedRecipient || !allowedRecipient) {
+        response.status(400).json({
+          success: false,
+          error: 'Test emails may only be sent to a configured internal administrator address.',
+          readiness,
+        });
+        return;
+      }
+
+      const emailResult = await sendAdminEmailTestEmail({
+        to: requestedRecipient,
+        requestedBy: session.username || 'admin',
+      });
+      const refreshedReadiness = await getEmailReadiness();
+      response.status(emailResult.status === 'failed' ? 502 : 201).json({
+        success: emailResult.status !== 'failed',
+        emailResult,
+        readiness: refreshedReadiness,
+      });
+    }),
+  );
+
   app.post(
     '/api/admin/acquisition-command-center/:id',
     asyncRoute(async (request, response) => {
-      const session = requireAdmin(request);
+      const session = await requireAdmin(request);
 
       if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
@@ -530,15 +605,19 @@ export function createApp() {
   app.get(
     '/api/admin/submissions',
     asyncRoute(async (request, response) => {
-      if (!requireAdminAccess(request)) {
+      if (!await requireAdminAccess(request)) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
 
       const result = await listDashboardSubmissions({
         page: Number(request.query.page) || 1,
+        pageSize: Number(request.query.pageSize) || 25,
         search: String(request.query.search || ''),
         status: String(request.query.status || 'all'),
+        created: String(request.query.created || 'all'),
+        sort: String(request.query.sort || 'created_at'),
+        direction: String(request.query.direction || 'desc'),
       });
 
       response.json({
@@ -551,7 +630,7 @@ export function createApp() {
   app.get(
     '/api/admin/follow-ups',
     asyncRoute(async (request, response) => {
-      if (!requireAdminAccess(request)) {
+      if (!await requireAdminAccess(request)) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
@@ -568,7 +647,7 @@ export function createApp() {
   app.post(
     '/api/admin/submissions',
     asyncRoute(async (request, response) => {
-      const session = requireAdmin(request);
+      const session = await requireAdmin(request);
 
       if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
@@ -595,7 +674,7 @@ export function createApp() {
   app.get(
     '/api/admin/submissions/export',
     asyncRoute(async (request, response) => {
-      if (!requireAdmin(request)) {
+      if (!await requireAdmin(request)) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
@@ -610,7 +689,7 @@ export function createApp() {
   app.get(
     '/api/admin/submissions/:id',
     asyncRoute(async (request, response) => {
-      if (!requireAdminAccess(request)) {
+      if (!await requireAdminAccess(request)) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
@@ -630,9 +709,38 @@ export function createApp() {
   );
 
   app.get(
+    '/api/admin/submissions/:id/activity',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const submission = await getDashboardSubmission(request.params.id);
+      if (!submission) {
+        response.status(404).json({ success: false, error: 'CRM record not found.' });
+        return;
+      }
+
+      const eventTypes = String(request.query.types || '')
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean);
+      const events = await listCrmActivity({
+        submissionId: request.params.id,
+        eventTypes,
+        limit: Number(request.query.limit) || 200,
+        before: String(request.query.before || ''),
+      });
+
+      response.json({ success: true, events });
+    }),
+  );
+
+  app.get(
     '/api/admin/deal-hunter/review',
     asyncRoute(async (request, response) => {
-      const session = requireAdminAccess(request);
+      const session = await requireAdminAccess(request);
 
       if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
@@ -641,6 +749,7 @@ export function createApp() {
 
       const review = await reviewDailyDeals();
       review.dailyEmailJob = await getDailyDealHunterJobStatus();
+      review.emailReadiness = await getEmailReadiness();
       await getSourceHealth(undefined, {
         persistSnapshot: session.role === 'admin',
         refresh: true,
@@ -656,7 +765,7 @@ export function createApp() {
   app.post(
     '/api/admin/deal-hunter/send',
     asyncRoute(async (request, response) => {
-      const session = requireAdmin(request);
+      const session = await requireAdmin(request);
 
       if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
@@ -666,6 +775,7 @@ export function createApp() {
       const result = await runClaimedDailyDealHunterEmail({ triggeredBy: session.username || 'admin' });
       if (result.review) {
         result.review.dailyEmailJob = result.jobRun || await getDailyDealHunterJobStatus();
+        result.review.emailReadiness = await getEmailReadiness();
       }
       response.status(result.emailResult.status === 'failed' ? 502 : result.inProgress ? 409 : 200).json({
         success: !['failed', 'in-progress'].includes(result.emailResult.status),
@@ -677,7 +787,7 @@ export function createApp() {
   app.post(
     '/api/admin/deal-hunter/cim-request',
     asyncRoute(async (request, response) => {
-      const session = requireAdmin(request);
+      const session = await requireAdmin(request);
 
       if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
@@ -700,7 +810,7 @@ export function createApp() {
   app.post(
     '/api/admin/deal-hunter/cim-requests/send-ready',
     asyncRoute(async (request, response) => {
-      const session = requireAdmin(request);
+      const session = await requireAdmin(request);
 
       if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
@@ -723,7 +833,8 @@ export function createApp() {
   app.post(
     '/api/admin/deal-hunter/cim-follow-ups/run',
     asyncRoute(async (request, response) => {
-      if (!requireAdmin(request)) {
+      const session = await requireAdmin(request);
+      if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
@@ -758,12 +869,16 @@ export function createApp() {
   app.patch(
     '/api/admin/submissions/:id',
     asyncRoute(async (request, response) => {
-      if (!requireAdmin(request)) {
+      const session = await requireAdmin(request);
+      if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
 
-      const updated = await updateSubmissionWorkflow(request.params.id, request.body || {});
+      const updated = await updateSubmissionWorkflow(request.params.id, request.body || {}, {
+        actor: session.username || 'admin',
+        role: session.role || 'admin',
+      });
 
       if (!updated) {
         response.status(400).json({ success: false, error: 'Invalid submission update payload.' });
@@ -789,7 +904,7 @@ export function createApp() {
   app.delete(
     '/api/admin/submissions/:id',
     asyncRoute(async (request, response) => {
-      if (!requireAdmin(request)) {
+      if (!await requireAdmin(request)) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
@@ -821,7 +936,7 @@ export function createApp() {
   app.post(
     '/api/admin/submissions/:id/upload-request',
     asyncRoute(async (request, response) => {
-      const session = requireAdmin(request);
+      const session = await requireAdmin(request);
 
       if (!session) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
@@ -832,6 +947,7 @@ export function createApp() {
         submissionId: request.params.id,
         requestedBy: session.username,
         note: String(request.body.note || ''),
+        requestedDocuments: Array.isArray(request.body.requestedDocuments) ? request.body.requestedDocuments : [],
         sendEmail: request.body.sendEmail !== false,
         request,
       });
@@ -853,7 +969,7 @@ export function createApp() {
   app.get(
     '/api/admin/secure-documents/:id/download',
     asyncRoute(async (request, response) => {
-      if (!requireAdmin(request)) {
+      if (!await requireAdmin(request)) {
         response.status(401).json({ success: false, error: 'Unauthorized.' });
         return;
       }
@@ -874,6 +990,32 @@ export function createApp() {
           response.status(500).json({ success: false, error: 'Secure document download failed.' });
         }
       });
+    }),
+  );
+
+  app.delete(
+    '/api/admin/secure-documents/:id',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+      const result = await deleteSecureDocument({ documentId: request.params.id, deletedBy: session.username });
+      response.status(result.ok ? 200 : result.status || 400).json({ success: result.ok, ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/secure-upload-requests/:id/revoke',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+      const result = await revokeSecureUploadRequest({ requestId: request.params.id, revokedBy: session.username });
+      response.status(result.ok ? 200 : result.status || 400).json({ success: result.ok, ...result });
     }),
   );
 
@@ -908,6 +1050,7 @@ export function createApp() {
         ndaAccepted: Boolean(request.body.ndaAccepted),
         note: String(request.body.note || ''),
         documents: Array.isArray(request.body.documents) ? request.body.documents : [],
+        completeRequest: Boolean(request.body.completeRequest),
         request,
       });
 
@@ -930,10 +1073,16 @@ export function createApp() {
   );
 
   if (config.isProduction) {
-    app.use(express.static(distDirectory));
+    app.use(express.static(distDirectory, { redirect: false }));
 
-    app.get('*', (_request, response) => {
-      response.sendFile(path.join(distDirectory, 'index.html'));
+    app.get('*', (request, response) => {
+      const routePath = request.path.replace(/^\/+|\/+$/g, '');
+      const routeIndex = routePath
+        ? path.resolve(distDirectory, routePath, 'index.html')
+        : path.join(distDirectory, 'index.html');
+      const staysInsideDist = routeIndex === distDirectory || routeIndex.startsWith(`${distDirectory}${path.sep}`);
+
+      response.sendFile(staysInsideDist && existsSync(routeIndex) ? routeIndex : path.join(distDirectory, 'index.html'));
     });
   }
 

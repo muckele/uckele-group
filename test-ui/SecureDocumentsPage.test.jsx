@@ -70,7 +70,7 @@ describe('SecureDocumentsPage', () => {
     fireEvent.change(fileInput, {
       target: { files: [new File(['invalid'], 'financials.exe', { type: 'application/octet-stream' })] },
     });
-    fireEvent.click(screen.getByRole('checkbox'));
+    fireEvent.click(screen.getByRole('checkbox', { name: /I confirm these documents/i }));
     fireEvent.click(screen.getByRole('button', { name: 'Upload Documents' }));
 
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('file type is not allowed'));

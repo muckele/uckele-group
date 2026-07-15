@@ -379,9 +379,11 @@ test('passing a command center record completes CRM follow-up state', async () =
         },
       };
     },
-    async updateSubmission(id, values) {
-      capturedUpdate = values;
-      return { id, ...values };
+    async mutateWithCrmActivity({ operation, payload, activity }) {
+      assert.equal(operation, 'update_submission');
+      assert.equal(activity.event_type, 'diligence.command-center-updated');
+      capturedUpdate = payload.values;
+      return { applied: true, record: { id: payload.id, ...payload.values }, activity };
     },
   };
 

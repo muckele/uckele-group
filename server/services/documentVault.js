@@ -6,6 +6,14 @@ import { getStorage } from '../storage/index.js';
 import { getClientIp, getRequestOrigin } from '../utils/http.js';
 import { hashIp, sha256, signPayload, verifySignedPayload } from '../utils/security.js';
 import { sendDocumentUploadNotificationEmail, sendSecureUploadInviteEmail } from './delivery.js';
+import { buildCrmActivityEvent, commitCrmActivityMutation } from './activity.js';
+import {
+  persistSecureDocumentCleanupJob,
+  registerSecureDocumentCleanupIntent,
+  secureDocumentCleanupSettlementMs,
+  unregisterSecureDocumentCleanupIntent,
+  updateSecureDocumentCleanupJobState,
+} from './secureDocumentCleanupState.js';
 
 const allowedMimeTypes = new Set([
   'application/pdf',
@@ -22,7 +30,7 @@ const allowedMimeTypes = new Set([
   'application/x-zip-compressed',
 ]);
 const maxDocumentsPerUpload = 5;
-const maxDocumentsPerRequest = maxDocumentsPerUpload;
+const maxDocumentsPerRequest = 25;
 const staleUploadingRequestMs = 15 * 60 * 1000;
 const secureUploadRateLimitEvents = new Map();
 const base64ExpansionRatio = 4 / 3;
@@ -75,8 +83,46 @@ function verifyAccessToken(token) {
 
 function normalizeDocumentType(value) {
   const normalized = String(value || 'other').trim().toLowerCase();
-  const allowed = ['teaser', 'cim', 'financials', 'tax-returns', 'contracts', 'customer-summary', 'other'];
-  return allowed.includes(normalized) ? normalized : 'other';
+  const aliases = {
+    'tax-returns': 'tax_returns',
+    'customer-summary': 'customer_concentration',
+    'p&l': 'p_and_l',
+  };
+  const canonical = aliases[normalized] || normalized.replace(/-/g, '_');
+  const allowed = [
+    'teaser', 'cim', 'nda', 'financials', 'p_and_l', 'tax_returns', 'balance_sheet',
+    'customer_concentration', 'payroll', 'lease', 'contracts', 'equipment', 'owner_role',
+    'management_depth', 'sba_fit', 'other',
+  ];
+  return allowed.includes(canonical) ? canonical : 'other';
+}
+
+function documentTypeLabel(value) {
+  return normalizeDocumentType(value).split('_').map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`).join(' ');
+}
+
+function normalizeRequestedDocuments(values = []) {
+  const seen = new Set();
+  return (Array.isArray(values) ? values : [])
+    .map((item) => {
+      const category = normalizeDocumentType(typeof item === 'string' ? item : item?.category || item?.id);
+      return { category, label: String(item?.label || documentTypeLabel(category)).trim().slice(0, 120), required: item?.required !== false };
+    })
+    .filter((item) => item.category !== 'other' && !seen.has(item.category) && seen.add(item.category))
+    .slice(0, 20);
+}
+
+function buildRequestedDocumentChecklist(requestRecord, documents = []) {
+  const counts = documents.reduce((result, document) => {
+    const category = normalizeDocumentType(document.document_type);
+    result[category] = (result[category] || 0) + 1;
+    return result;
+  }, {});
+  return normalizeRequestedDocuments(requestRecord.requested_documents).map((item) => ({
+    ...item,
+    received: Boolean(counts[item.category]),
+    receivedCount: counts[item.category] || 0,
+  }));
 }
 
 function inferMimeType(document = {}) {
@@ -222,7 +268,98 @@ function sumSecureDocumentBytes(documents = []) {
   return documents.reduce((sum, document) => sum + Number(document.size_bytes || 0), 0);
 }
 
-async function cleanupPartialUploadAttempt({ storage, requestId, savedDocuments, writtenFilePaths }) {
+async function commitWithSingleRetry(commit, { retryAmbiguousResponse = false } = {}) {
+  try {
+    return { mutation: await commit(), errors: [], ambiguous: false };
+  } catch (firstError) {
+    if (!retryAmbiguousResponse) {
+      return { mutation: null, errors: [firstError], ambiguous: false };
+    }
+
+    try {
+      return { mutation: await commit(), errors: [firstError], ambiguous: true };
+    } catch (retryError) {
+      return { mutation: null, errors: [firstError, retryError], ambiguous: true };
+    }
+  }
+}
+
+function storageCanLoseCommitResponses(storage) {
+  return storage.provider === 'supabase' || storage.ambiguousCommitResponses === true;
+}
+
+async function inspectUploadFinalization(storage, requestId, documents, expectedBatchCount) {
+  try {
+    const [requestRecord, storedDocuments] = await Promise.all([
+      storage.getSecureUploadRequest(requestId),
+      Promise.all(documents.map((document) => storage.getSecureDocument(document.id))),
+    ]);
+    const allStored = storedDocuments.length > 0 && storedDocuments.every((document) => Boolean(document));
+    const noneStored = storedDocuments.every((document) => !document);
+    const batchCommitted = Number(requestRecord?.upload_batch_count || 0) >= Number(expectedBatchCount || 0);
+
+    if (requestRecord && allStored && batchCommitted) {
+      return { known: true, committed: true, request: requestRecord, documents: storedDocuments };
+    }
+
+    if (requestRecord && noneStored && !batchCommitted) {
+      return { known: true, committed: false, request: requestRecord, documents: storedDocuments };
+    }
+
+    return { known: false, committed: false, request: requestRecord, documents: storedDocuments };
+  } catch (error) {
+    return { known: false, committed: false, request: null, documents: [], error };
+  }
+}
+
+async function preserveAmbiguousUploadFiles({ storage, cleanupJob, error }) {
+  const files = cleanupJob.files.map((file) => ({ ...file }));
+  const stagingErrors = [];
+
+  try {
+    await fs.mkdir(cleanupJob.trash_directory, { recursive: true, mode: 0o700 });
+  } catch (mkdirError) {
+    stagingErrors.push(mkdirError.message);
+  }
+
+  for (const file of files) {
+    if (stagingErrors.length === 0) {
+      try {
+        await fs.rename(file.originalPath, file.stagedPath);
+        file.staged = true;
+      } catch (renameError) {
+        if (renameError.code !== 'ENOENT') {
+          stagingErrors.push(renameError.message);
+        }
+      }
+    }
+
+  }
+
+  const now = new Date().toISOString();
+  const values = {
+    updated_at: now,
+    status: 'reconciliation-pending',
+    files,
+    last_error: String(error?.message || error || 'Secure upload finalization response was ambiguous.').slice(0, 2000),
+    metadata: {
+      ...cleanupJob.metadata,
+      stagingErrors,
+    },
+  };
+
+  try {
+    await updateSecureDocumentCleanupJobState(storage, cleanupJob, values);
+  } catch (persistenceError) {
+    persistenceError.preserveSecureFiles = true;
+    throw persistenceError;
+  }
+
+  return { ...cleanupJob, ...values };
+}
+
+async function cleanupPartialUploadAttempt({ storage, requestId, savedDocuments, writtenFilePaths, resetStatus = 'open' }) {
+  const failures = [];
   for (const document of savedDocuments) {
     if (!storage.deleteSecureDocument) {
       continue;
@@ -232,6 +369,7 @@ async function cleanupPartialUploadAttempt({ storage, requestId, savedDocuments,
       await storage.deleteSecureDocument(document.id);
     } catch (error) {
       console.warn(`[secure-documents] failed to remove partial document record ${document.id}: ${error.message}`);
+      failures.push(error);
     }
   }
 
@@ -241,16 +379,21 @@ async function cleanupPartialUploadAttempt({ storage, requestId, savedDocuments,
     } catch (error) {
       if (error.code !== 'ENOENT') {
         console.warn(`[secure-documents] failed to remove partial upload file ${filePath}: ${error.message}`);
+        failures.push(error);
       }
     }
   }
 
-  await storage.updateSecureUploadRequest(requestId, {
+  const resetRequest = storage.resetSecureUploadRequestIfUploading || storage.updateSecureUploadRequest;
+  await resetRequest.call(storage, requestId, {
     updated_at: new Date().toISOString(),
-    status: 'awaiting-documents',
+    status: resetStatus,
   }).catch((error) => {
     console.warn(`[secure-documents] failed to reset partial upload request ${requestId}: ${error.message}`);
+    failures.push(error);
   });
+
+  return failures;
 }
 
 function isStaleUploadingRequest(requestRecord) {
@@ -267,10 +410,13 @@ async function recoverStaleUploadRequest(storage, requestRecord) {
     return requestRecord;
   }
 
-  return storage.updateSecureUploadRequest(requestRecord.id, {
+  const resetRequest = storage.resetSecureUploadRequestIfUploading || storage.updateSecureUploadRequest;
+  const recovered = await resetRequest.call(storage, requestRecord.id, {
     updated_at: new Date().toISOString(),
-    status: 'awaiting-documents',
+    status: 'open',
   });
+
+  return recovered || storage.getSecureUploadRequest(requestRecord.id);
 }
 
 function enforceInMemoryRateLimit(buckets, windowMs, maxAttempts) {
@@ -347,7 +493,7 @@ async function enforceSecureUploadAttemptRateLimit({ token, request }) {
   });
 }
 
-export async function createSecureUploadRequest({ submissionId, requestedBy, note = '', sendEmail = true, request }) {
+export async function createSecureUploadRequest({ submissionId, requestedBy, note = '', requestedDocuments = [], sendEmail = true, request }) {
   const config = getConfig();
   const storage = getStorage();
   const submission = await storage.getSubmission(submissionId);
@@ -369,15 +515,31 @@ export async function createSecureUploadRequest({ submissionId, requestedBy, not
     email: submission.email,
     contact_name: submission.name,
     requested_by: requestedBy || config.workflow.defaultAssignee,
-    status: 'awaiting-documents',
+    status: 'open',
     expires_at: new Date(Date.now() + config.secureDocuments.requestTtlMs).toISOString(),
     nda_required: true,
     nda_accepted_at: null,
     last_uploaded_at: null,
     note,
+    requested_documents: normalizeRequestedDocuments(requestedDocuments),
+    revoked_at: null,
+    closed_at: null,
+    upload_batch_count: 0,
   };
 
-  await storage.insertSecureUploadRequest(requestRecord);
+  await commitCrmActivityMutation({
+    storage,
+    operation: 'insert_secure_upload_request',
+    payload: { request: requestRecord },
+    activity: {
+      submissionId: submission.id,
+      eventType: 'documents.requested',
+      summary: 'Secure document upload request created.',
+      actor: requestRecord.requested_by,
+      role: 'admin',
+      metadata: { requestId: requestRecord.id, expiresAt: requestRecord.expires_at, emailRequested: sendEmail },
+    },
+  });
 
   const accessToken = buildAccessToken({
     type: 'secure-upload',
@@ -427,12 +589,21 @@ export async function getSecureUploadContext(token, { recoverStale = false } = {
     return { ok: false, error: 'This secure document request has expired.' };
   }
 
+  if (requestRecord.revoked_at || requestRecord.status === 'revoked') {
+    return { ok: false, error: 'This secure document link has been revoked. Please contact Uckele Group if you need a new request.' };
+  }
+
   if (recoverStale) {
     requestRecord = await recoverStaleUploadRequest(storage, requestRecord);
   }
 
+  if (!requestRecord || requestRecord.revoked_at || requestRecord.status === 'revoked') {
+    return { ok: false, error: 'This secure document link has been revoked. Please contact Uckele Group if you need a new request.' };
+  }
+
   const submission = await storage.getSubmission(requestRecord.submission_id);
   const documents = await storage.listSecureDocumentsByRequest(requestRecord.id);
+  requestRecord.requested_checklist = buildRequestedDocumentChecklist(requestRecord, documents);
 
   return {
     ok: true,
@@ -505,7 +676,7 @@ export async function getSecureDocumentDownload(documentId, storage = getStorage
   }
 }
 
-export async function uploadSecureDocuments({ token, ndaAccepted, note = '', documents, request }) {
+export async function uploadSecureDocuments({ token, ndaAccepted, note = '', documents, completeRequest = false, request }) {
   const config = getConfig();
   const storage = getStorage();
   const rateLimitResult = await enforceSecureUploadAttemptRateLimit({ token, request });
@@ -522,12 +693,12 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
 
   context.request = await recoverStaleUploadRequest(storage, context.request);
 
-  if (context.request.status !== 'awaiting-documents') {
+  if (!['awaiting-documents', 'open', 'partially-received'].includes(context.request.status)) {
     return {
       ok: false,
       error: context.request.status === 'uploading'
         ? 'Documents are already being uploaded for this request. Please wait a few minutes before trying again.'
-        : 'Documents have already been received for this request. Please ask for a new secure upload link before sending more files.',
+        : 'This secure document request is closed. Please ask for a new upload link before sending more files.',
     };
   }
 
@@ -556,7 +727,7 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
   if (existingDocumentCount + incomingDocumentCount > maxDocumentsPerRequest) {
     return {
       ok: false,
-      error: `This request can receive no more than ${maxDocumentsPerRequest} total files. Please ask for a new secure upload link before sending more files.`,
+      error: `This request can receive no more than ${maxDocumentsPerRequest} total files. Contact Uckele Group if the request needs to be expanded.`,
     };
   }
 
@@ -598,6 +769,9 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
   const savedDocuments = [];
   const writtenFilePaths = [];
   let updatedRequest;
+  let cleanupJob = null;
+  let cleanupIntentPersisted = false;
+  let cleanupIntentActive = false;
 
   try {
     const requestDirectory = path.join(config.secureDocuments.storageDir, context.request.id);
@@ -609,8 +783,6 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
       const safeOriginalName = sanitizeFileName(document.name);
       const safeStoredName = `${documentId}-${safeOriginalName}`;
       const storagePath = path.join(requestDirectory, safeStoredName);
-      await fs.writeFile(storagePath, buffer);
-      writtenFilePaths.push(storagePath);
 
       const record = {
         id: documentId,
@@ -628,38 +800,199 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
         nda_accepted_at: new Date().toISOString(),
       };
 
-      await storage.insertSecureDocument(record);
       savedDocuments.push(record);
     }
 
-    updatedRequest = await storage.updateSecureUploadRequest(context.request.id, {
-      updated_at: new Date().toISOString(),
-      status: 'documents-received',
-      nda_accepted_at: claimedRequest.nda_accepted_at || new Date().toISOString(),
-      last_uploaded_at: new Date().toISOString(),
+    const cleanupId = randomUUID();
+    const cleanupCreatedAt = new Date().toISOString();
+    const cleanupTrashDirectory = path.join(config.secureDocuments.storageDir, '.trash', cleanupId);
+    cleanupJob = {
+      id: cleanupId,
+      submission_id: context.submission.id,
+      created_at: cleanupCreatedAt,
+      updated_at: cleanupCreatedAt,
+      completed_at: null,
+      status: 'staging',
+      trash_directory: cleanupTrashDirectory,
+      files: savedDocuments.map((document, index) => ({
+        documentId: document.id,
+        originalPath: document.storage_path,
+        stagedPath: path.join(cleanupTrashDirectory, `${index}-${path.basename(document.storage_path)}`),
+        staged: false,
+        purgeOriginalIfStagedMissing: true,
+      })),
+      attempt_count: 0,
+      last_error: null,
+      metadata: {
+        reason: 'ambiguous-secure-upload-finalization',
+        requestId: context.request.id,
+        documentIds: savedDocuments.map((document) => document.id),
+        resetStatus: context.documents.length > 0 ? 'partially-received' : 'open',
+        reconcileAfter: new Date(Date.parse(cleanupCreatedAt) + secureDocumentCleanupSettlementMs).toISOString(),
+        writeAheadIntent: true,
+      },
+    };
+    await persistSecureDocumentCleanupJob(storage, cleanupJob);
+    cleanupIntentPersisted = true;
+    registerSecureDocumentCleanupIntent(cleanupJob.id);
+    cleanupIntentActive = true;
+
+    for (const [index, preparedDocument] of preparedDocuments.entries()) {
+      await fs.writeFile(savedDocuments[index].storage_path, preparedDocument.buffer);
+      writtenFilePaths.push(savedDocuments[index].storage_path);
+    }
+
+    const finalizedAt = new Date().toISOString();
+    const expectedBatchCount = Number(context.request.upload_batch_count || 0) + 1;
+    const finalizationPayload = {
+      requestId: context.request.id,
+      documents: savedDocuments,
+      values: {
+        updated_at: finalizedAt,
+        status: completeRequest ? 'completed' : 'partially-received',
+        nda_accepted_at: claimedRequest.nda_accepted_at || finalizedAt,
+        last_uploaded_at: finalizedAt,
+        closed_at: completeRequest ? finalizedAt : null,
+        upload_batch_count: expectedBatchCount,
+      },
+    };
+    const activity = buildCrmActivityEvent({
+      submissionId: context.submission.id,
+      eventType: 'documents.uploaded',
+      summary: `${savedDocuments.length} secure document${savedDocuments.length === 1 ? '' : 's'} uploaded.`,
+      actor: claimedRequest.email,
+      role: 'contact',
+      metadata: {
+        requestId: context.request.id,
+        documents: savedDocuments.map((document) => ({
+          id: document.id,
+          name: document.original_name,
+          category: document.document_type,
+          sizeBytes: document.size_bytes,
+        })),
+      },
     });
+    const commitFinalization = () => commitCrmActivityMutation({
+      storage,
+      operation: 'finalize_secure_document_upload',
+      payload: finalizationPayload,
+      activity,
+    });
+    const resolution = await commitWithSingleRetry(commitFinalization, {
+      retryAmbiguousResponse: storageCanLoseCommitResponses(storage),
+    });
+    const mutation = resolution.mutation;
+
+    if (mutation?.applied && mutation.record) {
+      updatedRequest = mutation.record;
+    } else if (!mutation && !resolution.ambiguous) {
+      throw resolution.errors.at(-1);
+    } else if (resolution.errors.length > 0 || mutation) {
+      const durableState = await inspectUploadFinalization(
+        storage,
+        context.request.id,
+        savedDocuments,
+        expectedBatchCount,
+      );
+
+      if (durableState.committed) {
+        updatedRequest = durableState.request;
+      } else if (resolution.ambiguous || (!durableState.known && resolution.errors.length > 0)) {
+        const lastError = resolution.errors.at(-1) || durableState.error;
+        await preserveAmbiguousUploadFiles({
+          storage,
+          cleanupJob,
+          error: lastError,
+        });
+        const error = new Error('Secure upload finalization could not be confirmed. Files were retained for automatic reconciliation.');
+        error.code = 'SECURE_UPLOAD_FINALIZATION_AMBIGUOUS';
+        error.preserveSecureFiles = true;
+        throw error;
+      }
+    }
 
     if (!updatedRequest) {
-      throw new Error('Secure upload request could not be finalized.');
+      const error = new Error('Secure upload request changed while the files were being processed. No files were accepted.');
+      error.code = 'SECURE_UPLOAD_NOT_FINALIZED';
+      throw error;
     }
   } catch (error) {
-    await cleanupPartialUploadAttempt({
-      storage,
-      requestId: context.request.id,
-      savedDocuments,
-      writtenFilePaths,
-    });
+    if (!error.preserveSecureFiles) {
+      const cleanupFailures = await cleanupPartialUploadAttempt({
+        storage,
+        requestId: context.request.id,
+        savedDocuments,
+        writtenFilePaths,
+        resetStatus: context.documents.length > 0 ? 'partially-received' : 'open',
+      });
+      if (cleanupIntentPersisted && cleanupJob) {
+        const completedAt = new Date().toISOString();
+        const cleanupState = await updateSecureDocumentCleanupJobState(storage, cleanupJob, {
+          updated_at: new Date().toISOString(),
+          completed_at: cleanupFailures.length === 0 ? completedAt : null,
+          status: cleanupFailures.length === 0 ? 'completed' : 'cleanup-pending',
+          attempt_count: 1,
+          last_error: cleanupFailures.length === 0
+            ? null
+            : cleanupFailures.map((failure) => failure.message || String(failure)).join('; ').slice(0, 2000),
+        }).catch((persistenceError) => {
+          console.error(`[secure-documents] upload cleanup intent ${cleanupJob.id} could not be updated: ${persistenceError.message}`);
+          return null;
+        });
+        if (cleanupFailures.length === 0 && cleanupState && !cleanupState.persistenceError) {
+          await fs.rm(cleanupJob.trash_directory, { recursive: true, force: true }).catch(() => {});
+        }
+      }
+    }
+
+    if (cleanupIntentActive && cleanupJob) {
+      unregisterSecureDocumentCleanupIntent(cleanupJob.id);
+      cleanupIntentActive = false;
+    }
 
     throw error;
+  }
+
+  if (cleanupIntentActive && cleanupJob) {
+    unregisterSecureDocumentCleanupIntent(cleanupJob.id);
+    cleanupIntentActive = false;
+  }
+
+  if (cleanupJob) {
+    const completedAt = new Date().toISOString();
+    try {
+      const completion = await updateSecureDocumentCleanupJobState(storage, cleanupJob, {
+        updated_at: completedAt,
+        completed_at: completedAt,
+        status: 'completed',
+        attempt_count: 1,
+        last_error: null,
+      });
+      if (!completion.persistenceError) {
+        await fs.rm(cleanupJob.trash_directory, { recursive: true, force: true });
+      }
+    } catch (error) {
+      console.error(`[secure-documents] completed upload cleanup intent ${cleanupJob.id} remains queued: ${error.message}`);
+    }
   }
 
   await sendDocumentUploadNotificationEmail({
     submission: context.submission,
     request: updatedRequest,
     documents: savedDocuments,
+  }).catch((error) => {
+    console.warn(`[secure-documents] upload notification failed after documents were committed: ${error.message}`);
   });
 
-  const allDocuments = await storage.listSecureDocumentsByRequest(context.request.id);
+  let allDocuments;
+
+  try {
+    allDocuments = await storage.listSecureDocumentsByRequest(context.request.id);
+  } catch (error) {
+    console.warn(`[secure-documents] document list refresh failed after upload commit: ${error.message}`);
+    allDocuments = [...context.documents, ...savedDocuments];
+  }
+  updatedRequest.requested_checklist = buildRequestedDocumentChecklist(updatedRequest, allDocuments);
 
   return {
     ok: true,
@@ -667,4 +1000,220 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
     submission: context.submission,
     documents: allDocuments,
   };
+}
+
+export async function revokeSecureUploadRequest({ requestId, revokedBy = 'admin', storage = getStorage() } = {}) {
+  const requestRecord = await storage.getSecureUploadRequest(String(requestId || '').trim());
+  if (!requestRecord) return { ok: false, status: 404, error: 'Secure upload request was not found.' };
+  if (requestRecord.status === 'revoked') return { ok: true, request: requestRecord };
+  const now = new Date().toISOString();
+  const mutation = await commitCrmActivityMutation({
+    storage,
+    operation: 'update_secure_upload_request',
+    payload: {
+      id: requestRecord.id,
+      values: { updated_at: now, status: 'revoked', revoked_at: now, closed_at: now },
+      expectedStatuses: [requestRecord.status],
+    },
+    activity: {
+      submissionId: requestRecord.submission_id,
+      eventType: 'documents.link-revoked',
+      summary: 'Secure document upload link revoked.',
+      actor: revokedBy,
+      role: 'admin',
+      metadata: { requestId: requestRecord.id },
+    },
+  });
+  if (!mutation.applied && (mutation.record?.status === 'revoked' || mutation.record?.revoked_at)) {
+    return { ok: true, request: mutation.record };
+  }
+  return mutation.applied
+    ? { ok: true, request: mutation.record }
+    : { ok: false, status: 409, error: 'Secure upload request changed before it could be revoked.' };
+}
+
+export async function deleteSecureDocument({ documentId, deletedBy = 'admin', storage = getStorage() } = {}) {
+  const config = getConfig();
+  const document = await storage.getSecureDocument(String(documentId || '').trim());
+  if (!document) return { ok: false, status: 404, error: 'Secure document was not found.' };
+  const sourcePath = resolveSecureStoragePath(document.storage_path, config.secureDocuments.storageDir);
+  if (!sourcePath) return { ok: false, status: 500, error: 'Secure document path is invalid.' };
+  const operationId = randomUUID();
+  const trashDirectory = path.join(config.secureDocuments.storageDir, '.trash', operationId);
+  const stagedPath = path.join(trashDirectory, path.basename(sourcePath));
+  const intentCreatedAt = new Date().toISOString();
+  let cleanupJob = {
+    id: operationId,
+    submission_id: document.submission_id,
+    created_at: intentCreatedAt,
+    updated_at: intentCreatedAt,
+    completed_at: null,
+    status: 'staging',
+    trash_directory: trashDirectory,
+    files: [{ documentId: document.id, originalPath: sourcePath, stagedPath, staged: false }],
+    attempt_count: 0,
+    last_error: null,
+    metadata: {
+      reason: 'individual-document-deletion',
+      documentId: document.id,
+      ambiguousCommit: false,
+      reconcileAfter: new Date(Date.parse(intentCreatedAt) + secureDocumentCleanupSettlementMs).toISOString(),
+      writeAheadIntent: true,
+    },
+  };
+  await persistSecureDocumentCleanupJob(storage, cleanupJob);
+  registerSecureDocumentCleanupIntent(cleanupJob.id);
+
+  const updateCleanupState = async (values) => {
+    const result = await updateSecureDocumentCleanupJobState(storage, cleanupJob, values);
+    cleanupJob = { ...cleanupJob, ...values };
+    return result;
+  };
+  let fileWasStaged = false;
+  try {
+    await fs.mkdir(trashDirectory, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    unregisterSecureDocumentCleanupIntent(cleanupJob.id);
+    throw error;
+  }
+
+  try {
+    await fs.rename(sourcePath, stagedPath);
+    fileWasStaged = true;
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      await fs.rm(trashDirectory, { recursive: true, force: true }).catch(() => {});
+      await updateCleanupState({
+        updated_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+        status: 'restored',
+        attempt_count: 1,
+        last_error: null,
+      }).catch(() => {});
+      unregisterSecureDocumentCleanupIntent(cleanupJob.id);
+      throw error;
+    }
+  }
+  cleanupJob.files = cleanupJob.files.map((file) => ({ ...file, staged: fileWasStaged }));
+
+  const activity = buildCrmActivityEvent({
+    submissionId: document.submission_id,
+    eventType: 'documents.deleted',
+    summary: `Secure document deleted: ${document.original_name}.`,
+    actor: deletedBy,
+    role: 'admin',
+    metadata: { documentId: document.id, category: document.document_type },
+  });
+  const commitDeletion = () => commitCrmActivityMutation({
+    storage,
+    operation: 'delete_secure_document',
+    payload: { id: document.id },
+    activity,
+  });
+  const resolution = await commitWithSingleRetry(commitDeletion, {
+    retryAmbiguousResponse: storageCanLoseCommitResponses(storage),
+  });
+  unregisterSecureDocumentCleanupIntent(cleanupJob.id);
+  let deletionCommitted = Boolean(resolution.mutation?.applied);
+
+  if (!deletionCommitted) {
+    let currentDocument;
+
+    try {
+      currentDocument = await storage.getSecureDocument(document.id);
+    } catch (inspectionError) {
+      const now = new Date().toISOString();
+      await updateCleanupState({
+        updated_at: now,
+        status: 'reconciliation-pending',
+        files: cleanupJob.files,
+        last_error: String(inspectionError.message || inspectionError).slice(0, 2000),
+        metadata: { ...cleanupJob.metadata, ambiguousCommit: true },
+      });
+      const error = new Error('Secure document deletion could not be confirmed. The file was retained for automatic reconciliation.');
+      error.code = 'SECURE_DOCUMENT_DELETION_AMBIGUOUS';
+      throw error;
+    }
+
+    deletionCommitted = !currentDocument;
+
+    if (!deletionCommitted) {
+      if (resolution.ambiguous) {
+        const now = new Date().toISOString();
+        await updateCleanupState({
+          updated_at: now,
+          status: 'reconciliation-pending',
+          files: cleanupJob.files,
+          last_error: String(resolution.errors.at(-1)?.message || 'Secure document deletion response was ambiguous.').slice(0, 2000),
+          metadata: { ...cleanupJob.metadata, ambiguousCommit: true },
+        });
+        const error = new Error('Secure document deletion could not be confirmed. The file was retained for automatic reconciliation.');
+        error.code = 'SECURE_DOCUMENT_DELETION_AMBIGUOUS';
+        throw error;
+      }
+
+      const restoreError = fileWasStaged
+        ? await fs.rename(stagedPath, sourcePath).catch((error) => error)
+        : Object.assign(new Error('The secure document file was missing before deletion.'), { code: 'ENOENT' });
+
+      if (restoreError) {
+        const now = new Date().toISOString();
+        await updateCleanupState({
+          updated_at: now,
+          status: 'restore-failed',
+          files: cleanupJob.files,
+          attempt_count: 1,
+          last_error: String(restoreError.message || restoreError).slice(0, 2000),
+          metadata: { ...cleanupJob.metadata, ambiguousCommit: false, writeAheadIntent: false },
+        });
+      } else {
+        await fs.rm(trashDirectory, { recursive: true, force: true }).catch(() => {});
+        const completedAt = new Date().toISOString();
+        await updateCleanupState({
+          updated_at: completedAt,
+          completed_at: completedAt,
+          status: 'restored',
+          files: cleanupJob.files,
+          attempt_count: 1,
+          last_error: null,
+        }).catch(() => {});
+      }
+
+      throw resolution.errors.at(-1) || new Error('Secure document changed before it could be deleted.');
+    }
+  }
+
+  if (!deletionCommitted) {
+    throw new Error('Secure document deletion could not be confirmed.');
+  }
+
+  try {
+    await fs.rm(trashDirectory, { recursive: true, force: true });
+  } catch (error) {
+    const now = new Date().toISOString();
+    await updateCleanupState({
+      updated_at: now,
+      status: 'cleanup-failed',
+      files: cleanupJob.files,
+      attempt_count: 1,
+      last_error: error.message,
+      metadata: { ...cleanupJob.metadata, ambiguousCommit: false, writeAheadIntent: false },
+    });
+    return { ok: true, document };
+  }
+
+  const completedAt = new Date().toISOString();
+  await updateCleanupState({
+    updated_at: completedAt,
+    completed_at: completedAt,
+    status: 'completed',
+    files: cleanupJob.files,
+    attempt_count: 1,
+    last_error: null,
+    metadata: { ...cleanupJob.metadata, ambiguousCommit: false, writeAheadIntent: false },
+  }).catch((error) => {
+    console.error(`[secure-documents] completed deletion intent ${cleanupJob.id} remains queued: ${error.message}`);
+  });
+
+  return { ok: true, document };
 }

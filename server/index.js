@@ -3,12 +3,15 @@ import { app } from './app.js';
 import { assertValidConfig, getConfig } from './config.js';
 import { startDealHunterCimFollowUpScheduler, startDealHunterDailyEmailScheduler } from './services/dealHunterScheduler.js';
 import { reconcileSecureDocumentCleanupJobs, startSecureDocumentCleanupScheduler } from './services/submissions.js';
+import { startBackupScheduler } from './services/backups.js';
+import { cleanupExpiredAuthRecords, startAuthCleanupScheduler } from './services/auth.js';
 
 const config = getConfig();
 const host = process.env.HOST || '0.0.0.0';
 let schedulers = [];
 
 assertValidConfig(config);
+await cleanupExpiredAuthRecords();
 const cleanupSummary = await reconcileSecureDocumentCleanupJobs();
 if (cleanupSummary.reviewed > 0) {
   console.log(`[secure-documents:cleanup] startup reconciliation reviewed=${cleanupSummary.reviewed} completed=${cleanupSummary.completed} restored=${cleanupSummary.restored} failed=${cleanupSummary.failed}`);
@@ -20,6 +23,8 @@ const server = app.listen(config.server.port, host, () => {
     startDealHunterDailyEmailScheduler(),
     startDealHunterCimFollowUpScheduler(),
     startSecureDocumentCleanupScheduler(),
+    startBackupScheduler(),
+    startAuthCleanupScheduler(),
   ];
 });
 

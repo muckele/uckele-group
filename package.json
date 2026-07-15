@@ -10,14 +10,19 @@
     "dev": "npm run dev:server & npm run dev:client & wait",
     "dev:client": "vite",
     "dev:server": "node --watch server/index.js",
-    "build": "vite build",
+    "build": "vite build && node scripts/prerender-seo.js",
+    "backup:create": "node scripts/backup.js create",
+    "backup:verify": "node scripts/backup.js verify",
+    "backup:restore": "node scripts/backup.js restore",
+    "backup:drill": "node --test test/backups.test.js",
     "check": "npm run lint && npm test && npm run test:ui && npm run build",
     "lint": "eslint . --max-warnings=0",
     "preview": "vite preview",
     "start": "node server/index.js",
     "test": "node --test test/*.test.js",
     "test:coverage": "node --test --experimental-test-coverage test/*.test.js",
-    "test:ui": "vitest run test-ui"
+    "test:ui": "vitest run test-ui",
+    "test:browser": "playwright test"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",
@@ -32,6 +37,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.5",
+    "@playwright/test": "^1.61.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@vitejs/plugin-react": "^6.0.2",

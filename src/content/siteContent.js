@@ -1,3 +1,5 @@
+export { seoContent } from './seoMetadata.js';
+
 const publicSiteUrl = (import.meta.env.VITE_PUBLIC_SITE_URL || 'https://www.uckelegroup.com').replace(/\/+$/, '');
 const publicEmail = String(import.meta.env.VITE_PUBLIC_CONTACT_EMAIL || 'mathew@uckelegroup.com').trim();
 const publicPhone = String(import.meta.env.VITE_PUBLIC_CONTACT_PHONE || '914.361.9153').trim();
@@ -82,58 +84,6 @@ export const navigation = [
   { label: 'FAQ', path: '/faq' },
   { label: 'Contact', path: '/contact' },
 ];
-
-export const seoContent = {
-  home: {
-    title: 'Uckele Group | Long-Term Small Business Buyer',
-    description:
-      'Mathew Uckele is an individual buyer seeking to acquire and operate a strong small business for the long term with continuity, care, and respect for seller legacy.',
-    keywords:
-      'small business buyer, individual business buyer, long-term business buyer, acquire my business, sell my small business, business succession buyer, operator buyer, search fund alternative, not private equity business buyer',
-  },
-  about: {
-    title: 'About Mathew Uckele | Uckele Group',
-    description:
-      'Learn about Mathew Uckele, his background in business administration, sales, operations, and technical problem solving, and why he wants to buy and operate one great small business.',
-    keywords:
-      'about mathew uckele, small business buyer background, operator buyer, individual acquisition entrepreneur',
-  },
-  criteria: {
-    title: 'What I’m Looking For | Uckele Group',
-    description:
-      'Review the types of small businesses Mathew Uckele is looking to acquire, including stable profitable companies with recurring customer relationships and strong reputations.',
-    keywords:
-      'what business am I looking for, acquisition criteria, small business acquisition criteria, business succession buyer criteria',
-  },
-  sellerConcerns: {
-    title: 'Why Sell To Me | Uckele Group',
-    description:
-      'A thoughtful alternative to private equity for business owners who care about legacy, employees, customer relationships, and a fair transition process.',
-    keywords:
-      'sell to an individual buyer, not private equity business buyer, preserve business legacy after sale, business transition buyer',
-  },
-  process: {
-    title: 'Acquisition Process | Uckele Group',
-    description:
-      'See the respectful, straightforward acquisition process Mathew Uckele uses for confidential small business purchase conversations and smooth ownership transitions.',
-    keywords:
-      'small business acquisition process, sell my business process, confidential business sale discussion',
-  },
-  faq: {
-    title: 'FAQ | Uckele Group',
-    description:
-      'Answers to common questions business owners ask about selling to Mathew Uckele, including confidentiality, employees, timing, brokers, and deal structure.',
-    keywords:
-      'small business buyer faq, sell my business faq, individual buyer questions, operator buyer faq',
-  },
-  contact: {
-    title: 'Contact | Uckele Group',
-    description:
-      'Start a confidential conversation with Mathew Uckele about selling your business, succession planning, or a referral opportunity.',
-    keywords:
-      'contact small business buyer, confidential business sale conversation, broker referral small business buyer',
-  },
-};
 
 export const homePage = {
   hero: {

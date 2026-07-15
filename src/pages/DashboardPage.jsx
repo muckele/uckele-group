@@ -1,5 +1,5 @@
 import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { Navigate, NavLink, useNavigate, useParams } from 'react-router-dom';
+import { Navigate, NavLink, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   Activity,
   BellRing,
@@ -16,7 +16,6 @@ import {
   Plus,
   RefreshCw,
   Save,
-  Send,
   ShieldAlert,
   Target,
   Trash2,
@@ -25,6 +24,10 @@ import {
 import PageHero from '../components/PageHero';
 import Reveal from '../components/Reveal';
 import Seo from '../components/Seo';
+import CrmNavigation from '../components/admin/CrmNavigation';
+import DealActivityTimeline from '../components/admin/DealActivityTimeline';
+import OperationsCenter from '../components/admin/OperationsCenter';
+import DealHunterWorkspace from '../components/admin/DealHunterWorkspace';
 
 const statuses = ['new', 'review', 'contacted', 'archived', 'spam'];
 const priorities = ['low', 'normal', 'medium', 'high', 'urgent'];
@@ -88,12 +91,57 @@ const adminSections = [
   { id: 'command-center', label: 'Command Center', href: '/admin/command-center', icon: Target },
   { id: 'deal-hunter', label: 'Deal Hunter', href: '/admin/deal-hunter', icon: ClipboardList },
   { id: 'follow-ups', label: 'Follow-Ups', href: '/admin/follow-ups', icon: BellRing },
+  { id: 'operations', label: 'Operations', href: '/admin/operations', icon: Gauge },
   { id: 'new-record', label: 'New Record', href: '/admin/new-record', icon: Plus },
 ];
 const primaryActionButtonClass =
   'inline-flex min-h-[46px] w-full min-w-0 items-center justify-center gap-2 rounded-full border border-moss bg-moss px-4 py-2.5 text-center text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50 sm:w-auto sm:px-5 sm:py-3';
 const secondaryActionButtonClass =
   'inline-flex min-h-[46px] w-full min-w-0 items-center justify-center gap-2 rounded-full border border-ink/10 bg-white px-4 py-2.5 text-center text-sm font-semibold text-ink transition hover:border-moss/25 hover:text-moss disabled:opacity-50 sm:w-auto sm:px-5 sm:py-3';
+
+const defaultCrmFilters = {
+  search: '',
+  status: 'all',
+  created: 'all',
+  page: 1,
+  pageSize: 25,
+  sort: 'created_at',
+  direction: 'desc',
+};
+
+export function crmFiltersFromSearch(search = '') {
+  const params = new URLSearchParams(search);
+  const pageSize = Number(params.get('pageSize'));
+  const page = Number(params.get('page'));
+  const sort = params.get('sort') || defaultCrmFilters.sort;
+  const direction = params.get('direction') === 'asc' ? 'asc' : 'desc';
+
+  return {
+    search: params.get('search') || '',
+    status: statuses.includes(params.get('status')) ? params.get('status') : 'all',
+    created: params.get('created') === 'last-7-days' ? 'last-7-days' : 'all',
+    page: Number.isInteger(page) && page > 0 ? page : 1,
+    pageSize: [10, 25, 50, 100].includes(pageSize) ? pageSize : defaultCrmFilters.pageSize,
+    sort: ['created_at', 'updated_at', 'company', 'next_action_at', 'priority', 'status', 'deal_score', 'listing_date'].includes(sort)
+      ? sort
+      : defaultCrmFilters.sort,
+    direction,
+  };
+}
+
+export function crmSearchFromFilters(filters) {
+  const params = new URLSearchParams();
+
+  if (filters.search) params.set('search', filters.search);
+  if (filters.status !== defaultCrmFilters.status) params.set('status', filters.status);
+  if (filters.created && filters.created !== defaultCrmFilters.created) params.set('created', filters.created);
+  if (filters.page !== defaultCrmFilters.page) params.set('page', String(filters.page));
+  if (filters.pageSize !== defaultCrmFilters.pageSize) params.set('pageSize', String(filters.pageSize));
+  if (filters.sort !== defaultCrmFilters.sort) params.set('sort', filters.sort);
+  if (filters.direction !== defaultCrmFilters.direction) params.set('direction', filters.direction);
+
+  return params.toString();
+}
 
 function toDateTimeLocal(value) {
   if (!value) {
@@ -160,6 +208,21 @@ function formatDateTime(value) {
 
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? 'Not set' : date.toLocaleString();
+}
+
+function submissionDealScore(submission = {}) {
+  const rawScore = submission.metadata?.dealHunter?.score;
+
+  if (rawScore === null || rawScore === undefined || rawScore === '') {
+    return null;
+  }
+
+  const score = Number(rawScore);
+  return Number.isFinite(score) ? Math.max(0, Math.min(100, Math.round(score))) : null;
+}
+
+function submissionListingDate(submission = {}) {
+  return submission.metadata?.dealHunter?.dateAdded || submission.metadata?.dealHunter?.firstSeenAt || '';
 }
 
 function pluralize(count, label) {
@@ -279,16 +342,6 @@ function diligenceReadinessTone(score = 0) {
   }
 
   return 'danger';
-}
-
-function formatMoney(value) {
-  return Number.isFinite(value)
-    ? new Intl.NumberFormat('en-US', {
-        style: 'currency',
-        currency: 'USD',
-        maximumFractionDigits: 0,
-      }).format(value)
-    : 'Not disclosed';
 }
 
 function defaultDiligence() {
@@ -457,7 +510,7 @@ function blankRecordDraft() {
   };
 }
 
-function StatCard({ icon: Icon, label, value, tone = 'default' }) {
+function StatCard({ icon: Icon, label, onClick, value, tone = 'default', to = '' }) {
   const tones = {
     default: 'bg-moss/8 text-moss',
     success: 'bg-moss/10 text-moss',
@@ -466,13 +519,32 @@ function StatCard({ icon: Icon, label, value, tone = 'default' }) {
     info: 'bg-sky-100 text-sky-700',
   };
 
-  return (
-    <div className="panel p-4 sm:p-5">
+  const content = (
+    <>
       <div className={`flex h-12 w-12 items-center justify-center rounded-2xl ${tones[tone]}`}>
         <Icon className="h-5 w-5" />
       </div>
       <p className="mt-4 text-xs font-semibold uppercase leading-5 tracking-[0.14em] text-moss/80 sm:text-sm sm:tracking-[0.18em]">{label}</p>
       <p className="mt-2 text-2xl font-semibold text-ink sm:text-3xl">{value}</p>
+    </>
+  );
+
+  if (to) {
+    return (
+      <NavLink
+        aria-label={`View ${label}: ${value}`}
+        className="panel block p-4 transition duration-200 hover:-translate-y-0.5 hover:border-moss/25 hover:shadow-[0_18px_44px_rgba(24,33,29,0.11)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-moss focus-visible:ring-offset-2 sm:p-5"
+        onClick={onClick}
+        to={to}
+      >
+        {content}
+      </NavLink>
+    );
+  }
+
+  return (
+    <div className="panel p-4 sm:p-5">
+      {content}
     </div>
   );
 }
@@ -539,7 +611,7 @@ function getCimSnapshotToken(deal = {}) {
 }
 
 function AdminSectionNav({ activeSection, isReadOnly }) {
-  const visibleSections = adminSections.filter((section) => !isReadOnly || section.id !== 'new-record');
+  const visibleSections = adminSections.filter((section) => !isReadOnly || !['new-record', 'operations'].includes(section.id));
 
   return (
     <aside className="admin-section-nav">
@@ -655,119 +727,6 @@ function LinksRow({ submission }) {
           {link.label}
         </a>
       ))}
-    </div>
-  );
-}
-
-function DealHunterCard({ deal, mode = 'fit', onSendCimRequest, requestingCim = false, readOnly = false }) {
-  const detailItems = mode === 'remove' ? deal.removeReasons || deal.concerns || [] : deal.strengths || [];
-  const listingHref = safeExternalHref(deal.listingUrl);
-  const meta = [
-    deal.industry,
-    deal.location,
-    deal.annualProfit ? `Profit ${formatMoney(deal.annualProfit)}` : '',
-    deal.askingPrice ? `Ask ${formatMoney(deal.askingPrice)}` : '',
-    deal.profitMultiple ? `${deal.profitMultiple}x profit` : '',
-  ].filter(Boolean);
-  const cimRequest = deal.cimRequest || {};
-  const showCimRequest = mode !== 'remove' && deal.score >= 75;
-  const cimRequestComplete = ['sent', 'logged', 'follow_up_failed', 'delivery_issue', 'follow_up_pending'].includes(cimRequest.status);
-  const cimTone =
-    cimRequest.status === 'failed' || cimRequest.status === 'follow_up_failed' || cimRequest.status === 'delivery_issue'
-      ? 'danger'
-      : cimRequest.status === 'pending' || cimRequest.status === 'follow_up_pending'
-        ? 'warning'
-        : cimRequest.status === 'responded' || cimRequestComplete
-          ? 'success'
-          : 'info';
-  const cimLabel =
-    cimRequest.status === 'responded'
-      ? 'Broker replied'
-      : cimRequest.status === 'delivery_issue'
-        ? 'Delivery issue'
-        : cimRequest.status === 'follow_up_failed'
-          ? 'Follow-up failed'
-          : cimRequest.status === 'follow_up_pending'
-            ? 'Follow-up pending'
-            : cimRequest.status === 'sent'
-              ? 'CIM requested'
-              : cimRequest.status === 'logged'
-                ? 'CIM logged'
-                : cimRequest.status === 'failed'
-                  ? 'CIM failed'
-                  : cimRequest.status === 'pending'
-                    ? 'CIM pending'
-                    : cimRequest.eligible
-                      ? 'CIM ready'
-                      : 'CIM blocked';
-  const followUpSummary =
-    cimRequest.followUpCount > 0
-      ? ` ${cimRequest.followUpCount} follow-up${cimRequest.followUpCount === 1 ? '' : 's'} sent.`
-      : '';
-  const nextFollowUpSummary = cimRequest.nextFollowUpAt ? ` Next follow-up: ${formatDateTime(cimRequest.nextFollowUpAt)}.` : '';
-  const cimDescription =
-    cimRequest.status === 'responded'
-      ? `Reply recorded ${formatDateTime(cimRequest.respondedAt)}.`
-      : cimRequest.status === 'follow_up_pending'
-        ? `A CIM follow-up send is in progress for ${cimRequest.recipientEmail}.${nextFollowUpSummary}`
-        : cimRequestComplete
-          ? `Requested ${formatDateTime(cimRequest.requestedAt)}${cimRequest.recipientEmail ? ` to ${cimRequest.recipientEmail}` : ''}.${followUpSummary}${nextFollowUpSummary}`
-          : cimRequest.eligible
-            ? `Ready to request the CIM from ${cimRequest.recipientEmail}.`
-            : cimRequest.reason || 'No broker or contact email is available for this listing.';
-
-  return (
-    <div className={`min-w-0 rounded-2xl border p-4 sm:p-5 ${notificationToneClasses(mode === 'remove' ? 'danger' : mode === 'watch' ? 'warning' : 'info')}`}>
-      <div className="flex flex-wrap items-center gap-2">
-        <Pill tone={dealScoreTone(deal.score)}>Score {deal.score}</Pill>
-        {deal.isNew ? <Pill tone="success">New</Pill> : null}
-        {showCimRequest ? <Pill tone={cimTone}>{cimLabel}</Pill> : null}
-        <Pill>{deal.sourceName}</Pill>
-      </div>
-      <h3 className="mt-3 text-lg font-semibold leading-snug">{deal.name}</h3>
-      {meta.length > 0 ? <p className="mt-2 text-sm leading-6">{meta.join(' | ')}</p> : null}
-      {deal.recommendation ? <p className="mt-3 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-6">{deal.recommendation}</p> : null}
-      {showCimRequest ? (
-        <div className="mt-4 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-6">
-          <p className="font-semibold uppercase tracking-[0.14em]">CIM Request</p>
-          <p className="mt-2">{cimDescription}</p>
-          {cimRequest.deliveryError ? <p className="mt-2 text-red-700">{cimRequest.deliveryError}</p> : null}
-          {cimRequest.canRequest && onSendCimRequest && !readOnly ? (
-            <button
-              className="mt-3 inline-flex w-full items-center justify-center gap-2 rounded-full border border-moss bg-moss px-4 py-2.5 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:opacity-50"
-              disabled={requestingCim}
-              onClick={() => onSendCimRequest(deal)}
-              type="button"
-            >
-              <Send className="h-4 w-4" />
-              {requestingCim ? 'Sending...' : 'Send CIM Request'}
-            </button>
-          ) : null}
-          {cimRequest.canRequest && readOnly ? <p className="mt-2 text-xs font-semibold uppercase tracking-[0.12em]">Read-only access</p> : null}
-        </div>
-      ) : null}
-      {detailItems.length > 0 ? (
-        <ul className="mt-3 list-disc space-y-1 pl-5 text-sm leading-6">
-          {detailItems.slice(0, 3).map((item) => (
-            <li key={`${deal.id}-${item}`}>{item}</li>
-          ))}
-        </ul>
-      ) : null}
-      {deal.questions?.length > 0 ? (
-        <div className="mt-4 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-6">
-          <p className="font-semibold uppercase tracking-[0.14em]">Questions</p>
-          <ul className="mt-2 list-disc space-y-1 pl-5">
-            {deal.questions.slice(0, 2).map((question) => (
-              <li key={`${deal.id}-${question}`}>{question}</li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-      {listingHref ? (
-        <a className="mt-4 inline-flex text-sm font-semibold text-moss underline" href={listingHref} rel="noreferrer" target="_blank">
-          View listing
-        </a>
-      ) : null}
     </div>
   );
 }
@@ -941,6 +900,7 @@ async function copyText(value) {
 
 export default function DashboardPage() {
   const { section = 'overview', submissionId = '' } = useParams();
+  const location = useLocation();
   const navigate = useNavigate();
   const validSectionIds = useMemo(() => new Set(adminSections.map((item) => item.id)), []);
   const isCrmDetailView = Boolean(submissionId);
@@ -962,14 +922,24 @@ export default function DashboardPage() {
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [loginError, setLoginError] = useState('');
   const [loginPending, setLoginPending] = useState(false);
-  const [filters, setFilters] = useState({ search: '', status: 'all' });
-  const [dashboardData, setDashboardData] = useState({ summary: null, submissions: [], notifications: [], emailTriage: [], total: 0 });
+  const [filters, setFilters] = useState(() => crmFiltersFromSearch(window.location.search));
+  const [dashboardData, setDashboardData] = useState({
+    summary: null,
+    submissions: [],
+    notifications: [],
+    emailTriage: [],
+    total: 0,
+    page: 1,
+    pageSize: defaultCrmFilters.pageSize,
+    totalPages: 1,
+  });
   const [followUpData, setFollowUpData] = useState({ summary: null, notifications: [], emailTriage: [], total: 0 });
   const [followUpError, setFollowUpError] = useState('');
   const [followUpLoading, setFollowUpLoading] = useState(false);
   const [drafts, setDrafts] = useState({});
   const [loading, setLoading] = useState(false);
   const [actionError, setActionError] = useState('');
+  const [dealActivity, setDealActivity] = useState({ events: [], loading: false, error: '' });
   const [savingSubmissionId, setSavingSubmissionId] = useState('');
   const [creatingUploadForId, setCreatingUploadForId] = useState('');
   const [deletingSubmissionId, setDeletingSubmissionId] = useState('');
@@ -981,16 +951,26 @@ export default function DashboardPage() {
   const [dealHunterSending, setDealHunterSending] = useState(false);
   const [dealHunterBulkCimSending, setDealHunterBulkCimSending] = useState(false);
   const [dealHunterFollowUpRunning, setDealHunterFollowUpRunning] = useState(false);
+  const [emailTestSending, setEmailTestSending] = useState(false);
   const [requestingCimDealKey, setRequestingCimDealKey] = useState('');
   const [dealHunterFeedback, setDealHunterFeedback] = useState({ error: '', message: '' });
   const [commandCenter, setCommandCenter] = useState(null);
   const [commandCenterLoading, setCommandCenterLoading] = useState(false);
   const [commandCenterUpdatingId, setCommandCenterUpdatingId] = useState('');
   const [commandCenterFeedback, setCommandCenterFeedback] = useState({ error: '', message: '' });
+  const [operations, setOperations] = useState(null);
+  const [operationsLoading, setOperationsLoading] = useState(false);
+  const [operationsError, setOperationsError] = useState('');
   const dashboardRequestRef = useRef({ controller: null, id: 0 });
   const followUpRequestRef = useRef({ controller: null, id: 0 });
   const deferredSearch = useDeferredValue(filters.search);
   const isReadOnly = authState.role === 'viewer';
+  const requestedFollowUpView = new URLSearchParams(location.search).get('view');
+  const followUpView = ['action-items', 'overdue', 'due-soon', 'warm-leads'].includes(requestedFollowUpView)
+    ? requestedFollowUpView
+    : 'all';
+  const crmListSearch = crmSearchFromFilters(filters);
+  const crmListHref = `/admin/crm${crmListSearch ? `?${crmListSearch}` : ''}`;
 
   async function checkSession() {
     const response = await fetch('/api/admin/session', { credentials: 'same-origin' });
@@ -1056,6 +1036,15 @@ export default function DashboardPage() {
         query.set('search', search);
       }
 
+      if (filters.created !== 'all') {
+        query.set('created', filters.created);
+      }
+
+      query.set('page', String(filters.page));
+      query.set('pageSize', String(filters.pageSize));
+      query.set('sort', filters.sort);
+      query.set('direction', filters.direction);
+
       const response = await fetch(`/api/admin/submissions?${query.toString()}`, {
         credentials: 'same-origin',
         signal: controller.signal,
@@ -1082,7 +1071,13 @@ export default function DashboardPage() {
         notifications: result.notifications || [],
         emailTriage: result.emailTriage || [],
         total: result.total,
+        page: result.page,
+        pageSize: result.pageSize,
+        totalPages: result.totalPages,
       });
+      if (result.page !== filters.page) {
+        setFilters((current) => ({ ...current, page: result.page }));
+      }
       setDrafts(
         result.submissions.reduce((accumulator, submission) => {
           accumulator[submission.id] = buildDraft(submission);
@@ -1113,13 +1108,20 @@ export default function DashboardPage() {
     dashboardRequestRef.current.controller?.abort();
     dashboardRequestRef.current = { controller, id: requestId };
     setLoading(true);
+    setDealActivity((current) => ({ ...current, loading: true, error: '' }));
     setActionError('');
 
     try {
-      const response = await fetch(`/api/admin/submissions/${id}`, {
-        credentials: 'same-origin',
-        signal: controller.signal,
-      });
+      const [response, activityResponse] = await Promise.all([
+        fetch(`/api/admin/submissions/${id}`, {
+          credentials: 'same-origin',
+          signal: controller.signal,
+        }),
+        fetch(`/api/admin/submissions/${id}/activity`, {
+          credentials: 'same-origin',
+          signal: controller.signal,
+        }),
+      ]);
 
       if (dashboardRequestRef.current.id !== requestId) {
         return;
@@ -1131,6 +1133,7 @@ export default function DashboardPage() {
       }
 
       const result = await response.json();
+      const activityResult = await activityResponse.json();
 
       if (!response.ok || !result.success) {
         throw new Error(result.error || 'Unable to load this CRM record.');
@@ -1146,6 +1149,11 @@ export default function DashboardPage() {
       setDrafts({
         [result.submission.id]: buildDraft(result.submission),
       });
+      setDealActivity({
+        events: activityResponse.ok && activityResult.success ? activityResult.events || [] : [],
+        loading: false,
+        error: activityResponse.ok && activityResult.success ? '' : activityResult.error || 'Unable to load deal activity.',
+      });
     } catch (error) {
       if (error.name === 'AbortError') {
         return;
@@ -1156,6 +1164,7 @@ export default function DashboardPage() {
       }
 
       setActionError(error.message || 'Unable to load this CRM record.');
+      setDealActivity((current) => ({ ...current, loading: false, error: 'Unable to load deal activity.' }));
     } finally {
       if (dashboardRequestRef.current.id === requestId) {
         setLoading(false);
@@ -1254,6 +1263,75 @@ export default function DashboardPage() {
     }
   }
 
+  async function loadOperations() {
+    setOperationsLoading(true);
+    setOperationsError('');
+    try {
+      const response = await fetch('/api/admin/operations', { credentials: 'same-origin' });
+      const result = await response.json();
+      if (response.status === 401) {
+        throw new Error(result.error || 'Administrator access is required.');
+      }
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to load operations status.');
+      setOperations(result.operations);
+    } catch (error) {
+      setOperationsError(error.message || 'Unable to load operations status.');
+    } finally {
+      setOperationsLoading(false);
+    }
+  }
+
+  async function handleSendEmailTest() {
+    if (isReadOnly) {
+      setDealHunterFeedback({ error: 'Read-only users cannot send email tests.', message: '' });
+      return;
+    }
+
+    const readiness = dealHunterReview?.emailReadiness || operations?.email;
+    const recipient = readiness?.testRecipient || '';
+    if (!recipient) {
+      setDealHunterFeedback({ error: 'No configured internal email-test recipient is available.', message: '' });
+      setOperationsError('No configured internal email-test recipient is available.');
+      return;
+    }
+
+    if (!window.confirm(`Send a controlled email delivery test to ${recipient}?`)) return;
+
+    setEmailTestSending(true);
+    setDealHunterFeedback({ error: '', message: '' });
+    setOperationsError('');
+
+    try {
+      const response = await fetch('/api/admin/email/test', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient }),
+      });
+      const result = await response.json();
+
+      if (result.readiness) {
+        setOperations((current) => current ? { ...current, email: result.readiness } : current);
+        setDealHunterReview((current) => current ? { ...current, emailReadiness: result.readiness } : current);
+      }
+
+      if (!response.ok || !result.success) {
+        throw new Error(result.emailResult?.error || result.error || 'Unable to send the controlled email test.');
+      }
+
+      setDealHunterFeedback({
+        error: '',
+        message: `Test email accepted for ${recipient}. Reply to it without changing the subject to verify inbound reply tracking.`,
+      });
+    } catch (error) {
+      const message = error.message || 'Unable to send the controlled email test.';
+      setDealHunterFeedback({ error: message, message: '' });
+      setOperationsError(message);
+    } finally {
+      setEmailTestSending(false);
+    }
+  }
+
   useEffect(() => {
     const token = new URLSearchParams(window.location.search).get('admin_token');
 
@@ -1284,7 +1362,35 @@ export default function DashboardPage() {
 
     dashboardRequestRef.current.controller?.abort();
     setLoading(false);
-  }, [activeSection, authState.authenticated, deferredSearch, filters.status, isCrmDetailView, submissionId]);
+  // Loaders are intentionally recreated with the active query state; primitive query fields below are the reload boundary.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    activeSection,
+    authState.authenticated,
+    deferredSearch,
+    filters.direction,
+    filters.created,
+    filters.page,
+    filters.pageSize,
+    filters.sort,
+    filters.status,
+    isCrmDetailView,
+    submissionId,
+  ]);
+
+  useEffect(() => {
+    if (isCrmDetailView || activeSection !== 'crm') {
+      return;
+    }
+
+    const query = crmSearchFromFilters(filters);
+    const nextUrl = `${window.location.pathname}${query ? `?${query}` : ''}`;
+    const currentUrl = `${window.location.pathname}${window.location.search}`;
+
+    if (nextUrl !== currentUrl) {
+      window.history.replaceState({}, '', nextUrl);
+    }
+  }, [activeSection, filters, isCrmDetailView]);
 
   useEffect(() => {
     if (!authState.authenticated) {
@@ -1302,6 +1408,10 @@ export default function DashboardPage() {
       setFollowUpLoading(false);
     }
   }, [activeSection, authState.authenticated]);
+
+  useEffect(() => {
+    if (authState.authenticated && !isReadOnly && activeSection === 'operations') loadOperations();
+  }, [activeSection, authState.authenticated, isReadOnly]);
 
   useEffect(() => () => {
     dashboardRequestRef.current.controller?.abort();
@@ -1380,6 +1490,22 @@ export default function DashboardPage() {
       credentials: 'same-origin',
     });
 
+    setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
+  }
+
+  async function handleLogoutEverywhere() {
+    if (!window.confirm('Sign out every active session for this account?')) return;
+    const response = await fetch('/api/admin/sessions/revoke-all', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) {
+      setActionError(result.error || 'Unable to revoke active sessions.');
+      return;
+    }
     setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
   }
 
@@ -1620,6 +1746,9 @@ export default function DashboardPage() {
         },
         body: JSON.stringify({
           note: drafts[submissionId]?.notes || '',
+          requestedDocuments: diligenceChecklistItems
+            .filter((item) => !normalizeDiligence(drafts[submissionId]?.diligence).checklist[item.id])
+            .map((item) => ({ category: item.id, label: item.label, required: true })),
           sendEmail: true,
         }),
       });
@@ -1648,6 +1777,32 @@ export default function DashboardPage() {
     } finally {
       setCreatingUploadForId('');
     }
+  }
+
+  async function handleRevokeUploadRequest(requestRecord) {
+    if (!window.confirm('Revoke this secure upload link immediately?')) return;
+    const response = await fetch(`/api/admin/secure-upload-requests/${encodeURIComponent(requestRecord.id)}/revoke`, {
+      method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) {
+      setActionError(result.error || 'Unable to revoke the secure upload link.');
+      return;
+    }
+    await refreshCurrentCrmView();
+  }
+
+  async function handleDeleteSecureDocument(document) {
+    if (!window.confirm(`Permanently delete ${document.original_name} from the active secure vault?`)) return;
+    const response = await fetch(`/api/admin/secure-documents/${encodeURIComponent(document.id)}`, {
+      method: 'DELETE', credentials: 'same-origin',
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) {
+      setActionError(result.error || 'Unable to delete the secure document.');
+      return;
+    }
+    await refreshCurrentCrmView();
   }
 
   function updateDiligenceDraft(submissionId, fallbackDraft, updater) {
@@ -1765,6 +1920,13 @@ export default function DashboardPage() {
       setDealHunterFeedback({ error: 'Deal key is missing for this listing.', message: '' });
       return;
     }
+
+    const recipient = deal.cimRequest?.recipientEmail || deal.brokerEmail || '';
+    const retrying = deal.cimRequest?.status === 'failed';
+    const confirmed = window.confirm(
+      `${retrying ? 'Retry' : 'Send'} the CIM request for ${deal.name || 'this business'}${recipient ? ` to ${recipient}` : ''}?\n\nThis sends an email to the broker immediately.`,
+    );
+    if (!confirmed) return;
 
     setRequestingCimDealKey(deal.dealKey);
     setDealHunterFeedback({ error: '', message: '' });
@@ -1954,6 +2116,27 @@ export default function DashboardPage() {
   const followUpSummary = followUpData.summary || {};
   const notifications = useMemo(() => followUpData.notifications || [], [followUpData.notifications]);
   const emailTriage = useMemo(() => followUpData.emailTriage || [], [followUpData.emailTriage]);
+  const visibleNotifications = useMemo(() => {
+    if (followUpView === 'warm-leads') {
+      return [];
+    }
+
+    if (followUpView === 'overdue') {
+      return notifications.filter((submission) => submission.follow_up_prompt?.kind === 'overdue');
+    }
+
+    if (followUpView === 'due-soon') {
+      return notifications.filter((submission) => ['due', 'today'].includes(submission.follow_up_prompt?.kind));
+    }
+
+    return notifications;
+  }, [followUpView, notifications]);
+  const visibleEmailTriage = useMemo(
+    () => (followUpView === 'all' || followUpView === 'warm-leads' ? emailTriage : []),
+    [emailTriage, followUpView],
+  );
+  const displayedNotifications = followUpView === 'all' ? visibleNotifications.slice(0, 6) : visibleNotifications;
+  const displayedEmailTriage = followUpView === 'all' ? visibleEmailTriage.slice(0, 6) : visibleEmailTriage;
   const adminSummary = {
     ...summary,
     actionItems: followUpSummary.actionItems ?? summary.actionItems,
@@ -1979,7 +2162,7 @@ export default function DashboardPage() {
     return <Navigate replace to="/admin" />;
   }
 
-  if (authState.authenticated && isReadOnly && activeSection === 'new-record') {
+  if (authState.authenticated && isReadOnly && ['new-record', 'operations'].includes(activeSection)) {
     return <Navigate replace to="/admin/crm" />;
   }
 
@@ -2157,6 +2340,14 @@ export default function DashboardPage() {
                 <LogOut className="h-4 w-4" />
                 Sign Out
               </button>
+              <button
+                className={`${secondaryActionButtonClass} admin-action-button`}
+                onClick={handleLogoutEverywhere}
+                type="button"
+              >
+                <ShieldAlert className="h-4 w-4" />
+                Sign Out Everywhere
+              </button>
             </div>
           </div>
         </Reveal>
@@ -2171,13 +2362,13 @@ export default function DashboardPage() {
       <>
       <section className="section-shell mt-8">
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
-          <StatCard icon={Inbox} label="Total Records" value={summary.total} />
-          <StatCard icon={BellRing} label="Action Items" value={adminSummary.actionItems} tone={adminSummary.actionItems > 0 ? 'warning' : 'default'} />
-          <StatCard icon={CalendarClock} label="Overdue" value={adminSummary.overdue} tone={adminSummary.overdue > 0 ? 'danger' : 'default'} />
-          <StatCard icon={ClipboardList} label="Due Soon" value={adminSummary.dueSoon} tone={adminSummary.dueSoon > 0 ? 'warning' : 'default'} />
-          <StatCard icon={MailCheck} label="Warm Leads" value={adminSummary.emailEngaged} tone={adminSummary.emailEngaged > 0 ? 'warning' : 'default'} />
-          <StatCard icon={MailCheck} label="Last 7 Days" value={summary.lastSevenDays} />
-          <StatCard icon={ShieldAlert} label="Spam" value={summary.spam} />
+          <StatCard icon={Inbox} label="Total Records" onClick={() => setFilters({ ...defaultCrmFilters })} to="/admin/crm" value={summary.total} />
+          <StatCard icon={BellRing} label="Action Items" to="/admin/follow-ups?view=action-items" value={adminSummary.actionItems} tone={adminSummary.actionItems > 0 ? 'warning' : 'default'} />
+          <StatCard icon={CalendarClock} label="Overdue" to="/admin/follow-ups?view=overdue" value={adminSummary.overdue} tone={adminSummary.overdue > 0 ? 'danger' : 'default'} />
+          <StatCard icon={ClipboardList} label="Due Soon" to="/admin/follow-ups?view=due-soon" value={adminSummary.dueSoon} tone={adminSummary.dueSoon > 0 ? 'warning' : 'default'} />
+          <StatCard icon={MailCheck} label="Warm Leads" to="/admin/follow-ups?view=warm-leads" value={adminSummary.emailEngaged} tone={adminSummary.emailEngaged > 0 ? 'warning' : 'default'} />
+          <StatCard icon={MailCheck} label="Last 7 Days" onClick={() => setFilters({ ...defaultCrmFilters, created: 'last-7-days' })} to="/admin/crm?created=last-7-days" value={summary.lastSevenDays} />
+          <StatCard icon={ShieldAlert} label="Spam" onClick={() => setFilters({ ...defaultCrmFilters, status: 'spam' })} to="/admin/crm?status=spam" value={summary.spam} />
         </div>
       </section>
       <section className="section-shell mt-5">
@@ -2193,7 +2384,7 @@ export default function DashboardPage() {
           </div>
           <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
             {adminSections
-              .filter((item) => item.id !== 'overview' && (!isReadOnly || item.id !== 'new-record'))
+              .filter((item) => item.id !== 'overview' && (!isReadOnly || !['new-record', 'operations'].includes(item.id)))
               .map((item) => {
                 const Icon = item.icon;
                 const descriptions = {
@@ -2201,6 +2392,7 @@ export default function DashboardPage() {
                   'command-center': 'Review the 75+ pipeline, source health, action queue, and pass decisions.',
                   'deal-hunter': 'Run source scoring, send daily deal emails, and manage CIM follow-ups.',
                   'follow-ups': 'Work the generated follow-up prompts and email engagement triage queue.',
+                  operations: 'Inspect jobs, source history, audits, cleanup failures, storage, and backups.',
                   'new-record': 'Create a manual broker, seller, referral, or prospect record.',
                 };
 
@@ -2222,6 +2414,23 @@ export default function DashboardPage() {
         </Reveal>
       </section>
       </>
+      ) : null}
+
+      {activeSection === 'operations' ? (
+      <section className="section-shell mt-8 pb-8">
+        <div className="mb-6">
+          <SectionLabel>Operations Center</SectionLabel>
+          <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">System health, history, and recovery readiness</h2>
+          <p className="mt-3 max-w-3xl text-sm leading-7 text-ink/68">Admin-only operational visibility for scheduler runs, source checks, security cleanup, audit history, disk usage, database integrity, and backups.</p>
+        </div>
+        <OperationsCenter
+          data={operations}
+          emailTestSending={emailTestSending}
+          error={operationsError}
+          loading={operationsLoading}
+          onSendEmailTest={handleSendEmailTest}
+        />
+      </section>
       ) : null}
 
       {activeSection === 'command-center' ? (
@@ -2402,203 +2611,23 @@ export default function DashboardPage() {
       ) : null}
 
       {activeSection === 'deal-hunter' ? (
-      <section className="section-shell mt-5">
-        <Reveal className="panel p-5 sm:p-6">
-          <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-            <div>
-              <SectionLabel>Deal Hunter Scoring</SectionLabel>
-              <h2 className="mt-2 text-xl font-semibold text-ink sm:text-2xl">Daily source review</h2>
-              <p className="mt-2 max-w-3xl text-sm leading-6 text-ink/68 sm:text-base sm:leading-7">
-                Pulls the SMB Deal Hunter sheet and the larger Airtable business list, scores recent listings against your acquisition profile, and flags removals for tomorrow's update.
-              </p>
-            </div>
-
-            <div className="admin-action-row xl:justify-end">
-              <button
-                className={`${secondaryActionButtonClass} admin-action-button`}
-                disabled={dealHunterLoading || dealHunterSending || dealHunterBulkCimSending || dealHunterFollowUpRunning}
-                onClick={handleLoadDealHunterReview}
-                type="button"
-              >
-                <RefreshCw className={`h-4 w-4 ${dealHunterLoading ? 'animate-spin' : ''}`} />
-                {dealHunterLoading ? 'Reviewing...' : 'Review Sources'}
-              </button>
-              {!isReadOnly ? (
-                <>
-                  <button
-                    className={`${primaryActionButtonClass} admin-action-button`}
-                    disabled={dealHunterLoading || dealHunterSending || dealHunterBulkCimSending || dealHunterFollowUpRunning}
-                    onClick={handleSendReadyCimRequests}
-                    type="button"
-                  >
-                    <Send className="h-4 w-4" />
-                    {dealHunterBulkCimSending ? 'Sending CIMs...' : 'Send CIM Requests'}
-                  </button>
-                  <button
-                    className={`${secondaryActionButtonClass} admin-action-button`}
-                    disabled={dealHunterLoading || dealHunterSending || dealHunterBulkCimSending || dealHunterFollowUpRunning}
-                    onClick={handleRunCimFollowUps}
-                    type="button"
-                  >
-                    <MailCheck className={`h-4 w-4 ${dealHunterFollowUpRunning ? 'animate-pulse' : ''}`} />
-                    {dealHunterFollowUpRunning ? 'Checking...' : 'Run CIM Follow-Ups'}
-                  </button>
-                  <button
-                    className={`${secondaryActionButtonClass} admin-action-button`}
-                    disabled={dealHunterLoading || dealHunterSending || dealHunterBulkCimSending || dealHunterFollowUpRunning}
-                    onClick={handleSendDealHunterEmail}
-                    type="button"
-                  >
-                    <Send className="h-4 w-4" />
-                    {dealHunterSending ? 'Sending...' : 'Send Daily Email'}
-                  </button>
-                </>
-              ) : null}
-            </div>
-          </div>
-
-          {dealHunterFeedback.error ? (
-            <p className="mt-5 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{dealHunterFeedback.error}</p>
-          ) : null}
-          {dealHunterFeedback.message ? (
-            <p className="mt-5 rounded-2xl border border-moss/20 bg-moss/8 px-4 py-3 text-sm font-medium text-moss">{dealHunterFeedback.message}</p>
-          ) : null}
-
-          {dealHunterReview ? (
-            <div className="mt-7 space-y-7">
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-7">
-                <StatCard icon={ClipboardList} label="Reviewed" value={dealHunterReview.totals?.reviewedDeals || 0} />
-                <StatCard icon={BellRing} label="New Fits" value={dealHunterReview.totals?.newMatches || 0} tone={dealHunterReview.totals?.newMatches > 0 ? 'warning' : 'default'} />
-                <StatCard icon={MailCheck} label="High Fit" value={dealHunterReview.totals?.qualified || 0} tone={dealHunterReview.totals?.qualified > 0 ? 'warning' : 'default'} />
-                <StatCard icon={Send} label="CIM Ready" value={dealHunterReview.totals?.cimReady || 0} tone={dealHunterReview.totals?.cimReady > 0 ? 'warning' : 'default'} />
-                <StatCard icon={Inbox} label="Watchlist" value={dealHunterReview.totals?.watchlist || 0} />
-                <StatCard icon={ShieldAlert} label="Remove" value={dealHunterReview.totals?.removalCandidates || 0} tone={dealHunterReview.totals?.removalCandidates > 0 ? 'danger' : 'default'} />
-                <StatCard icon={CalendarClock} label="Lookback" value={`${dealHunterReview.lookbackDays || 0}d`} />
-              </div>
-
-              {dealHunterReview.dailyEmailJob ? (
-                <div className="rounded-2xl border border-line/80 bg-fog/70 px-4 py-3 text-sm leading-7 text-ink/74">
-                  <strong>Today's daily email:</strong>{' '}
-                  {formatLabel(dealHunterReview.dailyEmailJob.status)} · attempt {dealHunterReview.dailyEmailJob.attempt_count || 1}
-                  {dealHunterReview.dailyEmailJob.completed_at
-                    ? ` · completed ${formatDateTime(dealHunterReview.dailyEmailJob.completed_at)}`
-                    : ''}
-                  {dealHunterReview.dailyEmailJob.last_error ? ` · ${dealHunterReview.dailyEmailJob.last_error}` : ''}
-                </div>
-              ) : null}
-
-              <div className="grid gap-4 lg:grid-cols-2">
-                <div className="rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5">
-                  <SectionLabel>Sources</SectionLabel>
-                  <div className="mt-4 space-y-3">
-                    {(dealHunterReview.sources || []).map((source) => (
-                      <div className="rounded-2xl border border-line/80 bg-white/75 px-4 py-3 text-sm leading-6 text-ink/74" key={source.id}>
-                        <div className="flex flex-wrap items-center gap-2">
-                          <p className="font-semibold text-ink">{source.name}</p>
-                          <Pill tone={source.fetched ? 'success' : 'danger'}>{source.fetched ? `${source.rowCount || 0} rows` : 'failed'}</Pill>
-                          <Pill>{source.mode}</Pill>
-                        </div>
-                        {source.error ? <p className="mt-2 text-red-700">{source.error}</p> : null}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5">
-                  <SectionLabel>Criteria Notes</SectionLabel>
-                  {dealHunterReview.criteriaRecommendations?.length > 0 ? (
-                    <ul className="mt-4 list-disc space-y-2 pl-5 text-sm leading-7 text-ink/74">
-                      {dealHunterReview.criteriaRecommendations.map((item) => (
-                        <li key={item}>{item}</li>
-                      ))}
-                    </ul>
-                  ) : (
-                    <p className="mt-4 text-sm leading-7 text-ink/68">No criteria changes recommended from the latest run.</p>
-                  )}
-                </div>
-              </div>
-
-              {dealHunterReview.newlySeenMatches?.length > 0 ? (
-                <div>
-                  <div className="mb-3 flex items-center justify-between gap-3">
-                    <SectionLabel>Newly Seen Fits</SectionLabel>
-                    <Pill tone="success">{dealHunterReview.newlySeenMatches.length}</Pill>
-                  </div>
-                  <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
-                    {dealHunterReview.newlySeenMatches.slice(0, 6).map((deal) => (
-                      <DealHunterCard
-                        deal={deal}
-                        key={`new-${deal.sourceName}-${deal.dealKey || deal.id || deal.listingUrl}`}
-                        onSendCimRequest={handleSendCimRequest}
-                        readOnly={isReadOnly}
-                        requestingCim={requestingCimDealKey === deal.dealKey}
-                      />
-                    ))}
-                  </div>
-                </div>
-              ) : null}
-
-              <div className="grid gap-5 xl:grid-cols-3">
-                <div>
-                  <div className="mb-3 flex items-center justify-between gap-3">
-                    <SectionLabel>High Fit</SectionLabel>
-                    <Pill tone="success">{dealHunterReview.qualified?.length || 0}</Pill>
-                  </div>
-                  <div className="space-y-4">
-                    {(dealHunterReview.qualified || []).slice(0, 4).map((deal) => (
-                      <DealHunterCard
-                        deal={deal}
-                        key={`qualified-${deal.sourceName}-${deal.id || deal.listingUrl}`}
-                        onSendCimRequest={handleSendCimRequest}
-                        readOnly={isReadOnly}
-                        requestingCim={requestingCimDealKey === deal.dealKey}
-                      />
-                    ))}
-                    {dealHunterReview.qualified?.length === 0 ? <p className="text-sm leading-7 text-ink/68">No high-fit recent listings found.</p> : null}
-                  </div>
-                </div>
-
-                <div>
-                  <div className="mb-3 flex items-center justify-between gap-3">
-                    <SectionLabel>Watchlist</SectionLabel>
-                    <Pill tone="warning">{dealHunterReview.watchlist?.length || 0}</Pill>
-                  </div>
-                  <div className="space-y-4">
-                    {(dealHunterReview.watchlist || []).slice(0, 4).map((deal) => (
-                      <DealHunterCard
-                        deal={deal}
-                        key={`watch-${deal.sourceName}-${deal.id || deal.listingUrl}`}
-                        mode="watch"
-                        onSendCimRequest={handleSendCimRequest}
-                        readOnly={isReadOnly}
-                        requestingCim={requestingCimDealKey === deal.dealKey}
-                      />
-                    ))}
-                    {dealHunterReview.watchlist?.length === 0 ? <p className="text-sm leading-7 text-ink/68">No watchlist listings found.</p> : null}
-                  </div>
-                </div>
-
-                <div>
-                  <div className="mb-3 flex items-center justify-between gap-3">
-                    <SectionLabel>Remove</SectionLabel>
-                    <Pill tone="danger">{dealHunterReview.removalCandidates?.length || 0}</Pill>
-                  </div>
-                  <div className="space-y-4">
-                    {(dealHunterReview.removalCandidates || []).slice(0, 4).map((deal) => (
-                      <DealHunterCard deal={deal} key={`remove-${deal.sourceName}-${deal.id || deal.listingUrl}`} mode="remove" />
-                    ))}
-                    {dealHunterReview.removalCandidates?.length === 0 ? <p className="text-sm leading-7 text-ink/68">No removal candidates found.</p> : null}
-                  </div>
-                </div>
-              </div>
-            </div>
-          ) : (
-            <p className="mt-6 rounded-2xl border border-line/80 bg-fog/70 px-4 py-4 text-sm leading-7 text-ink/70 sm:px-5">
-              No source review loaded yet. Use Review Sources to preview scored deals before sending CIM requests. Send Daily Email only sends the internal review to you.
-            </p>
-          )}
-        </Reveal>
-      </section>
+        <DealHunterWorkspace
+          bulkSending={dealHunterBulkCimSending}
+          feedback={dealHunterFeedback}
+          followUpRunning={dealHunterFollowUpRunning}
+          emailTestSending={emailTestSending}
+          loading={dealHunterLoading}
+          onReview={handleLoadDealHunterReview}
+          onRunFollowUps={handleRunCimFollowUps}
+          onSendCimRequest={handleSendCimRequest}
+          onSendEmail={handleSendDealHunterEmail}
+          onSendEmailTest={handleSendEmailTest}
+          onSendReady={handleSendReadyCimRequests}
+          readOnly={isReadOnly}
+          requestingCimDealKey={requestingCimDealKey}
+          review={dealHunterReview}
+          sending={dealHunterSending}
+        />
       ) : null}
 
       {activeSection === 'follow-ups' && followUpError ? (
@@ -2615,7 +2644,24 @@ export default function DashboardPage() {
         </section>
       ) : null}
 
-      {activeSection === 'follow-ups' && !followUpLoading && notifications.length > 0 ? (
+      {activeSection === 'follow-ups' && followUpView !== 'all' ? (
+        <section className="section-shell mt-8">
+          <Reveal className="panel flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
+            <div>
+              <SectionLabel>Filtered View</SectionLabel>
+              <p className="mt-2 text-lg font-semibold text-ink">
+                {followUpView === 'action-items' ? 'All action items' : null}
+                {followUpView === 'overdue' ? 'Overdue follow-ups' : null}
+                {followUpView === 'due-soon' ? 'Due now or within 24 hours' : null}
+                {followUpView === 'warm-leads' ? 'Warm leads with email activity' : null}
+              </p>
+            </div>
+            <NavLink className={secondaryActionButtonClass} to="/admin/follow-ups">Show All Follow-Ups</NavLink>
+          </Reveal>
+        </section>
+      ) : null}
+
+      {activeSection === 'follow-ups' && !followUpLoading && visibleNotifications.length > 0 ? (
         <section className="section-shell mt-8">
           <Reveal className="panel p-5 sm:p-8">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
@@ -2626,11 +2672,11 @@ export default function DashboardPage() {
                   These prompts are generated from status, lead type, reminder dates, and document activity so you can keep seller and broker conversations moving without guessing.
                 </p>
               </div>
-              <Pill tone={adminSummary.overdue > 0 ? 'danger' : 'warning'}>{adminSummary.actionItems} active prompts</Pill>
+              <Pill tone={visibleNotifications.some((submission) => submission.follow_up_prompt?.kind === 'overdue') ? 'danger' : 'warning'}>{visibleNotifications.length} active prompts</Pill>
             </div>
 
             <div className="mt-6 grid gap-4 lg:grid-cols-2">
-              {notifications.slice(0, 6).map((submission) => (
+              {displayedNotifications.map((submission) => (
                 <div
                   className={`rounded-2xl border p-4 sm:p-5 ${notificationToneClasses(submission.follow_up_prompt?.severity)}`}
                   key={`notification-${submission.id}`}
@@ -2658,7 +2704,7 @@ export default function DashboardPage() {
         </section>
       ) : null}
 
-      {activeSection === 'follow-ups' && !followUpLoading && emailTriage.length > 0 ? (
+      {activeSection === 'follow-ups' && !followUpLoading && visibleEmailTriage.length > 0 ? (
         <section className="section-shell mt-8">
           <Reveal className="panel p-5 sm:p-8">
             <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
@@ -2669,11 +2715,11 @@ export default function DashboardPage() {
                   These records have opens, clicks, replies, or delivery issues that should change the follow-up plan.
                 </p>
               </div>
-              <Pill tone={adminSummary.hotLeads > 0 ? 'success' : 'warning'}>{adminSummary.hotLeads} hot lead(s)</Pill>
+              <Pill tone={visibleEmailTriage.some((submission) => submission.email_engagement?.hot) ? 'success' : 'warning'}>{visibleEmailTriage.filter((submission) => submission.email_engagement?.hot).length} hot lead(s)</Pill>
             </div>
 
             <div className="mt-6 grid gap-4 lg:grid-cols-2">
-              {emailTriage.slice(0, 6).map((submission) => {
+              {displayedEmailTriage.map((submission) => {
                 const engagement = submission.email_engagement;
 
                 return (
@@ -2701,10 +2747,12 @@ export default function DashboardPage() {
         </section>
       ) : null}
 
-      {activeSection === 'follow-ups' && !followUpLoading && !followUpError && notifications.length === 0 && emailTriage.length === 0 ? (
+      {activeSection === 'follow-ups' && !followUpLoading && !followUpError && visibleNotifications.length === 0 && visibleEmailTriage.length === 0 ? (
         <section className="section-shell mt-8">
           <Reveal className="panel p-7 text-sm leading-7 text-ink/70">
-            No follow-up prompts or email engagement triage items need attention right now.
+            {followUpView === 'all'
+              ? 'No follow-up prompts or email engagement triage items need attention right now.'
+              : 'No records match this overview-card filter right now.'}
           </Reveal>
         </section>
       ) : null}
@@ -2903,38 +2951,17 @@ export default function DashboardPage() {
       {activeSection === 'crm' && !isCrmDetailView ? (
       <section className="section-shell mt-8">
         <Reveal className="panel p-6 sm:p-7">
-          <div className="grid gap-4 md:grid-cols-[minmax(0,1fr)_220px]">
-            <input
-              className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
-              onChange={(event) => {
-                const value = event.target.value;
-                startTransition(() => {
-                  setFilters((current) => ({ ...current, search: value }));
-                });
-              }}
-              placeholder="Search by company, seller, broker, notes, listing URL, website, or email"
-              type="search"
-              value={filters.search}
-            />
-
-            <select
-              className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
-              onChange={(event) => {
-                const value = event.target.value;
-                startTransition(() => {
-                  setFilters((current) => ({ ...current, status: value }));
-                });
-              }}
-              value={filters.status}
-            >
-              <option value="all">All statuses</option>
-              {statuses.map((status) => (
-                <option key={status} value={status}>
-                  {formatLabel(status)}
-                </option>
-              ))}
-            </select>
-          </div>
+          <CrmNavigation
+            disabled={loading}
+            filters={filters}
+            onChange={(updates) => {
+              startTransition(() => {
+                setFilters((current) => ({ ...current, ...updates }));
+              });
+            }}
+            total={dashboardData.total}
+            totalPages={dashboardData.totalPages}
+          />
         </Reveal>
       </section>
       ) : null}
@@ -2947,7 +2974,7 @@ export default function DashboardPage() {
               <SectionLabel>Diligence Deal Room</SectionLabel>
               <h2 className="mt-2 text-2xl font-semibold text-ink">CRM record detail</h2>
             </div>
-            <NavLink className={secondaryActionButtonClass} to="/admin/crm">
+            <NavLink className={secondaryActionButtonClass} to={crmListHref}>
               Back To CRM
             </NavLink>
           </div>
@@ -2968,6 +2995,10 @@ export default function DashboardPage() {
             const draft = drafts[submission.id] || buildDraft(submission);
             const latestUploadRequest = submission.latest_upload_request;
             const documents = submission.secure_documents || [];
+            const requestedDocumentChecklist = (latestUploadRequest?.requested_documents || []).map((item) => ({
+              ...item,
+              received: documents.some((document) => document.request_id === latestUploadRequest.id && document.document_type === item.category),
+            }));
             const isSaving = savingSubmissionId === submission.id;
             const isCreatingUpload = creatingUploadForId === submission.id;
             const isDeleting = deletingSubmissionId === submission.id;
@@ -2975,6 +3006,9 @@ export default function DashboardPage() {
             const diligence = normalizeDiligence(draft.diligence);
             const diligenceProgress = diligenceChecklistProgress(diligence);
             const diligenceProgressTone = diligenceProgress.complete === diligenceProgress.total ? 'success' : diligenceProgress.complete > 0 ? 'info' : 'default';
+            const dealScore = submissionDealScore(submission);
+            const listingDate = submissionListingDate(submission);
+            const listingDateLabel = submission.metadata?.dealHunter?.dateAdded ? 'Date listed' : listingDate ? 'First seen' : 'Date listed';
 
             return (
               <Reveal className="panel p-5 sm:p-8" delay={index * 50} key={submission.id}>
@@ -2989,6 +3023,7 @@ export default function DashboardPage() {
                         {submission.priority}
                       </Pill>
                       <Pill>{submission.lead_type}</Pill>
+                      {dealScore !== null ? <Pill tone={dealScoreTone(dealScore)}>Deal score {dealScore}</Pill> : null}
                       {followUpPrompt ? (
                         <Pill tone={followUpPrompt.severity === 'danger' ? 'danger' : followUpPrompt.severity === 'warning' ? 'warning' : 'info'}>
                           {followUpPrompt.kind}
@@ -3008,7 +3043,7 @@ export default function DashboardPage() {
                       {!isCrmDetailView ? (
                         <NavLink
                           className="inline-flex min-h-[38px] items-center justify-center gap-2 rounded-full border border-ink/10 bg-white px-4 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
-                          to={`/admin/crm/${encodeURIComponent(submission.id)}`}
+                          to={`/admin/crm/${encodeURIComponent(submission.id)}${crmListSearch ? `?${crmListSearch}` : ''}`}
                         >
                           <Target className="h-3.5 w-3.5" />
                           Open Deal Room
@@ -3016,8 +3051,9 @@ export default function DashboardPage() {
                       ) : null}
                     </div>
 
-                    <div className="mt-4 grid gap-3 text-sm leading-7 text-ink/74 sm:grid-cols-2 xl:grid-cols-4">
+                    <div className="mt-4 grid gap-3 text-sm leading-7 text-ink/74 sm:grid-cols-2 xl:grid-cols-5">
                       <p><strong>Date added:</strong> {formatDateTime(submission.created_at)}</p>
+                      <p><strong>{listingDateLabel}:</strong> {listingDate ? formatDateTime(listingDate) : 'Not provided'}</p>
                       <p><strong>Last status edit:</strong> {formatDateTime(submission.status_updated_at || submission.updated_at)}</p>
                       <p><strong>Days ago:</strong> {submission.days_since_added ?? '0'}</p>
                       <p><strong>Next action:</strong> {formatDateTime(submission.next_action_at)}</p>
@@ -3550,10 +3586,23 @@ export default function DashboardPage() {
                           <p>Expires: {formatDateTime(latestUploadRequest.expires_at)}</p>
                           <p>NDA accepted: {latestUploadRequest.nda_accepted_at ? 'Yes' : 'Pending'}</p>
                           <p>Last upload: {latestUploadRequest.last_uploaded_at ? formatDateTime(latestUploadRequest.last_uploaded_at) : 'No files yet'}</p>
+                          <p>Upload batches: {latestUploadRequest.upload_batch_count || 0}</p>
                         </div>
                       ) : (
                         <p className="mt-4 text-sm leading-7 text-ink/68">No secure upload request has been issued yet.</p>
                       )}
+                      {requestedDocumentChecklist.length > 0 ? (
+                        <ul className="mt-4 space-y-2">
+                          {requestedDocumentChecklist.map((item) => (
+                            <li className="flex items-center justify-between gap-3 rounded-xl border border-line/80 bg-white/70 px-3 py-2 text-xs" key={item.category}>
+                              <span>{item.label}</span><span className={item.received ? 'text-emerald-700' : 'text-amber-700'}>{item.received ? 'Received' : 'Requested'}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : null}
+                      {!isReadOnly && latestUploadRequest && !['revoked', 'completed', 'documents-received'].includes(latestUploadRequest.status) ? (
+                        <button className="mt-4 inline-flex rounded-full border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700" onClick={() => handleRevokeUploadRequest(latestUploadRequest)} type="button">Revoke Link</button>
+                      ) : null}
                     </div>
 
                     <div className="rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5">
@@ -3581,6 +3630,16 @@ export default function DashboardPage() {
                                       Download
                                     </a>
                                   ) : null}
+                                  {!isReadOnly ? (
+                                    <button
+                                      className="inline-flex items-center gap-2 rounded-full border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700 transition hover:bg-red-100"
+                                      onClick={() => handleDeleteSecureDocument(document)}
+                                      type="button"
+                                    >
+                                      <Trash2 className="h-3.5 w-3.5" />
+                                      Delete
+                                    </button>
+                                  ) : null}
                                   <button
                                     className="inline-flex items-center gap-2 rounded-full border border-ink/10 bg-white px-3 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
                                     onClick={() => copyText(document.original_name)}
@@ -3601,6 +3660,14 @@ export default function DashboardPage() {
                     </div>
                   </div>
                 </fieldset>
+
+                {isCrmDetailView ? (
+                  <DealActivityTimeline
+                    error={dealActivity.error}
+                    events={dealActivity.events}
+                    loading={dealActivity.loading}
+                  />
+                ) : null}
 
                 {!isReadOnly ? (
                   <div className="mt-6 grid gap-3 sm:flex sm:flex-wrap">
@@ -3644,6 +3711,18 @@ export default function DashboardPage() {
           ) : null}
 
           {loading ? <Reveal className="panel p-7 text-sm leading-7 text-ink/70">Loading CRM records...</Reveal> : null}
+
+          {!isCrmDetailView && dashboardData.total > 0 ? (
+            <Reveal className="panel p-4 sm:p-5">
+              <CrmNavigation
+                disabled={loading}
+                filters={filters}
+                onChange={(updates) => setFilters((current) => ({ ...current, ...updates }))}
+                total={dashboardData.total}
+                totalPages={dashboardData.totalPages}
+              />
+            </Reveal>
+          ) : null}
         </div>
       </section>
       ) : null}
