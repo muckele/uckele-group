@@ -100,7 +100,7 @@ export const homePage = {
       'Flexible transition approach',
     ],
     founderCard: {
-      title: 'Why owners respond',
+      title: 'What owners can expect',
       body: 'If you are considering succession, retirement, or simply the next chapter, this should feel like a serious but human conversation. The goal is a practical transition that protects what is already working.',
       points: [
         'Continuity for employees and customers',
@@ -109,74 +109,98 @@ export const homePage = {
       ],
     },
   },
-  quickTrust: [
-    {
-      title: 'Operator-focused',
-      description: 'Built around long-term ownership and hands-on stewardship, not financial engineering.',
-    },
-    {
-      title: 'Confidential',
-      description: 'Discreet conversations for owners, brokers, and referral partners from the first call onward.',
-    },
-    {
-      title: 'Relationship-driven',
-      description: 'Respect for employees, customers, and the reputation you spent years building.',
-    },
-  ],
-  whyWorkWithMe: {
-    eyebrow: 'Why Work With Me',
-    title: 'A serious buyer with a practical, people-first mindset',
+  operatorExperience: {
+    eyebrow: 'Operating Experience',
+    title: 'Experience grounded in real operating responsibility',
     description:
-      'The best seller-buyer relationships begin with trust. This site is designed to answer the questions owners reasonably ask before taking a conversation.',
-    cards: [
+      'My background combines hands-on leadership in a growing healthcare services business with earlier operating and commercial roles inside scaled organizations.',
+    items: [
       {
-        title: 'You deal directly with the future owner',
+        label: 'Current operating role',
+        title: 'Co-founder and President',
         description:
-          'You are not getting passed between a fund, a junior team, and a temporary operator. You speak with the person who wants to own and run the business.',
+          'At Golden Behavior Connection, I work directly across operations, staffing, compliance, revenue cycle management, sales execution, and financial performance.',
       },
       {
-        title: 'I am looking for one strong business to commit to',
+        label: 'Hands-on scope',
+        title: 'Execution across the business',
         description:
-          'The objective is long-term ownership, not a quick resale. I want to preserve what already works and build on it thoughtfully over time.',
+          'My experience spans team leadership, process implementation, customer growth, operating discipline, and the practical systems that keep a service business healthy.',
       },
       {
-        title: 'My background is broad and execution-oriented',
+        label: 'Earlier experience',
+        title: 'Scaled company perspective',
         description:
-          'I bring hands-on operating experience from healthcare services, sales and growth leadership, process implementation, and prior roles at Tripadvisor, Better Mortgage, and Wayfair.',
-      },
-      {
-        title: 'The process should feel steady and low-drama',
-        description:
-          'Good transactions rely on clarity, professionalism, and realistic expectations. I value straightforward communication and respectful timelines.',
+          'Prior roles at Tripadvisor, Better Mortgage, and Wayfair developed my approach to growth, training, process improvement, and leading through change.',
       },
     ],
   },
-  letter: {
-    eyebrow: 'A Note From Mathew',
-    title: 'Business succession is personal. It should be treated that way.',
-    body: [
-      'If you have spent years building a business, the decision to sell is about far more than a purchase price. It is about employees, customers, relationships, reputation, and the legacy of your work.',
-      'That is exactly why I want to buy and operate a small business. I respect what owner-operators build over time, and I want to continue that work responsibly. My goal is not to force a playbook onto a company. It is to understand how the business works, preserve the strengths already in place, and help lead the next chapter with care.',
-    ],
-    signature: 'Mathew Uckele',
-  },
-  criteriaPreview: {
-    eyebrow: 'What I’m Looking For',
-    title: 'Simple, understandable, durable small businesses',
+  criteriaAtAGlance: {
+    eyebrow: 'Acquisition Criteria',
+    title: 'A clear fit, at a glance',
     description:
-      'I am most interested in businesses with a strong reputation, loyal customers, and operating models that can be learned, supported, and improved over time.',
-    list: [
-      'Stable, profitable small businesses',
-      'Recurring or repeat customer relationships',
-      'Clear and understandable business models',
-      'Strong local reputation and dependable customer service',
-      'Owners preparing for retirement, transition, or reduced day-to-day involvement',
-      'Southern California preferred, with flexibility nationwide for the right opportunity',
+      'I am looking for a durable service business with healthy fundamentals, loyal customers, and an operating model that can be understood and supported for the long term.',
+    details: [
+      {
+        label: 'Revenue',
+        value: '$1M–$5M',
+        note: 'Primary target range, with flexibility for an exceptional fit.',
+      },
+      {
+        label: 'SDE / EBITDA',
+        value: '$250K–$750K+',
+        note: 'Open to select larger opportunities with durable cash flow.',
+      },
+      {
+        label: 'Geography',
+        value: 'Southern California',
+        note: 'Preferred, with nationwide flexibility for the right business and transition plan.',
+      },
+      {
+        label: 'Business profile',
+        value: 'Established services',
+        note: 'Stable, profitable, understandable, and built around repeat customer relationships.',
+      },
     ],
-    industries: ['Professional services', 'Healthcare services', 'Home services', 'Environmental and waste services', 'Pet care and veterinary-related services'],
+    industries: [
+      'Professional services',
+      'Healthcare services',
+      'Home services',
+      'Environmental and waste services',
+      'Pet care and veterinary-related services',
+    ],
+  },
+  readiness: {
+    eyebrow: 'Acquisition Readiness',
+    title: 'Prepared for a serious process and a long-term operating commitment',
+    description:
+      'The right transaction begins with mutual fit. From there, sellers and their advisors should receive direct communication, realistic expectations, and a practical path through financing, diligence, and transition planning.',
+    commitments: [
+      {
+        title: 'Direct ownership and accountability',
+        description:
+          'Uckele Group is my acquisition platform. I am the principal decision-maker and the person intending to take responsibility for the company after closing.',
+      },
+      {
+        title: 'One-company operating focus',
+        description:
+          'I am seeking one strong business where I can commit to long-term ownership, work closely with the existing team, and build on what is already successful.',
+      },
+      {
+        title: 'Practical financing conversations',
+        description:
+          'Transaction structure depends on the business. Once mutual fit is established, the financing approach, timing, and relevant readiness information can be discussed directly with the owner and advisors.',
+      },
+    ],
+    expectations: [
+      'A direct conversation with the intended future owner',
+      'Mutual fit before detailed information is requested',
+      'Clear communication with brokers, lenders, attorneys, and other advisors',
+      'A transition plan shaped around the company, team, and seller timeline',
+    ],
   },
   transitionApproach: {
-    eyebrow: 'My Approach To Transition',
+    eyebrow: 'Transition Process',
     title: 'Protect the core of what made the business worth buying',
     description:
       'A transition works best when it is planned around continuity, communication, and the specific realities of the business.',
@@ -198,37 +222,37 @@ export const homePage = {
       },
     ],
   },
-  individualBuyer: {
-    eyebrow: 'Why Owners Often Prefer An Individual Buyer',
-    title: 'A more personal alternative to the private equity playbook',
+  professionalCredibility: {
+    eyebrow: 'Professional Credibility',
+    title: 'A background sellers and advisors can evaluate directly',
     description:
-      'For many sellers, the right outcome is not just a transaction. It is confidence in who will own the business next and how they will treat the people around it.',
-    cards: [
+      'Trust should work in both directions. My operating history, professional profile, and approach to a transaction should be open to the same thoughtful evaluation I bring to a business.',
+    items: [
       {
-        title: 'Direct accountability',
+        label: 'Operating leadership',
+        title: 'Golden Behavior Connection',
         description:
-          'You know who is making decisions, who is learning the business, and who will be responsible after closing.',
+          'Current co-founder and President of an ABA healthcare services practice, with direct exposure to the operational and financial responsibilities of company leadership.',
       },
       {
-        title: 'More continuity, less churn',
+        label: 'Professional background',
+        title: 'Tripadvisor · Better Mortgage · Wayfair',
         description:
-          'An individual buyer is often better positioned to focus on preserving relationships rather than imposing immediate portfolio-wide changes.',
+          'Earlier roles across operating, commercial, growth, and process-focused environments provide perspective from businesses at different stages and scales.',
       },
       {
-        title: 'Flexible transition structures',
+        label: 'Transparent evaluation',
+        title: 'Trust works both ways',
         description:
-          'Seller support, phased handoffs, and practical involvement after closing can all be explored where they make sense.',
-      },
-      {
-        title: 'A calmer process',
-        description:
-          'The best deals are thoughtful and fair. They do not need artificial deadlines, pressure tactics, or unnecessary noise.',
+          'As a conversation becomes serious, owners and their advisors should have enough context to evaluate my background, readiness, and fit as a future steward.',
       },
     ],
   },
-  faqPreview: {
-    eyebrow: 'Frequently Asked Questions',
-    title: 'Common questions from business owners',
+  essentialFaqs: {
+    eyebrow: 'Essential Questions',
+    title: 'What owners usually want to know first',
+    description:
+      'Straightforward answers about who is buying, what fits, how the process works, and what happens after a first conversation.',
     items: [
       {
         question: 'Are you a private equity firm?',
@@ -236,19 +260,24 @@ export const homePage = {
           'No. Uckele Group is centered on Mathew Uckele as an individual buyer and future operator. The goal is long-term ownership of one strong business, not a roll-up strategy.',
       },
       {
+        question: 'Will you personally operate the business?',
+        answer:
+          'The intention is active, long-term ownership rather than a passive investment. I want to work closely with the existing team, learn the operation in depth, and take direct responsibility for the company’s next chapter.',
+      },
+      {
+        question: 'How do you expect to finance an acquisition?',
+        answer:
+          'The right financing structure depends on the company, its cash flow, and the seller’s goals. Once there is mutual fit, I am prepared to discuss the proposed capital structure, financing path, timing, and relevant readiness information directly with the owner and advisors.',
+      },
+      {
+        question: 'What size businesses are you looking for?',
+        answer:
+          'My primary target is approximately $1M to $5M in revenue and $250K to $750K+ in SDE or EBITDA, with flexibility for select larger opportunities that have durable cash flow and a clear operating fit.',
+      },
+      {
         question: 'Will our conversations be confidential?',
         answer:
-          'Yes. Discretion matters. Initial conversations are handled carefully, and more detailed information should only be shared when there is mutual interest and an appropriate process in place.',
-      },
-      {
-        question: 'Can I stay involved after the sale?',
-        answer:
-          'Yes, if that is useful. Some owners prefer a clean transition, while others want to remain involved for a period of time as an advisor, trainer, or relationship bridge.',
-      },
-      {
-        question: 'Do you work with brokers?',
-        answer:
-          'Yes. Brokers, intermediaries, and referral partners are welcome to reach out if they have a business that fits the criteria and values outlined here.',
+          'Yes. Early conversations are handled discreetly, and sensitive information should only be shared when there is mutual interest and an appropriate process in place.',
       },
     ],
   },
@@ -257,7 +286,7 @@ export const homePage = {
     description:
       'If you own a business and are considering a future transition, or if you represent an opportunity that may be a fit, I would welcome the conversation.',
     primaryCta: { label: 'Contact Mathew', href: '/contact' },
-    secondaryCta: { label: 'See The Process', href: '/process' },
+    secondaryCta: { label: 'See The Full Process', href: '/process' },
   },
 };
 
