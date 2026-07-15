@@ -7,6 +7,10 @@ const migrationUrl = new URL(
   '../supabase/migrations/20260713104500_supabase_service_role_isolation.sql',
   import.meta.url,
 );
+const analyticsMigrationUrl = new URL(
+  '../supabase/migrations/20260714193000_privacy_conscious_analytics.sql',
+  import.meta.url,
+);
 
 function currentAppTables(schema) {
   return Array.from(
@@ -83,12 +87,17 @@ function assertServerOnlyPrivileges(sql, sourceLabel) {
 test('Supabase migration and fresh schema isolate every current app table to the server role', () => {
   const schema = fs.readFileSync(schemaUrl, 'utf8');
   const migration = fs.readFileSync(migrationUrl, 'utf8');
+  const analyticsMigration = fs.readFileSync(analyticsMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
-  assert.deepEqual(rowLevelSecurityTables(migration), appTables);
+  assert.deepEqual(rowLevelSecurityTables(forwardMigrations), appTables);
   assert.deepEqual(rowLevelSecurityTables(schema), appTables);
   assert.doesNotMatch(migration, /create\s+policy/i, 'server-only tables must not add public RLS policies');
+  assert.doesNotMatch(analyticsMigration, /create\s+policy/i, 'analytics table must not add public RLS policies');
   assertServerOnlyPrivileges(migration, 'forward migration');
+  assert.match(analyticsMigration, /revoke all privileges on table public\.analytics_events from public, anon, authenticated;/i);
+  assert.match(analyticsMigration, /grant all privileges on table public\.analytics_events to service_role;/i);
   assertServerOnlyPrivileges(schema, 'fresh schema');
 });

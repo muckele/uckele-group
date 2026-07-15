@@ -19,6 +19,13 @@ const sections = [
     ],
   },
   {
+    title: 'Privacy-conscious website measurement',
+    body: [
+      'The public website uses first-party, aggregate measurement to understand which public pages are visited, whether the contact form is started and submitted successfully, and whether the acquisition-criteria summary is downloaded. This measurement does not record the contents of form fields, confidential documents, administrator activity, raw IP addresses, full referring URLs, or device fingerprints.',
+      'Referral attribution is limited to the referring website hostname and, when present, campaign source, medium, and campaign labels. The site does not use advertising pixels or cross-site behavioral profiles. Analytics records are retained for a limited period, currently up to 90 days, and are used only to improve the website and understand legitimate acquisition outreach.',
+    ],
+  },
+  {
     title: 'Confidential documents',
     body: [
       'Secure document links are intended only for the recipient and may be revoked or closed. Uploaded files are stored outside the public website, are not exposed through predictable public paths, and are available only through authenticated administrative access.',
@@ -42,7 +49,7 @@ const sections = [
   {
     title: 'Cookies and authentication',
     body: [
-      'The public website does not use advertising cookies. Authorized administrators receive a secure, HTTP-only session cookie after signing in. Sessions expire, can be revoked individually, and can be revoked across all devices.',
+      'The public website does not use advertising cookies. A temporary browser-session value may preserve coarse referral and campaign attribution while you move between public pages; it is not a cross-site identifier and is removed when that browser session ends. Authorized administrators receive a secure, HTTP-only session cookie after signing in. Sessions expire, can be revoked individually, and can be revoked across all devices.',
     ],
   },
 ];
@@ -62,7 +69,7 @@ export default function PrivacyPage() {
         <div className="mx-auto max-w-4xl space-y-6">
           <Reveal className="panel p-7 sm:p-9">
             <p className="text-base leading-8 text-ink/74">
-              This notice applies to the Uckele Group website, contact workflow, CRM, and secure document service. It was last updated July 13, 2026.
+              This notice applies to the Uckele Group website, contact workflow, CRM, and secure document service. It was last updated July 14, 2026.
             </p>
           </Reveal>
 

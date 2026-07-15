@@ -63,6 +63,14 @@ export const seoContent = Object.freeze({
     keywords:
       'uckele group privacy, confidential business information, secure document privacy, business buyer privacy',
   }),
+  thankYou: Object.freeze({
+    path: '/thank-you',
+    title: 'Thank You | Uckele Group',
+    description: 'Your confidential inquiry has been received by Uckele Group.',
+    keywords: '',
+    noindex: true,
+  }),
 });
 
-export const publicSeoPages = Object.freeze(Object.values(seoContent));
+export const allSeoPages = Object.freeze(Object.values(seoContent));
+export const publicSeoPages = Object.freeze(allSeoPages.filter((page) => !page.noindex));

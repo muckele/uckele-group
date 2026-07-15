@@ -1,4 +1,5 @@
 export { seoContent } from './seoMetadata.js';
+export { faqItems } from './faqContent.js';
 
 const publicSiteUrl = (import.meta.env.VITE_PUBLIC_SITE_URL || 'https://www.uckelegroup.com').replace(/\/+$/, '');
 const publicEmail = String(import.meta.env.VITE_PUBLIC_CONTACT_EMAIL || 'mathew@uckelegroup.com').trim();
@@ -71,8 +72,8 @@ export const siteConfig = {
   linkedin: publicLinkedin,
   contactDetailItems,
   downloadHref: '/downloads/uckele-group-acquisition-criteria.pdf',
-  socialImage: '/social-card.svg',
-  socialImageUrl: toAbsoluteUrl('/social-card.svg'),
+  socialImage: '/og.png',
+  socialImageUrl: toAbsoluteUrl('/og.png'),
 };
 
 export const navigation = [
@@ -511,59 +512,6 @@ export const processPage = {
     'A practical focus on continuity after closing',
   ],
 };
-
-export const faqItems = [
-  {
-    question: 'Are you a private equity firm?',
-    answer:
-      'No. I am an individual buyer seeking to acquire and operate one strong small business for the long term. The goal is to be a stable future owner, not a fund manager or consolidator.',
-  },
-  {
-    question: 'What size businesses are you looking for?',
-    answer:
-      'My typical target is a business with approximately $1M to $5M in revenue and $250K to $750K+ in SDE or EBITDA. I am open to larger opportunities up to roughly $2M in SDE or EBITDA where there is a strong fit, durable cash flow, and a clear path to financing.',
-  },
-  {
-    question: 'Will you keep my employees?',
-    answer:
-      'Continuity for good employees is a priority. Every business is different, but my approach is to preserve the team and institutional knowledge that make the company valuable whenever possible.',
-  },
-  {
-    question: 'Will you change the business name?',
-    answer:
-      'Not by default. If the business name carries trust in the market, preserving it often makes sense. Any changes should be thoughtful and rooted in what best serves customers and the company over time.',
-  },
-  {
-    question: 'Can I stay involved after the sale?',
-    answer:
-      'Yes. Many owners prefer a phased transition or limited ongoing involvement after closing. I am open to practical arrangements that help support continuity and reduce risk.',
-  },
-  {
-    question: 'How quickly can you move?',
-    answer:
-      'That depends on fit, information availability, financing, and your preferred timeline. Some opportunities move quickly, while others benefit from a more measured process. I do not believe in rushing for the sake of appearances.',
-  },
-  {
-    question: 'Will our conversations be confidential?',
-    answer:
-      'Yes. Early conversations are handled discreetly, and sensitive information should only be shared when there is mutual interest and an appropriate process in place.',
-  },
-  {
-    question: 'Do you work with brokers?',
-    answer:
-      'Yes. Brokers, intermediaries, and referral partners are welcome. If you are representing a strong business that fits the criteria, I would be glad to connect.',
-  },
-  {
-    question: 'Are you open to creative deal structures?',
-    answer:
-      'Yes, where they make sense. Seller support, phased transitions, and other practical structures can be part of a thoughtful transaction if they help align interests and support continuity.',
-  },
-  {
-    question: 'What happens after I reach out?',
-    answer:
-      'You should expect a direct response, a simple introductory conversation, and an honest discussion about fit. If the opportunity makes sense, the next steps become more structured, including a secure path for sharing confidential materials when appropriate. If it does not, the process should still feel respectful and straightforward.',
-  },
-];
 
 export const contactPage = {
   hero: {

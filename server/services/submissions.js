@@ -20,6 +20,7 @@ import {
 } from './workflow.js';
 import { resolveSecureStoragePath } from './documentVault.js';
 import { commitCrmActivityMutation, summarizeSubmissionChanges } from './activity.js';
+import { normalizeAttribution } from './analytics.js';
 import {
   isSecureDocumentCleanupIntentActive,
   listSecureDocumentCleanupSidecars,
@@ -892,6 +893,7 @@ export async function submitContactLead(body, request) {
       elapsedMs,
       turnstileEnabled: turnstileResult.enabled,
       turnstileValidated: turnstileResult.success,
+      attribution: normalizeAttribution(body.attribution, request),
     },
   };
 

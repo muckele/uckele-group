@@ -461,6 +461,18 @@ export function createSqliteStorage(config) {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS analytics_events (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      event_name TEXT NOT NULL,
+      path TEXT NOT NULL,
+      referrer_host TEXT NOT NULL DEFAULT '',
+      utm_source TEXT NOT NULL DEFAULT '',
+      utm_medium TEXT NOT NULL DEFAULT '',
+      utm_campaign TEXT NOT NULL DEFAULT '',
+      placement TEXT NOT NULL DEFAULT ''
+    );
+
     CREATE TABLE IF NOT EXISTS secure_upload_requests (
       id TEXT PRIMARY KEY,
       submission_id TEXT NOT NULL,
@@ -661,6 +673,9 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_email ON contact_submissions(email);
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_ip_hash ON contact_submissions(ip_hash);
     CREATE INDEX IF NOT EXISTS idx_contact_rate_limit_events_bucket ON contact_rate_limit_events(bucket, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_analytics_events_created_at ON analytics_events(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_analytics_events_name_created ON analytics_events(event_name, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_analytics_events_path_created ON analytics_events(path, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_secure_upload_requests_submission_id ON secure_upload_requests(submission_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_secure_documents_submission_id ON secure_documents(submission_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_secure_documents_request_id ON secure_documents(request_id, created_at DESC);
@@ -1718,6 +1733,25 @@ export function createSqliteStorage(config) {
           .prepare('SELECT COUNT(*) AS count FROM contact_rate_limit_events WHERE bucket = ? AND created_at >= ?')
           .get(bucket, sinceIso)?.count || 0
       );
+    },
+
+    async insertAnalyticsEvent(event, retentionDays = 90) {
+      const cutoffIso = new Date(Date.now() - Math.max(1, Number(retentionDays) || 90) * 86_400_000).toISOString();
+      database.prepare('DELETE FROM analytics_events WHERE created_at < ?').run(cutoffIso);
+      database.prepare(`
+        INSERT INTO analytics_events (
+          id, created_at, event_name, path, referrer_host, utm_source, utm_medium, utm_campaign, placement
+        ) VALUES (
+          @id, @created_at, @event_name, @path, @referrer_host, @utm_source, @utm_medium, @utm_campaign, @placement
+        )
+      `).run(event);
+      return event;
+    },
+
+    async listAnalyticsEvents({ sinceIso = '', limit = 1000 } = {}) {
+      return database
+        .prepare('SELECT * FROM analytics_events WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?')
+        .all(sinceIso || '0000-01-01T00:00:00.000Z', Math.max(1, Math.min(Number(limit) || 1000, 10000)));
     },
 
     async insertSecureUploadRequest(requestRecord) {

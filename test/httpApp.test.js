@@ -80,6 +80,38 @@ test('bodyless public and admin posts return controlled client errors', async ()
   });
 });
 
+test('public analytics endpoint accepts an allowlisted event without retaining sensitive request details', async () => {
+  await withServer(async (origin) => {
+    const response = await fetch(`${origin}/api/analytics/events`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Fly-Client-Ip': '203.0.113.19',
+      },
+      body: JSON.stringify({
+        eventName: 'criteria_downloaded',
+        path: '/criteria',
+        placement: 'criteria_page',
+        attribution: {
+          referrerHost: 'broker.example',
+          utmSource: 'email',
+          privateMessage: 'must not persist',
+        },
+      }),
+    });
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(await response.json(), { success: true });
+
+    const [event] = await getStorage().listAnalyticsEvents({ limit: 1 });
+    assert.equal(event.event_name, 'criteria_downloaded');
+    assert.equal(event.path, '/criteria');
+    assert.equal(event.placement, 'criteria_page');
+    assert.equal(event.referrer_host, 'broker.example');
+    assert.doesNotMatch(JSON.stringify(event), /203\.0\.113\.19|must not persist/);
+  });
+});
+
 test('unknown API routes return a JSON 404 instead of falling through to the app shell', async () => {
   await withServer(async (origin) => {
     const response = await fetch(`${origin}/api/not-a-real-endpoint`);

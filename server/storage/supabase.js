@@ -780,6 +780,32 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return count || 0;
     },
 
+    async insertAnalyticsEvent(event, retentionDays = 90) {
+      const cutoffIso = new Date(Date.now() - Math.max(1, Number(retentionDays) || 90) * 86_400_000).toISOString();
+      const { error: pruneError } = await client.from('analytics_events').delete().lt('created_at', cutoffIso);
+
+      if (pruneError) throw pruneError;
+
+      const { data, error } = await client.from('analytics_events').insert(event).select().single();
+
+      if (error) throw error;
+      return data;
+    },
+
+    async listAnalyticsEvents({ sinceIso = '', limit = 1000 } = {}) {
+      let query = client
+        .from('analytics_events')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(Math.max(1, Math.min(Number(limit) || 1000, 10000)));
+
+      if (sinceIso) query = query.gte('created_at', sinceIso);
+      const { data, error } = await query;
+
+      if (error) throw error;
+      return data || [];
+    },
+
     async insertSecureUploadRequest(requestRecord) {
       const { data, error } = await client.from('secure_upload_requests').insert(requestRecord).select().single();
 

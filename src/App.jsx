@@ -9,6 +9,7 @@ import HomePage from './pages/HomePage';
 import ProcessPage from './pages/ProcessPage';
 import PrivacyPage from './pages/PrivacyPage';
 import SellerConcernsPage from './pages/SellerConcernsPage';
+import ThankYouPage from './pages/ThankYouPage';
 
 const AdminLayout = lazy(() => import('./components/AdminLayout'));
 const DashboardPage = lazy(() => import('./pages/DashboardPage'));
@@ -48,6 +49,7 @@ export default function App() {
           <Route element={<FaqPage />} path="faq" />
           <Route element={<ContactPage />} path="contact" />
           <Route element={<PrivacyPage />} path="privacy" />
+          <Route element={<ThankYouPage />} path="thank-you" />
           <Route
             element={
               <Suspense fallback={<RouteFallback />}>

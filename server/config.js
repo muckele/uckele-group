@@ -177,6 +177,12 @@ export function getConfig() {
       minSubmitTimeMs: numberFromEnv(process.env.MIN_SUBMIT_TIME_MS, 4000),
       spamScoreThreshold: numberFromEnv(process.env.SPAM_SCORE_THRESHOLD, 50),
     },
+    analytics: {
+      enabled: booleanFromEnv(process.env.ANALYTICS_ENABLED, true),
+      retentionDays: Math.max(1, numberFromEnv(process.env.ANALYTICS_RETENTION_DAYS, 90)),
+      rateLimitWindowMs: Math.max(1_000, numberFromEnv(process.env.ANALYTICS_RATE_LIMIT_WINDOW_MS, 60_000)),
+      rateLimitMax: Math.max(1, numberFromEnv(process.env.ANALYTICS_RATE_LIMIT_MAX, 120)),
+    },
   };
 
   return cachedConfig;
@@ -335,6 +341,9 @@ export function validateConfig(config = getConfig()) {
   requirePositiveNumber(config.protection?.rateLimitMax, 'RATE_LIMIT_MAX', { integer: true });
   requirePositiveNumber(config.protection?.minSubmitTimeMs, 'MIN_SUBMIT_TIME_MS');
   requirePositiveNumber(config.protection?.spamScoreThreshold, 'SPAM_SCORE_THRESHOLD');
+  requirePositiveNumber(config.analytics?.retentionDays, 'ANALYTICS_RETENTION_DAYS', { integer: true, max: 3650 });
+  requirePositiveNumber(config.analytics?.rateLimitWindowMs, 'ANALYTICS_RATE_LIMIT_WINDOW_MS');
+  requirePositiveNumber(config.analytics?.rateLimitMax, 'ANALYTICS_RATE_LIMIT_MAX', { integer: true });
   requirePositiveNumber(config.backup?.retentionDays, 'BACKUP_RETENTION_DAYS', { integer: true });
   requirePositiveNumber(config.backup?.retentionCount, 'BACKUP_RETENTION_COUNT', { integer: true });
   requirePositiveNumber(config.backup?.checkIntervalMs, 'BACKUP_CHECK_INTERVAL_MS');

@@ -57,6 +57,7 @@ import { asyncRoute } from './utils/http.js';
 import { safeCompareText } from './utils/security.js';
 import { listCrmActivity } from './services/activity.js';
 import { getOperationsCenter } from './services/operations.js';
+import { recordAnalyticsEvent } from './services/analytics.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.resolve(__dirname, '../dist');
@@ -337,6 +338,7 @@ export function createApp() {
     }
   });
   app.use('/api/contact', express.json(jsonParserOptions(config.protection.contactJsonLimit)));
+  app.use('/api/analytics/events', express.json(jsonParserOptions('16kb')));
   app.use('/api/webhooks/resend', express.json(jsonParserOptions('1mb')));
   app.use(express.json(jsonParserOptions('512kb')));
   app.use(express.urlencoded({ extended: true, limit: '64kb' }));
@@ -391,6 +393,20 @@ export function createApp() {
       turnstileEnabled: Boolean(config.turnstile.siteKey && config.turnstile.secretKey),
     });
   });
+
+  app.post(
+    '/api/analytics/events',
+    asyncRoute(async (request, response) => {
+      const result = await recordAnalyticsEvent(request.body || {}, request);
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error });
+        return;
+      }
+
+      response.status(202).json({ success: true });
+    }),
+  );
 
   app.post(
     '/api/contact',

@@ -1,7 +1,8 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { publicSeoPages } from '../src/content/seoMetadata.js';
+import { allSeoPages } from '../src/content/seoMetadata.js';
+import { buildStructuredData } from '../src/content/structuredData.js';
 
 const scriptPath = fileURLToPath(import.meta.url);
 const rootDirectory = path.resolve(path.dirname(scriptPath), '..');
@@ -17,7 +18,7 @@ export function escapeHtml(value) {
     .replaceAll("'", '&#039;');
 }
 
-export function renderHead(html, route, title, description, baseUrl = siteUrl) {
+export function renderHead(html, route, title, description, baseUrl = siteUrl, noindex = false) {
   const canonicalUrl = `${baseUrl}${route === '/' ? '' : route}`;
   const safeTitle = escapeHtml(title);
   const safeDescription = escapeHtml(description);
@@ -29,22 +30,27 @@ export function renderHead(html, route, title, description, baseUrl = siteUrl) {
 
   const metadata = [
     `<link rel="canonical" href="${safeCanonicalUrl}" />`,
+    ...(noindex ? ['<meta name="robots" content="noindex, nofollow" />'] : []),
     `<meta property="og:title" content="${safeTitle}" />`,
     `<meta property="og:description" content="${safeDescription}" />`,
     `<meta property="og:url" content="${safeCanonicalUrl}" />`,
     '<meta property="og:type" content="website" />',
     '<meta property="og:site_name" content="Uckele Group" />',
-    `<meta property="og:image" content="${escapeHtml(`${baseUrl}/social-card.svg`)}" />`,
+    `<meta property="og:image" content="${escapeHtml(`${baseUrl}/og.png`)}" />`,
+    '<meta property="og:image:type" content="image/png" />',
+    '<meta property="og:image:width" content="1200" />',
+    '<meta property="og:image:height" content="630" />',
+    '<meta property="og:image:alt" content="Uckele Group — a thoughtful long-term home for a great small business" />',
     '<meta name="twitter:card" content="summary_large_image" />',
     `<meta name="twitter:title" content="${safeTitle}" />`,
     `<meta name="twitter:description" content="${safeDescription}" />`,
-    '<script type="application/ld+json">' + JSON.stringify({
-      '@context': 'https://schema.org',
-      '@type': route === '/' ? 'Organization' : 'WebPage',
-      name: title,
+    `<meta name="twitter:image" content="${escapeHtml(`${baseUrl}/og.png`)}" />`,
+    '<script id="structured-data" type="application/ld+json">' + JSON.stringify(buildStructuredData({
+      route,
+      title,
       description,
-      url: canonicalUrl,
-    }).replaceAll('<', '\\u003c') + '</script>',
+      baseUrl,
+    })).replaceAll('<', '\\u003c') + '</script>',
   ].join('\n    ');
 
   return output.replace('</head>', `    ${metadata}\n  </head>`);
@@ -53,15 +59,15 @@ export function renderHead(html, route, title, description, baseUrl = siteUrl) {
 export async function prerenderSeo({ outputDirectory = distDirectory, baseUrl = siteUrl } = {}) {
   const template = await readFile(path.join(outputDirectory, 'index.html'), 'utf8');
 
-  for (const page of publicSeoPages) {
+  for (const page of allSeoPages) {
     const destination = page.path === '/'
       ? path.join(outputDirectory, 'index.html')
       : path.join(outputDirectory, page.path.slice(1), 'index.html');
     await mkdir(path.dirname(destination), { recursive: true });
-    await writeFile(destination, renderHead(template, page.path, page.title, page.description, baseUrl));
+    await writeFile(destination, renderHead(template, page.path, page.title, page.description, baseUrl, page.noindex));
   }
 
-  return publicSeoPages.length;
+  return allSeoPages.length;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {

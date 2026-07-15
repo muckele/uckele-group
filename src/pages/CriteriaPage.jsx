@@ -1,5 +1,6 @@
 import { ArrowDownToLine, ArrowRight, BriefcaseBusiness, CircleDollarSign, Compass, MapPinned } from 'lucide-react';
 import ButtonLink from '../components/ButtonLink';
+import TrackedDownloadLink from '../components/TrackedDownloadLink';
 import PageHero from '../components/PageHero';
 import Reveal from '../components/Reveal';
 import SectionHeading from '../components/SectionHeading';
@@ -84,9 +85,9 @@ export default function CriteriaPage() {
             </div>
 
             <div className="grid gap-3 sm:flex sm:flex-wrap">
-              <ButtonLink className="w-full sm:w-auto" download href={siteConfig.downloadHref}>
+              <TrackedDownloadLink className="w-full sm:w-auto" href={siteConfig.downloadHref} placement="criteria_page">
                 Download Criteria <ArrowDownToLine className="h-4 w-4" />
-              </ButtonLink>
+              </TrackedDownloadLink>
               <ButtonLink className="w-full sm:w-auto" href="/contact" variant="secondary">
                 Start A Conversation <ArrowRight className="h-4 w-4" />
               </ButtonLink>

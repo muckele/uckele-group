@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, test } from 'vitest';
 import { escapeHtml, prerenderSeo } from '../scripts/prerender-seo.js';
-import { publicSeoPages, seoContent as sharedSeoContent } from '../src/content/seoMetadata.js';
+import { allSeoPages, publicSeoPages, seoContent as sharedSeoContent } from '../src/content/seoMetadata.js';
 import { seoContent as clientSeoContent } from '../src/content/siteContent.js';
 
 const htmlTemplate = `<!doctype html>
@@ -32,9 +32,9 @@ describe('pre-rendered SEO metadata', () => {
     temporaryDirectories.push(outputDirectory);
     await writeFile(path.join(outputDirectory, 'index.html'), htmlTemplate);
 
-    await expect(prerenderSeo({ outputDirectory, baseUrl })).resolves.toBe(publicSeoPages.length);
+    await expect(prerenderSeo({ outputDirectory, baseUrl })).resolves.toBe(allSeoPages.length);
 
-    for (const page of publicSeoPages) {
+    for (const page of allSeoPages) {
       const destination = page.path === '/'
         ? path.join(outputDirectory, 'index.html')
         : path.join(outputDirectory, page.path.slice(1), 'index.html');
@@ -45,6 +45,20 @@ describe('pre-rendered SEO metadata', () => {
       expect(output).toContain(`<meta name="description" content="${escapeHtml(page.description)}" />`);
       expect(output).toContain(`<link rel="canonical" href="${canonicalUrl}" />`);
       expect(output).toContain(`"url":"${canonicalUrl}"`);
+      expect(output).toContain(`<meta property="og:image" content="${baseUrl}/og.png" />`);
+      expect(output).toContain('<meta property="og:image:width" content="1200" />');
+      expect(output).toContain('"@type":"Organization"');
+      expect(output).toContain('"@type":"Person"');
+      expect(output).toContain('"@type":"WebSite"');
+      expect(output).toContain('"sameAs":["https://www.linkedin.com/in/mathew-uckele"]');
+      if (page.path === '/faq') {
+        expect(output).toContain('"@type":"FAQPage"');
+        expect(output.match(/"@type":"Question"/g)).toHaveLength(10);
+      }
+      if (['/about', '/criteria', '/why-sell-to-me', '/process', '/faq', '/contact', '/privacy'].includes(page.path)) {
+        expect(output).toContain('"@type":"BreadcrumbList"');
+      }
+      if (page.noindex) expect(output).toContain('<meta name="robots" content="noindex, nofollow" />');
     }
   });
 });

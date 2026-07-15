@@ -87,6 +87,22 @@ create table if not exists public.contact_rate_limit_events (
 
 create index if not exists idx_contact_rate_limit_events_bucket on public.contact_rate_limit_events (bucket, created_at desc);
 
+create table if not exists public.analytics_events (
+  id uuid primary key,
+  created_at timestamptz not null,
+  event_name text not null,
+  path text not null,
+  referrer_host text not null default '',
+  utm_source text not null default '',
+  utm_medium text not null default '',
+  utm_campaign text not null default '',
+  placement text not null default ''
+);
+
+create index if not exists idx_analytics_events_created_at on public.analytics_events (created_at desc);
+create index if not exists idx_analytics_events_name_created on public.analytics_events (event_name, created_at desc);
+create index if not exists idx_analytics_events_path_created on public.analytics_events (path, created_at desc);
+
 create table if not exists public.secure_upload_requests (
   id uuid primary key,
   submission_id uuid not null references public.contact_submissions(id) on delete cascade,
@@ -786,6 +802,7 @@ grant execute on function public.update_secure_document_cleanup_job_if_leased(uu
 -- so direct anon/authenticated table access is intentionally disabled.
 alter table public.contact_submissions enable row level security;
 alter table public.contact_rate_limit_events enable row level security;
+alter table public.analytics_events enable row level security;
 alter table public.secure_upload_requests enable row level security;
 alter table public.secure_documents enable row level security;
 alter table public.email_events enable row level security;

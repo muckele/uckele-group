@@ -15,6 +15,7 @@ import {
   UserRoundCheck,
 } from 'lucide-react';
 import ButtonLink from '../components/ButtonLink';
+import TrackedDownloadLink from '../components/TrackedDownloadLink';
 import FaqAccordion from '../components/FaqAccordion';
 import Reveal from '../components/Reveal';
 import SectionHeading from '../components/SectionHeading';
@@ -166,9 +167,9 @@ export default function HomePage() {
               <ButtonLink className="w-full sm:w-auto" href="/criteria">
                 View Full Criteria <ArrowRight className="h-4 w-4" />
               </ButtonLink>
-              <ButtonLink className="w-full sm:w-auto" download href={siteConfig.downloadHref} variant="secondary">
+              <TrackedDownloadLink className="w-full sm:w-auto" href={siteConfig.downloadHref} placement="homepage" variant="secondary">
                 Download Summary <ArrowDownToLine className="h-4 w-4" />
-              </ButtonLink>
+              </TrackedDownloadLink>
             </div>
           </Reveal>
 
