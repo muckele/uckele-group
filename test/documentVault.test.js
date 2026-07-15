@@ -29,6 +29,7 @@ const {
   writeSecureDocumentCleanupSidecar,
 } = await import('../server/services/secureDocumentCleanupState.js');
 const { getStorage } = await import('../server/storage/index.js');
+const { signPayload } = await import('../server/utils/security.js');
 
 after(() => {
   fs.rmSync(tempDir, { force: true, recursive: true });
@@ -149,6 +150,52 @@ test('secure upload infers allowed MIME type when browsers send octet-stream', a
   assert.equal(result.ok, true);
   assert.equal(documents.length, 1);
   assert.equal(documents[0].mime_type, 'text/csv');
+});
+
+test('secure upload bounds metadata and stores confidential artifacts with private permissions', async () => {
+  const storage = getStorage();
+  const { request, token } = await createUploadToken('private-file-test@example.com');
+  const result = await uploadSecureDocuments({
+    token,
+    ndaAccepted: true,
+    note: 'n'.repeat(5000),
+    request: requestFromIp('192.0.2.41'),
+    documents: [
+      {
+        name: `${'a'.repeat(400)}.txt`,
+        mimeType: 'text/plain',
+        contentBase64: Buffer.from('Private diligence file').toString('base64'),
+      },
+    ],
+  });
+  const [document] = await storage.listSecureDocumentsByRequest(request.id);
+  const requestDirectory = path.dirname(document.storage_path);
+
+  assert.equal(result.ok, true);
+  assert.equal(document.note.length, 2000);
+  assert.ok(document.original_name.length <= 180);
+  assert.match(document.original_name, /\.txt$/);
+  assert.equal(fs.statSync(document.storage_path).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(process.env.SECURE_DOCUMENTS_STORAGE_DIR).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(requestDirectory).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(process.env.SQLITE_PATH).mode & 0o777, 0o600);
+});
+
+test('secure upload tokens are bound to both the request and its submission', async () => {
+  const { request } = await createUploadToken('token-binding-test@example.com');
+  const mismatchedToken = signPayload(
+    {
+      type: 'secure-upload',
+      requestId: request.id,
+      submissionId: 'different-submission',
+      exp: Date.now() + 60_000,
+    },
+    process.env.ADMIN_SESSION_SECRET,
+  );
+  const result = await getSecureUploadContext(mismatchedToken);
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /invalid or has expired/i);
 });
 
 test('secure document download resolves stored file metadata', async () => {

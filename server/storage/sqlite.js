@@ -400,10 +400,17 @@ function placeholders(count) {
 
 export function createSqliteStorage(config) {
   const directory = path.dirname(config.storage.sqlitePath);
-  fs.mkdirSync(directory, { recursive: true });
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
 
   const database = new Database(config.storage.sqlitePath);
+  fs.chmodSync(config.storage.sqlitePath, 0o600);
   database.pragma('journal_mode = WAL');
+  for (const suffix of ['-wal', '-shm']) {
+    const auxiliaryPath = `${config.storage.sqlitePath}${suffix}`;
+    if (fs.existsSync(auxiliaryPath)) {
+      fs.chmodSync(auxiliaryPath, 0o600);
+    }
+  }
   migrateLegacyAdminMagicLinksTable(database);
 
   database.exec(`

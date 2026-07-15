@@ -190,12 +190,49 @@ export function validateConfig(config = getConfig()) {
       errors.push(`${label} is required.`);
     }
   };
-  const requirePositiveNumber = (value, label, { integer = false } = {}) => {
+  const requirePositiveNumber = (value, label, { integer = false, max = Infinity } = {}) => {
     if (value === undefined) {
       return;
     }
-    if (!Number.isFinite(Number(value)) || Number(value) <= 0 || (integer && !Number.isInteger(Number(value)))) {
-      errors.push(`${label} must be a positive${integer ? ' integer' : ''}.`);
+    const numericValue = Number(value);
+    if (
+      !Number.isFinite(numericValue) ||
+      numericValue <= 0 ||
+      numericValue > max ||
+      (integer && !Number.isInteger(numericValue))
+    ) {
+      errors.push(`${label} must be a positive${integer ? ' integer' : ''}${Number.isFinite(max) ? ` no greater than ${max}` : ''}.`);
+    }
+  };
+  const requireNonNegativeNumber = (value, label, { integer = false, max = Infinity } = {}) => {
+    if (value === undefined) {
+      return;
+    }
+    const numericValue = Number(value);
+    if (
+      !Number.isFinite(numericValue) ||
+      numericValue < 0 ||
+      numericValue > max ||
+      (integer && !Number.isInteger(numericValue))
+    ) {
+      errors.push(`${label} must be a non-negative${integer ? ' integer' : ''}${Number.isFinite(max) ? ` no greater than ${max}` : ''}.`);
+    }
+  };
+  const requireHttpUrl = (value, label, { originOnly = false } = {}) => {
+    if (value === undefined || value === null || value === '') {
+      return;
+    }
+
+    try {
+      const url = new URL(String(value));
+      if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+        throw new Error('invalid protocol or credentials');
+      }
+      if (originOnly && (url.pathname !== '/' || url.search || url.hash)) {
+        throw new Error('not an origin');
+      }
+    } catch {
+      errors.push(`${label} must be a valid HTTP(S)${originOnly ? ' origin without a path, query, or fragment' : ' URL'}.`);
     }
   };
 
@@ -238,6 +275,7 @@ export function validateConfig(config = getConfig()) {
   if (config.storage.provider === 'supabase') {
     requireValue(config.storage.supabaseUrl, 'SUPABASE_URL');
     requireValue(config.storage.supabaseServiceRoleKey, 'SUPABASE_SERVICE_ROLE_KEY');
+    requireHttpUrl(config.storage.supabaseUrl, 'SUPABASE_URL');
   }
 
   if (config.delivery.provider === 'resend') {
@@ -255,7 +293,11 @@ export function validateConfig(config = getConfig()) {
 
   if (config.delivery.provider === 'formspree') {
     requireValue(config.delivery.formspreeEndpoint, 'FORMSPREE_ENDPOINT');
+    requireHttpUrl(config.delivery.formspreeEndpoint, 'FORMSPREE_ENDPOINT');
   }
+
+  requireHttpUrl(config.server?.origin, 'PUBLIC_SITE_URL', { originOnly: true });
+  requireHttpUrl(config.crm?.webhookUrl, 'CRM_WEBHOOK_URL');
 
   const scheduledTime = String(config.dealHunter.dailyEmail.time || '10:15');
   const scheduledTimeMatch = scheduledTime.match(/^(\d{1,2}):(\d{2})$/);
@@ -269,8 +311,9 @@ export function validateConfig(config = getConfig()) {
     errors.push('BACKUP_DAILY_TIME must use a valid 24-hour HH:MM value.');
   }
 
-  requirePositiveNumber(config.server?.port, 'PORT', { integer: true });
+  requirePositiveNumber(config.server?.port, 'PORT', { integer: true, max: 65_535 });
   requirePositiveNumber(config.server?.outboundRequestTimeoutMs, 'OUTBOUND_HTTP_TIMEOUT_MS');
+  requirePositiveNumber(config.delivery?.emailjsRateLimitMs, 'EMAILJS_RATE_LIMIT_MS');
   requirePositiveNumber(config.admin.magicLinkTtlMs, 'ADMIN_MAGIC_LINK_TTL_MS');
   requirePositiveNumber(config.admin.sessionMaxAgeMs, 'ADMIN_SESSION_MAX_AGE_MS');
   requirePositiveNumber(config.secureDocuments.requestTtlMs, 'SECURE_DOCUMENTS_REQUEST_TTL_MS');
@@ -280,11 +323,29 @@ export function validateConfig(config = getConfig()) {
   requirePositiveNumber(config.dealHunter.dailyEmail.checkIntervalMs, 'DEAL_HUNTER_DAILY_EMAIL_CHECK_INTERVAL_MS');
   requirePositiveNumber(config.dealHunter.dailyEmail.retryIntervalMs, 'DEAL_HUNTER_DAILY_EMAIL_RETRY_INTERVAL_MS');
   requirePositiveNumber(config.dealHunter.cimFollowUp?.checkIntervalMs, 'DEAL_HUNTER_CIM_FOLLOW_UP_CHECK_INTERVAL_MS');
+  requirePositiveNumber(config.dealHunter.cimFollowUp?.firstDelayHours, 'DEAL_HUNTER_CIM_FOLLOW_UP_FIRST_DELAY_HOURS');
+  requirePositiveNumber(config.dealHunter.cimFollowUp?.intervalHours, 'DEAL_HUNTER_CIM_FOLLOW_UP_INTERVAL_HOURS');
+  requireNonNegativeNumber(config.dealHunter.cimFollowUp?.maxCount, 'DEAL_HUNTER_CIM_FOLLOW_UP_MAX_COUNT', { integer: true, max: 10 });
+  requirePositiveNumber(config.dealHunter.lookbackDays, 'DEAL_HUNTER_LOOKBACK_DAYS');
+  requirePositiveNumber(config.dealHunter.maxSourceRecords, 'DEAL_HUNTER_MAX_SOURCE_RECORDS', { integer: true });
+  requirePositiveNumber(config.dealHunter.sheetCsvMaxPayloadBytes, 'DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES', { integer: true });
+  requirePositiveNumber(config.dealHunter.airtableSharedMaxPayloadBytes, 'DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES', { integer: true });
   requirePositiveNumber(config.protection?.rateLimitWindowMs, 'RATE_LIMIT_WINDOW_MS');
+  requirePositiveNumber(config.protection?.rateLimitRetentionMs, 'RATE_LIMIT_RETENTION_MS');
   requirePositiveNumber(config.protection?.rateLimitMax, 'RATE_LIMIT_MAX', { integer: true });
+  requirePositiveNumber(config.protection?.minSubmitTimeMs, 'MIN_SUBMIT_TIME_MS');
+  requirePositiveNumber(config.protection?.spamScoreThreshold, 'SPAM_SCORE_THRESHOLD');
   requirePositiveNumber(config.backup?.retentionDays, 'BACKUP_RETENTION_DAYS', { integer: true });
   requirePositiveNumber(config.backup?.retentionCount, 'BACKUP_RETENTION_COUNT', { integer: true });
   requirePositiveNumber(config.backup?.checkIntervalMs, 'BACKUP_CHECK_INTERVAL_MS');
+
+  if (
+    Number.isFinite(Number(config.protection?.rateLimitRetentionMs)) &&
+    Number.isFinite(Number(config.protection?.rateLimitWindowMs)) &&
+    Number(config.protection.rateLimitRetentionMs) < Number(config.protection.rateLimitWindowMs)
+  ) {
+    errors.push('RATE_LIMIT_RETENTION_MS must be greater than or equal to RATE_LIMIT_WINDOW_MS.');
+  }
 
   if (config.isProduction) {
     requireValue(config.admin.email, 'ADMIN_EMAIL');

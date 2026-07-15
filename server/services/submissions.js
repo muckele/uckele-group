@@ -1442,7 +1442,7 @@ async function stageSecureDocumentFiles(
     await onPrepared({ plannedFiles, trashDirectory });
   }
 
-  await mkdir(trashDirectory, { recursive: true });
+  await mkdir(trashDirectory, { recursive: true, mode: 0o700 });
 
   for (const file of plannedFiles) {
     try {

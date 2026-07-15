@@ -11,6 +11,11 @@ export default function Reveal({ as: Tag = 'div', children, className = '', dela
       return undefined;
     }
 
+    if (typeof IntersectionObserver === 'undefined') {
+      setVisible(true);
+      return undefined;
+    }
+
     const observer = new IntersectionObserver(
       ([entry]) => {
         if (entry.isIntersecting) {

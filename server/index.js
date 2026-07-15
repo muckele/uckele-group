@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { app } from './app.js';
+import { createApp } from './app.js';
 import { assertValidConfig, getConfig } from './config.js';
 import { startDealHunterCimFollowUpScheduler, startDealHunterDailyEmailScheduler } from './services/dealHunterScheduler.js';
 import { reconcileSecureDocumentCleanupJobs, startSecureDocumentCleanupScheduler } from './services/submissions.js';
@@ -11,6 +11,7 @@ const host = process.env.HOST || '0.0.0.0';
 let schedulers = [];
 
 assertValidConfig(config);
+const app = createApp();
 await cleanupExpiredAuthRecords();
 const cleanupSummary = await reconcileSecureDocumentCleanupJobs();
 if (cleanupSummary.reviewed > 0) {

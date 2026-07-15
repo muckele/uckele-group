@@ -53,6 +53,45 @@ test('protected APIs reject cross-site mutations and disable caching', async () 
   });
 });
 
+test('malformed session cookies are treated as anonymous instead of crashing', async () => {
+  await withServer(async (origin) => {
+    const response = await fetch(`${origin}/api/admin/session`, {
+      headers: { Cookie: 'ug_admin_session=%E0%A4%A' },
+    });
+    const result = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(result.authenticated, false);
+  });
+});
+
+test('bodyless public and admin posts return controlled client errors', async () => {
+  await withServer(async (origin) => {
+    const contactResponse = await fetch(`${origin}/api/contact`, { method: 'POST' });
+    const contactResult = await contactResponse.json();
+    assert.equal(contactResponse.status, 400);
+    assert.equal(contactResult.success, false);
+    assert.ok(Array.isArray(contactResult.errors));
+
+    const loginResponse = await fetch(`${origin}/api/admin/session`, { method: 'POST' });
+    const loginResult = await loginResponse.json();
+    assert.equal(loginResponse.status, 401);
+    assert.deepEqual(loginResult, { success: false, error: 'Invalid credentials.' });
+  });
+});
+
+test('unknown API routes return a JSON 404 instead of falling through to the app shell', async () => {
+  await withServer(async (origin) => {
+    const response = await fetch(`${origin}/api/not-a-real-endpoint`);
+    assert.equal(response.status, 404);
+    assert.match(response.headers.get('content-type') || '', /application\/json/);
+    assert.deepEqual(await response.json(), {
+      success: false,
+      error: 'API endpoint not found.',
+    });
+  });
+});
+
 test('readiness checks storage and the document vault', async () => {
   await withServer(async (origin) => {
     const response = await fetch(`${origin}/api/ready`);

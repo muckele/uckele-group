@@ -38,7 +38,13 @@ export function verifySignedPayload(token, secret) {
     return null;
   }
 
-  const [encodedPayload, signature] = token.split('.');
+  const parts = String(token).split('.');
+
+  if (parts.length !== 2) {
+    return null;
+  }
+
+  const [encodedPayload, signature] = parts;
 
   if (!encodedPayload || !signature) {
     return null;
@@ -53,7 +59,14 @@ export function verifySignedPayload(token, secret) {
   try {
     const payload = JSON.parse(safeBase64UrlDecode(encodedPayload));
 
-    if (payload.exp && payload.exp < Date.now()) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return null;
+    }
+
+    if (
+      Object.hasOwn(payload, 'exp') &&
+      (!Number.isFinite(payload.exp) || payload.exp <= Date.now())
+    ) {
       return null;
     }
 

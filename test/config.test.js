@@ -158,3 +158,32 @@ test('production password auth must include usable credentials', () => {
   assert.equal(result.ok, false);
   assert.ok(result.errors.some((error) => error.includes('authentication path')));
 });
+
+test('configuration rejects unsafe origins, ports, retention, and resource limits', () => {
+  const config = productionConfig();
+  config.server = {
+    origin: 'https://www.example.com/unexpected-path?token=leak',
+    port: 70_000,
+    outboundRequestTimeoutMs: 10_000,
+  };
+  config.protection = {
+    rateLimitWindowMs: 600_000,
+    rateLimitRetentionMs: 60_000,
+    rateLimitMax: 6,
+    minSubmitTimeMs: 0,
+    spamScoreThreshold: -1,
+  };
+  config.dealHunter.lookbackDays = -4;
+  config.dealHunter.maxSourceRecords = 1.5;
+
+  const result = validateConfig(config);
+
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes('PUBLIC_SITE_URL')));
+  assert.ok(result.errors.some((error) => error.includes('PORT')));
+  assert.ok(result.errors.some((error) => error.includes('RATE_LIMIT_RETENTION_MS must be greater')));
+  assert.ok(result.errors.some((error) => error.includes('MIN_SUBMIT_TIME_MS')));
+  assert.ok(result.errors.some((error) => error.includes('SPAM_SCORE_THRESHOLD')));
+  assert.ok(result.errors.some((error) => error.includes('DEAL_HUNTER_LOOKBACK_DAYS')));
+  assert.ok(result.errors.some((error) => error.includes('DEAL_HUNTER_MAX_SOURCE_RECORDS')));
+});

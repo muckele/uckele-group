@@ -31,6 +31,8 @@ const allowedMimeTypes = new Set([
 ]);
 const maxDocumentsPerUpload = 5;
 const maxDocumentsPerRequest = 25;
+const maxSecureDocumentFileNameLength = 180;
+const maxSecureDocumentNoteLength = 2000;
 const staleUploadingRequestMs = 15 * 60 * 1000;
 const secureUploadRateLimitEvents = new Map();
 const base64ExpansionRatio = 4 / 3;
@@ -57,7 +59,23 @@ function sanitizeFileName(fileName) {
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '');
 
-  return cleaned || 'document';
+  if (!cleaned) {
+    return 'document';
+  }
+
+  if (cleaned.length <= maxSecureDocumentFileNameLength) {
+    return cleaned;
+  }
+
+  const extension = path.extname(cleaned).slice(0, 20);
+  const stem = cleaned.slice(0, cleaned.length - extension.length);
+  const availableStemLength = Math.max(1, maxSecureDocumentFileNameLength - extension.length);
+  const truncatedStem = stem.slice(0, availableStemLength).replace(/[._-]+$/g, '') || 'document';
+  return `${truncatedStem}${extension}`.slice(0, maxSecureDocumentFileNameLength);
+}
+
+function normalizeSecureDocumentNote(value) {
+  return String(value || '').trim().slice(0, maxSecureDocumentNoteLength);
 }
 
 export function resolveSecureStoragePath(filePath, storageDir) {
@@ -507,6 +525,7 @@ export async function createSecureUploadRequest({ submissionId, requestedBy, not
   }
 
   const now = new Date().toISOString();
+  const normalizedNote = normalizeSecureDocumentNote(note);
   const requestRecord = {
     id: randomUUID(),
     submission_id: submission.id,
@@ -520,7 +539,7 @@ export async function createSecureUploadRequest({ submissionId, requestedBy, not
     nda_required: true,
     nda_accepted_at: null,
     last_uploaded_at: null,
-    note,
+    note: normalizedNote,
     requested_documents: normalizeRequestedDocuments(requestedDocuments),
     revoked_at: null,
     closed_at: null,
@@ -559,7 +578,7 @@ export async function createSecureUploadRequest({ submissionId, requestedBy, not
       uploadUrl,
       expiresAt: requestRecord.expires_at,
       submission,
-      note,
+      note: normalizedNote,
     });
   }
 
@@ -585,7 +604,12 @@ export async function getSecureUploadContext(token, { recoverStale = false } = {
     return { ok: false, error: 'This secure document request could not be found.' };
   }
 
-  if (new Date(requestRecord.expires_at).getTime() < Date.now()) {
+  if (payload.submissionId !== requestRecord.submission_id) {
+    return { ok: false, error: 'This secure document link is invalid or has expired.' };
+  }
+
+  const expiresAt = Date.parse(requestRecord.expires_at || '');
+  if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
     return { ok: false, error: 'This secure document request has expired.' };
   }
 
@@ -768,14 +792,18 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
 
   const savedDocuments = [];
   const writtenFilePaths = [];
+  const normalizedNote = normalizeSecureDocumentNote(note);
   let updatedRequest;
   let cleanupJob = null;
   let cleanupIntentPersisted = false;
   let cleanupIntentActive = false;
 
   try {
+    await fs.mkdir(config.secureDocuments.storageDir, { recursive: true, mode: 0o700 });
+    await fs.chmod(config.secureDocuments.storageDir, 0o700);
     const requestDirectory = path.join(config.secureDocuments.storageDir, context.request.id);
-    await fs.mkdir(requestDirectory, { recursive: true });
+    await fs.mkdir(requestDirectory, { recursive: true, mode: 0o700 });
+    await fs.chmod(requestDirectory, 0o700);
 
     for (const preparedDocument of preparedDocuments) {
       const { document, buffer, mimeType } = preparedDocument;
@@ -796,7 +824,7 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
         size_bytes: buffer.byteLength,
         storage_path: storagePath,
         uploaded_by_email: claimedRequest.email,
-        note: String(note || '').trim(),
+        note: normalizedNote,
         nda_accepted_at: new Date().toISOString(),
       };
 
@@ -838,7 +866,8 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
     cleanupIntentActive = true;
 
     for (const [index, preparedDocument] of preparedDocuments.entries()) {
-      await fs.writeFile(savedDocuments[index].storage_path, preparedDocument.buffer);
+      await fs.writeFile(savedDocuments[index].storage_path, preparedDocument.buffer, { mode: 0o600 });
+      await fs.chmod(savedDocuments[index].storage_path, 0o600);
       writtenFilePaths.push(savedDocuments[index].storage_path);
     }
 

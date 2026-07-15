@@ -37,7 +37,7 @@ export default function CrmNavigation({ filters, total, totalPages, onChange, di
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_170px_170px_200px_130px]">
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-[minmax(15rem,1.4fr)_minmax(8rem,0.8fr)_minmax(8rem,0.8fr)_minmax(11rem,1fr)_minmax(7rem,0.55fr)]">
         <label className="flex flex-col gap-2 text-sm font-medium text-ink">
           Search CRM
           <input

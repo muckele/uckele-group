@@ -1,6 +1,25 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { parseCookies } from '../server/utils/cookies.js';
 import { fetchWithTimeout, getClientIp } from '../server/utils/http.js';
+import { signPayload, verifySignedPayload } from '../server/utils/security.js';
+
+test('cookie parsing tolerates malformed percent encoding', () => {
+  assert.deepEqual(parseCookies('valid=value; malformed=%E0%A4%A'), {
+    valid: 'value',
+    malformed: '%E0%A4%A',
+  });
+});
+
+test('signed payload verification rejects non-canonical and invalid expiry values', () => {
+  const secret = 'signed-payload-test-secret';
+  const token = signPayload({ type: 'test', exp: Date.now() + 60_000 }, secret);
+  const invalidExpiryToken = signPayload({ type: 'test', exp: 'later' }, secret);
+
+  assert.equal(verifySignedPayload(`${token}.unexpected`, secret), null);
+  assert.equal(verifySignedPayload(invalidExpiryToken, secret), null);
+  assert.equal(verifySignedPayload(token, secret)?.type, 'test');
+});
 
 test('getClientIp prefers trusted platform headers over forwarded-for', () => {
   const request = {

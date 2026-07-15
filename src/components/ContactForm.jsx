@@ -244,7 +244,7 @@ export default function ContactForm() {
           Name
           <input
             required
-            className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            className="form-control"
             name="name"
             onChange={handleChange}
             placeholder="Your name"
@@ -257,7 +257,7 @@ export default function ContactForm() {
           Email
           <input
             required
-            className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            className="form-control"
             name="email"
             onChange={handleChange}
             placeholder="you@example.com"
@@ -269,7 +269,7 @@ export default function ContactForm() {
         <label className="flex flex-col gap-2 text-sm font-medium text-ink">
           Phone
           <input
-            className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            className="form-control"
             name="phone"
             onChange={handleChange}
             placeholder="Optional"
@@ -281,7 +281,7 @@ export default function ContactForm() {
         <label className="flex flex-col gap-2 text-sm font-medium text-ink">
           Business / Firm
           <input
-            className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            className="form-control"
             name="company"
             onChange={handleChange}
             placeholder="Company name"
@@ -293,7 +293,7 @@ export default function ContactForm() {
         <label className="flex flex-col gap-2 text-sm font-medium text-ink md:col-span-2">
           I am reaching out as
           <select
-            className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+            className="form-control"
             name="role"
             onChange={handleChange}
             value={formData.role}
@@ -315,7 +315,7 @@ export default function ContactForm() {
           Message
           <textarea
             required
-            className="min-h-[180px] rounded-2xl border border-line bg-white px-4 py-4 text-sm text-ink outline-none transition focus:border-moss"
+            className="form-control min-h-[180px] py-4"
             name="message"
             onChange={handleChange}
             placeholder="Share a bit about the business, your timing, or the opportunity."
@@ -344,7 +344,7 @@ export default function ContactForm() {
         </p>
 
         <button
-          className="inline-flex w-full items-center justify-center rounded-full border border-moss bg-moss px-6 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
+          className="button-link inline-flex w-full items-center justify-center rounded-full border border-moss bg-moss px-6 py-3 text-sm font-semibold text-white transition hover:border-pine hover:bg-pine disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto"
           disabled={!isComplete || submitting}
           type="submit"
         >

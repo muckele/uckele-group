@@ -13,7 +13,7 @@ function getVariantClasses(variant) {
 }
 
 export default function ButtonLink({ href, children, variant = 'primary', className = '', ...props }) {
-  const classes = `inline-flex min-h-[48px] min-w-0 items-center justify-center gap-2 rounded-full px-5 py-3 text-center text-sm font-semibold tracking-[0.01em] transition duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-moss/25 ${getVariantClasses(
+  const classes = `button-link inline-flex min-h-[48px] min-w-0 items-center justify-center gap-2 rounded-full px-5 py-3 text-center text-sm font-semibold tracking-[0.01em] transition duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-moss/25 ${getVariantClasses(
     variant,
   )} ${className}`;
 

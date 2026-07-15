@@ -1,4 +1,4 @@
-import { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import React, { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { Navigate, NavLink, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   Activity,
@@ -520,20 +520,22 @@ function StatCard({ icon: Icon, label, onClick, value, tone = 'default', to = ''
   };
 
   const content = (
-    <>
-      <div className={`flex h-12 w-12 items-center justify-center rounded-2xl ${tones[tone]}`}>
-        <Icon className="h-5 w-5" />
+    <div className="admin-stat-card-inner">
+      <div className="admin-stat-card-topline">
+        <div className={`admin-stat-icon ${tones[tone]}`}>
+          <Icon className="h-[18px] w-[18px]" />
+        </div>
+        <p className="admin-stat-value">{value}</p>
       </div>
-      <p className="mt-4 text-xs font-semibold uppercase leading-5 tracking-[0.14em] text-moss/80 sm:text-sm sm:tracking-[0.18em]">{label}</p>
-      <p className="mt-2 text-2xl font-semibold text-ink sm:text-3xl">{value}</p>
-    </>
+      <p className="admin-stat-label">{label}</p>
+    </div>
   );
 
   if (to) {
     return (
       <NavLink
         aria-label={`View ${label}: ${value}`}
-        className="panel block p-4 transition duration-200 hover:-translate-y-0.5 hover:border-moss/25 hover:shadow-[0_18px_44px_rgba(24,33,29,0.11)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-moss focus-visible:ring-offset-2 sm:p-5"
+        className="admin-stat-card panel block p-4 transition duration-200 hover:-translate-y-0.5 hover:border-moss/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-moss focus-visible:ring-offset-2"
         onClick={onClick}
         to={to}
       >
@@ -543,7 +545,7 @@ function StatCard({ icon: Icon, label, onClick, value, tone = 'default', to = ''
   }
 
   return (
-    <div className="panel p-4 sm:p-5">
+    <div className="admin-stat-card panel p-4">
       {content}
     </div>
   );
@@ -616,17 +618,17 @@ function AdminSectionNav({ activeSection, isReadOnly }) {
   return (
     <aside className="admin-section-nav">
       <nav className="admin-section-nav-card">
-        <div className="hidden px-2 pb-2 pt-1 xl:block">
+        <div className="hidden px-2 pb-2 pt-1 md:block">
           <p className="text-[11px] font-semibold uppercase tracking-normal text-moss/75">Admin</p>
         </div>
-        <div className="flex gap-2 overflow-x-auto overscroll-x-contain pb-1 xl:max-h-[calc(100vh-8rem)] xl:flex-col xl:overflow-y-auto xl:pb-0">
+        <div className="flex gap-2 overflow-x-auto overscroll-x-contain pb-1 md:max-h-[calc(100vh-8rem)] md:flex-col md:overflow-y-auto md:pb-0">
           {visibleSections.map((section) => {
             const Icon = section.icon;
             const isActive = section.id === activeSection;
 
             return (
               <NavLink
-                className={`inline-flex min-h-10 shrink-0 items-center justify-center gap-2 rounded-full px-3.5 py-2 text-sm font-semibold transition xl:w-full xl:justify-start xl:rounded-xl ${
+                className={`inline-flex min-h-10 shrink-0 items-center justify-center gap-2 rounded-full px-3.5 py-2 text-sm font-semibold transition md:w-full md:justify-start md:rounded-xl ${
                   isActive
                     ? 'bg-moss text-white shadow-sm'
                     : 'border border-transparent text-ink/72 hover:border-moss/20 hover:bg-moss/8 hover:text-moss'
@@ -659,7 +661,7 @@ function InputField({ label, value, onChange, placeholder = '', type = 'text' })
   return (
     <Field label={label}>
       <input
-        className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+        className="form-control"
         onChange={onChange}
         placeholder={placeholder}
         type={type}
@@ -673,7 +675,7 @@ function SelectField({ label, value, onChange, options }) {
   return (
     <Field label={label}>
       <select
-        className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+        className="form-control"
         onChange={onChange}
         value={value}
       >
@@ -691,7 +693,7 @@ function TextAreaField({ label, value, onChange, placeholder = '' }) {
   return (
     <Field label={label}>
       <textarea
-        className="min-h-[132px] w-full rounded-2xl border border-line bg-white px-4 py-4 text-sm text-ink outline-none transition focus:border-moss"
+        className="form-control min-h-[132px] py-4"
         onChange={onChange}
         placeholder={placeholder}
         value={value}
@@ -919,6 +921,7 @@ export default function DashboardPage() {
   const [magicLinkForm, setMagicLinkForm] = useState({ email: '' });
   const [magicLinkFeedback, setMagicLinkFeedback] = useState({ error: '', message: '', previewUrl: '' });
   const [magicLinkPending, setMagicLinkPending] = useState(false);
+  const [authBootstrapError, setAuthBootstrapError] = useState('');
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [loginError, setLoginError] = useState('');
   const [loginPending, setLoginPending] = useState(false);
@@ -973,46 +976,65 @@ export default function DashboardPage() {
   const crmListHref = `/admin/crm${crmListSearch ? `?${crmListSearch}` : ''}`;
 
   async function checkSession() {
-    const response = await fetch('/api/admin/session', { credentials: 'same-origin' });
-    const result = await response.json();
+    setAuthBootstrapError('');
 
-    setAuthState({
-      checked: true,
-      authenticated: Boolean(result.authenticated),
-      username: result.username || '',
-      role: result.role || '',
-      authMode: result.authMode || 'hybrid',
-      magicLinkEnabled: Boolean(result.magicLinkEnabled),
-      passwordEnabled: Boolean(result.passwordEnabled),
-      adminEmailHint: result.adminEmailHint || '',
-      viewerAccessEnabled: Boolean(result.viewerAccessEnabled),
-    });
+    try {
+      const response = await fetch('/api/admin/session', { credentials: 'same-origin' });
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || 'Unable to check the admin session.');
+      }
+
+      setAuthState({
+        checked: true,
+        authenticated: Boolean(result.authenticated),
+        username: result.username || '',
+        role: result.role || '',
+        authMode: result.authMode || 'hybrid',
+        magicLinkEnabled: Boolean(result.magicLinkEnabled),
+        passwordEnabled: Boolean(result.passwordEnabled),
+        adminEmailHint: result.adminEmailHint || '',
+        viewerAccessEnabled: Boolean(result.viewerAccessEnabled),
+      });
+      return true;
+    } catch (error) {
+      setAuthState((current) => ({
+        ...current,
+        checked: true,
+        authenticated: false,
+        username: '',
+        role: '',
+      }));
+      setAuthBootstrapError(error.message || 'Unable to reach the admin service. Check your connection and try again.');
+      return false;
+    }
   }
 
   async function verifyMagicLink(token) {
-    const response = await fetch('/api/admin/magic-link/verify', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ token }),
-    });
+    try {
+      const response = await fetch('/api/admin/magic-link/verify', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ token }),
+      });
 
-    const result = await response.json();
+      const result = await response.json();
 
-    if (!response.ok || !result.success) {
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'That sign-in link is invalid or has expired.');
+      }
+    } catch (error) {
       setMagicLinkFeedback({
-        error: result.error || 'That sign-in link is invalid or has expired.',
+        error: error.message || 'That sign-in link is invalid or has expired.',
         message: '',
         previewUrl: '',
       });
-      return;
     }
 
-    const url = new URL(window.location.href);
-    url.searchParams.delete('admin_token');
-    window.history.replaceState({}, '', url.toString());
     await checkSession();
   }
 
@@ -1336,6 +1358,9 @@ export default function DashboardPage() {
     const token = new URLSearchParams(window.location.search).get('admin_token');
 
     if (token) {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('admin_token');
+      window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
       verifyMagicLink(token);
       return;
     }
@@ -2187,6 +2212,14 @@ export default function DashboardPage() {
         />
 
         <section className="section-shell mt-10">
+          {authBootstrapError ? (
+            <div className="mb-6 flex flex-col gap-3 rounded-2xl border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-800 sm:flex-row sm:items-center sm:justify-between" role="alert">
+              <span>{authBootstrapError}</span>
+              <button className="font-semibold underline underline-offset-4" onClick={checkSession} type="button">
+                Retry session check
+              </button>
+            </div>
+          ) : null}
           <div className="grid gap-8 lg:grid-cols-2">
             <Reveal className="panel p-5 sm:p-9">
               <form className="space-y-5" onSubmit={handleMagicLinkRequest}>
@@ -2361,7 +2394,7 @@ export default function DashboardPage() {
       {activeSection === 'overview' ? (
       <>
       <section className="section-shell mt-8">
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
+        <div className="admin-stat-grid">
           <StatCard icon={Inbox} label="Total Records" onClick={() => setFilters({ ...defaultCrmFilters })} to="/admin/crm" value={summary.total} />
           <StatCard icon={BellRing} label="Action Items" to="/admin/follow-ups?view=action-items" value={adminSummary.actionItems} tone={adminSummary.actionItems > 0 ? 'warning' : 'default'} />
           <StatCard icon={CalendarClock} label="Overdue" to="/admin/follow-ups?view=overdue" value={adminSummary.overdue} tone={adminSummary.overdue > 0 ? 'danger' : 'default'} />
@@ -2862,7 +2895,7 @@ export default function DashboardPage() {
                 />
                 <Field label="Next action">
                   <input
-                    className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+                    className="form-control"
                     onChange={(event) => setCreateDraft((current) => ({ ...current, next_action_at: event.target.value }))}
                     type="datetime-local"
                     value={createDraft.next_action_at}
@@ -3011,7 +3044,11 @@ export default function DashboardPage() {
             const listingDateLabel = submission.metadata?.dealHunter?.dateAdded ? 'Date listed' : listingDate ? 'First seen' : 'Date listed';
 
             return (
-              <Reveal className="panel p-5 sm:p-8" delay={index * 50} key={submission.id}>
+              <Reveal
+                className={`panel p-5 sm:p-8 ${isCrmDetailView ? '' : 'admin-crm-record-card'}`}
+                delay={isCrmDetailView ? 0 : Math.min(index * 35, 210)}
+                key={submission.id}
+              >
                 <div className="flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-3">
@@ -3207,7 +3244,7 @@ export default function DashboardPage() {
 
                   <Field label="Next action">
                     <input
-                      className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink outline-none transition focus:border-moss"
+                      className="form-control"
                       onChange={(event) =>
                         setDrafts((current) => ({
                           ...current,

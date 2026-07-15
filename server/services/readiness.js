@@ -4,7 +4,8 @@ import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 
 async function checkDocumentVault(config) {
-  await fs.mkdir(config.secureDocuments.storageDir, { recursive: true });
+  await fs.mkdir(config.secureDocuments.storageDir, { recursive: true, mode: 0o700 });
+  await fs.chmod(config.secureDocuments.storageDir, 0o700);
   await fs.access(config.secureDocuments.storageDir, fsConstants.R_OK | fsConstants.W_OK);
 }
 

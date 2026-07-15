@@ -395,7 +395,7 @@ export function createApp() {
   app.post(
     '/api/contact',
     asyncRoute(async (request, response) => {
-      const result = await submitContactLead(request.body, request);
+      const result = await submitContactLead(request.body || {}, request);
       response.status(result.status).json(result.body);
     }),
   );
@@ -431,7 +431,7 @@ export function createApp() {
   app.post(
     '/api/admin/session',
     asyncRoute(async (request, response) => {
-      const result = await loginAdmin(request.body.username || '', request.body.password || '', request);
+      const result = await loginAdmin(request.body?.username || '', request.body?.password || '', request);
 
       if (!result.ok) {
         response.status(result.status || 401).json({ success: false, error: result.reason });
@@ -451,7 +451,7 @@ export function createApp() {
   app.post(
     '/api/admin/magic-link/request',
     asyncRoute(async (request, response) => {
-      const result = await requestAdminMagicLink(request.body.email || '', request);
+      const result = await requestAdminMagicLink(request.body?.email || '', request);
 
       if (!result.ok) {
         response.status(result.status || 400).json({ success: false, error: result.reason });
@@ -467,7 +467,7 @@ export function createApp() {
   );
 
   app.post('/api/admin/magic-link/verify', asyncRoute(async (request, response) => {
-    const result = await verifyAdminMagicLink(request.body.token || '');
+    const result = await verifyAdminMagicLink(request.body?.token || '');
 
     if (!result.ok) {
       response.status(401).json({ success: false, error: result.reason });
@@ -946,9 +946,9 @@ export function createApp() {
       const result = await createSecureUploadRequest({
         submissionId: request.params.id,
         requestedBy: session.username,
-        note: String(request.body.note || ''),
-        requestedDocuments: Array.isArray(request.body.requestedDocuments) ? request.body.requestedDocuments : [],
-        sendEmail: request.body.sendEmail !== false,
+        note: String(request.body?.note || ''),
+        requestedDocuments: Array.isArray(request.body?.requestedDocuments) ? request.body.requestedDocuments : [],
+        sendEmail: request.body?.sendEmail !== false,
         request,
       });
 
@@ -1045,12 +1045,13 @@ export function createApp() {
   app.post(
     '/api/secure-documents/upload',
     asyncRoute(async (request, response) => {
+      const body = request.body || {};
       const result = await uploadSecureDocuments({
-        token: request.secureUploadToken || request.body.token,
-        ndaAccepted: Boolean(request.body.ndaAccepted),
-        note: String(request.body.note || ''),
-        documents: Array.isArray(request.body.documents) ? request.body.documents : [],
-        completeRequest: Boolean(request.body.completeRequest),
+        token: request.secureUploadToken || body.token,
+        ndaAccepted: Boolean(body.ndaAccepted),
+        note: String(body.note || ''),
+        documents: Array.isArray(body.documents) ? body.documents : [],
+        completeRequest: Boolean(body.completeRequest),
         request,
       });
 
@@ -1072,6 +1073,11 @@ export function createApp() {
     }),
   );
 
+  app.use('/api', (_request, response) => {
+    response.setHeader('Cache-Control', 'no-store');
+    response.status(404).json({ success: false, error: 'API endpoint not found.' });
+  });
+
   if (config.isProduction) {
     app.use(express.static(distDirectory, { redirect: false }));
 
@@ -1090,5 +1096,3 @@ export function createApp() {
 
   return app;
 }
-
-export const app = createApp();

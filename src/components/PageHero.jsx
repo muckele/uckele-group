@@ -2,7 +2,7 @@ import Reveal from './Reveal';
 
 export default function PageHero({ eyebrow, title, description }) {
   return (
-    <section className="section-shell pt-7 sm:pt-12">
+    <section className="page-hero section-shell pt-7 sm:pt-12">
       <Reveal className="panel overflow-hidden px-5 py-9 sm:px-10 sm:py-14 lg:px-14">
         <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(135deg,rgba(40,70,56,0.10),transparent_34%),linear-gradient(315deg,rgba(185,137,82,0.12),transparent_38%)]" />
         <div className="surface-grid pointer-events-none absolute inset-y-0 right-0 hidden w-[34%] opacity-[0.18] lg:block" />

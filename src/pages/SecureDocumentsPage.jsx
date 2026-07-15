@@ -289,7 +289,7 @@ export default function SecureDocumentsPage() {
                   Files
                   <input
                     accept={acceptedDocumentTypes}
-                    className="w-full rounded-2xl border border-line bg-white px-4 py-3 text-sm text-ink"
+                    className="form-control"
                     multiple
                     onChange={(event) => {
                       const selectedFiles = Array.from(event.target.files || []);
@@ -325,7 +325,7 @@ export default function SecureDocumentsPage() {
                 <label className="flex flex-col gap-2 text-sm font-medium text-ink">
                   Note
                   <textarea
-                    className="min-h-[140px] rounded-2xl border border-line bg-white px-4 py-4 text-sm text-ink outline-none transition focus:border-moss"
+                    className="form-control min-h-[140px] py-4"
                     onChange={(event) => setNote(event.target.value)}
                     placeholder="Optional context about the files you are sharing"
                     value={note}
