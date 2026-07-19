@@ -232,6 +232,32 @@ create table if not exists public.deal_hunter_cim_requests (
 create unique index if not exists idx_deal_hunter_cim_requests_deal_recipient on public.deal_hunter_cim_requests (deal_key, recipient_email);
 create index if not exists idx_deal_hunter_cim_requests_deal_key on public.deal_hunter_cim_requests (deal_key, updated_at desc);
 
+create table if not exists public.deal_hunter_cim_reviews (
+  id uuid primary key,
+  created_at timestamptz not null default now(),
+  deal_key text not null,
+  decision text not null,
+  pass_reason text,
+  original_recipient_email text,
+  final_recipient_email text,
+  recipient_edited boolean not null default false,
+  score integer,
+  actor text,
+  automation_stage integer not null default 1,
+  metadata jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_deal_hunter_cim_reviews_created on public.deal_hunter_cim_reviews (created_at desc);
+create index if not exists idx_deal_hunter_cim_reviews_deal on public.deal_hunter_cim_reviews (deal_key, created_at desc);
+
+create table if not exists public.deal_hunter_automation_settings (
+  id text primary key,
+  updated_at timestamptz not null default now(),
+  paused boolean not null default false,
+  updated_by text,
+  metadata jsonb not null default '{}'::jsonb
+);
+
 create table if not exists public.deal_hunter_crm_imports (
   id text primary key,
   created_at timestamptz not null,
@@ -809,6 +835,8 @@ alter table public.email_events enable row level security;
 alter table public.crm_activity_events enable row level security;
 alter table public.deal_hunter_seen_deals enable row level security;
 alter table public.deal_hunter_cim_requests enable row level security;
+alter table public.deal_hunter_cim_reviews enable row level security;
+alter table public.deal_hunter_automation_settings enable row level security;
 alter table public.deal_hunter_crm_imports enable row level security;
 alter table public.scheduled_job_runs enable row level security;
 alter table public.admin_audit_events enable row level security;

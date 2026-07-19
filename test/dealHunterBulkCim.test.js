@@ -110,6 +110,58 @@ test('bulk CIM send fails closed when confirmed recipient no longer matches sour
   assert.match(result.error, /list changed/i);
 });
 
+test('bulk CIM send accepts an edited recipient only with the signed reviewed snapshot', async () => {
+  const { reviewDailyDeals, sendDealHunterReadyCimRequests } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const review = await reviewDailyDeals({ storage });
+  const deal = review.qualified.find((item) => item.cimRequest?.canRequest);
+
+  const result = await sendDealHunterReadyCimRequests({
+    requestedBy: 'test-admin',
+    selections: [{
+      dealKey: deal.dealKey,
+      recipientEmail: 'corrected-broker@example.com',
+      snapshotToken: deal.cimRequest.snapshotToken,
+    }],
+    storage,
+  });
+  const [request] = Array.from(storage.requests.values());
+
+  assert.equal(result.status, 502);
+  assert.equal(result.failed, 1);
+  assert.equal(storage.requests.size, 1);
+  assert.equal(request.recipient_email, 'corrected-broker@example.com');
+});
+
+test('approval evidence is derived from a signed queue snapshot', async () => {
+  const { reviewDailyDeals, validateCimReviewDecisions } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const review = await reviewDailyDeals({ storage });
+  const deal = review.qualified.find((item) => item.cimRequest?.canRequest);
+  const valid = validateCimReviewDecisions([{
+    dealKey: deal.dealKey,
+    snapshotToken: deal.cimRequest.snapshotToken,
+    decision: 'approved',
+    finalRecipientEmail: 'corrected-broker@example.com',
+    dealName: 'Client-controlled name',
+    score: 100,
+  }]);
+
+  assert.equal(valid.valid, true);
+  assert.equal(valid.decisions[0].dealName, deal.name);
+  assert.equal(valid.decisions[0].score, deal.score);
+  assert.equal(valid.decisions[0].originalRecipientEmail, deal.brokerEmail);
+  assert.equal(valid.decisions[0].finalRecipientEmail, 'corrected-broker@example.com');
+
+  const forged = validateCimReviewDecisions([{
+    dealKey: deal.dealKey,
+    snapshotToken: 'forged',
+    decision: 'approved',
+    finalRecipientEmail: 'attacker@example.com',
+  }]);
+  assert.equal(forged.valid, false);
+});
+
 test('bulk CIM send uses confirmed snapshots when a source review is incomplete', async () => {
   const { reviewDailyDeals, sendDealHunterReadyCimRequests } = await import('../server/services/dealHunter.js');
   const storage = createCimStorage();

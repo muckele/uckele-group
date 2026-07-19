@@ -54,7 +54,7 @@ fly secrets set \
   CRM_WEBHOOK_SECRET=... \
   EMAIL_BRAND_MAILING_ADDRESS="Your business mailing address" \
   DEAL_HUNTER_CRON_SECRET=... \
-  DEAL_HUNTER_DAILY_EMAIL_TIME=10:15 \
+  DEAL_HUNTER_DAILY_EMAIL_TIME=08:00 \
   DEAL_HUNTER_DAILY_EMAIL_TIMEZONE=America/Los_Angeles \
   DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR=/data/deal-hunter-daily-email \
   ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH=/data/acquisition-command-center-source-health.json \

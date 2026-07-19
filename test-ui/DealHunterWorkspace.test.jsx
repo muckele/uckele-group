@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import React from 'react';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest';
 import DealHunterWorkspace, { getCimRequestPresentation } from '../src/components/admin/DealHunterWorkspace.jsx';
 
@@ -140,5 +140,58 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
 
     expect(screen.getByRole('button', { name: 'Follow-Ups Paused' })).toBeDisabled();
     expect(screen.getByText('Configured; reply test still required')).toBeVisible();
+  });
+
+  test('requires an explicit approval before recipient correction and bulk send', () => {
+    const onSendReady = vi.fn();
+    const review = reviewWithDeal({
+      eligible: true,
+      canRequest: true,
+      status: 'ready',
+      recipientEmail: 'broker@example.com',
+      snapshotToken: 'signed-review-snapshot',
+      preview: { subject: 'CIM / NDA request for Recurring HVAC Services', text: 'Hello Broker,\n\nPlease send the CIM.' },
+    });
+    review.totals.cimReady = 1;
+
+    render(
+      <DealHunterWorkspace
+        feedback={{ error: '', message: '' }}
+        onOpenApprovals={vi.fn()}
+        onReview={vi.fn()}
+        onSendReady={onSendReady}
+        review={review}
+      />,
+    );
+
+    const sendButton = screen.getByRole('button', { name: 'Save Review' });
+    expect(sendButton).toBeDisabled();
+    expect(screen.getByText('Review all 1 pending request before saving.')).toBeVisible();
+    fireEvent.click(screen.getByText('Preview exact broker email'));
+    expect(screen.getByText('Subject: CIM / NDA request for Recurring HVAC Services')).toBeVisible();
+    expect(screen.getByText(/Please send the CIM/)).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    const recipient = screen.getByLabelText('Broker recipient for Recurring HVAC Services');
+    fireEvent.change(recipient, { target: { value: 'corrected@example.com' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send 1 Approved' }));
+
+    expect(onSendReady).toHaveBeenCalledWith(
+      [expect.objectContaining({ confirmedRecipientEmail: 'corrected@example.com' })],
+      [expect.objectContaining({ decision: 'approved', finalRecipientEmail: 'corrected@example.com', snapshotToken: 'signed-review-snapshot' })],
+    );
+  });
+
+  test('requires a structured reason before saving a pass decision', () => {
+    const onSendReady = vi.fn();
+    const review = reviewWithDeal({ eligible: true, canRequest: true, status: 'ready', recipientEmail: 'broker@example.com' });
+    review.totals.cimReady = 1;
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onReview={vi.fn()} onSendReady={onSendReady} review={review} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Pass' }));
+    expect(screen.getByRole('button', { name: 'Save Review' })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('Pass reason'), { target: { value: 'valuation' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Review' }));
+    expect(onSendReady).toHaveBeenCalledWith([], [expect.objectContaining({ decision: 'rejected', passReason: 'valuation' })]);
   });
 });

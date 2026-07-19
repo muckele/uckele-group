@@ -3,6 +3,7 @@ import { getStorage } from '../storage/index.js';
 import { sha256, signPayload, verifySignedPayload } from '../utils/security.js';
 import {
   buildCimReplyToAddress,
+  buildDealHunterCimRequestEmail,
   normalizeResendTagToken,
   sendDailyDealHunterEmail,
   sendDealHunterCimFollowUpEmail,
@@ -11,6 +12,12 @@ import {
 import { createManualSubmission } from './submissions.js';
 import { commitCrmActivityMutation } from './activity.js';
 import { getEmailReadiness } from './emailReadiness.js';
+import {
+  evaluateCimAutomationCandidates,
+  getCimAutomationStatus,
+  isCimAutomationPaused,
+  recordCimReviewDecisions,
+} from './cimAutomation.js';
 
 const defaultTimeoutMs = 45000;
 const cimRequestScoreThreshold = 75;
@@ -2323,6 +2330,7 @@ function attachCimRequestStatus(scoredDeals, requests = []) {
     const reason = getCimRequestUnavailableReason(deal, recipientEmail);
     const eligible = reason === '';
     const completed = isCompletedCimStatus(existingRequest?.status);
+    const preview = eligible ? buildDealHunterCimRequestEmail({ to: recipientEmail, deal }) : null;
 
     return {
       ...deal,
@@ -2338,6 +2346,7 @@ function attachCimRequestStatus(scoredDeals, requests = []) {
         deliveryError: existingRequest?.delivery_error || '',
         providerMessageId: existingRequest?.provider_message_id || '',
         subject: existingRequest?.subject || '',
+        preview: preview ? { subject: preview.subject, text: preview.text } : null,
         followUpCount: Number(existingRequest?.follow_up_count || 0),
         lastFollowUpAt: existingRequest?.last_follow_up_at || '',
         nextFollowUpAt: existingRequest?.next_follow_up_at || '',
@@ -2725,6 +2734,20 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
 
 export async function reviewDailyDeals({ markSeen = false, storage = getStorage() } = {}) {
   const result = await buildDailyDealReview({ storage });
+  const automationStatus = await getCimAutomationStatus({ storage, config: getConfig() });
+  const [requests, events] = await Promise.all([
+    storage.listDealHunterCimRequests?.({ limit: 100000 }) || [],
+    storage.listEmailEvents?.({ limit: 100000 }) || [],
+  ]);
+  const evaluated = automationStatus.effectiveStage > 1
+    ? evaluateCimAutomationCandidates({ review: result.review, scoredDeals: result.scoredDeals, status: automationStatus, requests, events })
+    : {
+        eligible: [],
+        exceptions: result.scoredDeals.filter((deal) => deal.cimRequest?.canRequest).map((deal) => ({
+          dealKey: deal.dealKey, name: deal.name, recipientEmail: deal.brokerEmail, score: deal.score, reasons: ['Stage 1 requires manual approval'],
+        })),
+      };
+  result.review.cimAutomation = { ...automationStatus, run: { ...evaluated, sent: 0, failed: 0, results: [] } };
 
   if (markSeen) {
     await persistDealHunterHistory(result.storage, result.scoredDeals);
@@ -2740,6 +2763,104 @@ export async function sendDailyDealHunterReview({ idempotencyKey = '' } = {}) {
   const crmSync = await syncHighFitDealsToCrm(scoredDeals, storage);
 
   review.crmSync = crmSync;
+  const automationStatus = await getCimAutomationStatus({ storage, config });
+  const [existingRequests, emailEvents] = await Promise.all([
+    storage.listDealHunterCimRequests?.({ limit: 100000 }) || [],
+    storage.listEmailEvents?.({ limit: 100000 }) || [],
+  ]);
+  const todayKey = new Date().toISOString().slice(0, 10);
+  const sentToday = existingRequests.filter((request) => String(request.created_at || '').startsWith(todayKey)).length;
+  const remainingDailyCapacity = Math.max(0, automationStatus.policy.maximumDailyInitials - sentToday);
+  let automationRun = { eligible: [], exceptions: [], sent: 0, failed: 0, results: [] };
+
+  if (automationStatus.effectiveStage > 1 && !automationStatus.paused && remainingDailyCapacity > 0) {
+    const evaluated = evaluateCimAutomationCandidates({
+      review, scoredDeals, status: automationStatus, requests: existingRequests, events: emailEvents,
+    });
+    const eligibleWithinCap = evaluated.eligible.slice(0, remainingDailyCapacity);
+    automationRun = {
+      ...automationRun,
+      ...evaluated,
+      eligible: eligibleWithinCap,
+      exceptions: [
+        ...evaluated.exceptions,
+        ...evaluated.eligible.slice(remainingDailyCapacity).map((deal) => ({
+          dealKey: deal.dealKey,
+          name: deal.name,
+          recipientEmail: deal.brokerEmail,
+          score: deal.score,
+          reasons: ['Automatic daily send cap reached'],
+        })),
+      ],
+    };
+
+    for (const [index, deal] of automationRun.eligible.entries()) {
+      if (await isCimAutomationPaused({ storage, config })) {
+        const withheld = automationRun.eligible.slice(index);
+        automationRun.exceptions.push(...withheld.map((item) => ({
+          dealKey: item.dealKey,
+          name: item.name,
+          recipientEmail: item.brokerEmail,
+          score: item.score,
+          reasons: ['Emergency pause activated before send'],
+        })));
+        automationRun.eligible = automationRun.eligible.slice(0, index);
+        break;
+      }
+      const sendResult = await sendCimRequestForScoredDeal({ deal, requestedBy: `automation-stage-${automationStatus.effectiveStage}`, storage });
+      automationRun.results.push({ dealKey: deal.dealKey, dealName: deal.name, recipientEmail: deal.brokerEmail, ok: Boolean(sendResult.ok), error: sendResult.error || '' });
+      if (sendResult.ok) automationRun.sent += 1;
+      else automationRun.failed += 1;
+    }
+
+    const successfulKeys = new Set(automationRun.results.filter((item) => item.ok).map((item) => item.dealKey));
+    const successfullyAutomated = automationRun.eligible.filter((deal) => successfulKeys.has(deal.dealKey));
+    if (successfullyAutomated.length > 0) {
+      await recordCimReviewDecisions({
+        storage,
+        actor: `automation-stage-${automationStatus.effectiveStage}`,
+        stage: automationStatus.effectiveStage,
+        source: 'automation',
+        decisions: successfullyAutomated.map((deal) => ({
+          dealKey: deal.dealKey, dealName: deal.name, score: deal.score, decision: 'approved',
+          originalRecipientEmail: deal.brokerEmail, finalRecipientEmail: deal.brokerEmail,
+        })),
+      });
+    }
+
+    const sentKeys = new Set(automationRun.results.filter((item) => item.ok).map((item) => item.dealKey));
+    for (const section of ['newlySeenMatches', 'qualified', 'watchlist']) {
+      review[section] = (review[section] || []).map((deal) => sentKeys.has(deal.dealKey)
+        ? { ...deal, cimRequest: { ...deal.cimRequest, canRequest: false, status: 'sent' } }
+        : deal);
+    }
+    review.totals.cimReady = Math.max(0, Number(review.totals.cimReady || 0) - automationRun.sent);
+  } else if (automationStatus.effectiveStage > 1) {
+    const evaluated = evaluateCimAutomationCandidates({
+      review, scoredDeals, status: automationStatus, requests: existingRequests, events: emailEvents,
+    });
+    const holdReason = automationStatus.paused ? 'Emergency pause is active' : 'Automatic daily send cap reached';
+    automationRun = {
+      ...automationRun,
+      sourceHealthy: evaluated.sourceHealthy,
+      exceptions: [
+        ...evaluated.exceptions,
+        ...evaluated.eligible.map((deal) => ({
+          dealKey: deal.dealKey,
+          name: deal.name,
+          recipientEmail: deal.brokerEmail,
+          score: deal.score,
+          reasons: [holdReason],
+        })),
+      ],
+    };
+  } else if (automationStatus.effectiveStage === 1) {
+    automationRun.exceptions = scoredDeals.filter((deal) => deal.cimRequest?.canRequest).map((deal) => ({
+      dealKey: deal.dealKey, name: deal.name, recipientEmail: deal.brokerEmail, score: deal.score, reasons: ['Stage 1 requires manual approval'],
+    }));
+  }
+
+  review.cimAutomation = { ...automationStatus, run: automationRun, remainingDailyCapacity };
 
   const emailResult = await sendDailyDealHunterEmail({
     to: config.dealHunter.recipient || config.delivery.fallbackRecipient,
@@ -2963,6 +3084,48 @@ function normalizeCimRequestSelections(selections = []) {
   return normalizedSelections.slice(0, cimBulkRequestMax);
 }
 
+export function validateCimReviewDecisions(decisions = []) {
+  if (!Array.isArray(decisions) || decisions.length === 0) {
+    return { valid: false, decisions: [], error: 'At least one CIM review decision is required.' };
+  }
+
+  const validated = [];
+  const seen = new Set();
+
+  for (const decision of decisions.slice(0, cimBulkRequestMax)) {
+    const snapshotToken = decision?.snapshotToken || decision?.snapshot_token || '';
+    const snapshot = verifyCimDealSnapshotToken(snapshotToken);
+    const dealKey = normalizeText(decision?.dealKey || decision?.deal_key, 1000);
+    const result = decision?.decision === 'approved' ? 'approved' : decision?.decision === 'rejected' ? 'rejected' : '';
+
+    if (!snapshot || !dealKey || snapshot.dealKey !== dealKey || seen.has(dealKey) || !result) {
+      return { valid: false, decisions: [], error: 'One or more CIM review decisions do not match the signed approval queue.' };
+    }
+
+    const originalRecipientEmail = normalizeEmail(snapshot.brokerEmail);
+    const finalRecipientEmail = result === 'approved'
+      ? normalizeEmail(decision?.finalRecipientEmail || decision?.final_recipient_email || originalRecipientEmail)
+      : originalRecipientEmail;
+
+    if (!originalRecipientEmail || (result === 'approved' && !isValidEmail(finalRecipientEmail))) {
+      return { valid: false, decisions: [], error: 'One or more CIM review recipients are invalid.' };
+    }
+
+    seen.add(dealKey);
+    validated.push({
+      dealKey,
+      dealName: snapshot.name,
+      score: snapshot.score,
+      decision: result,
+      passReason: decision?.passReason || decision?.pass_reason || '',
+      originalRecipientEmail,
+      finalRecipientEmail,
+    });
+  }
+
+  return { valid: true, decisions: validated, error: '' };
+}
+
 function buildSelectionFailure(selection, error) {
   return {
     ok: false,
@@ -3081,11 +3244,14 @@ export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit =
     const missingFromReadyList = [];
 
     readyDeals = selectedRecipients.map((selection) => {
-      const deal = readyByDealRecipient.get(`${selection.dealKey}|${selection.recipientEmail}`);
+      const exactDeal = readyByDealRecipient.get(`${selection.dealKey}|${selection.recipientEmail}`);
+      const latestDeal = readyByDealKey.get(selection.dealKey);
+      const snapshotMatches = selection.deal?.dealKey === selection.dealKey;
+      const deal = exactDeal || (latestDeal && snapshotMatches
+        ? { ...latestDeal, brokerEmail: selection.recipientEmail }
+        : null);
 
       if (!deal) {
-        const latestDeal = readyByDealKey.get(selection.dealKey);
-
         if (!latestDeal) {
           missingFromReadyList.push(selection);
         }
@@ -3094,10 +3260,17 @@ export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit =
           buildSelectionFailure(
             selection,
             latestDeal
-              ? 'This deal is no longer CIM-ready for the confirmed broker email. Review sources again before sending.'
+              ? 'The confirmed deal snapshot or broker recipient is no longer valid. Review sources again before sending.'
               : 'This deal was not available in the latest source review. Review sources again before sending.',
           ),
         );
+        return null;
+      }
+
+      const unavailableReason = getCimRequestUnavailableReason(deal, selection.recipientEmail);
+      if (unavailableReason) {
+        validationFailures.push(buildSelectionFailure(selection, unavailableReason));
+        return null;
       }
 
       return deal;

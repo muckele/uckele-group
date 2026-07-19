@@ -964,11 +964,14 @@ export default function DashboardPage() {
   const [operations, setOperations] = useState(null);
   const [operationsLoading, setOperationsLoading] = useState(false);
   const [operationsError, setOperationsError] = useState('');
+  const [cimAutomationUpdating, setCimAutomationUpdating] = useState(false);
   const dashboardRequestRef = useRef({ controller: null, id: 0 });
   const followUpRequestRef = useRef({ controller: null, id: 0 });
+  const dealHunterAutoReviewAttemptedRef = useRef(false);
   const deferredSearch = useDeferredValue(filters.search);
   const isReadOnly = authState.role === 'viewer';
   const requestedFollowUpView = new URLSearchParams(location.search).get('view');
+  const requestedDealHunterView = new URLSearchParams(location.search).get('view');
   const followUpView = ['action-items', 'overdue', 'due-soon', 'warm-leads'].includes(requestedFollowUpView)
     ? requestedFollowUpView
     : 'all';
@@ -1303,6 +1306,24 @@ export default function DashboardPage() {
     }
   }
 
+  async function handleToggleCimAutomation(paused) {
+    setCimAutomationUpdating(true);
+    setOperationsError('');
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-automation/pause', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paused }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to update CIM automation.');
+      setOperations((current) => current ? { ...current, cimAutomation: result.automation } : current);
+    } catch (error) {
+      setOperationsError(error.message || 'Unable to update CIM automation.');
+    } finally {
+      setCimAutomationUpdating(false);
+    }
+  }
+
   async function handleSendEmailTest() {
     if (isReadOnly) {
       setDealHunterFeedback({ error: 'Read-only users cannot send email tests.', message: '' });
@@ -1437,6 +1458,21 @@ export default function DashboardPage() {
   useEffect(() => {
     if (authState.authenticated && !isReadOnly && activeSection === 'operations') loadOperations();
   }, [activeSection, authState.authenticated, isReadOnly]);
+
+  useEffect(() => {
+    if (authState.authenticated && activeSection === 'deal-hunter' && !dealHunterReview && !dealHunterLoading && !dealHunterAutoReviewAttemptedRef.current) {
+      dealHunterAutoReviewAttemptedRef.current = true;
+      handleLoadDealHunterReview();
+    }
+  // The review loader is intentionally bounded by the loaded/loading state.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSection, authState.authenticated, dealHunterLoading, dealHunterReview]);
+
+  useEffect(() => {
+    if (activeSection === 'deal-hunter' && requestedDealHunterView === 'cim-approvals' && dealHunterReview) {
+      window.requestAnimationFrame(() => document.getElementById('cim-approvals')?.scrollIntoView({ block: 'start' }));
+    }
+  }, [activeSection, dealHunterReview, requestedDealHunterView]);
 
   useEffect(() => () => {
     dashboardRequestRef.current.controller?.abort();
@@ -1994,7 +2030,7 @@ export default function DashboardPage() {
     }
   }
 
-  async function handleSendReadyCimRequests() {
+  async function handleSendReadyCimRequests(approvedDeals = null, reviewDecisions = []) {
     if (isReadOnly) {
       setDealHunterFeedback({ error: 'Read-only users cannot send CIM requests.', message: '' });
       return;
@@ -2008,9 +2044,9 @@ export default function DashboardPage() {
       return;
     }
 
-    const readyDeals = getCimReadyDealsFromReview(dealHunterReview);
+    const readyDeals = Array.isArray(approvedDeals) ? approvedDeals : getCimReadyDealsFromReview(dealHunterReview);
 
-    if (readyDeals.length === 0) {
+    if (readyDeals.length === 0 && reviewDecisions.length === 0) {
       setDealHunterFeedback({
         error: 'No CIM-ready 75+ deals are available in the loaded review. Confirm each deal has annual profit and a valid broker email.',
         message: '',
@@ -2023,9 +2059,9 @@ export default function DashboardPage() {
       .map((deal) => `- ${deal.name || 'Unnamed deal'} -> ${deal.confirmedRecipientEmail}`)
       .join('\n');
     const additionalCount = readyDeals.length > 10 ? `\n...and ${readyDeals.length - 10} more.` : '';
-    const confirmed = window.confirm(
-      `Send CIM request emails to these ${readyDeals.length} confirmed broker recipient${readyDeals.length === 1 ? '' : 's'}?\n\n${previewLines}${additionalCount}\n\nThis will email brokers directly.`,
-    );
+    const confirmed = window.confirm(readyDeals.length > 0
+      ? `Send CIM request emails to these ${readyDeals.length} approved broker recipient${readyDeals.length === 1 ? '' : 's'}?\n\n${previewLines}${additionalCount}\n\nThis will email brokers directly and start their automated follow-up sequences.`
+      : 'Save these CIM pass decisions without sending any broker emails?');
 
     if (!confirmed) {
       return;
@@ -2035,6 +2071,21 @@ export default function DashboardPage() {
     setDealHunterFeedback({ error: '', message: '' });
 
     try {
+      if (reviewDecisions.length > 0) {
+        const reviewResponse = await fetch('/api/admin/deal-hunter/cim-reviews', {
+          method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ decisions: reviewDecisions }),
+        });
+        const reviewResult = await reviewResponse.json();
+        if (!reviewResponse.ok || !reviewResult.success) throw new Error(reviewResult.error || 'Unable to save CIM review decisions.');
+      }
+
+      if (readyDeals.length === 0) {
+        setDealHunterFeedback({ error: '', message: `Saved ${reviewDecisions.length} CIM review decision${reviewDecisions.length === 1 ? '' : 's'} without sending outreach.` });
+        await handleLoadDealHunterReview();
+        return;
+      }
+
       const response = await fetch('/api/admin/deal-hunter/cim-requests/send-ready', {
         method: 'POST',
         credentials: 'same-origin',
@@ -2117,6 +2168,21 @@ export default function DashboardPage() {
       setDealHunterFeedback({ error: error.message || 'Unable to run CIM follow-ups.', message: '' });
     } finally {
       setDealHunterFollowUpRunning(false);
+    }
+  }
+
+  async function handleRecordCimOutcome(deal, outcome) {
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-outcomes', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dealKey: deal.dealKey, outcome }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to record the broker response outcome.');
+      setDealHunterFeedback({ error: '', message: `Marked ${deal.name || 'the CIM response'} as ${outcome}.` });
+      await handleLoadDealHunterReview();
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to record the broker response outcome.', message: '' });
     }
   }
 
@@ -2457,10 +2523,12 @@ export default function DashboardPage() {
           <p className="mt-3 max-w-3xl text-sm leading-7 text-ink/68">Admin-only operational visibility for scheduler runs, source checks, security cleanup, audit history, disk usage, database integrity, and backups.</p>
         </div>
         <OperationsCenter
+          cimAutomationUpdating={cimAutomationUpdating}
           data={operations}
           emailTestSending={emailTestSending}
           error={operationsError}
           loading={operationsLoading}
+          onToggleCimAutomation={handleToggleCimAutomation}
           onSendEmailTest={handleSendEmailTest}
         />
       </section>
@@ -2651,6 +2719,11 @@ export default function DashboardPage() {
           emailTestSending={emailTestSending}
           loading={dealHunterLoading}
           onReview={handleLoadDealHunterReview}
+          onRecordCimOutcome={handleRecordCimOutcome}
+          onOpenApprovals={() => {
+            navigate('/admin/deal-hunter?view=cim-approvals');
+            window.requestAnimationFrame(() => document.getElementById('cim-approvals')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+          }}
           onRunFollowUps={handleRunCimFollowUps}
           onSendCimRequest={handleSendCimRequest}
           onSendEmail={handleSendDealHunterEmail}

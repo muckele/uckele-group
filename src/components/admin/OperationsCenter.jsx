@@ -36,7 +36,7 @@ function PanelError({ children }) {
   return children ? <p className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900" role="status">{children}</p> : null;
 }
 
-export default function OperationsCenter({ data, loading = false, error = '', onSendEmailTest, emailTestSending = false }) {
+export default function OperationsCenter({ data, loading = false, error = '', onSendEmailTest, emailTestSending = false, onToggleCimAutomation, cimAutomationUpdating = false }) {
   if (loading && !data) return <div className="panel p-7 text-sm text-ink/65" role="status">Loading operations history…</div>;
   if (error && !data) return <div className="rounded-2xl border border-red-200 bg-red-50 p-5 text-sm text-red-700" role="alert">{error}</div>;
   if (!data) return null;
@@ -52,11 +52,25 @@ export default function OperationsCenter({ data, loading = false, error = '', on
   const schedulerFailures = Number(data.scheduler?.failures || 0);
   const schedulerPending = Number(data.scheduler?.pending || 0);
   const schedulerUnavailable = Boolean(data.scheduler?.error);
+  const cimAutomation = data.cimAutomation || {};
+  const cimMetrics = cimAutomation.metrics || {};
 
   return (
     <div className="space-y-6">
       {error ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800" role="alert">{error}</div> : null}
       <EmailReadinessPanel data={data.email} onSendTest={onSendEmailTest} testSending={emailTestSending} />
+      <section className="panel p-5 sm:p-7" aria-labelledby="cim-automation-heading">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">CIM outreach</p><h3 className="mt-2 text-xl font-semibold text-ink" id="cim-automation-heading">Automation stage and learning metrics</h3><p className="mt-2 text-sm text-ink/65">Configured Stage {cimAutomation.configuredStage || 1} · effective Stage {cimAutomation.effectiveStage || 1}</p></div>
+          <button className={`rounded-full border px-4 py-2.5 text-sm font-semibold ${cimAutomation.paused ? 'border-moss bg-moss text-white' : 'border-red-200 bg-red-50 text-red-800'}`} disabled={cimAutomationUpdating} onClick={() => onToggleCimAutomation?.(!cimAutomation.paused)} type="button">{cimAutomationUpdating ? 'Updating…' : cimAutomation.paused ? 'Resume initial outreach' : 'Emergency pause'}</button>
+        </div>
+        <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
+          {[['Reviewed', cimMetrics.reviewed || 0], ['Approval rate', `${cimMetrics.approvalRate || 0}%`], ['Recipient edits', `${cimMetrics.recipientEditRate || 0}%`], ['Delivery rate', `${cimMetrics.deliveryRate || 0}%`], ['Bounce rate', `${cimMetrics.bounceRate || 0}%`], ['Reply rate', `${cimMetrics.replyRate || 0}%`], ['Positive replies', `${cimMetrics.positiveResponseRate || 0}%`], ['Duplicate rate', `${cimMetrics.duplicateListingRate || 0}%`], ['Recipient issue rate', `${cimMetrics.incorrectRecipientRate || 0}%`]].map(([metric, value]) => <div className="rounded-2xl border border-line bg-fog/60 p-4" key={metric}><p className="text-xs font-semibold uppercase tracking-[0.1em] text-ink/55">{metric}</p><p className="mt-2 text-xl font-semibold text-ink">{value}</p></div>)}
+        </div>
+        <p className="mt-4 text-sm text-ink/65">Stage 2 readiness: {cimAutomation.stage2Ready ? 'ready' : `needs ${cimAutomation.policy?.stage2MinimumReviews || 25} reviewed requests`} · Stage 3 readiness: {cimAutomation.stage3Ready ? 'ready' : `${cimAutomation.policy?.stage3MinimumReviews || 50} reviews and ${Math.round((cimAutomation.policy?.stage3MinimumApprovalRate || 0.9) * 100)}% approval required`}.</p>
+        {Object.keys(cimMetrics.passReasons || {}).length > 0 ? <p className="mt-3 text-sm text-ink/65"><strong>Pass reasons:</strong> {Object.entries(cimMetrics.passReasons).sort((left, right) => right[1] - left[1]).map(([reason, count]) => `${reason}: ${count}`).join(' · ')}</p> : null}
+        <PanelError>{cimAutomation.error}</PanelError>
+      </section>
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <article className="panel p-5">
           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">Database</p>

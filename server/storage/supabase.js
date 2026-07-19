@@ -1221,6 +1221,40 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return safeRecords;
     },
 
+    async insertDealHunterCimReviews(reviews = []) {
+      const safeReviews = Array.isArray(reviews) ? reviews.filter((review) => review?.id && review?.deal_key) : [];
+      if (safeReviews.length === 0) return [];
+      const { data, error } = await client.from('deal_hunter_cim_reviews').insert(safeReviews).select();
+      if (error) throw error;
+      return data || [];
+    },
+
+    async listDealHunterCimReviews({ limit = 5000 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 5000, 100000));
+      const { data, error } = await client.from('deal_hunter_cim_reviews').select('*').order('created_at', { ascending: false }).limit(safeLimit);
+      if (error) throw error;
+      return data || [];
+    },
+
+    async getDealHunterAutomationSettings() {
+      const { data, error } = await client.from('deal_hunter_automation_settings').select('*').eq('id', 'cim-initial-outreach').maybeSingle();
+      if (error) throw error;
+      return data;
+    },
+
+    async upsertDealHunterAutomationSettings(settings = {}) {
+      const payload = {
+        id: 'cim-initial-outreach',
+        updated_at: settings.updated_at || new Date().toISOString(),
+        paused: Boolean(settings.paused),
+        updated_by: settings.updated_by || '',
+        metadata: settings.metadata || {},
+      };
+      const { data, error } = await client.from('deal_hunter_automation_settings').upsert(payload, { onConflict: 'id' }).select().single();
+      if (error) throw error;
+      return data;
+    },
+
     async getDealHunterCrmImport({ id = '', dealKey = '', listingIdentity = '' } = {}) {
       return getDealHunterCrmImportRecord({ id, dealKey, listingIdentity });
     },

@@ -610,6 +610,7 @@ function dealHunterTextSection(title, deals = [], options = {}) {
 }
 
 export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = '' } = {}) {
+  const config = getConfig();
   const generatedLabel = review.generatedAt ? new Date(review.generatedAt).toLocaleString() : new Date().toLocaleString();
   const crmSync = review.crmSync || {};
   const emailSectionLimit = 8;
@@ -618,7 +619,32 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
     .map((source) => `${source.name}: ${source.fetched ? `${source.rowCount || 0} rows` : `failed (${source.error || 'unknown error'})`}`)
     .join('\n');
   const recommendations = review.criteriaRecommendations || [];
+  const automation = review.cimAutomation || {};
+  const automationRun = automation.run || {};
+  const cimReadyDeals = [];
+  const seenCimDeals = new Set();
+
+  for (const deal of [...(review.qualified || []), ...(review.newlySeenMatches || []), ...(review.watchlist || [])]) {
+    const recipient = deal?.cimRequest?.recipientEmail || deal?.brokerEmail || '';
+    const key = `${deal?.dealKey || ''}|${String(recipient).toLowerCase()}`;
+
+    if (!deal?.cimRequest?.canRequest || !recipient || seenCimDeals.has(key)) continue;
+    seenCimDeals.add(key);
+    cimReadyDeals.push(deal);
+  }
+
+  const approvalUrl = `${String(config.server.origin || '').replace(/\/$/, '')}/admin/deal-hunter?view=cim-approvals`;
   const bodyHtml = `
+    <div style="margin: 20px 0; border: 1px solid #E3D9CA; border-radius: 14px; background: #F8F4ED; padding: 16px;">
+      <p style="margin: 0 0 8px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase;">CIM Automation</p>
+      <p style="margin: 0; color: #33443B; font-size: 14px; line-height: 1.6;">Configured Stage ${escapeHtml(automation.configuredStage || 1)}; effective Stage ${escapeHtml(automation.effectiveStage || 1)}${automation.paused ? '; emergency paused' : ''}. ${escapeHtml(automationRun.sent || 0)} initial request(s) sent automatically; ${escapeHtml(automationRun.exceptions?.length || 0)} exception(s) retained for review.</p>
+    </div>
+    ${dealHunterSectionHtml(
+      'CIM Requests Ready For Approval',
+      'Review the exact businesses and recipients, edit any broker address, skip weak fits, and send only the requests you approve.',
+      cimReadyDeals,
+      { tone: 'warning', limit: emailSectionLimit },
+    )}
     ${dealHunterSectionHtml(
       'Newly Seen Fits',
       'These listings were not in the prior Deal Hunter history and deserve the first look today.',
@@ -661,7 +687,8 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
       crmSync.reviewed ? `CRM sync checked ${crmSync.reviewed} score-75-plus deal(s): ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped.` : '',
     ],
     bodyHtml,
-    details: [
+	    details: [
+      { label: 'CIM approvals', value: String(cimReadyDeals.length) },
       { label: 'High-fit deals', value: String(review.totals?.qualified || 0) },
       { label: 'New fit(s)', value: String(review.totals?.newMatches || 0) },
       { label: 'Watchlist', value: String(review.totals?.watchlist || 0) },
@@ -671,17 +698,22 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
       crmSync.reviewed ? { label: 'CRM updated', value: String(crmSync.updated || 0) } : null,
       { label: 'Lookback', value: `${review.lookbackDays || 0} day(s)` },
     ].filter(Boolean),
+    ctas: cimReadyDeals.length > 0 ? [{ label: `Review ${cimReadyDeals.length} CIM Request${cimReadyDeals.length === 1 ? '' : 's'}`, href: approvalUrl }] : [],
   });
   const text = [
     'Daily acquisition deal review',
     '',
     `Generated: ${generatedLabel}`,
     `Reviewed deals: ${review.totals?.reviewedDeals || 0}`,
+    `CIM requests ready for approval: ${cimReadyDeals.length}`,
+    `CIM automation: configured Stage ${automation.configuredStage || 1}, effective Stage ${automation.effectiveStage || 1}${automation.paused ? ', paused' : ''}; ${automationRun.sent || 0} automatically sent; ${automationRun.exceptions?.length || 0} exceptions.`,
+    cimReadyDeals.length > 0 ? `Review and approve: ${approvalUrl}` : '',
     crmSync.reviewed ? `CRM sync: ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped, ${crmSync.failed || 0} failed.` : '',
     '',
 	    'Sources:',
 	    sourceSummary || 'No sources configured.',
 	    '',
+		    ...dealHunterTextSection('CIM requests ready for approval', cimReadyDeals, { limit: emailSectionLimit }),
 		    ...dealHunterTextSection('Newly seen fits', review.newlySeenMatches || [], { limit: emailSectionLimit }),
 		    '',
 		    ...dealHunterTextSection('High-fit deals', review.qualified || [], { limit: emailSectionLimit }),
@@ -704,6 +736,7 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
       source: 'daily-deal-hunter',
       generatedAt: review.generatedAt || '',
       totals: review.totals || {},
+      cimReadyCount: cimReadyDeals.length,
     },
   };
 }
@@ -716,7 +749,7 @@ export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = ''
   const config = getConfig();
   const businessName = normalizeText(deal.name || 'the listed business', 160);
   const subject = `CIM / NDA request for ${businessName}`;
-  const requester = normalizeText(requestedBy || config.workflow?.defaultAssignee || 'Mathew Uckele', 120);
+  const requester = normalizeText(config.workflow?.defaultAssignee || requestedBy || 'Mathew Uckele', 120);
   const listingUrl = normalizeUrl(deal.listingUrl || '');
   const details = [
     { label: 'Business', value: businessName },
@@ -870,7 +903,7 @@ export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumb
   const config = getConfig();
   const metadata = request.metadata && typeof request.metadata === 'object' ? request.metadata : {};
   const businessName = normalizeText(request.deal_name || 'the listed business', 160);
-  const requester = normalizeText(requestedBy || request.requested_by || config.workflow?.defaultAssignee || 'Mathew Uckele', 120);
+  const requester = normalizeText(config.workflow?.defaultAssignee || requestedBy || request.requested_by || 'Mathew Uckele', 120);
   const listingUrl = normalizeUrl(request.listing_url || '');
   const copy = buildCimFollowUpCopy({ businessName, followUpNumber });
   const subject = `Re: CIM / NDA request for ${businessName}`;

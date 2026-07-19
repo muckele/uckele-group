@@ -144,7 +144,7 @@ export function getConfig() {
       airtableSharedMaxPayloadBytes: numberFromEnv(process.env.DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES, 12 * 1024 * 1024),
       dailyEmail: {
         enabled: booleanFromEnv(process.env.DEAL_HUNTER_DAILY_EMAIL_ENABLED, isProduction),
-        time: process.env.DEAL_HUNTER_DAILY_EMAIL_TIME || '10:15',
+        time: process.env.DEAL_HUNTER_DAILY_EMAIL_TIME || '08:00',
         timezone: process.env.DEAL_HUNTER_DAILY_EMAIL_TIMEZONE || 'America/Los_Angeles',
         checkIntervalMs: numberFromEnv(process.env.DEAL_HUNTER_DAILY_EMAIL_CHECK_INTERVAL_MS, 1000 * 60),
         retryIntervalMs: numberFromEnv(process.env.DEAL_HUNTER_DAILY_EMAIL_RETRY_INTERVAL_MS, 1000 * 60 * 30),
@@ -159,6 +159,17 @@ export function getConfig() {
         delaySequenceHours: numberListFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_DELAYS_HOURS, [48, 72, 96]).slice(0, 10),
         weekdaysOnly: booleanFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_WEEKDAYS_ONLY, true),
         timezone: process.env.DEAL_HUNTER_CIM_FOLLOW_UP_TIMEZONE || 'America/Los_Angeles',
+      },
+      cimAutomation: {
+        stage: Math.max(1, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_STAGE, 1), 3)),
+        paused: booleanFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_PAUSED, false),
+        stage2MinimumReviews: Math.max(25, numberFromEnv(process.env.DEAL_HUNTER_CIM_STAGE2_MIN_REVIEWS, 25)),
+        stage3MinimumReviews: Math.max(50, numberFromEnv(process.env.DEAL_HUNTER_CIM_STAGE3_MIN_REVIEWS, 50)),
+        stage3MinimumApprovalRate: Math.max(0.9, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_STAGE3_MIN_APPROVAL_RATE, 0.9), 1)),
+        minimumScore: Math.max(75, numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_MIN_SCORE, 90)),
+        maximumDailyInitials: Math.max(1, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_DAILY_CAP, 3), 10)),
+        maximumBrokerContacts30Days: Math.max(1, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_BROKER_30_DAY_CAP, 3), 20)),
+        maximumProfitMultiple: Math.max(1, numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_MAX_PROFIT_MULTIPLE, 4)),
       },
     },
     secureDocuments: {

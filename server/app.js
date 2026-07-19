@@ -40,6 +40,7 @@ import {
   runDealHunterCimFollowUps,
   sendDealHunterCimRequest,
   sendDealHunterReadyCimRequests,
+  validateCimReviewDecisions,
 } from './services/dealHunter.js';
 import { getDailyDealHunterJobStatus, runClaimedDailyDealHunterEmail } from './services/dealHunterScheduler.js';
 import {
@@ -58,6 +59,12 @@ import { safeCompareText } from './utils/security.js';
 import { listCrmActivity } from './services/activity.js';
 import { getOperationsCenter } from './services/operations.js';
 import { recordAnalyticsEvent } from './services/analytics.js';
+import {
+  getCimAutomationStatus,
+  recordCimResponseOutcome,
+  recordCimReviewDecisions,
+  setCimAutomationPaused,
+} from './services/cimAutomation.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.resolve(__dirname, '../dist');
@@ -843,6 +850,70 @@ export function createApp() {
         success: Boolean(result.ok),
         ...result,
       });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-reviews',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const validated = validateCimReviewDecisions(request.body?.decisions);
+      if (!validated.valid) {
+        response.status(400).json({ success: false, error: validated.error });
+        return;
+      }
+      const status = await getCimAutomationStatus();
+      const reviews = await recordCimReviewDecisions({
+        decisions: validated.decisions,
+        actor: session.username || 'admin',
+        stage: status.effectiveStage,
+        source: 'approval-queue',
+      });
+      response.status(201).json({ success: true, recorded: reviews.length, automation: await getCimAutomationStatus() });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-automation/pause',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      if (typeof request.body?.paused !== 'boolean') {
+        response.status(400).json({ success: false, error: 'A boolean paused value is required.' });
+        return;
+      }
+      await setCimAutomationPaused({ paused: request.body.paused, actor: session.username || 'admin' });
+      response.json({ success: true, automation: await getCimAutomationStatus() });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-outcomes',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      let outcome;
+      try {
+        outcome = await recordCimResponseOutcome({
+          dealKey: request.body?.dealKey,
+          outcome: request.body?.outcome,
+          actor: session.username || 'admin',
+        });
+      } catch (error) {
+        response.status(400).json({ success: false, error: error.message || 'A valid CIM response outcome is required.' });
+        return;
+      }
+      response.status(201).json({ success: true, outcome });
     }),
   );
 

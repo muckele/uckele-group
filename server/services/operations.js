@@ -5,6 +5,7 @@ import { getStorage } from '../storage/index.js';
 import { getSourceHealth } from './acquisitionCommandCenter.js';
 import { getBackupStatus } from './backups.js';
 import { getEmailReadiness } from './emailReadiness.js';
+import { getCimAutomationStatus } from './cimAutomation.js';
 
 function safeError(error) {
   return error?.message || 'Status check failed.';
@@ -70,6 +71,7 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
   const databaseStatusCheck = checks.database || getDatabaseStatus;
   const backupStatusCheck = checks.backup || getBackupStatus;
   const emailReadinessCheck = checks.emailReadiness || getEmailReadiness;
+  const cimAutomationCheck = checks.cimAutomation || getCimAutomationStatus;
   const tasks = [
     () => storage.listScheduledJobs?.({ limit: 50 }) || [],
     () => storage.listAdminAuditEvents?.({ limit: 100 }) || [],
@@ -80,6 +82,7 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
     () => databaseStatusCheck(storage, config),
     () => backupStatusCheck(config),
     () => emailReadinessCheck({ storage, config }),
+    () => cimAutomationCheck({ storage, config }),
   ];
   const results = await Promise.allSettled(tasks.map((task) => Promise.resolve().then(task)));
   const scheduledPanel = settledPanel(results[0], [], 'Scheduler history is temporarily unavailable.');
@@ -109,6 +112,9 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
     followUpsSafe: false,
     issues: ['Email readiness is temporarily unavailable.'],
   }, 'Email readiness is temporarily unavailable.');
+  const cimAutomationPanel = settledPanel(results[9], {
+    configuredStage: 1, effectiveStage: 1, paused: true, stage2Ready: false, stage3Ready: false, metrics: {}, policy: {},
+  }, 'CIM automation status is temporarily unavailable.');
 
   const scheduledJobs = Array.isArray(scheduledPanel.value) ? scheduledPanel.value : [];
   const auditEvents = Array.isArray(auditPanel.value) ? auditPanel.value : [];
@@ -144,5 +150,6 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
     },
     backup: { ...backupPanel.value, error: backupPanel.error },
     email: { ...emailPanel.value, error: emailPanel.error },
+    cimAutomation: { ...cimAutomationPanel.value, error: cimAutomationPanel.error },
   };
 }

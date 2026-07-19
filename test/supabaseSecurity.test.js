@@ -11,6 +11,10 @@ const analyticsMigrationUrl = new URL(
   '../supabase/migrations/20260714193000_privacy_conscious_analytics.sql',
   import.meta.url,
 );
+const cimAutomationMigrationUrl = new URL(
+  '../supabase/migrations/20260719160000_cim_automation_learning.sql',
+  import.meta.url,
+);
 
 function currentAppTables(schema) {
   return Array.from(
@@ -88,7 +92,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const schema = fs.readFileSync(schemaUrl, 'utf8');
   const migration = fs.readFileSync(migrationUrl, 'utf8');
   const analyticsMigration = fs.readFileSync(analyticsMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}`;
+  const cimAutomationMigration = fs.readFileSync(cimAutomationMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');

@@ -32,6 +32,29 @@ test('daily Deal Hunter email carries its deterministic provider idempotency key
   assert.equal(message.idempotencyKey, 'daily-deal-hunter-email:2026-07-12');
 });
 
+test('daily Deal Hunter email links CIM-ready deals to the authenticated approval queue', () => {
+  const message = buildDailyDealHunterEmail({
+    to: 'admin@example.com',
+    review: {
+      totals: { cimReady: 1 },
+      sources: [],
+      criteriaRecommendations: [],
+      qualified: [{
+        dealKey: 'deal-1',
+        name: 'Recurring HVAC Services',
+        score: 88,
+        brokerEmail: 'broker@example.com',
+        cimRequest: { canRequest: true, recipientEmail: 'broker@example.com' },
+      }],
+    },
+  });
+
+  assert.match(message.text, /CIM requests ready for approval: 1/);
+  assert.match(message.text, /\/admin\/deal-hunter\?view=cim-approvals/);
+  assert.match(message.html, /Review 1 CIM Request/);
+  assert.equal(message.tracking.cimReadyCount, 1);
+});
+
 test('CIM touch identifiers are deterministic and isolated by request and follow-up number', () => {
   const initialKey = buildCimEmailIdempotencyKey({ requestId: 'request-1' });
 
@@ -148,6 +171,18 @@ test('CIM request email keeps internal score and deal economics out of broker-vi
   assertBrokerEmailOmitsBodyHeadline(message);
   assertBrokerEmailHidesFollowUpSequenceLabels(message);
   assertBrokerEmailHidesInternalDetails(message);
+});
+
+test('CIM broker emails never expose an internal automation actor as the sender identity', () => {
+  const message = buildDealHunterCimRequestEmail({
+    to: 'broker@example.com',
+    deal: sampleDeal,
+    requestedBy: 'automation-stage-2',
+    cimRequestId: 'request-automation',
+  });
+
+  assert.doesNotMatch(message.text, /automation-stage-2/i);
+  assert.match(message.text, /Mathew Uckele/);
 });
 
 test('CIM request email tags are safe for Resend when deal keys contain punctuation', () => {

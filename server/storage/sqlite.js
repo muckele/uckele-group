@@ -577,6 +577,29 @@ export function createSqliteStorage(config) {
 	      metadata TEXT NOT NULL DEFAULT '{}'
 	    );
 
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_reviews (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        deal_key TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        pass_reason TEXT,
+        original_recipient_email TEXT,
+        final_recipient_email TEXT,
+        recipient_edited INTEGER NOT NULL DEFAULT 0,
+        score INTEGER,
+        actor TEXT,
+        automation_stage INTEGER NOT NULL DEFAULT 1,
+        metadata TEXT NOT NULL DEFAULT '{}'
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_automation_settings (
+        id TEXT PRIMARY KEY,
+        updated_at TEXT NOT NULL,
+        paused INTEGER NOT NULL DEFAULT 0,
+        updated_by TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}'
+      );
+
 	    CREATE TABLE IF NOT EXISTS deal_hunter_crm_imports (
 	      id TEXT PRIMARY KEY,
 	      created_at TEXT NOT NULL,
@@ -689,6 +712,8 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_source_id ON deal_hunter_seen_deals(source_id, last_seen_at DESC);
 	    CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_deal_recipient ON deal_hunter_cim_requests(deal_key, recipient_email);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_deal_key ON deal_hunter_cim_requests(deal_key, updated_at DESC);
+	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_reviews_created ON deal_hunter_cim_reviews(created_at DESC);
+	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_reviews_deal ON deal_hunter_cim_reviews(deal_key, created_at DESC);
 	    CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_deal_key ON deal_hunter_crm_imports(deal_key);
 	    CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_listing_identity ON deal_hunter_crm_imports(listing_identity) WHERE listing_identity IS NOT NULL AND listing_identity <> '';
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_submission_id ON deal_hunter_crm_imports(submission_id);
@@ -2059,7 +2084,7 @@ export function createSqliteStorage(config) {
 	        .map(normalizeDealHunterSeenDealRow);
 	    },
 
-		    async upsertDealHunterSeenDeals(records = []) {
+	    async upsertDealHunterSeenDeals(records = []) {
 		      if (!Array.isArray(records) || records.length === 0) {
 		        return [];
 		      }
@@ -2088,6 +2113,57 @@ export function createSqliteStorage(config) {
 
 	      return normalizeDealHunterCrmImportRow(row);
 	    },
+
+      async insertDealHunterCimReviews(reviews = []) {
+        const safeReviews = Array.isArray(reviews) ? reviews.filter((review) => review?.id && review?.deal_key) : [];
+        const statement = database.prepare(`
+          INSERT INTO deal_hunter_cim_reviews (
+            id, created_at, deal_key, decision, pass_reason, original_recipient_email,
+            final_recipient_email, recipient_edited, score, actor, automation_stage, metadata
+          ) VALUES (
+            @id, @created_at, @deal_key, @decision, @pass_reason, @original_recipient_email,
+            @final_recipient_email, @recipient_edited, @score, @actor, @automation_stage, @metadata
+          )
+        `);
+        const transaction = database.transaction((items) => items.forEach((review) => statement.run({
+          ...review,
+          recipient_edited: review.recipient_edited ? 1 : 0,
+          metadata: JSON.stringify(review.metadata || {}),
+        })));
+        transaction(safeReviews);
+        return safeReviews;
+      },
+
+      async listDealHunterCimReviews({ limit = 5000 } = {}) {
+        const safeLimit = Math.max(1, Math.min(Number(limit) || 5000, 100000));
+        return database.prepare('SELECT * FROM deal_hunter_cim_reviews ORDER BY created_at DESC, id DESC LIMIT ?')
+          .all(safeLimit)
+          .map((review) => ({ ...review, recipient_edited: Boolean(review.recipient_edited), metadata: parseJsonColumn(review.metadata, {}) }));
+      },
+
+      async getDealHunterAutomationSettings() {
+        const row = database.prepare('SELECT * FROM deal_hunter_automation_settings WHERE id = ? LIMIT 1').get('cim-initial-outreach');
+        return row ? { ...row, paused: Boolean(row.paused), metadata: parseJsonColumn(row.metadata, {}) } : null;
+      },
+
+      async upsertDealHunterAutomationSettings(settings = {}) {
+        database.prepare(`
+          INSERT INTO deal_hunter_automation_settings (id, updated_at, paused, updated_by, metadata)
+          VALUES (@id, @updated_at, @paused, @updated_by, @metadata)
+          ON CONFLICT(id) DO UPDATE SET
+            updated_at = excluded.updated_at,
+            paused = excluded.paused,
+            updated_by = excluded.updated_by,
+            metadata = excluded.metadata
+        `).run({
+          id: 'cim-initial-outreach',
+          updated_at: settings.updated_at || new Date().toISOString(),
+          paused: settings.paused ? 1 : 0,
+          updated_by: settings.updated_by || '',
+          metadata: JSON.stringify(settings.metadata || {}),
+        });
+        return this.getDealHunterAutomationSettings();
+      },
 
 	    async claimDealHunterCrmImport(record = {}, { pendingCutoff = '' } = {}) {
 	      const serializedRecord = serializeDealHunterCrmImport(record);

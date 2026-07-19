@@ -109,6 +109,18 @@ Automatic follow-ups are controlled by:
 - `DEAL_HUNTER_CIM_FOLLOW_UP_WEEKDAYS_ONLY=true`
 - `DEAL_HUNTER_CIM_FOLLOW_UP_TIMEZONE=America/Los_Angeles`
 
+Initial CIM outreach uses a gated three-stage automation policy. Stage 1 is the production-safe default and requires approval for every initial request. Stage 2 activates trusted-rule sends only after the configured minimum review history; Stage 3 additionally requires the configured review count and approval-rate threshold. Both higher stages retain daily and broker contact caps, source-health checks, suppression events, duplicate detection, and the Operations emergency pause.
+
+- `DEAL_HUNTER_CIM_AUTOMATION_STAGE=1` (`1`, `2`, or `3`)
+- `DEAL_HUNTER_CIM_AUTOMATION_PAUSED=false`
+- `DEAL_HUNTER_CIM_STAGE2_MIN_REVIEWS=25`
+- `DEAL_HUNTER_CIM_STAGE3_MIN_REVIEWS=50`
+- `DEAL_HUNTER_CIM_STAGE3_MIN_APPROVAL_RATE=0.90`
+- `DEAL_HUNTER_CIM_AUTOMATION_MIN_SCORE=90`
+- `DEAL_HUNTER_CIM_AUTOMATION_DAILY_CAP=3`
+- `DEAL_HUNTER_CIM_BROKER_30_DAY_CAP=3`
+- `DEAL_HUNTER_CIM_AUTOMATION_MAX_PROFIT_MULTIPLE=4`
+
 The production cadence is three persistent touches: first follow-up after 48 hours, second follow-up 72 hours later, and final follow-up 96 hours after that. With weekday-only delivery enabled, a follow-up that becomes due on Saturday or Sunday remains queued until the next scheduler check on a weekday in the configured timezone. The follow-up job checks for Resend inbound `email.received` webhook events before sending and stores them internally as replies. Configure the delivery provider webhook with `EMAIL_WEBHOOK_SECRET` or `RESEND_WEBHOOK_SECRET`; without inbound reply webhook events, the app can send due follow-ups but cannot automatically know when a broker responded. The job stops follow-ups on replies, bounces, complaints, failures, or unsubscribes.
 
 ### Diligence And Decisioning
