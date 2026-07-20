@@ -536,6 +536,7 @@ function dealHunterDealHtml(deal, { tone = 'success', showRemoveReasons = false 
   const badgeColor = tone === 'danger' ? '#B91C1C' : tone === 'warning' ? '#92400E' : '#284638';
   const detailItems = showRemoveReasons ? deal.removeReasons || deal.concerns || [] : deal.strengths || [];
   const questionItems = deal.questions || [];
+  const listingUrl = normalizeUrl(deal.listingUrl);
 
   return `
     <div style="margin: 18px 0; border: 1px solid ${border}; border-radius: 16px; background: ${background}; padding: 18px;">
@@ -562,7 +563,7 @@ function dealHunterDealHtml(deal, { tone = 'success', showRemoveReasons = false 
               .join('')}</ul>`
           : ''
       }
-      ${deal.listingUrl ? `<a href="${escapeHtml(deal.listingUrl)}" style="color: #284638; font-size: 14px; font-weight: 800; text-decoration: underline;">View listing</a>` : ''}
+      ${listingUrl ? `<a href="${escapeHtml(listingUrl)}" style="color: #284638; font-size: 14px; font-weight: 800; text-decoration: underline;">View listing</a>` : ''}
     </div>
   `;
 }
@@ -597,7 +598,7 @@ function dealHunterTextSection(title, deals = [], options = {}) {
       `${index + 1}. ${deal.name} (${deal.score}/100)`,
       options.showRemoveReasons ? (deal.removeReasons || deal.concerns || []).join('; ') : dealHunterMetaLine(deal),
       options.showRemoveReasons ? '' : (deal.recommendation || ''),
-      deal.listingUrl || '',
+      normalizeUrl(deal.listingUrl),
       '',
     ]),
   ];
@@ -633,7 +634,9 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
     cimReadyDeals.push(deal);
   }
 
-  const approvalUrl = `${String(config.server.origin || '').replace(/\/$/, '')}/admin/deal-hunter?view=cim-approvals`;
+  const adminOrigin = String(config.server.origin || '').replace(/\/$/, '');
+  const scoredBusinessesUrl = `${adminOrigin}/admin/command-center`;
+  const approvalUrl = `${adminOrigin}/admin/deal-hunter?view=cim-approvals`;
   const bodyHtml = `
     <div style="margin: 20px 0; border: 1px solid #E3D9CA; border-radius: 14px; background: #F8F4ED; padding: 16px;">
       <p style="margin: 0 0 8px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase;">CIM Automation</p>
@@ -698,7 +701,12 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
       crmSync.reviewed ? { label: 'CRM updated', value: String(crmSync.updated || 0) } : null,
       { label: 'Lookback', value: `${review.lookbackDays || 0} day(s)` },
     ].filter(Boolean),
-    ctas: cimReadyDeals.length > 0 ? [{ label: `Review ${cimReadyDeals.length} CIM Request${cimReadyDeals.length === 1 ? '' : 's'}`, href: approvalUrl }] : [],
+    ctas: [
+      { label: 'Review 75+ Scored Businesses', href: scoredBusinessesUrl },
+      cimReadyDeals.length > 0
+        ? { label: `Review & Send ${cimReadyDeals.length} CIM Request${cimReadyDeals.length === 1 ? '' : 's'}`, href: approvalUrl }
+        : null,
+    ].filter(Boolean),
   });
   const text = [
     'Daily acquisition deal review',
@@ -707,7 +715,8 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
     `Reviewed deals: ${review.totals?.reviewedDeals || 0}`,
     `CIM requests ready for approval: ${cimReadyDeals.length}`,
     `CIM automation: configured Stage ${automation.configuredStage || 1}, effective Stage ${automation.effectiveStage || 1}${automation.paused ? ', paused' : ''}; ${automationRun.sent || 0} automatically sent; ${automationRun.exceptions?.length || 0} exceptions.`,
-    cimReadyDeals.length > 0 ? `Review and approve: ${approvalUrl}` : '',
+    `Review 75+ scored businesses: ${scoredBusinessesUrl}`,
+    cimReadyDeals.length > 0 ? `Review and send CIM requests: ${approvalUrl}` : '',
     crmSync.reviewed ? `CRM sync: ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped, ${crmSync.failed || 0} failed.` : '',
     '',
 	    'Sources:',

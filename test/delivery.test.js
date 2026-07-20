@@ -32,7 +32,7 @@ test('daily Deal Hunter email carries its deterministic provider idempotency key
   assert.equal(message.idempotencyKey, 'daily-deal-hunter-email:2026-07-12');
 });
 
-test('daily Deal Hunter email links CIM-ready deals to the authenticated approval queue', () => {
+test('daily Deal Hunter email has clickable links for 75+ businesses and CIM approvals', () => {
   const message = buildDailyDealHunterEmail({
     to: 'admin@example.com',
     review: {
@@ -50,9 +50,40 @@ test('daily Deal Hunter email links CIM-ready deals to the authenticated approva
   });
 
   assert.match(message.text, /CIM requests ready for approval: 1/);
-  assert.match(message.text, /\/admin\/deal-hunter\?view=cim-approvals/);
-  assert.match(message.html, /Review 1 CIM Request/);
+  assert.match(message.text, /Review 75\+ scored businesses: http:\/\/localhost:5173\/admin\/command-center/);
+  assert.match(message.text, /Review and send CIM requests: http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals/);
+  assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/command-center"[^>]*>Review 75\+ Scored Businesses<\/a>/);
+  assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals"[^>]*>Review &amp; Send 1 CIM Request<\/a>/);
   assert.equal(message.tracking.cimReadyCount, 1);
+});
+
+test('daily Deal Hunter email always links to the 75+ scored-business dashboard', () => {
+  const message = buildDailyDealHunterEmail({
+    to: 'admin@example.com',
+    review: { totals: {}, sources: [], criteriaRecommendations: [] },
+  });
+
+  assert.match(message.html, /href="http:\/\/localhost:5173\/admin\/command-center"/);
+  assert.doesNotMatch(message.html, /href="http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals"/);
+});
+
+test('daily Deal Hunter email only makes HTTP(S) listing URLs clickable', () => {
+  const message = buildDailyDealHunterEmail({
+    to: 'admin@example.com',
+    review: {
+      totals: { qualified: 2 },
+      sources: [],
+      criteriaRecommendations: [],
+      qualified: [
+        { dealKey: 'safe-deal', name: 'Safe listing', score: 90, listingUrl: 'https://example.com/listing' },
+        { dealKey: 'unsafe-deal', name: 'Unsafe listing', score: 89, listingUrl: 'javascript:alert(1)' },
+      ],
+    },
+  });
+
+  assert.match(message.html, /href="https:\/\/example.com\/listing"/);
+  assert.doesNotMatch(message.html, /javascript:/i);
+  assert.doesNotMatch(message.text, /javascript:/i);
 });
 
 test('CIM touch identifiers are deterministic and isolated by request and follow-up number', () => {
