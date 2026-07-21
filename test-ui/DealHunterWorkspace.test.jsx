@@ -54,6 +54,8 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
 
     const dialog = screen.getByRole('dialog', { name: 'Recurring HVAC Services' });
     expect(dialog).toBeVisible();
+    expect(dialog.querySelector('article')).toHaveClass('bg-parchment');
+    expect(dialog.querySelector('header')).toHaveClass('bg-parchment');
     expect(within(dialog).getByText('High fit. Validate financial quality before advancing.')).toBeVisible();
     expect(within(dialog).getByText('Customer concentration needs validation.')).toBeVisible();
     expect(within(dialog).getByText('What does the owner do each week?')).toBeVisible();

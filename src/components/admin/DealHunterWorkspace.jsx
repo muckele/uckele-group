@@ -125,8 +125,8 @@ function OpportunityReview({ deal, onClose }) {
   return (
     <div aria-labelledby="opportunity-review-title" aria-modal="true" className="fixed inset-0 z-50 flex items-end justify-center bg-ink/45 p-0 backdrop-blur-[2px] sm:items-center sm:p-6" role="dialog">
       <button aria-label="Close review backdrop" className="absolute inset-0 cursor-default" onClick={onClose} type="button" />
-      <article className="relative z-10 max-h-[94vh] w-full max-w-4xl overflow-y-auto rounded-t-3xl border border-line bg-cream shadow-2xl sm:max-h-[90vh] sm:rounded-3xl">
-        <header className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-line bg-cream/95 px-5 py-4 backdrop-blur sm:px-7">
+      <article className="relative z-10 max-h-[94vh] w-full max-w-4xl overflow-y-auto rounded-t-3xl border border-line bg-parchment shadow-2xl sm:max-h-[90vh] sm:rounded-3xl">
+        <header className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-line bg-parchment px-5 py-4 shadow-[0_1px_0_rgba(255,255,255,0.7)] sm:px-7">
           <div className="min-w-0">
             <div className="flex flex-wrap gap-2"><Pill tone={deal.score >= 70 ? 'success' : deal.score >= 55 ? 'warning' : 'danger'}>Score {deal.score}</Pill>{deal.isNew ? <Pill tone="success">New</Pill> : null}<Pill>{deal.sourceName}</Pill></div>
             <h2 className="mt-3 text-xl font-semibold leading-snug text-ink sm:text-2xl" id="opportunity-review-title">{deal.name}</h2>
@@ -140,7 +140,7 @@ function OpportunityReview({ deal, onClose }) {
           </section>
 
           <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {details.map(([detailLabel, value]) => <div className="rounded-2xl border border-line bg-white/80 p-4" key={detailLabel}><p className="text-xs font-semibold uppercase tracking-[0.12em] text-moss/80">{detailLabel}</p><p className="mt-2 break-words text-sm leading-6 text-ink">{value}</p></div>)}
+            {details.map(([detailLabel, value]) => <div className="rounded-2xl border border-line bg-white p-4" key={detailLabel}><p className="text-xs font-semibold uppercase tracking-[0.12em] text-moss/80">{detailLabel}</p><p className="mt-2 break-words text-sm leading-6 text-ink">{value}</p></div>)}
           </section>
 
           <div className="grid gap-5 lg:grid-cols-2">
