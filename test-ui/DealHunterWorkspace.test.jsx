@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import React from 'react';
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeAll, describe, expect, test, vi } from 'vitest';
 import DealHunterWorkspace, { getCimRequestPresentation } from '../src/components/admin/DealHunterWorkspace.jsx';
 
@@ -37,6 +37,44 @@ function reviewWithDeal(cimRequest) {
 }
 
 describe('Deal Hunter CIM lifecycle presentation', () => {
+  test('opens the complete opportunity review with a safe link to the original broker listing', () => {
+    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    Object.assign(review.qualified[0], {
+      listingUrl: 'https://broker.example/listings/recurring-hvac',
+      recommendation: 'High fit. Validate financial quality before advancing.',
+      concerns: ['Customer concentration needs validation.', 'Confirm owner responsibilities.'],
+      strengths: ['Recurring maintenance contracts', 'Commercial customer base'],
+      questions: ['What percentage of revenue is recurring?', 'What does the owner do each week?'],
+      brokerName: 'Jamie Broker',
+      annualRevenue: 1800000,
+    });
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onReview={vi.fn()} review={review} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Recurring HVAC Services' }));
+
+    const dialog = screen.getByRole('dialog', { name: 'Recurring HVAC Services' });
+    expect(dialog).toBeVisible();
+    expect(within(dialog).getByText('High fit. Validate financial quality before advancing.')).toBeVisible();
+    expect(within(dialog).getByText('Customer concentration needs validation.')).toBeVisible();
+    expect(within(dialog).getByText('What does the owner do each week?')).toBeVisible();
+    expect(within(dialog).getByText('Jamie Broker')).toBeVisible();
+    expect(within(dialog).getByRole('link', { name: 'Original broker listing' })).toHaveAttribute('href', 'https://broker.example/listings/recurring-hvac');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close opportunity review' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
+  test('does not make an unsafe broker listing URL clickable', () => {
+    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    review.qualified[0].listingUrl = 'javascript:alert(1)';
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onReview={vi.fn()} review={review} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Recurring HVAC Services' }));
+
+    expect(screen.getByText('Original broker listing unavailable')).toBeVisible();
+    expect(screen.queryByRole('link', { name: 'Original broker listing' })).not.toBeInTheDocument();
+  });
+
   test('keeps an in-progress follow-up in the warning state with its schedule', () => {
     const presentation = getCimRequestPresentation({
       status: 'follow_up_pending',

@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { BellRing, CalendarClock, ClipboardList, Inbox, MailCheck, RefreshCw, Send, ShieldAlert } from 'lucide-react';
+import { BellRing, CalendarClock, ClipboardList, ExternalLink, Inbox, MailCheck, RefreshCw, Send, ShieldAlert, X } from 'lucide-react';
 import Reveal from '../Reveal';
 import EmailReadinessPanel from './EmailReadinessPanel';
 
@@ -93,7 +93,83 @@ function Stat({ icon: Icon, label: statLabel, value, tone = 'default' }) {
   return <div className="panel p-4"><div className={`flex h-10 w-10 items-center justify-center rounded-xl ${tones[tone]}`}><Icon className="h-4 w-4" /></div><p className="mt-3 text-xs font-semibold uppercase tracking-[0.12em] text-moss/80">{statLabel}</p><p className="mt-2 text-2xl font-semibold text-ink">{value}</p></div>;
 }
 
-function DealCard({ deal, mode = 'fit', onSendCimRequest, requestingCim, readOnly, onRecordCimOutcome, responseOutcome = '' }) {
+function ReviewNoteList({ empty, items = [] }) {
+  return items.length ? <ul className="mt-3 list-disc space-y-2 pl-5 text-sm leading-6 text-ink/75">{items.map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}</ul> : <p className="mt-3 text-sm leading-6 text-ink/60">{empty}</p>;
+}
+
+function OpportunityReview({ deal, onClose }) {
+  const listing = safeUrl(deal.listingUrl);
+  const details = [
+    ['Industry', deal.industry],
+    ['Location', deal.location],
+    ['Annual profit', Number.isFinite(deal.annualProfit) ? money(deal.annualProfit) : 'Not disclosed'],
+    ['Annual revenue', Number.isFinite(deal.annualRevenue) ? money(deal.annualRevenue) : 'Not disclosed'],
+    ['Asking price', Number.isFinite(deal.askingPrice) ? money(deal.askingPrice) : 'Not disclosed'],
+    ['Profit multiple', Number.isFinite(deal.profitMultiple) ? `${deal.profitMultiple}x` : 'Not disclosed'],
+    ['Years established', Number.isFinite(deal.yearsEstablished) ? deal.yearsEstablished : 'Not disclosed'],
+    ['Broker', deal.brokerName || deal.brokerCompany],
+    ['Broker email', deal.brokerEmail],
+    ['Broker contact', deal.brokerContact],
+    ['First seen', deal.firstSeenAt ? dateTime(deal.firstSeenAt) : 'Not recorded'],
+    ['Last reviewed', deal.lastSeenAt ? dateTime(deal.lastSeenAt) : 'Not recorded'],
+  ].filter(([, value]) => value);
+
+  useEffect(() => {
+    const closeOnEscape = (event) => {
+      if (event.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', closeOnEscape);
+    return () => document.removeEventListener('keydown', closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div aria-labelledby="opportunity-review-title" aria-modal="true" className="fixed inset-0 z-50 flex items-end justify-center bg-ink/45 p-0 backdrop-blur-[2px] sm:items-center sm:p-6" role="dialog">
+      <button aria-label="Close review backdrop" className="absolute inset-0 cursor-default" onClick={onClose} type="button" />
+      <article className="relative z-10 max-h-[94vh] w-full max-w-4xl overflow-y-auto rounded-t-3xl border border-line bg-cream shadow-2xl sm:max-h-[90vh] sm:rounded-3xl">
+        <header className="sticky top-0 z-10 flex items-start justify-between gap-4 border-b border-line bg-cream/95 px-5 py-4 backdrop-blur sm:px-7">
+          <div className="min-w-0">
+            <div className="flex flex-wrap gap-2"><Pill tone={deal.score >= 70 ? 'success' : deal.score >= 55 ? 'warning' : 'danger'}>Score {deal.score}</Pill>{deal.isNew ? <Pill tone="success">New</Pill> : null}<Pill>{deal.sourceName}</Pill></div>
+            <h2 className="mt-3 text-xl font-semibold leading-snug text-ink sm:text-2xl" id="opportunity-review-title">{deal.name}</h2>
+          </div>
+          <button aria-label="Close opportunity review" className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:text-moss" onClick={onClose} type="button"><X className="h-5 w-5" /></button>
+        </header>
+        <div className="space-y-6 px-5 py-6 sm:px-7 sm:py-7">
+          <section>
+            <SectionLabel>Review notes</SectionLabel>
+            <p className="mt-3 rounded-2xl border border-moss/15 bg-white px-4 py-3 text-sm leading-7 text-ink/78">{deal.recommendation || 'No overall recommendation was recorded in this review.'}</p>
+          </section>
+
+          <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {details.map(([detailLabel, value]) => <div className="rounded-2xl border border-line bg-white/80 p-4" key={detailLabel}><p className="text-xs font-semibold uppercase tracking-[0.12em] text-moss/80">{detailLabel}</p><p className="mt-2 break-words text-sm leading-6 text-ink">{value}</p></div>)}
+          </section>
+
+          <div className="grid gap-5 lg:grid-cols-2">
+            <section className="rounded-2xl border border-moss/15 bg-moss/5 p-5">
+              <h3 className="font-semibold text-ink">Why it scored</h3>
+              <ReviewNoteList empty="No strengths were recorded in this review." items={deal.strengths} />
+            </section>
+            <section className="rounded-2xl border border-amber-200 bg-amber-50/70 p-5">
+              <h3 className="font-semibold text-ink">Concerns to validate</h3>
+              <ReviewNoteList empty="No concerns were recorded in this review." items={deal.concerns?.length ? deal.concerns : deal.removeReasons} />
+            </section>
+          </div>
+
+          <section className="rounded-2xl border border-sky-200 bg-sky-50/70 p-5">
+            <h3 className="font-semibold text-ink">Questions for the broker or seller</h3>
+            <ReviewNoteList empty="No diligence questions were generated in this review." items={deal.questions} />
+          </section>
+
+          <div className="flex flex-col gap-3 border-t border-line pt-5 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-sm leading-6 text-ink/60">The broker listing opens in a new tab.</p>
+            {listing ? <a className={primaryButton} href={listing} rel="noreferrer" target="_blank"><ExternalLink className="h-4 w-4" />Original broker listing</a> : <span className="text-sm font-semibold text-ink/55">Original broker listing unavailable</span>}
+          </div>
+        </div>
+      </article>
+    </div>
+  );
+}
+
+function DealCard({ deal, mode = 'fit', onOpenDeal, onSendCimRequest, requestingCim, readOnly, onRecordCimOutcome, responseOutcome = '' }) {
   const items = mode === 'remove' ? deal.removeReasons || deal.concerns || [] : deal.strengths || [];
   const listing = safeUrl(deal.listingUrl);
   const request = deal.cimRequest || {};
@@ -103,7 +179,7 @@ function DealCard({ deal, mode = 'fit', onSendCimRequest, requestingCim, readOnl
   return (
     <article className={`min-w-0 rounded-2xl border p-4 sm:p-5 ${background}`}>
       <div className="flex flex-wrap gap-2"><Pill tone={deal.score >= 70 ? 'success' : deal.score >= 55 ? 'warning' : 'danger'}>Score {deal.score}</Pill>{deal.isNew ? <Pill tone="success">New</Pill> : null}<Pill>{deal.sourceName}</Pill></div>
-      <h3 className="mt-3 text-lg font-semibold leading-snug">{deal.name}</h3>
+      <h3 className="mt-3 text-lg font-semibold leading-snug"><button className="text-left underline decoration-current/30 underline-offset-4 transition hover:text-moss" onClick={() => onOpenDeal?.(deal)} type="button">{deal.name}</button></h3>
       {meta.length ? <p className="mt-2 text-sm leading-6">{meta.join(' | ')}</p> : null}
       {deal.recommendation ? <p className="mt-3 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-6">{deal.recommendation}</p> : null}
       {mode !== 'remove' && deal.score >= 75 ? (
@@ -119,13 +195,13 @@ function DealCard({ deal, mode = 'fit', onSendCimRequest, requestingCim, readOnl
       ) : null}
       {items.length ? <ul className="mt-3 list-disc space-y-1 pl-5 text-sm leading-6">{items.slice(0, 3).map((item) => <li key={`${deal.id}-${item}`}>{item}</li>)}</ul> : null}
       {deal.questions?.length ? <div className="mt-4 rounded-2xl border border-current/15 bg-white/60 p-4 text-sm leading-6"><strong className="uppercase tracking-[0.14em]">Questions</strong><ul className="mt-2 list-disc space-y-1 pl-5">{deal.questions.slice(0, 2).map((question) => <li key={`${deal.id}-${question}`}>{question}</li>)}</ul></div> : null}
-      {listing ? <a className="mt-4 inline-flex text-sm font-semibold text-moss underline" href={listing} rel="noreferrer" target="_blank">View listing</a> : null}
+      <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2"><button className="inline-flex text-sm font-semibold text-moss underline" onClick={() => onOpenDeal?.(deal)} type="button">View opportunity review</button>{listing ? <a className="inline-flex items-center gap-1.5 text-sm font-semibold text-moss underline" href={listing} rel="noreferrer" target="_blank">Original broker listing<ExternalLink className="h-3.5 w-3.5" /></a> : null}</div>
     </article>
   );
 }
 
-function DealColumn({ title, deals, mode, empty, onSendCimRequest, readOnly, requestingCimDealKey, onRecordCimOutcome, responseOutcomes = {} }) {
-  return <div><div className="mb-3 flex items-center justify-between"><SectionLabel>{title}</SectionLabel><Pill tone={mode === 'remove' ? 'danger' : mode === 'watch' ? 'warning' : 'success'}>{deals.length}</Pill></div><div className="space-y-4">{deals.slice(0, 4).map((deal) => <DealCard deal={deal} key={`${title}-${deal.sourceName}-${deal.dealKey || deal.id || deal.listingUrl}`} mode={mode} onRecordCimOutcome={onRecordCimOutcome} onSendCimRequest={onSendCimRequest} readOnly={readOnly} requestingCim={requestingCimDealKey === deal.dealKey} responseOutcome={responseOutcomes[deal.dealKey]} />)}{deals.length === 0 ? <p className="text-sm text-ink/68">{empty}</p> : null}</div></div>;
+function DealColumn({ title, deals, mode, empty, onOpenDeal, onSendCimRequest, readOnly, requestingCimDealKey, onRecordCimOutcome, responseOutcomes = {} }) {
+  return <div><div className="mb-3 flex items-center justify-between"><SectionLabel>{title}</SectionLabel><Pill tone={mode === 'remove' ? 'danger' : mode === 'watch' ? 'warning' : 'success'}>{deals.length}</Pill></div><div className="space-y-4">{deals.slice(0, 4).map((deal) => <DealCard deal={deal} key={`${title}-${deal.sourceName}-${deal.dealKey || deal.id || deal.listingUrl}`} mode={mode} onOpenDeal={onOpenDeal} onRecordCimOutcome={onRecordCimOutcome} onSendCimRequest={onSendCimRequest} readOnly={readOnly} requestingCim={requestingCimDealKey === deal.dealKey} responseOutcome={responseOutcomes[deal.dealKey]} />)}{deals.length === 0 ? <p className="text-sm text-ink/68">{empty}</p> : null}</div></div>;
 }
 
 function cimReadyDeals(review) {
@@ -143,7 +219,7 @@ function cimReadyDeals(review) {
   return ready;
 }
 
-function CimApprovalQueue({ review, readOnly, sending, onSendApproved }) {
+function CimApprovalQueue({ review, readOnly, sending, onOpenDeal, onSendApproved }) {
   const deals = useMemo(() => cimReadyDeals(review), [review]);
   const [decisions, setDecisions] = useState({});
 
@@ -185,8 +261,8 @@ function CimApprovalQueue({ review, readOnly, sending, onSendApproved }) {
               <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(260px,0.7fr)_auto] lg:items-center">
                 <div className="min-w-0">
                   <div className="flex flex-wrap gap-2"><Pill tone="success">Score {deal.score}</Pill>{deal.annualProfit ? <Pill>{money(deal.annualProfit)} profit</Pill> : null}</div>
-                  <h4 className="mt-2 font-semibold leading-6 text-ink">{deal.name}</h4>
-                  {safeUrl(deal.listingUrl) ? <a className="mt-1 inline-flex text-sm font-semibold text-moss underline" href={safeUrl(deal.listingUrl)} rel="noreferrer" target="_blank">View listing</a> : null}
+                  <h4 className="mt-2 font-semibold leading-6 text-ink"><button className="text-left underline decoration-ink/25 underline-offset-4 transition hover:text-moss" onClick={() => onOpenDeal?.(deal)} type="button">{deal.name}</button></h4>
+                  <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1"><button className="inline-flex text-sm font-semibold text-moss underline" onClick={() => onOpenDeal?.(deal)} type="button">View opportunity review</button>{safeUrl(deal.listingUrl) ? <a className="inline-flex items-center gap-1.5 text-sm font-semibold text-moss underline" href={safeUrl(deal.listingUrl)} rel="noreferrer" target="_blank">Original broker listing<ExternalLink className="h-3.5 w-3.5" /></a> : null}</div>
                 </div>
                 <label className="text-sm font-semibold text-ink">
                   Broker recipient
@@ -240,6 +316,7 @@ export default function DealHunterWorkspace({
   review, loading, sending, bulkSending, followUpRunning, requestingCimDealKey, feedback = {}, readOnly,
   emailTestSending, onReview, onOpenApprovals, onSendReady, onRunFollowUps, onSendEmail, onSendCimRequest, onSendEmailTest, onRecordCimOutcome,
 }) {
+  const [selectedDeal, setSelectedDeal] = useState(null);
   const busy = loading || sending || bulkSending || followUpRunning;
   const emailReadiness = review?.emailReadiness;
   const outboundReady = emailReadiness ? emailReadiness.outboundConfigured : true;
@@ -249,12 +326,13 @@ export default function DealHunterWorkspace({
       <Reveal className="panel p-5 sm:p-6">
         <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between"><div><SectionLabel>Deal Hunter Scoring</SectionLabel><h2 className="mt-2 text-2xl font-semibold text-ink">Daily source review</h2><p className="mt-2 max-w-3xl text-sm leading-7 text-ink/68">Pulls configured deal sources, scores recent listings against the acquisition profile, and manages CIM outreach.</p></div><div className="flex flex-wrap gap-2"><button className={secondaryButton} disabled={busy} onClick={onReview} type="button"><RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />{loading ? 'Reviewing…' : 'Review Sources'}</button>{!readOnly ? <><button className={primaryButton} disabled={busy || !outboundReady || !review?.totals?.cimReady} onClick={onOpenApprovals} type="button"><ClipboardList className="h-4 w-4" />Review CIM Requests</button><button className={secondaryButton} disabled={busy || !followUpsSafe} onClick={onRunFollowUps} type="button"><MailCheck className="h-4 w-4" />{followUpRunning ? 'Checking…' : followUpsSafe ? 'Run Follow-Ups' : 'Follow-Ups Paused'}</button><button className={secondaryButton} disabled={busy || !outboundReady} onClick={onSendEmail} type="button"><Send className="h-4 w-4" />{sending ? 'Sending…' : 'Send Daily Email'}</button></> : null}</div></div>
         {feedback.error ? <p className="mt-5 rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-700" role="alert">{feedback.error}</p> : null}{feedback.message ? <p className="mt-5 rounded-2xl border border-moss/20 bg-moss/8 p-4 text-sm text-moss" role="status">{feedback.message}</p> : null}
-        {review ? <div className="mt-7 space-y-7"><CimApprovalQueue onSendApproved={onSendReady} readOnly={readOnly} review={review} sending={bulkSending} />{review.cimAutomation ? <section className="rounded-2xl border border-line bg-fog/70 p-5"><div className="flex flex-wrap items-center gap-2"><strong>CIM automation</strong><Pill tone={review.cimAutomation.paused ? 'danger' : 'info'}>Stage {review.cimAutomation.effectiveStage || 1}{review.cimAutomation.paused ? ' paused' : ''}</Pill><Pill>{review.cimAutomation.metrics?.reviewed || 0} reviewed</Pill><Pill>{review.cimAutomation.metrics?.approvalRate || 0}% approved</Pill></div>{review.cimAutomation.run?.exceptions?.length ? <details className="mt-3"><summary className="cursor-pointer text-sm font-semibold text-ink">{review.cimAutomation.run.exceptions.length} automation exception(s) require review</summary><ul className="mt-3 space-y-2 text-sm text-ink/70">{review.cimAutomation.run.exceptions.slice(0, 25).map((item) => <li className="rounded-xl border border-line bg-white p-3" key={`exception-${item.dealKey}`}><strong>{item.name}</strong><p className="mt-1">{item.reasons.join(' · ')}</p></li>)}</ul></details> : null}</section> : null}<EmailReadinessPanel data={emailReadiness} onSendTest={readOnly ? undefined : onSendEmailTest} testSending={emailTestSending} /><div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-7"><Stat icon={ClipboardList} label="Reviewed" value={review.totals?.reviewedDeals || 0} /><Stat icon={BellRing} label="New Fits" value={review.totals?.newMatches || 0} tone="warning" /><Stat icon={MailCheck} label="High Fit" value={review.totals?.qualified || 0} tone="warning" /><Stat icon={Send} label="CIM Ready" value={review.totals?.cimReady || 0} tone="warning" /><Stat icon={Inbox} label="Watchlist" value={review.totals?.watchlist || 0} /><Stat icon={ShieldAlert} label="Remove" value={review.totals?.removalCandidates || 0} tone="danger" /><Stat icon={CalendarClock} label="Lookback" value={`${review.lookbackDays || 0}d`} /></div>
+        {review ? <div className="mt-7 space-y-7"><CimApprovalQueue onOpenDeal={setSelectedDeal} onSendApproved={onSendReady} readOnly={readOnly} review={review} sending={bulkSending} />{review.cimAutomation ? <section className="rounded-2xl border border-line bg-fog/70 p-5"><div className="flex flex-wrap items-center gap-2"><strong>CIM automation</strong><Pill tone={review.cimAutomation.paused ? 'danger' : 'info'}>Stage {review.cimAutomation.effectiveStage || 1}{review.cimAutomation.paused ? ' paused' : ''}</Pill><Pill>{review.cimAutomation.metrics?.reviewed || 0} reviewed</Pill><Pill>{review.cimAutomation.metrics?.approvalRate || 0}% approved</Pill></div>{review.cimAutomation.run?.exceptions?.length ? <details className="mt-3"><summary className="cursor-pointer text-sm font-semibold text-ink">{review.cimAutomation.run.exceptions.length} automation exception(s) require review</summary><ul className="mt-3 space-y-2 text-sm text-ink/70">{review.cimAutomation.run.exceptions.slice(0, 25).map((item) => <li className="rounded-xl border border-line bg-white p-3" key={`exception-${item.dealKey}`}><strong>{item.name}</strong><p className="mt-1">{item.reasons.join(' · ')}</p></li>)}</ul></details> : null}</section> : null}<EmailReadinessPanel data={emailReadiness} onSendTest={readOnly ? undefined : onSendEmailTest} testSending={emailTestSending} /><div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-7"><Stat icon={ClipboardList} label="Reviewed" value={review.totals?.reviewedDeals || 0} /><Stat icon={BellRing} label="New Fits" value={review.totals?.newMatches || 0} tone="warning" /><Stat icon={MailCheck} label="High Fit" value={review.totals?.qualified || 0} tone="warning" /><Stat icon={Send} label="CIM Ready" value={review.totals?.cimReady || 0} tone="warning" /><Stat icon={Inbox} label="Watchlist" value={review.totals?.watchlist || 0} /><Stat icon={ShieldAlert} label="Remove" value={review.totals?.removalCandidates || 0} tone="danger" /><Stat icon={CalendarClock} label="Lookback" value={`${review.lookbackDays || 0}d`} /></div>
           {review.dailyEmailJob ? <div className="rounded-2xl border border-line bg-fog/70 p-4 text-sm text-ink/72"><p><strong>Today&apos;s daily email:</strong> {label(review.dailyEmailJob.status)} · attempt {review.dailyEmailJob.attempt_count || 1}{review.dailyEmailJob.completed_at ? ` · completed ${dateTime(review.dailyEmailJob.completed_at)}` : ''}</p>{review.dailyEmailJob.last_error ? <p className="mt-2 text-red-700">{review.dailyEmailJob.last_error}</p> : null}</div> : null}
           <div className="grid gap-4 lg:grid-cols-2"><div className="rounded-2xl border border-line bg-fog/70 p-5"><SectionLabel>Sources</SectionLabel><div className="mt-4 space-y-3">{(review.sources || []).map((source) => <div className="rounded-2xl border border-line bg-white/75 p-4 text-sm" key={source.id}><div className="flex flex-wrap gap-2"><strong>{source.name}</strong><Pill tone={source.fetched ? 'success' : 'danger'}>{source.fetched ? `${source.rowCount || 0} rows` : 'failed'}</Pill><Pill>{source.mode}</Pill></div>{source.error ? <p className="mt-2 text-red-700">{source.error}</p> : null}</div>)}</div></div><div className="rounded-2xl border border-line bg-white/70 p-5"><SectionLabel>Criteria Notes</SectionLabel>{review.criteriaRecommendations?.length ? <ul className="mt-4 list-disc space-y-2 pl-5 text-sm leading-7 text-ink/74">{review.criteriaRecommendations.map((item) => <li key={item}>{item}</li>)}</ul> : <p className="mt-4 text-sm text-ink/68">No criteria changes recommended.</p>}</div></div>
-          {review.newlySeenMatches?.length ? <div><div className="mb-3 flex justify-between"><SectionLabel>Newly Seen Fits</SectionLabel><Pill tone="success">{review.newlySeenMatches.length}</Pill></div><div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">{review.newlySeenMatches.slice(0, 6).map((deal) => <DealCard deal={deal} key={`new-${deal.dealKey}`} onSendCimRequest={onSendCimRequest} readOnly={readOnly} requestingCim={requestingCimDealKey === deal.dealKey} />)}</div></div> : null}
-          <div className="grid gap-5 xl:grid-cols-3"><DealColumn deals={review.qualified || []} empty="No high-fit recent listings found." onRecordCimOutcome={onRecordCimOutcome} onSendCimRequest={onSendCimRequest} readOnly={readOnly} requestingCimDealKey={requestingCimDealKey} responseOutcomes={review.cimAutomation?.metrics?.responseOutcomes} title="High Fit" /><DealColumn deals={review.watchlist || []} empty="No watchlist listings found." mode="watch" onRecordCimOutcome={onRecordCimOutcome} onSendCimRequest={onSendCimRequest} readOnly={readOnly} requestingCimDealKey={requestingCimDealKey} responseOutcomes={review.cimAutomation?.metrics?.responseOutcomes} title="Watchlist" /><DealColumn deals={review.removalCandidates || []} empty="No removal candidates found." mode="remove" title="Remove" /></div></div> : <p className="mt-6 rounded-2xl border border-line bg-fog/70 p-4 text-sm text-ink/70">No source review loaded yet. Review sources before sending CIM requests.</p>}
+          {review.newlySeenMatches?.length ? <div><div className="mb-3 flex justify-between"><SectionLabel>Newly Seen Fits</SectionLabel><Pill tone="success">{review.newlySeenMatches.length}</Pill></div><div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">{review.newlySeenMatches.slice(0, 6).map((deal) => <DealCard deal={deal} key={`new-${deal.dealKey}`} onOpenDeal={setSelectedDeal} onSendCimRequest={onSendCimRequest} readOnly={readOnly} requestingCim={requestingCimDealKey === deal.dealKey} />)}</div></div> : null}
+          <div className="grid gap-5 xl:grid-cols-3"><DealColumn deals={review.qualified || []} empty="No high-fit recent listings found." onOpenDeal={setSelectedDeal} onRecordCimOutcome={onRecordCimOutcome} onSendCimRequest={onSendCimRequest} readOnly={readOnly} requestingCimDealKey={requestingCimDealKey} responseOutcomes={review.cimAutomation?.metrics?.responseOutcomes} title="High Fit" /><DealColumn deals={review.watchlist || []} empty="No watchlist listings found." mode="watch" onOpenDeal={setSelectedDeal} onRecordCimOutcome={onRecordCimOutcome} onSendCimRequest={onSendCimRequest} readOnly={readOnly} requestingCimDealKey={requestingCimDealKey} responseOutcomes={review.cimAutomation?.metrics?.responseOutcomes} title="Watchlist" /><DealColumn deals={review.removalCandidates || []} empty="No removal candidates found." mode="remove" onOpenDeal={setSelectedDeal} title="Remove" /></div></div> : <p className="mt-6 rounded-2xl border border-line bg-fog/70 p-4 text-sm text-ink/70">No source review loaded yet. Review sources before sending CIM requests.</p>}
       </Reveal>
+      {selectedDeal ? <OpportunityReview deal={selectedDeal} onClose={() => setSelectedDeal(null)} /> : null}
     </section>
   );
 }
