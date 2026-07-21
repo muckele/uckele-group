@@ -60,7 +60,11 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     expect(within(dialog).getByText('Customer concentration needs validation.')).toBeVisible();
     expect(within(dialog).getByText('What does the owner do each week?')).toBeVisible();
     expect(within(dialog).getByText('Jamie Broker')).toBeVisible();
-    expect(within(dialog).getByRole('link', { name: 'Original broker listing' })).toHaveAttribute('href', 'https://broker.example/listings/recurring-hvac');
+    const listingButton = within(dialog).getByRole('link', { name: 'View original listing' });
+    expect(listingButton).toHaveAttribute('href', 'https://broker.example/listings/recurring-hvac');
+    expect(listingButton).toHaveAttribute('target', '_blank');
+    expect(listingButton).toHaveAttribute('rel', 'noreferrer');
+    expect(within(dialog).queryByText('https://broker.example/listings/recurring-hvac')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Close opportunity review' }));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
@@ -74,7 +78,26 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Recurring HVAC Services' }));
 
     expect(screen.getByText('Original broker listing unavailable')).toBeVisible();
-    expect(screen.queryByRole('link', { name: 'Original broker listing' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'View original listing' })).not.toBeInTheDocument();
+  });
+
+  test('shows recovered listing-link coverage and non-fatal workbook warnings', () => {
+    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    review.sources = [{
+      id: 'sheet-0',
+      name: 'SMB Deal Hunter Google Sheet',
+      mode: 'csv',
+      fetched: true,
+      rowCount: 871,
+      listingUrlCount: 302,
+      listingUrlWarning: 'Workbook export timed out; CSV deals were still imported.',
+    }];
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onReview={vi.fn()} review={review} />);
+
+    expect(screen.getByText('302 original listing links recovered.')).toBeVisible();
+    expect(screen.getByText(/Listing-link import warning: Workbook export timed out/)).toBeVisible();
+    expect(screen.getByText('871 rows')).toBeVisible();
   });
 
   test('keeps an in-progress follow-up in the warning state with its schedule', () => {

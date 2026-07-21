@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { eventMatchesCimRequest, parseSheetCsvDeals, scoreDeal } from '../server/services/dealHunter.js';
+import { strToU8, zipSync } from 'fflate';
+import {
+  buildGoogleSheetWorkbookUrl,
+  eventMatchesCimRequest,
+  extractGoogleSheetListingUrls,
+  parseSheetCsvDeals,
+  scoreDeal,
+} from '../server/services/dealHunter.js';
 import { normalizeResendTagToken } from '../server/services/delivery.js';
 
 function baseDeal(overrides = {}) {
@@ -216,6 +223,119 @@ test('Google Sheet CSV parsing caps rows before normalizing source deals', () =>
   assert.equal(result.deals.length, 2);
   assert.equal(result.deals[0].name, 'Commercial HVAC Maintenance Co');
   assert.equal(result.deals[1].name, 'Commercial Plumbing Service');
+});
+
+test('Google Sheet workbook extraction maps View Listing hyperlinks onto CSV deals', () => {
+  const sharedStrings = [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">',
+    '<si><t>Name</t></si><si><t>View Listing</t></si>',
+    '<si><t>Alpha HVAC</t></si><si><t>Beta Plumbing</t></si><si><t>Unsafe Listing</t></si>',
+    '</sst>',
+  ].join('');
+  const worksheet = [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheetData>',
+    '<row r="4"><c r="A4" t="inlineStr"><is><t>&#9999999999;</t></is></c></row>',
+    '<row r="5"><c r="B5" t="s"><v>0</v></c><c r="V5" t="s"><v>1</v></c></row>',
+    '<row r="6"><c r="B6" t="s"><v>2</v></c><c r="V6" t="str"><f>HYPERLINK(&quot;https://broker.example/alpha?source=sheet&amp;deal=1&quot;, &quot;View Listing&quot;)</f><v>View Listing</v></c></row>',
+    '<row r="8"><c r="B8" t="s"><v>3</v></c><c r="V8" t="s"><v>1</v></c></row>',
+    '<row r="9"><c r="B9" t="s"><v>4</v></c><c r="V9" t="str"><f>HYPERLINK(&quot;javascript:alert(1)&quot;, &quot;View Listing&quot;)</f><v>View Listing</v></c></row>',
+    '</sheetData><hyperlinks><hyperlink ref="V8" r:id="rId1"/><hyperlink ref="V9" r:id="rId2"/></hyperlinks></worksheet>',
+  ].join('');
+  const relationships = [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://broker.example/beta" TargetMode="External"/>',
+    '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://broker.example/should-not-be-used" TargetMode="Internal"/>',
+    '</Relationships>',
+  ].join('');
+  const workbook = zipSync({
+    'xl/sharedStrings.xml': strToU8(sharedStrings),
+    'xl/worksheets/sheet1.xml': strToU8(worksheet),
+    'xl/worksheets/_rels/sheet1.xml.rels': strToU8(relationships),
+  });
+  const extracted = extractGoogleSheetListingUrls(workbook);
+
+  assert.equal(extracted.headerRow, 5);
+  assert.equal(extracted.listingColumn, 'V');
+  assert.equal(extracted.listingUrlsByRow.get(0), 'https://broker.example/alpha?source=sheet&deal=1');
+  assert.equal(extracted.listingUrlsByRow.get(1), 'https://broker.example/beta');
+  assert.equal(extracted.listingUrlsByRow.has(2), false);
+
+  const csv = [
+    'Name,Listing,View Listing',
+    'Alpha HVAC,Descriptive listing title,View Listing',
+    'Beta Plumbing,Another listing title,View Listing',
+    'Unsafe Listing,Unsafe listing title,View Listing',
+  ].join('\n');
+  const parsed = parseSheetCsvDeals(csv, 0, Infinity, extracted.listingUrlsByRow);
+
+  assert.equal(parsed.deals[0].listingUrl, 'https://broker.example/alpha?source=sheet&deal=1');
+  assert.equal(parsed.deals[1].listingUrl, 'https://broker.example/beta');
+  assert.equal(parsed.deals[2].listingUrl, '');
+});
+
+test('Google Sheet workbook extraction selects the worksheet matching the CSV rows', () => {
+  const worksheet = (name, listingUrl) => [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>',
+    '<row r="1"><c r="B1" t="inlineStr"><is><t>Business Name</t></is></c><c r="V1" t="inlineStr"><is><t>View Listing</t></is></c></row>',
+    `<row r="2"><c r="B2" t="inlineStr"><is><t>${name}</t></is></c><c r="V2" t="str"><f>HYPERLINK(&quot;${listingUrl}&quot;, &quot;View Listing&quot;)</f><v>View Listing</v></c></row>`,
+    '</sheetData></worksheet>',
+  ].join('');
+  const workbook = zipSync({
+    'xl/worksheets/sheet1.xml': strToU8(worksheet('Archived Deal', 'https://broker.example/archive')),
+    'xl/worksheets/sheet2.xml': strToU8(worksheet('Current Deal', 'https://broker.example/current')),
+  });
+  const expectedRows = [{ 'Business Name': 'Current Deal', 'View Listing': 'View Listing' }];
+  const extracted = extractGoogleSheetListingUrls(workbook, expectedRows);
+
+  assert.equal(extracted.listingUrlsByRow.get(0), 'https://broker.example/current');
+  assert.throws(
+    () => extractGoogleSheetListingUrls(workbook),
+    /none uniquely matches the configured CSV source/i,
+  );
+});
+
+test('Google Sheet workbook extraction skips hidden duplicate rows instead of shifting their links', () => {
+  const row = (number, description, listingUrl) => [
+    `<row r="${number}">`,
+    `<c r="B${number}" t="inlineStr"><is><t>Repeated Deal</t></is></c>`,
+    `<c r="C${number}" t="inlineStr"><is><t>${description}</t></is></c>`,
+    `<c r="V${number}" t="str"><f>HYPERLINK(&quot;${listingUrl}&quot;, &quot;View Listing&quot;)</f><v>View Listing</v></c>`,
+    '</row>',
+  ].join('');
+  const worksheet = [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>',
+    '<row r="1"><c r="B1" t="inlineStr"><is><t>Business Name</t></is></c><c r="C1" t="inlineStr"><is><t>Description</t></is></c><c r="V1" t="inlineStr"><is><t>View Listing</t></is></c></row>',
+    row(2, 'Visible alpha location', 'https://broker.example/alpha'),
+    row(3, 'Hidden workbook-only location', 'https://broker.example/hidden'),
+    row(4, 'Visible beta location', 'https://broker.example/beta'),
+    '</sheetData></worksheet>',
+  ].join('');
+  const workbook = zipSync({ 'xl/worksheets/sheet1.xml': strToU8(worksheet) });
+  const expectedRows = [
+    { 'Business Name': 'Repeated Deal', Description: 'Visible alpha location', 'Annual Profit': '$100,000' },
+    { 'Business Name': 'Repeated Deal', Description: 'Visible beta location', 'Annual Profit': '$120,000' },
+  ];
+  const extracted = extractGoogleSheetListingUrls(workbook, expectedRows);
+
+  assert.equal(extracted.listingUrlsByRow.get(0), 'https://broker.example/alpha');
+  assert.equal(extracted.listingUrlsByRow.get(1), 'https://broker.example/beta');
+  assert.equal([...extracted.listingUrlsByRow.values()].includes('https://broker.example/hidden'), false);
+  assert.equal(extracted.unmatchedListingUrlCount, 1);
+});
+
+test('Google Sheet workbook URL derivation preserves the selected tab and rejects filtered queries', () => {
+  assert.equal(
+    buildGoogleSheetWorkbookUrl('https://docs.google.com/spreadsheets/d/sheet-id/gviz/tq?tqx=out:csv&gid=123'),
+    'https://docs.google.com/spreadsheets/d/sheet-id/export?format=xlsx&gid=123',
+  );
+  assert.equal(buildGoogleSheetWorkbookUrl('https://docs.google.com/spreadsheets/d/sheet-id/gviz/tq?tq=select+A&gid=123'), '');
+  assert.equal(buildGoogleSheetWorkbookUrl('https://docs.google.com/spreadsheets/d/sheet-id/gviz/tq?headers=2&gid=123'), '');
+  assert.equal(buildGoogleSheetWorkbookUrl('https://example.com/deals.csv'), '');
 });
 
 test('Google Sheet parsing preserves, ranks, and deduplicates multiple broker contacts', async () => {

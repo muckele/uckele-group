@@ -1,6 +1,7 @@
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { sha256, signPayload, verifySignedPayload } from '../utils/security.js';
+import { strFromU8, unzipSync } from 'fflate';
 import {
   buildCimReplyToAddress,
   buildDealHunterCimRequestEmail,
@@ -20,6 +21,8 @@ import {
 } from './cimAutomation.js';
 
 const defaultTimeoutMs = 45000;
+const sheetWorkbookExpandedMaxBytes = 32 * 1024 * 1024;
+const sheetWorkbookEntryMaxBytes = 16 * 1024 * 1024;
 const cimRequestScoreThreshold = 75;
 const highFitScoreThreshold = 75;
 const watchlistScoreThreshold = 60;
@@ -579,7 +582,7 @@ function formatLocation({ city, county, state, country }) {
 }
 
 function normalizeDealRecord(rawRow = {}, source = {}) {
-  const listing = getField(rawRow, ['Listing', 'Listing URL', 'URL', 'Link', 'Deal Link', 'Business URL']);
+  const listing = getField(rawRow, ['Original Broker Listing URL', 'Listing URL', 'URL', 'Link', 'Deal Link', 'Business URL', 'View Listing', 'Listing']);
   const listingUrl = normalizeUrl(listing?.url || listing);
   const city = normalizeText(getField(rawRow, ['City']), 80);
   const county = normalizeText(getField(rawRow, ['County']), 120);
@@ -986,11 +989,458 @@ function parseCsvRows(csvText = '') {
     headers.reduce((record, header, index) => {
       record[header] = normalizeText(values[index] || '', 5000);
       return record;
-    }, {}),
+    }, Object.create(null)),
   );
 }
 
-function formatPayloadLimitError(byteLength, maxBytes) {
+function decodeXmlCodePoint(code = '', radix = 10) {
+  const value = Number.parseInt(code, radix);
+
+  if (!Number.isInteger(value) || value < 0 || value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff)) {
+    return '\ufffd';
+  }
+
+  return String.fromCodePoint(value);
+}
+
+function decodeXmlEntities(value = '') {
+  return String(value || '')
+    .replace(/&#(\d+);/g, (_match, code) => decodeXmlCodePoint(code))
+    .replace(/&#x([\da-f]+);/gi, (_match, code) => decodeXmlCodePoint(code, 16))
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+function getXmlAttribute(attributes = '', name = '') {
+  for (const match of String(attributes || '').matchAll(/([:\w.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)) {
+    if (match[1] === name) return decodeXmlEntities(match[2] ?? match[3] ?? '');
+  }
+
+  return '';
+}
+
+function extractXmlTextRuns(xml = '') {
+  return [...String(xml || '').matchAll(/<t(?:\s[^>]*)?>([\s\S]*?)<\/t>/g)]
+    .map((match) => decodeXmlEntities(match[1]))
+    .join('');
+}
+
+function parseWorksheetCells(worksheetXml = '', sharedStrings = []) {
+  return [...String(worksheetXml || '').matchAll(/<c\b([^>]*)>([\s\S]*?)<\/c>/g)].map((match) => {
+    const attributes = match[1];
+    const body = match[2];
+    const ref = getXmlAttribute(attributes, 'r').toUpperCase();
+    const type = getXmlAttribute(attributes, 't');
+    const rawValue = body.match(/<v>([\s\S]*?)<\/v>/)?.[1] || '';
+    const value = type === 's'
+      ? sharedStrings[Number(rawValue)] || ''
+      : type === 'inlineStr'
+        ? extractXmlTextRuns(body)
+        : decodeXmlEntities(rawValue);
+    const formula = decodeXmlEntities(body.match(/<f(?:\s[^>]*)?>([\s\S]*?)<\/f>/)?.[1] || '');
+
+    return { formula, ref, value };
+  });
+}
+
+function extractHyperlinkFormulaTarget(formula = '') {
+  const target = String(formula || '').match(/HYPERLINK\(\s*"((?:""|[^"])*)"/i)?.[1] || '';
+  return target.replace(/""/g, '"');
+}
+
+function worksheetColumn(ref = '') {
+  return String(ref || '').toUpperCase().match(/^[A-Z]+/)?.[0] || '';
+}
+
+function worksheetColumnIndex(ref = '') {
+  return [...worksheetColumn(ref)].reduce((index, character) => index * 26 + character.charCodeAt(0) - 64, 0);
+}
+
+function parseWorksheetRelationshipTargets(relationshipsXml = '') {
+  const targets = new Map();
+
+  for (const match of String(relationshipsXml || '').matchAll(/<Relationship\b([^>]*)\/?\s*>/g)) {
+    const attributes = match[1];
+    const type = getXmlAttribute(attributes, 'Type');
+    const id = getXmlAttribute(attributes, 'Id');
+    const target = getXmlAttribute(attributes, 'Target');
+    const targetMode = getXmlAttribute(attributes, 'TargetMode');
+
+    if (id && target && type.endsWith('/hyperlink') && targetMode.toLowerCase() === 'external') targets.set(id, target);
+  }
+
+  return targets;
+}
+
+function extractWorksheetListingUrls(worksheetXml = '', relationshipsXml = '', sharedStrings = []) {
+  const cells = parseWorksheetCells(worksheetXml, sharedStrings);
+  const header = cells
+    .filter((cell) => !cell.formula && normalizeComparableText(cell.value) === 'view listing')
+    .sort((left, right) => Number(left.ref.match(/\d+$/)?.[0] || Infinity) - Number(right.ref.match(/\d+$/)?.[0] || Infinity))[0];
+
+  if (!header) return null;
+
+  const listingColumn = header.ref.match(/^[A-Z]+/)?.[0] || '';
+  const headerRow = Number(header.ref.match(/\d+$/)?.[0] || 0);
+
+  if (!listingColumn || !headerRow) return null;
+
+  const cellsByRow = new Map();
+
+  for (const cell of cells) {
+    const row = Number(cell.ref.match(/\d+$/)?.[0] || 0);
+    if (row <= headerRow) continue;
+    if (!cellsByRow.has(row)) cellsByRow.set(row, []);
+    cellsByRow.get(row).push(cell);
+  }
+
+  const populatedRows = [...cellsByRow.entries()]
+    .filter(([, rowCells]) => rowCells.some((cell) => normalizeText(cell.value) !== ''))
+    .map(([row]) => row)
+    .sort((left, right) => left - right);
+  const compactIndexByRow = new Map(populatedRows.map((row, index) => [row, index]));
+  const listingUrlsByPhysicalRow = new Map();
+  const setListingUrl = (ref, value) => {
+    const normalizedRef = String(ref || '').toUpperCase();
+    if (!/^[A-Z]+\d+$/.test(normalizedRef)) return;
+    const column = worksheetColumn(normalizedRef);
+    const row = Number(normalizedRef.match(/\d+$/)?.[0] || 0);
+    const listingUrl = normalizeUrl(value);
+
+    if (column !== listingColumn || !compactIndexByRow.has(row) || !listingUrl) return;
+    if (!listingUrlsByPhysicalRow.has(row)) listingUrlsByPhysicalRow.set(row, listingUrl);
+  };
+
+  for (const cell of cells) {
+    setListingUrl(cell.ref, extractHyperlinkFormulaTarget(cell.formula));
+  }
+
+  const relationshipTargets = parseWorksheetRelationshipTargets(relationshipsXml);
+
+  for (const match of String(worksheetXml || '').matchAll(/<hyperlink\b([^>]*)\/?\s*>/g)) {
+    const attributes = match[1];
+    setListingUrl(getXmlAttribute(attributes, 'ref'), relationshipTargets.get(getXmlAttribute(attributes, 'r:id')) || '');
+  }
+
+  const listingUrlsByRow = new Map(
+    [...listingUrlsByPhysicalRow.entries()].map(([row, listingUrl]) => [compactIndexByRow.get(row), listingUrl]),
+  );
+  const headerCells = cells
+    .filter((cell) => Number(cell.ref.match(/\d+$/)?.[0] || 0) === headerRow && !cell.formula)
+    .sort((left, right) => worksheetColumnIndex(left.ref) - worksheetColumnIndex(right.ref));
+  const headersByColumn = new Map();
+  const duplicateCounts = new Map();
+  const usedHeaders = new Set();
+
+  for (const cell of headerCells) {
+    const column = worksheetColumn(cell.ref);
+    const base = normalizeText(cell.value, 160);
+    if (!column || !base) continue;
+    let count = (duplicateCounts.get(base) || 0) + 1;
+    let headerName = count === 1 ? base : `${base} ${count}`;
+
+    while (usedHeaders.has(headerName)) {
+      count += 1;
+      headerName = `${base} ${count}`;
+    }
+
+    duplicateCounts.set(base, count);
+    usedHeaders.add(headerName);
+    headersByColumn.set(column, headerName);
+  }
+
+  const rawRowsByPhysicalRow = new Map();
+  const rowNamesByIndex = new Map();
+
+  for (const [row, rowCells] of cellsByRow) {
+    const dataIndex = compactIndexByRow.get(row);
+    if (dataIndex === undefined) continue;
+    const rawRow = rowCells.reduce((record, cell) => {
+      const headerName = headersByColumn.get(worksheetColumn(cell.ref));
+      if (headerName) record[headerName] = normalizeText(cell.value, 5000);
+      return record;
+    }, Object.create(null));
+    const name = normalizeComparableText(getField(rawRow, ['Name', 'Business Name', 'Company', 'Title', 'Listing Title']));
+    rawRowsByPhysicalRow.set(row, rawRow);
+    if (name) rowNamesByIndex.set(dataIndex, name);
+  }
+
+  return {
+    headerRow,
+    listingColumn,
+    listingUrlsByPhysicalRow,
+    listingUrlsByRow,
+    rawRowsByPhysicalRow,
+    rowNamesByIndex,
+  };
+}
+
+function selectWorksheetListingUrls(candidates = [], expectedRows = []) {
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+
+  const expectedNames = expectedRows.map((row) => normalizeComparableText(
+    getField(row, ['Name', 'Business Name', 'Company', 'Title', 'Listing Title']),
+  ));
+  const requiredMatches = Math.min(3, expectedNames.filter(Boolean).length);
+  const expectedNameCounts = expectedNames.reduce((counts, name) => {
+    if (name) counts.set(name, (counts.get(name) || 0) + 1);
+    return counts;
+  }, new Map());
+  const scored = candidates.map((candidate) => {
+    const candidateNameCounts = [...candidate.rawRowsByPhysicalRow.values()].reduce((counts, row) => {
+      const name = normalizeComparableText(getField(row, ['Name', 'Business Name', 'Company', 'Title', 'Listing Title']));
+      if (name) counts.set(name, (counts.get(name) || 0) + 1);
+      return counts;
+    }, new Map());
+    const matches = [...candidateNameCounts].reduce(
+      (count, [name, occurrences]) => count + Math.min(occurrences, expectedNameCounts.get(name) || 0),
+      0,
+    );
+    return { ...candidate, matches };
+  }).sort((left, right) => right.matches - left.matches || right.listingUrlsByRow.size - left.listingUrlsByRow.size);
+
+  if (requiredMatches > 0 && scored[0].matches >= requiredMatches && scored[0].matches > scored[1].matches) {
+    return scored[0];
+  }
+
+  throw new Error('Google Sheet workbook contains multiple View Listing worksheets, but none uniquely matches the configured CSV source.');
+}
+
+function sheetRowMatchIdentity(rawRow = {}) {
+  const deal = normalizeDealRecord(rawRow);
+  const number = (value) => Number.isFinite(value) ? String(value) : '';
+  const name = normalizeComparableText(deal.name);
+  const features = {
+    industry: normalizeComparableText(deal.industry),
+    description: normalizeComparableText(deal.description),
+    city: normalizeComparableText(deal.city),
+    county: normalizeComparableText(deal.county),
+    state: normalizeComparableText(deal.state),
+    country: normalizeComparableText(deal.country),
+    annualProfit: number(deal.annualProfit),
+    annualRevenue: number(deal.annualRevenue),
+    askingPrice: number(deal.askingPrice),
+    yearsEstablished: number(deal.yearsEstablished),
+    brokerName: normalizeComparableText(deal.brokerName),
+    brokerEmail: normalizeEmail(deal.brokerEmail),
+  };
+  const strongKey = [name, ...Object.values(features)].join('\u001f');
+
+  return { features, name, strongKey };
+}
+
+function groupSheetRows(items = [], identityKey) {
+  return items.reduce((groups, item) => {
+    const key = identityKey(item);
+    if (key === undefined || key === null || key === '') return groups;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+    return groups;
+  }, new Map());
+}
+
+function sheetRowSimilarity(left = {}, right = {}) {
+  const weights = {
+    industry: 4,
+    description: 12,
+    city: 4,
+    county: 3,
+    state: 2,
+    country: 1,
+    annualProfit: 6,
+    annualRevenue: 4,
+    askingPrice: 6,
+    yearsEstablished: 2,
+    brokerName: 4,
+    brokerEmail: 10,
+  };
+
+  return Object.entries(weights).reduce((score, [field, weight]) => (
+    left[field] && right[field] && left[field] === right[field] ? score + weight : score
+  ), 0);
+}
+
+function matchSimilarSheetRows(workbookRows = [], expectedRows = [], onMatch) {
+  const remainingWorkbook = new Map(workbookRows.map((item) => [item.row, item]));
+  const remainingExpected = new Map(expectedRows.map((item) => [item.index, item]));
+
+  while (remainingWorkbook.size > 0 && remainingExpected.size > 0) {
+    const pairs = [];
+
+    for (const workbookItem of remainingWorkbook.values()) {
+      for (const expectedItem of remainingExpected.values()) {
+        pairs.push({
+          expectedItem,
+          score: sheetRowSimilarity(workbookItem.features, expectedItem.features),
+          workbookItem,
+        });
+      }
+    }
+
+    const uniqueBest = (items, identity) => {
+      const groups = groupSheetRows(items, identity);
+      const best = new Map();
+
+      for (const [key, matches] of groups) {
+        const ranked = matches.sort((left, right) => right.score - left.score);
+        if (ranked[0]?.score >= 6 && ranked[0].score > (ranked[1]?.score ?? -1)) best.set(key, ranked[0]);
+      }
+
+      return best;
+    };
+    const bestByWorkbook = uniqueBest(pairs, (pair) => pair.workbookItem.row);
+    const bestByExpected = uniqueBest(pairs, (pair) => pair.expectedItem.index);
+    const confirmed = [...bestByWorkbook.values()].filter((pair) => (
+      bestByExpected.get(pair.expectedItem.index)?.workbookItem.row === pair.workbookItem.row
+    ));
+
+    if (confirmed.length === 0) break;
+
+    for (const pair of confirmed) {
+      onMatch(pair.workbookItem, pair.expectedItem);
+      remainingWorkbook.delete(pair.workbookItem.row);
+      remainingExpected.delete(pair.expectedItem.index);
+    }
+  }
+}
+
+function alignWorksheetListingUrls(candidate, expectedRows = []) {
+  if (expectedRows.length === 0) return candidate.listingUrlsByRow;
+
+  const expected = expectedRows.map((rawRow, index) => ({ index, ...sheetRowMatchIdentity(rawRow) }));
+  const workbook = [...candidate.listingUrlsByPhysicalRow.entries()]
+    .sort(([left], [right]) => left - right)
+    .map(([row, listingUrl]) => ({ listingUrl, row, ...sheetRowMatchIdentity(candidate.rawRowsByPhysicalRow.get(row)) }));
+  const matchedExpectedIndexes = new Set();
+  const matchedWorkbookRows = new Set();
+  const listingUrlsByRow = new Map();
+  const expectedByStrongKey = groupSheetRows(expected, (item) => item.strongKey);
+  const workbookByStrongKey = groupSheetRows(workbook, (item) => item.strongKey);
+
+  for (const [strongKey, workbookMatches] of workbookByStrongKey) {
+    const expectedMatches = expectedByStrongKey.get(strongKey) || [];
+    if (expectedMatches.length === 0 || expectedMatches.length !== workbookMatches.length) continue;
+    expectedMatches.forEach((expectedMatch, index) => {
+      const workbookMatch = workbookMatches[index];
+      listingUrlsByRow.set(expectedMatch.index, workbookMatch.listingUrl);
+      matchedExpectedIndexes.add(expectedMatch.index);
+      matchedWorkbookRows.add(workbookMatch.row);
+    });
+  }
+
+  const unmatchedExpectedByName = groupSheetRows(
+    expected.filter((item) => !matchedExpectedIndexes.has(item.index)),
+    (item) => item.name,
+  );
+  const unmatchedWorkbookByName = groupSheetRows(
+    workbook.filter((item) => !matchedWorkbookRows.has(item.row)),
+    (item) => item.name,
+  );
+
+  for (const [name, workbookMatches] of unmatchedWorkbookByName) {
+    const expectedMatches = unmatchedExpectedByName.get(name) || [];
+    if (workbookMatches.length === 1 && expectedMatches.length === 1) {
+      listingUrlsByRow.set(expectedMatches[0].index, workbookMatches[0].listingUrl);
+      continue;
+    }
+
+    matchSimilarSheetRows(workbookMatches, expectedMatches, (workbookMatch, expectedMatch) => {
+      listingUrlsByRow.set(expectedMatch.index, workbookMatch.listingUrl);
+    });
+  }
+
+  return listingUrlsByRow;
+}
+
+export function extractGoogleSheetListingUrls(workbookBytes, expectedRows = []) {
+  let expandedBytes = 0;
+  const entries = unzipSync(workbookBytes, {
+    filter: (file) => {
+      const needed = file.name === 'xl/sharedStrings.xml'
+        || /^xl\/worksheets\/sheet\d+\.xml$/i.test(file.name)
+        || /^xl\/worksheets\/_rels\/sheet\d+\.xml\.rels$/i.test(file.name);
+
+      if (!needed) return false;
+      const originalSize = Number(file.originalSize);
+      if (!Number.isSafeInteger(originalSize) || originalSize < 0) throw new Error(`Google Sheet workbook entry has an invalid size: ${file.name}`);
+      if (originalSize > sheetWorkbookEntryMaxBytes) throw new Error(`Google Sheet workbook entry is too large: ${file.name}`);
+      expandedBytes += originalSize;
+      if (expandedBytes > sheetWorkbookExpandedMaxBytes) throw new Error('Google Sheet workbook expands beyond the safe import limit.');
+      return true;
+    },
+  });
+  const sharedStringsXml = entries['xl/sharedStrings.xml'] ? strFromU8(entries['xl/sharedStrings.xml']) : '';
+  const sharedStrings = [...sharedStringsXml.matchAll(/<si>([\s\S]*?)<\/si>/g)].map((match) => extractXmlTextRuns(match[1]));
+  const worksheetPaths = Object.keys(entries)
+    .filter((name) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(name))
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+
+  const candidates = [];
+
+  for (const worksheetPath of worksheetPaths) {
+    const worksheetXml = strFromU8(entries[worksheetPath]);
+    const worksheetName = worksheetPath.split('/').pop();
+    const relationshipsPath = `xl/worksheets/_rels/${worksheetName}.rels`;
+    const relationshipsXml = entries[relationshipsPath] ? strFromU8(entries[relationshipsPath]) : '';
+    const result = extractWorksheetListingUrls(worksheetXml, relationshipsXml, sharedStrings);
+
+    if (result) candidates.push(result);
+  }
+
+  const result = selectWorksheetListingUrls(candidates, expectedRows);
+  if (!result) {
+    return {
+      headerRow: 0,
+      listingColumn: '',
+      listingUrlsByRow: new Map(),
+      rowNamesByIndex: new Map(),
+      unmatchedListingUrlCount: 0,
+    };
+  }
+
+  const listingUrlsByRow = alignWorksheetListingUrls(result, expectedRows);
+  return {
+    ...result,
+    listingUrlsByRow,
+    unmatchedListingUrlCount: result.listingUrlsByPhysicalRow.size - listingUrlsByRow.size,
+  };
+}
+
+export function buildGoogleSheetWorkbookUrl(sourceUrl = '') {
+  try {
+    const source = new URL(sourceUrl);
+    const match = source.pathname.match(/^(\/spreadsheets\/d\/[^/]+)\/gviz\/tq\/?$/i);
+
+    if (
+      source.hostname !== 'docs.google.com'
+      || !match
+      || source.searchParams.get('tq')
+      || source.searchParams.get('range')
+      || source.searchParams.get('headers')
+    ) return '';
+
+    const gid = source.searchParams.get('gid');
+    source.pathname = `${match[1]}/export`;
+    source.search = '';
+    source.searchParams.set('format', 'xlsx');
+    if (gid) source.searchParams.set('gid', gid);
+    return source.toString();
+  } catch {
+    return '';
+  }
+}
+
+function formatPayloadLimitError(byteLength, maxBytes, label = 'Remote response') {
+  const sizeMb = (byteLength / (1024 * 1024)).toFixed(1);
+  const limitMb = (maxBytes / (1024 * 1024)).toFixed(1);
+  return new Error(`${label} is too large to import safely (${sizeMb} MB, limit ${limitMb} MB).`);
+}
+
+function formatAirtableSharedViewPayloadLimitError(byteLength, maxBytes) {
   const sizeMb = (byteLength / (1024 * 1024)).toFixed(1);
   const limitMb = (maxBytes / (1024 * 1024)).toFixed(1);
   const error = new Error(
@@ -1004,11 +1454,11 @@ function formatPayloadLimitError(byteLength, maxBytes) {
   return error;
 }
 
-async function readResponseText(response, maxBytes = Infinity) {
+async function readResponseText(response, maxBytes = Infinity, formatLimitError = formatPayloadLimitError) {
   const contentLength = Number(response.headers.get('content-length') || 0);
 
   if (Number.isFinite(maxBytes) && contentLength > maxBytes) {
-    throw formatPayloadLimitError(contentLength, maxBytes);
+    throw formatLimitError(contentLength, maxBytes);
   }
 
   if (!Number.isFinite(maxBytes) || !response.body?.getReader) {
@@ -1016,7 +1466,7 @@ async function readResponseText(response, maxBytes = Infinity) {
     const byteLength = Buffer.byteLength(text, 'utf8');
 
     if (Number.isFinite(maxBytes) && byteLength > maxBytes) {
-      throw formatPayloadLimitError(byteLength, maxBytes);
+      throw formatLimitError(byteLength, maxBytes);
     }
 
     return text;
@@ -1038,7 +1488,7 @@ async function readResponseText(response, maxBytes = Infinity) {
 
     if (byteLength > maxBytes) {
       await reader.cancel().catch(() => {});
-      throw formatPayloadLimitError(byteLength, maxBytes);
+      throw formatLimitError(byteLength, maxBytes);
     }
 
     chunks.push(decoder.decode(value, { stream: true }));
@@ -1048,9 +1498,63 @@ async function readResponseText(response, maxBytes = Infinity) {
   return chunks.join('');
 }
 
-async function fetchText(url, { headers = {}, timeoutMs = defaultTimeoutMs, maxBytes = Infinity } = {}) {
+async function readResponseBytes(response, maxBytes = Infinity, formatLimitError = formatPayloadLimitError) {
+  const contentLength = Number(response.headers.get('content-length') || 0);
+
+  if (Number.isFinite(maxBytes) && contentLength > maxBytes) {
+    throw formatLimitError(contentLength, maxBytes);
+  }
+
+  if (!Number.isFinite(maxBytes) || !response.body?.getReader) {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+
+    if (Number.isFinite(maxBytes) && bytes.byteLength > maxBytes) {
+      throw formatLimitError(bytes.byteLength, maxBytes);
+    }
+
+    return bytes;
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let byteLength = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) break;
+
+    byteLength += value.byteLength;
+
+    if (byteLength > maxBytes) {
+      await reader.cancel().catch(() => {});
+      throw formatLimitError(byteLength, maxBytes);
+    }
+
+    chunks.push(value);
+  }
+
+  const bytes = new Uint8Array(byteLength);
+  let offset = 0;
+
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return bytes;
+}
+
+async function fetchText(url, {
+  headers = {},
+  timeoutMs = defaultTimeoutMs,
+  maxBytes = Infinity,
+  payloadLabel = 'Remote response',
+  limitErrorFactory,
+} = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const formatLimitError = limitErrorFactory || ((byteLength, limit) => formatPayloadLimitError(byteLength, limit, payloadLabel));
 
   try {
     const response = await fetch(url, {
@@ -1063,7 +1567,7 @@ async function fetchText(url, { headers = {}, timeoutMs = defaultTimeoutMs, maxB
       throw new Error(`Fetch failed with ${response.status}: ${text.slice(0, 180)}`);
     }
 
-    return await readResponseText(response, maxBytes);
+    return await readResponseText(response, maxBytes, formatLimitError);
   } catch (error) {
     if (error.name === 'AbortError') {
       throw new Error(`Fetch timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
@@ -1075,15 +1579,53 @@ async function fetchText(url, { headers = {}, timeoutMs = defaultTimeoutMs, maxB
   }
 }
 
-async function fetchJson(url, { headers = {}, timeoutMs = defaultTimeoutMs, maxBytes = Infinity } = {}) {
-  const text = await fetchText(url, { headers, timeoutMs, maxBytes });
+async function fetchJson(url, {
+  headers = {},
+  timeoutMs = defaultTimeoutMs,
+  maxBytes = Infinity,
+  payloadLabel = 'Remote response',
+  limitErrorFactory,
+} = {}) {
+  const text = await fetchText(url, { headers, timeoutMs, maxBytes, payloadLabel, limitErrorFactory });
   return JSON.parse(text);
 }
 
-export function parseSheetCsvDeals(csv, sourceIndex = 0, maxRecords = Infinity) {
-  const safeMaxRecords = Number.isFinite(maxRecords) ? Math.max(0, maxRecords) : Infinity;
-  const rows = parseCsvRows(csv).slice(0, safeMaxRecords);
+async function fetchBytes(url, {
+  headers = {},
+  timeoutMs = defaultTimeoutMs,
+  maxBytes = Infinity,
+  payloadLabel = 'Remote response',
+  limitErrorFactory,
+} = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  const formatLimitError = limitErrorFactory || ((byteLength, limit) => formatPayloadLimitError(byteLength, limit, payloadLabel));
 
+  try {
+    const response = await fetch(url, {
+      headers,
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const text = await readResponseText(response, 16 * 1024).catch(() => '');
+      throw new Error(`Fetch failed with ${response.status}: ${text.slice(0, 180)}`);
+    }
+
+    return await readResponseBytes(response, maxBytes, formatLimitError);
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error(`Fetch timed out after ${Math.round(timeoutMs / 1000)} seconds.`);
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function normalizeSheetCsvRows(rows = [], sourceIndex = 0, listingUrlsByRow = new Map()) {
+  const safeListingUrls = listingUrlsByRow instanceof Map ? listingUrlsByRow : new Map();
   return {
     source: {
       id: `sheet-${sourceIndex}`,
@@ -1092,21 +1634,71 @@ export function parseSheetCsvDeals(csv, sourceIndex = 0, maxRecords = Infinity) 
       fetched: true,
       rowCount: rows.length,
     },
-    deals: rows.map((row, index) => normalizeDealRecord(row, { id: `sheet-${sourceIndex}`, name: 'SMB Deal Hunter Google Sheet', mode: 'csv', rowId: String(index + 1) })),
+    deals: rows.map((row, index) => normalizeDealRecord(
+      safeListingUrls.get(index) ? { ...row, 'Original Broker Listing URL': safeListingUrls.get(index) } : row,
+      { id: `sheet-${sourceIndex}`, name: 'SMB Deal Hunter Google Sheet', mode: 'csv', rowId: String(index + 1) },
+    )),
   };
 }
 
+export function parseSheetCsvDeals(csv, sourceIndex = 0, maxRecords = Infinity, listingUrlsByRow = new Map()) {
+  const safeMaxRecords = Number.isFinite(maxRecords) ? Math.max(0, maxRecords) : Infinity;
+  return normalizeSheetCsvRows(parseCsvRows(csv).slice(0, safeMaxRecords), sourceIndex, listingUrlsByRow);
+}
+
 async function fetchSheetCsvDeals(url, sourceIndex, config) {
-  const csv = await fetchText(url, {
-    maxBytes: config.dealHunter.sheetCsvMaxPayloadBytes,
+  const workbookUrl = buildGoogleSheetWorkbookUrl(url);
+  const [csv, workbookDownload] = await Promise.all([
+    fetchText(url, {
+      maxBytes: config.dealHunter.sheetCsvMaxPayloadBytes,
+      payloadLabel: 'Google Sheet CSV',
+    }),
+    workbookUrl
+      ? fetchBytes(workbookUrl, {
+        maxBytes: config.dealHunter.sheetCsvMaxPayloadBytes,
+        payloadLabel: 'Google Sheet workbook',
+      })
+        .then((workbookBytes) => ({ workbookBytes, error: '' }))
+        .catch((error) => ({ workbookBytes: null, error: normalizeText(error.message, 500) }))
+      : Promise.resolve({ workbookBytes: null, error: '' }),
+  ]);
+  const allRows = parseCsvRows(csv);
+  const rows = allRows.slice(0, config.dealHunter.maxSourceRecords);
+  let workbookResult = { listingUrlsByRow: new Map(), error: workbookDownload.error };
+
+  if (workbookDownload.workbookBytes) {
+    try {
+      const extracted = extractGoogleSheetListingUrls(workbookDownload.workbookBytes, allRows);
+      const listingUrlsByRow = new Map(
+        [...extracted.listingUrlsByRow].filter(([index]) => index >= 0 && index < rows.length),
+      );
+      workbookResult = { ...extracted, listingUrlsByRow, error: '' };
+    } catch (error) {
+      workbookResult.error = normalizeText(error.message, 500);
+    }
+  }
+
+  const hasUnresolvedListingLabels = rows.some((row) => {
+    const listing = getField(row, ['View Listing']);
+    return normalizeText(listing) !== '' && !normalizeUrl(listing);
   });
-  const result = parseSheetCsvDeals(csv, sourceIndex, config.dealHunter.maxSourceRecords);
+
+  if (workbookUrl && !workbookResult.error && hasUnresolvedListingLabels && workbookResult.listingUrlsByRow.size === 0) {
+    workbookResult.error = 'Google Sheet workbook did not contain any safe View Listing hyperlinks for the imported rows.';
+  } else if (!workbookResult.error && workbookResult.unmatchedListingUrlCount > 0) {
+    const count = workbookResult.unmatchedListingUrlCount;
+    workbookResult.error = `${count} workbook listing link${count === 1 ? '' : 's'} could not be matched unambiguously to an imported CSV row and ${count === 1 ? 'was' : 'were'} skipped.`;
+  }
+
+  const result = normalizeSheetCsvRows(rows, sourceIndex, workbookResult.listingUrlsByRow);
 
   return {
     ...result,
     source: {
       ...result.source,
       url,
+      listingUrlCount: workbookResult.listingUrlsByRow.size,
+      listingUrlWarning: workbookResult.error,
     },
   };
 }
@@ -1208,6 +1800,7 @@ async function fetchAirtableSharedDeals(url, maxRecords, maxPayloadBytes) {
         ...(applicationId ? { 'x-airtable-application-id': applicationId } : {}),
       },
       maxBytes: maxPayloadBytes,
+      limitErrorFactory: formatAirtableSharedViewPayloadLimitError,
     },
   );
   const source = {
