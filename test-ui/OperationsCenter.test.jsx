@@ -44,5 +44,8 @@ describe('Operations Center partial failures', () => {
     expect(screen.queryByText('0 failed · 0 pending')).not.toBeInTheDocument();
     expect(screen.getByText('Source-health history is temporarily unavailable.')).toBeVisible();
     expect(screen.getByText('Bundles: 1 valid · 0 invalid · 1 incomplete')).toBeVisible();
+    expect(screen.getByRole('navigation', { name: 'Operations sections' })).toBeVisible();
+    expect(screen.getByRole('link', { name: 'Core systems' })).toHaveAttribute('href', '#core-systems-heading');
+    expect(screen.getByRole('heading', { name: 'Core systems at a glance' })).toBeVisible();
   });
 });

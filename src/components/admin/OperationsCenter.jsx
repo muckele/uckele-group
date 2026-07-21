@@ -58,6 +58,24 @@ export default function OperationsCenter({ data, loading = false, error = '', on
   return (
     <div className="space-y-6">
       {error ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800" role="alert">{error}</div> : null}
+      <nav className="panel p-3 sm:p-4" aria-label="Operations sections">
+        <p className="px-2 text-xs font-semibold uppercase tracking-[0.12em] text-moss/70">Jump to</p>
+        <div className="mt-2 flex gap-2 overflow-x-auto pb-1">
+          {[
+            ...(data.email ? [['#email-readiness-heading', 'Email']] : []),
+            ['#cim-automation-heading', 'Automation'],
+            ['#core-systems-heading', 'Core systems'],
+            ['#scheduler-history-heading', 'Jobs'],
+            ['#source-history-heading', 'Sources'],
+            ['#cleanup-heading', 'Cleanup'],
+            ['#audit-heading', 'Audit'],
+          ].map(([href, label]) => (
+            <a className="inline-flex min-h-9 shrink-0 items-center rounded-full border border-line bg-white px-3 text-xs font-semibold text-ink/72 transition hover:border-moss/30 hover:text-moss" href={href} key={href}>
+              {label}
+            </a>
+          ))}
+        </div>
+      </nav>
       <EmailReadinessPanel data={data.email} onSendTest={onSendEmailTest} testSending={emailTestSending} />
       <section className="panel p-5 sm:p-7" aria-labelledby="cim-automation-heading">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
@@ -71,7 +89,12 @@ export default function OperationsCenter({ data, loading = false, error = '', on
         {Object.keys(cimMetrics.passReasons || {}).length > 0 ? <p className="mt-3 text-sm text-ink/65"><strong>Pass reasons:</strong> {Object.entries(cimMetrics.passReasons).sort((left, right) => right[1] - left[1]).map(([reason, count]) => `${reason}: ${count}`).join(' · ')}</p> : null}
         <PanelError>{cimAutomation.error}</PanelError>
       </section>
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+      <section aria-labelledby="core-systems-heading">
+        <div className="mb-4">
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">Infrastructure</p>
+          <h3 className="mt-2 text-xl font-semibold text-ink" id="core-systems-heading">Core systems at a glance</h3>
+        </div>
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <article className="panel p-5">
           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">Database</p>
           <div className="mt-3"><StatusBadge healthy={database.ok}>{database.ok ? 'Healthy' : 'Check failed'}</StatusBadge></div>
@@ -99,7 +122,8 @@ export default function OperationsCenter({ data, loading = false, error = '', on
           {data.backup?.bundleCounts ? <p className="mt-2 text-xs text-ink/55">Bundles: {data.backup.bundleCounts.valid || 0} valid · {data.backup.bundleCounts.invalid || 0} invalid · {data.backup.bundleCounts.incomplete || 0} incomplete</p> : null}
           <PanelError>{data.backup?.error}</PanelError>
         </article>
-      </div>
+        </div>
+      </section>
 
       <section className="panel p-5 sm:p-7" aria-labelledby="scheduler-history-heading">
         <div className="flex flex-wrap items-center justify-between gap-3">

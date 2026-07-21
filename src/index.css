@@ -310,6 +310,10 @@ h6 {
   letter-spacing: 0;
 }
 
+.admin-content-with-side-nav :where(h2, h3)[id] {
+  scroll-margin-top: 6.5rem;
+}
+
 .admin-stat-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -11,7 +11,6 @@ import {
   Gauge,
   Inbox,
   Link2,
-  LogOut,
   MailCheck,
   Plus,
   RefreshCw,
@@ -28,6 +27,7 @@ import CrmNavigation from '../components/admin/CrmNavigation';
 import DealActivityTimeline from '../components/admin/DealActivityTimeline';
 import OperationsCenter from '../components/admin/OperationsCenter';
 import DealHunterWorkspace from '../components/admin/DealHunterWorkspace';
+import { adminSectionMeta } from '../content/adminSectionMeta';
 
 const statuses = ['new', 'review', 'contacted', 'archived', 'spam'];
 const priorities = ['low', 'normal', 'medium', 'high', 'urgent'];
@@ -580,6 +580,16 @@ function SectionLabel({ children }) {
   return <p className="text-xs font-semibold uppercase leading-5 tracking-[0.14em] text-moss sm:text-sm sm:tracking-[0.18em]">{children}</p>;
 }
 
+function AdminFormSection({ title, description, children }) {
+  return (
+    <fieldset className="rounded-2xl border border-line/80 bg-fog/45 p-4 sm:p-6">
+      <legend className="px-2 text-lg font-semibold text-ink">{title}</legend>
+      {description ? <p className="mb-5 text-sm leading-6 text-ink/62">{description}</p> : null}
+      <div className="space-y-5">{children}</div>
+    </fieldset>
+  );
+}
+
 function getCimReadyDealsFromReview(review, limit = 25) {
   const seen = new Set();
   const readyDeals = [];
@@ -1016,6 +1026,7 @@ export default function DashboardPage() {
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [loginError, setLoginError] = useState('');
   const [loginPending, setLoginPending] = useState(false);
+  const [logoutEverywherePending, setLogoutEverywherePending] = useState(false);
   const [filters, setFilters] = useState(() => crmFiltersFromSearch(window.location.search));
   const [dashboardData, setDashboardData] = useState({
     summary: null,
@@ -1068,6 +1079,12 @@ export default function DashboardPage() {
     : 'all';
   const crmListSearch = crmSearchFromFilters(filters);
   const crmListHref = `/admin/crm${crmListSearch ? `?${crmListSearch}` : ''}`;
+  const pageMeta = adminSectionMeta[isCrmDetailView ? 'crm-detail' : activeSection] || adminSectionMeta.overview;
+  const showNewRecordAction = !isReadOnly
+    && !isCrmDetailView
+    && ['overview', 'crm', 'command-center', 'deal-hunter', 'follow-ups'].includes(activeSection);
+  const showExportAction = !isReadOnly && !isCrmDetailView && ['overview', 'crm'].includes(activeSection);
+  const showDailyUpdateAction = !isCrmDetailView && ['overview', 'command-center', 'deal-hunter'].includes(activeSection);
 
   async function checkSession() {
     setAuthBootstrapError('');
@@ -1647,18 +1664,27 @@ export default function DashboardPage() {
 
   async function handleLogoutEverywhere() {
     if (!window.confirm('Sign out every active session for this account?')) return;
-    const response = await fetch('/api/admin/sessions/revoke-all', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{}',
-    });
-    const result = await response.json();
-    if (!response.ok || !result.success) {
-      setActionError(result.error || 'Unable to revoke active sessions.');
-      return;
+
+    setLogoutEverywherePending(true);
+    setActionError('');
+
+    try {
+      const response = await fetch('/api/admin/sessions/revoke-all', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to revoke active sessions.');
+      }
+      setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
+    } catch (error) {
+      setActionError(error.message || 'Unable to revoke active sessions. Check your connection and try again.');
+    } finally {
+      setLogoutEverywherePending(false);
     }
-    setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
   }
 
   async function handleSave(submissionId) {
@@ -2463,24 +2489,45 @@ export default function DashboardPage() {
 
   return (
     <>
-      <Seo description="Private admin CRM for Uckele Group." keywords="private admin crm" noindex title="Admin | Uckele Group" />
+      <Seo
+        description={pageMeta.description}
+        keywords="private admin crm"
+        noindex
+        title={`${pageMeta.title} | Uckele Group Admin`}
+      />
 
       <section className="admin-page-header">
         <Reveal className="admin-page-header-card">
           <div className="flex flex-col gap-5 xl:flex-row xl:items-center xl:justify-between">
             <div className="min-w-0">
-              <p className="text-[11px] font-semibold uppercase tracking-normal text-moss">Private Admin</p>
-              <h1 className="mt-2 text-3xl font-semibold leading-tight text-ink sm:text-4xl">Admin workspace</h1>
+              <p className="text-[11px] font-semibold uppercase tracking-normal text-moss">{pageMeta.eyebrow}</p>
+              <h1 className="mt-2 text-3xl font-semibold leading-tight text-ink sm:text-4xl">{pageMeta.title}</h1>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-ink/68 sm:text-base">
-                CRM records, Deal Hunter scoring, and follow-up work are split into focused views so daily admin work stays readable.
+                {pageMeta.description}
               </p>
             </div>
 
             <div className="admin-session-panel">
-              <p className="text-xs font-semibold uppercase tracking-normal text-moss/75">Signed in</p>
-              <p className="mt-1 text-sm font-semibold text-ink">
-                {authState.username}{isReadOnly ? ' · Read-only viewer' : ''}
-              </p>
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold uppercase tracking-normal text-moss/75">Signed in</p>
+                  <p className="mt-1 truncate text-sm font-semibold text-ink">
+                    {authState.username}{isReadOnly ? ' · Read-only viewer' : ''}
+                  </p>
+                </div>
+                <button className="shrink-0 text-xs font-semibold text-moss underline decoration-moss/30 underline-offset-4" onClick={handleLogout} type="button">
+                  Sign out
+                </button>
+              </div>
+              <button
+                className="mt-3 inline-flex items-center gap-1.5 text-xs font-medium text-ink/55 transition hover:text-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={logoutEverywherePending}
+                onClick={handleLogoutEverywhere}
+                type="button"
+              >
+                <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
+                {logoutEverywherePending ? 'Signing out all sessions…' : 'Sign out all sessions'}
+              </button>
             </div>
           </div>
 
@@ -2491,13 +2538,13 @@ export default function DashboardPage() {
               </p>
             ) : (
               <p className="text-sm leading-6 text-ink/68">
-                Use the navigation to move between focused admin workspaces.
+                {pageMeta.guidance}
               </p>
             )}
 
-            <div className="admin-action-row">
-              {!isReadOnly ? (
-                <>
+            {showNewRecordAction || showExportAction || showDailyUpdateAction ? (
+              <div className="admin-action-row">
+                {showNewRecordAction ? (
                   <NavLink
                     className={`${primaryActionButtonClass} admin-action-button`}
                     to="/admin/new-record"
@@ -2505,6 +2552,8 @@ export default function DashboardPage() {
                     <Plus className="h-4 w-4" />
                     New CRM Record
                   </NavLink>
+                ) : null}
+                {showExportAction ? (
                   <a
                     className={`${secondaryActionButtonClass} admin-action-button`}
                     href="/api/admin/submissions/export"
@@ -2512,34 +2561,20 @@ export default function DashboardPage() {
                     <Download className="h-4 w-4" />
                     Export CSV
                   </a>
-                </>
-              ) : null}
-              <a
-                className={`${secondaryActionButtonClass} admin-action-button`}
-                href={dailyDealUpdateUrl}
-                rel="noreferrer"
-                target="_blank"
-              >
-                <ClipboardList className="h-4 w-4" />
-                Daily Deal Update
-              </a>
-              <button
-                className={`${secondaryActionButtonClass} admin-action-button`}
-                onClick={handleLogout}
-                type="button"
-              >
-                <LogOut className="h-4 w-4" />
-                Sign Out
-              </button>
-              <button
-                className={`${secondaryActionButtonClass} admin-action-button`}
-                onClick={handleLogoutEverywhere}
-                type="button"
-              >
-                <ShieldAlert className="h-4 w-4" />
-                Sign Out Everywhere
-              </button>
-            </div>
+                ) : null}
+                {showDailyUpdateAction ? (
+                  <a
+                    className={`${secondaryActionButtonClass} admin-action-button`}
+                    href={dailyDealUpdateUrl}
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    <ClipboardList className="h-4 w-4" />
+                    Daily Deal Update
+                  </a>
+                ) : null}
+              </div>
+            ) : null}
           </div>
         </Reveal>
       </section>
@@ -2947,10 +2982,21 @@ export default function DashboardPage() {
 
       {activeSection === 'follow-ups' && !followUpLoading && !followUpError && visibleNotifications.length === 0 && visibleEmailTriage.length === 0 ? (
         <section className="section-shell mt-8">
-          <Reveal className="panel p-7 text-sm leading-7 text-ink/70">
-            {followUpView === 'all'
-              ? 'No follow-up prompts or email engagement triage items need attention right now.'
-              : 'No records match this overview-card filter right now.'}
+          <Reveal className="panel p-6 sm:p-8">
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-moss/10 text-moss">
+              <CheckCircle2 className="h-5 w-5" aria-hidden="true" />
+            </div>
+            <div className="mt-4"><SectionLabel>Queue clear</SectionLabel></div>
+            <h2 className="mt-2 text-2xl font-semibold text-ink">No follow-ups need attention</h2>
+            <p className="mt-3 max-w-2xl text-sm leading-7 text-ink/68">
+              {followUpView === 'all'
+                ? 'There are no generated prompts, overdue actions, warm leads, or email-delivery issues in the current queue.'
+                : 'No records match this follow-up filter right now. Return to all follow-ups or review upcoming actions in the CRM.'}
+            </p>
+            <div className="mt-5 flex flex-wrap gap-3">
+              {followUpView !== 'all' ? <NavLink className={secondaryActionButtonClass} to="/admin/follow-ups">Show all follow-ups</NavLink> : null}
+              <NavLink className={secondaryActionButtonClass} to="/admin/crm?sort=next_action_at&direction=asc">Review upcoming CRM actions</NavLink>
+            </div>
           </Reveal>
         </section>
       ) : null}
@@ -2969,7 +3015,8 @@ export default function DashboardPage() {
             </div>
 
             <form className="mt-8 space-y-8" onSubmit={handleCreateSubmission}>
-              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
+              <AdminFormSection description="Identify the opportunity and connect it to its source. Only the company or contact context is needed to get started." title="1. Opportunity basics">
+                <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                 <InputField
                   label="Company / Business"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, company: event.target.value }))}
@@ -2992,9 +3039,9 @@ export default function DashboardPage() {
                   onChange={(event) => setCreateDraft((current) => ({ ...current, assigned_to: event.target.value }))}
                   value={createDraft.assigned_to}
                 />
-              </div>
+                </div>
 
-              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
+                <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                 <InputField
                   label="Listing URL"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, listing_url: event.target.value }))}
@@ -3015,9 +3062,11 @@ export default function DashboardPage() {
                   onChange={(event) => setCreateDraft((current) => ({ ...current, asking_price: event.target.value }))}
                   value={createDraft.asking_price}
                 />
-              </div>
+                </div>
+              </AdminFormSection>
 
-              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-5">
+              <AdminFormSection description="Add the economics you know today. These fields can remain blank until a listing or CIM provides them." title="2. Financial profile">
+                <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-5">
                 <InputField
                   label="TTM Revenue"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, ttm_revenue: event.target.value }))}
@@ -3043,9 +3092,11 @@ export default function DashboardPage() {
                   onChange={(event) => setCreateDraft((current) => ({ ...current, business_age: event.target.value }))}
                   value={createDraft.business_age}
                 />
-              </div>
+                </div>
+              </AdminFormSection>
 
-              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
+              <AdminFormSection description="Set ownership and the next concrete action so the new record enters the correct working queue." title="3. Workflow">
+                <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                 <SelectField
                   label="Priority"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, priority: event.target.value }))}
@@ -3072,9 +3123,11 @@ export default function DashboardPage() {
                   options={sbaOptions}
                   value={createDraft.sba_eligible}
                 />
-              </div>
+                </div>
+              </AdminFormSection>
 
-              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+              <AdminFormSection description="Capture whichever relationship is available. Broker and seller details remain distinct throughout the CRM." title="4. Contacts">
+                <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
                 <InputField
                   label="Broker name"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, broker_name: event.target.value }))}
@@ -3091,9 +3144,9 @@ export default function DashboardPage() {
                   onChange={(event) => setCreateDraft((current) => ({ ...current, broker_phone: event.target.value }))}
                   value={createDraft.broker_phone}
                 />
-              </div>
+                </div>
 
-              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+                <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
                 <InputField
                   label="Seller name"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, seller_name: event.target.value }))}
@@ -3110,9 +3163,11 @@ export default function DashboardPage() {
                   onChange={(event) => setCreateDraft((current) => ({ ...current, seller_phone: event.target.value }))}
                   value={createDraft.seller_phone}
                 />
-              </div>
+                </div>
+              </AdminFormSection>
 
-              <div className="grid gap-5 lg:grid-cols-[0.7fr_1.3fr]">
+              <AdminFormSection description="Leave enough context for the next person—or your future self—to understand why this opportunity matters." title="5. Context and notes">
+                <div className="grid gap-5 lg:grid-cols-[0.7fr_1.3fr]">
                 <InputField
                   label="Tags"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, tags: event.target.value }))}
@@ -3125,7 +3180,8 @@ export default function DashboardPage() {
                   placeholder="Internal notes, context, next steps, or anything from the broker or seller."
                   value={createDraft.notes}
                 />
-              </div>
+                </div>
+              </AdminFormSection>
 
               {createError ? (
                 <p className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{createError}</p>
