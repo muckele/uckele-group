@@ -637,12 +637,21 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
   const adminOrigin = String(config.server.origin || '').replace(/\/$/, '');
   const scoredBusinessesUrl = `${adminOrigin}/admin/command-center`;
   const approvalUrl = `${adminOrigin}/admin/deal-hunter?view=cim-approvals`;
+  const directActionButtonHtml = (label, href, { secondary = false } = {}) => `
+    <table cellpadding="0" cellspacing="0" role="presentation" style="width: 100%; border-collapse: separate; margin: 0 0 10px;">
+      <tr>
+        <td align="center" bgcolor="${secondary ? '#FFFFFF' : '#284638'}" style="border: 1px solid ${secondary ? '#A9BCAF' : '#284638'}; border-radius: 8px;">
+          <a href="${escapeHtml(href)}" target="_blank" style="display: block; padding: 14px 18px; color: ${secondary ? '#284638' : '#FFFFFF'}; font-size: 14px; font-weight: 800; line-height: 1.25; text-align: center; text-decoration: none;">${escapeHtml(label)}</a>
+        </td>
+      </tr>
+    </table>
+  `;
   const directActionLinksHtml = `
     <div style="margin: 20px 0; border: 1px solid #C9D8CF; border-radius: 14px; background: #F4F8F5; padding: 16px;">
       <p style="margin: 0 0 8px; color: #284638; font-size: 13px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;">Direct action links</p>
-      <p style="margin: 0 0 12px; color: #33443B; font-size: 13px; line-height: 1.55;">If your email app does not open the buttons, use these full links:</p>
-      <p style="margin: 0 0 12px; color: #18211D; font-size: 14px; line-height: 1.55;"><strong>Review 75+ scored businesses</strong><br><a href="${escapeHtml(scoredBusinessesUrl)}" target="_blank" style="color: #284638; text-decoration: underline; word-break: break-all;">${escapeHtml(scoredBusinessesUrl)}</a></p>
-      ${cimReadyDeals.length > 0 ? `<p style="margin: 0; color: #18211D; font-size: 14px; line-height: 1.55;"><strong>Review and send CIM requests</strong><br><a href="${escapeHtml(approvalUrl)}" target="_blank" style="color: #284638; text-decoration: underline; word-break: break-all;">${escapeHtml(approvalUrl)}</a></p>` : ''}
+      <p style="margin: 0 0 14px; color: #33443B; font-size: 13px; line-height: 1.55;">Open the protected dashboards to review today&rsquo;s opportunities and approvals.</p>
+      ${directActionButtonHtml('Review 75+ Scored Businesses', scoredBusinessesUrl)}
+      ${cimReadyDeals.length > 0 ? directActionButtonHtml(`Review & Send ${cimReadyDeals.length} CIM Request${cimReadyDeals.length === 1 ? '' : 's'}`, approvalUrl, { secondary: true }) : ''}
     </div>
   `;
   const bodyHtml = `
@@ -710,12 +719,7 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
       crmSync.reviewed ? { label: 'CRM updated', value: String(crmSync.updated || 0) } : null,
       { label: 'Lookback', value: `${review.lookbackDays || 0} day(s)` },
     ].filter(Boolean),
-    ctas: [
-      { label: 'Review 75+ Scored Businesses', href: scoredBusinessesUrl },
-      cimReadyDeals.length > 0
-        ? { label: `Review & Send ${cimReadyDeals.length} CIM Request${cimReadyDeals.length === 1 ? '' : 's'}`, href: approvalUrl }
-        : null,
-    ].filter(Boolean),
+    ctas: [],
   });
   const text = [
     'Daily acquisition deal review',

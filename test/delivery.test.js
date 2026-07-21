@@ -54,8 +54,10 @@ test('daily Deal Hunter email has clickable links for 75+ businesses and CIM app
   assert.match(message.text, /Review and send CIM requests: http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals/);
   assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/command-center" target="_blank"[^>]*>Review 75\+ Scored Businesses<\/a>/);
   assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals" target="_blank"[^>]*>Review &amp; Send 1 CIM Request<\/a>/);
-  assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/command-center" target="_blank"[^>]*>http:\/\/localhost:5173\/admin\/command-center<\/a>/);
-  assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals" target="_blank"[^>]*>http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals<\/a>/);
+  assert.doesNotMatch(message.html, />http:\/\/localhost:5173\/admin\/command-center<\/a>/);
+  assert.doesNotMatch(message.html, />http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals<\/a>/);
+  assert.match(message.html, /bgcolor="#284638"[^>]*>[\s\S]*?Review 75\+ Scored Businesses/);
+  assert.match(message.html, /bgcolor="#FFFFFF"[^>]*>[\s\S]*?Review &amp; Send 1 CIM Request/);
   assert.equal(message.tracking.cimReadyCount, 1);
 });
 
