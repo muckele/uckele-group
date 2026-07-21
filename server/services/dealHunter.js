@@ -363,6 +363,93 @@ function isValidEmail(value = '') {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizeEmail(value));
 }
 
+const genericContactMailboxNames = new Set([
+  'admin', 'broker', 'contact', 'deals', 'dealdesk', 'hello', 'info', 'inquiries', 'office', 'reception', 'sales', 'support',
+]);
+
+function contactHeaderMetadata(header = '') {
+  const key = normalizeKey(header)
+    .replace(/emailaddress(?:es)?/g, 'email')
+    .replace(/emails(?=\d*$)/, 'email');
+  const match = key.match(/^(broker|contact|listingagent|agent|receptionist|reception|dealdesk|seller)?(\d*)email(\d*)$/);
+
+  if (!match) return null;
+
+  const type = match?.[1] || 'contact';
+  const index = match?.[2] || match?.[3] || '';
+  const roles = {
+    broker: 'Broker', listingagent: 'Listing agent', agent: 'Agent', seller: 'Seller',
+    contact: 'Contact', dealdesk: 'Deal desk', receptionist: 'Reception', reception: 'Reception',
+  };
+  const priorities = {
+    broker: 0, listingagent: 0, agent: 1, seller: 1, contact: 2, dealdesk: 3, receptionist: 4, reception: 4,
+  };
+
+  return { type, index, unqualified: !match[1], role: roles[type] || 'Contact', priority: priorities[type] ?? 2 };
+}
+
+function extractEmailAddresses(value = '') {
+  return Array.from(new Set(String(value || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi)?.map(normalizeEmail) || []));
+}
+
+function relatedContactName(rawRow, metadata, fallbackName = '') {
+  const entries = new Map(Object.entries(rawRow || {}).map(([key, value]) => [normalizeKey(key), value]));
+  const prefixes = metadata.type === 'listingagent' ? ['listingagent', 'agent', 'broker'] : [metadata.type];
+  const candidates = prefixes.flatMap((prefix) => [
+    `${prefix}${metadata.index}name`, `${prefix}name${metadata.index}`, `${prefix}name`, prefix,
+  ]);
+
+  for (const candidate of candidates) {
+    const name = normalizeText(entries.get(candidate), 160);
+    if (name) return name;
+  }
+
+  return normalizeText(fallbackName, 160);
+}
+
+function normalizeBrokerContacts(contacts = []) {
+  const byEmail = new Map();
+  const rolePriorities = { Broker: 0, 'Listing agent': 0, Agent: 1, Seller: 1, Contact: 2, 'Deal desk': 3, Reception: 4 };
+
+  for (const candidate of contacts) {
+    const email = normalizeEmail(candidate?.email);
+    if (!isValidEmail(email)) continue;
+    const localPart = email.split('@')[0].replace(/[^a-z0-9]/g, '');
+    const contact = {
+      name: normalizeText(candidate?.name, 160),
+      email,
+      role: normalizeText(candidate?.role || 'Contact', 80),
+      sourceColumn: normalizeText(candidate?.sourceColumn, 160),
+      priority: Math.max(0, Number.isFinite(Number(candidate?.priority)) ? Number(candidate.priority) : rolePriorities[candidate?.role] ?? 2)
+        + (genericContactMailboxNames.has(localPart) ? 10 : 0),
+      generic: genericContactMailboxNames.has(localPart),
+    };
+    const current = byEmail.get(email);
+    if (!current || contact.priority < current.priority || (!current.name && contact.name)) byEmail.set(email, contact);
+  }
+
+  return [...byEmail.values()]
+    .sort((left, right) => left.priority - right.priority || Number(right.name !== '') - Number(left.name !== '') || left.email.localeCompare(right.email))
+    .map(({ priority: _priority, ...contact }) => contact);
+}
+
+function extractBrokerContacts(rawRow = {}, nameFallbacks = {}) {
+  const contacts = [];
+
+  for (const [header, value] of Object.entries(rawRow || {})) {
+    const metadata = contactHeaderMetadata(header);
+    if (!metadata) continue;
+    const emails = extractEmailAddresses(value);
+    const fallbackName = metadata.unqualified
+      ? nameFallbacks.contact || nameFallbacks.broker || ''
+      : nameFallbacks[metadata.type] || '';
+    const name = relatedContactName(rawRow, metadata, fallbackName);
+    emails.forEach((email, index) => contacts.push({ ...metadata, email, name: index === 0 ? name : '', sourceColumn: header }));
+  }
+
+  return normalizeBrokerContacts(contacts);
+}
+
 function normalizeKey(value = '') {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
@@ -508,8 +595,12 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
   const remoteFlag = normalizeText(getField(rawRow, ['Remote/Relocatable/Absentee-Run', 'Remote', 'Relocatable', 'Absentee', 'Absentee Run']), 100);
   const franchiseFlag = normalizeText(getField(rawRow, ['Franchise', 'Is Franchise', 'Include Franchises']), 100);
   const fiveYearsFlag = normalizeText(getField(rawRow, ['5+ Years In Business', '5+ Years', 'Five Years In Business']), 100);
-  const brokerEmail = normalizeText(getField(rawRow, ['Broker Email', 'Contact Email', 'Email']), 200).toLowerCase();
-  const brokerName = normalizeText(getField(rawRow, ['Broker Name', 'Contact Name', 'Broker']), 160);
+  const sourceBrokerName = normalizeText(getField(rawRow, ['Broker Name', 'Broker']), 160);
+  const sourceContactName = normalizeText(getField(rawRow, ['Contact Name']), 160);
+  const brokerContacts = extractBrokerContacts(rawRow, { broker: sourceBrokerName, contact: sourceContactName });
+  const preferredBrokerContact = brokerContacts[0] || null;
+  const brokerEmail = preferredBrokerContact?.email || '';
+  const brokerName = preferredBrokerContact ? preferredBrokerContact.name : sourceBrokerName;
   const brokerCompany = normalizeText(getField(rawRow, ['Broker Company', 'Company']), 160);
   const brokerContact = normalizeText(getField(rawRow, ['Broker Contact', 'Broker Phone', 'Phone', 'Contact Phone']), 200);
   const name = normalizeText(getField(rawRow, ['Name', 'Business Name', 'Company', 'Title', 'Listing Title']), 220) || 'Unnamed business';
@@ -541,6 +632,7 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
     fiveYearsFlag,
     brokerEmail,
     brokerName,
+    brokerContacts,
     brokerCompany,
     brokerContact,
     listingUrl,
@@ -874,10 +966,25 @@ function parseCsvRows(csvText = '') {
     return [];
   }
 
-  const headers = rows[0].map((header) => normalizeText(header, 160));
+  const usedHeaders = new Set();
+  const duplicateCounts = new Map();
+  const headers = rows[0].map((header, index) => {
+    const base = normalizeText(header, 160) || `Column ${index + 1}`;
+    let count = (duplicateCounts.get(base) || 0) + 1;
+    let candidate = count === 1 ? base : `${base} ${count}`;
+
+    while (usedHeaders.has(candidate)) {
+      count += 1;
+      candidate = `${base} ${count}`;
+    }
+
+    duplicateCounts.set(base, count);
+    usedHeaders.add(candidate);
+    return candidate;
+  });
   return rows.slice(1).map((values) =>
     headers.reduce((record, header, index) => {
-      record[header || `Column ${index + 1}`] = normalizeText(values[index] || '', 5000);
+      record[header] = normalizeText(values[index] || '', 5000);
       return record;
     }, {}),
   );
@@ -1232,18 +1339,36 @@ async function collectSources(config) {
   return sourceResults;
 }
 
-function dedupeDeals(deals) {
-  const seen = new Set();
+export function dedupeDeals(deals) {
+  const indexByKey = new Map();
   const deduped = [];
 
   for (const deal of deals) {
     const key = buildDealKey(deal);
 
-    if (!key || seen.has(key)) {
+    if (!key) continue;
+
+    if (indexByKey.has(key)) {
+      const index = indexByKey.get(key);
+      const current = deduped[index];
+      const brokerContacts = normalizeBrokerContacts([
+        ...(current.brokerContacts || []),
+        ...(deal.brokerContacts || []),
+      ]);
+      const preferredBrokerContact = brokerContacts[0] || null;
+      deduped[index] = {
+        ...current,
+        brokerContacts,
+        brokerEmail: preferredBrokerContact?.email || current.brokerEmail || deal.brokerEmail || '',
+        brokerName: preferredBrokerContact ? preferredBrokerContact.name : current.brokerName || deal.brokerName || '',
+        brokerCompany: current.brokerCompany || deal.brokerCompany || '',
+        brokerContact: current.brokerContact || deal.brokerContact || '',
+        raw: { ...(current.raw || {}), ...(deal.raw || {}) },
+      };
       continue;
     }
 
-    seen.add(key);
+    indexByKey.set(key, deduped.length);
     deduped.push(deal);
   }
 
@@ -1369,6 +1494,7 @@ function publicDeal(deal) {
     brokerCompany: deal.brokerCompany,
     brokerContact: deal.brokerContact,
     brokerEmail: deal.brokerEmail,
+    brokerContacts: deal.brokerContacts || [],
     listingUrl: deal.listingUrl,
     dateAdded: deal.dateAdded,
     lastUpdated: deal.lastUpdated,
@@ -1398,6 +1524,7 @@ function normalizeCimDealSnapshot(snapshot = null) {
 
   const cimRequest = snapshot.cimRequest && typeof snapshot.cimRequest === 'object' ? snapshot.cimRequest : {};
   const dealKey = normalizeText(snapshot.dealKey || snapshot.deal_key, 1000);
+  const brokerContacts = normalizeBrokerContacts(snapshot.brokerContacts || snapshot.broker_contacts || []);
   const brokerEmail = normalizeEmail(
     snapshot.confirmedRecipientEmail ||
       snapshot.confirmed_recipient_email ||
@@ -1435,6 +1562,7 @@ function normalizeCimDealSnapshot(snapshot = null) {
     brokerCompany: normalizeText(snapshot.brokerCompany || snapshot.broker_company, 220),
     brokerContact: normalizeText(snapshot.brokerContact || snapshot.broker_contact, 500),
     brokerEmail,
+    brokerContacts,
     listingUrl: normalizeUrl(snapshot.listingUrl || snapshot.listing_url),
     dateAdded: normalizeText(snapshot.dateAdded || snapshot.date_added, 100),
     lastUpdated: normalizeText(snapshot.lastUpdated || snapshot.last_updated, 100),
@@ -1596,6 +1724,9 @@ function dealHunterCrmNotes(deal) {
     deal.brokerName ? `Broker name: ${deal.brokerName}` : '',
     deal.brokerCompany ? `Broker company: ${deal.brokerCompany}` : '',
     deal.brokerEmail ? `Broker email: ${deal.brokerEmail}` : '',
+    ...(deal.brokerContacts?.length > 1
+      ? ['Available contacts', ...deal.brokerContacts.map((contact) => `- ${[contact.name, contact.role, contact.email, contact.sourceColumn].filter(Boolean).join(' | ')}`)]
+      : []),
     deal.brokerContact ? `Broker phone/contact: ${deal.brokerContact}` : '',
     '',
     ...listLines('Strengths', deal.strengths || []),
@@ -1689,6 +1820,7 @@ function dealHunterCrmMetadata(deal, options = {}) {
       concerns: deal.concerns || [],
       removeReasons: deal.removeReasons || [],
       questions: deal.questions || [],
+      brokerContacts: deal.brokerContacts || [],
       generatedNotes,
       raw: deal.raw || {},
     },
@@ -2071,6 +2203,10 @@ function buildCimRequestLockKey(dealKey, recipientEmail) {
   return `${normalizeText(dealKey, 1000)}|${normalizeEmail(recipientEmail)}`;
 }
 
+function buildCimDealSendLockKey(dealKey) {
+  return `first-contact:${normalizeText(dealKey, 1000)}`;
+}
+
 function addHoursIso(value, hours) {
   const baseMs = Date.parse(value || '');
 
@@ -2321,25 +2457,54 @@ function mapCimRequestsByDealRecipient(requests = []) {
   }, new Map());
 }
 
+function mapCimRequestsByDeal(requests = []) {
+  return requests.reduce((accumulator, request) => {
+    const dealKey = request?.deal_key || '';
+    if (!dealKey) return accumulator;
+    const current = accumulator.get(dealKey) || [];
+    current.push(request);
+    current.sort((left, right) => Date.parse(right.updated_at || '') - Date.parse(left.updated_at || ''));
+    accumulator.set(dealKey, current);
+    return accumulator;
+  }, new Map());
+}
+
+function findBlockingCimRequest(requests = []) {
+  return requests.find((request) => isCompletedCimStatus(request?.status) || isRecentPendingCimRequest(request)) || null;
+}
+
 function attachCimRequestStatus(scoredDeals, requests = []) {
   const requestsByDealRecipient = mapCimRequestsByDealRecipient(requests);
+  const requestsByDeal = mapCimRequestsByDeal(requests);
 
   return scoredDeals.map((deal) => {
     const recipientEmail = normalizeEmail(deal.brokerEmail);
-    const existingRequest = requestsByDealRecipient.get(`${deal.dealKey}|${recipientEmail}`);
+    const brokerContacts = normalizeBrokerContacts(deal.brokerContacts?.length
+      ? deal.brokerContacts
+      : recipientEmail ? [{ name: deal.brokerName, email: recipientEmail, role: 'Broker', sourceColumn: 'Broker Email' }] : []);
+    const exactRequest = requestsByDealRecipient.get(`${deal.dealKey}|${recipientEmail}`);
+    const existingRequest = findBlockingCimRequest(requestsByDeal.get(deal.dealKey) || []) || exactRequest;
     const reason = getCimRequestUnavailableReason(deal, recipientEmail);
     const eligible = reason === '';
     const completed = isCompletedCimStatus(existingRequest?.status);
     const preview = eligible ? buildDealHunterCimRequestEmail({ to: recipientEmail, deal }) : null;
+    const contactPreviews = eligible ? brokerContacts.map((contact) => {
+      const contactPreview = buildDealHunterCimRequestEmail({
+        to: contact.email,
+        deal: { ...deal, brokerEmail: contact.email, brokerName: contact.name || '' },
+      });
+      return { email: contact.email, name: contact.name || '', subject: contactPreview.subject, text: contactPreview.text };
+    }) : [];
 
     return {
       ...deal,
+      brokerContacts,
       cimRequest: {
         eligible,
         canRequest: eligible && !completed && !isRecentPendingCimRequest(existingRequest),
         status: existingRequest?.status || (eligible ? 'ready' : 'unavailable'),
         reason,
-        recipientEmail,
+        recipientEmail: normalizeEmail(existingRequest?.recipient_email || recipientEmail),
         snapshotToken: eligible ? signCimDealSnapshot(deal) : '',
         requestedAt: existingRequest?.updated_at || '',
         requestedBy: existingRequest?.requested_by || '',
@@ -2347,6 +2512,7 @@ function attachCimRequestStatus(scoredDeals, requests = []) {
         providerMessageId: existingRequest?.provider_message_id || '',
         subject: existingRequest?.subject || '',
         preview: preview ? { subject: preview.subject, text: preview.text } : null,
+        contactPreviews,
         followUpCount: Number(existingRequest?.follow_up_count || 0),
         lastFollowUpAt: existingRequest?.last_follow_up_at || '',
         nextFollowUpAt: existingRequest?.next_follow_up_at || '',
@@ -2424,6 +2590,7 @@ function buildCimRequestRecord({ deal, recipientEmail, requestedBy = '', emailRe
       askingPrice: deal.askingPrice,
       profitMultiple: deal.profitMultiple,
       brokerName: deal.brokerName || '',
+      brokerContacts: deal.brokerContacts || [],
       brokerCompany: deal.brokerCompany || '',
       brokerContact: deal.brokerContact || '',
       recommendation: deal.recommendation || '',
@@ -2880,7 +3047,7 @@ export async function sendDailyDealHunterReview({ idempotencyKey = '' } = {}) {
 }
 
 async function sendCimRequestForScoredDeal({ deal, requestedBy = '', storage = getStorage() } = {}) {
-  if (!storage.getDealHunterCimRequest || !storage.upsertDealHunterCimRequest) {
+  if (!storage.getDealHunterCimRequest || !storage.listDealHunterCimRequests || !storage.upsertDealHunterCimRequest) {
     return { ok: false, status: 500, error: 'CIM request tracking storage is not configured.' };
   }
 
@@ -2896,7 +3063,7 @@ async function sendCimRequestForScoredDeal({ deal, requestedBy = '', storage = g
     };
   }
 
-  const lockKey = buildCimRequestLockKey(deal.dealKey, recipientEmail);
+  const lockKey = buildCimDealSendLockKey(deal.dealKey);
 
   if (!acquireLock(cimRequestSendLocks, lockKey)) {
     return {
@@ -2908,33 +3075,33 @@ async function sendCimRequestForScoredDeal({ deal, requestedBy = '', storage = g
   }
 
   try {
-    const existingRequest = await storage.getDealHunterCimRequest({
-      dealKey: deal.dealKey,
-      recipientEmail,
-    });
+    const dealRequests = await storage.listDealHunterCimRequests({ dealKeys: [deal.dealKey], limit: 100 });
+    const blockingRequest = findBlockingCimRequest(dealRequests);
+    const existingRequest = dealRequests.find((request) => normalizeEmail(request?.recipient_email) === recipientEmail)
+      || await storage.getDealHunterCimRequest({ dealKey: deal.dealKey, recipientEmail });
 
-    if (isCompletedCimStatus(existingRequest?.status)) {
+    if (blockingRequest && isCompletedCimStatus(blockingRequest.status)) {
       return {
         ok: true,
         status: 200,
         alreadySent: true,
-        request: existingRequest,
-        deal: publicDeal(attachCimRequestStatus([deal], [existingRequest])[0]),
+        request: blockingRequest,
+        deal: publicDeal(attachCimRequestStatus([deal], dealRequests)[0]),
         emailResult: {
-          status: existingRequest.status,
+          status: blockingRequest.status,
           error: '',
-          providerMessageId: existingRequest.provider_message_id || '',
+          providerMessageId: blockingRequest.provider_message_id || '',
         },
       };
     }
 
-    if (isRecentPendingCimRequest(existingRequest)) {
+    if (blockingRequest && isRecentPendingCimRequest(blockingRequest)) {
       return {
         ok: false,
         status: 409,
         error: 'A CIM request for this deal is already in progress. Please wait a few minutes before retrying.',
-        request: existingRequest,
-        deal: publicDeal(attachCimRequestStatus([deal], [existingRequest])[0]),
+        request: blockingRequest,
+        deal: publicDeal(attachCimRequestStatus([deal], dealRequests)[0]),
       };
     }
 
@@ -3025,9 +3192,14 @@ async function sendCimRequestForScoredDeal({ deal, requestedBy = '', storage = g
 
 export async function sendDealHunterCimRequest({ dealKey = '', snapshotToken = '', requestedBy = '', storage = getStorage() } = {}) {
   const normalizedDealKey = normalizeText(dealKey, 1000);
+  const snapshotDeal = verifyCimDealSnapshotToken(snapshotToken);
 
   if (!normalizedDealKey) {
     return { ok: false, status: 400, error: 'Deal key is required.' };
+  }
+
+  if (!snapshotDeal || snapshotDeal.dealKey !== normalizedDealKey) {
+    return { ok: false, status: 400, error: 'The CIM request does not match the signed approval queue.' };
   }
 
   let result = null;
@@ -3045,9 +3217,7 @@ export async function sendDealHunterCimRequest({ dealKey = '', snapshotToken = '
   const deal = result.scoredDeals.find((candidate) => candidate.dealKey === normalizedDealKey);
 
   if (!deal) {
-    const snapshotDeal = verifyCimDealSnapshotToken(snapshotToken);
-
-    if (snapshotDeal?.dealKey === normalizedDealKey && sourceFailureMatchesDeal(snapshotDeal, result.review)) {
+    if (sourceFailureMatchesDeal(snapshotDeal, result.review)) {
       console.warn('[deal-hunter] using confirmed CIM snapshot because one or more review sources failed.');
       return sendCimRequestForScoredDeal({ deal: snapshotDeal, requestedBy, storage });
     }
@@ -3055,12 +3225,20 @@ export async function sendDealHunterCimRequest({ dealKey = '', snapshotToken = '
     return { ok: false, status: 404, error: 'Deal was not found in the latest Deal Hunter review.' };
   }
 
+  if (normalizeEmail(deal.brokerEmail) !== normalizeEmail(snapshotDeal.brokerEmail)) {
+    return { ok: false, status: 409, error: 'The broker recipient changed after approval. Review the opportunity again before sending.' };
+  }
+
   return sendCimRequestForScoredDeal({ deal, requestedBy, storage });
 }
 
 function normalizeCimRequestSelections(selections = []) {
   if (!Array.isArray(selections)) {
-    return [];
+    return { valid: false, selections: [], error: 'CIM request selections must be an array.' };
+  }
+
+  if (selections.length === 0) {
+    return { valid: false, selections: [], error: 'At least one signed CIM request selection is required.' };
   }
 
   const seen = new Set();
@@ -3071,17 +3249,23 @@ function normalizeCimRequestSelections(selections = []) {
     const recipientEmail = normalizeEmail(selection?.recipientEmail || selection?.recipient_email);
     const snapshotToken = selection?.snapshotToken || selection?.snapshot_token || selection?.deal?.cimRequest?.snapshotToken || '';
     const deal = verifyCimDealSnapshotToken(snapshotToken);
+    const selectedContact = deal?.brokerContacts?.find((contact) => contact.email === recipientEmail);
+    const recipientName = normalizeText(selectedContact?.name || selection?.recipientName || selection?.recipient_name, 160);
     const key = `${dealKey}|${recipientEmail}`;
 
-    if (!dealKey || !recipientEmail || seen.has(key)) {
-      continue;
+    if (!deal || !dealKey || deal.dealKey !== dealKey || !isValidEmail(recipientEmail) || seen.has(key)) {
+      return {
+        valid: false,
+        selections: [],
+        error: 'One or more CIM request selections do not match the signed approval queue.',
+      };
     }
 
     seen.add(key);
-    normalizedSelections.push({ dealKey, recipientEmail, deal });
+    normalizedSelections.push({ dealKey, recipientEmail, recipientName, deal });
   }
 
-  return normalizedSelections.slice(0, cimBulkRequestMax);
+  return { valid: true, selections: normalizedSelections.slice(0, cimBulkRequestMax), error: '' };
 }
 
 export function validateCimReviewDecisions(decisions = []) {
@@ -3106,6 +3290,10 @@ export function validateCimReviewDecisions(decisions = []) {
     const finalRecipientEmail = result === 'approved'
       ? normalizeEmail(decision?.finalRecipientEmail || decision?.final_recipient_email || originalRecipientEmail)
       : originalRecipientEmail;
+    const selectedContact = snapshot.brokerContacts?.find((contact) => contact.email === finalRecipientEmail);
+    const finalRecipientName = result === 'approved'
+      ? normalizeText(selectedContact?.name || decision?.finalRecipientName || decision?.final_recipient_name, 160)
+      : '';
 
     if (!originalRecipientEmail || (result === 'approved' && !isValidEmail(finalRecipientEmail))) {
       return { valid: false, decisions: [], error: 'One or more CIM review recipients are invalid.' };
@@ -3120,6 +3308,7 @@ export function validateCimReviewDecisions(decisions = []) {
       passReason: decision?.passReason || decision?.pass_reason || '',
       originalRecipientEmail,
       finalRecipientEmail,
+      finalRecipientName,
     });
   }
 
@@ -3183,7 +3372,8 @@ function buildReadyDealsFromConfirmedSnapshots(selectedRecipients = []) {
       return null;
     }
 
-    if (normalizeEmail(deal.brokerEmail) !== selection.recipientEmail) {
+    const signedContact = deal.brokerContacts?.some((contact) => contact.email === selection.recipientEmail);
+    if (normalizeEmail(deal.brokerEmail) !== selection.recipientEmail && !signedContact) {
       validationFailures.push(
         buildSelectionFailure(selection, 'Confirmed broker email does not match the selected deal. Review sources again before sending.'),
       );
@@ -3197,7 +3387,7 @@ function buildReadyDealsFromConfirmedSnapshots(selectedRecipients = []) {
       return null;
     }
 
-    return deal;
+    return { ...deal, brokerEmail: selection.recipientEmail, brokerName: selection.recipientName || '' };
   }).filter(Boolean);
 
   return { readyDeals, validationFailures };
@@ -3209,7 +3399,22 @@ export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit =
   }
 
   const safeLimit = Math.max(1, Math.min(Number(limit) || cimBulkRequestMax, cimBulkRequestMax));
-  const selectedRecipients = normalizeCimRequestSelections(selections);
+  const selectionValidation = normalizeCimRequestSelections(selections);
+  if (!selectionValidation.valid) {
+    return {
+      ok: false,
+      status: 400,
+      error: selectionValidation.error,
+      review: null,
+      results: [],
+      sent: 0,
+      alreadySent: 0,
+      failed: 0,
+      totalReady: 0,
+      totalRequested: Array.isArray(selections) ? selections.length : 0,
+    };
+  }
+  const selectedRecipients = selectionValidation.selections;
   let result = null;
   let allReadyDeals = [];
   let readyDeals = [];
@@ -3247,9 +3452,12 @@ export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit =
       const exactDeal = readyByDealRecipient.get(`${selection.dealKey}|${selection.recipientEmail}`);
       const latestDeal = readyByDealKey.get(selection.dealKey);
       const snapshotMatches = selection.deal?.dealKey === selection.dealKey;
-      const deal = exactDeal || (latestDeal && snapshotMatches
-        ? { ...latestDeal, brokerEmail: selection.recipientEmail }
+      const matchedDeal = exactDeal || (latestDeal && snapshotMatches
+        ? { ...latestDeal, brokerEmail: selection.recipientEmail, brokerName: selection.recipientName || '' }
         : null);
+      const deal = matchedDeal
+        ? { ...matchedDeal, brokerEmail: selection.recipientEmail, brokerName: selection.recipientName || matchedDeal.brokerName || '' }
+        : null;
 
       if (!deal) {
         if (!latestDeal) {

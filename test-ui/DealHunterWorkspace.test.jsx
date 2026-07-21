@@ -234,4 +234,44 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save Review' }));
     expect(onSendReady).toHaveBeenCalledWith([], [expect.objectContaining({ decision: 'rejected', passReason: 'valuation' })]);
   });
+
+  test('selects one scraped contact and keeps the greeting synchronized with that recipient', () => {
+    const onSendReady = vi.fn();
+    const review = reviewWithDeal({
+      eligible: true,
+      canRequest: true,
+      status: 'ready',
+      recipientEmail: 'erin@broker.example',
+      snapshotToken: 'signed-multi-contact-snapshot',
+      preview: { subject: 'CIM request', text: 'Hello Erin,\n\nPlease send the CIM.' },
+      contactPreviews: [
+        { email: 'erin@broker.example', name: 'Erin', subject: 'CIM request', text: 'Hello Erin,\n\nPlease send the CIM.' },
+        { email: 'alex@broker.example', name: 'Alex', subject: 'CIM request', text: 'Hello Alex,\n\nPlease send the CIM.' },
+      ],
+    });
+    Object.assign(review.qualified[0], {
+      brokerEmail: 'erin@broker.example',
+      brokerName: 'Erin',
+      brokerContacts: [
+        { email: 'erin@broker.example', name: 'Erin', role: 'Broker', sourceColumn: 'Broker Email' },
+        { email: 'alex@broker.example', name: 'Alex', role: 'Contact', sourceColumn: 'Contact Email 2' },
+      ],
+    });
+    review.totals.cimReady = 1;
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onReview={vi.fn()} onSendReady={onSendReady} review={review} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    fireEvent.click(screen.getByText('Preview exact broker email'));
+    fireEvent.change(screen.getByLabelText('Broker contact for Recurring HVAC Services'), { target: { value: 'alex@broker.example' } });
+
+    expect(screen.getByLabelText('Broker recipient for Recurring HVAC Services')).toHaveValue('alex@broker.example');
+    expect(screen.getByLabelText('Broker recipient name for Recurring HVAC Services')).toHaveValue('Alex');
+    expect(screen.getByText(/Hello Alex,/)).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send 1 Approved' }));
+    expect(onSendReady).toHaveBeenCalledWith(
+      [expect.objectContaining({ confirmedRecipientEmail: 'alex@broker.example', confirmedRecipientName: 'Alex' })],
+      [expect.objectContaining({ finalRecipientEmail: 'alex@broker.example', finalRecipientName: 'Alex' })],
+    );
+  });
 });

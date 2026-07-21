@@ -108,7 +108,11 @@ export async function recordCimReviewDecisions({ decisions = [], actor = '', sta
       final_recipient_email: finalRecipient, recipient_edited: originalRecipient !== finalRecipient,
       score: Number.isFinite(Number(decision?.score)) ? Number(decision.score) : null,
       actor: String(actor || 'admin').slice(0, 160), automation_stage: Math.max(1, Math.min(Number(stage) || 1, 3)),
-      metadata: { dealName: String(decision?.dealName || '').slice(0, 220), source },
+      metadata: {
+        dealName: String(decision?.dealName || '').slice(0, 220),
+        recipientName: String(decision?.finalRecipientName || '').slice(0, 160),
+        source,
+      },
     };
   }).filter((decision) => decision.deal_key);
   if (safe.length === 0) return [];

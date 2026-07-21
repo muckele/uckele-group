@@ -217,3 +217,64 @@ test('Google Sheet CSV parsing caps rows before normalizing source deals', () =>
   assert.equal(result.deals[0].name, 'Commercial HVAC Maintenance Co');
   assert.equal(result.deals[1].name, 'Commercial Plumbing Service');
 });
+
+test('Google Sheet parsing preserves, ranks, and deduplicates multiple broker contacts', async () => {
+  const { dedupeDeals } = await import('../server/services/dealHunter.js');
+  const csv = [
+    'Business Name,Listing URL,Broker Name,Broker Email,Contact Name 2,Contact Email 2,Receptionist Email',
+    'Commercial HVAC Co,https://broker.example/hvac,Erin Gilliam,"erin@broker.example; office@broker.example",Alex Morgan,alex@broker.example,frontdesk@broker.example',
+    'Commercial HVAC Co,https://broker.example/hvac,Jordan Lee,jordan@broker.example,,,,',
+  ].join('\n');
+  const parsed = parseSheetCsvDeals(csv);
+  const contacts = parsed.deals[0].brokerContacts;
+
+  assert.deepEqual(contacts.map((contact) => contact.email), [
+    'erin@broker.example',
+    'alex@broker.example',
+    'frontdesk@broker.example',
+    'office@broker.example',
+  ]);
+  assert.equal(contacts[0].name, 'Erin Gilliam');
+  assert.equal(contacts[1].name, 'Alex Morgan');
+  assert.equal(parsed.deals[0].brokerEmail, 'erin@broker.example');
+
+  const [merged] = dedupeDeals(parsed.deals);
+  assert.deepEqual(merged.brokerContacts.map((contact) => contact.email), [
+    'erin@broker.example',
+    'jordan@broker.example',
+    'alex@broker.example',
+    'frontdesk@broker.example',
+    'office@broker.example',
+  ]);
+  assert.equal(merged.brokerEmail, 'erin@broker.example');
+});
+
+test('contact names stay bound to the matching role instead of leaking to the preferred email', () => {
+  const csv = [
+    'Business Name,Broker Email,Contact Name,Contact Email',
+    'Commercial HVAC Co,erin@broker.example,Alex Contact,alex@broker.example',
+  ].join('\n');
+  const [deal] = parseSheetCsvDeals(csv).deals;
+
+  assert.equal(deal.brokerEmail, 'erin@broker.example');
+  assert.equal(deal.brokerName, '');
+  assert.deepEqual(deal.brokerContacts.map(({ email, name }) => ({ email, name })), [
+    { email: 'erin@broker.example', name: '' },
+    { email: 'alex@broker.example', name: 'Alex Contact' },
+  ]);
+});
+
+test('duplicate Google Sheet email headings preserve every address', () => {
+  const csv = [
+    'Business Name,Broker Email,Broker Email,Receptionist Email',
+    'Commercial HVAC Co,erin@broker.example,jordan@broker.example,frontdesk@broker.example',
+  ].join('\n');
+  const [deal] = parseSheetCsvDeals(csv).deals;
+
+  assert.deepEqual(new Set(deal.brokerContacts.map((contact) => contact.email)), new Set([
+    'erin@broker.example',
+    'jordan@broker.example',
+    'frontdesk@broker.example',
+  ]));
+  assert.equal(deal.brokerContacts.find((contact) => contact.email === 'jordan@broker.example')?.sourceColumn, 'Broker Email 2');
+});

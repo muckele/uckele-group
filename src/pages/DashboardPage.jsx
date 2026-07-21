@@ -2056,7 +2056,7 @@ export default function DashboardPage() {
 
     const previewLines = readyDeals
       .slice(0, 10)
-      .map((deal) => `- ${deal.name || 'Unnamed deal'} -> ${deal.confirmedRecipientEmail}`)
+      .map((deal) => `- ${deal.name || 'Unnamed deal'} -> ${deal.confirmedRecipientName ? `${deal.confirmedRecipientName} <${deal.confirmedRecipientEmail}>` : deal.confirmedRecipientEmail}`)
       .join('\n');
     const additionalCount = readyDeals.length > 10 ? `\n...and ${readyDeals.length - 10} more.` : '';
     const confirmed = window.confirm(readyDeals.length > 0
@@ -2097,6 +2097,7 @@ export default function DashboardPage() {
           selections: readyDeals.map((deal) => ({
             dealKey: deal.dealKey,
             recipientEmail: deal.confirmedRecipientEmail,
+            recipientName: deal.confirmedRecipientName || '',
             snapshotToken: getCimSnapshotToken(deal),
           })),
         }),

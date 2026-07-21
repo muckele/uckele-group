@@ -99,6 +99,9 @@ function ReviewNoteList({ empty, items = [] }) {
 
 function OpportunityReview({ deal, onClose }) {
   const listing = safeUrl(deal.listingUrl);
+  const brokerContactSummary = deal.brokerContacts?.length > 1
+    ? deal.brokerContacts.map(contactLabel).join('\n')
+    : deal.brokerEmail;
   const details = [
     ['Industry', deal.industry],
     ['Location', deal.location],
@@ -108,7 +111,7 @@ function OpportunityReview({ deal, onClose }) {
     ['Profit multiple', Number.isFinite(deal.profitMultiple) ? `${deal.profitMultiple}x` : 'Not disclosed'],
     ['Years established', Number.isFinite(deal.yearsEstablished) ? deal.yearsEstablished : 'Not disclosed'],
     ['Broker', deal.brokerName || deal.brokerCompany],
-    ['Broker email', deal.brokerEmail],
+    [deal.brokerContacts?.length > 1 ? 'Broker contacts' : 'Broker email', brokerContactSummary],
     ['Broker contact', deal.brokerContact],
     ['First seen', deal.firstSeenAt ? dateTime(deal.firstSeenAt) : 'Not recorded'],
     ['Last reviewed', deal.lastSeenAt ? dateTime(deal.lastSeenAt) : 'Not recorded'],
@@ -140,7 +143,7 @@ function OpportunityReview({ deal, onClose }) {
           </section>
 
           <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {details.map(([detailLabel, value]) => <div className="rounded-2xl border border-line bg-white p-4" key={detailLabel}><p className="text-xs font-semibold uppercase tracking-[0.12em] text-moss/80">{detailLabel}</p><p className="mt-2 break-words text-sm leading-6 text-ink">{value}</p></div>)}
+            {details.map(([detailLabel, value]) => <div className="rounded-2xl border border-line bg-white p-4" key={detailLabel}><p className="text-xs font-semibold uppercase tracking-[0.12em] text-moss/80">{detailLabel}</p><p className="mt-2 whitespace-pre-line break-words text-sm leading-6 text-ink">{value}</p></div>)}
           </section>
 
           <div className="grid gap-5 lg:grid-cols-2">
@@ -219,6 +222,19 @@ function cimReadyDeals(review) {
   return ready;
 }
 
+function contactLabel(contact = {}) {
+  return [contact.name, contact.role, contact.email, contact.sourceColumn ? `Sheet: ${contact.sourceColumn}` : ''].filter(Boolean).join(' · ');
+}
+
+function previewForDecision(deal, decision = {}) {
+  const selected = (deal.cimRequest?.contactPreviews || []).find((preview) => preview.email === decision.recipientEmail);
+  if (selected) return selected;
+  const base = deal.cimRequest?.preview;
+  if (!base?.text) return base;
+  const greeting = `Hello${decision.recipientName ? ` ${decision.recipientName}` : ''},`;
+  return { ...base, text: base.text.replace(/^Hello[^\n]*,/i, greeting) };
+}
+
 function CimApprovalQueue({ review, readOnly, sending, onOpenDeal, onSendApproved }) {
   const deals = useMemo(() => cimReadyDeals(review), [review]);
   const [decisions, setDecisions] = useState({});
@@ -227,6 +243,7 @@ function CimApprovalQueue({ review, readOnly, sending, onOpenDeal, onSendApprove
     setDecisions(Object.fromEntries(deals.map((deal) => [deal.dealKey, {
       decision: 'pending',
       recipientEmail: deal.cimRequest?.recipientEmail || deal.brokerEmail || '',
+      recipientName: deal.brokerContacts?.find((contact) => contact.email === (deal.cimRequest?.recipientEmail || deal.brokerEmail))?.name || deal.brokerName || '',
       passReason: '',
     }])));
   }, [deals]);
@@ -236,6 +253,7 @@ function CimApprovalQueue({ review, readOnly, sending, onOpenDeal, onSendApprove
     .map((deal) => ({
       ...deal,
       confirmedRecipientEmail: String(decisions[deal.dealKey]?.recipientEmail || '').trim().toLowerCase(),
+      confirmedRecipientName: String(decisions[deal.dealKey]?.recipientName || '').trim(),
     }));
   const invalidCount = approvedDeals.filter((deal) => !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(deal.confirmedRecipientEmail)).length;
   const pendingCount = deals.filter((deal) => !['approved', 'rejected'].includes(decisions[deal.dealKey]?.decision)).length;
@@ -255,7 +273,10 @@ function CimApprovalQueue({ review, readOnly, sending, onOpenDeal, onSendApprove
       </div>
       <div className="mt-5 space-y-3">
         {deals.map((deal) => {
-          const decision = decisions[deal.dealKey] || { decision: 'pending', recipientEmail: deal.brokerEmail || '', passReason: '' };
+          const decision = decisions[deal.dealKey] || { decision: 'pending', recipientEmail: deal.brokerEmail || '', recipientName: deal.brokerName || '', passReason: '' };
+          const contacts = deal.brokerContacts || [];
+          const selectedContact = contacts.find((contact) => contact.email === decision.recipientEmail);
+          const emailPreview = previewForDecision(deal, decision);
           return (
             <article className="rounded-2xl border border-line bg-white/90 p-4" key={`approval-${deal.dealKey}`}>
               <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(260px,0.7fr)_auto] lg:items-center">
@@ -264,17 +285,49 @@ function CimApprovalQueue({ review, readOnly, sending, onOpenDeal, onSendApprove
                   <h4 className="mt-2 font-semibold leading-6 text-ink"><button className="text-left underline decoration-ink/25 underline-offset-4 transition hover:text-moss" onClick={() => onOpenDeal?.(deal)} type="button">{deal.name}</button></h4>
                   <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1"><button className="inline-flex text-sm font-semibold text-moss underline" onClick={() => onOpenDeal?.(deal)} type="button">View opportunity review</button>{safeUrl(deal.listingUrl) ? <a className="inline-flex items-center gap-1.5 text-sm font-semibold text-moss underline" href={safeUrl(deal.listingUrl)} rel="noreferrer" target="_blank">Original broker listing<ExternalLink className="h-3.5 w-3.5" /></a> : null}</div>
                 </div>
-                <label className="text-sm font-semibold text-ink">
-                  Broker recipient
+                <div className="text-sm font-semibold text-ink">
+                  <p>Broker recipient</p>
+                  {contacts.length > 1 ? (
+                    <select
+                      aria-label={`Broker contact for ${deal.name}`}
+                      className="mt-1.5 w-full rounded-xl border border-ink/15 bg-white px-3 py-2.5 font-normal text-ink disabled:bg-fog"
+                      disabled={readOnly || decision.decision !== 'approved' || sending}
+                      onChange={(event) => {
+                        const contact = contacts.find((candidate) => candidate.email === event.target.value);
+                        setDecisions((current) => ({ ...current, [deal.dealKey]: { ...decision, recipientEmail: contact?.email || '', recipientName: contact?.name || '' } }));
+                      }}
+                      value={selectedContact?.email || ''}
+                    >
+                      {contacts.map((contact) => <option key={contact.email} value={contact.email}>{contactLabel(contact)}</option>)}
+                      <option value="">Enter another address</option>
+                    </select>
+                  ) : null}
                   <input
                     aria-label={`Broker recipient for ${deal.name}`}
-                    className="mt-1.5 w-full rounded-xl border border-ink/15 bg-white px-3 py-2.5 font-normal text-ink disabled:bg-fog"
+                    className={`${contacts.length > 1 ? 'mt-2' : 'mt-1.5'} w-full rounded-xl border border-ink/15 bg-white px-3 py-2.5 font-normal text-ink disabled:bg-fog`}
                     disabled={readOnly || decision.decision !== 'approved' || sending}
-                    onChange={(event) => setDecisions((current) => ({ ...current, [deal.dealKey]: { ...decision, recipientEmail: event.target.value } }))}
+                    onChange={(event) => {
+                      const contact = contacts.find((candidate) => candidate.email === event.target.value.trim().toLowerCase());
+                      setDecisions((current) => ({ ...current, [deal.dealKey]: { ...decision, recipientEmail: event.target.value, recipientName: contact?.name || '' } }));
+                    }}
                     type="email"
                     value={decision.recipientEmail}
                   />
-                </label>
+                  {decision.decision === 'approved' ? (
+                    <span className="mt-2 block">
+                      <span className="block text-xs uppercase tracking-[0.1em] text-ink/60">Recipient name for greeting</span>
+                      <input
+                        aria-label={`Broker recipient name for ${deal.name}`}
+                        className="mt-1 w-full rounded-xl border border-ink/15 bg-white px-3 py-2.5 font-normal text-ink disabled:bg-fog"
+                        disabled={readOnly || sending}
+                        onChange={(event) => setDecisions((current) => ({ ...current, [deal.dealKey]: { ...decision, recipientName: event.target.value } }))}
+                        placeholder="Optional"
+                        type="text"
+                        value={decision.recipientName}
+                      />
+                    </span>
+                  ) : null}
+                </div>
                 <div className="flex flex-wrap gap-2">
                   <button className={decision.decision === 'approved' ? primaryButton : secondaryButton} disabled={readOnly || sending} onClick={() => setDecisions((current) => ({ ...current, [deal.dealKey]: { ...decision, decision: 'approved' } }))} type="button">Approve</button>
                   <button className={decision.decision === 'rejected' ? primaryButton : secondaryButton} disabled={readOnly || sending} onClick={() => setDecisions((current) => ({ ...current, [deal.dealKey]: { ...decision, decision: 'rejected' } }))} type="button">Pass</button>
@@ -288,11 +341,11 @@ function CimApprovalQueue({ review, readOnly, sending, onOpenDeal, onSendApprove
                   </select>
                 </label>
               ) : null}
-              {deal.cimRequest?.preview?.text ? (
+              {emailPreview?.text ? (
                 <details className="mt-3 rounded-xl border border-line bg-fog/55 p-3">
                   <summary className="cursor-pointer text-sm font-semibold text-ink">Preview exact broker email</summary>
-                  <p className="mt-3 text-sm font-semibold text-ink">Subject: {deal.cimRequest.preview.subject}</p>
-                  <pre className="mt-3 whitespace-pre-wrap font-sans text-sm leading-6 text-ink/75">{deal.cimRequest.preview.text}</pre>
+                  <p className="mt-3 text-sm font-semibold text-ink">Subject: {emailPreview.subject}</p>
+                  <pre className="mt-3 whitespace-pre-wrap font-sans text-sm leading-6 text-ink/75">{emailPreview.text}</pre>
                 </details>
               ) : null}
             </article>
@@ -302,7 +355,7 @@ function CimApprovalQueue({ review, readOnly, sending, onOpenDeal, onSendApprove
       {!readOnly ? (
         <div className="mt-5 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <p className="text-sm text-ink/68">This final action sends {approvedDeals.length} first-contact email{approvedDeals.length === 1 ? '' : 's'} and starts their follow-up sequences.</p>
-          <button className={primaryButton} disabled={sending || invalidCount > 0 || pendingCount > 0 || missingPassReasonCount > 0} onClick={() => onSendApproved(approvedDeals, deals.map((deal) => ({ dealKey: deal.dealKey, snapshotToken: deal.cimRequest?.snapshotToken || '', decision: decisions[deal.dealKey]?.decision, passReason: decisions[deal.dealKey]?.passReason || '', finalRecipientEmail: decisions[deal.dealKey]?.recipientEmail || deal.brokerEmail || '' })))} type="button"><Send className="h-4 w-4" />{sending ? 'Saving review…' : approvedDeals.length > 0 ? `Send ${approvedDeals.length} Approved` : 'Save Review'}</button>
+          <button className={primaryButton} disabled={sending || invalidCount > 0 || pendingCount > 0 || missingPassReasonCount > 0} onClick={() => onSendApproved(approvedDeals, deals.map((deal) => ({ dealKey: deal.dealKey, snapshotToken: deal.cimRequest?.snapshotToken || '', decision: decisions[deal.dealKey]?.decision, passReason: decisions[deal.dealKey]?.passReason || '', finalRecipientEmail: decisions[deal.dealKey]?.recipientEmail || deal.brokerEmail || '', finalRecipientName: decisions[deal.dealKey]?.recipientName || '' })))} type="button"><Send className="h-4 w-4" />{sending ? 'Saving review…' : approvedDeals.length > 0 ? `Send ${approvedDeals.length} Approved` : 'Save Review'}</button>
         </div>
       ) : <p className="mt-4 text-sm font-semibold text-ink/68">Read-only users cannot approve or send CIM requests.</p>}
       {invalidCount > 0 ? <p className="mt-3 text-sm text-red-700" role="alert">Correct {invalidCount} invalid broker email address{invalidCount === 1 ? '' : 'es'} before sending.</p> : null}
