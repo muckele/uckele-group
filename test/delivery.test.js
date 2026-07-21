@@ -52,8 +52,10 @@ test('daily Deal Hunter email has clickable links for 75+ businesses and CIM app
   assert.match(message.text, /CIM requests ready for approval: 1/);
   assert.match(message.text, /Review 75\+ scored businesses: http:\/\/localhost:5173\/admin\/command-center/);
   assert.match(message.text, /Review and send CIM requests: http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals/);
-  assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/command-center"[^>]*>Review 75\+ Scored Businesses<\/a>/);
-  assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals"[^>]*>Review &amp; Send 1 CIM Request<\/a>/);
+  assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/command-center" target="_blank"[^>]*>Review 75\+ Scored Businesses<\/a>/);
+  assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals" target="_blank"[^>]*>Review &amp; Send 1 CIM Request<\/a>/);
+  assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/command-center" target="_blank"[^>]*>http:\/\/localhost:5173\/admin\/command-center<\/a>/);
+  assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals" target="_blank"[^>]*>http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals<\/a>/);
   assert.equal(message.tracking.cimReadyCount, 1);
 });
 

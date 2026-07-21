@@ -158,7 +158,7 @@ function ctaHtml(ctas = []) {
 
             return `
               <td style="padding: 0 10px 10px 0;">
-                <a href="${escapeHtml(normalizeUrl(cta.href))}" style="display: inline-block; border: 1px solid ${border}; border-radius: 999px; background: ${background}; color: ${color}; font-size: 14px; font-weight: 700; line-height: 1; padding: 14px 18px; text-decoration: none;">${escapeHtml(cta.label)}</a>
+                <a href="${escapeHtml(normalizeUrl(cta.href))}" target="_blank" style="display: inline-block; border: 1px solid ${border}; border-radius: 999px; background: ${background}; color: ${color}; font-size: 14px; font-weight: 700; line-height: 1; padding: 14px 18px; text-decoration: none;">${escapeHtml(cta.label)}</a>
               </td>
             `;
           })
@@ -637,11 +637,20 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
   const adminOrigin = String(config.server.origin || '').replace(/\/$/, '');
   const scoredBusinessesUrl = `${adminOrigin}/admin/command-center`;
   const approvalUrl = `${adminOrigin}/admin/deal-hunter?view=cim-approvals`;
+  const directActionLinksHtml = `
+    <div style="margin: 20px 0; border: 1px solid #C9D8CF; border-radius: 14px; background: #F4F8F5; padding: 16px;">
+      <p style="margin: 0 0 8px; color: #284638; font-size: 13px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;">Direct action links</p>
+      <p style="margin: 0 0 12px; color: #33443B; font-size: 13px; line-height: 1.55;">If your email app does not open the buttons, use these full links:</p>
+      <p style="margin: 0 0 12px; color: #18211D; font-size: 14px; line-height: 1.55;"><strong>Review 75+ scored businesses</strong><br><a href="${escapeHtml(scoredBusinessesUrl)}" target="_blank" style="color: #284638; text-decoration: underline; word-break: break-all;">${escapeHtml(scoredBusinessesUrl)}</a></p>
+      ${cimReadyDeals.length > 0 ? `<p style="margin: 0; color: #18211D; font-size: 14px; line-height: 1.55;"><strong>Review and send CIM requests</strong><br><a href="${escapeHtml(approvalUrl)}" target="_blank" style="color: #284638; text-decoration: underline; word-break: break-all;">${escapeHtml(approvalUrl)}</a></p>` : ''}
+    </div>
+  `;
   const bodyHtml = `
     <div style="margin: 20px 0; border: 1px solid #E3D9CA; border-radius: 14px; background: #F8F4ED; padding: 16px;">
       <p style="margin: 0 0 8px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase;">CIM Automation</p>
       <p style="margin: 0; color: #33443B; font-size: 14px; line-height: 1.6;">Configured Stage ${escapeHtml(automation.configuredStage || 1)}; effective Stage ${escapeHtml(automation.effectiveStage || 1)}${automation.paused ? '; emergency paused' : ''}. ${escapeHtml(automationRun.sent || 0)} initial request(s) sent automatically; ${escapeHtml(automationRun.exceptions?.length || 0)} exception(s) retained for review.</p>
     </div>
+    ${directActionLinksHtml}
     ${dealHunterSectionHtml(
       'CIM Requests Ready For Approval',
       'Review the exact businesses and recipients, edit any broker address, skip weak fits, and send only the requests you approve.',
