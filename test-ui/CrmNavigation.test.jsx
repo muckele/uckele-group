@@ -73,6 +73,23 @@ describe('CRM navigation', () => {
     expect(crmFiltersFromSearch('?created=not-valid').created).toBe('all');
   });
 
+  test('shows the active filter count and clears discovery filters together', () => {
+    const onChange = vi.fn();
+    render(
+      <CrmNavigation
+        filters={{ ...filters, search: 'dental', status: 'review', created: 'last-7-days' }}
+        onChange={onChange}
+        total={4}
+        totalPages={1}
+      />,
+    );
+
+    expect(screen.getByText('Find a CRM record')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Clear 3 filters' }));
+
+    expect(onChange).toHaveBeenCalledWith({ search: '', created: 'all', status: 'all', page: 1 });
+  });
+
   test('represents every accepted deep-link sort direction in the visible control', () => {
     const onChange = vi.fn();
     const parsed = crmFiltersFromSearch('?sort=priority&direction=asc');

@@ -1,5 +1,5 @@
 import React from 'react';
-import { ChevronLeft, ChevronRight } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Search, SlidersHorizontal, X } from 'lucide-react';
 
 const pageSizes = [10, 25, 50, 100];
 
@@ -34,19 +34,48 @@ function rangeLabel(page, pageSize, total) {
 
 export default function CrmNavigation({ filters, total, totalPages, onChange, disabled = false }) {
   const sortValue = `${filters.sort}:${filters.direction}`;
+  const activeFilterCount = [filters.search, filters.created !== 'all', filters.status !== 'all'].filter(Boolean).length;
+
+  function clearFilters() {
+    onChange({ search: '', created: 'all', status: 'all', page: 1 });
+  }
 
   return (
     <div className="space-y-4">
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-[minmax(15rem,1.4fr)_minmax(8rem,0.8fr)_minmax(8rem,0.8fr)_minmax(11rem,1fr)_minmax(7rem,0.55fr)]">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            <SlidersHorizontal className="h-4 w-4 text-moss" aria-hidden="true" />
+            <h2 className="text-lg font-semibold text-ink">Find a CRM record</h2>
+          </div>
+          <p className="mt-1 text-sm leading-6 text-ink/60">Search and filter the index, then open a record to edit its full deal room.</p>
+        </div>
+        {activeFilterCount > 0 ? (
+          <button
+            className="inline-flex min-h-10 shrink-0 items-center justify-center gap-2 self-start rounded-xl border border-line bg-white px-3 text-sm font-semibold text-ink/75 transition hover:border-moss/30 hover:text-moss"
+            disabled={disabled}
+            onClick={clearFilters}
+            type="button"
+          >
+            <X className="h-4 w-4" aria-hidden="true" />
+            Clear {activeFilterCount} {activeFilterCount === 1 ? 'filter' : 'filters'}
+          </button>
+        ) : null}
+      </div>
+
+      <div className="grid gap-4 border-t border-line/80 pt-4 md:grid-cols-2 xl:grid-cols-[minmax(15rem,1.4fr)_minmax(8rem,0.8fr)_minmax(8rem,0.8fr)_minmax(11rem,1fr)_minmax(7rem,0.55fr)]">
         <label className="flex flex-col gap-2 text-sm font-medium text-ink">
           Search CRM
-          <input
-            className="form-control"
-            onChange={(event) => onChange({ search: event.target.value, page: 1 })}
-            placeholder="Company, seller, broker, notes, URL, or email"
-            type="search"
-            value={filters.search}
-          />
+          <span className="relative block">
+            <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-ink/40" aria-hidden="true" />
+            <input
+              className="form-control pl-10"
+              onChange={(event) => onChange({ search: event.target.value, page: 1 })}
+              placeholder="Company, contact, notes, URL, or email"
+              type="search"
+              value={filters.search}
+            />
+          </span>
         </label>
 
         <label className="flex flex-col gap-2 text-sm font-medium text-ink">

@@ -702,7 +702,7 @@ function TextAreaField({ label, value, onChange, placeholder = '' }) {
   );
 }
 
-function LinksRow({ submission }) {
+function LinksRow({ submission, compact = false }) {
   const listingHref = safeExternalHref(submission.listing_url);
   const websiteHref = safeExternalHref(submission.business_website);
   const prospectusHref = safeExternalHref(submission.prospectus_url);
@@ -713,14 +713,14 @@ function LinksRow({ submission }) {
   ].filter(Boolean);
 
   if (links.length === 0) {
-    return <p className="mt-4 text-sm leading-7 text-ink/68">No listing or company links added yet.</p>;
+    return <p className={`${compact ? 'mt-1' : 'mt-4'} text-sm leading-7 text-ink/68`}>{compact ? 'No links added' : 'No listing or company links added yet.'}</p>;
   }
 
   return (
-    <div className="mt-4 flex flex-wrap gap-3">
+    <div className={`${compact ? 'mt-1.5 gap-2' : 'mt-4 gap-3'} flex flex-wrap`}>
       {links.map((link) => (
         <a
-          className="inline-flex items-center justify-center rounded-full border border-ink/10 bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-moss/25 hover:text-moss"
+          className={`inline-flex items-center justify-center rounded-full border border-ink/10 bg-white text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss ${compact ? 'px-3 py-1.5' : 'px-4 py-2 uppercase tracking-[0.14em]'}`}
           href={link.href}
           key={link.label}
           rel="noreferrer"
@@ -730,6 +730,97 @@ function LinksRow({ submission }) {
         </a>
       ))}
     </div>
+  );
+}
+
+export function CrmRecordCard({ submission, detailHref }) {
+  const dealScore = submissionDealScore(submission);
+  const contactName = submission.broker_name || submission.seller_name || submission.name || 'No contact named';
+  const contactEmail = submission.broker_email || submission.seller_email || submission.email || '';
+  const nextActionAt = submission.next_action_at ? new Date(submission.next_action_at) : null;
+  const nextActionIsOverdue = submission.follow_up_state !== 'completed'
+    && nextActionAt
+    && !Number.isNaN(nextActionAt.getTime())
+    && nextActionAt.getTime() < Date.now();
+  const followUpPrompt = submission.follow_up_prompt;
+  const financials = [
+    { label: 'Asking price', value: submission.asking_price || 'Not set' },
+    { label: 'TTM revenue', value: submission.ttm_revenue || 'Not set' },
+    { label: 'TTM EBITDA', value: submission.ttm_ebitda || 'Not set' },
+    { label: 'Multiple', value: submission.ebitda_multiple || 'Not set' },
+  ];
+
+  return (
+    <article className="admin-crm-record-summary">
+      <div className="flex min-w-0 flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <Pill tone={submission.status === 'spam' ? 'danger' : submission.status === 'contacted' ? 'success' : 'status'}>
+              {formatLabel(submission.status)}
+            </Pill>
+            <Pill tone={submission.priority === 'urgent' || submission.priority === 'high' ? 'warning' : 'default'}>
+              {formatLabel(submission.priority)} priority
+            </Pill>
+            {dealScore !== null ? <Pill tone={dealScoreTone(dealScore)}>Score {dealScore}</Pill> : null}
+            {followUpPrompt ? (
+              <Pill tone={followUpPrompt.severity === 'danger' ? 'danger' : followUpPrompt.severity === 'warning' ? 'warning' : 'info'}>
+                {formatLabel(followUpPrompt.kind)}
+              </Pill>
+            ) : null}
+          </div>
+
+          <h2 className="mt-3 text-xl font-semibold leading-tight text-ink sm:text-2xl">
+            {submission.company || submission.name || 'Untitled record'}
+          </h2>
+          <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm leading-6 text-ink/68">
+            <span>{formatLabel(submission.lead_type || 'prospect')}</span>
+            <span>Added {formatDateTime(submission.created_at)}</span>
+            <span>Owner: {submission.assigned_to || 'Unassigned'}</span>
+          </div>
+        </div>
+
+        <NavLink className={`${primaryActionButtonClass} shrink-0`} to={detailHref}>
+          Open record
+          <Target className="h-4 w-4" aria-hidden="true" />
+        </NavLink>
+      </div>
+
+      <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        {financials.map((item) => (
+          <div className="rounded-xl border border-line/75 bg-fog/60 px-4 py-3" key={item.label}>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-moss/72">{item.label}</p>
+            <p className="mt-1.5 font-semibold text-ink">{item.value}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-5 grid gap-4 border-t border-line/75 pt-5 md:grid-cols-3">
+        <div className="min-w-0">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-moss/72">Primary contact</p>
+          <p className="mt-1.5 truncate text-sm font-semibold text-ink">{contactName}</p>
+          {contactEmail ? (
+            <a className="mt-1 block truncate text-sm text-moss underline decoration-moss/30 underline-offset-2" href={`mailto:${contactEmail}`}>
+              {contactEmail}
+            </a>
+          ) : (
+            <p className="mt-1 text-sm text-ink/55">No email added</p>
+          )}
+        </div>
+
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-moss/72">Next action</p>
+          <p className={`mt-1.5 text-sm font-semibold ${nextActionIsOverdue ? 'text-red-700' : 'text-ink'}`}>
+            {formatDateTime(submission.next_action_at)}
+          </p>
+          <p className="mt-1 text-sm text-ink/55">{formatLabel(submission.follow_up_state || 'needs-response')}</p>
+        </div>
+
+        <div className="min-w-0">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-moss/72">Quick links</p>
+          <LinksRow compact submission={submission} />
+        </div>
+      </div>
+    </article>
   );
 }
 
@@ -3098,7 +3189,34 @@ export default function DashboardPage() {
       {activeSection === 'crm' ? (
       <section className="section-shell mt-8 pb-8">
         <div className="space-y-6">
+          {!isCrmDetailView ? (
+            <div className="flex flex-col gap-2 px-1 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <SectionLabel>Records index</SectionLabel>
+                <h2 className="mt-1 text-2xl font-semibold text-ink">{pluralize(dashboardData.total, 'record')}</h2>
+              </div>
+              <p aria-live="polite" className="text-sm text-ink/60">
+                {loading ? 'Updating results…' : `Showing ${submissions.length} on this page`}
+              </p>
+            </div>
+          ) : null}
+
           {submissions.map((submission, index) => {
+            if (!isCrmDetailView) {
+              return (
+                <Reveal
+                  className="panel admin-crm-record-card p-5 sm:p-6"
+                  delay={Math.min(index * 35, 210)}
+                  key={submission.id}
+                >
+                  <CrmRecordCard
+                    detailHref={`/admin/crm/${encodeURIComponent(submission.id)}${crmListSearch ? `?${crmListSearch}` : ''}`}
+                    submission={submission}
+                  />
+                </Reveal>
+              );
+            }
+
             const draft = drafts[submission.id] || buildDraft(submission);
             const latestUploadRequest = submission.latest_upload_request;
             const documents = submission.secure_documents || [];
@@ -3119,8 +3237,8 @@ export default function DashboardPage() {
 
             return (
               <Reveal
-                className={`panel p-5 sm:p-8 ${isCrmDetailView ? '' : 'admin-crm-record-card'}`}
-                delay={isCrmDetailView ? 0 : Math.min(index * 35, 210)}
+                className="panel p-5 sm:p-8"
+                delay={0}
                 key={submission.id}
               >
                 <div className="flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
@@ -3150,15 +3268,6 @@ export default function DashboardPage() {
                       submission.email_engagement?.failed ||
                       submission.email_engagement?.unsubscribed ? (
                         <Pill tone="danger">Email issue</Pill>
-                      ) : null}
-                      {!isCrmDetailView ? (
-                        <NavLink
-                          className="inline-flex min-h-[38px] items-center justify-center gap-2 rounded-full border border-ink/10 bg-white px-4 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
-                          to={`/admin/crm/${encodeURIComponent(submission.id)}${crmListSearch ? `?${crmListSearch}` : ''}`}
-                        >
-                          <Target className="h-3.5 w-3.5" />
-                          Open Deal Room
-                        </NavLink>
                       ) : null}
                     </div>
 
@@ -3772,13 +3881,11 @@ export default function DashboardPage() {
                   </div>
                 </fieldset>
 
-                {isCrmDetailView ? (
-                  <DealActivityTimeline
-                    error={dealActivity.error}
-                    events={dealActivity.events}
-                    loading={dealActivity.loading}
-                  />
-                ) : null}
+                <DealActivityTimeline
+                  error={dealActivity.error}
+                  events={dealActivity.events}
+                  loading={dealActivity.loading}
+                />
 
                 {!isReadOnly ? (
                   <div className="mt-6 grid gap-3 sm:flex sm:flex-wrap">
