@@ -181,6 +181,9 @@ function brandedEmailHtml({
 }) {
   const config = getConfig();
   const websiteUrl = normalizeUrl(config.brand.websiteUrl || config.server.origin);
+  const logoUrl = websiteUrl
+    ? normalizeUrl(`${websiteUrl.replace(/\/+$/, '')}/email-logo.png`)
+    : '';
   const mailingAddress = normalizeText(config.brand.mailingAddress, 260);
   const footerLines = [
     footerNote ? { value: footerNote, isHtml: true } : null,
@@ -211,9 +214,13 @@ function brandedEmailHtml({
                   <td style="padding: 0 0 14px;">
                     <table cellpadding="0" cellspacing="0" role="presentation" style="width: 100%; border-collapse: collapse;">
                       <tr>
-                        <td>
-                          <div style="display: inline-block; height: 40px; width: 40px; border-radius: 10px; background: #284638; color: #FFFFFF; font-size: 14px; font-weight: 800; line-height: 40px; text-align: center;">UG</div>
-                          <span style="display: inline-block; margin-left: 10px; color: #18211D; font-size: 18px; font-weight: 800; vertical-align: middle;">${escapeHtml(config.brand.companyName)}</span>
+                        <td style="width: 48px; vertical-align: middle;">
+                          ${logoUrl
+                            ? `<img src="${escapeHtml(logoUrl)}" width="44" height="44" alt="" style="display: block; width: 44px; height: 44px; border: 0; border-radius: 10px; outline: none; text-decoration: none;">`
+                            : '<div style="height: 40px; width: 40px; border-radius: 10px; background: #284638; color: #FFFFFF; font-size: 14px; font-weight: 800; line-height: 40px; text-align: center;">UG</div>'}
+                        </td>
+                        <td style="padding-left: 10px; color: #18211D; font-size: 18px; font-weight: 800; vertical-align: middle;">
+                          ${escapeHtml(config.brand.companyName)}
                         </td>
                       </tr>
                     </table>

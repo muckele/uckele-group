@@ -190,6 +190,15 @@ function assertBrokerEmailOmitsBodyHeadline(message) {
   );
 }
 
+function assertBrokerEmailIncludesBrandLogo(message) {
+  assert.match(
+    message.html,
+    /<img src="http:\/\/localhost:5173\/email-logo\.png" width="44" height="44" alt=""/,
+    'Broker email should render the hosted Uckele Group logo mark',
+  );
+  assert.match(message.html, />\s*Uckele Group\s*<\/td>/);
+}
+
 test('CIM request email keeps internal score and deal economics out of broker-visible content', () => {
   const message = buildDealHunterCimRequestEmail({
     to: 'broker@example.com',
@@ -203,6 +212,7 @@ test('CIM request email keeps internal score and deal economics out of broker-vi
   assert.match(message.subject, /CIM \/ NDA request/);
   assert.match(message.text, /Could you please send over the CIM or teaser, or let me know the NDA process\?/);
   assert.match(message.html, /View Listing/);
+  assertBrokerEmailIncludesBrandLogo(message);
   assertBrokerEmailOmitsBodyHeadline(message);
   assertBrokerEmailHidesFollowUpSequenceLabels(message);
   assertBrokerEmailHidesInternalDetails(message);
@@ -267,6 +277,7 @@ test('CIM follow-up emails keep internal score and deal economics out of broker-
     assert.match(message.subject, /^Re: CIM \/ NDA request/);
     assert.equal(message.tracking.followUpNumber, followUpNumber);
     assert.equal(message.tags.some((tag) => tag.name === 'follow_up_number' && tag.value === String(followUpNumber)), true);
+    assertBrokerEmailIncludesBrandLogo(message);
     assertBrokerEmailOmitsBodyHeadline(message);
     assertBrokerEmailHidesFollowUpSequenceLabels(message);
     assert.equal(message.text.includes(`#${followUpNumber}`), false);
