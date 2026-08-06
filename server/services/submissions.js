@@ -1021,6 +1021,13 @@ export async function createManualSubmission(body, adminUsername = '', options =
   }
 
   const status = normalizeStatus(body.status, 'review');
+  if (status === 'archived') {
+    return {
+      ok: false,
+      status: 400,
+      errors: ['Create the CRM record first, then use Archive Lead so a disposition reason and activity are retained.'],
+    };
+  }
   const message =
     normalizeMessage(body.message, 5000) ||
     notes ||
@@ -1273,6 +1280,15 @@ export async function updateSubmissionWorkflow(id, fields, options = {}) {
       return null;
     }
 
+    // Archive and restore carry required disposition/audit semantics and must
+    // use their explicit lifecycle operations instead of the generic status field.
+    if (
+      (nextStatus === 'archived' && existing.status !== 'archived') ||
+      (existing.status === 'archived' && nextStatus !== 'archived')
+    ) {
+      return null;
+    }
+
     updates.status = nextStatus;
 
     if (nextStatus !== existing.status) {
@@ -1293,11 +1309,19 @@ export async function updateSubmissionWorkflow(id, fields, options = {}) {
   }
 
   if (fields.next_action_at !== undefined) {
-    updates.next_action_at = normalizeField(fields.next_action_at, 80) || null;
+    const nextActionAt = normalizeField(fields.next_action_at, 80) || null;
+    if (existing.status === 'archived' && nextActionAt) {
+      return null;
+    }
+    updates.next_action_at = nextActionAt;
   }
 
   if (fields.follow_up_state !== undefined) {
-    updates.follow_up_state = normalizeFollowUpState(fields.follow_up_state, existing.follow_up_state);
+    const followUpState = normalizeFollowUpState(fields.follow_up_state, existing.follow_up_state);
+    if (existing.status === 'archived' && followUpState !== 'completed') {
+      return null;
+    }
+    updates.follow_up_state = followUpState;
   }
 
   if (fields.tags !== undefined) {
@@ -2077,6 +2101,38 @@ export async function deleteDashboardSubmission(id, options = {}) {
   }
 
   if (deletionError) {
+    if (deletionError.code === 'CIM_SEND_IN_PROGRESS' || deletionError.status === 409) {
+      const restoreFailures = await restoreStagedDocumentFiles(staged.stagedFiles, renameFile);
+      if (restoreFailures.length === 0) {
+        await removeCleanupDirectory(staged.trashDirectory, rmdir).catch((error) => {
+          restoreFailures.push({ filePath: staged.trashDirectory, message: error.message });
+        });
+      }
+      if (cleanupJob) {
+        const now = new Date().toISOString();
+        await updateCleanupState({
+          updated_at: now,
+          completed_at: restoreFailures.length === 0 ? now : null,
+          status: restoreFailures.length === 0 ? 'restored' : 'restore-failed',
+          attempt_count: 1,
+          last_error: restoreFailures.map((failure) => failure.message).join('; ') || null,
+        }).catch(() => {});
+      }
+      return restoreFailures.length === 0
+        ? {
+            ok: false,
+            status: 409,
+            error: 'CRM deletion is blocked while a CIM transmission is in progress. Retry after the claim lease expires.',
+            cleanupFailures: [],
+          }
+        : {
+            ok: false,
+            status: 500,
+            error: 'CRM deletion was blocked, and staged documents could not be fully restored.',
+            cleanupFailures: restoreFailures,
+          };
+    }
+
     const message = String(deletionError.message || deletionError).slice(0, 2000);
     if (cleanupJob) {
       await updateCleanupState({

@@ -81,7 +81,7 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     expect(screen.queryByRole('link', { name: 'View original listing' })).not.toBeInTheDocument();
   });
 
-  test('shows recovered listing-link coverage and non-fatal workbook warnings', () => {
+  test('shows listing-link coverage and non-fatal workbook warnings', () => {
     const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
     review.sources = [{
       id: 'sheet-0',
@@ -90,14 +90,74 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
       fetched: true,
       rowCount: 871,
       listingUrlCount: 302,
+      listingUrlExpectedCount: 305,
       listingUrlWarning: 'Workbook export timed out; CSV deals were still imported.',
     }];
 
     render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onReview={vi.fn()} review={review} />);
 
-    expect(screen.getByText('302 original listing links recovered.')).toBeVisible();
+    expect(screen.getByText('302 of 305 original listing links available (99%).')).toBeVisible();
     expect(screen.getByText(/Listing-link import warning: Workbook export timed out/)).toBeVisible();
     expect(screen.getByText('871 rows')).toBeVisible();
+  });
+
+  test('labels configuration failures as setup-needed and flags partial totals', () => {
+    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    review.sources = [{
+      id: 'airtable-shared',
+      name: 'Airtable Biz List',
+      mode: 'shared-view',
+      fetched: false,
+      rowCount: 0,
+      error: 'Airtable shared view requires API mode.',
+      requiresConfiguration: true,
+      configurationKey: 'DEAL_HUNTER_AIRTABLE_TOKEN',
+    }];
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onReview={vi.fn()} review={review} />);
+
+    expect(screen.getByText('setup needed')).toBeVisible();
+    expect(screen.getByText(/Required setting:/)).toHaveTextContent('DEAL_HUNTER_AIRTABLE_TOKEN');
+    expect(screen.getByRole('alert')).toHaveTextContent('Partial review.');
+    expect(screen.getByRole('alert')).toHaveTextContent('totals and candidates cover only successfully imported sources');
+  });
+
+  test('pauses daily email and CIM outreach while a source review is partial', () => {
+    const review = reviewWithDeal({
+      eligible: true,
+      canRequest: true,
+      status: 'failed',
+      recipientEmail: 'broker@example.com',
+    });
+    review.totals.cimReady = 1;
+    review.sources = [{
+      id: 'airtable-shared',
+      name: 'Airtable Biz List',
+      mode: 'shared-view',
+      fetched: false,
+      error: 'Airtable shared view requires API mode.',
+      requiresConfiguration: true,
+      configurationKey: 'DEAL_HUNTER_AIRTABLE_TOKEN',
+    }];
+
+    render(
+      <DealHunterWorkspace
+        feedback={{ error: '', message: '' }}
+        onOpenApprovals={vi.fn()}
+        onReview={vi.fn()}
+        onSendCimRequest={vi.fn()}
+        onSendEmail={vi.fn()}
+        onSendReady={vi.fn()}
+        review={review}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Review CIM Requests' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Send Daily Email' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Retry CIM Request' })).toBeDisabled();
+    expect(screen.getByText('Complete a successful source review before approving or sending CIM requests.')).toBeVisible();
+    expect(screen.getByText('Complete the source review before outreach')).toBeVisible();
   });
 
   test('keeps an in-progress follow-up in the warning state with its schedule', () => {
@@ -133,6 +193,55 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('Mailbox rejected the CIM request.');
     expect(screen.getByText('Read-only access')).toBeVisible();
     expect(screen.getByText('What percentage of revenue is recurring?')).toBeVisible();
+  });
+
+  test('keeps durable CIM lifecycle and CRM links visible on watchlist and removal cards', () => {
+    const watchDeal = {
+      id: 'watch-deal',
+      dealKey: 'watch-deal',
+      name: 'Watchlist Industrial Services',
+      score: 68,
+      sourceName: 'Test source',
+      strengths: ['Recurring customers'],
+      cimRequest: {
+        status: 'sent',
+        requestState: 'provider_accepted',
+        deliveryState: 'accepted',
+        recipientEmail: 'watch@broker.example',
+        submissionId: 'watch-submission',
+        firstProviderAcceptedAt: '2026-08-06T17:00:00.000Z',
+      },
+    };
+    const removalDeal = {
+      id: 'remove-deal',
+      dealKey: 'remove-deal',
+      name: 'Unavailable Field Services',
+      score: 44,
+      sourceName: 'Test source',
+      removeReasons: ['Listing is no longer available'],
+      cimRequest: {
+        status: 'delivery_issue',
+        requestState: 'provider_accepted',
+        deliveryState: 'bounced',
+        recipientEmail: 'old@broker.example',
+        submissionId: 'remove-submission',
+        deliveryError: 'Mailbox rejected the message.',
+      },
+    };
+    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    review.qualified = [];
+    review.watchlist = [watchDeal];
+    review.removalCandidates = [removalDeal];
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onReview={vi.fn()} review={review} />);
+
+    expect(screen.getByText('Watchlist Industrial Services').closest('article')).toHaveTextContent('Awaiting delivery');
+    expect(screen.getByText('Unavailable Field Services').closest('article')).toHaveTextContent('Bounced');
+    expect(screen.getAllByRole('link', { name: 'Open CIM history' })).toHaveLength(2);
+    expect(screen.getAllByRole('link', { name: 'Open CRM communications' }).map((link) => link.getAttribute('href'))).toEqual([
+      '/admin/crm/watch-submission',
+      '/admin/crm/remove-submission',
+    ]);
   });
 
   test('announces action failures and retains the daily-email job error', () => {

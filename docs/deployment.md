@@ -120,8 +120,9 @@ Then update DNS:
 - Turnstile should be enabled in production.
 - Configure Resend webhooks to post `email.sent`, `email.delivered`, `email.delivery_delayed`, `email.failed`, `email.bounced`, `email.complained`, `email.opened`, `email.clicked`, and `email.received` events to `/api/webhooks/resend`; store that webhook's signing secret in `RESEND_WEBHOOK_SECRET`.
 - Configure a Resend receiving subdomain such as `replies.uckelegroup.com`, set `RESEND_INBOUND_DOMAIN` to that domain, and set `RESEND_REPLY_TO` to an address on it. Do not replace the root domain's existing MX records.
+- Use `DELIVERY_PROVIDER=resend` for live CIM initial and follow-up outreach. EmailJS may still deliver ordinary application mail, but CIM sends intentionally fail closed before the network because that provider cannot supply the durable acceptance/idempotency proof required for safe retry.
 - Keep `DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED=false` until the Operations email-readiness panel shows a verified inbound reply from the controlled test email. When enabling it, set the intended delay sequence, maximum count, weekday policy, and timezone explicitly.
-- Apply every committed Supabase migration before deploying code when `STORAGE_PROVIDER=supabase` is enabled.
+- Apply every committed Supabase migration before deploying code when `STORAGE_PROVIDER=supabase` is enabled. Confirm that `20260806120000_crm_communications_lifecycle.sql` and its atomic communication/CIM/archive RPCs complete successfully before starting the new application version.
 - Keep the secure document `.trash` directory on the persistent volume; startup and hourly cleanup reconciliation depend on it. Every file-mutating upload or deletion records a write-ahead cleanup intent before its first write or move. When database persistence cannot be confirmed, a private local `.reconciliation.json` sidecar preserves the intent until it can be imported safely; atomic temporary writes and directory syncing allow a valid intent to be recovered after abrupt process loss. Ambiguous mutations remain staged for the settlement window. A reconciler must then acquire the job's opaque, expiring lease token. The database clock renews a still-valid token before every filesystem mutation (including each file in a batch), and token-fenced state transitions reject expired leases. Reconciliation rejects paths outside the intent's exact operation directory, destinations inconsistent with the corresponding secure-document record, and filesystem or state changes from stale lease owners.
 - Application-consistent SQLite backups run daily at `03:30 America/Los_Angeles`, retain 14 verified bundles/days by default, and are visible in the admin-only Operations page.
 - Fly volume snapshots and application backup bundles are complementary. Follow [sqlite-recovery.md](/Users/Matt/Documents/uckele-group/docs/sqlite-recovery.md) for verification and restore drills.
@@ -130,14 +131,20 @@ Then update DNS:
 
 - Confirm the contact form is delivering to `mathew@uckelegroup.com`
 - Confirm `/admin` can run Deal Hunter scoring and send the daily email
-- Confirm `/admin` can send a 75+ Deal Hunter CIM request and run the CIM follow-up check
+- With Resend configured, confirm `/admin` can send a controlled 75+ Deal Hunter CIM request and run the CIM follow-up check
 - Confirm the in-app scheduler logs `deal-hunter:scheduler` startup and sends after the configured Pacific time
 - If using an external scheduler, confirm it posts to `/api/deal-hunter/daily-email` with `Authorization: Bearer DEAL_HUNTER_CRON_SECRET`
 - Confirm the first successful daily email creates Deal Hunter history rows so later emails can separate newly seen matches from already reviewed listings
 - Confirm magic-link sign-in emails are being delivered
 - If SMB Deal Hunter viewer access is needed, configure `ADMIN_VIEWER_EMAILS` or `ADMIN_VIEWER_USERNAME` / `ADMIN_VIEWER_PASSWORD` and verify a viewer cannot save, export, send emails, or run imports
 - Confirm Resend webhook events create email engagement records in the admin CRM
+- Send a controlled inbound reply through the Resend receiving subdomain and confirm its plain-text body and attachment metadata appear once in CRM Communications; verify replaying the same webhook does not duplicate it
+- Confirm ambiguous inbound mail appears only in the admin unassigned inbox and can be assigned to a searched CRM record
 - Confirm Resend inbound `email.received` webhook events stop CIM follow-ups before enabling `DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED=true`
+- Force a controlled bounce, confirm request and delivery state remain distinct, and verify corrected-recipient retry requires a different validated address or an explicit reasoned override
+- Confirm archiving a CRM record stops linked CIM follow-ups, restoring it does not restart outreach, and permanent delete remains a separately confirmed action
+- Confirm archive, dismissal, and permanent delete return a conflict instead of racing a fresh CIM transmission lease
+- Confirm the CIM request history remains available after its source listing is removed or unavailable and reveals the exact stored initial/follow-up email copies
 - Confirm weekend-due CIM follow-ups are deferred when `DEAL_HUNTER_CIM_FOLLOW_UP_WEEKDAYS_ONLY=true`
 - Verify `/api/health` returns `200` for process liveness and `/api/ready` returns `200` for storage and document-vault readiness on the Fly URL
 - Confirm uploaded secure documents are written under the mounted volume

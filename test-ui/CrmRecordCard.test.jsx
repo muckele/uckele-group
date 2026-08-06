@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import React from 'react';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { CrmRecordCard } from '../src/pages/DashboardPage.jsx';
 
 afterEach(cleanup);
@@ -28,11 +28,12 @@ const submission = {
   metadata: { dealHunter: { score: 82 } },
 };
 
-function renderCard(overrides = {}) {
+function renderCard(overrides = {}, props = {}) {
   return render(
     <MemoryRouter>
       <CrmRecordCard
         detailHref="/admin/crm/record-123?status=review"
+        {...props}
         submission={{ ...submission, ...overrides }}
       />
     </MemoryRouter>,
@@ -66,5 +67,20 @@ describe('CRM record summary card', () => {
 
     const nextActionSection = screen.getByText('Next action').parentElement;
     expect(nextActionSection.querySelector('.text-red-700')).not.toBeNull();
+  });
+
+  test('offers a reasoned Archive Lead action on editable index cards', async () => {
+    const onArchiveLead = vi.fn().mockResolvedValue({ ...submission, status: 'archived' });
+    renderCard({}, { onArchiveLead });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Archive Lead' }));
+    fireEvent.change(screen.getByLabelText('Disposition reason'), { target: { value: 'not-a-fit' } });
+    fireEvent.change(screen.getByLabelText('Archive note (optional)'), { target: { value: 'Outside the acquisition profile.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm Archive' }));
+
+    await waitFor(() => expect(onArchiveLead).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'record-123' }),
+      { reason: 'not-a-fit', note: 'Outside the acquisition profile.', communicationId: '' },
+    ));
   });
 });

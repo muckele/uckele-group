@@ -54,6 +54,11 @@ export default function OperationsCenter({ data, loading = false, error = '', on
   const schedulerUnavailable = Boolean(data.scheduler?.error);
   const cimAutomation = data.cimAutomation || {};
   const cimMetrics = cimAutomation.metrics || {};
+  const communications = data.communications || {};
+  const communicationPending = Math.max(0, Number(communications.pending || 0));
+  const communicationFailed = Math.max(0, Number(communications.failed || 0));
+  const communicationUnassigned = Math.max(0, Number(communications.unassigned || 0));
+  const communicationAttention = communicationPending + communicationFailed + communicationUnassigned;
 
   return (
     <div className="space-y-6">
@@ -64,6 +69,7 @@ export default function OperationsCenter({ data, loading = false, error = '', on
           {[
             ...(data.email ? [['#email-readiness-heading', 'Email']] : []),
             ['#cim-automation-heading', 'Automation'],
+            ['#communication-ingestion-heading', 'Communications'],
             ['#core-systems-heading', 'Core systems'],
             ['#scheduler-history-heading', 'Jobs'],
             ['#source-history-heading', 'Sources'],
@@ -94,7 +100,15 @@ export default function OperationsCenter({ data, loading = false, error = '', on
           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">Infrastructure</p>
           <h3 className="mt-2 text-xl font-semibold text-ink" id="core-systems-heading">Core systems at a glance</h3>
         </div>
-        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+        <article className="panel p-5" aria-labelledby="communication-ingestion-heading">
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">Inbound communications</p>
+          <h4 className="sr-only" id="communication-ingestion-heading">Communication ingestion status</h4>
+          <div className="mt-3"><StatusBadge healthy={!communications.error && communicationAttention === 0} warning={!communications.error && communicationFailed === 0 && communicationAttention > 0}>{communications.error ? 'Check unavailable' : communicationAttention === 0 ? 'Healthy' : `${communicationAttention} need attention`}</StatusBadge></div>
+          <p className="mt-3 text-sm text-ink/68">{communicationPending} pending · {communicationFailed} failed · {communicationUnassigned} unassigned</p>
+          <p className="mt-1 text-xs text-ink/50">Counts only; message content is never exposed in Operations.</p>
+          <PanelError>{communications.error}</PanelError>
+        </article>
         <article className="panel p-5">
           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">Database</p>
           <div className="mt-3"><StatusBadge healthy={database.ok}>{database.ok ? 'Healthy' : 'Check failed'}</StatusBadge></div>

@@ -5,6 +5,7 @@ import { startDealHunterCimFollowUpScheduler, startDealHunterDailyEmailScheduler
 import { reconcileSecureDocumentCleanupJobs, startSecureDocumentCleanupScheduler } from './services/submissions.js';
 import { startBackupScheduler } from './services/backups.js';
 import { cleanupExpiredAuthRecords, startAuthCleanupScheduler } from './services/auth.js';
+import { startInboundCommunicationIngestionScheduler } from './services/communications.js';
 
 const config = getConfig();
 const host = process.env.HOST || '0.0.0.0';
@@ -26,6 +27,7 @@ const server = app.listen(config.server.port, host, () => {
     startSecureDocumentCleanupScheduler(),
     startBackupScheduler(),
     startAuthCleanupScheduler(),
+    startInboundCommunicationIngestionScheduler(),
   ];
 });
 

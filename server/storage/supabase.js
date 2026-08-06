@@ -41,6 +41,20 @@ function normalizeCrmActivityEventRow(row) {
     : null;
 }
 
+function normalizeCrmCommunicationRow(row) {
+  return row
+    ? {
+        ...row,
+        to_addresses: Array.isArray(row.to_addresses) ? row.to_addresses : [],
+        cc_addresses: Array.isArray(row.cc_addresses) ? row.cc_addresses : [],
+        bcc_addresses: Array.isArray(row.bcc_addresses) ? row.bcc_addresses : [],
+        attachment_metadata: Array.isArray(row.attachment_metadata) ? row.attachment_metadata : [],
+        metadata: typeof row.metadata === 'object' && row.metadata !== null && !Array.isArray(row.metadata) ? row.metadata : {},
+        content_attempt_count: Number(row.content_attempt_count || 0),
+      }
+    : null;
+}
+
 function normalizeSecureDocumentCleanupJobRow(row) {
   return row
     ? {
@@ -183,7 +197,18 @@ function normalizeDealHunterCimRequestRow(row) {
     ? {
         ...row,
         follow_up_count: Number(row.follow_up_count || 0),
+        attempt_count: Number(row.attempt_count || 0),
         metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
+      }
+    : null;
+}
+
+function normalizeDealHunterDispositionRow(row) {
+  return row
+    ? {
+        ...row,
+        status: row.disposition,
+        metadata: typeof row.metadata === 'object' && row.metadata !== null && !Array.isArray(row.metadata) ? row.metadata : {},
       }
     : null;
 }
@@ -209,12 +234,21 @@ function normalizeAtomicMutationResult(operation, data) {
     finalize_secure_document_upload: normalizeUploadRequestRow,
     update_secure_upload_request: normalizeUploadRequestRow,
     insert_email_event: normalizeEmailEventRow,
+    insert_crm_communication: normalizeCrmCommunicationRow,
+    assign_crm_communication: normalizeCrmCommunicationRow,
+    archive_submission: normalizeSubmissionRow,
     upsert_deal_hunter_cim_request: normalizeDealHunterCimRequestRow,
+    finalize_deal_hunter_cim_request_claim: normalizeDealHunterCimRequestRow,
+    dismiss_deal_hunter_opportunity: (record) => ({
+      submission: record?.submission ? normalizeSubmissionRow(record.submission) : null,
+      disposition: record?.disposition ? normalizeDealHunterDispositionRow(record.disposition) : null,
+    }),
   };
   const normalizeRecord = normalizers[operation] || ((record) => record);
 
   return {
     applied: Boolean(data.applied),
+    reason: data.reason || '',
     record: data.record ? normalizeRecord(data.record) : null,
     activity: data.activity ? normalizeCrmActivityEventRow(data.activity) : null,
   };
@@ -228,6 +262,13 @@ function normalizeList(values, maxLength = 5000) {
         .filter(Boolean),
     ),
   ).slice(0, maxLength);
+}
+
+function normalizePage(value, maxPage = 10000) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue)
+    ? Math.min(maxPage, Math.max(1, Math.trunc(numericValue)))
+    : 1;
 }
 
 const sharedWebsiteDomains = [
@@ -319,17 +360,66 @@ function isUniqueViolation(error) {
 }
 
 function safeDealHunterCimRequest(request = {}) {
+  const now = new Date().toISOString();
+  const status = String(request.status || 'pending').trim() || 'pending';
+  const createdAt = request.created_at || now;
+  const updatedAt = request.updated_at || createdAt;
+  const metadata = request.metadata && typeof request.metadata === 'object' && !Array.isArray(request.metadata)
+    ? request.metadata
+    : {};
+  const inferredRequestState = status === 'pending'
+    ? 'pending'
+    : status === 'responded'
+      ? 'responded'
+      : status === 'delivery_issue'
+        ? 'stopped'
+        : status === 'failed'
+          ? 'ready'
+          : ['sent', 'logged', 'follow_up_pending', 'follow_up_failed'].includes(status)
+            ? 'provider_accepted'
+            : null;
+  const inferredDeliveryState = status === 'logged'
+    ? 'development-only'
+    : status === 'failed'
+      ? 'failed'
+      : status === 'delivery_issue'
+        ? String(metadata.deliveryIssueType || 'failed').replaceAll('_', '-')
+        : ['sent', 'responded', 'follow_up_pending', 'follow_up_failed'].includes(status)
+          ? 'accepted'
+          : 'not-attempted';
   return {
     ...request,
+    id: String(request.id || '').trim(),
+    created_at: createdAt,
+    updated_at: updatedAt,
+    deal_key: String(request.deal_key || '').trim(),
     recipient_email: String(request.recipient_email || '').trim().toLowerCase(),
+    status,
+    submission_id: String(request.submission_id || '').trim() || null,
+    request_state: request.request_state || inferredRequestState,
+    delivery_state: request.delivery_state || inferredDeliveryState,
+    delivery_state_at: request.delivery_state_at || null,
+    follow_up_state: request.follow_up_state || (request.responded_at
+      ? 'completed'
+      : request.next_follow_up_at
+        ? 'scheduled'
+        : ['failed', 'delivery_issue'].includes(status)
+          ? 'stopped'
+          : 'not-scheduled'),
+    first_requested_at: request.first_requested_at || createdAt,
+    first_provider_accepted_at: request.first_provider_accepted_at || null,
+    delivered_at: request.delivered_at || null,
+    last_attempt_at: request.last_attempt_at || null,
+    last_delivery_event_at: request.last_delivery_event_at || null,
+    reply_to_address: String(request.reply_to_address || metadata.replyToAddress || '').trim().toLowerCase() || null,
+    retry_of_request_id: request.retry_of_request_id || null,
+    attempt_count: Object.hasOwn(request, 'attempt_count')
+      ? Math.max(0, Number(request.attempt_count || 0))
+      : status === 'pending' ? 0 : 1,
+    last_activity_at: request.last_activity_at || updatedAt,
     follow_up_count: Number(request.follow_up_count || 0),
+    metadata,
   };
-}
-
-function dealHunterCimUpdatePayload(request = {}) {
-  const payload = safeDealHunterCimRequest(request);
-  delete payload.created_at;
-  return payload;
 }
 
 function safeDealHunterCrmImport(record = {}) {
@@ -340,6 +430,64 @@ function safeDealHunterCrmImport(record = {}) {
     listing_url: String(record.listing_url || '').trim(),
     submission_id: String(record.submission_id || '').trim() || null,
     metadata: typeof record.metadata === 'object' && record.metadata !== null ? record.metadata : {},
+  };
+}
+
+const crmCommunicationFields = [
+  'id', 'submission_id', 'deal_key', 'cim_request_id', 'direction', 'channel', 'source', 'kind',
+  'provider', 'provider_message_id', 'source_event_id', 'idempotency_key', 'in_reply_to',
+  'reply_to_address', 'from_address', 'to_addresses', 'cc_addresses', 'bcc_addresses', 'subject',
+  'body_text', 'body_html_sanitized', 'occurred_at', 'created_at', 'updated_at', 'delivery_state',
+  'delivery_state_at', 'content_state', 'content_attempt_count', 'content_last_error',
+  'content_next_attempt_at', 'attachment_metadata', 'assigned_at', 'assigned_by', 'created_by',
+  'updated_by', 'metadata',
+];
+
+function safeCrmCommunication(record = {}, { update = false } = {}) {
+  const payload = {};
+  for (const field of crmCommunicationFields) {
+    if (!Object.hasOwn(record, field)) continue;
+    payload[field] = record[field];
+  }
+  if (!update) {
+    payload.submission_id = String(payload.submission_id || '').trim() || null;
+    payload.deal_key = String(payload.deal_key || '').trim() || null;
+    payload.cim_request_id = String(payload.cim_request_id || '').trim() || null;
+    payload.to_addresses = Array.isArray(payload.to_addresses) ? payload.to_addresses : [];
+    payload.cc_addresses = Array.isArray(payload.cc_addresses) ? payload.cc_addresses : [];
+    payload.bcc_addresses = Array.isArray(payload.bcc_addresses) ? payload.bcc_addresses : [];
+    payload.attachment_metadata = Array.isArray(payload.attachment_metadata) ? payload.attachment_metadata : [];
+  }
+  if (Object.hasOwn(payload, 'metadata')) {
+    payload.metadata = typeof payload.metadata === 'object' && payload.metadata !== null && !Array.isArray(payload.metadata)
+      ? payload.metadata
+      : {};
+  }
+  return payload;
+}
+
+function safeDealHunterDisposition(record = {}) {
+  const disposition = String(record.disposition || record.status || 'dismissed').trim().toLowerCase();
+  const now = record.updated_at || record.updatedAt || new Date().toISOString();
+  return {
+    id: String(record.id || '').trim(),
+    deal_key: String(record.deal_key || record.dealKey || '').trim(),
+    submission_id: String(record.submission_id || record.submissionId || '').trim() || null,
+    communication_id: String(record.communication_id || record.communicationId || '').trim() || null,
+    listing_url: String(record.listing_url || record.listingUrl || '').trim() || null,
+    deal_name: String(record.deal_name || record.dealName || '').trim() || null,
+    created_at: record.created_at || record.createdAt || now,
+    updated_at: now,
+    disposition,
+    reason: String(record.reason || '').trim() || null,
+    note: String(record.note || '').trim() || null,
+    dismissed_at: record.dismissed_at || record.dismissedAt || (disposition === 'dismissed' ? now : null),
+    dismissed_by: String(record.dismissed_by || record.dismissedBy || (disposition === 'dismissed' ? record.updated_by || record.created_by : '') || '').trim() || null,
+    restored_at: record.restored_at || record.restoredAt || (disposition === 'restored' ? now : null),
+    restored_by: String(record.restored_by || record.restoredBy || (disposition === 'restored' ? record.updated_by : '') || '').trim() || null,
+    created_by: String(record.created_by || record.createdBy || 'system').trim() || 'system',
+    updated_by: String(record.updated_by || record.updatedBy || 'system').trim() || 'system',
+    metadata: typeof record.metadata === 'object' && record.metadata !== null && !Array.isArray(record.metadata) ? record.metadata : {},
   };
 }
 
@@ -436,7 +584,24 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     async mutateWithCrmActivity({ operation, payload, activity }) {
-      const { data, error } = await client.rpc('mutate_with_crm_activity', {
+      const communicationsOperations = new Set([
+        'insert_crm_communication',
+        'assign_crm_communication',
+        'archive_submission',
+        'upsert_deal_hunter_cim_request',
+        'finalize_deal_hunter_cim_request_claim',
+        'dismiss_deal_hunter_opportunity',
+      ]);
+      const lifecycleSubmissionFields = [
+        'archived_at', 'archived_by', 'archive_reason', 'archive_note', 'archive_communication_id',
+        'restored_at', 'restored_by',
+      ];
+      const usesLifecycleSubmissionFields = operation === 'update_submission'
+        && lifecycleSubmissionFields.some((field) => Object.hasOwn(payload?.values || {}, field));
+      const rpcName = communicationsOperations.has(operation) || usesLifecycleSubmissionFields
+        ? 'mutate_communications_with_crm_activity'
+        : 'mutate_with_crm_activity';
+      const { data, error } = await client.rpc(rpcName, {
         p_operation: operation,
         p_payload: payload || {},
         p_activity: activity,
@@ -505,34 +670,22 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return data ? normalizeSubmissionRow(data) : null;
     },
 
-    async deleteSubmission(id) {
-      const existing = await this.getSubmission(id);
-
-      if (!existing) {
-        return null;
-      }
-
-      const nowIso = new Date().toISOString();
-      const relatedUpdates = await Promise.all([
-        client.from('email_events').delete().eq('submission_id', id),
-        client
-          .from('deal_hunter_crm_imports')
-          .update({ submission_id: null, status: 'crm-deleted', updated_at: nowIso })
-          .eq('submission_id', id),
-      ]);
-      const relatedError = relatedUpdates.find((result) => result.error)?.error;
-
-      if (relatedError) {
-        throw relatedError;
-      }
-
-      const { error } = await client.from('contact_submissions').delete().eq('id', id);
-
+    async deleteSubmission(id, { deletedAt = '' } = {}) {
+      const effectiveDeletedAt = deletedAt || new Date().toISOString();
+      const { data, error } = await client.rpc('delete_crm_submission_lifecycle', {
+        p_submission_id: id,
+        p_deleted_at: effectiveDeletedAt,
+      });
       if (error) {
+        if (/CIM transmission is in progress/i.test(error.message || '')) {
+          const conflict = new Error(error.message);
+          conflict.code = 'CIM_SEND_IN_PROGRESS';
+          conflict.status = 409;
+          throw conflict;
+        }
         throw error;
       }
-
-      return existing;
+      return data ? normalizeSubmissionRow(data) : null;
     },
 
     async getSubmissionByContactEmail(email) {
@@ -555,6 +708,19 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       }
 
       return data ? normalizeSubmissionRow(data) : null;
+    },
+
+    async listSubmissionsByContactEmail(email, { limit = 25, openOnly = false } = {}) {
+      const normalizedEmail = String(email || '').trim().toLowerCase();
+      if (!normalizedEmail) return [];
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 25, 250));
+      const { data, error } = await client.rpc('list_submissions_by_contact_email', {
+        p_email: normalizedEmail,
+        p_limit: safeLimit,
+        p_open_only: Boolean(openOnly),
+      });
+      if (error) throw error;
+      return Array.isArray(data) ? data.map(normalizeSubmissionRow) : [];
     },
 
     async getSubmissionByBusinessWebsite(websiteUrl) {
@@ -1135,6 +1301,188 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return (data || []).map(normalizeEmailEventRow);
     },
 
+    async getCrmCommunication(id) {
+      if (!id) return null;
+      const { data, error } = await client
+        .from('crm_communications')
+        .select('*')
+        .eq('id', id)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeCrmCommunicationRow(data);
+    },
+
+    async getCrmCommunicationByProviderMessage(provider, messageId, direction = '') {
+      if (!provider || !messageId) return null;
+      let query = client
+        .from('crm_communications')
+        .select('*')
+        .eq('provider', String(provider).trim())
+        .eq('provider_message_id', String(messageId).trim())
+        .order('occurred_at', { ascending: false })
+        .limit(1);
+      if (direction) query = query.eq('direction', String(direction).trim());
+      const { data, error } = await query.maybeSingle();
+      if (error) throw error;
+      return normalizeCrmCommunicationRow(data);
+    },
+
+    async getCrmCommunicationBySourceEvent(provider, sourceEventId) {
+      if (!provider || !sourceEventId) return null;
+      const { data, error } = await client
+        .from('crm_communications')
+        .select('*')
+        .eq('provider', String(provider).trim())
+        .eq('source_event_id', String(sourceEventId).trim())
+        .order('occurred_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeCrmCommunicationRow(data);
+    },
+
+    async insertCrmCommunication(communication = {}) {
+      const payload = safeCrmCommunication(communication);
+      const { data, error } = await client.from('crm_communications').insert(payload).select().single();
+      if (!error) return normalizeCrmCommunicationRow(data);
+      if (!isUniqueViolation(error)) throw error;
+
+      if (payload.id) {
+        const existing = await this.getCrmCommunication(payload.id);
+        if (existing) return existing;
+      }
+      if (payload.idempotency_key) {
+        const result = await client.from('crm_communications').select('*').eq('idempotency_key', payload.idempotency_key).maybeSingle();
+        if (result.error) throw result.error;
+        if (result.data) return normalizeCrmCommunicationRow(result.data);
+      }
+      if (payload.provider && payload.source_event_id) {
+        const existing = await this.getCrmCommunicationBySourceEvent(payload.provider, payload.source_event_id);
+        if (existing) return existing;
+      }
+      if (payload.provider && payload.provider_message_id) {
+        const existing = await this.getCrmCommunicationByProviderMessage(payload.provider, payload.provider_message_id, payload.direction);
+        if (existing) return existing;
+      }
+      throw error;
+    },
+
+    async updateCrmCommunication(id, values = {}) {
+      const payload = safeCrmCommunication(values, { update: true });
+      for (const immutableField of ['id', 'created_at', 'created_by']) delete payload[immutableField];
+      if (Object.keys(payload).length === 0) return this.getCrmCommunication(id);
+      const { data, error } = await client
+        .from('crm_communications')
+        .update(payload)
+        .eq('id', id)
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeCrmCommunicationRow(data);
+    },
+
+    async listCrmCommunications({
+      submissionId = '', cimRequestId = '', dealKey = '', unassigned = false, direction = '',
+      channels = [], deliveryStates = [], contentStates = [], search = '', before = '', page = 1, pageSize = 25,
+    } = {}) {
+      const safePage = normalizePage(page);
+      const safePageSize = Math.max(1, Math.min(Number(pageSize) || 25, 100));
+      const offset = before ? 0 : (safePage - 1) * safePageSize;
+      let query = client
+        .from('crm_communications')
+        .select('*', { count: 'exact' })
+        .order('occurred_at', { ascending: false })
+        .order('id', { ascending: false })
+        .range(offset, offset + safePageSize - 1);
+      if (submissionId) query = query.eq('submission_id', submissionId);
+      if (cimRequestId) query = query.eq('cim_request_id', cimRequestId);
+      if (dealKey) query = query.eq('deal_key', dealKey);
+      if (unassigned) query = query.is('submission_id', null);
+      if (direction) query = query.eq('direction', direction);
+      const safeChannels = normalizeList(channels, 20);
+      const safeDeliveryStates = normalizeList(deliveryStates, 20);
+      const safeContentStates = normalizeList(contentStates, 20);
+      if (safeChannels.length > 0) query = query.in('channel', safeChannels);
+      if (safeDeliveryStates.length > 0) query = query.in('delivery_state', safeDeliveryStates);
+      if (safeContentStates.length > 0) query = query.in('content_state', safeContentStates);
+      if (before) query = query.lt('occurred_at', before);
+      const safeSearch = String(search || '').trim().toLowerCase().replace(/["\\(),]/g, ' ').slice(0, 500);
+      if (safeSearch) {
+        query = query.or([
+          `subject.ilike."*${safeSearch}*"`,
+          `from_address.ilike."*${safeSearch}*"`,
+          `body_text.ilike."*${safeSearch}*"`,
+          `deal_key.ilike."*${safeSearch}*"`,
+        ].join(','));
+      }
+      const { data, error, count } = await query;
+      if (error) throw error;
+      return {
+        rows: (data || []).map(normalizeCrmCommunicationRow),
+        total: Number(count || 0),
+        page: safePage,
+        pageSize: safePageSize,
+      };
+    },
+
+    async countCrmCommunications({
+      submissionId = '', cimRequestId = '', unassigned = false, direction = '', contentStates = [], deliveryStates = [],
+    } = {}) {
+      let query = client.from('crm_communications').select('*', { count: 'exact', head: true });
+      if (submissionId) query = query.eq('submission_id', submissionId);
+      if (cimRequestId) query = query.eq('cim_request_id', cimRequestId);
+      if (unassigned) query = query.is('submission_id', null);
+      if (direction) query = query.eq('direction', direction);
+      const safeContentStates = normalizeList(contentStates, 20);
+      const safeDeliveryStates = normalizeList(deliveryStates, 20);
+      if (safeContentStates.length > 0) query = query.in('content_state', safeContentStates);
+      if (safeDeliveryStates.length > 0) query = query.in('delivery_state', safeDeliveryStates);
+      const { count, error } = await query;
+      if (error) throw error;
+      return Number(count || 0);
+    },
+
+    async listCrmCommunicationsPendingIngestion({ dueBefore = '', limit = 25 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 25, 250));
+      const { data, error } = await client
+        .from('crm_communications')
+        .select('*')
+        .in('content_state', ['pending', 'failed'])
+        .not('content_next_attempt_at', 'is', null)
+        .lte('content_next_attempt_at', dueBefore || new Date().toISOString())
+        .order('content_next_attempt_at', { ascending: true })
+        .order('created_at', { ascending: true })
+        .limit(safeLimit);
+      if (error) throw error;
+      return (data || []).map(normalizeCrmCommunicationRow);
+    },
+
+    async claimCrmCommunicationsPendingIngestion({
+      dueBefore = '',
+      limit = 25,
+      leaseUntil = '',
+      claimedBy = 'communications-ingestion',
+    } = {}) {
+      const dueAt = normalizeCanonicalUtcIso(
+        String(dueBefore || new Date().toISOString()).trim(),
+        'Communication ingestion due time',
+      );
+      const requestedLeaseUntil = leaseUntil || new Date(Date.parse(dueAt) + 5 * 60 * 1000).toISOString();
+      const leaseAt = normalizeCanonicalUtcIso(String(requestedLeaseUntil).trim(), 'Communication ingestion lease expiry');
+      if (Date.parse(leaseAt) <= Date.parse(dueAt)) {
+        throw new Error('Communication ingestion lease expiry must be later than its due time.');
+      }
+      const { data, error } = await client.rpc('claim_crm_communications_pending_ingestion', {
+        p_due_before: dueAt,
+        p_lease_until: leaseAt,
+        p_limit: Math.max(1, Math.min(Number(limit) || 25, 250)),
+        p_claimed_by: String(claimedBy || 'communications-ingestion').trim().slice(0, 160)
+          || 'communications-ingestion',
+      });
+      if (error) throw error;
+      return Array.isArray(data) ? data.map(normalizeCrmCommunicationRow) : [];
+    },
+
     async insertCrmActivityEvent(event) {
       const { data, error } = await client.from('crm_activity_events').insert(event).select().single();
 
@@ -1368,6 +1716,43 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterCrmImportRow(data);
     },
 
+    async getDealHunterCimRequestById(id) {
+      if (!id) return null;
+      const { data, error } = await client
+        .from('deal_hunter_cim_requests')
+        .select('*')
+        .eq('id', String(id).trim())
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeDealHunterCimRequestRow(data);
+    },
+
+    async getDealHunterCimRequestByReplyToAddress(replyToAddress, requestToken = '') {
+      const normalizedAddress = String(replyToAddress || '').trim().toLowerCase();
+      if (normalizedAddress) {
+        const exact = await client
+          .from('deal_hunter_cim_requests')
+          .select('*')
+          .eq('reply_to_address', normalizedAddress)
+          .order('created_at', { ascending: true })
+          .limit(1)
+          .maybeSingle();
+        if (exact.error) throw exact.error;
+        if (exact.data) return normalizeDealHunterCimRequestRow(exact.data);
+      }
+
+      const token = String(requestToken || '').trim().toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 64);
+      if (!token) return null;
+      const { data, error } = await client
+        .from('deal_hunter_cim_requests')
+        .select('*')
+        .ilike('id', `${token}%`)
+        .order('created_at', { ascending: true })
+        .limit(2);
+      if (error) throw error;
+      return data?.length === 1 ? normalizeDealHunterCimRequestRow(data[0]) : null;
+    },
+
     async getDealHunterCimRequest({ dealKey = '', recipientEmail = '' } = {}) {
       const normalizedEmail = String(recipientEmail || '').trim().toLowerCase();
 
@@ -1423,6 +1808,53 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return (data || []).map(normalizeDealHunterCimRequestRow);
     },
 
+    async listDealHunterCimRequestHistory({
+      page = 1,
+      pageSize = 25,
+      search = '',
+      requestStates = [],
+      deliveryStates = [],
+      statuses = [],
+      replyState = '',
+      followUpState = '',
+      sort = 'last-activity',
+      direction = 'desc',
+    } = {}) {
+	      const safePage = normalizePage(page);
+      const safePageSize = Math.max(1, Math.min(Number(pageSize) || 25, 100));
+      const safeDeliveryStates = normalizeList(deliveryStates, 20).map((value) => value.replaceAll('_', '-'));
+      const normalizedFollowUpState = String(followUpState || '').trim().toLowerCase().replaceAll('_', '-');
+      const { data, error } = await client.rpc('list_deal_hunter_cim_request_history', {
+        p_page: safePage,
+        p_page_size: safePageSize,
+        p_search: String(search || '').trim().slice(0, 500),
+        p_request_states: normalizeList(requestStates, 20),
+        p_delivery_states: safeDeliveryStates,
+        p_statuses: normalizeList(statuses, 20),
+        p_reply_state: String(replyState || '').trim().toLowerCase(),
+        p_follow_up_state: normalizedFollowUpState,
+        p_sort: ['first-request', 'last-activity', 'failure'].includes(sort) ? sort : 'last-activity',
+        p_direction: String(direction).toLowerCase() === 'asc' ? 'asc' : 'desc',
+      });
+      if (error) throw error;
+      const result = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+      const counts = result.counts && typeof result.counts === 'object' ? result.counts : {};
+      return {
+        rows: Array.isArray(result.rows) ? result.rows.map(normalizeDealHunterCimRequestRow) : [],
+        total: Number(result.total || 0),
+        page: Number(result.page || safePage),
+        pageSize: Number(result.pageSize || result.page_size || safePageSize),
+        counts: {
+          ready: Number(counts.ready || 0),
+          pending: Number(counts.pending || 0),
+          accepted: Number(counts.accepted || 0),
+          delivered: Number(counts.delivered || 0),
+          deliveryIssue: Number(counts.deliveryIssue || counts.delivery_issue || 0),
+          replied: Number(counts.replied || 0),
+        },
+      };
+    },
+
 	    async upsertDealHunterCimRequest(request = {}) {
 	      const safeRequest = safeDealHunterCimRequest(request);
 	      const { data, error } = await client
@@ -1440,79 +1872,16 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
 
 	    async claimDealHunterCimRequest(request = {}, { pendingCutoff = '' } = {}) {
 	      const safeRequest = safeDealHunterCimRequest(request);
-	      const { data: insertedData, error: insertError } = await client
-	        .from('deal_hunter_cim_requests')
-	        .insert(safeRequest)
-	        .select()
-	        .single();
-
-	      if (!insertError) {
-	        return {
-	          claimed: true,
-	          request: normalizeDealHunterCimRequestRow(insertedData),
-	        };
-	      }
-
-	      if (!isUniqueViolation(insertError)) {
-	        throw insertError;
-	      }
-
-	      const updatePayload = dealHunterCimUpdatePayload(safeRequest);
-	      const claimFailedRequest = async () => client
-	        .from('deal_hunter_cim_requests')
-	        .update(updatePayload)
-	        .eq('deal_key', safeRequest.deal_key)
-	        .eq('recipient_email', safeRequest.recipient_email)
-	        .eq('status', 'failed')
-	        .select()
-	        .maybeSingle();
-	      const claimStalePendingRequest = async () => {
-	        if (!pendingCutoff) {
-	          return { data: null, error: null };
-	        }
-
-	        return client
-	          .from('deal_hunter_cim_requests')
-	          .update(updatePayload)
-	          .eq('deal_key', safeRequest.deal_key)
-	          .eq('recipient_email', safeRequest.recipient_email)
-	          .eq('status', 'pending')
-	          .lte('updated_at', pendingCutoff)
-	          .select()
-	          .maybeSingle();
-	      };
-	      const failedClaim = await claimFailedRequest();
-
-	      if (failedClaim.error) {
-	        throw failedClaim.error;
-	      }
-
-	      if (failedClaim.data) {
-	        return {
-	          claimed: true,
-	          request: normalizeDealHunterCimRequestRow(failedClaim.data),
-	        };
-	      }
-
-	      const stalePendingClaim = await claimStalePendingRequest();
-
-	      if (stalePendingClaim.error) {
-	        throw stalePendingClaim.error;
-	      }
-
-	      if (stalePendingClaim.data) {
-	        return {
-	          claimed: true,
-	          request: normalizeDealHunterCimRequestRow(stalePendingClaim.data),
-	        };
-	      }
-
+	      const { data, error } = await client.rpc('claim_deal_hunter_cim_request', {
+	        p_request: safeRequest,
+	        p_pending_cutoff: pendingCutoff || null,
+	      });
+	      if (error) throw error;
+	      const result = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
 	      return {
-	        claimed: false,
-	        request: await this.getDealHunterCimRequest({
-	          dealKey: safeRequest.deal_key,
-	          recipientEmail: safeRequest.recipient_email,
-	        }),
+	        claimed: Boolean(result.claimed),
+	        reason: result.reason || '',
+	        request: result.request ? normalizeDealHunterCimRequestRow(result.request) : null,
 	      };
 	    },
 
@@ -1521,71 +1890,77 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
 	        return { claimed: false, request: null };
 	      }
 
-	      const updatePayload = {
-	        status: 'follow_up_pending',
-	        delivery_error: '',
-	        updated_at: nowIso,
-	      };
-	      const activeClaim = await client
-	        .from('deal_hunter_cim_requests')
-	        .update(updatePayload)
-	        .eq('id', id)
-	        .not('next_follow_up_at', 'is', null)
-	        .lte('next_follow_up_at', dueBefore)
-	        .in('status', ['sent', 'logged', 'failed', 'follow_up_failed'])
-	        .select()
-	        .maybeSingle();
-
-	      if (activeClaim.error) {
-	        throw activeClaim.error;
-	      }
-
-	      if (activeClaim.data) {
-	        return {
-	          claimed: true,
-	          request: normalizeDealHunterCimRequestRow(activeClaim.data),
-	        };
-	      }
-
-	      if (staleBefore) {
-	        const staleClaim = await client
-	          .from('deal_hunter_cim_requests')
-	          .update(updatePayload)
-	          .eq('id', id)
-	          .not('next_follow_up_at', 'is', null)
-	          .lte('next_follow_up_at', dueBefore)
-	          .eq('status', 'follow_up_pending')
-	          .lte('updated_at', staleBefore)
-	          .select()
-	          .maybeSingle();
-
-	        if (staleClaim.error) {
-	          throw staleClaim.error;
-	        }
-
-	        if (staleClaim.data) {
-	          return {
-	            claimed: true,
-	            request: normalizeDealHunterCimRequestRow(staleClaim.data),
-	          };
-	        }
-	      }
-
-	      const { data, error } = await client
-	        .from('deal_hunter_cim_requests')
-	        .select('*')
-	        .eq('id', id)
-	        .maybeSingle();
-
-	      if (error) {
-	        throw error;
-	      }
-
+	      const { data, error } = await client.rpc('claim_deal_hunter_cim_follow_up_request', {
+	        p_request_id: id,
+	        p_due_before: dueBefore,
+	        p_stale_before: staleBefore || null,
+	        p_claimed_at: nowIso,
+	      });
+	      if (error) throw error;
+	      const result = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
 	      return {
-	        claimed: false,
-	        request: normalizeDealHunterCimRequestRow(data),
+	        claimed: Boolean(result.claimed),
+	        reason: result.reason || '',
+	        request: result.request ? normalizeDealHunterCimRequestRow(result.request) : null,
 	      };
 	    },
+
+	    async renewDealHunterCimRequestClaim({ id = '', expectedUpdatedAt = '', expectedStatus = '', nowIso = '' } = {}) {
+	      if (!id || !expectedUpdatedAt || !expectedStatus || !nowIso) {
+	        return { renewed: false, reason: 'invalid-claim', request: null };
+	      }
+
+	      const { data, error } = await client.rpc('renew_deal_hunter_cim_request_claim', {
+	        p_request_id: id,
+	        p_expected_updated_at: expectedUpdatedAt,
+	        p_expected_status: expectedStatus,
+	        p_renewed_at: nowIso,
+	      });
+	      if (error) throw error;
+	      const result = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+	      return {
+	        renewed: Boolean(result.renewed),
+	        reason: result.reason || '',
+	        request: result.request ? normalizeDealHunterCimRequestRow(result.request) : null,
+	      };
+	    },
+
+    async getDealHunterDisposition({ id = '', dealKey = '' } = {}) {
+      if (!id && !dealKey) return null;
+      let query = client.from('deal_hunter_dispositions').select('*');
+      query = id ? query.eq('id', id) : query.eq('deal_key', dealKey);
+      const { data, error } = await query.limit(1).maybeSingle();
+      if (error) throw error;
+      return normalizeDealHunterDispositionRow(data);
+    },
+
+    async upsertDealHunterDisposition(record = {}) {
+      const payload = safeDealHunterDisposition(record);
+      const { data, error } = await client
+        .from('deal_hunter_dispositions')
+        .upsert(payload, { onConflict: 'deal_key' })
+        .select()
+        .single();
+      if (error) throw error;
+      return normalizeDealHunterDispositionRow(data);
+    },
+
+    async listDealHunterDispositions({ dealKeys = [], statuses = [], activeOnly = false, limit = 1000 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 1000, 5000));
+      let query = client
+        .from('deal_hunter_dispositions')
+        .select('*')
+        .order('updated_at', { ascending: false })
+        .limit(safeLimit);
+      const keys = normalizeList(dealKeys);
+      const safeStatuses = normalizeList(statuses, 20);
+      if (keys.length > 0) query = query.in('deal_key', keys);
+      if (safeStatuses.length > 0) query = query.in('disposition', safeStatuses);
+      else if (activeOnly) query = query.eq('disposition', 'dismissed');
+      const { data, error } = await query;
+      if (error) throw error;
+      return (data || []).map(normalizeDealHunterDispositionRow);
+    },
 
     async claimScheduledJob({ jobKey = '', jobName = '', triggeredBy = '', nowIso = '', staleBefore = '', metadata = {} } = {}) {
       if (!jobKey || !jobName || !nowIso) {

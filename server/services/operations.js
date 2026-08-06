@@ -6,6 +6,7 @@ import { getSourceHealth } from './acquisitionCommandCenter.js';
 import { getBackupStatus } from './backups.js';
 import { getEmailReadiness } from './emailReadiness.js';
 import { getCimAutomationStatus } from './cimAutomation.js';
+import { getCommunicationOperationsStatus } from './communications.js';
 
 function safeError(error) {
   return error?.message || 'Status check failed.';
@@ -59,6 +60,15 @@ function sanitizeCleanupJob(job) {
   };
 }
 
+function sanitizeCommunicationOperations(status = {}) {
+  const count = (value) => Math.max(0, Math.floor(Number(value) || 0));
+  return {
+    pending: count(status.pending),
+    failed: count(status.failed),
+    unassigned: count(status.unassigned),
+  };
+}
+
 function settledPanel(result, fallback, error) {
   return result.status === 'fulfilled'
     ? { value: result.value, error: '' }
@@ -72,6 +82,7 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
   const backupStatusCheck = checks.backup || getBackupStatus;
   const emailReadinessCheck = checks.emailReadiness || getEmailReadiness;
   const cimAutomationCheck = checks.cimAutomation || getCimAutomationStatus;
+  const communicationOperationsCheck = checks.communications || getCommunicationOperationsStatus;
   const tasks = [
     () => storage.listScheduledJobs?.({ limit: 50 }) || [],
     () => storage.listAdminAuditEvents?.({ limit: 100 }) || [],
@@ -83,6 +94,7 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
     () => backupStatusCheck(config),
     () => emailReadinessCheck({ storage, config }),
     () => cimAutomationCheck({ storage, config }),
+    () => communicationOperationsCheck({ storage }),
   ];
   const results = await Promise.allSettled(tasks.map((task) => Promise.resolve().then(task)));
   const scheduledPanel = settledPanel(results[0], [], 'Scheduler history is temporarily unavailable.');
@@ -115,6 +127,9 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
   const cimAutomationPanel = settledPanel(results[9], {
     configuredStage: 1, effectiveStage: 1, paused: true, stage2Ready: false, stage3Ready: false, metrics: {}, policy: {},
   }, 'CIM automation status is temporarily unavailable.');
+  const communicationsPanel = settledPanel(results[10], {
+    pending: 0, failed: 0, unassigned: 0,
+  }, 'Communication ingestion status is temporarily unavailable.');
 
   const scheduledJobs = Array.isArray(scheduledPanel.value) ? scheduledPanel.value : [];
   const auditEvents = Array.isArray(auditPanel.value) ? auditPanel.value : [];
@@ -122,6 +137,7 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
   const sourceHistory = Array.isArray(sourceHistoryPanel.value) ? sourceHistoryPanel.value : [];
 
   const cleanup = cleanupJobs.map(sanitizeCleanupJob);
+  const communicationCounts = sanitizeCommunicationOperations(communicationsPanel.value);
   return {
     generatedAt: new Date().toISOString(),
     scheduler: {
@@ -151,5 +167,6 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
     backup: { ...backupPanel.value, error: backupPanel.error },
     email: { ...emailPanel.value, error: emailPanel.error },
     cimAutomation: { ...cimAutomationPanel.value, error: cimAutomationPanel.error },
+    communications: { ...communicationCounts, error: communicationsPanel.error },
   };
 }

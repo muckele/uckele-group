@@ -38,6 +38,8 @@ import { checkReadiness } from './services/readiness.js';
 import {
   reviewDailyDeals,
   runDealHunterCimFollowUps,
+  listDealHunterCimRequestHistory,
+  retryDealHunterCimRequestWithCorrectedRecipient,
   sendDealHunterCimRequest,
   sendDealHunterReadyCimRequests,
   validateCimReviewDecisions,
@@ -58,6 +60,18 @@ import { asyncRoute } from './utils/http.js';
 import { safeCompareText } from './utils/security.js';
 import { listCrmActivity } from './services/activity.js';
 import { getOperationsCenter } from './services/operations.js';
+import {
+  assignUnassignedCommunication,
+  createManualCommunication,
+  listCrmCommunications,
+  listUnassignedCommunications,
+} from './services/communications.js';
+import {
+  archiveLead,
+  dismissDealHunterOpportunity,
+  restoreDealHunterOpportunity,
+  restoreLead,
+} from './services/leadLifecycle.js';
 import { recordAnalyticsEvent } from './services/analytics.js';
 import {
   getCimAutomationStatus,
@@ -186,7 +200,11 @@ export function handleAppError(error, request, response, next) {
       : 'Something went wrong while processing the request.';
 
   if (status >= 500) {
-    console.error(`[request:${request.id || 'unknown'}]`, error);
+    console.error(`[request:${request.id || 'unknown'}] request failed`, {
+      name: String(error?.name || 'Error').slice(0, 100),
+      code: String(error?.code || '').slice(0, 100),
+      status,
+    });
   } else {
     console.warn(`[request:${request.id || 'unknown'}] ${error?.message || error}`);
   }
@@ -761,6 +779,82 @@ export function createApp() {
   );
 
   app.get(
+    '/api/admin/submissions/:id/communications',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const submission = await getDashboardSubmission(request.params.id);
+      if (!submission) {
+        response.status(404).json({ success: false, error: 'CRM record not found.' });
+        return;
+      }
+
+      const result = await listCrmCommunications({
+        submissionId: submission.id,
+        page: Number(request.query.page) || 1,
+        pageSize: Number(request.query.pageSize) || 25,
+        before: String(request.query.before || ''),
+      });
+      response.json({ success: true, communications: result.rows || [], ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/submissions/:id/communications',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await createManualCommunication({
+        submissionId: request.params.id,
+        input: request.body || {},
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 201 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.get(
+    '/api/admin/communications/unassigned',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await listUnassignedCommunications({
+        page: Number(request.query.page) || 1,
+        pageSize: Number(request.query.pageSize) || 25,
+      });
+      response.json({ success: true, communications: result.rows || [], ...result });
+    }),
+  );
+
+  app.patch(
+    '/api/admin/communications/:id/assign',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await assignUnassignedCommunication({
+        communicationId: request.params.id,
+        submissionId: request.body?.submissionId || request.body?.submission_id || '',
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.get(
     '/api/admin/deal-hunter/review',
     asyncRoute(async (request, response) => {
       const session = await requireAdminAccess(request);
@@ -804,6 +898,77 @@ export function createApp() {
         success: !['failed', 'in-progress'].includes(result.emailResult.status),
         ...result,
       });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/cim-requests',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await listDealHunterCimRequestHistory({
+        page: Number(request.query.page) || 1,
+        pageSize: Number(request.query.pageSize) || 25,
+        search: String(request.query.search || ''),
+        requestState: String(request.query.requestState || request.query.request_state || ''),
+        deliveryState: String(request.query.deliveryState || request.query.delivery_state || ''),
+        replyState: String(request.query.replyState || request.query.reply_state || ''),
+        followUpState: String(request.query.followUpState || request.query.follow_up_state || ''),
+        sort: String(request.query.sort || 'first_requested_at'),
+        direction: String(request.query.direction || 'desc'),
+      });
+      response.json({ success: true, requests: result.rows || [], ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-requests/:id/retry',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await retryDealHunterCimRequestWithCorrectedRecipient({
+        requestId: request.params.id,
+        newRecipientEmail: request.body?.newRecipientEmail || request.body?.recipientEmail || '',
+        confirmed: request.body?.confirmed === true,
+        overrideReason: request.body?.overrideReason || '',
+        requestedBy: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 201 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/dispositions',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const action = String(request.body?.action || 'dismiss').toLowerCase();
+      const result = action === 'restore'
+        ? await restoreDealHunterOpportunity({
+            dealKey: request.body?.dealKey || '',
+            actor: session.username || 'admin',
+          })
+        : await dismissDealHunterOpportunity({
+            dealKey: request.body?.dealKey || '',
+            listingUrl: request.body?.listingUrl || '',
+            dealName: request.body?.dealName || '',
+            reason: request.body?.reason || '',
+            note: request.body?.note || '',
+            submissionId: request.body?.submissionId || '',
+            actor: session.username || 'admin',
+          });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );
 
@@ -950,6 +1115,48 @@ export function createApp() {
         success: !['failed', 'in-progress'].includes(result.emailResult.status),
         ...result,
       });
+    }),
+  );
+
+  app.post(
+    '/api/admin/submissions/:id/archive',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await archiveLead({
+        submissionId: request.params.id,
+        reason: request.body?.reason || '',
+        note: request.body?.note || '',
+        communicationId: request.body?.communicationId || '',
+        expectedUpdatedAt: request.body?.expectedUpdatedAt || request.body?.expected_updated_at || '',
+        actor: session.username || 'admin',
+        role: session.role || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/submissions/:id/restore',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await restoreLead({
+        submissionId: request.params.id,
+        status: request.body?.status || 'review',
+        expectedUpdatedAt: request.body?.expectedUpdatedAt || request.body?.expected_updated_at || '',
+        actor: session.username || 'admin',
+        role: session.role || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );
 

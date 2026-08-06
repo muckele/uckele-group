@@ -118,7 +118,7 @@ test('authenticated CRM navigation persists page, size, sort, search, and status
   await mockAuthenticatedAdmin(page);
   await page.goto('/admin/crm?search=HVAC&status=review&page=2&pageSize=10&sort=priority&direction=asc');
 
-  await expect(page.getByRole('heading', { level: 1, name: 'Admin workspace' })).toBeVisible();
+  await expect(page.getByRole('heading', { level: 1, name: 'CRM records' })).toBeVisible();
   await expect(page.getByLabel('Search CRM').first()).toHaveValue('HVAC');
   await expect(page.getByLabel('Status').first()).toHaveValue('review');
   await expect(page.getByLabel('Sort').first()).toHaveValue('priority:asc');

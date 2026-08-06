@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { strToU8, zipSync } from 'fflate';
 import {
+  batchDealHunterStorageKeys,
   buildGoogleSheetWorkbookUrl,
   eventMatchesCimRequest,
   extractGoogleSheetListingUrls,
@@ -36,6 +37,27 @@ function baseDeal(overrides = {}) {
     ...overrides,
   };
 }
+
+test('Deal Hunter storage keys are batched without truncating large source reviews', () => {
+  const dealKeys = Array.from({ length: 8001 }, (_, index) => `deal-${index}`);
+  const sqliteBatches = batchDealHunterStorageKeys(dealKeys, 'sqlite');
+
+  assert.ok(sqliteBatches.length > 1);
+  assert.ok(sqliteBatches.every((batch) => batch.length <= 800));
+  assert.deepEqual(sqliteBatches.flat(), dealKeys);
+
+  const longSupabaseKeys = Array.from(
+    { length: 250 },
+    (_, index) => `deal-${index}-${'broker-listing-identity'.repeat(5)}`,
+  );
+  const supabaseBatches = batchDealHunterStorageKeys([...longSupabaseKeys, longSupabaseKeys[0]], 'supabase');
+  assert.ok(supabaseBatches.length > 1);
+  assert.ok(supabaseBatches.every((batch) => batch.length <= 75));
+  assert.ok(supabaseBatches.every((batch) => (
+    batch.reduce((total, key) => total + encodeURIComponent(key).length + 1, 0) <= 6000
+  )));
+  assert.deepEqual(supabaseBatches.flat(), longSupabaseKeys);
+});
 
 test('scoring qualifies durable recurring field-service deals as high fit', () => {
   const deal = baseDeal({
@@ -103,7 +125,7 @@ test('scoring does not treat non-recurring language as recurring revenue strengt
   assert.equal(scored.concerns.some((concern) => /Financial quality risk language found/i.test(concern)), true);
 });
 
-test('CIM response matching ignores unrelated replies from the same broker', () => {
+test('CIM response matching requires an exact request signal for replies from the same broker', () => {
   const request = {
     id: 'cim-request-1',
     deal_key: 'commercial-hvac-maintenance-co',
@@ -125,9 +147,13 @@ test('CIM response matching ignores unrelated replies from the same broker', () 
   const trackedReply = {
     ...unrelatedReply,
     subject: 'Re: CIM / NDA request for Commercial HVAC Maintenance Co',
+    metadata: {
+      tracking: { cimRequestId: request.id },
+    },
   };
 
   assert.equal(eventMatchesCimRequest(unrelatedReply, request), false);
+  assert.equal(eventMatchesCimRequest({ ...unrelatedReply, subject: trackedReply.subject }, request), false);
   assert.equal(eventMatchesCimRequest(trackedReply, request), true);
 });
 
@@ -274,6 +300,20 @@ test('Google Sheet workbook extraction maps View Listing hyperlinks onto CSV dea
   assert.equal(parsed.deals[0].listingUrl, 'https://broker.example/alpha?source=sheet&deal=1');
   assert.equal(parsed.deals[1].listingUrl, 'https://broker.example/beta');
   assert.equal(parsed.deals[2].listingUrl, '');
+});
+
+test('Google Sheet workbook extraction does not let self-closing cells swallow hyperlink formulas', () => {
+  const worksheet = [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>',
+    '<row r="1"><c r="B1" t="inlineStr"><is><t>Name</t></is></c><c r="V1" t="inlineStr"><is><t>View Listing</t></is></c></row>',
+    '<row r="2"><c r="B2" t="inlineStr"><is><t>Alpha HVAC</t></is></c><c r="U2"/><c r="V2" t="str"><f>HYPERLINK(&quot;https://broker.example/alpha&quot;, &quot;View Listing&quot;)</f><v>View Listing</v></c></row>',
+    '</sheetData></worksheet>',
+  ].join('');
+  const workbook = zipSync({ 'xl/worksheets/sheet1.xml': strToU8(worksheet) });
+  const extracted = extractGoogleSheetListingUrls(workbook, [{ Name: 'Alpha HVAC', 'View Listing': 'View Listing' }]);
+
+  assert.equal(extracted.listingUrlsByRow.get(0), 'https://broker.example/alpha');
 });
 
 test('Google Sheet workbook extraction selects the worksheet matching the CSV rows', () => {

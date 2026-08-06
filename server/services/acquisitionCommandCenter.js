@@ -8,6 +8,7 @@ import { reviewDailyDeals } from './dealHunter.js';
 import { normalizeDiligenceReview } from './submissions.js';
 import { buildFollowUpPrompt } from './workflow.js';
 import { commitCrmActivityMutation } from './activity.js';
+import { archiveLead } from './leadLifecycle.js';
 
 export const acquisitionPipelineStages = [
   'new-fit',
@@ -59,6 +60,13 @@ function normalizePipelineStage(value, fallback = 'new-fit') {
 function normalizePassReason(value) {
   const normalized = normalizeText(value, 100).toLowerCase();
   return acquisitionPassReasons.includes(normalized) ? normalized : '';
+}
+
+function archiveReasonForCommandCenterPass(reason) {
+  if (reason === 'too-expensive') return 'valuation';
+  if (reason === 'seller-financing-gap') return 'financing';
+  if (reason === 'other') return 'other';
+  return 'not-a-fit';
 }
 
 function normalizeFitFeedback(value, fallback = 'neutral') {
@@ -1130,6 +1138,10 @@ export async function updateAcquisitionCommandCenterRecord({
     return { ok: false, status: 400, error: 'Fit feedback is not valid.' };
   }
 
+  if (normalizedStage === 'passed' && !normalizedPassReason) {
+    return { ok: false, status: 400, error: 'Pass & Archive requires a disposition reason.' };
+  }
+
   if (!normalizedStage && !normalizedPassReason && !normalizedFeedback && feedbackNote === '') {
     return { ok: false, status: 400, error: 'No command center update was provided.' };
   }
@@ -1154,6 +1166,32 @@ export async function updateAcquisitionCommandCenterRecord({
       : nextStage === 'loi-candidate'
         ? { stage: 'loi-candidate', decision: 'advance' }
         : {};
+
+  if (normalizedPassReason) {
+    const archiveResult = await archiveLead({
+      submissionId: existing.id,
+      reason: archiveReasonForCommandCenterPass(normalizedPassReason),
+      note: normalizeText(feedbackNote, 1000),
+      actor: acquisitionCommand.updatedBy,
+      role: 'admin',
+      storage,
+      metadataPatch: {
+        acquisitionCommand,
+        diligence: normalizeDiligenceReview(diligencePatch, metadata.diligence, { now }),
+      },
+    });
+
+    return archiveResult.ok
+      ? {
+          ok: true,
+          status: archiveResult.status,
+          submission: archiveResult.submission,
+          acquisitionCommand,
+          archived: true,
+        }
+      : archiveResult;
+  }
+
   const updates = {
     updated_at: now,
     ...(nextStage === 'passed' ? { follow_up_state: 'completed' } : {}),

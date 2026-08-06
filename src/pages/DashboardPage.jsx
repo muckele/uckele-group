@@ -27,9 +27,13 @@ import CrmNavigation from '../components/admin/CrmNavigation';
 import DealActivityTimeline from '../components/admin/DealActivityTimeline';
 import OperationsCenter from '../components/admin/OperationsCenter';
 import DealHunterWorkspace from '../components/admin/DealHunterWorkspace';
+import CimRequestHistory from '../components/admin/CimRequestHistory';
+import CrmCommunications from '../components/admin/CrmCommunications';
+import UnassignedCommunicationsInbox from '../components/admin/UnassignedCommunicationsInbox';
 import { adminSectionMeta } from '../content/adminSectionMeta';
 
 const statuses = ['new', 'review', 'contacted', 'archived', 'spam'];
+const editableStatuses = ['new', 'review', 'contacted', 'spam'];
 const priorities = ['low', 'normal', 'medium', 'high', 'urgent'];
 const followUpStates = ['needs-response', 'scheduled', 'waiting-on-owner', 'completed'];
 const leadTypes = ['prospect', 'seller', 'broker', 'referral', 'advisor', 'other'];
@@ -68,6 +72,18 @@ const acquisitionPassReasons = [
   'seller-financing-gap',
   'other',
 ];
+const archiveLeadReasons = [
+  'not-a-fit',
+  'unavailable',
+  'duplicate',
+  'broker-declined',
+  'valuation',
+  'geography',
+  'timing',
+  'financing',
+  'other',
+];
+const restoreLeadStatuses = ['new', 'review', 'contacted'];
 const diligenceChecklistItems = [
   { id: 'cim', label: 'CIM / teaser' },
   { id: 'nda', label: 'NDA' },
@@ -107,6 +123,18 @@ const defaultCrmFilters = {
   pageSize: 25,
   sort: 'created_at',
   direction: 'desc',
+};
+
+const defaultCimHistoryQuery = {
+  search: '',
+  requestState: 'all',
+  deliveryState: 'all',
+  replyState: 'all',
+  followUpState: 'all',
+  sort: 'first_requested_at',
+  direction: 'desc',
+  page: 1,
+  pageSize: 25,
 };
 
 export function crmFiltersFromSearch(search = '') {
@@ -618,6 +646,16 @@ function getCimReadyDealsFromReview(review, limit = 25) {
   return readyDeals;
 }
 
+function getDealHunterDealFromReview(review, dealKey) {
+  const sections = [
+    ...(review?.qualified || []),
+    ...(review?.newlySeenMatches || []),
+    ...(review?.watchlist || []),
+    ...(review?.removalCandidates || []),
+  ];
+  return sections.find((deal) => deal?.dealKey === dealKey) || null;
+}
+
 function getCimSnapshotToken(deal = {}) {
   return deal.cimRequest?.snapshotToken || '';
 }
@@ -681,11 +719,12 @@ function InputField({ label, value, onChange, placeholder = '', type = 'text' })
   );
 }
 
-function SelectField({ label, value, onChange, options }) {
+function SelectField({ label, value, onChange, options, disabled = false }) {
   return (
     <Field label={label}>
       <select
         className="form-control"
+        disabled={disabled}
         onChange={onChange}
         value={value}
       >
@@ -743,7 +782,160 @@ function LinksRow({ submission, compact = false }) {
   );
 }
 
-export function CrmRecordCard({ submission, detailHref }) {
+export function LeadLifecycleControls({
+  submission,
+  communications = [],
+  compact = false,
+  pending = false,
+  readOnly = false,
+  onArchive,
+  onRestore,
+}) {
+  const [mode, setMode] = useState('');
+  const [archiveDraft, setArchiveDraft] = useState({ reason: '', note: '', communicationId: '' });
+  const [restoreStatus, setRestoreStatus] = useState('review');
+  const [localError, setLocalError] = useState('');
+  const archived = submission?.status === 'archived';
+  const archiveReason = submission?.archive_reason || submission?.metadata?.leadArchive?.reason || '';
+  const archivedAt = submission?.archived_at || submission?.metadata?.leadArchive?.archivedAt || '';
+  const communicationOptions = communications
+    .map((communication) => ({
+      id: String(communication?.id || communication?.communication_id || ''),
+      label: communication?.subject || `${formatLabel(communication?.channel || 'communication')} · ${formatDateTime(communication?.occurred_at || communication?.occurredAt)}`,
+    }))
+    .filter((communication) => communication.id);
+
+  async function submitArchive(event) {
+    event.preventDefault();
+    setLocalError('');
+    if (!archiveDraft.reason) {
+      setLocalError('Select an archive disposition reason.');
+      return;
+    }
+    try {
+      await onArchive(submission, archiveDraft);
+      setArchiveDraft({ reason: '', note: '', communicationId: '' });
+      setMode('');
+    } catch (error) {
+      setLocalError(error?.message || 'Unable to archive this lead.');
+    }
+  }
+
+  async function submitRestore(event) {
+    event.preventDefault();
+    setLocalError('');
+    try {
+      await onRestore(submission, { status: restoreStatus });
+      setRestoreStatus('review');
+      setMode('');
+    } catch (error) {
+      setLocalError(error?.message || 'Unable to restore this lead.');
+    }
+  }
+
+  return (
+    <div className={`${compact ? 'mt-5 border-t border-line/75 pt-4' : 'mt-6 rounded-2xl border border-amber-200 bg-amber-50/60 p-4 sm:p-5'}`} data-lead-lifecycle-controls>
+      {archived ? (
+        <div className="text-sm leading-6 text-ink/70">
+          <p className="font-semibold text-ink">Archived lead</p>
+          <p>{archiveReason ? `Disposition: ${formatLabel(archiveReason)}` : 'No disposition was recorded.'}{archivedAt ? ` · ${formatDateTime(archivedAt)}` : ''}</p>
+          {submission.archive_note ? <p className="mt-1 whitespace-pre-wrap">{submission.archive_note}</p> : null}
+        </div>
+      ) : (
+        <div className="text-sm leading-6 text-ink/70">
+          <p className="font-semibold text-ink">Lead lifecycle</p>
+          {!compact ? <p>Archive keeps the record and audit history while stopping follow-up work. Permanent delete remains separate below.</p> : null}
+        </div>
+      )}
+
+      {!readOnly && archived && typeof onRestore === 'function' && mode !== 'restore' ? (
+        <button className={`${secondaryActionButtonClass} mt-3`} disabled={pending} onClick={() => { setMode('restore'); setLocalError(''); }} type="button">Restore Lead</button>
+      ) : null}
+      {!readOnly && !archived && typeof onArchive === 'function' && mode !== 'archive' ? (
+        <button className="mt-3 inline-flex min-h-[44px] w-full items-center justify-center rounded-full border border-amber-300 bg-white px-4 py-2.5 text-sm font-semibold text-amber-900 disabled:opacity-50 sm:w-auto" disabled={pending} onClick={() => { setMode('archive'); setLocalError(''); }} type="button">Archive Lead</button>
+      ) : null}
+
+      {mode === 'archive' && !readOnly ? (
+        <form className="mt-4 grid gap-4" onSubmit={submitArchive}>
+          <label className="text-sm font-semibold text-ink">Disposition reason<select className="form-control mt-2" disabled={pending} onChange={(event) => setArchiveDraft((current) => ({ ...current, reason: event.target.value }))} required value={archiveDraft.reason}><option value="">Select a reason</option>{archiveLeadReasons.map((reason) => <option key={reason} value={reason}>{formatLabel(reason)}</option>)}</select></label>
+          <label className="text-sm font-semibold text-ink">Archive note (optional)<textarea className="form-control mt-2 min-h-24" disabled={pending} maxLength={2000} onChange={(event) => setArchiveDraft((current) => ({ ...current, note: event.target.value }))} value={archiveDraft.note} /></label>
+          {communicationOptions.length > 0 ? <label className="text-sm font-semibold text-ink">Triggering communication (optional)<select className="form-control mt-2" disabled={pending} onChange={(event) => setArchiveDraft((current) => ({ ...current, communicationId: event.target.value }))} value={archiveDraft.communicationId}><option value="">No linked communication</option>{communicationOptions.map((communication) => <option key={communication.id} value={communication.id}>{communication.label}</option>)}</select></label> : null}
+          {localError ? <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert">{localError}</p> : null}
+          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+            <button className="inline-flex min-h-[44px] items-center justify-center rounded-full border border-amber-400 bg-amber-100 px-5 py-2.5 text-sm font-semibold text-amber-950 disabled:opacity-50" disabled={pending} type="submit">{pending ? 'Archiving…' : 'Confirm Archive'}</button>
+            <button className={secondaryActionButtonClass} disabled={pending} onClick={() => setMode('')} type="button">Cancel</button>
+          </div>
+        </form>
+      ) : null}
+
+      {mode === 'restore' && !readOnly ? (
+        <form className="mt-4 grid gap-4" onSubmit={submitRestore}>
+          <label className="text-sm font-semibold text-ink">Restore status<select className="form-control mt-2" disabled={pending} onChange={(event) => setRestoreStatus(event.target.value)} value={restoreStatus}>{restoreLeadStatuses.map((status) => <option key={status} value={status}>{formatLabel(status)}</option>)}</select></label>
+          <p className="text-sm leading-6 text-ink/70">Restoring does not restart outreach or schedule a next action.</p>
+          {localError ? <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert">{localError}</p> : null}
+          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+            <button className={primaryActionButtonClass} disabled={pending} type="submit">{pending ? 'Restoring…' : 'Confirm Restore'}</button>
+            <button className={secondaryActionButtonClass} disabled={pending} onClick={() => setMode('')} type="button">Cancel</button>
+          </div>
+        </form>
+      ) : null}
+    </div>
+  );
+}
+
+export function CorrectedRecipientRetryForm({ request, error = '', pending = false, onCancel, onRetry }) {
+  const [recipient, setRecipient] = useState('');
+  const [confirmed, setConfirmed] = useState(false);
+  const [overrideReason, setOverrideReason] = useState('');
+  const [localError, setLocalError] = useState('');
+  const originalRecipient = String(request?.recipient_email || request?.recipientEmail || '').trim().toLowerCase();
+  const signedContacts = (Array.isArray(request?.metadata?.brokerContacts) ? request.metadata.brokerContacts : [])
+    .map((contact) => ({ name: contact?.name || '', email: String(contact?.email || '').trim().toLowerCase() }))
+    .filter((contact) => contact.email && contact.email !== originalRecipient);
+
+  async function handleSubmit(event) {
+    event.preventDefault();
+    setLocalError('');
+    const normalizedRecipient = recipient.trim().toLowerCase();
+    const selectedFromSignedSnapshot = signedContacts.some((contact) => contact.email === normalizedRecipient);
+    if (!normalizedRecipient || normalizedRecipient === originalRecipient) {
+      setLocalError('Enter a corrected recipient that differs from the failed address.');
+      return;
+    }
+    if (!selectedFromSignedSnapshot && (!confirmed || overrideReason.trim().length < 5)) {
+      setLocalError('A manually entered address requires confirmation and an override reason of at least five characters.');
+      return;
+    }
+    try {
+      await onRetry({
+        newRecipientEmail: normalizedRecipient,
+        confirmed: selectedFromSignedSnapshot ? false : confirmed,
+        overrideReason: selectedFromSignedSnapshot ? '' : overrideReason.trim(),
+      });
+    } catch (retryError) {
+      setLocalError(retryError?.message || 'Unable to retry this CIM request.');
+    }
+  }
+
+  return (
+    <form className="rounded-2xl border border-red-200 bg-red-50/70 p-4 sm:p-6" onSubmit={handleSubmit}>
+      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-red-700">Corrected-recipient workflow</p>
+      <h3 className="mt-2 text-xl font-semibold text-ink">Retry CIM request safely</h3>
+      <p className="mt-2 text-sm leading-6 text-ink/70">Failed recipient: {originalRecipient || 'Not recorded'}. An accepted request to another contact still blocks duplicate first contact.</p>
+      <label className="mt-4 block text-sm font-semibold text-ink">Corrected recipient email<input className="form-control mt-2" disabled={pending} list="corrected-cim-recipient-options" maxLength={320} onChange={(event) => setRecipient(event.target.value)} required type="email" value={recipient} /></label>
+      {signedContacts.length > 0 ? <datalist id="corrected-cim-recipient-options">{signedContacts.map((contact) => <option key={contact.email} value={contact.email}>{contact.name}</option>)}</datalist> : null}
+      <label className="mt-4 block text-sm font-semibold text-ink">Override reason<textarea className="form-control mt-2 min-h-24" disabled={pending} maxLength={500} onChange={(event) => setOverrideReason(event.target.value)} placeholder="Required when the address is not from the signed broker-contact snapshot" value={overrideReason} /></label>
+      <label className="mt-4 flex items-start gap-3 text-sm leading-6 text-ink/75"><input checked={confirmed} className="mt-1 h-4 w-4 accent-moss" disabled={pending} onChange={(event) => setConfirmed(event.target.checked)} type="checkbox" /><span>I confirm this manually entered address is the corrected broker recipient.</span></label>
+      {localError || error ? <p className="mt-4 rounded-xl border border-red-200 bg-white px-4 py-3 text-sm text-red-700" role="alert">{localError || error}</p> : null}
+      <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+        <button className="inline-flex min-h-[46px] items-center justify-center rounded-full border border-red-300 bg-red-100 px-5 py-3 text-sm font-semibold text-red-800 disabled:opacity-50" disabled={pending} type="submit">{pending ? 'Retrying…' : 'Retry CIM Request'}</button>
+        <button className={secondaryActionButtonClass} disabled={pending} onClick={onCancel} type="button">Cancel</button>
+      </div>
+    </form>
+  );
+}
+
+export function CrmRecordCard({ submission, detailHref, lifecyclePending = false, onArchiveLead, onRestoreLead, readOnly = false }) {
   const dealScore = submissionDealScore(submission);
   const contactName = submission.broker_name || submission.seller_name || submission.name || 'No contact named';
   const contactEmail = submission.broker_email || submission.seller_email || submission.email || '';
@@ -830,6 +1022,15 @@ export function CrmRecordCard({ submission, detailHref }) {
           <LinksRow compact submission={submission} />
         </div>
       </div>
+
+      <LeadLifecycleControls
+        compact
+        onArchive={onArchiveLead}
+        onRestore={onRestoreLead}
+        pending={lifecyclePending}
+        readOnly={readOnly}
+        submission={submission}
+      />
     </article>
   );
 }
@@ -903,7 +1104,7 @@ function CommandCenterRecordCard({ record, updating, onUpdate, readOnly = false 
 
       {record.passReason ? (
         <p className="mt-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 font-medium text-red-700">
-          Passed: {formatPassReason(record.passReason)}
+          Passed & archived: {formatPassReason(record.passReason)}
         </p>
       ) : null}
 
@@ -951,7 +1152,7 @@ function CommandCenterRecordCard({ record, updating, onUpdate, readOnly = false 
           </div>
 
           <div className="mt-4">
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss">Quick pass</p>
+            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss">Pass &amp; Archive</p>
             <div className="mt-2 flex flex-wrap gap-2">
               {acquisitionPassReasons.map((reason) => (
                 <button
@@ -1045,6 +1246,18 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(false);
   const [actionError, setActionError] = useState('');
   const [dealActivity, setDealActivity] = useState({ events: [], loading: false, error: '' });
+  const [crmCommunications, setCrmCommunications] = useState({
+    rows: [],
+    total: 0,
+    page: 1,
+    pageSize: 25,
+    loading: false,
+    loadingMore: false,
+    error: '',
+    logPending: false,
+    logError: '',
+  });
+  const [leadLifecyclePendingId, setLeadLifecyclePendingId] = useState('');
   const [savingSubmissionId, setSavingSubmissionId] = useState('');
   const [creatingUploadForId, setCreatingUploadForId] = useState('');
   const [deletingSubmissionId, setDeletingSubmissionId] = useState('');
@@ -1058,7 +1271,22 @@ export default function DashboardPage() {
   const [dealHunterFollowUpRunning, setDealHunterFollowUpRunning] = useState(false);
   const [emailTestSending, setEmailTestSending] = useState(false);
   const [requestingCimDealKey, setRequestingCimDealKey] = useState('');
+  const [dismissingDealKey, setDismissingDealKey] = useState('');
   const [dealHunterFeedback, setDealHunterFeedback] = useState({ error: '', message: '' });
+  const [cimHistoryQuery, setCimHistoryQuery] = useState(defaultCimHistoryQuery);
+  const [cimHistory, setCimHistory] = useState({ rows: [], counts: {}, total: 0, totalPages: 1, loading: false, error: '' });
+  const [correctedRecipientRequest, setCorrectedRecipientRequest] = useState(null);
+  const [correctedRecipientRetry, setCorrectedRecipientRetry] = useState({ requestId: '', pending: false, error: '' });
+  const [unassignedCommunications, setUnassignedCommunications] = useState({
+    rows: [],
+    total: 0,
+    page: 1,
+    pageSize: 25,
+    loading: false,
+    loadingMore: false,
+    error: '',
+    assigningId: '',
+  });
   const [commandCenter, setCommandCenter] = useState(null);
   const [commandCenterLoading, setCommandCenterLoading] = useState(false);
   const [commandCenterUpdatingId, setCommandCenterUpdatingId] = useState('');
@@ -1069,8 +1297,12 @@ export default function DashboardPage() {
   const [cimAutomationUpdating, setCimAutomationUpdating] = useState(false);
   const dashboardRequestRef = useRef({ controller: null, id: 0 });
   const followUpRequestRef = useRef({ controller: null, id: 0 });
+  const crmCommunicationsRequestRef = useRef({ controller: null, id: 0 });
+  const cimHistoryRequestRef = useRef({ controller: null, id: 0 });
+  const unassignedCommunicationsRequestRef = useRef({ controller: null, id: 0 });
   const dealHunterAutoReviewAttemptedRef = useRef(false);
   const deferredSearch = useDeferredValue(filters.search);
+  const deferredCimHistorySearch = useDeferredValue(cimHistoryQuery.search);
   const isReadOnly = authState.role === 'viewer';
   const requestedFollowUpView = new URLSearchParams(location.search).get('view');
   const requestedDealHunterView = new URLSearchParams(location.search).get('view');
@@ -1305,6 +1537,163 @@ export default function DashboardPage() {
     }
   }
 
+  async function loadCrmCommunications(id, { append = false } = {}) {
+    const requestId = crmCommunicationsRequestRef.current.id + 1;
+    const controller = new AbortController();
+    const page = append ? Math.max(1, Number(crmCommunications.page) || 1) + 1 : 1;
+    const pageSize = Math.max(1, Math.min(Number(crmCommunications.pageSize) || 25, 100));
+
+    crmCommunicationsRequestRef.current.controller?.abort();
+    crmCommunicationsRequestRef.current = { controller, id: requestId };
+    setCrmCommunications((current) => ({
+      ...current,
+      loading: append ? current.loading : true,
+      loadingMore: append,
+      error: '',
+    }));
+
+    try {
+      const query = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+      const response = await fetch(`/api/admin/submissions/${encodeURIComponent(id)}/communications?${query.toString()}`, {
+        credentials: 'same-origin',
+        signal: controller.signal,
+      });
+      const result = await response.json();
+
+      if (response.status === 401) {
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
+        return;
+      }
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to load CRM communications.');
+      }
+
+      const rows = Array.isArray(result.rows) ? result.rows : Array.isArray(result.communications) ? result.communications : [];
+      setCrmCommunications((current) => ({
+        ...current,
+        rows: append ? [...current.rows, ...rows] : rows,
+        total: Math.max(0, Number(result.total) || rows.length),
+        page: Math.max(1, Number(result.page) || page),
+        pageSize: Math.max(1, Number(result.pageSize) || pageSize),
+        error: '',
+      }));
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        setCrmCommunications((current) => ({ ...current, error: error.message || 'Unable to load CRM communications.' }));
+      }
+    } finally {
+      if (crmCommunicationsRequestRef.current.id === requestId) {
+        setCrmCommunications((current) => ({ ...current, loading: false, loadingMore: false }));
+      }
+    }
+  }
+
+  async function loadCimRequestHistory(queryInput = cimHistoryQuery) {
+    const requestId = cimHistoryRequestRef.current.id + 1;
+    const controller = new AbortController();
+    const query = { ...defaultCimHistoryQuery, ...queryInput };
+    const params = new URLSearchParams({
+      page: String(query.page),
+      pageSize: String(query.pageSize),
+      sort: query.sort,
+      direction: query.direction,
+    });
+    if (query.search) {
+      params.set('search', query.search);
+    }
+    if (query.requestState !== 'all') params.set('requestState', query.requestState);
+    if (query.deliveryState !== 'all') params.set('deliveryState', query.deliveryState);
+    if (query.replyState !== 'all') params.set('replyState', query.replyState);
+    if (query.followUpState !== 'all') params.set('followUpState', query.followUpState);
+
+    cimHistoryRequestRef.current.controller?.abort();
+    cimHistoryRequestRef.current = { controller, id: requestId };
+    setCimHistory((current) => ({ ...current, loading: true, error: '' }));
+
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/cim-requests?${params.toString()}`, {
+        credentials: 'same-origin',
+        signal: controller.signal,
+      });
+      const result = await response.json();
+      if (response.status === 401) {
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
+        return;
+      }
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to load CIM request history.');
+      }
+      const rows = Array.isArray(result.rows) ? result.rows : Array.isArray(result.requests) ? result.requests : [];
+      const total = Math.max(0, Number(result.total) || rows.length);
+      const pageSize = Math.max(1, Number(result.pageSize) || Number(query.pageSize) || 25);
+      setCimHistory({
+        rows,
+        counts: result.counts || result.summary || {},
+        total,
+        totalPages: Math.max(1, Number(result.totalPages) || Math.ceil(total / pageSize) || 1),
+        loading: false,
+        error: '',
+      });
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        setCimHistory((current) => ({ ...current, loading: false, error: error.message || 'Unable to load CIM request history.' }));
+      }
+    } finally {
+      if (cimHistoryRequestRef.current.id === requestId) {
+        setCimHistory((current) => ({ ...current, loading: false }));
+      }
+    }
+  }
+
+  async function loadUnassignedCommunications({ append = false } = {}) {
+    const requestId = unassignedCommunicationsRequestRef.current.id + 1;
+    const controller = new AbortController();
+    const page = append ? Math.max(1, Number(unassignedCommunications.page) || 1) + 1 : 1;
+    const pageSize = Math.max(1, Math.min(Number(unassignedCommunications.pageSize) || 25, 100));
+
+    unassignedCommunicationsRequestRef.current.controller?.abort();
+    unassignedCommunicationsRequestRef.current = { controller, id: requestId };
+    setUnassignedCommunications((current) => ({
+      ...current,
+      loading: append ? current.loading : true,
+      loadingMore: append,
+      error: '',
+    }));
+
+    try {
+      const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+      const response = await fetch(`/api/admin/communications/unassigned?${params.toString()}`, {
+        credentials: 'same-origin',
+        signal: controller.signal,
+      });
+      const result = await response.json();
+      if (response.status === 401) {
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
+        return;
+      }
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to load unassigned communications.');
+      }
+      const rows = Array.isArray(result.rows) ? result.rows : Array.isArray(result.communications) ? result.communications : [];
+      setUnassignedCommunications((current) => ({
+        ...current,
+        rows: append ? [...current.rows, ...rows] : rows,
+        total: Math.max(0, Number(result.total) || rows.length),
+        page: Math.max(1, Number(result.page) || page),
+        pageSize: Math.max(1, Number(result.pageSize) || pageSize),
+        error: '',
+      }));
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        setUnassignedCommunications((current) => ({ ...current, error: error.message || 'Unable to load unassigned communications.' }));
+      }
+    } finally {
+      if (unassignedCommunicationsRequestRef.current.id === requestId) {
+        setUnassignedCommunications((current) => ({ ...current, loading: false, loadingMore: false }));
+      }
+    }
+  }
+
   function refreshCurrentCrmView(options = {}) {
     return isCrmDetailView
       ? loadSubmissionDetail(submissionId, options)
@@ -1506,8 +1895,12 @@ export default function DashboardPage() {
 
     if (isCrmDetailView) {
       loadSubmissionDetail(submissionId);
+      loadCrmCommunications(submissionId);
       return;
     }
+
+    crmCommunicationsRequestRef.current.controller?.abort();
+    setCrmCommunications((current) => ({ ...current, rows: [], total: 0, page: 1, loading: false, loadingMore: false, error: '', logError: '' }));
 
     if (activeSection === 'overview' || activeSection === 'crm') {
       loadDashboard(filters.status, deferredSearch.trim());
@@ -1577,6 +1970,41 @@ export default function DashboardPage() {
   }, [activeSection, authState.authenticated, dealHunterLoading, dealHunterReview]);
 
   useEffect(() => {
+    if (!authState.authenticated || activeSection !== 'deal-hunter') {
+      cimHistoryRequestRef.current.controller?.abort();
+      return;
+    }
+    loadCimRequestHistory({ ...cimHistoryQuery, search: deferredCimHistorySearch });
+  // The loader is bounded to the primitive history query values below so object identity cannot trigger refetch loops.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    activeSection,
+    authState.authenticated,
+    deferredCimHistorySearch,
+    cimHistoryQuery.deliveryState,
+    cimHistoryQuery.direction,
+    cimHistoryQuery.followUpState,
+    cimHistoryQuery.page,
+    cimHistoryQuery.pageSize,
+    cimHistoryQuery.replyState,
+    cimHistoryQuery.requestState,
+    cimHistoryQuery.sort,
+  ]);
+
+  useEffect(() => {
+    if (!authState.authenticated || activeSection !== 'deal-hunter' || isReadOnly) {
+      unassignedCommunicationsRequestRef.current.controller?.abort();
+      if (isReadOnly) {
+        setUnassignedCommunications((current) => ({ ...current, rows: [], total: 0, page: 1, loading: false, loadingMore: false, error: '', assigningId: '' }));
+      }
+      return;
+    }
+    loadUnassignedCommunications();
+  // Unassigned inbox bootstrap is intentionally scoped to section and permission changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSection, authState.authenticated, isReadOnly]);
+
+  useEffect(() => {
     if (activeSection === 'deal-hunter' && requestedDealHunterView === 'cim-approvals' && dealHunterReview) {
       window.requestAnimationFrame(() => document.getElementById('cim-approvals')?.scrollIntoView({ block: 'start' }));
     }
@@ -1585,6 +2013,9 @@ export default function DashboardPage() {
   useEffect(() => () => {
     dashboardRequestRef.current.controller?.abort();
     followUpRequestRef.current.controller?.abort();
+    crmCommunicationsRequestRef.current.controller?.abort();
+    cimHistoryRequestRef.current.controller?.abort();
+    unassignedCommunicationsRequestRef.current.controller?.abort();
   }, []);
 
   async function handleMagicLinkRequest(event) {
@@ -1825,6 +2256,195 @@ export default function DashboardPage() {
     } finally {
       setDeletingSubmissionId('');
     }
+  }
+
+  function applySubmissionUpdate(updatedSubmission) {
+    if (!updatedSubmission?.id) return;
+    setDashboardData((current) => ({
+      ...current,
+      submissions: current.submissions.map((submission) => submission.id === updatedSubmission.id ? updatedSubmission : submission),
+      notifications: current.notifications.filter((submission) => submission.id !== updatedSubmission.id),
+      emailTriage: current.emailTriage.filter((submission) => submission.id !== updatedSubmission.id),
+    }));
+    setDrafts((current) => ({ ...current, [updatedSubmission.id]: buildDraft(updatedSubmission) }));
+  }
+
+  async function handleLogCommunication(payload) {
+    if (isReadOnly) {
+      const error = new Error('Read-only users cannot log communications.');
+      setCrmCommunications((current) => ({ ...current, logError: error.message }));
+      throw error;
+    }
+    if (!submissionId) throw new Error('A CRM record is required to log a communication.');
+
+    setCrmCommunications((current) => ({ ...current, logPending: true, logError: '' }));
+    try {
+      const response = await fetch(`/api/admin/submissions/${encodeURIComponent(submissionId)}/communications`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to log this communication.');
+      }
+      if (result.communication) {
+        setCrmCommunications((current) => ({
+          ...current,
+          rows: [...current.rows, result.communication],
+          total: current.total + 1,
+          logError: '',
+        }));
+      }
+      await loadSubmissionDetail(submissionId);
+      return result.communication;
+    } catch (error) {
+      setCrmCommunications((current) => ({ ...current, logError: error.message || 'Unable to log this communication.' }));
+      throw error;
+    } finally {
+      setCrmCommunications((current) => ({ ...current, logPending: false }));
+    }
+  }
+
+  async function handleArchiveLead(submission, payload) {
+    if (isReadOnly) throw new Error('Read-only users cannot archive leads.');
+    if (!submission?.id) throw new Error('A CRM record is required to archive a lead.');
+
+    setLeadLifecyclePendingId(submission.id);
+    setActionError('');
+    try {
+      const response = await fetch(`/api/admin/submissions/${encodeURIComponent(submission.id)}/archive`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          reason: payload.reason,
+          note: payload.note || '',
+          communicationId: payload.communicationId || '',
+          expectedUpdatedAt: submission.updated_at || '',
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to archive this lead.');
+      applySubmissionUpdate(result.submission);
+      await Promise.allSettled([refreshCurrentCrmView(), loadCommandCenter(), loadFollowUps()]);
+      return result.submission;
+    } catch (error) {
+      setActionError(error.message || 'Unable to archive this lead.');
+      throw error;
+    } finally {
+      setLeadLifecyclePendingId('');
+    }
+  }
+
+  async function handleRestoreLead(submission, payload) {
+    if (isReadOnly) throw new Error('Read-only users cannot restore leads.');
+    if (!submission?.id) throw new Error('A CRM record is required to restore a lead.');
+
+    setLeadLifecyclePendingId(submission.id);
+    setActionError('');
+    try {
+      const response = await fetch(`/api/admin/submissions/${encodeURIComponent(submission.id)}/restore`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: payload.status, expectedUpdatedAt: submission.updated_at || '' }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to restore this lead.');
+      applySubmissionUpdate(result.submission);
+      await Promise.allSettled([refreshCurrentCrmView(), loadCommandCenter(), loadFollowUps()]);
+      return result.submission;
+    } catch (error) {
+      setActionError(error.message || 'Unable to restore this lead.');
+      throw error;
+    } finally {
+      setLeadLifecyclePendingId('');
+    }
+  }
+
+  function openCorrectedRecipientRetry(request) {
+    if (isReadOnly) return;
+    setCorrectedRecipientRequest(request);
+    setCorrectedRecipientRetry({ requestId: String(request?.id || request?.cim_request_id || ''), pending: false, error: '' });
+  }
+
+  async function handleRetryCorrectedRecipient(payload) {
+    if (isReadOnly) throw new Error('Read-only users cannot retry CIM requests.');
+    const requestId = String(correctedRecipientRequest?.id || correctedRecipientRequest?.cim_request_id || '');
+    if (!requestId) throw new Error('A CIM request is required for corrected-recipient retry.');
+
+    setCorrectedRecipientRetry({ requestId, pending: true, error: '' });
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/cim-requests/${encodeURIComponent(requestId)}/retry`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to retry this CIM request.');
+      setCorrectedRecipientRequest(null);
+      setCorrectedRecipientRetry({ requestId: '', pending: false, error: '' });
+      setDealHunterFeedback({ error: '', message: `CIM request retried with corrected recipient ${payload.newRecipientEmail}.` });
+      await loadCimRequestHistory({ ...cimHistoryQuery, search: deferredCimHistorySearch });
+      return result.request;
+    } catch (error) {
+      setCorrectedRecipientRetry({ requestId, pending: false, error: error.message || 'Unable to retry this CIM request.' });
+      throw error;
+    }
+  }
+
+  async function handleAssignCommunication({ communicationId, submissionId: destinationSubmissionId }) {
+    if (isReadOnly) throw new Error('Read-only users cannot assign communications.');
+    setUnassignedCommunications((current) => ({ ...current, assigningId: communicationId, error: '' }));
+    try {
+      const response = await fetch(`/api/admin/communications/${encodeURIComponent(communicationId)}/assign`, {
+        method: 'PATCH',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ submissionId: destinationSubmissionId }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to assign this communication.');
+      setUnassignedCommunications((current) => ({
+        ...current,
+        rows: current.rows.filter((communication) => String(communication.id || communication.communication_id) !== String(communicationId)),
+        total: Math.max(0, current.total - 1),
+        assigningId: '',
+      }));
+      return result.communication;
+    } catch (error) {
+      setUnassignedCommunications((current) => ({ ...current, assigningId: '', error: error.message || 'Unable to assign this communication.' }));
+      throw error;
+    }
+  }
+
+  async function handleSearchCommunicationRecords(search) {
+    if (isReadOnly) throw new Error('Read-only users cannot search the assignment queue.');
+    const query = String(search || '').trim();
+    if (query.length < 2) return [];
+    const params = new URLSearchParams({
+      page: '1',
+      pageSize: '25',
+      search: query,
+      status: 'all',
+      sort: 'updated_at',
+      direction: 'desc',
+    });
+    const response = await fetch(`/api/admin/submissions?${params.toString()}`, {
+      credentials: 'same-origin',
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) {
+      throw new Error(result.error || 'Unable to search CRM records.');
+    }
+    return Array.isArray(result.submissions)
+      ? result.submissions
+      : Array.isArray(result.rows)
+        ? result.rows
+        : [];
   }
 
   async function handleCommandCenterUpdate(record, payload) {
@@ -2147,6 +2767,43 @@ export default function DashboardPage() {
     }
   }
 
+  async function persistDealHunterDisposition(deal, reasonInput = 'not-a-fit') {
+    if (isReadOnly) throw new Error('Read-only users cannot dismiss Deal Hunter opportunities.');
+    if (!deal?.dealKey) throw new Error('Deal key is required to save a disposition.');
+    const reason = typeof reasonInput === 'string' ? reasonInput : reasonInput?.reason || reasonInput?.passReason || 'not-a-fit';
+    const note = typeof reasonInput === 'object' ? reasonInput?.note || '' : '';
+    const response = await fetch('/api/admin/deal-hunter/dispositions', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        dealKey: deal.dealKey,
+        listingUrl: deal.listingUrl || deal.listing_url || '',
+        dealName: deal.name || deal.company || '',
+        reason,
+        note,
+        submissionId: deal.submissionId || deal.submission_id || deal.cimRequest?.submissionId || '',
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save this Deal Hunter disposition.');
+    return result;
+  }
+
+  async function handleDismissDealHunterOpportunity(deal, reasonInput) {
+    setDismissingDealKey(deal?.dealKey || '');
+    try {
+      await persistDealHunterDisposition(deal, reasonInput);
+      setDealHunterFeedback({ error: '', message: `${deal.name || 'Deal Hunter opportunity'} dismissed and retained in disposition history.` });
+      await handleLoadDealHunterReview();
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to dismiss this Deal Hunter opportunity.', message: '' });
+      throw error;
+    } finally {
+      setDismissingDealKey('');
+    }
+  }
+
   async function handleSendReadyCimRequests(approvedDeals = null, reviewDecisions = []) {
     if (isReadOnly) {
       setDealHunterFeedback({ error: 'Read-only users cannot send CIM requests.', message: '' });
@@ -2195,6 +2852,16 @@ export default function DashboardPage() {
         });
         const reviewResult = await reviewResponse.json();
         if (!reviewResponse.ok || !reviewResult.success) throw new Error(reviewResult.error || 'Unable to save CIM review decisions.');
+
+        const rejectedDecisions = reviewDecisions.filter((decision) => decision.decision === 'rejected');
+        for (const decision of rejectedDecisions) {
+          const deal = getDealHunterDealFromReview(dealHunterReview, decision.dealKey) || {
+            dealKey: decision.dealKey,
+            name: decision.dealName || '',
+            listingUrl: decision.listingUrl || '',
+          };
+          await persistDealHunterDisposition(deal, decision.passReason || 'not-a-fit');
+        }
       }
 
       if (readyDeals.length === 0) {
@@ -2322,6 +2989,18 @@ export default function DashboardPage() {
   };
 
   const submissions = useMemo(() => dashboardData.submissions || [], [dashboardData.submissions]);
+  const crmCimRequestOptions = useMemo(() => {
+    const seen = new Set();
+    return crmCommunications.rows.reduce((options, communication) => {
+      const id = String(communication.cim_request_id || communication.cimRequestId || '');
+      if (!id || seen.has(id)) return options;
+      seen.add(id);
+      options.push({ id, label: communication.subject || `CIM request ${id}` });
+      return options;
+    }, []);
+  }, [crmCommunications.rows]);
+  const crmCommunicationsHasMore = crmCommunications.rows.length < crmCommunications.total;
+  const unassignedCommunicationsHasMore = unassignedCommunications.rows.length < unassignedCommunications.total;
   const followUpSummary = followUpData.summary || {};
   const notifications = useMemo(() => followUpData.notifications || [], [followUpData.notifications]);
   const emailTriage = useMemo(() => followUpData.emailTriage || [], [followUpData.emailTriage]);
@@ -2839,28 +3518,80 @@ export default function DashboardPage() {
       ) : null}
 
       {activeSection === 'deal-hunter' ? (
-        <DealHunterWorkspace
-          bulkSending={dealHunterBulkCimSending}
-          feedback={dealHunterFeedback}
-          followUpRunning={dealHunterFollowUpRunning}
-          emailTestSending={emailTestSending}
-          loading={dealHunterLoading}
-          onReview={handleLoadDealHunterReview}
-          onRecordCimOutcome={handleRecordCimOutcome}
-          onOpenApprovals={() => {
-            navigate('/admin/deal-hunter?view=cim-approvals');
-            window.requestAnimationFrame(() => document.getElementById('cim-approvals')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
-          }}
-          onRunFollowUps={handleRunCimFollowUps}
-          onSendCimRequest={handleSendCimRequest}
-          onSendEmail={handleSendDealHunterEmail}
-          onSendEmailTest={handleSendEmailTest}
-          onSendReady={handleSendReadyCimRequests}
-          readOnly={isReadOnly}
-          requestingCimDealKey={requestingCimDealKey}
-          review={dealHunterReview}
-          sending={dealHunterSending}
-        />
+        <>
+          <DealHunterWorkspace
+            bulkSending={dealHunterBulkCimSending}
+            dismissingDealKey={dismissingDealKey}
+            feedback={dealHunterFeedback}
+            followUpRunning={dealHunterFollowUpRunning}
+            emailTestSending={emailTestSending}
+            loading={dealHunterLoading}
+            onDismissDeal={handleDismissDealHunterOpportunity}
+            onReview={handleLoadDealHunterReview}
+            onRecordCimOutcome={handleRecordCimOutcome}
+            onOpenApprovals={() => {
+              navigate('/admin/deal-hunter?view=cim-approvals');
+              window.requestAnimationFrame(() => document.getElementById('cim-approvals')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+            }}
+            onRunFollowUps={handleRunCimFollowUps}
+            onSendCimRequest={handleSendCimRequest}
+            onSendEmail={handleSendDealHunterEmail}
+            onSendEmailTest={handleSendEmailTest}
+            onSendReady={handleSendReadyCimRequests}
+            readOnly={isReadOnly}
+            requestingCimDealKey={requestingCimDealKey}
+            review={dealHunterReview}
+            sending={dealHunterSending}
+          />
+
+          {correctedRecipientRequest && !isReadOnly ? (
+            <section className="section-shell mt-6">
+              <CorrectedRecipientRetryForm
+                error={correctedRecipientRetry.error}
+                onCancel={() => {
+                  setCorrectedRecipientRequest(null);
+                  setCorrectedRecipientRetry({ requestId: '', pending: false, error: '' });
+                }}
+                onRetry={handleRetryCorrectedRecipient}
+                pending={correctedRecipientRetry.pending}
+                request={correctedRecipientRequest}
+              />
+            </section>
+          ) : null}
+
+          <section className="section-shell mt-8">
+            <CimRequestHistory
+              counts={cimHistory.counts}
+              error={cimHistory.error}
+              loading={cimHistory.loading}
+              onQueryChange={setCimHistoryQuery}
+              onRetryCorrectedRecipient={isReadOnly ? undefined : openCorrectedRecipientRetry}
+              query={cimHistoryQuery}
+              readOnly={isReadOnly}
+              requests={cimHistory.rows}
+              retryingRequestId={correctedRecipientRetry.pending ? correctedRecipientRetry.requestId : ''}
+              total={cimHistory.total}
+              totalPages={cimHistory.totalPages}
+            />
+          </section>
+
+          {!isReadOnly ? (
+            <section className="section-shell mt-8 pb-8">
+              <UnassignedCommunicationsInbox
+                assigningId={unassignedCommunications.assigningId}
+                communications={unassignedCommunications.rows}
+                error={unassignedCommunications.error}
+                hasMore={unassignedCommunicationsHasMore}
+                loading={unassignedCommunications.loading}
+                loadingMore={unassignedCommunications.loadingMore}
+                onAssign={handleAssignCommunication}
+                onLoadMore={() => loadUnassignedCommunications({ append: true })}
+                onSearchRecords={handleSearchCommunicationRecords}
+                recordOptions={submissions}
+              />
+            </section>
+          ) : null}
+        </>
       ) : null}
 
       {activeSection === 'follow-ups' && followUpError ? (
@@ -3025,7 +3756,7 @@ export default function DashboardPage() {
                 <SelectField
                   label="Status"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, status: event.target.value }))}
-                  options={statuses}
+                  options={editableStatuses}
                   value={createDraft.status}
                 />
                 <SelectField
@@ -3267,6 +3998,10 @@ export default function DashboardPage() {
                 >
                   <CrmRecordCard
                     detailHref={`/admin/crm/${encodeURIComponent(submission.id)}${crmListSearch ? `?${crmListSearch}` : ''}`}
+                    lifecyclePending={leadLifecyclePendingId === submission.id}
+                    onArchiveLead={handleArchiveLead}
+                    onRestoreLead={handleRestoreLead}
+                    readOnly={isReadOnly}
                     submission={submission}
                   />
                 </Reveal>
@@ -3420,6 +4155,15 @@ export default function DashboardPage() {
                   </div>
                 </div>
 
+                <LeadLifecycleControls
+                  communications={crmCommunications.rows}
+                  onArchive={handleArchiveLead}
+                  onRestore={handleRestoreLead}
+                  pending={leadLifecyclePendingId === submission.id}
+                  readOnly={isReadOnly}
+                  submission={submission}
+                />
+
                 <fieldset className={isReadOnly ? 'opacity-75' : ''} disabled={isReadOnly}>
                   <div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-6">
                     <SelectField
@@ -3430,7 +4174,7 @@ export default function DashboardPage() {
                           [submission.id]: { ...draft, status: event.target.value },
                         }))
                       }
-                      options={statuses}
+                      options={submission.status === 'archived' ? ['archived'] : editableStatuses}
                       value={draft.status}
                     />
 
@@ -3470,6 +4214,7 @@ export default function DashboardPage() {
                   />
 
                   <SelectField
+                    disabled={submission.status === 'archived'}
                     label="Follow-up state"
                     onChange={(event) =>
                       setDrafts((current) => ({
@@ -3484,6 +4229,7 @@ export default function DashboardPage() {
                   <Field label="Next action">
                     <input
                       className="form-control"
+                      disabled={submission.status === 'archived'}
                       onChange={(event) =>
                         setDrafts((current) => ({
                           ...current,
@@ -3937,6 +4683,21 @@ export default function DashboardPage() {
                   </div>
                 </fieldset>
 
+                <CrmCommunications
+                  cimRequestOptions={crmCimRequestOptions}
+                  communications={crmCommunications.rows}
+                  error={crmCommunications.error}
+                  hasMore={crmCommunicationsHasMore}
+                  loading={crmCommunications.loading}
+                  loadingMore={crmCommunications.loadingMore}
+                  logError={crmCommunications.logError}
+                  logPending={crmCommunications.logPending}
+                  onLoadMore={() => loadCrmCommunications(submission.id, { append: true })}
+                  onLogCommunication={isReadOnly ? undefined : handleLogCommunication}
+                  readOnly={isReadOnly}
+                  workflowUpdatesDisabled={submission.status === 'archived'}
+                />
+
                 <DealActivityTimeline
                   error={dealActivity.error}
                   events={dealActivity.events}
@@ -3944,37 +4705,43 @@ export default function DashboardPage() {
                 />
 
                 {!isReadOnly ? (
-                  <div className="mt-6 grid gap-3 sm:flex sm:flex-wrap">
-                    <button
-                      className={primaryActionButtonClass}
-                      disabled={isSaving}
-                      onClick={() => handleSave(submission.id)}
-                      type="button"
-                    >
-                      <Save className="h-4 w-4" />
-                      {isSaving ? 'Saving...' : 'Save Updates'}
-                    </button>
+                  <>
+                    <div className="mt-6 grid gap-3 sm:flex sm:flex-wrap">
+                      <button
+                        className={primaryActionButtonClass}
+                        disabled={isSaving}
+                        onClick={() => handleSave(submission.id)}
+                        type="button"
+                      >
+                        <Save className="h-4 w-4" />
+                        {isSaving ? 'Saving...' : 'Save Updates'}
+                      </button>
 
-                    <button
-                      className={secondaryActionButtonClass}
-                      disabled={isCreatingUpload}
-                      onClick={() => handleCreateUploadRequest(submission.id)}
-                      type="button"
-                    >
-                      <Link2 className="h-4 w-4" />
-                      {isCreatingUpload ? 'Creating Link...' : 'Create Secure Upload Link'}
-                    </button>
+                      <button
+                        className={secondaryActionButtonClass}
+                        disabled={isCreatingUpload}
+                        onClick={() => handleCreateUploadRequest(submission.id)}
+                        type="button"
+                      >
+                        <Link2 className="h-4 w-4" />
+                        {isCreatingUpload ? 'Creating Link...' : 'Create Secure Upload Link'}
+                      </button>
+                    </div>
 
-                    <button
-                      className="inline-flex min-h-[46px] w-full min-w-0 items-center justify-center gap-2 rounded-full border border-red-200 bg-red-50 px-4 py-2.5 text-center text-sm font-semibold text-red-700 transition hover:border-red-300 hover:bg-red-100 disabled:opacity-50 sm:w-auto sm:px-5 sm:py-3"
-                      disabled={isDeleting}
-                      onClick={() => handleDeleteSubmission(submission)}
-                      type="button"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                      {isDeleting ? 'Deleting...' : 'Delete Record'}
-                    </button>
-                  </div>
+                    <div className="mt-8 rounded-2xl border border-red-200 bg-red-50/60 p-4 sm:p-5">
+                      <p className="text-sm font-semibold text-red-800">Permanent delete</p>
+                      <p className="mt-1 text-sm leading-6 text-red-700">Permanently removes this CRM record and runs the existing secure-document cleanup workflow. Archive Lead above is the reversible option.</p>
+                      <button
+                        className="mt-4 inline-flex min-h-[46px] w-full min-w-0 items-center justify-center gap-2 rounded-full border border-red-300 bg-white px-4 py-2.5 text-center text-sm font-semibold text-red-700 transition hover:bg-red-100 disabled:opacity-50 sm:w-auto sm:px-5 sm:py-3"
+                        disabled={isDeleting}
+                        onClick={() => handleDeleteSubmission(submission)}
+                        type="button"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        {isDeleting ? 'Deleting...' : 'Permanently Delete Record'}
+                      </button>
+                    </div>
+                  </>
                 ) : null}
               </Reveal>
             );

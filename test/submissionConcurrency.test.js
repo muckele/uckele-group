@@ -6,6 +6,8 @@ import test from 'node:test';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 
+process.env.ADMIN_SESSION_SECRET = 'submission-concurrency-test-secret';
+
 function submission(id, updatedAt) {
   return {
     id,
@@ -75,6 +77,37 @@ test('SQLite compare-and-set permits exactly one write for a shared CRM version'
   assert.equal(results.filter(Boolean).length, 1);
   const current = await storage.getSubmission('cas-record');
   assert.ok(['editor one', 'editor two'].includes(current.notes));
+});
+
+test('generic workflow updates cannot make an archived CRM record actionable', async (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-archived-workflow-'));
+  t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
+  const storage = createSqliteStorage({
+    storage: { sqlitePath: path.join(tempDir, 'crm.sqlite') },
+    protection: { rateLimitRetentionMs: 0 },
+  });
+  t.after(() => storage.close());
+  const initialVersion = '2026-07-12T10:00:00.000Z';
+  await storage.insertSubmission({
+    ...submission('archived-workflow-record', initialVersion),
+    status: 'archived',
+    follow_up_state: 'completed',
+  });
+  const { updateSubmissionWorkflow } = await import('../server/services/submissions.js');
+
+  assert.equal(await updateSubmissionWorkflow('archived-workflow-record', {
+    expected_updated_at: initialVersion,
+    follow_up_state: 'scheduled',
+  }, { storage }), null);
+  assert.equal(await updateSubmissionWorkflow('archived-workflow-record', {
+    expected_updated_at: initialVersion,
+    next_action_at: '2026-07-13T10:00:00.000Z',
+  }, { storage }), null);
+
+  const current = await storage.getSubmission('archived-workflow-record');
+  assert.equal(current.status, 'archived');
+  assert.equal(current.follow_up_state, 'completed');
+  assert.equal(current.next_action_at, null);
 });
 
 test('Supabase compare-and-set predicates the write on id and updated_at', async () => {

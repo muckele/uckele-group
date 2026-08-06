@@ -6,6 +6,9 @@ delete process.env.RESEND_API_KEY;
 delete process.env.RESEND_FROM_EMAIL;
 process.env.DEAL_HUNTER_SHEET_CSV_URLS = 'https://example.test/deals.csv';
 process.env.DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL = 'https://example.test/appEGxhjno0HTpEco/shrUhtbnzZTPaR4Lk';
+process.env.DEAL_HUNTER_AIRTABLE_TOKEN = 'test-token';
+process.env.DEAL_HUNTER_AIRTABLE_BASE_ID = 'appTest';
+process.env.DEAL_HUNTER_AIRTABLE_TABLE_ID = 'tblTest';
 process.env.DEAL_HUNTER_LOOKBACK_DAYS = '30';
 process.env.ADMIN_SESSION_SECRET = 'deal-hunter-bulk-cim-session-secret';
 
@@ -14,10 +17,11 @@ const originalConsoleWarn = console.warn;
 let sourceFetchMode = 'ok';
 const today = new Date().toISOString().slice(0, 10);
 const sourceCsv = [
-  'Business Name,Industry,State,Date Added,Profit,Revenue,Asking Price,Broker Name,Broker Email,Contact Name 2,Contact Email 2,Description',
-  `"Commercial HVAC Maintenance Co","Commercial HVAC maintenance","CA","${today}","$450,000","$1,800,000","$1,400,000","Erin Broker","erin@example.com","Alex Contact","alex@example.com","Recurring maintenance contracts, service agreements, scheduled maintenance, field technicians, repair, replacement, compliance work, trained staff, management in place, SBA eligible, seller financing available."`,
+  'Business Name,Industry,State,Date Added,Profit,Revenue,Asking Price,Broker Name,Broker Email,Contact Name 2,Contact Email 2,Listing URL,Description',
+  `"Commercial HVAC Maintenance Co","Commercial HVAC maintenance","CA","${today}","$450,000","$1,800,000","$1,400,000","Erin Broker","erin@example.com","Alex Contact","alex@example.com","https://broker.example.test/hvac-maintenance","Recurring maintenance contracts, service agreements, scheduled maintenance, field technicians, repair, replacement, compliance work, trained staff, management in place, SBA eligible, seller financing available."`,
 ].join('\n');
-const emptySourceCsv = 'Business Name,Industry,State,Date Added,Profit,Revenue,Asking Price,Broker Name,Broker Email,Contact Name 2,Contact Email 2,Description';
+const emptySourceCsv = 'Business Name,Industry,State,Date Added,Profit,Revenue,Asking Price,Broker Name,Broker Email,Contact Name 2,Contact Email 2,Listing URL,Description';
+let activeSourceCsv = sourceCsv;
 
 before(() => {
   console.warn = () => {};
@@ -27,10 +31,14 @@ before(() => {
         return new Response('source unavailable', { status: 503 });
       }
 
-      return new Response(sourceFetchMode === 'empty' ? emptySourceCsv : sourceCsv, {
+      return new Response(sourceFetchMode === 'empty' ? emptySourceCsv : activeSourceCsv, {
         status: 200,
         headers: { 'Content-Type': 'text/csv' },
       });
+    }
+
+    if (String(url).includes('api.airtable.com')) {
+      return Response.json({ records: [] });
     }
 
     return new Response('not found', { status: 404 });
@@ -39,6 +47,7 @@ before(() => {
 
 beforeEach(() => {
   sourceFetchMode = 'ok';
+  activeSourceCsv = sourceCsv;
 });
 
 after(() => {
@@ -48,21 +57,90 @@ after(() => {
 
 function createCimStorage() {
   const requests = new Map();
+  const submissions = new Map();
+  const communications = new Map();
+  const activities = [];
+
+  function requestKey(request) {
+    return `${request.deal_key}|${request.recipient_email}`;
+  }
+
+  function saveRequest(request) {
+    requests.set(requestKey(request), request);
+    return request;
+  }
 
   return {
     requests,
+    submissions,
+    communications,
+    activities,
     async listDealHunterSeenDeals() {
       return [];
     },
-    async listDealHunterCimRequests() {
-      return Array.from(requests.values());
+    async listDealHunterCimRequests({ dealKeys = [] } = {}) {
+      return Array.from(requests.values()).filter((request) => dealKeys.length === 0 || dealKeys.includes(request.deal_key));
     },
     async getDealHunterCimRequest({ dealKey, recipientEmail }) {
       return requests.get(`${dealKey}|${recipientEmail}`) || null;
     },
+    async getDealHunterCimRequestById(id) {
+      return Array.from(requests.values()).find((request) => request.id === id) || null;
+    },
     async upsertDealHunterCimRequest(request) {
-      requests.set(`${request.deal_key}|${request.recipient_email}`, request);
-      return request;
+      return saveRequest(request);
+    },
+    async getSubmission(id) {
+      return submissions.get(id) || null;
+    },
+    async listSubmissions({ search = '' } = {}) {
+      const normalizedSearch = String(search || '').trim();
+      const rows = Array.from(submissions.values()).filter((submission) => (
+        !normalizedSearch
+        || submission.metadata?.dealHunter?.dealKey === normalizedSearch
+        || String(submission.notes || '').includes(normalizedSearch)
+      ));
+      return { rows, total: rows.length, page: 1, pageSize: rows.length || 1 };
+    },
+    async getLatestSecureUploadRequestForSubmission() {
+      return null;
+    },
+    async listSecureDocumentsForSubmission() {
+      return [];
+    },
+    async getCrmCommunication(id) {
+      return communications.get(id) || null;
+    },
+    async insertCrmCommunication(communication) {
+      assert.ok(submissions.has(communication.submission_id), 'CRM lead must exist before its communication is persisted');
+      assert.ok(
+        Array.from(requests.values()).some((request) => request.id === communication.cim_request_id),
+        'pending CIM request must exist before its exact communication is persisted',
+      );
+      communications.set(communication.id, communication);
+      return communication;
+    },
+    async updateCrmCommunication(id, values) {
+      const existing = communications.get(id);
+      assert.ok(existing, 'communication must already be persisted before delivery state is updated');
+      const updated = { ...existing, ...values };
+      communications.set(id, updated);
+      return updated;
+    },
+    async mutateWithCrmActivity({ operation, payload, activity }) {
+      let record;
+      if (operation === 'insert_submission') {
+        record = payload.submission;
+        submissions.set(record.id, record);
+      } else if (operation === 'insert_crm_communication') {
+        record = await this.insertCrmCommunication(payload.communication);
+      } else if (operation === 'upsert_deal_hunter_cim_request') {
+        record = saveRequest(payload.request);
+      } else {
+        throw new Error(`Unsupported CIM test mutation: ${operation}`);
+      }
+      activities.push(activity);
+      return { applied: true, record, activity };
     },
   };
 }
@@ -136,7 +214,14 @@ test('bulk CIM send accepts an edited recipient only with the signed reviewed sn
   assert.equal(result.status, 502);
   assert.equal(result.failed, 1);
   assert.equal(storage.requests.size, 1);
+  assert.equal(storage.submissions.size, 1);
+  assert.equal(storage.communications.size, 1);
   assert.equal(request.recipient_email, 'corrected-broker@example.com');
+  const [communication] = Array.from(storage.communications.values());
+  assert.equal(communication.submission_id, request.submission_id);
+  assert.equal(communication.cim_request_id, request.id);
+  assert.deepEqual(communication.to_addresses, ['corrected-broker@example.com']);
+  assert.ok(communication.body_text);
 });
 
 test('bulk CIM send accepts a signed alternate contact and uses that contact in the greeting metadata', async () => {
@@ -158,8 +243,46 @@ test('bulk CIM send accepts a signed alternate contact and uses that contact in 
   const [request] = Array.from(storage.requests.values());
 
   assert.equal(result.status, 502);
+  assert.equal(storage.submissions.size, 1);
+  assert.equal(storage.communications.size, 1);
   assert.equal(request.recipient_email, 'alex@example.com');
   assert.equal(request.metadata.brokerName, 'Alex Contact');
+  const [communication] = Array.from(storage.communications.values());
+  assert.deepEqual(communication.to_addresses, ['alex@example.com']);
+  assert.match(communication.body_text, /Alex/);
+});
+
+test('bulk CIM send preserves the signed approved copy when template fields change in a later healthy source review', async () => {
+  const { reviewDailyDeals, sendDealHunterReadyCimRequests } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const review = await reviewDailyDeals({ storage });
+  const deal = review.qualified.find((item) => item.cimRequest?.canRequest);
+  const approvedPreview = deal.cimRequest.preview;
+
+  activeSourceCsv = sourceCsv.replace(
+    'Commercial HVAC maintenance',
+    'Commercial HVAC maintenance - changed after approval',
+  );
+
+  const result = await sendDealHunterReadyCimRequests({
+    requestedBy: 'test-admin',
+    selections: [{
+      dealKey: deal.dealKey,
+      recipientEmail: deal.cimRequest.recipientEmail,
+      snapshotToken: deal.cimRequest.snapshotToken,
+    }],
+    storage,
+  });
+  const [request] = Array.from(storage.requests.values());
+  const [communication] = Array.from(storage.communications.values());
+
+  assert.equal(result.status, 502);
+  assert.equal(result.failed, 1);
+  assert.equal(communication.subject, approvedPreview.subject);
+  assert.equal(communication.body_text, approvedPreview.text);
+  assert.equal(request.subject, approvedPreview.subject);
+  assert.equal(request.metadata.industry, deal.industry);
+  assert.doesNotMatch(communication.body_text, /changed after approval/i);
 });
 
 test('source-healthy bulk send rejects an exact recipient without a signed snapshot', async () => {
@@ -266,8 +389,8 @@ test('approval evidence is derived from a signed queue snapshot', async () => {
   assert.equal(forged.valid, false);
 });
 
-test('bulk CIM send uses confirmed snapshots when a source review is incomplete', async () => {
-  const { reviewDailyDeals, sendDealHunterReadyCimRequests } = await import('../server/services/dealHunter.js');
+test('CIM send paths fail closed when a source review is incomplete', async () => {
+  const { reviewDailyDeals, sendDealHunterCimRequest, sendDealHunterReadyCimRequests } = await import('../server/services/dealHunter.js');
   const storage = createCimStorage();
   const review = await reviewDailyDeals({ storage });
   const deal = review.qualified.find((item) => item.cimRequest?.canRequest);
@@ -288,19 +411,40 @@ test('bulk CIM send uses confirmed snapshots when a source review is incomplete'
     ],
     storage,
   });
-  const [request] = Array.from(storage.requests.values());
-
   assert.equal(result.ok, false);
-  assert.equal(result.status, 502);
+  assert.equal(result.status, 503);
   assert.equal(result.sent, 0);
-  assert.equal(result.failed, 1);
-  assert.equal(storage.requests.size, 1);
-  assert.equal(request.deal_key, deal.dealKey);
-  assert.equal(request.recipient_email, deal.cimRequest.recipientEmail);
-  assert.doesNotMatch(result.error, /list changed/i);
+  assert.equal(result.failed, 0);
+  assert.equal(storage.requests.size, 0);
+  assert.match(result.error, /source review is incomplete/i);
+
+  const directResult = await sendDealHunterCimRequest({
+    dealKey: deal.dealKey,
+    snapshotToken: deal.cimRequest.snapshotToken,
+    requestedBy: 'test-admin',
+    storage,
+  });
+  assert.equal(directResult.ok, false);
+  assert.equal(directResult.status, 503);
+  assert.equal(storage.requests.size, 0);
+  assert.match(directResult.error, /source review is incomplete/i);
 });
 
-test('source-outage fallback permits an alternate contact only when it is present in the signed snapshot', async () => {
+test('daily review email and CRM sync fail closed when a source is unavailable', async () => {
+  const { sendDailyDealHunterReview } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  sourceFetchMode = 'down';
+
+  const result = await sendDailyDealHunterReview({ idempotencyKey: 'partial-review-test', storage });
+
+  assert.equal(result.emailResult.status, 'failed');
+  assert.match(result.emailResult.error, /one or more sources were unavailable/i);
+  assert.equal(result.crmSync.paused, true);
+  assert.equal(result.crmSync.reviewed, 0);
+  assert.equal(storage.requests.size, 0);
+});
+
+test('source outages block alternate contacts even when they are present in a signed snapshot', async () => {
   const { reviewDailyDeals, sendDealHunterReadyCimRequests } = await import('../server/services/dealHunter.js');
   const storage = createCimStorage();
   const review = await reviewDailyDeals({ storage });
@@ -317,12 +461,11 @@ test('source-outage fallback permits an alternate contact only when it is presen
     }],
     storage,
   });
-  const [request] = Array.from(storage.requests.values());
-
-  assert.equal(result.status, 502);
-  assert.equal(request.recipient_email, 'alex@example.com');
-  assert.equal(request.metadata.brokerName, 'Alex Contact');
-  assert.doesNotMatch(result.error, /list changed/i);
+  assert.equal(result.status, 503);
+  assert.equal(result.sent, 0);
+  assert.equal(result.failed, 0);
+  assert.equal(storage.requests.size, 0);
+  assert.match(result.error, /source review is incomplete/i);
 });
 
 test('bulk CIM send ignores raw client snapshots without a signed token', async () => {

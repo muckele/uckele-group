@@ -11,6 +11,9 @@ The site now includes:
 - Private admin CRM at `/admin`
 - Email magic-link admin auth with optional password fallback
 - Workflow fields for assignee, notes, tags, priority, follow-up state, and next action date
+- Durable first-class CRM communication history for email, phone, meeting, text, and notes
+- Separate CIM request, provider-delivery, reply, and follow-up lifecycle state with corrected-recipient retries
+- Explicit archive/restore workflows and a separate permanent-delete action
 - Secure upload request generation and a seller-facing upload page at `/secure-documents`
 - Email engagement event tracking and follow-up triage via `/api/webhooks/resend`
 - Acquisition Command Center for 75+ deals, active CIM conversations, pass reasons, source health, and diligence readiness
@@ -53,14 +56,16 @@ Configure:
 - `ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH` if you want to override where the source-health row-count snapshot is stored
 - `DEAL_HUNTER_CRON_SECRET` if you also want to trigger the protected endpoint externally
 
-Optional Airtable API mode:
+Airtable API mode (required when the shared-view export exceeds the payload limit):
 
 - `DEAL_HUNTER_AIRTABLE_TOKEN` with `data.records:read`
 - `DEAL_HUNTER_AIRTABLE_BASE_ID`
 - `DEAL_HUNTER_AIRTABLE_TABLE_ID`
 - `DEAL_HUNTER_AIRTABLE_VIEW_ID`
 
-Use Airtable API mode for the larger business list in production. The unauthenticated shared-view payload is guarded by `DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES`; if Airtable returns an oversized JSON payload, the source is marked failed instead of crashing the daily email job. Google Sheet CSV imports are similarly capped by `DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES` and `DEAL_HUNTER_MAX_SOURCE_RECORDS` before records are normalized.
+Use Airtable API mode for the larger business list in production. The unauthenticated shared-view payload is guarded by `DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES`; if Airtable returns an oversized JSON payload, the source is marked as needing setup instead of crashing the review. Google Sheet CSV imports are similarly capped by `DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES` and `DEAL_HUNTER_MAX_SOURCE_RECORDS` before records are normalized.
+
+If any configured source is unavailable, the admin shows a partial-review warning and pauses the daily review email, CRM synchronization, and new CIM outreach until every source passes a fresh review. Follow-ups for already-contacted deals remain governed separately by inbound-reply readiness.
 
 Admin endpoints:
 
@@ -82,7 +87,7 @@ The production Fly machine runs the in-app scheduler once daily at the configure
 
 Phase 15 also records an atomic daily job claim in `scheduled_job_runs`. Admin, in-process scheduler, and external cron triggers share the same date-keyed claim, preventing overlapping triggers from sending duplicate daily emails. Successful provider delivery uses a deterministic idempotency key, local delivery evidence is written before completion bookkeeping, and stale in-progress claims remain retryable.
 
-Apply all committed Supabase migrations before deploying this version when `STORAGE_PROVIDER=supabase` is used. Phase 15 adds `scheduled_job_runs`, append-only `admin_audit_events`, and `secure_document_cleanup_jobs`.
+Apply all committed Supabase migrations before deploying this version when `STORAGE_PROVIDER=supabase` is used. In particular, `20260806120000_crm_communications_lifecycle.sql` adds first-class communications, the expanded CIM lifecycle, Deal Hunter dispositions, and the atomic RPCs used by this release. SQLite applies the equivalent additive migration automatically at startup; take and verify a backup before starting the upgraded process against production data.
 
 Optional external scheduler endpoint:
 
@@ -99,7 +104,7 @@ The Acquisition Command Center is an admin-only view over CRM records that score
 
 ### CIM Requests And Broker Follow-Ups
 
-Deal Hunter deals scoring 75+ can be approved from the protected admin dashboard with the `Send CIM Request` button. Each request is stored in `deal_hunter_cim_requests`, including the broker email, provider message id, follow-up count, next follow-up date, and response status.
+Deal Hunter deals scoring 75+ can be approved from the protected admin dashboard with the `Send CIM Request` button. Each request is linked to a CRM record and keeps request, provider-delivery, reply, and follow-up state separately. The exact recipient, subject, text, HTML, reply alias, and idempotency key are persisted as a CRM communication before provider transmission. A failed first attempt can retry the same persisted copy; a delivery failure can use the separately confirmed corrected-recipient workflow without rewriting the original attempt. Live CIM initial and follow-up delivery requires `DELIVERY_PROVIDER=resend`, whose provider message IDs and idempotency keys make post-acceptance reconciliation safe. The console provider remains available for development-only verification. EmailJS remains available for ordinary application mail, but CIM outreach fails closed before the network because EmailJS does not provide the acceptance identity/idempotency boundary this workflow requires.
 
 Automatic follow-ups are controlled by:
 
@@ -109,7 +114,7 @@ Automatic follow-ups are controlled by:
 - `DEAL_HUNTER_CIM_FOLLOW_UP_WEEKDAYS_ONLY=true`
 - `DEAL_HUNTER_CIM_FOLLOW_UP_TIMEZONE=America/Los_Angeles`
 
-Initial CIM outreach uses a gated three-stage automation policy. Stage 1 is the production-safe default and requires approval for every initial request. Stage 2 activates trusted-rule sends only after the configured minimum review history; Stage 3 additionally requires the configured review count and approval-rate threshold. Both higher stages retain daily and broker contact caps, source-health checks, suppression events, duplicate detection, and the Operations emergency pause.
+Initial CIM outreach uses a gated three-stage automation policy. Stage 1 is the production-safe default and requires administrator approval for every initial request. Stage 2 activates trusted-rule sends only after the configured minimum review history; Stage 3 additionally requires the configured review count and approval-rate threshold. Every higher-stage send creates and re-verifies a server-signed snapshot of the exact reviewed deal before persistence or transmission, and records the verified snapshot digest and automation stage on the durable request. Both higher stages retain daily and broker contact caps, source-health checks, suppression events, duplicate detection, and the Operations emergency pause.
 
 - `DEAL_HUNTER_CIM_AUTOMATION_STAGE=1` (`1`, `2`, or `3`)
 - `DEAL_HUNTER_CIM_AUTOMATION_PAUSED=false`
@@ -122,6 +127,10 @@ Initial CIM outreach uses a gated three-stage automation policy. Stage 1 is the 
 - `DEAL_HUNTER_CIM_AUTOMATION_MAX_PROFIT_MULTIPLE=4`
 
 The production cadence is three persistent touches: first follow-up after 48 hours, second follow-up 72 hours later, and final follow-up 96 hours after that. With weekday-only delivery enabled, a follow-up that becomes due on Saturday or Sunday remains queued until the next scheduler check on a weekday in the configured timezone. The follow-up job checks for Resend inbound `email.received` webhook events before sending and stores them internally as replies. Configure the delivery provider webhook with `EMAIL_WEBHOOK_SECRET` or `RESEND_WEBHOOK_SECRET`; without inbound reply webhook events, the app can send due follow-ups but cannot automatically know when a broker responded. The job stops follow-ups on replies, bounces, complaints, failures, or unsubscribes.
+
+For received mail, the signed webhook first creates a durable, replay-safe placeholder. The ingestion worker then uses the configured `RESEND_API_KEY` to retrieve the message text and attachment metadata from Resend's fixed receiving API endpoints. It does not download attachment content or retain provider attachment URLs, and inbound HTML is converted to plain text rather than trusted for rendering. A signed per-request reply alias wins over sender-email matching; otherwise sender matching assigns only when exactly one CRM record matches. Ambiguous mail remains in the admin-only unassigned inbox. Operations exposes counts and bounded failure status, never message bodies.
+
+Archive is the normal way to close a CRM record. It stops linked CIM follow-ups, records a reason and actor, and remains reversible without restarting outreach. Permanent delete remains a distinct destructive action and should be reserved for retention/privacy requirements. Archive, Deal Hunter dismissal, and permanent delete all refuse to race a fresh CIM transmission lease; retry the lifecycle action after the in-flight attempt resolves or its bounded lease expires.
 
 ### Diligence And Decisioning
 
@@ -182,7 +191,7 @@ Set:
 - `EMAILJS_PUBLIC_KEY`
 - `EMAILJS_PRIVATE_KEY` if your EmailJS account requires it
 
-EmailJS can be used for both inbound lead notifications and the new outbound admin/upload messages, assuming your template accepts the provided generic email parameters.
+EmailJS can be used for both inbound lead notifications and outbound admin/upload messages, assuming your template accepts the provided generic email parameters. It is intentionally not eligible for CIM initial or follow-up outreach; use Resend for live CIM communications or the console provider for development-only verification.
 
 ## CRM Forwarding
 
@@ -243,7 +252,11 @@ Use:
 The admin CRM supports:
 
 - submission review
+- paginated communication history with lifecycle badges and manual communication logging
+- searchable CIM request history with each exact stored initial/follow-up email and safe retry actions
+- an admin-only unassigned inbound communication inbox
 - status updates
+- archive and restore, with permanent delete kept separate
 - assignee, notes, tags, priority, and reminder dates
 - CSV export
 - secure upload link generation

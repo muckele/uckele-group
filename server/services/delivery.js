@@ -2,6 +2,11 @@ import { getConfig } from '../config.js';
 import { fetchWithTimeout } from '../utils/http.js';
 import { recordEmailEvent } from './emailEvents.js';
 
+const cimMessageKinds = new Set([
+  'deal-hunter-cim-request',
+  'deal-hunter-cim-follow-up',
+]);
+
 function escapeHtml(value = '') {
   return String(value)
     .replaceAll('&', '&amp;')
@@ -399,6 +404,7 @@ async function recordTrackedEmailDelivery(message, result) {
           recipient_email: recipient,
           subject: message.subject,
           submission_id: message.tracking.submissionId || '',
+          communication_id: message.tracking.communicationId || message.communicationId || '',
           source: message.kind,
           metadata: {
             deliveryStatus: result.status,
@@ -416,6 +422,19 @@ async function recordTrackedEmailDelivery(message, result) {
 async function sendMessage(message) {
   const config = getConfig();
   let result;
+
+  // EmailJS returns a successful response without a provider message ID and
+  // does not offer the provider-side idempotency guarantee used by CIM sends.
+  // A process failure after acceptance could therefore make a retry duplicate
+  // private broker outreach. Keep EmailJS available for ordinary application
+  // mail, but fail closed before the network for every CIM send entry point.
+  if (config.delivery.provider === 'emailjs' && cimMessageKinds.has(message.kind)) {
+    return {
+      status: 'failed',
+      error: 'EmailJS is not eligible for CIM outreach because provider acceptance cannot be reconciled idempotently. Configure Resend, or use the console provider for development-only verification.',
+      providerMessageId: '',
+    };
+  }
 
   try {
     switch (config.delivery.provider) {
@@ -443,6 +462,21 @@ async function sendMessage(message) {
 
   await recordTrackedEmailDelivery(message, result);
   return result;
+}
+
+// CIM workflows persist the fully-rendered message before calling this entry
+// point, then pass the same immutable object here. Keeping this small public
+// seam prevents template changes between persistence and transmission.
+export async function sendPreparedMessage(message = {}) {
+  if (!hasOnlyValidEmailRecipients(message.to)) {
+    return {
+      status: 'failed',
+      error: 'A valid broker or contact email is required before sending this email.',
+      providerMessageId: '',
+    };
+  }
+
+  return sendMessage(message);
 }
 
 function buildSubmissionMessage(submission) {
@@ -774,7 +808,14 @@ export async function sendDailyDealHunterEmail(options) {
   return sendMessage(buildDailyDealHunterEmail(options));
 }
 
-export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = '', cimRequestId = '' } = {}) {
+export function buildDealHunterCimRequestEmail({
+  to,
+  deal = {},
+  requestedBy = '',
+  cimRequestId = '',
+  submissionId = '',
+  communicationId = '',
+} = {}) {
   const config = getConfig();
   const businessName = normalizeText(deal.name || 'the listed business', 160);
   const subject = `CIM / NDA request for ${businessName}`;
@@ -833,6 +874,7 @@ export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = ''
   });
 
   return {
+    communicationId,
     kind: 'deal-hunter-cim-request',
     idempotencyKey: buildCimEmailIdempotencyKey({ requestId: cimRequestId }),
     to,
@@ -847,12 +889,16 @@ export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = ''
       { name: 'source', value: 'deal-hunter-cim-request' },
       { name: 'deal_key', value: normalizeText(deal.dealKey || '', 250) },
       { name: 'cim_request_id', value: normalizeText(cimRequestId, 250) },
+      { name: 'submission_id', value: normalizeText(submissionId, 250) },
+      { name: 'communication_id', value: normalizeText(communicationId, 250) },
     ],
     tracking: {
       source: 'deal-hunter-cim-request',
       dealKey: deal.dealKey || '',
       dealName: businessName,
       cimRequestId,
+      submissionId,
+      communicationId,
       score: deal.score || 0,
       requestedBy,
     },
@@ -928,7 +974,13 @@ function buildCimFollowUpCopy({ businessName, followUpNumber }) {
   };
 }
 
-export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumber = 1, requestedBy = '' } = {}) {
+export function buildDealHunterCimFollowUpEmail({
+  to,
+  request = {},
+  followUpNumber = 1,
+  requestedBy = '',
+  communicationId = '',
+} = {}) {
   const config = getConfig();
   const metadata = request.metadata && typeof request.metadata === 'object' ? request.metadata : {};
   const businessName = normalizeText(request.deal_name || 'the listed business', 160);
@@ -973,6 +1025,7 @@ export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumb
   });
 
   return {
+    communicationId,
     kind: 'deal-hunter-cim-follow-up',
     idempotencyKey: buildCimEmailIdempotencyKey({ requestId: request.id, followUpNumber }),
     to,
@@ -987,6 +1040,8 @@ export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumb
       { name: 'source', value: 'deal-hunter-cim-follow-up' },
       { name: 'deal_key', value: normalizeText(request.deal_key || '', 250) },
       { name: 'cim_request_id', value: normalizeText(request.id || '', 250) },
+      { name: 'submission_id', value: normalizeText(request.submission_id || '', 250) },
+      { name: 'communication_id', value: normalizeText(communicationId, 250) },
       { name: 'follow_up_number', value: String(followUpNumber) },
     ],
     tracking: {
@@ -994,6 +1049,8 @@ export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumb
       dealKey: request.deal_key || '',
       dealName: businessName,
       cimRequestId: request.id || '',
+      submissionId: request.submission_id || '',
+      communicationId,
       followUpNumber,
       requestedBy: requester,
     },

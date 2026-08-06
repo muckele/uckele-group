@@ -365,7 +365,7 @@ test('command center action queue ignores passed records', () => {
   assert.equal(actions.some((action) => action.record?.id === 'active-1'), true);
 });
 
-test('passing a command center record completes CRM follow-up state', async () => {
+test('passing a command center record atomically archives it and completes CRM follow-up state', async () => {
   let capturedUpdate = null;
   const storage = {
     async getSubmission(id) {
@@ -380,8 +380,8 @@ test('passing a command center record completes CRM follow-up state', async () =
       };
     },
     async mutateWithCrmActivity({ operation, payload, activity }) {
-      assert.equal(operation, 'update_submission');
-      assert.equal(activity.event_type, 'diligence.command-center-updated');
+      assert.equal(operation, 'archive_submission');
+      assert.equal(activity.event_type, 'submission.archived');
       capturedUpdate = payload.values;
       return { applied: true, record: { id: payload.id, ...payload.values }, activity };
     },
@@ -395,7 +395,11 @@ test('passing a command center record completes CRM follow-up state', async () =
   });
 
   assert.equal(result.ok, true);
+  assert.equal(result.archived, true);
+  assert.equal(capturedUpdate.status, 'archived');
+  assert.equal(capturedUpdate.archive_reason, 'valuation');
   assert.equal(capturedUpdate.follow_up_state, 'completed');
+  assert.equal(capturedUpdate.next_action_at, null);
   assert.equal(capturedUpdate.metadata.acquisitionCommand.pipelineStage, 'passed');
   assert.equal(capturedUpdate.metadata.acquisitionCommand.passReason, 'too-expensive');
   assert.equal(capturedUpdate.metadata.diligence.stage, 'passed');
