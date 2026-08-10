@@ -536,7 +536,6 @@ export function summarizeEmailEngagement(events = []) {
   const suppressionEvent = counts.bounced || counts.complained || counts.failed || counts.suppressed || counts.unsubscribed;
   const rawScore =
     counts.delivered * 2 +
-    counts.opened * 10 +
     counts.clicked * 30 +
     counts.replied * 50 -
     counts.delayed * 5 -
@@ -546,7 +545,7 @@ export function summarizeEmailEngagement(events = []) {
     counts.suppressed * 100 -
     counts.unsubscribed * 100;
   const score = Math.max(0, Math.min(100, rawScore));
-  const actionable = !suppressionEvent && (counts.replied > 0 || counts.clicked > 0 || counts.opened >= 2);
+  const actionable = !suppressionEvent && (counts.replied > 0 || counts.clicked > 0);
   const hot = actionable && score >= 30;
 
   let action = '';
@@ -562,11 +561,11 @@ export function summarizeEmailEngagement(events = []) {
     tone = 'success';
     action = 'They clicked a link. Call or send a direct follow-up today.';
   } else if (counts.opened >= 2) {
-    tone = 'warning';
-    action = 'They opened more than once. Follow up while the request is fresh.';
+    tone = 'info';
+    action = 'Open tracking is informational only. Use the CRM reminder date and stronger direct signals.';
   } else if (counts.opened === 1) {
     tone = 'info';
-    action = 'They opened once. Send a short follow-up if they do not respond.';
+    action = 'Open tracking is informational only. Do not treat it as interest or consent.';
   } else if (counts.sent || counts.delivered) {
     action = 'Email sent. Wait for engagement or follow the normal reminder date.';
   }

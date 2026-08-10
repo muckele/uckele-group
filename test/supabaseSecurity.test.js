@@ -19,6 +19,14 @@ const communicationsLifecycleMigrationUrl = new URL(
   '../supabase/migrations/20260806120000_crm_communications_lifecycle.sql',
   import.meta.url,
 );
+const followUpWorkspaceMigrationUrl = new URL(
+  '../supabase/migrations/20260809120000_crm_follow_up_workspace.sql',
+  import.meta.url,
+);
+const followUpQueueMigrationUrl = new URL(
+  '../supabase/migrations/20260809123000_follow_up_queue_pagination.sql',
+  import.meta.url,
+);
 
 function currentAppTables(schema) {
   return Array.from(
@@ -114,7 +122,9 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const analyticsMigration = fs.readFileSync(analyticsMigrationUrl, 'utf8');
   const cimAutomationMigration = fs.readFileSync(cimAutomationMigrationUrl, 'utf8');
   const communicationsLifecycleMigration = fs.readFileSync(communicationsLifecycleMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}`;
+  const followUpWorkspaceMigration = fs.readFileSync(followUpWorkspaceMigrationUrl, 'utf8');
+  const followUpQueueMigration = fs.readFileSync(followUpQueueMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
@@ -123,6 +133,7 @@ test('Supabase migration and fresh schema isolate every current app table to the
   assert.doesNotMatch(migration, /create\s+policy/i, 'server-only tables must not add public RLS policies');
   assert.doesNotMatch(analyticsMigration, /create\s+policy/i, 'analytics table must not add public RLS policies');
   assert.doesNotMatch(communicationsLifecycleMigration, /create\s+policy/i, 'communications tables must not add public RLS policies');
+  assert.doesNotMatch(followUpWorkspaceMigration, /create\s+policy/i, 'follow-up tables must not add public RLS policies');
   assertServerOnlyPrivileges(migration, 'forward migration');
   assert.match(analyticsMigration, /revoke all privileges on table public\.analytics_events from public, anon, authenticated;/i);
   assert.match(analyticsMigration, /grant all privileges on table public\.analytics_events to service_role;/i);
@@ -136,6 +147,16 @@ test('Supabase migration and fresh schema isolate every current app table to the
       new RegExp(`grant all privileges on table public\\.${tableName} to service_role;`, 'i'),
     );
   }
+  for (const tableName of ['crm_email_outbox', 'crm_follow_up_recommendations', 'email_suppressions']) {
+    assert.match(
+      followUpWorkspaceMigration,
+      new RegExp(`revoke all privileges on table public\\.${tableName} from public, anon, authenticated;`, 'i'),
+    );
+    assert.match(
+      followUpWorkspaceMigration,
+      new RegExp(`grant all privileges on table public\\.${tableName} to service_role;`, 'i'),
+    );
+  }
   const serviceRoleFunctions = [
     'canonical_listing_identity',
     'delete_crm_submission_lifecycle',
@@ -146,11 +167,37 @@ test('Supabase migration and fresh schema isolate every current app table to the
     'list_submissions_by_contact_email',
     'mutate_communications_with_crm_activity',
     'list_deal_hunter_cim_request_history',
+    'create_crm_email_command',
+    'supersede_crm_follow_up_recommendations_from_related_change',
+    'claim_crm_email_outbox',
+    'finish_crm_email_outbox_claim',
+    'count_crm_follow_up_sends',
+    'get_crm_follow_up_operational_metrics',
+    'list_follow_up_submissions_page',
   ];
   for (const functionName of serviceRoleFunctions) {
+    const sourceSql = [
+      'count_crm_follow_up_sends',
+      'get_crm_follow_up_operational_metrics',
+      'list_follow_up_submissions_page',
+    ].includes(functionName)
+      ? followUpQueueMigration
+      : [
+          'create_crm_email_command',
+          'supersede_crm_follow_up_recommendations_from_related_change',
+          'claim_crm_email_outbox',
+          'finish_crm_email_outbox_claim',
+        ].includes(functionName)
+        ? followUpWorkspaceMigration
+        : communicationsLifecycleMigration;
+    const sourceLabel = sourceSql === followUpQueueMigration
+      ? 'follow-up queue migration'
+      : sourceSql === followUpWorkspaceMigration
+        ? 'follow-up workspace migration'
+        : 'communications lifecycle migration';
     assertServiceRoleOnlyFunction(
-      communicationsLifecycleMigration,
-      'communications lifecycle migration',
+      sourceSql,
+      sourceLabel,
       functionName,
     );
     assertServiceRoleOnlyFunction(schema, 'fresh schema', functionName);

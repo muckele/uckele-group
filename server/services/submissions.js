@@ -1224,21 +1224,171 @@ export async function getDashboardSubmission(id) {
   return enrichSubmission(submission, storage);
 }
 
-export async function listDashboardFollowUps() {
+function zonedDateParts(date, timeZone) {
+  return Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date).map((part) => [part.type, part.value]));
+}
+
+function zonedMidnightUtc({ year, month, day }, timeZone) {
+  const targetWallTime = Date.UTC(Number(year), Number(month) - 1, Number(day), 0, 0, 0, 0);
+  let guess = targetWallTime;
+  for (let index = 0; index < 3; index += 1) {
+    const parts = zonedDateParts(new Date(guess), timeZone);
+    const observedWallTime = Date.UTC(
+      Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+      Number(parts.hour), Number(parts.minute), Number(parts.second), 0,
+    );
+    guess += targetWallTime - observedWallTime;
+  }
+  return new Date(guess);
+}
+
+function followUpDayBounds(now, timeZone) {
+  const current = zonedDateParts(now, timeZone);
+  const currentDate = new Date(Date.UTC(Number(current.year), Number(current.month) - 1, Number(current.day)));
+  const nextDate = new Date(currentDate.getTime() + 24 * 60 * 60 * 1_000);
+  return {
+    start: zonedMidnightUtc({
+      year: currentDate.getUTCFullYear(),
+      month: currentDate.getUTCMonth() + 1,
+      day: currentDate.getUTCDate(),
+    }, timeZone).toISOString(),
+    end: zonedMidnightUtc({
+      year: nextDate.getUTCFullYear(),
+      month: nextDate.getUTCMonth() + 1,
+      day: nextDate.getUTCDate(),
+    }, timeZone).toISOString(),
+  };
+}
+
+function safeDealHunterQueueContext(metadata = {}) {
+  const dealHunter = metadata?.dealHunter && typeof metadata.dealHunter === 'object' ? metadata.dealHunter : {};
+  return {
+    score: Number.isFinite(Number(dealHunter.score)) ? Number(dealHunter.score) : null,
+    scoreVersion: normalizeField(dealHunter.scoreVersion, 120),
+    strengths: Array.isArray(dealHunter.strengths) ? dealHunter.strengths.slice(0, 5).map((item) => normalizeField(item, 300)) : [],
+    concerns: Array.isArray(dealHunter.concerns) ? dealHunter.concerns.slice(0, 5).map((item) => normalizeField(item, 300)) : [],
+    unansweredQuestions: Array.isArray(dealHunter.unansweredQuestions)
+      ? dealHunter.unansweredQuestions.slice(0, 5).map((item) => normalizeField(item, 300))
+      : [],
+    sourceFreshAt: normalizeField(dealHunter.sourceFreshAt || dealHunter.lastSeenAt, 80),
+  };
+}
+
+function safeFollowUpQueueItem(submission) {
+  return {
+    id: submission.id,
+    created_at: submission.created_at,
+    updated_at: submission.updated_at,
+    status_updated_at: submission.status_updated_at || submission.updated_at,
+    status: submission.status,
+    follow_up_state: submission.follow_up_state,
+    next_action_at: submission.next_action_at,
+    last_contacted_at: submission.last_contacted_at,
+    priority: submission.priority,
+    assigned_to: submission.assigned_to,
+    lead_type: submission.lead_type,
+    company: submission.company,
+    name: submission.name,
+    email: submission.email,
+    broker_name: submission.broker_name,
+    broker_email: submission.broker_email,
+    seller_name: submission.seller_name,
+    seller_email: submission.seller_email,
+    listing_url: submission.listing_url,
+    tags: submission.tags,
+    follow_up_prompt: submission.follow_up_prompt,
+    email_engagement: submission.email_engagement,
+    follow_up_latest_subject: submission.follow_up_latest_subject || '',
+    follow_up_latest_direction: submission.follow_up_latest_direction || '',
+    follow_up_latest_delivery_state: submission.follow_up_latest_delivery_state || '',
+    follow_up_latest_communication_at: submission.follow_up_latest_communication_at || '',
+    follow_up_deal_key: submission.follow_up_deal_key || '',
+    follow_up_recommendation_id: submission.follow_up_recommendation_id || '',
+    follow_up_recommendation_action: submission.follow_up_recommendation_action || '',
+    follow_up_conversation_state: submission.follow_up_conversation_state || '',
+    follow_up_priority_score: Number(submission.follow_up_priority_score || 0),
+    follow_up_confidence: Number(submission.follow_up_confidence || 0),
+    deal_hunter: safeDealHunterQueueContext(submission.metadata),
+  };
+}
+
+export async function listDashboardFollowUps({
+  page = 1, pageSize = 25, search = '', view = 'crm-actions', sort = 'urgency', direction = 'desc',
+} = {}) {
   const storage = getStorage();
-  const [baseSummary, submissions] = await Promise.all([
-    storage.getSummary(),
-    storage.listSubmissions({ limit: 5000, page: 1, status: 'all' }),
+  const config = getConfig();
+  const safePageSize = [10, 25, 50, 100].includes(Number(pageSize)) ? Number(pageSize) : 25;
+  const safePage = Math.max(1, Math.min(Math.trunc(Number(page) || 1), 1_000_000));
+  const allowedViews = new Set([
+    'crm-actions', 'email-triage', 'due-today', 'overdue', 'awaiting-reply', 'inbound-reply',
+    'delivery-problem', 'manual-review', 'completed', 'all',
   ]);
+  const safeView = allowedViews.has(view) ? view : 'crm-actions';
+  const allowedSorts = new Set(['urgency', 'next_action_at', 'updated_at', 'company', 'priority', 'created_at']);
+  const safeSort = allowedSorts.has(sort) ? sort : 'urgency';
+  const safeDirection = String(direction).toLowerCase() === 'asc' ? 'asc' : 'desc';
   const now = new Date();
+  const bounds = followUpDayBounds(now, config.followUp.timezone);
+  const [baseSummary, initialSubmissions] = await Promise.all([
+    storage.getSummary(),
+    storage.listFollowUpSubmissions({
+      page: safePage,
+      pageSize: safePageSize,
+      search: normalizeField(search, 500),
+      view: safeView,
+      sort: safeSort,
+      direction: safeDirection,
+      now: now.toISOString(),
+      todayStart: bounds.start,
+      todayEnd: bounds.end,
+    }),
+  ]);
+  let submissions = initialSubmissions;
+  const initialTotalPages = Math.max(1, Math.ceil(submissions.total / safePageSize));
+  const resolvedPage = Math.min(safePage, initialTotalPages);
+  if (resolvedPage !== safePage) {
+    submissions = await storage.listFollowUpSubmissions({
+      page: resolvedPage,
+      pageSize: safePageSize,
+      search: normalizeField(search, 500),
+      view: safeView,
+      sort: safeSort,
+      direction: safeDirection,
+      now: now.toISOString(),
+      todayStart: bounds.start,
+      todayEnd: bounds.end,
+    });
+  }
   const enriched = await enrichSubmissions(submissions.rows, storage, now);
-  const { notifications, emailTriage } = buildFollowUpQueues(enriched);
+  const safeItems = enriched.map(safeFollowUpQueueItem);
+  const { notifications, emailTriage } = buildFollowUpQueues(safeItems);
+  const totalPages = Math.max(1, Math.ceil(submissions.total / safePageSize));
 
   return {
-    summary: buildNotificationSummary(baseSummary, enriched, emailTriage),
+    summary: {
+      ...buildNotificationSummary(baseSummary, safeItems, emailTriage),
+      filteredTotal: submissions.total,
+    },
+    items: safeItems,
     notifications,
     emailTriage,
     total: submissions.total,
+    page: resolvedPage,
+    pageSize: safePageSize,
+    totalPages,
+    view: safeView,
+    search: normalizeField(search, 500),
+    sort: safeSort,
+    direction: safeDirection,
   };
 }
 
@@ -1419,6 +1569,8 @@ export async function updateSubmissionWorkflow(id, fields, options = {}) {
       ? { conflict: true, current: await enrichSubmission(current, storage) }
       : null;
   }
+
+  await storage.supersedeCrmFollowUpRecommendations?.(id, updates.updated_at);
 
   return enrichSubmission(updated, storage);
 }

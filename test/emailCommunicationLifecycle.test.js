@@ -39,6 +39,8 @@ function createStorage({ submissions = [], communications = [], cimRequests = []
     cimRequests: cimRequests.map(clone),
     communications: communications.map(clone),
     emailEvents: [],
+    recommendationsSuperseded: [],
+    suppressions: [],
     submissions: submissions.map(clone),
   };
   const closedStatuses = new Set(['archived', 'deleted', 'rejected', 'spam']);
@@ -144,6 +146,21 @@ function createStorage({ submissions = [], communications = [], cimRequests = []
         communication.provider === provider
         && communication.provider_message_id === messageId
         && (!direction || communication.direction === direction)) || null);
+    },
+    async getCrmCommunicationByMessageId(messageId) {
+      return clone(state.communications.find((communication) => communication.message_id === messageId) || null);
+    },
+    async supersedeCrmFollowUpRecommendations(submissionId, supersededAt) {
+      state.recommendationsSuperseded.push({ submissionId, supersededAt });
+      return 1;
+    },
+    async upsertEmailSuppression(suppression) {
+      const normalizedEmail = String(suppression.normalized_email || '').toLowerCase();
+      const index = state.suppressions.findIndex((item) => item.normalized_email === normalizedEmail);
+      const record = { ...clone(suppression), normalized_email: normalizedEmail, lifted_at: null };
+      if (index >= 0) state.suppressions[index] = record;
+      else state.suppressions.push(record);
+      return clone(record);
     },
     insertCrmCommunication: insertCommunication,
     async updateCrmCommunication(id, updates) {
@@ -294,6 +311,9 @@ test('received email uses only the fixed Resend API, persists bounded body and a
   assert.equal(communication.body_text, 'Confidential inbound message body.');
   assert.equal(communication.body_html_sanitized, '');
   assert.equal(communication.in_reply_to, '<outbound-message@example>');
+  assert.equal(communication.message_id, '<inbound-message@example>');
+  assert.deepEqual(communication.references_json, ['<earlier-message@example>', '<outbound-message@example>']);
+  assert.equal(communication.headers_json['message-id'], '<inbound-message@example>');
   assert.equal(communication.metadata.messageId, '<inbound-message@example>');
   assert.equal(communication.metadata.references, '<earlier-message@example> <outbound-message@example>');
   assert.equal(communication.attachment_metadata.length, 1);
@@ -307,6 +327,109 @@ test('received email uses only the fixed Resend API, persists bounded body and a
   });
   assert.equal(JSON.stringify(communication).includes('temporary-secret.example'), false);
   assert.equal(JSON.stringify(first).includes('Confidential inbound message body.'), false);
+  assert.equal(storage.state.recommendationsSuperseded.length > 0, true);
+});
+
+test('RFC In-Reply-To assigns a shared-address reply only to the unique matching CRM thread', async () => {
+  const parent = {
+    id: 'thread-parent-1',
+    submission_id: 'submission-rfc-1',
+    direction: 'outbound',
+    channel: 'email',
+    source: 'manual',
+    provider: 'resend',
+    provider_message_id: 'sent-provider-1',
+    message_id: '<sent-rfc-message@example.test>',
+    thread_key: 'thread-rfc-1',
+    to_addresses: ['shared@example.com'],
+    from_address: 'outreach@example.test',
+    subject: 'Diligence question',
+    body_text: 'Could you share the CIM?',
+    body_html_sanitized: '',
+    occurred_at: '2026-08-06T15:00:00.000Z',
+    created_at: '2026-08-06T15:00:00.000Z',
+    updated_at: '2026-08-06T15:00:00.000Z',
+    delivery_state: 'delivered',
+    content_state: 'complete',
+    references_json: [],
+    attachment_metadata: [],
+    metadata: {},
+  };
+  const storage = createStorage({
+    submissions: [
+      { id: 'submission-rfc-1', status: 'review', company: 'First Shared Co', broker_email: 'shared@example.com' },
+      { id: 'submission-rfc-2', status: 'review', company: 'Second Shared Co', broker_email: 'shared@example.com' },
+    ],
+    communications: [parent],
+  });
+  const fetcher = async (url) => {
+    if (url.endsWith('/attachments')) return response({ data: [] });
+    return response({
+      id: 'received-rfc-1',
+      from: 'Shared Broker <shared@example.com>',
+      to: ['deals@inbound.example.com'],
+      subject: 'Re: Diligence question',
+      text: 'Yes, I can share it after the NDA.',
+      headers: {
+        'message-id': '<received-rfc-message@example.test>',
+        'in-reply-to': '<sent-rfc-message@example.test>',
+        references: '<sent-rfc-message@example.test>',
+      },
+      attachments: [],
+      created_at: '2026-08-06T16:00:00.000Z',
+    });
+  };
+  const result = await recordEmailEventsFromWebhook(
+    sharedSecretRequest(receivedPayload({
+      id: 'evt-rfc-1',
+      emailId: 'received-rfc-1',
+      from: 'Shared Broker <shared@example.com>',
+    })),
+    { storage, fetcher },
+  );
+  assert.equal(result.ok, true);
+  const inbound = storage.state.communications.find((communication) => communication.direction === 'inbound');
+  assert.equal(inbound.submission_id, 'submission-rfc-1');
+  assert.equal(inbound.parent_communication_id, parent.id);
+  assert.equal(inbound.thread_key, parent.thread_key);
+  assert.equal(inbound.metadata.assignmentMethod, 'rfc-thread');
+});
+
+test('an obvious new inbound opt-out suppresses globally while quoted historical text does not', async () => {
+  const makeStorage = () => createStorage({
+    submissions: [{ id: 'submission-optout-1', status: 'review', company: 'Opt Out Co', broker_email: 'broker@example.com' }],
+  });
+  const directStorage = makeStorage();
+  const directFetcher = async (url) => url.endsWith('/attachments')
+    ? response({ data: [] })
+    : response({
+        id: 'received-optout-direct', from: 'Broker <broker@example.com>', to: ['deals@inbound.example.com'],
+        subject: 'Re: Diligence', text: 'Stop.',
+        headers: { 'message-id': '<optout-direct@example.test>' }, attachments: [],
+        created_at: '2026-08-06T16:00:00.000Z',
+      });
+  await recordEmailEventsFromWebhook(
+    sharedSecretRequest(receivedPayload({ id: 'evt-optout-direct', emailId: 'received-optout-direct' })),
+    { storage: directStorage, fetcher: directFetcher },
+  );
+  assert.equal(directStorage.state.suppressions.length, 1);
+  assert.equal(directStorage.state.suppressions[0].reason, 'explicit-opt-out');
+  assert.equal(directStorage.state.suppressions[0].normalized_email, 'broker@example.com');
+
+  const quotedStorage = makeStorage();
+  const quotedFetcher = async (url) => url.endsWith('/attachments')
+    ? response({ data: [] })
+    : response({
+        id: 'received-optout-quoted', from: 'Broker <broker@example.com>', to: ['deals@inbound.example.com'],
+        subject: 'Re: Diligence', text: 'Thanks, Tuesday works.\n\n> Please unsubscribe me from all outreach.',
+        headers: { 'message-id': '<optout-quoted@example.test>' }, attachments: [],
+        created_at: '2026-08-06T16:05:00.000Z',
+      });
+  await recordEmailEventsFromWebhook(
+    sharedSecretRequest(receivedPayload({ id: 'evt-optout-quoted', emailId: 'received-optout-quoted' })),
+    { storage: quotedStorage, fetcher: quotedFetcher },
+  );
+  assert.equal(quotedStorage.state.suppressions.length, 0);
 });
 
 test('an archived CRM record rejects a follow-up-only manual workflow update before communication persistence', async () => {
@@ -761,6 +884,7 @@ test('accepted, delivered, delayed, bounce, failure, complaint, and suppression 
     assert.equal(storage.state.communications[0].delivery_state, expectedDeliveryState);
     assert.equal(storage.state.cimRequests[0].delivery_state, expectedDeliveryState);
     assert.equal(storage.state.cimRequests[0].status, expectedStatus);
+    assert.equal(storage.state.recommendationsSuperseded.length > 0, true, `${eventType} invalidates current advice`);
   }
 });
 
@@ -886,4 +1010,16 @@ test('suppression is normalized as a terminal non-actionable email outcome', () 
   assert.equal(summary.actionable, false);
   assert.equal(summary.tone, 'danger');
   assert.match(summary.action, /verif/i);
+});
+
+test('open tracking remains informational and never makes outreach actionable', () => {
+  const summary = summarizeEmailEngagement([
+    { id: 'opened-1', event_type: 'email.opened', created_at: '2026-08-06T18:00:00.000Z' },
+    { id: 'opened-2', event_type: 'email.opened', created_at: '2026-08-06T18:05:00.000Z' },
+  ]);
+
+  assert.equal(summary.opened, 2);
+  assert.equal(summary.actionable, false);
+  assert.equal(summary.hot, false);
+  assert.match(summary.action, /informational only/i);
 });

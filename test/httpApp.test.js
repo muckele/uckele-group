@@ -766,6 +766,120 @@ test('communication assignment, corrected retry, and Deal Hunter disposition enf
   });
 });
 
+test('follow-up APIs paginate without bodies and enforce admin-only context, recommendation, and workflow actions', async () => {
+  await withServer(async (origin) => {
+    const adminCookie = lifecycleAdminCookie;
+    const viewerCookie = lifecycleViewerCookie;
+    assert.ok(adminCookie);
+    assert.ok(viewerCookie);
+    const created = [];
+    for (let index = 0; index < 12; index += 1) {
+      const response = await fetch(`${origin}/api/admin/submissions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+        body: JSON.stringify({
+          company: `Followup Pagination Fixture ${String(index).padStart(2, '0')}`,
+          seller_name: `Fixture Seller ${index}`,
+          seller_email: `followup-pagination-${index}@example.test`,
+          lead_type: 'seller',
+          message: `Sensitive queue body ${index} must not appear in a queue response.`,
+        }),
+      });
+      assert.equal(response.status, 201);
+      created.push((await response.json()).submission);
+    }
+
+    const firstPageResponse = await fetch(
+      `${origin}/api/admin/follow-ups?view=all&search=Followup%20Pagination%20Fixture&page=1&pageSize=10`,
+      { headers: { Cookie: viewerCookie } },
+    );
+    const firstPage = await firstPageResponse.json();
+    assert.equal(firstPageResponse.status, 200);
+    assert.match(firstPageResponse.headers.get('cache-control') || '', /no-store/);
+    assert.equal(firstPage.total, 12);
+    assert.equal(firstPage.items.length, 10);
+    assert.equal(firstPage.totalPages, 2);
+    assert.equal(Object.hasOwn(firstPage.items[0], 'message'), false);
+    assert.equal(Object.hasOwn(firstPage.items[0], 'notes'), false);
+    assert.equal(Object.hasOwn(firstPage.items[0], 'metadata'), false);
+    assert.doesNotMatch(JSON.stringify(firstPage), /Sensitive queue body/);
+
+    const secondPageResponse = await fetch(
+      `${origin}/api/admin/follow-ups?view=all&search=Followup%20Pagination%20Fixture&page=2&pageSize=10`,
+      { headers: { Cookie: viewerCookie } },
+    );
+    const secondPage = await secondPageResponse.json();
+    assert.equal(secondPage.items.length, 2);
+
+    const selected = created[0];
+    const viewerContext = await fetch(`${origin}/api/admin/follow-ups/${selected.id}/context`, {
+      headers: { Cookie: viewerCookie },
+    });
+    assert.equal(viewerContext.status, 403);
+    const viewerRecommendation = await fetch(`${origin}/api/admin/follow-ups/${selected.id}/recommendations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: viewerCookie },
+      body: '{}',
+    });
+    assert.equal(viewerRecommendation.status, 403);
+
+    const adminContext = await fetch(`${origin}/api/admin/follow-ups/${selected.id}/context`, {
+      headers: { Cookie: adminCookie },
+    });
+    const context = await adminContext.json();
+    assert.equal(adminContext.status, 200);
+    assert.equal(context.context.submission.id, selected.id);
+    assert.deepEqual(context.context.communications, []);
+    assert.equal(context.context.policy.email.enabled, false);
+
+    const recommendationResponse = await fetch(`${origin}/api/admin/follow-ups/${selected.id}/recommendations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: '{}',
+    });
+    const recommendation = await recommendationResponse.json();
+    assert.equal(recommendationResponse.status, 200);
+    assert.equal(recommendation.recommendation.metadata.sendAllowed, false);
+
+    const previewResponse = await fetch(`${origin}/api/admin/follow-ups/${selected.id}/email-preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({
+        expectedSubmissionVersion: selected.updated_at,
+        recipient: selected.seller_email,
+        subject: 'A safe preview',
+        bodyText: 'This preview must not send.',
+      }),
+    });
+    const preview = await previewResponse.json();
+    assert.equal(previewResponse.status, 422);
+    assert.equal(preview.code, 'email-disabled');
+
+    const completeResponse = await fetch(`${origin}/api/admin/follow-ups/${selected.id}/workflow`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({ action: 'complete', expectedSubmissionVersion: selected.updated_at }),
+    });
+    const completed = await completeResponse.json();
+    assert.equal(completeResponse.status, 200);
+    assert.equal(completed.submission.follow_up_state, 'completed');
+
+    const completedContextResponse = await fetch(`${origin}/api/admin/follow-ups/${selected.id}/context`, {
+      headers: { Cookie: adminCookie },
+    });
+    const completedContext = await completedContextResponse.json();
+    assert.equal(completedContextResponse.status, 200);
+    assert.equal(completedContext.context.recommendation, null, 'workflow mutation supersedes the prior recommendation');
+
+    const staleResponse = await fetch(`${origin}/api/admin/follow-ups/${selected.id}/workflow`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({ action: 'reopen', expectedSubmissionVersion: selected.updated_at }),
+    });
+    assert.equal(staleResponse.status, 409);
+  });
+});
+
 test.after(() => {
   fs.rmSync(tempDir, { recursive: true, force: true });
 });

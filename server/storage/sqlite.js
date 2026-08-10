@@ -62,9 +62,48 @@ function normalizeCrmCommunicationRow(row) {
         to_addresses: parseJsonColumn(row.to_addresses, []),
         cc_addresses: parseJsonColumn(row.cc_addresses, []),
         bcc_addresses: parseJsonColumn(row.bcc_addresses, []),
+        references_json: parseJsonColumn(row.references_json, []),
+        headers_json: parseJsonColumn(row.headers_json, {}),
         attachment_metadata: parseJsonColumn(row.attachment_metadata, []),
         metadata: parseJsonColumn(row.metadata, {}),
         content_attempt_count: Number(row.content_attempt_count || 0),
+        legacy_content_unavailable: Boolean(row.legacy_content_unavailable),
+      }
+    : null;
+}
+
+function normalizeCrmEmailOutboxRow(row) {
+  return row
+    ? {
+        ...row,
+        attempt_count: Number(row.attempt_count || 0),
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
+function normalizeCrmFollowUpRecommendationRow(row) {
+  return row
+    ? {
+        ...row,
+        priority_score: Number(row.priority_score || 0),
+        confidence: Number(row.confidence || 0),
+        evidence_json: parseJsonColumn(row.evidence_json, []),
+        signals_json: parseJsonColumn(row.signals_json, []),
+        commitments_json: parseJsonColumn(row.commitments_json, []),
+        questions_json: parseJsonColumn(row.questions_json, []),
+        blockers_json: parseJsonColumn(row.blockers_json, []),
+        safety_flags_json: parseJsonColumn(row.safety_flags_json, []),
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
+function normalizeEmailSuppressionRow(row) {
+  return row
+    ? {
+        ...row,
+        metadata: parseJsonColumn(row.metadata, {}),
       }
     : null;
 }
@@ -290,7 +329,20 @@ function serializeCrmCommunication(communication) {
     provider_message_id: communication.provider_message_id || null,
     source_event_id: communication.source_event_id || null,
     idempotency_key: communication.idempotency_key || null,
+    message_id: communication.message_id || null,
     in_reply_to: communication.in_reply_to || null,
+    references_json: JSON.stringify(Array.isArray(communication.references_json) ? communication.references_json : []),
+    parent_communication_id: communication.parent_communication_id || null,
+    thread_key: communication.thread_key || null,
+    legacy_content_unavailable: communication.legacy_content_unavailable ? 1 : 0,
+    content_redaction_state: communication.content_redaction_state || 'none',
+    recommendation_id: communication.recommendation_id || null,
+    outbox_id: communication.outbox_id || null,
+    headers_json: JSON.stringify(
+      communication.headers_json && typeof communication.headers_json === 'object' && !Array.isArray(communication.headers_json)
+        ? communication.headers_json
+        : {},
+    ),
     reply_to_address: communication.reply_to_address || null,
     from_address: communication.from_address || null,
     to_addresses: JSON.stringify(Array.isArray(communication.to_addresses) ? communication.to_addresses : []),
@@ -313,10 +365,83 @@ function serializeCrmCommunication(communication) {
 }
 
 function serializeCrmCommunicationValues(values = {}) {
-  const jsonFields = new Set(['to_addresses', 'cc_addresses', 'bcc_addresses', 'attachment_metadata', 'metadata']);
+  const jsonFields = new Set([
+    'to_addresses', 'cc_addresses', 'bcc_addresses', 'references_json', 'headers_json',
+    'attachment_metadata', 'metadata',
+  ]);
+  const objectFields = new Set(['headers_json', 'metadata']);
   return Object.fromEntries(
-    Object.entries(values).map(([key, value]) => [key, jsonFields.has(key) ? JSON.stringify(value ?? (key === 'metadata' ? {} : [])) : value]),
+    Object.entries(values).map(([key, value]) => [
+      key,
+      key === 'legacy_content_unavailable'
+        ? (value ? 1 : 0)
+        : jsonFields.has(key)
+          ? JSON.stringify(value ?? (objectFields.has(key) ? {} : []))
+          : value,
+    ]),
   );
+}
+
+function serializeCrmEmailOutbox(outbox = {}) {
+  return {
+    ...outbox,
+    cim_request_id: outbox.cim_request_id || null,
+    provider: outbox.provider || null,
+    provider_message_id: outbox.provider_message_id || null,
+    next_attempt_at: outbox.next_attempt_at || null,
+    claim_token: outbox.claim_token || null,
+    claimed_at: outbox.claimed_at || null,
+    claim_expires_at: outbox.claim_expires_at || null,
+    accepted_at: outbox.accepted_at || null,
+    failed_at: outbox.failed_at || null,
+    ambiguous_at: outbox.ambiguous_at || null,
+    last_error_category: outbox.last_error_category || null,
+    last_error_message: outbox.last_error_message || null,
+    intended_follow_up_state: outbox.intended_follow_up_state || null,
+    intended_next_action_at: outbox.intended_next_action_at || null,
+    attempt_count: Math.max(0, Number(outbox.attempt_count || 0)),
+    metadata: JSON.stringify(outbox.metadata || {}),
+  };
+}
+
+function serializeCrmFollowUpRecommendation(recommendation = {}) {
+  const jsonArray = (value) => JSON.stringify(Array.isArray(value) ? value : []);
+  return {
+    ...recommendation,
+    cim_request_id: recommendation.cim_request_id || null,
+    triggering_communication_id: recommendation.triggering_communication_id || null,
+    model_provider: recommendation.model_provider || null,
+    model_id: recommendation.model_id || null,
+    recommended_next_action_at: recommendation.recommended_next_action_at || null,
+    thread_parent_communication_id: recommendation.thread_parent_communication_id || null,
+    priority_score: Math.max(0, Math.min(100, Number(recommendation.priority_score || 0))),
+    confidence: Math.max(0, Math.min(1, Number(recommendation.confidence || 0))),
+    evidence_json: jsonArray(recommendation.evidence_json),
+    signals_json: jsonArray(recommendation.signals_json),
+    commitments_json: jsonArray(recommendation.commitments_json),
+    questions_json: jsonArray(recommendation.questions_json),
+    blockers_json: jsonArray(recommendation.blockers_json),
+    safety_flags_json: jsonArray(recommendation.safety_flags_json),
+    expires_at: recommendation.expires_at || null,
+    acted_on_at: recommendation.acted_on_at || null,
+    superseded_at: recommendation.superseded_at || null,
+    acted_on_by: recommendation.acted_on_by || null,
+    outcome: recommendation.outcome || null,
+    metadata: JSON.stringify(recommendation.metadata || {}),
+  };
+}
+
+function serializeEmailSuppression(suppression = {}) {
+  return {
+    ...suppression,
+    normalized_email: String(suppression.normalized_email || '').trim().toLowerCase(),
+    source_event_id: suppression.source_event_id || null,
+    source_communication_id: suppression.source_communication_id || null,
+    lifted_at: suppression.lifted_at || null,
+    lifted_by: suppression.lifted_by || null,
+    lift_reason: suppression.lift_reason || null,
+    metadata: JSON.stringify(suppression.metadata || {}),
+  };
 }
 
 function serializeCrmActivityEvent(event) {
@@ -715,7 +840,16 @@ export function createSqliteStorage(config) {
       provider_message_id TEXT,
       source_event_id TEXT,
       idempotency_key TEXT,
+      message_id TEXT,
       in_reply_to TEXT,
+      references_json TEXT NOT NULL DEFAULT '[]',
+      parent_communication_id TEXT,
+      thread_key TEXT,
+      legacy_content_unavailable INTEGER NOT NULL DEFAULT 0,
+      content_redaction_state TEXT NOT NULL DEFAULT 'none',
+      recommendation_id TEXT,
+      outbox_id TEXT,
+      headers_json TEXT NOT NULL DEFAULT '{}',
       reply_to_address TEXT,
       from_address TEXT,
       to_addresses TEXT NOT NULL DEFAULT '[]',
@@ -738,6 +872,86 @@ export function createSqliteStorage(config) {
       assigned_by TEXT,
       created_by TEXT NOT NULL DEFAULT 'system',
       updated_by TEXT NOT NULL DEFAULT 'system',
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS crm_email_outbox (
+      id TEXT PRIMARY KEY,
+      communication_id TEXT NOT NULL UNIQUE,
+      submission_id TEXT NOT NULL,
+      cim_request_id TEXT,
+      idempotency_key TEXT NOT NULL UNIQUE,
+      client_request_key TEXT NOT NULL UNIQUE,
+      state TEXT NOT NULL,
+      provider TEXT,
+      provider_message_id TEXT,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      claim_token TEXT,
+      claimed_at TEXT,
+      claim_expires_at TEXT,
+      accepted_at TEXT,
+      failed_at TEXT,
+      ambiguous_at TEXT,
+      last_error_category TEXT,
+      last_error_message TEXT,
+      expected_submission_version TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      intended_follow_up_state TEXT,
+      intended_next_action_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS crm_follow_up_recommendations (
+      id TEXT PRIMARY KEY,
+      submission_id TEXT NOT NULL,
+      cim_request_id TEXT,
+      triggering_communication_id TEXT,
+      input_fingerprint TEXT NOT NULL,
+      engine_version TEXT NOT NULL,
+      rules_version TEXT NOT NULL,
+      model_provider TEXT,
+      model_id TEXT,
+      status TEXT NOT NULL,
+      conversation_state TEXT NOT NULL,
+      intent TEXT NOT NULL,
+      action_type TEXT NOT NULL,
+      priority_score INTEGER NOT NULL DEFAULT 0,
+      confidence REAL NOT NULL DEFAULT 0,
+      recommended_next_action_at TEXT,
+      thread_parent_communication_id TEXT,
+      rationale TEXT NOT NULL DEFAULT '',
+      evidence_json TEXT NOT NULL DEFAULT '[]',
+      signals_json TEXT NOT NULL DEFAULT '[]',
+      commitments_json TEXT NOT NULL DEFAULT '[]',
+      questions_json TEXT NOT NULL DEFAULT '[]',
+      blockers_json TEXT NOT NULL DEFAULT '[]',
+      safety_flags_json TEXT NOT NULL DEFAULT '[]',
+      draft_subject TEXT NOT NULL DEFAULT '',
+      draft_body_text TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      expires_at TEXT,
+      acted_on_at TEXT,
+      superseded_at TEXT,
+      acted_on_by TEXT,
+      outcome TEXT,
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS email_suppressions (
+      id TEXT PRIMARY KEY,
+      normalized_email TEXT NOT NULL UNIQUE,
+      reason TEXT NOT NULL,
+      source TEXT NOT NULL,
+      source_event_id TEXT,
+      source_communication_id TEXT,
+      created_at TEXT NOT NULL,
+      created_by TEXT NOT NULL,
+      lifted_at TEXT,
+      lifted_by TEXT,
+      lift_reason TEXT,
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
@@ -957,6 +1171,24 @@ export function createSqliteStorage(config) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_communications_provider_message ON crm_communications(provider, provider_message_id, direction) WHERE provider IS NOT NULL AND provider_message_id IS NOT NULL AND provider_message_id <> '';
     CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_communications_source_event ON crm_communications(provider, source_event_id) WHERE provider IS NOT NULL AND source_event_id IS NOT NULL AND source_event_id <> '';
     CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_communications_idempotency ON crm_communications(idempotency_key) WHERE idempotency_key IS NOT NULL AND idempotency_key <> '';
+    CREATE INDEX IF NOT EXISTS idx_crm_email_outbox_submission_created ON crm_email_outbox(submission_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_crm_email_outbox_claimable ON crm_email_outbox(state, next_attempt_at, claim_expires_at);
+    CREATE INDEX IF NOT EXISTS idx_crm_email_outbox_provider_message ON crm_email_outbox(provider_message_id);
+    CREATE INDEX IF NOT EXISTS idx_crm_follow_up_recommendations_submission_created ON crm_follow_up_recommendations(submission_id, created_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_follow_up_recommendations_cache ON crm_follow_up_recommendations(submission_id, input_fingerprint, engine_version);
+    UPDATE crm_follow_up_recommendations
+    SET status = 'superseded', superseded_at = COALESCE(superseded_at, created_at)
+    WHERE status = 'current'
+      AND EXISTS (
+        SELECT 1 FROM crm_follow_up_recommendations AS newer
+        WHERE newer.submission_id = crm_follow_up_recommendations.submission_id
+          AND newer.status = 'current'
+          AND (newer.created_at > crm_follow_up_recommendations.created_at
+            OR (newer.created_at = crm_follow_up_recommendations.created_at AND newer.id > crm_follow_up_recommendations.id))
+      );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_follow_up_recommendations_one_current
+      ON crm_follow_up_recommendations(submission_id) WHERE status = 'current';
+    CREATE INDEX IF NOT EXISTS idx_email_suppressions_active ON email_suppressions(normalized_email) WHERE lifted_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_last_seen_at ON deal_hunter_seen_deals(last_seen_at DESC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_source_id ON deal_hunter_seen_deals(source_id, last_seen_at DESC);
 	    CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_deal_recipient ON deal_hunter_cim_requests(deal_key, recipient_email);
@@ -993,6 +1225,20 @@ export function createSqliteStorage(config) {
   ensureColumn(database, 'secure_document_cleanup_jobs', 'lease_expires_at', 'TEXT');
   ensureColumn(database, 'secure_document_cleanup_jobs', 'lease_token', 'TEXT');
   database.exec('CREATE INDEX IF NOT EXISTS idx_secure_document_cleanup_jobs_lease ON secure_document_cleanup_jobs(status, lease_expires_at)');
+  ensureColumn(database, 'crm_communications', 'message_id', 'TEXT');
+  ensureColumn(database, 'crm_communications', 'references_json', "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn(database, 'crm_communications', 'parent_communication_id', 'TEXT');
+  ensureColumn(database, 'crm_communications', 'thread_key', 'TEXT');
+  ensureColumn(database, 'crm_communications', 'legacy_content_unavailable', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(database, 'crm_communications', 'content_redaction_state', "TEXT NOT NULL DEFAULT 'none'");
+  ensureColumn(database, 'crm_communications', 'recommendation_id', 'TEXT');
+  ensureColumn(database, 'crm_communications', 'outbox_id', 'TEXT');
+  ensureColumn(database, 'crm_communications', 'headers_json', "TEXT NOT NULL DEFAULT '{}'");
+  database.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_crm_communications_message_id ON crm_communications(message_id) WHERE message_id IS NOT NULL AND message_id <> '';
+    CREATE INDEX IF NOT EXISTS idx_crm_communications_parent ON crm_communications(parent_communication_id);
+    CREATE INDEX IF NOT EXISTS idx_crm_communications_thread_occurred ON crm_communications(thread_key, occurred_at DESC, id DESC);
+  `);
   ensureColumn(database, 'contact_submissions', 'status_updated_at', 'TEXT');
   ensureColumn(database, 'contact_submissions', 'listing_url', 'TEXT');
   ensureColumn(database, 'contact_submissions', 'business_website', 'TEXT');
@@ -1097,6 +1343,7 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_email_events_communication_id ON email_events(communication_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_broker_email_lower ON contact_submissions(LOWER(broker_email));
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_seller_email_lower ON contact_submissions(LOWER(seller_email));
+    CREATE INDEX IF NOT EXISTS idx_contact_submissions_follow_up_queue ON contact_submissions(status, follow_up_state, next_action_at, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_submission ON deal_hunter_cim_requests(submission_id, last_activity_at DESC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_request_state ON deal_hunter_cim_requests(request_state, first_requested_at DESC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_delivery_state ON deal_hunter_cim_requests(delivery_state, last_delivery_event_at DESC);
@@ -1372,7 +1619,9 @@ export function createSqliteStorage(config) {
   const insertCrmCommunicationStatement = database.prepare(`
     INSERT INTO crm_communications (
       id, submission_id, deal_key, cim_request_id, direction, channel, source, kind,
-      provider, provider_message_id, source_event_id, idempotency_key, in_reply_to,
+      provider, provider_message_id, source_event_id, idempotency_key, message_id, in_reply_to,
+      references_json, parent_communication_id, thread_key, legacy_content_unavailable,
+      content_redaction_state, recommendation_id, outbox_id, headers_json,
       reply_to_address, from_address, to_addresses, cc_addresses, bcc_addresses,
       subject, body_text, body_html_sanitized, occurred_at, created_at, updated_at,
       delivery_state, delivery_state_at, content_state, content_attempt_count,
@@ -1380,7 +1629,9 @@ export function createSqliteStorage(config) {
       assigned_by, created_by, updated_by, metadata
     ) VALUES (
       @id, @submission_id, @deal_key, @cim_request_id, @direction, @channel, @source, @kind,
-      @provider, @provider_message_id, @source_event_id, @idempotency_key, @in_reply_to,
+      @provider, @provider_message_id, @source_event_id, @idempotency_key, @message_id, @in_reply_to,
+      @references_json, @parent_communication_id, @thread_key, @legacy_content_unavailable,
+      @content_redaction_state, @recommendation_id, @outbox_id, @headers_json,
       @reply_to_address, @from_address, @to_addresses, @cc_addresses, @bcc_addresses,
       @subject, @body_text, @body_html_sanitized, @occurred_at, @created_at, @updated_at,
       @delivery_state, @delivery_state_at, @content_state, @content_attempt_count,
@@ -1388,6 +1639,63 @@ export function createSqliteStorage(config) {
       @assigned_by, @created_by, @updated_by, @metadata
     )
     ON CONFLICT DO NOTHING
+  `);
+  const insertCrmEmailOutboxStatement = database.prepare(`
+    INSERT INTO crm_email_outbox (
+      id, communication_id, submission_id, cim_request_id, idempotency_key,
+      client_request_key, state, provider, provider_message_id, attempt_count,
+      next_attempt_at, claim_token, claimed_at, claim_expires_at, accepted_at,
+      failed_at, ambiguous_at, last_error_category, last_error_message,
+      expected_submission_version, actor, intended_follow_up_state,
+      intended_next_action_at, created_at, updated_at, metadata
+    ) VALUES (
+      @id, @communication_id, @submission_id, @cim_request_id, @idempotency_key,
+      @client_request_key, @state, @provider, @provider_message_id, @attempt_count,
+      @next_attempt_at, @claim_token, @claimed_at, @claim_expires_at, @accepted_at,
+      @failed_at, @ambiguous_at, @last_error_category, @last_error_message,
+      @expected_submission_version, @actor, @intended_follow_up_state,
+      @intended_next_action_at, @created_at, @updated_at, @metadata
+    )
+  `);
+  const insertCrmFollowUpRecommendationStatement = database.prepare(`
+    INSERT INTO crm_follow_up_recommendations (
+      id, submission_id, cim_request_id, triggering_communication_id, input_fingerprint,
+      engine_version, rules_version, model_provider, model_id, status, conversation_state,
+      intent, action_type, priority_score, confidence, recommended_next_action_at,
+      thread_parent_communication_id, rationale, evidence_json, signals_json,
+      commitments_json, questions_json, blockers_json, safety_flags_json, draft_subject,
+      draft_body_text, created_at, expires_at, acted_on_at, superseded_at, acted_on_by,
+      outcome, metadata
+    ) VALUES (
+      @id, @submission_id, @cim_request_id, @triggering_communication_id, @input_fingerprint,
+      @engine_version, @rules_version, @model_provider, @model_id, @status, @conversation_state,
+      @intent, @action_type, @priority_score, @confidence, @recommended_next_action_at,
+      @thread_parent_communication_id, @rationale, @evidence_json, @signals_json,
+      @commitments_json, @questions_json, @blockers_json, @safety_flags_json, @draft_subject,
+      @draft_body_text, @created_at, @expires_at, @acted_on_at, @superseded_at, @acted_on_by,
+      @outcome, @metadata
+    )
+    ON CONFLICT(submission_id, input_fingerprint, engine_version) DO NOTHING
+  `);
+  const upsertEmailSuppressionStatement = database.prepare(`
+    INSERT INTO email_suppressions (
+      id, normalized_email, reason, source, source_event_id, source_communication_id,
+      created_at, created_by, lifted_at, lifted_by, lift_reason, metadata
+    ) VALUES (
+      @id, @normalized_email, @reason, @source, @source_event_id, @source_communication_id,
+      @created_at, @created_by, @lifted_at, @lifted_by, @lift_reason, @metadata
+    )
+    ON CONFLICT(normalized_email) DO UPDATE SET
+      reason = excluded.reason,
+      source = excluded.source,
+      source_event_id = excluded.source_event_id,
+      source_communication_id = excluded.source_communication_id,
+      created_at = excluded.created_at,
+      created_by = excluded.created_by,
+      lifted_at = NULL,
+      lifted_by = NULL,
+      lift_reason = NULL,
+      metadata = excluded.metadata
   `);
 
   function getExistingCrmCommunication(communication) {
@@ -1737,6 +2045,13 @@ export function createSqliteStorage(config) {
         WHERE deal_key = ? AND LOWER(recipient_email) = ?
         LIMIT 1
       `).get(request.deal_key, request.recipient_email);
+      if (updateResult.changes > 0 && current?.submission_id) {
+        database.prepare(`
+          UPDATE crm_follow_up_recommendations
+          SET status = 'superseded', superseded_at = ?
+          WHERE submission_id = ? AND status = 'current'
+        `).run(request.updated_at || new Date().toISOString(), current.submission_id);
+      }
       return {
         claimed: updateResult.changes > 0,
         request: normalizeDealHunterCimRequestRow(current),
@@ -1786,6 +2101,13 @@ export function createSqliteStorage(config) {
       WHERE deal_key = ? AND LOWER(recipient_email) = ?
       LIMIT 1
     `).get(request.deal_key, request.recipient_email);
+    if (stored?.submission_id) {
+      database.prepare(`
+        UPDATE crm_follow_up_recommendations
+        SET status = 'superseded', superseded_at = ?
+        WHERE submission_id = ? AND status = 'current'
+      `).run(request.updated_at || new Date().toISOString(), stored.submission_id);
+    }
     return { claimed: true, request: normalizeDealHunterCimRequestRow(stored) };
   });
 	  const claimDealHunterCimFollowUpRequestStatement = database.prepare(`
@@ -1831,6 +2153,13 @@ export function createSqliteStorage(config) {
 	      now_iso: nowIso,
 	    });
 	    const row = database.prepare('SELECT * FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1').get(id);
+	    if (updateResult.changes > 0 && row?.submission_id) {
+	      database.prepare(`
+	        UPDATE crm_follow_up_recommendations
+	        SET status = 'superseded', superseded_at = ?
+	        WHERE submission_id = ? AND status = 'current'
+	      `).run(nowIso, row.submission_id);
+	    }
 
 	    return {
 	      claimed: updateResult.changes > 0,
@@ -2494,6 +2823,17 @@ export function createSqliteStorage(config) {
       throw new Error(`Unsupported atomic CRM activity operation: ${operation || 'unknown'}.`);
     }
 
+    if (
+      ['upsert_deal_hunter_cim_request', 'finalize_deal_hunter_cim_request_claim'].includes(operation)
+      && record?.submission_id
+    ) {
+      database.prepare(`
+        UPDATE crm_follow_up_recommendations
+        SET status = 'superseded', superseded_at = ?
+        WHERE submission_id = ? AND status = 'current'
+      `).run(activity.created_at || record.updated_at || new Date().toISOString(), record.submission_id);
+    }
+
     const storedActivity = insertCrmActivityEvent(activity);
     return { applied: true, record, activity: storedActivity };
   });
@@ -2806,6 +3146,145 @@ export function createSqliteStorage(config) {
       };
     },
 
+    async listFollowUpSubmissions({
+      page = 1, pageSize = 25, search = '', view = 'crm-actions', sort = 'urgency', direction = 'desc',
+      now = '', todayStart = '', todayEnd = '',
+    } = {}) {
+      const safePage = normalizePage(page);
+      const safePageSize = Math.max(1, Math.min(Number(pageSize) || 25, 100));
+      const normalizeTimestamp = (value, fallback) => Number.isFinite(Date.parse(value || ''))
+        ? new Date(value).toISOString()
+        : fallback;
+      const safeNow = normalizeTimestamp(now, new Date().toISOString());
+      const safeTodayStart = normalizeTimestamp(todayStart, safeNow);
+      const safeTodayEnd = normalizeTimestamp(todayEnd, safeNow);
+      const allowedViews = new Set([
+        'crm-actions', 'email-triage', 'due-today', 'overdue', 'awaiting-reply', 'inbound-reply',
+        'delivery-problem', 'manual-review', 'completed', 'all',
+      ]);
+      const requestedView = normalizeList([view], 1)[0] || 'crm-actions';
+      const safeView = allowedViews.has(requestedView) ? requestedView : 'crm-actions';
+      const clauses = ["submission.status NOT IN ('archived', 'spam')"];
+      const params = [];
+      const latestDirection = `(SELECT communication.direction FROM crm_communications AS communication
+        WHERE communication.submission_id = submission.id
+        ORDER BY communication.occurred_at DESC, communication.id DESC LIMIT 1)`;
+      const latestDeliveryState = `(SELECT communication.delivery_state FROM crm_communications AS communication
+        WHERE communication.submission_id = submission.id AND communication.direction = 'outbound'
+        ORDER BY communication.occurred_at DESC, communication.id DESC LIMIT 1)`;
+      const currentRecommendationAction = `(SELECT recommendation.action_type FROM crm_follow_up_recommendations AS recommendation
+        WHERE recommendation.submission_id = submission.id AND recommendation.status = 'current'
+          AND (recommendation.expires_at IS NULL OR recommendation.expires_at > '${safeNow.replaceAll("'", "''")}')
+        ORDER BY recommendation.created_at DESC, recommendation.id DESC LIMIT 1)`;
+
+      if (safeView === 'completed') {
+        clauses.push("submission.follow_up_state = 'completed'");
+      } else if (safeView === 'due-today') {
+        clauses.push("submission.follow_up_state <> 'completed'");
+        clauses.push('submission.next_action_at >= ? AND submission.next_action_at < ?');
+        params.push(safeTodayStart, safeTodayEnd);
+      } else if (safeView === 'overdue') {
+        clauses.push("submission.follow_up_state <> 'completed'");
+        clauses.push('submission.next_action_at IS NOT NULL AND submission.next_action_at < ?');
+        params.push(safeTodayStart);
+      } else if (safeView === 'awaiting-reply') {
+        clauses.push("submission.follow_up_state <> 'completed'");
+        clauses.push(`(submission.follow_up_state = 'waiting-on-owner' OR ${latestDirection} = 'outbound')`);
+      } else if (safeView === 'inbound-reply') {
+        clauses.push("submission.follow_up_state <> 'completed'");
+        clauses.push(`${latestDirection} = 'inbound'`);
+      } else if (safeView === 'delivery-problem') {
+        clauses.push("submission.follow_up_state <> 'completed'");
+        clauses.push(`${latestDeliveryState} IN ('delayed', 'bounced', 'failed', 'complained', 'suppressed')`);
+      } else if (safeView === 'manual-review') {
+        clauses.push("submission.follow_up_state <> 'completed'");
+        clauses.push(`${currentRecommendationAction} = 'manual_review'`);
+      } else if (safeView === 'email-triage') {
+        clauses.push("submission.follow_up_state <> 'completed'");
+        clauses.push(`(${latestDirection} = 'inbound' OR ${latestDeliveryState} IN ('delayed', 'bounced', 'failed', 'complained', 'suppressed'))`);
+      } else if (safeView === 'crm-actions') {
+        clauses.push("submission.follow_up_state <> 'completed'");
+      }
+
+      const normalizedSearch = String(search || '').trim().toLowerCase();
+      if (normalizedSearch) {
+        clauses.push(`(
+          INSTR(LOWER(COALESCE(submission.company, '') || ' ' || COALESCE(submission.name, '') || ' ' ||
+            COALESCE(submission.email, '') || ' ' || COALESCE(submission.broker_name, '') || ' ' ||
+            COALESCE(submission.broker_email, '') || ' ' || COALESCE(submission.seller_name, '') || ' ' ||
+            COALESCE(submission.seller_email, '') || ' ' || COALESCE(submission.listing_url, '')), ?) > 0
+          OR EXISTS (
+            SELECT 1 FROM crm_communications AS communication
+            WHERE communication.submission_id = submission.id
+              AND INSTR(LOWER(COALESCE(communication.subject, '') || ' ' || COALESCE(communication.deal_key, '')), ?) > 0
+          )
+        )`);
+        params.push(normalizedSearch, normalizedSearch);
+      }
+
+      const whereClause = `WHERE ${clauses.join(' AND ')}`;
+      const safeDirection = String(direction).toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+      const sortExpressions = {
+        urgency: `CASE
+          WHEN ${latestDeliveryState} IN ('bounced', 'failed', 'complained', 'suppressed') THEN 4
+          WHEN ${latestDirection} = 'inbound' THEN 3
+          WHEN submission.next_action_at IS NOT NULL AND submission.next_action_at < '${safeNow.replaceAll("'", "''")}' THEN 2
+          ELSE 1 END DESC,
+          COALESCE((SELECT recommendation.priority_score FROM crm_follow_up_recommendations AS recommendation
+            WHERE recommendation.submission_id = submission.id AND recommendation.status = 'current'
+              AND (recommendation.expires_at IS NULL OR recommendation.expires_at > '${safeNow.replaceAll("'", "''")}')
+            ORDER BY recommendation.created_at DESC, recommendation.id DESC LIMIT 1), 0) DESC,
+          CASE WHEN submission.next_action_at IS NULL THEN 1 ELSE 0 END ASC, submission.next_action_at ASC`,
+        next_action_at: 'CASE WHEN submission.next_action_at IS NULL THEN 1 ELSE 0 END ASC, submission.next_action_at',
+        updated_at: 'submission.updated_at',
+        company: "LOWER(COALESCE(submission.company, submission.name, ''))",
+        priority: "CASE submission.priority WHEN 'urgent' THEN 5 WHEN 'high' THEN 4 WHEN 'medium' THEN 3 WHEN 'normal' THEN 2 WHEN 'low' THEN 1 ELSE 0 END",
+        created_at: 'submission.created_at',
+      };
+      const sortExpression = sortExpressions[sort] || sortExpressions.urgency;
+      const directionSuffix = sort === 'urgency' || !sortExpressions[sort] ? '' : ` ${safeDirection}`;
+      const total = Number(database.prepare(`
+        SELECT COUNT(*) AS count FROM contact_submissions AS submission ${whereClause}
+      `).get(...params)?.count || 0);
+      const offset = (safePage - 1) * safePageSize;
+      const rows = database.prepare(`
+        SELECT submission.*,
+          (SELECT communication.subject FROM crm_communications AS communication
+            WHERE communication.submission_id = submission.id
+            ORDER BY communication.occurred_at DESC, communication.id DESC LIMIT 1) AS follow_up_latest_subject,
+          ${latestDirection} AS follow_up_latest_direction,
+          ${latestDeliveryState} AS follow_up_latest_delivery_state,
+          (SELECT communication.occurred_at FROM crm_communications AS communication
+            WHERE communication.submission_id = submission.id
+            ORDER BY communication.occurred_at DESC, communication.id DESC LIMIT 1) AS follow_up_latest_communication_at,
+          (SELECT communication.deal_key FROM crm_communications AS communication
+            WHERE communication.submission_id = submission.id AND communication.deal_key IS NOT NULL
+            ORDER BY communication.occurred_at DESC, communication.id DESC LIMIT 1) AS follow_up_deal_key,
+          (SELECT recommendation.id FROM crm_follow_up_recommendations AS recommendation
+            WHERE recommendation.submission_id = submission.id AND recommendation.status = 'current'
+              AND (recommendation.expires_at IS NULL OR recommendation.expires_at > '${safeNow.replaceAll("'", "''")}')
+            ORDER BY recommendation.created_at DESC, recommendation.id DESC LIMIT 1) AS follow_up_recommendation_id,
+          ${currentRecommendationAction} AS follow_up_recommendation_action,
+          (SELECT recommendation.conversation_state FROM crm_follow_up_recommendations AS recommendation
+            WHERE recommendation.submission_id = submission.id AND recommendation.status = 'current'
+              AND (recommendation.expires_at IS NULL OR recommendation.expires_at > '${safeNow.replaceAll("'", "''")}')
+            ORDER BY recommendation.created_at DESC, recommendation.id DESC LIMIT 1) AS follow_up_conversation_state,
+          (SELECT recommendation.priority_score FROM crm_follow_up_recommendations AS recommendation
+            WHERE recommendation.submission_id = submission.id AND recommendation.status = 'current'
+              AND (recommendation.expires_at IS NULL OR recommendation.expires_at > '${safeNow.replaceAll("'", "''")}')
+            ORDER BY recommendation.created_at DESC, recommendation.id DESC LIMIT 1) AS follow_up_priority_score,
+          (SELECT recommendation.confidence FROM crm_follow_up_recommendations AS recommendation
+            WHERE recommendation.submission_id = submission.id AND recommendation.status = 'current'
+              AND (recommendation.expires_at IS NULL OR recommendation.expires_at > '${safeNow.replaceAll("'", "''")}')
+            ORDER BY recommendation.created_at DESC, recommendation.id DESC LIMIT 1) AS follow_up_confidence
+        FROM contact_submissions AS submission
+        ${whereClause}
+        ORDER BY ${sortExpression}${directionSuffix}, submission.updated_at DESC, submission.id ASC
+        LIMIT ? OFFSET ?
+      `).all(...params, safePageSize, offset).map(normalizeSubmissionRow);
+      return { rows, total, page: safePage, pageSize: safePageSize };
+    },
+
     async getSummary() {
       const total = database.prepare('SELECT COUNT(*) AS count FROM contact_submissions').get()?.count || 0;
       const lastSevenDaysSince = new Date(Date.now() - 1000 * 60 * 60 * 24 * 7).toISOString();
@@ -2977,11 +3456,26 @@ export function createSqliteStorage(config) {
 
     async insertSecureDocument(document) {
       insertSecureDocumentStatement.run(document);
+      if (document.submission_id) {
+        database.prepare(`
+          UPDATE crm_follow_up_recommendations
+          SET status = 'superseded', superseded_at = ?
+          WHERE submission_id = ? AND status = 'current'
+        `).run(document.created_at || new Date().toISOString(), document.submission_id);
+      }
       return document;
     },
 
     async deleteSecureDocument(id) {
+      const document = database.prepare('SELECT submission_id FROM secure_documents WHERE id = ? LIMIT 1').get(id);
       deleteSecureDocumentStatement.run(id);
+      if (document?.submission_id) {
+        database.prepare(`
+          UPDATE crm_follow_up_recommendations
+          SET status = 'superseded', superseded_at = ?
+          WHERE submission_id = ? AND status = 'current'
+        `).run(new Date().toISOString(), document.submission_id);
+      }
     },
 
     async getSecureDocument(id) {
@@ -3167,6 +3661,19 @@ export function createSqliteStorage(config) {
       );
     },
 
+    async getCrmCommunicationByMessageId(messageId) {
+      const normalizedMessageId = String(messageId || '').trim();
+      if (!normalizedMessageId) return null;
+      return normalizeCrmCommunicationRow(
+        database.prepare(`
+          SELECT * FROM crm_communications
+          WHERE message_id = ?
+          ORDER BY occurred_at DESC, id DESC
+          LIMIT 1
+        `).get(normalizedMessageId),
+      );
+    },
+
     async insertCrmCommunication(communication = {}) {
       const serialized = serializeCrmCommunication(communication);
       return database.transaction(() => {
@@ -3176,6 +3683,13 @@ export function createSqliteStorage(config) {
           database.prepare('SELECT * FROM crm_communications WHERE id = ? LIMIT 1').get(serialized.id),
         );
         linkEmailEventsToCommunication(stored);
+        if (stored?.submission_id) {
+          database.prepare(`
+            UPDATE crm_follow_up_recommendations
+            SET status = 'superseded', superseded_at = ?
+            WHERE submission_id = ? AND status = 'current'
+          `).run(stored.occurred_at || stored.updated_at || new Date().toISOString(), stored.submission_id);
+        }
         return stored;
       })();
     },
@@ -3183,7 +3697,9 @@ export function createSqliteStorage(config) {
     async updateCrmCommunication(id, values = {}) {
       const allowedFields = [
         'submission_id', 'deal_key', 'cim_request_id', 'direction', 'channel', 'source', 'kind',
-        'provider', 'provider_message_id', 'source_event_id', 'idempotency_key', 'in_reply_to',
+        'provider', 'provider_message_id', 'source_event_id', 'idempotency_key', 'message_id', 'in_reply_to',
+        'references_json', 'parent_communication_id', 'thread_key', 'legacy_content_unavailable',
+        'content_redaction_state', 'recommendation_id', 'outbox_id', 'headers_json',
         'reply_to_address', 'from_address', 'to_addresses', 'cc_addresses', 'bcc_addresses',
         'subject', 'body_text', 'body_html_sanitized', 'occurred_at', 'updated_at', 'delivery_state',
         'delivery_state_at', 'content_state', 'content_attempt_count', 'content_last_error',
@@ -3196,7 +3712,413 @@ export function createSqliteStorage(config) {
         serializeCrmCommunicationValues(values),
         allowedFields,
       );
-      return this.getCrmCommunication(id);
+      const updated = await this.getCrmCommunication(id);
+      if (updated?.submission_id) {
+        database.prepare(`
+          UPDATE crm_follow_up_recommendations
+          SET status = 'superseded', superseded_at = ?
+          WHERE submission_id = ? AND status = 'current'
+        `).run(updated.updated_at || new Date().toISOString(), updated.submission_id);
+      }
+      return updated;
+    },
+
+    async createCrmEmailCommand({
+      communication = {}, outbox = {}, activity = {}, expectedSubmissionVersion = '',
+      manualTakeoverCimRequestId = '',
+    } = {}) {
+      const serializedCommunication = serializeCrmCommunication(communication);
+      const serializedOutbox = serializeCrmEmailOutbox(outbox);
+      const recommendationDecision = ['accepted', 'edited_and_accepted'].includes(outbox.metadata?.recommendationDecision)
+        ? outbox.metadata.recommendationDecision
+        : '';
+      const command = database.transaction(() => {
+        const duplicate = database.prepare(`
+          SELECT * FROM crm_email_outbox WHERE client_request_key = ? LIMIT 1
+        `).get(serializedOutbox.client_request_key);
+        if (duplicate) {
+          const existingOutbox = normalizeCrmEmailOutboxRow(duplicate);
+          return {
+            applied: false,
+            reason: 'duplicate-client-request',
+            outbox: existingOutbox,
+            communication: normalizeCrmCommunicationRow(
+              database.prepare('SELECT * FROM crm_communications WHERE id = ? LIMIT 1').get(existingOutbox.communication_id),
+            ),
+            submission: normalizeSubmissionRow(
+              database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1').get(existingOutbox.submission_id),
+            ),
+          };
+        }
+
+        const submission = database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1')
+          .get(serializedOutbox.submission_id);
+        if (!submission) return { applied: false, reason: 'submission-not-found', outbox: null, communication: null, submission: null };
+        if (!expectedSubmissionVersion || submission.updated_at !== expectedSubmissionVersion) {
+          return {
+            applied: false,
+            reason: 'stale-submission',
+            outbox: null,
+            communication: null,
+            submission: normalizeSubmissionRow(submission),
+          };
+        }
+        if (['archived', 'spam'].includes(String(submission.status || '').toLowerCase())) {
+          return {
+            applied: false,
+            reason: `submission-${String(submission.status).toLowerCase()}`,
+            outbox: null,
+            communication: null,
+            submission: normalizeSubmissionRow(submission),
+          };
+        }
+
+        if (manualTakeoverCimRequestId) {
+          const cimRequest = database.prepare(`
+            SELECT * FROM deal_hunter_cim_requests
+            WHERE id = ? AND submission_id = ?
+            LIMIT 1
+          `).get(manualTakeoverCimRequestId, serializedOutbox.submission_id);
+          if (!cimRequest) {
+            return { applied: false, reason: 'cim-request-not-found', outbox: null, communication: null, submission: normalizeSubmissionRow(submission) };
+          }
+          if (['pending', 'follow_up_pending'].includes(String(cimRequest.status || ''))) {
+            return { applied: false, reason: 'cim-send-in-progress', outbox: null, communication: null, submission: normalizeSubmissionRow(submission) };
+          }
+          database.prepare(`
+            UPDATE deal_hunter_cim_requests SET
+              request_state = 'manual_takeover',
+              follow_up_state = 'stopped',
+              next_follow_up_at = NULL,
+              follow_up_count = follow_up_count + 1,
+              updated_at = ?,
+              last_activity_at = ?,
+              metadata = json_set(CASE WHEN json_valid(metadata) THEN metadata ELSE '{}' END,
+                '$.manualTakeoverAt', ?, '$.manualTakeoverBy', ?)
+            WHERE id = ? AND submission_id = ?
+          `).run(
+            serializedOutbox.created_at,
+            serializedOutbox.created_at,
+            serializedOutbox.created_at,
+            serializedOutbox.actor,
+            manualTakeoverCimRequestId,
+            serializedOutbox.submission_id,
+          );
+        }
+
+        const communicationInsert = insertCrmCommunicationStatement.run(serializedCommunication);
+        if (communicationInsert.changes !== 1) throw new Error('Unable to create the immutable CRM communication.');
+        insertCrmEmailOutboxStatement.run(serializedOutbox);
+        const recommendationId = String(serializedCommunication.recommendation_id || '').trim();
+        if (recommendationId) {
+          database.prepare(`
+            UPDATE crm_follow_up_recommendations
+            SET
+              status = CASE
+                WHEN ? = 'accepted' THEN 'accepted'
+                WHEN ? = 'edited_and_accepted' THEN 'edited_and_accepted'
+                WHEN COALESCE(draft_subject, '') = COALESCE(?, '')
+                  AND COALESCE(draft_body_text, '') = COALESCE(?, '')
+                THEN 'accepted'
+                ELSE 'edited_and_accepted'
+              END,
+              acted_on_at = ?,
+              acted_on_by = ?,
+              outcome = 'email-command-created'
+            WHERE id = ? AND submission_id = ? AND status = 'current'
+          `).run(
+            recommendationDecision,
+            recommendationDecision,
+            serializedCommunication.subject,
+            serializedCommunication.body_text,
+            serializedOutbox.created_at,
+            serializedOutbox.actor,
+            recommendationId,
+            serializedOutbox.submission_id,
+          );
+        }
+        database.prepare(`
+          UPDATE crm_follow_up_recommendations
+          SET status = 'superseded', superseded_at = ?
+          WHERE submission_id = ? AND status = 'current'
+        `).run(serializedOutbox.created_at, serializedOutbox.submission_id);
+        insertCrmActivityEventStatement.run(serializeCrmActivityEvent(activity));
+        const submissionUpdate = database.prepare(`
+          UPDATE contact_submissions
+          SET updated_at = ?
+          WHERE id = ? AND updated_at = ?
+        `).run(serializedOutbox.created_at, serializedOutbox.submission_id, expectedSubmissionVersion);
+        if (submissionUpdate.changes !== 1) throw new Error('The CRM record changed while the email command was being created.');
+
+        return {
+          applied: true,
+          reason: '',
+          outbox: normalizeCrmEmailOutboxRow(
+            database.prepare('SELECT * FROM crm_email_outbox WHERE id = ? LIMIT 1').get(serializedOutbox.id),
+          ),
+          communication: normalizeCrmCommunicationRow(
+            database.prepare('SELECT * FROM crm_communications WHERE id = ? LIMIT 1').get(serializedCommunication.id),
+          ),
+          submission: normalizeSubmissionRow(
+            database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1').get(serializedOutbox.submission_id),
+          ),
+        };
+      });
+      return command.immediate();
+    },
+
+    async getCrmEmailOutbox(id) {
+      if (!id) return null;
+      return normalizeCrmEmailOutboxRow(
+        database.prepare('SELECT * FROM crm_email_outbox WHERE id = ? LIMIT 1').get(id),
+      );
+    },
+
+    async getCrmEmailOutboxByClientRequestKey(clientRequestKey) {
+      const normalizedKey = String(clientRequestKey || '').trim();
+      if (!normalizedKey) return null;
+      return normalizeCrmEmailOutboxRow(
+        database.prepare('SELECT * FROM crm_email_outbox WHERE client_request_key = ? LIMIT 1').get(normalizedKey),
+      );
+    },
+
+    async getCrmEmailOutboxByProviderMessageId(providerMessageId) {
+      const normalizedId = String(providerMessageId || '').trim();
+      if (!normalizedId) return null;
+      return normalizeCrmEmailOutboxRow(
+        database.prepare(`
+          SELECT * FROM crm_email_outbox
+          WHERE provider_message_id = ?
+          ORDER BY created_at DESC, id DESC LIMIT 1
+        `).get(normalizedId),
+      );
+    },
+
+    async listCrmEmailOutbox({ submissionId = '', states = [], limit = 25 } = {}) {
+      const clauses = [];
+      const params = [];
+      if (submissionId) {
+        clauses.push('submission_id = ?');
+        params.push(String(submissionId).trim());
+      }
+      const safeStates = normalizeList(states, 20);
+      if (safeStates.length > 0) {
+        clauses.push(`state IN (${placeholders(safeStates.length)})`);
+        params.push(...safeStates);
+      }
+      const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 25, 100));
+      return database.prepare(`
+        SELECT * FROM crm_email_outbox ${whereClause}
+        ORDER BY created_at DESC, id DESC LIMIT ?
+      `).all(...params, safeLimit).map(normalizeCrmEmailOutboxRow);
+    },
+
+    async claimCrmEmailOutbox({ id = '', claimToken = '', claimedAt = '', claimExpiresAt = '' } = {}) {
+      const row = database.prepare(`
+        UPDATE crm_email_outbox SET
+          state = 'sending',
+          attempt_count = attempt_count + 1,
+          claim_token = ?,
+          claimed_at = ?,
+          claim_expires_at = ?,
+          updated_at = ?
+        WHERE id = ?
+          AND (
+            state = 'queued'
+            OR (state = 'retryable_failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+            OR (state = 'sending' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?)
+          )
+        RETURNING *
+      `).get(claimToken, claimedAt, claimExpiresAt, claimedAt, id, claimedAt, claimedAt);
+      return { claimed: Boolean(row), outbox: normalizeCrmEmailOutboxRow(row || database.prepare('SELECT * FROM crm_email_outbox WHERE id = ? LIMIT 1').get(id)) };
+    },
+
+    async finishCrmEmailOutboxClaim(id, claimToken, values = {}) {
+      const allowedFields = [
+        'state', 'provider', 'provider_message_id', 'next_attempt_at', 'accepted_at', 'failed_at',
+        'ambiguous_at', 'last_error_category', 'last_error_message', 'updated_at', 'metadata',
+      ];
+      const safeValues = Object.fromEntries(Object.entries(values).filter(([field]) => allowedFields.includes(field)));
+      if (Object.hasOwn(safeValues, 'metadata')) safeValues.metadata = JSON.stringify(safeValues.metadata || {});
+      const assignments = Object.keys(safeValues).map((field) => `${field} = @${field}`);
+      if (assignments.length === 0) return this.getCrmEmailOutbox(id);
+      assignments.push('claim_token = NULL', 'claimed_at = NULL', 'claim_expires_at = NULL');
+      const row = database.prepare(`
+        UPDATE crm_email_outbox
+        SET ${assignments.join(', ')}
+        WHERE id = @id AND claim_token = @claim_token AND state = 'sending'
+        RETURNING *
+      `).get({ ...safeValues, id, claim_token: claimToken });
+      return normalizeCrmEmailOutboxRow(row);
+    },
+
+    async countCrmEmailOutboxByStates(states = []) {
+      const safeStates = normalizeList(states, 20);
+      if (safeStates.length === 0) return 0;
+      return Number(database.prepare(`
+        SELECT COUNT(*) AS count FROM crm_email_outbox
+        WHERE state IN (${placeholders(safeStates.length)})
+      `).get(...safeStates)?.count || 0);
+    },
+
+    async countCrmFollowUpSends({ recipient = '', since = '' } = {}) {
+      const normalizedRecipient = String(recipient || '').trim().toLowerCase();
+      const clauses = [
+        "communication.kind = 'crm-follow-up'",
+        "outbox.state NOT IN ('permanent_failed', 'cancelled')",
+      ];
+      const params = [];
+      if (since) {
+        clauses.push('outbox.created_at >= ?');
+        params.push(String(since));
+      }
+      if (normalizedRecipient) {
+        clauses.push(`EXISTS (
+          SELECT 1 FROM json_each(communication.to_addresses)
+          WHERE LOWER(json_each.value) = ?
+        )`);
+        params.push(normalizedRecipient);
+      }
+      return Number(database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM crm_email_outbox AS outbox
+        JOIN crm_communications AS communication ON communication.id = outbox.communication_id
+        WHERE ${clauses.join(' AND ')}
+      `).get(...params)?.count || 0);
+    },
+
+    async getCrmFollowUpOperationalMetrics({ since = '' } = {}) {
+      const windowStartedAt = String(since || '1970-01-01T00:00:00.000Z');
+      const row = database.prepare(`
+        SELECT
+          (SELECT COUNT(*) FROM crm_email_outbox WHERE created_at >= @since AND state = 'queued') AS outbox_queued,
+          (SELECT COUNT(*) FROM crm_email_outbox WHERE created_at >= @since AND state = 'sending') AS outbox_sending,
+          (SELECT COUNT(*) FROM crm_email_outbox WHERE created_at >= @since AND state = 'accepted') AS outbox_accepted,
+          (SELECT COUNT(*) FROM crm_email_outbox WHERE created_at >= @since AND state = 'ambiguous') AS outbox_ambiguous,
+          (SELECT COUNT(*) FROM crm_email_outbox WHERE created_at >= @since AND state = 'retryable_failed') AS outbox_retryable_failed,
+          (SELECT COUNT(*) FROM crm_email_outbox WHERE created_at >= @since AND state = 'permanent_failed') AS outbox_permanent_failed,
+          (SELECT COUNT(*) FROM crm_email_outbox WHERE created_at >= @since AND state = 'cancelled') AS outbox_cancelled,
+          (SELECT COUNT(*) FROM crm_communications WHERE occurred_at >= @since AND kind = 'crm-follow-up' AND direction = 'outbound' AND delivery_state = 'delivered') AS delivered,
+          (SELECT COUNT(*) FROM crm_communications WHERE occurred_at >= @since AND kind = 'crm-follow-up' AND direction = 'outbound' AND delivery_state = 'delayed') AS delayed,
+          (SELECT COUNT(*) FROM crm_communications WHERE occurred_at >= @since AND kind = 'crm-follow-up' AND direction = 'outbound' AND delivery_state = 'bounced') AS bounced,
+          (SELECT COUNT(*) FROM crm_communications WHERE occurred_at >= @since AND kind = 'crm-follow-up' AND direction = 'outbound' AND delivery_state = 'complained') AS complained,
+          (SELECT COUNT(*) FROM crm_communications WHERE occurred_at >= @since AND kind = 'crm-follow-up' AND direction = 'outbound' AND delivery_state = 'failed') AS delivery_failed,
+          (SELECT COUNT(*) FROM crm_communications AS outbound
+            WHERE outbound.occurred_at >= @since AND outbound.kind = 'crm-follow-up' AND outbound.direction = 'outbound'
+              AND EXISTS (
+                SELECT 1 FROM crm_communications AS inbound
+                WHERE inbound.direction = 'inbound'
+                  AND inbound.submission_id = outbound.submission_id
+                  AND inbound.occurred_at >= outbound.occurred_at
+                  AND (
+                    inbound.parent_communication_id = outbound.id
+                    OR (outbound.message_id IS NOT NULL AND inbound.in_reply_to = outbound.message_id)
+                    OR (outbound.thread_key IS NOT NULL AND inbound.thread_key = outbound.thread_key)
+                  )
+              )) AS replied,
+          (SELECT COUNT(*) FROM crm_follow_up_recommendations WHERE created_at >= @since AND status = 'current') AS recommendations_current,
+          (SELECT COUNT(*) FROM crm_follow_up_recommendations WHERE created_at >= @since AND status = 'accepted') AS recommendations_accepted,
+          (SELECT COUNT(*) FROM crm_follow_up_recommendations WHERE created_at >= @since AND status = 'edited_and_accepted') AS recommendations_edited_and_accepted,
+          (SELECT COUNT(*) FROM crm_follow_up_recommendations WHERE created_at >= @since AND status = 'dismissed') AS recommendations_dismissed,
+          (SELECT COUNT(*) FROM crm_follow_up_recommendations WHERE created_at >= @since AND status = 'superseded') AS recommendations_superseded,
+          (SELECT COUNT(*) FROM crm_follow_up_recommendations WHERE created_at >= @since AND status = 'failed') AS recommendations_failed,
+          (SELECT COUNT(*) FROM crm_follow_up_recommendations WHERE created_at >= @since AND model_provider IS NOT NULL) AS ai_used,
+          (SELECT COUNT(*) FROM crm_follow_up_recommendations WHERE created_at >= @since AND json_extract(metadata, '$.aiRequested') = 1 AND json_extract(metadata, '$.aiUsed') = 0) AS ai_fallback,
+          (SELECT COUNT(*) FROM email_suppressions WHERE lifted_at IS NULL) AS suppressions_active
+      `).get({ since: windowStartedAt });
+      const count = (value) => Math.max(0, Math.floor(Number(value) || 0));
+      return {
+        windowStartedAt,
+        outbox: {
+          queued: count(row.outbox_queued), sending: count(row.outbox_sending), accepted: count(row.outbox_accepted),
+          ambiguous: count(row.outbox_ambiguous), retryableFailed: count(row.outbox_retryable_failed),
+          permanentFailed: count(row.outbox_permanent_failed), cancelled: count(row.outbox_cancelled),
+        },
+        delivery: {
+          delivered: count(row.delivered), delayed: count(row.delayed), bounced: count(row.bounced),
+          complained: count(row.complained), failed: count(row.delivery_failed), replied: count(row.replied),
+        },
+        recommendations: {
+          current: count(row.recommendations_current), accepted: count(row.recommendations_accepted),
+          editedAndAccepted: count(row.recommendations_edited_and_accepted), dismissed: count(row.recommendations_dismissed),
+          superseded: count(row.recommendations_superseded), failed: count(row.recommendations_failed),
+          aiUsed: count(row.ai_used), aiFallback: count(row.ai_fallback),
+        },
+        suppressions: { active: count(row.suppressions_active) },
+      };
+    },
+
+    async insertCrmFollowUpRecommendation(recommendation = {}) {
+      const serialized = serializeCrmFollowUpRecommendation(recommendation);
+      insertCrmFollowUpRecommendationStatement.run(serialized);
+      return normalizeCrmFollowUpRecommendationRow(database.prepare(`
+        SELECT * FROM crm_follow_up_recommendations
+        WHERE submission_id = ? AND input_fingerprint = ? AND engine_version = ?
+        LIMIT 1
+      `).get(serialized.submission_id, serialized.input_fingerprint, serialized.engine_version));
+    },
+
+    async getCurrentCrmFollowUpRecommendation(submissionId) {
+      return normalizeCrmFollowUpRecommendationRow(database.prepare(`
+        SELECT * FROM crm_follow_up_recommendations
+        WHERE submission_id = ? AND status = 'current'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `).get(submissionId));
+    },
+
+    async getCrmFollowUpRecommendation(id) {
+      return normalizeCrmFollowUpRecommendationRow(database.prepare(`
+        SELECT * FROM crm_follow_up_recommendations WHERE id = ? LIMIT 1
+      `).get(id));
+    },
+
+    async supersedeCrmFollowUpRecommendations(submissionId, supersededAt) {
+      return database.prepare(`
+        UPDATE crm_follow_up_recommendations
+        SET status = 'superseded', superseded_at = ?
+        WHERE submission_id = ? AND status = 'current'
+      `).run(supersededAt, submissionId).changes;
+    },
+
+    async updateCrmFollowUpRecommendation(id, values = {}) {
+      const allowedFields = ['status', 'acted_on_at', 'superseded_at', 'acted_on_by', 'outcome', 'metadata'];
+      const safeValues = Object.fromEntries(Object.entries(values).filter(([field]) => allowedFields.includes(field)));
+      if (Object.hasOwn(safeValues, 'metadata')) safeValues.metadata = JSON.stringify(safeValues.metadata || {});
+      if (Object.keys(safeValues).length === 0) return normalizeCrmFollowUpRecommendationRow(
+        database.prepare('SELECT * FROM crm_follow_up_recommendations WHERE id = ? LIMIT 1').get(id),
+      );
+      const assignments = Object.keys(safeValues).map((field) => `${field} = @${field}`).join(', ');
+      return normalizeCrmFollowUpRecommendationRow(database.prepare(`
+        UPDATE crm_follow_up_recommendations SET ${assignments} WHERE id = @id RETURNING *
+      `).get({ ...safeValues, id }));
+    },
+
+    async getActiveEmailSuppression(email) {
+      const normalizedEmail = String(email || '').trim().toLowerCase();
+      if (!normalizedEmail) return null;
+      return normalizeEmailSuppressionRow(database.prepare(`
+        SELECT * FROM email_suppressions
+        WHERE normalized_email = ? AND lifted_at IS NULL
+        LIMIT 1
+      `).get(normalizedEmail));
+    },
+
+    async upsertEmailSuppression(suppression = {}) {
+      const serialized = serializeEmailSuppression(suppression);
+      upsertEmailSuppressionStatement.run(serialized);
+      return this.getActiveEmailSuppression(serialized.normalized_email);
+    },
+
+    async liftEmailSuppression(email, { liftedAt = '', liftedBy = '', liftReason = '' } = {}) {
+      const normalizedEmail = String(email || '').trim().toLowerCase();
+      const row = database.prepare(`
+        UPDATE email_suppressions SET lifted_at = ?, lifted_by = ?, lift_reason = ?
+        WHERE normalized_email = ? AND lifted_at IS NULL
+        RETURNING *
+      `).get(liftedAt, liftedBy, liftReason, normalizedEmail);
+      return normalizeEmailSuppressionRow(row);
     },
 
     async listCrmCommunications({
@@ -3626,6 +4548,17 @@ export function createSqliteStorage(config) {
         .map(normalizeDealHunterCimRequestRow);
     },
 
+    async getLatestDealHunterCimRequestForSubmission(submissionId) {
+      const normalizedId = String(submissionId || '').trim();
+      if (!normalizedId) return null;
+      return normalizeDealHunterCimRequestRow(database.prepare(`
+        SELECT * FROM deal_hunter_cim_requests
+        WHERE submission_id = ?
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+      `).get(normalizedId));
+    },
+
     async listDealHunterCimRequestHistory({
       page = 1,
       pageSize = 25,
@@ -3726,11 +4659,23 @@ export function createSqliteStorage(config) {
     },
 
 	    async upsertDealHunterCimRequest(request = {}) {
-	      upsertDealHunterCimRequestStatement.run(serializeDealHunterCimRequest(request));
-	      return this.getDealHunterCimRequest({
-	        dealKey: request.deal_key,
-	        recipientEmail: request.recipient_email,
-	      });
+	      const serialized = serializeDealHunterCimRequest(request);
+	      return database.transaction(() => {
+	        upsertDealHunterCimRequestStatement.run(serialized);
+	        const stored = database.prepare(`
+	          SELECT * FROM deal_hunter_cim_requests
+	          WHERE deal_key = ? AND LOWER(recipient_email) = ?
+	          LIMIT 1
+	        `).get(serialized.deal_key, serialized.recipient_email);
+	        if (stored?.submission_id) {
+	          database.prepare(`
+	            UPDATE crm_follow_up_recommendations
+	            SET status = 'superseded', superseded_at = ?
+	            WHERE submission_id = ? AND status = 'current'
+	          `).run(serialized.updated_at || new Date().toISOString(), stored.submission_id);
+	        }
+	        return normalizeDealHunterCimRequestRow(stored);
+	      }).immediate();
 	    },
 
 	    async claimDealHunterCimRequest(request = {}, { pendingCutoff = '' } = {}) {

@@ -15,6 +15,28 @@ const emptySummary = {
   hotLeads: 0,
 };
 
+function followUpRecord(index) {
+  return {
+    id: `browser-follow-up-${index}`,
+    updated_at: '2026-08-09T16:00:00.000Z',
+    status: 'review',
+    follow_up_state: 'needs-response',
+    next_action_at: '2026-08-09T17:00:00.000Z',
+    priority: index === 0 ? 'high' : 'normal',
+    company: `Browser Follow-Up ${index}`,
+    name: `Broker ${index}`,
+    email: `browser-broker-${index}@example.test`,
+    broker_name: `Broker ${index}`,
+    broker_email: `browser-broker-${index}@example.test`,
+    follow_up_prompt: { title: 'Follow up due', kind: 'due' },
+    follow_up_latest_subject: index === 0 ? 'Re: Browser acquisition question' : '',
+    follow_up_latest_direction: index === 0 ? 'inbound' : '',
+    follow_up_latest_delivery_state: index === 1 ? 'bounced' : '',
+    follow_up_latest_communication_at: '2026-08-09T16:30:00.000Z',
+    follow_up_priority_score: index === 0 ? 95 : 20,
+  };
+}
+
 async function mockAuthenticatedAdmin(page) {
   await page.route('**/api/admin/session', async (route) => {
     await route.fulfill({
@@ -74,16 +96,67 @@ async function mockAuthenticatedAdmin(page) {
     });
   });
 
-  await page.route('**/api/admin/follow-ups', async (route) => {
+  await page.route('**/api/admin/follow-ups/*/context?*', async (route) => {
     await route.fulfill({
       contentType: 'application/json',
       status: 200,
       body: JSON.stringify({
         success: true,
-        summary: emptySummary,
-        notifications: [],
-        emailTriage: [],
-        total: 15,
+        context: {
+          submission: {
+            ...followUpRecord(0),
+            assigned_to: 'Mathew Uckele',
+          },
+          communications: [{
+            id: 'browser-inbound-1',
+            direction: 'inbound',
+            channel: 'email',
+            from_address: 'browser-broker-0@example.test',
+            to_addresses: ['reply@example.test'],
+            subject: 'Re: Browser acquisition question',
+            body_text: '<script>untrusted email instruction</script> Could you send the CIM?',
+            body_html_sanitized: '<script>must not render</script>',
+            message_id: '<browser-inbound-1@example.test>',
+            references_json: [],
+            delivery_state: 'replied',
+            content_state: 'complete',
+            attachment_metadata: [],
+            occurred_at: '2026-08-09T16:30:00.000Z',
+          }],
+          communicationTotal: 1,
+          documents: [],
+          dealHunter: { linked: false, cimRequest: null, concerns: [], strengths: [], unansweredQuestions: [] },
+          recommendation: null,
+          outbox: [],
+          recipients: [{ email: 'browser-broker-0@example.test', label: 'Broker 0', source: 'broker' }],
+          suppressions: [],
+          policy: {
+            email: { enabled: false, ready: false, blockers: ['email-disabled'] },
+            sender: { from: '', replyTo: '' },
+            ai: { enabled: false, ready: true, optional: true },
+            timezone: 'America/Los_Angeles',
+            sendWindowStart: '08:00',
+            sendWindowEnd: '17:00',
+            maxTouches: 3,
+          },
+        },
+      }),
+    });
+  });
+
+  await page.route('**/api/admin/follow-ups?*', async (route) => {
+    const rows = Array.from({ length: 25 }, (_, index) => followUpRecord(index));
+    await route.fulfill({
+      contentType: 'application/json',
+      status: 200,
+      body: JSON.stringify({
+        success: true,
+        items: rows,
+        summary: { ...emptySummary, total: 25 },
+        total: 25,
+        page: 1,
+        pageSize: 25,
+        totalPages: 1,
       }),
     });
   });
@@ -149,4 +222,29 @@ test('an authenticated administrator can reach the Operations Center', async ({ 
   await expect(page.getByText('70% free')).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Job history' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Audit events' })).toBeVisible();
+});
+
+test('the follow-up queue renders a full server page and its mobile dialog is keyboard-safe', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await mockAuthenticatedAdmin(page);
+  await page.goto('/admin/follow-ups?view=all');
+
+  await expect(page.getByRole('heading', { name: 'Follow-Up decisions and email actions' })).toBeVisible();
+  await expect(page.getByText('Showing 1–25 of 25 filtered records')).toBeVisible();
+  await expect(page.getByRole('button', { name: /Browser Follow-Up/ })).toHaveCount(25);
+
+  const firstRow = page.getByRole('button', { name: /Browser Follow-Up 0/ });
+  await firstRow.focus();
+  await firstRow.click();
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Close follow-up detail' })).toBeFocused();
+  await expect(page.getByText('<script>untrusted email instruction</script> Could you send the CIM?')).toBeVisible();
+  await expect(dialog.locator('script')).toHaveCount(0);
+  const box = await dialog.boundingBox();
+  expect(box?.width).toBeGreaterThanOrEqual(389);
+
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(firstRow).toBeFocused();
 });

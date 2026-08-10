@@ -30,6 +30,7 @@ import DealHunterWorkspace from '../components/admin/DealHunterWorkspace';
 import CimRequestHistory from '../components/admin/CimRequestHistory';
 import CrmCommunications from '../components/admin/CrmCommunications';
 import UnassignedCommunicationsInbox from '../components/admin/UnassignedCommunicationsInbox';
+import FollowUpsWorkspace from '../components/admin/FollowUpsWorkspace';
 import { adminSectionMeta } from '../content/adminSectionMeta';
 
 const statuses = ['new', 'review', 'contacted', 'archived', 'spam'];
@@ -1240,8 +1241,8 @@ export default function DashboardPage() {
     totalPages: 1,
   });
   const [followUpData, setFollowUpData] = useState({ summary: null, notifications: [], emailTriage: [], total: 0 });
-  const [followUpError, setFollowUpError] = useState('');
-  const [followUpLoading, setFollowUpLoading] = useState(false);
+  const [, setFollowUpError] = useState('');
+  const [, setFollowUpLoading] = useState(false);
   const [drafts, setDrafts] = useState({});
   const [loading, setLoading] = useState(false);
   const [actionError, setActionError] = useState('');
@@ -1304,11 +1305,7 @@ export default function DashboardPage() {
   const deferredSearch = useDeferredValue(filters.search);
   const deferredCimHistorySearch = useDeferredValue(cimHistoryQuery.search);
   const isReadOnly = authState.role === 'viewer';
-  const requestedFollowUpView = new URLSearchParams(location.search).get('view');
   const requestedDealHunterView = new URLSearchParams(location.search).get('view');
-  const followUpView = ['action-items', 'overdue', 'due-soon', 'warm-leads'].includes(requestedFollowUpView)
-    ? requestedFollowUpView
-    : 'all';
   const crmListSearch = crmSearchFromFilters(filters);
   const crmListHref = `/admin/crm${crmListSearch ? `?${crmListSearch}` : ''}`;
   const pageMeta = adminSectionMeta[isCrmDetailView ? 'crm-detail' : activeSection] || adminSectionMeta.overview;
@@ -1948,7 +1945,7 @@ export default function DashboardPage() {
       loadCommandCenter();
     }
 
-    if (activeSection === 'overview' || activeSection === 'follow-ups') {
+    if (activeSection === 'overview') {
       loadFollowUps();
     } else {
       followUpRequestRef.current.controller?.abort();
@@ -3002,29 +2999,6 @@ export default function DashboardPage() {
   const crmCommunicationsHasMore = crmCommunications.rows.length < crmCommunications.total;
   const unassignedCommunicationsHasMore = unassignedCommunications.rows.length < unassignedCommunications.total;
   const followUpSummary = followUpData.summary || {};
-  const notifications = useMemo(() => followUpData.notifications || [], [followUpData.notifications]);
-  const emailTriage = useMemo(() => followUpData.emailTriage || [], [followUpData.emailTriage]);
-  const visibleNotifications = useMemo(() => {
-    if (followUpView === 'warm-leads') {
-      return [];
-    }
-
-    if (followUpView === 'overdue') {
-      return notifications.filter((submission) => submission.follow_up_prompt?.kind === 'overdue');
-    }
-
-    if (followUpView === 'due-soon') {
-      return notifications.filter((submission) => ['due', 'today'].includes(submission.follow_up_prompt?.kind));
-    }
-
-    return notifications;
-  }, [followUpView, notifications]);
-  const visibleEmailTriage = useMemo(
-    () => (followUpView === 'all' || followUpView === 'warm-leads' ? emailTriage : []),
-    [emailTriage, followUpView],
-  );
-  const displayedNotifications = followUpView === 'all' ? visibleNotifications.slice(0, 6) : visibleNotifications;
-  const displayedEmailTriage = followUpView === 'all' ? visibleEmailTriage.slice(0, 6) : visibleEmailTriage;
   const adminSummary = {
     ...summary,
     actionItems: followUpSummary.actionItems ?? summary.actionItems,
@@ -3594,143 +3568,7 @@ export default function DashboardPage() {
         </>
       ) : null}
 
-      {activeSection === 'follow-ups' && followUpError ? (
-        <section className="section-shell mt-8">
-          <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{followUpError}</div>
-        </section>
-      ) : null}
-
-      {activeSection === 'follow-ups' && followUpLoading ? (
-        <section className="section-shell mt-8">
-          <Reveal className="panel p-7 text-sm leading-7 text-ink/70">
-            Loading follow-up prompts and email triage...
-          </Reveal>
-        </section>
-      ) : null}
-
-      {activeSection === 'follow-ups' && followUpView !== 'all' ? (
-        <section className="section-shell mt-8">
-          <Reveal className="panel flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
-            <div>
-              <SectionLabel>Filtered View</SectionLabel>
-              <p className="mt-2 text-lg font-semibold text-ink">
-                {followUpView === 'action-items' ? 'All action items' : null}
-                {followUpView === 'overdue' ? 'Overdue follow-ups' : null}
-                {followUpView === 'due-soon' ? 'Due now or within 24 hours' : null}
-                {followUpView === 'warm-leads' ? 'Warm leads with email activity' : null}
-              </p>
-            </div>
-            <NavLink className={secondaryActionButtonClass} to="/admin/follow-ups">Show All Follow-Ups</NavLink>
-          </Reveal>
-        </section>
-      ) : null}
-
-      {activeSection === 'follow-ups' && !followUpLoading && visibleNotifications.length > 0 ? (
-        <section className="section-shell mt-8">
-          <Reveal className="panel p-5 sm:p-8">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-              <div>
-                <SectionLabel>Follow-Up Notifications</SectionLabel>
-                <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Who needs a follow-up next</h2>
-                <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
-                  These prompts are generated from status, lead type, reminder dates, and document activity so you can keep seller and broker conversations moving without guessing.
-                </p>
-              </div>
-              <Pill tone={visibleNotifications.some((submission) => submission.follow_up_prompt?.kind === 'overdue') ? 'danger' : 'warning'}>{visibleNotifications.length} active prompts</Pill>
-            </div>
-
-            <div className="mt-6 grid gap-4 lg:grid-cols-2">
-              {displayedNotifications.map((submission) => (
-                <div
-                  className={`rounded-2xl border p-4 sm:p-5 ${notificationToneClasses(submission.follow_up_prompt?.severity)}`}
-                  key={`notification-${submission.id}`}
-                >
-                  <div className="flex flex-wrap items-center gap-3">
-                    <p className="text-lg font-semibold">{submission.company || submission.name}</p>
-                    <Pill tone={submission.follow_up_prompt?.severity === 'danger' ? 'danger' : submission.follow_up_prompt?.severity === 'warning' ? 'warning' : 'info'}>
-                      {submission.follow_up_prompt?.kind || 'prompt'}
-                    </Pill>
-                  </div>
-                  <p className="mt-3 text-sm font-semibold uppercase tracking-[0.14em]">
-                    {submission.follow_up_prompt?.title}
-                  </p>
-                  <p className="mt-3 text-sm leading-7">{submission.follow_up_prompt?.message}</p>
-                  <p className="mt-3 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-7">
-                    {submission.follow_up_prompt?.prompt}
-                  </p>
-                  <p className="mt-3 text-xs font-semibold uppercase tracking-[0.14em]">
-                    Next action: {formatDateTime(submission.next_action_at)}
-                  </p>
-                </div>
-              ))}
-            </div>
-          </Reveal>
-        </section>
-      ) : null}
-
-      {activeSection === 'follow-ups' && !followUpLoading && visibleEmailTriage.length > 0 ? (
-        <section className="section-shell mt-8">
-          <Reveal className="panel p-5 sm:p-8">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-              <div>
-                <SectionLabel>Email Follow-Up Triage</SectionLabel>
-                <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Leads showing email engagement</h2>
-                <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
-                  These records have opens, clicks, replies, or delivery issues that should change the follow-up plan.
-                </p>
-              </div>
-              <Pill tone={visibleEmailTriage.some((submission) => submission.email_engagement?.hot) ? 'success' : 'warning'}>{visibleEmailTriage.filter((submission) => submission.email_engagement?.hot).length} hot lead(s)</Pill>
-            </div>
-
-            <div className="mt-6 grid gap-4 lg:grid-cols-2">
-              {displayedEmailTriage.map((submission) => {
-                const engagement = submission.email_engagement;
-
-                return (
-                  <div
-                    className={`rounded-2xl border p-4 sm:p-5 ${notificationToneClasses(engagement?.tone === 'danger' ? 'danger' : engagement?.tone === 'warning' ? 'warning' : 'info')}`}
-                    key={`email-triage-${submission.id}`}
-                  >
-                    <div className="flex flex-wrap items-center gap-3">
-                      <p className="text-lg font-semibold">{submission.company || submission.name}</p>
-                      <Pill tone={emailEngagementTone(engagement)}>Score {engagement?.score || 0}</Pill>
-                      {engagement?.latest_event_type ? <Pill tone={emailEngagementTone(engagement)}>{engagement.latest_event_type}</Pill> : null}
-                    </div>
-                    <p className="mt-3 text-sm leading-7">{formatEmailEngagement(engagement)}</p>
-                    {engagement?.action ? (
-                      <p className="mt-3 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-7">{engagement.action}</p>
-                    ) : null}
-                    <p className="mt-3 text-xs font-semibold uppercase tracking-[0.14em]">
-                      Next action: {formatDateTime(submission.next_action_at)}
-                    </p>
-                  </div>
-                );
-              })}
-            </div>
-          </Reveal>
-        </section>
-      ) : null}
-
-      {activeSection === 'follow-ups' && !followUpLoading && !followUpError && visibleNotifications.length === 0 && visibleEmailTriage.length === 0 ? (
-        <section className="section-shell mt-8">
-          <Reveal className="panel p-6 sm:p-8">
-            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-moss/10 text-moss">
-              <CheckCircle2 className="h-5 w-5" aria-hidden="true" />
-            </div>
-            <div className="mt-4"><SectionLabel>Queue clear</SectionLabel></div>
-            <h2 className="mt-2 text-2xl font-semibold text-ink">No follow-ups need attention</h2>
-            <p className="mt-3 max-w-2xl text-sm leading-7 text-ink/68">
-              {followUpView === 'all'
-                ? 'There are no generated prompts, overdue actions, warm leads, or email-delivery issues in the current queue.'
-                : 'No records match this follow-up filter right now. Return to all follow-ups or review upcoming actions in the CRM.'}
-            </p>
-            <div className="mt-5 flex flex-wrap gap-3">
-              {followUpView !== 'all' ? <NavLink className={secondaryActionButtonClass} to="/admin/follow-ups">Show all follow-ups</NavLink> : null}
-              <NavLink className={secondaryActionButtonClass} to="/admin/crm?sort=next_action_at&direction=asc">Review upcoming CRM actions</NavLink>
-            </div>
-          </Reveal>
-        </section>
-      ) : null}
+      {activeSection === 'follow-ups' ? <FollowUpsWorkspace readOnly={isReadOnly} /> : null}
 
       {activeSection === 'new-record' && !isReadOnly ? (
         <section className="section-shell mt-8">

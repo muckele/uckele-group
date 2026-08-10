@@ -79,6 +79,18 @@ import {
   recordCimReviewDecisions,
   setCimAutomationPaused,
 } from './services/cimAutomation.js';
+import {
+  previewCrmFollowUpEmail,
+  sendCrmFollowUpEmail,
+} from './services/followUpEmail.js';
+import { generateCrmFollowUpRecommendation } from './services/followUpRecommendations.js';
+import {
+  createAdminEmailSuppression,
+  dismissCrmFollowUpRecommendation,
+  getCrmFollowUpContext,
+  getCrmFollowUpOutboxResult,
+  liftAdminEmailSuppression,
+} from './services/followUpWorkspace.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.resolve(__dirname, '../dist');
@@ -676,12 +688,206 @@ export function createApp() {
         return;
       }
 
-      const result = await listDashboardFollowUps();
+      const result = await listDashboardFollowUps({
+        page: Number(request.query.page) || 1,
+        pageSize: Number(request.query.pageSize) || 25,
+        search: String(request.query.search || ''),
+        view: String(request.query.view || 'crm-actions'),
+        sort: String(request.query.sort || 'urgency'),
+        direction: String(request.query.direction || 'desc'),
+      });
 
       response.json({
         success: true,
         ...result,
       });
+    }),
+  );
+
+  app.get(
+    '/api/admin/follow-ups/:submissionId/context',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdmin(request)) {
+        response.status(403).json({ success: false, error: 'Administrator access is required to read email contents.' });
+        return;
+      }
+      const result = await getCrmFollowUpContext({
+        submissionId: request.params.submissionId,
+        communicationPage: Number(request.query.communicationPage) || 1,
+        communicationPageSize: Number(request.query.communicationPageSize) || 50,
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/recommendations',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdmin(request)) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await generateCrmFollowUpRecommendation({
+        submissionId: request.params.submissionId,
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/email-preview',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await previewCrmFollowUpEmail({
+        submissionId: request.params.submissionId,
+        actor: session.username || 'admin',
+        input: request.body || {},
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/send-email',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await sendCrmFollowUpEmail({
+        submissionId: request.params.submissionId,
+        actor: session.username || 'admin',
+        input: request.body || {},
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.get(
+    '/api/admin/follow-ups/:submissionId/outbox/:outboxId',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdmin(request)) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await getCrmFollowUpOutboxResult({
+        submissionId: request.params.submissionId,
+        outboxId: request.params.outboxId,
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/workflow',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const action = String(request.body?.action || '').trim().toLowerCase();
+      const expectedUpdatedAt = String(request.body?.expectedSubmissionVersion || request.body?.expected_updated_at || '');
+      let fields;
+      if (action === 'snooze' || action === 'reschedule') {
+        if (!Number.isFinite(Date.parse(request.body?.nextActionAt || ''))) {
+          response.status(422).json({ success: false, error: 'A valid next action time is required.' });
+          return;
+        }
+        fields = {
+          expected_updated_at: expectedUpdatedAt,
+          follow_up_state: 'scheduled',
+          next_action_at: new Date(request.body.nextActionAt).toISOString(),
+        };
+      } else if (action === 'complete') {
+        fields = { expected_updated_at: expectedUpdatedAt, follow_up_state: 'completed', next_action_at: null };
+      } else if (action === 'reopen') {
+        fields = {
+          expected_updated_at: expectedUpdatedAt,
+          follow_up_state: 'needs-response',
+          next_action_at: Number.isFinite(Date.parse(request.body?.nextActionAt || ''))
+            ? new Date(request.body.nextActionAt).toISOString()
+            : new Date().toISOString(),
+        };
+      } else {
+        response.status(422).json({ success: false, error: 'Choose snooze, reschedule, complete, or reopen.' });
+        return;
+      }
+      const submission = await updateSubmissionWorkflow(request.params.submissionId, fields, {
+        actor: session.username || 'admin',
+        role: 'admin',
+      });
+      if (submission?.conflict) {
+        response.status(409).json({ success: false, error: 'The CRM record changed. Refresh and try again.', ...submission });
+        return;
+      }
+      if (!submission) {
+        response.status(422).json({ success: false, error: 'The CRM workflow action could not be applied.' });
+        return;
+      }
+      response.json({ success: true, submission });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/recommendations/:recommendationId/dismiss',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await dismissCrmFollowUpRecommendation({
+        submissionId: request.params.submissionId,
+        recommendationId: request.params.recommendationId,
+        expectedSubmissionVersion: String(request.body?.expectedSubmissionVersion || ''),
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/suppressions',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await createAdminEmailSuppression({
+        submissionId: request.params.submissionId,
+        email: request.body?.email || '',
+        reason: request.body?.reason || '',
+        confirmed: request.body?.confirmed === true,
+        overrideReason: request.body?.overrideReason || '',
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 201 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/suppressions/lift',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await liftAdminEmailSuppression({
+        submissionId: request.params.submissionId,
+        email: request.body?.email || '',
+        liftReason: request.body?.liftReason || '',
+        confirmed: request.body?.confirmed === true,
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );
 

@@ -453,7 +453,16 @@ create table if not exists public.crm_communications (
   provider_message_id text,
   source_event_id text,
   idempotency_key text,
+  message_id text,
   in_reply_to text,
+  references_json jsonb not null default '[]'::jsonb,
+  parent_communication_id text,
+  thread_key text,
+  legacy_content_unavailable boolean not null default false,
+  content_redaction_state text not null default 'none',
+  recommendation_id text,
+  outbox_id text,
+  headers_json jsonb not null default '{}'::jsonb,
   reply_to_address text,
   from_address text,
   to_addresses jsonb not null default '[]'::jsonb,
@@ -502,6 +511,114 @@ create unique index if not exists idx_crm_communications_source_event
 create unique index if not exists idx_crm_communications_idempotency
   on public.crm_communications (idempotency_key)
   where idempotency_key is not null and idempotency_key <> '';
+create unique index if not exists idx_crm_communications_message_id
+  on public.crm_communications (message_id)
+  where message_id is not null and message_id <> '';
+create index if not exists idx_crm_communications_parent
+  on public.crm_communications (parent_communication_id);
+create index if not exists idx_crm_communications_thread_occurred
+  on public.crm_communications (thread_key, occurred_at desc, id desc);
+
+create table if not exists public.crm_email_outbox (
+  id text primary key,
+  communication_id text not null unique references public.crm_communications(id) on delete cascade,
+  submission_id uuid not null references public.contact_submissions(id) on delete cascade,
+  cim_request_id text references public.deal_hunter_cim_requests(id) on delete set null,
+  idempotency_key text not null unique,
+  client_request_key text not null unique,
+  state text not null check (state in (
+    'queued', 'sending', 'accepted', 'ambiguous', 'retryable_failed', 'permanent_failed', 'cancelled'
+  )),
+  provider text,
+  provider_message_id text,
+  attempt_count integer not null default 0 check (attempt_count >= 0),
+  next_attempt_at timestamptz,
+  claim_token text,
+  claimed_at timestamptz,
+  claim_expires_at timestamptz,
+  accepted_at timestamptz,
+  failed_at timestamptz,
+  ambiguous_at timestamptz,
+  last_error_category text,
+  last_error_message text,
+  expected_submission_version timestamptz not null,
+  actor text not null,
+  intended_follow_up_state text,
+  intended_next_action_at timestamptz,
+  created_at timestamptz not null,
+  updated_at timestamptz not null,
+  metadata jsonb not null default '{}'::jsonb
+);
+create index if not exists idx_crm_email_outbox_submission_created
+  on public.crm_email_outbox (submission_id, created_at desc);
+create index if not exists idx_crm_email_outbox_claimable
+  on public.crm_email_outbox (state, next_attempt_at, claim_expires_at);
+create index if not exists idx_crm_email_outbox_provider_message
+  on public.crm_email_outbox (provider_message_id);
+
+create table if not exists public.crm_follow_up_recommendations (
+  id text primary key,
+  submission_id uuid not null references public.contact_submissions(id) on delete cascade,
+  cim_request_id text references public.deal_hunter_cim_requests(id) on delete set null,
+  triggering_communication_id text references public.crm_communications(id) on delete set null,
+  input_fingerprint text not null,
+  engine_version text not null,
+  rules_version text not null,
+  model_provider text,
+  model_id text,
+  status text not null check (status in (
+    'current', 'superseded', 'accepted', 'edited_and_accepted', 'dismissed', 'failed'
+  )),
+  conversation_state text not null,
+  intent text not null,
+  action_type text not null,
+  priority_score integer not null default 0 check (priority_score between 0 and 100),
+  confidence numeric not null default 0 check (confidence between 0 and 1),
+  recommended_next_action_at timestamptz,
+  thread_parent_communication_id text references public.crm_communications(id) on delete set null,
+  rationale text not null default '',
+  evidence_json jsonb not null default '[]'::jsonb,
+  signals_json jsonb not null default '[]'::jsonb,
+  commitments_json jsonb not null default '[]'::jsonb,
+  questions_json jsonb not null default '[]'::jsonb,
+  blockers_json jsonb not null default '[]'::jsonb,
+  safety_flags_json jsonb not null default '[]'::jsonb,
+  draft_subject text not null default '',
+  draft_body_text text not null default '',
+  created_at timestamptz not null,
+  expires_at timestamptz,
+  acted_on_at timestamptz,
+  superseded_at timestamptz,
+  acted_on_by text,
+  outcome text,
+  metadata jsonb not null default '{}'::jsonb,
+  unique (submission_id, input_fingerprint, engine_version)
+);
+create index if not exists idx_crm_follow_up_recommendations_submission_created
+  on public.crm_follow_up_recommendations (submission_id, created_at desc);
+create unique index if not exists idx_crm_follow_up_recommendations_one_current
+  on public.crm_follow_up_recommendations (submission_id)
+  where status = 'current';
+
+create table if not exists public.email_suppressions (
+  id text primary key,
+  normalized_email text not null unique,
+  reason text not null check (reason in (
+    'explicit-opt-out', 'complaint', 'hard-bounce', 'admin-block', 'provider-suppression'
+  )),
+  source text not null,
+  source_event_id text,
+  source_communication_id text references public.crm_communications(id) on delete set null,
+  created_at timestamptz not null,
+  created_by text not null,
+  lifted_at timestamptz,
+  lifted_by text,
+  lift_reason text,
+  metadata jsonb not null default '{}'::jsonb
+);
+create index if not exists idx_email_suppressions_active
+  on public.email_suppressions (normalized_email)
+  where lifted_at is null;
 
 do $$
 begin
@@ -2154,6 +2271,9 @@ alter table public.secure_documents enable row level security;
 alter table public.email_events enable row level security;
 alter table public.crm_activity_events enable row level security;
 alter table public.crm_communications enable row level security;
+alter table public.crm_email_outbox enable row level security;
+alter table public.crm_follow_up_recommendations enable row level security;
+alter table public.email_suppressions enable row level security;
 alter table public.deal_hunter_seen_deals enable row level security;
 alter table public.deal_hunter_cim_requests enable row level security;
 alter table public.deal_hunter_cim_reviews enable row level security;
@@ -2186,3 +2306,518 @@ alter default privileges in schema public
   grant all privileges on sequences to service_role;
 alter default privileges in schema public
   grant execute on functions to service_role;
+
+create or replace function public.supersede_crm_follow_up_recommendations_from_related_change()
+returns trigger
+language plpgsql
+volatile
+security invoker
+set search_path = ''
+as $$
+declare
+  v_record jsonb := case when tg_op = 'DELETE' then to_jsonb(old) else to_jsonb(new) end;
+  v_submission_id uuid := case
+    when tg_table_name = 'contact_submissions' then nullif(v_record ->> 'id', '')::uuid
+    else nullif(v_record ->> 'submission_id', '')::uuid
+  end;
+  v_changed_at timestamptz := coalesce(
+    nullif(v_record ->> 'updated_at', '')::timestamptz,
+    nullif(v_record ->> 'created_at', '')::timestamptz,
+    now()
+  );
+begin
+  if v_submission_id is not null then
+    update public.crm_follow_up_recommendations
+    set status = 'superseded', superseded_at = v_changed_at
+    where submission_id = v_submission_id and status = 'current';
+  end if;
+  return case when tg_op = 'DELETE' then old else new end;
+end;
+$$;
+
+drop trigger if exists trg_deal_hunter_cim_supersede_follow_up_recommendation on public.deal_hunter_cim_requests;
+create trigger trg_deal_hunter_cim_supersede_follow_up_recommendation
+after insert or update or delete on public.deal_hunter_cim_requests
+for each row execute function public.supersede_crm_follow_up_recommendations_from_related_change();
+
+drop trigger if exists trg_crm_communication_supersede_follow_up_recommendation on public.crm_communications;
+create trigger trg_crm_communication_supersede_follow_up_recommendation
+after insert or update or delete on public.crm_communications
+for each row execute function public.supersede_crm_follow_up_recommendations_from_related_change();
+
+drop trigger if exists trg_contact_submission_supersede_follow_up_recommendation on public.contact_submissions;
+create trigger trg_contact_submission_supersede_follow_up_recommendation
+after update on public.contact_submissions
+for each row execute function public.supersede_crm_follow_up_recommendations_from_related_change();
+
+drop trigger if exists trg_secure_document_supersede_follow_up_recommendation on public.secure_documents;
+create trigger trg_secure_document_supersede_follow_up_recommendation
+after insert or update or delete on public.secure_documents
+for each row execute function public.supersede_crm_follow_up_recommendations_from_related_change();
+
+revoke all on function public.supersede_crm_follow_up_recommendations_from_related_change() from public, anon, authenticated;
+grant execute on function public.supersede_crm_follow_up_recommendations_from_related_change() to service_role;
+
+create or replace function public.create_crm_email_command(
+  p_communication jsonb,
+  p_outbox jsonb,
+  p_activity jsonb,
+  p_expected_submission_version timestamptz,
+  p_manual_takeover_cim_request_id text default null
+)
+returns jsonb
+language plpgsql
+volatile
+security invoker
+set search_path = ''
+as $$
+declare
+  v_submission public.contact_submissions%rowtype;
+  v_communication public.crm_communications%rowtype;
+  v_outbox public.crm_email_outbox%rowtype;
+  v_existing public.crm_email_outbox%rowtype;
+  v_cim_request public.deal_hunter_cim_requests%rowtype;
+begin
+  select * into v_existing from public.crm_email_outbox
+  where client_request_key = p_outbox ->> 'client_request_key' limit 1;
+  if found then
+    select * into v_communication from public.crm_communications where id = v_existing.communication_id;
+    select * into v_submission from public.contact_submissions where id = v_existing.submission_id;
+    return jsonb_build_object(
+      'applied', false, 'reason', 'duplicate-client-request',
+      'communication', to_jsonb(v_communication), 'outbox', to_jsonb(v_existing),
+      'submission', to_jsonb(v_submission)
+    );
+  end if;
+
+  select * into v_submission from public.contact_submissions
+  where id = (p_outbox ->> 'submission_id')::uuid for update;
+  if not found then return jsonb_build_object('applied', false, 'reason', 'submission-not-found'); end if;
+  if p_expected_submission_version is null or v_submission.updated_at is distinct from p_expected_submission_version then
+    return jsonb_build_object('applied', false, 'reason', 'stale-submission', 'submission', to_jsonb(v_submission));
+  end if;
+  if lower(coalesce(v_submission.status, '')) in ('archived', 'spam') then
+    return jsonb_build_object(
+      'applied', false, 'reason', 'submission-' || lower(v_submission.status),
+      'submission', to_jsonb(v_submission)
+    );
+  end if;
+
+  if nullif(btrim(coalesce(p_manual_takeover_cim_request_id, '')), '') is not null then
+    select * into v_cim_request from public.deal_hunter_cim_requests
+    where id = p_manual_takeover_cim_request_id and submission_id = v_submission.id for update;
+    if not found then
+      return jsonb_build_object('applied', false, 'reason', 'cim-request-not-found', 'submission', to_jsonb(v_submission));
+    end if;
+    if v_cim_request.status in ('pending', 'follow_up_pending') then
+      return jsonb_build_object('applied', false, 'reason', 'cim-send-in-progress', 'submission', to_jsonb(v_submission));
+    end if;
+  end if;
+
+  -- Record the reviewed recommendation decision before a manual takeover
+  -- mutates the linked CIM row and its invalidation trigger runs.
+  update public.crm_follow_up_recommendations
+  set
+    status = case
+      when p_outbox #>> '{metadata,recommendationDecision}' = 'accepted' then 'accepted'
+      when p_outbox #>> '{metadata,recommendationDecision}' = 'edited_and_accepted' then 'edited_and_accepted'
+      when coalesce(draft_subject, '') = coalesce(p_communication ->> 'subject', '')
+        and coalesce(draft_body_text, '') = coalesce(p_communication ->> 'body_text', '')
+      then 'accepted'
+      else 'edited_and_accepted'
+    end,
+    acted_on_at = (p_outbox ->> 'created_at')::timestamptz,
+    acted_on_by = p_outbox ->> 'actor',
+    outcome = 'email-command-created'
+  where id = nullif(p_communication ->> 'recommendation_id', '')
+    and submission_id = (p_outbox ->> 'submission_id')::uuid
+    and status = 'current';
+
+  if nullif(btrim(coalesce(p_manual_takeover_cim_request_id, '')), '') is not null then
+    update public.deal_hunter_cim_requests set
+      request_state = 'manual_takeover', follow_up_state = 'stopped', next_follow_up_at = null,
+      follow_up_count = follow_up_count + 1, updated_at = (p_outbox ->> 'created_at')::timestamptz,
+      last_activity_at = (p_outbox ->> 'created_at')::timestamptz,
+      metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object(
+        'manualTakeoverAt', p_outbox ->> 'created_at', 'manualTakeoverBy', p_outbox ->> 'actor'
+      )
+    where id = v_cim_request.id;
+  end if;
+
+  insert into public.crm_communications
+  select * from jsonb_populate_record(null::public.crm_communications, p_communication)
+  returning * into v_communication;
+  insert into public.crm_email_outbox
+  select * from jsonb_populate_record(null::public.crm_email_outbox, p_outbox)
+  returning * into v_outbox;
+
+  update public.crm_follow_up_recommendations
+  set status = 'superseded', superseded_at = (p_outbox ->> 'created_at')::timestamptz
+  where submission_id = (p_outbox ->> 'submission_id')::uuid
+    and status = 'current';
+
+  insert into public.crm_activity_events
+  select * from jsonb_populate_record(null::public.crm_activity_events, p_activity);
+
+  update public.contact_submissions set updated_at = (p_outbox ->> 'created_at')::timestamptz
+  where id = v_submission.id and updated_at = p_expected_submission_version returning * into v_submission;
+  if not found then
+    raise exception 'The CRM record changed while the email command was being created.' using errcode = '40001';
+  end if;
+  return jsonb_build_object(
+    'applied', true, 'reason', '', 'communication', to_jsonb(v_communication),
+    'outbox', to_jsonb(v_outbox), 'submission', to_jsonb(v_submission)
+  );
+end;
+$$;
+
+create or replace function public.claim_crm_email_outbox(
+  p_id text,
+  p_claim_token text,
+  p_claimed_at timestamptz,
+  p_claim_expires_at timestamptz
+)
+returns jsonb
+language plpgsql
+volatile
+security invoker
+set search_path = ''
+as $$
+declare v_outbox public.crm_email_outbox%rowtype;
+begin
+  if nullif(btrim(coalesce(p_claim_token, '')), '') is null
+     or p_claimed_at is null or p_claim_expires_at is null or p_claim_expires_at <= p_claimed_at then
+    raise exception 'A valid outbox claim token and future lease expiry are required.';
+  end if;
+  update public.crm_email_outbox set
+    state = 'sending', attempt_count = attempt_count + 1, claim_token = p_claim_token,
+    claimed_at = p_claimed_at, claim_expires_at = p_claim_expires_at, updated_at = p_claimed_at
+  where id = p_id and (
+    state = 'queued'
+    or (state = 'retryable_failed' and (next_attempt_at is null or next_attempt_at <= p_claimed_at))
+    or (state = 'sending' and claim_expires_at is not null and claim_expires_at <= p_claimed_at)
+  ) returning * into v_outbox;
+  if found then return jsonb_build_object('claimed', true, 'outbox', to_jsonb(v_outbox)); end if;
+  select * into v_outbox from public.crm_email_outbox where id = p_id;
+  return jsonb_build_object('claimed', false, 'outbox', to_jsonb(v_outbox));
+end;
+$$;
+
+create or replace function public.finish_crm_email_outbox_claim(
+  p_id text,
+  p_claim_token text,
+  p_values jsonb
+)
+returns jsonb
+language plpgsql
+volatile
+security invoker
+set search_path = ''
+as $$
+declare
+  v_outbox public.crm_email_outbox%rowtype;
+  v_state text := p_values ->> 'state';
+begin
+  if v_state not in ('accepted', 'ambiguous', 'retryable_failed', 'permanent_failed', 'cancelled') then
+    raise exception 'Invalid final outbox state.';
+  end if;
+  update public.crm_email_outbox set
+    state = v_state,
+    provider = case when p_values ? 'provider' then nullif(p_values ->> 'provider', '') else provider end,
+    provider_message_id = case when p_values ? 'provider_message_id' then nullif(p_values ->> 'provider_message_id', '') else provider_message_id end,
+    next_attempt_at = case when p_values ? 'next_attempt_at' then nullif(p_values ->> 'next_attempt_at', '')::timestamptz else next_attempt_at end,
+    accepted_at = case when p_values ? 'accepted_at' then nullif(p_values ->> 'accepted_at', '')::timestamptz else accepted_at end,
+    failed_at = case when p_values ? 'failed_at' then nullif(p_values ->> 'failed_at', '')::timestamptz else failed_at end,
+    ambiguous_at = case when p_values ? 'ambiguous_at' then nullif(p_values ->> 'ambiguous_at', '')::timestamptz else ambiguous_at end,
+    last_error_category = case when p_values ? 'last_error_category' then nullif(p_values ->> 'last_error_category', '') else last_error_category end,
+    last_error_message = case when p_values ? 'last_error_message' then nullif(p_values ->> 'last_error_message', '') else last_error_message end,
+    updated_at = coalesce(nullif(p_values ->> 'updated_at', '')::timestamptz, now()),
+    metadata = case when p_values ? 'metadata' then coalesce(p_values -> 'metadata', '{}'::jsonb) else metadata end,
+    claim_token = null, claimed_at = null, claim_expires_at = null
+  where id = p_id and claim_token = p_claim_token and state = 'sending'
+  returning * into v_outbox;
+  return to_jsonb(v_outbox);
+end;
+$$;
+
+revoke all on function public.create_crm_email_command(jsonb, jsonb, jsonb, timestamptz, text)
+  from public, anon, authenticated;
+grant execute on function public.create_crm_email_command(jsonb, jsonb, jsonb, timestamptz, text)
+  to service_role;
+revoke all on function public.claim_crm_email_outbox(text, text, timestamptz, timestamptz)
+  from public, anon, authenticated;
+grant execute on function public.claim_crm_email_outbox(text, text, timestamptz, timestamptz)
+  to service_role;
+revoke all on function public.finish_crm_email_outbox_claim(text, text, jsonb)
+  from public, anon, authenticated;
+grant execute on function public.finish_crm_email_outbox_claim(text, text, jsonb)
+  to service_role;
+
+create index if not exists idx_contact_submissions_follow_up_queue
+  on public.contact_submissions (status, follow_up_state, next_action_at, updated_at desc);
+
+create or replace function public.count_crm_follow_up_sends(
+  p_recipient text default '',
+  p_since timestamptz default null
+)
+returns bigint
+language sql
+stable
+security invoker
+set search_path = public
+as $$
+  select count(*)::bigint
+  from public.crm_email_outbox as outbox
+  join public.crm_communications as communication on communication.id = outbox.communication_id
+  where communication.kind = 'crm-follow-up'
+    and outbox.state not in ('permanent_failed', 'cancelled')
+    and (p_since is null or outbox.created_at >= p_since)
+    and (
+      btrim(coalesce(p_recipient, '')) = ''
+      or exists (
+        select 1
+        from jsonb_array_elements_text(coalesce(communication.to_addresses, '[]'::jsonb)) as recipient(value)
+        where lower(recipient.value) = lower(btrim(p_recipient))
+      )
+    );
+$$;
+
+revoke all on function public.count_crm_follow_up_sends(text, timestamptz) from public, anon, authenticated;
+grant execute on function public.count_crm_follow_up_sends(text, timestamptz) to service_role;
+
+create or replace function public.get_crm_follow_up_operational_metrics(
+  p_since timestamptz default '1970-01-01T00:00:00Z'::timestamptz
+)
+returns jsonb
+language sql
+stable
+security invoker
+set search_path = public
+as $$
+  select jsonb_build_object(
+    'windowStartedAt', p_since,
+    'outbox', jsonb_build_object(
+      'queued', (select count(*) from public.crm_email_outbox where created_at >= p_since and state = 'queued'),
+      'sending', (select count(*) from public.crm_email_outbox where created_at >= p_since and state = 'sending'),
+      'accepted', (select count(*) from public.crm_email_outbox where created_at >= p_since and state = 'accepted'),
+      'ambiguous', (select count(*) from public.crm_email_outbox where created_at >= p_since and state = 'ambiguous'),
+      'retryableFailed', (select count(*) from public.crm_email_outbox where created_at >= p_since and state = 'retryable_failed'),
+      'permanentFailed', (select count(*) from public.crm_email_outbox where created_at >= p_since and state = 'permanent_failed'),
+      'cancelled', (select count(*) from public.crm_email_outbox where created_at >= p_since and state = 'cancelled')
+    ),
+    'delivery', jsonb_build_object(
+      'delivered', (select count(*) from public.crm_communications where occurred_at >= p_since and kind = 'crm-follow-up' and direction = 'outbound' and delivery_state = 'delivered'),
+      'delayed', (select count(*) from public.crm_communications where occurred_at >= p_since and kind = 'crm-follow-up' and direction = 'outbound' and delivery_state = 'delayed'),
+      'bounced', (select count(*) from public.crm_communications where occurred_at >= p_since and kind = 'crm-follow-up' and direction = 'outbound' and delivery_state = 'bounced'),
+      'complained', (select count(*) from public.crm_communications where occurred_at >= p_since and kind = 'crm-follow-up' and direction = 'outbound' and delivery_state = 'complained'),
+      'failed', (select count(*) from public.crm_communications where occurred_at >= p_since and kind = 'crm-follow-up' and direction = 'outbound' and delivery_state = 'failed'),
+      'replied', (
+        select count(*) from public.crm_communications as outbound
+        where outbound.occurred_at >= p_since and outbound.kind = 'crm-follow-up' and outbound.direction = 'outbound'
+          and exists (
+            select 1 from public.crm_communications as inbound
+            where inbound.direction = 'inbound'
+              and inbound.submission_id = outbound.submission_id
+              and inbound.occurred_at >= outbound.occurred_at
+              and (
+                inbound.parent_communication_id = outbound.id
+                or (outbound.message_id is not null and inbound.in_reply_to = outbound.message_id)
+                or (outbound.thread_key is not null and inbound.thread_key = outbound.thread_key)
+              )
+          )
+      )
+    ),
+    'recommendations', jsonb_build_object(
+      'current', (select count(*) from public.crm_follow_up_recommendations where created_at >= p_since and status = 'current'),
+      'accepted', (select count(*) from public.crm_follow_up_recommendations where created_at >= p_since and status = 'accepted'),
+      'editedAndAccepted', (select count(*) from public.crm_follow_up_recommendations where created_at >= p_since and status = 'edited_and_accepted'),
+      'dismissed', (select count(*) from public.crm_follow_up_recommendations where created_at >= p_since and status = 'dismissed'),
+      'superseded', (select count(*) from public.crm_follow_up_recommendations where created_at >= p_since and status = 'superseded'),
+      'failed', (select count(*) from public.crm_follow_up_recommendations where created_at >= p_since and status = 'failed'),
+      'aiUsed', (select count(*) from public.crm_follow_up_recommendations where created_at >= p_since and model_provider is not null),
+      'aiFallback', (select count(*) from public.crm_follow_up_recommendations where created_at >= p_since and metadata ->> 'aiRequested' = 'true' and metadata ->> 'aiUsed' = 'false')
+    ),
+    'suppressions', jsonb_build_object(
+      'active', (select count(*) from public.email_suppressions where lifted_at is null)
+    )
+  );
+$$;
+
+revoke all on function public.get_crm_follow_up_operational_metrics(timestamptz) from public, anon, authenticated;
+grant execute on function public.get_crm_follow_up_operational_metrics(timestamptz) to service_role;
+
+create or replace function public.list_follow_up_submissions_page(
+  p_limit integer default 25,
+  p_page integer default 1,
+  p_search text default '',
+  p_view text default 'crm-actions',
+  p_sort text default 'urgency',
+  p_direction text default 'desc',
+  p_now timestamptz default now(),
+  p_today_start timestamptz default now(),
+  p_today_end timestamptz default now()
+)
+returns jsonb
+language sql
+stable
+security invoker
+set search_path = public
+as $$
+  with parameters as (
+    select
+      greatest(1, least(coalesce(p_limit, 25), 100)) as page_limit,
+      greatest(0, coalesce(p_page, 1) - 1)::bigint
+        * greatest(1, least(coalesce(p_limit, 25), 100))::bigint as page_offset,
+      lower(trim(coalesce(p_search, ''))) as search_text,
+      lower(trim(coalesce(p_view, 'crm-actions'))) as selected_view,
+      lower(trim(coalesce(p_sort, 'urgency'))) as selected_sort,
+      case when lower(p_direction) = 'asc' then 'asc' else 'desc' end as selected_direction
+  ),
+  base as (
+    select
+      submission.*,
+      latest_communication.subject as follow_up_latest_subject,
+      latest_communication.direction as follow_up_latest_direction,
+      latest_outbound.delivery_state as follow_up_latest_delivery_state,
+      latest_communication.occurred_at as follow_up_latest_communication_at,
+      latest_deal.deal_key as follow_up_deal_key,
+      current_recommendation.id as follow_up_recommendation_id,
+      current_recommendation.action_type as follow_up_recommendation_action,
+      current_recommendation.conversation_state as follow_up_conversation_state,
+      current_recommendation.priority_score as follow_up_priority_score,
+      current_recommendation.confidence as follow_up_confidence
+    from public.contact_submissions as submission
+    left join lateral (
+      select communication.subject, communication.direction, communication.occurred_at
+      from public.crm_communications as communication
+      where communication.submission_id = submission.id
+      order by communication.occurred_at desc, communication.id desc
+      limit 1
+    ) as latest_communication on true
+    left join lateral (
+      select communication.delivery_state
+      from public.crm_communications as communication
+      where communication.submission_id = submission.id
+        and communication.direction = 'outbound'
+      order by communication.occurred_at desc, communication.id desc
+      limit 1
+    ) as latest_outbound on true
+    left join lateral (
+      select communication.deal_key
+      from public.crm_communications as communication
+      where communication.submission_id = submission.id
+        and communication.deal_key is not null
+      order by communication.occurred_at desc, communication.id desc
+      limit 1
+    ) as latest_deal on true
+    left join lateral (
+      select recommendation.id, recommendation.action_type, recommendation.conversation_state,
+        recommendation.priority_score, recommendation.confidence
+      from public.crm_follow_up_recommendations as recommendation
+      where recommendation.submission_id = submission.id
+        and recommendation.status = 'current'
+        and (recommendation.expires_at is null or recommendation.expires_at > p_now)
+      order by recommendation.created_at desc, recommendation.id desc
+      limit 1
+    ) as current_recommendation on true
+  ),
+  filtered as (
+    select base.*
+    from base cross join parameters
+    where base.status not in ('archived', 'spam')
+      and case parameters.selected_view
+        when 'completed' then base.follow_up_state = 'completed'
+        when 'due-today' then base.follow_up_state <> 'completed'
+          and base.next_action_at >= p_today_start and base.next_action_at < p_today_end
+        when 'overdue' then base.follow_up_state <> 'completed'
+          and base.next_action_at is not null and base.next_action_at < p_today_start
+        when 'awaiting-reply' then base.follow_up_state <> 'completed'
+          and (base.follow_up_state = 'waiting-on-owner' or base.follow_up_latest_direction = 'outbound')
+        when 'inbound-reply' then base.follow_up_state <> 'completed'
+          and base.follow_up_latest_direction = 'inbound'
+        when 'delivery-problem' then base.follow_up_state <> 'completed'
+          and base.follow_up_latest_delivery_state in ('delayed', 'bounced', 'failed', 'complained', 'suppressed')
+        when 'manual-review' then base.follow_up_state <> 'completed'
+          and base.follow_up_recommendation_action = 'manual_review'
+        when 'email-triage' then base.follow_up_state <> 'completed'
+          and (
+            base.follow_up_latest_direction = 'inbound'
+            or base.follow_up_latest_delivery_state in ('delayed', 'bounced', 'failed', 'complained', 'suppressed')
+          )
+        when 'all' then true
+        else base.follow_up_state <> 'completed'
+      end
+      and (
+        parameters.search_text = ''
+        or position(parameters.search_text in lower(concat_ws(' ',
+          base.company, base.name, base.email, base.broker_name, base.broker_email,
+          base.seller_name, base.seller_email, base.listing_url,
+          base.follow_up_latest_subject, base.follow_up_deal_key
+        ))) > 0
+        or exists (
+          select 1
+          from public.crm_communications as search_communication
+          where search_communication.submission_id = base.id
+            and position(parameters.search_text in lower(concat_ws(' ',
+              search_communication.subject, search_communication.deal_key
+            ))) > 0
+        )
+      )
+  ),
+  ordered as (
+    select
+      filtered.*,
+      row_number() over (
+        order by
+          case when parameters.selected_sort = 'urgency' then
+            case
+              when filtered.follow_up_latest_delivery_state in ('bounced', 'failed', 'complained', 'suppressed') then 4
+              when filtered.follow_up_latest_direction = 'inbound' then 3
+              when filtered.next_action_at is not null and filtered.next_action_at < p_now then 2
+              else 1
+            end
+          end desc nulls last,
+          case when parameters.selected_sort = 'urgency' then coalesce(filtered.follow_up_priority_score, 0) end desc nulls last,
+          case when parameters.selected_sort = 'next_action_at' and parameters.selected_direction = 'asc' then filtered.next_action_at end asc nulls last,
+          case when parameters.selected_sort = 'next_action_at' and parameters.selected_direction = 'desc' then filtered.next_action_at end desc nulls last,
+          case when parameters.selected_sort = 'updated_at' and parameters.selected_direction = 'asc' then filtered.updated_at end asc,
+          case when parameters.selected_sort = 'updated_at' and parameters.selected_direction = 'desc' then filtered.updated_at end desc,
+          case when parameters.selected_sort = 'company' and parameters.selected_direction = 'asc' then lower(coalesce(filtered.company, filtered.name, '')) end asc,
+          case when parameters.selected_sort = 'company' and parameters.selected_direction = 'desc' then lower(coalesce(filtered.company, filtered.name, '')) end desc,
+          case when parameters.selected_sort = 'priority' and parameters.selected_direction = 'asc' then
+            case filtered.priority when 'urgent' then 5 when 'high' then 4 when 'medium' then 3 when 'normal' then 2 when 'low' then 1 else 0 end
+          end asc,
+          case when parameters.selected_sort = 'priority' and parameters.selected_direction = 'desc' then
+            case filtered.priority when 'urgent' then 5 when 'high' then 4 when 'medium' then 3 when 'normal' then 2 when 'low' then 1 else 0 end
+          end desc,
+          case when parameters.selected_sort = 'created_at' and parameters.selected_direction = 'asc' then filtered.created_at end asc,
+          case when parameters.selected_sort = 'created_at' and parameters.selected_direction = 'desc' then filtered.created_at end desc,
+          filtered.next_action_at asc nulls last,
+          filtered.updated_at desc,
+          filtered.id asc
+      ) as page_position
+    from filtered cross join parameters
+  ),
+  paged as (
+    select ordered.*
+    from ordered cross join parameters
+    order by ordered.page_position
+    limit greatest(1, least(coalesce(p_limit, 25), 100))
+    offset greatest(0, coalesce(p_page, 1) - 1)::bigint
+      * greatest(1, least(coalesce(p_limit, 25), 100))::bigint
+  )
+  select jsonb_build_object(
+    'rows', coalesce(
+      (select jsonb_agg(to_jsonb(paged) - 'page_position' order by page_position) from paged),
+      '[]'::jsonb
+    ),
+    'total', (select count(*) from filtered)
+  );
+$$;
+
+revoke all on function public.list_follow_up_submissions_page(
+  integer, integer, text, text, text, text, timestamptz, timestamptz, timestamptz
+) from public, anon, authenticated;
+grant execute on function public.list_follow_up_submissions_page(
+  integer, integer, text, text, text, text, timestamptz, timestamptz, timestamptz
+) to service_role;

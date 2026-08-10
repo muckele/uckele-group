@@ -58,6 +58,8 @@ const maxIngestionAttempts = 10;
 const ingestionRetryDelayMs = 15 * 60 * 1000;
 const ingestionClaimLeaseMs = 5 * 60 * 1000;
 const maxListPage = 10_000;
+const maxReferencesCount = 20;
+const maxReferencesLength = 2_000;
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const manualWorkflowWarnings = {
@@ -112,6 +114,44 @@ function boundedObject(value, maxBytes = maxMetadataBytes) {
   const normalized = objectValue(value);
   const json = JSON.stringify(normalized);
   return Buffer.byteLength(json, 'utf8') <= maxBytes ? normalized : { truncated: true };
+}
+
+function normalizeMessageId(value = '') {
+  const normalized = compactText(value, 500);
+  return normalized.startsWith('<') && normalized.endsWith('>') ? normalized : '';
+}
+
+function normalizeReferences(value) {
+  const values = Array.isArray(value)
+    ? value
+    : String(value || '').match(/<[^<>\r\n]{1,498}>/g) || [];
+  const seen = new Set();
+  const result = [];
+  for (const item of values) {
+    const messageId = normalizeMessageId(item);
+    if (!messageId || seen.has(messageId)) continue;
+    if (result.join(' ').length + messageId.length + 1 > maxReferencesLength) break;
+    seen.add(messageId);
+    result.push(messageId);
+    if (result.length >= maxReferencesCount) break;
+  }
+  return result;
+}
+
+function normalizeHeaders(value) {
+  const headers = objectValue(value);
+  const normalized = Object.create(null);
+  let totalBytes = 0;
+  for (const [rawName, rawValue] of Object.entries(headers)) {
+    const name = compactText(rawName, 120).toLowerCase();
+    if (!name) continue;
+    const headerValue = compactText(Array.isArray(rawValue) ? rawValue.join(' ') : rawValue, 2_000);
+    const nextBytes = Buffer.byteLength(name, 'utf8') + Buffer.byteLength(headerValue, 'utf8');
+    if (totalBytes + nextBytes > 16 * 1024) break;
+    normalized[name] = headerValue;
+    totalBytes += nextBytes;
+  }
+  return normalized;
 }
 
 function nextVersionTimestamp(previousValue = '') {
@@ -240,7 +280,16 @@ function normalizeCommunicationRecord(input = {}, { strict = false } = {}) {
     provider_message_id: compactText(input.provider_message_id ?? input.providerMessageId, 240) || null,
     source_event_id: compactText(input.source_event_id ?? input.sourceEventId, 240) || null,
     idempotency_key: compactText(input.idempotency_key ?? input.idempotencyKey, 300) || null,
-    in_reply_to: compactText(input.in_reply_to ?? input.inReplyTo, 500) || null,
+    message_id: normalizeMessageId(input.message_id ?? input.messageId) || null,
+    in_reply_to: normalizeMessageId(input.in_reply_to ?? input.inReplyTo) || null,
+    references_json: normalizeReferences(input.references_json ?? input.references),
+    parent_communication_id: compactText(input.parent_communication_id ?? input.parentCommunicationId, 120) || null,
+    thread_key: compactText(input.thread_key ?? input.threadKey, 500) || null,
+    legacy_content_unavailable: Boolean(input.legacy_content_unavailable ?? input.legacyContentUnavailable),
+    content_redaction_state: compactText(input.content_redaction_state ?? input.contentRedactionState, 60) || 'none',
+    recommendation_id: compactText(input.recommendation_id ?? input.recommendationId, 120) || null,
+    outbox_id: compactText(input.outbox_id ?? input.outboxId, 120) || null,
+    headers_json: normalizeHeaders(input.headers_json ?? input.headers),
     reply_to_address: extractEmail(input.reply_to_address ?? input.replyToAddress) || null,
     from_address: extractEmail(input.from_address ?? input.fromAddress) || null,
     to_addresses: toAddresses,
@@ -326,6 +375,10 @@ export async function createCommunicationWithActivity({ communication, actor = '
     },
   });
   if (!mutation.applied || !mutation.record) throw new Error('Communication could not be saved with its activity record.');
+  await storage.supersedeCrmFollowUpRecommendations?.(
+    normalized.submission_id,
+    normalized.occurred_at || new Date().toISOString(),
+  );
   return mutation.record;
 }
 
@@ -535,7 +588,9 @@ function requestIdFromInboundRecipient(value) {
   return address.match(/^cim-([a-z0-9_-]{8,64})@/i)?.[1]?.toLowerCase() || '';
 }
 
-async function resolveInboundAssignment(storage, { recipients = [], fromAddress = '', explicitSubmissionId = '' } = {}) {
+async function resolveInboundAssignment(storage, {
+  recipients = [], fromAddress = '', explicitSubmissionId = '', inReplyTo = '', references = [],
+} = {}) {
   for (const recipient of recipients) {
     const alias = extractEmail(recipient);
     const requestToken = requestIdFromInboundRecipient(alias);
@@ -544,6 +599,23 @@ async function resolveInboundAssignment(storage, { recipients = [], fromAddress 
     if (request?.submission_id) {
       return { submissionId: request.submission_id, request, method: 'cim-reply-alias' };
     }
+  }
+
+  const rfcCandidates = normalizeReferences([inReplyTo, ...normalizeReferences(references)]);
+  const matchedParents = [];
+  for (const messageId of rfcCandidates) {
+    const parent = await storage.getCrmCommunicationByMessageId?.(messageId);
+    if (parent?.submission_id) matchedParents.push(parent);
+  }
+  const rfcSubmissionIds = Array.from(new Set(matchedParents.map((parent) => parent.submission_id)));
+  if (rfcSubmissionIds.length === 1) {
+    const parent = matchedParents.find((candidate) => candidate.submission_id === rfcSubmissionIds[0]);
+    return {
+      submissionId: rfcSubmissionIds[0],
+      request: parent?.cim_request_id ? await storage.getDealHunterCimRequestById?.(parent.cim_request_id) : null,
+      parent,
+      method: 'rfc-thread',
+    };
   }
 
   if (uuidPattern.test(explicitSubmissionId || '')) {
@@ -644,6 +716,7 @@ function inboundCommunicationFromWebhook(event, assignment) {
     provider: event.provider || 'resend',
     provider_message_id: metadata.resendEmailId || event.message_id,
     source_event_id: event.provider_event_id,
+    message_id: metadata.inboundMessageId,
     from_address: metadata.fromEmail || event.recipient_email,
     to_addresses: metadata.to,
     reply_to_address: metadata.replyTo,
@@ -655,6 +728,8 @@ function inboundCommunicationFromWebhook(event, assignment) {
     content_next_attempt_at: new Date().toISOString(),
     created_by: 'resend-webhook',
     updated_by: 'resend-webhook',
+    parent_communication_id: assignment.parent?.id,
+    thread_key: assignment.parent?.thread_key,
     metadata: { assignmentMethod: assignment.method, emailEventId: event.id },
   });
 }
@@ -704,15 +779,40 @@ async function markCimResponded(storage, request, communication) {
 
 async function updateInboundContent(storage, communication, received) {
   const email = received.email || {};
-  const headers = objectValue(email.headers);
+  const headers = normalizeHeaders(email.headers);
   const plainText = text(email.text || htmlToPlainText(email.html), maxBodyTextLength);
   const now = new Date().toISOString();
+  const messageId = normalizeMessageId(headers['message-id'] || headers.message_id);
+  const inReplyTo = normalizeMessageId(headers['in-reply-to'] || headers.in_reply_to);
+  const references = normalizeReferences(headers.references);
+  let parent = null;
+  for (const rfcId of normalizeReferences([inReplyTo, ...references]).reverse()) {
+    const candidate = await storage.getCrmCommunicationByMessageId?.(rfcId);
+    if (candidate && (!communication.submission_id || candidate.submission_id === communication.submission_id)) {
+      parent = candidate;
+      break;
+    }
+  }
   const updates = {
     submission_id: communication.submission_id,
     deal_key: communication.deal_key,
     cim_request_id: communication.cim_request_id,
     provider_message_id: compactText(email.id, 240) || communication.provider_message_id,
-    in_reply_to: compactText(headers['in-reply-to'] || headers.in_reply_to, 500) || communication.in_reply_to,
+    message_id: messageId || communication.message_id,
+    in_reply_to: inReplyTo || communication.in_reply_to,
+    references_json: references.length > 0 ? references : communication.references_json,
+    parent_communication_id: parent?.id || communication.parent_communication_id,
+    thread_key: parent?.thread_key || communication.thread_key
+      || `${communication.submission_id || 'unassigned'}:${extractEmail(email.from) || communication.from_address || 'unknown'}`,
+    headers_json: {
+      ...headers,
+      from: compactText(email.from, 500),
+      to: normalizeCommunicationAddresses(email.to).join(', '),
+      cc: normalizeCommunicationAddresses(email.cc).join(', '),
+      bcc: normalizeCommunicationAddresses(email.bcc).join(', '),
+      'reply-to': normalizeCommunicationAddresses(email.reply_to).join(', '),
+      subject: compactText(email.subject, maxSubjectLength),
+    },
     reply_to_address: normalizeCommunicationAddresses(email.reply_to)[0] || communication.reply_to_address,
     from_address: extractEmail(email.from) || communication.from_address,
     to_addresses: normalizeCommunicationAddresses(email.to).length ? normalizeCommunicationAddresses(email.to) : communication.to_addresses,
@@ -734,11 +834,46 @@ async function updateInboundContent(storage, communication, received) {
       htmlDiscarded: Boolean(email.html),
       contentRetrievedAt: now,
       attachmentCount: received.attachments.length,
-      messageId: compactText(headers['message-id'] || headers.message_id, 500),
-      references: compactText(headers.references, 2000),
+      messageId,
+      references: references.join(' '),
     },
   };
-  return storage.updateCrmCommunication(communication.id, updates);
+  const updated = await storage.updateCrmCommunication(communication.id, updates);
+  if (updated?.submission_id) await storage.supersedeCrmFollowUpRecommendations?.(updated.submission_id, now);
+  return updated;
+}
+
+async function applyObviousInboundOptOut(storage, communication) {
+  const analysisText = String(communication?.body_text || '')
+    .split(/^\s*On .+wrote:\s*$/im)[0]
+    .split('\n')
+    .filter((line) => !/^\s*>/.test(line))
+    .join('\n')
+    .slice(0, 10_000);
+  if (!/(?:^|\b)(?:unsubscribe|remove me|do not (?:email|contact) me|stop contacting me|stop (?:all )?(?:email(?:ing)?|outreach))(?:\b|[.!?]*\s*$)/i.test(analysisText)
+    && !/^\s*stop[.!?]*\s*$/i.test(analysisText)) {
+    return null;
+  }
+  const suppressedEmail = extractEmail(communication.from_address);
+  if (!suppressedEmail || !storage.upsertEmailSuppression) return null;
+  const suppression = await storage.upsertEmailSuppression({
+    id: randomUUID(),
+    normalized_email: suppressedEmail,
+    reason: 'explicit-opt-out',
+    source: 'inbound-content',
+    source_event_id: communication.source_event_id,
+    source_communication_id: communication.id,
+    created_at: communication.occurred_at || new Date().toISOString(),
+    created_by: 'resend-ingestion',
+    metadata: { evidenceCommunicationId: communication.id },
+  });
+  if (communication.submission_id) {
+    await storage.supersedeCrmFollowUpRecommendations?.(
+      communication.submission_id,
+      communication.occurred_at || new Date().toISOString(),
+    );
+  }
+  return suppression;
 }
 
 async function markInboundContentFailed(storage, communication) {
@@ -775,6 +910,8 @@ async function resolveAndAssignInboundCommunication({ storage, communication, re
     recipients: received?.email?.to || fallbackRecipients,
     fromAddress: extractEmail(received?.email?.from) || communication.from_address,
     explicitSubmissionId: '',
+    inReplyTo: normalizeHeaders(received?.email?.headers)['in-reply-to'],
+    references: normalizeHeaders(received?.email?.headers).references,
   });
   if (!fullAssignment.submissionId) return { communication, assignment: fullAssignment };
 
@@ -835,6 +972,9 @@ export async function ingestResendReceivedEmail({ event, storage = getStorage(),
         }, storage)
       : await storage.insertCrmCommunication(placeholder);
   }
+  if (communication.submission_id) {
+    await storage.supersedeCrmFollowUpRecommendations?.(communication.submission_id, communication.occurred_at || new Date().toISOString());
+  }
 
   // The signed reply alias is enough to stop outreach safely. Message content
   // retrieval may retry later, but follow-ups must not continue meanwhile.
@@ -859,6 +999,7 @@ export async function ingestResendReceivedEmail({ event, storage = getStorage(),
     assignment.request = resolved.assignment.request;
     assignment.method = resolved.assignment.method;
     const updated = await updateInboundContent(storage, communication, received);
+    await applyObviousInboundOptOut(storage, updated);
     await markCimResponded(storage, assignment.request, updated);
     return { ok: true, accepted: true, communication: updated };
   } catch {
@@ -883,6 +1024,7 @@ export async function retryPendingInboundIngestion({ storage = getStorage(), lim
       const received = await fetchReceivedEmail(communication.provider_message_id, { fetcher });
       const resolved = await resolveAndAssignInboundCommunication({ storage, communication, received });
       const updated = await updateInboundContent(storage, resolved.communication, received);
+      await applyObviousInboundOptOut(storage, updated);
       await markCimResponded(storage, resolved.assignment.request, updated);
       results.push({ id: communication.id, status: 'complete', communication: updated });
     } catch {
@@ -969,6 +1111,10 @@ export async function applyEmailLifecycleToCommunication(event, { storage = getS
   if (!communication && event.message_id) {
     communication = await storage.getCrmCommunicationByProviderMessage?.(event.provider, event.message_id, 'outbound');
   }
+  if (!communication && event.message_id && storage.getCrmEmailOutboxByProviderMessageId) {
+    const outbox = await storage.getCrmEmailOutboxByProviderMessageId(event.message_id);
+    if (outbox?.communication_id) communication = await storage.getCrmCommunication?.(outbox.communication_id);
+  }
   if (!communication && tracking.cimRequestId) {
     const matches = await storage.listCrmCommunications?.({ cimRequestId: tracking.cimRequestId, page: 1, pageSize: 10 });
     communication = (matches?.rows || []).find((row) => row.direction === 'outbound') || null;
@@ -1008,12 +1154,39 @@ export async function applyEmailLifecycleToCommunication(event, { storage = getS
 
   const updated = await storage.updateCrmCommunication(communication.id, {
     provider_message_id: event.message_id || communication.provider_message_id,
+    message_id: normalizeMessageId(event.metadata?.inboundMessageId) || communication.message_id,
     source_event_id: event.provider_event_id || communication.source_event_id,
     delivery_state: state,
     delivery_state_at: eventAt,
     updated_at: new Date().toISOString(),
     updated_by: 'email-webhook',
   });
+  if (updated?.submission_id) {
+    await storage.supersedeCrmFollowUpRecommendations?.(updated.submission_id, eventAt);
+  }
+
+  if (['complained', 'bounced', 'suppressed'].includes(state) && storage.upsertEmailSuppression) {
+    const normalizedEmail = extractEmail(event.recipient_email)
+      || normalizeCommunicationAddresses(updated.to_addresses)[0];
+    if (normalizedEmail) {
+      const reason = state === 'complained'
+        ? 'complaint'
+        : state === 'bounced'
+          ? 'hard-bounce'
+          : 'provider-suppression';
+      await storage.upsertEmailSuppression({
+        id: randomUUID(),
+        normalized_email: normalizedEmail,
+        reason,
+        source: 'provider-lifecycle',
+        source_event_id: event.provider_event_id || event.id || null,
+        source_communication_id: updated.id,
+        created_at: eventAt,
+        created_by: 'email-webhook',
+        metadata: { deliveryState: state, communicationId: updated.id },
+      });
+    }
+  }
 
   if (updated.cim_request_id && requestDeliveryStates.has(state)) {
     const request = await storage.getDealHunterCimRequestById?.(updated.cim_request_id);

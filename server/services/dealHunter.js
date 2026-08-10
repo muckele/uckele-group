@@ -3993,6 +3993,31 @@ async function processCimFollowUpRequest(storage, request, nowIso) {
       }
     }
 
+    const activeSuppression = await storage.getActiveEmailSuppression?.(request.recipient_email);
+    if (activeSuppression) {
+      const stoppedRequest = await upsertCimRequestWithActivity(
+        storage,
+        buildCimRequestStorageUpdate(request, {
+          request_state: 'stopped',
+          follow_up_state: 'stopped',
+          next_follow_up_at: null,
+          last_activity_at: nowIso,
+          metadata: {
+            ...(request.metadata || {}),
+            suppressionReason: activeSuppression.reason,
+            suppressionId: activeSuppression.id,
+          },
+        }),
+        {
+          eventType: 'cim.outreach-suppressed',
+          summary: 'CIM outreach stopped by the global email suppression policy.',
+          actor: 'email-suppression-policy',
+          metadata: { suppressionId: activeSuppression.id, reason: activeSuppression.reason },
+        },
+      );
+      return { status: 'stopped', request: stoppedRequest };
+    }
+
     const events = await loadCimRequestEvents(storage, request);
     const replyEvent = findCimReplyEvent(request, events);
 
@@ -4617,6 +4642,17 @@ async function sendCimRequestForScoredDeal({
         status: 409,
         error: archivedCimUnavailableReason,
         deal: publicDealWithUnavailableCim(deal, archivedCimUnavailableReason, retryOfRequest ? [retryOfRequest] : []),
+      };
+    }
+
+    const activeSuppression = await storage.getActiveEmailSuppression?.(recipientEmail);
+    if (activeSuppression) {
+      return {
+        ok: false,
+        status: 422,
+        error: 'This recipient is globally suppressed from outreach. No CIM email was transmitted.',
+        suppression: { reason: activeSuppression.reason, createdAt: activeSuppression.created_at },
+        deal: publicDeal(attachCimRequestStatus([deal], retryOfRequest ? [retryOfRequest] : [])[0]),
       };
     }
 

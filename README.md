@@ -7,11 +7,11 @@ The production deployment is designed to run economically on Fly.io with SQLite 
 ## What is included
 
 - Public acquisition site with responsive pages, accessible navigation, privacy language, contact intake, metadata, sitemap, and pre-rendered SEO heads.
-- Paginated CRM with URL-persisted search, filtering, sorting, page size, accurate totals, follow-ups, CSV export, and deal rooms.
+- Paginated CRM with URL-persisted search, filtering, sorting, page size, accurate totals, a human-reviewed follow-up workspace, CSV export, and deal rooms.
 - Durable deal activity events for CRM changes, email delivery and replies, CIM activity, diligence, and secure-document actions.
 - Deal Hunter review workflow with source health, daily delivery history, CIM requests, and acquisition-command-center feedback.
 - Secure Documents v2 with expiring request links, requested-document checklists, multiple batches, per-file categories, revocation, individual deletion, and NDA acknowledgment.
-- Operations center with scheduler history, source-health history, audit events, cleanup failures, database and disk status, and backup status.
+- Operations center with scheduler history, source-health history, audit events, cleanup failures, CRM email readiness and learning metrics, database and disk status, and backup status.
 - Application-consistent SQLite backup bundles with secure-document manifests, checksums, integrity verification, retention, restore tooling, and a recovery drill.
 - Single-use magic links and server-side, revocable admin sessions, including sign-out-all-sessions and automatic expired-record cleanup.
 
@@ -113,10 +113,13 @@ Copy `.env.example` and configure only the providers you use. Important groups a
 - Authentication: `ADMIN_AUTH_MODE`, administrator identity, unique session and magic-link secrets, session lifetime, and optional viewer access.
 - Secure documents: a unique token secret, storage directory, request lifetime, and upload limits.
 - Deal Hunter: source configuration, recipient, schedule, and optional automated CIM follow-ups.
+- Human-reviewed follow-ups: `FOLLOW_UP_EMAIL_ENABLED`, optional `FOLLOW_UP_AI_ENABLED`, sender/reply identity, send windows, caps, cadence, postal footer, and opt-out settings. Both feature flags default to `false`.
 - Protection: Turnstile, request limits, rate limiting, and spam thresholds.
 - Backup: enabled state, private bundle directory, retention limits, daily time, timezone, and scheduler interval.
 
 Production validation intentionally rejects missing or weak authentication secrets, reused secure-document secrets, unusable login configuration, and development-only delivery providers.
+
+The generic CRM email action and AI enrichment flags are independent. Deterministic recommendations remain available when AI is disabled or degraded, and no recommendation may send an email. Before enabling either flag, use the staged checklist in [docs/follow-up-operations.md](docs/follow-up-operations.md).
 
 ## SQLite data and recovery
 
@@ -167,6 +170,8 @@ curl -i https://www.uckelegroup.com/api/ready
 ```
 
 See [docs/deployment.md](docs/deployment.md) and [docs/backend-setup.md](docs/backend-setup.md) for the full provider and production checklist.
+
+For the CRM follow-up rollout, provider receiving setup, compliance review, monitoring, ambiguous-send incident handling, and rollback procedure, see [docs/follow-up-operations.md](docs/follow-up-operations.md). Deployment is a separate, explicit operator action; this repository does not enable the feature or perform live sends by itself.
 
 ## Continuous integration
 

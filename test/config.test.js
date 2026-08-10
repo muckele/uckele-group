@@ -86,6 +86,45 @@ test('production follow-ups require the reply-to address to use the receiving do
   assert.ok(result.errors.some((error) => error.includes('must use the RESEND_INBOUND_DOMAIN')));
 });
 
+test('AI follow-up enrichment fails closed without both a model and an API key', () => {
+  const config = productionConfig();
+  config.followUp = {
+    aiEnabled: true,
+    aiModel: 'gpt-test',
+    aiApiKeyConfigured: false,
+  };
+
+  const missingKey = validateConfig(config);
+  assert.equal(missingKey.ok, false);
+  assert.ok(missingKey.errors.some((error) => error.includes('OPENAI_API_KEY')));
+
+  config.followUp.aiApiKeyConfigured = true;
+  config.followUp.aiModel = '';
+  const missingModel = validateConfig(config);
+  assert.equal(missingModel.ok, false);
+  assert.ok(missingModel.errors.some((error) => error.includes('FOLLOW_UP_AI_MODEL')));
+});
+
+test('generic follow-up sender and reply identities must align with verified Resend configuration', () => {
+  const config = productionConfig();
+  config.followUp = {
+    emailEnabled: true,
+    senderEmail: 'Different Sender <different@example.com>',
+    replyTo: 'different@other.example.com',
+    physicalPostalAddress: '123 Main Street',
+    replyOptOutEnabled: true,
+    optOutBaseUrl: '',
+    requireSignedPreview: false,
+  };
+
+  const result = validateConfig(config);
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes('FOLLOW_UP_SENDER_EMAIL must match')));
+  assert.ok(result.errors.some((error) => error.includes('FOLLOW_UP_REPLY_TO must match')));
+  assert.ok(result.errors.some((error) => error.includes('FOLLOW_UP_REPLY_TO must use')));
+  assert.ok(result.errors.some((error) => error.includes('FOLLOW_UP_REQUIRE_SIGNED_PREVIEW')));
+});
+
 test('production configuration validates EmailJS and Formspree provider requirements', () => {
   const emailJs = productionConfig();
   emailJs.delivery = {

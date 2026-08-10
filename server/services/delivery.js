@@ -282,7 +282,7 @@ async function sendViaResend(message) {
       ...(message.idempotencyKey ? { 'Idempotency-Key': message.idempotencyKey } : {}),
     },
     body: JSON.stringify({
-      from: config.delivery.resendFromEmail,
+      from: message.from || config.delivery.resendFromEmail,
       to: normalizeRecipients(message.to),
       subject: message.subject,
       html: message.html,

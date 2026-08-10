@@ -41,6 +41,25 @@ export default function EmailReadinessPanel({ data, onSendTest, testSending = fa
       ? ['ready', 'Enabled and reply-safe']
       : ['blocked', 'Blocked by the server safety gate']
     : ['waiting', 'Paused'];
+  const genericFollowUpState = data.genericFollowUpsEnabled
+    ? data.genericFollowUpsSafe
+      ? ['ready', 'Enabled with all safety gates verified']
+      : ['blocked', 'Enabled but blocked by server readiness']
+    : ['waiting', 'Feature flag is off'];
+  const suppressionState = data.suppressionOperational
+    ? ['ready', `${data.metrics?.suppressions?.active || 0} active global suppression(s)`]
+    : ['blocked', 'Suppression store check unavailable'];
+  const complianceState = data.physicalPostalAddressConfigured && data.optOutConfigured
+    ? ['ready', `${data.replyOptOutConfigured ? 'Reply-based' : 'External link-based'} opt-out and postal footer configured`]
+    : ['blocked', 'Postal address or opt-out mechanism missing'];
+  const aiState = data.aiEnabled
+    ? data.aiReady
+      ? ['ready', `${data.aiModel || 'Configured model'} · optional enrichment only`]
+      : ['blocked', 'Enabled but model or API key is missing']
+    : ['waiting', 'Optional enrichment is off; deterministic rules remain available'];
+  const metrics = data.metrics || {};
+  const metricRates = metrics.rates || {};
+  const outboxAttention = Number(metrics.outbox?.ambiguous || 0) + Number(metrics.outbox?.retryableFailed || 0);
 
   return (
     <section className="rounded-2xl border border-line bg-white/75 p-5" aria-labelledby="email-readiness-heading">
@@ -74,6 +93,10 @@ export default function EmailReadinessPanel({ data, onSendTest, testSending = fa
         <Status detail={deliveryState[1]} label="Delivery Tracking" state={deliveryState[0]} />
         <Status detail={replyState[1]} label="Reply Tracking" state={replyState[0]} />
         <Status detail={followUpState[1]} label="CIM Follow-Ups" state={followUpState[0]} />
+        <Status detail={genericFollowUpState[1]} label="CRM Email Actions" state={genericFollowUpState[0]} />
+        <Status detail={suppressionState[1]} label="Suppressions" state={suppressionState[0]} />
+        <Status detail={complianceState[1]} label="Footer & Opt-Out" state={complianceState[0]} />
+        <Status detail={aiState[1]} label="AI Enrichment" state={aiState[0]} />
       </div>
 
       <div className="mt-5 grid gap-3 text-xs leading-6 text-ink/65 md:grid-cols-2">
@@ -83,7 +106,44 @@ export default function EmailReadinessPanel({ data, onSendTest, testSending = fa
         <p><strong className="text-ink">Last delivery event:</strong> {formatDate(data.latestDeliveryEvent?.createdAt)}</p>
         <p><strong className="text-ink">Verified test reply:</strong> {formatDate(data.latestVerifiedReplyEvent?.createdAt)}</p>
         <p><strong className="text-ink">Last test event:</strong> {data.latestTestEvent ? `${data.latestTestEvent.eventType} · ${formatDate(data.latestTestEvent.createdAt)}` : 'Not observed'}</p>
+        <p><strong className="text-ink">30-day metric window:</strong> {data.metricsAvailable ? `Since ${formatDate(metrics.windowStartedAt)}` : 'Unavailable'}</p>
       </div>
+
+      {data.metricsAvailable ? (
+        <div className="mt-5" aria-label="CRM follow-up operational metrics">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
+            {[
+              ['24h volume', `${metrics.sentLast24Hours || 0} / ${metrics.dailyCap || 0}`],
+              ['Recommendation acceptance', `${metricRates.recommendationAcceptance || 0}%`],
+              ['Accepted draft edits', `${metricRates.recommendationEdit || 0}%`],
+              ['Recommendation dismissal', `${metricRates.recommendationDismissal || 0}%`],
+              ['Delivery', `${metricRates.delivery || 0}%`],
+              ['Bounce', `${metricRates.bounce || 0}%`],
+              ['Reply', `${metricRates.reply || 0}%`],
+              ['AI fallback', `${metricRates.aiFallback || 0}%`],
+            ].map(([label, value]) => (
+              <div className="rounded-xl border border-line bg-fog/60 p-3" key={label}>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-ink/52">{label}</p>
+                <p className="mt-1 text-lg font-semibold text-ink">{value}</p>
+              </div>
+            ))}
+          </div>
+          <p className="mt-3 text-xs leading-5 text-ink/55">
+            Durable outbox: {metrics.outbox?.queued || 0} queued · {metrics.outbox?.sending || 0} sending · {metrics.outbox?.accepted || 0} provider-accepted · {metrics.outbox?.ambiguous || 0} ambiguous · {metrics.outbox?.retryableFailed || 0} retryable · {metrics.outbox?.permanentFailed || 0} permanent failures. Counts only; Operations never returns message bodies.
+          </p>
+        </div>
+      ) : null}
+
+      <div className="mt-4 rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm leading-6 text-sky-900">
+        <p className="font-semibold">Sender-domain authentication requires a manual provider check.</p>
+        <p className="mt-1">{data.domainAuthentication?.guidance || 'Verify SPF, DKIM, and DMARC before enabling real sends.'} <a className="font-semibold underline" href={data.domainAuthentication?.providerUrl || 'https://resend.com/domains'} rel="noreferrer" target="_blank">Open Resend Domains</a>.</p>
+      </div>
+
+      {outboxAttention > 0 ? (
+        <p className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm leading-6 text-red-800" role="alert">
+          {outboxAttention} durable email command(s) need operator review. Never retry an ambiguous command until the provider result has been reconciled.
+        </p>
+      ) : null}
 
       {data.replyTrackingConfigured && !data.replyTrackingVerified ? (
         <p className="mt-4 rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm leading-6 text-sky-800">

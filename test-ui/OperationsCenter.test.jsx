@@ -4,6 +4,7 @@ import React from 'react';
 import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, test } from 'vitest';
 import OperationsCenter from '../src/components/admin/OperationsCenter.jsx';
+import EmailReadinessPanel from '../src/components/admin/EmailReadinessPanel.jsx';
 
 afterEach(cleanup);
 
@@ -52,5 +53,54 @@ describe('Operations Center partial failures', () => {
     expect(screen.getByText('2 pending · 1 failed · 3 unassigned')).toBeVisible();
     expect(screen.getByText('6 need attention')).toBeVisible();
     expect(screen.getByRole('heading', { name: 'Core systems at a glance' })).toBeVisible();
+  });
+
+  test('shows generic email gates and body-free operational metrics without overstating delivery', () => {
+    render(<EmailReadinessPanel data={{
+      provider: 'resend',
+      outboundConfigured: true,
+      deliveryTrackingConfigured: true,
+      deliveryTrackingVerified: true,
+      replyTrackingConfigured: true,
+      replyTrackingVerified: true,
+      followUpsEnabled: false,
+      genericFollowUpsEnabled: true,
+      genericFollowUpsSafe: true,
+      suppressionOperational: true,
+      physicalPostalAddressConfigured: true,
+      optOutConfigured: true,
+      replyOptOutConfigured: true,
+      aiEnabled: false,
+      aiReady: true,
+      metricsAvailable: true,
+      metrics: {
+        windowStartedAt: '2026-07-10T20:00:00.000Z',
+        sentLast24Hours: 3,
+        dailyCap: 25,
+        suppressions: { active: 4 },
+        outbox: { queued: 1, sending: 0, accepted: 8, ambiguous: 1, retryableFailed: 1, permanentFailed: 0 },
+        rates: {
+          recommendationAcceptance: 75,
+          recommendationEdit: 25,
+          recommendationDismissal: 25,
+          delivery: 80,
+          bounce: 10,
+          reply: 25,
+          aiFallback: 0,
+        },
+      },
+      domainAuthentication: {
+        guidance: 'Verify SPF, DKIM, and DMARC manually.',
+        providerUrl: 'https://resend.com/domains',
+      },
+      issues: [],
+    }} />);
+
+    expect(screen.getByText('Enabled with all safety gates verified')).toBeVisible();
+    expect(screen.getByText('4 active global suppression(s)')).toBeVisible();
+    expect(screen.getByText('3 / 25')).toBeVisible();
+    expect(screen.getByText(/8 provider-accepted/)).toBeVisible();
+    expect(screen.getByText(/Never retry an ambiguous command/)).toBeVisible();
+    expect(screen.getByRole('link', { name: 'Open Resend Domains' })).toHaveAttribute('href', 'https://resend.com/domains');
   });
 });

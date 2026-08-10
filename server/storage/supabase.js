@@ -48,9 +48,50 @@ function normalizeCrmCommunicationRow(row) {
         to_addresses: Array.isArray(row.to_addresses) ? row.to_addresses : [],
         cc_addresses: Array.isArray(row.cc_addresses) ? row.cc_addresses : [],
         bcc_addresses: Array.isArray(row.bcc_addresses) ? row.bcc_addresses : [],
+        references_json: Array.isArray(row.references_json) ? row.references_json : [],
+        headers_json: typeof row.headers_json === 'object' && row.headers_json !== null && !Array.isArray(row.headers_json)
+          ? row.headers_json
+          : {},
         attachment_metadata: Array.isArray(row.attachment_metadata) ? row.attachment_metadata : [],
         metadata: typeof row.metadata === 'object' && row.metadata !== null && !Array.isArray(row.metadata) ? row.metadata : {},
         content_attempt_count: Number(row.content_attempt_count || 0),
+        legacy_content_unavailable: Boolean(row.legacy_content_unavailable),
+      }
+    : null;
+}
+
+function normalizeCrmEmailOutboxRow(row) {
+  return row
+    ? {
+        ...row,
+        attempt_count: Number(row.attempt_count || 0),
+        metadata: typeof row.metadata === 'object' && row.metadata !== null && !Array.isArray(row.metadata) ? row.metadata : {},
+      }
+    : null;
+}
+
+function normalizeCrmFollowUpRecommendationRow(row) {
+  return row
+    ? {
+        ...row,
+        priority_score: Number(row.priority_score || 0),
+        confidence: Number(row.confidence || 0),
+        evidence_json: Array.isArray(row.evidence_json) ? row.evidence_json : [],
+        signals_json: Array.isArray(row.signals_json) ? row.signals_json : [],
+        commitments_json: Array.isArray(row.commitments_json) ? row.commitments_json : [],
+        questions_json: Array.isArray(row.questions_json) ? row.questions_json : [],
+        blockers_json: Array.isArray(row.blockers_json) ? row.blockers_json : [],
+        safety_flags_json: Array.isArray(row.safety_flags_json) ? row.safety_flags_json : [],
+        metadata: typeof row.metadata === 'object' && row.metadata !== null && !Array.isArray(row.metadata) ? row.metadata : {},
+      }
+    : null;
+}
+
+function normalizeEmailSuppressionRow(row) {
+  return row
+    ? {
+        ...row,
+        metadata: typeof row.metadata === 'object' && row.metadata !== null && !Array.isArray(row.metadata) ? row.metadata : {},
       }
     : null;
 }
@@ -435,7 +476,9 @@ function safeDealHunterCrmImport(record = {}) {
 
 const crmCommunicationFields = [
   'id', 'submission_id', 'deal_key', 'cim_request_id', 'direction', 'channel', 'source', 'kind',
-  'provider', 'provider_message_id', 'source_event_id', 'idempotency_key', 'in_reply_to',
+  'provider', 'provider_message_id', 'source_event_id', 'idempotency_key', 'message_id', 'in_reply_to',
+  'references_json', 'parent_communication_id', 'thread_key', 'legacy_content_unavailable',
+  'content_redaction_state', 'recommendation_id', 'outbox_id', 'headers_json',
   'reply_to_address', 'from_address', 'to_addresses', 'cc_addresses', 'bcc_addresses', 'subject',
   'body_text', 'body_html_sanitized', 'occurred_at', 'created_at', 'updated_at', 'delivery_state',
   'delivery_state_at', 'content_state', 'content_attempt_count', 'content_last_error',
@@ -456,6 +499,10 @@ function safeCrmCommunication(record = {}, { update = false } = {}) {
     payload.to_addresses = Array.isArray(payload.to_addresses) ? payload.to_addresses : [];
     payload.cc_addresses = Array.isArray(payload.cc_addresses) ? payload.cc_addresses : [];
     payload.bcc_addresses = Array.isArray(payload.bcc_addresses) ? payload.bcc_addresses : [];
+    payload.references_json = Array.isArray(payload.references_json) ? payload.references_json : [];
+    payload.headers_json = typeof payload.headers_json === 'object' && payload.headers_json !== null && !Array.isArray(payload.headers_json)
+      ? payload.headers_json
+      : {};
     payload.attachment_metadata = Array.isArray(payload.attachment_metadata) ? payload.attachment_metadata : [];
   }
   if (Object.hasOwn(payload, 'metadata')) {
@@ -861,6 +908,32 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       };
     },
 
+    async listFollowUpSubmissions({
+      page = 1, pageSize = 25, search = '', view = 'crm-actions', sort = 'urgency', direction = 'desc',
+      now = '', todayStart = '', todayEnd = '',
+    } = {}) {
+      const safePage = normalizePage(page);
+      const safePageSize = Math.max(1, Math.min(Number(pageSize) || 25, 100));
+      const { data, error } = await client.rpc('list_follow_up_submissions_page', {
+        p_limit: safePageSize,
+        p_page: safePage,
+        p_search: String(search || '').trim(),
+        p_view: String(view || 'crm-actions'),
+        p_sort: String(sort || 'urgency'),
+        p_direction: String(direction || 'desc'),
+        p_now: String(now || new Date().toISOString()),
+        p_today_start: String(todayStart || now || new Date().toISOString()),
+        p_today_end: String(todayEnd || now || new Date().toISOString()),
+      });
+      if (error) throw error;
+      return {
+        rows: (data?.rows || []).map(normalizeSubmissionRow),
+        total: Number(data?.total || 0),
+        page: safePage,
+        pageSize: safePageSize,
+      };
+    },
+
     async getSummary() {
       const lastSevenDaysSince = new Date(Date.now() - 1000 * 60 * 60 * 24 * 7).toISOString();
       const nowIso = new Date().toISOString();
@@ -1112,6 +1185,9 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       if (error) {
         throw error;
       }
+
+      // Supabase invalidates recommendations in the related-record trigger so
+      // the document mutation and invalidation cannot be separated by a crash.
     },
 
     async getSecureDocument(id) {
@@ -1341,6 +1417,21 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeCrmCommunicationRow(data);
     },
 
+    async getCrmCommunicationByMessageId(messageId) {
+      const normalizedMessageId = String(messageId || '').trim();
+      if (!normalizedMessageId) return null;
+      const { data, error } = await client
+        .from('crm_communications')
+        .select('*')
+        .eq('message_id', normalizedMessageId)
+        .order('occurred_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeCrmCommunicationRow(data);
+    },
+
     async insertCrmCommunication(communication = {}) {
       const payload = safeCrmCommunication(communication);
       const { data, error } = await client.from('crm_communications').insert(payload).select().single();
@@ -1379,6 +1470,272 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         .maybeSingle();
       if (error) throw error;
       return normalizeCrmCommunicationRow(data);
+    },
+
+    async createCrmEmailCommand({
+      communication = {}, outbox = {}, activity = {}, expectedSubmissionVersion = '',
+      manualTakeoverCimRequestId = '',
+    } = {}) {
+      const { data, error } = await client.rpc('create_crm_email_command', {
+        p_communication: safeCrmCommunication(communication),
+        p_outbox: outbox,
+        p_activity: activity,
+        p_expected_submission_version: expectedSubmissionVersion,
+        p_manual_takeover_cim_request_id: manualTakeoverCimRequestId || null,
+      });
+      if (error) throw error;
+      return {
+        applied: Boolean(data?.applied),
+        reason: data?.reason || '',
+        communication: normalizeCrmCommunicationRow(data?.communication || null),
+        outbox: normalizeCrmEmailOutboxRow(data?.outbox || null),
+        submission: data?.submission ? normalizeSubmissionRow(data.submission) : null,
+      };
+    },
+
+    async getCrmEmailOutbox(id) {
+      if (!id) return null;
+      const { data, error } = await client.from('crm_email_outbox').select('*').eq('id', id).maybeSingle();
+      if (error) throw error;
+      return normalizeCrmEmailOutboxRow(data);
+    },
+
+    async getCrmEmailOutboxByClientRequestKey(clientRequestKey) {
+      const normalizedKey = String(clientRequestKey || '').trim();
+      if (!normalizedKey) return null;
+      const { data, error } = await client
+        .from('crm_email_outbox')
+        .select('*')
+        .eq('client_request_key', normalizedKey)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeCrmEmailOutboxRow(data);
+    },
+
+    async getCrmEmailOutboxByProviderMessageId(providerMessageId) {
+      const normalizedId = String(providerMessageId || '').trim();
+      if (!normalizedId) return null;
+      const { data, error } = await client
+        .from('crm_email_outbox')
+        .select('*')
+        .eq('provider_message_id', normalizedId)
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeCrmEmailOutboxRow(data);
+    },
+
+    async listCrmEmailOutbox({ submissionId = '', states = [], limit = 25 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 25, 100));
+      let query = client
+        .from('crm_email_outbox')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(safeLimit);
+      if (submissionId) query = query.eq('submission_id', String(submissionId).trim());
+      const safeStates = normalizeList(states, 20);
+      if (safeStates.length > 0) query = query.in('state', safeStates);
+      const { data, error } = await query;
+      if (error) throw error;
+      return (data || []).map(normalizeCrmEmailOutboxRow);
+    },
+
+    async claimCrmEmailOutbox({ id = '', claimToken = '', claimedAt = '', claimExpiresAt = '' } = {}) {
+      const { data, error } = await client.rpc('claim_crm_email_outbox', {
+        p_id: id,
+        p_claim_token: claimToken,
+        p_claimed_at: claimedAt,
+        p_claim_expires_at: claimExpiresAt,
+      });
+      if (error) throw error;
+      return { claimed: Boolean(data?.claimed), outbox: normalizeCrmEmailOutboxRow(data?.outbox || null) };
+    },
+
+    async finishCrmEmailOutboxClaim(id, claimToken, values = {}) {
+      const allowedFields = new Set([
+        'state', 'provider', 'provider_message_id', 'next_attempt_at', 'accepted_at', 'failed_at',
+        'ambiguous_at', 'last_error_category', 'last_error_message', 'updated_at', 'metadata',
+      ]);
+      const payload = Object.fromEntries(Object.entries(values).filter(([field]) => allowedFields.has(field)));
+      const { data, error } = await client.rpc('finish_crm_email_outbox_claim', {
+        p_id: id,
+        p_claim_token: claimToken,
+        p_values: payload,
+      });
+      if (error) throw error;
+      return normalizeCrmEmailOutboxRow(data);
+    },
+
+    async countCrmEmailOutboxByStates(states = []) {
+      const safeStates = normalizeList(states, 20);
+      if (safeStates.length === 0) return 0;
+      const { count, error } = await client
+        .from('crm_email_outbox')
+        .select('*', { count: 'exact', head: true })
+        .in('state', safeStates);
+      if (error) throw error;
+      return Number(count || 0);
+    },
+
+    async countCrmFollowUpSends({ recipient = '', since = '' } = {}) {
+      const normalizedRecipient = String(recipient || '').trim().toLowerCase();
+      const { data, error } = await client.rpc('count_crm_follow_up_sends', {
+        p_recipient: normalizedRecipient,
+        p_since: since || null,
+      });
+      if (error) throw error;
+      return Number(data || 0);
+    },
+
+    async getCrmFollowUpOperationalMetrics({ since = '' } = {}) {
+      const windowStartedAt = String(since || '1970-01-01T00:00:00.000Z');
+      const { data, error } = await client.rpc('get_crm_follow_up_operational_metrics', {
+        p_since: windowStartedAt,
+      });
+      if (error) throw error;
+      const count = (value) => Math.max(0, Math.floor(Number(value) || 0));
+      return {
+        windowStartedAt,
+        outbox: {
+          queued: count(data?.outbox?.queued), sending: count(data?.outbox?.sending),
+          accepted: count(data?.outbox?.accepted), ambiguous: count(data?.outbox?.ambiguous),
+          retryableFailed: count(data?.outbox?.retryableFailed), permanentFailed: count(data?.outbox?.permanentFailed),
+          cancelled: count(data?.outbox?.cancelled),
+        },
+        delivery: {
+          delivered: count(data?.delivery?.delivered), delayed: count(data?.delivery?.delayed),
+          bounced: count(data?.delivery?.bounced), complained: count(data?.delivery?.complained),
+          failed: count(data?.delivery?.failed), replied: count(data?.delivery?.replied),
+        },
+        recommendations: {
+          current: count(data?.recommendations?.current), accepted: count(data?.recommendations?.accepted),
+          editedAndAccepted: count(data?.recommendations?.editedAndAccepted),
+          dismissed: count(data?.recommendations?.dismissed), superseded: count(data?.recommendations?.superseded),
+          failed: count(data?.recommendations?.failed), aiUsed: count(data?.recommendations?.aiUsed),
+          aiFallback: count(data?.recommendations?.aiFallback),
+        },
+        suppressions: { active: count(data?.suppressions?.active) },
+      };
+    },
+
+    async insertCrmFollowUpRecommendation(recommendation = {}) {
+      const { data, error } = await client
+        .from('crm_follow_up_recommendations')
+        .upsert(recommendation, {
+          onConflict: 'submission_id,input_fingerprint,engine_version',
+          ignoreDuplicates: true,
+        })
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+      if (data) return normalizeCrmFollowUpRecommendationRow(data);
+      const existing = await client
+        .from('crm_follow_up_recommendations')
+        .select('*')
+        .eq('submission_id', recommendation.submission_id)
+        .eq('input_fingerprint', recommendation.input_fingerprint)
+        .eq('engine_version', recommendation.engine_version)
+        .maybeSingle();
+      if (existing.error) throw existing.error;
+      return normalizeCrmFollowUpRecommendationRow(existing.data);
+    },
+
+    async getCurrentCrmFollowUpRecommendation(submissionId) {
+      const { data, error } = await client
+        .from('crm_follow_up_recommendations')
+        .select('*')
+        .eq('submission_id', submissionId)
+        .eq('status', 'current')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeCrmFollowUpRecommendationRow(data);
+    },
+
+    async getCrmFollowUpRecommendation(id) {
+      const { data, error } = await client
+        .from('crm_follow_up_recommendations')
+        .select('*')
+        .eq('id', id)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeCrmFollowUpRecommendationRow(data);
+    },
+
+    async supersedeCrmFollowUpRecommendations(submissionId, supersededAt) {
+      const { data, error } = await client
+        .from('crm_follow_up_recommendations')
+        .update({ status: 'superseded', superseded_at: supersededAt })
+        .eq('submission_id', submissionId)
+        .eq('status', 'current')
+        .select('id');
+      if (error) throw error;
+      return data?.length || 0;
+    },
+
+    async updateCrmFollowUpRecommendation(id, values = {}) {
+      const allowedFields = new Set(['status', 'acted_on_at', 'superseded_at', 'acted_on_by', 'outcome', 'metadata']);
+      const payload = Object.fromEntries(Object.entries(values).filter(([field]) => allowedFields.has(field)));
+      if (Object.keys(payload).length === 0) {
+        const current = await client.from('crm_follow_up_recommendations').select('*').eq('id', id).maybeSingle();
+        if (current.error) throw current.error;
+        return normalizeCrmFollowUpRecommendationRow(current.data);
+      }
+      const { data, error } = await client
+        .from('crm_follow_up_recommendations')
+        .update(payload)
+        .eq('id', id)
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeCrmFollowUpRecommendationRow(data);
+    },
+
+    async getActiveEmailSuppression(email) {
+      const normalizedEmail = String(email || '').trim().toLowerCase();
+      if (!normalizedEmail) return null;
+      const { data, error } = await client
+        .from('email_suppressions')
+        .select('*')
+        .eq('normalized_email', normalizedEmail)
+        .is('lifted_at', null)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeEmailSuppressionRow(data);
+    },
+
+    async upsertEmailSuppression(suppression = {}) {
+      const payload = {
+        ...suppression,
+        normalized_email: String(suppression.normalized_email || '').trim().toLowerCase(),
+        lifted_at: null,
+        lifted_by: null,
+        lift_reason: null,
+      };
+      const { data, error } = await client
+        .from('email_suppressions')
+        .upsert(payload, { onConflict: 'normalized_email' })
+        .select()
+        .single();
+      if (error) throw error;
+      return normalizeEmailSuppressionRow(data);
+    },
+
+    async liftEmailSuppression(email, { liftedAt = '', liftedBy = '', liftReason = '' } = {}) {
+      const { data, error } = await client
+        .from('email_suppressions')
+        .update({ lifted_at: liftedAt, lifted_by: liftedBy, lift_reason: liftReason })
+        .eq('normalized_email', String(email || '').trim().toLowerCase())
+        .is('lifted_at', null)
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeEmailSuppressionRow(data);
     },
 
     async listCrmCommunications({
@@ -1806,6 +2163,21 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       }
 
       return (data || []).map(normalizeDealHunterCimRequestRow);
+    },
+
+    async getLatestDealHunterCimRequestForSubmission(submissionId) {
+      const normalizedId = String(submissionId || '').trim();
+      if (!normalizedId) return null;
+      const { data, error } = await client
+        .from('deal_hunter_cim_requests')
+        .select('*')
+        .eq('submission_id', normalizedId)
+        .order('updated_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeDealHunterCimRequestRow(data);
     },
 
     async listDealHunterCimRequestHistory({

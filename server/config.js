@@ -127,6 +127,31 @@ export function getConfig() {
       defaultAssignee: process.env.DEFAULT_LEAD_ASSIGNEE || 'Mathew Uckele',
       defaultFollowUpDelayHours: numberFromEnv(process.env.DEFAULT_FOLLOW_UP_DELAY_HOURS, 24),
     },
+    followUp: {
+      emailEnabled: booleanFromEnv(process.env.FOLLOW_UP_EMAIL_ENABLED, false),
+      aiEnabled: booleanFromEnv(process.env.FOLLOW_UP_AI_ENABLED, false),
+      aiApiKeyConfigured: Boolean(process.env.OPENAI_API_KEY),
+      aiModel: process.env.FOLLOW_UP_AI_MODEL || '',
+      aiTimeoutMs: Math.max(1_000, Math.min(numberFromEnv(process.env.FOLLOW_UP_AI_TIMEOUT_MS, 12_000), 60_000)),
+      aiMaxContextChars: Math.max(2_000, Math.min(numberFromEnv(process.env.FOLLOW_UP_AI_MAX_CONTEXT_CHARS, 30_000), 100_000)),
+      timezone: process.env.FOLLOW_UP_TIMEZONE || process.env.DEAL_HUNTER_CIM_FOLLOW_UP_TIMEZONE || 'America/Los_Angeles',
+      sendWindowStart: process.env.FOLLOW_UP_SEND_WINDOW_START || '08:00',
+      sendWindowEnd: process.env.FOLLOW_UP_SEND_WINDOW_END || '17:00',
+      weekdaysOnly: booleanFromEnv(process.env.FOLLOW_UP_WEEKDAYS_ONLY, true),
+      dailyCap: Math.max(1, Math.min(numberFromEnv(process.env.FOLLOW_UP_DAILY_CAP, 25), 500)),
+      recipientRollingCap: Math.max(1, Math.min(numberFromEnv(process.env.FOLLOW_UP_RECIPIENT_30_DAY_CAP, 4), 50)),
+      maxTouches: Math.max(1, Math.min(numberFromEnv(process.env.FOLLOW_UP_MAX_TOUCHES, 3), 10)),
+      cadenceHours: numberListFromEnv(process.env.FOLLOW_UP_CADENCE_HOURS, [48, 72, 96]).slice(0, 10),
+      minimumAiDraftConfidence: Math.max(0, Math.min(numberFromEnv(process.env.FOLLOW_UP_AI_MIN_CONFIDENCE, 0.72), 1)),
+      senderName: process.env.FOLLOW_UP_SENDER_NAME || process.env.EMAIL_BRAND_COMPANY_NAME || 'Uckele Group',
+      senderEmail: process.env.FOLLOW_UP_SENDER_EMAIL || process.env.RESEND_FROM_EMAIL || '',
+      replyTo: process.env.FOLLOW_UP_REPLY_TO || process.env.RESEND_REPLY_TO || '',
+      requireSignedPreview: booleanFromEnv(process.env.FOLLOW_UP_REQUIRE_SIGNED_PREVIEW, true),
+      requireVerifiedReply: booleanFromEnv(process.env.FOLLOW_UP_REQUIRE_VERIFIED_REPLY, isProduction),
+      physicalPostalAddress: process.env.FOLLOW_UP_PHYSICAL_POSTAL_ADDRESS || process.env.EMAIL_BRAND_MAILING_ADDRESS || '',
+      optOutBaseUrl: process.env.FOLLOW_UP_OPT_OUT_BASE_URL || '',
+      replyOptOutEnabled: booleanFromEnv(process.env.FOLLOW_UP_REPLY_OPT_OUT_ENABLED, false),
+    },
     dealHunter: {
       recipient: process.env.DEAL_HUNTER_EMAIL_RECIPIENT || adminEmail,
       cronSecret: process.env.DEAL_HUNTER_CRON_SECRET || '',
@@ -289,6 +314,12 @@ export function validateConfig(config = getConfig()) {
     errors.push('BACKUP_TIMEZONE is not a valid IANA timezone.');
   }
 
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: config.followUp?.timezone || 'America/Los_Angeles' }).format();
+  } catch {
+    errors.push('FOLLOW_UP_TIMEZONE is not a valid IANA timezone.');
+  }
+
   if (config.storage.provider === 'supabase') {
     requireValue(config.storage.supabaseUrl, 'SUPABASE_URL');
     requireValue(config.storage.supabaseServiceRoleKey, 'SUPABASE_SERVICE_ROLE_KEY');
@@ -358,6 +389,64 @@ export function validateConfig(config = getConfig()) {
   requirePositiveNumber(config.backup?.retentionDays, 'BACKUP_RETENTION_DAYS', { integer: true });
   requirePositiveNumber(config.backup?.retentionCount, 'BACKUP_RETENTION_COUNT', { integer: true });
   requirePositiveNumber(config.backup?.checkIntervalMs, 'BACKUP_CHECK_INTERVAL_MS');
+  requirePositiveNumber(config.followUp?.aiTimeoutMs, 'FOLLOW_UP_AI_TIMEOUT_MS', { integer: true, max: 60_000 });
+  requirePositiveNumber(config.followUp?.aiMaxContextChars, 'FOLLOW_UP_AI_MAX_CONTEXT_CHARS', { integer: true, max: 100_000 });
+  requirePositiveNumber(config.followUp?.dailyCap, 'FOLLOW_UP_DAILY_CAP', { integer: true, max: 500 });
+  requirePositiveNumber(config.followUp?.recipientRollingCap, 'FOLLOW_UP_RECIPIENT_30_DAY_CAP', { integer: true, max: 50 });
+  requirePositiveNumber(config.followUp?.maxTouches, 'FOLLOW_UP_MAX_TOUCHES', { integer: true, max: 10 });
+
+  for (const [value, label] of [
+    [config.followUp?.sendWindowStart || '08:00', 'FOLLOW_UP_SEND_WINDOW_START'],
+    [config.followUp?.sendWindowEnd || '17:00', 'FOLLOW_UP_SEND_WINDOW_END'],
+  ]) {
+    const match = String(value || '').match(/^(\d{2}):(\d{2})$/);
+    if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) {
+      errors.push(`${label} must use a valid 24-hour HH:MM value.`);
+    }
+  }
+
+  if (config.followUp?.aiEnabled) {
+    requireValue(config.followUp.aiModel, 'FOLLOW_UP_AI_MODEL');
+    if (!config.followUp.aiApiKeyConfigured) {
+      errors.push('OPENAI_API_KEY is required when FOLLOW_UP_AI_ENABLED=true.');
+    }
+  }
+
+  if (config.followUp?.emailEnabled) {
+    if (config.delivery.provider !== 'resend') {
+      errors.push('DELIVERY_PROVIDER=resend is required when generic CRM follow-up email is enabled.');
+    }
+    requireValue(config.delivery.resendApiKey, 'RESEND_API_KEY');
+    requireValue(config.followUp.senderEmail, 'FOLLOW_UP_SENDER_EMAIL or RESEND_FROM_EMAIL');
+    requireValue(config.followUp.replyTo, 'FOLLOW_UP_REPLY_TO or RESEND_REPLY_TO');
+    const followUpSender = String(config.followUp.senderEmail || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0]?.toLowerCase() || '';
+    const deliverySender = String(config.delivery.resendFromEmail || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0]?.toLowerCase() || '';
+    const followUpReplyTo = String(config.followUp.replyTo || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0]?.toLowerCase() || '';
+    const deliveryReplyTo = String(config.delivery.resendReplyTo || '').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0]?.toLowerCase() || '';
+    if (followUpSender && deliverySender && followUpSender !== deliverySender) {
+      errors.push('FOLLOW_UP_SENDER_EMAIL must match the RESEND_FROM_EMAIL address.');
+    }
+    if (followUpReplyTo && deliveryReplyTo && followUpReplyTo !== deliveryReplyTo) {
+      errors.push('FOLLOW_UP_REPLY_TO must match RESEND_REPLY_TO.');
+    }
+    if (followUpReplyTo && config.delivery.resendInboundDomain
+      && followUpReplyTo.split('@')[1] !== String(config.delivery.resendInboundDomain).trim().toLowerCase().replace(/^@/, '')) {
+      errors.push('FOLLOW_UP_REPLY_TO must use RESEND_INBOUND_DOMAIN.');
+    }
+    if (config.isProduction && config.followUp.requireSignedPreview === false) {
+      errors.push('FOLLOW_UP_REQUIRE_SIGNED_PREVIEW cannot be disabled in production.');
+    }
+    if (config.followUp.requireSignedPreview !== false && String(config.admin?.sessionSecret || '').length < 16) {
+      errors.push('ADMIN_SESSION_SECRET is required to sign exact CRM follow-up previews.');
+    }
+    requireValue(config.delivery.emailWebhookSecret, 'RESEND_WEBHOOK_SECRET or EMAIL_WEBHOOK_SECRET');
+    requireValue(config.delivery.resendInboundDomain, 'RESEND_INBOUND_DOMAIN');
+    requireValue(config.followUp.physicalPostalAddress, 'FOLLOW_UP_PHYSICAL_POSTAL_ADDRESS or EMAIL_BRAND_MAILING_ADDRESS');
+    if (!config.followUp.replyOptOutEnabled && !config.followUp.optOutBaseUrl) {
+      errors.push('FOLLOW_UP_REPLY_OPT_OUT_ENABLED=true or FOLLOW_UP_OPT_OUT_BASE_URL is required when generic CRM follow-up email is enabled.');
+    }
+    requireHttpUrl(config.followUp.optOutBaseUrl, 'FOLLOW_UP_OPT_OUT_BASE_URL');
+  }
 
   if (
     Number.isFinite(Number(config.protection?.rateLimitRetentionMs)) &&
