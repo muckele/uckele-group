@@ -1,5 +1,9 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  FOLLOW_UP_AI_REASONING_EFFORTS,
+  FOLLOW_UP_EVAL_VERSION,
+} from './services/followUpAiPolicy.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
@@ -8,6 +12,11 @@ const isProduction = process.env.NODE_ENV === 'production';
 function numberFromEnv(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function explicitNumberFromEnv(value, fallback) {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
+  return Number(value);
 }
 
 function booleanFromEnv(value, fallback) {
@@ -130,10 +139,18 @@ export function getConfig() {
     followUp: {
       emailEnabled: booleanFromEnv(process.env.FOLLOW_UP_EMAIL_ENABLED, false),
       aiEnabled: booleanFromEnv(process.env.FOLLOW_UP_AI_ENABLED, false),
-      aiApiKeyConfigured: Boolean(process.env.OPENAI_API_KEY),
+      aiApiKeyConfigured: Boolean(process.env.OPENAI_API_KEY?.trim()),
       aiModel: process.env.FOLLOW_UP_AI_MODEL || '',
-      aiTimeoutMs: Math.max(1_000, Math.min(numberFromEnv(process.env.FOLLOW_UP_AI_TIMEOUT_MS, 12_000), 60_000)),
-      aiMaxContextChars: Math.max(2_000, Math.min(numberFromEnv(process.env.FOLLOW_UP_AI_MAX_CONTEXT_CHARS, 30_000), 100_000)),
+      aiReasoningEffort: process.env.FOLLOW_UP_AI_REASONING_EFFORT || 'low',
+      aiTimeoutMs: explicitNumberFromEnv(process.env.FOLLOW_UP_AI_TIMEOUT_MS, 12_000),
+      aiMaxContextChars: explicitNumberFromEnv(process.env.FOLLOW_UP_AI_MAX_CONTEXT_CHARS, 30_000),
+      aiMaxOutputTokens: explicitNumberFromEnv(process.env.FOLLOW_UP_AI_MAX_OUTPUT_TOKENS, 1_600),
+      aiMaxRetries: explicitNumberFromEnv(process.env.FOLLOW_UP_AI_MAX_RETRIES, 0),
+      aiRateLimitPerMinute: explicitNumberFromEnv(process.env.FOLLOW_UP_AI_RATE_LIMIT_PER_MINUTE, 10),
+      aiDataHandlingApprovalId: process.env.FOLLOW_UP_AI_DATA_HANDLING_APPROVAL_ID || '',
+      aiAcceptedEvalVersion: process.env.FOLLOW_UP_AI_ACCEPTED_EVAL_VERSION || '',
+      aiCostRateApprovalId: process.env.FOLLOW_UP_AI_COST_RATE_APPROVAL_ID || '',
+      aiSyntheticSmokeId: process.env.FOLLOW_UP_AI_SYNTHETIC_SMOKE_ID || '',
       timezone: process.env.FOLLOW_UP_TIMEZONE || process.env.DEAL_HUNTER_CIM_FOLLOW_UP_TIMEZONE || 'America/Los_Angeles',
       sendWindowStart: process.env.FOLLOW_UP_SEND_WINDOW_START || '08:00',
       sendWindowEnd: process.env.FOLLOW_UP_SEND_WINDOW_END || '17:00',
@@ -142,7 +159,6 @@ export function getConfig() {
       recipientRollingCap: Math.max(1, Math.min(numberFromEnv(process.env.FOLLOW_UP_RECIPIENT_30_DAY_CAP, 4), 50)),
       maxTouches: Math.max(1, Math.min(numberFromEnv(process.env.FOLLOW_UP_MAX_TOUCHES, 3), 10)),
       cadenceHours: numberListFromEnv(process.env.FOLLOW_UP_CADENCE_HOURS, [48, 72, 96]).slice(0, 10),
-      minimumAiDraftConfidence: Math.max(0, Math.min(numberFromEnv(process.env.FOLLOW_UP_AI_MIN_CONFIDENCE, 0.72), 1)),
       senderName: process.env.FOLLOW_UP_SENDER_NAME || process.env.EMAIL_BRAND_COMPANY_NAME || 'Uckele Group',
       senderEmail: process.env.FOLLOW_UP_SENDER_EMAIL || process.env.RESEND_FROM_EMAIL || '',
       replyTo: process.env.FOLLOW_UP_REPLY_TO || process.env.RESEND_REPLY_TO || '',
@@ -391,6 +407,9 @@ export function validateConfig(config = getConfig()) {
   requirePositiveNumber(config.backup?.checkIntervalMs, 'BACKUP_CHECK_INTERVAL_MS');
   requirePositiveNumber(config.followUp?.aiTimeoutMs, 'FOLLOW_UP_AI_TIMEOUT_MS', { integer: true, max: 60_000 });
   requirePositiveNumber(config.followUp?.aiMaxContextChars, 'FOLLOW_UP_AI_MAX_CONTEXT_CHARS', { integer: true, max: 100_000 });
+  requirePositiveNumber(config.followUp?.aiMaxOutputTokens, 'FOLLOW_UP_AI_MAX_OUTPUT_TOKENS', { integer: true, max: 4_000 });
+  requireNonNegativeNumber(config.followUp?.aiMaxRetries, 'FOLLOW_UP_AI_MAX_RETRIES', { integer: true, max: 2 });
+  requirePositiveNumber(config.followUp?.aiRateLimitPerMinute, 'FOLLOW_UP_AI_RATE_LIMIT_PER_MINUTE', { integer: true, max: 120 });
   requirePositiveNumber(config.followUp?.dailyCap, 'FOLLOW_UP_DAILY_CAP', { integer: true, max: 500 });
   requirePositiveNumber(config.followUp?.recipientRollingCap, 'FOLLOW_UP_RECIPIENT_30_DAY_CAP', { integer: true, max: 50 });
   requirePositiveNumber(config.followUp?.maxTouches, 'FOLLOW_UP_MAX_TOUCHES', { integer: true, max: 10 });
@@ -407,8 +426,28 @@ export function validateConfig(config = getConfig()) {
 
   if (config.followUp?.aiEnabled) {
     requireValue(config.followUp.aiModel, 'FOLLOW_UP_AI_MODEL');
+    requireValue(config.followUp.aiReasoningEffort, 'FOLLOW_UP_AI_REASONING_EFFORT');
+    requireValue(config.followUp.aiDataHandlingApprovalId, 'FOLLOW_UP_AI_DATA_HANDLING_APPROVAL_ID');
+    requireValue(config.followUp.aiAcceptedEvalVersion, 'FOLLOW_UP_AI_ACCEPTED_EVAL_VERSION');
+    requireValue(config.followUp.aiCostRateApprovalId, 'FOLLOW_UP_AI_COST_RATE_APPROVAL_ID');
+    requireValue(config.followUp.aiSyntheticSmokeId, 'FOLLOW_UP_AI_SYNTHETIC_SMOKE_ID');
     if (!config.followUp.aiApiKeyConfigured) {
       errors.push('OPENAI_API_KEY is required when FOLLOW_UP_AI_ENABLED=true.');
+    }
+    if (!FOLLOW_UP_AI_REASONING_EFFORTS.includes(config.followUp.aiReasoningEffort)) {
+      errors.push(`FOLLOW_UP_AI_REASONING_EFFORT must be one of: ${FOLLOW_UP_AI_REASONING_EFFORTS.join(', ')}.`);
+    }
+    if (config.followUp.aiAcceptedEvalVersion !== FOLLOW_UP_EVAL_VERSION) {
+      errors.push(`FOLLOW_UP_AI_ACCEPTED_EVAL_VERSION must equal the current accepted corpus version (${FOLLOW_UP_EVAL_VERSION}).`);
+    }
+    if (Number(config.followUp.aiTimeoutMs) < 1_000) {
+      errors.push('FOLLOW_UP_AI_TIMEOUT_MS must be at least 1000.');
+    }
+    if (Number(config.followUp.aiMaxContextChars) < 2_000) {
+      errors.push('FOLLOW_UP_AI_MAX_CONTEXT_CHARS must be at least 2000.');
+    }
+    if (Number(config.followUp.aiMaxOutputTokens) < 256) {
+      errors.push('FOLLOW_UP_AI_MAX_OUTPUT_TOKENS must be at least 256.');
     }
   }
 

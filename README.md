@@ -113,13 +113,13 @@ Copy `.env.example` and configure only the providers you use. Important groups a
 - Authentication: `ADMIN_AUTH_MODE`, administrator identity, unique session and magic-link secrets, session lifetime, and optional viewer access.
 - Secure documents: a unique token secret, storage directory, request lifetime, and upload limits.
 - Deal Hunter: source configuration, recipient, schedule, and optional automated CIM follow-ups.
-- Human-reviewed follow-ups: `FOLLOW_UP_EMAIL_ENABLED`, optional `FOLLOW_UP_AI_ENABLED`, sender/reply identity, send windows, caps, cadence, postal footer, and opt-out settings. Both feature flags default to `false`.
+- Human-reviewed follow-ups: `FOLLOW_UP_EMAIL_ENABLED`, optional `FOLLOW_UP_AI_ENABLED`, sender/reply identity, send windows, caps, cadence, postal footer, opt-out settings, and the AI model/reasoning/request bounds plus approval/eval/synthetic-smoke references. Both feature flags default to `false`.
 - Protection: Turnstile, request limits, rate limiting, and spam thresholds.
 - Backup: enabled state, private bundle directory, retention limits, daily time, timezone, and scheduler interval.
 
 Production validation intentionally rejects missing or weak authentication secrets, reused secure-document secrets, unusable login configuration, and development-only delivery providers.
 
-The generic CRM email action and AI enrichment flags are independent. Deterministic recommendations remain available when AI is disabled or degraded, and no recommendation may send an email. Before enabling either flag, use the staged checklist in [docs/follow-up-operations.md](docs/follow-up-operations.md).
+The generic CRM email action and AI enrichment flags are independent. Deterministic recommendations remain available when AI is disabled or degraded, and no recommendation may send an email. The credential-free synthetic gate is `npm run eval:follow-ups`; paid live comparison is separately guarded and never implied by that command. Before enabling either flag, use the staged checklist in [docs/follow-up-operations.md](docs/follow-up-operations.md).
 
 ## SQLite data and recovery
 

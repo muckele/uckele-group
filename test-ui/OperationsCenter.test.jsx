@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import React from 'react';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, test } from 'vitest';
 import OperationsCenter from '../src/components/admin/OperationsCenter.jsx';
 import EmailReadinessPanel from '../src/components/admin/EmailReadinessPanel.jsx';
@@ -71,7 +71,31 @@ describe('Operations Center partial failures', () => {
       optOutConfigured: true,
       replyOptOutConfigured: true,
       aiEnabled: false,
-      aiReady: true,
+      aiReady: false,
+      aiReadiness: {
+        modelConfigured: false,
+        apiKeyConfigured: false,
+        reasoningConfigured: true,
+        reasoningEffort: 'low',
+        timeoutConfigured: true,
+        contextLimitConfigured: true,
+        outputLimitConfigured: true,
+        retryLimitConfigured: true,
+        rateLimitConfigured: true,
+        dataHandlingApproved: false,
+        costRateApproved: false,
+        evalAccepted: false,
+        acceptedEvalVersion: '',
+        expectedEvalVersion: 'follow-up-eval-v1',
+        syntheticSmokeObserved: false,
+        promptVersion: 'follow-up-ai-prompt-v2',
+        schemaVersion: 'follow-up-ai-schema-v2',
+        maxContextCharacters: 30000,
+        maxOutputTokens: 1600,
+        timeoutMs: 12000,
+        maxRetries: 0,
+        rateLimitPerMinute: 10,
+      },
       metricsAvailable: true,
       metrics: {
         windowStartedAt: '2026-07-10T20:00:00.000Z',
@@ -86,7 +110,19 @@ describe('Operations Center partial failures', () => {
           delivery: 80,
           bounce: 10,
           reply: 25,
-          aiFallback: 0,
+          aiFallback: null,
+        },
+        ai: {
+          fallbackReasons: {},
+          responseStates: {},
+          latencyMs: { observed: 0, average: null, minimum: null, maximum: null },
+          tokens: {
+            observed: 0,
+            inputTotal: null,
+            outputTotal: null,
+            cachedTotal: null,
+            reasoningTotal: null,
+          },
         },
       },
       domainAuthentication: {
@@ -101,6 +137,19 @@ describe('Operations Center partial failures', () => {
     expect(screen.getByText('3 / 25')).toBeVisible();
     expect(screen.getByText(/8 provider-accepted/)).toBeVisible();
     expect(screen.getByText(/Never retry an ambiguous command/)).toBeVisible();
+    expect(screen.getByText('Deterministic Recommendations')).toBeVisible();
+    expect(screen.getByText('AI Feature Flag')).toBeVisible();
+    expect(screen.getByText('AI Model')).toBeVisible();
+    expect(screen.getByText('AI API Key')).toBeVisible();
+    expect(screen.getByText('AI Request Bounds')).toBeVisible();
+    expect(screen.getByText('AI Data Approval')).toBeVisible();
+    expect(screen.getByText('AI Cost & Rate')).toBeVisible();
+    expect(screen.getByText('AI Evaluation')).toBeVisible();
+    expect(screen.getByText('AI Synthetic Smoke')).toBeVisible();
+    expect(screen.getByText('Controlled synthetic smoke not observed')).toBeVisible();
+    expect(screen.getAllByText('Not observed').length).toBeGreaterThan(0);
+    const aiFallbackCard = screen.getByText('AI fallback').closest('div');
+    expect(within(aiFallbackCard).getByText('Not observed')).toBeVisible();
     expect(screen.getByRole('link', { name: 'Open Resend Domains' })).toHaveAttribute('href', 'https://resend.com/domains');
   });
 });

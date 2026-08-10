@@ -105,7 +105,7 @@ function contextFixture() {
   };
 }
 
-function recommendationFixture() {
+function recommendationFixture(overrides = {}) {
   return {
     id: 'recommendation-1',
     submission_id: 'follow-up-0',
@@ -124,6 +124,7 @@ function recommendationFixture() {
     draft_subject: 'Re: Acquisition question',
     draft_body_text: 'Hi Avery,\n\nThank you for the request. I will review the approved materials before sharing a secure link.\n\nBest,',
     metadata: { aiRequested: true, aiUsed: false, aiFallbackReason: 'timeout', sendAllowed: false },
+    ...overrides,
   };
 }
 
@@ -267,8 +268,10 @@ describe('FollowUpsWorkspace', () => {
     expect(screen.getByText(/overview\.pdf/)).toBeVisible();
 
     fireEvent.click(screen.getByRole('button', { name: 'Review recommendation' }));
-    expect(await screen.findByText(/AI enrichment was unavailable \(Timeout\)/)).toBeVisible();
+    expect(await screen.findByText('AI unavailable; deterministic result shown')).toBeVisible();
+    expect(screen.getByText(/Timeout.*deterministic action and safety policy remain authoritative/)).toBeVisible();
     expect(screen.getByText('The latest inbound message requests a CIM; a human must select an approved asset.')).toBeVisible();
+    expect(screen.queryByText('90%')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Review draft' }));
     expect(await screen.findByRole('heading', { name: 'Review and compose' })).toBeVisible();
@@ -287,5 +290,48 @@ describe('FollowUpsWorkspace', () => {
     expect((await screen.findAllByText('Provider accepted the email. Delivery is still pending lifecycle confirmation.'))[0]).toBeVisible();
     expect(sendCalls).toBe(1);
     expect(contextLoads).toBeGreaterThanOrEqual(2);
+  });
+
+  test.each([
+    {
+      metadata: { aiRequested: false, aiUsed: false, sendAllowed: false },
+      label: 'Deterministic',
+    },
+    {
+      metadata: {
+        aiRequested: true,
+        aiUsed: true,
+        aiResponseState: 'completed',
+        returnedModel: 'synthetic-model-snapshot',
+        sendAllowed: false,
+      },
+      label: 'AI-enriched · human review required',
+    },
+  ])('labels $label recommendation provenance', async ({ metadata, label }) => {
+    const context = contextFixture();
+    context.recommendation = recommendationFixture({ metadata });
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const path = String(url);
+      if (path.startsWith('/api/admin/follow-ups?')) {
+        return response({
+          success: true,
+          items: [queueRecord(0)],
+          total: 1,
+          page: 1,
+          pageSize: 25,
+          totalPages: 1,
+          summary: { total: 1 },
+        });
+      }
+      if (path.endsWith('/context?communicationPageSize=100')) {
+        return response({ success: true, context });
+      }
+      throw new Error(`Unexpected fetch: ${path}`);
+    });
+
+    render(<FollowUpsWorkspace />);
+    fireEvent.click(await screen.findByRole('button', { name: /Follow-Up Company 0/ }));
+    expect(await screen.findByText(label)).toBeVisible();
+    expect(screen.queryByText('90%')).not.toBeInTheDocument();
   });
 });

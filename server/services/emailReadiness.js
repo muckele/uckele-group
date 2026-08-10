@@ -1,5 +1,10 @@
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
+import {
+  FOLLOW_UP_AI_FALLBACK_REASONS,
+  FOLLOW_UP_AI_RESPONSE_STATES,
+  buildFollowUpAiReadiness,
+} from './followUpAiPolicy.js';
 
 const deliveryEventTypes = new Set(['delivered', 'delayed', 'bounced', 'complained', 'failed']);
 const replyEventTypes = new Set(['replied', 'received']);
@@ -71,6 +76,21 @@ function percent(numerator, denominator) {
   return denominator > 0 ? Math.round((count(numerator) / denominator) * 1_000) / 10 : 0;
 }
 
+function nullableNumber(value) {
+  return (typeof value === 'number' || typeof value === 'string')
+    && String(value).trim() !== ''
+    && Number.isFinite(Number(value)) && Number(value) >= 0
+    ? Number(value)
+    : null;
+}
+
+function countMap(value, allowedValues) {
+  const allowed = new Set(allowedValues);
+  return Object.fromEntries(Object.entries(value && typeof value === 'object' && !Array.isArray(value) ? value : {})
+    .map(([key, total]) => [normalizeText(key, 80), count(total)])
+    .filter(([key]) => allowed.has(key)));
+}
+
 function publicOperationalMetrics(metrics = {}, sentLast24Hours = 0, dailyCap = 0) {
   const outbox = Object.fromEntries(Object.entries(metrics.outbox || {}).map(([key, value]) => [key, count(value)]));
   const delivery = Object.fromEntries(Object.entries(metrics.delivery || {}).map(([key, value]) => [key, count(value)]));
@@ -79,11 +99,29 @@ function publicOperationalMetrics(metrics = {}, sentLast24Hours = 0, dailyCap = 
   const acceptedDecisions = count(recommendations.accepted) + count(recommendations.editedAndAccepted);
   const deliveryOutcomes = count(delivery.delivered) + count(delivery.bounced) + count(delivery.complained) + count(delivery.failed);
   const aiOutcomes = count(recommendations.aiUsed) + count(recommendations.aiFallback);
+  const ai = metrics.ai || {};
   return {
     windowStartedAt: metrics.windowStartedAt || '',
     outbox,
     delivery,
     recommendations,
+    ai: {
+      fallbackReasons: countMap(ai.fallbackReasons, FOLLOW_UP_AI_FALLBACK_REASONS),
+      responseStates: countMap(ai.responseStates, FOLLOW_UP_AI_RESPONSE_STATES),
+      latencyMs: {
+        observed: count(ai.latencyMs?.observed),
+        average: nullableNumber(ai.latencyMs?.average),
+        minimum: nullableNumber(ai.latencyMs?.minimum),
+        maximum: nullableNumber(ai.latencyMs?.maximum),
+      },
+      tokens: {
+        observed: count(ai.tokens?.observed),
+        inputTotal: nullableNumber(ai.tokens?.inputTotal),
+        outputTotal: nullableNumber(ai.tokens?.outputTotal),
+        cachedTotal: nullableNumber(ai.tokens?.cachedTotal),
+        reasoningTotal: nullableNumber(ai.tokens?.reasoningTotal),
+      },
+    },
     suppressions: { active: count(metrics.suppressions?.active) },
     sentLast24Hours: count(sentLast24Hours),
     dailyCap: count(dailyCap),
@@ -94,7 +132,7 @@ function publicOperationalMetrics(metrics = {}, sentLast24Hours = 0, dailyCap = 
       delivery: percent(delivery.delivered, deliveryOutcomes),
       bounce: percent(delivery.bounced, deliveryOutcomes),
       reply: percent(delivery.replied, Math.max(1, count(delivery.delivered))),
-      aiFallback: percent(recommendations.aiFallback, aiOutcomes),
+      aiFallback: aiOutcomes > 0 ? percent(recommendations.aiFallback, aiOutcomes) : null,
     },
   };
 }
@@ -149,10 +187,11 @@ export function buildEmailReadiness({
     metricsAvailable
       && Number.isFinite(Number(operationalMetrics?.suppressions?.active)),
   );
-  const aiEnabled = Boolean(config.followUp?.aiEnabled);
-  const aiModelConfigured = Boolean(normalizeText(config.followUp?.aiModel, 120));
-  const aiApiKeyConfigured = Boolean(config.followUp?.aiApiKeyConfigured);
-  const aiReady = !aiEnabled || (aiModelConfigured && aiApiKeyConfigured);
+  const aiReadiness = buildFollowUpAiReadiness(config);
+  const aiEnabled = aiReadiness.enabled;
+  const aiModelConfigured = aiReadiness.modelConfigured;
+  const aiApiKeyConfigured = aiReadiness.apiKeyConfigured;
+  const aiReady = aiReadiness.ready;
   const genericFollowUpsSafe = genericFollowUpsEnabled
     && outboundConfigured
     && replyTrackingConfigured
@@ -192,7 +231,7 @@ export function buildEmailReadiness({
     issues.push('The global suppression store could not be verified. Generic follow-up sending remains blocked.');
   }
   if (aiEnabled && !aiReady) {
-    issues.push('AI enrichment is enabled but its model or API key is missing. Deterministic recommendations remain the fallback.');
+    issues.push('AI enrichment is enabled without every required configuration, approval, evaluation, and synthetic-smoke gate. Deterministic recommendations remain the fallback.');
   }
 
   const metrics = publicOperationalMetrics(
@@ -229,10 +268,12 @@ export function buildEmailReadiness({
     optOutConfigured,
     suppressionOperational,
     aiEnabled,
-    aiModel: normalizeText(config.followUp?.aiModel, 120),
+    deterministicRecommendationsAvailable: true,
+    aiModel: aiReadiness.model,
     aiModelConfigured,
     aiApiKeyConfigured,
     aiReady,
+    aiReadiness,
     domainAuthentication: {
       state: 'manual-verification-required',
       guidance: 'Verify the sender domain SPF/DKIM status with Resend and publish a monitored DMARC policy before enabling real sends.',

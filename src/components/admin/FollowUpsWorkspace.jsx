@@ -200,6 +200,12 @@ function RecommendationPanel({ recommendation, onCompose, onDismiss, pending, re
     );
   }
   const degraded = recommendation.metadata?.aiRequested && !recommendation.metadata?.aiUsed;
+  const aiEnriched = Boolean(recommendation.metadata?.aiUsed);
+  const provenance = aiEnriched
+    ? 'AI-enriched · human review required'
+    : degraded
+      ? 'AI unavailable; deterministic result shown'
+      : 'Deterministic';
   const current = recommendation.status === 'current';
   return (
     <section aria-labelledby="follow-up-recommendation-title" className="rounded-2xl border border-moss/15 bg-moss/[0.035] p-5">
@@ -209,15 +215,15 @@ function RecommendationPanel({ recommendation, onCompose, onDismiss, pending, re
           <h3 className="mt-1 text-lg font-semibold text-ink" id="follow-up-recommendation-title">{humanize(recommendation.action_type)}</h3>
         </div>
         <div className="flex flex-wrap gap-2">
+          <Badge value={aiEnriched ? 'replied' : degraded ? 'delayed' : 'complete'}>{provenance}</Badge>
           <Badge value={recommendation.conversation_state}>{humanize(recommendation.conversation_state)}</Badge>
-          <Badge>Confidence {Math.round(Number(recommendation.confidence || 0) * 100)}%</Badge>
           <Badge>Priority {recommendation.priority_score || 0}</Badge>
         </div>
       </div>
       {degraded ? (
         <div className="mt-4 flex gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
-          <span>AI enrichment was unavailable ({humanize(recommendation.metadata.aiFallbackReason)}). The deterministic result remains available and authoritative.</span>
+          <span>{provenance} ({humanize(recommendation.metadata.aiFallbackReason)}). The deterministic action and safety policy remain authoritative.</span>
         </div>
       ) : null}
       {!current ? (

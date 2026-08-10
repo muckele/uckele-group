@@ -1597,6 +1597,15 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       });
       if (error) throw error;
       const count = (value) => Math.max(0, Math.floor(Number(value) || 0));
+      const nullableNumber = (value) => (typeof value === 'number' || typeof value === 'string')
+        && String(value).trim() !== ''
+        && Number.isFinite(Number(value)) && Number(value) >= 0
+        ? Number(value)
+        : null;
+      const countMap = (value) => Object.fromEntries(
+        Object.entries(value && typeof value === 'object' && !Array.isArray(value) ? value : {})
+          .map(([key, total]) => [String(key).slice(0, 80), count(total)]),
+      );
       return {
         windowStartedAt,
         outbox: {
@@ -1616,6 +1625,24 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
           dismissed: count(data?.recommendations?.dismissed), superseded: count(data?.recommendations?.superseded),
           failed: count(data?.recommendations?.failed), aiUsed: count(data?.recommendations?.aiUsed),
           aiFallback: count(data?.recommendations?.aiFallback),
+        },
+        ai: {
+          fallbackReasons: countMap(data?.ai?.fallbackReasons),
+          responseStates: countMap(data?.ai?.responseStates),
+          latencyMs: {
+            observed: count(data?.ai?.latencyMs?.observed),
+            average: nullableNumber(data?.ai?.latencyMs?.average),
+            minimum: nullableNumber(data?.ai?.latencyMs?.minimum),
+            maximum: nullableNumber(data?.ai?.latencyMs?.maximum),
+            total: nullableNumber(data?.ai?.latencyMs?.total),
+          },
+          tokens: {
+            observed: count(data?.ai?.tokens?.observed),
+            inputTotal: nullableNumber(data?.ai?.tokens?.inputTotal),
+            outputTotal: nullableNumber(data?.ai?.tokens?.outputTotal),
+            cachedTotal: nullableNumber(data?.ai?.tokens?.cachedTotal),
+            reasoningTotal: nullableNumber(data?.ai?.tokens?.reasoningTotal),
+          },
         },
         suppressions: { active: count(data?.suppressions?.active) },
       };

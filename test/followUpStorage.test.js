@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
+import { createSupabaseStorage } from '../server/storage/supabase.js';
 
 const initialAt = '2026-08-09T17:00:00.000Z';
 const commandAt = '2026-08-09T17:05:00.000Z';
@@ -289,7 +290,20 @@ test('SQLite creates one immutable communication/outbox/activity command and tok
 test('durable email commands record recommendation decisions, invalidate stale advice, and expose count-only metrics', async (t) => {
   const storage = createStorage(t);
   await storage.insertSubmission(submission());
-  await storage.insertCrmFollowUpRecommendation(recommendation());
+  await storage.insertCrmFollowUpRecommendation(recommendation({
+    model_provider: 'openai',
+    model_id: 'synthetic-model-snapshot',
+    metadata: {
+      aiRequested: true,
+      aiUsed: true,
+      aiResponseState: 'completed',
+      aiLatencyMs: 40,
+      aiInputTokens: 100,
+      aiOutputTokens: 20,
+      aiCachedTokens: 10,
+      aiReasoningTokens: 5,
+    },
+  }));
 
   const acceptedDecision = await storage.createCrmEmailCommand({
     communication: communication(),
@@ -311,6 +325,17 @@ test('durable email commands record recommendation decisions, invalidate stale a
     submission_id: 'edited-submission',
     input_fingerprint: 'fingerprint-2',
     draft_body_text: 'An original suggested draft.',
+    metadata: {
+      aiRequested: true,
+      aiUsed: false,
+      aiFallbackReason: 'timeout',
+      aiResponseState: 'provider-error',
+      aiLatencyMs: 120,
+      aiInputTokens: null,
+      aiOutputTokens: null,
+      aiCachedTokens: null,
+      aiReasoningTokens: null,
+    },
   }));
   await storage.createCrmEmailCommand({
     communication: communication({
@@ -342,8 +367,60 @@ test('durable email commands record recommendation decisions, invalidate stale a
   assert.equal(metrics.outbox.queued, 2);
   assert.equal(metrics.recommendations.accepted, 1);
   assert.equal(metrics.recommendations.editedAndAccepted, 1);
+  assert.equal(metrics.recommendations.aiUsed, 1);
+  assert.equal(metrics.recommendations.aiFallback, 1);
+  assert.deepEqual(metrics.ai.fallbackReasons, { timeout: 1 });
+  assert.deepEqual(metrics.ai.responseStates, { completed: 1, 'provider-error': 1 });
+  assert.deepEqual(metrics.ai.latencyMs, {
+    observed: 2, average: 80, minimum: 40, maximum: 120, total: 160,
+  });
+  assert.deepEqual(metrics.ai.tokens, {
+    observed: 1, inputTotal: 100, outputTotal: 20, cachedTotal: 10, reasoningTotal: 5,
+  });
   assert.equal(metrics.suppressions.active, 0);
   assert.equal(Object.hasOwn(metrics, 'communications'), false, 'operational metrics never expose message records');
+});
+
+test('Supabase operational metrics preserve missing AI observations as null', async () => {
+  const storage = createSupabaseStorage(
+    { storage: { supabaseUrl: '', supabaseServiceRoleKey: '' } },
+    {
+      client: {
+        async rpc(name) {
+          assert.equal(name, 'get_crm_follow_up_operational_metrics');
+          return {
+            data: {
+              ai: {
+                fallbackReasons: { timeout: 2 },
+                responseStates: { 'provider-error': 2 },
+                latencyMs: { observed: 0, average: null, minimum: null, maximum: null, total: null },
+                tokens: {
+                  observed: 0,
+                  inputTotal: null,
+                  outputTotal: null,
+                  cachedTotal: null,
+                  reasoningTotal: null,
+                },
+              },
+            },
+            error: null,
+          };
+        },
+      },
+    },
+  );
+
+  const metrics = await storage.getCrmFollowUpOperationalMetrics({ since: initialAt });
+  assert.deepEqual(metrics.ai.latencyMs, {
+    observed: 0, average: null, minimum: null, maximum: null, total: null,
+  });
+  assert.deepEqual(metrics.ai.tokens, {
+    observed: 0,
+    inputTotal: null,
+    outputTotal: null,
+    cachedTotal: null,
+    reasoningTotal: null,
+  });
 });
 
 test('SQLite stores RFC identity, recommendations, and globally normalized suppressions', async (t) => {

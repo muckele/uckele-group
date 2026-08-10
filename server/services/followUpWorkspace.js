@@ -3,6 +3,7 @@ import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { getFollowUpEmailReadiness } from './followUpEmail.js';
 import { hasVerifiedFollowUpReply } from './emailReadiness.js';
+import { buildFollowUpAiReadiness } from './followUpAiPolicy.js';
 
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -179,6 +180,7 @@ export async function getCrmFollowUpContext({
     recipients.map((recipient) => storage.getActiveEmailSuppression?.(recipient.email)),
   )).filter(Boolean);
   const emailPolicy = getFollowUpEmailReadiness(config);
+  const aiPolicy = buildFollowUpAiReadiness(config);
   if (config.followUp?.requireVerifiedReply) {
     let verifiedReply = false;
     try {
@@ -223,9 +225,14 @@ export async function getCrmFollowUpContext({
           replyTo: normalizeEmail(config.followUp?.replyTo),
         },
         ai: {
-          enabled: Boolean(config.followUp?.aiEnabled),
-          ready: Boolean(config.followUp?.aiEnabled && config.followUp?.aiModel && config.followUp?.aiApiKeyConfigured),
+          enabled: aiPolicy.enabled,
+          ready: aiPolicy.ready,
           optional: true,
+          blockers: aiPolicy.blockers,
+          model: aiPolicy.model,
+          reasoningEffort: aiPolicy.reasoningEffort,
+          promptVersion: aiPolicy.promptVersion,
+          schemaVersion: aiPolicy.schemaVersion,
         },
         timezone: config.followUp?.timezone,
         sendWindowStart: config.followUp?.sendWindowStart,

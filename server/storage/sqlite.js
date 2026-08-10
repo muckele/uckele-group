@@ -4028,6 +4028,33 @@ export function createSqliteStorage(config) {
           (SELECT COUNT(*) FROM email_suppressions WHERE lifted_at IS NULL) AS suppressions_active
       `).get({ since: windowStartedAt });
       const count = (value) => Math.max(0, Math.floor(Number(value) || 0));
+      const aiMetadata = database.prepare(`
+        SELECT metadata FROM crm_follow_up_recommendations
+        WHERE created_at >= ? AND json_extract(metadata, '$.aiRequested') = 1
+      `).all(windowStartedAt).map((item) => parseJsonColumn(item.metadata, {}));
+      const countsBy = (field) => aiMetadata.reduce((result, metadata) => {
+        const value = String(metadata?.[field] || '').trim();
+        if (value) result[value] = count(result[value]) + 1;
+        return result;
+      }, {});
+      const observedValues = (field) => aiMetadata
+        .map((metadata) => metadata?.[field])
+        .filter((value) => (typeof value === 'number' || typeof value === 'string')
+          && String(value).trim() !== '')
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && value >= 0);
+      const aggregate = (values) => values.length > 0 ? {
+        observed: values.length,
+        average: Math.round((values.reduce((total, value) => total + value, 0) / values.length) * 10) / 10,
+        minimum: Math.min(...values),
+        maximum: Math.max(...values),
+        total: values.reduce((total, value) => total + value, 0),
+      } : { observed: 0, average: null, minimum: null, maximum: null, total: null };
+      const latency = aggregate(observedValues('aiLatencyMs'));
+      const inputTokens = aggregate(observedValues('aiInputTokens'));
+      const outputTokens = aggregate(observedValues('aiOutputTokens'));
+      const cachedTokens = aggregate(observedValues('aiCachedTokens'));
+      const reasoningTokens = aggregate(observedValues('aiReasoningTokens'));
       return {
         windowStartedAt,
         outbox: {
@@ -4044,6 +4071,18 @@ export function createSqliteStorage(config) {
           editedAndAccepted: count(row.recommendations_edited_and_accepted), dismissed: count(row.recommendations_dismissed),
           superseded: count(row.recommendations_superseded), failed: count(row.recommendations_failed),
           aiUsed: count(row.ai_used), aiFallback: count(row.ai_fallback),
+        },
+        ai: {
+          fallbackReasons: countsBy('aiFallbackReason'),
+          responseStates: countsBy('aiResponseState'),
+          latencyMs: latency,
+          tokens: {
+            observed: Math.max(inputTokens.observed, outputTokens.observed),
+            inputTotal: inputTokens.total,
+            outputTotal: outputTokens.total,
+            cachedTotal: cachedTokens.total,
+            reasoningTotal: reasoningTokens.total,
+          },
         },
         suppressions: { active: count(row.suppressions_active) },
       };

@@ -27,6 +27,7 @@ For an existing Supabase database, apply these migrations in order:
 
 1. `supabase/migrations/20260809120000_crm_follow_up_workspace.sql`
 2. `supabase/migrations/20260809123000_follow_up_queue_pagination.sql`
+3. `supabase/migrations/20260810120000_follow_up_ai_metrics.sql`
 
 `supabase/schema.sql` is the fresh-database schema. The new outbox, recommendation, suppression, and communication fields remain server-role only. Row-level security is enabled; privileges are revoked from `public`, `anon`, and `authenticated`, and granted to `service_role` only. Do not place the Supabase service-role key in browser configuration.
 
@@ -57,12 +58,50 @@ The server rejects an enabled but incomplete configuration during startup. Opera
 AI enrichment is independent and optional. Enabling it requires:
 
 - `FOLLOW_UP_AI_ENABLED=true`
-- `FOLLOW_UP_AI_MODEL` set to a model approved for this workload
-- `OPENAI_API_KEY`
+- `FOLLOW_UP_AI_MODEL` set to the exact model identifier accepted for this workload;
+- `OPENAI_API_KEY` from the approved OpenAI project;
+- an explicit `FOLLOW_UP_AI_REASONING_EFFORT` (`low` is the evaluation baseline);
+- reviewed bounds in `FOLLOW_UP_AI_TIMEOUT_MS`, `FOLLOW_UP_AI_MAX_CONTEXT_CHARS`, `FOLLOW_UP_AI_MAX_OUTPUT_TOKENS`, `FOLLOW_UP_AI_MAX_RETRIES`, and `FOLLOW_UP_AI_RATE_LIMIT_PER_MINUTE`;
+- `FOLLOW_UP_AI_DATA_HANDLING_APPROVAL_ID`, a non-secret reference to the completed privacy/data-handling approval;
+- `FOLLOW_UP_AI_ACCEPTED_EVAL_VERSION=follow-up-eval-v1` after the matching live synthetic and human evaluation is accepted;
+- `FOLLOW_UP_AI_COST_RATE_APPROVAL_ID`, a non-secret reference to the approved cost, latency, and rate envelope; and
+- `FOLLOW_UP_AI_SYNTHETIC_SMOKE_ID`, a non-secret reference to a reviewed smoke from the approved project.
 
-The application uses the OpenAI Responses API with strict structured output, `store: false`, no tools, a bounded context, a timeout, and application-side Zod validation. Email bodies are labeled as untrusted quoted data; instructions within them must be ignored. Attachment contents are not sent or analyzed—only bounded attachment metadata is available. The model cannot change the deterministic action or safety result, recipients, headers, or send authorization.
+Startup fails closed if AI is enabled without any one of these items or if the accepted evaluation version differs from the code's current version. Operations shows model/key presence, bounds, approval states, eval version, and smoke state independently. The default and example flags stay false.
+
+The application uses the OpenAI Responses API with strict structured output, `store: false`, no tools, explicit reasoning effort, bounded input and output, a timeout, deliberately bounded retries, an application request-rate cap, and application-side Zod validation. The OpenAI SDK's implicit retries are disabled at client construction and set explicitly per request. Concurrent identical requests share one in-process provider call; a slower older request cannot supersede a newer different fingerprint in the current process; and persisted recommendations are cached by a fingerprint that includes normalized allowed inputs, time-bound policy signals, engine/rules/prompt/schema/eval versions, the configured model, and every request/result-changing AI bound. The current SQLite deployment remains single-machine; reassess durable cross-instance coordination before horizontally scaling recommendation generation.
+
+### Exact OpenAI data boundary
+
+The dedicated model projection may send only:
+
+- the deterministic action, state, timing, rationale, signals, questions, commitments, blockers, safety flags, draft, and immutable `sendAllowed: false` result;
+- a safe first name and redacted company label for presentation;
+- opaque per-request evidence labels, direction, occurrence time, redacted subject/plain-text body, lifecycle/content state, communication kind, legacy-content flag, and attachment-presence boolean;
+- a count of available secure documents and bounded CIM request state/delivery/follow-up timing; and
+- prompt/schema contract identifiers and the instruction that all evidence is untrusted quoted data.
+
+Before serialization, address-like strings, URLs, RFC-style header lines, and secret/token patterns in free text are replaced with redaction markers. The payload is then reduced to the configured character cap.
+
+The projection never sends email addresses; To/From/CC/BCC/Reply-To values; raw RFC Message-ID, In-Reply-To, References, or header objects; listing, business, secure-document, or other URLs; attachment names, IDs, MIME types, sizes, or contents; document names, IDs, or contents; suppression addresses/reason labels; raw HTML; CRM notes; API keys; or internal submission, communication, attachment, document, CIM-request, or listing identifiers. Original communication IDs are translated to opaque evidence labels and are restored only after the returned labels pass membership and duplicate checks.
+
+The model output schema contains enrichment fields only: rationale, evidence labels, signals, commitments, questions, blockers, subject, and body. It contains no intent, action, timing, recipient, header, confidence, authorization, tool, queue, or send field. The deterministic layer retains action, intent, timing, confidence, blockers/safety authority, and `sendAllowed: false`. Hard-stop recommendations do not request AI at all. Attachment contents are never sent or analyzed.
 
 `store: false` is an API request control, not a claim of zero data retention or Zero Data Retention eligibility. Confirm the organization’s current OpenAI data controls, approved model, contractual terms, and retention requirements separately before enabling AI with real CRM data. Do not log prompts, raw message bodies, API keys, or model responses outside the protected recommendation record.
+
+### Failure behavior and redacted observations
+
+Refusal, incomplete/max-output, content filtering, empty output, missing or different returned model, unexpected/failed/cancelled response state, invalid JSON/schema, unknown or duplicate evidence, unsafe output, authentication, provider rate-limit, timeout, transient/permanent provider error, local request-rate exhaustion, and context overflow all produce a bounded reason code and return the deterministic recommendation. The configured and returned model IDs must match exactly, preventing an alias or provider-side target change from being silently accepted. The application does not retain provider error or refusal bodies. It does not retry ambiguous application work, and a context reload/fingerprint mismatch discards stale advice with a conflict.
+
+Recommendation metadata retains only bounded provenance/contract versions; configured and returned model IDs; response state and safe fallback category; request outcome (`cache`, single-flight leader/shared, or provider); and numeric request/response character, latency, and input/output/cached/reasoning token observations. Operations exposes aggregate counts, fallback/response-state maps, latency ranges, and token totals without message records or bodies. Missing observations remain `Not observed`; they are not coerced to zero. The Follow-ups UI labels results as `Deterministic`, `AI-enriched · human review required`, or `AI unavailable; deterministic result shown`. No model-derived probability is presented as calibrated confidence.
+
+### Evaluation and model decision
+
+Run `npm run eval:follow-ups` for the credential-free frozen corpus before release. The baseline is 51/51 deterministic cases passing across 40 regression and 11 holdout cases plus 24/24 fake-client adapter response/fault cases. The checked baseline includes a SHA-256 over both fixture files, and the runner refuses unreviewed corpus/version/count/split drift. Read [the evaluation protocol](../evals/follow-up-recommendations/README.md) before any live call.
+
+No paid live evaluation has been authorized or run as of 2026-08-10, and no production model is selected. The initial bounded comparison is `gpt-5.6-terra:low` versus `gpt-5.6-sol:low`; `medium` is considered only if low effort misses a material quality target. A candidate needs 100% automatic safety/schema gates, at least 90% blinded human usable-with-minor-edits results, an allowed exact returned model, and approved measured latency/token/cost/rate evidence. Documentation positioning alone is not a model selection.
+
+Current official guidance was reviewed on 2026-08-10: [model selection](https://developers.openai.com/api/docs/guides/latest-model.md), [GPT-5.6 migration and explicit reasoning effort](https://developers.openai.com/api/docs/guides/upgrading-to-gpt-5p6-sol.md), [prompting](https://developers.openai.com/api/docs/guides/prompt-guidance-gpt-5p6.md), [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs), [Responses/reasoning](https://developers.openai.com/api/docs/guides/reasoning), [data controls](https://developers.openai.com/api/docs/guides/your-data#v1responses), and [evaluation practice](https://developers.openai.com/api/docs/guides/evaluation-best-practices). Re-check these sources and dated pricing before approval because model availability and controls can change.
 
 ## Resend sender, receiving, and webhook setup
 
@@ -110,8 +149,10 @@ Use this sequence and stop whenever a check is not green:
 7. Enable `FOLLOW_UP_EMAIL_ENABLED=true` for a small administrator group with conservative caps. Keep `FOLLOW_UP_AI_ENABLED=false` initially.
 8. Send only a few manually reviewed messages. Inspect every durable outbox result and provider event. Confirm that provider acceptance is not being mistaken for delivery and that replies stop outreach.
 9. Review the 30-day Operations metrics: recommendation acceptance, draft edits, dismissals, delivery, bounce, reply, AI fallback, active suppressions, recent volume, and outbox failures.
-10. Only after the deterministic workflow is stable, complete the OpenAI privacy/model review and optionally enable AI for bounded enrichment. Deliberately test provider failure and timeout; deterministic recommendations must remain usable.
-11. Increase caps only through a reviewed configuration change. Never use an empty queue or low bounce count as the sole justification for expansion.
+10. With both production flags still false, complete the OpenAI privacy/project review and authorize the guarded, synthetic-only paid comparison. Blind-review the frozen regression and holdout results and record the accepted model/effort, exact returned model, eval version, dated cost, latency/token envelope, and request cap.
+11. Run the controlled synthetic smoke from the approved project. Confirm strict schema success, no canary disclosure, returned-model match, observed usage/latency, and deterministic fallback under induced adapter timeout/provider failure. Record the reviewed evidence and approval identifiers; do not put secrets in the identifiers.
+12. Only after every AI readiness card is green may a release owner separately decide whether to enable AI for a limited admin canary. AI remains decision support, and every draft still requires human review. Keep generic email independently gated.
+13. Increase caps only through a reviewed configuration change. Never use an empty queue, low fallback rate, or low bounce count as the sole justification for expansion.
 
 No step in this runbook authorizes an automatic mass send. The workspace always requires a human preview, exact final confirmation, and one explicit send action.
 
@@ -130,6 +171,8 @@ Review Operations and the Follow-ups Workspace at least each business day while 
 - recommendation acceptance, edit, and dismissal rates;
 - delivery, bounce, and reply rates;
 - AI fallback/error rate when AI is enabled;
+- AI response states, fallback reasons, latency distribution, and input/output/cached/reasoning token totals, treating missing values as unobserved;
+- unexpected configured-versus-returned model differences or contract-version drift;
 - unexpected changes in sender domain authentication or webhook health.
 
 Metrics are aggregate counts and rates derived from durable outbox, lifecycle, recommendation, and suppression records. The Operations response does not include message bodies. Metrics with very small denominators are directional only; investigate underlying audited records before changing policy.
@@ -164,5 +207,7 @@ For a generic-email incident:
 5. Keep the additive schema. Roll application code back only after confirming the older version tolerates the added columns/tables.
 6. Preserve provider events, activity events, recommendations, suppressions, and outbox records for investigation.
 7. Run the backend, UI, build, and smoke checks against the rollback candidate before deployment.
+
+For an AI incident, immediately set `FOLLOW_UP_AI_ENABLED=false` and restart/redeploy through the normal configuration process; deterministic recommendations remain available. Preserve bounded provenance and aggregate observations, but never copy raw CRM bodies or provider errors into general logs. If key exposure is suspected, revoke the affected key in the approved OpenAI project, create a replacement with the minimum required scope through the secret-management process, update the deployment secret, and invalidate the prior smoke evidence. Re-run the guarded synthetic comparison or smoke required by the incident owner before any re-enable. A key rotation, model change, prompt/schema/eval-version change, or material bound change requires renewed evidence rather than silently reusing an old acceptance ID.
 
 If confidentiality, recipient correctness, or suppression integrity is uncertain, keep sending disabled and escalate to the responsible security/compliance owner. Safety and reconciliation take priority over cadence.

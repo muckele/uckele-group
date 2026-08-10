@@ -1,0 +1,38 @@
+{
+  "evalVersion": "follow-up-eval-v1",
+  "recordedAt": "2026-08-10",
+  "privacy": "synthetic-only",
+  "corpusSha256": "c95846669f98e49a07eaf7d90c2e22c4bc21ed6694c58f88d10b7135544ee4f7",
+  "fixtureCount": 51,
+  "faultFixtureCount": 24,
+  "splits": {
+    "regression": 40,
+    "holdout": 11
+  },
+  "deterministic": {
+    "passedCases": 51,
+    "failedCases": 0,
+    "expectedActionAndState": true,
+    "sendAllowedFalse": true,
+    "suppliedEvidenceOnly": true
+  },
+  "adapterFaults": {
+    "passedCases": 24,
+    "failedCases": 0,
+    "covers": "completed, refusal, incomplete, empty, returned-model enforcement, malformed/schema-invalid output, evidence violations, unsafe content, auth, rate limit, timeout, transient/permanent errors, and failed/cancelled/unexpected response states"
+  },
+  "liveModelComparison": {
+    "status": "not-authorized-not-run",
+    "startingCandidates": [
+      { "model": "gpt-5.6-terra", "reasoningEffort": "low" },
+      { "model": "gpt-5.6-sol", "reasoningEffort": "low" }
+    ],
+    "mediumEffortCondition": "Only if low reasoning misses a material quality target.",
+    "selectedModel": null,
+    "quality": null,
+    "latency": null,
+    "tokens": null,
+    "costEstimate": null
+  },
+  "rolloutDecision": "Keep optional AI disabled until the live synthetic comparison, blind human review, privacy approval, cost/rate approval, and controlled smoke are accepted."
+}

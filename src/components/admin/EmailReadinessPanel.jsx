@@ -26,6 +26,8 @@ function Status({ label, state, detail }) {
 export default function EmailReadinessPanel({ data, onSendTest, testSending = false }) {
   if (!data) return null;
 
+  const aiReadiness = data.aiReadiness || {};
+
   const deliveryState = data.deliveryTrackingVerified
     ? ['ready', 'Verified by webhook event']
     : data.deliveryTrackingConfigured
@@ -52,14 +54,25 @@ export default function EmailReadinessPanel({ data, onSendTest, testSending = fa
   const complianceState = data.physicalPostalAddressConfigured && data.optOutConfigured
     ? ['ready', `${data.replyOptOutConfigured ? 'Reply-based' : 'External link-based'} opt-out and postal footer configured`]
     : ['blocked', 'Postal address or opt-out mechanism missing'];
-  const aiState = data.aiEnabled
+  const aiFlagState = data.aiEnabled
     ? data.aiReady
-      ? ['ready', `${data.aiModel || 'Configured model'} · optional enrichment only`]
-      : ['blocked', 'Enabled but model or API key is missing']
-    : ['waiting', 'Optional enrichment is off; deterministic rules remain available'];
+      ? ['ready', 'Enabled after all readiness gates']
+      : ['blocked', 'Enabled but blocked by readiness gates']
+    : ['waiting', 'Feature flag is off'];
+  const aiBoundsReady = aiReadiness.reasoningConfigured && aiReadiness.timeoutConfigured
+    && aiReadiness.contextLimitConfigured && aiReadiness.outputLimitConfigured
+    && aiReadiness.retryLimitConfigured && aiReadiness.rateLimitConfigured;
+  const aiEvalState = aiReadiness.evalAccepted
+    ? ['ready', `${aiReadiness.acceptedEvalVersion} accepted`]
+    : ['blocked', `${aiReadiness.expectedEvalVersion || 'Current eval'} not accepted`];
+  const aiSmokeState = aiReadiness.syntheticSmokeObserved
+    ? ['ready', 'Controlled synthetic smoke recorded']
+    : ['blocked', 'Controlled synthetic smoke not observed'];
   const metrics = data.metrics || {};
   const metricRates = metrics.rates || {};
   const outboxAttention = Number(metrics.outbox?.ambiguous || 0) + Number(metrics.outbox?.retryableFailed || 0);
+  const aiOutcomeCount = Number(metrics.recommendations?.aiUsed || 0)
+    + Number(metrics.recommendations?.aiFallback || 0);
 
   return (
     <section className="rounded-2xl border border-line bg-white/75 p-5" aria-labelledby="email-readiness-heading">
@@ -96,7 +109,15 @@ export default function EmailReadinessPanel({ data, onSendTest, testSending = fa
         <Status detail={genericFollowUpState[1]} label="CRM Email Actions" state={genericFollowUpState[0]} />
         <Status detail={suppressionState[1]} label="Suppressions" state={suppressionState[0]} />
         <Status detail={complianceState[1]} label="Footer & Opt-Out" state={complianceState[0]} />
-        <Status detail={aiState[1]} label="AI Enrichment" state={aiState[0]} />
+        <Status detail="Credential-free rules are authoritative and available" label="Deterministic Recommendations" state="ready" />
+        <Status detail={aiFlagState[1]} label="AI Feature Flag" state={aiFlagState[0]} />
+        <Status detail={data.aiModel || 'No model selected'} label="AI Model" state={aiReadiness.modelConfigured ? 'ready' : 'blocked'} />
+        <Status detail={aiReadiness.apiKeyConfigured ? 'Present (value hidden)' : 'Not configured'} label="AI API Key" state={aiReadiness.apiKeyConfigured ? 'ready' : 'blocked'} />
+        <Status detail={aiBoundsReady ? `${aiReadiness.reasoningEffort} reasoning · bounded` : 'One or more request bounds are invalid'} label="AI Request Bounds" state={aiBoundsReady ? 'ready' : 'blocked'} />
+        <Status detail={aiReadiness.dataHandlingApproved ? 'Approval recorded' : 'Approval missing'} label="AI Data Approval" state={aiReadiness.dataHandlingApproved ? 'ready' : 'blocked'} />
+        <Status detail={aiReadiness.costRateApproved ? 'Approval recorded' : 'Approval missing'} label="AI Cost & Rate" state={aiReadiness.costRateApproved ? 'ready' : 'blocked'} />
+        <Status detail={aiEvalState[1]} label="AI Evaluation" state={aiEvalState[0]} />
+        <Status detail={aiSmokeState[1]} label="AI Synthetic Smoke" state={aiSmokeState[0]} />
       </div>
 
       <div className="mt-5 grid gap-3 text-xs leading-6 text-ink/65 md:grid-cols-2">
@@ -107,6 +128,8 @@ export default function EmailReadinessPanel({ data, onSendTest, testSending = fa
         <p><strong className="text-ink">Verified test reply:</strong> {formatDate(data.latestVerifiedReplyEvent?.createdAt)}</p>
         <p><strong className="text-ink">Last test event:</strong> {data.latestTestEvent ? `${data.latestTestEvent.eventType} · ${formatDate(data.latestTestEvent.createdAt)}` : 'Not observed'}</p>
         <p><strong className="text-ink">30-day metric window:</strong> {data.metricsAvailable ? `Since ${formatDate(metrics.windowStartedAt)}` : 'Unavailable'}</p>
+        <p><strong className="text-ink">AI contract:</strong> {aiReadiness.promptVersion || 'Unknown prompt'} · {aiReadiness.schemaVersion || 'unknown schema'}</p>
+        <p><strong className="text-ink">AI bounds:</strong> {aiReadiness.maxContextCharacters ?? 'Not configured'} input characters · {aiReadiness.maxOutputTokens ?? 'Not configured'} output tokens · {aiReadiness.timeoutMs ?? 'Not configured'} ms · {aiReadiness.maxRetries ?? 'Not configured'} retries · {aiReadiness.rateLimitPerMinute ?? 'Not configured'} requests/minute</p>
       </div>
 
       {data.metricsAvailable ? (
@@ -120,7 +143,9 @@ export default function EmailReadinessPanel({ data, onSendTest, testSending = fa
               ['Delivery', `${metricRates.delivery || 0}%`],
               ['Bounce', `${metricRates.bounce || 0}%`],
               ['Reply', `${metricRates.reply || 0}%`],
-              ['AI fallback', `${metricRates.aiFallback || 0}%`],
+              ['AI fallback', metricRates.aiFallback === null || metricRates.aiFallback === undefined
+                ? 'Not observed'
+                : `${metricRates.aiFallback}%`],
             ].map(([label, value]) => (
               <div className="rounded-xl border border-line bg-fog/60 p-3" key={label}>
                 <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-ink/52">{label}</p>
@@ -131,6 +156,28 @@ export default function EmailReadinessPanel({ data, onSendTest, testSending = fa
           <p className="mt-3 text-xs leading-5 text-ink/55">
             Durable outbox: {metrics.outbox?.queued || 0} queued · {metrics.outbox?.sending || 0} sending · {metrics.outbox?.accepted || 0} provider-accepted · {metrics.outbox?.ambiguous || 0} ambiguous · {metrics.outbox?.retryableFailed || 0} retryable · {metrics.outbox?.permanentFailed || 0} permanent failures. Counts only; Operations never returns message bodies.
           </p>
+          <div className="mt-3 rounded-xl border border-line bg-fog/60 p-3 text-xs leading-5 text-ink/65">
+            <p className="font-semibold text-ink">Redacted AI observations</p>
+            <p className="mt-1">
+              Runs: {aiOutcomeCount
+                ? `${metrics.recommendations?.aiUsed || 0} enriched / ${metrics.recommendations?.aiFallback || 0} fallback`
+                : 'Not observed'} · Response states: {Object.entries(metrics.ai?.responseStates || {}).length
+                ? Object.entries(metrics.ai.responseStates).map(([state, total]) => `${state} ${total}`).join(' · ')
+                : 'Not observed'}.
+            </p>
+            <p className="mt-1">
+              Latency: {metrics.ai?.latencyMs?.observed
+                ? `${metrics.ai.latencyMs.average} ms average (${metrics.ai.latencyMs.minimum}–${metrics.ai.latencyMs.maximum} ms)`
+                : 'Not observed'} · Tokens: {metrics.ai?.tokens?.observed
+                ? `${metrics.ai.tokens.inputTotal ?? 'unknown'} input / ${metrics.ai.tokens.outputTotal ?? 'unknown'} output / ${metrics.ai.tokens.cachedTotal ?? 'unknown'} cached / ${metrics.ai.tokens.reasoningTotal ?? 'unknown'} reasoning`
+                : 'Not observed'}.
+            </p>
+            <p className="mt-1">
+              Fallback reasons: {Object.entries(metrics.ai?.fallbackReasons || {}).length
+                ? Object.entries(metrics.ai.fallbackReasons).map(([reason, total]) => `${reason} ${total}`).join(' · ')
+                : 'Not observed'}.
+            </p>
+          </div>
         </div>
       ) : null}
 

@@ -2637,6 +2637,65 @@ as $$
       'aiUsed', (select count(*) from public.crm_follow_up_recommendations where created_at >= p_since and model_provider is not null),
       'aiFallback', (select count(*) from public.crm_follow_up_recommendations where created_at >= p_since and metadata ->> 'aiRequested' = 'true' and metadata ->> 'aiUsed' = 'false')
     ),
+    'ai', jsonb_build_object(
+      'fallbackReasons', (
+        select coalesce(jsonb_object_agg(reason, total), '{}'::jsonb)
+        from (
+          select metadata ->> 'aiFallbackReason' as reason, count(*) as total
+          from public.crm_follow_up_recommendations
+          where created_at >= p_since
+            and metadata ->> 'aiRequested' = 'true'
+            and nullif(metadata ->> 'aiFallbackReason', '') is not null
+          group by metadata ->> 'aiFallbackReason'
+        ) as reasons
+      ),
+      'responseStates', (
+        select coalesce(jsonb_object_agg(response_state, total), '{}'::jsonb)
+        from (
+          select metadata ->> 'aiResponseState' as response_state, count(*) as total
+          from public.crm_follow_up_recommendations
+          where created_at >= p_since
+            and metadata ->> 'aiRequested' = 'true'
+            and nullif(metadata ->> 'aiResponseState', '') is not null
+          group by metadata ->> 'aiResponseState'
+        ) as states
+      ),
+      'latencyMs', (
+        select jsonb_build_object(
+          'observed', count(value),
+          'average', case when count(value) > 0 then round(avg(value), 1) else null end,
+          'minimum', min(value),
+          'maximum', max(value),
+          'total', sum(value)
+        )
+        from (
+          select case
+            when metadata ->> 'aiLatencyMs' ~ '^[0-9]+$' then (metadata ->> 'aiLatencyMs')::numeric
+            else null
+          end as value
+          from public.crm_follow_up_recommendations
+          where created_at >= p_since and metadata ->> 'aiRequested' = 'true'
+        ) as latency
+      ),
+      'tokens', (
+        select jsonb_build_object(
+          'observed', count(*) filter (where input_tokens is not null or output_tokens is not null),
+          'inputTotal', sum(input_tokens),
+          'outputTotal', sum(output_tokens),
+          'cachedTotal', sum(cached_tokens),
+          'reasoningTotal', sum(reasoning_tokens)
+        )
+        from (
+          select
+            case when metadata ->> 'aiInputTokens' ~ '^[0-9]+$' then (metadata ->> 'aiInputTokens')::bigint else null end as input_tokens,
+            case when metadata ->> 'aiOutputTokens' ~ '^[0-9]+$' then (metadata ->> 'aiOutputTokens')::bigint else null end as output_tokens,
+            case when metadata ->> 'aiCachedTokens' ~ '^[0-9]+$' then (metadata ->> 'aiCachedTokens')::bigint else null end as cached_tokens,
+            case when metadata ->> 'aiReasoningTokens' ~ '^[0-9]+$' then (metadata ->> 'aiReasoningTokens')::bigint else null end as reasoning_tokens
+          from public.crm_follow_up_recommendations
+          where created_at >= p_since and metadata ->> 'aiRequested' = 'true'
+        ) as usage
+      )
+    ),
     'suppressions', jsonb_build_object(
       'active', (select count(*) from public.email_suppressions where lifted_at is null)
     )
