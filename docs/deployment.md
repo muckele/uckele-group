@@ -34,8 +34,6 @@ fly secrets set \
   RESEND_WEBHOOK_SECRET=... \
   EMAIL_BRAND_COMPANY_NAME="Uckele Group" \
   DEAL_HUNTER_EMAIL_RECIPIENT=mathew@uckelegroup.com \
-  DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL="https://airtable.com/appEGxhjno0HTpEco/shrUhtbnzZTPaR4Lk/tblACIQ9QNiVmoWSK?viewControls=on" \
-  DEAL_HUNTER_AIRTABLE_TOKEN=... \
   DEAL_HUNTER_SHEET_CSV_URL="https://docs.google.com/spreadsheets/d/.../gviz/tq?tqx=out:csv&gid=..." \
   ADMIN_AUTH_MODE=magic-link \
   ADMIN_EMAIL=mathew@uckelegroup.com \
@@ -59,13 +57,19 @@ fly secrets set \
   DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR=/data/deal-hunter-daily-email \
   ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH=/data/acquisition-command-center-source-health.json \
   DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES=8388608 \
+  DEAL_HUNTER_AIRTABLE_ENABLED=false \
   DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES=12582912 \
   DEAL_HUNTER_AIRTABLE_BASE_ID=appEGxhjno0HTpEco \
   DEAL_HUNTER_AIRTABLE_TABLE_ID=tblACIQ9QNiVmoWSK \
   DEAL_HUNTER_AIRTABLE_VIEW_ID=viw4OORhKKWPUsWa4 \
+  DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES=8388608 \
+  DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS=1000 \
+  DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS=72 \
   DEFAULT_LEAD_ASSIGNEE="Mathew Uckele" \
   DEFAULT_FOLLOW_UP_DELAY_HOURS=24
 ```
+
+Only if the legacy Airtable source is deliberately retained, set `DEAL_HUNTER_AIRTABLE_ENABLED=true` together with the shared-view URL or a read-only `DEAL_HUNTER_AIRTABLE_TOKEN` and its base/table/view identifiers. Do not enable the source without an access method that passes a fresh source review.
 
 If you enable Turnstile, configure the public site key and secret at runtime. The site key is browser-safe and is exposed through `/api/public-config`; the secret stays server-only:
 
@@ -122,7 +126,7 @@ Then update DNS:
 - Configure a Resend receiving subdomain such as `replies.uckelegroup.com`, set `RESEND_INBOUND_DOMAIN` to that domain, and set `RESEND_REPLY_TO` to an address on it. Do not replace the root domain's existing MX records.
 - Use `DELIVERY_PROVIDER=resend` for live CIM initial and follow-up outreach. EmailJS may still deliver ordinary application mail, but CIM sends intentionally fail closed before the network because that provider cannot supply the durable acceptance/idempotency proof required for safe retry.
 - Keep `DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED=false` until the Operations email-readiness panel shows a verified inbound reply from the controlled test email. When enabling it, set the intended delay sequence, maximum count, weekday policy, and timezone explicitly.
-- Apply every committed Supabase migration before deploying code when `STORAGE_PROVIDER=supabase` is enabled. Confirm that `20260806120000_crm_communications_lifecycle.sql`, `20260809120000_crm_follow_up_workspace.sql`, `20260809123000_follow_up_queue_pagination.sql`, and `20260810120000_follow_up_ai_metrics.sql` complete successfully before starting the new application version.
+- Apply every committed Supabase migration before deploying code when `STORAGE_PROVIDER=supabase` is enabled. Confirm that `20260806120000_crm_communications_lifecycle.sql`, `20260809120000_crm_follow_up_workspace.sql`, `20260809123000_follow_up_queue_pagination.sql`, `20260810120000_follow_up_ai_metrics.sql`, and `20260810130000_deal_os_exports.sql` complete successfully before starting the new application version.
 - Keep `FOLLOW_UP_EMAIL_ENABLED=false` and `FOLLOW_UP_AI_ENABLED=false` through the schema rollout. AI startup validation requires an approved exact model/key project, explicit reasoning and request bounds, data-handling approval, accepted current eval version, cost/rate approval, and controlled synthetic-smoke evidence. Follow [follow-up-operations.md](/Users/Matt/Documents/uckele-group/docs/follow-up-operations.md) for the backup, provider, inbound-reply, suppression, compliance, AI evaluation, smoke, and restricted-canary checks required before either flag is enabled.
 - Keep the secure document `.trash` directory on the persistent volume; startup and hourly cleanup reconciliation depend on it. Every file-mutating upload or deletion records a write-ahead cleanup intent before its first write or move. When database persistence cannot be confirmed, a private local `.reconciliation.json` sidecar preserves the intent until it can be imported safely; atomic temporary writes and directory syncing allow a valid intent to be recovered after abrupt process loss. Ambiguous mutations remain staged for the settlement window. A reconciler must then acquire the job's opaque, expiring lease token. The database clock renews a still-valid token before every filesystem mutation (including each file in a batch), and token-fenced state transitions reject expired leases. Reconciliation rejects paths outside the intent's exact operation directory, destinations inconsistent with the corresponding secure-document record, and filesystem or state changes from stale lease owners.
 - Application-consistent SQLite backups run daily at `03:30 America/Los_Angeles`, retain 14 verified bundles/days by default, and are visible in the admin-only Operations page.
@@ -132,6 +136,8 @@ Then update DNS:
 
 - Confirm the contact form is delivering to `mathew@uckelegroup.com`
 - Confirm `/admin` can run Deal Hunter scoring and send the daily email
+- With Airtable disabled, confirm no Airtable source request is made, the admin review and email disclose limited coverage, and the remaining configured sources can pass the send gate
+- Upload controlled CSV and XLSX Deal OS fixtures as a full administrator; confirm viewer upload is denied, provenance/age/coverage appear in source health, duplicate identities do not create duplicate deals, and an export older than the configured window pauses the send gate
 - With Resend configured, confirm `/admin` can send a controlled 75+ Deal Hunter CIM request and run the CIM follow-up check
 - Confirm the in-app scheduler logs `deal-hunter:scheduler` startup and sends after the configured Pacific time
 - If using an external scheduler, confirm it posts to `/api/deal-hunter/daily-email` with `Authorization: Bearer DEAL_HUNTER_CRON_SECRET`

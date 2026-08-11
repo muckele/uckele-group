@@ -199,6 +199,32 @@ test('environment parsing does not normalize invalid AI enablement controls into
   }
 });
 
+test('Deal Hunter parses explicit Airtable retirement and validates Deal OS import bounds', () => {
+  const configModuleUrl = new URL('../server/config.js', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--input-type=module', '--eval', [
+    `import { getConfig, validateConfig } from ${JSON.stringify(configModuleUrl)};`,
+    'const config = getConfig();',
+    'const validation = validateConfig(config);',
+    'console.log(JSON.stringify({ dealHunter: config.dealHunter, errors: validation.errors }));',
+  ].join('\n')], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      NODE_ENV: 'development',
+      DEAL_HUNTER_AIRTABLE_ENABLED: 'false',
+      DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES: 'not-a-number',
+      DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS: '1001',
+      DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS: '721',
+    },
+  });
+  assert.equal(child.status, 0, child.stderr);
+  const parsed = JSON.parse(child.stdout.trim());
+  assert.equal(parsed.dealHunter.airtableEnabled, false);
+  assert.ok(parsed.errors.some((error) => error.includes('DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES')));
+  assert.ok(parsed.errors.some((error) => error.includes('DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS')));
+  assert.ok(parsed.errors.some((error) => error.includes('DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS')));
+});
+
 test('generic follow-up sender and reply identities must align with verified Resend configuration', () => {
   const config = productionConfig();
   config.followUp = {

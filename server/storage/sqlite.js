@@ -255,6 +255,17 @@ function normalizeDealHunterSeenDealRow(row) {
     : null;
 }
 
+function normalizeDealHunterDealOsImportRow(row) {
+  return row
+    ? {
+        ...row,
+        coverage_limit_reached: Boolean(row.coverage_limit_reached),
+        records: parseJsonColumn(row.records, []),
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
 function normalizeDealHunterCimRequestRow(row) {
   return row
     ? {
@@ -456,6 +467,16 @@ function serializeDealHunterSeenDeal(deal) {
     ...deal,
     should_remove: deal.should_remove ? 1 : 0,
     metadata: JSON.stringify(deal.metadata || {}),
+  };
+}
+
+function serializeDealHunterDealOsImport(record) {
+  return {
+    ...record,
+    expected_row_count: record.expected_row_count ?? null,
+    coverage_limit_reached: record.coverage_limit_reached ? 1 : 0,
+    records: JSON.stringify(Array.isArray(record.records) ? record.records : []),
+    metadata: JSON.stringify(record.metadata || {}),
   };
 }
 
@@ -975,6 +996,27 @@ export function createSqliteStorage(config) {
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
+    CREATE TABLE IF NOT EXISTS deal_hunter_deal_os_imports (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      imported_by TEXT NOT NULL,
+      exported_at TEXT NOT NULL,
+      file_name TEXT NOT NULL,
+      file_type TEXT NOT NULL,
+      file_size INTEGER NOT NULL,
+      file_sha256 TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      coverage_label TEXT NOT NULL,
+      expected_row_count INTEGER,
+      row_count INTEGER NOT NULL,
+      duplicate_count INTEGER NOT NULL DEFAULT 0,
+      stable_id_count INTEGER NOT NULL DEFAULT 0,
+      listing_url_count INTEGER NOT NULL DEFAULT 0,
+      coverage_limit_reached INTEGER NOT NULL DEFAULT 0,
+      records TEXT NOT NULL DEFAULT '[]',
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+
 	    CREATE TABLE IF NOT EXISTS deal_hunter_cim_requests (
 	      id TEXT PRIMARY KEY,
 	      created_at TEXT NOT NULL,
@@ -1191,6 +1233,8 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_email_suppressions_active ON email_suppressions(normalized_email) WHERE lifted_at IS NULL;
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_last_seen_at ON deal_hunter_seen_deals(last_seen_at DESC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_seen_deals_source_id ON deal_hunter_seen_deals(source_id, last_seen_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_deal_os_imports_created_at ON deal_hunter_deal_os_imports(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_deal_os_imports_exported_at ON deal_hunter_deal_os_imports(exported_at DESC);
 	    CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_deal_recipient ON deal_hunter_cim_requests(deal_key, recipient_email);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_deal_key ON deal_hunter_cim_requests(deal_key, updated_at DESC);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_reviews_created ON deal_hunter_cim_reviews(created_at DESC);
@@ -4365,6 +4409,42 @@ export function createSqliteStorage(config) {
 		      upsertDealHunterSeenDealsTransaction(records);
 		      return records;
 		    },
+
+    async insertDealHunterDealOsImport(record) {
+      const serialized = serializeDealHunterDealOsImport(record);
+      database.prepare(`
+        INSERT INTO deal_hunter_deal_os_imports (
+          id, created_at, imported_by, exported_at, file_name, file_type, file_size, file_sha256,
+          scope, coverage_label, expected_row_count, row_count, duplicate_count, stable_id_count,
+          listing_url_count, coverage_limit_reached, records, metadata
+        ) VALUES (
+          @id, @created_at, @imported_by, @exported_at, @file_name, @file_type, @file_size, @file_sha256,
+          @scope, @coverage_label, @expected_row_count, @row_count, @duplicate_count, @stable_id_count,
+          @listing_url_count, @coverage_limit_reached, @records, @metadata
+        )
+      `).run(serialized);
+      return normalizeDealHunterDealOsImportRow(
+        database.prepare('SELECT * FROM deal_hunter_deal_os_imports WHERE id = ?').get(record.id),
+      );
+    },
+
+    async getLatestDealHunterDealOsImport() {
+      return normalizeDealHunterDealOsImportRow(
+        database.prepare(`
+          SELECT * FROM deal_hunter_deal_os_imports
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1
+        `).get(),
+      );
+    },
+
+    async listDealHunterDealOsImports({ limit = 25 } = {}) {
+      return database.prepare(`
+        SELECT * FROM deal_hunter_deal_os_imports
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+      `).all(Math.max(1, Math.min(Number(limit) || 25, 100))).map(normalizeDealHunterDealOsImportRow);
+    },
 
 	    async getDealHunterCrmImport({ id = '', dealKey = '', listingIdentity = '' } = {}) {
 	      if (!id && !dealKey && !listingIdentity) {

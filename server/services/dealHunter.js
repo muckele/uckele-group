@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { sha256, signPayload, verifySignedPayload } from '../utils/security.js';
@@ -28,6 +29,11 @@ const defaultTimeoutMs = 45000;
 const sheetWorkbookExpandedMaxBytes = 32 * 1024 * 1024;
 const sheetWorkbookEntryMaxBytes = 16 * 1024 * 1024;
 const sheetRowSimilarityMaxComparisons = 250_000;
+const dealOsSourceId = 'deal-os-export';
+const dealOsSourceName = 'SMB Deal OS export';
+const dealOsAllowedScopes = new Set(['saved-search', 'deal-radar']);
+const dealOsImportFutureToleranceMs = 15 * 60 * 1000;
+const dealOsImportMaxColumns = 200;
 const cimRequestScoreThreshold = 75;
 const highFitScoreThreshold = 75;
 const watchlistScoreThreshold = 60;
@@ -525,6 +531,19 @@ function normalizeIdentityPart(value = '', maxLength = 500) {
     .trim();
 }
 
+function normalizeStableExternalIdentity(value = '') {
+  const normalized = normalizeText(value, 120);
+  return normalized ? encodeURIComponent(normalized) : '';
+}
+
+function sourceExternalIdentity(sourceId = '', externalId = '', stableExternalId = false) {
+  if (!sourceId || !externalId) return '';
+  const normalized = stableExternalId || sourceId === dealOsSourceId
+    ? normalizeStableExternalIdentity(externalId)
+    : normalizeIdentityPart(externalId, 120);
+  return normalized ? `${sourceId}:${normalized}` : '';
+}
+
 function parseNumber(value) {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value;
@@ -560,7 +579,15 @@ function parseNumber(value) {
 }
 
 function parseDate(value) {
-  const timestamp = Date.parse(value || '');
+  const normalized = normalizeText(value, 100);
+  const numeric = Number(normalized);
+
+  if (/^\d+(?:\.\d+)?$/.test(normalized) && Number.isFinite(numeric) && numeric >= 20_000 && numeric < 2_958_466) {
+    const excelEpoch = Date.UTC(1899, 11, 30);
+    return new Date(excelEpoch + numeric * 24 * 60 * 60 * 1000).toISOString();
+  }
+
+  const timestamp = Date.parse(normalized);
   return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : '';
 }
 
@@ -599,13 +626,13 @@ function formatLocation({ city, county, state, country }) {
 }
 
 function normalizeDealRecord(rawRow = {}, source = {}) {
-  const listing = getField(rawRow, ['Original Broker Listing URL', 'Listing URL', 'URL', 'Link', 'Deal Link', 'Business URL', 'View Listing', 'Listing']);
+  const listing = getField(rawRow, ['Original Broker Listing URL', 'View Listing URL', 'Listing URL', 'Deal URL', 'URL', 'Link', 'Deal Link', 'Business URL', 'View Listing', 'Listing']);
   const listingUrl = normalizeUrl(listing?.url || listing);
   const city = normalizeText(getField(rawRow, ['City']), 80);
   const county = normalizeText(getField(rawRow, ['County']), 120);
   const state = normalizeText(getField(rawRow, ['State', 'Province']), 40).toUpperCase();
   const country = normalizeText(getField(rawRow, ['Country']), 40);
-  const industry = normalizeText(getField(rawRow, ['Industry', 'Industries', 'Category', 'Business Type']), 500);
+  const industry = normalizeText(getField(rawRow, ['Industry', 'Industries', 'Category', 'Business Type', 'Sector']), 500);
   const description = normalizeText(getField(rawRow, ['Description', 'Summary', 'Listing Description', 'Business Description', 'Notes']), 5000);
   const annualProfit = parseNumber(getField(rawRow, ['Annual Profit', 'Cash Flow', 'SDE', 'EBITDA', 'TTM EBITDA', 'Profit']));
   const annualRevenue = parseNumber(getField(rawRow, ['Annual Revenue', 'Revenue', 'TTM Revenue', 'Sales', 'Gross Revenue']));
@@ -623,14 +650,16 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
   const brokerName = preferredBrokerContact ? preferredBrokerContact.name : sourceBrokerName;
   const brokerCompany = normalizeText(getField(rawRow, ['Broker Company', 'Company']), 160);
   const brokerContact = normalizeText(getField(rawRow, ['Broker Contact', 'Broker Phone', 'Phone', 'Contact Phone']), 200);
-  const name = normalizeText(getField(rawRow, ['Name', 'Business Name', 'Company', 'Title', 'Listing Title']), 220) || 'Unnamed business';
-  const dateAdded = parseDate(getField(rawRow, ['Date Added', 'Created', 'Added Date', 'Posted Date']));
-  const lastUpdated = parseDate(getField(rawRow, ['Last Updated', 'Updated', 'Modified', 'Last Modified']));
-  const id = normalizeText(getField(rawRow, ['ID', 'Record ID', 'Ad ID', 'Ad#']), 100) || source.rowId || '';
+  const name = normalizeText(getField(rawRow, ['Name', 'Business Name', 'Business', 'Company', 'Title', 'Listing Title', 'Deal Name']), 220) || 'Unnamed business';
+  const dateAdded = parseDate(getField(rawRow, ['Date Added', 'Created', 'Created At', 'Added Date', 'Posted Date', 'Date Listed', 'Listing Date']));
+  const lastUpdated = parseDate(getField(rawRow, ['Last Updated', 'Updated', 'Updated At', 'Modified', 'Last Modified']));
+  const id = normalizeText(getField(rawRow, ['Deal OS ID', 'SMB Deal OS ID', 'Listing ID', 'Deal ID', 'Opportunity ID', 'ID', 'Record ID', 'Ad ID', 'Ad#']), 120) || source.rowId || '';
+  const listingSource = normalizeText(getField(rawRow, ['Listing Source', 'Original Source', 'Source', 'Marketplace', 'Platform']), 220);
   const fullText = normalizeText([name, industry, description, city, county, state, remoteFlag, franchiseFlag].join(' '), 9000);
 
   return {
     id,
+    stableExternalId: Boolean(source.stableExternalId),
     sourceId: source.id || source.name || 'unknown',
     sourceName: source.name || 'Unknown source',
     sourceMode: source.mode || '',
@@ -656,6 +685,7 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
     brokerCompany,
     brokerContact,
     listingUrl,
+    listingSource,
     dateAdded,
     lastUpdated,
     fullText,
@@ -1432,6 +1462,136 @@ export function extractGoogleSheetListingUrls(workbookBytes, expectedRows = []) 
   };
 }
 
+function dealOsHeaderKind(value = '') {
+  const key = normalizeKey(value);
+  const nameHeaders = new Set(['name', 'businessname', 'business', 'company', 'title', 'listingtitle', 'dealname']);
+  const idHeaders = new Set(['dealosid', 'smbdealosid', 'listingid', 'dealid', 'opportunityid', 'id', 'recordid', 'adid', 'ad']);
+  const urlHeaders = new Set(['originalbrokerlistingurl', 'viewlistingurl', 'listingurl', 'dealurl', 'url', 'link', 'deallink', 'businessurl', 'viewlisting', 'listing']);
+
+  if (nameHeaders.has(key)) return 'name';
+  if (idHeaders.has(key)) return 'id';
+  if (urlHeaders.has(key)) return 'url';
+  return '';
+}
+
+function worksheetExternalHyperlinks(worksheetXml = '', relationshipsXml = '') {
+  const relationshipTargets = parseWorksheetRelationshipTargets(relationshipsXml);
+  const hyperlinks = new Map();
+
+  for (const match of String(worksheetXml || '').matchAll(/<hyperlink\b([^>]*)\/?\s*>/g)) {
+    const attributes = match[1];
+    const ref = getXmlAttribute(attributes, 'ref').toUpperCase();
+    const target = relationshipTargets.get(getXmlAttribute(attributes, 'r:id')) || '';
+    if (/^[A-Z]+\d+$/.test(ref) && normalizeUrl(target)) hyperlinks.set(ref, normalizeUrl(target));
+  }
+
+  return hyperlinks;
+}
+
+function extractDealOsWorksheetRows(worksheetXml = '', relationshipsXml = '', sharedStrings = []) {
+  const cells = parseWorksheetCells(worksheetXml, sharedStrings).filter((cell) => /^[A-Z]+\d+$/.test(cell.ref));
+  const cellsByRow = new Map();
+
+  for (const cell of cells) {
+    const row = Number(cell.ref.match(/\d+$/)?.[0] || 0);
+    if (!row) continue;
+    if (!cellsByRow.has(row)) cellsByRow.set(row, []);
+    cellsByRow.get(row).push(cell);
+  }
+
+  const headerCandidate = [...cellsByRow.entries()]
+    .map(([row, rowCells]) => {
+      const kinds = rowCells.map((cell) => dealOsHeaderKind(cell.value)).filter(Boolean);
+      return { row, rowCells, kinds };
+    })
+    .filter(({ kinds }) => kinds.includes('name') && (kinds.includes('id') || kinds.includes('url')))
+    .sort((left, right) => left.row - right.row)[0];
+
+  if (!headerCandidate) return null;
+
+  const duplicateCounts = new Map();
+  const usedHeaders = new Set();
+  const headersByColumn = new Map();
+
+  for (const cell of headerCandidate.rowCells.sort((left, right) => worksheetColumnIndex(left.ref) - worksheetColumnIndex(right.ref))) {
+    const column = worksheetColumn(cell.ref);
+    const base = normalizeText(cell.value, 160);
+    if (!column || !base) continue;
+    let count = (duplicateCounts.get(base) || 0) + 1;
+    let header = count === 1 ? base : `${base} ${count}`;
+    while (usedHeaders.has(header)) {
+      count += 1;
+      header = `${base} ${count}`;
+    }
+    duplicateCounts.set(base, count);
+    usedHeaders.add(header);
+    headersByColumn.set(column, header);
+  }
+
+  if (headersByColumn.size > dealOsImportMaxColumns) {
+    throw new Error(`Deal OS workbook has more than ${dealOsImportMaxColumns} columns.`);
+  }
+
+  const relationshipHyperlinks = worksheetExternalHyperlinks(worksheetXml, relationshipsXml);
+  const rows = [...cellsByRow.entries()]
+    .filter(([row]) => row > headerCandidate.row)
+    .sort(([left], [right]) => left - right)
+    .map(([, rowCells]) => rowCells.reduce((record, cell) => {
+      const header = headersByColumn.get(worksheetColumn(cell.ref));
+      if (!header) return record;
+      const formulaUrl = normalizeUrl(extractHyperlinkFormulaTarget(cell.formula));
+      const relationshipUrl = relationshipHyperlinks.get(cell.ref) || '';
+      record[header] = normalizeText(relationshipUrl || formulaUrl || cell.value, 5000);
+      return record;
+    }, Object.create(null)))
+    .filter((row) => Object.values(row).some((value) => normalizeText(value) !== ''));
+
+  return {
+    headerRow: headerCandidate.row,
+    headers: [...headersByColumn.values()],
+    rows,
+  };
+}
+
+export function parseDealOsXlsxRows(workbookBytes) {
+  let expandedBytes = 0;
+  const entries = unzipSync(workbookBytes, {
+    filter: (file) => {
+      const needed = file.name === 'xl/sharedStrings.xml'
+        || /^xl\/worksheets\/sheet\d+\.xml$/i.test(file.name)
+        || /^xl\/worksheets\/_rels\/sheet\d+\.xml\.rels$/i.test(file.name);
+      if (!needed) return false;
+      const originalSize = Number(file.originalSize);
+      if (!Number.isSafeInteger(originalSize) || originalSize < 0) throw new Error(`Deal OS workbook entry has an invalid size: ${file.name}`);
+      if (originalSize > sheetWorkbookEntryMaxBytes) throw new Error(`Deal OS workbook entry is too large: ${file.name}`);
+      expandedBytes += originalSize;
+      if (expandedBytes > sheetWorkbookExpandedMaxBytes) throw new Error('Deal OS workbook expands beyond the safe import limit.');
+      return true;
+    },
+  });
+  const sharedStringsXml = entries['xl/sharedStrings.xml'] ? strFromU8(entries['xl/sharedStrings.xml']) : '';
+  const sharedStrings = [...sharedStringsXml.matchAll(/<si>([\s\S]*?)<\/si>/g)].map((match) => extractXmlTextRuns(match[1]));
+  const worksheetPaths = Object.keys(entries)
+    .filter((name) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(name))
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+  const candidates = worksheetPaths.map((worksheetPath) => {
+    const worksheetName = worksheetPath.split('/').pop();
+    const relationshipsPath = `xl/worksheets/_rels/${worksheetName}.rels`;
+    const result = extractDealOsWorksheetRows(
+      strFromU8(entries[worksheetPath]),
+      entries[relationshipsPath] ? strFromU8(entries[relationshipsPath]) : '',
+      sharedStrings,
+    );
+    return result ? { ...result, worksheetPath } : null;
+  }).filter(Boolean).sort((left, right) => right.rows.length - left.rows.length || left.worksheetPath.localeCompare(right.worksheetPath));
+
+  if (candidates.length === 0) {
+    return { headers: [], rows: [], worksheetPath: '' };
+  }
+
+  return candidates[0];
+}
+
 export function buildGoogleSheetWorkbookUrl(sourceUrl = '') {
   try {
     const source = new URL(sourceUrl);
@@ -1894,8 +2054,346 @@ async function fetchAirtableApiDeals(config) {
   };
 }
 
-async function collectSources(config) {
+function dealOsImportFailure(status, error, details = {}) {
+  return { ok: false, status, error, ...details };
+}
+
+function dealOsFileName(value = '') {
+  return normalizeText(String(value || '').split(/[\\/]/).pop(), 180);
+}
+
+function dealOsStableId(rawRow = {}) {
+  return normalizeText(getField(rawRow, [
+    'Deal OS ID', 'SMB Deal OS ID', 'Listing ID', 'Deal ID', 'Opportunity ID', 'ID', 'Record ID', 'Ad ID', 'Ad#',
+  ]), 120);
+}
+
+function dealOsListingValue(rawRow = {}) {
+  return getField(rawRow, [
+    'Original Broker Listing URL', 'View Listing URL', 'Listing URL', 'Deal URL', 'URL', 'Link', 'Deal Link',
+    'Business URL', 'View Listing', 'Listing',
+  ]);
+}
+
+function canonicalDealOsRecord(rawRow = {}) {
+  const stableId = dealOsStableId(rawRow);
+  const deal = normalizeDealRecord(rawRow, {
+    id: dealOsSourceId,
+    name: dealOsSourceName,
+    mode: 'manual-export',
+    rowId: stableId,
+    stableExternalId: Boolean(stableId),
+  });
+
+  return {
+    stableId,
+    name: deal.name,
+    industry: deal.industry,
+    description: deal.description,
+    city: deal.city,
+    county: deal.county,
+    state: deal.state,
+    country: deal.country,
+    annualProfit: deal.annualProfit,
+    annualRevenue: deal.annualRevenue,
+    askingPrice: deal.askingPrice,
+    profitMultiple: deal.profitMultiple,
+    yearsEstablished: deal.yearsEstablished,
+    remoteFlag: deal.remoteFlag,
+    franchiseFlag: deal.franchiseFlag,
+    fiveYearsFlag: deal.fiveYearsFlag,
+    brokerEmail: deal.brokerEmail,
+    brokerName: deal.brokerName,
+    brokerContacts: deal.brokerContacts,
+    brokerCompany: deal.brokerCompany,
+    brokerContact: deal.brokerContact,
+    listingUrl: deal.listingUrl,
+    listingSource: deal.listingSource,
+    dateAdded: deal.dateAdded,
+    lastUpdated: deal.lastUpdated,
+  };
+}
+
+function dealOsRecordIdentity(record = {}) {
+  const stableId = normalizeStableExternalIdentity(record.stableId);
+  if (stableId) return `id:${stableId}`;
+  const listingIdentity = normalizeListingIdentity(record.listingUrl);
+  return listingIdentity ? `url:${listingIdentity}` : '';
+}
+
+function mergeCanonicalDealOsRecords(current, incoming) {
+  const merged = { ...current };
+
+  for (const [key, value] of Object.entries(incoming)) {
+    if (key === 'brokerContacts') continue;
+    if ((merged[key] === '' || merged[key] === null || merged[key] === undefined) && value !== '' && value !== null && value !== undefined) {
+      merged[key] = value;
+    }
+  }
+
+  merged.brokerContacts = normalizeBrokerContacts([...(current.brokerContacts || []), ...(incoming.brokerContacts || [])]);
+  const preferred = merged.brokerContacts[0];
+  if (preferred) {
+    merged.brokerEmail = preferred.email;
+    merged.brokerName = preferred.name || merged.brokerName;
+  }
+  return merged;
+}
+
+function dealOsRawRecord(record = {}) {
+  return {
+    'Deal OS ID': record.stableId || '',
+    'Business Name': record.name || '',
+    Industry: record.industry || '',
+    Description: record.description || '',
+    City: record.city || '',
+    County: record.county || '',
+    State: record.state || '',
+    Country: record.country || '',
+    'Annual Profit': record.annualProfit,
+    'Annual Revenue': record.annualRevenue,
+    'Asking Price': record.askingPrice,
+    'Profit Multiple': record.profitMultiple,
+    'Years Established': record.yearsEstablished,
+    Remote: record.remoteFlag || '',
+    Franchise: record.franchiseFlag || '',
+    '5+ Years In Business': record.fiveYearsFlag || '',
+    'Broker Name': record.brokerName || '',
+    'Broker Email': record.brokerEmail || '',
+    'Broker Company': record.brokerCompany || '',
+    'Broker Contact': record.brokerContact || '',
+    'View Listing URL': record.listingUrl || '',
+    'Listing Source': record.listingSource || '',
+    'Date Added': record.dateAdded || '',
+    'Last Updated': record.lastUpdated || '',
+  };
+}
+
+function hydrateDealOsRecord(record = {}) {
+  const raw = dealOsRawRecord(record);
+  const deal = normalizeDealRecord(raw, {
+    id: dealOsSourceId,
+    name: dealOsSourceName,
+    mode: 'manual-export',
+    rowId: record.stableId || '',
+    stableExternalId: Boolean(record.stableId),
+  });
+  const brokerContacts = normalizeBrokerContacts(record.brokerContacts || deal.brokerContacts || []);
+  const preferred = brokerContacts[0];
+
+  return {
+    ...deal,
+    brokerContacts,
+    brokerEmail: preferred?.email || deal.brokerEmail,
+    brokerName: preferred?.name || deal.brokerName,
+    raw,
+  };
+}
+
+function publicDealOsImport(record = {}) {
+  return {
+    id: record.id,
+    importedAt: record.created_at,
+    importedBy: record.imported_by,
+    exportedAt: record.exported_at,
+    fileName: record.file_name,
+    fileType: record.file_type,
+    fileSize: Number(record.file_size || 0),
+    scope: record.scope,
+    coverageLabel: record.coverage_label,
+    expectedRowCount: record.expected_row_count === null || record.expected_row_count === undefined
+      ? null
+      : Number(record.expected_row_count),
+    rowCount: Number(record.row_count || 0),
+    duplicateCount: Number(record.duplicate_count || 0),
+    stableIdCount: Number(record.stable_id_count || 0),
+    listingUrlCount: Number(record.listing_url_count || 0),
+    coverageLimitReached: Boolean(record.coverage_limit_reached),
+  };
+}
+
+function parseDealOsUpload(fileName, fileBuffer) {
+  const extension = fileName.toLowerCase().match(/\.(csv|xlsx)$/)?.[1] || '';
+
+  if (!extension) {
+    return dealOsImportFailure(415, 'Deal OS exports must be uploaded as .csv or .xlsx files.');
+  }
+
+  try {
+    if (extension === 'csv') {
+      const csv = new TextDecoder('utf-8', { fatal: true }).decode(fileBuffer).replace(/^\ufeff/, '');
+      const rows = parseCsvRows(csv);
+      return { ok: true, extension, headers: Object.keys(rows[0] || {}), rows, worksheetPath: '' };
+    }
+
+    const workbook = parseDealOsXlsxRows(fileBuffer);
+    return { ok: true, extension, ...workbook };
+  } catch (error) {
+    return dealOsImportFailure(422, `The Deal OS ${extension.toUpperCase()} file could not be parsed safely: ${normalizeText(error.message, 300)}`);
+  }
+}
+
+export async function importDealOsExport({
+  fileBuffer,
+  fileName = '',
+  mimeType = '',
+  exportedAt = '',
+  scope = '',
+  coverageLabel = '',
+  expectedRowCount = null,
+  importedBy = '',
+  storage = getStorage(),
+  now = new Date(),
+} = {}) {
+  const config = getConfig();
+  const safeFileName = dealOsFileName(fileName);
+  const safeBuffer = Buffer.isBuffer(fileBuffer) ? fileBuffer : Buffer.from(fileBuffer || []);
+  const safeScope = normalizeText(scope, 40).toLowerCase();
+  const safeCoverageLabel = normalizeText(coverageLabel, 200);
+  const safeImportedBy = normalizeText(importedBy || 'admin', 160);
+  const exportedTimestamp = Date.parse(exportedAt || '');
+  const nowTimestamp = now instanceof Date ? now.getTime() : Date.parse(now || '');
+  const maximumAgeMs = config.dealHunter.dealOsExportMaxAgeHours * 60 * 60 * 1000;
+
+  if (!safeFileName || safeBuffer.length === 0) return dealOsImportFailure(400, 'Select a non-empty Deal OS CSV or XLSX export.');
+  if (safeBuffer.length > config.dealHunter.dealOsExportMaxPayloadBytes) {
+    return dealOsImportFailure(413, `Deal OS export exceeds the ${config.dealHunter.dealOsExportMaxPayloadBytes} byte upload limit.`);
+  }
+  if (!dealOsAllowedScopes.has(safeScope)) return dealOsImportFailure(400, 'Choose whether this is a saved-search or Deal Radar export.');
+  if (!safeCoverageLabel) return dealOsImportFailure(400, 'Describe the saved search or Deal Radar filters covered by this export.');
+  if (!Number.isFinite(exportedTimestamp) || !Number.isFinite(nowTimestamp)) return dealOsImportFailure(400, 'Provide a valid export timestamp.');
+  if (exportedTimestamp > nowTimestamp + dealOsImportFutureToleranceMs) return dealOsImportFailure(422, 'The Deal OS export timestamp is in the future.');
+  if (nowTimestamp - exportedTimestamp > maximumAgeMs) {
+    return dealOsImportFailure(422, `The Deal OS export is older than the ${config.dealHunter.dealOsExportMaxAgeHours}-hour freshness limit.`);
+  }
+
+  const parsed = parseDealOsUpload(safeFileName, safeBuffer);
+  if (!parsed.ok) return parsed;
+  if (parsed.headers.length > dealOsImportMaxColumns) return dealOsImportFailure(422, `Deal OS export has more than ${dealOsImportMaxColumns} columns.`);
+  const headerKinds = new Set(parsed.headers.map(dealOsHeaderKind).filter(Boolean));
+  if (!headerKinds.has('name') || (!headerKinds.has('id') && !headerKinds.has('url'))) {
+    return dealOsImportFailure(422, 'The export schema is incompatible. Include a business-name column and either a Deal OS listing ID or View Listing URL column.');
+  }
+  if (parsed.rows.length === 0) return dealOsImportFailure(422, 'The Deal OS export contains no listing rows.');
+  if (parsed.rows.length > config.dealHunter.dealOsExportMaxRecords) {
+    return dealOsImportFailure(422, `The export contains ${parsed.rows.length} rows; the supported maximum is ${config.dealHunter.dealOsExportMaxRecords}.`);
+  }
+
+  let normalizedExpectedRowCount = null;
+  if (expectedRowCount !== null && expectedRowCount !== undefined && String(expectedRowCount).trim() !== '') {
+    normalizedExpectedRowCount = Number(expectedRowCount);
+    if (!Number.isSafeInteger(normalizedExpectedRowCount) || normalizedExpectedRowCount < 1 || normalizedExpectedRowCount > config.dealHunter.dealOsExportMaxRecords) {
+      return dealOsImportFailure(400, `Expected listing count must be a whole number from 1 to ${config.dealHunter.dealOsExportMaxRecords}.`);
+    }
+    if (normalizedExpectedRowCount !== parsed.rows.length) {
+      return dealOsImportFailure(422, `Deal OS showed ${normalizedExpectedRowCount} expected listings, but the file contains ${parsed.rows.length} rows.`);
+    }
+  }
+
+  const invalidRows = [];
+  const recordsByIdentity = new Map();
+  parsed.rows.forEach((rawRow, index) => {
+    const record = canonicalDealOsRecord(rawRow);
+    const suppliedListing = normalizeText(dealOsListingValue(rawRow), 1000);
+    if (!record.name || record.name === 'Unnamed business') invalidRows.push(`row ${index + 2}: business name is missing`);
+    if (suppliedListing && !record.listingUrl) invalidRows.push(`row ${index + 2}: listing URL is not a safe HTTP(S) URL`);
+    const identity = dealOsRecordIdentity(record);
+    if (!identity) invalidRows.push(`row ${index + 2}: Deal OS listing ID or View Listing URL is required`);
+    if (!identity || record.name === 'Unnamed business' || (suppliedListing && !record.listingUrl)) return;
+    const current = recordsByIdentity.get(identity);
+    recordsByIdentity.set(identity, current ? mergeCanonicalDealOsRecords(current, record) : record);
+  });
+
+  if (invalidRows.length > 0) {
+    return dealOsImportFailure(422, `The export has ${invalidRows.length} invalid row${invalidRows.length === 1 ? '' : 's'}.`, {
+      details: invalidRows.slice(0, 10),
+    });
+  }
+
+  if (!storage.insertDealHunterDealOsImport) {
+    throw new Error('Deal OS import storage is unavailable.');
+  }
+
+  const records = [...recordsByIdentity.values()];
+  const stableIdCount = records.filter((record) => record.stableId).length;
+  const listingUrlCount = records.filter((record) => record.listingUrl).length;
+  const record = {
+    id: randomUUID(),
+    created_at: new Date(nowTimestamp).toISOString(),
+    imported_by: safeImportedBy,
+    exported_at: new Date(exportedTimestamp).toISOString(),
+    file_name: safeFileName,
+    file_type: parsed.extension === 'xlsx'
+      ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+      : 'text/csv',
+    file_size: safeBuffer.length,
+    file_sha256: sha256(safeBuffer),
+    scope: safeScope,
+    coverage_label: safeCoverageLabel,
+    expected_row_count: normalizedExpectedRowCount,
+    row_count: records.length,
+    duplicate_count: parsed.rows.length - records.length,
+    stable_id_count: stableIdCount,
+    listing_url_count: listingUrlCount,
+    coverage_limit_reached: parsed.rows.length >= config.dealHunter.dealOsExportMaxRecords,
+    records,
+    metadata: {
+      sourceRowCount: parsed.rows.length,
+      worksheetPath: parsed.worksheetPath || '',
+      suppliedMimeType: normalizeText(mimeType, 160),
+      parserVersion: 'deal-os-export-v1',
+    },
+  };
+  const saved = await storage.insertDealHunterDealOsImport(record);
+  return { ok: true, status: 201, import: publicDealOsImport(saved || record) };
+}
+
+async function loadDealOsExportSource(config, storage) {
+  if (!storage.getLatestDealHunterDealOsImport) return null;
+  const imported = await storage.getLatestDealHunterDealOsImport();
+  if (!imported) return null;
+  const importedSummary = publicDealOsImport(imported);
+  const ageMs = Date.now() - Date.parse(imported.exported_at || '');
+  const maximumAgeMs = config.dealHunter.dealOsExportMaxAgeHours * 60 * 60 * 1000;
+  const ageHours = Number.isFinite(ageMs) ? Math.max(0, ageMs / (60 * 60 * 1000)) : Infinity;
+  const records = Array.isArray(imported.records) ? imported.records : [];
+  const source = {
+    id: dealOsSourceId,
+    name: dealOsSourceName,
+    mode: 'manual-export',
+    fetched: records.length > 0 && ageMs >= -dealOsImportFutureToleranceMs && ageMs <= maximumAgeMs,
+    rowCount: records.length,
+    exportedAt: imported.exported_at,
+    importedAt: imported.created_at,
+    importedBy: imported.imported_by,
+    importAgeHours: Number.isFinite(ageHours) ? Number(ageHours.toFixed(1)) : null,
+    maxAgeHours: config.dealHunter.dealOsExportMaxAgeHours,
+    scope: imported.scope,
+    coverageLabel: imported.coverage_label,
+    expectedRowCount: imported.expected_row_count,
+    duplicateCount: Number(imported.duplicate_count || 0),
+    stableIdCount: Number(imported.stable_id_count || 0),
+    listingUrlCount: Number(imported.listing_url_count || 0),
+    coverageLimitReached: Boolean(imported.coverage_limit_reached),
+    latestImport: importedSummary,
+  };
+
+  if (records.length === 0) source.error = 'The latest Deal OS import contains no normalized records. Upload a fresh export.';
+  else if (!Number.isFinite(ageMs)) source.error = 'The latest Deal OS export timestamp is invalid. Upload a fresh export.';
+  else if (ageMs < -dealOsImportFutureToleranceMs) source.error = 'The latest Deal OS export timestamp is in the future. Upload a corrected export.';
+  else if (ageMs > maximumAgeMs) source.error = `The Deal OS export is ${ageHours.toFixed(1)} hours old and exceeds the ${config.dealHunter.dealOsExportMaxAgeHours}-hour freshness limit.`;
+
+  return {
+    source,
+    deals: source.fetched ? records.map(hydrateDealOsRecord) : [],
+  };
+}
+
+async function collectSources(config, storage) {
   const sourceResults = [];
+
+  const dealOsSource = await loadDealOsExportSource(config, storage);
+  if (dealOsSource) sourceResults.push(dealOsSource);
 
   for (const [index, url] of config.dealHunter.sheetCsvUrls.entries()) {
     try {
@@ -1914,6 +2412,10 @@ async function collectSources(config) {
         deals: [],
       });
     }
+  }
+
+  if (!config.dealHunter.airtableEnabled) {
+    return sourceResults;
   }
 
   if (config.dealHunter.airtableToken && config.dealHunter.airtableBaseId && config.dealHunter.airtableTableId) {
@@ -1969,19 +2471,32 @@ export function dedupeDeals(deals) {
 
   for (const deal of deals) {
     const key = buildDealKey(deal);
+    const listingIdentity = normalizeListingIdentity(deal.listingUrl);
+    const sourceIdentity = sourceExternalIdentity(deal.sourceId, deal.id, deal.stableExternalId);
+    const alternateKeys = [
+      key,
+      listingIdentity ? `url:${listingIdentity}` : '',
+      sourceIdentity ? `source:${sourceIdentity}` : '',
+    ].filter(Boolean);
 
     if (!key) continue;
 
-    if (indexByKey.has(key)) {
-      const index = indexByKey.get(key);
+    const existingKey = alternateKeys.find((candidate) => indexByKey.has(candidate));
+
+    if (existingKey) {
+      const index = indexByKey.get(existingKey);
       const current = deduped[index];
+      const preferIncoming = Boolean(deal.stableExternalId && !current.stableExternalId);
+      const preferred = preferIncoming ? deal : current;
+      const secondary = preferIncoming ? current : deal;
       const brokerContacts = normalizeBrokerContacts([
         ...(current.brokerContacts || []),
         ...(deal.brokerContacts || []),
       ]);
       const preferredBrokerContact = brokerContacts[0] || null;
       deduped[index] = {
-        ...current,
+        ...secondary,
+        ...preferred,
         brokerContacts,
         brokerEmail: preferredBrokerContact?.email || current.brokerEmail || deal.brokerEmail || '',
         brokerName: preferredBrokerContact ? preferredBrokerContact.name : current.brokerName || deal.brokerName || '',
@@ -1989,10 +2504,17 @@ export function dedupeDeals(deals) {
         brokerContact: current.brokerContact || deal.brokerContact || '',
         raw: { ...(current.raw || {}), ...(deal.raw || {}) },
       };
+      const merged = deduped[index];
+      const mergedListingIdentity = normalizeListingIdentity(merged.listingUrl);
+      for (const candidate of [
+        ...alternateKeys,
+        buildDealKey(merged),
+        mergedListingIdentity ? `url:${mergedListingIdentity}` : '',
+      ].filter(Boolean)) indexByKey.set(candidate, index);
       continue;
     }
 
-    indexByKey.set(key, deduped.length);
+    for (const candidate of alternateKeys) indexByKey.set(candidate, deduped.length);
     deduped.push(deal);
   }
 
@@ -2000,6 +2522,12 @@ export function dedupeDeals(deals) {
 }
 
 function buildDealKey(deal) {
+  const stableExternalId = normalizeStableExternalIdentity(deal.id);
+
+  if (deal.stableExternalId && deal.sourceId && stableExternalId) {
+    return `source:${deal.sourceId}:${stableExternalId}`;
+  }
+
   const listingUrl = normalizeUrl(deal.listingUrl).toLowerCase();
 
   if (listingUrl) {
@@ -2100,6 +2628,7 @@ function publicDeal(deal) {
     sourceId: deal.sourceId,
     sourceName: deal.sourceName,
     sourceMode: deal.sourceMode,
+    listingSource: deal.listingSource,
     name: deal.name,
     isNew: Boolean(deal.isNew),
     firstSeenAt: deal.firstSeenAt,
@@ -2168,6 +2697,7 @@ function normalizeCimDealSnapshot(snapshot = null) {
     sourceId: normalizeText(snapshot.sourceId || snapshot.source_id, 200),
     sourceName: normalizeText(snapshot.sourceName || snapshot.source_name, 200),
     sourceMode: normalizeText(snapshot.sourceMode || snapshot.source_mode, 100),
+    listingSource: normalizeText(snapshot.listingSource || snapshot.listing_source, 220),
     name: normalizeText(snapshot.name || snapshot.businessName || snapshot.business_name || 'Unnamed deal', 300),
     isNew: Boolean(snapshot.isNew || snapshot.is_new),
     firstSeenAt: normalizeText(snapshot.firstSeenAt || snapshot.first_seen_at, 100),
@@ -2257,10 +2787,22 @@ function buildCimAutomationApproval(deal = null) {
 
 function attachHistory(scoredDeals, seenDeals = [], generatedAt) {
   const seenById = new Map(seenDeals.map((deal) => [deal.id, deal]));
+  const seenByListingIdentity = new Map(
+    seenDeals.map((deal) => [normalizeListingIdentity(deal.listing_url), deal]).filter(([identity]) => identity),
+  );
+  const seenBySourceExternalId = new Map(
+    seenDeals.map((deal) => [
+      sourceExternalIdentity(deal.source_id, deal.external_id, deal.source_id === dealOsSourceId),
+      deal,
+    ]).filter(([identity]) => identity),
+  );
 
   return scoredDeals.map((deal) => {
-    const dealKey = buildDealKey(deal);
-    const seen = seenById.get(dealKey);
+    const derivedDealKey = buildDealKey(deal);
+    const seen = seenById.get(derivedDealKey)
+      || seenByListingIdentity.get(normalizeListingIdentity(deal.listingUrl))
+      || seenBySourceExternalId.get(sourceExternalIdentity(deal.sourceId, deal.id, deal.stableExternalId));
+    const dealKey = seen?.id || derivedDealKey;
 
     return {
       ...deal,
@@ -2454,6 +2996,7 @@ function dealHunterCrmMetadata(deal, options = {}) {
       sourceName: deal.sourceName || '',
       sourceMode: deal.sourceMode || '',
       sourceId: deal.sourceId || '',
+      listingSource: deal.listingSource || '',
       externalId: deal.id || '',
       firstSeenAt: deal.firstSeenAt || '',
       lastSeenAt: deal.lastSeenAt || '',
@@ -4195,10 +4738,48 @@ async function processCimFollowUpRequest(storage, request, nowIso) {
   }
 }
 
+function buildDealHunterCoverage(config, sourceResults = []) {
+  const dealOsSource = sourceResults.find((result) => result.source.id === dealOsSourceId)?.source || null;
+  const activeSourceNames = sourceResults.map((result) => result.source.name).filter(Boolean);
+  const warnings = [];
+  const disabledSources = [];
+
+  if (!config.dealHunter.airtableEnabled) {
+    disabledSources.push({
+      id: 'airtable-disabled',
+      name: 'Legacy Airtable Biz List',
+      mode: 'disabled',
+      disabled: true,
+      fetched: true,
+      rowCount: 0,
+      reason: 'Explicitly retired with DEAL_HUNTER_AIRTABLE_ENABLED=false.',
+    });
+    warnings.push(dealOsSource
+      ? `Legacy Airtable is disabled. Deal OS coverage is limited to the ${dealOsSource.scope === 'saved-search' ? 'saved search' : 'Deal Radar filter'} “${dealOsSource.coverageLabel}” exported ${dealOsSource.exportedAt}.`
+      : `Legacy Airtable is disabled and no Deal OS export is active. This review covers only ${activeSourceNames.join(', ') || 'the remaining configured sources'}.`);
+  }
+
+  if (dealOsSource?.coverageLimitReached) {
+    warnings.push(`The Deal OS export reached the ${config.dealHunter.dealOsExportMaxRecords}-listing import ceiling. Listings beyond the export cap may be absent.`);
+  }
+
+  return {
+    warnings,
+    disabledSources,
+    dealOsImportPolicy: {
+      acceptedExtensions: ['.csv', '.xlsx'],
+      maxPayloadBytes: config.dealHunter.dealOsExportMaxPayloadBytes,
+      maxRecords: config.dealHunter.dealOsExportMaxRecords,
+      maxAgeHours: config.dealHunter.dealOsExportMaxAgeHours,
+    },
+  };
+}
+
 async function buildDailyDealReview({ storage = getStorage() } = {}) {
   const config = getConfig();
   const generatedAt = new Date().toISOString();
-  const sourceResults = await collectSources(config);
+  const sourceResults = await collectSources(config, storage);
+  const coverage = buildDealHunterCoverage(config, sourceResults);
   const allDeals = dedupeDeals(sourceResults.flatMap((result) => result.deals));
   const recentDeals = allDeals.filter((deal) => isRecentDeal(deal, config.dealHunter.lookbackDays));
   const candidateDeals = recentDeals.length > 0 ? recentDeals : allDeals;
@@ -4254,6 +4835,9 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
       buyerCashContext: 'ROBS plus savings can support an acquisition when paired with SBA financing, seller note, or investors.',
     },
     sources: sourceResults.map((result) => result.source),
+    disabledSources: coverage.disabledSources,
+    coverageWarnings: coverage.warnings,
+    dealOsImportPolicy: coverage.dealOsImportPolicy,
     totals: {
       sourceRows: sourceResults.reduce((sum, result) => sum + (result.source.rowCount || 0), 0),
       normalizedDeals: allDeals.length,

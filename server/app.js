@@ -37,6 +37,7 @@ import { sendAdminEmailTestEmail } from './services/delivery.js';
 import { checkReadiness } from './services/readiness.js';
 import {
   reviewDailyDeals,
+  importDealOsExport,
   runDealHunterCimFollowUps,
   listDealHunterCimRequestHistory,
   retryDealHunterCimRequestWithCorrectedRecipient,
@@ -120,6 +121,17 @@ function jsonParserOptions(limit) {
     limit,
     verify: captureRawBody,
   };
+}
+
+function decodedHeader(request, name, maxLength = 500) {
+  const raw = String(request.headers[name] || '').trim();
+  if (!raw) return '';
+
+  try {
+    return decodeURIComponent(raw).replace(/[\r\n]/g, ' ').trim().slice(0, maxLength);
+  } catch {
+    return raw.replace(/[\r\n]/g, ' ').trim().slice(0, maxLength);
+  }
 }
 
 function setProtectedResponseHeaders(_request, response, next) {
@@ -264,6 +276,10 @@ function publicSecureUploadRequest(requestRecord) {
 export function createApp() {
   const config = getConfig();
   const app = express();
+  const dealOsRawParser = express.raw({
+    type: () => true,
+    limit: config.dealHunter.dealOsExportMaxPayloadBytes,
+  });
   let activeSecureUploads = 0;
 
   app.disable('x-powered-by');
@@ -377,6 +393,34 @@ export function createApp() {
   app.use('/api/contact', express.json(jsonParserOptions(config.protection.contactJsonLimit)));
   app.use('/api/analytics/events', express.json(jsonParserOptions('16kb')));
   app.use('/api/webhooks/resend', express.json(jsonParserOptions('1mb')));
+  app.use('/api/admin/deal-hunter/deal-os-import', async (request, response, next) => {
+    if (request.method !== 'POST') {
+      next();
+      return;
+    }
+
+    try {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      request.dealOsImportSession = session;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.use(
+    '/api/admin/deal-hunter/deal-os-import',
+    (request, response, next) => {
+      if (request.method !== 'POST') {
+        next();
+        return;
+      }
+      dealOsRawParser(request, response, next);
+    },
+  );
   app.use(express.json(jsonParserOptions('512kb')));
   app.use(express.urlencoded({ extended: true, limit: '64kb' }));
 
@@ -1082,6 +1126,36 @@ export function createApp() {
         success: true,
         review,
       });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/deal-os-import',
+    asyncRoute(async (request, response) => {
+      const session = request.dealOsImportSession || await requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await importDealOsExport({
+        fileBuffer: request.body,
+        fileName: decodedHeader(request, 'x-deal-os-file-name', 180),
+        mimeType: String(request.headers['content-type'] || '').slice(0, 160),
+        exportedAt: decodedHeader(request, 'x-deal-os-exported-at', 100),
+        scope: decodedHeader(request, 'x-deal-os-scope', 40),
+        coverageLabel: decodedHeader(request, 'x-deal-os-coverage-label', 200),
+        expectedRowCount: decodedHeader(request, 'x-deal-os-expected-row-count', 20),
+        importedBy: session.username || 'admin',
+      });
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error, details: result.details || [] });
+        return;
+      }
+
+      response.status(201).json({ success: true, import: result.import });
     }),
   );
 

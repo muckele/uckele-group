@@ -851,6 +851,18 @@ export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}
         name: source.name,
         mode: source.mode,
         checkedAt: sourceHealth.generatedAt || generatedAt,
+        exportedAt: source.exportedAt || '',
+        importedAt: source.importedAt || '',
+        importedBy: source.importedBy || '',
+        importAgeHours: source.importAgeHours ?? null,
+        maxAgeHours: source.maxAgeHours ?? null,
+        scope: source.scope || '',
+        coverageLabel: source.coverageLabel || '',
+        expectedRowCount: source.expectedRowCount ?? null,
+        duplicateCount: Number(source.duplicateCount || 0),
+        stableIdCount: Number(source.stableIdCount || 0),
+        listingUrlCount: Number(source.listingUrlCount || 0),
+        coverageLimitReached: Boolean(source.coverageLimitReached),
       };
       continue;
     }
@@ -877,21 +889,51 @@ export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}
 
 function buildCachedSourceHealth(previousSnapshot = {}, now = new Date(), config = getConfig()) {
   const sourceSnapshots = objectValue(previousSnapshot.sources);
-  const sources = Object.entries(sourceSnapshots).map(([id, source]) => ({
-    id,
-    name: source.name || id,
-    mode: source.mode || 'cached',
-    fetched: true,
-    rowCount: Number(source.rowCount || 0),
-    previousRowCount: Number(source.rowCount || 0),
-    rowDelta: 0,
-    tone: 'success',
-    error: '',
-    requiresConfiguration: false,
-    configurationKey: '',
-    checkedAt: source.checkedAt || previousSnapshot.generatedAt || '',
-  }));
-  const issues = Array.isArray(previousSnapshot.issues) ? previousSnapshot.issues : [];
+  const issues = Array.isArray(previousSnapshot.issues) ? [...previousSnapshot.issues] : [];
+  const issueSourceIds = new Set(issues.map((issue) => issue?.sourceId).filter(Boolean));
+  const sources = Object.entries(sourceSnapshots).map(([id, source]) => {
+    const mode = source.mode || 'cached';
+    const exportedTimestamp = Date.parse(source.exportedAt || '');
+    const maxAgeHours = Number(source.maxAgeHours);
+    const ageHours = Number.isFinite(exportedTimestamp)
+      ? Math.max(0, (now.getTime() - exportedTimestamp) / (60 * 60 * 1000))
+      : null;
+    const staleManualExport = mode === 'manual-export'
+      && Number.isFinite(ageHours)
+      && Number.isFinite(maxAgeHours)
+      && maxAgeHours > 0
+      && ageHours > maxAgeHours;
+    const freshnessError = staleManualExport
+      ? `The Deal OS export is ${ageHours.toFixed(1)} hours old and exceeds the ${maxAgeHours}-hour freshness limit.`
+      : '';
+
+    if (freshnessError && !issueSourceIds.has(id)) {
+      issues.push({
+        sourceId: id,
+        tone: 'danger',
+        title: `${source.name || 'Deal source'} needs attention`,
+        message: freshnessError,
+      });
+      issueSourceIds.add(id);
+    }
+
+    return {
+      ...source,
+      id,
+      name: source.name || id,
+      mode,
+      fetched: !staleManualExport,
+      rowCount: Number(source.rowCount || 0),
+      previousRowCount: Number(source.rowCount || 0),
+      rowDelta: 0,
+      tone: staleManualExport ? 'danger' : 'success',
+      error: freshnessError,
+      requiresConfiguration: false,
+      configurationKey: '',
+      checkedAt: source.checkedAt || previousSnapshot.generatedAt || '',
+      importAgeHours: Number.isFinite(ageHours) ? Number(ageHours.toFixed(1)) : source.importAgeHours ?? null,
+    };
+  });
 
   if (sources.length === 0) {
     return {
@@ -976,6 +1018,18 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
       error: source.error || '',
       requiresConfiguration,
       configurationKey: source.configurationKey || '',
+      exportedAt: source.exportedAt || '',
+      importedAt: source.importedAt || '',
+      importedBy: source.importedBy || '',
+      importAgeHours: source.importAgeHours ?? null,
+      maxAgeHours: source.maxAgeHours ?? null,
+      scope: source.scope || '',
+      coverageLabel: source.coverageLabel || '',
+      expectedRowCount: source.expectedRowCount ?? null,
+      duplicateCount: Number(source.duplicateCount || 0),
+      stableIdCount: Number(source.stableIdCount || 0),
+      listingUrlCount: Number(source.listingUrlCount || 0),
+      coverageLimitReached: Boolean(source.coverageLimitReached),
     };
   });
 

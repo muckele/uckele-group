@@ -660,6 +660,10 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
   const sourceSummary = (review.sources || [])
     .map((source) => `${source.name}: ${source.fetched ? `${source.rowCount || 0} rows` : `failed (${source.error || 'unknown error'})`}`)
     .join('\n');
+  const coverageWarnings = Array.isArray(review.coverageWarnings) ? review.coverageWarnings.filter(Boolean) : [];
+  const coverageWarningHtml = coverageWarnings.length > 0
+    ? `<div style="margin: 20px 0; border: 1px solid #F0C36A; border-radius: 14px; background: #FFF8E7; padding: 16px;"><p style="margin: 0 0 8px; color: #7A5200; font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase;">Limited source coverage</p><ul style="margin: 0 0 0 18px; padding: 0; color: #664A10; font-size: 14px; line-height: 1.6;">${coverageWarnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('')}</ul></div>`
+    : '';
   const recommendations = review.criteriaRecommendations || [];
   const automation = review.cimAutomation || {};
   const automationRun = automation.run || {};
@@ -696,6 +700,7 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
     </div>
   `;
   const bodyHtml = `
+    ${coverageWarningHtml}
     <div style="margin: 20px 0; border: 1px solid #E3D9CA; border-radius: 14px; background: #F8F4ED; padding: 16px;">
       <p style="margin: 0 0 8px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase;">CIM Automation</p>
       <p style="margin: 0; color: #33443B; font-size: 14px; line-height: 1.6;">Configured Stage ${escapeHtml(automation.configuredStage || 1)}; effective Stage ${escapeHtml(automation.effectiveStage || 1)}${automation.paused ? '; emergency paused' : ''}. ${escapeHtml(automationRun.sent || 0)} initial request(s) sent automatically; ${escapeHtml(automationRun.exceptions?.length || 0)} exception(s) retained for review.</p>
@@ -745,6 +750,7 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
     title: 'Daily acquisition deal review',
     paragraphs: [
       `Generated ${generatedLabel}. Reviewed ${review.totals?.reviewedDeals || 0} recent deals from ${review.sources?.length || 0} source(s).`,
+      coverageWarnings.length > 0 ? 'Source coverage is intentionally limited. Review the warning below before relying on today\'s totals.' : '',
       'The scoring profile favors essential B2B and field-service companies with recurring or repeat revenue, recession resistance, AI resistance, and financeable acquisition size. Management in place is preferred but not required.',
       crmSync.reviewed ? `CRM sync checked ${crmSync.reviewed} score-75-plus deal(s): ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped.` : '',
     ],
@@ -767,6 +773,8 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
     '',
     `Generated: ${generatedLabel}`,
     `Reviewed deals: ${review.totals?.reviewedDeals || 0}`,
+    coverageWarnings.length > 0 ? 'LIMITED SOURCE COVERAGE:' : '',
+    ...coverageWarnings.map((warning) => `- ${warning}`),
     `CIM requests ready for approval: ${cimReadyDeals.length}`,
     `CIM automation: configured Stage ${automation.configuredStage || 1}, effective Stage ${automation.effectiveStage || 1}${automation.paused ? ', paused' : ''}; ${automationRun.sent || 0} automatically sent; ${automationRun.exceptions?.length || 0} exceptions.`,
     `Review 75+ scored businesses: ${scoredBusinessesUrl}`,
@@ -790,7 +798,7 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
 			    kind: 'daily-deal-hunter',
 			    idempotencyKey,
 		    to,
-		    subject: `Daily deal review: ${review.totals?.newMatches || 0} new fit, ${review.totals?.removalCandidates || 0} remove`,
+		    subject: `Daily deal review${coverageWarnings.length > 0 ? ' (limited source coverage)' : ''}: ${review.totals?.newMatches || 0} new fit, ${review.totals?.removalCandidates || 0} remove`,
     headline: 'Daily acquisition deal review',
     text,
     html,

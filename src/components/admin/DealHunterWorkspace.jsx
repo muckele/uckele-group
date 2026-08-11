@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { BellRing, CalendarClock, ClipboardList, ExternalLink, Inbox, MailCheck, RefreshCw, Send, ShieldAlert, X } from 'lucide-react';
+import { BellRing, CalendarClock, ClipboardList, ExternalLink, Inbox, MailCheck, RefreshCw, Send, ShieldAlert, Upload, X } from 'lucide-react';
 import Reveal from '../Reveal';
 import EmailReadinessPanel from './EmailReadinessPanel';
 import CommunicationLifecycleBadge from './CommunicationLifecycleBadge';
@@ -108,8 +108,8 @@ function DealSourceStatus({ source }) {
   const listingUrlExpectedCount = Number(source.listingUrlExpectedCount || 0);
   const listingUrlCoverage = listingUrlExpectedCount > 0 ? Math.round((listingUrlCount / listingUrlExpectedCount) * 100) : 0;
   const setupRequired = Boolean(source.requiresConfiguration || source.configurationKey);
-  const sourceTone = source.fetched ? 'success' : setupRequired ? 'warning' : 'danger';
-  const sourceStatus = source.fetched ? `${source.rowCount || 0} rows` : setupRequired ? 'setup needed' : 'failed';
+  const sourceTone = source.disabled ? 'warning' : source.fetched ? 'success' : setupRequired ? 'warning' : 'danger';
+  const sourceStatus = source.disabled ? 'disabled' : source.fetched ? `${source.rowCount || 0} rows` : setupRequired ? 'setup needed' : 'failed';
 
   return (
     <div className="rounded-2xl border border-line bg-white/75 p-4 text-sm">
@@ -120,9 +120,63 @@ function DealSourceStatus({ source }) {
       </div>
       {listingUrlExpectedCount > 0 ? <p className="mt-2 text-ink/65">{listingUrlCount} of {listingUrlExpectedCount} original listing links available ({listingUrlCoverage}%).</p> : listingUrlCount > 0 ? <p className="mt-2 text-ink/65">{listingUrlCount} original listing link{listingUrlCount === 1 ? '' : 's'} available.</p> : null}
       {source.error ? <p className={`mt-2 ${setupRequired ? 'text-amber-800' : 'text-red-700'}`}>{source.error}</p> : null}
+      {source.reason ? <p className="mt-2 text-amber-800">{source.reason}</p> : null}
       {setupRequired && source.configurationKey ? <p className="mt-2 text-xs font-semibold uppercase tracking-[0.1em] text-amber-800">Required setting: <code>{source.configurationKey}</code></p> : null}
       {source.listingUrlWarning ? <p className="mt-2 text-amber-800">Listing-link import warning: {source.listingUrlWarning}</p> : null}
+      {source.mode === 'manual-export' ? <dl className="mt-3 grid gap-2 text-xs leading-5 text-ink/65 sm:grid-cols-2"><div><dt className="font-semibold text-ink/80">Coverage</dt><dd>{label(source.scope)} · {source.coverageLabel}</dd></div><div><dt className="font-semibold text-ink/80">Exported</dt><dd>{dateTime(source.exportedAt)} · {source.importAgeHours ?? '?'}h old</dd></div><div><dt className="font-semibold text-ink/80">Identity</dt><dd>{source.stableIdCount || 0} stable ID · {source.listingUrlCount || 0} listing URLs</dd></div><div><dt className="font-semibold text-ink/80">Imported</dt><dd>{dateTime(source.importedAt)} by {source.importedBy || 'admin'}</dd></div></dl> : null}
+      {source.coverageLimitReached ? <p className="mt-2 font-semibold text-amber-800">This export reached the configured listing ceiling; additional Deal OS results may be absent.</p> : null}
     </div>
+  );
+}
+
+function localDateTimeValue(timestamp) {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return '';
+  const offset = date.getTimezoneOffset() * 60 * 1000;
+  return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+}
+
+function DealOsImportPanel({ importing, onImport, policy = {} }) {
+  const [file, setFile] = useState(null);
+  const [scope, setScope] = useState('saved-search');
+  const [coverageLabel, setCoverageLabel] = useState('');
+  const [exportedAt, setExportedAt] = useState('');
+  const [expectedRowCount, setExpectedRowCount] = useState('');
+
+  function selectFile(event) {
+    const selected = event.target.files?.[0] || null;
+    setFile(selected);
+    if (selected?.lastModified) setExportedAt(localDateTimeValue(selected.lastModified));
+  }
+
+  function submit(event) {
+    event.preventDefault();
+    if (!file || !coverageLabel.trim() || !exportedAt || !onImport) return;
+    onImport({
+      file,
+      scope,
+      coverageLabel: coverageLabel.trim(),
+      exportedAt: new Date(exportedAt).toISOString(),
+      expectedRowCount: expectedRowCount.trim(),
+    });
+  }
+
+  const canSubmit = Boolean(file && coverageLabel.trim() && exportedAt && !importing);
+  const maxRecords = Number(policy.maxRecords || 1000);
+  const maxAgeHours = Number(policy.maxAgeHours || 72);
+
+  return (
+    <form className="mt-5 rounded-2xl border border-sky-200 bg-sky-50/65 p-5" onSubmit={submit}>
+      <div className="flex items-start gap-3"><span className="mt-0.5 rounded-xl bg-sky-100 p-2 text-sky-700"><Upload className="h-4 w-4" /></span><div><h3 className="font-semibold text-ink">Import SMB Deal OS export</h3><p className="mt-1 text-sm leading-6 text-ink/68">Upload a fresh saved-search or Deal Radar CSV/XLSX export. The file is parsed in memory; only normalized deal fields and import provenance are retained.</p></div></div>
+      <div className="mt-4 grid gap-4 lg:grid-cols-2">
+        <label className="text-sm font-semibold text-ink">Deal OS export file<input accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" className="form-control mt-1.5" disabled={importing} onChange={selectFile} required type="file" /></label>
+        <label className="text-sm font-semibold text-ink">Export type<select className="form-control mt-1.5" disabled={importing} onChange={(event) => setScope(event.target.value)} value={scope}><option value="saved-search">Saved search</option><option value="deal-radar">Deal Radar filters</option></select></label>
+        <label className="text-sm font-semibold text-ink">Coverage description<input className="form-control mt-1.5" disabled={importing} maxLength={200} onChange={(event) => setCoverageLabel(event.target.value)} placeholder="e.g. All active saved-search results" required value={coverageLabel} /></label>
+        <label className="text-sm font-semibold text-ink">Exported at<input className="form-control mt-1.5" disabled={importing} onChange={(event) => setExportedAt(event.target.value)} required type="datetime-local" value={exportedAt} /></label>
+        <label className="text-sm font-semibold text-ink">Expected listings shown by Deal OS <span className="font-normal text-ink/55">(optional)</span><input className="form-control mt-1.5" disabled={importing} max={maxRecords} min="1" onChange={(event) => setExpectedRowCount(event.target.value)} type="number" value={expectedRowCount} /></label>
+      </div>
+      <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"><p className="text-xs leading-5 text-ink/60">Accepted: CSV/XLSX · up to {maxRecords} listings · export must be no more than {maxAgeHours} hours old. A 1,000-row export may indicate Deal OS truncation.</p><button className={primaryButton} disabled={!canSubmit} type="submit"><Upload className="h-4 w-4" />{importing ? 'Importing…' : 'Validate & Import'}</button></div>
+    </form>
   );
 }
 
@@ -410,11 +464,11 @@ function CimApprovalQueue({ review, readOnly, actionsDisabled = false, sending, 
 }
 
 export default function DealHunterWorkspace({
-  review, loading, sending, bulkSending, followUpRunning, requestingCimDealKey, dismissingDealKey, feedback = {}, readOnly,
-  emailTestSending, onReview, onOpenApprovals, onSendReady, onRunFollowUps, onSendEmail, onSendCimRequest, onSendEmailTest, onRecordCimOutcome, onDismissDeal,
+  review, loading, sending, importingDealOs, bulkSending, followUpRunning, requestingCimDealKey, dismissingDealKey, feedback = {}, readOnly,
+  emailTestSending, onReview, onImportDealOs, onOpenApprovals, onSendReady, onRunFollowUps, onSendEmail, onSendCimRequest, onSendEmailTest, onRecordCimOutcome, onDismissDeal,
 }) {
   const [selectedDeal, setSelectedDeal] = useState(null);
-  const busy = loading || sending || bulkSending || followUpRunning;
+  const busy = loading || sending || importingDealOs || bulkSending || followUpRunning;
   const emailReadiness = review?.emailReadiness;
   const outboundReady = emailReadiness ? emailReadiness.outboundConfigured : true;
   const followUpsSafe = emailReadiness ? emailReadiness.followUpsSafe : true;
@@ -425,9 +479,10 @@ export default function DealHunterWorkspace({
       <Reveal className="panel p-5 sm:p-6">
         <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between"><div><SectionLabel>Deal Hunter Scoring</SectionLabel><h2 className="mt-2 text-2xl font-semibold text-ink">Daily source review</h2><p className="mt-2 max-w-3xl text-sm leading-7 text-ink/68">Pulls configured deal sources, scores recent listings against the acquisition profile, and manages CIM outreach.</p></div><div className="flex flex-wrap gap-2"><button className={secondaryButton} disabled={busy} onClick={onReview} type="button"><RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />{loading ? 'Reviewing…' : 'Review Sources'}</button>{!readOnly ? <><button className={primaryButton} disabled={busy || !outboundReady || !sourceReviewComplete || !review?.totals?.cimReady} onClick={onOpenApprovals} type="button"><ClipboardList className="h-4 w-4" />Review CIM Requests</button><button className={secondaryButton} disabled={busy || !followUpsSafe} onClick={onRunFollowUps} type="button"><MailCheck className="h-4 w-4" />{followUpRunning ? 'Checking…' : followUpsSafe ? 'Run Follow-Ups' : 'Follow-Ups Paused'}</button><button className={secondaryButton} disabled={busy || !outboundReady || !sourceReviewComplete} onClick={onSendEmail} type="button"><Send className="h-4 w-4" />{sending ? 'Sending…' : 'Send Daily Email'}</button></> : null}</div></div>
         {feedback.error ? <p className="mt-5 rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-700" role="alert">{feedback.error}</p> : null}{feedback.message ? <p className="mt-5 rounded-2xl border border-moss/20 bg-moss/8 p-4 text-sm text-moss" role="status">{feedback.message}</p> : null}
-        {review ? <div className="mt-7 space-y-7">{unavailableSources.length > 0 ? <p className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-900" role="alert"><strong>Partial review.</strong> {unavailableSources.map((source) => source.name).join(', ')} {unavailableSources.length === 1 ? 'is' : 'are'} unavailable, so totals and candidates cover only successfully imported sources. Daily email, CRM sync, and new CIM outreach are paused until every source succeeds.</p> : null}<CimApprovalQueue actionsDisabled={!sourceReviewComplete} onOpenDeal={setSelectedDeal} onSendApproved={onSendReady} readOnly={readOnly} review={review} sending={bulkSending} />{review.cimAutomation ? <section className="rounded-2xl border border-line bg-fog/70 p-5"><div className="flex flex-wrap items-center gap-2"><strong>CIM automation</strong><Pill tone={review.cimAutomation.paused ? 'danger' : 'info'}>Stage {review.cimAutomation.effectiveStage || 1}{review.cimAutomation.paused ? ' paused' : ''}</Pill><Pill>{review.cimAutomation.metrics?.reviewed || 0} reviewed</Pill><Pill>{review.cimAutomation.metrics?.approvalRate || 0}% approved</Pill></div>{review.cimAutomation.run?.exceptions?.length ? <details className="mt-3"><summary className="cursor-pointer text-sm font-semibold text-ink">{review.cimAutomation.run.exceptions.length} automation exception(s) require review</summary><ul className="mt-3 space-y-2 text-sm text-ink/70">{review.cimAutomation.run.exceptions.slice(0, 25).map((item) => <li className="rounded-xl border border-line bg-white p-3" key={`exception-${item.dealKey}`}><strong>{item.name}</strong><p className="mt-1">{item.reasons.join(' · ')}</p></li>)}</ul></details> : null}</section> : null}<EmailReadinessPanel data={emailReadiness} onSendTest={readOnly ? undefined : onSendEmailTest} testSending={emailTestSending} /><div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-7"><Stat icon={ClipboardList} label="Reviewed" value={review.totals?.reviewedDeals || 0} /><Stat icon={BellRing} label="New Fits" value={review.totals?.newMatches || 0} tone="warning" /><Stat icon={MailCheck} label="High Fit" value={review.totals?.qualified || 0} tone="warning" /><Stat icon={Send} label="CIM Ready" value={review.totals?.cimReady || 0} tone="warning" /><Stat icon={Inbox} label="Watchlist" value={review.totals?.watchlist || 0} /><Stat icon={ShieldAlert} label="Remove" value={review.totals?.removalCandidates || 0} tone="danger" /><Stat icon={CalendarClock} label="Lookback" value={`${review.lookbackDays || 0}d`} /></div>
+        {!readOnly ? <DealOsImportPanel importing={importingDealOs} onImport={onImportDealOs} policy={review?.dealOsImportPolicy} /> : null}
+        {review ? <div className="mt-7 space-y-7">{unavailableSources.length > 0 ? <p className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-900" role="alert"><strong>Partial review.</strong> {unavailableSources.map((source) => source.name).join(', ')} {unavailableSources.length === 1 ? 'is' : 'are'} unavailable, so totals and candidates cover only successfully imported sources. Daily email, CRM sync, and new CIM outreach are paused until every source succeeds.</p> : null}{review.coverageWarnings?.length ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-900" role="alert"><strong>Limited source coverage.</strong><ul className="mt-2 list-disc space-y-1 pl-5">{review.coverageWarnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div> : null}<CimApprovalQueue actionsDisabled={!sourceReviewComplete} onOpenDeal={setSelectedDeal} onSendApproved={onSendReady} readOnly={readOnly} review={review} sending={bulkSending} />{review.cimAutomation ? <section className="rounded-2xl border border-line bg-fog/70 p-5"><div className="flex flex-wrap items-center gap-2"><strong>CIM automation</strong><Pill tone={review.cimAutomation.paused ? 'danger' : 'info'}>Stage {review.cimAutomation.effectiveStage || 1}{review.cimAutomation.paused ? ' paused' : ''}</Pill><Pill>{review.cimAutomation.metrics?.reviewed || 0} reviewed</Pill><Pill>{review.cimAutomation.metrics?.approvalRate || 0}% approved</Pill></div>{review.cimAutomation.run?.exceptions?.length ? <details className="mt-3"><summary className="cursor-pointer text-sm font-semibold text-ink">{review.cimAutomation.run.exceptions.length} automation exception(s) require review</summary><ul className="mt-3 space-y-2 text-sm text-ink/70">{review.cimAutomation.run.exceptions.slice(0, 25).map((item) => <li className="rounded-xl border border-line bg-white p-3" key={`exception-${item.dealKey}`}><strong>{item.name}</strong><p className="mt-1">{item.reasons.join(' · ')}</p></li>)}</ul></details> : null}</section> : null}<EmailReadinessPanel data={emailReadiness} onSendTest={readOnly ? undefined : onSendEmailTest} testSending={emailTestSending} /><div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-7"><Stat icon={ClipboardList} label="Reviewed" value={review.totals?.reviewedDeals || 0} /><Stat icon={BellRing} label="New Fits" value={review.totals?.newMatches || 0} tone="warning" /><Stat icon={MailCheck} label="High Fit" value={review.totals?.qualified || 0} tone="warning" /><Stat icon={Send} label="CIM Ready" value={review.totals?.cimReady || 0} tone="warning" /><Stat icon={Inbox} label="Watchlist" value={review.totals?.watchlist || 0} /><Stat icon={ShieldAlert} label="Remove" value={review.totals?.removalCandidates || 0} tone="danger" /><Stat icon={CalendarClock} label="Lookback" value={`${review.lookbackDays || 0}d`} /></div>
           {review.dailyEmailJob ? <div className="rounded-2xl border border-line bg-fog/70 p-4 text-sm text-ink/72"><p><strong>Today&apos;s daily email:</strong> {label(review.dailyEmailJob.status)} · attempt {review.dailyEmailJob.attempt_count || 1}{review.dailyEmailJob.completed_at ? ` · completed ${dateTime(review.dailyEmailJob.completed_at)}` : ''}</p>{review.dailyEmailJob.last_error ? <p className="mt-2 text-red-700">{review.dailyEmailJob.last_error}</p> : null}</div> : null}
-          <div className="grid gap-4 lg:grid-cols-2"><div className="rounded-2xl border border-line bg-fog/70 p-5"><SectionLabel>Sources</SectionLabel><div className="mt-4 space-y-3">{(review.sources || []).map((source) => <DealSourceStatus key={source.id} source={source} />)}</div></div><div className="rounded-2xl border border-line bg-white/70 p-5"><SectionLabel>Criteria Notes</SectionLabel>{review.criteriaRecommendations?.length ? <ul className="mt-4 list-disc space-y-2 pl-5 text-sm leading-7 text-ink/74">{review.criteriaRecommendations.map((item) => <li key={item}>{item}</li>)}</ul> : <p className="mt-4 text-sm text-ink/68">No criteria changes recommended.</p>}</div></div>
+          <div className="grid gap-4 lg:grid-cols-2"><div className="rounded-2xl border border-line bg-fog/70 p-5"><SectionLabel>Sources</SectionLabel><div className="mt-4 space-y-3">{[...(review.sources || []), ...(review.disabledSources || [])].map((source) => <DealSourceStatus key={source.id} source={source} />)}</div></div><div className="rounded-2xl border border-line bg-white/70 p-5"><SectionLabel>Criteria Notes</SectionLabel>{review.criteriaRecommendations?.length ? <ul className="mt-4 list-disc space-y-2 pl-5 text-sm leading-7 text-ink/74">{review.criteriaRecommendations.map((item) => <li key={item}>{item}</li>)}</ul> : <p className="mt-4 text-sm text-ink/68">No criteria changes recommended.</p>}</div></div>
           {review.newlySeenMatches?.length ? <div><div className="mb-3 flex justify-between"><SectionLabel>Newly Seen Fits</SectionLabel><Pill tone="success">{review.newlySeenMatches.length}</Pill></div><div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">{review.newlySeenMatches.slice(0, 6).map((deal) => <DealCard deal={deal} dismissing={dismissingDealKey === deal.dealKey} key={`new-${deal.dealKey}`} onDismissDeal={onDismissDeal} onOpenDeal={setSelectedDeal} onSendCimRequest={onSendCimRequest} outreachDisabled={!sourceReviewComplete} readOnly={readOnly} requestingCim={requestingCimDealKey === deal.dealKey} />)}</div></div> : null}
           <div className="grid gap-5 xl:grid-cols-3"><DealColumn deals={review.qualified || []} dismissingDealKey={dismissingDealKey} empty="No high-fit recent listings found." onDismissDeal={onDismissDeal} onOpenDeal={setSelectedDeal} onRecordCimOutcome={onRecordCimOutcome} onSendCimRequest={onSendCimRequest} outreachDisabled={!sourceReviewComplete} readOnly={readOnly} requestingCimDealKey={requestingCimDealKey} responseOutcomes={review.cimAutomation?.metrics?.responseOutcomes} title="High Fit" /><DealColumn deals={review.watchlist || []} dismissingDealKey={dismissingDealKey} empty="No watchlist listings found." mode="watch" onDismissDeal={onDismissDeal} onOpenDeal={setSelectedDeal} onRecordCimOutcome={onRecordCimOutcome} onSendCimRequest={onSendCimRequest} outreachDisabled={!sourceReviewComplete} readOnly={readOnly} requestingCimDealKey={requestingCimDealKey} responseOutcomes={review.cimAutomation?.metrics?.responseOutcomes} title="Watchlist" /><DealColumn deals={review.removalCandidates || []} dismissingDealKey={dismissingDealKey} empty="No removal candidates found." mode="remove" onDismissDeal={onDismissDeal} onOpenDeal={setSelectedDeal} readOnly={readOnly} title="Remove" /></div></div> : <p className="mt-6 rounded-2xl border border-line bg-fog/70 p-4 text-sm text-ink/70">No source review loaded yet. Review sources before sending CIM requests.</p>}
       </Reveal>

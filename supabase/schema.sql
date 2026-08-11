@@ -224,6 +224,32 @@ create table if not exists public.deal_hunter_seen_deals (
 create index if not exists idx_deal_hunter_seen_deals_last_seen_at on public.deal_hunter_seen_deals (last_seen_at desc);
 create index if not exists idx_deal_hunter_seen_deals_source_id on public.deal_hunter_seen_deals (source_id, last_seen_at desc);
 
+create table if not exists public.deal_hunter_deal_os_imports (
+  id uuid primary key,
+  created_at timestamptz not null,
+  imported_by text not null,
+  exported_at timestamptz not null,
+  file_name text not null,
+  file_type text not null,
+  file_size integer not null,
+  file_sha256 text not null,
+  scope text not null,
+  coverage_label text not null,
+  expected_row_count integer,
+  row_count integer not null,
+  duplicate_count integer not null default 0,
+  stable_id_count integer not null default 0,
+  listing_url_count integer not null default 0,
+  coverage_limit_reached boolean not null default false,
+  records jsonb not null default '[]'::jsonb,
+  metadata jsonb not null default '{}'::jsonb
+);
+
+create index if not exists idx_deal_hunter_deal_os_imports_created_at
+  on public.deal_hunter_deal_os_imports (created_at desc);
+create index if not exists idx_deal_hunter_deal_os_imports_exported_at
+  on public.deal_hunter_deal_os_imports (exported_at desc);
+
 create table if not exists public.deal_hunter_cim_requests (
   id text primary key,
   created_at timestamptz not null,
@@ -2275,6 +2301,7 @@ alter table public.crm_email_outbox enable row level security;
 alter table public.crm_follow_up_recommendations enable row level security;
 alter table public.email_suppressions enable row level security;
 alter table public.deal_hunter_seen_deals enable row level security;
+alter table public.deal_hunter_deal_os_imports enable row level security;
 alter table public.deal_hunter_cim_requests enable row level security;
 alter table public.deal_hunter_cim_reviews enable row level security;
 alter table public.deal_hunter_automation_settings enable row level security;

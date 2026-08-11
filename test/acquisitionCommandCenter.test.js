@@ -151,6 +151,48 @@ test('source health flags row drops and missing post-window updates', () => {
   assert.equal(health.issues.some((issue) => issue.sourceId === 'daily-update-window'), true);
 });
 
+test('source health retains Deal OS export freshness and coverage provenance', () => {
+  const health = buildAcquisitionSourceHealth({
+    review: {
+      generatedAt: '2026-08-10T17:00:00.000Z',
+      totals: { newDeals: 2 },
+      sources: [{
+        id: 'deal-os-export',
+        name: 'SMB Deal OS export',
+        mode: 'manual-export',
+        fetched: true,
+        rowCount: 120,
+        exportedAt: '2026-08-10T15:00:00.000Z',
+        importedAt: '2026-08-10T15:05:00.000Z',
+        importedBy: 'mathew@example.com',
+        importAgeHours: 2,
+        maxAgeHours: 72,
+        scope: 'saved-search',
+        coverageLabel: 'All active criteria',
+        expectedRowCount: 120,
+        duplicateCount: 0,
+        stableIdCount: 118,
+        listingUrlCount: 120,
+        coverageLimitReached: false,
+      }],
+    },
+    now: new Date('2026-08-10T17:00:00.000Z'),
+  });
+  const source = health.sources[0];
+
+  assert.equal(source.exportedAt, '2026-08-10T15:00:00.000Z');
+  assert.equal(source.importedBy, 'mathew@example.com');
+  assert.equal(source.importAgeHours, 2);
+  assert.equal(source.scope, 'saved-search');
+  assert.equal(source.coverageLabel, 'All active criteria');
+  assert.equal(source.stableIdCount, 118);
+  assert.equal(source.listingUrlCount, 120);
+
+  const snapshot = buildNextSourceSnapshot(health, {}, '2026-08-10T17:00:00.000Z');
+  assert.equal(snapshot.sources['deal-os-export'].coverageLabel, 'All active criteria');
+  assert.equal(snapshot.sources['deal-os-export'].exportedAt, '2026-08-10T15:00:00.000Z');
+});
+
 test('source health suppresses no-new-deals warning when a configured source fails', () => {
   const health = buildAcquisitionSourceHealth({
     now: new Date('2026-06-16T18:00:00.000Z'),
@@ -320,6 +362,55 @@ test('source health uses cached snapshot unless explicitly refreshed', async () 
     assert.equal(sourceHealth.healthy, true);
     assert.equal(sourceHealth.sources[0].rowCount, 982);
     assert.equal(sourceHealth.totals.reviewedDeals, 42);
+  } finally {
+    if (previousSnapshotPath === undefined) {
+      delete process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH;
+    } else {
+      process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH = previousSnapshotPath;
+    }
+  }
+});
+
+test('cached source health recomputes Deal OS export age and fails stale imports closed', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-source-health-deal-os-cache-'));
+  const snapshotPath = path.join(tempDir, 'source-health.json');
+  const previousSnapshotPath = process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH;
+  process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH = snapshotPath;
+  const exportedAt = new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(
+    snapshotPath,
+    JSON.stringify({
+      generatedAt: new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString(),
+      issues: [],
+      sources: {
+        'deal-os-export': {
+          rowCount: 120,
+          name: 'SMB Deal OS export',
+          mode: 'manual-export',
+          checkedAt: new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString(),
+          exportedAt,
+          importedAt: exportedAt,
+          importedBy: 'mathew@example.com',
+          importAgeHours: 1,
+          maxAgeHours: 72,
+          scope: 'saved-search',
+          coverageLabel: 'All active criteria',
+        },
+      },
+    }),
+  );
+
+  try {
+    const sourceHealth = await getSourceHealth({}, { persistSnapshot: false });
+    const source = sourceHealth.sources[0];
+
+    assert.equal(sourceHealth.cached, true);
+    assert.equal(sourceHealth.healthy, false);
+    assert.equal(source.fetched, false);
+    assert.equal(source.tone, 'danger');
+    assert.ok(source.importAgeHours >= 73);
+    assert.match(source.error, /72-hour freshness limit/);
+    assert.equal(sourceHealth.issues.some((issue) => issue.sourceId === 'deal-os-export'), true);
   } finally {
     if (previousSnapshotPath === undefined) {
       delete process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH;

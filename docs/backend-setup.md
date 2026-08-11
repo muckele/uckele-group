@@ -42,13 +42,17 @@ Vite proxies `/api/*` requests to the backend during development.
 
 ## Daily Deal Hunter Review
 
-The private admin CRM includes a Deal Hunter scoring panel that can pull the SMB Deal Hunter Google Sheet CSV and the larger Airtable shared business list, score recent listings, and send the daily email.
+The private admin CRM includes a Deal Hunter scoring panel that can pull the SMB Deal Hunter Google Sheet CSV, accept a manually exported SMB Deal OS saved search or Deal Radar result, optionally retain the legacy Airtable source, score recent listings, and send the daily email.
 
 Configure:
 
 - `DEAL_HUNTER_EMAIL_RECIPIENT`
 - `DEAL_HUNTER_SHEET_CSV_URL` or `DEAL_HUNTER_SHEET_CSV_URLS`
+- `DEAL_HUNTER_AIRTABLE_ENABLED=false` to explicitly retire Airtable from the configured source set
 - `DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL`
+- `DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES` (default 8 MiB)
+- `DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS` (default and maximum 1,000)
+- `DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS` (default 72 hours)
 - `DEAL_HUNTER_DAILY_EMAIL_ENABLED`
 - `DEAL_HUNTER_DAILY_EMAIL_TIME`
 - `DEAL_HUNTER_DAILY_EMAIL_TIMEZONE`
@@ -63,13 +67,24 @@ Airtable API mode (required when the shared-view export exceeds the payload limi
 - `DEAL_HUNTER_AIRTABLE_TABLE_ID`
 - `DEAL_HUNTER_AIRTABLE_VIEW_ID`
 
-Use Airtable API mode for the larger business list in production. The unauthenticated shared-view payload is guarded by `DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES`; if Airtable returns an oversized JSON payload, the source is marked as needing setup instead of crashing the review. Google Sheet CSV imports are similarly capped by `DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES` and `DEAL_HUNTER_MAX_SOURCE_RECORDS` before records are normalized.
+Use Airtable API mode only while the legacy source remains enabled. The unauthenticated shared-view payload is guarded by `DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES`; if Airtable returns an oversized JSON payload, the source is marked as needing setup instead of crashing the review. Google Sheet CSV imports are similarly capped by `DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES` and `DEAL_HUNTER_MAX_SOURCE_RECORDS` before records are normalized. When `DEAL_HUNTER_AIRTABLE_ENABLED=false`, no Airtable network request is made and the disabled source does not block the scheduler. The admin review and daily email explicitly warn that source coverage is limited.
+
+### Manual SMB Deal OS export bridge
+
+A full administrator can upload a `.csv` or `.xlsx` export under **Deal Hunter → Import SMB Deal OS export**. Viewer sessions cannot upload. The administrator must select `Saved search` or `Deal Radar filters`, describe the covered search/filter, record when the export was generated, and may enter the listing count shown by Deal OS. If an expected count is supplied, it must exactly match the file.
+
+The importer requires every row to contain a business name and either a stable Deal OS/listing ID or a safe HTTP(S) View Listing URL. It normalizes listing identity, source, dates, business details, financial fields, and broker contacts; deduplicates repeated identities; and stores only allowlisted normalized fields plus file hash, size, type, coverage, export/import timestamps, and authenticated importer. The uploaded file and arbitrary spreadsheet columns are not retained. CSV must be valid UTF-8. XLSX formulas are never evaluated, external listing hyperlinks are extracted, compressed entries are bounded, and macro-enabled/legacy Excel formats are rejected.
+
+An upload is rejected when it is empty, oversized, older than the configured freshness window, future-dated, structurally incompatible, over the configured row ceiling, missing durable identities, contains an unsafe listing URL, or disagrees with the administrator-supplied expected count. The accepted export becomes a first-class source in the existing scoring, history, CRM synchronization, and email workflow. Once its export timestamp exceeds `DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS`, that source becomes unavailable and the existing fail-closed source gate pauses new email/CRM/CIM activity until a fresh export is uploaded.
+
+Exports at the 1,000-listing ceiling are accepted but prominently marked as potentially truncated. Source health records the covered search/filter, export and import timestamps, importer, age, expected/actual count, deduplication count, stable-ID count, link count, and cap warning.
 
 If any configured source is unavailable, the admin shows a partial-review warning and pauses the daily review email, CRM synchronization, and new CIM outreach until every source passes a fresh review. Follow-ups for already-contacted deals remain governed separately by inbound-reply readiness.
 
 Admin endpoints:
 
 - `GET /api/admin/deal-hunter/review`
+- `POST /api/admin/deal-hunter/deal-os-import` (full administrator only; raw CSV/XLSX body plus `X-Deal-OS-*` provenance headers)
 - `POST /api/admin/deal-hunter/send`
 - `POST /api/admin/deal-hunter/cim-request`
 - `POST /api/admin/deal-hunter/cim-follow-ups/run`
@@ -87,7 +102,7 @@ The production Fly machine runs the in-app scheduler once daily at the configure
 
 Phase 15 also records an atomic daily job claim in `scheduled_job_runs`. Admin, in-process scheduler, and external cron triggers share the same date-keyed claim, preventing overlapping triggers from sending duplicate daily emails. Successful provider delivery uses a deterministic idempotency key, local delivery evidence is written before completion bookkeeping, and stale in-progress claims remain retryable.
 
-Apply all committed Supabase migrations before deploying this version when `STORAGE_PROVIDER=supabase` is used. In particular, `20260806120000_crm_communications_lifecycle.sql` adds first-class communications, the expanded CIM lifecycle, Deal Hunter dispositions, and the atomic RPCs used by this release. SQLite applies the equivalent additive migration automatically at startup; take and verify a backup before starting the upgraded process against production data.
+Apply all committed Supabase migrations before deploying this version when `STORAGE_PROVIDER=supabase` is used. In particular, `20260806120000_crm_communications_lifecycle.sql` adds first-class communications, the expanded CIM lifecycle, Deal Hunter dispositions, and the atomic RPCs used by this release; `20260810130000_deal_os_exports.sql` adds the server-only normalized Deal OS import history. SQLite applies the equivalent additive migration automatically at startup; take and verify a backup before starting the upgraded process against production data.
 
 Optional external scheduler endpoint:
 

@@ -1267,6 +1267,7 @@ export default function DashboardPage() {
   const [createError, setCreateError] = useState('');
   const [dealHunterReview, setDealHunterReview] = useState(null);
   const [dealHunterLoading, setDealHunterLoading] = useState(false);
+  const [dealOsImporting, setDealOsImporting] = useState(false);
   const [dealHunterSending, setDealHunterSending] = useState(false);
   const [dealHunterBulkCimSending, setDealHunterBulkCimSending] = useState(false);
   const [dealHunterFollowUpRunning, setDealHunterFollowUpRunning] = useState(false);
@@ -2642,6 +2643,60 @@ export default function DashboardPage() {
     }
   }
 
+  async function handleImportDealOsExport({ file, scope, coverageLabel, exportedAt, expectedRowCount }) {
+    if (isReadOnly) {
+      setDealHunterFeedback({ error: 'Read-only users cannot import Deal OS exports.', message: '' });
+      return;
+    }
+
+    setDealOsImporting(true);
+    setDealHunterFeedback({ error: '', message: '' });
+
+    try {
+      const extension = file.name.toLowerCase().endsWith('.xlsx') ? 'xlsx' : 'csv';
+      const contentType = extension === 'xlsx'
+        ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        : 'text/csv';
+      const headers = {
+        'Content-Type': contentType,
+        'X-Deal-OS-File-Name': encodeURIComponent(file.name),
+        'X-Deal-OS-Exported-At': exportedAt,
+        'X-Deal-OS-Scope': scope,
+        'X-Deal-OS-Coverage-Label': encodeURIComponent(coverageLabel),
+      };
+      if (expectedRowCount) headers['X-Deal-OS-Expected-Row-Count'] = expectedRowCount;
+      const response = await fetch('/api/admin/deal-hunter/deal-os-import', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers,
+        body: file,
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        const details = Array.isArray(result.details) && result.details.length > 0 ? ` ${result.details.join('; ')}` : '';
+        throw new Error(`${result.error || 'Unable to import the Deal OS export.'}${details}`);
+      }
+
+      const reviewResponse = await fetch('/api/admin/deal-hunter/review', { credentials: 'same-origin' });
+      const reviewResult = await reviewResponse.json();
+      if (reviewResponse.ok && reviewResult.success && reviewResult.review) {
+        setDealHunterReview(reviewResult.review);
+      }
+      const imported = result.import || {};
+      const refreshWarning = reviewResponse.ok && reviewResult.success ? '' : ' The import was saved, but source review could not be refreshed.';
+      setDealHunterFeedback({
+        error: '',
+        message: `Imported ${imported.rowCount || 0} Deal OS listing${Number(imported.rowCount || 0) === 1 ? '' : 's'} from ${imported.fileName || file.name}.${refreshWarning}`,
+      });
+      await loadCommandCenter();
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to import the Deal OS export.', message: '' });
+    } finally {
+      setDealOsImporting(false);
+    }
+  }
+
   async function handleSendDealHunterEmail() {
     if (isReadOnly) {
       setDealHunterFeedback({ error: 'Read-only users cannot send daily deal emails.', message: '' });
@@ -3380,6 +3435,8 @@ export default function DashboardPage() {
                       ) : null}
                     </div>
                     {source.error ? <p className="mt-2 text-red-700">{source.error}</p> : null}
+                    {source.mode === 'manual-export' ? <p className="mt-2 text-ink/62">Coverage: {source.coverageLabel || 'not described'} ({formatLabel(source.scope || 'manual export')}) · exported {formatDateTime(source.exportedAt)} · {source.importAgeHours ?? '?'}h old · {source.stableIdCount || 0} stable IDs · {source.listingUrlCount || 0} listing URLs.</p> : null}
+                    {source.coverageLimitReached ? <p className="mt-2 font-semibold text-amber-800">The Deal OS export reached its listing ceiling and may be truncated.</p> : null}
                   </div>
                 ))}
                 {commandSourceHealth.sources?.length === 0 ? (
@@ -3500,7 +3557,9 @@ export default function DashboardPage() {
             followUpRunning={dealHunterFollowUpRunning}
             emailTestSending={emailTestSending}
             loading={dealHunterLoading}
+            importingDealOs={dealOsImporting}
             onDismissDeal={handleDismissDealHunterOpportunity}
+            onImportDealOs={handleImportDealOsExport}
             onReview={handleLoadDealHunterReview}
             onRecordCimOutcome={handleRecordCimOutcome}
             onOpenApprovals={() => {

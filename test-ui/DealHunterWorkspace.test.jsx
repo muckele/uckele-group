@@ -101,6 +101,70 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     expect(screen.getByText('871 rows')).toBeVisible();
   });
 
+  test('imports a fresh Deal OS export with explicit scope, coverage, timestamp, and expected count', () => {
+    const onImportDealOs = vi.fn();
+    const file = new File(['Listing ID,Business Name\nDOS-1,HVAC'], 'deal-os.csv', {
+      type: 'text/csv',
+      lastModified: new Date('2026-08-10T16:00:00.000Z').getTime(),
+    });
+    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    review.dealOsImportPolicy = { maxRecords: 1000, maxAgeHours: 72 };
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onImportDealOs={onImportDealOs} onReview={vi.fn()} review={review} />);
+
+    fireEvent.change(screen.getByLabelText('Deal OS export file'), { target: { files: [file] } });
+    fireEvent.change(screen.getByLabelText('Export type'), { target: { value: 'deal-radar' } });
+    fireEvent.change(screen.getByLabelText('Coverage description'), { target: { value: 'NY field service filters' } });
+    fireEvent.change(screen.getByLabelText('Exported at'), { target: { value: '2026-08-10T09:00' } });
+    fireEvent.change(screen.getByLabelText(/Expected listings shown by Deal OS/), { target: { value: '1' } });
+    fireEvent.submit(screen.getByRole('button', { name: 'Validate & Import' }).closest('form'));
+
+    expect(onImportDealOs).toHaveBeenCalledWith({
+      file,
+      scope: 'deal-radar',
+      coverageLabel: 'NY field service filters',
+      exportedAt: expect.any(String),
+      expectedRowCount: '1',
+    });
+  });
+
+  test('surfaces Deal OS provenance and an explicit limited-coverage warning when Airtable is retired', () => {
+    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    review.coverageWarnings = ['Legacy Airtable is disabled. Deal OS coverage is limited to one saved search.'];
+    review.sources = [{
+      id: 'deal-os-export',
+      name: 'SMB Deal OS export',
+      mode: 'manual-export',
+      fetched: true,
+      rowCount: 120,
+      exportedAt: '2026-08-10T16:00:00.000Z',
+      importedAt: '2026-08-10T16:05:00.000Z',
+      importedBy: 'mathew@example.com',
+      importAgeHours: 2.5,
+      scope: 'saved-search',
+      coverageLabel: 'All active criteria',
+      stableIdCount: 118,
+      listingUrlCount: 120,
+    }];
+    review.disabledSources = [{
+      id: 'airtable-disabled',
+      name: 'Legacy Airtable Biz List',
+      mode: 'disabled',
+      disabled: true,
+      fetched: true,
+      reason: 'Explicitly retired with DEAL_HUNTER_AIRTABLE_ENABLED=false.',
+    }];
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onReview={vi.fn()} review={review} />);
+
+    expect(screen.getByRole('alert')).toHaveTextContent('Limited source coverage.');
+    expect(screen.getByRole('alert')).toHaveTextContent('Legacy Airtable is disabled');
+    expect(screen.getByText('Saved Search · All active criteria')).toBeVisible();
+    expect(screen.getByText('118 stable ID · 120 listing URLs')).toBeVisible();
+    expect(screen.getByText(/by mathew@example.com/)).toBeVisible();
+    expect(screen.getByText('Legacy Airtable Biz List').closest('div')).toHaveTextContent('disabled');
+  });
+
   test('labels configuration failures as setup-needed and flags partial totals', () => {
     const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
     review.sources = [{

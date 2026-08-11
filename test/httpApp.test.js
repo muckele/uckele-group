@@ -512,6 +512,55 @@ test('communications and lead lifecycle endpoints enforce viewer read-only acces
   });
 });
 
+test('Deal OS export import requires a full administrator and records the authenticated importer', async () => {
+  await withServer(async (origin) => {
+    const adminCookie = lifecycleAdminCookie;
+    const viewerCookie = lifecycleViewerCookie;
+    assert.ok(adminCookie);
+    assert.ok(viewerCookie);
+    const csv = Buffer.from([
+      'Listing ID,Business Name,View Listing URL,SDE',
+      'HTTP-IMPORT-1,Commercial Fire Inspection,https://broker.example/http-import,425000',
+    ].join('\n'));
+    const importHeaders = {
+      'Content-Type': 'text/csv',
+      'X-Deal-OS-File-Name': encodeURIComponent('deal-os-http.csv'),
+      'X-Deal-OS-Exported-At': new Date().toISOString(),
+      'X-Deal-OS-Scope': 'saved-search',
+      'X-Deal-OS-Coverage-Label': encodeURIComponent('HTTP authorization test'),
+      'X-Deal-OS-Expected-Row-Count': '1',
+    };
+    const anonymous = await fetch(`${origin}/api/admin/deal-hunter/deal-os-import`, {
+      method: 'POST',
+      headers: importHeaders,
+      body: csv,
+    });
+    assert.equal(anonymous.status, 401);
+
+    const viewer = await fetch(`${origin}/api/admin/deal-hunter/deal-os-import`, {
+      method: 'POST',
+      headers: { ...importHeaders, Cookie: viewerCookie },
+      body: csv,
+    });
+    assert.equal(viewer.status, 401);
+
+    const response = await fetch(`${origin}/api/admin/deal-hunter/deal-os-import`, {
+      method: 'POST',
+      headers: { ...importHeaders, Cookie: adminCookie },
+      body: csv,
+    });
+    const result = await response.json();
+
+    assert.equal(response.status, 201);
+    assert.equal(result.success, true);
+    assert.equal(result.import.rowCount, 1);
+    assert.equal(result.import.importedBy, 'admin');
+    const stored = await getStorage().getLatestDealHunterDealOsImport();
+    assert.equal(stored.imported_by, 'admin');
+    assert.equal(stored.records[0].stableId, 'HTTP-IMPORT-1');
+  });
+});
+
 test('communication assignment, corrected retry, and Deal Hunter disposition enforce HTTP authorization and replay safety', async () => {
   await withServer(async (origin) => {
     const adminCookie = lifecycleAdminCookie;

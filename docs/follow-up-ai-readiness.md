@@ -68,7 +68,8 @@ No paid live model run or real-CRM evaluation is authorized in this task. The bo
 | External approval | Cost, rate, and latency envelope is not approved | Finance/operations owner | Approved request-rate cap, budget envelope, and acceptable measured latency | Record the approval identifier and bounds; keep AI disabled if no target is approved |
 | External service | Controlled synthetic smoke has not been authorized or observed | Release owner | Synthetic-only smoke ID with returned model, schema result, token usage, latency, and fallback test | Authorize and run the documented smoke sequence while both production feature flags remain off |
 | External approval | Rollback owner and decision on whether real CRM content is ever permitted are unresolved | Operations/privacy owner | Named owner, disable/rotation procedure, and explicit real-data decision | Record the decision before any canary |
-| Unrelated | Deal Hunter Airtable shared-view payload/token issue | Deal Hunter ingestion owner | Separate source-ingestion diagnosis | Track outside this optional-AI hardening task unless it blocks a required acceptance test |
+
+The previously unrelated Airtable payload/token issue now has a separate repository remediation: an explicit Airtable-disable control plus an admin-only, freshness-gated Deal OS CSV/XLSX export bridge. That work does not change any optional-AI approval or enablement decision and still requires its own deployment and first controlled Deal OS import.
 
 ## Local verification record
 

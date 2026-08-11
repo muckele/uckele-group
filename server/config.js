@@ -172,6 +172,7 @@ export function getConfig() {
       recipient: process.env.DEAL_HUNTER_EMAIL_RECIPIENT || adminEmail,
       cronSecret: process.env.DEAL_HUNTER_CRON_SECRET || '',
       sheetCsvUrls: listFromEnv(process.env.DEAL_HUNTER_SHEET_CSV_URLS || process.env.DEAL_HUNTER_SHEET_CSV_URL),
+      airtableEnabled: booleanFromEnv(process.env.DEAL_HUNTER_AIRTABLE_ENABLED, true),
       airtableSharedViewUrl:
         process.env.DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL ||
         'https://airtable.com/appEGxhjno0HTpEco/shrUhtbnzZTPaR4Lk/tblACIQ9QNiVmoWSK?viewControls=on',
@@ -183,6 +184,9 @@ export function getConfig() {
       maxSourceRecords: numberFromEnv(process.env.DEAL_HUNTER_MAX_SOURCE_RECORDS, 8000),
       sheetCsvMaxPayloadBytes: numberFromEnv(process.env.DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES, 8 * 1024 * 1024),
       airtableSharedMaxPayloadBytes: numberFromEnv(process.env.DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES, 12 * 1024 * 1024),
+      dealOsExportMaxPayloadBytes: explicitNumberFromEnv(process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES, 8 * 1024 * 1024),
+      dealOsExportMaxRecords: explicitNumberFromEnv(process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS, 1000),
+      dealOsExportMaxAgeHours: explicitNumberFromEnv(process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS, 72),
       dailyEmail: {
         enabled: booleanFromEnv(process.env.DEAL_HUNTER_DAILY_EMAIL_ENABLED, isProduction),
         time: process.env.DEAL_HUNTER_DAILY_EMAIL_TIME || '08:00',
@@ -394,6 +398,9 @@ export function validateConfig(config = getConfig()) {
   requirePositiveNumber(config.dealHunter.maxSourceRecords, 'DEAL_HUNTER_MAX_SOURCE_RECORDS', { integer: true });
   requirePositiveNumber(config.dealHunter.sheetCsvMaxPayloadBytes, 'DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES', { integer: true });
   requirePositiveNumber(config.dealHunter.airtableSharedMaxPayloadBytes, 'DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES', { integer: true });
+  requirePositiveNumber(config.dealHunter.dealOsExportMaxPayloadBytes, 'DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES', { integer: true, max: 20 * 1024 * 1024 });
+  requirePositiveNumber(config.dealHunter.dealOsExportMaxRecords, 'DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS', { integer: true, max: 1000 });
+  requirePositiveNumber(config.dealHunter.dealOsExportMaxAgeHours, 'DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS', { max: 24 * 30 });
   requirePositiveNumber(config.protection?.rateLimitWindowMs, 'RATE_LIMIT_WINDOW_MS');
   requirePositiveNumber(config.protection?.rateLimitRetentionMs, 'RATE_LIMIT_RETENTION_MS');
   requirePositiveNumber(config.protection?.rateLimitMax, 'RATE_LIMIT_MAX', { integer: true });

@@ -233,6 +233,17 @@ function normalizeDealHunterSeenDealRow(row) {
     : null;
 }
 
+function normalizeDealHunterDealOsImportRow(row) {
+  return row
+    ? {
+        ...row,
+        coverage_limit_reached: Boolean(row.coverage_limit_reached),
+        records: Array.isArray(row.records) ? row.records : [],
+        metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
+      }
+    : null;
+}
+
 function normalizeDealHunterCimRequestRow(row) {
   return row
     ? {
@@ -1951,6 +1962,43 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       }
 
       return safeRecords;
+    },
+
+    async insertDealHunterDealOsImport(record) {
+      const payload = {
+        ...record,
+        expected_row_count: record.expected_row_count ?? null,
+        records: Array.isArray(record.records) ? record.records : [],
+        metadata: record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)
+          ? record.metadata
+          : {},
+      };
+      const { data, error } = await client.from('deal_hunter_deal_os_imports').insert(payload).select().single();
+      if (error) throw error;
+      return normalizeDealHunterDealOsImportRow(data);
+    },
+
+    async getLatestDealHunterDealOsImport() {
+      const { data, error } = await client
+        .from('deal_hunter_deal_os_imports')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeDealHunterDealOsImportRow(data);
+    },
+
+    async listDealHunterDealOsImports({ limit = 25 } = {}) {
+      const { data, error } = await client
+        .from('deal_hunter_deal_os_imports')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(Math.max(1, Math.min(Number(limit) || 25, 100)));
+      if (error) throw error;
+      return (data || []).map(normalizeDealHunterDealOsImportRow);
     },
 
     async insertDealHunterCimReviews(reviews = []) {

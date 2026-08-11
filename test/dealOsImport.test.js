@@ -1,0 +1,308 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import { strToU8, zipSync } from 'fflate';
+
+process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
+process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
+process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS = '72';
+process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS = '1000';
+process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES = String(8 * 1024 * 1024);
+
+const {
+  importDealOsExport,
+  parseDealOsXlsxRows,
+  reviewDailyDeals,
+} = await import('../server/services/dealHunter.js');
+const { createSqliteStorage } = await import('../server/storage/sqlite.js');
+
+function memoryStorage(initial = null) {
+  let latest = initial;
+  const imports = initial ? [initial] : [];
+
+  return {
+    async insertDealHunterDealOsImport(record) {
+      latest = record;
+      imports.unshift(record);
+      return record;
+    },
+    async getLatestDealHunterDealOsImport() {
+      return latest;
+    },
+    async listDealHunterDealOsImports() {
+      return imports;
+    },
+  };
+}
+
+function freshTimestamp(offsetHours = 0) {
+  return new Date(Date.now() + offsetHours * 60 * 60 * 1000).toISOString();
+}
+
+function validCsv() {
+  return [
+    'Listing ID,Business Name,View Listing URL,Source,Date Added,Last Updated,Industry,Description,SDE,Revenue,Asking Price,Broker Name,Broker Email,Unretained Internal Column',
+    'DOS-100,Commercial HVAC Services,https://broker.example/hvac,DealStream,2026-08-09,2026-08-10,HVAC,Recurring commercial maintenance,$450000,$2200000,$1800000,Jamie Broker,jamie@broker.example,do not retain',
+    'DOS-100,Commercial HVAC Services,https://broker.example/hvac,DealStream,2026-08-09,2026-08-10,HVAC,Recurring commercial maintenance,$450000,$2200000,$1800000,Jamie Broker,backup@broker.example,do not retain',
+    ',Industrial Inspection,https://broker.example/inspection,BizBuySell,2026-08-10,2026-08-10,Inspection,Compliance inspection contracts,$375000,$1600000,$1400000,Alex Broker,alex@broker.example,do not retain',
+  ].join('\n');
+}
+
+function dealOsWorkbook() {
+  const worksheet = [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+    '<sheetData>',
+    '<row r="1"><c r="A1" t="inlineStr"><is><t>Listing ID</t></is></c><c r="B1" t="inlineStr"><is><t>Business Name</t></is></c><c r="C1" t="inlineStr"><is><t>View Listing URL</t></is></c><c r="D1" t="inlineStr"><is><t>Date Added</t></is></c><c r="E1" t="inlineStr"><is><t>SDE</t></is></c><c r="F1" t="inlineStr"><is><t>Broker Email</t></is></c></row>',
+    '<row r="2"><c r="A2" t="inlineStr"><is><t>DOS-XLSX-1</t></is></c><c r="B2" t="inlineStr"><is><t>Fire Safety Inspection</t></is></c><c r="C2" t="inlineStr"><is><t>View Listing</t></is></c><c r="D2"><v>46244</v></c><c r="E2"><v>425000</v></c><c r="F2" t="inlineStr"><is><t>broker@example.com</t></is></c></row>',
+    '</sheetData>',
+    '<hyperlinks><hyperlink ref="C2" r:id="rId1"/></hyperlinks>',
+    '</worksheet>',
+  ].join('');
+  const relationships = [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://broker.example/fire-safety" TargetMode="External"/>',
+    '</Relationships>',
+  ].join('');
+
+  return Buffer.from(zipSync({
+    'xl/worksheets/sheet1.xml': strToU8(worksheet),
+    'xl/worksheets/_rels/sheet1.xml.rels': strToU8(relationships),
+  }));
+}
+
+test('CSV import preserves durable identities, normalizes deal fields, deduplicates rows, and discards arbitrary columns', async () => {
+  const storage = memoryStorage();
+  const result = await importDealOsExport({
+    fileBuffer: Buffer.from(validCsv()),
+    fileName: 'deal-os-saved-search.csv',
+    mimeType: 'text/csv',
+    exportedAt: freshTimestamp(-1),
+    scope: 'saved-search',
+    coverageLabel: 'All active acquisition criteria',
+    expectedRowCount: 3,
+    importedBy: 'mathew@example.com',
+    storage,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.import.rowCount, 2);
+  assert.equal(result.import.duplicateCount, 1);
+  assert.equal(result.import.stableIdCount, 1);
+  assert.equal(result.import.listingUrlCount, 2);
+  const stored = await storage.getLatestDealHunterDealOsImport();
+  assert.equal(stored.records[0].stableId, 'DOS-100');
+  assert.equal(stored.records[0].annualProfit, 450000);
+  assert.equal(stored.records[0].listingSource, 'DealStream');
+  assert.deepEqual(stored.records[0].brokerContacts.map((contact) => contact.email), [
+    'backup@broker.example',
+    'jamie@broker.example',
+  ]);
+  assert.doesNotMatch(JSON.stringify(stored.records), /Unretained Internal Column|do not retain/);
+
+  const review = await reviewDailyDeals({ storage });
+  const source = review.sources.find((item) => item.id === 'deal-os-export');
+  assert.equal(source.fetched, true);
+  assert.equal(source.rowCount, 2);
+  assert.equal(source.coverageLabel, 'All active acquisition criteria');
+  assert.equal(review.disabledSources[0].id, 'airtable-disabled');
+  assert.match(review.coverageWarnings[0], /Legacy Airtable is disabled/);
+  const deals = [...review.qualified, ...review.watchlist, ...review.removalCandidates];
+  const stableDeal = deals.find((deal) => deal.id === 'DOS-100');
+  assert.equal(stableDeal.dealKey, 'source:deal-os-export:DOS-100');
+  assert.equal(stableDeal.listingSource, 'DealStream');
+});
+
+test('punctuation-distinct Deal OS IDs remain separate durable identities', async () => {
+  const storage = memoryStorage();
+  const result = await importDealOsExport({
+    fileBuffer: Buffer.from([
+      'Listing ID,Business Name',
+      'A-1,Commercial Plumbing',
+      'A 1,Industrial Plumbing',
+    ].join('\n')),
+    fileName: 'deal-os-distinct-ids.csv',
+    exportedAt: freshTimestamp(-1),
+    scope: 'saved-search',
+    coverageLabel: 'Distinct stable IDs',
+    expectedRowCount: 2,
+    importedBy: 'admin',
+    storage,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.import.rowCount, 2);
+  const review = await reviewDailyDeals({ storage });
+  const deals = [...review.qualified, ...review.watchlist, ...review.removalCandidates];
+  assert.deepEqual(
+    deals.map((deal) => deal.dealKey).sort(),
+    ['source:deal-os-export:A%201', 'source:deal-os-export:A-1'],
+  );
+});
+
+test('Deal OS stable IDs retain an established URL deal key so existing outreach history stays connected', async () => {
+  const storage = memoryStorage();
+  const result = await importDealOsExport({
+    fileBuffer: Buffer.from(validCsv()),
+    fileName: 'deal-os-continuity.csv',
+    exportedAt: freshTimestamp(-1),
+    scope: 'saved-search',
+    coverageLabel: 'Existing listing continuity',
+    expectedRowCount: 3,
+    importedBy: 'admin',
+    storage,
+  });
+  assert.equal(result.ok, true);
+  storage.listDealHunterSeenDeals = async () => [{
+    id: 'url:https://broker.example/hvac',
+    first_seen_at: '2026-08-01T12:00:00.000Z',
+    last_seen_at: '2026-08-09T12:00:00.000Z',
+    source_id: 'sheet-0',
+    source_name: 'SMB Deal Hunter Google Sheet',
+    source_mode: 'csv',
+    external_id: '42',
+    listing_url: 'https://broker.example/hvac',
+  }];
+
+  const review = await reviewDailyDeals({ storage });
+  const deals = [...review.qualified, ...review.watchlist, ...review.removalCandidates];
+  const stableDeal = deals.find((deal) => deal.id === 'DOS-100');
+
+  assert.equal(stableDeal.id, 'DOS-100');
+  assert.equal(stableDeal.dealKey, 'url:https://broker.example/hvac');
+  assert.equal(stableDeal.firstSeenAt, '2026-08-01T12:00:00.000Z');
+});
+
+test('XLSX import reads first-class cell values, external listing hyperlinks, and Excel date serials', async () => {
+  const workbook = dealOsWorkbook();
+  const parsed = parseDealOsXlsxRows(workbook);
+  assert.equal(parsed.rows.length, 1);
+  assert.equal(parsed.rows[0]['View Listing URL'], 'https://broker.example/fire-safety');
+
+  const storage = memoryStorage();
+  const result = await importDealOsExport({
+    fileBuffer: workbook,
+    fileName: 'deal-radar.xlsx',
+    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    exportedAt: freshTimestamp(-1),
+    scope: 'deal-radar',
+    coverageLabel: 'NY and NJ field-service filters',
+    expectedRowCount: 1,
+    importedBy: 'admin',
+    storage,
+  });
+
+  assert.equal(result.ok, true);
+  const stored = await storage.getLatestDealHunterDealOsImport();
+  assert.equal(stored.records[0].listingUrl, 'https://broker.example/fire-safety');
+  assert.equal(stored.records[0].dateAdded, '2026-08-10T00:00:00.000Z');
+  assert.equal(stored.records[0].brokerEmail, 'broker@example.com');
+});
+
+test('import rejects stale, incompatible, count-mismatched, and identity-free exports without persistence', async () => {
+  const cases = [
+    {
+      name: 'stale',
+      csv: validCsv(),
+      exportedAt: freshTimestamp(-73),
+      expectedRowCount: 3,
+      pattern: /older than the 72-hour freshness limit/i,
+    },
+    {
+      name: 'incompatible',
+      csv: 'Company,Notes\nAlpha,No durable identity',
+      exportedAt: freshTimestamp(-1),
+      expectedRowCount: 1,
+      pattern: /schema is incompatible/i,
+    },
+    {
+      name: 'count mismatch',
+      csv: validCsv(),
+      exportedAt: freshTimestamp(-1),
+      expectedRowCount: 2,
+      pattern: /showed 2 expected listings.*contains 3 rows/i,
+    },
+    {
+      name: 'unsafe URL',
+      csv: 'Business Name,View Listing URL\nAlpha,javascript:alert(1)',
+      exportedAt: freshTimestamp(-1),
+      expectedRowCount: 1,
+      pattern: /invalid row/i,
+    },
+  ];
+
+  for (const scenario of cases) {
+    const storage = memoryStorage();
+    const result = await importDealOsExport({
+      fileBuffer: Buffer.from(scenario.csv),
+      fileName: `${scenario.name}.csv`,
+      exportedAt: scenario.exportedAt,
+      scope: 'saved-search',
+      coverageLabel: 'Test coverage',
+      expectedRowCount: scenario.expectedRowCount,
+      importedBy: 'admin',
+      storage,
+    });
+    assert.equal(result.ok, false, scenario.name);
+    assert.match(result.error, scenario.pattern, scenario.name);
+    assert.equal(await storage.getLatestDealHunterDealOsImport(), null, scenario.name);
+  }
+});
+
+test('an accepted Deal OS import becomes an unavailable source after its freshness window', async () => {
+  const staleImport = {
+    id: '00000000-0000-4000-8000-000000000001',
+    created_at: freshTimestamp(-80),
+    imported_by: 'admin',
+    exported_at: freshTimestamp(-80),
+    file_name: 'stale.csv',
+    file_type: 'text/csv',
+    file_size: 100,
+    file_sha256: 'a'.repeat(64),
+    scope: 'saved-search',
+    coverage_label: 'Stale saved search',
+    expected_row_count: 1,
+    row_count: 1,
+    duplicate_count: 0,
+    stable_id_count: 1,
+    listing_url_count: 1,
+    coverage_limit_reached: false,
+    records: [{ stableId: 'STALE-1', name: 'Stale HVAC', listingUrl: 'https://broker.example/stale', brokerContacts: [] }],
+    metadata: {},
+  };
+  const review = await reviewDailyDeals({ storage: memoryStorage(staleImport) });
+  const source = review.sources.find((item) => item.id === 'deal-os-export');
+
+  assert.equal(source.fetched, false);
+  assert.match(source.error, /exceeds the 72-hour freshness limit/i);
+  assert.equal(review.totals.reviewedDeals, 0);
+});
+
+test('SQLite persists normalized Deal OS import provenance and records without the uploaded file', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-os-import-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'deal-os.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const result = await importDealOsExport({
+    fileBuffer: Buffer.from(validCsv()),
+    fileName: 'deal-os.csv',
+    exportedAt: freshTimestamp(-1),
+    scope: 'saved-search',
+    coverageLabel: 'Persisted source',
+    expectedRowCount: 3,
+    importedBy: 'admin@example.com',
+    storage,
+  });
+
+  assert.equal(result.ok, true);
+  const latest = await storage.getLatestDealHunterDealOsImport();
+  assert.equal(latest.imported_by, 'admin@example.com');
+  assert.equal(latest.records.length, 2);
+  assert.equal(latest.metadata.parserVersion, 'deal-os-export-v1');
+  assert.equal((await storage.listDealHunterDealOsImports({ limit: 10 })).length, 1);
+});

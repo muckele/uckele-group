@@ -71,6 +71,26 @@ test('daily Deal Hunter email always links to the 75+ scored-business dashboard'
   assert.doesNotMatch(message.html, /href="http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals"/);
 });
 
+test('daily Deal Hunter email clearly discloses intentionally limited source coverage', () => {
+  const message = buildDailyDealHunterEmail({
+    to: 'admin@example.com',
+    review: {
+      totals: {},
+      sources: [{ name: 'SMB Deal Hunter Google Sheet', fetched: true, rowCount: 290 }],
+      coverageWarnings: [
+        'Legacy Airtable is disabled and no Deal OS export is active. This review covers only the Google Sheet.',
+      ],
+      criteriaRecommendations: [],
+    },
+  });
+
+  assert.match(message.subject, /limited source coverage/i);
+  assert.match(message.text, /LIMITED SOURCE COVERAGE/);
+  assert.match(message.text, /Legacy Airtable is disabled/);
+  assert.match(message.html, /Limited source coverage/);
+  assert.match(message.html, /Legacy Airtable is disabled/);
+});
+
 test('daily Deal Hunter email only makes HTTP(S) listing URLs clickable', () => {
   const message = buildDailyDealHunterEmail({
     to: 'admin@example.com',
