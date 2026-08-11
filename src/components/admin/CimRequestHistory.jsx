@@ -197,7 +197,7 @@ export default function CimRequestHistory({
   }
 
   return (
-    <section aria-labelledby="cim-request-history-heading" className="min-w-0 space-y-5">
+    <section aria-labelledby="cim-request-history-heading" className="min-w-0 space-y-5" data-admin-tour="deal-hunter-history">
       <div className="rounded-2xl border border-line/80 bg-white/80 p-4 sm:p-6">
         <p className="text-xs font-semibold uppercase tracking-[0.18em] text-moss">Deal Hunter</p>
         <h2 className="mt-2 text-2xl font-semibold text-ink" id="cim-request-history-heading">CIM Request History</h2>

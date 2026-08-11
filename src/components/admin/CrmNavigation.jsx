@@ -41,7 +41,7 @@ export default function CrmNavigation({ filters, total, totalPages, onChange, di
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4" data-admin-tour="crm-filters">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <div className="flex items-center gap-2">

@@ -96,6 +96,18 @@ function normalizeEmailSuppressionRow(row) {
     : null;
 }
 
+function normalizeAdminOnboardingProgressRow(row) {
+  return row
+    ? {
+        ...row,
+        tour_version: Number(row.tour_version),
+        last_completed_step_id: row.last_completed_step_id || null,
+        completed_at: row.completed_at || null,
+        skipped_at: row.skipped_at || null,
+      }
+    : null;
+}
+
 function normalizeSecureDocumentCleanupJobRow(row) {
   return row
     ? {
@@ -2615,6 +2627,35 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       const { data, error } = await client.from('admin_sessions').select('*').eq('id', id).maybeSingle();
       if (error) throw error;
       return data || null;
+    },
+
+    async listAdminOnboardingProgress(principalId) {
+      const { data, error } = await client
+        .from('admin_onboarding_progress')
+        .select('*')
+        .eq('principal_id', principalId)
+        .order('updated_at', { ascending: false })
+        .order('tour_key', { ascending: true })
+        .order('tour_version', { ascending: false });
+      if (error) throw error;
+      return (data || []).map(normalizeAdminOnboardingProgressRow);
+    },
+
+    async upsertAdminOnboardingProgress(record) {
+      const { data, error } = await client.rpc('upsert_admin_onboarding_progress', {
+        p_principal_id: record.principal_id,
+        p_tour_key: record.tour_key,
+        p_tour_version: record.tour_version,
+        p_status: record.status,
+        p_last_completed_step_id: record.last_completed_step_id || null,
+        p_step_ids: record.valid_step_ids || [],
+        p_started_at: record.started_at,
+        p_updated_at: record.updated_at,
+        p_completed_at: record.completed_at || null,
+        p_skipped_at: record.skipped_at || null,
+      });
+      if (error) throw error;
+      return normalizeAdminOnboardingProgressRow(Array.isArray(data) ? data[0] : data);
     },
 
     async touchAdminSession(id, lastSeenAt) {

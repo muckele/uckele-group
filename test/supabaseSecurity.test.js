@@ -31,6 +31,10 @@ const dealOsMigrationUrl = new URL(
   '../supabase/migrations/20260810130000_deal_os_exports.sql',
   import.meta.url,
 );
+const adminOnboardingMigrationUrl = new URL(
+  '../supabase/migrations/20260810143000_admin_onboarding_progress.sql',
+  import.meta.url,
+);
 
 function currentAppTables(schema) {
   return Array.from(
@@ -129,7 +133,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const followUpWorkspaceMigration = fs.readFileSync(followUpWorkspaceMigrationUrl, 'utf8');
   const followUpQueueMigration = fs.readFileSync(followUpQueueMigrationUrl, 'utf8');
   const dealOsMigration = fs.readFileSync(dealOsMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}`;
+  const adminOnboardingMigration = fs.readFileSync(adminOnboardingMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
@@ -140,6 +145,7 @@ test('Supabase migration and fresh schema isolate every current app table to the
   assert.doesNotMatch(communicationsLifecycleMigration, /create\s+policy/i, 'communications tables must not add public RLS policies');
   assert.doesNotMatch(followUpWorkspaceMigration, /create\s+policy/i, 'follow-up tables must not add public RLS policies');
   assert.doesNotMatch(dealOsMigration, /create\s+policy/i, 'Deal OS import table must not add public RLS policies');
+  assert.doesNotMatch(adminOnboardingMigration, /create\s+policy/i, 'onboarding preference table must not add public RLS policies');
   assertServerOnlyPrivileges(migration, 'forward migration');
   assert.match(analyticsMigration, /revoke all privileges on table public\.analytics_events from public, anon, authenticated;/i);
   assert.match(analyticsMigration, /grant all privileges on table public\.analytics_events to service_role;/i);
@@ -165,6 +171,12 @@ test('Supabase migration and fresh schema isolate every current app table to the
   }
   assert.match(dealOsMigration, /revoke all privileges on table public\.deal_hunter_deal_os_imports from public, anon, authenticated;/i);
   assert.match(dealOsMigration, /grant all privileges on table public\.deal_hunter_deal_os_imports to service_role;/i);
+  assert.match(adminOnboardingMigration, /revoke all privileges on table public\.admin_onboarding_progress from public, anon, authenticated;/i);
+  assert.match(adminOnboardingMigration, /grant all privileges on table public\.admin_onboarding_progress to service_role;/i);
+  assert.match(adminOnboardingMigration, /p_step_ids\s+text\[\]/i);
+  assert.match(adminOnboardingMigration, /array_position\(p_step_ids,\s*excluded\.last_completed_step_id\)/i);
+  assertServiceRoleOnlyFunction(adminOnboardingMigration, 'admin onboarding migration', 'upsert_admin_onboarding_progress');
+  assertServiceRoleOnlyFunction(schema, 'fresh schema', 'upsert_admin_onboarding_progress');
   const serviceRoleFunctions = [
     'canonical_listing_identity',
     'delete_crm_submission_lifecycle',

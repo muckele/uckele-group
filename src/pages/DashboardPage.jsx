@@ -31,6 +31,7 @@ import CimRequestHistory from '../components/admin/CimRequestHistory';
 import CrmCommunications from '../components/admin/CrmCommunications';
 import UnassignedCommunicationsInbox from '../components/admin/UnassignedCommunicationsInbox';
 import FollowUpsWorkspace from '../components/admin/FollowUpsWorkspace';
+import AdminOnboarding from '../components/admin/AdminOnboarding';
 import { adminSectionMeta } from '../content/adminSectionMeta';
 
 const statuses = ['new', 'review', 'contacted', 'archived', 'spam'];
@@ -609,9 +610,9 @@ function SectionLabel({ children }) {
   return <p className="text-xs font-semibold uppercase leading-5 tracking-[0.14em] text-moss sm:text-sm sm:tracking-[0.18em]">{children}</p>;
 }
 
-function AdminFormSection({ title, description, children }) {
+function AdminFormSection({ title, description, children, tourTarget = '' }) {
   return (
-    <fieldset className="rounded-2xl border border-line/80 bg-fog/45 p-4 sm:p-6">
+    <fieldset className="rounded-2xl border border-line/80 bg-fog/45 p-4 sm:p-6" data-admin-tour={tourTarget || undefined}>
       <legend className="px-2 text-lg font-semibold text-ink">{title}</legend>
       {description ? <p className="mb-5 text-sm leading-6 text-ink/62">{description}</p> : null}
       <div className="space-y-5">{children}</div>
@@ -665,7 +666,7 @@ function AdminSectionNav({ activeSection, isReadOnly }) {
   const visibleSections = adminSections.filter((section) => !isReadOnly || !['new-record', 'operations'].includes(section.id));
 
   return (
-    <aside className="admin-section-nav">
+    <aside className="admin-section-nav" data-admin-tour="section-navigation">
       <nav className="admin-section-nav-card">
         <div className="hidden px-2 pb-2 pt-1 md:block">
           <p className="text-[11px] font-semibold uppercase tracking-normal text-moss/75">Admin</p>
@@ -1310,6 +1311,7 @@ export default function DashboardPage() {
   const crmListSearch = crmSearchFromFilters(filters);
   const crmListHref = `/admin/crm${crmListSearch ? `?${crmListSearch}` : ''}`;
   const pageMeta = adminSectionMeta[isCrmDetailView ? 'crm-detail' : activeSection] || adminSectionMeta.overview;
+  const onboardingScope = isCrmDetailView ? 'crm-detail' : activeSection === 'crm' ? 'crm-index' : activeSection;
   const showNewRecordAction = !isReadOnly
     && !isCrmDetailView
     && ['overview', 'crm', 'command-center', 'deal-hunter', 'follow-ups'].includes(activeSection);
@@ -3206,7 +3208,7 @@ export default function DashboardPage() {
 
       <section className="admin-page-header">
         <Reveal className="admin-page-header-card">
-          <div className="flex flex-col gap-5 xl:flex-row xl:items-center xl:justify-between">
+          <div className="flex flex-col gap-5 xl:flex-row xl:items-center xl:justify-between" data-admin-tour="page-guidance">
             <div className="min-w-0">
               <p className="text-[11px] font-semibold uppercase tracking-normal text-moss">{pageMeta.eyebrow}</p>
               <h1 className="mt-2 text-3xl font-semibold leading-tight text-ink sm:text-4xl">{pageMeta.title}</h1>
@@ -3250,8 +3252,14 @@ export default function DashboardPage() {
               </p>
             )}
 
-            {showNewRecordAction || showExportAction || showDailyUpdateAction ? (
-              <div className="admin-action-row">
+            <div className="admin-action-row">
+              <AdminOnboarding
+                scope={onboardingScope}
+                sessionIdentity={`${authState.role}:${authState.username}`}
+                userRole={authState.role}
+              />
+              {showNewRecordAction || showExportAction || showDailyUpdateAction ? (
+                <>
                 {showNewRecordAction ? (
                   <NavLink
                     className={`${primaryActionButtonClass} admin-action-button`}
@@ -3281,8 +3289,9 @@ export default function DashboardPage() {
                     Daily Deal Update
                   </a>
                 ) : null}
-              </div>
-            ) : null}
+                </>
+              ) : null}
+            </div>
           </div>
         </Reveal>
       </section>
@@ -3295,7 +3304,7 @@ export default function DashboardPage() {
       {activeSection === 'overview' ? (
       <>
       <section className="section-shell mt-8">
-        <div className="admin-stat-grid">
+        <div className="admin-stat-grid" data-admin-tour="overview-priorities">
           <StatCard icon={Inbox} label="Total Records" onClick={() => setFilters({ ...defaultCrmFilters })} to="/admin/crm" value={summary.total} />
           <StatCard icon={BellRing} label="Action Items" to="/admin/follow-ups?view=action-items" value={adminSummary.actionItems} tone={adminSummary.actionItems > 0 ? 'warning' : 'default'} />
           <StatCard icon={CalendarClock} label="Overdue" to="/admin/follow-ups?view=overdue" value={adminSummary.overdue} tone={adminSummary.overdue > 0 ? 'danger' : 'default'} />
@@ -3306,7 +3315,7 @@ export default function DashboardPage() {
         </div>
       </section>
       <section className="section-shell mt-5">
-        <Reveal className="panel p-5 sm:p-6">
+        <Reveal className="panel p-5 sm:p-6" data-admin-tour="workspace-launcher">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
             <div>
               <SectionLabel>Admin Areas</SectionLabel>
@@ -3409,7 +3418,7 @@ export default function DashboardPage() {
           </div>
 
           <div className="mt-7 grid gap-5 xl:grid-cols-[0.95fr_1.05fr]">
-            <div className="rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5">
+            <div className="rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5" data-admin-tour="command-center-source-health">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <SectionLabel>Source Health</SectionLabel>
                 <Pill tone={commandSourceHealth.healthy ? 'success' : 'warning'}>
@@ -3454,7 +3463,7 @@ export default function DashboardPage() {
               ) : null}
             </div>
 
-            <div className="rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5">
+            <div className="rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5" data-admin-tour="command-center-action-queue">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <SectionLabel>Global Action Queue</SectionLabel>
                 <Pill tone={commandSummary.actionItems > 0 ? 'warning' : 'success'}>{commandSummary.actionItems}</Pill>
@@ -3512,7 +3521,7 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          <div className="mt-7">
+          <div className="mt-7" data-admin-tour="command-center-pipeline">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <SectionLabel>Pipeline Stages</SectionLabel>
               <Pill>{commandSummary.totalRecords} command records</Pill>
@@ -3643,7 +3652,7 @@ export default function DashboardPage() {
             </div>
 
             <form className="mt-8 space-y-8" onSubmit={handleCreateSubmission}>
-              <AdminFormSection description="Identify the opportunity and connect it to its source. Only the company or contact context is needed to get started." title="1. Opportunity basics">
+              <AdminFormSection description="Identify the opportunity and connect it to its source. Only the company or contact context is needed to get started." title="1. Opportunity basics" tourTarget="new-record-basics">
                 <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                 <InputField
                   label="Company / Business"
@@ -3693,7 +3702,7 @@ export default function DashboardPage() {
                 </div>
               </AdminFormSection>
 
-              <AdminFormSection description="Add the economics you know today. These fields can remain blank until a listing or CIM provides them." title="2. Financial profile">
+              <AdminFormSection description="Add the economics you know today. These fields can remain blank until a listing or CIM provides them." title="2. Financial profile" tourTarget="new-record-economics">
                 <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-5">
                 <InputField
                   label="TTM Revenue"
@@ -3723,7 +3732,7 @@ export default function DashboardPage() {
                 </div>
               </AdminFormSection>
 
-              <AdminFormSection description="Set ownership and the next concrete action so the new record enters the correct working queue." title="3. Workflow">
+              <AdminFormSection description="Set ownership and the next concrete action so the new record enters the correct working queue." title="3. Workflow" tourTarget="new-record-next-action">
                 <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                 <SelectField
                   label="Priority"
@@ -3850,7 +3859,7 @@ export default function DashboardPage() {
 
       {activeSection === 'crm' && isCrmDetailView ? (
       <section className="section-shell mt-8">
-        <Reveal className="panel p-5 sm:p-7">
+        <Reveal className="panel p-5 sm:p-7" data-admin-tour="crm-detail-workflow">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <SectionLabel>Diligence Deal Room</SectionLabel>
@@ -3871,7 +3880,7 @@ export default function DashboardPage() {
       ) : null}
 
       {activeSection === 'crm' ? (
-      <section className="section-shell mt-8 pb-8">
+      <section className="section-shell mt-8 pb-8" data-admin-tour="crm-results">
         <div className="space-y-6">
           {!isCrmDetailView ? (
             <div className="flex flex-col gap-2 px-1 sm:flex-row sm:items-end sm:justify-between">
@@ -4061,8 +4070,8 @@ export default function DashboardPage() {
                   submission={submission}
                 />
 
-                <fieldset className={isReadOnly ? 'opacity-75' : ''} disabled={isReadOnly}>
-                  <div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-6">
+                <fieldset className={isReadOnly ? 'opacity-75' : ''} data-admin-tour="crm-detail-evidence" disabled={isReadOnly}>
+                  <div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-6" data-admin-tour="crm-detail-next-action">
                     <SelectField
                       label="Status"
                       onChange={(event) =>
@@ -4595,13 +4604,14 @@ export default function DashboardPage() {
                   workflowUpdatesDisabled={submission.status === 'archived'}
                 />
 
-                <DealActivityTimeline
-                  error={dealActivity.error}
-                  events={dealActivity.events}
-                  loading={dealActivity.loading}
-                />
+                <div data-admin-tour="crm-detail-actions">
+                  <DealActivityTimeline
+                    error={dealActivity.error}
+                    events={dealActivity.events}
+                    loading={dealActivity.loading}
+                  />
 
-                {!isReadOnly ? (
+                  {!isReadOnly ? (
                   <>
                     <div className="mt-6 grid gap-3 sm:flex sm:flex-wrap">
                       <button
@@ -4639,7 +4649,8 @@ export default function DashboardPage() {
                       </button>
                     </div>
                   </>
-                ) : null}
+                  ) : null}
+                </div>
               </Reveal>
             );
           })}

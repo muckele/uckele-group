@@ -108,6 +108,18 @@ function normalizeEmailSuppressionRow(row) {
     : null;
 }
 
+function normalizeAdminOnboardingProgressRow(row) {
+  return row
+    ? {
+        ...row,
+        tour_version: Number(row.tour_version),
+        last_completed_step_id: row.last_completed_step_id || null,
+        completed_at: row.completed_at || null,
+        skipped_at: row.skipped_at || null,
+      }
+    : null;
+}
+
 function normalizeDealHunterDispositionRow(row) {
   return row
     ? {
@@ -1188,6 +1200,24 @@ export function createSqliteStorage(config) {
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
+    CREATE TABLE IF NOT EXISTS admin_onboarding_progress (
+      principal_id TEXT NOT NULL,
+      tour_key TEXT NOT NULL,
+      tour_version INTEGER NOT NULL CHECK (tour_version > 0),
+      status TEXT NOT NULL CHECK (status IN ('in_progress', 'completed', 'skipped')),
+      last_completed_step_id TEXT,
+      started_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      completed_at TEXT,
+      skipped_at TEXT,
+      PRIMARY KEY (principal_id, tour_key, tour_version),
+      CHECK (
+        (status = 'in_progress' AND completed_at IS NULL AND skipped_at IS NULL)
+        OR (status = 'completed' AND completed_at IS NOT NULL AND skipped_at IS NULL)
+        OR (status = 'skipped' AND completed_at IS NULL AND skipped_at IS NOT NULL)
+      )
+    );
+
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_created_at ON contact_submissions(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_status ON contact_submissions(status);
     CREATE INDEX IF NOT EXISTS idx_contact_submissions_email ON contact_submissions(email);
@@ -1251,6 +1281,8 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_admin_magic_links_expires_at ON admin_magic_links(expires_at);
     CREATE INDEX IF NOT EXISTS idx_admin_sessions_username ON admin_sessions(username, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at ON admin_sessions(expires_at);
+		CREATE INDEX IF NOT EXISTS idx_admin_onboarding_progress_principal_updated
+		  ON admin_onboarding_progress(principal_id, updated_at DESC);
 	  `);
 
   ensureColumn(database, 'contact_submissions', 'lead_type', "TEXT NOT NULL DEFAULT 'owner'");
@@ -5040,6 +5072,84 @@ export function createSqliteStorage(config) {
     async getAdminSession(id) {
       const row = database.prepare('SELECT * FROM admin_sessions WHERE id = ?').get(id);
       return row ? { ...row, metadata: parseJsonColumn(row.metadata, {}) } : null;
+    },
+
+    async listAdminOnboardingProgress(principalId) {
+      return database
+        .prepare(`
+          SELECT * FROM admin_onboarding_progress
+          WHERE principal_id = ?
+          ORDER BY updated_at DESC, tour_key ASC, tour_version DESC
+        `)
+        .all(principalId)
+        .map(normalizeAdminOnboardingProgressRow);
+    },
+
+    async upsertAdminOnboardingProgress(record) {
+      database.prepare(`
+        INSERT INTO admin_onboarding_progress (
+          principal_id, tour_key, tour_version, status, last_completed_step_id,
+          started_at, updated_at, completed_at, skipped_at
+        ) VALUES (
+          @principal_id, @tour_key, @tour_version, @status, @last_completed_step_id,
+          @started_at, @updated_at, @completed_at, @skipped_at
+        )
+        ON CONFLICT(principal_id, tour_key, tour_version) DO UPDATE SET
+          status = CASE
+            WHEN admin_onboarding_progress.status = 'completed' THEN admin_onboarding_progress.status
+            WHEN admin_onboarding_progress.status = 'skipped' AND excluded.status <> 'completed' THEN admin_onboarding_progress.status
+            ELSE excluded.status
+          END,
+          last_completed_step_id = CASE
+            WHEN admin_onboarding_progress.status = 'completed' THEN admin_onboarding_progress.last_completed_step_id
+            WHEN admin_onboarding_progress.status = 'skipped' AND excluded.status <> 'completed' THEN admin_onboarding_progress.last_completed_step_id
+            WHEN COALESCE((
+              SELECT CAST(key AS INTEGER)
+              FROM json_each(@valid_step_ids_json)
+              WHERE value = excluded.last_completed_step_id
+            ), -1) < COALESCE((
+              SELECT CAST(key AS INTEGER)
+              FROM json_each(@valid_step_ids_json)
+              WHERE value = admin_onboarding_progress.last_completed_step_id
+            ), -1) THEN admin_onboarding_progress.last_completed_step_id
+            ELSE excluded.last_completed_step_id
+          END,
+          updated_at = CASE
+            WHEN admin_onboarding_progress.status = 'completed' THEN admin_onboarding_progress.updated_at
+            WHEN admin_onboarding_progress.status = 'skipped' AND excluded.status <> 'completed' THEN admin_onboarding_progress.updated_at
+            WHEN admin_onboarding_progress.status = 'in_progress'
+              AND excluded.status = 'in_progress'
+              AND COALESCE((
+                SELECT CAST(key AS INTEGER)
+                FROM json_each(@valid_step_ids_json)
+                WHERE value = excluded.last_completed_step_id
+              ), -1) <= COALESCE((
+                SELECT CAST(key AS INTEGER)
+                FROM json_each(@valid_step_ids_json)
+                WHERE value = admin_onboarding_progress.last_completed_step_id
+              ), -1) THEN admin_onboarding_progress.updated_at
+            ELSE excluded.updated_at
+          END,
+          completed_at = CASE
+            WHEN admin_onboarding_progress.status = 'completed' THEN admin_onboarding_progress.completed_at
+            WHEN excluded.status = 'completed' THEN excluded.completed_at
+            ELSE NULL
+          END,
+          skipped_at = CASE
+            WHEN admin_onboarding_progress.status = 'completed' THEN NULL
+            WHEN admin_onboarding_progress.status = 'skipped' AND excluded.status <> 'completed' THEN admin_onboarding_progress.skipped_at
+            WHEN excluded.status = 'skipped' THEN excluded.skipped_at
+            ELSE NULL
+          END
+      `).run({
+        ...record,
+        valid_step_ids_json: JSON.stringify(record.valid_step_ids || []),
+      });
+
+      return normalizeAdminOnboardingProgressRow(database.prepare(`
+        SELECT * FROM admin_onboarding_progress
+        WHERE principal_id = ? AND tour_key = ? AND tour_version = ?
+      `).get(record.principal_id, record.tour_key, record.tour_version));
     },
 
     async touchAdminSession(id, lastSeenAt) {

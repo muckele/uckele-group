@@ -9,8 +9,21 @@ import EmailReadinessPanel from '../src/components/admin/EmailReadinessPanel.jsx
 afterEach(cleanup);
 
 describe('Operations Center partial failures', () => {
+  test.each([
+    [{ loading: true }, 'Loading operations readiness…'],
+    [{ error: 'Operations are unavailable.' }, 'Operations are unavailable.'],
+    [{}, 'No operations readiness data is available.'],
+  ])('retains stable guide targets before operational data is available', (props, expectedText) => {
+    const { container } = render(<OperationsCenter {...props} />);
+
+    expect(screen.getByText(expectedText)).toBeVisible();
+    expect(container.querySelector('[data-admin-tour="operations-readiness"]')).toBeInTheDocument();
+    expect(container.querySelector('[data-admin-tour="operations-history"]')).toBeInTheDocument();
+    expect(container.querySelector('[data-admin-tour="operations-storage"]')).toBeInTheDocument();
+  });
+
   test('keeps healthy panels visible while showing sanitized panel errors', () => {
-    render(
+    const { container } = render(
       <OperationsCenter
         data={{
           scheduler: { runs: [], failures: 0, pending: 0, error: 'Scheduler history is temporarily unavailable.' },
@@ -53,6 +66,9 @@ describe('Operations Center partial failures', () => {
     expect(screen.getByText('2 pending · 1 failed · 3 unassigned')).toBeVisible();
     expect(screen.getByText('6 need attention')).toBeVisible();
     expect(screen.getByRole('heading', { name: 'Core systems at a glance' })).toBeVisible();
+    expect(container.querySelector('[data-admin-tour="operations-readiness"]')).toBeInTheDocument();
+    expect(container.querySelector('[data-admin-tour="operations-history"]')).toBeInTheDocument();
+    expect(container.querySelector('[data-admin-tour="operations-storage"]')).toBeInTheDocument();
   });
 
   test('shows generic email gates and body-free operational metrics without overstating delivery', () => {

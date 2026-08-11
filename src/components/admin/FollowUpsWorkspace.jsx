@@ -786,10 +786,10 @@ export default function FollowUpsWorkspace({ readOnly = false }) {
   return (
     <section className="section-shell mt-8 pb-8">
       <div className="panel overflow-hidden">
-        <div className="border-b border-ink/10 p-5 sm:p-7">
+        <div className="border-b border-ink/10 p-5 sm:p-7" data-admin-tour="follow-ups-filters">
           <div className="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
             <div><p className="text-xs font-bold uppercase tracking-[0.16em] text-moss">Human-reviewed workspace</p><h2 className="mt-2 text-2xl font-semibold text-ink sm:text-3xl">Follow-Up decisions and email actions</h2><p className="mt-2 max-w-3xl text-sm leading-6 text-ink/65">Review facts, chronology, safety policy, and a traceable recommendation before composing one email. Page loads, recommendations, previews, and drafts cannot send.</p></div>
-            <div className="flex flex-wrap gap-2"><Badge>{state.total} filtered</Badge>{state.summary?.total !== undefined ? <Badge>{state.summary.total} CRM records</Badge> : null}{readOnly ? <Badge value="delayed">Viewer · queue summaries only</Badge> : <Badge value="delivered">Admin actions enabled</Badge>}</div>
+            <div className="flex flex-wrap gap-2" data-admin-tour="follow-ups-email-controls"><Badge>{state.total} filtered</Badge>{state.summary?.total !== undefined ? <Badge>{state.summary.total} CRM records</Badge> : null}{readOnly ? <Badge value="delayed">Viewer · queue summaries only</Badge> : <Badge value="delivered">Admin actions enabled</Badge>}</div>
           </div>
           <div aria-label="Follow-up queue filters" className="mt-5 flex gap-2 overflow-x-auto pb-2" role="tablist">
             {views.map(([id, label]) => <button aria-selected={query.view === id} className={`shrink-0 rounded-full border px-3 py-2 text-sm font-semibold transition ${query.view === id ? 'border-moss bg-moss text-white' : 'border-ink/10 bg-white text-ink/65 hover:border-moss/30 hover:text-moss'}`} key={id} onClick={() => setQuery((current) => ({ ...current, view: id, page: 1 }))} role="tab" type="button">{label}</button>)}
@@ -802,7 +802,7 @@ export default function FollowUpsWorkspace({ readOnly = false }) {
           </div>
         </div>
 
-        <div aria-live="polite">
+        <div aria-live="polite" data-admin-tour="follow-ups-queue" data-admin-tour-next-action="true">
           {state.loading ? <div className="flex min-h-64 items-center justify-center gap-3 p-8 text-sm text-ink/60"><Loader2 className="h-5 w-5 animate-spin" />Loading {selectedViewLabel.toLowerCase()}…</div> : null}
           {!state.loading && state.error ? <div className="m-5 rounded-2xl border border-red-200 bg-red-50 p-5 text-sm text-red-800"><div className="flex gap-2"><AlertTriangle className="h-5 w-5 shrink-0" /><span>{state.error}</span></div><button className={`${buttonSecondary} mt-4`} onClick={loadQueue} type="button">Retry queue</button></div> : null}
           {!state.loading && !state.error && state.items.length === 0 ? <div className="flex min-h-64 flex-col items-center justify-center p-8 text-center"><Inbox className="h-9 w-9 text-moss/55" /><h3 className="mt-4 text-lg font-semibold text-ink">No records match {selectedViewLabel.toLowerCase()}</h3><p className="mt-2 max-w-xl text-sm leading-6 text-ink/60">Try another filter or clear the search. No background recommendation or email action runs for an empty queue.</p>{query.search ? <button className={`${buttonSecondary} mt-4`} onClick={() => setSearchInput('')} type="button">Clear search</button> : null}</div> : null}

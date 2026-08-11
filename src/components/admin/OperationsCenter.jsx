@@ -37,9 +37,9 @@ function PanelError({ children }) {
 }
 
 export default function OperationsCenter({ data, loading = false, error = '', onSendEmailTest, emailTestSending = false, onToggleCimAutomation, cimAutomationUpdating = false }) {
-  if (loading && !data) return <div className="panel p-7 text-sm text-ink/65" role="status">Loading operations history…</div>;
-  if (error && !data) return <div className="rounded-2xl border border-red-200 bg-red-50 p-5 text-sm text-red-700" role="alert">{error}</div>;
-  if (!data) return null;
+  if (loading && !data) return <div className="space-y-4"><div className="panel p-7 text-sm text-ink/65" data-admin-tour="operations-readiness" role="status">Loading operations readiness…</div><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-history">Operations history will appear when the readiness check completes.</div><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-storage">Storage and recovery status will appear when the readiness check completes.</div></div>;
+  if (error && !data) return <div className="space-y-4"><div className="rounded-2xl border border-red-200 bg-red-50 p-5 text-sm text-red-700" data-admin-tour="operations-readiness" role="alert">{error}</div><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-history">Operations history is temporarily unavailable.</div><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-storage">Storage and recovery status is temporarily unavailable.</div></div>;
+  if (!data) return <div className="space-y-4"><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-readiness">No operations readiness data is available.</div><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-history">No operations history is available.</div><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-storage">No storage status is available.</div></div>;
 
   const jobs = data.scheduler?.runs || [];
   const auditEvents = data.audit?.events || [];
@@ -61,7 +61,7 @@ export default function OperationsCenter({ data, loading = false, error = '', on
   const communicationAttention = communicationPending + communicationFailed + communicationUnassigned;
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6" data-admin-tour="operations-readiness">
       {error ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800" role="alert">{error}</div> : null}
       <nav className="panel p-3 sm:p-4" aria-label="Operations sections">
         <p className="px-2 text-xs font-semibold uppercase tracking-[0.12em] text-moss/70">Jump to</p>
@@ -95,7 +95,7 @@ export default function OperationsCenter({ data, loading = false, error = '', on
         {Object.keys(cimMetrics.passReasons || {}).length > 0 ? <p className="mt-3 text-sm text-ink/65"><strong>Pass reasons:</strong> {Object.entries(cimMetrics.passReasons).sort((left, right) => right[1] - left[1]).map(([reason, count]) => `${reason}: ${count}`).join(' · ')}</p> : null}
         <PanelError>{cimAutomation.error}</PanelError>
       </section>
-      <section aria-labelledby="core-systems-heading">
+      <section aria-labelledby="core-systems-heading" data-admin-tour="operations-storage">
         <div className="mb-4">
           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">Infrastructure</p>
           <h3 className="mt-2 text-xl font-semibold text-ink" id="core-systems-heading">Core systems at a glance</h3>
@@ -139,7 +139,7 @@ export default function OperationsCenter({ data, loading = false, error = '', on
         </div>
       </section>
 
-      <section className="panel p-5 sm:p-7" aria-labelledby="scheduler-history-heading">
+      <section className="panel p-5 sm:p-7" aria-labelledby="scheduler-history-heading" data-admin-tour="operations-history">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">Scheduler</p><h3 className="mt-2 text-xl font-semibold text-ink" id="scheduler-history-heading">Job history</h3></div>
           <StatusBadge

@@ -21,9 +21,10 @@ describe('CRM navigation', () => {
 
   test('reports accurate record range and requests adjacent pages', () => {
     const onChange = vi.fn();
-    render(<CrmNavigation filters={filters} onChange={onChange} total={63} totalPages={3} />);
+    const { container } = render(<CrmNavigation filters={filters} onChange={onChange} total={63} totalPages={3} />);
 
     expect(screen.getByText('26–50 of 63 records · Page 2 of 3')).toBeVisible();
+    expect(container.querySelector('[data-admin-tour="crm-filters"]')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /next/i }));
     expect(onChange).toHaveBeenCalledWith({ page: 3 });
   });

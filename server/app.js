@@ -92,6 +92,7 @@ import {
   getCrmFollowUpOutboxResult,
   liftAdminEmailSuppression,
 } from './services/followUpWorkspace.js';
+import { registerAdminOnboardingRoutes } from './routes/adminOnboarding.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.resolve(__dirname, '../dist');
@@ -594,6 +595,8 @@ export function createApp() {
     response.setHeader('Set-Cookie', result.cookie);
     response.json({ success: true, revoked: result.revoked });
   }));
+
+  registerAdminOnboardingRoutes(app);
 
   app.get(
     '/api/admin/acquisition-command-center',

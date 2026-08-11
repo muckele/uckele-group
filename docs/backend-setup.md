@@ -280,6 +280,23 @@ The admin CRM supports:
 - delivery visibility
 - spam flag visibility
 
+### Private admin page guides
+
+Authenticated administrators and read-only viewers have short, route-scoped page guides under `/admin`. The Overview foundations guide is the only guide that starts automatically; every eligible admin page exposes **Guide this page** for an on-demand replay. Viewer definitions are filtered before the guide starts, and Operations and New Record guides remain administrator-only.
+
+Guide progress is a server-owned preference keyed by the authenticated session's `principal_id`, tour key, and integer tour version. The browser never selects a principal, and browser storage is not the durable authority. The private API is:
+
+```text
+GET   /api/admin/onboarding
+PATCH /api/admin/onboarding/:tourKey
+```
+
+SQLite creates `admin_onboarding_progress` additively during normal storage initialization. Supabase deployments must apply `supabase/migrations/20260810143000_admin_onboarding_progress.sql` (or apply the complete `supabase/schema.sql`) before enabling this release. The table and its atomic transition function are restricted to the server's service role by the repository's existing RLS posture. No new environment variable is required.
+
+Tour keys, versions, eligible roles, and stable step IDs live in `shared/adminOnboarding.js`. Increment a tour's integer version only when its structure or operating meaning changes materially. Completion for an older version intentionally does not suppress the new version.
+
+An onboarding read or write failure does not block admin work. It suppresses repeated automatic attempts for that mounted browser session while leaving the manual page guide available. The public acquisition routes and `/secure-documents` do not mount, fetch, or render this feature.
+
 Recommended production mode:
 
 - `ADMIN_AUTH_MODE=magic-link`
