@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import fs from 'node:fs';
 import path from 'node:path';
 import { getStorage } from '../server/storage/index.js';
 import { verifyBackupBundle } from '../server/services/backups.js';
@@ -12,6 +13,15 @@ function option(name) {
 async function main() {
   const apply = process.argv.includes('--apply');
   const backupReference = option('--backup');
+  const resolutionReference = option('--resolutions');
+  let historicalResolutions = [];
+  if (resolutionReference) {
+    const parsed = JSON.parse(fs.readFileSync(path.resolve(resolutionReference), 'utf8'));
+    historicalResolutions = Array.isArray(parsed) ? parsed : parsed?.decisions;
+    if (!Array.isArray(historicalResolutions)) {
+      throw new Error('The historical resolution file must be an array or an object with a decisions array.');
+    }
+  }
   const storage = getStorage();
   let backupVerified = false;
   if (apply) {
@@ -29,6 +39,7 @@ async function main() {
     backupReference: apply ? path.resolve(backupReference) : '',
     backupVerified,
     actor: option('--actor') || (apply ? '' : 'cim-identity-audit'),
+    historicalResolutions,
     storage,
   });
   console.log(JSON.stringify(result, null, 2));

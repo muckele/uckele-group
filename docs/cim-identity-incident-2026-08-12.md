@@ -31,6 +31,29 @@ Dry run is read-only and prints bounded, recipient-redacted evidence:
 npm run cim:identity:audit
 ```
 
+The audit reports missing historical `opportunity_id` links separately and includes deterministically repairable links in the linkage-mismatch total. Apply refuses to proceed while any ambiguous historical pair lacks an explicit incident-owner decision. Put reviewed decisions in a protected JSON file; never commit a production decision file containing real record identifiers:
+
+```json
+{
+  "decisions": [
+    {
+      "action": "link",
+      "requestId": "reviewed-legacy-request-id",
+      "targetRequestId": "reviewed-matching-request-id",
+      "incidentOwnerAuthorized": true,
+      "authorizedBy": "incident-owner",
+      "reason": "Specific bounded evidence supporting this historical link."
+    }
+  ]
+}
+```
+
+Use `"action": "keep-distinct"` when the incident owner deliberately decides that an otherwise ambiguous pair represents separate opportunities. Preview the effect before apply:
+
+```bash
+npm run cim:identity:audit -- --resolutions /absolute/path/to/protected-resolutions.json
+```
+
 For SQLite, create and verify an application-consistent backup before any authorized repair:
 
 ```bash
@@ -44,10 +67,11 @@ Apply is never run at application startup. It requires the explicit flag, exact 
 npm run cim:identity:repair -- \
   --confirm APPLY-CIM-IDENTITY-REPAIR \
   --actor release-owner \
+  --resolutions /absolute/path/to/protected-resolutions.json \
   --backup /absolute/path/to/verified-backup-bundle
 ```
 
-The apply transaction creates canonical records and aliases, backfills only deterministic links, quarantines duplicate active sequences, adds repair activities where a CRM submission exists, and stores a checksummed reconciliation manifest. It never deletes requests, communications, message bodies, provider IDs, webhook events, or CRM submissions. Re-running the same plan returns the existing manifest without additional changes.
+The apply transaction creates canonical records and aliases, backfills deterministic and explicitly reviewed historical links, quarantines duplicate active sequences, adds repair activities where a CRM submission exists, and stores the authorization evidence in a checksummed reconciliation manifest. It never guesses an unresolved ambiguous pair and never deletes requests, communications, message bodies, provider IDs, webhook events, or CRM submissions. Re-running the same plan returns the existing manifest without additional changes.
 
 Supabase apply requires independently verified managed-backup evidence and an authorized operator procedure; the bundled CLI verifier applies only to SQLite backup bundles. Do not fabricate a local path as Supabase backup evidence.
 

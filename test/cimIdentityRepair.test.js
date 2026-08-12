@@ -279,6 +279,183 @@ test('repair dry run is read-only and apply is confirmation-gated and idempotent
   assert.equal((await storage.listDealHunterCimRepairManifests({ limit: 100 })).length, 1);
 });
 
+test('repair refuses unresolved legacy ambiguity and records an incident-owner request-pair decision', async (t) => {
+  const storage = repairStorage(t);
+  const legacyFingerprint = request('legacy-fingerprint', {
+    deal_key: 'fingerprint:legacy-no-description',
+    metadata: {
+      description: '',
+      location: 'Pooler, Chatham, GA, US',
+      state: '',
+      askingPrice: 1_580_000,
+      annualRevenue: 3_535_760,
+      annualProfit: 535_397,
+      sourceId: 'fixture-source',
+      providerMessageIds: ['provider-legacy-fingerprint'],
+    },
+  });
+  const matchingUrl = request('matching-url', {
+    created_at: '2026-07-20T16:00:00.000Z',
+    updated_at: '2026-07-20T16:00:00.000Z',
+    first_requested_at: '2026-07-20T16:00:00.000Z',
+    first_provider_accepted_at: '2026-07-20T16:00:00.000Z',
+    deal_key: 'url:https://bizbuysell.com/business-opportunity/synthetic-hvac/2516010',
+    listing_url: 'https://bizbuysell.com/business-opportunity/synthetic-hvac/2516010',
+    provider_message_id: 'provider-matching-url',
+    metadata: {
+      description: '',
+      location: 'Pooler, Chatham, GA, US',
+      state: '',
+      askingPrice: 1_580_000,
+      annualRevenue: 3_535_760,
+      annualProfit: 535_397,
+      sourceId: 'fixture-source',
+      providerMessageIds: ['provider-matching-url'],
+    },
+  });
+  const distinctUrl = request('distinct-url', {
+    deal_key: 'url:https://bizbuysell.com/business-opportunity/synthetic-hvac/2436873',
+    listing_url: 'https://bizbuysell.com/business-opportunity/synthetic-hvac/2436873',
+    provider_message_id: 'provider-distinct-url',
+    metadata: {
+      description: '',
+      location: 'Berlin Township, Camden, NJ, US',
+      state: '',
+      askingPrice: 1_400_000,
+      annualRevenue: 3_535_760,
+      annualProfit: 490_070,
+      sourceId: 'fixture-source',
+      providerMessageIds: ['provider-distinct-url'],
+    },
+  });
+  await storage.upsertDealHunterCimRequest(legacyFingerprint);
+  await storage.upsertDealHunterCimRequest(matchingUrl);
+  await storage.upsertDealHunterCimRequest(distinctUrl);
+  await storage.upsertDealHunterCimSafetySettings({
+    updated_at: now.toISOString(),
+    outreach_paused: true,
+    updated_by: 'incident-owner',
+    metadata: { pauseReason: 'Historical ambiguity repair test.' },
+  });
+
+  const dryRun = await runCimIdentityRepair({ storage, now });
+  assert.equal(dryRun.audit.counts.ambiguousPairs, 2);
+  assert.equal(dryRun.audit.counts.materiallyDistinctPairs, 1);
+  assert.equal(dryRun.audit.counts.missingOpportunityLinks, 3);
+  await assert.rejects(
+    runCimIdentityRepair({
+      apply: true,
+      confirmation: 'APPLY-CIM-IDENTITY-REPAIR',
+      backupReference: '/synthetic/verified-backup',
+      backupVerified: true,
+      actor: 'repair-admin',
+      storage,
+      now,
+    }),
+    /unresolved ambiguous historical identity pairs/i,
+  );
+
+  const historicalResolutions = [{
+    action: 'link',
+    requestId: legacyFingerprint.id,
+    targetRequestId: matchingUrl.id,
+    incidentOwnerAuthorized: true,
+    authorizedBy: 'incident-owner',
+    reason: 'Exact location and all three economics match the later URL listing; the conflicting URL remains distinct.',
+  }];
+  const preview = await runCimIdentityRepair({ storage, now, historicalResolutions });
+  assert.equal(preview.resolutionPreview.ambiguousPairsBefore, 2);
+  assert.equal(preview.resolutionPreview.ambiguousPairsRemaining, 0);
+  const applied = await runCimIdentityRepair({
+    apply: true,
+    confirmation: 'APPLY-CIM-IDENTITY-REPAIR',
+    backupReference: '/synthetic/verified-backup',
+    backupVerified: true,
+    actor: 'repair-admin',
+    historicalResolutions,
+    storage,
+    now,
+  });
+  assert.equal(applied.applied, true);
+  assert.equal(applied.manifest.manifest.historicalResolutions.length, 1);
+  const repaired = await storage.listDealHunterCimRequests({ limit: 100 });
+  assert.equal(
+    repaired.find((item) => item.id === legacyFingerprint.id).opportunity_id,
+    repaired.find((item) => item.id === matchingUrl.id).opportunity_id,
+  );
+  assert.notEqual(
+    repaired.find((item) => item.id === distinctUrl.id).opportunity_id,
+    repaired.find((item) => item.id === matchingUrl.id).opportunity_id,
+  );
+  const replay = await runCimIdentityRepair({
+    apply: true,
+    confirmation: 'APPLY-CIM-IDENTITY-REPAIR',
+    backupReference: '/synthetic/verified-backup',
+    backupVerified: true,
+    actor: 'repair-admin',
+    historicalResolutions,
+    storage,
+    now: new Date('2026-08-13T18:00:00.000Z'),
+  });
+  assert.equal(replay.alreadyApplied, true);
+  assert.equal((await storage.listDealHunterCimRepairManifests({ limit: 100 })).length, 1);
+  const after = await runCimIdentityRepair({ storage, now });
+  assert.equal(after.audit.counts.ambiguousPairs, 0);
+  assert.equal(after.audit.counts.missingOpportunityLinks, 0);
+  assert.equal(after.audit.counts.linkageMismatches, 0);
+});
+
+test('repair persists a reviewed keep-distinct decision so the pair does not reopen', async (t) => {
+  const storage = repairStorage(t);
+  const left = request('ambiguous-left', {
+    deal_key: 'fingerprint:ambiguous-left',
+    metadata: {
+      description: '', location: 'Phoenix, AZ', state: '', askingPrice: 1_000_000,
+      annualRevenue: 2_000_000, annualProfit: 400_000, sourceId: 'fixture-source',
+      providerMessageIds: ['provider-ambiguous-left'],
+    },
+  });
+  const right = request('ambiguous-right', {
+    deal_key: 'url:https://example.test/listing/ambiguous-right',
+    listing_url: 'https://example.test/listing/ambiguous-right',
+    provider_message_id: 'provider-ambiguous-right',
+    metadata: {
+      description: '', location: 'Phoenix, AZ', state: '', askingPrice: 1_000_000,
+      annualRevenue: 2_000_000, annualProfit: 400_000, sourceId: 'fixture-source',
+      providerMessageIds: ['provider-ambiguous-right'],
+    },
+  });
+  await storage.upsertDealHunterCimRequest(left);
+  await storage.upsertDealHunterCimRequest(right);
+  await storage.upsertDealHunterCimSafetySettings({
+    updated_at: now.toISOString(), outreach_paused: true, updated_by: 'incident-owner', metadata: {},
+  });
+  const historicalResolutions = [{
+    action: 'keep-distinct',
+    requestId: left.id,
+    targetRequestId: right.id,
+    incidentOwnerAuthorized: true,
+    authorizedBy: 'incident-owner',
+    reason: 'The incident owner verified these are separate opportunities despite incomplete retained evidence.',
+  }];
+  const applied = await runCimIdentityRepair({
+    apply: true,
+    confirmation: 'APPLY-CIM-IDENTITY-REPAIR',
+    backupReference: '/synthetic/verified-backup',
+    backupVerified: true,
+    actor: 'repair-admin',
+    historicalResolutions,
+    storage,
+    now,
+  });
+  assert.equal(applied.applied, true);
+  const repaired = await storage.listDealHunterCimRequests({ limit: 100 });
+  assert.notEqual(repaired[0].opportunity_id, repaired[1].opportunity_id);
+  const after = await runCimIdentityRepair({ storage, now });
+  assert.equal(after.audit.counts.ambiguousPairs, 0);
+  assert.equal(after.audit.counts.manuallyDistinctPairs, 1);
+});
+
 test('repair transaction rolls back canonical inserts when an audited request version changes', async (t) => {
   const storage = repairStorage(t);
   const existing = request('version-conflict');

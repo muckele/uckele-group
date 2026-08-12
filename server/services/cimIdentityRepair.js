@@ -145,7 +145,160 @@ function buildIdentityGroups(requests) {
     const root = union.find(index);
     grouped.set(root, [...(grouped.get(root) || []), { request, deal: deals[index], aliases: aliases[index] }]);
   });
-  return { groups: [...grouped.values()], ambiguousPairs, distinctPairs, highConfidencePairs };
+  const requestIndexes = new Map(requests.map((request, index) => [request.id, index]));
+  const finalClusterPairKey = (pair) => {
+    const left = requestIndexes.get(pair.leftRequestId);
+    const right = requestIndexes.get(pair.rightRequestId);
+    if (left === undefined || right === undefined) return '';
+    const roots = [union.find(left), union.find(right)].sort((a, b) => a - b);
+    return roots[0] === roots[1] ? '' : roots.join(':');
+  };
+  const finalDistinctPairs = distinctPairs.filter((pair) => finalClusterPairKey(pair));
+  const distinctClusterPairs = new Set(finalDistinctPairs.map(finalClusterPairKey));
+  const finalAmbiguousPairs = ambiguousPairs.filter((pair) => {
+    const key = finalClusterPairKey(pair);
+    return key && !distinctClusterPairs.has(key);
+  });
+  return {
+    groups: [...grouped.values()],
+    ambiguousPairs: finalAmbiguousPairs,
+    distinctPairs: finalDistinctPairs,
+    highConfidencePairs,
+  };
+}
+
+function normalizeHistoricalResolutions(resolutions = [], audit) {
+  const requests = new Map(audit._data.requests.map((request) => [request.id, request]));
+  const ambiguousPairs = new Set(audit.ambiguousPairs.flatMap((pair) => [
+    `${pair.leftRequestId}:${pair.rightRequestId}`,
+    `${pair.rightRequestId}:${pair.leftRequestId}`,
+  ]));
+  const persistedDecisions = new Map(audit._data.repairManifests.flatMap((record) => (
+    Array.isArray(record.manifest?.historicalResolutions) ? record.manifest.historicalResolutions : []
+  )).map((resolution) => [
+    `${resolution.action}:${[resolution.requestId, resolution.targetRequestId].sort().join(':')}`,
+    resolution,
+  ]));
+  const normalized = [];
+  const claimedRequests = new Set();
+  const claimedPairs = new Set();
+  for (const value of Array.isArray(resolutions) ? resolutions : []) {
+    const action = String(value?.action || '').trim();
+    const requestId = String(value?.requestId || '').trim();
+    const targetRequestId = String(value?.targetRequestId || '').trim();
+    const reason = String(value?.reason || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+    const authorizedBy = String(value?.authorizedBy || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    if (!['link', 'keep-distinct'].includes(action) || !requestId || !targetRequestId || requestId === targetRequestId) {
+      throw new Error('Historical resolution refused: each decision must link or keep distinct two different audited request IDs.');
+    }
+    if (!requests.has(requestId) || !requests.has(targetRequestId)) {
+      throw new Error('Historical resolution refused: every request ID must exist in the bounded audit dataset.');
+    }
+    const persistedDecision = persistedDecisions.get(`${action}:${[requestId, targetRequestId].sort().join(':')}`);
+    if (!ambiguousPairs.has(`${requestId}:${targetRequestId}`) && !persistedDecision) {
+      throw new Error('Historical resolution refused: the selected pair is not an ambiguous pair from this audit.');
+    }
+    if (!ambiguousPairs.has(`${requestId}:${targetRequestId}`) && (
+      persistedDecision.reason !== reason || persistedDecision.authorizedBy !== authorizedBy
+    )) {
+      throw new Error('Historical resolution refused: a resolved pair may only replay its exact authorized decision.');
+    }
+    if (reason.length < 20 || authorizedBy.length < 2 || value?.incidentOwnerAuthorized !== true) {
+      throw new Error('Historical resolution refused: incident-owner authorization, an accountable actor, and a specific reason are required.');
+    }
+    if (action === 'link' && claimedRequests.has(requestId)) {
+      throw new Error('Historical resolution refused: a request may appear as the resolved request only once.');
+    }
+    const pairKey = [requestId, targetRequestId].sort().join(':');
+    if (claimedPairs.has(`${action}:${pairKey}`)) {
+      throw new Error('Historical resolution refused: duplicate request-pair decision.');
+    }
+    if (action === 'link') claimedRequests.add(requestId);
+    claimedPairs.add(`${action}:${pairKey}`);
+    normalized.push({
+      action,
+      requestId,
+      targetRequestId,
+      reason,
+      authorizedBy,
+      incidentOwnerAuthorized: true,
+    });
+  }
+  return normalized;
+}
+
+function mergeIdentityGroups(groups, resolutions = []) {
+  if (resolutions.length === 0) return groups;
+  const parents = Array.from({ length: groups.length }, (_, index) => index);
+  const find = (index) => {
+    while (parents[index] !== index) {
+      parents[index] = parents[parents[index]];
+      index = parents[index];
+    }
+    return index;
+  };
+  const requestGroups = new Map();
+  groups.forEach((group, index) => {
+    for (const entry of group) requestGroups.set(entry.request.id, index);
+  });
+  for (const resolution of resolutions) {
+    if (resolution.action !== 'link') continue;
+    const left = requestGroups.get(resolution.requestId);
+    const right = requestGroups.get(resolution.targetRequestId);
+    if (left === undefined || right === undefined) throw new Error('Historical resolution refused: audited request group is unavailable.');
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot !== rightRoot) parents[rightRoot] = leftRoot;
+  }
+  const merged = new Map();
+  groups.forEach((group, index) => {
+    const root = find(index);
+    merged.set(root, [...(merged.get(root) || []), ...group]);
+  });
+  return [...merged.values()];
+}
+
+function unresolvedAmbiguousPairs(audit, resolutions = []) {
+  if (audit.ambiguousPairs.length === 0) return [];
+  const groups = audit._identityGroups;
+  const parents = Array.from({ length: groups.length }, (_, index) => index);
+  const find = (index) => {
+    while (parents[index] !== index) {
+      parents[index] = parents[parents[index]];
+      index = parents[index];
+    }
+    return index;
+  };
+  const requestGroups = new Map();
+  groups.forEach((group, index) => {
+    for (const entry of group) requestGroups.set(entry.request.id, index);
+  });
+  for (const resolution of resolutions) {
+    if (resolution.action !== 'link') continue;
+    const left = find(requestGroups.get(resolution.requestId));
+    const right = find(requestGroups.get(resolution.targetRequestId));
+    if (left !== right) parents[right] = left;
+  }
+  const pairKey = (leftRequestId, rightRequestId) => {
+    const leftGroup = requestGroups.get(leftRequestId);
+    const rightGroup = requestGroups.get(rightRequestId);
+    if (leftGroup === undefined || rightGroup === undefined) return '';
+    const roots = [find(leftGroup), find(rightGroup)].sort((a, b) => a - b);
+    return roots[0] === roots[1] ? '' : roots.join(':');
+  };
+  const distinctClusters = new Set(audit.materiallyDistinctPairs.map((pair) => (
+    pairKey(pair.leftRequestId, pair.rightRequestId)
+  )).filter(Boolean));
+  for (const resolution of resolutions) {
+    if (resolution.action !== 'keep-distinct') continue;
+    const key = pairKey(resolution.requestId, resolution.targetRequestId);
+    if (!key) throw new Error('Historical resolution refused: the same requests cannot be linked and kept distinct.');
+    distinctClusters.add(key);
+  }
+  return audit.ambiguousPairs.filter((pair) => {
+    const key = pairKey(pair.leftRequestId, pair.rightRequestId);
+    return key && !distinctClusters.has(key);
+  });
 }
 
 function isActiveSequence(request) {
@@ -180,6 +333,7 @@ async function loadAuditData(storage) {
     requests,
     opportunities: await storage.listDealHunterOpportunities({ limit: auditLimit }),
     aliases: await storage.listDealHunterOpportunityAliases({ limit: auditLimit }),
+    repairManifests: await storage.listDealHunterCimRepairManifests?.({ limit: 1000 }) || [],
     imports: await storage.listDealHunterCrmImports?.({ limit: auditLimit }) || [],
     communications,
     emailEvents: recipientEmails.length > 0
@@ -202,7 +356,7 @@ function existingOpportunityForGroup(group, opportunitiesById, aliasesByKey) {
   return existing[0] || null;
 }
 
-function groupPlan(group, data, nowIso, actor) {
+function groupPlan(group, data, nowIso, actor, historicalResolutions = []) {
   const opportunitiesById = new Map(data.opportunities.map((item) => [item.opportunity_id, item]));
   const aliasesByKey = new Map(data.aliases.map((item) => [item.alias_key, item]));
   const requests = group.map((item) => item.request).sort(requestSort);
@@ -230,6 +384,13 @@ function groupPlan(group, data, nowIso, actor) {
       ...(accumulatedOpportunity?.metadata || {}),
       repairRequestIds: requests.map((item) => item.id),
       legacyOpportunityIds: [...new Set(requests.map((item) => item.opportunity_id).filter((id) => id && id !== opportunityId))],
+      historicalResolutionDecisions: historicalResolutions.map((resolution) => ({
+        action: resolution.action,
+        requestId: resolution.requestId,
+        targetRequestId: resolution.targetRequestId,
+        reason: resolution.reason,
+        authorizedBy: resolution.authorizedBy,
+      })),
     },
   };
   const aliasRecords = group.flatMap((entry) => entry.aliases).map((item) => ({
@@ -246,7 +407,36 @@ function groupPlan(group, data, nowIso, actor) {
     confidence_state: 'high',
     resolved_by: actor,
     metadata: { repair: true },
-  })).filter((item, index, all) => all.findIndex((candidate) => candidate.alias_key === item.alias_key) === index);
+  }));
+  for (const resolution of historicalResolutions) {
+    const request = requests.find((item) => item.id === resolution.requestId);
+    const legacyDealKey = String(request?.deal_key || '').trim();
+    if (!legacyDealKey) continue;
+    const aliasKey = `deal-key:${legacyDealKey}`;
+    aliasRecords.push({
+      id: sha256(`cim-opportunity-alias:${aliasKey}`),
+      opportunity_id: opportunityId,
+      alias_type: 'deal-key',
+      alias_value: legacyDealKey,
+      alias_key: aliasKey,
+      source: request.source_name || 'manual-historical-resolution',
+      first_observed_at: request.created_at || nowIso,
+      last_observed_at: nowIso,
+      evidence_version: CIM_IDENTITY_EVIDENCE_VERSION,
+      resolution_method: 'manual-historical-link',
+      confidence_state: 'manual',
+      resolved_by: resolution.authorizedBy,
+      metadata: {
+        repair: true,
+        reason: resolution.reason,
+        targetRequestId: resolution.targetRequestId,
+        incidentOwnerAuthorized: true,
+      },
+    });
+  }
+  const uniqueAliasRecords = aliasRecords.filter((item, index, all) => (
+    all.findIndex((candidate) => candidate.alias_key === item.alias_key) === index
+  ));
   const requestLinks = requests.map((request) => ({
     id: request.id,
     opportunity_id: opportunityId,
@@ -271,7 +461,7 @@ function groupPlan(group, data, nowIso, actor) {
   return {
     opportunityId,
     opportunityRecord,
-    aliasRecords,
+    aliasRecords: uniqueAliasRecords,
     requestLinks,
     stopRequests,
     ownerRequestId: owner.id,
@@ -347,6 +537,39 @@ export async function auditCimIdentity({ storage = getStorage(), now = new Date(
   const nowIso = now instanceof Date ? now.toISOString() : new Date(now).toISOString();
   const data = await loadAuditData(storage);
   const identity = buildIdentityGroups(data.requests);
+  const persistedHistoricalResolutions = data.repairManifests.flatMap((record) => (
+    Array.isArray(record.manifest?.historicalResolutions) ? record.manifest.historicalResolutions : []
+  ));
+  const manuallyDistinctKeys = new Map(persistedHistoricalResolutions
+    .filter((resolution) => resolution?.action === 'keep-distinct')
+    .map((resolution) => [[resolution.requestId, resolution.targetRequestId].sort().join(':'), resolution]));
+  const manuallyDistinctPairs = identity.ambiguousPairs.flatMap((pair) => {
+    const decision = manuallyDistinctKeys.get([pair.leftRequestId, pair.rightRequestId].sort().join(':'));
+    return decision ? [{ ...pair, decision: {
+      action: 'keep-distinct',
+      authorizedBy: decision.authorizedBy,
+      reason: decision.reason,
+    } }] : [];
+  });
+  identity.ambiguousPairs = identity.ambiguousPairs.filter((pair) => (
+    !manuallyDistinctKeys.has([pair.leftRequestId, pair.rightRequestId].sort().join(':'))
+  ));
+  const aliasOwners = new Map(data.aliases.map((aliasRecord) => [aliasRecord.alias_key, aliasRecord.opportunity_id]));
+  const requestCanonicalLinks = data.requests.map((request) => {
+    const owners = [...new Set(buildCimOpportunityAliases(requestDeal(request))
+      .map((item) => aliasOwners.get(item.alias_key))
+      .filter(Boolean))];
+    return {
+      request,
+      owners,
+      missing: !request.opportunity_id,
+      safelyRepairable: !request.opportunity_id && owners.length === 1,
+      conflicting: Boolean(request.opportunity_id && owners.length === 1 && owners[0] !== request.opportunity_id),
+    };
+  });
+  const missingOpportunityLinks = requestCanonicalLinks.filter((item) => item.missing).length;
+  const safelyRepairableRequestLinks = requestCanonicalLinks.filter((item) => item.safelyRepairable).length;
+  const requestCanonicalLinkIssues = requestCanonicalLinks.filter((item) => item.safelyRepairable || item.conflicting).length;
   const groups = identity.groups.map((group) => {
     const requests = group.map((item) => item.request).sort(requestSort);
     const providerIds = new Set();
@@ -396,7 +619,7 @@ export async function auditCimIdentity({ storage = getStorage(), now = new Date(
     for (const request of requests) primarySubmissionByRequest.set(request.id, primarySubmissionId);
   }
   const primarySubmissionByCommunication = new Map();
-  let linkageMismatches = 0;
+  let linkageMismatches = requestCanonicalLinkIssues;
   for (const communication of data.communications) {
     const request = requestById.get(communication.cim_request_id);
     if (!request) continue;
@@ -424,16 +647,20 @@ export async function auditCimIdentity({ storage = getStorage(), now = new Date(
       fingerprintToUrlCandidates: identity.highConfidencePairs.length
         + groups.filter((group) => group.fingerprintToUrlTransition).length,
       materiallyDistinctPairs: identity.distinctPairs.length,
+      manuallyDistinctPairs: manuallyDistinctPairs.length,
       ambiguousPairs: identity.ambiguousPairs.length,
       recipientCapExcesses: recipientPolicies.length,
       rawLifecycleEvents: data.emailEvents.length,
       logicalMessages: logicalMessageKeys.size,
       distinctProviderMessages: providerMessageIds.size,
+      missingOpportunityLinks,
+      safelyRepairableRequestLinks,
       linkageMismatches,
     },
     groups: groups.filter((group) => group.requestCount > 1).slice(0, 100),
     ambiguousPairs: identity.ambiguousPairs.slice(0, 100),
     materiallyDistinctPairs: identity.distinctPairs.slice(0, 100),
+    manuallyDistinctPairs: manuallyDistinctPairs.slice(0, 100),
     recipientPolicies: recipientPolicies.slice(0, 100),
     _data: data,
     _identityGroups: identity.groups,
@@ -451,12 +678,20 @@ export async function runCimIdentityRepair({
   backupReference = '',
   backupVerified = false,
   actor = '',
+  historicalResolutions = [],
   storage = getStorage(),
   now = new Date(),
 } = {}) {
   const audit = await auditCimIdentity({ storage, now });
+  const normalizedResolutions = normalizeHistoricalResolutions(historicalResolutions, audit);
+  const remainingAmbiguousPairs = unresolvedAmbiguousPairs(audit, normalizedResolutions);
+  const resolutionPreview = {
+    decisions: normalizedResolutions,
+    ambiguousPairsBefore: audit.ambiguousPairs.length,
+    ambiguousPairsRemaining: remainingAmbiguousPairs.length,
+  };
   if (!apply) {
-    return { ok: true, mode: 'dry-run', applied: false, audit: publicAudit(audit) };
+    return { ok: true, mode: 'dry-run', applied: false, audit: publicAudit(audit), resolutionPreview };
   }
   if (confirmation !== 'APPLY-CIM-IDENTITY-REPAIR') {
     throw new Error('Apply refused: pass the exact confirmation APPLY-CIM-IDENTITY-REPAIR.');
@@ -466,6 +701,9 @@ export async function runCimIdentityRepair({
   }
   if (!String(actor || '').trim()) throw new Error('Apply refused: an accountable actor is required.');
   if (!storage.applyDealHunterCimIdentityRepair) throw new Error('Atomic CIM identity repair storage is unavailable.');
+  if (remainingAmbiguousPairs.length > 0) {
+    throw new Error('Apply refused: unresolved ambiguous historical identity pairs require explicit incident-owner decisions.');
+  }
   const health = await storage.checkHealth?.();
   if (!health?.ok) throw new Error('Apply refused: storage health check did not pass.');
   const pause = await getCimOutreachPauseStatus({ storage });
@@ -473,11 +711,24 @@ export async function runCimIdentityRepair({
 
   const nowIso = audit.generatedAt;
   const existingAliases = new Map(audit._data.aliases.map((item) => [item.alias_key, item.opportunity_id]));
-  const groupPlans = audit._identityGroups.map((group) => groupPlan(group, audit._data, nowIso, actor));
+  const plannedGroups = mergeIdentityGroups(audit._identityGroups, normalizedResolutions);
+  const groupPlans = plannedGroups.map((group) => {
+    const groupRequestIds = new Set(group.map((entry) => entry.request.id));
+    return groupPlan(
+      group,
+      audit._data,
+      nowIso,
+      actor,
+      normalizedResolutions.filter((resolution) => (
+        groupRequestIds.has(resolution.requestId) && groupRequestIds.has(resolution.targetRequestId)
+      )),
+    );
+  });
   const links = buildLinkPlan(groupPlans, audit._data, nowIso, actor);
   const planSummary = {
     evidenceVersion: CIM_IDENTITY_EVIDENCE_VERSION,
     generatedAt: nowIso,
+    historicalResolutions: normalizedResolutions,
     opportunityIds: groupPlans.map((plan) => plan.opportunityId).sort(),
     requestIds: groupPlans.flatMap((plan) => plan.requestLinks.map((link) => link.id)).sort(),
     duplicateRequestIds: groupPlans.flatMap((plan) => plan.requestLinks
@@ -485,7 +736,9 @@ export async function runCimIdentityRepair({
       .map((item) => item.id)).sort(),
     linkageCounts: Object.fromEntries(Object.entries(links).map(([key, value]) => [key, value.length])),
   };
-  const checksum = sha256(stableJson(planSummary));
+  const stablePlanIdentity = { ...planSummary };
+  delete stablePlanIdentity.generatedAt;
+  const checksum = sha256(stableJson(stablePlanIdentity));
   const manifestId = `cim-repair-${checksum}`;
   const prior = (await storage.listDealHunterCimRepairManifests?.({ limit: 1000 }) || []).find((item) => item.id === manifestId);
   if (prior) return { ok: true, mode: 'apply', applied: false, alreadyApplied: true, manifest: prior, audit: publicAudit(audit) };
@@ -542,7 +795,10 @@ export async function runCimIdentityRepair({
         }),
       },
     },
-    metadata: { evidenceVersion: CIM_IDENTITY_EVIDENCE_VERSION },
+    metadata: {
+      evidenceVersion: CIM_IDENTITY_EVIDENCE_VERSION,
+      historicalResolutionCount: normalizedResolutions.length,
+    },
   };
   const batch = {
     opportunityRecords: groupPlans.map((plan) => plan.opportunityRecord),

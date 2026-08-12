@@ -29,9 +29,9 @@ primary_region = "ewr"
   DEAL_HUNTER_DAILY_EMAIL_TIME = "08:00"
   DEAL_HUNTER_DAILY_EMAIL_TIMEZONE = "America/Los_Angeles"
   DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR = "/data/deal-hunter-daily-email"
-  # The scheduler is fail-closed: it will not send broker follow-ups until
+  # The scheduler is fail-closed: leave broker follow-ups disabled until
   # Resend delivery webhooks and a controlled inbound reply are both verified.
-  DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED = "true"
+  DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED = "false"
   DEAL_HUNTER_CIM_FOLLOW_UP_CHECK_INTERVAL_MS = "3600000"
   DEAL_HUNTER_CIM_FOLLOW_UP_DELAYS_HOURS = "48,72,96"
   DEAL_HUNTER_CIM_FOLLOW_UP_MAX_COUNT = "3"

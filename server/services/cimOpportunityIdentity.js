@@ -696,6 +696,7 @@ export async function getCimIdentityOperationsStatus({ storage = getStorage(), c
   const communicationById = new Map(communications.map((communication) => [communication.id, communication]));
   const requestById = new Map(requests.map((request) => [request.id, request]));
   const opportunityById = new Map(opportunities.map((opportunity) => [opportunity.opportunity_id, opportunity]));
+  const missingOpportunityLinks = requests.filter((request) => !request.opportunity_id).length;
   const cimCommunicationIds = new Set(communications
     .filter((communication) => requestById.has(communication.cim_request_id))
     .map((communication) => communication.id));
@@ -703,7 +704,7 @@ export async function getCimIdentityOperationsStatus({ storage = getStorage(), c
     .filter((communication) => cimCommunicationIds.has(communication.id))
     .map((communication) => communication.provider_message_id)
     .filter(Boolean));
-  let linkageMismatches = 0;
+  let linkageMismatches = missingOpportunityLinks;
   for (const communication of communications) {
     const request = requestById.get(communication.cim_request_id);
     if (!request) continue;
@@ -744,6 +745,7 @@ export async function getCimIdentityOperationsStatus({ storage = getStorage(), c
     recipientsAtCap,
     recipientCapDeferrals: safety?.metadata?.recipientCapDeferrals ?? recipientsAtCap,
     outOfWindowDeferrals: safety?.metadata?.outOfWindowDeferrals ?? null,
+    missingOpportunityLinks,
     linkageMismatches,
     rawLifecycleEvents: events.length,
     logicalMessages: logicalMessages.size,
@@ -755,6 +757,7 @@ export async function getCimIdentityOperationsStatus({ storage = getStorage(), c
         unresolvedIdentityExceptions: exceptions.length,
         duplicateActiveSequences,
         recipientsAtCap,
+        missingOpportunityLinks,
         linkageMismatches,
         rawLifecycleEvents: events.length,
         logicalMessages: logicalMessages.size,
