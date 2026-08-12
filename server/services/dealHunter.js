@@ -24,7 +24,6 @@ import {
   isCimAutomationPaused,
   recordCimReviewDecisions,
 } from './cimAutomation.js';
-
 const defaultTimeoutMs = 45000;
 const sheetWorkbookExpandedMaxBytes = 32 * 1024 * 1024;
 const sheetWorkbookEntryMaxBytes = 16 * 1024 * 1024;
@@ -446,12 +445,58 @@ function normalizeBrokerContacts(contacts = []) {
       email,
       role: normalizeText(candidate?.role || 'Contact', 80),
       sourceColumn: normalizeText(candidate?.sourceColumn, 160),
+      sourceId: normalizeText(candidate?.sourceId, 200),
+      sourceName: normalizeText(candidate?.sourceName, 200),
+      sourceRecordId: normalizeText(candidate?.sourceRecordId, 120),
+      sourceListingUrl: normalizeUrl(candidate?.sourceListingUrl),
+      inherited: Boolean(candidate?.inherited),
+      matchDecision: normalizeText(candidate?.matchDecision, 80),
+      sources: (Array.isArray(candidate?.sources) ? candidate.sources : [])
+        .map((source) => ({
+          sourceId: normalizeText(source?.sourceId, 200),
+          sourceName: normalizeText(source?.sourceName, 200),
+          sourceRecordId: normalizeText(source?.sourceRecordId, 120),
+          listingUrl: normalizeUrl(source?.listingUrl),
+          inherited: Boolean(source?.inherited),
+          matchDecision: normalizeText(source?.matchDecision, 80),
+        }))
+        .filter((source) => source.sourceId || source.sourceRecordId || source.listingUrl),
       priority: Math.max(0, Number.isFinite(Number(candidate?.priority)) ? Number(candidate.priority) : rolePriorities[candidate?.role] ?? 2)
         + (genericContactMailboxNames.has(localPart) ? 10 : 0),
       generic: genericContactMailboxNames.has(localPart),
     };
     const current = byEmail.get(email);
-    if (!current || contact.priority < current.priority || (!current.name && contact.name)) byEmail.set(email, contact);
+    if (!current) {
+      byEmail.set(email, contact);
+      continue;
+    }
+
+    const preferred = contact.priority < current.priority || (!current.name && contact.name) ? contact : current;
+    const secondary = preferred === contact ? current : contact;
+    const sources = [...(preferred.sources || []), ...(secondary.sources || [])];
+    for (const item of [preferred, secondary]) {
+      if (item.sourceId || item.sourceRecordId || item.sourceListingUrl) {
+        sources.push({
+          sourceId: item.sourceId,
+          sourceName: item.sourceName,
+          sourceRecordId: item.sourceRecordId,
+          listingUrl: item.sourceListingUrl,
+          inherited: item.inherited,
+          matchDecision: item.matchDecision,
+        });
+      }
+    }
+    const uniqueSources = new Map(sources.map((source) => [
+      [source.sourceId, source.sourceRecordId, normalizeListingIdentity(source.listingUrl)].join('|'),
+      source,
+    ]));
+    byEmail.set(email, {
+      ...preferred,
+      // A contact is inherited only when every sighting came from another
+      // syndication. A direct sighting on the canonical row wins.
+      inherited: preferred.inherited && secondary.inherited,
+      sources: [...uniqueSources.values()],
+    });
   }
 
   return [...byEmail.values()]
@@ -540,7 +585,9 @@ function sourceExternalIdentity(sourceId = '', externalId = '', stableExternalId
   if (!sourceId || !externalId) return '';
   const normalized = stableExternalId || sourceId === dealOsSourceId
     ? normalizeStableExternalIdentity(externalId)
-    : normalizeIdentityPart(externalId, 120);
+    : /^\d+$/.test(normalizeText(externalId, 120))
+      ? ''
+      : normalizeIdentityPart(externalId, 120);
   return normalized ? `${sourceId}:${normalized}` : '';
 }
 
@@ -644,22 +691,38 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
   const fiveYearsFlag = normalizeText(getField(rawRow, ['5+ Years In Business', '5+ Years', 'Five Years In Business']), 100);
   const sourceBrokerName = normalizeText(getField(rawRow, ['Broker Name', 'Broker']), 160);
   const sourceContactName = normalizeText(getField(rawRow, ['Contact Name']), 160);
-  const brokerContacts = extractBrokerContacts(rawRow, { broker: sourceBrokerName, contact: sourceContactName });
-  const preferredBrokerContact = brokerContacts[0] || null;
-  const brokerEmail = preferredBrokerContact?.email || '';
-  const brokerName = preferredBrokerContact ? preferredBrokerContact.name : sourceBrokerName;
+  const extractedBrokerContacts = extractBrokerContacts(rawRow, { broker: sourceBrokerName, contact: sourceContactName });
   const brokerCompany = normalizeText(getField(rawRow, ['Broker Company', 'Company']), 160);
   const brokerContact = normalizeText(getField(rawRow, ['Broker Contact', 'Broker Phone', 'Phone', 'Contact Phone']), 200);
   const name = normalizeText(getField(rawRow, ['Name', 'Business Name', 'Business', 'Company', 'Title', 'Listing Title', 'Deal Name']), 220) || 'Unnamed business';
   const dateAdded = parseDate(getField(rawRow, ['Date Added', 'Created', 'Created At', 'Added Date', 'Posted Date', 'Date Listed', 'Listing Date']));
   const lastUpdated = parseDate(getField(rawRow, ['Last Updated', 'Updated', 'Updated At', 'Modified', 'Last Modified']));
-  const id = normalizeText(getField(rawRow, ['Deal OS ID', 'SMB Deal OS ID', 'Listing ID', 'Deal ID', 'Opportunity ID', 'ID', 'Record ID', 'Ad ID', 'Ad#']), 120) || source.rowId || '';
+  const explicitExternalId = normalizeText(getField(rawRow, ['Deal OS ID', 'SMB Deal OS ID', 'Listing ID', 'Deal ID', 'Opportunity ID', 'ID', 'Record ID', 'Ad ID', 'Ad#']), 120);
+  const sourceRowId = normalizeText(source.rowId, 120);
+  const id = explicitExternalId || sourceRowId;
+  const stableExternalId = Boolean(source.stableExternalId || explicitExternalId);
   const listingSource = normalizeText(getField(rawRow, ['Listing Source', 'Original Source', 'Source', 'Marketplace', 'Platform']), 220);
+  const brokerContacts = normalizeBrokerContacts(extractedBrokerContacts.map((contact) => ({
+    ...contact,
+    sourceId: source.id || source.name || 'unknown',
+    sourceName: source.name || 'Unknown source',
+    sourceRecordId: id,
+    sourceListingUrl: listingUrl,
+  })));
+  const preferredBrokerContact = brokerContacts[0] || null;
+  const brokerEmail = preferredBrokerContact?.email || '';
+  const brokerName = preferredBrokerContact ? preferredBrokerContact.name : sourceBrokerName;
   const fullText = normalizeText([name, industry, description, city, county, state, remoteFlag, franchiseFlag].join(' '), 9000);
 
   return {
     id,
-    stableExternalId: Boolean(source.stableExternalId),
+    stableExternalId,
+    sourceRowId,
+    idFromSourceRowPosition: Boolean(
+      !explicitExternalId
+      && /^sheet-\d+$/.test(normalizeText(source.id, 80))
+      && /^\d+$/.test(sourceRowId),
+    ),
     sourceId: source.id || source.name || 'unknown',
     sourceName: source.name || 'Unknown source',
     sourceMode: source.mode || '',
@@ -2465,60 +2528,379 @@ async function collectSources(config, storage) {
   return sourceResults;
 }
 
+function uniqueStrings(values = []) {
+  return [...new Set(values.map((value) => normalizeText(value, 1000)).filter(Boolean))];
+}
+
+function tokenSet(value = '') {
+  return new Set(normalizeComparableText(value).split(' ').filter((token) => token.length > 1));
+}
+
+function tokenSimilarity(left = '', right = '') {
+  const leftTokens = tokenSet(left);
+  const rightTokens = tokenSet(right);
+  if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
+  const overlap = [...leftTokens].filter((token) => rightTokens.has(token)).length;
+  return overlap / (leftTokens.size + rightTokens.size - overlap);
+}
+
+function listingMarketplaceAliases(listingUrl = '') {
+  const normalized = normalizeUrl(listingUrl);
+  if (!normalized) return [];
+
+  try {
+    const url = new URL(normalized);
+    const host = url.hostname.replace(/^www\./i, '').toLowerCase();
+    const pathname = decodeURIComponent(url.pathname).replace(/\/+$/, '').toLowerCase();
+    const aliases = [];
+    const numericAdId = pathname.match(/(?:\/|[-_])(\d{5,})(?:\.[a-z]+)?$/)?.[1];
+
+    if (numericAdId && /(bizbuysell|bizquest|loopnet)\./.test(host)) aliases.push(`costar:${numericAdId}`);
+    if (host.includes('dealstream.com') && pathname && pathname !== '/') aliases.push(`dealstream:${pathname}`);
+    if (numericAdId && host.includes('businessbroker.net')) aliases.push(`businessbroker:${numericAdId}`);
+    return aliases;
+  } catch {
+    return [];
+  }
+}
+
+function dealIdentityAliases(deal = {}) {
+  const listingIdentity = normalizeListingIdentity(deal.listingUrl);
+  const sourceIdentity = sourceExternalIdentity(deal.sourceId, deal.id, deal.stableExternalId);
+  const brokerReference = normalizeIdentityPart(getField(deal.raw || {}, [
+    'Broker Reference', 'Broker Ref', 'Reference Number', 'Reference #', 'Listing Number', 'Ad Number',
+  ]), 120);
+  const brokerNamespace = normalizeIdentityPart(getField(deal.raw || {}, [
+    'Broker Company', 'Brokerage', 'Broker Firm',
+  ]), 120);
+
+  return uniqueStrings([
+    listingIdentity ? `url:${listingIdentity}` : '',
+    ...listingMarketplaceAliases(deal.listingUrl),
+    sourceIdentity ? `source:${sourceIdentity}` : '',
+    brokerReference && brokerNamespace ? `broker-ref:${brokerNamespace}:${brokerReference}` : '',
+    ...(deal.identityAliases || []),
+  ]);
+}
+
+function contentFingerprintDealKey(deal = {}) {
+  const fingerprint = [
+    deal.name,
+    deal.location,
+    deal.industry,
+    deal.askingPrice ?? '',
+    deal.annualProfit ?? '',
+  ]
+    .map((value) => normalizeIdentityPart(value, 220))
+    .filter(Boolean)
+    .join('|');
+
+  return fingerprint ? `fingerprint:${fingerprint}` : '';
+}
+
+function sourceRecord(deal = {}) {
+  return {
+    sourceId: deal.sourceId || '',
+    sourceName: deal.sourceName || '',
+    sourceMode: deal.sourceMode || '',
+    externalId: deal.id || '',
+    stableExternalId: Boolean(deal.stableExternalId),
+    positionalRowId: Boolean(deal.idFromSourceRowPosition),
+    listingUrl: deal.listingUrl || '',
+    listingSource: deal.listingSource || '',
+  };
+}
+
+function contactWithProvenance(contact, deal, { inherited = false, matchDecision = '' } = {}) {
+  return {
+    ...contact,
+    sourceId: contact?.sourceId || deal.sourceId || '',
+    sourceName: contact?.sourceName || deal.sourceName || '',
+    sourceRecordId: contact?.sourceRecordId || deal.id || '',
+    sourceListingUrl: contact?.sourceListingUrl || deal.listingUrl || '',
+    inherited,
+    matchDecision,
+  };
+}
+
+function initializeDealIdentity(deal = {}) {
+  const listingAliases = uniqueStrings([deal.listingUrl, ...(deal.listingAliases || [])].map(normalizeUrl));
+  const identityAliases = dealIdentityAliases({ ...deal, listingAliases });
+  const dealKeyAliases = uniqueStrings([
+    buildDealKey(deal),
+    contentFingerprintDealKey(deal),
+    ...(deal.dealKeyAliases || []),
+  ]);
+  const contacts = normalizeBrokerContacts((deal.brokerContacts || []).map((contact) => (
+    contactWithProvenance(contact, deal)
+  )));
+  const preferredContact = contacts[0] || null;
+
+  return {
+    ...deal,
+    _canonicalMatchRecord: deal._canonicalMatchRecord || { ...deal },
+    brokerContacts: contacts,
+    brokerEmail: preferredContact?.email || deal.brokerEmail || '',
+    brokerName: preferredContact ? preferredContact.name : deal.brokerName || '',
+    listingAliases,
+    identityAliases,
+    dealKeyAliases,
+    sourceRecords: deal.sourceRecords?.length ? deal.sourceRecords : [sourceRecord(deal)],
+    deduplicationMatches: deal.deduplicationMatches || [],
+  };
+}
+
+function relativeDifference(left, right) {
+  if (!Number.isFinite(left) || !Number.isFinite(right) || left <= 0 || right <= 0) return null;
+  return Math.abs(left - right) / Math.max(left, right);
+}
+
+function financialMatchEvidence(left, right) {
+  const fields = ['annualProfit', 'annualRevenue', 'askingPrice'];
+  const compared = fields.map((field) => ({ field, difference: relativeDifference(left[field], right[field]) }))
+    .filter(({ difference }) => difference !== null);
+  return {
+    matches: compared.filter(({ difference }) => difference <= 0.03).map(({ field }) => field),
+    conflicts: compared.filter(({ difference }) => difference >= 0.15).map(({ field }) => field),
+    compared: compared.map(({ field, difference }) => ({ field, difference: Number(difference.toFixed(4)) })),
+  };
+}
+
+function geographicEvidence(left, right) {
+  const leftState = normalizeIdentityPart(left.state, 40);
+  const rightState = normalizeIdentityPart(right.state, 40);
+  const leftCountry = normalizeIdentityPart(left.country, 40);
+  const rightCountry = normalizeIdentityPart(right.country, 40);
+  const stateConflict = Boolean(leftState && rightState && leftState !== rightState);
+  const countryConflict = Boolean(leftCountry && rightCountry && leftCountry !== rightCountry);
+  const stateMatch = Boolean(leftState && rightState && leftState === rightState);
+  const leftCity = normalizeIdentityPart(left.city, 80);
+  const rightCity = normalizeIdentityPart(right.city, 80);
+  const leftCounty = normalizeIdentityPart(left.county, 120);
+  const rightCounty = normalizeIdentityPart(right.county, 120);
+  const locationMatch = Boolean(
+    (leftCity && rightCity && leftCity === rightCity)
+    || (leftCounty && rightCounty && leftCounty === rightCounty),
+  );
+  return { hardConflict: stateConflict || countryConflict, stateMatch, locationMatch };
+}
+
+function stableMarketplaceConflict(leftAliases, rightAliases) {
+  for (const namespace of ['costar:', 'dealstream:', 'businessbroker:']) {
+    const left = leftAliases.filter((alias) => alias.startsWith(namespace));
+    const right = rightAliases.filter((alias) => alias.startsWith(namespace));
+    if (left.length > 0 && right.length > 0 && !left.some((alias) => right.includes(alias))) return true;
+  }
+  return false;
+}
+
+function stableSourceConflict(left, right) {
+  if (!left.sourceId || left.sourceId !== right.sourceId) return false;
+  const leftIdentity = sourceExternalIdentity(left.sourceId, left.id, left.stableExternalId);
+  const rightIdentity = sourceExternalIdentity(right.sourceId, right.id, right.stableExternalId);
+  return Boolean(leftIdentity && rightIdentity && leftIdentity !== rightIdentity);
+}
+
+function syndicatedMatchDecision(left, right) {
+  const leftAliases = dealIdentityAliases(left);
+  const rightAliases = dealIdentityAliases(right);
+  const sharedAliases = leftAliases.filter((alias) => rightAliases.includes(alias));
+  const geography = geographicEvidence(left, right);
+  const financials = financialMatchEvidence(left, right);
+  const titleSimilarity = tokenSimilarity(left.name, right.name);
+  const descriptionSimilarity = tokenSimilarity(left.description, right.description);
+  const descriptionLongEnough = normalizeComparableText(left.description).length >= 120
+    && normalizeComparableText(right.description).length >= 120;
+  const exactTitle = normalizeComparableText(left.name) !== ''
+    && normalizeComparableText(left.name) === normalizeComparableText(right.name);
+  const hardConflict = geography.hardConflict
+    || stableMarketplaceConflict(leftAliases, rightAliases)
+    || stableSourceConflict(left, right)
+    || financials.conflicts.length >= 2;
+  const evidence = {
+    sharedAliases,
+    titleSimilarity: Number(titleSimilarity.toFixed(4)),
+    descriptionSimilarity: Number(descriptionSimilarity.toFixed(4)),
+    geography,
+    financials,
+  };
+
+  if (hardConflict) return { automatic: false, reason: 'hard-conflict', confidence: 0, evidence };
+  if (sharedAliases.length > 0) return { automatic: true, reason: 'shared-durable-identity', confidence: 1, evidence };
+  if (
+    exactTitle
+    && descriptionLongEnough
+    && descriptionSimilarity >= 0.9
+    && (geography.stateMatch || geography.locationMatch)
+    && financials.matches.length >= 1
+  ) {
+    return { automatic: true, reason: 'title-description-location-financials', confidence: 0.98, evidence };
+  }
+  if (
+    titleSimilarity >= 0.6
+    && descriptionLongEnough
+    && descriptionSimilarity >= 0.96
+    && (geography.stateMatch || geography.locationMatch)
+    && financials.matches.length >= 2
+  ) {
+    return { automatic: true, reason: 'near-title-description-location-financials', confidence: 0.97, evidence };
+  }
+  return { automatic: false, reason: 'insufficient-corroboration', confidence: 0, evidence };
+}
+
+function canonicalDealQuality(deal = {}) {
+  const contacts = deal.brokerContacts || [];
+  return (contacts.some((contact) => contact.name && isValidEmail(contact.email)) ? 1000 : 0)
+    + (contacts.some((contact) => isValidEmail(contact.email)) ? 500 : 0)
+    + (deal.listingUrl ? 100 : 0)
+    + (deal.stableExternalId ? 50 : 0)
+    + Math.min(normalizeComparableText(deal.description).length, 500) / 10
+    + ['annualProfit', 'annualRevenue', 'askingPrice'].filter((field) => Number.isFinite(deal[field])).length * 10
+    + (deal.state ? 5 : 0);
+}
+
+function financialBlockKeys(deal = {}) {
+  const state = normalizeIdentityPart(deal.state, 40);
+  if (!state) return [];
+  const keys = [];
+  for (const field of ['annualProfit', 'annualRevenue', 'askingPrice']) {
+    const value = deal[field];
+    if (!Number.isFinite(value) || value <= 0) continue;
+    const bucket = Math.floor(Math.log(value) / Math.log(1.05));
+    for (const offset of [-1, 0, 1]) keys.push(`finance:${state}:${field}:${bucket + offset}`);
+  }
+  return keys;
+}
+
+function candidateBlockKeys(deal = {}) {
+  const title = normalizeComparableText(deal.name);
+  const description = normalizeComparableText(deal.description);
+  const state = normalizeIdentityPart(deal.state, 40);
+  return uniqueStrings([
+    ...dealIdentityAliases(deal).map((alias) => `identity:${alias}`),
+    title.length >= 10 ? `title:${title}` : '',
+    description.length >= 120 ? `description:${sha256(description)}` : '',
+    ...financialBlockKeys(deal),
+    ...(deal.brokerContacts || []).map((contact) => (
+      state && isValidEmail(contact.email) ? `contact:${state}:${normalizeEmail(contact.email)}` : ''
+    )),
+  ]);
+}
+
+function mergeSyndicatedDeals(canonical, duplicate, decision) {
+  const missingValueFields = [
+    'industry', 'description', 'city', 'county', 'state', 'country', 'location', 'annualProfit', 'annualRevenue',
+    'askingPrice', 'profitMultiple', 'yearsEstablished', 'remoteFlag', 'franchiseFlag', 'fiveYearsFlag',
+    'brokerCompany', 'brokerContact', 'listingUrl', 'listingSource', 'dateAdded', 'lastUpdated',
+  ];
+  const merged = { ...canonical };
+  for (const field of missingValueFields) {
+    if (merged[field] === '' || merged[field] === null || merged[field] === undefined) merged[field] = duplicate[field];
+  }
+
+  const canonicalListingIdentity = normalizeListingIdentity(canonical.listingUrl);
+  const contacts = normalizeBrokerContacts([
+    ...(canonical.brokerContacts || []).map((contact) => contactWithProvenance(contact, canonical, {
+      inherited: Boolean(contact.inherited),
+      matchDecision: contact.matchDecision || '',
+    })),
+    ...(duplicate.brokerContacts || []).map((contact) => contactWithProvenance(contact, duplicate, {
+      inherited: normalizeListingIdentity(contact.sourceListingUrl || duplicate.listingUrl) !== canonicalListingIdentity,
+      matchDecision: decision.reason,
+    })),
+  ]);
+  const preferredContact = contacts[0] || null;
+
+  return {
+    ...merged,
+    brokerContacts: contacts,
+    brokerEmail: preferredContact?.email || canonical.brokerEmail || duplicate.brokerEmail || '',
+    brokerName: preferredContact ? preferredContact.name : canonical.brokerName || duplicate.brokerName || '',
+    raw: { ...(duplicate.raw || {}), ...(canonical.raw || {}) },
+    listingAliases: uniqueStrings([
+      ...(canonical.listingAliases || []), canonical.listingUrl,
+      ...(duplicate.listingAliases || []), duplicate.listingUrl,
+    ].map(normalizeUrl)),
+    identityAliases: uniqueStrings([
+      ...(canonical.identityAliases || []), ...dealIdentityAliases(canonical),
+      ...(duplicate.identityAliases || []), ...dealIdentityAliases(duplicate),
+    ]),
+    dealKeyAliases: uniqueStrings([
+      ...(canonical.dealKeyAliases || []), buildDealKey(canonical), contentFingerprintDealKey(canonical),
+      ...(duplicate.dealKeyAliases || []), buildDealKey(duplicate), contentFingerprintDealKey(duplicate),
+    ]),
+    sourceRecords: [...(canonical.sourceRecords || [sourceRecord(canonical)]), ...(duplicate.sourceRecords || [sourceRecord(duplicate)])],
+    deduplicationMatches: [
+      ...(canonical.deduplicationMatches || []),
+      {
+        decision: 'automatic',
+        reason: decision.reason,
+        confidence: decision.confidence,
+        matchedSourceId: duplicate.sourceId || '',
+        matchedExternalId: duplicate.id || '',
+        matchedListingUrl: duplicate.listingUrl || '',
+        evidence: decision.evidence,
+      },
+    ],
+  };
+}
+
 export function dedupeDeals(deals) {
-  const indexByKey = new Map();
+  const ranked = deals
+    .map((deal, inputIndex) => ({ deal: initializeDealIdentity(deal), inputIndex }))
+    .filter(({ deal }) => buildDealKey(deal))
+    .sort((left, right) => canonicalDealQuality(right.deal) - canonicalDealQuality(left.deal) || left.inputIndex - right.inputIndex);
   const deduped = [];
+  const indicesByBlock = new Map();
+  const maximumBlockSize = 200;
+  const maximumCandidateComparisons = 500;
 
-  for (const deal of deals) {
-    const key = buildDealKey(deal);
-    const listingIdentity = normalizeListingIdentity(deal.listingUrl);
-    const sourceIdentity = sourceExternalIdentity(deal.sourceId, deal.id, deal.stableExternalId);
-    const alternateKeys = [
-      key,
-      listingIdentity ? `url:${listingIdentity}` : '',
-      sourceIdentity ? `source:${sourceIdentity}` : '',
-    ].filter(Boolean);
+  const indexDeal = (deal, index) => {
+    for (const key of candidateBlockKeys(deal)) {
+      const indices = indicesByBlock.get(key);
+      if (indices === null) continue;
+      if (!indices) {
+        indicesByBlock.set(key, [index]);
+      } else if (indices.length >= maximumBlockSize) {
+        indicesByBlock.set(key, null);
+      } else if (!indices.includes(index)) {
+        indices.push(index);
+      }
+    }
+  };
 
-    if (!key) continue;
+  for (const { deal } of ranked) {
+    const candidateIndices = new Set();
+    for (const key of candidateBlockKeys(deal)) {
+      for (const index of indicesByBlock.get(key) || []) {
+        candidateIndices.add(index);
+        if (candidateIndices.size >= maximumCandidateComparisons) break;
+      }
+      if (candidateIndices.size >= maximumCandidateComparisons) break;
+    }
+    const matches = [...candidateIndices]
+      .map((index) => ({
+        index,
+        decision: syndicatedMatchDecision(deduped[index]._canonicalMatchRecord || deduped[index], deal),
+      }))
+      .filter(({ decision }) => decision.automatic)
+      .sort((left, right) => right.decision.confidence - left.decision.confidence || left.index - right.index);
 
-    const existingKey = alternateKeys.find((candidate) => indexByKey.has(candidate));
-
-    if (existingKey) {
-      const index = indexByKey.get(existingKey);
-      const current = deduped[index];
-      const preferIncoming = Boolean(deal.stableExternalId && !current.stableExternalId);
-      const preferred = preferIncoming ? deal : current;
-      const secondary = preferIncoming ? current : deal;
-      const brokerContacts = normalizeBrokerContacts([
-        ...(current.brokerContacts || []),
-        ...(deal.brokerContacts || []),
-      ]);
-      const preferredBrokerContact = brokerContacts[0] || null;
-      deduped[index] = {
-        ...secondary,
-        ...preferred,
-        brokerContacts,
-        brokerEmail: preferredBrokerContact?.email || current.brokerEmail || deal.brokerEmail || '',
-        brokerName: preferredBrokerContact ? preferredBrokerContact.name : current.brokerName || deal.brokerName || '',
-        brokerCompany: current.brokerCompany || deal.brokerCompany || '',
-        brokerContact: current.brokerContact || deal.brokerContact || '',
-        raw: { ...(current.raw || {}), ...(deal.raw || {}) },
-      };
-      const merged = deduped[index];
-      const mergedListingIdentity = normalizeListingIdentity(merged.listingUrl);
-      for (const candidate of [
-        ...alternateKeys,
-        buildDealKey(merged),
-        mergedListingIdentity ? `url:${mergedListingIdentity}` : '',
-      ].filter(Boolean)) indexByKey.set(candidate, index);
+    if (matches.length === 0) {
+      const index = deduped.length;
+      deduped.push(deal);
+      indexDeal(deal, index);
       continue;
     }
 
-    for (const candidate of alternateKeys) indexByKey.set(candidate, deduped.length);
-    deduped.push(deal);
+    const { index, decision } = matches[0];
+    // The canonical representative never changes. Every new member must match
+    // it directly, which prevents weak A-B/B-C links from collapsing A and C.
+    deduped[index] = mergeSyndicatedDeals(deduped[index], deal, decision);
+    indexDeal(deduped[index], index);
   }
 
-  return deduped;
+  return deduped.map(({ _canonicalMatchRecord: _canonical, ...deal }) => deal);
 }
 
 function buildDealKey(deal) {
@@ -2540,18 +2922,7 @@ function buildDealKey(deal) {
     return `source:${deal.sourceId}:${externalId}`;
   }
 
-  const fingerprint = [
-    deal.name,
-    deal.location,
-    deal.industry,
-    deal.askingPrice ?? '',
-    deal.annualProfit ?? '',
-  ]
-    .map((value) => normalizeIdentityPart(value, 220))
-    .filter(Boolean)
-    .join('|');
-
-  return fingerprint ? `fingerprint:${fingerprint}` : '';
+  return contentFingerprintDealKey(deal);
 }
 
 function isRecentDeal(deal, lookbackDays) {
@@ -2649,6 +3020,11 @@ function publicDeal(deal) {
     brokerEmail: deal.brokerEmail,
     brokerContacts: deal.brokerContacts || [],
     listingUrl: deal.listingUrl,
+    listingAliases: deal.listingAliases || [],
+    identityAliases: deal.identityAliases || [],
+    dealKeyAliases: deal.dealKeyAliases || [],
+    sourceRecords: deal.sourceRecords || [],
+    deduplicationMatches: deal.deduplicationMatches || [],
     dateAdded: deal.dateAdded,
     lastUpdated: deal.lastUpdated,
     strengths: deal.strengths,
@@ -2668,6 +3044,30 @@ function normalizeTextArray(value = [], maxItems = 12, maxLength = 500) {
     .map((item) => normalizeText(item, maxLength))
     .filter(Boolean)
     .slice(0, maxItems);
+}
+
+function normalizeCimSourceRecords(value = []) {
+  return (Array.isArray(value) ? value : []).slice(0, 50).map((record) => ({
+    sourceId: normalizeText(record?.sourceId || record?.source_id, 200),
+    sourceName: normalizeText(record?.sourceName || record?.source_name, 200),
+    sourceMode: normalizeText(record?.sourceMode || record?.source_mode, 100),
+    externalId: normalizeText(record?.externalId || record?.external_id, 120),
+    stableExternalId: Boolean(record?.stableExternalId || record?.stable_external_id),
+    positionalRowId: Boolean(record?.positionalRowId || record?.positional_row_id),
+    listingUrl: normalizeUrl(record?.listingUrl || record?.listing_url),
+    listingSource: normalizeText(record?.listingSource || record?.listing_source, 220),
+  }));
+}
+
+function normalizeCimDeduplicationMatches(value = []) {
+  return (Array.isArray(value) ? value : []).slice(0, 50).map((match) => ({
+    decision: normalizeText(match?.decision, 40),
+    reason: normalizeText(match?.reason, 100),
+    confidence: Math.max(0, Math.min(1, Number(match?.confidence) || 0)),
+    matchedSourceId: normalizeText(match?.matchedSourceId || match?.matched_source_id, 200),
+    matchedExternalId: normalizeText(match?.matchedExternalId || match?.matched_external_id, 120),
+    matchedListingUrl: normalizeUrl(match?.matchedListingUrl || match?.matched_listing_url),
+  }));
 }
 
 function normalizeCimDealSnapshot(snapshot = null) {
@@ -2718,6 +3118,15 @@ function normalizeCimDealSnapshot(snapshot = null) {
     brokerEmail,
     brokerContacts,
     listingUrl: normalizeUrl(snapshot.listingUrl || snapshot.listing_url),
+    listingAliases: uniqueStrings(
+      normalizeTextArray(snapshot.listingAliases || snapshot.listing_aliases, 50, 1000).map(normalizeUrl),
+    ),
+    identityAliases: normalizeTextArray(snapshot.identityAliases || snapshot.identity_aliases, 50, 1000),
+    dealKeyAliases: normalizeTextArray(snapshot.dealKeyAliases || snapshot.deal_key_aliases, 50, 1000),
+    sourceRecords: normalizeCimSourceRecords(snapshot.sourceRecords || snapshot.source_records),
+    deduplicationMatches: normalizeCimDeduplicationMatches(
+      snapshot.deduplicationMatches || snapshot.deduplication_matches,
+    ),
     dateAdded: normalizeText(snapshot.dateAdded || snapshot.date_added, 100),
     lastUpdated: normalizeText(snapshot.lastUpdated || snapshot.last_updated, 100),
     strengths: normalizeTextArray(snapshot.strengths),
@@ -2785,30 +3194,155 @@ function buildCimAutomationApproval(deal = null) {
   };
 }
 
+function historyMetadata(seen = {}) {
+  if (seen.metadata && typeof seen.metadata === 'object') return seen.metadata;
+  try {
+    const parsed = JSON.parse(seen.metadata || '{}');
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function historyArray(metadata = {}, key) {
+  return Array.isArray(metadata[key]) ? metadata[key].slice(0, 100) : [];
+}
+
+function isConsistentSeenDeal(seen = {}) {
+  const dealKey = normalizeText(seen.id, 1000);
+  if (!dealKey) return false;
+
+  if (dealKey.startsWith('url:')) {
+    const keyIdentity = normalizeListingIdentity(dealKey.slice(4));
+    const listingIdentity = normalizeListingIdentity(seen.listing_url);
+    return Boolean(keyIdentity && listingIdentity && keyIdentity === listingIdentity);
+  }
+
+  if (dealKey.startsWith('fingerprint:')) {
+    return dealKey === contentFingerprintDealKey({
+      name: seen.name,
+      location: seen.location,
+      industry: seen.industry,
+      askingPrice: seen.asking_price,
+      annualProfit: seen.annual_profit,
+    });
+  }
+
+  if (dealKey.startsWith('source:')) {
+    const metadata = historyMetadata(seen);
+    const metadataAliases = historyArray(metadata, 'identityAliases');
+    const inferredIdentity = sourceExternalIdentity(
+      seen.source_id,
+      seen.external_id,
+      seen.source_id === dealOsSourceId,
+    );
+    return metadataAliases.includes(dealKey)
+      || (inferredIdentity && dealKey === `source:${inferredIdentity}`);
+  }
+
+  return true;
+}
+
+function addHistoryIndex(index, key, seen) {
+  if (!key) return;
+  const current = index.get(key) || [];
+  current.push(seen);
+  index.set(key, current);
+}
+
+function earliestFirstSeen(seenDeals = [], fallback = '') {
+  return seenDeals
+    .map((seen) => seen.first_seen_at)
+    .filter((value) => value && Number.isFinite(Date.parse(value)))
+    .sort((left, right) => Date.parse(left) - Date.parse(right))[0] || fallback;
+}
+
+function selectHistoricalCanonicalMatch(seenDeals = [], derivedDealKey = '') {
+  return [...seenDeals].sort((left, right) => {
+    const quality = (seen) => {
+      const metadata = historyMetadata(seen);
+      const dealKeyAliases = historyArray(metadata, 'dealKeyAliases');
+      return (seen.id !== derivedDealKey && dealKeyAliases.includes(derivedDealKey) ? 1000 : 0)
+        + (seen.id === derivedDealKey ? 100 : 0)
+        + historyArray(metadata, 'listingAliases').length * 10
+        + historyArray(metadata, 'identityAliases').length;
+    };
+    return quality(right) - quality(left)
+      || (Date.parse(left.first_seen_at || '') || Number.MAX_SAFE_INTEGER)
+        - (Date.parse(right.first_seen_at || '') || Number.MAX_SAFE_INTEGER)
+      || String(left.id).localeCompare(String(right.id));
+  })[0] || null;
+}
+
 function attachHistory(scoredDeals, seenDeals = [], generatedAt) {
-  const seenById = new Map(seenDeals.map((deal) => [deal.id, deal]));
-  const seenByListingIdentity = new Map(
-    seenDeals.map((deal) => [normalizeListingIdentity(deal.listing_url), deal]).filter(([identity]) => identity),
-  );
-  const seenBySourceExternalId = new Map(
-    seenDeals.map((deal) => [
-      sourceExternalIdentity(deal.source_id, deal.external_id, deal.source_id === dealOsSourceId),
-      deal,
-    ]).filter(([identity]) => identity),
-  );
+  const validSeenDeals = seenDeals.filter(isConsistentSeenDeal);
+  const seenById = new Map();
+  const seenByListingIdentity = new Map();
+  const seenByIdentityAlias = new Map();
+
+  for (const seen of validSeenDeals) {
+    const metadata = historyMetadata(seen);
+    addHistoryIndex(seenById, seen.id, seen);
+    for (const dealKeyAlias of historyArray(metadata, 'dealKeyAliases')) addHistoryIndex(seenById, dealKeyAlias, seen);
+    for (const listingUrl of [seen.listing_url, ...historyArray(metadata, 'listingAliases')]) {
+      addHistoryIndex(seenByListingIdentity, normalizeListingIdentity(listingUrl), seen);
+    }
+    const inferredIdentity = sourceExternalIdentity(
+      seen.source_id,
+      seen.external_id,
+      seen.source_id === dealOsSourceId,
+    );
+    for (const identityAlias of [inferredIdentity ? `source:${inferredIdentity}` : '', ...historyArray(metadata, 'identityAliases')]) {
+      addHistoryIndex(seenByIdentityAlias, identityAlias, seen);
+    }
+  }
 
   return scoredDeals.map((deal) => {
     const derivedDealKey = buildDealKey(deal);
-    const seen = seenById.get(derivedDealKey)
-      || seenByListingIdentity.get(normalizeListingIdentity(deal.listingUrl))
-      || seenBySourceExternalId.get(sourceExternalIdentity(deal.sourceId, deal.id, deal.stableExternalId));
+    const listingAliases = uniqueStrings([deal.listingUrl, ...(deal.listingAliases || [])].map(normalizeUrl));
+    const identityAliases = uniqueStrings([...(deal.identityAliases || []), ...dealIdentityAliases(deal)]);
+    const currentDealKeyAliases = uniqueStrings([
+      derivedDealKey,
+      contentFingerprintDealKey(deal),
+      ...(deal.dealKeyAliases || []),
+    ]);
+    const directMatches = seenById.get(derivedDealKey) || [];
+    const primaryListingMatches = seenByListingIdentity.get(normalizeListingIdentity(deal.listingUrl)) || [];
+    const aliasListingMatches = listingAliases.flatMap((listingUrl) => (
+      seenByListingIdentity.get(normalizeListingIdentity(listingUrl)) || []
+    ));
+    const identityMatches = identityAliases.flatMap((identity) => seenByIdentityAlias.get(identity) || []);
+    const keyAliasMatches = currentDealKeyAliases.flatMap((dealKey) => seenById.get(dealKey) || []);
+    const matchedSeenDeals = [...new Map([
+      ...directMatches,
+      ...primaryListingMatches,
+      ...aliasListingMatches,
+      ...identityMatches,
+      ...keyAliasMatches,
+    ].map((seen) => [seen.id, seen])).values()];
+    const seen = selectHistoricalCanonicalMatch(matchedSeenDeals, derivedDealKey);
     const dealKey = seen?.id || derivedDealKey;
+    const historicalDealKeyAliases = matchedSeenDeals.flatMap((item) => {
+      const metadata = historyMetadata(item);
+      return [item.id, ...historyArray(metadata, 'dealKeyAliases')];
+    });
+    const historicalListingAliases = matchedSeenDeals.flatMap((item) => {
+      const metadata = historyMetadata(item);
+      return [item.listing_url, ...historyArray(metadata, 'listingAliases')];
+    });
+    const historicalIdentityAliases = matchedSeenDeals.flatMap((item) => (
+      historyArray(historyMetadata(item), 'identityAliases')
+    ));
 
     return {
       ...deal,
       dealKey,
+      listingAliases: uniqueStrings([...listingAliases, ...historicalListingAliases].map(normalizeUrl)),
+      identityAliases: uniqueStrings([...identityAliases, ...historicalIdentityAliases]),
+      dealKeyAliases: uniqueStrings([dealKey, ...currentDealKeyAliases, ...historicalDealKeyAliases])
+        .filter((alias) => alias !== dealKey),
       isNew: !seen,
-      firstSeenAt: seen?.first_seen_at || generatedAt,
+      firstSeenAt: earliestFirstSeen(matchedSeenDeals, generatedAt),
       lastSeenAt: generatedAt,
     };
   });
@@ -2837,6 +3371,11 @@ function buildSeenRecord(deal) {
       strengths: deal.strengths,
       concerns: deal.concerns,
       removeReasons: deal.removeReasons,
+      listingAliases: deal.listingAliases || [],
+      identityAliases: deal.identityAliases || [],
+      dealKeyAliases: deal.dealKeyAliases || [],
+      sourceRecords: deal.sourceRecords || [],
+      deduplicationMatches: deal.deduplicationMatches || [],
     },
   };
 }
@@ -2907,6 +3446,11 @@ function dealHunterCrmNotes(deal) {
     deal.yearsEstablished ? `Years established: ${formatYearsForCrm(deal.yearsEstablished)}` : '',
     deal.remoteFlag ? `Remote / absentee / relocatable: ${deal.remoteFlag}` : '',
     deal.listingUrl ? `Listing URL: ${deal.listingUrl}` : '',
+    ...(deal.listingAliases?.filter((listingUrl) => listingUrl !== deal.listingUrl).length
+      ? ['Syndicated listing URLs', ...deal.listingAliases
+          .filter((listingUrl) => listingUrl !== deal.listingUrl)
+          .map((listingUrl) => `- ${listingUrl}`)]
+      : []),
     '',
     'Broker / contact',
     deal.brokerName ? `Broker name: ${deal.brokerName}` : '',
@@ -3010,6 +3554,11 @@ function dealHunterCrmMetadata(deal, options = {}) {
       removeReasons: deal.removeReasons || [],
       questions: deal.questions || [],
       brokerContacts: deal.brokerContacts || [],
+      listingAliases: deal.listingAliases || [],
+      identityAliases: deal.identityAliases || [],
+      dealKeyAliases: deal.dealKeyAliases || [],
+      sourceRecords: deal.sourceRecords || [],
+      deduplicationMatches: deal.deduplicationMatches || [],
       generatedNotes,
       raw: deal.raw || {},
     },
@@ -3045,22 +3594,63 @@ function dealHunterCrmPayload(deal, options = {}) {
   };
 }
 
-async function findExistingDealHunterSubmission(storage, deal) {
-  if (deal.listingUrl && storage.getSubmissionByListingUrl) {
-    const existingByListingUrl = await storage.getSubmissionByListingUrl(deal.listingUrl);
+export async function findExistingDealHunterSubmission(storage, deal) {
+  const listingAliases = uniqueStrings([
+    deal.listingUrl,
+    ...(Array.isArray(deal.listingAliases) ? deal.listingAliases : []),
+  ].map(normalizeUrl)).slice(0, 50);
+  const dealKeyAliases = uniqueStrings([
+    deal.dealKey,
+    ...(Array.isArray(deal.dealKeyAliases) ? deal.dealKeyAliases : []),
+  ]).slice(0, 50);
+  const listingIdentities = new Set(listingAliases.map(normalizeListingIdentity).filter(Boolean));
+  const candidates = new Map();
+  const addCandidate = (submission) => {
+    if (submission?.id) candidates.set(submission.id, submission);
+  };
 
-    if (existingByListingUrl) {
-      return existingByListingUrl;
+  if (storage.getSubmissionByListingUrl) {
+    for (const listingUrl of listingAliases) {
+      const existingByListingUrl = await storage.getSubmissionByListingUrl(listingUrl);
+      addCandidate(existingByListingUrl);
     }
   }
 
-  if (deal.dealKey && storage.listSubmissions) {
-    const result = await storage.listSubmissions({ limit: 10, page: 1, search: deal.dealKey, status: 'all' });
-    const rows = result?.rows || [];
-    return rows.find((row) => row?.metadata?.dealHunter?.dealKey === deal.dealKey || String(row?.notes || '').includes(deal.dealKey)) || null;
+  if (storage.listSubmissions) {
+    for (const search of uniqueStrings([...dealKeyAliases, ...listingAliases])) {
+      const result = await storage.listSubmissions({ limit: 25, page: 1, search, status: 'all' });
+      const rows = result?.rows || [];
+      for (const row of rows) {
+        const metadata = row?.metadata?.dealHunter || {};
+        const storedKeys = uniqueStrings([
+          metadata.dealKey,
+          ...(Array.isArray(metadata.dealKeyAliases) ? metadata.dealKeyAliases : []),
+        ]);
+        const storedListings = uniqueStrings([
+          row.listing_url,
+          ...(Array.isArray(metadata.listingAliases) ? metadata.listingAliases : []),
+        ].map(normalizeUrl));
+        const keyMatch = storedKeys.some((dealKey) => dealKeyAliases.includes(dealKey));
+        const listingMatch = storedListings.some((listingUrl) => listingIdentities.has(normalizeListingIdentity(listingUrl)));
+        const legacyNotesMatch = dealKeyAliases.some((dealKey) => String(row?.notes || '').includes(dealKey));
+        if (keyMatch || listingMatch || legacyNotesMatch) addCandidate(row);
+      }
+    }
   }
 
-  return null;
+  const primaryListingIdentity = normalizeListingIdentity(deal.listingUrl);
+  return [...candidates.values()].sort((left, right) => {
+    const quality = (submission) => {
+      const metadata = submission?.metadata?.dealHunter || {};
+      return (submission?.status !== 'archived' ? 1000 : 0)
+        + (metadata.dealKey === deal.dealKey ? 500 : 0)
+        + (normalizeListingIdentity(submission?.listing_url) === primaryListingIdentity ? 100 : 0)
+        + (isValidEmail(submission?.broker_email) ? 20 : 0);
+    };
+    return quality(right) - quality(left)
+      || (Date.parse(right.updated_at || '') || 0) - (Date.parse(left.updated_at || '') || 0)
+      || String(left.id).localeCompare(String(right.id));
+  })[0] || null;
 }
 
 async function ensureDealHunterSubmissionForCim(storage, deal, requestedBy = '') {
@@ -3306,7 +3896,7 @@ async function updateDealHunterCrmSubmission(storage, existing, deal, { preserve
 
 function buildDealHunterCrmImportRecord(deal, submissionId = '', status = 'pending') {
   const listingIdentity = normalizeListingIdentity(deal.listingUrl);
-  const importIdentity = listingIdentity || deal.dealKey || normalizeIdentityPart([deal.sourceName, deal.name, deal.location].join('|'), 1000);
+  const importIdentity = deal.dealKey || listingIdentity || normalizeIdentityPart([deal.sourceName, deal.name, deal.location].join('|'), 1000);
   const now = new Date().toISOString();
 
   return {
@@ -3792,11 +4382,17 @@ function attachCimRequestStatus(scoredDeals, requests = []) {
 
   return scoredDeals.map((deal) => {
     const recipientEmail = normalizeEmail(deal.brokerEmail);
+    const lookupDealKeys = uniqueStrings([deal.dealKey, ...(deal.dealKeyAliases || [])]);
     const brokerContacts = normalizeBrokerContacts(deal.brokerContacts?.length
       ? deal.brokerContacts
       : recipientEmail ? [{ name: deal.brokerName, email: recipientEmail, role: 'Broker', sourceColumn: 'Broker Email' }] : []);
-    const exactRequest = requestsByDealRecipient.get(`${deal.dealKey}|${recipientEmail}`);
-    const existingRequest = findBlockingCimRequest(requestsByDeal.get(deal.dealKey) || []) || exactRequest;
+    const exactRequest = lookupDealKeys
+      .map((dealKey) => requestsByDealRecipient.get(`${dealKey}|${recipientEmail}`))
+      .filter(Boolean)
+      .sort((left, right) => Date.parse(right.updated_at || '') - Date.parse(left.updated_at || ''))[0];
+    const requestsForAliases = lookupDealKeys.flatMap((dealKey) => requestsByDeal.get(dealKey) || [])
+      .sort((left, right) => Date.parse(right.updated_at || '') - Date.parse(left.updated_at || ''));
+    const existingRequest = findBlockingCimRequest(requestsForAliases) || exactRequest;
     const reason = getCimRequestUnavailableReason(deal, recipientEmail);
     const eligible = reason === '';
     const completed = isCompletedCimStatus(existingRequest?.status);
@@ -3922,7 +4518,9 @@ async function loadDealHunterDispositions(storage, dealKeys) {
 function attachDealHunterDispositions(deals, dispositions = []) {
   const byDealKey = new Map(dispositions.map((item) => [item.deal_key, item]));
   return deals.map((deal) => {
-    const disposition = byDealKey.get(deal.dealKey) || null;
+    const disposition = uniqueStrings([deal.dealKey, ...(deal.dealKeyAliases || [])])
+      .map((dealKey) => byDealKey.get(dealKey))
+      .find(Boolean) || null;
     return {
       ...deal,
       disposition,
@@ -4785,7 +5383,10 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
   const candidateDeals = recentDeals.length > 0 ? recentDeals : allDeals;
   const seenDeals = await loadDealHunterHistory(storage);
   const scoredDealsWithHistory = attachHistory(candidateDeals.map(scoreDeal), seenDeals, generatedAt);
-  const dealKeys = scoredDealsWithHistory.map((deal) => deal.dealKey).filter(Boolean);
+  const dealKeys = uniqueStrings(scoredDealsWithHistory.flatMap((deal) => [
+    deal.dealKey,
+    ...(deal.dealKeyAliases || []),
+  ]));
   const [cimRequests, dispositions] = await Promise.all([
     loadDealHunterCimRequests(storage, dealKeys),
     loadDealHunterDispositions(storage, dealKeys),
