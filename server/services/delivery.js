@@ -896,6 +896,7 @@ export function buildDealHunterCimRequestEmail({
     tags: [
       { name: 'source', value: 'deal-hunter-cim-request' },
       { name: 'deal_key', value: normalizeText(deal.dealKey || '', 250) },
+      { name: 'opportunity_id', value: normalizeText(deal.opportunityId || deal.opportunity_id || '', 250) },
       { name: 'cim_request_id', value: normalizeText(cimRequestId, 250) },
       { name: 'submission_id', value: normalizeText(submissionId, 250) },
       { name: 'communication_id', value: normalizeText(communicationId, 250) },
@@ -903,6 +904,7 @@ export function buildDealHunterCimRequestEmail({
     tracking: {
       source: 'deal-hunter-cim-request',
       dealKey: deal.dealKey || '',
+      opportunityId: deal.opportunityId || deal.opportunity_id || '',
       dealName: businessName,
       cimRequestId,
       submissionId,
@@ -1047,6 +1049,7 @@ export function buildDealHunterCimFollowUpEmail({
     tags: [
       { name: 'source', value: 'deal-hunter-cim-follow-up' },
       { name: 'deal_key', value: normalizeText(request.deal_key || '', 250) },
+      { name: 'opportunity_id', value: normalizeText(request.opportunity_id || '', 250) },
       { name: 'cim_request_id', value: normalizeText(request.id || '', 250) },
       { name: 'submission_id', value: normalizeText(request.submission_id || '', 250) },
       { name: 'communication_id', value: normalizeText(communicationId, 250) },
@@ -1055,6 +1058,7 @@ export function buildDealHunterCimFollowUpEmail({
     tracking: {
       source: 'deal-hunter-cim-follow-up',
       dealKey: request.deal_key || '',
+      opportunityId: request.opportunity_id || '',
       dealName: businessName,
       cimRequestId: request.id || '',
       submissionId: request.submission_id || '',

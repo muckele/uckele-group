@@ -29,12 +29,22 @@ primary_region = "ewr"
   DEAL_HUNTER_DAILY_EMAIL_TIME = "08:00"
   DEAL_HUNTER_DAILY_EMAIL_TIMEZONE = "America/Los_Angeles"
   DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR = "/data/deal-hunter-daily-email"
-  DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED = "false"
+  # The scheduler is fail-closed: it will not send broker follow-ups until
+  # Resend delivery webhooks and a controlled inbound reply are both verified.
+  DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED = "true"
   DEAL_HUNTER_CIM_FOLLOW_UP_CHECK_INTERVAL_MS = "3600000"
   DEAL_HUNTER_CIM_FOLLOW_UP_DELAYS_HOURS = "48,72,96"
   DEAL_HUNTER_CIM_FOLLOW_UP_MAX_COUNT = "3"
   DEAL_HUNTER_CIM_FOLLOW_UP_WEEKDAYS_ONLY = "true"
   DEAL_HUNTER_CIM_FOLLOW_UP_TIMEZONE = "America/Los_Angeles"
+  DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_START = "08:00"
+  DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_END = "17:00"
+  # Keep the central kill switch active through migration, dry-run audit, and
+  # any separately authorized repair. Unpause only after release-owner review.
+  DEAL_HUNTER_CIM_OUTREACH_PAUSED = "true"
+  DEAL_HUNTER_CIM_RECIPIENT_24_HOUR_CAP = "1"
+  DEAL_HUNTER_CIM_RECIPIENT_30_DAY_TOUCH_CAP = "4"
+  DEAL_HUNTER_CIM_RECIPIENT_OVERRIDE_MAX_HOURS = "24"
   DEAL_HUNTER_CIM_AUTOMATION_STAGE = "1"
   DEAL_HUNTER_MAX_SOURCE_RECORDS = "8000"
   DEAL_HUNTER_AIRTABLE_ENABLED = "false"

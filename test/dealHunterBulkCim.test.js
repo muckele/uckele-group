@@ -60,6 +60,11 @@ function createCimStorage() {
   const submissions = new Map();
   const communications = new Map();
   const activities = [];
+  const opportunities = new Map();
+  const opportunityAliases = new Map();
+  const identityExceptions = new Map();
+  const opportunityClaims = new Map();
+  const recipientClaims = new Map();
 
   function requestKey(request) {
     return `${request.deal_key}|${request.recipient_email}`;
@@ -75,11 +80,16 @@ function createCimStorage() {
     submissions,
     communications,
     activities,
+    opportunities,
     async listDealHunterSeenDeals() {
       return [];
     },
-    async listDealHunterCimRequests({ dealKeys = [] } = {}) {
-      return Array.from(requests.values()).filter((request) => dealKeys.length === 0 || dealKeys.includes(request.deal_key));
+    async listDealHunterCimRequests({ dealKeys = [], opportunityIds = [], recipientEmails = [] } = {}) {
+      return Array.from(requests.values()).filter((request) => (
+        (dealKeys.length === 0 || dealKeys.includes(request.deal_key))
+        && (opportunityIds.length === 0 || opportunityIds.includes(request.opportunity_id))
+        && (recipientEmails.length === 0 || recipientEmails.includes(request.recipient_email))
+      ));
     },
     async getDealHunterCimRequest({ dealKey, recipientEmail }) {
       return requests.get(`${dealKey}|${recipientEmail}`) || null;
@@ -89,6 +99,65 @@ function createCimStorage() {
     },
     async upsertDealHunterCimRequest(request) {
       return saveRequest(request);
+    },
+    async getDealHunterOpportunity(opportunityId) {
+      return opportunities.get(opportunityId) || null;
+    },
+    async listDealHunterOpportunities({ opportunityIds = [], recipientEmails = [] } = {}) {
+      return Array.from(opportunities.values()).filter((opportunity) => (
+        (opportunityIds.length === 0 || opportunityIds.includes(opportunity.opportunity_id))
+        && (recipientEmails.length === 0 || recipientEmails.includes(opportunity.canonical_recipient))
+      ));
+    },
+    async findDealHunterOpportunityByAliases(aliasKeys = []) {
+      const ids = [...new Set(aliasKeys.map((key) => opportunityAliases.get(key)?.opportunity_id).filter(Boolean))];
+      if (ids.length > 1) throw new Error('conflicting aliases');
+      return ids[0] ? opportunities.get(ids[0]) : null;
+    },
+    async upsertDealHunterOpportunity(opportunity) {
+      opportunities.set(opportunity.opportunity_id, opportunity);
+      return opportunity;
+    },
+    async listDealHunterOpportunityAliases({ opportunityIds = [] } = {}) {
+      return Array.from(opportunityAliases.values()).filter((item) => (
+        opportunityIds.length === 0 || opportunityIds.includes(item.opportunity_id)
+      ));
+    },
+    async upsertDealHunterOpportunityAlias(item) {
+      const existing = opportunityAliases.get(item.alias_key);
+      if (existing && existing.opportunity_id !== item.opportunity_id) return existing;
+      opportunityAliases.set(item.alias_key, item);
+      return item;
+    },
+    async upsertDealHunterIdentityException(item) {
+      identityExceptions.set(item.id, item);
+      return item;
+    },
+    async getDealHunterCimSafetySettings() {
+      return null;
+    },
+    async claimDealHunterCimOpportunity({ opportunityId, requestId, recipientEmail, allowedRequestIds = [], nowIso, metadata = {} }) {
+      const existing = opportunityClaims.get(opportunityId);
+      if (existing && ![requestId, ...allowedRequestIds].includes(existing.request_id)) {
+        return { claimed: false, reason: 'opportunity-already-claimed', claim: existing };
+      }
+      const claim = { opportunity_id: opportunityId, request_id: requestId, recipient_email: recipientEmail, claimed_at: nowIso, metadata };
+      opportunityClaims.set(opportunityId, claim);
+      return { claimed: true, reason: '', claim };
+    },
+    async claimDealHunterCimRecipient({ recipientEmail, requestId, opportunityId, nowIso, expiresAt, metadata = {} }) {
+      const existing = recipientClaims.get(recipientEmail);
+      if (existing && existing.request_id !== requestId && Date.parse(existing.expires_at) > Date.parse(nowIso)) {
+        return { claimed: false, reason: 'recipient-send-in-progress', claim: existing };
+      }
+      const claim = { recipient_email: recipientEmail, request_id: requestId, opportunity_id: opportunityId, claimed_at: nowIso, expires_at: expiresAt, metadata };
+      recipientClaims.set(recipientEmail, claim);
+      return { claimed: true, reason: '', claim };
+    },
+    async releaseDealHunterCimRecipientClaim({ recipientEmail, requestId }) {
+      if (recipientClaims.get(recipientEmail)?.request_id !== requestId) return false;
+      recipientClaims.delete(recipientEmail);
+      return true;
     },
     async getSubmission(id) {
       return submissions.get(id) || null;
@@ -533,4 +602,84 @@ test('bulk CIM send does not use stale snapshot when selected source still fetch
   assert.equal(result.failed, 1);
   assert.equal(storage.requests.size, 0);
   assert.match(result.error, /list changed/i);
+});
+
+test('a completed fingerprint CIM request blocks the same listing after it gains a BizBuySell URL', async () => {
+  const { reviewDailyDeals, sendDealHunterReadyCimRequests } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  activeSourceCsv = sourceCsv.replace('https://broker.example.test/hvac-maintenance', '');
+  const fingerprintReview = await reviewDailyDeals({ storage });
+  const fingerprintDeal = fingerprintReview.qualified.find((item) => item.cimRequest?.canRequest);
+  assert.ok(fingerprintDeal?.dealKey.startsWith('fingerprint:'), 'fixture starts without a durable listing URL');
+  await storage.upsertDealHunterCimRequest({
+    id: 'completed-fingerprint-request',
+    created_at: '2026-08-01T16:00:00.000Z',
+    updated_at: '2026-08-01T16:00:00.000Z',
+    opportunity_id: fingerprintDeal.opportunityId,
+    deal_key: fingerprintDeal.dealKey,
+    recipient_email: fingerprintDeal.brokerEmail,
+    status: 'sent',
+    request_state: 'provider_accepted',
+    delivery_state: 'delivered',
+    follow_up_state: 'completed',
+    first_requested_at: '2026-08-01T16:00:00.000Z',
+    first_provider_accepted_at: '2026-08-01T16:00:00.000Z',
+    next_follow_up_at: null,
+    deal_name: fingerprintDeal.name,
+    source_name: fingerprintDeal.sourceName,
+    metadata: {},
+  });
+
+  activeSourceCsv = sourceCsv.replace(
+    'https://broker.example.test/hvac-maintenance',
+    'https://www.bizbuysell.com/business-opportunity/commercial-hvac-maintenance/24681012',
+  );
+  const urlReview = await reviewDailyDeals({ storage });
+  const urlDeal = urlReview.qualified.find((item) => item.name === fingerprintDeal.name);
+  assert.ok(urlDeal?.dealKey.startsWith('url:'));
+  assert.equal(urlDeal.opportunityId, fingerprintDeal.opportunityId);
+  assert.equal(urlDeal.cimRequest.canRequest, false);
+  assert.match(urlDeal.cimRequest.reason, /already|sent|contact/i);
+
+  const attempt = await sendDealHunterReadyCimRequests({
+    requestedBy: 'test-admin',
+    selections: [{
+      dealKey: urlDeal.dealKey,
+      recipientEmail: urlDeal.brokerEmail,
+      snapshotToken: urlDeal.cimRequest.snapshotToken,
+    }],
+    storage,
+  });
+  assert.equal(attempt.sent, 0);
+  assert.equal(storage.communications.size, 0);
+  assert.equal(storage.requests.size, 1);
+});
+
+test('central CIM outreach pause blocks bulk and direct preparation before provider work', async () => {
+  const { reviewDailyDeals, sendDealHunterCimRequest, sendDealHunterReadyCimRequests } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  storage.getDealHunterCimSafetySettings = async () => ({
+    id: 'global',
+    outreach_paused: true,
+    updated_at: '2026-08-12T16:00:00.000Z',
+    updated_by: 'test-admin',
+    metadata: { pauseReason: 'Synthetic incident containment.' },
+  });
+  const review = await reviewDailyDeals({ storage });
+  const deal = review.qualified[0];
+  assert.equal(review.cimOutreachPause.paused, true);
+  assert.equal(deal.cimRequest.canRequest, false);
+  assert.match(deal.cimRequest.reason, /globally paused/i);
+
+  const bulk = await sendDealHunterReadyCimRequests({
+    requestedBy: 'test-admin',
+    selections: [{ dealKey: deal.dealKey, recipientEmail: deal.brokerEmail, snapshotToken: deal.cimRequest.snapshotToken }],
+    storage,
+  });
+  const direct = await sendDealHunterCimRequest({ dealKey: deal.dealKey, snapshotToken: deal.cimRequest.snapshotToken, requestedBy: 'test-admin', storage });
+  assert.equal(bulk.sent, 0);
+  assert.equal(direct.ok, false);
+  assert.match(direct.error, /globally paused/i);
+  assert.equal(storage.communications.size, 0);
+  assert.equal(storage.requests.size, 0);
 });

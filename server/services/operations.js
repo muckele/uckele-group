@@ -7,6 +7,7 @@ import { getBackupStatus } from './backups.js';
 import { getEmailReadiness } from './emailReadiness.js';
 import { getCimAutomationStatus } from './cimAutomation.js';
 import { getCommunicationOperationsStatus } from './communications.js';
+import { getCimIdentityOperationsStatus } from './cimOpportunityIdentity.js';
 
 function safeError(error) {
   return error?.message || 'Status check failed.';
@@ -83,6 +84,7 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
   const emailReadinessCheck = checks.emailReadiness || getEmailReadiness;
   const cimAutomationCheck = checks.cimAutomation || getCimAutomationStatus;
   const communicationOperationsCheck = checks.communications || getCommunicationOperationsStatus;
+  const cimIdentityCheck = checks.cimIdentity || getCimIdentityOperationsStatus;
   const tasks = [
     () => storage.listScheduledJobs?.({ limit: 50 }) || [],
     () => storage.listAdminAuditEvents?.({ limit: 100 }) || [],
@@ -95,6 +97,7 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
     () => emailReadinessCheck({ storage, config }),
     () => cimAutomationCheck({ storage, config }),
     () => communicationOperationsCheck({ storage }),
+    () => cimIdentityCheck({ storage, config }),
   ];
   const results = await Promise.allSettled(tasks.map((task) => Promise.resolve().then(task)));
   const scheduledPanel = settledPanel(results[0], [], 'Scheduler history is temporarily unavailable.');
@@ -139,6 +142,18 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
   const communicationsPanel = settledPanel(results[10], {
     pending: 0, failed: 0, unassigned: 0,
   }, 'Communication ingestion status is temporarily unavailable.');
+  const cimIdentityPanel = settledPanel(results[11], {
+    pause: { paused: true, source: 'status-unavailable' },
+    storageHealthy: false,
+    canonicalOpportunities: 0,
+    unresolvedIdentityExceptions: 0,
+    duplicateActiveSequences: 0,
+    recipientCapDeferrals: null,
+    outOfWindowDeferrals: null,
+    linkageMismatches: null,
+    lastAudit: null,
+    lastRepair: null,
+  }, 'CIM identity and outreach safety status is temporarily unavailable.');
 
   const scheduledJobs = Array.isArray(scheduledPanel.value) ? scheduledPanel.value : [];
   const auditEvents = Array.isArray(auditPanel.value) ? auditPanel.value : [];
@@ -177,5 +192,6 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
     email: { ...emailPanel.value, error: emailPanel.error },
     cimAutomation: { ...cimAutomationPanel.value, error: cimAutomationPanel.error },
     communications: { ...communicationCounts, error: communicationsPanel.error },
+    cimIdentity: { ...cimIdentityPanel.value, error: cimIdentityPanel.error },
   };
 }

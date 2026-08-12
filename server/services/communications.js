@@ -270,6 +270,7 @@ function normalizeCommunicationRecord(input = {}, { strict = false } = {}) {
   return {
     id: compactText(input.id, 120) || randomUUID(),
     submission_id: compactText(input.submission_id ?? input.submissionId, 120) || null,
+    opportunity_id: compactText(input.opportunity_id ?? input.opportunityId, 160) || null,
     deal_key: compactText(input.deal_key ?? input.dealKey, 1000) || null,
     cim_request_id: compactText(input.cim_request_id ?? input.cimRequestId, 120) || null,
     direction: direction || 'inbound',
@@ -325,6 +326,7 @@ export function buildOutboundCommunication({ message = {}, request = {}, submiss
   return normalizeCommunicationRecord({
     id: message.communicationId || randomUUID(),
     submission_id: submissionId,
+    opportunity_id: request.opportunity_id,
     deal_key: request.deal_key,
     cim_request_id: request.id,
     direction: 'outbound',
@@ -361,6 +363,7 @@ export async function createCommunicationWithActivity({ communication, actor = '
     payload: { communication: normalized },
     activity: {
       submissionId: normalized.submission_id,
+      opportunityId: normalized.opportunity_id,
       eventType: 'communication.created',
       summary: summary || `${normalized.direction === 'inbound' ? 'Inbound' : 'Outbound'} ${normalized.channel} communication recorded.`,
       actor,

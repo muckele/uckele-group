@@ -10,6 +10,7 @@ process.env.DELIVERY_PROVIDER = 'resend';
 process.env.RESEND_API_KEY = 're_test_local_only';
 process.env.RESEND_FROM_EMAIL = 'buyer@example.test';
 process.env.RESEND_REPLY_TO = 'replies@example.test';
+process.env.EMAIL_WEBHOOK_SECRET = 'cim-lifecycle-webhook-secret';
 process.env.LEAD_NOTIFICATION_EMAIL = 'admin@example.test';
 process.env.DEAL_HUNTER_SHEET_CSV_URLS = 'https://example.test/cim-lifecycle.csv';
 process.env.DEAL_HUNTER_AIRTABLE_TOKEN = 'test-token';
@@ -19,6 +20,8 @@ process.env.DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL = '';
 process.env.DEAL_HUNTER_LOOKBACK_DAYS = '30';
 process.env.DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED = 'true';
 process.env.DEAL_HUNTER_CIM_FOLLOW_UP_WEEKDAYS_ONLY = 'false';
+process.env.DEAL_HUNTER_CIM_RECIPIENT_24_HOUR_CAP = '100';
+process.env.DEAL_HUNTER_CIM_RECIPIENT_30_DAY_TOUCH_CAP = '100';
 process.env.DEAL_HUNTER_CIM_AUTOMATION_STAGE = '2';
 process.env.DEAL_HUNTER_CIM_AUTOMATION_MIN_SCORE = '75';
 process.env.ADMIN_SESSION_SECRET = 'cim-communication-lifecycle-test-secret';
@@ -637,6 +640,124 @@ test('an exact late inbound reply is retained and marks an archived CIM request 
   const activities = await storage.listCrmActivityEvents({ submissionId: submission.id, limit: 100 });
   assert.ok(activities.some((activity) => activity.event_type === 'communication.created'));
   assert.ok(activities.some((activity) => activity.event_type === 'cim.response-received'));
+});
+
+test('an exact inbound reply stops every sequence for the canonical opportunity but not another shared-broker deal', async (t) => {
+  const storage = testStorage(t);
+  const { sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
+  const { recordEmailEventsFromWebhook } = await import('../server/services/emailEvents.js');
+  const deal = await reviewedDeal(storage);
+  const initial = await sendDealHunterCimRequest({
+    dealKey: deal.dealKey,
+    snapshotToken: deal.cimRequest.snapshotToken,
+    requestedBy: 'canonical-reply-admin',
+    storage,
+  });
+  const primarySubmission = await storage.getSubmission(initial.request.submission_id);
+  const duplicateSubmissionId = '00000000-0000-4000-8000-000000000211';
+  const unrelatedSubmissionId = '00000000-0000-4000-8000-000000000212';
+  await storage.insertSubmission({
+    ...primarySubmission,
+    id: duplicateSubmissionId,
+    created_at: new Date(Date.now() - 60_000).toISOString(),
+    updated_at: new Date(Date.now() - 60_000).toISOString(),
+  });
+  await storage.insertSubmission({
+    ...primarySubmission,
+    id: unrelatedSubmissionId,
+    created_at: new Date(Date.now() - 30_000).toISOString(),
+    updated_at: new Date(Date.now() - 30_000).toISOString(),
+    company: 'Unrelated Shared Broker Opportunity',
+    listing_url: 'https://broker.example.test/unrelated-shared-broker-opportunity',
+  });
+  const dueAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  await storage.upsertDealHunterCimRequest({
+    ...initial.request,
+    id: 'canonical-duplicate-sequence',
+    created_at: new Date(Date.now() - 60_000).toISOString(),
+    updated_at: new Date(Date.now() - 60_000).toISOString(),
+    submission_id: duplicateSubmissionId,
+    deal_key: 'fingerprint:canonical-duplicate-sequence',
+    provider_message_id: 'canonical-duplicate-provider-message',
+    reply_to_address: 'canonical-duplicate@inbound.example.test',
+    status: 'sent',
+    request_state: 'provider_accepted',
+    follow_up_state: 'scheduled',
+    next_follow_up_at: dueAt,
+    metadata: {
+      ...(initial.request.metadata || {}),
+      providerMessageIds: ['canonical-duplicate-provider-message'],
+      replyToAddress: 'canonical-duplicate@inbound.example.test',
+    },
+  });
+  await storage.upsertDealHunterCimRequest({
+    ...initial.request,
+    id: 'unrelated-shared-broker-sequence',
+    created_at: new Date(Date.now() - 30_000).toISOString(),
+    updated_at: new Date(Date.now() - 30_000).toISOString(),
+    opportunity_id: null,
+    submission_id: unrelatedSubmissionId,
+    deal_key: 'unrelated-shared-broker-opportunity',
+    deal_name: 'Unrelated Shared Broker Opportunity',
+    listing_url: 'https://broker.example.test/unrelated-shared-broker-opportunity',
+    provider_message_id: 'unrelated-shared-broker-provider-message',
+    reply_to_address: 'unrelated-shared-broker@inbound.example.test',
+    status: 'sent',
+    request_state: 'provider_accepted',
+    follow_up_state: 'scheduled',
+    next_follow_up_at: dueAt,
+    metadata: {
+      ...(initial.request.metadata || {}),
+      providerMessageIds: ['unrelated-shared-broker-provider-message'],
+      replyToAddress: 'unrelated-shared-broker@inbound.example.test',
+    },
+  });
+
+  const replyAt = new Date(Date.now() + 1000).toISOString();
+  const payload = {
+    id: 'canonical-exact-reply-provider-event',
+    type: 'email.received',
+    created_at: replyAt,
+    data: {
+      email_id: 'canonical-exact-reply-email',
+      message_id: '<canonical-exact-reply-email@resend.example>',
+      from: initial.request.recipient_email,
+      to: [initial.request.reply_to_address],
+      subject: `Re: CIM / NDA request for ${initial.request.deal_name}`,
+    },
+  };
+  const result = await recordEmailEventsFromWebhook({
+    body: payload,
+    rawBody: JSON.stringify(payload),
+    headers: { 'x-webhook-secret': 'cim-lifecycle-webhook-secret' },
+  }, {
+    storage,
+    fetcher: async () => Response.json({
+      id: 'canonical-exact-reply-email',
+      from: initial.request.recipient_email,
+      to: [initial.request.reply_to_address],
+      subject: payload.data.subject,
+      text: 'Yes, I will send the CIM.',
+      attachments: [],
+      created_at: replyAt,
+    }),
+  });
+
+  assert.equal(result.ok, true);
+  const primaryAfter = await storage.getDealHunterCimRequestById(initial.request.id);
+  const duplicateAfter = await storage.getDealHunterCimRequestById('canonical-duplicate-sequence');
+  const unrelatedAfter = await storage.getDealHunterCimRequestById('unrelated-shared-broker-sequence');
+  for (const request of [primaryAfter, duplicateAfter]) {
+    assert.equal(request.request_state, 'responded');
+    assert.equal(request.follow_up_state, 'stopped');
+    assert.equal(request.next_follow_up_at, null);
+    assert.equal(request.metadata.canonicalReplyOpportunityId, initial.request.opportunity_id);
+  }
+  assert.equal(unrelatedAfter.request_state, 'provider_accepted');
+  assert.equal(unrelatedAfter.follow_up_state, 'scheduled');
+  assert.equal(unrelatedAfter.next_follow_up_at, dueAt);
+  const duplicateActivity = await storage.listCrmActivityEvents({ submissionId: duplicateSubmissionId, limit: 100 });
+  assert.ok(duplicateActivity.some((event) => event.event_type === 'cim.canonical-reply-stopped'));
 });
 
 test('provider-accepted communication is reconciled after request activity persistence fails without retransmission', async (t) => {

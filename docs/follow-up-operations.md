@@ -17,6 +17,8 @@ The Follow-ups Workspace replaces the former passive six-card follow-up slice wi
 
 Existing Deal Hunter scoring, source selection, opportunity review, initial CIM request policy, and scheduled CIM cadence remain authoritative. The generic workspace reads linked Deal Hunter context; it does not recalculate Deal Hunter scores. When an administrator explicitly takes over a linked active CIM sequence, the server atomically stops the scheduled sequence, clears its next send, records the takeover, and creates one durable generic email command. If a scheduler has already claimed the CIM send, the manual action fails with a conflict and performs no provider work.
 
+Deal Hunter CIM outreach also has an independent central kill switch and canonical-opportunity boundary. `DEAL_HUNTER_CIM_OUTREACH_PAUSED` blocks every new CIM initial and follow-up—including manual Stage 1 and the admin “Run Follow-Ups” action—without disabling inbound reply/webhook processing. `DEAL_HUNTER_CIM_AUTOMATION_PAUSED` only pauses higher-stage initial automation. Do not substitute one for the other during an incident.
+
 ## Storage rollout
 
 Back up the current data before applying a production migration.
@@ -28,6 +30,7 @@ For an existing Supabase database, apply these migrations in order:
 1. `supabase/migrations/20260809120000_crm_follow_up_workspace.sql`
 2. `supabase/migrations/20260809123000_follow_up_queue_pagination.sql`
 3. `supabase/migrations/20260810120000_follow_up_ai_metrics.sql`
+4. `supabase/migrations/20260812130000_cim_canonical_identity_safety.sql`
 
 `supabase/schema.sql` is the fresh-database schema. The new outbox, recommendation, suppression, and communication fields remain server-role only. Row-level security is enabled; privileges are revoked from `public`, `anon`, and `authenticated`, and granted to `service_role` only. Do not place the Supabase service-role key in browser configuration.
 
@@ -202,7 +205,7 @@ For a generic-email incident:
 
 1. Set `FOLLOW_UP_EMAIL_ENABLED=false` and restart/redeploy using the normal secret/configuration process.
 2. If AI data handling is in question, also set `FOLLOW_UP_AI_ENABLED=false` and rotate `OPENAI_API_KEY` if exposure is suspected.
-3. Pause Deal Hunter CIM automation separately if the incident could affect scheduled CIM sends. Its control and flag are independent.
+3. If the incident could affect Deal Hunter outreach, set the central CIM outreach pause before investigating. The central control blocks manual, bulk, automatic, scheduled, and admin-triggered CIM transmissions; leave inbound webhooks active. The staged-automation pause is narrower and is not sufficient containment.
 4. Reconcile all queued, sending, retryable, and ambiguous outbox records before re-enabling. Disabling the flag prevents new generic sends but does not erase the audit trail.
 5. Keep the additive schema. Roll application code back only after confirming the older version tolerates the added columns/tables.
 6. Preserve provider events, activity events, recommendations, suppressions, and outbox records for investigation.
@@ -211,3 +214,5 @@ For a generic-email incident:
 For an AI incident, immediately set `FOLLOW_UP_AI_ENABLED=false` and restart/redeploy through the normal configuration process; deterministic recommendations remain available. Preserve bounded provenance and aggregate observations, but never copy raw CRM bodies or provider errors into general logs. If key exposure is suspected, revoke the affected key in the approved OpenAI project, create a replacement with the minimum required scope through the secret-management process, update the deployment secret, and invalidate the prior smoke evidence. Re-run the guarded synthetic comparison or smoke required by the incident owner before any re-enable. A key rotation, model change, prompt/schema/eval-version change, or material bound change requires renewed evidence rather than silently reusing an old acceptance ID.
 
 If confidentiality, recipient correctness, or suppression integrity is uncertain, keep sending disabled and escalate to the responsible security/compliance owner. Safety and reconciliation take priority over cadence.
+
+For duplicate CIM identity, sequence, or historical-linkage incidents, use [the dedicated CIM identity incident, audit, repair, rollout, and compensating-repair runbook](cim-identity-incident-2026-08-12.md). Dry run is the default and is read-only. Apply requires the exact confirmation string, a verified backup, a healthy storage check, and an accountable actor; it is never part of server startup.

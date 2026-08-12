@@ -24,6 +24,15 @@ import {
   isCimAutomationPaused,
   recordCimReviewDecisions,
 } from './cimAutomation.js';
+import {
+  assertCimOutreachAllowed,
+  evaluateCimFollowUpWindow,
+  evaluateCimRecipientPolicy,
+  logicalCimTouchesForRecipient,
+  recordCimSafetyMetric,
+  resolveDealHunterOpportunity,
+} from './cimOpportunityIdentity.js';
+
 const defaultTimeoutMs = 45000;
 const sheetWorkbookExpandedMaxBytes = 32 * 1024 * 1024;
 const sheetWorkbookEntryMaxBytes = 16 * 1024 * 1024;
@@ -57,6 +66,7 @@ const cimBulkRequestMax = 25;
 const cimClaimStaleMinutes = 30;
 const cimSnapshotTtlMs = 1000 * 60 * 60 * 2;
 const cimRequestSendLocks = new Set();
+const cimRecipientSendLocks = new Set();
 const cimFollowUpLocks = new Set();
 const dealHunterCrmNotesHeading = 'Deal Hunter scoring profile';
 const dealHunterCrmUserNotesHeading = 'User notes';
@@ -2995,6 +3005,10 @@ function summarizeCriteria(scoredDeals) {
 function publicDeal(deal) {
   return {
     id: deal.id,
+    opportunityId: deal.opportunityId || '',
+    identityStatus: deal.identityStatus || '',
+    identityResolution: deal.identityResolution || '',
+    identityExceptionId: deal.identityExceptionId || '',
     dealKey: deal.dealKey,
     sourceId: deal.sourceId,
     sourceName: deal.sourceName,
@@ -3093,6 +3107,8 @@ function normalizeCimDealSnapshot(snapshot = null) {
 
   return {
     id: normalizeText(snapshot.id || dealKey, 1000),
+    opportunityId: normalizeText(snapshot.opportunityId || snapshot.opportunity_id, 160),
+    identityStatus: normalizeText(snapshot.identityStatus || snapshot.identity_status, 80),
     dealKey,
     sourceId: normalizeText(snapshot.sourceId || snapshot.source_id, 200),
     sourceName: normalizeText(snapshot.sourceName || snapshot.source_name, 200),
@@ -3535,6 +3551,7 @@ function dealHunterCrmMetadata(deal, options = {}) {
     dealHunter: {
       managed,
       linkedToExistingCrmRecord: Boolean(options.linkedToExistingCrmRecord),
+      opportunityId: deal.opportunityId || '',
       dealKey: deal.dealKey || '',
       score: deal.score,
       sourceName: deal.sourceName || '',
@@ -3595,6 +3612,13 @@ function dealHunterCrmPayload(deal, options = {}) {
 }
 
 export async function findExistingDealHunterSubmission(storage, deal) {
+  if (deal.opportunityId && storage.getDealHunterOpportunity && storage.getSubmission) {
+    const opportunity = await storage.getDealHunterOpportunity(deal.opportunityId);
+    if (opportunity?.primary_submission_id) {
+      const primary = await storage.getSubmission(opportunity.primary_submission_id);
+      if (primary) return primary;
+    }
+  }
   const listingAliases = uniqueStrings([
     deal.listingUrl,
     ...(Array.isArray(deal.listingAliases) ? deal.listingAliases : []),
@@ -3653,10 +3677,24 @@ export async function findExistingDealHunterSubmission(storage, deal) {
   })[0] || null;
 }
 
+async function linkDealHunterOpportunitySubmission(storage, deal, submissionId) {
+  if (!deal.opportunityId || !submissionId || !storage.getDealHunterOpportunity || !storage.upsertDealHunterOpportunity) {
+    return null;
+  }
+  const opportunity = await storage.getDealHunterOpportunity(deal.opportunityId);
+  if (!opportunity || opportunity.primary_submission_id === submissionId) return opportunity;
+  return storage.upsertDealHunterOpportunity({
+    ...opportunity,
+    updated_at: new Date().toISOString(),
+    primary_submission_id: submissionId,
+  });
+}
+
 async function ensureDealHunterSubmissionForCim(storage, deal, requestedBy = '') {
   const existing = await findExistingDealHunterSubmission(storage, deal);
 
   if (existing) {
+    await linkDealHunterOpportunitySubmission(storage, deal, existing.id);
     return existing;
   }
 
@@ -3675,6 +3713,7 @@ async function ensureDealHunterSubmissionForCim(storage, deal, requestedBy = '')
       const concurrentlyCreated = claimedSubmission || await findExistingDealHunterSubmission(storage, deal);
 
       if (concurrentlyCreated) {
+        await linkDealHunterOpportunitySubmission(storage, deal, concurrentlyCreated.id);
         return concurrentlyCreated;
       }
 
@@ -3691,6 +3730,7 @@ async function ensureDealHunterSubmissionForCim(storage, deal, requestedBy = '')
       submission_id: afterClaim.id,
       status: 'linked',
     });
+    await linkDealHunterOpportunitySubmission(storage, deal, afterClaim.id);
     return afterClaim;
   }
 
@@ -3713,8 +3753,10 @@ async function ensureDealHunterSubmissionForCim(storage, deal, requestedBy = '')
 
   await updateDealHunterCrmImport(storage, importRecord, {
     submission_id: created.submission.id,
+    opportunity_id: deal.opportunityId || null,
     status: 'created',
   });
+  await linkDealHunterOpportunitySubmission(storage, deal, created.submission.id);
   return created.submission;
 }
 
@@ -3740,6 +3782,7 @@ async function upsertCimRequestWithActivity(storage, request, { eventType, summa
     payload: { request: linkedRequest },
     activity: {
       submissionId: submission.id,
+      opportunityId: linkedRequest.opportunity_id,
       eventType,
       summary,
       actor: actor || 'deal-hunter',
@@ -3791,6 +3834,7 @@ async function finalizeCimRequestClaimWithActivity(
     },
     activity: {
       submissionId,
+      opportunityId: request.opportunity_id || claim?.opportunity_id || '',
       eventType,
       summary,
       actor: actor || 'deal-hunter',
@@ -3873,6 +3917,7 @@ async function updateDealHunterCrmSubmission(storage, existing, deal, { preserve
     payload: { id: existing.id, values },
     activity: {
       submissionId: existing.id,
+      opportunityId: deal.opportunityId || '',
       eventType: 'submission.deal-hunter-synced',
       summary: preserveExistingFields
         ? 'Existing CRM record enriched from Deal Hunter.'
@@ -3903,6 +3948,7 @@ function buildDealHunterCrmImportRecord(deal, submissionId = '', status = 'pendi
     id: sha256(`deal-hunter-crm-import:${importIdentity}`),
     created_at: now,
     updated_at: now,
+    opportunity_id: deal.opportunityId || null,
     deal_key: deal.dealKey || importIdentity,
     listing_identity: listingIdentity,
     listing_url: deal.listingUrl || '',
@@ -3914,6 +3960,7 @@ function buildDealHunterCrmImportRecord(deal, submissionId = '', status = 'pendi
       name: deal.name || '',
       sourceMode: deal.sourceMode || '',
       sourceId: deal.sourceId || '',
+      opportunityId: deal.opportunityId || '',
     },
   };
 }
@@ -3977,6 +4024,7 @@ async function syncHighFitDealsToCrm(scoredDeals = [], storage = getStorage()) {
             const status = preserveExistingFields ? 'enriched' : 'updated';
             summary[status] += 1;
             summary.results.push({ dealKey: deal.dealKey, status, submissionId: updated?.id || claimedSubmission.id });
+            await linkDealHunterOpportunitySubmission(storage, deal, updated?.id || claimedSubmission.id);
           } else {
             summary.skipped += 1;
             summary.results.push({ dealKey: deal.dealKey, status: 'duplicate-in-progress', submissionId: importRecord?.submission_id || '' });
@@ -4001,9 +4049,11 @@ async function syncHighFitDealsToCrm(scoredDeals = [], storage = getStorage()) {
             submission_id: updated?.id || existing.id,
             status,
           });
+          await linkDealHunterOpportunitySubmission(storage, deal, updated?.id || existing.id);
         } else {
           summary.skipped += 1;
           summary.results.push({ dealKey: deal.dealKey, status: 'duplicate-no-update', submissionId: existing.id });
+          await linkDealHunterOpportunitySubmission(storage, deal, existing.id);
         }
 
         continue;
@@ -4034,6 +4084,7 @@ async function syncHighFitDealsToCrm(scoredDeals = [], storage = getStorage()) {
         submission_id: created.submission?.id || '',
         status: 'created',
       });
+      await linkDealHunterOpportunitySubmission(storage, deal, created.submission?.id || '');
     } catch (error) {
       summary.failed += 1;
       summary.results.push({ dealKey: deal.dealKey, status: 'failed', error: error.message });
@@ -4050,8 +4101,8 @@ async function syncHighFitDealsToCrm(scoredDeals = [], storage = getStorage()) {
   return summary;
 }
 
-function buildCimRequestId(dealKey, recipientEmail) {
-  return sha256(`deal-hunter-cim-request:${dealKey}:${normalizeEmail(recipientEmail)}`);
+function buildCimRequestId(opportunityId, recipientEmail) {
+  return sha256(`deal-hunter-cim-request:${opportunityId}:${normalizeEmail(recipientEmail)}`);
 }
 
 function isCompletedCimStatus(status = '') {
@@ -4081,6 +4132,8 @@ function getCimFollowUpSettings() {
     delaySequenceHours: [48, 72, 96],
     weekdaysOnly: true,
     timezone: 'America/Los_Angeles',
+    sendWindowStart: '08:00',
+    sendWindowEnd: '17:00',
   };
 }
 
@@ -4320,6 +4373,14 @@ function findCimStopEvent(request, events = []) {
 }
 
 function getCimRequestUnavailableReason(deal, recipientEmail) {
+  if (deal?.identityStatus === 'ambiguous') {
+    return 'Opportunity identity is ambiguous. An administrator must resolve it before outreach.';
+  }
+
+  if (!deal?.opportunityId) {
+    return 'Canonical opportunity identity is unavailable. Outreach is blocked until identity storage is healthy.';
+  }
+
   if (!deal?.dealKey) {
     return 'Deal tracking key is missing.';
   }
@@ -4372,6 +4433,18 @@ function mapCimRequestsByDeal(requests = []) {
   }, new Map());
 }
 
+function mapCimRequestsByOpportunity(requests = []) {
+  return requests.reduce((accumulator, request) => {
+    const opportunityId = request?.opportunity_id || '';
+    if (!opportunityId) return accumulator;
+    const current = accumulator.get(opportunityId) || [];
+    current.push(request);
+    current.sort((left, right) => Date.parse(right.updated_at || '') - Date.parse(left.updated_at || ''));
+    accumulator.set(opportunityId, current);
+    return accumulator;
+  }, new Map());
+}
+
 function findBlockingCimRequest(requests = []) {
   return requests.find((request) => isCompletedCimStatus(request?.status) || isRecentPendingCimRequest(request)) || null;
 }
@@ -4379,6 +4452,7 @@ function findBlockingCimRequest(requests = []) {
 function attachCimRequestStatus(scoredDeals, requests = []) {
   const requestsByDealRecipient = mapCimRequestsByDealRecipient(requests);
   const requestsByDeal = mapCimRequestsByDeal(requests);
+  const requestsByOpportunity = mapCimRequestsByOpportunity(requests);
 
   return scoredDeals.map((deal) => {
     const recipientEmail = normalizeEmail(deal.brokerEmail);
@@ -4390,12 +4464,22 @@ function attachCimRequestStatus(scoredDeals, requests = []) {
       .map((dealKey) => requestsByDealRecipient.get(`${dealKey}|${recipientEmail}`))
       .filter(Boolean)
       .sort((left, right) => Date.parse(right.updated_at || '') - Date.parse(left.updated_at || ''))[0];
-    const requestsForAliases = lookupDealKeys.flatMap((dealKey) => requestsByDeal.get(dealKey) || [])
+    const requestsForAliases = [
+      ...(deal.opportunityId ? requestsByOpportunity.get(deal.opportunityId) || [] : []),
+      ...lookupDealKeys.flatMap((dealKey) => requestsByDeal.get(dealKey) || []),
+    ]
+      .filter((request, index, all) => all.findIndex((candidate) => candidate.id === request.id) === index)
       .sort((left, right) => Date.parse(right.updated_at || '') - Date.parse(left.updated_at || ''));
     const existingRequest = findBlockingCimRequest(requestsForAliases) || exactRequest;
     const reason = getCimRequestUnavailableReason(deal, recipientEmail);
     const eligible = reason === '';
     const completed = isCompletedCimStatus(existingRequest?.status);
+    const statusReason = reason
+      || (completed
+        ? 'This canonical opportunity was already contacted; its CIM sequence is retained in history.'
+        : isRecentPendingCimRequest(existingRequest)
+          ? 'A CIM request for this canonical opportunity is already in progress.'
+          : '');
     const preview = eligible ? buildDealHunterCimRequestEmail({ to: recipientEmail, deal }) : null;
     const contactPreviews = eligible ? brokerContacts.map((contact) => {
       const contactPreview = buildDealHunterCimRequestEmail({
@@ -4417,7 +4501,7 @@ function attachCimRequestStatus(scoredDeals, requests = []) {
         requestState: existingRequest?.request_state || (eligible ? 'ready' : 'not_requested'),
         deliveryState: existingRequest?.delivery_state || 'not-attempted',
         followUpState: existingRequest?.follow_up_state || (existingRequest?.next_follow_up_at ? 'scheduled' : 'not-scheduled'),
-        reason,
+        reason: statusReason,
         recipientEmail: normalizeEmail(existingRequest?.recipient_email || recipientEmail),
         snapshotToken: eligible ? signCimDealSnapshot(deal) : '',
         requestedAt: existingRequest?.first_requested_at || existingRequest?.created_at || '',
@@ -4476,22 +4560,108 @@ async function loadDealHunterStorageBatches(batches, loader) {
   return records;
 }
 
-async function loadDealHunterCimRequests(storage, dealKeys) {
-  if (!storage.listDealHunterCimRequests || dealKeys.length === 0) {
+async function loadDealHunterCimRequests(storage, dealKeys, opportunityIds = []) {
+  if (!storage.listDealHunterCimRequests || (dealKeys.length === 0 && opportunityIds.length === 0)) {
     return [];
   }
 
   try {
-    const batches = batchDealHunterStorageKeys(dealKeys, storage.provider);
-    return await loadDealHunterStorageBatches(batches, (batch) => (
+    const dealBatches = batchDealHunterStorageKeys(dealKeys, storage.provider);
+    const opportunityBatches = batchDealHunterStorageKeys(opportunityIds, storage.provider);
+    const records = await Promise.all([
+      loadDealHunterStorageBatches(dealBatches, (batch) => (
       storage.listDealHunterCimRequests({ dealKeys: batch, limit: 5000 })
-    ));
+      )),
+      loadDealHunterStorageBatches(opportunityBatches, (batch) => (
+        storage.listDealHunterCimRequests({ opportunityIds: batch, limit: 5000 })
+      )),
+    ]);
+    return [...new Map(records.flat().map((request) => [request.id, request])).values()];
   } catch (error) {
     console.warn(`[deal-hunter] CIM request history lookup failed: ${error.message}`);
     // Missing request history could make previously contacted deals appear ready
     // for outreach. Keep reviews and automation fail-closed instead.
     throw new Error('Deal Hunter CIM request history could not be loaded safely.');
   }
+}
+
+async function attachCanonicalOpportunityIdentities(storage, deals = []) {
+  if (!storage.listDealHunterOpportunities) {
+    return deals.map((deal) => ({ ...deal, identityStatus: 'unavailable', opportunityId: '' }));
+  }
+  const candidates = await storage.listDealHunterOpportunities({ limit: 100000 });
+  const resolvedDeals = [];
+  for (const deal of deals) {
+    const resolution = await resolveDealHunterOpportunity({
+      deal,
+      storage,
+      actor: 'deal-hunter-review',
+      candidateOpportunities: candidates,
+    });
+    if (resolution.opportunity) {
+      const candidateIndex = candidates.findIndex((item) => item.opportunity_id === resolution.opportunity.opportunity_id);
+      if (candidateIndex >= 0) candidates[candidateIndex] = resolution.opportunity;
+      else candidates.push(resolution.opportunity);
+    }
+    resolvedDeals.push({
+      ...deal,
+      opportunityId: resolution.opportunityId || '',
+      identityStatus: resolution.ok ? 'resolved' : resolution.status || 'unavailable',
+      identityResolution: resolution.resolution || '',
+      identityExceptionId: resolution.identityException?.id || '',
+    });
+  }
+
+  const opportunityIds = uniqueStrings(resolvedDeals.map((deal) => deal.opportunityId));
+  const aliases = opportunityIds.length > 0 && storage.listDealHunterOpportunityAliases
+    ? await storage.listDealHunterOpportunityAliases({ opportunityIds, limit: 100000 })
+    : [];
+  const aliasesByOpportunity = aliases.reduce((map, item) => {
+    const current = map.get(item.opportunity_id) || [];
+    current.push(item);
+    map.set(item.opportunity_id, current);
+    return map;
+  }, new Map());
+  const enrichedDeals = resolvedDeals.map((deal) => {
+    const durableAliases = aliasesByOpportunity.get(deal.opportunityId) || [];
+    return {
+      ...deal,
+      dealKeyAliases: uniqueStrings([
+        ...(deal.dealKeyAliases || []),
+        ...durableAliases.filter((item) => item.alias_type === 'deal-key').map((item) => item.alias_value),
+      ]).filter((value) => value !== deal.dealKey),
+      listingAliases: uniqueStrings([
+        ...(deal.listingAliases || []),
+        ...durableAliases.filter((item) => item.alias_type === 'listing-url').map((item) => item.alias_value),
+      ]),
+      identityAliases: uniqueStrings([
+        ...(deal.identityAliases || []),
+        ...durableAliases
+          .filter((item) => ['listing-id', 'source-identity'].includes(item.alias_type))
+          .map((item) => item.alias_value),
+      ]),
+    };
+  });
+  const collapsed = [];
+  const indexByOpportunity = new Map();
+  for (const deal of enrichedDeals) {
+    if (!deal.opportunityId || deal.identityStatus !== 'resolved') {
+      collapsed.push(deal);
+      continue;
+    }
+    const existingIndex = indexByOpportunity.get(deal.opportunityId);
+    if (existingIndex === undefined) {
+      indexByOpportunity.set(deal.opportunityId, collapsed.length);
+      collapsed.push(deal);
+      continue;
+    }
+    collapsed[existingIndex] = mergeSyndicatedDeals(collapsed[existingIndex], deal, {
+      reason: 'canonical-opportunity-alias',
+      confidence: 1,
+      evidence: { opportunityId: deal.opportunityId, evidenceVersion: 'cim-opportunity-v1' },
+    });
+  }
+  return collapsed;
 }
 
 async function loadDealHunterDispositions(storage, dealKeys) {
@@ -4539,6 +4709,7 @@ function buildCimRequestRecord({
   requestId = '',
   retryOfRequestId = '',
   correctedRecipient = null,
+  communicationId = '',
 } = {}) {
   const now = new Date().toISOString();
   const businessName = normalizeText(deal.name || 'Unnamed business', 220);
@@ -4559,7 +4730,7 @@ function buildCimRequestRecord({
     ),
   );
   const existingMetadata = existingRequest?.metadata && typeof existingRequest.metadata === 'object' ? existingRequest.metadata : {};
-  const resolvedRequestId = requestId || existingRequest?.id || buildCimRequestId(deal.dealKey, recipientEmail);
+  const resolvedRequestId = requestId || existingRequest?.id || buildCimRequestId(deal.opportunityId, recipientEmail);
   const replyToAddress = buildCimReplyToAddress({
     requestId: resolvedRequestId,
     replyTo: getConfig().delivery.resendReplyTo || '',
@@ -4575,6 +4746,7 @@ function buildCimRequestRecord({
     created_at: existingRequest?.created_at || now,
     updated_at: now,
     submission_id: submissionId || existingRequest?.submission_id || null,
+    opportunity_id: deal.opportunityId || existingRequest?.opportunity_id || null,
     retry_of_request_id: retryOfRequestId || existingRequest?.retry_of_request_id || null,
     deal_key: deal.dealKey,
     recipient_email: normalizeEmail(recipientEmail),
@@ -4622,7 +4794,15 @@ function buildCimRequestRecord({
     metadata: {
       ...existingMetadata,
       industry: deal.industry || '',
+      description: deal.description || '',
       location: deal.location || '',
+      city: deal.city || '',
+      county: deal.county || '',
+      state: deal.state || '',
+      country: deal.country || '',
+      sourceId: deal.sourceId || '',
+      identityAliases: deal.identityAliases || [],
+      stableExternalId: Boolean(deal.stableExternalId),
       annualProfit: deal.annualProfit,
       annualRevenue: deal.annualRevenue,
       askingPrice: deal.askingPrice,
@@ -4637,6 +4817,8 @@ function buildCimRequestRecord({
       questions: deal.questions || [],
       replyToAddress: existingMetadata.replyToAddress || replyToAddress,
       providerMessageIds,
+      opportunityId: deal.opportunityId || existingRequest?.opportunity_id || '',
+      initialCommunicationId: existingMetadata.initialCommunicationId || communicationId || '',
       ...(correctedRecipient ? { correctedRecipient } : {}),
     },
   };
@@ -5008,7 +5190,7 @@ async function markCimRequestDeliveryIssue(storage, request, stopEvent) {
   });
 }
 
-function buildCimFollowUpUpdate(request, emailResult, followUpNumber, sentAt) {
+function buildCimFollowUpUpdate(request, emailResult, followUpNumber, sentAt, communicationId = '') {
   const settings = getCimFollowUpSettings();
   const sent = ['sent', 'logged'].includes(emailResult.status);
   const existingMetadata = request.metadata && typeof request.metadata === 'object' ? request.metadata : {};
@@ -5063,7 +5245,9 @@ function buildCimFollowUpUpdate(request, emailResult, followUpNumber, sentAt) {
         {
           number: followUpNumber,
           attemptedAt: sentAt,
+          acceptedAt: sent ? sentAt : '',
           status: emailResult.status,
+          communicationId,
           providerMessageId: emailResult.providerMessageId || '',
           error: emailResult.error || '',
         },
@@ -5075,6 +5259,8 @@ function buildCimFollowUpUpdate(request, emailResult, followUpNumber, sentAt) {
 function dealFromCimRequest(request = {}) {
   const metadata = request.metadata && typeof request.metadata === 'object' ? request.metadata : {};
   return {
+    opportunityId: request.opportunity_id || metadata.opportunityId || '',
+    identityStatus: request.opportunity_id ? 'resolved' : 'unavailable',
     dealKey: request.deal_key || '',
     name: request.deal_name || 'Unnamed business',
     listingUrl: request.listing_url || '',
@@ -5100,12 +5286,135 @@ function dealFromCimRequest(request = {}) {
 
 async function processCimFollowUpRequest(storage, request, nowIso) {
   const lockKey = request?.id || buildCimRequestLockKey(request?.deal_key, request?.recipient_email);
+  let durableRecipientClaimId = '';
 
   if (!acquireLock(cimFollowUpLocks, lockKey)) {
     return { status: 'locked', request };
   }
 
   try {
+    const outreachGate = await assertCimOutreachAllowed({ storage });
+    if (!outreachGate.allowed) return { status: 'deferred', reason: 'outreach-paused', request };
+
+    // Global suppressions are recipient-wide and can be enforced safely even
+    // while a legacy request is still awaiting canonical identity backfill.
+    const activeSuppression = await storage.getActiveEmailSuppression?.(request.recipient_email);
+    if (activeSuppression) {
+      const stoppedRequest = await upsertCimRequestWithActivity(
+        storage,
+        buildCimRequestStorageUpdate(request, {
+          request_state: 'stopped',
+          follow_up_state: 'stopped',
+          next_follow_up_at: null,
+          last_activity_at: nowIso,
+          metadata: {
+            ...(request.metadata || {}),
+            suppressionReason: activeSuppression.reason,
+            suppressionId: activeSuppression.id,
+          },
+        }),
+        {
+          eventType: 'cim.outreach-suppressed',
+          summary: 'CIM outreach stopped by the global email suppression policy.',
+          actor: 'email-suppression-policy',
+          metadata: { suppressionId: activeSuppression.id, reason: activeSuppression.reason },
+        },
+      );
+      return { status: 'stopped', request: stoppedRequest };
+    }
+
+    const identity = await resolveDealHunterOpportunity({
+      deal: dealFromCimRequest(request),
+      storage,
+      actor: 'deal-hunter-follow-up-boundary',
+    });
+    if (!identity.ok) {
+      const stoppedRequest = await upsertCimRequestWithActivity(storage, {
+        ...request,
+        request_state: 'stopped',
+        follow_up_state: 'stopped',
+        next_follow_up_at: null,
+        updated_at: nowIso,
+        last_activity_at: nowIso,
+        metadata: { ...(request.metadata || {}), identityExceptionId: identity.identityException?.id || '' },
+      }, {
+        eventType: 'cim.identity-blocked',
+        summary: 'CIM follow-up stopped because canonical opportunity identity requires review.',
+        actor: 'deal-hunter-identity-policy',
+      });
+      return { status: 'stopped', reason: 'identity-ambiguous', request: stoppedRequest };
+    }
+    if (request.opportunity_id !== identity.opportunityId) {
+      request = await upsertCimRequestWithActivity(storage, {
+        ...request,
+        opportunity_id: identity.opportunityId,
+        updated_at: nowIso,
+        last_activity_at: nowIso,
+      }, {
+        eventType: 'cim.identity-linked',
+        summary: 'CIM request linked to its canonical opportunity before follow-up.',
+        actor: 'deal-hunter-identity-policy',
+        metadata: { opportunityId: identity.opportunityId, resolution: identity.resolution },
+      });
+    }
+
+    const siblingRequests = await storage.listDealHunterCimRequests({
+      opportunityIds: [identity.opportunityId],
+      limit: 500,
+    });
+    const terminalSibling = siblingRequests.find((candidate) => candidate.id !== request.id && (
+      candidate.responded_at
+      || candidate.request_state === 'responded'
+      || ['complained', 'suppressed'].includes(candidate.delivery_state)
+    ));
+    if (terminalSibling) {
+      const stoppedRequest = await upsertCimRequestWithActivity(storage, {
+        ...request,
+        request_state: terminalSibling.request_state === 'responded' ? 'responded' : 'stopped',
+        follow_up_state: 'stopped',
+        next_follow_up_at: null,
+        updated_at: nowIso,
+        last_activity_at: nowIso,
+        metadata: { ...(request.metadata || {}), stoppedByCanonicalRequestId: terminalSibling.id },
+      }, {
+        eventType: 'cim.canonical-sequence-stopped',
+        summary: 'Duplicate CIM sequence stopped by canonical opportunity state.',
+        actor: 'deal-hunter-identity-policy',
+        metadata: { opportunityId: identity.opportunityId, controllingRequestId: terminalSibling.id },
+      });
+      return { status: terminalSibling.request_state === 'responded' ? 'responded' : 'stopped', request: stoppedRequest };
+    }
+    const activeSiblings = siblingRequests.filter((candidate) => candidate.next_follow_up_at || candidate.status === 'follow_up_pending')
+      .sort((left, right) => Date.parse(left.first_requested_at || left.created_at || '') - Date.parse(right.first_requested_at || right.created_at || '') || left.id.localeCompare(right.id));
+    if (activeSiblings.length > 1 && activeSiblings[0].id !== request.id) {
+      const stoppedRequest = await upsertCimRequestWithActivity(storage, {
+        ...request,
+        request_state: 'stopped',
+        follow_up_state: 'stopped',
+        next_follow_up_at: null,
+        updated_at: nowIso,
+        last_activity_at: nowIso,
+        metadata: { ...(request.metadata || {}), canonicalSequenceOwnerId: activeSiblings[0].id },
+      }, {
+        eventType: 'cim.duplicate-sequence-quarantined',
+        summary: 'Duplicate active CIM sequence quarantined without deleting history.',
+        actor: 'deal-hunter-identity-policy',
+        metadata: { opportunityId: identity.opportunityId, sequenceOwnerId: activeSiblings[0].id },
+      });
+      return { status: 'stopped', reason: 'duplicate-active-sequence', request: stoppedRequest };
+    }
+
+    const recipientPolicy = await evaluateCimRecipientPolicy({
+      recipientEmail: request.recipient_email,
+      opportunityId: identity.opportunityId,
+      storage,
+      now: new Date(nowIso),
+    });
+    if (!recipientPolicy.allowed) {
+      await recordCimSafetyMetric({ metric: 'recipientCapDeferrals', storage, now: new Date(nowIso) }).catch(() => null);
+      return { status: 'deferred', reason: recipientPolicy.reason, recipientPolicy, request };
+    }
+
     if (!request.submission_id) {
       const submission = await ensureDealHunterSubmissionForCim(
         storage,
@@ -5132,31 +5441,6 @@ async function processCimFollowUpRequest(storage, request, nowIso) {
       if (!linkedSubmission || linkedSubmission.status === 'archived') {
         return { status: 'stopped', request };
       }
-    }
-
-    const activeSuppression = await storage.getActiveEmailSuppression?.(request.recipient_email);
-    if (activeSuppression) {
-      const stoppedRequest = await upsertCimRequestWithActivity(
-        storage,
-        buildCimRequestStorageUpdate(request, {
-          request_state: 'stopped',
-          follow_up_state: 'stopped',
-          next_follow_up_at: null,
-          last_activity_at: nowIso,
-          metadata: {
-            ...(request.metadata || {}),
-            suppressionReason: activeSuppression.reason,
-            suppressionId: activeSuppression.id,
-          },
-        }),
-        {
-          eventType: 'cim.outreach-suppressed',
-          summary: 'CIM outreach stopped by the global email suppression policy.',
-          actor: 'email-suppression-policy',
-          metadata: { suppressionId: activeSuppression.id, reason: activeSuppression.reason },
-        },
-      );
-      return { status: 'stopped', request: stoppedRequest };
     }
 
     const events = await loadCimRequestEvents(storage, request);
@@ -5217,6 +5501,40 @@ async function processCimFollowUpRequest(storage, request, nowIso) {
 
     const followUpNumber = followUpCount + 1;
     const communicationId = sha256(`crm-communication:${claimedRequest.id}:follow-up:${followUpNumber}`);
+    if (!storage.claimDealHunterCimRecipient) {
+      return { status: 'failed', reason: 'recipient-claim-storage-unavailable', request: claimedRequest };
+    }
+    durableRecipientClaimId = `${claimedRequest.id}:follow-up:${followUpNumber}`;
+    const recipientClaim = await storage.claimDealHunterCimRecipient({
+      recipientEmail: claimedRequest.recipient_email,
+      requestId: durableRecipientClaimId,
+      opportunityId: claimedRequest.opportunity_id,
+      nowIso,
+      expiresAt: new Date(Date.parse(nowIso) + 10 * 60 * 1000).toISOString(),
+      metadata: { kind: 'cim-follow-up', followUpNumber },
+    });
+    if (!recipientClaim?.claimed) {
+      const deferredRequest = await finalizeCimRequestClaimWithActivity(
+        storage,
+        buildCimRequestStorageUpdate(claimedRequest, {
+          status: cimRequestSentStatuses.includes(request.status) ? request.status : 'follow_up_failed',
+          follow_up_state: 'scheduled',
+          next_follow_up_at: request.next_follow_up_at || nowIso,
+          updated_at: nowIso,
+          last_activity_at: nowIso,
+          delivery_error: 'Another CIM transmission to this recipient is in progress.',
+        }),
+        claimedRequest,
+        {
+          expectedStatuses: ['follow_up_pending'],
+          eventType: 'cim.follow-up-deferred',
+          summary: 'CIM follow-up deferred because another recipient transmission is in progress.',
+          actor: 'deal-hunter-recipient-policy',
+        },
+      );
+      durableRecipientClaimId = '';
+      return { status: 'deferred', reason: 'recipient-send-in-progress', request: deferredRequest };
+    }
     const renderedMessage = buildDealHunterCimFollowUpEmail({
       to: claimedRequest.recipient_email,
       request: claimedRequest,
@@ -5263,6 +5581,43 @@ async function processCimFollowUpRequest(storage, request, nowIso) {
       }
       claimedRequest = renewal.request || claimedRequest;
 
+      const finalOutreachGate = await assertCimOutreachAllowed({ storage });
+      const finalRecipientPolicy = finalOutreachGate.allowed
+        ? await evaluateCimRecipientPolicy({
+            recipientEmail: claimedRequest.recipient_email,
+            opportunityId: claimedRequest.opportunity_id,
+            storage,
+            now: new Date(nowIso),
+          })
+        : null;
+      if (!finalOutreachGate.allowed || !finalRecipientPolicy?.allowed) {
+        const deferredRequest = await finalizeCimRequestClaimWithActivity(
+          storage,
+          buildCimRequestStorageUpdate(claimedRequest, {
+            status: cimRequestSentStatuses.includes(request.status) ? request.status : 'follow_up_failed',
+            follow_up_state: 'scheduled',
+            next_follow_up_at: request.next_follow_up_at || nowIso,
+            updated_at: nowIso,
+            last_activity_at: nowIso,
+            delivery_error: finalOutreachGate.allowed ? 'Recipient cadence deferred this follow-up.' : finalOutreachGate.error,
+          }),
+          claimedRequest,
+          {
+            expectedStatuses: ['follow_up_pending'],
+            eventType: 'cim.follow-up-deferred',
+            summary: finalOutreachGate.allowed
+              ? 'CIM follow-up deferred by recipient cadence policy.'
+              : 'CIM follow-up deferred because outreach is globally paused.',
+            actor: 'deal-hunter-safety-policy',
+            metadata: { recipientPolicy: finalRecipientPolicy, outreachPause: finalOutreachGate.status },
+          },
+        );
+        return { status: 'deferred', request: deferredRequest, recipientPolicy: finalRecipientPolicy };
+      }
+      if (finalRecipientPolicy.override?.id && storage.consumeDealHunterCimRecipientOverride) {
+        await storage.consumeDealHunterCimRecipientOverride(finalRecipientPolicy.override.id, nowIso);
+      }
+
       try {
         emailResult = await sendPreparedMessage(preparedMessageFromCommunication(communication, renderedMessage));
       } catch (error) {
@@ -5292,7 +5647,7 @@ async function processCimFollowUpRequest(storage, request, nowIso) {
     try {
       updatedRequest = await finalizeCimRequestClaimWithActivity(
         storage,
-        buildCimFollowUpUpdate(claimedRequest, emailResult, followUpNumber, nowIso),
+        buildCimFollowUpUpdate(claimedRequest, emailResult, followUpNumber, nowIso, communication?.id || communicationId),
         claimedRequest,
         {
           expectedStatuses: ['follow_up_pending'],
@@ -5332,6 +5687,9 @@ async function processCimFollowUpRequest(storage, request, nowIso) {
         : '',
     };
   } finally {
+    if (durableRecipientClaimId && storage.releaseDealHunterCimRecipientClaim) {
+      await storage.releaseDealHunterCimRecipientClaim({ recipientEmail: request.recipient_email, requestId: durableRecipientClaimId });
+    }
     releaseLock(cimFollowUpLocks, lockKey);
   }
 }
@@ -5381,17 +5739,22 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
   const allDeals = dedupeDeals(sourceResults.flatMap((result) => result.deals));
   const recentDeals = allDeals.filter((deal) => isRecentDeal(deal, config.dealHunter.lookbackDays));
   const candidateDeals = recentDeals.length > 0 ? recentDeals : allDeals;
+  const scoredDealsWithIdentity = await attachCanonicalOpportunityIdentities(storage, candidateDeals.map(scoreDeal));
   const seenDeals = await loadDealHunterHistory(storage);
-  const scoredDealsWithHistory = attachHistory(candidateDeals.map(scoreDeal), seenDeals, generatedAt);
+  const scoredDealsWithHistory = attachHistory(scoredDealsWithIdentity, seenDeals, generatedAt);
   const dealKeys = uniqueStrings(scoredDealsWithHistory.flatMap((deal) => [
     deal.dealKey,
     ...(deal.dealKeyAliases || []),
   ]));
-  const [cimRequests, dispositions] = await Promise.all([
-    loadDealHunterCimRequests(storage, dealKeys),
+  const opportunityIds = uniqueStrings(scoredDealsWithHistory.map((deal) => deal.opportunityId));
+  const [cimRequests, dispositions, allCimRequests, outreachGate, identityExceptions] = await Promise.all([
+    loadDealHunterCimRequests(storage, dealKeys, opportunityIds),
     loadDealHunterDispositions(storage, dealKeys),
+    storage.listDealHunterCimRequests?.({ limit: 100000 }) || [],
+    assertCimOutreachAllowed({ storage }),
+    storage.listDealHunterIdentityExceptions?.({ statuses: ['open'], limit: 100 }) || [],
   ]);
-  const scoredDeals = attachCimRequestStatus(
+  const baseScoredDeals = attachCimRequestStatus(
     attachDealHunterDispositions(scoredDealsWithHistory, dispositions),
     cimRequests,
   ).map((deal) => deal.dismissed
@@ -5404,6 +5767,32 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
         },
       }
     : deal);
+  const generatedAtMs = Date.parse(generatedAt);
+  const scoredDeals = baseScoredDeals.map((deal) => {
+    const touches = logicalCimTouchesForRecipient(allCimRequests, deal.brokerEmail);
+    const touches24Hours = touches.filter((touch) => Date.parse(touch.occurredAt) >= generatedAtMs - 24 * 60 * 60 * 1000).length;
+    const touches30Days = touches.filter((touch) => Date.parse(touch.occurredAt) >= generatedAtMs - 30 * 24 * 60 * 60 * 1000).length;
+    const cap24Hours = Number(config.dealHunter.cimOutreach.recipientCap24Hours);
+    const cap30Days = Number(config.dealHunter.cimOutreach.recipientCap30Days);
+    const recipientBlocked = touches24Hours >= cap24Hours || touches30Days >= cap30Days;
+    const policyReason = !outreachGate.allowed
+      ? outreachGate.error
+      : recipientBlocked
+        ? touches24Hours >= cap24Hours
+          ? 'This recipient has reached the rolling 24-hour CIM touch cap.'
+          : 'This recipient has reached the rolling 30-day CIM touch cap.'
+        : '';
+    return {
+      ...deal,
+      cimRequest: {
+        ...deal.cimRequest,
+        canRequest: deal.cimRequest.canRequest && !policyReason,
+        reason: deal.cimRequest.reason || policyReason,
+        recipientPolicy: { touches24Hours, touches30Days, cap24Hours, cap30Days, blocked: recipientBlocked },
+        outreachPaused: !outreachGate.allowed,
+      },
+    };
+  });
   const newlySeenMatches = scoredDeals
     .filter((deal) => !deal.dismissed && deal.isNew && !deal.shouldRemove && deal.score >= watchlistScoreThreshold)
     .sort(sortBestDeals)
@@ -5438,6 +5827,7 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
     sources: sourceResults.map((result) => result.source),
     disabledSources: coverage.disabledSources,
     coverageWarnings: coverage.warnings,
+    cimOutreachPause: outreachGate.status,
     dealOsImportPolicy: coverage.dealOsImportPolicy,
     totals: {
       sourceRows: sourceResults.reduce((sum, result) => sum + (result.source.rowCount || 0), 0),
@@ -5456,6 +5846,17 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
     qualified,
     watchlist,
     removalCandidates,
+    identityExceptions: identityExceptions.map((item) => ({
+      id: item.id,
+      createdAt: item.created_at,
+      observedDealKey: item.observed_deal_key,
+      observedName: item.observed_name,
+      observedRecipient: item.observed_recipient,
+      candidateOpportunityIds: item.candidate_opportunity_ids || [],
+      reason: item.reason,
+      evidenceVersion: item.evidence_version,
+      comparisons: item.metadata?.comparisons || [],
+    })),
   };
 
   return { review, scoredDeals, storage };
@@ -5750,6 +6151,35 @@ async function sendCimRequestForScoredDeal({
     return { ok: false, status: 500, error: 'CIM request tracking storage is not configured.' };
   }
 
+  const outreachGate = await assertCimOutreachAllowed({ storage });
+  if (!outreachGate.allowed) {
+    return { ok: false, status: 409, error: outreachGate.error, outreachPause: outreachGate.status };
+  }
+
+  const identity = await resolveDealHunterOpportunity({
+    deal,
+    storage,
+    actor: requestedBy || 'deal-hunter-send-boundary',
+  });
+  if (!identity.ok) {
+    return {
+      ok: false,
+      status: 409,
+      error: identity.error || 'Canonical opportunity identity could not be resolved. No broker email was transmitted.',
+      identityException: identity.identityException || null,
+    };
+  }
+  deal = {
+    ...deal,
+    opportunityId: identity.opportunityId,
+    identityStatus: 'resolved',
+    identityResolution: identity.resolution,
+    dealKeyAliases: uniqueStrings([
+      ...(deal.dealKeyAliases || []),
+      ...identity.aliases.filter((item) => item.alias_type === 'deal-key').map((item) => item.alias_value),
+    ]).filter((key) => key !== deal.dealKey),
+  };
+
   // Revalidate eligibility and build/link the CRM record from the latest healthy
   // source deal, while keeping the signed approval snapshot as the immutable
   // input for request metadata and the exact outbound copy. Automated actors
@@ -5765,6 +6195,7 @@ async function sendCimRequestForScoredDeal({
     (
       !verifiedAutomationDeal ||
       verifiedAutomationDeal.dealKey !== deal?.dealKey ||
+      (verifiedAutomationDeal.opportunityId && verifiedAutomationDeal.opportunityId !== deal?.opportunityId) ||
       normalizeEmail(verifiedAutomationDeal.brokerEmail) !== normalizeEmail(deal?.brokerEmail)
     )
   ) {
@@ -5776,11 +6207,15 @@ async function sendCimRequestForScoredDeal({
     };
   }
 
-  const approvedMessageDeal = automaticSend
+  const approvedMessageDeal = {
+    ...(automaticSend
     ? verifiedAutomationDeal
     : approvedDeal?.dealKey === deal?.dealKey
       ? approvedDeal
-      : deal;
+      : deal),
+    opportunityId: deal.opportunityId,
+    identityStatus: 'resolved',
+  };
   const recipientEmail = normalizeEmail(approvedMessageDeal?.brokerEmail);
   const unavailableReason = getCimRequestUnavailableReason(deal, recipientEmail);
 
@@ -5793,9 +6228,11 @@ async function sendCimRequestForScoredDeal({
     };
   }
 
-  const lockKey = buildCimDealSendLockKey(deal.dealKey);
+  const lockKey = buildCimDealSendLockKey(deal.opportunityId);
+  const recipientLockKey = normalizeEmail(recipientEmail);
 
-  if (!acquireLock(cimRequestSendLocks, lockKey)) {
+  if (!acquireLock(cimRequestSendLocks, lockKey) || !acquireLock(cimRecipientSendLocks, recipientLockKey)) {
+    releaseLock(cimRequestSendLocks, lockKey);
     return {
       ok: false,
       status: 409,
@@ -5803,6 +6240,8 @@ async function sendCimRequestForScoredDeal({
       deal: publicDeal(attachCimRequestStatus([deal], [])[0]),
     };
   }
+
+  let durableRecipientClaimRequestId = '';
 
   try {
     let submission;
@@ -5815,7 +6254,7 @@ async function sendCimRequestForScoredDeal({
     } catch (error) {
       return {
         ok: false,
-        status: 409,
+        status: 500,
         error: error.message || 'A CRM record could not be linked before sending the CIM request.',
         deal: publicDeal(attachCimRequestStatus([deal], [])[0]),
       };
@@ -5841,7 +6280,11 @@ async function sendCimRequestForScoredDeal({
       };
     }
 
-    const dealRequests = await storage.listDealHunterCimRequests({ dealKeys: [deal.dealKey], limit: 100 });
+    const dealRequests = await loadDealHunterCimRequests(
+      storage,
+      uniqueStrings([deal.dealKey, ...(deal.dealKeyAliases || [])]),
+      [deal.opportunityId],
+    );
     const blockingRequest = findBlockingCimRequest(
       retryOfRequest
         ? dealRequests.filter((request) => request.id !== retryOfRequest.id)
@@ -5851,11 +6294,12 @@ async function sendCimRequestForScoredDeal({
       || await storage.getDealHunterCimRequest({ dealKey: deal.dealKey, recipientEmail });
 
     if (blockingRequest && isCompletedCimStatus(blockingRequest.status)) {
-      const linkedBlockingRequest = blockingRequest.submission_id
+      const linkedBlockingRequest = blockingRequest.submission_id && blockingRequest.opportunity_id === deal.opportunityId
         ? blockingRequest
         : await upsertCimRequestWithActivity(storage, {
             ...blockingRequest,
             submission_id: submission.id,
+            opportunity_id: deal.opportunityId,
             updated_at: new Date().toISOString(),
             last_activity_at: new Date().toISOString(),
           }, {
@@ -5927,6 +6371,25 @@ async function sendCimRequestForScoredDeal({
       };
     }
 
+    const recipientPolicy = await evaluateCimRecipientPolicy({
+      recipientEmail,
+      opportunityId: deal.opportunityId,
+      storage,
+      includePendingInitial: false,
+    });
+    if (!recipientPolicy.allowed) {
+      await recordCimSafetyMetric({ metric: 'recipientCapDeferrals', storage }).catch(() => null);
+      return {
+        ok: false,
+        status: 409,
+        error: recipientPolicy.reason === 'recipient-24-hour-cap'
+          ? 'This recipient has reached the rolling 24-hour CIM touch cap. No email was transmitted.'
+          : 'This recipient has reached the rolling 30-day CIM touch cap. No email was transmitted.',
+        recipientPolicy,
+        deal: publicDeal(attachCimRequestStatus([deal], dealRequests)[0]),
+      };
+    }
+
     const unsignedPendingRecord = buildCimRequestRecord({
       deal: approvedMessageDeal,
       recipientEmail,
@@ -5952,6 +6415,52 @@ async function sendCimRequestForScoredDeal({
           },
         }
       : unsignedPendingRecord;
+    if (!storage.claimDealHunterCimRecipient) {
+      return { ok: false, status: 500, error: 'Recipient cadence claim storage is not configured. No email was transmitted.' };
+    }
+    const durableRecipientClaim = await storage.claimDealHunterCimRecipient({
+      recipientEmail,
+      requestId: pendingRecord.id,
+      opportunityId: deal.opportunityId,
+      nowIso: pendingRecord.updated_at,
+      expiresAt: new Date(Date.parse(pendingRecord.updated_at) + 10 * 60 * 1000).toISOString(),
+      metadata: { kind: 'initial-cim-request' },
+    });
+    if (!durableRecipientClaim?.claimed) {
+      return {
+        ok: false,
+        status: 409,
+        error: 'Another CIM transmission to this recipient is already in progress. No email was transmitted.',
+        recipientClaim: durableRecipientClaim?.claim || null,
+      };
+    }
+    durableRecipientClaimRequestId = pendingRecord.id;
+    if (!storage.claimDealHunterCimOpportunity) {
+      return { ok: false, status: 500, error: 'Canonical opportunity claim storage is not configured. No email was transmitted.' };
+    }
+    const canonicalClaim = await storage.claimDealHunterCimOpportunity({
+      opportunityId: deal.opportunityId,
+      requestId: pendingRecord.id,
+      recipientEmail,
+      allowedRequestIds: retryOfRequest ? [retryOfRequest.id] : [],
+      nowIso: pendingRecord.updated_at,
+      metadata: { dealKey: deal.dealKey, requestedBy: normalizeText(requestedBy, 160) },
+    });
+    if (!canonicalClaim?.claimed) {
+      const owner = canonicalClaim?.claim?.request_id
+        ? await storage.getDealHunterCimRequestById?.(canonicalClaim.claim.request_id)
+        : null;
+      return {
+        ok: Boolean(owner && isCompletedCimStatus(owner.status)),
+        alreadySent: Boolean(owner && isCompletedCimStatus(owner.status)),
+        status: owner && isCompletedCimStatus(owner.status) ? 200 : 409,
+        error: owner && isCompletedCimStatus(owner.status)
+          ? ''
+          : 'Another CIM sequence already owns this canonical opportunity. No email was transmitted.',
+        request: owner,
+        deal: publicDeal(attachCimRequestStatus([deal], owner ? [owner] : dealRequests)[0]),
+      };
+    }
     const claimResult = storage.claimDealHunterCimRequest
       ? await storage.claimDealHunterCimRequest(pendingRecord, {
           pendingCutoff: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
@@ -6081,6 +6590,54 @@ async function sendCimRequestForScoredDeal({
       };
     }
     const activeRequest = renewal.request || pendingRequest || pendingRecord;
+    const finalOutreachGate = await assertCimOutreachAllowed({ storage });
+    const finalRecipientPolicy = finalOutreachGate.allowed
+      ? await evaluateCimRecipientPolicy({
+          recipientEmail,
+          opportunityId: deal.opportunityId,
+          storage,
+          includePendingInitial: false,
+        })
+      : null;
+    if (!finalOutreachGate.allowed || !finalRecipientPolicy?.allowed) {
+      const policyError = finalOutreachGate.allowed
+        ? 'The recipient cadence changed before transmission. No email was transmitted.'
+        : finalOutreachGate.error;
+      const blockedRequest = await finalizeCimRequestClaimWithActivity(
+        storage,
+        buildCimRequestRecord({
+          deal: approvedMessageDeal,
+          recipientEmail,
+          requestedBy,
+          emailResult: { status: 'failed', error: policyError, providerMessageId: '' },
+          existingRequest: activeRequest,
+          submissionId: submission.id,
+          retryOfRequestId: retryOfRequest?.id || '',
+          correctedRecipient,
+          communicationId: communication.id,
+        }),
+        activeRequest,
+        {
+          expectedStatuses: ['pending'],
+          eventType: 'cim.outreach-deferred',
+          summary: policyError,
+          actor: requestedBy,
+          metadata: { recipientPolicy: finalRecipientPolicy, outreachPause: finalOutreachGate.status },
+        },
+      );
+      return {
+        ok: false,
+        status: 409,
+        error: policyError,
+        request: blockedRequest,
+        recipientPolicy: finalRecipientPolicy,
+        outreachPause: finalOutreachGate.status,
+        deal: publicDeal(attachCimRequestStatus([deal], [blockedRequest])[0]),
+      };
+    }
+    if (finalRecipientPolicy.override?.id && storage.consumeDealHunterCimRecipientOverride) {
+      await storage.consumeDealHunterCimRecipientOverride(finalRecipientPolicy.override.id, new Date().toISOString());
+    }
     const preparedMessage = preparedMessageFromCommunication(communication, renderedMessage);
     const emailResult = await sendPreparedMessage(preparedMessage);
     let communicationStateError = null;
@@ -6103,6 +6660,7 @@ async function sendCimRequestForScoredDeal({
           submissionId: submission.id,
           retryOfRequestId: retryOfRequest?.id || '',
           correctedRecipient,
+          communicationId: communication.id,
         }),
         activeRequest,
         {
@@ -6149,7 +6707,11 @@ async function sendCimRequestForScoredDeal({
         : '',
     };
   } finally {
+    if (durableRecipientClaimRequestId && storage.releaseDealHunterCimRecipientClaim) {
+      await storage.releaseDealHunterCimRecipientClaim({ recipientEmail, requestId: durableRecipientClaimRequestId });
+    }
     releaseLock(cimRequestSendLocks, lockKey);
+    releaseLock(cimRecipientSendLocks, recipientLockKey);
   }
 }
 
@@ -6249,7 +6811,11 @@ export async function retryDealHunterCimRequestWithCorrectedRecipient({
     };
   }
 
-  const requests = await storage.listDealHunterCimRequests({ dealKeys: [original.deal_key], limit: 100 });
+  const requests = await loadDealHunterCimRequests(
+    storage,
+    [original.deal_key],
+    original.opportunity_id ? [original.opportunity_id] : [],
+  );
   const acceptedElsewhere = requests.find((request) => {
     if (request.id === original.id) return false;
     return (
@@ -6334,6 +6900,7 @@ function normalizeCimRequestSelections(selections = []) {
   }
 
   const seen = new Set();
+  const seenRecipients = new Set();
   const normalizedSelections = [];
 
   for (const selection of selections) {
@@ -6353,7 +6920,16 @@ function normalizeCimRequestSelections(selections = []) {
       };
     }
 
+    if (seenRecipients.has(recipientEmail)) {
+      return {
+        valid: false,
+        selections: [],
+        error: 'A bulk CIM operation may include only one initial email per recipient. Review the other opportunity separately.',
+      };
+    }
+
     seen.add(key);
+    seenRecipients.add(recipientEmail);
     normalizedSelections.push({ dealKey, recipientEmail, recipientName, deal });
   }
 
@@ -6639,6 +7215,23 @@ export async function runDealHunterCimFollowUps({
     };
   }
 
+  const outreachGate = await assertCimOutreachAllowed({ storage });
+  if (!outreachGate.allowed) {
+    return {
+      ok: false,
+      status: 409,
+      error: outreachGate.error,
+      reviewed: 0,
+      sent: 0,
+      responded: 0,
+      stopped: 0,
+      failed: 0,
+      skipped: 0,
+      results: [],
+      outreachPause: outreachGate.status,
+    };
+  }
+
   if (getConfig().isProduction) {
     const emailReadiness = await getEmailReadiness({ storage });
 
@@ -6674,7 +7267,9 @@ export async function runDealHunterCimFollowUps({
     };
   }
 
-  if (!isCimFollowUpSendDay({ now, settings })) {
+  const sendWindow = evaluateCimFollowUpWindow({ now, settings });
+  if (!sendWindow.allowed) {
+    await recordCimSafetyMetric({ metric: 'outOfWindowDeferrals', storage, now }).catch(() => null);
     return {
       ok: true,
       status: 200,
@@ -6685,7 +7280,10 @@ export async function runDealHunterCimFollowUps({
       failed: 0,
       skipped: 0,
       deferred: true,
-      message: `CIM follow-ups are deferred until the next weekday in ${settings.timezone || 'America/Los_Angeles'}.`,
+      deferralReason: sendWindow.reason,
+      message: sendWindow.reason === 'weekend'
+        ? `CIM follow-ups are deferred until the next weekday in ${settings.timezone || 'America/Los_Angeles'}.`
+        : `CIM follow-ups are deferred until the ${settings.sendWindowStart}-${settings.sendWindowEnd} business-hours window in ${settings.timezone || 'America/Los_Angeles'}.`,
       results: [],
     };
   }

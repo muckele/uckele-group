@@ -102,7 +102,7 @@ The production Fly machine runs the in-app scheduler once daily at the configure
 
 Phase 15 also records an atomic daily job claim in `scheduled_job_runs`. Admin, in-process scheduler, and external cron triggers share the same date-keyed claim, preventing overlapping triggers from sending duplicate daily emails. Successful provider delivery uses a deterministic idempotency key, local delivery evidence is written before completion bookkeeping, and stale in-progress claims remain retryable.
 
-Apply all committed Supabase migrations before deploying this version when `STORAGE_PROVIDER=supabase` is used. In particular, `20260806120000_crm_communications_lifecycle.sql` adds first-class communications, the expanded CIM lifecycle, Deal Hunter dispositions, and the atomic RPCs used by this release; `20260810130000_deal_os_exports.sql` adds the server-only normalized Deal OS import history. SQLite applies the equivalent additive migration automatically at startup; take and verify a backup before starting the upgraded process against production data.
+Apply all committed Supabase migrations before deploying this version when `STORAGE_PROVIDER=supabase` is used. In particular, `20260806120000_crm_communications_lifecycle.sql` adds first-class communications, the expanded CIM lifecycle, Deal Hunter dispositions, and the atomic RPCs used by this release; `20260810130000_deal_os_exports.sql` adds the server-only normalized Deal OS import history; and `20260812130000_cim_canonical_identity_safety.sql` adds immutable canonical opportunities, auditable aliases/exceptions, recipient and opportunity claims, the central pause, repair manifests, linkage columns, and service-role-only repair RPCs. SQLite applies the equivalent additive migration automatically at startup; take and verify a backup before starting the upgraded process against production data.
 
 Optional external scheduler endpoint:
 
@@ -128,6 +128,19 @@ Automatic follow-ups are controlled by:
 - `DEAL_HUNTER_CIM_FOLLOW_UP_MAX_COUNT=3`
 - `DEAL_HUNTER_CIM_FOLLOW_UP_WEEKDAYS_ONLY=true`
 - `DEAL_HUNTER_CIM_FOLLOW_UP_TIMEZONE=America/Los_Angeles`
+- `DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_START=08:00`
+- `DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_END=17:00`
+
+All CIM initial and follow-up paths also share the server-authoritative safety controls below. The values in `.env.example` are conservative examples; a release owner must select production values before they are added to `fly.toml` or production secrets.
+
+- `DEAL_HUNTER_CIM_OUTREACH_PAUSED=false` is the central kill switch. It is separate from the staged-automation pause and covers manual, bulk, automatic, scheduled, and admin-triggered outreach.
+- `DEAL_HUNTER_CIM_RECIPIENT_24_HOUR_CAP=1` caps accepted logical touches in a rolling day.
+- `DEAL_HUNTER_CIM_RECIPIENT_30_DAY_TOUCH_CAP=4` caps accepted logical initials plus follow-ups in thirty days.
+- `DEAL_HUNTER_CIM_RECIPIENT_OVERRIDE_MAX_HOURS=24` bounds a full administrator’s confirmed, reasoned, single-initial override. An override is scoped to one opportunity/recipient and is consumed once; it never pre-authorizes later follow-ups.
+
+`next_follow_up_at` is the earliest eligible time. The scheduler still applies the central pause, weekday and local-time window, canonical sequence ownership, exact reply state, archive/suppression state, recipient caps, and claims immediately before provider work.
+
+Canonical identity resolution is deterministic. Exact aliases and provider listing IDs win first. A fingerprint-to-URL transition links only when normalized name, recipient, source history, geography, and at least two financial fields agree without material conflicts. Different provider listing IDs or conflicting geography/economics stay distinct. Weak same-title/same-broker evidence becomes an admin identity exception and blocks outreach. See [the incident and repair runbook](cim-identity-incident-2026-08-12.md).
 
 Initial CIM outreach uses a gated three-stage automation policy. Stage 1 is the production-safe default and requires administrator approval for every initial request. Stage 2 activates trusted-rule sends only after the configured minimum review history; Stage 3 additionally requires the configured review count and approval-rate threshold. Every higher-stage send creates and re-verifies a server-signed snapshot of the exact reviewed deal before persistence or transmission, and records the verified snapshot digest and automation stage on the durable request. Both higher stages retain daily and broker contact caps, source-health checks, suppression events, duplicate detection, and the Operations emergency pause.
 

@@ -346,3 +346,30 @@ test('configuration rejects unsafe origins, ports, retention, and resource limit
   assert.ok(result.errors.some((error) => error.includes('DEAL_HUNTER_LOOKBACK_DAYS')));
   assert.ok(result.errors.some((error) => error.includes('DEAL_HUNTER_MAX_SOURCE_RECORDS')));
 });
+
+test('CIM recipient caps and follow-up send windows fail closed when invalid', () => {
+  const config = productionConfig();
+  config.dealHunter.cimOutreach = {
+    recipientCap24Hours: 0,
+    recipientCap30Days: Number.NaN,
+    overrideMaxHours: 500,
+  };
+  config.dealHunter.cimFollowUp.sendWindowStart = '8:00';
+  config.dealHunter.cimFollowUp.sendWindowEnd = '08:00';
+  const invalid = validateConfig(config);
+  assert.equal(invalid.ok, false);
+  for (const setting of [
+    'DEAL_HUNTER_CIM_RECIPIENT_24_HOUR_CAP',
+    'DEAL_HUNTER_CIM_RECIPIENT_30_DAY_TOUCH_CAP',
+    'DEAL_HUNTER_CIM_RECIPIENT_OVERRIDE_MAX_HOURS',
+    'DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_START',
+  ]) {
+    assert.ok(invalid.errors.some((error) => error.includes(setting)), `${setting} should fail closed`);
+  }
+
+  Object.assign(config.dealHunter.cimOutreach, { recipientCap24Hours: 2, recipientCap30Days: 1, overrideMaxHours: 24 });
+  Object.assign(config.dealHunter.cimFollowUp, { sendWindowStart: '17:00', sendWindowEnd: '08:00' });
+  const reversed = validateConfig(config);
+  assert.ok(reversed.errors.some((error) => error.includes('30_DAY_TOUCH_CAP')));
+  assert.ok(reversed.errors.some((error) => error.includes('SEND_WINDOW_START must be earlier')));
+});

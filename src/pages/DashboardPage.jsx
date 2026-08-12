@@ -1298,6 +1298,7 @@ export default function DashboardPage() {
   const [operationsLoading, setOperationsLoading] = useState(false);
   const [operationsError, setOperationsError] = useState('');
   const [cimAutomationUpdating, setCimAutomationUpdating] = useState(false);
+  const [cimOutreachUpdating, setCimOutreachUpdating] = useState(false);
   const dashboardRequestRef = useRef({ controller: null, id: 0 });
   const followUpRequestRef = useRef({ controller: null, id: 0 });
   const crmCommunicationsRequestRef = useRef({ controller: null, id: 0 });
@@ -1818,6 +1819,27 @@ export default function DashboardPage() {
       setOperationsError(error.message || 'Unable to update CIM automation.');
     } finally {
       setCimAutomationUpdating(false);
+    }
+  }
+
+  async function handleToggleCimOutreach(paused) {
+    if (!window.confirm(paused
+      ? 'Pause every Deal Hunter CIM initial and follow-up email? Inbound tracking will remain active.'
+      : 'Resume Deal Hunter CIM outreach after confirming migrations, audit, caps, and send-window readiness?')) return;
+    setCimOutreachUpdating(true);
+    setOperationsError('');
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-outreach/pause', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paused, reason: paused ? 'Paused from Operations.' : 'Resumed from Operations after readiness review.' }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to update the CIM outreach safety control.');
+      await loadOperations();
+    } catch (error) {
+      setOperationsError(error.message || 'Unable to update the CIM outreach safety control.');
+    } finally {
+      setCimOutreachUpdating(false);
     }
   }
 
@@ -2645,6 +2667,30 @@ export default function DashboardPage() {
     }
   }
 
+  async function handleResolveCimIdentityException(identityException, { action, opportunityId }) {
+    if (isReadOnly) return;
+    const reason = window.prompt('Explain why this listing should be linked or kept distinct. This reason is retained in the identity audit history.');
+    if (!reason || reason.trim().length < 10) {
+      setDealHunterFeedback({ error: 'Identity resolution requires a specific reason of at least 10 characters.', message: '' });
+      return;
+    }
+    if (!window.confirm(`Confirm ${action === 'link' ? 'canonical identity link' : 'distinct opportunity'} for ${identityException.observedName || 'this listing'}?`)) return;
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/identity-exceptions/${encodeURIComponent(identityException.id)}/resolve`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, opportunityId, reason: reason.trim(), confirmed: true }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to resolve the identity exception.');
+      setDealHunterFeedback({ error: '', message: 'Identity exception resolved and audited.' });
+      await handleLoadDealHunterReview();
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to resolve the identity exception.', message: '' });
+    }
+  }
+
   async function handleImportDealOsExport({ file, scope, coverageLabel, exportedAt, expectedRowCount }) {
     if (isReadOnly) {
       setDealHunterFeedback({ error: 'Read-only users cannot import Deal OS exports.', message: '' });
@@ -3368,11 +3414,13 @@ export default function DashboardPage() {
         </div>
         <OperationsCenter
           cimAutomationUpdating={cimAutomationUpdating}
+          cimOutreachUpdating={cimOutreachUpdating}
           data={operations}
           emailTestSending={emailTestSending}
           error={operationsError}
           loading={operationsLoading}
           onToggleCimAutomation={handleToggleCimAutomation}
+          onToggleCimOutreach={handleToggleCimOutreach}
           onSendEmailTest={handleSendEmailTest}
         />
       </section>
@@ -3570,6 +3618,7 @@ export default function DashboardPage() {
             onDismissDeal={handleDismissDealHunterOpportunity}
             onImportDealOs={handleImportDealOsExport}
             onReview={handleLoadDealHunterReview}
+            onResolveIdentityException={handleResolveCimIdentityException}
             onRecordCimOutcome={handleRecordCimOutcome}
             onOpenApprovals={() => {
               navigate('/admin/deal-hunter?view=cim-approvals');

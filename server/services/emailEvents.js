@@ -380,6 +380,20 @@ export async function recordEmailEvent(input, { storage = getStorage() } = {}) {
   const provider = normalizeText(input.provider, 60) || 'unknown';
   const createdAt = normalizeEventDate(input.created_at || input.createdAt);
   const providerEventId = normalizeText(input.provider_event_id || input.providerEventId || input.metadata?.providerEventId, 240);
+  const communicationId = normalizeText(
+    input.communication_id || input.communicationId || input.metadata?.tracking?.communicationId,
+    120,
+  ) || null;
+  const linkedCommunication = communicationId && storage.getCrmCommunication
+    ? await storage.getCrmCommunication(communicationId)
+    : null;
+  const linkedRequest = !linkedCommunication?.opportunity_id && submissionId && storage.getLatestDealHunterCimRequestForSubmission
+    ? await storage.getLatestDealHunterCimRequestForSubmission(submissionId)
+    : null;
+  const opportunityId = normalizeText(
+    input.opportunity_id || input.opportunityId || linkedCommunication?.opportunity_id || linkedRequest?.opportunity_id,
+    160,
+  ) || null;
   const event = {
     id: input.id || randomUUID(),
     created_at: createdAt,
@@ -390,10 +404,8 @@ export async function recordEmailEvent(input, { storage = getStorage() } = {}) {
     recipient_email: recipientEmail || null,
     subject: normalizeText(input.subject, 300) || null,
     submission_id: submissionId,
-    communication_id: normalizeText(
-      input.communication_id || input.communicationId || input.metadata?.tracking?.communicationId,
-      120,
-    ) || null,
+    communication_id: communicationId,
+    opportunity_id: opportunityId,
     source: normalizeText(input.source, 100) || 'manual',
     metadata: boundedEmailEventMetadata(input.metadata),
   };
@@ -409,6 +421,7 @@ export async function recordEmailEvent(input, { storage = getStorage() } = {}) {
       payload: { event },
       activity: {
         submissionId: event.submission_id,
+        opportunityId: event.opportunity_id,
         eventType: `email.${event.event_type}`,
         summary: `Email ${event.event_type}${event.subject ? `: ${event.subject}` : '.'}`,
         actor: event.recipient_email || event.provider,
@@ -429,6 +442,51 @@ export async function recordEmailEvent(input, { storage = getStorage() } = {}) {
   }
 
   return storedEvent;
+}
+
+async function stopCanonicalCimSequencesForReply(event, storage) {
+  if (event?.event_type !== 'replied' || !event.opportunity_id || !storage.listDealHunterCimRequests) return;
+  const requests = await storage.listDealHunterCimRequests({ opportunityIds: [event.opportunity_id], limit: 500 });
+  for (const request of requests) {
+    if (request.metadata?.canonicalReplyEventId === event.id) continue;
+    const active = Boolean(request.next_follow_up_at)
+      || !['stopped', 'completed'].includes(request.follow_up_state)
+      || request.request_state !== 'responded';
+    if (!active) continue;
+    const updated = {
+      ...request,
+      request_state: 'responded',
+      follow_up_state: 'stopped',
+      next_follow_up_at: null,
+      responded_at: request.responded_at || event.created_at,
+      updated_at: event.created_at,
+      last_activity_at: event.created_at,
+      metadata: {
+        ...(request.metadata || {}),
+        canonicalReplyEventId: event.id,
+        canonicalReplyOpportunityId: event.opportunity_id,
+      },
+    };
+    if (request.submission_id && storage.mutateWithCrmActivity) {
+      await commitCrmActivityMutation({
+        storage,
+        operation: 'upsert_deal_hunter_cim_request',
+        payload: { request: updated },
+        activity: {
+          submissionId: request.submission_id,
+          opportunityId: event.opportunity_id,
+          eventType: 'cim.canonical-reply-stopped',
+          summary: 'Inbound reply stopped every automated CIM sequence for the canonical opportunity.',
+          actor: event.recipient_email || 'broker-reply',
+          role: 'contact',
+          createdAt: event.created_at,
+          metadata: { emailEventId: event.id, opportunityId: event.opportunity_id, cimRequestId: request.id },
+        },
+      });
+    } else {
+      await storage.upsertDealHunterCimRequest(updated);
+    }
+  }
 }
 
 export async function recordEmailEventsFromWebhook(request, { storage = getStorage(), fetcher } = {}) {
@@ -466,6 +524,7 @@ export async function recordEmailEventsFromWebhook(request, { storage = getStora
 
     try {
       await applyEmailLifecycleToCommunication(event, { storage });
+      await stopCanonicalCimSequencesForReply(event, storage);
     } catch {
       return {
         ok: false,

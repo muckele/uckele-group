@@ -204,6 +204,14 @@ export function getConfig() {
         delaySequenceHours: numberListFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_DELAYS_HOURS, [48, 72, 96]).slice(0, 10),
         weekdaysOnly: booleanFromEnv(process.env.DEAL_HUNTER_CIM_FOLLOW_UP_WEEKDAYS_ONLY, true),
         timezone: process.env.DEAL_HUNTER_CIM_FOLLOW_UP_TIMEZONE || 'America/Los_Angeles',
+        sendWindowStart: process.env.DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_START || '08:00',
+        sendWindowEnd: process.env.DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_END || '17:00',
+      },
+      cimOutreach: {
+        paused: booleanFromEnv(process.env.DEAL_HUNTER_CIM_OUTREACH_PAUSED, false),
+        recipientCap24Hours: explicitNumberFromEnv(process.env.DEAL_HUNTER_CIM_RECIPIENT_24_HOUR_CAP, 1),
+        recipientCap30Days: explicitNumberFromEnv(process.env.DEAL_HUNTER_CIM_RECIPIENT_30_DAY_TOUCH_CAP, 4),
+        overrideMaxHours: explicitNumberFromEnv(process.env.DEAL_HUNTER_CIM_RECIPIENT_OVERRIDE_MAX_HOURS, 24),
       },
       cimAutomation: {
         stage: Math.max(1, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_STAGE, 1), 3)),
@@ -394,6 +402,27 @@ export function validateConfig(config = getConfig()) {
   requirePositiveNumber(config.dealHunter.cimFollowUp?.firstDelayHours, 'DEAL_HUNTER_CIM_FOLLOW_UP_FIRST_DELAY_HOURS');
   requirePositiveNumber(config.dealHunter.cimFollowUp?.intervalHours, 'DEAL_HUNTER_CIM_FOLLOW_UP_INTERVAL_HOURS');
   requireNonNegativeNumber(config.dealHunter.cimFollowUp?.maxCount, 'DEAL_HUNTER_CIM_FOLLOW_UP_MAX_COUNT', { integer: true, max: 10 });
+  requirePositiveNumber(config.dealHunter.cimOutreach?.recipientCap24Hours, 'DEAL_HUNTER_CIM_RECIPIENT_24_HOUR_CAP', { integer: true, max: 100 });
+  requirePositiveNumber(config.dealHunter.cimOutreach?.recipientCap30Days, 'DEAL_HUNTER_CIM_RECIPIENT_30_DAY_TOUCH_CAP', { integer: true, max: 500 });
+  requirePositiveNumber(config.dealHunter.cimOutreach?.overrideMaxHours, 'DEAL_HUNTER_CIM_RECIPIENT_OVERRIDE_MAX_HOURS', { integer: true, max: 168 });
+  if (Number(config.dealHunter.cimOutreach?.recipientCap30Days) < Number(config.dealHunter.cimOutreach?.recipientCap24Hours)) {
+    errors.push('DEAL_HUNTER_CIM_RECIPIENT_30_DAY_TOUCH_CAP must be greater than or equal to DEAL_HUNTER_CIM_RECIPIENT_24_HOUR_CAP.');
+  }
+  const cimWindowTimes = [
+    [config.dealHunter.cimFollowUp?.sendWindowStart ?? '08:00', 'DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_START'],
+    [config.dealHunter.cimFollowUp?.sendWindowEnd ?? '17:00', 'DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_END'],
+  ];
+  const cimWindowMinutes = cimWindowTimes.map(([value, name]) => {
+    const match = String(value || '').match(/^(\d{2}):(\d{2})$/);
+    if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) {
+      errors.push(`${name} must use a valid zero-padded 24-hour HH:MM value.`);
+      return null;
+    }
+    return Number(match[1]) * 60 + Number(match[2]);
+  });
+  if (cimWindowMinutes.every((value) => value !== null) && cimWindowMinutes[0] >= cimWindowMinutes[1]) {
+    errors.push('DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_START must be earlier than DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_END.');
+  }
   requirePositiveNumber(config.dealHunter.lookbackDays, 'DEAL_HUNTER_LOOKBACK_DAYS');
   requirePositiveNumber(config.dealHunter.maxSourceRecords, 'DEAL_HUNTER_MAX_SOURCE_RECORDS', { integer: true });
   requirePositiveNumber(config.dealHunter.sheetCsvMaxPayloadBytes, 'DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES', { integer: true });

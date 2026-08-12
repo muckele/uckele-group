@@ -81,6 +81,7 @@ export default function DealActivityTimeline({ events = [], loading = false, err
     const selected = filters.find((filter) => filter.id === activeFilter) || filters[0];
     return events.filter((event) => selected.matches(String(event.event_type || '')));
   }, [activeFilter, events]);
+  const visibleRawCount = visibleEvents.reduce((count, event) => count + Math.max(1, Number(event.metadata?.rawEventCount || 1)), 0);
 
   return (
     <section aria-labelledby="deal-activity-heading" className="mt-6 rounded-2xl border border-line/80 bg-white/75 p-4 sm:p-6">
@@ -108,6 +109,9 @@ export default function DealActivityTimeline({ events = [], loading = false, err
       {!loading && !error && visibleEvents.length === 0 ? (
         <p className="mt-5 rounded-2xl border border-line/80 bg-fog/60 px-4 py-4 text-sm text-ink/64">No events match this timeline filter.</p>
       ) : null}
+      {!loading && !error && activeFilter === 'email' && visibleEvents.length > 0 ? (
+        <p className="mt-4 text-sm text-ink/64">{visibleEvents.length} logical email{visibleEvents.length === 1 ? '' : 's'} · {visibleRawCount} retained lifecycle event{visibleRawCount === 1 ? '' : 's'}</p>
+      ) : null}
 
       {visibleEvents.length > 0 ? (
         <ol className="mt-6 space-y-4">
@@ -125,6 +129,21 @@ export default function DealActivityTimeline({ events = [], loading = false, err
                 <time className="shrink-0 text-xs text-ink/55" dateTime={event.created_at}>{formatTimestamp(event.created_at)}</time>
               </div>
               <p className="mt-2 text-xs text-ink/60">{event.actor || 'system'} · {event.role || 'system'}</p>
+              {event.metadata?.logicalMessage ? (
+                <>
+                  <p className="mt-2 text-xs text-ink/60">First lifecycle event {formatTimestamp(event.metadata.firstLifecycleAt)} · latest lifecycle {formatTimestamp(event.metadata.latestLifecycleAt)}</p>
+                  <details className="mt-3 rounded-xl border border-line/80 bg-fog/60 p-3">
+                    <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.12em] text-moss/80">Provider and audit events ({event.metadata.rawEventCount})</summary>
+                    <ol className="mt-3 space-y-2">
+                      {(event.metadata.auditEvents || []).map((auditEvent) => (
+                        <li className="text-xs leading-5 text-ink/65" key={auditEvent.id}>
+                          <span className="font-semibold text-ink/75">{eventLabel(auditEvent.eventType)}</span> · {formatTimestamp(auditEvent.createdAt)} · {auditEvent.provider || auditEvent.role || 'system'}
+                        </li>
+                      ))}
+                    </ol>
+                  </details>
+                </>
+              ) : null}
               {changes.length > 0 ? (
                 <div className="mt-3 rounded-xl border border-line/80 bg-fog/60 p-3">
                   <p className="text-xs font-semibold uppercase tracking-[0.12em] text-moss/80">Changed fields</p>

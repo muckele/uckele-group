@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
+import { logicalCimTouchesForRecipient } from './cimOpportunityIdentity.js';
 
 const passReasons = new Set([
   'industry', 'geography', 'valuation', 'profit', 'owner-dependence', 'duplicate',
@@ -156,6 +157,7 @@ export async function getCimAutomationStatus({ storage = getStorage(), config = 
     stage2Ready,
     stage3Ready,
     policy,
+    recipientPolicy: config.dealHunter.cimOutreach,
     metrics,
   };
 }
@@ -201,6 +203,9 @@ export function evaluateCimAutomationCandidates({ review = {}, scoredDeals = [],
     const location = String(deal.location || '').toUpperCase();
     const normalizedName = String(deal.name || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
     const brokerRequests = requests.filter((request) => normalizeEmail(request.recipient_email) === email);
+    const brokerTouches = logicalCimTouchesForRecipient(brokerRequests, email);
+    const touches30Days = brokerTouches.filter((touch) => Date.now() - Date.parse(touch.occurredAt || '') < 30 * 86400000).length;
+    const recipientCap30Days = Number(status.recipientPolicy?.recipientCap30Days || policy.maximumBrokerContacts30Days || 3);
     const brokerMessageIds = new Set(brokerRequests.flatMap((request) => [...providerIds(request)]));
     const suppressed = events.some((event) => brokerMessageIds.has(event.message_id) && suppressionTypes.has(event.event_type));
     const reasons = [];
@@ -218,7 +223,7 @@ export function evaluateCimAutomationCandidates({ review = {}, scoredDeals = [],
     if (latestDecision.get(deal.dealKey)?.decision === 'rejected') reasons.push('Manual pass recorded');
     if (brokerRequests.some((request) => request.deal_key === deal.dealKey)) reasons.push('Opportunity previously contacted');
     if (trustedRulesStage && brokerRequests.length > 0) reasons.push('Broker or recipient has prior outreach');
-    if (brokerRequests.filter((request) => Date.now() - Date.parse(request.created_at || '') < 30 * 86400000).length >= Number(policy.maximumBrokerContacts30Days || 3)) reasons.push('Broker contact cap reached');
+    if (touches30Days >= recipientCap30Days) reasons.push('Broker recipient logical-touch cap reached');
     if (suppressed) reasons.push('Broker address suppressed');
 
     if (reasons.length === 0) eligible.push(deal);

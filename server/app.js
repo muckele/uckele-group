@@ -59,7 +59,7 @@ import {
 } from './services/submissions.js';
 import { asyncRoute } from './utils/http.js';
 import { safeCompareText } from './utils/security.js';
-import { listCrmActivity } from './services/activity.js';
+import { listCrmActivity, projectCrmActivityTimeline } from './services/activity.js';
 import { getOperationsCenter } from './services/operations.js';
 import {
   assignUnassignedCommunication,
@@ -93,6 +93,11 @@ import {
   liftAdminEmailSuppression,
 } from './services/followUpWorkspace.js';
 import { registerAdminOnboardingRoutes } from './routes/adminOnboarding.js';
+import {
+  createCimRecipientOverride,
+  resolveCimIdentityException,
+  setCimOutreachPaused,
+} from './services/cimOpportunityIdentity.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.resolve(__dirname, '../dist');
@@ -1026,8 +1031,8 @@ export function createApp() {
         limit: Number(request.query.limit) || 200,
         before: String(request.query.before || ''),
       });
-
-      response.json({ success: true, events });
+      const timeline = projectCrmActivityTimeline(events);
+      response.json({ success: true, events: timeline.events, rawEvents: events, counts: timeline.counts });
     }),
   );
 
@@ -1339,6 +1344,83 @@ export function createApp() {
       }
       await setCimAutomationPaused({ paused: request.body.paused, actor: session.username || 'admin' });
       response.json({ success: true, automation: await getCimAutomationStatus() });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-outreach/pause',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      if (typeof request.body?.paused !== 'boolean') {
+        response.status(400).json({ success: false, error: 'A boolean paused value is required.' });
+        return;
+      }
+      const settings = await setCimOutreachPaused({
+        paused: request.body.paused,
+        actor: session.username || 'admin',
+        reason: request.body?.reason || '',
+      });
+      response.json({ success: true, settings });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/identity-exceptions',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+      const storage = getStorage();
+      const exceptions = await storage.listDealHunterIdentityExceptions?.({
+        statuses: String(request.query.status || 'open') === 'all' ? [] : [String(request.query.status || 'open')],
+        limit: Number(request.query.limit) || 100,
+      }) || [];
+      response.json({ success: true, exceptions });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/identity-exceptions/:id/resolve',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await resolveCimIdentityException({
+        exceptionId: request.params.id,
+        opportunityId: request.body?.opportunityId || '',
+        action: request.body?.action || 'link',
+        confirmed: request.body?.confirmed === true,
+        reason: request.body?.reason || '',
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-recipient-overrides',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await createCimRecipientOverride({
+        opportunityId: request.body?.opportunityId || '',
+        recipientEmail: request.body?.recipientEmail || '',
+        confirmed: request.body?.confirmed === true,
+        reason: request.body?.reason || '',
+        expiresInHours: request.body?.expiresInHours ?? 1,
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 201 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );
 
