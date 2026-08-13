@@ -2,6 +2,8 @@
 
 This runbook deploys the Stage 2 safety architecture without authorizing automatic broker email. Code deployment and canary activation are separate release decisions. A successful deploy must continue to report effective Stage 1 and automatic transmission blocked unless a later, explicit release-owner acceptance satisfies every gate.
 
+Use [the Stage 2 human-review and pre-canary playbook](./cim-stage2-human-review-playbook.md) for the protected deterministic evidence queue, authentic-review thresholds, attributable compliance/sender checklist, and count-only pre-canary handoff.
+
 ## Inert deployment baseline
 
 The checked-in Fly configuration deliberately keeps:

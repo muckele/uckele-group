@@ -4880,6 +4880,21 @@ export function createSqliteStorage(config) {
           }));
       },
 
+      async getCimStage2ReviewEvidence({ opportunityId = '', snapshotDigest = '', evidenceVersion = '', ruleVersion = '', sourcePolicyHash = '' } = {}) {
+        return database.prepare(`
+          SELECT id, created_at, decision_at, opportunity_id, snapshot_digest, evidence_version,
+            rule_version, source_policy_hash, decision
+          FROM deal_hunter_cim_reviews
+          WHERE opportunity_id = ? AND snapshot_digest = ? AND evidence_version = ?
+            AND rule_version = ? AND source_policy_hash = ?
+            AND decision IN ('approved', 'rejected')
+            AND json_extract(metadata, '$.source') = 'stage2-review-queue'
+            AND json_extract(metadata, '$.immutableEvidenceComplete') = 1
+          ORDER BY decision_at DESC, created_at DESC, id DESC
+          LIMIT 1
+        `).get(opportunityId, snapshotDigest, evidenceVersion, ruleVersion, sourcePolicyHash) || null;
+      },
+
       async listCimStage2MetricReviews({ limit = 5000 } = {}) {
         const safeLimit = Math.max(1, Math.min(Number(limit) || 5000, 100000));
         return database.prepare(`
@@ -4889,6 +4904,9 @@ export function createSqliteStorage(config) {
             source_policy_hash, source_ids, decision_at,
             json_extract(metadata, '$.source') AS review_source,
             json_extract(metadata, '$.stage2CohortEligible') AS cohort_eligible,
+            json_extract(metadata, '$.queueVersion') AS queue_version,
+            json_extract(metadata, '$.reviewChecklistVersion') AS review_checklist_version,
+            json_extract(metadata, '$.immutableEvidenceComplete') AS immutable_evidence_complete,
             json_extract(metadata, '$.outcome') AS response_outcome
           FROM deal_hunter_cim_reviews
           ORDER BY created_at DESC, id DESC
@@ -4900,6 +4918,9 @@ export function createSqliteStorage(config) {
           metadata: {
             source: review.review_source || '',
             stage2CohortEligible: Boolean(review.cohort_eligible),
+            queueVersion: review.queue_version || '',
+            reviewChecklistVersion: review.review_checklist_version || '',
+            immutableEvidenceComplete: Boolean(review.immutable_evidence_complete),
             outcome: review.response_outcome || '',
           },
         }));

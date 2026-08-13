@@ -75,6 +75,70 @@ test('production-shaped SQLite review evidence migrates additively and restart i
   ]);
 });
 
+test('human evidence is append-only while aggregate metric reads exclude protected candidate and recipient detail', async (t) => {
+  const sqlitePath = await temporaryDatabase(t, 'uckele-cim-stage2-review-privacy-');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const review = {
+    id: '11111111-1111-4111-8111-111111111111',
+    created_at: '2026-08-12T18:00:00.000Z',
+    decision_at: '2026-08-12T18:00:00.000Z',
+    deal_key: 'private-deal-key',
+    opportunity_id: 'opportunity-1',
+    decision: 'approved',
+    pass_reason: '',
+    original_recipient_email: 'private-broker@example.test',
+    final_recipient_email: 'private-broker@example.test',
+    recipient_edited: false,
+    score: 95,
+    actor: 'human-admin@example.test',
+    actor_role: 'admin',
+    automation_stage: 1,
+    snapshot_digest: 'a'.repeat(64),
+    evidence_version: 'cim-stage2-human-evidence-v2',
+    rule_version: 'rules-v2',
+    source_policy_version: 'source-v1',
+    source_policy_hash: 'b'.repeat(64),
+    source_ids: ['sheet-0'],
+    metadata: {
+      source: 'stage2-review-queue',
+      stage2CohortEligible: true,
+      queueVersion: 'cim-stage2-deterministic-review-queue-v1',
+      reviewChecklistVersion: 'cim-stage2-human-review-checklist-v1',
+      immutableEvidenceComplete: true,
+      candidateSnapshot: {
+        name: 'Private Candidate Name',
+        brokerEmail: 'private-broker@example.test',
+        listingUrl: 'https://private.example.test/listing',
+      },
+      policySnapshot: { policyHash: 'c'.repeat(64) },
+      decisionNote: 'Private review note.',
+    },
+  };
+  await storage.insertDealHunterCimReviews([review]);
+  await assert.rejects(storage.insertDealHunterCimReviews([{ ...review, decision: 'rejected' }]), /unique|constraint/i);
+
+  const exactEvidence = await storage.getCimStage2ReviewEvidence({
+    opportunityId: 'opportunity-1',
+    snapshotDigest: 'a'.repeat(64),
+    evidenceVersion: 'cim-stage2-human-evidence-v2',
+    ruleVersion: 'rules-v2',
+    sourcePolicyHash: 'b'.repeat(64),
+  });
+  assert.equal(exactEvidence.id, review.id);
+  assert.equal(JSON.stringify(exactEvidence).includes('private-broker@example.test'), false);
+
+  const protectedRows = await storage.listDealHunterCimReviews({ limit: 10 });
+  assert.equal(protectedRows[0].metadata.candidateSnapshot.brokerEmail, 'private-broker@example.test');
+  const metricRows = await storage.listCimStage2MetricReviews({ limit: 10 });
+  const serializedMetrics = JSON.stringify(metricRows);
+  for (const forbidden of ['private-broker@example.test', 'Private Candidate Name', 'private.example.test', 'Private review note']) {
+    assert.equal(serializedMetrics.includes(forbidden), false, forbidden);
+  }
+  assert.equal(metricRows[0].metadata.source, 'stage2-review-queue');
+  assert.equal(metricRows[0].metadata.stage2CohortEligible, true);
+});
+
 test('SQLite Stage 2 run and decision claims are durable, exclusive, and capacity-conservative', async (t) => {
   const sqlitePath = await temporaryDatabase(t, 'uckele-cim-stage2-claims-');
   const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });

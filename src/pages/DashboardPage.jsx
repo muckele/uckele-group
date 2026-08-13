@@ -3469,6 +3469,7 @@ export default function DashboardPage() {
           loading={operationsLoading}
           onActivateCimStage2={handleActivateCimStage2}
           onRunCimStage2={handleRunCimStage2}
+          onStage2EvidenceRecorded={loadOperations}
           onToggleCimAutomation={handleToggleCimAutomation}
           onToggleCimOutreach={handleToggleCimOutreach}
           onSendEmailTest={handleSendEmailTest}

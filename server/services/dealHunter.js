@@ -19,15 +19,21 @@ import {
   createCommunicationWithActivity,
 } from './communications.js';
 import {
+  CIM_STAGE2_EVIDENCE_VERSION,
+  CIM_STAGE2_REVIEW_QUEUE_VERSION,
+  assessCimStage2SourceReview,
   assessCimStage2StaticCandidate,
   authorizeCimStage2SendBoundary,
+  buildCimStage2HumanReviewQueue,
   buildCimStage2DecisionRecord,
+  cimStage2Digest,
   cimStage2SnapshotDigest,
   evaluateCimAutomationCandidates,
   evaluateCimStage2Window,
   getCimStage2Policy,
   getCimAutomationStatus,
   hashCimStage2Recipient,
+  recordCimReviewDecisions,
   reconcileCimStage2AmbiguousDecisions,
   sourceSnapshotDigestForDeal,
 } from './cimAutomation.js';
@@ -70,6 +76,10 @@ const cimProviderAcceptedCommunicationStates = new Set([
 const cimDeliveryIssueStates = new Set(['bounced', 'failed', 'complained', 'suppressed']);
 const archivedCimUnavailableReason = 'This CRM record is archived. Restore and review it before sending CIM outreach.';
 const cimBulkRequestMax = 25;
+const cimStage2ReviewPassReasons = new Set([
+  'industry', 'geography', 'valuation', 'profit', 'owner-dependence', 'duplicate',
+  'recipient', 'financing', 'quality', 'timing', 'other',
+]);
 const cimClaimStaleMinutes = 30;
 const cimSnapshotTtlMs = 1000 * 60 * 60 * 2;
 const cimRequestSendLocks = new Set();
@@ -3161,9 +3171,8 @@ function normalizeCimDealSnapshot(snapshot = null) {
   };
 }
 
-function getCimSnapshotSecret() {
-  const config = getConfig();
-  return config.admin.sessionSecret || config.secureDocuments.tokenSecret;
+function getCimSnapshotSecret(config = getConfig()) {
+  return config.admin?.sessionSecret || config.secureDocuments?.tokenSecret || '';
 }
 
 function signCimDealSnapshot(deal = null) {
@@ -5766,14 +5775,14 @@ function buildDealHunterCoverage(config, sourceResults = []) {
   };
 }
 
-async function buildDailyDealReview({ storage = getStorage() } = {}) {
+async function buildDailyDealReview({ storage = getStorage(), includeAllSourceDeals = false } = {}) {
   const config = getConfig();
   const generatedAt = new Date().toISOString();
   const sourceResults = await collectSources(config, storage);
   const coverage = buildDealHunterCoverage(config, sourceResults);
   const allDeals = dedupeDeals(sourceResults.flatMap((result) => result.deals));
   const recentDeals = allDeals.filter((deal) => isRecentDeal(deal, config.dealHunter.lookbackDays));
-  const candidateDeals = recentDeals.length > 0 ? recentDeals : allDeals;
+  const candidateDeals = includeAllSourceDeals ? allDeals : recentDeals.length > 0 ? recentDeals : allDeals;
   const scoredDealsWithIdentity = await attachCanonicalOpportunityIdentities(storage, candidateDeals.map(scoreDeal));
   const seenDeals = await loadDealHunterHistory(storage);
   const scoredDealsWithHistory = attachHistory(scoredDealsWithIdentity, seenDeals, generatedAt);
@@ -5896,6 +5905,310 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
   };
 
   return { review, scoredDeals, storage };
+}
+
+function publicCimStage2ReviewCandidate(candidate = {}, reviewToken = '') {
+  const deal = normalizeCimDealSnapshot(candidate.deal);
+  if (!deal) return null;
+  return {
+    opportunityId: candidate.opportunityId,
+    dealKey: deal.dealKey,
+    name: deal.name,
+    listingUrl: deal.listingUrl,
+    sourceId: deal.sourceId,
+    sourceName: deal.sourceName,
+    sourceRecords: deal.sourceRecords,
+    score: deal.score,
+    industry: deal.industry,
+    location: deal.location,
+    annualProfit: deal.annualProfit,
+    annualRevenue: deal.annualRevenue,
+    askingPrice: deal.askingPrice,
+    profitMultiple: deal.profitMultiple,
+    brokerName: deal.brokerName,
+    brokerEmail: deal.brokerEmail,
+    brokerContacts: deal.brokerContacts,
+    identityStatus: deal.identityStatus,
+    snapshotDigest: candidate.snapshotDigest,
+    queueRank: candidate.queueRank,
+    currentPolicyReviewed: candidate.currentPolicyReviewed,
+    exactSnapshotReviewed: candidate.exactSnapshotReviewed,
+    latestDecisionAt: candidate.latestDecisionAt,
+    reviewToken,
+  };
+}
+
+function cimStage2HumanReviewEvidenceId(candidate = {}, policySnapshot = {}) {
+  const digest = cimStage2Digest({
+    evidenceVersion: policySnapshot.evidenceVersion,
+    ruleVersion: policySnapshot.ruleVersion,
+    sourcePolicyHash: policySnapshot.sourcePolicyHash,
+    opportunityId: candidate.opportunityId,
+    snapshotDigest: candidate.snapshotDigest,
+  });
+  const variant = ((Number.parseInt(digest[16], 16) & 0x3) | 0x8).toString(16);
+  return `${digest.slice(0, 8)}-${digest.slice(8, 12)}-5${digest.slice(13, 16)}-${variant}${digest.slice(17, 20)}-${digest.slice(20, 32)}`;
+}
+
+export async function getCimStage2HumanReviewQueue({
+  page = 1, pageSize = 10, expectedQueueDigest = '', storage = getStorage(), config = getConfig(), now = new Date(),
+} = {}) {
+  const result = await buildDailyDealReview({ storage, includeAllSourceDeals: true });
+  const status = await getCimAutomationStatus({ storage, config, now });
+  const queue = buildCimStage2HumanReviewQueue({
+    review: result.review,
+    scoredDeals: result.scoredDeals,
+    status,
+    page,
+    pageSize,
+    now,
+  });
+  const secret = getCimSnapshotSecret(config);
+  const candidates = queue.candidates.map((candidate) => {
+    const candidateSnapshot = normalizeCimDealSnapshot(candidate.deal);
+    if (!candidateSnapshot || !secret) return null;
+    // The protected record ID is stable for an exact canonical snapshot and
+    // policy binding. Separate queue refreshes therefore converge on the same
+    // primary key if they race, while changed snapshots or policies append a
+    // distinct immutable record.
+    const evidenceId = cimStage2HumanReviewEvidenceId(candidate, queue.policySnapshot);
+    const reviewToken = signPayload({
+      typ: 'cim-stage2-human-review',
+      version: 1,
+      exp: now.getTime() + cimSnapshotTtlMs,
+      evidenceId,
+      queueVersion: queue.version,
+      queueDigest: queue.queueDigest,
+      queueRank: candidate.queueRank,
+      candidateSnapshot,
+      candidateSnapshotDigest: candidate.snapshotDigest,
+      policySnapshot: queue.policySnapshot,
+      sourceReviewSnapshot: queue.sourceReviewSnapshot,
+      stage2CohortEligible: candidate.stage2CohortEligible,
+    }, secret);
+    return publicCimStage2ReviewCandidate(candidate, reviewToken);
+  }).filter(Boolean);
+  const metrics = status.metrics || {};
+  return {
+    version: queue.version,
+    generatedAt: queue.generatedAt,
+    sourceHealthy: queue.sourceHealthy,
+    sourceAssessment: queue.sourceAssessment,
+    queueDigest: queue.queueDigest,
+    queueChanged: Boolean(expectedQueueDigest && expectedQueueDigest !== queue.queueDigest),
+    page: queue.page,
+    pageSize: queue.pageSize,
+    total: queue.total,
+    totalPages: queue.totalPages,
+    hasMore: queue.hasMore,
+    counts: queue.counts,
+    progress: {
+      canonicalHumanReviews: Number(metrics.canonicalHumanReviews || 0),
+      canonicalHumanReviewsRequired: Number(status.policy?.stage2MinimumReviews || 25),
+      remainingCanonicalReviews: Number(metrics.remainingStage2Reviews || 0),
+      compatibleEvidence: Number(metrics.compatibleEvidence || 0),
+      eligibleCohortReviews: Number(metrics.stage2EligibleCohort || 0),
+      eligibleCohortRequired: Number(status.policy?.stage2MinimumEligibleCohort || 10),
+      unchangedRecipientApprovals: Number(metrics.stage2UnchangedApprovals || 0),
+      unchangedRecipientApprovalRate: Number(metrics.stage2UnchangedApprovalRate || 0),
+      unchangedRecipientApprovalRateRequired: Number(status.policy?.stage2MinimumUnchangedApprovalRate || 0.95) * 100,
+    },
+    policy: {
+      policyHash: queue.policySnapshot.policyHash,
+      ruleVersion: queue.policySnapshot.ruleVersion,
+      sourcePolicyHash: queue.policySnapshot.sourcePolicyHash,
+      evidenceVersion: queue.policySnapshot.evidenceVersion,
+      allowedSourceIds: queue.policySnapshot.sourcePolicy.allowedSourceIds,
+    },
+    candidates,
+  };
+}
+
+export function validateCimStage2HumanReviewDecision(input = {}, { config = getConfig(), now = new Date() } = {}) {
+  const payload = verifySignedPayload(String(input.reviewToken || input.review_token || ''), getCimSnapshotSecret(config));
+  if (payload?.typ !== 'cim-stage2-human-review' || payload.version !== 1 || payload.queueVersion !== CIM_STAGE2_REVIEW_QUEUE_VERSION) {
+    return { valid: false, status: 400, error: 'The protected Stage 2 review snapshot is invalid or expired. Reload the deterministic queue.' };
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(payload.evidenceId || ''))) {
+    return { valid: false, status: 400, error: 'The protected Stage 2 evidence identifier is invalid. Reload the deterministic queue.' };
+  }
+  if (input.reviewConfirmed !== true && input.review_confirmed !== true) {
+    return { valid: false, status: 400, error: 'Confirm the per-opportunity source, listing, canonical identity, and recipient review.' };
+  }
+  const policy = getCimStage2Policy(config);
+  const policySnapshot = payload.policySnapshot || {};
+  if (policySnapshot.policyHash !== policy.policyHash
+    || policySnapshot.ruleVersion !== policy.rules.version
+    || policySnapshot.sourcePolicyHash !== policy.sourcePolicyHash
+    || policySnapshot.evidenceVersion !== CIM_STAGE2_EVIDENCE_VERSION) {
+    return { valid: false, status: 409, error: 'The Stage 2 rule or source policy changed. Reload and review the candidate again.' };
+  }
+  const sourceReviewSnapshot = payload.sourceReviewSnapshot || {};
+  const sourceAssessment = assessCimStage2SourceReview({
+    generatedAt: sourceReviewSnapshot.generatedAt,
+    sources: (sourceReviewSnapshot.sources || []).map((source) => ({
+      id: source.id,
+      fetched: source.fetched,
+      rowCount: source.rowCount,
+      error: source.errorPresent ? 'recorded-source-error' : '',
+    })),
+    stage2CoverageWarnings: Number(sourceReviewSnapshot.warningCount || 0) > 0 ? ['recorded-coverage-warning'] : [],
+  }, policy, now);
+  if (!sourceAssessment.healthy) {
+    return { valid: false, status: 409, error: 'The signed Sheet-only source review is incomplete, stale, widened, or warning-bearing. Reload the queue.' };
+  }
+  const candidateSnapshot = normalizeCimDealSnapshot(payload.candidateSnapshot);
+  if (!candidateSnapshot
+    || candidateSnapshot.identityStatus !== 'resolved'
+    || !candidateSnapshot.opportunityId
+    || payload.candidateSnapshotDigest !== cimStage2SnapshotDigest(candidateSnapshot)) {
+    return { valid: false, status: 400, error: 'The protected canonical candidate snapshot is invalid. Reload the queue.' };
+  }
+  const expectedRank = cimStage2Digest({
+    version: CIM_STAGE2_REVIEW_QUEUE_VERSION,
+    ruleVersion: policy.rules.version,
+    sourcePolicyHash: policy.sourcePolicyHash,
+    opportunityId: candidateSnapshot.opportunityId,
+  });
+  if (payload.queueRank !== expectedRank || !/^[a-f0-9]{64}$/i.test(String(payload.queueDigest || ''))) {
+    return { valid: false, status: 400, error: 'The deterministic review-queue binding is invalid. Reload the queue.' };
+  }
+  const eligibility = assessCimStage2StaticCandidate(candidateSnapshot, { policy });
+  if (Boolean(payload.stage2CohortEligible) !== eligibility.eligible) {
+    return { valid: false, status: 409, error: 'The candidate no longer matches its signed cohort classification. Reload the queue.' };
+  }
+  const action = normalizeText(input.action, 40).toLowerCase();
+  if (!['approve', 'approve-edit', 'reject'].includes(action)) {
+    return { valid: false, status: 400, error: 'Choose approve unchanged, approve with a recipient edit, or reject.' };
+  }
+  const originalRecipientEmail = normalizeEmail(candidateSnapshot.brokerEmail);
+  const originalRecipientName = normalizeText(candidateSnapshot.brokerName, 160);
+  const requestedFinalEmail = normalizeEmail(input.finalRecipientEmail || input.final_recipient_email || originalRecipientEmail);
+  const requestedFinalName = normalizeText(input.finalRecipientName || input.final_recipient_name || originalRecipientName, 160);
+  const passReason = normalizeText(input.passReason || input.pass_reason, 80).toLowerCase();
+  const decisionNote = normalizeText(input.decisionNote || input.decision_note, 1000);
+  const recipientEditReason = normalizeText(input.recipientEditReason || input.recipient_edit_reason, 1000);
+  if (action === 'approve' && (!isValidEmail(originalRecipientEmail) || requestedFinalEmail !== originalRecipientEmail)) {
+    return { valid: false, status: 400, error: 'Approve unchanged must retain the valid source recipient exactly.' };
+  }
+  if (action === 'approve-edit' && (!isValidEmail(requestedFinalEmail)
+    || requestedFinalEmail === originalRecipientEmail
+    || recipientEditReason.length < 20)) {
+    return { valid: false, status: 400, error: 'A recipient edit requires a different valid final address and at least 20 characters of attributable edit evidence.' };
+  }
+  if (action === 'reject' && !cimStage2ReviewPassReasons.has(passReason)) {
+    return { valid: false, status: 400, error: 'A supported rejection reason is required.' };
+  }
+  if (action === 'reject' && passReason === 'other' && decisionNote.length < 10) {
+    return { valid: false, status: 400, error: 'An “other” rejection requires a short factual review note.' };
+  }
+  return {
+    valid: true,
+    status: 200,
+    decision: {
+      evidenceId: normalizeText(payload.evidenceId, 64),
+      dealKey: candidateSnapshot.dealKey,
+      opportunityId: candidateSnapshot.opportunityId,
+      dealName: candidateSnapshot.name,
+      score: candidateSnapshot.score,
+      decision: action === 'reject' ? 'rejected' : 'approved',
+      passReason: action === 'reject' ? passReason : '',
+      originalRecipientEmail,
+      originalRecipientName,
+      finalRecipientEmail: action === 'reject' ? originalRecipientEmail : requestedFinalEmail,
+      finalRecipientName: action === 'reject' ? originalRecipientName : requestedFinalName,
+      recipientEditReason: action === 'approve-edit' ? recipientEditReason : '',
+      decisionNote,
+      snapshotDigest: payload.candidateSnapshotDigest,
+      evidenceVersion: CIM_STAGE2_EVIDENCE_VERSION,
+      ruleVersion: policy.rules.version,
+      sourcePolicyVersion: policy.sourcePolicy.version,
+      sourcePolicyHash: policy.sourcePolicyHash,
+      sourceIds: eligibility.sourceIds,
+      stage2CohortEligible: eligibility.eligible,
+      queueVersion: CIM_STAGE2_REVIEW_QUEUE_VERSION,
+      queueRank: payload.queueRank,
+      reviewChecklistVersion: 'cim-stage2-human-review-checklist-v1',
+      candidateSnapshot,
+      policySnapshot,
+      sourceReviewSnapshot,
+      queueDigest: payload.queueDigest,
+    },
+  };
+}
+
+export async function recordCimStage2HumanReviewDecision({
+  input = {}, actor = '', actorRole = 'admin', storage = getStorage(), config = getConfig(), now = new Date(),
+  queueLoader = getCimStage2HumanReviewQueue,
+} = {}) {
+  const validated = validateCimStage2HumanReviewDecision(input, { config, now });
+  if (!validated.valid) return { ok: false, status: validated.status, error: validated.error };
+  const decision = validated.decision;
+  let currentQueue;
+  try {
+    currentQueue = await queueLoader({
+      page: 1,
+      pageSize: 1,
+      expectedQueueDigest: decision.queueDigest,
+      storage,
+      config,
+      now,
+    });
+  } catch {
+    return { ok: false, status: 503, error: 'The current Sheet-only review queue could not be refreshed. No decision was recorded.' };
+  }
+  if (!currentQueue?.sourceHealthy || currentQueue.queueChanged || currentQueue.queueDigest !== decision.queueDigest) {
+    return { ok: false, status: 409, error: 'The deterministic Sheet-only queue changed after this candidate was loaded. Reload from the first candidate; no decision was recorded.' };
+  }
+  const evidenceLookup = {
+    opportunityId: decision.opportunityId,
+    snapshotDigest: decision.snapshotDigest,
+    evidenceVersion: CIM_STAGE2_EVIDENCE_VERSION,
+    ruleVersion: decision.ruleVersion,
+    sourcePolicyHash: decision.sourcePolicyHash,
+  };
+  const alreadyRecorded = storage.getCimStage2ReviewEvidence
+    ? await storage.getCimStage2ReviewEvidence(evidenceLookup)
+    : (await storage.listDealHunterCimReviews?.({ limit: 100000 }) || []).find((review) => (
+      review.opportunity_id === evidenceLookup.opportunityId
+      && review.snapshot_digest === evidenceLookup.snapshotDigest
+      && review.evidence_version === evidenceLookup.evidenceVersion
+      && review.rule_version === evidenceLookup.ruleVersion
+      && review.source_policy_hash === evidenceLookup.sourcePolicyHash
+      && ['approved', 'rejected'].includes(review.decision)
+    ));
+  if (alreadyRecorded) {
+    return { ok: false, status: 409, error: 'This exact canonical snapshot already has a current-policy human decision. Reload the queue and verify the aggregate counters.' };
+  }
+  try {
+    const rows = await recordCimReviewDecisions({
+      decisions: [decision],
+      actor,
+      actorRole,
+      stage: 1,
+      source: 'stage2-review-queue',
+      storage,
+    });
+    if (rows.length !== 1) throw new Error('The Stage 2 evidence row was not appended.');
+    const automation = await getCimAutomationStatus({ storage, config, now: new Date() });
+    return {
+      ok: true,
+      status: 201,
+      recorded: {
+        id: rows[0].id,
+        opportunityId: rows[0].opportunity_id,
+        decision: rows[0].decision,
+        decisionAt: rows[0].decision_at,
+        snapshotDigest: rows[0].snapshot_digest,
+      },
+      automation,
+    };
+  } catch (error) {
+    if (/unique|duplicate|primary key/i.test(String(error?.message || ''))) {
+      return { ok: false, status: 409, error: 'This signed human review action was already recorded. Reload the queue and verify the aggregate counters.' };
+    }
+    throw error;
+  }
 }
 
 export async function reviewDailyDeals({ markSeen = false, storage = getStorage() } = {}) {

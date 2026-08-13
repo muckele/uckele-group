@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   CIM_STAGE2_EVIDENCE_VERSION,
+  buildCimStage2HumanReviewQueue,
   assessCimStage2StaticCandidate,
   authorizeCimStage2SendBoundary,
   buildCimStage2DecisionRecord,
@@ -101,7 +102,13 @@ function humanReview(index, policy, overrides = {}) {
     evidence_version: CIM_STAGE2_EVIDENCE_VERSION,
     rule_version: policy.rules.version,
     source_policy_hash: policy.sourcePolicyHash,
-    metadata: { source: 'approval-queue', stage2CohortEligible: index < 10 },
+    metadata: {
+      source: 'stage2-review-queue',
+      stage2CohortEligible: index < 10,
+      queueVersion: 'cim-stage2-deterministic-review-queue-v1',
+      reviewChecklistVersion: 'cim-stage2-human-review-checklist-v1',
+      immutableEvidenceComplete: true,
+    },
     ...overrides,
   };
 }
@@ -213,20 +220,44 @@ test('automated, ambiguous, unlinked, and incompatible-policy reviews never qual
     humanReview(1, policy, { metadata: { source: 'automation' } }),
     humanReview(2, policy, { opportunity_id: null, deal_key: 'unlinked' }),
     humanReview(3, policy, { rule_version: 'old-rule-version' }),
+    humanReview(4, policy, { metadata: { source: 'stage2-review-queue', stage2CohortEligible: true, immutableEvidenceComplete: false } }),
   ];
   const storage = {
     async listDealHunterCimReviews() { return reviews; },
     async listDealHunterCimRequests() { return []; },
     async listEmailEvents() { return []; },
     async listCrmCommunications() { return { rows: [], totalPages: 1 }; },
-    async listDealHunterOpportunities() { return [{ opportunity_id: 'opportunity-3' }]; },
+    async listDealHunterOpportunities() { return [{ opportunity_id: 'opportunity-3' }, { opportunity_id: 'opportunity-4' }]; },
     async listDealHunterOpportunityAliases() { return []; },
   };
   const metrics = await getCimAutomationMetrics({ storage, config: automationConfig() });
   assert.equal(metrics.canonicalHumanReviews, 0);
   assert.equal(metrics.automatedReviews, 1);
   assert.equal(metrics.unlinkedEvidence, 1);
-  assert.equal(metrics.incompatibleEvidence, 1);
+  assert.equal(metrics.incompatibleEvidence, 2);
+});
+
+test('protected Stage 2 queue decisions count as genuine current-policy evidence while canonical aliases still count once', async () => {
+  const policy = getCimStage2Policy(automationConfig());
+  const reviews = [
+    humanReview(1, policy),
+    humanReview(2, policy, {
+      deal_key: 'new-alias-for-opportunity-1',
+      opportunity_id: 'opportunity-1',
+    }),
+  ];
+  const storage = {
+    async listDealHunterCimReviews() { return reviews; },
+    async listDealHunterCimRequests() { return []; },
+    async listEmailEvents() { return []; },
+    async listCrmCommunications() { return { rows: [], totalPages: 1 }; },
+    async listDealHunterOpportunities() { return [{ opportunity_id: 'opportunity-1' }]; },
+    async listDealHunterOpportunityAliases() { return []; },
+  };
+  const metrics = await getCimAutomationMetrics({ storage, config: automationConfig() });
+  assert.equal(metrics.canonicalHumanReviews, 1);
+  assert.equal(metrics.compatibleEvidence, 1);
+  assert.equal(metrics.stage2EligibleCohort, 1);
 });
 
 test('configured Stage 2 and Stage 3 stay at effective Stage 1 without durable activation and every independent gate', async () => {
@@ -278,6 +309,72 @@ test('trusted Stage 2 candidate requires score 90, canonical identity, named exa
   assert.equal(assessCimStage2StaticCandidate(trustedDeal({ brokerEmail: 'info@example.test', brokerContacts: [{ name: 'Jane Broker', email: 'info@example.test', sourceColumn: 'Broker Email' }] }), { policy }).eligible, false);
   assert.equal(assessCimStage2StaticCandidate(trustedDeal({ brokerEmail: 'info+listing@example.test', brokerContacts: [{ name: 'Jane Broker', email: 'info+listing@example.test', sourceColumn: 'Broker Email' }] }), { policy }).eligible, false);
   assert.equal(assessCimStage2StaticCandidate(trustedDeal({ sourceId: 'deal-os-export', sourceRecords: [{ sourceId: 'deal-os-export' }] }), { policy }).eligible, false);
+});
+
+test('human review queue canonically deduplicates and uses stable score-independent ordering with bounded pagination', () => {
+  const policy = getCimStage2Policy(automationConfig());
+  const review = currentPolicyReview();
+  const latestHumanByOpportunity = new Map([
+    ['opportunity-2', { current_policy: true, snapshot_digest: 'previous-snapshot', decision_at: '2026-08-12T12:00:00.000Z' }],
+    ['opportunity-3', { current_policy: false, snapshot_digest: 'legacy-snapshot' }],
+  ]);
+  const deals = [
+    trustedDeal({ dealKey: 'deal-1', opportunityId: 'opportunity-1', score: 99 }),
+    trustedDeal({ dealKey: 'deal-2', opportunityId: 'opportunity-2', score: 90, listingUrl: 'https://example.test/deal-2', sourceRecords: [{ sourceId: 'sheet-0', externalId: 'row-2', stableExternalId: true, listingUrl: 'https://example.test/deal-2' }] }),
+    trustedDeal({ dealKey: 'deal-2-alias', opportunityId: 'opportunity-2', score: 75, listingUrl: 'https://example.test/deal-2-alias', sourceRecords: [{ sourceId: 'sheet-0', externalId: 'row-2-alias', stableExternalId: true, listingUrl: 'https://example.test/deal-2-alias' }] }),
+    trustedDeal({ dealKey: 'deal-3', opportunityId: 'opportunity-3', score: 60, listingUrl: 'https://example.test/deal-3', sourceRecords: [{ sourceId: 'sheet-0', externalId: 'row-3', stableExternalId: true, listingUrl: 'https://example.test/deal-3' }] }),
+    trustedDeal({ dealKey: 'unresolved', opportunityId: '', identityStatus: 'ambiguous' }),
+  ];
+  const status = { policy, metrics: { latestHumanByOpportunity } };
+  const first = buildCimStage2HumanReviewQueue({ review, scoredDeals: deals, status, page: 1, pageSize: 2 });
+  const second = buildCimStage2HumanReviewQueue({ review, scoredDeals: [...deals].reverse().map((deal) => ({ ...deal, score: 1 })), status, page: 2, pageSize: 2 });
+  const all = buildCimStage2HumanReviewQueue({ review, scoredDeals: deals, status, page: 1, pageSize: 10 });
+
+  assert.equal(all.total, 3);
+  assert.equal(all.counts.duplicateCanonicalRows, 1);
+  assert.equal(all.counts.unresolvedCanonicalRows, 1);
+  assert.equal(all.counts.currentPolicyReviewed, 1);
+  assert.equal(all.counts.currentPolicyRemaining, 2);
+  assert.equal(first.candidates.length, 2);
+  assert.equal(second.candidates.length, 1);
+  assert.deepEqual(
+    [...first.candidates, ...second.candidates].map((candidate) => candidate.opportunityId),
+    all.candidates.map((candidate) => candidate.opportunityId),
+  );
+  assert.deepEqual(
+    second.candidates.map((candidate) => candidate.opportunityId),
+    buildCimStage2HumanReviewQueue({ review, scoredDeals: [...deals].reverse(), status, page: 2, pageSize: 2 }).candidates.map((candidate) => candidate.opportunityId),
+  );
+  assert.equal(all.candidates.find((candidate) => candidate.opportunityId === 'opportunity-2').currentPolicyReviewed, true);
+  assert.equal(all.candidates.find((candidate) => candidate.opportunityId === 'opportunity-3').currentPolicyReviewed, false, 'legacy evidence must not be labeled current-policy compatible');
+  const refreshedSameRows = buildCimStage2HumanReviewQueue({
+    review: { ...review, generatedAt: new Date(Date.now() + 1000).toISOString() },
+    scoredDeals: deals,
+    status,
+    page: 1,
+    pageSize: 10,
+  });
+  assert.equal(refreshedSameRows.queueDigest, all.queueDigest, 'a fetch timestamp alone must not reorder or invalidate the queue');
+  const changedCandidate = buildCimStage2HumanReviewQueue({
+    review,
+    scoredDeals: deals.map((deal) => deal.opportunityId === 'opportunity-1' ? { ...deal, brokerEmail: 'changed@example.test' } : deal),
+    status,
+    page: 1,
+    pageSize: 10,
+  });
+  assert.notEqual(changedCandidate.queueDigest, all.queueDigest, 'candidate evidence changes must invalidate pagination continuity');
+});
+
+test('human review queue fails closed on widened or incomplete source evidence', () => {
+  const policy = getCimStage2Policy(automationConfig());
+  const queue = buildCimStage2HumanReviewQueue({
+    review: { ...currentPolicyReview(), sources: [{ id: 'sheet-0', fetched: true, rowCount: 1 }, { id: 'other-source', fetched: true, rowCount: 1 }] },
+    scoredDeals: [trustedDeal()],
+    status: { policy, metrics: {} },
+  });
+  assert.equal(queue.sourceHealthy, false);
+  assert.equal(queue.total, 0);
+  assert.deepEqual(queue.candidates, []);
 });
 
 test('Stage 2 evaluator blocks widened, warning-bearing, stale, or failed source coverage', () => {

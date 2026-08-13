@@ -262,6 +262,8 @@ test('viewer credentials create read-only admin access', async () => {
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-request', body: { dealKey: 'deal-1' } },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-requests/send-ready' },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-reviews' },
+    { method: 'get', routePath: '/api/admin/deal-hunter/cim-stage2/review-queue' },
+    { method: 'post', routePath: '/api/admin/deal-hunter/cim-stage2/review-decisions' },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-automation/pause' },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-stage2/activation', body: { mode: 'canary' } },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-stage2/run', body: { mode: 'shadow' } },

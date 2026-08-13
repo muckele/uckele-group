@@ -37,7 +37,9 @@ import { sendAdminEmailTestEmail } from './services/delivery.js';
 import { checkReadiness } from './services/readiness.js';
 import {
   reviewDailyDeals,
+  getCimStage2HumanReviewQueue,
   importDealOsExport,
+  recordCimStage2HumanReviewDecision,
   runCimStage2Automation,
   runDealHunterCimFollowUps,
   listDealHunterCimRequestHistory,
@@ -1335,6 +1337,43 @@ export function createApp() {
         source: 'approval-queue',
       });
       response.status(201).json({ success: true, recorded: reviews.length, automation: await getCimAutomationStatus() });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/cim-stage2/review-queue',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const queue = await getCimStage2HumanReviewQueue({
+        page: request.query?.page,
+        pageSize: request.query?.pageSize,
+        expectedQueueDigest: String(request.query?.expectedQueueDigest || '').slice(0, 64),
+      });
+      if (queue.queueChanged) {
+        response.status(409).json({ success: false, error: 'The deterministic source queue changed. Reload from the first candidate before recording another decision.' });
+        return;
+      }
+      response.json({ success: true, queue });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-stage2/review-decisions',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await recordCimStage2HumanReviewDecision({
+        input: request.body || {},
+        actor: session.username || '',
+        actorRole: session.role || 'admin',
+      });
+      response.status(result.status || (result.ok ? 201 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );
 

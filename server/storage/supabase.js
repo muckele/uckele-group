@@ -2139,10 +2139,28 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return data || [];
     },
 
+    async getCimStage2ReviewEvidence({ opportunityId = '', snapshotDigest = '', evidenceVersion = '', ruleVersion = '', sourcePolicyHash = '' } = {}) {
+      const { data, error } = await client.from('deal_hunter_cim_reviews')
+        .select('id,created_at,decision_at,opportunity_id,snapshot_digest,evidence_version,rule_version,source_policy_hash,decision')
+        .eq('opportunity_id', opportunityId)
+        .eq('snapshot_digest', snapshotDigest)
+        .eq('evidence_version', evidenceVersion)
+        .eq('rule_version', ruleVersion)
+        .eq('source_policy_hash', sourcePolicyHash)
+        .in('decision', ['approved', 'rejected'])
+        .contains('metadata', { source: 'stage2-review-queue', immutableEvidenceComplete: true })
+        .order('decision_at', { ascending: false })
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return data || null;
+    },
+
     async listCimStage2MetricReviews({ limit = 5000 } = {}) {
       const safeLimit = Math.max(1, Math.min(Number(limit) || 5000, 100000));
       const { data, error } = await client.from('deal_hunter_cim_reviews')
-        .select('id,created_at,deal_key,opportunity_id,decision,pass_reason,recipient_edited,score,actor,actor_role,automation_stage,snapshot_digest,evidence_version,rule_version,source_policy_version,source_policy_hash,source_ids,decision_at,review_source:metadata->>source,cohort_eligible:metadata->>stage2CohortEligible,response_outcome:metadata->>outcome')
+        .select('id,created_at,deal_key,opportunity_id,decision,pass_reason,recipient_edited,score,actor,actor_role,automation_stage,snapshot_digest,evidence_version,rule_version,source_policy_version,source_policy_hash,source_ids,decision_at,review_source:metadata->>source,cohort_eligible:metadata->>stage2CohortEligible,queue_version:metadata->>queueVersion,review_checklist_version:metadata->>reviewChecklistVersion,immutable_evidence_complete:metadata->>immutableEvidenceComplete,response_outcome:metadata->>outcome')
         .order('created_at', { ascending: false })
         .order('id', { ascending: false })
         .limit(safeLimit);
@@ -2152,6 +2170,9 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         metadata: {
           source: review.review_source || '',
           stage2CohortEligible: review.cohort_eligible === true || review.cohort_eligible === 'true',
+          queueVersion: review.queue_version || '',
+          reviewChecklistVersion: review.review_checklist_version || '',
+          immutableEvidenceComplete: review.immutable_evidence_complete === true || review.immutable_evidence_complete === 'true',
           outcome: review.response_outcome || '',
         },
       }));

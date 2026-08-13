@@ -8,6 +8,7 @@ import {
 } from './cimOpportunityIdentity.js';
 
 export const CIM_STAGE2_EVIDENCE_VERSION = 'cim-stage2-human-evidence-v2';
+export const CIM_STAGE2_REVIEW_QUEUE_VERSION = 'cim-stage2-deterministic-review-queue-v1';
 export const CIM_STAGE2_ACTIVATION_CONFIRMATIONS = Object.freeze({
   off: 'SET CIM STAGE 2 OFF',
   shadow: 'ACTIVATE CIM STAGE 2 SHADOW',
@@ -35,6 +36,7 @@ const trustedIndustryTerms = [
 ];
 const trustedTargetStates = ['NY', 'CA', 'NJ', 'AZ', 'NV', 'CT'];
 const automationModes = new Set(['off', 'shadow', 'canary', 'active']);
+const humanReviewSources = new Set(['approval-queue', 'stage2-review-queue']);
 
 function normalizeText(value = '', maxLength = 1000) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
@@ -243,7 +245,7 @@ async function canonicalHumanEvidence({ storage, reviews, policy }) {
     opportunityIdsByDeal.set(dealKey, ids);
   }
   const knownOpportunityIds = new Set(opportunities.map((item) => item.opportunity_id).filter(Boolean));
-  const humanRows = reviews.filter((review) => review.metadata?.source === 'approval-queue' && ['approved', 'rejected'].includes(review.decision));
+  const humanRows = reviews.filter((review) => humanReviewSources.has(review.metadata?.source) && ['approved', 'rejected'].includes(review.decision));
   const linked = [];
   let unlinked = 0;
   let ambiguous = 0;
@@ -261,7 +263,11 @@ async function canonicalHumanEvidence({ storage, reviews, policy }) {
       continue;
     }
     const explicitlyVersioned = Boolean(review.rule_version || review.source_policy_hash);
-    const currentPolicy = review.rule_version === policy.rules.version
+    const currentPolicy = review.metadata?.source === 'stage2-review-queue'
+      && review.metadata?.immutableEvidenceComplete === true
+      && review.metadata?.queueVersion === CIM_STAGE2_REVIEW_QUEUE_VERSION
+      && review.metadata?.reviewChecklistVersion === 'cim-stage2-human-review-checklist-v1'
+      && review.rule_version === policy.rules.version
       && review.source_policy_hash === policy.sourcePolicyHash
       && review.evidence_version === CIM_STAGE2_EVIDENCE_VERSION;
     if (explicitlyVersioned && !currentPolicy) {
@@ -419,19 +425,30 @@ export async function getCimAutomationMetrics({ storage = getStorage(), config =
 export async function recordCimReviewDecisions({
   decisions = [], actor = '', actorRole = 'admin', stage = 1, source = 'approval-queue', storage = getStorage(),
 } = {}) {
+  const inputDecisions = Array.isArray(decisions) ? decisions : [];
+  const accountableActor = normalizeText(actor, 160);
+  if (source === 'stage2-review-queue' && inputDecisions.length !== 1) {
+    throw new Error('Stage 2 human evidence must be recorded one opportunity at a time.');
+  }
+  if (source === 'stage2-review-queue' && !accountableActor) {
+    throw new Error('An authenticated, attributable human administrator is required.');
+  }
   const createdAt = new Date().toISOString();
-  const safe = (Array.isArray(decisions) ? decisions : []).slice(0, 100).map((decision) => {
+  const safe = inputDecisions.slice(0, 100).map((decision) => {
     const result = decision?.decision === 'approved' ? 'approved' : 'rejected';
     const originalRecipient = normalizeEmail(decision?.originalRecipientEmail);
     const finalRecipient = normalizeEmail(decision?.finalRecipientEmail || originalRecipient);
     const reason = result === 'rejected' && passReasons.has(decision?.passReason) ? decision.passReason : result === 'rejected' ? 'other' : '';
     return {
-      id: randomUUID(), created_at: createdAt, decision_at: decision?.decisionAt || createdAt,
+      id: source === 'stage2-review-queue' && decision?.evidenceId
+        ? normalizeText(decision.evidenceId, 64)
+        : randomUUID(),
+      created_at: createdAt, decision_at: decision?.decisionAt || createdAt,
       deal_key: normalizeText(decision?.dealKey, 1000), opportunity_id: normalizeText(decision?.opportunityId, 160) || null,
       decision: result, pass_reason: reason, original_recipient_email: originalRecipient,
       final_recipient_email: finalRecipient, recipient_edited: originalRecipient !== finalRecipient,
       score: Number.isFinite(Number(decision?.score)) ? Number(decision.score) : null,
-      actor: normalizeText(actor || 'admin', 160), actor_role: normalizeText(actorRole || 'admin', 80),
+      actor: accountableActor || 'admin', actor_role: normalizeText(actorRole || 'admin', 80),
       automation_stage: Math.max(1, Math.min(Number(stage) || 1, 3)),
       snapshot_digest: normalizeText(decision?.snapshotDigest, 64) || null,
       evidence_version: normalizeText(decision?.evidenceVersion || CIM_STAGE2_EVIDENCE_VERSION, 100),
@@ -444,9 +461,31 @@ export async function recordCimReviewDecisions({
         recipientName: normalizeText(decision?.finalRecipientName, 160),
         source,
         stage2CohortEligible: decision?.stage2CohortEligible === true,
+        queueVersion: normalizeText(decision?.queueVersion, 100),
+        queueRank: normalizeText(decision?.queueRank, 64),
+        reviewTokenId: normalizeText(decision?.evidenceId, 64),
+        reviewChecklistVersion: normalizeText(decision?.reviewChecklistVersion, 100),
+        immutableEvidenceComplete: source === 'stage2-review-queue'
+          && Boolean(decision?.candidateSnapshot && typeof decision.candidateSnapshot === 'object')
+          && Boolean(decision?.policySnapshot && typeof decision.policySnapshot === 'object')
+          && Boolean(decision?.sourceReviewSnapshot && typeof decision.sourceReviewSnapshot === 'object')
+          && decision?.queueVersion === CIM_STAGE2_REVIEW_QUEUE_VERSION
+          && decision?.reviewChecklistVersion === 'cim-stage2-human-review-checklist-v1',
+        decisionNote: normalizeText(decision?.decisionNote, 1000),
+        recipientEditReason: normalizeText(decision?.recipientEditReason, 1000),
+        originalRecipientName: normalizeText(decision?.originalRecipientName, 160),
+        candidateSnapshot: decision?.candidateSnapshot && typeof decision.candidateSnapshot === 'object'
+          ? stableValue(decision.candidateSnapshot)
+          : null,
+        policySnapshot: decision?.policySnapshot && typeof decision.policySnapshot === 'object'
+          ? stableValue(decision.policySnapshot)
+          : null,
+        sourceReviewSnapshot: decision?.sourceReviewSnapshot && typeof decision.sourceReviewSnapshot === 'object'
+          ? stableValue(decision.sourceReviewSnapshot)
+          : null,
       },
     };
-  }).filter((decision) => decision.deal_key && (source !== 'approval-queue' || decision.opportunity_id));
+  }).filter((decision) => decision.deal_key && (!humanReviewSources.has(source) || decision.opportunity_id));
   if (safe.length === 0) return [];
   if (!storage.insertDealHunterCimReviews) throw new Error('CIM review decision storage is not configured.');
   return storage.insertDealHunterCimReviews(safe);
@@ -868,6 +907,140 @@ export function assessCimStage2StaticCandidate(deal = {}, { policy = getCimStage
   if (deal.shouldRemove || deal.dismissed || deal.archived) reasons.push(reason('lifecycle_not_actionable', 'The opportunity is dismissed, archived, or not actionable.'));
   if ((deal.deduplicationMatches || []).some((match) => match?.decision === 'duplicate')) reasons.push(reason('duplicate_listing', 'The candidate is a known duplicate.'));
   return { eligible: reasons.length === 0, reasons, sourceIds };
+}
+
+function stage2ReviewSourceSnapshot(review = {}, policy = getCimStage2Policy()) {
+  const sources = (Array.isArray(review.sources) ? review.sources : []).map((source) => ({
+    id: normalizeText(source?.id, 200),
+    fetched: Boolean(source?.fetched),
+    rowCount: Math.max(0, Number(source?.rowCount || 0)),
+    errorPresent: Boolean(source?.error),
+  })).sort((left, right) => left.id.localeCompare(right.id));
+  const warnings = (Array.isArray(review.stage2CoverageWarnings)
+    ? review.stage2CoverageWarnings
+    : review.coverageWarnings || []).map((warning) => normalizeText(warning, 500)).filter(Boolean);
+  const snapshot = {
+    generatedAt: normalizeText(review.generatedAt, 100),
+    sources,
+    warningCount: warnings.length,
+    allowedSourceIds: policy.sourcePolicy.allowedSourceIds,
+  };
+  return { ...snapshot, digest: cimStage2Digest(snapshot) };
+}
+
+function stage2ReviewPolicySnapshot(policy = getCimStage2Policy()) {
+  return {
+    policyHash: policy.policyHash,
+    ruleVersion: policy.rules.version,
+    rules: policy.rules,
+    sourcePolicy: policy.sourcePolicy,
+    sourcePolicyHash: policy.sourcePolicyHash,
+    evidenceVersion: CIM_STAGE2_EVIDENCE_VERSION,
+  };
+}
+
+export function buildCimStage2HumanReviewQueue({
+  review = {}, scoredDeals = [], status = {}, page = 1, pageSize = 10, now = new Date(),
+} = {}) {
+  const policy = status.policy?.policyHash ? status.policy : getCimStage2Policy();
+  const sourceAssessment = assessCimStage2SourceReview(review, policy, now);
+  const sourceReviewSnapshot = stage2ReviewSourceSnapshot(review, policy);
+  const policySnapshot = stage2ReviewPolicySnapshot(policy);
+  const requestedPage = Math.max(1, Math.min(Math.trunc(Number(page) || 1), 10_000));
+  const safePageSize = Math.max(1, Math.min(Math.trunc(Number(pageSize) || 10), 10));
+  const latestByOpportunity = status.metrics?.latestHumanByOpportunity instanceof Map
+    ? status.metrics.latestHumanByOpportunity
+    : new Map();
+  const canonicalCandidates = new Map();
+  let unresolvedCanonicalRows = 0;
+  let duplicateCanonicalRows = 0;
+
+  for (const deal of Array.isArray(scoredDeals) ? scoredDeals : []) {
+    if (deal?.dismissed || deal?.archived) continue;
+    const opportunityId = normalizeText(deal?.opportunityId || deal?.opportunity_id, 160);
+    if (!opportunityId || deal?.identityStatus !== 'resolved') {
+      unresolvedCanonicalRows += 1;
+      continue;
+    }
+    const current = canonicalCandidates.get(opportunityId);
+    if (current) duplicateCanonicalRows += 1;
+    const representativeRank = cimStage2Digest({
+      sourceSnapshotDigest: sourceSnapshotDigestForDeal(deal),
+      dealKey: normalizeText(deal?.dealKey || deal?.deal_key, 1000),
+    });
+    if (!current || representativeRank < current.representativeRank) {
+      canonicalCandidates.set(opportunityId, { deal, representativeRank });
+    }
+  }
+
+  const candidates = [...canonicalCandidates.entries()].map(([opportunityId, entry]) => {
+    const assessment = assessCimStage2StaticCandidate(entry.deal, { policy });
+    const snapshotDigest = cimStage2SnapshotDigest(entry.deal);
+    const latest = latestByOpportunity.get(opportunityId);
+    const currentPolicyReviewed = Boolean(latest?.current_policy);
+    return {
+      opportunityId,
+      deal: entry.deal,
+      snapshotDigest,
+      queueRank: cimStage2Digest({
+        version: CIM_STAGE2_REVIEW_QUEUE_VERSION,
+        ruleVersion: policy.rules.version,
+        sourcePolicyHash: policy.sourcePolicyHash,
+        opportunityId,
+      }),
+      stage2CohortEligible: assessment.eligible,
+      eligibilityReasons: assessment.reasons,
+      sourceIds: assessment.sourceIds,
+      currentPolicyReviewed,
+      exactSnapshotReviewed: currentPolicyReviewed && latest?.snapshot_digest === snapshotDigest,
+      latestDecisionAt: currentPolicyReviewed ? latest?.decision_at || latest?.created_at || '' : '',
+    };
+  }).sort((left, right) => left.queueRank.localeCompare(right.queueRank)
+    || left.opportunityId.localeCompare(right.opportunityId));
+  const total = sourceAssessment.healthy ? candidates.length : 0;
+  const totalPages = Math.max(1, Math.ceil(total / safePageSize));
+  const safePage = Math.min(requestedPage, totalPages);
+  const start = (safePage - 1) * safePageSize;
+  const pagedCandidates = sourceAssessment.healthy ? candidates.slice(start, start + safePageSize) : [];
+  const reviewed = candidates.filter((candidate) => candidate.currentPolicyReviewed);
+  const eligible = candidates.filter((candidate) => candidate.stage2CohortEligible);
+
+  return {
+    version: CIM_STAGE2_REVIEW_QUEUE_VERSION,
+    generatedAt: normalizeText(review.generatedAt, 100),
+    sourceHealthy: sourceAssessment.healthy,
+    sourceAssessment,
+    sourceReviewSnapshot,
+    policySnapshot,
+    queueDigest: cimStage2Digest({
+      version: CIM_STAGE2_REVIEW_QUEUE_VERSION,
+      policySnapshot,
+      sourceReview: {
+        sources: sourceReviewSnapshot.sources,
+        warningCount: sourceReviewSnapshot.warningCount,
+        allowedSourceIds: sourceReviewSnapshot.allowedSourceIds,
+      },
+      canonicalCandidates: candidates.map((candidate) => ({
+        opportunityId: candidate.opportunityId,
+        snapshotDigest: candidate.snapshotDigest,
+      })),
+    }),
+    page: safePage,
+    pageSize: safePageSize,
+    total,
+    totalPages,
+    hasMore: safePage < totalPages,
+    counts: {
+      reviewableCanonical: total,
+      currentPolicyReviewed: reviewed.length,
+      currentPolicyRemaining: Math.max(0, total - reviewed.length),
+      eligibleCohortCandidates: eligible.length,
+      eligibleCohortReviewed: eligible.filter((candidate) => candidate.currentPolicyReviewed).length,
+      unresolvedCanonicalRows,
+      duplicateCanonicalRows,
+    },
+    candidates: pagedCandidates,
+  };
 }
 
 export function evaluateCimAutomationCandidates({
