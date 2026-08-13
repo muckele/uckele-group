@@ -328,6 +328,36 @@ function normalizeDealHunterRepairManifestRow(row) {
     : null;
 }
 
+function normalizeCimStage2ActivationRow(row) {
+  return row
+    ? {
+        ...row,
+        weekdays_only: Boolean(row.weekdays_only),
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
+function normalizeCimStage2RunRow(row) {
+  return row
+    ? {
+        ...row,
+        blocked_counts: parseJsonColumn(row.blocked_counts, {}),
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
+function normalizeCimStage2DecisionRow(row) {
+  return row
+    ? {
+        ...row,
+        reasons: parseJsonColumn(row.reasons, []),
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
 function ensureColumn(database, tableName, columnName, definition) {
   const columns = database.prepare(`PRAGMA table_info(${tableName})`).all();
   const hasColumn = columns.some((column) => column.name === columnName);
@@ -1234,6 +1264,95 @@ export function createSqliteStorage(config) {
         metadata TEXT NOT NULL DEFAULT '{}'
       );
 
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_stage2_activations (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        status TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        confirmation_phrase TEXT NOT NULL,
+        policy_hash TEXT NOT NULL,
+        rule_version TEXT NOT NULL,
+        source_policy_version TEXT NOT NULL,
+        source_policy_hash TEXT NOT NULL,
+        evidence_checksum TEXT NOT NULL,
+        evidence_generated_at TEXT NOT NULL,
+        backup_reference TEXT NOT NULL,
+        backup_checksum TEXT NOT NULL,
+        identity_audit_reference TEXT NOT NULL,
+        identity_audit_checksum TEXT NOT NULL,
+        compliance_reference TEXT NOT NULL,
+        sender_auth_reference TEXT NOT NULL,
+        timezone TEXT NOT NULL,
+        window_start TEXT NOT NULL,
+        window_end TEXT NOT NULL,
+        weekdays_only INTEGER NOT NULL DEFAULT 1,
+        canary_daily_cap INTEGER NOT NULL,
+        active_daily_cap INTEGER NOT NULL,
+        recipient_cap_24_hours INTEGER NOT NULL,
+        recipient_cap_30_days INTEGER NOT NULL,
+        expires_at TEXT NOT NULL,
+        superseded_at TEXT,
+        superseded_by TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}'
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_stage2_runs (
+        id TEXT PRIMARY KEY,
+        run_key TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        pacific_business_date TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        triggered_by TEXT NOT NULL,
+        policy_hash TEXT NOT NULL,
+        rule_version TEXT NOT NULL,
+        source_policy_hash TEXT NOT NULL,
+        activation_id TEXT,
+        considered_count INTEGER NOT NULL DEFAULT 0,
+        eligible_count INTEGER NOT NULL DEFAULT 0,
+        would_send_count INTEGER NOT NULL DEFAULT 0,
+        attempted_count INTEGER NOT NULL DEFAULT 0,
+        accepted_count INTEGER NOT NULL DEFAULT 0,
+        failed_count INTEGER NOT NULL DEFAULT 0,
+        ambiguous_count INTEGER NOT NULL DEFAULT 0,
+        deferred_count INTEGER NOT NULL DEFAULT 0,
+        blocked_counts TEXT NOT NULL DEFAULT '{}',
+        last_error TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}'
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_stage2_decisions (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        opportunity_id TEXT NOT NULL,
+        deal_key TEXT NOT NULL,
+        decision_state TEXT NOT NULL,
+        policy_hash TEXT NOT NULL,
+        rule_version TEXT NOT NULL,
+        source_policy_hash TEXT NOT NULL,
+        activation_id TEXT,
+        snapshot_digest TEXT NOT NULL,
+        recipient_hash TEXT NOT NULL,
+        source_snapshot_digest TEXT NOT NULL,
+        reasons TEXT NOT NULL DEFAULT '[]',
+        claim_token TEXT,
+        claimed_at TEXT,
+        consumed_at TEXT,
+        cim_request_id TEXT,
+        communication_id TEXT,
+        provider_state TEXT,
+        last_error TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        UNIQUE(run_id, opportunity_id, policy_hash)
+      );
+
       CREATE TABLE IF NOT EXISTS deal_hunter_dispositions (
         id TEXT PRIMARY KEY,
         deal_key TEXT NOT NULL UNIQUE,
@@ -1411,6 +1530,15 @@ export function createSqliteStorage(config) {
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_identity_exceptions_status ON deal_hunter_identity_exceptions(status, updated_at DESC);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_overrides_lookup ON deal_hunter_cim_recipient_overrides(opportunity_id, recipient_email, expires_at DESC);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_repair_manifests_created ON deal_hunter_cim_repair_manifests(created_at DESC);
+	    CREATE UNIQUE INDEX IF NOT EXISTS idx_cim_stage2_one_current_activation ON deal_hunter_cim_stage2_activations(status) WHERE status = 'current';
+	    CREATE INDEX IF NOT EXISTS idx_cim_stage2_activations_created ON deal_hunter_cim_stage2_activations(created_at DESC);
+	    CREATE INDEX IF NOT EXISTS idx_cim_stage2_runs_date_mode ON deal_hunter_cim_stage2_runs(pacific_business_date DESC, mode, status);
+	    CREATE INDEX IF NOT EXISTS idx_cim_stage2_runs_policy ON deal_hunter_cim_stage2_runs(policy_hash, created_at DESC);
+	    CREATE INDEX IF NOT EXISTS idx_cim_stage2_decisions_run ON deal_hunter_cim_stage2_decisions(run_id, decision_state);
+	    CREATE INDEX IF NOT EXISTS idx_cim_stage2_decisions_opportunity ON deal_hunter_cim_stage2_decisions(opportunity_id, created_at DESC);
+	    CREATE INDEX IF NOT EXISTS idx_cim_stage2_decisions_evidence ON deal_hunter_cim_stage2_decisions(policy_hash, source_policy_hash, decision_state);
+	    CREATE UNIQUE INDEX IF NOT EXISTS idx_cim_stage2_active_opportunity_claim ON deal_hunter_cim_stage2_decisions(opportunity_id)
+	      WHERE decision_state IN ('claimed', 'attempting', 'ambiguous');
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_dispositions_updated ON deal_hunter_dispositions(updated_at DESC, id DESC);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_dispositions_submission ON deal_hunter_dispositions(submission_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_scheduled_job_runs_name_updated_at ON scheduled_job_runs(job_name, updated_at DESC);
@@ -1513,6 +1641,19 @@ export function createSqliteStorage(config) {
 	  ensureColumn(database, 'deal_hunter_cim_requests', 'attempt_count', 'INTEGER');
 	  ensureColumn(database, 'deal_hunter_cim_requests', 'last_activity_at', 'TEXT');
 	  ensureColumn(database, 'deal_hunter_cim_requests', 'opportunity_id', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_cim_reviews', 'opportunity_id', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_cim_reviews', 'snapshot_digest', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_cim_reviews', 'evidence_version', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_cim_reviews', 'rule_version', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_cim_reviews', 'source_policy_version', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_cim_reviews', 'source_policy_hash', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_cim_reviews', 'source_ids', "TEXT NOT NULL DEFAULT '[]'");
+	  ensureColumn(database, 'deal_hunter_cim_reviews', 'actor_role', 'TEXT');
+	  ensureColumn(database, 'deal_hunter_cim_reviews', 'decision_at', 'TEXT');
+	  database.exec(`
+	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_reviews_opportunity ON deal_hunter_cim_reviews(opportunity_id, decision_at DESC, created_at DESC);
+	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_reviews_policy ON deal_hunter_cim_reviews(rule_version, source_policy_hash, created_at DESC);
+	  `);
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'listing_identity', 'TEXT');
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'listing_url', 'TEXT');
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'submission_id', 'TEXT');
@@ -3522,6 +3663,20 @@ export function createSqliteStorage(config) {
       return { rows, total, page: safePage, pageSize: safePageSize };
     },
 
+    async listCimStage2MetricCommunications({ limit = 10000, offset = 0 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 10000, 100000));
+      const safeOffset = Math.max(0, Math.min(Number(offset) || 0, 100000));
+      return database.prepare(`
+        SELECT id, submission_id, cim_request_id, opportunity_id, direction, kind,
+          provider, provider_message_id, occurred_at, created_at, delivery_state,
+          delivery_state_at
+        FROM crm_communications
+        WHERE kind = 'deal-hunter-cim-request'
+        ORDER BY occurred_at DESC, id DESC
+        LIMIT ? OFFSET ?
+      `).all(safeLimit, safeOffset);
+    },
+
     async getSummary() {
       const total = database.prepare('SELECT COUNT(*) AS count FROM contact_submissions').get()?.count || 0;
       const lastSevenDaysSince = new Date(Date.now() - 1000 * 60 * 60 * 24 * 7).toISOString();
@@ -3793,6 +3948,17 @@ export function createSqliteStorage(config) {
         )
         .all(...params, safeLimit)
         .map(normalizeEmailEventRow);
+    },
+
+    async listCimStage2MetricEmailEvents({ limit = 10000 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 10000, 100000));
+      return database.prepare(`
+        SELECT id, created_at, provider, event_type, message_id, provider_event_id,
+          event_key, submission_id, communication_id, opportunity_id, source
+        FROM email_events
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+      `).all(safeLimit);
     },
 
     async listEmailEventsForSubmissions(submissionIds = [], limit = 5000) {
@@ -4674,15 +4840,28 @@ export function createSqliteStorage(config) {
         const statement = database.prepare(`
           INSERT INTO deal_hunter_cim_reviews (
             id, created_at, deal_key, decision, pass_reason, original_recipient_email,
-            final_recipient_email, recipient_edited, score, actor, automation_stage, metadata
+            final_recipient_email, recipient_edited, score, actor, automation_stage, metadata,
+            opportunity_id, snapshot_digest, evidence_version, rule_version,
+            source_policy_version, source_policy_hash, source_ids, actor_role, decision_at
           ) VALUES (
             @id, @created_at, @deal_key, @decision, @pass_reason, @original_recipient_email,
-            @final_recipient_email, @recipient_edited, @score, @actor, @automation_stage, @metadata
+            @final_recipient_email, @recipient_edited, @score, @actor, @automation_stage, @metadata,
+            @opportunity_id, @snapshot_digest, @evidence_version, @rule_version,
+            @source_policy_version, @source_policy_hash, @source_ids, @actor_role, @decision_at
           )
         `);
         const transaction = database.transaction((items) => items.forEach((review) => statement.run({
           ...review,
           recipient_edited: review.recipient_edited ? 1 : 0,
+          opportunity_id: review.opportunity_id || null,
+          snapshot_digest: review.snapshot_digest || null,
+          evidence_version: review.evidence_version || null,
+          rule_version: review.rule_version || null,
+          source_policy_version: review.source_policy_version || null,
+          source_policy_hash: review.source_policy_hash || null,
+          source_ids: JSON.stringify(Array.isArray(review.source_ids) ? review.source_ids : []),
+          actor_role: review.actor_role || null,
+          decision_at: review.decision_at || review.created_at,
           metadata: JSON.stringify(review.metadata || {}),
         })));
         transaction(safeReviews);
@@ -4693,7 +4872,37 @@ export function createSqliteStorage(config) {
         const safeLimit = Math.max(1, Math.min(Number(limit) || 5000, 100000));
         return database.prepare('SELECT * FROM deal_hunter_cim_reviews ORDER BY created_at DESC, id DESC LIMIT ?')
           .all(safeLimit)
-          .map((review) => ({ ...review, recipient_edited: Boolean(review.recipient_edited), metadata: parseJsonColumn(review.metadata, {}) }));
+          .map((review) => ({
+            ...review,
+            recipient_edited: Boolean(review.recipient_edited),
+            source_ids: parseJsonColumn(review.source_ids, []),
+            metadata: parseJsonColumn(review.metadata, {}),
+          }));
+      },
+
+      async listCimStage2MetricReviews({ limit = 5000 } = {}) {
+        const safeLimit = Math.max(1, Math.min(Number(limit) || 5000, 100000));
+        return database.prepare(`
+          SELECT id, created_at, deal_key, opportunity_id, decision, pass_reason,
+            recipient_edited, score, actor, actor_role, automation_stage,
+            snapshot_digest, evidence_version, rule_version, source_policy_version,
+            source_policy_hash, source_ids, decision_at,
+            json_extract(metadata, '$.source') AS review_source,
+            json_extract(metadata, '$.stage2CohortEligible') AS cohort_eligible,
+            json_extract(metadata, '$.outcome') AS response_outcome
+          FROM deal_hunter_cim_reviews
+          ORDER BY created_at DESC, id DESC
+          LIMIT ?
+        `).all(safeLimit).map((review) => ({
+          ...review,
+          recipient_edited: Boolean(review.recipient_edited),
+          source_ids: parseJsonColumn(review.source_ids, []),
+          metadata: {
+            source: review.review_source || '',
+            stage2CohortEligible: Boolean(review.cohort_eligible),
+            outcome: review.response_outcome || '',
+          },
+        }));
       },
 
       async getDealHunterAutomationSettings() {
@@ -4718,6 +4927,249 @@ export function createSqliteStorage(config) {
           metadata: JSON.stringify(settings.metadata || {}),
         });
         return this.getDealHunterAutomationSettings();
+      },
+
+      async checkCimStage2Storage() {
+        const requiredTables = [
+          'deal_hunter_cim_stage2_activations',
+          'deal_hunter_cim_stage2_runs',
+          'deal_hunter_cim_stage2_decisions',
+        ];
+        const tables = new Set(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map((row) => row.name));
+        const reviewColumns = new Set(database.prepare('PRAGMA table_info(deal_hunter_cim_reviews)').all().map((column) => column.name));
+        const missingTables = requiredTables.filter((table) => !tables.has(table));
+        const missingReviewColumns = [
+          'opportunity_id', 'snapshot_digest', 'evidence_version', 'rule_version',
+          'source_policy_version', 'source_policy_hash', 'source_ids', 'actor_role', 'decision_at',
+        ].filter((column) => !reviewColumns.has(column));
+        return { ok: missingTables.length === 0 && missingReviewColumns.length === 0, missingTables, missingReviewColumns };
+      },
+
+      async getCurrentCimStage2Activation() {
+        return normalizeCimStage2ActivationRow(database.prepare(`
+          SELECT * FROM deal_hunter_cim_stage2_activations
+          WHERE status = 'current'
+          ORDER BY created_at DESC, id DESC
+          LIMIT 1
+        `).get());
+      },
+
+      async listCimStage2Activations({ limit = 50 } = {}) {
+        return database.prepare(`
+          SELECT * FROM deal_hunter_cim_stage2_activations
+          ORDER BY created_at DESC, id DESC LIMIT ?
+        `).all(Math.max(1, Math.min(Number(limit) || 50, 500))).map(normalizeCimStage2ActivationRow);
+      },
+
+      async createCimStage2Activation(activation = {}) {
+        const insert = database.prepare(`
+          INSERT INTO deal_hunter_cim_stage2_activations (
+            id, created_at, updated_at, status, mode, actor, reason, confirmation_phrase,
+            policy_hash, rule_version, source_policy_version, source_policy_hash,
+            evidence_checksum, evidence_generated_at, backup_reference, backup_checksum,
+            identity_audit_reference, identity_audit_checksum, compliance_reference,
+            sender_auth_reference, timezone, window_start, window_end, weekdays_only,
+            canary_daily_cap, active_daily_cap, recipient_cap_24_hours,
+            recipient_cap_30_days, expires_at, superseded_at, superseded_by, metadata
+          ) VALUES (
+            @id, @created_at, @updated_at, 'current', @mode, @actor, @reason, @confirmation_phrase,
+            @policy_hash, @rule_version, @source_policy_version, @source_policy_hash,
+            @evidence_checksum, @evidence_generated_at, @backup_reference, @backup_checksum,
+            @identity_audit_reference, @identity_audit_checksum, @compliance_reference,
+            @sender_auth_reference, @timezone, @window_start, @window_end, @weekdays_only,
+            @canary_daily_cap, @active_daily_cap, @recipient_cap_24_hours,
+            @recipient_cap_30_days, @expires_at, NULL, NULL, @metadata
+          )
+        `);
+        const transaction = database.transaction((record) => {
+          database.prepare(`
+            UPDATE deal_hunter_cim_stage2_activations
+            SET status = 'superseded', updated_at = ?, superseded_at = ?, superseded_by = ?
+            WHERE status = 'current'
+          `).run(record.created_at, record.created_at, record.actor);
+          insert.run({
+            ...record,
+            updated_at: record.updated_at || record.created_at,
+            weekdays_only: record.weekdays_only ? 1 : 0,
+            metadata: JSON.stringify(record.metadata || {}),
+          });
+        });
+        transaction(activation);
+        return this.getCurrentCimStage2Activation();
+      },
+
+      async getCimStage2Run({ id = '', runKey = '' } = {}) {
+        if (!id && !runKey) return null;
+        return normalizeCimStage2RunRow(database.prepare(`
+          SELECT * FROM deal_hunter_cim_stage2_runs
+          WHERE id = ? OR run_key = ?
+          ORDER BY created_at DESC LIMIT 1
+        `).get(id || '', runKey || ''));
+      },
+
+      async claimCimStage2Run(run = {}) {
+        try {
+          database.prepare(`
+            INSERT INTO deal_hunter_cim_stage2_runs (
+              id, run_key, created_at, updated_at, completed_at, pacific_business_date,
+              mode, status, triggered_by, policy_hash, rule_version, source_policy_hash,
+              activation_id, considered_count, eligible_count, would_send_count,
+              attempted_count, accepted_count, failed_count, ambiguous_count,
+              deferred_count, blocked_counts, last_error, metadata
+            ) VALUES (
+              @id, @run_key, @created_at, @updated_at, NULL, @pacific_business_date,
+              @mode, @status, @triggered_by, @policy_hash, @rule_version, @source_policy_hash,
+              @activation_id, 0, 0, 0, 0, 0, 0, 0, 0, '{}', NULL, @metadata
+            )
+          `).run({
+            ...run,
+            updated_at: run.updated_at || run.created_at,
+            activation_id: run.activation_id || null,
+            metadata: JSON.stringify(run.metadata || {}),
+          });
+          return { claimed: true, run: await this.getCimStage2Run({ id: run.id }) };
+        } catch (error) {
+          if (error?.code !== 'SQLITE_CONSTRAINT_UNIQUE' && error?.code !== 'SQLITE_CONSTRAINT_PRIMARYKEY') throw error;
+          return { claimed: false, run: await this.getCimStage2Run({ runKey: run.run_key }) };
+        }
+      },
+
+      async updateCimStage2Run(id, updates = {}) {
+        const current = await this.getCimStage2Run({ id });
+        if (!current) return null;
+        const next = { ...current, ...updates, id };
+        database.prepare(`
+          UPDATE deal_hunter_cim_stage2_runs SET
+            updated_at = @updated_at, completed_at = @completed_at, status = @status,
+            activation_id = @activation_id, considered_count = @considered_count,
+            eligible_count = @eligible_count, would_send_count = @would_send_count,
+            attempted_count = @attempted_count, accepted_count = @accepted_count,
+            failed_count = @failed_count, ambiguous_count = @ambiguous_count,
+            deferred_count = @deferred_count, blocked_counts = @blocked_counts,
+            last_error = @last_error, metadata = @metadata
+          WHERE id = @id
+        `).run({
+          ...next,
+          completed_at: next.completed_at || null,
+          activation_id: next.activation_id || null,
+          blocked_counts: JSON.stringify(next.blocked_counts || {}),
+          last_error: next.last_error || null,
+          metadata: JSON.stringify(next.metadata || {}),
+        });
+        return this.getCimStage2Run({ id });
+      },
+
+      async listCimStage2Runs({ mode = '', policyHash = '', limit = 50 } = {}) {
+        const clauses = [];
+        const values = [];
+        if (mode) { clauses.push('mode = ?'); values.push(mode); }
+        if (policyHash) { clauses.push('policy_hash = ?'); values.push(policyHash); }
+        values.push(Math.max(1, Math.min(Number(limit) || 50, 500)));
+        return database.prepare(`
+          SELECT * FROM deal_hunter_cim_stage2_runs
+          ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+          ORDER BY created_at DESC, id DESC LIMIT ?
+        `).all(...values).map(normalizeCimStage2RunRow);
+      },
+
+      async insertCimStage2Decisions(decisions = []) {
+        const safe = Array.isArray(decisions) ? decisions.slice(0, 500) : [];
+        const statement = database.prepare(`
+          INSERT OR IGNORE INTO deal_hunter_cim_stage2_decisions (
+            id, run_id, created_at, updated_at, opportunity_id, deal_key, decision_state,
+            policy_hash, rule_version, source_policy_hash, activation_id, snapshot_digest,
+            recipient_hash, source_snapshot_digest, reasons, claim_token, claimed_at,
+            consumed_at, cim_request_id, communication_id, provider_state, last_error, metadata
+          ) VALUES (
+            @id, @run_id, @created_at, @updated_at, @opportunity_id, @deal_key, @decision_state,
+            @policy_hash, @rule_version, @source_policy_hash, @activation_id, @snapshot_digest,
+            @recipient_hash, @source_snapshot_digest, @reasons, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL, @metadata
+          )
+        `);
+        database.transaction((items) => items.forEach((item) => statement.run({
+          ...item,
+          updated_at: item.updated_at || item.created_at,
+          activation_id: item.activation_id || null,
+          reasons: JSON.stringify(item.reasons || []),
+          metadata: JSON.stringify(item.metadata || {}),
+        })))(safe);
+        return this.listCimStage2Decisions({ runId: safe[0]?.run_id || '', limit: 500 });
+      },
+
+      async getCimStage2Decision(id) {
+        return normalizeCimStage2DecisionRow(database.prepare(`
+          SELECT * FROM deal_hunter_cim_stage2_decisions WHERE id = ? LIMIT 1
+        `).get(id));
+      },
+
+      async listCimStage2Decisions({ runId = '', opportunityId = '', state = '', limit = 100, offset = 0 } = {}) {
+        const clauses = [];
+        const values = [];
+        if (runId) { clauses.push('run_id = ?'); values.push(runId); }
+        if (opportunityId) { clauses.push('opportunity_id = ?'); values.push(opportunityId); }
+        if (state) { clauses.push('decision_state = ?'); values.push(state); }
+        values.push(Math.max(1, Math.min(Number(limit) || 100, 500)));
+        values.push(Math.max(0, Math.min(Number(offset) || 0, 10000)));
+        return database.prepare(`
+          SELECT * FROM deal_hunter_cim_stage2_decisions
+          ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''}
+          ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
+        `).all(...values).map(normalizeCimStage2DecisionRow);
+      },
+
+      async claimCimStage2Decision({ id = '', claimToken = '', claimedAt = '', activationId = '' } = {}) {
+        try {
+          const result = database.prepare(`
+            UPDATE deal_hunter_cim_stage2_decisions
+            SET decision_state = 'claimed', claim_token = ?, claimed_at = ?, updated_at = ?, activation_id = ?
+            WHERE id = ? AND decision_state = 'eligible' AND claim_token IS NULL
+          `).run(claimToken, claimedAt, claimedAt, activationId || null, id);
+          return { claimed: result.changes === 1, decision: await this.getCimStage2Decision(id) };
+        } catch (error) {
+          if (error?.code !== 'SQLITE_CONSTRAINT_UNIQUE') throw error;
+          return { claimed: false, decision: await this.getCimStage2Decision(id) };
+        }
+      },
+
+      async transitionCimStage2Decision({ id = '', expectedStates = [], state = '', updates = {} } = {}) {
+        const current = await this.getCimStage2Decision(id);
+        if (!current || !expectedStates.includes(current.decision_state)) return { applied: false, decision: current };
+        const next = { ...current, ...updates, decision_state: state, updated_at: updates.updated_at || new Date().toISOString() };
+        const result = database.prepare(`
+          UPDATE deal_hunter_cim_stage2_decisions SET
+            updated_at = @updated_at, decision_state = @decision_state, activation_id = @activation_id,
+            claim_token = @claim_token, claimed_at = @claimed_at, consumed_at = @consumed_at,
+            cim_request_id = @cim_request_id, communication_id = @communication_id,
+            provider_state = @provider_state, last_error = @last_error, reasons = @reasons,
+            metadata = @metadata
+          WHERE id = @id AND decision_state = @expected_state
+        `).run({
+          ...next,
+          expected_state: current.decision_state,
+          activation_id: next.activation_id || null,
+          claim_token: next.claim_token || null,
+          claimed_at: next.claimed_at || null,
+          consumed_at: next.consumed_at || null,
+          cim_request_id: next.cim_request_id || null,
+          communication_id: next.communication_id || null,
+          provider_state: next.provider_state || null,
+          last_error: next.last_error || null,
+          reasons: JSON.stringify(next.reasons || []),
+          metadata: JSON.stringify(next.metadata || {}),
+        });
+        return { applied: result.changes === 1, decision: await this.getCimStage2Decision(id) };
+      },
+
+      async countCimStage2Capacity({ pacificBusinessDate = '' } = {}) {
+        return Number(database.prepare(`
+          SELECT COUNT(*) AS count
+          FROM deal_hunter_cim_stage2_decisions AS decision
+          JOIN deal_hunter_cim_stage2_runs AS run ON run.id = decision.run_id
+          WHERE run.pacific_business_date = ?
+            AND run.mode IN ('canary', 'active')
+            AND decision.decision_state IN ('claimed', 'attempting', 'accepted', 'failed', 'ambiguous')
+        `).get(pacificBusinessDate)?.count || 0);
       },
 
 	    async claimDealHunterCrmImport(record = {}, { pendingCutoff = '' } = {}) {
@@ -4810,6 +5262,24 @@ export function createSqliteStorage(config) {
         ORDER BY updated_at DESC, opportunity_id
         LIMIT ?
       `).all(...params, safeLimit).map(normalizeDealHunterOpportunityRow);
+    },
+
+    async listCimStage2IdentityOpportunities({ limit = 5000 } = {}) {
+      return database.prepare(`
+        SELECT opportunity_id, primary_submission_id
+        FROM deal_hunter_opportunities
+        ORDER BY updated_at DESC, opportunity_id
+        LIMIT ?
+      `).all(Math.max(1, Math.min(Number(limit) || 5000, 100000)));
+    },
+
+    async listCimStage2EvidenceAliases({ limit = 10000 } = {}) {
+      return database.prepare(`
+        SELECT alias_type, alias_value, opportunity_id
+        FROM deal_hunter_opportunity_aliases
+        ORDER BY last_observed_at DESC, alias_key
+        LIMIT ?
+      `).all(Math.max(1, Math.min(Number(limit) || 10000, 100000)));
     },
 
     async findDealHunterOpportunityByAliases(aliasKeys = []) {
@@ -5001,6 +5471,17 @@ export function createSqliteStorage(config) {
         ORDER BY updated_at DESC, id
         LIMIT ?
       `).all(...safeStatuses, safeLimit).map(normalizeDealHunterIdentityExceptionRow);
+    },
+
+    async listCimStage2IdentityExceptions({ statuses = [], limit = 5000 } = {}) {
+      const safeStatuses = normalizeList(statuses, 20);
+      const where = safeStatuses.length > 0 ? `WHERE status IN (${placeholders(safeStatuses.length)})` : '';
+      return database.prepare(`
+        SELECT id, status, created_at, updated_at
+        FROM deal_hunter_identity_exceptions ${where}
+        ORDER BY updated_at DESC, id
+        LIMIT ?
+      `).all(...safeStatuses, Math.max(1, Math.min(Number(limit) || 5000, 100000)));
     },
 
     async claimDealHunterCimOpportunity({ opportunityId = '', requestId = '', recipientEmail = '', allowedRequestIds = [], nowIso = '', metadata = {} } = {}) {
@@ -5416,6 +5897,28 @@ export function createSqliteStorage(config) {
         )
         .all(...params, safeLimit)
         .map(normalizeDealHunterCimRequestRow);
+    },
+
+    async listCimStage2MetricRequests({ limit = 10000 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 10000, 100000));
+      return database.prepare(`
+        SELECT id, created_at, updated_at, deal_key, opportunity_id, recipient_email,
+          status, provider_message_id, follow_up_count, last_follow_up_at,
+          next_follow_up_at, responded_at, submission_id, request_state,
+          delivery_state, delivery_state_at, follow_up_state, first_requested_at,
+          first_provider_accepted_at, delivered_at, last_activity_at,
+          json_extract(metadata, '$.initialCommunicationId') AS initial_communication_id,
+          json_extract(metadata, '$.followUps') AS metric_follow_ups
+        FROM deal_hunter_cim_requests
+        ORDER BY updated_at DESC, id ASC
+        LIMIT ?
+      `).all(safeLimit).map((request) => ({
+        ...request,
+        metadata: {
+          initialCommunicationId: request.initial_communication_id || '',
+          followUps: parseJsonColumn(request.metric_follow_ups, []),
+        },
+      }));
     },
 
     async getLatestDealHunterCimRequestForSubmission(submissionId) {

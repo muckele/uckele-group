@@ -38,6 +38,7 @@ import { checkReadiness } from './services/readiness.js';
 import {
   reviewDailyDeals,
   importDealOsExport,
+  runCimStage2Automation,
   runDealHunterCimFollowUps,
   listDealHunterCimRequestHistory,
   retryDealHunterCimRequestWithCorrectedRecipient,
@@ -60,7 +61,7 @@ import {
 import { asyncRoute } from './utils/http.js';
 import { safeCompareText } from './utils/security.js';
 import { listCrmActivity, projectCrmActivityTimeline } from './services/activity.js';
-import { getOperationsCenter } from './services/operations.js';
+import { getOperationsCenter, sanitizeViewerOperations } from './services/operations.js';
 import {
   assignUnassignedCommunication,
   createManualCommunication,
@@ -75,6 +76,7 @@ import {
 } from './services/leadLifecycle.js';
 import { recordAnalyticsEvent } from './services/analytics.js';
 import {
+  createCimStage2Activation,
   getCimAutomationStatus,
   recordCimResponseOutcome,
   recordCimReviewDecisions,
@@ -626,12 +628,17 @@ export function createApp() {
   app.get(
     '/api/admin/operations',
     asyncRoute(async (request, response) => {
-      if (!await requireAdmin(request)) {
-        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
         return;
       }
 
-      response.json({ success: true, operations: await getOperationsCenter() });
+      const operations = await getOperationsCenter();
+      response.json({
+        success: true,
+        operations: session.role === 'viewer' ? sanitizeViewerOperations(operations) : operations,
+      });
     }),
   );
 
@@ -1323,6 +1330,7 @@ export function createApp() {
       const reviews = await recordCimReviewDecisions({
         decisions: validated.decisions,
         actor: session.username || 'admin',
+        actorRole: session.role || 'admin',
         stage: status.effectiveStage,
         source: 'approval-queue',
       });
@@ -1342,8 +1350,93 @@ export function createApp() {
         response.status(400).json({ success: false, error: 'A boolean paused value is required.' });
         return;
       }
-      await setCimAutomationPaused({ paused: request.body.paused, actor: session.username || 'admin' });
-      response.json({ success: true, automation: await getCimAutomationStatus() });
+      try {
+        await setCimAutomationPaused({
+          paused: request.body.paused,
+          actor: session.username || 'admin',
+          reason: request.body?.reason || '',
+        });
+        response.json({ success: true, automation: await getCimAutomationStatus() });
+      } catch (error) {
+        response.status(400).json({ success: false, error: error.message || 'The automation pause change was rejected.' });
+      }
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-stage2/activation',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      try {
+        const activation = await createCimStage2Activation({
+          mode: request.body?.mode,
+          confirmation: request.body?.confirmation,
+          actor: session.username || 'admin',
+          reason: request.body?.reason,
+          evidenceChecksum: request.body?.evidenceChecksum || request.body?.evidence_checksum,
+          evidenceGeneratedAt: request.body?.evidenceGeneratedAt || request.body?.evidence_generated_at,
+          backupReference: request.body?.backupReference || request.body?.backup_reference,
+          backupChecksum: request.body?.backupChecksum || request.body?.backup_checksum,
+          identityAuditReference: request.body?.identityAuditReference || request.body?.identity_audit_reference,
+          identityAuditChecksum: request.body?.identityAuditChecksum || request.body?.identity_audit_checksum,
+          complianceReference: request.body?.complianceReference || request.body?.compliance_reference,
+          senderAuthReference: request.body?.senderAuthReference || request.body?.sender_auth_reference,
+        });
+        response.status(201).json({ success: true, activation, automation: await getCimAutomationStatus() });
+      } catch (error) {
+        response.status(400).json({ success: false, error: error.message || 'Stage 2 activation was rejected.' });
+      }
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-stage2/run',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const mode = String(request.body?.mode || 'shadow').toLowerCase();
+      if (mode === 'active') {
+        response.status(400).json({ success: false, error: 'Active-mode runs are not available from this rollout endpoint.' });
+        return;
+      }
+      if (mode === 'canary' && request.body?.confirmation !== 'RUN CIM STAGE 2 CANARY') {
+        response.status(400).json({ success: false, error: 'Enter the exact confirmation phrase: RUN CIM STAGE 2 CANARY' });
+        return;
+      }
+      const result = await runCimStage2Automation({ mode, triggeredBy: session.username || 'admin' });
+      response.status(result.status || (result.ok ? 200 : 409)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/cim-stage2/runs/:id/decisions',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const page = Math.max(1, Math.min(Number.parseInt(request.query?.page, 10) || 1, 10));
+      const pageSize = Math.max(1, Math.min(Number.parseInt(request.query?.pageSize, 10) || 50, 100));
+      const start = (page - 1) * pageSize;
+      const decisions = await getStorage().listCimStage2Decisions({
+        runId: String(request.params.id || '').slice(0, 200),
+        limit: pageSize + 1,
+        offset: start,
+      });
+      response.json({
+        success: true,
+        page,
+        pageSize,
+        hasMore: decisions.length > pageSize,
+        decisions: decisions.slice(0, pageSize),
+      });
     }),
   );
 
@@ -1479,6 +1572,32 @@ export function createApp() {
       response.status(result.emailResult.status === 'failed' ? 502 : result.inProgress ? 409 : 200).json({
         success: !['failed', 'in-progress'].includes(result.emailResult.status),
         ...result,
+      });
+    }),
+  );
+
+  app.post(
+    '/api/deal-hunter/cim-stage2/run',
+    asyncRoute(async (request, response) => {
+      if (!requireDealHunterCron(request, config)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+      const mode = String(request.body?.mode || 'shadow').toLowerCase();
+      if (!['shadow', 'canary'].includes(mode)) {
+        response.status(400).json({ success: false, error: 'External Stage 2 runs are restricted to shadow or canary mode.' });
+        return;
+      }
+      const result = await runCimStage2Automation({ mode, triggeredBy: 'external-stage2-cron' });
+      response.status(result.status || (result.ok ? 200 : 409)).json({
+        success: Boolean(result.ok),
+        ok: Boolean(result.ok),
+        status: result.status,
+        error: result.error || '',
+        blockerCodes: result.blockerCodes || [],
+        providerCalls: Number(result.providerCalls || 0),
+        duplicateInvocation: Boolean(result.duplicateInvocation),
+        run: result.run || null,
       });
     }),
   );

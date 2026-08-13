@@ -73,6 +73,7 @@ Local data is stored under `data/` by default and is excluded from Git.
 | `npm run backup:verify` | Verify the newest or selected backup bundle |
 | `npm run backup:restore` | Restore a verified backup bundle |
 | `npm run backup:drill` | Execute the automated backup-and-restore recovery drill |
+| `npm run cim:stage2:audit` | Run the count-only, address-free Stage 2 readiness and linkage audit |
 
 Install the Playwright browser once before the first local browser run:
 
@@ -133,7 +134,7 @@ For operating and restore instructions, including Fly volume snapshots and the r
 
 Production should use `ADMIN_AUTH_MODE=magic-link` unless password login is deliberately required. Magic links are single-use. Successful login creates a server-side session whose ID is stored in a signed, secure, HTTP-only cookie. Logging out revokes the current session; “Sign Out Everywhere” revokes every active session for that identity.
 
-The `admin` role can mutate deal data, access Operations, export records, manage secure requests, and revoke sessions. The `viewer` role has limited read access and cannot open Operations or perform mutations.
+The `admin` role can mutate deal data, use Operations release controls, export records, manage secure requests, and revoke sessions. The `viewer` role has limited read access, can see the aggregate body-free and address-free Operations status, and cannot activate, run, pause, inspect Stage 2 decision details, or perform other mutations.
 
 ## Secure-document handling
 
@@ -169,7 +170,7 @@ fly status -a uckele-group
 curl -i https://www.uckelegroup.com/api/ready
 ```
 
-See [docs/deployment.md](docs/deployment.md) and [docs/backend-setup.md](docs/backend-setup.md) for the full provider and production checklist.
+See [docs/deployment.md](docs/deployment.md), [docs/backend-setup.md](docs/backend-setup.md), and the [guarded CIM Stage 2 rollout runbook](docs/cim-stage2-rollout.md) for the full provider and production checklist.
 
 For the CRM follow-up rollout, provider receiving setup, compliance review, monitoring, ambiguous-send incident handling, and rollback procedure, see [docs/follow-up-operations.md](docs/follow-up-operations.md). Deployment is a separate, explicit operator action; this repository does not enable the feature or perform live sends by itself.
 

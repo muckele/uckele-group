@@ -70,6 +70,152 @@ function sanitizeCommunicationOperations(status = {}) {
   };
 }
 
+function sanitizeViewerCimAutomation(status = {}) {
+  const sourceMetrics = status.metrics || {};
+  const metrics = Object.fromEntries([
+    'reviewed', 'canonicalHumanReviews', 'rawHumanReviewRows', 'compatibleEvidence', 'legacyUnversionedEvidence',
+    'incompatibleEvidence', 'unlinkedEvidence', 'ambiguousEvidence', 'unsupportedActorEvidence',
+    'remainingStage2Reviews', 'stage2EligibleCohort', 'stage2UnchangedApprovals',
+    'stage2CohortIdentityProblems', 'stage2UnchangedApprovalRate', 'automatedReviews',
+    'approved', 'rejected', 'approvalRate', 'rejectionRate', 'recipientEdits',
+    'recipientEditRate', 'requests', 'sent', 'logicalInitialMessages', 'rawLifecycleEvents',
+    'delivered', 'bounced', 'complained', 'failed', 'adverseInitials', 'adverseEventWindowDays', 'explicitOptOuts',
+    'activeSuppressions', 'deliveryRate', 'bounceRate', 'replies', 'replyRate',
+    'positiveResponses', 'positiveResponseRate', 'duplicateListingRate', 'incorrectRecipientRate',
+  ].map((key) => [key, sourceMetrics[key]]));
+  const activation = status.activation ? {
+    id: status.activation.id,
+    mode: status.activation.mode,
+    createdAt: status.activation.createdAt,
+    expiresAt: status.activation.expiresAt,
+    policyHash: status.activation.policyHash,
+    sourcePolicyHash: status.activation.sourcePolicyHash,
+    evidenceChecksum: status.activation.evidenceChecksum,
+  } : null;
+  const sourcePolicy = status.policy?.sourcePolicy || {};
+  const policy = {
+    configuredStage: status.policy?.configuredStage ?? status.configuredStage ?? 1,
+    stage2MinimumReviews: status.policy?.stage2MinimumReviews,
+    stage2MinimumEligibleCohort: status.policy?.stage2MinimumEligibleCohort,
+    stage2MinimumUnchangedApprovalRate: status.policy?.stage2MinimumUnchangedApprovalRate,
+    shadowFreshnessHours: status.policy?.shadowFreshnessHours,
+    activationMaxAgeHours: status.policy?.activationMaxAgeHours,
+    adverseEventWindowDays: status.policy?.adverseEventWindowDays,
+    rules: status.policy?.rules || {},
+    sourcePolicy: {
+      version: sourcePolicy.version || '',
+      allowedSourceIds: sourcePolicy.allowedSourceIds || [],
+      exclusiveProvenanceRequired: Boolean(sourcePolicy.exclusiveProvenanceRequired),
+      blockingCoverageWarnings: Boolean(sourcePolicy.blockingCoverageWarnings),
+      maximumAgeHours: sourcePolicy.maximumAgeHours,
+    },
+    sourcePolicyHash: status.policy?.sourcePolicyHash || '',
+    window: status.policy?.window || {},
+    caps: status.policy?.caps || {},
+    compliance: status.policy?.compliance || {},
+    policyHash: status.policy?.policyHash || '',
+  };
+  return {
+    ...status,
+    metrics,
+    policy,
+    activation,
+    latestShadowRun: status.latestShadowRun ? {
+      id: status.latestShadowRun.id,
+      mode: status.latestShadowRun.mode,
+      status: status.latestShadowRun.status,
+      created_at: status.latestShadowRun.created_at,
+      completed_at: status.latestShadowRun.completed_at,
+      considered_count: status.latestShadowRun.considered_count,
+      eligible_count: status.latestShadowRun.eligible_count,
+      would_send_count: status.latestShadowRun.would_send_count,
+      blocked_counts: status.latestShadowRun.blocked_counts,
+    } : null,
+    latestLiveRun: status.latestLiveRun ? {
+      id: status.latestLiveRun.id,
+      mode: status.latestLiveRun.mode,
+      status: status.latestLiveRun.status,
+      created_at: status.latestLiveRun.created_at,
+      completed_at: status.latestLiveRun.completed_at,
+      attempted_count: status.latestLiveRun.attempted_count,
+      accepted_count: status.latestLiveRun.accepted_count,
+      failed_count: status.latestLiveRun.failed_count,
+      ambiguous_count: status.latestLiveRun.ambiguous_count,
+      deferred_count: status.latestLiveRun.deferred_count,
+    } : null,
+  };
+}
+
+function sanitizeViewerCimIdentity(status = {}) {
+  return {
+    pause: {
+      paused: Boolean(status.pause?.paused),
+      source: status.pause?.source || '',
+      configurationPaused: Boolean(status.pause?.configurationPaused),
+      persistedPaused: Boolean(status.pause?.persistedPaused),
+      updatedAt: status.pause?.updatedAt || '',
+    },
+    followUpWindow: status.followUpWindow || {},
+    recipientPolicy: status.recipientPolicy || {},
+    storageHealthy: Boolean(status.storageHealthy),
+    canonicalOpportunities: Number(status.canonicalOpportunities || 0),
+    unresolvedIdentityExceptions: Number(status.unresolvedIdentityExceptions || 0),
+    duplicateActiveSequences: Number(status.duplicateActiveSequences || 0),
+    recipientsAtCap: Number(status.recipientsAtCap || 0),
+    recipientCapDeferrals: status.recipientCapDeferrals ?? null,
+    outOfWindowDeferrals: status.outOfWindowDeferrals ?? null,
+    missingOpportunityLinks: Number(status.missingOpportunityLinks || 0),
+    linkageMismatches: Number(status.linkageMismatches || 0),
+    rawLifecycleEvents: Number(status.rawLifecycleEvents || 0),
+    logicalMessages: Number(status.logicalMessages || 0),
+    lastAudit: status.lastAudit ? {
+      mode: status.lastAudit.mode || '',
+      generatedAt: status.lastAudit.generatedAt || '',
+      counts: status.lastAudit.counts || {},
+    } : null,
+    lastRepair: status.lastRepair ? {
+      id: status.lastRepair.id || '',
+      status: status.lastRepair.status || '',
+      createdAt: status.lastRepair.createdAt || '',
+      checksum: status.lastRepair.checksum || '',
+    } : null,
+    error: status.error || '',
+  };
+}
+
+export function sanitizeViewerOperations(operations = {}) {
+  return {
+    ...operations,
+    scheduler: {
+      ...operations.scheduler,
+      runs: (operations.scheduler?.runs || []).map((run) => ({
+        job_key: run.job_key,
+        job_name: run.job_name,
+        status: run.status,
+        created_at: run.created_at,
+        updated_at: run.updated_at,
+        attempt_count: run.attempt_count,
+      })),
+      error: operations.scheduler?.error ? 'Scheduler history is temporarily unavailable.' : '',
+    },
+    audit: { events: [], error: operations.audit?.error ? 'Audit history is temporarily unavailable.' : '' },
+    cleanup: {
+      jobs: [],
+      failures: [],
+      failureCount: (operations.cleanup?.failures || []).length,
+      error: operations.cleanup?.error ? 'Secure-document cleanup history is temporarily unavailable.' : '',
+    },
+    email: {
+      ...operations.email,
+      testRecipient: '',
+      allowedTestRecipients: [],
+    },
+    cimAutomation: sanitizeViewerCimAutomation(operations.cimAutomation),
+    cimIdentity: sanitizeViewerCimIdentity(operations.cimIdentity),
+    viewerAggregateOnly: true,
+  };
+}
+
 function settledPanel(result, fallback, error) {
   return result.status === 'fulfilled'
     ? { value: result.value, error: '' }

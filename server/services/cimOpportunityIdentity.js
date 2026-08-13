@@ -640,6 +640,9 @@ export function evaluateCimFollowUpWindow({ now = new Date(), settings = {} } = 
 }
 
 async function listBoundedCimCommunications(storage, limit = 5000) {
+  if (storage.listCimStage2MetricCommunications) {
+    return storage.listCimStage2MetricCommunications({ limit });
+  }
   if (!storage.listCrmCommunications) return [];
   const pageSize = 100;
   const first = await storage.listCrmCommunications({ page: 1, pageSize });
@@ -664,12 +667,18 @@ async function listBoundedCimEmailEvents(storage, recipients, limit = 10000) {
   return results.flat().slice(0, limit);
 }
 
-export async function getCimIdentityOperationsStatus({ storage = getStorage(), config = getConfig() } = {}) {
+export async function getCimIdentityOperationsStatus({ storage = getStorage(), config = getConfig(), privacySafe = false } = {}) {
   const [pause, opportunities, exceptions, requests, safety, repairManifests] = await Promise.all([
     getCimOutreachPauseStatus({ storage, config }),
-    storage.listDealHunterOpportunities?.({ limit: 5000 }) || [],
-    storage.listDealHunterIdentityExceptions?.({ statuses: ['open'], limit: 5000 }) || [],
-    storage.listDealHunterCimRequests?.({ limit: 5000 }) || [],
+    privacySafe && storage.listCimStage2IdentityOpportunities
+      ? storage.listCimStage2IdentityOpportunities({ limit: 5000 })
+      : storage.listDealHunterOpportunities?.({ limit: 5000 }) || [],
+    privacySafe && storage.listCimStage2IdentityExceptions
+      ? storage.listCimStage2IdentityExceptions({ statuses: ['open'], limit: 5000 })
+      : storage.listDealHunterIdentityExceptions?.({ statuses: ['open'], limit: 5000 }) || [],
+    privacySafe && storage.listCimStage2MetricRequests
+      ? storage.listCimStage2MetricRequests({ limit: 5000 })
+      : storage.listDealHunterCimRequests?.({ limit: 5000 }) || [],
     storage.getDealHunterCimSafetySettings?.() || null,
     storage.listDealHunterCimRepairManifests?.({ limit: 1 }) || [],
   ]);
@@ -712,7 +721,9 @@ export async function getCimIdentityOperationsStatus({ storage = getStorage(), c
     if ((request.opportunity_id && communication.opportunity_id !== request.opportunity_id)
       || (primarySubmissionId && communication.submission_id !== primarySubmissionId)) linkageMismatches += 1;
   }
-  const recipientEvents = await listBoundedCimEmailEvents(storage, [...requestsByRecipient.keys()]);
+  const recipientEvents = privacySafe && storage.listCimStage2MetricEmailEvents
+    ? await storage.listCimStage2MetricEmailEvents({ limit: 10000 })
+    : await listBoundedCimEmailEvents(storage, [...requestsByRecipient.keys()]);
   const events = recipientEvents.filter((event) => (
     cimCommunicationIds.has(event.communication_id)
     || cimProviderMessageIds.has(event.message_id)

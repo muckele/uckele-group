@@ -51,11 +51,15 @@ before(() => {
       const storedBeforeProviderCall = await activeStorage.listCrmCommunications({ page: 1, pageSize: 100 });
       const crmBeforeProviderCall = await activeStorage.listSubmissions({ page: 1, limit: 100, status: 'all' });
       assert.ok(crmBeforeProviderCall.total > 0, 'CRM lead must exist before provider transmission');
-      assert.ok(storedBeforeProviderCall.total > 0, 'exact communication must exist before provider transmission');
+      const providerBody = JSON.parse(options.body);
+      if (/^CIM \/ NDA request/i.test(providerBody.subject || '')) {
+        assert.ok(storedBeforeProviderCall.total > 0, 'exact CIM communication must exist before provider transmission');
+      }
       resendCalls.push({
-        body: JSON.parse(options.body),
+        body: providerBody,
         idempotencyKey: options.headers['Idempotency-Key'],
       });
+      if (resendMode === 'ambiguous') throw new Error('simulated transport timeout after request dispatch');
       if (resendMode === 'fail') return new Response('provider rejected test message', { status: 503 });
       return Response.json({ id: `resend-message-${resendCalls.length}` }, { status: 200 });
     }
@@ -217,6 +221,8 @@ test('CIM send links CRM and persists the exact message before provider acceptan
       maxCount: 3,
       weekdaysOnly: false,
       timezone: 'America/Los_Angeles',
+      sendWindowStart: '00:00',
+      sendWindowEnd: '23:59',
     },
   });
   assert.equal(followUp.sent, 1);
@@ -281,66 +287,47 @@ test('direct CIM send preserves the signed approved copy when a later healthy re
   assert.doesNotMatch(communication.body_html_sanitized, /changed after approval/i);
 });
 
-test('Stage 2 first contact sends and stores only a freshly verified server-signed snapshot', async (t) => {
+test('daily summary and Stage 2 shadow evaluation never transmit a broker first contact', async (t) => {
   const storage = testStorage(t);
   const {
+    cimStage2DailyLimit,
     reviewDailyDeals,
+    runCimStage2Automation,
     sendDailyDealHunterReview,
   } = await import('../server/services/dealHunter.js');
   const previewReview = await reviewDailyDeals({ storage });
   const previewDeal = previewReview.qualified.find((item) => item.cimRequest?.canRequest);
   assert.ok(previewDeal?.cimRequest?.snapshotToken, 'the current review must expose a signed snapshot');
 
-  await storage.insertDealHunterCimReviews(Array.from({ length: 25 }, (_, index) => ({
-    id: `stage-2-evidence-${index}`,
-    created_at: new Date(Date.now() - index * 1000).toISOString(),
-    deal_key: `reviewed-deal-${index}`,
-    decision: 'approved',
-    pass_reason: '',
-    original_recipient_email: `broker-${index}@example.test`,
-    final_recipient_email: `broker-${index}@example.test`,
-    recipient_edited: false,
-    score: 95,
-    actor: 'approval-admin',
-    automation_stage: 1,
-    metadata: { source: 'approval-queue' },
-  })));
-
-  const result = await sendDailyDealHunterReview({
+  const summary = await sendDailyDealHunterReview({
     idempotencyKey: 'stage-2-signed-snapshot-regression',
     storage,
   });
-  const brokerProviderCall = resendCalls.find((call) => call.body.subject === previewDeal.cimRequest.preview.subject);
-  const requests = await storage.listDealHunterCimRequests({ dealKeys: [previewDeal.dealKey], limit: 100 });
-  const [request] = requests;
-  const communications = await storage.listCrmCommunications({
-    cimRequestId: request?.id,
-    page: 1,
-    pageSize: 25,
+  const callsAfterSummary = resendCalls.length;
+  const shadow = await runCimStage2Automation({
+    mode: 'shadow',
+    triggeredBy: 'stage-2-shadow-regression',
+    storage,
   });
-  const [communication] = communications.rows;
-  const reviews = await storage.listDealHunterCimReviews({ limit: 1000 });
-  const automationAudit = reviews.find((review) => (
-    review.deal_key === previewDeal.dealKey && review.metadata?.source === 'automation'
-  ));
+  const brokerProviderCalls = resendCalls.filter((call) => call.body.subject === previewDeal.cimRequest.preview.subject);
+  const requests = await storage.listDealHunterCimRequests({ dealKeys: [previewDeal.dealKey], limit: 100 });
+  const runs = await storage.listCimStage2Runs({ mode: 'shadow', limit: 10 });
+  const decisions = await storage.listCimStage2Decisions({ runId: shadow.run.id, limit: 100 });
 
-  assert.equal(result.review.cimAutomation.effectiveStage, 2);
-  assert.equal(
-    result.review.cimAutomation.run.sent,
-    1,
-    JSON.stringify(result.review.cimAutomation.run),
-  );
-  assert.equal(result.review.cimAutomation.run.failed, 0);
-  assert.ok(brokerProviderCall, 'the eligible broker should receive the automatic first contact');
-  assert.equal(brokerProviderCall.body.subject, previewDeal.cimRequest.preview.subject);
-  assert.equal(brokerProviderCall.body.text, previewDeal.cimRequest.preview.text);
-  assert.equal(communication.subject, previewDeal.cimRequest.preview.subject);
-  assert.equal(communication.body_text, previewDeal.cimRequest.preview.text);
-  assert.equal(request.metadata.automationApproval.mode, 'server-signed-snapshot');
-  assert.equal(request.metadata.automationApproval.verified, true);
-  assert.match(request.metadata.automationApproval.snapshotDigest, /^[a-f0-9]{64}$/);
-  assert.equal(request.metadata.automationApproval.stage, 2);
-  assert.ok(automationAudit, 'the successful automatic approval must retain its post-send audit row');
+  assert.equal(summary.review.cimAutomation.run.mode, 'internal-summary-preview');
+  assert.equal(summary.review.cimAutomation.run.providerCalls, 0);
+  assert.equal(summary.review.cimAutomation.run.sent, 0);
+  assert.equal(shadow.providerCalls, 0);
+  assert.equal(shadow.run.mode, 'shadow');
+  assert.equal(shadow.run.attempted, 0);
+  assert.equal(cimStage2DailyLimit('shadow', { caps: { canaryDailyInitials: 1, activeDailyInitials: 3 } }), 1);
+  assert.equal(resendCalls.length, callsAfterSummary, 'shadow evaluation must not call any provider');
+  assert.equal(brokerProviderCalls.length, 0, 'daily summary and shadow evaluation must never send broker copy');
+  assert.equal(requests.length, 0, 'shadow evaluation must not create a CIM request sequence');
+  assert.equal(runs.length, 1);
+  assert.ok(decisions.length > 0, 'every considered canonical opportunity should retain a durable decision');
+  assert.equal(previewReview.cimAutomation.effectiveStage, 1, 'configuration alone cannot activate Stage 2');
+  assert.equal(previewReview.cimAutomation.activationMode, 'off');
 });
 
 test('an automation actor cannot use the direct-send fallback without the private verified snapshot boundary', async (t) => {
@@ -360,6 +347,17 @@ test('an automation actor cannot use the direct-send fallback without the privat
   assert.equal(resendCalls.length, 0);
   assert.equal((await storage.listDealHunterCimRequests({ dealKeys: [deal.dealKey], limit: 100 })).length, 0);
   assert.equal((await storage.listCrmCommunications({ page: 1, pageSize: 25 })).total, 0);
+
+  const stage3Result = await sendDealHunterCimRequest({
+    dealKey: deal.dealKey,
+    snapshotToken: deal.cimRequest.snapshotToken,
+    requestedBy: 'automation-stage-3',
+    storage,
+  });
+  assert.equal(stage3Result.ok, false);
+  assert.equal(stage3Result.status, 409);
+  assert.match(stage3Result.error, /Stage 3 automatic transmission is not implemented/i);
+  assert.equal(resendCalls.length, 0);
 });
 
 test('an initial provider failure retries the same exact persisted communication and idempotency key', async (t) => {
@@ -415,6 +413,42 @@ test('an initial provider failure retries the same exact persisted communication
   assert.equal(afterRetry.rows[0].body_text, originalBody);
 });
 
+test('an ambiguous Resend transport outcome is durable and cannot be retransmitted', async (t) => {
+  const storage = testStorage(t);
+  const { sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
+  const deal = await reviewedDeal(storage);
+  resendMode = 'ambiguous';
+  const first = await sendDealHunterCimRequest({
+    dealKey: deal.dealKey,
+    snapshotToken: deal.cimRequest.snapshotToken,
+    requestedBy: 'ambiguity-test-admin',
+    storage,
+  });
+  const communicationPage = await storage.listCrmCommunications({ page: 1, pageSize: 25 });
+
+  assert.equal(first.ok, false);
+  assert.equal(first.status, 503);
+  assert.equal(first.providerOutcomeAmbiguous, true);
+  assert.equal(first.request.status, 'ambiguous');
+  assert.equal(first.request.request_state, 'provider_ambiguous');
+  assert.equal(first.request.delivery_state, 'ambiguous');
+  assert.equal(communicationPage.rows[0].delivery_state, 'ambiguous');
+  assert.equal(resendCalls.length, 1);
+
+  resendMode = 'ok';
+  const second = await sendDealHunterCimRequest({
+    dealKey: deal.dealKey,
+    snapshotToken: deal.cimRequest.snapshotToken,
+    requestedBy: 'ambiguity-test-admin',
+    storage,
+  });
+  assert.equal(second.ok, false);
+  assert.equal(second.status, 409);
+  assert.equal(second.providerOutcomeAmbiguous, true);
+  assert.match(second.error, /reconcile/i);
+  assert.equal(resendCalls.length, 1, 'an ambiguous permanent message identity must never be transmitted again automatically');
+});
+
 test('an archived linked CRM record blocks a fresh CIM send before claim, communication, or provider work', async (t) => {
   const storage = testStorage(t);
   const { sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
@@ -454,6 +488,32 @@ test('an archived linked CRM record blocks a fresh CIM send before claim, commun
   assert.equal(resendCalls.length, 0);
   assert.equal((await storage.listDealHunterCimRequests({ dealKeys: [deal.dealKey], limit: 100 })).length, 0);
   assert.equal((await storage.listCrmCommunications({ page: 1, pageSize: 25 })).total, 0);
+});
+
+test('a Deal Hunter dismissal winning after review stops the persisted initial before provider work', async (t) => {
+  const storage = testStorage(t);
+  const { sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
+  const deal = await reviewedDeal(storage);
+  storage.getDealHunterDisposition = async () => ({
+    id: 'late-dismissal',
+    deal_key: deal.dealKey,
+    disposition: 'dismissed',
+  });
+
+  const result = await sendDealHunterCimRequest({
+    dealKey: deal.dealKey,
+    snapshotToken: deal.cimRequest.snapshotToken,
+    requestedBy: 'dismissal-race-admin',
+    storage,
+  });
+  const communications = await storage.listCrmCommunications({ page: 1, pageSize: 25 });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 409);
+  assert.match(result.error, /dismissed before provider work/i);
+  assert.equal(resendCalls.length, 0);
+  assert.equal(communications.total, 1, 'the exact prepared communication remains as durable no-send evidence');
+  assert.equal(result.request.status, 'failed');
 });
 
 test('an archived linked CRM record blocks corrected-recipient retry before a second communication or provider call', async (t) => {
@@ -1147,6 +1207,8 @@ test('follow-up processing does not assign a subject-only reply across a shared 
       maxCount: 3,
       weekdaysOnly: false,
       timezone: 'America/Los_Angeles',
+      sendWindowStart: '00:00',
+      sendWindowEnd: '23:59',
     },
   });
 

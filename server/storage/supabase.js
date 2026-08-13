@@ -324,6 +324,36 @@ function normalizeDealHunterCimRepairManifestRow(row) {
     : null;
 }
 
+function normalizeCimStage2ActivationRow(row) {
+  return row
+    ? {
+        ...row,
+        weekdays_only: Boolean(row.weekdays_only),
+        metadata: typeof row.metadata === 'object' && row.metadata !== null && !Array.isArray(row.metadata) ? row.metadata : {},
+      }
+    : null;
+}
+
+function normalizeCimStage2RunRow(row) {
+  return row
+    ? {
+        ...row,
+        blocked_counts: typeof row.blocked_counts === 'object' && row.blocked_counts !== null && !Array.isArray(row.blocked_counts) ? row.blocked_counts : {},
+        metadata: typeof row.metadata === 'object' && row.metadata !== null && !Array.isArray(row.metadata) ? row.metadata : {},
+      }
+    : null;
+}
+
+function normalizeCimStage2DecisionRow(row) {
+  return row
+    ? {
+        ...row,
+        reasons: Array.isArray(row.reasons) ? row.reasons : [],
+        metadata: typeof row.metadata === 'object' && row.metadata !== null && !Array.isArray(row.metadata) ? row.metadata : {},
+      }
+    : null;
+}
+
 function normalizeAtomicMutationResult(operation, data) {
   if (!data || typeof data !== 'object') {
     return { applied: false, record: null, activity: null };
@@ -1389,6 +1419,18 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return (data || []).map(normalizeEmailEventRow);
     },
 
+    async listCimStage2MetricEmailEvents({ limit = 10000 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 10000, 100000));
+      const { data, error } = await client
+        .from('email_events')
+        .select('id,created_at,provider,event_type,message_id,provider_event_id,event_key,submission_id,communication_id,opportunity_id,source')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(safeLimit);
+      if (error) throw error;
+      return data || [];
+    },
+
     async listEmailEventsForSubmissions(submissionIds = [], limit = 5000) {
       const ids = normalizeList(submissionIds);
 
@@ -1887,6 +1929,20 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       };
     },
 
+    async listCimStage2MetricCommunications({ limit = 10000, offset = 0 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 10000, 100000));
+      const safeOffset = Math.max(0, Math.min(Number(offset) || 0, 100000));
+      const { data, error } = await client
+        .from('crm_communications')
+        .select('id,submission_id,cim_request_id,opportunity_id,direction,kind,provider,provider_message_id,occurred_at,created_at,delivery_state,delivery_state_at')
+        .eq('kind', 'deal-hunter-cim-request')
+        .order('occurred_at', { ascending: false })
+        .order('id', { ascending: false })
+        .range(safeOffset, safeOffset + safeLimit - 1);
+      if (error) throw error;
+      return data || [];
+    },
+
     async countCrmCommunications({
       submissionId = '', cimRequestId = '', unassigned = false, direction = '', contentStates = [], deliveryStates = [],
     } = {}) {
@@ -2083,6 +2139,24 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return data || [];
     },
 
+    async listCimStage2MetricReviews({ limit = 5000 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 5000, 100000));
+      const { data, error } = await client.from('deal_hunter_cim_reviews')
+        .select('id,created_at,deal_key,opportunity_id,decision,pass_reason,recipient_edited,score,actor,actor_role,automation_stage,snapshot_digest,evidence_version,rule_version,source_policy_version,source_policy_hash,source_ids,decision_at,review_source:metadata->>source,cohort_eligible:metadata->>stage2CohortEligible,response_outcome:metadata->>outcome')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(safeLimit);
+      if (error) throw error;
+      return (data || []).map((review) => ({
+        ...review,
+        metadata: {
+          source: review.review_source || '',
+          stage2CohortEligible: review.cohort_eligible === true || review.cohort_eligible === 'true',
+          outcome: review.response_outcome || '',
+        },
+      }));
+    },
+
     async getDealHunterAutomationSettings() {
       const { data, error } = await client.from('deal_hunter_automation_settings').select('*').eq('id', 'cim-initial-outreach').maybeSingle();
       if (error) throw error;
@@ -2100,6 +2174,156 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       const { data, error } = await client.from('deal_hunter_automation_settings').upsert(payload, { onConflict: 'id' }).select().single();
       if (error) throw error;
       return data;
+    },
+
+    async checkCimStage2Storage() {
+      const checks = await Promise.all([
+        client.from('deal_hunter_cim_stage2_activations').select('id', { head: true, count: 'exact' }),
+        client.from('deal_hunter_cim_stage2_runs').select('id', { head: true, count: 'exact' }),
+        client.from('deal_hunter_cim_stage2_decisions').select('id', { head: true, count: 'exact' }),
+        client.from('deal_hunter_cim_reviews').select('opportunity_id,snapshot_digest,evidence_version,rule_version,source_policy_version,source_policy_hash,source_ids,actor_role,decision_at').limit(1),
+      ]);
+      const errors = checks.map((result) => result.error?.message || '').filter(Boolean);
+      return { ok: errors.length === 0, errors: errors.map(() => 'Required Stage 2 storage is unavailable.') };
+    },
+
+    async getCurrentCimStage2Activation() {
+      const { data, error } = await client.from('deal_hunter_cim_stage2_activations')
+        .select('*').eq('status', 'current').order('created_at', { ascending: false }).limit(1).maybeSingle();
+      if (error) throw error;
+      return normalizeCimStage2ActivationRow(data);
+    },
+
+    async listCimStage2Activations({ limit = 50 } = {}) {
+      const { data, error } = await client.from('deal_hunter_cim_stage2_activations')
+        .select('*').order('created_at', { ascending: false }).limit(Math.max(1, Math.min(Number(limit) || 50, 500)));
+      if (error) throw error;
+      return (data || []).map(normalizeCimStage2ActivationRow);
+    },
+
+    async createCimStage2Activation(activation = {}) {
+      const { data, error } = await client.rpc('create_cim_stage2_activation', {
+        p_activation: { ...activation, status: 'current' },
+      });
+      if (error) throw error;
+      return normalizeCimStage2ActivationRow(data);
+    },
+
+    async getCimStage2Run({ id = '', runKey = '' } = {}) {
+      if (!id && !runKey) return null;
+      let query = client.from('deal_hunter_cim_stage2_runs').select('*');
+      query = id ? query.eq('id', id) : query.eq('run_key', runKey);
+      const { data, error } = await query.limit(1).maybeSingle();
+      if (error) throw error;
+      return normalizeCimStage2RunRow(data);
+    },
+
+    async claimCimStage2Run(run = {}) {
+      const payload = {
+        ...run,
+        updated_at: run.updated_at || run.created_at,
+        activation_id: run.activation_id || null,
+        blocked_counts: {},
+        metadata: run.metadata || {},
+      };
+      const { data, error } = await client.from('deal_hunter_cim_stage2_runs').insert(payload).select().single();
+      if (!error) return { claimed: true, run: normalizeCimStage2RunRow(data) };
+      if (error.code !== '23505') throw error;
+      return { claimed: false, run: await this.getCimStage2Run({ runKey: run.run_key }) };
+    },
+
+    async updateCimStage2Run(id, updates = {}) {
+      const safe = {
+        ...updates,
+        activation_id: updates.activation_id || null,
+        blocked_counts: updates.blocked_counts || {},
+        metadata: updates.metadata || {},
+      };
+      const { data, error } = await client.from('deal_hunter_cim_stage2_runs').update(safe).eq('id', id).select().single();
+      if (error) throw error;
+      return normalizeCimStage2RunRow(data);
+    },
+
+    async listCimStage2Runs({ mode = '', policyHash = '', limit = 50 } = {}) {
+      let query = client.from('deal_hunter_cim_stage2_runs').select('*').order('created_at', { ascending: false });
+      if (mode) query = query.eq('mode', mode);
+      if (policyHash) query = query.eq('policy_hash', policyHash);
+      const { data, error } = await query.limit(Math.max(1, Math.min(Number(limit) || 50, 500)));
+      if (error) throw error;
+      return (data || []).map(normalizeCimStage2RunRow);
+    },
+
+    async insertCimStage2Decisions(decisions = []) {
+      const safe = (Array.isArray(decisions) ? decisions : []).slice(0, 500).map((item) => ({
+        ...item,
+        updated_at: item.updated_at || item.created_at,
+        activation_id: item.activation_id || null,
+        reasons: item.reasons || [],
+        metadata: item.metadata || {},
+      }));
+      if (safe.length === 0) return [];
+      const { error } = await client.from('deal_hunter_cim_stage2_decisions').upsert(safe, {
+        onConflict: 'run_id,opportunity_id,policy_hash', ignoreDuplicates: true,
+      });
+      if (error) throw error;
+      return this.listCimStage2Decisions({ runId: safe[0].run_id, limit: 500 });
+    },
+
+    async getCimStage2Decision(id) {
+      const { data, error } = await client.from('deal_hunter_cim_stage2_decisions').select('*').eq('id', id).maybeSingle();
+      if (error) throw error;
+      return normalizeCimStage2DecisionRow(data);
+    },
+
+    async listCimStage2Decisions({ runId = '', opportunityId = '', state = '', limit = 100, offset = 0 } = {}) {
+      let query = client.from('deal_hunter_cim_stage2_decisions').select('*').order('created_at', { ascending: false });
+      if (runId) query = query.eq('run_id', runId);
+      if (opportunityId) query = query.eq('opportunity_id', opportunityId);
+      if (state) query = query.eq('decision_state', state);
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 500));
+      const safeOffset = Math.max(0, Math.min(Number(offset) || 0, 10000));
+      const { data, error } = await query.range(safeOffset, safeOffset + safeLimit - 1);
+      if (error) throw error;
+      return (data || []).map(normalizeCimStage2DecisionRow);
+    },
+
+    async claimCimStage2Decision({ id = '', claimToken = '', claimedAt = '', activationId = '' } = {}) {
+      const { data, error } = await client.rpc('claim_cim_stage2_decision', {
+        p_id: id,
+        p_claim_token: claimToken,
+        p_claimed_at: claimedAt,
+        p_activation_id: activationId || null,
+      });
+      if (error) {
+        if (error.code === '23505') return { claimed: false, decision: await this.getCimStage2Decision(id) };
+        throw error;
+      }
+      return { claimed: Boolean(data?.claimed), decision: normalizeCimStage2DecisionRow(data?.decision) };
+    },
+
+    async transitionCimStage2Decision({ id = '', expectedStates = [], state = '', updates = {} } = {}) {
+      const payload = {
+        ...updates,
+        decision_state: state,
+        updated_at: updates.updated_at || new Date().toISOString(),
+      };
+      const { data, error } = await client.from('deal_hunter_cim_stage2_decisions')
+        .update(payload).eq('id', id).in('decision_state', expectedStates).select().maybeSingle();
+      if (error) throw error;
+      return { applied: Boolean(data), decision: normalizeCimStage2DecisionRow(data || await this.getCimStage2Decision(id)) };
+    },
+
+    async countCimStage2Capacity({ pacificBusinessDate = '' } = {}) {
+      const { data: runs, error: runsError } = await client.from('deal_hunter_cim_stage2_runs')
+        .select('id').eq('pacific_business_date', pacificBusinessDate).in('mode', ['canary', 'active']);
+      if (runsError) throw runsError;
+      const runIds = (runs || []).map((run) => run.id);
+      if (runIds.length === 0) return 0;
+      const { count, error } = await client.from('deal_hunter_cim_stage2_decisions')
+        .select('id', { head: true, count: 'exact' }).in('run_id', runIds)
+        .in('decision_state', ['claimed', 'attempting', 'accepted', 'failed', 'ambiguous']);
+      if (error) throw error;
+      return Number(count || 0);
     },
 
     async getDealHunterCrmImport({ id = '', dealKey = '', listingIdentity = '' } = {}) {
@@ -2244,6 +2468,26 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return rows.map(normalizeDealHunterOpportunityRow);
     },
 
+    async listCimStage2IdentityOpportunities({ limit = 5000 } = {}) {
+      const { data, error } = await client.from('deal_hunter_opportunities')
+        .select('opportunity_id,primary_submission_id')
+        .order('updated_at', { ascending: false })
+        .order('opportunity_id')
+        .limit(Math.max(1, Math.min(Number(limit) || 5000, 100000)));
+      if (error) throw error;
+      return data || [];
+    },
+
+    async listCimStage2EvidenceAliases({ limit = 10000 } = {}) {
+      const { data, error } = await client.from('deal_hunter_opportunity_aliases')
+        .select('alias_type,alias_value,opportunity_id')
+        .order('last_observed_at', { ascending: false })
+        .order('alias_key')
+        .limit(Math.max(1, Math.min(Number(limit) || 10000, 100000)));
+      if (error) throw error;
+      return data || [];
+    },
+
     async findDealHunterOpportunityByAliases(aliasKeys = []) {
       const keys = normalizeList(aliasKeys);
       if (keys.length === 0) return null;
@@ -2364,6 +2608,18 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       const { data, error } = await query;
       if (error) throw error;
       return (data || []).map(normalizeDealHunterIdentityExceptionRow);
+    },
+
+    async listCimStage2IdentityExceptions({ statuses = [], limit = 5000 } = {}) {
+      const safeStatuses = normalizeList(statuses, 20);
+      let query = client.from('deal_hunter_identity_exceptions')
+        .select('id,status,created_at,updated_at')
+        .order('updated_at', { ascending: false })
+        .limit(Math.max(1, Math.min(Number(limit) || 5000, 100000)));
+      if (safeStatuses.length > 0) query = query.in('status', safeStatuses);
+      const { data, error } = await query;
+      if (error) throw error;
+      return data || [];
     },
 
     async claimDealHunterCimOpportunity({ opportunityId = '', requestId = '', recipientEmail = '', allowedRequestIds = [], nowIso = '', metadata = {} } = {}) {
@@ -2560,6 +2816,37 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         if (!data || data.length < upperBound - offset + 1) break;
       }
       return rows.map(normalizeDealHunterCimRequestRow);
+    },
+
+    async listCimStage2MetricRequests({ limit = 10000 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 10000, 100000));
+      const pageSize = Math.min(1000, safeLimit);
+      const rows = [];
+      for (let offset = 0; offset < safeLimit; offset += pageSize) {
+        const upperBound = Math.min(safeLimit, offset + pageSize) - 1;
+        const { data, error } = await client.from('deal_hunter_cim_requests')
+          .select('id,created_at,updated_at,deal_key,opportunity_id,recipient_email,status,provider_message_id,follow_up_count,last_follow_up_at,next_follow_up_at,responded_at,submission_id,request_state,delivery_state,delivery_state_at,follow_up_state,first_requested_at,first_provider_accepted_at,delivered_at,last_activity_at,initial_communication_id:metadata->>initialCommunicationId,metric_follow_ups:metadata->followUps')
+          .order('updated_at', { ascending: false })
+          .order('id', { ascending: true })
+          .range(offset, upperBound);
+        if (error) throw error;
+        rows.push(...(data || []).map((request) => ({
+          ...request,
+          metadata: {
+            initialCommunicationId: request.initial_communication_id || '',
+            followUps: Array.isArray(request.metric_follow_ups) ? request.metric_follow_ups.map((followUp) => ({
+              number: followUp?.number,
+              status: followUp?.status,
+              communicationId: followUp?.communicationId || '',
+              providerMessageId: followUp?.providerMessageId || '',
+              acceptedAt: followUp?.acceptedAt || '',
+              attemptedAt: followUp?.attemptedAt || '',
+            })) : [],
+          },
+        })));
+        if (!data || data.length < upperBound - offset + 1) break;
+      }
+      return rows;
     },
 
     async getLatestDealHunterCimRequestForSubmission(submissionId) {

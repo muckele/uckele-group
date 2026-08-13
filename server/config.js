@@ -215,14 +215,36 @@ export function getConfig() {
       },
       cimAutomation: {
         stage: Math.max(1, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_STAGE, 1), 3)),
-        paused: booleanFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_PAUSED, false),
+        paused: booleanFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_PAUSED, true),
         stage2MinimumReviews: Math.max(25, numberFromEnv(process.env.DEAL_HUNTER_CIM_STAGE2_MIN_REVIEWS, 25)),
+        stage2MinimumEligibleCohort: Math.max(10, numberFromEnv(process.env.DEAL_HUNTER_CIM_STAGE2_MIN_ELIGIBLE_COHORT, 10)),
+        stage2MinimumUnchangedApprovalRate: Math.max(0.95, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_STAGE2_MIN_UNCHANGED_APPROVAL_RATE, 0.95), 1)),
         stage3MinimumReviews: Math.max(50, numberFromEnv(process.env.DEAL_HUNTER_CIM_STAGE3_MIN_REVIEWS, 50)),
         stage3MinimumApprovalRate: Math.max(0.9, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_STAGE3_MIN_APPROVAL_RATE, 0.9), 1)),
-        minimumScore: Math.max(75, numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_MIN_SCORE, 90)),
-        maximumDailyInitials: Math.max(1, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_DAILY_CAP, 3), 10)),
-        maximumBrokerContacts30Days: Math.max(1, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_BROKER_30_DAY_CAP, 3), 20)),
+        ruleVersion: 'cim-stage2-trusted-rules-v2',
+        sourcePolicyVersion: 'cim-stage2-smb-sheet-only-v1',
+        minimumScore: Math.max(90, numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_MIN_SCORE, 90)),
+        canaryDailyInitialCap: 1,
+        activeDailyInitialCap: Math.max(1, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_DAILY_CAP, 3), 10)),
+        recipientFirstContactOnly: true,
         maximumProfitMultiple: Math.max(1, numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_MAX_PROFIT_MULTIPLE, 4)),
+        timezone: process.env.DEAL_HUNTER_CIM_AUTOMATION_TIMEZONE || 'America/Los_Angeles',
+        sendWindowStart: process.env.DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_START || '08:00',
+        sendWindowEnd: process.env.DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_END || '17:00',
+        weekdaysOnly: booleanFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_WEEKDAYS_ONLY, true),
+        allowedSourceIds: listFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_ALLOWED_SOURCE_IDS || 'sheet-0'),
+        maximumSourceAgeHours: Math.max(1, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_SOURCE_MAX_AGE_HOURS, 24), 168)),
+        shadowFreshnessHours: Math.max(1, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_SHADOW_MAX_AGE_HOURS, 24), 168)),
+        activationMaxAgeHours: Math.max(1, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_ACTIVATION_MAX_AGE_HOURS, 168), 720)),
+        adverseEventWindowDays: Math.max(7, Math.min(numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_ADVERSE_WINDOW_DAYS, 30), 90)),
+        physicalPostalAddress: process.env.DEAL_HUNTER_CIM_AUTOMATION_PHYSICAL_POSTAL_ADDRESS || process.env.EMAIL_BRAND_MAILING_ADDRESS || '',
+        replyOptOutEnabled: booleanFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_REPLY_OPT_OUT_ENABLED, false),
+        complianceClassificationReference: process.env.DEAL_HUNTER_CIM_AUTOMATION_COMPLIANCE_REFERENCE || '',
+        copyAcceptanceReference: process.env.DEAL_HUNTER_CIM_AUTOMATION_COPY_ACCEPTANCE_REFERENCE || '',
+        senderAuthenticationReference: process.env.DEAL_HUNTER_CIM_AUTOMATION_SENDER_AUTH_REFERENCE || '',
+        dmarcReviewReference: process.env.DEAL_HUNTER_CIM_AUTOMATION_DMARC_REVIEW_REFERENCE || '',
+        schedulerEnabled: booleanFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED, false),
+        schedulerCheckIntervalMs: Math.max(60_000, numberFromEnv(process.env.DEAL_HUNTER_CIM_AUTOMATION_CHECK_INTERVAL_MS, 15 * 60 * 1000)),
       },
     },
     secureDocuments: {
@@ -337,6 +359,14 @@ export function validateConfig(config = getConfig()) {
   }
 
   try {
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: config.dealHunter.cimAutomation?.timezone || 'America/Los_Angeles',
+    }).format();
+  } catch {
+    errors.push('DEAL_HUNTER_CIM_AUTOMATION_TIMEZONE is not a valid IANA timezone.');
+  }
+
+  try {
     new Intl.DateTimeFormat('en-US', { timeZone: config.backup?.timezone || 'America/Los_Angeles' }).format();
   } catch {
     errors.push('BACKUP_TIMEZONE is not a valid IANA timezone.');
@@ -401,6 +431,7 @@ export function validateConfig(config = getConfig()) {
   requirePositiveNumber(config.dealHunter.cimFollowUp?.checkIntervalMs, 'DEAL_HUNTER_CIM_FOLLOW_UP_CHECK_INTERVAL_MS');
   requirePositiveNumber(config.dealHunter.cimFollowUp?.firstDelayHours, 'DEAL_HUNTER_CIM_FOLLOW_UP_FIRST_DELAY_HOURS');
   requirePositiveNumber(config.dealHunter.cimFollowUp?.intervalHours, 'DEAL_HUNTER_CIM_FOLLOW_UP_INTERVAL_HOURS');
+  requirePositiveNumber(config.dealHunter.cimAutomation?.schedulerCheckIntervalMs, 'DEAL_HUNTER_CIM_AUTOMATION_CHECK_INTERVAL_MS');
   requireNonNegativeNumber(config.dealHunter.cimFollowUp?.maxCount, 'DEAL_HUNTER_CIM_FOLLOW_UP_MAX_COUNT', { integer: true, max: 10 });
   requirePositiveNumber(config.dealHunter.cimOutreach?.recipientCap24Hours, 'DEAL_HUNTER_CIM_RECIPIENT_24_HOUR_CAP', { integer: true, max: 100 });
   requirePositiveNumber(config.dealHunter.cimOutreach?.recipientCap30Days, 'DEAL_HUNTER_CIM_RECIPIENT_30_DAY_TOUCH_CAP', { integer: true, max: 500 });
@@ -422,6 +453,21 @@ export function validateConfig(config = getConfig()) {
   });
   if (cimWindowMinutes.every((value) => value !== null) && cimWindowMinutes[0] >= cimWindowMinutes[1]) {
     errors.push('DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_START must be earlier than DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_END.');
+  }
+  const stage2WindowTimes = [
+    [config.dealHunter.cimAutomation?.sendWindowStart ?? '08:00', 'DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_START'],
+    [config.dealHunter.cimAutomation?.sendWindowEnd ?? '17:00', 'DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_END'],
+  ];
+  const stage2WindowMinutes = stage2WindowTimes.map(([value, name]) => {
+    const match = String(value || '').match(/^(\d{2}):(\d{2})$/);
+    if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) {
+      errors.push(`${name} must use a valid zero-padded 24-hour HH:MM value.`);
+      return null;
+    }
+    return Number(match[1]) * 60 + Number(match[2]);
+  });
+  if (stage2WindowMinutes.every((value) => value !== null) && stage2WindowMinutes[0] >= stage2WindowMinutes[1]) {
+    errors.push('DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_START must be earlier than DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_END.');
   }
   requirePositiveNumber(config.dealHunter.lookbackDays, 'DEAL_HUNTER_LOOKBACK_DAYS');
   requirePositiveNumber(config.dealHunter.maxSourceRecords, 'DEAL_HUNTER_MAX_SOURCE_RECORDS', { integer: true });

@@ -102,7 +102,7 @@ The production Fly machine runs the in-app scheduler once daily at the configure
 
 Phase 15 also records an atomic daily job claim in `scheduled_job_runs`. Admin, in-process scheduler, and external cron triggers share the same date-keyed claim, preventing overlapping triggers from sending duplicate daily emails. Successful provider delivery uses a deterministic idempotency key, local delivery evidence is written before completion bookkeeping, and stale in-progress claims remain retryable.
 
-Apply all committed Supabase migrations before deploying this version when `STORAGE_PROVIDER=supabase` is used. In particular, `20260806120000_crm_communications_lifecycle.sql` adds first-class communications, the expanded CIM lifecycle, Deal Hunter dispositions, and the atomic RPCs used by this release; `20260810130000_deal_os_exports.sql` adds the server-only normalized Deal OS import history; and `20260812130000_cim_canonical_identity_safety.sql` adds immutable canonical opportunities, auditable aliases/exceptions, recipient and opportunity claims, the central pause, repair manifests, linkage columns, and service-role-only repair RPCs. SQLite applies the equivalent additive migration automatically at startup; take and verify a backup before starting the upgraded process against production data.
+Apply all committed Supabase migrations before deploying this version when `STORAGE_PROVIDER=supabase` is used. In particular, `20260806120000_crm_communications_lifecycle.sql` adds first-class communications, the expanded CIM lifecycle, Deal Hunter dispositions, and the atomic RPCs used by this release; `20260810130000_deal_os_exports.sql` adds the server-only normalized Deal OS import history; `20260812130000_cim_canonical_identity_safety.sql` adds immutable canonical opportunities, auditable aliases/exceptions, recipient and opportunity claims, the central pause, repair manifests, linkage columns, and service-role-only repair RPCs; and `20260813120000_cim_stage2_guarded_rollout.sql` adds versioned human-review evidence plus durable Stage 2 activations, runs, decisions, indexes, RLS, privilege revocation, and atomic claims. SQLite applies the equivalent additive migration automatically at startup; take and verify a backup before starting the upgraded process against production data.
 
 Optional external scheduler endpoint:
 
@@ -142,17 +142,28 @@ All CIM initial and follow-up paths also share the server-authoritative safety c
 
 Canonical identity resolution is deterministic. Exact aliases and provider listing IDs win first. A fingerprint-to-URL transition links only when normalized name, recipient, source history, geography, and at least two financial fields agree without material conflicts. Different provider listing IDs or conflicting geography/economics stay distinct. Weak same-title/same-broker evidence becomes an admin identity exception and blocks outreach. See [the incident and repair runbook](cim-identity-incident-2026-08-12.md).
 
-Initial CIM outreach uses a gated three-stage automation policy. Stage 1 is the production-safe default and requires administrator approval for every initial request. Stage 2 activates trusted-rule sends only after the configured minimum review history; Stage 3 additionally requires the configured review count and approval-rate threshold. Every higher-stage send creates and re-verifies a server-signed snapshot of the exact reviewed deal before persistence or transmission, and records the verified snapshot digest and automation stage on the durable request. Both higher stages retain daily and broker contact caps, source-health checks, suppression events, duplicate detection, and the Operations emergency pause.
+Initial CIM outreach uses a fail-closed staged policy. Stage 1 is the production-safe default and requires administrator approval for every initial request. Merely configuring Stage 2 or Stage 3 never permits an automatic send. Stage 2 requires compatible canonical human evidence, every named readiness gate, a fresh zero-send shadow run, a current durable release-owner activation, the separate automation pause to be clear, and final-boundary revalidation immediately before the provider call. Stage 3 is intentionally non-transmitting in this release.
+
+The daily Deal Hunter email is an internal summary only. It cannot invoke the broker-send path. Shadow, canary, and active work use a separate durable run/decision store. Shadow records bounded decisions with zero provider calls. Canary is capped at one automatic initial per Pacific business day. Automatic candidates must come exclusively from `sheet-0`, score at least 90, have resolved canonical identity, a source-provided named direct recipient, an original listing URL, trusted industry/geography/profit/multiple values, no prior opportunity or recipient outreach, no active claim, and no suppression, reply, adverse state, archive, dismissal, duplicate, or cap conflict.
 
 - `DEAL_HUNTER_CIM_AUTOMATION_STAGE=1` (`1`, `2`, or `3`)
-- `DEAL_HUNTER_CIM_AUTOMATION_PAUSED=false`
+- `DEAL_HUNTER_CIM_AUTOMATION_PAUSED=true`
 - `DEAL_HUNTER_CIM_STAGE2_MIN_REVIEWS=25`
+- `DEAL_HUNTER_CIM_STAGE2_MIN_ELIGIBLE_COHORT=10`
+- `DEAL_HUNTER_CIM_STAGE2_MIN_UNCHANGED_APPROVAL_RATE=0.95`
 - `DEAL_HUNTER_CIM_STAGE3_MIN_REVIEWS=50`
 - `DEAL_HUNTER_CIM_STAGE3_MIN_APPROVAL_RATE=0.90`
 - `DEAL_HUNTER_CIM_AUTOMATION_MIN_SCORE=90`
 - `DEAL_HUNTER_CIM_AUTOMATION_DAILY_CAP=3`
-- `DEAL_HUNTER_CIM_BROKER_30_DAY_CAP=3`
 - `DEAL_HUNTER_CIM_AUTOMATION_MAX_PROFIT_MULTIPLE=4`
+- `DEAL_HUNTER_CIM_AUTOMATION_ALLOWED_SOURCE_IDS=sheet-0`
+- `DEAL_HUNTER_CIM_AUTOMATION_TIMEZONE=America/Los_Angeles`
+- `DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_START=08:00`
+- `DEAL_HUNTER_CIM_AUTOMATION_SEND_WINDOW_END=17:00`
+- `DEAL_HUNTER_CIM_AUTOMATION_WEEKDAYS_ONLY=true`
+- `DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED=false`
+
+Keep automatic transmission off during ordinary code deployment: Stage 1, automation pause on, scheduler off, follow-ups off, and activation off or shadow. `npm run cim:stage2:audit` is the privacy-safe read-only audit. See [the Stage 2 rollout runbook](cim-stage2-rollout.md) before creating a canary activation.
 
 The production cadence is three persistent touches: first follow-up after 48 hours, second follow-up 72 hours later, and final follow-up 96 hours after that. With weekday-only delivery enabled, a follow-up that becomes due on Saturday or Sunday remains queued until the next scheduler check on a weekday in the configured timezone. The follow-up job checks for Resend inbound `email.received` webhook events before sending and stores them internally as replies. Configure the delivery provider webhook with `EMAIL_WEBHOOK_SECRET` or `RESEND_WEBHOOK_SECRET`; without inbound reply webhook events, the app can send due follow-ups but cannot automatically know when a broker responded. The job stops follow-ups on replies, bounces, complaints, failures, or unsubscribes.
 

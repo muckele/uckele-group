@@ -217,7 +217,7 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     );
 
     expect(screen.getByRole('button', { name: 'Review CIM Requests' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Send Daily Email' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Send Internal Daily Summary' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Retry CIM Request' })).toBeDisabled();
     expect(screen.getByText('Complete a successful source review before approving or sending CIM requests.')).toBeVisible();

@@ -135,6 +135,7 @@ test('readiness checks storage and the document vault', async () => {
       checks: {
         configuration: 'ok',
         storage: 'ok',
+        cimStage2Storage: 'ok',
         documentVault: 'ok',
       },
     });

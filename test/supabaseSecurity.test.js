@@ -39,6 +39,10 @@ const cimIdentityMigrationUrl = new URL(
   '../supabase/migrations/20260812130000_cim_canonical_identity_safety.sql',
   import.meta.url,
 );
+const cimStage2MigrationUrl = new URL(
+  '../supabase/migrations/20260813120000_cim_stage2_guarded_rollout.sql',
+  import.meta.url,
+);
 
 function currentAppTables(schema) {
   return Array.from(
@@ -139,7 +143,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const dealOsMigration = fs.readFileSync(dealOsMigrationUrl, 'utf8');
   const adminOnboardingMigration = fs.readFileSync(adminOnboardingMigrationUrl, 'utf8');
   const cimIdentityMigration = fs.readFileSync(cimIdentityMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}`;
+  const cimStage2Migration = fs.readFileSync(cimStage2MigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
@@ -152,6 +157,7 @@ test('Supabase migration and fresh schema isolate every current app table to the
   assert.doesNotMatch(dealOsMigration, /create\s+policy/i, 'Deal OS import table must not add public RLS policies');
   assert.doesNotMatch(adminOnboardingMigration, /create\s+policy/i, 'onboarding preference table must not add public RLS policies');
   assert.doesNotMatch(cimIdentityMigration, /create\s+policy/i, 'canonical CIM identity tables must not add public RLS policies');
+  assert.doesNotMatch(cimStage2Migration, /create\s+policy/i, 'Stage 2 authorization tables must not add public RLS policies');
   assertServerOnlyPrivileges(migration, 'forward migration');
   assert.match(analyticsMigration, /revoke all privileges on table public\.analytics_events from public, anon, authenticated;/i);
   assert.match(analyticsMigration, /grant all privileges on table public\.analytics_events to service_role;/i);
@@ -222,6 +228,20 @@ test('Supabase migration and fresh schema isolate every current app table to the
       `${sourceLabel} must compare audited repair versions before mutable relationship updates`,
     );
   }
+  for (const tableName of [
+    'deal_hunter_cim_stage2_activations',
+    'deal_hunter_cim_stage2_runs',
+    'deal_hunter_cim_stage2_decisions',
+  ]) {
+    assert.match(cimStage2Migration, new RegExp(`revoke all privileges on table public\\.${tableName} from public, anon, authenticated;`, 'i'));
+    assert.match(cimStage2Migration, new RegExp(`grant all privileges on table public\\.${tableName} to service_role;`, 'i'));
+  }
+  for (const functionName of ['create_cim_stage2_activation', 'claim_cim_stage2_decision']) {
+    assertServiceRoleOnlyFunction(cimStage2Migration, 'Stage 2 guarded rollout migration', functionName);
+    assertServiceRoleOnlyFunction(schema, 'fresh schema', functionName);
+  }
+  assert.match(cimStage2Migration, /pg_advisory_xact_lock[\s\S]*deal-hunter-cim-stage2-activation/i);
+  assert.match(cimStage2Migration, /pg_advisory_xact_lock[\s\S]*deal-hunter-cim-stage2-decision:/i);
   const serviceRoleFunctions = [
     'canonical_listing_identity',
     'delete_crm_submission_lifecycle',

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import EmailReadinessPanel from './EmailReadinessPanel';
 
 function formatDate(value) {
@@ -36,7 +36,25 @@ function PanelError({ children }) {
   return children ? <p className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900" role="status">{children}</p> : null;
 }
 
-export default function OperationsCenter({ data, loading = false, error = '', onSendEmailTest, emailTestSending = false, onToggleCimAutomation, cimAutomationUpdating = false, onToggleCimOutreach, cimOutreachUpdating = false }) {
+function shortHash(value) {
+  return value ? `${String(value).slice(0, 12)}…` : 'Not recorded';
+}
+
+function formatGateValue(value) {
+  if (value === null || value === undefined || value === '') return 'Not recorded';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+export default function OperationsCenter({
+  data, loading = false, error = '', onSendEmailTest, emailTestSending = false,
+  onToggleCimAutomation, cimAutomationUpdating = false, onToggleCimOutreach,
+  cimOutreachUpdating = false, onRunCimStage2, onActivateCimStage2,
+  cimStage2Updating = false, readOnly = false,
+}) {
+  const [decisionAudit, setDecisionAudit] = useState(null);
+  const [decisionAuditLoading, setDecisionAuditLoading] = useState(false);
+  const [decisionAuditError, setDecisionAuditError] = useState('');
   if (loading && !data) return <div className="space-y-4"><div className="panel p-7 text-sm text-ink/65" data-admin-tour="operations-readiness" role="status">Loading operations readiness…</div><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-history">Operations history will appear when the readiness check completes.</div><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-storage">Storage and recovery status will appear when the readiness check completes.</div></div>;
   if (error && !data) return <div className="space-y-4"><div className="rounded-2xl border border-red-200 bg-red-50 p-5 text-sm text-red-700" data-admin-tour="operations-readiness" role="alert">{error}</div><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-history">Operations history is temporarily unavailable.</div><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-storage">Storage and recovery status is temporarily unavailable.</div></div>;
   if (!data) return <div className="space-y-4"><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-readiness">No operations readiness data is available.</div><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-history">No operations history is available.</div><div className="panel p-5 text-sm text-ink/55" data-admin-tour="operations-storage">No storage status is available.</div></div>;
@@ -61,6 +79,60 @@ export default function OperationsCenter({ data, loading = false, error = '', on
   const communicationFailed = Math.max(0, Number(communications.failed || 0));
   const communicationUnassigned = Math.max(0, Number(communications.unassigned || 0));
   const communicationAttention = communicationPending + communicationFailed + communicationUnassigned;
+  const stage2Gates = cimAutomation.stage2Readiness || [];
+  const shadowRun = cimAutomation.latestShadowRun || null;
+  const liveRun = cimAutomation.latestLiveRun || null;
+
+  async function loadDecisionAudit(run, page = 1) {
+    if (readOnly || !run?.id) return;
+    setDecisionAuditLoading(true);
+    setDecisionAuditError('');
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/cim-stage2/runs/${encodeURIComponent(run.id)}/decisions?page=${page}&pageSize=100`, {
+        credentials: 'same-origin',
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to load Stage 2 decision evidence.');
+      setDecisionAudit({ ...result, run });
+    } catch (loadError) {
+      setDecisionAuditError(loadError.message || 'Unable to load Stage 2 decision evidence.');
+    } finally {
+      setDecisionAuditLoading(false);
+    }
+  }
+
+  function runCanary() {
+    const confirmation = window.prompt('Stage 2 canary sends one real broker email without per-opportunity approval. Enter exactly: RUN CIM STAGE 2 CANARY');
+    if (confirmation !== null) onRunCimStage2?.({ mode: 'canary', confirmation });
+  }
+
+  function activate(mode) {
+    const phrases = {
+      off: 'SET CIM STAGE 2 OFF',
+      shadow: 'ACTIVATE CIM STAGE 2 SHADOW',
+      canary: 'ACTIVATE CIM STAGE 2 CANARY',
+    };
+    const confirmation = window.prompt(`${mode === 'canary' ? 'Canary activation permits one automatic broker email per Pacific business day without per-opportunity approval. ' : ''}Enter exactly: ${phrases[mode]}`);
+    if (confirmation === null) return;
+    const reason = window.prompt('Record a substantive release reason (at least 20 characters):');
+    if (reason === null) return;
+    const payload = {
+      mode,
+      confirmation,
+      reason,
+      evidenceChecksum: cimAutomation.evidenceChecksum,
+      evidenceGeneratedAt: cimAutomation.evidenceGeneratedAt,
+    };
+    if (mode === 'canary') {
+      payload.backupReference = window.prompt('Fresh verified backup reference:') || '';
+      payload.backupChecksum = window.prompt('Backup SHA-256 checksum:') || '';
+      payload.identityAuditReference = window.prompt('Dry-run identity-audit reference:') || '';
+      payload.identityAuditChecksum = window.prompt('Identity-audit SHA-256 checksum:') || '';
+      payload.complianceReference = window.prompt('Compliance/copy acceptance reference:') || '';
+      payload.senderAuthReference = window.prompt('SPF/DKIM and DMARC acceptance reference:') || '';
+    }
+    onActivateCimStage2?.(payload);
+  }
 
   return (
     <div className="space-y-6" data-admin-tour="operations-readiness">
@@ -84,14 +156,14 @@ export default function OperationsCenter({ data, loading = false, error = '', on
           ))}
         </div>
       </nav>
-      <EmailReadinessPanel data={data.email} onSendTest={onSendEmailTest} testSending={emailTestSending} />
+      <EmailReadinessPanel data={data.email} onSendTest={readOnly ? undefined : onSendEmailTest} testSending={emailTestSending} />
       <section className="panel p-5 sm:p-7" aria-labelledby="cim-automation-heading">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">CIM outreach</p><h3 className="mt-2 text-xl font-semibold text-ink" id="cim-automation-heading">Automation stage and learning metrics</h3><p className="mt-2 text-sm text-ink/65">Configured Stage {cimAutomation.configuredStage || 1} · effective Stage {cimAutomation.effectiveStage || 1}</p></div>
-          <div className="flex flex-wrap gap-2">
+          <div><p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">CIM outreach</p><h3 className="mt-2 text-xl font-semibold text-ink" id="cim-automation-heading">Guarded Stage 2 rollout</h3><p className="mt-2 text-sm text-ink/65">Configured Stage {cimAutomation.configuredStage || 1} · evidence Stage {cimAutomation.evidenceStage || 1} · effective Stage {cimAutomation.effectiveStage || 1} · activation {cimAutomation.activationMode || 'off'}</p><p className="mt-1 text-sm font-semibold text-ink">Automatic transmission: {cimAutomation.automaticTransmissionAllowed ? 'ALLOWED under the current durable activation' : 'BLOCKED'}</p></div>
+          {!readOnly ? <div className="flex flex-wrap gap-2">
             <button className={`rounded-full border px-4 py-2.5 text-sm font-semibold ${outreachPaused ? 'border-moss bg-moss text-white' : 'border-red-200 bg-red-50 text-red-800'}`} disabled={cimOutreachUpdating} onClick={() => onToggleCimOutreach?.(!outreachPaused)} type="button">{cimOutreachUpdating ? 'Updating…' : outreachPaused ? 'Resume all CIM outreach' : 'Pause all CIM outreach'}</button>
             <button className={`rounded-full border px-4 py-2.5 text-sm font-semibold ${cimAutomation.paused ? 'border-moss bg-moss text-white' : 'border-line bg-white text-ink'}`} disabled={cimAutomationUpdating} onClick={() => onToggleCimAutomation?.(!cimAutomation.paused)} type="button">{cimAutomationUpdating ? 'Updating…' : cimAutomation.paused ? 'Resume automation only' : 'Pause automation only'}</button>
-          </div>
+          </div> : <p className="rounded-xl border border-line bg-fog px-3 py-2 text-xs text-ink/60">Aggregate read-only view. Activation, run, pause, and decision-detail controls require a full administrator.</p>}
         </div>
         <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
           {[['Canonical opportunities', cimIdentity.canonicalOpportunities ?? 0], ['Identity exceptions', cimIdentity.unresolvedIdentityExceptions ?? 0], ['Duplicate active sequences', cimIdentity.duplicateActiveSequences ?? 0], ['Linkage mismatches', cimIdentity.linkageMismatches ?? 'Link check unavailable'], ['Recipients currently at cap', cimIdentity.recipientsAtCap ?? 'Cap status unavailable'], ['Recipient-cap deferrals', cimIdentity.recipientCapDeferrals ?? 'Not tracked'], ['Out-of-window deferrals', cimIdentity.outOfWindowDeferrals ?? 'Not tracked'], ['Logical email messages', cimIdentity.logicalMessages ?? 'Logical count unavailable'], ['Raw lifecycle events', cimIdentity.rawLifecycleEvents ?? 'Raw count unavailable']].map(([metric, value]) => <div className="rounded-2xl border border-line bg-fog/60 p-4" key={metric}><p className="text-xs font-semibold uppercase tracking-[0.1em] text-ink/55">{metric}</p><p className="mt-2 text-xl font-semibold text-ink">{value}</p></div>)}
@@ -101,10 +173,20 @@ export default function OperationsCenter({ data, loading = false, error = '', on
         <p className="mt-2 text-xs text-ink/55">Latest read-only identity summary: {cimIdentity.lastAudit?.generatedAt ? formatDate(cimIdentity.lastAudit.generatedAt) : 'Unavailable'} · last applied repair: {cimIdentity.lastRepair?.createdAt ? `${formatDate(cimIdentity.lastRepair.createdAt)} · ${cimIdentity.lastRepair.status}` : 'Not recorded'}.</p>
         <PanelError>{cimIdentity.error}</PanelError>
         <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
-          {[['Reviewed', cimMetrics.reviewed || 0], ['Approval rate', `${cimMetrics.approvalRate || 0}%`], ['Recipient edits', `${cimMetrics.recipientEditRate || 0}%`], ['Delivery rate', `${cimMetrics.deliveryRate || 0}%`], ['Bounce rate', `${cimMetrics.bounceRate || 0}%`], ['Reply rate', `${cimMetrics.replyRate || 0}%`], ['Positive replies', `${cimMetrics.positiveResponseRate || 0}%`], ['Duplicate rate', `${cimMetrics.duplicateListingRate || 0}%`], ['Recipient issue rate', `${cimMetrics.incorrectRecipientRate || 0}%`]].map(([metric, value]) => <div className="rounded-2xl border border-line bg-fog/60 p-4" key={metric}><p className="text-xs font-semibold uppercase tracking-[0.1em] text-ink/55">{metric}</p><p className="mt-2 text-xl font-semibold text-ink">{value}</p></div>)}
+          {[['Canonical human reviews', cimMetrics.canonicalHumanReviews || 0], ['Still required', cimMetrics.remainingStage2Reviews ?? 'Unavailable'], ['Compatible evidence', cimMetrics.compatibleEvidence || 0], ['Legacy unversioned evidence', cimMetrics.legacyUnversionedEvidence || 0], ['Incompatible evidence', (cimMetrics.incompatibleEvidence || 0) + (cimMetrics.unlinkedEvidence || 0) + (cimMetrics.ambiguousEvidence || 0)], ['Eligible cohort', cimMetrics.stage2EligibleCohort || 0], ['Unchanged approval', `${cimMetrics.stage2UnchangedApprovalRate || 0}%`], ['Logical initials', cimMetrics.logicalInitialMessages || 0], ['Raw lifecycle events', cimMetrics.rawLifecycleEvents || 0], ['Delivered', cimMetrics.delivered || 0], ['Replies', cimMetrics.replies || 0], ['Complaints', cimMetrics.complained || 0], ['Bounces / failures', (cimMetrics.bounced || 0) + (cimMetrics.failed || 0)], ['Opt-outs', cimMetrics.explicitOptOuts || 0], ['Active suppressions', cimMetrics.activeSuppressions || 0], ['Ambiguous provider outcomes', cimAutomation.unresolvedAmbiguousDecisions || 0]].map(([metric, value]) => <div className="rounded-2xl border border-line bg-fog/60 p-4" key={metric}><p className="text-xs font-semibold uppercase tracking-[0.1em] text-ink/55">{metric}</p><p className="mt-2 text-xl font-semibold text-ink">{value}</p></div>)}
         </div>
-        <p className="mt-4 text-sm text-ink/65">Stage 2 readiness: {cimAutomation.stage2Ready ? 'ready' : `needs ${cimAutomation.policy?.stage2MinimumReviews || 25} reviewed requests`} · Stage 3 readiness: {cimAutomation.stage3Ready ? 'ready' : `${cimAutomation.policy?.stage3MinimumReviews || 50} reviews and ${Math.round((cimAutomation.policy?.stage3MinimumApprovalRate || 0.9) * 100)}% approval required`}.</p>
-        {Object.keys(cimMetrics.passReasons || {}).length > 0 ? <p className="mt-3 text-sm text-ink/65"><strong>Pass reasons:</strong> {Object.entries(cimMetrics.passReasons).sort((left, right) => right[1] - left[1]).map(([reason, count]) => `${reason}: ${count}`).join(' · ')}</p> : null}
+        <div className="mt-5 grid gap-4 lg:grid-cols-2">
+          <div className="rounded-2xl border border-line bg-white p-4"><p className="text-sm font-semibold text-ink">Bound policy and activation</p><p className="mt-2 break-all text-xs leading-5 text-ink/60">Rule {cimAutomation.policy?.rules?.version || cimAutomation.policy?.ruleVersion || 'Not recorded'} · policy {shortHash(cimAutomation.policy?.policyHash)} · source {shortHash(cimAutomation.policy?.sourcePolicyHash)} · evidence {shortHash(cimAutomation.evidenceChecksum)}</p><p className="mt-2 text-xs leading-5 text-ink/60">Actor {cimAutomation.activation?.actor || (readOnly ? 'Protected' : 'Not recorded')} · accepted {formatDate(cimAutomation.activation?.createdAt)} · expires {formatDate(cimAutomation.activation?.expiresAt)}</p></div>
+          <div className="rounded-2xl border border-line bg-white p-4"><p className="text-sm font-semibold text-ink">Pacific operating boundary</p><p className="mt-2 text-xs leading-5 text-ink/60">{cimAutomation.operatingWindow?.open ? 'Open now' : `Closed: ${cimAutomation.operatingWindow?.reason || 'unknown'}`} · {cimAutomation.policy?.window?.start || '08:00'}–{cimAutomation.policy?.window?.end || '17:00'} {cimAutomation.policy?.window?.timezone || 'America/Los_Angeles'} · weekdays only</p><p className="mt-2 text-xs text-ink/60">Capacity {cimAutomation.capacity?.used ?? '—'} / {cimAutomation.capacity?.limit ?? '—'} used · {cimAutomation.capacity?.remaining ?? '—'} remaining · {cimAutomation.capacity?.pacificBusinessDate || 'no date'}</p></div>
+        </div>
+        <div className="mt-5 grid gap-4 lg:grid-cols-2">
+          <div className="rounded-2xl border border-line bg-fog/60 p-4"><p className="text-sm font-semibold text-ink">Latest shadow run</p><p className="mt-2 text-xs leading-5 text-ink/65">{shadowRun ? `${shadowRun.status} · considered ${shadowRun.considered_count || 0} · eligible ${shadowRun.eligible_count || 0} · would send ${shadowRun.would_send_count || 0}` : 'No policy-matching shadow run recorded.'}</p>{shadowRun?.blocked_counts && Object.keys(shadowRun.blocked_counts).length ? <p className="mt-2 text-xs text-ink/60">Blocked: {Object.entries(shadowRun.blocked_counts).map(([code, count]) => `${code} ${count}`).join(' · ')}</p> : null}</div>
+          <div className="rounded-2xl border border-line bg-fog/60 p-4"><p className="text-sm font-semibold text-ink">Latest live run</p><p className="mt-2 text-xs leading-5 text-ink/65">{liveRun ? `${liveRun.mode} · ${liveRun.status} · attempted ${liveRun.attempted_count || 0} · accepted ${liveRun.accepted_count || 0} · failed ${liveRun.failed_count || 0} · ambiguous ${liveRun.ambiguous_count || 0} · deferred ${liveRun.deferred_count || 0}` : 'No canary or active run recorded.'}</p></div>
+        </div>
+        {!readOnly ? <div className="mt-4 rounded-2xl border border-line bg-white p-4"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-sm font-semibold text-ink">Protected per-candidate decision evidence</p><p className="mt-1 text-xs text-ink/60">Full administrators only. Recipient references remain SHA-256 hashes.</p></div><div className="flex flex-wrap gap-2">{shadowRun ? <button className="rounded-full border border-line bg-white px-3 py-2 text-xs font-semibold" disabled={decisionAuditLoading} onClick={() => loadDecisionAudit(shadowRun)} type="button">Inspect shadow decisions</button> : null}{liveRun ? <button className="rounded-full border border-line bg-white px-3 py-2 text-xs font-semibold" disabled={decisionAuditLoading} onClick={() => loadDecisionAudit(liveRun)} type="button">Inspect live decisions</button> : null}</div></div>{decisionAuditError ? <p className="mt-3 text-xs text-red-700" role="alert">{decisionAuditError}</p> : null}{decisionAudit ? <div className="mt-4"><p className="text-xs text-ink/60">{decisionAudit.run.mode} run · page {decisionAudit.page} · {decisionAudit.decisions.length} decision(s)</p><div className="mt-2 overflow-x-auto"><table className="min-w-full text-left text-xs"><thead><tr className="border-b border-line"><th className="px-2 py-2">Opportunity</th><th className="px-2 py-2">State</th><th className="px-2 py-2">Recipient hash</th><th className="px-2 py-2">Reasons</th></tr></thead><tbody>{decisionAudit.decisions.map((decision) => <tr className="border-b border-line/60" key={decision.id}><td className="max-w-48 break-all px-2 py-2">{decision.opportunity_id}</td><td className="px-2 py-2">{decision.decision_state}</td><td className="max-w-48 break-all px-2 py-2">{decision.recipient_hash}</td><td className="px-2 py-2">{(decision.reasons || []).join(', ') || 'eligible'}</td></tr>)}</tbody></table></div><div className="mt-3 flex gap-2"><button className="rounded-full border border-line px-3 py-1.5 text-xs font-semibold" disabled={decisionAuditLoading || decisionAudit.page <= 1} onClick={() => loadDecisionAudit(decisionAudit.run, decisionAudit.page - 1)} type="button">Previous</button><button className="rounded-full border border-line px-3 py-1.5 text-xs font-semibold" disabled={decisionAuditLoading || !decisionAudit.hasMore} onClick={() => loadDecisionAudit(decisionAudit.run, decisionAudit.page + 1)} type="button">Next</button></div></div> : null}</div> : null}
+        <div className="mt-5"><h4 className="text-sm font-semibold text-ink">Every Stage 2 readiness gate</h4><div className="mt-3 grid gap-2 lg:grid-cols-2">{stage2Gates.map((gate) => <div className={`rounded-xl border p-3 text-xs leading-5 ${gate.passed ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : 'border-red-200 bg-red-50 text-red-900'}`} key={gate.code}><strong>{gate.passed ? 'PASS' : 'BLOCK'} · {gate.code}</strong><p>{gate.passed ? 'Current evidence satisfies this gate.' : gate.reason}</p><p className="mt-1 break-words opacity-80">Observed: {formatGateValue(gate.observed)}</p><p className="break-words opacity-80">Required: {formatGateValue(gate.required)}</p><p className="opacity-70">Checked: {formatDate(gate.evidenceAt)}</p></div>)}</div></div>
+        <p className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950"><strong>Safe next action:</strong> {cimAutomation.safeNextAction || 'Refresh readiness evidence.'}</p>
+        {!readOnly ? <div className="mt-5 rounded-2xl border border-moss/20 bg-moss/5 p-4"><p className="text-sm font-semibold text-ink">Release-owner controls</p><p className="mt-2 text-xs leading-5 text-ink/65">Shadow performs zero provider work. Canary sends a real broker email without per-opportunity approval and is capped at one automatic initial per Pacific business day. Active mode and Stage 3 are intentionally unavailable here.</p><div className="mt-3 flex flex-wrap gap-2"><button className="rounded-full border border-line bg-white px-4 py-2 text-sm font-semibold text-ink" disabled={cimStage2Updating} onClick={() => onRunCimStage2?.({ mode: 'shadow' })} type="button">Run zero-send shadow</button><button className="rounded-full border border-amber-300 bg-amber-50 px-4 py-2 text-sm font-semibold text-amber-950" disabled={cimStage2Updating || !cimAutomation.automaticTransmissionAllowed || cimAutomation.activationMode !== 'canary'} onClick={runCanary} type="button">Run one-email canary</button><button className="rounded-full border border-line bg-white px-4 py-2 text-sm font-semibold text-ink" disabled={cimStage2Updating} onClick={() => activate('off')} type="button">Record off activation</button><button className="rounded-full border border-line bg-white px-4 py-2 text-sm font-semibold text-ink" disabled={cimStage2Updating} onClick={() => activate('shadow')} type="button">Record shadow activation</button><button className="rounded-full border border-red-300 bg-red-50 px-4 py-2 text-sm font-semibold text-red-900" disabled={cimStage2Updating || cimAutomation.evidenceStage < 2} onClick={() => activate('canary')} type="button">Accept canary activation…</button></div></div> : null}
         <PanelError>{cimAutomation.error}</PanelError>
       </section>
       <section aria-labelledby="core-systems-heading" data-admin-tour="operations-storage">

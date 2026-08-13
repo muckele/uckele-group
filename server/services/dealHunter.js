@@ -19,10 +19,17 @@ import {
   createCommunicationWithActivity,
 } from './communications.js';
 import {
+  assessCimStage2StaticCandidate,
+  authorizeCimStage2SendBoundary,
+  buildCimStage2DecisionRecord,
+  cimStage2SnapshotDigest,
   evaluateCimAutomationCandidates,
+  evaluateCimStage2Window,
+  getCimStage2Policy,
   getCimAutomationStatus,
-  isCimAutomationPaused,
-  recordCimReviewDecisions,
+  hashCimStage2Recipient,
+  reconcileCimStage2AmbiguousDecisions,
+  sourceSnapshotDigestForDeal,
 } from './cimAutomation.js';
 import {
   assertCimOutreachAllowed,
@@ -46,8 +53,8 @@ const cimRequestScoreThreshold = 75;
 const highFitScoreThreshold = 75;
 const watchlistScoreThreshold = 60;
 const cimRequestSentStatuses = ['sent', 'logged'];
-const cimRequestActiveStatuses = ['sent', 'logged', 'failed', 'follow_up_failed', 'follow_up_pending'];
-const cimRequestTerminalStatuses = ['sent', 'logged', 'responded', 'delivery_issue', 'follow_up_failed', 'follow_up_pending'];
+const cimRequestActiveStatuses = ['sent', 'logged', 'failed', 'ambiguous', 'follow_up_failed', 'follow_up_pending', 'follow_up_ambiguous'];
+const cimRequestTerminalStatuses = ['sent', 'logged', 'responded', 'delivery_issue', 'ambiguous', 'follow_up_failed', 'follow_up_pending', 'follow_up_ambiguous'];
 const replyEventTypes = new Set(['replied', 'received']);
 const stopFollowUpEventTypes = new Set(['bounced', 'complained', 'failed', 'unsubscribed']);
 const cimProviderAcceptedCommunicationStates = new Set([
@@ -4718,6 +4725,7 @@ function buildCimRequestRecord({
   const providerAccepted = status === 'sent';
   const developmentOnly = status === 'logged';
   const failed = status === 'failed';
+  const ambiguous = status === 'ambiguous';
   const followUpCount = Number(existingRequest?.follow_up_count || 0);
   const providerMessageIds = Array.from(
     new Set(
@@ -4756,6 +4764,8 @@ function buildCimRequestRecord({
       ? 'provider_accepted'
       : developmentOnly
         ? 'development_only'
+        : ambiguous
+          ? 'provider_ambiguous'
         : failed
           ? 'ready'
         : existingRequest?.request_state === 'responded'
@@ -4765,10 +4775,12 @@ function buildCimRequestRecord({
       ? 'accepted'
       : developmentOnly
         ? 'development-only'
+        : ambiguous
+          ? 'ambiguous'
         : failed
           ? 'failed'
           : existingRequest?.delivery_state || 'not-attempted',
-    follow_up_state: nextFollowUpAt ? 'scheduled' : (failed ? 'stopped' : existingRequest?.follow_up_state || 'not-scheduled'),
+    follow_up_state: ambiguous ? 'stopped' : nextFollowUpAt ? 'scheduled' : (failed ? 'stopped' : existingRequest?.follow_up_state || 'not-scheduled'),
     delivery_error: emailResult.error || '',
     provider_message_id: emailResult.providerMessageId || '',
     subject: `CIM / NDA request for ${businessName}`,
@@ -4786,7 +4798,7 @@ function buildCimRequestRecord({
     last_attempt_at: isPendingClaim ? now : existingRequest?.last_attempt_at || now,
     last_delivery_event_at: existingRequest?.last_delivery_event_at || null,
     last_activity_at: now,
-    delivery_state_at: providerAccepted || developmentOnly || failed ? now : existingRequest?.delivery_state_at || null,
+    delivery_state_at: providerAccepted || developmentOnly || failed || ambiguous ? now : existingRequest?.delivery_state_at || null,
     reply_to_address: existingRequest?.reply_to_address || replyToAddress || null,
     last_follow_up_at: existingRequest?.last_follow_up_at || null,
     next_follow_up_at: nextFollowUpAt,
@@ -4876,7 +4888,9 @@ async function updateCimCommunicationAfterSend(storage, communication, emailResu
     ? 'accepted'
     : emailResult.status === 'logged'
       ? 'development-only'
-      : 'failed';
+      : emailResult.status === 'ambiguous'
+        ? 'ambiguous'
+        : 'failed';
   return storage.updateCrmCommunication(communication.id, {
     provider_message_id: emailResult.providerMessageId || communication.provider_message_id || null,
     delivery_state: deliveryState,
@@ -5077,6 +5091,7 @@ function postProviderPersistenceError(kind, { communicationStatePersisted = fals
       : 'Do not retransmit it until provider delivery is reconciled.'}`,
   );
   error.status = 503;
+  error.providerAcceptedAmbiguous = true;
   return error;
 }
 
@@ -5193,10 +5208,15 @@ async function markCimRequestDeliveryIssue(storage, request, stopEvent) {
 function buildCimFollowUpUpdate(request, emailResult, followUpNumber, sentAt, communicationId = '') {
   const settings = getCimFollowUpSettings();
   const sent = ['sent', 'logged'].includes(emailResult.status);
+  const ambiguous = emailResult.status === 'ambiguous';
   const existingMetadata = request.metadata && typeof request.metadata === 'object' ? request.metadata : {};
   const existingFollowUps = Array.isArray(existingMetadata.followUps) ? existingMetadata.followUps : [];
   const followUpCount = sent ? Number(request.follow_up_count || 0) + 1 : Number(request.follow_up_count || 0);
-  const status = sent ? (cimRequestSentStatuses.includes(request.status) ? request.status : emailResult.status) : 'follow_up_failed';
+  const status = ambiguous
+    ? 'follow_up_ambiguous'
+    : sent
+      ? (cimRequestSentStatuses.includes(request.status) ? request.status : emailResult.status)
+      : 'follow_up_failed';
   const nextFollowUpAt = sent
     ? nextCimFollowUpAt({ status, followUpCount, lastTouchAt: sentAt })
     : addHoursIso(sentAt, settings.intervalHours) || null;
@@ -5224,16 +5244,20 @@ function buildCimFollowUpUpdate(request, emailResult, followUpNumber, sentAt, co
       ? 'accepted'
       : emailResult.status === 'logged'
         ? 'development-only'
-        : 'failed',
+        : ambiguous
+          ? 'ambiguous'
+          : 'failed',
     delivery_state_at: sentAt,
     delivery_error: emailResult.error || '',
     provider_message_id: emailResult.providerMessageId || request.provider_message_id || '',
     follow_up_count: followUpCount,
     last_follow_up_at: sent ? sentAt : request.last_follow_up_at || null,
-    next_follow_up_at: nextFollowUpAt,
+    next_follow_up_at: ambiguous ? null : nextFollowUpAt,
     follow_up_state: sent
       ? (nextFollowUpAt ? 'scheduled' : 'completed')
-      : 'failed',
+      : ambiguous
+        ? 'stopped'
+        : 'failed',
     first_provider_accepted_at: request.first_provider_accepted_at || (emailResult.status === 'sent' ? sentAt : null),
     last_attempt_at: sentAt,
     last_activity_at: sentAt,
@@ -5651,12 +5675,18 @@ async function processCimFollowUpRequest(storage, request, nowIso) {
         claimedRequest,
         {
           expectedStatuses: ['follow_up_pending'],
-          eventType: emailResult.status === 'failed' ? 'cim.follow-up-failed' : 'cim.follow-up-sent',
-          summary: emailResult.status === 'failed'
-            ? `CIM follow-up ${followUpNumber} provider attempt failed.`
-            : emailResult.status === 'logged'
-              ? `CIM follow-up ${followUpNumber} logged by the development-only console provider.`
-              : `CIM follow-up ${followUpNumber} accepted by the email provider; delivery is awaiting confirmation.`,
+          eventType: emailResult.status === 'ambiguous'
+            ? 'cim.follow-up-ambiguous'
+            : emailResult.status === 'failed'
+              ? 'cim.follow-up-failed'
+              : 'cim.follow-up-sent',
+          summary: emailResult.status === 'ambiguous'
+            ? `CIM follow-up ${followUpNumber} provider outcome is ambiguous; reconciliation is required before any retry.`
+            : emailResult.status === 'failed'
+              ? `CIM follow-up ${followUpNumber} provider attempt failed.`
+              : emailResult.status === 'logged'
+                ? `CIM follow-up ${followUpNumber} logged by the development-only console provider.`
+                : `CIM follow-up ${followUpNumber} accepted by the email provider; delivery is awaiting confirmation.`,
           actor: claimedRequest.requested_by || 'deal-hunter',
           metadata: {
             followUpNumber,
@@ -5677,9 +5707,10 @@ async function processCimFollowUpRequest(storage, request, nowIso) {
     }
 
     return {
-      status: emailResult.status === 'failed' ? 'failed' : 'sent',
+      status: emailResult.status === 'ambiguous' ? 'ambiguous' : emailResult.status === 'failed' ? 'failed' : 'sent',
       request: updatedRequest,
       emailResult,
+      providerOutcomeAmbiguous: emailResult.status === 'ambiguous',
       warning: communicationStateError
         ? ['sent', 'logged'].includes(emailResult.status)
           ? 'The provider accepted the follow-up, but its communication delivery state awaits reconciliation.'
@@ -5698,6 +5729,7 @@ function buildDealHunterCoverage(config, sourceResults = []) {
   const dealOsSource = sourceResults.find((result) => result.source.id === dealOsSourceId)?.source || null;
   const activeSourceNames = sourceResults.map((result) => result.source.name).filter(Boolean);
   const warnings = [];
+  const stage2Warnings = [];
   const disabledSources = [];
 
   if (!config.dealHunter.airtableEnabled) {
@@ -5716,11 +5748,14 @@ function buildDealHunterCoverage(config, sourceResults = []) {
   }
 
   if (dealOsSource?.coverageLimitReached) {
-    warnings.push(`The Deal OS export reached the ${config.dealHunter.dealOsExportMaxRecords}-listing import ceiling. Listings beyond the export cap may be absent.`);
+    const warning = `The Deal OS export reached the ${config.dealHunter.dealOsExportMaxRecords}-listing import ceiling. Listings beyond the export cap may be absent.`;
+    warnings.push(warning);
+    stage2Warnings.push(warning);
   }
 
   return {
     warnings,
+    stage2Warnings,
     disabledSources,
     dealOsImportPolicy: {
       acceptedExtensions: ['.csv', '.xlsx'],
@@ -5827,6 +5862,7 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
     sources: sourceResults.map((result) => result.source),
     disabledSources: coverage.disabledSources,
     coverageWarnings: coverage.warnings,
+    stage2CoverageWarnings: coverage.stage2Warnings,
     cimOutreachPause: outreachGate.status,
     dealOsImportPolicy: coverage.dealOsImportPolicy,
     totals: {
@@ -5869,15 +5905,24 @@ export async function reviewDailyDeals({ markSeen = false, storage = getStorage(
     storage.listDealHunterCimRequests?.({ limit: 100000 }) || [],
     storage.listEmailEvents?.({ limit: 100000 }) || [],
   ]);
-  const evaluated = automationStatus.effectiveStage > 1
-    ? evaluateCimAutomationCandidates({ review: result.review, scoredDeals: result.scoredDeals, status: automationStatus, requests, events })
-    : {
-        eligible: [],
-        exceptions: result.scoredDeals.filter((deal) => deal.cimRequest?.canRequest).map((deal) => ({
-          dealKey: deal.dealKey, name: deal.name, recipientEmail: deal.brokerEmail, score: deal.score, reasons: ['Stage 1 requires manual approval'],
-        })),
-      };
-  result.review.cimAutomation = { ...automationStatus, run: { ...evaluated, sent: 0, failed: 0, results: [] } };
+  const evaluated = evaluateCimAutomationCandidates({
+    review: result.review,
+    scoredDeals: result.scoredDeals,
+    status: automationStatus,
+    requests,
+    events,
+  });
+  result.review.cimAutomation = {
+    ...automationStatus,
+    run: {
+      mode: 'preview-only',
+      ...evaluated,
+      sent: 0,
+      failed: 0,
+      providerCalls: 0,
+      results: [],
+    },
+  };
 
   if (markSeen) {
     await persistDealHunterHistory(result.storage, result.scoredDeals);
@@ -6008,112 +6053,25 @@ export async function sendDailyDealHunterReview({ idempotencyKey = '', storage =
     storage.listDealHunterCimRequests?.({ limit: 100000 }) || [],
     storage.listEmailEvents?.({ limit: 100000 }) || [],
   ]);
-  const todayKey = new Date().toISOString().slice(0, 10);
-  const sentToday = existingRequests.filter((request) => String(request.created_at || '').startsWith(todayKey)).length;
-  const remainingDailyCapacity = Math.max(0, automationStatus.policy.maximumDailyInitials - sentToday);
-  let automationRun = { eligible: [], exceptions: [], sent: 0, failed: 0, results: [] };
-
-  if (automationStatus.effectiveStage > 1 && !automationStatus.paused && remainingDailyCapacity > 0) {
-    const evaluated = evaluateCimAutomationCandidates({
-      review, scoredDeals, status: automationStatus, requests: existingRequests, events: emailEvents,
-    });
-    const eligibleWithinCap = evaluated.eligible.slice(0, remainingDailyCapacity);
-    automationRun = {
-      ...automationRun,
+  const evaluated = evaluateCimAutomationCandidates({
+    review,
+    scoredDeals,
+    status: automationStatus,
+    requests: existingRequests,
+    events: emailEvents,
+  });
+  review.cimAutomation = {
+    ...automationStatus,
+    run: {
+      mode: 'internal-summary-preview',
       ...evaluated,
-      eligible: eligibleWithinCap,
-      exceptions: [
-        ...evaluated.exceptions,
-        ...evaluated.eligible.slice(remainingDailyCapacity).map((deal) => ({
-          dealKey: deal.dealKey,
-          name: deal.name,
-          recipientEmail: deal.brokerEmail,
-          score: deal.score,
-          reasons: ['Automatic daily send cap reached'],
-        })),
-      ],
-    };
-
-    for (const [index, deal] of automationRun.eligible.entries()) {
-      if (await isCimAutomationPaused({ storage, config })) {
-        const withheld = automationRun.eligible.slice(index);
-        automationRun.exceptions.push(...withheld.map((item) => ({
-          dealKey: item.dealKey,
-          name: item.name,
-          recipientEmail: item.brokerEmail,
-          score: item.score,
-          reasons: ['Emergency pause activated before send'],
-        })));
-        automationRun.eligible = automationRun.eligible.slice(0, index);
-        break;
-      }
-      const approval = buildCimAutomationApproval(deal);
-      const sendResult = approval
-        ? await sendCimRequestForScoredDeal({
-            deal,
-            approvedDeal: approval.approvedDeal,
-            approvalSnapshotToken: approval.snapshotToken,
-            requestedBy: `automation-stage-${automationStatus.effectiveStage}`,
-            storage,
-          })
-        : {
-            ok: false,
-            status: 503,
-            error: 'The automatic CIM approval snapshot could not be signed and verified. No broker email was transmitted.',
-          };
-      automationRun.results.push({ dealKey: deal.dealKey, dealName: deal.name, recipientEmail: deal.brokerEmail, ok: Boolean(sendResult.ok), error: sendResult.error || '' });
-      if (sendResult.ok) automationRun.sent += 1;
-      else automationRun.failed += 1;
-    }
-
-    const successfulKeys = new Set(automationRun.results.filter((item) => item.ok).map((item) => item.dealKey));
-    const successfullyAutomated = automationRun.eligible.filter((deal) => successfulKeys.has(deal.dealKey));
-    if (successfullyAutomated.length > 0) {
-      await recordCimReviewDecisions({
-        storage,
-        actor: `automation-stage-${automationStatus.effectiveStage}`,
-        stage: automationStatus.effectiveStage,
-        source: 'automation',
-        decisions: successfullyAutomated.map((deal) => ({
-          dealKey: deal.dealKey, dealName: deal.name, score: deal.score, decision: 'approved',
-          originalRecipientEmail: deal.brokerEmail, finalRecipientEmail: deal.brokerEmail,
-        })),
-      });
-    }
-
-    const sentKeys = new Set(automationRun.results.filter((item) => item.ok).map((item) => item.dealKey));
-    for (const section of ['newlySeenMatches', 'qualified', 'watchlist']) {
-      review[section] = (review[section] || []).map((deal) => sentKeys.has(deal.dealKey)
-        ? { ...deal, cimRequest: { ...deal.cimRequest, canRequest: false, status: 'sent' } }
-        : deal);
-    }
-    review.totals.cimReady = Math.max(0, Number(review.totals.cimReady || 0) - automationRun.sent);
-  } else if (automationStatus.effectiveStage > 1) {
-    const evaluated = evaluateCimAutomationCandidates({
-      review, scoredDeals, status: automationStatus, requests: existingRequests, events: emailEvents,
-    });
-    const holdReason = automationStatus.paused ? 'Emergency pause is active' : 'Automatic daily send cap reached';
-    automationRun = {
-      ...automationRun,
-      sourceHealthy: evaluated.sourceHealthy,
-      exceptions: [
-        ...evaluated.exceptions,
-        ...evaluated.eligible.map((deal) => ({
-          dealKey: deal.dealKey,
-          name: deal.name,
-          recipientEmail: deal.brokerEmail,
-          score: deal.score,
-          reasons: [holdReason],
-        })),
-      ],
-    };
-  } else if (automationStatus.effectiveStage === 1) {
-    automationRun.exceptions = scoredDeals.filter((deal) => deal.cimRequest?.canRequest).map((deal) => ({
-      dealKey: deal.dealKey, name: deal.name, recipientEmail: deal.brokerEmail, score: deal.score, reasons: ['Stage 1 requires manual approval'],
-    }));
-  }
-
-  review.cimAutomation = { ...automationStatus, run: automationRun, remainingDailyCapacity };
+      sent: 0,
+      failed: 0,
+      providerCalls: 0,
+      results: [],
+    },
+    remainingDailyCapacity: automationStatus.capacity?.remaining ?? 0,
+  };
 
   const emailResult = await sendDailyDealHunterEmail({
     to: config.dealHunter.recipient || config.delivery.fallbackRecipient,
@@ -6132,6 +6090,387 @@ export async function sendDailyDealHunterReview({ idempotencyKey = '', storage =
   };
 }
 
+function stage2RunSummary(run = null) {
+  if (!run) return null;
+  return {
+    id: run.id,
+    runKey: run.run_key,
+    createdAt: run.created_at,
+    completedAt: run.completed_at,
+    pacificBusinessDate: run.pacific_business_date,
+    mode: run.mode,
+    status: run.status,
+    policyHash: run.policy_hash,
+    considered: Number(run.considered_count || 0),
+    eligible: Number(run.eligible_count || 0),
+    wouldSend: Number(run.would_send_count || 0),
+    attempted: Number(run.attempted_count || 0),
+    accepted: Number(run.accepted_count || 0),
+    failed: Number(run.failed_count || 0),
+    ambiguous: Number(run.ambiguous_count || 0),
+    deferred: Number(run.deferred_count || 0),
+    blockedCounts: run.blocked_counts || {},
+    lastError: run.last_error || '',
+  };
+}
+
+function countStage2Blockers(exceptions = []) {
+  const counts = {};
+  for (const exception of exceptions) {
+    for (const code of exception.reasonCodes || []) counts[code] = (counts[code] || 0) + 1;
+  }
+  return counts;
+}
+
+export function cimStage2DailyLimit(mode, policy) {
+  return mode === 'active'
+    ? policy.caps.activeDailyInitials
+    : policy.caps.canaryDailyInitials;
+}
+
+export async function runCimStage2Automation({
+  mode = 'shadow', triggeredBy = 'admin', now = new Date(), storage = getStorage(),
+} = {}) {
+  const normalizedMode = normalizeText(mode, 20).toLowerCase();
+  if (!['shadow', 'canary', 'active'].includes(normalizedMode)) {
+    return { ok: false, status: 400, error: 'Stage 2 run mode must be shadow, canary, or active.' };
+  }
+  const config = getConfig();
+  const policy = getCimStage2Policy(config);
+  const window = evaluateCimStage2Window(now, policy);
+  if (!storage.claimCimStage2Run || !storage.insertCimStage2Decisions || !storage.updateCimStage2Run) {
+    return { ok: false, status: 503, error: 'Required Stage 2 run/decision storage is unavailable.' };
+  }
+  if (['canary', 'active'].includes(normalizedMode)) {
+    try {
+      await reconcileCimStage2AmbiguousDecisions({ storage, now });
+    } catch {
+      return {
+        ok: false,
+        status: 503,
+        error: 'Ambiguous provider-state reconciliation is unavailable. No automatic provider work was attempted.',
+        providerCalls: 0,
+      };
+    }
+  }
+  const runKey = `deal-hunter-cim-stage2:${window.dateKey}:${normalizedMode}:${policy.policyHash}`;
+  const runId = randomUUID();
+  const statusBeforeRun = await getCimAutomationStatus({ storage, config, now });
+  const activationId = ['canary', 'active'].includes(normalizedMode) ? statusBeforeRun.activation?.id || '' : '';
+  const claim = await storage.claimCimStage2Run({
+    id: runId,
+    run_key: runKey,
+    created_at: now.toISOString(),
+    updated_at: now.toISOString(),
+    pacific_business_date: window.dateKey,
+    mode: normalizedMode,
+    status: 'running',
+    triggered_by: normalizeText(triggeredBy, 200) || 'admin',
+    policy_hash: policy.policyHash,
+    rule_version: policy.rules.version,
+    source_policy_hash: policy.sourcePolicyHash,
+    activation_id: activationId || null,
+    metadata: { windowOpenAtStart: window.open, providerCalls: 0 },
+  });
+  if (!claim.claimed) {
+    return {
+      ok: true,
+      status: 200,
+      duplicateInvocation: true,
+      providerCalls: 0,
+      run: stage2RunSummary(claim.run),
+    };
+  }
+  let run = claim.run;
+  try {
+    const result = await buildDailyDealReview({ storage });
+    const { review, scoredDeals } = result;
+    const [requests, events] = await Promise.all([
+      storage.listDealHunterCimRequests?.({ limit: 100000 }) || [],
+      storage.listEmailEvents?.({ limit: 100000 }) || [],
+    ]);
+    const consideredDeals = scoredDeals
+      .filter((deal) => deal.cimRequest?.eligible && deal.opportunityId)
+      .slice(0, 500);
+    const [suppressions, opportunityClaims] = await Promise.all([
+      Promise.all(consideredDeals.map((deal) => storage.getActiveEmailSuppression?.(deal.brokerEmail) || null)),
+      Promise.all(consideredDeals.map((deal) => storage.getDealHunterCimOpportunityClaim?.(deal.opportunityId) || null)),
+    ]);
+    const evaluated = evaluateCimAutomationCandidates({
+      review,
+      scoredDeals: consideredDeals,
+      status: statusBeforeRun,
+      requests,
+      events,
+      suppressions: suppressions.filter(Boolean),
+      opportunityClaims: opportunityClaims.filter(Boolean),
+      now,
+    });
+    const exceptionByOpportunity = new Map(evaluated.exceptions.map((item) => [item.opportunityId, item]));
+    const decisions = consideredDeals.map((deal) => buildCimStage2DecisionRecord({
+      run,
+      deal,
+      evaluation: exceptionByOpportunity.get(deal.opportunityId) || { reasonCodes: [] },
+      activationId,
+      policy,
+      createdAt: now.toISOString(),
+    }));
+    await storage.insertCimStage2Decisions(decisions);
+    // Shadow is the canary rehearsal: its would-send count must model the
+    // accepted one-per-Pacific-business-day canary, never the larger active cap.
+    const dailyLimit = cimStage2DailyLimit(normalizedMode, policy);
+    const wouldSend = Math.min(evaluated.eligible.length, dailyLimit);
+    const blockedCounts = countStage2Blockers(evaluated.exceptions);
+    const sourcePolicyHealthy = Boolean(evaluated.sourceReview?.healthy);
+    const coverageComplete = Boolean(evaluated.sourceReview
+      && evaluated.sourceReview.missingCount === 0
+      && evaluated.sourceReview.unexpectedCount === 0
+      && evaluated.sourceReview.failedCount === 0
+      && evaluated.sourceReview.emptyCount === 0
+      && evaluated.sourceReview.duplicateSourceCount === 0
+      && evaluated.sourceReview.warningCount === 0);
+    run = await storage.updateCimStage2Run(run.id, {
+      updated_at: new Date().toISOString(),
+      considered_count: decisions.length,
+      eligible_count: evaluated.eligible.length,
+      would_send_count: wouldSend,
+      blocked_counts: blockedCounts,
+      metadata: {
+        ...(run.metadata || {}),
+        sourcePolicyHealthy,
+        coverageComplete,
+        sourceReview: {
+          configuredIds: evaluated.sourceReview?.configuredIds || [],
+          unexpectedCount: evaluated.sourceReview?.unexpectedCount || 0,
+          missingCount: evaluated.sourceReview?.missingCount || 0,
+          failedCount: evaluated.sourceReview?.failedCount || 0,
+          emptyCount: evaluated.sourceReview?.emptyCount || 0,
+          duplicateSourceCount: evaluated.sourceReview?.duplicateSourceCount || 0,
+          warningCount: evaluated.sourceReview?.warningCount || 0,
+        },
+        readinessBlockerCodes: statusBeforeRun.blockerCodes,
+        providerCalls: 0,
+      },
+    });
+
+    if (normalizedMode === 'shadow') {
+      run = await storage.updateCimStage2Run(run.id, {
+        updated_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+        status: sourcePolicyHealthy && coverageComplete ? 'completed' : 'blocked',
+        metadata: { ...(run.metadata || {}), providerCalls: 0, shadowOnly: true },
+      });
+      return {
+        ok: true,
+        status: 200,
+        providerCalls: 0,
+        run: stage2RunSummary(run),
+        sourceReview: evaluated.sourceReview,
+      };
+    }
+
+    if (statusBeforeRun.activationMode !== normalizedMode || !statusBeforeRun.automaticTransmissionAllowed) {
+      run = await storage.updateCimStage2Run(run.id, {
+        updated_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+        status: 'blocked',
+        deferred_count: evaluated.eligible.length,
+        last_error: 'Live Stage 2 authorization/readiness gates did not pass. No provider work was attempted.',
+        metadata: { ...(run.metadata || {}), providerCalls: 0 },
+      });
+      return {
+        ok: false,
+        status: 409,
+        error: run.last_error,
+        blockerCodes: statusBeforeRun.blockerCodes,
+        providerCalls: 0,
+        run: stage2RunSummary(run),
+      };
+    }
+
+    const storedDecisions = await storage.listCimStage2Decisions({ runId: run.id, limit: 500 });
+    const decisionByOpportunity = new Map(storedDecisions.map((decision) => [decision.opportunity_id, decision]));
+    let attempted = 0;
+    let accepted = 0;
+    let failed = 0;
+    let ambiguous = 0;
+    let deferred = 0;
+    let providerCalls = 0;
+    const liveCandidates = evaluated.eligible.slice(0, dailyLimit);
+
+    for (const deal of liveCandidates) {
+      const decision = decisionByOpportunity.get(deal.opportunityId);
+      const capacityUsed = await storage.countCimStage2Capacity({ pacificBusinessDate: window.dateKey });
+      if (!decision || capacityUsed >= dailyLimit) {
+        deferred += 1;
+        if (decision) await storage.transitionCimStage2Decision({
+          id: decision.id,
+          expectedStates: ['eligible'],
+          state: 'deferred',
+          updates: { reasons: ['daily_capacity_exhausted'], consumed_at: new Date().toISOString() },
+        });
+        continue;
+      }
+      const claimToken = randomUUID();
+      const claimedAt = new Date().toISOString();
+      const decisionClaim = await storage.claimCimStage2Decision({
+        id: decision.id,
+        claimToken,
+        claimedAt,
+        activationId,
+      });
+      if (!decisionClaim.claimed) {
+        deferred += 1;
+        continue;
+      }
+      const attempting = await storage.transitionCimStage2Decision({
+        id: decision.id,
+        expectedStates: ['claimed'],
+        state: 'attempting',
+        updates: { updated_at: new Date().toISOString() },
+      });
+      if (!attempting.applied) {
+        deferred += 1;
+        continue;
+      }
+      const approval = buildCimAutomationApproval(deal);
+      if (!approval) {
+        failed += 1;
+        await storage.transitionCimStage2Decision({
+          id: decision.id,
+          expectedStates: ['attempting'],
+          state: 'failed',
+          updates: { consumed_at: new Date().toISOString(), last_error: 'Signed snapshot preparation failed.' },
+        });
+        continue;
+      }
+      attempted += 1;
+      try {
+        const boundary = await authorizeCimStage2SendBoundary({
+          decisionId: decision.id,
+          runId: run.id,
+          activationId,
+          claimToken,
+          deal,
+          snapshotDigest: cimStage2SnapshotDigest(deal),
+          storage,
+          config,
+          now: new Date(),
+        });
+        if (!boundary.ok) {
+          failed += 1;
+          await storage.transitionCimStage2Decision({
+            id: decision.id,
+            expectedStates: ['attempting'],
+            state: 'failed',
+            updates: { consumed_at: new Date().toISOString(), last_error: boundary.error, reasons: [boundary.code] },
+          });
+          continue;
+        }
+        const sendResult = await sendCimRequestForScoredDeal({
+          deal,
+          approvedDeal: approval.approvedDeal,
+          approvalSnapshotToken: approval.snapshotToken,
+          requestedBy: 'automation-stage-2',
+          automationAuthorization: {
+            decisionId: decision.id,
+            runId: run.id,
+            activationId,
+            claimToken,
+            snapshotDigest: cimStage2SnapshotDigest(deal),
+          },
+          storage,
+        });
+        if (sendResult.providerAttempted) providerCalls += 1;
+        const completedAt = new Date().toISOString();
+        if (sendResult.providerOutcomeAmbiguous) {
+          ambiguous += 1;
+          await storage.transitionCimStage2Decision({
+            id: decision.id,
+            expectedStates: ['attempting'],
+            state: 'ambiguous',
+            updates: {
+              cim_request_id: sendResult.request?.id || null,
+              communication_id: sendResult.request?.metadata?.initialCommunicationId || null,
+              provider_state: 'ambiguous',
+              last_error: 'Provider acceptance is ambiguous and requires reconciliation; automatic retry is forbidden.',
+            },
+          });
+        } else if (sendResult.ok && !sendResult.alreadySent) {
+          accepted += 1;
+          await storage.transitionCimStage2Decision({
+            id: decision.id,
+            expectedStates: ['attempting'],
+            state: 'accepted',
+            updates: {
+              consumed_at: completedAt,
+              cim_request_id: sendResult.request?.id || null,
+              communication_id: sendResult.request?.metadata?.initialCommunicationId || null,
+              provider_state: sendResult.emailResult?.status || sendResult.request?.delivery_state || 'accepted',
+            },
+          });
+        } else {
+          failed += 1;
+          await storage.transitionCimStage2Decision({
+            id: decision.id,
+            expectedStates: ['attempting'],
+            state: 'failed',
+            updates: {
+              consumed_at: completedAt,
+              cim_request_id: sendResult.request?.id || null,
+              communication_id: sendResult.request?.metadata?.initialCommunicationId || null,
+              provider_state: sendResult.alreadySent ? 'already-sent' : sendResult.emailResult?.status || 'failed',
+              last_error: sendResult.error || (sendResult.alreadySent ? 'An existing sequence already owns this opportunity.' : 'Provider attempt failed.'),
+            },
+          });
+        }
+      } catch (error) {
+        if (error?.providerAcceptedAmbiguous) {
+          providerCalls += 1;
+          ambiguous += 1;
+          await storage.transitionCimStage2Decision({
+            id: decision.id,
+            expectedStates: ['attempting'],
+            state: 'ambiguous',
+            updates: { provider_state: 'ambiguous', last_error: 'Provider acceptance requires reconciliation; automatic retry is forbidden.' },
+          });
+        } else {
+          failed += 1;
+          await storage.transitionCimStage2Decision({
+            id: decision.id,
+            expectedStates: ['attempting'],
+            state: 'failed',
+            updates: { consumed_at: new Date().toISOString(), provider_state: 'failed', last_error: normalizeText(error?.message, 500) },
+          });
+        }
+      }
+    }
+    deferred += Math.max(0, evaluated.eligible.length - liveCandidates.length);
+    run = await storage.updateCimStage2Run(run.id, {
+      updated_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+      status: ambiguous > 0 ? 'blocked' : 'completed',
+      attempted_count: attempted,
+      accepted_count: accepted,
+      failed_count: failed,
+      ambiguous_count: ambiguous,
+      deferred_count: deferred,
+      metadata: { ...(run.metadata || {}), providerCalls },
+      last_error: ambiguous > 0 ? 'One or more provider outcomes are ambiguous and require reconciliation.' : null,
+    });
+    return { ok: ambiguous === 0, status: ambiguous > 0 ? 503 : 200, providerCalls, run: stage2RunSummary(run) };
+  } catch (error) {
+    run = await storage.updateCimStage2Run(run.id, {
+      updated_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+      status: 'failed',
+      last_error: normalizeText(error?.message || 'Stage 2 run failed.', 500),
+      metadata: { ...(run.metadata || {}), providerCalls: Number(run.metadata?.providerCalls || 0) },
+    }).catch(() => run);
+    return { ok: false, status: 503, error: 'Stage 2 automation run failed closed. No automatic retry was scheduled.', providerCalls: Number(run.metadata?.providerCalls || 0), run: stage2RunSummary(run) };
+  }
+}
+
 async function sendCimRequestForScoredDeal({
   deal,
   approvedDeal = null,
@@ -6140,7 +6479,11 @@ async function sendCimRequestForScoredDeal({
   storage = getStorage(),
   retryOfRequest = null,
   correctedRecipient = null,
+  automationAuthorization = null,
 } = {}) {
+  if (normalizeText(requestedBy, 160).toLowerCase() === 'automation-stage-3') {
+    return { ok: false, status: 409, error: 'Stage 3 automatic transmission is not implemented or authorized in this release.' };
+  }
   if (
     !storage.getDealHunterCimRequest ||
     !storage.listDealHunterCimRequests ||
@@ -6216,6 +6559,28 @@ async function sendCimRequestForScoredDeal({
     opportunityId: deal.opportunityId,
     identityStatus: 'resolved',
   };
+  if (automaticSend) {
+    const authorization = await authorizeCimStage2SendBoundary({
+      decisionId: automationAuthorization?.decisionId || '',
+      runId: automationAuthorization?.runId || '',
+      activationId: automationAuthorization?.activationId || '',
+      claimToken: automationAuthorization?.claimToken || '',
+      deal: approvedMessageDeal,
+      snapshotDigest: automationAuthorization?.snapshotDigest || '',
+      storage,
+      config: getConfig(),
+      now: new Date(),
+    });
+    if (!authorization.ok) {
+      return {
+        ok: false,
+        status: 409,
+        error: authorization.error,
+        automationBlockerCode: authorization.code,
+        deal: publicDeal(attachCimRequestStatus([deal], [])[0]),
+      };
+    }
+  }
   const recipientEmail = normalizeEmail(approvedMessageDeal?.brokerEmail);
   const unavailableReason = getCimRequestUnavailableReason(deal, recipientEmail);
 
@@ -6292,6 +6657,17 @@ async function sendCimRequestForScoredDeal({
     );
     const existingRequest = dealRequests.find((request) => normalizeEmail(request?.recipient_email) === recipientEmail)
       || await storage.getDealHunterCimRequest({ dealKey: deal.dealKey, recipientEmail });
+
+    if (blockingRequest && ['ambiguous', 'follow_up_ambiguous'].includes(blockingRequest.status)) {
+      return {
+        ok: false,
+        status: 409,
+        error: 'The prior provider outcome is ambiguous. Reconcile the persisted communication before any retry; no email was transmitted.',
+        providerOutcomeAmbiguous: true,
+        request: blockingRequest,
+        deal: publicDeal(attachCimRequestStatus([deal], dealRequests)[0]),
+      };
+    }
 
     if (blockingRequest && isCompletedCimStatus(blockingRequest.status)) {
       const linkedBlockingRequest = blockingRequest.submission_id && blockingRequest.opportunity_id === deal.opportunityId
@@ -6406,10 +6782,15 @@ async function sendCimRequestForScoredDeal({
           metadata: {
             ...(unsignedPendingRecord.metadata || {}),
             automationApproval: {
-              mode: 'server-signed-snapshot',
-              snapshotDigest: sha256(JSON.stringify(verifiedAutomationDeal)),
+              mode: 'durable-stage2-decision',
+              snapshotDigest: cimStage2SnapshotDigest(approvedMessageDeal),
+              sourceSnapshotDigest: sourceSnapshotDigestForDeal(approvedMessageDeal),
+              recipientHash: hashCimStage2Recipient(recipientEmail),
               verified: true,
-              stage: Number(normalizeText(requestedBy, 160).split('-').at(-1)) || 1,
+              stage: 2,
+              runId: automationAuthorization?.runId || '',
+              decisionId: automationAuthorization?.decisionId || '',
+              activationId: automationAuthorization?.activationId || '',
               verifiedAt: new Date().toISOString(),
             },
           },
@@ -6590,6 +6971,51 @@ async function sendCimRequestForScoredDeal({
       };
     }
     const activeRequest = renewal.request || pendingRequest || pendingRecord;
+    let finalDisposition = null;
+    let dispositionCheckFailed = false;
+    if (storage.getDealHunterDisposition) {
+      try {
+        finalDisposition = await storage.getDealHunterDisposition({ dealKey: deal.dealKey });
+      } catch {
+        dispositionCheckFailed = automaticSend;
+      }
+    } else if (automaticSend) {
+      dispositionCheckFailed = true;
+    }
+    if (dispositionCheckFailed || finalDisposition?.disposition === 'dismissed') {
+      const dispositionError = dispositionCheckFailed
+        ? 'The final dismissal check is unavailable. No automatic email was transmitted.'
+        : 'This Deal Hunter opportunity was dismissed before provider work. No email was transmitted.';
+      const blockedRequest = await finalizeCimRequestClaimWithActivity(
+        storage,
+        buildCimRequestRecord({
+          deal: approvedMessageDeal,
+          recipientEmail,
+          requestedBy,
+          emailResult: { status: 'failed', error: dispositionError, providerMessageId: '' },
+          existingRequest: activeRequest,
+          submissionId: submission.id,
+          retryOfRequestId: retryOfRequest?.id || '',
+          correctedRecipient,
+          communicationId: communication.id,
+        }),
+        activeRequest,
+        {
+          expectedStatuses: ['pending'],
+          eventType: 'cim.dismissal-blocked',
+          summary: dispositionError,
+          actor: requestedBy,
+          metadata: { dispositionId: finalDisposition?.id || '', dispositionCheckFailed },
+        },
+      );
+      return {
+        ok: false,
+        status: 409,
+        error: dispositionError,
+        request: blockedRequest,
+        deal: publicDeal(attachCimRequestStatus([deal], [blockedRequest])[0]),
+      };
+    }
     const finalOutreachGate = await assertCimOutreachAllowed({ storage });
     const finalRecipientPolicy = finalOutreachGate.allowed
       ? await evaluateCimRecipientPolicy({
@@ -6635,6 +7061,88 @@ async function sendCimRequestForScoredDeal({
         deal: publicDeal(attachCimRequestStatus([deal], [blockedRequest])[0]),
       };
     }
+    const finalSuppression = automaticSend
+      ? await storage.getActiveEmailSuppression?.(recipientEmail)
+      : null;
+    if (automaticSend && finalSuppression) {
+      const suppressionError = 'The recipient became suppressed before Stage 2 provider work. No email was transmitted.';
+      const blockedRequest = await finalizeCimRequestClaimWithActivity(
+        storage,
+        buildCimRequestRecord({
+          deal: approvedMessageDeal,
+          recipientEmail,
+          requestedBy,
+          emailResult: { status: 'failed', error: suppressionError, providerMessageId: '' },
+          existingRequest: activeRequest,
+          submissionId: submission.id,
+          retryOfRequestId: retryOfRequest?.id || '',
+          correctedRecipient,
+          communicationId: communication.id,
+        }),
+        activeRequest,
+        {
+          expectedStatuses: ['pending'],
+          eventType: 'cim.stage2-suppression-blocked',
+          summary: suppressionError,
+          actor: requestedBy,
+          metadata: { suppressionReason: finalSuppression.reason || 'active-suppression' },
+        },
+      );
+      return {
+        ok: false,
+        status: 409,
+        error: suppressionError,
+        automationBlockerCode: 'recipient_suppressed',
+        request: blockedRequest,
+        deal: publicDeal(attachCimRequestStatus([deal], [blockedRequest])[0]),
+      };
+    }
+    if (automaticSend) {
+      const finalAutomationAuthorization = await authorizeCimStage2SendBoundary({
+        decisionId: automationAuthorization?.decisionId || '',
+        runId: automationAuthorization?.runId || '',
+        activationId: automationAuthorization?.activationId || '',
+        claimToken: automationAuthorization?.claimToken || '',
+        deal: approvedMessageDeal,
+        snapshotDigest: automationAuthorization?.snapshotDigest || '',
+        storage,
+        config: getConfig(),
+        now: new Date(),
+      });
+      if (!finalAutomationAuthorization.ok) {
+        const authorizationError = finalAutomationAuthorization.error;
+        const blockedRequest = await finalizeCimRequestClaimWithActivity(
+          storage,
+          buildCimRequestRecord({
+            deal: approvedMessageDeal,
+            recipientEmail,
+            requestedBy,
+            emailResult: { status: 'failed', error: authorizationError, providerMessageId: '' },
+            existingRequest: activeRequest,
+            submissionId: submission.id,
+            retryOfRequestId: retryOfRequest?.id || '',
+            correctedRecipient,
+            communicationId: communication.id,
+          }),
+          activeRequest,
+          {
+            expectedStatuses: ['pending'],
+            eventType: 'cim.stage2-authorization-blocked',
+            summary: 'Stage 2 durable authorization changed before provider work; no email was transmitted.',
+            actor: requestedBy,
+            metadata: { blockerCode: finalAutomationAuthorization.code, communicationId: communication.id },
+          },
+        );
+        return {
+          ok: false,
+          status: 409,
+          error: authorizationError,
+          automationBlockerCode: finalAutomationAuthorization.code,
+          request: blockedRequest,
+          deal: publicDeal(attachCimRequestStatus([deal], [blockedRequest])[0]),
+        };
+      }
+    }
     if (finalRecipientPolicy.override?.id && storage.consumeDealHunterCimRecipientOverride) {
       await storage.consumeDealHunterCimRecipientOverride(finalRecipientPolicy.override.id, new Date().toISOString());
     }
@@ -6665,12 +7173,18 @@ async function sendCimRequestForScoredDeal({
         activeRequest,
         {
           expectedStatuses: ['pending'],
-          eventType: emailResult.status === 'failed' ? 'cim.request-failed' : 'cim.request-sent',
-          summary: emailResult.status === 'failed'
-            ? 'CIM request provider attempt failed.'
-            : emailResult.status === 'logged'
-              ? 'CIM request logged by the development-only console provider.'
-              : 'CIM request accepted by the email provider; delivery is awaiting confirmation.',
+          eventType: emailResult.status === 'ambiguous'
+            ? 'cim.request-ambiguous'
+            : emailResult.status === 'failed'
+              ? 'cim.request-failed'
+              : 'cim.request-sent',
+          summary: emailResult.status === 'ambiguous'
+            ? 'CIM request provider outcome is ambiguous; reconciliation is required before any retry.'
+            : emailResult.status === 'failed'
+              ? 'CIM request provider attempt failed.'
+              : emailResult.status === 'logged'
+                ? 'CIM request logged by the development-only console provider.'
+                : 'CIM request accepted by the email provider; delivery is awaiting confirmation.',
           actor: requestedBy,
           metadata: {
             recipientEmail,
@@ -6693,13 +7207,15 @@ async function sendCimRequestForScoredDeal({
     const publicUpdatedDeal = publicDeal(attachCimRequestStatus([deal], [savedRequest])[0]);
 
     return {
-      ok: emailResult.status !== 'failed',
-      status: emailResult.status === 'failed' ? 502 : 201,
+      ok: !['failed', 'ambiguous'].includes(emailResult.status),
+      status: emailResult.status === 'ambiguous' ? 503 : emailResult.status === 'failed' ? 502 : 201,
       alreadySent: false,
       request: savedRequest,
       deal: publicUpdatedDeal,
       emailResult,
-      error: emailResult.status === 'failed' ? emailResult.error || 'CIM request email failed.' : '',
+      providerAttempted: true,
+      providerOutcomeAmbiguous: emailResult.status === 'ambiguous',
+      error: ['failed', 'ambiguous'].includes(emailResult.status) ? emailResult.error || 'CIM request email failed.' : '',
       warning: communicationStateError
         ? ['sent', 'logged'].includes(emailResult.status)
           ? 'The provider accepted the CIM request, but its communication delivery state awaits reconciliation.'
@@ -6943,6 +7459,7 @@ export function validateCimReviewDecisions(decisions = []) {
 
   const validated = [];
   const seen = new Set();
+  const stage2Policy = getCimStage2Policy(getConfig());
 
   for (const decision of decisions.slice(0, cimBulkRequestMax)) {
     const snapshotToken = decision?.snapshotToken || decision?.snapshot_token || '';
@@ -6950,7 +7467,7 @@ export function validateCimReviewDecisions(decisions = []) {
     const dealKey = normalizeText(decision?.dealKey || decision?.deal_key, 1000);
     const result = decision?.decision === 'approved' ? 'approved' : decision?.decision === 'rejected' ? 'rejected' : '';
 
-    if (!snapshot || !dealKey || snapshot.dealKey !== dealKey || seen.has(dealKey) || !result) {
+    if (!snapshot || !snapshot.opportunityId || snapshot.identityStatus !== 'resolved' || !dealKey || snapshot.dealKey !== dealKey || seen.has(dealKey) || !result) {
       return { valid: false, decisions: [], error: 'One or more CIM review decisions do not match the signed approval queue.' };
     }
 
@@ -6970,6 +7487,7 @@ export function validateCimReviewDecisions(decisions = []) {
     seen.add(dealKey);
     validated.push({
       dealKey,
+      opportunityId: snapshot.opportunityId,
       dealName: snapshot.name,
       score: snapshot.score,
       decision: result,
@@ -6977,6 +7495,16 @@ export function validateCimReviewDecisions(decisions = []) {
       originalRecipientEmail,
       finalRecipientEmail,
       finalRecipientName,
+      snapshotDigest: cimStage2SnapshotDigest(snapshot),
+      evidenceVersion: 'cim-stage2-human-evidence-v2',
+      ruleVersion: stage2Policy.rules.version,
+      sourcePolicyVersion: stage2Policy.sourcePolicy.version,
+      sourcePolicyHash: stage2Policy.sourcePolicyHash,
+      sourceIds: [...new Set([
+        snapshot.sourceId,
+        ...(snapshot.sourceRecords || []).map((record) => record.sourceId),
+      ].filter(Boolean))],
+      stage2CohortEligible: assessCimStage2StaticCandidate(snapshot, { policy: stage2Policy }).eligible,
     });
   }
 

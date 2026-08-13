@@ -453,10 +453,15 @@ async function sendMessage(message) {
         break;
     }
   } catch (error) {
+    const providerOutcomeAmbiguous = config.delivery.provider === 'resend'
+      && cimMessageKinds.has(message.kind);
     result = {
-      status: 'failed',
-      error: `${config.delivery.provider} delivery failed: ${error.message}`,
+      status: providerOutcomeAmbiguous ? 'ambiguous' : 'failed',
+      error: providerOutcomeAmbiguous
+        ? `Resend delivery outcome is ambiguous: ${error.message}. Reconcile the persisted communication before any retry.`
+        : `${config.delivery.provider} delivery failed: ${error.message}`,
       providerMessageId: '',
+      providerOutcomeAmbiguous,
     };
   }
 
@@ -825,6 +830,10 @@ export function buildDealHunterCimRequestEmail({
   communicationId = '',
 } = {}) {
   const config = getConfig();
+  const stage2Automatic = /^automation-stage-(2|3)$/i.test(normalizeText(requestedBy, 160));
+  const stage2PostalAddress = normalizeText(config.dealHunter?.cimAutomation?.physicalPostalAddress, 500);
+  const stage2PurposeDisclosure = 'This is a commercial acquisition-outreach message about a possible purchase of the listed business.';
+  const stage2OptOut = 'To stop acquisition outreach from Uckele Group, reply with “unsubscribe” or “stop”.';
   const businessName = normalizeText(deal.name || 'the listed business', 160);
   const subject = `CIM / NDA request for ${businessName}`;
   const requester = normalizeText(config.workflow?.defaultAssignee || requestedBy || 'Mathew Uckele', 120);
@@ -843,6 +852,8 @@ export function buildDealHunterCimRequestEmail({
     'I am prepared to move quickly if the opportunity is a fit. I have acquisition equity available, am working with SBA financing, and can provide proof of funds or lender context upon request.',
     'Could you please send over the CIM or teaser, or let me know the NDA process? If there is a specific process you prefer buyers to follow, I am happy to follow it.',
     'I will treat all materials confidentially.',
+    stage2Automatic ? stage2PurposeDisclosure : null,
+    stage2Automatic ? stage2OptOut : null,
     'Best,',
     requester,
     'Uckele Group',
@@ -861,6 +872,7 @@ export function buildDealHunterCimRequestEmail({
     'Could you please send over the CIM or teaser, or let me know the NDA process? If there is a specific process you prefer buyers to follow, I am happy to follow it.',
     '',
     'I will treat all materials confidentially.',
+    ...(stage2Automatic ? ['', stage2PurposeDisclosure, '', stage2OptOut, '', `Postal address: ${stage2PostalAddress}`] : []),
     '',
     'Deal details:',
     ...details.map((item) => `- ${item.label}: ${item.value}`),
@@ -879,6 +891,9 @@ export function buildDealHunterCimRequestEmail({
     paragraphs,
     details,
     ctas: listingUrl ? [{ label: 'View Listing', href: listingUrl }] : [],
+    footerNote: stage2Automatic
+      ? escapeHtml(`Postal address: ${stage2PostalAddress}`)
+      : '',
   });
 
   return {

@@ -46,6 +46,10 @@ primary_region = "ewr"
   DEAL_HUNTER_CIM_RECIPIENT_30_DAY_TOUCH_CAP = "4"
   DEAL_HUNTER_CIM_RECIPIENT_OVERRIDE_MAX_HOURS = "24"
   DEAL_HUNTER_CIM_AUTOMATION_STAGE = "1"
+  # Stage 2 code is deployed inert. This pause affects only automatic initial
+  # outreach; manual Stage 1 remains governed by the central outreach control.
+  DEAL_HUNTER_CIM_AUTOMATION_PAUSED = "true"
+  DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED = "false"
   DEAL_HUNTER_MAX_SOURCE_RECORDS = "8000"
   DEAL_HUNTER_AIRTABLE_ENABLED = "false"
   DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES = "12582912"

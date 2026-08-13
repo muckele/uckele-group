@@ -663,7 +663,7 @@ function getCimSnapshotToken(deal = {}) {
 }
 
 function AdminSectionNav({ activeSection, isReadOnly }) {
-  const visibleSections = adminSections.filter((section) => !isReadOnly || !['new-record', 'operations'].includes(section.id));
+  const visibleSections = adminSections.filter((section) => !isReadOnly || section.id !== 'new-record');
 
   return (
     <aside className="admin-section-nav" data-admin-tour="section-navigation">
@@ -1299,6 +1299,7 @@ export default function DashboardPage() {
   const [operationsError, setOperationsError] = useState('');
   const [cimAutomationUpdating, setCimAutomationUpdating] = useState(false);
   const [cimOutreachUpdating, setCimOutreachUpdating] = useState(false);
+  const [cimStage2Updating, setCimStage2Updating] = useState(false);
   const dashboardRequestRef = useRef({ controller: null, id: 0 });
   const followUpRequestRef = useRef({ controller: null, id: 0 });
   const crmCommunicationsRequestRef = useRef({ controller: null, id: 0 });
@@ -1805,12 +1806,20 @@ export default function DashboardPage() {
   }
 
   async function handleToggleCimAutomation(paused) {
+    if (!paused && !window.confirm(
+      'Clear only the Stage 2 automation emergency pause? This does not activate Stage 2, and every evidence, activation, source, window, cap, suppression, and final-boundary gate must still pass.',
+    )) return;
     setCimAutomationUpdating(true);
     setOperationsError('');
     try {
       const response = await fetch('/api/admin/deal-hunter/cim-automation/pause', {
         method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ paused }),
+        body: JSON.stringify({
+          paused,
+          reason: paused
+            ? 'Emergency Stage 2 automation pause enabled from Operations.'
+            : 'Stage 2 automation pause cleared from Operations after the authenticated operator confirmed every independent gate remains authoritative.',
+        }),
       });
       const result = await response.json();
       if (!response.ok || !result.success) throw new Error(result.error || 'Unable to update CIM automation.');
@@ -1840,6 +1849,44 @@ export default function DashboardPage() {
       setOperationsError(error.message || 'Unable to update the CIM outreach safety control.');
     } finally {
       setCimOutreachUpdating(false);
+    }
+  }
+
+  async function handleRunCimStage2({ mode, confirmation = '' }) {
+    if (isReadOnly) return;
+    setCimStage2Updating(true);
+    setOperationsError('');
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-stage2/run', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, confirmation }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to run the Stage 2 job.');
+      await loadOperations();
+    } catch (error) {
+      setOperationsError(error.message || 'Unable to run the Stage 2 job.');
+    } finally {
+      setCimStage2Updating(false);
+    }
+  }
+
+  async function handleActivateCimStage2(payload) {
+    if (isReadOnly) return;
+    setCimStage2Updating(true);
+    setOperationsError('');
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-stage2/activation', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to record the Stage 2 activation.');
+      await loadOperations();
+    } catch (error) {
+      setOperationsError(error.message || 'Unable to record the Stage 2 activation.');
+    } finally {
+      setCimStage2Updating(false);
     }
   }
 
@@ -1979,7 +2026,7 @@ export default function DashboardPage() {
   }, [activeSection, authState.authenticated]);
 
   useEffect(() => {
-    if (authState.authenticated && !isReadOnly && activeSection === 'operations') loadOperations();
+    if (authState.authenticated && activeSection === 'operations') loadOperations();
   }, [activeSection, authState.authenticated, isReadOnly]);
 
   useEffect(() => {
@@ -3127,7 +3174,7 @@ export default function DashboardPage() {
     return <Navigate replace to="/admin" />;
   }
 
-  if (authState.authenticated && isReadOnly && ['new-record', 'operations'].includes(activeSection)) {
+  if (authState.authenticated && isReadOnly && activeSection === 'new-record') {
     return <Navigate replace to="/admin/crm" />;
   }
 
@@ -3373,7 +3420,7 @@ export default function DashboardPage() {
           </div>
           <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
             {adminSections
-              .filter((item) => item.id !== 'overview' && (!isReadOnly || !['new-record', 'operations'].includes(item.id)))
+              .filter((item) => item.id !== 'overview' && (!isReadOnly || item.id !== 'new-record'))
               .map((item) => {
                 const Icon = item.icon;
                 const descriptions = {
@@ -3410,18 +3457,22 @@ export default function DashboardPage() {
         <div className="mb-6">
           <SectionLabel>Operations Center</SectionLabel>
           <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">System health, history, and recovery readiness</h2>
-          <p className="mt-3 max-w-3xl text-sm leading-7 text-ink/68">Admin-only operational visibility for scheduler runs, source checks, security cleanup, audit history, disk usage, database integrity, and backups.</p>
+          <p className="mt-3 max-w-3xl text-sm leading-7 text-ink/68">Operational visibility for readiness gates, scheduler runs, sources, storage, and recovery. Read-only users receive aggregate privacy-safe status; release controls require a full administrator.</p>
         </div>
         <OperationsCenter
           cimAutomationUpdating={cimAutomationUpdating}
           cimOutreachUpdating={cimOutreachUpdating}
+          cimStage2Updating={cimStage2Updating}
           data={operations}
           emailTestSending={emailTestSending}
           error={operationsError}
           loading={operationsLoading}
+          onActivateCimStage2={handleActivateCimStage2}
+          onRunCimStage2={handleRunCimStage2}
           onToggleCimAutomation={handleToggleCimAutomation}
           onToggleCimOutreach={handleToggleCimOutreach}
           onSendEmailTest={handleSendEmailTest}
+          readOnly={isReadOnly}
         />
       </section>
       ) : null}

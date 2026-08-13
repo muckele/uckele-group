@@ -55,7 +55,7 @@ describe('Operations Center partial failures', () => {
     expect(screen.getByText('70% free')).toBeVisible();
     expect(screen.getByText('Integrity: ok')).toBeVisible();
     expect(screen.getByText('Scheduler history is temporarily unavailable.')).toBeVisible();
-    expect(screen.getByText('Unavailable')).toBeVisible();
+    expect(screen.getAllByText('Unavailable').length).toBeGreaterThan(0);
     expect(screen.queryByText('0 failed · 0 pending')).not.toBeInTheDocument();
     expect(screen.getByText('Source-health history is temporarily unavailable.')).toBeVisible();
     expect(screen.getByText('Bundles: 1 valid · 0 invalid · 1 incomplete')).toBeVisible();
@@ -69,6 +69,47 @@ describe('Operations Center partial failures', () => {
     expect(container.querySelector('[data-admin-tour="operations-readiness"]')).toBeInTheDocument();
     expect(container.querySelector('[data-admin-tour="operations-history"]')).toBeInTheDocument();
     expect(container.querySelector('[data-admin-tour="operations-storage"]')).toBeInTheDocument();
+  });
+
+  test('shows configured, evidence, effective, activation, every gate, and zero-send/live summaries without granting viewer controls', () => {
+    render(<OperationsCenter readOnly data={{
+      scheduler: { runs: [], failures: 0, pending: 0 },
+      sources: { current: { healthy: true, issues: [] }, history: [] },
+      audit: { events: [] },
+      cleanup: { failures: [] },
+      storage: { disk: {}, database: {} },
+      backup: {},
+      communications: {},
+      cimIdentity: { pause: { paused: false }, storageHealthy: true },
+      cimAutomation: {
+        configuredStage: 2,
+        evidenceStage: 1,
+        effectiveStage: 1,
+        activationMode: 'shadow',
+        automaticTransmissionAllowed: false,
+        stage2Readiness: [
+          { code: 'canonical_human_reviews', passed: false, reason: '16 additional decisions are required.' },
+          { code: 'stage2_storage', passed: true, reason: '' },
+        ],
+        metrics: { canonicalHumanReviews: 9, remainingStage2Reviews: 16, compatibleEvidence: 9 },
+        latestShadowRun: { status: 'completed', considered_count: 5, eligible_count: 1, would_send_count: 1, blocked_counts: { score_below_90: 4 } },
+        latestLiveRun: { mode: 'canary', status: 'blocked', attempted_count: 0, accepted_count: 0, deferred_count: 1 },
+        operatingWindow: { open: false, reason: 'outside-window' },
+        capacity: { used: 0, limit: 1, remaining: 1, pacificBusinessDate: '2026-08-12' },
+        policy: { policyHash: 'a'.repeat(64), sourcePolicyHash: 'b'.repeat(64), rules: { version: 'rules-v2' }, window: {} },
+        safeNextAction: 'Collect 16 additional canonical human decisions.',
+      },
+    }} />);
+
+    expect(screen.getByText(/Configured Stage 2 · evidence Stage 1 · effective Stage 1 · activation shadow/)).toBeVisible();
+    expect(screen.getByText('Automatic transmission: BLOCKED')).toBeVisible();
+    expect(screen.getByText(/completed · considered 5 · eligible 1 · would send 1/)).toBeVisible();
+    expect(screen.getByText(/canary · blocked · attempted 0 · accepted 0/)).toBeVisible();
+    expect(screen.getByText(/BLOCK · canonical_human_reviews/)).toBeVisible();
+    expect(screen.getByText(/PASS · stage2_storage/)).toBeVisible();
+    expect(screen.getByText(/Collect 16 additional canonical human decisions/)).toBeVisible();
+    expect(screen.getByText(/Aggregate read-only view/)).toBeVisible();
+    expect(screen.queryByRole('button', { name: /canary/i })).not.toBeInTheDocument();
   });
 
   test('shows generic email gates and body-free operational metrics without overstating delivery', () => {
