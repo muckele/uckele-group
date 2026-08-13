@@ -348,17 +348,18 @@ test('recipient policy counts accepted logical touches but not failed attempts',
 test('administrator recipient override is confirmed, scoped, bounded, and consumed once', async (t) => {
   const storage = testStorage(t);
   const identity = await resolveDealHunterOpportunity({ deal: opportunityDeal(), storage, actor: 'test' });
+  const acceptedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
   await storage.upsertDealHunterCimRequest({
     id: 'accepted-touch',
-    created_at: '2026-08-12T15:00:00.000Z',
-    updated_at: '2026-08-12T15:00:00.000Z',
+    created_at: acceptedAt,
+    updated_at: acceptedAt,
     opportunity_id: identity.opportunityId,
     deal_key: opportunityDeal().dealKey,
     recipient_email: 'broker@example.test',
     status: 'sent',
     request_state: 'provider_accepted',
     delivery_state: 'accepted',
-    first_provider_accepted_at: '2026-08-12T15:00:00.000Z',
+    first_provider_accepted_at: acceptedAt,
     metadata: {},
   });
   const config = { dealHunter: { cimOutreach: { recipientCap24Hours: 1, recipientCap30Days: 4, overrideMaxHours: 2 } } };

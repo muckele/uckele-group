@@ -7,6 +7,7 @@ import {
   eventMatchesCimRequest,
   extractGoogleSheetListingUrls,
   parseSheetCsvDeals,
+  repairDealHunterCrmSourceFields,
   scoreDeal,
 } from '../server/services/dealHunter.js';
 import { normalizeResendTagToken } from '../server/services/delivery.js';
@@ -401,6 +402,152 @@ test('Daily Deal Update columns A and R through U map to the CRM source fields',
   assert.equal(deal.brokerContact, '310-555-0199');
   assert.equal(deal.brokerEmail, 'erin@broker.example');
   assert.equal(deal.brokerContacts[0].sourceColumn, 'Broker Email');
+});
+
+test('Daily Deal Update banner export still maps physical column A to Date Added', () => {
+  const csv = [
+    [
+      'On-Market Deal Tracker This is where all of your On-Market Deals will be updated daily. 🔏 Auto Update Area - These columns are updated daily by AI Deal Hunter.',
+      'Name', 'Annual Profit', 'Broker Name', 'Broker Company', 'Broker Contact', 'Broker Email',
+    ].join(','),
+    [
+      '09-29-2025', 'Commercial HVAC Co', '$450000', 'Erin Gilliam',
+      'West Coast Business Brokers', '310-555-0199', 'erin@broker.example',
+    ].join(','),
+  ].join('\n');
+  const [deal] = parseSheetCsvDeals(csv).deals;
+
+  assert.match(deal.dateAdded, /^2025-09-29/);
+  assert.equal(deal.raw['Date Added'], '09-29-2025');
+  assert.equal(deal.brokerName, 'Erin Gilliam');
+  assert.equal(deal.brokerCompany, 'West Coast Business Brokers');
+  assert.equal(deal.brokerContact, '310-555-0199');
+  assert.equal(deal.brokerEmail, 'erin@broker.example');
+});
+
+test('source-field repair safely enriches a stale syndicated CRM record', async () => {
+  const description = 'Established commercial HVAC and electrical contractor with recurring institutional service work, experienced leadership, and transferable operating systems.'.repeat(2);
+  const csv = [
+    [
+      'On-Market Deal Tracker This is where all of your On-Market Deals will be updated daily. 🔏 Auto Update Area - These columns are updated daily by AI Deal Hunter.',
+      'Name', 'Description', 'City', 'County', 'State', 'Annual Profit', 'Annual Revenue',
+      'Broker Name', 'Broker Company', 'Broker Contact', 'Broker Email', 'Listing URL',
+    ].join(','),
+    [
+      '09-29-2025', 'HVAC & Electrical Contractor with Real Estate', `"${description}"`, '', 'Shelby', 'TN',
+      '$800000', '$5643225', 'Kelvin Woods', 'CBI Team', '870-335-2823',
+      'kelvin.woods@cbiteam.com', 'https://www.bizbuysell.com/business-opportunity/hvac-and-electrical-contractor-with-real-estate/2401626/',
+    ].join(','),
+    [
+      '08-13-2025', 'HVAC & Electrical Contractor with Real Estate', `"${description}"`, 'Memphis', 'Shelby', 'TN',
+      '$800000', '$5643224', '', '', '', '', 'https://dealstream.com/d/biz-sale/hvac/09w2qq',
+    ].join(','),
+  ].join('\n');
+  const source = parseSheetCsvDeals(csv);
+  let submission = {
+    id: 'stale-crm-id',
+    created_at: '2026-08-11T02:50:58.066Z',
+    updated_at: '2026-08-12T15:00:37.021Z',
+    source: 'deal-hunter-daily-review',
+    company: 'HVAC & Electrical Contractor with Real Estate',
+    listing_url: 'https://dealstream.com/d/biz-sale/hvac/09w2qq',
+    role: 'Prospect',
+    lead_type: 'prospect',
+    priority: 'high',
+    tags: ['deal-hunter'],
+    notes: '',
+    broker_name: '',
+    broker_email: '',
+    broker_phone: '',
+    metadata: {
+      dealHunter: {
+        managed: true,
+        dealKey: 'fingerprint:unrelated-listing|worcester-ma|3350000|971170',
+        firstSeenAt: '2026-06-13T17:57:40.060Z',
+      },
+    },
+  };
+  const activities = [];
+  const storage = {
+    async getSubmission(id) {
+      return id === submission.id ? submission : null;
+    },
+    async mutateWithCrmActivity({ operation, payload, activity }) {
+      assert.equal(operation, 'update_submission');
+      assert.equal(payload.expectedUpdatedAt, submission.updated_at);
+      submission = { ...submission, ...payload.values };
+      activities.push(activity);
+      return { applied: true, record: submission };
+    },
+  };
+
+  const preview = await repairDealHunterCrmSourceFields({
+    submissionId: submission.id,
+    storage,
+    sourceResults: [source],
+  });
+  assert.equal(preview.applied, false);
+  assert.match(preview.preview.dateAdded, /^2025-09-29/);
+  assert.equal(preview.preview.brokerName, 'Kelvin Woods');
+  assert.deepEqual(preview.preview.matchedListingIdentities, ['dealstream.com/d/biz-sale/hvac/09w2qq']);
+  assert.equal(activities.length, 0);
+
+  const staleSubmission = submission;
+  submission = {
+    ...staleSubmission,
+    listing_url: 'https://broker.example/a-different-listing',
+    metadata: {
+      dealHunter: {
+        ...staleSubmission.metadata.dealHunter,
+        dealKey: preview.preview.dealKey,
+      },
+    },
+  };
+  await assert.rejects(
+    repairDealHunterCrmSourceFields({
+      submissionId: submission.id,
+      storage,
+      sourceResults: [source],
+    }),
+    /no current Deal Hunter source record safely matches/i,
+  );
+  submission = staleSubmission;
+
+  await assert.rejects(
+    repairDealHunterCrmSourceFields({
+      submissionId: submission.id,
+      apply: true,
+      actor: 'release-owner',
+      storage,
+      sourceResults: [source],
+    }),
+    /verified backup is required/i,
+  );
+
+  const result = await repairDealHunterCrmSourceFields({
+    submissionId: submission.id,
+    apply: true,
+    actor: 'release-owner',
+    backupVerified: true,
+    backupReference: '/verified/backups/deal-hunter-source-repair',
+    storage,
+    sourceResults: [source],
+  });
+  assert.equal(result.applied, true);
+  assert.equal(submission.broker_name, 'Kelvin Woods');
+  assert.equal(submission.broker_email, 'kelvin.woods@cbiteam.com');
+  assert.equal(submission.broker_phone, '870-335-2823');
+  assert.equal(submission.role, 'Broker');
+  assert.equal(submission.lead_type, 'broker');
+  assert.match(submission.metadata.dealHunter.dateAdded, /^2025-09-29/);
+  assert.equal(submission.metadata.dealHunter.brokerCompany, 'CBI Team');
+  assert.equal(submission.metadata.dealHunter.brokerContact, '870-335-2823');
+  assert.equal(submission.metadata.dealHunter.brokerEmail, 'kelvin.woods@cbiteam.com');
+  assert.equal(submission.metadata.dealHunter.firstSeenAt, '2026-06-13T17:57:40.060Z');
+  assert.equal(activities[0].actor, 'release-owner');
+  assert.equal(activities[0].summary, 'Deal Hunter CRM source fields repaired from the current listing data.');
+  assert.equal(activities[0].metadata.repairType, 'deal-hunter-crm-source-fields');
+  assert.equal(activities[0].metadata.backupReference, '/verified/backups/deal-hunter-source-repair');
 });
 
 test('Google Sheet parsing preserves, ranks, and deduplicates multiple broker contacts', async () => {

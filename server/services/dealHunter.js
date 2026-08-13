@@ -1121,6 +1121,29 @@ function parseCsvRows(csvText = '') {
   );
 }
 
+function normalizeDailyDealUpdateRow(row = {}) {
+  if (getField(row, ['Date Added'])) {
+    return row;
+  }
+
+  const entries = Object.entries(row);
+  const [firstHeader, firstValue] = entries[0] || [];
+  const looksLikeDailyDealUpdate = normalizeKey(firstHeader).startsWith('onmarketdealtracker')
+    && entries.some(([header]) => normalizeKey(header) === 'name')
+    && entries.some(([header]) => normalizeKey(header) === 'annualprofit')
+    && entries.some(([header]) => normalizeKey(header) === 'brokername')
+    && entries.some(([header]) => normalizeKey(header) === 'brokeremail');
+
+  if (!looksLikeDailyDealUpdate) {
+    return row;
+  }
+
+  return {
+    ...row,
+    'Date Added': firstValue,
+  };
+}
+
 function decodeXmlCodePoint(code = '', radix = 10) {
   const value = Number.parseInt(code, radix);
 
@@ -1898,7 +1921,9 @@ function normalizeSheetCsvRows(rows = [], sourceIndex = 0, listingUrlsByRow = ne
       rowCount: rows.length,
     },
     deals: rows.map((row, index) => normalizeDealRecord(
-      safeListingUrls.get(index) ? { ...row, 'Original Broker Listing URL': safeListingUrls.get(index) } : row,
+      safeListingUrls.get(index)
+        ? { ...normalizeDailyDealUpdateRow(row), 'Original Broker Listing URL': safeListingUrls.get(index) }
+        : normalizeDailyDealUpdateRow(row),
       { id: `sheet-${sourceIndex}`, name: 'SMB Deal Hunter Google Sheet', mode: 'csv', rowId: String(index + 1) },
     )),
   };
@@ -3610,7 +3635,7 @@ function dealHunterCrmMetadata(deal, options = {}) {
 
 function dealHunterCrmPayload(deal, options = {}) {
   const broker = dealHunterSourceBrokerFields(deal);
-  const hasBrokerContact = Boolean(broker.name || broker.email || broker.contact);
+  const hasBrokerContact = Boolean(broker.name || broker.company || broker.email || broker.contact);
   const sourceTag = normalizeComparableText(deal.sourceName || 'deal-hunter').replace(/\s+/g, '-').slice(0, 40);
   const generatedNotes = dealHunterCrmNotes(deal);
 
@@ -3926,6 +3951,8 @@ function dealHunterCrmUpdate(existing, deal, options = {}) {
     broker_name: chooseDealHunterCrmValue(existing, payload, 'broker_name', preserveExistingFields),
     broker_email: chooseDealHunterCrmValue(existing, payload, 'broker_email', preserveExistingFields),
     broker_phone: chooseDealHunterCrmValue(existing, payload, 'broker_phone', preserveExistingFields),
+    role: chooseDealHunterCrmValue(existing, payload, 'role', preserveExistingFields),
+    lead_type: chooseDealHunterCrmValue(existing, payload, 'lead_type', preserveExistingFields),
     priority: preserveExistingFields && existingPriority && existingPriority !== 'normal' ? existingPriority : payload.priority,
     tags: Array.from(new Set([...existingTags, ...payload.tags])),
     notes: mergeDealHunterCrmNotes(existing.notes, payload.notes),
@@ -3936,25 +3963,37 @@ function dealHunterCrmUpdate(existing, deal, options = {}) {
   };
 }
 
-async function updateDealHunterCrmSubmission(storage, existing, deal, { preserveExistingFields = false } = {}) {
+async function updateDealHunterCrmSubmission(storage, existing, deal, {
+  preserveExistingFields = false,
+  actor = 'deal-hunter',
+  summary = '',
+  activityMetadata = {},
+} = {}) {
   const values = dealHunterCrmUpdate(existing, deal, { preserveExistingFields });
   const mutation = await commitCrmActivityMutation({
     storage,
     operation: 'update_submission',
-    payload: { id: existing.id, values },
+    payload: {
+      id: existing.id,
+      expectedUpdatedAt: existing.updated_at || '',
+      values,
+    },
     activity: {
       submissionId: existing.id,
       opportunityId: deal.opportunityId || '',
       eventType: 'submission.deal-hunter-synced',
-      summary: preserveExistingFields
+      summary: summary || (preserveExistingFields
         ? 'Existing CRM record enriched from Deal Hunter.'
-        : 'Deal Hunter CRM record refreshed from its listing.',
-      actor: 'deal-hunter',
+        : 'Deal Hunter CRM record refreshed from its listing.'),
+      actor,
       role: 'system',
       metadata: {
         dealKey: deal.dealKey || '',
         listingUrl: deal.listingUrl || '',
         changedFields: Object.keys(values).filter((field) => field !== 'updated_at'),
+        ...(activityMetadata && typeof activityMetadata === 'object' && !Array.isArray(activityMetadata)
+          ? activityMetadata
+          : {}),
       },
     },
   });
@@ -3964,6 +4003,166 @@ async function updateDealHunterCrmSubmission(storage, existing, deal, { preserve
   }
 
   return mutation.record;
+}
+
+function dealHunterSourceKeys(deal = {}) {
+  const primary = buildDealKey(deal);
+  return uniqueStrings([
+    primary,
+    contentFingerprintDealKey(deal),
+    deal.dealKey,
+    ...(Array.isArray(deal.dealKeyAliases) ? deal.dealKeyAliases : []),
+  ]);
+}
+
+function dealHunterSourceListings(deal = {}) {
+  return uniqueStrings([
+    deal.listingUrl,
+    ...(Array.isArray(deal.listingAliases) ? deal.listingAliases : []),
+  ].map(normalizeListingIdentity));
+}
+
+function dealHunterSubmissionSourceMatch(existing = {}, deal = {}) {
+  const metadata = existing.metadata?.dealHunter || {};
+  if (
+    !normalizeComparableText(existing.company)
+    || normalizeComparableText(existing.company) !== normalizeComparableText(deal.name)
+  ) {
+    return null;
+  }
+
+  const primaryListing = normalizeListingIdentity(existing.listing_url);
+  const existingListings = uniqueStrings([
+    primaryListing,
+    ...(Array.isArray(metadata.listingAliases) ? metadata.listingAliases : []).map(normalizeListingIdentity),
+  ]);
+  const sourceListings = dealHunterSourceListings(deal);
+  const listingMatches = existingListings.filter((listing) => sourceListings.includes(listing));
+  const existingKeys = uniqueStrings([
+    metadata.dealKey,
+    ...(Array.isArray(metadata.dealKeyAliases) ? metadata.dealKeyAliases : []),
+  ]);
+  const sourceKeys = dealHunterSourceKeys(deal);
+  const dealKeyMatches = existingKeys.filter((key) => sourceKeys.includes(key));
+
+  if (primaryListing && !sourceListings.includes(primaryListing)) {
+    return null;
+  }
+  if (listingMatches.length === 0 && (!primaryListing && dealKeyMatches.length === 0)) {
+    return null;
+  }
+
+  return { listingMatches, dealKeyMatches };
+}
+
+function currentDealHunterSourceDeals(sourceResults = []) {
+  return dedupeDeals(sourceResults.flatMap((result) => result.deals || [])).map((deal) => {
+    const dealKey = buildDealKey(deal);
+    return scoreDeal({
+      ...deal,
+      dealKey,
+      dealKeyAliases: uniqueStrings([
+        ...(deal.dealKeyAliases || []),
+        contentFingerprintDealKey(deal),
+      ]).filter((key) => key !== dealKey),
+    });
+  });
+}
+
+export async function repairDealHunterCrmSourceFields({
+  submissionId = '',
+  apply = false,
+  actor = '',
+  backupVerified = false,
+  backupReference = '',
+  storage = getStorage(),
+  sourceResults = null,
+} = {}) {
+  const normalizedSubmissionId = normalizeText(submissionId, 100);
+  const normalizedActor = normalizeText(actor, 160);
+  const normalizedBackupReference = normalizeText(backupReference, 1000);
+  if (!normalizedSubmissionId) {
+    throw new Error('A CRM submission ID is required.');
+  }
+  if (apply && !normalizedActor) {
+    throw new Error('An accountable actor is required to apply a CRM source-field repair.');
+  }
+  if (apply && backupVerified !== true) {
+    throw new Error('A verified backup is required to apply a CRM source-field repair.');
+  }
+  if (apply && !normalizedBackupReference) {
+    throw new Error('A verified backup reference is required to apply a CRM source-field repair.');
+  }
+
+  const existing = await storage.getSubmission?.(normalizedSubmissionId);
+  if (!existing) {
+    throw new Error('The requested CRM submission was not found.');
+  }
+  if (!isDealHunterManagedSubmission(existing)) {
+    throw new Error('Only Deal Hunter-managed CRM records can be repaired from the current source.');
+  }
+
+  const resolvedSourceResults = sourceResults || await collectSources(getConfig(), storage);
+  const failedSources = resolvedSourceResults
+    .map((result) => result.source)
+    .filter((source) => source?.fetched === false || source?.error);
+  if (failedSources.length > 0) {
+    throw new Error(`CRM source-field repair stopped because ${failedSources.length} source${failedSources.length === 1 ? '' : 's'} failed.`);
+  }
+
+  const matches = currentDealHunterSourceDeals(resolvedSourceResults)
+    .map((deal) => ({ deal, evidence: dealHunterSubmissionSourceMatch(existing, deal) }))
+    .filter((match) => match.evidence);
+  if (matches.length === 0) {
+    throw new Error('No current Deal Hunter source record safely matches this CRM submission.');
+  }
+  if (matches.length > 1) {
+    throw new Error('Multiple current Deal Hunter source records match this CRM submission; repair requires manual identity review.');
+  }
+
+  const { deal, evidence } = matches[0];
+  const previousMetadata = existing.metadata?.dealHunter || {};
+  const repairDeal = {
+    ...deal,
+    opportunityId: previousMetadata.opportunityId || '',
+    firstSeenAt: previousMetadata.firstSeenAt || existing.created_at || '',
+    lastSeenAt: new Date().toISOString(),
+    isNew: false,
+  };
+  const broker = dealHunterSourceBrokerFields(repairDeal);
+  const preview = {
+    submissionId: existing.id,
+    company: repairDeal.name,
+    dealKey: repairDeal.dealKey,
+    listingUrl: repairDeal.listingUrl,
+    matchedListingIdentities: evidence.listingMatches,
+    matchedDealKeys: evidence.dealKeyMatches,
+    dateAdded: repairDeal.dateAdded || '',
+    brokerName: broker.name,
+    brokerCompany: broker.company,
+    brokerContact: broker.contact,
+    brokerEmail: broker.email,
+  };
+
+  if (!apply) {
+    return { ok: true, applied: false, preview };
+  }
+
+  const updated = await updateDealHunterCrmSubmission(storage, existing, repairDeal, {
+    preserveExistingFields: false,
+    actor: normalizedActor,
+    summary: 'Deal Hunter CRM source fields repaired from the current listing data.',
+    activityMetadata: {
+      repairType: 'deal-hunter-crm-source-fields',
+      backupReference: normalizedBackupReference,
+    },
+  });
+  return {
+    ok: true,
+    applied: true,
+    preview,
+    updatedAt: updated?.updated_at || '',
+  };
 }
 
 function buildDealHunterCrmImportRecord(deal, submissionId = '', status = 'pending') {
