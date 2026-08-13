@@ -17,10 +17,10 @@ const originalConsoleWarn = console.warn;
 let sourceFetchMode = 'ok';
 const today = new Date().toISOString().slice(0, 10);
 const sourceCsv = [
-  'Business Name,Industry,State,Date Added,Profit,Revenue,Asking Price,Broker Name,Broker Email,Contact Name 2,Contact Email 2,Listing URL,Description',
-  `"Commercial HVAC Maintenance Co","Commercial HVAC maintenance","CA","${today}","$450,000","$1,800,000","$1,400,000","Erin Broker","erin@example.com","Alex Contact","alex@example.com","https://broker.example.test/hvac-maintenance","Recurring maintenance contracts, service agreements, scheduled maintenance, field technicians, repair, replacement, compliance work, trained staff, management in place, SBA eligible, seller financing available."`,
+  'Business Name,Industry,State,Date Added,Profit,Revenue,Asking Price,Broker Name,Broker Company,Broker Contact,Broker Email,Contact Name 2,Contact Email 2,Listing URL,Description',
+  `"Commercial HVAC Maintenance Co","Commercial HVAC maintenance","CA","${today}","$450,000","$1,800,000","$1,400,000","Erin Broker","West Coast Business Brokers","310-555-0199","erin@example.com","Alex Contact","alex@example.com","https://broker.example.test/hvac-maintenance","Recurring maintenance contracts, service agreements, scheduled maintenance, field technicians, repair, replacement, compliance work, trained staff, management in place, SBA eligible, seller financing available."`,
 ].join('\n');
-const emptySourceCsv = 'Business Name,Industry,State,Date Added,Profit,Revenue,Asking Price,Broker Name,Broker Email,Contact Name 2,Contact Email 2,Listing URL,Description';
+const emptySourceCsv = 'Business Name,Industry,State,Date Added,Profit,Revenue,Asking Price,Broker Name,Broker Company,Broker Contact,Broker Email,Contact Name 2,Contact Email 2,Listing URL,Description';
 let activeSourceCsv = sourceCsv;
 
 before(() => {
@@ -316,6 +316,14 @@ test('bulk CIM send accepts a signed alternate contact and uses that contact in 
   assert.equal(storage.communications.size, 1);
   assert.equal(request.recipient_email, 'alex@example.com');
   assert.equal(request.metadata.brokerName, 'Alex Contact');
+  const [submission] = Array.from(storage.submissions.values());
+  assert.equal(submission.broker_name, 'Erin Broker');
+  assert.equal(submission.broker_email, 'erin@example.com');
+  assert.equal(submission.broker_phone, '310-555-0199');
+  assert.equal(submission.metadata.dealHunter.brokerName, 'Erin Broker');
+  assert.equal(submission.metadata.dealHunter.brokerCompany, 'West Coast Business Brokers');
+  assert.equal(submission.metadata.dealHunter.brokerContact, '310-555-0199');
+  assert.equal(submission.metadata.dealHunter.brokerEmail, 'erin@example.com');
   const [communication] = Array.from(storage.communications.values());
   assert.deepEqual(communication.to_addresses, ['alex@example.com']);
   assert.match(communication.body_text, /Alex/);

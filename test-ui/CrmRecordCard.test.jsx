@@ -4,7 +4,7 @@ import React from 'react';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, test, vi } from 'vitest';
-import { CrmRecordCard } from '../src/pages/DashboardPage.jsx';
+import { CrmRecordCard, crmBrokerContactDetails, crmDateAdded } from '../src/pages/DashboardPage.jsx';
 
 afterEach(cleanup);
 
@@ -67,6 +67,41 @@ describe('CRM record summary card', () => {
 
     const nextActionSection = screen.getByText('Next action').parentElement;
     expect(nextActionSection.querySelector('.text-red-700')).not.toBeNull();
+  });
+
+  test('uses the Daily Deal Update column-A date as the CRM date added', () => {
+    renderCard({
+      metadata: { dealHunter: { score: 82, dateAdded: '2026-08-08T00:00:00.000Z' } },
+    });
+
+    expect(screen.getByText('Added 8/8/2026')).toBeVisible();
+    expect(crmDateAdded({
+      created_at: '2026-08-12T18:00:00.000Z',
+      metadata: { dealHunter: { dateAdded: '2026-08-08T00:00:00.000Z' } },
+    })).toMatchObject({ formatted: '8/8/2026', source: 'daily-deal-update' });
+  });
+
+  test('resolves broker details from Daily Deal Update columns R through U for existing CRM records', () => {
+    expect(crmBrokerContactDetails({
+      broker_name: '',
+      broker_email: '',
+      broker_phone: '',
+      metadata: {
+        dealHunter: {
+          raw: {
+            'Broker Name': 'Erin Gilliam',
+            'Broker Company': 'West Coast Business Brokers',
+            'Broker Contact': '310-555-0199',
+            'Broker Email': 'erin@broker.example',
+          },
+        },
+      },
+    })).toEqual({
+      broker: 'Erin Gilliam',
+      company: 'West Coast Business Brokers',
+      contact: '310-555-0199',
+      email: 'erin@broker.example',
+    });
   });
 
   test('offers a reasoned Archive Lead action on editable index cards', async () => {

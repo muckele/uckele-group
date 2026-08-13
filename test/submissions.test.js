@@ -97,6 +97,20 @@ test('CSV export neutralizes spreadsheet formula starters', () => {
   assert.match(csv, /"'-feed"/);
 });
 
+test('Deal Hunter CSV export uses the Daily Deal Update source date', () => {
+  const csv = buildCsv([{
+    id: 'deal-hunter-submission',
+    company: 'Commercial HVAC Co',
+    created_at: '2026-08-12T18:00:00.000Z',
+    updated_at: '2026-08-12T18:00:00.000Z',
+    status: 'review',
+    metadata: { dealHunter: { dateAdded: '2026-08-08T00:00:00.000Z' } },
+  }]);
+
+  assert.match(csv, /"Commercial HVAC Co","2026-08-08T00:00:00\.000Z"/);
+  assert.doesNotMatch(csv, /"Commercial HVAC Co","2026-08-12T18:00:00\.000Z"/);
+});
+
 test('CRM URL normalizer only keeps HTTP(S) links', () => {
   assert.equal(normalizeCrmUrl('example.com/listing'), 'https://example.com/listing');
   assert.equal(normalizeCrmUrl('https://example.com/listing'), 'https://example.com/listing');

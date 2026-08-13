@@ -69,6 +69,8 @@ Airtable API mode (required when the shared-view export exceeds the payload limi
 
 Use Airtable API mode only while the legacy source remains enabled. The unauthenticated shared-view payload is guarded by `DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES`; if Airtable returns an oversized JSON payload, the source is marked as needing setup instead of crashing the review. Google Sheet CSV imports are similarly capped by `DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES` and `DEAL_HUNTER_MAX_SOURCE_RECORDS` before records are normalized. When `DEAL_HUNTER_AIRTABLE_ENABLED=false`, no Airtable network request is made and the disabled source does not block the scheduler. The admin review and daily email explicitly warn that source coverage is limited.
 
+For the `Mathew  Uckele - Daily Deal Update` **On-Market** tab, CRM synchronization treats column A (`Date Added`) as the record's displayed source date and preserves the source broker fields from column R (`Broker Name`), S (`Broker Company`), T (`Broker Contact`), and U (`Broker Email`). These four broker values are shown with explicit labels in the CRM record's Contacts section. The CRM import timestamp remains separately visible as `Imported to CRM`.
+
 ### Manual SMB Deal OS export bridge
 
 A full administrator can upload a `.csv` or `.xlsx` export under **Deal Hunter → Import SMB Deal OS export**. Viewer sessions cannot upload. The administrator must select `Saved search` or `Deal Radar filters`, describe the covered search/filter, record when the export was generated, and may enter the listing count shown by Deal OS. If an expected count is supplied, it must exactly match the file.

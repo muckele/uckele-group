@@ -378,6 +378,31 @@ test('Google Sheet workbook URL derivation preserves the selected tab and reject
   assert.equal(buildGoogleSheetWorkbookUrl('https://example.com/deals.csv'), '');
 });
 
+test('Daily Deal Update columns A and R through U map to the CRM source fields', () => {
+  const csv = [
+    [
+      'Date Added', 'Name', 'Industry', 'Description', 'City', 'County', 'State', 'Country',
+      'Years Established', 'Annual Profit', 'Annual Revenue', 'Asking Price', 'Profit Multiple',
+      'Revenue Multiple', 'Remote/Relocatable/Absentee-Run', 'Franchise', '5+ Years In Business',
+      'Broker Name', 'Broker Company', 'Broker Contact', 'Broker Email',
+    ].join(','),
+    [
+      '08-08-2026', 'Commercial HVAC Co', 'Home Services', 'Recurring maintenance contracts',
+      'Los Angeles', 'Los Angeles', 'CA', 'US', '12', '$450000', '$1800000', '$1400000',
+      '3.11', '0.78', 'No', 'No', 'Yes', 'Erin Gilliam', 'West Coast Business Brokers',
+      '310-555-0199', 'erin@broker.example',
+    ].join(','),
+  ].join('\n');
+  const [deal] = parseSheetCsvDeals(csv).deals;
+
+  assert.match(deal.dateAdded, /^2026-08-08/);
+  assert.equal(deal.brokerName, 'Erin Gilliam');
+  assert.equal(deal.brokerCompany, 'West Coast Business Brokers');
+  assert.equal(deal.brokerContact, '310-555-0199');
+  assert.equal(deal.brokerEmail, 'erin@broker.example');
+  assert.equal(deal.brokerContacts[0].sourceColumn, 'Broker Email');
+});
+
 test('Google Sheet parsing preserves, ranks, and deduplicates multiple broker contacts', async () => {
   const { dedupeDeals } = await import('../server/services/dealHunter.js');
   const csv = [

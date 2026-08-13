@@ -319,6 +319,11 @@ function daysAgoFrom(timestamp, nowValue = Date.now()) {
   return Math.max(0, Math.floor((nowTimestamp - dateValue) / (1000 * 60 * 60 * 24)));
 }
 
+function submissionDateAdded(submission = {}) {
+  const sourceDate = normalizeField(submission.metadata?.dealHunter?.dateAdded, 100);
+  return Number.isFinite(Date.parse(sourceDate)) ? sourceDate : submission.created_at;
+}
+
 function normalizeDealFields(raw = {}) {
   return Object.entries(dealFieldNormalizers).reduce((accumulator, [key, normalizer]) => {
     accumulator[key] = normalizer(raw[key]);
@@ -488,13 +493,14 @@ export function buildCsv(submissions) {
     headers.join(','),
     ...submissions.map((submission) => {
       const followUpPrompt = submission.follow_up_prompt || buildFollowUpPrompt(submission);
+      const dateAdded = submissionDateAdded(submission);
 
       return [
         submission.company,
-        submission.created_at,
+        dateAdded,
         submission.status,
         submission.status_updated_at || submission.updated_at,
-        submission.days_since_added ?? daysAgoFrom(submission.created_at),
+        submission.days_since_added ?? daysAgoFrom(dateAdded),
         submission.listing_url,
         submission.business_website,
         submission.prospectus_url,
@@ -620,13 +626,14 @@ function enrichSubmissionWithRelatedData(
   nowValue = new Date(),
 ) {
   const emailEngagement = summarizeEmailEngagement(dedupeEmailEvents(emailEvents));
+  const dateAdded = submissionDateAdded(submission);
   const enriched = {
     ...submission,
     latest_upload_request: uploadRequest,
     secure_documents: documents,
     email_engagement: emailEngagement,
     status_updated_at: submission.status_updated_at || submission.updated_at,
-    days_since_added: daysAgoFrom(submission.created_at, nowValue),
+    days_since_added: daysAgoFrom(dateAdded, nowValue),
   };
 
   return {

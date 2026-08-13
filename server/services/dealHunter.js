@@ -709,6 +709,7 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
   const sourceBrokerName = normalizeText(getField(rawRow, ['Broker Name', 'Broker']), 160);
   const sourceContactName = normalizeText(getField(rawRow, ['Contact Name']), 160);
   const extractedBrokerContacts = extractBrokerContacts(rawRow, { broker: sourceBrokerName, contact: sourceContactName });
+  const sourceBrokerEmail = extractEmailAddresses(getField(rawRow, ['Broker Email']))[0] || '';
   const brokerCompany = normalizeText(getField(rawRow, ['Broker Company', 'Company']), 160);
   const brokerContact = normalizeText(getField(rawRow, ['Broker Contact', 'Broker Phone', 'Phone', 'Contact Phone']), 200);
   const name = normalizeText(getField(rawRow, ['Name', 'Business Name', 'Business', 'Company', 'Title', 'Listing Title', 'Deal Name']), 220) || 'Unnamed business';
@@ -727,8 +728,8 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
     sourceListingUrl: listingUrl,
   })));
   const preferredBrokerContact = brokerContacts[0] || null;
-  const brokerEmail = preferredBrokerContact?.email || '';
-  const brokerName = preferredBrokerContact ? preferredBrokerContact.name : sourceBrokerName;
+  const brokerEmail = sourceBrokerEmail || preferredBrokerContact?.email || '';
+  const brokerName = sourceBrokerName || preferredBrokerContact?.name || '';
   const fullText = normalizeText([name, industry, description, city, county, state, remoteFlag, franchiseFlag].join(' '), 9000);
 
   return {
@@ -2657,8 +2658,8 @@ function initializeDealIdentity(deal = {}) {
     ...deal,
     _canonicalMatchRecord: deal._canonicalMatchRecord || { ...deal },
     brokerContacts: contacts,
-    brokerEmail: preferredContact?.email || deal.brokerEmail || '',
-    brokerName: preferredContact ? preferredContact.name : deal.brokerName || '',
+    brokerEmail: deal.brokerEmail || preferredContact?.email || '',
+    brokerName: deal.brokerName || preferredContact?.name || '',
     listingAliases,
     identityAliases,
     dealKeyAliases,
@@ -2831,8 +2832,8 @@ function mergeSyndicatedDeals(canonical, duplicate, decision) {
   return {
     ...merged,
     brokerContacts: contacts,
-    brokerEmail: preferredContact?.email || canonical.brokerEmail || duplicate.brokerEmail || '',
-    brokerName: preferredContact ? preferredContact.name : canonical.brokerName || duplicate.brokerName || '',
+    brokerEmail: canonical.brokerEmail || duplicate.brokerEmail || preferredContact?.email || '',
+    brokerName: canonical.brokerName || duplicate.brokerName || preferredContact?.name || '',
     raw: { ...(duplicate.raw || {}), ...(canonical.raw || {}) },
     listingAliases: uniqueStrings([
       ...(canonical.listingAliases || []), canonical.listingUrl,
@@ -3448,7 +3449,20 @@ function listLines(label, values = []) {
   return [label, ...safeValues.map((value) => `- ${value}`)];
 }
 
+function dealHunterSourceBrokerFields(deal = {}) {
+  const raw = deal.raw || {};
+  const sourceEmail = extractEmailAddresses(getField(raw, ['Broker Email']))[0] || '';
+
+  return {
+    name: normalizeText(getField(raw, ['Broker Name', 'Broker']), 160) || deal.brokerName || '',
+    company: normalizeText(getField(raw, ['Broker Company']), 160) || deal.brokerCompany || '',
+    contact: normalizeText(getField(raw, ['Broker Contact']), 200) || deal.brokerContact || '',
+    email: sourceEmail || deal.brokerEmail || '',
+  };
+}
+
 function dealHunterCrmNotes(deal) {
+  const broker = dealHunterSourceBrokerFields(deal);
   const lines = [
     dealHunterCrmNotesHeading,
     `Deal key: ${deal.dealKey || 'Not set'}`,
@@ -3476,13 +3490,13 @@ function dealHunterCrmNotes(deal) {
       : []),
     '',
     'Broker / contact',
-    deal.brokerName ? `Broker name: ${deal.brokerName}` : '',
-    deal.brokerCompany ? `Broker company: ${deal.brokerCompany}` : '',
-    deal.brokerEmail ? `Broker email: ${deal.brokerEmail}` : '',
+    broker.name ? `Broker name: ${broker.name}` : '',
+    broker.company ? `Broker company: ${broker.company}` : '',
+    broker.email ? `Broker email: ${broker.email}` : '',
     ...(deal.brokerContacts?.length > 1
       ? ['Available contacts', ...deal.brokerContacts.map((contact) => `- ${[contact.name, contact.role, contact.email, contact.sourceColumn].filter(Boolean).join(' | ')}`)]
       : []),
-    deal.brokerContact ? `Broker phone/contact: ${deal.brokerContact}` : '',
+    broker.contact ? `Broker phone/contact: ${broker.contact}` : '',
     '',
     ...listLines('Strengths', deal.strengths || []),
     '',
@@ -3553,6 +3567,7 @@ function mergeDealHunterCrmNotes(existingNotes = '', freshNotes = '') {
 function dealHunterCrmMetadata(deal, options = {}) {
   const managed = options.managed !== false;
   const generatedNotes = dealHunterCrmNotes(deal);
+  const broker = dealHunterSourceBrokerFields(deal);
 
   return {
     dealHunter: {
@@ -3577,6 +3592,10 @@ function dealHunterCrmMetadata(deal, options = {}) {
       concerns: deal.concerns || [],
       removeReasons: deal.removeReasons || [],
       questions: deal.questions || [],
+      brokerName: broker.name,
+      brokerCompany: broker.company,
+      brokerContact: broker.contact,
+      brokerEmail: broker.email,
       brokerContacts: deal.brokerContacts || [],
       listingAliases: deal.listingAliases || [],
       identityAliases: deal.identityAliases || [],
@@ -3590,7 +3609,8 @@ function dealHunterCrmMetadata(deal, options = {}) {
 }
 
 function dealHunterCrmPayload(deal, options = {}) {
-  const hasBrokerContact = Boolean(deal.brokerName || deal.brokerEmail || deal.brokerContact);
+  const broker = dealHunterSourceBrokerFields(deal);
+  const hasBrokerContact = Boolean(broker.name || broker.email || broker.contact);
   const sourceTag = normalizeComparableText(deal.sourceName || 'deal-hunter').replace(/\s+/g, '-').slice(0, 40);
   const generatedNotes = dealHunterCrmNotes(deal);
 
@@ -3603,9 +3623,9 @@ function dealHunterCrmPayload(deal, options = {}) {
     ttm_ebitda: formatCurrencyForCrm(deal.annualProfit),
     ebitda_multiple: formatMultipleForCrm(deal.profitMultiple),
     business_age: formatYearsForCrm(deal.yearsEstablished),
-    broker_name: deal.brokerName || deal.brokerCompany || '',
-    broker_email: deal.brokerEmail || '',
-    broker_phone: deal.brokerContact || '',
+    broker_name: broker.name || broker.company,
+    broker_email: broker.email,
+    broker_phone: broker.contact,
     lead_type: hasBrokerContact ? 'broker' : 'prospect',
     status: 'review',
     priority: deal.score >= 85 ? 'urgent' : 'high',

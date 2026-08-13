@@ -255,6 +255,71 @@ function submissionListingDate(submission = {}) {
   return submission.metadata?.dealHunter?.dateAdded || submission.metadata?.dealHunter?.firstSeenAt || '';
 }
 
+function formatSourceCalendarDate(value) {
+  const normalized = String(value || '').trim();
+  const calendarDate = normalized.match(/^(\d{4})-(\d{2})-(\d{2})/)?.slice(1);
+
+  if (calendarDate) {
+    const [year, month, day] = calendarDate.map(Number);
+    const date = new Date(Date.UTC(year, month - 1, day));
+
+    if (!Number.isNaN(date.getTime())) {
+      return date.toLocaleDateString(undefined, {
+        year: 'numeric',
+        month: 'numeric',
+        day: 'numeric',
+        timeZone: 'UTC',
+      });
+    }
+  }
+
+  return formatDateTime(value);
+}
+
+function dealHunterRawField(raw = {}, aliases = []) {
+  const values = new Map(Object.entries(raw || {}).map(([key, value]) => [
+    String(key).toLowerCase().replace(/[^a-z0-9]/g, ''),
+    value,
+  ]));
+
+  for (const alias of aliases) {
+    const value = values.get(String(alias).toLowerCase().replace(/[^a-z0-9]/g, ''));
+    if (String(value || '').trim()) return String(value).trim();
+  }
+
+  return '';
+}
+
+export function crmBrokerContactDetails(submission = {}) {
+  const dealHunter = submission.metadata?.dealHunter || {};
+  const raw = dealHunter.raw || {};
+
+  return {
+    broker: dealHunter.brokerName
+      || dealHunterRawField(raw, ['Broker Name', 'Broker'])
+      || submission.broker_name
+      || '',
+    company: dealHunter.brokerCompany
+      || dealHunterRawField(raw, ['Broker Company'])
+      || '',
+    contact: dealHunter.brokerContact
+      || dealHunterRawField(raw, ['Broker Contact'])
+      || submission.broker_phone
+      || '',
+    email: dealHunter.brokerEmail
+      || dealHunterRawField(raw, ['Broker Email'])
+      || submission.broker_email
+      || '',
+  };
+}
+
+export function crmDateAdded(submission = {}) {
+  const sourceDate = submission.metadata?.dealHunter?.dateAdded || '';
+  return sourceDate
+    ? { value: sourceDate, formatted: formatSourceCalendarDate(sourceDate), source: 'daily-deal-update' }
+    : { value: submission.created_at || '', formatted: formatDateTime(submission.created_at), source: 'crm' };
+}
+
 function pluralize(count, label) {
   return `${count} ${label}${count === 1 ? '' : 's'}`;
 }
@@ -939,6 +1004,7 @@ export function CorrectedRecipientRetryForm({ request, error = '', pending = fal
 
 export function CrmRecordCard({ submission, detailHref, lifecyclePending = false, onArchiveLead, onRestoreLead, readOnly = false }) {
   const dealScore = submissionDealScore(submission);
+  const dateAdded = crmDateAdded(submission);
   const contactName = submission.broker_name || submission.seller_name || submission.name || 'No contact named';
   const contactEmail = submission.broker_email || submission.seller_email || submission.email || '';
   const nextActionAt = submission.next_action_at ? new Date(submission.next_action_at) : null;
@@ -978,7 +1044,7 @@ export function CrmRecordCard({ submission, detailHref, lifecyclePending = false
           </h2>
           <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm leading-6 text-ink/68">
             <span>{formatLabel(submission.lead_type || 'prospect')}</span>
-            <span>Added {formatDateTime(submission.created_at)}</span>
+            <span>Added {dateAdded.formatted}</span>
             <span>Owner: {submission.assigned_to || 'Unassigned'}</span>
           </div>
         </div>
@@ -4030,7 +4096,11 @@ export default function DashboardPage() {
             const diligenceProgressTone = diligenceProgress.complete === diligenceProgress.total ? 'success' : diligenceProgress.complete > 0 ? 'info' : 'default';
             const dealScore = submissionDealScore(submission);
             const listingDate = submissionListingDate(submission);
-            const listingDateLabel = submission.metadata?.dealHunter?.dateAdded ? 'Date listed' : listingDate ? 'First seen' : 'Date listed';
+            const dateAdded = crmDateAdded(submission);
+            const sourceDateAdded = submission.metadata?.dealHunter?.dateAdded || '';
+            const secondaryDateLabel = sourceDateAdded ? 'Imported to CRM' : listingDate ? 'First seen' : 'Date listed';
+            const secondaryDate = sourceDateAdded ? submission.created_at : listingDate;
+            const brokerContactDetails = crmBrokerContactDetails(submission);
 
             return (
               <Reveal
@@ -4069,8 +4139,8 @@ export default function DashboardPage() {
                     </div>
 
                     <div className="mt-4 grid gap-3 text-sm leading-7 text-ink/74 sm:grid-cols-2 xl:grid-cols-5">
-                      <p><strong>Date added:</strong> {formatDateTime(submission.created_at)}</p>
-                      <p><strong>{listingDateLabel}:</strong> {listingDate ? formatDateTime(listingDate) : 'Not provided'}</p>
+                      <p><strong>Date added:</strong> {dateAdded.formatted}</p>
+                      <p><strong>{secondaryDateLabel}:</strong> {secondaryDate ? formatDateTime(secondaryDate) : 'Not provided'}</p>
                       <p><strong>Last status edit:</strong> {formatDateTime(submission.status_updated_at || submission.updated_at)}</p>
                       <p><strong>Days ago:</strong> {submission.days_since_added ?? '0'}</p>
                       <p><strong>Next action:</strong> {formatDateTime(submission.next_action_at)}</p>
@@ -4134,10 +4204,18 @@ export default function DashboardPage() {
                       <SectionLabel>Contacts</SectionLabel>
                       <div className="mt-4 space-y-5 text-sm leading-7 text-ink/74">
                         <div>
-                          <p className="font-semibold text-ink">Broker</p>
-                          <p>{submission.broker_name || 'Not set'}</p>
-                          <p>{submission.broker_email || 'No email'}</p>
-                          <p>{submission.broker_phone || 'No phone'}</p>
+                          <p className="font-semibold text-ink">Broker details</p>
+                          <p><strong>Broker:</strong> {brokerContactDetails.broker || 'Not set'}</p>
+                          <p><strong>Broker company:</strong> {brokerContactDetails.company || 'Not set'}</p>
+                          <p><strong>Broker contact:</strong> {brokerContactDetails.contact || 'Not set'}</p>
+                          <p>
+                            <strong>Email:</strong>{' '}
+                            {brokerContactDetails.email ? (
+                              <a className="text-moss underline decoration-moss/30 underline-offset-2" href={`mailto:${brokerContactDetails.email}`}>
+                                {brokerContactDetails.email}
+                              </a>
+                            ) : 'Not set'}
+                          </p>
                         </div>
                         <div>
                           <p className="font-semibold text-ink">Seller</p>
