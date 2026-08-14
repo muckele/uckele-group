@@ -369,6 +369,34 @@ test('Google Sheet workbook extraction skips hidden duplicate rows instead of sh
   assert.equal(extracted.unmatchedListingUrlCount, 1);
 });
 
+test('Google Sheet workbook extraction uses Date Added to distinguish otherwise identical listings', () => {
+  const row = (number, dateAdded, listingUrl) => [
+    `<row r="${number}">`,
+    `<c r="A${number}" t="inlineStr"><is><t>${dateAdded}</t></is></c>`,
+    `<c r="B${number}" t="inlineStr"><is><t>Pain Treatment Center - High Profits For Sale</t></is></c>`,
+    `<c r="V${number}" t="str"><f>HYPERLINK(&quot;${listingUrl}&quot;, &quot;View Listing&quot;)</f><v>View Listing</v></c>`,
+    '</row>',
+  ].join('');
+  const worksheet = [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>',
+    '<row r="1"><c r="A1" t="inlineStr"><is><t>Date Added</t></is></c><c r="B1" t="inlineStr"><is><t>Business Name</t></is></c><c r="V1" t="inlineStr"><is><t>View Listing</t></is></c></row>',
+    row(2, '12/5/2025', 'https://us.businessesforsale.com/us/pain-treatment-center-high-profits-4.aspx'),
+    row(3, '12/3/2025', 'https://us.businessesforsale.com/us/pain-treatment-center-high-profits-2.aspx'),
+    '</sheetData></worksheet>',
+  ].join('');
+  const workbook = zipSync({ 'xl/worksheets/sheet1.xml': strToU8(worksheet) });
+  const expectedRows = [
+    { 'Date Added': '12/3/2025', 'Business Name': 'Pain Treatment Center - High Profits For Sale' },
+    { 'Date Added': '12/5/2025', 'Business Name': 'Pain Treatment Center - High Profits For Sale' },
+  ];
+  const extracted = extractGoogleSheetListingUrls(workbook, expectedRows);
+
+  assert.equal(extracted.listingUrlsByRow.get(0), 'https://us.businessesforsale.com/us/pain-treatment-center-high-profits-2.aspx');
+  assert.equal(extracted.listingUrlsByRow.get(1), 'https://us.businessesforsale.com/us/pain-treatment-center-high-profits-4.aspx');
+  assert.equal(extracted.unmatchedListingUrlCount, 0);
+});
+
 test('Google Sheet workbook URL derivation preserves the selected tab and rejects filtered queries', () => {
   assert.equal(
     buildGoogleSheetWorkbookUrl('https://docs.google.com/spreadsheets/d/sheet-id/gviz/tq?tqx=out:csv&gid=123'),

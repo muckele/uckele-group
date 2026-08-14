@@ -125,7 +125,60 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
       coverageLabel: 'NY field service filters',
       exportedAt: expect.any(String),
       expectedRowCount: '1',
+      runFullBackfill: false,
     });
+  });
+
+  test('keeps full-backfill scoring explicit and separate from CRM sync', () => {
+    const onImportDealOs = vi.fn();
+    const file = new File(['Listing ID,Business Name\nDOS-1,HVAC'], 'deal-os.csv', {
+      type: 'text/csv',
+      lastModified: new Date('2026-08-10T16:00:00.000Z').getTime(),
+    });
+    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    review.dealOsImportPolicy = { maxRecords: 1000, maxAgeHours: 72 };
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onImportDealOs={onImportDealOs} onReview={vi.fn()} review={review} />);
+
+    fireEvent.change(screen.getByLabelText('Deal OS export file'), { target: { files: [file] } });
+    fireEvent.change(screen.getByLabelText('Coverage description'), { target: { value: 'Full saved search' } });
+    fireEvent.click(screen.getByRole('checkbox', { name: /Score all current listings after import/ }));
+    fireEvent.submit(screen.getByRole('button', { name: 'Validate & Import' }).closest('form'));
+
+    expect(onImportDealOs).toHaveBeenCalledWith(expect.objectContaining({ runFullBackfill: true }));
+    expect(screen.getByText(/does not create CRM records or send email/i)).toBeVisible();
+  });
+
+  test('shows post-import counts and only enables explicit CRM sync for eligible reviewed deals', () => {
+    const onSyncHighFits = vi.fn();
+    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    review.reviewMode = 'full-backfill';
+    review.totals = { reviewedDeals: 261, qualified: 3, crmEligible: 3 };
+    const importSummary = {
+      reviewMode: 'full-backfill',
+      importedRows: 261,
+      canonicalListings: 254,
+      withinFileDuplicates: 1,
+      collapsedDuplicates: 6,
+      scoredListings: 261,
+      highFitListings: 3,
+      syncedListings: 0,
+      fieldCoverage: {
+        totalRecords: 261,
+        fields: [
+          { key: 'industry', label: 'Industry', present: 0, percent: 0 },
+          { key: 'description', label: 'Description / notes', present: 0, percent: 0 },
+          { key: 'brokerEmail', label: 'Broker email', present: 0, percent: 0 },
+        ],
+      },
+    };
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} importSummary={importSummary} onReview={vi.fn()} onSyncHighFits={onSyncHighFits} review={review} />);
+
+    expect(screen.getByRole('region', { name: 'Latest Deal OS import summary' })).toHaveTextContent('261');
+    expect(screen.getByText(/Missing fields remain visibly undisclosed/)).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Sync 3 High Fits to CRM' }));
+    expect(onSyncHighFits).toHaveBeenCalledOnce();
   });
 
   test('makes the required coverage field actionable instead of silently disabling import', () => {

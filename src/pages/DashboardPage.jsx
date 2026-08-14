@@ -1333,8 +1333,10 @@ export default function DashboardPage() {
   const [createPending, setCreatePending] = useState(false);
   const [createError, setCreateError] = useState('');
   const [dealHunterReview, setDealHunterReview] = useState(null);
+  const [dealHunterImportSummary, setDealHunterImportSummary] = useState(null);
   const [dealHunterLoading, setDealHunterLoading] = useState(false);
   const [dealOsImporting, setDealOsImporting] = useState(false);
+  const [dealHunterCrmSyncing, setDealHunterCrmSyncing] = useState(false);
   const [dealHunterSending, setDealHunterSending] = useState(false);
   const [dealHunterBulkCimSending, setDealHunterBulkCimSending] = useState(false);
   const [dealHunterFollowUpRunning, setDealHunterFollowUpRunning] = useState(false);
@@ -2754,12 +2756,16 @@ export default function DashboardPage() {
     });
   }
 
-  async function handleLoadDealHunterReview() {
+  async function handleLoadDealHunterReview(reviewMode = 'daily') {
+    const fullBackfill = reviewMode === 'full-backfill';
     setDealHunterLoading(true);
     setDealHunterFeedback({ error: '', message: '' });
 
     try {
-      const response = await fetch('/api/admin/deal-hunter/review', {
+      const response = await fetch(fullBackfill
+        ? '/api/admin/deal-hunter/backfill-review'
+        : '/api/admin/deal-hunter/review', {
+        method: fullBackfill ? 'POST' : 'GET',
         credentials: 'same-origin',
       });
       const result = await response.json();
@@ -2770,8 +2776,14 @@ export default function DashboardPage() {
 
       if (result.review) {
         setDealHunterReview(result.review);
+        setDealHunterImportSummary(result.summary || result.review.importSummary || null);
       }
-      setDealHunterFeedback({ error: '', message: `Reviewed ${result.review?.totals?.reviewedDeals || 0} recent deals.` });
+      setDealHunterFeedback({
+        error: '',
+        message: fullBackfill
+          ? `Full backfill scored ${result.review?.totals?.reviewedDeals || 0} canonical listings. No CRM records were changed.`
+          : `Reviewed ${result.review?.totals?.reviewedDeals || 0} recent deals.`,
+      });
       await loadCommandCenter();
     } catch (error) {
       setDealHunterFeedback({ error: error.message || 'Unable to review daily deals.', message: '' });
@@ -2804,7 +2816,7 @@ export default function DashboardPage() {
     }
   }
 
-  async function handleImportDealOsExport({ file, scope, coverageLabel, exportedAt, expectedRowCount }) {
+  async function handleImportDealOsExport({ file, scope, coverageLabel, exportedAt, expectedRowCount, runFullBackfill }) {
     if (isReadOnly) {
       setDealHunterFeedback({ error: 'Read-only users cannot import Deal OS exports.', message: '' });
       return;
@@ -2824,6 +2836,7 @@ export default function DashboardPage() {
         'X-Deal-OS-Exported-At': exportedAt,
         'X-Deal-OS-Scope': scope,
         'X-Deal-OS-Coverage-Label': encodeURIComponent(coverageLabel),
+        'X-Deal-OS-Review-Mode': runFullBackfill ? 'full-backfill' : 'daily',
       };
       if (expectedRowCount) headers['X-Deal-OS-Expected-Row-Count'] = expectedRowCount;
       const response = await fetch('/api/admin/deal-hunter/deal-os-import', {
@@ -2839,16 +2852,27 @@ export default function DashboardPage() {
         throw new Error(`${result.error || 'Unable to import the Deal OS export.'}${details}`);
       }
 
-      const reviewResponse = await fetch('/api/admin/deal-hunter/review', { credentials: 'same-origin' });
-      const reviewResult = await reviewResponse.json();
-      if (reviewResponse.ok && reviewResult.success && reviewResult.review) {
-        setDealHunterReview(reviewResult.review);
+      let refreshedReview = result.review || null;
+      let refreshWarning = result.reviewWarning ? ` ${result.reviewWarning}` : '';
+      if (!refreshedReview) {
+        const reviewResponse = await fetch('/api/admin/deal-hunter/review', { credentials: 'same-origin' });
+        const reviewResult = await reviewResponse.json();
+        if (reviewResponse.ok && reviewResult.success && reviewResult.review) {
+          refreshedReview = reviewResult.review;
+        } else {
+          refreshWarning = ' The import was saved, but source review could not be refreshed.';
+        }
       }
+      if (refreshedReview) setDealHunterReview(refreshedReview);
+      const summary = result.summary || refreshedReview?.importSummary || null;
+      setDealHunterImportSummary(summary);
       const imported = result.import || {};
-      const refreshWarning = reviewResponse.ok && reviewResult.success ? '' : ' The import was saved, but source review could not be refreshed.';
+      const scoredMessage = summary?.scoredListings !== undefined
+        ? ` Scored ${summary.scoredListings} listing${Number(summary.scoredListings) === 1 ? '' : 's'} in ${summary.reviewMode === 'full-backfill' ? 'full-backfill' : 'daily'} mode.`
+        : '';
       setDealHunterFeedback({
         error: '',
-        message: `Imported ${imported.rowCount || 0} Deal OS listing${Number(imported.rowCount || 0) === 1 ? '' : 's'} from ${imported.fileName || file.name}.${refreshWarning}`,
+        message: `Imported ${imported.rowCount || 0} Deal OS listing${Number(imported.rowCount || 0) === 1 ? '' : 's'} from ${imported.fileName || file.name}.${scoredMessage}${refreshWarning}`,
       });
       await loadCommandCenter();
     } catch (error) {
@@ -2879,13 +2903,12 @@ export default function DashboardPage() {
       }
 
       setDealHunterReview(result.review);
-      const crmSync = result.crmSync || result.review?.crmSync;
-      const crmMessage = crmSync?.reviewed
-        ? ` CRM sync: ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped.`
-        : '';
+      setDealHunterImportSummary(result.review?.importSummary || dealHunterImportSummary);
       setDealHunterFeedback({
         error: '',
-        message: result.alreadySent ? 'The daily deal email was already sent for today.' : `Daily deal email sent.${crmMessage}`,
+        message: result.alreadySent
+          ? 'The daily deal email was already sent for today.'
+          : 'Daily deal email sent. No CRM records were changed.',
       });
       await Promise.all([
         loadCommandCenter(),
@@ -2895,6 +2918,59 @@ export default function DashboardPage() {
       setDealHunterFeedback({ error: error.message || 'Unable to send the daily deal email.', message: '' });
     } finally {
       setDealHunterSending(false);
+    }
+  }
+
+  async function handleSyncDealHunterHighFits() {
+    if (isReadOnly) {
+      setDealHunterFeedback({ error: 'Read-only users cannot sync Deal Hunter listings to CRM.', message: '' });
+      return;
+    }
+
+    const confirmation = window.prompt(
+      `This will idempotently create or update ${dealHunterReview?.totals?.crmEligible || 0} reviewed high-fit CRM record${Number(dealHunterReview?.totals?.crmEligible || 0) === 1 ? '' : 's'}. Type SYNC HIGH FITS to continue.`,
+    );
+    if (confirmation !== 'SYNC HIGH FITS') {
+      if (confirmation !== null) setDealHunterFeedback({ error: 'CRM sync confirmation did not match. No records were changed.', message: '' });
+      return;
+    }
+
+    setDealHunterCrmSyncing(true);
+    setDealHunterFeedback({ error: '', message: '' });
+    try {
+      const response = await fetch('/api/admin/deal-hunter/crm-sync', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          confirmation,
+          expectedDealKeys: dealHunterReview?.crmSyncPreview?.dealKeys
+            || (dealHunterReview?.qualified || []).map((deal) => deal.dealKey),
+          reviewMode: dealHunterReview?.reviewMode === 'full-backfill' ? 'full-backfill' : 'daily',
+        }),
+      });
+      const result = await response.json();
+      if (result.review) setDealHunterReview(result.review);
+      if (result.summary || result.review?.importSummary) {
+        setDealHunterImportSummary(result.summary || result.review.importSummary);
+      }
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to sync high-fit listings to CRM.');
+      }
+
+      const crmSync = result.crmSync || {};
+      setDealHunterFeedback({
+        error: '',
+        message: `CRM sync completed: ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped, ${crmSync.failed || 0} failed.`,
+      });
+      await Promise.all([
+        loadCommandCenter(),
+        loadDashboard(filters.status, deferredSearch.trim()),
+      ]);
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to sync high-fit listings to CRM.', message: '' });
+    } finally {
+      setDealHunterCrmSyncing(false);
     }
   }
 
@@ -3726,15 +3802,18 @@ export default function DashboardPage() {
         <>
           <DealHunterWorkspace
             bulkSending={dealHunterBulkCimSending}
+            crmSyncing={dealHunterCrmSyncing}
             dismissingDealKey={dismissingDealKey}
             feedback={dealHunterFeedback}
             followUpRunning={dealHunterFollowUpRunning}
             emailTestSending={emailTestSending}
             loading={dealHunterLoading}
             importingDealOs={dealOsImporting}
+            importSummary={dealHunterImportSummary}
             onDismissDeal={handleDismissDealHunterOpportunity}
             onImportDealOs={handleImportDealOsExport}
             onReview={handleLoadDealHunterReview}
+            onRunFullBackfill={() => handleLoadDealHunterReview('full-backfill')}
             onResolveIdentityException={handleResolveCimIdentityException}
             onRecordCimOutcome={handleRecordCimOutcome}
             onOpenApprovals={() => {
@@ -3744,6 +3823,7 @@ export default function DashboardPage() {
             onRunFollowUps={handleRunCimFollowUps}
             onSendCimRequest={handleSendCimRequest}
             onSendEmail={handleSendDealHunterEmail}
+            onSyncHighFits={handleSyncDealHunterHighFits}
             onSendEmailTest={handleSendEmailTest}
             onSendReady={handleSendReadyCimRequests}
             readOnly={isReadOnly}

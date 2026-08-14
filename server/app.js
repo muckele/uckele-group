@@ -36,6 +36,7 @@ import { getEmailReadiness } from './services/emailReadiness.js';
 import { sendAdminEmailTestEmail } from './services/delivery.js';
 import { checkReadiness } from './services/readiness.js';
 import {
+  dealHunterCrmSyncConfirmation,
   reviewDailyDeals,
   importDealOsExport,
   runCimStage2Automation,
@@ -44,6 +45,7 @@ import {
   retryDealHunterCimRequestWithCorrectedRecipient,
   sendDealHunterCimRequest,
   sendDealHunterReadyCimRequests,
+  syncDealHunterHighFitsToCrm,
   validateCimReviewDecisions,
 } from './services/dealHunter.js';
 import { getDailyDealHunterJobStatus, runClaimedDailyDealHunterEmail } from './services/dealHunterScheduler.js';
@@ -1154,6 +1156,12 @@ export function createApp() {
         return;
       }
 
+      const requestedReviewMode = decodedHeader(request, 'x-deal-os-review-mode', 40) || 'daily';
+      if (!['daily', 'full-backfill'].includes(requestedReviewMode)) {
+        response.status(400).json({ success: false, error: 'Deal OS review mode must be daily or full-backfill.' });
+        return;
+      }
+
       const result = await importDealOsExport({
         fileBuffer: request.body,
         fileName: decodedHeader(request, 'x-deal-os-file-name', 180),
@@ -1170,7 +1178,78 @@ export function createApp() {
         return;
       }
 
-      response.status(201).json({ success: true, import: result.import });
+      let review = null;
+      let reviewWarning = '';
+      try {
+        review = await reviewDailyDeals({ reviewMode: requestedReviewMode });
+        review.dailyEmailJob = await getDailyDealHunterJobStatus();
+        review.emailReadiness = await getEmailReadiness();
+      } catch (error) {
+        reviewWarning = `The export was imported, but scoring could not be refreshed: ${error.message}`;
+      }
+
+      response.status(201).json({
+        success: true,
+        import: result.import,
+        review,
+        summary: review?.importSummary || {
+          reviewMode: requestedReviewMode,
+          importedRows: Number(result.import?.rowCount || 0),
+          withinFileDuplicates: Number(result.import?.duplicateCount || 0),
+          fieldCoverage: result.import?.fieldCoverage || { totalRecords: 0, fields: [] },
+        },
+        ...(reviewWarning ? { reviewWarning } : {}),
+      });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/backfill-review',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const review = await reviewDailyDeals({ reviewMode: 'full-backfill' });
+      review.dailyEmailJob = await getDailyDealHunterJobStatus();
+      review.emailReadiness = await getEmailReadiness();
+      await getSourceHealth(undefined, { persistSnapshot: true, refresh: true, review });
+      response.json({ success: true, review, summary: review.importSummary });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/crm-sync',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const reviewMode = String(request.body?.reviewMode || 'daily');
+      if (!['daily', 'full-backfill'].includes(reviewMode)) {
+        response.status(400).json({ success: false, error: 'CRM sync review mode must be daily or full-backfill.' });
+        return;
+      }
+
+      const result = await syncDealHunterHighFitsToCrm({
+        confirmation: request.body?.confirmation || '',
+        expectedDealKeys: request.body?.expectedDealKeys || [],
+        requestedBy: session.username || 'admin',
+        reviewMode,
+      });
+      if (result.review) {
+        result.review.dailyEmailJob = await getDailyDealHunterJobStatus();
+        result.review.emailReadiness = await getEmailReadiness();
+      }
+      response.status(result.status || (result.ok ? 200 : 400)).json({
+        success: Boolean(result.ok),
+        confirmationRequired: dealHunterCrmSyncConfirmation,
+        ...result,
+      });
     }),
   );
 

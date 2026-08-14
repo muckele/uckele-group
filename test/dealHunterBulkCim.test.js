@@ -521,6 +521,187 @@ test('daily review email and CRM sync fail closed when a source is unavailable',
   assert.equal(storage.requests.size, 0);
 });
 
+test('daily internal summary never writes high-fit listings to CRM', async () => {
+  const { sendDailyDealHunterReview } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  let crmClaimCalls = 0;
+  storage.claimDealHunterCrmImport = async () => {
+    crmClaimCalls += 1;
+    throw new Error('daily email must not enter CRM sync');
+  };
+
+  const result = await sendDailyDealHunterReview({ idempotencyKey: 'no-implicit-crm-sync', storage });
+
+  assert.equal(result.crmSync.notRun, true);
+  assert.equal(result.crmSync.explicitActionRequired, true);
+  assert.equal(crmClaimCalls, 0);
+  assert.equal(storage.submissions.size, 0);
+});
+
+test('explicit confirmed CRM sync is idempotent across repeated runs', async () => {
+  const { reviewDailyDeals, syncDealHunterHighFitsToCrm } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const crmImports = new Map();
+  const originalMutation = storage.mutateWithCrmActivity.bind(storage);
+  storage.claimDealHunterCrmImport = async (record) => {
+    const existing = crmImports.get(record.id);
+    if (existing) return { claimed: false, importRecord: existing };
+    crmImports.set(record.id, record);
+    return { claimed: true, importRecord: record };
+  };
+  storage.updateDealHunterCrmImport = async (id, values) => {
+    const updated = { ...crmImports.get(id), ...values };
+    crmImports.set(id, updated);
+    return updated;
+  };
+  storage.updateSubmission = async (id, values) => {
+    const updated = { ...storage.submissions.get(id), ...values };
+    storage.submissions.set(id, updated);
+    return updated;
+  };
+  storage.mutateWithCrmActivity = async ({ operation, payload, activity }) => {
+    if (operation !== 'update_submission') {
+      return originalMutation({ operation, payload, activity });
+    }
+    const existing = storage.submissions.get(payload.id);
+    const record = { ...existing, ...payload.values };
+    storage.submissions.set(record.id, record);
+    storage.activities.push(activity);
+    return { applied: true, record, activity };
+  };
+  const reviewed = await reviewDailyDeals({ storage });
+  const expectedDealKeys = reviewed.qualified.map((deal) => deal.dealKey);
+
+  const first = await syncDealHunterHighFitsToCrm({
+    confirmation: 'SYNC HIGH FITS',
+    expectedDealKeys,
+    requestedBy: 'test-admin',
+    storage,
+  });
+  const second = await syncDealHunterHighFitsToCrm({
+    confirmation: 'SYNC HIGH FITS',
+    expectedDealKeys,
+    requestedBy: 'test-admin',
+    storage,
+  });
+
+  assert.equal(first.ok, true);
+  assert.equal(first.crmSync.created, 1);
+  assert.equal(second.ok, true);
+  assert.equal(second.crmSync.created, 0);
+  assert.equal(second.crmSync.updated, 1);
+  assert.equal(storage.submissions.size, 1);
+  assert.equal(crmImports.size, 1);
+});
+
+test('explicit CRM sync requires durable import claims before reviewing or writing listings', async () => {
+  const { syncDealHunterHighFitsToCrm } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  delete storage.claimDealHunterCrmImport;
+  let crmMutationCalls = 0;
+  storage.mutateWithCrmActivity = async () => {
+    crmMutationCalls += 1;
+    throw new Error('CRM mutation must not run without durable claims');
+  };
+
+  const result = await syncDealHunterHighFitsToCrm({
+    confirmation: 'SYNC HIGH FITS',
+    expectedDealKeys: ['reviewed-deal-key'],
+    requestedBy: 'test-admin',
+    storage,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 503);
+  assert.match(result.error, /durable CRM import claims are unavailable/i);
+  assert.equal(crmMutationCalls, 0);
+  assert.equal(storage.submissions.size, 0);
+});
+
+test('explicit CRM sync aborts when the high-fit set changes after review', async () => {
+  const { reviewDailyDeals, syncDealHunterHighFitsToCrm } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const reviewed = await reviewDailyDeals({ storage });
+  const expectedDealKeys = reviewed.qualified.map((deal) => deal.dealKey);
+  let crmClaimCalls = 0;
+  storage.claimDealHunterCrmImport = async () => {
+    crmClaimCalls += 1;
+    throw new Error('a changed review must not reach CRM storage');
+  };
+  activeSourceCsv = emptySourceCsv;
+
+  const result = await syncDealHunterHighFitsToCrm({
+    confirmation: 'SYNC HIGH FITS',
+    expectedDealKeys,
+    requestedBy: 'test-admin',
+    storage,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 409);
+  assert.match(result.error, /high-fit set changed/i);
+  assert.equal(crmClaimCalls, 0);
+  assert.equal(storage.submissions.size, 0);
+});
+
+test('explicit CRM sync fails closed when its durable idempotency claim is unavailable', async () => {
+  const { reviewDailyDeals, syncDealHunterHighFitsToCrm } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const reviewed = await reviewDailyDeals({ storage });
+  const expectedDealKeys = reviewed.qualified.map((deal) => deal.dealKey);
+  let crmMutationCalls = 0;
+  storage.claimDealHunterCrmImport = async () => {
+    throw new Error('claim database unavailable');
+  };
+  storage.mutateWithCrmActivity = async () => {
+    crmMutationCalls += 1;
+    throw new Error('CRM mutation must not run without its durable claim');
+  };
+
+  const result = await syncDealHunterHighFitsToCrm({
+    confirmation: 'SYNC HIGH FITS',
+    expectedDealKeys,
+    requestedBy: 'test-admin',
+    storage,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 503);
+  assert.equal(result.crmSync.created, 0);
+  assert.equal(result.crmSync.failed, 1);
+  assert.match(result.error, /durable idempotency claim/i);
+  assert.equal(crmMutationCalls, 0);
+  assert.equal(storage.submissions.size, 0);
+});
+
+test('explicit CRM sync fails closed when its durable idempotency claim returns an invalid result', async () => {
+  const { reviewDailyDeals, syncDealHunterHighFitsToCrm } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const reviewed = await reviewDailyDeals({ storage });
+  const expectedDealKeys = reviewed.qualified.map((deal) => deal.dealKey);
+  let crmMutationCalls = 0;
+  storage.claimDealHunterCrmImport = async () => null;
+  storage.mutateWithCrmActivity = async () => {
+    crmMutationCalls += 1;
+    throw new Error('CRM mutation must not run after an invalid durable claim result');
+  };
+
+  const result = await syncDealHunterHighFitsToCrm({
+    confirmation: 'SYNC HIGH FITS',
+    expectedDealKeys,
+    requestedBy: 'test-admin',
+    storage,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 503);
+  assert.equal(result.crmSync.created, 0);
+  assert.equal(result.crmSync.failed, 1);
+  assert.match(result.error, /durable idempotency claim/i);
+  assert.equal(crmMutationCalls, 0);
+  assert.equal(storage.submissions.size, 0);
+});
+
 test('source outages block alternate contacts even when they are present in a signed snapshot', async () => {
   const { reviewDailyDeals, sendDealHunterReadyCimRequests } = await import('../server/services/dealHunter.js');
   const storage = createCimStorage();

@@ -12,11 +12,13 @@ process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS = '1000';
 process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES = String(8 * 1024 * 1024);
 
 const {
+  dealHunterCrmSyncConfirmation,
   importDealOsExport,
   parseDealOsXlsxRows,
   parseSheetCsvDeals,
   repairDealHunterCrmSourceFields,
   reviewDailyDeals,
+  syncDealHunterHighFitsToCrm,
 } = await import('../server/services/dealHunter.js');
 const { createSqliteStorage } = await import('../server/storage/sqlite.js');
 
@@ -184,6 +186,11 @@ test('current SMB Deal OS marketplace export maps Listing, Earnings, and Margin 
 
   assert.equal(result.ok, true);
   assert.equal(result.import.rowCount, 1);
+  assert.equal(result.import.fieldCoverage.totalRecords, 1);
+  assert.equal(result.import.fieldCoverage.fields.find((field) => field.key === 'listingUrl').percent, 100);
+  assert.equal(result.import.fieldCoverage.fields.find((field) => field.key === 'industry').percent, 0);
+  assert.equal(result.import.fieldCoverage.fields.find((field) => field.key === 'description').percent, 100);
+  assert.equal(result.import.fieldCoverage.fields.find((field) => field.key === 'brokerEmail').percent, 0);
   const stored = await storage.getLatestDealHunterDealOsImport();
   assert.equal(stored.records[0].name, 'Southern California Sign Company with 40+ Years of Operating History');
   assert.equal(stored.records[0].annualProfit, 365112);
@@ -200,6 +207,81 @@ test('current SMB Deal OS marketplace export maps Listing, Earnings, and Margin 
   assert.equal(deals[0].name, stored.records[0].name);
   assert.equal(deals[0].annualProfit, 365112);
   assert.equal(deals[0].netMargin, 31.2);
+});
+
+test('full-backfill review scores every canonical listing while daily review preserves the lookback', async () => {
+  const now = new Date();
+  const storage = memoryStorage({
+    id: 'backfill-import',
+    created_at: now.toISOString(),
+    imported_by: 'admin@example.com',
+    exported_at: now.toISOString(),
+    file_name: 'backfill.csv',
+    file_type: 'text/csv',
+    file_size: 100,
+    scope: 'saved-search',
+    coverage_label: 'Backfill mode regression fixture',
+    expected_row_count: 2,
+    row_count: 2,
+    duplicate_count: 0,
+    stable_id_count: 2,
+    listing_url_count: 2,
+    coverage_limit_reached: false,
+    metadata: {},
+    records: [
+      {
+        stableId: 'RECENT-1',
+        name: 'Recent Commercial HVAC Maintenance',
+        industry: 'HVAC maintenance',
+        description: 'Recurring commercial maintenance contracts and field technicians',
+        state: 'CA',
+        annualProfit: 425000,
+        annualRevenue: 1800000,
+        askingPrice: 1400000,
+        listingUrl: 'https://broker.example/recent',
+        dateAdded: now.toISOString(),
+      },
+      {
+        stableId: 'OLD-1',
+        name: 'Older Commercial Plumbing Maintenance',
+        industry: 'Plumbing maintenance',
+        description: 'Recurring commercial service agreements and field repair',
+        state: 'NY',
+        annualProfit: 400000,
+        annualRevenue: 1600000,
+        askingPrice: 1300000,
+        listingUrl: 'https://broker.example/older',
+        dateAdded: '2024-01-01T00:00:00.000Z',
+      },
+    ],
+  });
+
+  const daily = await reviewDailyDeals({ storage });
+  const backfill = await reviewDailyDeals({ reviewMode: 'full-backfill', storage });
+
+  assert.equal(daily.reviewMode, 'daily');
+  assert.equal(daily.totals.reviewedDeals, 1);
+  assert.equal(backfill.reviewMode, 'full-backfill');
+  assert.equal(backfill.selection.strategy, 'all-canonical-listings');
+  assert.equal(backfill.totals.reviewedDeals, 2);
+  assert.equal(backfill.importSummary.scoredListings, 2);
+});
+
+test('explicit CRM sync rejects missing confirmation before reading sources or writing records', async () => {
+  const storage = new Proxy({}, {
+    get() {
+      throw new Error('storage must not be touched before confirmation');
+    },
+  });
+  const result = await syncDealHunterHighFitsToCrm({
+    confirmation: 'sync',
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 400);
+  assert.match(result.error, new RegExp(dealHunterCrmSyncConfirmation));
 });
 
 test('current SMB Deal OS financial fields update the matched CRM record', async () => {

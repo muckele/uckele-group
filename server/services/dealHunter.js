@@ -1368,6 +1368,7 @@ function sheetRowMatchIdentity(rawRow = {}) {
   const number = (value) => Number.isFinite(value) ? String(value) : '';
   const name = normalizeComparableText(deal.name);
   const features = {
+    dateAdded: parseDate(deal.dateAdded),
     industry: normalizeComparableText(deal.industry),
     description: normalizeComparableText(deal.description),
     city: normalizeComparableText(deal.city),
@@ -1398,6 +1399,7 @@ function groupSheetRows(items = [], identityKey) {
 
 function sheetRowSimilarity(left = {}, right = {}) {
   const weights = {
+    dateAdded: 14,
     industry: 4,
     description: 12,
     city: 4,
@@ -2322,6 +2324,8 @@ function hydrateDealOsRecord(record = {}) {
 }
 
 function publicDealOsImport(record = {}) {
+  const fieldCoverage = record.metadata?.fieldCoverage || summarizeDealOsFieldCoverage(record.records || []);
+
   return {
     id: record.id,
     importedAt: record.created_at,
@@ -2340,6 +2344,82 @@ function publicDealOsImport(record = {}) {
     stableIdCount: Number(record.stable_id_count || 0),
     listingUrlCount: Number(record.listing_url_count || 0),
     coverageLimitReached: Boolean(record.coverage_limit_reached),
+    fieldCoverage,
+  };
+}
+
+function summarizeDealOsFieldCoverage(records = []) {
+  const normalizedRecords = Array.isArray(records) ? records : [];
+  const fields = [
+    ['listingUrl', 'Original listing URL', (record) => record.listingUrl],
+    ['dateAdded', 'Date added', (record) => record.dateAdded],
+    ['state', 'State', (record) => record.state],
+    ['annualProfit', 'Earnings / annual profit', (record) => record.annualProfit],
+    ['annualRevenue', 'Revenue', (record) => record.annualRevenue],
+    ['askingPrice', 'Asking price', (record) => record.askingPrice],
+    ['profitMultiple', 'Profit multiple', (record) => record.profitMultiple],
+    ['netMargin', 'Net margin', (record) => record.netMargin],
+    ['yearsEstablished', 'Years in business', (record) => record.yearsEstablished],
+    ['industry', 'Industry', (record) => record.industry],
+    ['description', 'Description / notes', (record) => record.description],
+    ['brokerEmail', 'Broker email', (record) => record.brokerEmail || record.brokerContacts?.[0]?.email],
+  ].map(([key, label, select]) => {
+    const present = normalizedRecords.filter((record) => {
+      const value = select(record || {});
+      return value !== null && value !== undefined && String(value).trim() !== '';
+    }).length;
+    const total = normalizedRecords.length;
+    return {
+      key,
+      label,
+      present,
+      missing: Math.max(0, total - present),
+      percent: total > 0 ? Math.round((present / total) * 100) : 0,
+    };
+  });
+
+  return {
+    totalRecords: normalizedRecords.length,
+    fields,
+  };
+}
+
+function dealHunterCrmSyncSummary(values = {}) {
+  return {
+    reviewed: Number(values.reviewed || 0),
+    created: Number(values.created || 0),
+    enriched: Number(values.enriched || 0),
+    updated: Number(values.updated || 0),
+    skipped: Number(values.skipped || 0),
+    failed: Number(values.failed || 0),
+    ...(values.paused ? { paused: true } : {}),
+    ...(values.notRun ? { notRun: true } : {}),
+    ...(values.explicitActionRequired ? { explicitActionRequired: true } : {}),
+    ...(values.reason ? { reason: values.reason } : {}),
+    ...(Array.isArray(values.results) ? { results: values.results } : {}),
+  };
+}
+
+function buildDealHunterImportSummary(review = {}, dealOsImport = null, crmSync = null) {
+  if (!dealOsImport) return null;
+
+  const imported = dealOsImport || {};
+  const normalizedCrmSync = dealHunterCrmSyncSummary(crmSync || {});
+  const syncedListings = normalizedCrmSync.created + normalizedCrmSync.enriched + normalizedCrmSync.updated;
+
+  return {
+    reviewMode: review.reviewMode || 'daily',
+    importedRows: Number(imported.rowCount || 0),
+    withinFileDuplicates: Number(imported.duplicateCount || 0),
+    combinedSourceRows: Number(review.totals?.sourceRows || 0),
+    canonicalListings: Number(review.totals?.normalizedDeals || 0),
+    collapsedDuplicates: Number(review.totals?.collapsedDuplicates || 0),
+    scoredListings: Number(review.totals?.reviewedDeals || 0),
+    highFitListings: Number(review.totals?.qualified || 0),
+    crmEligibleListings: Number(review.totals?.crmEligible || 0),
+    syncedListings,
+    crmSync: normalizedCrmSync,
+    fieldCoverage: imported.fieldCoverage || { totalRecords: 0, fields: [] },
   };
 }
 
@@ -2448,6 +2528,7 @@ export async function importDealOsExport({
   const records = [...recordsByIdentity.values()];
   const stableIdCount = records.filter((record) => record.stableId).length;
   const listingUrlCount = records.filter((record) => record.listingUrl).length;
+  const fieldCoverage = summarizeDealOsFieldCoverage(records);
   const record = {
     id: randomUUID(),
     created_at: new Date(nowTimestamp).toISOString(),
@@ -2473,6 +2554,7 @@ export async function importDealOsExport({
       worksheetPath: parsed.worksheetPath || '',
       suppliedMimeType: normalizeText(mimeType, 160),
       parserVersion: 'deal-os-export-v1',
+      fieldCoverage,
     },
   };
   const saved = await storage.insertDealHunterDealOsImport(record);
@@ -2506,6 +2588,7 @@ async function loadDealOsExportSource(config, storage) {
     stableIdCount: Number(imported.stable_id_count || 0),
     listingUrlCount: Number(imported.listing_url_count || 0),
     coverageLimitReached: Boolean(imported.coverage_limit_reached),
+    fieldCoverage: importedSummary.fieldCoverage,
     latestImport: importedSummary,
   };
 
@@ -4305,10 +4388,14 @@ async function updateDealHunterCrmImport(storage, importRecord, values = {}) {
   }
 }
 
-async function syncHighFitDealsToCrm(scoredDeals = [], storage = getStorage()) {
-  const candidates = scoredDeals.filter(
-    (deal) => !deal.shouldRemove && deal.score >= cimRequestScoreThreshold && deal.annualProfit !== null,
+function dealHunterCrmCandidates(scoredDeals = []) {
+  return scoredDeals.filter(
+    (deal) => !deal.dismissed && !deal.shouldRemove && deal.score >= cimRequestScoreThreshold && deal.annualProfit !== null,
   );
+}
+
+async function performHighFitDealsCrmSync(scoredDeals = [], storage = getStorage()) {
+  const candidates = dealHunterCrmCandidates(scoredDeals);
   const summary = {
     reviewed: candidates.length,
     created: 0,
@@ -4326,38 +4413,39 @@ async function syncHighFitDealsToCrm(scoredDeals = [], storage = getStorage()) {
       const pendingCutoff = new Date(Date.now() - dealHunterCrmImportPendingStaleMinutes * 60 * 1000).toISOString();
       const proposedImportRecord = buildDealHunterCrmImportRecord(deal);
 
-      if (storage.claimDealHunterCrmImport) {
-        let claim = null;
+      let claim = null;
 
-        try {
-          claim = await storage.claimDealHunterCrmImport(proposedImportRecord, { pendingCutoff });
-        } catch (error) {
-          console.warn(`[deal-hunter] CRM import claim failed; continuing without duplicate claim: ${error.message}`);
+      try {
+        claim = await storage.claimDealHunterCrmImport(proposedImportRecord, { pendingCutoff });
+      } catch (error) {
+        console.warn(`[deal-hunter] CRM import claim failed; CRM write blocked: ${error.message}`);
+        throw new Error('The durable CRM import claim failed, so no CRM write was attempted for this listing.');
+      }
+
+      if (!claim || typeof claim.claimed !== 'boolean' || !claim.importRecord?.id) {
+        throw new Error('The durable CRM import claim returned an invalid result, so no CRM write was attempted for this listing.');
+      }
+
+      importRecord = claim.importRecord;
+
+      if (!claim.claimed) {
+        const claimedSubmission = importRecord?.submission_id && storage.getSubmission
+          ? await storage.getSubmission(importRecord.submission_id)
+          : null;
+
+        if (claimedSubmission && storage.updateSubmission) {
+          const preserveExistingFields = !isDealHunterManagedSubmission(claimedSubmission);
+          const updated = await updateDealHunterCrmSubmission(storage, claimedSubmission, deal, { preserveExistingFields });
+          const status = preserveExistingFields ? 'enriched' : 'updated';
+          summary[status] += 1;
+          summary.results.push({ dealKey: deal.dealKey, status, submissionId: updated?.id || claimedSubmission.id });
+          await linkDealHunterOpportunitySubmission(storage, deal, updated?.id || claimedSubmission.id);
+        } else {
+          summary.skipped += 1;
+          summary.results.push({ dealKey: deal.dealKey, status: 'duplicate-in-progress', submissionId: importRecord?.submission_id || '' });
         }
 
-        importRecord = claim?.importRecord || proposedImportRecord;
-
-        if (claim && !claim.claimed) {
-          const claimedSubmission = importRecord?.submission_id && storage.getSubmission
-            ? await storage.getSubmission(importRecord.submission_id)
-            : null;
-
-          if (claimedSubmission && storage.updateSubmission) {
-            const preserveExistingFields = !isDealHunterManagedSubmission(claimedSubmission);
-            const updated = await updateDealHunterCrmSubmission(storage, claimedSubmission, deal, { preserveExistingFields });
-            const status = preserveExistingFields ? 'enriched' : 'updated';
-            summary[status] += 1;
-            summary.results.push({ dealKey: deal.dealKey, status, submissionId: updated?.id || claimedSubmission.id });
-            await linkDealHunterOpportunitySubmission(storage, deal, updated?.id || claimedSubmission.id);
-          } else {
-            summary.skipped += 1;
-            summary.results.push({ dealKey: deal.dealKey, status: 'duplicate-in-progress', submissionId: importRecord?.submission_id || '' });
-          }
-
-          continue;
-        }
-      } else {
-        importRecord = proposedImportRecord;
+        continue;
       }
 
       const existing = await findExistingDealHunterSubmission(storage, deal);
@@ -6083,14 +6171,24 @@ function buildDealHunterCoverage(config, sourceResults = []) {
   };
 }
 
-async function buildDailyDealReview({ storage = getStorage() } = {}) {
+function normalizeDealHunterReviewMode(value = '') {
+  return value === 'full-backfill' ? 'full-backfill' : 'daily';
+}
+
+async function buildDailyDealReview({ reviewMode = 'daily', storage = getStorage() } = {}) {
   const config = getConfig();
+  const normalizedReviewMode = normalizeDealHunterReviewMode(reviewMode);
   const generatedAt = new Date().toISOString();
   const sourceResults = await collectSources(config, storage);
   const coverage = buildDealHunterCoverage(config, sourceResults);
   const allDeals = dedupeDeals(sourceResults.flatMap((result) => result.deals));
   const recentDeals = allDeals.filter((deal) => isRecentDeal(deal, config.dealHunter.lookbackDays));
-  const candidateDeals = recentDeals.length > 0 ? recentDeals : allDeals;
+  const usedDailyFallback = normalizedReviewMode === 'daily' && recentDeals.length === 0 && allDeals.length > 0;
+  const candidateDeals = normalizedReviewMode === 'full-backfill'
+    ? allDeals
+    : recentDeals.length > 0
+      ? recentDeals
+      : allDeals;
   const scoredDealsWithIdentity = await attachCanonicalOpportunityIdentities(storage, candidateDeals.map(scoreDeal));
   const seenDeals = await loadDealHunterHistory(storage);
   const scoredDealsWithHistory = attachHistory(scoredDealsWithIdentity, seenDeals, generatedAt);
@@ -6164,10 +6262,17 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
       return dateDifference || left.score - right.score;
     })
     .map(publicDeal);
+  const crmEligibleDeals = dealHunterCrmCandidates(scoredDeals);
 
   const review = {
     generatedAt,
+    reviewMode: normalizedReviewMode,
     lookbackDays: config.dealHunter.lookbackDays,
+    selection: {
+      strategy: normalizedReviewMode === 'full-backfill' ? 'all-canonical-listings' : 'recent-listings',
+      recentListings: recentDeals.length,
+      usedDailyFallback,
+    },
     profile: {
       minAnnualProfit: profile.minAnnualProfit,
       maxAnnualProfit: profile.maxAnnualProfit,
@@ -6182,9 +6287,15 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
     stage2CoverageWarnings: coverage.stage2Warnings,
     cimOutreachPause: outreachGate.status,
     dealOsImportPolicy: coverage.dealOsImportPolicy,
+    crmSyncPreview: {
+      count: crmEligibleDeals.length,
+      dealKeys: crmEligibleDeals.map((deal) => deal.dealKey).sort(),
+    },
     totals: {
       sourceRows: sourceResults.reduce((sum, result) => sum + (result.source.rowCount || 0), 0),
       normalizedDeals: allDeals.length,
+      collapsedDuplicates: Math.max(0, sourceResults.reduce((sum, result) => sum + (result.source.rowCount || 0), 0) - allDeals.length),
+      recentDeals: recentDeals.length,
       reviewedDeals: candidateDeals.length,
       newDeals: scoredDeals.filter((deal) => deal.isNew).length,
       newMatches: newlySeenMatches.length,
@@ -6193,6 +6304,7 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
       removalCandidates: removalCandidates.length,
       dismissed: scoredDeals.filter((deal) => deal.dismissed).length,
       cimReady: scoredDeals.filter((deal) => deal.cimRequest?.canRequest).length,
+      crmEligible: crmEligibleDeals.length,
     },
     criteriaRecommendations: summarizeCriteria(scoredDeals),
     newlySeenMatches,
@@ -6212,11 +6324,14 @@ async function buildDailyDealReview({ storage = getStorage() } = {}) {
     })),
   };
 
+  const latestDealOsImport = sourceResults.find((result) => result.source.id === dealOsSourceId)?.source?.latestImport || null;
+  review.importSummary = buildDealHunterImportSummary(review, latestDealOsImport);
+
   return { review, scoredDeals, storage };
 }
 
-export async function reviewDailyDeals({ markSeen = false, storage = getStorage() } = {}) {
-  const result = await buildDailyDealReview({ storage });
+export async function reviewDailyDeals({ markSeen = false, reviewMode = 'daily', storage = getStorage() } = {}) {
+  const result = await buildDailyDealReview({ reviewMode, storage });
   const automationStatus = await getCimAutomationStatus({ storage, config: getConfig() });
   const [requests, events] = await Promise.all([
     storage.listDealHunterCimRequests?.({ limit: 100000 }) || [],
@@ -6346,7 +6461,7 @@ export async function listDealHunterCimRequestHistory({
 }
 
 export async function sendDailyDealHunterReview({ idempotencyKey = '', storage = getStorage() } = {}) {
-  const result = await buildDailyDealReview({ storage });
+  const result = await buildDailyDealReview({ reviewMode: 'daily', storage });
   const { review, scoredDeals } = result;
   const config = getConfig();
 
@@ -6358,13 +6473,24 @@ export async function sendDailyDealHunterReview({ idempotencyKey = '', storage =
         error: 'Daily Deal Hunter email was not sent because one or more sources were unavailable. Restore every source and review again.',
         providerMessageId: '',
       },
-      crmSync: { reviewed: 0, created: 0, enriched: 0, updated: 0, skipped: 0, failed: 0, paused: true },
+      crmSync: dealHunterCrmSyncSummary({
+        paused: true,
+        reason: 'CRM sync is unavailable while one or more deal sources are unavailable.',
+      }),
     };
   }
 
-  const crmSync = await syncHighFitDealsToCrm(scoredDeals, storage);
-
+  const crmSync = dealHunterCrmSyncSummary({
+    notRun: true,
+    explicitActionRequired: true,
+    reason: 'The internal daily summary does not write to CRM. Use the explicit high-fit CRM sync action after reviewing the scored listings.',
+  });
   review.crmSync = crmSync;
+  review.importSummary = buildDealHunterImportSummary(
+    review,
+    review.sources.find((source) => source.id === dealOsSourceId)?.latestImport || null,
+    crmSync,
+  );
   const automationStatus = await getCimAutomationStatus({ storage, config });
   const [existingRequests, emailEvents] = await Promise.all([
     storage.listDealHunterCimRequests?.({ limit: 100000 }) || [],
@@ -6404,6 +6530,114 @@ export async function sendDailyDealHunterReview({ idempotencyKey = '', storage =
     review,
     emailResult,
     crmSync,
+  };
+}
+
+export const dealHunterCrmSyncConfirmation = 'SYNC HIGH FITS';
+
+export async function syncDealHunterHighFitsToCrm({
+  confirmation = '',
+  expectedDealKeys = [],
+  requestedBy = '',
+  reviewMode = 'daily',
+  storage = getStorage(),
+} = {}) {
+  if (normalizeText(confirmation, 80) !== dealHunterCrmSyncConfirmation) {
+    return {
+      ok: false,
+      status: 400,
+      error: `Type ${dealHunterCrmSyncConfirmation} to confirm the explicit CRM write.`,
+    };
+  }
+
+  const normalizedExpectedDealKeys = uniqueStrings(
+    Array.isArray(expectedDealKeys) ? expectedDealKeys.map((key) => normalizeText(key, 1000)) : [],
+  ).sort();
+  if (normalizedExpectedDealKeys.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'Refresh the Deal Hunter review and select its current high-fit set before syncing CRM.',
+    };
+  }
+
+  if (typeof storage.claimDealHunterCrmImport !== 'function') {
+    return {
+      ok: false,
+      status: 503,
+      error: 'Durable CRM import claims are unavailable, so no CRM write was attempted.',
+    };
+  }
+
+  const result = await buildDailyDealReview({ reviewMode, storage });
+  const { review, scoredDeals } = result;
+
+  if (reviewHasSourceFailures(review)) {
+    const crmSync = dealHunterCrmSyncSummary({
+      paused: true,
+      reason: 'CRM sync was not run because one or more deal sources are unavailable.',
+    });
+    review.crmSync = crmSync;
+    review.importSummary = buildDealHunterImportSummary(
+      review,
+      review.sources.find((source) => source.id === dealOsSourceId)?.latestImport || null,
+      crmSync,
+    );
+    return {
+      ok: false,
+      status: 503,
+      error: crmSync.reason,
+      requestedBy: normalizeText(requestedBy || 'admin', 160),
+      review,
+      crmSync,
+      summary: review.importSummary,
+    };
+  }
+
+  const currentDealKeys = uniqueStrings(dealHunterCrmCandidates(scoredDeals).map((deal) => deal.dealKey)).sort();
+  if (
+    currentDealKeys.length !== normalizedExpectedDealKeys.length
+    || currentDealKeys.some((dealKey, index) => dealKey !== normalizedExpectedDealKeys[index])
+  ) {
+    const crmSync = dealHunterCrmSyncSummary({
+      paused: true,
+      reason: 'The current high-fit set changed after it was reviewed. Refresh the review and confirm the updated set before syncing CRM.',
+    });
+    review.crmSync = crmSync;
+    review.importSummary = buildDealHunterImportSummary(
+      review,
+      review.sources.find((source) => source.id === dealOsSourceId)?.latestImport || null,
+      crmSync,
+    );
+    return {
+      ok: false,
+      status: 409,
+      error: crmSync.reason,
+      review,
+      crmSync,
+      summary: review.importSummary,
+    };
+  }
+
+  const crmSync = dealHunterCrmSyncSummary(await performHighFitDealsCrmSync(scoredDeals, storage));
+  review.crmSync = crmSync;
+  review.importSummary = buildDealHunterImportSummary(
+    review,
+    review.sources.find((source) => source.id === dealOsSourceId)?.latestImport || null,
+    crmSync,
+  );
+
+  const successfulWrites = crmSync.created + crmSync.enriched + crmSync.updated;
+  const syncFailed = crmSync.failed > 0;
+  return {
+    ok: !syncFailed,
+    status: !syncFailed ? 200 : successfulWrites > 0 ? 207 : 503,
+    ...(syncFailed ? { error: `CRM sync failed for ${crmSync.failed} of ${crmSync.reviewed} reviewed high-fit listing${crmSync.reviewed === 1 ? '' : 's'}. No failed listing was written without a durable idempotency claim.` } : {}),
+    requestedBy: normalizeText(requestedBy || 'admin', 160),
+    reviewMode: review.reviewMode,
+    review,
+    crmSync,
+    summary: review.importSummary,
   };
 }
 

@@ -556,9 +556,56 @@ test('Deal OS export import requires a full administrator and records the authen
     assert.equal(result.success, true);
     assert.equal(result.import.rowCount, 1);
     assert.equal(result.import.importedBy, 'admin');
+    assert.equal(result.summary.importedRows, 1);
+    assert.equal(result.import.fieldCoverage.fields.find((field) => field.key === 'annualProfit').percent, 100);
     const stored = await getStorage().getLatestDealHunterDealOsImport();
     assert.equal(stored.imported_by, 'admin');
     assert.equal(stored.records[0].stableId, 'HTTP-IMPORT-1');
+  });
+});
+
+test('full-backfill scoring and explicit CRM sync require administrator access and exact confirmation', async () => {
+  await withServer(async (origin) => {
+    const adminCookie = lifecycleAdminCookie;
+    const viewerCookie = lifecycleViewerCookie;
+    assert.ok(adminCookie);
+    assert.ok(viewerCookie);
+
+    const anonymousBackfill = await fetch(`${origin}/api/admin/deal-hunter/backfill-review`, { method: 'POST' });
+    assert.equal(anonymousBackfill.status, 401);
+    const viewerBackfill = await fetch(`${origin}/api/admin/deal-hunter/backfill-review`, {
+      method: 'POST',
+      headers: { Cookie: viewerCookie },
+    });
+    assert.equal(viewerBackfill.status, 401);
+
+    const viewerSync = await fetch(`${origin}/api/admin/deal-hunter/crm-sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: viewerCookie },
+      body: JSON.stringify({ confirmation: 'SYNC HIGH FITS', reviewMode: 'daily' }),
+    });
+    assert.equal(viewerSync.status, 401);
+
+    const unconfirmedSync = await fetch(`${origin}/api/admin/deal-hunter/crm-sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({ confirmation: 'sync', reviewMode: 'daily' }),
+    });
+    const unconfirmedResult = await unconfirmedSync.json();
+    assert.equal(unconfirmedSync.status, 400);
+    assert.equal(unconfirmedResult.success, false);
+    assert.equal(unconfirmedResult.confirmationRequired, 'SYNC HIGH FITS');
+    assert.match(unconfirmedResult.error, /SYNC HIGH FITS/);
+
+    const missingReviewedSet = await fetch(`${origin}/api/admin/deal-hunter/crm-sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({ confirmation: 'SYNC HIGH FITS', reviewMode: 'daily' }),
+    });
+    const missingReviewedSetResult = await missingReviewedSet.json();
+    assert.equal(missingReviewedSet.status, 400);
+    assert.equal(missingReviewedSetResult.success, false);
+    assert.match(missingReviewedSetResult.error, /Refresh the Deal Hunter review/i);
   });
 });
 
