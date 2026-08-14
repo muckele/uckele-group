@@ -128,6 +128,22 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     });
   });
 
+  test('makes the required coverage field actionable instead of silently disabling import', () => {
+    const file = new File(['Listing,Listing URL\nHVAC,https://broker.example/hvac'], 'marketplace-export.csv', {
+      type: 'text/csv',
+      lastModified: new Date('2026-08-10T16:00:00.000Z').getTime(),
+    });
+    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    review.dealOsImportPolicy = { maxRecords: 1000, maxAgeHours: 72 };
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onImportDealOs={vi.fn()} onReview={vi.fn()} review={review} />);
+    fireEvent.change(screen.getByLabelText('Deal OS export file'), { target: { files: [file] } });
+
+    expect(screen.getByRole('button', { name: 'Validate & Import' })).toBeEnabled();
+    expect(screen.getByLabelText(/Coverage description/)).toBeRequired();
+    expect(screen.getByText(/Describe the saved search or Deal Radar filters/)).toBeVisible();
+  });
+
   test('surfaces Deal OS provenance and an explicit limited-coverage warning when Airtable is retired', () => {
     const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
     review.coverageWarnings = ['Legacy Airtable is disabled. Deal OS coverage is limited to one saved search.'];

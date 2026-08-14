@@ -698,10 +698,11 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
   const country = normalizeText(getField(rawRow, ['Country']), 40);
   const industry = normalizeText(getField(rawRow, ['Industry', 'Industries', 'Category', 'Business Type', 'Sector']), 500);
   const description = normalizeText(getField(rawRow, ['Description', 'Summary', 'Listing Description', 'Business Description', 'Notes']), 5000);
-  const annualProfit = parseNumber(getField(rawRow, ['Annual Profit', 'Cash Flow', 'SDE', 'EBITDA', 'TTM EBITDA', 'Profit']));
+  const annualProfit = parseNumber(getField(rawRow, ['Annual Profit', 'Cash Flow', 'SDE', 'EBITDA', 'TTM EBITDA', 'Earnings', 'Profit']));
   const annualRevenue = parseNumber(getField(rawRow, ['Annual Revenue', 'Revenue', 'TTM Revenue', 'Sales', 'Gross Revenue']));
   const askingPrice = parseNumber(getField(rawRow, ['Asking Price', 'Price', 'Purchase Price', 'List Price']));
   const profitMultiple = parseNumber(getField(rawRow, ['Profit Multiple', 'SDE Multiple', 'EBITDA Multiple', 'Multiple']));
+  const netMargin = parseNumber(getField(rawRow, ['Net Margin', 'Profit Margin', 'EBITDA Margin', 'SDE Margin', 'Margin %', 'Margin']));
   const yearsEstablished = parseNumber(getField(rawRow, ['Years Established', 'Years In Business', 'Business Age', 'Age']));
   const remoteFlag = normalizeText(getField(rawRow, ['Remote/Relocatable/Absentee-Run', 'Remote', 'Relocatable', 'Absentee', 'Absentee Run']), 100);
   const franchiseFlag = normalizeText(getField(rawRow, ['Franchise', 'Is Franchise', 'Include Franchises']), 100);
@@ -712,7 +713,7 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
   const sourceBrokerEmail = extractEmailAddresses(getField(rawRow, ['Broker Email']))[0] || '';
   const brokerCompany = normalizeText(getField(rawRow, ['Broker Company', 'Company']), 160);
   const brokerContact = normalizeText(getField(rawRow, ['Broker Contact', 'Broker Phone', 'Phone', 'Contact Phone']), 200);
-  const name = normalizeText(getField(rawRow, ['Name', 'Business Name', 'Business', 'Company', 'Title', 'Listing Title', 'Deal Name']), 220) || 'Unnamed business';
+  const name = normalizeText(getField(rawRow, ['Name', 'Business Name', 'Business', 'Company', 'Title', 'Listing Title', 'Deal Name', 'Listing']), 220) || 'Unnamed business';
   const dateAdded = parseDate(getField(rawRow, ['Date Added', 'Created', 'Created At', 'Added Date', 'Posted Date', 'Date Listed', 'Listing Date']));
   const lastUpdated = parseDate(getField(rawRow, ['Last Updated', 'Updated', 'Updated At', 'Modified', 'Last Modified']));
   const explicitExternalId = normalizeText(getField(rawRow, ['Deal OS ID', 'SMB Deal OS ID', 'Listing ID', 'Deal ID', 'Opportunity ID', 'ID', 'Record ID', 'Ad ID', 'Ad#']), 120);
@@ -756,6 +757,7 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
     annualRevenue,
     askingPrice,
     profitMultiple,
+    netMargin,
     yearsEstablished,
     remoteFlag,
     franchiseFlag,
@@ -1566,16 +1568,26 @@ export function extractGoogleSheetListingUrls(workbookBytes, expectedRows = []) 
   };
 }
 
-function dealOsHeaderKind(value = '') {
-  const key = normalizeKey(value);
+function dealOsHeaderKinds(values = []) {
+  const keys = values.map(normalizeKey);
   const nameHeaders = new Set(['name', 'businessname', 'business', 'company', 'title', 'listingtitle', 'dealname']);
   const idHeaders = new Set(['dealosid', 'smbdealosid', 'listingid', 'dealid', 'opportunityid', 'id', 'recordid', 'adid', 'ad']);
-  const urlHeaders = new Set(['originalbrokerlistingurl', 'viewlistingurl', 'listingurl', 'dealurl', 'url', 'link', 'deallink', 'businessurl', 'viewlisting', 'listing']);
+  const urlHeaders = new Set(['originalbrokerlistingurl', 'viewlistingurl', 'listingurl', 'dealurl', 'url', 'link', 'deallink', 'businessurl', 'viewlisting']);
+  const hasExplicitName = keys.some((key) => nameHeaders.has(key));
+  const hasExplicitUrl = keys.some((key) => urlHeaders.has(key));
+  const kinds = new Set();
 
-  if (nameHeaders.has(key)) return 'name';
-  if (idHeaders.has(key)) return 'id';
-  if (urlHeaders.has(key)) return 'url';
-  return '';
+  for (const key of keys) {
+    if (nameHeaders.has(key)) kinds.add('name');
+    if (idHeaders.has(key)) kinds.add('id');
+    if (urlHeaders.has(key)) kinds.add('url');
+    if (key === 'listing') {
+      if (hasExplicitUrl || !hasExplicitName) kinds.add('name');
+      if (hasExplicitName && !hasExplicitUrl) kinds.add('url');
+    }
+  }
+
+  return kinds;
 }
 
 function worksheetExternalHyperlinks(worksheetXml = '', relationshipsXml = '') {
@@ -1605,7 +1617,7 @@ function extractDealOsWorksheetRows(worksheetXml = '', relationshipsXml = '', sh
 
   const headerCandidate = [...cellsByRow.entries()]
     .map(([row, rowCells]) => {
-      const kinds = rowCells.map((cell) => dealOsHeaderKind(cell.value)).filter(Boolean);
+      const kinds = [...dealOsHeaderKinds(rowCells.map((cell) => cell.value))];
       return { row, rowCells, kinds };
     })
     .filter(({ kinds }) => kinds.includes('name') && (kinds.includes('id') || kinds.includes('url')))
@@ -2175,14 +2187,22 @@ function dealOsStableId(rawRow = {}) {
 }
 
 function dealOsListingValue(rawRow = {}) {
-  return getField(rawRow, [
+  const explicitListing = getField(rawRow, [
     'Original Broker Listing URL', 'View Listing URL', 'Listing URL', 'Deal URL', 'URL', 'Link', 'Deal Link',
-    'Business URL', 'View Listing', 'Listing',
+    'Business URL', 'View Listing',
   ]);
+
+  if (explicitListing) return explicitListing;
+
+  return dealOsHeaderKinds(Object.keys(rawRow)).has('url')
+    ? getField(rawRow, ['Listing'])
+    : '';
 }
 
 function canonicalDealOsRecord(rawRow = {}) {
   const stableId = dealOsStableId(rawRow);
+  const suppliedListing = dealOsListingValue(rawRow);
+  const listingUrl = normalizeUrl(suppliedListing?.url || suppliedListing);
   const deal = normalizeDealRecord(rawRow, {
     id: dealOsSourceId,
     name: dealOsSourceName,
@@ -2204,16 +2224,20 @@ function canonicalDealOsRecord(rawRow = {}) {
     annualRevenue: deal.annualRevenue,
     askingPrice: deal.askingPrice,
     profitMultiple: deal.profitMultiple,
+    netMargin: deal.netMargin,
     yearsEstablished: deal.yearsEstablished,
     remoteFlag: deal.remoteFlag,
     franchiseFlag: deal.franchiseFlag,
     fiveYearsFlag: deal.fiveYearsFlag,
     brokerEmail: deal.brokerEmail,
     brokerName: deal.brokerName,
-    brokerContacts: deal.brokerContacts,
+    brokerContacts: normalizeBrokerContacts((deal.brokerContacts || []).map((contact) => ({
+      ...contact,
+      sourceListingUrl: listingUrl,
+    }))),
     brokerCompany: deal.brokerCompany,
     brokerContact: deal.brokerContact,
-    listingUrl: deal.listingUrl,
+    listingUrl,
     listingSource: deal.listingSource,
     dateAdded: deal.dateAdded,
     lastUpdated: deal.lastUpdated,
@@ -2260,6 +2284,7 @@ function dealOsRawRecord(record = {}) {
     'Annual Revenue': record.annualRevenue,
     'Asking Price': record.askingPrice,
     'Profit Multiple': record.profitMultiple,
+    'Net Margin': record.netMargin,
     'Years Established': record.yearsEstablished,
     Remote: record.remoteFlag || '',
     Franchise: record.franchiseFlag || '',
@@ -2376,7 +2401,7 @@ export async function importDealOsExport({
   const parsed = parseDealOsUpload(safeFileName, safeBuffer);
   if (!parsed.ok) return parsed;
   if (parsed.headers.length > dealOsImportMaxColumns) return dealOsImportFailure(422, `Deal OS export has more than ${dealOsImportMaxColumns} columns.`);
-  const headerKinds = new Set(parsed.headers.map(dealOsHeaderKind).filter(Boolean));
+  const headerKinds = dealOsHeaderKinds(parsed.headers);
   if (!headerKinds.has('name') || (!headerKinds.has('id') && !headerKinds.has('url'))) {
     return dealOsImportFailure(422, 'The export schema is incompatible. Include a business-name column and either a Deal OS listing ID or View Listing URL column.');
   }
@@ -2587,6 +2612,14 @@ function tokenSimilarity(left = '', right = '') {
   return overlap / (leftTokens.size + rightTokens.size - overlap);
 }
 
+function tokenContainment(left = '', right = '') {
+  const leftTokens = tokenSet(left);
+  const rightTokens = tokenSet(right);
+  if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
+  const overlap = [...leftTokens].filter((token) => rightTokens.has(token)).length;
+  return overlap / Math.min(leftTokens.size, rightTokens.size);
+}
+
 function listingMarketplaceAliases(listingUrl = '') {
   const normalized = normalizeUrl(listingUrl);
   if (!normalized) return [];
@@ -2751,18 +2784,19 @@ function syndicatedMatchDecision(left, right) {
   const geography = geographicEvidence(left, right);
   const financials = financialMatchEvidence(left, right);
   const titleSimilarity = tokenSimilarity(left.name, right.name);
+  const titleContainment = tokenContainment(left.name, right.name);
   const descriptionSimilarity = tokenSimilarity(left.description, right.description);
   const descriptionLongEnough = normalizeComparableText(left.description).length >= 120
     && normalizeComparableText(right.description).length >= 120;
   const exactTitle = normalizeComparableText(left.name) !== ''
     && normalizeComparableText(left.name) === normalizeComparableText(right.name);
-  const hardConflict = geography.hardConflict
-    || stableMarketplaceConflict(leftAliases, rightAliases)
-    || stableSourceConflict(left, right)
-    || financials.conflicts.length >= 2;
+  const marketplaceConflict = stableMarketplaceConflict(leftAliases, rightAliases);
+  const sourceConflict = stableSourceConflict(left, right);
+  const hardConflict = geography.hardConflict || sourceConflict || financials.conflicts.length >= 2;
   const evidence = {
     sharedAliases,
     titleSimilarity: Number(titleSimilarity.toFixed(4)),
+    titleContainment: Number(titleContainment.toFixed(4)),
     descriptionSimilarity: Number(descriptionSimilarity.toFixed(4)),
     geography,
     financials,
@@ -2776,6 +2810,7 @@ function syndicatedMatchDecision(left, right) {
     && descriptionSimilarity >= 0.9
     && (geography.stateMatch || geography.locationMatch)
     && financials.matches.length >= 1
+    && !marketplaceConflict
   ) {
     return { automatic: true, reason: 'title-description-location-financials', confidence: 0.98, evidence };
   }
@@ -2785,8 +2820,26 @@ function syndicatedMatchDecision(left, right) {
     && descriptionSimilarity >= 0.96
     && (geography.stateMatch || geography.locationMatch)
     && financials.matches.length >= 2
+    && !marketplaceConflict
   ) {
     return { automatic: true, reason: 'near-title-description-location-financials', confidence: 0.97, evidence };
+  }
+  if (
+    !descriptionLongEnough
+    && exactTitle
+    && (geography.stateMatch || geography.locationMatch)
+    && financials.matches.length >= 2
+  ) {
+    return { automatic: true, reason: 'exact-title-location-financials', confidence: 0.995, evidence };
+  }
+  if (marketplaceConflict) return { automatic: false, reason: 'hard-conflict', confidence: 0, evidence };
+  if (
+    !descriptionLongEnough
+    && titleContainment >= 0.75
+    && (geography.stateMatch || geography.locationMatch)
+    && financials.matches.length >= 3
+  ) {
+    return { automatic: true, reason: 'near-title-location-financials', confidence: 0.985, evidence };
   }
   return { automatic: false, reason: 'insufficient-corroboration', confidence: 0, evidence };
 }
@@ -2833,7 +2886,7 @@ function candidateBlockKeys(deal = {}) {
 function mergeSyndicatedDeals(canonical, duplicate, decision) {
   const missingValueFields = [
     'industry', 'description', 'city', 'county', 'state', 'country', 'location', 'annualProfit', 'annualRevenue',
-    'askingPrice', 'profitMultiple', 'yearsEstablished', 'remoteFlag', 'franchiseFlag', 'fiveYearsFlag',
+    'askingPrice', 'profitMultiple', 'netMargin', 'yearsEstablished', 'remoteFlag', 'franchiseFlag', 'fiveYearsFlag',
     'brokerCompany', 'brokerContact', 'listingUrl', 'listingSource', 'dateAdded', 'lastUpdated',
   ];
   const merged = { ...canonical };
@@ -3058,6 +3111,7 @@ function publicDeal(deal) {
     annualRevenue: deal.annualRevenue,
     askingPrice: deal.askingPrice,
     profitMultiple: deal.profitMultiple,
+    netMargin: deal.netMargin,
     yearsEstablished: deal.yearsEstablished,
     remoteFlag: deal.remoteFlag,
     franchiseFlag: deal.franchiseFlag,
@@ -3460,6 +3514,10 @@ function formatMultipleForCrm(value) {
   return Number.isFinite(value) && value > 0 ? `${Number(value.toFixed(2))}x` : '';
 }
 
+function formatPercentForCrm(value) {
+  return Number.isFinite(value) ? `${Number(value.toFixed(2))}%` : '';
+}
+
 function formatYearsForCrm(value) {
   return Number.isFinite(value) && value > 0 ? `${Number(value.toFixed(1))} years` : '';
 }
@@ -3505,6 +3563,7 @@ function dealHunterCrmNotes(deal) {
     deal.annualRevenue ? `Annual revenue: ${formatCurrencyForCrm(deal.annualRevenue)}` : '',
     deal.askingPrice ? `Asking price: ${formatCurrencyForCrm(deal.askingPrice)}` : '',
     deal.profitMultiple ? `Profit multiple: ${formatMultipleForCrm(deal.profitMultiple)}` : '',
+    Number.isFinite(deal.netMargin) ? `Net margin: ${formatPercentForCrm(deal.netMargin)}` : '',
     deal.yearsEstablished ? `Years established: ${formatYearsForCrm(deal.yearsEstablished)}` : '',
     deal.remoteFlag ? `Remote / absentee / relocatable: ${deal.remoteFlag}` : '',
     deal.listingUrl ? `Listing URL: ${deal.listingUrl}` : '',
@@ -3647,6 +3706,7 @@ function dealHunterCrmPayload(deal, options = {}) {
     ttm_revenue: formatCurrencyForCrm(deal.annualRevenue),
     ttm_ebitda: formatCurrencyForCrm(deal.annualProfit),
     ebitda_multiple: formatMultipleForCrm(deal.profitMultiple),
+    net_margin: formatPercentForCrm(deal.netMargin),
     business_age: formatYearsForCrm(deal.yearsEstablished),
     broker_name: broker.name || broker.company,
     broker_email: broker.email,
@@ -3680,6 +3740,13 @@ export async function findExistingDealHunterSubmission(storage, deal) {
     ...(Array.isArray(deal.dealKeyAliases) ? deal.dealKeyAliases : []),
   ]).slice(0, 50);
   const listingIdentities = new Set(listingAliases.map(normalizeListingIdentity).filter(Boolean));
+  const identityAliases = new Set(uniqueStrings([
+    ...(Array.isArray(deal.identityAliases) ? deal.identityAliases : []),
+    ...listingAliases.flatMap((listingUrl) => [
+      `url:${normalizeListingIdentity(listingUrl)}`,
+      ...listingMarketplaceAliases(listingUrl),
+    ]),
+  ]));
   const candidates = new Map();
   const addCandidate = (submission) => {
     if (submission?.id) candidates.set(submission.id, submission);
@@ -3693,7 +3760,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
   }
 
   if (storage.listSubmissions) {
-    for (const search of uniqueStrings([...dealKeyAliases, ...listingAliases])) {
+    for (const search of uniqueStrings([...dealKeyAliases, ...listingAliases, deal.name])) {
       const result = await storage.listSubmissions({ limit: 25, page: 1, search, status: 'all' });
       const rows = result?.rows || [];
       for (const row of rows) {
@@ -3706,10 +3773,40 @@ export async function findExistingDealHunterSubmission(storage, deal) {
           row.listing_url,
           ...(Array.isArray(metadata.listingAliases) ? metadata.listingAliases : []),
         ].map(normalizeUrl));
+        const storedIdentityAliases = uniqueStrings([
+          ...(Array.isArray(metadata.identityAliases) ? metadata.identityAliases : []),
+          ...storedListings.flatMap((listingUrl) => [
+            `url:${normalizeListingIdentity(listingUrl)}`,
+            ...listingMarketplaceAliases(listingUrl),
+          ]),
+        ]);
         const keyMatch = storedKeys.some((dealKey) => dealKeyAliases.includes(dealKey));
         const listingMatch = storedListings.some((listingUrl) => listingIdentities.has(normalizeListingIdentity(listingUrl)));
+        const identityMatch = storedIdentityAliases.some((identity) => identityAliases.has(identity));
         const legacyNotesMatch = dealKeyAliases.some((dealKey) => String(row?.notes || '').includes(dealKey));
-        if (keyMatch || listingMatch || legacyNotesMatch) addCandidate(row);
+        const raw = metadata.raw && typeof metadata.raw === 'object' && !Array.isArray(metadata.raw) ? metadata.raw : {};
+        const sourceRecord = (Array.isArray(metadata.sourceRecords) ? metadata.sourceRecords : [])
+          .find((record) => record?.externalId === metadata.externalId) || {};
+        const storedDeal = {
+          ...normalizeDealRecord(raw, {
+            id: metadata.sourceId || 'crm',
+            name: metadata.sourceName || 'CRM',
+            mode: metadata.sourceMode || 'crm',
+            rowId: metadata.externalId || '',
+            stableExternalId: Boolean(sourceRecord.stableExternalId),
+          }),
+          id: metadata.externalId || '',
+          stableExternalId: Boolean(sourceRecord.stableExternalId),
+          sourceId: metadata.sourceId || 'crm',
+          name: normalizeText(row.company || row.name || getField(raw, ['Business Name', 'Name', 'Listing']), 220),
+          listingUrl: normalizeUrl(row.listing_url) || normalizeUrl(getField(raw, ['Original Broker Listing URL', 'View Listing URL', 'Listing URL'])),
+          annualProfit: parseNumber(row.ttm_ebitda) ?? parseNumber(getField(raw, ['Annual Profit', 'Earnings', 'SDE', 'EBITDA'])),
+          annualRevenue: parseNumber(row.ttm_revenue) ?? parseNumber(getField(raw, ['Annual Revenue', 'Revenue'])),
+          askingPrice: parseNumber(row.asking_price) ?? parseNumber(getField(raw, ['Asking Price'])),
+          identityAliases: storedIdentityAliases,
+        };
+        const corroboratedMatch = syndicatedMatchDecision(storedDeal, deal).automatic;
+        if (keyMatch || listingMatch || identityMatch || legacyNotesMatch || corroboratedMatch) addCandidate(row);
       }
     }
   }
@@ -3947,6 +4044,7 @@ function dealHunterCrmUpdate(existing, deal, options = {}) {
     ttm_revenue: chooseDealHunterCrmValue(existing, payload, 'ttm_revenue', preserveExistingFields),
     ttm_ebitda: chooseDealHunterCrmValue(existing, payload, 'ttm_ebitda', preserveExistingFields),
     ebitda_multiple: chooseDealHunterCrmValue(existing, payload, 'ebitda_multiple', preserveExistingFields),
+    net_margin: chooseDealHunterCrmValue(existing, payload, 'net_margin', preserveExistingFields),
     business_age: chooseDealHunterCrmValue(existing, payload, 'business_age', preserveExistingFields),
     broker_name: chooseDealHunterCrmValue(existing, payload, 'broker_name', preserveExistingFields),
     broker_email: chooseDealHunterCrmValue(existing, payload, 'broker_email', preserveExistingFields),
@@ -4167,7 +4265,7 @@ export async function repairDealHunterCrmSourceFields({
 
 function buildDealHunterCrmImportRecord(deal, submissionId = '', status = 'pending') {
   const listingIdentity = normalizeListingIdentity(deal.listingUrl);
-  const importIdentity = deal.dealKey || listingIdentity || normalizeIdentityPart([deal.sourceName, deal.name, deal.location].join('|'), 1000);
+  const importIdentity = deal.opportunityId || deal.dealKey || listingIdentity || normalizeIdentityPart([deal.sourceName, deal.name, deal.location].join('|'), 1000);
   const now = new Date().toISOString();
 
   return {

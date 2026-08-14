@@ -161,7 +161,7 @@ function DealOsImportPanel({ importing, onImport, policy = {} }) {
     });
   }
 
-  const canSubmit = Boolean(file && coverageLabel.trim() && exportedAt && !importing);
+  const canSubmit = Boolean(file && exportedAt && !importing);
   const maxRecords = Number(policy.maxRecords || 1000);
   const maxAgeHours = Number(policy.maxAgeHours || 72);
 
@@ -171,7 +171,7 @@ function DealOsImportPanel({ importing, onImport, policy = {} }) {
       <div className="mt-4 grid gap-4 lg:grid-cols-2">
         <label className="text-sm font-semibold text-ink">Deal OS export file<input accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" className="form-control mt-1.5" disabled={importing} onChange={selectFile} required type="file" /></label>
         <label className="text-sm font-semibold text-ink">Export type<select className="form-control mt-1.5" disabled={importing} onChange={(event) => setScope(event.target.value)} value={scope}><option value="saved-search">Saved search</option><option value="deal-radar">Deal Radar filters</option></select></label>
-        <label className="text-sm font-semibold text-ink">Coverage description<input className="form-control mt-1.5" disabled={importing} maxLength={200} onChange={(event) => setCoverageLabel(event.target.value)} placeholder="e.g. All active saved-search results" required value={coverageLabel} /></label>
+        <label className="text-sm font-semibold text-ink">Coverage description <span className="font-normal text-ink/55">(required)</span><input aria-describedby="deal-os-coverage-help" aria-label="Coverage description" className="form-control mt-1.5" disabled={importing} maxLength={200} onChange={(event) => setCoverageLabel(event.target.value)} placeholder="e.g. CA, NY, NJ, AZ, NV, CT Deal Radar filters" required value={coverageLabel} /><span className="mt-1.5 block text-xs font-normal leading-5 text-ink/60" id="deal-os-coverage-help">Describe the saved search or Deal Radar filters represented by this file.</span></label>
         <label className="text-sm font-semibold text-ink">Exported at<input className="form-control mt-1.5" disabled={importing} onChange={(event) => setExportedAt(event.target.value)} required type="datetime-local" value={exportedAt} /></label>
         <label className="text-sm font-semibold text-ink">Expected listings shown by Deal OS <span className="font-normal text-ink/55">(optional)</span><input className="form-control mt-1.5" disabled={importing} max={maxRecords} min="1" onChange={(event) => setExpectedRowCount(event.target.value)} type="number" value={expectedRowCount} /></label>
       </div>
@@ -201,6 +201,7 @@ function OpportunityReview({ deal, onClose }) {
     ['Annual revenue', Number.isFinite(deal.annualRevenue) ? money(deal.annualRevenue) : 'Not disclosed'],
     ['Asking price', Number.isFinite(deal.askingPrice) ? money(deal.askingPrice) : 'Not disclosed'],
     ['Profit multiple', Number.isFinite(deal.profitMultiple) ? `${deal.profitMultiple}x` : 'Not disclosed'],
+    ['Net margin', Number.isFinite(deal.netMargin) ? `${deal.netMargin}%` : 'Not disclosed'],
     ['Years established', Number.isFinite(deal.yearsEstablished) ? deal.yearsEstablished : 'Not disclosed'],
     ['Broker', deal.brokerName || deal.brokerCompany],
     [deal.brokerContacts?.length > 1 ? 'Broker contacts' : 'Broker email', brokerContactSummary],

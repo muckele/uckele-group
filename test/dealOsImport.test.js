@@ -14,6 +14,8 @@ process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES = String(8 * 1024 * 102
 const {
   importDealOsExport,
   parseDealOsXlsxRows,
+  parseSheetCsvDeals,
+  repairDealHunterCrmSourceFields,
   reviewDailyDeals,
 } = await import('../server/services/dealHunter.js');
 const { createSqliteStorage } = await import('../server/storage/sqlite.js');
@@ -47,6 +49,13 @@ function validCsv() {
     'DOS-100,Commercial HVAC Services,https://broker.example/hvac,DealStream,2026-08-09,2026-08-10,HVAC,Recurring commercial maintenance,$450000,$2200000,$1800000,Jamie Broker,jamie@broker.example,do not retain',
     'DOS-100,Commercial HVAC Services,https://broker.example/hvac,DealStream,2026-08-09,2026-08-10,HVAC,Recurring commercial maintenance,$450000,$2200000,$1800000,Jamie Broker,backup@broker.example,do not retain',
     ',Industrial Inspection,https://broker.example/inspection,BizBuySell,2026-08-10,2026-08-10,Inspection,Compliance inspection contracts,$375000,$1600000,$1400000,Alex Broker,alex@broker.example,do not retain',
+  ].join('\n');
+}
+
+function currentMarketplaceCsv() {
+  return [
+    'Listing,City,State,Asking Price,Revenue,Earnings,Margin %,Multiple,Years in Business,Remote,Franchise,Listing URL,Date Added,Notes',
+    'Southern California Sign Company with 40+ Years of Operating History,,CA,"$1,450,000","$1,170,330","$365,112",31.2%,4.0x,41,No,No,https://www.bizbuysell.com/business-opportunity/southern-california-sign-company-with-40-years-of-operating-history/2540383/,8/13/2026,Recurring commercial customer relationships',
   ].join('\n');
 }
 
@@ -114,6 +123,135 @@ test('CSV import preserves durable identities, normalizes deal fields, deduplica
   const stableDeal = deals.find((deal) => deal.id === 'DOS-100');
   assert.equal(stableDeal.dealKey, 'source:deal-os-export:DOS-100');
   assert.equal(stableDeal.listingSource, 'DealStream');
+});
+
+test('ID-based exports can use bare Listing as the business name without a URL', async () => {
+  const storage = memoryStorage();
+  const result = await importDealOsExport({
+    fileBuffer: Buffer.from('Listing ID,Listing,Earnings\nDOS-NAME-1,HVAC,$425000'),
+    fileName: 'deal-os-id-and-name.csv',
+    mimeType: 'text/csv',
+    exportedAt: freshTimestamp(-1),
+    scope: 'saved-search',
+    coverageLabel: 'Stable-ID export without listing URLs',
+    expectedRowCount: 1,
+    importedBy: 'mathew@example.com',
+    storage,
+  });
+
+  assert.equal(result.ok, true);
+  const stored = await storage.getLatestDealHunterDealOsImport();
+  assert.equal(stored.records[0].stableId, 'DOS-NAME-1');
+  assert.equal(stored.records[0].name, 'HVAC');
+  assert.equal(stored.records[0].listingUrl, '');
+  assert.equal(stored.records[0].annualProfit, 425000);
+});
+
+test('exports with an explicit name can still use bare Listing as the URL', async () => {
+  const storage = memoryStorage();
+  const result = await importDealOsExport({
+    fileBuffer: Buffer.from('Business Name,Listing,Earnings\nCommercial Roofing Company,https://broker.example/roofing,$425000'),
+    fileName: 'deal-os-name-and-listing-url.csv',
+    mimeType: 'text/csv',
+    exportedAt: freshTimestamp(-1),
+    scope: 'saved-search',
+    coverageLabel: 'Legacy listing URL column',
+    expectedRowCount: 1,
+    importedBy: 'mathew@example.com',
+    storage,
+  });
+
+  assert.equal(result.ok, true);
+  const stored = await storage.getLatestDealHunterDealOsImport();
+  assert.equal(stored.records[0].name, 'Commercial Roofing Company');
+  assert.equal(stored.records[0].listingUrl, 'https://broker.example/roofing');
+  assert.equal(stored.records[0].annualProfit, 425000);
+});
+
+test('current SMB Deal OS marketplace export maps Listing, Earnings, and Margin into normalized review fields', async () => {
+  const storage = memoryStorage();
+  const result = await importDealOsExport({
+    fileBuffer: Buffer.from(currentMarketplaceCsv()),
+    fileName: 'marketplace-export-2026-08-14.csv',
+    mimeType: 'text/csv',
+    exportedAt: freshTimestamp(-1),
+    scope: 'deal-radar',
+    coverageLabel: 'CA, NY, NJ, AZ, NV, CT Deal Radar filters',
+    expectedRowCount: 1,
+    importedBy: 'mathew@example.com',
+    storage,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.import.rowCount, 1);
+  const stored = await storage.getLatestDealHunterDealOsImport();
+  assert.equal(stored.records[0].name, 'Southern California Sign Company with 40+ Years of Operating History');
+  assert.equal(stored.records[0].annualProfit, 365112);
+  assert.equal(stored.records[0].annualRevenue, 1170330);
+  assert.equal(stored.records[0].askingPrice, 1450000);
+  assert.equal(stored.records[0].profitMultiple, 4);
+  assert.equal(stored.records[0].netMargin, 31.2);
+  assert.equal(stored.records[0].yearsEstablished, 41);
+  assert.equal(stored.records[0].state, 'CA');
+  assert.equal(stored.records[0].listingUrl, 'https://www.bizbuysell.com/business-opportunity/southern-california-sign-company-with-40-years-of-operating-history/2540383/');
+
+  const review = await reviewDailyDeals({ storage });
+  const deals = [...review.qualified, ...review.watchlist, ...review.removalCandidates];
+  assert.equal(deals[0].name, stored.records[0].name);
+  assert.equal(deals[0].annualProfit, 365112);
+  assert.equal(deals[0].netMargin, 31.2);
+});
+
+test('current SMB Deal OS financial fields update the matched CRM record', async () => {
+  const [deal] = parseSheetCsvDeals(currentMarketplaceCsv()).deals;
+  const existing = {
+    id: 'crm-marketplace-listing',
+    created_at: '2026-08-13T12:00:00.000Z',
+    updated_at: '2026-08-13T12:00:00.000Z',
+    source: 'deal-hunter-daily-review',
+    status: 'review',
+    company: deal.name,
+    listing_url: deal.listingUrl,
+    priority: 'high',
+    tags: ['deal-hunter'],
+    notes: '',
+    metadata: {
+      dealHunter: {
+        managed: true,
+        dealKey: `url:${deal.listingUrl.toLowerCase()}`,
+        listingAliases: [deal.listingUrl],
+      },
+    },
+  };
+  let updatedValues = null;
+  const storage = {
+    async getSubmission(id) {
+      return id === existing.id ? existing : null;
+    },
+    async mutateWithCrmActivity({ operation, payload }) {
+      assert.equal(operation, 'update_submission');
+      updatedValues = payload.values;
+      return { applied: true, record: { ...existing, ...payload.values } };
+    },
+  };
+
+  const result = await repairDealHunterCrmSourceFields({
+    submissionId: existing.id,
+    apply: true,
+    actor: 'mathew@example.com',
+    backupVerified: true,
+    backupReference: 'test-only-backup',
+    storage,
+    sourceResults: [{ source: { id: 'deal-os-export', fetched: true }, deals: [deal] }],
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(updatedValues.asking_price, '$1,450,000');
+  assert.equal(updatedValues.ttm_revenue, '$1,170,330');
+  assert.equal(updatedValues.ttm_ebitda, '$365,112');
+  assert.equal(updatedValues.ebitda_multiple, '4x');
+  assert.equal(updatedValues.net_margin, '31.2%');
+  assert.equal(updatedValues.business_age, '41 years');
 });
 
 test('punctuation-distinct Deal OS IDs remain separate durable identities', async () => {

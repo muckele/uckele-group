@@ -175,6 +175,89 @@ test('near-title syndication requires near-identical descriptions, location, and
   assert.equal(dedupeDeals(parsed.deals).length, 1);
 });
 
+test('description-free Deal OS and Daily Deal Update copies merge on exact title, geography, and financials', () => {
+  const parsed = parseSheetCsvDeals(sheetCsv([
+    {
+      'Business Name': 'Nassau County HVAC Company',
+      'Listing URL': 'https://www.bizbuysell.com/business-opportunity/nassau-county-hvac-company/2534394/',
+      'Listing Source': 'BizBuySell',
+      State: 'NY',
+      'Annual Profit': '$427,747',
+      'Annual Revenue': '$1,141,941',
+      'Asking Price': '$950,000',
+    },
+  ])).deals[0];
+  const dealOsCopy = {
+    ...parsed,
+    id: '',
+    stableExternalId: false,
+    sourceId: 'deal-os-export',
+    sourceName: 'SMB Deal OS export',
+    sourceMode: 'manual-export',
+    name: 'Nassau County HVAC Company For Sale',
+    listingUrl: 'https://www.dealstream.com/d/biz-sale/hvac/tomhyp',
+    raw: { ...parsed.raw, 'Listing URL': 'https://www.dealstream.com/d/biz-sale/hvac/tomhyp' },
+  };
+
+  const deals = dedupeDeals([parsed, dealOsCopy]);
+  assert.equal(deals.length, 1);
+  assert.deepEqual(new Set(deals[0].listingAliases), new Set([
+    'https://www.bizbuysell.com/business-opportunity/nassau-county-hvac-company/2534394/',
+    'https://www.dealstream.com/d/biz-sale/hvac/tomhyp',
+  ]));
+  assert.equal(deals[0].deduplicationMatches[0].reason, 'near-title-location-financials');
+});
+
+test('same-marketplace re-listings merge only with exact title, geography, and corroborating financials', () => {
+  const rows = [
+    {
+      'Business Name': 'Commercial Cabinet Manufacturer',
+      'Listing URL': 'https://www.bizbuysell.com/business-opportunity/commercial-cabinet-manufacturer/2538197/',
+      State: 'CT',
+      'Annual Profit': '$300,166',
+      'Annual Revenue': '$1,765,992',
+      'Asking Price': '$650,000',
+    },
+    {
+      'Business Name': 'Commercial Cabinet Manufacturer',
+      'Listing URL': 'https://www.bizbuysell.com/business-opportunity/commercial-cabinet-manufacturer/2489676/',
+      State: 'CT',
+      'Annual Profit': '$300,166',
+      'Annual Revenue': '$1,765,992',
+      'Asking Price': '$650,000',
+    },
+  ];
+
+  const deals = dedupeDeals(parseSheetCsvDeals(sheetCsv(rows)).deals);
+  assert.equal(deals.length, 1);
+  assert.equal(deals[0].deduplicationMatches[0].reason, 'exact-title-location-financials');
+});
+
+test('near-identical description-free titles require all three matching financials', () => {
+  const rows = [
+    {
+      'Business Name': 'Electric Firm with Niche in Fire Protection Systems',
+      'Listing URL': 'https://www.businessbroker.net/business-for-sale/electric-firm-fire-protection/1010327.aspx',
+      State: 'NY',
+      'Annual Profit': '$717,956',
+      'Annual Revenue': '$2,520,761',
+      'Asking Price': '$1,785,000',
+    },
+    {
+      'Business Name': 'Electric Firm with Niche in Fire Protection System',
+      'Listing URL': 'https://www.dealstream.com/d/biz-sale/engineering/q40m15',
+      State: 'NY',
+      'Annual Profit': '$717,956',
+      'Annual Revenue': '$2,520,761',
+      'Asking Price': '$1,785,000',
+    },
+  ];
+
+  const deals = dedupeDeals(parseSheetCsvDeals(sheetCsv(rows)).deals);
+  assert.equal(deals.length, 1);
+  assert.equal(deals[0].deduplicationMatches[0].reason, 'near-title-location-financials');
+});
+
 test('cluster expansion requires a direct canonical match and does not merge weak transitive links', () => {
   const common = Array.from({ length: 60 }, (_, index) => `common${index}`).join(' ');
   const leftOnly = Array.from({ length: 6 }, (_, index) => `left${index}`).join(' ');
@@ -334,4 +417,98 @@ test('CRM alias lookup prefers the active canonical card over an archived syndic
   });
 
   assert.equal(existing.id, 'active-bizbuysell-card');
+});
+
+test('CRM lookup reuses a Daily Deal Update card for a corroborated Deal OS syndication', async () => {
+  const searches = [];
+  const dailyDealRecord = {
+    id: 'daily-deal-update-card',
+    status: 'review',
+    company: 'Nassau County HVAC Company',
+    listing_url: 'https://www.bizbuysell.com/business-opportunity/nassau-county-hvac-company/2534394/',
+    asking_price: '$950,000',
+    ttm_revenue: '$1,141,941',
+    ttm_ebitda: '$427,747',
+    updated_at: '2026-08-13T12:00:00.000Z',
+    metadata: {
+      dealHunter: {
+        sourceId: 'sheet-0',
+        sourceName: 'SMB Deal Hunter Google Sheet',
+        sourceMode: 'csv',
+        externalId: '42',
+        raw: { State: 'NY' },
+      },
+    },
+  };
+  const storage = {
+    async getSubmissionByListingUrl() { return null; },
+    async listSubmissions({ search }) {
+      searches.push(search);
+      return { rows: search === dailyDealRecord.company ? [dailyDealRecord] : [] };
+    },
+  };
+
+  const existing = await findExistingDealHunterSubmission(storage, {
+    id: '',
+    stableExternalId: false,
+    sourceId: 'deal-os-export',
+    sourceName: 'SMB Deal OS export',
+    sourceMode: 'manual-export',
+    dealKey: 'url:https://www.dealstream.com/d/biz-sale/hvac/tomhyp',
+    name: 'Nassau County HVAC Company',
+    state: 'NY',
+    location: 'NY',
+    annualProfit: 427747,
+    annualRevenue: 1141941,
+    askingPrice: 950000,
+    description: '',
+    listingUrl: 'https://www.dealstream.com/d/biz-sale/hvac/tomhyp',
+  });
+
+  assert.equal(existing.id, dailyDealRecord.id);
+  assert.equal(searches.includes(dailyDealRecord.company), true);
+});
+
+test('CRM lookup does not reuse a same-name listing when geography conflicts', async () => {
+  const dailyDealRecord = {
+    id: 'different-market-card',
+    status: 'review',
+    company: 'Nassau County HVAC Company',
+    listing_url: 'https://www.bizbuysell.com/business-opportunity/nassau-county-hvac-company/2534394/',
+    asking_price: '$950,000',
+    ttm_revenue: '$1,141,941',
+    ttm_ebitda: '$427,747',
+    metadata: {
+      dealHunter: {
+        sourceId: 'sheet-0',
+        sourceName: 'SMB Deal Hunter Google Sheet',
+        sourceMode: 'csv',
+        externalId: '42',
+        raw: { State: 'NJ' },
+      },
+    },
+  };
+  const storage = {
+    async getSubmissionByListingUrl() { return null; },
+    async listSubmissions({ search }) {
+      return { rows: search === dailyDealRecord.company ? [dailyDealRecord] : [] };
+    },
+  };
+
+  const existing = await findExistingDealHunterSubmission(storage, {
+    sourceId: 'deal-os-export',
+    sourceName: 'SMB Deal OS export',
+    sourceMode: 'manual-export',
+    dealKey: 'url:https://www.dealstream.com/d/biz-sale/hvac/tomhyp',
+    name: dailyDealRecord.company,
+    state: 'NY',
+    location: 'NY',
+    annualProfit: 427747,
+    annualRevenue: 1141941,
+    askingPrice: 950000,
+    description: '',
+    listingUrl: 'https://www.dealstream.com/d/biz-sale/hvac/tomhyp',
+  });
+
+  assert.equal(existing, null);
 });
