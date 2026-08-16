@@ -599,6 +599,47 @@ test('full-backfill scoring and explicit CRM sync require administrator access a
     });
     assert.equal(viewerAudit.status, 401);
 
+    // Triage: viewers may read the queue, only full administrators may decide.
+    const viewerTriage = await fetch(`${origin}/api/admin/deal-hunter/triage?view=needs-review`, {
+      headers: { Cookie: viewerCookie },
+    });
+    assert.equal(viewerTriage.status, 200);
+    const viewerTriageResult = await viewerTriage.json();
+    assert.equal(viewerTriageResult.success, true);
+    assert.ok(Array.isArray(viewerTriageResult.rows));
+
+    const anonymousTriage = await fetch(`${origin}/api/admin/deal-hunter/triage`);
+    assert.equal(anonymousTriage.status, 401);
+
+    const viewerDecision = await fetch(`${origin}/api/admin/deal-hunter/triage/opp-any/decision`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: viewerCookie },
+      body: JSON.stringify({ priority: 'urgent' }),
+    });
+    assert.equal(viewerDecision.status, 401, 'a read-only viewer cannot record an operator decision');
+
+    const viewerRefresh = await fetch(`${origin}/api/admin/deal-hunter/scores/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: viewerCookie },
+      body: JSON.stringify({ force: false }),
+    });
+    assert.equal(viewerRefresh.status, 401);
+
+    // A full forced rebuild is bounded by a typed confirmation.
+    const unconfirmedRebuild = await fetch(`${origin}/api/admin/deal-hunter/scores/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({ force: true }),
+    });
+    const unconfirmedRebuildResult = await unconfirmedRebuild.json();
+    assert.equal(unconfirmedRebuild.status, 400);
+    assert.match(unconfirmedRebuildResult.error, /REBUILD ALL SCORES/);
+
+    const missingTriageDetail = await fetch(`${origin}/api/admin/deal-hunter/triage/opp-missing`, {
+      headers: { Cookie: adminCookie },
+    });
+    assert.equal(missingTriageDetail.status, 404);
+
     const missingReconciliationImport = await fetch(`${origin}/api/admin/deal-hunter/crm-reconciliation/preview`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Cookie: adminCookie },

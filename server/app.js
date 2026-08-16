@@ -35,7 +35,15 @@ import { recordEmailEventsFromWebhook } from './services/emailEvents.js';
 import { getEmailReadiness } from './services/emailReadiness.js';
 import { sendAdminEmailTestEmail } from './services/delivery.js';
 import { checkReadiness } from './services/readiness.js';
-import { refreshOpportunityScores } from './services/dealHunterScoreStore.js';
+import {
+  refreshOpportunityScores,
+  requestOpportunityScoreRefresh,
+} from './services/dealHunterScoreStore.js';
+import {
+  getTriageOpportunityDetail,
+  listTriageQueue,
+  setTriageOperatorDecision,
+} from './services/dealHunterTriage.js';
 import {
   dealHunterCrmSyncConfirmation,
   auditDealHunterCrmIntegrity,
@@ -1335,6 +1343,83 @@ export function createApp() {
       }
       const audit = await auditDealHunterCrmIntegrity();
       response.status(audit.ok ? 200 : 409).json({ success: audit.ok, audit });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/triage',
+    asyncRoute(async (request, response) => {
+      // Read-only viewers may inspect the queue, matching adjacent Deal Hunter
+      // read routes. Only full administrators can record a decision.
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      const result = await listTriageQueue({
+        view: request.query.view,
+        page: request.query.page,
+        pageSize: request.query.pageSize,
+        search: request.query.search,
+        sort: request.query.sort,
+        direction: request.query.direction,
+        minScore: request.query.minScore,
+        confidence: request.query.confidence,
+        priority: request.query.priority,
+        state: request.query.state,
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/triage/:opportunityId',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      const result = await getTriageOpportunityDetail({ opportunityId: request.params.opportunityId });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/decision',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await setTriageOperatorDecision({
+        opportunityId: request.params.opportunityId,
+        priority: request.body?.priority,
+        note: request.body?.note,
+        markReviewed: Boolean(request.body?.markReviewed),
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/scores/refresh',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const requestedIds = Array.isArray(request.body?.opportunityIds) ? request.body.opportunityIds.slice(0, 1000) : [];
+      const result = await requestOpportunityScoreRefresh({
+        opportunityIds: requestedIds,
+        force: Boolean(request.body?.force),
+        confirmation: request.body?.confirmation || '',
+        requestedBy: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );
 
