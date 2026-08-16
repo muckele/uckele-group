@@ -310,6 +310,39 @@ function normalizeDealHunterCrmReconciliationItemRow(row) {
     : null;
 }
 
+// Operator-owned columns on deal_hunter_opportunity_scores, kept identical to
+// the SQLite provider so ownership rules cannot diverge between providers.
+export const dealHunterOperatorOwnedScoreFields = Object.freeze([
+  'operator_priority',
+  'operator_note',
+  'reviewed_at',
+  'reviewed_by',
+  'reviewed_fingerprint',
+  'operator_updated_at',
+]);
+
+function normalizeDealHunterOpportunityScoreRow(row) {
+  return row
+    ? {
+        ...row,
+        should_remove: Boolean(row.should_remove),
+        high_fit: Boolean(row.high_fit),
+        dimensions: Array.isArray(row.dimensions) ? row.dimensions : [],
+        gates: Array.isArray(row.gates) ? row.gates : [],
+        applied_caps: Array.isArray(row.applied_caps) ? row.applied_caps : [],
+        missing_evidence: Array.isArray(row.missing_evidence) ? row.missing_evidence : [],
+        confidence_reasons: Array.isArray(row.confidence_reasons) ? row.confidence_reasons : [],
+        summary: typeof row.summary === 'object' && row.summary !== null ? row.summary : {},
+        changed_since_review: Boolean(row.reviewed_fingerprint) && row.reviewed_fingerprint !== row.score_fingerprint,
+        reviewed: Boolean(row.reviewed_at),
+      }
+    : null;
+}
+
+function normalizeDealHunterScoreEvidenceRow(row) {
+  return row ? { ...row, terms: Array.isArray(row.terms) ? row.terms : [] } : null;
+}
+
 function normalizeDealHunterOpportunityRow(row) {
   return row
     ? { ...row, metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {} }
@@ -2531,6 +2564,117 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       const { data, error } = await query.limit(1).maybeSingle();
       if (error) throw error;
       return normalizeDealHunterCrmReconciliationRunRow(data);
+    },
+
+    // --- Deal Hunter opportunity scoring ---------------------------------
+    //
+    // Machine scoring and operator decisions are written by separate methods
+    // with disjoint column sets, matching the SQLite provider. The score row and
+    // its evidence are replaced by a single security-definer function so a
+    // reader never sees a score beside evidence from an earlier fingerprint.
+
+    async writeDealHunterOpportunityScore(score = {}, evidence = []) {
+      for (const field of dealHunterOperatorOwnedScoreFields) {
+        if (Object.hasOwn(score, field)) {
+          throw new Error(`Machine score writes must not carry operator-owned field "${field}".`);
+        }
+      }
+      const { data, error } = await client.rpc('write_deal_hunter_opportunity_score', {
+        p_score: score,
+        p_evidence: Array.isArray(evidence) ? evidence : [],
+      });
+      if (error) throw error;
+      return normalizeDealHunterOpportunityScoreRow(data);
+    },
+
+    async setDealHunterOpportunityOperatorDecision(decision = {}) {
+      const opportunityId = String(decision.opportunityId || '').trim();
+      if (!opportunityId) throw new Error('A canonical opportunity id is required to record an operator decision.');
+      const payload = { operator_updated_at: decision.updatedAt || new Date().toISOString() };
+      if (decision.priority !== undefined) payload.operator_priority = String(decision.priority || 'normal');
+      if (decision.note !== undefined) payload.operator_note = decision.note === null ? null : String(decision.note);
+      if (decision.reviewed) {
+        payload.reviewed_at = decision.reviewedAt || payload.operator_updated_at;
+        payload.reviewed_by = String(decision.reviewedBy || 'admin');
+        payload.reviewed_fingerprint = String(decision.reviewedFingerprint || '');
+      }
+      const { data, error } = await client
+        .from('deal_hunter_opportunity_scores')
+        .update(payload)
+        .eq('opportunity_id', opportunityId)
+        .select()
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeDealHunterOpportunityScoreRow(data);
+    },
+
+    async getDealHunterOpportunityScore(opportunityId) {
+      const { data, error } = await client
+        .from('deal_hunter_opportunity_scores')
+        .select('*')
+        .eq('opportunity_id', String(opportunityId || '').trim())
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeDealHunterOpportunityScoreRow(data);
+    },
+
+    async listDealHunterOpportunityScoreFingerprints(opportunityIds = []) {
+      const ids = normalizeList(opportunityIds);
+      if (ids.length === 0) return [];
+      const rows = [];
+      for (let index = 0; index < ids.length; index += 500) {
+        const batch = ids.slice(index, index + 500);
+        const { data, error } = await client
+          .from('deal_hunter_opportunity_scores')
+          .select('opportunity_id, score_fingerprint, rules_version, engine_version, profile_version')
+          .in('opportunity_id', batch);
+        if (error) throw error;
+        rows.push(...(data || []));
+      }
+      return rows;
+    },
+
+    async listDealHunterScoreEvidence(opportunityId, { limit = 500 } = {}) {
+      const { data, error } = await client
+        .from('deal_hunter_score_evidence')
+        .select('*')
+        .eq('opportunity_id', String(opportunityId || '').trim())
+        .order('dimension')
+        .order('evidence_class')
+        .order('rule_id')
+        .limit(Math.max(1, Math.min(Number(limit) || 500, 5000)));
+      if (error) throw error;
+      return (data || []).map(normalizeDealHunterScoreEvidenceRow);
+    },
+
+    async listDealHunterOpportunityScores({
+      view = 'needs-review', page = 1, pageSize = 25, search = '', sort = 'fit-score', direction = 'desc',
+      minScore = null, confidence = '', priority = '', state = '',
+    } = {}) {
+      const safePage = Math.max(1, Math.min(Number(page) || 1, 10000));
+      const safePageSize = Math.max(1, Math.min(Number(pageSize) || 25, 100));
+      const { data, error } = await client.rpc('list_deal_hunter_opportunity_scores', {
+        p_view: String(view || 'needs-review'),
+        p_page: safePage,
+        p_page_size: safePageSize,
+        p_search: String(search || ''),
+        p_sort: String(sort || 'fit-score'),
+        p_direction: String(direction || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc',
+        p_min_score: minScore === null || minScore === '' ? null : Number(minScore),
+        p_confidence: String(confidence || ''),
+        p_priority: String(priority || ''),
+        p_state: String(state || ''),
+      });
+      if (error) throw error;
+      const total = Number(data?.total || 0);
+      return {
+        rows: (data?.rows || []).map(normalizeDealHunterOpportunityScoreRow),
+        total,
+        page: safePage,
+        pageSize: safePageSize,
+        totalPages: Math.max(1, Math.ceil(total / safePageSize)),
+      };
     },
 
     async listDealHunterCrmReconciliationItems(runId, { limit = 5000 } = {}) {

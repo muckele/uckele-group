@@ -326,6 +326,40 @@ function normalizeDealHunterOpportunityRow(row) {
   return row ? { ...row, metadata: parseJsonColumn(row.metadata, {}) } : null;
 }
 
+// Operator-owned columns on deal_hunter_opportunity_scores. Machine score writes
+// reject any payload carrying one of these, so ownership cannot be crossed by a
+// caller that forgets the convention.
+export const dealHunterOperatorOwnedScoreFields = Object.freeze([
+  'operator_priority',
+  'operator_note',
+  'reviewed_at',
+  'reviewed_by',
+  'reviewed_fingerprint',
+  'operator_updated_at',
+]);
+
+function normalizeDealHunterOpportunityScoreRow(row) {
+  return row
+    ? {
+        ...row,
+        should_remove: Boolean(row.should_remove),
+        high_fit: Boolean(row.high_fit),
+        dimensions: parseJsonColumn(row.dimensions, []),
+        gates: parseJsonColumn(row.gates, []),
+        applied_caps: parseJsonColumn(row.applied_caps, []),
+        missing_evidence: parseJsonColumn(row.missing_evidence, []),
+        confidence_reasons: parseJsonColumn(row.confidence_reasons, []),
+        summary: parseJsonColumn(row.summary, {}),
+        changed_since_review: Boolean(row.reviewed_fingerprint) && row.reviewed_fingerprint !== row.score_fingerprint,
+        reviewed: Boolean(row.reviewed_at),
+      }
+    : null;
+}
+
+function normalizeDealHunterScoreEvidenceRow(row) {
+  return row ? { ...row, terms: parseJsonColumn(row.terms, []) } : null;
+}
+
 function normalizeDealHunterOpportunityAliasRow(row) {
   return row ? { ...row, metadata: parseJsonColumn(row.metadata, {}) } : null;
 }
@@ -1199,6 +1233,70 @@ export function createSqliteStorage(config) {
         FOREIGN KEY(run_id) REFERENCES deal_hunter_crm_reconciliation_runs(id) ON DELETE CASCADE
       );
 
+      -- Deal Hunter opportunity scoring. Machine-computed columns and
+      -- operator-owned columns share a row so the triage queue can derive
+      -- "changed since reviewed" without a join, but they are never written by
+      -- the same method: see writeDealHunterOpportunityScore and
+      -- setDealHunterOpportunityOperatorDecision.
+      CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_scores (
+        opportunity_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        -- machine-owned
+        scored_at TEXT NOT NULL,
+        deal_key TEXT,
+        name TEXT,
+        state TEXT,
+        listing_url TEXT,
+        fit_score INTEGER NOT NULL DEFAULT 0,
+        score_status TEXT NOT NULL DEFAULT 'provisional',
+        confidence TEXT NOT NULL DEFAULT 'low',
+        completeness_score INTEGER NOT NULL DEFAULT 0,
+        contradiction_count INTEGER NOT NULL DEFAULT 0,
+        missing_evidence_count INTEGER NOT NULL DEFAULT 0,
+        should_remove INTEGER NOT NULL DEFAULT 0,
+        high_fit INTEGER NOT NULL DEFAULT 0,
+        gate_count INTEGER NOT NULL DEFAULT 0,
+        score_fingerprint TEXT NOT NULL,
+        engine_version TEXT NOT NULL,
+        rules_version TEXT NOT NULL,
+        profile_version TEXT NOT NULL,
+        completeness_policy_version TEXT NOT NULL,
+        dimensions TEXT NOT NULL DEFAULT '[]',
+        gates TEXT NOT NULL DEFAULT '[]',
+        applied_caps TEXT NOT NULL DEFAULT '[]',
+        missing_evidence TEXT NOT NULL DEFAULT '[]',
+        confidence_reasons TEXT NOT NULL DEFAULT '[]',
+        summary TEXT NOT NULL DEFAULT '{}',
+        -- operator-owned
+        operator_priority TEXT NOT NULL DEFAULT 'normal',
+        operator_note TEXT,
+        reviewed_at TEXT,
+        reviewed_by TEXT,
+        reviewed_fingerprint TEXT,
+        operator_updated_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_score_evidence (
+        id TEXT PRIMARY KEY,
+        opportunity_id TEXT NOT NULL,
+        score_fingerprint TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        dimension TEXT,
+        rule_id TEXT NOT NULL,
+        rule_label TEXT NOT NULL,
+        evidence_class TEXT NOT NULL,
+        field TEXT,
+        value TEXT,
+        observed_value TEXT,
+        terms TEXT NOT NULL DEFAULT '[]',
+        source_id TEXT,
+        source_name TEXT,
+        source_record_id TEXT,
+        listing_url TEXT,
+        observed_at TEXT,
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunity_scores(opportunity_id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_reviews (
         id TEXT PRIMARY KEY,
         created_at TEXT NOT NULL,
@@ -1791,6 +1889,14 @@ export function createSqliteStorage(config) {
       ON deal_hunter_crm_reconciliation_runs(import_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_crm_reconciliation_items_run
       ON deal_hunter_crm_reconciliation_items(run_id, status, opportunity_id);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_queue
+      ON deal_hunter_opportunity_scores(should_remove, fit_score DESC, confidence, opportunity_id);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_priority
+      ON deal_hunter_opportunity_scores(operator_priority, fit_score DESC, opportunity_id);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_fingerprint
+      ON deal_hunter_opportunity_scores(score_fingerprint);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_score_evidence_opportunity
+      ON deal_hunter_score_evidence(opportunity_id, dimension, evidence_class);
     CREATE INDEX IF NOT EXISTS idx_crm_communications_opportunity ON crm_communications(opportunity_id, occurred_at DESC);
     CREATE INDEX IF NOT EXISTS idx_email_events_opportunity ON email_events(opportunity_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_crm_activity_opportunity ON crm_activity_events(opportunity_id, created_at DESC);
@@ -5046,6 +5152,284 @@ export function createSqliteStorage(config) {
           SELECT * FROM deal_hunter_crm_reconciliation_runs
           WHERE id = ? OR idempotency_key = ? ORDER BY created_at DESC LIMIT 1
         `).get(id || '', idempotencyKey || ''));
+      },
+
+      // --- Deal Hunter opportunity scoring -------------------------------
+      //
+      // Machine-computed scoring and operator decisions are written by separate
+      // methods with disjoint column lists. Neither method can reach the other's
+      // columns, so no import, sync, reconciliation, rescore, or retry is able
+      // to overwrite an operator decision.
+
+      async writeDealHunterOpportunityScore(score = {}, evidence = []) {
+        for (const field of dealHunterOperatorOwnedScoreFields) {
+          if (Object.hasOwn(score, field)) {
+            throw new Error(`Machine score writes must not carry operator-owned field "${field}".`);
+          }
+        }
+        const opportunityId = String(score.opportunity_id || '').trim();
+        if (!opportunityId) throw new Error('A canonical opportunity id is required to write a score.');
+        const now = score.scored_at || new Date().toISOString();
+        const serialized = {
+          opportunity_id: opportunityId,
+          created_at: now,
+          scored_at: now,
+          deal_key: score.deal_key || null,
+          name: score.name || null,
+          state: score.state || null,
+          listing_url: score.listing_url || null,
+          fit_score: Number(score.fit_score || 0),
+          score_status: String(score.score_status || 'provisional'),
+          confidence: String(score.confidence || 'low'),
+          completeness_score: Number(score.completeness_score || 0),
+          contradiction_count: Number(score.contradiction_count || 0),
+          missing_evidence_count: Number(score.missing_evidence_count || 0),
+          should_remove: score.should_remove ? 1 : 0,
+          high_fit: score.high_fit ? 1 : 0,
+          gate_count: Number(score.gate_count || 0),
+          score_fingerprint: String(score.score_fingerprint || ''),
+          engine_version: String(score.engine_version || ''),
+          rules_version: String(score.rules_version || ''),
+          profile_version: String(score.profile_version || ''),
+          completeness_policy_version: String(score.completeness_policy_version || ''),
+          dimensions: JSON.stringify(score.dimensions || []),
+          gates: JSON.stringify(score.gates || []),
+          applied_caps: JSON.stringify(score.applied_caps || []),
+          missing_evidence: JSON.stringify(score.missing_evidence || []),
+          confidence_reasons: JSON.stringify(score.confidence_reasons || []),
+          summary: JSON.stringify(score.summary || {}),
+        };
+        // The score and the evidence describing it are replaced together, so no
+        // reader can observe a score at fingerprint B beside evidence from A.
+        const transaction = database.transaction(() => {
+          database.prepare(`
+            INSERT INTO deal_hunter_opportunity_scores (
+              opportunity_id, created_at, scored_at, deal_key, name, state, listing_url, fit_score, score_status, confidence,
+              completeness_score, contradiction_count, missing_evidence_count, should_remove, high_fit,
+              gate_count, score_fingerprint, engine_version, rules_version, profile_version,
+              completeness_policy_version, dimensions, gates, applied_caps, missing_evidence,
+              confidence_reasons, summary
+            ) VALUES (
+              @opportunity_id, @created_at, @scored_at, @deal_key, @name, @state, @listing_url, @fit_score, @score_status, @confidence,
+              @completeness_score, @contradiction_count, @missing_evidence_count, @should_remove, @high_fit,
+              @gate_count, @score_fingerprint, @engine_version, @rules_version, @profile_version,
+              @completeness_policy_version, @dimensions, @gates, @applied_caps, @missing_evidence,
+              @confidence_reasons, @summary
+            )
+            ON CONFLICT(opportunity_id) DO UPDATE SET
+              scored_at = excluded.scored_at,
+              deal_key = excluded.deal_key,
+              name = excluded.name,
+              state = excluded.state,
+              listing_url = excluded.listing_url,
+              fit_score = excluded.fit_score,
+              score_status = excluded.score_status,
+              confidence = excluded.confidence,
+              completeness_score = excluded.completeness_score,
+              contradiction_count = excluded.contradiction_count,
+              missing_evidence_count = excluded.missing_evidence_count,
+              should_remove = excluded.should_remove,
+              high_fit = excluded.high_fit,
+              gate_count = excluded.gate_count,
+              score_fingerprint = excluded.score_fingerprint,
+              engine_version = excluded.engine_version,
+              rules_version = excluded.rules_version,
+              profile_version = excluded.profile_version,
+              completeness_policy_version = excluded.completeness_policy_version,
+              dimensions = excluded.dimensions,
+              gates = excluded.gates,
+              applied_caps = excluded.applied_caps,
+              missing_evidence = excluded.missing_evidence,
+              confidence_reasons = excluded.confidence_reasons,
+              summary = excluded.summary
+          `).run(serialized);
+          database.prepare('DELETE FROM deal_hunter_score_evidence WHERE opportunity_id = ?').run(opportunityId);
+          const insertEvidence = database.prepare(`
+            INSERT INTO deal_hunter_score_evidence (
+              id, opportunity_id, score_fingerprint, created_at, dimension, rule_id, rule_label,
+              evidence_class, field, value, observed_value, terms, source_id, source_name,
+              source_record_id, listing_url, observed_at
+            ) VALUES (
+              @id, @opportunity_id, @score_fingerprint, @created_at, @dimension, @rule_id, @rule_label,
+              @evidence_class, @field, @value, @observed_value, @terms, @source_id, @source_name,
+              @source_record_id, @listing_url, @observed_at
+            )
+          `);
+          (Array.isArray(evidence) ? evidence : []).forEach((row, index) => {
+            insertEvidence.run({
+              id: `${opportunityId}:${serialized.score_fingerprint}:${index}`,
+              opportunity_id: opportunityId,
+              score_fingerprint: serialized.score_fingerprint,
+              created_at: now,
+              dimension: row.dimension || null,
+              rule_id: String(row.ruleId || row.rule_id || ''),
+              rule_label: String(row.ruleLabel || row.rule_label || ''),
+              evidence_class: String(row.evidenceClass || row.evidence_class || ''),
+              field: row.field || null,
+              value: row.value === null || row.value === undefined ? null : String(row.value),
+              observed_value: row.observedValue === null || row.observedValue === undefined ? null : String(row.observedValue),
+              terms: JSON.stringify(row.terms || []),
+              source_id: row.sourceId || row.source_id || null,
+              source_name: row.sourceName || row.source_name || null,
+              source_record_id: row.sourceRecordId || row.source_record_id || null,
+              listing_url: row.listingUrl || row.listing_url || null,
+              observed_at: row.observedAt || row.observed_at || null,
+            });
+          });
+        });
+        transaction.immediate();
+        return this.getDealHunterOpportunityScore(opportunityId);
+      },
+
+      async setDealHunterOpportunityOperatorDecision(decision = {}) {
+        const opportunityId = String(decision.opportunityId || '').trim();
+        if (!opportunityId) throw new Error('A canonical opportunity id is required to record an operator decision.');
+        const existing = database
+          .prepare('SELECT opportunity_id FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?')
+          .get(opportunityId);
+        if (!existing) return null;
+        const assignments = [];
+        const params = { opportunity_id: opportunityId, operator_updated_at: decision.updatedAt || new Date().toISOString() };
+        if (decision.priority !== undefined) {
+          assignments.push('operator_priority = @operator_priority');
+          params.operator_priority = String(decision.priority || 'normal');
+        }
+        if (decision.note !== undefined) {
+          assignments.push('operator_note = @operator_note');
+          params.operator_note = decision.note === null ? null : String(decision.note);
+        }
+        if (decision.reviewed) {
+          assignments.push('reviewed_at = @reviewed_at', 'reviewed_by = @reviewed_by', 'reviewed_fingerprint = @reviewed_fingerprint');
+          params.reviewed_at = decision.reviewedAt || params.operator_updated_at;
+          params.reviewed_by = String(decision.reviewedBy || 'admin');
+          params.reviewed_fingerprint = String(decision.reviewedFingerprint || '');
+        }
+        if (assignments.length === 0) return this.getDealHunterOpportunityScore(opportunityId);
+        database.prepare(`
+          UPDATE deal_hunter_opportunity_scores
+          SET ${assignments.join(', ')}, operator_updated_at = @operator_updated_at
+          WHERE opportunity_id = @opportunity_id
+        `).run(params);
+        return this.getDealHunterOpportunityScore(opportunityId);
+      },
+
+      async getDealHunterOpportunityScore(opportunityId) {
+        return normalizeDealHunterOpportunityScoreRow(
+          database.prepare('SELECT * FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?').get(String(opportunityId || '').trim()),
+        );
+      },
+
+      async listDealHunterOpportunityScoreFingerprints(opportunityIds = []) {
+        const ids = normalizeList(opportunityIds, 100000);
+        if (ids.length === 0) return [];
+        const rows = [];
+        for (let index = 0; index < ids.length; index += 500) {
+          const batch = ids.slice(index, index + 500);
+          rows.push(...database.prepare(`
+            SELECT opportunity_id, score_fingerprint, rules_version, engine_version, profile_version
+            FROM deal_hunter_opportunity_scores
+            WHERE opportunity_id IN (${batch.map(() => '?').join(', ')})
+          `).all(...batch));
+        }
+        return rows;
+      },
+
+      async listDealHunterScoreEvidence(opportunityId, { limit = 500 } = {}) {
+        return database.prepare(`
+          SELECT * FROM deal_hunter_score_evidence
+          WHERE opportunity_id = ?
+          ORDER BY dimension, evidence_class, rule_id
+          LIMIT ?
+        `).all(String(opportunityId || '').trim(), Math.max(1, Math.min(Number(limit) || 500, 5000)))
+          .map(normalizeDealHunterScoreEvidenceRow);
+      },
+
+      async listDealHunterOpportunityScores({
+        view = 'needs-review', page = 1, pageSize = 25, search = '', sort = 'fit-score', direction = 'desc',
+        minScore = null, confidence = '', priority = '', state = '',
+      } = {}) {
+        const safePage = Math.max(1, Math.min(Number(page) || 1, 10000));
+        const safePageSize = Math.max(1, Math.min(Number(pageSize) || 25, 100));
+        const clauses = [];
+        const params = [];
+
+        // Dismissal stays owned by the existing disposition record rather than
+        // being duplicated as another state column on the score row.
+        const dismissedJoin = `
+          LEFT JOIN deal_hunter_dispositions AS disposition
+            ON disposition.deal_key = scores.deal_key AND disposition.disposition = 'dismissed'
+        `;
+        if (view === 'dismissed') {
+          clauses.push('disposition.deal_key IS NOT NULL');
+        } else {
+          clauses.push('disposition.deal_key IS NULL');
+          if (view === 'needs-review') {
+            clauses.push('(scores.reviewed_at IS NULL OR scores.reviewed_fingerprint IS NULL OR scores.reviewed_fingerprint <> scores.score_fingerprint)');
+            clauses.push('scores.should_remove = 0');
+          } else if (view === 'high-priority') {
+            clauses.push("(scores.high_fit = 1 OR scores.operator_priority IN ('urgent', 'high'))");
+            clauses.push('scores.should_remove = 0');
+          } else if (view === 'watchlist') {
+            clauses.push("((scores.fit_score >= 60 AND scores.fit_score < 75) OR scores.operator_priority = 'watch')");
+            clauses.push('scores.should_remove = 0');
+          } else if (view === 'low-confidence') {
+            clauses.push("(scores.confidence = 'low' OR scores.contradiction_count > 0)");
+            clauses.push('scores.should_remove = 0');
+          }
+        }
+
+        const searchTerm = String(search || '').trim().toLowerCase();
+        if (searchTerm) {
+          clauses.push('(LOWER(COALESCE(scores.name, \'\')) LIKE ? OR LOWER(COALESCE(scores.deal_key, \'\')) LIKE ?)');
+          params.push(`%${searchTerm}%`, `%${searchTerm}%`);
+        }
+        if (Number.isFinite(Number(minScore)) && minScore !== null && minScore !== '') {
+          clauses.push('scores.fit_score >= ?');
+          params.push(Number(minScore));
+        }
+        if (confidence) {
+          clauses.push('scores.confidence = ?');
+          params.push(String(confidence));
+        }
+        if (priority) {
+          clauses.push('scores.operator_priority = ?');
+          params.push(String(priority));
+        }
+        if (state) {
+          clauses.push('UPPER(COALESCE(scores.state, \'\')) = ?');
+          params.push(String(state).toUpperCase());
+        }
+
+        const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+        const safeDirection = String(direction || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+        const sortColumns = {
+          'fit-score': 'scores.fit_score',
+          confidence: "CASE scores.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END",
+          completeness: 'scores.completeness_score',
+          'scored-at': 'scores.scored_at',
+          name: 'LOWER(COALESCE(scores.name, \'\'))',
+          changed: 'CASE WHEN scores.reviewed_fingerprint IS NULL OR scores.reviewed_fingerprint <> scores.score_fingerprint THEN 1 ELSE 0 END',
+        };
+        const sortColumn = sortColumns[String(sort || 'fit-score')] || sortColumns['fit-score'];
+        // opportunity_id is always the final key so pagination is stable when
+        // rows tie on the requested sort.
+        const orderBy = `ORDER BY ${sortColumn} ${safeDirection}, `
+          + "CASE scores.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC, "
+          + 'scores.opportunity_id ASC';
+
+        const total = Number(database.prepare(`
+          SELECT COUNT(*) AS total FROM deal_hunter_opportunity_scores AS scores ${dismissedJoin} ${where}
+        `).get(...params)?.total || 0);
+        const rows = database.prepare(`
+          SELECT scores.*, disposition.reason AS dismissed_reason, disposition.dismissed_at AS dismissed_at
+          FROM deal_hunter_opportunity_scores AS scores
+          ${dismissedJoin}
+          ${where}
+          ${orderBy}
+          LIMIT ? OFFSET ?
+        `).all(...params, safePageSize, (safePage - 1) * safePageSize).map(normalizeDealHunterOpportunityScoreRow);
+
+        return { rows, total, page: safePage, pageSize: safePageSize, totalPages: Math.max(1, Math.ceil(total / safePageSize)) };
       },
 
       async listDealHunterCrmReconciliationItems(runId, { limit = 5000 } = {}) {
