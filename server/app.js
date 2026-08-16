@@ -35,6 +35,7 @@ import { recordEmailEventsFromWebhook } from './services/emailEvents.js';
 import { getEmailReadiness } from './services/emailReadiness.js';
 import { sendAdminEmailTestEmail } from './services/delivery.js';
 import { checkReadiness } from './services/readiness.js';
+import { refreshOpportunityScores } from './services/dealHunterScoreStore.js';
 import {
   dealHunterCrmSyncConfirmation,
   auditDealHunterCrmIntegrity,
@@ -1226,10 +1227,15 @@ export function createApp() {
 
       let review = null;
       let reviewWarning = '';
+      let scoreRefresh = null;
       try {
-        review = await reviewDailyDeals({ reviewMode: requestedReviewMode });
+        const reviewed = await reviewDailyDeals({ reviewMode: requestedReviewMode, withScoredDeals: true });
+        review = reviewed.review;
         review.dailyEmailJob = await getDailyDealHunterJobStatus();
         review.emailReadiness = await getEmailReadiness();
+        // Persist scores for the listings this import produced. Fingerprint
+        // gating means unchanged opportunities cost nothing.
+        scoreRefresh = await refreshOpportunityScores({ deals: reviewed.scoredDeals, actor: session.username || 'admin' });
       } catch (error) {
         reviewWarning = `The export was imported, but scoring could not be refreshed: ${error.message}`;
       }
@@ -1238,6 +1244,7 @@ export function createApp() {
         success: true,
         import: result.import,
         review,
+        scoreRefresh: scoreRefresh ? { counts: scoreRefresh.counts, ok: scoreRefresh.ok } : null,
         summary: review?.importSummary || {
           importId: result.import?.id || '',
           reviewMode: requestedReviewMode,
@@ -1262,11 +1269,21 @@ export function createApp() {
         return;
       }
 
-      const review = await reviewDailyDeals({ reviewMode: 'full-backfill' });
+      const reviewed = await reviewDailyDeals({ reviewMode: 'full-backfill', withScoredDeals: true });
+      const review = reviewed.review;
       review.dailyEmailJob = await getDailyDealHunterJobStatus();
       review.emailReadiness = await getEmailReadiness();
       await getSourceHealth(undefined, { persistSnapshot: true, refresh: true, review });
-      response.json({ success: true, review, summary: review.importSummary });
+      const scoreRefresh = await refreshOpportunityScores({
+        deals: reviewed.scoredDeals,
+        actor: session.username || 'admin',
+      });
+      response.json({
+        success: true,
+        review,
+        summary: review.importSummary,
+        scoreRefresh: { counts: scoreRefresh.counts, ok: scoreRefresh.ok },
+      });
     }),
   );
 

@@ -6650,7 +6650,15 @@ async function buildDailyDealReview({ reviewMode = 'daily', dealOsImportId = '',
   return { review, scoredDeals, storage };
 }
 
-export async function reviewDailyDeals({ markSeen = false, reviewMode = 'daily', storage = getStorage() } = {}) {
+export async function reviewDailyDeals({
+  markSeen = false,
+  reviewMode = 'daily',
+  // Opt in to receive the scored listings alongside the review so a caller that
+  // needs both does not have to build the review a second time. Callers that
+  // omit it keep the existing return shape.
+  withScoredDeals = false,
+  storage = getStorage(),
+} = {}) {
   const result = await buildDailyDealReview({ reviewMode, storage });
   const automationStatus = await getCimAutomationStatus({ storage, config: getConfig() });
   const [requests, events] = await Promise.all([
@@ -6680,7 +6688,19 @@ export async function reviewDailyDeals({ markSeen = false, reviewMode = 'daily',
     await persistDealHunterHistory(result.storage, result.scoredDeals);
   }
 
-  return result.review;
+  return withScoredDeals ? { review: result.review, scoredDeals: result.scoredDeals } : result.review;
+}
+
+/**
+ * Canonical scored listings with their resolved opportunity identity.
+ *
+ * The daily review returns only its presentation shape; opportunity scoring
+ * needs the scored listings themselves. This is a thin accessor over the same
+ * review build rather than a second scoring path.
+ */
+export async function collectScoredOpportunities({ reviewMode = 'full-backfill', dealOsImportId = '', storage = getStorage() } = {}) {
+  const result = await buildDailyDealReview({ reviewMode, dealOsImportId, storage });
+  return { scoredDeals: result.scoredDeals, review: result.review };
 }
 
 function historyFilterValues(value, { format = 'preserve', aliases = {} } = {}) {
