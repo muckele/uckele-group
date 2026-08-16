@@ -11,6 +11,7 @@ const { createSqliteStorage } = await import('../server/storage/sqlite.js');
 const { fullRebuildConfirmation, refreshOpportunityScores, requestOpportunityScoreRefresh } =
   await import('../server/services/dealHunterScoreStore.js');
 const { createManualSubmission } = await import('../server/services/submissions.js');
+const { DEAL_SCORING_RULES_VERSION } = await import('../server/services/dealHunterScoringPolicy.js');
 
 function scoredDeal(overrides = {}) {
   const deal = {
@@ -287,7 +288,7 @@ test('a rescore emits one activity event only when the score actually moved', as
   assert.equal(initial.length, 1, 'exactly one event records the first scoring');
   assert.equal(moved.length, 1, 'exactly one event records the score moving');
   assert.notEqual(moved[0].metadata.previousFingerprint, moved[0].metadata.fingerprint);
-  assert.equal(moved[0].metadata.rulesVersion, 'deal-hunter-fit-v2');
+  assert.equal(moved[0].metadata.rulesVersion, DEAL_SCORING_RULES_VERSION);
   assert.ok(Array.isArray(moved[0].metadata.dimensionChanges));
   assert.ok(moved[0].metadata.dimensionChanges.some((change) => change.dimension === 'financial-fit'));
 });

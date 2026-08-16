@@ -14,6 +14,7 @@ const {
 } = await import('../server/services/dealHunterScoring.js');
 const {
   DEAL_SCORING_RULES_VERSION,
+  DEAL_SCORING_RULES_VERSION_PREVIOUS,
   dealScoreDimensionIds,
   dealScoreRules,
 } = await import('../server/services/dealHunterScoringPolicy.js');
@@ -64,8 +65,15 @@ function baseDeal(overrides = {}) {
 // the scorer into dimensions must not move a single score, status, or gate.
 // ---------------------------------------------------------------------------
 
-test('the frozen deal-hunter-fit-v2 corpus scores identically after decomposition', () => {
-  assert.equal(baseline.scoringRuleVersion, DEAL_SCORING_RULES_VERSION);
+// The baseline was captured under deal-hunter-fit-v2, before the scorer was
+// decomposed into dimensions and before the semantic matcher landed. Asserting
+// it case by case under the current rules version is the cross-version
+// compatibility claim: v2.1 corrects which keyword occurrences count, and no
+// case in this corpus contains negated or qualified language, so every score
+// must still reproduce exactly.
+test('the frozen deal-hunter-fit-v2 corpus scores identically under the current rules version', () => {
+  assert.equal(baseline.scoringRuleVersion, DEAL_SCORING_RULES_VERSION_PREVIOUS);
+  assert.equal(DEAL_SCORING_RULES_VERSION, 'deal-hunter-fit-v2.1');
   const corpus = buildScoringCorpus();
   assert.equal(corpus.length, baseline.caseCount);
   assert.equal(baseline.caseCount, 506);

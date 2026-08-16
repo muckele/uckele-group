@@ -7,7 +7,12 @@
 // new rules version, never under `deal-hunter-fit-v2`.
 
 export const DEAL_SCORING_ENGINE_VERSION = 'deal-scoring-engine-v1';
-export const DEAL_SCORING_RULES_VERSION = 'deal-hunter-fit-v2';
+// v2.1 corrects semantic matching only: negated positives no longer score,
+// favorable qualifiers no longer draw risk penalties. No weight, threshold,
+// gate, band or arithmetic changed. A result produced under v2 and one produced
+// under v2.1 are distinguishable in storage, which is why the version moves.
+export const DEAL_SCORING_RULES_VERSION = 'deal-hunter-fit-v2.1';
+export const DEAL_SCORING_RULES_VERSION_PREVIOUS = 'deal-hunter-fit-v2';
 export const DEAL_SCORING_PROFILE_VERSION = 'deal-hunter-profile-v1';
 export const DEAL_COMPLETENESS_POLICY_VERSION = 'deal-hunter-completeness-v1';
 

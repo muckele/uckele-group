@@ -11,6 +11,7 @@
 
 import { createHash } from 'node:crypto';
 import { scoreDeal } from './dealHunter.js';
+import { DEAL_SEMANTIC_MATCHER_VERSION } from './dealHunterSemanticMatcher.js';
 import {
   DEAL_COMPLETENESS_POLICY_VERSION,
   DEAL_SCORING_ENGINE_VERSION,
@@ -74,6 +75,9 @@ export function dealScoreFingerprintInput(deal = {}) {
     rulesVersion: DEAL_SCORING_RULES_VERSION,
     profileVersion: DEAL_SCORING_PROFILE_VERSION,
     completenessPolicyVersion: DEAL_COMPLETENESS_POLICY_VERSION,
+    // The matcher decides which keyword occurrences count, so its version is a
+    // scoring input: a matcher change must stale every stored fingerprint.
+    matcherVersion: DEAL_SEMANTIC_MATCHER_VERSION,
   };
 }
 
@@ -305,6 +309,10 @@ export function scoreOpportunity(deal = {}) {
     rulesVersion: DEAL_SCORING_RULES_VERSION,
     profileVersion: DEAL_SCORING_PROFILE_VERSION,
     completenessPolicyVersion: DEAL_COMPLETENESS_POLICY_VERSION,
+    matcherVersion: DEAL_SEMANTIC_MATCHER_VERSION,
+    // Keyword occurrences the matcher declined to count, with the reason. These
+    // explain why a listing that mentions a term did not score for it.
+    suppressedMatches: state.finalized?.semantic?.suppressed || [],
     fingerprint: dealScoreFingerprint(deal),
     scoredDeal: scored,
   };

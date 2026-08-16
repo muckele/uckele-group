@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
+import { matchDealNarrative } from './dealHunterSemanticMatcher.js';
 import { getStorage } from '../storage/index.js';
 import { sha256, signPayload, verifySignedPayload } from '../utils/security.js';
 import { strFromU8, unzipSync } from 'fflate';
@@ -874,24 +875,20 @@ function dealCompleteness(deal = {}) {
 }
 
 export function scoreDeal(deal, ledger = null) {
+  const semantic = matchDealNarrative(deal.fullText, profile);
   // The ledger is an optional observer used by the scoring service to explain a
   // score. Anything that is not a ledger is ignored, so passing this function
   // directly as an array callback cannot corrupt scoring.
   const record = ledger && typeof ledger.baseline === 'function' ? ledger : null;
   const completeness = dealCompleteness(deal);
   const matches = {
+    // Category gates keep raw substring matching. Suppressing a gate would
+    // admit a disqualified listing, which is the expensive error; a false gate
+    // is merely reviewable.
     excluded: containsAny(deal.fullText, profile.excludedKeywords),
-    preferred: containsAny(deal.fullText, profile.preferredKeywords),
-    recurring: containsAny(deal.fullText, profile.recurringRevenueKeywords),
-    commercial: containsAny(deal.fullText, profile.commercialCustomerKeywords),
-    recession: containsAny(deal.fullText, profile.recessionProofKeywords),
-    aiProof: containsAny(deal.fullText, profile.aiProofKeywords),
-    management: containsAny(deal.fullText, profile.managementKeywords),
-    capex: containsAny(deal.fullText, profile.capexKeywords),
-    financeable: containsAny(deal.fullText, profile.financeableKeywords),
-    ownerDependency: containsAny(deal.fullText, profile.ownerDependencyRiskKeywords),
-    concentrationRisk: containsAny(deal.fullText, profile.customerConcentrationRiskKeywords),
-    financialRisk: containsAny(deal.fullText, profile.financialRiskKeywords),
+    // Every other family is matched semantically: a term still matches wherever
+    // it matched before unless a documented rule suppresses that occurrence.
+    ...semantic.matches,
   };
   const strengths = [];
   const concerns = [];
@@ -1133,7 +1130,7 @@ export function scoreDeal(deal, ledger = null) {
 
   score = applyScoreCaps(score, scoreCaps, concerns);
   score = Math.max(0, Math.min(100, Math.round(score)));
-  record?.finalize({ caps: scoreCaps, score, completeness, removeReasons });
+  record?.finalize({ caps: scoreCaps, score, completeness, removeReasons, semantic });
   const shouldRemove = removeReasons.length > 0 || score < 45;
   const highFit = !shouldRemove && score >= highFitScoreThreshold && deal.annualProfit !== null;
   const scoreStatus = completeness.evidenceConfidence === 'low'
