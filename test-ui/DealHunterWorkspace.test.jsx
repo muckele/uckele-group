@@ -181,6 +181,55 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     expect(onSyncHighFits).toHaveBeenCalledOnce();
   });
 
+  test('requires a reconciliation preview and blocks execution for ambiguous or unmapped rows', () => {
+    const onPreviewReconciliation = vi.fn();
+    const onExecuteReconciliation = vi.fn();
+    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    const importSummary = {
+      importId: 'import-261',
+      reviewMode: 'full-backfill',
+      importedRows: 261,
+      canonicalImportRecords: 254,
+      canonicalListings: 250,
+      fieldCoverage: { totalRecords: 254, fields: [] },
+    };
+    const { rerender } = render(
+      <DealHunterWorkspace
+        feedback={{ error: '', message: '' }}
+        importSummary={importSummary}
+        onExecuteReconciliation={onExecuteReconciliation}
+        onPreviewReconciliation={onPreviewReconciliation}
+        onReview={vi.fn()}
+        reconciliation={{ preview: null, busy: false }}
+        review={review}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Build preview' }));
+    expect(onPreviewReconciliation).toHaveBeenCalledOnce();
+    expect(screen.getByRole('button', { name: 'Execute exact plan' })).toBeDisabled();
+
+    rerender(
+      <DealHunterWorkspace
+        feedback={{ error: '', message: '' }}
+        importSummary={importSummary}
+        onExecuteReconciliation={onExecuteReconciliation}
+        onPreviewReconciliation={onPreviewReconciliation}
+        onReview={vi.fn()}
+        reconciliation={{
+          busy: false,
+          preview: {
+            counts: { acceptedRows: 261, mappedSourceRows: 260, unmappedSourceRows: 1, ambiguous: 1, create: 248, update: 2, mutable: 250 },
+            items: [{ scoringRuleVersion: 'deal-hunter-fit-v2' }],
+          },
+        }}
+        review={review}
+      />,
+    );
+    expect(screen.getByText(/Execution is blocked/)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Execute exact plan' })).toBeDisabled();
+    expect(onExecuteReconciliation).not.toHaveBeenCalled();
+  });
+
   test('makes the required coverage field actionable instead of silently disabling import', () => {
     const file = new File(['Listing,Listing URL\nHVAC,https://broker.example/hvac'], 'marketplace-export.csv', {
       type: 'text/csv',

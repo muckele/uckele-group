@@ -37,6 +37,9 @@ import { sendAdminEmailTestEmail } from './services/delivery.js';
 import { checkReadiness } from './services/readiness.js';
 import {
   dealHunterCrmSyncConfirmation,
+  auditDealHunterCrmIntegrity,
+  executeDealOsCrmReconciliation,
+  previewDealOsCrmReconciliation,
   reviewDailyDeals,
   importDealOsExport,
   runCimStage2Automation,
@@ -281,6 +284,29 @@ function publicSecureUploadRequest(requestRecord) {
     closed_at: requestRecord.closed_at || '',
     upload_batch_count: Number(requestRecord.upload_batch_count || 0),
   };
+}
+
+// The reconciliation plan is executed whole server-side; the response only has
+// to stay small enough to render, so item bounding belongs here rather than in
+// the plan itself. `dealsByOpportunity` is an in-process carry-over.
+const reconciliationPreviewItemLimit = 1000;
+
+function boundedReconciliationPlan(plan) {
+  if (!plan || typeof plan !== 'object' || !Array.isArray(plan.items)) return plan;
+  const { dealsByOpportunity: _carriedDeals, ...rest } = plan;
+  return {
+    ...rest,
+    items: plan.items.slice(0, reconciliationPreviewItemLimit),
+    itemsTruncated: plan.items.length > reconciliationPreviewItemLimit,
+  };
+}
+
+function boundedReconciliationPreview(result) {
+  if (!result || typeof result !== 'object') return result;
+  const bounded = boundedReconciliationPlan(result);
+  return bounded.preview && typeof bounded.preview === 'object'
+    ? { ...bounded, preview: boundedReconciliationPlan(bounded.preview) }
+    : bounded;
 }
 
 export function createApp() {
@@ -1193,8 +1219,12 @@ export function createApp() {
         import: result.import,
         review,
         summary: review?.importSummary || {
+          importId: result.import?.id || '',
           reviewMode: requestedReviewMode,
-          importedRows: Number(result.import?.rowCount || 0),
+          importedRows: Number(result.import?.acceptedRowCount ?? result.import?.rowCount ?? 0),
+          sourceRows: Number(result.import?.sourceRowCount ?? result.import?.rowCount ?? 0),
+          rejectedRows: Number(result.import?.rejectedRowCount || 0),
+          canonicalImportRecords: Number(result.import?.canonicalRecordCount ?? result.import?.rowCount ?? 0),
           withinFileDuplicates: Number(result.import?.duplicateCount || 0),
           fieldCoverage: result.import?.fieldCoverage || { totalRecords: 0, fields: [] },
         },
@@ -1217,6 +1247,57 @@ export function createApp() {
       review.emailReadiness = await getEmailReadiness();
       await getSourceHealth(undefined, { persistSnapshot: true, refresh: true, review });
       response.json({ success: true, review, summary: review.importSummary });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/crm-reconciliation/preview',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await previewDealOsCrmReconciliation({
+        importId: request.body?.importId || '',
+        requestedBy: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400))
+        .json({ success: Boolean(result.ok), ...boundedReconciliationPreview(result) });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/crm-reconciliation/execute',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await executeDealOsCrmReconciliation({
+        importId: request.body?.importId || '',
+        planDigest: request.body?.planDigest || '',
+        previewGeneratedAt: request.body?.previewGeneratedAt || '',
+        expectedOpportunityIds: request.body?.expectedOpportunityIds || [],
+        confirmation: request.body?.confirmation || '',
+        requestedBy: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400))
+        .json({ success: Boolean(result.ok), ...boundedReconciliationPreview(result) });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/crm-integrity-audit',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const audit = await auditDealHunterCrmIntegrity();
+      response.status(audit.ok ? 200 : 409).json({ success: audit.ok, audit });
     }),
   );
 

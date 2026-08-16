@@ -188,8 +188,9 @@ function ImportReviewSummary({ summary }) {
   const fieldCoverage = summary.fieldCoverage?.fields || [];
   const missingContext = fieldCoverage.filter((field) => ['industry', 'description', 'brokerEmail'].includes(field.key) && field.percent < 100);
   const stats = [
-    ['Imported', summary.importedRows],
-    ['Canonical', summary.canonicalListings],
+    ['Accepted rows', summary.importedRows],
+    ['Import canonical', summary.canonicalImportRecords],
+    ['Cross-source canonical', summary.canonicalListings],
     ['Duplicates collapsed', Number(summary.withinFileDuplicates || 0) + Number(summary.collapsedDuplicates || 0)],
     ['Scored', summary.scoredListings],
     ['High fit', summary.highFitListings],
@@ -199,8 +200,36 @@ function ImportReviewSummary({ summary }) {
   return (
     <section aria-label="Latest Deal OS import summary" className="rounded-2xl border border-sky-200 bg-sky-50/55 p-5">
       <div className="flex flex-wrap items-center gap-2"><strong>Latest import result</strong><Pill>{summary.reviewMode === 'full-backfill' ? 'Full backfill' : 'Daily review'}</Pill></div>
-      <dl className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-6">{stats.map(([statLabel, value]) => <div className="rounded-xl border border-sky-100 bg-white p-3" key={statLabel}><dt className="text-xs font-semibold uppercase tracking-[0.1em] text-ink/55">{statLabel}</dt><dd className="mt-1 text-xl font-semibold text-ink">{Number(value || 0)}</dd></div>)}</dl>
+      <dl className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-7">{stats.map(([statLabel, value]) => <div className="rounded-xl border border-sky-100 bg-white p-3" key={statLabel}><dt className="text-xs font-semibold uppercase tracking-[0.1em] text-ink/55">{statLabel}</dt><dd className="mt-1 text-xl font-semibold text-ink">{Number(value || 0)}</dd></div>)}</dl>
       {missingContext.length > 0 ? <p className="mt-4 text-sm leading-6 text-amber-900"><strong>Export field coverage:</strong> {missingContext.map((field) => `${field.label} ${field.present}/${summary.fieldCoverage.totalRecords}`).join(' · ')}. Missing fields remain visibly undisclosed and are not inferred from third-party pages.</p> : null}
+    </section>
+  );
+}
+
+function CrmReconciliationPanel({ summary, reconciliation, busy, readOnly, onPreview, onExecute }) {
+  if (!summary?.importId || readOnly) return null;
+  const preview = reconciliation?.preview;
+  const counts = preview?.counts || {};
+  const blocked = Number(counts.unmappedSourceRows || 0) > 0 || Number(counts.ambiguous || 0) > 0;
+  return (
+    <section aria-label="Deal OS CRM reconciliation" className="rounded-2xl border border-moss/20 bg-moss/5 p-5">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+        <div>
+          <div className="flex flex-wrap items-center gap-2"><strong>Canonical CRM reconciliation</strong><Pill>{preview ? 'Preview ready' : 'Preview required'}</Pill></div>
+          <p className="mt-2 max-w-3xl text-sm leading-6 text-ink/68">Maps every accepted CSV row to its canonical opportunity, preserves CRM tombstones, and creates non-actionable <em>sourced</em> records below the outreach threshold. Previewing sends no messages and changes no CRM records.</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button className={secondaryButton} disabled={busy} onClick={onPreview} type="button"><RefreshCw className={reconciliation?.busy ? 'h-4 w-4 animate-spin' : 'h-4 w-4'} />{preview ? 'Refresh preview' : 'Build preview'}</button>
+          <button className={primaryButton} disabled={busy || !preview || blocked || Number(counts.mutable || 0) === 0} onClick={onExecute} type="button"><Upload className="h-4 w-4" />Execute exact plan</button>
+        </div>
+      </div>
+      {preview ? <>
+        <dl className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+          {[['Create', counts.create], ['Update', counts.update], ['Unchanged', counts.unchanged], ['Tombstoned', counts.tombstoned], ['Ambiguous', counts.ambiguous], ['Field conflicts', counts.conflicts]].map(([key, value]) => <div className="rounded-xl border border-moss/10 bg-white p-3" key={key}><dt className="text-xs font-semibold uppercase tracking-[0.1em] text-ink/55">{key}</dt><dd className="mt-1 text-xl font-semibold text-ink">{Number(value || 0)}</dd></div>)}
+        </dl>
+        <p className="mt-4 text-sm leading-6 text-ink/68">{counts.mappedSourceRows || 0}/{counts.acceptedRows || 0} accepted source rows mapped · {counts.actionable || 0} actionable · {counts.sourced || 0} sourced/non-actionable · scoring rule {preview.items?.[0]?.scoringRuleVersion || 'current'}.</p>
+        {blocked ? <p className="mt-3 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">Execution is blocked until {counts.unmappedSourceRows || 0} unmapped source row(s) and {counts.ambiguous || 0} ambiguous canonical identity item(s) are resolved.</p> : null}
+      </> : null}
     </section>
   );
 }
@@ -491,10 +520,10 @@ function CimApprovalQueue({ review, readOnly, actionsDisabled = false, sending, 
 
 export default function DealHunterWorkspace({
   review, importSummary, loading, sending, importingDealOs, crmSyncing, bulkSending, followUpRunning, requestingCimDealKey, dismissingDealKey, feedback = {}, readOnly,
-  emailTestSending, onReview, onRunFullBackfill, onImportDealOs, onOpenApprovals, onSendReady, onRunFollowUps, onSendEmail, onSyncHighFits, onSendCimRequest, onSendEmailTest, onRecordCimOutcome, onDismissDeal, onResolveIdentityException,
+  reconciliation, emailTestSending, onReview, onRunFullBackfill, onImportDealOs, onPreviewReconciliation, onExecuteReconciliation, onOpenApprovals, onSendReady, onRunFollowUps, onSendEmail, onSyncHighFits, onSendCimRequest, onSendEmailTest, onRecordCimOutcome, onDismissDeal, onResolveIdentityException,
 }) {
   const [selectedDeal, setSelectedDeal] = useState(null);
-  const busy = loading || sending || importingDealOs || crmSyncing || bulkSending || followUpRunning;
+  const busy = loading || sending || importingDealOs || crmSyncing || reconciliation?.busy || bulkSending || followUpRunning;
   const emailReadiness = review?.emailReadiness;
   const outboundReady = emailReadiness ? emailReadiness.outboundConfigured : true;
   const followUpsSafe = (emailReadiness ? emailReadiness.followUpsSafe : true)
@@ -520,6 +549,7 @@ export default function DealHunterWorkspace({
         </div>
         {feedback.error ? <p className="mt-5 rounded-2xl border border-red-200 bg-red-50 p-4 text-sm text-red-700" role="alert">{feedback.error}</p> : null}{feedback.message ? <p className="mt-5 rounded-2xl border border-moss/20 bg-moss/8 p-4 text-sm text-moss" role="status">{feedback.message}</p> : null}
         {!readOnly ? <DealOsImportPanel importing={importingDealOs} onImport={onImportDealOs} policy={review?.dealOsImportPolicy} /> : null}
+        <div className="mt-7"><CrmReconciliationPanel busy={busy} onExecute={onExecuteReconciliation} onPreview={onPreviewReconciliation} readOnly={readOnly} reconciliation={reconciliation} summary={importSummary || review?.importSummary} /></div>
         {review ? <div className="mt-7 space-y-7"><ImportReviewSummary summary={importSummary || review.importSummary} />{unavailableSources.length > 0 ? <p className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-900" role="alert"><strong>Partial review.</strong> {unavailableSources.map((source) => source.name).join(', ')} {unavailableSources.length === 1 ? 'is' : 'are'} unavailable, so totals and candidates cover only successfully imported sources. Daily email, CRM sync, and new CIM outreach are paused until every source succeeds.</p> : null}{review.coverageWarnings?.length ? <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-900" role="alert"><strong>Limited source coverage.</strong><ul className="mt-2 list-disc space-y-1 pl-5">{review.coverageWarnings.map((warning) => <li key={warning}>{warning}</li>)}</ul></div> : null}{review.identityExceptions?.length ? <section className="rounded-2xl border border-red-200 bg-red-50 p-5" aria-label="CIM identity exceptions"><div className="flex flex-wrap items-center gap-2"><strong className="text-red-900">Identity ambiguous—manual resolution required</strong><Pill tone="danger">{review.identityExceptions.length}</Pill></div><p className="mt-2 text-sm leading-6 text-red-900/80">New outreach remains blocked for these listings. Compare the bounded evidence, then deliberately link to a candidate or keep the listing distinct.</p><div className="mt-4 space-y-3">{review.identityExceptions.map((item) => <details className="rounded-xl border border-red-200 bg-white p-3" key={item.id}><summary className="cursor-pointer text-sm font-semibold text-ink">{item.observedName || 'Unnamed opportunity'} · {item.reason}</summary><p className="mt-2 text-xs text-ink/62">Evidence {item.evidenceVersion} · recipient {item.observedRecipient || 'not set'}</p><div className="mt-3 flex flex-wrap gap-2">{item.candidateOpportunityIds.map((opportunityId) => <button className={secondaryButton} disabled={readOnly || busy} key={opportunityId} onClick={() => onResolveIdentityException(item, { action: 'link', opportunityId })} type="button">Link to {opportunityId.slice(0, 16)}…</button>)}<button className={secondaryButton} disabled={readOnly || busy} onClick={() => onResolveIdentityException(item, { action: 'keep-distinct', opportunityId: '' })} type="button">Keep distinct</button></div></details>)}</div>{readOnly ? <p className="mt-3 text-sm font-semibold text-red-900/75">Read-only users cannot resolve identity exceptions.</p> : null}</section> : null}<CimApprovalQueue actionsDisabled={!sourceReviewComplete} onOpenDeal={setSelectedDeal} onSendApproved={onSendReady} readOnly={readOnly} review={review} sending={bulkSending} />{review.cimAutomation ? <section className="rounded-2xl border border-line bg-fog/70 p-5"><div className="flex flex-wrap items-center gap-2"><strong>CIM automation</strong><Pill tone={review.cimAutomation.automaticTransmissionAllowed ? 'success' : 'danger'}>Automatic transmission {review.cimAutomation.automaticTransmissionAllowed ? 'allowed' : 'blocked'}</Pill><Pill>Configured {review.cimAutomation.configuredStage || 1}</Pill><Pill>Evidence {review.cimAutomation.evidenceStage || 1}</Pill><Pill>Effective {review.cimAutomation.effectiveStage || 1}</Pill><Pill>Activation {review.cimAutomation.activationMode || 'off'}</Pill><Pill>{review.cimAutomation.metrics?.canonicalHumanReviews || 0} canonical reviews</Pill><Pill>{review.cimAutomation.metrics?.remainingStage2Reviews ?? 0} still required</Pill></div><p className="mt-3 text-sm text-ink/68">Source review, internal daily summary, and this preview perform zero automatic provider work. Stage 2 broker transmission is owned by the separate durable runner and activation workflow.</p>{review.cimAutomation.run?.exceptions?.length ? <details className="mt-3"><summary className="cursor-pointer text-sm font-semibold text-ink">{review.cimAutomation.run.exceptions.length} preview exception(s) require review</summary><ul className="mt-3 space-y-2 text-sm text-ink/70">{review.cimAutomation.run.exceptions.slice(0, 25).map((item) => <li className="rounded-xl border border-line bg-white p-3" key={`exception-${item.dealKey}`}><strong>{item.name}</strong><p className="mt-1">{item.reasons.join(' · ')}</p></li>)}</ul></details> : null}</section> : null}<EmailReadinessPanel data={emailReadiness} onSendTest={readOnly ? undefined : onSendEmailTest} testSending={emailTestSending} /><div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-7"><Stat icon={ClipboardList} label="Reviewed" value={review.totals?.reviewedDeals || 0} /><Stat icon={BellRing} label="New Fits" value={review.totals?.newMatches || 0} tone="warning" /><Stat icon={MailCheck} label="High Fit" value={review.totals?.qualified || 0} tone="warning" /><Stat icon={Send} label="CIM Ready" value={review.totals?.cimReady || 0} tone="warning" /><Stat icon={Inbox} label="Watchlist" value={review.totals?.watchlist || 0} /><Stat icon={ShieldAlert} label="Remove" value={review.totals?.removalCandidates || 0} tone="danger" /><Stat icon={CalendarClock} label="Lookback" value={review.reviewMode === 'full-backfill' ? 'All' : `${review.lookbackDays || 0}d`} /></div>
           {review.dailyEmailJob ? <div className="rounded-2xl border border-line bg-fog/70 p-4 text-sm text-ink/72"><p><strong>Today&apos;s daily email:</strong> {label(review.dailyEmailJob.status)} · attempt {review.dailyEmailJob.attempt_count || 1}{review.dailyEmailJob.completed_at ? ` · completed ${dateTime(review.dailyEmailJob.completed_at)}` : ''}</p>{review.dailyEmailJob.last_error ? <p className="mt-2 text-red-700">{review.dailyEmailJob.last_error}</p> : null}</div> : null}
           <div className="grid gap-4 lg:grid-cols-2"><div className="rounded-2xl border border-line bg-fog/70 p-5"><SectionLabel>Sources</SectionLabel><div className="mt-4 space-y-3">{[...(review.sources || []), ...(review.disabledSources || [])].map((source) => <DealSourceStatus key={source.id} source={source} />)}</div></div><div className="rounded-2xl border border-line bg-white/70 p-5"><SectionLabel>Criteria Notes</SectionLabel>{review.criteriaRecommendations?.length ? <ul className="mt-4 list-disc space-y-2 pl-5 text-sm leading-7 text-ink/74">{review.criteriaRecommendations.map((item) => <li key={item}>{item}</li>)}</ul> : <p className="mt-4 text-sm text-ink/68">No criteria changes recommended.</p>}</div></div>

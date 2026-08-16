@@ -30,7 +30,7 @@ import {
   updateSecureDocumentCleanupJobState,
 } from './secureDocumentCleanupState.js';
 
-const allowedStatuses = ['new', 'review', 'contacted', 'archived', 'spam'];
+const allowedStatuses = ['sourced', 'new', 'review', 'contacted', 'archived', 'spam'];
 const turnstileTokenMaxLength = 2048;
 const cleanupWriteAheadGraceMs = secureDocumentCleanupSettlementMs;
 const cleanupLeaseMs = secureDocumentCleanupSettlementMs;
@@ -1055,6 +1055,7 @@ export async function createManualSubmission(body, adminUsername = '', options =
     created_at: now,
     updated_at: now,
     status,
+    deal_hunter_opportunity_id: normalizeField(body.deal_hunter_opportunity_id, 200) || null,
     status_updated_at: now,
     spam_score: 0,
     spam_reasons: [],
@@ -1094,7 +1095,9 @@ export async function createManualSubmission(body, adminUsername = '', options =
     assigned_to: normalizeField(body.assigned_to, 120) || config.workflow.defaultAssignee,
     notes,
     follow_up_state: normalizeFollowUpState(body.follow_up_state, workflowDefaults.followUpState),
-    next_action_at: normalizeField(body.next_action_at, 80) || workflowDefaults.nextActionAt,
+    next_action_at: status === 'sourced' || normalizeFollowUpState(body.follow_up_state, workflowDefaults.followUpState) === 'completed'
+      ? null
+      : normalizeField(body.next_action_at, 80) || workflowDefaults.nextActionAt,
     last_contacted_at: status === 'contacted' ? now : null,
     metadata: {
       ...metadata,

@@ -512,3 +512,35 @@ test('CRM lookup does not reuse a same-name listing when geography conflicts', a
 
   assert.equal(existing, null);
 });
+
+test('canonical merge preserves field provenance and records deterministic non-identity conflicts', () => {
+  const shared = {
+    name: 'Commercial Fire Safety Inspection Co',
+    industry: 'Fire safety inspection',
+    description: '',
+    state: 'CA',
+    location: 'CA',
+    annualProfit: 400000,
+    annualRevenue: 1500000,
+    askingPrice: 1200000,
+    fullText: 'Commercial Fire Safety Inspection Co CA',
+    brokerContacts: [],
+  };
+  const [canonical] = dedupeDeals([
+    { ...shared, id: 'daily-1', sourceId: 'daily-deal-update', sourceName: 'Daily Deal Update', sourceMode: 'csv', netMargin: 20 },
+    { ...shared, id: 'deal-os-1', sourceId: 'deal-os-export', sourceName: 'SMB Deal OS export', sourceMode: 'manual-export', netMargin: 30 },
+  ]);
+
+  assert.equal(canonical.netMargin, 20);
+  assert.equal(canonical.fieldProvenance.netMargin.sourceId, 'daily-deal-update');
+  assert.equal(canonical.fieldConflicts.length, 1);
+  assert.deepEqual(canonical.fieldConflicts[0], {
+    field: 'netMargin',
+    canonicalValue: 20,
+    observedValue: 30,
+    canonicalSource: canonical.fieldConflicts[0].canonicalSource,
+    observedSource: canonical.fieldConflicts[0].observedSource,
+    resolution: 'preserved-canonical',
+  });
+  assert.equal(canonical.fieldConflicts[0].observedSource.sourceId, 'deal-os-export');
+});

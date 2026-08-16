@@ -43,6 +43,10 @@ const cimStage2MigrationUrl = new URL(
   '../supabase/migrations/20260813120000_cim_stage2_guarded_rollout.sql',
   import.meta.url,
 );
+const crmReconciliationMigrationUrl = new URL(
+  '../supabase/migrations/20260814120000_deal_os_crm_reconciliation.sql',
+  import.meta.url,
+);
 
 function currentAppTables(schema) {
   return Array.from(
@@ -144,7 +148,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const adminOnboardingMigration = fs.readFileSync(adminOnboardingMigrationUrl, 'utf8');
   const cimIdentityMigration = fs.readFileSync(cimIdentityMigrationUrl, 'utf8');
   const cimStage2Migration = fs.readFileSync(cimStage2MigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}`;
+  const crmReconciliationMigration = fs.readFileSync(crmReconciliationMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
@@ -158,6 +163,7 @@ test('Supabase migration and fresh schema isolate every current app table to the
   assert.doesNotMatch(adminOnboardingMigration, /create\s+policy/i, 'onboarding preference table must not add public RLS policies');
   assert.doesNotMatch(cimIdentityMigration, /create\s+policy/i, 'canonical CIM identity tables must not add public RLS policies');
   assert.doesNotMatch(cimStage2Migration, /create\s+policy/i, 'Stage 2 authorization tables must not add public RLS policies');
+  assert.doesNotMatch(crmReconciliationMigration, /create\s+policy/i, 'CRM reconciliation tables must not add public RLS policies');
   assertServerOnlyPrivileges(migration, 'forward migration');
   assert.match(analyticsMigration, /revoke all privileges on table public\.analytics_events from public, anon, authenticated;/i);
   assert.match(analyticsMigration, /grant all privileges on table public\.analytics_events to service_role;/i);
@@ -189,6 +195,16 @@ test('Supabase migration and fresh schema isolate every current app table to the
   assert.match(adminOnboardingMigration, /array_position\(p_step_ids,\s*excluded\.last_completed_step_id\)/i);
   assertServiceRoleOnlyFunction(adminOnboardingMigration, 'admin onboarding migration', 'upsert_admin_onboarding_progress');
   assertServiceRoleOnlyFunction(schema, 'fresh schema', 'upsert_admin_onboarding_progress');
+  for (const tableName of ['deal_hunter_crm_reconciliation_runs', 'deal_hunter_crm_reconciliation_items']) {
+    assert.match(crmReconciliationMigration, new RegExp(`revoke all privileges on table public\\.${tableName} from public, anon, authenticated;`, 'i'));
+    assert.match(crmReconciliationMigration, new RegExp(`grant all privileges on table public\\.${tableName} to service_role;`, 'i'));
+  }
+  assertServiceRoleOnlyFunction(crmReconciliationMigration, 'CRM reconciliation migration', 'start_deal_hunter_crm_reconciliation');
+  assertServiceRoleOnlyFunction(crmReconciliationMigration, 'CRM reconciliation migration', 'link_deal_hunter_crm_submission');
+  assert.match(crmReconciliationMigration, /select deal_hunter_opportunity_id[\s\S]*for update/i);
+  assert.match(crmReconciliationMigration, /CRM submission already belongs to another canonical opportunity/i);
+  assertServiceRoleOnlyFunction(schema, 'fresh schema', 'start_deal_hunter_crm_reconciliation');
+  assertServiceRoleOnlyFunction(schema, 'fresh schema', 'link_deal_hunter_crm_submission');
   for (const tableName of [
     'deal_hunter_opportunities',
     'deal_hunter_opportunity_aliases',

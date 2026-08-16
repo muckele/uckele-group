@@ -251,6 +251,7 @@ function normalizeDealHunterDealOsImportRow(row) {
         ...row,
         coverage_limit_reached: Boolean(row.coverage_limit_reached),
         records: Array.isArray(row.records) ? row.records : [],
+        row_accounting: Array.isArray(row.row_accounting) ? row.row_accounting : [],
         metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
       }
     : null;
@@ -281,6 +282,29 @@ function normalizeDealHunterCrmImportRow(row) {
   return row
     ? {
         ...row,
+        metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
+      }
+    : null;
+}
+
+function normalizeDealHunterCrmReconciliationRunRow(row) {
+  return row
+    ? {
+        ...row,
+        counts: typeof row.counts === 'object' && row.counts !== null ? row.counts : {},
+        plan: typeof row.plan === 'object' && row.plan !== null ? row.plan : {},
+        results: typeof row.results === 'object' && row.results !== null ? row.results : {},
+        metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
+      }
+    : null;
+}
+
+function normalizeDealHunterCrmReconciliationItemRow(row) {
+  return row
+    ? {
+        ...row,
+        source_row_numbers: Array.isArray(row.source_row_numbers) ? row.source_row_numbers : [],
+        planned_changes: typeof row.planned_changes === 'object' && row.planned_changes !== null ? row.planned_changes : {},
         metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
       }
     : null;
@@ -668,7 +692,17 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     return count || 0;
   }
 
-  async function getDealHunterCrmImportRecord({ id = '', dealKey = '', listingIdentity = '' } = {}) {
+  async function getDealHunterCrmImportRecord({ id = '', opportunityId = '', dealKey = '', listingIdentity = '' } = {}) {
+    if (opportunityId) {
+      const { data, error } = await client
+        .from('deal_hunter_crm_imports')
+        .select('*')
+        .eq('opportunity_id', opportunityId)
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      if (data) return normalizeDealHunterCrmImportRow(data);
+    }
     if (id) {
       const { data, error } = await client
         .from('deal_hunter_crm_imports')
@@ -2113,6 +2147,17 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterDealOsImportRow(data);
     },
 
+    async getDealHunterDealOsImport(id) {
+      const { data, error } = await client
+        .from('deal_hunter_deal_os_imports')
+        .select('*')
+        .eq('id', String(id || '').trim())
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeDealHunterDealOsImportRow(data);
+    },
+
     async listDealHunterDealOsImports({ limit = 25 } = {}) {
       const { data, error } = await client
         .from('deal_hunter_deal_os_imports')
@@ -2326,8 +2371,28 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return Number(count || 0);
     },
 
-    async getDealHunterCrmImport({ id = '', dealKey = '', listingIdentity = '' } = {}) {
-      return getDealHunterCrmImportRecord({ id, dealKey, listingIdentity });
+    async getDealHunterCrmImport({ id = '', opportunityId = '', dealKey = '', listingIdentity = '' } = {}) {
+      return getDealHunterCrmImportRecord({ id, opportunityId, dealKey, listingIdentity });
+    },
+
+    async getDealHunterCanonicalCrmOwnershipHealth() {
+      const { data, error } = await client
+        .from('deal_hunter_crm_imports')
+        .select('opportunity_id')
+        .not('opportunity_id', 'is', null)
+        .neq('opportunity_id', '')
+        .limit(100000);
+      if (error) throw error;
+      const recordCounts = new Map();
+      for (const row of data || []) {
+        const opportunityId = String(row?.opportunity_id || '').trim();
+        if (!opportunityId) continue;
+        recordCounts.set(opportunityId, (recordCounts.get(opportunityId) || 0) + 1);
+      }
+      const collisions = [...recordCounts.entries()]
+        .filter(([, recordCount]) => recordCount > 1)
+        .map(([opportunityId, recordCount]) => ({ opportunityId, recordCount }));
+      return { healthy: collisions.length === 0, collisions };
     },
 
     async listDealHunterCrmImports({ limit = 5000 } = {}) {
@@ -2357,6 +2422,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
 
       const existingImport = await getDealHunterCrmImportRecord({
         id: safeRecord.id,
+        opportunityId: safeRecord.opportunity_id,
         dealKey: safeRecord.deal_key,
         listingIdentity: safeRecord.listing_identity,
       });
@@ -2402,6 +2468,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
             claimed: false,
             importRecord: await getDealHunterCrmImportRecord({
               id: existingImport.id,
+              opportunityId: safeRecord.opportunity_id,
               dealKey: safeRecord.deal_key,
               listingIdentity: safeRecord.listing_identity,
             }),
@@ -2445,6 +2512,60 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       }
 
       return normalizeDealHunterCrmImportRow(data);
+    },
+
+    async startDealHunterCrmReconciliationRun(run, items = []) {
+      const { data, error } = await client.rpc('start_deal_hunter_crm_reconciliation', {
+        p_run: run,
+        p_items: Array.isArray(items) ? items : [],
+      });
+      if (error) throw error;
+      return normalizeDealHunterCrmReconciliationRunRow(data);
+    },
+
+    async getDealHunterCrmReconciliationRun({ id = '', idempotencyKey = '' } = {}) {
+      let query = client.from('deal_hunter_crm_reconciliation_runs').select('*');
+      if (id) query = query.eq('id', id);
+      else if (idempotencyKey) query = query.eq('idempotency_key', idempotencyKey);
+      else return null;
+      const { data, error } = await query.limit(1).maybeSingle();
+      if (error) throw error;
+      return normalizeDealHunterCrmReconciliationRunRow(data);
+    },
+
+    async listDealHunterCrmReconciliationItems(runId, { limit = 5000 } = {}) {
+      const { data, error } = await client.from('deal_hunter_crm_reconciliation_items').select('*')
+        .eq('run_id', runId).order('opportunity_id').limit(Math.max(1, Math.min(Number(limit) || 5000, 100000)));
+      if (error) throw error;
+      return (data || []).map(normalizeDealHunterCrmReconciliationItemRow);
+    },
+
+    async updateDealHunterCrmReconciliationItem(id, values = {}) {
+      const allowed = ['status', 'submission_id', 'error', 'updated_at', 'metadata'];
+      const payload = Object.fromEntries(Object.entries(values).filter(([field]) => allowed.includes(field)));
+      const { data, error } = await client.from('deal_hunter_crm_reconciliation_items').update(payload)
+        .eq('id', id).select().single();
+      if (error) throw error;
+      return normalizeDealHunterCrmReconciliationItemRow(data);
+    },
+
+    async updateDealHunterCrmReconciliationRun(id, values = {}) {
+      const allowed = ['updated_at', 'completed_at', 'status', 'counts', 'results', 'last_error', 'metadata'];
+      const payload = Object.fromEntries(Object.entries(values).filter(([field]) => allowed.includes(field)));
+      const { data, error } = await client.from('deal_hunter_crm_reconciliation_runs').update(payload)
+        .eq('id', id).select().single();
+      if (error) throw error;
+      return normalizeDealHunterCrmReconciliationRunRow(data);
+    },
+
+    async linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt = '' } = {}) {
+      const { data, error } = await client.rpc('link_deal_hunter_crm_submission', {
+        p_opportunity_id: opportunityId,
+        p_submission_id: submissionId,
+        p_updated_at: updatedAt || new Date().toISOString(),
+      });
+      if (error) throw error;
+      return normalizeDealHunterOpportunityRow(data);
     },
 
     async getDealHunterOpportunity(opportunityId) {

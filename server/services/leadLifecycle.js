@@ -14,7 +14,7 @@ export const archiveReasons = [
   'other',
 ];
 
-const restoreStatuses = new Set(['new', 'review', 'contacted']);
+const restoreStatuses = new Set(['sourced', 'new', 'review', 'contacted']);
 
 function compactText(value, maxLength = 1000) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
@@ -139,7 +139,7 @@ export async function restoreLead({
 
   if (!existing) return { ok: false, status: 404, error: 'CRM record not found.' };
   if (existing.status !== 'archived') return { ok: false, status: 409, error: 'Only an archived lead can be restored.' };
-  if (!restoreStatuses.has(nextStatus)) return { ok: false, status: 400, error: 'Restore status must be new, review, or contacted.' };
+  if (!restoreStatuses.has(nextStatus)) return { ok: false, status: 400, error: 'Restore status must be sourced, new, review, or contacted.' };
 
   const now = new Date().toISOString();
   const expectedVersion = compactText(expectedUpdatedAt, 80) || existing.updated_at;

@@ -73,6 +73,27 @@ test('scoring qualifies durable recurring field-service deals as high fit', () =
   assert.equal(scored.shouldRemove, false);
   assert.ok(scored.score >= 75, `expected high-fit score, got ${scored.score}`);
   assert.equal(scored.concerns.some((concern) => /No explicit recurring/i.test(concern)), false);
+  assert.equal(scored.actionEligibility.highFit, true);
+  assert.equal(scored.scoringRuleVersion, 'deal-hunter-fit-v2');
+  assert.equal(scored.completenessPolicyVersion, 'deal-hunter-completeness-v1');
+});
+
+test('scoring records missing narrative as unknown instead of negative evidence', () => {
+  const deal = baseDeal({
+    industry: '',
+    description: '',
+    annualRevenue: null,
+    askingPrice: null,
+    yearsEstablished: null,
+  });
+  const scored = scoreDeal({ ...deal, fullText: [deal.name, deal.state].join(' ') });
+
+  assert.equal(scored.scoreStatus, 'provisional');
+  assert.equal(scored.evidenceConfidence, 'low');
+  assert.ok(scored.missingEvidence.includes('description'));
+  assert.equal(scored.concerns.some((concern) => /No explicit recurring/i.test(concern)), false);
+  assert.equal(scored.concerns.some((concern) => /Recurring or repeat revenue is unknown/i.test(concern)), true);
+  assert.equal(scored.actionEligibility.highFit, false);
 });
 
 test('scoring hard-removes excluded categories even with recurring revenue language', () => {

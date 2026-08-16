@@ -90,7 +90,7 @@ export default function CrmNavigation({ filters, total, totalPages, onChange, di
           Status
           <select className="form-control" onChange={(event) => onChange({ status: event.target.value, page: 1 })} value={filters.status}>
             <option value="all">All statuses</option>
-            {['new', 'review', 'contacted', 'archived', 'spam'].map((status) => (
+            {['sourced', 'new', 'review', 'contacted', 'archived', 'spam'].map((status) => (
               <option key={status} value={status}>{status[0].toUpperCase() + status.slice(1)}</option>
             ))}
           </select>

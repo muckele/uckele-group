@@ -273,6 +273,7 @@ function normalizeDealHunterDealOsImportRow(row) {
         ...row,
         coverage_limit_reached: Boolean(row.coverage_limit_reached),
         records: parseJsonColumn(row.records, []),
+        row_accounting: parseJsonColumn(row.row_accounting, []),
         metadata: parseJsonColumn(row.metadata, {}),
       }
     : null;
@@ -293,6 +294,29 @@ function normalizeDealHunterCrmImportRow(row) {
   return row
     ? {
         ...row,
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
+function normalizeDealHunterCrmReconciliationRunRow(row) {
+  return row
+    ? {
+        ...row,
+        counts: parseJsonColumn(row.counts, {}),
+        plan: parseJsonColumn(row.plan, {}),
+        results: parseJsonColumn(row.results, {}),
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
+function normalizeDealHunterCrmReconciliationItemRow(row) {
+  return row
+    ? {
+        ...row,
+        source_row_numbers: parseJsonColumn(row.source_row_numbers, []),
+        planned_changes: parseJsonColumn(row.planned_changes, {}),
         metadata: parseJsonColumn(row.metadata, {}),
       }
     : null;
@@ -370,6 +394,7 @@ function ensureColumn(database, tableName, columnName, definition) {
 function serializeSubmission(submission) {
   return {
     ...submission,
+    deal_hunter_opportunity_id: submission.deal_hunter_opportunity_id || null,
     spam_reasons: JSON.stringify(submission.spam_reasons || []),
     metadata: JSON.stringify(submission.metadata || {}),
     tags: JSON.stringify(submission.tags || []),
@@ -551,6 +576,7 @@ function serializeDealHunterDealOsImport(record) {
     expected_row_count: record.expected_row_count ?? null,
     coverage_limit_reached: record.coverage_limit_reached ? 1 : 0,
     records: JSON.stringify(Array.isArray(record.records) ? record.records : []),
+    row_accounting: JSON.stringify(Array.isArray(record.row_accounting) ? record.row_accounting : []),
     metadata: JSON.stringify(record.metadata || {}),
   };
 }
@@ -841,6 +867,7 @@ export function createSqliteStorage(config) {
       archive_communication_id TEXT,
       restored_at TEXT,
       restored_by TEXT,
+      deal_hunter_opportunity_id TEXT,
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
@@ -1086,6 +1113,12 @@ export function createSqliteStorage(config) {
       coverage_label TEXT NOT NULL,
       expected_row_count INTEGER,
       row_count INTEGER NOT NULL,
+      source_row_count INTEGER NOT NULL DEFAULT 0,
+      accepted_row_count INTEGER NOT NULL DEFAULT 0,
+      rejected_row_count INTEGER NOT NULL DEFAULT 0,
+      canonical_record_count INTEGER NOT NULL DEFAULT 0,
+      parser_version TEXT NOT NULL DEFAULT 'deal-os-export-v1',
+      row_accounting TEXT NOT NULL DEFAULT '[]',
       duplicate_count INTEGER NOT NULL DEFAULT 0,
       stable_id_count INTEGER NOT NULL DEFAULT 0,
       listing_url_count INTEGER NOT NULL DEFAULT 0,
@@ -1129,6 +1162,42 @@ export function createSqliteStorage(config) {
 	      last_activity_at TEXT,
 		      metadata TEXT NOT NULL DEFAULT '{}'
 		    );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_crm_reconciliation_runs (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        import_id TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        plan_digest TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL,
+        requested_by TEXT,
+        counts TEXT NOT NULL DEFAULT '{}',
+        plan TEXT NOT NULL DEFAULT '{}',
+        results TEXT NOT NULL DEFAULT '{}',
+        last_error TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}'
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_crm_reconciliation_items (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        opportunity_id TEXT NOT NULL,
+        deal_key TEXT,
+        action TEXT NOT NULL,
+        status TEXT NOT NULL,
+        submission_id TEXT,
+        source_row_numbers TEXT NOT NULL DEFAULT '[]',
+        planned_changes TEXT NOT NULL DEFAULT '{}',
+        error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        UNIQUE(run_id, opportunity_id),
+        FOREIGN KEY(run_id) REFERENCES deal_hunter_crm_reconciliation_runs(id) ON DELETE CASCADE
+      );
 
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_reviews (
         id TEXT PRIMARY KEY,
@@ -1606,6 +1675,7 @@ export function createSqliteStorage(config) {
   ensureColumn(database, 'contact_submissions', 'archive_communication_id', 'TEXT');
   ensureColumn(database, 'contact_submissions', 'restored_at', 'TEXT');
   ensureColumn(database, 'contact_submissions', 'restored_by', 'TEXT');
+  ensureColumn(database, 'contact_submissions', 'deal_hunter_opportunity_id', 'TEXT');
   ensureColumn(database, 'email_events', 'provider_event_id', 'TEXT');
   ensureColumn(database, 'email_events', 'event_key', 'TEXT');
   ensureColumn(database, 'email_events', 'communication_id', 'TEXT');
@@ -1659,6 +1729,12 @@ export function createSqliteStorage(config) {
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'submission_id', 'TEXT');
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'source_name', 'TEXT');
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'opportunity_id', 'TEXT');
+  ensureColumn(database, 'deal_hunter_deal_os_imports', 'source_row_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(database, 'deal_hunter_deal_os_imports', 'accepted_row_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(database, 'deal_hunter_deal_os_imports', 'rejected_row_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(database, 'deal_hunter_deal_os_imports', 'canonical_record_count', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(database, 'deal_hunter_deal_os_imports', 'parser_version', "TEXT NOT NULL DEFAULT 'deal-os-export-v1'");
+  ensureColumn(database, 'deal_hunter_deal_os_imports', 'row_accounting', "TEXT NOT NULL DEFAULT '[]'");
 	  ensureColumn(database, 'crm_communications', 'opportunity_id', 'TEXT');
 	  ensureColumn(database, 'email_events', 'opportunity_id', 'TEXT');
 	  ensureColumn(database, 'crm_activity_events', 'opportunity_id', 'TEXT');
@@ -1708,6 +1784,13 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_submission ON deal_hunter_cim_requests(submission_id, last_activity_at DESC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_opportunity ON deal_hunter_cim_requests(opportunity_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_opportunity ON deal_hunter_crm_imports(opportunity_id, updated_at DESC);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_contact_submissions_deal_hunter_opportunity
+      ON contact_submissions(deal_hunter_opportunity_id)
+      WHERE deal_hunter_opportunity_id IS NOT NULL AND deal_hunter_opportunity_id <> '';
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_crm_reconciliation_runs_import
+      ON deal_hunter_crm_reconciliation_runs(import_id, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_crm_reconciliation_items_run
+      ON deal_hunter_crm_reconciliation_items(run_id, status, opportunity_id);
     CREATE INDEX IF NOT EXISTS idx_crm_communications_opportunity ON crm_communications(opportunity_id, occurred_at DESC);
     CREATE INDEX IF NOT EXISTS idx_email_events_opportunity ON email_events(opportunity_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_crm_activity_opportunity ON crm_activity_events(opportunity_id, created_at DESC);
@@ -1716,6 +1799,22 @@ export function createSqliteStorage(config) {
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_follow_up_state ON deal_hunter_cim_requests(follow_up_state, next_follow_up_at);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_cim_requests_reply_to ON deal_hunter_cim_requests(LOWER(reply_to_address)) WHERE reply_to_address IS NOT NULL AND reply_to_address <> '';
   `);
+
+  const crmImportOpportunityCollisions = database.prepare(`
+    SELECT opportunity_id, COUNT(*) AS record_count
+    FROM deal_hunter_crm_imports
+    WHERE opportunity_id IS NOT NULL AND opportunity_id <> ''
+    GROUP BY opportunity_id
+    HAVING COUNT(*) > 1
+  `).all();
+  if (crmImportOpportunityCollisions.length === 0) {
+    database.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_unique_opportunity
+      ON deal_hunter_crm_imports(opportunity_id)
+      WHERE opportunity_id IS NOT NULL AND opportunity_id <> '';
+    `);
+  }
+  const canonicalCrmOwnershipHealthy = crmImportOpportunityCollisions.length === 0;
 
   const legacyCimRequests = database.prepare(`
     SELECT id, deal_key, listing_url
@@ -1818,6 +1917,7 @@ export function createSqliteStorage(config) {
       follow_up_state,
       next_action_at,
       last_contacted_at,
+      deal_hunter_opportunity_id,
       metadata
     ) VALUES (
       @id,
@@ -1865,6 +1965,7 @@ export function createSqliteStorage(config) {
       @follow_up_state,
       @next_action_at,
       @last_contacted_at,
+      @deal_hunter_opportunity_id,
       @metadata
     )
   `);
@@ -2699,6 +2800,7 @@ export function createSqliteStorage(config) {
     'follow_up_state',
     'next_action_at',
     'last_contacted_at',
+    'deal_hunter_opportunity_id',
     'archived_at',
     'archived_by',
     'archive_reason',
@@ -4774,12 +4876,14 @@ export function createSqliteStorage(config) {
       database.prepare(`
         INSERT INTO deal_hunter_deal_os_imports (
           id, created_at, imported_by, exported_at, file_name, file_type, file_size, file_sha256,
-          scope, coverage_label, expected_row_count, row_count, duplicate_count, stable_id_count,
-          listing_url_count, coverage_limit_reached, records, metadata
+          scope, coverage_label, expected_row_count, row_count, source_row_count, accepted_row_count,
+          rejected_row_count, canonical_record_count, parser_version, row_accounting,
+          duplicate_count, stable_id_count, listing_url_count, coverage_limit_reached, records, metadata
         ) VALUES (
           @id, @created_at, @imported_by, @exported_at, @file_name, @file_type, @file_size, @file_sha256,
-          @scope, @coverage_label, @expected_row_count, @row_count, @duplicate_count, @stable_id_count,
-          @listing_url_count, @coverage_limit_reached, @records, @metadata
+          @scope, @coverage_label, @expected_row_count, @row_count, @source_row_count, @accepted_row_count,
+          @rejected_row_count, @canonical_record_count, @parser_version, @row_accounting,
+          @duplicate_count, @stable_id_count, @listing_url_count, @coverage_limit_reached, @records, @metadata
         )
       `).run(serialized);
       return normalizeDealHunterDealOsImportRow(
@@ -4797,6 +4901,12 @@ export function createSqliteStorage(config) {
       );
     },
 
+    async getDealHunterDealOsImport(id) {
+      return normalizeDealHunterDealOsImportRow(
+        database.prepare('SELECT * FROM deal_hunter_deal_os_imports WHERE id = ? LIMIT 1').get(String(id || '').trim()),
+      );
+    },
+
     async listDealHunterDealOsImports({ limit = 25 } = {}) {
       return database.prepare(`
         SELECT * FROM deal_hunter_deal_os_imports
@@ -4805,26 +4915,36 @@ export function createSqliteStorage(config) {
       `).all(Math.max(1, Math.min(Number(limit) || 25, 100))).map(normalizeDealHunterDealOsImportRow);
     },
 
-	    async getDealHunterCrmImport({ id = '', dealKey = '', listingIdentity = '' } = {}) {
-	      if (!id && !dealKey && !listingIdentity) {
+	    async getDealHunterCrmImport({ id = '', opportunityId = '', dealKey = '', listingIdentity = '' } = {}) {
+	      if (!id && !opportunityId && !dealKey && !listingIdentity) {
 	        return null;
 	      }
 
-	      const row = database
-	        .prepare(
-	          `
-	            SELECT * FROM deal_hunter_crm_imports
-	            WHERE id = ?
-	              OR deal_key = ?
-	              OR (? <> '' AND listing_identity = ?)
-	            ORDER BY updated_at DESC
-	            LIMIT 1
-	          `,
-	        )
-	        .get(id || '', dealKey || '', listingIdentity || '', listingIdentity || '');
+        const lookups = [
+          ['opportunity_id', opportunityId],
+          ['id', id],
+          ['deal_key', dealKey],
+          ['listing_identity', listingIdentity],
+        ];
+        let row = null;
+        for (const [field, value] of lookups) {
+          if (!value) continue;
+          row = database.prepare(`SELECT * FROM deal_hunter_crm_imports WHERE ${field} = ? ORDER BY updated_at DESC LIMIT 1`).get(value);
+          if (row) break;
+        }
 
 	      return normalizeDealHunterCrmImportRow(row);
 	    },
+
+      async getDealHunterCanonicalCrmOwnershipHealth() {
+        return {
+          healthy: canonicalCrmOwnershipHealthy,
+          collisions: crmImportOpportunityCollisions.map((row) => ({
+            opportunityId: row.opportunity_id,
+            recordCount: Number(row.record_count || 0),
+          })),
+        };
+      },
 
       async listDealHunterCrmImports({ limit = 5000 } = {}) {
         const safeLimit = Math.max(1, Math.min(Number(limit) || 5000, 100000));
@@ -4833,6 +4953,90 @@ export function createSqliteStorage(config) {
           ORDER BY updated_at DESC, id
           LIMIT ?
         `).all(safeLimit).map(normalizeDealHunterCrmImportRow);
+      },
+
+      async startDealHunterCrmReconciliationRun(run, items = []) {
+        const insertRun = database.prepare(`
+          INSERT INTO deal_hunter_crm_reconciliation_runs (
+            id, created_at, updated_at, completed_at, import_id, mode, plan_digest,
+            idempotency_key, status, requested_by, counts, plan, results, last_error, metadata
+          ) VALUES (
+            @id, @created_at, @updated_at, @completed_at, @import_id, @mode, @plan_digest,
+            @idempotency_key, @status, @requested_by, @counts, @plan, @results, @last_error, @metadata
+          )
+        `);
+        const insertItem = database.prepare(`
+          INSERT INTO deal_hunter_crm_reconciliation_items (
+            id, run_id, opportunity_id, deal_key, action, status, submission_id,
+            source_row_numbers, planned_changes, error, created_at, updated_at, metadata
+          ) VALUES (
+            @id, @run_id, @opportunity_id, @deal_key, @action, @status, @submission_id,
+            @source_row_numbers, @planned_changes, @error, @created_at, @updated_at, @metadata
+          )
+        `);
+        const transaction = database.transaction(() => {
+          insertRun.run({
+            ...run,
+            completed_at: run.completed_at || null,
+            requested_by: run.requested_by || null,
+            counts: JSON.stringify(run.counts || {}),
+            plan: JSON.stringify(run.plan || {}),
+            results: JSON.stringify(run.results || {}),
+            last_error: run.last_error || null,
+            metadata: JSON.stringify(run.metadata || {}),
+          });
+          for (const item of items) {
+            insertItem.run({
+              ...item,
+              deal_key: item.deal_key || null,
+              submission_id: item.submission_id || null,
+              source_row_numbers: JSON.stringify(item.source_row_numbers || []),
+              planned_changes: JSON.stringify(item.planned_changes || {}),
+              error: item.error || null,
+              metadata: JSON.stringify(item.metadata || {}),
+            });
+          }
+        });
+        try {
+          transaction();
+        } catch (error) {
+          if (!['SQLITE_CONSTRAINT_UNIQUE', 'SQLITE_CONSTRAINT_PRIMARYKEY'].includes(error?.code)) throw error;
+        }
+        return normalizeDealHunterCrmReconciliationRunRow(database.prepare(`
+          SELECT * FROM deal_hunter_crm_reconciliation_runs
+          WHERE id = ? OR idempotency_key = ? ORDER BY created_at DESC LIMIT 1
+        `).get(run.id, run.idempotency_key));
+      },
+
+      async getDealHunterCrmReconciliationRun({ id = '', idempotencyKey = '' } = {}) {
+        if (!id && !idempotencyKey) return null;
+        return normalizeDealHunterCrmReconciliationRunRow(database.prepare(`
+          SELECT * FROM deal_hunter_crm_reconciliation_runs
+          WHERE id = ? OR idempotency_key = ? ORDER BY created_at DESC LIMIT 1
+        `).get(id || '', idempotencyKey || ''));
+      },
+
+      async listDealHunterCrmReconciliationItems(runId, { limit = 5000 } = {}) {
+        return database.prepare(`
+          SELECT * FROM deal_hunter_crm_reconciliation_items
+          WHERE run_id = ? ORDER BY opportunity_id LIMIT ?
+        `).all(runId, Math.max(1, Math.min(Number(limit) || 5000, 100000))).map(normalizeDealHunterCrmReconciliationItemRow);
+      },
+
+      async updateDealHunterCrmReconciliationItem(id, values = {}) {
+        const fields = ['status', 'submission_id', 'error', 'updated_at', 'metadata'];
+        updateRecord('deal_hunter_crm_reconciliation_items', id, values, fields, ['metadata']);
+        return normalizeDealHunterCrmReconciliationItemRow(
+          database.prepare('SELECT * FROM deal_hunter_crm_reconciliation_items WHERE id = ?').get(id),
+        );
+      },
+
+      async updateDealHunterCrmReconciliationRun(id, values = {}) {
+        const fields = ['updated_at', 'completed_at', 'status', 'counts', 'results', 'last_error', 'metadata'];
+        updateRecord('deal_hunter_crm_reconciliation_runs', id, values, fields, ['counts', 'results', 'metadata']);
+        return normalizeDealHunterCrmReconciliationRunRow(
+          database.prepare('SELECT * FROM deal_hunter_crm_reconciliation_runs WHERE id = ?').get(id),
+        );
       },
 
       async insertDealHunterCimReviews(reviews = []) {
@@ -5173,6 +5377,9 @@ export function createSqliteStorage(config) {
       },
 
 	    async claimDealHunterCrmImport(record = {}, { pendingCutoff = '' } = {}) {
+	      if (!canonicalCrmOwnershipHealthy) {
+          throw new Error('Canonical CRM ownership has duplicate opportunity claims. Run the integrity audit before reconciliation.');
+        }
 	      const serializedRecord = serializeDealHunterCrmImport(record);
 
 	      try {
@@ -5184,6 +5391,7 @@ export function createSqliteStorage(config) {
 
 	        const existingImport = await this.getDealHunterCrmImport({
 	          id: record.id,
+	          opportunityId: record.opportunity_id,
 	          dealKey: record.deal_key,
 	          listingIdentity: record.listing_identity,
 	        });
@@ -5195,6 +5403,7 @@ export function createSqliteStorage(config) {
 	          : { changes: 0 };
 	        const currentImport = await this.getDealHunterCrmImport({
 	          id: existingImport?.id || record.id,
+	          opportunityId: record.opportunity_id,
 	          dealKey: record.deal_key,
 	          listingIdentity: record.listing_identity,
 	        });
@@ -5209,6 +5418,7 @@ export function createSqliteStorage(config) {
 	        claimed: true,
 	        importRecord: await this.getDealHunterCrmImport({
 	          id: record.id,
+	          opportunityId: record.opportunity_id,
 	          dealKey: record.deal_key,
 	          listingIdentity: record.listing_identity,
 	        }),
@@ -5326,6 +5536,43 @@ export function createSqliteStorage(config) {
         metadata: JSON.stringify(record.metadata || {}),
       });
       return this.getDealHunterOpportunity(record.opportunity_id);
+    },
+
+    async linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt = '' } = {}) {
+      const timestamp = updatedAt || new Date().toISOString();
+      const transaction = database.transaction(() => {
+        const opportunity = database.prepare(`
+          SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+        `).get(opportunityId);
+        if (!opportunity) throw new Error('Canonical Deal Hunter opportunity not found.');
+        if (opportunity.primary_submission_id && opportunity.primary_submission_id !== submissionId) {
+          throw new Error('Canonical opportunity already owns another CRM submission.');
+        }
+        const submission = database.prepare(`
+          SELECT id, deal_hunter_opportunity_id
+          FROM contact_submissions
+          WHERE id = ?
+          LIMIT 1
+        `).get(submissionId);
+        if (!submission) throw new Error('CRM submission not found.');
+        if (submission.deal_hunter_opportunity_id
+          && submission.deal_hunter_opportunity_id !== opportunityId) {
+          throw new Error('CRM submission already belongs to another canonical opportunity.');
+        }
+        const conflicting = database.prepare(`
+          SELECT id FROM contact_submissions
+          WHERE deal_hunter_opportunity_id = ? AND id <> ? LIMIT 1
+        `).get(opportunityId, submissionId);
+        if (conflicting) throw new Error('Canonical opportunity already owns another CRM submission.');
+        database.prepare(`
+          UPDATE contact_submissions SET deal_hunter_opportunity_id = ?, updated_at = ? WHERE id = ?
+        `).run(opportunityId, timestamp, submissionId);
+        database.prepare(`
+          UPDATE deal_hunter_opportunities SET primary_submission_id = ?, updated_at = ? WHERE opportunity_id = ?
+        `).run(submissionId, timestamp, opportunityId);
+      });
+      transaction.immediate();
+      return this.getDealHunterOpportunity(opportunityId);
     },
 
     async listDealHunterOpportunityAliases({ opportunityIds = [], aliasKeys = [], limit = 5000 } = {}) {

@@ -18,6 +18,7 @@
     "cim:identity:audit": "node scripts/audit-repair-cim-identity.js",
     "cim:identity:repair": "node scripts/audit-repair-cim-identity.js --apply",
     "crm:source-fields:repair": "node scripts/repair-deal-hunter-crm-source-fields.js",
+    "crm:integrity:audit": "node scripts/audit-deal-hunter-crm-integrity.js",
     "cim:stage2:audit": "node scripts/audit-cim-stage2.js",
     "eval:follow-ups": "node scripts/run-follow-up-eval.js",
     "eval:follow-ups:live": "node scripts/run-follow-up-eval.js --live",

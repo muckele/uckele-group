@@ -101,6 +101,12 @@ test('CSV import preserves durable identities, normalizes deal fields, deduplica
 
   assert.equal(result.ok, true);
   assert.equal(result.import.rowCount, 2);
+  assert.equal(result.import.sourceRowCount, 3);
+  assert.equal(result.import.acceptedRowCount, 3);
+  assert.equal(result.import.rejectedRowCount, 0);
+  assert.equal(result.import.canonicalRecordCount, 2);
+  assert.equal(result.import.rowAccounting.length, 3);
+  assert.deepEqual(result.import.rowAccounting.map((row) => row.canonicalIndex), [0, 0, 1]);
   assert.equal(result.import.duplicateCount, 1);
   assert.equal(result.import.stableIdCount, 1);
   assert.equal(result.import.listingUrlCount, 2);
@@ -117,7 +123,8 @@ test('CSV import preserves durable identities, normalizes deal fields, deduplica
   const review = await reviewDailyDeals({ storage });
   const source = review.sources.find((item) => item.id === 'deal-os-export');
   assert.equal(source.fetched, true);
-  assert.equal(source.rowCount, 2);
+  assert.equal(source.rowCount, 3);
+  assert.equal(source.canonicalRecordCount, 2);
   assert.equal(source.coverageLabel, 'All active acquisition criteria');
   assert.equal(review.disabledSources[0].id, 'airtable-disabled');
   assert.match(review.coverageWarnings[0], /Legacy Airtable is disabled/);
@@ -523,6 +530,10 @@ test('SQLite persists normalized Deal OS import provenance and records without t
   const latest = await storage.getLatestDealHunterDealOsImport();
   assert.equal(latest.imported_by, 'admin@example.com');
   assert.equal(latest.records.length, 2);
-  assert.equal(latest.metadata.parserVersion, 'deal-os-export-v1');
+  assert.equal(latest.metadata.parserVersion, 'deal-os-export-v2');
+  assert.equal(latest.source_row_count, 3);
+  assert.equal(latest.accepted_row_count, 3);
+  assert.equal(latest.canonical_record_count, 2);
+  assert.equal(latest.row_accounting.length, 3);
   assert.equal((await storage.listDealHunterDealOsImports({ limit: 10 })).length, 1);
 });

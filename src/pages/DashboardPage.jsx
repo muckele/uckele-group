@@ -34,8 +34,8 @@ import FollowUpsWorkspace from '../components/admin/FollowUpsWorkspace';
 import AdminOnboarding from '../components/admin/AdminOnboarding';
 import { adminSectionMeta } from '../content/adminSectionMeta';
 
-const statuses = ['new', 'review', 'contacted', 'archived', 'spam'];
-const editableStatuses = ['new', 'review', 'contacted', 'spam'];
+const statuses = ['sourced', 'new', 'review', 'contacted', 'archived', 'spam'];
+const editableStatuses = ['sourced', 'new', 'review', 'contacted', 'spam'];
 const priorities = ['low', 'normal', 'medium', 'high', 'urgent'];
 const followUpStates = ['needs-response', 'scheduled', 'waiting-on-owner', 'completed'];
 const leadTypes = ['prospect', 'seller', 'broker', 'referral', 'advisor', 'other'];
@@ -85,7 +85,7 @@ const archiveLeadReasons = [
   'financing',
   'other',
 ];
-const restoreLeadStatuses = ['new', 'review', 'contacted'];
+const restoreLeadStatuses = ['sourced', 'new', 'review', 'contacted'];
 const diligenceChecklistItems = [
   { id: 'cim', label: 'CIM / teaser' },
   { id: 'nda', label: 'NDA' },
@@ -1337,6 +1337,7 @@ export default function DashboardPage() {
   const [dealHunterLoading, setDealHunterLoading] = useState(false);
   const [dealOsImporting, setDealOsImporting] = useState(false);
   const [dealHunterCrmSyncing, setDealHunterCrmSyncing] = useState(false);
+  const [dealHunterReconciliation, setDealHunterReconciliation] = useState({ preview: null, busy: false });
   const [dealHunterSending, setDealHunterSending] = useState(false);
   const [dealHunterBulkCimSending, setDealHunterBulkCimSending] = useState(false);
   const [dealHunterFollowUpRunning, setDealHunterFollowUpRunning] = useState(false);
@@ -2866,13 +2867,14 @@ export default function DashboardPage() {
       if (refreshedReview) setDealHunterReview(refreshedReview);
       const summary = result.summary || refreshedReview?.importSummary || null;
       setDealHunterImportSummary(summary);
+      setDealHunterReconciliation({ preview: null, busy: false });
       const imported = result.import || {};
       const scoredMessage = summary?.scoredListings !== undefined
         ? ` Scored ${summary.scoredListings} listing${Number(summary.scoredListings) === 1 ? '' : 's'} in ${summary.reviewMode === 'full-backfill' ? 'full-backfill' : 'daily'} mode.`
         : '';
       setDealHunterFeedback({
         error: '',
-        message: `Imported ${imported.rowCount || 0} Deal OS listing${Number(imported.rowCount || 0) === 1 ? '' : 's'} from ${imported.fileName || file.name}.${scoredMessage}${refreshWarning}`,
+        message: `Accepted ${imported.acceptedRowCount ?? imported.rowCount ?? 0} Deal OS row${Number(imported.acceptedRowCount ?? imported.rowCount ?? 0) === 1 ? '' : 's'} and retained ${imported.canonicalRecordCount ?? imported.rowCount ?? 0} canonical import record${Number(imported.canonicalRecordCount ?? imported.rowCount ?? 0) === 1 ? '' : 's'} from ${imported.fileName || file.name}.${scoredMessage}${refreshWarning}`,
       });
       await loadCommandCenter();
     } catch (error) {
@@ -2971,6 +2973,81 @@ export default function DashboardPage() {
       setDealHunterFeedback({ error: error.message || 'Unable to sync high-fit listings to CRM.', message: '' });
     } finally {
       setDealHunterCrmSyncing(false);
+    }
+  }
+
+  async function handlePreviewDealHunterReconciliation() {
+    if (isReadOnly) {
+      setDealHunterFeedback({ error: 'Read-only users cannot reconcile Deal OS imports to CRM.', message: '' });
+      return;
+    }
+    const importId = dealHunterImportSummary?.importId;
+    if (!importId) {
+      setDealHunterFeedback({ error: 'Upload or refresh a Deal OS import before building a reconciliation preview.', message: '' });
+      return;
+    }
+    setDealHunterReconciliation((current) => ({ ...current, busy: true }));
+    setDealHunterFeedback({ error: '', message: '' });
+    try {
+      const response = await fetch('/api/admin/deal-hunter/crm-reconciliation/preview', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ importId }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to build the CRM reconciliation preview.');
+      setDealHunterReconciliation({ preview: result, busy: false });
+      setDealHunterFeedback({
+        error: '',
+        message: `Reconciliation preview is ready: ${result.counts?.create || 0} create, ${result.counts?.update || 0} update, ${result.counts?.unchanged || 0} unchanged, ${result.counts?.tombstoned || 0} tombstoned, ${result.counts?.ambiguous || 0} ambiguous. No CRM records were changed.`,
+      });
+    } catch (error) {
+      setDealHunterReconciliation((current) => ({ ...current, busy: false }));
+      setDealHunterFeedback({ error: error.message || 'Unable to build the CRM reconciliation preview.', message: '' });
+    }
+  }
+
+  async function handleExecuteDealHunterReconciliation() {
+    const preview = dealHunterReconciliation.preview;
+    if (!preview?.planDigest || !preview?.confirmationRequired) {
+      setDealHunterFeedback({ error: 'Build a fresh reconciliation preview before executing.', message: '' });
+      return;
+    }
+    const confirmation = window.prompt(
+      `This will reconcile the exact reviewed canonical set. It will not send email or CIM requests. Type ${preview.confirmationRequired} to continue.`,
+    );
+    if (confirmation !== preview.confirmationRequired) {
+      if (confirmation !== null) setDealHunterFeedback({ error: 'Reconciliation confirmation did not match. No CRM records were changed.', message: '' });
+      return;
+    }
+    setDealHunterReconciliation((current) => ({ ...current, busy: true }));
+    setDealHunterFeedback({ error: '', message: '' });
+    try {
+      const response = await fetch('/api/admin/deal-hunter/crm-reconciliation/execute', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          importId: preview.import?.id,
+          planDigest: preview.planDigest,
+          previewGeneratedAt: preview.generatedAt,
+          expectedOpportunityIds: preview.expectedOpportunityIds,
+          confirmation,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || result.run?.last_error || 'CRM reconciliation completed with errors.');
+      setDealHunterReconciliation({ preview: null, busy: false });
+      const counts = result.resultCounts || result.run?.counts?.results || {};
+      setDealHunterFeedback({
+        error: '',
+        message: `CRM reconciliation completed: ${counts.created || 0} created, ${counts.updated || 0} updated, ${counts.enriched || 0} enriched, ${counts.unchanged || 0} unchanged, ${counts.tombstoned || 0} tombstoned, ${counts.failed || 0} failed. No outbound messages were sent.`,
+      });
+      await Promise.all([loadCommandCenter(), loadDashboard(filters.status, deferredSearch.trim())]);
+    } catch (error) {
+      setDealHunterReconciliation((current) => ({ ...current, busy: false }));
+      setDealHunterFeedback({ error: error.message || 'Unable to execute CRM reconciliation.', message: '' });
     }
   }
 
@@ -3810,8 +3887,11 @@ export default function DashboardPage() {
             loading={dealHunterLoading}
             importingDealOs={dealOsImporting}
             importSummary={dealHunterImportSummary}
+            reconciliation={dealHunterReconciliation}
             onDismissDeal={handleDismissDealHunterOpportunity}
             onImportDealOs={handleImportDealOsExport}
+            onPreviewReconciliation={handlePreviewDealHunterReconciliation}
+            onExecuteReconciliation={handleExecuteDealHunterReconciliation}
             onReview={handleLoadDealHunterReview}
             onRunFullBackfill={() => handleLoadDealHunterReview('full-backfill')}
             onResolveIdentityException={handleResolveCimIdentityException}

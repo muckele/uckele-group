@@ -586,6 +586,26 @@ test('full-backfill scoring and explicit CRM sync require administrator access a
     });
     assert.equal(viewerSync.status, 401);
 
+    for (const route of ['preview', 'execute']) {
+      const viewerReconciliation = await fetch(`${origin}/api/admin/deal-hunter/crm-reconciliation/${route}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: viewerCookie },
+        body: JSON.stringify({ importId: '00000000-0000-0000-0000-000000000000' }),
+      });
+      assert.equal(viewerReconciliation.status, 401);
+    }
+    const viewerAudit = await fetch(`${origin}/api/admin/deal-hunter/crm-integrity-audit`, {
+      headers: { Cookie: viewerCookie },
+    });
+    assert.equal(viewerAudit.status, 401);
+
+    const missingReconciliationImport = await fetch(`${origin}/api/admin/deal-hunter/crm-reconciliation/preview`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({ importId: '00000000-0000-0000-0000-000000000000' }),
+    });
+    assert.equal(missingReconciliationImport.status, 404);
+
     const unconfirmedSync = await fetch(`${origin}/api/admin/deal-hunter/crm-sync`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Cookie: adminCookie },

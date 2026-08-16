@@ -721,12 +721,14 @@ test('an exact inbound reply stops every sequence for the canonical opportunity 
     id: duplicateSubmissionId,
     created_at: new Date(Date.now() - 60_000).toISOString(),
     updated_at: new Date(Date.now() - 60_000).toISOString(),
+    deal_hunter_opportunity_id: null,
   });
   await storage.insertSubmission({
     ...primarySubmission,
     id: unrelatedSubmissionId,
     created_at: new Date(Date.now() - 30_000).toISOString(),
     updated_at: new Date(Date.now() - 30_000).toISOString(),
+    deal_hunter_opportunity_id: null,
     company: 'Unrelated Shared Broker Opportunity',
     listing_url: 'https://broker.example.test/unrelated-shared-broker-opportunity',
   });
@@ -1138,6 +1140,7 @@ test('follow-up processing does not assign a subject-only reply across a shared 
     updated_at: new Date(Date.now() - 60_000).toISOString(),
     company: 'Second Commercial Safety Services',
     listing_url: 'https://broker.example.test/listing-shared-broker-2',
+    deal_hunter_opportunity_id: null,
     metadata: {
       ...(firstSubmission.metadata || {}),
       dealHunter: {

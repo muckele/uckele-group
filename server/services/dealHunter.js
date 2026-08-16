@@ -80,6 +80,16 @@ const dealHunterCrmUserNotesHeading = 'User notes';
 const dealHunterCrmGeneratedStartMarker = 'Deal Hunter generated notes';
 const dealHunterCrmGeneratedEndMarker = 'End Deal Hunter generated notes';
 const dealHunterCrmImportPendingStaleMinutes = 30;
+const dealHunterScoringRuleVersion = 'deal-hunter-fit-v2';
+const dealHunterCompletenessPolicyVersion = 'deal-hunter-completeness-v1';
+const dealOsParserVersion = 'deal-os-export-v2';
+const dealHunterManagedFields = [
+  'name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
+  'annualProfit', 'annualRevenue', 'askingPrice', 'profitMultiple', 'netMargin',
+  'yearsEstablished', 'remoteFlag', 'franchiseFlag', 'fiveYearsFlag', 'brokerName',
+  'brokerEmail', 'brokerCompany', 'brokerContact', 'listingUrl', 'listingSource',
+  'dateAdded', 'lastUpdated',
+];
 
 const profile = {
   minAnnualProfit: 300000,
@@ -832,7 +842,38 @@ function applyScoreCaps(score, caps, concerns) {
   return cappedScore;
 }
 
+function dealFieldPresent(value) {
+  return value !== null && value !== undefined && (typeof value !== 'string' || value.trim() !== '');
+}
+
+function dealCompleteness(deal = {}) {
+  const checks = [
+    ['name', 10, deal.name],
+    ['listingUrl', 10, deal.listingUrl],
+    ['location', 8, deal.state || deal.location],
+    ['annualProfit', 16, deal.annualProfit],
+    ['annualRevenue', 10, deal.annualRevenue],
+    ['askingPrice', 10, deal.askingPrice],
+    ['industry', 8, deal.industry],
+    ['description', 12, normalizeText(deal.description, 10000).length >= 40 ? deal.description : ''],
+    ['yearsEstablished', 6, deal.yearsEstablished ?? deal.fiveYearsFlag],
+    ['brokerContact', 10, deal.brokerEmail || deal.brokerContact || deal.brokerName],
+  ];
+  const missingEvidence = checks.filter(([, , value]) => !dealFieldPresent(value)).map(([field]) => field);
+  const completenessScore = checks.reduce((sum, [, weight, value]) => sum + (dealFieldPresent(value) ? weight : 0), 0);
+  const narrativeEvidenceAvailable = normalizeText([deal.industry, deal.description].filter(Boolean).join(' '), 20000).length >= 40;
+  const evidenceConfidence = completenessScore >= 80 ? 'high' : completenessScore >= 55 ? 'medium' : 'low';
+
+  return {
+    completenessScore,
+    evidenceConfidence,
+    missingEvidence,
+    narrativeEvidenceAvailable,
+  };
+}
+
 export function scoreDeal(deal) {
+  const completeness = dealCompleteness(deal);
   const matches = {
     excluded: containsAny(deal.fullText, profile.excludedKeywords),
     preferred: containsAny(deal.fullText, profile.preferredKeywords),
@@ -957,9 +998,11 @@ export function scoreDeal(deal) {
   if (matches.recurring.length > 0) {
     score += Math.min(14, matches.recurring.length * 3);
     strengths.push(`Recurring or repeat revenue signals: ${matches.recurring.slice(0, 4).join(', ')}.`);
-  } else {
+  } else if (completeness.narrativeEvidenceAvailable) {
     addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'No explicit recurring, contracted, scheduled, or repeat revenue signal.');
     concerns.push('No explicit recurring, contracted, scheduled, or repeat revenue signal.');
+  } else {
+    concerns.push('Recurring or repeat revenue is unknown because the source did not include enough narrative evidence.');
   }
 
   if (matches.commercial.length > 0) {
@@ -970,17 +1013,21 @@ export function scoreDeal(deal) {
   if (matches.recession.length > 0) {
     score += Math.min(12, matches.recession.length * 3);
     strengths.push(`Recession-resistant indicators: ${matches.recession.slice(0, 4).join(', ')}.`);
-  } else {
+  } else if (completeness.narrativeEvidenceAvailable) {
     addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'No clear recession-resistant indicator in the listing text.');
     concerns.push('No clear recession-resistant indicator in the listing text.');
+  } else {
+    concerns.push('Recession resistance is unknown because the source did not include enough narrative evidence.');
   }
 
   if (matches.aiProof.length > 0) {
     score += Math.min(12, matches.aiProof.length * 3);
     strengths.push(`AI-resistant operating work: ${matches.aiProof.slice(0, 4).join(', ')}.`);
-  } else {
+  } else if (completeness.narrativeEvidenceAvailable) {
     addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'No clear physical, field-service, regulated, or relationship-heavy work signal.');
     concerns.push('No clear physical, field-service, regulated, or relationship-heavy work signal.');
+  } else {
+    concerns.push('AI resistance is unknown because the source did not include enough narrative evidence.');
   }
 
   if (matches.management.length > 0 || /yes/i.test(deal.remoteFlag)) {
@@ -1035,6 +1082,14 @@ export function scoreDeal(deal) {
   score = applyScoreCaps(score, scoreCaps, concerns);
   score = Math.max(0, Math.min(100, Math.round(score)));
   const shouldRemove = removeReasons.length > 0 || score < 45;
+  const highFit = !shouldRemove && score >= highFitScoreThreshold && deal.annualProfit !== null;
+  const scoreStatus = completeness.evidenceConfidence === 'low'
+    ? 'provisional'
+    : highFit
+      ? 'high-fit'
+      : shouldRemove
+        ? 'remove'
+        : 'watchlist';
   const recommendation = shouldRemove
     ? 'Remove from tomorrow\'s daily update unless there is a specific strategic reason to keep it.'
     : score >= highFitScoreThreshold
@@ -1044,6 +1099,26 @@ export function scoreDeal(deal) {
   return {
     ...deal,
     score,
+    fitScore: score,
+    completenessScore: completeness.completenessScore,
+    evidenceConfidence: completeness.evidenceConfidence,
+    scoreStatus,
+    missingEvidence: completeness.missingEvidence,
+    scoreReasons: [...new Set([...strengths, ...concerns])].slice(0, 12),
+    scoringRuleVersion: dealHunterScoringRuleVersion,
+    completenessPolicyVersion: dealHunterCompletenessPolicyVersion,
+    actionEligibility: {
+      highFit,
+      crmSync: !shouldRemove && Boolean(deal.opportunityId || deal.dealKey),
+      cimRequest: highFit && completeness.evidenceConfidence !== 'low',
+      reason: highFit
+        ? 'Fit score and annual-profit evidence satisfy the high-fit rule.'
+        : deal.annualProfit === null
+          ? 'Annual profit is required before high-fit outreach.'
+          : shouldRemove
+            ? 'The listing is outside the current acquisition profile.'
+            : 'The listing remains a sourced/watchlist CRM record without automatic outreach.',
+    },
     strengths: [...new Set(strengths)].slice(0, 6),
     concerns: [...new Set(concerns)].slice(0, 7),
     removeReasons: removeReasons.length > 0 ? removeReasons : score < 45 ? concerns.slice(0, 3) : [],
@@ -2325,6 +2400,15 @@ function hydrateDealOsRecord(record = {}) {
 
 function publicDealOsImport(record = {}) {
   const fieldCoverage = record.metadata?.fieldCoverage || summarizeDealOsFieldCoverage(record.records || []);
+  const sourceRowCount = Number(record.source_row_count ?? record.metadata?.sourceRowCount ?? record.row_count ?? 0);
+  const acceptedRowCount = Number(record.accepted_row_count ?? record.metadata?.acceptedRowCount ?? sourceRowCount);
+  const rejectedRowCount = Number(record.rejected_row_count ?? record.metadata?.rejectedRowCount ?? 0);
+  const canonicalRecordCount = Number(record.canonical_record_count ?? record.row_count ?? 0);
+  const rowAccounting = Array.isArray(record.row_accounting)
+    ? record.row_accounting
+    : Array.isArray(record.metadata?.rowAccounting)
+      ? record.metadata.rowAccounting
+      : [];
 
   return {
     id: record.id,
@@ -2340,11 +2424,17 @@ function publicDealOsImport(record = {}) {
       ? null
       : Number(record.expected_row_count),
     rowCount: Number(record.row_count || 0),
+    sourceRowCount,
+    acceptedRowCount,
+    rejectedRowCount,
+    canonicalRecordCount,
     duplicateCount: Number(record.duplicate_count || 0),
     stableIdCount: Number(record.stable_id_count || 0),
     listingUrlCount: Number(record.listing_url_count || 0),
     coverageLimitReached: Boolean(record.coverage_limit_reached),
     fieldCoverage,
+    parserVersion: record.parser_version || record.metadata?.parserVersion || 'deal-os-export-v1',
+    rowAccounting,
   };
 }
 
@@ -2408,8 +2498,12 @@ function buildDealHunterImportSummary(review = {}, dealOsImport = null, crmSync 
   const syncedListings = normalizedCrmSync.created + normalizedCrmSync.enriched + normalizedCrmSync.updated;
 
   return {
+    importId: imported.id || '',
     reviewMode: review.reviewMode || 'daily',
-    importedRows: Number(imported.rowCount || 0),
+    importedRows: Number(imported.acceptedRowCount ?? imported.sourceRowCount ?? imported.rowCount ?? 0),
+    sourceRows: Number(imported.sourceRowCount ?? imported.rowCount ?? 0),
+    rejectedRows: Number(imported.rejectedRowCount || 0),
+    canonicalImportRecords: Number(imported.canonicalRecordCount ?? imported.rowCount ?? 0),
     withinFileDuplicates: Number(imported.duplicateCount || 0),
     combinedSourceRows: Number(review.totals?.sourceRows || 0),
     canonicalListings: Number(review.totals?.normalizedDeals || 0),
@@ -2503,6 +2597,7 @@ export async function importDealOsExport({
 
   const invalidRows = [];
   const recordsByIdentity = new Map();
+  const acceptedRows = [];
   parsed.rows.forEach((rawRow, index) => {
     const record = canonicalDealOsRecord(rawRow);
     const suppliedListing = normalizeText(dealOsListingValue(rawRow), 1000);
@@ -2513,6 +2608,12 @@ export async function importDealOsExport({
     if (!identity || record.name === 'Unnamed business' || (suppliedListing && !record.listingUrl)) return;
     const current = recordsByIdentity.get(identity);
     recordsByIdentity.set(identity, current ? mergeCanonicalDealOsRecords(current, record) : record);
+    acceptedRows.push({
+      rowNumber: index + 2,
+      identity,
+      stableId: record.stableId || '',
+      listingIdentity: normalizeListingIdentity(record.listingUrl),
+    });
   });
 
   if (invalidRows.length > 0) {
@@ -2526,6 +2627,15 @@ export async function importDealOsExport({
   }
 
   const records = [...recordsByIdentity.values()];
+  const canonicalIndexByIdentity = new Map(records.map((record, index) => [dealOsRecordIdentity(record), index]));
+  const rowAccounting = acceptedRows.map((row) => ({
+    rowNumber: row.rowNumber,
+    status: 'accepted',
+    identity: row.identity,
+    stableId: row.stableId,
+    listingIdentity: row.listingIdentity,
+    canonicalIndex: canonicalIndexByIdentity.get(row.identity) ?? null,
+  }));
   const stableIdCount = records.filter((record) => record.stableId).length;
   const listingUrlCount = records.filter((record) => record.listingUrl).length;
   const fieldCoverage = summarizeDealOsFieldCoverage(records);
@@ -2544,6 +2654,12 @@ export async function importDealOsExport({
     coverage_label: safeCoverageLabel,
     expected_row_count: normalizedExpectedRowCount,
     row_count: records.length,
+    source_row_count: parsed.rows.length,
+    accepted_row_count: acceptedRows.length,
+    rejected_row_count: 0,
+    canonical_record_count: records.length,
+    parser_version: dealOsParserVersion,
+    row_accounting: rowAccounting,
     duplicate_count: parsed.rows.length - records.length,
     stable_id_count: stableIdCount,
     listing_url_count: listingUrlCount,
@@ -2553,7 +2669,11 @@ export async function importDealOsExport({
       sourceRowCount: parsed.rows.length,
       worksheetPath: parsed.worksheetPath || '',
       suppliedMimeType: normalizeText(mimeType, 160),
-      parserVersion: 'deal-os-export-v1',
+      acceptedRowCount: acceptedRows.length,
+      rejectedRowCount: 0,
+      canonicalRecordCount: records.length,
+      parserVersion: dealOsParserVersion,
+      rowAccounting,
       fieldCoverage,
     },
   };
@@ -2561,9 +2681,25 @@ export async function importDealOsExport({
   return { ok: true, status: 201, import: publicDealOsImport(saved || record) };
 }
 
-async function loadDealOsExportSource(config, storage) {
+async function loadDealOsExportSource(config, storage, importId = '') {
   if (!storage.getLatestDealHunterDealOsImport) return null;
-  const imported = await storage.getLatestDealHunterDealOsImport();
+  const normalizedImportId = normalizeText(importId, 200);
+  const imported = normalizedImportId && storage.getDealHunterDealOsImport
+    ? await storage.getDealHunterDealOsImport(normalizedImportId)
+    : await storage.getLatestDealHunterDealOsImport();
+  if (normalizedImportId && !imported) {
+    return {
+      source: {
+        id: dealOsSourceId,
+        name: dealOsSourceName,
+        mode: 'manual-export',
+        fetched: false,
+        rowCount: 0,
+        error: 'The selected Deal OS import no longer exists. Refresh imports before reconciling.',
+      },
+      deals: [],
+    };
+  }
   if (!imported) return null;
   const importedSummary = publicDealOsImport(imported);
   const ageMs = Date.now() - Date.parse(imported.exported_at || '');
@@ -2575,7 +2711,8 @@ async function loadDealOsExportSource(config, storage) {
     name: dealOsSourceName,
     mode: 'manual-export',
     fetched: records.length > 0 && ageMs >= -dealOsImportFutureToleranceMs && ageMs <= maximumAgeMs,
-    rowCount: records.length,
+    rowCount: importedSummary.acceptedRowCount,
+    canonicalRecordCount: records.length,
     exportedAt: imported.exported_at,
     importedAt: imported.created_at,
     importedBy: imported.imported_by,
@@ -2603,10 +2740,10 @@ async function loadDealOsExportSource(config, storage) {
   };
 }
 
-async function collectSources(config, storage) {
+async function collectSources(config, storage, { dealOsImportId = '' } = {}) {
   const sourceResults = [];
 
-  const dealOsSource = await loadDealOsExportSource(config, storage);
+  const dealOsSource = await loadDealOsExportSource(config, storage, dealOsImportId);
   if (dealOsSource) sourceResults.push(dealOsSource);
 
   for (const [index, url] of config.dealHunter.sheetCsvUrls.entries()) {
@@ -2770,6 +2907,42 @@ function sourceRecord(deal = {}) {
   };
 }
 
+function fieldProvenanceEntry(deal = {}, resolution = 'direct') {
+  return {
+    sourceId: deal.sourceId || '',
+    sourceName: deal.sourceName || '',
+    sourceRecordId: deal.id || '',
+    listingUrl: deal.listingUrl || '',
+    observedAt: deal.lastUpdated || deal.dateAdded || '',
+    resolution,
+  };
+}
+
+function initialFieldProvenance(deal = {}) {
+  const existing = deal.fieldProvenance && typeof deal.fieldProvenance === 'object' && !Array.isArray(deal.fieldProvenance)
+    ? deal.fieldProvenance
+    : {};
+  const provenance = { ...existing };
+  for (const field of dealHunterManagedFields) {
+    if (dealFieldPresent(deal[field]) && !provenance[field]) provenance[field] = fieldProvenanceEntry(deal);
+  }
+  return provenance;
+}
+
+function comparableFieldValue(value) {
+  if (Number.isFinite(value)) return Number(value);
+  return normalizeComparableText(value);
+}
+
+function materialFieldConflict(field, left, right) {
+  if (!dealFieldPresent(left) || !dealFieldPresent(right)) return false;
+  if (Number.isFinite(left) && Number.isFinite(right)) {
+    const difference = relativeDifference(left, right);
+    return difference !== null && difference >= (['annualProfit', 'annualRevenue', 'askingPrice'].includes(field) ? 0.05 : 0.02);
+  }
+  return comparableFieldValue(left) !== comparableFieldValue(right);
+}
+
 function contactWithProvenance(contact, deal, { inherited = false, matchDecision = '' } = {}) {
   return {
     ...contact,
@@ -2805,6 +2978,8 @@ function initializeDealIdentity(deal = {}) {
     identityAliases,
     dealKeyAliases,
     sourceRecords: deal.sourceRecords?.length ? deal.sourceRecords : [sourceRecord(deal)],
+    fieldProvenance: initialFieldProvenance(deal),
+    fieldConflicts: Array.isArray(deal.fieldConflicts) ? deal.fieldConflicts : [],
     deduplicationMatches: deal.deduplicationMatches || [],
   };
 }
@@ -2973,8 +3148,26 @@ function mergeSyndicatedDeals(canonical, duplicate, decision) {
     'brokerCompany', 'brokerContact', 'listingUrl', 'listingSource', 'dateAdded', 'lastUpdated',
   ];
   const merged = { ...canonical };
+  const fieldProvenance = { ...initialFieldProvenance(canonical) };
+  const fieldConflicts = [...(canonical.fieldConflicts || [])];
   for (const field of missingValueFields) {
-    if (merged[field] === '' || merged[field] === null || merged[field] === undefined) merged[field] = duplicate[field];
+    if (!dealFieldPresent(merged[field]) && dealFieldPresent(duplicate[field])) {
+      merged[field] = duplicate[field];
+      fieldProvenance[field] = duplicate.fieldProvenance?.[field] || fieldProvenanceEntry(duplicate, `inherited:${decision.reason}`);
+    } else if (materialFieldConflict(field, merged[field], duplicate[field])) {
+      const conflict = {
+        field,
+        canonicalValue: merged[field],
+        observedValue: duplicate[field],
+        canonicalSource: fieldProvenance[field] || fieldProvenanceEntry(canonical),
+        observedSource: duplicate.fieldProvenance?.[field] || fieldProvenanceEntry(duplicate),
+        resolution: 'preserved-canonical',
+      };
+      const conflictKey = JSON.stringify([field, comparableFieldValue(merged[field]), comparableFieldValue(duplicate[field]), conflict.observedSource.sourceId]);
+      if (!fieldConflicts.some((item) => JSON.stringify([item.field, comparableFieldValue(item.canonicalValue), comparableFieldValue(item.observedValue), item.observedSource?.sourceId]) === conflictKey)) {
+        fieldConflicts.push(conflict);
+      }
+    }
   }
 
   const canonicalListingIdentity = normalizeListingIdentity(canonical.listingUrl);
@@ -2995,6 +3188,8 @@ function mergeSyndicatedDeals(canonical, duplicate, decision) {
     brokerContacts: contacts,
     brokerEmail: canonical.brokerEmail || duplicate.brokerEmail || preferredContact?.email || '',
     brokerName: canonical.brokerName || duplicate.brokerName || preferredContact?.name || '',
+    fieldProvenance,
+    fieldConflicts: fieldConflicts.slice(0, 100),
     raw: { ...(duplicate.raw || {}), ...(canonical.raw || {}) },
     listingAliases: uniqueStrings([
       ...(canonical.listingAliases || []), canonical.listingUrl,
@@ -3188,6 +3383,15 @@ function publicDeal(deal) {
     firstSeenAt: deal.firstSeenAt,
     lastSeenAt: deal.lastSeenAt,
     score: deal.score,
+    fitScore: deal.fitScore ?? deal.score,
+    completenessScore: deal.completenessScore ?? 0,
+    evidenceConfidence: deal.evidenceConfidence || 'low',
+    scoreStatus: deal.scoreStatus || 'provisional',
+    missingEvidence: deal.missingEvidence || [],
+    scoreReasons: deal.scoreReasons || [],
+    scoringRuleVersion: deal.scoringRuleVersion || dealHunterScoringRuleVersion,
+    completenessPolicyVersion: deal.completenessPolicyVersion || dealHunterCompletenessPolicyVersion,
+    actionEligibility: deal.actionEligibility || {},
     industry: deal.industry,
     location: deal.location,
     annualProfit: deal.annualProfit,
@@ -3208,6 +3412,8 @@ function publicDeal(deal) {
     identityAliases: deal.identityAliases || [],
     dealKeyAliases: deal.dealKeyAliases || [],
     sourceRecords: deal.sourceRecords || [],
+    fieldProvenance: deal.fieldProvenance || {},
+    fieldConflicts: deal.fieldConflicts || [],
     deduplicationMatches: deal.deduplicationMatches || [],
     dateAdded: deal.dateAdded,
     lastUpdated: deal.lastUpdated,
@@ -3740,9 +3946,19 @@ function dealHunterCrmMetadata(deal, options = {}) {
     dealHunter: {
       managed,
       linkedToExistingCrmRecord: Boolean(options.linkedToExistingCrmRecord),
+      actionable: options.actionable !== false,
       opportunityId: deal.opportunityId || '',
       dealKey: deal.dealKey || '',
       score: deal.score,
+      fitScore: deal.fitScore ?? deal.score,
+      completenessScore: deal.completenessScore ?? 0,
+      evidenceConfidence: deal.evidenceConfidence || 'low',
+      scoreStatus: deal.scoreStatus || 'provisional',
+      missingEvidence: deal.missingEvidence || [],
+      scoreReasons: deal.scoreReasons || [],
+      scoringRuleVersion: deal.scoringRuleVersion || dealHunterScoringRuleVersion,
+      completenessPolicyVersion: deal.completenessPolicyVersion || dealHunterCompletenessPolicyVersion,
+      actionEligibility: deal.actionEligibility || {},
       sourceName: deal.sourceName || '',
       sourceMode: deal.sourceMode || '',
       sourceId: deal.sourceId || '',
@@ -3768,6 +3984,8 @@ function dealHunterCrmMetadata(deal, options = {}) {
       identityAliases: deal.identityAliases || [],
       dealKeyAliases: deal.dealKeyAliases || [],
       sourceRecords: deal.sourceRecords || [],
+      fieldProvenance: deal.fieldProvenance || {},
+      fieldConflicts: deal.fieldConflicts || [],
       deduplicationMatches: deal.deduplicationMatches || [],
       generatedNotes,
       raw: deal.raw || {},
@@ -3776,6 +3994,7 @@ function dealHunterCrmMetadata(deal, options = {}) {
 }
 
 function dealHunterCrmPayload(deal, options = {}) {
+  const actionable = options.actionable !== false;
   const broker = dealHunterSourceBrokerFields(deal);
   const hasBrokerContact = Boolean(broker.name || broker.company || broker.email || broker.contact);
   const sourceTag = normalizeComparableText(deal.sourceName || 'deal-hunter').replace(/\s+/g, '-').slice(0, 40);
@@ -3795,14 +4014,18 @@ function dealHunterCrmPayload(deal, options = {}) {
     broker_email: broker.email,
     broker_phone: broker.contact,
     lead_type: hasBrokerContact ? 'broker' : 'prospect',
-    status: 'review',
-    priority: deal.score >= 85 ? 'urgent' : 'high',
-    follow_up_state: 'needs-response',
+    status: actionable ? 'review' : 'sourced',
+    priority: actionable ? (deal.score >= 85 ? 'urgent' : 'high') : 'normal',
+    follow_up_state: actionable ? 'needs-response' : 'completed',
+    next_action_at: null,
     source: 'deal-hunter-daily-review',
-    tags: ['deal-hunter', 'score-75-plus', 'high-fit', sourceTag].filter(Boolean),
+    tags: ['deal-hunter', actionable ? 'score-75-plus' : 'sourced', actionable ? 'high-fit' : '', sourceTag].filter(Boolean),
     notes: mergeDealHunterCrmNotes('', generatedNotes),
-    message: `High-fit Deal Hunter listing imported into the CRM with score ${deal.score}/100.`,
-    metadata: dealHunterCrmMetadata(deal, options),
+    message: actionable
+      ? `High-fit Deal Hunter listing imported into the CRM with score ${deal.score}/100.`
+      : `Deal Hunter listing synchronized as a non-actionable sourced record with score ${deal.score}/100.`,
+    deal_hunter_opportunity_id: deal.opportunityId || null,
+    metadata: dealHunterCrmMetadata(deal, { ...options, actionable }),
   };
 }
 
@@ -3913,8 +4136,18 @@ async function linkDealHunterOpportunitySubmission(storage, deal, submissionId) 
   if (!deal.opportunityId || !submissionId || !storage.getDealHunterOpportunity || !storage.upsertDealHunterOpportunity) {
     return null;
   }
+  if (storage.linkDealHunterCrmSubmission) {
+    return storage.linkDealHunterCrmSubmission({
+      opportunityId: deal.opportunityId,
+      submissionId,
+      updatedAt: new Date().toISOString(),
+    });
+  }
   const opportunity = await storage.getDealHunterOpportunity(deal.opportunityId);
   if (!opportunity || opportunity.primary_submission_id === submissionId) return opportunity;
+  if (opportunity.primary_submission_id) {
+    throw new Error('Canonical opportunity already owns another CRM submission.');
+  }
   return storage.upsertDealHunterOpportunity({
     ...opportunity,
     updated_at: new Date().toISOString(),
@@ -4110,18 +4343,39 @@ function chooseDealHunterCrmValue(existing, payload, field, preserveExistingFiel
     : payload[field] || existing[field] || '';
 }
 
+// Tags Deal Hunter assigns itself, so a demotion from high fit to sourced can
+// drop them. Every other tag on the record belongs to an operator and is kept.
+const dealHunterOwnedCrmTags = new Set(['deal-hunter', 'high-fit', 'score-75-plus', 'sourced']);
+const dealHunterOwnedCrmStatuses = new Set(['sourced', 'review']);
+
+function mergeDealHunterCrmTags(existingTags = [], payloadTags = [], { preserveExistingFields = false } = {}) {
+  const retained = preserveExistingFields
+    ? existingTags
+    : existingTags.filter((tag) => !dealHunterOwnedCrmTags.has(normalizeText(tag, 80).toLowerCase()));
+  return Array.from(new Set([...retained, ...payloadTags]));
+}
+
 function dealHunterCrmUpdate(existing, deal, options = {}) {
   const preserveExistingFields = Boolean(options.preserveExistingFields);
   const managed = !preserveExistingFields;
+  const actionable = options.actionable !== false;
   const payload = dealHunterCrmPayload(deal, {
     managed,
     linkedToExistingCrmRecord: preserveExistingFields,
+    actionable,
   });
   const existingTags = Array.isArray(existing.tags) ? existing.tags : [];
   const existingPriority = normalizeText(existing.priority, 80);
+  // Deal Hunter only owns the workflow it assigns itself. Once an operator has
+  // advanced the record past that baseline, a later sync reports the refreshed
+  // listing facts without reverting their work.
+  const operatorAdvancedWorkflow = !dealHunterOwnedCrmStatuses.has(normalizeText(existing.status, 40));
+  const preserveWorkflow = preserveExistingFields || operatorAdvancedWorkflow;
 
   return {
     updated_at: new Date().toISOString(),
+    company: chooseDealHunterCrmValue(existing, payload, 'company', preserveExistingFields),
+    deal_hunter_opportunity_id: deal.opportunityId || existing.deal_hunter_opportunity_id || null,
     listing_url: chooseDealHunterCrmValue(existing, payload, 'listing_url', preserveExistingFields),
     asking_price: chooseDealHunterCrmValue(existing, payload, 'asking_price', preserveExistingFields),
     ttm_revenue: chooseDealHunterCrmValue(existing, payload, 'ttm_revenue', preserveExistingFields),
@@ -4134,8 +4388,11 @@ function dealHunterCrmUpdate(existing, deal, options = {}) {
     broker_phone: chooseDealHunterCrmValue(existing, payload, 'broker_phone', preserveExistingFields),
     role: chooseDealHunterCrmValue(existing, payload, 'role', preserveExistingFields),
     lead_type: chooseDealHunterCrmValue(existing, payload, 'lead_type', preserveExistingFields),
+    status: preserveWorkflow ? existing.status : payload.status,
     priority: preserveExistingFields && existingPriority && existingPriority !== 'normal' ? existingPriority : payload.priority,
-    tags: Array.from(new Set([...existingTags, ...payload.tags])),
+    follow_up_state: preserveWorkflow || actionable ? existing.follow_up_state || payload.follow_up_state : payload.follow_up_state,
+    next_action_at: preserveWorkflow || actionable ? existing.next_action_at ?? null : payload.next_action_at,
+    tags: mergeDealHunterCrmTags(existingTags, payload.tags, { preserveExistingFields }),
     notes: mergeDealHunterCrmNotes(existing.notes, payload.notes),
     metadata: {
       ...(existing.metadata || {}),
@@ -4146,11 +4403,12 @@ function dealHunterCrmUpdate(existing, deal, options = {}) {
 
 async function updateDealHunterCrmSubmission(storage, existing, deal, {
   preserveExistingFields = false,
+  actionable = true,
   actor = 'deal-hunter',
   summary = '',
   activityMetadata = {},
 } = {}) {
-  const values = dealHunterCrmUpdate(existing, deal, { preserveExistingFields });
+  const values = dealHunterCrmUpdate(existing, deal, { preserveExistingFields, actionable });
   const mutation = await commitCrmActivityMutation({
     storage,
     operation: 'update_submission',
@@ -4390,7 +4648,10 @@ async function updateDealHunterCrmImport(storage, importRecord, values = {}) {
 
 function dealHunterCrmCandidates(scoredDeals = []) {
   return scoredDeals.filter(
-    (deal) => !deal.dismissed && !deal.shouldRemove && deal.score >= cimRequestScoreThreshold && deal.annualProfit !== null,
+    (deal) => !deal.dismissed && (
+      deal.actionEligibility?.highFit === true
+      || (!deal.shouldRemove && deal.score >= cimRequestScoreThreshold && deal.annualProfit !== null)
+    ),
   );
 }
 
@@ -6175,11 +6436,11 @@ function normalizeDealHunterReviewMode(value = '') {
   return value === 'full-backfill' ? 'full-backfill' : 'daily';
 }
 
-async function buildDailyDealReview({ reviewMode = 'daily', storage = getStorage() } = {}) {
+async function buildDailyDealReview({ reviewMode = 'daily', dealOsImportId = '', storage = getStorage() } = {}) {
   const config = getConfig();
   const normalizedReviewMode = normalizeDealHunterReviewMode(reviewMode);
   const generatedAt = new Date().toISOString();
-  const sourceResults = await collectSources(config, storage);
+  const sourceResults = await collectSources(config, storage, { dealOsImportId });
   const coverage = buildDealHunterCoverage(config, sourceResults);
   const allDeals = dedupeDeals(sourceResults.flatMap((result) => result.deals));
   const recentDeals = allDeals.filter((deal) => isRecentDeal(deal, config.dealHunter.lookbackDays));
@@ -6534,6 +6795,579 @@ export async function sendDailyDealHunterReview({ idempotencyKey = '', storage =
 }
 
 export const dealHunterCrmSyncConfirmation = 'SYNC HIGH FITS';
+
+const dealHunterCrmReconciliationPlanTtlMs = 30 * 60 * 1000;
+
+function dealOsImportRecordKeys(record = {}) {
+  return new Set(uniqueStrings([
+    record.stableId ? `id:${normalizeStableExternalIdentity(record.stableId)}` : '',
+    record.listingUrl ? `url:${normalizeListingIdentity(record.listingUrl)}` : '',
+  ]));
+}
+
+function dealOsSourceRecordKeys(deal = {}) {
+  const keys = [];
+  for (const source of deal.sourceRecords || []) {
+    if (source.sourceId !== dealOsSourceId) continue;
+    if (source.externalId) keys.push(`id:${normalizeStableExternalIdentity(source.externalId)}`);
+    if (source.listingUrl) keys.push(`url:${normalizeListingIdentity(source.listingUrl)}`);
+  }
+  return new Set(uniqueStrings(keys));
+}
+
+// Observation bookkeeping, not listing facts: these move on their own between
+// review runs, so comparing them would classify every already-synced record as
+// an update and make `unchanged` unreachable. The write still refreshes them.
+const reconciliationVolatileDealHunterFields = ['firstSeenAt', 'lastSeenAt', 'isNew', 'generatedNotes'];
+
+function reconciliationComparableDealHunterMetadata(metadata = {}) {
+  const comparable = { ...metadata };
+  for (const field of reconciliationVolatileDealHunterFields) delete comparable[field];
+  return comparable;
+}
+
+function reconciliationComparablePayload(payload = {}) {
+  return {
+    company: payload.company || '',
+    listing_url: payload.listing_url || '',
+    asking_price: payload.asking_price || '',
+    ttm_revenue: payload.ttm_revenue || '',
+    ttm_ebitda: payload.ttm_ebitda || '',
+    ebitda_multiple: payload.ebitda_multiple || '',
+    net_margin: payload.net_margin || '',
+    business_age: payload.business_age || '',
+    broker_name: payload.broker_name || '',
+    broker_email: payload.broker_email || '',
+    broker_phone: payload.broker_phone || '',
+    role: payload.role || '',
+    lead_type: payload.lead_type || '',
+    status: payload.status || '',
+    priority: payload.priority || '',
+    follow_up_state: payload.follow_up_state || '',
+    next_action_at: payload.next_action_at || null,
+    tags: [...(payload.tags || [])].sort(),
+    deal_hunter_opportunity_id: payload.deal_hunter_opportunity_id || '',
+    dealHunter: reconciliationComparableDealHunterMetadata(payload.metadata?.dealHunter || {}),
+  };
+}
+
+function reconciliationChangedFields(existing = {}, values = {}) {
+  const before = reconciliationComparablePayload(existing);
+  const after = reconciliationComparablePayload(values);
+  return Object.keys(after).filter((field) => JSON.stringify(before[field]) !== JSON.stringify(after[field]));
+}
+
+function reconciliationPlanDigest(importId, items = []) {
+  return sha256(JSON.stringify({
+    importId,
+    scoringRuleVersion: dealHunterScoringRuleVersion,
+    completenessPolicyVersion: dealHunterCompletenessPolicyVersion,
+    items: items.map((item) => ({
+      opportunityId: item.opportunityId,
+      dealKey: item.dealKey,
+      action: item.action,
+      submissionId: item.submissionId,
+      actionable: item.actionable,
+      sourceRowNumbers: item.sourceRowNumbers,
+      changedFields: item.changedFields,
+      fitScore: item.fitScore,
+      completenessScore: item.completenessScore,
+      scoreStatus: item.scoreStatus,
+    })).sort((left, right) => left.opportunityId.localeCompare(right.opportunityId) || left.dealKey.localeCompare(right.dealKey)),
+  }));
+}
+
+function countReconciliationActions(items = []) {
+  const counts = {
+    total: items.length,
+    create: 0,
+    update: 0,
+    unchanged: 0,
+    tombstoned: 0,
+    ambiguous: 0,
+    actionable: 0,
+    sourced: 0,
+    conflicts: 0,
+  };
+  for (const item of items) {
+    if (Object.hasOwn(counts, item.action)) counts[item.action] += 1;
+    if (item.actionable) counts.actionable += 1;
+    else counts.sourced += 1;
+    counts.conflicts += Number(item.fieldConflictCount || 0);
+  }
+  counts.mutable = counts.create + counts.update;
+  return counts;
+}
+
+export async function previewDealOsCrmReconciliation({
+  importId = '',
+  requestedBy = '',
+  storage = getStorage(),
+} = {}) {
+  const normalizedImportId = normalizeText(importId, 200);
+  if (!normalizedImportId) return { ok: false, status: 400, error: 'Select a Deal OS import to reconcile.' };
+  if (!storage.getDealHunterDealOsImport) return { ok: false, status: 503, error: 'Exact Deal OS import lookup is unavailable.' };
+  const importedRecord = await storage.getDealHunterDealOsImport(normalizedImportId);
+  if (!importedRecord) return { ok: false, status: 404, error: 'The selected Deal OS import was not found.' };
+  const ownershipHealth = storage.getDealHunterCanonicalCrmOwnershipHealth
+    ? await storage.getDealHunterCanonicalCrmOwnershipHealth()
+    : { healthy: false, collisions: [] };
+  if (!ownershipHealth.healthy) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'Canonical CRM ownership is not unique. Resolve the integrity-audit collisions before reconciliation.',
+      ownershipHealth,
+    };
+  }
+
+  const result = await buildDailyDealReview({ reviewMode: 'full-backfill', dealOsImportId: normalizedImportId, storage });
+  if (reviewHasSourceFailures(result.review)) {
+    return { ok: false, status: 503, error: 'Reconciliation preview is blocked while a configured source is unavailable.', review: result.review };
+  }
+  const integrityAudit = await auditDealHunterCrmIntegrity({ storage });
+  if (!integrityAudit.safeToReconcile) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'CRM integrity findings must be resolved before reconciliation can plan any writes.',
+      integrityAudit,
+    };
+  }
+  const imported = publicDealOsImport(importedRecord);
+  const records = Array.isArray(importedRecord.records) ? importedRecord.records : [];
+  const rowAccounting = imported.rowAccounting || [];
+  const rowNumbersByCanonicalIndex = rowAccounting.reduce((map, row) => {
+    if (!Number.isInteger(row.canonicalIndex)) return map;
+    const rows = map.get(row.canonicalIndex) || [];
+    rows.push(Number(row.rowNumber));
+    map.set(row.canonicalIndex, rows);
+    return map;
+  }, new Map());
+  // Index the import records once instead of rebuilding their identity keys for
+  // every scored deal, which is quadratic on a large export.
+  const canonicalIndicesByImportKey = new Map();
+  records.forEach((record, index) => {
+    for (const key of dealOsImportRecordKeys(record)) {
+      const indices = canonicalIndicesByImportKey.get(key) || new Set();
+      indices.add(index);
+      canonicalIndicesByImportKey.set(key, indices);
+    }
+  });
+  const rowsByDeal = new Map();
+  for (const deal of result.scoredDeals) {
+    const sourceKeys = dealOsSourceRecordKeys(deal);
+    if (sourceKeys.size === 0) continue;
+    const indices = new Set();
+    for (const key of sourceKeys) {
+      for (const index of canonicalIndicesByImportKey.get(key) || []) indices.add(index);
+    }
+    if (indices.size === 0) continue;
+    const rowNumbers = new Set();
+    for (const index of indices) {
+      for (const rowNumber of rowNumbersByCanonicalIndex.get(index) || []) rowNumbers.add(Number(rowNumber));
+    }
+    rowsByDeal.set(deal, [...rowNumbers].sort((left, right) => left - right));
+  }
+
+  const items = [];
+  for (const [deal, sourceRowNumbers] of rowsByDeal.entries()) {
+    const actionable = deal.actionEligibility?.highFit === true;
+    let action = 'create';
+    let submissionId = '';
+    let changedFields = [];
+    if (!deal.opportunityId || deal.identityStatus !== 'resolved') {
+      action = 'ambiguous';
+    } else {
+      const [importRecord, existing] = await Promise.all([
+        storage.getDealHunterCrmImport?.({ opportunityId: deal.opportunityId }) || null,
+        findExistingDealHunterSubmission(storage, deal),
+      ]);
+      submissionId = existing?.id || importRecord?.submission_id || '';
+      if (!existing && importRecord?.status === 'crm-deleted') {
+        action = 'tombstoned';
+      } else if (existing) {
+        const declaredOpportunityId = existing.deal_hunter_opportunity_id
+          || existing.metadata?.dealHunter?.opportunityId
+          || '';
+        if (declaredOpportunityId && declaredOpportunityId !== deal.opportunityId) {
+          action = 'ambiguous';
+          changedFields = ['deal_hunter_opportunity_id'];
+        } else {
+          const preserveExistingFields = !isDealHunterManagedSubmission(existing);
+          const values = dealHunterCrmUpdate(existing, deal, { preserveExistingFields, actionable });
+          changedFields = reconciliationChangedFields(existing, values);
+          action = changedFields.length > 0 ? 'update' : 'unchanged';
+        }
+      }
+    }
+    items.push({
+      opportunityId: deal.opportunityId || `unresolved:${deal.dealKey}`,
+      dealKey: deal.dealKey || '',
+      name: deal.name || '',
+      action,
+      submissionId,
+      actionable,
+      fitScore: deal.fitScore ?? deal.score,
+      completenessScore: deal.completenessScore ?? 0,
+      evidenceConfidence: deal.evidenceConfidence || 'low',
+      scoreStatus: deal.scoreStatus || 'provisional',
+      scoringRuleVersion: deal.scoringRuleVersion || dealHunterScoringRuleVersion,
+      missingEvidence: deal.missingEvidence || [],
+      fieldConflictCount: deal.fieldConflicts?.length || 0,
+      changedFields,
+      sourceRowNumbers,
+    });
+  }
+  items.sort((left, right) => left.opportunityId.localeCompare(right.opportunityId));
+  const mappedSourceRows = new Set(items.flatMap((item) => item.sourceRowNumbers));
+  const unmappedSourceRows = rowAccounting
+    .filter((row) => row.status === 'accepted' && !mappedSourceRows.has(Number(row.rowNumber)))
+    .map((row) => Number(row.rowNumber));
+  const counts = countReconciliationActions(items);
+  const planDigest = reconciliationPlanDigest(normalizedImportId, items);
+  const generatedAt = new Date().toISOString();
+  // Carried so execution applies exactly the canonical listings this plan was
+  // digested from, instead of rebuilding the same full review a second time.
+  const dealsByOpportunity = new Map(result.scoredDeals
+    .filter((deal) => deal.opportunityId)
+    .map((deal) => [deal.opportunityId, deal]));
+  return {
+    ok: true,
+    status: 200,
+    preview: true,
+    import: imported,
+    generatedAt,
+    expiresAt: new Date(Date.parse(generatedAt) + dealHunterCrmReconciliationPlanTtlMs).toISOString(),
+    requestedBy: normalizeText(requestedBy || 'admin', 160),
+    integrityAudit,
+    planDigest,
+    confirmationRequired: `RECONCILE ${counts.mutable} CANONICAL`,
+    expectedOpportunityIds: items.map((item) => item.opportunityId).sort(),
+    counts: {
+      sourceRows: imported.sourceRowCount,
+      acceptedRows: imported.acceptedRowCount,
+      rejectedRows: imported.rejectedRowCount,
+      withinFileDuplicates: imported.duplicateCount,
+      canonicalImportRecords: imported.canonicalRecordCount,
+      canonicalMatched: items.length,
+      mappedSourceRows: mappedSourceRows.size,
+      unmappedSourceRows: unmappedSourceRows.length,
+      ...counts,
+    },
+    // The plan is returned whole: counts, the digest, and the confirmation
+    // string are derived from every item, so truncating here would execute a
+    // different set than the operator confirmed. Transport bounds the response.
+    items,
+    dealsByOpportunity,
+    unmappedSourceRowNumbers: unmappedSourceRows.slice(0, 100),
+  };
+}
+
+async function applyDealOsCrmReconciliationItem({ deal, item, storage, requestedBy }) {
+  const pendingCutoff = new Date(Date.now() - dealHunterCrmImportPendingStaleMinutes * 60 * 1000).toISOString();
+  const proposedImport = buildDealHunterCrmImportRecord(deal);
+  const claim = await storage.claimDealHunterCrmImport(proposedImport, { pendingCutoff });
+  if (!claim?.importRecord) throw new Error('The durable CRM ownership claim returned no record.');
+  const importRecord = claim.importRecord;
+  if (!claim.claimed && importRecord.status === 'crm-deleted') return { status: 'tombstoned', submissionId: '' };
+  let existing = importRecord.submission_id && storage.getSubmission
+    ? await storage.getSubmission(importRecord.submission_id)
+    : null;
+  existing ||= await findExistingDealHunterSubmission(storage, deal);
+  if (existing) {
+    const preserveExistingFields = !isDealHunterManagedSubmission(existing);
+    const updated = await updateDealHunterCrmSubmission(storage, existing, deal, {
+      preserveExistingFields,
+      actionable: item.actionable,
+      actor: requestedBy,
+      summary: item.actionable
+        ? 'Deal OS reconciliation refreshed an actionable Deal Hunter CRM record.'
+        : 'Deal OS reconciliation refreshed a sourced Deal Hunter CRM record.',
+      activityMetadata: { reconciliation: true, planAction: item.action },
+    });
+    await updateDealHunterCrmImport(storage, importRecord, {
+      opportunity_id: deal.opportunityId,
+      submission_id: updated?.id || existing.id,
+      status: preserveExistingFields ? 'enriched' : 'updated',
+    });
+    await linkDealHunterOpportunitySubmission(storage, deal, updated?.id || existing.id);
+    return { status: preserveExistingFields ? 'enriched' : 'updated', submissionId: updated?.id || existing.id };
+  }
+  if (!claim.claimed) throw new Error('CRM ownership is already claimed without a linked submission. Retry after the pending claim expires.');
+  const created = await createManualSubmission(
+    dealHunterCrmPayload(deal, { actionable: item.actionable }),
+    requestedBy,
+    { storage },
+  );
+  if (!created.ok || !created.submission?.id) throw new Error((created.errors || []).join(' ') || 'CRM record creation failed.');
+  await updateDealHunterCrmImport(storage, importRecord, {
+    opportunity_id: deal.opportunityId,
+    submission_id: created.submission.id,
+    status: 'created',
+  });
+  await linkDealHunterOpportunitySubmission(storage, deal, created.submission.id);
+  return { status: 'created', submissionId: created.submission.id };
+}
+
+export async function executeDealOsCrmReconciliation({
+  importId = '',
+  planDigest = '',
+  previewGeneratedAt = '',
+  expectedOpportunityIds = [],
+  confirmation = '',
+  requestedBy = '',
+  storage = getStorage(),
+} = {}) {
+  const requestedImportId = normalizeText(importId, 200);
+  const requestedPlanDigest = normalizeText(planDigest, 200);
+  if (requestedImportId && requestedPlanDigest && storage.getDealHunterCrmReconciliationRun) {
+    const previousRun = await storage.getDealHunterCrmReconciliationRun({
+      idempotencyKey: `deal-os-crm-reconciliation:${requestedImportId}:${requestedPlanDigest}`,
+    });
+    // Only a fully successful run is terminal. A run that ended with failures
+    // is resumed below so its failed items can be retried, which is exactly
+    // what its last_error tells the operator to do.
+    if (previousRun && previousRun.status === 'completed') {
+      return { ok: true, status: 200, idempotent: true, run: previousRun };
+    }
+  }
+  const previewGeneratedAtMs = Date.parse(previewGeneratedAt);
+  const previewAgeMs = Date.now() - previewGeneratedAtMs;
+  if (!Number.isFinite(previewGeneratedAtMs)
+    || previewAgeMs < -60 * 1000
+    || previewAgeMs > dealHunterCrmReconciliationPlanTtlMs) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'The reconciliation preview is missing or expired. Build a fresh preview before executing.',
+    };
+  }
+  const previewResult = await previewDealOsCrmReconciliation({ importId, requestedBy, storage });
+  if (!previewResult.ok) return previewResult;
+  if (previewResult.counts.unmappedSourceRows > 0) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'One or more accepted CSV rows could not be mapped to a canonical opportunity. Resolve those rows before CRM execution.',
+      preview: previewResult,
+    };
+  }
+  if (previewResult.counts.ambiguous > 0) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'One or more imported listings have ambiguous canonical identities. Resolve them before CRM execution.',
+      preview: previewResult,
+    };
+  }
+  const expectedIds = uniqueStrings(expectedOpportunityIds).sort();
+  if (normalizeText(planDigest, 200) !== previewResult.planDigest
+    || JSON.stringify(expectedIds) !== JSON.stringify(previewResult.expectedOpportunityIds)) {
+    return { ok: false, status: 409, error: 'The reconciliation plan changed. Refresh the preview before executing.', preview: previewResult };
+  }
+  if (normalizeText(confirmation, 120) !== previewResult.confirmationRequired) {
+    return { ok: false, status: 400, error: `Type ${previewResult.confirmationRequired} to execute this exact canonical set.`, preview: previewResult };
+  }
+  const requiredMethods = [
+    'claimDealHunterCrmImport', 'startDealHunterCrmReconciliationRun',
+    'listDealHunterCrmReconciliationItems',
+    'updateDealHunterCrmReconciliationItem', 'updateDealHunterCrmReconciliationRun',
+  ];
+  if (requiredMethods.some((method) => typeof storage[method] !== 'function')) {
+    return { ok: false, status: 503, error: 'Durable CRM reconciliation storage is unavailable.' };
+  }
+  const idempotencyKey = `deal-os-crm-reconciliation:${previewResult.import.id}:${previewResult.planDigest}`;
+  const now = new Date().toISOString();
+  const runId = sha256(idempotencyKey);
+  const durableItems = previewResult.items.map((item) => ({
+    id: sha256(`${runId}:${item.opportunityId}`),
+    run_id: runId,
+    opportunity_id: item.opportunityId,
+    deal_key: item.dealKey,
+    action: item.action,
+    status: ['create', 'update'].includes(item.action) ? 'pending' : item.action,
+    submission_id: item.submissionId || null,
+    source_row_numbers: item.sourceRowNumbers,
+    planned_changes: { changedFields: item.changedFields, actionable: item.actionable },
+    error: null,
+    created_at: now,
+    updated_at: now,
+    metadata: { fitScore: item.fitScore, completenessScore: item.completenessScore, scoreStatus: item.scoreStatus },
+  }));
+  let run = await storage.startDealHunterCrmReconciliationRun({
+    id: runId,
+    created_at: now,
+    updated_at: now,
+    completed_at: null,
+    import_id: previewResult.import.id,
+    mode: 'exact-import',
+    plan_digest: previewResult.planDigest,
+    idempotency_key: idempotencyKey,
+    status: 'running',
+    requested_by: normalizeText(requestedBy || 'admin', 160),
+    counts: previewResult.counts,
+    plan: { confirmationRequired: previewResult.confirmationRequired, expectedOpportunityIds: previewResult.expectedOpportunityIds },
+    results: {},
+    last_error: null,
+    metadata: { scoringRuleVersion: dealHunterScoringRuleVersion, completenessPolicyVersion: dealHunterCompletenessPolicyVersion },
+  }, durableItems);
+  if (run.status === 'completed') {
+    return { ok: true, status: 200, idempotent: true, run, preview: previewResult };
+  }
+  if (run.status === 'completed-with-errors') {
+    run = await storage.updateDealHunterCrmReconciliationRun(runId, {
+      updated_at: new Date().toISOString(),
+      completed_at: null,
+      status: 'running',
+      last_error: null,
+    }) || run;
+  }
+
+  const dealsByOpportunity = previewResult.dealsByOpportunity instanceof Map
+    ? previewResult.dealsByOpportunity
+    : new Map();
+  const plannedItemsByOpportunity = new Map(previewResult.items.map((item) => [item.opportunityId, item]));
+  const resultCounts = { created: 0, updated: 0, enriched: 0, tombstoned: 0, unchanged: 0, ambiguous: 0, failed: 0 };
+  const results = [];
+  const storedItems = await storage.listDealHunterCrmReconciliationItems(runId, { limit: 100000 });
+  for (const storedItem of storedItems) {
+    // `failed` is retryable: applying an item is idempotent through the durable
+    // ownership claim, so a resumed run re-attempts only what did not land.
+    if (!['pending', 'failed'].includes(storedItem.status)) {
+      if (Object.hasOwn(resultCounts, storedItem.status)) resultCounts[storedItem.status] += 1;
+      continue;
+    }
+    const item = plannedItemsByOpportunity.get(storedItem.opportunity_id);
+    const deal = dealsByOpportunity.get(storedItem.opportunity_id);
+    try {
+      if (!deal || !item) throw new Error('The canonical listing disappeared after preview.');
+      const applied = await applyDealOsCrmReconciliationItem({ deal, item, storage, requestedBy: run.requested_by || 'admin' });
+      resultCounts[applied.status] = Number(resultCounts[applied.status] || 0) + 1;
+      results.push({ opportunityId: storedItem.opportunity_id, ...applied });
+      await storage.updateDealHunterCrmReconciliationItem(storedItem.id, {
+        status: applied.status,
+        submission_id: applied.submissionId || null,
+        error: null,
+        updated_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      resultCounts.failed += 1;
+      results.push({ opportunityId: storedItem.opportunity_id, status: 'failed', error: normalizeText(error.message, 500) });
+      await storage.updateDealHunterCrmReconciliationItem(storedItem.id, {
+        status: 'failed',
+        error: normalizeText(error.message, 1000),
+        updated_at: new Date().toISOString(),
+      });
+    }
+  }
+  const completedAt = new Date().toISOString();
+  run = await storage.updateDealHunterCrmReconciliationRun(runId, {
+    updated_at: completedAt,
+    completed_at: completedAt,
+    status: resultCounts.failed > 0 ? 'completed-with-errors' : 'completed',
+    counts: { ...previewResult.counts, results: resultCounts },
+    results: { items: results.slice(0, 1000) },
+    last_error: resultCounts.failed > 0 ? `${resultCounts.failed} item(s) failed; inspect durable item errors before retrying.` : null,
+  });
+  return { ok: resultCounts.failed === 0, status: resultCounts.failed > 0 ? 207 : 200, run, resultCounts, preview: previewResult };
+}
+
+async function listAllSubmissionsForDealHunterAudit(storage) {
+  if (typeof storage.listSubmissions !== 'function') return [];
+  const limit = 5000;
+  const submissions = [];
+  for (let page = 1; ; page += 1) {
+    const result = await storage.listSubmissions({ limit, page, status: 'all' });
+    const rows = Array.isArray(result?.rows) ? result.rows : [];
+    submissions.push(...rows);
+    const total = Number(result?.total || submissions.length);
+    if (rows.length === 0 || submissions.length >= total) break;
+  }
+  return submissions;
+}
+
+export async function auditDealHunterCrmIntegrity({ storage = getStorage() } = {}) {
+  const [imports, opportunities, submissions, ownershipHealth] = await Promise.all([
+    storage.listDealHunterCrmImports?.({ limit: 100000 }) || [],
+    storage.listDealHunterOpportunities?.({ limit: 100000 }) || [],
+    listAllSubmissionsForDealHunterAudit(storage),
+    storage.getDealHunterCanonicalCrmOwnershipHealth?.() || { healthy: false, collisions: [] },
+  ]);
+  const claimsByOpportunity = new Map();
+  const addClaim = (opportunityId, kind, id) => {
+    if (!opportunityId) return;
+    const claims = claimsByOpportunity.get(opportunityId) || [];
+    claims.push({ kind, id });
+    claimsByOpportunity.set(opportunityId, claims);
+  };
+  imports.forEach((record) => addClaim(record.opportunity_id, 'import', record.id));
+  submissions.forEach((record) => addClaim(record.deal_hunter_opportunity_id || record.metadata?.dealHunter?.opportunityId, 'submission', record.id));
+  opportunities.forEach((record) => addClaim(record.opportunity_id, 'primary', record.primary_submission_id));
+  const duplicatePrimaries = [];
+  const identityMismatches = [];
+  const nameMismatches = [];
+  const tombstoneActive = [];
+  for (const [opportunityId, claims] of claimsByOpportunity.entries()) {
+    const submissionIds = uniqueStrings(claims.filter((claim) => claim.kind !== 'import').map((claim) => claim.id));
+    if (submissionIds.length > 1) duplicatePrimaries.push({ opportunityId, submissionIds });
+  }
+  const importsBySubmissionId = new Map(imports
+    .filter((record) => record.submission_id)
+    .map((record) => [record.submission_id, record]));
+  const submissionsById = new Map(submissions.map((record) => [record.id, record]));
+  for (const submission of submissions) {
+    const metadata = submission.metadata?.dealHunter || {};
+    const directOpportunityId = submission.deal_hunter_opportunity_id || '';
+    const metadataOpportunityId = metadata.opportunityId || '';
+    if (directOpportunityId && metadataOpportunityId && directOpportunityId !== metadataOpportunityId) {
+      identityMismatches.push({
+        submissionId: submission.id,
+        directOpportunityId,
+        metadataOpportunityId,
+      });
+    }
+    const sourceName = metadata.raw?.['Business Name'] || metadata.raw?.Name || metadata.raw?.Listing || metadata.name || '';
+    if (metadata.managed && sourceName && normalizeComparableText(submission.company) !== normalizeComparableText(sourceName)) {
+      nameMismatches.push({ submissionId: submission.id, opportunityId: submission.deal_hunter_opportunity_id || metadata.opportunityId || '', company: submission.company || '' });
+    }
+    const linkedImport = importsBySubmissionId.get(submission.id);
+    if (linkedImport?.status === 'crm-deleted' && submission.status !== 'archived') {
+      tombstoneActive.push({ submissionId: submission.id, importId: linkedImport.id, opportunityId: linkedImport.opportunity_id || '' });
+    }
+  }
+  const missingLinks = opportunities.filter((opportunity) => {
+    if (!opportunity.primary_submission_id) return false;
+    const submission = submissionsById.get(opportunity.primary_submission_id);
+    const declaredOpportunityId = submission?.deal_hunter_opportunity_id
+      || submission?.metadata?.dealHunter?.opportunityId
+      || '';
+    return !submission || declaredOpportunityId !== opportunity.opportunity_id;
+  }).map((opportunity) => ({ opportunityId: opportunity.opportunity_id, submissionId: opportunity.primary_submission_id }));
+  const safeToReconcile = ownershipHealth.healthy
+    && duplicatePrimaries.length === 0
+    && identityMismatches.length === 0
+    && tombstoneActive.length === 0
+    && missingLinks.length === 0;
+  return {
+    ok: safeToReconcile && nameMismatches.length === 0,
+    safeToReconcile,
+    generatedAt: new Date().toISOString(),
+    counts: {
+      imports: imports.length,
+      opportunities: opportunities.length,
+      submissions: submissions.length,
+      ownershipCollisions: ownershipHealth.collisions?.length || 0,
+      duplicatePrimaries: duplicatePrimaries.length,
+      identityMismatches: identityMismatches.length,
+      nameMismatches: nameMismatches.length,
+      tombstoneActive: tombstoneActive.length,
+      missingLinks: missingLinks.length,
+    },
+    ownershipHealth,
+    findings: { duplicatePrimaries, identityMismatches, nameMismatches, tombstoneActive, missingLinks },
+  };
+}
 
 export async function syncDealHunterHighFitsToCrm({
   confirmation = '',
