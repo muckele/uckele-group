@@ -8,8 +8,12 @@ process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
 process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
 
 const { createSqliteStorage } = await import('../server/storage/sqlite.js');
-const { fullRebuildConfirmation, refreshOpportunityScores, requestOpportunityScoreRefresh } =
-  await import('../server/services/dealHunterScoreStore.js');
+const {
+  fullRebuildConfirmation,
+  previewOpportunityScoreRefresh,
+  refreshOpportunityScores,
+  requestOpportunityScoreRefresh,
+} = await import('../server/services/dealHunterScoreStore.js');
 const { createManualSubmission } = await import('../server/services/submissions.js');
 const { DEAL_SCORING_RULES_VERSION } = await import('../server/services/dealHunterScoringPolicy.js');
 
@@ -84,7 +88,7 @@ test('the first refresh scores and persists evidence, and a repeat refresh write
 
   const first = await refreshOpportunityScores({ deals, storage });
   assert.equal(first.ok, true);
-  assert.deepEqual(first.counts, { considered: 1, scored: 1, skipped: 0, failed: 0 });
+  assert.deepEqual(first.counts, { considered: 1, scored: 1, skipped: 0, failed: 0, changed: 1, versionOnly: 0 });
 
   const stored = await storage.getDealHunterOpportunityScore('opp-refresh-1');
   assert.ok(stored.fit_score > 0);
@@ -98,7 +102,7 @@ test('the first refresh scores and persists evidence, and a repeat refresh write
 
   const second = await refreshOpportunityScores({ deals, storage });
   assert.equal(second.ok, true);
-  assert.deepEqual(second.counts, { considered: 1, scored: 0, skipped: 1, failed: 0 });
+  assert.deepEqual(second.counts, { considered: 1, scored: 0, skipped: 1, failed: 0, changed: 0, versionOnly: 0 });
   assert.equal(writes, 0, 'an unchanged opportunity must not be rewritten');
 
   const after = await storage.getDealHunterOpportunityScore('opp-refresh-1');
@@ -116,7 +120,7 @@ test('a material source change rescores and replaces evidence atomically', async
     deals: [scoredDeal({ annualProfit: 120000, annualRevenue: 400000 })],
     storage,
   });
-  assert.deepEqual(changed.counts, { considered: 1, scored: 1, skipped: 0, failed: 0 });
+  assert.deepEqual(changed.counts, { considered: 1, scored: 1, skipped: 0, failed: 0, changed: 1, versionOnly: 0 });
 
   const after = await storage.getDealHunterOpportunityScore('opp-refresh-1');
   assert.notEqual(after.score_fingerprint, before.score_fingerprint);
@@ -147,7 +151,7 @@ test('volatile bookkeeping alone does not trigger a rescore', async (t) => {
     })],
     storage,
   });
-  assert.deepEqual(noisy.counts, { considered: 1, scored: 0, skipped: 1, failed: 0 });
+  assert.deepEqual(noisy.counts, { considered: 1, scored: 0, skipped: 1, failed: 0, changed: 0, versionOnly: 0 });
 });
 
 test('operator decisions survive rescoring, forced refresh, and retries', async (t) => {
@@ -186,7 +190,9 @@ test('a forced refresh over unchanged inputs rewrites without claiming a change'
   });
 
   const forced = await refreshOpportunityScores({ deals: [scoredDeal()], storage, force: true });
-  assert.deepEqual(forced.counts, { considered: 1, scored: 1, skipped: 0, failed: 0 });
+  // Rewritten, but the conclusions are identical, so it is a version-only write
+  // and must not be reported or evented as a change.
+  assert.deepEqual(forced.counts, { considered: 1, scored: 1, skipped: 0, failed: 0, changed: 0, versionOnly: 1 });
 
   const after = await storage.getDealHunterOpportunityScore('opp-refresh-1');
   assert.equal(after.score_fingerprint, before.score_fingerprint);
@@ -215,7 +221,7 @@ test('a failed opportunity is reported without stopping the batch, and a retry r
   const partial = await refreshOpportunityScores({ deals, storage });
   assert.equal(partial.ok, false);
   assert.equal(partial.status, 207);
-  assert.deepEqual(partial.counts, { considered: 2, scored: 1, skipped: 0, failed: 1 });
+  assert.deepEqual(partial.counts, { considered: 2, scored: 1, skipped: 0, failed: 1, changed: 1, versionOnly: 0 });
   assert.equal(partial.errors[0].opportunityId, 'opp-refresh-2');
   assert.ok(await storage.getDealHunterOpportunityScore('opp-refresh-1'));
   assert.equal(await storage.getDealHunterOpportunityScore('opp-refresh-2'), null);
@@ -223,7 +229,7 @@ test('a failed opportunity is reported without stopping the batch, and a retry r
   // The retry redoes only the opportunity that did not land.
   const retry = await refreshOpportunityScores({ deals, storage });
   assert.equal(retry.ok, true);
-  assert.deepEqual(retry.counts, { considered: 2, scored: 1, skipped: 1, failed: 0 });
+  assert.deepEqual(retry.counts, { considered: 2, scored: 1, skipped: 1, failed: 0, changed: 1, versionOnly: 0 });
   assert.ok(await storage.getDealHunterOpportunityScore('opp-refresh-2'));
 });
 
@@ -237,7 +243,7 @@ test('refresh can be scoped to specific opportunities', async (t) => {
   ];
 
   const scoped = await refreshOpportunityScores({ deals, opportunityIds: ['opp-refresh-2'], storage });
-  assert.deepEqual(scoped.counts, { considered: 1, scored: 1, skipped: 0, failed: 0 });
+  assert.deepEqual(scoped.counts, { considered: 1, scored: 1, skipped: 0, failed: 0, changed: 1, versionOnly: 0 });
   assert.equal(await storage.getDealHunterOpportunityScore('opp-refresh-1'), null);
   assert.ok(await storage.getDealHunterOpportunityScore('opp-refresh-2'));
 });
@@ -248,7 +254,7 @@ test('unresolved canonical identities are never scored into the queue', async (t
     deals: [scoredDeal({ identityStatus: 'ambiguous' }), scoredDeal({ opportunityId: '', identityStatus: 'unavailable' })],
     storage,
   });
-  assert.deepEqual(result.counts, { considered: 0, scored: 0, skipped: 0, failed: 0 });
+  assert.deepEqual(result.counts, { considered: 0, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 });
 });
 
 test('a rescore emits one activity event only when the score actually moved', async (t) => {
@@ -314,4 +320,99 @@ test('scoring reports unavailable storage instead of failing opaquely', async ()
   assert.equal(result.ok, false);
   assert.equal(result.status, 503);
   assert.ok(result.missingMethods.includes('writeDealHunterOpportunityScore'));
+});
+
+// ---------------------------------------------------------------------------
+// Rules-version bump behaviour (Phase 3A.1)
+//
+// A rules bump stales every stored fingerprint. These assert that a bump which
+// reproduces the same conclusions is a version-only rewrite: it does not flood
+// the review queue and does not emit a rescore event.
+// ---------------------------------------------------------------------------
+
+test('a version-only rewrite does not flag a reviewed opportunity as changed', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage, 'opp-refresh-1');
+  await refreshOpportunityScores({ deals: [scoredDeal()], storage });
+
+  const scored = await storage.getDealHunterOpportunityScore('opp-refresh-1');
+  await storage.setDealHunterOpportunityOperatorDecision({
+    opportunityId: 'opp-refresh-1',
+    reviewed: true,
+    reviewedBy: 'owner@example.invalid',
+    reviewedFingerprint: scored.score_fingerprint,
+    reviewedSemanticDigest: scored.semantic_digest,
+  });
+  assert.equal((await storage.getDealHunterOpportunityScore('opp-refresh-1')).changed_since_review, false);
+
+  // Simulate the version bump: force a rewrite over identical inputs. The row is
+  // rewritten and its fingerprint may move, but the conclusions did not.
+  const forced = await refreshOpportunityScores({ deals: [scoredDeal()], storage, force: true });
+  assert.equal(forced.counts.versionOnly, 1);
+  assert.equal(forced.counts.changed, 0);
+
+  const after = await storage.getDealHunterOpportunityScore('opp-refresh-1');
+  assert.equal(after.changed_since_review, false, 'a version-only rewrite must not stale the review');
+  assert.equal(after.reviewed_by, 'owner@example.invalid');
+});
+
+test('a semantic change still flags a reviewed opportunity as changed', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage, 'opp-refresh-1');
+  await refreshOpportunityScores({ deals: [scoredDeal()], storage });
+
+  const scored = await storage.getDealHunterOpportunityScore('opp-refresh-1');
+  await storage.setDealHunterOpportunityOperatorDecision({
+    opportunityId: 'opp-refresh-1',
+    reviewed: true,
+    reviewedBy: 'owner@example.invalid',
+    reviewedFingerprint: scored.score_fingerprint,
+    reviewedSemanticDigest: scored.semantic_digest,
+  });
+
+  const changed = await refreshOpportunityScores({ deals: [scoredDeal({ annualProfit: 120000 })], storage });
+  assert.equal(changed.counts.changed, 1);
+  assert.equal(changed.counts.versionOnly, 0);
+
+  const after = await storage.getDealHunterOpportunityScore('opp-refresh-1');
+  assert.equal(after.changed_since_review, true);
+  assert.equal(after.reviewed_by, 'owner@example.invalid', 'the earlier review is remembered, not erased');
+});
+
+test('the refresh preview separates material change from version-only change and writes nothing', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage, 'opp-refresh-1');
+  await seedOpportunity(storage, 'opp-refresh-2');
+  const first = scoredDeal();
+  const second = scoredDeal({ opportunityId: 'opp-refresh-2', dealKey: 'deal-refresh-2', id: 'source-2' });
+  await refreshOpportunityScores({ deals: [first, second], storage });
+  const before = await storage.getDealHunterOpportunityScore('opp-refresh-1');
+
+  const preview = await previewOpportunityScoreRefresh({
+    deals: [first, scoredDeal({ opportunityId: 'opp-refresh-2', dealKey: 'deal-refresh-2', id: 'source-2', annualProfit: 120000 })],
+    storage,
+  });
+  assert.equal(preview.ok, true);
+  assert.equal(preview.preview, true);
+  assert.equal(preview.counts.considered, 2);
+  assert.equal(preview.counts.unchanged, 1, 'the untouched listing needs no write');
+  assert.equal(preview.counts.semanticChange, 1);
+  assert.equal(preview.counts.scoreChange, 1);
+  assert.equal(preview.counts.estimatedWrites, 1);
+  assert.equal(preview.proposedRulesVersion, 'deal-hunter-fit-v2.1');
+  assert.ok(preview.samples.some((item) => item.opportunityId === 'opp-refresh-2'));
+
+  // A preview is read-only.
+  const after = await storage.getDealHunterOpportunityScore('opp-refresh-1');
+  assert.equal(after.scored_at, before.scored_at);
+  assert.equal(after.score_fingerprint, before.score_fingerprint);
+});
+
+test('the preview counts opportunities that have never been scored', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage, 'opp-refresh-1');
+  const preview = await previewOpportunityScoreRefresh({ deals: [scoredDeal()], storage });
+  assert.equal(preview.counts.newlyScored, 1);
+  assert.equal(preview.counts.estimatedWrites, 1);
+  assert.equal(preview.counts.semanticChange, 0);
 });

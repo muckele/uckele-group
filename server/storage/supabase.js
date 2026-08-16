@@ -2627,7 +2627,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         const batch = ids.slice(index, index + 500);
         const { data, error } = await client
           .from('deal_hunter_opportunity_scores')
-          .select('opportunity_id, score_fingerprint, rules_version, engine_version, profile_version')
+          .select('opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version, profile_version')
           .in('opportunity_id', batch);
         if (error) throw error;
         rows.push(...(data || []));

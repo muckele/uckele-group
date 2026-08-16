@@ -255,9 +255,11 @@ test('fingerprint lookup returns only the columns the refresh gate needs', async
       .map((row) => row.score_fingerprint),
     ['fingerprint-a', 'fingerprint-two'],
   );
+  // semantic_digest joins the gate columns so the refresh can tell a material
+  // change from a version-only rewrite without a per-row lookup.
   assert.deepEqual(
     Object.keys(fingerprints[0]).sort(),
-    ['engine_version', 'opportunity_id', 'profile_version', 'rules_version', 'score_fingerprint'],
+    ['engine_version', 'opportunity_id', 'profile_version', 'rules_version', 'score_fingerprint', 'semantic_digest'],
   );
   assert.equal(await storage.listDealHunterOpportunityScoreFingerprints([]).then((rows) => rows.length), 0);
 });

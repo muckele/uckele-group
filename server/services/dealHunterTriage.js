@@ -233,9 +233,11 @@ export async function setTriageOperatorDecision({
   if (markReviewed) {
     decision.reviewed = true;
     decision.reviewedBy = normalizeText(actor, 160) || 'admin';
-    // Snapshotting the fingerprint the operator actually saw is what makes
-    // "changed since reviewed" meaningful later.
+    // Snapshotting what the operator actually saw is what makes "changed since
+    // reviewed" meaningful later. The semantic digest is the one that decides
+    // staleness; the fingerprint is kept for provenance and legacy rows.
     decision.reviewedFingerprint = current.score_fingerprint;
+    decision.reviewedSemanticDigest = current.semantic_digest;
   }
   if (decision.priority === undefined && decision.note === undefined && !decision.reviewed) {
     return { ok: false, status: 400, error: 'No operator decision was provided.' };

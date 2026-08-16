@@ -14,6 +14,7 @@ import {
   DEAL_SCORING_ENGINE_VERSION,
   DEAL_SCORING_PROFILE_VERSION,
   DEAL_SCORING_RULES_VERSION,
+  DEAL_SCORING_RULES_VERSION_PREVIOUS,
 } from './dealHunterScoringPolicy.js';
 import { scoreOpportunity } from './dealHunterScoring.js';
 
@@ -62,6 +63,7 @@ function machineScoreRow(deal, result) {
     high_fit: result.actionEligibility?.highFit === true,
     gate_count: result.gates.length,
     score_fingerprint: result.fingerprint,
+    semantic_digest: result.semanticDigest,
     engine_version: result.engineVersion,
     rules_version: result.rulesVersion,
     profile_version: result.profileVersion,
@@ -175,7 +177,7 @@ export async function refreshOpportunityScores({
       .map((row) => [row.opportunity_id, row]),
   );
 
-  const counts = { considered: scoped.length, scored: 0, skipped: 0, failed: 0 };
+  const counts = { considered: scoped.length, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 };
   const errors = [];
 
   for (const deal of scoped) {
@@ -189,12 +191,24 @@ export async function refreshOpportunityScores({
       // A forced refresh over identical inputs rewrites the row but must not
       // claim the opportunity changed. The batched fingerprint read already
       // answers this, so no per-opportunity lookup is needed to decide it.
-      const changed = !stored || stored.score_fingerprint !== result.fingerprint;
       const row = machineScoreRow(deal, result);
-      // The previous row is read only when an event will describe it.
-      const previous = changed ? await storage.getDealHunterOpportunityScore(deal.opportunityId) : null;
+      // An event describes a change in conclusions, not a change in version
+      // metadata, so it is gated on the semantic digest rather than the
+      // fingerprint. A rules bump that reproduces the same score is silent.
+      // The batched read already carries the stored digest, so deciding this
+      // costs no extra query.
+      const semanticallyChanged = !stored || stored.semantic_digest !== result.semanticDigest;
+      // The previous row is read only when an event will actually describe it.
+      const previous = semanticallyChanged
+        ? await storage.getDealHunterOpportunityScore(deal.opportunityId)
+        : null;
       await storage.writeDealHunterOpportunityScore(row, result.evidence);
-      if (changed) await emitRescoreEvent({ storage, deal, previous, row, actor });
+      if (semanticallyChanged) {
+        await emitRescoreEvent({ storage, deal, previous, row, actor });
+        counts.changed += 1;
+      } else {
+        counts.versionOnly += 1;
+      }
       counts.scored += 1;
     } catch (error) {
       counts.failed += 1;
@@ -210,6 +224,124 @@ export async function refreshOpportunityScores({
     rulesVersion: DEAL_SCORING_RULES_VERSION,
     engineVersion: DEAL_SCORING_ENGINE_VERSION,
     profileVersion: DEAL_SCORING_PROFILE_VERSION,
+  };
+}
+
+/**
+ * Preview what a refresh would do, writing nothing.
+ *
+ * This exists because a rules-version bump stales every stored fingerprint. The
+ * preview separates opportunities whose conclusions actually move from those
+ * whose only difference is version metadata, so an operator can see before
+ * executing whether a rebuild will flood the review queue.
+ */
+export async function previewOpportunityScoreRefresh({
+  deals = null,
+  opportunityIds = [],
+  reviewMode = 'full-backfill',
+  storage = getStorage(),
+} = {}) {
+  if (typeof storage.getDealHunterOpportunityScore !== 'function') {
+    return { ok: false, status: 503, error: 'Durable opportunity scoring storage is unavailable.' };
+  }
+
+  let candidates = Array.isArray(deals) ? deals : null;
+  if (!candidates) {
+    const collected = await collectScoredOpportunities({ reviewMode, storage });
+    candidates = collected.scoredDeals || [];
+  }
+  const requested = new Set(opportunityIds.map((id) => String(id || '').trim()).filter(Boolean));
+  const scoped = candidates
+    .filter((deal) => deal?.opportunityId && deal.identityStatus === 'resolved')
+    .filter((deal) => requested.size === 0 || requested.has(deal.opportunityId))
+    .slice(0, maxRefreshBatch);
+
+  const counts = {
+    considered: scoped.length,
+    newlyScored: 0,
+    unchanged: 0,
+    versionOnly: 0,
+    semanticChange: 0,
+    scoreChange: 0,
+    classificationChange: 0,
+    gateChange: 0,
+    evidenceOnlyChange: 0,
+    highFitToWatchlist: 0,
+    watchlistToHighFit: 0,
+    newlyGated: 0,
+    gateLifted: 0,
+    operatorPrioritized: 0,
+    reviewedAffected: 0,
+    reviewedFlaggedChanged: 0,
+    estimatedWrites: 0,
+  };
+  const samples = [];
+
+  for (const deal of scoped) {
+    const result = scoreOpportunity(deal);
+    const stored = await storage.getDealHunterOpportunityScore(deal.opportunityId);
+    if (!stored) {
+      counts.newlyScored += 1;
+      counts.estimatedWrites += 1;
+      continue;
+    }
+
+    const semanticChange = stored.semantic_digest !== result.semanticDigest;
+    const fingerprintChange = stored.score_fingerprint !== result.fingerprint;
+    if (!semanticChange && !fingerprintChange) {
+      counts.unchanged += 1;
+      continue;
+    }
+    counts.estimatedWrites += 1;
+    if (!semanticChange) {
+      // Same conclusions, different version metadata. This is the case a
+      // version bump produces and the case that must not flood review.
+      counts.versionOnly += 1;
+      continue;
+    }
+
+    counts.semanticChange += 1;
+    const scoreMoved = stored.fit_score !== result.fitScore;
+    const statusMoved = stored.score_status !== result.scoreStatus;
+    const gatesMoved = JSON.stringify((stored.gates || []).map((gate) => gate.ruleId).sort())
+      !== JSON.stringify(result.gates.map((gate) => gate.ruleId).sort());
+    if (scoreMoved) counts.scoreChange += 1;
+    if (statusMoved) counts.classificationChange += 1;
+    if (gatesMoved) counts.gateChange += 1;
+    if (!scoreMoved && !statusMoved && !gatesMoved) counts.evidenceOnlyChange += 1;
+    if (stored.high_fit && !(result.actionEligibility?.highFit === true)) counts.highFitToWatchlist += 1;
+    if (!stored.high_fit && result.actionEligibility?.highFit === true) counts.watchlistToHighFit += 1;
+    if (!stored.should_remove && result.shouldRemove) counts.newlyGated += 1;
+    if (stored.should_remove && !result.shouldRemove) counts.gateLifted += 1;
+    if (stored.operator_priority && stored.operator_priority !== 'normal') counts.operatorPrioritized += 1;
+    if (stored.reviewed_at) {
+      counts.reviewedAffected += 1;
+      counts.reviewedFlaggedChanged += 1;
+    }
+    if (samples.length < 25) {
+      samples.push({
+        opportunityId: deal.opportunityId,
+        previousScore: stored.fit_score,
+        score: result.fitScore,
+        previousStatus: stored.score_status,
+        status: result.scoreStatus,
+        reviewed: Boolean(stored.reviewed_at),
+        operatorPriority: stored.operator_priority || 'normal',
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    status: 200,
+    preview: true,
+    currentRulesVersion: DEAL_SCORING_RULES_VERSION_PREVIOUS,
+    proposedRulesVersion: DEAL_SCORING_RULES_VERSION,
+    engineVersion: DEAL_SCORING_ENGINE_VERSION,
+    profileVersion: DEAL_SCORING_PROFILE_VERSION,
+    counts,
+    samples,
+    confirmationRequired: fullRebuildConfirmation,
   };
 }
 

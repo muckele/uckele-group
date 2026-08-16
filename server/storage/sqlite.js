@@ -350,7 +350,14 @@ function normalizeDealHunterOpportunityScoreRow(row) {
         missing_evidence: parseJsonColumn(row.missing_evidence, []),
         confidence_reasons: parseJsonColumn(row.confidence_reasons, []),
         summary: parseJsonColumn(row.summary, {}),
-        changed_since_review: Boolean(row.reviewed_fingerprint) && row.reviewed_fingerprint !== row.score_fingerprint,
+        // A review is stale only when the score's *conclusions* moved. Rows
+        // reviewed before semantic digests existed fall back to comparing the
+        // input fingerprint, which is the previous, coarser behaviour.
+        changed_since_review: Boolean(row.reviewed_at) && (
+          row.reviewed_semantic_digest
+            ? row.reviewed_semantic_digest !== row.semantic_digest
+            : Boolean(row.reviewed_fingerprint) && row.reviewed_fingerprint !== row.score_fingerprint
+        ),
         reviewed: Boolean(row.reviewed_at),
       }
     : null;
@@ -1257,6 +1264,7 @@ export function createSqliteStorage(config) {
         high_fit INTEGER NOT NULL DEFAULT 0,
         gate_count INTEGER NOT NULL DEFAULT 0,
         score_fingerprint TEXT NOT NULL,
+        semantic_digest TEXT,
         engine_version TEXT NOT NULL,
         rules_version TEXT NOT NULL,
         profile_version TEXT NOT NULL,
@@ -1273,6 +1281,7 @@ export function createSqliteStorage(config) {
         reviewed_at TEXT,
         reviewed_by TEXT,
         reviewed_fingerprint TEXT,
+        reviewed_semantic_digest TEXT,
         operator_updated_at TEXT
       );
 
@@ -1827,6 +1836,8 @@ export function createSqliteStorage(config) {
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'submission_id', 'TEXT');
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'source_name', 'TEXT');
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'opportunity_id', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'semantic_digest', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_semantic_digest', 'TEXT');
   ensureColumn(database, 'deal_hunter_deal_os_imports', 'source_row_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(database, 'deal_hunter_deal_os_imports', 'accepted_row_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(database, 'deal_hunter_deal_os_imports', 'rejected_row_count', 'INTEGER NOT NULL DEFAULT 0');
@@ -5188,6 +5199,7 @@ export function createSqliteStorage(config) {
           high_fit: score.high_fit ? 1 : 0,
           gate_count: Number(score.gate_count || 0),
           score_fingerprint: String(score.score_fingerprint || ''),
+          semantic_digest: score.semantic_digest ? String(score.semantic_digest) : null,
           engine_version: String(score.engine_version || ''),
           rules_version: String(score.rules_version || ''),
           profile_version: String(score.profile_version || ''),
@@ -5206,13 +5218,13 @@ export function createSqliteStorage(config) {
             INSERT INTO deal_hunter_opportunity_scores (
               opportunity_id, created_at, scored_at, deal_key, name, state, listing_url, fit_score, score_status, confidence,
               completeness_score, contradiction_count, missing_evidence_count, should_remove, high_fit,
-              gate_count, score_fingerprint, engine_version, rules_version, profile_version,
+              gate_count, score_fingerprint, semantic_digest, engine_version, rules_version, profile_version,
               completeness_policy_version, dimensions, gates, applied_caps, missing_evidence,
               confidence_reasons, summary
             ) VALUES (
               @opportunity_id, @created_at, @scored_at, @deal_key, @name, @state, @listing_url, @fit_score, @score_status, @confidence,
               @completeness_score, @contradiction_count, @missing_evidence_count, @should_remove, @high_fit,
-              @gate_count, @score_fingerprint, @engine_version, @rules_version, @profile_version,
+              @gate_count, @score_fingerprint, @semantic_digest, @engine_version, @rules_version, @profile_version,
               @completeness_policy_version, @dimensions, @gates, @applied_caps, @missing_evidence,
               @confidence_reasons, @summary
             )
@@ -5232,6 +5244,7 @@ export function createSqliteStorage(config) {
               high_fit = excluded.high_fit,
               gate_count = excluded.gate_count,
               score_fingerprint = excluded.score_fingerprint,
+              semantic_digest = excluded.semantic_digest,
               engine_version = excluded.engine_version,
               rules_version = excluded.rules_version,
               profile_version = excluded.profile_version,
@@ -5299,10 +5312,15 @@ export function createSqliteStorage(config) {
           params.operator_note = decision.note === null ? null : String(decision.note);
         }
         if (decision.reviewed) {
-          assignments.push('reviewed_at = @reviewed_at', 'reviewed_by = @reviewed_by', 'reviewed_fingerprint = @reviewed_fingerprint');
+          assignments.push(
+            'reviewed_at = @reviewed_at', 'reviewed_by = @reviewed_by',
+            'reviewed_fingerprint = @reviewed_fingerprint', 'reviewed_semantic_digest = @reviewed_semantic_digest',
+          );
           params.reviewed_at = decision.reviewedAt || params.operator_updated_at;
           params.reviewed_by = String(decision.reviewedBy || 'admin');
           params.reviewed_fingerprint = String(decision.reviewedFingerprint || '');
+          params.reviewed_semantic_digest = decision.reviewedSemanticDigest
+            ? String(decision.reviewedSemanticDigest) : null;
         }
         if (assignments.length === 0) return this.getDealHunterOpportunityScore(opportunityId);
         database.prepare(`
@@ -5326,7 +5344,7 @@ export function createSqliteStorage(config) {
         for (let index = 0; index < ids.length; index += 500) {
           const batch = ids.slice(index, index + 500);
           rows.push(...database.prepare(`
-            SELECT opportunity_id, score_fingerprint, rules_version, engine_version, profile_version
+            SELECT opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version, profile_version
             FROM deal_hunter_opportunity_scores
             WHERE opportunity_id IN (${batch.map(() => '?').join(', ')})
           `).all(...batch));
@@ -5364,7 +5382,11 @@ export function createSqliteStorage(config) {
         } else {
           clauses.push('disposition.deal_key IS NULL');
           if (view === 'needs-review') {
-            clauses.push('(scores.reviewed_at IS NULL OR scores.reviewed_fingerprint IS NULL OR scores.reviewed_fingerprint <> scores.score_fingerprint)');
+            clauses.push(`(scores.reviewed_at IS NULL OR (
+              CASE WHEN scores.reviewed_semantic_digest IS NOT NULL
+                THEN scores.reviewed_semantic_digest <> COALESCE(scores.semantic_digest, '')
+                ELSE scores.reviewed_fingerprint IS NULL OR scores.reviewed_fingerprint <> scores.score_fingerprint
+              END))`);
             clauses.push('scores.should_remove = 0');
           } else if (view === 'high-priority') {
             clauses.push("(scores.high_fit = 1 OR scores.operator_priority IN ('urgent', 'high'))");
@@ -5408,7 +5430,11 @@ export function createSqliteStorage(config) {
           completeness: 'scores.completeness_score',
           'scored-at': 'scores.scored_at',
           name: 'LOWER(COALESCE(scores.name, \'\'))',
-          changed: 'CASE WHEN scores.reviewed_fingerprint IS NULL OR scores.reviewed_fingerprint <> scores.score_fingerprint THEN 1 ELSE 0 END',
+          changed: `CASE WHEN scores.reviewed_at IS NULL THEN 1
+            WHEN scores.reviewed_semantic_digest IS NOT NULL
+              THEN CASE WHEN scores.reviewed_semantic_digest <> COALESCE(scores.semantic_digest, '') THEN 1 ELSE 0 END
+            WHEN scores.reviewed_fingerprint IS NULL OR scores.reviewed_fingerprint <> scores.score_fingerprint THEN 1
+            ELSE 0 END`,
         };
         const sortColumn = sortColumns[String(sort || 'fit-score')] || sortColumns['fit-score'];
         // opportunity_id is always the final key so pagination is stable when

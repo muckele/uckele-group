@@ -36,6 +36,7 @@ import { getEmailReadiness } from './services/emailReadiness.js';
 import { sendAdminEmailTestEmail } from './services/delivery.js';
 import { checkReadiness } from './services/readiness.js';
 import {
+  previewOpportunityScoreRefresh,
   refreshOpportunityScores,
   requestOpportunityScoreRefresh,
 } from './services/dealHunterScoreStore.js';
@@ -1400,6 +1401,21 @@ export function createApp() {
         markReviewed: Boolean(request.body?.markReviewed),
         actor: session.username || 'admin',
       });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/scores/refresh/preview',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      // Read-only: reports what a refresh would change without writing.
+      const requestedIds = Array.isArray(request.body?.opportunityIds) ? request.body.opportunityIds.slice(0, 1000) : [];
+      const result = await previewOpportunityScoreRefresh({ opportunityIds: requestedIds });
       response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );

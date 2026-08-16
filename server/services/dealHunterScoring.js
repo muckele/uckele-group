@@ -85,6 +85,34 @@ export function dealScoreFingerprint(deal = {}) {
   return sha256(JSON.stringify(dealScoreFingerprintInput(deal)));
 }
 
+/**
+ * Digest of what a score *concludes*, ignoring how it was computed.
+ *
+ * The fingerprint answers "should this be rescored" and therefore includes the
+ * rules and matcher versions. This digest answers the different question "should
+ * a human look again", so it deliberately excludes every version field. A rules
+ * bump that reproduces the same conclusions leaves this digest unchanged, which
+ * is what stops a version bump from flooding the review queue.
+ */
+export function dealSemanticDigest(result = {}) {
+  return sha256(JSON.stringify({
+    fitScore: result.fitScore ?? null,
+    scoreStatus: result.scoreStatus || '',
+    shouldRemove: Boolean(result.shouldRemove),
+    confidence: result.confidence || '',
+    completenessScore: result.completenessScore ?? null,
+    highFit: result.actionEligibility?.highFit === true,
+    cimRequest: result.actionEligibility?.cimRequest === true,
+    gates: (result.gates || []).map((gate) => gate.ruleId).sort(),
+    appliedCaps: (result.appliedCaps || []).map((cap) => `${cap.ruleId}:${cap.cap}`).sort(),
+    dimensions: (result.dimensions || [])
+      .map((dimension) => ({ id: dimension.id, contribution: dimension.contribution, verdict: dimension.verdict }))
+      .sort((left, right) => left.id.localeCompare(right.id)),
+    missingEvidence: [...(result.missingEvidence || [])].sort(),
+    contradictionCount: result.contradictionCount ?? 0,
+  }));
+}
+
 function provenanceFor(deal, field) {
   const entry = deal.fieldProvenance?.[field];
   return {
@@ -284,7 +312,7 @@ export function scoreOpportunity(deal = {}) {
     confidenceReasons.push(`Sources disagree on ${row.field}; the canonical value was preserved.`);
   }
 
-  return {
+  const result = {
     // `fitScore` is the v2 score verbatim. Nothing in this module recomputes it.
     fitScore: scored.score,
     scoreStatus: scored.scoreStatus,
@@ -316,4 +344,6 @@ export function scoreOpportunity(deal = {}) {
     fingerprint: dealScoreFingerprint(deal),
     scoredDeal: scored,
   };
+  result.semanticDigest = dealSemanticDigest(result);
+  return result;
 }
