@@ -170,6 +170,8 @@ fly status -a uckele-group
 curl -i https://www.uckelegroup.com/api/ready
 ```
 
+In production the server sends Vite's fingerprinted `/assets/*` bundles with a one-year immutable cache policy, because changing their content changes their filename. Entry documents, including every client-routed path, are sent `no-cache` so a deploy is picked up on the next request. The application deliberately does not compress responses itself: the Fly proxy compresses at the edge for any response that arrives without a `Content-Encoding` header, so adding compression middleware would only disable that.
+
 See [docs/deployment.md](docs/deployment.md), [docs/backend-setup.md](docs/backend-setup.md), and the [guarded CIM Stage 2 rollout runbook](docs/cim-stage2-rollout.md) for the full provider and production checklist.
 
 For the CRM follow-up rollout, provider receiving setup, compliance review, monitoring, ambiguous-send incident handling, and rollback procedure, see [docs/follow-up-operations.md](docs/follow-up-operations.md). Deployment is a separate, explicit operator action; this repository does not enable the feature or perform live sends by itself.

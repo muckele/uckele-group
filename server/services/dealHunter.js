@@ -7287,13 +7287,39 @@ async function listAllSubmissionsForDealHunterAudit(storage) {
   return submissions;
 }
 
+// The audit only reasons about records that carry a Deal Hunter link or that an
+// import or opportunity claims, so it reads exactly that set rather than the
+// whole CRM. Anything an import or opportunity points at is fetched by id even
+// when the record itself carries no link, which is precisely the broken state
+// the tombstone and missing-link checks exist to catch. Providers without the
+// narrow lookups fall back to the exhaustive read, so coverage never shrinks.
+async function listDealHunterAuditSubmissions(storage, { imports = [], opportunities = [] } = {}) {
+  if (typeof storage.listDealHunterLinkedSubmissions !== 'function'
+    || typeof storage.listSubmissionsByIds !== 'function') {
+    return listAllSubmissionsForDealHunterAudit(storage);
+  }
+
+  const submissionsById = new Map();
+  for (const submission of await storage.listDealHunterLinkedSubmissions({ limit: 100000 })) {
+    submissionsById.set(submission.id, submission);
+  }
+  const claimedIds = uniqueStrings([
+    ...imports.map((record) => record.submission_id),
+    ...opportunities.map((record) => record.primary_submission_id),
+  ]).filter((id) => !submissionsById.has(id));
+  for (const submission of await storage.listSubmissionsByIds(claimedIds, { limit: 100000 })) {
+    submissionsById.set(submission.id, submission);
+  }
+  return [...submissionsById.values()];
+}
+
 export async function auditDealHunterCrmIntegrity({ storage = getStorage() } = {}) {
-  const [imports, opportunities, submissions, ownershipHealth] = await Promise.all([
+  const [imports, opportunities, ownershipHealth] = await Promise.all([
     storage.listDealHunterCrmImports?.({ limit: 100000 }) || [],
     storage.listDealHunterOpportunities?.({ limit: 100000 }) || [],
-    listAllSubmissionsForDealHunterAudit(storage),
     storage.getDealHunterCanonicalCrmOwnershipHealth?.() || { healthy: false, collisions: [] },
   ]);
+  const submissions = await listDealHunterAuditSubmissions(storage, { imports, opportunities });
   const claimsByOpportunity = new Map();
   const addClaim = (opportunityId, kind, id) => {
     if (!opportunityId) return;
@@ -7309,7 +7335,7 @@ export async function auditDealHunterCrmIntegrity({ storage = getStorage() } = {
   const nameMismatches = [];
   const tombstoneActive = [];
   for (const [opportunityId, claims] of claimsByOpportunity.entries()) {
-    const submissionIds = uniqueStrings(claims.filter((claim) => claim.kind !== 'import').map((claim) => claim.id));
+    const submissionIds = uniqueStrings(claims.filter((claim) => claim.kind !== 'import').map((claim) => claim.id)).sort();
     if (submissionIds.length > 1) duplicatePrimaries.push({ opportunityId, submissionIds });
   }
   const importsBySubmissionId = new Map(imports
@@ -7344,6 +7370,21 @@ export async function auditDealHunterCrmIntegrity({ storage = getStorage() } = {
       || '';
     return !submission || declaredOpportunityId !== opportunity.opportunity_id;
   }).map((opportunity) => ({ opportunityId: opportunity.opportunity_id, submissionId: opportunity.primary_submission_id }));
+  // Findings are ordered by their own identifiers rather than by however storage
+  // happened to return the rows, so two audits over the same data produce byte
+  // identical reports and can be diffed across runs.
+  const orderFindings = (findings, ...keys) => findings.sort((left, right) => {
+    for (const key of keys) {
+      const comparison = String(left[key] || '').localeCompare(String(right[key] || ''));
+      if (comparison !== 0) return comparison;
+    }
+    return 0;
+  });
+  orderFindings(duplicatePrimaries, 'opportunityId');
+  orderFindings(identityMismatches, 'submissionId');
+  orderFindings(nameMismatches, 'submissionId');
+  orderFindings(tombstoneActive, 'submissionId');
+  orderFindings(missingLinks, 'opportunityId', 'submissionId');
   const safeToReconcile = ownershipHealth.healthy
     && duplicatePrimaries.length === 0
     && identityMismatches.length === 0
@@ -7356,7 +7397,8 @@ export async function auditDealHunterCrmIntegrity({ storage = getStorage() } = {
     counts: {
       imports: imports.length,
       opportunities: opportunities.length,
-      submissions: submissions.length,
+      // Deal Hunter-linked and claimed records examined, not the CRM total.
+      auditedSubmissions: submissions.length,
       ownershipCollisions: ownershipHealth.collisions?.length || 0,
       duplicatePrimaries: duplicatePrimaries.length,
       identityMismatches: identityMismatches.length,

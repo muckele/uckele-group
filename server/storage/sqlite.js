@@ -3374,6 +3374,38 @@ export function createSqliteStorage(config) {
       return row ? normalizeSubmissionRow(row) : null;
     },
 
+    // Every Deal Hunter integrity check concerns a record that carries a
+    // canonical link, a managed marker, or the daily-review source. Reading only
+    // those avoids paging the entire CRM through JSON parsing on every audit.
+    // The direct column is uniquely indexed; the metadata predicates also cover
+    // records linked before that column existed, so nothing is missed.
+    async listDealHunterLinkedSubmissions({ limit = 100000 } = {}) {
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 100000, 1000000));
+      return database.prepare(`
+        SELECT * FROM contact_submissions
+        WHERE (deal_hunter_opportunity_id IS NOT NULL AND deal_hunter_opportunity_id <> '')
+           OR source = 'deal-hunter-daily-review'
+           OR COALESCE(json_extract(metadata, '$.dealHunter.opportunityId'), '') <> ''
+           OR json_extract(metadata, '$.dealHunter.managed') IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT ?
+      `).all(safeLimit).map(normalizeSubmissionRow);
+    },
+
+    async listSubmissionsByIds(ids = [], { limit = 100000 } = {}) {
+      const safeIds = normalizeList(ids, 100000).slice(0, Math.max(1, Math.min(Number(limit) || 100000, 1000000)));
+      if (safeIds.length === 0) return [];
+      const rows = [];
+      // SQLite bounds host parameters per statement, so read in batches.
+      for (let index = 0; index < safeIds.length; index += 500) {
+        const batch = safeIds.slice(index, index + 500);
+        rows.push(...database.prepare(
+          `SELECT * FROM contact_submissions WHERE id IN (${batch.map(() => '?').join(', ')})`,
+        ).all(...batch));
+      }
+      return rows.map(normalizeSubmissionRow);
+    },
+
     async getSubmissionStrict(id) {
       const row = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(id);
       return row ? normalizeSubmissionRow(row) : null;

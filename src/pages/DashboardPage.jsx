@@ -1,4 +1,4 @@
-import React, { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import React, { lazy, startTransition, Suspense, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { Navigate, NavLink, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   Activity,
@@ -24,15 +24,25 @@ import PageHero from '../components/PageHero';
 import Reveal from '../components/Reveal';
 import Seo from '../components/Seo';
 import CrmNavigation from '../components/admin/CrmNavigation';
-import DealActivityTimeline from '../components/admin/DealActivityTimeline';
-import OperationsCenter from '../components/admin/OperationsCenter';
-import DealHunterWorkspace from '../components/admin/DealHunterWorkspace';
-import CimRequestHistory from '../components/admin/CimRequestHistory';
-import CrmCommunications from '../components/admin/CrmCommunications';
-import UnassignedCommunicationsInbox from '../components/admin/UnassignedCommunicationsInbox';
-import FollowUpsWorkspace from '../components/admin/FollowUpsWorkspace';
-import AdminOnboarding from '../components/admin/AdminOnboarding';
 import { adminSectionMeta } from '../content/adminSectionMeta';
+
+// Each of these renders behind a section gate or the CRM detail view, so the
+// operator only pays for the workspace they opened instead of downloading every
+// workspace with the dashboard shell. AdminOnboarding is split for the same
+// reason: it carries the guided-tour dependency and is never needed for first
+// paint. Navigation, URLs, and render conditions are unchanged.
+const AdminOnboarding = lazy(() => import('../components/admin/AdminOnboarding'));
+const CimRequestHistory = lazy(() => import('../components/admin/CimRequestHistory'));
+const CrmCommunications = lazy(() => import('../components/admin/CrmCommunications'));
+const DealActivityTimeline = lazy(() => import('../components/admin/DealActivityTimeline'));
+const DealHunterWorkspace = lazy(() => import('../components/admin/DealHunterWorkspace'));
+const FollowUpsWorkspace = lazy(() => import('../components/admin/FollowUpsWorkspace'));
+const OperationsCenter = lazy(() => import('../components/admin/OperationsCenter'));
+const UnassignedCommunicationsInbox = lazy(() => import('../components/admin/UnassignedCommunicationsInbox'));
+
+function WorkspaceFallback() {
+  return <div className="panel p-7 text-sm leading-7 text-ink/70">Loading...</div>;
+}
 
 const statuses = ['sourced', 'new', 'review', 'contacted', 'archived', 'spam'];
 const editableStatuses = ['sourced', 'new', 'review', 'contacted', 'spam'];
@@ -3565,11 +3575,13 @@ export default function DashboardPage() {
             )}
 
             <div className="admin-action-row">
-              <AdminOnboarding
-                scope={onboardingScope}
-                sessionIdentity={`${authState.role}:${authState.username}`}
-                userRole={authState.role}
-              />
+              <Suspense fallback={null}>
+                <AdminOnboarding
+                  scope={onboardingScope}
+                  sessionIdentity={`${authState.role}:${authState.username}`}
+                  userRole={authState.role}
+                />
+              </Suspense>
               {showNewRecordAction || showExportAction || showDailyUpdateAction ? (
                 <>
                 {showNewRecordAction ? (
@@ -3678,21 +3690,23 @@ export default function DashboardPage() {
           <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">System health, history, and recovery readiness</h2>
           <p className="mt-3 max-w-3xl text-sm leading-7 text-ink/68">Operational visibility for readiness gates, scheduler runs, sources, storage, and recovery. Read-only users receive aggregate privacy-safe status; release controls require a full administrator.</p>
         </div>
-        <OperationsCenter
-          cimAutomationUpdating={cimAutomationUpdating}
-          cimOutreachUpdating={cimOutreachUpdating}
-          cimStage2Updating={cimStage2Updating}
-          data={operations}
-          emailTestSending={emailTestSending}
-          error={operationsError}
-          loading={operationsLoading}
-          onActivateCimStage2={handleActivateCimStage2}
-          onRunCimStage2={handleRunCimStage2}
-          onToggleCimAutomation={handleToggleCimAutomation}
-          onToggleCimOutreach={handleToggleCimOutreach}
-          onSendEmailTest={handleSendEmailTest}
-          readOnly={isReadOnly}
-        />
+        <Suspense fallback={<WorkspaceFallback />}>
+          <OperationsCenter
+            cimAutomationUpdating={cimAutomationUpdating}
+            cimOutreachUpdating={cimOutreachUpdating}
+            cimStage2Updating={cimStage2Updating}
+            data={operations}
+            emailTestSending={emailTestSending}
+            error={operationsError}
+            loading={operationsLoading}
+            onActivateCimStage2={handleActivateCimStage2}
+            onRunCimStage2={handleRunCimStage2}
+            onToggleCimAutomation={handleToggleCimAutomation}
+            onToggleCimOutreach={handleToggleCimOutreach}
+            onSendEmailTest={handleSendEmailTest}
+            readOnly={isReadOnly}
+          />
+        </Suspense>
       </section>
       ) : null}
 
@@ -3876,7 +3890,7 @@ export default function DashboardPage() {
       ) : null}
 
       {activeSection === 'deal-hunter' ? (
-        <>
+        <Suspense fallback={<div className="section-shell mt-8"><WorkspaceFallback /></div>}>
           <DealHunterWorkspace
             bulkSending={dealHunterBulkCimSending}
             crmSyncing={dealHunterCrmSyncing}
@@ -3959,10 +3973,14 @@ export default function DashboardPage() {
               />
             </section>
           ) : null}
-        </>
+        </Suspense>
       ) : null}
 
-      {activeSection === 'follow-ups' ? <FollowUpsWorkspace readOnly={isReadOnly} /> : null}
+      {activeSection === 'follow-ups' ? (
+        <Suspense fallback={<div className="section-shell mt-8"><WorkspaceFallback /></div>}>
+          <FollowUpsWorkspace readOnly={isReadOnly} />
+        </Suspense>
+      ) : null}
 
       {activeSection === 'new-record' && !isReadOnly ? (
         <section className="section-shell mt-8">
@@ -4927,27 +4945,31 @@ export default function DashboardPage() {
                   </div>
                 </fieldset>
 
-                <CrmCommunications
-                  cimRequestOptions={crmCimRequestOptions}
-                  communications={crmCommunications.rows}
-                  error={crmCommunications.error}
-                  hasMore={crmCommunicationsHasMore}
-                  loading={crmCommunications.loading}
-                  loadingMore={crmCommunications.loadingMore}
-                  logError={crmCommunications.logError}
-                  logPending={crmCommunications.logPending}
-                  onLoadMore={() => loadCrmCommunications(submission.id, { append: true })}
-                  onLogCommunication={isReadOnly ? undefined : handleLogCommunication}
-                  readOnly={isReadOnly}
-                  workflowUpdatesDisabled={submission.status === 'archived'}
-                />
+                <Suspense fallback={<WorkspaceFallback />}>
+                  <CrmCommunications
+                    cimRequestOptions={crmCimRequestOptions}
+                    communications={crmCommunications.rows}
+                    error={crmCommunications.error}
+                    hasMore={crmCommunicationsHasMore}
+                    loading={crmCommunications.loading}
+                    loadingMore={crmCommunications.loadingMore}
+                    logError={crmCommunications.logError}
+                    logPending={crmCommunications.logPending}
+                    onLoadMore={() => loadCrmCommunications(submission.id, { append: true })}
+                    onLogCommunication={isReadOnly ? undefined : handleLogCommunication}
+                    readOnly={isReadOnly}
+                    workflowUpdatesDisabled={submission.status === 'archived'}
+                  />
+                </Suspense>
 
                 <div data-admin-tour="crm-detail-actions">
-                  <DealActivityTimeline
-                    error={dealActivity.error}
-                    events={dealActivity.events}
-                    loading={dealActivity.loading}
-                  />
+                  <Suspense fallback={<WorkspaceFallback />}>
+                    <DealActivityTimeline
+                      error={dealActivity.error}
+                      events={dealActivity.events}
+                      loading={dealActivity.loading}
+                    />
+                  </Suspense>
 
                   {!isReadOnly ? (
                   <>

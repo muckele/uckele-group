@@ -286,6 +286,26 @@ function publicSecureUploadRequest(requestRecord) {
   };
 }
 
+// Vite fingerprints everything it emits under /assets, so those URLs can never
+// go stale: changing the content changes the filename. Entry documents are not
+// fingerprinted, so they revalidate and a deploy is picked up immediately.
+// Anything else in dist keeps serve-static's revalidating default.
+// Compression is deliberately absent: the Fly proxy compresses at the edge for
+// responses that do not already carry a Content-Encoding header.
+export const immutableAssetCacheControl = `public, max-age=${365 * 24 * 60 * 60}, immutable`;
+export const entryDocumentCacheControl = 'no-cache';
+
+export function setStaticAssetHeaders(response, filePath) {
+  const relativePath = path.relative(distDirectory, filePath);
+  if (relativePath === 'assets' || relativePath.startsWith(`assets${path.sep}`)) {
+    response.setHeader('Cache-Control', immutableAssetCacheControl);
+    return;
+  }
+  if (path.extname(filePath).toLowerCase() === '.html') {
+    response.setHeader('Cache-Control', entryDocumentCacheControl);
+  }
+}
+
 // The reconciliation plan is executed whole server-side; the response only has
 // to stay small enough to render, so item bounding belongs here rather than in
 // the plan itself. `dealsByOpportunity` is an in-process carry-over.
@@ -2017,7 +2037,7 @@ export function createApp() {
   });
 
   if (config.isProduction) {
-    app.use(express.static(distDirectory, { redirect: false }));
+    app.use(express.static(distDirectory, { redirect: false, setHeaders: setStaticAssetHeaders }));
 
     app.get('*', (request, response) => {
       const routePath = request.path.replace(/^\/+|\/+$/g, '');
@@ -2026,6 +2046,7 @@ export function createApp() {
         : path.join(distDirectory, 'index.html');
       const staysInsideDist = routeIndex === distDirectory || routeIndex.startsWith(`${distDirectory}${path.sep}`);
 
+      response.setHeader('Cache-Control', entryDocumentCacheControl);
       response.sendFile(staysInsideDist && existsSync(routeIndex) ? routeIndex : path.join(distDirectory, 'index.html'));
     });
   }

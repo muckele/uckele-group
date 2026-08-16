@@ -39,3 +39,5 @@ Each CRM record stores the scoring rule version, completeness policy version, mi
 ## Integrity audit
 
 `npm run crm:integrity:audit` is read-only. It reports canonical ownership collisions, multiple primaries, direct-versus-metadata identity mismatches, visible company/source-name mismatches, active records attached to deletion tombstones, and missing direct ownership links. The command rejects `--apply`; repairs require a separately reviewed manifest and a verified backup.
+
+The audit reads only the records it can reason about: those carrying a canonical link, a managed marker, or the daily-review source, plus anything an import or opportunity claims by id even when that record carries no link of its own. Unrelated CRM traffic is never pulled in. `counts.auditedSubmissions` is therefore the number of records examined, not the size of the CRM. Findings are ordered by their own identifiers, so two audits over unchanged data produce identical reports and can be diffed across runs. Storage providers without the narrow lookups fall back to reading every submission, so coverage is the same either way.
