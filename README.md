@@ -174,6 +174,8 @@ In production the server sends Vite's fingerprinted `/assets/*` bundles with a o
 
 See [docs/deployment.md](docs/deployment.md), [docs/backend-setup.md](docs/backend-setup.md), and the [guarded CIM Stage 2 rollout runbook](docs/cim-stage2-rollout.md) for the full provider and production checklist.
 
+Deal Hunter scoring, evidence provenance, fingerprint-gated rescoring, machine-versus-operator ownership, and the triage queue are documented in [docs/deal-scoring-and-triage.md](docs/deal-scoring-and-triage.md). Scoring is fully deterministic and requires no model provider.
+
 For the CRM follow-up rollout, provider receiving setup, compliance review, monitoring, ambiguous-send incident handling, and rollback procedure, see [docs/follow-up-operations.md](docs/follow-up-operations.md). Deployment is a separate, explicit operator action; this repository does not enable the feature or perform live sends by itself.
 
 ## Continuous integration

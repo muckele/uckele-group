@@ -280,11 +280,16 @@ test('a rescore emits one activity event only when the score actually moved', as
   const afterChange = await storage.listCrmActivityEvents({ submissionId: submission.id, limit: 50 });
   const rescores = afterChange.filter((event) => event.event_type === 'opportunity.rescored');
   assert.equal(rescores.length, 2);
-  const latest = rescores[0];
-  assert.equal(typeof latest.metadata.previousScore, 'number');
-  assert.notEqual(latest.metadata.previousFingerprint, latest.metadata.fingerprint);
-  assert.ok(Array.isArray(latest.metadata.dimensionChanges));
-  assert.ok(latest.metadata.dimensionChanges.some((change) => change.dimension === 'financial-fit'));
+  // Events written in the same millisecond have no guaranteed order, so assert
+  // on the pair rather than on a position.
+  const initial = rescores.filter((event) => event.metadata.previousScore === null);
+  const moved = rescores.filter((event) => typeof event.metadata.previousScore === 'number');
+  assert.equal(initial.length, 1, 'exactly one event records the first scoring');
+  assert.equal(moved.length, 1, 'exactly one event records the score moving');
+  assert.notEqual(moved[0].metadata.previousFingerprint, moved[0].metadata.fingerprint);
+  assert.equal(moved[0].metadata.rulesVersion, 'deal-hunter-fit-v2');
+  assert.ok(Array.isArray(moved[0].metadata.dimensionChanges));
+  assert.ok(moved[0].metadata.dimensionChanges.some((change) => change.dimension === 'financial-fit'));
 });
 
 test('a full forced rebuild requires the typed confirmation', async (t) => {

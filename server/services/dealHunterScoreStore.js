@@ -99,7 +99,9 @@ function meaningfulDimensionChanges(previousDimensions = [], nextDimensions = []
 async function emitRescoreEvent({ storage, deal, previous, row, actor }) {
   // Activity events hang off a CRM record. A sourced opportunity with no linked
   // submission has nothing to attach to; its score row and fingerprint are the
-  // durable audit trail in that case.
+  // durable audit trail in that case. The lookup happens here, and only for an
+  // opportunity whose score actually moved, so a large rebuild does not pay it
+  // per candidate.
   const opportunity = storage.getDealHunterOpportunity
     ? await storage.getDealHunterOpportunity(deal.opportunityId)
     : null;
@@ -184,11 +186,13 @@ export async function refreshOpportunityScores({
         counts.skipped += 1;
         continue;
       }
-      const previous = await storage.getDealHunterOpportunityScore(deal.opportunityId);
       // A forced refresh over identical inputs rewrites the row but must not
-      // claim the opportunity changed.
-      const changed = !previous || previous.score_fingerprint !== result.fingerprint;
+      // claim the opportunity changed. The batched fingerprint read already
+      // answers this, so no per-opportunity lookup is needed to decide it.
+      const changed = !stored || stored.score_fingerprint !== result.fingerprint;
       const row = machineScoreRow(deal, result);
+      // The previous row is read only when an event will describe it.
+      const previous = changed ? await storage.getDealHunterOpportunityScore(deal.opportunityId) : null;
       await storage.writeDealHunterOpportunityScore(row, result.evidence);
       if (changed) await emitRescoreEvent({ storage, deal, previous, row, actor });
       counts.scored += 1;
