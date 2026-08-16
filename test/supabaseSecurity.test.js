@@ -51,6 +51,10 @@ const opportunityScoringMigrationUrl = new URL(
   '../supabase/migrations/20260816120000_deal_hunter_opportunity_scoring.sql',
   import.meta.url,
 );
+const semanticScoringMigrationUrl = new URL(
+  '../supabase/migrations/20260817090000_deal_hunter_semantic_scoring.sql',
+  import.meta.url,
+);
 
 function currentAppTables(schema) {
   return Array.from(
@@ -154,7 +158,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const cimStage2Migration = fs.readFileSync(cimStage2MigrationUrl, 'utf8');
   const crmReconciliationMigration = fs.readFileSync(crmReconciliationMigrationUrl, 'utf8');
   const opportunityScoringMigration = fs.readFileSync(opportunityScoringMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}`;
+  const semanticScoringMigration = fs.readFileSync(semanticScoringMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');

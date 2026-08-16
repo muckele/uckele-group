@@ -3966,6 +3966,7 @@ create table if not exists public.deal_hunter_opportunity_scores (
   high_fit boolean not null default false,
   gate_count integer not null default 0,
   score_fingerprint text not null,
+  semantic_digest text,
   engine_version text not null,
   rules_version text not null,
   profile_version text not null,
@@ -3981,6 +3982,7 @@ create table if not exists public.deal_hunter_opportunity_scores (
   reviewed_at timestamptz,
   reviewed_by text,
   reviewed_fingerprint text,
+  reviewed_semantic_digest text,
   operator_updated_at timestamptz
 );
 
@@ -4033,7 +4035,7 @@ begin
   insert into public.deal_hunter_opportunity_scores (
     opportunity_id, created_at, scored_at, deal_key, name, state, listing_url, fit_score, score_status,
     confidence, completeness_score, contradiction_count, missing_evidence_count, should_remove, high_fit,
-    gate_count, score_fingerprint, engine_version, rules_version, profile_version,
+    gate_count, score_fingerprint, semantic_digest, engine_version, rules_version, profile_version,
     completeness_policy_version, dimensions, gates, applied_caps, missing_evidence, confidence_reasons, summary
   ) values (
     v_opportunity_id, v_scored_at, v_scored_at, nullif(p_score->>'deal_key', ''), nullif(p_score->>'name', ''),
@@ -4042,7 +4044,8 @@ begin
     coalesce(p_score->>'confidence', 'low'), coalesce((p_score->>'completeness_score')::integer, 0),
     coalesce((p_score->>'contradiction_count')::integer, 0), coalesce((p_score->>'missing_evidence_count')::integer, 0),
     coalesce((p_score->>'should_remove')::boolean, false), coalesce((p_score->>'high_fit')::boolean, false),
-    coalesce((p_score->>'gate_count')::integer, 0), v_fingerprint, p_score->>'engine_version',
+    coalesce((p_score->>'gate_count')::integer, 0), v_fingerprint,
+    nullif(p_score->>'semantic_digest', ''), p_score->>'engine_version',
     p_score->>'rules_version', p_score->>'profile_version', p_score->>'completeness_policy_version',
     coalesce(p_score->'dimensions', '[]'::jsonb), coalesce(p_score->'gates', '[]'::jsonb),
     coalesce(p_score->'applied_caps', '[]'::jsonb), coalesce(p_score->'missing_evidence', '[]'::jsonb),
@@ -4064,6 +4067,7 @@ begin
     high_fit = excluded.high_fit,
     gate_count = excluded.gate_count,
     score_fingerprint = excluded.score_fingerprint,
+    semantic_digest = excluded.semantic_digest,
     engine_version = excluded.engine_version,
     rules_version = excluded.rules_version,
     profile_version = excluded.profile_version,
@@ -4115,7 +4119,10 @@ as $$
     where (case
         when p_view = 'dismissed' then dismissed_deal_key is not null
         when p_view = 'needs-review' then dismissed_deal_key is null and should_remove = false
-          and (reviewed_at is null or reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint)
+          and (reviewed_at is null or (case
+            when reviewed_semantic_digest is not null then reviewed_semantic_digest <> coalesce(semantic_digest, '')
+            else reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint
+          end))
         when p_view = 'high-priority' then dismissed_deal_key is null and should_remove = false
           and (high_fit or operator_priority in ('urgent', 'high'))
         when p_view = 'watchlist' then dismissed_deal_key is null and should_remove = false
@@ -4140,7 +4147,9 @@ as $$
         case coalesce(p_sort, 'fit-score')
           when 'confidence' then (case confidence when 'high' then 3 when 'medium' then 2 else 1 end)::numeric
           when 'completeness' then completeness_score::numeric
-          when 'changed' then (case when reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint then 1 else 0 end)::numeric
+          when 'changed' then (case when reviewed_at is null then 1
+            when reviewed_semantic_digest is not null then (case when reviewed_semantic_digest <> coalesce(semantic_digest, '') then 1 else 0 end)
+            when reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint then 1 else 0 end)::numeric
           else fit_score::numeric
         end
       end asc nulls last,
@@ -4148,14 +4157,18 @@ as $$
         case coalesce(p_sort, 'fit-score')
           when 'confidence' then (case confidence when 'high' then 3 when 'medium' then 2 else 1 end)::numeric
           when 'completeness' then completeness_score::numeric
-          when 'changed' then (case when reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint then 1 else 0 end)::numeric
+          when 'changed' then (case when reviewed_at is null then 1
+            when reviewed_semantic_digest is not null then (case when reviewed_semantic_digest <> coalesce(semantic_digest, '') then 1 else 0 end)
+            when reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint then 1 else 0 end)::numeric
           else fit_score::numeric
         end
       end desc nulls last,
       case confidence when 'high' then 3 when 'medium' then 2 else 1 end desc,
       opportunity_id asc
-    limit greatest(coalesce(p_page_size, 25), 1)
-    offset greatest(0, (greatest(coalesce(p_page, 1), 1) - 1) * greatest(coalesce(p_page_size, 25), 1))
+    -- Page size is clamped in SQL as well as in the application caller, so a
+    -- direct RPC invocation cannot request an unbounded page.
+    limit least(greatest(coalesce(p_page_size, 25), 1), 100)
+    offset greatest(0, (greatest(coalesce(p_page, 1), 1) - 1) * least(greatest(coalesce(p_page_size, 25), 1), 100))
   )
   select jsonb_build_object(
     'total', (select count(*) from filtered),
