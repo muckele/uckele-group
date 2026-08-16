@@ -35,6 +35,7 @@ const AdminOnboarding = lazy(() => import('../components/admin/AdminOnboarding')
 const CimRequestHistory = lazy(() => import('../components/admin/CimRequestHistory'));
 const CrmCommunications = lazy(() => import('../components/admin/CrmCommunications'));
 const DealActivityTimeline = lazy(() => import('../components/admin/DealActivityTimeline'));
+const DealHunterTriage = lazy(() => import('../components/admin/DealHunterTriage'));
 const DealHunterWorkspace = lazy(() => import('../components/admin/DealHunterWorkspace'));
 const FollowUpsWorkspace = lazy(() => import('../components/admin/FollowUpsWorkspace'));
 const OperationsCenter = lazy(() => import('../components/admin/OperationsCenter'));
@@ -3891,6 +3892,9 @@ export default function DashboardPage() {
 
       {activeSection === 'deal-hunter' ? (
         <Suspense fallback={<div className="section-shell mt-8"><WorkspaceFallback /></div>}>
+          <section className="section-shell mt-8">
+            <DealHunterTriage readOnly={isReadOnly} />
+          </section>
           <DealHunterWorkspace
             bulkSending={dealHunterBulkCimSending}
             crmSyncing={dealHunterCrmSyncing}
