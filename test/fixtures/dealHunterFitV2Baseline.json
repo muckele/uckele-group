@@ -1,0 +1,7273 @@
+{
+  "scoringRuleVersion": "deal-hunter-fit-v2",
+  "completenessPolicyVersion": "deal-hunter-completeness-v1",
+  "generatedFrom": "test/fixtures/dealHunterScoringCorpus.js",
+  "caseCount": 506,
+  "distribution": {
+    "provisional": 16,
+    "remove": 346,
+    "watchlist": 111,
+    "high-fit": 33
+  },
+  "cases": [
+    {
+      "id": "none-missing-no-price",
+      "score": 33,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 44,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "askingPrice",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-missing-cheap-multiple",
+      "score": 49,
+      "shouldRemove": false,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 54,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-missing-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 36,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue",
+        "industry",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-missing-rich-multiple",
+      "score": 23,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 48,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "industry",
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "none-missing-expensive-multiple",
+      "score": 3,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 54,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-missing-implied-only",
+      "score": 37,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 44,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "industry",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-missing-tiny-price",
+      "score": 29,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 46,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-far-below-no-price",
+      "score": 9,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "askingPrice",
+        "industry",
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "none-far-below-cheap-multiple",
+      "score": 30,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-far-below-workable-multiple",
+      "score": 20,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-far-below-rich-multiple",
+      "score": 4,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-far-below-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-far-below-implied-only",
+      "score": 2,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-far-below-tiny-price",
+      "score": 13,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-below-floor-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 52,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice",
+        "industry",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-below-floor-cheap-multiple",
+      "score": 52,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "none-below-floor-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-below-floor-rich-multiple",
+      "score": 24,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-below-floor-expensive-multiple",
+      "score": 6,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-below-floor-implied-only",
+      "score": 32,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "none-below-floor-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-in-band-low-no-price",
+      "score": 48,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-in-band-low-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-in-band-low-workable-multiple",
+      "score": 61,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-in-band-low-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-in-band-low-expensive-multiple",
+      "score": 18,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-in-band-low-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 62,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "industry",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-in-band-low-tiny-price",
+      "score": 54,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "none-in-band-high-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-in-band-high-cheap-multiple",
+      "score": 67,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-in-band-high-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-in-band-high-rich-multiple",
+      "score": 41,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "none-in-band-high-expensive-multiple",
+      "score": 21,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-in-band-high-implied-only",
+      "score": 65,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-in-band-high-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-above-band-no-price",
+      "score": 27,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 54,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "askingPrice",
+        "industry",
+        "description",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-above-band-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-above-band-workable-multiple",
+      "score": 38,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-above-band-rich-multiple",
+      "score": 22,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 62,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "industry",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-above-band-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "none-above-band-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-above-band-tiny-price",
+      "score": 31,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-far-above-band-no-price",
+      "score": 22,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 62,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-far-above-band-cheap-multiple",
+      "score": 38,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "none-far-above-band-workable-multiple",
+      "score": 33,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-far-above-band-rich-multiple",
+      "score": 10,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-far-above-band-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "none-far-above-band-implied-only",
+      "score": 36,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "industry",
+        "description",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "none-far-above-band-tiny-price",
+      "score": 26,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "industry",
+        "description"
+      ]
+    },
+    {
+      "id": "bare-missing-no-price",
+      "score": 30,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 52,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "askingPrice",
+        "description"
+      ]
+    },
+    {
+      "id": "bare-missing-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 44,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-missing-workable-multiple",
+      "score": 43,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 56,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "bare-missing-rich-multiple",
+      "score": 25,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 62,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "description"
+      ]
+    },
+    {
+      "id": "bare-missing-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 52,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-missing-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 54,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue",
+        "description"
+      ]
+    },
+    {
+      "id": "bare-missing-tiny-price",
+      "score": 26,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 56,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "bare-far-below-no-price",
+      "score": 11,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 68,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-far-below-cheap-multiple",
+      "score": 27,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-far-below-workable-multiple",
+      "score": 24,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "description"
+      ]
+    },
+    {
+      "id": "bare-far-below-rich-multiple",
+      "score": 1,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-far-below-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-far-below-implied-only",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-far-below-tiny-price",
+      "score": 17,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-below-floor-no-price",
+      "score": 33,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "askingPrice",
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "bare-below-floor-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-below-floor-workable-multiple",
+      "score": 44,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 78,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-below-floor-rich-multiple",
+      "score": 28,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "description"
+      ]
+    },
+    {
+      "id": "bare-below-floor-expensive-multiple",
+      "score": 3,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "bare-below-floor-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 78,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-below-floor-tiny-price",
+      "score": 37,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-in-band-low-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice",
+        "description"
+      ]
+    },
+    {
+      "id": "bare-in-band-low-cheap-multiple",
+      "score": 68,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "description",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-in-band-low-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-in-band-low-rich-multiple",
+      "score": 40,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-in-band-low-expensive-multiple",
+      "score": 22,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-in-band-low-implied-only",
+      "score": 60,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "bare-in-band-low-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-in-band-high-no-price",
+      "score": 48,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 68,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-in-band-high-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "description"
+      ]
+    },
+    {
+      "id": "bare-in-band-high-workable-multiple",
+      "score": 61,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "bare-in-band-high-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 78,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-in-band-high-expensive-multiple",
+      "score": 18,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-in-band-high-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "description"
+      ]
+    },
+    {
+      "id": "bare-in-band-high-tiny-price",
+      "score": 54,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "description",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-above-band-no-price",
+      "score": 29,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 78,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice",
+        "description"
+      ]
+    },
+    {
+      "id": "bare-above-band-cheap-multiple",
+      "score": 45,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-above-band-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 70,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-above-band-rich-multiple",
+      "score": 19,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "bare-above-band-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-above-band-implied-only",
+      "score": 43,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 78,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-above-band-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "description"
+      ]
+    },
+    {
+      "id": "bare-far-above-band-no-price",
+      "score": 19,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "askingPrice",
+        "description",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "bare-far-above-band-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 78,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "description",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-far-above-band-workable-multiple",
+      "score": 30,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-far-above-band-rich-multiple",
+      "score": 14,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "description"
+      ]
+    },
+    {
+      "id": "bare-far-above-band-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "bare-far-above-band-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "bare-far-above-band-tiny-price",
+      "score": 23,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 88,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "description"
+      ]
+    },
+    {
+      "id": "recurring-missing-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 46,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue",
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-missing-cheap-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 68,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "recurring-missing-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "recurring-missing-rich-multiple",
+      "score": 69,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-missing-expensive-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 66,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "recurring-missing-implied-only",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 68,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "recurring-missing-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-far-below-no-price",
+      "score": 52,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "recurring-far-below-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "recurring-far-below-workable-multiple",
+      "score": 52,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-far-below-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "recurring-far-below-expensive-multiple",
+      "score": 25,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "recurring-far-below-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-far-below-tiny-price",
+      "score": 52,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "recurring-below-floor-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "recurring-below-floor-cheap-multiple",
+      "score": 98,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-below-floor-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "recurring-below-floor-rich-multiple",
+      "score": 72,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "recurring-below-floor-expensive-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-below-floor-implied-only",
+      "score": 78,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "recurring-below-floor-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "recurring-in-band-low-no-price",
+      "score": 96,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-in-band-low-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "recurring-in-band-low-workable-multiple",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "recurring-in-band-low-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-in-band-low-expensive-multiple",
+      "score": 66,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "recurring-in-band-low-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "recurring-in-band-low-tiny-price",
+      "score": 66,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-in-band-high-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "recurring-in-band-high-cheap-multiple",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "recurring-in-band-high-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-in-band-high-rich-multiple",
+      "score": 82,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "recurring-in-band-high-expensive-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "recurring-in-band-high-implied-only",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-in-band-high-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "recurring-above-band-no-price",
+      "score": 73,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "recurring-above-band-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-above-band-workable-multiple",
+      "score": 86,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "recurring-above-band-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "recurring-above-band-expensive-multiple",
+      "score": 43,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-above-band-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "recurring-above-band-tiny-price",
+      "score": 66,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "recurring-far-above-band-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-far-above-band-cheap-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "recurring-far-above-band-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "recurring-far-above-band-rich-multiple",
+      "score": 58,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "recurring-far-above-band-expensive-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "recurring-far-above-band-implied-only",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "recurring-far-above-band-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-missing-no-price",
+      "score": 71,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 58,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "askingPrice",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "resilient-missing-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "resilient-missing-workable-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-missing-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 66,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "resilient-missing-expensive-multiple",
+      "score": 41,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 68,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "resilient-missing-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-missing-tiny-price",
+      "score": 65,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "resilient-far-below-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "resilient-far-below-cheap-multiple",
+      "score": 52,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-far-below-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "resilient-far-below-rich-multiple",
+      "score": 40,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "resilient-far-below-expensive-multiple",
+      "score": 22,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-far-below-implied-only",
+      "score": 40,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "resilient-far-below-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "resilient-below-floor-no-price",
+      "score": 72,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-below-floor-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "resilient-below-floor-workable-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "resilient-below-floor-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-below-floor-expensive-multiple",
+      "score": 42,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "resilient-below-floor-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "resilient-below-floor-tiny-price",
+      "score": 66,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-in-band-low-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "resilient-in-band-low-cheap-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "resilient-in-band-low-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-in-band-low-rich-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "resilient-in-band-low-expensive-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "resilient-in-band-low-implied-only",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-in-band-low-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "resilient-in-band-high-no-price",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "resilient-in-band-high-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-in-band-high-workable-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "resilient-in-band-high-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "resilient-in-band-high-expensive-multiple",
+      "score": 59,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-in-band-high-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "resilient-in-band-high-tiny-price",
+      "score": 66,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "resilient-above-band-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-above-band-cheap-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "resilient-above-band-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "resilient-above-band-rich-multiple",
+      "score": 58,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-above-band-expensive-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "resilient-above-band-implied-only",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "resilient-above-band-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-far-above-band-no-price",
+      "score": 58,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "resilient-far-above-band-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "resilient-far-above-band-workable-multiple",
+      "score": 71,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-far-above-band-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "resilient-far-above-band-expensive-multiple",
+      "score": 28,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "resilient-far-above-band-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "resilient-far-above-band-tiny-price",
+      "score": 64,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "managed-missing-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "managed-missing-cheap-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-missing-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 66,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "managed-missing-rich-multiple",
+      "score": 56,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 68,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "managed-missing-expensive-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-missing-implied-only",
+      "score": 63,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "managed-missing-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 66,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "managed-far-below-no-price",
+      "score": 42,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "askingPrice",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-far-below-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-far-below-workable-multiple",
+      "score": 46,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-far-below-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-far-below-expensive-multiple",
+      "score": 12,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "managed-far-below-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-far-below-tiny-price",
+      "score": 39,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-below-floor-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "managed-below-floor-cheap-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "managed-below-floor-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-below-floor-rich-multiple",
+      "score": 50,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-below-floor-expensive-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "managed-below-floor-implied-only",
+      "score": 65,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-below-floor-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-in-band-low-no-price",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "managed-in-band-low-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-in-band-low-workable-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "managed-in-band-low-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-in-band-low-expensive-multiple",
+      "score": 44,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-in-band-low-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "managed-in-band-low-tiny-price",
+      "score": 66,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "managed-in-band-high-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-in-band-high-cheap-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-in-band-high-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "managed-in-band-high-rich-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-in-band-high-expensive-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-in-band-high-implied-only",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-in-band-high-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-above-band-no-price",
+      "score": 60,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "managed-above-band-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-above-band-workable-multiple",
+      "score": 64,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-above-band-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "managed-above-band-expensive-multiple",
+      "score": 30,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "managed-above-band-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-above-band-tiny-price",
+      "score": 57,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-far-above-band-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "managed-far-above-band-cheap-multiple",
+      "score": 71,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-far-above-band-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-far-above-band-rich-multiple",
+      "score": 36,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "managed-far-above-band-expensive-multiple",
+      "score": 25,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "managed-far-above-band-implied-only",
+      "score": 69,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "managed-far-above-band-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-missing-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 54,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-missing-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 66,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "ownerDependent-missing-workable-multiple",
+      "score": 47,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 68,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "ownerDependent-missing-rich-multiple",
+      "score": 29,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-missing-expensive-multiple",
+      "score": 4,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "ownerDependent-missing-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 66,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "ownerDependent-missing-tiny-price",
+      "score": 30,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 58,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-far-below-no-price",
+      "score": 15,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "ownerDependent-far-below-cheap-multiple",
+      "score": 31,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-far-below-workable-multiple",
+      "score": 28,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-far-below-rich-multiple",
+      "score": 5,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "ownerDependent-far-below-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-far-below-implied-only",
+      "score": 3,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-far-below-tiny-price",
+      "score": 21,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "ownerDependent-below-floor-no-price",
+      "score": 37,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "askingPrice",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "ownerDependent-below-floor-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-below-floor-workable-multiple",
+      "score": 48,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-below-floor-rich-multiple",
+      "score": 32,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "ownerDependent-below-floor-expensive-multiple",
+      "score": 7,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-below-floor-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-below-floor-tiny-price",
+      "score": 41,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-in-band-low-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-in-band-low-cheap-multiple",
+      "score": 72,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "ownerDependent-in-band-low-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-in-band-low-rich-multiple",
+      "score": 44,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-in-band-low-expensive-multiple",
+      "score": 26,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "ownerDependent-in-band-low-implied-only",
+      "score": 64,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "ownerDependent-in-band-low-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-in-band-high-no-price",
+      "score": 52,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "ownerDependent-in-band-high-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "ownerDependent-in-band-high-workable-multiple",
+      "score": 65,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-in-band-high-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-in-band-high-expensive-multiple",
+      "score": 22,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-in-band-high-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-in-band-high-tiny-price",
+      "score": 58,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "ownerDependent-above-band-no-price",
+      "score": 33,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "ownerDependent-above-band-cheap-multiple",
+      "score": 49,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-above-band-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "ownerDependent-above-band-rich-multiple",
+      "score": 23,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "ownerDependent-above-band-expensive-multiple",
+      "score": 3,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-above-band-implied-only",
+      "score": 47,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-above-band-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "ownerDependent-far-above-band-no-price",
+      "score": 23,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "askingPrice",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-far-above-band-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-far-above-band-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-far-above-band-rich-multiple",
+      "score": 18,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "ownerDependent-far-above-band-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "ownerDependent-far-above-band-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "ownerDependent-far-above-band-tiny-price",
+      "score": 27,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-missing-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 56,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue",
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "concentrated-missing-cheap-multiple",
+      "score": 60,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 68,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "concentrated-missing-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-missing-rich-multiple",
+      "score": 32,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "concentrated-missing-expensive-multiple",
+      "score": 14,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 66,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "concentrated-missing-implied-only",
+      "score": 48,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 58,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-missing-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "concentrated-far-below-no-price",
+      "score": 18,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "concentrated-far-below-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-far-below-workable-multiple",
+      "score": 31,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "concentrated-far-below-rich-multiple",
+      "score": 13,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "concentrated-far-below-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-far-below-implied-only",
+      "score": 13,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "concentrated-far-below-tiny-price",
+      "score": 24,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "concentrated-below-floor-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-below-floor-cheap-multiple",
+      "score": 61,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "concentrated-below-floor-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "concentrated-below-floor-rich-multiple",
+      "score": 35,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-below-floor-expensive-multiple",
+      "score": 15,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "concentrated-below-floor-implied-only",
+      "score": 41,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "concentrated-below-floor-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-in-band-low-no-price",
+      "score": 59,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "concentrated-in-band-low-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "concentrated-in-band-low-workable-multiple",
+      "score": 70,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-in-band-low-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "concentrated-in-band-low-expensive-multiple",
+      "score": 29,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "concentrated-in-band-low-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-in-band-low-tiny-price",
+      "score": 63,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "concentrated-in-band-high-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "concentrated-in-band-high-cheap-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-in-band-high-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "concentrated-in-band-high-rich-multiple",
+      "score": 50,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "concentrated-in-band-high-expensive-multiple",
+      "score": 32,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-in-band-high-implied-only",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "concentrated-in-band-high-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "concentrated-above-band-no-price",
+      "score": 36,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-above-band-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "concentrated-above-band-workable-multiple",
+      "score": 49,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "concentrated-above-band-rich-multiple",
+      "score": 31,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-above-band-expensive-multiple",
+      "score": 6,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "concentrated-above-band-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "concentrated-above-band-tiny-price",
+      "score": 42,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-far-above-band-no-price",
+      "score": 31,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "concentrated-far-above-band-cheap-multiple",
+      "score": 47,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "concentrated-far-above-band-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-far-above-band-rich-multiple",
+      "score": 21,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "concentrated-far-above-band-expensive-multiple",
+      "score": 1,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "concentrated-far-above-band-implied-only",
+      "score": 45,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "concentrated-far-above-band-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "capexHeavy-missing-no-price",
+      "score": 43,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 58,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "askingPrice",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "capexHeavy-missing-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-missing-workable-multiple",
+      "score": 54,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "capexHeavy-missing-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 66,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "capexHeavy-missing-expensive-multiple",
+      "score": 13,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 58,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-missing-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "capexHeavy-missing-tiny-price",
+      "score": 37,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "capexHeavy-far-below-no-price",
+      "score": 24,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-far-below-cheap-multiple",
+      "score": 40,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "capexHeavy-far-below-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "capexHeavy-far-below-rich-multiple",
+      "score": 12,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-far-below-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "capexHeavy-far-below-implied-only",
+      "score": 12,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "capexHeavy-far-below-tiny-price",
+      "score": 28,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-below-floor-no-price",
+      "score": 44,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "capexHeavy-below-floor-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "capexHeavy-below-floor-workable-multiple",
+      "score": 57,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-below-floor-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "capexHeavy-below-floor-expensive-multiple",
+      "score": 14,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "capexHeavy-below-floor-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-below-floor-tiny-price",
+      "score": 50,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "capexHeavy-in-band-low-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "capexHeavy-in-band-low-cheap-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-in-band-low-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "capexHeavy-in-band-low-rich-multiple",
+      "score": 53,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "capexHeavy-in-band-low-expensive-multiple",
+      "score": 33,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-in-band-low-implied-only",
+      "score": 71,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "capexHeavy-in-band-low-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "capexHeavy-in-band-high-no-price",
+      "score": 61,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-in-band-high-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "capexHeavy-in-band-high-workable-multiple",
+      "score": 72,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "capexHeavy-in-band-high-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-in-band-high-expensive-multiple",
+      "score": 31,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "capexHeavy-in-band-high-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "capexHeavy-in-band-high-tiny-price",
+      "score": 65,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-above-band-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "capexHeavy-above-band-cheap-multiple",
+      "score": 58,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "capexHeavy-above-band-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-above-band-rich-multiple",
+      "score": 30,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": []
+    },
+    {
+      "id": "capexHeavy-above-band-expensive-multiple",
+      "score": 12,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "capexHeavy-above-band-implied-only",
+      "score": 56,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-above-band-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "capexHeavy-far-above-band-no-price",
+      "score": 30,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "capexHeavy-far-above-band-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-far-above-band-workable-multiple",
+      "score": 43,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "capexHeavy-far-above-band-rich-multiple",
+      "score": 25,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "capexHeavy-far-above-band-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "capexHeavy-far-above-band-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "capexHeavy-far-above-band-tiny-price",
+      "score": 36,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "excluded-missing-no-price",
+      "score": 33,
+      "shouldRemove": true,
+      "scoreStatus": "provisional",
+      "evidenceConfidence": "low",
+      "completenessScore": 54,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-missing-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "excluded-missing-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 66,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "excluded-missing-rich-multiple",
+      "score": 23,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 58,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-missing-expensive-multiple",
+      "score": 3,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "excluded-missing-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "excluded-missing-tiny-price",
+      "score": 29,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 56,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-far-below-no-price",
+      "score": 9,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "excluded-far-below-cheap-multiple",
+      "score": 30,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": []
+    },
+    {
+      "id": "excluded-far-below-workable-multiple",
+      "score": 20,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-far-below-rich-multiple",
+      "score": 4,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "excluded-far-below-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "excluded-far-below-implied-only",
+      "score": 2,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-far-below-tiny-price",
+      "score": 13,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "excluded-below-floor-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "location",
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "excluded-below-floor-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-below-floor-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": []
+    },
+    {
+      "id": "excluded-below-floor-rich-multiple",
+      "score": 24,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "excluded-below-floor-expensive-multiple",
+      "score": 6,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-below-floor-implied-only",
+      "score": 32,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "excluded-below-floor-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": []
+    },
+    {
+      "id": "excluded-in-band-low-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-in-band-low-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "excluded-in-band-low-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "excluded-in-band-low-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-in-band-low-expensive-multiple",
+      "score": 18,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "excluded-in-band-low-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "excluded-in-band-low-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-in-band-high-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "excluded-in-band-high-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "excluded-in-band-high-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-in-band-high-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "excluded-in-band-high-expensive-multiple",
+      "score": 21,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": []
+    },
+    {
+      "id": "excluded-in-band-high-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-in-band-high-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "excluded-above-band-no-price",
+      "score": 27,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "excluded-above-band-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-above-band-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "excluded-above-band-rich-multiple",
+      "score": 22,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "excluded-above-band-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-above-band-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": []
+    },
+    {
+      "id": "excluded-above-band-tiny-price",
+      "score": 31,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "excluded-far-above-band-no-price",
+      "score": 22,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 72,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "location",
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-far-above-band-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "excluded-far-above-band-workable-multiple",
+      "score": 33,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": []
+    },
+    {
+      "id": "excluded-far-above-band-rich-multiple",
+      "score": 10,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "excluded-far-above-band-expensive-multiple",
+      "score": 0,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "excluded-far-above-band-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "excluded-far-above-band-tiny-price",
+      "score": 26,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 2,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-missing-no-price",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 64,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "financeable-missing-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 66,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "financeable-missing-workable-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 58,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-missing-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "financeable-missing-expensive-multiple",
+      "score": 47,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue"
+      ]
+    },
+    {
+      "id": "financeable-missing-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "medium",
+      "completenessScore": 56,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "annualProfit",
+        "annualRevenue",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-missing-tiny-price",
+      "score": 66,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "medium",
+      "completenessScore": 68,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "annualProfit",
+        "annualRevenue",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "financeable-far-below-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "financeable-far-below-cheap-multiple",
+      "score": 52,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-far-below-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "financeable-far-below-rich-multiple",
+      "score": 48,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "financeable-far-below-expensive-multiple",
+      "score": 28,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-far-below-implied-only",
+      "score": 46,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "financeable-far-below-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "financeable-below-floor-no-price",
+      "score": 80,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "medium",
+      "completenessScore": 74,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice",
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-below-floor-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "financeable-below-floor-workable-multiple",
+      "score": 91,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "financeable-below-floor-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-below-floor-expensive-multiple",
+      "score": 50,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "financeable-below-floor-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "financeable-below-floor-tiny-price",
+      "score": 66,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-in-band-low-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "financeable-in-band-low-cheap-multiple",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "financeable-in-band-low-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-in-band-low-rich-multiple",
+      "score": 82,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "financeable-in-band-low-expensive-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "financeable-in-band-low-implied-only",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-in-band-low-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "financeable-in-band-high-no-price",
+      "score": 95,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice"
+      ]
+    },
+    {
+      "id": "financeable-in-band-high-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-in-band-high-workable-multiple",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "financeable-in-band-high-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "financeable-in-band-high-expensive-multiple",
+      "score": 65,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-in-band-high-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "financeable-in-band-high-tiny-price",
+      "score": 66,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "financeable-above-band-no-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 80,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "askingPrice",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-above-band-cheap-multiple",
+      "score": 92,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "financeable-above-band-workable-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "financeable-above-band-rich-multiple",
+      "score": 66,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-above-band-expensive-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "financeable-above-band-implied-only",
+      "score": 90,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "financeable-above-band-tiny-price",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 82,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-far-above-band-no-price",
+      "score": 66,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "askingPrice",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "financeable-far-above-band-cheap-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": []
+    },
+    {
+      "id": "financeable-far-above-band-workable-multiple",
+      "score": 74,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-far-above-band-rich-multiple",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "financeable-far-above-band-expensive-multiple",
+      "score": 36,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 3,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "financeable-far-above-band-implied-only",
+      "score": 34,
+      "shouldRemove": true,
+      "scoreStatus": "remove",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 1,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "financeable-far-above-band-tiny-price",
+      "score": 66,
+      "shouldRemove": false,
+      "scoreStatus": "watchlist",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": false,
+      "cimRequest": false,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "edge-age-missing-target-state",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "edge-age-missing-other-state",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 94,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "edge-age-missing-remote",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 84,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "yearsEstablished",
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "edge-age-missing-no-location",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 86,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "location",
+        "yearsEstablished"
+      ]
+    },
+    {
+      "id": "edge-age-flagged-target-state",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "edge-age-flagged-other-state",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "edge-age-flagged-remote",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "edge-age-flagged-no-location",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "edge-age-young-target-state",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "edge-age-young-other-state",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "edge-age-young-remote",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "edge-age-young-no-location",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "location"
+      ]
+    },
+    {
+      "id": "edge-age-established-target-state",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "edge-age-established-other-state",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 100,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": []
+    },
+    {
+      "id": "edge-age-established-remote",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 90,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "brokerContact"
+      ]
+    },
+    {
+      "id": "edge-age-established-no-location",
+      "score": 100,
+      "shouldRemove": false,
+      "scoreStatus": "high-fit",
+      "evidenceConfidence": "high",
+      "completenessScore": 92,
+      "highFit": true,
+      "cimRequest": true,
+      "removeReasonCount": 0,
+      "missingEvidence": [
+        "location"
+      ]
+    }
+  ]
+}

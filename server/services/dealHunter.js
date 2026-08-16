@@ -822,8 +822,8 @@ function buildQuestions(deal, matches, concerns) {
   return [...new Set(questions)].slice(0, 5);
 }
 
-function addScoreCap(caps, cap, reason) {
-  caps.push({ cap, reason });
+function addScoreCap(caps, cap, reason, ruleId = '') {
+  caps.push({ cap, reason, ruleId, applied: false });
 }
 
 function applyScoreCaps(score, caps, concerns) {
@@ -832,6 +832,7 @@ function applyScoreCaps(score, caps, concerns) {
   for (const item of caps) {
     if (cappedScore > item.cap) {
       cappedScore = item.cap;
+      item.applied = true;
     }
 
     if (item.reason) {
@@ -872,7 +873,11 @@ function dealCompleteness(deal = {}) {
   };
 }
 
-export function scoreDeal(deal) {
+export function scoreDeal(deal, ledger = null) {
+  // The ledger is an optional observer used by the scoring service to explain a
+  // score. Anything that is not a ledger is ignored, so passing this function
+  // directly as an array callback cannot corrupt scoring.
+  const record = ledger && typeof ledger.baseline === 'function' ? ledger : null;
   const completeness = dealCompleteness(deal);
   const matches = {
     excluded: containsAny(deal.fullText, profile.excludedKeywords),
@@ -893,66 +898,82 @@ export function scoreDeal(deal) {
   const removeReasons = [];
   const scoreCaps = [];
   let score = 28;
+  record?.baseline(score);
 
   if (matches.excluded.length > 0) {
     removeReasons.push(`Excluded category match: ${matches.excluded.slice(0, 4).join(', ')}`);
+    record?.gate('gate.excluded-category', `Excluded category match: ${matches.excluded.slice(0, 4).join(', ')}`, { field: 'fullText', terms: matches.excluded });
   }
 
   if (isYes(deal.franchiseFlag)) {
     removeReasons.push('Franchise listing, which is outside the current acquisition strategy.');
+    record?.gate('gate.franchise', 'Franchise listing, which is outside the current acquisition strategy.', { field: 'franchiseFlag', value: deal.franchiseFlag });
   }
 
   if (deal.annualProfit !== null) {
     if (deal.annualProfit >= profile.minAnnualProfit && deal.annualProfit <= profile.maxAnnualProfit) {
       score += 18;
+      record?.adjust('profit.in-band', 18, { field: 'annualProfit', value: deal.annualProfit });
       strengths.push('Annual profit is inside the target $300k-$750k range.');
     } else if (deal.annualProfit >= 200000 && deal.annualProfit < profile.minAnnualProfit) {
       score += 2;
+      record?.adjust('profit.below-floor', 2, { field: 'annualProfit', value: deal.annualProfit });
       concerns.push('Profit is below the target floor; review only if recurring revenue and management depth are unusually strong.');
     } else if (deal.annualProfit < 200000) {
       score -= 22;
-      addScoreCap(scoreCaps, 52, 'Profit is well below the current acquisition target and should not qualify as a high-fit deal.');
+      record?.adjust('profit.well-below', -22, { field: 'annualProfit', value: deal.annualProfit });
+      addScoreCap(scoreCaps, 52, 'Profit is well below the current acquisition target and should not qualify as a high-fit deal.', 'profit.well-below');
       concerns.push('Profit is well below the current acquisition target.');
     } else if (deal.annualProfit > 1000000) {
       score -= 12;
-      addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Profit is materially above the target band and likely requires a different capital structure.');
+      record?.adjust('profit.far-above-band', -12, { field: 'annualProfit', value: deal.annualProfit });
+      addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Profit is materially above the target band and likely requires a different capital structure.', 'profit.far-above-band');
       concerns.push('Profit is materially above the current target band and likely needs a larger equity check.');
     } else {
       score -= 4;
+      record?.adjust('profit.above-band', -4, { field: 'annualProfit', value: deal.annualProfit });
       concerns.push('Profit is above the current target band and may require a larger equity check.');
     }
   } else {
-    addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Annual profit is missing, so the listing cannot qualify as high fit yet.');
+    addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Annual profit is missing, so the listing cannot qualify as high fit yet.', 'profit.missing');
+    record?.absent('profit.missing', { field: 'annualProfit' });
     concerns.push('Annual profit is missing.');
   }
 
   if (deal.yearsEstablished !== null) {
     if (deal.yearsEstablished >= 5) {
       score += 6;
+      record?.adjust('age.established', 6, { field: 'yearsEstablished', value: deal.yearsEstablished });
       strengths.push('Business age clears the 5+ year preference.');
     } else {
       score -= 8;
+      record?.adjust('age.young', -8, { field: 'yearsEstablished', value: deal.yearsEstablished });
       concerns.push('Business appears younger than the 5+ year preference.');
     }
   } else if (isYes(deal.fiveYearsFlag)) {
     score += 5;
+    record?.adjust('age.flagged', 5, { field: 'fiveYearsFlag', value: deal.fiveYearsFlag });
     strengths.push('Source marks this as 5+ years in business.');
   }
 
   if (deal.profitMultiple !== null) {
     if (deal.profitMultiple > 0 && deal.profitMultiple <= 3.25) {
       score += 12;
+      record?.adjust('multiple.financeable', 12, { field: 'profitMultiple', value: deal.profitMultiple });
       strengths.push('Profit multiple appears financeable for a self-funded/SBA-style acquisition.');
     } else if (deal.profitMultiple > 3.25 && deal.profitMultiple <= 4) {
       score += 5;
+      record?.adjust('multiple.workable', 5, { field: 'profitMultiple', value: deal.profitMultiple });
       strengths.push('Profit multiple may be workable if SBA, seller note, or investor structure checks out.');
     } else if (deal.profitMultiple > 4 && deal.profitMultiple <= 5) {
       score -= 8;
-      addScoreCap(scoreCaps, 82, 'Profit multiple is above the preferred range; require strong financing and growth evidence.');
+      record?.adjust('multiple.above-preferred', -8, { field: 'profitMultiple', value: deal.profitMultiple });
+      addScoreCap(scoreCaps, 82, 'Profit multiple is above the preferred range; require strong financing and growth evidence.', 'multiple.above-preferred');
       concerns.push('Profit multiple is above the preferred range for the current buying strategy.');
     } else if (deal.profitMultiple > 5) {
       score -= 16;
-      addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Profit multiple is too high for a high-fit rating without exceptional structure.');
+      record?.adjust('multiple.too-high', -16, { field: 'profitMultiple', value: deal.profitMultiple });
+      addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Profit multiple is too high for a high-fit rating without exceptional structure.', 'multiple.too-high');
       concerns.push('Profit multiple is high for the current buying strategy.');
     }
   } else if (deal.askingPrice && deal.annualProfit) {
@@ -960,17 +981,21 @@ export function scoreDeal(deal) {
 
     if (impliedMultiple <= 3.25) {
       score += 10;
+      record?.adjust('implied-multiple.financeable', 10, { field: 'impliedMultiple', value: impliedMultiple });
       strengths.push('Implied asking-price-to-profit multiple looks reasonable.');
     } else if (impliedMultiple <= 4) {
       score += 4;
+      record?.adjust('implied-multiple.workable', 4, { field: 'impliedMultiple', value: impliedMultiple });
       strengths.push('Implied multiple may be workable if financing terms are favorable.');
     } else if (impliedMultiple <= 5) {
       score -= 8;
-      addScoreCap(scoreCaps, 82, 'Implied multiple is above the preferred range; require stronger diligence before advancing.');
+      record?.adjust('implied-multiple.above-preferred', -8, { field: 'impliedMultiple', value: impliedMultiple });
+      addScoreCap(scoreCaps, 82, 'Implied multiple is above the preferred range; require stronger diligence before advancing.', 'implied-multiple.above-preferred');
       concerns.push('Implied asking-price-to-profit multiple is above the preferred range.');
     } else if (impliedMultiple > 5) {
       score -= 16;
-      addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Implied multiple is too expensive for a high-fit rating.');
+      record?.adjust('implied-multiple.too-high', -16, { field: 'impliedMultiple', value: impliedMultiple });
+      addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Implied multiple is too expensive for a high-fit rating.', 'implied-multiple.too-high');
       concerns.push('Implied asking-price-to-profit multiple looks expensive.');
     }
   }
@@ -978,109 +1003,137 @@ export function scoreDeal(deal) {
   if (deal.askingPrice) {
     if (deal.askingPrice >= 500000 && deal.askingPrice <= 1500000) {
       score += 7;
+      record?.adjust('asking.in-band', 7, { field: 'askingPrice', value: deal.askingPrice });
       strengths.push('Asking price is within a plausible range for ROBS cash plus SBA, seller note, or investors.');
     } else if (deal.askingPrice > 2000000) {
       score -= 14;
-      addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Asking price likely requires outside equity or unusually favorable seller financing.');
+      record?.adjust('asking.too-large', -14, { field: 'askingPrice', value: deal.askingPrice });
+      addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'Asking price likely requires outside equity or unusually favorable seller financing.', 'asking.too-large');
       concerns.push('Asking price likely needs outside equity or unusually favorable seller financing.');
     } else if (deal.askingPrice < 250000) {
       score -= 5;
-      addScoreCap(scoreCaps, 66, 'Small asking price may indicate a smaller owner-operator opportunity.');
+      record?.adjust('asking.too-small', -5, { field: 'askingPrice', value: deal.askingPrice });
+      addScoreCap(scoreCaps, 66, 'Small asking price may indicate a smaller owner-operator opportunity.', 'asking.too-small');
       concerns.push('Small asking price may indicate a smaller owner-operator opportunity.');
     }
   }
 
   if (matches.preferred.length > 0) {
     score += Math.min(10, matches.preferred.length * 2);
+    record?.adjust('preferred.present', Math.min(10, matches.preferred.length * 2), { field: 'fullText', terms: matches.preferred });
     strengths.push(`Matches preferred search themes: ${matches.preferred.slice(0, 5).join(', ')}.`);
   }
 
   if (matches.recurring.length > 0) {
     score += Math.min(14, matches.recurring.length * 3);
+    record?.adjust('recurring.present', Math.min(14, matches.recurring.length * 3), { field: 'fullText', terms: matches.recurring });
     strengths.push(`Recurring or repeat revenue signals: ${matches.recurring.slice(0, 4).join(', ')}.`);
   } else if (completeness.narrativeEvidenceAvailable) {
-    addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'No explicit recurring, contracted, scheduled, or repeat revenue signal.');
+    addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'No explicit recurring, contracted, scheduled, or repeat revenue signal.', 'recurring.absent');
+    record?.absent('recurring.absent', { field: 'fullText' });
     concerns.push('No explicit recurring, contracted, scheduled, or repeat revenue signal.');
   } else {
+    record?.absent('recurring.unknown', { field: 'description' });
     concerns.push('Recurring or repeat revenue is unknown because the source did not include enough narrative evidence.');
   }
 
   if (matches.commercial.length > 0) {
     score += Math.min(8, matches.commercial.length * 2);
+    record?.adjust('commercial.present', Math.min(8, matches.commercial.length * 2), { field: 'fullText', terms: matches.commercial });
     strengths.push(`Commercial or institutional customer signals: ${matches.commercial.slice(0, 4).join(', ')}.`);
   }
 
   if (matches.recession.length > 0) {
     score += Math.min(12, matches.recession.length * 3);
+    record?.adjust('recession.present', Math.min(12, matches.recession.length * 3), { field: 'fullText', terms: matches.recession });
     strengths.push(`Recession-resistant indicators: ${matches.recession.slice(0, 4).join(', ')}.`);
   } else if (completeness.narrativeEvidenceAvailable) {
-    addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'No clear recession-resistant indicator in the listing text.');
+    addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'No clear recession-resistant indicator in the listing text.', 'recession.absent');
+    record?.absent('recession.absent', { field: 'fullText' });
     concerns.push('No clear recession-resistant indicator in the listing text.');
   } else {
+    record?.absent('recession.unknown', { field: 'description' });
     concerns.push('Recession resistance is unknown because the source did not include enough narrative evidence.');
   }
 
   if (matches.aiProof.length > 0) {
     score += Math.min(12, matches.aiProof.length * 3);
+    record?.adjust('ai-resistance.present', Math.min(12, matches.aiProof.length * 3), { field: 'fullText', terms: matches.aiProof });
     strengths.push(`AI-resistant operating work: ${matches.aiProof.slice(0, 4).join(', ')}.`);
   } else if (completeness.narrativeEvidenceAvailable) {
-    addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'No clear physical, field-service, regulated, or relationship-heavy work signal.');
+    addScoreCap(scoreCaps, highFitScoreThreshold - 1, 'No clear physical, field-service, regulated, or relationship-heavy work signal.', 'ai-resistance.absent');
+    record?.absent('ai-resistance.absent', { field: 'fullText' });
     concerns.push('No clear physical, field-service, regulated, or relationship-heavy work signal.');
   } else {
+    record?.absent('ai-resistance.unknown', { field: 'description' });
     concerns.push('AI resistance is unknown because the source did not include enough narrative evidence.');
   }
 
   if (matches.management.length > 0 || /yes/i.test(deal.remoteFlag)) {
     score += 7;
+    record?.adjust('management.present', 7, { field: 'fullText', terms: matches.management.length > 0 ? matches.management : ['remote flag'] });
     strengths.push('Remote, absentee, turnkey, staff, or management signal exists.');
   } else {
+    record?.absent('management.absent', { field: 'fullText' });
     concerns.push('Management in place is not shown; this is acceptable but needs diligence.');
   }
 
   if (matches.capex.length > 0) {
     score -= Math.min(12, matches.capex.length * 3);
-    addScoreCap(scoreCaps, 82, 'Capex or asset-heavy language requires extra diligence before high conviction.');
+    record?.adjust('capex.present', -Math.min(12, matches.capex.length * 3), { field: 'fullText', terms: matches.capex });
+    addScoreCap(scoreCaps, 82, 'Capex or asset-heavy language requires extra diligence before high conviction.', 'capex.present');
     concerns.push(`Possible capex or asset-heavy concern: ${matches.capex.slice(0, 4).join(', ')}.`);
   }
 
   if (matches.financeable.length > 0) {
     score += Math.min(6, matches.financeable.length * 2);
+    record?.adjust('financeable.signals', Math.min(6, matches.financeable.length * 2), { field: 'fullText', terms: matches.financeable });
     strengths.push(`Financing support signals: ${matches.financeable.slice(0, 3).join(', ')}.`);
   }
 
   if (matches.ownerDependency.length > 0) {
     score -= Math.min(12, matches.ownerDependency.length * 4);
-    addScoreCap(scoreCaps, highFitScoreThreshold - 1, `Owner-dependency risk language found: ${matches.ownerDependency.slice(0, 3).join(', ')}.`);
+    record?.adjust('owner-dependency.present', -Math.min(12, matches.ownerDependency.length * 4), { field: 'fullText', terms: matches.ownerDependency });
+    addScoreCap(scoreCaps, highFitScoreThreshold - 1, `Owner-dependency risk language found: ${matches.ownerDependency.slice(0, 3).join(', ')}.`, 'owner-dependency.present');
   }
 
   if (matches.concentrationRisk.length > 0) {
     score -= Math.min(12, matches.concentrationRisk.length * 4);
-    addScoreCap(scoreCaps, highFitScoreThreshold - 1, `Customer concentration risk language found: ${matches.concentrationRisk.slice(0, 3).join(', ')}.`);
+    record?.adjust('concentration.present', -Math.min(12, matches.concentrationRisk.length * 4), { field: 'fullText', terms: matches.concentrationRisk });
+    addScoreCap(scoreCaps, highFitScoreThreshold - 1, `Customer concentration risk language found: ${matches.concentrationRisk.slice(0, 3).join(', ')}.`, 'concentration.present');
   }
 
   const nonCapexFinancialRisks = matches.financialRisk.filter((term) => !matches.capex.includes(term) && !matches.concentrationRisk.includes(term));
 
   if (nonCapexFinancialRisks.length > 0) {
     score -= Math.min(10, nonCapexFinancialRisks.length * 3);
-    addScoreCap(scoreCaps, 72, `Financial quality risk language found: ${nonCapexFinancialRisks.slice(0, 3).join(', ')}.`);
+    record?.adjust('financial-risk.present', -Math.min(10, nonCapexFinancialRisks.length * 3), { field: 'fullText', terms: nonCapexFinancialRisks });
+    addScoreCap(scoreCaps, 72, `Financial quality risk language found: ${nonCapexFinancialRisks.slice(0, 3).join(', ')}.`, 'financial-risk.present');
   }
 
   if (deal.state && profile.targetStates.includes(deal.state)) {
     score += 3;
+    record?.adjust('geography.target-state', 3, { field: 'state', value: deal.state });
     strengths.push(`Located in target state ${deal.state}.`);
   } else if (/yes/i.test(deal.remoteFlag)) {
     score += 3;
+    record?.adjust('geography.remote', 3, { field: 'remoteFlag', value: deal.remoteFlag });
     strengths.push('Location concern reduced because the listing is remote, relocatable, or absentee-run.');
   }
 
+  const preFloorScore = score;
+
   if (removeReasons.length > 0) {
     score = Math.min(score, 34);
+    if (score !== preFloorScore) record?.floor('gate.removed-floor', 34);
   } else if (deal.annualProfit === null) {
     score = Math.min(score, highFitScoreThreshold - 1);
+    if (score !== preFloorScore) record?.floor('profit.missing', highFitScoreThreshold - 1);
   }
 
   score = applyScoreCaps(score, scoreCaps, concerns);
   score = Math.max(0, Math.min(100, Math.round(score)));
+  record?.finalize({ caps: scoreCaps, score, completeness, removeReasons });
   const shouldRemove = removeReasons.length > 0 || score < 45;
   const highFit = !shouldRemove && score >= highFitScoreThreshold && deal.annualProfit !== null;
   const scoreStatus = completeness.evidenceConfidence === 'low'
@@ -6450,7 +6503,13 @@ async function buildDailyDealReview({ reviewMode = 'daily', dealOsImportId = '',
     : recentDeals.length > 0
       ? recentDeals
       : allDeals;
-  const scoredDealsWithIdentity = await attachCanonicalOpportunityIdentities(storage, candidateDeals.map(scoreDeal));
+  // Called explicitly rather than as a bare map callback: `scoreDeal` takes an
+  // optional ledger as its second argument, which a callback would fill with the
+  // array index.
+  const scoredDealsWithIdentity = await attachCanonicalOpportunityIdentities(
+    storage,
+    candidateDeals.map((candidateDeal) => scoreDeal(candidateDeal)),
+  );
   const seenDeals = await loadDealHunterHistory(storage);
   const scoredDealsWithHistory = attachHistory(scoredDealsWithIdentity, seenDeals, generatedAt);
   const dealKeys = uniqueStrings(scoredDealsWithHistory.flatMap((deal) => [
