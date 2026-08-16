@@ -4,7 +4,7 @@ Phase 3A turns Deal Hunter scoring into a durable, explainable operator decision
 
 ## What the score is, and is not
 
-`fitScore` is the `deal-hunter-fit-v2` score. Phase 3A did not change the acquisition scoring philosophy; it recorded the one already in production. An optional ledger is threaded through the existing scorer and observes each rule as it fires, so the number in the queue is the number the scorer computed, by construction rather than by approximation. A 506-case frozen corpus asserts this case by case.
+`fitScore` is the `deal-hunter-fit-v2.1` score. Phase 3A did not change the acquisition scoring philosophy; it recorded the one already in production. Phase 3A.1 corrected which keyword occurrences count (see [Semantic matching](#semantic-matching)) without touching a single weight, threshold, band, cap or gate. An optional ledger is threaded through the existing scorer and observes each rule as it fires, so the number in the queue is the number the scorer computed, by construction rather than by approximation. A 506-case frozen corpus asserts this case by case.
 
 A future scoring philosophy change must ship under a new rules version. It must not be called `deal-hunter-fit-v2`.
 
@@ -33,6 +33,28 @@ Every point, cap, and gate is attributed to one of seven dimensions. These descr
 | Strategic and geographic fit | Search-theme match, business age, target geography, category exclusions. |
 
 Each dimension reports a verdict: `supported`, `mixed`, `negative`, or `absent`.
+
+## Semantic matching
+
+Keyword families are matched by a bounded deterministic matcher rather than plain substring search. A term still matches wherever it matched before **unless** a documented rule suppresses that occurrence, and a term still counts if any one of its occurrences survives.
+
+| Suppression reason | Meaning | Example |
+| --- | --- | --- |
+| `negated-positive` | A negator precedes a positive term | "no recurring revenue" |
+| `negated-risk` | A negator precedes a risk term | "no customer accounts for more than 10%" |
+| `favorable-qualifier` | A favorable word directly qualifies a risk term | "low customer concentration" |
+| `adverse-context` | The positive term sits in an adverse clause | "losing maintenance contracts" |
+| `future-or-conditional` | A plan rather than a current fact | "plans to add service agreements" |
+| `historical-only` | A past state rather than a current one | "formerly had maintenance contracts" |
+| `longer-phrase-precedence` | A longer opposite-polarity phrase owns the span | "low customer concentration" over "customer concentration" |
+
+**Negation scope is bounded to the clause.** It stops at sentence punctuation, at a semicolon, at an adversative conjunction (`but`, `however`, `although`, `yet`), and after six tokens. `not only` is treated as emphasis, not negation. A `non-` prefix suppresses the term it negates, while a hyphenated keyword such as `non-discretionary` still scores as itself.
+
+**Category gates are deliberately excluded from suppression.** Falsely suppressing a gate would admit a disqualified listing; a false gate is merely reviewable. The expensive error is the one that is prevented.
+
+**One documented limitation:** negation does not model English coordination, so a positive term sharing a clause with an earlier negator is conservatively withheld. Breaking the window on `and` would fix "revenue is no longer declining and maintenance contracts renew annually" but would wrongly accept "no maintenance contracts and recurring revenue", where negation legitimately distributes. Withholding credit is the safe direction, and a sentence break recovers the positive.
+
+Suppressed occurrences are recorded on the score result, so an operator can see why a listing that mentions a term did not score for it.
 
 ## The absent-evidence rule
 
@@ -65,7 +87,14 @@ Contradictions come from the existing `fieldConflicts` work and surface as evide
 
 ## Fingerprints and rescoring
 
-`score_fingerprint` is a digest of the normalized inputs that can actually change a score, plus the engine, rules, profile, and completeness-policy versions.
+Two digests answer two different questions:
+
+| Digest | Covers | Answers |
+| --- | --- | --- |
+| `score_fingerprint` | scoring inputs **plus** every version, including the matcher version | "should this be rescored?" |
+| `semantic_digest` | what the score concludes: score, status, confidence, completeness, eligibility, gates, caps, per-dimension contribution and verdict, missing evidence, contradictions — and **no** version field | "should a human look again?" |
+
+`score_fingerprint` is a digest of the normalized inputs that can actually change a score, plus the engine, rules, profile, completeness-policy, and semantic-matcher versions.
 
 It deliberately **excludes** observation bookkeeping — first seen, last seen, `isNew`, generated notes, per-run metadata, and fields such as `netMargin` that no scoring branch reads. Including volatile timestamps in a digest is what previously made the reconciliation preview classify every unchanged record as a write; the same mistake here would make every opportunity look permanently changed.
 
@@ -83,12 +112,28 @@ Scoring never runs on page load. The triage queue reads persisted rows only, so 
 
 A refresh is bounded and resumable. Pass `opportunityIds` to scope it. A failure on one opportunity is recorded and the batch continues, so a retry redoes only what did not land. Forcing a rebuild of every score requires typing `REBUILD ALL SCORES`.
 
+## Scoring versions and what a bump does
+
+| | Value |
+| --- | --- |
+| Previous rules version | `deal-hunter-fit-v2` |
+| Current rules version | `deal-hunter-fit-v2.1` |
+| Semantic matcher version | `deal-semantic-matcher-v1` |
+
+A rules bump stales every stored `score_fingerprint`, so every opportunity is rescored. That is intended: a score computed under retired semantics must not be served as current. What is **not** intended is treating that rewrite as something a human must re-review.
+
+`changed_since_review` therefore compares `reviewed_semantic_digest` against `semantic_digest` — conclusions against conclusions. A rescore that reproduces the same conclusions is a **version-only rewrite**: the row is updated, no `opportunity.rescored` event is emitted, and the operator's review stands. Rows reviewed before digests existed fall back to the previous fingerprint comparison.
+
+Before any broad rescore, run the preview (`POST /api/admin/deal-hunter/scores/refresh/preview`). It writes nothing and reports newly scored, unchanged, version-only, semantic change, score/classification/gate change, evidence-only change, high-fit and watchlist movement both ways, newly gated and gates lifted, and how many operator-prioritized and reviewed rows are affected. Execute only once those counts look right.
+
+**Rollback:** v2.1 is additive in storage terms — two nullable columns and a corrected matcher. Reverting the code returns scoring to v2 semantics; stored rows keep their `rules_version`, so a row's provenance is always legible. The demonstrated v2 false positives would return.
+
 ## Machine ownership versus operator ownership
 
 | Owner | Fields |
 | --- | --- |
-| Deal Hunter | fit score, dimensions, confidence, completeness, gates, evidence, scoring versions, fingerprint, scored-at |
-| Operator | priority, note, reviewed-at, reviewed-by, reviewed-fingerprint |
+| Deal Hunter | fit score, dimensions, confidence, completeness, gates, evidence, scoring versions, fingerprint, semantic digest, scored-at |
+| Operator | priority, note, reviewed-at, reviewed-by, reviewed-fingerprint, reviewed-semantic-digest |
 
 These are written by two separate storage operations with disjoint column lists. The machine write **throws** if its payload carries any operator-owned key; the operator write cannot reach a scoring column at all. There is no generic upsert spanning both. An import, reconciliation, CRM sync, rescore, forced refresh, or retry therefore cannot erase a human decision, and tests assert that across every one of those paths.
 
