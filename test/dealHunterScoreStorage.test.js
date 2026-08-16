@@ -264,6 +264,195 @@ test('fingerprint lookup returns only the columns the refresh gate needs', async
   assert.equal(await storage.listDealHunterOpportunityScoreFingerprints([]).then((rows) => rows.length), 0);
 });
 
+// ---------------------------------------------------------------------------
+// Supabase provider parity (Phase 3A.1 provider-parity patch)
+//
+// The SQL RPC (list_deal_hunter_opportunity_scores) already implements
+// semantic-digest-first review comparison, validated against real PostgreSQL
+// in Phase 3A.1 commit 4. This section covers the JS-side row normalization in
+// server/storage/supabase.js, used by getDealHunterOpportunityScore and by the
+// row returned from setDealHunterOpportunityOperatorDecision, which had drifted
+// from that behaviour by comparing only the fingerprint.
+// ---------------------------------------------------------------------------
+
+// Minimal chainable stub matching exactly the query shapes
+// getDealHunterOpportunityScore and setDealHunterOpportunityOperatorDecision
+// issue against `deal_hunter_opportunity_scores`, following the inline mock
+// convention used elsewhere for createSupabaseStorage (see
+// communicationsStorage.test.js).
+function supabaseRowClient(row) {
+  let table = null;
+  let pendingUpdate = null;
+  const chain = {
+    from(name) {
+      table = name;
+      pendingUpdate = null;
+      return chain;
+    },
+    select() {
+      return chain;
+    },
+    update(payload) {
+      pendingUpdate = payload;
+      return chain;
+    },
+    eq(column, value) {
+      assert.equal(table, 'deal_hunter_opportunity_scores');
+      assert.equal(column, 'opportunity_id');
+      assert.equal(value, row.opportunity_id);
+      if (pendingUpdate) Object.assign(row, pendingUpdate);
+      return chain;
+    },
+    limit() {
+      return chain;
+    },
+    async maybeSingle() {
+      return { data: { ...row }, error: null };
+    },
+  };
+  return chain;
+}
+
+function storedScoreRow(overrides = {}) {
+  return {
+    opportunity_id: 'opp-score-1',
+    scored_at: '2026-08-16T12:00:00.000Z',
+    deal_key: 'deal-score-1',
+    name: 'Commercial Fire Safety Inspection Co',
+    fit_score: 81,
+    score_status: 'high-fit',
+    confidence: 'high',
+    completeness_score: 92,
+    should_remove: false,
+    high_fit: true,
+    score_fingerprint: 'fingerprint-a',
+    semantic_digest: 'digest-a',
+    rules_version: 'deal-hunter-fit-v2.1',
+    dimensions: [],
+    gates: [],
+    applied_caps: [],
+    missing_evidence: [],
+    confidence_reasons: [],
+    summary: {},
+    operator_priority: 'normal',
+    operator_note: null,
+    reviewed_at: null,
+    reviewed_by: null,
+    reviewed_fingerprint: null,
+    reviewed_semantic_digest: null,
+    ...overrides,
+  };
+}
+
+function supabaseStorageOver(row) {
+  return supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: supabaseRowClient(row) },
+  );
+}
+
+test('Supabase: same semantic digest with a different fingerprint is a version-only rewrite, not a change', async () => {
+  const storage = supabaseStorageOver(storedScoreRow({
+    reviewed_at: '2026-08-16T13:00:00.000Z',
+    reviewed_by: 'owner@example.invalid',
+    reviewed_fingerprint: 'fingerprint-old',
+    reviewed_semantic_digest: 'digest-a',
+    score_fingerprint: 'fingerprint-new',
+    semantic_digest: 'digest-a',
+  }));
+  const row = await storage.getDealHunterOpportunityScore('opp-score-1');
+  assert.equal(row.reviewed, true);
+  assert.equal(row.changed_since_review, false, 'a version-only rewrite must not read as changed');
+});
+
+test('Supabase: a different semantic digest reads as changed since review', async () => {
+  const storage = supabaseStorageOver(storedScoreRow({
+    reviewed_at: '2026-08-16T13:00:00.000Z',
+    reviewed_by: 'owner@example.invalid',
+    reviewed_fingerprint: 'fingerprint-a',
+    reviewed_semantic_digest: 'digest-old',
+    semantic_digest: 'digest-new',
+  }));
+  const row = await storage.getDealHunterOpportunityScore('opp-score-1');
+  assert.equal(row.changed_since_review, true);
+});
+
+test('Supabase: a legacy reviewed row with no semantic digest falls back to the fingerprint comparison', async () => {
+  const unchanged = supabaseStorageOver(storedScoreRow({
+    reviewed_at: '2026-08-16T13:00:00.000Z',
+    reviewed_by: 'owner@example.invalid',
+    reviewed_fingerprint: 'fingerprint-a',
+    reviewed_semantic_digest: null,
+    score_fingerprint: 'fingerprint-a',
+  }));
+  assert.equal((await unchanged.getDealHunterOpportunityScore('opp-score-1')).changed_since_review, false);
+
+  const changed = supabaseStorageOver(storedScoreRow({
+    reviewed_at: '2026-08-16T13:00:00.000Z',
+    reviewed_by: 'owner@example.invalid',
+    reviewed_fingerprint: 'fingerprint-old',
+    reviewed_semantic_digest: null,
+    score_fingerprint: 'fingerprint-new',
+  }));
+  assert.equal((await changed.getDealHunterOpportunityScore('opp-score-1')).changed_since_review, true);
+});
+
+test('Supabase: an opportunity that has never been reviewed is never changed since review', async () => {
+  const storage = supabaseStorageOver(storedScoreRow({
+    reviewed_at: null,
+    reviewed_fingerprint: null,
+    reviewed_semantic_digest: null,
+  }));
+  const row = await storage.getDealHunterOpportunityScore('opp-score-1');
+  assert.equal(row.reviewed, false);
+  assert.equal(row.changed_since_review, false, 'never reviewed is not the same as changed');
+});
+
+test('Supabase: an operator review decision persists the semantic digest alongside the fingerprint', async () => {
+  const storage = supabaseStorageOver(storedScoreRow());
+  const updated = await storage.setDealHunterOpportunityOperatorDecision({
+    opportunityId: 'opp-score-1',
+    reviewed: true,
+    reviewedBy: 'owner@example.invalid',
+    reviewedFingerprint: 'fingerprint-a',
+    reviewedSemanticDigest: 'digest-a',
+    reviewedAt: '2026-08-16T13:00:00.000Z',
+  });
+  assert.equal(updated.reviewed_at, '2026-08-16T13:00:00.000Z');
+  assert.equal(updated.reviewed_by, 'owner@example.invalid');
+  assert.equal(updated.reviewed_fingerprint, 'fingerprint-a');
+  assert.equal(updated.reviewed_semantic_digest, 'digest-a');
+  assert.equal(updated.changed_since_review, false);
+});
+
+test('Supabase: omitting reviewedSemanticDigest persists null, never an empty string', async () => {
+  const storage = supabaseStorageOver(storedScoreRow());
+  const updated = await storage.setDealHunterOpportunityOperatorDecision({
+    opportunityId: 'opp-score-1',
+    reviewed: true,
+    reviewedBy: 'legacy-caller',
+    reviewedFingerprint: 'fingerprint-a',
+    // reviewedSemanticDigest intentionally omitted, as an older caller would.
+  });
+  assert.equal(updated.reviewed_semantic_digest, null, 'an omitted digest must persist as null, not ""');
+  assert.notEqual(updated.reviewed_semantic_digest, '');
+
+  // With no digest recorded, changed-since-review falls back to the
+  // fingerprint comparison rather than treating "" as a meaningful digest.
+  assert.equal(updated.changed_since_review, false, 'unchanged fingerprint, no digest recorded');
+});
+
+test('Supabase: a machine score write refuses to carry reviewed_semantic_digest', async () => {
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { rpc: () => { throw new Error('the ownership guard must reject before any network call'); } } },
+  );
+  await assert.rejects(
+    storage.writeDealHunterOpportunityScore({ ...scorePayload(), reviewed_semantic_digest: 'attacker-supplied' }, []),
+    /operator-owned field "reviewed_semantic_digest"/,
+  );
+});
+
 test('both storage providers expose the same scoring surface', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-score-parity-'));
   const sqlite = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'parity.sqlite') } });

@@ -335,6 +335,7 @@ export const dealHunterOperatorOwnedScoreFields = Object.freeze([
   'reviewed_at',
   'reviewed_by',
   'reviewed_fingerprint',
+  'reviewed_semantic_digest',
   'operator_updated_at',
 ]);
 

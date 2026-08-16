@@ -318,6 +318,7 @@ export const dealHunterOperatorOwnedScoreFields = Object.freeze([
   'reviewed_at',
   'reviewed_by',
   'reviewed_fingerprint',
+  'reviewed_semantic_digest',
   'operator_updated_at',
 ]);
 
@@ -333,7 +334,15 @@ function normalizeDealHunterOpportunityScoreRow(row) {
         missing_evidence: Array.isArray(row.missing_evidence) ? row.missing_evidence : [],
         confidence_reasons: Array.isArray(row.confidence_reasons) ? row.confidence_reasons : [],
         summary: typeof row.summary === 'object' && row.summary !== null ? row.summary : {},
-        changed_since_review: Boolean(row.reviewed_fingerprint) && row.reviewed_fingerprint !== row.score_fingerprint,
+        // A review is stale only when the score's *conclusions* moved. Rows
+        // reviewed before semantic digests existed fall back to comparing the
+        // input fingerprint, which is the previous, coarser behaviour. Kept in
+        // sync with the identical logic in the SQLite provider.
+        changed_since_review: Boolean(row.reviewed_at) && (
+          row.reviewed_semantic_digest
+            ? row.reviewed_semantic_digest !== row.semantic_digest
+            : Boolean(row.reviewed_fingerprint) && row.reviewed_fingerprint !== row.score_fingerprint
+        ),
         reviewed: Boolean(row.reviewed_at),
       }
     : null;
@@ -2597,6 +2606,8 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         payload.reviewed_at = decision.reviewedAt || payload.operator_updated_at;
         payload.reviewed_by = String(decision.reviewedBy || 'admin');
         payload.reviewed_fingerprint = String(decision.reviewedFingerprint || '');
+        payload.reviewed_semantic_digest = decision.reviewedSemanticDigest
+          ? String(decision.reviewedSemanticDigest) : null;
       }
       const { data, error } = await client
         .from('deal_hunter_opportunity_scores')
