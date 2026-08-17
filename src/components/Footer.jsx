@@ -2,6 +2,7 @@ import { ArrowRight } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { navigation, siteConfig } from '../content/siteContent';
 import ButtonLink from './ButtonLink';
+import TrackedDownloadLink from './TrackedDownloadLink';
 import LinkedInIcon from './LinkedInIcon';
 import LogoMark from './LogoMark';
 
@@ -23,13 +24,13 @@ export default function Footer() {
               <ButtonLink className="w-full bg-white text-pine hover:bg-sand sm:w-auto" href="/contact">
                 Start A Conversation
               </ButtonLink>
-              <ButtonLink
+              <TrackedDownloadLink
                 className="w-full border-white/20 bg-white/10 text-white hover:border-white/30 hover:bg-white/15 sm:w-auto"
-                download
                 href={siteConfig.downloadHref}
+                placement="footer"
               >
                 Download Criteria
-              </ButtonLink>
+              </TrackedDownloadLink>
             </div>
           </div>
 

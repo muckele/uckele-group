@@ -371,6 +371,30 @@ test('dashboard submission delete restores staged files when database deletion f
   assert.equal(fs.readFileSync(documentPath, 'utf8'), 'recoverable diligence document');
 });
 
+test('dashboard submission delete reports a fresh CIM transmission lease as a retryable conflict', async () => {
+  const result = await deleteDashboardSubmission('active-cim-delete-submission', {
+    storage: {
+      async getSubmission(id) {
+        return { id };
+      },
+      async listSecureDocumentsForSubmission() {
+        return [];
+      },
+      async deleteSubmission() {
+        const error = new Error('CIM transmission is in progress; CRM deletion is blocked until its claim lease expires.');
+        error.code = 'CIM_SEND_IN_PROGRESS';
+        error.status = 409;
+        throw error;
+      },
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 409);
+  assert.match(result.error, /CIM transmission is in progress/i);
+  assert.deepEqual(result.cleanupFailures, []);
+});
+
 test('dashboard submission delete rejects secure document paths outside the vault', async () => {
   let deleteCalled = false;
   let unlinkCalled = false;

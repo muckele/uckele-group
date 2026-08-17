@@ -36,10 +36,30 @@ import { getEmailReadiness } from './services/emailReadiness.js';
 import { sendAdminEmailTestEmail } from './services/delivery.js';
 import { checkReadiness } from './services/readiness.js';
 import {
+  previewOpportunityScoreRefresh,
+  refreshOpportunityScores,
+  requestOpportunityScoreRefresh,
+} from './services/dealHunterScoreStore.js';
+import {
+  getTriageOpportunityDetail,
+  listTriageQueue,
+  setTriageOperatorDecision,
+} from './services/dealHunterTriage.js';
+import {
+  dealHunterCrmSyncConfirmation,
+  auditDealHunterCrmIntegrity,
+  executeDealOsCrmReconciliation,
+  previewDealOsCrmReconciliation,
   reviewDailyDeals,
+  importDealOsExport,
+  runCimStage2Automation,
   runDealHunterCimFollowUps,
+  listDealHunterCimRequestHistory,
+  retryDealHunterCimRequestWithCorrectedRecipient,
   sendDealHunterCimRequest,
   sendDealHunterReadyCimRequests,
+  syncDealHunterHighFitsToCrm,
+  validateCimReviewDecisions,
 } from './services/dealHunter.js';
 import { getDailyDealHunterJobStatus, runClaimedDailyDealHunterEmail } from './services/dealHunterScheduler.js';
 import {
@@ -55,8 +75,46 @@ import {
 } from './services/submissions.js';
 import { asyncRoute } from './utils/http.js';
 import { safeCompareText } from './utils/security.js';
-import { listCrmActivity } from './services/activity.js';
-import { getOperationsCenter } from './services/operations.js';
+import { listCrmActivity, projectCrmActivityTimeline } from './services/activity.js';
+import { getOperationsCenter, sanitizeViewerOperations } from './services/operations.js';
+import {
+  assignUnassignedCommunication,
+  createManualCommunication,
+  listCrmCommunications,
+  listUnassignedCommunications,
+} from './services/communications.js';
+import {
+  archiveLead,
+  dismissDealHunterOpportunity,
+  restoreDealHunterOpportunity,
+  restoreLead,
+} from './services/leadLifecycle.js';
+import { recordAnalyticsEvent } from './services/analytics.js';
+import {
+  createCimStage2Activation,
+  getCimAutomationStatus,
+  recordCimResponseOutcome,
+  recordCimReviewDecisions,
+  setCimAutomationPaused,
+} from './services/cimAutomation.js';
+import {
+  previewCrmFollowUpEmail,
+  sendCrmFollowUpEmail,
+} from './services/followUpEmail.js';
+import { generateCrmFollowUpRecommendation } from './services/followUpRecommendations.js';
+import {
+  createAdminEmailSuppression,
+  dismissCrmFollowUpRecommendation,
+  getCrmFollowUpContext,
+  getCrmFollowUpOutboxResult,
+  liftAdminEmailSuppression,
+} from './services/followUpWorkspace.js';
+import { registerAdminOnboardingRoutes } from './routes/adminOnboarding.js';
+import {
+  createCimRecipientOverride,
+  resolveCimIdentityException,
+  setCimOutreachPaused,
+} from './services/cimOpportunityIdentity.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDirectory = path.resolve(__dirname, '../dist');
@@ -86,6 +144,17 @@ function jsonParserOptions(limit) {
     limit,
     verify: captureRawBody,
   };
+}
+
+function decodedHeader(request, name, maxLength = 500) {
+  const raw = String(request.headers[name] || '').trim();
+  if (!raw) return '';
+
+  try {
+    return decodeURIComponent(raw).replace(/[\r\n]/g, ' ').trim().slice(0, maxLength);
+  } catch {
+    return raw.replace(/[\r\n]/g, ' ').trim().slice(0, maxLength);
+  }
 }
 
 function setProtectedResponseHeaders(_request, response, next) {
@@ -178,7 +247,11 @@ export function handleAppError(error, request, response, next) {
       : 'Something went wrong while processing the request.';
 
   if (status >= 500) {
-    console.error(`[request:${request.id || 'unknown'}]`, error);
+    console.error(`[request:${request.id || 'unknown'}] request failed`, {
+      name: String(error?.name || 'Error').slice(0, 100),
+      code: String(error?.code || '').slice(0, 100),
+      status,
+    });
   } else {
     console.warn(`[request:${request.id || 'unknown'}] ${error?.message || error}`);
   }
@@ -223,9 +296,56 @@ function publicSecureUploadRequest(requestRecord) {
   };
 }
 
+// Vite fingerprints everything it emits under /assets, so those URLs can never
+// go stale: changing the content changes the filename. Entry documents are not
+// fingerprinted, so they revalidate and a deploy is picked up immediately.
+// Anything else in dist keeps serve-static's revalidating default.
+// Compression is deliberately absent: the Fly proxy compresses at the edge for
+// responses that do not already carry a Content-Encoding header.
+export const immutableAssetCacheControl = `public, max-age=${365 * 24 * 60 * 60}, immutable`;
+export const entryDocumentCacheControl = 'no-cache';
+
+export function setStaticAssetHeaders(response, filePath) {
+  const relativePath = path.relative(distDirectory, filePath);
+  if (relativePath === 'assets' || relativePath.startsWith(`assets${path.sep}`)) {
+    response.setHeader('Cache-Control', immutableAssetCacheControl);
+    return;
+  }
+  if (path.extname(filePath).toLowerCase() === '.html') {
+    response.setHeader('Cache-Control', entryDocumentCacheControl);
+  }
+}
+
+// The reconciliation plan is executed whole server-side; the response only has
+// to stay small enough to render, so item bounding belongs here rather than in
+// the plan itself. `dealsByOpportunity` is an in-process carry-over.
+const reconciliationPreviewItemLimit = 1000;
+
+function boundedReconciliationPlan(plan) {
+  if (!plan || typeof plan !== 'object' || !Array.isArray(plan.items)) return plan;
+  const { dealsByOpportunity: _carriedDeals, ...rest } = plan;
+  return {
+    ...rest,
+    items: plan.items.slice(0, reconciliationPreviewItemLimit),
+    itemsTruncated: plan.items.length > reconciliationPreviewItemLimit,
+  };
+}
+
+function boundedReconciliationPreview(result) {
+  if (!result || typeof result !== 'object') return result;
+  const bounded = boundedReconciliationPlan(result);
+  return bounded.preview && typeof bounded.preview === 'object'
+    ? { ...bounded, preview: boundedReconciliationPlan(bounded.preview) }
+    : bounded;
+}
+
 export function createApp() {
   const config = getConfig();
   const app = express();
+  const dealOsRawParser = express.raw({
+    type: () => true,
+    limit: config.dealHunter.dealOsExportMaxPayloadBytes,
+  });
   let activeSecureUploads = 0;
 
   app.disable('x-powered-by');
@@ -337,7 +457,36 @@ export function createApp() {
     }
   });
   app.use('/api/contact', express.json(jsonParserOptions(config.protection.contactJsonLimit)));
+  app.use('/api/analytics/events', express.json(jsonParserOptions('16kb')));
   app.use('/api/webhooks/resend', express.json(jsonParserOptions('1mb')));
+  app.use('/api/admin/deal-hunter/deal-os-import', async (request, response, next) => {
+    if (request.method !== 'POST') {
+      next();
+      return;
+    }
+
+    try {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      request.dealOsImportSession = session;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.use(
+    '/api/admin/deal-hunter/deal-os-import',
+    (request, response, next) => {
+      if (request.method !== 'POST') {
+        next();
+        return;
+      }
+      dealOsRawParser(request, response, next);
+    },
+  );
   app.use(express.json(jsonParserOptions('512kb')));
   app.use(express.urlencoded({ extended: true, limit: '64kb' }));
 
@@ -391,6 +540,20 @@ export function createApp() {
       turnstileEnabled: Boolean(config.turnstile.siteKey && config.turnstile.secretKey),
     });
   });
+
+  app.post(
+    '/api/analytics/events',
+    asyncRoute(async (request, response) => {
+      const result = await recordAnalyticsEvent(request.body || {}, request);
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error });
+        return;
+      }
+
+      response.status(202).json({ success: true });
+    }),
+  );
 
   app.post(
     '/api/contact',
@@ -498,6 +661,8 @@ export function createApp() {
     response.json({ success: true, revoked: result.revoked });
   }));
 
+  registerAdminOnboardingRoutes(app);
+
   app.get(
     '/api/admin/acquisition-command-center',
     asyncRoute(async (request, response) => {
@@ -521,12 +686,17 @@ export function createApp() {
   app.get(
     '/api/admin/operations',
     asyncRoute(async (request, response) => {
-      if (!await requireAdmin(request)) {
-        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
         return;
       }
 
-      response.json({ success: true, operations: await getOperationsCenter() });
+      const operations = await getOperationsCenter();
+      response.json({
+        success: true,
+        operations: session.role === 'viewer' ? sanitizeViewerOperations(operations) : operations,
+      });
     }),
   );
 
@@ -635,12 +805,206 @@ export function createApp() {
         return;
       }
 
-      const result = await listDashboardFollowUps();
+      const result = await listDashboardFollowUps({
+        page: Number(request.query.page) || 1,
+        pageSize: Number(request.query.pageSize) || 25,
+        search: String(request.query.search || ''),
+        view: String(request.query.view || 'crm-actions'),
+        sort: String(request.query.sort || 'urgency'),
+        direction: String(request.query.direction || 'desc'),
+      });
 
       response.json({
         success: true,
         ...result,
       });
+    }),
+  );
+
+  app.get(
+    '/api/admin/follow-ups/:submissionId/context',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdmin(request)) {
+        response.status(403).json({ success: false, error: 'Administrator access is required to read email contents.' });
+        return;
+      }
+      const result = await getCrmFollowUpContext({
+        submissionId: request.params.submissionId,
+        communicationPage: Number(request.query.communicationPage) || 1,
+        communicationPageSize: Number(request.query.communicationPageSize) || 50,
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/recommendations',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdmin(request)) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await generateCrmFollowUpRecommendation({
+        submissionId: request.params.submissionId,
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/email-preview',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await previewCrmFollowUpEmail({
+        submissionId: request.params.submissionId,
+        actor: session.username || 'admin',
+        input: request.body || {},
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/send-email',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await sendCrmFollowUpEmail({
+        submissionId: request.params.submissionId,
+        actor: session.username || 'admin',
+        input: request.body || {},
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.get(
+    '/api/admin/follow-ups/:submissionId/outbox/:outboxId',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdmin(request)) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await getCrmFollowUpOutboxResult({
+        submissionId: request.params.submissionId,
+        outboxId: request.params.outboxId,
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/workflow',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const action = String(request.body?.action || '').trim().toLowerCase();
+      const expectedUpdatedAt = String(request.body?.expectedSubmissionVersion || request.body?.expected_updated_at || '');
+      let fields;
+      if (action === 'snooze' || action === 'reschedule') {
+        if (!Number.isFinite(Date.parse(request.body?.nextActionAt || ''))) {
+          response.status(422).json({ success: false, error: 'A valid next action time is required.' });
+          return;
+        }
+        fields = {
+          expected_updated_at: expectedUpdatedAt,
+          follow_up_state: 'scheduled',
+          next_action_at: new Date(request.body.nextActionAt).toISOString(),
+        };
+      } else if (action === 'complete') {
+        fields = { expected_updated_at: expectedUpdatedAt, follow_up_state: 'completed', next_action_at: null };
+      } else if (action === 'reopen') {
+        fields = {
+          expected_updated_at: expectedUpdatedAt,
+          follow_up_state: 'needs-response',
+          next_action_at: Number.isFinite(Date.parse(request.body?.nextActionAt || ''))
+            ? new Date(request.body.nextActionAt).toISOString()
+            : new Date().toISOString(),
+        };
+      } else {
+        response.status(422).json({ success: false, error: 'Choose snooze, reschedule, complete, or reopen.' });
+        return;
+      }
+      const submission = await updateSubmissionWorkflow(request.params.submissionId, fields, {
+        actor: session.username || 'admin',
+        role: 'admin',
+      });
+      if (submission?.conflict) {
+        response.status(409).json({ success: false, error: 'The CRM record changed. Refresh and try again.', ...submission });
+        return;
+      }
+      if (!submission) {
+        response.status(422).json({ success: false, error: 'The CRM workflow action could not be applied.' });
+        return;
+      }
+      response.json({ success: true, submission });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/recommendations/:recommendationId/dismiss',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await dismissCrmFollowUpRecommendation({
+        submissionId: request.params.submissionId,
+        recommendationId: request.params.recommendationId,
+        expectedSubmissionVersion: String(request.body?.expectedSubmissionVersion || ''),
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/suppressions',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await createAdminEmailSuppression({
+        submissionId: request.params.submissionId,
+        email: request.body?.email || '',
+        reason: request.body?.reason || '',
+        confirmed: request.body?.confirmed === true,
+        overrideReason: request.body?.overrideReason || '',
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 201 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/follow-ups/:submissionId/suppressions/lift',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(403).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await liftAdminEmailSuppression({
+        submissionId: request.params.submissionId,
+        email: request.body?.email || '',
+        liftReason: request.body?.liftReason || '',
+        confirmed: request.body?.confirmed === true,
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );
 
@@ -732,8 +1096,84 @@ export function createApp() {
         limit: Number(request.query.limit) || 200,
         before: String(request.query.before || ''),
       });
+      const timeline = projectCrmActivityTimeline(events);
+      response.json({ success: true, events: timeline.events, rawEvents: events, counts: timeline.counts });
+    }),
+  );
 
-      response.json({ success: true, events });
+  app.get(
+    '/api/admin/submissions/:id/communications',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const submission = await getDashboardSubmission(request.params.id);
+      if (!submission) {
+        response.status(404).json({ success: false, error: 'CRM record not found.' });
+        return;
+      }
+
+      const result = await listCrmCommunications({
+        submissionId: submission.id,
+        page: Number(request.query.page) || 1,
+        pageSize: Number(request.query.pageSize) || 25,
+        before: String(request.query.before || ''),
+      });
+      response.json({ success: true, communications: result.rows || [], ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/submissions/:id/communications',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await createManualCommunication({
+        submissionId: request.params.id,
+        input: request.body || {},
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 201 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.get(
+    '/api/admin/communications/unassigned',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await listUnassignedCommunications({
+        page: Number(request.query.page) || 1,
+        pageSize: Number(request.query.pageSize) || 25,
+      });
+      response.json({ success: true, communications: result.rows || [], ...result });
+    }),
+  );
+
+  app.patch(
+    '/api/admin/communications/:id/assign',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await assignUnassignedCommunication({
+        communicationId: request.params.id,
+        submissionId: request.body?.submissionId || request.body?.submission_id || '',
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );
 
@@ -763,6 +1203,276 @@ export function createApp() {
   );
 
   app.post(
+    '/api/admin/deal-hunter/deal-os-import',
+    asyncRoute(async (request, response) => {
+      const session = request.dealOsImportSession || await requireAdmin(request);
+
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const requestedReviewMode = decodedHeader(request, 'x-deal-os-review-mode', 40) || 'daily';
+      if (!['daily', 'full-backfill'].includes(requestedReviewMode)) {
+        response.status(400).json({ success: false, error: 'Deal OS review mode must be daily or full-backfill.' });
+        return;
+      }
+
+      const result = await importDealOsExport({
+        fileBuffer: request.body,
+        fileName: decodedHeader(request, 'x-deal-os-file-name', 180),
+        mimeType: String(request.headers['content-type'] || '').slice(0, 160),
+        exportedAt: decodedHeader(request, 'x-deal-os-exported-at', 100),
+        scope: decodedHeader(request, 'x-deal-os-scope', 40),
+        coverageLabel: decodedHeader(request, 'x-deal-os-coverage-label', 200),
+        expectedRowCount: decodedHeader(request, 'x-deal-os-expected-row-count', 20),
+        importedBy: session.username || 'admin',
+      });
+
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error, details: result.details || [] });
+        return;
+      }
+
+      let review = null;
+      let reviewWarning = '';
+      let scoreRefresh = null;
+      try {
+        const reviewed = await reviewDailyDeals({ reviewMode: requestedReviewMode, withScoredDeals: true });
+        review = reviewed.review;
+        review.dailyEmailJob = await getDailyDealHunterJobStatus();
+        review.emailReadiness = await getEmailReadiness();
+        // Persist scores for the listings this import produced. Fingerprint
+        // gating means unchanged opportunities cost nothing.
+        scoreRefresh = await refreshOpportunityScores({ deals: reviewed.scoredDeals, actor: session.username || 'admin' });
+      } catch (error) {
+        reviewWarning = `The export was imported, but scoring could not be refreshed: ${error.message}`;
+      }
+
+      response.status(201).json({
+        success: true,
+        import: result.import,
+        review,
+        scoreRefresh: scoreRefresh ? { counts: scoreRefresh.counts, ok: scoreRefresh.ok } : null,
+        summary: review?.importSummary || {
+          importId: result.import?.id || '',
+          reviewMode: requestedReviewMode,
+          importedRows: Number(result.import?.acceptedRowCount ?? result.import?.rowCount ?? 0),
+          sourceRows: Number(result.import?.sourceRowCount ?? result.import?.rowCount ?? 0),
+          rejectedRows: Number(result.import?.rejectedRowCount || 0),
+          canonicalImportRecords: Number(result.import?.canonicalRecordCount ?? result.import?.rowCount ?? 0),
+          withinFileDuplicates: Number(result.import?.duplicateCount || 0),
+          fieldCoverage: result.import?.fieldCoverage || { totalRecords: 0, fields: [] },
+        },
+        ...(reviewWarning ? { reviewWarning } : {}),
+      });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/backfill-review',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const reviewed = await reviewDailyDeals({ reviewMode: 'full-backfill', withScoredDeals: true });
+      const review = reviewed.review;
+      review.dailyEmailJob = await getDailyDealHunterJobStatus();
+      review.emailReadiness = await getEmailReadiness();
+      await getSourceHealth(undefined, { persistSnapshot: true, refresh: true, review });
+      const scoreRefresh = await refreshOpportunityScores({
+        deals: reviewed.scoredDeals,
+        actor: session.username || 'admin',
+      });
+      response.json({
+        success: true,
+        review,
+        summary: review.importSummary,
+        scoreRefresh: { counts: scoreRefresh.counts, ok: scoreRefresh.ok },
+      });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/crm-reconciliation/preview',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await previewDealOsCrmReconciliation({
+        importId: request.body?.importId || '',
+        requestedBy: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400))
+        .json({ success: Boolean(result.ok), ...boundedReconciliationPreview(result) });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/crm-reconciliation/execute',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await executeDealOsCrmReconciliation({
+        importId: request.body?.importId || '',
+        planDigest: request.body?.planDigest || '',
+        previewGeneratedAt: request.body?.previewGeneratedAt || '',
+        expectedOpportunityIds: request.body?.expectedOpportunityIds || [],
+        confirmation: request.body?.confirmation || '',
+        requestedBy: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400))
+        .json({ success: Boolean(result.ok), ...boundedReconciliationPreview(result) });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/crm-integrity-audit',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const audit = await auditDealHunterCrmIntegrity();
+      response.status(audit.ok ? 200 : 409).json({ success: audit.ok, audit });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/triage',
+    asyncRoute(async (request, response) => {
+      // Read-only viewers may inspect the queue, matching adjacent Deal Hunter
+      // read routes. Only full administrators can record a decision.
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      const result = await listTriageQueue({
+        view: request.query.view,
+        page: request.query.page,
+        pageSize: request.query.pageSize,
+        search: request.query.search,
+        sort: request.query.sort,
+        direction: request.query.direction,
+        minScore: request.query.minScore,
+        confidence: request.query.confidence,
+        priority: request.query.priority,
+        state: request.query.state,
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/triage/:opportunityId',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      const result = await getTriageOpportunityDetail({ opportunityId: request.params.opportunityId });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/decision',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await setTriageOperatorDecision({
+        opportunityId: request.params.opportunityId,
+        priority: request.body?.priority,
+        note: request.body?.note,
+        markReviewed: Boolean(request.body?.markReviewed),
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/scores/refresh/preview',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      // Read-only: reports what a refresh would change without writing.
+      const requestedIds = Array.isArray(request.body?.opportunityIds) ? request.body.opportunityIds.slice(0, 1000) : [];
+      const result = await previewOpportunityScoreRefresh({ opportunityIds: requestedIds });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/scores/refresh',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const requestedIds = Array.isArray(request.body?.opportunityIds) ? request.body.opportunityIds.slice(0, 1000) : [];
+      const result = await requestOpportunityScoreRefresh({
+        opportunityIds: requestedIds,
+        force: Boolean(request.body?.force),
+        confirmation: request.body?.confirmation || '',
+        requestedBy: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/crm-sync',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const reviewMode = String(request.body?.reviewMode || 'daily');
+      if (!['daily', 'full-backfill'].includes(reviewMode)) {
+        response.status(400).json({ success: false, error: 'CRM sync review mode must be daily or full-backfill.' });
+        return;
+      }
+
+      const result = await syncDealHunterHighFitsToCrm({
+        confirmation: request.body?.confirmation || '',
+        expectedDealKeys: request.body?.expectedDealKeys || [],
+        requestedBy: session.username || 'admin',
+        reviewMode,
+      });
+      if (result.review) {
+        result.review.dailyEmailJob = await getDailyDealHunterJobStatus();
+        result.review.emailReadiness = await getEmailReadiness();
+      }
+      response.status(result.status || (result.ok ? 200 : 400)).json({
+        success: Boolean(result.ok),
+        confirmationRequired: dealHunterCrmSyncConfirmation,
+        ...result,
+      });
+    }),
+  );
+
+  app.post(
     '/api/admin/deal-hunter/send',
     asyncRoute(async (request, response) => {
       const session = await requireAdmin(request);
@@ -781,6 +1491,77 @@ export function createApp() {
         success: !['failed', 'in-progress'].includes(result.emailResult.status),
         ...result,
       });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/cim-requests',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      const result = await listDealHunterCimRequestHistory({
+        page: Number(request.query.page) || 1,
+        pageSize: Number(request.query.pageSize) || 25,
+        search: String(request.query.search || ''),
+        requestState: String(request.query.requestState || request.query.request_state || ''),
+        deliveryState: String(request.query.deliveryState || request.query.delivery_state || ''),
+        replyState: String(request.query.replyState || request.query.reply_state || ''),
+        followUpState: String(request.query.followUpState || request.query.follow_up_state || ''),
+        sort: String(request.query.sort || 'first_requested_at'),
+        direction: String(request.query.direction || 'desc'),
+      });
+      response.json({ success: true, requests: result.rows || [], ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-requests/:id/retry',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await retryDealHunterCimRequestWithCorrectedRecipient({
+        requestId: request.params.id,
+        newRecipientEmail: request.body?.newRecipientEmail || request.body?.recipientEmail || '',
+        confirmed: request.body?.confirmed === true,
+        overrideReason: request.body?.overrideReason || '',
+        requestedBy: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 201 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/dispositions',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const action = String(request.body?.action || 'dismiss').toLowerCase();
+      const result = action === 'restore'
+        ? await restoreDealHunterOpportunity({
+            dealKey: request.body?.dealKey || '',
+            actor: session.username || 'admin',
+          })
+        : await dismissDealHunterOpportunity({
+            dealKey: request.body?.dealKey || '',
+            listingUrl: request.body?.listingUrl || '',
+            dealName: request.body?.dealName || '',
+            reason: request.body?.reason || '',
+            note: request.body?.note || '',
+            submissionId: request.body?.submissionId || '',
+            actor: session.username || 'admin',
+          });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );
 
@@ -831,6 +1612,233 @@ export function createApp() {
   );
 
   app.post(
+    '/api/admin/deal-hunter/cim-reviews',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const validated = validateCimReviewDecisions(request.body?.decisions);
+      if (!validated.valid) {
+        response.status(400).json({ success: false, error: validated.error });
+        return;
+      }
+      const status = await getCimAutomationStatus();
+      const reviews = await recordCimReviewDecisions({
+        decisions: validated.decisions,
+        actor: session.username || 'admin',
+        actorRole: session.role || 'admin',
+        stage: status.effectiveStage,
+        source: 'approval-queue',
+      });
+      response.status(201).json({ success: true, recorded: reviews.length, automation: await getCimAutomationStatus() });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-automation/pause',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      if (typeof request.body?.paused !== 'boolean') {
+        response.status(400).json({ success: false, error: 'A boolean paused value is required.' });
+        return;
+      }
+      try {
+        await setCimAutomationPaused({
+          paused: request.body.paused,
+          actor: session.username || 'admin',
+          reason: request.body?.reason || '',
+        });
+        response.json({ success: true, automation: await getCimAutomationStatus() });
+      } catch (error) {
+        response.status(400).json({ success: false, error: error.message || 'The automation pause change was rejected.' });
+      }
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-stage2/activation',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      try {
+        const activation = await createCimStage2Activation({
+          mode: request.body?.mode,
+          confirmation: request.body?.confirmation,
+          actor: session.username || 'admin',
+          reason: request.body?.reason,
+          evidenceChecksum: request.body?.evidenceChecksum || request.body?.evidence_checksum,
+          evidenceGeneratedAt: request.body?.evidenceGeneratedAt || request.body?.evidence_generated_at,
+          backupReference: request.body?.backupReference || request.body?.backup_reference,
+          backupChecksum: request.body?.backupChecksum || request.body?.backup_checksum,
+          identityAuditReference: request.body?.identityAuditReference || request.body?.identity_audit_reference,
+          identityAuditChecksum: request.body?.identityAuditChecksum || request.body?.identity_audit_checksum,
+          complianceReference: request.body?.complianceReference || request.body?.compliance_reference,
+          senderAuthReference: request.body?.senderAuthReference || request.body?.sender_auth_reference,
+        });
+        response.status(201).json({ success: true, activation, automation: await getCimAutomationStatus() });
+      } catch (error) {
+        response.status(400).json({ success: false, error: error.message || 'Stage 2 activation was rejected.' });
+      }
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-stage2/run',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const mode = String(request.body?.mode || 'shadow').toLowerCase();
+      if (mode === 'active') {
+        response.status(400).json({ success: false, error: 'Active-mode runs are not available from this rollout endpoint.' });
+        return;
+      }
+      if (mode === 'canary' && request.body?.confirmation !== 'RUN CIM STAGE 2 CANARY') {
+        response.status(400).json({ success: false, error: 'Enter the exact confirmation phrase: RUN CIM STAGE 2 CANARY' });
+        return;
+      }
+      const result = await runCimStage2Automation({ mode, triggeredBy: session.username || 'admin' });
+      response.status(result.status || (result.ok ? 200 : 409)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/cim-stage2/runs/:id/decisions',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdmin(request)) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const page = Math.max(1, Math.min(Number.parseInt(request.query?.page, 10) || 1, 10));
+      const pageSize = Math.max(1, Math.min(Number.parseInt(request.query?.pageSize, 10) || 50, 100));
+      const start = (page - 1) * pageSize;
+      const decisions = await getStorage().listCimStage2Decisions({
+        runId: String(request.params.id || '').slice(0, 200),
+        limit: pageSize + 1,
+        offset: start,
+      });
+      response.json({
+        success: true,
+        page,
+        pageSize,
+        hasMore: decisions.length > pageSize,
+        decisions: decisions.slice(0, pageSize),
+      });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-outreach/pause',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      if (typeof request.body?.paused !== 'boolean') {
+        response.status(400).json({ success: false, error: 'A boolean paused value is required.' });
+        return;
+      }
+      const settings = await setCimOutreachPaused({
+        paused: request.body.paused,
+        actor: session.username || 'admin',
+        reason: request.body?.reason || '',
+      });
+      response.json({ success: true, settings });
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/identity-exceptions',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+      const storage = getStorage();
+      const exceptions = await storage.listDealHunterIdentityExceptions?.({
+        statuses: String(request.query.status || 'open') === 'all' ? [] : [String(request.query.status || 'open')],
+        limit: Number(request.query.limit) || 100,
+      }) || [];
+      response.json({ success: true, exceptions });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/identity-exceptions/:id/resolve',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await resolveCimIdentityException({
+        exceptionId: request.params.id,
+        opportunityId: request.body?.opportunityId || '',
+        action: request.body?.action || 'link',
+        confirmed: request.body?.confirmed === true,
+        reason: request.body?.reason || '',
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-recipient-overrides',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await createCimRecipientOverride({
+        opportunityId: request.body?.opportunityId || '',
+        recipientEmail: request.body?.recipientEmail || '',
+        confirmed: request.body?.confirmed === true,
+        reason: request.body?.reason || '',
+        expiresInHours: request.body?.expiresInHours ?? 1,
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 201 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/cim-outcomes',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      let outcome;
+      try {
+        outcome = await recordCimResponseOutcome({
+          dealKey: request.body?.dealKey,
+          outcome: request.body?.outcome,
+          actor: session.username || 'admin',
+        });
+      } catch (error) {
+        response.status(400).json({ success: false, error: error.message || 'A valid CIM response outcome is required.' });
+        return;
+      }
+      response.status(201).json({ success: true, outcome });
+    }),
+  );
+
+  app.post(
     '/api/admin/deal-hunter/cim-follow-ups/run',
     asyncRoute(async (request, response) => {
       const session = await requireAdmin(request);
@@ -863,6 +1871,74 @@ export function createApp() {
         success: !['failed', 'in-progress'].includes(result.emailResult.status),
         ...result,
       });
+    }),
+  );
+
+  app.post(
+    '/api/deal-hunter/cim-stage2/run',
+    asyncRoute(async (request, response) => {
+      if (!requireDealHunterCron(request, config)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+      const mode = String(request.body?.mode || 'shadow').toLowerCase();
+      if (!['shadow', 'canary'].includes(mode)) {
+        response.status(400).json({ success: false, error: 'External Stage 2 runs are restricted to shadow or canary mode.' });
+        return;
+      }
+      const result = await runCimStage2Automation({ mode, triggeredBy: 'external-stage2-cron' });
+      response.status(result.status || (result.ok ? 200 : 409)).json({
+        success: Boolean(result.ok),
+        ok: Boolean(result.ok),
+        status: result.status,
+        error: result.error || '',
+        blockerCodes: result.blockerCodes || [],
+        providerCalls: Number(result.providerCalls || 0),
+        duplicateInvocation: Boolean(result.duplicateInvocation),
+        run: result.run || null,
+      });
+    }),
+  );
+
+  app.post(
+    '/api/admin/submissions/:id/archive',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await archiveLead({
+        submissionId: request.params.id,
+        reason: request.body?.reason || '',
+        note: request.body?.note || '',
+        communicationId: request.body?.communicationId || '',
+        expectedUpdatedAt: request.body?.expectedUpdatedAt || request.body?.expected_updated_at || '',
+        actor: session.username || 'admin',
+        role: session.role || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/submissions/:id/restore',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      const result = await restoreLead({
+        submissionId: request.params.id,
+        status: request.body?.status || 'review',
+        expectedUpdatedAt: request.body?.expectedUpdatedAt || request.body?.expected_updated_at || '',
+        actor: session.username || 'admin',
+        role: session.role || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
   );
 
@@ -1079,7 +2155,7 @@ export function createApp() {
   });
 
   if (config.isProduction) {
-    app.use(express.static(distDirectory, { redirect: false }));
+    app.use(express.static(distDirectory, { redirect: false, setHeaders: setStaticAssetHeaders }));
 
     app.get('*', (request, response) => {
       const routePath = request.path.replace(/^\/+|\/+$/g, '');
@@ -1088,6 +2164,7 @@ export function createApp() {
         : path.join(distDirectory, 'index.html');
       const staysInsideDist = routeIndex === distDirectory || routeIndex.startsWith(`${distDirectory}${path.sep}`);
 
+      response.setHeader('Cache-Control', entryDocumentCacheControl);
       response.sendFile(staysInsideDist && existsSync(routeIndex) ? routeIndex : path.join(distDirectory, 'index.html'));
     });
   }

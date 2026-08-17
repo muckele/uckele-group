@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { getSafeAttribution, trackAnalyticsEvent } from '../utils/analytics';
 
 const turnstileScriptLoadTimeoutMs = 10000;
 
@@ -17,6 +19,7 @@ function createInitialState() {
 }
 
 export default function ContactForm() {
+  const navigate = useNavigate();
   const [formData, setFormData] = useState(createInitialState);
   const [submitted, setSubmitted] = useState(false);
   const [submitError, setSubmitError] = useState('');
@@ -24,6 +27,7 @@ export default function ContactForm() {
   const [submitting, setSubmitting] = useState(false);
   const turnstileContainerRef = useRef(null);
   const turnstileWidgetIdRef = useRef(null);
+  const startedEventSentRef = useRef(false);
   const lastRenderedSiteKeyRef = useRef('');
   const buildTurnstileSiteKey = import.meta.env.VITE_TURNSTILE_SITE_KEY || '';
   const [turnstileConfigLoaded, setTurnstileConfigLoaded] = useState(false);
@@ -195,6 +199,12 @@ export default function ContactForm() {
     setFormData((current) => ({ ...current, [name]: value }));
   }
 
+  function handleFormStart() {
+    if (startedEventSentRef.current) return;
+    startedEventSentRef.current = true;
+    trackAnalyticsEvent('contact_form_started', { path: '/contact' });
+  }
+
   async function handleSubmit(event) {
     event.preventDefault();
 
@@ -215,6 +225,7 @@ export default function ContactForm() {
         body: JSON.stringify({
           ...formData,
           source: 'website-contact-form',
+          attribution: getSafeAttribution(),
         }),
       });
 
@@ -228,6 +239,8 @@ export default function ContactForm() {
       setSubmitMessage(result.message || 'Your message has been received.');
       setFormData(createInitialState());
       resetTurnstileWidget();
+      trackAnalyticsEvent('contact_submission_succeeded', { path: '/contact' });
+      navigate('/thank-you', { replace: true });
     } catch (error) {
       setSubmitted(false);
       setSubmitError(error.message || 'Unable to send your inquiry right now.');
@@ -238,7 +251,7 @@ export default function ContactForm() {
   }
 
   return (
-    <form className="panel p-6 sm:p-8" onSubmit={handleSubmit}>
+    <form className="panel p-6 sm:p-8" onFocusCapture={handleFormStart} onSubmit={handleSubmit}>
       <div className="grid gap-5 md:grid-cols-2">
         <label className="flex flex-col gap-2 text-sm font-medium text-ink">
           Name

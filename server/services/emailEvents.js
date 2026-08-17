@@ -3,8 +3,13 @@ import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { safeCompareText } from '../utils/security.js';
 import { commitCrmActivityMutation } from './activity.js';
+import {
+  applyEmailLifecycleToCommunication,
+  ingestResendReceivedEmail,
+} from './communications.js';
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const maxEmailEventMetadataBytes = 32 * 1024;
 
 const eventAliases = {
   'email.sent': 'sent',
@@ -16,6 +21,7 @@ const eventAliases = {
   'email.bounced': 'bounced',
   'email.complained': 'complained',
   'email.failed': 'failed',
+  'email.suppressed': 'suppressed',
   'email.received': 'replied',
   'email.replied': 'replied',
   'email.unsubscribed': 'unsubscribed',
@@ -31,6 +37,7 @@ const eventAliases = {
   'delivery.delayed': 'delayed',
   sent: 'sent',
   failed: 'failed',
+  suppressed: 'suppressed',
   received: 'replied',
   reply: 'replied',
   replied: 'replied',
@@ -51,6 +58,39 @@ function normalizeEmail(value) {
 
 function headerValue(value) {
   return Array.isArray(value) ? normalizeText(value[0], 500) : normalizeText(value, 500);
+}
+
+function boundedEmailEventMetadata(value) {
+  const metadata = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  let serialized = '';
+  try {
+    serialized = JSON.stringify(metadata);
+  } catch {
+    return { truncated: true };
+  }
+  if (Buffer.byteLength(serialized, 'utf8') <= maxEmailEventMetadataBytes) return metadata;
+  const tracking = metadata.tracking && typeof metadata.tracking === 'object' && !Array.isArray(metadata.tracking)
+    ? metadata.tracking
+    : {};
+  return {
+    truncated: true,
+    rawType: normalizeText(metadata.rawType, 80),
+    providerEventId: normalizeText(metadata.providerEventId, 240),
+    payloadProviderEventId: normalizeText(metadata.payloadProviderEventId, 240),
+    svixId: normalizeText(metadata.svixId, 240),
+    clickUrl: normalizeText(metadata.clickUrl, 1000),
+    fromEmail: firstEmail(metadata.fromEmail || metadata.from),
+    toEmail: firstEmail(metadata.toEmail || metadata.to),
+    replyTo: firstEmail(metadata.replyTo),
+    resendEmailId: normalizeText(metadata.resendEmailId, 240),
+    inboundMessageId: normalizeText(metadata.inboundMessageId, 240),
+    tracking: {
+      communicationId: normalizeText(tracking.communicationId, 120),
+      cimRequestId: normalizeText(tracking.cimRequestId, 120),
+      submissionId: normalizeText(tracking.submissionId, 120),
+      followUpNumber: Math.max(0, Math.min(Number(tracking.followUpNumber) || 0, 100)),
+    },
+  };
 }
 
 export function normalizeEmailEventType(value) {
@@ -210,7 +250,33 @@ function extractSubmissionId(payload, data, tags) {
   );
 }
 
-async function resolveSubmissionId(storage, { submissionId, recipientEmail }) {
+function inboundRecipientEmails(value) {
+  const values = Array.isArray(value) ? value : [value];
+  return Array.from(new Set(values.flatMap((item) => {
+    if (Array.isArray(item)) return inboundRecipientEmails(item);
+    if (item && typeof item === 'object') return inboundRecipientEmails(item.email || item.address || item.value || item.to);
+    return String(item || '').split(/[;,]/).map(firstEmail).filter(Boolean);
+  })));
+}
+
+function cimRequestTokenFromAddress(value) {
+  return firstEmail(value).match(/^cim-([a-z0-9_-]{8,64})@/i)?.[1]?.toLowerCase() || '';
+}
+
+async function resolveSubmissionId(storage, {
+  submissionId,
+  recipientEmail,
+  inboundRecipients = [],
+} = {}) {
+  if (storage.getDealHunterCimRequestByReplyToAddress) {
+    for (const address of inboundRecipientEmails(inboundRecipients)) {
+      const requestToken = cimRequestTokenFromAddress(address);
+      if (!requestToken) continue;
+      const request = await storage.getDealHunterCimRequestByReplyToAddress(address, requestToken);
+      if (request?.submission_id) return request.submission_id;
+    }
+  }
+
   if (submissionId && uuidPattern.test(submissionId)) {
     const submission = await storage.getSubmission(submissionId);
 
@@ -219,15 +285,20 @@ async function resolveSubmissionId(storage, { submissionId, recipientEmail }) {
     }
   }
 
-  if (!recipientEmail || !storage.getSubmissionByContactEmail) {
+  if (!recipientEmail || !storage.listSubmissionsByContactEmail) {
     return null;
   }
 
-  const matchedSubmission = await storage.getSubmissionByContactEmail(recipientEmail);
-  return matchedSubmission?.id || null;
+  const matchedSubmissions = await storage.listSubmissionsByContactEmail(recipientEmail, {
+    limit: 3,
+    openOnly: true,
+  });
+  return Array.isArray(matchedSubmissions) && matchedSubmissions.length === 1
+    ? matchedSubmissions[0].id
+    : null;
 }
 
-function buildEventInputFromWebhook(payload) {
+function buildEventInputFromWebhook(payload, { providerEventId = '', svixId = '' } = {}) {
   const data = payload?.data || payload || {};
   const tags = extractTags(payload, data);
   const rawType = normalizeText(payload?.type || data?.type || payload?.event || data?.event || payload?.event_type || data?.event_type, 80);
@@ -240,6 +311,7 @@ function buildEventInputFromWebhook(payload) {
     ? inboundSenderEmail || outboundRecipientEmail
     : outboundRecipientEmail;
   const clickUrl = normalizeText(data.url || data.link?.url || data.link || data.click_url || data.clicked_url, 1000);
+  const payloadProviderEventId = normalizeText(payload?.id || data.event_id || data.eventId || data.webhook_id || data.webhookId, 240);
 
   return {
     created_at: data.created_at || data.createdAt || payload?.created_at || payload?.createdAt,
@@ -249,14 +321,17 @@ function buildEventInputFromWebhook(payload) {
       data.email_id || data.emailId || data.email?.id || data.message_id || data.messageId || payload?.email_id,
       240,
     ),
-    provider_event_id: normalizeText(payload?.id || data.event_id || data.eventId || data.webhook_id || data.webhookId, 240),
+    provider_event_id: normalizeText(providerEventId, 240) || payloadProviderEventId,
     recipient_email: recipientEmail,
     subject: normalizeText(data.subject || payload?.subject, 300),
     submission_id: extractSubmissionId(payload, data, tags),
+    communication_id: getTagValue(tags, 'communication_id') || getTagValue(tags, 'communicationId'),
     source: 'webhook',
     metadata: {
       rawType,
-      providerEventId: normalizeText(payload?.id, 240),
+      providerEventId: normalizeText(providerEventId, 240) || payloadProviderEventId,
+      payloadProviderEventId,
+      svixId: normalizeText(svixId, 240),
       tags,
       clickUrl,
       from: normalizeText(data.from || payload?.from, 500),
@@ -291,18 +366,34 @@ function buildEventKey(event) {
   return null;
 }
 
-export async function recordEmailEvent(input) {
-  const storage = getStorage();
+export async function recordEmailEvent(input, { storage = getStorage() } = {}) {
   const recipientEmail = normalizeEmail(input.recipient_email || input.recipientEmail);
   const eventType = normalizeEmailEventType(input.event_type || input.eventType);
   const explicitSubmissionId = normalizeText(input.submission_id || input.submissionId, 80);
   const submissionId = await resolveSubmissionId(storage, {
     submissionId: explicitSubmissionId,
     recipientEmail,
+    inboundRecipients: normalizeText(input.metadata?.rawType, 80).toLowerCase().replace(/_/g, '.') === 'email.received'
+      ? input.metadata?.to
+      : [],
   });
   const provider = normalizeText(input.provider, 60) || 'unknown';
   const createdAt = normalizeEventDate(input.created_at || input.createdAt);
   const providerEventId = normalizeText(input.provider_event_id || input.providerEventId || input.metadata?.providerEventId, 240);
+  const communicationId = normalizeText(
+    input.communication_id || input.communicationId || input.metadata?.tracking?.communicationId,
+    120,
+  ) || null;
+  const linkedCommunication = communicationId && storage.getCrmCommunication
+    ? await storage.getCrmCommunication(communicationId)
+    : null;
+  const linkedRequest = !linkedCommunication?.opportunity_id && submissionId && storage.getLatestDealHunterCimRequestForSubmission
+    ? await storage.getLatestDealHunterCimRequestForSubmission(submissionId)
+    : null;
+  const opportunityId = normalizeText(
+    input.opportunity_id || input.opportunityId || linkedCommunication?.opportunity_id || linkedRequest?.opportunity_id,
+    160,
+  ) || null;
   const event = {
     id: input.id || randomUUID(),
     created_at: createdAt,
@@ -313,8 +404,10 @@ export async function recordEmailEvent(input) {
     recipient_email: recipientEmail || null,
     subject: normalizeText(input.subject, 300) || null,
     submission_id: submissionId,
+    communication_id: communicationId,
+    opportunity_id: opportunityId,
     source: normalizeText(input.source, 100) || 'manual',
-    metadata: input.metadata && typeof input.metadata === 'object' ? input.metadata : {},
+    metadata: boundedEmailEventMetadata(input.metadata),
   };
 
   event.event_key = normalizeText(input.event_key || input.eventKey, 700) || buildEventKey(event);
@@ -328,6 +421,7 @@ export async function recordEmailEvent(input) {
       payload: { event },
       activity: {
         submissionId: event.submission_id,
+        opportunityId: event.opportunity_id,
         eventType: `email.${event.event_type}`,
         summary: `Email ${event.event_type}${event.subject ? `: ${event.subject}` : '.'}`,
         actor: event.recipient_email || event.provider,
@@ -337,6 +431,7 @@ export async function recordEmailEvent(input) {
           emailEventId: event.id,
           provider: event.provider,
           messageId: event.message_id,
+          communicationId: event.communication_id,
           subject: event.subject,
         },
       },
@@ -349,7 +444,52 @@ export async function recordEmailEvent(input) {
   return storedEvent;
 }
 
-export async function recordEmailEventsFromWebhook(request) {
+async function stopCanonicalCimSequencesForReply(event, storage) {
+  if (event?.event_type !== 'replied' || !event.opportunity_id || !storage.listDealHunterCimRequests) return;
+  const requests = await storage.listDealHunterCimRequests({ opportunityIds: [event.opportunity_id], limit: 500 });
+  for (const request of requests) {
+    if (request.metadata?.canonicalReplyEventId === event.id) continue;
+    const active = Boolean(request.next_follow_up_at)
+      || !['stopped', 'completed'].includes(request.follow_up_state)
+      || request.request_state !== 'responded';
+    if (!active) continue;
+    const updated = {
+      ...request,
+      request_state: 'responded',
+      follow_up_state: 'stopped',
+      next_follow_up_at: null,
+      responded_at: request.responded_at || event.created_at,
+      updated_at: event.created_at,
+      last_activity_at: event.created_at,
+      metadata: {
+        ...(request.metadata || {}),
+        canonicalReplyEventId: event.id,
+        canonicalReplyOpportunityId: event.opportunity_id,
+      },
+    };
+    if (request.submission_id && storage.mutateWithCrmActivity) {
+      await commitCrmActivityMutation({
+        storage,
+        operation: 'upsert_deal_hunter_cim_request',
+        payload: { request: updated },
+        activity: {
+          submissionId: request.submission_id,
+          opportunityId: event.opportunity_id,
+          eventType: 'cim.canonical-reply-stopped',
+          summary: 'Inbound reply stopped every automated CIM sequence for the canonical opportunity.',
+          actor: event.recipient_email || 'broker-reply',
+          role: 'contact',
+          createdAt: event.created_at,
+          metadata: { emailEventId: event.id, opportunityId: event.opportunity_id, cimRequestId: request.id },
+        },
+      });
+    } else {
+      await storage.upsertDealHunterCimRequest(updated);
+    }
+  }
+}
+
+export async function recordEmailEventsFromWebhook(request, { storage = getStorage(), fetcher } = {}) {
   const authorization = authorizeWebhook(request);
 
   if (!authorization.ok) {
@@ -371,16 +511,61 @@ export async function recordEmailEventsFromWebhook(request) {
   }
 
   const events = [];
+  const ingestion = [];
+  const svixId = headerValue(request.headers['svix-id']);
 
-  for (const payload of payloads) {
-    const event = await recordEmailEvent(buildEventInputFromWebhook(payload));
+  for (const [index, payload] of payloads.entries()) {
+    const providerEventId = svixId
+      ? payloads.length === 1 ? svixId : `${svixId}:${index + 1}`
+      : '';
+    const eventInput = buildEventInputFromWebhook(payload, { providerEventId, svixId });
+    const event = await recordEmailEvent(eventInput, { storage });
     events.push(event);
+
+    try {
+      await applyEmailLifecycleToCommunication(event, { storage });
+      await stopCanonicalCimSequencesForReply(event, storage);
+    } catch {
+      return {
+        ok: false,
+        status: 503,
+        error: 'Email lifecycle processing is temporarily unavailable.',
+      };
+    }
+
+    if (normalizeText(eventInput.metadata?.rawType, 80).toLowerCase().replace(/_/g, '.') === 'email.received') {
+      let result;
+      try {
+        result = await ingestResendReceivedEmail({ event, storage, fetcher });
+      } catch {
+        return {
+          ok: false,
+          status: 503,
+          error: 'Inbound email could not be queued for content retrieval.',
+        };
+      }
+
+      if (!result.accepted) {
+        return {
+          ok: false,
+          status: 503,
+          error: 'Inbound email could not be queued for content retrieval.',
+        };
+      }
+
+      ingestion.push({
+        eventId: event.id,
+        accepted: true,
+        pendingRetry: !result.ok,
+      });
+    }
   }
 
   return {
     ok: true,
     status: 201,
     events,
+    ingestion,
   };
 }
 
@@ -402,23 +587,24 @@ export function summarizeEmailEngagement(events = []) {
       bounced: 0,
       complained: 0,
       failed: 0,
+      suppressed: 0,
       unsubscribed: 0,
     },
   );
   const latestEvent = sortedEvents[0] || null;
-  const suppressionEvent = counts.bounced || counts.complained || counts.failed || counts.unsubscribed;
+  const suppressionEvent = counts.bounced || counts.complained || counts.failed || counts.suppressed || counts.unsubscribed;
   const rawScore =
     counts.delivered * 2 +
-    counts.opened * 10 +
     counts.clicked * 30 +
     counts.replied * 50 -
     counts.delayed * 5 -
     counts.bounced * 75 -
     counts.complained * 100 -
     counts.failed * 40 -
+    counts.suppressed * 100 -
     counts.unsubscribed * 100;
   const score = Math.max(0, Math.min(100, rawScore));
-  const actionable = !suppressionEvent && (counts.replied > 0 || counts.clicked > 0 || counts.opened >= 2);
+  const actionable = !suppressionEvent && (counts.replied > 0 || counts.clicked > 0);
   const hot = actionable && score >= 30;
 
   let action = '';
@@ -434,11 +620,11 @@ export function summarizeEmailEngagement(events = []) {
     tone = 'success';
     action = 'They clicked a link. Call or send a direct follow-up today.';
   } else if (counts.opened >= 2) {
-    tone = 'warning';
-    action = 'They opened more than once. Follow up while the request is fresh.';
+    tone = 'info';
+    action = 'Open tracking is informational only. Use the CRM reminder date and stronger direct signals.';
   } else if (counts.opened === 1) {
     tone = 'info';
-    action = 'They opened once. Send a short follow-up if they do not respond.';
+    action = 'Open tracking is informational only. Do not treat it as interest or consent.';
   } else if (counts.sent || counts.delivered) {
     action = 'Email sent. Wait for engagement or follow the normal reminder date.';
   }
@@ -455,6 +641,7 @@ export function summarizeEmailEngagement(events = []) {
     bounced: counts.bounced,
     complained: counts.complained,
     failed: counts.failed,
+    suppressed: counts.suppressed,
     unsubscribed: counts.unsubscribed,
     last_event_at: latestEvent?.created_at || '',
     latest_event_type: latestEvent ? normalizeEmailEventType(latestEvent.event_type) : '',

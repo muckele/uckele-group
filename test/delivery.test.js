@@ -32,6 +32,84 @@ test('daily Deal Hunter email carries its deterministic provider idempotency key
   assert.equal(message.idempotencyKey, 'daily-deal-hunter-email:2026-07-12');
 });
 
+test('daily Deal Hunter email has clickable links for 75+ businesses and CIM approvals', () => {
+  const message = buildDailyDealHunterEmail({
+    to: 'admin@example.com',
+    review: {
+      totals: { cimReady: 1 },
+      sources: [],
+      criteriaRecommendations: [],
+      qualified: [{
+        dealKey: 'deal-1',
+        name: 'Recurring HVAC Services',
+        score: 88,
+        brokerEmail: 'broker@example.com',
+        cimRequest: { canRequest: true, recipientEmail: 'broker@example.com' },
+      }],
+    },
+  });
+
+  assert.match(message.text, /CIM requests ready for approval: 1/);
+  assert.match(message.text, /Review 75\+ scored businesses: http:\/\/localhost:5173\/admin\/command-center/);
+  assert.match(message.text, /Review and send CIM requests: http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals/);
+  assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/command-center" target="_blank"[^>]*>Review 75\+ Scored Businesses<\/a>/);
+  assert.match(message.html, /<a href="http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals" target="_blank"[^>]*>Review &amp; Send 1 CIM Request<\/a>/);
+  assert.doesNotMatch(message.html, />http:\/\/localhost:5173\/admin\/command-center<\/a>/);
+  assert.doesNotMatch(message.html, />http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals<\/a>/);
+  assert.match(message.html, /bgcolor="#284638"[^>]*>[\s\S]*?Review 75\+ Scored Businesses/);
+  assert.match(message.html, /bgcolor="#FFFFFF"[^>]*>[\s\S]*?Review &amp; Send 1 CIM Request/);
+  assert.equal(message.tracking.cimReadyCount, 1);
+});
+
+test('daily Deal Hunter email always links to the 75+ scored-business dashboard', () => {
+  const message = buildDailyDealHunterEmail({
+    to: 'admin@example.com',
+    review: { totals: {}, sources: [], criteriaRecommendations: [] },
+  });
+
+  assert.match(message.html, /href="http:\/\/localhost:5173\/admin\/command-center"/);
+  assert.doesNotMatch(message.html, /href="http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals"/);
+});
+
+test('daily Deal Hunter email clearly discloses intentionally limited source coverage', () => {
+  const message = buildDailyDealHunterEmail({
+    to: 'admin@example.com',
+    review: {
+      totals: {},
+      sources: [{ name: 'SMB Deal Hunter Google Sheet', fetched: true, rowCount: 290 }],
+      coverageWarnings: [
+        'Legacy Airtable is disabled and no Deal OS export is active. This review covers only the Google Sheet.',
+      ],
+      criteriaRecommendations: [],
+    },
+  });
+
+  assert.match(message.subject, /limited source coverage/i);
+  assert.match(message.text, /LIMITED SOURCE COVERAGE/);
+  assert.match(message.text, /Legacy Airtable is disabled/);
+  assert.match(message.html, /Limited source coverage/);
+  assert.match(message.html, /Legacy Airtable is disabled/);
+});
+
+test('daily Deal Hunter email only makes HTTP(S) listing URLs clickable', () => {
+  const message = buildDailyDealHunterEmail({
+    to: 'admin@example.com',
+    review: {
+      totals: { qualified: 2 },
+      sources: [],
+      criteriaRecommendations: [],
+      qualified: [
+        { dealKey: 'safe-deal', name: 'Safe listing', score: 90, listingUrl: 'https://example.com/listing' },
+        { dealKey: 'unsafe-deal', name: 'Unsafe listing', score: 89, listingUrl: 'javascript:alert(1)' },
+      ],
+    },
+  });
+
+  assert.match(message.html, /href="https:\/\/example.com\/listing"/);
+  assert.doesNotMatch(message.html, /javascript:/i);
+  assert.doesNotMatch(message.text, /javascript:/i);
+});
+
 test('CIM touch identifiers are deterministic and isolated by request and follow-up number', () => {
   const initialKey = buildCimEmailIdempotencyKey({ requestId: 'request-1' });
 
@@ -132,6 +210,15 @@ function assertBrokerEmailOmitsBodyHeadline(message) {
   );
 }
 
+function assertBrokerEmailIncludesBrandLogo(message) {
+  assert.match(
+    message.html,
+    /<img src="http:\/\/localhost:5173\/email-logo\.png" width="44" height="44" alt=""/,
+    'Broker email should render the hosted Uckele Group logo mark',
+  );
+  assert.match(message.html, />\s*Uckele Group\s*<\/td>/);
+}
+
 test('CIM request email keeps internal score and deal economics out of broker-visible content', () => {
   const message = buildDealHunterCimRequestEmail({
     to: 'broker@example.com',
@@ -145,9 +232,22 @@ test('CIM request email keeps internal score and deal economics out of broker-vi
   assert.match(message.subject, /CIM \/ NDA request/);
   assert.match(message.text, /Could you please send over the CIM or teaser, or let me know the NDA process\?/);
   assert.match(message.html, /View Listing/);
+  assertBrokerEmailIncludesBrandLogo(message);
   assertBrokerEmailOmitsBodyHeadline(message);
   assertBrokerEmailHidesFollowUpSequenceLabels(message);
   assertBrokerEmailHidesInternalDetails(message);
+});
+
+test('CIM broker emails never expose an internal automation actor as the sender identity', () => {
+  const message = buildDealHunterCimRequestEmail({
+    to: 'broker@example.com',
+    deal: sampleDeal,
+    requestedBy: 'automation-stage-2',
+    cimRequestId: 'request-automation',
+  });
+
+  assert.doesNotMatch(message.text, /automation-stage-2/i);
+  assert.match(message.text, /Mathew Uckele/);
 });
 
 test('CIM request email tags are safe for Resend when deal keys contain punctuation', () => {
@@ -197,6 +297,7 @@ test('CIM follow-up emails keep internal score and deal economics out of broker-
     assert.match(message.subject, /^Re: CIM \/ NDA request/);
     assert.equal(message.tracking.followUpNumber, followUpNumber);
     assert.equal(message.tags.some((tag) => tag.name === 'follow_up_number' && tag.value === String(followUpNumber)), true);
+    assertBrokerEmailIncludesBrandLogo(message);
     assertBrokerEmailOmitsBodyHeadline(message);
     assertBrokerEmailHidesFollowUpSequenceLabels(message);
     assert.equal(message.text.includes(`#${followUpNumber}`), false);

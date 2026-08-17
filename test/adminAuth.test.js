@@ -241,6 +241,16 @@ test('viewer credentials create read-only admin access', async () => {
 
   assert.equal(followUpsResponse.statusCode, 200);
   assert.equal(followUpsResponse.body.success, true);
+  const viewerOperationsResponse = await invokeRoute(app, {
+    method: 'get',
+    routePath: '/api/admin/operations',
+    cookie: viewerCookie,
+  });
+  assert.equal(viewerOperationsResponse.statusCode, 200);
+  assert.equal(viewerOperationsResponse.body.success, true);
+  assert.equal(viewerOperationsResponse.body.operations.viewerAggregateOnly, true);
+  assert.deepEqual(viewerOperationsResponse.body.operations.audit.events, []);
+  assert.deepEqual(viewerOperationsResponse.body.operations.email.allowedTestRecipients, []);
   assert.equal(routeLayer(app, 'get', '/api/admin/prospect-discovery'), undefined);
   assert.equal(routeLayer(app, 'post', '/api/admin/prospect-discovery/run'), undefined);
 
@@ -251,13 +261,18 @@ test('viewer credentials create read-only admin access', async () => {
     { method: 'post', routePath: '/api/admin/deal-hunter/send' },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-request', body: { dealKey: 'deal-1' } },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-requests/send-ready' },
+    { method: 'post', routePath: '/api/admin/deal-hunter/cim-reviews' },
+    { method: 'post', routePath: '/api/admin/deal-hunter/cim-automation/pause' },
+    { method: 'post', routePath: '/api/admin/deal-hunter/cim-stage2/activation', body: { mode: 'canary' } },
+    { method: 'post', routePath: '/api/admin/deal-hunter/cim-stage2/run', body: { mode: 'shadow' } },
+    { method: 'get', routePath: '/api/admin/deal-hunter/cim-stage2/runs/:id/decisions', params: { id: 'stage2-run' } },
+    { method: 'post', routePath: '/api/admin/deal-hunter/cim-outcomes' },
     { method: 'post', routePath: '/api/admin/deal-hunter/cim-follow-ups/run' },
     { method: 'post', routePath: '/api/admin/email/test' },
     { method: 'patch', routePath: '/api/admin/submissions/:id', params: { id: 'submission-1' }, body: { status: 'review' } },
     { method: 'delete', routePath: '/api/admin/submissions/:id', params: { id: 'submission-1' } },
     { method: 'post', routePath: '/api/admin/submissions/:id/upload-request', params: { id: 'submission-1' } },
     { method: 'get', routePath: '/api/admin/secure-documents/:id/download', params: { id: 'document-1' } },
-    { method: 'get', routePath: '/api/admin/operations' },
   ];
 
   for (const route of blockedRoutes) {

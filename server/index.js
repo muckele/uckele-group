@@ -1,10 +1,15 @@
 import 'dotenv/config';
 import { createApp } from './app.js';
 import { assertValidConfig, getConfig } from './config.js';
-import { startDealHunterCimFollowUpScheduler, startDealHunterDailyEmailScheduler } from './services/dealHunterScheduler.js';
+import {
+  startDealHunterCimFollowUpScheduler,
+  startDealHunterCimStage2Scheduler,
+  startDealHunterDailyEmailScheduler,
+} from './services/dealHunterScheduler.js';
 import { reconcileSecureDocumentCleanupJobs, startSecureDocumentCleanupScheduler } from './services/submissions.js';
 import { startBackupScheduler } from './services/backups.js';
 import { cleanupExpiredAuthRecords, startAuthCleanupScheduler } from './services/auth.js';
+import { startInboundCommunicationIngestionScheduler } from './services/communications.js';
 
 const config = getConfig();
 const host = process.env.HOST || '0.0.0.0';
@@ -22,10 +27,12 @@ const server = app.listen(config.server.port, host, () => {
   console.log(`Uckele Group backend listening on ${host}:${config.server.port}`);
   schedulers = [
     startDealHunterDailyEmailScheduler(),
+    startDealHunterCimStage2Scheduler(),
     startDealHunterCimFollowUpScheduler(),
     startSecureDocumentCleanupScheduler(),
     startBackupScheduler(),
     startAuthCleanupScheduler(),
+    startInboundCommunicationIngestionScheduler(),
   ];
 });
 

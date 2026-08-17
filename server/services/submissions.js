@@ -20,6 +20,7 @@ import {
 } from './workflow.js';
 import { resolveSecureStoragePath } from './documentVault.js';
 import { commitCrmActivityMutation, summarizeSubmissionChanges } from './activity.js';
+import { normalizeAttribution } from './analytics.js';
 import {
   isSecureDocumentCleanupIntentActive,
   listSecureDocumentCleanupSidecars,
@@ -29,7 +30,7 @@ import {
   updateSecureDocumentCleanupJobState,
 } from './secureDocumentCleanupState.js';
 
-const allowedStatuses = ['new', 'review', 'contacted', 'archived', 'spam'];
+const allowedStatuses = ['sourced', 'new', 'review', 'contacted', 'archived', 'spam'];
 const turnstileTokenMaxLength = 2048;
 const cleanupWriteAheadGraceMs = secureDocumentCleanupSettlementMs;
 const cleanupLeaseMs = secureDocumentCleanupSettlementMs;
@@ -318,6 +319,11 @@ function daysAgoFrom(timestamp, nowValue = Date.now()) {
   return Math.max(0, Math.floor((nowTimestamp - dateValue) / (1000 * 60 * 60 * 24)));
 }
 
+function submissionDateAdded(submission = {}) {
+  const sourceDate = normalizeField(submission.metadata?.dealHunter?.dateAdded, 100);
+  return Number.isFinite(Date.parse(sourceDate)) ? sourceDate : submission.created_at;
+}
+
 function normalizeDealFields(raw = {}) {
   return Object.entries(dealFieldNormalizers).reduce((accumulator, [key, normalizer]) => {
     accumulator[key] = normalizer(raw[key]);
@@ -487,13 +493,14 @@ export function buildCsv(submissions) {
     headers.join(','),
     ...submissions.map((submission) => {
       const followUpPrompt = submission.follow_up_prompt || buildFollowUpPrompt(submission);
+      const dateAdded = submissionDateAdded(submission);
 
       return [
         submission.company,
-        submission.created_at,
+        dateAdded,
         submission.status,
         submission.status_updated_at || submission.updated_at,
-        submission.days_since_added ?? daysAgoFrom(submission.created_at),
+        submission.days_since_added ?? daysAgoFrom(dateAdded),
         submission.listing_url,
         submission.business_website,
         submission.prospectus_url,
@@ -619,13 +626,14 @@ function enrichSubmissionWithRelatedData(
   nowValue = new Date(),
 ) {
   const emailEngagement = summarizeEmailEngagement(dedupeEmailEvents(emailEvents));
+  const dateAdded = submissionDateAdded(submission);
   const enriched = {
     ...submission,
     latest_upload_request: uploadRequest,
     secure_documents: documents,
     email_engagement: emailEngagement,
     status_updated_at: submission.status_updated_at || submission.updated_at,
-    days_since_added: daysAgoFrom(submission.created_at, nowValue),
+    days_since_added: daysAgoFrom(dateAdded, nowValue),
   };
 
   return {
@@ -892,6 +900,7 @@ export async function submitContactLead(body, request) {
       elapsedMs,
       turnstileEnabled: turnstileResult.enabled,
       turnstileValidated: turnstileResult.success,
+      attribution: normalizeAttribution(body.attribution, request),
     },
   };
 
@@ -1019,6 +1028,13 @@ export async function createManualSubmission(body, adminUsername = '', options =
   }
 
   const status = normalizeStatus(body.status, 'review');
+  if (status === 'archived') {
+    return {
+      ok: false,
+      status: 400,
+      errors: ['Create the CRM record first, then use Archive Lead so a disposition reason and activity are retained.'],
+    };
+  }
   const message =
     normalizeMessage(body.message, 5000) ||
     notes ||
@@ -1039,6 +1055,7 @@ export async function createManualSubmission(body, adminUsername = '', options =
     created_at: now,
     updated_at: now,
     status,
+    deal_hunter_opportunity_id: normalizeField(body.deal_hunter_opportunity_id, 200) || null,
     status_updated_at: now,
     spam_score: 0,
     spam_reasons: [],
@@ -1078,7 +1095,9 @@ export async function createManualSubmission(body, adminUsername = '', options =
     assigned_to: normalizeField(body.assigned_to, 120) || config.workflow.defaultAssignee,
     notes,
     follow_up_state: normalizeFollowUpState(body.follow_up_state, workflowDefaults.followUpState),
-    next_action_at: normalizeField(body.next_action_at, 80) || workflowDefaults.nextActionAt,
+    next_action_at: status === 'sourced' || normalizeFollowUpState(body.follow_up_state, workflowDefaults.followUpState) === 'completed'
+      ? null
+      : normalizeField(body.next_action_at, 80) || workflowDefaults.nextActionAt,
     last_contacted_at: status === 'contacted' ? now : null,
     metadata: {
       ...metadata,
@@ -1215,21 +1234,171 @@ export async function getDashboardSubmission(id) {
   return enrichSubmission(submission, storage);
 }
 
-export async function listDashboardFollowUps() {
+function zonedDateParts(date, timeZone) {
+  return Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date).map((part) => [part.type, part.value]));
+}
+
+function zonedMidnightUtc({ year, month, day }, timeZone) {
+  const targetWallTime = Date.UTC(Number(year), Number(month) - 1, Number(day), 0, 0, 0, 0);
+  let guess = targetWallTime;
+  for (let index = 0; index < 3; index += 1) {
+    const parts = zonedDateParts(new Date(guess), timeZone);
+    const observedWallTime = Date.UTC(
+      Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+      Number(parts.hour), Number(parts.minute), Number(parts.second), 0,
+    );
+    guess += targetWallTime - observedWallTime;
+  }
+  return new Date(guess);
+}
+
+function followUpDayBounds(now, timeZone) {
+  const current = zonedDateParts(now, timeZone);
+  const currentDate = new Date(Date.UTC(Number(current.year), Number(current.month) - 1, Number(current.day)));
+  const nextDate = new Date(currentDate.getTime() + 24 * 60 * 60 * 1_000);
+  return {
+    start: zonedMidnightUtc({
+      year: currentDate.getUTCFullYear(),
+      month: currentDate.getUTCMonth() + 1,
+      day: currentDate.getUTCDate(),
+    }, timeZone).toISOString(),
+    end: zonedMidnightUtc({
+      year: nextDate.getUTCFullYear(),
+      month: nextDate.getUTCMonth() + 1,
+      day: nextDate.getUTCDate(),
+    }, timeZone).toISOString(),
+  };
+}
+
+function safeDealHunterQueueContext(metadata = {}) {
+  const dealHunter = metadata?.dealHunter && typeof metadata.dealHunter === 'object' ? metadata.dealHunter : {};
+  return {
+    score: Number.isFinite(Number(dealHunter.score)) ? Number(dealHunter.score) : null,
+    scoreVersion: normalizeField(dealHunter.scoreVersion, 120),
+    strengths: Array.isArray(dealHunter.strengths) ? dealHunter.strengths.slice(0, 5).map((item) => normalizeField(item, 300)) : [],
+    concerns: Array.isArray(dealHunter.concerns) ? dealHunter.concerns.slice(0, 5).map((item) => normalizeField(item, 300)) : [],
+    unansweredQuestions: Array.isArray(dealHunter.unansweredQuestions)
+      ? dealHunter.unansweredQuestions.slice(0, 5).map((item) => normalizeField(item, 300))
+      : [],
+    sourceFreshAt: normalizeField(dealHunter.sourceFreshAt || dealHunter.lastSeenAt, 80),
+  };
+}
+
+function safeFollowUpQueueItem(submission) {
+  return {
+    id: submission.id,
+    created_at: submission.created_at,
+    updated_at: submission.updated_at,
+    status_updated_at: submission.status_updated_at || submission.updated_at,
+    status: submission.status,
+    follow_up_state: submission.follow_up_state,
+    next_action_at: submission.next_action_at,
+    last_contacted_at: submission.last_contacted_at,
+    priority: submission.priority,
+    assigned_to: submission.assigned_to,
+    lead_type: submission.lead_type,
+    company: submission.company,
+    name: submission.name,
+    email: submission.email,
+    broker_name: submission.broker_name,
+    broker_email: submission.broker_email,
+    seller_name: submission.seller_name,
+    seller_email: submission.seller_email,
+    listing_url: submission.listing_url,
+    tags: submission.tags,
+    follow_up_prompt: submission.follow_up_prompt,
+    email_engagement: submission.email_engagement,
+    follow_up_latest_subject: submission.follow_up_latest_subject || '',
+    follow_up_latest_direction: submission.follow_up_latest_direction || '',
+    follow_up_latest_delivery_state: submission.follow_up_latest_delivery_state || '',
+    follow_up_latest_communication_at: submission.follow_up_latest_communication_at || '',
+    follow_up_deal_key: submission.follow_up_deal_key || '',
+    follow_up_recommendation_id: submission.follow_up_recommendation_id || '',
+    follow_up_recommendation_action: submission.follow_up_recommendation_action || '',
+    follow_up_conversation_state: submission.follow_up_conversation_state || '',
+    follow_up_priority_score: Number(submission.follow_up_priority_score || 0),
+    follow_up_confidence: Number(submission.follow_up_confidence || 0),
+    deal_hunter: safeDealHunterQueueContext(submission.metadata),
+  };
+}
+
+export async function listDashboardFollowUps({
+  page = 1, pageSize = 25, search = '', view = 'crm-actions', sort = 'urgency', direction = 'desc',
+} = {}) {
   const storage = getStorage();
-  const [baseSummary, submissions] = await Promise.all([
-    storage.getSummary(),
-    storage.listSubmissions({ limit: 5000, page: 1, status: 'all' }),
+  const config = getConfig();
+  const safePageSize = [10, 25, 50, 100].includes(Number(pageSize)) ? Number(pageSize) : 25;
+  const safePage = Math.max(1, Math.min(Math.trunc(Number(page) || 1), 1_000_000));
+  const allowedViews = new Set([
+    'crm-actions', 'email-triage', 'due-today', 'overdue', 'awaiting-reply', 'inbound-reply',
+    'delivery-problem', 'manual-review', 'completed', 'all',
   ]);
+  const safeView = allowedViews.has(view) ? view : 'crm-actions';
+  const allowedSorts = new Set(['urgency', 'next_action_at', 'updated_at', 'company', 'priority', 'created_at']);
+  const safeSort = allowedSorts.has(sort) ? sort : 'urgency';
+  const safeDirection = String(direction).toLowerCase() === 'asc' ? 'asc' : 'desc';
   const now = new Date();
+  const bounds = followUpDayBounds(now, config.followUp.timezone);
+  const [baseSummary, initialSubmissions] = await Promise.all([
+    storage.getSummary(),
+    storage.listFollowUpSubmissions({
+      page: safePage,
+      pageSize: safePageSize,
+      search: normalizeField(search, 500),
+      view: safeView,
+      sort: safeSort,
+      direction: safeDirection,
+      now: now.toISOString(),
+      todayStart: bounds.start,
+      todayEnd: bounds.end,
+    }),
+  ]);
+  let submissions = initialSubmissions;
+  const initialTotalPages = Math.max(1, Math.ceil(submissions.total / safePageSize));
+  const resolvedPage = Math.min(safePage, initialTotalPages);
+  if (resolvedPage !== safePage) {
+    submissions = await storage.listFollowUpSubmissions({
+      page: resolvedPage,
+      pageSize: safePageSize,
+      search: normalizeField(search, 500),
+      view: safeView,
+      sort: safeSort,
+      direction: safeDirection,
+      now: now.toISOString(),
+      todayStart: bounds.start,
+      todayEnd: bounds.end,
+    });
+  }
   const enriched = await enrichSubmissions(submissions.rows, storage, now);
-  const { notifications, emailTriage } = buildFollowUpQueues(enriched);
+  const safeItems = enriched.map(safeFollowUpQueueItem);
+  const { notifications, emailTriage } = buildFollowUpQueues(safeItems);
+  const totalPages = Math.max(1, Math.ceil(submissions.total / safePageSize));
 
   return {
-    summary: buildNotificationSummary(baseSummary, enriched, emailTriage),
+    summary: {
+      ...buildNotificationSummary(baseSummary, safeItems, emailTriage),
+      filteredTotal: submissions.total,
+    },
+    items: safeItems,
     notifications,
     emailTriage,
     total: submissions.total,
+    page: resolvedPage,
+    pageSize: safePageSize,
+    totalPages,
+    view: safeView,
+    search: normalizeField(search, 500),
+    sort: safeSort,
+    direction: safeDirection,
   };
 }
 
@@ -1271,6 +1440,15 @@ export async function updateSubmissionWorkflow(id, fields, options = {}) {
       return null;
     }
 
+    // Archive and restore carry required disposition/audit semantics and must
+    // use their explicit lifecycle operations instead of the generic status field.
+    if (
+      (nextStatus === 'archived' && existing.status !== 'archived') ||
+      (existing.status === 'archived' && nextStatus !== 'archived')
+    ) {
+      return null;
+    }
+
     updates.status = nextStatus;
 
     if (nextStatus !== existing.status) {
@@ -1291,11 +1469,19 @@ export async function updateSubmissionWorkflow(id, fields, options = {}) {
   }
 
   if (fields.next_action_at !== undefined) {
-    updates.next_action_at = normalizeField(fields.next_action_at, 80) || null;
+    const nextActionAt = normalizeField(fields.next_action_at, 80) || null;
+    if (existing.status === 'archived' && nextActionAt) {
+      return null;
+    }
+    updates.next_action_at = nextActionAt;
   }
 
   if (fields.follow_up_state !== undefined) {
-    updates.follow_up_state = normalizeFollowUpState(fields.follow_up_state, existing.follow_up_state);
+    const followUpState = normalizeFollowUpState(fields.follow_up_state, existing.follow_up_state);
+    if (existing.status === 'archived' && followUpState !== 'completed') {
+      return null;
+    }
+    updates.follow_up_state = followUpState;
   }
 
   if (fields.tags !== undefined) {
@@ -1393,6 +1579,8 @@ export async function updateSubmissionWorkflow(id, fields, options = {}) {
       ? { conflict: true, current: await enrichSubmission(current, storage) }
       : null;
   }
+
+  await storage.supersedeCrmFollowUpRecommendations?.(id, updates.updated_at);
 
   return enrichSubmission(updated, storage);
 }
@@ -2075,6 +2263,38 @@ export async function deleteDashboardSubmission(id, options = {}) {
   }
 
   if (deletionError) {
+    if (deletionError.code === 'CIM_SEND_IN_PROGRESS' || deletionError.status === 409) {
+      const restoreFailures = await restoreStagedDocumentFiles(staged.stagedFiles, renameFile);
+      if (restoreFailures.length === 0) {
+        await removeCleanupDirectory(staged.trashDirectory, rmdir).catch((error) => {
+          restoreFailures.push({ filePath: staged.trashDirectory, message: error.message });
+        });
+      }
+      if (cleanupJob) {
+        const now = new Date().toISOString();
+        await updateCleanupState({
+          updated_at: now,
+          completed_at: restoreFailures.length === 0 ? now : null,
+          status: restoreFailures.length === 0 ? 'restored' : 'restore-failed',
+          attempt_count: 1,
+          last_error: restoreFailures.map((failure) => failure.message).join('; ') || null,
+        }).catch(() => {});
+      }
+      return restoreFailures.length === 0
+        ? {
+            ok: false,
+            status: 409,
+            error: 'CRM deletion is blocked while a CIM transmission is in progress. Retry after the claim lease expires.',
+            cleanupFailures: [],
+          }
+        : {
+            ok: false,
+            status: 500,
+            error: 'CRM deletion was blocked, and staged documents could not be fully restored.',
+            cleanupFailures: restoreFailures,
+          };
+    }
+
     const message = String(deletionError.message || deletionError).slice(0, 2000);
     if (cleanupJob) {
       await updateCleanupState({

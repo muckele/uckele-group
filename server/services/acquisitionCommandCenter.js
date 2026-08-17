@@ -8,6 +8,7 @@ import { reviewDailyDeals } from './dealHunter.js';
 import { normalizeDiligenceReview } from './submissions.js';
 import { buildFollowUpPrompt } from './workflow.js';
 import { commitCrmActivityMutation } from './activity.js';
+import { archiveLead } from './leadLifecycle.js';
 
 export const acquisitionPipelineStages = [
   'new-fit',
@@ -59,6 +60,13 @@ function normalizePipelineStage(value, fallback = 'new-fit') {
 function normalizePassReason(value) {
   const normalized = normalizeText(value, 100).toLowerCase();
   return acquisitionPassReasons.includes(normalized) ? normalized : '';
+}
+
+function archiveReasonForCommandCenterPass(reason) {
+  if (reason === 'too-expensive') return 'valuation';
+  if (reason === 'seller-financing-gap') return 'financing';
+  if (reason === 'other') return 'other';
+  return 'not-a-fit';
 }
 
 function normalizeFitFeedback(value, fallback = 'neutral') {
@@ -843,6 +851,18 @@ export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}
         name: source.name,
         mode: source.mode,
         checkedAt: sourceHealth.generatedAt || generatedAt,
+        exportedAt: source.exportedAt || '',
+        importedAt: source.importedAt || '',
+        importedBy: source.importedBy || '',
+        importAgeHours: source.importAgeHours ?? null,
+        maxAgeHours: source.maxAgeHours ?? null,
+        scope: source.scope || '',
+        coverageLabel: source.coverageLabel || '',
+        expectedRowCount: source.expectedRowCount ?? null,
+        duplicateCount: Number(source.duplicateCount || 0),
+        stableIdCount: Number(source.stableIdCount || 0),
+        listingUrlCount: Number(source.listingUrlCount || 0),
+        coverageLimitReached: Boolean(source.coverageLimitReached),
       };
       continue;
     }
@@ -869,21 +889,51 @@ export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}
 
 function buildCachedSourceHealth(previousSnapshot = {}, now = new Date(), config = getConfig()) {
   const sourceSnapshots = objectValue(previousSnapshot.sources);
-  const sources = Object.entries(sourceSnapshots).map(([id, source]) => ({
-    id,
-    name: source.name || id,
-    mode: source.mode || 'cached',
-    fetched: true,
-    rowCount: Number(source.rowCount || 0),
-    previousRowCount: Number(source.rowCount || 0),
-    rowDelta: 0,
-    tone: 'success',
-    error: '',
-    requiresConfiguration: false,
-    configurationKey: '',
-    checkedAt: source.checkedAt || previousSnapshot.generatedAt || '',
-  }));
-  const issues = Array.isArray(previousSnapshot.issues) ? previousSnapshot.issues : [];
+  const issues = Array.isArray(previousSnapshot.issues) ? [...previousSnapshot.issues] : [];
+  const issueSourceIds = new Set(issues.map((issue) => issue?.sourceId).filter(Boolean));
+  const sources = Object.entries(sourceSnapshots).map(([id, source]) => {
+    const mode = source.mode || 'cached';
+    const exportedTimestamp = Date.parse(source.exportedAt || '');
+    const maxAgeHours = Number(source.maxAgeHours);
+    const ageHours = Number.isFinite(exportedTimestamp)
+      ? Math.max(0, (now.getTime() - exportedTimestamp) / (60 * 60 * 1000))
+      : null;
+    const staleManualExport = mode === 'manual-export'
+      && Number.isFinite(ageHours)
+      && Number.isFinite(maxAgeHours)
+      && maxAgeHours > 0
+      && ageHours > maxAgeHours;
+    const freshnessError = staleManualExport
+      ? `The Deal OS export is ${ageHours.toFixed(1)} hours old and exceeds the ${maxAgeHours}-hour freshness limit.`
+      : '';
+
+    if (freshnessError && !issueSourceIds.has(id)) {
+      issues.push({
+        sourceId: id,
+        tone: 'danger',
+        title: `${source.name || 'Deal source'} needs attention`,
+        message: freshnessError,
+      });
+      issueSourceIds.add(id);
+    }
+
+    return {
+      ...source,
+      id,
+      name: source.name || id,
+      mode,
+      fetched: !staleManualExport,
+      rowCount: Number(source.rowCount || 0),
+      previousRowCount: Number(source.rowCount || 0),
+      rowDelta: 0,
+      tone: staleManualExport ? 'danger' : 'success',
+      error: freshnessError,
+      requiresConfiguration: false,
+      configurationKey: '',
+      checkedAt: source.checkedAt || previousSnapshot.generatedAt || '',
+      importAgeHours: Number.isFinite(ageHours) ? Number(ageHours.toFixed(1)) : source.importAgeHours ?? null,
+    };
+  });
 
   if (sources.length === 0) {
     return {
@@ -968,6 +1018,18 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
       error: source.error || '',
       requiresConfiguration,
       configurationKey: source.configurationKey || '',
+      exportedAt: source.exportedAt || '',
+      importedAt: source.importedAt || '',
+      importedBy: source.importedBy || '',
+      importAgeHours: source.importAgeHours ?? null,
+      maxAgeHours: source.maxAgeHours ?? null,
+      scope: source.scope || '',
+      coverageLabel: source.coverageLabel || '',
+      expectedRowCount: source.expectedRowCount ?? null,
+      duplicateCount: Number(source.duplicateCount || 0),
+      stableIdCount: Number(source.stableIdCount || 0),
+      listingUrlCount: Number(source.listingUrlCount || 0),
+      coverageLimitReached: Boolean(source.coverageLimitReached),
     };
   });
 
@@ -1130,6 +1192,10 @@ export async function updateAcquisitionCommandCenterRecord({
     return { ok: false, status: 400, error: 'Fit feedback is not valid.' };
   }
 
+  if (normalizedStage === 'passed' && !normalizedPassReason) {
+    return { ok: false, status: 400, error: 'Pass & Archive requires a disposition reason.' };
+  }
+
   if (!normalizedStage && !normalizedPassReason && !normalizedFeedback && feedbackNote === '') {
     return { ok: false, status: 400, error: 'No command center update was provided.' };
   }
@@ -1154,6 +1220,32 @@ export async function updateAcquisitionCommandCenterRecord({
       : nextStage === 'loi-candidate'
         ? { stage: 'loi-candidate', decision: 'advance' }
         : {};
+
+  if (normalizedPassReason) {
+    const archiveResult = await archiveLead({
+      submissionId: existing.id,
+      reason: archiveReasonForCommandCenterPass(normalizedPassReason),
+      note: normalizeText(feedbackNote, 1000),
+      actor: acquisitionCommand.updatedBy,
+      role: 'admin',
+      storage,
+      metadataPatch: {
+        acquisitionCommand,
+        diligence: normalizeDiligenceReview(diligencePatch, metadata.diligence, { now }),
+      },
+    });
+
+    return archiveResult.ok
+      ? {
+          ok: true,
+          status: archiveResult.status,
+          submission: archiveResult.submission,
+          acquisitionCommand,
+          archived: true,
+        }
+      : archiveResult;
+  }
+
   const updates = {
     updated_at: now,
     ...(nextStage === 'passed' ? { follow_up_state: 'completed' } : {}),

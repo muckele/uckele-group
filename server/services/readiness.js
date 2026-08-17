@@ -14,6 +14,7 @@ export async function checkReadiness() {
   const checks = {
     configuration: 'ok',
     storage: 'ok',
+    cimStage2Storage: 'ok',
     documentVault: 'ok',
   };
 
@@ -24,8 +25,11 @@ export async function checkReadiness() {
     } else {
       await storage.getSummary();
     }
+    const stage2Storage = await storage.checkCimStage2Storage?.();
+    if (!stage2Storage?.ok) checks.cimStage2Storage = 'failed';
   } catch {
     checks.storage = 'failed';
+    checks.cimStage2Storage = 'failed';
   }
 
   try {

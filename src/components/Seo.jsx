@@ -17,6 +17,10 @@ export default function Seo({ title, description, keywords, noindex = false }) {
       <meta content={description} property="og:description" />
       <meta content={canonicalUrl} property="og:url" />
       <meta content={siteConfig.socialImageUrl} property="og:image" />
+      <meta content="image/png" property="og:image:type" />
+      <meta content="1200" property="og:image:width" />
+      <meta content="630" property="og:image:height" />
+      <meta content="Uckele Group — a thoughtful long-term home for a great small business" property="og:image:alt" />
       <meta content={siteConfig.siteName} property="og:site_name" />
       <meta content="website" property="og:type" />
       <meta content={title} name="twitter:title" />

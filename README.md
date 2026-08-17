@@ -7,11 +7,11 @@ The production deployment is designed to run economically on Fly.io with SQLite 
 ## What is included
 
 - Public acquisition site with responsive pages, accessible navigation, privacy language, contact intake, metadata, sitemap, and pre-rendered SEO heads.
-- Paginated CRM with URL-persisted search, filtering, sorting, page size, accurate totals, follow-ups, CSV export, and deal rooms.
+- Paginated CRM with URL-persisted search, filtering, sorting, page size, accurate totals, a human-reviewed follow-up workspace, CSV export, and deal rooms.
 - Durable deal activity events for CRM changes, email delivery and replies, CIM activity, diligence, and secure-document actions.
 - Deal Hunter review workflow with source health, daily delivery history, CIM requests, and acquisition-command-center feedback.
 - Secure Documents v2 with expiring request links, requested-document checklists, multiple batches, per-file categories, revocation, individual deletion, and NDA acknowledgment.
-- Operations center with scheduler history, source-health history, audit events, cleanup failures, database and disk status, and backup status.
+- Operations center with scheduler history, source-health history, audit events, cleanup failures, CRM email readiness and learning metrics, database and disk status, and backup status.
 - Application-consistent SQLite backup bundles with secure-document manifests, checksums, integrity verification, retention, restore tooling, and a recovery drill.
 - Single-use magic links and server-side, revocable admin sessions, including sign-out-all-sessions and automatic expired-record cleanup.
 
@@ -73,6 +73,7 @@ Local data is stored under `data/` by default and is excluded from Git.
 | `npm run backup:verify` | Verify the newest or selected backup bundle |
 | `npm run backup:restore` | Restore a verified backup bundle |
 | `npm run backup:drill` | Execute the automated backup-and-restore recovery drill |
+| `npm run cim:stage2:audit` | Run the count-only, address-free Stage 2 readiness and linkage audit |
 
 Install the Playwright browser once before the first local browser run:
 
@@ -113,10 +114,13 @@ Copy `.env.example` and configure only the providers you use. Important groups a
 - Authentication: `ADMIN_AUTH_MODE`, administrator identity, unique session and magic-link secrets, session lifetime, and optional viewer access.
 - Secure documents: a unique token secret, storage directory, request lifetime, and upload limits.
 - Deal Hunter: source configuration, recipient, schedule, and optional automated CIM follow-ups.
+- Human-reviewed follow-ups: `FOLLOW_UP_EMAIL_ENABLED`, optional `FOLLOW_UP_AI_ENABLED`, sender/reply identity, send windows, caps, cadence, postal footer, opt-out settings, and the AI model/reasoning/request bounds plus approval/eval/synthetic-smoke references. Both feature flags default to `false`.
 - Protection: Turnstile, request limits, rate limiting, and spam thresholds.
 - Backup: enabled state, private bundle directory, retention limits, daily time, timezone, and scheduler interval.
 
 Production validation intentionally rejects missing or weak authentication secrets, reused secure-document secrets, unusable login configuration, and development-only delivery providers.
+
+The generic CRM email action and AI enrichment flags are independent. Deterministic recommendations remain available when AI is disabled or degraded, and no recommendation may send an email. The credential-free synthetic gate is `npm run eval:follow-ups`; paid live comparison is separately guarded and never implied by that command. Before enabling either flag, use the staged checklist in [docs/follow-up-operations.md](docs/follow-up-operations.md).
 
 ## SQLite data and recovery
 
@@ -130,7 +134,7 @@ For operating and restore instructions, including Fly volume snapshots and the r
 
 Production should use `ADMIN_AUTH_MODE=magic-link` unless password login is deliberately required. Magic links are single-use. Successful login creates a server-side session whose ID is stored in a signed, secure, HTTP-only cookie. Logging out revokes the current session; “Sign Out Everywhere” revokes every active session for that identity.
 
-The `admin` role can mutate deal data, access Operations, export records, manage secure requests, and revoke sessions. The `viewer` role has limited read access and cannot open Operations or perform mutations.
+The `admin` role can mutate deal data, use Operations release controls, export records, manage secure requests, and revoke sessions. The `viewer` role has limited read access, can see the aggregate body-free and address-free Operations status, and cannot activate, run, pause, inspect Stage 2 decision details, or perform other mutations.
 
 ## Secure-document handling
 
@@ -166,7 +170,13 @@ fly status -a uckele-group
 curl -i https://www.uckelegroup.com/api/ready
 ```
 
-See [docs/deployment.md](docs/deployment.md) and [docs/backend-setup.md](docs/backend-setup.md) for the full provider and production checklist.
+In production the server sends Vite's fingerprinted `/assets/*` bundles with a one-year immutable cache policy, because changing their content changes their filename. Entry documents, including every client-routed path, are sent `no-cache` so a deploy is picked up on the next request. The application deliberately does not compress responses itself: the Fly proxy compresses at the edge for any response that arrives without a `Content-Encoding` header, so adding compression middleware would only disable that.
+
+See [docs/deployment.md](docs/deployment.md), [docs/backend-setup.md](docs/backend-setup.md), and the [guarded CIM Stage 2 rollout runbook](docs/cim-stage2-rollout.md) for the full provider and production checklist.
+
+Deal Hunter scoring, evidence provenance, fingerprint-gated rescoring, machine-versus-operator ownership, and the triage queue are documented in [docs/deal-scoring-and-triage.md](docs/deal-scoring-and-triage.md). Scoring is fully deterministic and requires no model provider.
+
+For the CRM follow-up rollout, provider receiving setup, compliance review, monitoring, ambiguous-send incident handling, and rollback procedure, see [docs/follow-up-operations.md](docs/follow-up-operations.md). Deployment is a separate, explicit operator action; this repository does not enable the feature or perform live sends by itself.
 
 ## Continuous integration
 

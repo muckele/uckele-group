@@ -222,6 +222,160 @@ h6 {
   font-size: 0.75rem;
 }
 
+.admin-guide-control {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.35rem;
+}
+
+.admin-guide-button {
+  display: inline-flex;
+  min-height: 2.5rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+  border: 1px solid #6d8077;
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.96);
+  color: var(--color-moss);
+  padding: 0.5rem 0.75rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1.25rem;
+  transition: border-color 160ms ease, background 160ms ease, color 160ms ease;
+}
+
+.admin-guide-button:hover:not(:disabled) {
+  border-color: rgba(40, 70, 56, 0.48);
+  background: rgba(40, 70, 56, 0.07);
+}
+
+.admin-guide-button:disabled {
+  opacity: 0.58;
+}
+
+.admin-guide-message {
+  max-width: 24rem;
+  color: rgba(24, 33, 29, 0.68);
+  font-size: 0.72rem;
+  line-height: 1.1rem;
+}
+
+.admin-tour-tooltip {
+  width: min(22rem, calc(100vw - 2rem));
+  max-height: min(34rem, calc(100vh - 2rem));
+  overflow-y: auto;
+  border: 1px solid #7b8c84;
+  border-radius: 18px;
+  background: var(--color-parchment);
+  color: var(--color-ink);
+  box-shadow: 0 24px 70px rgba(24, 33, 29, 0.3);
+  padding: 1rem;
+}
+
+.admin-tour-tooltip-heading,
+.admin-tour-footer,
+.admin-tour-primary-actions {
+  display: flex;
+  align-items: center;
+}
+
+.admin-tour-tooltip-heading,
+.admin-tour-footer {
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.admin-tour-kicker {
+  margin: 0;
+  color: var(--color-moss);
+  font-size: 0.68rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1rem;
+  text-transform: uppercase;
+}
+
+.admin-tour-close {
+  min-height: 2.25rem;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: rgba(24, 33, 29, 0.72);
+  padding: 0.4rem 0.55rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+}
+
+.admin-tour-close:hover {
+  background: rgba(40, 70, 56, 0.08);
+  color: var(--color-pine);
+}
+
+.admin-tour-title {
+  margin: 0.8rem 0 0;
+  color: var(--color-ink);
+  font-size: 1.15rem;
+  font-weight: 750;
+  line-height: 1.45rem;
+}
+
+.admin-tour-content {
+  margin-top: 0.55rem;
+  color: rgba(24, 33, 29, 0.78);
+  font-size: 0.9rem;
+  line-height: 1.45rem;
+}
+
+.admin-tour-footer {
+  margin-top: 1rem;
+  border-top: 1px solid rgba(216, 208, 196, 0.9);
+  padding-top: 0.85rem;
+}
+
+.admin-tour-primary-actions {
+  justify-content: flex-end;
+  gap: 0.5rem;
+}
+
+.admin-tour-button {
+  min-height: 2.5rem;
+  border-radius: 10px;
+  padding: 0.48rem 0.72rem;
+  font-size: 0.78rem;
+  font-weight: 750;
+  line-height: 1.15rem;
+}
+
+.admin-tour-button-secondary {
+  border: 1px solid #6d8077;
+  background: rgba(255, 255, 255, 0.78);
+  color: var(--color-moss);
+}
+
+.admin-tour-button-secondary:hover {
+  border-color: rgba(40, 70, 56, 0.48);
+  background: rgba(40, 70, 56, 0.08);
+}
+
+.admin-tour-button-primary {
+  border: 1px solid var(--color-moss);
+  background: var(--color-moss);
+  color: #fff;
+}
+
+.admin-tour-button-primary:hover {
+  border-color: var(--color-pine);
+  background: var(--color-pine);
+}
+
+.admin-guide-button:focus-visible,
+.admin-tour-tooltip :where(button):focus-visible {
+  outline-color: var(--color-moss);
+}
+
 .admin-workspace-link {
   display: block;
   min-width: 0;
@@ -310,6 +464,10 @@ h6 {
   letter-spacing: 0;
 }
 
+.admin-content-with-side-nav :where(h2, h3)[id] {
+  scroll-margin-top: 6.5rem;
+}
+
 .admin-stat-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -327,7 +485,7 @@ h6 {
 @supports (content-visibility: auto) {
   .admin-crm-record-card {
     content-visibility: auto;
-    contain-intrinsic-size: auto 160rem;
+    contain-intrinsic-size: auto 24rem;
     transition-delay: 0ms !important;
   }
 }
@@ -464,13 +622,23 @@ textarea {
     grid-column: 1 / -1;
   }
 
+  .admin-guide-control {
+    grid-column: 1 / -1;
+    width: 100%;
+  }
+
+  .admin-guide-button {
+    width: 100%;
+    min-height: 2.75rem;
+  }
+
   .admin-stat-card {
     min-height: 8.5rem;
   }
 
   @supports (content-visibility: auto) {
     .admin-crm-record-card {
-      contain-intrinsic-size: auto 280rem;
+      contain-intrinsic-size: auto 38rem;
     }
   }
 }
@@ -517,7 +685,7 @@ textarea {
 
   @supports (content-visibility: auto) {
     .admin-crm-record-card {
-      contain-intrinsic-size: auto 128rem;
+      contain-intrinsic-size: auto 24rem;
     }
   }
 }

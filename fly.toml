@@ -26,17 +26,40 @@ primary_region = "ewr"
   BACKUP_DAILY_TIME = "03:30"
   BACKUP_TIMEZONE = "America/Los_Angeles"
   DEAL_HUNTER_DAILY_EMAIL_ENABLED = "true"
-  DEAL_HUNTER_DAILY_EMAIL_TIME = "10:15"
+  DEAL_HUNTER_DAILY_EMAIL_TIME = "08:00"
   DEAL_HUNTER_DAILY_EMAIL_TIMEZONE = "America/Los_Angeles"
   DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR = "/data/deal-hunter-daily-email"
-  DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED = "true"
+  # The scheduler is fail-closed: leave broker follow-ups disabled until
+  # Resend delivery webhooks and a controlled inbound reply are both verified.
+  DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED = "false"
   DEAL_HUNTER_CIM_FOLLOW_UP_CHECK_INTERVAL_MS = "3600000"
   DEAL_HUNTER_CIM_FOLLOW_UP_DELAYS_HOURS = "48,72,96"
   DEAL_HUNTER_CIM_FOLLOW_UP_MAX_COUNT = "3"
   DEAL_HUNTER_CIM_FOLLOW_UP_WEEKDAYS_ONLY = "true"
   DEAL_HUNTER_CIM_FOLLOW_UP_TIMEZONE = "America/Los_Angeles"
+  DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_START = "08:00"
+  DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_END = "17:00"
+  # Release-owner approved manual Stage 1 initial CIM outreach. Follow-ups stay
+  # separately disabled until a later release-owner decision.
+  DEAL_HUNTER_CIM_OUTREACH_PAUSED = "false"
+  DEAL_HUNTER_CIM_RECIPIENT_24_HOUR_CAP = "1"
+  DEAL_HUNTER_CIM_RECIPIENT_30_DAY_TOUCH_CAP = "4"
+  DEAL_HUNTER_CIM_RECIPIENT_OVERRIDE_MAX_HOURS = "24"
+  DEAL_HUNTER_CIM_AUTOMATION_STAGE = "1"
+  # Stage 2 code is deployed inert. This pause affects only automatic initial
+  # outreach; manual Stage 1 remains governed by the central outreach control.
+  DEAL_HUNTER_CIM_AUTOMATION_PAUSED = "true"
+  DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED = "false"
   DEAL_HUNTER_MAX_SOURCE_RECORDS = "8000"
+  DEAL_HUNTER_AIRTABLE_ENABLED = "false"
   DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES = "12582912"
+  DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES = "8388608"
+  DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS = "1000"
+  DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS = "72"
+  ANALYTICS_ENABLED = "true"
+  ANALYTICS_RETENTION_DAYS = "90"
+  ANALYTICS_RATE_LIMIT_WINDOW_MS = "60000"
+  ANALYTICS_RATE_LIMIT_MAX = "120"
 
 [http_service]
   internal_port = 8787

@@ -110,6 +110,37 @@ test('app error handler preserves parser client error statuses', () => {
   });
 });
 
+test('app error handler does not log submitted content from server errors', () => {
+  const response = createResponse();
+  const originalConsoleError = console.error;
+  const calls = [];
+
+  try {
+    console.error = (...args) => calls.push(args);
+    handleAppError({
+      name: 'DatabaseError',
+      code: 'SQL_WRITE_FAILED',
+      message: 'failed while writing secret communication body',
+      submittedBody: 'secret communication body',
+    }, { id: 'request-123' }, response, () => {});
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(response.statusCode, 500);
+  assert.deepEqual(response.body, {
+    success: false,
+    error: 'Something went wrong while processing the request.',
+  });
+  assert.equal(calls.length, 1);
+  assert.doesNotMatch(JSON.stringify(calls), /secret communication body/);
+  assert.deepEqual(calls[0][1], {
+    name: 'DatabaseError',
+    code: 'SQL_WRITE_FAILED',
+    status: 500,
+  });
+});
+
 test('secure upload JSON parser limit accounts for base64 batch overhead', () => {
   assert.ok(getSecureUploadJsonLimitBytes() > 1024 * 5);
 });

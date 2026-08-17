@@ -21,9 +21,10 @@ describe('CRM navigation', () => {
 
   test('reports accurate record range and requests adjacent pages', () => {
     const onChange = vi.fn();
-    render(<CrmNavigation filters={filters} onChange={onChange} total={63} totalPages={3} />);
+    const { container } = render(<CrmNavigation filters={filters} onChange={onChange} total={63} totalPages={3} />);
 
     expect(screen.getByText('26–50 of 63 records · Page 2 of 3')).toBeVisible();
+    expect(container.querySelector('[data-admin-tour="crm-filters"]')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /next/i }));
     expect(onChange).toHaveBeenCalledWith({ page: 3 });
   });
@@ -71,6 +72,23 @@ describe('CRM navigation', () => {
     expect(onChange).toHaveBeenCalledWith({ created: 'last-7-days', page: 1 });
     expect(crmFiltersFromSearch('?created=last-7-days').created).toBe('last-7-days');
     expect(crmFiltersFromSearch('?created=not-valid').created).toBe('all');
+  });
+
+  test('shows the active filter count and clears discovery filters together', () => {
+    const onChange = vi.fn();
+    render(
+      <CrmNavigation
+        filters={{ ...filters, search: 'dental', status: 'review', created: 'last-7-days' }}
+        onChange={onChange}
+        total={4}
+        totalPages={1}
+      />,
+    );
+
+    expect(screen.getByText('Find a CRM record')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Clear 3 filters' }));
+
+    expect(onChange).toHaveBeenCalledWith({ search: '', created: 'all', status: 'all', page: 1 });
   });
 
   test('represents every accepted deep-link sort direction in the visible control', () => {

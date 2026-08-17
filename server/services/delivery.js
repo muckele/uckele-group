@@ -2,6 +2,11 @@ import { getConfig } from '../config.js';
 import { fetchWithTimeout } from '../utils/http.js';
 import { recordEmailEvent } from './emailEvents.js';
 
+const cimMessageKinds = new Set([
+  'deal-hunter-cim-request',
+  'deal-hunter-cim-follow-up',
+]);
+
 function escapeHtml(value = '') {
   return String(value)
     .replaceAll('&', '&amp;')
@@ -158,7 +163,7 @@ function ctaHtml(ctas = []) {
 
             return `
               <td style="padding: 0 10px 10px 0;">
-                <a href="${escapeHtml(normalizeUrl(cta.href))}" style="display: inline-block; border: 1px solid ${border}; border-radius: 999px; background: ${background}; color: ${color}; font-size: 14px; font-weight: 700; line-height: 1; padding: 14px 18px; text-decoration: none;">${escapeHtml(cta.label)}</a>
+                <a href="${escapeHtml(normalizeUrl(cta.href))}" target="_blank" style="display: inline-block; border: 1px solid ${border}; border-radius: 999px; background: ${background}; color: ${color}; font-size: 14px; font-weight: 700; line-height: 1; padding: 14px 18px; text-decoration: none;">${escapeHtml(cta.label)}</a>
               </td>
             `;
           })
@@ -181,6 +186,9 @@ function brandedEmailHtml({
 }) {
   const config = getConfig();
   const websiteUrl = normalizeUrl(config.brand.websiteUrl || config.server.origin);
+  const logoUrl = websiteUrl
+    ? normalizeUrl(`${websiteUrl.replace(/\/+$/, '')}/email-logo.png`)
+    : '';
   const mailingAddress = normalizeText(config.brand.mailingAddress, 260);
   const footerLines = [
     footerNote ? { value: footerNote, isHtml: true } : null,
@@ -211,9 +219,13 @@ function brandedEmailHtml({
                   <td style="padding: 0 0 14px;">
                     <table cellpadding="0" cellspacing="0" role="presentation" style="width: 100%; border-collapse: collapse;">
                       <tr>
-                        <td>
-                          <div style="display: inline-block; height: 40px; width: 40px; border-radius: 10px; background: #284638; color: #FFFFFF; font-size: 14px; font-weight: 800; line-height: 40px; text-align: center;">UG</div>
-                          <span style="display: inline-block; margin-left: 10px; color: #18211D; font-size: 18px; font-weight: 800; vertical-align: middle;">${escapeHtml(config.brand.companyName)}</span>
+                        <td style="width: 48px; vertical-align: middle;">
+                          ${logoUrl
+                            ? `<img src="${escapeHtml(logoUrl)}" width="44" height="44" alt="" style="display: block; width: 44px; height: 44px; border: 0; border-radius: 10px; outline: none; text-decoration: none;">`
+                            : '<div style="height: 40px; width: 40px; border-radius: 10px; background: #284638; color: #FFFFFF; font-size: 14px; font-weight: 800; line-height: 40px; text-align: center;">UG</div>'}
+                        </td>
+                        <td style="padding-left: 10px; color: #18211D; font-size: 18px; font-weight: 800; vertical-align: middle;">
+                          ${escapeHtml(config.brand.companyName)}
                         </td>
                       </tr>
                     </table>
@@ -270,7 +282,7 @@ async function sendViaResend(message) {
       ...(message.idempotencyKey ? { 'Idempotency-Key': message.idempotencyKey } : {}),
     },
     body: JSON.stringify({
-      from: config.delivery.resendFromEmail,
+      from: message.from || config.delivery.resendFromEmail,
       to: normalizeRecipients(message.to),
       subject: message.subject,
       html: message.html,
@@ -392,6 +404,7 @@ async function recordTrackedEmailDelivery(message, result) {
           recipient_email: recipient,
           subject: message.subject,
           submission_id: message.tracking.submissionId || '',
+          communication_id: message.tracking.communicationId || message.communicationId || '',
           source: message.kind,
           metadata: {
             deliveryStatus: result.status,
@@ -410,6 +423,19 @@ async function sendMessage(message) {
   const config = getConfig();
   let result;
 
+  // EmailJS returns a successful response without a provider message ID and
+  // does not offer the provider-side idempotency guarantee used by CIM sends.
+  // A process failure after acceptance could therefore make a retry duplicate
+  // private broker outreach. Keep EmailJS available for ordinary application
+  // mail, but fail closed before the network for every CIM send entry point.
+  if (config.delivery.provider === 'emailjs' && cimMessageKinds.has(message.kind)) {
+    return {
+      status: 'failed',
+      error: 'EmailJS is not eligible for CIM outreach because provider acceptance cannot be reconciled idempotently. Configure Resend, or use the console provider for development-only verification.',
+      providerMessageId: '',
+    };
+  }
+
   try {
     switch (config.delivery.provider) {
       case 'resend':
@@ -427,15 +453,35 @@ async function sendMessage(message) {
         break;
     }
   } catch (error) {
+    const providerOutcomeAmbiguous = config.delivery.provider === 'resend'
+      && cimMessageKinds.has(message.kind);
     result = {
-      status: 'failed',
-      error: `${config.delivery.provider} delivery failed: ${error.message}`,
+      status: providerOutcomeAmbiguous ? 'ambiguous' : 'failed',
+      error: providerOutcomeAmbiguous
+        ? `Resend delivery outcome is ambiguous: ${error.message}. Reconcile the persisted communication before any retry.`
+        : `${config.delivery.provider} delivery failed: ${error.message}`,
       providerMessageId: '',
+      providerOutcomeAmbiguous,
     };
   }
 
   await recordTrackedEmailDelivery(message, result);
   return result;
+}
+
+// CIM workflows persist the fully-rendered message before calling this entry
+// point, then pass the same immutable object here. Keeping this small public
+// seam prevents template changes between persistence and transmission.
+export async function sendPreparedMessage(message = {}) {
+  if (!hasOnlyValidEmailRecipients(message.to)) {
+    return {
+      status: 'failed',
+      error: 'A valid broker or contact email is required before sending this email.',
+      providerMessageId: '',
+    };
+  }
+
+  return sendMessage(message);
 }
 
 function buildSubmissionMessage(submission) {
@@ -536,6 +582,7 @@ function dealHunterDealHtml(deal, { tone = 'success', showRemoveReasons = false 
   const badgeColor = tone === 'danger' ? '#B91C1C' : tone === 'warning' ? '#92400E' : '#284638';
   const detailItems = showRemoveReasons ? deal.removeReasons || deal.concerns || [] : deal.strengths || [];
   const questionItems = deal.questions || [];
+  const listingUrl = normalizeUrl(deal.listingUrl);
 
   return `
     <div style="margin: 18px 0; border: 1px solid ${border}; border-radius: 16px; background: ${background}; padding: 18px;">
@@ -562,7 +609,7 @@ function dealHunterDealHtml(deal, { tone = 'success', showRemoveReasons = false 
               .join('')}</ul>`
           : ''
       }
-      ${deal.listingUrl ? `<a href="${escapeHtml(deal.listingUrl)}" style="color: #284638; font-size: 14px; font-weight: 800; text-decoration: underline;">View listing</a>` : ''}
+      ${listingUrl ? `<a href="${escapeHtml(listingUrl)}" style="color: #284638; font-size: 14px; font-weight: 800; text-decoration: underline;">View listing</a>` : ''}
     </div>
   `;
 }
@@ -597,7 +644,7 @@ function dealHunterTextSection(title, deals = [], options = {}) {
       `${index + 1}. ${deal.name} (${deal.score}/100)`,
       options.showRemoveReasons ? (deal.removeReasons || deal.concerns || []).join('; ') : dealHunterMetaLine(deal),
       options.showRemoveReasons ? '' : (deal.recommendation || ''),
-      deal.listingUrl || '',
+      normalizeUrl(deal.listingUrl),
       '',
     ]),
   ];
@@ -610,6 +657,7 @@ function dealHunterTextSection(title, deals = [], options = {}) {
 }
 
 export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = '' } = {}) {
+  const config = getConfig();
   const generatedLabel = review.generatedAt ? new Date(review.generatedAt).toLocaleString() : new Date().toLocaleString();
   const crmSync = review.crmSync || {};
   const emailSectionLimit = 8;
@@ -617,8 +665,58 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
   const sourceSummary = (review.sources || [])
     .map((source) => `${source.name}: ${source.fetched ? `${source.rowCount || 0} rows` : `failed (${source.error || 'unknown error'})`}`)
     .join('\n');
+  const coverageWarnings = Array.isArray(review.coverageWarnings) ? review.coverageWarnings.filter(Boolean) : [];
+  const coverageWarningHtml = coverageWarnings.length > 0
+    ? `<div style="margin: 20px 0; border: 1px solid #F0C36A; border-radius: 14px; background: #FFF8E7; padding: 16px;"><p style="margin: 0 0 8px; color: #7A5200; font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase;">Limited source coverage</p><ul style="margin: 0 0 0 18px; padding: 0; color: #664A10; font-size: 14px; line-height: 1.6;">${coverageWarnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('')}</ul></div>`
+    : '';
   const recommendations = review.criteriaRecommendations || [];
+  const automation = review.cimAutomation || {};
+  const automationRun = automation.run || {};
+  const cimReadyDeals = [];
+  const seenCimDeals = new Set();
+
+  for (const deal of [...(review.qualified || []), ...(review.newlySeenMatches || []), ...(review.watchlist || [])]) {
+    const recipient = deal?.cimRequest?.recipientEmail || deal?.brokerEmail || '';
+    const key = `${deal?.dealKey || ''}|${String(recipient).toLowerCase()}`;
+
+    if (!deal?.cimRequest?.canRequest || !recipient || seenCimDeals.has(key)) continue;
+    seenCimDeals.add(key);
+    cimReadyDeals.push(deal);
+  }
+
+  const adminOrigin = String(config.server.origin || '').replace(/\/$/, '');
+  const scoredBusinessesUrl = `${adminOrigin}/admin/command-center`;
+  const approvalUrl = `${adminOrigin}/admin/deal-hunter?view=cim-approvals`;
+  const directActionButtonHtml = (label, href, { secondary = false } = {}) => `
+    <table cellpadding="0" cellspacing="0" role="presentation" style="width: 100%; border-collapse: separate; margin: 0 0 10px;">
+      <tr>
+        <td align="center" bgcolor="${secondary ? '#FFFFFF' : '#284638'}" style="border: 1px solid ${secondary ? '#A9BCAF' : '#284638'}; border-radius: 8px;">
+          <a href="${escapeHtml(href)}" target="_blank" style="display: block; padding: 14px 18px; color: ${secondary ? '#284638' : '#FFFFFF'}; font-size: 14px; font-weight: 800; line-height: 1.25; text-align: center; text-decoration: none;">${escapeHtml(label)}</a>
+        </td>
+      </tr>
+    </table>
+  `;
+  const directActionLinksHtml = `
+    <div style="margin: 20px 0; border: 1px solid #C9D8CF; border-radius: 14px; background: #F4F8F5; padding: 16px;">
+      <p style="margin: 0 0 8px; color: #284638; font-size: 13px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;">Direct action links</p>
+      <p style="margin: 0 0 14px; color: #33443B; font-size: 13px; line-height: 1.55;">Open the protected dashboards to review today&rsquo;s opportunities and approvals.</p>
+      ${directActionButtonHtml('Review 75+ Scored Businesses', scoredBusinessesUrl)}
+      ${cimReadyDeals.length > 0 ? directActionButtonHtml(`Review & Send ${cimReadyDeals.length} CIM Request${cimReadyDeals.length === 1 ? '' : 's'}`, approvalUrl, { secondary: true }) : ''}
+    </div>
+  `;
   const bodyHtml = `
+    ${coverageWarningHtml}
+    <div style="margin: 20px 0; border: 1px solid #E3D9CA; border-radius: 14px; background: #F8F4ED; padding: 16px;">
+      <p style="margin: 0 0 8px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase;">CIM Automation</p>
+      <p style="margin: 0; color: #33443B; font-size: 14px; line-height: 1.6;">Configured Stage ${escapeHtml(automation.configuredStage || 1)}; effective Stage ${escapeHtml(automation.effectiveStage || 1)}${automation.paused ? '; emergency paused' : ''}. ${escapeHtml(automationRun.sent || 0)} initial request(s) sent automatically; ${escapeHtml(automationRun.exceptions?.length || 0)} exception(s) retained for review.</p>
+    </div>
+    ${directActionLinksHtml}
+    ${dealHunterSectionHtml(
+      'CIM Requests Ready For Approval',
+      'Review the exact businesses and recipients, edit any broker address, skip weak fits, and send only the requests you approve.',
+      cimReadyDeals,
+      { tone: 'warning', limit: emailSectionLimit },
+    )}
     ${dealHunterSectionHtml(
       'Newly Seen Fits',
       'These listings were not in the prior Deal Hunter history and deserve the first look today.',
@@ -657,11 +755,13 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
     title: 'Daily acquisition deal review',
     paragraphs: [
       `Generated ${generatedLabel}. Reviewed ${review.totals?.reviewedDeals || 0} recent deals from ${review.sources?.length || 0} source(s).`,
+      coverageWarnings.length > 0 ? 'Source coverage is intentionally limited. Review the warning below before relying on today\'s totals.' : '',
       'The scoring profile favors essential B2B and field-service companies with recurring or repeat revenue, recession resistance, AI resistance, and financeable acquisition size. Management in place is preferred but not required.',
       crmSync.reviewed ? `CRM sync checked ${crmSync.reviewed} score-75-plus deal(s): ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped.` : '',
     ],
     bodyHtml,
-    details: [
+	    details: [
+      { label: 'CIM approvals', value: String(cimReadyDeals.length) },
       { label: 'High-fit deals', value: String(review.totals?.qualified || 0) },
       { label: 'New fit(s)', value: String(review.totals?.newMatches || 0) },
       { label: 'Watchlist', value: String(review.totals?.watchlist || 0) },
@@ -671,17 +771,25 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
       crmSync.reviewed ? { label: 'CRM updated', value: String(crmSync.updated || 0) } : null,
       { label: 'Lookback', value: `${review.lookbackDays || 0} day(s)` },
     ].filter(Boolean),
+    ctas: [],
   });
   const text = [
     'Daily acquisition deal review',
     '',
     `Generated: ${generatedLabel}`,
     `Reviewed deals: ${review.totals?.reviewedDeals || 0}`,
+    coverageWarnings.length > 0 ? 'LIMITED SOURCE COVERAGE:' : '',
+    ...coverageWarnings.map((warning) => `- ${warning}`),
+    `CIM requests ready for approval: ${cimReadyDeals.length}`,
+    `CIM automation: configured Stage ${automation.configuredStage || 1}, effective Stage ${automation.effectiveStage || 1}${automation.paused ? ', paused' : ''}; ${automationRun.sent || 0} automatically sent; ${automationRun.exceptions?.length || 0} exceptions.`,
+    `Review 75+ scored businesses: ${scoredBusinessesUrl}`,
+    cimReadyDeals.length > 0 ? `Review and send CIM requests: ${approvalUrl}` : '',
     crmSync.reviewed ? `CRM sync: ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped, ${crmSync.failed || 0} failed.` : '',
     '',
 	    'Sources:',
 	    sourceSummary || 'No sources configured.',
 	    '',
+		    ...dealHunterTextSection('CIM requests ready for approval', cimReadyDeals, { limit: emailSectionLimit }),
 		    ...dealHunterTextSection('Newly seen fits', review.newlySeenMatches || [], { limit: emailSectionLimit }),
 		    '',
 		    ...dealHunterTextSection('High-fit deals', review.qualified || [], { limit: emailSectionLimit }),
@@ -695,7 +803,7 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
 			    kind: 'daily-deal-hunter',
 			    idempotencyKey,
 		    to,
-		    subject: `Daily deal review: ${review.totals?.newMatches || 0} new fit, ${review.totals?.removalCandidates || 0} remove`,
+		    subject: `Daily deal review${coverageWarnings.length > 0 ? ' (limited source coverage)' : ''}: ${review.totals?.newMatches || 0} new fit, ${review.totals?.removalCandidates || 0} remove`,
     headline: 'Daily acquisition deal review',
     text,
     html,
@@ -704,6 +812,7 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
       source: 'daily-deal-hunter',
       generatedAt: review.generatedAt || '',
       totals: review.totals || {},
+      cimReadyCount: cimReadyDeals.length,
     },
   };
 }
@@ -712,11 +821,22 @@ export async function sendDailyDealHunterEmail(options) {
   return sendMessage(buildDailyDealHunterEmail(options));
 }
 
-export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = '', cimRequestId = '' } = {}) {
+export function buildDealHunterCimRequestEmail({
+  to,
+  deal = {},
+  requestedBy = '',
+  cimRequestId = '',
+  submissionId = '',
+  communicationId = '',
+} = {}) {
   const config = getConfig();
+  const stage2Automatic = /^automation-stage-(2|3)$/i.test(normalizeText(requestedBy, 160));
+  const stage2PostalAddress = normalizeText(config.dealHunter?.cimAutomation?.physicalPostalAddress, 500);
+  const stage2PurposeDisclosure = 'This is a commercial acquisition-outreach message about a possible purchase of the listed business.';
+  const stage2OptOut = 'To stop acquisition outreach from Uckele Group, reply with “unsubscribe” or “stop”.';
   const businessName = normalizeText(deal.name || 'the listed business', 160);
   const subject = `CIM / NDA request for ${businessName}`;
-  const requester = normalizeText(requestedBy || config.workflow?.defaultAssignee || 'Mathew Uckele', 120);
+  const requester = normalizeText(config.workflow?.defaultAssignee || requestedBy || 'Mathew Uckele', 120);
   const listingUrl = normalizeUrl(deal.listingUrl || '');
   const details = [
     { label: 'Business', value: businessName },
@@ -732,6 +852,8 @@ export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = ''
     'I am prepared to move quickly if the opportunity is a fit. I have acquisition equity available, am working with SBA financing, and can provide proof of funds or lender context upon request.',
     'Could you please send over the CIM or teaser, or let me know the NDA process? If there is a specific process you prefer buyers to follow, I am happy to follow it.',
     'I will treat all materials confidentially.',
+    stage2Automatic ? stage2PurposeDisclosure : null,
+    stage2Automatic ? stage2OptOut : null,
     'Best,',
     requester,
     'Uckele Group',
@@ -750,6 +872,7 @@ export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = ''
     'Could you please send over the CIM or teaser, or let me know the NDA process? If there is a specific process you prefer buyers to follow, I am happy to follow it.',
     '',
     'I will treat all materials confidentially.',
+    ...(stage2Automatic ? ['', stage2PurposeDisclosure, '', stage2OptOut, '', `Postal address: ${stage2PostalAddress}`] : []),
     '',
     'Deal details:',
     ...details.map((item) => `- ${item.label}: ${item.value}`),
@@ -768,9 +891,13 @@ export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = ''
     paragraphs,
     details,
     ctas: listingUrl ? [{ label: 'View Listing', href: listingUrl }] : [],
+    footerNote: stage2Automatic
+      ? escapeHtml(`Postal address: ${stage2PostalAddress}`)
+      : '',
   });
 
   return {
+    communicationId,
     kind: 'deal-hunter-cim-request',
     idempotencyKey: buildCimEmailIdempotencyKey({ requestId: cimRequestId }),
     to,
@@ -784,13 +911,19 @@ export function buildDealHunterCimRequestEmail({ to, deal = {}, requestedBy = ''
     tags: [
       { name: 'source', value: 'deal-hunter-cim-request' },
       { name: 'deal_key', value: normalizeText(deal.dealKey || '', 250) },
+      { name: 'opportunity_id', value: normalizeText(deal.opportunityId || deal.opportunity_id || '', 250) },
       { name: 'cim_request_id', value: normalizeText(cimRequestId, 250) },
+      { name: 'submission_id', value: normalizeText(submissionId, 250) },
+      { name: 'communication_id', value: normalizeText(communicationId, 250) },
     ],
     tracking: {
       source: 'deal-hunter-cim-request',
       dealKey: deal.dealKey || '',
+      opportunityId: deal.opportunityId || deal.opportunity_id || '',
       dealName: businessName,
       cimRequestId,
+      submissionId,
+      communicationId,
       score: deal.score || 0,
       requestedBy,
     },
@@ -866,11 +999,17 @@ function buildCimFollowUpCopy({ businessName, followUpNumber }) {
   };
 }
 
-export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumber = 1, requestedBy = '' } = {}) {
+export function buildDealHunterCimFollowUpEmail({
+  to,
+  request = {},
+  followUpNumber = 1,
+  requestedBy = '',
+  communicationId = '',
+} = {}) {
   const config = getConfig();
   const metadata = request.metadata && typeof request.metadata === 'object' ? request.metadata : {};
   const businessName = normalizeText(request.deal_name || 'the listed business', 160);
-  const requester = normalizeText(requestedBy || request.requested_by || config.workflow?.defaultAssignee || 'Mathew Uckele', 120);
+  const requester = normalizeText(config.workflow?.defaultAssignee || requestedBy || request.requested_by || 'Mathew Uckele', 120);
   const listingUrl = normalizeUrl(request.listing_url || '');
   const copy = buildCimFollowUpCopy({ businessName, followUpNumber });
   const subject = `Re: CIM / NDA request for ${businessName}`;
@@ -911,6 +1050,7 @@ export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumb
   });
 
   return {
+    communicationId,
     kind: 'deal-hunter-cim-follow-up',
     idempotencyKey: buildCimEmailIdempotencyKey({ requestId: request.id, followUpNumber }),
     to,
@@ -924,14 +1064,20 @@ export function buildDealHunterCimFollowUpEmail({ to, request = {}, followUpNumb
     tags: [
       { name: 'source', value: 'deal-hunter-cim-follow-up' },
       { name: 'deal_key', value: normalizeText(request.deal_key || '', 250) },
+      { name: 'opportunity_id', value: normalizeText(request.opportunity_id || '', 250) },
       { name: 'cim_request_id', value: normalizeText(request.id || '', 250) },
+      { name: 'submission_id', value: normalizeText(request.submission_id || '', 250) },
+      { name: 'communication_id', value: normalizeText(communicationId, 250) },
       { name: 'follow_up_number', value: String(followUpNumber) },
     ],
     tracking: {
       source: 'deal-hunter-cim-follow-up',
       dealKey: request.deal_key || '',
+      opportunityId: request.opportunity_id || '',
       dealName: businessName,
       cimRequestId: request.id || '',
+      submissionId: request.submission_id || '',
+      communicationId,
       followUpNumber,
       requestedBy: requester,
     },

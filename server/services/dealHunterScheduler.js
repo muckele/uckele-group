@@ -2,7 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
-import { runDealHunterCimFollowUps, sendDailyDealHunterReview } from './dealHunter.js';
+import { runCimStage2Automation, runDealHunterCimFollowUps, sendDailyDealHunterReview } from './dealHunter.js';
+import { evaluateCimStage2Window, getCimAutomationStatus, getCimStage2Policy } from './cimAutomation.js';
 
 const dailyEmailSource = 'daily-deal-hunter';
 const dailyEmailJobName = 'daily-deal-hunter-email';
@@ -414,6 +415,56 @@ export function startDealHunterCimFollowUpScheduler() {
       if (timer) {
         clearTimeout(timer);
       }
+    },
+  };
+}
+
+export function startDealHunterCimStage2Scheduler({
+  getNow = () => new Date(),
+  runStage2 = runCimStage2Automation,
+  scheduleTimer = setTimeout,
+} = {}) {
+  const config = getConfig();
+  const schedule = config.dealHunter.cimAutomation;
+  if (!schedule.schedulerEnabled) {
+    console.log('[deal-hunter:cim-stage2] scheduler disabled');
+    return { stop() {} };
+  }
+  let stopped = false;
+  let inFlight = false;
+  let timer = null;
+  async function tick() {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      const now = getNow();
+      const status = await getCimAutomationStatus({ now });
+      const mode = ['canary', 'active'].includes(status.activationMode) ? status.activationMode : 'shadow';
+      if (mode !== 'shadow' && !evaluateCimStage2Window(now, getCimStage2Policy(config)).open) return;
+      const result = await runStage2({ mode, triggeredBy: 'stage2-scheduler', now });
+      if (!result.ok && !result.duplicateInvocation) {
+        console.error(`[deal-hunter:cim-stage2] ${mode} run blocked: ${result.error || 'readiness gate failed'}`);
+      }
+    } catch (error) {
+      console.error(`[deal-hunter:cim-stage2] scheduler failed closed: ${error.message}`);
+    } finally {
+      inFlight = false;
+    }
+  }
+  function scheduleNext(delayMs = schedule.schedulerCheckIntervalMs) {
+    timer = scheduleTimer(async () => {
+      await tick();
+      if (!stopped) scheduleNext();
+    }, delayMs);
+    if (timer.unref) timer.unref();
+  }
+  console.log(`[deal-hunter:cim-stage2] scheduler enabled; check interval ${Math.round(schedule.schedulerCheckIntervalMs / 60000)} minute(s)`);
+  scheduleNext(1000);
+  return {
+    tick,
+    stop() {
+      stopped = true;
+      if (timer) clearTimeout(timer);
     },
   };
 }

@@ -99,3 +99,106 @@ test('CIM follow-up run defers weekend work before reading the due queue', async
   assert.equal(queueRead, false);
   assert.match(result.message, /next weekday/i);
 });
+
+test('an out-of-window admin run performs no queue claim and due work remains eligible in the next window', async () => {
+  let queueReads = 0;
+  let claimed = false;
+  const storage = {
+    async listDealHunterCimRequests() {
+      queueReads += 1;
+      return [];
+    },
+    async claimDealHunterCimFollowUpRequest() {
+      claimed = true;
+      throw new Error('an empty synthetic queue must not claim');
+    },
+    async getDealHunterCimSafetySettings() { return null; },
+    async upsertDealHunterCimRequest(request) { return request; },
+  };
+  const settings = { ...weekdaySettings, sendWindowStart: '08:00', sendWindowEnd: '17:00' };
+  const beforeWindow = await runDealHunterCimFollowUps({
+    storage,
+    now: new Date('2026-07-20T14:59:00.000Z'),
+    settings,
+  });
+  assert.equal(beforeWindow.deferred, true);
+  assert.equal(beforeWindow.deferralReason, 'outside-send-window');
+  assert.equal(queueReads, 0);
+  assert.equal(claimed, false);
+
+  const nextWindow = await runDealHunterCimFollowUps({
+    storage,
+    now: new Date('2026-07-20T15:00:00.000Z'),
+    settings,
+  });
+  assert.equal(nextWindow.deferred, undefined);
+  assert.equal(queueReads, 1, 'the unchanged due queue is eligible as soon as the next window opens');
+  assert.equal(claimed, false);
+});
+
+test('global suppression stops a due CIM follow-up before claim, persistence, or provider work', async () => {
+  const request = {
+    id: 'suppressed-cim-request',
+    submission_id: 'suppressed-submission',
+    deal_key: 'suppressed-deal',
+    deal_name: 'Suppressed Deal',
+    recipient_email: 'suppressed@example.test',
+    status: 'sent',
+    request_state: 'provider_accepted',
+    follow_up_state: 'scheduled',
+    follow_up_count: 0,
+    next_follow_up_at: '2026-07-20T15:00:00.000Z',
+    updated_at: '2026-07-18T16:00:00.000Z',
+    metadata: {},
+  };
+  let claimed = false;
+  let stored = request;
+  const storage = {
+    async listDealHunterCimRequests() { return [stored]; },
+    async upsertDealHunterCimRequest(value) { stored = value; return value; },
+    async getSubmission() { return { id: request.submission_id, status: 'review' }; },
+    async getActiveEmailSuppression(email) {
+      assert.equal(email, request.recipient_email);
+      return { id: 'suppression-1', reason: 'complaint', created_at: '2026-07-19T16:00:00.000Z' };
+    },
+    async claimDealHunterCimFollowUpRequest() { claimed = true; throw new Error('must not claim'); },
+    async mutateWithCrmActivity({ operation, payload, activity }) {
+      assert.equal(operation, 'upsert_deal_hunter_cim_request');
+      assert.equal(activity.event_type, 'cim.outreach-suppressed');
+      stored = payload.request;
+      return { applied: true, record: stored, activity };
+    },
+  };
+  const result = await runDealHunterCimFollowUps({
+    storage,
+    now: new Date('2026-07-20T16:00:00.000Z'),
+    settings: weekdaySettings,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.stopped, 1);
+  assert.equal(result.sent, 0);
+  assert.equal(claimed, false);
+  assert.equal(stored.request_state, 'stopped');
+  assert.equal(stored.follow_up_state, 'stopped');
+  assert.equal(stored.next_follow_up_at, null);
+});
+
+test('central CIM outreach pause blocks a follow-up run before reading or claiming the queue', async () => {
+  let queueRead = false;
+  const storage = {
+    async listDealHunterCimRequests() { queueRead = true; return []; },
+    async upsertDealHunterCimRequest(request) { return request; },
+    async getDealHunterCimSafetySettings() {
+      return { id: 'global', outreach_paused: true, metadata: { pauseReason: 'Synthetic containment.' } };
+    },
+  };
+  const result = await runDealHunterCimFollowUps({
+    storage,
+    now: new Date('2026-07-20T16:00:00.000Z'),
+    settings: { ...weekdaySettings, sendWindowStart: '08:00', sendWindowEnd: '17:00' },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 409);
+  assert.match(result.error, /globally paused/i);
+  assert.equal(queueRead, false);
+});

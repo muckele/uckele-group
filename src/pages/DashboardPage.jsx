@@ -1,4 +1,4 @@
-import React, { startTransition, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import React, { lazy, startTransition, Suspense, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { Navigate, NavLink, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   Activity,
@@ -11,7 +11,6 @@ import {
   Gauge,
   Inbox,
   Link2,
-  LogOut,
   MailCheck,
   Plus,
   RefreshCw,
@@ -25,11 +24,29 @@ import PageHero from '../components/PageHero';
 import Reveal from '../components/Reveal';
 import Seo from '../components/Seo';
 import CrmNavigation from '../components/admin/CrmNavigation';
-import DealActivityTimeline from '../components/admin/DealActivityTimeline';
-import OperationsCenter from '../components/admin/OperationsCenter';
-import DealHunterWorkspace from '../components/admin/DealHunterWorkspace';
+import { adminSectionMeta } from '../content/adminSectionMeta';
 
-const statuses = ['new', 'review', 'contacted', 'archived', 'spam'];
+// Each of these renders behind a section gate or the CRM detail view, so the
+// operator only pays for the workspace they opened instead of downloading every
+// workspace with the dashboard shell. AdminOnboarding is split for the same
+// reason: it carries the guided-tour dependency and is never needed for first
+// paint. Navigation, URLs, and render conditions are unchanged.
+const AdminOnboarding = lazy(() => import('../components/admin/AdminOnboarding'));
+const CimRequestHistory = lazy(() => import('../components/admin/CimRequestHistory'));
+const CrmCommunications = lazy(() => import('../components/admin/CrmCommunications'));
+const DealActivityTimeline = lazy(() => import('../components/admin/DealActivityTimeline'));
+const DealHunterTriage = lazy(() => import('../components/admin/DealHunterTriage'));
+const DealHunterWorkspace = lazy(() => import('../components/admin/DealHunterWorkspace'));
+const FollowUpsWorkspace = lazy(() => import('../components/admin/FollowUpsWorkspace'));
+const OperationsCenter = lazy(() => import('../components/admin/OperationsCenter'));
+const UnassignedCommunicationsInbox = lazy(() => import('../components/admin/UnassignedCommunicationsInbox'));
+
+function WorkspaceFallback() {
+  return <div className="panel p-7 text-sm leading-7 text-ink/70">Loading...</div>;
+}
+
+const statuses = ['sourced', 'new', 'review', 'contacted', 'archived', 'spam'];
+const editableStatuses = ['sourced', 'new', 'review', 'contacted', 'spam'];
 const priorities = ['low', 'normal', 'medium', 'high', 'urgent'];
 const followUpStates = ['needs-response', 'scheduled', 'waiting-on-owner', 'completed'];
 const leadTypes = ['prospect', 'seller', 'broker', 'referral', 'advisor', 'other'];
@@ -68,6 +85,18 @@ const acquisitionPassReasons = [
   'seller-financing-gap',
   'other',
 ];
+const archiveLeadReasons = [
+  'not-a-fit',
+  'unavailable',
+  'duplicate',
+  'broker-declined',
+  'valuation',
+  'geography',
+  'timing',
+  'financing',
+  'other',
+];
+const restoreLeadStatuses = ['sourced', 'new', 'review', 'contacted'];
 const diligenceChecklistItems = [
   { id: 'cim', label: 'CIM / teaser' },
   { id: 'nda', label: 'NDA' },
@@ -107,6 +136,18 @@ const defaultCrmFilters = {
   pageSize: 25,
   sort: 'created_at',
   direction: 'desc',
+};
+
+const defaultCimHistoryQuery = {
+  search: '',
+  requestState: 'all',
+  deliveryState: 'all',
+  replyState: 'all',
+  followUpState: 'all',
+  sort: 'first_requested_at',
+  direction: 'desc',
+  page: 1,
+  pageSize: 25,
 };
 
 export function crmFiltersFromSearch(search = '') {
@@ -223,6 +264,71 @@ function submissionDealScore(submission = {}) {
 
 function submissionListingDate(submission = {}) {
   return submission.metadata?.dealHunter?.dateAdded || submission.metadata?.dealHunter?.firstSeenAt || '';
+}
+
+function formatSourceCalendarDate(value) {
+  const normalized = String(value || '').trim();
+  const calendarDate = normalized.match(/^(\d{4})-(\d{2})-(\d{2})/)?.slice(1);
+
+  if (calendarDate) {
+    const [year, month, day] = calendarDate.map(Number);
+    const date = new Date(Date.UTC(year, month - 1, day));
+
+    if (!Number.isNaN(date.getTime())) {
+      return date.toLocaleDateString(undefined, {
+        year: 'numeric',
+        month: 'numeric',
+        day: 'numeric',
+        timeZone: 'UTC',
+      });
+    }
+  }
+
+  return formatDateTime(value);
+}
+
+function dealHunterRawField(raw = {}, aliases = []) {
+  const values = new Map(Object.entries(raw || {}).map(([key, value]) => [
+    String(key).toLowerCase().replace(/[^a-z0-9]/g, ''),
+    value,
+  ]));
+
+  for (const alias of aliases) {
+    const value = values.get(String(alias).toLowerCase().replace(/[^a-z0-9]/g, ''));
+    if (String(value || '').trim()) return String(value).trim();
+  }
+
+  return '';
+}
+
+export function crmBrokerContactDetails(submission = {}) {
+  const dealHunter = submission.metadata?.dealHunter || {};
+  const raw = dealHunter.raw || {};
+
+  return {
+    broker: dealHunter.brokerName
+      || dealHunterRawField(raw, ['Broker Name', 'Broker'])
+      || submission.broker_name
+      || '',
+    company: dealHunter.brokerCompany
+      || dealHunterRawField(raw, ['Broker Company'])
+      || '',
+    contact: dealHunter.brokerContact
+      || dealHunterRawField(raw, ['Broker Contact'])
+      || submission.broker_phone
+      || '',
+    email: dealHunter.brokerEmail
+      || dealHunterRawField(raw, ['Broker Email'])
+      || submission.broker_email
+      || '',
+  };
+}
+
+export function crmDateAdded(submission = {}) {
+  const sourceDate = submission.metadata?.dealHunter?.dateAdded || '';
+  return sourceDate
+    ? { value: sourceDate, formatted: formatSourceCalendarDate(sourceDate), source: 'daily-deal-update' }
+    : { value: submission.created_at || '', formatted: formatDateTime(submission.created_at), source: 'crm' };
 }
 
 function pluralize(count, label) {
@@ -580,6 +686,16 @@ function SectionLabel({ children }) {
   return <p className="text-xs font-semibold uppercase leading-5 tracking-[0.14em] text-moss sm:text-sm sm:tracking-[0.18em]">{children}</p>;
 }
 
+function AdminFormSection({ title, description, children, tourTarget = '' }) {
+  return (
+    <fieldset className="rounded-2xl border border-line/80 bg-fog/45 p-4 sm:p-6" data-admin-tour={tourTarget || undefined}>
+      <legend className="px-2 text-lg font-semibold text-ink">{title}</legend>
+      {description ? <p className="mb-5 text-sm leading-6 text-ink/62">{description}</p> : null}
+      <div className="space-y-5">{children}</div>
+    </fieldset>
+  );
+}
+
 function getCimReadyDealsFromReview(review, limit = 25) {
   const seen = new Set();
   const readyDeals = [];
@@ -608,15 +724,25 @@ function getCimReadyDealsFromReview(review, limit = 25) {
   return readyDeals;
 }
 
+function getDealHunterDealFromReview(review, dealKey) {
+  const sections = [
+    ...(review?.qualified || []),
+    ...(review?.newlySeenMatches || []),
+    ...(review?.watchlist || []),
+    ...(review?.removalCandidates || []),
+  ];
+  return sections.find((deal) => deal?.dealKey === dealKey) || null;
+}
+
 function getCimSnapshotToken(deal = {}) {
   return deal.cimRequest?.snapshotToken || '';
 }
 
 function AdminSectionNav({ activeSection, isReadOnly }) {
-  const visibleSections = adminSections.filter((section) => !isReadOnly || !['new-record', 'operations'].includes(section.id));
+  const visibleSections = adminSections.filter((section) => !isReadOnly || section.id !== 'new-record');
 
   return (
-    <aside className="admin-section-nav">
+    <aside className="admin-section-nav" data-admin-tour="section-navigation">
       <nav className="admin-section-nav-card">
         <div className="hidden px-2 pb-2 pt-1 md:block">
           <p className="text-[11px] font-semibold uppercase tracking-normal text-moss/75">Admin</p>
@@ -671,11 +797,12 @@ function InputField({ label, value, onChange, placeholder = '', type = 'text' })
   );
 }
 
-function SelectField({ label, value, onChange, options }) {
+function SelectField({ label, value, onChange, options, disabled = false }) {
   return (
     <Field label={label}>
       <select
         className="form-control"
+        disabled={disabled}
         onChange={onChange}
         value={value}
       >
@@ -702,7 +829,7 @@ function TextAreaField({ label, value, onChange, placeholder = '' }) {
   );
 }
 
-function LinksRow({ submission }) {
+function LinksRow({ submission, compact = false }) {
   const listingHref = safeExternalHref(submission.listing_url);
   const websiteHref = safeExternalHref(submission.business_website);
   const prospectusHref = safeExternalHref(submission.prospectus_url);
@@ -713,14 +840,14 @@ function LinksRow({ submission }) {
   ].filter(Boolean);
 
   if (links.length === 0) {
-    return <p className="mt-4 text-sm leading-7 text-ink/68">No listing or company links added yet.</p>;
+    return <p className={`${compact ? 'mt-1' : 'mt-4'} text-sm leading-7 text-ink/68`}>{compact ? 'No links added' : 'No listing or company links added yet.'}</p>;
   }
 
   return (
-    <div className="mt-4 flex flex-wrap gap-3">
+    <div className={`${compact ? 'mt-1.5 gap-2' : 'mt-4 gap-3'} flex flex-wrap`}>
       {links.map((link) => (
         <a
-          className="inline-flex items-center justify-center rounded-full border border-ink/10 bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-moss/25 hover:text-moss"
+          className={`inline-flex items-center justify-center rounded-full border border-ink/10 bg-white text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss ${compact ? 'px-3 py-1.5' : 'px-4 py-2 uppercase tracking-[0.14em]'}`}
           href={link.href}
           key={link.label}
           rel="noreferrer"
@@ -730,6 +857,260 @@ function LinksRow({ submission }) {
         </a>
       ))}
     </div>
+  );
+}
+
+export function LeadLifecycleControls({
+  submission,
+  communications = [],
+  compact = false,
+  pending = false,
+  readOnly = false,
+  onArchive,
+  onRestore,
+}) {
+  const [mode, setMode] = useState('');
+  const [archiveDraft, setArchiveDraft] = useState({ reason: '', note: '', communicationId: '' });
+  const [restoreStatus, setRestoreStatus] = useState('review');
+  const [localError, setLocalError] = useState('');
+  const archived = submission?.status === 'archived';
+  const archiveReason = submission?.archive_reason || submission?.metadata?.leadArchive?.reason || '';
+  const archivedAt = submission?.archived_at || submission?.metadata?.leadArchive?.archivedAt || '';
+  const communicationOptions = communications
+    .map((communication) => ({
+      id: String(communication?.id || communication?.communication_id || ''),
+      label: communication?.subject || `${formatLabel(communication?.channel || 'communication')} · ${formatDateTime(communication?.occurred_at || communication?.occurredAt)}`,
+    }))
+    .filter((communication) => communication.id);
+
+  async function submitArchive(event) {
+    event.preventDefault();
+    setLocalError('');
+    if (!archiveDraft.reason) {
+      setLocalError('Select an archive disposition reason.');
+      return;
+    }
+    try {
+      await onArchive(submission, archiveDraft);
+      setArchiveDraft({ reason: '', note: '', communicationId: '' });
+      setMode('');
+    } catch (error) {
+      setLocalError(error?.message || 'Unable to archive this lead.');
+    }
+  }
+
+  async function submitRestore(event) {
+    event.preventDefault();
+    setLocalError('');
+    try {
+      await onRestore(submission, { status: restoreStatus });
+      setRestoreStatus('review');
+      setMode('');
+    } catch (error) {
+      setLocalError(error?.message || 'Unable to restore this lead.');
+    }
+  }
+
+  return (
+    <div className={`${compact ? 'mt-5 border-t border-line/75 pt-4' : 'mt-6 rounded-2xl border border-amber-200 bg-amber-50/60 p-4 sm:p-5'}`} data-lead-lifecycle-controls>
+      {archived ? (
+        <div className="text-sm leading-6 text-ink/70">
+          <p className="font-semibold text-ink">Archived lead</p>
+          <p>{archiveReason ? `Disposition: ${formatLabel(archiveReason)}` : 'No disposition was recorded.'}{archivedAt ? ` · ${formatDateTime(archivedAt)}` : ''}</p>
+          {submission.archive_note ? <p className="mt-1 whitespace-pre-wrap">{submission.archive_note}</p> : null}
+        </div>
+      ) : (
+        <div className="text-sm leading-6 text-ink/70">
+          <p className="font-semibold text-ink">Lead lifecycle</p>
+          {!compact ? <p>Archive keeps the record and audit history while stopping follow-up work. Permanent delete remains separate below.</p> : null}
+        </div>
+      )}
+
+      {!readOnly && archived && typeof onRestore === 'function' && mode !== 'restore' ? (
+        <button className={`${secondaryActionButtonClass} mt-3`} disabled={pending} onClick={() => { setMode('restore'); setLocalError(''); }} type="button">Restore Lead</button>
+      ) : null}
+      {!readOnly && !archived && typeof onArchive === 'function' && mode !== 'archive' ? (
+        <button className="mt-3 inline-flex min-h-[44px] w-full items-center justify-center rounded-full border border-amber-300 bg-white px-4 py-2.5 text-sm font-semibold text-amber-900 disabled:opacity-50 sm:w-auto" disabled={pending} onClick={() => { setMode('archive'); setLocalError(''); }} type="button">Archive Lead</button>
+      ) : null}
+
+      {mode === 'archive' && !readOnly ? (
+        <form className="mt-4 grid gap-4" onSubmit={submitArchive}>
+          <label className="text-sm font-semibold text-ink">Disposition reason<select className="form-control mt-2" disabled={pending} onChange={(event) => setArchiveDraft((current) => ({ ...current, reason: event.target.value }))} required value={archiveDraft.reason}><option value="">Select a reason</option>{archiveLeadReasons.map((reason) => <option key={reason} value={reason}>{formatLabel(reason)}</option>)}</select></label>
+          <label className="text-sm font-semibold text-ink">Archive note (optional)<textarea className="form-control mt-2 min-h-24" disabled={pending} maxLength={2000} onChange={(event) => setArchiveDraft((current) => ({ ...current, note: event.target.value }))} value={archiveDraft.note} /></label>
+          {communicationOptions.length > 0 ? <label className="text-sm font-semibold text-ink">Triggering communication (optional)<select className="form-control mt-2" disabled={pending} onChange={(event) => setArchiveDraft((current) => ({ ...current, communicationId: event.target.value }))} value={archiveDraft.communicationId}><option value="">No linked communication</option>{communicationOptions.map((communication) => <option key={communication.id} value={communication.id}>{communication.label}</option>)}</select></label> : null}
+          {localError ? <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert">{localError}</p> : null}
+          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+            <button className="inline-flex min-h-[44px] items-center justify-center rounded-full border border-amber-400 bg-amber-100 px-5 py-2.5 text-sm font-semibold text-amber-950 disabled:opacity-50" disabled={pending} type="submit">{pending ? 'Archiving…' : 'Confirm Archive'}</button>
+            <button className={secondaryActionButtonClass} disabled={pending} onClick={() => setMode('')} type="button">Cancel</button>
+          </div>
+        </form>
+      ) : null}
+
+      {mode === 'restore' && !readOnly ? (
+        <form className="mt-4 grid gap-4" onSubmit={submitRestore}>
+          <label className="text-sm font-semibold text-ink">Restore status<select className="form-control mt-2" disabled={pending} onChange={(event) => setRestoreStatus(event.target.value)} value={restoreStatus}>{restoreLeadStatuses.map((status) => <option key={status} value={status}>{formatLabel(status)}</option>)}</select></label>
+          <p className="text-sm leading-6 text-ink/70">Restoring does not restart outreach or schedule a next action.</p>
+          {localError ? <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert">{localError}</p> : null}
+          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+            <button className={primaryActionButtonClass} disabled={pending} type="submit">{pending ? 'Restoring…' : 'Confirm Restore'}</button>
+            <button className={secondaryActionButtonClass} disabled={pending} onClick={() => setMode('')} type="button">Cancel</button>
+          </div>
+        </form>
+      ) : null}
+    </div>
+  );
+}
+
+export function CorrectedRecipientRetryForm({ request, error = '', pending = false, onCancel, onRetry }) {
+  const [recipient, setRecipient] = useState('');
+  const [confirmed, setConfirmed] = useState(false);
+  const [overrideReason, setOverrideReason] = useState('');
+  const [localError, setLocalError] = useState('');
+  const originalRecipient = String(request?.recipient_email || request?.recipientEmail || '').trim().toLowerCase();
+  const signedContacts = (Array.isArray(request?.metadata?.brokerContacts) ? request.metadata.brokerContacts : [])
+    .map((contact) => ({ name: contact?.name || '', email: String(contact?.email || '').trim().toLowerCase() }))
+    .filter((contact) => contact.email && contact.email !== originalRecipient);
+
+  async function handleSubmit(event) {
+    event.preventDefault();
+    setLocalError('');
+    const normalizedRecipient = recipient.trim().toLowerCase();
+    const selectedFromSignedSnapshot = signedContacts.some((contact) => contact.email === normalizedRecipient);
+    if (!normalizedRecipient || normalizedRecipient === originalRecipient) {
+      setLocalError('Enter a corrected recipient that differs from the failed address.');
+      return;
+    }
+    if (!selectedFromSignedSnapshot && (!confirmed || overrideReason.trim().length < 5)) {
+      setLocalError('A manually entered address requires confirmation and an override reason of at least five characters.');
+      return;
+    }
+    try {
+      await onRetry({
+        newRecipientEmail: normalizedRecipient,
+        confirmed: selectedFromSignedSnapshot ? false : confirmed,
+        overrideReason: selectedFromSignedSnapshot ? '' : overrideReason.trim(),
+      });
+    } catch (retryError) {
+      setLocalError(retryError?.message || 'Unable to retry this CIM request.');
+    }
+  }
+
+  return (
+    <form className="rounded-2xl border border-red-200 bg-red-50/70 p-4 sm:p-6" onSubmit={handleSubmit}>
+      <p className="text-xs font-semibold uppercase tracking-[0.16em] text-red-700">Corrected-recipient workflow</p>
+      <h3 className="mt-2 text-xl font-semibold text-ink">Retry CIM request safely</h3>
+      <p className="mt-2 text-sm leading-6 text-ink/70">Failed recipient: {originalRecipient || 'Not recorded'}. An accepted request to another contact still blocks duplicate first contact.</p>
+      <label className="mt-4 block text-sm font-semibold text-ink">Corrected recipient email<input className="form-control mt-2" disabled={pending} list="corrected-cim-recipient-options" maxLength={320} onChange={(event) => setRecipient(event.target.value)} required type="email" value={recipient} /></label>
+      {signedContacts.length > 0 ? <datalist id="corrected-cim-recipient-options">{signedContacts.map((contact) => <option key={contact.email} value={contact.email}>{contact.name}</option>)}</datalist> : null}
+      <label className="mt-4 block text-sm font-semibold text-ink">Override reason<textarea className="form-control mt-2 min-h-24" disabled={pending} maxLength={500} onChange={(event) => setOverrideReason(event.target.value)} placeholder="Required when the address is not from the signed broker-contact snapshot" value={overrideReason} /></label>
+      <label className="mt-4 flex items-start gap-3 text-sm leading-6 text-ink/75"><input checked={confirmed} className="mt-1 h-4 w-4 accent-moss" disabled={pending} onChange={(event) => setConfirmed(event.target.checked)} type="checkbox" /><span>I confirm this manually entered address is the corrected broker recipient.</span></label>
+      {localError || error ? <p className="mt-4 rounded-xl border border-red-200 bg-white px-4 py-3 text-sm text-red-700" role="alert">{localError || error}</p> : null}
+      <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+        <button className="inline-flex min-h-[46px] items-center justify-center rounded-full border border-red-300 bg-red-100 px-5 py-3 text-sm font-semibold text-red-800 disabled:opacity-50" disabled={pending} type="submit">{pending ? 'Retrying…' : 'Retry CIM Request'}</button>
+        <button className={secondaryActionButtonClass} disabled={pending} onClick={onCancel} type="button">Cancel</button>
+      </div>
+    </form>
+  );
+}
+
+export function CrmRecordCard({ submission, detailHref, lifecyclePending = false, onArchiveLead, onRestoreLead, readOnly = false }) {
+  const dealScore = submissionDealScore(submission);
+  const dateAdded = crmDateAdded(submission);
+  const contactName = submission.broker_name || submission.seller_name || submission.name || 'No contact named';
+  const contactEmail = submission.broker_email || submission.seller_email || submission.email || '';
+  const nextActionAt = submission.next_action_at ? new Date(submission.next_action_at) : null;
+  const nextActionIsOverdue = submission.follow_up_state !== 'completed'
+    && nextActionAt
+    && !Number.isNaN(nextActionAt.getTime())
+    && nextActionAt.getTime() < Date.now();
+  const followUpPrompt = submission.follow_up_prompt;
+  const financials = [
+    { label: 'Asking price', value: submission.asking_price || 'Not set' },
+    { label: 'TTM revenue', value: submission.ttm_revenue || 'Not set' },
+    { label: 'TTM EBITDA', value: submission.ttm_ebitda || 'Not set' },
+    { label: 'Multiple', value: submission.ebitda_multiple || 'Not set' },
+  ];
+
+  return (
+    <article className="admin-crm-record-summary">
+      <div className="flex min-w-0 flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <Pill tone={submission.status === 'spam' ? 'danger' : submission.status === 'contacted' ? 'success' : 'status'}>
+              {formatLabel(submission.status)}
+            </Pill>
+            <Pill tone={submission.priority === 'urgent' || submission.priority === 'high' ? 'warning' : 'default'}>
+              {formatLabel(submission.priority)} priority
+            </Pill>
+            {dealScore !== null ? <Pill tone={dealScoreTone(dealScore)}>Score {dealScore}</Pill> : null}
+            {followUpPrompt ? (
+              <Pill tone={followUpPrompt.severity === 'danger' ? 'danger' : followUpPrompt.severity === 'warning' ? 'warning' : 'info'}>
+                {formatLabel(followUpPrompt.kind)}
+              </Pill>
+            ) : null}
+          </div>
+
+          <h2 className="mt-3 text-xl font-semibold leading-tight text-ink sm:text-2xl">
+            {submission.company || submission.name || 'Untitled record'}
+          </h2>
+          <div className="mt-3 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm leading-6 text-ink/68">
+            <span>{formatLabel(submission.lead_type || 'prospect')}</span>
+            <span>Added {dateAdded.formatted}</span>
+            <span>Owner: {submission.assigned_to || 'Unassigned'}</span>
+          </div>
+        </div>
+
+        <NavLink className={`${primaryActionButtonClass} shrink-0`} to={detailHref}>
+          Open record
+          <Target className="h-4 w-4" aria-hidden="true" />
+        </NavLink>
+      </div>
+
+      <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        {financials.map((item) => (
+          <div className="rounded-xl border border-line/75 bg-fog/60 px-4 py-3" key={item.label}>
+            <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-moss/72">{item.label}</p>
+            <p className="mt-1.5 font-semibold text-ink">{item.value}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-5 grid gap-4 border-t border-line/75 pt-5 md:grid-cols-3">
+        <div className="min-w-0">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-moss/72">Primary contact</p>
+          <p className="mt-1.5 truncate text-sm font-semibold text-ink">{contactName}</p>
+          {contactEmail ? (
+            <a className="mt-1 block truncate text-sm text-moss underline decoration-moss/30 underline-offset-2" href={`mailto:${contactEmail}`}>
+              {contactEmail}
+            </a>
+          ) : (
+            <p className="mt-1 text-sm text-ink/55">No email added</p>
+          )}
+        </div>
+
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-moss/72">Next action</p>
+          <p className={`mt-1.5 text-sm font-semibold ${nextActionIsOverdue ? 'text-red-700' : 'text-ink'}`}>
+            {formatDateTime(submission.next_action_at)}
+          </p>
+          <p className="mt-1 text-sm text-ink/55">{formatLabel(submission.follow_up_state || 'needs-response')}</p>
+        </div>
+
+        <div className="min-w-0">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-moss/72">Quick links</p>
+          <LinksRow compact submission={submission} />
+        </div>
+      </div>
+
+      <LeadLifecycleControls
+        compact
+        onArchive={onArchiveLead}
+        onRestore={onRestoreLead}
+        pending={lifecyclePending}
+        readOnly={readOnly}
+        submission={submission}
+      />
+    </article>
   );
 }
 
@@ -802,7 +1183,7 @@ function CommandCenterRecordCard({ record, updating, onUpdate, readOnly = false 
 
       {record.passReason ? (
         <p className="mt-4 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 font-medium text-red-700">
-          Passed: {formatPassReason(record.passReason)}
+          Passed & archived: {formatPassReason(record.passReason)}
         </p>
       ) : null}
 
@@ -850,7 +1231,7 @@ function CommandCenterRecordCard({ record, updating, onUpdate, readOnly = false 
           </div>
 
           <div className="mt-4">
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss">Quick pass</p>
+            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-moss">Pass &amp; Archive</p>
             <div className="mt-2 flex flex-wrap gap-2">
               {acquisitionPassReasons.map((reason) => (
                 <button
@@ -925,6 +1306,7 @@ export default function DashboardPage() {
   const [loginForm, setLoginForm] = useState({ username: '', password: '' });
   const [loginError, setLoginError] = useState('');
   const [loginPending, setLoginPending] = useState(false);
+  const [logoutEverywherePending, setLogoutEverywherePending] = useState(false);
   const [filters, setFilters] = useState(() => crmFiltersFromSearch(window.location.search));
   const [dashboardData, setDashboardData] = useState({
     summary: null,
@@ -937,12 +1319,24 @@ export default function DashboardPage() {
     totalPages: 1,
   });
   const [followUpData, setFollowUpData] = useState({ summary: null, notifications: [], emailTriage: [], total: 0 });
-  const [followUpError, setFollowUpError] = useState('');
-  const [followUpLoading, setFollowUpLoading] = useState(false);
+  const [, setFollowUpError] = useState('');
+  const [, setFollowUpLoading] = useState(false);
   const [drafts, setDrafts] = useState({});
   const [loading, setLoading] = useState(false);
   const [actionError, setActionError] = useState('');
   const [dealActivity, setDealActivity] = useState({ events: [], loading: false, error: '' });
+  const [crmCommunications, setCrmCommunications] = useState({
+    rows: [],
+    total: 0,
+    page: 1,
+    pageSize: 25,
+    loading: false,
+    loadingMore: false,
+    error: '',
+    logPending: false,
+    logError: '',
+  });
+  const [leadLifecyclePendingId, setLeadLifecyclePendingId] = useState('');
   const [savingSubmissionId, setSavingSubmissionId] = useState('');
   const [creatingUploadForId, setCreatingUploadForId] = useState('');
   const [deletingSubmissionId, setDeletingSubmissionId] = useState('');
@@ -950,13 +1344,32 @@ export default function DashboardPage() {
   const [createPending, setCreatePending] = useState(false);
   const [createError, setCreateError] = useState('');
   const [dealHunterReview, setDealHunterReview] = useState(null);
+  const [dealHunterImportSummary, setDealHunterImportSummary] = useState(null);
   const [dealHunterLoading, setDealHunterLoading] = useState(false);
+  const [dealOsImporting, setDealOsImporting] = useState(false);
+  const [dealHunterCrmSyncing, setDealHunterCrmSyncing] = useState(false);
+  const [dealHunterReconciliation, setDealHunterReconciliation] = useState({ preview: null, busy: false });
   const [dealHunterSending, setDealHunterSending] = useState(false);
   const [dealHunterBulkCimSending, setDealHunterBulkCimSending] = useState(false);
   const [dealHunterFollowUpRunning, setDealHunterFollowUpRunning] = useState(false);
   const [emailTestSending, setEmailTestSending] = useState(false);
   const [requestingCimDealKey, setRequestingCimDealKey] = useState('');
+  const [dismissingDealKey, setDismissingDealKey] = useState('');
   const [dealHunterFeedback, setDealHunterFeedback] = useState({ error: '', message: '' });
+  const [cimHistoryQuery, setCimHistoryQuery] = useState(defaultCimHistoryQuery);
+  const [cimHistory, setCimHistory] = useState({ rows: [], counts: {}, total: 0, totalPages: 1, loading: false, error: '' });
+  const [correctedRecipientRequest, setCorrectedRecipientRequest] = useState(null);
+  const [correctedRecipientRetry, setCorrectedRecipientRetry] = useState({ requestId: '', pending: false, error: '' });
+  const [unassignedCommunications, setUnassignedCommunications] = useState({
+    rows: [],
+    total: 0,
+    page: 1,
+    pageSize: 25,
+    loading: false,
+    loadingMore: false,
+    error: '',
+    assigningId: '',
+  });
   const [commandCenter, setCommandCenter] = useState(null);
   const [commandCenterLoading, setCommandCenterLoading] = useState(false);
   const [commandCenterUpdatingId, setCommandCenterUpdatingId] = useState('');
@@ -964,16 +1377,28 @@ export default function DashboardPage() {
   const [operations, setOperations] = useState(null);
   const [operationsLoading, setOperationsLoading] = useState(false);
   const [operationsError, setOperationsError] = useState('');
+  const [cimAutomationUpdating, setCimAutomationUpdating] = useState(false);
+  const [cimOutreachUpdating, setCimOutreachUpdating] = useState(false);
+  const [cimStage2Updating, setCimStage2Updating] = useState(false);
   const dashboardRequestRef = useRef({ controller: null, id: 0 });
   const followUpRequestRef = useRef({ controller: null, id: 0 });
+  const crmCommunicationsRequestRef = useRef({ controller: null, id: 0 });
+  const cimHistoryRequestRef = useRef({ controller: null, id: 0 });
+  const unassignedCommunicationsRequestRef = useRef({ controller: null, id: 0 });
+  const dealHunterAutoReviewAttemptedRef = useRef(false);
   const deferredSearch = useDeferredValue(filters.search);
+  const deferredCimHistorySearch = useDeferredValue(cimHistoryQuery.search);
   const isReadOnly = authState.role === 'viewer';
-  const requestedFollowUpView = new URLSearchParams(location.search).get('view');
-  const followUpView = ['action-items', 'overdue', 'due-soon', 'warm-leads'].includes(requestedFollowUpView)
-    ? requestedFollowUpView
-    : 'all';
+  const requestedDealHunterView = new URLSearchParams(location.search).get('view');
   const crmListSearch = crmSearchFromFilters(filters);
   const crmListHref = `/admin/crm${crmListSearch ? `?${crmListSearch}` : ''}`;
+  const pageMeta = adminSectionMeta[isCrmDetailView ? 'crm-detail' : activeSection] || adminSectionMeta.overview;
+  const onboardingScope = isCrmDetailView ? 'crm-detail' : activeSection === 'crm' ? 'crm-index' : activeSection;
+  const showNewRecordAction = !isReadOnly
+    && !isCrmDetailView
+    && ['overview', 'crm', 'command-center', 'deal-hunter', 'follow-ups'].includes(activeSection);
+  const showExportAction = !isReadOnly && !isCrmDetailView && ['overview', 'crm'].includes(activeSection);
+  const showDailyUpdateAction = !isCrmDetailView && ['overview', 'command-center', 'deal-hunter'].includes(activeSection);
 
   async function checkSession() {
     setAuthBootstrapError('');
@@ -1194,6 +1619,163 @@ export default function DashboardPage() {
     }
   }
 
+  async function loadCrmCommunications(id, { append = false } = {}) {
+    const requestId = crmCommunicationsRequestRef.current.id + 1;
+    const controller = new AbortController();
+    const page = append ? Math.max(1, Number(crmCommunications.page) || 1) + 1 : 1;
+    const pageSize = Math.max(1, Math.min(Number(crmCommunications.pageSize) || 25, 100));
+
+    crmCommunicationsRequestRef.current.controller?.abort();
+    crmCommunicationsRequestRef.current = { controller, id: requestId };
+    setCrmCommunications((current) => ({
+      ...current,
+      loading: append ? current.loading : true,
+      loadingMore: append,
+      error: '',
+    }));
+
+    try {
+      const query = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+      const response = await fetch(`/api/admin/submissions/${encodeURIComponent(id)}/communications?${query.toString()}`, {
+        credentials: 'same-origin',
+        signal: controller.signal,
+      });
+      const result = await response.json();
+
+      if (response.status === 401) {
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
+        return;
+      }
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to load CRM communications.');
+      }
+
+      const rows = Array.isArray(result.rows) ? result.rows : Array.isArray(result.communications) ? result.communications : [];
+      setCrmCommunications((current) => ({
+        ...current,
+        rows: append ? [...current.rows, ...rows] : rows,
+        total: Math.max(0, Number(result.total) || rows.length),
+        page: Math.max(1, Number(result.page) || page),
+        pageSize: Math.max(1, Number(result.pageSize) || pageSize),
+        error: '',
+      }));
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        setCrmCommunications((current) => ({ ...current, error: error.message || 'Unable to load CRM communications.' }));
+      }
+    } finally {
+      if (crmCommunicationsRequestRef.current.id === requestId) {
+        setCrmCommunications((current) => ({ ...current, loading: false, loadingMore: false }));
+      }
+    }
+  }
+
+  async function loadCimRequestHistory(queryInput = cimHistoryQuery) {
+    const requestId = cimHistoryRequestRef.current.id + 1;
+    const controller = new AbortController();
+    const query = { ...defaultCimHistoryQuery, ...queryInput };
+    const params = new URLSearchParams({
+      page: String(query.page),
+      pageSize: String(query.pageSize),
+      sort: query.sort,
+      direction: query.direction,
+    });
+    if (query.search) {
+      params.set('search', query.search);
+    }
+    if (query.requestState !== 'all') params.set('requestState', query.requestState);
+    if (query.deliveryState !== 'all') params.set('deliveryState', query.deliveryState);
+    if (query.replyState !== 'all') params.set('replyState', query.replyState);
+    if (query.followUpState !== 'all') params.set('followUpState', query.followUpState);
+
+    cimHistoryRequestRef.current.controller?.abort();
+    cimHistoryRequestRef.current = { controller, id: requestId };
+    setCimHistory((current) => ({ ...current, loading: true, error: '' }));
+
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/cim-requests?${params.toString()}`, {
+        credentials: 'same-origin',
+        signal: controller.signal,
+      });
+      const result = await response.json();
+      if (response.status === 401) {
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
+        return;
+      }
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to load CIM request history.');
+      }
+      const rows = Array.isArray(result.rows) ? result.rows : Array.isArray(result.requests) ? result.requests : [];
+      const total = Math.max(0, Number(result.total) || rows.length);
+      const pageSize = Math.max(1, Number(result.pageSize) || Number(query.pageSize) || 25);
+      setCimHistory({
+        rows,
+        counts: result.counts || result.summary || {},
+        total,
+        totalPages: Math.max(1, Number(result.totalPages) || Math.ceil(total / pageSize) || 1),
+        loading: false,
+        error: '',
+      });
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        setCimHistory((current) => ({ ...current, loading: false, error: error.message || 'Unable to load CIM request history.' }));
+      }
+    } finally {
+      if (cimHistoryRequestRef.current.id === requestId) {
+        setCimHistory((current) => ({ ...current, loading: false }));
+      }
+    }
+  }
+
+  async function loadUnassignedCommunications({ append = false } = {}) {
+    const requestId = unassignedCommunicationsRequestRef.current.id + 1;
+    const controller = new AbortController();
+    const page = append ? Math.max(1, Number(unassignedCommunications.page) || 1) + 1 : 1;
+    const pageSize = Math.max(1, Math.min(Number(unassignedCommunications.pageSize) || 25, 100));
+
+    unassignedCommunicationsRequestRef.current.controller?.abort();
+    unassignedCommunicationsRequestRef.current = { controller, id: requestId };
+    setUnassignedCommunications((current) => ({
+      ...current,
+      loading: append ? current.loading : true,
+      loadingMore: append,
+      error: '',
+    }));
+
+    try {
+      const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+      const response = await fetch(`/api/admin/communications/unassigned?${params.toString()}`, {
+        credentials: 'same-origin',
+        signal: controller.signal,
+      });
+      const result = await response.json();
+      if (response.status === 401) {
+        setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
+        return;
+      }
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to load unassigned communications.');
+      }
+      const rows = Array.isArray(result.rows) ? result.rows : Array.isArray(result.communications) ? result.communications : [];
+      setUnassignedCommunications((current) => ({
+        ...current,
+        rows: append ? [...current.rows, ...rows] : rows,
+        total: Math.max(0, Number(result.total) || rows.length),
+        page: Math.max(1, Number(result.page) || page),
+        pageSize: Math.max(1, Number(result.pageSize) || pageSize),
+        error: '',
+      }));
+    } catch (error) {
+      if (error.name !== 'AbortError') {
+        setUnassignedCommunications((current) => ({ ...current, error: error.message || 'Unable to load unassigned communications.' }));
+      }
+    } finally {
+      if (unassignedCommunicationsRequestRef.current.id === requestId) {
+        setUnassignedCommunications((current) => ({ ...current, loading: false, loadingMore: false }));
+      }
+    }
+  }
+
   function refreshCurrentCrmView(options = {}) {
     return isCrmDetailView
       ? loadSubmissionDetail(submissionId, options)
@@ -1303,6 +1885,91 @@ export default function DashboardPage() {
     }
   }
 
+  async function handleToggleCimAutomation(paused) {
+    if (!paused && !window.confirm(
+      'Clear only the Stage 2 automation emergency pause? This does not activate Stage 2, and every evidence, activation, source, window, cap, suppression, and final-boundary gate must still pass.',
+    )) return;
+    setCimAutomationUpdating(true);
+    setOperationsError('');
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-automation/pause', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          paused,
+          reason: paused
+            ? 'Emergency Stage 2 automation pause enabled from Operations.'
+            : 'Stage 2 automation pause cleared from Operations after the authenticated operator confirmed every independent gate remains authoritative.',
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to update CIM automation.');
+      setOperations((current) => current ? { ...current, cimAutomation: result.automation } : current);
+    } catch (error) {
+      setOperationsError(error.message || 'Unable to update CIM automation.');
+    } finally {
+      setCimAutomationUpdating(false);
+    }
+  }
+
+  async function handleToggleCimOutreach(paused) {
+    if (!window.confirm(paused
+      ? 'Pause every Deal Hunter CIM initial and follow-up email? Inbound tracking will remain active.'
+      : 'Resume Deal Hunter CIM outreach after confirming migrations, audit, caps, and send-window readiness?')) return;
+    setCimOutreachUpdating(true);
+    setOperationsError('');
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-outreach/pause', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paused, reason: paused ? 'Paused from Operations.' : 'Resumed from Operations after readiness review.' }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to update the CIM outreach safety control.');
+      await loadOperations();
+    } catch (error) {
+      setOperationsError(error.message || 'Unable to update the CIM outreach safety control.');
+    } finally {
+      setCimOutreachUpdating(false);
+    }
+  }
+
+  async function handleRunCimStage2({ mode, confirmation = '' }) {
+    if (isReadOnly) return;
+    setCimStage2Updating(true);
+    setOperationsError('');
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-stage2/run', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, confirmation }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to run the Stage 2 job.');
+      await loadOperations();
+    } catch (error) {
+      setOperationsError(error.message || 'Unable to run the Stage 2 job.');
+    } finally {
+      setCimStage2Updating(false);
+    }
+  }
+
+  async function handleActivateCimStage2(payload) {
+    if (isReadOnly) return;
+    setCimStage2Updating(true);
+    setOperationsError('');
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-stage2/activation', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to record the Stage 2 activation.');
+      await loadOperations();
+    } catch (error) {
+      setOperationsError(error.message || 'Unable to record the Stage 2 activation.');
+    } finally {
+      setCimStage2Updating(false);
+    }
+  }
+
   async function handleSendEmailTest() {
     if (isReadOnly) {
       setDealHunterFeedback({ error: 'Read-only users cannot send email tests.', message: '' });
@@ -1377,8 +2044,12 @@ export default function DashboardPage() {
 
     if (isCrmDetailView) {
       loadSubmissionDetail(submissionId);
+      loadCrmCommunications(submissionId);
       return;
     }
+
+    crmCommunicationsRequestRef.current.controller?.abort();
+    setCrmCommunications((current) => ({ ...current, rows: [], total: 0, page: 1, loading: false, loadingMore: false, error: '', logError: '' }));
 
     if (activeSection === 'overview' || activeSection === 'crm') {
       loadDashboard(filters.status, deferredSearch.trim());
@@ -1426,7 +2097,7 @@ export default function DashboardPage() {
       loadCommandCenter();
     }
 
-    if (activeSection === 'overview' || activeSection === 'follow-ups') {
+    if (activeSection === 'overview') {
       loadFollowUps();
     } else {
       followUpRequestRef.current.controller?.abort();
@@ -1435,12 +2106,65 @@ export default function DashboardPage() {
   }, [activeSection, authState.authenticated]);
 
   useEffect(() => {
-    if (authState.authenticated && !isReadOnly && activeSection === 'operations') loadOperations();
+    if (authState.authenticated && activeSection === 'operations') loadOperations();
   }, [activeSection, authState.authenticated, isReadOnly]);
+
+  useEffect(() => {
+    if (authState.authenticated && activeSection === 'deal-hunter' && !dealHunterReview && !dealHunterLoading && !dealHunterAutoReviewAttemptedRef.current) {
+      dealHunterAutoReviewAttemptedRef.current = true;
+      handleLoadDealHunterReview();
+    }
+  // The review loader is intentionally bounded by the loaded/loading state.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSection, authState.authenticated, dealHunterLoading, dealHunterReview]);
+
+  useEffect(() => {
+    if (!authState.authenticated || activeSection !== 'deal-hunter') {
+      cimHistoryRequestRef.current.controller?.abort();
+      return;
+    }
+    loadCimRequestHistory({ ...cimHistoryQuery, search: deferredCimHistorySearch });
+  // The loader is bounded to the primitive history query values below so object identity cannot trigger refetch loops.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    activeSection,
+    authState.authenticated,
+    deferredCimHistorySearch,
+    cimHistoryQuery.deliveryState,
+    cimHistoryQuery.direction,
+    cimHistoryQuery.followUpState,
+    cimHistoryQuery.page,
+    cimHistoryQuery.pageSize,
+    cimHistoryQuery.replyState,
+    cimHistoryQuery.requestState,
+    cimHistoryQuery.sort,
+  ]);
+
+  useEffect(() => {
+    if (!authState.authenticated || activeSection !== 'deal-hunter' || isReadOnly) {
+      unassignedCommunicationsRequestRef.current.controller?.abort();
+      if (isReadOnly) {
+        setUnassignedCommunications((current) => ({ ...current, rows: [], total: 0, page: 1, loading: false, loadingMore: false, error: '', assigningId: '' }));
+      }
+      return;
+    }
+    loadUnassignedCommunications();
+  // Unassigned inbox bootstrap is intentionally scoped to section and permission changes.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSection, authState.authenticated, isReadOnly]);
+
+  useEffect(() => {
+    if (activeSection === 'deal-hunter' && requestedDealHunterView === 'cim-approvals' && dealHunterReview) {
+      window.requestAnimationFrame(() => document.getElementById('cim-approvals')?.scrollIntoView({ block: 'start' }));
+    }
+  }, [activeSection, dealHunterReview, requestedDealHunterView]);
 
   useEffect(() => () => {
     dashboardRequestRef.current.controller?.abort();
     followUpRequestRef.current.controller?.abort();
+    crmCommunicationsRequestRef.current.controller?.abort();
+    cimHistoryRequestRef.current.controller?.abort();
+    unassignedCommunicationsRequestRef.current.controller?.abort();
   }, []);
 
   async function handleMagicLinkRequest(event) {
@@ -1520,18 +2244,27 @@ export default function DashboardPage() {
 
   async function handleLogoutEverywhere() {
     if (!window.confirm('Sign out every active session for this account?')) return;
-    const response = await fetch('/api/admin/sessions/revoke-all', {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: '{}',
-    });
-    const result = await response.json();
-    if (!response.ok || !result.success) {
-      setActionError(result.error || 'Unable to revoke active sessions.');
-      return;
+
+    setLogoutEverywherePending(true);
+    setActionError('');
+
+    try {
+      const response = await fetch('/api/admin/sessions/revoke-all', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to revoke active sessions.');
+      }
+      setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
+    } catch (error) {
+      setActionError(error.message || 'Unable to revoke active sessions. Check your connection and try again.');
+    } finally {
+      setLogoutEverywherePending(false);
     }
-    setAuthState((current) => ({ ...current, checked: true, authenticated: false, username: '', role: '' }));
   }
 
   async function handleSave(submissionId) {
@@ -1672,6 +2405,195 @@ export default function DashboardPage() {
     } finally {
       setDeletingSubmissionId('');
     }
+  }
+
+  function applySubmissionUpdate(updatedSubmission) {
+    if (!updatedSubmission?.id) return;
+    setDashboardData((current) => ({
+      ...current,
+      submissions: current.submissions.map((submission) => submission.id === updatedSubmission.id ? updatedSubmission : submission),
+      notifications: current.notifications.filter((submission) => submission.id !== updatedSubmission.id),
+      emailTriage: current.emailTriage.filter((submission) => submission.id !== updatedSubmission.id),
+    }));
+    setDrafts((current) => ({ ...current, [updatedSubmission.id]: buildDraft(updatedSubmission) }));
+  }
+
+  async function handleLogCommunication(payload) {
+    if (isReadOnly) {
+      const error = new Error('Read-only users cannot log communications.');
+      setCrmCommunications((current) => ({ ...current, logError: error.message }));
+      throw error;
+    }
+    if (!submissionId) throw new Error('A CRM record is required to log a communication.');
+
+    setCrmCommunications((current) => ({ ...current, logPending: true, logError: '' }));
+    try {
+      const response = await fetch(`/api/admin/submissions/${encodeURIComponent(submissionId)}/communications`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to log this communication.');
+      }
+      if (result.communication) {
+        setCrmCommunications((current) => ({
+          ...current,
+          rows: [...current.rows, result.communication],
+          total: current.total + 1,
+          logError: '',
+        }));
+      }
+      await loadSubmissionDetail(submissionId);
+      return result.communication;
+    } catch (error) {
+      setCrmCommunications((current) => ({ ...current, logError: error.message || 'Unable to log this communication.' }));
+      throw error;
+    } finally {
+      setCrmCommunications((current) => ({ ...current, logPending: false }));
+    }
+  }
+
+  async function handleArchiveLead(submission, payload) {
+    if (isReadOnly) throw new Error('Read-only users cannot archive leads.');
+    if (!submission?.id) throw new Error('A CRM record is required to archive a lead.');
+
+    setLeadLifecyclePendingId(submission.id);
+    setActionError('');
+    try {
+      const response = await fetch(`/api/admin/submissions/${encodeURIComponent(submission.id)}/archive`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          reason: payload.reason,
+          note: payload.note || '',
+          communicationId: payload.communicationId || '',
+          expectedUpdatedAt: submission.updated_at || '',
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to archive this lead.');
+      applySubmissionUpdate(result.submission);
+      await Promise.allSettled([refreshCurrentCrmView(), loadCommandCenter(), loadFollowUps()]);
+      return result.submission;
+    } catch (error) {
+      setActionError(error.message || 'Unable to archive this lead.');
+      throw error;
+    } finally {
+      setLeadLifecyclePendingId('');
+    }
+  }
+
+  async function handleRestoreLead(submission, payload) {
+    if (isReadOnly) throw new Error('Read-only users cannot restore leads.');
+    if (!submission?.id) throw new Error('A CRM record is required to restore a lead.');
+
+    setLeadLifecyclePendingId(submission.id);
+    setActionError('');
+    try {
+      const response = await fetch(`/api/admin/submissions/${encodeURIComponent(submission.id)}/restore`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: payload.status, expectedUpdatedAt: submission.updated_at || '' }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to restore this lead.');
+      applySubmissionUpdate(result.submission);
+      await Promise.allSettled([refreshCurrentCrmView(), loadCommandCenter(), loadFollowUps()]);
+      return result.submission;
+    } catch (error) {
+      setActionError(error.message || 'Unable to restore this lead.');
+      throw error;
+    } finally {
+      setLeadLifecyclePendingId('');
+    }
+  }
+
+  function openCorrectedRecipientRetry(request) {
+    if (isReadOnly) return;
+    setCorrectedRecipientRequest(request);
+    setCorrectedRecipientRetry({ requestId: String(request?.id || request?.cim_request_id || ''), pending: false, error: '' });
+  }
+
+  async function handleRetryCorrectedRecipient(payload) {
+    if (isReadOnly) throw new Error('Read-only users cannot retry CIM requests.');
+    const requestId = String(correctedRecipientRequest?.id || correctedRecipientRequest?.cim_request_id || '');
+    if (!requestId) throw new Error('A CIM request is required for corrected-recipient retry.');
+
+    setCorrectedRecipientRetry({ requestId, pending: true, error: '' });
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/cim-requests/${encodeURIComponent(requestId)}/retry`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to retry this CIM request.');
+      setCorrectedRecipientRequest(null);
+      setCorrectedRecipientRetry({ requestId: '', pending: false, error: '' });
+      setDealHunterFeedback({ error: '', message: `CIM request retried with corrected recipient ${payload.newRecipientEmail}.` });
+      await loadCimRequestHistory({ ...cimHistoryQuery, search: deferredCimHistorySearch });
+      return result.request;
+    } catch (error) {
+      setCorrectedRecipientRetry({ requestId, pending: false, error: error.message || 'Unable to retry this CIM request.' });
+      throw error;
+    }
+  }
+
+  async function handleAssignCommunication({ communicationId, submissionId: destinationSubmissionId }) {
+    if (isReadOnly) throw new Error('Read-only users cannot assign communications.');
+    setUnassignedCommunications((current) => ({ ...current, assigningId: communicationId, error: '' }));
+    try {
+      const response = await fetch(`/api/admin/communications/${encodeURIComponent(communicationId)}/assign`, {
+        method: 'PATCH',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ submissionId: destinationSubmissionId }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to assign this communication.');
+      setUnassignedCommunications((current) => ({
+        ...current,
+        rows: current.rows.filter((communication) => String(communication.id || communication.communication_id) !== String(communicationId)),
+        total: Math.max(0, current.total - 1),
+        assigningId: '',
+      }));
+      return result.communication;
+    } catch (error) {
+      setUnassignedCommunications((current) => ({ ...current, assigningId: '', error: error.message || 'Unable to assign this communication.' }));
+      throw error;
+    }
+  }
+
+  async function handleSearchCommunicationRecords(search) {
+    if (isReadOnly) throw new Error('Read-only users cannot search the assignment queue.');
+    const query = String(search || '').trim();
+    if (query.length < 2) return [];
+    const params = new URLSearchParams({
+      page: '1',
+      pageSize: '25',
+      search: query,
+      status: 'all',
+      sort: 'updated_at',
+      direction: 'desc',
+    });
+    const response = await fetch(`/api/admin/submissions?${params.toString()}`, {
+      credentials: 'same-origin',
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) {
+      throw new Error(result.error || 'Unable to search CRM records.');
+    }
+    return Array.isArray(result.submissions)
+      ? result.submissions
+      : Array.isArray(result.rows)
+        ? result.rows
+        : [];
   }
 
   async function handleCommandCenterUpdate(record, payload) {
@@ -1846,12 +2768,16 @@ export default function DashboardPage() {
     });
   }
 
-  async function handleLoadDealHunterReview() {
+  async function handleLoadDealHunterReview(reviewMode = 'daily') {
+    const fullBackfill = reviewMode === 'full-backfill';
     setDealHunterLoading(true);
     setDealHunterFeedback({ error: '', message: '' });
 
     try {
-      const response = await fetch('/api/admin/deal-hunter/review', {
+      const response = await fetch(fullBackfill
+        ? '/api/admin/deal-hunter/backfill-review'
+        : '/api/admin/deal-hunter/review', {
+        method: fullBackfill ? 'POST' : 'GET',
         credentials: 'same-origin',
       });
       const result = await response.json();
@@ -1862,13 +2788,110 @@ export default function DashboardPage() {
 
       if (result.review) {
         setDealHunterReview(result.review);
+        setDealHunterImportSummary(result.summary || result.review.importSummary || null);
       }
-      setDealHunterFeedback({ error: '', message: `Reviewed ${result.review?.totals?.reviewedDeals || 0} recent deals.` });
+      setDealHunterFeedback({
+        error: '',
+        message: fullBackfill
+          ? `Full backfill scored ${result.review?.totals?.reviewedDeals || 0} canonical listings. No CRM records were changed.`
+          : `Reviewed ${result.review?.totals?.reviewedDeals || 0} recent deals.`,
+      });
       await loadCommandCenter();
     } catch (error) {
       setDealHunterFeedback({ error: error.message || 'Unable to review daily deals.', message: '' });
     } finally {
       setDealHunterLoading(false);
+    }
+  }
+
+  async function handleResolveCimIdentityException(identityException, { action, opportunityId }) {
+    if (isReadOnly) return;
+    const reason = window.prompt('Explain why this listing should be linked or kept distinct. This reason is retained in the identity audit history.');
+    if (!reason || reason.trim().length < 10) {
+      setDealHunterFeedback({ error: 'Identity resolution requires a specific reason of at least 10 characters.', message: '' });
+      return;
+    }
+    if (!window.confirm(`Confirm ${action === 'link' ? 'canonical identity link' : 'distinct opportunity'} for ${identityException.observedName || 'this listing'}?`)) return;
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/identity-exceptions/${encodeURIComponent(identityException.id)}/resolve`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, opportunityId, reason: reason.trim(), confirmed: true }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to resolve the identity exception.');
+      setDealHunterFeedback({ error: '', message: 'Identity exception resolved and audited.' });
+      await handleLoadDealHunterReview();
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to resolve the identity exception.', message: '' });
+    }
+  }
+
+  async function handleImportDealOsExport({ file, scope, coverageLabel, exportedAt, expectedRowCount, runFullBackfill }) {
+    if (isReadOnly) {
+      setDealHunterFeedback({ error: 'Read-only users cannot import Deal OS exports.', message: '' });
+      return;
+    }
+
+    setDealOsImporting(true);
+    setDealHunterFeedback({ error: '', message: '' });
+
+    try {
+      const extension = file.name.toLowerCase().endsWith('.xlsx') ? 'xlsx' : 'csv';
+      const contentType = extension === 'xlsx'
+        ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        : 'text/csv';
+      const headers = {
+        'Content-Type': contentType,
+        'X-Deal-OS-File-Name': encodeURIComponent(file.name),
+        'X-Deal-OS-Exported-At': exportedAt,
+        'X-Deal-OS-Scope': scope,
+        'X-Deal-OS-Coverage-Label': encodeURIComponent(coverageLabel),
+        'X-Deal-OS-Review-Mode': runFullBackfill ? 'full-backfill' : 'daily',
+      };
+      if (expectedRowCount) headers['X-Deal-OS-Expected-Row-Count'] = expectedRowCount;
+      const response = await fetch('/api/admin/deal-hunter/deal-os-import', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers,
+        body: file,
+      });
+      const result = await response.json();
+
+      if (!response.ok || !result.success) {
+        const details = Array.isArray(result.details) && result.details.length > 0 ? ` ${result.details.join('; ')}` : '';
+        throw new Error(`${result.error || 'Unable to import the Deal OS export.'}${details}`);
+      }
+
+      let refreshedReview = result.review || null;
+      let refreshWarning = result.reviewWarning ? ` ${result.reviewWarning}` : '';
+      if (!refreshedReview) {
+        const reviewResponse = await fetch('/api/admin/deal-hunter/review', { credentials: 'same-origin' });
+        const reviewResult = await reviewResponse.json();
+        if (reviewResponse.ok && reviewResult.success && reviewResult.review) {
+          refreshedReview = reviewResult.review;
+        } else {
+          refreshWarning = ' The import was saved, but source review could not be refreshed.';
+        }
+      }
+      if (refreshedReview) setDealHunterReview(refreshedReview);
+      const summary = result.summary || refreshedReview?.importSummary || null;
+      setDealHunterImportSummary(summary);
+      setDealHunterReconciliation({ preview: null, busy: false });
+      const imported = result.import || {};
+      const scoredMessage = summary?.scoredListings !== undefined
+        ? ` Scored ${summary.scoredListings} listing${Number(summary.scoredListings) === 1 ? '' : 's'} in ${summary.reviewMode === 'full-backfill' ? 'full-backfill' : 'daily'} mode.`
+        : '';
+      setDealHunterFeedback({
+        error: '',
+        message: `Accepted ${imported.acceptedRowCount ?? imported.rowCount ?? 0} Deal OS row${Number(imported.acceptedRowCount ?? imported.rowCount ?? 0) === 1 ? '' : 's'} and retained ${imported.canonicalRecordCount ?? imported.rowCount ?? 0} canonical import record${Number(imported.canonicalRecordCount ?? imported.rowCount ?? 0) === 1 ? '' : 's'} from ${imported.fileName || file.name}.${scoredMessage}${refreshWarning}`,
+      });
+      await loadCommandCenter();
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to import the Deal OS export.', message: '' });
+    } finally {
+      setDealOsImporting(false);
     }
   }
 
@@ -1893,13 +2916,12 @@ export default function DashboardPage() {
       }
 
       setDealHunterReview(result.review);
-      const crmSync = result.crmSync || result.review?.crmSync;
-      const crmMessage = crmSync?.reviewed
-        ? ` CRM sync: ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped.`
-        : '';
+      setDealHunterImportSummary(result.review?.importSummary || dealHunterImportSummary);
       setDealHunterFeedback({
         error: '',
-        message: result.alreadySent ? 'The daily deal email was already sent for today.' : `Daily deal email sent.${crmMessage}`,
+        message: result.alreadySent
+          ? 'The daily deal email was already sent for today.'
+          : 'Daily deal email sent. No CRM records were changed.',
       });
       await Promise.all([
         loadCommandCenter(),
@@ -1909,6 +2931,134 @@ export default function DashboardPage() {
       setDealHunterFeedback({ error: error.message || 'Unable to send the daily deal email.', message: '' });
     } finally {
       setDealHunterSending(false);
+    }
+  }
+
+  async function handleSyncDealHunterHighFits() {
+    if (isReadOnly) {
+      setDealHunterFeedback({ error: 'Read-only users cannot sync Deal Hunter listings to CRM.', message: '' });
+      return;
+    }
+
+    const confirmation = window.prompt(
+      `This will idempotently create or update ${dealHunterReview?.totals?.crmEligible || 0} reviewed high-fit CRM record${Number(dealHunterReview?.totals?.crmEligible || 0) === 1 ? '' : 's'}. Type SYNC HIGH FITS to continue.`,
+    );
+    if (confirmation !== 'SYNC HIGH FITS') {
+      if (confirmation !== null) setDealHunterFeedback({ error: 'CRM sync confirmation did not match. No records were changed.', message: '' });
+      return;
+    }
+
+    setDealHunterCrmSyncing(true);
+    setDealHunterFeedback({ error: '', message: '' });
+    try {
+      const response = await fetch('/api/admin/deal-hunter/crm-sync', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          confirmation,
+          expectedDealKeys: dealHunterReview?.crmSyncPreview?.dealKeys
+            || (dealHunterReview?.qualified || []).map((deal) => deal.dealKey),
+          reviewMode: dealHunterReview?.reviewMode === 'full-backfill' ? 'full-backfill' : 'daily',
+        }),
+      });
+      const result = await response.json();
+      if (result.review) setDealHunterReview(result.review);
+      if (result.summary || result.review?.importSummary) {
+        setDealHunterImportSummary(result.summary || result.review.importSummary);
+      }
+      if (!response.ok || !result.success) {
+        throw new Error(result.error || 'Unable to sync high-fit listings to CRM.');
+      }
+
+      const crmSync = result.crmSync || {};
+      setDealHunterFeedback({
+        error: '',
+        message: `CRM sync completed: ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped, ${crmSync.failed || 0} failed.`,
+      });
+      await Promise.all([
+        loadCommandCenter(),
+        loadDashboard(filters.status, deferredSearch.trim()),
+      ]);
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to sync high-fit listings to CRM.', message: '' });
+    } finally {
+      setDealHunterCrmSyncing(false);
+    }
+  }
+
+  async function handlePreviewDealHunterReconciliation() {
+    if (isReadOnly) {
+      setDealHunterFeedback({ error: 'Read-only users cannot reconcile Deal OS imports to CRM.', message: '' });
+      return;
+    }
+    const importId = dealHunterImportSummary?.importId;
+    if (!importId) {
+      setDealHunterFeedback({ error: 'Upload or refresh a Deal OS import before building a reconciliation preview.', message: '' });
+      return;
+    }
+    setDealHunterReconciliation((current) => ({ ...current, busy: true }));
+    setDealHunterFeedback({ error: '', message: '' });
+    try {
+      const response = await fetch('/api/admin/deal-hunter/crm-reconciliation/preview', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ importId }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to build the CRM reconciliation preview.');
+      setDealHunterReconciliation({ preview: result, busy: false });
+      setDealHunterFeedback({
+        error: '',
+        message: `Reconciliation preview is ready: ${result.counts?.create || 0} create, ${result.counts?.update || 0} update, ${result.counts?.unchanged || 0} unchanged, ${result.counts?.tombstoned || 0} tombstoned, ${result.counts?.ambiguous || 0} ambiguous. No CRM records were changed.`,
+      });
+    } catch (error) {
+      setDealHunterReconciliation((current) => ({ ...current, busy: false }));
+      setDealHunterFeedback({ error: error.message || 'Unable to build the CRM reconciliation preview.', message: '' });
+    }
+  }
+
+  async function handleExecuteDealHunterReconciliation() {
+    const preview = dealHunterReconciliation.preview;
+    if (!preview?.planDigest || !preview?.confirmationRequired) {
+      setDealHunterFeedback({ error: 'Build a fresh reconciliation preview before executing.', message: '' });
+      return;
+    }
+    const confirmation = window.prompt(
+      `This will reconcile the exact reviewed canonical set. It will not send email or CIM requests. Type ${preview.confirmationRequired} to continue.`,
+    );
+    if (confirmation !== preview.confirmationRequired) {
+      if (confirmation !== null) setDealHunterFeedback({ error: 'Reconciliation confirmation did not match. No CRM records were changed.', message: '' });
+      return;
+    }
+    setDealHunterReconciliation((current) => ({ ...current, busy: true }));
+    setDealHunterFeedback({ error: '', message: '' });
+    try {
+      const response = await fetch('/api/admin/deal-hunter/crm-reconciliation/execute', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          importId: preview.import?.id,
+          planDigest: preview.planDigest,
+          previewGeneratedAt: preview.generatedAt,
+          expectedOpportunityIds: preview.expectedOpportunityIds,
+          confirmation,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || result.run?.last_error || 'CRM reconciliation completed with errors.');
+      setDealHunterReconciliation({ preview: null, busy: false });
+      const counts = result.resultCounts || result.run?.counts?.results || {};
+      setDealHunterFeedback({
+        error: '',
+        message: `CRM reconciliation completed: ${counts.created || 0} created, ${counts.updated || 0} updated, ${counts.enriched || 0} enriched, ${counts.unchanged || 0} unchanged, ${counts.tombstoned || 0} tombstoned, ${counts.failed || 0} failed. No outbound messages were sent.`,
+      });
+      await Promise.all([loadCommandCenter(), loadDashboard(filters.status, deferredSearch.trim())]);
+    } catch (error) {
+      setDealHunterReconciliation((current) => ({ ...current, busy: false }));
+      setDealHunterFeedback({ error: error.message || 'Unable to execute CRM reconciliation.', message: '' });
     }
   }
 
@@ -1994,7 +3144,44 @@ export default function DashboardPage() {
     }
   }
 
-  async function handleSendReadyCimRequests() {
+  async function persistDealHunterDisposition(deal, reasonInput = 'not-a-fit') {
+    if (isReadOnly) throw new Error('Read-only users cannot dismiss Deal Hunter opportunities.');
+    if (!deal?.dealKey) throw new Error('Deal key is required to save a disposition.');
+    const reason = typeof reasonInput === 'string' ? reasonInput : reasonInput?.reason || reasonInput?.passReason || 'not-a-fit';
+    const note = typeof reasonInput === 'object' ? reasonInput?.note || '' : '';
+    const response = await fetch('/api/admin/deal-hunter/dispositions', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        dealKey: deal.dealKey,
+        listingUrl: deal.listingUrl || deal.listing_url || '',
+        dealName: deal.name || deal.company || '',
+        reason,
+        note,
+        submissionId: deal.submissionId || deal.submission_id || deal.cimRequest?.submissionId || '',
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save this Deal Hunter disposition.');
+    return result;
+  }
+
+  async function handleDismissDealHunterOpportunity(deal, reasonInput) {
+    setDismissingDealKey(deal?.dealKey || '');
+    try {
+      await persistDealHunterDisposition(deal, reasonInput);
+      setDealHunterFeedback({ error: '', message: `${deal.name || 'Deal Hunter opportunity'} dismissed and retained in disposition history.` });
+      await handleLoadDealHunterReview();
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to dismiss this Deal Hunter opportunity.', message: '' });
+      throw error;
+    } finally {
+      setDismissingDealKey('');
+    }
+  }
+
+  async function handleSendReadyCimRequests(approvedDeals = null, reviewDecisions = []) {
     if (isReadOnly) {
       setDealHunterFeedback({ error: 'Read-only users cannot send CIM requests.', message: '' });
       return;
@@ -2008,9 +3195,9 @@ export default function DashboardPage() {
       return;
     }
 
-    const readyDeals = getCimReadyDealsFromReview(dealHunterReview);
+    const readyDeals = Array.isArray(approvedDeals) ? approvedDeals : getCimReadyDealsFromReview(dealHunterReview);
 
-    if (readyDeals.length === 0) {
+    if (readyDeals.length === 0 && reviewDecisions.length === 0) {
       setDealHunterFeedback({
         error: 'No CIM-ready 75+ deals are available in the loaded review. Confirm each deal has annual profit and a valid broker email.',
         message: '',
@@ -2020,12 +3207,12 @@ export default function DashboardPage() {
 
     const previewLines = readyDeals
       .slice(0, 10)
-      .map((deal) => `- ${deal.name || 'Unnamed deal'} -> ${deal.confirmedRecipientEmail}`)
+      .map((deal) => `- ${deal.name || 'Unnamed deal'} -> ${deal.confirmedRecipientName ? `${deal.confirmedRecipientName} <${deal.confirmedRecipientEmail}>` : deal.confirmedRecipientEmail}`)
       .join('\n');
     const additionalCount = readyDeals.length > 10 ? `\n...and ${readyDeals.length - 10} more.` : '';
-    const confirmed = window.confirm(
-      `Send CIM request emails to these ${readyDeals.length} confirmed broker recipient${readyDeals.length === 1 ? '' : 's'}?\n\n${previewLines}${additionalCount}\n\nThis will email brokers directly.`,
-    );
+    const confirmed = window.confirm(readyDeals.length > 0
+      ? `Send CIM request emails to these ${readyDeals.length} approved broker recipient${readyDeals.length === 1 ? '' : 's'}?\n\n${previewLines}${additionalCount}\n\nThis will email brokers directly and start their automated follow-up sequences.`
+      : 'Save these CIM pass decisions without sending any broker emails?');
 
     if (!confirmed) {
       return;
@@ -2035,6 +3222,31 @@ export default function DashboardPage() {
     setDealHunterFeedback({ error: '', message: '' });
 
     try {
+      if (reviewDecisions.length > 0) {
+        const reviewResponse = await fetch('/api/admin/deal-hunter/cim-reviews', {
+          method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ decisions: reviewDecisions }),
+        });
+        const reviewResult = await reviewResponse.json();
+        if (!reviewResponse.ok || !reviewResult.success) throw new Error(reviewResult.error || 'Unable to save CIM review decisions.');
+
+        const rejectedDecisions = reviewDecisions.filter((decision) => decision.decision === 'rejected');
+        for (const decision of rejectedDecisions) {
+          const deal = getDealHunterDealFromReview(dealHunterReview, decision.dealKey) || {
+            dealKey: decision.dealKey,
+            name: decision.dealName || '',
+            listingUrl: decision.listingUrl || '',
+          };
+          await persistDealHunterDisposition(deal, decision.passReason || 'not-a-fit');
+        }
+      }
+
+      if (readyDeals.length === 0) {
+        setDealHunterFeedback({ error: '', message: `Saved ${reviewDecisions.length} CIM review decision${reviewDecisions.length === 1 ? '' : 's'} without sending outreach.` });
+        await handleLoadDealHunterReview();
+        return;
+      }
+
       const response = await fetch('/api/admin/deal-hunter/cim-requests/send-ready', {
         method: 'POST',
         credentials: 'same-origin',
@@ -2046,6 +3258,7 @@ export default function DashboardPage() {
           selections: readyDeals.map((deal) => ({
             dealKey: deal.dealKey,
             recipientEmail: deal.confirmedRecipientEmail,
+            recipientName: deal.confirmedRecipientName || '',
             snapshotToken: getCimSnapshotToken(deal),
           })),
         }),
@@ -2120,6 +3333,21 @@ export default function DashboardPage() {
     }
   }
 
+  async function handleRecordCimOutcome(deal, outcome) {
+    try {
+      const response = await fetch('/api/admin/deal-hunter/cim-outcomes', {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dealKey: deal.dealKey, outcome }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.success) throw new Error(result.error || 'Unable to record the broker response outcome.');
+      setDealHunterFeedback({ error: '', message: `Marked ${deal.name || 'the CIM response'} as ${outcome}.` });
+      await handleLoadDealHunterReview();
+    } catch (error) {
+      setDealHunterFeedback({ error: error.message || 'Unable to record the broker response outcome.', message: '' });
+    }
+  }
+
   const summary = dashboardData.summary || {
     total: 0,
     lastSevenDays: 0,
@@ -2138,30 +3366,19 @@ export default function DashboardPage() {
   };
 
   const submissions = useMemo(() => dashboardData.submissions || [], [dashboardData.submissions]);
+  const crmCimRequestOptions = useMemo(() => {
+    const seen = new Set();
+    return crmCommunications.rows.reduce((options, communication) => {
+      const id = String(communication.cim_request_id || communication.cimRequestId || '');
+      if (!id || seen.has(id)) return options;
+      seen.add(id);
+      options.push({ id, label: communication.subject || `CIM request ${id}` });
+      return options;
+    }, []);
+  }, [crmCommunications.rows]);
+  const crmCommunicationsHasMore = crmCommunications.rows.length < crmCommunications.total;
+  const unassignedCommunicationsHasMore = unassignedCommunications.rows.length < unassignedCommunications.total;
   const followUpSummary = followUpData.summary || {};
-  const notifications = useMemo(() => followUpData.notifications || [], [followUpData.notifications]);
-  const emailTriage = useMemo(() => followUpData.emailTriage || [], [followUpData.emailTriage]);
-  const visibleNotifications = useMemo(() => {
-    if (followUpView === 'warm-leads') {
-      return [];
-    }
-
-    if (followUpView === 'overdue') {
-      return notifications.filter((submission) => submission.follow_up_prompt?.kind === 'overdue');
-    }
-
-    if (followUpView === 'due-soon') {
-      return notifications.filter((submission) => ['due', 'today'].includes(submission.follow_up_prompt?.kind));
-    }
-
-    return notifications;
-  }, [followUpView, notifications]);
-  const visibleEmailTriage = useMemo(
-    () => (followUpView === 'all' || followUpView === 'warm-leads' ? emailTriage : []),
-    [emailTriage, followUpView],
-  );
-  const displayedNotifications = followUpView === 'all' ? visibleNotifications.slice(0, 6) : visibleNotifications;
-  const displayedEmailTriage = followUpView === 'all' ? visibleEmailTriage.slice(0, 6) : visibleEmailTriage;
   const adminSummary = {
     ...summary,
     actionItems: followUpSummary.actionItems ?? summary.actionItems,
@@ -2187,7 +3404,7 @@ export default function DashboardPage() {
     return <Navigate replace to="/admin" />;
   }
 
-  if (authState.authenticated && isReadOnly && ['new-record', 'operations'].includes(activeSection)) {
+  if (authState.authenticated && isReadOnly && activeSection === 'new-record') {
     return <Navigate replace to="/admin/crm" />;
   }
 
@@ -2305,24 +3522,45 @@ export default function DashboardPage() {
 
   return (
     <>
-      <Seo description="Private admin CRM for Uckele Group." keywords="private admin crm" noindex title="Admin | Uckele Group" />
+      <Seo
+        description={pageMeta.description}
+        keywords="private admin crm"
+        noindex
+        title={`${pageMeta.title} | Uckele Group Admin`}
+      />
 
       <section className="admin-page-header">
         <Reveal className="admin-page-header-card">
-          <div className="flex flex-col gap-5 xl:flex-row xl:items-center xl:justify-between">
+          <div className="flex flex-col gap-5 xl:flex-row xl:items-center xl:justify-between" data-admin-tour="page-guidance">
             <div className="min-w-0">
-              <p className="text-[11px] font-semibold uppercase tracking-normal text-moss">Private Admin</p>
-              <h1 className="mt-2 text-3xl font-semibold leading-tight text-ink sm:text-4xl">Admin workspace</h1>
+              <p className="text-[11px] font-semibold uppercase tracking-normal text-moss">{pageMeta.eyebrow}</p>
+              <h1 className="mt-2 text-3xl font-semibold leading-tight text-ink sm:text-4xl">{pageMeta.title}</h1>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-ink/68 sm:text-base">
-                CRM records, Deal Hunter scoring, and follow-up work are split into focused views so daily admin work stays readable.
+                {pageMeta.description}
               </p>
             </div>
 
             <div className="admin-session-panel">
-              <p className="text-xs font-semibold uppercase tracking-normal text-moss/75">Signed in</p>
-              <p className="mt-1 text-sm font-semibold text-ink">
-                {authState.username}{isReadOnly ? ' · Read-only viewer' : ''}
-              </p>
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold uppercase tracking-normal text-moss/75">Signed in</p>
+                  <p className="mt-1 truncate text-sm font-semibold text-ink">
+                    {authState.username}{isReadOnly ? ' · Read-only viewer' : ''}
+                  </p>
+                </div>
+                <button className="shrink-0 text-xs font-semibold text-moss underline decoration-moss/30 underline-offset-4" onClick={handleLogout} type="button">
+                  Sign out
+                </button>
+              </div>
+              <button
+                className="mt-3 inline-flex items-center gap-1.5 text-xs font-medium text-ink/55 transition hover:text-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={logoutEverywherePending}
+                onClick={handleLogoutEverywhere}
+                type="button"
+              >
+                <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
+                {logoutEverywherePending ? 'Signing out all sessions…' : 'Sign out all sessions'}
+              </button>
             </div>
           </div>
 
@@ -2333,13 +3571,21 @@ export default function DashboardPage() {
               </p>
             ) : (
               <p className="text-sm leading-6 text-ink/68">
-                Use the navigation to move between focused admin workspaces.
+                {pageMeta.guidance}
               </p>
             )}
 
             <div className="admin-action-row">
-              {!isReadOnly ? (
+              <Suspense fallback={null}>
+                <AdminOnboarding
+                  scope={onboardingScope}
+                  sessionIdentity={`${authState.role}:${authState.username}`}
+                  userRole={authState.role}
+                />
+              </Suspense>
+              {showNewRecordAction || showExportAction || showDailyUpdateAction ? (
                 <>
+                {showNewRecordAction ? (
                   <NavLink
                     className={`${primaryActionButtonClass} admin-action-button`}
                     to="/admin/new-record"
@@ -2347,6 +3593,8 @@ export default function DashboardPage() {
                     <Plus className="h-4 w-4" />
                     New CRM Record
                   </NavLink>
+                ) : null}
+                {showExportAction ? (
                   <a
                     className={`${secondaryActionButtonClass} admin-action-button`}
                     href="/api/admin/submissions/export"
@@ -2354,33 +3602,20 @@ export default function DashboardPage() {
                     <Download className="h-4 w-4" />
                     Export CSV
                   </a>
+                ) : null}
+                {showDailyUpdateAction ? (
+                  <a
+                    className={`${secondaryActionButtonClass} admin-action-button`}
+                    href={dailyDealUpdateUrl}
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    <ClipboardList className="h-4 w-4" />
+                    Daily Deal Update
+                  </a>
+                ) : null}
                 </>
               ) : null}
-              <a
-                className={`${secondaryActionButtonClass} admin-action-button`}
-                href={dailyDealUpdateUrl}
-                rel="noreferrer"
-                target="_blank"
-              >
-                <ClipboardList className="h-4 w-4" />
-                Daily Deal Update
-              </a>
-              <button
-                className={`${secondaryActionButtonClass} admin-action-button`}
-                onClick={handleLogout}
-                type="button"
-              >
-                <LogOut className="h-4 w-4" />
-                Sign Out
-              </button>
-              <button
-                className={`${secondaryActionButtonClass} admin-action-button`}
-                onClick={handleLogoutEverywhere}
-                type="button"
-              >
-                <ShieldAlert className="h-4 w-4" />
-                Sign Out Everywhere
-              </button>
             </div>
           </div>
         </Reveal>
@@ -2394,7 +3629,7 @@ export default function DashboardPage() {
       {activeSection === 'overview' ? (
       <>
       <section className="section-shell mt-8">
-        <div className="admin-stat-grid">
+        <div className="admin-stat-grid" data-admin-tour="overview-priorities">
           <StatCard icon={Inbox} label="Total Records" onClick={() => setFilters({ ...defaultCrmFilters })} to="/admin/crm" value={summary.total} />
           <StatCard icon={BellRing} label="Action Items" to="/admin/follow-ups?view=action-items" value={adminSummary.actionItems} tone={adminSummary.actionItems > 0 ? 'warning' : 'default'} />
           <StatCard icon={CalendarClock} label="Overdue" to="/admin/follow-ups?view=overdue" value={adminSummary.overdue} tone={adminSummary.overdue > 0 ? 'danger' : 'default'} />
@@ -2405,7 +3640,7 @@ export default function DashboardPage() {
         </div>
       </section>
       <section className="section-shell mt-5">
-        <Reveal className="panel p-5 sm:p-6">
+        <Reveal className="panel p-5 sm:p-6" data-admin-tour="workspace-launcher">
           <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
             <div>
               <SectionLabel>Admin Areas</SectionLabel>
@@ -2417,7 +3652,7 @@ export default function DashboardPage() {
           </div>
           <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
             {adminSections
-              .filter((item) => item.id !== 'overview' && (!isReadOnly || !['new-record', 'operations'].includes(item.id)))
+              .filter((item) => item.id !== 'overview' && (!isReadOnly || item.id !== 'new-record'))
               .map((item) => {
                 const Icon = item.icon;
                 const descriptions = {
@@ -2454,15 +3689,25 @@ export default function DashboardPage() {
         <div className="mb-6">
           <SectionLabel>Operations Center</SectionLabel>
           <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">System health, history, and recovery readiness</h2>
-          <p className="mt-3 max-w-3xl text-sm leading-7 text-ink/68">Admin-only operational visibility for scheduler runs, source checks, security cleanup, audit history, disk usage, database integrity, and backups.</p>
+          <p className="mt-3 max-w-3xl text-sm leading-7 text-ink/68">Operational visibility for readiness gates, scheduler runs, sources, storage, and recovery. Read-only users receive aggregate privacy-safe status; release controls require a full administrator.</p>
         </div>
-        <OperationsCenter
-          data={operations}
-          emailTestSending={emailTestSending}
-          error={operationsError}
-          loading={operationsLoading}
-          onSendEmailTest={handleSendEmailTest}
-        />
+        <Suspense fallback={<WorkspaceFallback />}>
+          <OperationsCenter
+            cimAutomationUpdating={cimAutomationUpdating}
+            cimOutreachUpdating={cimOutreachUpdating}
+            cimStage2Updating={cimStage2Updating}
+            data={operations}
+            emailTestSending={emailTestSending}
+            error={operationsError}
+            loading={operationsLoading}
+            onActivateCimStage2={handleActivateCimStage2}
+            onRunCimStage2={handleRunCimStage2}
+            onToggleCimAutomation={handleToggleCimAutomation}
+            onToggleCimOutreach={handleToggleCimOutreach}
+            onSendEmailTest={handleSendEmailTest}
+            readOnly={isReadOnly}
+          />
+        </Suspense>
       </section>
       ) : null}
 
@@ -2506,7 +3751,7 @@ export default function DashboardPage() {
           </div>
 
           <div className="mt-7 grid gap-5 xl:grid-cols-[0.95fr_1.05fr]">
-            <div className="rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5">
+            <div className="rounded-2xl border border-line/80 bg-fog/70 p-4 sm:p-5" data-admin-tour="command-center-source-health">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <SectionLabel>Source Health</SectionLabel>
                 <Pill tone={commandSourceHealth.healthy ? 'success' : 'warning'}>
@@ -2532,6 +3777,8 @@ export default function DashboardPage() {
                       ) : null}
                     </div>
                     {source.error ? <p className="mt-2 text-red-700">{source.error}</p> : null}
+                    {source.mode === 'manual-export' ? <p className="mt-2 text-ink/62">Coverage: {source.coverageLabel || 'not described'} ({formatLabel(source.scope || 'manual export')}) · exported {formatDateTime(source.exportedAt)} · {source.importAgeHours ?? '?'}h old · {source.stableIdCount || 0} stable IDs · {source.listingUrlCount || 0} listing URLs.</p> : null}
+                    {source.coverageLimitReached ? <p className="mt-2 font-semibold text-amber-800">The Deal OS export reached its listing ceiling and may be truncated.</p> : null}
                   </div>
                 ))}
                 {commandSourceHealth.sources?.length === 0 ? (
@@ -2549,7 +3796,7 @@ export default function DashboardPage() {
               ) : null}
             </div>
 
-            <div className="rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5">
+            <div className="rounded-2xl border border-line/80 bg-white/70 p-4 sm:p-5" data-admin-tour="command-center-action-queue">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <SectionLabel>Global Action Queue</SectionLabel>
                 <Pill tone={commandSummary.actionItems > 0 ? 'warning' : 'success'}>{commandSummary.actionItems}</Pill>
@@ -2607,7 +3854,7 @@ export default function DashboardPage() {
             </div>
           </div>
 
-          <div className="mt-7">
+          <div className="mt-7" data-admin-tour="command-center-pipeline">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <SectionLabel>Pipeline Stages</SectionLabel>
               <Pill>{commandSummary.totalRecords} command records</Pill>
@@ -2644,150 +3891,99 @@ export default function DashboardPage() {
       ) : null}
 
       {activeSection === 'deal-hunter' ? (
-        <DealHunterWorkspace
-          bulkSending={dealHunterBulkCimSending}
-          feedback={dealHunterFeedback}
-          followUpRunning={dealHunterFollowUpRunning}
-          emailTestSending={emailTestSending}
-          loading={dealHunterLoading}
-          onReview={handleLoadDealHunterReview}
-          onRunFollowUps={handleRunCimFollowUps}
-          onSendCimRequest={handleSendCimRequest}
-          onSendEmail={handleSendDealHunterEmail}
-          onSendEmailTest={handleSendEmailTest}
-          onSendReady={handleSendReadyCimRequests}
-          readOnly={isReadOnly}
-          requestingCimDealKey={requestingCimDealKey}
-          review={dealHunterReview}
-          sending={dealHunterSending}
-        />
+        <Suspense fallback={<div className="section-shell mt-8"><WorkspaceFallback /></div>}>
+          <section className="section-shell mt-8">
+            <DealHunterTriage readOnly={isReadOnly} />
+          </section>
+          <DealHunterWorkspace
+            bulkSending={dealHunterBulkCimSending}
+            crmSyncing={dealHunterCrmSyncing}
+            dismissingDealKey={dismissingDealKey}
+            feedback={dealHunterFeedback}
+            followUpRunning={dealHunterFollowUpRunning}
+            emailTestSending={emailTestSending}
+            loading={dealHunterLoading}
+            importingDealOs={dealOsImporting}
+            importSummary={dealHunterImportSummary}
+            reconciliation={dealHunterReconciliation}
+            onDismissDeal={handleDismissDealHunterOpportunity}
+            onImportDealOs={handleImportDealOsExport}
+            onPreviewReconciliation={handlePreviewDealHunterReconciliation}
+            onExecuteReconciliation={handleExecuteDealHunterReconciliation}
+            onReview={handleLoadDealHunterReview}
+            onRunFullBackfill={() => handleLoadDealHunterReview('full-backfill')}
+            onResolveIdentityException={handleResolveCimIdentityException}
+            onRecordCimOutcome={handleRecordCimOutcome}
+            onOpenApprovals={() => {
+              navigate('/admin/deal-hunter?view=cim-approvals');
+              window.requestAnimationFrame(() => document.getElementById('cim-approvals')?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+            }}
+            onRunFollowUps={handleRunCimFollowUps}
+            onSendCimRequest={handleSendCimRequest}
+            onSendEmail={handleSendDealHunterEmail}
+            onSyncHighFits={handleSyncDealHunterHighFits}
+            onSendEmailTest={handleSendEmailTest}
+            onSendReady={handleSendReadyCimRequests}
+            readOnly={isReadOnly}
+            requestingCimDealKey={requestingCimDealKey}
+            review={dealHunterReview}
+            sending={dealHunterSending}
+          />
+
+          {correctedRecipientRequest && !isReadOnly ? (
+            <section className="section-shell mt-6">
+              <CorrectedRecipientRetryForm
+                error={correctedRecipientRetry.error}
+                onCancel={() => {
+                  setCorrectedRecipientRequest(null);
+                  setCorrectedRecipientRetry({ requestId: '', pending: false, error: '' });
+                }}
+                onRetry={handleRetryCorrectedRecipient}
+                pending={correctedRecipientRetry.pending}
+                request={correctedRecipientRequest}
+              />
+            </section>
+          ) : null}
+
+          <section className="section-shell mt-8">
+            <CimRequestHistory
+              counts={cimHistory.counts}
+              error={cimHistory.error}
+              loading={cimHistory.loading}
+              onQueryChange={setCimHistoryQuery}
+              onRetryCorrectedRecipient={isReadOnly ? undefined : openCorrectedRecipientRetry}
+              query={cimHistoryQuery}
+              readOnly={isReadOnly}
+              requests={cimHistory.rows}
+              retryingRequestId={correctedRecipientRetry.pending ? correctedRecipientRetry.requestId : ''}
+              total={cimHistory.total}
+              totalPages={cimHistory.totalPages}
+            />
+          </section>
+
+          {!isReadOnly ? (
+            <section className="section-shell mt-8 pb-8">
+              <UnassignedCommunicationsInbox
+                assigningId={unassignedCommunications.assigningId}
+                communications={unassignedCommunications.rows}
+                error={unassignedCommunications.error}
+                hasMore={unassignedCommunicationsHasMore}
+                loading={unassignedCommunications.loading}
+                loadingMore={unassignedCommunications.loadingMore}
+                onAssign={handleAssignCommunication}
+                onLoadMore={() => loadUnassignedCommunications({ append: true })}
+                onSearchRecords={handleSearchCommunicationRecords}
+                recordOptions={submissions}
+              />
+            </section>
+          ) : null}
+        </Suspense>
       ) : null}
 
-      {activeSection === 'follow-ups' && followUpError ? (
-        <section className="section-shell mt-8">
-          <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{followUpError}</div>
-        </section>
-      ) : null}
-
-      {activeSection === 'follow-ups' && followUpLoading ? (
-        <section className="section-shell mt-8">
-          <Reveal className="panel p-7 text-sm leading-7 text-ink/70">
-            Loading follow-up prompts and email triage...
-          </Reveal>
-        </section>
-      ) : null}
-
-      {activeSection === 'follow-ups' && followUpView !== 'all' ? (
-        <section className="section-shell mt-8">
-          <Reveal className="panel flex flex-col gap-4 p-5 sm:flex-row sm:items-center sm:justify-between sm:p-6">
-            <div>
-              <SectionLabel>Filtered View</SectionLabel>
-              <p className="mt-2 text-lg font-semibold text-ink">
-                {followUpView === 'action-items' ? 'All action items' : null}
-                {followUpView === 'overdue' ? 'Overdue follow-ups' : null}
-                {followUpView === 'due-soon' ? 'Due now or within 24 hours' : null}
-                {followUpView === 'warm-leads' ? 'Warm leads with email activity' : null}
-              </p>
-            </div>
-            <NavLink className={secondaryActionButtonClass} to="/admin/follow-ups">Show All Follow-Ups</NavLink>
-          </Reveal>
-        </section>
-      ) : null}
-
-      {activeSection === 'follow-ups' && !followUpLoading && visibleNotifications.length > 0 ? (
-        <section className="section-shell mt-8">
-          <Reveal className="panel p-5 sm:p-8">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-              <div>
-                <SectionLabel>Follow-Up Notifications</SectionLabel>
-                <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Who needs a follow-up next</h2>
-                <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
-                  These prompts are generated from status, lead type, reminder dates, and document activity so you can keep seller and broker conversations moving without guessing.
-                </p>
-              </div>
-              <Pill tone={visibleNotifications.some((submission) => submission.follow_up_prompt?.kind === 'overdue') ? 'danger' : 'warning'}>{visibleNotifications.length} active prompts</Pill>
-            </div>
-
-            <div className="mt-6 grid gap-4 lg:grid-cols-2">
-              {displayedNotifications.map((submission) => (
-                <div
-                  className={`rounded-2xl border p-4 sm:p-5 ${notificationToneClasses(submission.follow_up_prompt?.severity)}`}
-                  key={`notification-${submission.id}`}
-                >
-                  <div className="flex flex-wrap items-center gap-3">
-                    <p className="text-lg font-semibold">{submission.company || submission.name}</p>
-                    <Pill tone={submission.follow_up_prompt?.severity === 'danger' ? 'danger' : submission.follow_up_prompt?.severity === 'warning' ? 'warning' : 'info'}>
-                      {submission.follow_up_prompt?.kind || 'prompt'}
-                    </Pill>
-                  </div>
-                  <p className="mt-3 text-sm font-semibold uppercase tracking-[0.14em]">
-                    {submission.follow_up_prompt?.title}
-                  </p>
-                  <p className="mt-3 text-sm leading-7">{submission.follow_up_prompt?.message}</p>
-                  <p className="mt-3 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-7">
-                    {submission.follow_up_prompt?.prompt}
-                  </p>
-                  <p className="mt-3 text-xs font-semibold uppercase tracking-[0.14em]">
-                    Next action: {formatDateTime(submission.next_action_at)}
-                  </p>
-                </div>
-              ))}
-            </div>
-          </Reveal>
-        </section>
-      ) : null}
-
-      {activeSection === 'follow-ups' && !followUpLoading && visibleEmailTriage.length > 0 ? (
-        <section className="section-shell mt-8">
-          <Reveal className="panel p-5 sm:p-8">
-            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-              <div>
-                <SectionLabel>Email Follow-Up Triage</SectionLabel>
-                <h2 className="mt-3 text-2xl font-semibold text-ink sm:text-3xl">Leads showing email engagement</h2>
-                <p className="mt-3 max-w-3xl text-base leading-7 text-ink/72">
-                  These records have opens, clicks, replies, or delivery issues that should change the follow-up plan.
-                </p>
-              </div>
-              <Pill tone={visibleEmailTriage.some((submission) => submission.email_engagement?.hot) ? 'success' : 'warning'}>{visibleEmailTriage.filter((submission) => submission.email_engagement?.hot).length} hot lead(s)</Pill>
-            </div>
-
-            <div className="mt-6 grid gap-4 lg:grid-cols-2">
-              {displayedEmailTriage.map((submission) => {
-                const engagement = submission.email_engagement;
-
-                return (
-                  <div
-                    className={`rounded-2xl border p-4 sm:p-5 ${notificationToneClasses(engagement?.tone === 'danger' ? 'danger' : engagement?.tone === 'warning' ? 'warning' : 'info')}`}
-                    key={`email-triage-${submission.id}`}
-                  >
-                    <div className="flex flex-wrap items-center gap-3">
-                      <p className="text-lg font-semibold">{submission.company || submission.name}</p>
-                      <Pill tone={emailEngagementTone(engagement)}>Score {engagement?.score || 0}</Pill>
-                      {engagement?.latest_event_type ? <Pill tone={emailEngagementTone(engagement)}>{engagement.latest_event_type}</Pill> : null}
-                    </div>
-                    <p className="mt-3 text-sm leading-7">{formatEmailEngagement(engagement)}</p>
-                    {engagement?.action ? (
-                      <p className="mt-3 rounded-2xl border border-current/15 bg-white/60 px-4 py-3 text-sm leading-7">{engagement.action}</p>
-                    ) : null}
-                    <p className="mt-3 text-xs font-semibold uppercase tracking-[0.14em]">
-                      Next action: {formatDateTime(submission.next_action_at)}
-                    </p>
-                  </div>
-                );
-              })}
-            </div>
-          </Reveal>
-        </section>
-      ) : null}
-
-      {activeSection === 'follow-ups' && !followUpLoading && !followUpError && visibleNotifications.length === 0 && visibleEmailTriage.length === 0 ? (
-        <section className="section-shell mt-8">
-          <Reveal className="panel p-7 text-sm leading-7 text-ink/70">
-            {followUpView === 'all'
-              ? 'No follow-up prompts or email engagement triage items need attention right now.'
-              : 'No records match this overview-card filter right now.'}
-          </Reveal>
-        </section>
+      {activeSection === 'follow-ups' ? (
+        <Suspense fallback={<div className="section-shell mt-8"><WorkspaceFallback /></div>}>
+          <FollowUpsWorkspace readOnly={isReadOnly} />
+        </Suspense>
       ) : null}
 
       {activeSection === 'new-record' && !isReadOnly ? (
@@ -2804,7 +4000,8 @@ export default function DashboardPage() {
             </div>
 
             <form className="mt-8 space-y-8" onSubmit={handleCreateSubmission}>
-              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
+              <AdminFormSection description="Identify the opportunity and connect it to its source. Only the company or contact context is needed to get started." title="1. Opportunity basics" tourTarget="new-record-basics">
+                <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                 <InputField
                   label="Company / Business"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, company: event.target.value }))}
@@ -2813,7 +4010,7 @@ export default function DashboardPage() {
                 <SelectField
                   label="Status"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, status: event.target.value }))}
-                  options={statuses}
+                  options={editableStatuses}
                   value={createDraft.status}
                 />
                 <SelectField
@@ -2827,9 +4024,9 @@ export default function DashboardPage() {
                   onChange={(event) => setCreateDraft((current) => ({ ...current, assigned_to: event.target.value }))}
                   value={createDraft.assigned_to}
                 />
-              </div>
+                </div>
 
-              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
+                <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                 <InputField
                   label="Listing URL"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, listing_url: event.target.value }))}
@@ -2850,9 +4047,11 @@ export default function DashboardPage() {
                   onChange={(event) => setCreateDraft((current) => ({ ...current, asking_price: event.target.value }))}
                   value={createDraft.asking_price}
                 />
-              </div>
+                </div>
+              </AdminFormSection>
 
-              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-5">
+              <AdminFormSection description="Add the economics you know today. These fields can remain blank until a listing or CIM provides them." title="2. Financial profile" tourTarget="new-record-economics">
+                <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-5">
                 <InputField
                   label="TTM Revenue"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, ttm_revenue: event.target.value }))}
@@ -2878,9 +4077,11 @@ export default function DashboardPage() {
                   onChange={(event) => setCreateDraft((current) => ({ ...current, business_age: event.target.value }))}
                   value={createDraft.business_age}
                 />
-              </div>
+                </div>
+              </AdminFormSection>
 
-              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
+              <AdminFormSection description="Set ownership and the next concrete action so the new record enters the correct working queue." title="3. Workflow" tourTarget="new-record-next-action">
+                <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-4">
                 <SelectField
                   label="Priority"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, priority: event.target.value }))}
@@ -2907,9 +4108,11 @@ export default function DashboardPage() {
                   options={sbaOptions}
                   value={createDraft.sba_eligible}
                 />
-              </div>
+                </div>
+              </AdminFormSection>
 
-              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+              <AdminFormSection description="Capture whichever relationship is available. Broker and seller details remain distinct throughout the CRM." title="4. Contacts">
+                <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
                 <InputField
                   label="Broker name"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, broker_name: event.target.value }))}
@@ -2926,9 +4129,9 @@ export default function DashboardPage() {
                   onChange={(event) => setCreateDraft((current) => ({ ...current, broker_phone: event.target.value }))}
                   value={createDraft.broker_phone}
                 />
-              </div>
+                </div>
 
-              <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
+                <div className="grid gap-5 sm:grid-cols-2 xl:grid-cols-3">
                 <InputField
                   label="Seller name"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, seller_name: event.target.value }))}
@@ -2945,9 +4148,11 @@ export default function DashboardPage() {
                   onChange={(event) => setCreateDraft((current) => ({ ...current, seller_phone: event.target.value }))}
                   value={createDraft.seller_phone}
                 />
-              </div>
+                </div>
+              </AdminFormSection>
 
-              <div className="grid gap-5 lg:grid-cols-[0.7fr_1.3fr]">
+              <AdminFormSection description="Leave enough context for the next person—or your future self—to understand why this opportunity matters." title="5. Context and notes">
+                <div className="grid gap-5 lg:grid-cols-[0.7fr_1.3fr]">
                 <InputField
                   label="Tags"
                   onChange={(event) => setCreateDraft((current) => ({ ...current, tags: event.target.value }))}
@@ -2960,7 +4165,8 @@ export default function DashboardPage() {
                   placeholder="Internal notes, context, next steps, or anything from the broker or seller."
                   value={createDraft.notes}
                 />
-              </div>
+                </div>
+              </AdminFormSection>
 
               {createError ? (
                 <p className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">{createError}</p>
@@ -3001,7 +4207,7 @@ export default function DashboardPage() {
 
       {activeSection === 'crm' && isCrmDetailView ? (
       <section className="section-shell mt-8">
-        <Reveal className="panel p-5 sm:p-7">
+        <Reveal className="panel p-5 sm:p-7" data-admin-tour="crm-detail-workflow">
           <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
             <div>
               <SectionLabel>Diligence Deal Room</SectionLabel>
@@ -3022,9 +4228,40 @@ export default function DashboardPage() {
       ) : null}
 
       {activeSection === 'crm' ? (
-      <section className="section-shell mt-8 pb-8">
+      <section className="section-shell mt-8 pb-8" data-admin-tour="crm-results">
         <div className="space-y-6">
+          {!isCrmDetailView ? (
+            <div className="flex flex-col gap-2 px-1 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <SectionLabel>Records index</SectionLabel>
+                <h2 className="mt-1 text-2xl font-semibold text-ink">{pluralize(dashboardData.total, 'record')}</h2>
+              </div>
+              <p aria-live="polite" className="text-sm text-ink/60">
+                {loading ? 'Updating results…' : `Showing ${submissions.length} on this page`}
+              </p>
+            </div>
+          ) : null}
+
           {submissions.map((submission, index) => {
+            if (!isCrmDetailView) {
+              return (
+                <Reveal
+                  className="panel admin-crm-record-card p-5 sm:p-6"
+                  delay={Math.min(index * 35, 210)}
+                  key={submission.id}
+                >
+                  <CrmRecordCard
+                    detailHref={`/admin/crm/${encodeURIComponent(submission.id)}${crmListSearch ? `?${crmListSearch}` : ''}`}
+                    lifecyclePending={leadLifecyclePendingId === submission.id}
+                    onArchiveLead={handleArchiveLead}
+                    onRestoreLead={handleRestoreLead}
+                    readOnly={isReadOnly}
+                    submission={submission}
+                  />
+                </Reveal>
+              );
+            }
+
             const draft = drafts[submission.id] || buildDraft(submission);
             const latestUploadRequest = submission.latest_upload_request;
             const documents = submission.secure_documents || [];
@@ -3041,12 +4278,16 @@ export default function DashboardPage() {
             const diligenceProgressTone = diligenceProgress.complete === diligenceProgress.total ? 'success' : diligenceProgress.complete > 0 ? 'info' : 'default';
             const dealScore = submissionDealScore(submission);
             const listingDate = submissionListingDate(submission);
-            const listingDateLabel = submission.metadata?.dealHunter?.dateAdded ? 'Date listed' : listingDate ? 'First seen' : 'Date listed';
+            const dateAdded = crmDateAdded(submission);
+            const sourceDateAdded = submission.metadata?.dealHunter?.dateAdded || '';
+            const secondaryDateLabel = sourceDateAdded ? 'Imported to CRM' : listingDate ? 'First seen' : 'Date listed';
+            const secondaryDate = sourceDateAdded ? submission.created_at : listingDate;
+            const brokerContactDetails = crmBrokerContactDetails(submission);
 
             return (
               <Reveal
-                className={`panel p-5 sm:p-8 ${isCrmDetailView ? '' : 'admin-crm-record-card'}`}
-                delay={isCrmDetailView ? 0 : Math.min(index * 35, 210)}
+                className="panel p-5 sm:p-8"
+                delay={0}
                 key={submission.id}
               >
                 <div className="flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
@@ -3077,20 +4318,11 @@ export default function DashboardPage() {
                       submission.email_engagement?.unsubscribed ? (
                         <Pill tone="danger">Email issue</Pill>
                       ) : null}
-                      {!isCrmDetailView ? (
-                        <NavLink
-                          className="inline-flex min-h-[38px] items-center justify-center gap-2 rounded-full border border-ink/10 bg-white px-4 py-2 text-xs font-semibold text-ink transition hover:border-moss/25 hover:text-moss"
-                          to={`/admin/crm/${encodeURIComponent(submission.id)}${crmListSearch ? `?${crmListSearch}` : ''}`}
-                        >
-                          <Target className="h-3.5 w-3.5" />
-                          Open Deal Room
-                        </NavLink>
-                      ) : null}
                     </div>
 
                     <div className="mt-4 grid gap-3 text-sm leading-7 text-ink/74 sm:grid-cols-2 xl:grid-cols-5">
-                      <p><strong>Date added:</strong> {formatDateTime(submission.created_at)}</p>
-                      <p><strong>{listingDateLabel}:</strong> {listingDate ? formatDateTime(listingDate) : 'Not provided'}</p>
+                      <p><strong>Date added:</strong> {dateAdded.formatted}</p>
+                      <p><strong>{secondaryDateLabel}:</strong> {secondaryDate ? formatDateTime(secondaryDate) : 'Not provided'}</p>
                       <p><strong>Last status edit:</strong> {formatDateTime(submission.status_updated_at || submission.updated_at)}</p>
                       <p><strong>Days ago:</strong> {submission.days_since_added ?? '0'}</p>
                       <p><strong>Next action:</strong> {formatDateTime(submission.next_action_at)}</p>
@@ -3154,10 +4386,18 @@ export default function DashboardPage() {
                       <SectionLabel>Contacts</SectionLabel>
                       <div className="mt-4 space-y-5 text-sm leading-7 text-ink/74">
                         <div>
-                          <p className="font-semibold text-ink">Broker</p>
-                          <p>{submission.broker_name || 'Not set'}</p>
-                          <p>{submission.broker_email || 'No email'}</p>
-                          <p>{submission.broker_phone || 'No phone'}</p>
+                          <p className="font-semibold text-ink">Broker details</p>
+                          <p><strong>Broker:</strong> {brokerContactDetails.broker || 'Not set'}</p>
+                          <p><strong>Broker company:</strong> {brokerContactDetails.company || 'Not set'}</p>
+                          <p><strong>Broker contact:</strong> {brokerContactDetails.contact || 'Not set'}</p>
+                          <p>
+                            <strong>Email:</strong>{' '}
+                            {brokerContactDetails.email ? (
+                              <a className="text-moss underline decoration-moss/30 underline-offset-2" href={`mailto:${brokerContactDetails.email}`}>
+                                {brokerContactDetails.email}
+                              </a>
+                            ) : 'Not set'}
+                          </p>
                         </div>
                         <div>
                           <p className="font-semibold text-ink">Seller</p>
@@ -3181,8 +4421,17 @@ export default function DashboardPage() {
                   </div>
                 </div>
 
-                <fieldset className={isReadOnly ? 'opacity-75' : ''} disabled={isReadOnly}>
-                  <div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-6">
+                <LeadLifecycleControls
+                  communications={crmCommunications.rows}
+                  onArchive={handleArchiveLead}
+                  onRestore={handleRestoreLead}
+                  pending={leadLifecyclePendingId === submission.id}
+                  readOnly={isReadOnly}
+                  submission={submission}
+                />
+
+                <fieldset className={isReadOnly ? 'opacity-75' : ''} data-admin-tour="crm-detail-evidence" disabled={isReadOnly}>
+                  <div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-6" data-admin-tour="crm-detail-next-action">
                     <SelectField
                       label="Status"
                       onChange={(event) =>
@@ -3191,7 +4440,7 @@ export default function DashboardPage() {
                           [submission.id]: { ...draft, status: event.target.value },
                         }))
                       }
-                      options={statuses}
+                      options={submission.status === 'archived' ? ['archived'] : editableStatuses}
                       value={draft.status}
                     />
 
@@ -3231,6 +4480,7 @@ export default function DashboardPage() {
                   />
 
                   <SelectField
+                    disabled={submission.status === 'archived'}
                     label="Follow-up state"
                     onChange={(event) =>
                       setDrafts((current) => ({
@@ -3245,6 +4495,7 @@ export default function DashboardPage() {
                   <Field label="Next action">
                     <input
                       className="form-control"
+                      disabled={submission.status === 'archived'}
                       onChange={(event) =>
                         setDrafts((current) => ({
                           ...current,
@@ -3698,47 +4949,72 @@ export default function DashboardPage() {
                   </div>
                 </fieldset>
 
-                {isCrmDetailView ? (
-                  <DealActivityTimeline
-                    error={dealActivity.error}
-                    events={dealActivity.events}
-                    loading={dealActivity.loading}
+                <Suspense fallback={<WorkspaceFallback />}>
+                  <CrmCommunications
+                    cimRequestOptions={crmCimRequestOptions}
+                    communications={crmCommunications.rows}
+                    error={crmCommunications.error}
+                    hasMore={crmCommunicationsHasMore}
+                    loading={crmCommunications.loading}
+                    loadingMore={crmCommunications.loadingMore}
+                    logError={crmCommunications.logError}
+                    logPending={crmCommunications.logPending}
+                    onLoadMore={() => loadCrmCommunications(submission.id, { append: true })}
+                    onLogCommunication={isReadOnly ? undefined : handleLogCommunication}
+                    readOnly={isReadOnly}
+                    workflowUpdatesDisabled={submission.status === 'archived'}
                   />
-                ) : null}
+                </Suspense>
 
-                {!isReadOnly ? (
-                  <div className="mt-6 grid gap-3 sm:flex sm:flex-wrap">
-                    <button
-                      className={primaryActionButtonClass}
-                      disabled={isSaving}
-                      onClick={() => handleSave(submission.id)}
-                      type="button"
-                    >
-                      <Save className="h-4 w-4" />
-                      {isSaving ? 'Saving...' : 'Save Updates'}
-                    </button>
+                <div data-admin-tour="crm-detail-actions">
+                  <Suspense fallback={<WorkspaceFallback />}>
+                    <DealActivityTimeline
+                      error={dealActivity.error}
+                      events={dealActivity.events}
+                      loading={dealActivity.loading}
+                    />
+                  </Suspense>
 
-                    <button
-                      className={secondaryActionButtonClass}
-                      disabled={isCreatingUpload}
-                      onClick={() => handleCreateUploadRequest(submission.id)}
-                      type="button"
-                    >
-                      <Link2 className="h-4 w-4" />
-                      {isCreatingUpload ? 'Creating Link...' : 'Create Secure Upload Link'}
-                    </button>
+                  {!isReadOnly ? (
+                  <>
+                    <div className="mt-6 grid gap-3 sm:flex sm:flex-wrap">
+                      <button
+                        className={primaryActionButtonClass}
+                        disabled={isSaving}
+                        onClick={() => handleSave(submission.id)}
+                        type="button"
+                      >
+                        <Save className="h-4 w-4" />
+                        {isSaving ? 'Saving...' : 'Save Updates'}
+                      </button>
 
-                    <button
-                      className="inline-flex min-h-[46px] w-full min-w-0 items-center justify-center gap-2 rounded-full border border-red-200 bg-red-50 px-4 py-2.5 text-center text-sm font-semibold text-red-700 transition hover:border-red-300 hover:bg-red-100 disabled:opacity-50 sm:w-auto sm:px-5 sm:py-3"
-                      disabled={isDeleting}
-                      onClick={() => handleDeleteSubmission(submission)}
-                      type="button"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                      {isDeleting ? 'Deleting...' : 'Delete Record'}
-                    </button>
-                  </div>
-                ) : null}
+                      <button
+                        className={secondaryActionButtonClass}
+                        disabled={isCreatingUpload}
+                        onClick={() => handleCreateUploadRequest(submission.id)}
+                        type="button"
+                      >
+                        <Link2 className="h-4 w-4" />
+                        {isCreatingUpload ? 'Creating Link...' : 'Create Secure Upload Link'}
+                      </button>
+                    </div>
+
+                    <div className="mt-8 rounded-2xl border border-red-200 bg-red-50/60 p-4 sm:p-5">
+                      <p className="text-sm font-semibold text-red-800">Permanent delete</p>
+                      <p className="mt-1 text-sm leading-6 text-red-700">Permanently removes this CRM record and runs the existing secure-document cleanup workflow. Archive Lead above is the reversible option.</p>
+                      <button
+                        className="mt-4 inline-flex min-h-[46px] w-full min-w-0 items-center justify-center gap-2 rounded-full border border-red-300 bg-white px-4 py-2.5 text-center text-sm font-semibold text-red-700 transition hover:bg-red-100 disabled:opacity-50 sm:w-auto sm:px-5 sm:py-3"
+                        disabled={isDeleting}
+                        onClick={() => handleDeleteSubmission(submission)}
+                        type="button"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        {isDeleting ? 'Deleting...' : 'Permanently Delete Record'}
+                      </button>
+                    </div>
+                  </>
+                  ) : null}
+                </div>
               </Reveal>
             );
           })}

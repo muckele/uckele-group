@@ -1,10 +1,13 @@
 import { Outlet } from 'react-router-dom';
 import Footer from './Footer';
 import Header from './Header';
+import AnalyticsTracker from './AnalyticsTracker';
+import Breadcrumbs from './Breadcrumbs';
 
 export default function Layout() {
   return (
     <div className="relative overflow-x-clip">
+      <AnalyticsTracker />
       <a
         className="skip-link"
         href="#main-content"
@@ -17,6 +20,7 @@ export default function Layout() {
       <Header />
 
       <main id="main-content" tabIndex={-1}>
+        <Breadcrumbs />
         <Outlet />
       </main>
 

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { validateConfig } from '../server/config.js';
 
@@ -84,6 +85,164 @@ test('production follow-ups require the reply-to address to use the receiving do
   const result = validateConfig(config);
   assert.equal(result.ok, false);
   assert.ok(result.errors.some((error) => error.includes('must use the RESEND_INBOUND_DOMAIN')));
+});
+
+test('AI follow-up enrichment fails closed without both a model and an API key', () => {
+  const config = productionConfig();
+  config.followUp = {
+    aiEnabled: true,
+    aiModel: 'gpt-test',
+    aiApiKeyConfigured: false,
+  };
+
+  const missingKey = validateConfig(config);
+  assert.equal(missingKey.ok, false);
+  assert.ok(missingKey.errors.some((error) => error.includes('OPENAI_API_KEY')));
+
+  config.followUp.aiApiKeyConfigured = true;
+  config.followUp.aiModel = '';
+  const missingModel = validateConfig(config);
+  assert.equal(missingModel.ok, false);
+  assert.ok(missingModel.errors.some((error) => error.includes('FOLLOW_UP_AI_MODEL')));
+});
+
+test('AI enablement requires explicit bounded controls and documented rollout gates', () => {
+  const config = productionConfig();
+  config.followUp = {
+    aiEnabled: true,
+    aiModel: 'gpt-5.6-terra',
+    aiApiKeyConfigured: true,
+    aiReasoningEffort: 'implicit-default',
+    aiTimeoutMs: 999,
+    aiMaxContextChars: 1_999,
+    aiMaxOutputTokens: 128,
+    aiMaxRetries: 3,
+    aiRateLimitPerMinute: 121,
+    aiDataHandlingApprovalId: '',
+    aiAcceptedEvalVersion: '',
+    aiCostRateApprovalId: '',
+    aiSyntheticSmokeId: '',
+  };
+
+  const blocked = validateConfig(config);
+  assert.equal(blocked.ok, false);
+  for (const setting of [
+    'FOLLOW_UP_AI_REASONING_EFFORT',
+    'FOLLOW_UP_AI_TIMEOUT_MS',
+    'FOLLOW_UP_AI_MAX_CONTEXT_CHARS',
+    'FOLLOW_UP_AI_MAX_OUTPUT_TOKENS',
+    'FOLLOW_UP_AI_MAX_RETRIES',
+    'FOLLOW_UP_AI_RATE_LIMIT_PER_MINUTE',
+    'FOLLOW_UP_AI_DATA_HANDLING_APPROVAL_ID',
+    'FOLLOW_UP_AI_ACCEPTED_EVAL_VERSION',
+    'FOLLOW_UP_AI_COST_RATE_APPROVAL_ID',
+    'FOLLOW_UP_AI_SYNTHETIC_SMOKE_ID',
+  ]) {
+    assert.ok(blocked.errors.some((error) => error.includes(setting)), `${setting} should block enablement`);
+  }
+
+  Object.assign(config.followUp, {
+    aiReasoningEffort: 'low',
+    aiTimeoutMs: 12_000,
+    aiMaxContextChars: 30_000,
+    aiMaxOutputTokens: 1_600,
+    aiMaxRetries: 0,
+    aiRateLimitPerMinute: 10,
+    aiDataHandlingApprovalId: 'privacy-review-2026-08',
+    aiAcceptedEvalVersion: 'follow-up-eval-v1',
+    aiCostRateApprovalId: 'operations-envelope-2026-08',
+    aiSyntheticSmokeId: 'synthetic-smoke-2026-08',
+  });
+  const configured = validateConfig(config);
+  assert.equal(configured.ok, true);
+});
+
+test('environment parsing does not normalize invalid AI enablement controls into passing values', () => {
+  const configModuleUrl = new URL('../server/config.js', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--input-type=module', '--eval', [
+    `import { getConfig, validateConfig } from ${JSON.stringify(configModuleUrl)};`,
+    'const config = getConfig();',
+    'const validation = validateConfig(config);',
+    'console.log(JSON.stringify({ apiKeyConfigured: config.followUp.aiApiKeyConfigured, errors: validation.errors }));',
+  ].join('\n')], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      NODE_ENV: 'development',
+      FOLLOW_UP_AI_ENABLED: 'true',
+      FOLLOW_UP_AI_MODEL: 'gpt-test',
+      OPENAI_API_KEY: '   ',
+      FOLLOW_UP_AI_REASONING_EFFORT: 'low',
+      FOLLOW_UP_AI_TIMEOUT_MS: 'not-a-number',
+      FOLLOW_UP_AI_MAX_CONTEXT_CHARS: '1999',
+      FOLLOW_UP_AI_MAX_OUTPUT_TOKENS: '128',
+      FOLLOW_UP_AI_MAX_RETRIES: '3',
+      FOLLOW_UP_AI_RATE_LIMIT_PER_MINUTE: '121',
+      FOLLOW_UP_AI_DATA_HANDLING_APPROVAL_ID: 'privacy-review',
+      FOLLOW_UP_AI_ACCEPTED_EVAL_VERSION: 'follow-up-eval-v1',
+      FOLLOW_UP_AI_COST_RATE_APPROVAL_ID: 'cost-review',
+      FOLLOW_UP_AI_SYNTHETIC_SMOKE_ID: 'synthetic-smoke',
+    },
+  });
+  assert.equal(child.status, 0, child.stderr);
+  const parsed = JSON.parse(child.stdout.trim());
+  assert.equal(parsed.apiKeyConfigured, false);
+  for (const setting of [
+    'OPENAI_API_KEY',
+    'FOLLOW_UP_AI_TIMEOUT_MS',
+    'FOLLOW_UP_AI_MAX_CONTEXT_CHARS',
+    'FOLLOW_UP_AI_MAX_OUTPUT_TOKENS',
+    'FOLLOW_UP_AI_MAX_RETRIES',
+    'FOLLOW_UP_AI_RATE_LIMIT_PER_MINUTE',
+  ]) {
+    assert.ok(parsed.errors.some((error) => error.includes(setting)), `${setting} should remain invalid`);
+  }
+});
+
+test('Deal Hunter parses explicit Airtable retirement and validates Deal OS import bounds', () => {
+  const configModuleUrl = new URL('../server/config.js', import.meta.url).href;
+  const child = spawnSync(process.execPath, ['--input-type=module', '--eval', [
+    `import { getConfig, validateConfig } from ${JSON.stringify(configModuleUrl)};`,
+    'const config = getConfig();',
+    'const validation = validateConfig(config);',
+    'console.log(JSON.stringify({ dealHunter: config.dealHunter, errors: validation.errors }));',
+  ].join('\n')], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      NODE_ENV: 'development',
+      DEAL_HUNTER_AIRTABLE_ENABLED: 'false',
+      DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES: 'not-a-number',
+      DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS: '1001',
+      DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS: '721',
+    },
+  });
+  assert.equal(child.status, 0, child.stderr);
+  const parsed = JSON.parse(child.stdout.trim());
+  assert.equal(parsed.dealHunter.airtableEnabled, false);
+  assert.ok(parsed.errors.some((error) => error.includes('DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES')));
+  assert.ok(parsed.errors.some((error) => error.includes('DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS')));
+  assert.ok(parsed.errors.some((error) => error.includes('DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS')));
+});
+
+test('generic follow-up sender and reply identities must align with verified Resend configuration', () => {
+  const config = productionConfig();
+  config.followUp = {
+    emailEnabled: true,
+    senderEmail: 'Different Sender <different@example.com>',
+    replyTo: 'different@other.example.com',
+    physicalPostalAddress: '123 Main Street',
+    replyOptOutEnabled: true,
+    optOutBaseUrl: '',
+    requireSignedPreview: false,
+  };
+
+  const result = validateConfig(config);
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes('FOLLOW_UP_SENDER_EMAIL must match')));
+  assert.ok(result.errors.some((error) => error.includes('FOLLOW_UP_REPLY_TO must match')));
+  assert.ok(result.errors.some((error) => error.includes('FOLLOW_UP_REPLY_TO must use')));
+  assert.ok(result.errors.some((error) => error.includes('FOLLOW_UP_REQUIRE_SIGNED_PREVIEW')));
 });
 
 test('production configuration validates EmailJS and Formspree provider requirements', () => {
@@ -186,4 +345,31 @@ test('configuration rejects unsafe origins, ports, retention, and resource limit
   assert.ok(result.errors.some((error) => error.includes('SPAM_SCORE_THRESHOLD')));
   assert.ok(result.errors.some((error) => error.includes('DEAL_HUNTER_LOOKBACK_DAYS')));
   assert.ok(result.errors.some((error) => error.includes('DEAL_HUNTER_MAX_SOURCE_RECORDS')));
+});
+
+test('CIM recipient caps and follow-up send windows fail closed when invalid', () => {
+  const config = productionConfig();
+  config.dealHunter.cimOutreach = {
+    recipientCap24Hours: 0,
+    recipientCap30Days: Number.NaN,
+    overrideMaxHours: 500,
+  };
+  config.dealHunter.cimFollowUp.sendWindowStart = '8:00';
+  config.dealHunter.cimFollowUp.sendWindowEnd = '08:00';
+  const invalid = validateConfig(config);
+  assert.equal(invalid.ok, false);
+  for (const setting of [
+    'DEAL_HUNTER_CIM_RECIPIENT_24_HOUR_CAP',
+    'DEAL_HUNTER_CIM_RECIPIENT_30_DAY_TOUCH_CAP',
+    'DEAL_HUNTER_CIM_RECIPIENT_OVERRIDE_MAX_HOURS',
+    'DEAL_HUNTER_CIM_FOLLOW_UP_SEND_WINDOW_START',
+  ]) {
+    assert.ok(invalid.errors.some((error) => error.includes(setting)), `${setting} should fail closed`);
+  }
+
+  Object.assign(config.dealHunter.cimOutreach, { recipientCap24Hours: 2, recipientCap30Days: 1, overrideMaxHours: 24 });
+  Object.assign(config.dealHunter.cimFollowUp, { sendWindowStart: '17:00', sendWindowEnd: '08:00' });
+  const reversed = validateConfig(config);
+  assert.ok(reversed.errors.some((error) => error.includes('30_DAY_TOUCH_CAP')));
+  assert.ok(reversed.errors.some((error) => error.includes('SEND_WINDOW_START must be earlier')));
 });
