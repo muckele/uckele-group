@@ -88,6 +88,7 @@ async function seedQueue(t) {
   for (const deal of deals) await seedOpportunity(storage, deal.opportunityId);
   const refreshed = await refreshOpportunityScores({ deals, storage });
   assert.equal(refreshed.ok, true, JSON.stringify(refreshed.errors));
+  await storage.reconcileDealHunterCurrentScoreEligibility(deals.map((deal) => deal.opportunityId));
 
   await storage.upsertDealHunterDisposition({
     id: 'disposition-dismissed',
@@ -283,6 +284,37 @@ test('the detail view explains a score from persisted evidence alone', async (t)
   const absent = await getTriageOpportunityDetail({ opportunityId: 'opp-nope', storage });
   assert.equal(absent.ok, false);
   assert.equal(absent.status, 404);
+});
+
+test('inactive historical scores disappear from every triage surface without losing score or evidence history', async (t) => {
+  const storage = await seedQueue(t);
+  const evidenceBefore = await storage.listDealHunterScoreEvidence('opp-high');
+  assert.ok(evidenceBefore.length > 0);
+
+  await storage.reconcileDealHunterCurrentScoreEligibility([
+    'opp-watch', 'opp-sparse', 'opp-removed', 'opp-dismissed',
+  ]);
+
+  const queue = await listTriageQueue({ view: 'all', search: 'Opportunity high', storage });
+  assert.equal(queue.total, 0);
+  assert.deepEqual(queue.rows, []);
+
+  const detail = await getTriageOpportunityDetail({ opportunityId: 'opp-high', storage });
+  assert.equal(detail.ok, false);
+  assert.equal(detail.status, 404);
+
+  const decision = await setTriageOperatorDecision({
+    opportunityId: 'opp-high', priority: 'urgent', actor: 'owner@example.invalid', storage,
+  });
+  assert.equal(decision.ok, false);
+  assert.equal(decision.status, 404);
+
+  assert.ok(await storage.getDealHunterOpportunityScore('opp-high'), 'raw historical score remains available');
+  assert.equal(
+    (await storage.listDealHunterScoreEvidence('opp-high')).length,
+    evidenceBefore.length,
+    'raw historical evidence remains available',
+  );
 });
 
 test('a gated opportunity keeps its explanation and its gate reason', async (t) => {

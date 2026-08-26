@@ -10,6 +10,7 @@ import {
   buildDealHunterCimRequestEmail,
   normalizeResendTagToken,
   sendDailyDealHunterEmail,
+  sendDailyDealHunterSourceAlertEmail,
   sendPreparedMessage,
 } from './delivery.js';
 import { createManualSubmission } from './submissions.js';
@@ -1865,20 +1866,6 @@ function formatPayloadLimitError(byteLength, maxBytes, label = 'Remote response'
   return new Error(`${label} is too large to import safely (${sizeMb} MB, limit ${limitMb} MB).`);
 }
 
-function formatAirtableSharedViewPayloadLimitError(byteLength, maxBytes) {
-  const sizeMb = (byteLength / (1024 * 1024)).toFixed(1);
-  const limitMb = (maxBytes / (1024 * 1024)).toFixed(1);
-  const error = new Error(
-    `Airtable shared view is too large to import safely (${sizeMb} MB, limit ${limitMb} MB). Set DEAL_HUNTER_AIRTABLE_TOKEN so the app can use Airtable's paged API instead of the oversized shared view.`,
-  );
-
-  error.code = 'AIRTABLE_SHARED_VIEW_PAYLOAD_LIMIT';
-  error.requiresConfiguration = true;
-  error.configurationKey = 'DEAL_HUNTER_AIRTABLE_TOKEN';
-
-  return error;
-}
-
 async function readResponseText(response, maxBytes = Infinity, formatLimitError = formatPayloadLimitError) {
   const contentLength = Number(response.headers.get('content-length') || 0);
 
@@ -2004,17 +1991,6 @@ async function fetchText(url, {
   }
 }
 
-async function fetchJson(url, {
-  headers = {},
-  timeoutMs = defaultTimeoutMs,
-  maxBytes = Infinity,
-  payloadLabel = 'Remote response',
-  limitErrorFactory,
-} = {}) {
-  const text = await fetchText(url, { headers, timeoutMs, maxBytes, payloadLabel, limitErrorFactory });
-  return JSON.parse(text);
-}
-
 async function fetchBytes(url, {
   headers = {},
   timeoutMs = defaultTimeoutMs,
@@ -2136,166 +2112,6 @@ async function fetchSheetCsvDeals(url, sourceIndex, config) {
       unmatchedWorkbookListingUrlCount: Number(workbookResult.unmatchedListingUrlCount || 0),
       listingUrlWarning: workbookResult.error,
     },
-  };
-}
-
-function buildAirtableEmbedUrl(sharedViewUrl) {
-  const url = new URL(sharedViewUrl);
-
-  if (url.pathname.startsWith('/embed/')) {
-    return url.toString();
-  }
-
-  const baseId = url.pathname.match(/app[A-Za-z0-9]+/)?.[0];
-  const shareId = url.pathname.match(/shr[A-Za-z0-9]+/)?.[0];
-
-  if (!baseId || !shareId) {
-    throw new Error('Airtable shared view URL must include both app... and shr... ids.');
-  }
-
-  return `https://airtable.com/embed/${baseId}/${shareId}?viewControls=on`;
-}
-
-function decodeAirtableEmbeddedPath(value = '') {
-  return value
-    .replaceAll('\\u002F', '/')
-    .replaceAll('\\u0026', '&')
-    .replaceAll('&amp;', '&');
-}
-
-function extractAirtableSharedDataPath(html = '') {
-  const urlWithParamsMatch = html.match(/urlWithParams:\s*"([^"]+readSharedViewData[^"]+)"/);
-
-  if (urlWithParamsMatch) {
-    return decodeAirtableEmbeddedPath(urlWithParamsMatch[1]);
-  }
-
-  const fetchMatch = html.match(/fetch\("([^"]+readSharedViewData[^"]+)"/);
-  return fetchMatch ? decodeAirtableEmbeddedPath(fetchMatch[1]) : '';
-}
-
-function normalizeAirtableCell(column, value) {
-  if (Array.isArray(value)) {
-    return value.map((item) => normalizeAirtableCell(column, item)).filter((item) => normalizeText(item) !== '');
-  }
-
-  if (value && typeof value === 'object') {
-    if (value.url) {
-      return {
-        label: normalizeText(value.label || 'View Listing', 100),
-        url: normalizeUrl(value.url),
-      };
-    }
-
-    return normalizeText(Object.values(value).join(' '), 1000);
-  }
-
-  if (column?.typeOptions?.choices?.[value]) {
-    return column.typeOptions.choices[value].name;
-  }
-
-  return value;
-}
-
-function mapAirtableSharedPayload(payload, source, maxRecords = Infinity) {
-  const table = payload?.data?.table || {};
-  const columnsById = Object.fromEntries((table.columns || []).map((column) => [column.id, column]));
-  const rows = (Array.isArray(table.rows) ? table.rows : []).slice(0, maxRecords);
-
-  return rows.map((row) => {
-    const namedRow = Object.entries(row.cellValuesByColumnId || {}).reduce((record, [columnId, value]) => {
-      const column = columnsById[columnId];
-      record[column?.name || columnId] = normalizeAirtableCell(column, value);
-      return record;
-    }, {});
-
-    return normalizeDealRecord(namedRow, {
-      ...source,
-      rowId: row.id,
-    });
-  });
-}
-
-async function fetchAirtableSharedDeals(url, maxRecords, maxPayloadBytes) {
-  const embedUrl = buildAirtableEmbedUrl(url);
-  const html = await fetchText(embedUrl);
-  const dataPath = extractAirtableSharedDataPath(html);
-  const applicationId = html.match(/"x-airtable-application-id":"([^"]+)"/)?.[1] || html.match(/"singleApplicationId":"([^"]+)"/)?.[1] || '';
-
-  if (!dataPath) {
-    throw new Error('Airtable shared view did not expose a readable shared-view data endpoint.');
-  }
-
-  const payload = await fetchJson(
-    new URL(dataPath, 'https://airtable.com').toString(),
-    {
-      headers: {
-        'x-requested-with': 'XMLHttpRequest',
-        'x-user-locale': 'en',
-        'x-time-zone': 'America/Los_Angeles',
-        ...(applicationId ? { 'x-airtable-application-id': applicationId } : {}),
-      },
-      maxBytes: maxPayloadBytes,
-      limitErrorFactory: formatAirtableSharedViewPayloadLimitError,
-    },
-  );
-  const source = {
-    id: 'airtable-shared',
-    name: payload?.data?.sharedModelName || 'Airtable Biz List',
-    mode: 'shared-view',
-    url,
-    fetched: true,
-  };
-  const deals = mapAirtableSharedPayload(payload, source, maxRecords);
-
-  return {
-    source: {
-      ...source,
-      rowCount: deals.length,
-    },
-    deals,
-  };
-}
-
-async function fetchAirtableApiDeals(config) {
-  const records = [];
-  let offset = '';
-  const baseUrl = `https://api.airtable.com/v0/${encodeURIComponent(config.dealHunter.airtableBaseId)}/${encodeURIComponent(config.dealHunter.airtableTableId)}`;
-
-  do {
-    const url = new URL(baseUrl);
-    url.searchParams.set('pageSize', '100');
-
-    if (config.dealHunter.airtableViewId) {
-      url.searchParams.set('view', config.dealHunter.airtableViewId);
-    }
-
-    if (offset) {
-      url.searchParams.set('offset', offset);
-    }
-
-    const payload = await fetchJson(url.toString(), {
-      headers: {
-        Authorization: `Bearer ${config.dealHunter.airtableToken}`,
-      },
-    });
-
-    records.push(...(payload.records || []));
-    offset = payload.offset || '';
-  } while (offset && records.length < config.dealHunter.maxSourceRecords);
-
-  return {
-    source: {
-      id: 'airtable-api',
-      name: 'Airtable Biz List',
-      mode: 'api',
-      url: config.dealHunter.airtableSharedViewUrl,
-      fetched: true,
-      rowCount: records.length,
-    },
-    deals: records
-      .slice(0, config.dealHunter.maxSourceRecords)
-      .map((record) => normalizeDealRecord(record.fields || {}, { id: 'airtable-api', name: 'Airtable Biz List', mode: 'api', rowId: record.id })),
   };
 }
 
@@ -2793,12 +2609,60 @@ async function loadDealOsExportSource(config, storage, importId = '') {
 async function collectSources(config, storage, { dealOsImportId = '' } = {}) {
   const sourceResults = [];
 
-  const dealOsSource = await loadDealOsExportSource(config, storage, dealOsImportId);
-  if (dealOsSource) sourceResults.push(dealOsSource);
+  let dealOsSource = null;
+  try {
+    dealOsSource = await loadDealOsExportSource(config, storage, dealOsImportId);
+  } catch (error) {
+    dealOsSource = {
+      source: {
+        id: dealOsSourceId,
+        name: dealOsSourceName,
+        mode: 'manual-export',
+        fetched: false,
+        rowCount: 0,
+        error: `The optional Deal OS import is unavailable: ${normalizeText(error.message, 400) || 'storage lookup failed.'}`,
+      },
+      deals: [],
+    };
+  }
+  if (dealOsSource) {
+    sourceResults.push({
+      ...dealOsSource,
+      source: {
+        ...dealOsSource.source,
+        required: false,
+        sourceRole: 'optional-supplemental',
+      },
+    });
+  }
+
+  if (config.dealHunter.sheetCsvUrls.length === 0) {
+    sourceResults.push({
+      source: {
+        id: 'sheet-0',
+        name: 'SMB Deal Hunter Google Sheet',
+        mode: 'csv',
+        fetched: false,
+        required: true,
+        sourceRole: 'required-primary',
+        rowCount: 0,
+        error: 'The required Google Sheet source is not configured.',
+      },
+      deals: [],
+    });
+  }
 
   for (const [index, url] of config.dealHunter.sheetCsvUrls.entries()) {
     try {
-      sourceResults.push(await fetchSheetCsvDeals(url, index, config));
+      const sheetResult = await fetchSheetCsvDeals(url, index, config);
+      sourceResults.push({
+        ...sheetResult,
+        source: {
+          ...sheetResult.source,
+          required: true,
+          sourceRole: 'required-primary',
+        },
+      });
     } catch (error) {
       sourceResults.push({
         source: {
@@ -2807,56 +2671,10 @@ async function collectSources(config, storage, { dealOsImportId = '' } = {}) {
           mode: 'csv',
           url,
           fetched: false,
+          required: true,
+          sourceRole: 'required-primary',
           rowCount: 0,
           error: error.message,
-        },
-        deals: [],
-      });
-    }
-  }
-
-  if (!config.dealHunter.airtableEnabled) {
-    return sourceResults;
-  }
-
-  if (config.dealHunter.airtableToken && config.dealHunter.airtableBaseId && config.dealHunter.airtableTableId) {
-    try {
-      sourceResults.push(await fetchAirtableApiDeals(config));
-    } catch (error) {
-      sourceResults.push({
-        source: {
-          id: 'airtable-api',
-          name: 'Airtable Biz List',
-          mode: 'api',
-          url: config.dealHunter.airtableSharedViewUrl,
-          fetched: false,
-          rowCount: 0,
-          error: error.message,
-        },
-        deals: [],
-      });
-    }
-  } else if (config.dealHunter.airtableSharedViewUrl) {
-    try {
-      sourceResults.push(
-        await fetchAirtableSharedDeals(
-          config.dealHunter.airtableSharedViewUrl,
-          config.dealHunter.maxSourceRecords,
-          config.dealHunter.airtableSharedMaxPayloadBytes,
-        ),
-      );
-    } catch (error) {
-      sourceResults.push({
-        source: {
-          id: 'airtable-shared',
-          name: 'Airtable Biz List',
-          mode: 'shared-view',
-          url: config.dealHunter.airtableSharedViewUrl,
-          fetched: false,
-          rowCount: 0,
-          error: error.message,
-          requiresConfiguration: Boolean(error.requiresConfiguration),
-          configurationKey: error.configurationKey || '',
         },
         deals: [],
       });
@@ -6443,25 +6261,32 @@ async function processCimFollowUpRequest(storage, request, nowIso) {
 
 function buildDealHunterCoverage(config, sourceResults = []) {
   const dealOsSource = sourceResults.find((result) => result.source.id === dealOsSourceId)?.source || null;
-  const activeSourceNames = sourceResults.map((result) => result.source.name).filter(Boolean);
   const warnings = [];
+  const optionalSourceWarnings = [];
   const stage2Warnings = [];
-  const disabledSources = [];
+  const disabledSources = [{
+    id: 'airtable-disabled',
+    name: 'Legacy Airtable Biz List',
+    mode: 'retired',
+    disabled: true,
+    retired: true,
+    required: false,
+    sourceRole: 'retired',
+    fetched: false,
+    rowCount: 0,
+    reason: 'Airtable is retired and excluded from source collection and health.',
+  }];
 
-  if (!config.dealHunter.airtableEnabled) {
-    disabledSources.push({
-      id: 'airtable-disabled',
-      name: 'Legacy Airtable Biz List',
-      mode: 'disabled',
-      disabled: true,
-      fetched: true,
-      rowCount: 0,
-      reason: 'Explicitly retired with DEAL_HUNTER_AIRTABLE_ENABLED=false.',
-    });
-    warnings.push(dealOsSource
-      ? `Legacy Airtable is disabled. Deal OS coverage is limited to the ${dealOsSource.scope === 'saved-search' ? 'saved search' : 'Deal Radar filter'} “${dealOsSource.coverageLabel}” exported ${dealOsSource.exportedAt}.`
-      : `Legacy Airtable is disabled and no Deal OS export is active. This review covers only ${activeSourceNames.join(', ') || 'the remaining configured sources'}.`);
+  if (!dealOsSource) {
+    optionalSourceWarnings.push("OPTIONAL DEAL OS IMPORT ABSENT: No Deal OS CSV/XLSX import is active. Today's digest and eligible manual workflows use only the required Google Sheet; Deal OS reconciliation requires a fresh selected import.");
+  } else if (!dealOsSource.fetched || dealOsSource.error) {
+    const condition = /\bstale\b|hours? old|freshness limit/i.test(String(dealOsSource.error || ''))
+      ? 'STALE'
+      : 'UNAVAILABLE';
+    optionalSourceWarnings.push(`OPTIONAL DEAL OS IMPORT ${condition} — NOT USED: ${dealOsSource.error || 'The latest import is unavailable.'} Today's digest and eligible manual workflows use only current Google Sheet rows; Deal OS reconciliation requires a fresh selected import.`);
   }
+
+  warnings.push(...optionalSourceWarnings);
 
   if (dealOsSource?.coverageLimitReached) {
     const warning = `The Deal OS export reached the ${config.dealHunter.dealOsExportMaxRecords}-listing import ceiling. Listings beyond the export cap may be absent.`;
@@ -6471,6 +6296,7 @@ function buildDealHunterCoverage(config, sourceResults = []) {
 
   return {
     warnings,
+    optionalSourceWarnings,
     stage2Warnings,
     disabledSources,
     dealOsImportPolicy: {
@@ -6492,6 +6318,66 @@ async function buildDailyDealReview({ reviewMode = 'daily', dealOsImportId = '',
   const generatedAt = new Date().toISOString();
   const sourceResults = await collectSources(config, storage, { dealOsImportId });
   const coverage = buildDealHunterCoverage(config, sourceResults);
+  const sourceOnlyReview = {
+    generatedAt,
+    reviewMode: normalizedReviewMode,
+    lookbackDays: config.dealHunter.lookbackDays,
+    selection: {
+      strategy: normalizedReviewMode === 'full-backfill' ? 'all-canonical-listings' : 'recent-listings',
+      recentListings: 0,
+      usedDailyFallback: false,
+    },
+    profile: {
+      minAnnualProfit: profile.minAnnualProfit,
+      maxAnnualProfit: profile.maxAnnualProfit,
+      targetStates: profile.targetStates,
+      managementRequired: false,
+      managementPreferred: true,
+      buyerCashContext: 'ROBS plus savings can support an acquisition when paired with SBA financing, seller note, or investors.',
+    },
+    sources: sourceResults.map((result) => result.source),
+    disabledSources: coverage.disabledSources,
+    coverageWarnings: coverage.warnings,
+    optionalSourceWarnings: coverage.optionalSourceWarnings,
+    stage2CoverageWarnings: coverage.stage2Warnings,
+    scoringDeferred: true,
+    scoringDeferredReason: 'Scoring and scored-opportunity actions are deferred until every required Google Sheet is healthy.',
+    cimOutreachPause: { paused: true, reason: 'The required Google Sheet source is unavailable.' },
+    dealOsImportPolicy: coverage.dealOsImportPolicy,
+    crmSyncPreview: { count: 0, dealKeys: [] },
+    totals: {
+      sourceRows: 0,
+      normalizedDeals: 0,
+      collapsedDuplicates: 0,
+      recentDeals: 0,
+      reviewedDeals: 0,
+      newDeals: 0,
+      newMatches: 0,
+      qualified: 0,
+      watchlist: 0,
+      removalCandidates: 0,
+      dismissed: 0,
+      cimReady: 0,
+      crmEligible: 0,
+    },
+    criteriaRecommendations: [],
+    newlySeenMatches: [],
+    qualified: [],
+    watchlist: [],
+    removalCandidates: [],
+    identityExceptions: [],
+  };
+
+  // Required-source health is an invariant of the canonical review builder,
+  // not an option individual callers can forget. This return happens before
+  // deduplication, identity attachment, scoring, history writes, or any scored
+  // opportunity output can be produced from supplemental rows alone.
+  if (reviewHasRequiredSourceFailures(sourceOnlyReview)) {
+    const latestDealOsImport = sourceResults.find((result) => result.source.id === dealOsSourceId)?.source?.latestImport || null;
+    sourceOnlyReview.importSummary = buildDealHunterImportSummary(sourceOnlyReview, latestDealOsImport);
+    return { review: sourceOnlyReview, scoredDeals: [], storage };
+  }
+
   const allDeals = dedupeDeals(sourceResults.flatMap((result) => result.deals));
   const recentDeals = allDeals.filter((deal) => isRecentDeal(deal, config.dealHunter.lookbackDays));
   const usedDailyFallback = normalizedReviewMode === 'daily' && recentDeals.length === 0 && allDeals.length > 0;
@@ -6580,6 +6466,9 @@ async function buildDailyDealReview({ reviewMode = 'daily', dealOsImportId = '',
     })
     .map(publicDeal);
   const crmEligibleDeals = dealHunterCrmCandidates(scoredDeals);
+  const includedSourceRows = sourceResults
+    .filter((result) => result.source.fetched && !result.source.error)
+    .reduce((sum, result) => sum + (result.source.rowCount || 0), 0);
 
   const review = {
     generatedAt,
@@ -6601,7 +6490,10 @@ async function buildDailyDealReview({ reviewMode = 'daily', dealOsImportId = '',
     sources: sourceResults.map((result) => result.source),
     disabledSources: coverage.disabledSources,
     coverageWarnings: coverage.warnings,
+    optionalSourceWarnings: coverage.optionalSourceWarnings,
     stage2CoverageWarnings: coverage.stage2Warnings,
+    scoringDeferred: false,
+    scoringDeferredReason: '',
     cimOutreachPause: outreachGate.status,
     dealOsImportPolicy: coverage.dealOsImportPolicy,
     crmSyncPreview: {
@@ -6609,9 +6501,9 @@ async function buildDailyDealReview({ reviewMode = 'daily', dealOsImportId = '',
       dealKeys: crmEligibleDeals.map((deal) => deal.dealKey).sort(),
     },
     totals: {
-      sourceRows: sourceResults.reduce((sum, result) => sum + (result.source.rowCount || 0), 0),
+      sourceRows: includedSourceRows,
       normalizedDeals: allDeals.length,
-      collapsedDuplicates: Math.max(0, sourceResults.reduce((sum, result) => sum + (result.source.rowCount || 0), 0) - allDeals.length),
+      collapsedDuplicates: Math.max(0, includedSourceRows - allDeals.length),
       recentDeals: recentDeals.length,
       reviewedDeals: candidateDeals.length,
       newDeals: scoredDeals.filter((deal) => deal.isNew).length,
@@ -6797,22 +6689,47 @@ export async function listDealHunterCimRequestHistory({
   };
 }
 
-export async function sendDailyDealHunterReview({ idempotencyKey = '', storage = getStorage() } = {}) {
+export async function sendDailyDealHunterReview({
+  idempotencyKey = '',
+  storage = getStorage(),
+  sendDigestEmail = sendDailyDealHunterEmail,
+  sendSourceAlertEmail = sendDailyDealHunterSourceAlertEmail,
+} = {}) {
   const result = await buildDailyDealReview({ reviewMode: 'daily', storage });
   const { review, scoredDeals } = result;
   const config = getConfig();
 
-  if (reviewHasSourceFailures(review)) {
+  if (reviewHasRequiredSourceFailures(review)) {
+    if (storage.listEmailEvents) {
+      try {
+        const deliveryEvents = await storage.listEmailEvents({ source: 'daily-deal-hunter', limit: 50 });
+        const latestNormalDelivery = (Array.isArray(deliveryEvents) ? deliveryEvents : [])
+          .filter((event) => event?.event_type === 'sent'
+            && event?.metadata?.tracking?.notificationType !== 'required-source-alert'
+            && !/action required/i.test(String(event?.subject || '')))
+          .sort((left, right) => Date.parse(right.created_at || '') - Date.parse(left.created_at || ''))[0];
+        if (latestNormalDelivery) {
+          review.latestSuccessfulDelivery = {
+            createdAt: latestNormalDelivery.created_at || '',
+            subject: latestNormalDelivery.subject || '',
+          };
+        }
+      } catch (error) {
+        console.warn(`[deal-hunter] prior daily delivery lookup failed: ${normalizeText(error.message, 300)}`);
+      }
+    }
+    const emailResult = await sendSourceAlertEmail({
+      to: config.dealHunter.recipient || config.delivery.fallbackRecipient,
+      review,
+      idempotencyKey,
+    });
     return {
       review,
-      emailResult: {
-        status: 'failed',
-        error: 'Daily Deal Hunter email was not sent because one or more sources were unavailable. Restore every source and review again.',
-        providerMessageId: '',
-      },
+      emailResult,
+      notificationType: 'required-source-alert',
       crmSync: dealHunterCrmSyncSummary({
         paused: true,
-        reason: 'CRM sync is unavailable while one or more deal sources are unavailable.',
+        reason: 'CRM sync is unavailable while the required Google Sheet source is unavailable.',
       }),
     };
   }
@@ -6853,7 +6770,7 @@ export async function sendDailyDealHunterReview({ idempotencyKey = '', storage =
     remainingDailyCapacity: automationStatus.capacity?.remaining ?? 0,
   };
 
-  const emailResult = await sendDailyDealHunterEmail({
+  const emailResult = await sendDigestEmail({
     to: config.dealHunter.recipient || config.delivery.fallbackRecipient,
     review,
     idempotencyKey,
@@ -6866,6 +6783,7 @@ export async function sendDailyDealHunterReview({ idempotencyKey = '', storage =
   return {
     review,
     emailResult,
+    notificationType: 'normal-digest',
     crmSync,
   };
 }
@@ -7524,10 +7442,10 @@ export async function syncDealHunterHighFitsToCrm({
   const result = await buildDailyDealReview({ reviewMode, storage });
   const { review, scoredDeals } = result;
 
-  if (reviewHasSourceFailures(review)) {
+  if (reviewHasRequiredSourceFailures(review)) {
     const crmSync = dealHunterCrmSyncSummary({
       paused: true,
-      reason: 'CRM sync was not run because one or more deal sources are unavailable.',
+      reason: 'CRM sync was not run because a required Google Sheet is unavailable.',
     });
     review.crmSync = crmSync;
     review.importSummary = buildDealHunterImportSummary(
@@ -8758,11 +8676,11 @@ export async function sendDealHunterCimRequest({ dealKey = '', snapshotToken = '
     };
   }
 
-  if (reviewHasSourceFailures(result.review)) {
+  if (reviewHasRequiredSourceFailures(result.review)) {
     return {
       ok: false,
       status: 503,
-      error: 'Deal Hunter source review is incomplete. Restore every source and review again before sending this CIM request.',
+      error: 'Deal Hunter required-source review is incomplete. Restore every required Google Sheet and review again before sending this CIM request.',
     };
   }
 
@@ -9028,7 +8946,19 @@ function buildSelectionFailure(selection, error) {
 }
 
 function reviewHasSourceFailures(review = null) {
-  return (review?.sources || []).some((source) => source?.fetched === false || source?.error);
+  return reviewHasRequiredSourceFailures(review)
+    || (review?.sources || []).some((source) => source?.fetched === false || source?.error);
+}
+
+function reviewHasRequiredSourceFailures(review = null) {
+  const requiredSources = (review?.sources || []).filter((source) => (
+    source?.required === true
+    || source?.sourceRole === 'required-primary'
+    || String(source?.id || '').startsWith('sheet-')
+  ));
+
+  return requiredSources.length === 0
+    || requiredSources.some((source) => source?.fetched === false || source?.error || Number(source?.rowCount || 0) <= 0);
 }
 
 export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit = cimBulkRequestMax, selections = [], storage = getStorage() } = {}) {
@@ -9079,11 +9009,11 @@ export async function sendDealHunterReadyCimRequests({ requestedBy = '', limit =
     };
   }
 
-  if (reviewHasSourceFailures(result.review)) {
+  if (reviewHasRequiredSourceFailures(result.review)) {
     return {
       ok: false,
       status: 503,
-      error: 'Deal Hunter source review is incomplete. Restore every source and review again before sending bulk CIM requests.',
+      error: 'Deal Hunter required-source review is incomplete. Restore every required Google Sheet and review again before sending bulk CIM requests.',
       review: result.review,
       results: [],
       sent: 0,

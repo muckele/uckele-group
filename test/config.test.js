@@ -211,7 +211,9 @@ test('Deal Hunter parses explicit Airtable retirement and validates Deal OS impo
     env: {
       ...process.env,
       NODE_ENV: 'development',
-      DEAL_HUNTER_AIRTABLE_ENABLED: 'false',
+      DEAL_HUNTER_AIRTABLE_ENABLED: 'true',
+      DEAL_HUNTER_AIRTABLE_TOKEN: 'obsolete-token-must-be-ignored',
+      DEAL_HUNTER_AIRTABLE_BASE_ID: 'obsolete-base',
       DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES: 'not-a-number',
       DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS: '1001',
       DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS: '721',
@@ -220,6 +222,8 @@ test('Deal Hunter parses explicit Airtable retirement and validates Deal OS impo
   assert.equal(child.status, 0, child.stderr);
   const parsed = JSON.parse(child.stdout.trim());
   assert.equal(parsed.dealHunter.airtableEnabled, false);
+  assert.equal(Object.hasOwn(parsed.dealHunter, 'airtableToken'), false);
+  assert.equal(Object.hasOwn(parsed.dealHunter, 'airtableBaseId'), false);
   assert.ok(parsed.errors.some((error) => error.includes('DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES')));
   assert.ok(parsed.errors.some((error) => error.includes('DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS')));
   assert.ok(parsed.errors.some((error) => error.includes('DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS')));

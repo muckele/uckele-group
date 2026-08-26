@@ -193,9 +193,31 @@ test('source health retains Deal OS export freshness and coverage provenance', (
   assert.equal(snapshot.sources['deal-os-export'].exportedAt, '2026-08-10T15:00:00.000Z');
 });
 
-test('source health suppresses no-new-deals warning when a configured source fails', () => {
+test('optional Deal OS alone cannot make source health healthy without the required Google Sheet', () => {
   const health = buildAcquisitionSourceHealth({
-    now: new Date('2026-06-16T18:00:00.000Z'),
+    review: {
+      generatedAt: '2026-08-10T17:00:00.000Z',
+      totals: { newDeals: 2 },
+      sources: [{
+        id: 'deal-os-export',
+        name: 'SMB Deal OS export',
+        mode: 'manual-export',
+        required: false,
+        sourceRole: 'optional-supplemental',
+        fetched: true,
+        rowCount: 120,
+      }],
+    },
+    now: new Date('2026-08-10T17:00:00.000Z'),
+  });
+
+  assert.equal(health.healthy, false);
+  assert.equal(health.issues.some((issue) => issue.sourceId === 'sheet-0'), true);
+});
+
+test('retired Airtable is excluded from source health even if a legacy review includes it', () => {
+  const health = buildAcquisitionSourceHealth({
+    now: new Date('2026-06-16T15:00:00.000Z'),
     config: {
       dealHunter: {
         dailyEmail: {
@@ -230,13 +252,10 @@ test('source health suppresses no-new-deals warning when a configured source fai
       ],
     },
   });
-  const airtableStatus = health.sources.find((source) => source.id === 'airtable-shared');
-
-  assert.equal(health.healthy, false);
-  assert.equal(airtableStatus.tone, 'warning');
-  assert.equal(airtableStatus.requiresConfiguration, true);
-  assert.equal(airtableStatus.configurationKey, 'DEAL_HUNTER_AIRTABLE_TOKEN');
-  assert.equal(health.issues.some((issue) => issue.sourceId === 'airtable-shared'), true);
+  assert.equal(health.healthy, true);
+  assert.equal(health.sources.some((source) => source.id === 'airtable-shared'), false);
+  assert.equal(health.issues.some((issue) => issue.sourceId === 'airtable-shared'), false);
+  assert.equal(health.issues.some((issue) => issue.sourceId === 'deal-os-export'), true);
   assert.equal(health.issues.some((issue) => issue.sourceId === 'daily-update-window'), false);
 });
 
@@ -371,7 +390,7 @@ test('source health uses cached snapshot unless explicitly refreshed', async () 
   }
 });
 
-test('cached source health recomputes Deal OS export age and fails stale imports closed', async () => {
+test('cached source health warns on stale optional Deal OS without failing healthy required Sheets', async () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-source-health-deal-os-cache-'));
   const snapshotPath = path.join(tempDir, 'source-health.json');
   const previousSnapshotPath = process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH;
@@ -383,6 +402,14 @@ test('cached source health recomputes Deal OS export age and fails stale imports
       generatedAt: new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString(),
       issues: [],
       sources: {
+        'sheet-0': {
+          rowCount: 982,
+          name: 'SMB Deal Hunter Google Sheet',
+          mode: 'csv',
+          required: true,
+          sourceRole: 'required-primary',
+          checkedAt: new Date().toISOString(),
+        },
         'deal-os-export': {
           rowCount: 120,
           name: 'SMB Deal OS export',
@@ -402,15 +429,80 @@ test('cached source health recomputes Deal OS export age and fails stale imports
 
   try {
     const sourceHealth = await getSourceHealth({}, { persistSnapshot: false });
-    const source = sourceHealth.sources[0];
+    const source = sourceHealth.sources.find((item) => item.id === 'deal-os-export');
 
     assert.equal(sourceHealth.cached, true);
-    assert.equal(sourceHealth.healthy, false);
+    assert.equal(sourceHealth.healthy, true);
     assert.equal(source.fetched, false);
-    assert.equal(source.tone, 'danger');
+    assert.equal(source.tone, 'warning');
+    assert.equal(source.required, false);
     assert.ok(source.importAgeHours >= 73);
     assert.match(source.error, /72-hour freshness limit/);
     assert.equal(sourceHealth.issues.some((issue) => issue.sourceId === 'deal-os-export'), true);
+  } finally {
+    if (previousSnapshotPath === undefined) {
+      delete process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH;
+    } else {
+      process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH = previousSnapshotPath;
+    }
+  }
+});
+
+test('cached source health preserves optional Deal OS provenance but not a stale success state after lookup failure', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-source-health-deal-os-unavailable-'));
+  const snapshotPath = path.join(tempDir, 'source-health.json');
+  const previousSnapshotPath = process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH;
+  process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH = snapshotPath;
+  const now = new Date();
+  const previousSnapshot = {
+    generatedAt: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+    sources: {
+      'sheet-0': {
+        rowCount: 982,
+        name: 'SMB Deal Hunter Google Sheet',
+        mode: 'csv',
+        required: true,
+        sourceRole: 'required-primary',
+        checkedAt: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+      },
+      'deal-os-export': {
+        rowCount: 120,
+        name: 'SMB Deal OS export',
+        mode: 'manual-export',
+        required: false,
+        sourceRole: 'optional-supplemental',
+        checkedAt: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+        exportedAt: new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString(),
+        importedAt: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+        maxAgeHours: 72,
+      },
+    },
+  };
+  const liveHealth = buildAcquisitionSourceHealth({
+    previousSnapshot,
+    now,
+    review: {
+      generatedAt: now.toISOString(),
+      totals: { newDeals: 1 },
+      sources: [
+        { id: 'sheet-0', name: 'SMB Deal Hunter Google Sheet', mode: 'csv', required: true, sourceRole: 'required-primary', fetched: true, rowCount: 982 },
+        { id: 'deal-os-export', name: 'SMB Deal OS export', mode: 'manual-export', required: false, sourceRole: 'optional-supplemental', fetched: false, rowCount: 0, error: 'Supplemental import storage is unavailable.' },
+      ],
+    },
+  });
+  const nextSnapshot = buildNextSourceSnapshot(liveHealth, previousSnapshot, now.toISOString());
+  fs.writeFileSync(snapshotPath, JSON.stringify(nextSnapshot));
+
+  try {
+    const cachedHealth = await getSourceHealth({}, { persistSnapshot: false });
+    const dealOs = cachedHealth.sources.find((source) => source.id === 'deal-os-export');
+
+    assert.equal(cachedHealth.healthy, true);
+    assert.equal(dealOs.rowCount, 120);
+    assert.equal(dealOs.fetched, false);
+    assert.equal(dealOs.tone, 'warning');
+    assert.match(dealOs.error, /storage is unavailable/i);
+    assert.equal(cachedHealth.issues.find((issue) => issue.sourceId === 'deal-os-export').affectsHealth, false);
   } finally {
     if (previousSnapshotPath === undefined) {
       delete process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH;

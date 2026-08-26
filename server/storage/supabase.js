@@ -322,12 +322,17 @@ export const dealHunterOperatorOwnedScoreFields = Object.freeze([
   'operator_updated_at',
 ]);
 
+export const dealHunterEligibilityOwnedScoreFields = Object.freeze([
+  'current_triage_eligible',
+]);
+
 function normalizeDealHunterOpportunityScoreRow(row) {
   return row
     ? {
         ...row,
         should_remove: Boolean(row.should_remove),
         high_fit: Boolean(row.high_fit),
+        current_triage_eligible: Boolean(row.current_triage_eligible),
         dimensions: Array.isArray(row.dimensions) ? row.dimensions : [],
         gates: Array.isArray(row.gates) ? row.gates : [],
         applied_caps: Array.isArray(row.applied_caps) ? row.applied_caps : [],
@@ -2588,6 +2593,11 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
           throw new Error(`Machine score writes must not carry operator-owned field "${field}".`);
         }
       }
+      for (const field of dealHunterEligibilityOwnedScoreFields) {
+        if (Object.hasOwn(score, field)) {
+          throw new Error(`Machine score writes must not carry eligibility-owned field "${field}".`);
+        }
+      }
       const { data, error } = await client.rpc('write_deal_hunter_opportunity_score', {
         p_score: score,
         p_evidence: Array.isArray(evidence) ? evidence : [],
@@ -2628,6 +2638,30 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         .maybeSingle();
       if (error) throw error;
       return normalizeDealHunterOpportunityScoreRow(data);
+    },
+
+    async getCurrentDealHunterOpportunityScore(opportunityId) {
+      const { data, error } = await client
+        .from('deal_hunter_opportunity_scores')
+        .select('*')
+        .eq('opportunity_id', String(opportunityId || '').trim())
+        .eq('current_triage_eligible', true)
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeDealHunterOpportunityScoreRow(data);
+    },
+
+    async reconcileDealHunterCurrentScoreEligibility(opportunityIds = []) {
+      const { data, error } = await client.rpc('reconcile_deal_hunter_current_score_eligibility', {
+        p_opportunity_ids: normalizeList(opportunityIds, 100000),
+      });
+      if (error) throw error;
+      const result = Array.isArray(data) ? data[0] : data;
+      return {
+        activated: Number(result?.activated || 0),
+        deactivated: Number(result?.deactivated || 0),
+      };
     },
 
     async listDealHunterOpportunityScoreFingerprints(opportunityIds = []) {

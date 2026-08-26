@@ -21,6 +21,10 @@ const sourceCsv = [
   `"Commercial HVAC Maintenance Co","Commercial HVAC maintenance","CA","${today}","$450,000","$1,800,000","$1,400,000","Erin Broker","West Coast Business Brokers","310-555-0199","erin@example.com","Alex Contact","alex@example.com","https://broker.example.test/hvac-maintenance","Recurring maintenance contracts, service agreements, scheduled maintenance, field technicians, repair, replacement, compliance work, trained staff, management in place, SBA eligible, seller financing available."`,
 ].join('\n');
 const emptySourceCsv = 'Business Name,Industry,State,Date Added,Profit,Revenue,Asking Price,Broker Name,Broker Company,Broker Contact,Broker Email,Contact Name 2,Contact Email 2,Listing URL,Description';
+const replacementSourceCsv = [
+  emptySourceCsv,
+  `"Industrial Fire Safety Inspections","Fire safety inspection","NY","${today}","$525,000","$2,100,000","$1,500,000","River Broker","East Coast Business Brokers","212-555-0135","river@example.com","","","https://broker.example.test/industrial-fire-inspections","Recurring commercial inspection contracts, regulated compliance testing, essential field technicians, trained staff, management in place, SBA eligible, and seller financing available."`,
+].join('\n');
 let activeSourceCsv = sourceCsv;
 
 before(() => {
@@ -212,6 +216,27 @@ function createCimStorage() {
       return { applied: true, record, activity };
     },
   };
+}
+
+function enableCrmImportClaims(storage) {
+  const crmImports = new Map();
+  storage.claimDealHunterCrmImport = async (record) => {
+    const existing = crmImports.get(record.id);
+    if (existing) return { claimed: false, importRecord: existing };
+    crmImports.set(record.id, record);
+    return { claimed: true, importRecord: record };
+  };
+  storage.updateDealHunterCrmImport = async (id, values) => {
+    const updated = { ...crmImports.get(id), ...values };
+    crmImports.set(id, updated);
+    return updated;
+  };
+  storage.updateSubmission = async (id, values) => {
+    const updated = { ...storage.submissions.get(id), ...values };
+    storage.submissions.set(id, updated);
+    return updated;
+  };
+  return crmImports;
 }
 
 test('bulk CIM send fails when every selected email fails', async () => {
@@ -507,18 +532,380 @@ test('CIM send paths fail closed when a source review is incomplete', async () =
   assert.match(directResult.error, /source review is incomplete/i);
 });
 
-test('daily review email and CRM sync fail closed when a source is unavailable', async () => {
+test('healthy required Sheet with no Deal OS import sends the normal digest with a warning', async () => {
   const { sendDailyDealHunterReview } = await import('../server/services/dealHunter.js');
   const storage = createCimStorage();
+  let digestCalls = 0;
+  let alertCalls = 0;
+  let sentReview;
+
+  const result = await sendDailyDealHunterReview({
+    idempotencyKey: 'daily-deal-hunter-email:2026-08-25',
+    storage,
+    sendDigestEmail: async (options) => {
+      digestCalls += 1;
+      sentReview = options.review;
+      return { status: 'sent', error: '', providerMessageId: 'digest-1' };
+    },
+    sendSourceAlertEmail: async () => {
+      alertCalls += 1;
+      return { status: 'sent', error: '', providerMessageId: 'unexpected-alert' };
+    },
+  });
+
+  assert.equal(result.emailResult.status, 'sent');
+  assert.equal(result.notificationType, 'normal-digest');
+  assert.equal(digestCalls, 1);
+  assert.equal(alertCalls, 0);
+  assert.equal(sentReview.sources.some((source) => source.id === 'sheet-0' && source.fetched), true);
+  assert.match(sentReview.optionalSourceWarnings[0], /Deal OS import absent/i);
+  assert.equal(sentReview.disabledSources[0].sourceRole, 'retired');
+});
+
+function supplementalDealOsImport({ exportedAt = new Date().toISOString(), name = 'Supplemental Fire Safety' } = {}) {
+  return {
+    id: '00000000-0000-4000-8000-000000000099',
+    created_at: new Date().toISOString(),
+    imported_by: 'admin@example.com',
+    exported_at: exportedAt,
+    file_name: 'deal-os.csv',
+    file_type: 'text/csv',
+    file_size: 100,
+    file_sha256: 'a'.repeat(64),
+    scope: 'saved-search',
+    coverage_label: 'All active criteria',
+    expected_row_count: 1,
+    source_row_count: 1,
+    accepted_row_count: 1,
+    rejected_row_count: 0,
+    canonical_record_count: 1,
+    row_count: 1,
+    duplicate_count: 0,
+    stable_id_count: 1,
+    listing_url_count: 1,
+    coverage_limit_reached: false,
+    records: [{
+      stableId: 'DOS-SUPPLEMENT-1',
+      name,
+      listingUrl: 'https://broker.example.test/supplemental-fire-safety',
+      dateAdded: today,
+      state: 'CA',
+      industry: 'Fire protection and inspection services',
+      description: 'Recurring revenue from commercial service contracts and scheduled inspections, compliance testing, trained technicians, and management in place.',
+      annualProfit: 425000,
+      annualRevenue: 1700000,
+      askingPrice: 1500000,
+      yearsEstablished: 12,
+      brokerContacts: [],
+    }],
+    metadata: {},
+  };
+}
+
+test('healthy required Sheet plus healthy Deal OS includes both in the normal digest', async () => {
+  const { sendDailyDealHunterReview } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  storage.getLatestDealHunterDealOsImport = async () => supplementalDealOsImport();
+  let sentReview;
+
+  const result = await sendDailyDealHunterReview({
+    storage,
+    sendDigestEmail: async (options) => {
+      sentReview = options.review;
+      return { status: 'sent', error: '', providerMessageId: 'digest-both' };
+    },
+  });
+
+  assert.equal(result.emailResult.status, 'sent');
+  assert.equal(result.notificationType, 'normal-digest');
+  assert.equal(sentReview.sources.some((source) => source.id === 'sheet-0' && source.fetched), true);
+  assert.equal(sentReview.sources.some((source) => source.id === 'deal-os-export' && source.fetched), true);
+  assert.equal(sentReview.totals.sourceRows, 2);
+  assert.equal([...sentReview.qualified, ...sentReview.watchlist, ...sentReview.removalCandidates]
+    .some((deal) => deal.name === 'Supplemental Fire Safety'), true);
+  assert.deepEqual(sentReview.optionalSourceWarnings, []);
+});
+
+test('healthy required Sheet plus stale Deal OS sends normally and excludes every stale row', async () => {
+  const { sendDailyDealHunterReview } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  storage.getLatestDealHunterDealOsImport = async () => supplementalDealOsImport({
+    exportedAt: new Date(Date.now() - 80 * 60 * 60 * 1000).toISOString(),
+    name: 'Stale Deal OS Must Not Appear',
+  });
+  let sentReview;
+
+  const result = await sendDailyDealHunterReview({
+    storage,
+    sendDigestEmail: async (options) => {
+      sentReview = options.review;
+      return { status: 'sent', error: '', providerMessageId: 'digest-stale-warning' };
+    },
+  });
+
+  assert.equal(result.emailResult.status, 'sent');
+  assert.equal(result.notificationType, 'normal-digest');
+  assert.equal(sentReview.sources.find((source) => source.id === 'deal-os-export').fetched, false);
+  assert.match(sentReview.optionalSourceWarnings[0], /stale.*not used/i);
+  assert.equal(sentReview.totals.sourceRows, 1);
+  assert.equal(JSON.stringify([
+    sentReview.newlySeenMatches,
+    sentReview.qualified,
+    sentReview.watchlist,
+    sentReview.removalCandidates,
+  ]).includes('Stale Deal OS Must Not Appear'), false);
+});
+
+test('stale optional Deal OS does not block Sheet-backed CRM, single CIM, or bulk CIM actions', async () => {
+  const {
+    reviewDailyDeals,
+    sendDealHunterCimRequest,
+    sendDealHunterReadyCimRequests,
+    syncDealHunterHighFitsToCrm,
+  } = await import('../server/services/dealHunter.js');
+  const staleImport = supplementalDealOsImport({
+    exportedAt: new Date(Date.now() - 80 * 60 * 60 * 1000).toISOString(),
+    name: 'Stale Supplemental Must Never Be Actionable',
+  });
+
+  const crmStorage = createCimStorage();
+  crmStorage.getLatestDealHunterDealOsImport = async () => staleImport;
+  enableCrmImportClaims(crmStorage);
+  const crmReview = await reviewDailyDeals({ storage: crmStorage });
+  const expectedDealKeys = crmReview.qualified.map((deal) => deal.dealKey);
+  assert.equal(expectedDealKeys.length, 1);
+  assert.equal(JSON.stringify(crmReview).includes('Stale Supplemental Must Never Be Actionable'), false);
+  const crmResult = await syncDealHunterHighFitsToCrm({
+    confirmation: 'SYNC HIGH FITS',
+    expectedDealKeys,
+    requestedBy: 'test-admin',
+    storage: crmStorage,
+  });
+  assert.equal(crmResult.ok, true, crmResult.error);
+  assert.equal(crmResult.crmSync.created, 1);
+  assert.equal(crmStorage.submissions.size, 1);
+
+  const directStorage = createCimStorage();
+  directStorage.getLatestDealHunterDealOsImport = async () => staleImport;
+  const directReview = await reviewDailyDeals({ storage: directStorage });
+  const directDeal = directReview.qualified.find((deal) => deal.cimRequest?.canRequest);
+  assert.ok(directDeal);
+  const directResult = await sendDealHunterCimRequest({
+    dealKey: directDeal.dealKey,
+    snapshotToken: directDeal.cimRequest.snapshotToken,
+    requestedBy: 'test-admin',
+    storage: directStorage,
+  });
+  assert.equal(directResult.status, 502);
+  assert.doesNotMatch(directResult.error, /source review|required Google Sheet/i);
+  assert.equal(directStorage.requests.size, 1);
+
+  const bulkStorage = createCimStorage();
+  bulkStorage.getLatestDealHunterDealOsImport = async () => staleImport;
+  const bulkReview = await reviewDailyDeals({ storage: bulkStorage });
+  const bulkDeal = bulkReview.qualified.find((deal) => deal.cimRequest?.canRequest);
+  assert.ok(bulkDeal);
+  const bulkResult = await sendDealHunterReadyCimRequests({
+    requestedBy: 'test-admin',
+    selections: [{
+      dealKey: bulkDeal.dealKey,
+      recipientEmail: bulkDeal.cimRequest.recipientEmail,
+      snapshotToken: bulkDeal.cimRequest.snapshotToken,
+    }],
+    storage: bulkStorage,
+  });
+  assert.equal(bulkResult.status, 502);
+  assert.doesNotMatch(bulkResult.error, /source review|required Google Sheet/i);
+  assert.equal(bulkStorage.requests.size, 1);
+});
+
+test('an older signed Deal OS snapshot cannot survive when that optional import becomes stale', async () => {
+  const { reviewDailyDeals, sendDealHunterCimRequest, sendDealHunterReadyCimRequests } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  let currentImport = supplementalDealOsImport({ name: 'Deal OS Snapshot That Will Expire' });
+  currentImport.records[0].brokerContacts = [{ name: 'Supplemental Broker', email: 'supplemental@example.com' }];
+  storage.getLatestDealHunterDealOsImport = async () => currentImport;
+  const freshReview = await reviewDailyDeals({ storage });
+  const staleCandidate = freshReview.qualified.find((deal) => deal.name === 'Deal OS Snapshot That Will Expire');
+  assert.ok(staleCandidate?.cimRequest?.snapshotToken);
+
+  currentImport = {
+    ...currentImport,
+    exported_at: new Date(Date.now() - 80 * 60 * 60 * 1000).toISOString(),
+  };
+  const directResult = await sendDealHunterCimRequest({
+    dealKey: staleCandidate.dealKey,
+    snapshotToken: staleCandidate.cimRequest.snapshotToken,
+    requestedBy: 'test-admin',
+    storage,
+  });
+  const bulkResult = await sendDealHunterReadyCimRequests({
+    requestedBy: 'test-admin',
+    selections: [{
+      dealKey: staleCandidate.dealKey,
+      recipientEmail: staleCandidate.cimRequest.recipientEmail,
+      snapshotToken: staleCandidate.cimRequest.snapshotToken,
+    }],
+    storage,
+  });
+
+  assert.equal(directResult.status, 404);
+  assert.match(directResult.error, /not found in the latest/i);
+  assert.equal(bulkResult.ok, false);
+  assert.equal(bulkResult.sent, 0);
+  assert.match(bulkResult.error, /CIM-ready list changed after the preview/i);
+  assert.equal(storage.requests.size, 0);
+  assert.equal(storage.submissions.size, 0);
+});
+
+test('healthy required Sheet tolerates an unavailable optional Deal OS lookup', async () => {
+  const { sendDailyDealHunterReview } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  storage.getLatestDealHunterDealOsImport = async () => {
+    throw new Error('supplemental import storage temporarily unavailable');
+  };
+  let sentReview;
+
+  const result = await sendDailyDealHunterReview({
+    storage,
+    sendDigestEmail: async (options) => {
+      sentReview = options.review;
+      return { status: 'sent', error: '', providerMessageId: 'digest-optional-unavailable' };
+    },
+  });
+
+  assert.equal(result.emailResult.status, 'sent');
+  assert.equal(result.notificationType, 'normal-digest');
+  assert.equal(sentReview.sources.find((source) => source.id === 'deal-os-export').fetched, false);
+  assert.match(sentReview.optionalSourceWarnings[0], /unavailable.*not used.*unavailable/i);
+  assert.equal(sentReview.totals.sourceRows, 1);
+});
+
+test('required source failure sends the operational alert and performs no CRM or broker work', async () => {
+  const { sendDailyDealHunterReview } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  storage.getLatestDealHunterDealOsImport = async () => supplementalDealOsImport({ name: 'Optional Deal OS Must Not Substitute' });
   sourceFetchMode = 'down';
+  let digestCalls = 0;
+  let alertCalls = 0;
+  let alertReview;
 
-  const result = await sendDailyDealHunterReview({ idempotencyKey: 'partial-review-test', storage });
+  const result = await sendDailyDealHunterReview({
+    idempotencyKey: 'daily-deal-hunter-email:2026-08-25',
+    storage,
+    sendDigestEmail: async () => {
+      digestCalls += 1;
+      return { status: 'sent', error: '', providerMessageId: 'unexpected-digest' };
+    },
+    sendSourceAlertEmail: async (options) => {
+      alertCalls += 1;
+      alertReview = options.review;
+      return { status: 'sent', error: '', providerMessageId: 'source-alert-1' };
+    },
+  });
 
-  assert.equal(result.emailResult.status, 'failed');
-  assert.match(result.emailResult.error, /one or more sources were unavailable/i);
+  assert.equal(result.notificationType, 'required-source-alert');
+  assert.equal(result.emailResult.status, 'sent');
+  assert.equal(digestCalls, 0);
+  assert.equal(alertCalls, 1);
   assert.equal(result.crmSync.paused, true);
   assert.equal(result.crmSync.reviewed, 0);
+  assert.deepEqual(alertReview.qualified, []);
+  assert.deepEqual(alertReview.watchlist, []);
+  assert.deepEqual(alertReview.removalCandidates, []);
+  assert.equal(alertReview.totals.reviewedDeals, 0);
+  assert.equal(alertReview.totals.sourceRows, 0);
+  assert.equal(alertReview.sources.find((source) => source.id === 'deal-os-export').fetched, true);
+  assert.equal(JSON.stringify([alertReview.qualified, alertReview.watchlist, alertReview.removalCandidates])
+    .includes('Optional Deal OS Must Not Substitute'), false);
   assert.equal(storage.requests.size, 0);
+  assert.equal(storage.submissions.size, 0);
+});
+
+test('an empty required Sheet sends the operational alert instead of an empty digest', async () => {
+  const { sendDailyDealHunterReview } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  sourceFetchMode = 'empty';
+  let digestCalls = 0;
+  let alertCalls = 0;
+
+  const result = await sendDailyDealHunterReview({
+    storage,
+    sendDigestEmail: async () => {
+      digestCalls += 1;
+      return { status: 'sent', error: '', providerMessageId: 'unexpected-empty-digest' };
+    },
+    sendSourceAlertEmail: async () => {
+      alertCalls += 1;
+      return { status: 'sent', error: '', providerMessageId: 'empty-source-alert' };
+    },
+  });
+
+  assert.equal(result.notificationType, 'required-source-alert');
+  assert.equal(digestCalls, 0);
+  assert.equal(alertCalls, 1);
+  assert.equal(result.review.totals.reviewedDeals, 0);
+});
+
+test('a header-only required Sheet blocks explicit CRM and CIM actions even with healthy supplemental rows', async () => {
+  const {
+    reviewDailyDeals,
+    sendDealHunterCimRequest,
+    sendDealHunterReadyCimRequests,
+    syncDealHunterHighFitsToCrm,
+  } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const imported = supplementalDealOsImport({ name: 'Supplemental Deal Must Stay Inert' });
+  imported.records[0].brokerContacts = [{ name: 'Supplemental Broker', email: 'supplemental-broker@example.com' }];
+  storage.getLatestDealHunterDealOsImport = async () => imported;
+  const healthyReview = await reviewDailyDeals({ storage });
+  const supplementalDeal = [
+    ...healthyReview.qualified,
+    ...healthyReview.watchlist,
+    ...healthyReview.removalCandidates,
+  ].find((deal) => deal.name === 'Supplemental Deal Must Stay Inert');
+
+  assert.ok(
+    supplementalDeal?.cimRequest?.canRequest,
+    `expected the supplemental fixture to prove the server-side action gate; score=${supplementalDeal?.score || 'missing'} concerns=${JSON.stringify(supplementalDeal?.concerns || supplementalDeal?.scoreReasons || [])}`,
+  );
+  sourceFetchMode = 'empty';
+  let crmClaimCalls = 0;
+  storage.claimDealHunterCrmImport = async () => {
+    crmClaimCalls += 1;
+    throw new Error('required-source failure must stop before a CRM claim');
+  };
+
+  const crmResult = await syncDealHunterHighFitsToCrm({
+    confirmation: 'SYNC HIGH FITS',
+    expectedDealKeys: [supplementalDeal.dealKey],
+    requestedBy: 'test-admin',
+    storage,
+  });
+  const bulkResult = await sendDealHunterReadyCimRequests({
+    requestedBy: 'test-admin',
+    selections: [{
+      dealKey: supplementalDeal.dealKey,
+      recipientEmail: supplementalDeal.cimRequest.recipientEmail,
+      snapshotToken: supplementalDeal.cimRequest.snapshotToken,
+    }],
+    storage,
+  });
+  const directResult = await sendDealHunterCimRequest({
+    dealKey: supplementalDeal.dealKey,
+    snapshotToken: supplementalDeal.cimRequest.snapshotToken,
+    requestedBy: 'test-admin',
+    storage,
+  });
+
+  assert.equal(crmResult.status, 503);
+  assert.equal(crmResult.crmSync.paused, true);
+  assert.equal(crmClaimCalls, 0);
+  assert.equal(bulkResult.status, 503);
+  assert.equal(bulkResult.sent, 0);
+  assert.equal(directResult.status, 503);
+  assert.equal(storage.requests.size, 0);
+  assert.equal(storage.submissions.size, 0);
 });
 
 test('daily internal summary never writes high-fit listings to CRM', async () => {
@@ -628,7 +1015,7 @@ test('explicit CRM sync aborts when the high-fit set changes after review', asyn
     crmClaimCalls += 1;
     throw new Error('a changed review must not reach CRM storage');
   };
-  activeSourceCsv = emptySourceCsv;
+  activeSourceCsv = replacementSourceCsv;
 
   const result = await syncDealHunterHighFitsToCrm({
     confirmation: 'SYNC HIGH FITS',
@@ -771,7 +1158,7 @@ test('bulk CIM send does not use stale snapshot when selected source still fetch
 
   assert.ok(deal, 'expected one CIM-ready deal in fixture review');
 
-  sourceFetchMode = 'empty';
+  activeSourceCsv = replacementSourceCsv;
 
   const result = await sendDealHunterReadyCimRequests({
     requestedBy: 'test-admin',

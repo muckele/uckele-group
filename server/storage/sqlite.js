@@ -339,12 +339,20 @@ export const dealHunterOperatorOwnedScoreFields = Object.freeze([
   'operator_updated_at',
 ]);
 
+// Current-triage eligibility is owned by complete-set reconciliation. Neither
+// a machine score payload nor an operator decision may elect a row into the
+// current queue.
+export const dealHunterEligibilityOwnedScoreFields = Object.freeze([
+  'current_triage_eligible',
+]);
+
 function normalizeDealHunterOpportunityScoreRow(row) {
   return row
     ? {
         ...row,
         should_remove: Boolean(row.should_remove),
         high_fit: Boolean(row.high_fit),
+        current_triage_eligible: Boolean(row.current_triage_eligible),
         dimensions: parseJsonColumn(row.dimensions, []),
         gates: parseJsonColumn(row.gates, []),
         applied_caps: parseJsonColumn(row.applied_caps, []),
@@ -1276,6 +1284,8 @@ export function createSqliteStorage(config) {
         missing_evidence TEXT NOT NULL DEFAULT '[]',
         confidence_reasons TEXT NOT NULL DEFAULT '[]',
         summary TEXT NOT NULL DEFAULT '{}',
+        -- complete-set reconciliation-owned
+        current_triage_eligible INTEGER NOT NULL DEFAULT 0,
         -- operator-owned
         operator_priority TEXT NOT NULL DEFAULT 'normal',
         operator_note TEXT,
@@ -1839,6 +1849,9 @@ export function createSqliteStorage(config) {
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'opportunity_id', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'semantic_digest', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_semantic_digest', 'TEXT');
+  // Existing installations retain their last-good visible queue. Fresh tables
+  // already declare DEFAULT 0 above, and score INSERTs explicitly use 0.
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'current_triage_eligible', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn(database, 'deal_hunter_deal_os_imports', 'source_row_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(database, 'deal_hunter_deal_os_imports', 'accepted_row_count', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn(database, 'deal_hunter_deal_os_imports', 'rejected_row_count', 'INTEGER NOT NULL DEFAULT 0');
@@ -1903,6 +1916,8 @@ export function createSqliteStorage(config) {
       ON deal_hunter_crm_reconciliation_items(run_id, status, opportunity_id);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_queue
       ON deal_hunter_opportunity_scores(should_remove, fit_score DESC, confidence, opportunity_id);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_current_queue
+      ON deal_hunter_opportunity_scores(current_triage_eligible, should_remove, fit_score DESC, opportunity_id);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_priority
       ON deal_hunter_opportunity_scores(operator_priority, fit_score DESC, opportunity_id);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_fingerprint
@@ -5179,6 +5194,11 @@ export function createSqliteStorage(config) {
             throw new Error(`Machine score writes must not carry operator-owned field "${field}".`);
           }
         }
+        for (const field of dealHunterEligibilityOwnedScoreFields) {
+          if (Object.hasOwn(score, field)) {
+            throw new Error(`Machine score writes must not carry eligibility-owned field "${field}".`);
+          }
+        }
         const opportunityId = String(score.opportunity_id || '').trim();
         if (!opportunityId) throw new Error('A canonical opportunity id is required to write a score.');
         const now = score.scored_at || new Date().toISOString();
@@ -5211,6 +5231,7 @@ export function createSqliteStorage(config) {
           missing_evidence: JSON.stringify(score.missing_evidence || []),
           confidence_reasons: JSON.stringify(score.confidence_reasons || []),
           summary: JSON.stringify(score.summary || {}),
+          current_triage_eligible: 0,
         };
         // The score and the evidence describing it are replaced together, so no
         // reader can observe a score at fingerprint B beside evidence from A.
@@ -5221,13 +5242,13 @@ export function createSqliteStorage(config) {
               completeness_score, contradiction_count, missing_evidence_count, should_remove, high_fit,
               gate_count, score_fingerprint, semantic_digest, engine_version, rules_version, profile_version,
               completeness_policy_version, dimensions, gates, applied_caps, missing_evidence,
-              confidence_reasons, summary
+              confidence_reasons, summary, current_triage_eligible
             ) VALUES (
               @opportunity_id, @created_at, @scored_at, @deal_key, @name, @state, @listing_url, @fit_score, @score_status, @confidence,
               @completeness_score, @contradiction_count, @missing_evidence_count, @should_remove, @high_fit,
               @gate_count, @score_fingerprint, @semantic_digest, @engine_version, @rules_version, @profile_version,
               @completeness_policy_version, @dimensions, @gates, @applied_caps, @missing_evidence,
-              @confidence_reasons, @summary
+              @confidence_reasons, @summary, @current_triage_eligible
             )
             ON CONFLICT(opportunity_id) DO UPDATE SET
               scored_at = excluded.scored_at,
@@ -5338,6 +5359,46 @@ export function createSqliteStorage(config) {
         );
       },
 
+      async getCurrentDealHunterOpportunityScore(opportunityId) {
+        return normalizeDealHunterOpportunityScoreRow(
+          database.prepare(`
+            SELECT * FROM deal_hunter_opportunity_scores
+            WHERE opportunity_id = ? AND current_triage_eligible = 1
+          `).get(String(opportunityId || '').trim()),
+        );
+      },
+
+      async reconcileDealHunterCurrentScoreEligibility(opportunityIds = []) {
+        const idsJson = JSON.stringify(normalizeList(opportunityIds, 100000));
+        const transaction = database.transaction(() => {
+          const activated = Number(database.prepare(`
+            SELECT COUNT(*) AS count
+            FROM deal_hunter_opportunity_scores AS scores
+            WHERE scores.current_triage_eligible = 0
+              AND scores.opportunity_id IN (SELECT value FROM json_each(?))
+          `).get(idsJson)?.count || 0);
+          const deactivated = Number(database.prepare(`
+            SELECT COUNT(*) AS count
+            FROM deal_hunter_opportunity_scores AS scores
+            WHERE scores.current_triage_eligible = 1
+              AND scores.opportunity_id NOT IN (SELECT value FROM json_each(?))
+          `).get(idsJson)?.count || 0);
+          database.prepare(`
+            UPDATE deal_hunter_opportunity_scores
+            SET current_triage_eligible = CASE
+              WHEN opportunity_id IN (SELECT value FROM json_each(@opportunity_ids)) THEN 1
+              ELSE 0
+            END
+            WHERE current_triage_eligible <> CASE
+              WHEN opportunity_id IN (SELECT value FROM json_each(@opportunity_ids)) THEN 1
+              ELSE 0
+            END
+          `).run({ opportunity_ids: idsJson });
+          return { activated, deactivated };
+        });
+        return transaction.immediate();
+      },
+
       async listDealHunterOpportunityScoreFingerprints(opportunityIds = []) {
         const ids = normalizeList(opportunityIds, 100000);
         if (ids.length === 0) return [];
@@ -5369,7 +5430,7 @@ export function createSqliteStorage(config) {
       } = {}) {
         const safePage = Math.max(1, Math.min(Number(page) || 1, 10000));
         const safePageSize = Math.max(1, Math.min(Number(pageSize) || 25, 100));
-        const clauses = [];
+        const clauses = ['scores.current_triage_eligible = 1'];
         const params = [];
 
         // Dismissal stays owned by the existing disposition record rather than

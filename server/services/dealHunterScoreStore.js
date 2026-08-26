@@ -34,6 +34,35 @@ function requiredStorageMethods(storage) {
   ].filter((method) => typeof storage[method] !== 'function');
 }
 
+function deferredScoringError(review) {
+  return review?.scoringDeferredReason
+    || 'Scoring is deferred until every required Google Sheet is healthy.';
+}
+
+function authoritativeFullBackfillProblems(review, candidates = []) {
+  const requiredSheets = (review?.sources || []).filter(
+    (source) => source?.required === true && source?.sourceRole === 'required-primary',
+  );
+  const problems = [];
+  if (review?.reviewMode !== 'full-backfill') problems.push('review mode is not full-backfill');
+  if (review?.scoringDeferred) problems.push('scoring is deferred');
+  if (review?.selection?.strategy !== 'all-canonical-listings') problems.push('selection is not the complete canonical set');
+  if (requiredSheets.length === 0) problems.push('no required Google Sheet was reviewed');
+  if (requiredSheets.some((source) => !source.fetched || source.error || Number(source.rowCount || 0) < 1)) {
+    problems.push('a required Google Sheet is unhealthy or empty');
+  }
+  // Multiple reviewed source rows may collapse to one canonical opportunity.
+  // The inverse (more canonical candidates than reviewed deals) would indicate
+  // that this is not the builder's complete reviewed set.
+  if (Number(review?.totals?.reviewedDeals ?? -1) < candidates.length) {
+    problems.push('the canonical candidate count exceeds the reviewed full-backfill count');
+  }
+  if (candidates.some((deal) => !deal?.opportunityId || deal.identityStatus !== 'resolved')) {
+    problems.push('the canonical candidate set contains an unresolved identity');
+  }
+  return problems;
+}
+
 // A stored score is reusable only when the inputs and every scoring version
 // behind it are unchanged. A rules or profile bump therefore forces a rescore
 // rather than serving a score computed under retired rules.
@@ -159,13 +188,57 @@ export async function refreshOpportunityScores({
     };
   }
 
-  let candidates = Array.isArray(deals) ? deals : null;
+  const callerSuppliedDeals = Array.isArray(deals);
+  const requested = new Set(opportunityIds.map((id) => String(id || '').trim()).filter(Boolean));
+  let candidates = callerSuppliedDeals ? deals : null;
+  let authoritativeOpportunityIds = null;
   if (!candidates) {
     const collected = await collectScoredOpportunities({ reviewMode, storage });
+    if (collected.review?.scoringDeferred) {
+      return {
+        ok: false,
+        status: 503,
+        scoringDeferred: true,
+        error: deferredScoringError(collected.review),
+        review: collected.review,
+        counts: { considered: 0, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 },
+        errors: [],
+        rulesVersion: DEAL_SCORING_RULES_VERSION,
+        engineVersion: DEAL_SCORING_ENGINE_VERSION,
+        profileVersion: DEAL_SCORING_PROFILE_VERSION,
+      };
+    }
     candidates = collected.scoredDeals || [];
+    if (reviewMode === 'full-backfill' && requested.size === 0) {
+      const authorityProblems = authoritativeFullBackfillProblems(collected.review, candidates);
+      if (authorityProblems.length > 0) {
+        return {
+          ok: false,
+          status: 409,
+          error: 'The canonical full-backfill review could not prove a complete authoritative opportunity set.',
+          authorityProblems,
+          counts: { considered: 0, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 },
+          errors: [],
+          rulesVersion: DEAL_SCORING_RULES_VERSION,
+          engineVersion: DEAL_SCORING_ENGINE_VERSION,
+          profileVersion: DEAL_SCORING_PROFILE_VERSION,
+        };
+      }
+      if (typeof storage.reconcileDealHunterCurrentScoreEligibility !== 'function') {
+        return {
+          ok: false,
+          status: 503,
+          error: 'Durable current-triage eligibility reconciliation is unavailable.',
+          missingMethods: ['reconcileDealHunterCurrentScoreEligibility'],
+        };
+      }
+      // Capture the complete builder-owned set before the per-run score-write
+      // batch limit. Existing scores outside this run's write slice must not be
+      // deactivated merely because the scorer writes in bounded batches.
+      authoritativeOpportunityIds = Array.from(new Set(candidates.map((deal) => deal.opportunityId)));
+    }
   }
 
-  const requested = new Set(opportunityIds.map((id) => String(id || '').trim()).filter(Boolean));
   const scoped = candidates
     .filter((deal) => deal?.opportunityId && deal.identityStatus === 'resolved')
     .filter((deal) => requested.size === 0 || requested.has(deal.opportunityId))
@@ -216,11 +289,30 @@ export async function refreshOpportunityScores({
     }
   }
 
+  let eligibilityReconciliation = null;
+  if (authoritativeOpportunityIds && counts.failed === 0) {
+    try {
+      eligibilityReconciliation = await storage.reconcileDealHunterCurrentScoreEligibility(authoritativeOpportunityIds);
+    } catch (error) {
+      return {
+        ok: false,
+        status: 503,
+        error: `Current-triage eligibility could not be reconciled: ${normalizeText(error.message, 500)}`,
+        counts,
+        errors: [],
+        rulesVersion: DEAL_SCORING_RULES_VERSION,
+        engineVersion: DEAL_SCORING_ENGINE_VERSION,
+        profileVersion: DEAL_SCORING_PROFILE_VERSION,
+      };
+    }
+  }
+
   return {
     ok: counts.failed === 0,
     status: counts.failed > 0 ? 207 : 200,
     counts,
     errors: errors.slice(0, 100),
+    eligibilityReconciliation,
     rulesVersion: DEAL_SCORING_RULES_VERSION,
     engineVersion: DEAL_SCORING_ENGINE_VERSION,
     profileVersion: DEAL_SCORING_PROFILE_VERSION,
@@ -248,6 +340,37 @@ export async function previewOpportunityScoreRefresh({
   let candidates = Array.isArray(deals) ? deals : null;
   if (!candidates) {
     const collected = await collectScoredOpportunities({ reviewMode, storage });
+    if (collected.review?.scoringDeferred) {
+      return {
+        ok: false,
+        status: 503,
+        preview: true,
+        scoringDeferred: true,
+        error: deferredScoringError(collected.review),
+        review: collected.review,
+        counts: {
+          considered: 0,
+          newlyScored: 0,
+          unchanged: 0,
+          versionOnly: 0,
+          semanticChange: 0,
+          scoreChange: 0,
+          classificationChange: 0,
+          gateChange: 0,
+          evidenceOnlyChange: 0,
+          highFitToWatchlist: 0,
+          watchlistToHighFit: 0,
+          newlyGated: 0,
+          gateLifted: 0,
+          operatorPrioritized: 0,
+          reviewedAffected: 0,
+          reviewedFlaggedChanged: 0,
+          estimatedWrites: 0,
+        },
+        samples: [],
+        confirmationRequired: fullRebuildConfirmation,
+      };
+    }
     candidates = collected.scoredDeals || [];
   }
   const requested = new Set(opportunityIds.map((id) => String(id || '').trim()).filter(Boolean));

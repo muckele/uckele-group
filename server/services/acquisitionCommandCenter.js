@@ -833,6 +833,18 @@ async function writeSourceSnapshot(config, snapshot) {
   }
 }
 
+function isRetiredAirtableSource(source = {}) {
+  const id = typeof source === 'string' ? source : source.id || source.sourceId || '';
+  const name = typeof source === 'string' ? '' : source.name || '';
+  return String(id).toLowerCase().startsWith('airtable') || /airtable/i.test(String(name));
+}
+
+function isRequiredDealHunterSource(source = {}) {
+  if (source.required === false || source.sourceRole === 'optional-supplemental' || source.id === 'deal-os-export') return false;
+  if (source.required === true || source.sourceRole === 'required-primary' || String(source.id || '').startsWith('sheet-')) return true;
+  return true;
+}
+
 export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}, generatedAt = new Date().toISOString()) {
   const previousSources = objectValue(previousSnapshot.sources);
   const issueSourceIds = new Set(
@@ -843,6 +855,7 @@ export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}
   const nextSources = {};
 
   for (const source of sourceHealth.sources || []) {
+    if (isRetiredAirtableSource(source)) continue;
     const previous = objectValue(previousSources[source.id]);
 
     if (source.fetched && !issueSourceIds.has(source.id)) {
@@ -850,6 +863,8 @@ export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}
         rowCount: source.rowCount,
         name: source.name,
         mode: source.mode,
+        required: isRequiredDealHunterSource(source),
+        sourceRole: source.sourceRole || (isRequiredDealHunterSource(source) ? 'required-primary' : 'optional-supplemental'),
         checkedAt: sourceHealth.generatedAt || generatedAt,
         exportedAt: source.exportedAt || '',
         importedAt: source.importedAt || '',
@@ -873,6 +888,7 @@ export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}
   }
 
   for (const [sourceId, previous] of Object.entries(previousSources)) {
+    if (isRetiredAirtableSource({ id: sourceId, name: previous?.name })) continue;
     if (!nextSources[sourceId]) {
       nextSources[sourceId] = previous;
     }
@@ -881,7 +897,7 @@ export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}
   return {
     generatedAt,
     dateKey: sourceHealth.dateKey || previousSnapshot.dateKey || '',
-    issues: sourceHealth.issues || [],
+    issues: (sourceHealth.issues || []).filter((issue) => !isRetiredAirtableSource(issue?.sourceId || '')),
     totals: sourceHealth.totals || {},
     sources: nextSources,
   };
@@ -889,10 +905,17 @@ export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}
 
 function buildCachedSourceHealth(previousSnapshot = {}, now = new Date(), config = getConfig()) {
   const sourceSnapshots = objectValue(previousSnapshot.sources);
-  const issues = Array.isArray(previousSnapshot.issues) ? [...previousSnapshot.issues] : [];
+  const issues = (Array.isArray(previousSnapshot.issues) ? previousSnapshot.issues : [])
+    .filter((issue) => !isRetiredAirtableSource(issue?.sourceId || ''))
+    .map((issue) => issue?.sourceId === 'deal-os-export'
+      ? { ...issue, tone: 'warning', affectsHealth: false }
+      : issue);
   const issueSourceIds = new Set(issues.map((issue) => issue?.sourceId).filter(Boolean));
-  const sources = Object.entries(sourceSnapshots).map(([id, source]) => {
+  const sources = Object.entries(sourceSnapshots)
+    .filter(([id, source]) => !isRetiredAirtableSource({ id, name: source?.name }))
+    .map(([id, source]) => {
     const mode = source.mode || 'cached';
+    const required = isRequiredDealHunterSource({ ...source, id });
     const exportedTimestamp = Date.parse(source.exportedAt || '');
     const maxAgeHours = Number(source.maxAgeHours);
     const ageHours = Number.isFinite(exportedTimestamp)
@@ -910,24 +933,33 @@ function buildCachedSourceHealth(previousSnapshot = {}, now = new Date(), config
     if (freshnessError && !issueSourceIds.has(id)) {
       issues.push({
         sourceId: id,
-        tone: 'danger',
+        tone: required ? 'danger' : 'warning',
         title: `${source.name || 'Deal source'} needs attention`,
         message: freshnessError,
+        affectsHealth: required,
+        sourceUnavailable: true,
       });
       issueSourceIds.add(id);
     }
+
+    const sourceIssue = issues.find((issue) => issue?.sourceId === id);
+    const sourceUnavailable = sourceIssue?.sourceUnavailable === true;
 
     return {
       ...source,
       id,
       name: source.name || id,
       mode,
-      fetched: !staleManualExport,
+      required,
+      sourceRole: source.sourceRole || (required ? 'required-primary' : 'optional-supplemental'),
+      fetched: !staleManualExport && !sourceUnavailable,
       rowCount: Number(source.rowCount || 0),
       previousRowCount: Number(source.rowCount || 0),
       rowDelta: 0,
-      tone: staleManualExport ? 'danger' : 'success',
-      error: freshnessError,
+      tone: staleManualExport || sourceUnavailable
+        ? (required ? 'danger' : 'warning')
+        : sourceIssue?.tone || 'success',
+      error: freshnessError || (sourceUnavailable ? sourceIssue?.message || 'Source failed to fetch.' : ''),
       requiresConfiguration: false,
       configurationKey: '',
       checkedAt: source.checkedAt || previousSnapshot.generatedAt || '',
@@ -935,7 +967,9 @@ function buildCachedSourceHealth(previousSnapshot = {}, now = new Date(), config
     };
   });
 
-  if (sources.length === 0) {
+  const requiredSources = sources.filter(isRequiredDealHunterSource);
+
+  if (requiredSources.length === 0) {
     return {
       generatedAt: previousSnapshot.generatedAt || now.toISOString(),
       dateKey: previousSnapshot.dateKey || getZonedParts(now, config.dealHunter.dailyEmail.timezone).dateKey,
@@ -955,11 +989,38 @@ function buildCachedSourceHealth(previousSnapshot = {}, now = new Date(), config
     };
   }
 
+  if (!sources.some((source) => source.id === 'deal-os-export')) {
+    const message = 'No optional Deal OS CSV/XLSX import is active. Google Sheets remains the required primary source.';
+    sources.push({
+      id: 'deal-os-export',
+      name: 'SMB Deal OS export',
+      mode: 'manual-export',
+      required: false,
+      sourceRole: 'optional-supplemental',
+      fetched: false,
+      rowCount: 0,
+      previousRowCount: 0,
+      rowDelta: 0,
+      tone: 'warning',
+      error: message,
+    });
+    if (!issueSourceIds.has('deal-os-export')) {
+      issues.push({
+        sourceId: 'deal-os-export',
+        tone: 'warning',
+        title: 'Optional Deal OS import is missing',
+        message,
+        affectsHealth: false,
+        sourceUnavailable: true,
+      });
+    }
+  }
+
   return {
     generatedAt: previousSnapshot.generatedAt || now.toISOString(),
     dateKey: previousSnapshot.dateKey || getZonedParts(now, config.dealHunter.dailyEmail.timezone).dateKey,
     afterDailyUpdateWindow: false,
-    healthy: issues.length === 0,
+    healthy: issues.every((issue) => issue?.affectsHealth === false),
     issues,
     sources,
     totals: previousSnapshot.totals || {},
@@ -968,7 +1029,7 @@ function buildCachedSourceHealth(previousSnapshot = {}, now = new Date(), config
 }
 
 export function buildAcquisitionSourceHealth({ review = null, previousSnapshot = {}, now = new Date(), config = getConfig() } = {}) {
-  const sources = review?.sources || [];
+  const sources = (review?.sources || []).filter((source) => !isRetiredAirtableSource(source));
   const issues = [];
   const sourceSnapshots = objectValue(previousSnapshot.sources);
   const schedule = config.dealHunter.dailyEmail;
@@ -976,21 +1037,24 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
   const zoned = getZonedParts(now, schedule.timezone);
   const updateWindowMinute = scheduled.hour * 60 + scheduled.minute + sourceHealthUpdateBufferMinutes;
   const afterDailyUpdateWindow = zoned.minutesSinceMidnight >= updateWindowMinute;
-  const allSourcesFetched = sources.length > 0 && sources.every((source) => source.fetched);
+  const requiredSources = sources.filter(isRequiredDealHunterSource);
+  const allRequiredSourcesFetched = requiredSources.length > 0
+    && requiredSources.every((source) => source.fetched && !source.error && Number(source.rowCount || 0) > 0);
   const sourceStatuses = sources.map((source) => {
+    const required = isRequiredDealHunterSource(source);
     const previous = objectValue(sourceSnapshots[source.id]);
     const rowCount = Number(source.rowCount || 0);
     const previousRowCount = Number(previous.rowCount || 0);
     const rowDelta = previousRowCount ? rowCount - previousRowCount : 0;
     const requiresConfiguration = Boolean(source.requiresConfiguration);
-    let tone = source.fetched ? 'success' : requiresConfiguration ? 'warning' : 'danger';
+    let tone = source.fetched ? 'success' : required && !requiresConfiguration ? 'danger' : 'warning';
     const sourceIssues = [];
 
     if (!source.fetched) {
-      tone = requiresConfiguration ? 'warning' : 'danger';
+      tone = required && !requiresConfiguration ? 'danger' : 'warning';
       sourceIssues.push(source.error || 'Source failed to fetch.');
     } else if (rowCount === 0) {
-      tone = 'danger';
+      tone = required ? 'danger' : 'warning';
       sourceIssues.push('Source returned zero rows.');
     } else if (previousRowCount > 0 && rowCount < previousRowCount * sourceHealthWarningDropRatio) {
       tone = 'warning';
@@ -1003,6 +1067,8 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
         tone,
         title: `${source.name || 'Deal source'} needs attention`,
         message,
+        affectsHealth: required,
+        sourceUnavailable: !source.fetched || rowCount === 0,
       });
     }
 
@@ -1010,6 +1076,8 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
       id: source.id,
       name: source.name,
       mode: source.mode,
+      required,
+      sourceRole: source.sourceRole || (required ? 'required-primary' : 'optional-supplemental'),
       fetched: Boolean(source.fetched),
       rowCount,
       previousRowCount,
@@ -1033,12 +1101,51 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
     };
   });
 
-  if (afterDailyUpdateWindow && review && allSourcesFetched && (review.totals?.newDeals || 0) === 0) {
+  if (requiredSources.length === 0) {
+    issues.push({
+      sourceId: 'sheet-0',
+      tone: 'danger',
+      title: 'Required Google Sheet source is missing',
+      message: 'The source review did not include the required SMB Deal Hunter Google Sheet.',
+      affectsHealth: true,
+      sourceUnavailable: true,
+    });
+  }
+
+  if (!sourceStatuses.some((source) => source.id === 'deal-os-export')) {
+    const message = 'No optional Deal OS CSV/XLSX import is active. Google Sheets remains the required primary source.';
+    sourceStatuses.push({
+      id: 'deal-os-export',
+      name: 'SMB Deal OS export',
+      mode: 'manual-export',
+      required: false,
+      sourceRole: 'optional-supplemental',
+      fetched: false,
+      rowCount: 0,
+      previousRowCount: 0,
+      rowDelta: 0,
+      tone: 'warning',
+      error: message,
+      requiresConfiguration: false,
+      configurationKey: '',
+    });
+    issues.push({
+      sourceId: 'deal-os-export',
+      tone: 'warning',
+      title: 'Optional Deal OS import is missing',
+      message,
+      affectsHealth: false,
+      sourceUnavailable: true,
+    });
+  }
+
+  if (afterDailyUpdateWindow && review && allRequiredSourcesFetched && (review.totals?.newDeals || 0) === 0) {
     issues.push({
       sourceId: 'daily-update-window',
       tone: 'warning',
       title: 'No new deals after normal update window',
       message: `No new deals were detected after the ${schedule.time} ${schedule.timezone} update window.`,
+      affectsHealth: true,
     });
   }
 
@@ -1046,7 +1153,7 @@ export function buildAcquisitionSourceHealth({ review = null, previousSnapshot =
     generatedAt: review?.generatedAt || now.toISOString(),
     dateKey: zoned.dateKey,
     afterDailyUpdateWindow,
-    healthy: issues.length === 0,
+    healthy: issues.every((issue) => issue?.affectsHealth === false),
     issues,
     sources: sourceStatuses,
     totals: review?.totals || {},

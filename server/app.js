@@ -339,6 +339,59 @@ function boundedReconciliationPreview(result) {
     : bounded;
 }
 
+const fullBackfillScoreFailureError = 'Full-backfill scoring could not be completed. The prior current-triage set remains in force.';
+const currentTriageReconciliationFailureError = 'Current-triage eligibility could not be reconciled. The prior current-triage set remains in force.';
+const safeScoreRefreshErrors = new Set([
+  'Durable opportunity scoring storage is unavailable.',
+  'The canonical full-backfill review could not prove a complete authoritative opportunity set.',
+  'Durable current-triage eligibility reconciliation is unavailable.',
+  'Scoring is deferred until every required Google Sheet is healthy.',
+]);
+
+function scoreRefreshFailureStatus(scoreRefresh) {
+  const status = Number(scoreRefresh?.status);
+  return Number.isInteger(status) && status >= 400 && status < 600 ? status : 500;
+}
+
+function scoreRefreshOperatorError(scoreRefresh) {
+  const error = String(scoreRefresh?.error || '').replace(/\s+/g, ' ').trim();
+  if (error.startsWith('Current-triage eligibility could not be reconciled:')) {
+    return currentTriageReconciliationFailureError;
+  }
+  return safeScoreRefreshErrors.has(error) ? error : fullBackfillScoreFailureError;
+}
+
+function publicScoreRefreshResult(scoreRefresh) {
+  if (!scoreRefresh || typeof scoreRefresh !== 'object') return null;
+  const result = {
+    counts: scoreRefresh.counts,
+    ok: Boolean(scoreRefresh.ok),
+  };
+  if (scoreRefresh.ok !== false) return result;
+
+  const status = Number(scoreRefresh.status);
+  if (Number.isInteger(status) && status >= 100 && status < 600) result.status = status;
+  result.error = scoreRefreshOperatorError(scoreRefresh);
+  if (scoreRefresh.scoringDeferred === true) result.scoringDeferred = true;
+  if (Array.isArray(scoreRefresh.missingMethods)) {
+    result.missingMethods = scoreRefresh.missingMethods.slice(0, 25)
+      .map((method) => String(method || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 100))
+      .filter(Boolean);
+  }
+  if (Array.isArray(scoreRefresh.authorityProblems)) {
+    result.authorityProblems = scoreRefresh.authorityProblems.slice(0, 25)
+      .map((problem) => String(problem || '').replace(/\s+/g, ' ').trim().slice(0, 200))
+      .filter(Boolean);
+  }
+  if (Array.isArray(scoreRefresh.errors) && scoreRefresh.errors.length > 0) {
+    result.errors = scoreRefresh.errors.slice(0, 100).map((item) => ({
+      opportunityId: String(item?.opportunityId || '').replace(/[^A-Za-z0-9_.:-]/g, '').slice(0, 160),
+      error: 'Opportunity scoring failed.',
+    }));
+  }
+  return result;
+}
+
 export function createApp() {
   const config = getConfig();
   const app = express();
@@ -1242,9 +1295,13 @@ export function createApp() {
         review = reviewed.review;
         review.dailyEmailJob = await getDailyDealHunterJobStatus();
         review.emailReadiness = await getEmailReadiness();
-        // Persist scores for the listings this import produced. Fingerprint
-        // gating means unchanged opportunities cost nothing.
-        scoreRefresh = await refreshOpportunityScores({ deals: reviewed.scoredDeals, actor: session.username || 'admin' });
+        if (review.scoringDeferred) {
+          reviewWarning = 'The export was imported and retained, but scoring is deferred until every required Google Sheet is healthy.';
+        } else {
+          // Persist scores for the listings this import produced. Fingerprint
+          // gating means unchanged opportunities cost nothing.
+          scoreRefresh = await refreshOpportunityScores({ deals: reviewed.scoredDeals, actor: session.username || 'admin' });
+        }
       } catch (error) {
         reviewWarning = `The export was imported, but scoring could not be refreshed: ${error.message}`;
       }
@@ -1283,15 +1340,44 @@ export function createApp() {
       review.dailyEmailJob = await getDailyDealHunterJobStatus();
       review.emailReadiness = await getEmailReadiness();
       await getSourceHealth(undefined, { persistSnapshot: true, refresh: true, review });
-      const scoreRefresh = await refreshOpportunityScores({
-        deals: reviewed.scoredDeals,
-        actor: session.username || 'admin',
-      });
+      const reviewWarning = review.scoringDeferred
+        ? 'Full-backfill scoring is deferred until every required Google Sheet is healthy. Existing persisted scores were left unchanged.'
+        : '';
+      const scoreRefresh = review.scoringDeferred
+        ? null
+        : await refreshOpportunityScores({
+            actor: session.username || 'admin',
+          });
+      if (scoreRefresh?.scoringDeferred === true) {
+        const deferredReview = {
+          ...(scoreRefresh.review && typeof scoreRefresh.review === 'object' ? scoreRefresh.review : review),
+          dailyEmailJob: review.dailyEmailJob,
+          emailReadiness: review.emailReadiness,
+        };
+        response.json({
+          success: true,
+          review: deferredReview,
+          summary: deferredReview.importSummary,
+          scoreRefresh: null,
+          reviewWarning: 'Full-backfill scoring is deferred until every required Google Sheet is healthy. Existing persisted scores were left unchanged.',
+        });
+        return;
+      }
+      const publicScoreRefresh = publicScoreRefreshResult(scoreRefresh);
+      if (scoreRefresh?.ok === false) {
+        response.status(scoreRefreshFailureStatus(scoreRefresh)).json({
+          success: false,
+          error: publicScoreRefresh.error,
+          scoreRefresh: publicScoreRefresh,
+        });
+        return;
+      }
       response.json({
         success: true,
         review,
         summary: review.importSummary,
-        scoreRefresh: { counts: scoreRefresh.counts, ok: scoreRefresh.ok },
+        scoreRefresh: publicScoreRefresh,
+        ...(reviewWarning ? { reviewWarning } : {}),
       });
     }),
   );

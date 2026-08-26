@@ -12,6 +12,9 @@ const originalFetch = globalThis.fetch;
 const { reviewDailyDeals } = await import('../server/services/dealHunter.js');
 let sourceCsv;
 let sourceWorkbook;
+let airtableFetchCount;
+let sheetFetchStatus;
+let dealOsImport;
 
 function buildWorkbook(rows) {
   const worksheetRows = rows.map(({ name, row, url }) => [
@@ -32,7 +35,58 @@ function buildWorkbook(rows) {
 }
 
 function sourceStorage() {
-  return {};
+  return {
+    async getLatestDealHunterDealOsImport() {
+      return dealOsImport;
+    },
+  };
+}
+
+function freshDealOsImport() {
+  const now = new Date().toISOString();
+  return {
+    id: 'source-health-fresh-import',
+    created_at: now,
+    imported_by: 'admin',
+    exported_at: now,
+    file_name: 'fresh-deal-os.csv',
+    file_type: 'text/csv',
+    file_size: 100,
+    file_sha256: 'a'.repeat(64),
+    scope: 'saved-search',
+    coverage_label: 'Source-health regression fixture',
+    expected_row_count: 1,
+    source_row_count: 1,
+    accepted_row_count: 1,
+    rejected_row_count: 0,
+    canonical_record_count: 1,
+    row_count: 1,
+    duplicate_count: 0,
+    stable_id_count: 1,
+    listing_url_count: 1,
+    coverage_limit_reached: false,
+    records: [{
+      stableId: 'DEAL-OS-ONLY-1',
+      name: 'Deal OS Must Stay Supplemental',
+      listingUrl: 'https://broker.example/deal-os-only',
+      annualProfit: 425000,
+      state: 'CA',
+      brokerContacts: [],
+    }],
+    metadata: {},
+  };
+}
+
+function assertFailClosedReview(reviewed) {
+  assert.deepEqual(reviewed.scoredDeals, []);
+  assert.equal(reviewed.review.scoringDeferred, true);
+  assert.deepEqual(reviewed.review.qualified, []);
+  assert.deepEqual(reviewed.review.watchlist, []);
+  assert.deepEqual(reviewed.review.removalCandidates, []);
+  assert.deepEqual(reviewed.review.newlySeenMatches, []);
+  assert.deepEqual(reviewed.review.criteriaRecommendations, []);
+  assert.deepEqual(reviewed.review.crmSyncPreview, { count: 0, dealKeys: [] });
+  assert.equal(reviewed.review.totals.cimReady, 0);
 }
 
 beforeEach(() => {
@@ -46,11 +100,17 @@ beforeEach(() => {
     { row: 3, name: 'Workbook Only', url: 'https://broker.example/workbook-only' },
     { row: 4, name: 'Beta Plumbing', url: 'https://broker.example/beta' },
   ]);
+  airtableFetchCount = 0;
+  sheetFetchStatus = 200;
+  dealOsImport = null;
   globalThis.fetch = async (url) => {
     const value = String(url);
-    if (value.includes('/gviz/tq')) return new Response(sourceCsv, { status: 200 });
+    if (value.includes('/gviz/tq')) return new Response(sourceCsv, { status: sheetFetchStatus });
     if (value.includes('/export?')) return new Response(sourceWorkbook, { status: 200 });
-    if (value.includes('api.airtable.com')) return Response.json({ records: [] });
+    if (value.includes('airtable.com')) {
+      airtableFetchCount += 1;
+      return Response.json({ records: [] });
+    }
     return new Response('not found', { status: 404 });
   };
 });
@@ -69,6 +129,15 @@ test('Google Sheet source health ignores workbook-only links when every imported
   assert.equal(source.listingUrlUnresolvedCount, 0);
   assert.equal(source.unmatchedWorkbookListingUrlCount, 1);
   assert.equal(source.listingUrlWarning, '');
+});
+
+test('legacy Airtable configuration cannot reactivate the retired source', async () => {
+  const review = await reviewDailyDeals({ storage: sourceStorage() });
+
+  assert.equal(airtableFetchCount, 0);
+  assert.equal(review.sources.some((source) => /airtable/i.test(source.id || source.name)), false);
+  assert.equal(review.disabledSources[0].sourceRole, 'retired');
+  assert.equal(review.disabledSources[0].retired, true);
 });
 
 test('Google Sheet source health reports imported rows that genuinely lack a safe link', async () => {
@@ -99,4 +168,30 @@ test('an unexpected workbook link cannot mask a missing expected listing link', 
   assert.equal(source.listingUrlExpectedCount, 1);
   assert.equal(source.listingUrlUnresolvedCount, 1);
   assert.match(source.listingUrlWarning, /1 imported CSV row displays a View Listing label/);
+});
+
+test('a failed required Sheet suppresses every scored output even when Deal OS is fresh', async () => {
+  dealOsImport = freshDealOsImport();
+  sheetFetchStatus = 503;
+
+  const reviewed = await reviewDailyDeals({ storage: sourceStorage(), withScoredDeals: true });
+
+  assert.equal(reviewed.review.sources.find((source) => source.id === 'deal-os-export').fetched, true);
+  assert.equal(reviewed.review.sources.find((source) => source.id === 'sheet-0').fetched, false);
+  assertFailClosedReview(reviewed);
+  assert.equal(JSON.stringify(reviewed).includes('Deal OS Must Stay Supplemental'), false);
+});
+
+test('a header-only required Sheet suppresses every scored output even when Deal OS is fresh', async () => {
+  dealOsImport = freshDealOsImport();
+  sourceCsv = 'Name,View Listing';
+  sourceWorkbook = buildWorkbook([]);
+
+  const reviewed = await reviewDailyDeals({ storage: sourceStorage(), withScoredDeals: true });
+
+  const sheet = reviewed.review.sources.find((source) => source.id === 'sheet-0');
+  assert.equal(sheet.fetched, true);
+  assert.equal(sheet.rowCount, 0);
+  assertFailClosedReview(reviewed);
+  assert.equal(JSON.stringify(reviewed).includes('Deal OS Must Stay Supplemental'), false);
 });

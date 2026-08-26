@@ -17,7 +17,15 @@ afterEach(cleanup);
 function reviewWithDeal(cimRequest) {
   return {
     totals: {},
-    sources: [],
+    sources: [{
+      id: 'sheet-0',
+      name: 'SMB Deal Hunter Google Sheet',
+      mode: 'csv',
+      fetched: true,
+      required: true,
+      sourceRole: 'required-primary',
+      rowCount: 1,
+    }],
     criteriaRecommendations: [],
     qualified: [
       {
@@ -185,6 +193,15 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     const onPreviewReconciliation = vi.fn();
     const onExecuteReconciliation = vi.fn();
     const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    review.sources.push({
+      id: 'deal-os-export',
+      name: 'SMB Deal OS export',
+      mode: 'manual-export',
+      fetched: true,
+      required: false,
+      sourceRole: 'optional-supplemental',
+      rowCount: 261,
+    });
     const importSummary = {
       importId: 'import-261',
       reviewMode: 'full-backfill',
@@ -246,62 +263,81 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     expect(screen.getByText(/Describe the saved search or Deal Radar filters/)).toBeVisible();
   });
 
-  test('surfaces Deal OS provenance and an explicit limited-coverage warning when Airtable is retired', () => {
+  test('surfaces Deal OS provenance and labels Airtable as retired', () => {
     const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
-    review.coverageWarnings = ['Legacy Airtable is disabled. Deal OS coverage is limited to one saved search.'];
-    review.sources = [{
-      id: 'deal-os-export',
-      name: 'SMB Deal OS export',
-      mode: 'manual-export',
-      fetched: true,
-      rowCount: 120,
-      exportedAt: '2026-08-10T16:00:00.000Z',
-      importedAt: '2026-08-10T16:05:00.000Z',
-      importedBy: 'mathew@example.com',
-      importAgeHours: 2.5,
-      scope: 'saved-search',
-      coverageLabel: 'All active criteria',
-      stableIdCount: 118,
-      listingUrlCount: 120,
-    }];
+    review.sources = [
+      { id: 'sheet-0', name: 'SMB Deal Hunter Google Sheet', mode: 'csv', fetched: true, required: true, sourceRole: 'required-primary', rowCount: 290 },
+      {
+        id: 'deal-os-export',
+        name: 'SMB Deal OS export',
+        mode: 'manual-export',
+        fetched: true,
+        required: false,
+        sourceRole: 'optional-supplemental',
+        rowCount: 120,
+        exportedAt: '2026-08-10T16:00:00.000Z',
+        importedAt: '2026-08-10T16:05:00.000Z',
+        importedBy: 'mathew@example.com',
+        importAgeHours: 2.5,
+        scope: 'saved-search',
+        coverageLabel: 'All active criteria',
+        stableIdCount: 118,
+        listingUrlCount: 120,
+      },
+    ];
     review.disabledSources = [{
       id: 'airtable-disabled',
       name: 'Legacy Airtable Biz List',
-      mode: 'disabled',
+      mode: 'retired',
       disabled: true,
-      fetched: true,
-      reason: 'Explicitly retired with DEAL_HUNTER_AIRTABLE_ENABLED=false.',
+      retired: true,
+      required: false,
+      sourceRole: 'retired',
+      fetched: false,
+      reason: 'Airtable is retired and excluded from source collection and health.',
     }];
 
     render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onReview={vi.fn()} review={review} />);
 
-    expect(screen.getByRole('alert')).toHaveTextContent('Limited source coverage.');
-    expect(screen.getByRole('alert')).toHaveTextContent('Legacy Airtable is disabled');
     expect(screen.getByText('Saved Search · All active criteria')).toBeVisible();
     expect(screen.getByText('118 stable ID · 120 listing URLs')).toBeVisible();
     expect(screen.getByText(/by mathew@example.com/)).toBeVisible();
-    expect(screen.getByText('Legacy Airtable Biz List').closest('div')).toHaveTextContent('disabled');
+    expect(screen.getByText('Legacy Airtable Biz List').closest('div')).toHaveTextContent('retired');
+    expect(screen.getByText('SMB Deal Hunter Google Sheet').closest('div')).toHaveTextContent('required');
+    expect(screen.getByText('SMB Deal OS export').closest('div')).toHaveTextContent('supplemental');
   });
 
-  test('labels configuration failures as setup-needed and flags partial totals', () => {
-    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
-    review.sources = [{
-      id: 'airtable-shared',
-      name: 'Airtable Biz List',
-      mode: 'shared-view',
-      fetched: false,
-      rowCount: 0,
-      error: 'Airtable shared view requires API mode.',
-      requiresConfiguration: true,
-      configurationKey: 'DEAL_HUNTER_AIRTABLE_TOKEN',
-    }];
+  test('keeps Sheet-backed scoring actions available while stale Deal OS reconciliation stays disabled', () => {
+    const review = reviewWithDeal({
+      eligible: true,
+      canRequest: true,
+      status: 'ready',
+      recipientEmail: 'broker@example.com',
+    });
+    review.totals = { crmEligible: 1, cimReady: 1 };
+    review.crmSyncPreview = { count: 1, dealKeys: ['deal-1'] };
+    review.importSummary = { importId: 'stale-import', fieldCoverage: { totalRecords: 1, fields: [] } };
+    review.sources = [
+      { id: 'sheet-0', name: 'SMB Deal Hunter Google Sheet', mode: 'csv', fetched: true, required: true, sourceRole: 'required-primary', rowCount: 290 },
+      { id: 'deal-os-export', name: 'SMB Deal OS export', mode: 'manual-export', fetched: false, required: false, sourceRole: 'optional-supplemental', rowCount: 120, error: 'The export exceeds the freshness limit.' },
+    ];
+    const onOpenApprovals = vi.fn();
+    const onSyncHighFits = vi.fn();
 
-    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onReview={vi.fn()} review={review} />);
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onOpenApprovals={onOpenApprovals} onPreviewReconciliation={vi.fn()} onReview={vi.fn()} onRunFullBackfill={vi.fn()} onSendCimRequest={vi.fn()} onSendEmail={vi.fn()} onSyncHighFits={onSyncHighFits} review={review} />);
 
-    expect(screen.getByText('setup needed')).toBeVisible();
-    expect(screen.getByText(/Required setting:/)).toHaveTextContent('DEAL_HUNTER_AIRTABLE_TOKEN');
-    expect(screen.getByRole('alert')).toHaveTextContent('Partial review.');
-    expect(screen.getByRole('alert')).toHaveTextContent('totals and candidates cover only successfully imported sources');
+    expect(screen.getByText('not used')).toBeVisible();
+    expect(screen.getByText(/Optional Deal OS unavailable\/stale — Google Sheets workflow remains available/)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Send Internal Daily Summary' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Score Full Backfill' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Sync 1 High Fit to CRM' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Review CIM Requests' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Build preview' })).toBeDisabled();
+    expect(screen.getByText('Deal OS reconciliation is unavailable until a fresh import is selected.')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Sync 1 High Fit to CRM' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review CIM Requests' }));
+    expect(onSyncHighFits).toHaveBeenCalledOnce();
+    expect(onOpenApprovals).toHaveBeenCalledOnce();
   });
 
   test('pauses daily email and CIM outreach while a source review is partial', () => {
@@ -313,13 +349,14 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     });
     review.totals.cimReady = 1;
     review.sources = [{
-      id: 'airtable-shared',
-      name: 'Airtable Biz List',
-      mode: 'shared-view',
+      id: 'sheet-0',
+      name: 'SMB Deal Hunter Google Sheet',
+      mode: 'csv',
       fetched: false,
-      error: 'Airtable shared view requires API mode.',
-      requiresConfiguration: true,
-      configurationKey: 'DEAL_HUNTER_AIRTABLE_TOKEN',
+      required: true,
+      sourceRole: 'required-primary',
+      rowCount: 0,
+      error: 'Google Sheet CSV unavailable.',
     }];
 
     render(
@@ -335,11 +372,32 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     );
 
     expect(screen.getByRole('button', { name: 'Review CIM Requests' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Score Full Backfill' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Send Internal Daily Summary' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Retry CIM Request' })).toBeDisabled();
-    expect(screen.getByText('Complete a successful source review before approving or sending CIM requests.')).toBeVisible();
-    expect(screen.getByText('Complete the source review before outreach')).toBeVisible();
+    expect(screen.getByText('Complete a successful required Google Sheet review before approving or sending CIM requests.')).toBeVisible();
+    expect(screen.getByText('Restore the required Google Sheet before outreach')).toBeVisible();
+  });
+
+  test('treats a header-only required Sheet as failed and disables the internal summary', () => {
+    const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
+    review.sources = [{
+      id: 'sheet-0',
+      name: 'SMB Deal Hunter Google Sheet',
+      mode: 'csv',
+      fetched: true,
+      required: true,
+      sourceRole: 'required-primary',
+      rowCount: 0,
+    }];
+
+    render(<DealHunterWorkspace feedback={{ error: '', message: '' }} onReview={vi.fn()} onSendEmail={vi.fn()} review={review} />);
+
+    expect(screen.getByText('failed')).toBeVisible();
+    expect(screen.getByRole('alert')).toHaveTextContent('Required Google Sheet unavailable — scoring and actions paused.');
+    expect(screen.getByRole('button', { name: 'Score Full Backfill' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Send Internal Daily Summary' })).toBeDisabled();
   });
 
   test('keeps an in-progress follow-up in the warning state with its schedule', () => {

@@ -49,7 +49,7 @@ Re-verify these facts before editing; treat them as the expected starting point,
 - The automation-only emergency pause is currently clear, but engage it before deploying Phase 2 code.
 - Global recipient caps are 1 logical CIM touch per rolling 24 hours and 4 logical CIM touches per rolling 30 days.
 - The accepted operating window is 08:00–17:00 `America/Los_Angeles`, weekdays only.
-- Accepted CIM automation source coverage is the SMB Deal Hunter Google Sheet only. Airtable is disabled. A Deal OS import or any additional source must not silently enter the Stage 2 cohort.
+- Accepted CIM automation source coverage is the SMB Deal Hunter Google Sheet only. Airtable is retired. A Deal OS import or any additional source must not silently enter the Stage 2 cohort.
 - Reply tracking has passed a controlled end-to-end test.
 - Production identity health was clean: zero duplicate active sequences, zero unresolved identity exceptions, zero missing links, zero safely repairable linkage mismatches, and zero linkage mismatches.
 - One known historical recipient is already over the accepted rolling cap. That is a historical exception, not permission for another touch.

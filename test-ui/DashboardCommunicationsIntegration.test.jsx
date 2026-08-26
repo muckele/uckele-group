@@ -141,7 +141,15 @@ function createCrmFetch(role = 'admin', initialSubmission = crmSubmission()) {
 function dealHunterReview() {
   return {
     totals: { reviewedDeals: 2, qualified: 1, removalCandidates: 1, cimReady: 1 },
-    sources: [],
+    sources: [{
+      id: 'sheet-0',
+      name: 'SMB Deal Hunter Google Sheet',
+      mode: 'csv',
+      fetched: true,
+      required: true,
+      sourceRole: 'required-primary',
+      rowCount: 2,
+    }],
     criteriaRecommendations: [],
     newlySeenMatches: [],
     watchlist: [],
@@ -334,6 +342,86 @@ describe('Dashboard communications and lead lifecycle integration', () => {
 });
 
 describe('Dashboard Deal Hunter communications integration', () => {
+  test('treats nested full-backfill score failure as failure even in a malformed HTTP 200 success response', async () => {
+    const fallbackFetch = createDealHunterFetch();
+    const operatorError = 'Current-triage eligibility could not be reconciled. The prior current-triage set remains in force.';
+    const fetchMock = vi.fn(async (input, options = {}) => {
+      if (String(input) === '/api/admin/deal-hunter/backfill-review') {
+        return jsonResponse({
+          success: true,
+          error: operatorError,
+          review: { ...dealHunterReview(), reviewMode: 'full-backfill', scoringDeferred: false },
+          scoreRefresh: { ok: false, status: 503, counts: { considered: 2, scored: 0, failed: 0 } },
+        });
+      }
+      return fallbackFetch(input, options);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderDashboard('/admin/deal-hunter');
+
+    const backfillButton = await screen.findByRole('button', { name: 'Score Full Backfill' });
+    await waitFor(() => expect(backfillButton).toBeEnabled());
+    fireEvent.click(backfillButton);
+
+    expect(await screen.findByText(operatorError)).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(/Full backfill scored/i)).not.toBeInTheDocument();
+  });
+
+  test('uses a bounded generic error when a full-backfill response cannot be parsed', async () => {
+    const fallbackFetch = createDealHunterFetch();
+    const privateError = `Invalid JSON at /private/deal-hunter-response.json?token=do-not-expose-${'x'.repeat(1000)}`;
+    const fetchMock = vi.fn(async (input, options = {}) => {
+      if (String(input) === '/api/admin/deal-hunter/backfill-review') {
+        return {
+          ok: false,
+          status: 502,
+          json: async () => {
+            throw new Error(privateError);
+          },
+        };
+      }
+      return fallbackFetch(input, options);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderDashboard('/admin/deal-hunter');
+
+    const backfillButton = await screen.findByRole('button', { name: 'Score Full Backfill' });
+    await waitFor(() => expect(backfillButton).toBeEnabled());
+    fireEvent.click(backfillButton);
+
+    expect(await screen.findByText('Unable to review daily deals.')).toHaveAttribute('role', 'alert');
+    expect(screen.queryByText(/private|do-not-expose|token=/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Full backfill scored/i)).not.toBeInTheDocument();
+  });
+
+  test('keeps genuine full-backfill success feedback unchanged', async () => {
+    const fallbackFetch = createDealHunterFetch();
+    const fetchMock = vi.fn(async (input, options = {}) => {
+      if (String(input) === '/api/admin/deal-hunter/backfill-review') {
+        return jsonResponse({
+          success: true,
+          review: { ...dealHunterReview(), reviewMode: 'full-backfill', scoringDeferred: false },
+          scoreRefresh: { ok: true, status: 200, counts: { considered: 2, scored: 2, failed: 0 } },
+        });
+      }
+      return fallbackFetch(input, options);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderDashboard('/admin/deal-hunter');
+
+    const backfillButton = await screen.findByRole('button', { name: 'Score Full Backfill' });
+    await waitFor(() => expect(backfillButton).toBeEnabled());
+    fireEvent.click(backfillButton);
+
+    expect(await screen.findByText(
+      'Full backfill scored 2 canonical listings. No CRM records were changed.',
+    )).toHaveAttribute('role', 'status');
+    expect(screen.queryByText(/Current-triage eligibility could not be reconciled/i)).not.toBeInTheDocument();
+  });
+
   test('loads durable history and the admin inbox, persists approval passes and card dismissals, retries safely, and assigns inbound mail', async () => {
     const fetchMock = createDealHunterFetch();
     vi.stubGlobal('fetch', fetchMock);
