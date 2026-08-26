@@ -70,6 +70,7 @@ async function writeSentDailyEmailMarker(markerDir, dateKey, result) {
         dateKey,
         createdAt: new Date().toISOString(),
         emailStatus: result.emailResult.status,
+        notificationType: result.notificationType || 'normal-digest',
         providerMessageId: result.emailResult.providerMessageId || '',
         totals: result.review?.totals || {},
         crmSync: result.crmSync || result.review?.crmSync || {},
@@ -219,6 +220,7 @@ export async function runClaimedDailyDealHunterEmail({
         timezone: schedule.timezone,
         totals: result.review?.totals || {},
         crmSync: result.crmSync || result.review?.crmSync || {},
+        notificationType: result.notificationType || 'normal-digest',
       },
     });
 

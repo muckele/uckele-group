@@ -36,7 +36,7 @@ The research and code audit identified these primary gaps to investigate and, wh
 9. There is no dedicated, reproducible offline eval harness and sanitized fixture corpus for model/prompt comparison.
 10. Production intentionally has optional AI and generic CRM email disabled. The OpenAI key/model/privacy approval/evaluation/smoke-test prerequisites have not been established as completed. These are rollout blockers, not permission to guess secrets or enable flags.
 
-The current Deal Hunter Airtable shared-view payload/token issue is a separate source-ingestion blocker. Track it separately if rediscovered; do not broaden this optional-AI task into Deal Hunter source remediation unless it actually blocks a required Recommendations acceptance test.
+Deal Hunter Airtable ingestion is retired and does not participate in source health. The separate Google Sheets-to-Deal OS transition remains outside this optional-AI task unless it actually blocks a required Recommendations acceptance test.
 
 ---
 

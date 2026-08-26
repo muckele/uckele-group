@@ -57,11 +57,6 @@ fly secrets set \
   DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR=/data/deal-hunter-daily-email \
   ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH=/data/acquisition-command-center-source-health.json \
   DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES=8388608 \
-  DEAL_HUNTER_AIRTABLE_ENABLED=false \
-  DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES=12582912 \
-  DEAL_HUNTER_AIRTABLE_BASE_ID=appEGxhjno0HTpEco \
-  DEAL_HUNTER_AIRTABLE_TABLE_ID=tblACIQ9QNiVmoWSK \
-  DEAL_HUNTER_AIRTABLE_VIEW_ID=viw4OORhKKWPUsWa4 \
   DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES=8388608 \
   DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS=1000 \
   DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS=72 \
@@ -69,7 +64,7 @@ fly secrets set \
   DEFAULT_FOLLOW_UP_DELAY_HOURS=24
 ```
 
-Only if the legacy Airtable source is deliberately retained, set `DEAL_HUNTER_AIRTABLE_ENABLED=true` together with the shared-view URL or a read-only `DEAL_HUNTER_AIRTABLE_TOKEN` and its base/table/view identifiers. Do not enable the source without an access method that passes a fresh source review.
+Google Sheets is the current required primary Deal Hunter source. Deal OS imports are optional supplemental data until the later Deal OS rollout. Airtable is retired: legacy `DEAL_HUNTER_AIRTABLE_*` variables are ignored and must not be added to new deployments.
 
 If you enable Turnstile, configure the public site key and secret at runtime. The site key is browser-safe and is exposed through `/api/public-config`; the secret stays server-only:
 
@@ -136,8 +131,10 @@ Then update DNS:
 
 - Confirm the contact form is delivering to `mathew@uckelegroup.com`
 - Confirm `/admin` can run Deal Hunter scoring and send the daily email
-- With Airtable disabled, confirm no Airtable source request is made, the admin review and email disclose limited coverage, and the remaining configured sources can pass the send gate
-- Upload controlled CSV and XLSX Deal OS fixtures as a full administrator; confirm viewer upload is denied, provenance/age/coverage appear in source health, duplicate identities do not create duplicate deals, and an export older than the configured window pauses the send gate
+- Confirm no Airtable request is made and the admin/email label Airtable as retired
+- Confirm a healthy Google Sheet with no Deal OS import sends a normal digest with a supplemental-data warning
+- Upload controlled CSV and XLSX Deal OS fixtures as a full administrator; confirm viewer upload is denied, provenance/age/coverage appear in source health, duplicates collapse, and a stale export is excluded without blocking a Sheet-backed digest
+- Make the Google Sheet CSV temporarily unavailable in a controlled environment; confirm exactly one Pacific-date action-required alert is sent with no recommendations, CRM sync, CIM request, follow-up, or Stage 2 provider work, then restore access and verify source health
 - With Resend configured, confirm `/admin` can send a controlled 75+ Deal Hunter CIM request and run the CIM follow-up check
 - Confirm the in-app scheduler logs `deal-hunter:scheduler` startup and sends after the configured Pacific time
 - If using an external scheduler, confirm it posts to `/api/deal-hunter/daily-email` with `Authorization: Bearer DEAL_HUNTER_CRON_SECRET`

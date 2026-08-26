@@ -3977,6 +3977,7 @@ create table if not exists public.deal_hunter_opportunity_scores (
   missing_evidence jsonb not null default '[]'::jsonb,
   confidence_reasons jsonb not null default '[]'::jsonb,
   summary jsonb not null default '{}'::jsonb,
+  current_triage_eligible boolean not null default false,
   operator_priority text not null default 'normal',
   operator_note text,
   reviewed_at timestamptz,
@@ -4008,6 +4009,8 @@ create table if not exists public.deal_hunter_score_evidence (
 
 create index if not exists idx_deal_hunter_scores_queue
   on public.deal_hunter_opportunity_scores(should_remove, fit_score desc, confidence, opportunity_id);
+create index if not exists idx_deal_hunter_scores_current_queue
+  on public.deal_hunter_opportunity_scores(current_triage_eligible, should_remove, fit_score desc, opportunity_id);
 create index if not exists idx_deal_hunter_scores_priority
   on public.deal_hunter_opportunity_scores(operator_priority, fit_score desc, opportunity_id);
 create index if not exists idx_deal_hunter_scores_fingerprint
@@ -4100,6 +4103,48 @@ begin
 end;
 $$;
 
+-- Replaces the complete current-triage set atomically. This is intentionally a
+-- dedicated service-role operation rather than a field accepted by score writes.
+create or replace function public.reconcile_deal_hunter_current_score_eligibility(p_opportunity_ids text[])
+returns table (activated bigint, deactivated bigint)
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_ids text[];
+  v_activated bigint;
+  v_deactivated bigint;
+begin
+  select coalesce(array_agg(distinct btrim(value)), array[]::text[])
+  into v_ids
+  from unnest(coalesce(p_opportunity_ids, array[]::text[])) as supplied(value)
+  where nullif(btrim(value), '') is not null;
+
+  select count(*) into v_activated
+  from public.deal_hunter_opportunity_scores as scores
+  where scores.current_triage_eligible = false
+    and scores.opportunity_id = any(v_ids);
+
+  select count(*) into v_deactivated
+  from public.deal_hunter_opportunity_scores as scores
+  where scores.current_triage_eligible = true
+    and not (scores.opportunity_id = any(v_ids));
+
+  update public.deal_hunter_opportunity_scores
+  set current_triage_eligible = case
+    when opportunity_id = any(v_ids) then true
+    else false
+  end
+  where current_triage_eligible is distinct from case
+    when opportunity_id = any(v_ids) then true
+    else false
+  end;
+
+  return query select v_activated, v_deactivated;
+end;
+$$;
+
 create or replace function public.list_deal_hunter_opportunity_scores(
   p_view text, p_page integer, p_page_size integer, p_search text, p_sort text, p_direction text,
   p_min_score integer, p_confidence text, p_priority text, p_state text
@@ -4114,6 +4159,7 @@ as $$
     from public.deal_hunter_opportunity_scores as scores
     left join public.deal_hunter_dispositions as disposition
       on disposition.deal_key = scores.deal_key and disposition.disposition = 'dismissed'
+    where scores.current_triage_eligible = true
   ), filtered as (
     select * from candidates
     where (case
@@ -4181,8 +4227,10 @@ alter table public.deal_hunter_score_evidence enable row level security;
 revoke all privileges on table public.deal_hunter_opportunity_scores from public, anon, authenticated;
 revoke all privileges on table public.deal_hunter_score_evidence from public, anon, authenticated;
 revoke all privileges on function public.write_deal_hunter_opportunity_score(jsonb, jsonb) from public, anon, authenticated;
+revoke all privileges on function public.reconcile_deal_hunter_current_score_eligibility(text[]) from public, anon, authenticated;
 revoke all privileges on function public.list_deal_hunter_opportunity_scores(text, integer, integer, text, text, text, integer, text, text, text) from public, anon, authenticated;
 grant all privileges on table public.deal_hunter_opportunity_scores to service_role;
 grant all privileges on table public.deal_hunter_score_evidence to service_role;
 grant execute on function public.write_deal_hunter_opportunity_score(jsonb, jsonb) to service_role;
+grant execute on function public.reconcile_deal_hunter_current_score_eligibility(text[]) to service_role;
 grant execute on function public.list_deal_hunter_opportunity_scores(text, integer, integer, text, text, text, integer, text, text, text) to service_role;

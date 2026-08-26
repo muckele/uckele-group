@@ -144,10 +144,10 @@ export async function listTriageQueue({
 export async function getTriageOpportunityDetail({ opportunityId = '', storage = getStorage() } = {}) {
   const id = normalizeText(opportunityId, 200);
   if (!id) return { ok: false, status: 400, error: 'A canonical opportunity id is required.' };
-  if (typeof storage.getDealHunterOpportunityScore !== 'function') {
+  if (typeof storage.getCurrentDealHunterOpportunityScore !== 'function') {
     return { ok: false, status: 503, error: 'Opportunity scoring storage is unavailable.' };
   }
-  const score = await storage.getDealHunterOpportunityScore(id);
+  const score = await storage.getCurrentDealHunterOpportunityScore(id);
   if (!score) return { ok: false, status: 404, error: 'No score has been recorded for this opportunity.' };
   const evidence = await storage.listDealHunterScoreEvidence?.(id, { limit: 500 }) || [];
 
@@ -214,11 +214,14 @@ export async function setTriageOperatorDecision({
 } = {}) {
   const id = normalizeText(opportunityId, 200);
   if (!id) return { ok: false, status: 400, error: 'A canonical opportunity id is required.' };
-  if (typeof storage.setDealHunterOpportunityOperatorDecision !== 'function') {
+  if (
+    typeof storage.setDealHunterOpportunityOperatorDecision !== 'function'
+    || typeof storage.getCurrentDealHunterOpportunityScore !== 'function'
+  ) {
     return { ok: false, status: 503, error: 'Opportunity scoring storage is unavailable.' };
   }
 
-  const current = await storage.getDealHunterOpportunityScore(id);
+  const current = await storage.getCurrentDealHunterOpportunityScore(id);
   if (!current) return { ok: false, status: 404, error: 'No score has been recorded for this opportunity.' };
 
   const decision = { opportunityId: id };

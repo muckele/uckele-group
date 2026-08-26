@@ -2782,8 +2782,14 @@ export default function DashboardPage() {
       });
       const result = await response.json();
 
-      if (!response.ok || !result.success) {
-        throw new Error(result.error || 'Unable to review daily deals.');
+      const scoreRefreshFailed = fullBackfill && result?.scoreRefresh?.ok === false;
+      if (!response.ok || result?.success !== true || scoreRefreshFailed) {
+        const fallbackError = scoreRefreshFailed
+          ? 'Full-backfill scoring could not be completed. The prior current-triage set remains in force.'
+          : 'Unable to review daily deals.';
+        const operatorError = String(result?.error || fallbackError).replace(/\s+/g, ' ').trim().slice(0, 500);
+        setDealHunterFeedback({ error: operatorError || fallbackError, message: '' });
+        return;
       }
 
       if (result.review) {
@@ -2793,12 +2799,14 @@ export default function DashboardPage() {
       setDealHunterFeedback({
         error: '',
         message: fullBackfill
-          ? `Full backfill scored ${result.review?.totals?.reviewedDeals || 0} canonical listings. No CRM records were changed.`
+          ? result.review?.scoringDeferred
+            ? result.reviewWarning || 'Full-backfill scoring is deferred until every required Google Sheet is healthy. Existing persisted scores were left unchanged.'
+            : `Full backfill scored ${result.review?.totals?.reviewedDeals || 0} canonical listings. No CRM records were changed.`
           : `Reviewed ${result.review?.totals?.reviewedDeals || 0} recent deals.`,
       });
       await loadCommandCenter();
-    } catch (error) {
-      setDealHunterFeedback({ error: error.message || 'Unable to review daily deals.', message: '' });
+    } catch {
+      setDealHunterFeedback({ error: 'Unable to review daily deals.', message: '' });
     } finally {
       setDealHunterLoading(false);
     }
@@ -2880,7 +2888,7 @@ export default function DashboardPage() {
       setDealHunterImportSummary(summary);
       setDealHunterReconciliation({ preview: null, busy: false });
       const imported = result.import || {};
-      const scoredMessage = summary?.scoredListings !== undefined
+      const scoredMessage = !refreshedReview?.scoringDeferred && summary?.scoredListings !== undefined
         ? ` Scored ${summary.scoredListings} listing${Number(summary.scoredListings) === 1 ? '' : 's'} in ${summary.reviewMode === 'full-backfill' ? 'full-backfill' : 'daily'} mode.`
         : '';
       setDealHunterFeedback({

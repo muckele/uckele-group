@@ -55,6 +55,10 @@ const semanticScoringMigrationUrl = new URL(
   '../supabase/migrations/20260817090000_deal_hunter_semantic_scoring.sql',
   import.meta.url,
 );
+const currentTriageEligibilityMigrationUrl = new URL(
+  '../supabase/migrations/20260826120000_deal_hunter_current_triage_eligibility.sql',
+  import.meta.url,
+);
 
 function currentAppTables(schema) {
   return Array.from(
@@ -159,7 +163,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const crmReconciliationMigration = fs.readFileSync(crmReconciliationMigrationUrl, 'utf8');
   const opportunityScoringMigration = fs.readFileSync(opportunityScoringMigrationUrl, 'utf8');
   const semanticScoringMigration = fs.readFileSync(semanticScoringMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}`;
+  const currentTriageEligibilityMigration = fs.readFileSync(currentTriageEligibilityMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
@@ -215,6 +220,52 @@ test('Supabase migration and fresh schema isolate every current app table to the
   assert.match(crmReconciliationMigration, /CRM submission already belongs to another canonical opportunity/i);
   assertServiceRoleOnlyFunction(schema, 'fresh schema', 'start_deal_hunter_crm_reconciliation');
   assertServiceRoleOnlyFunction(schema, 'fresh schema', 'link_deal_hunter_crm_submission');
+  assertServiceRoleOnlyFunction(
+    currentTriageEligibilityMigration,
+    'current triage eligibility migration',
+    'reconcile_deal_hunter_current_score_eligibility',
+  );
+  assertServiceRoleOnlyFunction(schema, 'fresh schema', 'reconcile_deal_hunter_current_score_eligibility');
+  for (const [sourceLabel, sql] of [
+    ['current triage eligibility migration', currentTriageEligibilityMigration],
+    ['fresh schema', schema],
+  ]) {
+    assert.match(
+      sql,
+      /current_triage_eligible\s+boolean/i,
+      `${sourceLabel} must define a current-triage eligibility marker`,
+    );
+    assert.match(
+      sql,
+      /current_triage_eligible\s+boolean\s+not null\s+default\s+false|alter column current_triage_eligible set not null/i,
+      `${sourceLabel} must make current-triage eligibility non-null`,
+    );
+    assert.match(
+      sql,
+      /where\s+scores\.current_triage_eligible\s*=\s*true/i,
+      `${sourceLabel} must filter triage rows before count, filters, sorting, and pagination`,
+    );
+    assert.match(
+      sql,
+      /update\s+public\.deal_hunter_opportunity_scores[\s\S]*current_triage_eligible\s*=\s*case[\s\S]*opportunity_id\s*=\s*any\s*\(/i,
+      `${sourceLabel} must reconcile the complete current set in one database statement`,
+    );
+  }
+  assert.match(
+    currentTriageEligibilityMigration,
+    /add column if not exists current_triage_eligible boolean/i,
+    'the forward migration must safely add the marker to existing installations',
+  );
+  assert.match(
+    currentTriageEligibilityMigration,
+    /set current_triage_eligible = true\s+where current_triage_eligible is null/i,
+    'existing score rows must retain their last-good current visibility during migration',
+  );
+  assert.match(
+    currentTriageEligibilityMigration,
+    /alter column current_triage_eligible set default false[\s\S]*alter column current_triage_eligible set not null/i,
+    'new score rows must be inactive until an authoritative reconciliation',
+  );
   for (const tableName of [
     'deal_hunter_opportunities',
     'deal_hunter_opportunity_aliases',

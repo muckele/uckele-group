@@ -2,11 +2,22 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { after } from 'node:test';
 
 process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
-process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
+process.env.DEAL_HUNTER_SHEET_CSV_URL = 'https://example.test/required-sheet.csv';
 process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS = '72';
+
+const originalFetch = globalThis.fetch;
+globalThis.fetch = async (url, options) => {
+  if (String(url) === process.env.DEAL_HUNTER_SHEET_CSV_URL) {
+    return new Response('Name\nHealthy Required Sheet Control', { status: 200 });
+  }
+  return originalFetch(url, options);
+};
+after(() => {
+  globalThis.fetch = originalFetch;
+});
 
 const {
   auditDealHunterCrmIntegrity,
@@ -28,6 +39,39 @@ function reconciliationCsv() {
 function singleListingCsv() {
   return reconciliationCsv().split('\n').slice(0, 2).join('\n');
 }
+
+test('exact-import reconciliation remains blocked when the selected Deal OS import is stale', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-crm-reconciliation-stale-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'crm.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const historicNow = new Date(Date.now() - 80 * 60 * 60 * 1000);
+  const imported = await importDealOsExport({
+    fileBuffer: Buffer.from(singleListingCsv()),
+    fileName: 'deal-os-stale-selected-import.csv',
+    exportedAt: new Date(historicNow.getTime() - 60 * 60 * 1000).toISOString(),
+    scope: 'saved-search',
+    coverageLabel: 'Stale selected reconciliation fixture',
+    expectedRowCount: 1,
+    importedBy: 'admin@example.com',
+    storage,
+    now: historicNow,
+  });
+  assert.equal(imported.ok, true);
+
+  const preview = await previewDealOsCrmReconciliation({
+    importId: imported.import.id,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+
+  assert.equal(preview.ok, false);
+  assert.equal(preview.status, 503);
+  assert.match(preview.error, /reconciliation preview is blocked/i);
+  assert.match(preview.review.sources.find((source) => source.id === 'deal-os-export').error, /freshness limit/i);
+});
 
 test('exact-import reconciliation accounts for every row, creates one CRM owner per opportunity, and is idempotent', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-crm-reconciliation-'));
@@ -59,7 +103,7 @@ test('exact-import reconciliation accounts for every row, creates one CRM owner 
     requestedBy: 'admin@example.com',
     storage,
   });
-  assert.equal(preview.ok, true);
+  assert.equal(preview.ok, true, JSON.stringify({ error: preview.error, sources: preview.review?.sources }, null, 2));
   assert.equal(preview.counts.acceptedRows, 3);
   assert.equal(preview.counts.mappedSourceRows, 3);
   assert.equal(preview.counts.unmappedSourceRows, 0);

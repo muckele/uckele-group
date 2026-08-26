@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 
 process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
 process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
@@ -120,6 +121,107 @@ test('a machine score write persists the score and its evidence together', async
   assert.equal(observed.evidence_class, 'observed');
   assert.equal(observed.source_id, 'deal-os-export');
   assert.equal(observed.source_record_id, 'row-9');
+});
+
+test('only eligibility reconciliation can place historical scores in the current triage set', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage);
+  await seedOpportunity(storage, 'opp-score-2');
+  await storage.writeDealHunterOpportunityScore(scorePayload(), evidencePayload());
+  await storage.writeDealHunterOpportunityScore(
+    scorePayload({
+      opportunity_id: 'opp-score-2',
+      deal_key: 'deal-score-2',
+      name: 'Second Current Opportunity',
+      listing_url: 'https://listings.example.invalid/opp-score-2',
+      score_fingerprint: 'fingerprint-two',
+      fit_score: 72,
+      score_status: 'watchlist',
+      high_fit: false,
+    }),
+    evidencePayload('fingerprint-two'),
+  );
+
+  assert.ok(await storage.getDealHunterOpportunityScore('opp-score-1'), 'the historical score is durable');
+  assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
+  assert.deepEqual(
+    await storage.listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 1 }),
+    { rows: [], total: 0, page: 1, pageSize: 1, totalPages: 1 },
+  );
+
+  const activated = await storage.reconcileDealHunterCurrentScoreEligibility(['opp-score-1', 'opp-score-2']);
+  assert.deepEqual(activated, { activated: 2, deactivated: 0 });
+  assert.ok(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'));
+
+  const firstPage = await storage.listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 1 });
+  const secondPage = await storage.listDealHunterOpportunityScores({ view: 'all', page: 2, pageSize: 1 });
+  assert.equal(firstPage.total, 2, 'counting must use the same current-only population as row selection');
+  assert.equal(firstPage.totalPages, 2);
+  assert.equal(firstPage.rows.length, 1);
+  assert.equal(secondPage.rows.length, 1);
+  assert.notEqual(firstPage.rows[0].opportunity_id, secondPage.rows[0].opportunity_id);
+
+  const narrowed = await storage.reconcileDealHunterCurrentScoreEligibility(['opp-score-2']);
+  assert.deepEqual(narrowed, { activated: 0, deactivated: 1 });
+  assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
+  const searched = await storage.listDealHunterOpportunityScores({
+    view: 'all', search: 'Commercial Fire Safety', page: 1, pageSize: 25,
+  });
+  assert.equal(searched.total, 0, 'filters must never reach an inactive historical row');
+
+  const historical = await storage.getDealHunterOpportunityScore('opp-score-1');
+  const evidence = await storage.listDealHunterScoreEvidence('opp-score-1');
+  assert.equal(historical.score_fingerprint, 'fingerprint-a');
+  assert.equal(evidence.length, 2, 'deactivation preserves historical evidence');
+});
+
+test('machine score payloads cannot set current-triage eligibility', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage);
+  await assert.rejects(
+    storage.writeDealHunterOpportunityScore({ ...scorePayload(), current_triage_eligible: true }, []),
+    /eligibility-owned field "current_triage_eligible"/,
+  );
+});
+
+test('SQLite forward migration preserves existing scores as last-good current but keeps later inserts inactive', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-score-eligibility-migration-'));
+  const sqlitePath = path.join(directory, 'legacy.sqlite');
+  let storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => {
+    storage?.close?.();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  await seedOpportunity(storage);
+  await storage.writeDealHunterOpportunityScore(scorePayload(), evidencePayload());
+  await storage.reconcileDealHunterCurrentScoreEligibility(['opp-score-1']);
+  storage.close();
+  storage = null;
+
+  const legacy = new Database(sqlitePath);
+  legacy.exec(`
+    DROP INDEX IF EXISTS idx_deal_hunter_scores_current_queue;
+    ALTER TABLE deal_hunter_opportunity_scores DROP COLUMN current_triage_eligible;
+  `);
+  legacy.close();
+
+  storage = createSqliteStorage({ storage: { sqlitePath } });
+  assert.ok(
+    await storage.getCurrentDealHunterOpportunityScore('opp-score-1'),
+    'the additive migration preserves the existing queue as last-known-good',
+  );
+
+  await seedOpportunity(storage, 'opp-score-2');
+  await storage.writeDealHunterOpportunityScore(
+    scorePayload({ opportunity_id: 'opp-score-2', deal_key: 'deal-score-2', score_fingerprint: 'fingerprint-two' }),
+    [],
+  );
+  assert.equal(
+    await storage.getCurrentDealHunterOpportunityScore('opp-score-2'),
+    null,
+    'the score INSERT explicitly remains inactive even though the legacy column default preserves old rows',
+  );
 });
 
 test('rewriting a score replaces its evidence so none survives from an older fingerprint', async (t) => {
@@ -283,10 +385,12 @@ test('fingerprint lookup returns only the columns the refresh gate needs', async
 function supabaseRowClient(row) {
   let table = null;
   let pendingUpdate = null;
+  let currentOnly = false;
   const chain = {
     from(name) {
       table = name;
       pendingUpdate = null;
+      currentOnly = false;
       return chain;
     },
     select() {
@@ -298,8 +402,11 @@ function supabaseRowClient(row) {
     },
     eq(column, value) {
       assert.equal(table, 'deal_hunter_opportunity_scores');
-      assert.equal(column, 'opportunity_id');
-      assert.equal(value, row.opportunity_id);
+      if (column === 'opportunity_id') assert.equal(value, row.opportunity_id);
+      else if (column === 'current_triage_eligible') {
+        assert.equal(value, true);
+        currentOnly = true;
+      } else assert.fail(`unexpected Supabase score filter ${column}`);
       if (pendingUpdate) Object.assign(row, pendingUpdate);
       return chain;
     },
@@ -307,6 +414,7 @@ function supabaseRowClient(row) {
       return chain;
     },
     async maybeSingle() {
+      if (currentOnly && !row.current_triage_eligible) return { data: null, error: null };
       return { data: { ...row }, error: null };
     },
   };
@@ -340,6 +448,7 @@ function storedScoreRow(overrides = {}) {
     reviewed_by: null,
     reviewed_fingerprint: null,
     reviewed_semantic_digest: null,
+    current_triage_eligible: true,
     ...overrides,
   };
 }
@@ -453,6 +562,33 @@ test('Supabase: a machine score write refuses to carry reviewed_semantic_digest'
   );
 });
 
+test('Supabase: current lookup filters eligibility and reconciliation uses the dedicated RPC', async () => {
+  const inactive = supabaseStorageOver(storedScoreRow({ current_triage_eligible: false }));
+  assert.equal(await inactive.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
+  assert.ok(await inactive.getDealHunterOpportunityScore('opp-score-1'), 'historical lookup remains unfiltered');
+
+  const calls = [];
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    {
+      client: {
+        async rpc(name, payload) {
+          calls.push({ name, payload });
+          return { data: [{ activated: 3, deactivated: 2 }], error: null };
+        },
+      },
+    },
+  );
+  assert.deepEqual(
+    await storage.reconcileDealHunterCurrentScoreEligibility(['opp-3', 'opp-1', 'opp-3']),
+    { activated: 3, deactivated: 2 },
+  );
+  assert.deepEqual(calls, [{
+    name: 'reconcile_deal_hunter_current_score_eligibility',
+    payload: { p_opportunity_ids: ['opp-3', 'opp-1'] },
+  }]);
+});
+
 test('both storage providers expose the same scoring surface', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-score-parity-'));
   const sqlite = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'parity.sqlite') } });
@@ -465,6 +601,8 @@ test('both storage providers expose the same scoring surface', () => {
       'writeDealHunterOpportunityScore',
       'setDealHunterOpportunityOperatorDecision',
       'getDealHunterOpportunityScore',
+      'getCurrentDealHunterOpportunityScore',
+      'reconcileDealHunterCurrentScoreEligibility',
       'listDealHunterOpportunityScores',
       'listDealHunterOpportunityScoreFingerprints',
       'listDealHunterScoreEvidence',

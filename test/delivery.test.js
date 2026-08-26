@@ -6,6 +6,7 @@ import {
   buildDealHunterCimFollowUpEmail,
   buildDealHunterCimRequestEmail,
   buildDailyDealHunterEmail,
+  buildDailyDealHunterSourceAlertEmail,
   buildAdminEmailTestEmail,
   normalizeResendTags,
 } from '../server/services/delivery.js';
@@ -30,6 +31,7 @@ test('daily Deal Hunter email carries its deterministic provider idempotency key
     review: { totals: {}, sources: [], criteriaRecommendations: [] },
   });
   assert.equal(message.idempotencyKey, 'daily-deal-hunter-email:2026-07-12');
+  assert.equal(message.tracking.notificationType, 'normal-digest');
 });
 
 test('daily Deal Hunter email has clickable links for 75+ businesses and CIM approvals', () => {
@@ -71,14 +73,14 @@ test('daily Deal Hunter email always links to the 75+ scored-business dashboard'
   assert.doesNotMatch(message.html, /href="http:\/\/localhost:5173\/admin\/deal-hunter\?view=cim-approvals"/);
 });
 
-test('daily Deal Hunter email clearly discloses intentionally limited source coverage', () => {
+test('daily Deal Hunter email clearly discloses an additional source coverage limit', () => {
   const message = buildDailyDealHunterEmail({
     to: 'admin@example.com',
     review: {
       totals: {},
       sources: [{ name: 'SMB Deal Hunter Google Sheet', fetched: true, rowCount: 290 }],
       coverageWarnings: [
-        'Legacy Airtable is disabled and no Deal OS export is active. This review covers only the Google Sheet.',
+        'The Deal OS export reached its listing ceiling and may be truncated.',
       ],
       criteriaRecommendations: [],
     },
@@ -86,9 +88,66 @@ test('daily Deal Hunter email clearly discloses intentionally limited source cov
 
   assert.match(message.subject, /limited source coverage/i);
   assert.match(message.text, /LIMITED SOURCE COVERAGE/);
-  assert.match(message.text, /Legacy Airtable is disabled/);
+  assert.match(message.text, /Deal OS export reached its listing ceiling/);
   assert.match(message.html, /Limited source coverage/);
-  assert.match(message.html, /Legacy Airtable is disabled/);
+  assert.match(message.html, /Deal OS export reached its listing ceiling/);
+});
+
+test('daily Deal Hunter email prominently labels required, supplemental, and retired source coverage', () => {
+  const warning = 'OPTIONAL DEAL OS IMPORT STALE — NOT USED: export exceeds the freshness limit.';
+  const message = buildDailyDealHunterEmail({
+    to: 'admin@example.com',
+    review: {
+      totals: {},
+      sources: [
+        { id: 'sheet-0', name: 'SMB Deal Hunter Google Sheet', fetched: true, rowCount: 290, required: true, sourceRole: 'required-primary' },
+        { id: 'deal-os-export', name: 'SMB Deal OS export', fetched: false, rowCount: 120, required: false, sourceRole: 'optional-supplemental', error: 'export exceeds the freshness limit' },
+      ],
+      optionalSourceWarnings: [warning],
+      coverageWarnings: [warning],
+      criteriaRecommendations: [],
+    },
+  });
+
+  assert.match(message.subject, /Deal OS warning/);
+  assert.match(message.text, /ACTION RECOMMENDED — OPTIONAL DEAL OS DATA NOT USED/);
+  assert.match(message.text, /Google Sheet: REQUIRED PRIMARY — healthy/);
+  assert.match(message.text, /Deal OS export: OPTIONAL SUPPLEMENTAL — stale; not used/);
+  assert.match(message.text, /Airtable Biz List: RETIRED — not fetched/);
+  assert.match(message.html, /Action recommended — optional Deal OS data not used/);
+  assert.match(message.html, /REQUIRED PRIMARY/);
+  assert.match(message.html, /RETIRED/);
+});
+
+test('required-source alert is bounded, escaped, date-scoped, and contains no recommendations', () => {
+  const unsafeError = `<script>alert(1)</script>${'x'.repeat(700)}END-OF-UNBOUNDED-ERROR`;
+  const message = buildDailyDealHunterSourceAlertEmail({
+    to: 'admin@example.com',
+    idempotencyKey: 'daily-deal-hunter-email:2026-08-25',
+    review: {
+      generatedAt: '2026-08-25T18:00:00.000Z',
+      latestSuccessfulDelivery: { createdAt: '2026-08-24T18:00:00.000Z', subject: 'Daily deal review' },
+      sources: [
+        { id: 'sheet-0', name: 'SMB Deal Hunter Google Sheet', fetched: false, required: true, sourceRole: 'required-primary', rowCount: 0, error: unsafeError },
+        { id: 'deal-os-export', name: 'SMB Deal OS export', fetched: false, required: false, sourceRole: 'optional-supplemental', exportedAt: '2026-08-20T12:00:00.000Z', importedAt: '2026-08-20T12:05:00.000Z', error: 'stale' },
+      ],
+      qualified: [{ name: 'Must Not Appear Recommendation' }],
+    },
+  });
+
+  assert.equal(message.idempotencyKey, 'daily-deal-hunter-email:2026-08-25');
+  assert.equal(message.tracking.notificationType, 'required-source-alert');
+  assert.match(message.subject, /2026-08-25/);
+  assert.match(message.text, /Pacific business date: 2026-08-25/);
+  assert.match(message.text, /No CRM synchronization, CIM request, follow-up, Stage 2 automation, or other broker outreach occurred/);
+  assert.match(message.text, /Latest successful normal digest/);
+  assert.match(message.text, /Deal OS: optional and stale; not used/);
+  assert.doesNotMatch(message.text, /Must Not Appear Recommendation/);
+  assert.doesNotMatch(message.html, /Must Not Appear Recommendation/);
+  assert.doesNotMatch(message.html, /<script>/i);
+  assert.match(message.html, /&lt;script&gt;/);
+  assert.doesNotMatch(message.text, /END-OF-UNBOUNDED-ERROR/);
+  assert.doesNotMatch(message.html, /END-OF-UNBOUNDED-ERROR/);
 });
 
 test('daily Deal Hunter email only makes HTTP(S) listing URLs clickable', () => {

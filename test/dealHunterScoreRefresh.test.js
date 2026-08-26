@@ -5,15 +5,22 @@ import path from 'node:path';
 import test from 'node:test';
 
 process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
-process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
+process.env.DEAL_HUNTER_SHEET_CSV_URL = 'https://example.invalid/daily-deal-hunter.csv';
+delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
+
+globalThis.fetch = async () => {
+  throw new Error('The required Google Sheet is unavailable in this score-refresh test.');
+};
 
 const { createSqliteStorage } = await import('../server/storage/sqlite.js');
+const { importDealOsExport } = await import('../server/services/dealHunter.js');
 const {
   fullRebuildConfirmation,
   previewOpportunityScoreRefresh,
   refreshOpportunityScores,
   requestOpportunityScoreRefresh,
 } = await import('../server/services/dealHunterScoreStore.js');
+const { listTriageQueue } = await import('../server/services/dealHunterTriage.js');
 const { createManualSubmission } = await import('../server/services/submissions.js');
 const { DEAL_SCORING_RULES_VERSION } = await import('../server/services/dealHunterScoringPolicy.js');
 
@@ -79,6 +86,55 @@ async function seedOpportunity(storage, opportunityId, primarySubmissionId = nul
     status: 'active',
     metadata: {},
   });
+}
+
+async function seedFreshCanonicalSources(t, storage, {
+  sheetName = 'Current Required Sheet Co',
+  sheetListingUrl = 'https://listings.example.invalid/current-sheet',
+  dealOsName = 'Supplemental Deal OS Co',
+  dealOsListingUrl = 'https://dealos.example.invalid/fresh-001',
+} = {}) {
+  const originalSheetUrl = process.env.DEAL_HUNTER_SHEET_CSV_URL;
+  const originalFetch = globalThis.fetch;
+  const originalNow = Date.now;
+  // This file configures the required Sheet before importing the service; the
+  // application config is intentionally cached after import.
+  const sheetUrl = 'https://example.invalid/daily-deal-hunter.csv';
+  const baseNow = originalNow();
+  process.env.DEAL_HUNTER_SHEET_CSV_URL = sheetUrl;
+  Date.now = () => baseNow;
+  globalThis.fetch = async (url) => {
+    assert.equal(String(url), sheetUrl);
+    return new Response([
+      'Business Name,State,Earnings,Revenue,Asking Price,Date Added,View Listing URL,Description',
+      `${sheetName},CA,$450000,$1800000,$1250000,2026-08-25,${sheetListingUrl},Recurring commercial inspection contracts`,
+    ].join('\n'), { status: 200, headers: { 'content-type': 'text/csv' } });
+  };
+  t.after(() => {
+    process.env.DEAL_HUNTER_SHEET_CSV_URL = originalSheetUrl;
+    globalThis.fetch = originalFetch;
+    Date.now = originalNow;
+  });
+
+  const imported = await importDealOsExport({
+    fileName: 'fresh-deal-os.csv',
+    fileBuffer: Buffer.from([
+      'Listing ID,Business Name,State,Earnings,Revenue,Asking Price,Date Added,View Listing URL,Description',
+      `FRESH-001,${dealOsName},TX,$700000,$2800000,$1900000,2026-08-20,${dealOsListingUrl},Recurring service contracts`,
+    ].join('\n')),
+    exportedAt: new Date(baseNow - (60 * 60 * 1000)).toISOString(),
+    scope: 'saved-search',
+    coverageLabel: 'Complete fresh saved-search export',
+    importedBy: 'score-refresh-test',
+    storage,
+    now: new Date(baseNow),
+  });
+  assert.equal(imported.ok, true, JSON.stringify(imported));
+  return {
+    advanceBeyondFreshness() {
+      Date.now = () => baseNow + (80 * 60 * 60 * 1000);
+    },
+  };
 }
 
 test('the first refresh scores and persists evidence, and a repeat refresh writes nothing', async (t) => {
@@ -297,6 +353,206 @@ test('a rescore emits one activity event only when the score actually moved', as
   assert.equal(moved[0].metadata.rulesVersion, DEAL_SCORING_RULES_VERSION);
   assert.ok(Array.isArray(moved[0].metadata.dimensionChanges));
   assert.ok(moved[0].metadata.dimensionChanges.some((change) => change.dimension === 'financial-fit'));
+});
+
+test('required-source outage defers implicit refresh and preview without erasing scores or writing activity', async (t) => {
+  const storage = withStorage(t);
+  const created = await createManualSubmission({
+    name: 'Broker',
+    email: 'broker@example.invalid',
+    company: 'Preserved Score Co',
+    message: 'Seed an existing score that must survive a temporary required-source outage.',
+  }, 'admin', { storage });
+  assert.equal(created.ok, true, JSON.stringify(created.errors));
+  await seedOpportunity(storage, 'opp-refresh-1', created.submission.id);
+  await refreshOpportunityScores({ deals: [scoredDeal()], storage });
+  await storage.reconcileDealHunterCurrentScoreEligibility(['opp-refresh-1']);
+  const beforeScore = await storage.getDealHunterOpportunityScore('opp-refresh-1');
+  const beforeQueue = await listTriageQueue({ view: 'all', storage });
+  assert.deepEqual(beforeQueue.rows.map((row) => row.opportunityId), ['opp-refresh-1']);
+  const beforeEvents = await storage.listCrmActivityEvents({ submissionId: created.submission.id, limit: 50 });
+
+  const refreshed = await refreshOpportunityScores({ storage });
+  const previewed = await previewOpportunityScoreRefresh({ storage });
+
+  assert.equal(refreshed.ok, false);
+  assert.equal(refreshed.status, 503);
+  assert.equal(refreshed.scoringDeferred, true);
+  assert.deepEqual(refreshed.counts, { considered: 0, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 });
+  assert.equal(previewed.ok, false);
+  assert.equal(previewed.status, 503);
+  assert.equal(previewed.scoringDeferred, true);
+  const afterScore = await storage.getDealHunterOpportunityScore('opp-refresh-1');
+  assert.equal(afterScore.score_fingerprint, beforeScore.score_fingerprint);
+  assert.equal(afterScore.scored_at, beforeScore.scored_at);
+  const afterEvents = await storage.listCrmActivityEvents({ submissionId: created.submission.id, limit: 50 });
+  assert.equal(afterEvents.length, beforeEvents.length);
+  assert.equal(afterEvents.filter((event) => event.event_type === 'opportunity.rescored').length, 1);
+  const afterQueue = await listTriageQueue({ view: 'all', storage });
+  assert.deepEqual(afterQueue.rows.map((row) => row.opportunityId), ['opp-refresh-1']);
+});
+
+test('fresh Deal OS becomes current, scoped calls preserve it, and authoritative recovery removes it only from current triage', async (t) => {
+  const storage = withStorage(t);
+  const sources = await seedFreshCanonicalSources(t, storage);
+
+  const fresh = await refreshOpportunityScores({ storage });
+  assert.equal(fresh.ok, true, JSON.stringify(fresh));
+  const freshQueue = await listTriageQueue({ view: 'all', pageSize: 100, storage });
+  assert.deepEqual(new Set(freshQueue.rows.map((row) => row.name)), new Set([
+    'Current Required Sheet Co', 'Supplemental Deal OS Co',
+  ]));
+  const sheet = freshQueue.rows.find((row) => row.name === 'Current Required Sheet Co');
+  const supplemental = freshQueue.rows.find((row) => row.name === 'Supplemental Deal OS Co');
+  assert.ok(sheet?.opportunityId);
+  assert.ok(supplemental?.opportunityId);
+  const historicalScore = await storage.getDealHunterOpportunityScore(supplemental.opportunityId);
+  const historicalEvidence = await storage.listDealHunterScoreEvidence(supplemental.opportunityId);
+  assert.ok(historicalEvidence.length > 0);
+
+  const created = await createManualSubmission({
+    name: 'Supplemental broker',
+    email: 'supplemental-broker@example.invalid',
+    company: 'Supplemental Deal OS Co',
+    message: 'Link the historical score to verify reconciliation emits no fake rescore activity.',
+  }, 'admin', { storage });
+  const opportunity = await storage.getDealHunterOpportunity(supplemental.opportunityId);
+  await storage.upsertDealHunterOpportunity({
+    ...opportunity,
+    updated_at: new Date().toISOString(),
+    primary_submission_id: created.submission.id,
+  });
+  const eventsBefore = await storage.listCrmActivityEvents({ submissionId: created.submission.id, limit: 50 });
+
+  sources.advanceBeyondFreshness();
+
+  const preview = await previewOpportunityScoreRefresh({ storage });
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  assert.equal(
+    (await listTriageQueue({ view: 'all', pageSize: 100, storage })).rows.some(
+      (row) => row.opportunityId === supplemental.opportunityId,
+    ),
+    true,
+    'preview must never reconcile current-triage eligibility',
+  );
+
+  const partial = await refreshOpportunityScores({ reviewMode: 'daily', storage });
+  assert.equal(partial.ok, true, JSON.stringify(partial));
+  assert.equal(
+    (await listTriageQueue({ view: 'all', pageSize: 100, storage })).rows.some(
+      (row) => row.opportunityId === supplemental.opportunityId,
+    ),
+    true,
+    'a partial daily refresh must never globally reconcile',
+  );
+
+  const explicit = await refreshOpportunityScores({
+    deals: [scoredDeal({
+      opportunityId: sheet.opportunityId,
+      dealKey: sheet.dealKey,
+      name: sheet.name,
+      listingUrl: sheet.listingUrl,
+      sourceId: 'google-sheet',
+      sourceName: 'Required Google Sheet',
+    })],
+    storage,
+  });
+  assert.equal(explicit.ok, true, JSON.stringify(explicit));
+  assert.equal(
+    (await listTriageQueue({ view: 'all', pageSize: 100, storage })).rows.some(
+      (row) => row.opportunityId === supplemental.opportunityId,
+    ),
+    true,
+    'a generic refreshOpportunityScores({ deals: [...] }) must never globally reconcile',
+  );
+
+  const narrowed = await refreshOpportunityScores({ opportunityIds: [sheet.opportunityId], storage });
+  assert.equal(narrowed.ok, true, JSON.stringify(narrowed));
+  assert.equal(
+    (await listTriageQueue({ view: 'all', pageSize: 100, storage })).rows.some(
+      (row) => row.opportunityId === supplemental.opportunityId,
+    ),
+    true,
+    'a narrowed opportunityIds refresh must never globally reconcile',
+  );
+
+  const reconciled = await refreshOpportunityScores({ storage });
+  assert.equal(reconciled.ok, true, JSON.stringify(reconciled));
+  const current = await listTriageQueue({ view: 'all', pageSize: 100, storage });
+  assert.deepEqual(current.rows.map((row) => row.name), ['Current Required Sheet Co']);
+  assert.equal(await storage.getCurrentDealHunterOpportunityScore(supplemental.opportunityId), null);
+  assert.equal(
+    (await storage.getDealHunterOpportunityScore(supplemental.opportunityId)).score_fingerprint,
+    historicalScore.score_fingerprint,
+  );
+  assert.equal(
+    (await storage.listDealHunterScoreEvidence(supplemental.opportunityId)).length,
+    historicalEvidence.length,
+  );
+  const eventsAfter = await storage.listCrmActivityEvents({ submissionId: created.submission.id, limit: 50 });
+  assert.deepEqual(eventsAfter, eventsBefore, 'eligibility reconciliation must not fabricate a rescore event');
+});
+
+test('a cross-source canonical opportunity stays current when its supplemental representation becomes stale', async (t) => {
+  const storage = withStorage(t);
+  const listingUrl = 'https://listings.example.invalid/shared-canonical-listing';
+  const sources = await seedFreshCanonicalSources(t, storage, {
+    sheetName: 'Shared Canonical Services',
+    sheetListingUrl: listingUrl,
+    dealOsName: 'Shared Canonical Services',
+    dealOsListingUrl: listingUrl,
+  });
+
+  const fresh = await refreshOpportunityScores({ storage });
+  assert.equal(fresh.ok, true, JSON.stringify(fresh));
+  const before = await listTriageQueue({ view: 'all', pageSize: 100, storage });
+  assert.equal(before.total, 1);
+  const canonicalId = before.rows[0].opportunityId;
+
+  sources.advanceBeyondFreshness();
+  assert.equal((await refreshOpportunityScores({ storage })).ok, true);
+  const after = await listTriageQueue({ view: 'all', pageSize: 100, storage });
+  assert.equal(after.total, 1);
+  assert.equal(after.rows[0].opportunityId, canonicalId);
+});
+
+test('authoritative reconciliation waits until every attempted score write succeeds', async (t) => {
+  const storage = withStorage(t);
+  const sources = await seedFreshCanonicalSources(t, storage);
+  assert.equal((await refreshOpportunityScores({ storage })).ok, true);
+  sources.advanceBeyondFreshness();
+
+  const realWrite = storage.writeDealHunterOpportunityScore.bind(storage);
+  storage.writeDealHunterOpportunityScore = async () => { throw new Error('injected authoritative write failure'); };
+  const failed = await refreshOpportunityScores({ storage, force: true });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.counts.failed, 1);
+  assert.equal(
+    (await listTriageQueue({ view: 'all', pageSize: 100, storage })).total,
+    2,
+    'failed scoring preserves the entire last-good current set',
+  );
+
+  storage.writeDealHunterOpportunityScore = realWrite;
+  assert.equal((await refreshOpportunityScores({ storage })).ok, true);
+  assert.equal((await listTriageQueue({ view: 'all', pageSize: 100, storage })).total, 1);
+});
+
+test('an unavailable supplemental import lookup is excluded by the next healthy authoritative refresh', async (t) => {
+  const storage = withStorage(t);
+  await seedFreshCanonicalSources(t, storage);
+  assert.equal((await refreshOpportunityScores({ storage })).ok, true);
+  const before = await listTriageQueue({ view: 'all', pageSize: 100, storage });
+  const supplemental = before.rows.find((row) => row.name === 'Supplemental Deal OS Co');
+  assert.ok(supplemental);
+
+  storage.getLatestDealHunterDealOsImport = async () => { throw new Error('injected import lookup outage'); };
+  const refreshed = await refreshOpportunityScores({ storage });
+  assert.equal(refreshed.ok, true, JSON.stringify(refreshed));
+  assert.equal((await listTriageQueue({ view: 'all', pageSize: 100, storage })).total, 1);
+  assert.equal(await storage.getCurrentDealHunterOpportunityScore(supplemental.opportunityId), null);
+  assert.ok(await storage.getDealHunterOpportunityScore(supplemental.opportunityId));
+  assert.ok((await storage.listDealHunterScoreEvidence(supplemental.opportunityId)).length > 0);
 });
 
 test('a full forced rebuild requires the typed confirmation', async (t) => {

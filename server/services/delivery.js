@@ -656,16 +656,42 @@ function dealHunterTextSection(title, deals = [], options = {}) {
   return lines;
 }
 
+function dealOsUnavailableStatus(source = {}) {
+  return /\bstale\b|hours? old|freshness limit/i.test(String(source.error || ''))
+    ? 'stale; not used'
+    : 'unavailable; not used';
+}
+
 export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = '' } = {}) {
   const config = getConfig();
   const generatedLabel = review.generatedAt ? new Date(review.generatedAt).toLocaleString() : new Date().toLocaleString();
   const crmSync = review.crmSync || {};
   const emailSectionLimit = 8;
   const removalSectionLimit = 12;
-  const sourceSummary = (review.sources || [])
-    .map((source) => `${source.name}: ${source.fetched ? `${source.rowCount || 0} rows` : `failed (${source.error || 'unknown error'})`}`)
-    .join('\n');
-  const coverageWarnings = Array.isArray(review.coverageWarnings) ? review.coverageWarnings.filter(Boolean) : [];
+  const reviewSources = review.sources || [];
+  const dealOsSource = reviewSources.find((source) => source.id === 'deal-os-export');
+  const includedSourceCount = reviewSources.filter((source) => source.fetched && !source.error).length;
+  const sourceCoverageLines = [
+    ...reviewSources
+      .filter((source) => String(source.id || '').startsWith('sheet-'))
+      .map((source) => `${source.name}: REQUIRED PRIMARY — ${source.fetched && !source.error ? `healthy (${source.rowCount || 0} rows)` : `failed (${source.error || 'unknown error'})`}`),
+    dealOsSource
+      ? `${dealOsSource.name}: OPTIONAL SUPPLEMENTAL — ${dealOsSource.fetched && !dealOsSource.error ? `healthy (${dealOsSource.rowCount || 0} rows)` : `${dealOsUnavailableStatus(dealOsSource)} (${dealOsSource.error || 'unavailable'})`}`
+      : 'SMB Deal OS export: OPTIONAL SUPPLEMENTAL — missing; not used',
+    'Legacy Airtable Biz List: RETIRED — not fetched and excluded from source health',
+  ];
+  const sourceSummary = sourceCoverageLines.join('\n');
+  const sourceCoverageHtml = `<div style="margin: 20px 0; border: 1px solid #C9D8CF; border-radius: 14px; background: #F4F8F5; padding: 16px;"><p style="margin: 0 0 8px; color: #284638; font-size: 12px; font-weight: 900; letter-spacing: .12em; text-transform: uppercase;">Source coverage</p><ul style="margin: 0 0 0 18px; padding: 0; color: #33443B; font-size: 14px; line-height: 1.6;">${sourceCoverageLines.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul></div>`;
+  const optionalSourceWarnings = Array.isArray(review.optionalSourceWarnings)
+    ? review.optionalSourceWarnings.filter(Boolean)
+    : [];
+  const optionalWarningSet = new Set(optionalSourceWarnings);
+  const coverageWarnings = Array.isArray(review.coverageWarnings)
+    ? review.coverageWarnings.filter((warning) => warning && !optionalWarningSet.has(warning))
+    : [];
+  const optionalSourceWarningHtml = optionalSourceWarnings.length > 0
+    ? `<div style="margin: 20px 0; border: 2px solid #D97706; border-radius: 14px; background: #FFF7ED; padding: 18px;"><p style="margin: 0 0 8px; color: #9A3412; font-size: 13px; font-weight: 900; letter-spacing: .12em; text-transform: uppercase;">Action recommended — optional Deal OS data not used</p><ul style="margin: 0 0 0 18px; padding: 0; color: #7C2D12; font-size: 15px; font-weight: 700; line-height: 1.65;">${optionalSourceWarnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('')}</ul></div>`
+    : '';
   const coverageWarningHtml = coverageWarnings.length > 0
     ? `<div style="margin: 20px 0; border: 1px solid #F0C36A; border-radius: 14px; background: #FFF8E7; padding: 16px;"><p style="margin: 0 0 8px; color: #7A5200; font-size: 12px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase;">Limited source coverage</p><ul style="margin: 0 0 0 18px; padding: 0; color: #664A10; font-size: 14px; line-height: 1.6;">${coverageWarnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('')}</ul></div>`
     : '';
@@ -705,6 +731,8 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
     </div>
   `;
   const bodyHtml = `
+    ${sourceCoverageHtml}
+    ${optionalSourceWarningHtml}
     ${coverageWarningHtml}
     <div style="margin: 20px 0; border: 1px solid #E3D9CA; border-radius: 14px; background: #F8F4ED; padding: 16px;">
       <p style="margin: 0 0 8px; color: #7A5A3B; font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase;">CIM Automation</p>
@@ -754,8 +782,9 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
     eyebrow: 'Daily Deal Hunter',
     title: 'Daily acquisition deal review',
     paragraphs: [
-      `Generated ${generatedLabel}. Reviewed ${review.totals?.reviewedDeals || 0} recent deals from ${review.sources?.length || 0} source(s).`,
-      coverageWarnings.length > 0 ? 'Source coverage is intentionally limited. Review the warning below before relying on today\'s totals.' : '',
+      `Generated ${generatedLabel}. Reviewed ${review.totals?.reviewedDeals || 0} recent deals from ${includedSourceCount} included source(s).`,
+      optionalSourceWarnings.length > 0 ? 'The optional Deal OS import was not used. Review the prominent warning below; the digest continues from the required Google Sheet.' : '',
+      coverageWarnings.length > 0 ? 'Source coverage has additional limitations. Review the warning below before relying on today\'s totals.' : '',
       'The scoring profile favors essential B2B and field-service companies with recurring or repeat revenue, recession resistance, AI resistance, and financeable acquisition size. Management in place is preferred but not required.',
       crmSync.reviewed ? `CRM sync checked ${crmSync.reviewed} score-75-plus deal(s): ${crmSync.created || 0} created, ${crmSync.enriched || 0} enriched, ${crmSync.updated || 0} updated, ${crmSync.skipped || 0} skipped.` : '',
     ],
@@ -778,6 +807,8 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
     '',
     `Generated: ${generatedLabel}`,
     `Reviewed deals: ${review.totals?.reviewedDeals || 0}`,
+    optionalSourceWarnings.length > 0 ? 'ACTION RECOMMENDED — OPTIONAL DEAL OS DATA NOT USED:' : '',
+    ...optionalSourceWarnings.map((warning) => `- ${warning}`),
     coverageWarnings.length > 0 ? 'LIMITED SOURCE COVERAGE:' : '',
     ...coverageWarnings.map((warning) => `- ${warning}`),
     `CIM requests ready for approval: ${cimReadyDeals.length}`,
@@ -803,13 +834,14 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
 			    kind: 'daily-deal-hunter',
 			    idempotencyKey,
 		    to,
-		    subject: `Daily deal review${coverageWarnings.length > 0 ? ' (limited source coverage)' : ''}: ${review.totals?.newMatches || 0} new fit, ${review.totals?.removalCandidates || 0} remove`,
+		    subject: `Daily deal review${optionalSourceWarnings.length > 0 ? ' (Deal OS warning)' : coverageWarnings.length > 0 ? ' (limited source coverage)' : ''}: ${review.totals?.newMatches || 0} new fit, ${review.totals?.removalCandidates || 0} remove`,
     headline: 'Daily acquisition deal review',
     text,
     html,
     tags: [{ name: 'source', value: 'daily-deal-hunter' }],
     tracking: {
       source: 'daily-deal-hunter',
+      notificationType: 'normal-digest',
       generatedAt: review.generatedAt || '',
       totals: review.totals || {},
       cimReadyCount: cimReadyDeals.length,
@@ -819,6 +851,107 @@ export function buildDailyDealHunterEmail({ to, review = {}, idempotencyKey = ''
 
 export async function sendDailyDealHunterEmail(options) {
   return sendMessage(buildDailyDealHunterEmail(options));
+}
+
+export function buildDailyDealHunterSourceAlertEmail({ to, review = {}, idempotencyKey = '' } = {}) {
+  const config = getConfig();
+  const generatedLabel = review.generatedAt ? new Date(review.generatedAt).toLocaleString() : new Date().toLocaleString();
+  const failedRequiredSources = (review.sources || []).filter((source) => (
+    source?.required === true || source?.sourceRole === 'required-primary' || String(source?.id || '').startsWith('sheet-')
+  ) && (source?.fetched === false || source?.error || Number(source?.rowCount || 0) <= 0));
+  const failures = failedRequiredSources.length > 0
+    ? failedRequiredSources
+    : [{ name: 'Required Google Sheet', error: 'The required source did not complete successfully.' }];
+  const businessDate = idempotencyKey.match(/(\d{4}-\d{2}-\d{2})$/)?.[1]
+    || new Intl.DateTimeFormat('en-CA', {
+      timeZone: config.dealHunter.dailyEmail.timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(review.generatedAt ? new Date(review.generatedAt) : new Date());
+  const adminOrigin = String(config.server.origin || '').replace(/\/$/, '');
+  const sourceReviewUrl = `${adminOrigin}/admin/deal-hunter?view=source-review`;
+  const failureLines = failures.map((source) => `${normalizeText(source.name || 'Required Google Sheet', 160)}: ${normalizeText(source.error || (Number(source?.rowCount || 0) <= 0 ? 'Source returned zero rows.' : 'Source failed to fetch.'), 500)}`);
+  const dealOsSource = (review.sources || []).find((source) => source.id === 'deal-os-export');
+  const dealOsStatus = dealOsSource
+    ? dealOsSource.fetched && !dealOsSource.error
+      ? `optional and healthy; exported ${dealOsSource.exportedAt || 'time unavailable'}, imported ${dealOsSource.importedAt || 'time unavailable'}`
+      : `optional and ${dealOsUnavailableStatus(dealOsSource)}; ${normalizeText(dealOsSource.error || 'unavailable', 500)}; exported ${dealOsSource.exportedAt || 'time unavailable'}, imported ${dealOsSource.importedAt || 'time unavailable'}`
+    : 'optional and missing; no import is active';
+  const latestSuccessfulReview = review.latestSuccessfulDelivery?.createdAt
+    ? `Latest successful normal digest: ${review.latestSuccessfulDelivery.createdAt}${review.latestSuccessfulDelivery.subject ? ` (${normalizeText(review.latestSuccessfulDelivery.subject, 200)})` : ''}`
+    : 'Latest successful normal digest: unavailable from delivery history';
+  const bodyHtml = `
+    <div style="margin: 20px 0; border: 2px solid #B91C1C; border-radius: 14px; background: #FEF2F2; padding: 18px;">
+      <p style="margin: 0 0 8px; color: #991B1B; font-size: 13px; font-weight: 900; letter-spacing: .12em; text-transform: uppercase;">Action required</p>
+      <p style="margin: 0 0 12px; color: #7F1D1D; font-size: 16px; font-weight: 700; line-height: 1.6;">The Daily Deal Hunter digest was not generated because its required Google Sheet source failed. Optional Deal OS data was not substituted.</p>
+      <ul style="margin: 0 0 0 18px; padding: 0; color: #7F1D1D; font-size: 14px; line-height: 1.6;">${failureLines.map((failure) => `<li>${escapeHtml(failure)}</li>`).join('')}</ul>
+    </div>
+  `;
+  const html = brandedEmailHtml({
+    preheader: 'Action required: the required Daily Deal Hunter Google Sheet source failed.',
+    eyebrow: 'Daily Deal Hunter · Source alert',
+    title: 'Action required: restore the Google Sheet source',
+    paragraphs: [
+      `The scheduled source check for Pacific business date ${businessDate} ran ${generatedLabel}. No daily deal digest was sent, and no stale or optional source data was used as a replacement.`,
+      'Restore the Google Sheet published-CSV access, confirm the Sheet source is healthy, then run the protected source review again.',
+      'No CRM synchronization, CIM request, follow-up, Stage 2 automation, or other broker outreach occurred.',
+    ],
+    bodyHtml,
+    details: [
+      { label: 'Pacific business date', value: businessDate },
+      ...failures.map((source) => ({
+        label: normalizeText(source.name || 'Required source', 160),
+        value: normalizeText(source.error || (Number(source?.rowCount || 0) <= 0 ? 'Source returned zero rows.' : 'Source failed to fetch.'), 500),
+      })),
+      { label: 'Deal OS', value: dealOsStatus },
+      { label: 'Prior normal digest', value: latestSuccessfulReview },
+      { label: 'Airtable', value: 'Retired; not fetched and excluded from health.' },
+    ],
+    ctas: [{ label: 'Review Deal Hunter sources', href: sourceReviewUrl }],
+  });
+  const text = [
+    'ACTION REQUIRED: Daily Deal Hunter Google Sheet source failed',
+    '',
+    `Pacific business date: ${businessDate}`,
+    `Checked: ${generatedLabel}`,
+    'The daily digest was not generated. Optional Deal OS data was not substituted, and no stale rows were used.',
+    'No CRM synchronization, CIM request, follow-up, Stage 2 automation, or other broker outreach occurred.',
+    '',
+    ...failureLines.map((failure) => `- ${failure}`),
+    '',
+    `Deal OS: ${dealOsStatus}`,
+    latestSuccessfulReview,
+    'Airtable: retired; not fetched and excluded from source health.',
+    '',
+    'Required action: restore the Google Sheet published-CSV access, confirm the Sheet source is healthy, then run the protected source review again.',
+    `Review Deal Hunter sources: ${sourceReviewUrl}`,
+  ].join('\n');
+
+  return {
+    kind: 'daily-deal-hunter',
+    idempotencyKey,
+    to,
+    subject: `Deal Hunter action required: source unavailable — ${businessDate}`,
+    headline: 'Action required: restore the Google Sheet source',
+    text,
+    html,
+    tags: [
+      { name: 'source', value: 'daily-deal-hunter' },
+      { name: 'notification', value: 'source-alert' },
+    ],
+    tracking: {
+      source: 'daily-deal-hunter',
+      notificationType: 'required-source-alert',
+      businessDate,
+      generatedAt: review.generatedAt || '',
+      failedSourceIds: failures.map((source) => source.id).filter(Boolean),
+    },
+  };
+}
+
+export async function sendDailyDealHunterSourceAlertEmail(options) {
+  return sendMessage(buildDailyDealHunterSourceAlertEmail(options));
 }
 
 export function buildDealHunterCimRequestEmail({

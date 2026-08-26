@@ -9,6 +9,8 @@ process.env.ADMIN_SESSION_SECRET = 'http-app-session-secret-for-tests';
 process.env.SECURE_DOCUMENTS_TOKEN_SECRET = 'http-app-document-secret-for-tests';
 process.env.SQLITE_PATH = path.join(tempDir, 'http-app.sqlite');
 process.env.SECURE_DOCUMENTS_STORAGE_DIR = path.join(tempDir, 'secure-documents');
+process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
+delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
 
 const { createApp } = await import('../server/app.js');
 const { createSecureUploadRequest } = await import('../server/services/documentVault.js');
@@ -523,6 +525,7 @@ test('Deal OS export import requires a full administrator and records the authen
       'Listing ID,Business Name,View Listing URL,SDE',
       'HTTP-IMPORT-1,Commercial Fire Inspection,https://broker.example/http-import,425000',
     ].join('\n'));
+    const scoresBefore = await getStorage().listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 100 });
     const importHeaders = {
       'Content-Type': 'text/csv',
       'X-Deal-OS-File-Name': encodeURIComponent('deal-os-http.csv'),
@@ -557,10 +560,22 @@ test('Deal OS export import requires a full administrator and records the authen
     assert.equal(result.import.rowCount, 1);
     assert.equal(result.import.importedBy, 'admin');
     assert.equal(result.summary.importedRows, 1);
+    assert.equal(result.review.scoringDeferred, true);
+    assert.equal(result.review.totals.reviewedDeals, 0);
+    assert.deepEqual(result.review.qualified, []);
+    assert.deepEqual(result.review.watchlist, []);
+    assert.deepEqual(result.review.removalCandidates, []);
+    assert.deepEqual(result.review.criteriaRecommendations, []);
+    assert.deepEqual(result.review.crmSyncPreview, { count: 0, dealKeys: [] });
+    assert.equal(result.scoreRefresh, null);
+    assert.match(result.reviewWarning, /imported and retained.*scoring is deferred.*required Google Sheet/i);
     assert.equal(result.import.fieldCoverage.fields.find((field) => field.key === 'annualProfit').percent, 100);
     const stored = await getStorage().getLatestDealHunterDealOsImport();
     assert.equal(stored.imported_by, 'admin');
     assert.equal(stored.records[0].stableId, 'HTTP-IMPORT-1');
+    const scoresAfter = await getStorage().listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 100 });
+    assert.equal(scoresAfter.total, scoresBefore.total);
+    assert.equal(scoresAfter.rows.some((score) => score.deal_key === 'source:deal-os-export:HTTP-IMPORT-1'), false);
   });
 });
 
@@ -578,6 +593,20 @@ test('full-backfill scoring and explicit CRM sync require administrator access a
       headers: { Cookie: viewerCookie },
     });
     assert.equal(viewerBackfill.status, 401);
+
+    const scoresBeforeBackfill = await getStorage().listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 100 });
+    const adminBackfill = await fetch(`${origin}/api/admin/deal-hunter/backfill-review`, {
+      method: 'POST',
+      headers: { Cookie: adminCookie },
+    });
+    const adminBackfillResult = await adminBackfill.json();
+    assert.equal(adminBackfill.status, 200);
+    assert.equal(adminBackfillResult.review.scoringDeferred, true);
+    assert.equal(adminBackfillResult.review.totals.reviewedDeals, 0);
+    assert.equal(adminBackfillResult.scoreRefresh, null);
+    assert.match(adminBackfillResult.reviewWarning, /Full-backfill scoring is deferred.*existing persisted scores were left unchanged/i);
+    const scoresAfterBackfill = await getStorage().listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 100 });
+    assert.equal(scoresAfterBackfill.total, scoresBeforeBackfill.total);
 
     const viewerSync = await fetch(`${origin}/api/admin/deal-hunter/crm-sync`, {
       method: 'POST',

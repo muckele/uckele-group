@@ -42,14 +42,12 @@ Vite proxies `/api/*` requests to the backend during development.
 
 ## Daily Deal Hunter Review
 
-The private admin CRM includes a Deal Hunter scoring panel that can pull the SMB Deal Hunter Google Sheet CSV, accept a manually exported SMB Deal OS saved search or Deal Radar result, optionally retain the legacy Airtable source, score recent listings, and send the daily email.
+The private admin CRM includes a Deal Hunter scoring panel that pulls the SMB Deal Hunter Google Sheet CSV, accepts a manually exported SMB Deal OS saved search or Deal Radar result as supplemental data, scores recent listings, and sends the daily email. Google Sheets is the current required primary source. Deal OS will become required only after its separate rollout. Airtable is retired and is never fetched or included in source health.
 
 Configure:
 
 - `DEAL_HUNTER_EMAIL_RECIPIENT`
 - `DEAL_HUNTER_SHEET_CSV_URL` or `DEAL_HUNTER_SHEET_CSV_URLS`
-- `DEAL_HUNTER_AIRTABLE_ENABLED=false` to explicitly retire Airtable from the configured source set
-- `DEAL_HUNTER_AIRTABLE_SHARED_VIEW_URL`
 - `DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES` (default 8 MiB)
 - `DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS` (default and maximum 1,000)
 - `DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS` (default 72 hours)
@@ -60,14 +58,7 @@ Configure:
 - `ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH` if you want to override where the source-health row-count snapshot is stored
 - `DEAL_HUNTER_CRON_SECRET` if you also want to trigger the protected endpoint externally
 
-Airtable API mode (required when the shared-view export exceeds the payload limit):
-
-- `DEAL_HUNTER_AIRTABLE_TOKEN` with `data.records:read`
-- `DEAL_HUNTER_AIRTABLE_BASE_ID`
-- `DEAL_HUNTER_AIRTABLE_TABLE_ID`
-- `DEAL_HUNTER_AIRTABLE_VIEW_ID`
-
-Use Airtable API mode only while the legacy source remains enabled. The unauthenticated shared-view payload is guarded by `DEAL_HUNTER_AIRTABLE_SHARED_MAX_PAYLOAD_BYTES`; if Airtable returns an oversized JSON payload, the source is marked as needing setup instead of crashing the review. Google Sheet CSV imports are similarly capped by `DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES` and `DEAL_HUNTER_MAX_SOURCE_RECORDS` before records are normalized. When `DEAL_HUNTER_AIRTABLE_ENABLED=false`, no Airtable network request is made and the disabled source does not block the scheduler. The admin review and daily email explicitly warn that source coverage is limited.
+Google Sheet CSV imports are capped by `DEAL_HUNTER_SHEET_CSV_MAX_PAYLOAD_BYTES` and `DEAL_HUNTER_MAX_SOURCE_RECORDS` before records are normalized. Legacy `DEAL_HUNTER_AIRTABLE_*` variables are ignored; reintroducing Airtable requires a future deliberate migration and code change.
 
 For the `Mathew  Uckele - Daily Deal Update` **On-Market** tab, CRM synchronization treats column A (`Date Added`) as the record's displayed source date and preserves the source broker fields from column R (`Broker Name`), S (`Broker Company`), T (`Broker Contact`), and U (`Broker Email`). These four broker values are shown with explicit labels in the CRM record's Contacts section. The CRM import timestamp remains separately visible as `Imported to CRM`.
 
@@ -77,11 +68,11 @@ A full administrator can upload a `.csv` or `.xlsx` export under **Deal Hunter â
 
 The importer requires every row to contain a business name and either a stable Deal OS/listing ID or a safe HTTP(S) View Listing URL. It normalizes listing identity, source, dates, business details, financial fields, and broker contacts; deduplicates repeated identities; and stores only allowlisted normalized fields plus file hash, size, type, coverage, export/import timestamps, and authenticated importer. The uploaded file and arbitrary spreadsheet columns are not retained. CSV must be valid UTF-8. XLSX formulas are never evaluated, external listing hyperlinks are extracted, compressed entries are bounded, and macro-enabled/legacy Excel formats are rejected.
 
-An upload is rejected when it is empty, oversized, older than the configured freshness window, future-dated, structurally incompatible, over the configured row ceiling, missing durable identities, contains an unsafe listing URL, or disagrees with the administrator-supplied expected count. The accepted export becomes a first-class source in the existing scoring, history, CRM synchronization, and email workflow. Once its export timestamp exceeds `DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS`, that source becomes unavailable and the existing fail-closed source gate pauses new email/CRM/CIM activity until a fresh export is uploaded.
+An upload is rejected when it is empty, oversized, older than the configured freshness window, future-dated, structurally incompatible, over the configured row ceiling, missing durable identities, contains an unsafe listing URL, or disagrees with the administrator-supplied expected count. A healthy accepted export supplements the required Google Sheet in normalization, deduplication, and review. Once its export timestamp exceeds `DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS`, its rows are excluded and the normal digest prominently warns that supplemental data was not used. A missing, stale, or unavailable optional import does not block a digest, explicit high-fit CRM sync, or manual CIM action backed by the current healthy required Sheet. Exact Deal OS CRM reconciliation remains unavailable until its selected import is present, fresh, and valid. If any required Sheet is unavailable or empty, all cross-source scoring and scored-opportunity actions fail closed; a valid raw Deal OS upload may still be retained, but score refresh is deferred and existing persisted scores are left unchanged.
 
 Exports at the 1,000-listing ceiling are accepted but prominently marked as potentially truncated. Source health records the covered search/filter, export and import timestamps, importer, age, expected/actual count, deduplication count, stable-ID count, link count, and cap warning.
 
-If any configured source is unavailable, the admin shows a partial-review warning and pauses the daily review email, CRM synchronization, and new CIM outreach until every source passes a fresh review. Follow-ups for already-contacted deals remain governed separately by inbound-reply readiness.
+For each Pacific business date, the daily job uses one durable claim for either a normal digest or a degraded operational alert. A failed or empty required Google Sheet produces the action-required alert instead of recommendations. The alert instructs the operator to restore published-CSV access and confirms that no stale recommendations, CRM synchronization, CIM request, follow-up, Stage 2 run, or other broker outreach occurred. After correcting access, refresh **Deal Hunter â†’ Review Sources**; the next business date returns to the normal digest once the required Sheet is healthy. A failed provider attempt remains retryable, while provider acceptance and the date-scoped marker prevent a second outcome for the same date.
 
 Admin endpoints:
 

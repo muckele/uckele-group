@@ -2,14 +2,21 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import test from 'node:test';
+import test, { after } from 'node:test';
 import { strToU8, zipSync } from 'fflate';
 
+const originalFetch = globalThis.fetch;
+const healthySheetUrl = 'https://example.test/required-sheet.csv';
+
 process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
-process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
+process.env.DEAL_HUNTER_SHEET_CSV_URL = healthySheetUrl;
+delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
 process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS = '72';
 process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_RECORDS = '1000';
 process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_PAYLOAD_BYTES = String(8 * 1024 * 1024);
+globalThis.fetch = async () => {
+  throw new Error('The required Google Sheet is unavailable in this Deal OS import test.');
+};
 
 const {
   dealHunterCrmSyncConfirmation,
@@ -21,6 +28,32 @@ const {
   syncDealHunterHighFitsToCrm,
 } = await import('../server/services/dealHunter.js');
 const { createSqliteStorage } = await import('../server/storage/sqlite.js');
+
+after(() => {
+  globalThis.fetch = originalFetch;
+});
+
+async function withHealthyRequiredSheet(csv, run) {
+  const previousUrl = process.env.DEAL_HUNTER_SHEET_CSV_URL;
+  const previousUrls = process.env.DEAL_HUNTER_SHEET_CSV_URLS;
+  const previousFetch = globalThis.fetch;
+  process.env.DEAL_HUNTER_SHEET_CSV_URL = healthySheetUrl;
+  delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
+  globalThis.fetch = async (url, options) => (
+    String(url) === healthySheetUrl
+      ? new Response(csv, { status: 200, headers: { 'Content-Type': 'text/csv' } })
+      : originalFetch(url, options)
+  );
+  try {
+    return await run();
+  } finally {
+    if (previousUrl === undefined) delete process.env.DEAL_HUNTER_SHEET_CSV_URL;
+    else process.env.DEAL_HUNTER_SHEET_CSV_URL = previousUrl;
+    if (previousUrls === undefined) delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
+    else process.env.DEAL_HUNTER_SHEET_CSV_URLS = previousUrls;
+    globalThis.fetch = previousFetch;
+  }
+}
 
 function memoryStorage(initial = null) {
   let latest = initial;
@@ -85,7 +118,7 @@ function dealOsWorkbook() {
   }));
 }
 
-test('CSV import preserves durable identities, normalizes deal fields, deduplicates rows, and discards arbitrary columns', async () => {
+test('CSV import preserves raw metadata but cannot produce Deal OS-only scoring without a required Sheet', async () => {
   const storage = memoryStorage();
   const result = await importDealOsExport({
     fileBuffer: Buffer.from(validCsv()),
@@ -120,18 +153,27 @@ test('CSV import preserves durable identities, normalizes deal fields, deduplica
   ]);
   assert.doesNotMatch(JSON.stringify(stored.records), /Unretained Internal Column|do not retain/);
 
-  const review = await reviewDailyDeals({ storage });
+  const reviewed = await reviewDailyDeals({ storage, withScoredDeals: true });
+  const review = reviewed.review;
   const source = review.sources.find((item) => item.id === 'deal-os-export');
   assert.equal(source.fetched, true);
   assert.equal(source.rowCount, 3);
   assert.equal(source.canonicalRecordCount, 2);
   assert.equal(source.coverageLabel, 'All active acquisition criteria');
   assert.equal(review.disabledSources[0].id, 'airtable-disabled');
-  assert.match(review.coverageWarnings[0], /Legacy Airtable is disabled/);
-  const deals = [...review.qualified, ...review.watchlist, ...review.removalCandidates];
-  const stableDeal = deals.find((deal) => deal.id === 'DOS-100');
-  assert.equal(stableDeal.dealKey, 'source:deal-os-export:DOS-100');
-  assert.equal(stableDeal.listingSource, 'DealStream');
+  assert.equal(review.disabledSources[0].sourceRole, 'retired');
+  assert.equal(review.disabledSources[0].required, false);
+  assert.equal(review.coverageWarnings.length, 0);
+  assert.equal(review.scoringDeferred, true);
+  assert.deepEqual(reviewed.scoredDeals, []);
+  assert.deepEqual(review.qualified, []);
+  assert.deepEqual(review.watchlist, []);
+  assert.deepEqual(review.removalCandidates, []);
+  assert.deepEqual(review.newlySeenMatches, []);
+  assert.deepEqual(review.criteriaRecommendations, []);
+  assert.deepEqual(review.crmSyncPreview, { count: 0, dealKeys: [] });
+  assert.equal(review.totals.cimReady, 0);
+  assert.equal(review.totals.crmEligible, 0);
 });
 
 test('ID-based exports can use bare Listing as the business name without a URL', async () => {
@@ -209,7 +251,7 @@ test('current SMB Deal OS marketplace export maps Listing, Earnings, and Margin 
   assert.equal(stored.records[0].state, 'CA');
   assert.equal(stored.records[0].listingUrl, 'https://www.bizbuysell.com/business-opportunity/southern-california-sign-company-with-40-years-of-operating-history/2540383/');
 
-  const review = await reviewDailyDeals({ storage });
+  const review = await withHealthyRequiredSheet(currentMarketplaceCsv(), () => reviewDailyDeals({ storage }));
   const deals = [...review.qualified, ...review.watchlist, ...review.removalCandidates];
   assert.equal(deals[0].name, stored.records[0].name);
   assert.equal(deals[0].annualProfit, 365112);
@@ -263,8 +305,14 @@ test('full-backfill review scores every canonical listing while daily review pre
     ],
   });
 
-  const daily = await reviewDailyDeals({ storage });
-  const backfill = await reviewDailyDeals({ reviewMode: 'full-backfill', storage });
+  const requiredSheetCsv = [
+    'Business Name,Industry,State,Date Added,Profit,Revenue,Asking Price,Listing URL',
+    `Recent Commercial HVAC Maintenance,HVAC maintenance,CA,${now.toISOString()},425000,1800000,1400000,https://broker.example/recent`,
+  ].join('\n');
+  const { daily, backfill } = await withHealthyRequiredSheet(requiredSheetCsv, async () => ({
+    daily: await reviewDailyDeals({ storage }),
+    backfill: await reviewDailyDeals({ reviewMode: 'full-backfill', storage }),
+  }));
 
   assert.equal(daily.reviewMode, 'daily');
   assert.equal(daily.totals.reviewedDeals, 1);
@@ -362,10 +410,13 @@ test('punctuation-distinct Deal OS IDs remain separate durable identities', asyn
 
   assert.equal(result.ok, true);
   assert.equal(result.import.rowCount, 2);
-  const review = await reviewDailyDeals({ storage });
+  const review = await withHealthyRequiredSheet(
+    'Business Name,State\nRequired Sheet Control,CA',
+    () => reviewDailyDeals({ storage }),
+  );
   const deals = [...review.qualified, ...review.watchlist, ...review.removalCandidates];
   assert.deepEqual(
-    deals.map((deal) => deal.dealKey).sort(),
+    deals.filter((deal) => deal.sourceId === 'deal-os-export').map((deal) => deal.dealKey).sort(),
     ['source:deal-os-export:A%201', 'source:deal-os-export:A-1'],
   );
 });
@@ -394,7 +445,13 @@ test('Deal OS stable IDs retain an established URL deal key so existing outreach
     listing_url: 'https://broker.example/hvac',
   }];
 
-  const review = await reviewDailyDeals({ storage });
+  const review = await withHealthyRequiredSheet(
+    [
+      'Business Name,Listing URL',
+      'Commercial HVAC Services,https://broker.example/hvac',
+    ].join('\n'),
+    () => reviewDailyDeals({ storage }),
+  );
   const deals = [...review.qualified, ...review.watchlist, ...review.removalCandidates];
   const stableDeal = deals.find((deal) => deal.id === 'DOS-100');
 
@@ -500,12 +557,17 @@ test('an accepted Deal OS import becomes an unavailable source after its freshne
     records: [{ stableId: 'STALE-1', name: 'Stale HVAC', listingUrl: 'https://broker.example/stale', brokerContacts: [] }],
     metadata: {},
   };
-  const review = await reviewDailyDeals({ storage: memoryStorage(staleImport) });
+  const review = await withHealthyRequiredSheet(
+    'Business Name,State\nCurrent Required Sheet Control,CA',
+    () => reviewDailyDeals({ storage: memoryStorage(staleImport) }),
+  );
   const source = review.sources.find((item) => item.id === 'deal-os-export');
 
   assert.equal(source.fetched, false);
   assert.match(source.error, /exceeds the 72-hour freshness limit/i);
-  assert.equal(review.totals.reviewedDeals, 0);
+  assert.equal(review.totals.reviewedDeals, 1);
+  assert.equal(review.scoringDeferred, false);
+  assert.equal(JSON.stringify([review.qualified, review.watchlist, review.removalCandidates]).includes('Stale HVAC'), false);
 });
 
 test('SQLite persists normalized Deal OS import provenance and records without the uploaded file', async (t) => {
