@@ -107,9 +107,20 @@ function createCimStorage() {
     async getDealHunterOpportunity(opportunityId) {
       return opportunities.get(opportunityId) || null;
     },
+    async getCurrentDealHunterOpportunity(opportunityId) {
+      const opportunity = opportunities.get(opportunityId) || null;
+      return opportunity?.status === 'active' ? opportunity : null;
+    },
     async listDealHunterOpportunities({ opportunityIds = [], recipientEmails = [] } = {}) {
       return Array.from(opportunities.values()).filter((opportunity) => (
         (opportunityIds.length === 0 || opportunityIds.includes(opportunity.opportunity_id))
+        && (recipientEmails.length === 0 || recipientEmails.includes(opportunity.canonical_recipient))
+      ));
+    },
+    async listCurrentDealHunterOpportunities({ opportunityIds = [], recipientEmails = [] } = {}) {
+      return Array.from(opportunities.values()).filter((opportunity) => (
+        opportunity.status === 'active'
+        && (opportunityIds.length === 0 || opportunityIds.includes(opportunity.opportunity_id))
         && (recipientEmails.length === 0 || recipientEmails.includes(opportunity.canonical_recipient))
       ));
     },
@@ -118,9 +129,152 @@ function createCimStorage() {
       if (ids.length > 1) throw new Error('conflicting aliases');
       return ids[0] ? opportunities.get(ids[0]) : null;
     },
+    async findCurrentDealHunterOpportunityByAliases(aliasKeys = []) {
+      const ids = [...new Set(aliasKeys.map((key) => opportunityAliases.get(key)?.opportunity_id).filter(Boolean))];
+      if (ids.length > 1) throw new Error('conflicting aliases');
+      const opportunity = ids[0] ? opportunities.get(ids[0]) : null;
+      if (opportunity && opportunity.status !== 'active') {
+        const error = new Error(`Canonical opportunity ${opportunity.opportunity_id} is not current.`);
+        error.code = 'DEAL_HUNTER_OPPORTUNITY_NOT_CURRENT';
+        throw error;
+      }
+      return opportunity || null;
+    },
+    async createDealHunterOpportunityWithAliases({
+      opportunity,
+      aliases = [],
+      existingOwnerMode = 'return-current',
+      identityException = null,
+    } = {}) {
+      assert.equal(opportunity?.status, 'active');
+      assert.ok(opportunity?.opportunity_id);
+      assert.ok(aliases.length > 0);
+      assert.ok(aliases.every((alias) => alias.opportunity_id === opportunity.opportunity_id));
+
+      const ownerIds = [...new Set(aliases
+        .map((alias) => opportunityAliases.get(alias.alias_key)?.opportunity_id)
+        .filter(Boolean))];
+      if (ownerIds.length > 1) {
+        return {
+          created: false,
+          linked: false,
+          conflict: {
+            reason: 'conflicting-alias-owners',
+            opportunity_id: ownerIds[0],
+            opportunity_ids: ownerIds,
+            alias_key: '',
+          },
+          opportunity: null,
+          aliases: [],
+          identityException: null,
+        };
+      }
+
+      let owner = ownerIds[0] ? opportunities.get(ownerIds[0]) : null;
+      if (ownerIds[0] && !owner) throw new Error('canonical alias owner is missing');
+      if (owner && owner.status !== 'active') {
+        return {
+          created: false,
+          linked: false,
+          conflict: {
+            reason: 'alias-owner-not-current',
+            opportunity_id: owner.opportunity_id,
+            alias_key: '',
+          },
+          opportunity: owner,
+          aliases: [],
+          identityException: null,
+        };
+      }
+      if (owner && existingOwnerMode === 'conflict') {
+        return {
+          created: false,
+          linked: false,
+          conflict: {
+            reason: 'alias-owner-exists',
+            opportunity_id: owner.opportunity_id,
+            alias_key: '',
+          },
+          opportunity: owner,
+          aliases: [],
+          identityException: null,
+        };
+      }
+
+      if (identityException) {
+        const currentException = identityExceptions.get(identityException.id);
+        if (!currentException || currentException.status !== 'open') {
+          return {
+            created: false,
+            linked: false,
+            conflict: {
+              reason: 'identity-exception-not-open',
+              opportunity_id: '',
+              alias_key: '',
+            },
+            opportunity: null,
+            aliases: [],
+            identityException: currentException || null,
+          };
+        }
+      }
+
+      const created = !owner;
+      if (!owner) {
+        owner = opportunity;
+        opportunities.set(owner.opportunity_id, owner);
+      }
+      const linkedAliases = aliases.map((alias) => {
+        const linkedAlias = { ...alias, opportunity_id: owner.opportunity_id };
+        opportunityAliases.set(alias.alias_key, linkedAlias);
+        return linkedAlias;
+      });
+      if (identityException) identityExceptions.set(identityException.id, identityException);
+
+      return {
+        created,
+        linked: true,
+        conflict: null,
+        opportunity: owner,
+        aliases: linkedAliases,
+        identityException,
+      };
+    },
     async upsertDealHunterOpportunity(opportunity) {
       opportunities.set(opportunity.opportunity_id, opportunity);
       return opportunity;
+    },
+    async linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt }) {
+      const opportunity = opportunities.get(opportunityId);
+      if (!opportunity || opportunity.status !== 'active') {
+        throw new Error('canonical opportunity is superseded or otherwise not current');
+      }
+      if (opportunity.primary_submission_id && opportunity.primary_submission_id !== submissionId) {
+        throw new Error('canonical opportunity already owns another CRM submission');
+      }
+      const submission = submissions.get(submissionId);
+      if (!submission) throw new Error('CRM submission not found');
+      if (submission.deal_hunter_opportunity_id
+        && submission.deal_hunter_opportunity_id !== opportunityId) {
+        throw new Error('CRM submission already belongs to another canonical opportunity');
+      }
+      const conflict = Array.from(submissions.values()).find((candidate) => (
+        candidate.id !== submissionId && candidate.deal_hunter_opportunity_id === opportunityId
+      ));
+      if (conflict) throw new Error('canonical opportunity already owns another CRM submission');
+      const timestamp = updatedAt || new Date().toISOString();
+      submissions.set(submissionId, {
+        ...submission,
+        deal_hunter_opportunity_id: opportunityId,
+        updated_at: timestamp,
+      });
+      const linked = {
+        ...opportunity,
+        primary_submission_id: submissionId,
+        updated_at: timestamp,
+      };
+      opportunities.set(opportunityId, linked);
+      return linked;
     },
     async listDealHunterOpportunityAliases({ opportunityIds = [] } = {}) {
       return Array.from(opportunityAliases.values()).filter((item) => (

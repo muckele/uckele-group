@@ -3898,8 +3898,8 @@ function dealHunterCrmPayload(deal, options = {}) {
 }
 
 export async function findExistingDealHunterSubmission(storage, deal) {
-  if (deal.opportunityId && storage.getDealHunterOpportunity && storage.getSubmission) {
-    const opportunity = await storage.getDealHunterOpportunity(deal.opportunityId);
+  if (deal.opportunityId && storage.getCurrentDealHunterOpportunity && storage.getSubmission) {
+    const opportunity = await storage.getCurrentDealHunterOpportunity(deal.opportunityId);
     if (opportunity?.primary_submission_id) {
       const primary = await storage.getSubmission(opportunity.primary_submission_id);
       if (primary) return primary;
@@ -4001,25 +4001,14 @@ export async function findExistingDealHunterSubmission(storage, deal) {
 }
 
 async function linkDealHunterOpportunitySubmission(storage, deal, submissionId) {
-  if (!deal.opportunityId || !submissionId || !storage.getDealHunterOpportunity || !storage.upsertDealHunterOpportunity) {
-    return null;
+  if (!deal.opportunityId || !submissionId) return null;
+  if (typeof storage.linkDealHunterCrmSubmission !== 'function') {
+    throw new Error('Atomic canonical CRM linkage is unavailable for the configured storage provider.');
   }
-  if (storage.linkDealHunterCrmSubmission) {
-    return storage.linkDealHunterCrmSubmission({
-      opportunityId: deal.opportunityId,
-      submissionId,
-      updatedAt: new Date().toISOString(),
-    });
-  }
-  const opportunity = await storage.getDealHunterOpportunity(deal.opportunityId);
-  if (!opportunity || opportunity.primary_submission_id === submissionId) return opportunity;
-  if (opportunity.primary_submission_id) {
-    throw new Error('Canonical opportunity already owns another CRM submission.');
-  }
-  return storage.upsertDealHunterOpportunity({
-    ...opportunity,
-    updated_at: new Date().toISOString(),
-    primary_submission_id: submissionId,
+  return storage.linkDealHunterCrmSubmission({
+    opportunityId: deal.opportunityId,
+    submissionId,
+    updatedAt: new Date().toISOString(),
   });
 }
 
@@ -4243,7 +4232,6 @@ function dealHunterCrmUpdate(existing, deal, options = {}) {
   return {
     updated_at: new Date().toISOString(),
     company: chooseDealHunterCrmValue(existing, payload, 'company', preserveExistingFields),
-    deal_hunter_opportunity_id: deal.opportunityId || existing.deal_hunter_opportunity_id || null,
     listing_url: chooseDealHunterCrmValue(existing, payload, 'listing_url', preserveExistingFields),
     asking_price: chooseDealHunterCrmValue(existing, payload, 'asking_price', preserveExistingFields),
     ttm_revenue: chooseDealHunterCrmValue(existing, payload, 'ttm_revenue', preserveExistingFields),
@@ -4276,17 +4264,28 @@ async function updateDealHunterCrmSubmission(storage, existing, deal, {
   summary = '',
   activityMetadata = {},
 } = {}) {
-  const values = dealHunterCrmUpdate(existing, deal, { preserveExistingFields, actionable });
+  let currentSubmission = existing;
+  if (deal.opportunityId) {
+    await linkDealHunterOpportunitySubmission(storage, deal, existing.id);
+    if (typeof storage.getSubmission !== 'function') {
+      throw new Error('CRM submission reload is unavailable after canonical linkage.');
+    }
+    currentSubmission = await storage.getSubmission(existing.id);
+    if (!currentSubmission || currentSubmission.deal_hunter_opportunity_id !== deal.opportunityId) {
+      throw new Error('Atomic canonical CRM linkage did not persist the requested current ownership.');
+    }
+  }
+  const values = dealHunterCrmUpdate(currentSubmission, deal, { preserveExistingFields, actionable });
   const mutation = await commitCrmActivityMutation({
     storage,
     operation: 'update_submission',
     payload: {
-      id: existing.id,
-      expectedUpdatedAt: existing.updated_at || '',
+      id: currentSubmission.id,
+      expectedUpdatedAt: currentSubmission.updated_at || '',
       values,
     },
     activity: {
-      submissionId: existing.id,
+      submissionId: currentSubmission.id,
       opportunityId: deal.opportunityId || '',
       eventType: 'submission.deal-hunter-synced',
       summary: summary || (preserveExistingFields
@@ -5127,10 +5126,10 @@ async function loadDealHunterCimRequests(storage, dealKeys, opportunityIds = [])
 }
 
 async function attachCanonicalOpportunityIdentities(storage, deals = []) {
-  if (!storage.listDealHunterOpportunities) {
+  if (!storage.listCurrentDealHunterOpportunities) {
     return deals.map((deal) => ({ ...deal, identityStatus: 'unavailable', opportunityId: '' }));
   }
-  const candidates = await storage.listDealHunterOpportunities({ limit: 100000 });
+  const candidates = await storage.listCurrentDealHunterOpportunities({ limit: 100000 });
   const resolvedDeals = [];
   for (const deal of deals) {
     const resolution = await resolveDealHunterOpportunity({
@@ -6847,7 +6846,7 @@ function reconciliationComparablePayload(payload = {}) {
 
 function reconciliationChangedFields(existing = {}, values = {}) {
   const before = reconciliationComparablePayload(existing);
-  const after = reconciliationComparablePayload(values);
+  const after = reconciliationComparablePayload({ ...existing, ...values });
   return Object.keys(after).filter((field) => JSON.stringify(before[field]) !== JSON.stringify(after[field]));
 }
 

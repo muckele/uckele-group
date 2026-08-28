@@ -216,9 +216,12 @@ async function listCimCommunications(storage, limit = 10000) {
 }
 
 function reviewOpportunity(review, opportunityIdsByDeal, knownOpportunityIds) {
-  const explicit = normalizeText(review.opportunity_id || review.metadata?.opportunityId, 160);
-  if (explicit && (knownOpportunityIds.size === 0 || knownOpportunityIds.has(explicit))) {
-    return { opportunityId: explicit, deterministic: true, legacy: false };
+  const explicit = normalizeText(review.opportunity_id, 160)
+    || normalizeText(review.metadata?.opportunityId, 160);
+  if (explicit) {
+    return knownOpportunityIds.has(explicit)
+      ? { opportunityId: explicit, deterministic: true, legacy: false }
+      : { opportunityId: '', deterministic: false, legacy: false, nonCurrent: true };
   }
   const candidates = opportunityIdsByDeal.get(normalizeText(review.deal_key, 1000)) || new Set();
   return candidates.size === 1
@@ -231,18 +234,21 @@ async function canonicalHumanEvidence({ storage, reviews, policy }) {
     storage.listCimStage2EvidenceAliases?.({ limit: 100000 })
       || storage.listDealHunterOpportunityAliases?.({ limit: 100000 }) || [],
     storage.listCimStage2IdentityOpportunities?.({ limit: 100000 })
-      || storage.listDealHunterOpportunities?.({ limit: 100000 }) || [],
+      || storage.listCurrentDealHunterOpportunities?.({ limit: 100000 }) || [],
   ]);
+  const knownOpportunityIds = new Set(opportunities
+    .filter((item) => item.status === undefined || item.status === 'active')
+    .map((item) => item.opportunity_id)
+    .filter(Boolean));
   const opportunityIdsByDeal = new Map();
   for (const alias of aliases) {
     if (!['deal-key', 'deal_key'].includes(String(alias.alias_type || '').toLowerCase())) continue;
     const dealKey = normalizeText(alias.alias_value, 1000);
-    if (!dealKey || !alias.opportunity_id) continue;
+    if (!dealKey || !knownOpportunityIds.has(alias.opportunity_id)) continue;
     const ids = opportunityIdsByDeal.get(dealKey) || new Set();
     ids.add(alias.opportunity_id);
     opportunityIdsByDeal.set(dealKey, ids);
   }
-  const knownOpportunityIds = new Set(opportunities.map((item) => item.opportunity_id).filter(Boolean));
   const humanRows = reviews.filter((review) => review.metadata?.source === 'approval-queue' && ['approved', 'rejected'].includes(review.decision));
   const linked = [];
   let unlinked = 0;
@@ -961,11 +967,12 @@ export async function authorizeCimStage2SendBoundary({
   storage = getStorage(), config = getConfig(), now = new Date(), statusCheck = getCimAutomationStatus,
 } = {}) {
   if (!decisionId || !runId || !activationId || !claimToken) return { ok: false, code: 'stage2_authorization_missing', error: 'A durable Stage 2 decision authorization is required.' };
-  const [decision, run, activation, status] = await Promise.all([
+  const [decision, run, activation, status, currentOpportunity] = await Promise.all([
     storage.getCimStage2Decision?.(decisionId),
     storage.getCimStage2Run?.({ id: runId }),
     storage.getCurrentCimStage2Activation?.(),
     statusCheck({ storage, config, now }),
+    storage.getCurrentDealHunterOpportunity?.(normalizeText(deal.opportunityId, 160)),
   ]);
   const policy = getCimStage2Policy(config);
   const expectedSnapshot = cimStage2SnapshotDigest(deal);
@@ -988,6 +995,8 @@ export async function authorizeCimStage2SendBoundary({
     ['wrong_mode', ['canary', 'active'].includes(run?.mode) && run?.mode === activation?.mode],
     ['wrong_policy', decision?.policy_hash === policy.policyHash && run?.policy_hash === policy.policyHash && activation?.policy_hash === policy.policyHash],
     ['wrong_opportunity', decision?.opportunity_id === normalizeText(deal.opportunityId, 160)],
+    ['opportunity_not_current', currentOpportunity?.status === 'active'
+      && currentOpportunity?.opportunity_id === normalizeText(deal.opportunityId, 160)],
     ['wrong_recipient', decision?.recipient_hash === hashCimStage2Recipient(deal.brokerEmail)],
     ['wrong_snapshot', decision?.snapshot_digest === expectedSnapshot && snapshotDigest === expectedSnapshot],
     ['wrong_source_snapshot', decision?.source_snapshot_digest === sourceSnapshotDigestForDeal(deal)],

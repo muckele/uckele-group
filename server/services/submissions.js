@@ -978,6 +978,25 @@ export async function createManualSubmission(body, adminUsername = '', options =
   const config = getConfig();
   const storage = options.storage || getStorage();
   const now = new Date().toISOString();
+  const canonicalOpportunityId = normalizeField(body.deal_hunter_opportunity_id, 200);
+  if (canonicalOpportunityId) {
+    if (typeof storage.getCurrentDealHunterOpportunity !== 'function') {
+      return { ok: false, status: 503, error: 'Current canonical opportunity lookup is unavailable.' };
+    }
+    const currentOpportunity = await storage.getCurrentDealHunterOpportunity(canonicalOpportunityId);
+    if (!currentOpportunity) {
+      const historicalOpportunity = typeof storage.getDealHunterOpportunity === 'function'
+        ? await storage.getDealHunterOpportunity(canonicalOpportunityId)
+        : null;
+      return {
+        ok: false,
+        status: historicalOpportunity ? 409 : 400,
+        error: historicalOpportunity
+          ? 'The selected canonical opportunity is superseded or otherwise not current. No CRM record was created.'
+          : 'The selected canonical opportunity does not exist.',
+      };
+    }
+  }
   const roleSeed =
     normalizeField(body.role, 80) ||
     normalizeField(body.lead_type, 80) ||
@@ -1055,7 +1074,7 @@ export async function createManualSubmission(body, adminUsername = '', options =
     created_at: now,
     updated_at: now,
     status,
-    deal_hunter_opportunity_id: normalizeField(body.deal_hunter_opportunity_id, 200) || null,
+    deal_hunter_opportunity_id: canonicalOpportunityId || null,
     status_updated_at: now,
     spam_score: 0,
     spam_reasons: [],

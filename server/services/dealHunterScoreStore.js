@@ -133,8 +133,8 @@ async function emitRescoreEvent({ storage, deal, previous, row, actor }) {
   // durable audit trail in that case. The lookup happens here, and only for an
   // opportunity whose score actually moved, so a large rebuild does not pay it
   // per candidate.
-  const opportunity = storage.getDealHunterOpportunity
-    ? await storage.getDealHunterOpportunity(deal.opportunityId)
+  const opportunity = storage.getCurrentDealHunterOpportunity
+    ? await storage.getCurrentDealHunterOpportunity(deal.opportunityId)
     : null;
   const submissionId = opportunity?.primary_submission_id || '';
   if (!submissionId) return null;

@@ -1,6 +1,19 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
+import {
+  buildCanonicalOpportunityMergePlan,
+  canonicalOpportunityMergeManifestId,
+  CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION,
+  CANONICAL_OPPORTUNITY_MERGE_MANIFEST_SCHEMA,
+  CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE,
+  CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY,
+  getCanonicalOpportunityMergeApproval,
+  isCanonicalOpportunityMergeRelationshipColumn,
+  validateCanonicalOpportunityMergeReplayManifest,
+} from '../repairs/canonicalOpportunityMerge.js';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
 
 function parseJsonColumn(value, fallback) {
@@ -854,6 +867,970 @@ function migrateLegacyAdminMagicLinksTable(database) {
 
 function placeholders(count) {
   return Array.from({ length: count }, () => '?').join(', ');
+}
+
+function canonicalAliasOwnershipError(code, message, opportunityIds = []) {
+  const error = new Error(message);
+  error.code = code;
+  error.opportunityIds = [...opportunityIds];
+  return error;
+}
+
+function completeCanonicalAliasOwners(database, aliasKeys = []) {
+  const keys = normalizeList(aliasKeys, Number.MAX_SAFE_INTEGER);
+  if (keys.length === 0) return [];
+  const ownerIds = new Set();
+  for (let offset = 0; offset < keys.length; offset += 500) {
+    const chunk = keys.slice(offset, offset + 500);
+    const rows = database.prepare(`
+      SELECT DISTINCT opportunity_id
+      FROM deal_hunter_opportunity_aliases
+      WHERE alias_key IN (${placeholders(chunk.length)})
+      ORDER BY opportunity_id
+    `).all(...chunk);
+    for (const row of rows) {
+      if (!row.opportunity_id) {
+        throw canonicalAliasOwnershipError(
+          'DEAL_HUNTER_OPPORTUNITY_ALIAS_INTEGRITY',
+          'Deal Hunter opportunity alias ownership is missing its canonical owner identifier.',
+        );
+      }
+      ownerIds.add(row.opportunity_id);
+    }
+  }
+  const orderedOwnerIds = [...ownerIds].sort();
+  if (orderedOwnerIds.length === 0) return [];
+  const ownersById = new Map();
+  for (let offset = 0; offset < orderedOwnerIds.length; offset += 500) {
+    const chunk = orderedOwnerIds.slice(offset, offset + 500);
+    const rows = database.prepare(`
+      SELECT *
+      FROM deal_hunter_opportunities
+      WHERE opportunity_id IN (${placeholders(chunk.length)})
+      ORDER BY opportunity_id
+    `).all(...chunk);
+    for (const row of rows) ownersById.set(row.opportunity_id, normalizeDealHunterOpportunityRow(row));
+  }
+  const missingOwnerIds = orderedOwnerIds.filter((opportunityId) => !ownersById.has(opportunityId));
+  if (missingOwnerIds.length > 0) {
+    throw canonicalAliasOwnershipError(
+      'DEAL_HUNTER_OPPORTUNITY_ALIAS_INTEGRITY',
+      'Deal Hunter opportunity alias references a missing canonical opportunity.',
+      missingOwnerIds,
+    );
+  }
+  return orderedOwnerIds.map((opportunityId) => ownersById.get(opportunityId));
+}
+
+function uniqueCanonicalMergeValues(values = []) {
+  return [...new Set(values.filter((value) => value !== null && value !== undefined && String(value) !== '')
+    .map((value) => String(value)))].sort();
+}
+
+async function sha256CanonicalMergeFile(filePath) {
+  const digest = createHash('sha256');
+  for await (const chunk of fs.createReadStream(filePath)) digest.update(chunk);
+  return digest.digest('hex');
+}
+
+function selectCanonicalMergeRows(database, table, filters = []) {
+  const tableExists = database.prepare(`
+    SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1
+  `).get(table);
+  if (!tableExists) return [];
+  const clauses = [];
+  const params = [];
+  for (const filter of filters) {
+    const values = uniqueCanonicalMergeValues(filter.values);
+    if (values.length === 0) continue;
+    if (filter.contains) {
+      clauses.push(`(${values.map(() => `instr(COALESCE(${filter.column}, ''), ?) > 0`).join(' OR ')})`);
+    } else {
+      clauses.push(`${filter.column} IN (${placeholders(values.length)})`);
+    }
+    params.push(...values);
+  }
+  if (clauses.length === 0) return [];
+  return database.prepare(`SELECT * FROM ${table} WHERE ${clauses.join(' OR ')}`).all(...params);
+}
+
+function canonicalMergeRecordIds(table, rows = [], idColumn = 'id') {
+  return uniqueCanonicalMergeValues(rows.map((row) => `${table}:${row[idColumn]}`));
+}
+
+function inspectCanonicalMergeDependentState(database, approval) {
+  const opportunityIds = [approval.survivorId, approval.supersededId];
+  const aliasValues = approval.expectedAliases.map((item) => item.aliasValue);
+  const aliasKeys = approval.expectedAliases.map((item) => item.aliasKey);
+  const dealKeys = approval.expectedAliases
+    .filter((item) => item.aliasType === 'deal-key')
+    .map((item) => item.aliasValue);
+  const listingUrls = uniqueCanonicalMergeValues([
+    ...approval.expectedAliases
+      .filter((item) => item.aliasType === 'listing-url')
+      .map((item) => item.aliasValue),
+    ...approval.sourceObservations.map((item) => item.listingUrl),
+    ...dealKeys.filter((item) => item.startsWith('url:')).map((item) => item.slice(4)),
+  ]);
+  const listingIdentities = uniqueCanonicalMergeValues([
+    ...approval.expectedAliases
+      .filter((item) => ['listing-id', 'source-identity'].includes(item.aliasType))
+      .map((item) => item.aliasValue),
+    ...aliasValues,
+    ...aliasKeys,
+  ]);
+  const referenceValues = uniqueCanonicalMergeValues([...opportunityIds, ...aliasValues, ...aliasKeys]);
+  const metadataFilter = { column: 'metadata', values: referenceValues, contains: true };
+
+  const opportunityScores = selectCanonicalMergeRows(database, 'deal_hunter_opportunity_scores', [
+    { column: 'opportunity_id', values: opportunityIds },
+    { column: 'deal_key', values: dealKeys },
+    { column: 'listing_url', values: listingUrls },
+  ]);
+  const scoreEvidence = selectCanonicalMergeRows(database, 'deal_hunter_score_evidence', [
+    { column: 'opportunity_id', values: opportunityIds },
+    { column: 'listing_url', values: listingUrls },
+  ]);
+  const contactSubmissions = selectCanonicalMergeRows(database, 'contact_submissions', [
+    { column: 'deal_hunter_opportunity_id', values: opportunityIds },
+    { column: 'listing_url', values: listingUrls },
+    metadataFilter,
+  ]);
+  const crmImports = selectCanonicalMergeRows(database, 'deal_hunter_crm_imports', [
+    { column: 'opportunity_id', values: opportunityIds },
+    { column: 'deal_key', values: dealKeys },
+    { column: 'listing_identity', values: listingIdentities },
+    { column: 'listing_url', values: listingUrls },
+    metadataFilter,
+  ]);
+  const crmReconciliationItems = selectCanonicalMergeRows(database, 'deal_hunter_crm_reconciliation_items', [
+    { column: 'opportunity_id', values: opportunityIds },
+    { column: 'deal_key', values: dealKeys },
+    { column: 'planned_changes', values: referenceValues, contains: true },
+    metadataFilter,
+  ]);
+  const crmReconciliationRuns = selectCanonicalMergeRows(database, 'deal_hunter_crm_reconciliation_runs', [
+    { column: 'id', values: crmReconciliationItems.map((row) => row.run_id) },
+    { column: 'plan', values: referenceValues, contains: true },
+    { column: 'results', values: referenceValues, contains: true },
+    metadataFilter,
+  ]);
+  const cimRequests = selectCanonicalMergeRows(database, 'deal_hunter_cim_requests', [
+    { column: 'opportunity_id', values: opportunityIds },
+    { column: 'deal_key', values: dealKeys },
+    { column: 'listing_url', values: listingUrls },
+    metadataFilter,
+  ]);
+  const cimReviews = selectCanonicalMergeRows(database, 'deal_hunter_cim_reviews', [
+    { column: 'opportunity_id', values: opportunityIds },
+    { column: 'deal_key', values: dealKeys },
+    metadataFilter,
+  ]);
+  const opportunityClaims = selectCanonicalMergeRows(database, 'deal_hunter_cim_opportunity_claims', [
+    { column: 'opportunity_id', values: opportunityIds },
+    metadataFilter,
+  ]);
+  const recipientClaims = selectCanonicalMergeRows(database, 'deal_hunter_cim_recipient_claims', [
+    { column: 'opportunity_id', values: opportunityIds },
+    metadataFilter,
+  ]);
+  const recipientOverrides = selectCanonicalMergeRows(database, 'deal_hunter_cim_recipient_overrides', [
+    { column: 'opportunity_id', values: opportunityIds },
+    metadataFilter,
+  ]);
+  const stage2Decisions = selectCanonicalMergeRows(database, 'deal_hunter_cim_stage2_decisions', [
+    { column: 'opportunity_id', values: opportunityIds },
+    { column: 'deal_key', values: dealKeys },
+    metadataFilter,
+  ]);
+  const historicalIdentityEvidence = selectCanonicalMergeRows(database, 'deal_hunter_seen_deals', [
+    { column: 'id', values: [...dealKeys, ...aliasKeys, ...aliasValues] },
+    { column: 'external_id', values: listingIdentities },
+    { column: 'listing_url', values: listingUrls },
+    metadataFilter,
+  ]);
+  const sourceImportPayloads = selectCanonicalMergeRows(database, 'deal_hunter_deal_os_imports', [
+    { column: 'row_accounting', values: referenceValues, contains: true },
+    { column: 'records', values: referenceValues, contains: true },
+    metadataFilter,
+  ]);
+  const otherIdentityExceptions = selectCanonicalMergeRows(database, 'deal_hunter_identity_exceptions', [
+    { column: 'observed_deal_key', values: dealKeys },
+    { column: 'candidate_opportunity_ids', values: opportunityIds, contains: true },
+    metadataFilter,
+  ]).filter((row) => row.id !== approval.exceptionId);
+
+  const submissionIds = uniqueCanonicalMergeValues([
+    ...contactSubmissions.map((row) => row.id),
+    ...crmImports.map((row) => row.submission_id),
+    ...crmReconciliationItems.map((row) => row.submission_id),
+    ...cimRequests.map((row) => row.submission_id),
+  ]);
+  const cimRequestIds = uniqueCanonicalMergeValues([
+    ...cimRequests.map((row) => row.id),
+    ...opportunityClaims.map((row) => row.request_id),
+    ...recipientClaims.map((row) => row.request_id),
+    ...stage2Decisions.map((row) => row.cim_request_id),
+  ]);
+  const communications = selectCanonicalMergeRows(database, 'crm_communications', [
+    { column: 'opportunity_id', values: opportunityIds },
+    { column: 'deal_key', values: dealKeys },
+    { column: 'submission_id', values: submissionIds },
+    { column: 'cim_request_id', values: cimRequestIds },
+    metadataFilter,
+  ]);
+  const communicationIds = uniqueCanonicalMergeValues([
+    ...communications.map((row) => row.id),
+    ...stage2Decisions.map((row) => row.communication_id),
+  ]);
+  const providerMessageIds = uniqueCanonicalMergeValues(communications.map((row) => row.provider_message_id));
+  const emailEvents = selectCanonicalMergeRows(database, 'email_events', [
+    { column: 'opportunity_id', values: opportunityIds },
+    { column: 'submission_id', values: submissionIds },
+    { column: 'communication_id', values: communicationIds },
+    { column: 'message_id', values: providerMessageIds },
+    metadataFilter,
+  ]);
+  const activityEvents = selectCanonicalMergeRows(database, 'crm_activity_events', [
+    { column: 'opportunity_id', values: opportunityIds },
+    { column: 'submission_id', values: submissionIds },
+    metadataFilter,
+  ]);
+  const followUpRecommendations = selectCanonicalMergeRows(database, 'crm_follow_up_recommendations', [
+    { column: 'submission_id', values: submissionIds },
+    { column: 'cim_request_id', values: cimRequestIds },
+    { column: 'triggering_communication_id', values: communicationIds },
+    metadataFilter,
+  ]);
+  const emailOutbox = selectCanonicalMergeRows(database, 'crm_email_outbox', [
+    { column: 'submission_id', values: submissionIds },
+    { column: 'cim_request_id', values: cimRequestIds },
+    { column: 'communication_id', values: communicationIds },
+    metadataFilter,
+  ]);
+  const dispositions = selectCanonicalMergeRows(database, 'deal_hunter_dispositions', [
+    { column: 'deal_key', values: dealKeys },
+    { column: 'listing_url', values: listingUrls },
+    { column: 'submission_id', values: submissionIds },
+    { column: 'communication_id', values: communicationIds },
+    metadataFilter,
+  ]);
+  const stage2Runs = selectCanonicalMergeRows(database, 'deal_hunter_cim_stage2_runs', [
+    { column: 'id', values: stage2Decisions.map((row) => row.run_id) },
+    metadataFilter,
+  ]);
+  const scheduledJobs = selectCanonicalMergeRows(database, 'scheduled_job_runs', [metadataFilter]);
+  const secureUploadRequests = selectCanonicalMergeRows(database, 'secure_upload_requests', [
+    { column: 'submission_id', values: submissionIds },
+  ]);
+  const secureDocuments = selectCanonicalMergeRows(database, 'secure_documents', [
+    { column: 'submission_id', values: submissionIds },
+    { column: 'request_id', values: secureUploadRequests.map((row) => row.id) },
+  ]);
+  const secureCleanupJobs = selectCanonicalMergeRows(database, 'secure_document_cleanup_jobs', [
+    { column: 'submission_id', values: submissionIds },
+    metadataFilter,
+  ]);
+  const prospectDiscoveries = selectCanonicalMergeRows(database, 'prospect_discoveries', [
+    { column: 'submission_id', values: submissionIds },
+  ]);
+
+  const manifestId = canonicalOpportunityMergeManifestId(approval);
+  const otherRepairManifests = selectCanonicalMergeRows(database, 'deal_hunter_cim_repair_manifests', [
+    { column: 'manifest', values: referenceValues, contains: true },
+    metadataFilter,
+  ]).filter((row) => row.id !== manifestId);
+  const linkedCrmState = [
+    ...secureUploadRequests.map((row) => `secure_upload_requests:${row.id}`),
+    ...secureDocuments.map((row) => `secure_documents:${row.id}`),
+    ...secureCleanupJobs.map((row) => `secure_document_cleanup_jobs:${row.id}`),
+    ...prospectDiscoveries.map((row) => `prospect_discoveries:${row.id}`),
+  ];
+
+  const records = {
+    opportunityScores: canonicalMergeRecordIds('deal_hunter_opportunity_scores', opportunityScores, 'opportunity_id'),
+    scoreEvidence: canonicalMergeRecordIds('deal_hunter_score_evidence', scoreEvidence),
+    contactSubmissions: canonicalMergeRecordIds('contact_submissions', contactSubmissions),
+    crmImports: canonicalMergeRecordIds('deal_hunter_crm_imports', crmImports),
+    crmReconciliationItems: canonicalMergeRecordIds('deal_hunter_crm_reconciliation_items', crmReconciliationItems),
+    crmReconciliationRuns: canonicalMergeRecordIds('deal_hunter_crm_reconciliation_runs', crmReconciliationRuns),
+    cimRequests: canonicalMergeRecordIds('deal_hunter_cim_requests', cimRequests),
+    cimReviews: canonicalMergeRecordIds('deal_hunter_cim_reviews', cimReviews),
+    communications: canonicalMergeRecordIds('crm_communications', communications),
+    emailEvents: canonicalMergeRecordIds('email_events', emailEvents),
+    activityEvents: canonicalMergeRecordIds('crm_activity_events', activityEvents),
+    opportunityClaims: canonicalMergeRecordIds('deal_hunter_cim_opportunity_claims', opportunityClaims, 'opportunity_id'),
+    recipientClaims: canonicalMergeRecordIds('deal_hunter_cim_recipient_claims', recipientClaims, 'recipient_email'),
+    recipientOverrides: canonicalMergeRecordIds('deal_hunter_cim_recipient_overrides', recipientOverrides),
+    stage2Decisions: canonicalMergeRecordIds('deal_hunter_cim_stage2_decisions', stage2Decisions),
+    followUpState: uniqueCanonicalMergeValues([
+      ...followUpRecommendations.map((row) => `crm_follow_up_recommendations:${row.id}`),
+      ...emailOutbox.map((row) => `crm_email_outbox:${row.id}`),
+    ]),
+    dispositions: canonicalMergeRecordIds('deal_hunter_dispositions', dispositions),
+    historicalIdentityEvidence: canonicalMergeRecordIds('deal_hunter_seen_deals', historicalIdentityEvidence),
+    sourceImportPayloads: canonicalMergeRecordIds('deal_hunter_deal_os_imports', sourceImportPayloads),
+    otherIdentityExceptions: canonicalMergeRecordIds('deal_hunter_identity_exceptions', otherIdentityExceptions),
+    stage2Runs: canonicalMergeRecordIds('deal_hunter_cim_stage2_runs', stage2Runs),
+    scheduledJobs: canonicalMergeRecordIds('scheduled_job_runs', scheduledJobs, 'job_key'),
+    linkedCrmState: uniqueCanonicalMergeValues(linkedCrmState),
+    otherRepairManifests: canonicalMergeRecordIds('deal_hunter_cim_repair_manifests', otherRepairManifests),
+  };
+  return {
+    counts: Object.fromEntries(Object.entries(records).map(([category, ids]) => [category, ids.length])),
+    records,
+  };
+}
+
+function inspectCanonicalMergeOperationalState(database, approval) {
+  const opportunityIds = [approval.survivorId, approval.supersededId];
+  const recipients = uniqueCanonicalMergeValues(database.prepare(`
+    SELECT LOWER(TRIM(canonical_recipient)) AS recipient
+    FROM deal_hunter_opportunities
+    WHERE opportunity_id IN (${placeholders(opportunityIds.length)})
+      AND NULLIF(TRIM(canonical_recipient), '') IS NOT NULL
+    ORDER BY recipient
+  `).all(...opportunityIds).map((row) => row.recipient));
+  const deterministicRecipient = recipients.length === 1 ? recipients[0] : '';
+  const suppressionCounts = deterministicRecipient
+    ? database.prepare(`
+        SELECT
+          COUNT(*) AS total_count,
+          COUNT(DISTINCT normalized_email) AS matched_recipient_count,
+          SUM(CASE WHEN lifted_at IS NULL THEN 1 ELSE 0 END) AS active_count,
+          SUM(CASE WHEN lifted_at IS NOT NULL THEN 1 ELSE 0 END) AS lifted_count
+        FROM email_suppressions
+        WHERE normalized_email = ?
+      `).get(deterministicRecipient)
+    : {
+        total_count: 0,
+        matched_recipient_count: 0,
+        active_count: 0,
+        lifted_count: 0,
+      };
+  const stage2ActivationCounts = database.prepare(`
+    SELECT
+      COUNT(*) AS total_count,
+      SUM(CASE WHEN status = 'current' THEN 1 ELSE 0 END) AS active_count
+    FROM deal_hunter_cim_stage2_activations
+  `).get();
+  return {
+    preservedOperationalState: {
+      emailSuppressions: {
+        recipientResolution: deterministicRecipient
+          ? 'deterministic-approved-pair'
+          : 'indeterminate-approved-pair',
+        matchedRecipientCount: Number(suppressionCounts.matched_recipient_count || 0),
+        totalCount: Number(suppressionCounts.total_count || 0),
+        activeCount: Number(suppressionCounts.active_count || 0),
+        liftedCount: Number(suppressionCounts.lifted_count || 0),
+        authorityEffect: 'restrictive',
+      },
+    },
+    authorityGrantingOperationalState: {
+      stage2Activations: {
+        totalCount: Number(stage2ActivationCounts.total_count || 0),
+        activeCount: Number(stage2ActivationCounts.active_count || 0),
+        authorityEffect: 'granting',
+      },
+    },
+  };
+}
+
+function inspectCanonicalOpportunityMergeState(database, approval) {
+  const opportunityIds = [approval.survivorId, approval.supersededId];
+  const opportunities = database.prepare(`
+    SELECT * FROM deal_hunter_opportunities
+    WHERE opportunity_id IN (${placeholders(opportunityIds.length)})
+    ORDER BY opportunity_id
+  `).all(...opportunityIds).map(normalizeDealHunterOpportunityRow);
+  const identityException = normalizeDealHunterIdentityExceptionRow(database.prepare(`
+    SELECT * FROM deal_hunter_identity_exceptions WHERE id = ? LIMIT 1
+  `).get(approval.exceptionId));
+  const aliases = database.prepare(`
+    SELECT * FROM deal_hunter_opportunity_aliases
+    WHERE opportunity_id IN (${placeholders(opportunityIds.length)})
+    ORDER BY alias_type, alias_value, opportunity_id, alias_key
+  `).all(...opportunityIds).map(normalizeDealHunterOpportunityAliasRow);
+  const findGlobalOwners = database.prepare(`
+    SELECT * FROM deal_hunter_opportunity_aliases
+    WHERE alias_type = ? AND alias_value = ?
+    ORDER BY opportunity_id, alias_key
+  `);
+  const globalAliasOwnership = approval.expectedAliases.flatMap((item) => (
+    findGlobalOwners.all(item.aliasType, item.aliasValue).map(normalizeDealHunterOpportunityAliasRow)
+  ));
+  const manifestId = canonicalOpportunityMergeManifestId(approval);
+  const manifestAtId = normalizeDealHunterRepairManifestRow(database.prepare(`
+    SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ? LIMIT 1
+  `).get(manifestId));
+  const typedManifests = database.prepare(`
+    SELECT * FROM deal_hunter_cim_repair_manifests
+    WHERE mode = ?
+    ORDER BY id
+  `).all(CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE)
+    .map(normalizeDealHunterRepairManifestRow)
+    .filter((manifest) => canonicalMergeManifestClaimsTuple(manifest, approval));
+  const operationalState = inspectCanonicalMergeOperationalState(database, approval);
+  return {
+    opportunities,
+    identityException,
+    aliases,
+    globalAliasOwnership,
+    manifestAtId,
+    typedManifests,
+    dependentState: inspectCanonicalMergeDependentState(database, approval),
+    ...operationalState,
+  };
+}
+
+function checkedCanonicalOpportunityMergeApproval(approval = {}) {
+  return getCanonicalOpportunityMergeApproval({
+    exceptionId: approval.exceptionId,
+    survivorId: approval.survivorId,
+    supersededId: approval.supersededId,
+  });
+}
+
+const canonicalOpportunityMergeRequiredSchema = Object.freeze({
+  contact_submissions: ['id', 'deal_hunter_opportunity_id', 'listing_url', 'metadata'],
+  secure_upload_requests: ['id', 'submission_id'],
+  secure_documents: ['id', 'request_id', 'submission_id'],
+  email_events: ['id', 'message_id', 'submission_id', 'communication_id', 'opportunity_id', 'metadata'],
+  crm_activity_events: ['id', 'submission_id', 'opportunity_id', 'metadata'],
+  crm_communications: [
+    'id',
+    'submission_id',
+    'deal_key',
+    'cim_request_id',
+    'provider_message_id',
+    'opportunity_id',
+    'metadata',
+  ],
+  crm_email_outbox: ['id', 'communication_id', 'submission_id', 'cim_request_id', 'metadata'],
+  crm_follow_up_recommendations: [
+    'id',
+    'submission_id',
+    'cim_request_id',
+    'triggering_communication_id',
+    'metadata',
+  ],
+  deal_hunter_seen_deals: ['id', 'listing_url', 'metadata'],
+  deal_hunter_deal_os_imports: ['id', 'row_accounting', 'records', 'metadata'],
+  deal_hunter_cim_requests: [
+    'id',
+    'deal_key',
+    'listing_url',
+    'submission_id',
+    'opportunity_id',
+    'metadata',
+  ],
+  deal_hunter_crm_reconciliation_runs: ['id', 'plan', 'results', 'metadata'],
+  deal_hunter_crm_reconciliation_items: [
+    'id',
+    'run_id',
+    'opportunity_id',
+    'deal_key',
+    'submission_id',
+    'planned_changes',
+    'metadata',
+  ],
+  deal_hunter_opportunity_scores: ['opportunity_id', 'deal_key', 'listing_url'],
+  deal_hunter_score_evidence: ['id', 'opportunity_id', 'listing_url'],
+  deal_hunter_cim_reviews: ['id', 'deal_key', 'opportunity_id', 'metadata'],
+  deal_hunter_crm_imports: [
+    'id',
+    'deal_key',
+    'listing_identity',
+    'listing_url',
+    'submission_id',
+    'opportunity_id',
+    'metadata',
+  ],
+  deal_hunter_opportunities: [
+    'opportunity_id',
+    'created_at',
+    'updated_at',
+    'canonical_name',
+    'canonical_recipient',
+    'canonical_location',
+    'primary_submission_id',
+    'identity_version',
+    'status',
+    'metadata',
+  ],
+  deal_hunter_opportunity_aliases: [
+    'id',
+    'opportunity_id',
+    'alias_type',
+    'alias_value',
+    'alias_key',
+    'source',
+    'first_observed_at',
+    'last_observed_at',
+    'evidence_version',
+    'resolution_method',
+    'confidence_state',
+    'resolved_by',
+    'metadata',
+  ],
+  deal_hunter_identity_exceptions: [
+    'id',
+    'created_at',
+    'updated_at',
+    'status',
+    'observed_deal_key',
+    'candidate_opportunity_ids',
+    'reason',
+    'evidence_version',
+    'resolved_at',
+    'resolved_by',
+    'resolution_reason',
+    'metadata',
+  ],
+  deal_hunter_cim_opportunity_claims: ['opportunity_id', 'request_id', 'metadata'],
+  deal_hunter_cim_recipient_overrides: ['id', 'opportunity_id', 'metadata'],
+  deal_hunter_cim_recipient_claims: ['recipient_email', 'request_id', 'opportunity_id', 'metadata'],
+  deal_hunter_cim_safety_settings: ['id', 'updated_at', 'outreach_paused'],
+  deal_hunter_cim_repair_manifests: [
+    'id',
+    'created_at',
+    'updated_at',
+    'mode',
+    'status',
+    'actor',
+    'backup_reference',
+    'checksum',
+    'manifest',
+    'metadata',
+  ],
+  deal_hunter_cim_stage2_runs: ['id', 'metadata'],
+  deal_hunter_cim_stage2_decisions: [
+    'id',
+    'run_id',
+    'opportunity_id',
+    'deal_key',
+    'cim_request_id',
+    'communication_id',
+    'metadata',
+  ],
+  deal_hunter_dispositions: [
+    'id',
+    'deal_key',
+    'submission_id',
+    'communication_id',
+    'listing_url',
+    'metadata',
+  ],
+  scheduled_job_runs: ['job_key', 'metadata'],
+  secure_document_cleanup_jobs: ['id', 'submission_id', 'metadata'],
+});
+
+function assertCanonicalOpportunityMergeSqliteSchema(database) {
+  const missing = [];
+  const actualColumnsByTable = new Map(database.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    ORDER BY name
+  `).all().map(({ name }) => [
+    name,
+    new Set(database.prepare('SELECT name FROM pragma_table_info(?)').all(name).map((row) => row.name)),
+  ]));
+  for (const [table, requiredColumns] of Object.entries(canonicalOpportunityMergeRequiredSchema)) {
+    const presentColumns = actualColumnsByTable.get(table);
+    if (!presentColumns) {
+      missing.push(`${table} (table)`);
+      continue;
+    }
+    for (const column of requiredColumns) {
+      if (!presentColumns.has(column)) missing.push(`${table}.${column}`);
+    }
+  }
+  const inventoryKeys = new Set(CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries
+    .map((entry) => `${entry.table}.${entry.column}`));
+  for (const entry of CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries) {
+    const columns = actualColumnsByTable.get(entry.table);
+    if (!columns) missing.push(`${entry.table} (relationship inventory table)`);
+    else if (!columns.has(entry.column)) missing.push(`${entry.table}.${entry.column}`);
+  }
+  const unclassified = [];
+  for (const [table, columns] of actualColumnsByTable) {
+    for (const column of columns) {
+      if (
+        isCanonicalOpportunityMergeRelationshipColumn(column)
+        && !inventoryKeys.has(`${table}.${column}`)
+      ) {
+        unclassified.push(`${table}.${column}`);
+      }
+    }
+  }
+  if (missing.length > 0 || unclassified.length > 0) {
+    const details = [];
+    if (missing.length > 0) details.push(`missing required repair schema: ${[...new Set(missing)].sort().join(', ')}`);
+    if (unclassified.length > 0) details.push(`unclassified relationship schema: ${unclassified.sort().join(', ')}`);
+    throw new Error(
+      `Canonical opportunity merge refused unsupported SQLite schema; ${details.join('; ')}.`,
+    );
+  }
+}
+
+function canonicalMergeFileFingerprint(filePath, { optional = false } = {}) {
+  let before;
+  try {
+    before = fs.statSync(filePath, { bigint: true });
+  } catch (error) {
+    if (optional && error?.code === 'ENOENT') return null;
+    throw error;
+  }
+  if (!before.isFile()) throw new Error(`Canonical opportunity merge source is not a regular file: ${filePath}.`);
+  const descriptor = fs.openSync(filePath, 'r');
+  const digest = createHash('sha256');
+  const buffer = Buffer.allocUnsafe(1024 * 1024);
+  try {
+    let bytesRead;
+    do {
+      bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (bytesRead > 0) digest.update(buffer.subarray(0, bytesRead));
+    } while (bytesRead > 0);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  const after = fs.statSync(filePath, { bigint: true });
+  const stable = ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs']
+    .every((field) => before[field] === after[field]);
+  if (!stable) throw new Error(`Canonical opportunity merge source changed while hashing ${filePath}.`);
+  return {
+    dev: String(after.dev),
+    ino: String(after.ino),
+    size: String(after.size),
+    mtimeNs: String(after.mtimeNs),
+    ctimeNs: String(after.ctimeNs),
+    sha256: digest.digest('hex'),
+  };
+}
+
+function captureCanonicalMergeSourceFiles(sourcePath) {
+  return {
+    database: canonicalMergeFileFingerprint(sourcePath),
+    wal: canonicalMergeFileFingerprint(`${sourcePath}-wal`, { optional: true }),
+    journal: canonicalMergeFileFingerprint(`${sourcePath}-journal`, { optional: true }),
+  };
+}
+
+function removeCanonicalMergeSnapshotFiles(snapshotPath) {
+  for (const suffix of ['', '-wal', '-shm', '-journal']) {
+    fs.rmSync(`${snapshotPath}${suffix}`, { force: true });
+  }
+}
+
+function createStableCanonicalMergeSqliteSnapshot(sqlitePath) {
+  const sourcePath = fs.realpathSync(path.resolve(sqlitePath));
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-canonical-merge-readonly-'));
+  const snapshotPath = path.join(temporaryDirectory, 'snapshot.sqlite');
+  let lastError = null;
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      removeCanonicalMergeSnapshotFiles(snapshotPath);
+      try {
+        const before = captureCanonicalMergeSourceFiles(sourcePath);
+        if (before.journal) {
+          throw new Error('Canonical opportunity merge refused a SQLite source with an active rollback journal.');
+        }
+        fs.copyFileSync(sourcePath, snapshotPath);
+        if (before.wal) fs.copyFileSync(`${sourcePath}-wal`, `${snapshotPath}-wal`);
+        const after = captureCanonicalMergeSourceFiles(sourcePath);
+        const copied = captureCanonicalMergeSourceFiles(snapshotPath);
+        if (
+          after.journal
+          || JSON.stringify(before) !== JSON.stringify(after)
+          || copied.database.sha256 !== after.database.sha256
+          || copied.wal?.sha256 !== after.wal?.sha256
+        ) {
+          throw new Error('Canonical opportunity merge source changed while creating its read-only snapshot.');
+        }
+        const header = Buffer.alloc(20);
+        const descriptor = fs.openSync(snapshotPath, 'r');
+        try {
+          if (fs.readSync(descriptor, header, 0, header.length, 0) !== header.length) {
+            throw new Error('Canonical opportunity merge source has an invalid SQLite header.');
+          }
+        } finally {
+          fs.closeSync(descriptor);
+        }
+        if (header.subarray(0, 16).toString('utf8') !== 'SQLite format 3\u0000') {
+          throw new Error('Canonical opportunity merge source is not a SQLite 3 database.');
+        }
+        if (header[18] !== 2 || header[19] !== 2) {
+          throw new Error('Canonical opportunity merge read-only inspection requires a stable SQLite WAL-mode source.');
+        }
+        return { databasePath: snapshotPath, temporaryDirectory };
+      } catch (error) {
+        lastError = error;
+      }
+    }
+  } catch (error) {
+    lastError = error;
+  }
+  fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+  throw new Error(`Canonical opportunity merge could not create a stable read-only SQLite snapshot: ${lastError?.message || 'unknown error'}`);
+}
+
+function inspectCanonicalOpportunityMerge(database, { approval, actor = '', reason = '' } = {}) {
+  assertCanonicalOpportunityMergeSqliteSchema(database);
+  const checkedApproval = checkedCanonicalOpportunityMergeApproval(approval);
+  const inspection = inspectCanonicalOpportunityMergeState(database, checkedApproval);
+  if (inspection.manifestAtId) {
+    const replay = validateCanonicalOpportunityMergeReplayManifest({
+      approval: checkedApproval,
+      manifest: inspection.manifestAtId,
+      actor,
+      reason,
+      expectedPlanChecksum: inspection.manifestAtId.checksum,
+    });
+    const finalState = validateCanonicalMergeFinalState(database, {
+      approval: checkedApproval,
+      actor: replay.actor,
+      reason: replay.reason,
+      planChecksum: replay.planChecksum,
+      manifestId: replay.manifestId,
+    });
+    return {
+      alreadyApplied: true,
+      planChecksum: replay.planChecksum,
+      manifestId: replay.manifestId,
+      plan: replay.plan,
+      manifest: finalState.manifest,
+      finalState,
+    };
+  }
+  return buildCanonicalOpportunityMergePlan({ approval: checkedApproval, inspection, actor, reason });
+}
+
+function canonicalMergeManifestClaimsTuple(manifest, approval) {
+  const expected = [approval.exceptionId, approval.survivorId, approval.supersededId];
+  const tuples = [
+    manifest?.manifest?.approvalTuple,
+    manifest?.manifest?.plan?.approvalTuple,
+    manifest?.metadata && {
+      exceptionId: manifest.metadata.exceptionId,
+      survivorId: manifest.metadata.survivorId,
+      supersededId: manifest.metadata.supersededId,
+    },
+  ];
+  return tuples.some((tuple) => (
+    tuple?.exceptionId === expected[0]
+    && tuple?.survivorId === expected[1]
+    && tuple?.supersededId === expected[2]
+  ));
+}
+
+function assertCanonicalMergeAliasPostconditions(database, approval) {
+  const canonicalIds = [approval.survivorId, approval.supersededId];
+  const ownedAliases = database.prepare(`
+    SELECT alias_key, alias_type, alias_value, opportunity_id
+    FROM deal_hunter_opportunity_aliases
+    WHERE opportunity_id IN (${placeholders(canonicalIds.length)})
+    ORDER BY alias_key, opportunity_id
+  `).all(...canonicalIds);
+  const expectedOwnedAliases = approval.expectedAliases
+    .map((item) => ({
+      alias_key: item.aliasKey,
+      alias_type: item.aliasType,
+      alias_value: item.aliasValue,
+      opportunity_id: approval.survivorId,
+    }))
+    .sort((left, right) => left.alias_key.localeCompare(right.alias_key));
+  if (
+    ownedAliases.length !== expectedOwnedAliases.length
+    || ownedAliases.some((row, index) => (
+      row.alias_key !== expectedOwnedAliases[index].alias_key
+      || row.alias_type !== expectedOwnedAliases[index].alias_type
+      || row.alias_value !== expectedOwnedAliases[index].alias_value
+      || row.opportunity_id !== expectedOwnedAliases[index].opportunity_id
+    ))
+  ) {
+    throw new Error('Canonical opportunity merge approved alias ownership set failed its final-state postcondition.');
+  }
+  const findOwners = database.prepare(`
+    SELECT * FROM deal_hunter_opportunity_aliases
+    WHERE alias_type = ? AND alias_value = ?
+    ORDER BY opportunity_id, alias_key
+  `);
+  const aliases = [];
+  for (const expected of approval.expectedAliases) {
+    const rows = findOwners.all(expected.aliasType, expected.aliasValue);
+    if (
+      rows.length !== 1
+      || rows[0].opportunity_id !== approval.survivorId
+      || rows[0].alias_key !== expected.aliasKey
+    ) {
+      throw new Error(`Canonical opportunity merge alias postcondition failed for ${expected.aliasKey}.`);
+    }
+    aliases.push(normalizeDealHunterOpportunityAliasRow(rows[0]));
+  }
+  const losingAliasCount = database.prepare(`
+    SELECT COUNT(*) AS count FROM deal_hunter_opportunity_aliases WHERE opportunity_id = ?
+  `).get(approval.supersededId).count;
+  if (Number(losingAliasCount) !== 0) {
+    throw new Error('Canonical opportunity merge left aliases on the superseded opportunity.');
+  }
+  for (const observation of approval.sourceObservations) {
+    if (!Array.isArray(observation.durableAliasKeys) || observation.durableAliasKeys.length === 0) {
+      throw new Error(`Approved source observation ${observation.sourceRecordId} has no durable identity postcondition.`);
+    }
+    const rows = database.prepare(`
+      SELECT alias_key, opportunity_id
+      FROM deal_hunter_opportunity_aliases
+      WHERE alias_key IN (${placeholders(observation.durableAliasKeys.length)})
+      ORDER BY alias_key
+    `).all(...observation.durableAliasKeys);
+    if (
+      rows.length !== observation.durableAliasKeys.length
+      || rows.some((row) => row.opportunity_id !== approval.survivorId)
+    ) {
+      throw new Error(`Approved source observation ${observation.sourceRecordId} can still resolve outside the survivor.`);
+    }
+  }
+  return aliases.sort((left, right) => left.alias_key.localeCompare(right.alias_key));
+}
+
+function validateCanonicalMergeFinalState(database, {
+  approval,
+  actor,
+  reason,
+  planChecksum,
+  manifestId,
+} = {}) {
+  const manifest = normalizeDealHunterRepairManifestRow(database.prepare(`
+    SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ? LIMIT 1
+  `).get(manifestId));
+  const appliedAt = manifest?.manifest?.appliedAt;
+  const aliases = assertCanonicalMergeAliasPostconditions(database, approval);
+  const survivor = normalizeDealHunterOpportunityRow(database.prepare(`
+    SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+  `).get(approval.survivorId));
+  const superseded = normalizeDealHunterOpportunityRow(database.prepare(`
+    SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+  `).get(approval.supersededId));
+  if (survivor?.status !== 'active') throw new Error('Canonical opportunity merge survivor is not active after apply.');
+  if (superseded?.status !== 'superseded') throw new Error('Canonical opportunity merge loser was not superseded.');
+  const mergeMetadata = superseded.metadata?.canonicalOpportunityMerge;
+  if (
+    mergeMetadata?.repairType !== CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE
+    || mergeMetadata?.schemaVersion !== 1
+    || mergeMetadata?.mergedInto !== approval.survivorId
+    || mergeMetadata?.supersededOpportunityId !== approval.supersededId
+    || mergeMetadata?.exceptionId !== approval.exceptionId
+    || mergeMetadata?.actor !== actor
+    || mergeMetadata?.reason !== reason
+    || mergeMetadata?.planChecksum !== planChecksum
+    || mergeMetadata?.supersededAt !== appliedAt
+    || superseded.updated_at !== appliedAt
+  ) {
+    throw new Error('Canonical opportunity merge supersession metadata failed final validation.');
+  }
+  const identityException = normalizeDealHunterIdentityExceptionRow(database.prepare(`
+    SELECT * FROM deal_hunter_identity_exceptions WHERE id = ? LIMIT 1
+  `).get(approval.exceptionId));
+  const exceptionMerge = identityException?.metadata?.canonicalOpportunityMerge;
+  const candidateIds = uniqueCanonicalMergeValues(identityException?.candidate_opportunity_ids);
+  const expectedCandidateIds = uniqueCanonicalMergeValues([approval.survivorId, approval.supersededId]);
+  if (
+    identityException?.status !== 'resolved'
+    || identityException?.updated_at !== appliedAt
+    || identityException?.resolved_at !== appliedAt
+    || identityException?.resolved_by !== actor
+    || identityException?.resolution_reason !== reason
+    || identityException?.reason !== approval.expectedExceptionReason
+    || identityException?.evidence_version !== approval.expectedEvidenceVersion
+    || candidateIds.length !== expectedCandidateIds.length
+    || candidateIds.some((id, index) => id !== expectedCandidateIds[index])
+    || exceptionMerge?.repairType !== CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE
+    || exceptionMerge?.schemaVersion !== 1
+    || exceptionMerge?.decision !== 'merge'
+    || exceptionMerge?.survivorId !== approval.survivorId
+    || exceptionMerge?.supersededId !== approval.supersededId
+    || exceptionMerge?.planChecksum !== planChecksum
+  ) {
+    throw new Error('Canonical opportunity merge exception resolution failed final validation.');
+  }
+  const typedManifests = database.prepare(`
+    SELECT * FROM deal_hunter_cim_repair_manifests WHERE mode = ? ORDER BY id
+  `).all(CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE)
+    .map(normalizeDealHunterRepairManifestRow)
+    .filter((row) => canonicalMergeManifestClaimsTuple(row, approval));
+  validateCanonicalOpportunityMergeReplayManifest({
+    approval,
+    manifest,
+    actor,
+    reason,
+    expectedPlanChecksum: planChecksum,
+  });
+  if (
+    !manifest
+    || typedManifests.length !== 1
+    || typedManifests[0].id !== manifestId
+    || manifest.mode !== CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE
+    || manifest.status !== 'applied'
+    || manifest.checksum !== planChecksum
+    || manifest.manifest?.repairType !== CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE
+    || manifest.manifest?.manifestSchema !== CANONICAL_OPPORTUNITY_MERGE_MANIFEST_SCHEMA
+    || manifest.metadata?.repairType !== CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE
+  ) {
+    throw new Error('Canonical opportunity merge manifest failed typed final validation.');
+  }
+  const dependentState = inspectCanonicalMergeDependentState(database, approval);
+  const unexpected = Object.entries(dependentState.counts).filter(([, count]) => count !== 0);
+  if (unexpected.length > 0) {
+    throw new Error(`Canonical opportunity merge final state acquired unexpected dependents: ${unexpected.map(([name]) => name).join(', ')}.`);
+  }
+  return { survivor, superseded, identityException, aliases, manifest, dependentState };
+}
+
+export function createSqliteCanonicalOpportunityMergeReadOnlyStorage(config) {
+  if (config?.storage?.provider !== 'sqlite') {
+    throw new Error('Canonical opportunity merge repair is SQLite-only and refused the active storage provider.');
+  }
+  const sqlitePath = String(config.storage.sqlitePath || '').trim();
+  if (!sqlitePath) throw new Error('Canonical opportunity merge repair requires an existing SQLite database path.');
+
+  const snapshot = createStableCanonicalMergeSqliteSnapshot(sqlitePath);
+  let database;
+  let closed = false;
+  try {
+    database = new Database(snapshot.databasePath, { readonly: true, fileMustExist: true });
+    database.pragma('query_only = ON');
+    if (Number(database.pragma('query_only', { simple: true })) !== 1) {
+      throw new Error('Canonical opportunity merge could not enforce SQLite query-only mode.');
+    }
+    const quickCheck = String(database.pragma('quick_check', { simple: true }) || '');
+    if (quickCheck !== 'ok') {
+      throw new Error(`Canonical opportunity merge SQLite snapshot quick_check returned ${quickCheck || 'no result'}.`);
+    }
+    assertCanonicalOpportunityMergeSqliteSchema(database);
+  } catch (error) {
+    database?.close();
+    fs.rmSync(snapshot.temporaryDirectory, { recursive: true, force: true });
+    throw error;
+  }
+
+  return {
+    provider: 'sqlite',
+
+    close() {
+      if (closed) return;
+      closed = true;
+      try {
+        database.close();
+      } finally {
+        fs.rmSync(snapshot.temporaryDirectory, { recursive: true, force: true });
+      }
+    },
+
+    async inspectDealHunterCanonicalOpportunityMerge(input = {}) {
+      return inspectCanonicalOpportunityMerge(database, input);
+    },
+  };
 }
 
 export function createSqliteStorage(config) {
@@ -3060,9 +4037,24 @@ export function createSqliteStorage(config) {
     let record = null;
 
     if (operation === 'insert_submission') {
+      const canonicalOpportunityId = payload.submission?.deal_hunter_opportunity_id || '';
+      if (canonicalOpportunityId) {
+        const opportunity = database.prepare(`
+          SELECT status
+          FROM deal_hunter_opportunities
+          WHERE opportunity_id = ?
+          LIMIT 1
+        `).get(canonicalOpportunityId);
+        if (opportunity?.status !== 'active') {
+          throw new Error('A superseded or otherwise non-current opportunity cannot receive a CRM submission.');
+        }
+      }
       insertSubmissionStatement.run(serializeSubmission(payload.submission));
       record = payload.submission;
     } else if (operation === 'update_submission') {
+      if (Object.hasOwn(payload.values || {}, 'deal_hunter_opportunity_id')) {
+        throw new Error('Canonical CRM linkage must use the atomic Deal Hunter link primitive.');
+      }
       const result = updateRecord(
         'contact_submissions',
         payload.id,
@@ -5236,6 +6228,12 @@ export function createSqliteStorage(config) {
         // The score and the evidence describing it are replaced together, so no
         // reader can observe a score at fingerprint B beside evidence from A.
         const transaction = database.transaction(() => {
+          const opportunity = database.prepare(`
+            SELECT status FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+          `).get(opportunityId);
+          if (opportunity?.status !== 'active') {
+            throw new Error('A superseded or otherwise non-current opportunity cannot be scored.');
+          }
           database.prepare(`
             INSERT INTO deal_hunter_opportunity_scores (
               opportunity_id, created_at, scored_at, deal_key, name, state, listing_url, fit_score, score_status, confidence,
@@ -5319,10 +6317,6 @@ export function createSqliteStorage(config) {
       async setDealHunterOpportunityOperatorDecision(decision = {}) {
         const opportunityId = String(decision.opportunityId || '').trim();
         if (!opportunityId) throw new Error('A canonical opportunity id is required to record an operator decision.');
-        const existing = database
-          .prepare('SELECT opportunity_id FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?')
-          .get(opportunityId);
-        if (!existing) return null;
         const assignments = [];
         const params = { opportunity_id: opportunityId, operator_updated_at: decision.updatedAt || new Date().toISOString() };
         if (decision.priority !== undefined) {
@@ -5344,12 +6338,27 @@ export function createSqliteStorage(config) {
           params.reviewed_semantic_digest = decision.reviewedSemanticDigest
             ? String(decision.reviewedSemanticDigest) : null;
         }
-        if (assignments.length === 0) return this.getDealHunterOpportunityScore(opportunityId);
-        database.prepare(`
-          UPDATE deal_hunter_opportunity_scores
-          SET ${assignments.join(', ')}, operator_updated_at = @operator_updated_at
-          WHERE opportunity_id = @opportunity_id
-        `).run(params);
+        if (assignments.length === 0) return this.getCurrentDealHunterOpportunityScore(opportunityId);
+        const transaction = database.transaction(() => {
+          const opportunity = database.prepare(`
+            SELECT status FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+          `).get(opportunityId);
+          if (!opportunity) return false;
+          if (opportunity?.status !== 'active') {
+            throw new Error('A superseded or otherwise non-current opportunity cannot receive a triage decision.');
+          }
+          const existing = database
+            .prepare('SELECT opportunity_id FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?')
+            .get(opportunityId);
+          if (!existing) return false;
+          database.prepare(`
+            UPDATE deal_hunter_opportunity_scores
+            SET ${assignments.join(', ')}, operator_updated_at = @operator_updated_at
+            WHERE opportunity_id = @opportunity_id
+          `).run(params);
+          return true;
+        });
+        if (!transaction.immediate()) return null;
         return this.getDealHunterOpportunityScore(opportunityId);
       },
 
@@ -5362,8 +6371,12 @@ export function createSqliteStorage(config) {
       async getCurrentDealHunterOpportunityScore(opportunityId) {
         return normalizeDealHunterOpportunityScoreRow(
           database.prepare(`
-            SELECT * FROM deal_hunter_opportunity_scores
-            WHERE opportunity_id = ? AND current_triage_eligible = 1
+            SELECT scores.*
+            FROM deal_hunter_opportunity_scores AS scores
+            JOIN deal_hunter_opportunities AS opportunity
+              ON opportunity.opportunity_id = scores.opportunity_id
+             AND opportunity.status = 'active'
+            WHERE scores.opportunity_id = ? AND scores.current_triage_eligible = 1
           `).get(String(opportunityId || '').trim()),
         );
       },
@@ -5374,23 +6387,44 @@ export function createSqliteStorage(config) {
           const activated = Number(database.prepare(`
             SELECT COUNT(*) AS count
             FROM deal_hunter_opportunity_scores AS scores
+            JOIN deal_hunter_opportunities AS opportunity
+              ON opportunity.opportunity_id = scores.opportunity_id
+             AND opportunity.status = 'active'
             WHERE scores.current_triage_eligible = 0
               AND scores.opportunity_id IN (SELECT value FROM json_each(?))
           `).get(idsJson)?.count || 0);
           const deactivated = Number(database.prepare(`
             SELECT COUNT(*) AS count
             FROM deal_hunter_opportunity_scores AS scores
+            LEFT JOIN deal_hunter_opportunities AS opportunity
+              ON opportunity.opportunity_id = scores.opportunity_id
+             AND opportunity.status = 'active'
             WHERE scores.current_triage_eligible = 1
-              AND scores.opportunity_id NOT IN (SELECT value FROM json_each(?))
+              AND (
+                opportunity.opportunity_id IS NULL
+                OR scores.opportunity_id NOT IN (SELECT value FROM json_each(?))
+              )
           `).get(idsJson)?.count || 0);
           database.prepare(`
             UPDATE deal_hunter_opportunity_scores
             SET current_triage_eligible = CASE
-              WHEN opportunity_id IN (SELECT value FROM json_each(@opportunity_ids)) THEN 1
+              WHEN opportunity_id IN (
+                SELECT requested.value
+                FROM json_each(@opportunity_ids) AS requested
+                JOIN deal_hunter_opportunities AS opportunity
+                  ON opportunity.opportunity_id = requested.value
+                 AND opportunity.status = 'active'
+              ) THEN 1
               ELSE 0
             END
             WHERE current_triage_eligible <> CASE
-              WHEN opportunity_id IN (SELECT value FROM json_each(@opportunity_ids)) THEN 1
+              WHEN opportunity_id IN (
+                SELECT requested.value
+                FROM json_each(@opportunity_ids) AS requested
+                JOIN deal_hunter_opportunities AS opportunity
+                  ON opportunity.opportunity_id = requested.value
+                 AND opportunity.status = 'active'
+              ) THEN 1
               ELSE 0
             END
           `).run({ opportunity_ids: idsJson });
@@ -5436,6 +6470,9 @@ export function createSqliteStorage(config) {
         // Dismissal stays owned by the existing disposition record rather than
         // being duplicated as another state column on the score row.
         const dismissedJoin = `
+          JOIN deal_hunter_opportunities AS opportunity
+            ON opportunity.opportunity_id = scores.opportunity_id
+           AND opportunity.status = 'active'
           LEFT JOIN deal_hunter_dispositions AS disposition
             ON disposition.deal_key = scores.deal_key AND disposition.disposition = 'dismissed'
         `;
@@ -5949,10 +6986,348 @@ export function createSqliteStorage(config) {
 	      return this.getDealHunterCrmImport({ id });
 	    },
 
+    async inspectDealHunterCanonicalOpportunityMerge({ approval, actor = '', reason = '' } = {}) {
+      return inspectCanonicalOpportunityMerge(database, { approval, actor, reason });
+    },
+
+    async verifyDealHunterCanonicalOpportunityMergeBackupPlan({
+      approval,
+      actor = '',
+      reason = '',
+      backupEvidence = null,
+      expectedPlanChecksum = '',
+    } = {}) {
+      const checkedApproval = checkedCanonicalOpportunityMergeApproval(approval);
+      try {
+        const bundlePath = fs.realpathSync(path.resolve(String(backupEvidence?.path || '')));
+        const relativePath = String(backupEvidence?.databaseRelativePath || '');
+        const resolvedDatabasePath = path.resolve(bundlePath, relativePath);
+        if (!resolvedDatabasePath.startsWith(`${bundlePath}${path.sep}`)) {
+          throw new Error('database snapshot resolves outside the verified bundle');
+        }
+        const databasePath = fs.realpathSync(resolvedDatabasePath);
+        if (!databasePath.startsWith(`${bundlePath}${path.sep}`)) {
+          throw new Error('database snapshot escapes the verified bundle through a symbolic link');
+        }
+        const snapshotStat = fs.statSync(databasePath);
+        if (!snapshotStat.isFile() || snapshotStat.size !== backupEvidence?.databaseSizeBytes) {
+          throw new Error('database snapshot size no longer matches verified evidence');
+        }
+        const snapshotDigest = await sha256CanonicalMergeFile(databasePath);
+        const snapshotStatAfterHash = fs.statSync(databasePath);
+        if (
+          snapshotDigest !== backupEvidence?.databaseSha256
+          || snapshotStatAfterHash.dev !== snapshotStat.dev
+          || snapshotStatAfterHash.ino !== snapshotStat.ino
+          || snapshotStatAfterHash.size !== snapshotStat.size
+          || snapshotStatAfterHash.mtimeMs !== snapshotStat.mtimeMs
+        ) {
+          throw new Error('database snapshot checksum changed after backup verification');
+        }
+        const sidecarSuffixes = ['-wal', '-shm', '-journal'];
+        const unexpectedSidecars = sidecarSuffixes.filter((suffix) => fs.existsSync(`${databasePath}${suffix}`));
+        if (unexpectedSidecars.length > 0) {
+          throw new Error(`verified database snapshot has unverified SQLite sidecars: ${unexpectedSidecars.join(', ')}`);
+        }
+        const snapshotBuffer = fs.readFileSync(databasePath);
+        const snapshotStatAfterRead = fs.statSync(databasePath);
+        if (
+          createHash('sha256').update(snapshotBuffer).digest('hex') !== backupEvidence.databaseSha256
+          || snapshotStatAfterRead.dev !== snapshotStat.dev
+          || snapshotStatAfterRead.ino !== snapshotStat.ino
+          || snapshotStatAfterRead.size !== snapshotStat.size
+          || snapshotStatAfterRead.mtimeMs !== snapshotStat.mtimeMs
+          || sidecarSuffixes.some((suffix) => fs.existsSync(`${databasePath}${suffix}`))
+        ) {
+          throw new Error('database snapshot changed while loading verified in-memory evidence');
+        }
+        const inMemorySnapshot = Buffer.from(snapshotBuffer);
+        inMemorySnapshot[18] = 1;
+        inMemorySnapshot[19] = 1;
+        const backupDatabase = new Database(inMemorySnapshot);
+        try {
+          backupDatabase.pragma('query_only = ON');
+          assertCanonicalOpportunityMergeSqliteSchema(backupDatabase);
+          const quickCheck = String(backupDatabase.pragma('quick_check', { simple: true }) || '');
+          if (quickCheck !== 'ok') throw new Error(`SQLite quick_check returned ${quickCheck || 'no result'}`);
+          const backupPause = backupDatabase.prepare(`
+            SELECT updated_at, outreach_paused
+            FROM deal_hunter_cim_safety_settings WHERE id = 'global' LIMIT 1
+          `).get();
+          if (!backupPause || Number(backupPause.outreach_paused) !== 1 || !Number.isFinite(Date.parse(backupPause.updated_at))) {
+            throw new Error('database snapshot does not contain an active global CIM outreach pause');
+          }
+          const inspection = inspectCanonicalOpportunityMergeState(backupDatabase, checkedApproval);
+          const plan = buildCanonicalOpportunityMergePlan({
+            approval: checkedApproval,
+            inspection,
+            actor,
+            reason,
+          });
+          if (plan.planChecksum !== expectedPlanChecksum) {
+            throw new Error('database snapshot plan checksum differs from the reviewed plan');
+          }
+          return { planChecksum: plan.planChecksum, pauseUpdatedAt: backupPause.updated_at };
+        } finally {
+          backupDatabase.close();
+        }
+      } catch (error) {
+        throw new Error(`Apply refused: verified SQLite backup does not reproduce the reviewed pre-merge plan: ${error.message}`);
+      }
+    },
+
+    async applyDealHunterCanonicalOpportunityMerge({
+      approval,
+      actor = '',
+      reason = '',
+      confirmation = '',
+      expectedPlanChecksum = '',
+      backupEvidence = null,
+      nowIso = '',
+    } = {}) {
+      const checkedApproval = checkedCanonicalOpportunityMergeApproval(approval);
+      if (confirmation !== CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION) {
+        throw new Error('Canonical opportunity merge transaction requires the exact confirmation phrase.');
+      }
+      if (!/^[a-f0-9]{64}$/.test(String(expectedPlanChecksum || ''))) {
+        throw new Error('Canonical opportunity merge transaction requires an exact plan checksum.');
+      }
+      if (
+        backupEvidence?.provider !== 'sqlite'
+        || !String(backupEvidence.path || '').trim()
+        || !/^[a-f0-9]{64}$/.test(String(backupEvidence.databaseSha256 || ''))
+        || backupEvidence.reviewedPlanChecksum !== expectedPlanChecksum
+        || !Number.isFinite(Date.parse(backupEvidence.pauseUpdatedAt))
+      ) {
+        throw new Error('Canonical opportunity merge transaction requires verified SQLite backup evidence.');
+      }
+      if (!Number.isFinite(Date.parse(nowIso))) {
+        throw new Error('Canonical opportunity merge transaction requires a valid audit timestamp.');
+      }
+      const transaction = database.transaction(() => {
+        assertCanonicalOpportunityMergeSqliteSchema(database);
+        const pause = database.prepare(`
+          SELECT * FROM deal_hunter_cim_safety_settings WHERE id = 'global' LIMIT 1
+        `).get();
+        if (!pause || Number(pause.outreach_paused) !== 1) {
+          throw new Error('Apply refused: global Deal Hunter CIM outreach must already be paused.');
+        }
+        if (pause.updated_at !== backupEvidence.pauseUpdatedAt) {
+          throw new Error('Apply refused: the verified backup does not contain the active outreach-pause epoch.');
+        }
+        const manifestId = canonicalOpportunityMergeManifestId(checkedApproval);
+        const existingManifest = normalizeDealHunterRepairManifestRow(database.prepare(`
+          SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ? LIMIT 1
+        `).get(manifestId));
+        if (existingManifest) {
+          const replay = validateCanonicalOpportunityMergeReplayManifest({
+            approval: checkedApproval,
+            manifest: existingManifest,
+            actor,
+            reason,
+            expectedPlanChecksum,
+          });
+          const finalState = validateCanonicalMergeFinalState(database, {
+            approval: checkedApproval,
+            actor: replay.actor,
+            reason: replay.reason,
+            planChecksum: replay.planChecksum,
+            manifestId: replay.manifestId,
+          });
+          return {
+            ok: true,
+            mode: 'apply',
+            applied: false,
+            alreadyApplied: true,
+            planChecksum: replay.planChecksum,
+            movedAliasCount: 0,
+            manifestId: replay.manifestId,
+            manifest: finalState.manifest,
+            finalState,
+          };
+        }
+
+        const inspection = inspectCanonicalOpportunityMergeState(database, checkedApproval);
+        const planned = buildCanonicalOpportunityMergePlan({
+          approval: checkedApproval,
+          inspection,
+          actor,
+          reason,
+        });
+        if (planned.planChecksum !== expectedPlanChecksum) {
+          throw new Error('Apply refused: the dry-run plan checksum is stale or does not match current state.');
+        }
+
+        for (const move of planned.plan.aliasMoves) {
+          const result = database.prepare(`
+            UPDATE deal_hunter_opportunity_aliases
+            SET opportunity_id = ?
+            WHERE alias_key = ?
+              AND alias_type = ?
+              AND alias_value = ?
+              AND opportunity_id = ?
+          `).run(
+            checkedApproval.survivorId,
+            move.aliasKey,
+            move.aliasType,
+            move.aliasValue,
+            checkedApproval.supersededId,
+          );
+          if (result.changes !== 1) {
+            throw new Error(`Canonical opportunity merge alias changed after planning: ${move.aliasKey}.`);
+          }
+        }
+
+        assertCanonicalMergeAliasPostconditions(database, checkedApproval);
+
+        const supersededBefore = planned.plan.opportunities.superseded;
+        const supersededMetadata = {
+          ...(supersededBefore.metadata || {}),
+          canonicalOpportunityMerge: {
+            repairType: CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE,
+            schemaVersion: 1,
+            mergedInto: checkedApproval.survivorId,
+            supersededOpportunityId: checkedApproval.supersededId,
+            exceptionId: checkedApproval.exceptionId,
+            actor: planned.actor,
+            reason: planned.reason,
+            planChecksum: planned.planChecksum,
+            supersededAt: nowIso,
+          },
+        };
+        const supersededUpdate = database.prepare(`
+          UPDATE deal_hunter_opportunities
+          SET status = 'superseded', updated_at = ?, metadata = ?
+          WHERE opportunity_id = ? AND status = 'active' AND updated_at = ?
+        `).run(
+          nowIso,
+          JSON.stringify(supersededMetadata),
+          checkedApproval.supersededId,
+          supersededBefore.updated_at,
+        );
+        if (supersededUpdate.changes !== 1) {
+          throw new Error('Canonical opportunity merge loser changed before supersession.');
+        }
+
+        const exceptionBefore = planned.plan.identityException;
+        const exceptionMetadata = {
+          ...(exceptionBefore.metadata || {}),
+          canonicalOpportunityMerge: {
+            repairType: CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE,
+            schemaVersion: 1,
+            decision: 'merge',
+            survivorId: checkedApproval.survivorId,
+            supersededId: checkedApproval.supersededId,
+            planChecksum: planned.planChecksum,
+          },
+        };
+        const exceptionUpdate = database.prepare(`
+          UPDATE deal_hunter_identity_exceptions
+          SET updated_at = ?, status = 'resolved', resolved_at = ?, resolved_by = ?,
+              resolution_reason = ?, metadata = ?
+          WHERE id = ? AND status = 'open' AND updated_at = ?
+            AND resolved_at IS NULL AND resolved_by IS NULL AND resolution_reason IS NULL
+        `).run(
+          nowIso,
+          nowIso,
+          planned.actor,
+          planned.reason,
+          JSON.stringify(exceptionMetadata),
+          checkedApproval.exceptionId,
+          exceptionBefore.updated_at,
+        );
+        if (exceptionUpdate.changes !== 1) {
+          throw new Error('Canonical opportunity merge exception changed before resolution.');
+        }
+
+        const manifestRecord = {
+          id: planned.manifestId,
+          created_at: nowIso,
+          updated_at: nowIso,
+          mode: CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE,
+          status: 'applied',
+          actor: planned.actor,
+          backup_reference: backupEvidence.path,
+          checksum: planned.planChecksum,
+          manifest: {
+            repairType: CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE,
+            manifestSchema: CANONICAL_OPPORTUNITY_MERGE_MANIFEST_SCHEMA,
+            approvalSchema: checkedApproval.approvalSchema,
+            approvalTuple: planned.plan.approvalTuple,
+            planChecksum: planned.planChecksum,
+            actor: planned.actor,
+            reason: planned.reason,
+            appliedAt: nowIso,
+            aliasMoves: planned.plan.aliasMoves,
+            backupEvidence,
+            plan: planned.plan,
+          },
+          metadata: {
+            repairType: CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE,
+            manifestSchema: CANONICAL_OPPORTUNITY_MERGE_MANIFEST_SCHEMA,
+            approvalSchema: checkedApproval.approvalSchema,
+            exceptionId: checkedApproval.exceptionId,
+            survivorId: checkedApproval.survivorId,
+            supersededId: checkedApproval.supersededId,
+            planChecksum: planned.planChecksum,
+          },
+        };
+        const manifestInsert = database.prepare(`
+          INSERT INTO deal_hunter_cim_repair_manifests (
+            id, created_at, updated_at, mode, status, actor,
+            backup_reference, checksum, manifest, metadata
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          manifestRecord.id,
+          manifestRecord.created_at,
+          manifestRecord.updated_at,
+          manifestRecord.mode,
+          manifestRecord.status,
+          manifestRecord.actor,
+          manifestRecord.backup_reference,
+          manifestRecord.checksum,
+          JSON.stringify(manifestRecord.manifest),
+          JSON.stringify(manifestRecord.metadata),
+        );
+        if (manifestInsert.changes !== 1) {
+          throw new Error('Canonical opportunity merge manifest was not inserted exactly once.');
+        }
+
+        const finalState = validateCanonicalMergeFinalState(database, {
+          approval: checkedApproval,
+          actor: planned.actor,
+          reason: planned.reason,
+          planChecksum: planned.planChecksum,
+          manifestId: planned.manifestId,
+        });
+        return {
+          ok: true,
+          mode: 'apply',
+          applied: true,
+          alreadyApplied: false,
+          planChecksum: planned.planChecksum,
+          movedAliasCount: planned.plan.aliasMoves.length,
+          manifestId: planned.manifestId,
+          manifest: finalState.manifest,
+          finalState,
+        };
+      });
+      return transaction.immediate();
+    },
+
     async getDealHunterOpportunity(opportunityId) {
       if (!opportunityId) return null;
       return normalizeDealHunterOpportunityRow(database.prepare(`
         SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+      `).get(String(opportunityId).trim()));
+    },
+
+    async getCurrentDealHunterOpportunity(opportunityId) {
+      if (!opportunityId) return null;
+      return normalizeDealHunterOpportunityRow(database.prepare(`
+        SELECT * FROM deal_hunter_opportunities
+        WHERE opportunity_id = ? AND status = 'active'
+        LIMIT 1
       `).get(String(opportunityId).trim()));
     },
 
@@ -5978,10 +7353,33 @@ export function createSqliteStorage(config) {
       `).all(...params, safeLimit).map(normalizeDealHunterOpportunityRow);
     },
 
+    async listCurrentDealHunterOpportunities({ opportunityIds = [], recipientEmails = [], limit = 1000 } = {}) {
+      const ids = normalizeList(opportunityIds);
+      const recipients = normalizeList(recipientEmails).map((value) => value.toLowerCase());
+      const safeLimit = Math.max(1, Math.min(Number(limit) || 1000, 100000));
+      const clauses = ["status = 'active'"];
+      const params = [];
+      if (ids.length > 0) {
+        clauses.push(`opportunity_id IN (${placeholders(ids.length)})`);
+        params.push(...ids);
+      }
+      if (recipients.length > 0) {
+        clauses.push(`LOWER(canonical_recipient) IN (${placeholders(recipients.length)})`);
+        params.push(...recipients);
+      }
+      return database.prepare(`
+        SELECT * FROM deal_hunter_opportunities
+        WHERE ${clauses.join(' AND ')}
+        ORDER BY updated_at DESC, opportunity_id
+        LIMIT ?
+      `).all(...params, safeLimit).map(normalizeDealHunterOpportunityRow);
+    },
+
     async listCimStage2IdentityOpportunities({ limit = 5000 } = {}) {
       return database.prepare(`
         SELECT opportunity_id, primary_submission_id
         FROM deal_hunter_opportunities
+        WHERE status = 'active'
         ORDER BY updated_at DESC, opportunity_id
         LIMIT ?
       `).all(Math.max(1, Math.min(Number(limit) || 5000, 100000)));
@@ -5989,29 +7387,230 @@ export function createSqliteStorage(config) {
 
     async listCimStage2EvidenceAliases({ limit = 10000 } = {}) {
       return database.prepare(`
-        SELECT alias_type, alias_value, opportunity_id
-        FROM deal_hunter_opportunity_aliases
-        ORDER BY last_observed_at DESC, alias_key
+        SELECT alias.alias_type, alias.alias_value, alias.opportunity_id
+        FROM deal_hunter_opportunity_aliases AS alias
+        JOIN deal_hunter_opportunities AS opportunity
+          ON opportunity.opportunity_id = alias.opportunity_id
+         AND opportunity.status = 'active'
+        ORDER BY alias.last_observed_at DESC, alias.alias_key
         LIMIT ?
       `).all(Math.max(1, Math.min(Number(limit) || 10000, 100000)));
     },
 
     async findDealHunterOpportunityByAliases(aliasKeys = []) {
-      const keys = normalizeList(aliasKeys);
-      if (keys.length === 0) return null;
-      const rows = database.prepare(`
-        SELECT opportunity.*
-        FROM deal_hunter_opportunity_aliases AS alias
-        JOIN deal_hunter_opportunities AS opportunity
-          ON opportunity.opportunity_id = alias.opportunity_id
-        WHERE alias.alias_key IN (${placeholders(keys.length)})
-        ORDER BY alias.last_observed_at DESC, opportunity.opportunity_id
-        LIMIT 2
-      `).all(...keys);
-      if (new Set(rows.map((row) => row.opportunity_id)).size > 1) {
-        throw new Error('Conflicting Deal Hunter opportunity aliases require review.');
+      const owners = completeCanonicalAliasOwners(database, aliasKeys);
+      if (owners.length > 1) {
+        throw canonicalAliasOwnershipError(
+          'DEAL_HUNTER_OPPORTUNITY_ALIAS_CONFLICT',
+          'Conflicting Deal Hunter opportunity aliases require review.',
+          owners.map((owner) => owner.opportunity_id),
+        );
       }
-      return normalizeDealHunterOpportunityRow(rows[0]);
+      return owners[0] || null;
+    },
+
+    async findCurrentDealHunterOpportunityByAliases(aliasKeys = []) {
+      const owners = completeCanonicalAliasOwners(database, aliasKeys);
+      if (owners.length > 1) {
+        throw canonicalAliasOwnershipError(
+          'DEAL_HUNTER_OPPORTUNITY_ALIAS_CONFLICT',
+          'Conflicting Deal Hunter opportunity aliases require review.',
+          owners.map((owner) => owner.opportunity_id),
+        );
+      }
+      if (owners[0] && owners[0].status !== 'active') {
+        const error = new Error('Deal Hunter opportunity alias belongs to a non-current canonical opportunity.');
+        error.code = 'DEAL_HUNTER_OPPORTUNITY_NOT_CURRENT';
+        error.opportunityId = owners[0].opportunity_id;
+        throw error;
+      }
+      return owners[0] || null;
+    },
+
+    async createDealHunterOpportunityWithAliases({
+      opportunity: opportunityRecord = {},
+      aliases: records = [],
+      existingOwnerMode = 'return-current',
+      identityException: identityExceptionRecord = null,
+    } = {}) {
+      const aliases = Array.isArray(records)
+        ? records.filter((record) => record?.alias_key && record?.opportunity_id)
+        : [];
+      if (!opportunityRecord.opportunity_id || opportunityRecord.status !== 'active' || aliases.length === 0) {
+        throw new Error('Atomic canonical opportunity creation requires one active opportunity and at least one alias.');
+      }
+      if (!['return-current', 'conflict'].includes(existingOwnerMode)) {
+        throw new Error('Atomic canonical opportunity creation received an unsupported existing-owner mode.');
+      }
+      const proposedOwnerIds = new Set(aliases.map((record) => record.opportunity_id));
+      if (proposedOwnerIds.size !== 1 || !proposedOwnerIds.has(opportunityRecord.opportunity_id)) {
+        throw new Error('Atomic canonical opportunity aliases must target the proposed opportunity.');
+      }
+      const transaction = database.transaction(() => {
+        let currentIdentityException = null;
+        if (identityExceptionRecord) {
+          currentIdentityException = normalizeDealHunterIdentityExceptionRow(database.prepare(`
+            SELECT * FROM deal_hunter_identity_exceptions WHERE id = ? LIMIT 1
+          `).get(identityExceptionRecord.id));
+          if (
+            !currentIdentityException
+            || currentIdentityException.status !== 'open'
+            || currentIdentityException.resolved_at
+            || currentIdentityException.resolved_by
+            || currentIdentityException.resolution_reason
+          ) {
+            return {
+              created: false,
+              linked: false,
+              conflict: { reason: 'identity-exception-not-open', opportunity_id: '', alias_key: '' },
+              opportunity: null,
+              aliases: [],
+              identityException: currentIdentityException,
+            };
+          }
+        }
+
+        const owners = completeCanonicalAliasOwners(database, aliases.map((record) => record.alias_key));
+        if (owners.length > 1) {
+          return {
+            created: false,
+            linked: false,
+            conflict: {
+              reason: 'conflicting-alias-owners',
+              opportunity_id: owners[0].opportunity_id,
+              opportunity_ids: owners.map((owner) => owner.opportunity_id),
+              alias_key: '',
+            },
+            opportunity: null,
+            aliases: [],
+            identityException: currentIdentityException,
+          };
+        }
+
+        let opportunity = owners[0] || null;
+        let created = false;
+        if (opportunity) {
+          if (opportunity.status !== 'active') {
+            return {
+              created: false,
+              linked: false,
+              conflict: {
+                reason: 'alias-owner-not-current',
+                opportunity_id: opportunity.opportunity_id,
+                alias_key: '',
+              },
+              opportunity,
+              aliases: [],
+              identityException: currentIdentityException,
+            };
+          }
+          if (existingOwnerMode === 'conflict') {
+            return {
+              created: false,
+              linked: false,
+              conflict: {
+                reason: 'alias-owner-exists',
+                opportunity_id: opportunity.opportunity_id,
+                alias_key: '',
+              },
+              opportunity,
+              aliases: [],
+              identityException: currentIdentityException,
+            };
+          }
+        } else {
+          database.prepare(`
+            INSERT INTO deal_hunter_opportunities (
+              opportunity_id, created_at, updated_at, canonical_name, canonical_recipient,
+              canonical_location, primary_submission_id, identity_version, status, metadata
+            ) VALUES (
+              @opportunity_id, @created_at, @updated_at, @canonical_name, @canonical_recipient,
+              @canonical_location, @primary_submission_id, @identity_version, @status, @metadata
+            )
+          `).run({
+            ...opportunityRecord,
+            canonical_recipient: opportunityRecord.canonical_recipient || null,
+            canonical_location: opportunityRecord.canonical_location || null,
+            primary_submission_id: opportunityRecord.primary_submission_id || null,
+            metadata: JSON.stringify(opportunityRecord.metadata || {}),
+          });
+          opportunity = normalizeDealHunterOpportunityRow(database.prepare(`
+            SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+          `).get(opportunityRecord.opportunity_id));
+          created = true;
+        }
+
+        const aliasStatement = database.prepare(`
+          INSERT INTO deal_hunter_opportunity_aliases (
+            id, opportunity_id, alias_type, alias_value, alias_key, source,
+            first_observed_at, last_observed_at, evidence_version, resolution_method,
+            confidence_state, resolved_by, metadata
+          ) VALUES (
+            @id, @opportunity_id, @alias_type, @alias_value, @alias_key, @source,
+            @first_observed_at, @last_observed_at, @evidence_version, @resolution_method,
+            @confidence_state, @resolved_by, @metadata
+          )
+          ON CONFLICT(alias_key) DO UPDATE SET
+            last_observed_at = excluded.last_observed_at,
+            source = COALESCE(excluded.source, deal_hunter_opportunity_aliases.source),
+            metadata = excluded.metadata
+          WHERE deal_hunter_opportunity_aliases.opportunity_id = excluded.opportunity_id
+        `);
+        const linkedAliases = [];
+        for (const record of aliases) {
+          aliasStatement.run({
+            ...record,
+            opportunity_id: opportunity.opportunity_id,
+            source: record.source || null,
+            resolved_by: record.resolved_by || null,
+            metadata: JSON.stringify(record.metadata || {}),
+          });
+          const linkedAlias = normalizeDealHunterOpportunityAliasRow(database.prepare(`
+            SELECT * FROM deal_hunter_opportunity_aliases WHERE alias_key = ? LIMIT 1
+          `).get(record.alias_key));
+          if (linkedAlias?.opportunity_id !== opportunity.opportunity_id) {
+            throw new Error('Atomic canonical opportunity alias acquisition failed its owner postcondition.');
+          }
+          linkedAliases.push(linkedAlias);
+        }
+
+        let resolvedIdentityException = currentIdentityException;
+        if (identityExceptionRecord) {
+          const update = database.prepare(`
+            UPDATE deal_hunter_identity_exceptions
+            SET updated_at = @updated_at,
+                status = @status,
+                resolved_at = @resolved_at,
+                resolved_by = @resolved_by,
+                resolution_reason = @resolution_reason,
+                metadata = @metadata
+            WHERE id = @id
+              AND status = 'open'
+              AND resolved_at IS NULL
+              AND resolved_by IS NULL
+              AND resolution_reason IS NULL
+          `).run({
+            ...identityExceptionRecord,
+            metadata: JSON.stringify(identityExceptionRecord.metadata || {}),
+          });
+          if (update.changes !== 1) {
+            throw new Error('Atomic canonical opportunity creation could not resolve the expected open identity exception.');
+          }
+          resolvedIdentityException = normalizeDealHunterIdentityExceptionRow(database.prepare(`
+            SELECT * FROM deal_hunter_identity_exceptions WHERE id = ? LIMIT 1
+          `).get(identityExceptionRecord.id));
+        }
+
+        return {
+          created,
+          linked: true,
+          conflict: null,
+          opportunity,
+          aliases: linkedAliases,
+          identityException: resolvedIdentityException,
+        };
+      });
+      return transaction.immediate();
     },
 
     async upsertDealHunterOpportunity(record = {}) {
@@ -6032,6 +7631,7 @@ export function createSqliteStorage(config) {
           identity_version = excluded.identity_version,
           status = excluded.status,
           metadata = excluded.metadata
+        WHERE deal_hunter_opportunities.status = 'active'
       `).run({
         ...record,
         canonical_recipient: record.canonical_recipient || null,
@@ -6049,6 +7649,9 @@ export function createSqliteStorage(config) {
           SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
         `).get(opportunityId);
         if (!opportunity) throw new Error('Canonical Deal Hunter opportunity not found.');
+        if (opportunity.status !== 'active') {
+          throw new Error('Canonical Deal Hunter opportunity is superseded or otherwise not current.');
+        }
         if (opportunity.primary_submission_id && opportunity.primary_submission_id !== submissionId) {
           throw new Error('Canonical opportunity already owns another CRM submission.');
         }
@@ -6102,27 +7705,36 @@ export function createSqliteStorage(config) {
     },
 
     async upsertDealHunterOpportunityAlias(record = {}) {
-      database.prepare(`
-        INSERT INTO deal_hunter_opportunity_aliases (
-          id, opportunity_id, alias_type, alias_value, alias_key, source,
-          first_observed_at, last_observed_at, evidence_version, resolution_method,
-          confidence_state, resolved_by, metadata
-        ) VALUES (
-          @id, @opportunity_id, @alias_type, @alias_value, @alias_key, @source,
-          @first_observed_at, @last_observed_at, @evidence_version, @resolution_method,
-          @confidence_state, @resolved_by, @metadata
-        )
-        ON CONFLICT(alias_key) DO UPDATE SET
-          last_observed_at = excluded.last_observed_at,
-          source = COALESCE(excluded.source, deal_hunter_opportunity_aliases.source),
-          metadata = excluded.metadata
-        WHERE deal_hunter_opportunity_aliases.opportunity_id = excluded.opportunity_id
-      `).run({
-        ...record,
-        source: record.source || null,
-        resolved_by: record.resolved_by || null,
-        metadata: JSON.stringify(record.metadata || {}),
+      const transaction = database.transaction(() => {
+        const opportunity = database.prepare(`
+          SELECT status FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+        `).get(record.opportunity_id);
+        if (opportunity?.status !== 'active') {
+          throw new Error('A superseded or otherwise non-current opportunity cannot own a new alias.');
+        }
+        database.prepare(`
+          INSERT INTO deal_hunter_opportunity_aliases (
+            id, opportunity_id, alias_type, alias_value, alias_key, source,
+            first_observed_at, last_observed_at, evidence_version, resolution_method,
+            confidence_state, resolved_by, metadata
+          ) VALUES (
+            @id, @opportunity_id, @alias_type, @alias_value, @alias_key, @source,
+            @first_observed_at, @last_observed_at, @evidence_version, @resolution_method,
+            @confidence_state, @resolved_by, @metadata
+          )
+          ON CONFLICT(alias_key) DO UPDATE SET
+            last_observed_at = excluded.last_observed_at,
+            source = COALESCE(excluded.source, deal_hunter_opportunity_aliases.source),
+            metadata = excluded.metadata
+          WHERE deal_hunter_opportunity_aliases.opportunity_id = excluded.opportunity_id
+        `).run({
+          ...record,
+          source: record.source || null,
+          resolved_by: record.resolved_by || null,
+          metadata: JSON.stringify(record.metadata || {}),
+        });
       });
+      transaction.immediate();
       return normalizeDealHunterOpportunityAliasRow(database.prepare(`
         SELECT * FROM deal_hunter_opportunity_aliases WHERE alias_key = ? LIMIT 1
       `).get(record.alias_key));
@@ -6134,6 +7746,13 @@ export function createSqliteStorage(config) {
       const opportunityIds = new Set(aliases.map((record) => record.opportunity_id));
       if (opportunityIds.size !== 1) throw new Error('A canonical alias batch must target exactly one opportunity.');
       const transaction = database.transaction(() => {
+        const targetOpportunityId = [...opportunityIds][0];
+        const opportunity = database.prepare(`
+          SELECT status FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+        `).get(targetOpportunityId);
+        if (opportunity?.status !== 'active') {
+          throw new Error('A superseded or otherwise non-current opportunity cannot own new aliases.');
+        }
         for (const record of aliases) {
           const owner = database.prepare(`
             SELECT * FROM deal_hunter_opportunity_aliases WHERE alias_key = ? LIMIT 1
@@ -6238,6 +7857,12 @@ export function createSqliteStorage(config) {
     async claimDealHunterCimOpportunity({ opportunityId = '', requestId = '', recipientEmail = '', allowedRequestIds = [], nowIso = '', metadata = {} } = {}) {
       if (!opportunityId || !requestId || !recipientEmail || !nowIso) return { claimed: false, reason: 'invalid-claim', claim: null };
       const transaction = database.transaction(() => {
+        const opportunity = database.prepare(`
+          SELECT status FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+        `).get(opportunityId);
+        if (opportunity?.status !== 'active') {
+          return { claimed: false, reason: 'opportunity-not-current', claim: null };
+        }
         const existing = database.prepare(`
           SELECT * FROM deal_hunter_cim_opportunity_claims WHERE opportunity_id = ? LIMIT 1
         `).get(opportunityId);
@@ -6274,6 +7899,12 @@ export function createSqliteStorage(config) {
       if (!recipientEmail || !requestId || !opportunityId || !nowIso || !expiresAt) return { claimed: false, reason: 'invalid-claim' };
       const recipient = String(recipientEmail).trim().toLowerCase();
       const transaction = database.transaction(() => {
+        const opportunity = database.prepare(`
+          SELECT status FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+        `).get(opportunityId);
+        if (opportunity?.status !== 'active') {
+          return { claimed: false, reason: 'opportunity-not-current', claim: null };
+        }
         const existing = database.prepare(`SELECT * FROM deal_hunter_cim_recipient_claims WHERE recipient_email = ? LIMIT 1`).get(recipient);
         if (existing && existing.request_id !== requestId && Date.parse(existing.expires_at) > Date.parse(nowIso)) {
           return { claimed: false, reason: 'recipient-send-in-progress', claim: { ...existing, metadata: parseJsonColumn(existing.metadata, {}) } };
@@ -6301,28 +7932,51 @@ export function createSqliteStorage(config) {
     },
 
     async upsertDealHunterCimRecipientOverride(record = {}) {
-      database.prepare(`
-        INSERT INTO deal_hunter_cim_recipient_overrides (
-          id, opportunity_id, recipient_email, created_at, expires_at, consumed_at, created_by, reason, metadata
-        ) VALUES (
-          @id, @opportunity_id, @recipient_email, @created_at, @expires_at, @consumed_at, @created_by, @reason, @metadata
-        )
-        ON CONFLICT(id) DO UPDATE SET
-          expires_at = excluded.expires_at,
-          consumed_at = excluded.consumed_at,
-          reason = excluded.reason,
-          metadata = excluded.metadata
-      `).run({ ...record, recipient_email: String(record.recipient_email || '').toLowerCase(), consumed_at: record.consumed_at || null, metadata: JSON.stringify(record.metadata || {}) });
+      const transaction = database.transaction(() => {
+        const existing = database.prepare(`
+          SELECT opportunity_id
+          FROM deal_hunter_cim_recipient_overrides
+          WHERE id = ?
+          LIMIT 1
+        `).get(record.id);
+        if (existing && existing.opportunity_id !== record.opportunity_id) {
+          throw new Error('CIM recipient override ID already belongs to another canonical opportunity.');
+        }
+        const opportunity = database.prepare(`
+          SELECT status FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+        `).get(record.opportunity_id);
+        if (opportunity?.status !== 'active') {
+          throw new Error('A superseded or otherwise non-current opportunity cannot receive CIM authority.');
+        }
+        database.prepare(`
+          INSERT INTO deal_hunter_cim_recipient_overrides (
+            id, opportunity_id, recipient_email, created_at, expires_at, consumed_at, created_by, reason, metadata
+          ) VALUES (
+            @id, @opportunity_id, @recipient_email, @created_at, @expires_at, @consumed_at, @created_by, @reason, @metadata
+          )
+          ON CONFLICT(id) DO UPDATE SET
+            expires_at = excluded.expires_at,
+            consumed_at = excluded.consumed_at,
+            reason = excluded.reason,
+            metadata = excluded.metadata
+          WHERE deal_hunter_cim_recipient_overrides.opportunity_id = excluded.opportunity_id
+        `).run({ ...record, recipient_email: String(record.recipient_email || '').toLowerCase(), consumed_at: record.consumed_at || null, metadata: JSON.stringify(record.metadata || {}) });
+      });
+      transaction.immediate();
       const row = database.prepare(`SELECT * FROM deal_hunter_cim_recipient_overrides WHERE id = ? LIMIT 1`).get(record.id);
       return row ? { ...row, metadata: parseJsonColumn(row.metadata, {}) } : null;
     },
 
     async getActiveDealHunterCimRecipientOverride({ opportunityId = '', recipientEmail = '', nowIso = '' } = {}) {
       const row = database.prepare(`
-        SELECT * FROM deal_hunter_cim_recipient_overrides
-        WHERE opportunity_id = ? AND LOWER(recipient_email) = ?
-          AND consumed_at IS NULL AND expires_at > ?
-        ORDER BY created_at DESC LIMIT 1
+        SELECT override.*
+        FROM deal_hunter_cim_recipient_overrides AS override
+        JOIN deal_hunter_opportunities AS opportunity
+          ON opportunity.opportunity_id = override.opportunity_id
+         AND opportunity.status = 'active'
+        WHERE override.opportunity_id = ? AND LOWER(override.recipient_email) = ?
+          AND override.consumed_at IS NULL AND override.expires_at > ?
+        ORDER BY override.created_at DESC LIMIT 1
       `).get(opportunityId, String(recipientEmail).toLowerCase(), nowIso);
       return row ? { ...row, metadata: parseJsonColumn(row.metadata, {}) } : null;
     },

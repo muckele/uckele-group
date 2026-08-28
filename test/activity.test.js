@@ -211,9 +211,8 @@ test('Supabase sends primary mutations and activity through one transactional RP
   });
 
   assert.deepEqual(calls, [{
-    name: 'mutate_with_crm_activity',
+    name: 'insert_submission_with_crm_activity',
     parameters: {
-      p_operation: 'insert_submission',
       p_payload: { submission: inputSubmission },
       p_activity: inputActivity,
     },
