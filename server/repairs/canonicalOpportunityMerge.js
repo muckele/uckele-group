@@ -34,6 +34,11 @@ export const CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_ENFORCEMENTS = deeplyFreez
   EXPLICIT_EXCLUSION: 'explicit-exclusion',
 });
 
+export const CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_SCHEMA_PRESENCE = deeplyFreeze({
+  REQUIRED: 'required',
+  OPTIONAL_LEGACY: 'optional-legacy',
+});
+
 export const CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INDEPENDENT_GATES = deeplyFreeze({
   AUTOMATION_INERT_POLICY_STATE_VERIFICATION: {
     id: 'automation-inert-policy-state-verification',
@@ -91,6 +96,7 @@ function relationshipEntries({
     return '';
   })(),
   gateId = null,
+  schemaPresence = CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_SCHEMA_PRESENCE.REQUIRED,
 }) {
   return columns.map((column) => ({
     table,
@@ -101,6 +107,7 @@ function relationshipEntries({
     authorityEffect,
     enforcement,
     gateId,
+    schemaPresence,
   }));
 }
 
@@ -118,6 +125,16 @@ const automationSettingsIndependentGateReason =
   'Global automation settings are preserved out of band and never reparented; merge safety is enforced by the named automation-inert policy/state gate.';
 const cimSafetySettingsIndependentGateReason =
   'Global CIM safety settings are preserved out of band and never reparented; apply safety is enforced by the persisted outreach-pause gate and pause-epoch revalidation.';
+const legacyAdminAuthenticationExclusionReason =
+  'The preserved legacy magic-link email is authentication audit identity only; it cannot establish acquisition identity and no merge mutation reads or rewrites it.';
+const legacyCandidateSourceUrlBlockingReason =
+  'A legacy Deal Hunter candidate source URL was durable acquisition identity; the candidate scanner compares its canonical listing identity with the approved listing evidence and requires zero matching rows.';
+const legacyCandidateRunRedundancyReason =
+  'The legacy candidate run ID identifies only the acquisition run that owns a candidate; whenever that candidate can matter, its row is already selected by the normalized source-URL scanner.';
+const linkedProspectSubmissionBlockingReason =
+  'A retired prospect discovery can join current CRM state only through submission_id; the linked CRM state scanner selects that discovery whenever its submission is related to the approved canonical pair.';
+const linkedProspectParentRedundancyReason =
+  'Retired prospect discovery run, provider-source, and website identity cannot independently establish Deal Hunter canonical authority; any CRM-relevant row is already selected through its submission_id by the linked CRM state scanner.';
 
 const relationshipInventoryEntries = [
   ...relationshipEntries({
@@ -133,6 +150,14 @@ const relationshipInventoryEntries = [
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED,
     scannerPath: 'excluded.adminAuthentication',
     reason: excludedRelationshipReason,
+  }),
+  ...relationshipEntries({
+    table: 'admin_magic_links_legacy_v1',
+    columns: ['email'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED,
+    scannerPath: 'excluded.adminAuthentication',
+    reason: legacyAdminAuthenticationExclusionReason,
+    schemaPresence: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_SCHEMA_PRESENCE.OPTIONAL_LEGACY,
   }),
   ...relationshipEntries({
     table: 'admin_onboarding_progress',
@@ -236,6 +261,22 @@ const relationshipInventoryEntries = [
     enforcement: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_ENFORCEMENTS.INDEPENDENT_GATE,
     gateId: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INDEPENDENT_GATES
       .AUTOMATION_INERT_POLICY_STATE_VERIFICATION.id,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_candidates',
+    columns: ['source_url'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.legacyDealHunterCandidates',
+    reason: legacyCandidateSourceUrlBlockingReason,
+    schemaPresence: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_SCHEMA_PRESENCE.OPTIONAL_LEGACY,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_candidates',
+    columns: ['run_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+    scannerPath: 'dependentState.records.legacyDealHunterCandidates',
+    reason: legacyCandidateRunRedundancyReason,
+    schemaPresence: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_SCHEMA_PRESENCE.OPTIONAL_LEGACY,
   }),
   ...relationshipEntries({
     table: 'deal_hunter_cim_opportunity_claims',
@@ -488,6 +529,22 @@ const relationshipInventoryEntries = [
     authorityEffect: 'restrictive',
   }),
   ...relationshipEntries({
+    table: 'prospect_discoveries',
+    columns: ['submission_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.linkedCrmState',
+    reason: linkedProspectSubmissionBlockingReason,
+    schemaPresence: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_SCHEMA_PRESENCE.OPTIONAL_LEGACY,
+  }),
+  ...relationshipEntries({
+    table: 'prospect_discoveries',
+    columns: ['run_id', 'source_id', 'website_url'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+    scannerPath: 'dependentState.records.linkedCrmState',
+    reason: linkedProspectParentRedundancyReason,
+    schemaPresence: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_SCHEMA_PRESENCE.OPTIONAL_LEGACY,
+  }),
+  ...relationshipEntries({
     table: 'scheduled_job_runs',
     columns: ['metadata'],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
@@ -571,6 +628,28 @@ export const CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY = deeplyFreeze({
   entries: relationshipInventoryEntries,
 });
 
+export function canonicalOpportunityMergeRelationshipSchemaPresenceByTable(
+  entries = CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries,
+) {
+  if (!Array.isArray(entries)) {
+    throw new Error('Canonical opportunity merge relationship inventory entries must be an array.');
+  }
+  const allowed = new Set(Object.values(CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_SCHEMA_PRESENCE));
+  const presenceByTable = new Map();
+  for (const entry of entries) {
+    const label = `${entry?.table || 'unknown'}.${entry?.column || 'unknown'}`;
+    if (!allowed.has(entry?.schemaPresence)) {
+      throw new Error(`Canonical opportunity merge relationship inventory schema presence is missing or invalid for ${label}.`);
+    }
+    const existing = presenceByTable.get(entry.table);
+    if (existing && existing !== entry.schemaPresence) {
+      throw new Error(`Canonical opportunity merge relationship inventory has conflicting schema presence for ${entry.table}.`);
+    }
+    presenceByTable.set(entry.table, entry.schemaPresence);
+  }
+  return presenceByTable;
+}
+
 function objectPathExists(value, objectPath) {
   let current = value;
   for (const part of String(objectPath || '').split('.').filter(Boolean)) {
@@ -593,6 +672,7 @@ export function validateCanonicalOpportunityMergeRelationshipInventory({
   if (!Array.isArray(entries)) {
     throw new Error('Canonical opportunity merge relationship inventory entries must be an array.');
   }
+  canonicalOpportunityMergeRelationshipSchemaPresenceByTable(entries);
   const knownIndependentGateIds = new Set(
     Object.values(CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INDEPENDENT_GATES)
       .map((gate) => gate.id),
