@@ -14,11 +14,17 @@ import {
   CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY,
   canonicalOpportunityMergeManifestId,
   canonicalOpportunityMergePlanChecksum,
+  canonicalOpportunityMergeRelationshipInventorySummary,
   getCanonicalOpportunityMergeApproval,
+  isCanonicalOpportunityMergeRelationshipColumn,
+  stableCanonicalJson,
 } from '../server/repairs/canonicalOpportunityMerge.js';
 import { runCanonicalOpportunityMergeRepair } from '../server/services/canonicalOpportunityMergeRepair.js';
 import { resolveDealHunterOpportunity } from '../server/services/cimOpportunityIdentity.js';
-import { createSqliteStorage } from '../server/storage/sqlite.js';
+import {
+  createSqliteCanonicalOpportunityMergeReadOnlyStorage,
+  createSqliteStorage,
+} from '../server/storage/sqlite.js';
 import {
   parseCanonicalOpportunityMergeArgs,
   runCanonicalOpportunityMergeCli,
@@ -33,6 +39,48 @@ const approvalPreconditionEnforcement = 'approval-precondition';
 const explicitExclusionEnforcement = 'explicit-exclusion';
 const automationInertGate = 'automation-inert-policy-state-verification';
 const persistedOutreachPauseGate = 'persisted-global-cim-outreach-pause';
+const optionalLegacySchemaPresence = 'optional-legacy';
+const productionDerivedLegacySchema = fs.readFileSync(
+  new URL('./fixtures/production-derived-legacy-relationship-schema.sql', import.meta.url),
+  'utf8',
+);
+const productionOnlyRelationshipClassifications = {
+  'admin_magic_links_legacy_v1.email': {
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED,
+    enforcement: explicitExclusionEnforcement,
+    scannerPath: 'excluded.adminAuthentication',
+  },
+  'deal_hunter_candidates.run_id': {
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+    enforcement: materialScannerPathEnforcement,
+    scannerPath: 'dependentState.records.legacyDealHunterCandidates',
+  },
+  'deal_hunter_candidates.source_url': {
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    enforcement: materialScannerPathEnforcement,
+    scannerPath: 'dependentState.records.legacyDealHunterCandidates',
+  },
+  'prospect_discoveries.run_id': {
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+    enforcement: materialScannerPathEnforcement,
+    scannerPath: 'dependentState.records.linkedCrmState',
+  },
+  'prospect_discoveries.source_id': {
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+    enforcement: materialScannerPathEnforcement,
+    scannerPath: 'dependentState.records.linkedCrmState',
+  },
+  'prospect_discoveries.submission_id': {
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    enforcement: materialScannerPathEnforcement,
+    scannerPath: 'dependentState.records.linkedCrmState',
+  },
+  'prospect_discoveries.website_url': {
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+    enforcement: materialScannerPathEnforcement,
+    scannerPath: 'dependentState.records.linkedCrmState',
+  },
+};
 
 const expectedAliases = [
   ['deal-key', 'url:https://us.businessesforsale.com/us/hvac-plumbing-sheet-metal-business-and-real-estate.aspx', supersededId],
@@ -270,6 +318,98 @@ function withRawDatabase(sqlitePath, callback) {
   } finally {
     database.close();
   }
+}
+
+function installProductionDerivedLegacySchema(sqlitePath) {
+  withRawDatabase(sqlitePath, (database) => database.exec(productionDerivedLegacySchema));
+}
+
+async function assertReadOnlyPlanningRefuses(sqlitePath, pattern) {
+  let readOnlyStorage;
+  try {
+    await assert.rejects(async () => {
+      readOnlyStorage = createSqliteCanonicalOpportunityMergeReadOnlyStorage({
+        storage: { provider: 'sqlite', sqlitePath },
+      });
+      await runCanonicalOpportunityMergeRepair(repairInput({ storage: readOnlyStorage }));
+    }, pattern);
+  } finally {
+    readOnlyStorage?.close();
+  }
+}
+
+function sqliteTableColumnMetadata(database, table) {
+  return database.prepare(`
+    SELECT name, hidden FROM pragma_table_xinfo(?) ORDER BY cid
+  `).all(table);
+}
+
+function sqliteRelationshipSchema(database) {
+  const tables = database.prepare(`
+    SELECT name FROM sqlite_master
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    ORDER BY name
+  `).all().map((row) => row.name);
+  const relationshipColumns = tables.flatMap((table) => (
+    sqliteTableColumnMetadata(database, table)
+      .map((row) => row.name)
+      .filter(isCanonicalOpportunityMergeRelationshipColumn)
+      .map((column) => `${table}.${column}`)
+  )).sort();
+  return { tables, relationshipColumns };
+}
+
+function insertLegacyDealHunterCandidate(database, {
+  id,
+  sourceUrl,
+  broker = null,
+  rawText = null,
+} = {}) {
+  database.prepare(`
+    INSERT INTO deal_hunter_candidates (
+      id, run_id, created_at, company, source_url, broker, raw_text,
+      score, recession_score, ai_resistance_score, criteria_score, status
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    'synthetic-legacy-run',
+    fixtureNowIso,
+    'Synthetic legacy candidate',
+    sourceUrl,
+    broker,
+    rawText,
+    80,
+    20,
+    20,
+    40,
+    'qualified',
+  );
+}
+
+function insertRetiredProspectDiscovery(database, {
+  id,
+  submissionId = null,
+  websiteUrl = null,
+  sourceData = {},
+} = {}) {
+  database.prepare(`
+    INSERT INTO prospect_discoveries (
+      id, run_id, created_at, updated_at, provider, source_id,
+      business_name, website_url, status, submission_id, source_data
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    'synthetic-discovery-run',
+    fixtureNowIso,
+    fixtureNowIso,
+    'synthetic-provider',
+    'synthetic-source-id',
+    'Synthetic retired prospect',
+    websiteUrl,
+    'retired',
+    submissionId,
+    JSON.stringify(sourceData),
+  );
 }
 
 function directoryFileSha256(directory) {
@@ -920,6 +1060,324 @@ test('dry run refuses an unclassified future relationship-bearing column', async
   );
 });
 
+test('read-only planning refuses a virtual generated relationship column on a required current table', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  const columns = withRawDatabase(fixture.sqlitePath, (database) => {
+    database.exec(`
+      ALTER TABLE deal_hunter_cim_requests
+      ADD COLUMN future_opportunity_id TEXT
+      GENERATED ALWAYS AS (opportunity_id) VIRTUAL
+    `);
+    return sqliteTableColumnMetadata(database, 'deal_hunter_cim_requests');
+  });
+  assert.deepEqual(columns.find(({ name }) => name === 'opportunity_id'), {
+    name: 'opportunity_id',
+    hidden: 0,
+  });
+  assert.deepEqual(columns.find(({ name }) => name === 'future_opportunity_id'), {
+    name: 'future_opportunity_id',
+    hidden: 2,
+  });
+
+  await assertReadOnlyPlanningRefuses(
+    fixture.sqlitePath,
+    /unsupported SQLite schema.*unclassified relationship schema.*deal_hunter_cim_requests\.future_opportunity_id/i,
+  );
+});
+
+test('read-only planning refuses a virtual generated optional-legacy opportunity relationship on an unlinked row', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  installProductionDerivedLegacySchema(fixture.sqlitePath);
+  const evidence = withRawDatabase(fixture.sqlitePath, (database) => {
+    database.exec(`
+      ALTER TABLE prospect_discoveries
+      ADD COLUMN future_opportunity_id TEXT
+      GENERATED ALWAYS AS (json_extract(source_data, '$.opportunityId')) VIRTUAL
+    `);
+    insertRetiredProspectDiscovery(database, {
+      id: 'unlinked-generated-opportunity-prospect',
+      submissionId: null,
+      websiteUrl: 'https://example.test/unrelated-direct-origination-site',
+      sourceData: { opportunityId: survivorId },
+    });
+    return {
+      columns: sqliteTableColumnMetadata(database, 'prospect_discoveries'),
+      row: database.prepare(`
+        SELECT submission_id, future_opportunity_id
+        FROM prospect_discoveries WHERE id = ?
+      `).get('unlinked-generated-opportunity-prospect'),
+    };
+  });
+  assert.deepEqual(evidence.columns.find(({ name }) => name === 'submission_id'), {
+    name: 'submission_id',
+    hidden: 0,
+  });
+  assert.deepEqual(evidence.columns.find(({ name }) => name === 'future_opportunity_id'), {
+    name: 'future_opportunity_id',
+    hidden: 2,
+  });
+  assert.deepEqual(evidence.row, {
+    submission_id: null,
+    future_opportunity_id: survivorId,
+  });
+
+  await assertReadOnlyPlanningRefuses(
+    fixture.sqlitePath,
+    /unsupported SQLite schema.*unclassified relationship schema.*prospect_discoveries\.future_opportunity_id/i,
+  );
+});
+
+test('read-only planning refuses a stored generated relationship column', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  const evidence = withRawDatabase(fixture.sqlitePath, (database) => {
+    database.exec(`
+      CREATE TABLE admin_magic_links_legacy_v1 (
+        id TEXT PRIMARY KEY,
+        email TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        source_data TEXT NOT NULL DEFAULT '{}',
+        future_opportunity_id TEXT
+          GENERATED ALWAYS AS (json_extract(source_data, '$.opportunityId')) STORED
+      )
+    `);
+    database.prepare(`
+      INSERT INTO admin_magic_links_legacy_v1 (
+        id, email, created_at, expires_at, source_data
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(
+      'stored-generated-relationship',
+      'synthetic@example.test',
+      fixtureNowIso,
+      '2026-08-27T20:00:00.000Z',
+      JSON.stringify({ opportunityId: survivorId }),
+    );
+    return {
+      columns: sqliteTableColumnMetadata(database, 'admin_magic_links_legacy_v1'),
+      value: database.prepare(`
+        SELECT future_opportunity_id FROM admin_magic_links_legacy_v1 WHERE id = ?
+      `).get('stored-generated-relationship').future_opportunity_id,
+    };
+  });
+  assert.deepEqual(evidence.columns.find(({ name }) => name === 'email'), {
+    name: 'email',
+    hidden: 0,
+  });
+  assert.deepEqual(evidence.columns.find(({ name }) => name === 'future_opportunity_id'), {
+    name: 'future_opportunity_id',
+    hidden: 3,
+  });
+  assert.equal(evidence.value, survivorId);
+
+  await assertReadOnlyPlanningRefuses(
+    fixture.sqlitePath,
+    /unsupported SQLite schema.*unclassified relationship schema.*admin_magic_links_legacy_v1\.future_opportunity_id/i,
+  );
+});
+
+test('read-only planning applies relationship classification to hidden virtual-table columns', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  const columns = withRawDatabase(fixture.sqlitePath, (database) => {
+    database.exec('CREATE VIRTUAL TABLE future_relationship_id USING fts5(body)');
+    return sqliteTableColumnMetadata(database, 'future_relationship_id');
+  });
+  assert.deepEqual(columns.find(({ name }) => name === 'body'), {
+    name: 'body',
+    hidden: 0,
+  });
+  assert.deepEqual(columns.find(({ name }) => name === 'future_relationship_id'), {
+    name: 'future_relationship_id',
+    hidden: 1,
+  });
+
+  await assertReadOnlyPlanningRefuses(
+    fixture.sqlitePath,
+    /unsupported SQLite schema.*unclassified relationship schema.*future_relationship_id\.future_relationship_id/i,
+  );
+});
+
+test('sanitized production-derived legacy schema is fully classified without embedding row data', async (t) => {
+  const fixture = repairStorage(t);
+  const before = withRawDatabase(fixture.sqlitePath, sqliteRelationshipSchema);
+  assert.doesNotMatch(productionDerivedLegacySchema, /\b(?:INSERT|REPLACE|UPDATE|DELETE)\b/i);
+  assert.doesNotMatch(
+    productionDerivedLegacySchema,
+    /https?:\/\/|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\bopp_[A-Z0-9_-]+|\/data\//i,
+  );
+
+  installProductionDerivedLegacySchema(fixture.sqlitePath);
+  const after = withRawDatabase(fixture.sqlitePath, sqliteRelationshipSchema);
+  assert.deepEqual(
+    after.tables.filter((table) => !before.tables.includes(table)),
+    [
+      'admin_magic_links_legacy_v1',
+      'deal_hunter_candidates',
+      'deal_hunter_runs',
+      'prospect_discoveries',
+      'prospect_discovery_runs',
+    ],
+  );
+  assert.deepEqual(
+    after.relationshipColumns.filter((column) => !before.relationshipColumns.includes(column)),
+    Object.keys(productionOnlyRelationshipClassifications).sort(),
+  );
+
+  await seedApprovedRepair(fixture.storage);
+  const readOnlyStorage = createSqliteCanonicalOpportunityMergeReadOnlyStorage({
+    storage: { provider: 'sqlite', sqlitePath: fixture.sqlitePath },
+  });
+  let dryRun;
+  try {
+    dryRun = await runCanonicalOpportunityMergeRepair(repairInput({ storage: readOnlyStorage }));
+  } finally {
+    readOnlyStorage.close();
+  }
+  assert.equal(dryRun.plan.planSchema, 'canonical-opportunity-merge-plan-v2');
+  assert.equal(dryRun.plan.dependentState.counts.legacyDealHunterCandidates, 0);
+  assert.deepEqual(dryRun.plan.dependentState.records.legacyDealHunterCandidates, []);
+});
+
+test('optional legacy inventory tables require every classified column when the table exists', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  withRawDatabase(fixture.sqlitePath, (database) => {
+    database.exec(`
+      CREATE TABLE admin_magic_links_legacy_v1 (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        used_at TEXT
+      )
+    `);
+  });
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage })),
+    /unsupported SQLite schema.*missing required repair schema.*admin_magic_links_legacy_v1\.email/i,
+  );
+});
+
+test('optional legacy inventory tables still fail closed on a future relationship-like column', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  installProductionDerivedLegacySchema(fixture.sqlitePath);
+  withRawDatabase(fixture.sqlitePath, (database) => {
+    database.exec('ALTER TABLE prospect_discoveries ADD COLUMN future_opportunity_id TEXT');
+  });
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage })),
+    /unsupported SQLite schema.*unclassified relationship schema.*prospect_discoveries\.future_opportunity_id/i,
+  );
+});
+
+test('legacy candidate scanner uses canonical listing identities and returns only bounded identifiers and a count', async (t) => {
+  const fixture = repairStorage(t);
+  installProductionDerivedLegacySchema(fixture.sqlitePath);
+  const privateBroker = 'private-broker-sentinel@example.test';
+  const privateSourceText = 'private source payload sentinel';
+  withRawDatabase(fixture.sqlitePath, (database) => {
+    for (let index = 0; index < 60; index += 1) {
+      insertLegacyDealHunterCandidate(database, {
+        id: `synthetic-matching-${String(index).padStart(2, '0')}`,
+        sourceUrl: `https://WWW.BIZBUYSELL.COM/business-opportunity/high-earning-hvac-plumbing-and-sheet-metal-business-and-real-estate/2542991/?utm_source=fixture-${index}#private-fragment`,
+        broker: privateBroker,
+        rawText: privateSourceText,
+      });
+    }
+    insertLegacyDealHunterCandidate(database, {
+      id: 'synthetic-near-match',
+      sourceUrl: 'https://www.bizbuysell.com/business-opportunity/high-earning-hvac-plumbing-and-sheet-metal-business-and-real-estate/25429910',
+      broker: privateBroker,
+      rawText: privateSourceText,
+    });
+  });
+
+  const storageModule = await import('../server/storage/sqlite.js');
+  assert.equal(
+    typeof storageModule.inspectCanonicalMergeLegacyDealHunterCandidates,
+    'function',
+    'the production legacy-candidate scanner must be directly regression-testable',
+  );
+  const approval = getCanonicalOpportunityMergeApproval({ exceptionId, survivorId, supersededId });
+  const summary = withRawDatabase(fixture.sqlitePath, (database) => (
+    storageModule.inspectCanonicalMergeLegacyDealHunterCandidates(database, approval)
+  ));
+  assert.equal(summary.count, 60);
+  assert.equal(summary.records.length, 50);
+  assert.equal(summary.records.every((id) => /^deal_hunter_candidates:synthetic-matching-\d{2}$/.test(id)), true);
+  assert.doesNotMatch(JSON.stringify(summary), /https?:|private-broker-sentinel|private source payload/i);
+});
+
+test('normalized legacy candidate source URL is an enforced blocking entity dependency', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  installProductionDerivedLegacySchema(fixture.sqlitePath);
+  withRawDatabase(fixture.sqlitePath, (database) => {
+    insertLegacyDealHunterCandidate(database, {
+      id: 'normalized-approved-listing',
+      sourceUrl: 'https://WWW.BIZBUYSELL.COM/business-opportunity/high-earning-hvac-plumbing-and-sheet-metal-business-and-real-estate/2542991/?utm_medium=legacy#fragment',
+      broker: 'must-not-appear@example.test',
+      rawText: 'must not appear in repair diagnostics',
+    });
+  });
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage })),
+    (error) => {
+      assert.match(error.message, /unexpected dependent state.*legacyDealHunterCandidates/i);
+      assert.doesNotMatch(error.message, /bizbuysell|must-not-appear|repair diagnostics/i);
+      return true;
+    },
+  );
+});
+
+test('unlinked retired prospect cannot become a blocker from website URL resemblance alone', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  installProductionDerivedLegacySchema(fixture.sqlitePath);
+  withRawDatabase(fixture.sqlitePath, (database) => {
+    insertRetiredProspectDiscovery(database, {
+      id: 'unlinked-retired-prospect',
+      submissionId: null,
+      websiteUrl: 'https://www.bizbuysell.com/business-opportunity/high-earning-hvac-plumbing-and-sheet-metal-business-and-real-estate/2542991/',
+    });
+  });
+
+  const dryRun = await runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage }));
+  assert.equal(dryRun.plan.dependentState.counts.linkedCrmState, 0);
+  assert.deepEqual(dryRun.plan.dependentState.records.linkedCrmState, []);
+});
+
+test('linked retired prospect is selected by the submission parent scanner', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  installProductionDerivedLegacySchema(fixture.sqlitePath);
+  insertUnexpectedDependent(fixture.sqlitePath, 'contactSubmissions', survivorId);
+  withRawDatabase(fixture.sqlitePath, (database) => {
+    insertRetiredProspectDiscovery(database, {
+      id: 'linked-retired-prospect',
+      submissionId: 'unexpected-contactSubmissions',
+      websiteUrl: 'https://example.test/unrelated-direct-origination-site',
+    });
+  });
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage })),
+    /unexpected dependent state:.*contactSubmissions.*linkedCrmState/i,
+  );
+  const retained = withRawDatabase(fixture.sqlitePath, (database) => (
+    database.prepare('SELECT COUNT(*) AS count FROM prospect_discoveries WHERE id = ?')
+      .get('linked-retired-prospect').count
+  ));
+  assert.equal(retained, 1);
+});
+
 test('standalone apply verifies backup evidence before writable storage startup', async (t) => {
   const fixture = repairStorage(t);
   await seedApprovedRepair(fixture.storage);
@@ -998,7 +1456,7 @@ test('dry run returns the exact deterministic plan and writes nothing', async (t
 test('relationship inventory classifies every reviewed omission exactly once in all four categories', () => {
   const entries = CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries;
   const keys = entries.map((entry) => `${entry.table}.${entry.column}`);
-  assert.equal(entries.length, 224);
+  assert.equal(entries.length, 231);
   assert.equal(new Set(keys).size, keys.length);
   assert.deepEqual(
     [...new Set(entries.map((entry) => entry.category))].sort(),
@@ -1010,15 +1468,48 @@ test('relationship inventory classifies every reviewed omission exactly once in 
       entries.filter((entry) => entry.category === category).length,
     ])),
     {
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 89,
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT]: 47,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 91,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT]: 51,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.PRESERVED_GLOBAL_RECIPIENT_OPERATIONAL_STATE]: 54,
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED]: 34,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED]: 35,
     },
   );
+  assert.deepEqual(
+    Object.fromEntries([
+      materialScannerPathEnforcement,
+      independentGateEnforcement,
+      approvalPreconditionEnforcement,
+      explicitExclusionEnforcement,
+    ].map((enforcement) => [
+      enforcement,
+      entries.filter((entry) => entry.enforcement === enforcement).length,
+    ])),
+    {
+      [materialScannerPathEnforcement]: 186,
+      [independentGateEnforcement]: 10,
+      [approvalPreconditionEnforcement]: 11,
+      [explicitExclusionEnforcement]: 24,
+    },
+  );
+  const optionalLegacyEntries = entries.filter((entry) => (
+    entry.schemaPresence === optionalLegacySchemaPresence
+  ));
+  assert.deepEqual(
+    optionalLegacyEntries.map((entry) => `${entry.table}.${entry.column}`).sort(),
+    Object.keys(productionOnlyRelationshipClassifications).sort(),
+  );
+  assert.deepEqual(
+    [...new Set(optionalLegacyEntries.map((entry) => entry.table))].sort(),
+    ['admin_magic_links_legacy_v1', 'deal_hunter_candidates', 'prospect_discoveries'],
+  );
+  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 224);
   for (const entry of entries) {
     assert.ok(entry.reason, `${entry.table}.${entry.column} must document its classification`);
     assert.ok(entry.enforcement, `${entry.table}.${entry.column} must declare its enforcement class`);
+    assert.ok(
+      ['required', optionalLegacySchemaPresence].includes(entry.schemaPresence),
+      `${entry.table}.${entry.column} must declare its schema presence contract`,
+    );
     if (entry.enforcement === materialScannerPathEnforcement) {
       assert.ok(entry.scannerPath, `${entry.table}.${entry.column} must name its material scanner path`);
     } else if (entry.enforcement === independentGateEnforcement) {
@@ -1031,6 +1522,20 @@ test('relationship inventory classifies every reviewed omission exactly once in 
     } else {
       assert.fail(`${entry.table}.${entry.column} has an unknown enforcement class`);
     }
+  }
+  for (const [key, expected] of Object.entries(productionOnlyRelationshipClassifications)) {
+    const matches = entries.filter((entry) => `${entry.table}.${entry.column}` === key);
+    assert.equal(matches.length, 1, `${key} must be classified exactly once`);
+    assert.deepEqual(
+      {
+        category: matches[0].category,
+        enforcement: matches[0].enforcement,
+        scannerPath: matches[0].scannerPath,
+      },
+      expected,
+    );
+    assert.equal(matches[0].schemaPresence, optionalLegacySchemaPresence);
+    assert.ok(matches[0].reason, `${key} must document its production-derived classification`);
   }
   for (const key of [
     'contact_submissions.archive_communication_id',
@@ -1062,6 +1567,20 @@ test('relationship inventory classifies every reviewed omission exactly once in 
   ]) {
     assert.equal(keys.filter((candidate) => candidate === key).length, 1, `${key} must be classified once`);
   }
+});
+
+test('relationship inventory checksum is deterministic over the complete presence-aware inventory', () => {
+  const first = canonicalOpportunityMergeRelationshipInventorySummary();
+  const second = canonicalOpportunityMergeRelationshipInventorySummary();
+  assert.deepEqual(first, second);
+  assert.equal(first.entryCount, 231);
+  assert.equal(first.checksum, '64e4e3376bca92e17a33f9f7ac5b1ccdd0f5954478d3eaf54f546723e52a404e');
+  assert.equal(
+    first.checksum,
+    createHash('sha256')
+      .update(stableCanonicalJson(CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY))
+      .digest('hex'),
+  );
 });
 
 test('relationship inventory validates real material paths and explicit independent gates', async (t) => {
@@ -1129,6 +1648,25 @@ test('relationship inventory validates real material paths and explicit independ
     entries: [independentEntries[0]],
     inspection: dryRun.plan,
   }));
+  const optionalCandidateEntries = entries.filter((entry) => entry.table === 'deal_hunter_candidates');
+  assert.equal(optionalCandidateEntries.length, 2);
+  assert.throws(
+    () => validateInventory({
+      entries: [
+        optionalCandidateEntries[0],
+        { ...optionalCandidateEntries[1], schemaPresence: 'required' },
+      ],
+      inspection: dryRun.plan,
+    }),
+    /conflicting schema presence.*deal_hunter_candidates/i,
+  );
+  assert.throws(
+    () => validateInventory({
+      entries: [{ ...materialEntry, schemaPresence: '' }],
+      inspection: dryRun.plan,
+    }),
+    /schema presence is missing or invalid/i,
+  );
 });
 
 test('recipient-global suppression is count-only preserved state and is never rewritten', async (t) => {
@@ -2199,6 +2737,22 @@ test('apply re-reads every dry-run invariant and refuses intervening drift', asy
         database.exec('ALTER TABLE deal_hunter_cim_requests ADD COLUMN intervening_opportunity_id TEXT');
       }),
       pattern: /unsupported SQLite schema.*unclassified.*intervening_opportunity_id/i,
+    },
+    {
+      name: 'generated relationship schema appeared',
+      mutate: ({ sqlitePath }) => withRawDatabase(sqlitePath, (database) => {
+        database.exec(`
+          ALTER TABLE deal_hunter_cim_requests
+          ADD COLUMN intervening_relationship_id TEXT
+          GENERATED ALWAYS AS (opportunity_id) VIRTUAL
+        `);
+        assert.deepEqual(
+          sqliteTableColumnMetadata(database, 'deal_hunter_cim_requests')
+            .find(({ name }) => name === 'intervening_relationship_id'),
+          { name: 'intervening_relationship_id', hidden: 2 },
+        );
+      }),
+      pattern: /unsupported SQLite schema.*unclassified.*intervening_relationship_id/i,
     },
   ];
 

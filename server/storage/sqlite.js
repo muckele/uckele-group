@@ -10,6 +10,8 @@ import {
   CANONICAL_OPPORTUNITY_MERGE_MANIFEST_SCHEMA,
   CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE,
   CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY,
+  CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_SCHEMA_PRESENCE,
+  canonicalOpportunityMergeRelationshipSchemaPresenceByTable,
   getCanonicalOpportunityMergeApproval,
   isCanonicalOpportunityMergeRelationshipColumn,
   validateCanonicalOpportunityMergeReplayManifest,
@@ -958,6 +960,50 @@ function canonicalMergeRecordIds(table, rows = [], idColumn = 'id') {
   return uniqueCanonicalMergeValues(rows.map((row) => `${table}:${row[idColumn]}`));
 }
 
+function canonicalMergeApprovedListingUrls(approval) {
+  const dealKeys = approval.expectedAliases
+    .filter((item) => item.aliasType === 'deal-key')
+    .map((item) => item.aliasValue);
+  return uniqueCanonicalMergeValues([
+    ...approval.expectedAliases
+      .filter((item) => item.aliasType === 'listing-url')
+      .map((item) => item.aliasValue),
+    ...approval.sourceObservations.map((item) => item.listingUrl),
+    ...dealKeys.filter((item) => item.startsWith('url:')).map((item) => item.slice(4)),
+  ]);
+}
+
+const canonicalMergeLegacyCandidateRecordLimit = 50;
+
+export function inspectCanonicalMergeLegacyDealHunterCandidates(database, approval) {
+  const tableExists = database.prepare(`
+    SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1
+  `).get('deal_hunter_candidates');
+  if (!tableExists) return { count: 0, records: [] };
+
+  const approvedListingIdentities = new Set(
+    canonicalMergeApprovedListingUrls(approval)
+      .map((value) => canonicalListingIdentity(value))
+      .filter(Boolean),
+  );
+  let count = 0;
+  const records = [];
+  const candidates = database.prepare(`
+    SELECT id, source_url
+    FROM deal_hunter_candidates
+    WHERE NULLIF(TRIM(source_url), '') IS NOT NULL
+    ORDER BY id
+  `).iterate();
+  for (const candidate of candidates) {
+    if (!approvedListingIdentities.has(canonicalListingIdentity(candidate.source_url))) continue;
+    count += 1;
+    if (records.length < canonicalMergeLegacyCandidateRecordLimit) {
+      records.push(`deal_hunter_candidates:${candidate.id}`);
+    }
+  }
+  return { count, records };
+}
+
 function inspectCanonicalMergeDependentState(database, approval) {
   const opportunityIds = [approval.survivorId, approval.supersededId];
   const aliasValues = approval.expectedAliases.map((item) => item.aliasValue);
@@ -965,13 +1011,7 @@ function inspectCanonicalMergeDependentState(database, approval) {
   const dealKeys = approval.expectedAliases
     .filter((item) => item.aliasType === 'deal-key')
     .map((item) => item.aliasValue);
-  const listingUrls = uniqueCanonicalMergeValues([
-    ...approval.expectedAliases
-      .filter((item) => item.aliasType === 'listing-url')
-      .map((item) => item.aliasValue),
-    ...approval.sourceObservations.map((item) => item.listingUrl),
-    ...dealKeys.filter((item) => item.startsWith('url:')).map((item) => item.slice(4)),
-  ]);
+  const listingUrls = canonicalMergeApprovedListingUrls(approval);
   const listingIdentities = uniqueCanonicalMergeValues([
     ...approval.expectedAliases
       .filter((item) => ['listing-id', 'source-identity'].includes(item.aliasType))
@@ -981,6 +1021,7 @@ function inspectCanonicalMergeDependentState(database, approval) {
   ]);
   const referenceValues = uniqueCanonicalMergeValues([...opportunityIds, ...aliasValues, ...aliasKeys]);
   const metadataFilter = { column: 'metadata', values: referenceValues, contains: true };
+  const legacyDealHunterCandidates = inspectCanonicalMergeLegacyDealHunterCandidates(database, approval);
 
   const opportunityScores = selectCanonicalMergeRows(database, 'deal_hunter_opportunity_scores', [
     { column: 'opportunity_id', values: opportunityIds },
@@ -1169,6 +1210,7 @@ function inspectCanonicalMergeDependentState(database, approval) {
     ]),
     dispositions: canonicalMergeRecordIds('deal_hunter_dispositions', dispositions),
     historicalIdentityEvidence: canonicalMergeRecordIds('deal_hunter_seen_deals', historicalIdentityEvidence),
+    legacyDealHunterCandidates: legacyDealHunterCandidates.records,
     sourceImportPayloads: canonicalMergeRecordIds('deal_hunter_deal_os_imports', sourceImportPayloads),
     otherIdentityExceptions: canonicalMergeRecordIds('deal_hunter_identity_exceptions', otherIdentityExceptions),
     stage2Runs: canonicalMergeRecordIds('deal_hunter_cim_stage2_runs', stage2Runs),
@@ -1176,10 +1218,9 @@ function inspectCanonicalMergeDependentState(database, approval) {
     linkedCrmState: uniqueCanonicalMergeValues(linkedCrmState),
     otherRepairManifests: canonicalMergeRecordIds('deal_hunter_cim_repair_manifests', otherRepairManifests),
   };
-  return {
-    counts: Object.fromEntries(Object.entries(records).map(([category, ids]) => [category, ids.length])),
-    records,
-  };
+  const counts = Object.fromEntries(Object.entries(records).map(([category, ids]) => [category, ids.length]));
+  counts.legacyDealHunterCandidates = legacyDealHunterCandidates.count;
+  return { counts, records };
 }
 
 function inspectCanonicalMergeOperationalState(database, approval) {
@@ -1434,7 +1475,8 @@ function assertCanonicalOpportunityMergeSqliteSchema(database) {
     ORDER BY name
   `).all().map(({ name }) => [
     name,
-    new Set(database.prepare('SELECT name FROM pragma_table_info(?)').all(name).map((row) => row.name)),
+    // Include ordinary, virtual-table implementation, and generated columns in the same fail-closed classifier.
+    new Set(database.prepare('SELECT name FROM pragma_table_xinfo(?)').all(name).map((row) => row.name)),
   ]));
   for (const [table, requiredColumns] of Object.entries(canonicalOpportunityMergeRequiredSchema)) {
     const presentColumns = actualColumnsByTable.get(table);
@@ -1448,10 +1490,19 @@ function assertCanonicalOpportunityMergeSqliteSchema(database) {
   }
   const inventoryKeys = new Set(CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries
     .map((entry) => `${entry.table}.${entry.column}`));
+  const inventoryPresenceByTable = canonicalOpportunityMergeRelationshipSchemaPresenceByTable();
   for (const entry of CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries) {
     const columns = actualColumnsByTable.get(entry.table);
-    if (!columns) missing.push(`${entry.table} (relationship inventory table)`);
-    else if (!columns.has(entry.column)) missing.push(`${entry.table}.${entry.column}`);
+    if (!columns) {
+      if (
+        inventoryPresenceByTable.get(entry.table)
+        !== CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_SCHEMA_PRESENCE.OPTIONAL_LEGACY
+      ) {
+        missing.push(`${entry.table} (relationship inventory table)`);
+      }
+    } else if (!columns.has(entry.column)) {
+      missing.push(`${entry.table}.${entry.column}`);
+    }
   }
   const unclassified = [];
   for (const [table, columns] of actualColumnsByTable) {

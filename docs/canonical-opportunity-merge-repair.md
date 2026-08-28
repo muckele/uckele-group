@@ -60,6 +60,30 @@ Before any production command, compare the checked-in approval descriptor with t
 
 Stop if the approved evidence is incomplete or the intended decision differs in any way. Do not edit the descriptor during the apply window to accommodate drift.
 
+### Production-derived legacy relationship schema contract
+
+The v1 relationship inventory contains 231 entries. Its reviewed classification counts are 91 blocking entity dependencies, 51 relationships redundant through a scanned parent, 54 preserved global/recipient operational fields, and 35 explicit exclusions. Enforcement counts are 186 material scanner paths, 10 independent gates, 11 approval preconditions, and 24 explicit exclusions. The current inventory checksum is `64e4e3376bca92e17a33f9f7ac5b1ccdd0f5954478d3eaf54f546723e52a404e`.
+
+Historical SQLite installations can retain three relationship-bearing tables that a fresh current schema does not create. Their seven relationship-like columns use the same inventory and enforcement machinery as every current-schema entry:
+
+| Column | Classification | Enforcement |
+| --- | --- | --- |
+| `admin_magic_links_legacy_v1.email` | explicitly irrelevant/excluded authentication audit identity | `excluded.adminAuthentication` |
+| `deal_hunter_candidates.run_id` | redundant through the scanned legacy candidate row | `dependentState.records.legacyDealHunterCandidates` |
+| `deal_hunter_candidates.source_url` | blocking entity dependency | `dependentState.records.legacyDealHunterCandidates` |
+| `prospect_discoveries.run_id` | redundant through the submission-linked discovery row | `dependentState.records.linkedCrmState` |
+| `prospect_discoveries.source_id` | redundant through the submission-linked discovery row | `dependentState.records.linkedCrmState` |
+| `prospect_discoveries.submission_id` | blocking entity dependency | `dependentState.records.linkedCrmState` |
+| `prospect_discoveries.website_url` | redundant through the submission-linked discovery row | `dependentState.records.linkedCrmState` |
+
+These tables are marked `optional-legacy`: a table may be absent, but its schema is strict when present. Every classified relationship column must exist, and any new unclassified relationship-like column still refuses the repair. Schema validation uses SQLite's complete `pragma_table_xinfo` view, so ordinary columns (`hidden=0`), virtual-table implementation columns (`hidden=1`), virtual generated columns (`hidden=2`), and stored generated columns (`hidden=3`) all pass through the same fail-closed relationship classifier. This is a table-presence contract, not a validator exception for particular table or column names.
+
+The legacy candidate scanner projects only `id` and `source_url`, compares both sides with the same canonical listing-URL normalization used by the approved HVAC listing evidence, and never uses substring matching. Its dependent-state result contains the exact match count and at most 50 opaque candidate identifiers; it never contains URLs, candidate payloads, broker/contact fields, or source text. Any match is blocking.
+
+Retired prospect discovery relevance remains mediated solely by `submission_id`. Run, provider-source, and website fields are subordinate data on a submission-linked row. An unlinked retired discovery does not become a blocker merely because `website_url` resembles or equals an approved listing URL.
+
+The schema-only regression overlay in `test/fixtures/production-derived-legacy-relationship-schema.sql` contains no rows or production values. Tests compose it with the repository-created current schema, require exactly the seven additional relationship-bearing columns above, and prove both complete classification and fail-closed future drift. `canonical-opportunity-merge-plan-v2` remains unchanged; because the inventory digest is part of the plan, every plan checksum generated before this inventory revision is stale and must not be preserved or reused.
+
 ## 2. Run the read-only dry run
 
 Use Node 22 and the exact deployed environment. Supply a real accountable actor and a specific, reviewed human reason:
@@ -88,7 +112,8 @@ Two people should review the output against the checked-in approval. At minimum,
 - `globalAliasOwnership` proves each alias type/value has exactly one owner and no third-party owner;
 - `aliasMoves` contains only the three approved BusinessesForSale aliases;
 - every blocking `dependentState` count is zero for both IDs and alias-derived references;
-- `relationshipInventory` matches the reviewed v1 inventory digest and classifies the current relationship-bearing schema into all four documented categories;
+- `relationshipInventory` matches the reviewed 231-entry v1 inventory digest and classifies the current and optional-legacy relationship-bearing schema into all four documented categories;
+- `dependentState.counts.legacyDealHunterCandidates` is zero; any nonzero count represents a canonical-normalized legacy source-URL match and is a blocker;
 - `preservedOperationalState.emailSuppressions` contains only deterministic resolution and integer counts (never a raw address or suppression row), and its restrictive presence is not a blocker;
 - `authorityGrantingOperationalState.stage2Activations.activeCount` is zero;
 - survivor remains active and loser becomes superseded in the mutation description;
