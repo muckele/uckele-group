@@ -325,7 +325,11 @@ export function buildCimOpportunityRecord(deal, opportunityId, now = new Date().
   return opportunityRecord(deal, opportunityId, now, existing);
 }
 
-async function linkAliases(storage, opportunity, aliases, { actor = 'system', method = 'observed', confidence = 'exact' } = {}) {
+function aliasRecordsForOpportunity(opportunity, aliases, {
+  actor = 'system',
+  method = 'observed',
+  confidence = 'exact',
+} = {}) {
   const priority = new Map([
     ['listing-id', 0],
     ['listing-url', 1],
@@ -338,7 +342,7 @@ async function linkAliases(storage, opportunity, aliases, { actor = 'system', me
     (priority.get(left.alias_type) ?? 99) - (priority.get(right.alias_type) ?? 99)
     || left.alias_key.localeCompare(right.alias_key)
   ));
-  const aliasRecords = orderedAliases.map((item) => ({
+  return orderedAliases.map((item) => ({
       id: sha256(`cim-opportunity-alias:${item.alias_key}`),
       opportunity_id: opportunity.opportunity_id,
       alias_type: item.alias_type,
@@ -353,6 +357,10 @@ async function linkAliases(storage, opportunity, aliases, { actor = 'system', me
       resolved_by: normalizeText(actor, 200) || 'system',
       metadata: {},
     }));
+}
+
+async function linkAliases(storage, opportunity, aliases, options = {}) {
+  const aliasRecords = aliasRecordsForOpportunity(opportunity, aliases, options);
   if (storage.linkDealHunterOpportunityAliases) {
     return storage.linkDealHunterOpportunityAliases(aliasRecords);
   }
@@ -367,8 +375,9 @@ async function linkAliases(storage, opportunity, aliases, { actor = 'system', me
 
 function identityStorageAvailable(storage) {
   return Boolean(
-    storage?.findDealHunterOpportunityByAliases
-    && storage?.listDealHunterOpportunities
+    storage?.findCurrentDealHunterOpportunityByAliases
+    && storage?.getCurrentDealHunterOpportunity
+    && storage?.listCurrentDealHunterOpportunities
     && storage?.upsertDealHunterOpportunity
     && storage?.upsertDealHunterOpportunityAlias
     && storage?.upsertDealHunterIdentityException,
@@ -431,12 +440,23 @@ export async function resolveDealHunterOpportunity({
   };
   let exact;
   try {
-    exact = await storage.findDealHunterOpportunityByAliases(aliases.map((item) => item.alias_key));
-  } catch {
-    return storeIdentityException({ reason: 'conflicting-canonical-aliases' });
+    exact = await storage.findCurrentDealHunterOpportunityByAliases(aliases.map((item) => item.alias_key));
+  } catch (error) {
+    return storeIdentityException({
+      reason: error?.code === 'DEAL_HUNTER_OPPORTUNITY_NOT_CURRENT'
+        ? 'non-current-canonical-alias'
+        : 'conflicting-canonical-aliases',
+      candidates: error?.opportunityId ? [error.opportunityId] : [],
+    });
   }
   if (exact) {
     const opportunity = await storage.upsertDealHunterOpportunity(opportunityRecord(deal, exact.opportunity_id, now, exact));
+    if (opportunity?.status !== 'active') {
+      return storeIdentityException({
+        reason: 'non-current-canonical-alias',
+        candidates: [exact.opportunity_id],
+      });
+    }
     const linked = await linkAliases(storage, opportunity, aliases, { actor, method: 'exact-alias', confidence: 'exact' });
     if (linked.conflict) {
       return storeIdentityException({
@@ -447,15 +467,23 @@ export async function resolveDealHunterOpportunity({
     return { ok: true, status: 'resolved', opportunity, opportunityId: opportunity.opportunity_id, aliases, resolution: 'exact-alias' };
   }
 
-  const opportunities = Array.isArray(candidateOpportunities)
+  const opportunities = (Array.isArray(candidateOpportunities)
     ? candidateOpportunities
-    : await storage.listDealHunterOpportunities({ limit: 100000 });
+    : await storage.listCurrentDealHunterOpportunities({ limit: 100000 }))
+    .filter((opportunity) => opportunity?.status === 'active');
   const comparisons = opportunities.map((opportunity) => ({ opportunity, ...compareCimOpportunityEvidence(deal, opportunity) }));
   const automatic = comparisons.filter((item) => item.automatic);
   const ambiguous = comparisons.filter((item) => item.ambiguous);
   if (automatic.length === 1) {
     const existing = automatic[0].opportunity;
     const opportunity = await storage.upsertDealHunterOpportunity(opportunityRecord(deal, existing.opportunity_id, now, existing));
+    if (opportunity?.status !== 'active') {
+      return storeIdentityException({
+        reason: 'non-current-canonical-alias',
+        candidates: [existing.opportunity_id],
+        comparisons: [{ opportunityId: existing.opportunity_id, evidence: automatic[0].evidence }],
+      });
+    }
     const linked = await linkAliases(storage, opportunity, aliases, { actor, method: 'high-confidence-transition', confidence: 'high' });
     if (linked.conflict) {
       return storeIdentityException({
@@ -486,29 +514,53 @@ export async function resolveDealHunterOpportunity({
     });
   }
   if (!allowCreate) return { ok: false, status: 'unresolved', error: 'No canonical opportunity could be resolved.' };
+  if (!storage.createDealHunterOpportunityWithAliases) {
+    return { ok: false, status: 'unavailable', error: 'Atomic canonical opportunity creation is unavailable.' };
+  }
 
   const opportunityId = `opp_${randomUUID()}`;
-  let opportunity = await storage.upsertDealHunterOpportunity(opportunityRecord(deal, opportunityId, now));
-  const linked = await linkAliases(storage, opportunity, aliases, { actor, method: 'new-opportunity', confidence: 'exact' });
-  if (linked.conflict) {
-    const canonical = await storage.getDealHunterOpportunity(linked.conflict.opportunity_id);
-    if (!canonical) {
-      return storeIdentityException({
-        reason: 'concurrent-canonical-alias-conflict',
-        candidates: [linked.conflict.opportunity_id].filter(Boolean),
-      });
-    }
-    opportunity = await storage.upsertDealHunterOpportunity(opportunityRecord(deal, canonical.opportunity_id, now, canonical));
-    const reconciled = await linkAliases(storage, opportunity, aliases, { actor, method: 'concurrent-alias-reconciliation', confidence: 'exact' });
-    if (reconciled.conflict) {
-      return storeIdentityException({
-        reason: 'conflicting-canonical-aliases',
-        candidates: [canonical.opportunity_id, reconciled.conflict.opportunity_id].filter(Boolean),
-      });
-    }
-    return { ok: true, status: 'resolved', opportunity, opportunityId: opportunity.opportunity_id, aliases, resolution: 'concurrent-alias-reconciliation' };
+  const proposedOpportunity = opportunityRecord(deal, opportunityId, now);
+  const aliasRecords = aliasRecordsForOpportunity(proposedOpportunity, aliases, {
+    actor,
+    method: 'new-opportunity',
+    confidence: 'exact',
+  });
+  const acquired = await storage.createDealHunterOpportunityWithAliases({
+    opportunity: proposedOpportunity,
+    aliases: aliasRecords,
+    existingOwnerMode: 'return-current',
+  });
+  if (acquired.conflict || !acquired.opportunity) {
+    return storeIdentityException({
+      reason: acquired.conflict?.reason === 'alias-owner-not-current'
+        ? 'non-current-canonical-alias'
+        : 'conflicting-canonical-aliases',
+      candidates: [
+        acquired.conflict?.opportunity_id,
+        ...(acquired.conflict?.opportunity_ids || []),
+      ].filter(Boolean),
+    });
   }
-  return { ok: true, status: 'created', opportunity, opportunityId: opportunity.opportunity_id, aliases, resolution: 'new-opportunity' };
+  let opportunity = acquired.opportunity;
+  if (!acquired.created) {
+    opportunity = await storage.upsertDealHunterOpportunity(
+      opportunityRecord(deal, opportunity.opportunity_id, now, opportunity),
+    );
+    if (opportunity?.status !== 'active') {
+      return storeIdentityException({
+        reason: 'non-current-canonical-alias',
+        candidates: [acquired.opportunity.opportunity_id],
+      });
+    }
+  }
+  return {
+    ok: true,
+    status: acquired.created ? 'created' : 'resolved',
+    opportunity,
+    opportunityId: opportunity.opportunity_id,
+    aliases,
+    resolution: acquired.created ? 'new-opportunity' : 'concurrent-alias-reconciliation',
+  };
 }
 
 export function isAcceptedCimRequest(request = {}) {
@@ -672,7 +724,7 @@ export async function getCimIdentityOperationsStatus({ storage = getStorage(), c
     getCimOutreachPauseStatus({ storage, config }),
     privacySafe && storage.listCimStage2IdentityOpportunities
       ? storage.listCimStage2IdentityOpportunities({ limit: 5000 })
-      : storage.listDealHunterOpportunities?.({ limit: 5000 }) || [],
+      : storage.listCurrentDealHunterOpportunities?.({ limit: 5000 }) || [],
     privacySafe && storage.listCimStage2IdentityExceptions
       ? storage.listCimStage2IdentityExceptions({ statuses: ['open'], limit: 5000 })
       : storage.listDealHunterIdentityExceptions?.({ statuses: ['open'], limit: 5000 }) || [],
@@ -839,7 +891,16 @@ export async function createCimRecipientOverride({
   if (!Number.isFinite(requestedHours) || requestedHours <= 0 || requestedHours > maximumHours) {
     return { ok: false, status: 400, error: `Override duration must be between 1 and ${maximumHours} hours.` };
   }
-  const opportunity = await storage.getDealHunterOpportunity?.(normalizedOpportunityId);
+  if (!storage.getCurrentDealHunterOpportunity) {
+    return { ok: false, status: 503, error: 'Current canonical opportunity lookup is unavailable.' };
+  }
+  const opportunity = await storage.getCurrentDealHunterOpportunity(normalizedOpportunityId);
+  if (!opportunity) {
+    const historical = await storage.getDealHunterOpportunity?.(normalizedOpportunityId);
+    if (historical) {
+      return { ok: false, status: 409, error: 'The selected canonical opportunity is superseded or otherwise not current. No recipient override was created.' };
+    }
+  }
   if (!opportunity || !storage.upsertDealHunterCimRecipientOverride) {
     return { ok: false, status: 404, error: 'Canonical opportunity or override storage was not found.' };
   }
@@ -876,17 +937,42 @@ export async function resolveCimIdentityException({
   if (!identityException || identityException.status !== 'open') {
     return { ok: false, status: 404, error: 'Open identity exception not found.' };
   }
+  let targetOpportunity = null;
+  if (opportunityId) {
+    if (!storage.getCurrentDealHunterOpportunity || !storage.getDealHunterOpportunity) {
+      return { ok: false, status: 503, error: 'Current canonical opportunity lookup is unavailable.' };
+    }
+    const historicalTarget = await storage.getDealHunterOpportunity(opportunityId);
+    targetOpportunity = await storage.getCurrentDealHunterOpportunity(opportunityId);
+    if (historicalTarget && !targetOpportunity) {
+      const mergedInto = normalizeText(
+        historicalTarget.metadata?.canonicalOpportunityMerge?.mergedInto,
+        160,
+      );
+      const activeSuccessor = mergedInto
+        ? await storage.getCurrentDealHunterOpportunity(mergedInto)
+        : null;
+      return {
+        ok: false,
+        status: 409,
+        error: 'The selected canonical opportunity is superseded or otherwise not current. Select an active opportunity explicitly; no identity mutation was applied.',
+        successorOpportunityId: activeSuccessor?.opportunity_id || '',
+      };
+    }
+  }
   const aliasKeys = (identityException.metadata?.aliases || []).filter(Boolean);
   const existingAliases = aliasKeys.length > 0 && storage.listDealHunterOpportunityAliases
     ? await storage.listDealHunterOpportunityAliases({ aliasKeys, limit: Math.max(100, aliasKeys.length) })
     : [];
-  let targetOpportunity = opportunityId ? await storage.getDealHunterOpportunity?.(opportunityId) : null;
   if (action === 'keep-distinct') {
     if (existingAliases.length > 0) {
       return { ok: false, status: 409, error: 'One or more aliases already belong to a canonical opportunity. Resolve that ownership conflict before keeping this observation distinct.' };
     }
+    if (!storage.createDealHunterOpportunityWithAliases) {
+      return { ok: false, status: 503, error: 'Atomic canonical opportunity creation is unavailable.' };
+    }
     const now = new Date().toISOString();
-    targetOpportunity = await storage.upsertDealHunterOpportunity({
+    targetOpportunity = {
       opportunity_id: `opp_${randomUUID()}`,
       created_at: now,
       updated_at: now,
@@ -897,7 +983,7 @@ export async function resolveCimIdentityException({
       identity_version: CIM_IDENTITY_EVIDENCE_VERSION,
       status: 'active',
       metadata: { createdFromIdentityException: identityException.id },
-    });
+    };
   }
   if (!targetOpportunity || !['link', 'keep-distinct'].includes(action)) {
     return { ok: false, status: 400, error: 'Select a valid canonical opportunity or keep the listing distinct.' };
@@ -929,7 +1015,50 @@ export async function resolveCimIdentityException({
       metadata: { exceptionId: identityException.id, reason: normalizedReason },
     });
   }
+  if (action === 'keep-distinct' && aliasRecords.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      error: 'Keeping an observation distinct requires at least one stable canonical alias. No identity mutation was applied.',
+    };
+  }
   if (aliasRecords.length > 0) {
+    if (action === 'keep-distinct') {
+      const resolvedRecord = {
+        ...identityException,
+        updated_at: now,
+        status: 'resolved',
+        resolved_at: now,
+        resolved_by: normalizeText(actor, 200) || 'admin',
+        resolution_reason: normalizedReason,
+        metadata: {
+          ...(identityException.metadata || {}),
+          action,
+          resolvedOpportunityId: targetOpportunity.opportunity_id,
+        },
+      };
+      const acquired = await storage.createDealHunterOpportunityWithAliases({
+        opportunity: targetOpportunity,
+        aliases: aliasRecords,
+        existingOwnerMode: 'conflict',
+        identityException: resolvedRecord,
+      });
+      if (acquired.conflict || !acquired.opportunity || !acquired.identityException) {
+        return {
+          ok: false,
+          status: 409,
+          error: acquired.conflict?.reason === 'identity-exception-not-open'
+            ? 'The identity exception was concurrently resolved. No partial identity resolution was applied.'
+            : 'An alias was concurrently assigned to another opportunity. No partial identity resolution was applied.',
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        identityException: acquired.identityException,
+        opportunity: acquired.opportunity,
+      };
+    }
     const linked = storage.linkDealHunterOpportunityAliases
       ? await storage.linkDealHunterOpportunityAliases(aliasRecords)
       : await linkAliases(storage, targetOpportunity, aliasRecords.map((record) => ({

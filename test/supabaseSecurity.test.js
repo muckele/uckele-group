@@ -59,6 +59,10 @@ const currentTriageEligibilityMigrationUrl = new URL(
   '../supabase/migrations/20260826120000_deal_hunter_current_triage_eligibility.sql',
   import.meta.url,
 );
+const canonicalCurrentSemanticsMigrationUrl = new URL(
+  '../supabase/migrations/20260827120000_canonical_opportunity_current_semantics.sql',
+  import.meta.url,
+);
 
 function currentAppTables(schema) {
   return Array.from(
@@ -147,6 +151,163 @@ function assertServiceRoleOnlyFunction(sql, sourceLabel, functionName) {
     `${sourceLabel} must grant service-role execution of ${functionName}`,
   );
 }
+
+function sqlFunctionDefinitions(sql) {
+  const starts = [...sql.matchAll(/^create or replace function public\.([a-z0-9_]+)\b/gim)];
+  return starts.map((match, index) => ({
+    name: match[1],
+    sql: sql.slice(match.index, starts[index + 1]?.index ?? sql.length),
+  }));
+}
+
+function canonicalOpportunityRowLockIndex(functionSql) {
+  const match = /from\s+public\.deal_hunter_opportunities\b[\s\S]*?for\s+update\b/i.exec(functionSql);
+  return match?.index ?? -1;
+}
+
+function mutatesCanonicalOpportunityAliases(functionSql) {
+  return /(?:insert\s+into|update|delete\s+from)\s+public\.deal_hunter_opportunity_aliases\b/i
+    .test(functionSql);
+}
+
+test('every canonical alias lock participant acquires the complete sorted alias lock set before opportunity rows', () => {
+  const migration = fs.readFileSync(canonicalCurrentSemanticsMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+
+  for (const [sourceLabel, sql, expectedAliasMutators] of [
+    [
+      'canonical current semantics migration',
+      migration,
+      [
+        'create_deal_hunter_opportunity_with_aliases',
+        'link_deal_hunter_opportunity_aliases',
+      ],
+    ],
+    [
+      'fresh schema',
+      schema,
+      [
+        'apply_deal_hunter_cim_identity_repair',
+        'create_deal_hunter_opportunity_with_aliases',
+        'link_deal_hunter_opportunity_aliases',
+      ],
+    ],
+  ]) {
+    const definitions = sqlFunctionDefinitions(sql);
+    const aliasMutators = definitions
+      .filter(({ sql: functionSql }) => mutatesCanonicalOpportunityAliases(functionSql))
+      .map(({ name }) => name)
+      .sort();
+    assert.deepEqual(
+      aliasMutators,
+      expectedAliasMutators,
+      `${sourceLabel} canonical alias-writer audit must remain complete`,
+    );
+
+    const participants = definitions.filter(({ sql: functionSql }) => (
+      functionSql.includes('deal-hunter-opportunity-alias:')
+      && canonicalOpportunityRowLockIndex(functionSql) >= 0
+    ));
+    assert.deepEqual(
+      participants.map(({ name }) => name).sort(),
+      [
+        'create_deal_hunter_opportunity_with_aliases',
+        'link_deal_hunter_opportunity_aliases',
+      ],
+      `${sourceLabel} canonical alias/opportunity cross-resource lock matrix must remain complete`,
+    );
+
+    for (const { name, sql: functionSql } of participants) {
+      const aliasLockIndex = functionSql.indexOf('deal-hunter-opportunity-alias:');
+      const opportunityRowLockIndex = canonicalOpportunityRowLockIndex(functionSql);
+      assert.ok(
+        aliasLockIndex < opportunityRowLockIndex,
+        `${sourceLabel} ${name} must acquire canonical alias advisory locks before canonical opportunity row locks`,
+      );
+      assert.match(
+        functionSql,
+        /for\s+v_alias_key\s+in\s+select\s+distinct\s+item\.value->>'alias_key'\s+as\s+alias_key\s+from\s+jsonb_array_elements\(p_aliases\)\s+as\s+item\(value\)\s+order\s+by\s+alias_key\s+loop\s+perform\s+pg_catalog\.pg_advisory_xact_lock\s*\(\s*pg_catalog\.hashtextextended\s*\(\s*'deal-hunter-opportunity-alias:'\s*\|\|\s*v_alias_key\s*,\s*0\s*\)\s*\)/i,
+        `${sourceLabel} ${name} must lock every distinct input alias in order with the canonical advisory namespace, hash, and seed`,
+      );
+    }
+  }
+});
+
+test('canonical current semantics migration is function-only and guards every atomic Supabase authority boundary', () => {
+  const migration = fs.readFileSync(canonicalCurrentSemanticsMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+
+  assert.doesNotMatch(migration, /\b(?:create|alter|drop)\s+table\b/i);
+  assert.doesNotMatch(migration, /\b(?:add|drop)\s+column\b/i);
+  assert.doesNotMatch(migration, /\b(?:create|alter)\s+type\b/i);
+  for (const [sourceLabel, sql] of [
+    ['canonical current semantics migration', migration],
+    ['fresh schema', schema],
+  ]) {
+    assertServiceRoleOnlyFunction(
+      sql,
+      sourceLabel,
+      'create_deal_hunter_opportunity_with_aliases',
+    );
+    assert.match(
+      sql,
+      /create_deal_hunter_opportunity_with_aliases[\s\S]*?for\s+v_alias_key\s+in[\s\S]*?order\s+by\s+alias_key[\s\S]*?pg_advisory_xact_lock[\s\S]*?deal-hunter-opportunity-alias:/i,
+      `${sourceLabel} must acquire deterministic alias locks before choosing an owner`,
+    );
+    assert.match(
+      sql,
+      /create_deal_hunter_opportunity_with_aliases[\s\S]*?insert\s+into\s+public\.deal_hunter_opportunities[\s\S]*?insert\s+into\s+public\.deal_hunter_opportunity_aliases[\s\S]*?update\s+public\.deal_hunter_identity_exceptions/i,
+      `${sourceLabel} must keep creation, alias acquisition, and optional exception resolution in one function`,
+    );
+  }
+
+  const preservedSignatures = [
+    ['claim_deal_hunter_cim_opportunity', /\(\s*p_opportunity_id\s+text,\s*p_request_id\s+text,\s*p_recipient_email\s+text,\s*p_allowed_request_ids\s+text\[\],\s*p_claimed_at\s+timestamptz,\s*p_metadata\s+jsonb\s+default\s+'\{\}'::jsonb\s*\)/i],
+    ['claim_deal_hunter_cim_recipient', /\(\s*p_recipient_email\s+text,\s*p_request_id\s+text,\s*p_opportunity_id\s+text,\s*p_claimed_at\s+timestamptz,\s*p_expires_at\s+timestamptz,\s*p_metadata\s+jsonb\s+default\s+'\{\}'::jsonb\s*\)/i],
+    ['link_deal_hunter_opportunity_aliases', /\(p_aliases\s+jsonb\)/i],
+    ['link_deal_hunter_crm_submission', /\(\s*p_opportunity_id\s+text,\s*p_submission_id\s+uuid,\s*p_updated_at\s+timestamptz\s*\)/i],
+    ['write_deal_hunter_opportunity_score', /\(p_score\s+jsonb,\s*p_evidence\s+jsonb\)/i],
+    ['reconcile_deal_hunter_current_score_eligibility', /\(p_opportunity_ids\s+text\[\]\)/i],
+    ['list_deal_hunter_opportunity_scores', /\(\s*p_view\s+text,\s*p_page\s+integer,\s*p_page_size\s+integer,\s*p_search\s+text,\s*p_sort\s+text,\s*p_direction\s+text,\s*p_min_score\s+integer,\s*p_confidence\s+text,\s*p_priority\s+text,\s*p_state\s+text\s*\)/i],
+  ];
+  for (const [functionName, signature] of preservedSignatures) {
+    assert.match(migration, new RegExp(`create or replace function public\\.${functionName}${signature.source}`, 'i'));
+    assertServiceRoleOnlyFunction(migration, 'canonical current semantics migration', functionName);
+    assertServiceRoleOnlyFunction(schema, 'fresh schema', functionName);
+  }
+
+  for (const functionName of [
+    'insert_submission_with_crm_activity',
+    'upsert_deal_hunter_opportunity',
+    'upsert_deal_hunter_cim_recipient_override',
+    'set_deal_hunter_opportunity_operator_decision',
+  ]) {
+    assertServiceRoleOnlyFunction(migration, 'canonical current semantics migration', functionName);
+    assertServiceRoleOnlyFunction(schema, 'fresh schema', functionName);
+  }
+
+  for (const [sourceLabel, sql] of [
+    ['canonical current semantics migration', migration],
+    ['fresh schema', schema],
+  ]) {
+    assert.match(sql, /deal_hunter_opportunities[\s\S]{0,400}status\s*=\s*'active'[\s\S]{0,200}for update/i,
+      `${sourceLabel} must lock and validate active canonical authority inside mutation functions`);
+    assert.match(sql, /create or replace function public\.insert_submission_with_crm_activity[\s\S]*?from public\.deal_hunter_opportunities[\s\S]*?status\s*=\s*'active'[\s\S]*?for update[\s\S]*?insert into public\.contact_submissions/i,
+      `${sourceLabel} must validate and lock active canonical authority inside the CRM insert transaction`);
+    assert.match(sql, /upsert_deal_hunter_opportunity[\s\S]*?on conflict\s*\(opportunity_id\)[\s\S]*?where\s+public\.deal_hunter_opportunities\.status\s*=\s*'active'/i,
+      `${sourceLabel} must never update a superseded opportunity through the ordinary observation upsert`);
+    assert.match(sql, /claim_deal_hunter_cim_opportunity[\s\S]*?opportunity-not-current/i);
+    assert.match(sql, /claim_deal_hunter_cim_recipient[\s\S]*?opportunity-not-current/i);
+    assert.match(sql, /link_deal_hunter_crm_submission[\s\S]*?status\s*=\s*'active'/i);
+    assert.match(sql, /reconcile_deal_hunter_current_score_eligibility[\s\S]*?join\s+public\.deal_hunter_opportunities[\s\S]*?status\s*=\s*'active'/i);
+    assert.match(sql, /list_deal_hunter_opportunity_scores[\s\S]*?with\s+candidates[\s\S]*?join\s+public\.deal_hunter_opportunities[\s\S]*?status\s*=\s*'active'[\s\S]*?limit\s+least/i,
+      `${sourceLabel} must filter active opportunities in the database before triage pagination`);
+    assert.match(sql, /upsert_deal_hunter_cim_recipient_override[\s\S]*?select\s+opportunity_id\s+into\s+v_existing_opportunity_id[\s\S]*?v_existing_opportunity_id\s*<>\s*v_opportunity_id/i,
+      `${sourceLabel} must reject recipient-override ID collisions across canonical owners`);
+    assert.match(sql, /upsert_deal_hunter_cim_recipient_override[\s\S]*?on conflict\s*\(id\)\s*do update[\s\S]*?where\s+public\.deal_hunter_cim_recipient_overrides\.opportunity_id\s*=\s*excluded\.opportunity_id/i,
+      `${sourceLabel} must make the recipient-override conflict update owner-preserving`);
+  }
+});
 
 test('Supabase migration and fresh schema isolate every current app table to the server role', () => {
   const schema = fs.readFileSync(schemaUrl, 'utf8');

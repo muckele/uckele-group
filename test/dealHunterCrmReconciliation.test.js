@@ -223,7 +223,11 @@ test('a re-run over unchanged listings plans no writes and keeps operator workfl
   // Observation bookkeeping moves on its own between review runs and must not
   // be mistaken for a listing change that needs another CRM write.
   const repeatPreview = await previewDealOsCrmReconciliation({ importId: imported.import.id, requestedBy: 'admin@example.com', storage });
-  assert.equal(repeatPreview.counts.unchanged, 2);
+  assert.equal(
+    repeatPreview.counts.unchanged,
+    2,
+    JSON.stringify({ counts: repeatPreview.counts, items: repeatPreview.items }, null, 2),
+  );
   assert.equal(repeatPreview.counts.update, 0);
   assert.equal(repeatPreview.counts.mutable, 0);
   assert.deepEqual(repeatPreview.items.map((item) => item.changedFields), [[], []]);

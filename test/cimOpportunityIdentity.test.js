@@ -380,6 +380,8 @@ test('identity operations metrics count only CIM-linked lifecycle records and re
   const nowIso = new Date().toISOString();
   const storage = {
     async findDealHunterOpportunityByAliases() { return null; },
+    async findCurrentDealHunterOpportunityByAliases() { return null; },
+    async getCurrentDealHunterOpportunity() { return null; },
     async listDealHunterOpportunityAliases() { return []; },
     async upsertDealHunterOpportunity() { return null; },
     async upsertDealHunterOpportunityAlias() { return null; },
@@ -390,7 +392,10 @@ test('identity operations metrics count only CIM-linked lifecycle records and re
     async getDealHunterCimSafetySettings() { return { outreach_paused: false, metadata: {} }; },
     async upsertDealHunterCimSafetySettings() { return null; },
     async listDealHunterOpportunities() {
-      return [{ opportunity_id: 'opp-one', primary_submission_id: 'submission-one' }];
+      return [{ opportunity_id: 'opp-one', primary_submission_id: 'submission-one', status: 'active' }];
+    },
+    async listCurrentDealHunterOpportunities() {
+      return [{ opportunity_id: 'opp-one', primary_submission_id: 'submission-one', status: 'active' }];
     },
     async listDealHunterIdentityExceptions() { return []; },
     async listDealHunterCimRepairManifests() { return []; },

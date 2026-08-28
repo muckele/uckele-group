@@ -511,12 +511,15 @@ test('source-field repair safely enriches a stale syndicated CRM record', async 
     metadata: {
       dealHunter: {
         managed: true,
+        opportunityId: 'opp-current-source-repair',
         dealKey: 'fingerprint:unrelated-listing|worcester-ma|3350000|971170',
         firstSeenAt: '2026-06-13T17:57:40.060Z',
       },
     },
   };
   const activities = [];
+  let currentLinkEstablished = false;
+  let submissionMutationStarted = false;
   const storage = {
     async getSubmission(id) {
       return id === submission.id ? submission : null;
@@ -524,9 +527,20 @@ test('source-field repair safely enriches a stale syndicated CRM record', async 
     async mutateWithCrmActivity({ operation, payload, activity }) {
       assert.equal(operation, 'update_submission');
       assert.equal(payload.expectedUpdatedAt, submission.updated_at);
+      assert.equal(currentLinkEstablished, true, 'canonical linkage must be established before CRM field mutation');
+      assert.equal(Object.hasOwn(payload.values, 'deal_hunter_opportunity_id'), false);
+      submissionMutationStarted = true;
       submission = { ...submission, ...payload.values };
       activities.push(activity);
       return { applied: true, record: submission };
+    },
+    async linkDealHunterCrmSubmission({ opportunityId, submissionId }) {
+      assert.equal(submissionMutationStarted, false, 'canonical linkage must precede CRM field mutation');
+      assert.equal(opportunityId, 'opp-current-source-repair');
+      assert.equal(submissionId, submission.id);
+      currentLinkEstablished = true;
+      submission = { ...submission, deal_hunter_opportunity_id: opportunityId };
+      return { opportunity_id: opportunityId, status: 'active', primary_submission_id: submissionId };
     },
   };
 
@@ -583,6 +597,7 @@ test('source-field repair safely enriches a stale syndicated CRM record', async 
     sourceResults: [source],
   });
   assert.equal(result.applied, true);
+  assert.equal(currentLinkEstablished, true);
   assert.equal(submission.broker_name, 'Kelvin Woods');
   assert.equal(submission.broker_email, 'kelvin.woods@cbiteam.com');
   assert.equal(submission.broker_phone, '870-335-2823');

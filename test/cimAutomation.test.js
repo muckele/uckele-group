@@ -129,8 +129,8 @@ test('CIM metrics use canonical human evidence and initial communication lifecyc
       { communication_id: 'communication-2', message_id: 'message-2', provider: 'resend', event_type: 'bounced' },
     ]; },
     async listCrmCommunications() { return { rows: communications, totalPages: 1 }; },
-    async listDealHunterOpportunities() { return [{ opportunity_id: 'opportunity-1' }, { opportunity_id: 'opportunity-2' }]; },
-    async listDealHunterOpportunityAliases() { return []; },
+    async listCimStage2IdentityOpportunities() { return [{ opportunity_id: 'opportunity-1' }, { opportunity_id: 'opportunity-2' }]; },
+    async listCimStage2EvidenceAliases() { return []; },
     async getActiveEmailSuppression() { return null; },
   };
   const metrics = await getCimAutomationMetrics({ storage, config: automationConfig() });
@@ -160,8 +160,8 @@ test('25 mutable deal-key aliases for one canonical opportunity count once and l
     async listDealHunterCimRequests() { return []; },
     async listEmailEvents() { return []; },
     async listCrmCommunications() { return { rows: [], totalPages: 1 }; },
-    async listDealHunterOpportunities() { return [{ opportunity_id: 'one-opportunity' }]; },
-    async listDealHunterOpportunityAliases() { return []; },
+    async listCimStage2IdentityOpportunities() { return [{ opportunity_id: 'one-opportunity' }]; },
+    async listCimStage2EvidenceAliases() { return []; },
   };
   const metrics = await getCimAutomationMetrics({ storage, config: automationConfig() });
   assert.equal(metrics.canonicalHumanReviews, 1);
@@ -198,8 +198,8 @@ test('adverse readiness counts only initial-message states inside the configured
         ],
       };
     },
-    async listDealHunterOpportunities() { return []; },
-    async listDealHunterOpportunityAliases() { return []; },
+    async listCimStage2IdentityOpportunities() { return []; },
+    async listCimStage2EvidenceAliases() { return []; },
     async getActiveEmailSuppression() { return null; },
   };
   const metrics = await getCimAutomationMetrics({ storage, config: automationConfig(), now });
@@ -219,14 +219,202 @@ test('automated, ambiguous, unlinked, and incompatible-policy reviews never qual
     async listDealHunterCimRequests() { return []; },
     async listEmailEvents() { return []; },
     async listCrmCommunications() { return { rows: [], totalPages: 1 }; },
-    async listDealHunterOpportunities() { return [{ opportunity_id: 'opportunity-3' }]; },
-    async listDealHunterOpportunityAliases() { return []; },
+    async listCimStage2IdentityOpportunities() { return [{ opportunity_id: 'opportunity-3' }]; },
+    async listCimStage2EvidenceAliases() { return []; },
   };
   const metrics = await getCimAutomationMetrics({ storage, config: automationConfig() });
   assert.equal(metrics.canonicalHumanReviews, 0);
   assert.equal(metrics.automatedReviews, 1);
   assert.equal(metrics.unlinkedEvidence, 1);
   assert.equal(metrics.incompatibleEvidence, 1);
+});
+
+test('a historical Stage 2 review remains readable but cannot supply current authority for a superseded opportunity', async () => {
+  const policy = getCimStage2Policy(automationConfig());
+  const historicalReview = humanReview(1, policy, {
+    opportunity_id: 'opportunity-superseded',
+    deal_key: 'historical-deal-key',
+  });
+  const storage = {
+    async listDealHunterCimReviews() { return [historicalReview]; },
+    async listDealHunterCimRequests() { return []; },
+    async listEmailEvents() { return []; },
+    async listCrmCommunications() { return { rows: [], totalPages: 1 }; },
+    async listCimStage2IdentityOpportunities() { return []; },
+    async listCimStage2EvidenceAliases() { return []; },
+  };
+
+  const metrics = await getCimAutomationMetrics({ storage, config: automationConfig() });
+
+  assert.equal(metrics.canonicalHumanReviews, 0);
+  assert.equal(metrics.unlinkedEvidence, 1);
+  assert.equal((await storage.listDealHunterCimReviews())[0], historicalReview);
+});
+
+test('an explicit active Stage 2 opportunity ID remains authoritative over deal-key aliases', async () => {
+  const policy = getCimStage2Policy(automationConfig());
+  const explicitReview = humanReview(1, policy, {
+    opportunity_id: 'opportunity-explicit-active',
+    deal_key: 'alias-owned-by-another-active-opportunity',
+  });
+  const storage = {
+    async listDealHunterCimReviews() { return [explicitReview]; },
+    async listDealHunterCimRequests() { return []; },
+    async listEmailEvents() { return []; },
+    async listCrmCommunications() { return { rows: [], totalPages: 1 }; },
+    async listCimStage2IdentityOpportunities() {
+      return [
+        { opportunity_id: 'opportunity-explicit-active', status: 'active' },
+        { opportunity_id: 'opportunity-alias-owner', status: 'active' },
+      ];
+    },
+    async listCimStage2EvidenceAliases() {
+      return [{
+        alias_type: 'deal-key',
+        alias_value: explicitReview.deal_key,
+        opportunity_id: 'opportunity-alias-owner',
+      }];
+    },
+  };
+
+  const metrics = await getCimAutomationMetrics({ storage, config: automationConfig() });
+
+  assert.equal(metrics.canonicalHumanReviews, 1);
+  assert.equal(metrics.stage2EligibleCohort, 1);
+  assert.equal(metrics.stage2UnchangedApprovals, 1);
+  assert.equal(metrics.unlinkedEvidence, 0);
+});
+
+test('a superseded HVAC loser review cannot rebound through an alias moved to the survivor', async () => {
+  const policy = getCimStage2Policy(automationConfig());
+  const historicalReview = humanReview(1, policy, {
+    opportunity_id: 'opp_c92d0c73-6a47-4fed-b528-6f310745e448',
+    deal_key: 'url:https://us.businessesforsale.com/us/hvac-plumbing-sheet-metal-business-and-real-estate.aspx',
+  });
+  const before = structuredClone(historicalReview);
+  const survivorId = 'opp_cd57a315-feaf-4158-a02e-4bdde97a922e';
+  const storage = {
+    async listDealHunterCimReviews() { return [historicalReview]; },
+    async listDealHunterCimRequests() { return []; },
+    async listEmailEvents() { return []; },
+    async listCrmCommunications() { return { rows: [], totalPages: 1 }; },
+    async listCimStage2IdentityOpportunities() {
+      return [{ opportunity_id: survivorId, status: 'active' }];
+    },
+    async listCimStage2EvidenceAliases() {
+      return [{
+        alias_type: 'deal-key',
+        alias_value: historicalReview.deal_key,
+        opportunity_id: survivorId,
+      }];
+    },
+  };
+
+  const metrics = await getCimAutomationMetrics({ storage, config: automationConfig() });
+
+  assert.equal(metrics.canonicalHumanReviews, 0);
+  assert.equal(metrics.stage2EligibleCohort, 0);
+  assert.equal(metrics.stage2UnchangedApprovals, 0);
+  assert.equal(metrics.unlinkedEvidence, 1);
+  assert.deepEqual(historicalReview, before, 'historical audit evidence must remain unchanged');
+});
+
+test('an explicit missing Stage 2 opportunity ID cannot use a matching current deal-key alias', async () => {
+  const policy = getCimStage2Policy(automationConfig());
+  const explicitMissingReview = humanReview(1, policy, {
+    opportunity_id: 'opportunity-missing-from-storage',
+    deal_key: 'legacy-looking-but-explicit',
+  });
+  const storage = {
+    async listDealHunterCimReviews() { return [explicitMissingReview]; },
+    async listDealHunterCimRequests() { return []; },
+    async listEmailEvents() { return []; },
+    async listCrmCommunications() { return { rows: [], totalPages: 1 }; },
+    async listCimStage2IdentityOpportunities() {
+      return [{ opportunity_id: 'opportunity-current-owner', status: 'active' }];
+    },
+    async listCimStage2EvidenceAliases() {
+      return [{
+        alias_type: 'deal-key',
+        alias_value: explicitMissingReview.deal_key,
+        opportunity_id: 'opportunity-current-owner',
+      }];
+    },
+  };
+
+  const metrics = await getCimAutomationMetrics({ storage, config: automationConfig() });
+
+  assert.equal(metrics.canonicalHumanReviews, 0);
+  assert.equal(metrics.stage2EligibleCohort, 0);
+  assert.equal(metrics.stage2UnchangedApprovals, 0);
+  assert.equal(metrics.unlinkedEvidence, 1);
+});
+
+test('a metadata-backed explicit Stage 2 opportunity ID cannot be masked by a blank legacy column', async () => {
+  const policy = getCimStage2Policy(automationConfig());
+  const explicitMetadataReview = humanReview(1, policy, {
+    opportunity_id: '   ',
+    deal_key: 'metadata-explicit-review-deal-key',
+    metadata: {
+      source: 'approval-queue',
+      stage2CohortEligible: true,
+      opportunityId: 'opportunity-missing-from-storage',
+    },
+  });
+  const storage = {
+    async listDealHunterCimReviews() { return [explicitMetadataReview]; },
+    async listDealHunterCimRequests() { return []; },
+    async listEmailEvents() { return []; },
+    async listCrmCommunications() { return { rows: [], totalPages: 1 }; },
+    async listCimStage2IdentityOpportunities() {
+      return [{ opportunity_id: 'opportunity-current-owner', status: 'active' }];
+    },
+    async listCimStage2EvidenceAliases() {
+      return [{
+        alias_type: 'deal-key',
+        alias_value: explicitMetadataReview.deal_key,
+        opportunity_id: 'opportunity-current-owner',
+      }];
+    },
+  };
+
+  const metrics = await getCimAutomationMetrics({ storage, config: automationConfig() });
+
+  assert.equal(metrics.canonicalHumanReviews, 0);
+  assert.equal(metrics.stage2EligibleCohort, 0);
+  assert.equal(metrics.stage2UnchangedApprovals, 0);
+  assert.equal(metrics.unlinkedEvidence, 1);
+});
+
+test('a truly legacy Stage 2 review with no explicit ID can use one current deal-key owner', async () => {
+  const policy = getCimStage2Policy(automationConfig());
+  const legacyReview = humanReview(1, policy, {
+    opportunity_id: null,
+    deal_key: 'legacy-review-deal-key',
+  });
+  const storage = {
+    async listDealHunterCimReviews() { return [legacyReview]; },
+    async listDealHunterCimRequests() { return []; },
+    async listEmailEvents() { return []; },
+    async listCrmCommunications() { return { rows: [], totalPages: 1 }; },
+    async listCimStage2IdentityOpportunities() {
+      return [{ opportunity_id: 'opportunity-legacy-current-owner', status: 'active' }];
+    },
+    async listCimStage2EvidenceAliases() {
+      return [{
+        alias_type: 'deal-key',
+        alias_value: legacyReview.deal_key,
+        opportunity_id: 'opportunity-legacy-current-owner',
+      }];
+    },
+  };
+
+  const metrics = await getCimAutomationMetrics({ storage, config: automationConfig() });
+
+  assert.equal(metrics.canonicalHumanReviews, 1);
+  assert.equal(metrics.stage2EligibleCohort, 1);
+  assert.equal(metrics.stage2UnchangedApprovals, 1);
+  assert.equal(metrics.unlinkedEvidence, 0);
 });
 
 test('configured Stage 2 and Stage 3 stay at effective Stage 1 without durable activation and every independent gate', async () => {
@@ -236,8 +424,8 @@ test('configured Stage 2 and Stage 3 stay at effective Stage 1 without durable a
       async listDealHunterCimRequests() { return []; },
       async listEmailEvents() { return []; },
       async listCrmCommunications() { return { rows: [], totalPages: 1 }; },
-      async listDealHunterOpportunities() { return []; },
-      async listDealHunterOpportunityAliases() { return []; },
+      async listCimStage2IdentityOpportunities() { return []; },
+      async listCimStage2EvidenceAliases() { return []; },
       async getDealHunterAutomationSettings() { return null; },
       async checkCimStage2Storage() { return { ok: true }; },
       async listCimStage2Runs() { return []; },
@@ -413,6 +601,11 @@ test('final Stage 2 authorization binds run, activation, claim, opportunity, rec
       async getCimStage2Decision() { return { ...decision, ...(overrides.decision || {}) }; },
       async getCimStage2Run() { return { ...run, ...(overrides.run || {}) }; },
       async getCurrentCimStage2Activation() { return { ...activation, ...(overrides.activation || {}) }; },
+      async getCurrentDealHunterOpportunity() {
+        return overrides.currentOpportunity === false
+          ? null
+          : { opportunity_id: deal.opportunityId, status: 'active' };
+      },
     },
     config,
     now: new Date('2026-07-13T16:00:00.000Z'),
@@ -429,6 +622,7 @@ test('final Stage 2 authorization binds run, activation, claim, opportunity, rec
     [{ snapshotDigest: 'wrong-snapshot' }, 'wrong_snapshot'],
     [{ decision: { claim_token: 'wrong-claim' } }, 'wrong_claim'],
     [{ decision: { consumed_at: '2026-07-13T15:59:00.000Z' } }, 'decision_consumed'],
+    [{ currentOpportunity: false }, 'opportunity_not_current'],
     [{ status: { ...validReservedStatus, blockerCodes: ['automation_pause'] } }, 'automatic_transmission_blocked'],
   ];
   for (const [overrides, expectedCode] of cases) {

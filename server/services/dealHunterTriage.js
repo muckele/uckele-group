@@ -248,7 +248,7 @@ export async function setTriageOperatorDecision({
 
   const updated = await storage.setDealHunterOpportunityOperatorDecision(decision);
 
-  const opportunity = await storage.getDealHunterOpportunity?.(id);
+  const opportunity = await storage.getCurrentDealHunterOpportunity?.(id);
   const submissionId = opportunity?.primary_submission_id || '';
   if (submissionId) {
     const parts = [];

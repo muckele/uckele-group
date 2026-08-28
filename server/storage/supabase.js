@@ -572,6 +572,65 @@ function chunkValues(values = [], size = 500) {
   return chunks;
 }
 
+function canonicalAliasOwnershipError(code, message, opportunityIds = []) {
+  const error = new Error(message);
+  error.code = code;
+  error.opportunityIds = [...opportunityIds];
+  return error;
+}
+
+async function completeCanonicalAliasOwners(client, aliasKeys = []) {
+  const keys = normalizeList(aliasKeys, Number.MAX_SAFE_INTEGER);
+  if (keys.length === 0) return [];
+  const ownerIds = new Set();
+  for (const keyChunk of chunkValues(keys, 500)) {
+    const pageSize = 100;
+    for (let offset = 0; ; ) {
+      const { data: aliases, error } = await client.from('deal_hunter_opportunity_aliases')
+        .select('opportunity_id')
+        .in('alias_key', keyChunk)
+        .order('alias_key')
+        .range(offset, offset + pageSize - 1);
+      if (error) throw error;
+      const page = aliases || [];
+      for (const alias of page) {
+        if (!alias.opportunity_id) {
+          throw canonicalAliasOwnershipError(
+            'DEAL_HUNTER_OPPORTUNITY_ALIAS_INTEGRITY',
+            'Deal Hunter opportunity alias ownership is missing its canonical owner identifier.',
+          );
+        }
+        ownerIds.add(alias.opportunity_id);
+      }
+      if (page.length < pageSize) break;
+      offset += page.length;
+    }
+  }
+  const orderedOwnerIds = [...ownerIds].sort();
+  if (orderedOwnerIds.length === 0) return [];
+  const ownersById = new Map();
+  for (const ownerChunk of chunkValues(orderedOwnerIds, 500)) {
+    const { data: owners, error } = await client.from('deal_hunter_opportunities')
+      .select('*')
+      .in('opportunity_id', ownerChunk)
+      .order('opportunity_id')
+      .range(0, ownerChunk.length - 1);
+    if (error) throw error;
+    for (const owner of owners || []) {
+      ownersById.set(owner.opportunity_id, normalizeDealHunterOpportunityRow(owner));
+    }
+  }
+  const missingOwnerIds = orderedOwnerIds.filter((opportunityId) => !ownersById.has(opportunityId));
+  if (missingOwnerIds.length > 0) {
+    throw canonicalAliasOwnershipError(
+      'DEAL_HUNTER_OPPORTUNITY_ALIAS_INTEGRITY',
+      'Deal Hunter opportunity alias references a missing canonical opportunity.',
+      missingOwnerIds,
+    );
+  }
+  return orderedOwnerIds.map((opportunityId) => ownersById.get(opportunityId));
+}
+
 function isUniqueViolation(error) {
   return error?.code === '23505' || /duplicate key|unique constraint/i.test(error?.message || '');
 }
@@ -834,14 +893,16 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       ];
       const usesLifecycleSubmissionFields = operation === 'update_submission'
         && lifecycleSubmissionFields.some((field) => Object.hasOwn(payload?.values || {}, field));
-      const rpcName = communicationsOperations.has(operation) || usesLifecycleSubmissionFields
-        ? 'mutate_communications_with_crm_activity'
-        : 'mutate_with_crm_activity';
-      const { data, error } = await client.rpc(rpcName, {
-        p_operation: operation,
-        p_payload: payload || {},
-        p_activity: activity,
-      });
+      const isSubmissionInsert = operation === 'insert_submission';
+      const rpcName = isSubmissionInsert
+        ? 'insert_submission_with_crm_activity'
+        : communicationsOperations.has(operation) || usesLifecycleSubmissionFields
+          ? 'mutate_communications_with_crm_activity'
+          : 'mutate_with_crm_activity';
+      const rpcPayload = isSubmissionInsert
+        ? { p_payload: payload || {}, p_activity: activity }
+        : { p_operation: operation, p_payload: payload || {}, p_activity: activity };
+      const { data, error } = await client.rpc(rpcName, rpcPayload);
 
       if (error) {
         throw error;
@@ -2619,12 +2680,10 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         payload.reviewed_semantic_digest = decision.reviewedSemanticDigest
           ? String(decision.reviewedSemanticDigest) : null;
       }
-      const { data, error } = await client
-        .from('deal_hunter_opportunity_scores')
-        .update(payload)
-        .eq('opportunity_id', opportunityId)
-        .select()
-        .maybeSingle();
+      const { data, error } = await client.rpc('set_deal_hunter_opportunity_operator_decision', {
+        p_opportunity_id: opportunityId,
+        p_decision: payload,
+      });
       if (error) throw error;
       return normalizeDealHunterOpportunityScoreRow(data);
     },
@@ -2643,13 +2702,16 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     async getCurrentDealHunterOpportunityScore(opportunityId) {
       const { data, error } = await client
         .from('deal_hunter_opportunity_scores')
-        .select('*')
+        .select('*,deal_hunter_opportunities!inner(status)')
         .eq('opportunity_id', String(opportunityId || '').trim())
         .eq('current_triage_eligible', true)
+        .eq('deal_hunter_opportunities.status', 'active')
         .limit(1)
         .maybeSingle();
       if (error) throw error;
-      return normalizeDealHunterOpportunityScoreRow(data);
+      if (!data) return null;
+      const { deal_hunter_opportunities: _opportunity, ...score } = data;
+      return normalizeDealHunterOpportunityScoreRow(score);
     },
 
     async reconcileDealHunterCurrentScoreEligibility(opportunityIds = []) {
@@ -2765,6 +2827,16 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterOpportunityRow(data);
     },
 
+    async getCurrentDealHunterOpportunity(opportunityId) {
+      if (!opportunityId) return null;
+      const { data, error } = await client.from('deal_hunter_opportunities').select('*')
+        .eq('opportunity_id', String(opportunityId).trim())
+        .eq('status', 'active')
+        .maybeSingle();
+      if (error) throw error;
+      return normalizeDealHunterOpportunityRow(data);
+    },
+
     async listDealHunterOpportunities({ opportunityIds = [], recipientEmails = [], limit = 1000 } = {}) {
       const ids = normalizeList(opportunityIds);
       const recipients = normalizeList(recipientEmails).map((value) => value.toLowerCase());
@@ -2778,9 +2850,24 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return rows.map(normalizeDealHunterOpportunityRow);
     },
 
+    async listCurrentDealHunterOpportunities({ opportunityIds = [], recipientEmails = [], limit = 1000 } = {}) {
+      const ids = normalizeList(opportunityIds);
+      const recipients = normalizeList(recipientEmails).map((value) => value.toLowerCase());
+      const rows = await collectPagedRows(() => {
+        let query = client.from('deal_hunter_opportunities').select('*')
+          .eq('status', 'active')
+          .order('updated_at', { ascending: false }).order('opportunity_id');
+        if (ids.length > 0) query = query.in('opportunity_id', ids);
+        if (recipients.length > 0) query = query.in('canonical_recipient', recipients);
+        return query;
+      }, limit);
+      return rows.map(normalizeDealHunterOpportunityRow);
+    },
+
     async listCimStage2IdentityOpportunities({ limit = 5000 } = {}) {
       const { data, error } = await client.from('deal_hunter_opportunities')
         .select('opportunity_id,primary_submission_id')
+        .eq('status', 'active')
         .order('updated_at', { ascending: false })
         .order('opportunity_id')
         .limit(Math.max(1, Math.min(Number(limit) || 5000, 100000)));
@@ -2790,23 +2877,81 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
 
     async listCimStage2EvidenceAliases({ limit = 10000 } = {}) {
       const { data, error } = await client.from('deal_hunter_opportunity_aliases')
-        .select('alias_type,alias_value,opportunity_id')
+        .select('alias_type,alias_value,opportunity_id,deal_hunter_opportunities!inner(status)')
+        .eq('deal_hunter_opportunities.status', 'active')
         .order('last_observed_at', { ascending: false })
         .order('alias_key')
         .limit(Math.max(1, Math.min(Number(limit) || 10000, 100000)));
       if (error) throw error;
-      return data || [];
+      return (data || []).map(({ deal_hunter_opportunities: _opportunity, ...alias }) => alias);
     },
 
     async findDealHunterOpportunityByAliases(aliasKeys = []) {
-      const keys = normalizeList(aliasKeys);
-      if (keys.length === 0) return null;
-      const { data: aliases, error } = await client.from('deal_hunter_opportunity_aliases')
-        .select('opportunity_id').in('alias_key', keys).limit(100);
+      const owners = await completeCanonicalAliasOwners(client, aliasKeys);
+      if (owners.length > 1) {
+        throw canonicalAliasOwnershipError(
+          'DEAL_HUNTER_OPPORTUNITY_ALIAS_CONFLICT',
+          'Conflicting Deal Hunter opportunity aliases require review.',
+          owners.map((owner) => owner.opportunity_id),
+        );
+      }
+      return owners[0] || null;
+    },
+
+    async findCurrentDealHunterOpportunityByAliases(aliasKeys = []) {
+      const owners = await completeCanonicalAliasOwners(client, aliasKeys);
+      if (owners.length > 1) {
+        throw canonicalAliasOwnershipError(
+          'DEAL_HUNTER_OPPORTUNITY_ALIAS_CONFLICT',
+          'Conflicting Deal Hunter opportunity aliases require review.',
+          owners.map((owner) => owner.opportunity_id),
+        );
+      }
+      if (owners[0] && owners[0].status !== 'active') {
+        const nonCurrentError = new Error('Deal Hunter opportunity alias belongs to a non-current canonical opportunity.');
+        nonCurrentError.code = 'DEAL_HUNTER_OPPORTUNITY_NOT_CURRENT';
+        nonCurrentError.opportunityId = owners[0].opportunity_id;
+        throw nonCurrentError;
+      }
+      return owners[0] || null;
+    },
+
+    async createDealHunterOpportunityWithAliases({
+      opportunity = {},
+      aliases: records = [],
+      existingOwnerMode = 'return-current',
+      identityException = null,
+    } = {}) {
+      const aliases = Array.isArray(records)
+        ? records.filter((record) => record?.alias_key && record?.opportunity_id)
+        : [];
+      if (!opportunity.opportunity_id || opportunity.status !== 'active' || aliases.length === 0) {
+        throw new Error('Atomic canonical opportunity creation requires one active opportunity and at least one alias.');
+      }
+      if (!['return-current', 'conflict'].includes(existingOwnerMode)) {
+        throw new Error('Atomic canonical opportunity creation received an unsupported existing-owner mode.');
+      }
+      const proposedOwnerIds = new Set(aliases.map((record) => record.opportunity_id));
+      if (proposedOwnerIds.size !== 1 || !proposedOwnerIds.has(opportunity.opportunity_id)) {
+        throw new Error('Atomic canonical opportunity aliases must target the proposed opportunity.');
+      }
+      const { data, error } = await client.rpc('create_deal_hunter_opportunity_with_aliases', {
+        p_opportunity: opportunity,
+        p_aliases: aliases,
+        p_existing_owner_mode: existingOwnerMode,
+        p_identity_exception: identityException,
+      });
       if (error) throw error;
-      const opportunityIds = [...new Set((aliases || []).map((item) => item.opportunity_id).filter(Boolean))];
-      if (opportunityIds.length > 1) throw new Error('Conflicting Deal Hunter opportunity aliases require review.');
-      return opportunityIds[0] ? this.getDealHunterOpportunity(opportunityIds[0]) : null;
+      return {
+        created: Boolean(data?.created),
+        linked: Boolean(data?.linked),
+        conflict: data?.conflict || null,
+        opportunity: normalizeDealHunterOpportunityRow(data?.opportunity),
+        aliases: (data?.aliases || []).map(normalizeDealHunterOpportunityAliasRow),
+        identityException: normalizeDealHunterIdentityExceptionRow(
+          data?.identityException || data?.identity_exception,
+        ),
+      };
     },
 
     async upsertDealHunterOpportunity(record = {}) {
@@ -2817,8 +2962,9 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         primary_submission_id: record.primary_submission_id || null,
         metadata: typeof record.metadata === 'object' && record.metadata !== null ? record.metadata : {},
       };
-      const { data, error } = await client.from('deal_hunter_opportunities')
-        .upsert(payload, { onConflict: 'opportunity_id' }).select().single();
+      const { data, error } = await client.rpc('upsert_deal_hunter_opportunity', {
+        p_record: payload,
+      });
       if (error) throw error;
       return normalizeDealHunterOpportunityRow(data);
     },
@@ -2837,34 +2983,23 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     async upsertDealHunterOpportunityAlias(record = {}) {
-      const existing = await client.from('deal_hunter_opportunity_aliases').select('*')
-        .eq('alias_key', record.alias_key).maybeSingle();
-      if (existing.error) throw existing.error;
-      if (existing.data?.opportunity_id && existing.data.opportunity_id !== record.opportunity_id) {
-        return normalizeDealHunterOpportunityAliasRow(existing.data);
-      }
-      const payload = { ...record, source: record.source || null, resolved_by: record.resolved_by || null, metadata: record.metadata || {} };
-      const mutation = existing.data
-        ? client.from('deal_hunter_opportunity_aliases')
-            .update({
-              last_observed_at: payload.last_observed_at,
-              source: payload.source || existing.data.source || null,
-              metadata: payload.metadata,
-            })
-            .eq('alias_key', payload.alias_key)
-            .eq('opportunity_id', payload.opportunity_id)
-            .select()
-            .single()
-        : client.from('deal_hunter_opportunity_aliases').insert(payload).select().single();
-      const { data, error } = await mutation;
-      if (error && isUniqueViolation(error)) {
+      const payload = {
+        ...record,
+        source: record.source || null,
+        resolved_by: record.resolved_by || null,
+        metadata: record.metadata || {},
+      };
+      const { data, error } = await client.rpc('link_deal_hunter_opportunity_aliases', {
+        p_aliases: [payload],
+      });
+      if (error) throw error;
+      if (data?.linked === false) {
         const conflict = await client.from('deal_hunter_opportunity_aliases').select('*')
           .eq('alias_key', record.alias_key).single();
         if (conflict.error) throw conflict.error;
         return normalizeDealHunterOpportunityAliasRow(conflict.data);
       }
-      if (error) throw error;
-      return normalizeDealHunterOpportunityAliasRow(data);
+      return normalizeDealHunterOpportunityAliasRow(data?.aliases?.[0]);
     },
 
     async linkDealHunterOpportunityAliases(records = []) {
@@ -2977,19 +3112,27 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     async upsertDealHunterCimRecipientOverride(record = {}) {
-      const { data, error } = await client.from('deal_hunter_cim_recipient_overrides')
-        .upsert({ ...record, recipient_email: String(record.recipient_email || '').toLowerCase(), metadata: record.metadata || {} }, { onConflict: 'id' })
-        .select().single();
+      const { data, error } = await client.rpc('upsert_deal_hunter_cim_recipient_override', {
+        p_record: {
+          ...record,
+          recipient_email: String(record.recipient_email || '').toLowerCase(),
+          metadata: record.metadata || {},
+        },
+      });
       if (error) throw error;
       return data;
     },
 
     async getActiveDealHunterCimRecipientOverride({ opportunityId = '', recipientEmail = '', nowIso = '' } = {}) {
-      const { data, error } = await client.from('deal_hunter_cim_recipient_overrides').select('*')
+      const { data, error } = await client.from('deal_hunter_cim_recipient_overrides')
+        .select('*,deal_hunter_opportunities!inner(status)')
         .eq('opportunity_id', opportunityId).eq('recipient_email', String(recipientEmail).toLowerCase())
+        .eq('deal_hunter_opportunities.status', 'active')
         .is('consumed_at', null).gt('expires_at', nowIso).order('created_at', { ascending: false }).limit(1).maybeSingle();
       if (error) throw error;
-      return data || null;
+      if (!data) return null;
+      const { deal_hunter_opportunities: _opportunity, ...override } = data;
+      return override;
     },
 
     async consumeDealHunterCimRecipientOverride(id, consumedAt) {

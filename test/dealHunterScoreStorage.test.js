@@ -175,6 +175,49 @@ test('only eligibility reconciliation can place historical scores in the current
   assert.equal(evidence.length, 2, 'deactivation preserves historical evidence');
 });
 
+test('superseded opportunities retain score history but cannot be scored, reactivated, or used in current triage', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage);
+  await storage.writeDealHunterOpportunityScore(scorePayload(), evidencePayload());
+  await storage.reconcileDealHunterCurrentScoreEligibility(['opp-score-1']);
+  const opportunity = await storage.getDealHunterOpportunity('opp-score-1');
+  await storage.upsertDealHunterOpportunity({
+    ...opportunity,
+    updated_at: '2026-08-27T11:00:00.000Z',
+    status: 'superseded',
+    metadata: { canonicalOpportunityMerge: { mergedInto: 'opp-score-survivor' } },
+  });
+
+  assert.equal((await storage.getDealHunterOpportunityScore('opp-score-1')).score_fingerprint, 'fingerprint-a');
+  assert.equal((await storage.listDealHunterScoreEvidence('opp-score-1')).length, 2);
+  assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
+  assert.deepEqual(
+    await storage.listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 25 }),
+    { rows: [], total: 0, page: 1, pageSize: 25, totalPages: 1 },
+  );
+  assert.deepEqual(
+    await storage.reconcileDealHunterCurrentScoreEligibility(['opp-score-1']),
+    { activated: 0, deactivated: 1 },
+  );
+  assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
+  await assert.rejects(
+    storage.writeDealHunterOpportunityScore(
+      scorePayload({ score_fingerprint: 'superseded-rewrite' }),
+      evidencePayload('superseded-rewrite'),
+    ),
+    /superseded|not current/i,
+  );
+  await assert.rejects(
+    storage.setDealHunterOpportunityOperatorDecision({
+      opportunityId: 'opp-score-1',
+      priority: 'urgent',
+      updatedAt: '2026-08-27T11:01:00.000Z',
+    }),
+    /superseded|not current/i,
+  );
+  assert.equal((await storage.getDealHunterOpportunityScore('opp-score-1')).operator_priority, 'normal');
+});
+
 test('machine score payloads cannot set current-triage eligibility', async (t) => {
   const storage = withStorage(t);
   await seedOpportunity(storage);
@@ -386,11 +429,13 @@ function supabaseRowClient(row) {
   let table = null;
   let pendingUpdate = null;
   let currentOnly = false;
+  let currentAuthorityOnly = false;
   const chain = {
     from(name) {
       table = name;
       pendingUpdate = null;
       currentOnly = false;
+      currentAuthorityOnly = false;
       return chain;
     },
     select() {
@@ -406,6 +451,9 @@ function supabaseRowClient(row) {
       else if (column === 'current_triage_eligible') {
         assert.equal(value, true);
         currentOnly = true;
+      } else if (column === 'deal_hunter_opportunities.status') {
+        assert.equal(value, 'active');
+        currentAuthorityOnly = true;
       } else assert.fail(`unexpected Supabase score filter ${column}`);
       if (pendingUpdate) Object.assign(row, pendingUpdate);
       return chain;
@@ -415,6 +463,13 @@ function supabaseRowClient(row) {
     },
     async maybeSingle() {
       if (currentOnly && !row.current_triage_eligible) return { data: null, error: null };
+      if (currentAuthorityOnly && row.opportunity_status !== 'active') return { data: null, error: null };
+      return { data: { ...row }, error: null };
+    },
+    async rpc(name, payload) {
+      assert.equal(name, 'set_deal_hunter_opportunity_operator_decision');
+      assert.equal(payload.p_opportunity_id, row.opportunity_id);
+      Object.assign(row, payload.p_decision);
       return { data: { ...row }, error: null };
     },
   };
@@ -449,6 +504,7 @@ function storedScoreRow(overrides = {}) {
     reviewed_fingerprint: null,
     reviewed_semantic_digest: null,
     current_triage_eligible: true,
+    opportunity_status: 'active',
     ...overrides,
   };
 }
@@ -587,6 +643,13 @@ test('Supabase: current lookup filters eligibility and reconciliation uses the d
     name: 'reconcile_deal_hunter_current_score_eligibility',
     payload: { p_opportunity_ids: ['opp-3', 'opp-1'] },
   }]);
+});
+
+test('Supabase: current score lookup rejects a superseded opportunity without hiding score history', async () => {
+  const storage = supabaseStorageOver(storedScoreRow({ opportunity_status: 'superseded' }));
+
+  assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
+  assert.equal((await storage.getDealHunterOpportunityScore('opp-score-1')).score_fingerprint, 'fingerprint-a');
 });
 
 test('both storage providers expose the same scoring surface', () => {
