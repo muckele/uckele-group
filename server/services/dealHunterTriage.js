@@ -81,9 +81,10 @@ function publicTriageSummary(summary = {}) {
   };
 }
 
-// The row an operator scans. Fit and confidence stay separate values; there is
-// deliberately no blended certainty number.
-export function publicTriageRow(row = {}) {
+// The list row an operator scans. Fit and confidence stay separate values;
+// there is deliberately no blended certainty number. Detail and decision
+// responses can explicitly retain the persisted operator note.
+export function publicTriageRow(row = {}, { includeOperatorNote = false } = {}) {
   return {
     opportunityId: row.opportunity_id,
     dealKey: row.deal_key || '',
@@ -114,6 +115,7 @@ export function publicTriageRow(row = {}) {
     },
     observationFreshness: row.observation_freshness || row.scored_at || '',
     operatorPriority: row.operator_priority || 'normal',
+    ...(includeOperatorNote ? { operatorNote: row.operator_note || '' } : {}),
     reviewed: Boolean(row.reviewed),
     reviewedAt: row.reviewed_at || '',
     reviewedBy: row.reviewed_by || '',
@@ -218,7 +220,7 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
     byDimension.set(row.dimension, rows);
   }
 
-  const summary = publicTriageRow(score);
+  const summary = publicTriageRow(score, { includeOperatorNote: true });
   return {
     ok: true,
     status: 200,
@@ -311,5 +313,5 @@ export async function setTriageOperatorDecision({
     });
   }
 
-  return { ok: true, status: 200, opportunity: publicTriageRow(updated) };
+  return { ok: true, status: 200, opportunity: publicTriageRow(updated, { includeOperatorNote: true }) };
 }

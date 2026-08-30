@@ -322,7 +322,7 @@ test('service normalizes malformed and fractional pagination before asking stora
 
 test('queue list rows omit full operator notes before and after public mapping', async (t) => {
   const storage = await seedQueue(t);
-  const sentinel = 'operator-note-sentinel-'.repeat(100);
+  const sentinel = 'operator-note-sentinel-'.repeat(100).slice(0, 2000);
   await setTriageOperatorDecision({ opportunityId: 'opp-high', note: sentinel, storage });
   const raw = await storage.listDealHunterOpportunityScores({ view: 'all', pageSize: 100 });
   const persisted = raw.rows.find((row) => row.opportunity_id === 'opp-high');
@@ -331,6 +331,16 @@ test('queue list rows omit full operator notes before and after public mapping',
   const row = queue.rows.find((item) => item.opportunityId === 'opp-high');
   assert.equal(Object.hasOwn(row, 'operatorNote'), false);
   assert.equal(JSON.stringify(row).includes(sentinel), false);
+});
+
+test('triage detail retains a persisted operator note that the list redacts', async (t) => {
+  const storage = await seedQueue(t);
+  const sentinel = 'operator-note-sentinel-'.repeat(100).slice(0, 2000);
+  await setTriageOperatorDecision({ opportunityId: 'opp-high', note: sentinel, storage });
+
+  const detail = await getTriageOpportunityDetail({ opportunityId: 'opp-high', storage });
+  assert.equal(detail.ok, true);
+  assert.equal(detail.opportunity.operatorNote, sentinel);
 });
 
 test('queue summary uses the same persisted view semantics and browsing never scores or writes', async (t) => {
@@ -486,11 +496,12 @@ test('operator priority is recorded without touching the machine score', async (
   });
   assert.equal(result.ok, true);
   assert.equal(result.opportunity.operatorPriority, 'urgent');
-  assert.equal(Object.hasOwn(result.opportunity, 'operatorNote'), false,
-    'queue projections keep full notes out of the scan-ready response');
+  assert.equal(result.opportunity.operatorNote, 'Broker call booked.');
   const persisted = await storage.getDealHunterOpportunityScore('opp-watch');
   assert.equal(persisted.operator_note, 'Broker call booked.',
     'the operator decision still persists its note for a later detail surface');
+  const detail = await getTriageOpportunityDetail({ opportunityId: 'opp-watch', storage });
+  assert.equal(detail.opportunity.operatorNote, 'Broker call booked.');
   assert.equal(result.opportunity.fitScore, before.fit_score, 'human priority does not rewrite the machine number');
 
   const highPriority = await listTriageQueue({ view: 'high-priority', storage });
