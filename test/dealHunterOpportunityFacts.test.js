@@ -692,8 +692,10 @@ test('Supabase source-observation snapshot replacement is one constrained RPC wi
 });
 
 test('Supabase snapshot replacement is a function-only, transactional, server-only migration matching the fresh schema', () => {
-  // Break caught: a future schema drifts to a partial client sequence, exposes
-  // the replacement boundary to non-server roles, or adds upgrade-risky DDL.
+  // Break caught: concurrent replacements for one source record delete stale
+  // fields before either one inserts, leaving their union instead of either
+  // caller's complete snapshot; the transaction-scoped advisory lock makes
+  // that source-record replacement linearizable.
   const migration = fs.readFileSync(opportunitySourceObservationSnapshotMigrationUrl, 'utf8');
   const schema = fs.readFileSync(supabaseSchemaUrl, 'utf8');
   for (const [label, sql] of [['migration', migration], ['fresh schema', schema]]) {
@@ -704,6 +706,15 @@ test('Supabase snapshot replacement is a function-only, transactional, server-on
     assert.match(definition, /delete from public\.deal_hunter_opportunity_source_observations/i, `${label} must reconcile stale fields`);
     assert.match(definition, /insert into public\.deal_hunter_opportunity_source_observations/i, `${label} must write incoming fields`);
     assert.match(definition, /on conflict \(opportunity_id, source_id, source_record_id, field\) do update/i, `${label} must preserve row identity on refresh`);
+    assert.match(
+      definition,
+      /perform\s+pg_catalog\.pg_advisory_xact_lock\(\s*pg_catalog\.hashtextextended\(\s*pg_catalog\.jsonb_build_array\(\s*p_opportunity_id\s*,\s*p_source_id\s*,\s*p_source_record_id\s*\)::text\s*,\s*0\s*\)\s*\)\s*;/is,
+      `${label} must serialize each complete source-record snapshot with an unambiguous transaction-scoped advisory lock`,
+    );
+    const lockIndex = definition.search(/perform\s+pg_catalog\.pg_advisory_xact_lock/i);
+    const deleteIndex = definition.search(/delete from public\.deal_hunter_opportunity_source_observations/i);
+    const insertIndex = definition.search(/insert into public\.deal_hunter_opportunity_source_observations/i);
+    assert.ok(lockIndex >= 0 && lockIndex < deleteIndex && lockIndex < insertIndex, `${label} must acquire the lock before snapshot reconciliation`);
     assert.match(sql, /revoke all privileges on function public\.replace_deal_hunter_opportunity_source_observation_snapshot/i, `${label} must revoke public execution`);
     assert.match(sql, /grant execute on function public\.replace_deal_hunter_opportunity_source_observation_snapshot/i, `${label} must grant only service execution`);
   }

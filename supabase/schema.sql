@@ -4308,6 +4308,13 @@ begin
     raise exception 'source observation snapshot rows must share one source record identity';
   end if;
 
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(p_opportunity_id, p_source_id, p_source_record_id)::text,
+      0
+    )
+  );
+
   delete from public.deal_hunter_opportunity_source_observations as stored
   where stored.opportunity_id = p_opportunity_id
     and stored.source_id = p_source_id
