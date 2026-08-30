@@ -1,6 +1,9 @@
 import { createClient } from '@supabase/supabase-js';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
-import { normalizeOpportunitySourceObservation } from '../services/dealHunterOpportunityFacts.js';
+import {
+  normalizeOpportunitySourceObservation,
+  normalizeOpportunitySourceObservationSnapshot,
+} from '../services/dealHunterOpportunityFacts.js';
 
 function normalizeSubmissionRow(row) {
   return {
@@ -3058,6 +3061,20 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         });
       if (error) throw error;
       return normalizeDealHunterOpportunitySourceObservationRow(data);
+    },
+
+    async replaceDealHunterOpportunitySourceObservationSnapshot(snapshot = {}) {
+      const normalizedSnapshot = normalizeOpportunitySourceObservationSnapshot(snapshot);
+      const { data, error } = await client
+        .rpc('replace_deal_hunter_opportunity_source_observation_snapshot', {
+          p_opportunity_id: normalizedSnapshot.opportunity_id,
+          p_source_id: normalizedSnapshot.source_id,
+          p_source_name: normalizedSnapshot.source_name,
+          p_source_record_id: normalizedSnapshot.source_record_id,
+          p_observations: normalizedSnapshot.observations,
+        });
+      if (error) throw error;
+      return (data || []).map(normalizeDealHunterOpportunitySourceObservationRow);
     },
 
     async listDealHunterOpportunityAliases({ opportunityIds = [], aliasKeys = [], limit = 5000 } = {}) {

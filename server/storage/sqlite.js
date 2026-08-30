@@ -3,7 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
-import { normalizeOpportunitySourceObservation } from '../services/dealHunterOpportunityFacts.js';
+import {
+  normalizeOpportunitySourceObservation,
+  normalizeOpportunitySourceObservationSnapshot,
+} from '../services/dealHunterOpportunityFacts.js';
 import {
   buildCanonicalOpportunityMergePlan,
   canonicalOpportunityMergeManifestId,
@@ -7851,6 +7854,43 @@ export function createSqliteStorage(config) {
         normalizedObservation.source_record_id,
         normalizedObservation.field,
       ));
+    },
+
+    async replaceDealHunterOpportunitySourceObservationSnapshot(snapshot = {}) {
+      const normalizedSnapshot = normalizeOpportunitySourceObservationSnapshot(snapshot);
+      const replace = database.transaction((value) => {
+        for (const observation of value.observations) {
+          database.prepare(`
+            INSERT INTO deal_hunter_opportunity_source_observations (
+              id, opportunity_id, source_id, source_name, source_record_id, field, value,
+              observed_at, created_at, updated_at
+            ) VALUES (
+              @id, @opportunity_id, @source_id, @source_name, @source_record_id, @field, @value,
+              @observed_at, @created_at, @updated_at
+            )
+            ON CONFLICT(opportunity_id, source_id, source_record_id, field) DO UPDATE SET
+              source_name = excluded.source_name,
+              value = excluded.value,
+              observed_at = excluded.observed_at,
+              updated_at = excluded.updated_at
+          `).run(observation);
+        }
+        const fields = value.observations.map((observation) => observation.field);
+        const condition = fields.length > 0
+          ? `AND field NOT IN (${fields.map(() => '?').join(', ')})`
+          : '';
+        database.prepare(`
+          DELETE FROM deal_hunter_opportunity_source_observations
+          WHERE opportunity_id = ? AND source_id = ? AND source_record_id = ? ${condition}
+        `).run(value.opportunity_id, value.source_id, value.source_record_id, ...fields);
+        return database.prepare(`
+          SELECT * FROM deal_hunter_opportunity_source_observations
+          WHERE opportunity_id = ? AND source_id = ? AND source_record_id = ?
+          ORDER BY observed_at DESC, id ASC
+        `).all(value.opportunity_id, value.source_id, value.source_record_id)
+          .map(normalizeDealHunterOpportunitySourceObservationRow);
+      });
+      return replace(normalizedSnapshot);
     },
 
     async linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt = '' } = {}) {

@@ -41,7 +41,7 @@ import {
   recordCimSafetyMetric,
   resolveDealHunterOpportunity,
 } from './cimOpportunityIdentity.js';
-import { buildOpportunitySourceObservations } from './dealHunterOpportunityFacts.js';
+import { buildOpportunitySourceObservationSnapshot } from './dealHunterOpportunityFacts.js';
 
 const defaultTimeoutMs = 45000;
 const sheetWorkbookExpandedMaxBytes = 32 * 1024 * 1024;
@@ -2776,6 +2776,17 @@ function sourceRecord(deal = {}) {
   };
 }
 
+function sourceObservationDeal(deal = {}) {
+  const fields = [
+    'sourceId', 'sourceName', 'sourceRowId', 'id', 'stableExternalId', 'idFromSourceRowPosition',
+    'name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
+    'annualProfit', 'annualRevenue', 'askingPrice', 'profitMultiple', 'netMargin', 'yearsEstablished',
+    'remoteFlag', 'franchiseFlag', 'fiveYearsFlag', 'brokerName', 'brokerCompany', 'brokerContact',
+    'brokerEmail', 'listingUrl', 'listingSource', 'dateAdded', 'lastUpdated',
+  ];
+  return Object.fromEntries(fields.map((field) => [field, deal[field]]));
+}
+
 function fieldProvenanceEntry(deal = {}, resolution = 'direct') {
   return {
     sourceId: deal.sourceId || '',
@@ -2847,7 +2858,7 @@ function initializeDealIdentity(deal = {}) {
     identityAliases,
     dealKeyAliases,
     sourceRecords: deal.sourceRecords?.length ? deal.sourceRecords : [sourceRecord(deal)],
-    sourceObservationDeals: Array.isArray(deal.sourceObservationDeals) ? deal.sourceObservationDeals : [deal],
+    sourceObservationDeals: Array.isArray(deal.sourceObservationDeals) ? deal.sourceObservationDeals : [sourceObservationDeal(deal)],
     fieldProvenance: initialFieldProvenance(deal),
     fieldConflicts: Array.isArray(deal.fieldConflicts) ? deal.fieldConflicts : [],
     deduplicationMatches: deal.deduplicationMatches || [],
@@ -3075,8 +3086,8 @@ function mergeSyndicatedDeals(canonical, duplicate, decision) {
     ]),
     sourceRecords: [...(canonical.sourceRecords || [sourceRecord(canonical)]), ...(duplicate.sourceRecords || [sourceRecord(duplicate)])],
     sourceObservationDeals: [
-      ...(canonical.sourceObservationDeals || [canonical]),
-      ...(duplicate.sourceObservationDeals || [duplicate]),
+      ...(canonical.sourceObservationDeals || [sourceObservationDeal(canonical)]),
+      ...(duplicate.sourceObservationDeals || [sourceObservationDeal(duplicate)]),
     ],
     deduplicationMatches: [
       ...(canonical.deduplicationMatches || []),
@@ -5149,17 +5160,28 @@ async function attachCanonicalOpportunityIdentities(storage, deals = []) {
       if (candidateIndex >= 0) candidates[candidateIndex] = resolution.opportunity;
       else candidates.push(resolution.opportunity);
     }
-    if (resolution.ok && resolution.opportunityId && typeof storage.upsertDealHunterOpportunitySourceObservation === 'function') {
+    if (resolution.ok && resolution.opportunityId && typeof storage.replaceDealHunterOpportunitySourceObservationSnapshot === 'function') {
       const now = new Date().toISOString();
-      const observations = (deal.sourceObservationDeals || [deal]).flatMap((sourceDeal) => (
-        buildOpportunitySourceObservations({ opportunityId: resolution.opportunityId, deal: sourceDeal, now })
-      ));
-      for (const observation of observations) {
-        await storage.upsertDealHunterOpportunitySourceObservation(observation);
+      const snapshotsBySourceRecord = new Map();
+      for (const sourceDeal of deal.sourceObservationDeals || [sourceObservationDeal(deal)]) {
+        const snapshot = buildOpportunitySourceObservationSnapshot({ opportunityId: resolution.opportunityId, deal: sourceDeal, now });
+        if (!snapshot) continue;
+        const key = [snapshot.opportunity_id, snapshot.source_id, snapshot.source_record_id].join('\u0000');
+        const current = snapshotsBySourceRecord.get(key);
+        if (!current) {
+          snapshotsBySourceRecord.set(key, snapshot);
+          continue;
+        }
+        const fields = new Set(current.observations.map((observation) => observation.field));
+        current.observations.push(...snapshot.observations.filter((observation) => !fields.has(observation.field)));
+      }
+      for (const snapshot of snapshotsBySourceRecord.values()) {
+        await storage.replaceDealHunterOpportunitySourceObservationSnapshot(snapshot);
       }
     }
+    const { sourceObservationDeals: _sourceObservationDeals, ...resolvedDeal } = deal;
     resolvedDeals.push({
-      ...deal,
+      ...resolvedDeal,
       opportunityId: resolution.opportunityId || '',
       identityStatus: resolution.ok ? 'resolved' : resolution.status || 'unavailable',
       identityResolution: resolution.resolution || '',

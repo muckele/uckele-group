@@ -3,10 +3,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import {
   getEffectiveOpportunityFacts,
+  buildOpportunitySourceObservationSnapshot,
   opportunityFactFields,
   opportunitySourceObservationFields,
   normalizeOpportunityFactField,
@@ -21,6 +23,10 @@ import {
 const supabaseModule = await import('../server/storage/supabase.js');
 const opportunityFactWriteBoundaryMigrationUrl = new URL(
   '../supabase/migrations/20260830130000_deal_hunter_opportunity_fact_write_boundary.sql',
+  import.meta.url,
+);
+const opportunitySourceObservationSnapshotMigrationUrl = new URL(
+  '../supabase/migrations/20260830140000_deal_hunter_source_observation_snapshot.sql',
   import.meta.url,
 );
 const supabaseSchemaUrl = new URL('../supabase/schema.sql', import.meta.url);
@@ -58,6 +64,17 @@ function observationRecord(overrides = {}) {
     created_at: '2026-08-30T12:30:00.000Z',
     updated_at: '2026-08-30T12:30:00.000Z',
     ...overrides,
+  };
+}
+
+function observationSnapshot(overrides = {}) {
+  const observation = observationRecord(overrides);
+  return {
+    opportunity_id: observation.opportunity_id,
+    source_id: observation.source_id,
+    source_name: observation.source_name,
+    source_record_id: observation.source_record_id,
+    observations: [observation],
   };
 }
 
@@ -185,6 +202,47 @@ function constrainedSupabaseBoundary() {
           observations.set(key, row);
           observationKeysById.set(row.id, key);
           return { data: row, error: null };
+        }
+        if (name === 'replace_deal_hunter_opportunity_source_observation_snapshot') {
+          const incoming = Array.isArray(payload.p_observations) ? payload.p_observations : [];
+          const snapshotRows = incoming.map((row) => ({
+            id: row.id,
+            opportunity_id: payload.p_opportunity_id,
+            source_id: payload.p_source_id,
+            source_name: payload.p_source_name,
+            source_record_id: payload.p_source_record_id,
+            field: row.field,
+            value: row.value,
+            observed_at: row.observed_at,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+          }));
+          const nextObservations = new Map(observations);
+          const nextIds = new Map(observationKeysById);
+          const snapshotKey = [payload.p_opportunity_id, payload.p_source_id, payload.p_source_record_id].join('\u0000');
+          for (const [key, row] of nextObservations) {
+            if (key.startsWith(`${snapshotKey}\u0000`)) nextObservations.delete(key);
+          }
+          for (const row of snapshotRows) {
+            const key = observationKey(row);
+            const previousKey = nextIds.get(row.id);
+            if (previousKey && previousKey !== key) {
+              return { data: null, error: new Error('duplicate key value violates unique constraint on observation id') };
+            }
+            const existing = observations.get(key);
+            const stored = existing ? { ...existing, ...row, id: existing.id, created_at: existing.created_at } : row;
+            nextObservations.set(key, stored);
+            nextIds.set(stored.id, key);
+          }
+          observations.clear();
+          for (const [key, row] of nextObservations) observations.set(key, row);
+          observationKeysById.clear();
+          for (const [id, key] of nextIds) observationKeysById.set(id, key);
+          return { data: [...nextObservations.values()].filter((row) => (
+            row.opportunity_id === payload.p_opportunity_id
+            && row.source_id === payload.p_source_id
+            && row.source_record_id === payload.p_source_record_id
+          )), error: null };
         }
         throw new Error(`Unexpected RPC: ${name}`);
       },
@@ -535,6 +593,121 @@ test('source observations normalize the bounded Deal Hunter field set and reject
     supabase.upsertDealHunterOpportunitySourceObservation(observationRecord({ observed_at: 'not-a-timestamp' })),
     /valid timestamp/,
   );
+});
+
+test('a no-explicit-ID Sheet observation snapshot keeps its source record identity when the listing URL is corrected', () => {
+  // Break caught: a corrected Sheet URL forks a new observation record even
+  // though the source row remains the same supported no-ID Sheet record.
+  const sourceDeal = {
+    sourceId: 'sheet-0',
+    sourceName: 'SMB Deal Hunter Google Sheet',
+    sourceRowId: '42',
+    id: '42',
+    idFromSourceRowPosition: true,
+    stableExternalId: false,
+    name: 'No-ID Sheet HVAC',
+    listingUrl: 'https://broker.example/original-listing',
+    annualProfit: 450000,
+  };
+  const first = buildOpportunitySourceObservationSnapshot({ opportunityId, deal: sourceDeal, now: '2026-08-30T12:30:00.000Z' });
+  const corrected = buildOpportunitySourceObservationSnapshot({
+    opportunityId,
+    deal: { ...sourceDeal, listingUrl: 'https://broker.example/corrected-listing' },
+    now: '2026-08-30T13:30:00.000Z',
+  });
+
+  assert.equal(first.source_record_id, 'sheet-row:42');
+  assert.equal(corrected.source_record_id, first.source_record_id);
+  assert.deepEqual(
+    corrected.observations.map((observation) => observation.id),
+    first.observations.map((observation) => observation.id),
+  );
+});
+
+test('SQLite source-observation snapshot replacement rolls back entirely when one incoming field write fails', async (t) => {
+  // Break caught: sequential writes leave a durable hybrid of old and new
+  // source values after a mid-snapshot persistence error.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-observation-snapshot-rollback-'));
+  const sqlitePath = path.join(directory, 'facts.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  await seedOpportunity(storage);
+
+  const original = observationSnapshot();
+  original.observations.push(observationRecord({
+    id: 'sheet:row-42:annual_revenue',
+    field: 'annual_revenue',
+    value: '1200000',
+  }));
+  await storage.replaceDealHunterOpportunitySourceObservationSnapshot(original);
+  const before = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+
+  const database = new Database(sqlitePath);
+  database.exec(`
+    CREATE TRIGGER fail_source_observation_snapshot
+    BEFORE INSERT ON deal_hunter_opportunity_source_observations
+    WHEN NEW.field = 'annual_revenue'
+    BEGIN
+      SELECT RAISE(ABORT, 'injected source snapshot failure');
+    END;
+  `);
+  database.close();
+
+  const replacement = observationSnapshot({ value: 'Updated Seller' });
+  replacement.observations.push(observationRecord({
+    id: 'sheet:row-42:annual_revenue',
+    field: 'annual_revenue',
+    value: '1400000',
+    updated_at: '2026-08-30T13:00:00.000Z',
+  }));
+  await assert.rejects(
+    storage.replaceDealHunterOpportunitySourceObservationSnapshot(replacement),
+    /injected source snapshot failure/,
+  );
+  assert.deepEqual(await storage.listDealHunterOpportunitySourceObservations(opportunityId), before);
+});
+
+test('Supabase source-observation snapshot replacement is one constrained RPC with SQLite-equivalent replacement semantics', async () => {
+  // Break caught: Supabase performs a partial client-side sequence instead of
+  // one atomic source-record replacement boundary.
+  const boundary = constrainedSupabaseBoundary();
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: boundary.client },
+  );
+  const first = observationSnapshot();
+  first.observations.push(observationRecord({ id: 'sheet:row-42:annual_revenue', field: 'annual_revenue', value: '1200000' }));
+  await storage.replaceDealHunterOpportunitySourceObservationSnapshot(first);
+  const refreshed = observationSnapshot({ value: 'Updated Seller', updated_at: '2026-08-30T13:00:00.000Z' });
+  await storage.replaceDealHunterOpportunitySourceObservationSnapshot(refreshed);
+
+  assert.deepEqual(boundary.calls.map((call) => call.name), [
+    'replace_deal_hunter_opportunity_source_observation_snapshot',
+    'replace_deal_hunter_opportunity_source_observation_snapshot',
+  ]);
+  assert.deepEqual(boundary.calls[1].payload.p_observations.map((observation) => observation.field), ['seller_name']);
+});
+
+test('Supabase snapshot replacement is a function-only, transactional, server-only migration matching the fresh schema', () => {
+  // Break caught: a future schema drifts to a partial client sequence, exposes
+  // the replacement boundary to non-server roles, or adds upgrade-risky DDL.
+  const migration = fs.readFileSync(opportunitySourceObservationSnapshotMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(supabaseSchemaUrl, 'utf8');
+  for (const [label, sql] of [['migration', migration], ['fresh schema', schema]]) {
+    const definition = rpcDefinition(sql, 'replace_deal_hunter_opportunity_source_observation_snapshot');
+    assert.match(definition, /returns setof public\.deal_hunter_opportunity_source_observations/i, `${label} must return its complete replacement snapshot`);
+    assert.match(definition, /security definer/i, `${label} must keep replacement server-side`);
+    assert.match(definition, /set search_path = public/i, `${label} must pin its search path`);
+    assert.match(definition, /delete from public\.deal_hunter_opportunity_source_observations/i, `${label} must reconcile stale fields`);
+    assert.match(definition, /insert into public\.deal_hunter_opportunity_source_observations/i, `${label} must write incoming fields`);
+    assert.match(definition, /on conflict \(opportunity_id, source_id, source_record_id, field\) do update/i, `${label} must preserve row identity on refresh`);
+    assert.match(sql, /revoke all privileges on function public\.replace_deal_hunter_opportunity_source_observation_snapshot/i, `${label} must revoke public execution`);
+    assert.match(sql, /grant execute on function public\.replace_deal_hunter_opportunity_source_observation_snapshot/i, `${label} must grant only service execution`);
+  }
+  assert.doesNotMatch(migration, /alter table|create table|drop table/i, 'function-only migration is safe for existing rows');
 });
 
 test('Supabase durable-write RPCs enforce the SQLite-compatible immutable conflict contract', () => {

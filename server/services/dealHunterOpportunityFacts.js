@@ -160,6 +160,7 @@ function sourceObservationRecordId(deal = {}) {
   const sourceId = String(deal.sourceId || '').trim();
   const externalId = String(deal.id || '').trim();
   if (sourceId && deal.stableExternalId && externalId) return `external:${externalId}`;
+  if (sourceId && deal.idFromSourceRowPosition && deal.sourceRowId) return `sheet-row:${String(deal.sourceRowId).trim()}`;
   const listingUrl = String(deal.listingUrl || '').trim();
   if (sourceId && listingUrl) return `listing:${sourceObservationDigest(listingUrl).slice(0, 40)}`;
   return '';
@@ -175,12 +176,42 @@ function observationTimestamp(deal = {}, fallback) {
  * It intentionally never reads `deal.raw`, so uploaded workbooks and arbitrary
  * source payloads cannot become durable observations.
  */
-export function buildOpportunitySourceObservations({ opportunityId, deal, now = new Date().toISOString() } = {}) {
+export function normalizeOpportunitySourceObservationSnapshot(snapshot = {}) {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot) || Buffer.isBuffer(snapshot)) {
+    throw new Error('Opportunity source-observation snapshot must be an object.');
+  }
+  const normalized = {
+    opportunity_id: normalizeText(snapshot.opportunity_id, 'Canonical opportunity id', { maxLength: 200 }),
+    source_id: normalizeText(snapshot.source_id, 'Opportunity source id', { maxLength: 160 }),
+    source_name: normalizeText(snapshot.source_name, 'Opportunity source name', { maxLength: 220 }),
+    source_record_id: normalizeText(snapshot.source_record_id, 'Opportunity source record id', { maxLength: 200 }),
+    observations: (Array.isArray(snapshot.observations) ? snapshot.observations : []).map(normalizeOpportunitySourceObservation),
+  };
+  if (normalized.observations.length > opportunitySourceObservationFields.length) {
+    throw new Error('Opportunity source-observation snapshot has too many fields.');
+  }
+  const fields = new Set();
+  for (const observation of normalized.observations) {
+    if (
+      observation.opportunity_id !== normalized.opportunity_id
+      || observation.source_id !== normalized.source_id
+      || observation.source_name !== normalized.source_name
+      || observation.source_record_id !== normalized.source_record_id
+    ) {
+      throw new Error('Opportunity source-observation snapshot rows must share one source record identity.');
+    }
+    if (fields.has(observation.field)) throw new Error('Opportunity source-observation snapshot fields must be unique.');
+    fields.add(observation.field);
+  }
+  return normalized;
+}
+
+export function buildOpportunitySourceObservationSnapshot({ opportunityId, deal, now = new Date().toISOString() } = {}) {
   const canonicalOpportunityId = normalizeText(opportunityId, 'Canonical opportunity id', { maxLength: 200 });
   const sourceId = normalizeText(deal?.sourceId, 'Opportunity source id', { maxLength: 160 });
   const sourceName = normalizeText(deal?.sourceName, 'Opportunity source name', { maxLength: 220 });
   const sourceRecordId = sourceObservationRecordId(deal);
-  if (!sourceRecordId) return [];
+  if (!sourceRecordId) return null;
   const timestamp = normalizeTimestamp(now, 'Opportunity source observation timestamp');
   const observedAt = observationTimestamp(deal, timestamp);
   const observations = [];
@@ -202,7 +233,17 @@ export function buildOpportunitySourceObservations({ opportunityId, deal, now = 
 
   for (const [field, property] of sourceObservationFieldMappings) add(field, deal?.[property]);
   if (deal?.stableExternalId && deal?.id) add('listing_id', deal.id);
-  return observations;
+  return normalizeOpportunitySourceObservationSnapshot({
+    opportunity_id: canonicalOpportunityId,
+    source_id: sourceId,
+    source_name: sourceName,
+    source_record_id: sourceRecordId,
+    observations,
+  });
+}
+
+export function buildOpportunitySourceObservations(values = {}) {
+  return buildOpportunitySourceObservationSnapshot(values)?.observations || [];
 }
 
 export function normalizeOpportunitySourceObservation(observation = {}) {

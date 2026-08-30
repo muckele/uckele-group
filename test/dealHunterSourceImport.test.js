@@ -5,7 +5,10 @@ import path from 'node:path';
 import { after, beforeEach, test } from 'node:test';
 import { strToU8, zipSync } from 'fflate';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
-import { setOperatorOpportunityFact } from '../server/services/dealHunterOpportunityFacts.js';
+import {
+  buildOpportunitySourceObservationSnapshot,
+  setOperatorOpportunityFact,
+} from '../server/services/dealHunterOpportunityFacts.js';
 
 process.env.DEAL_HUNTER_SHEET_CSV_URL = 'https://docs.google.com/spreadsheets/d/test/gviz/tq?tqx=out:csv&gid=123';
 process.env.DEAL_HUNTER_AIRTABLE_TOKEN = 'test-token';
@@ -14,7 +17,7 @@ process.env.DEAL_HUNTER_AIRTABLE_TABLE_ID = 'tblTest';
 process.env.DEAL_HUNTER_AIRTABLE_VIEW_ID = 'viwTest';
 
 const originalFetch = globalThis.fetch;
-const { reviewDailyDeals } = await import('../server/services/dealHunter.js');
+const { parseSheetCsvDeals, reviewDailyDeals } = await import('../server/services/dealHunter.js');
 let sourceCsv;
 let sourceWorkbook;
 let airtableFetchCount;
@@ -241,6 +244,7 @@ test('canonical ingestion retains separate bounded Sheet and Deal OS observation
   const first = await reviewDailyDeals({ storage, withScoredDeals: true });
   assert.equal(first.review.sources.find((source) => source.id === 'deal-os-export').fetched, true);
   assert.equal(first.scoredDeals.length, 1);
+  assert.equal(Object.hasOwn(first.scoredDeals[0], 'sourceObservationDeals'), false);
   assert.deepEqual(new Set(first.scoredDeals[0].sourceRecords.map((record) => record.sourceId)), new Set(['sheet-0', 'deal-os-export']));
   const opportunityId = first.scoredDeals[0].opportunityId;
   assert.ok(opportunityId);
@@ -271,14 +275,14 @@ test('canonical ingestion retains separate bounded Sheet and Deal OS observation
     ],
   );
 
-  sourceCsv = sourceCsv.replace(',450000,', ',475000,');
+  sourceCsv = sourceCsv.replace(',450000,', ',475000,').replace(',sheet@example.test,', ',,');
   await reviewDailyDeals({ storage, withScoredDeals: true });
 
   const refreshedObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
   const refreshedSheetProfit = refreshedObservations.find((observation) => (
     observation.source_id === 'sheet-0' && observation.field === 'annual_profit'
   ));
-  assert.equal(refreshedObservations.length, firstObservations.length);
+  assert.equal(refreshedObservations.length, firstObservations.length - 1);
   assert.equal(refreshedSheetProfit.id, firstSheetProfit.id);
   assert.equal(refreshedSheetProfit.created_at, firstSheetProfit.created_at);
   assert.deepEqual(
@@ -291,5 +295,56 @@ test('canonical ingestion retains separate bounded Sheet and Deal OS observation
       ['sheet-0', '475000'],
     ],
   );
+  assert.equal(refreshedObservations.some((observation) => (
+    observation.source_id === 'sheet-0' && observation.field === 'broker_email'
+  )), false);
   assert.deepEqual(await storage.listDealHunterOpportunityFacts(opportunityId), operatorFactsBeforeRefresh);
+});
+
+test('a no-explicit-ID Sheet row keeps one source observation snapshot when its listing URL is corrected', async (t) => {
+  // Break caught: the supported positional Sheet record shape uses a mutable
+  // listing URL as its observation identity and forks observations after the
+  // existing canonical resolver has identified the same opportunity.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-sheet-url-correction-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const firstCsv = [
+    'Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Broker Name,Broker Email,Description',
+    `No-ID URL Correction HVAC,https://broker.example/no-id-original,CA,${new Date().toISOString().slice(0, 10)},450000,1200000,900000,Sheet Broker,sheet@example.test,Commercial HVAC maintenance company`,
+  ].join('\n');
+  const correctedCsv = firstCsv.replace('https://broker.example/no-id-original', 'https://broker.example/no-id-corrected');
+  const [firstDeal] = parseSheetCsvDeals(firstCsv).deals;
+  const [correctedDeal] = parseSheetCsvDeals(correctedCsv).deals;
+  const opportunityId = 'opp-no-id-sheet-url-correction';
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: opportunityId,
+    created_at: '2026-08-30T12:00:00.000Z',
+    updated_at: '2026-08-30T12:00:00.000Z',
+    canonical_name: 'No-ID URL Correction HVAC',
+    canonical_recipient: null,
+    canonical_location: 'CA',
+    primary_submission_id: null,
+    identity_version: 'test',
+    status: 'active',
+    metadata: {},
+  });
+  await storage.replaceDealHunterOpportunitySourceObservationSnapshot(
+    buildOpportunitySourceObservationSnapshot({ opportunityId, deal: firstDeal, now: '2026-08-30T12:30:00.000Z' }),
+  );
+  const firstObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  const firstListing = firstObservations.find((observation) => observation.field === 'listing_url');
+  assert.equal(firstListing.source_record_id, 'sheet-row:1');
+
+  await storage.replaceDealHunterOpportunitySourceObservationSnapshot(
+    buildOpportunitySourceObservationSnapshot({ opportunityId, deal: correctedDeal, now: '2026-08-30T13:30:00.000Z' }),
+  );
+  const refreshedObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  const refreshedListing = refreshedObservations.find((observation) => observation.field === 'listing_url');
+  assert.equal(refreshedListing.source_record_id, 'sheet-row:1');
+  assert.equal(refreshedListing.id, firstListing.id);
+  assert.equal(refreshedListing.value, 'https://broker.example/no-id-corrected');
+  assert.equal(refreshedObservations.length, firstObservations.length);
 });
