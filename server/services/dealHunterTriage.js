@@ -25,7 +25,7 @@ export const triageViews = Object.freeze([
   'all',
 ]);
 
-export const triageSorts = Object.freeze(['fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed']);
+export const triageSorts = Object.freeze(['acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed']);
 
 const maxNoteLength = 2000;
 
@@ -38,9 +38,9 @@ function normalizeView(value) {
   return triageViews.includes(normalized) ? normalized : 'needs-review';
 }
 
-function normalizeSort(value) {
+function normalizeSort(value, fallback = 'fit-score') {
   const normalized = normalizeText(value, 40).toLowerCase();
-  return triageSorts.includes(normalized) ? normalized : 'fit-score';
+  return triageSorts.includes(normalized) ? normalized : fallback;
 }
 
 function normalizeConfidence(value) {
@@ -48,10 +48,36 @@ function normalizeConfidence(value) {
   return ['low', 'medium', 'high'].includes(normalized) ? normalized : '';
 }
 
+function nullableNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const normalized = Number(String(value).replace(/[$,\s]/g, ''));
+  return Number.isFinite(normalized) ? normalized : null;
+}
+
+function queueGeography(row = {}) {
+  const label = normalizeText(row.location, 240);
+  const state = normalizeText(row.state, 40).toUpperCase();
+  const [city = ''] = label.split(',');
+  return {
+    city: normalizeText(city, 160),
+    state,
+    label: label || state,
+  };
+}
+
+function publicTriageSummary(summary = {}) {
+  return {
+    needsReview: Number(summary.needsReview || summary.needs_review || 0),
+    highPriority: Number(summary.highPriority || summary.high_priority || 0),
+    watchlist: Number(summary.watchlist || 0),
+    lowConfidence: Number(summary.lowConfidence || summary.low_confidence || 0),
+    currentOpportunities: Number(summary.currentOpportunities || summary.current_opportunities || 0),
+  };
+}
+
 // The row an operator scans. Fit and confidence stay separate values; there is
 // deliberately no blended certainty number.
 export function publicTriageRow(row = {}) {
-  const dimensions = Array.isArray(row.dimensions) ? row.dimensions : [];
   return {
     opportunityId: row.opportunity_id,
     dealKey: row.deal_key || '',
@@ -63,25 +89,24 @@ export function publicTriageRow(row = {}) {
     confidence: row.confidence || 'low',
     completenessScore: Number(row.completeness_score || 0),
     missingEvidenceCount: Number(row.missing_evidence_count || 0),
-    missingEvidence: Array.isArray(row.missing_evidence) ? row.missing_evidence : [],
     contradictionCount: Number(row.contradiction_count || 0),
-    confidenceReasons: Array.isArray(row.confidence_reasons) ? row.confidence_reasons : [],
-    gates: Array.isArray(row.gates) ? row.gates : [],
     shouldRemove: Boolean(row.should_remove),
     highFit: Boolean(row.high_fit),
-    dimensions: dimensions.map((dimension) => ({
-      id: dimension.id,
-      label: dimension.label,
-      contribution: Number(dimension.contribution || 0),
-      verdict: dimension.verdict || 'absent',
-      missingCount: Array.isArray(dimension.missing) ? dimension.missing.length : 0,
-      contradictionCount: Array.isArray(dimension.contradictions) ? dimension.contradictions.length : 0,
-    })),
-    topReasons: [
-      ...(row.summary?.strengths || []).slice(0, 1),
-      ...(row.summary?.concerns || []).slice(0, 1),
-    ],
-    recommendation: row.summary?.recommendation || '',
+    geography: queueGeography(row),
+    industry: normalizeText(row.industry, 240),
+    financials: {
+      annualProfit: nullableNumber(row.annual_profit),
+      annualRevenue: nullableNumber(row.annual_revenue),
+      askingPrice: nullableNumber(row.asking_price),
+      profitMultiple: nullableNumber(row.profit_multiple),
+    },
+    topStrength: normalizeText(row.top_strength, 400),
+    topConcern: normalizeText(row.top_concern, 400),
+    workflow: {
+      crmStatus: normalizeText(row.crm_status, 80) || 'not-started',
+      cimStatus: normalizeText(row.cim_status, 80) || 'not-requested',
+    },
+    observationFreshness: row.observation_freshness || row.scored_at || '',
     operatorPriority: row.operator_priority || 'normal',
     operatorNote: row.operator_note || '',
     reviewed: Boolean(row.reviewed),
@@ -101,7 +126,7 @@ export async function listTriageQueue({
   page = 1,
   pageSize = 25,
   search = '',
-  sort = 'fit-score',
+  sort = '',
   direction = 'desc',
   minScore = null,
   confidence = '',
@@ -112,12 +137,17 @@ export async function listTriageQueue({
   if (typeof storage.listDealHunterOpportunityScores !== 'function') {
     return { ok: false, status: 503, error: 'Opportunity scoring storage is unavailable.' };
   }
+  const normalizedView = normalizeView(view);
+  const normalizedSort = normalizeSort(
+    sort,
+    normalizedView === 'needs-review' ? 'acquisition-priority' : 'fit-score',
+  );
   const result = await storage.listDealHunterOpportunityScores({
-    view: normalizeView(view),
+    view: normalizedView,
     page,
     pageSize,
     search: normalizeText(search, 160),
-    sort: normalizeSort(sort),
+    sort: normalizedSort,
     direction: normalizeText(direction, 8).toLowerCase() === 'asc' ? 'asc' : 'desc',
     minScore: minScore === null || minScore === '' || !Number.isFinite(Number(minScore)) ? null : Number(minScore),
     confidence: normalizeConfidence(confidence),
@@ -128,14 +158,15 @@ export async function listTriageQueue({
   return {
     ok: true,
     status: 200,
-    view: normalizeView(view),
-    sort: normalizeSort(sort),
+    view: normalizedView,
+    sort: normalizedSort,
     direction: normalizeText(direction, 8).toLowerCase() === 'asc' ? 'asc' : 'desc',
     rows: (result.rows || []).map(publicTriageRow),
     total: result.total,
     page: result.page,
     pageSize: result.pageSize,
     totalPages: result.totalPages,
+    summary: publicTriageSummary(result.summary),
     views: triageViews,
     priorities: dealOperatorPriorities,
   };

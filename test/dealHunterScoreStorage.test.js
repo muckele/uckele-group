@@ -146,7 +146,11 @@ test('only eligibility reconciliation can place historical scores in the current
   assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
   assert.deepEqual(
     await storage.listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 1 }),
-    { rows: [], total: 0, page: 1, pageSize: 1, totalPages: 1 },
+    {
+      rows: [], total: 0,
+      summary: { needsReview: 0, highPriority: 0, watchlist: 0, lowConfidence: 0, currentOpportunities: 0 },
+      page: 1, pageSize: 1, totalPages: 1,
+    },
   );
 
   const activated = await storage.reconcileDealHunterCurrentScoreEligibility(['opp-score-1', 'opp-score-2']);
@@ -193,7 +197,11 @@ test('superseded opportunities retain score history but cannot be scored, reacti
   assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
   assert.deepEqual(
     await storage.listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 25 }),
-    { rows: [], total: 0, page: 1, pageSize: 25, totalPages: 1 },
+    {
+      rows: [], total: 0,
+      summary: { needsReview: 0, highPriority: 0, watchlist: 0, lowConfidence: 0, currentOpportunities: 0 },
+      page: 1, pageSize: 25, totalPages: 1,
+    },
   );
   assert.deepEqual(
     await storage.reconcileDealHunterCurrentScoreEligibility(['opp-score-1']),
@@ -245,6 +253,7 @@ test('SQLite forward migration preserves existing scores as last-good current bu
   const legacy = new Database(sqlitePath);
   legacy.exec(`
     DROP INDEX IF EXISTS idx_deal_hunter_scores_current_queue;
+    DROP INDEX IF EXISTS idx_deal_hunter_scores_acquisition_priority;
     ALTER TABLE deal_hunter_opportunity_scores DROP COLUMN current_triage_eligible;
   `);
   legacy.close();
@@ -786,6 +795,44 @@ test('Supabase: current score lookup rejects a superseded opportunity without hi
 
   assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
   assert.equal((await storage.getDealHunterOpportunityScore('opp-score-1')).score_fingerprint, 'fingerprint-a');
+});
+
+test('Supabase queue uses the bounded RPC and preserves its database summary', async () => {
+  const calls = [];
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    {
+      client: {
+        async rpc(name, payload) {
+          calls.push({ name, payload });
+          return {
+            data: {
+              total: 1,
+              summary: {
+                needsReview: 1, highPriority: 1, watchlist: 0, lowConfidence: 0, currentOpportunities: 1,
+              },
+              rows: [storedScoreRow({ opportunity_id: 'opp-queue', dimensions: undefined, summary: undefined })],
+            },
+            error: null,
+          };
+        },
+      },
+    },
+  );
+
+  const result = await storage.listDealHunterOpportunityScores({ page: 0, pageSize: 1000 });
+  assert.deepEqual(calls, [{
+    name: 'list_deal_hunter_opportunity_scores',
+    payload: {
+      p_view: 'needs-review', p_page: 1, p_page_size: 100, p_search: '',
+      p_sort: 'fit-score', p_direction: 'desc', p_min_score: null,
+      p_confidence: '', p_priority: '', p_state: '',
+    },
+  }]);
+  assert.deepEqual(result.summary, {
+    needsReview: 1, highPriority: 1, watchlist: 0, lowConfidence: 0, currentOpportunities: 1,
+  });
+  assert.equal(result.rows.length, 1);
 });
 
 test('both storage providers expose the same scoring surface', () => {

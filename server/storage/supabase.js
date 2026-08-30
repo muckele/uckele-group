@@ -2813,6 +2813,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return {
         rows: (data?.rows || []).map(normalizeDealHunterOpportunityScoreRow),
         total,
+        summary: data?.summary || {},
         page: safePage,
         pageSize: safePageSize,
         totalPages: Math.max(1, Math.ceil(total / safePageSize)),

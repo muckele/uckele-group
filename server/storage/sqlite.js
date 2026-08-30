@@ -3024,6 +3024,13 @@ export function createSqliteStorage(config) {
       ON deal_hunter_opportunity_scores(current_triage_eligible, should_remove, fit_score DESC, opportunity_id);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_priority
       ON deal_hunter_opportunity_scores(operator_priority, fit_score DESC, opportunity_id);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_acquisition_priority
+      ON deal_hunter_opportunity_scores(
+        current_triage_eligible, should_remove, operator_priority, high_fit,
+        fit_score DESC, confidence, scored_at DESC, opportunity_id
+      );
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_source_observations_queue_projection
+      ON deal_hunter_opportunity_source_observations(opportunity_id, field, observed_at DESC, id ASC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_fingerprint
       ON deal_hunter_opportunity_scores(score_fingerprint);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_score_evidence_opportunity
@@ -6668,6 +6675,17 @@ export function createSqliteStorage(config) {
         const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
         const safeDirection = String(direction || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
         const sortColumns = {
+          'acquisition-priority': `CASE WHEN scores.operator_priority IN ('urgent', 'high') THEN 1 ELSE 0 END DESC,
+            CASE WHEN scores.high_fit = 1 AND (scores.reviewed_at IS NULL OR
+              CASE WHEN scores.reviewed_semantic_digest IS NOT NULL
+                THEN scores.reviewed_semantic_digest <> COALESCE(scores.semantic_digest, '')
+                ELSE scores.reviewed_fingerprint IS NULL OR scores.reviewed_fingerprint <> scores.score_fingerprint
+              END) THEN 1 ELSE 0 END DESC,
+            scores.fit_score DESC,
+            CASE scores.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC,
+            COALESCE((SELECT MAX(observed_at) FROM deal_hunter_opportunity_source_observations AS freshness
+              WHERE freshness.opportunity_id = scores.opportunity_id), scores.scored_at) DESC,
+            scores.opportunity_id ASC`,
           'fit-score': 'scores.fit_score',
           confidence: "CASE scores.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END",
           completeness: 'scores.completeness_score',
@@ -6679,18 +6697,73 @@ export function createSqliteStorage(config) {
             WHEN scores.reviewed_fingerprint IS NULL OR scores.reviewed_fingerprint <> scores.score_fingerprint THEN 1
             ELSE 0 END`,
         };
-        const sortColumn = sortColumns[String(sort || 'fit-score')] || sortColumns['fit-score'];
+        const normalizedSort = String(sort || 'fit-score');
+        const sortColumn = sortColumns[normalizedSort] || sortColumns['fit-score'];
         // opportunity_id is always the final key so pagination is stable when
         // rows tie on the requested sort.
-        const orderBy = `ORDER BY ${sortColumn} ${safeDirection}, `
-          + "CASE scores.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC, "
-          + 'scores.opportunity_id ASC';
+        const orderBy = normalizedSort === 'acquisition-priority'
+          ? `ORDER BY ${sortColumn}`
+          : `ORDER BY ${sortColumn} ${safeDirection}, `
+            + "CASE scores.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC, "
+            + 'scores.opportunity_id ASC';
 
         const total = Number(database.prepare(`
           SELECT COUNT(*) AS total FROM deal_hunter_opportunity_scores AS scores ${dismissedJoin} ${where}
         `).get(...params)?.total || 0);
+        const summary = database.prepare(`
+          SELECT
+            COALESCE(SUM(CASE WHEN disposition.deal_key IS NULL AND scores.should_remove = 0 AND (
+              scores.reviewed_at IS NULL OR CASE WHEN scores.reviewed_semantic_digest IS NOT NULL
+                THEN scores.reviewed_semantic_digest <> COALESCE(scores.semantic_digest, '')
+                ELSE scores.reviewed_fingerprint IS NULL OR scores.reviewed_fingerprint <> scores.score_fingerprint
+              END
+            ) THEN 1 ELSE 0 END), 0) AS needsReview,
+            COALESCE(SUM(CASE WHEN disposition.deal_key IS NULL AND scores.should_remove = 0
+              AND (scores.high_fit = 1 OR scores.operator_priority IN ('urgent', 'high')) THEN 1 ELSE 0 END), 0) AS highPriority,
+            COALESCE(SUM(CASE WHEN disposition.deal_key IS NULL AND scores.should_remove = 0
+              AND ((scores.fit_score >= 60 AND scores.fit_score < 75) OR scores.operator_priority = 'watch') THEN 1 ELSE 0 END), 0) AS watchlist,
+            COALESCE(SUM(CASE WHEN disposition.deal_key IS NULL AND scores.should_remove = 0
+              AND (scores.confidence = 'low' OR scores.contradiction_count > 0) THEN 1 ELSE 0 END), 0) AS lowConfidence,
+            COALESCE(SUM(CASE WHEN disposition.deal_key IS NULL THEN 1 ELSE 0 END), 0) AS currentOpportunities
+          FROM deal_hunter_opportunity_scores AS scores ${dismissedJoin}
+          WHERE scores.current_triage_eligible = 1
+        `).get() || {};
         const rows = database.prepare(`
-          SELECT scores.*, disposition.reason AS dismissed_reason, disposition.dismissed_at AS dismissed_at
+          SELECT
+            scores.opportunity_id, scores.deal_key, scores.name, scores.state, scores.listing_url,
+            scores.fit_score, scores.score_status, scores.confidence, scores.completeness_score,
+            scores.contradiction_count, scores.missing_evidence_count, scores.should_remove,
+            scores.high_fit, scores.score_fingerprint, scores.semantic_digest, scores.scored_at,
+            scores.rules_version, scores.operator_priority, scores.operator_note, scores.reviewed_at,
+            scores.reviewed_by, scores.reviewed_fingerprint, scores.reviewed_semantic_digest,
+            disposition.reason AS dismissed_reason, disposition.dismissed_at AS dismissed_at,
+            json_extract(scores.summary, '$.strengths[0]') AS top_strength,
+            json_extract(scores.summary, '$.concerns[0]') AS top_concern,
+            (SELECT value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'industry'
+              ORDER BY source.observed_at DESC, source.id ASC LIMIT 1) AS industry,
+            (SELECT value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'location'
+              ORDER BY source.observed_at DESC, source.id ASC LIMIT 1) AS location,
+            (SELECT value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'annual_profit'
+              ORDER BY source.observed_at DESC, source.id ASC LIMIT 1) AS annual_profit,
+            (SELECT value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'annual_revenue'
+              ORDER BY source.observed_at DESC, source.id ASC LIMIT 1) AS annual_revenue,
+            (SELECT value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'asking_price'
+              ORDER BY source.observed_at DESC, source.id ASC LIMIT 1) AS asking_price,
+            (SELECT value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'profit_multiple'
+              ORDER BY source.observed_at DESC, source.id ASC LIMIT 1) AS profit_multiple,
+            (SELECT MAX(observed_at) FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id) AS observation_freshness,
+            COALESCE((SELECT submission.status FROM contact_submissions AS submission
+              WHERE submission.id = opportunity.primary_submission_id LIMIT 1), 'not-started') AS crm_status,
+            COALESCE((SELECT cim.status FROM deal_hunter_cim_requests AS cim
+              WHERE cim.opportunity_id = scores.opportunity_id
+              ORDER BY cim.updated_at DESC, cim.id DESC LIMIT 1), 'not-requested') AS cim_status
           FROM deal_hunter_opportunity_scores AS scores
           ${dismissedJoin}
           ${where}
@@ -6698,7 +6771,7 @@ export function createSqliteStorage(config) {
           LIMIT ? OFFSET ?
         `).all(...params, safePageSize, (safePage - 1) * safePageSize).map(normalizeDealHunterOpportunityScoreRow);
 
-        return { rows, total, page: safePage, pageSize: safePageSize, totalPages: Math.max(1, Math.ceil(total / safePageSize)) };
+        return { rows, total, summary, page: safePage, pageSize: safePageSize, totalPages: Math.max(1, Math.ceil(total / safePageSize)) };
       },
 
       async listDealHunterCrmReconciliationItems(runId, { limit = 5000 } = {}) {

@@ -3318,6 +3318,8 @@ create index if not exists idx_deal_hunter_opportunity_facts_history
   on public.deal_hunter_opportunity_facts(opportunity_id, created_at desc, id desc);
 create index if not exists idx_deal_hunter_source_observations_history
   on public.deal_hunter_opportunity_source_observations(opportunity_id, observed_at desc, id);
+create index if not exists idx_deal_hunter_source_observations_queue_projection
+  on public.deal_hunter_opportunity_source_observations(opportunity_id, field, observed_at desc, id);
 create index if not exists idx_deal_hunter_opportunity_aliases_opportunity
   on public.deal_hunter_opportunity_aliases(opportunity_id, alias_type);
 create index if not exists idx_deal_hunter_identity_exceptions_status
@@ -4655,6 +4657,11 @@ create index if not exists idx_deal_hunter_scores_current_queue
   on public.deal_hunter_opportunity_scores(current_triage_eligible, should_remove, fit_score desc, opportunity_id);
 create index if not exists idx_deal_hunter_scores_priority
   on public.deal_hunter_opportunity_scores(operator_priority, fit_score desc, opportunity_id);
+create index if not exists idx_deal_hunter_scores_acquisition_priority
+  on public.deal_hunter_opportunity_scores(
+    current_triage_eligible, should_remove, operator_priority, high_fit,
+    fit_score desc, confidence, scored_at desc, opportunity_id
+  );
 create index if not exists idx_deal_hunter_scores_fingerprint
   on public.deal_hunter_opportunity_scores(score_fingerprint);
 create index if not exists idx_deal_hunter_score_evidence_opportunity
@@ -4818,8 +4825,41 @@ security definer
 set search_path = public
 as $$
   with candidates as (
-    select scores.*, disposition.deal_key as dismissed_deal_key,
-           disposition.reason as dismissed_reason, disposition.dismissed_at as dismissed_at
+    select
+           scores.opportunity_id, scores.deal_key, scores.name, scores.state, scores.listing_url,
+           scores.fit_score, scores.score_status, scores.confidence, scores.completeness_score,
+           scores.contradiction_count, scores.missing_evidence_count, scores.should_remove,
+           scores.high_fit, scores.score_fingerprint, scores.semantic_digest, scores.scored_at,
+           scores.rules_version, scores.operator_priority, scores.operator_note, scores.reviewed_at,
+           scores.reviewed_by, scores.reviewed_fingerprint, scores.reviewed_semantic_digest,
+           disposition.deal_key as dismissed_deal_key,
+           disposition.reason as dismissed_reason, disposition.dismissed_at as dismissed_at,
+           scores.summary->'strengths'->>0 as top_strength,
+           scores.summary->'concerns'->>0 as top_concern,
+           (select value from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id and source.field = 'industry'
+             order by source.observed_at desc, source.id asc limit 1) as industry,
+           (select value from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id and source.field = 'location'
+             order by source.observed_at desc, source.id asc limit 1) as location,
+           (select value from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id and source.field = 'annual_profit'
+             order by source.observed_at desc, source.id asc limit 1) as annual_profit,
+           (select value from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id and source.field = 'annual_revenue'
+             order by source.observed_at desc, source.id asc limit 1) as annual_revenue,
+           (select value from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id and source.field = 'asking_price'
+             order by source.observed_at desc, source.id asc limit 1) as asking_price,
+           (select value from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id and source.field = 'profit_multiple'
+             order by source.observed_at desc, source.id asc limit 1) as profit_multiple,
+           coalesce((select max(observed_at) from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id), scores.scored_at) as observation_freshness,
+           coalesce((select submission.status from public.contact_submissions as submission
+             where submission.id = opportunity.primary_submission_id limit 1), 'not-started') as crm_status,
+           coalesce((select cim.status from public.deal_hunter_cim_requests as cim
+             where cim.opportunity_id = scores.opportunity_id order by cim.updated_at desc, cim.id desc limit 1), 'not-requested') as cim_status
     from public.deal_hunter_opportunity_scores as scores
     join public.deal_hunter_opportunities as opportunity
       on opportunity.opportunity_id = scores.opportunity_id
@@ -4854,6 +4894,17 @@ as $$
   ), ordered as (
     select * from filtered
     order by
+      case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority'
+        then case when operator_priority in ('urgent', 'high') then 1 else 0 end end desc,
+      case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority'
+        then case when high_fit and (reviewed_at is null or (case
+          when reviewed_semantic_digest is not null then reviewed_semantic_digest <> coalesce(semantic_digest, '')
+          else reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint
+        end)) then 1 else 0 end end desc,
+      case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority' then fit_score end desc nulls last,
+      case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority'
+        then case confidence when 'high' then 3 when 'medium' then 2 else 1 end end desc nulls last,
+      case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority' then observation_freshness end desc nulls last,
       -- One sort key per direction; opportunity_id is always the final key so
       -- pagination stays stable when rows tie.
       case when lower(coalesce(p_direction, 'desc')) = 'asc' then
@@ -4885,6 +4936,19 @@ as $$
   )
   select jsonb_build_object(
     'total', (select count(*) from filtered),
+    'summary', (select jsonb_build_object(
+      'needsReview', count(*) filter (where dismissed_deal_key is null and should_remove = false
+        and (reviewed_at is null or (case when reviewed_semantic_digest is not null
+          then reviewed_semantic_digest <> coalesce(semantic_digest, '')
+          else reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint end))),
+      'highPriority', count(*) filter (where dismissed_deal_key is null and should_remove = false
+        and (high_fit or operator_priority in ('urgent', 'high'))),
+      'watchlist', count(*) filter (where dismissed_deal_key is null and should_remove = false
+        and ((fit_score >= 60 and fit_score < 75) or operator_priority = 'watch')),
+      'lowConfidence', count(*) filter (where dismissed_deal_key is null and should_remove = false
+        and (confidence = 'low' or contradiction_count > 0)),
+      'currentOpportunities', count(*) filter (where dismissed_deal_key is null)
+    ) from candidates),
     'rows', coalesce((select jsonb_agg(to_jsonb(ordered)) from ordered), '[]'::jsonb)
   );
 $$;

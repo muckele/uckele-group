@@ -67,6 +67,10 @@ const opportunityFactWriteBoundaryMigrationUrl = new URL(
   '../supabase/migrations/20260830130000_deal_hunter_opportunity_fact_write_boundary.sql',
   import.meta.url,
 );
+const acquisitionInboxQueueMigrationUrl = new URL(
+  '../supabase/migrations/20260830150000_acquisition_inbox_queue.sql',
+  import.meta.url,
+);
 const canonicalCurrentSemanticsMigrationUrl = new URL(
   '../supabase/migrations/20260827120000_canonical_opportunity_current_semantics.sql',
   import.meta.url,
@@ -177,6 +181,27 @@ function mutatesCanonicalOpportunityAliases(functionSql) {
   return /(?:insert\s+into|update|delete\s+from)\s+public\.deal_hunter_opportunity_aliases\b/i
     .test(functionSql);
 }
+
+test('Acquisition Inbox queue SQL keeps filtering, ordering, summary, and lightweight projection in the database', () => {
+  const migration = fs.readFileSync(acquisitionInboxQueueMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  for (const [sourceLabel, sql] of [
+    ['Acquisition Inbox migration', migration],
+    ['fresh schema', schema],
+  ]) {
+    const functionSql = sqlFunctionDefinitions(sql).find(({ name }) => name === 'list_deal_hunter_opportunity_scores')?.sql || '';
+    assertServiceRoleOnlyFunction(sql, sourceLabel, 'list_deal_hunter_opportunity_scores');
+    assert.match(functionSql, /security definer[\s\S]*?set search_path = public/i);
+    assert.match(functionSql, /current_triage_eligible = true[\s\S]*?limit least[\s\S]*?offset greatest/i);
+    assert.match(functionSql, /needsReview[\s\S]*?highPriority[\s\S]*?watchlist[\s\S]*?lowConfidence[\s\S]*?currentOpportunities/i);
+    assert.match(functionSql, /operator_priority in \('urgent', 'high'\)[\s\S]*?high_fit[\s\S]*?fit_score[\s\S]*?confidence[\s\S]*?observation_freshness[\s\S]*?opportunity_id asc/i);
+    assert.match(functionSql, /source\.field = 'annual_profit'[\s\S]*?source\.field = 'profit_multiple'/i);
+    assert.doesNotMatch(functionSql, /scores\.\*|scores\.(?:dimensions|gates|missing_evidence|confidence_reasons)\b/i,
+      `${sourceLabel} queue RPC must not return full score/evidence JSON`);
+    assert.match(sql, /idx_deal_hunter_scores_acquisition_priority/i);
+    assert.match(sql, /idx_deal_hunter_source_observations_queue_projection/i);
+  }
+});
 
 test('every canonical alias lock participant acquires the complete sorted alias lock set before opportunity rows', () => {
   const migration = fs.readFileSync(canonicalCurrentSemanticsMigrationUrl, 'utf8');

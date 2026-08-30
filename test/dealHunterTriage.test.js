@@ -66,6 +66,83 @@ async function seedOpportunity(storage, opportunityId) {
   });
 }
 
+async function seedSourceObservation(storage, opportunityId, field, value, observedAt = '2026-08-16T12:00:00.000Z') {
+  await storage.upsertDealHunterOpportunitySourceObservation({
+    id: `triage-observation:${opportunityId}:${field}`,
+    opportunity_id: opportunityId,
+    source_id: 'deal-os-export',
+    source_name: 'Deal OS',
+    source_record_id: `record:${opportunityId}`,
+    field,
+    value: String(value),
+    observed_at: observedAt,
+    created_at: observedAt,
+    updated_at: observedAt,
+  });
+}
+
+function queueScore(opportunityId, overrides = {}) {
+  return {
+    opportunity_id: opportunityId,
+    scored_at: '2026-08-16T10:00:00.000Z',
+    deal_key: `deal-${opportunityId}`,
+    name: opportunityId,
+    state: 'NY',
+    listing_url: `https://listings.example.invalid/${opportunityId}`,
+    fit_score: 50,
+    score_status: 'watchlist',
+    confidence: 'low',
+    completeness_score: 80,
+    contradiction_count: 0,
+    missing_evidence_count: 0,
+    should_remove: false,
+    high_fit: false,
+    gate_count: 0,
+    score_fingerprint: `fingerprint-${opportunityId}`,
+    semantic_digest: `digest-${opportunityId}`,
+    engine_version: 'triage-test',
+    rules_version: 'triage-test',
+    profile_version: 'triage-test',
+    completeness_policy_version: 'triage-test',
+    dimensions: [], gates: [], applied_caps: [], missing_evidence: [], confidence_reasons: [],
+    summary: { strengths: ['Strong'], concerns: ['Concern'] },
+    ...overrides,
+  };
+}
+
+async function seedPriorityLadder(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-triage-priority-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'priority.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const entries = [
+    queueScore('opp-tier-urgent', { fit_score: 1 }),
+    queueScore('opp-tier-high', { fit_score: 2 }),
+    queueScore('opp-tier-high-fit-new', { fit_score: 3, high_fit: true, score_status: 'high-fit' }),
+    queueScore('opp-tier-fit', { fit_score: 99 }),
+    queueScore('opp-tier-confidence-high', { fit_score: 50, confidence: 'high' }),
+    queueScore('opp-tier-confidence-medium', { fit_score: 50, confidence: 'medium' }),
+    queueScore('opp-tier-fresh', { fit_score: 50, confidence: 'low' }),
+    queueScore('opp-tier-old', { fit_score: 50, confidence: 'low' }),
+    queueScore('opp-tier-tie-a', { fit_score: 10, confidence: 'low' }),
+    queueScore('opp-tier-tie-b', { fit_score: 10, confidence: 'low' }),
+  ];
+  for (const entry of entries) {
+    await seedOpportunity(storage, entry.opportunity_id);
+    await storage.writeDealHunterOpportunityScore(entry, []);
+  }
+  await storage.reconcileDealHunterCurrentScoreEligibility(entries.map((entry) => entry.opportunity_id));
+  await setTriageOperatorDecision({ opportunityId: 'opp-tier-urgent', priority: 'urgent', storage });
+  await setTriageOperatorDecision({ opportunityId: 'opp-tier-high', priority: 'high', storage });
+  await seedSourceObservation(storage, 'opp-tier-fresh', 'industry', 'Services', '2026-08-18T10:00:00.000Z');
+  await seedSourceObservation(storage, 'opp-tier-old', 'industry', 'Services', '2026-08-17T10:00:00.000Z');
+  await seedSourceObservation(storage, 'opp-tier-tie-a', 'industry', 'Services', '2026-08-16T10:00:00.000Z');
+  await seedSourceObservation(storage, 'opp-tier-tie-b', 'industry', 'Services', '2026-08-16T10:00:00.000Z');
+  return storage;
+}
+
 // A spread of listings that lands in different queue views.
 async function seedQueue(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-triage-'));
@@ -119,7 +196,7 @@ test('the default queue shows unreviewed opportunities and excludes dismissed an
   assert.ok(queue.rows.every((row) => row.reviewed === false));
 });
 
-test('rows carry fit and confidence as separate values with no blended score', async (t) => {
+test('rows carry scan-ready fit and confidence values without blended scoring or full detail payloads', async (t) => {
   const storage = await seedQueue(t);
   const queue = await listTriageQueue({ storage });
   const row = queue.rows.find((item) => item.opportunityId === 'opp-high');
@@ -127,11 +204,121 @@ test('rows carry fit and confidence as separate values with no blended score', a
   assert.equal(typeof row.fitScore, 'number');
   assert.ok(['low', 'medium', 'high'].includes(row.confidence));
   assert.equal(typeof row.completenessScore, 'number');
-  assert.equal(row.dimensions.length, 7);
-  assert.ok(row.dimensions.every((dimension) => typeof dimension.contribution === 'number' && dimension.verdict));
-  assert.ok(row.topReasons.length > 0);
+  assert.equal(typeof row.topStrength, 'string');
+  assert.equal(typeof row.topConcern, 'string');
   assert.equal(Object.hasOwn(row, 'overallCertainty'), false, 'there is no blended certainty number');
   assert.equal(Object.hasOwn(row, 'operatorScoreOverride'), false, 'operators set priority, not a numeric override');
+  assert.equal(Object.hasOwn(row, 'dimensions'), false, 'dimension evidence belongs to the detail view');
+  assert.equal(Object.hasOwn(row, 'missingEvidence'), false, 'full evidence belongs to the detail view');
+  assert.equal(Object.hasOwn(row, 'sourceObservations'), false, 'source observation history belongs to the detail view');
+  assert.equal(Object.hasOwn(row, 'contactDetails'), false, 'contact detail belongs to the detail view');
+  assert.equal(Object.hasOwn(row, 'history'), false, 'history belongs to the detail view');
+});
+
+test('Needs Review defaults to deterministic acquisition priority and promotes operator attention first', async (t) => {
+  const storage = await seedQueue(t);
+  await setTriageOperatorDecision({ opportunityId: 'opp-watch', priority: 'urgent', storage });
+  await setTriageOperatorDecision({ opportunityId: 'opp-sparse', priority: 'high', storage });
+
+  const queue = await listTriageQueue({ pageSize: 100, storage });
+  assert.equal(queue.sort, 'acquisition-priority');
+  assert.deepEqual(
+    new Set(queue.rows.map((row) => row.opportunityId).slice(0, 2)),
+    new Set(['opp-watch', 'opp-sparse']),
+    'urgent and high operator priorities outrank fit score regardless of their machine score',
+  );
+
+  const tiedPriority = await listTriageQueue({
+    pageSize: 100,
+    sort: 'acquisition-priority',
+    storage,
+  });
+  assert.deepEqual(
+    tiedPriority.rows.map((row) => row.opportunityId),
+    queue.rows.map((row) => row.opportunityId),
+    'the explicit Inbox sort is identical to the Needs Review default',
+  );
+});
+
+test('acquisition priority applies every tier in order and keeps page boundaries deterministic', async (t) => {
+  const storage = await seedPriorityLadder(t);
+  const all = await listTriageQueue({ pageSize: 100, storage });
+  const ids = all.rows.map((row) => row.opportunityId);
+
+  assert.deepEqual(new Set(ids.slice(0, 2)), new Set(['opp-tier-urgent', 'opp-tier-high']));
+  assert.ok(ids.indexOf('opp-tier-high-fit-new') < ids.indexOf('opp-tier-fit'), 'new high-fit work precedes score alone');
+  assert.ok(ids.indexOf('opp-tier-fit') < ids.indexOf('opp-tier-confidence-high'), 'fit score precedes confidence');
+  assert.ok(ids.indexOf('opp-tier-confidence-high') < ids.indexOf('opp-tier-confidence-medium'));
+  assert.ok(ids.indexOf('opp-tier-confidence-medium') < ids.indexOf('opp-tier-fresh'));
+  assert.ok(ids.indexOf('opp-tier-fresh') < ids.indexOf('opp-tier-old'), 'newer observation precedes older observation');
+  assert.ok(ids.indexOf('opp-tier-tie-a') < ids.indexOf('opp-tier-tie-b'), 'opportunity id resolves exact ties');
+
+  const first = await listTriageQueue({ page: 1, pageSize: 3, storage });
+  const second = await listTriageQueue({ page: 2, pageSize: 3, storage });
+  const third = await listTriageQueue({ page: 3, pageSize: 3, storage });
+  const fourth = await listTriageQueue({ page: 4, pageSize: 3, storage });
+  assert.deepEqual(
+    [...first.rows, ...second.rows, ...third.rows, ...fourth.rows].map((row) => row.opportunityId),
+    ids,
+    'database pagination has no duplicates or gaps at acquisition-priority boundaries',
+  );
+});
+
+test('queue summary uses the same persisted view semantics and browsing never scores or writes', async (t) => {
+  const storage = await seedQueue(t);
+  const browsingStorage = {
+    ...storage,
+    writeDealHunterOpportunityScore: async () => { throw new Error('queue browsing must not score'); },
+    reconcileDealHunterCurrentScoreEligibility: async () => { throw new Error('queue browsing must not reconcile'); },
+    setDealHunterOpportunityOperatorDecision: async () => { throw new Error('queue browsing must not write decisions'); },
+  };
+
+  const queue = await listTriageQueue({ page: 1, pageSize: 2, storage: browsingStorage });
+  const [needsReview, highPriority, watchlist, lowConfidence, current] = await Promise.all([
+    listTriageQueue({ view: 'needs-review', pageSize: 100, storage }),
+    listTriageQueue({ view: 'high-priority', pageSize: 100, storage }),
+    listTriageQueue({ view: 'watchlist', pageSize: 100, storage }),
+    listTriageQueue({ view: 'low-confidence', pageSize: 100, storage }),
+    listTriageQueue({ view: 'all', pageSize: 100, storage }),
+  ]);
+
+  assert.deepEqual(Object.keys(queue.summary).sort(), [
+    'currentOpportunities', 'highPriority', 'lowConfidence', 'needsReview', 'watchlist',
+  ]);
+  assert.deepEqual(queue.summary, {
+    needsReview: needsReview.total,
+    highPriority: highPriority.total,
+    watchlist: watchlist.total,
+    lowConfidence: lowConfidence.total,
+    currentOpportunities: current.total,
+  });
+  assert.equal(queue.rows.length, 2, 'the storage query, not service memory, owns page boundaries');
+});
+
+test('queue rows project retained financial scan fields and workflow freshness without detail payloads', async (t) => {
+  const storage = await seedQueue(t);
+  await Promise.all([
+    seedSourceObservation(storage, 'opp-high', 'industry', 'Fire safety inspection'),
+    seedSourceObservation(storage, 'opp-high', 'location', 'Springfield, NY'),
+    seedSourceObservation(storage, 'opp-high', 'annual_profit', 450000),
+    seedSourceObservation(storage, 'opp-high', 'annual_revenue', 1800000),
+    seedSourceObservation(storage, 'opp-high', 'asking_price', 1300000),
+    seedSourceObservation(storage, 'opp-high', 'profit_multiple', 2.9),
+  ]);
+
+  const queue = await listTriageQueue({ view: 'all', pageSize: 100, storage });
+  const row = queue.rows.find((item) => item.opportunityId === 'opp-high');
+
+  assert.deepEqual(row.geography, { city: 'Springfield', state: 'NY', label: 'Springfield, NY' });
+  assert.equal(row.industry, 'Fire safety inspection');
+  assert.deepEqual(row.financials, {
+    annualProfit: 450000,
+    annualRevenue: 1800000,
+    askingPrice: 1300000,
+    profitMultiple: 2.9,
+  });
+  assert.deepEqual(Object.keys(row.workflow).sort(), ['cimStatus', 'crmStatus']);
+  assert.equal(row.observationFreshness, '2026-08-16T12:00:00.000Z');
 });
 
 test('each view selects the right population', async (t) => {
@@ -153,22 +340,22 @@ test('each view selects the right population', async (t) => {
   assert.equal(dismissed.rows[0].dismissedReason, 'not-a-fit');
 });
 
-test('sorting and pagination are stable across pages', async (t) => {
+test('requested fit-score sorting and pagination are stable across pages', async (t) => {
   const storage = await seedQueue(t);
-  const all = await listTriageQueue({ view: 'all', pageSize: 100, storage });
+  const all = await listTriageQueue({ view: 'all', pageSize: 100, sort: 'fit-score', storage });
   assert.ok(all.total >= 4);
 
   const scores = all.rows.map((row) => row.fitScore);
   assert.deepEqual(scores, [...scores].sort((left, right) => right - left), 'default sort is fit score descending');
 
-  const first = await listTriageQueue({ view: 'all', pageSize: 2, page: 1, storage });
-  const second = await listTriageQueue({ view: 'all', pageSize: 2, page: 2, storage });
-  const third = await listTriageQueue({ view: 'all', pageSize: 2, page: 3, storage });
+  const first = await listTriageQueue({ view: 'all', pageSize: 2, page: 1, sort: 'fit-score', storage });
+  const second = await listTriageQueue({ view: 'all', pageSize: 2, page: 2, sort: 'fit-score', storage });
+  const third = await listTriageQueue({ view: 'all', pageSize: 2, page: 3, sort: 'fit-score', storage });
   const paged = [...first.rows, ...second.rows, ...third.rows].map((row) => row.opportunityId);
   assert.equal(new Set(paged).size, paged.length, 'no row appears on two pages');
   assert.deepEqual(paged.slice(0, all.rows.length), all.rows.map((row) => row.opportunityId));
 
-  const ascending = await listTriageQueue({ view: 'all', pageSize: 100, direction: 'asc', storage });
+  const ascending = await listTriageQueue({ view: 'all', pageSize: 100, sort: 'fit-score', direction: 'asc', storage });
   assert.deepEqual(
     ascending.rows.map((row) => row.fitScore),
     [...scores].sort((left, right) => left - right),

@@ -636,6 +636,10 @@ test('full-backfill scoring and explicit CRM sync require administrator access a
     const viewerTriageResult = await viewerTriage.json();
     assert.equal(viewerTriageResult.success, true);
     assert.ok(Array.isArray(viewerTriageResult.rows));
+    assert.equal(viewerTriageResult.sort, 'acquisition-priority');
+    assert.deepEqual(Object.keys(viewerTriageResult.summary).sort(), [
+      'currentOpportunities', 'highPriority', 'lowConfidence', 'needsReview', 'watchlist',
+    ]);
 
     const anonymousTriage = await fetch(`${origin}/api/admin/deal-hunter/triage`);
     assert.equal(anonymousTriage.status, 401);
