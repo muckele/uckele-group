@@ -188,6 +188,11 @@ test('detail closes every nested projection and strips injected storage metadata
         source_id: 'source', source_name: 'x'.repeat(900), source_record_id: 'record', listing_url: 'https://user:pass@broker.example/private',
         observed_at: '2026-08-30T10:00:00.000Z', private: sentinel,
       }));
+      if (property === 'listDealHunterOpportunitySourceObservations') return async () => Array.from({ length: 700 }, (_, index) => ({
+        source_id: index === 0 ? { private: sentinel } : `source-${index}`, source_name: index === 0 ? { private: sentinel } : 'Source',
+        source_record_id: index === 0 ? { private: sentinel } : `record-${index}`, field: index === 0 ? { private: sentinel } : 'seller_name',
+        value: index === 0 ? { private: sentinel } : `Seller ${index}`, observed_at: index === 0 ? { private: sentinel } : '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z',
+      }));
       if (property === 'listDealHunterOpportunityFacts') return async () => [{ id: 'fact', field: 'seller_name', value: 'x'.repeat(9000), verified: true, actor: 'x'.repeat(900), note: 'x'.repeat(9000), created_at: '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z', private: sentinel }];
       if (property === 'listDealHunterCimRequests') return async () => [{ id: 'cim', status: 'requested', request_state: sentinel, delivery_state: sentinel, provider: sentinel, reply_to: sentinel, metadata: { private: sentinel }, updated_at: '2026-08-30T10:00:00.000Z' }];
       if (property === 'listCrmCommunications') return async () => ({ rows: [{ id: 'comm', direction: 'outbound', channel: 'email', kind: 'cim', occurred_at: '2026-08-30T10:00:00.000Z', provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }] });
@@ -204,5 +209,8 @@ test('detail closes every nested projection and strips injected storage metadata
   assert.ok(detail.score.dimensions[0].evidence.length <= 100);
   assert.ok(detail.score.dimensions[0].label.length <= 160);
   assert.ok(detail.operatorFacts[0].value.length <= 4000);
+  assert.equal(detail.sourceObservations.some((item) => JSON.stringify(item).includes(sentinel)), false);
+  assert.ok(detail.sourceObservations.length <= 100);
+  assert.ok(detail.sourceObservations.every((item) => Object.keys(item.values).every((field) => ['seller_name'].includes(field))));
   assert.equal(JSON.stringify(detail).includes(sentinel), false);
 });

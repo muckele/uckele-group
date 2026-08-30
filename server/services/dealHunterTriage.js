@@ -18,6 +18,7 @@ import {
 import {
   getEffectiveOpportunityFacts,
   opportunityFactFields,
+  opportunitySourceObservationFields,
 } from './dealHunterOpportunityFacts.js';
 
 export const triageViews = Object.freeze([
@@ -35,6 +36,10 @@ const maxNoteLength = 2000;
 
 function normalizeText(value = '', maxLength = 400) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function boundedPrimitive(value, maximum = 400) {
+  return ['string', 'number', 'boolean'].includes(typeof value) ? normalizeText(value, maximum) : '';
 }
 
 function normalizeView(value) {
@@ -253,10 +258,11 @@ function directCrmFactRows(submission = {}) {
 }
 
 function projectSourceObservations(rows = []) {
-  const all = rows.slice(0, 500).map((row) => ({
-    sourceId: row.source_id || '', sourceName: row.source_name || '', sourceRecordId: row.source_record_id || '',
-    field: row.field || '', value: ['listing_url', 'prospectus_url', 'business_website'].includes(row.field) ? safeListingUrl(row.value) : normalizeText(row.value, 5000), observedAt: row.observed_at || '', updatedAt: row.updated_at || '',
-  }));
+  const all = rows.slice(0, 500).flatMap((row) => {
+    const field = boundedPrimitive(row?.field, 80);
+    if (!opportunitySourceObservationFields.includes(field)) return [];
+    return [{ sourceId: boundedPrimitive(row?.source_id, 200), sourceName: boundedPrimitive(row?.source_name, 160), sourceRecordId: boundedPrimitive(row?.source_record_id, 200), field, value: ['listing_url', 'prospectus_url', 'business_website'].includes(field) ? safeListingUrl(row?.value) : boundedPrimitive(row?.value, 5000), observedAt: boundedPrimitive(row?.observed_at, 80), updatedAt: boundedPrimitive(row?.updated_at, 80) }];
+  });
   const valuesByField = new Map();
   for (const row of all) {
     const key = row.field;
@@ -266,7 +272,7 @@ function projectSourceObservations(rows = []) {
   }
   const conflicts = [...valuesByField.entries()].flatMap(([field, values]) => {
     const distinct = new Set(values.map((item) => normalizeText(item.value, 5000)));
-    return distinct.size > 1 ? [{ field, observations: values.map(({ sourceId, sourceName, sourceRecordId, value, observedAt }) => ({ sourceId, sourceName, sourceRecordId, value, observedAt })) }] : [];
+    return distinct.size > 1 ? [{ field, observations: values.slice(0, 20).map(({ sourceId, sourceName, sourceRecordId, value, observedAt }) => ({ sourceId, sourceName, sourceRecordId, value, observedAt })) }] : [];
   });
   const groups = new Map();
   for (const row of all) {
@@ -282,7 +288,7 @@ function projectSourceObservations(rows = []) {
   for (const group of groups.values()) {
     group.conflicts = conflicts.filter((conflict) => conflict.observations.some((item) => (
       item.sourceId === group.sourceId && item.sourceRecordId === group.sourceRecordId
-    )));
+    ))).slice(0, 20);
   }
   return { sourceObservations: [...groups.values()].slice(0, 100), conflicts };
 }
