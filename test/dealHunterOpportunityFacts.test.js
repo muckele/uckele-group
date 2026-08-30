@@ -339,15 +339,22 @@ test('atomic current operator-fact write refuses a superseded opportunity withou
   assert.equal((await sqlite.listDealHunterOpportunityFacts(opportunityId)).length, 1);
 });
 
-test('Supabase current-fact adapter uses exactly one atomic RPC, normalizes its row, and propagates failure', async () => {
+test('Supabase current-fact adapter uses exactly one atomic RPC, normalizes its raw provider row, and propagates failure', async () => {
   // Break caught: the service reintroduces a get-current/upsert gap or the
   // Supabase adapter routes the current-only write through another boundary.
   const calls = [];
-  const returned = factRecord({ id: 'rpc-fact', verified: true });
+  const returned = {
+    ...factRecord({ id: 'rpc-fact', verified: 1 }),
+    created_at: '2026-08-30T12:00:00.000Z',
+    updated_at: '2026-08-30T12:00:00.000Z',
+  };
   const client = { rpc: async (name, payload) => { calls.push({ name, payload }); return { data: returned, error: null }; } };
   const storage = supabaseModule.createSupabaseStorage({ storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'key' } }, { client });
   const saved = await setCurrentOperatorOpportunityFact({ opportunityId, field: 'seller_name', value: 'Current Seller', actor: 'admin', verified: true, note: 'confirmed', storage });
-  assert.deepEqual(saved, returned);
+  assert.notStrictEqual(saved, returned);
+  assert.notDeepEqual(saved, returned);
+  assert.deepEqual(Object.keys(saved).sort(), ['actor', 'created_at', 'field', 'id', 'note', 'opportunity_id', 'source', 'updated_at', 'value', 'verified']);
+  assert.deepEqual(saved, { ...returned, verified: true });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].name, 'insert_current_deal_hunter_opportunity_fact');
   assert.deepEqual(Object.keys(calls[0].payload).sort(), ['p_actor', 'p_created_at', 'p_field', 'p_id', 'p_note', 'p_opportunity_id', 'p_source', 'p_updated_at', 'p_value', 'p_verified']);

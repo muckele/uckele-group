@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { setOperatorOpportunityFact } from '../server/services/dealHunterOpportunityFacts.js';
+import { opportunityFactFields, opportunitySourceObservationFields, setOperatorOpportunityFact } from '../server/services/dealHunterOpportunityFacts.js';
 import { getTriageOpportunityDetail } from '../server/services/dealHunterTriage.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 
@@ -195,26 +195,68 @@ test('detail closes every nested projection and strips injected storage metadata
         value: index === 0 ? { private: sentinel } : `Seller ${index}`, observed_at: index === 0 ? { private: sentinel } : '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z',
       }));
       if (property === 'listDealHunterOpportunityFacts') return async () => [{ id: 'fact', field: 'seller_name', value: 'x'.repeat(9000), verified: true, actor: 'x'.repeat(900), note: 'x'.repeat(9000), created_at: '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z', private: sentinel }];
-      if (property === 'listDealHunterCimRequests') return async () => [{ id: 'cim', status: 'requested', request_state: sentinel, delivery_state: sentinel, provider: sentinel, reply_to: sentinel, metadata: { private: sentinel }, updated_at: '2026-08-30T10:00:00.000Z' }];
-      if (property === 'listCrmCommunications') return async () => ({ rows: [{ id: 'comm', direction: 'outbound', channel: 'email', kind: 'cim', occurred_at: '2026-08-30T10:00:00.000Z', provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }] });
-      if (property === 'getSubmission') return async () => ({ id: 'submission', status: 'open', company: 'x'.repeat(900), seller_name: 'x'.repeat(900), metadata: { private: sentinel, dealHunter: { sellerPhone: '555' } } });
+      if (property === 'listDealHunterCimRequests') return async () => Array.from({ length: 101 }, (_, index) => ({ id: `cim-${index}`, status: 'x'.repeat(900), request_state: sentinel, delivery_state: sentinel, provider: sentinel, reply_to: sentinel, metadata: { private: sentinel }, updated_at: 'x'.repeat(900) }));
+      if (property === 'listCrmActivityEvents') return async () => Array.from({ length: 101 }, (_, index) => ({ id: `activity-${index}`, event_type: 'x'.repeat(900), summary: 'x'.repeat(9000), created_at: 'x'.repeat(900), actor: 'x'.repeat(900), provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }));
+      if (property === 'listDealHunterDispositions') return async () => Array.from({ length: 21 }, (_, index) => ({ id: `disposition-${index}`, disposition: 'x'.repeat(900), reason: 'x'.repeat(900), note: 'x'.repeat(9000), dismissed_at: 'x'.repeat(900), dismissed_by: 'x'.repeat(900), provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }));
+      if (property === 'listCrmCommunications') return async () => ({ rows: [{ id: 'comm', direction: 'x'.repeat(900), channel: 'x'.repeat(900), kind: 'x'.repeat(900), occurred_at: 'x'.repeat(900), cim_request_id: 'cim-0', provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }] });
+      if (property === 'getSubmission') return async () => ({ id: 'submission', status: 'x'.repeat(900), company: 'x'.repeat(900), seller_name: 'x'.repeat(900), seller_email: 'x'.repeat(900), broker_name: 'x'.repeat(900), broker_email: 'x'.repeat(900), updated_at: 'x'.repeat(900), provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel, dealHunter: { sellerPhone: { private: sentinel } } } });
       const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
     },
   });
   const detail = await getTriageOpportunityDetail({ opportunityId, storage: hostile });
+  const assertExactRecord = (record, keys, label) => assert.deepEqual(Object.keys(record).sort(), [...keys].sort(), label);
+  const assertBoundedPrimitive = (value, max, label) => {
+    assert.equal(['string', 'number', 'boolean'].includes(typeof value), true, `${label} is primitive`);
+    if (typeof value === 'string') assert.ok(value.length <= max, `${label} is bounded`);
+  };
+  const assertBoundedNullablePrimitive = (value, max, label) => {
+    if (value === null) return;
+    assertBoundedPrimitive(value, max, label);
+  };
+  assertExactRecord(detail.opportunity, ['opportunityId', 'dealKey', 'name', 'state', 'listingUrl', 'fitScore', 'scoreStatus', 'confidence', 'completenessScore', 'missingEvidenceCount', 'contradictionCount', 'shouldRemove', 'highFit', 'geography', 'industry', 'financials', 'topStrength', 'topConcern', 'workflow', 'observationFreshness', 'operatorPriority', 'operatorNote', 'reviewed', 'reviewedAt', 'reviewedBy', 'changedSinceReview', 'dismissed', 'dismissedReason', 'scoredAt', 'scoreFingerprint', 'rulesVersion'], 'opportunity is closed');
   assert.deepEqual(Object.keys(detail.score).sort(), ['appliedCaps', 'completenessScore', 'confidence', 'confidenceReasons', 'dimensions', 'fitScore', 'gates', 'missingEvidence', 'scoreStatus', 'summary', 'unattributedEvidence']);
   assert.deepEqual(Object.keys(detail.score.dimensions[0]).sort(), ['contribution', 'evidence', 'id', 'label']);
   assert.deepEqual(Object.keys(detail.operatorFacts[0]).sort(), ['actor', 'createdAt', 'field', 'id', 'note', 'updatedAt', 'value', 'verified']);
-  assert.deepEqual(Object.keys(detail.effectiveFacts.seller_name).sort(), ['actor', 'note', 'provenance', 'value', 'verified']);
+  assert.deepEqual(Object.keys(detail.effectiveFacts).every((field) => opportunityFactFields.includes(field)), true);
+  for (const [field, fact] of Object.entries(detail.effectiveFacts)) {
+    assertExactRecord(fact, ['value', 'provenance', 'verified', 'actor', 'note'], `effective fact ${field} is closed`);
+    assertBoundedPrimitive(fact.value, 4000, `effective fact ${field} value`);
+    assertBoundedPrimitive(fact.provenance, 80, `effective fact ${field} provenance`);
+    assert.equal(typeof fact.verified, 'boolean', `effective fact ${field} verification is boolean`);
+    assertBoundedNullablePrimitive(fact.actor, 200, `effective fact ${field} actor`);
+    assertBoundedNullablePrimitive(fact.note, 500, `effective fact ${field} note`);
+  }
   assert.deepEqual(Object.keys(detail.history.operatorState).sort(), ['note', 'priority', 'reviewed', 'reviewedAt', 'reviewedBy']);
   assert.deepEqual(Object.keys(detail.opportunity.geography).sort(), ['city', 'label', 'state']);
   assert.deepEqual(Object.keys(detail.opportunity.financials).sort(), ['annualProfit', 'annualRevenue', 'askingPrice', 'profitMultiple']);
   assert.deepEqual(Object.keys(detail.opportunity.workflow).sort(), ['cimStatus', 'crmStatus']);
+  assertExactRecord(detail.sourceObservations[0], ['sourceId', 'sourceName', 'sourceRecordId', 'observedAt', 'values', 'conflicts'], 'source group is closed');
+  assert.equal(Object.keys(detail.sourceObservations[0].values).every((field) => opportunitySourceObservationFields.includes(field)), true);
+  assertExactRecord(detail.sourceObservations[0].conflicts[0], ['field', 'observations'], 'source conflict is closed');
+  assertExactRecord(detail.sourceObservations[0].conflicts[0].observations[0], ['sourceId', 'sourceName', 'sourceRecordId', 'value', 'observedAt'], 'source conflict observation is closed');
+  assertExactRecord(detail.cimSummary, ['requests', 'communications'], 'CIM summary is closed');
+  assertExactRecord(detail.crmSummary, ['submission', 'communications', 'factObservations', 'conflicts'], 'CRM summary is closed');
   assert.deepEqual(Object.keys(detail.cimSummary.requests[0]).sort(), ['id', 'status', 'updatedAt']);
+  assertExactRecord(detail.cimSummary.communications[0], ['id', 'direction', 'channel', 'kind', 'occurredAt', 'cimRequestId'], 'CIM communication is closed');
+  assertExactRecord(detail.crmSummary.submission, ['id', 'status', 'company', 'sellerName', 'sellerEmail', 'brokerName', 'brokerEmail', 'updatedAt'], 'CRM submission is closed');
   assert.deepEqual(Object.keys(detail.crmSummary.communications[0]).sort(), ['channel', 'cimRequestId', 'direction', 'id', 'kind', 'occurredAt']);
+  assertExactRecord(detail.crmSummary.factObservations[0], ['field', 'value', 'provenance'], 'CRM fact observation is closed');
+  assertExactRecord(detail.crmSummary.conflicts[0], ['field', 'winningProvenance', 'crmValue'], 'CRM conflict is closed');
+  assertExactRecord(detail.history, ['activities', 'dispositions', 'operatorFacts', 'operatorState'], 'history is closed');
+  assertExactRecord(detail.history.activities[0], ['id', 'eventType', 'summary', 'createdAt', 'actor'], 'activity is closed');
+  assertExactRecord(detail.history.dispositions[0], ['id', 'disposition', 'reason', 'note', 'dismissedAt', 'dismissedBy'], 'disposition is closed');
+  assertExactRecord(detail.history.operatorFacts[0], ['id', 'field', 'value', 'verified', 'actor', 'note', 'createdAt', 'updatedAt'], 'history operator fact is closed');
   assert.ok(detail.score.dimensions[0].evidence.length <= 100);
   assert.ok(detail.score.dimensions[0].label.length <= 160);
   assert.ok(detail.operatorFacts[0].value.length <= 4000);
+  assert.equal(detail.history.activities.length, 100);
+  assert.equal(detail.history.dispositions.length, 20);
+  for (const activity of detail.history.activities) {
+    for (const [key, max] of [['id', 200], ['eventType', 80], ['summary', 500], ['createdAt', 80], ['actor', 160]]) assertBoundedPrimitive(activity[key], max, `activity ${key}`);
+  }
+  for (const disposition of detail.history.dispositions) {
+    for (const [key, max] of [['id', 200], ['disposition', 80], ['reason', 160], ['note', 500], ['dismissedAt', 80], ['dismissedBy', 160]]) assertBoundedPrimitive(disposition[key], max, `disposition ${key}`);
+  }
   assert.equal(typeof detail.opportunity.reviewed, 'boolean');
   assert.ok(detail.history.operatorState.note.length <= 2000);
   assert.equal(detail.sourceObservations.some((item) => JSON.stringify(item).includes(sentinel)), false);
@@ -274,30 +316,46 @@ test('detail projects all thirteen scalar CRM facts and rejects non-scalar CRM v
   assert.equal(JSON.stringify(detail.crmSummary).includes('nope'), false);
 });
 
-test('detail URL projection rejects credentials controls and schemes, dedupes canonical listings, and keeps non-listing URLs categorized', async (t) => {
-  // Break caught: URL normalization accepts controls/credentials or promotes a
-  // prospectus/business website into an original-listing link.
+test('detail URL projection table-drives unsafe score and evidence URLs while retaining canonical listing categories', async (t) => {
+  // Break caught: either score/evidence branch can return a credentialed,
+  // control-character, or non-HTTP(S) link after source URLs stay safe.
   const { storage, opportunityId } = await detailStorage(t);
-  const hostile = new Proxy(storage, {
-    get(target, property) {
-      if (property === 'getCurrentDealHunterOpportunityScore') return async () => ({ ...currentScore(opportunityId), listing_url: 'https://broker.example/a/../listing' });
-      if (property === 'listDealHunterScoreEvidence') return async () => [{ listing_url: 'https://user:pass@broker.example/private', value: 'evidence', terms: [], dimension: null }];
-      if (property === 'listDealHunterOpportunitySourceObservations') return async () => [
-        { source_id: 'a', source_name: 'A', source_record_id: '1', field: 'listing_url', value: 'https://broker.example/listing', observed_at: '2026-08-30T10:00:00Z' },
-        { source_id: 'b', source_name: 'B', source_record_id: '2', field: 'listing_url', value: 'https://user:pass@broker.example/private', observed_at: '2026-08-30T10:00:00Z' },
-        { source_id: 'c', source_name: 'C', source_record_id: '3', field: 'listing_url', value: 'https://broker.example/new\nline', observed_at: '2026-08-30T10:00:00Z' },
-        { source_id: 'd', source_name: 'D', source_record_id: '4', field: 'listing_url', value: 'ftp://broker.example/listing', observed_at: '2026-08-30T10:00:00Z' },
-        { source_id: 'e', source_name: 'E', source_record_id: '5', field: 'prospectus_url', value: 'https://broker.example/prospectus.pdf', observed_at: '2026-08-30T10:00:00Z' },
-        { source_id: 'f', source_name: 'F', source_record_id: '6', field: 'business_website', value: 'https://business.example/', observed_at: '2026-08-30T10:00:00Z' },
-      ];
-      const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
-    },
-  });
-  const detail = await getTriageOpportunityDetail({ opportunityId, storage: hostile });
-  assert.deepEqual(detail.listingUrls, ['https://broker.example/listing']);
-  assert.equal(detail.sourceObservations.find((item) => item.sourceRecordId === '5').values.prospectus_url, 'https://broker.example/prospectus.pdf');
-  assert.equal(detail.sourceObservations.find((item) => item.sourceRecordId === '6').values.business_website, 'https://business.example/');
-  assert.equal(detail.sourceObservations.find((item) => item.sourceRecordId === '2').values.listing_url, '');
-  assert.equal(detail.sourceObservations.find((item) => item.sourceRecordId === '3').values.listing_url, '');
-  assert.equal(detail.score.unattributedEvidence[0].listingUrl, '');
+  const invalidUrls = [
+    ['credentials', 'https://user:pass@broker.example/private'],
+    ['ASCII control', 'https://broker.example/new\nline'],
+    ['unsupported scheme', 'ftp://broker.example/listing'],
+  ];
+  const sourceRows = [
+    // The first pair canonicalizes to the same link, proving dedupe remains
+    // independent of the invalid score/evidence cases below.
+    { source_id: 'a', source_name: 'A', source_record_id: '1', field: 'listing_url', value: 'https://broker.example/a/../listing', observed_at: '2026-08-30T10:00:00Z' },
+    { source_id: 'b', source_name: 'B', source_record_id: '2', field: 'listing_url', value: 'https://broker.example/listing', observed_at: '2026-08-30T10:00:00Z' },
+    { source_id: 'c', source_name: 'C', source_record_id: '3', field: 'prospectus_url', value: 'https://broker.example/prospectus.pdf', observed_at: '2026-08-30T10:00:00Z' },
+    { source_id: 'd', source_name: 'D', source_record_id: '4', field: 'business_website', value: 'https://business.example/', observed_at: '2026-08-30T10:00:00Z' },
+  ];
+  for (const [kind, invalidUrl] of invalidUrls) {
+    for (const [path, scoreUrl, evidenceUrl] of [
+      ['score', invalidUrl, 'https://broker.example/a/../listing'],
+      ['evidence', 'https://broker.example/a/../listing', invalidUrl],
+    ]) {
+      const hostile = new Proxy(storage, {
+        get(target, property) {
+          if (property === 'getCurrentDealHunterOpportunityScore') return async () => ({ ...currentScore(opportunityId), listing_url: scoreUrl });
+          if (property === 'listDealHunterScoreEvidence') return async () => [{ listing_url: evidenceUrl, value: 'evidence', terms: [], dimension: 'financial-fit' }];
+          if (property === 'listDealHunterOpportunitySourceObservations') return async () => sourceRows;
+          const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const detail = await getTriageOpportunityDetail({ opportunityId, storage: hostile });
+      assert.deepEqual(detail.listingUrls, ['https://broker.example/listing'], `${kind} ${path} preserves canonical source-listing dedupe`);
+      assert.equal(detail.sourceObservations.find((item) => item.sourceRecordId === '3').values.prospectus_url, 'https://broker.example/prospectus.pdf');
+      assert.equal(detail.sourceObservations.find((item) => item.sourceRecordId === '4').values.business_website, 'https://business.example/');
+      if (path === 'score') {
+        assert.equal(detail.opportunity.listingUrl, '', `${kind} score listing is omitted from opportunity`);
+        assert.equal(detail.listingUrls.includes(invalidUrl), false, `${kind} score listing is absent from listing URLs`);
+      } else {
+        assert.equal(detail.score.dimensions[0].evidence[0].listingUrl, '', `${kind} evidence listing is projected empty`);
+      }
+    }
+  }
 });
