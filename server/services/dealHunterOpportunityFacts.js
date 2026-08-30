@@ -343,7 +343,7 @@ function isUsefulFact(row) {
   } catch {
     return false;
   }
-  return row.value !== null && row.value !== undefined && String(row.value).trim() !== '';
+  return ['string', 'number', 'boolean'].includes(typeof row.value) && String(row.value).trim() !== '';
 }
 
 function compareOperatorFacts(left, right) {
@@ -356,11 +356,11 @@ function compareOperatorFacts(left, right) {
 
 function projectEffectiveFact(row, provenance) {
   return {
-    value: String(row.value).trim(),
+    value: String(row.value).trim().slice(0, 4000),
     provenance,
     verified: provenance === 'operator' ? Boolean(row.verified) : false,
-    actor: provenance === 'operator' ? (row.actor || null) : null,
-    note: provenance === 'operator' ? (row.note || null) : null,
+    actor: provenance === 'operator' && ['string', 'number', 'boolean'].includes(typeof row.actor) ? String(row.actor).trim().slice(0, 200) || null : null,
+    note: provenance === 'operator' && ['string', 'number', 'boolean'].includes(typeof row.note) ? String(row.note).trim().slice(0, 500) || null : null,
   };
 }
 

@@ -67,6 +67,10 @@ const opportunityFactWriteBoundaryMigrationUrl = new URL(
   '../supabase/migrations/20260830130000_deal_hunter_opportunity_fact_write_boundary.sql',
   import.meta.url,
 );
+const currentOperatorFactMigrationUrl = new URL(
+  '../supabase/migrations/20260830170000_current_operator_fact_write.sql',
+  import.meta.url,
+);
 const acquisitionInboxQueueMigrationUrl = new URL(
   '../supabase/migrations/20260830150000_acquisition_inbox_queue.sql',
   import.meta.url,
@@ -376,6 +380,7 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const currentTriageEligibilityMigration = fs.readFileSync(currentTriageEligibilityMigrationUrl, 'utf8');
   const opportunityFactsMigration = fs.readFileSync(opportunityFactsMigrationUrl, 'utf8');
   const opportunityFactWriteBoundaryMigration = fs.readFileSync(opportunityFactWriteBoundaryMigrationUrl, 'utf8');
+  const currentOperatorFactMigration = fs.readFileSync(currentOperatorFactMigrationUrl, 'utf8');
   const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}`;
   const appTables = currentAppTables(schema);
 
@@ -438,6 +443,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
     assertServiceRoleOnlyFunction(sql, sourceLabel, 'upsert_deal_hunter_opportunity_fact');
     assertServiceRoleOnlyFunction(sql, sourceLabel, 'upsert_deal_hunter_opportunity_source_observation');
   }
+  assertServiceRoleOnlyFunction(currentOperatorFactMigration, 'current operator fact migration', 'insert_current_deal_hunter_opportunity_fact');
+  assertServiceRoleOnlyFunction(schema, 'fresh schema', 'insert_current_deal_hunter_opportunity_fact');
   assert.match(opportunityFactWriteBoundaryMigration, /deal_hunter_opportunity_source_observations_bounded_check/i);
   assert.match(
     opportunityFactWriteBoundaryMigration,
@@ -577,9 +584,12 @@ test('Supabase migration and fresh schema isolate every current app table to the
     'count_crm_follow_up_sends',
     'get_crm_follow_up_operational_metrics',
     'list_follow_up_submissions_page',
+    'insert_current_deal_hunter_opportunity_fact',
   ];
   for (const functionName of serviceRoleFunctions) {
-    const sourceSql = [
+    const sourceSql = functionName === 'insert_current_deal_hunter_opportunity_fact'
+      ? currentOperatorFactMigration
+      : [
       'count_crm_follow_up_sends',
       'get_crm_follow_up_operational_metrics',
       'list_follow_up_submissions_page',
@@ -592,7 +602,7 @@ test('Supabase migration and fresh schema isolate every current app table to the
           'finish_crm_email_outbox_claim',
         ].includes(functionName)
         ? followUpWorkspaceMigration
-        : communicationsLifecycleMigration;
+      : communicationsLifecycleMigration;
     const sourceLabel = sourceSql === followUpQueueMigration
       ? 'follow-up queue migration'
       : sourceSql === followUpWorkspaceMigration

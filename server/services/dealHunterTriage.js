@@ -192,8 +192,13 @@ export async function listTriageQueue({
 }
 
 function safeListingUrl(value) {
-  const raw = normalizeText(value, 2000);
-  if (!raw || [...raw].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) return '';
+  // Check the original primitive before whitespace normalization: otherwise a
+  // newline/tab can be transformed into a harmless-looking encoded space.
+  if (typeof value !== 'string') return '';
+  const rawInput = value;
+  if ([...rawInput].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) return '';
+  const raw = rawInput.trim().slice(0, 2000);
+  if (!raw) return '';
   try {
     const parsed = new URL(raw);
     return ['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password ? parsed.href : '';
@@ -203,7 +208,7 @@ function safeListingUrl(value) {
 }
 
 function detailText(value, max = 500) {
-  return ['string', 'number', 'boolean'].includes(typeof value) ? normalizeText(value, max) : '';
+  return ['string', 'number', 'boolean'].includes(typeof value) ? String(value).replace(/\s+/g, ' ').trim().slice(0, max) : '';
 }
 
 function detailNumber(value, fallback = 0) {
@@ -252,8 +257,9 @@ function directCrmFactRows(submission = {}) {
     ['operator_contact_notes', ['operator_contact_notes', 'operatorContactNotes']],
   ];
   return fields.flatMap(([field, keys]) => {
-    const value = keys.map((key) => submission[key] ?? dealHunter[key]).find((item) => normalizeText(item, 4000));
-    return value === undefined ? [] : [{ field, value }];
+    const value = keys.map((key) => submission[key] ?? dealHunter[key])
+      .find((item) => ['string', 'number', 'boolean'].includes(typeof item) && detailText(item, 4000));
+    return value === undefined ? [] : [{ field, value: detailText(value, 4000) }];
   });
 }
 
@@ -272,7 +278,7 @@ function projectSourceObservations(rows = []) {
   }
   const conflicts = [...valuesByField.entries()].flatMap(([field, values]) => {
     const distinct = new Set(values.map((item) => normalizeText(item.value, 5000)));
-    return distinct.size > 1 ? [{ field, observations: values.slice(0, 20).map(({ sourceId, sourceName, sourceRecordId, value, observedAt }) => ({ sourceId, sourceName, sourceRecordId, value, observedAt })) }] : [];
+    return distinct.size > 1 ? [{ field, values }] : [];
   });
   const groups = new Map();
   for (const row of all) {
@@ -286,11 +292,28 @@ function projectSourceObservations(rows = []) {
     groups.set(key, group);
   }
   for (const group of groups.values()) {
-    group.conflicts = conflicts.filter((conflict) => conflict.observations.some((item) => (
-      item.sourceId === group.sourceId && item.sourceRecordId === group.sourceRecordId
-    ))).slice(0, 20);
+    group.conflicts = conflicts.flatMap((conflict) => {
+      const members = conflict.values.filter((item) => item.sourceId === group.sourceId && item.sourceRecordId === group.sourceRecordId);
+      if (members.length === 0) return [];
+      // Attribute using every bounded internal row, then cap just the display
+      // payload while retaining this group's representative observation.
+      const representative = members[0];
+      const peers = conflict.values.filter((item) => item !== representative).slice(0, 19);
+      return [{ field: conflict.field, observations: [representative, ...peers].map(({ sourceId, sourceName, sourceRecordId, value, observedAt }) => ({ sourceId, sourceName, sourceRecordId, value, observedAt })) }];
+    }).slice(0, 20);
   }
-  return { sourceObservations: [...groups.values()].slice(0, 100), conflicts };
+  return { sourceObservations: [...groups.values()].slice(0, 100), conflicts: conflicts.map(({ field, values }) => ({ field, observations: values.slice(0, 20) })) };
+}
+
+function projectDetailOpportunity(score = {}) {
+  const row = publicTriageRow(score, { includeOperatorNote: true });
+  return {
+    opportunityId: detailText(row.opportunityId, 200), dealKey: detailText(row.dealKey, 200), name: detailText(row.name, 500) || 'Unnamed opportunity', state: detailText(row.state, 40), listingUrl: safeListingUrl(row.listingUrl),
+    fitScore: detailNumber(row.fitScore), scoreStatus: detailText(row.scoreStatus, 80), confidence: detailText(row.confidence, 80), completenessScore: detailNumber(row.completenessScore), missingEvidenceCount: detailNumber(row.missingEvidenceCount), contradictionCount: detailNumber(row.contradictionCount), shouldRemove: Boolean(row.shouldRemove), highFit: Boolean(row.highFit),
+    geography: { city: detailText(row.geography?.city, 160), state: detailText(row.geography?.state, 40), label: detailText(row.geography?.label, 240) }, industry: detailText(row.industry, 240),
+    financials: { annualProfit: nullableNumber(row.financials?.annualProfit), annualRevenue: nullableNumber(row.financials?.annualRevenue), askingPrice: nullableNumber(row.financials?.askingPrice), profitMultiple: nullableNumber(row.financials?.profitMultiple) },
+    topStrength: detailText(row.topStrength, 400), topConcern: detailText(row.topConcern, 400), workflow: { crmStatus: detailText(row.workflow?.crmStatus, 80), cimStatus: detailText(row.workflow?.cimStatus, 80) }, observationFreshness: detailText(row.observationFreshness, 80), operatorPriority: detailText(row.operatorPriority, 40) || 'normal', operatorNote: detailText(row.operatorNote, 2000), reviewed: Boolean(row.reviewed), reviewedAt: detailText(row.reviewedAt, 80), reviewedBy: detailText(row.reviewedBy, 160), changedSinceReview: Boolean(row.changedSinceReview), dismissed: Boolean(row.dismissed), dismissedReason: detailText(row.dismissedReason, 160), scoredAt: detailText(row.scoredAt, 80), scoreFingerprint: detailText(row.scoreFingerprint, 200), rulesVersion: detailText(row.rulesVersion, 160),
+  };
 }
 
 function criticalMissingFields({ effectiveFacts, sourceRows, summary, listingUrls }) {
@@ -395,8 +418,7 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
       .filter((row) => row.field === 'listing_url')
       .map((row) => safeListingUrl(row.value)),
   ].filter(Boolean))].slice(0, 100);
-  const opportunity = publicTriageRow(score, { includeOperatorNote: true });
-  opportunity.listingUrl = safeListingUrl(score.listing_url);
+  const opportunity = projectDetailOpportunity(score);
   const projectedScore = projectScore(score, byDimension, unattributed);
   const communications = (crmCommunications?.rows || []).slice(0, 100).map((communication) => ({
     id: detailText(communication.id, 200), direction: detailText(communication.direction, 80), channel: detailText(communication.channel, 80),
@@ -426,10 +448,7 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
       activities: activities.slice(0, 100).map((item) => ({ id: detailText(item.id, 200), eventType: detailText(item.event_type, 80), summary: detailText(item.summary, 500), createdAt: detailText(item.created_at, 80), actor: detailText(item.actor, 160) })),
       dispositions: dispositions.slice(0, 20).map((item) => ({ id: detailText(item.id, 200), disposition: detailText(item.disposition, 80), reason: detailText(item.reason, 160), note: detailText(item.note, 500), dismissedAt: detailText(item.dismissed_at, 80), dismissedBy: detailText(item.dismissed_by, 160) })),
       operatorFacts: operatorFacts.slice(0, 100).map(projectOperatorFact),
-      operatorState: {
-        priority: opportunity.operatorPriority, note: opportunity.operatorNote,
-        reviewed: opportunity.reviewed, reviewedAt: opportunity.reviewedAt, reviewedBy: opportunity.reviewedBy,
-      },
+      operatorState: { priority: detailText(opportunity.operatorPriority, 40), note: detailText(opportunity.operatorNote, 2000), reviewed: Boolean(opportunity.reviewed), reviewedAt: detailText(opportunity.reviewedAt, 80), reviewedBy: detailText(opportunity.reviewedBy, 160) },
     },
   };
 }

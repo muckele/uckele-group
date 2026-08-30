@@ -339,6 +339,57 @@ test('atomic current operator-fact write refuses a superseded opportunity withou
   assert.equal((await sqlite.listDealHunterOpportunityFacts(opportunityId)).length, 1);
 });
 
+test('Supabase current-fact adapter uses exactly one atomic RPC, normalizes its row, and propagates failure', async () => {
+  // Break caught: the service reintroduces a get-current/upsert gap or the
+  // Supabase adapter routes the current-only write through another boundary.
+  const calls = [];
+  const returned = factRecord({ id: 'rpc-fact', verified: true });
+  const client = { rpc: async (name, payload) => { calls.push({ name, payload }); return { data: returned, error: null }; } };
+  const storage = supabaseModule.createSupabaseStorage({ storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'key' } }, { client });
+  const saved = await setCurrentOperatorOpportunityFact({ opportunityId, field: 'seller_name', value: 'Current Seller', actor: 'admin', verified: true, note: 'confirmed', storage });
+  assert.deepEqual(saved, returned);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'insert_current_deal_hunter_opportunity_fact');
+  assert.deepEqual(Object.keys(calls[0].payload).sort(), ['p_actor', 'p_created_at', 'p_field', 'p_id', 'p_note', 'p_opportunity_id', 'p_source', 'p_updated_at', 'p_value', 'p_verified']);
+  assert.deepEqual({ p_opportunity_id: calls[0].payload.p_opportunity_id, p_field: calls[0].payload.p_field, p_value: calls[0].payload.p_value, p_source: calls[0].payload.p_source, p_verified: calls[0].payload.p_verified, p_actor: calls[0].payload.p_actor, p_note: calls[0].payload.p_note }, { p_opportunity_id: opportunityId, p_field: 'seller_name', p_value: 'Current Seller', p_source: 'operator', p_verified: true, p_actor: 'admin', p_note: 'confirmed' });
+  assert.match(calls[0].payload.p_id, /^[0-9a-f-]{36}$/i);
+  assert.match(calls[0].payload.p_created_at, /^\d{4}-\d\d-\d\dT/);
+  assert.equal(calls[0].payload.p_updated_at, calls[0].payload.p_created_at);
+
+  const failed = supabaseModule.createSupabaseStorage({ storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'key' } }, { client: { rpc: async () => ({ data: null, error: new Error('P0002 unavailable') }) } });
+  await assert.rejects(failed.insertCurrentDealHunterOpportunityFact(factRecord()), /P0002 unavailable/);
+});
+
+test('atomic current-fact write serializes against supersession in both lock orderings', async () => {
+  // Break caught: a former get-current then upsert implementation can insert a
+  // historical fact after another transaction supersedes the opportunity.
+  const oldTwoCall = async (state) => {
+    if (state.status !== 'active') throw new Error('unavailable');
+    state.events.push('old:get-current');
+    state.status = 'superseded'; state.events.push('supersede');
+    state.facts.push('historical fact'); state.events.push('old:upsert');
+  };
+  const old = { status: 'active', facts: [], events: [] };
+  await oldTwoCall(old);
+  assert.deepEqual(old, { status: 'superseded', facts: ['historical fact'], events: ['old:get-current', 'supersede', 'old:upsert'] });
+
+  const atomic = async (state, order) => {
+    if (order === 'write-first') { state.events.push('write:lock'); if (state.status !== 'active') throw new Error('unavailable'); state.facts.push('current fact'); state.events.push('write:insert'); state.status = 'superseded'; state.events.push('supersede'); return; }
+    state.status = 'superseded'; state.events.push('supersede'); state.events.push('write:lock');
+    if (state.status !== 'active') throw new Error('unavailable');
+  };
+  const writeFirst = { status: 'active', facts: [], events: [] };
+  await atomic(writeFirst, 'write-first');
+  assert.deepEqual(writeFirst, { status: 'superseded', facts: ['current fact'], events: ['write:lock', 'write:insert', 'supersede'] });
+  const supersedeFirst = { status: 'active', facts: [], events: [] };
+  await assert.rejects(atomic(supersedeFirst, 'supersede-first'), /unavailable/);
+  assert.deepEqual(supersedeFirst, { status: 'superseded', facts: [], events: ['supersede', 'write:lock'] });
+
+  const calls = [];
+  await setCurrentOperatorOpportunityFact({ opportunityId, field: 'seller_name', value: 'x', actor: 'admin', storage: { insertCurrentDealHunterOpportunityFact: async (fact) => { calls.push('insertCurrent'); return fact; }, getCurrentDealHunterOpportunity: async () => { calls.push('getCurrent'); }, upsertDealHunterOpportunityFact: async () => { calls.push('upsert'); } } });
+  assert.deepEqual(calls, ['insertCurrent']);
+});
+
 test('provider fact and observation read limits normalize to integer bounds consistently', async (t) => {
   const sqlite = withStorage(t);
   await seedOpportunity(sqlite);
@@ -366,10 +417,14 @@ test('provider fact and observation read limits normalize to integer bounds cons
 test('current-fact RPC has the exact service-role fail-closed locking contract in both SQL sources', async () => {
   const migration = fs.readFileSync(currentOperatorFactMigrationUrl, 'utf8');
   const schema = fs.readFileSync(supabaseSchemaUrl, 'utf8');
+  const normalizeRpc = (sql) => rpcDefinition(sql, 'insert_current_deal_hunter_opportunity_fact')
+    .replace(/--[^\n]*/g, '').replace(/\s+/g, ' ').replace(/\s*([(),;])\s*/g, '$1').trim();
+  assert.equal(normalizeRpc(migration), normalizeRpc(schema), 'forward migration and fresh schema must carry the identical current-fact RPC');
   for (const sql of [migration, schema]) {
-    assert.match(sql, /create or replace function public\.insert_current_deal_hunter_opportunity_fact\(/i);
-    assert.match(sql, /security definer[\s\S]*set search_path = public/i);
-    assert.match(sql, /status = 'active' for update[\s\S]*if not found[\s\S]*errcode = 'P0002'[\s\S]*insert into public\.deal_hunter_opportunity_facts/i);
+    const definition = rpcDefinition(sql, 'insert_current_deal_hunter_opportunity_fact');
+    assert.match(definition, /^create or replace function public\.insert_current_deal_hunter_opportunity_fact\(\s*p_id text, p_opportunity_id text, p_field text, p_value text, p_source text,\s*p_verified boolean, p_actor text, p_note text, p_created_at timestamptz, p_updated_at timestamptz\s*\)/i);
+    assert.match(definition, /security definer[\s\S]*set search_path = public/i);
+    assert.match(definition, /status = 'active' for update[\s\S]*if not found[\s\S]*errcode = 'P0002'[\s\S]*insert into public\.deal_hunter_opportunity_facts[\s\S]*returning \* into v_fact[\s\S]*return v_fact/i);
     assert.match(sql, /revoke all privileges on function public\.insert_current_deal_hunter_opportunity_fact[\s\S]*from public, anon, authenticated/i);
     assert.match(sql, /grant execute on function public\.insert_current_deal_hunter_opportunity_fact[\s\S]*to service_role/i);
   }

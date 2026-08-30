@@ -86,6 +86,21 @@ test('Pass rejects non-primitive action and every invalid reason or note before 
   });
 });
 
+test('Pass rejects an array action with a valid reason without disposition or review side effects', async () => {
+  // Break caught: String(action) turns ["pass"] into a valid Pass command.
+  const { storage, opportunityId } = await seedCurrentOpportunity('opp-http-triage-array-pass');
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const response = await fetch(`${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/action`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ action: ['pass'], reason: 'not-a-fit' }),
+    });
+    assert.equal(response.status, 400);
+    const score = await storage.getDealHunterOpportunityScore(opportunityId);
+    assert.equal((await storage.listDealHunterDispositions({ dealKeys: [`deal-${opportunityId}`], limit: 20 })).length, 0);
+    assert.deepEqual({ reviewed_at: score.reviewed_at, reviewed_by: score.reviewed_by, reviewed_fingerprint: score.reviewed_fingerprint, reviewed_semantic_digest: score.reviewed_semantic_digest }, { reviewed_at: null, reviewed_by: null, reviewed_fingerprint: null, reviewed_semantic_digest: null });
+  });
+});
+
 test('triage detail remains readable while only administrators may enrich facts or run bounded Pursue, Watch, and Pass actions', async () => {
   const { storage, opportunityId } = await seedCurrentOpportunity();
   await withServer(async (origin) => {
