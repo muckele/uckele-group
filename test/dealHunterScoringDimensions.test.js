@@ -8,6 +8,7 @@ process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
 
 const { scoreDeal } = await import('../server/services/dealHunter.js');
 const {
+  canonicalDealHunterContradictionValue,
   dealScoreFingerprint,
   dealScoreFingerprintFields,
   scoreOpportunity,
@@ -263,11 +264,120 @@ test('source contradictions surface as evidence and confidence reasons without c
   }));
 
   assert.equal(conflicted.fitScore, clean.fitScore, 'a contradiction must not silently move the score');
+  assert.equal(conflicted.fingerprint, clean.fingerprint, 'contradiction bookkeeping is not an ordinary scoring input');
+  assert.notEqual(
+    conflicted.semanticDigest,
+    clean.semanticDigest,
+    'adding reviewer-visible contradiction evidence must change the semantic conclusion',
+  );
   assert.equal(conflicted.contradictionCount, 1);
   assert.equal(conflicted.evidence.some((row) => row.evidenceClass === 'contradicted'), true);
   assert.ok(conflicted.confidenceReasons.some((reason) => /disagree/i.test(reason)));
   const financial = conflicted.dimensions.find((d) => d.id === 'financial-fit');
   assert.equal(financial.contradictions.length, 1);
+});
+
+test('zero-contradiction semantic digests stay compatible with deployed v111 rows', () => {
+  assert.equal(
+    scoreOpportunity(baseDeal()).semanticDigest,
+    '2c12c4dbcde134560ea031502daa6a96139ee8428c70a13e9c0c87ce4387b4c6',
+    'strengthening contradiction semantics must not rewrite every unaffected score',
+  );
+});
+
+test('semantic digest binds same-count contradiction values but excludes volatile provenance', () => {
+  const contradiction = {
+    field: 'annualProfit',
+    canonicalValue: 450000,
+    observedValue: 520000,
+    canonicalSource: {
+      sourceId: 'deal-os-export',
+      sourceName: 'Deal OS',
+      sourceRecordId: 'row-9',
+      listingUrl: 'https://listings.example.invalid/unit-deal',
+      observedAt: '2026-08-15T00:00:00.000Z',
+    },
+    observedSource: { sourceId: 'daily-deal-update' },
+    resolution: 'preserved-canonical',
+  };
+  const original = scoreOpportunity(baseDeal({ fieldConflicts: [contradiction] }));
+  const stringRepresentation = scoreOpportunity(baseDeal({
+    fieldConflicts: [{
+      ...contradiction,
+      canonicalValue: '450000',
+      observedValue: '520000',
+    }],
+  }));
+  const genuinelyChangedStringValue = scoreOpportunity(baseDeal({
+    fieldConflicts: [{
+      ...contradiction,
+      canonicalValue: '450000',
+      observedValue: '530000',
+    }],
+  }));
+  const changedValue = scoreOpportunity(baseDeal({
+    fieldConflicts: [{ ...contradiction, observedValue: 610000 }],
+  }));
+  const changedProvenance = scoreOpportunity(baseDeal({
+    fieldConflicts: [{
+      ...contradiction,
+      canonicalSource: {
+        sourceId: 'refreshed-source',
+        sourceName: 'Refreshed source',
+        sourceRecordId: 'row-2026-08-29',
+        listingUrl: 'https://source-refresh.example.invalid/unit-deal',
+        observedAt: '2026-08-29T23:59:59.000Z',
+      },
+      observedSource: { sourceId: 'refreshed-conflicting-source' },
+    }],
+  }));
+  const coreContradictions = (result) => result.evidence
+    .filter((row) => row.evidenceClass === 'contradicted')
+    .map((row) => ({ field: row.field, value: row.value, observedValue: row.observedValue }));
+  const persistedCoreContradictions = (result) => coreContradictions(result).map((row) => ({
+    field: canonicalDealHunterContradictionValue(row.field),
+    value: canonicalDealHunterContradictionValue(row.value),
+    observedValue: canonicalDealHunterContradictionValue(row.observedValue),
+  }));
+
+  assert.equal(canonicalDealHunterContradictionValue(null), null);
+  assert.equal(canonicalDealHunterContradictionValue(undefined), null);
+  assert.equal(canonicalDealHunterContradictionValue(450000), '450000');
+  assert.equal(canonicalDealHunterContradictionValue(true), 'true');
+  assert.equal(canonicalDealHunterContradictionValue('  reviewer\n visible  '), 'reviewer visible');
+
+  assert.equal(original.fingerprint, changedValue.fingerprint);
+  assert.equal(original.fingerprint, changedProvenance.fingerprint);
+  assert.equal(original.fingerprint, stringRepresentation.fingerprint);
+  assert.equal(original.fitScore, changedValue.fitScore);
+  assert.equal(original.fitScore, stringRepresentation.fitScore);
+  assert.equal(original.contradictionCount, changedValue.contradictionCount);
+  assert.deepEqual(
+    persistedCoreContradictions(original),
+    persistedCoreContradictions(stringRepresentation),
+    'numeric and string contradiction values persist as the same reviewer-visible tuple',
+  );
+  assert.equal(
+    original.semanticDigest,
+    stringRepresentation.semanticDigest,
+    'type-only variation in reviewer-identical contradiction values must not change the semantic digest',
+  );
+  assert.notEqual(
+    original.semanticDigest,
+    genuinelyChangedStringValue.semanticDigest,
+    'a genuinely different reviewer-visible contradiction value must still change the semantic digest',
+  );
+  assert.notDeepEqual(coreContradictions(original), coreContradictions(changedValue));
+  assert.notEqual(
+    original.semanticDigest,
+    changedValue.semanticDigest,
+    'a same-count contradiction value change must stale persisted core evidence',
+  );
+  assert.equal(
+    original.semanticDigest,
+    changedProvenance.semanticDigest,
+    'source observation provenance alone must not create daily semantic rewrite churn',
+  );
 });
 
 // ---------------------------------------------------------------------------

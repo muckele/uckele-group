@@ -16,7 +16,10 @@ import {
   DEAL_SCORING_RULES_VERSION,
   DEAL_SCORING_RULES_VERSION_PREVIOUS,
 } from './dealHunterScoringPolicy.js';
-import { scoreOpportunity } from './dealHunterScoring.js';
+import {
+  canonicalDealHunterContradictionValue,
+  scoreOpportunity,
+} from './dealHunterScoring.js';
 
 export const fullRebuildConfirmation = 'REBUILD ALL SCORES';
 
@@ -63,15 +66,63 @@ function authoritativeFullBackfillProblems(review, candidates = []) {
   return problems;
 }
 
-// A stored score is reusable only when the inputs and every scoring version
-// behind it are unchanged. A rules or profile bump therefore forces a rescore
-// rather than serving a score computed under retired rules.
-function storedScoreIsCurrent(stored, fingerprint) {
-  return Boolean(stored)
-    && stored.score_fingerprint === fingerprint
-    && stored.engine_version === DEAL_SCORING_ENGINE_VERSION
-    && stored.rules_version === DEAL_SCORING_RULES_VERSION
-    && stored.profile_version === DEAL_SCORING_PROFILE_VERSION;
+function contradictionCoreSignature(evidence = []) {
+  return JSON.stringify(evidence
+    .filter((row) => (row.evidenceClass || row.evidence_class) === 'contradicted')
+    .map((row) => ({
+      field: canonicalDealHunterContradictionValue(row.field) || '',
+      canonicalValue: canonicalDealHunterContradictionValue(row.value),
+      observedValue: canonicalDealHunterContradictionValue(row.observedValue ?? row.observed_value),
+    }))
+    .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right))));
+}
+
+function semanticDigestIsCurrent(stored, result, storedContradictions = null) {
+  if (!stored) return false;
+  if (stored.semantic_digest === result.semanticDigest) return true;
+  return Boolean(result.legacySemanticDigest)
+    && stored.semantic_digest === result.legacySemanticDigest
+    && Array.isArray(storedContradictions)
+    && contradictionCoreSignature(storedContradictions) === contradictionCoreSignature(result.evidence || []);
+}
+
+async function loadLegacyContradictions(storage, evaluated, storedByOpportunity) {
+  if (typeof storage.listDealHunterContradictionEvidence !== 'function') return new Map();
+  const opportunityIds = evaluated
+    .filter(({ deal, result }) => {
+      const stored = storedByOpportunity.get(deal.opportunityId);
+      return stored
+        && stored.semantic_digest !== result.semanticDigest
+        && stored.semantic_digest === result.legacySemanticDigest;
+    })
+    .map(({ deal }) => deal.opportunityId);
+  if (opportunityIds.length === 0) return new Map();
+  const byOpportunity = new Map(opportunityIds.map((opportunityId) => [opportunityId, []]));
+  for (const row of await storage.listDealHunterContradictionEvidence(opportunityIds)) {
+    const rows = byOpportunity.get(row.opportunity_id);
+    if (rows) rows.push(row);
+  }
+  return byOpportunity;
+}
+
+// A stored score is reusable only when both its input/version identity and its
+// human-relevant conclusions match the already-computed fresh result.
+function storedScoreIsCurrent(stored, result, storedContradictions = null) {
+  if (!stored) return false;
+  const semanticCurrent = semanticDigestIsCurrent(stored, result, storedContradictions);
+  const unreviewedLegacyEncoding = semanticCurrent
+    && stored.semantic_digest !== result.semanticDigest
+    && !stored.reviewed_at;
+  return stored.score_fingerprint === result.fingerprint
+    && semanticCurrent
+    // Migrate an unreviewed equivalent legacy digest silently so a strict audit
+    // converges. A reviewed row keeps the encoding its operator acknowledged
+    // until its core evidence genuinely changes.
+    && !unreviewedLegacyEncoding
+    && stored.engine_version === result.engineVersion
+    && stored.rules_version === result.rulesVersion
+    && stored.profile_version === result.profileVersion
+    && stored.completeness_policy_version === result.completenessPolicyVersion;
 }
 
 function machineScoreRow(deal, result) {
@@ -131,22 +182,26 @@ async function emitRescoreEvent({ storage, deal, previous, row, actor }) {
   // Activity events hang off a CRM record. A sourced opportunity with no linked
   // submission has nothing to attach to; its score row and fingerprint are the
   // durable audit trail in that case. The lookup happens here, and only for an
-  // opportunity whose score actually moved, so a large rebuild does not pay it
-  // per candidate.
+  // opportunity whose human-relevant score conclusions or core evidence
+  // changed, so a large rebuild does not pay it per candidate.
   const opportunity = storage.getCurrentDealHunterOpportunity
     ? await storage.getCurrentDealHunterOpportunity(deal.opportunityId)
     : null;
   const submissionId = opportunity?.primary_submission_id || '';
   if (!submissionId) return null;
+  const scoreMoved = Boolean(previous) && previous.fit_score !== row.fit_score;
+  const changeKind = !previous ? 'initial' : scoreMoved ? 'score' : 'semantic-evidence';
 
   return recordCrmActivity({
     storage,
     submissionId,
     opportunityId: deal.opportunityId,
     eventType: 'opportunity.rescored',
-    summary: previous
-      ? `Deal Hunter score moved from ${previous.fit_score} to ${row.fit_score}.`
-      : `Deal Hunter scored this opportunity at ${row.fit_score}.`,
+    summary: !previous
+      ? `Deal Hunter scored this opportunity at ${row.fit_score}.`
+      : scoreMoved
+        ? `Deal Hunter score moved from ${previous.fit_score} to ${row.fit_score}.`
+        : `Deal Hunter score evidence changed while the fit score remained ${row.fit_score}.`,
     actor: normalizeText(actor, 160) || 'deal-hunter',
     role: 'system',
     metadata: {
@@ -158,6 +213,7 @@ async function emitRescoreEvent({ storage, deal, previous, row, actor }) {
       confidence: row.confidence,
       rulesVersion: row.rules_version,
       engineVersion: row.engine_version,
+      changeKind,
       dimensionChanges: meaningfulDimensionChanges(previous?.dimensions, row.dimensions).slice(0, 12),
     },
   });
@@ -243,34 +299,51 @@ export async function refreshOpportunityScores({
     .filter((deal) => deal?.opportunityId && deal.identityStatus === 'resolved')
     .filter((deal) => requested.size === 0 || requested.has(deal.opportunityId))
     .slice(0, maxRefreshBatch);
+  const counts = { considered: scoped.length, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 };
+  const errors = [];
+  const evaluated = [];
+  for (const deal of scoped) {
+    try {
+      evaluated.push({ deal, result: scoreOpportunity(deal) });
+    } catch (error) {
+      counts.failed += 1;
+      errors.push({ opportunityId: deal.opportunityId, error: normalizeText(error.message, 500) });
+    }
+  }
 
   // One batched read instead of a lookup per opportunity.
   const storedByOpportunity = new Map(
-    (await storage.listDealHunterOpportunityScoreFingerprints(scoped.map((deal) => deal.opportunityId)))
+    (await storage.listDealHunterOpportunityScoreFingerprints(evaluated.map(({ deal }) => deal.opportunityId)))
       .map((row) => [row.opportunity_id, row]),
   );
+  // Only deployed contradiction digests need the compatibility evidence, and
+  // those rows are loaded together rather than through an N+1 query.
+  const legacyContradictions = await loadLegacyContradictions(storage, evaluated, storedByOpportunity);
 
-  const counts = { considered: scoped.length, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 };
-  const errors = [];
-
-  for (const deal of scoped) {
+  for (const { deal, result } of evaluated) {
     try {
-      const result = scoreOpportunity(deal);
       const stored = storedByOpportunity.get(deal.opportunityId);
-      if (!force && storedScoreIsCurrent(stored, result.fingerprint)) {
+      const storedContradictions = legacyContradictions.get(deal.opportunityId);
+      if (!force && storedScoreIsCurrent(stored, result, storedContradictions)) {
         counts.skipped += 1;
         continue;
       }
-      // A forced refresh over identical inputs rewrites the row but must not
-      // claim the opportunity changed. The batched fingerprint read already
-      // answers this, so no per-opportunity lookup is needed to decide it.
-      const row = machineScoreRow(deal, result);
       // An event describes a change in conclusions, not a change in version
       // metadata, so it is gated on the semantic digest rather than the
       // fingerprint. A rules bump that reproduces the same score is silent.
       // The batched read already carries the stored digest, so deciding this
       // costs no extra query.
-      const semanticallyChanged = !stored || stored.semantic_digest !== result.semanticDigest;
+      const semanticallyChanged = !semanticDigestIsCurrent(stored, result, storedContradictions);
+      // A forced or version-only refresh over a reviewed, semantically
+      // equivalent v111 digest keeps the exact digest the operator
+      // acknowledged. Otherwise changing only the digest encoding would make
+      // the derived review state falsely stale.
+      const row = machineScoreRow(deal, result);
+      if (!semanticallyChanged
+        && stored?.reviewed_at
+        && stored.semantic_digest !== result.semanticDigest) {
+        row.semantic_digest = stored.semantic_digest;
+      }
       // The previous row is read only when an event will actually describe it.
       const previous = semanticallyChanged
         ? await storage.getDealHunterOpportunityScore(deal.opportunityId)
@@ -378,6 +451,18 @@ export async function previewOpportunityScoreRefresh({
     .filter((deal) => deal?.opportunityId && deal.identityStatus === 'resolved')
     .filter((deal) => requested.size === 0 || requested.has(deal.opportunityId))
     .slice(0, maxRefreshBatch);
+  const evaluated = [];
+  for (const deal of scoped) {
+    evaluated.push({
+      deal,
+      result: scoreOpportunity(deal),
+      stored: await storage.getDealHunterOpportunityScore(deal.opportunityId),
+    });
+  }
+  const storedByOpportunity = new Map(
+    evaluated.filter(({ stored }) => stored).map(({ deal, stored }) => [deal.opportunityId, stored]),
+  );
+  const legacyContradictions = await loadLegacyContradictions(storage, evaluated, storedByOpportunity);
 
   const counts = {
     considered: scoped.length,
@@ -400,9 +485,7 @@ export async function previewOpportunityScoreRefresh({
   };
   const samples = [];
 
-  for (const deal of scoped) {
-    const result = scoreOpportunity(deal);
-    const stored = await storage.getDealHunterOpportunityScore(deal.opportunityId);
+  for (const { deal, result, stored } of evaluated) {
     if (!stored) {
       counts.newlyScored += 1;
       counts.estimatedWrites += 1;
@@ -410,13 +493,13 @@ export async function previewOpportunityScoreRefresh({
     }
 
     const semanticChange = stored.semantic_digest !== result.semanticDigest;
-    const fingerprintChange = stored.score_fingerprint !== result.fingerprint;
-    if (!semanticChange && !fingerprintChange) {
+    const storedContradictions = legacyContradictions.get(deal.opportunityId);
+    if (storedScoreIsCurrent(stored, result, storedContradictions)) {
       counts.unchanged += 1;
       continue;
     }
     counts.estimatedWrites += 1;
-    if (!semanticChange) {
+    if (!semanticChange || semanticDigestIsCurrent(stored, result, storedContradictions)) {
       // Same conclusions, different version metadata. This is the case a
       // version bump produces and the case that must not flood review.
       counts.versionOnly += 1;

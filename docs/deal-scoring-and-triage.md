@@ -91,16 +91,44 @@ Two digests answer two different questions:
 
 | Digest | Covers | Answers |
 | --- | --- | --- |
-| `score_fingerprint` | scoring inputs **plus** every version, including the matcher version | "should this be rescored?" |
-| `semantic_digest` | what the score concludes: score, status, confidence, completeness, eligibility, gates, caps, per-dimension contribution and verdict, missing evidence, contradictions — and **no** version field | "should a human look again?" |
+| `score_fingerprint` | scoring inputs **plus** every version, including the matcher version | "does this row have the same scoring-input/version identity?" |
+| `semantic_digest` | what the score concludes: score, status, confidence, completeness, eligibility, gates, caps, per-dimension contribution and verdict, missing evidence, and reviewer-visible contradiction field/canonical/observed values — and **no** version or observation-provenance field | "are the persisted conclusions and core evidence still current, and should a human look again?" |
 
 `score_fingerprint` is a digest of the normalized inputs that can actually change a score, plus the engine, rules, profile, completeness-policy, and semantic-matcher versions.
 
-It deliberately **excludes** observation bookkeeping — first seen, last seen, `isNew`, generated notes, per-run metadata, and fields such as `netMargin` that no scoring branch reads. Including volatile timestamps in a digest is what previously made the reconciliation preview classify every unchanged record as a write; the same mistake here would make every opportunity look permanently changed.
+It deliberately **excludes** observation bookkeeping — first seen, last seen, `isNew`, generated notes, per-run metadata, and fields such as `netMargin` that no scoring branch reads. The semantic digest likewise excludes evidence provenance such as `observedAt`, source observation timestamps, source record IDs, source names, and listing-observation metadata. Including volatile timestamps in either digest would make every opportunity look permanently changed.
 
-When the fingerprint and every version match what is stored, the opportunity is skipped completely: no score write, no evidence replacement, no activity event, and `scored_at` does not move. A rules, engine, or profile version bump forces a rescore rather than serving a score computed under retired rules.
+Normal persistence currentness requires the fingerprint, semantic conclusions,
+and engine/rules/profile/completeness-policy versions to match the fresh
+deterministic result. The only compatibility form is a contradiction-bearing
+v111 semantic digest: it is considered semantically equivalent only when one
+batched evidence read proves that its persisted contradiction
+field/canonical/observed values exactly match the fresh core. There is no
+per-opportunity evidence lookup.
+
+An operator-reviewed equivalent v111 row is left byte-for-byte alone so changing
+digest encoding cannot manufacture review staleness. An unreviewed equivalent
+row is migrated once as a silent version-only rewrite, which gives strict
+post-refresh digest convergence without an activity event. A same-count
+contradiction value change is not equivalent: it remains a semantic/evidence
+write and becomes changed-since-review when applicable.
+
+If an operator-reviewed equivalent v111 row later needs an otherwise
+version-only rewrite, the machine updates its fingerprint and versions while
+retaining the exact legacy semantic digest the operator acknowledged. That
+preserves the existing reviewed-semantic-digest contract without allowing stale
+core contradiction evidence.
+
+Only a current row is skipped completely: no score write, no evidence
+replacement, no activity event, and `scored_at` does not move. A rules, engine,
+profile, or completeness-policy version bump forces a rescore rather than
+serving a score computed under retired policy. A same-fingerprint semantic
+change — for example, stale contradiction evidence — also forces a normal
+non-force rewrite.
 
 When a score changes, the score row and all of its evidence are replaced together — one SQLite transaction, one Supabase security-definer function — so evidence can never describe a superseded fingerprint.
+
+For recovery audits, compare deterministic **core evidence** separately from full provenance. Core evidence includes dimensions, rule IDs, evidence classes, fields, values, observed contradiction values, and terms. A core mismatch means persisted scoring evidence is stale. A full-provenance-only mismatch may simply mean a source was observed again under a new row ID or timestamp; it is expected observation churn and does not by itself require a score rewrite.
 
 ## Where scoring runs
 
@@ -147,14 +175,14 @@ Views are derived from state that already exists. No new workflow state machine 
 
 | View | Derivation |
 | --- | --- |
-| Needs review | Never reviewed, or `reviewed_fingerprint` differs from `score_fingerprint`. |
+| Needs review | Never reviewed, or `reviewed_semantic_digest` differs from `semantic_digest`; legacy reviews without a semantic digest fall back to fingerprint comparison. |
 | High priority | High-fit listings, plus anything the operator marked `urgent` or `high`. |
 | Watchlist | The existing 60–74 band, plus anything marked `watch`. |
 | Low confidence | `confidence = low`, or the sources contradict each other. |
 | Dismissed | The existing `deal_hunter_dispositions` record. |
 | All scored | Everything with a persisted score. |
 
-Working views exclude dismissed and gated listings. **Changed since reviewed** is derived from the fingerprint the operator acknowledged, not stored as its own flag, so it can never drift out of step with the score.
+Working views exclude dismissed and gated listings. **Changed since reviewed** is derived from the semantic digest the operator acknowledged, with the same legacy fingerprint fallback, rather than stored as its own flag. A version-only or volatile-provenance-only rewrite therefore does not manufacture human review work.
 
 Dismissal remains owned by the existing disposition mechanism, and acquisition progress remains owned by the command center's pipeline stage. Triage does not duplicate either.
 
@@ -162,7 +190,7 @@ Default sort is fit score descending, then confidence, then opportunity id. The 
 
 ## Audit trail
 
-- `opportunity.rescored` — emitted only when a score actually moved. Carries previous and new score, both fingerprints, confidence, rules version, and the dimensions whose contribution changed. A fingerprint-identical refresh emits nothing.
+- `opportunity.rescored` — emitted when human-relevant score conclusions or core contradiction evidence change. Carries a change kind, previous and new score, both fingerprints, confidence, rules version, and the dimensions whose contribution changed. Numerical changes say the score moved; evidence-only changes truthfully say evidence changed while the fit score remained constant. Version-only and volatile-provenance-only rewrites emit nothing.
 - `opportunity.triaged` — emitted when an operator sets priority, adds a note, or marks an opportunity reviewed.
 
 Both attach to the opportunity's linked CRM record. A sourced opportunity with no CRM record has nothing to attach to; its score row and fingerprint are the audit trail in that case.
@@ -180,5 +208,5 @@ Both attach to the opportunity's linked CRM record. A sourced opportunity with n
 2. Open **Deal Hunter → Triage** and work **Needs review**.
 3. Use **Why this score** to check the evidence before acting, especially where confidence is low or fields are missing.
 4. Set priority where your judgment differs from the machine's. The score stays as it was.
-5. Mark reviewed. The opportunity leaves the queue until its inputs actually change.
+5. Mark reviewed. The opportunity leaves the queue until its human-relevant scoring conclusions or core contradiction evidence change.
 6. Dismiss through the existing disposition action, not by lowering a score.

@@ -404,9 +404,145 @@ test('fingerprint lookup returns only the columns the refresh gate needs', async
   // change from a version-only rewrite without a per-row lookup.
   assert.deepEqual(
     Object.keys(fingerprints[0]).sort(),
-    ['engine_version', 'opportunity_id', 'profile_version', 'rules_version', 'score_fingerprint', 'semantic_digest'],
+    [
+      'completeness_policy_version',
+      'engine_version',
+      'opportunity_id',
+      'profile_version',
+      'reviewed_at',
+      'rules_version',
+      'score_fingerprint',
+      'semantic_digest',
+    ],
   );
   assert.equal(await storage.listDealHunterOpportunityScoreFingerprints([]).then((rows) => rows.length), 0);
+});
+
+test('Supabase fingerprint lookup projects the same complete currentness contract', async () => {
+  let selected = '';
+  const row = {
+    opportunity_id: 'opp-score-1',
+    score_fingerprint: 'fingerprint-a',
+    semantic_digest: 'digest-a',
+    rules_version: 'deal-hunter-fit-v2.1',
+    engine_version: 'deal-scoring-engine-v1',
+    profile_version: 'deal-hunter-profile-v1',
+    completeness_policy_version: 'deal-hunter-completeness-v1',
+    reviewed_at: null,
+  };
+  const chain = {
+    from(table) {
+      assert.equal(table, 'deal_hunter_opportunity_scores');
+      return chain;
+    },
+    select(fields) {
+      selected = fields;
+      return chain;
+    },
+    async in(column, values) {
+      assert.equal(column, 'opportunity_id');
+      assert.deepEqual(values, ['opp-score-1']);
+      return { data: [row], error: null };
+    },
+  };
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: chain },
+  );
+
+  assert.deepEqual(
+    await storage.listDealHunterOpportunityScoreFingerprints(['opp-score-1']),
+    [row],
+  );
+  assert.deepEqual(selected.split(/,\s*/).sort(), [
+    'completeness_policy_version',
+    'engine_version',
+    'opportunity_id',
+    'profile_version',
+    'reviewed_at',
+    'rules_version',
+    'score_fingerprint',
+    'semantic_digest',
+  ]);
+});
+
+test('SQLite batches only core contradiction evidence for legacy digest compatibility', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage);
+  await seedOpportunity(storage, 'opp-score-2');
+  await storage.writeDealHunterOpportunityScore(scorePayload(), [{
+    ruleId: 'evidence.contradiction',
+    ruleLabel: 'Sources disagree on annualProfit',
+    evidenceClass: 'contradicted',
+    field: 'annualProfit',
+    value: 450000,
+    observedValue: 520000,
+    sourceId: 'canonical-source',
+    sourceRecordId: 'volatile-row-1',
+    observedAt: '2026-08-29T00:00:00.000Z',
+  }]);
+  await storage.writeDealHunterOpportunityScore(
+    scorePayload({
+      opportunity_id: 'opp-score-2',
+      deal_key: 'deal-score-2',
+      score_fingerprint: 'fingerprint-two',
+    }),
+    evidencePayload('fingerprint-two'),
+  );
+
+  assert.deepEqual(
+    await storage.listDealHunterContradictionEvidence(['opp-score-1', 'opp-score-2']),
+    [{
+      opportunity_id: 'opp-score-1',
+      evidence_class: 'contradicted',
+      field: 'annualProfit',
+      value: '450000',
+      observed_value: '520000',
+    }],
+  );
+  assert.deepEqual(await storage.listDealHunterContradictionEvidence([]), []);
+});
+
+test('Supabase batches the same core contradiction evidence without provenance', async () => {
+  let selected = '';
+  const row = {
+    opportunity_id: 'opp-score-1',
+    evidence_class: 'contradicted',
+    field: 'annualProfit',
+    value: '450000',
+    observed_value: '520000',
+  };
+  const chain = {
+    from(table) {
+      assert.equal(table, 'deal_hunter_score_evidence');
+      return chain;
+    },
+    select(fields) {
+      selected = fields;
+      return chain;
+    },
+    eq(column, value) {
+      assert.equal(column, 'evidence_class');
+      assert.equal(value, 'contradicted');
+      return chain;
+    },
+    async in(column, values) {
+      assert.equal(column, 'opportunity_id');
+      assert.deepEqual(values, ['opp-score-1']);
+      return { data: [row], error: null };
+    },
+  };
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: chain },
+  );
+
+  assert.deepEqual(await storage.listDealHunterContradictionEvidence(['opp-score-1']), [row]);
+  assert.equal(
+    selected,
+    'opportunity_id, evidence_class, field, value, observed_value',
+  );
+  assert.deepEqual(await storage.listDealHunterContradictionEvidence([]), []);
 });
 
 // ---------------------------------------------------------------------------
@@ -668,6 +804,7 @@ test('both storage providers expose the same scoring surface', () => {
       'reconcileDealHunterCurrentScoreEligibility',
       'listDealHunterOpportunityScores',
       'listDealHunterOpportunityScoreFingerprints',
+      'listDealHunterContradictionEvidence',
       'listDealHunterScoreEvidence',
     ]) {
       assert.equal(typeof sqlite[method], 'function', `sqlite is missing ${method}`);

@@ -60,6 +60,15 @@ function normalizeValue(value) {
   return String(value).replace(/\s+/g, ' ').trim();
 }
 
+// SQLite String(...) serialization and Supabase's JSON ->> extraction both
+// persist contradiction values as reviewer-visible text. Semantic comparison
+// must use that same representation so a source type change alone is silent.
+export function canonicalDealHunterContradictionValue(value) {
+  return value === null || value === undefined
+    ? null
+    : String(value).replace(/\s+/g, ' ').trim();
+}
+
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -85,17 +94,19 @@ export function dealScoreFingerprint(deal = {}) {
   return sha256(JSON.stringify(dealScoreFingerprintInput(deal)));
 }
 
-/**
- * Digest of what a score *concludes*, ignoring how it was computed.
- *
- * The fingerprint answers "should this be rescored" and therefore includes the
- * rules and matcher versions. This digest answers the different question "should
- * a human look again", so it deliberately excludes every version field. A rules
- * bump that reproduces the same conclusions leaves this digest unchanged, which
- * is what stops a version bump from flooding the review queue.
- */
-export function dealSemanticDigest(result = {}) {
-  return sha256(JSON.stringify({
+function semanticContradictions(evidence = []) {
+  return evidence
+    .filter((row) => (row.evidenceClass || row.evidence_class) === 'contradicted')
+    .map((row) => ({
+      field: canonicalDealHunterContradictionValue(row.field) || '',
+      canonicalValue: canonicalDealHunterContradictionValue(row.value),
+      observedValue: canonicalDealHunterContradictionValue(row.observedValue ?? row.observed_value),
+    }))
+    .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+}
+
+function semanticConclusions(result = {}) {
+  return {
     fitScore: result.fitScore ?? null,
     scoreStatus: result.scoreStatus || '',
     shouldRemove: Boolean(result.shouldRemove),
@@ -110,7 +121,38 @@ export function dealSemanticDigest(result = {}) {
       .sort((left, right) => left.id.localeCompare(right.id)),
     missingEvidence: [...(result.missingEvidence || [])].sort(),
     contradictionCount: result.contradictionCount ?? 0,
-  }));
+  };
+}
+
+// The digest shape deployed in v111. It remains available only to recognize an
+// existing contradiction-bearing row whose persisted core evidence is already
+// identical to the stronger digest's input.
+export function dealLegacySemanticDigest(result = {}) {
+  return sha256(JSON.stringify(semanticConclusions(result)));
+}
+
+/**
+ * Digest of what a score *concludes*, ignoring how it was computed.
+ *
+ * The fingerprint answers "should this be rescored" and therefore includes the
+ * rules and matcher versions. This digest answers the different question "should
+ * a human look again", so it deliberately excludes every version field. A rules
+ * bump that reproduces the same conclusions leaves this digest unchanged, which
+ * is what stops a version bump from flooding the review queue.
+ */
+export function dealSemanticDigest(result = {}) {
+  const conclusions = semanticConclusions(result);
+  const contradictions = semanticContradictions(result.evidence || []);
+  if (contradictions.length > 0) {
+    // Contradiction count alone cannot protect the evidence a reviewer sees:
+    // one canonical/observed value pair may replace another without changing
+    // the count or score. Bind only that deterministic core, never observation
+    // timestamps or source-record provenance. Keep the key absent when there
+    // are no contradictions so deployed zero-contradiction digests remain
+    // byte-for-byte compatible.
+    conclusions.contradictions = contradictions;
+  }
+  return sha256(JSON.stringify(conclusions));
 }
 
 function provenanceFor(deal, field) {
@@ -344,6 +386,7 @@ export function scoreOpportunity(deal = {}) {
     fingerprint: dealScoreFingerprint(deal),
     scoredDeal: scored,
   };
+  result.legacySemanticDigest = dealLegacySemanticDigest(result);
   result.semanticDigest = dealSemanticDigest(result);
   return result;
 }
