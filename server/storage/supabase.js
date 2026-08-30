@@ -3016,13 +3016,14 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterOpportunityRow(data);
     },
 
-    async listDealHunterOpportunityFacts(opportunityId) {
+    async listDealHunterOpportunityFacts(opportunityId, { limit = 500 } = {}) {
       const { data, error } = await client
         .from('deal_hunter_opportunity_facts')
         .select('*')
         .eq('opportunity_id', String(opportunityId || '').trim())
         .order('created_at', { ascending: false })
-        .order('id', { ascending: false });
+        .order('id', { ascending: false })
+        .limit(Math.max(1, Math.min(Number(limit) || 500, 500)));
       if (error) throw error;
       return (data || []).map(normalizeDealHunterOpportunityFactRow);
     },
@@ -3045,13 +3046,24 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterOpportunityFactRow(data);
     },
 
-    async listDealHunterOpportunitySourceObservations(opportunityId) {
+    async insertCurrentDealHunterOpportunityFact(fact = {}) {
+      const { data, error } = await client.rpc('insert_current_deal_hunter_opportunity_fact', {
+        p_id: fact.id, p_opportunity_id: fact.opportunity_id, p_field: fact.field, p_value: fact.value,
+        p_source: fact.source || 'operator', p_verified: Boolean(fact.verified), p_actor: fact.actor,
+        p_note: fact.note || null, p_created_at: fact.created_at, p_updated_at: fact.updated_at,
+      });
+      if (error) throw error;
+      return normalizeDealHunterOpportunityFactRow(data);
+    },
+
+    async listDealHunterOpportunitySourceObservations(opportunityId, { limit = 500 } = {}) {
       const { data, error } = await client
         .from('deal_hunter_opportunity_source_observations')
         .select('*')
         .eq('opportunity_id', String(opportunityId || '').trim())
         .order('observed_at', { ascending: false })
-        .order('id');
+        .order('id')
+        .limit(Math.max(1, Math.min(Number(limit) || 500, 500)));
       if (error) throw error;
       return (data || []).map(normalizeDealHunterOpportunitySourceObservationRow);
     },

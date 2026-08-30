@@ -1469,7 +1469,12 @@ export function createApp() {
         return;
       }
       const result = await getTriageOpportunityDetail({ opportunityId: request.params.opportunityId });
-      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error || 'Opportunity detail is unavailable.' });
+        return;
+      }
+      const { ok: _ok, status: _status, ...detail } = result;
+      response.status(200).json(detail);
     }),
   );
 
@@ -1498,7 +1503,7 @@ export function createApp() {
         response.status(200).json({ success: true, fact });
       } catch (error) {
         const message = String(error?.message || 'Opportunity fact could not be saved.');
-        const status = /no longer current/i.test(message) ? 409 : /was not found/i.test(message) ? 404 : 400;
+        const status = /no longer current|current canonical opportunity/i.test(message) ? 409 : /was not found/i.test(message) ? 404 : 400;
         response.status(status).json({ success: false, error: message });
       }
     }),
@@ -1557,12 +1562,22 @@ export function createApp() {
         response.status(404).json({ success: false, error: 'No current score has been recorded for this opportunity.' });
         return;
       }
+      const reason = request.body?.reason;
+      const note = request.body?.note;
+      if (typeof reason !== 'string' || !reason.trim() || reason.trim().length > 80) {
+        response.status(400).json({ success: false, error: 'A bounded disposition reason is required.' });
+        return;
+      }
+      if (note !== undefined && note !== null && (typeof note !== 'string' || note.length > 2000)) {
+        response.status(400).json({ success: false, error: 'Disposition note must be a bounded string.' });
+        return;
+      }
       const dismissal = await dismissDealHunterOpportunity({
         dealKey: score.deal_key || '',
         listingUrl: score.listing_url || '',
         dealName: score.name || opportunity.canonical_name || '',
-        reason: request.body?.reason || '',
-        note: request.body?.note || '',
+        reason: reason.trim(),
+        note: note?.trim() || '',
         submissionId: opportunity.primary_submission_id || '',
         actor: session.username || 'admin',
         storage,

@@ -308,17 +308,21 @@ export async function setCurrentOperatorOpportunityFact({
   note = null,
   storage,
 } = {}) {
-  if (!storage || typeof storage.getCurrentDealHunterOpportunity !== 'function') {
-    throw new Error('Current canonical opportunity lookup is required.');
+  if (!storage || typeof storage.insertCurrentDealHunterOpportunityFact !== 'function') {
+    throw new Error('Atomic current opportunity fact storage is required.');
   }
   const id = normalizeText(opportunityId, 'Canonical opportunity id', { maxLength: 200 });
-  const current = await storage.getCurrentDealHunterOpportunity(id);
-  if (!current) {
-    const historical = await storage.getDealHunterOpportunity?.(id);
-    if (historical) throw new Error('The canonical opportunity is no longer current.');
-    throw new Error('The canonical opportunity was not found.');
-  }
-  return setOperatorOpportunityFact({ opportunityId: id, field, value, actor, verified, note, storage });
+  const now = new Date().toISOString();
+  if (typeof verified !== 'boolean') throw new Error('Opportunity fact verification state must be boolean.');
+  const fact = {
+    id: randomUUID(), opportunity_id: id, field: normalizeOpportunityFactField(field),
+    value: normalizeText(value, 'Opportunity fact value'), source: 'operator', verified,
+    actor: normalizeText(actor, 'Opportunity fact actor', { maxLength: 200 }),
+    note: normalizeText(note, 'Opportunity fact note', { required: false, maxLength: 4000 }), created_at: now, updated_at: now,
+  };
+  const saved = await storage.insertCurrentDealHunterOpportunityFact(fact);
+  if (!saved) throw new Error('The canonical opportunity is no longer current.');
+  return saved;
 }
 
 function toFactRows(facts) {

@@ -188,10 +188,10 @@ export async function listTriageQueue({
 
 function safeListingUrl(value) {
   const raw = normalizeText(value, 2000);
-  if (!raw) return '';
+  if (!raw || [...raw].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) return '';
   try {
     const parsed = new URL(raw);
-    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : '';
+    return ['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password ? parsed.href : '';
   } catch {
     return '';
   }
@@ -226,7 +226,7 @@ function directCrmFactRows(submission = {}) {
 function projectSourceObservations(rows = []) {
   const all = rows.slice(0, 500).map((row) => ({
     sourceId: row.source_id || '', sourceName: row.source_name || '', sourceRecordId: row.source_record_id || '',
-    field: row.field || '', value: row.value, observedAt: row.observed_at || '', updatedAt: row.updated_at || '',
+    field: row.field || '', value: ['listing_url', 'prospectus_url', 'business_website'].includes(row.field) ? safeListingUrl(row.value) : normalizeText(row.value, 5000), observedAt: row.observed_at || '', updatedAt: row.updated_at || '',
   }));
   const valuesByField = new Map();
   for (const row of all) {
@@ -334,7 +334,7 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
       sourceId: row.source_id || '',
       sourceName: row.source_name || '',
       sourceRecordId: row.source_record_id || '',
-      listingUrl: row.listing_url || '',
+      listingUrl: safeListingUrl(row.listing_url),
       observedAt: row.observed_at || '',
     };
     if (!row.dimension) {
@@ -347,8 +347,8 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
   }
 
   const [operatorFacts, sourceRows, submission, cimRequests, activities, dispositions, crmCommunications] = await Promise.all([
-    storage.listDealHunterOpportunityFacts?.(id) || [],
-    storage.listDealHunterOpportunitySourceObservations?.(id) || [],
+    storage.listDealHunterOpportunityFacts?.(id, { limit: 100 }) || [],
+    storage.listDealHunterOpportunitySourceObservations?.(id, { limit: 500 }) || [],
     currentOpportunity.primary_submission_id && storage.getSubmission
       ? storage.getSubmission(currentOpportunity.primary_submission_id)
       : null,
@@ -362,20 +362,22 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
       : { rows: [] },
   ]);
   const sourceFacts = sourceRows.filter((row) => opportunityFactFields.includes(row.field));
+  const crmFacts = directCrmFactRows(submission);
   const effectiveFacts = getEffectiveOpportunityFacts({
     opportunityId: id,
     operatorFacts,
-    crmFacts: directCrmFactRows(submission),
+    crmFacts,
     sourceFacts,
   });
   const { sourceObservations } = projectSourceObservations(sourceRows);
   const listingUrls = [...new Set([
     safeListingUrl(score.listing_url),
     ...sourceRows
-      .filter((row) => ['listing_url', 'prospectus_url', 'business_website'].includes(row.field))
+      .filter((row) => row.field === 'listing_url')
       .map((row) => safeListingUrl(row.value)),
-  ].filter(Boolean))];
+  ].filter(Boolean))].slice(0, 100);
   const opportunity = publicTriageRow(score, { includeOperatorNote: true });
+  opportunity.listingUrl = safeListingUrl(score.listing_url);
   const projectedScore = projectScore(score, byDimension, unattributed);
   const communications = (crmCommunications?.rows || []).slice(0, 100).map((communication) => ({
     id: communication.id || '', direction: communication.direction || '', channel: communication.channel || '',
@@ -393,14 +395,19 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
     listingUrls,
     score: projectedScore,
     cimSummary: {
-      requests: cimRequests.slice(0, 100),
+      requests: cimRequests.slice(0, 100).map((item) => ({ id: item.id || '', status: item.status || '', requestState: item.request_state || '', deliveryState: item.delivery_state || '', updatedAt: item.updated_at || '' })),
       communications: communications.filter((communication) => communication.cimRequestId),
     },
-    crmSummary: { submission: projectCrmSubmission(submission), communications },
+    crmSummary: {
+      submission: projectCrmSubmission(submission), communications,
+      factObservations: crmFacts.slice(0, 13).map((fact) => ({ field: fact.field, value: normalizeText(fact.value, 4000), provenance: 'crm' })),
+      conflicts: crmFacts.filter((fact) => effectiveFacts[fact.field]?.provenance !== 'crm' && effectiveFacts[fact.field]?.value !== String(fact.value).trim())
+        .map((fact) => ({ field: fact.field, winningProvenance: effectiveFacts[fact.field]?.provenance || '', crmValue: normalizeText(fact.value, 4000) })),
+    },
     history: {
-      activities: activities.slice(0, 100),
-      dispositions: dispositions.slice(0, 20),
-      operatorFacts: operatorFacts.slice(0, 100),
+      activities: activities.slice(0, 100).map((item) => ({ id: item.id || '', eventType: item.event_type || '', summary: normalizeText(item.summary, 500), createdAt: item.created_at || '', actor: normalizeText(item.actor, 160) })),
+      dispositions: dispositions.slice(0, 20).map((item) => ({ id: item.id || '', disposition: item.disposition || '', reason: item.reason || '', note: normalizeText(item.note, 500), dismissedAt: item.dismissed_at || '', dismissedBy: normalizeText(item.dismissed_by, 160) })),
+      operatorFacts: operatorFacts.slice(0, 100).map((item) => ({ id: item.id || '', field: item.field || '', value: normalizeText(item.value, 4000), verified: Boolean(item.verified), actor: normalizeText(item.actor, 160), note: normalizeText(item.note, 500), createdAt: item.created_at || '', updatedAt: item.updated_at || '' })),
       operatorState: {
         priority: opportunity.operatorPriority, note: opportunity.operatorNote,
         reviewed: opportunity.reviewed, reviewedAt: opportunity.reviewedAt, reviewedBy: opportunity.reviewedBy,

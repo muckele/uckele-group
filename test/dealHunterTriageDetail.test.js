@@ -141,3 +141,28 @@ test('consolidated detail rejects a superseded opportunity even when its histori
   assert.ok(await storage.getDealHunterOpportunityScore(opportunityId));
   assert.ok((await storage.listDealHunterOpportunityFacts(opportunityId)).length > 0);
 });
+
+test('detail sends bounded storage reads and closed, safe URL projections', async (t) => {
+  const { storage, opportunityId } = await detailStorage(t);
+  const calls = [];
+  const boundedStorage = new Proxy(storage, {
+    get(target, property) {
+      if (property === 'listDealHunterOpportunitySourceObservations') return async (...args) => {
+        calls.push(args);
+        return Array.from({ length: 700 }, (_, index) => ({
+          id: `source-${index}`, opportunity_id: opportunityId, source_id: `source-${index}`, source_name: `Source ${index}`,
+          source_record_id: `record-${index}`, field: 'listing_url', value: `https://broker.example/${index}`,
+          observed_at: '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z', metadata: { private: 'x'.repeat(2000) },
+        }));
+      };
+      if (property === 'listDealHunterCimRequests') return async () => [{ id: 'cim', status: 'requested', metadata: { private: 'x'.repeat(2000) }, provider_message_id: 'secret' }];
+      const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage: boundedStorage });
+  assert.deepEqual(calls[0][1], { limit: 500 });
+  assert.equal(detail.sourceObservations.length, 100);
+  assert.equal(detail.listingUrls.length, 100);
+  assert.equal(JSON.stringify(detail.cimSummary).includes('private'), false);
+  assert.equal(JSON.stringify(detail.cimSummary).includes('provider_message_id'), false);
+});

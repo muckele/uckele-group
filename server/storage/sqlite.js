@@ -7861,12 +7861,25 @@ export function createSqliteStorage(config) {
       return this.getDealHunterOpportunity(record.opportunity_id);
     },
 
-    async listDealHunterOpportunityFacts(opportunityId) {
+    async listDealHunterOpportunityFacts(opportunityId, { limit = 500 } = {}) {
       return database.prepare(`
         SELECT * FROM deal_hunter_opportunity_facts
         WHERE opportunity_id = ?
         ORDER BY created_at DESC, id DESC
-      `).all(String(opportunityId || '').trim()).map(normalizeDealHunterOpportunityFactRow);
+        LIMIT ?
+      `).all(String(opportunityId || '').trim(), Math.max(1, Math.min(Number(limit) || 500, 500))).map(normalizeDealHunterOpportunityFactRow);
+    },
+
+    async insertCurrentDealHunterOpportunityFact(fact = {}) {
+      const transaction = database.transaction(() => {
+        const current = database.prepare(`SELECT opportunity_id FROM deal_hunter_opportunities WHERE opportunity_id = ? AND status = 'active' LIMIT 1`)
+          .get(String(fact.opportunity_id || '').trim());
+        if (!current) return null;
+        database.prepare(`INSERT INTO deal_hunter_opportunity_facts (id, opportunity_id, field, value, source, verified, actor, note, created_at, updated_at)
+          VALUES (@id, @opportunity_id, @field, @value, @source, @verified, @actor, @note, @created_at, @updated_at)`).run({ ...fact, source: fact.source || 'operator', verified: fact.verified ? 1 : 0, note: fact.note || null });
+        return normalizeDealHunterOpportunityFactRow(database.prepare(`SELECT * FROM deal_hunter_opportunity_facts WHERE id = ?`).get(fact.id));
+      });
+      return transaction.immediate();
     },
 
     async upsertDealHunterOpportunityFact(fact = {}) {
@@ -7895,12 +7908,13 @@ export function createSqliteStorage(config) {
       `).get(fact.id));
     },
 
-    async listDealHunterOpportunitySourceObservations(opportunityId) {
+    async listDealHunterOpportunitySourceObservations(opportunityId, { limit = 500 } = {}) {
       return database.prepare(`
         SELECT * FROM deal_hunter_opportunity_source_observations
         WHERE opportunity_id = ?
         ORDER BY observed_at DESC, id ASC
-      `).all(String(opportunityId || '').trim()).map(normalizeDealHunterOpportunitySourceObservationRow);
+        LIMIT ?
+      `).all(String(opportunityId || '').trim(), Math.max(1, Math.min(Number(limit) || 500, 500))).map(normalizeDealHunterOpportunitySourceObservationRow);
     },
 
     async upsertDealHunterOpportunitySourceObservation(observation = {}) {

@@ -71,7 +71,12 @@ test('triage detail remains readable while only administrators may enrich facts 
     const factPath = `/api/admin/deal-hunter/opportunities/${encodeURIComponent(opportunityId)}/facts/seller_name`;
     const actionPath = `/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/action`;
 
-    assert.equal((await fetch(detailPath.replace(/^/, origin), { headers: { Cookie: viewerCookie } })).status, 200);
+    const viewerDetail = await fetch(detailPath.replace(/^/, origin), { headers: { Cookie: viewerCookie } });
+    assert.equal(viewerDetail.status, 200);
+    assert.deepEqual(Object.keys(await viewerDetail.json()).sort(), [
+      'cimSummary', 'crmSummary', 'effectiveFacts', 'history', 'listingUrls', 'missingCriticalFields',
+      'operatorFacts', 'opportunity', 'score', 'sourceObservations',
+    ]);
     assert.equal((await fetch(factPath.replace(/^/, origin), {
       method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: viewerCookie },
       body: JSON.stringify({ value: 'Viewer Seller', verified: true }),

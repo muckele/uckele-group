@@ -12,6 +12,7 @@ import {
   opportunityFactFields,
   opportunitySourceObservationFields,
   normalizeOpportunityFactField,
+  setCurrentOperatorOpportunityFact,
   setOperatorOpportunityFact,
 } from '../server/services/dealHunterOpportunityFacts.js';
 import {
@@ -112,6 +113,7 @@ function supabaseChain({ facts = [], observations = [] } = {}) {
       select() { return this; },
       eq() { return this; },
       order() { return this; },
+      limit() { return this; },
       upsert(value, options) {
         payload = value;
         calls.push({ table, value, options });
@@ -220,7 +222,7 @@ function constrainedSupabaseBoundary() {
           const nextObservations = new Map(observations);
           const nextIds = new Map(observationKeysById);
           const snapshotKey = [payload.p_opportunity_id, payload.p_source_id, payload.p_source_record_id].join('\u0000');
-          for (const [key, row] of nextObservations) {
+          for (const [key] of nextObservations) {
             if (key.startsWith(`${snapshotKey}\u0000`)) nextObservations.delete(key);
           }
           for (const row of snapshotRows) {
@@ -320,6 +322,17 @@ test('verified operator facts survive a structured-source refresh', async (t) =>
       note: 'Confirmed during diligence call.',
     },
   });
+});
+
+test('atomic current operator-fact write refuses a superseded opportunity without inserting a revision', async (t) => {
+  const sqlite = withStorage(t);
+  await sqlite.upsertDealHunterOpportunity({ opportunity_id: opportunityId, created_at: '2026-08-30T00:00:00.000Z', updated_at: '2026-08-30T00:00:00.000Z', canonical_name: 'Facts', canonical_recipient: null, canonical_location: null, primary_submission_id: null, identity_version: 'test', status: 'active', metadata: {} });
+  const first = await setCurrentOperatorOpportunityFact({ opportunityId, field: 'seller_name', value: 'Current seller', actor: 'admin', verified: true, storage: sqlite });
+  assert.equal(first.value, 'Current seller');
+  const current = await sqlite.getDealHunterOpportunity(opportunityId);
+  await sqlite.upsertDealHunterOpportunity({ ...current, status: 'superseded', updated_at: '2026-08-30T01:00:00.000Z' });
+  await assert.rejects(setCurrentOperatorOpportunityFact({ opportunityId, field: 'seller_phone', value: '555-0100', actor: 'admin', verified: true, storage: sqlite }), /no longer current/);
+  assert.equal((await sqlite.listDealHunterOpportunityFacts(opportunityId)).length, 1);
 });
 
 test('effective facts use operator, CRM, structured-source, then enrichment-suggestion precedence', () => {
