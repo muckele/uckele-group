@@ -398,6 +398,14 @@ test('Supabase migration and fresh schema isolate every current app table to the
     assertServiceRoleOnlyFunction(sql, sourceLabel, 'upsert_deal_hunter_opportunity_source_observation');
   }
   assert.match(opportunityFactWriteBoundaryMigration, /deal_hunter_opportunity_source_observations_bounded_check/i);
+  assert.match(
+    opportunityFactWriteBoundaryMigration,
+    /add constraint deal_hunter_opportunity_source_observations_bounded_check[\s\S]*?\) not valid;/i,
+  );
+  assert.doesNotMatch(
+    opportunityFactWriteBoundaryMigration,
+    /validate constraint deal_hunter_opportunity_source_observations_bounded_check/i,
+  );
   assert.match(schema, /deal_hunter_opportunity_source_observations_bounded_check/i);
   assert.match(adminOnboardingMigration, /array_position\(p_step_ids,\s*excluded\.last_completed_step_id\)/i);
   assertServiceRoleOnlyFunction(adminOnboardingMigration, 'admin onboarding migration', 'upsert_admin_onboarding_progress');

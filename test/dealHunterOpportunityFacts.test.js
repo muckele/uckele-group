@@ -7,6 +7,8 @@ import test from 'node:test';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import {
   getEffectiveOpportunityFacts,
+  opportunityFactFields,
+  opportunitySourceObservationFields,
   normalizeOpportunityFactField,
   setOperatorOpportunityFact,
 } from '../server/services/dealHunterOpportunityFacts.js';
@@ -21,6 +23,9 @@ const opportunityFactWriteBoundaryMigrationUrl = new URL(
   '../supabase/migrations/20260830130000_deal_hunter_opportunity_fact_write_boundary.sql',
   import.meta.url,
 );
+const supabaseSchemaUrl = new URL('../supabase/schema.sql', import.meta.url);
+const dealHunterServiceUrl = new URL('../server/services/dealHunter.js', import.meta.url);
+const submissionsServiceUrl = new URL('../server/services/submissions.js', import.meta.url);
 
 const opportunityId = 'opp-facts-1';
 
@@ -187,6 +192,47 @@ function constrainedSupabaseBoundary() {
   };
 }
 
+function quotedIdentifiers(source) {
+  return [...source.matchAll(/'([a-zA-Z][a-zA-Z0-9_]*)'/g)].map((match) => match[1]);
+}
+
+function declarationBody(source, declaration) {
+  const start = source.indexOf(declaration);
+  assert.notEqual(start, -1, `Missing declaration: ${declaration}`);
+  const arrayEnd = source.indexOf('];', start);
+  const objectEnd = source.indexOf('};', start);
+  const end = [arrayEnd, objectEnd].filter((index) => index >= 0).sort((left, right) => left - right)[0] ?? -1;
+  assert.notEqual(end, -1, `Missing declaration terminator: ${declaration}`);
+  return source.slice(start, end + 2);
+}
+
+function objectIdentifiers(source) {
+  return [...source.matchAll(/^\s{2}([a-zA-Z][a-zA-Z0-9_]*):/gm)].map((match) => match[1]);
+}
+
+function rpcDefinition(sql, name) {
+  const start = sql.indexOf(`create or replace function public.${name}(`);
+  assert.notEqual(start, -1, `Missing RPC definition: ${name}`);
+  const end = sql.indexOf('$$;', start);
+  assert.notEqual(end, -1, `Missing RPC terminator: ${name}`);
+  return sql.slice(start, end + 3);
+}
+
+function observationCheckFields(sql) {
+  const checkStart = sql.indexOf('deal_hunter_opportunity_source_observations_bounded_check');
+  assert.notEqual(checkStart, -1, 'source-observation bound CHECK must exist');
+  const fieldStart = sql.indexOf('field in (', checkStart);
+  assert.notEqual(fieldStart, -1, 'source-observation bound CHECK must constrain fields');
+  const fieldEnd = sql.indexOf(')', fieldStart);
+  return quotedIdentifiers(sql.slice(fieldStart, fieldEnd));
+}
+
+function conflictAssignments(definition, target) {
+  const match = new RegExp(`on conflict \\(${target}\\) do update set([\\s\\S]*?)returning \\* into`, 'i').exec(definition);
+  assert.ok(match, `Missing ${target} conflict update body`);
+  return [...match[1].matchAll(/([a-z_]+)\s*=\s*excluded\./g)].map((assignment) => assignment[1]);
+}
+
 test('verified operator facts survive a structured-source refresh', async (t) => {
   // Break caught: a source refresh mutates or takes precedence over a verified operator fact.
   const storage = withStorage(t);
@@ -344,6 +390,18 @@ test('fact conflicts preserve immutable identity while both providers update onl
   });
   assert.deepEqual(supabaseFinal, sqliteFinal);
   assert.equal(boundary.calls[1].name, 'upsert_deal_hunter_opportunity_fact');
+  assert.deepEqual(boundary.calls[1].payload, {
+    p_id: second.id,
+    p_opportunity_id: second.opportunity_id,
+    p_field: second.field,
+    p_value: second.value,
+    p_source: second.source,
+    p_verified: second.verified,
+    p_actor: second.actor,
+    p_note: second.note,
+    p_created_at: second.created_at,
+    p_updated_at: second.updated_at,
+  });
 });
 
 test('source-observation conflicts preserve immutable source identity while both providers refresh mutable values', async (t) => {
@@ -384,6 +442,18 @@ test('source-observation conflicts preserve immutable source identity while both
   });
   assert.deepEqual(supabaseFinal, sqliteFinal);
   assert.equal(boundary.calls[1].name, 'upsert_deal_hunter_opportunity_source_observation');
+  assert.deepEqual(boundary.calls[1].payload, {
+    p_id: second.id,
+    p_opportunity_id: second.opportunity_id,
+    p_source_id: first.source_id,
+    p_source_name: second.source_name,
+    p_source_record_id: first.source_record_id,
+    p_field: first.field,
+    p_value: second.value,
+    p_observed_at: second.observed_at,
+    p_created_at: second.created_at,
+    p_updated_at: second.updated_at,
+  });
 
   // A reused primary ID must not create a second observation under a different
   // ownership composite in either provider.
@@ -409,7 +479,7 @@ test('source observations normalize the bounded Deal Hunter field set and reject
     source_id: ' deal-hunter-sheet ',
     source_name: ' Deal Hunter Google Sheet ',
     source_record_id: ' row-42 ',
-    field: ' Asking Price ',
+    field: ' Broker Contact ',
     value: ' $1,450,000 ',
     observed_at: ' 2026-08-30T12:30:00Z ',
     created_at: ' 2026-08-30T12:30:00Z ',
@@ -419,12 +489,12 @@ test('source observations normalize the bounded Deal Hunter field set and reject
   await seedOpportunity(sqlite);
   const canonical = await sqlite.upsertDealHunterOpportunitySourceObservation(raw);
   assert.deepEqual(canonical, {
-    ...observationRecord({ field: 'asking_price', value: '$1,450,000' }),
+    ...observationRecord({ field: 'broker_contact', value: '$1,450,000' }),
     id: 'observation-normalized',
     source_id: 'deal-hunter-sheet',
     source_name: 'Deal Hunter Google Sheet',
     source_record_id: 'row-42',
-    field: 'asking_price',
+    field: 'broker_contact',
     value: '$1,450,000',
     observed_at: '2026-08-30T12:30:00.000Z',
     created_at: '2026-08-30T12:30:00.000Z',
@@ -435,11 +505,16 @@ test('source observations normalize the bounded Deal Hunter field set and reject
     { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
     { client: boundary.client },
   );
+  assert.deepEqual(await supabase.upsertDealHunterOpportunitySourceObservation(raw), canonical);
   const invalid = observationRecord({ field: 'raw_metadata' });
   await assert.rejects(sqlite.upsertDealHunterOpportunitySourceObservation(invalid), /Unsupported opportunity source-observation field/);
   await assert.rejects(supabase.upsertDealHunterOpportunitySourceObservation(invalid), /Unsupported opportunity source-observation field/);
   await assert.rejects(
     sqlite.upsertDealHunterOpportunitySourceObservation(observationRecord({ value: 'x'.repeat(5001) })),
+    /at most 5000 characters/,
+  );
+  await assert.rejects(
+    supabase.upsertDealHunterOpportunitySourceObservation(observationRecord({ value: 'x'.repeat(5001) })),
     /at most 5000 characters/,
   );
   for (const value of [{ raw: 'blob' }, Buffer.from('blob')]) {
@@ -454,6 +529,10 @@ test('source observations normalize the bounded Deal Hunter field set and reject
   }
   await assert.rejects(
     sqlite.upsertDealHunterOpportunitySourceObservation(observationRecord({ observed_at: 'not-a-timestamp' })),
+    /valid timestamp/,
+  );
+  await assert.rejects(
+    supabase.upsertDealHunterOpportunitySourceObservation(observationRecord({ observed_at: 'not-a-timestamp' })),
     /valid timestamp/,
   );
 });
@@ -478,6 +557,77 @@ test('Supabase durable-write RPCs enforce the SQLite-compatible immutable confli
   ]) {
     assert.match(migration, new RegExp(`revoke all privileges on function public\\.${functionName}\\(`, 'i'));
     assert.match(migration, new RegExp(`grant execute on function public\\.${functionName}\\(`, 'i'));
+  }
+});
+
+test('source-observation allowlist exhaustively maps the current Deal Hunter and Deal OS normalized field inventories', () => {
+  // Break caught: normalized fields added to either source model silently fail
+  // durable provenance capture, or the source allowlist drifts into raw data.
+  const dealHunterSource = fs.readFileSync(dealHunterServiceUrl, 'utf8');
+  const submissionsSource = fs.readFileSync(submissionsServiceUrl, 'utf8');
+  const dealHunterFields = quotedIdentifiers(declarationBody(dealHunterSource, 'const dealHunterManagedFields = ['));
+  const dealOsFields = objectIdentifiers(declarationBody(submissionsSource, 'const dealFieldNormalizers = {'));
+  const dealHunterAliases = {
+    name: 'name', industry: 'industry', description: 'description', city: 'city', county: 'county', state: 'state',
+    country: 'country', location: 'location', annualProfit: 'annual_profit', annualRevenue: 'annual_revenue',
+    askingPrice: 'asking_price', profitMultiple: 'profit_multiple', netMargin: 'net_margin',
+    yearsEstablished: 'years_established', remoteFlag: 'remote_flag', franchiseFlag: 'franchise_flag',
+    fiveYearsFlag: 'five_years_flag', brokerName: 'broker_name', brokerEmail: 'broker_email',
+    brokerCompany: 'broker_company', brokerContact: 'broker_contact', listingUrl: 'listing_url',
+    listingSource: 'listing_source', dateAdded: 'date_added', lastUpdated: 'last_updated',
+  };
+  assert.deepEqual(Object.keys(dealHunterAliases), dealHunterFields);
+  const expected = new Set([
+    ...Object.values(dealHunterAliases),
+    ...dealOsFields,
+    ...opportunityFactFields,
+    'business_name',
+    'listing_id',
+    'deal_key',
+    'source_identity',
+  ]);
+  assert.deepEqual(new Set(opportunitySourceObservationFields), expected);
+  assert.equal(opportunitySourceObservationFields.includes('raw_metadata'), false);
+});
+
+test('forward migration and fresh schema define identical constrained RPC and CHECK contracts', () => {
+  // Break caught: the fresh schema or forward migration drifts on immutable
+  // columns, return semantics, privileges, search path, or upgrade safety.
+  const forwardMigration = fs.readFileSync(opportunityFactWriteBoundaryMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(supabaseSchemaUrl, 'utf8');
+  assert.match(forwardMigration, /add constraint deal_hunter_opportunity_source_observations_bounded_check[\s\S]*?\) not valid;/i);
+  assert.doesNotMatch(forwardMigration, /validate constraint deal_hunter_opportunity_source_observations_bounded_check/i);
+
+  for (const [label, sql] of [['forward migration', forwardMigration], ['fresh schema', schema]]) {
+    const fact = rpcDefinition(sql, 'upsert_deal_hunter_opportunity_fact');
+    const observation = rpcDefinition(sql, 'upsert_deal_hunter_opportunity_source_observation');
+    for (const definition of [fact, observation]) {
+      assert.match(definition, /returns public\.deal_hunter_opportunity_/i, `${label} RPC must return its durable row`);
+      assert.match(definition, /security definer/i, `${label} RPC must be constrained server-side`);
+      assert.match(definition, /set search_path = public/i, `${label} RPC must pin its search path`);
+      assert.match(definition, /returning \* into/i, `${label} RPC must return the post-conflict row`);
+    }
+    assert.deepEqual(
+      conflictAssignments(fact, 'id'),
+      ['field', 'value', 'source', 'verified', 'actor', 'note', 'updated_at'],
+    );
+    assert.deepEqual(
+      conflictAssignments(observation, 'opportunity_id, source_id, source_record_id, field'),
+      ['source_name', 'value', 'observed_at', 'updated_at'],
+    );
+    for (const functionName of ['upsert_deal_hunter_opportunity_fact', 'upsert_deal_hunter_opportunity_source_observation']) {
+      assert.match(sql, new RegExp(`revoke all privileges on function public\\.${functionName}\\(`, 'i'));
+      assert.match(sql, new RegExp(`grant execute on function public\\.${functionName}\\(`, 'i'));
+    }
+  }
+  assert.match(forwardMigration, /field in \([\s\S]*'broker_contact'[\s\S]*'company'[\s\S]*'role'/i);
+  assert.match(schema, /field in \([\s\S]*'broker_contact'[\s\S]*'company'[\s\S]*'role'/i);
+  for (const [label, sql] of [['forward migration', forwardMigration], ['fresh schema', schema]]) {
+    assert.deepEqual(
+      new Set(observationCheckFields(sql)),
+      new Set(opportunitySourceObservationFields),
+      `${label} CHECK must match the shared bounded observation allowlist`,
+    );
   }
 });
 

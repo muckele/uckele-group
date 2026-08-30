@@ -21,15 +21,15 @@ begin
         and field in (
           'name', 'business_name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
           'annual_profit', 'annual_revenue', 'asking_price', 'profit_multiple', 'net_margin', 'years_established',
-          'remote_flag', 'franchise_flag', 'five_years_flag', 'broker_name', 'broker_company', 'broker_email',
-          'broker_phone', 'seller_name', 'seller_email', 'seller_phone', 'reason_for_sale', 'real_estate_included',
+          'remote_flag', 'franchise_flag', 'five_years_flag', 'broker_name', 'broker_company', 'broker_contact', 'broker_email',
+          'broker_phone', 'company', 'role', 'seller_name', 'seller_email', 'seller_phone', 'reason_for_sale', 'real_estate_included',
           'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes', 'listing_url',
           'listing_source', 'listing_id', 'deal_key', 'source_identity', 'date_added', 'last_updated',
           'business_website', 'prospectus_url', 'ttm_revenue', 'ttm_ebitda', 'ebitda_multiple', 'business_age',
           'sba_eligible', 'lead_type'
         )
         and value = btrim(value) and char_length(value) between 1 and 5000
-      );
+      ) not valid;
   end if;
 end;
 $$;
