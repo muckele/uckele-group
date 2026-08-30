@@ -5,6 +5,10 @@ import {
   normalizeOpportunitySourceObservationSnapshot,
 } from '../services/dealHunterOpportunityFacts.js';
 
+const dealHunterQueueSorts = new Set([
+  'acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed',
+]);
+
 function normalizeSubmissionRow(row) {
   return {
     ...row,
@@ -2794,15 +2798,22 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       view = 'needs-review', page = 1, pageSize = 25, search = '', sort = 'fit-score', direction = 'desc',
       minScore = null, confidence = '', priority = '', state = '',
     } = {}) {
-      const safePage = Math.max(1, Math.min(Number(page) || 1, 10000));
-      const safePageSize = Math.max(1, Math.min(Number(pageSize) || 25, 100));
+      const parsedPage = Number(page);
+      const parsedPageSize = Number(pageSize);
+      const safePage = Number.isFinite(parsedPage) ? Math.max(1, Math.min(Math.trunc(parsedPage), 10000)) : 1;
+      const safePageSize = Number.isFinite(parsedPageSize) ? Math.max(1, Math.min(Math.trunc(parsedPageSize), 100)) : 25;
+      const requestedSort = String(sort || 'fit-score');
+      const safeSort = dealHunterQueueSorts.has(requestedSort) ? requestedSort : 'fit-score';
+      const safeDirection = safeSort === 'acquisition-priority'
+        ? 'desc'
+        : (String(direction || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc');
       const { data, error } = await client.rpc('list_deal_hunter_opportunity_scores', {
         p_view: String(view || 'needs-review'),
         p_page: safePage,
         p_page_size: safePageSize,
         p_search: String(search || ''),
-        p_sort: String(sort || 'fit-score'),
-        p_direction: String(direction || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc',
+        p_sort: safeSort,
+        p_direction: safeDirection,
         p_min_score: minScore === null || minScore === '' ? null : Number(minScore),
         p_confidence: String(confidence || ''),
         p_priority: String(priority || ''),

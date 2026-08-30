@@ -6613,8 +6613,10 @@ export function createSqliteStorage(config) {
         view = 'needs-review', page = 1, pageSize = 25, search = '', sort = 'fit-score', direction = 'desc',
         minScore = null, confidence = '', priority = '', state = '',
       } = {}) {
-        const safePage = Math.max(1, Math.min(Number(page) || 1, 10000));
-        const safePageSize = Math.max(1, Math.min(Number(pageSize) || 25, 100));
+        const parsedPage = Number(page);
+        const parsedPageSize = Number(pageSize);
+        const safePage = Number.isFinite(parsedPage) ? Math.max(1, Math.min(Math.trunc(parsedPage), 10000)) : 1;
+        const safePageSize = Number.isFinite(parsedPageSize) ? Math.max(1, Math.min(Math.trunc(parsedPageSize), 100)) : 25;
         const clauses = ['scores.current_triage_eligible = 1'];
         const params = [];
 
@@ -6734,7 +6736,7 @@ export function createSqliteStorage(config) {
             scores.fit_score, scores.score_status, scores.confidence, scores.completeness_score,
             scores.contradiction_count, scores.missing_evidence_count, scores.should_remove,
             scores.high_fit, scores.score_fingerprint, scores.semantic_digest, scores.scored_at,
-            scores.rules_version, scores.operator_priority, scores.operator_note, scores.reviewed_at,
+            scores.rules_version, scores.operator_priority, scores.reviewed_at,
             scores.reviewed_by, scores.reviewed_fingerprint, scores.reviewed_semantic_digest,
             disposition.reason AS dismissed_reason, disposition.dismissed_at AS dismissed_at,
             json_extract(scores.summary, '$.strengths[0]') AS top_strength,

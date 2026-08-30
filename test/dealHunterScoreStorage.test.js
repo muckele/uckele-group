@@ -835,6 +835,49 @@ test('Supabase queue uses the bounded RPC and preserves its database summary', a
   assert.equal(result.rows.length, 1);
 });
 
+test('Supabase queue forwards every advertised sort and normalizes the fixed acquisition ladder direction', async () => {
+  const calls = [];
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { async rpc(name, payload) { calls.push({ name, payload }); return { data: { total: 0, rows: [], summary: {} }, error: null }; } } },
+  );
+  const sorts = ['acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed'];
+  for (const sort of sorts) {
+    await storage.listDealHunterOpportunityScores({ sort, direction: 'asc' });
+    await storage.listDealHunterOpportunityScores({ sort, direction: 'desc' });
+  }
+  await storage.listDealHunterOpportunityScores({ sort: 'not-an-advertised-sort' });
+  assert.deepEqual(
+    calls.map(({ name, payload }) => [name, payload.p_sort, payload.p_direction]),
+    [
+      ...sorts.flatMap((sort) => [
+        ['list_deal_hunter_opportunity_scores', sort, sort === 'acquisition-priority' ? 'desc' : 'asc'],
+        ['list_deal_hunter_opportunity_scores', sort, 'desc'],
+      ]),
+      ['list_deal_hunter_opportunity_scores', 'fit-score', 'desc'],
+    ],
+  );
+});
+
+test('both storage adapters normalize fractional and malformed queue pagination before SQL or RPC', async (t) => {
+  const sqlite = withStorage(t);
+  const sqlitePage = await sqlite.listDealHunterOpportunityScores({ page: '1.9', pageSize: '1.9' });
+  assert.equal(sqlitePage.page, 1);
+  assert.equal(sqlitePage.pageSize, 1);
+  const sqliteMalformed = await sqlite.listDealHunterOpportunityScores({ page: 'not-a-number', pageSize: Infinity });
+  assert.equal(sqliteMalformed.page, 1);
+  assert.equal(sqliteMalformed.pageSize, 25);
+
+  const calls = [];
+  const supabase = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { async rpc(name, payload) { calls.push({ name, payload }); return { data: { total: 0, rows: [], summary: {} }, error: null }; } } },
+  );
+  await supabase.listDealHunterOpportunityScores({ page: '1.9', pageSize: '1.9' });
+  await supabase.listDealHunterOpportunityScores({ page: 'not-a-number', pageSize: Infinity });
+  assert.deepEqual(calls.map(({ payload }) => [payload.p_page, payload.p_page_size]), [[1, 1], [1, 25]]);
+});
+
 test('both storage providers expose the same scoring surface', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-score-parity-'));
   const sqlite = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'parity.sqlite') } });

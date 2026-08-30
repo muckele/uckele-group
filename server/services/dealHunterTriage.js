@@ -48,6 +48,12 @@ function normalizeConfidence(value) {
   return ['low', 'medium', 'high'].includes(normalized) ? normalized : '';
 }
 
+function normalizeBoundedInteger(value, fallback, maximum) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(1, Math.min(Math.trunc(numeric), maximum));
+}
+
 function nullableNumber(value) {
   if (value === null || value === undefined || value === '') return null;
   const normalized = Number(String(value).replace(/[$,\s]/g, ''));
@@ -108,7 +114,6 @@ export function publicTriageRow(row = {}) {
     },
     observationFreshness: row.observation_freshness || row.scored_at || '',
     operatorPriority: row.operator_priority || 'normal',
-    operatorNote: row.operator_note || '',
     reviewed: Boolean(row.reviewed),
     reviewedAt: row.reviewed_at || '',
     reviewedBy: row.reviewed_by || '',
@@ -142,13 +147,16 @@ export async function listTriageQueue({
     sort,
     normalizedView === 'needs-review' ? 'acquisition-priority' : 'fit-score',
   );
+  const normalizedDirection = normalizedSort === 'acquisition-priority'
+    ? 'desc'
+    : (normalizeText(direction, 8).toLowerCase() === 'asc' ? 'asc' : 'desc');
   const result = await storage.listDealHunterOpportunityScores({
     view: normalizedView,
-    page,
-    pageSize,
+    page: normalizeBoundedInteger(page, 1, 10000),
+    pageSize: normalizeBoundedInteger(pageSize, 25, 100),
     search: normalizeText(search, 160),
     sort: normalizedSort,
-    direction: normalizeText(direction, 8).toLowerCase() === 'asc' ? 'asc' : 'desc',
+    direction: normalizedDirection,
     minScore: minScore === null || minScore === '' || !Number.isFinite(Number(minScore)) ? null : Number(minScore),
     confidence: normalizeConfidence(confidence),
     priority: priority ? normalizeDealOperatorPriority(priority, '') : '',
@@ -160,7 +168,7 @@ export async function listTriageQueue({
     status: 200,
     view: normalizedView,
     sort: normalizedSort,
-    direction: normalizeText(direction, 8).toLowerCase() === 'asc' ? 'asc' : 'desc',
+    direction: normalizedDirection,
     rows: (result.rows || []).map(publicTriageRow),
     total: result.total,
     page: result.page,

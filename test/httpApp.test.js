@@ -640,6 +640,13 @@ test('full-backfill scoring and explicit CRM sync require administrator access a
     assert.deepEqual(Object.keys(viewerTriageResult.summary).sort(), [
       'currentOpportunities', 'highPriority', 'lowConfidence', 'needsReview', 'watchlist',
     ]);
+    const fractionalTriage = await fetch(`${origin}/api/admin/deal-hunter/triage?page=1.9&pageSize=1.9`, {
+      headers: { Cookie: viewerCookie },
+    });
+    assert.equal(fractionalTriage.status, 200);
+    const fractionalTriageResult = await fractionalTriage.json();
+    assert.equal(fractionalTriageResult.page, 1);
+    assert.equal(fractionalTriageResult.pageSize, 1);
 
     const anonymousTriage = await fetch(`${origin}/api/admin/deal-hunter/triage`);
     assert.equal(anonymousTriage.status, 401);

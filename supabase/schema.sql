@@ -4830,7 +4830,7 @@ as $$
            scores.fit_score, scores.score_status, scores.confidence, scores.completeness_score,
            scores.contradiction_count, scores.missing_evidence_count, scores.should_remove,
            scores.high_fit, scores.score_fingerprint, scores.semantic_digest, scores.scored_at,
-           scores.rules_version, scores.operator_priority, scores.operator_note, scores.reviewed_at,
+           scores.rules_version, scores.operator_priority, scores.reviewed_at,
            scores.reviewed_by, scores.reviewed_fingerprint, scores.reviewed_semantic_digest,
            disposition.deal_key as dismissed_deal_key,
            disposition.reason as dismissed_reason, disposition.dismissed_at as dismissed_at,
@@ -4891,9 +4891,8 @@ as $$
       and (coalesce(p_confidence, '') = '' or confidence = p_confidence)
       and (coalesce(p_priority, '') = '' or operator_priority = p_priority)
       and (coalesce(p_state, '') = '' or upper(coalesce(state, '')) = upper(p_state))
-  ), ordered as (
-    select * from filtered
-    order by
+  ), ranked as (
+    select filtered.*, row_number() over (order by
       case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority'
         then case when operator_priority in ('urgent', 'high') then 1 else 0 end end desc,
       case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority'
@@ -4905,34 +4904,39 @@ as $$
       case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority'
         then case confidence when 'high' then 3 when 'medium' then 2 else 1 end end desc nulls last,
       case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority' then observation_freshness end desc nulls last,
-      -- One sort key per direction; opportunity_id is always the final key so
-      -- pagination stays stable when rows tie.
       case when lower(coalesce(p_direction, 'desc')) = 'asc' then
         case coalesce(p_sort, 'fit-score')
           when 'confidence' then (case confidence when 'high' then 3 when 'medium' then 2 else 1 end)::numeric
           when 'completeness' then completeness_score::numeric
+          when 'fit-score' then fit_score::numeric
           when 'changed' then (case when reviewed_at is null then 1
             when reviewed_semantic_digest is not null then (case when reviewed_semantic_digest <> coalesce(semantic_digest, '') then 1 else 0 end)
             when reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint then 1 else 0 end)::numeric
-          else fit_score::numeric
         end
       end asc nulls last,
       case when lower(coalesce(p_direction, 'desc')) <> 'asc' then
         case coalesce(p_sort, 'fit-score')
           when 'confidence' then (case confidence when 'high' then 3 when 'medium' then 2 else 1 end)::numeric
           when 'completeness' then completeness_score::numeric
+          when 'fit-score' then fit_score::numeric
           when 'changed' then (case when reviewed_at is null then 1
             when reviewed_semantic_digest is not null then (case when reviewed_semantic_digest <> coalesce(semantic_digest, '') then 1 else 0 end)
             when reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint then 1 else 0 end)::numeric
-          else fit_score::numeric
         end
       end desc nulls last,
-      case confidence when 'high' then 3 when 'medium' then 2 else 1 end desc,
+      case when lower(coalesce(p_direction, 'desc')) = 'asc' then case coalesce(p_sort, 'fit-score') when 'scored-at' then scored_at end end asc nulls last,
+      case when lower(coalesce(p_direction, 'desc')) <> 'asc' then case coalesce(p_sort, 'fit-score') when 'scored-at' then scored_at end end desc nulls last,
+      case when lower(coalesce(p_direction, 'desc')) = 'asc' then case coalesce(p_sort, 'fit-score') when 'name' then lower(coalesce(name, '')) end end asc nulls last,
+      case when lower(coalesce(p_direction, 'desc')) <> 'asc' then case coalesce(p_sort, 'fit-score') when 'name' then lower(coalesce(name, '')) end end desc nulls last,
+      case when coalesce(p_sort, 'fit-score') <> 'acquisition-priority' then case confidence when 'high' then 3 when 'medium' then 2 else 1 end end desc,
       opportunity_id asc
-    -- Page size is clamped in SQL as well as in the application caller, so a
-    -- direct RPC invocation cannot request an unbounded page.
-    limit least(greatest(coalesce(p_page_size, 25), 1), 100)
-    offset greatest(0, (greatest(coalesce(p_page, 1), 1) - 1) * least(greatest(coalesce(p_page_size, 25), 1), 100))
+    ) as ordinal
+    from filtered
+  ), ordered as (
+    select * from ranked
+    where ordinal > greatest(0, (greatest(coalesce(p_page, 1), 1) - 1) * least(greatest(coalesce(p_page_size, 25), 1), 100))
+      and ordinal <= greatest(0, (greatest(coalesce(p_page, 1), 1) - 1) * least(greatest(coalesce(p_page_size, 25), 1), 100))
+        + least(greatest(coalesce(p_page_size, 25), 1), 100)
   )
   select jsonb_build_object(
     'total', (select count(*) from filtered),
@@ -4949,7 +4953,7 @@ as $$
         and (confidence = 'low' or contradiction_count > 0)),
       'currentOpportunities', count(*) filter (where dismissed_deal_key is null)
     ) from candidates),
-    'rows', coalesce((select jsonb_agg(to_jsonb(ordered)) from ordered), '[]'::jsonb)
+    'rows', coalesce((select jsonb_agg((to_jsonb(ordered) - 'ordinal') order by ordinal) from ordered), '[]'::jsonb)
   );
 $$;
 

@@ -192,15 +192,31 @@ test('Acquisition Inbox queue SQL keeps filtering, ordering, summary, and lightw
     const functionSql = sqlFunctionDefinitions(sql).find(({ name }) => name === 'list_deal_hunter_opportunity_scores')?.sql || '';
     assertServiceRoleOnlyFunction(sql, sourceLabel, 'list_deal_hunter_opportunity_scores');
     assert.match(functionSql, /security definer[\s\S]*?set search_path = public/i);
-    assert.match(functionSql, /current_triage_eligible = true[\s\S]*?limit least[\s\S]*?offset greatest/i);
+    assert.match(functionSql, /current_triage_eligible = true[\s\S]*?row_number\(\) over \(order by[\s\S]*?\) as ordinal[\s\S]*?ordinal >/i);
     assert.match(functionSql, /needsReview[\s\S]*?highPriority[\s\S]*?watchlist[\s\S]*?lowConfidence[\s\S]*?currentOpportunities/i);
     assert.match(functionSql, /operator_priority in \('urgent', 'high'\)[\s\S]*?high_fit[\s\S]*?fit_score[\s\S]*?confidence[\s\S]*?observation_freshness[\s\S]*?opportunity_id asc/i);
+    assert.match(functionSql, /when 'scored-at' then scored_at/i);
+    assert.match(functionSql, /when 'name' then lower\(coalesce\(name, ''\)\)/i);
     assert.match(functionSql, /source\.field = 'annual_profit'[\s\S]*?source\.field = 'profit_multiple'/i);
-    assert.doesNotMatch(functionSql, /scores\.\*|scores\.(?:dimensions|gates|missing_evidence|confidence_reasons)\b/i,
+    assert.match(functionSql, /row_number\(\) over \(order by[\s\S]*?\) as ordinal/i);
+    assert.match(functionSql, /jsonb_agg\(\(to_jsonb\(ordered\) - 'ordinal'\) order by ordinal\)/i);
+    assert.doesNotMatch(functionSql, /scores\.\*|scores\.(?:dimensions|gates|missing_evidence|confidence_reasons|operator_note)\b/i,
       `${sourceLabel} queue RPC must not return full score/evidence JSON`);
     assert.match(sql, /idx_deal_hunter_scores_acquisition_priority/i);
     assert.match(sql, /idx_deal_hunter_source_observations_queue_projection/i);
   }
+});
+
+test('Acquisition Inbox queue migration and fresh schema keep the same function contract', () => {
+  const migration = fs.readFileSync(acquisitionInboxQueueMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
+  const definition = (sql) => {
+    const start = sql.indexOf('create or replace function public.list_deal_hunter_opportunity_scores');
+    const end = sql.indexOf('\n$$;', start);
+    return start >= 0 && end >= start ? sql.slice(start, end + 4) : '';
+  };
+  assert.equal(normalize(definition(migration)), normalize(definition(schema)));
 });
 
 test('every canonical alias lock participant acquires the complete sorted alias lock set before opportunity rows', () => {
@@ -333,7 +349,7 @@ test('canonical current semantics migration is function-only and guards every at
     assert.match(sql, /claim_deal_hunter_cim_recipient[\s\S]*?opportunity-not-current/i);
     assert.match(sql, /link_deal_hunter_crm_submission[\s\S]*?status\s*=\s*'active'/i);
     assert.match(sql, /reconcile_deal_hunter_current_score_eligibility[\s\S]*?join\s+public\.deal_hunter_opportunities[\s\S]*?status\s*=\s*'active'/i);
-    assert.match(sql, /list_deal_hunter_opportunity_scores[\s\S]*?with\s+candidates[\s\S]*?join\s+public\.deal_hunter_opportunities[\s\S]*?status\s*=\s*'active'[\s\S]*?limit\s+least/i,
+    assert.match(sql, /list_deal_hunter_opportunity_scores[\s\S]*?with\s+candidates[\s\S]*?join\s+public\.deal_hunter_opportunities[\s\S]*?status\s*=\s*'active'[\s\S]*?(?:limit\s+least|row_number\(\)\s+over\s*\(order\s+by[\s\S]*?ordinal\s*>)/i,
       `${sourceLabel} must filter active opportunities in the database before triage pagination`);
     assert.match(sql, /upsert_deal_hunter_cim_recipient_override[\s\S]*?select\s+opportunity_id\s+into\s+v_existing_opportunity_id[\s\S]*?v_existing_opportunity_id\s*<>\s*v_opportunity_id/i,
       `${sourceLabel} must reject recipient-override ID collisions across canonical owners`);
