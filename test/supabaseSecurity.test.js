@@ -59,6 +59,10 @@ const currentTriageEligibilityMigrationUrl = new URL(
   '../supabase/migrations/20260826120000_deal_hunter_current_triage_eligibility.sql',
   import.meta.url,
 );
+const opportunityFactsMigrationUrl = new URL(
+  '../supabase/migrations/20260830120000_deal_hunter_opportunity_facts.sql',
+  import.meta.url,
+);
 const canonicalCurrentSemanticsMigrationUrl = new URL(
   '../supabase/migrations/20260827120000_canonical_opportunity_current_semantics.sql',
   import.meta.url,
@@ -325,7 +329,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const opportunityScoringMigration = fs.readFileSync(opportunityScoringMigrationUrl, 'utf8');
   const semanticScoringMigration = fs.readFileSync(semanticScoringMigrationUrl, 'utf8');
   const currentTriageEligibilityMigration = fs.readFileSync(currentTriageEligibilityMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}`;
+  const opportunityFactsMigration = fs.readFileSync(opportunityFactsMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
@@ -340,6 +345,7 @@ test('Supabase migration and fresh schema isolate every current app table to the
   assert.doesNotMatch(cimIdentityMigration, /create\s+policy/i, 'canonical CIM identity tables must not add public RLS policies');
   assert.doesNotMatch(cimStage2Migration, /create\s+policy/i, 'Stage 2 authorization tables must not add public RLS policies');
   assert.doesNotMatch(crmReconciliationMigration, /create\s+policy/i, 'CRM reconciliation tables must not add public RLS policies');
+  assert.doesNotMatch(opportunityFactsMigration, /create\s+policy/i, 'opportunity fact tables must not add public RLS policies');
   assertServerOnlyPrivileges(migration, 'forward migration');
   assert.match(analyticsMigration, /revoke all privileges on table public\.analytics_events from public, anon, authenticated;/i);
   assert.match(analyticsMigration, /grant all privileges on table public\.analytics_events to service_role;/i);
@@ -368,6 +374,16 @@ test('Supabase migration and fresh schema isolate every current app table to the
   assert.match(adminOnboardingMigration, /revoke all privileges on table public\.admin_onboarding_progress from public, anon, authenticated;/i);
   assert.match(adminOnboardingMigration, /grant all privileges on table public\.admin_onboarding_progress to service_role;/i);
   assert.match(adminOnboardingMigration, /p_step_ids\s+text\[\]/i);
+  for (const tableName of ['deal_hunter_opportunity_facts', 'deal_hunter_opportunity_source_observations']) {
+    assert.match(
+      opportunityFactsMigration,
+      new RegExp(`revoke all privileges on table public\\.${tableName} from public, anon, authenticated;`, 'i'),
+    );
+    assert.match(
+      opportunityFactsMigration,
+      new RegExp(`grant all privileges on table public\\.${tableName} to service_role;`, 'i'),
+    );
+  }
   assert.match(adminOnboardingMigration, /array_position\(p_step_ids,\s*excluded\.last_completed_step_id\)/i);
   assertServiceRoleOnlyFunction(adminOnboardingMigration, 'admin onboarding migration', 'upsert_admin_onboarding_progress');
   assertServiceRoleOnlyFunction(schema, 'fresh schema', 'upsert_admin_onboarding_progress');

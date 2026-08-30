@@ -468,6 +468,27 @@ const relationshipInventoryEntries = [
     reason: coreRelationshipReason,
   }),
   ...relationshipEntries({
+    table: 'deal_hunter_opportunity_facts',
+    columns: ['opportunity_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.operatorFacts',
+    reason: blockingRelationshipReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_opportunity_source_observations',
+    columns: ['opportunity_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.sourceObservations',
+    reason: blockingRelationshipReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_opportunity_source_observations',
+    columns: ['source_id', 'source_record_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+    scannerPath: 'dependentState.records.sourceObservations',
+    reason: redundantRelationshipReason,
+  }),
+  ...relationshipEntries({
     table: 'deal_hunter_opportunity_scores',
     columns: ['opportunity_id', 'deal_key', 'listing_url'],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,

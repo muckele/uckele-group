@@ -357,6 +357,14 @@ function normalizeDealHunterScoreEvidenceRow(row) {
   return row ? { ...row, terms: Array.isArray(row.terms) ? row.terms : [] } : null;
 }
 
+function normalizeDealHunterOpportunityFactRow(row) {
+  return row ? { ...row, verified: Boolean(row.verified) } : null;
+}
+
+function normalizeDealHunterOpportunitySourceObservationRow(row) {
+  return row ? { ...row } : null;
+}
+
 function normalizeDealHunterOpportunityRow(row) {
   return row
     ? { ...row, metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {} }
@@ -2990,6 +2998,48 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       });
       if (error) throw error;
       return normalizeDealHunterOpportunityRow(data);
+    },
+
+    async listDealHunterOpportunityFacts(opportunityId) {
+      const { data, error } = await client
+        .from('deal_hunter_opportunity_facts')
+        .select('*')
+        .eq('opportunity_id', String(opportunityId || '').trim())
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false });
+      if (error) throw error;
+      return (data || []).map(normalizeDealHunterOpportunityFactRow);
+    },
+
+    async upsertDealHunterOpportunityFact(fact = {}) {
+      const { data, error } = await client
+        .from('deal_hunter_opportunity_facts')
+        .upsert({ ...fact, source: fact.source || 'operator', note: fact.note || null }, { onConflict: 'id' })
+        .select()
+        .single();
+      if (error) throw error;
+      return normalizeDealHunterOpportunityFactRow(data);
+    },
+
+    async listDealHunterOpportunitySourceObservations(opportunityId) {
+      const { data, error } = await client
+        .from('deal_hunter_opportunity_source_observations')
+        .select('*')
+        .eq('opportunity_id', String(opportunityId || '').trim())
+        .order('observed_at', { ascending: false })
+        .order('id');
+      if (error) throw error;
+      return (data || []).map(normalizeDealHunterOpportunitySourceObservationRow);
+    },
+
+    async upsertDealHunterOpportunitySourceObservation(observation = {}) {
+      const { data, error } = await client
+        .from('deal_hunter_opportunity_source_observations')
+        .upsert(observation, { onConflict: 'opportunity_id,source_id,source_record_id,field' })
+        .select()
+        .single();
+      if (error) throw error;
+      return normalizeDealHunterOpportunitySourceObservationRow(data);
     },
 
     async listDealHunterOpportunityAliases({ opportunityIds = [], aliasKeys = [], limit = 5000 } = {}) {

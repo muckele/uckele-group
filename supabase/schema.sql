@@ -3032,6 +3032,36 @@ create table if not exists public.deal_hunter_opportunities (
   metadata jsonb not null default '{}'::jsonb
 );
 
+-- Operator fact revisions retain historical corrections. Structured source
+-- observations are refreshed by a bounded source-record identity; neither
+-- table accepts arbitrary raw source blobs.
+create table if not exists public.deal_hunter_opportunity_facts (
+  id text primary key,
+  opportunity_id text not null references public.deal_hunter_opportunities(opportunity_id) on delete cascade,
+  field text not null,
+  value text not null,
+  source text not null default 'operator',
+  verified boolean not null default false,
+  actor text not null,
+  note text,
+  created_at timestamptz not null,
+  updated_at timestamptz not null
+);
+
+create table if not exists public.deal_hunter_opportunity_source_observations (
+  id text primary key,
+  opportunity_id text not null references public.deal_hunter_opportunities(opportunity_id) on delete cascade,
+  source_id text not null,
+  source_name text not null,
+  source_record_id text not null,
+  field text not null,
+  value text not null,
+  observed_at timestamptz not null,
+  created_at timestamptz not null,
+  updated_at timestamptz not null,
+  unique(opportunity_id, source_id, source_record_id, field)
+);
+
 create table if not exists public.deal_hunter_opportunity_aliases (
   id text primary key,
   opportunity_id text not null references public.deal_hunter_opportunities(opportunity_id) on delete restrict,
@@ -3266,6 +3296,10 @@ create index if not exists idx_deal_hunter_opportunities_updated
   on public.deal_hunter_opportunities(updated_at desc, opportunity_id);
 create index if not exists idx_deal_hunter_opportunities_recipient
   on public.deal_hunter_opportunities(canonical_recipient, updated_at desc);
+create index if not exists idx_deal_hunter_opportunity_facts_history
+  on public.deal_hunter_opportunity_facts(opportunity_id, created_at desc, id desc);
+create index if not exists idx_deal_hunter_source_observations_history
+  on public.deal_hunter_opportunity_source_observations(opportunity_id, observed_at desc, id);
 create index if not exists idx_deal_hunter_opportunity_aliases_opportunity
   on public.deal_hunter_opportunity_aliases(opportunity_id, alias_type);
 create index if not exists idx_deal_hunter_identity_exceptions_status
@@ -4159,6 +4193,8 @@ end;
 $$;
 
 alter table public.deal_hunter_opportunities enable row level security;
+alter table public.deal_hunter_opportunity_facts enable row level security;
+alter table public.deal_hunter_opportunity_source_observations enable row level security;
 alter table public.deal_hunter_opportunity_aliases enable row level security;
 alter table public.deal_hunter_identity_exceptions enable row level security;
 alter table public.deal_hunter_cim_opportunity_claims enable row level security;
@@ -4171,6 +4207,8 @@ alter table public.deal_hunter_cim_stage2_runs enable row level security;
 alter table public.deal_hunter_cim_stage2_decisions enable row level security;
 
 revoke all privileges on table public.deal_hunter_opportunities from public, anon, authenticated;
+revoke all privileges on table public.deal_hunter_opportunity_facts from public, anon, authenticated;
+revoke all privileges on table public.deal_hunter_opportunity_source_observations from public, anon, authenticated;
 revoke all privileges on table public.deal_hunter_opportunity_aliases from public, anon, authenticated;
 revoke all privileges on table public.deal_hunter_identity_exceptions from public, anon, authenticated;
 revoke all privileges on table public.deal_hunter_cim_opportunity_claims from public, anon, authenticated;
@@ -4191,6 +4229,8 @@ revoke all privileges on function public.create_cim_stage2_activation(jsonb) fro
 revoke all privileges on function public.claim_cim_stage2_decision(uuid, text, timestamptz, uuid) from public, anon, authenticated;
 
 grant all privileges on table public.deal_hunter_opportunities to service_role;
+grant all privileges on table public.deal_hunter_opportunity_facts to service_role;
+grant all privileges on table public.deal_hunter_opportunity_source_observations to service_role;
 grant all privileges on table public.deal_hunter_opportunity_aliases to service_role;
 grant all privileges on table public.deal_hunter_identity_exceptions to service_role;
 grant all privileges on table public.deal_hunter_cim_opportunity_claims to service_role;

@@ -391,6 +391,14 @@ function normalizeDealHunterScoreEvidenceRow(row) {
   return row ? { ...row, terms: parseJsonColumn(row.terms, []) } : null;
 }
 
+function normalizeDealHunterOpportunityFactRow(row) {
+  return row ? { ...row, verified: Boolean(row.verified) } : null;
+}
+
+function normalizeDealHunterOpportunitySourceObservationRow(row) {
+  return row ? { ...row } : null;
+}
+
 function normalizeDealHunterOpportunityAliasRow(row) {
   return row ? { ...row, metadata: parseJsonColumn(row.metadata, {}) } : null;
 }
@@ -1032,6 +1040,12 @@ function inspectCanonicalMergeDependentState(database, approval) {
     { column: 'opportunity_id', values: opportunityIds },
     { column: 'listing_url', values: listingUrls },
   ]);
+  const operatorFacts = selectCanonicalMergeRows(database, 'deal_hunter_opportunity_facts', [
+    { column: 'opportunity_id', values: opportunityIds },
+  ]);
+  const sourceObservations = selectCanonicalMergeRows(database, 'deal_hunter_opportunity_source_observations', [
+    { column: 'opportunity_id', values: opportunityIds },
+  ]);
   const contactSubmissions = selectCanonicalMergeRows(database, 'contact_submissions', [
     { column: 'deal_hunter_opportunity_id', values: opportunityIds },
     { column: 'listing_url', values: listingUrls },
@@ -1191,6 +1205,8 @@ function inspectCanonicalMergeDependentState(database, approval) {
   const records = {
     opportunityScores: canonicalMergeRecordIds('deal_hunter_opportunity_scores', opportunityScores, 'opportunity_id'),
     scoreEvidence: canonicalMergeRecordIds('deal_hunter_score_evidence', scoreEvidence),
+    operatorFacts: canonicalMergeRecordIds('deal_hunter_opportunity_facts', operatorFacts),
+    sourceObservations: canonicalMergeRecordIds('deal_hunter_opportunity_source_observations', sourceObservations),
     contactSubmissions: canonicalMergeRecordIds('contact_submissions', contactSubmissions),
     crmImports: canonicalMergeRecordIds('deal_hunter_crm_imports', crmImports),
     crmReconciliationItems: canonicalMergeRecordIds('deal_hunter_crm_reconciliation_items', crmReconciliationItems),
@@ -1378,6 +1394,8 @@ const canonicalOpportunityMergeRequiredSchema = Object.freeze({
   ],
   deal_hunter_opportunity_scores: ['opportunity_id', 'deal_key', 'listing_url'],
   deal_hunter_score_evidence: ['id', 'opportunity_id', 'listing_url'],
+  deal_hunter_opportunity_facts: ['id', 'opportunity_id'],
+  deal_hunter_opportunity_source_observations: ['id', 'opportunity_id', 'source_id', 'source_record_id'],
   deal_hunter_cim_reviews: ['id', 'deal_key', 'opportunity_id', 'metadata'],
   deal_hunter_crm_imports: [
     'id',
@@ -2394,6 +2412,39 @@ export function createSqliteStorage(config) {
         metadata TEXT NOT NULL DEFAULT '{}'
       );
 
+      -- Operator fact revisions are append-only by ID so later corrections
+      -- preserve the values an operator previously recorded. Source
+      -- observations use a bounded source-record identity and are refreshed in
+      -- place; neither projection stores raw source payloads.
+      CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_facts (
+        id TEXT PRIMARY KEY,
+        opportunity_id TEXT NOT NULL,
+        field TEXT NOT NULL,
+        value TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'operator',
+        verified INTEGER NOT NULL DEFAULT 0,
+        actor TEXT NOT NULL,
+        note TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_source_observations (
+        id TEXT PRIMARY KEY,
+        opportunity_id TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        source_name TEXT NOT NULL,
+        source_record_id TEXT NOT NULL,
+        field TEXT NOT NULL,
+        value TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(opportunity_id, source_id, source_record_id, field),
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_aliases (
         id TEXT PRIMARY KEY,
         opportunity_id TEXT NOT NULL,
@@ -2741,6 +2792,8 @@ export function createSqliteStorage(config) {
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_submission_id ON deal_hunter_crm_imports(submission_id);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_opportunities_updated ON deal_hunter_opportunities(updated_at DESC, opportunity_id);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_opportunities_recipient ON deal_hunter_opportunities(canonical_recipient, updated_at DESC);
+	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_opportunity_facts_history ON deal_hunter_opportunity_facts(opportunity_id, created_at DESC, id DESC);
+	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_source_observations_history ON deal_hunter_opportunity_source_observations(opportunity_id, observed_at DESC, id ASC);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_opportunity_aliases_opportunity ON deal_hunter_opportunity_aliases(opportunity_id, alias_type);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_identity_exceptions_status ON deal_hunter_identity_exceptions(status, updated_at DESC);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_overrides_lookup ON deal_hunter_cim_recipient_overrides(opportunity_id, recipient_email, expires_at DESC);
@@ -7708,6 +7761,70 @@ export function createSqliteStorage(config) {
         metadata: JSON.stringify(record.metadata || {}),
       });
       return this.getDealHunterOpportunity(record.opportunity_id);
+    },
+
+    async listDealHunterOpportunityFacts(opportunityId) {
+      return database.prepare(`
+        SELECT * FROM deal_hunter_opportunity_facts
+        WHERE opportunity_id = ?
+        ORDER BY created_at DESC, id DESC
+      `).all(String(opportunityId || '').trim()).map(normalizeDealHunterOpportunityFactRow);
+    },
+
+    async upsertDealHunterOpportunityFact(fact = {}) {
+      database.prepare(`
+        INSERT INTO deal_hunter_opportunity_facts (
+          id, opportunity_id, field, value, source, verified, actor, note, created_at, updated_at
+        ) VALUES (
+          @id, @opportunity_id, @field, @value, @source, @verified, @actor, @note, @created_at, @updated_at
+        )
+        ON CONFLICT(id) DO UPDATE SET
+          field = excluded.field,
+          value = excluded.value,
+          source = excluded.source,
+          verified = excluded.verified,
+          actor = excluded.actor,
+          note = excluded.note,
+          updated_at = excluded.updated_at
+      `).run({
+        ...fact,
+        source: fact.source || 'operator',
+        verified: fact.verified ? 1 : 0,
+        note: fact.note || null,
+      });
+      return normalizeDealHunterOpportunityFactRow(database.prepare(`
+        SELECT * FROM deal_hunter_opportunity_facts WHERE id = ? LIMIT 1
+      `).get(fact.id));
+    },
+
+    async listDealHunterOpportunitySourceObservations(opportunityId) {
+      return database.prepare(`
+        SELECT * FROM deal_hunter_opportunity_source_observations
+        WHERE opportunity_id = ?
+        ORDER BY observed_at DESC, id ASC
+      `).all(String(opportunityId || '').trim()).map(normalizeDealHunterOpportunitySourceObservationRow);
+    },
+
+    async upsertDealHunterOpportunitySourceObservation(observation = {}) {
+      database.prepare(`
+        INSERT INTO deal_hunter_opportunity_source_observations (
+          id, opportunity_id, source_id, source_name, source_record_id, field, value,
+          observed_at, created_at, updated_at
+        ) VALUES (
+          @id, @opportunity_id, @source_id, @source_name, @source_record_id, @field, @value,
+          @observed_at, @created_at, @updated_at
+        )
+        ON CONFLICT(opportunity_id, source_id, source_record_id, field) DO UPDATE SET
+          source_name = excluded.source_name,
+          value = excluded.value,
+          observed_at = excluded.observed_at,
+          updated_at = excluded.updated_at
+      `).run(observation);
+      return normalizeDealHunterOpportunitySourceObservationRow(database.prepare(`
+        SELECT * FROM deal_hunter_opportunity_source_observations
+        WHERE opportunity_id = ? AND source_id = ? AND source_record_id = ? AND field = ?
+        LIMIT 1
+      `).get(observation.opportunity_id, observation.source_id, observation.source_record_id, observation.field));
     },
 
     async linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt = '' } = {}) {
