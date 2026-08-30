@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
+import { normalizeOpportunitySourceObservation } from '../services/dealHunterOpportunityFacts.js';
 import {
   buildCanonicalOpportunityMergePlan,
   canonicalOpportunityMergeManifestId,
@@ -2412,8 +2413,9 @@ export function createSqliteStorage(config) {
         metadata TEXT NOT NULL DEFAULT '{}'
       );
 
-      -- Operator fact revisions are append-only by ID so later corrections
-      -- preserve the values an operator previously recorded. Source
+      -- Operator corrections create a new immutable revision ID so history
+      -- retains the values an operator previously recorded; a same-ID retry
+      -- may update only the mutable revision fields. Source
       -- observations use a bounded source-record identity and are refreshed in
       -- place; neither projection stores raw source payloads.
       CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_facts (
@@ -2442,6 +2444,24 @@ export function createSqliteStorage(config) {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(opportunity_id, source_id, source_record_id, field),
+        CHECK(
+          length(trim(id)) BETWEEN 1 AND 240 AND id = trim(id)
+          AND length(trim(opportunity_id)) BETWEEN 1 AND 200 AND opportunity_id = trim(opportunity_id)
+          AND length(trim(source_id)) BETWEEN 1 AND 160 AND source_id = trim(source_id)
+          AND length(trim(source_name)) BETWEEN 1 AND 220 AND source_name = trim(source_name)
+          AND length(trim(source_record_id)) BETWEEN 1 AND 200 AND source_record_id = trim(source_record_id)
+          AND field IN (
+            'name', 'business_name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
+            'annual_profit', 'annual_revenue', 'asking_price', 'profit_multiple', 'net_margin', 'years_established',
+            'remote_flag', 'franchise_flag', 'five_years_flag', 'broker_name', 'broker_company', 'broker_email',
+            'broker_phone', 'seller_name', 'seller_email', 'seller_phone', 'reason_for_sale', 'real_estate_included',
+            'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes', 'listing_url',
+            'listing_source', 'listing_id', 'deal_key', 'source_identity', 'date_added', 'last_updated',
+            'business_website', 'prospectus_url', 'ttm_revenue', 'ttm_ebitda', 'ebitda_multiple', 'business_age',
+            'sba_eligible', 'lead_type'
+          )
+          AND length(trim(value)) BETWEEN 1 AND 5000 AND value = trim(value)
+        ),
         FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE
       );
 
@@ -7806,6 +7826,7 @@ export function createSqliteStorage(config) {
     },
 
     async upsertDealHunterOpportunitySourceObservation(observation = {}) {
+      const normalizedObservation = normalizeOpportunitySourceObservation(observation);
       database.prepare(`
         INSERT INTO deal_hunter_opportunity_source_observations (
           id, opportunity_id, source_id, source_name, source_record_id, field, value,
@@ -7819,12 +7840,17 @@ export function createSqliteStorage(config) {
           value = excluded.value,
           observed_at = excluded.observed_at,
           updated_at = excluded.updated_at
-      `).run(observation);
+      `).run(normalizedObservation);
       return normalizeDealHunterOpportunitySourceObservationRow(database.prepare(`
         SELECT * FROM deal_hunter_opportunity_source_observations
         WHERE opportunity_id = ? AND source_id = ? AND source_record_id = ? AND field = ?
         LIMIT 1
-      `).get(observation.opportunity_id, observation.source_id, observation.source_record_id, observation.field));
+      `).get(
+        normalizedObservation.opportunity_id,
+        normalizedObservation.source_id,
+        normalizedObservation.source_record_id,
+        normalizedObservation.field,
+      ));
     },
 
     async linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt = '' } = {}) {

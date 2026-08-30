@@ -17,6 +17,10 @@ import {
 } from '../server/repairs/canonicalOpportunityMerge.js';
 
 const supabaseModule = await import('../server/storage/supabase.js');
+const opportunityFactWriteBoundaryMigrationUrl = new URL(
+  '../supabase/migrations/20260830130000_deal_hunter_opportunity_fact_write_boundary.sql',
+  import.meta.url,
+);
 
 const opportunityId = 'opp-facts-1';
 
@@ -101,6 +105,86 @@ function supabaseChain({ facts = [], observations = [] } = {}) {
     return chain;
   };
   return { client: { from: chainFor }, calls };
+}
+
+function constrainedSupabaseBoundary() {
+  const calls = [];
+  const facts = new Map();
+  const observations = new Map();
+  const observationKeysById = new Map();
+  const observationKey = (record) => [record.opportunity_id, record.source_id, record.source_record_id, record.field].join('\u0000');
+  return {
+    calls,
+    client: {
+      from() {
+        throw new Error('Task 2 durable writes must use the constrained RPC boundary.');
+      },
+      async rpc(name, payload) {
+        calls.push({ name, payload });
+        if (name === 'upsert_deal_hunter_opportunity_fact') {
+          const existing = facts.get(payload.p_id);
+          const row = existing
+            ? {
+                ...existing,
+                field: payload.p_field,
+                value: payload.p_value,
+                source: payload.p_source,
+                verified: payload.p_verified,
+                actor: payload.p_actor,
+                note: payload.p_note,
+                updated_at: payload.p_updated_at,
+              }
+            : {
+                id: payload.p_id,
+                opportunity_id: payload.p_opportunity_id,
+                field: payload.p_field,
+                value: payload.p_value,
+                source: payload.p_source,
+                verified: payload.p_verified,
+                actor: payload.p_actor,
+                note: payload.p_note,
+                created_at: payload.p_created_at,
+                updated_at: payload.p_updated_at,
+              };
+          facts.set(row.id, row);
+          return { data: row, error: null };
+        }
+        if (name === 'upsert_deal_hunter_opportunity_source_observation') {
+          const incoming = {
+            id: payload.p_id,
+            opportunity_id: payload.p_opportunity_id,
+            source_id: payload.p_source_id,
+            source_name: payload.p_source_name,
+            source_record_id: payload.p_source_record_id,
+            field: payload.p_field,
+            value: payload.p_value,
+            observed_at: payload.p_observed_at,
+            created_at: payload.p_created_at,
+            updated_at: payload.p_updated_at,
+          };
+          const key = observationKey(incoming);
+          const existing = observations.get(key);
+          const existingKeyForId = observationKeysById.get(incoming.id);
+          if (!existing && existingKeyForId && existingKeyForId !== key) {
+            return { data: null, error: new Error('duplicate key value violates unique constraint on observation id') };
+          }
+          const row = existing
+            ? {
+                ...existing,
+                source_name: incoming.source_name,
+                value: incoming.value,
+                observed_at: incoming.observed_at,
+                updated_at: incoming.updated_at,
+              }
+            : incoming;
+          observations.set(key, row);
+          observationKeysById.set(row.id, key);
+          return { data: row, error: null };
+        }
+        throw new Error(`Unexpected RPC: ${name}`);
+      },
+    },
+  };
 }
 
 test('verified operator facts survive a structured-source refresh', async (t) => {
@@ -216,21 +300,185 @@ test('SQLite and Supabase adapters expose matching fact and source-observation s
   );
   const supabaseFacts = await supabase.listDealHunterOpportunityFacts(opportunityId);
   const supabaseObservations = await supabase.listDealHunterOpportunitySourceObservations(opportunityId);
-  await supabase.upsertDealHunterOpportunityFact(fact);
-  await supabase.upsertDealHunterOpportunitySourceObservation(observation);
 
   assert.deepEqual(sqliteFacts, [fact]);
   assert.deepEqual(supabaseFacts, sqliteFacts);
   assert.deepEqual(sqliteObservations, [observation]);
   assert.deepEqual(supabaseObservations, sqliteObservations);
-  assert.deepEqual(chain.calls, [
-    { table: 'deal_hunter_opportunity_facts', value: fact, options: { onConflict: 'id' } },
-    {
-      table: 'deal_hunter_opportunity_source_observations',
-      value: observation,
-      options: { onConflict: 'opportunity_id,source_id,source_record_id,field' },
-    },
-  ]);
+  assert.deepEqual(chain.calls, []);
+});
+
+test('fact conflicts preserve immutable identity while both providers update only mutable revision fields', async (t) => {
+  // Break caught: Supabase merge-upsert can reassign an existing fact revision
+  // to another opportunity or replace its original audit timestamp.
+  const sqlite = withStorage(t);
+  await seedOpportunity(sqlite);
+  const first = factRecord({ id: 'fact-conflict', created_at: '2026-08-30T08:00:00.000Z' });
+  const second = factRecord({
+    id: first.id,
+    opportunity_id: 'opp-reassignment-attempt',
+    field: 'broker_name',
+    value: 'Updated Broker',
+    source: 'operator-correction',
+    verified: false,
+    actor: 'second-operator',
+    note: 'Corrected value',
+    created_at: '2026-08-30T09:00:00.000Z',
+    updated_at: '2026-08-30T10:00:00.000Z',
+  });
+  const boundary = constrainedSupabaseBoundary();
+  const supabase = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: boundary.client },
+  );
+
+  await sqlite.upsertDealHunterOpportunityFact(first);
+  await supabase.upsertDealHunterOpportunityFact(first);
+  const sqliteFinal = await sqlite.upsertDealHunterOpportunityFact(second);
+  const supabaseFinal = await supabase.upsertDealHunterOpportunityFact(second);
+
+  assert.deepEqual(sqliteFinal, {
+    ...second,
+    opportunity_id: first.opportunity_id,
+    created_at: first.created_at,
+  });
+  assert.deepEqual(supabaseFinal, sqliteFinal);
+  assert.equal(boundary.calls[1].name, 'upsert_deal_hunter_opportunity_fact');
+});
+
+test('source-observation conflicts preserve immutable source identity while both providers refresh mutable values', async (t) => {
+  // Break caught: a source refresh replaces observation ownership, ID, or the
+  // original creation timestamp in one provider but not the other.
+  const sqlite = withStorage(t);
+  await seedOpportunity(sqlite);
+  const first = observationRecord({ id: 'observation-conflict', created_at: '2026-08-30T08:00:00.000Z' });
+  const second = observationRecord({
+    id: 'replacement-id-attempt',
+    source_id: ` ${first.source_id} `,
+    source_name: 'Refreshed Source Name',
+    source_record_id: ` ${first.source_record_id} `,
+    field: ' Seller Name ',
+    value: 'Updated source value',
+    observed_at: '2026-08-30T10:00:00.000Z',
+    created_at: '2026-08-30T09:00:00.000Z',
+    updated_at: '2026-08-30T10:00:00.000Z',
+  });
+  const boundary = constrainedSupabaseBoundary();
+  const supabase = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: boundary.client },
+  );
+
+  await sqlite.upsertDealHunterOpportunitySourceObservation(first);
+  await supabase.upsertDealHunterOpportunitySourceObservation(first);
+  const sqliteFinal = await sqlite.upsertDealHunterOpportunitySourceObservation(second);
+  const supabaseFinal = await supabase.upsertDealHunterOpportunitySourceObservation(second);
+
+  assert.deepEqual(sqliteFinal, {
+    ...second,
+    id: first.id,
+    source_id: first.source_id,
+    source_record_id: first.source_record_id,
+    field: first.field,
+    created_at: first.created_at,
+  });
+  assert.deepEqual(supabaseFinal, sqliteFinal);
+  assert.equal(boundary.calls[1].name, 'upsert_deal_hunter_opportunity_source_observation');
+
+  // A reused primary ID must not create a second observation under a different
+  // ownership composite in either provider.
+  await seedOpportunity(sqlite, 'opp-other-observation-owner');
+  const reassignment = observationRecord({
+    id: first.id,
+    opportunity_id: 'opp-other-observation-owner',
+    source_id: 'other-source',
+    source_record_id: 'other-record',
+    field: 'annual_revenue',
+  });
+  await assert.rejects(sqlite.upsertDealHunterOpportunitySourceObservation(reassignment), /UNIQUE constraint failed/);
+  await assert.rejects(supabase.upsertDealHunterOpportunitySourceObservation(reassignment), /duplicate key value/);
+  assert.deepEqual(await sqlite.listDealHunterOpportunitySourceObservations(first.opportunity_id), [sqliteFinal]);
+});
+
+test('source observations normalize the bounded Deal Hunter field set and reject malformed provider writes', async (t) => {
+  // Break caught: unbounded/raw source payloads, whitespace-split identities,
+  // unsupported normalized fields, or invalid timestamps reach durable storage.
+  const raw = observationRecord({
+    id: ' observation-normalized ',
+    opportunity_id: opportunityId,
+    source_id: ' deal-hunter-sheet ',
+    source_name: ' Deal Hunter Google Sheet ',
+    source_record_id: ' row-42 ',
+    field: ' Asking Price ',
+    value: ' $1,450,000 ',
+    observed_at: ' 2026-08-30T12:30:00Z ',
+    created_at: ' 2026-08-30T12:30:00Z ',
+    updated_at: ' 2026-08-30T12:30:00Z ',
+  });
+  const sqlite = withStorage(t);
+  await seedOpportunity(sqlite);
+  const canonical = await sqlite.upsertDealHunterOpportunitySourceObservation(raw);
+  assert.deepEqual(canonical, {
+    ...observationRecord({ field: 'asking_price', value: '$1,450,000' }),
+    id: 'observation-normalized',
+    source_id: 'deal-hunter-sheet',
+    source_name: 'Deal Hunter Google Sheet',
+    source_record_id: 'row-42',
+    field: 'asking_price',
+    value: '$1,450,000',
+    observed_at: '2026-08-30T12:30:00.000Z',
+    created_at: '2026-08-30T12:30:00.000Z',
+    updated_at: '2026-08-30T12:30:00.000Z',
+  });
+  const boundary = constrainedSupabaseBoundary();
+  const supabase = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: boundary.client },
+  );
+  const invalid = observationRecord({ field: 'raw_metadata' });
+  await assert.rejects(sqlite.upsertDealHunterOpportunitySourceObservation(invalid), /Unsupported opportunity source-observation field/);
+  await assert.rejects(supabase.upsertDealHunterOpportunitySourceObservation(invalid), /Unsupported opportunity source-observation field/);
+  await assert.rejects(
+    sqlite.upsertDealHunterOpportunitySourceObservation(observationRecord({ value: 'x'.repeat(5001) })),
+    /at most 5000 characters/,
+  );
+  for (const value of [{ raw: 'blob' }, Buffer.from('blob')]) {
+    await assert.rejects(
+      sqlite.upsertDealHunterOpportunitySourceObservation(observationRecord({ value })),
+      /plain text, number, or boolean/,
+    );
+    await assert.rejects(
+      supabase.upsertDealHunterOpportunitySourceObservation(observationRecord({ value })),
+      /plain text, number, or boolean/,
+    );
+  }
+  await assert.rejects(
+    sqlite.upsertDealHunterOpportunitySourceObservation(observationRecord({ observed_at: 'not-a-timestamp' })),
+    /valid timestamp/,
+  );
+});
+
+test('Supabase durable-write RPCs enforce the SQLite-compatible immutable conflict contract', () => {
+  // Break caught: a future migration turns either constrained RPC back into a
+  // merge-upsert that can rewrite owner, source identity, or created_at.
+  const migration = fs.readFileSync(opportunityFactWriteBoundaryMigrationUrl, 'utf8');
+  assert.match(migration, /constraint deal_hunter_opportunity_source_observations_bounded_check/i);
+  assert.match(migration, /field in \([\s\S]*'asking_price'[\s\S]*'seller_name'/i);
+  assert.match(migration, /create or replace function public\.upsert_deal_hunter_opportunity_fact\(/i);
+  assert.match(migration, /on conflict \(id\) do update set[\s\S]*updated_at = excluded\.updated_at/i);
+  assert.doesNotMatch(migration, /on conflict \(id\) do update set[\s\S]*opportunity_id\s*=/i);
+  assert.doesNotMatch(migration, /on conflict \(id\) do update set[\s\S]*created_at\s*=/i);
+  assert.match(migration, /create or replace function public\.upsert_deal_hunter_opportunity_source_observation\(/i);
+  assert.match(migration, /on conflict \(opportunity_id, source_id, source_record_id, field\) do update set[\s\S]*updated_at = excluded\.updated_at/i);
+  assert.doesNotMatch(migration, /on conflict \(opportunity_id, source_id, source_record_id, field\) do update set[\s\S]*\bid\s*=/i);
+  assert.doesNotMatch(migration, /on conflict \(opportunity_id, source_id, source_record_id, field\) do update set[\s\S]*created_at\s*=/i);
+  for (const functionName of [
+    'upsert_deal_hunter_opportunity_fact',
+    'upsert_deal_hunter_opportunity_source_observation',
+  ]) {
+    assert.match(migration, new RegExp(`revoke all privileges on function public\\.${functionName}\\(`, 'i'));
+    assert.match(migration, new RegExp(`grant execute on function public\\.${functionName}\\(`, 'i'));
+  }
 });
 
 test('operator-fact history remains queryable after a corrected value is recorded', async (t) => {

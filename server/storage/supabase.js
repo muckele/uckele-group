@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
+import { normalizeOpportunitySourceObservation } from '../services/dealHunterOpportunityFacts.js';
 
 function normalizeSubmissionRow(row) {
   return {
@@ -3013,10 +3014,18 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
 
     async upsertDealHunterOpportunityFact(fact = {}) {
       const { data, error } = await client
-        .from('deal_hunter_opportunity_facts')
-        .upsert({ ...fact, source: fact.source || 'operator', note: fact.note || null }, { onConflict: 'id' })
-        .select()
-        .single();
+        .rpc('upsert_deal_hunter_opportunity_fact', {
+          p_id: fact.id,
+          p_opportunity_id: fact.opportunity_id,
+          p_field: fact.field,
+          p_value: fact.value,
+          p_source: fact.source || 'operator',
+          p_verified: Boolean(fact.verified),
+          p_actor: fact.actor,
+          p_note: fact.note || null,
+          p_created_at: fact.created_at,
+          p_updated_at: fact.updated_at,
+        });
       if (error) throw error;
       return normalizeDealHunterOpportunityFactRow(data);
     },
@@ -3033,11 +3042,20 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     async upsertDealHunterOpportunitySourceObservation(observation = {}) {
+      const normalizedObservation = normalizeOpportunitySourceObservation(observation);
       const { data, error } = await client
-        .from('deal_hunter_opportunity_source_observations')
-        .upsert(observation, { onConflict: 'opportunity_id,source_id,source_record_id,field' })
-        .select()
-        .single();
+        .rpc('upsert_deal_hunter_opportunity_source_observation', {
+          p_id: normalizedObservation.id,
+          p_opportunity_id: normalizedObservation.opportunity_id,
+          p_source_id: normalizedObservation.source_id,
+          p_source_name: normalizedObservation.source_name,
+          p_source_record_id: normalizedObservation.source_record_id,
+          p_field: normalizedObservation.field,
+          p_value: normalizedObservation.value,
+          p_observed_at: normalizedObservation.observed_at,
+          p_created_at: normalizedObservation.created_at,
+          p_updated_at: normalizedObservation.updated_at,
+        });
       if (error) throw error;
       return normalizeDealHunterOpportunitySourceObservationRow(data);
     },

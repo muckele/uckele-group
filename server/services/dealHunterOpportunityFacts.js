@@ -18,6 +18,60 @@ export const opportunityFactFields = Object.freeze([
 
 const opportunityFactFieldSet = new Set(opportunityFactFields);
 
+// This is intentionally broader than the operator-editable field set. It is
+// the bounded structured projection emitted by the current Deal Hunter / Deal
+// OS normalization model; raw source metadata never crosses this boundary.
+export const opportunitySourceObservationFields = Object.freeze([
+  'name',
+  'business_name',
+  'industry',
+  'description',
+  'city',
+  'county',
+  'state',
+  'country',
+  'location',
+  'annual_profit',
+  'annual_revenue',
+  'asking_price',
+  'profit_multiple',
+  'net_margin',
+  'years_established',
+  'remote_flag',
+  'franchise_flag',
+  'five_years_flag',
+  'broker_name',
+  'broker_company',
+  'broker_email',
+  'broker_phone',
+  'seller_name',
+  'seller_email',
+  'seller_phone',
+  'reason_for_sale',
+  'real_estate_included',
+  'seller_financing',
+  'management_structure',
+  'customer_concentration',
+  'operator_contact_notes',
+  'listing_url',
+  'listing_source',
+  'listing_id',
+  'deal_key',
+  'source_identity',
+  'date_added',
+  'last_updated',
+  'business_website',
+  'prospectus_url',
+  'ttm_revenue',
+  'ttm_ebitda',
+  'ebitda_multiple',
+  'business_age',
+  'sba_eligible',
+  'lead_type',
+]);
+
+const opportunitySourceObservationFieldSet = new Set(opportunitySourceObservationFields);
+
 function normalizeText(value, label, { required = true, maxLength = 4000 } = {}) {
   if (value === null || value === undefined) {
     if (!required) return null;
@@ -46,6 +100,42 @@ export function normalizeOpportunityFactField(field) {
     throw new Error(`Unsupported opportunity fact field: ${String(field)}.`);
   }
   return normalized;
+}
+
+export function normalizeOpportunitySourceObservationField(field) {
+  if (typeof field !== 'string') {
+    throw new Error('Unsupported opportunity source-observation field.');
+  }
+  const normalized = field.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (!opportunitySourceObservationFieldSet.has(normalized)) {
+    throw new Error(`Unsupported opportunity source-observation field: ${String(field)}.`);
+  }
+  return normalized;
+}
+
+function normalizeTimestamp(value, label) {
+  const normalized = normalizeText(value, label, { maxLength: 80 });
+  const timestamp = Date.parse(normalized);
+  if (!Number.isFinite(timestamp)) throw new Error(`${label} must be a valid timestamp.`);
+  return new Date(timestamp).toISOString();
+}
+
+export function normalizeOpportunitySourceObservation(observation = {}) {
+  if (!observation || typeof observation !== 'object' || Array.isArray(observation) || Buffer.isBuffer(observation)) {
+    throw new Error('Opportunity source observation must be an object.');
+  }
+  return {
+    id: normalizeText(observation.id, 'Opportunity source observation id', { maxLength: 240 }),
+    opportunity_id: normalizeText(observation.opportunity_id, 'Canonical opportunity id', { maxLength: 200 }),
+    source_id: normalizeText(observation.source_id, 'Opportunity source id', { maxLength: 160 }),
+    source_name: normalizeText(observation.source_name, 'Opportunity source name', { maxLength: 220 }),
+    source_record_id: normalizeText(observation.source_record_id, 'Opportunity source record id', { maxLength: 200 }),
+    field: normalizeOpportunitySourceObservationField(observation.field),
+    value: normalizeText(observation.value, 'Opportunity source observation value', { maxLength: 5000 }),
+    observed_at: normalizeTimestamp(observation.observed_at, 'Opportunity source observation timestamp'),
+    created_at: normalizeTimestamp(observation.created_at, 'Opportunity source observation creation timestamp'),
+    updated_at: normalizeTimestamp(observation.updated_at, 'Opportunity source observation update timestamp'),
+  };
 }
 
 export async function setOperatorOpportunityFact({

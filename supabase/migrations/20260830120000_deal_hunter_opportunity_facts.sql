@@ -1,6 +1,7 @@
 -- Durable operator-entered facts and retained source observations for the
--- Acquisition Inbox. Facts are append-only revisions; source observations are
--- atomically refreshed by their bounded source-record identity. No arbitrary
+-- Acquisition Inbox. Corrections create new fact revision IDs, while same-ID
+-- retries preserve immutable ownership/creation fields; source observations
+-- are atomically refreshed by their bounded source-record identity. No arbitrary
 -- raw source payload is stored in either projection.
 
 create table if not exists public.deal_hunter_opportunity_facts (
