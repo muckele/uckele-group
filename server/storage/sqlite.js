@@ -6491,9 +6491,26 @@ export function createSqliteStorage(config) {
         for (let index = 0; index < ids.length; index += 500) {
           const batch = ids.slice(index, index + 500);
           rows.push(...database.prepare(`
-            SELECT opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version, profile_version
+            SELECT opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version,
+                   profile_version, completeness_policy_version, reviewed_at
             FROM deal_hunter_opportunity_scores
             WHERE opportunity_id IN (${batch.map(() => '?').join(', ')})
+          `).all(...batch));
+        }
+        return rows;
+      },
+
+      async listDealHunterContradictionEvidence(opportunityIds = []) {
+        const ids = normalizeList(opportunityIds, 100000);
+        if (ids.length === 0) return [];
+        const rows = [];
+        for (let index = 0; index < ids.length; index += 500) {
+          const batch = ids.slice(index, index + 500);
+          rows.push(...database.prepare(`
+            SELECT opportunity_id, evidence_class, field, value, observed_value
+            FROM deal_hunter_score_evidence
+            WHERE evidence_class = 'contradicted'
+              AND opportunity_id IN (${batch.map(() => '?').join(', ')})
           `).all(...batch));
         }
         return rows;

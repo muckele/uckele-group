@@ -2734,7 +2734,30 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         const batch = ids.slice(index, index + 500);
         const { data, error } = await client
           .from('deal_hunter_opportunity_scores')
-          .select('opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version, profile_version')
+          .select(
+            'opportunity_id, score_fingerprint, semantic_digest, rules_version, engine_version, '
+            + 'profile_version, completeness_policy_version, reviewed_at',
+          )
+          .in('opportunity_id', batch);
+        if (error) throw error;
+        rows.push(...(data || []));
+      }
+      return rows;
+    },
+
+    async listDealHunterContradictionEvidence(opportunityIds = []) {
+      const ids = normalizeList(opportunityIds);
+      if (ids.length === 0) return [];
+      const rows = [];
+      // The scorer persists at most 50 contradictions per opportunity. Twenty
+      // opportunities per request therefore stay within PostgREST's usual
+      // 1,000-row response ceiling without truncating evidence.
+      for (let index = 0; index < ids.length; index += 20) {
+        const batch = ids.slice(index, index + 20);
+        const { data, error } = await client
+          .from('deal_hunter_score_evidence')
+          .select('opportunity_id, evidence_class, field, value, observed_value')
+          .eq('evidence_class', 'contradicted')
           .in('opportunity_id', batch);
         if (error) throw error;
         rows.push(...(data || []));
