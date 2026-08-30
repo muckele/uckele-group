@@ -296,6 +296,31 @@ export async function setOperatorOpportunityFact({
   return storage.upsertDealHunterOpportunityFact(fact);
 }
 
+// Operator enrichment is a mutation of the canonical, current opportunity.
+// Historical/superseded identities remain auditable through their existing fact
+// rows, but must never receive new operator assertions.
+export async function setCurrentOperatorOpportunityFact({
+  opportunityId,
+  field,
+  value,
+  actor,
+  verified = false,
+  note = null,
+  storage,
+} = {}) {
+  if (!storage || typeof storage.getCurrentDealHunterOpportunity !== 'function') {
+    throw new Error('Current canonical opportunity lookup is required.');
+  }
+  const id = normalizeText(opportunityId, 'Canonical opportunity id', { maxLength: 200 });
+  const current = await storage.getCurrentDealHunterOpportunity(id);
+  if (!current) {
+    const historical = await storage.getDealHunterOpportunity?.(id);
+    if (historical) throw new Error('The canonical opportunity is no longer current.');
+    throw new Error('The canonical opportunity was not found.');
+  }
+  return setOperatorOpportunityFact({ opportunityId: id, field, value, actor, verified, note, storage });
+}
+
 function toFactRows(facts) {
   if (Array.isArray(facts)) return facts;
   if (!facts || typeof facts !== 'object') return [];

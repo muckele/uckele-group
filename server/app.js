@@ -45,6 +45,7 @@ import {
   listTriageQueue,
   setTriageOperatorDecision,
 } from './services/dealHunterTriage.js';
+import { setCurrentOperatorOpportunityFact } from './services/dealHunterOpportunityFacts.js';
 import {
   dealHunterCrmSyncConfirmation,
   auditDealHunterCrmIntegrity,
@@ -1472,6 +1473,37 @@ export function createApp() {
     }),
   );
 
+  app.put(
+    '/api/admin/deal-hunter/opportunities/:opportunityId/facts/:field',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      if (typeof request.body?.verified !== 'boolean') {
+        response.status(400).json({ success: false, error: 'Opportunity fact verification state must be boolean.' });
+        return;
+      }
+      try {
+        const fact = await setCurrentOperatorOpportunityFact({
+          opportunityId: request.params.opportunityId,
+          field: request.params.field,
+          value: request.body?.value,
+          verified: request.body.verified,
+          note: request.body?.note ?? null,
+          actor: session.username || 'admin',
+          storage: getStorage(),
+        });
+        response.status(200).json({ success: true, fact });
+      } catch (error) {
+        const message = String(error?.message || 'Opportunity fact could not be saved.');
+        const status = /no longer current/i.test(message) ? 409 : /was not found/i.test(message) ? 404 : 400;
+        response.status(status).json({ success: false, error: message });
+      }
+    }),
+  );
+
   app.post(
     '/api/admin/deal-hunter/triage/:opportunityId/decision',
     asyncRoute(async (request, response) => {
@@ -1488,6 +1520,66 @@ export function createApp() {
         actor: session.username || 'admin',
       });
       response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/action',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const action = String(request.body?.action || '').trim().toLowerCase();
+      if (!['pursue', 'watch', 'pass'].includes(action)) {
+        response.status(400).json({ success: false, error: 'Action must be pursue, watch, or pass.' });
+        return;
+      }
+      const opportunityId = request.params.opportunityId;
+      if (action === 'pursue' || action === 'watch') {
+        const result = await setTriageOperatorDecision({
+          opportunityId,
+          priority: action === 'pursue' ? 'high' : 'watch',
+          markReviewed: true,
+          actor: session.username || 'admin',
+        });
+        response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), action, ...result });
+        return;
+      }
+
+      const storage = getStorage();
+      const [opportunity, score] = await Promise.all([
+        storage.getCurrentDealHunterOpportunity?.(opportunityId),
+        storage.getCurrentDealHunterOpportunityScore?.(opportunityId),
+      ]);
+      if (!opportunity || !score) {
+        response.status(404).json({ success: false, error: 'No current score has been recorded for this opportunity.' });
+        return;
+      }
+      const dismissal = await dismissDealHunterOpportunity({
+        dealKey: score.deal_key || '',
+        listingUrl: score.listing_url || '',
+        dealName: score.name || opportunity.canonical_name || '',
+        reason: request.body?.reason || '',
+        note: request.body?.note || '',
+        submissionId: opportunity.primary_submission_id || '',
+        actor: session.username || 'admin',
+        storage,
+      });
+      if (!dismissal.ok) {
+        response.status(dismissal.status || 400).json({ success: false, action, ...dismissal });
+        return;
+      }
+      const review = await setTriageOperatorDecision({
+        opportunityId,
+        markReviewed: true,
+        actor: session.username || 'admin',
+        storage,
+      });
+      response.status(review.status || (review.ok ? 200 : 400)).json({
+        success: Boolean(review.ok), action, disposition: dismissal.disposition || null, ...review,
+      });
     }),
   );
 

@@ -536,8 +536,8 @@ test('the detail view explains a score from persisted evidence alone', async (t)
   const detail = await getTriageOpportunityDetail({ opportunityId: 'opp-high', storage });
 
   assert.equal(detail.ok, true);
-  assert.equal(detail.dimensions.length, 7);
-  const financial = detail.dimensions.find((dimension) => dimension.id === 'financial-fit');
+  assert.equal(detail.score.dimensions.length, 7);
+  const financial = detail.score.dimensions.find((dimension) => dimension.id === 'financial-fit');
   assert.ok(financial.evidence.length > 0, 'financial fit is explained by evidence rows');
   assert.ok(financial.evidence.every((row) => row.ruleId && row.ruleLabel && row.evidenceClass));
   assert.ok(
@@ -545,12 +545,12 @@ test('the detail view explains a score from persisted evidence alone', async (t)
     'observed evidence names the source it came from',
   );
   // Phase 3A produces no model-generated evidence anywhere.
-  const everyRow = detail.dimensions.flatMap((dimension) => dimension.evidence).concat(detail.unattributedEvidence);
+  const everyRow = detail.score.dimensions.flatMap((dimension) => dimension.evidence).concat(detail.score.unattributedEvidence);
   assert.equal(everyRow.some((row) => row.evidenceClass === 'inferred'), false);
 
   const sparse = await getTriageOpportunityDetail({ opportunityId: 'opp-sparse', storage });
-  assert.ok(sparse.missingEvidence.length > 0, 'a sparse listing names what is missing');
-  assert.ok(sparse.confidenceReasons.length > 0);
+  assert.ok(sparse.score.missingEvidence.length > 0, 'a sparse listing names what is missing');
+  assert.ok(sparse.score.confidenceReasons.length > 0);
 
   const absent = await getTriageOpportunityDetail({ opportunityId: 'opp-nope', storage });
   assert.equal(absent.ok, false);
@@ -592,11 +592,11 @@ test('a gated opportunity keeps its explanation and its gate reason', async (t) 
   const storage = await seedQueue(t);
   const detail = await getTriageOpportunityDetail({ opportunityId: 'opp-removed', storage });
   assert.equal(detail.ok, true);
-  assert.ok(detail.gates.length > 0);
-  assert.equal(detail.gates.some((gate) => gate.ruleId === 'gate.excluded-category'), true);
+  assert.ok(detail.score.gates.length > 0);
+  assert.equal(detail.score.gates.some((gate) => gate.ruleId === 'gate.excluded-category'), true);
   assert.equal(detail.opportunity.shouldRemove, true);
   assert.equal(detail.opportunity.highFit, false);
-  assert.ok(detail.dimensions.some((dimension) => dimension.contribution !== 0), 'gated deals still explain themselves');
+  assert.ok(detail.score.dimensions.some((dimension) => dimension.contribution !== 0), 'gated deals still explain themselves');
 });
 
 test('triage reports unavailable storage rather than failing opaquely', async () => {

@@ -15,6 +15,10 @@ import {
   dealOperatorPriorities,
   normalizeDealOperatorPriority,
 } from './dealHunterScoringPolicy.js';
+import {
+  getEffectiveOpportunityFacts,
+  opportunityFactFields,
+} from './dealHunterOpportunityFacts.js';
 
 export const triageViews = Object.freeze([
   'needs-review',
@@ -182,14 +186,136 @@ export async function listTriageQueue({
   };
 }
 
+function safeListingUrl(value) {
+  const raw = normalizeText(value, 2000);
+  if (!raw) return '';
+  try {
+    const parsed = new URL(raw);
+    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : '';
+  } catch {
+    return '';
+  }
+}
+
+function directCrmFactRows(submission = {}) {
+  if (!submission || typeof submission !== 'object') return [];
+  const dealHunter = submission.metadata?.dealHunter && typeof submission.metadata.dealHunter === 'object'
+    ? submission.metadata.dealHunter
+    : {};
+  const fields = [
+    ['seller_name', ['seller_name', 'sellerName']],
+    ['seller_email', ['seller_email', 'sellerEmail']],
+    ['seller_phone', ['seller_phone', 'sellerPhone']],
+    ['broker_name', ['broker_name', 'brokerName']],
+    ['broker_company', ['broker_company', 'brokerCompany']],
+    ['broker_email', ['broker_email', 'brokerEmail']],
+    ['broker_phone', ['broker_phone', 'brokerPhone']],
+    ['reason_for_sale', ['reason_for_sale', 'reasonForSale']],
+    ['real_estate_included', ['real_estate_included', 'realEstateIncluded']],
+    ['seller_financing', ['seller_financing', 'sellerFinancing']],
+    ['management_structure', ['management_structure', 'managementStructure']],
+    ['customer_concentration', ['customer_concentration', 'customerConcentration']],
+    ['operator_contact_notes', ['operator_contact_notes', 'operatorContactNotes']],
+  ];
+  return fields.flatMap(([field, keys]) => {
+    const value = keys.map((key) => submission[key] ?? dealHunter[key]).find((item) => normalizeText(item, 4000));
+    return value === undefined ? [] : [{ field, value }];
+  });
+}
+
+function projectSourceObservations(rows = []) {
+  const all = rows.slice(0, 500).map((row) => ({
+    sourceId: row.source_id || '', sourceName: row.source_name || '', sourceRecordId: row.source_record_id || '',
+    field: row.field || '', value: row.value, observedAt: row.observed_at || '', updatedAt: row.updated_at || '',
+  }));
+  const valuesByField = new Map();
+  for (const row of all) {
+    const key = row.field;
+    const values = valuesByField.get(key) || [];
+    values.push(row);
+    valuesByField.set(key, values);
+  }
+  const conflicts = [...valuesByField.entries()].flatMap(([field, values]) => {
+    const distinct = new Set(values.map((item) => normalizeText(item.value, 5000)));
+    return distinct.size > 1 ? [{ field, observations: values.map(({ sourceId, sourceName, sourceRecordId, value, observedAt }) => ({ sourceId, sourceName, sourceRecordId, value, observedAt })) }] : [];
+  });
+  const groups = new Map();
+  for (const row of all) {
+    const key = [row.sourceId, row.sourceRecordId].join('\u0000');
+    const group = groups.get(key) || {
+      sourceId: row.sourceId, sourceName: row.sourceName, sourceRecordId: row.sourceRecordId,
+      observedAt: row.observedAt, values: {}, conflicts: [],
+    };
+    group.values[row.field] = row.value;
+    if (Date.parse(row.observedAt || '') > Date.parse(group.observedAt || '')) group.observedAt = row.observedAt;
+    groups.set(key, group);
+  }
+  for (const group of groups.values()) {
+    group.conflicts = conflicts.filter((conflict) => conflict.observations.some((item) => (
+      item.sourceId === group.sourceId && item.sourceRecordId === group.sourceRecordId
+    )));
+  }
+  return { sourceObservations: [...groups.values()].slice(0, 100), conflicts };
+}
+
+function criticalMissingFields({ effectiveFacts, sourceRows, summary, listingUrls }) {
+  const sourceValues = new Map();
+  for (const row of sourceRows) {
+    if (normalizeText(row.value, 5000)) sourceValues.set(row.field, row.value);
+  }
+  const financials = summary.financials || {};
+  const present = (field, alternatives = []) => {
+    if (effectiveFacts[field]?.value) return true;
+    if (sourceValues.get(field)) return true;
+    return alternatives.some((key) => financials[key] !== null && financials[key] !== undefined && financials[key] !== '');
+  };
+  const fields = [
+    ['seller_name'], ['seller_email'], ['seller_phone'], ['broker_name'], ['broker_email'], ['broker_phone'],
+    ['annual_profit', ['annualProfit']], ['annual_revenue', ['annualRevenue']], ['asking_price', ['askingPrice']],
+    ['customer_concentration'], ['management_structure'], ['reason_for_sale'], ['real_estate_included'], ['seller_financing'],
+  ];
+  const missing = fields.filter(([field, alternatives]) => !present(field, alternatives)).map(([field]) => field);
+  if (listingUrls.length === 0) missing.push('listing_url');
+  return missing;
+}
+
+function projectScore(score, byDimension, unattributed) {
+  return {
+    fitScore: Number(score.fit_score || 0),
+    scoreStatus: score.score_status || 'provisional',
+    confidence: score.confidence || 'low',
+    completenessScore: Number(score.completeness_score || 0),
+    dimensions: (score.dimensions || []).map((dimension) => ({ ...dimension, evidence: byDimension.get(dimension.id) || [] })),
+    unattributedEvidence: unattributed,
+    appliedCaps: score.applied_caps || [], gates: score.gates || [], confidenceReasons: score.confidence_reasons || [],
+    missingEvidence: score.missing_evidence || [], summary: score.summary || {},
+  };
+}
+
+function projectCrmSubmission(submission) {
+  if (!submission) return null;
+  return {
+    id: submission.id || '', status: submission.status || '', company: submission.company || '',
+    sellerName: submission.seller_name || submission.sellerName || '', sellerEmail: submission.seller_email || submission.sellerEmail || '',
+    brokerName: submission.broker_name || submission.brokerName || submission.metadata?.dealHunter?.brokerName || '',
+    brokerEmail: submission.broker_email || submission.brokerEmail || submission.metadata?.dealHunter?.brokerEmail || '',
+    updatedAt: submission.updated_at || '',
+  };
+}
+
 export async function getTriageOpportunityDetail({ opportunityId = '', storage = getStorage() } = {}) {
   const id = normalizeText(opportunityId, 200);
   if (!id) return { ok: false, status: 400, error: 'A canonical opportunity id is required.' };
-  if (typeof storage.getCurrentDealHunterOpportunityScore !== 'function') {
+  if (
+    typeof storage.getCurrentDealHunterOpportunityScore !== 'function'
+    || typeof storage.getCurrentDealHunterOpportunity !== 'function'
+  ) {
     return { ok: false, status: 503, error: 'Opportunity scoring storage is unavailable.' };
   }
-  const score = await storage.getCurrentDealHunterOpportunityScore(id);
-  if (!score) return { ok: false, status: 404, error: 'No score has been recorded for this opportunity.' };
+  const [currentOpportunity, score] = await Promise.all([
+    storage.getCurrentDealHunterOpportunity(id), storage.getCurrentDealHunterOpportunityScore(id),
+  ]);
+  if (!currentOpportunity || !score) return { ok: false, status: 404, error: 'No current score has been recorded for this opportunity.' };
   const evidence = await storage.listDealHunterScoreEvidence?.(id, { limit: 500 }) || [];
 
   // Evidence is grouped by dimension so an operator sees why a dimension landed
@@ -220,21 +346,66 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
     byDimension.set(row.dimension, rows);
   }
 
-  const summary = publicTriageRow(score, { includeOperatorNote: true });
+  const [operatorFacts, sourceRows, submission, cimRequests, activities, dispositions, crmCommunications] = await Promise.all([
+    storage.listDealHunterOpportunityFacts?.(id) || [],
+    storage.listDealHunterOpportunitySourceObservations?.(id) || [],
+    currentOpportunity.primary_submission_id && storage.getSubmission
+      ? storage.getSubmission(currentOpportunity.primary_submission_id)
+      : null,
+    storage.listDealHunterCimRequests?.({ opportunityIds: [id], limit: 100 }) || [],
+    currentOpportunity.primary_submission_id && storage.listCrmActivityEvents
+      ? storage.listCrmActivityEvents({ submissionId: currentOpportunity.primary_submission_id, limit: 100 })
+      : [],
+    storage.listDealHunterDispositions?.({ dealKeys: [score.deal_key], limit: 20 }) || [],
+    currentOpportunity.primary_submission_id && storage.listCrmCommunications
+      ? storage.listCrmCommunications({ submissionId: currentOpportunity.primary_submission_id, page: 1, pageSize: 100 })
+      : { rows: [] },
+  ]);
+  const sourceFacts = sourceRows.filter((row) => opportunityFactFields.includes(row.field));
+  const effectiveFacts = getEffectiveOpportunityFacts({
+    opportunityId: id,
+    operatorFacts,
+    crmFacts: directCrmFactRows(submission),
+    sourceFacts,
+  });
+  const { sourceObservations } = projectSourceObservations(sourceRows);
+  const listingUrls = [...new Set([
+    safeListingUrl(score.listing_url),
+    ...sourceRows
+      .filter((row) => ['listing_url', 'prospectus_url', 'business_website'].includes(row.field))
+      .map((row) => safeListingUrl(row.value)),
+  ].filter(Boolean))];
+  const opportunity = publicTriageRow(score, { includeOperatorNote: true });
+  const projectedScore = projectScore(score, byDimension, unattributed);
+  const communications = (crmCommunications?.rows || []).slice(0, 100).map((communication) => ({
+    id: communication.id || '', direction: communication.direction || '', channel: communication.channel || '',
+    kind: communication.kind || '', occurredAt: communication.occurred_at || '', deliveryState: communication.delivery_state || '',
+    cimRequestId: communication.cim_request_id || '',
+  }));
   return {
     ok: true,
     status: 200,
-    opportunity: summary,
-    dimensions: (score.dimensions || []).map((dimension) => ({
-      ...dimension,
-      evidence: byDimension.get(dimension.id) || [],
-    })),
-    unattributedEvidence: unattributed,
-    appliedCaps: score.applied_caps || [],
-    gates: score.gates || [],
-    confidenceReasons: score.confidence_reasons || [],
-    missingEvidence: score.missing_evidence || [],
-    summary: score.summary || {},
+    opportunity,
+    effectiveFacts,
+    operatorFacts: operatorFacts.slice(0, 100),
+    sourceObservations,
+    missingCriticalFields: criticalMissingFields({ effectiveFacts, sourceRows, summary: opportunity, listingUrls }),
+    listingUrls,
+    score: projectedScore,
+    cimSummary: {
+      requests: cimRequests.slice(0, 100),
+      communications: communications.filter((communication) => communication.cimRequestId),
+    },
+    crmSummary: { submission: projectCrmSubmission(submission), communications },
+    history: {
+      activities: activities.slice(0, 100),
+      dispositions: dispositions.slice(0, 20),
+      operatorFacts: operatorFacts.slice(0, 100),
+      operatorState: {
+        priority: opportunity.operatorPriority, note: opportunity.operatorNote,
+        reviewed: opportunity.reviewed, reviewedAt: opportunity.reviewedAt, reviewedBy: opportunity.reviewedBy,
+      },
+    },
   };
 }
 
