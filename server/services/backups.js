@@ -10,9 +10,12 @@ import { resolveSecureStoragePath } from './documentVault.js';
 const manifestFileName = 'manifest.json';
 const databaseFileName = 'database.sqlite';
 const activeMarkerFileName = '.active.json';
-const backupVersion = 1;
+const legacyBackupVersion = 1;
+const backupVersion = 2;
+const supportedBackupVersions = new Set([legacyBackupVersion, backupVersion]);
 const backupJobName = 'sqlite-application-backup';
 const abandonedBundleGraceMs = 24 * 60 * 60 * 1000;
+const sqliteSidecarSuffixes = ['-wal', '-shm', '-journal'];
 const activeBackupPaths = new Set();
 
 function isObject(value) {
@@ -39,7 +42,7 @@ function validateBackupManifest(manifest) {
   const errors = [];
   if (!isObject(manifest)) return ['Backup manifest must be a JSON object.'];
 
-  if (manifest.version !== backupVersion) errors.push(`Unsupported manifest version ${manifest.version}.`);
+  if (!supportedBackupVersions.has(manifest.version)) errors.push(`Unsupported manifest version ${manifest.version}.`);
   if (!isNonEmptyString(manifest.id)) errors.push('Backup manifest id is required.');
   if (!isValidDate(manifest.createdAt)) errors.push('Backup manifest createdAt must be a valid timestamp.');
   if (manifest.provider !== 'sqlite') errors.push('Backup manifest provider must be sqlite.');
@@ -159,8 +162,182 @@ function openBackupDatabase(databasePath, options = {}) {
   return new Database(databasePath, { readonly: options.readonly !== false, fileMustExist: true });
 }
 
-function readSecureDocumentRows(databasePath) {
-  const database = openBackupDatabase(databasePath);
+function sqliteFileIdentityMatches(before, after) {
+  return ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs']
+    .every((field) => before[field] === after[field]);
+}
+
+function sha256Bytes(bytes) {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
+async function existingSqliteSidecars(databasePath) {
+  const present = [];
+  for (const suffix of sqliteSidecarSuffixes) {
+    try {
+      await fs.lstat(`${databasePath}${suffix}`);
+      present.push(suffix);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  return present;
+}
+
+function assertNoSqliteSidecars(sidecars) {
+  if (sidecars.length > 0) {
+    throw new Error(`Database snapshot has unverified SQLite sidecars: ${sidecars.join(', ')}.`);
+  }
+}
+
+function sqliteHeaderVersions(snapshotBytes) {
+  if (snapshotBytes.length < 20 || snapshotBytes.subarray(0, 16).toString('utf8') !== 'SQLite format 3\u0000') {
+    throw new Error('Database snapshot is not a SQLite 3 database.');
+  }
+  const writeVersion = snapshotBytes[18];
+  const readVersion = snapshotBytes[19];
+  if (!((writeVersion === 1 && readVersion === 1) || (writeVersion === 2 && readVersion === 2))) {
+    throw new Error(`Database snapshot has invalid SQLite journal header bytes ${writeVersion}/${readVersion}.`);
+  }
+  return { writeVersion, readVersion };
+}
+
+async function readStableSqliteSnapshot(databasePath, {
+  expectedSizeBytes = null,
+  expectedSha256 = '',
+  allowLegacySidecars = false,
+} = {}) {
+  const sidecarsBefore = await existingSqliteSidecars(databasePath);
+  if (!allowLegacySidecars) assertNoSqliteSidecars(sidecarsBefore);
+  const before = await fs.lstat(databasePath, { bigint: true });
+  if (!before.isFile()) throw new Error('Database snapshot is not a regular file.');
+  if (expectedSizeBytes !== null && before.size !== BigInt(expectedSizeBytes)) {
+    throw new Error('Database snapshot size does not match the manifest.');
+  }
+
+  const snapshotBytes = await fs.readFile(databasePath);
+  const [after, sidecarsAfter] = await Promise.all([
+    fs.lstat(databasePath, { bigint: true }),
+    existingSqliteSidecars(databasePath),
+  ]);
+  if (!allowLegacySidecars) assertNoSqliteSidecars(sidecarsAfter);
+  if (sidecarsBefore.join('\u0000') !== sidecarsAfter.join('\u0000')) {
+    throw new Error('Database snapshot sidecars changed while loading immutable verification bytes.');
+  }
+  if (!sqliteFileIdentityMatches(before, after) || snapshotBytes.length !== Number(after.size)) {
+    throw new Error('Database snapshot changed while loading immutable verification bytes.');
+  }
+  const snapshotSha256 = sha256Bytes(snapshotBytes);
+  if (expectedSha256 && snapshotSha256 !== expectedSha256) {
+    throw new Error('Database snapshot checksum does not match the manifest.');
+  }
+  const header = sqliteHeaderVersions(snapshotBytes);
+  return {
+    bytes: snapshotBytes,
+    sha256: snapshotSha256,
+    sizeBytes: snapshotBytes.length,
+    sidecars: sidecarsAfter,
+    ...header,
+  };
+}
+
+function openQueryOnlySnapshotDatabase(snapshotBytes, { allowLegacyWalHeader = false } = {}) {
+  const { writeVersion, readVersion } = sqliteHeaderVersions(snapshotBytes);
+  if (writeVersion !== 1 || readVersion !== 1) {
+    if (!allowLegacyWalHeader) {
+      throw new Error(`Current-format database snapshot must persist SQLite rollback header bytes 1/1; found ${writeVersion}/${readVersion}.`);
+    }
+  }
+
+  const inspectionBytes = Buffer.from(snapshotBytes);
+  if (writeVersion === 2 && readVersion === 2) {
+    inspectionBytes[18] = 1;
+    inspectionBytes[19] = 1;
+  }
+  const database = new Database(inspectionBytes);
+  try {
+    database.pragma('query_only = ON');
+    if (Number(database.pragma('query_only', { simple: true })) !== 1) {
+      throw new Error('Database snapshot could not be restricted to query-only inspection.');
+    }
+    return database;
+  } catch (error) {
+    database.close();
+    throw error;
+  }
+}
+
+async function openImmutableBackupDatabase(databasePath, {
+  expectedSizeBytes = null,
+  expectedSha256 = '',
+  allowLegacyWalHeader = false,
+  allowLegacySidecars = false,
+} = {}) {
+  const snapshot = await readStableSqliteSnapshot(databasePath, {
+    expectedSizeBytes,
+    expectedSha256,
+    allowLegacySidecars,
+  });
+  const database = openQueryOnlySnapshotDatabase(snapshot.bytes, { allowLegacyWalHeader });
+  return { database, snapshot };
+}
+
+function assertSnapshotQuickCheck(database) {
+  const integrity = String(database.pragma('quick_check', { simple: true }) || '');
+  if (integrity !== 'ok') throw new Error(`SQLite integrity verification failed: ${integrity}`);
+}
+
+async function secureAtomicReplace(filePath, bytes) {
+  const temporaryPath = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${randomUUID()}.tmp`,
+  );
+  let handle = null;
+  try {
+    handle = await fs.open(temporaryPath, 'wx', 0o600);
+    await handle.writeFile(bytes);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.chmod(temporaryPath, 0o600);
+    await fs.rename(temporaryPath, filePath);
+    await fs.chmod(filePath, 0o600);
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+  }
+}
+
+async function normalizeCreatedBackupDatabase(databasePath) {
+  const created = await readStableSqliteSnapshot(databasePath);
+  const normalizedBytes = Buffer.from(created.bytes);
+  if (created.writeVersion === 2 && created.readVersion === 2) {
+    normalizedBytes[18] = 1;
+    normalizedBytes[19] = 1;
+  }
+
+  const normalizedDatabase = openQueryOnlySnapshotDatabase(normalizedBytes);
+  try {
+    assertSnapshotQuickCheck(normalizedDatabase);
+  } finally {
+    normalizedDatabase.close();
+  }
+
+  if (created.writeVersion !== 1 || created.readVersion !== 1) {
+    await secureAtomicReplace(databasePath, normalizedBytes);
+  }
+  const persisted = await readStableSqliteSnapshot(databasePath, {
+    expectedSizeBytes: normalizedBytes.length,
+    expectedSha256: sha256Bytes(normalizedBytes),
+  });
+  if (persisted.writeVersion !== 1 || persisted.readVersion !== 1) {
+    throw new Error('Normalized database snapshot did not persist SQLite rollback header bytes 1/1.');
+  }
+  return persisted;
+}
+
+async function readSecureDocumentRows(databasePath) {
+  const { database } = await openImmutableBackupDatabase(databasePath);
   try {
     return readSecureDocumentRowsFromDatabase(database);
   } finally {
@@ -211,7 +388,7 @@ function compareManifestDocumentsToDatabase(manifestDocuments, databaseRows) {
 }
 
 async function copySecureDocuments({ databasePath, documentsDirectory, destination }) {
-  const rows = readSecureDocumentRows(databasePath);
+  const rows = await readSecureDocumentRows(databasePath);
   const manifestDocuments = [];
 
   for (const row of rows) {
@@ -281,7 +458,9 @@ async function inspectBackupDirectory(config) {
     bundles.push({
       path: bundlePath,
       manifest: verification.manifest,
-      state: verification.ok ? 'valid' : 'invalid',
+      state: verification.classification === 'legacy'
+        ? 'legacy'
+        : verification.ok ? 'valid' : 'invalid',
       errors: verification.errors,
       createdAt: Date.parse(verification.manifest?.createdAt || '') || modifiedAt,
       modifiedAt,
@@ -333,7 +512,7 @@ export async function createBackupBundle({ storage = getStorage(), config = getC
     const databasePath = path.join(workingPath, databaseFileName);
     await storage.createApplicationBackup(databasePath);
     await fs.chmod(databasePath, 0o600);
-    const databaseStat = await fs.stat(databasePath);
+    const persistedDatabase = await normalizeCreatedBackupDatabase(databasePath);
     const documents = await copySecureDocuments({
       databasePath,
       documentsDirectory: config.secureDocuments.storageDir,
@@ -346,8 +525,8 @@ export async function createBackupBundle({ storage = getStorage(), config = getC
       provider: 'sqlite',
       database: {
         relativePath: databaseFileName,
-        sizeBytes: databaseStat.size,
-        sha256: await sha256File(databasePath),
+        sizeBytes: persistedDatabase.sizeBytes,
+        sha256: persistedDatabase.sha256,
       },
       secureDocuments: {
         count: documents.length,
@@ -389,31 +568,50 @@ export async function verifyBackupBundle(bundlePath) {
   } catch (error) {
     return {
       ok: false,
+      current: false,
+      legacy: false,
+      classification: 'invalid',
       errors: [`Backup manifest could not be loaded: ${error.message}`],
       manifest: null,
       path: resolvedBundle,
     };
   }
   const errors = validateBackupManifest(manifest);
-  if (errors.length > 0) return { ok: false, errors, manifest, path: resolvedBundle };
+  if (errors.length > 0) {
+    return {
+      ok: false,
+      current: false,
+      legacy: false,
+      classification: 'invalid',
+      errors,
+      manifest,
+      path: resolvedBundle,
+    };
+  }
+  const isLegacy = manifest.version === legacyBackupVersion;
+  const legacyReasons = [];
 
   const databasePath = path.resolve(resolvedBundle, manifest.database.relativePath);
   if (!databasePath.startsWith(`${resolvedBundle}${path.sep}`)) {
     errors.push('Database snapshot resolves outside the backup bundle.');
   } else {
     try {
-      const stat = await fs.stat(databasePath);
-      if (stat.size !== manifest.database.sizeBytes) errors.push('Database snapshot size does not match the manifest.');
-      if (await sha256File(databasePath) !== manifest.database.sha256) errors.push('Database snapshot checksum does not match the manifest.');
-      const database = openBackupDatabase(databasePath);
+      const { database, snapshot } = await openImmutableBackupDatabase(databasePath, {
+        expectedSizeBytes: manifest.database.sizeBytes,
+        expectedSha256: manifest.database.sha256,
+        allowLegacyWalHeader: isLegacy,
+        allowLegacySidecars: isLegacy,
+      });
       try {
-        const integrity = String(database.pragma('quick_check', { simple: true }) || '');
-        if (integrity !== 'ok') errors.push(`SQLite integrity verification failed: ${integrity}`);
+        assertSnapshotQuickCheck(database);
         const documentRows = readSecureDocumentRowsFromDatabase(database);
         if (documentRows.length !== manifest.secureDocuments.count) errors.push('Secure-document row count does not match the manifest.');
         errors.push(...compareManifestDocumentsToDatabase(manifest.secureDocuments.files, documentRows));
       } finally {
         database.close();
+      }
+      if (isLegacy && snapshot.sidecars.length > 0) {
+        legacyReasons.push(`Legacy backup contains unverified SQLite sidecars: ${snapshot.sidecars.join(', ')}.`);
       }
     } catch (error) {
       errors.push(`Database snapshot could not be verified: ${error.message}`);
@@ -435,7 +633,40 @@ export async function verifyBackupBundle(bundlePath) {
     }
   }
 
-  return { ok: errors.length === 0, errors, manifest, path: resolvedBundle };
+  if (errors.length > 0) {
+    return {
+      ok: false,
+      current: false,
+      legacy: false,
+      classification: 'invalid',
+      errors,
+      manifest,
+      path: resolvedBundle,
+    };
+  }
+  if (isLegacy) {
+    return {
+      ok: false,
+      current: false,
+      legacy: true,
+      classification: 'legacy',
+      errors: [
+        'Manifest version 1 is a legacy pre-invariant backup and is not eligible for current restore or repair evidence.',
+        ...legacyReasons,
+      ],
+      manifest,
+      path: resolvedBundle,
+    };
+  }
+  return {
+    ok: true,
+    current: true,
+    legacy: false,
+    classification: 'current',
+    errors: [],
+    manifest,
+    path: resolvedBundle,
+  };
 }
 
 export async function listBackupBundles(config = getConfig()) {
@@ -453,9 +684,15 @@ export async function listBackupBundles(config = getConfig()) {
 export async function getBackupStatus(config = getConfig()) {
   const inspected = await inspectBackupDirectory(config);
   const valid = inspected.filter((bundle) => bundle.state === 'valid');
+  const legacy = inspected.filter((bundle) => bundle.state === 'legacy');
   const invalid = inspected.filter((bundle) => bundle.state === 'invalid');
   const incomplete = inspected.filter((bundle) => bundle.state === 'incomplete');
-  const bundleCounts = { valid: valid.length, invalid: invalid.length, incomplete: incomplete.length };
+  const bundleCounts = {
+    valid: valid.length,
+    legacy: legacy.length,
+    invalid: invalid.length,
+    incomplete: incomplete.length,
+  };
   if (!config.backup.enabled) {
     return { status: 'disabled', message: 'Automated application backups are disabled.', latest: null, bundleCounts };
   }
@@ -479,6 +716,15 @@ export async function getBackupStatus(config = getConfig()) {
         bundleCounts,
       };
     }
+    if (legacy.length > 0) {
+      return {
+        status: 'legacy',
+        message: 'Historical pre-invariant backup bundles are preserved, but no current fully verified application backup is available.',
+        latest: null,
+        bundleCounts,
+        verificationErrors: legacy.flatMap((bundle) => bundle.errors).slice(0, 20),
+      };
+    }
     return { status: 'missing', message: 'No successful application backup is recorded yet.', latest: null, bundleCounts };
   }
   const latestSummary = {
@@ -489,8 +735,9 @@ export async function getBackupStatus(config = getConfig()) {
   };
   const ageMs = Date.now() - Date.parse(latest.manifest.createdAt || '');
   const stale = !Number.isFinite(ageMs) || ageMs > 36 * 60 * 60 * 1000;
-  if (invalid.length > 0 || incomplete.length > 0) {
+  if (legacy.length > 0 || invalid.length > 0 || incomplete.length > 0) {
     const issueSummary = [
+      legacy.length > 0 ? `${legacy.length} legacy` : '',
       invalid.length > 0 ? `${invalid.length} invalid` : '',
       incomplete.length > 0 ? `${incomplete.length} incomplete` : '',
     ].filter(Boolean).join(' and ');

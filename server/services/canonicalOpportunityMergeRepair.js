@@ -1,7 +1,9 @@
+import path from 'node:path';
 import {
   CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION,
   getCanonicalOpportunityMergeApproval,
 } from '../repairs/canonicalOpportunityMerge.js';
+import { verifyBackupBundle } from './backups.js';
 
 function normalizedText(value, limit) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, limit);
@@ -11,16 +13,19 @@ function validDate(value) {
   return typeof value === 'string' && Number.isFinite(Date.parse(value));
 }
 
-function verifiedBackupSummary(verification) {
+function verifiedBackupSummary(verification, requestedBundlePath) {
   const manifest = verification?.manifest;
   const database = manifest?.database;
   const verificationMetadata = manifest?.verification;
   const valid = verification?.ok === true
+    && verification?.current === true
+    && verification?.legacy === false
+    && verification?.classification === 'current'
     && Array.isArray(verification.errors)
     && verification.errors.length === 0
     && typeof verification.path === 'string'
-    && verification.path.trim()
-    && manifest?.version === 1
+    && verification.path === requestedBundlePath
+    && manifest?.version === 2
     && manifest?.provider === 'sqlite'
     && typeof manifest.id === 'string'
     && manifest.id.trim()
@@ -34,7 +39,16 @@ function verifiedBackupSummary(verification) {
     && Date.parse(verificationMetadata.verifiedAt) >= Date.parse(manifest.createdAt)
     && verificationMetadata?.databaseCheck === 'quick_check'
     && verificationMetadata?.checksum === 'sha256';
-  if (!valid) throw new Error('Apply refused: verified SQLite backup evidence is required.');
+  if (!valid) {
+    const details = [];
+    if (verification?.path !== requestedBundlePath) {
+      details.push('verified bundle path does not match the requested backup path');
+    }
+    if (Array.isArray(verification?.errors)) details.push(...verification.errors.slice(0, 3));
+    throw new Error(
+      `Apply refused: verified SQLite backup evidence is required${details.length ? `: ${details.join('; ')}` : '.'}`,
+    );
+  }
   return {
     path: verification.path,
     manifestId: manifest.id,
@@ -60,7 +74,7 @@ export async function runCanonicalOpportunityMergeRepair({
   reason = '',
   confirmation = '',
   expectedPlanChecksum = '',
-  backupVerification = null,
+  backupPath = '',
   storage = null,
   now = new Date(),
 } = {}) {
@@ -85,7 +99,12 @@ export async function runCanonicalOpportunityMergeRepair({
     if (!/^[a-f0-9]{64}$/.test(String(expectedPlanChecksum || ''))) {
       throw new Error('Apply refused: an exact 64-character dry-run plan checksum is required.');
     }
-    const backupEvidence = verifiedBackupSummary(backupVerification);
+    if (typeof backupPath !== 'string' || !backupPath.trim()) {
+      throw new Error('Apply refused: verified SQLite backup evidence is required.');
+    }
+    const requestedBundlePath = path.resolve(backupPath);
+    const backupVerification = await verifyBackupBundle(requestedBundlePath);
+    const backupEvidence = verifiedBackupSummary(backupVerification, requestedBundlePath);
     const pause = await storage.getDealHunterCimSafetySettings?.();
     if (!pause?.outreach_paused) {
       throw new Error('Apply refused: global Deal Hunter CIM outreach must already be paused.');

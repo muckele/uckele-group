@@ -158,7 +158,7 @@ Independently verify the resulting bundle and retain its absolute bundle path:
 npm run backup:verify -- --bundle '<absolute-backup-bundle-path>'
 ```
 
-The apply command runs `verifyBackupBundle` again and passes its complete verification result into the repair service. A boolean, a database filename, an unverified copy, a non-SQLite manifest, or a malformed/stale evidence object is not accepted backup evidence.
+The apply command resolves the exact bundle path, runs `verifyBackupBundle` before opening writable production storage, and passes that same resolved path into the repair service. The service deliberately runs the production `verifyBackupBundle` implementation again against that exact path and derives every database path, size, SHA-256, timestamp, provider, and manifest-version field from its own fresh result. Caller-supplied verification booleans or manifest metadata are not backup authority.
 
 The service then re-hashes the verified database snapshot, refuses any unverified SQLite WAL/SHM/rollback-journal sidecar, loads a private in-memory/query-only image without creating or changing bundle files, runs SQLite `quick_check`, reconstructs the exact reviewed pre-merge plan, and requires the snapshot to contain the same active outreach-pause epoch as the live database. The bundle creation time must not predate that pause. A valid but unrelated, older, swapped, unpaused, or plan-mismatched backup is refused.
 

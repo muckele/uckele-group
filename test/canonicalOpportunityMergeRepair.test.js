@@ -25,6 +25,7 @@ import {
   createSqliteCanonicalOpportunityMergeReadOnlyStorage,
   createSqliteStorage,
 } from '../server/storage/sqlite.js';
+import { createBackupBundle, verifyBackupBundle } from '../server/services/backups.js';
 import {
   parseCanonicalOpportunityMergeArgs,
   runCanonicalOpportunityMergeCli,
@@ -124,6 +125,7 @@ function repairStorage(t) {
   repairStoragePaths.set(storage, {
     sqlitePath,
     backupPath: path.join(directory, 'approved-pre-merge-backup.sqlite'),
+    bundlePath: '',
   });
   return { storage, sqlitePath };
 }
@@ -199,7 +201,12 @@ async function seedApprovedRepair(storage) {
     metadata: { fixture: true },
   });
   const paths = repairStoragePaths.get(storage);
-  if (paths) await storage.createApplicationBackup(paths.backupPath);
+  if (paths) {
+    await storage.createApplicationBackup(paths.backupPath);
+    await createCurrentCanonicalBackupBundle(storage, {
+      now: new Date('2026-08-26T19:30:00.000Z'),
+    });
+  }
   return approval;
 }
 
@@ -228,10 +235,13 @@ function repairInput(overrides = {}) {
 function verifiedBackupEvidence(overrides = {}) {
   return {
     ok: true,
+    current: true,
+    legacy: false,
+    classification: 'current',
     errors: [],
     path: '/synthetic/verified-backup',
     manifest: {
-      version: 1,
+      version: 2,
       provider: 'sqlite',
       id: 'synthetic-backup-2026-08-26',
       createdAt: '2026-08-26T19:30:00.000Z',
@@ -252,6 +262,186 @@ function verifiedBackupEvidence(overrides = {}) {
   };
 }
 
+function rawWalMainWithoutCommittedWalState(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-canonical-merge-forged-backup-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const sourcePath = path.join(root, 'source.sqlite');
+  const rawBundlePath = path.join(root, 'raw-main-only');
+  const rawDatabasePath = path.join(rawBundlePath, 'database.sqlite');
+  fs.mkdirSync(rawBundlePath);
+
+  const source = new Database(sourcePath);
+  try {
+    assert.equal(source.pragma('journal_mode = WAL', { simple: true }), 'wal');
+    source.exec(`
+      CREATE TABLE provenance_probe (
+        id INTEGER PRIMARY KEY,
+        state TEXT NOT NULL
+      );
+      INSERT INTO provenance_probe (id, state) VALUES (1, 'checkpointed-baseline');
+    `);
+    source.pragma('wal_checkpoint(TRUNCATE)');
+    source.pragma('wal_autocheckpoint = 0');
+    source.prepare('INSERT INTO provenance_probe (id, state) VALUES (?, ?)')
+      .run(2, 'committed-only-in-wal');
+    assert.deepEqual(
+      source.prepare('SELECT id, state FROM provenance_probe ORDER BY id').all(),
+      [
+        { id: 1, state: 'checkpointed-baseline' },
+        { id: 2, state: 'committed-only-in-wal' },
+      ],
+    );
+    assert.equal(fs.existsSync(`${sourcePath}-wal`), true);
+    fs.copyFileSync(sourcePath, rawDatabasePath);
+  } finally {
+    source.close();
+  }
+
+  const rawBytes = fs.readFileSync(rawDatabasePath);
+  assert.deepEqual([...rawBytes.subarray(18, 20)], [2, 2]);
+  const inspectableBytes = Buffer.from(rawBytes);
+  inspectableBytes[18] = 1;
+  inspectableBytes[19] = 1;
+  const rawMain = new Database(inspectableBytes);
+  try {
+    assert.deepEqual(
+      rawMain.prepare('SELECT id, state FROM provenance_probe ORDER BY id').all(),
+      [{ id: 1, state: 'checkpointed-baseline' }],
+      'the copied raw main file must omit the later committed WAL state',
+    );
+  } finally {
+    rawMain.close();
+  }
+
+  return { rawBundlePath, rawDatabasePath, rawBytes };
+}
+
+function forgedCurrentV2Claim(bundlePath, {
+  databaseRelativePath = 'database.sqlite',
+  databaseSizeBytes = null,
+  databaseSha256 = '',
+} = {}) {
+  const databasePath = path.join(bundlePath, databaseRelativePath);
+  const databaseBytes = fs.existsSync(databasePath) ? fs.readFileSync(databasePath) : Buffer.alloc(0);
+  const base = verifiedBackupEvidence();
+  return {
+    ...base,
+    path: bundlePath,
+    manifest: {
+      ...base.manifest,
+      version: 2,
+      provider: 'sqlite',
+      createdAt: fixtureNowIso,
+      database: {
+        ...base.manifest.database,
+        relativePath: databaseRelativePath,
+        sizeBytes: databaseSizeBytes ?? databaseBytes.length,
+        sha256: databaseSha256 || createHash('sha256').update(databaseBytes).digest('hex'),
+      },
+      verification: {
+        ...base.manifest.verification,
+        verifiedAt: fixtureNowIso,
+      },
+    },
+  };
+}
+
+function nonMutatingProvenanceBoundary() {
+  const calls = { pause: 0, strictReconstruction: 0, mutation: 0 };
+  return {
+    calls,
+    storage: {
+      provider: 'sqlite',
+      inspectDealHunterCanonicalOpportunityMerge: async () => ({}),
+      getDealHunterCimSafetySettings: async () => {
+        calls.pause += 1;
+        return { outreach_paused: true, updated_at: fixtureNowIso };
+      },
+      verifyDealHunterCanonicalOpportunityMergeBackupPlan: async ({ expectedPlanChecksum }) => {
+        calls.strictReconstruction += 1;
+        return { planChecksum: expectedPlanChecksum, pauseUpdatedAt: fixtureNowIso };
+      },
+      applyDealHunterCanonicalOpportunityMerge: async () => {
+        calls.mutation += 1;
+        return { ok: true, mode: 'apply', applied: true };
+      },
+    },
+  };
+}
+
+async function assertForgedEvidenceRejectedBeforeStorageBoundary({ backupPath = '', forgedVerification }) {
+  const boundary = nonMutatingProvenanceBoundary();
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(repairInput({
+      storage: boundary.storage,
+      apply: true,
+      confirmation: CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION,
+      expectedPlanChecksum: 'a'.repeat(64),
+      backupPath,
+      backupVerification: forgedVerification,
+    })),
+    /verified SQLite backup evidence is required/i,
+  );
+  assert.deepEqual(boundary.calls, { pause: 0, strictReconstruction: 0, mutation: 0 });
+}
+
+function canonicalBackupConfig(root, sqlitePath) {
+  return {
+    storage: { provider: 'sqlite', sqlitePath },
+    secureDocuments: { storageDir: path.join(root, 'secure-documents') },
+    protection: { rateLimitRetentionMs: 0 },
+    backup: {
+      enabled: true,
+      directory: path.join(root, 'application-backups'),
+      retentionDays: 30,
+      retentionCount: 14,
+      time: '03:30',
+      timezone: 'America/Los_Angeles',
+      checkIntervalMs: 900000,
+    },
+  };
+}
+
+async function createCurrentCanonicalBackupBundle(storage, { now = fixtureNow } = {}) {
+  const paths = repairStoragePaths.get(storage);
+  assert.ok(paths, 'canonical backup fixtures require tracked repair storage paths');
+  const config = canonicalBackupConfig(path.dirname(paths.sqlitePath), paths.sqlitePath);
+  const backup = await createBackupBundle({ storage, config, now });
+  const verification = await verifyBackupBundle(backup.path);
+  assert.equal(verification.ok, true, verification.errors.join(' '));
+  assert.equal(verification.current, true);
+  assert.equal(verification.legacy, false);
+  assert.equal(verification.classification, 'current');
+  assert.equal(verification.manifest.version, 2);
+  assert.equal(verification.path, path.resolve(backup.path));
+  paths.bundlePath = backup.path;
+  return { backup, verification };
+}
+
+async function createLegacyCanonicalBackupBundle(storage, bundlePath) {
+  fs.mkdirSync(bundlePath, { recursive: true });
+  const databasePath = path.join(bundlePath, 'database.sqlite');
+  await storage.createApplicationBackup(databasePath);
+  const databaseBytes = fs.readFileSync(databasePath);
+  assert.deepEqual([...databaseBytes.subarray(18, 20)], [2, 2]);
+  const manifest = {
+    version: 1,
+    id: 'legacy-canonical-evidence',
+    createdAt: fixtureNowIso,
+    provider: 'sqlite',
+    database: {
+      relativePath: 'database.sqlite',
+      sizeBytes: databaseBytes.length,
+      sha256: createHash('sha256').update(databaseBytes).digest('hex'),
+    },
+    secureDocuments: { count: 0, totalBytes: 0, files: [] },
+    retention: { days: 30, count: 14 },
+    verification: { verifiedAt: fixtureNowIso, databaseCheck: 'quick_check', checksum: 'sha256' },
+  };
+  fs.writeFileSync(path.join(bundlePath, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  return { path: bundlePath, databasePath, manifest };
+}
+
 async function pauseOutreach(storage, { refreshBackup = true } = {}) {
   await storage.upsertDealHunterCimSafetySettings({
     updated_at: fixtureNowIso,
@@ -263,36 +453,18 @@ async function pauseOutreach(storage, { refreshBackup = true } = {}) {
   if (refreshBackup && paths) {
     fs.rmSync(paths.backupPath, { force: true });
     await storage.createApplicationBackup(paths.backupPath);
+    await createCurrentCanonicalBackupBundle(storage);
   }
 }
 
 function applyInput(storage, planChecksum, overrides = {}) {
   const paths = repairStoragePaths.get(storage);
-  const backupVerification = paths
-    ? verifiedBackupEvidence({
-        path: path.dirname(paths.backupPath),
-        manifest: {
-          ...verifiedBackupEvidence().manifest,
-          createdAt: fixtureNowIso,
-          database: {
-            ...verifiedBackupEvidence().manifest.database,
-            relativePath: path.basename(paths.backupPath),
-            sizeBytes: fs.statSync(paths.backupPath).size,
-            sha256: createHash('sha256').update(fs.readFileSync(paths.backupPath)).digest('hex'),
-          },
-          verification: {
-            ...verifiedBackupEvidence().manifest.verification,
-            verifiedAt: fixtureNowIso,
-          },
-        },
-      })
-    : verifiedBackupEvidence();
   return repairInput({
     storage,
     apply: true,
     confirmation: CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION,
     expectedPlanChecksum: planChecksum,
-    backupVerification,
+    backupPath: paths?.bundlePath || '',
     ...overrides,
   });
 }
@@ -758,6 +930,152 @@ test('repair service requires explicitly supplied storage and never starts the a
   );
 });
 
+test('repair service rejects forged current-v2 assertions around a raw WAL main before strict reconstruction', async (t) => {
+  const { rawBundlePath, rawDatabasePath, rawBytes } = rawWalMainWithoutCommittedWalState(t);
+  const forgedVerification = verifiedBackupEvidence({
+    path: rawBundlePath,
+    manifest: {
+      ...verifiedBackupEvidence().manifest,
+      createdAt: fixtureNowIso,
+      database: {
+        ...verifiedBackupEvidence().manifest.database,
+        relativePath: path.basename(rawDatabasePath),
+        sizeBytes: rawBytes.length,
+        sha256: createHash('sha256').update(rawBytes).digest('hex'),
+      },
+      verification: {
+        ...verifiedBackupEvidence().manifest.verification,
+        verifiedAt: fixtureNowIso,
+      },
+    },
+  });
+  let strictReconstructionCalls = 0;
+  let mutationCalls = 0;
+  const storage = {
+    provider: 'sqlite',
+    inspectDealHunterCanonicalOpportunityMerge: async () => ({}),
+    getDealHunterCimSafetySettings: async () => ({
+      outreach_paused: true,
+      updated_at: fixtureNowIso,
+    }),
+    verifyDealHunterCanonicalOpportunityMergeBackupPlan: async () => {
+      strictReconstructionCalls += 1;
+      throw new Error('forged caller assertions reached strict reconstruction');
+    },
+    applyDealHunterCanonicalOpportunityMerge: async () => {
+      mutationCalls += 1;
+      throw new Error('repair mutation must remain unreachable');
+    },
+  };
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(repairInput({
+      storage,
+      apply: true,
+      confirmation: CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION,
+      expectedPlanChecksum: 'a'.repeat(64),
+      backupPath: rawBundlePath,
+      backupVerification: forgedVerification,
+    })),
+    /verified SQLite backup evidence is required/i,
+  );
+  assert.equal(strictReconstructionCalls, 0);
+  assert.equal(mutationCalls, 0);
+});
+
+test('repair service never authorizes apply from a caller-supplied backupVerification object alone', async () => {
+  await assertForgedEvidenceRejectedBeforeStorageBoundary({
+    forgedVerification: verifiedBackupEvidence(),
+  });
+});
+
+test('repair service rejects forged current-v2 assertions around a genuine legacy v1 bundle', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  const legacyBundlePath = path.join(path.dirname(fixture.sqlitePath), 'forged-current-legacy-v1');
+  const legacy = await createLegacyCanonicalBackupBundle(fixture.storage, legacyBundlePath);
+  const ordinaryVerification = await verifyBackupBundle(legacyBundlePath);
+  const forgedVerification = forgedCurrentV2Claim(legacyBundlePath, {
+    databaseRelativePath: path.basename(legacy.databasePath),
+  });
+
+  assert.equal(ordinaryVerification.ok, false);
+  assert.equal(ordinaryVerification.current, false);
+  assert.equal(ordinaryVerification.legacy, true);
+  assert.equal(ordinaryVerification.classification, 'legacy');
+  assert.equal(ordinaryVerification.manifest.version, 1);
+  assert.equal(forgedVerification.ok, true);
+  assert.equal(forgedVerification.current, true);
+  assert.equal(forgedVerification.legacy, false);
+  assert.equal(forgedVerification.classification, 'current');
+  assert.equal(forgedVerification.manifest.version, 2);
+
+  await assertForgedEvidenceRejectedBeforeStorageBoundary({
+    backupPath: legacyBundlePath,
+    forgedVerification,
+  });
+});
+
+test('repair service rejects forged ok=true around current-v2 bundles containing WAL or SHM', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  const sourceBundlePath = repairStoragePaths.get(fixture.storage).bundlePath;
+
+  for (const { suffix, bytes } of [
+    { suffix: '-wal', bytes: Buffer.alloc(0) },
+    { suffix: '-shm', bytes: Buffer.alloc(32 * 1024) },
+  ]) {
+    await t.test(suffix, async () => {
+      const bundlePath = path.join(path.dirname(fixture.sqlitePath), `forged-sidecar-${suffix.slice(1)}`);
+      fs.cpSync(sourceBundlePath, bundlePath, { recursive: true });
+      fs.writeFileSync(path.join(bundlePath, `database.sqlite${suffix}`), bytes);
+      const ordinaryVerification = await verifyBackupBundle(bundlePath);
+      const forgedVerification = forgedCurrentV2Claim(bundlePath);
+
+      assert.equal(ordinaryVerification.ok, false);
+      assert.equal(ordinaryVerification.classification, 'invalid');
+      assert.match(ordinaryVerification.errors.join(' '), /unverified SQLite sidecars/i);
+      assert.equal(forgedVerification.ok, true);
+
+      await assertForgedEvidenceRejectedBeforeStorageBoundary({
+        backupPath: bundlePath,
+        forgedVerification,
+      });
+    });
+  }
+});
+
+test('repair service ignores a caller good-SHA claim after the real bundle database changes', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  const sourceBundlePath = repairStoragePaths.get(fixture.storage).bundlePath;
+  const bundlePath = path.join(path.dirname(fixture.sqlitePath), 'forged-good-sha-changed-database');
+  fs.cpSync(sourceBundlePath, bundlePath, { recursive: true });
+  const beforeVerification = await verifyBackupBundle(bundlePath);
+  assert.equal(beforeVerification.ok, true, beforeVerification.errors.join(' '));
+  const databasePath = path.join(bundlePath, beforeVerification.manifest.database.relativePath);
+  const forgedVerification = forgedCurrentV2Claim(bundlePath, {
+    databaseRelativePath: beforeVerification.manifest.database.relativePath,
+    databaseSizeBytes: beforeVerification.manifest.database.sizeBytes,
+    databaseSha256: beforeVerification.manifest.database.sha256,
+  });
+
+  withRawDatabase(databasePath, (database) => database.pragma('user_version = 73'));
+  const changedSha256 = createHash('sha256').update(fs.readFileSync(databasePath)).digest('hex');
+  const ordinaryVerification = await verifyBackupBundle(bundlePath);
+
+  assert.notEqual(changedSha256, forgedVerification.manifest.database.sha256);
+  assert.equal(ordinaryVerification.ok, false);
+  assert.equal(ordinaryVerification.classification, 'invalid');
+  assert.match(ordinaryVerification.errors.join(' '), /checksum does not match/i);
+  assert.equal(forgedVerification.ok, true);
+
+  await assertForgedEvidenceRejectedBeforeStorageBoundary({
+    backupPath: bundlePath,
+    forgedVerification,
+  });
+});
+
 test('operator CLI parsing is dry-run by default and requires explicit human identity fields', () => {
   const parsed = parseCanonicalOpportunityMergeArgs(cliBaseArgs);
   assert.deepEqual(parsed, {
@@ -867,7 +1185,7 @@ test('operator CLI rejects an unapproved tuple before backup verification', asyn
   assert.equal(repairCalls, 0);
 });
 
-test('operator CLI verifies apply backup evidence and passes the complete result to the repair service', async () => {
+test('operator CLI verifies apply backup evidence and passes the exact resolved path to the repair service', async () => {
   const verification = verifiedBackupEvidence();
   const calls = [];
   const result = await runCanonicalOpportunityMergeCli({
@@ -893,10 +1211,54 @@ test('operator CLI verifies apply backup evidence and passes the complete result
   assert.equal(calls[0][0], 'verify');
   assert.equal(path.isAbsolute(calls[0][1]), true);
   assert.equal(calls[1][0], 'repair');
-  assert.equal(calls[1][1].backupVerification, verification);
+  assert.equal(calls[1][1].backupPath, calls[0][1]);
+  assert.equal(Object.hasOwn(calls[1][1], 'backupVerification'), false);
   assert.equal(calls[1][1].storage.provider, 'sqlite');
   assert.equal(calls[1][1].actor, fixtureActor);
   assert.equal(calls[1][1].reason, fixtureReason);
+});
+
+test('operator CLI preverification cannot replace fresh service verification of the same exact path', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  const sourceBundlePath = repairStoragePaths.get(fixture.storage).bundlePath;
+  const bundlePath = path.join(path.dirname(fixture.sqlitePath), 'cli-then-service-reverification');
+  fs.cpSync(sourceBundlePath, bundlePath, { recursive: true });
+  const boundary = nonMutatingProvenanceBoundary();
+  let cliVerificationCalls = 0;
+  let writableStorageCalls = 0;
+  let cliVerifiedPath = '';
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeCli({
+      argv: [
+        ...cliBaseArgs,
+        '--apply',
+        '--expected-plan-checksum', 'a'.repeat(64),
+        '--backup', bundlePath,
+        '--confirm', CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION,
+      ],
+      getConfigFn: () => canonicalBackupConfig(path.dirname(fixture.sqlitePath), fixture.sqlitePath),
+      getStorageFn: () => {
+        writableStorageCalls += 1;
+        return boundary.storage;
+      },
+      verifyBackupBundleFn: async (requestedPath) => {
+        cliVerificationCalls += 1;
+        cliVerifiedPath = requestedPath;
+        const verification = await verifyBackupBundle(requestedPath);
+        assert.equal(verification.ok, true, verification.errors.join(' '));
+        fs.writeFileSync(path.join(requestedPath, 'database.sqlite-wal'), Buffer.alloc(0));
+        return verification;
+      },
+    }),
+    /verified SQLite backup evidence.*sidecars/i,
+  );
+
+  assert.equal(cliVerificationCalls, 1);
+  assert.equal(cliVerifiedPath, path.resolve(bundlePath));
+  assert.equal(writableStorageCalls, 1, 'the CLI precheck passed before the bundle changed');
+  assert.deepEqual(boundary.calls, { pause: 0, strictReconstruction: 0, mutation: 0 });
 });
 
 test('operator CLI dry run never verifies a backup and direct refusals are prefixed and nonzero', async () => {
@@ -1996,6 +2358,22 @@ test('apply refuses every missing or invalid operator safety gate', async (t) =>
   const fixture = repairStorage(t);
   await seedApprovedRepair(fixture.storage);
   const dryRun = await runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage }));
+  const paths = repairStoragePaths.get(fixture.storage);
+  const missingBundlePath = path.join(path.dirname(fixture.sqlitePath), 'missing-backup-bundle');
+  const legacyBundlePath = path.join(path.dirname(fixture.sqlitePath), 'legacy-safety-gate-bundle');
+  await createLegacyCanonicalBackupBundle(fixture.storage, legacyBundlePath);
+  const invalidProviderPath = path.join(path.dirname(fixture.sqlitePath), 'invalid-provider-bundle');
+  fs.cpSync(paths.bundlePath, invalidProviderPath, { recursive: true });
+  const invalidProviderManifestPath = path.join(invalidProviderPath, 'manifest.json');
+  const invalidProviderManifest = JSON.parse(fs.readFileSync(invalidProviderManifestPath, 'utf8'));
+  invalidProviderManifest.provider = 'supabase';
+  fs.writeFileSync(invalidProviderManifestPath, `${JSON.stringify(invalidProviderManifest, null, 2)}\n`);
+  const malformedDigestPath = path.join(path.dirname(fixture.sqlitePath), 'malformed-digest-bundle');
+  fs.cpSync(paths.bundlePath, malformedDigestPath, { recursive: true });
+  const malformedDigestManifestPath = path.join(malformedDigestPath, 'manifest.json');
+  const malformedDigestManifest = JSON.parse(fs.readFileSync(malformedDigestManifestPath, 'utf8'));
+  malformedDigestManifest.database.sha256 = 'not-a-digest';
+  fs.writeFileSync(malformedDigestManifestPath, `${JSON.stringify(malformedDigestManifest, null, 2)}\n`);
 
   await t.test('missing actor', async () => {
     await assert.rejects(
@@ -2015,39 +2393,40 @@ test('apply refuses every missing or invalid operator safety gate', async (t) =>
       /exact confirmation phrase/i,
     );
   });
-  await t.test('missing backup verification', async () => {
+  await t.test('missing backup path', async () => {
     await assert.rejects(
-      runCanonicalOpportunityMergeRepair(applyInput(fixture.storage, dryRun.planChecksum, { backupVerification: null })),
+      runCanonicalOpportunityMergeRepair(applyInput(fixture.storage, dryRun.planChecksum, { backupPath: '' })),
       /verified SQLite backup/i,
     );
   });
   await t.test('failed backup verification', async () => {
     await assert.rejects(
       runCanonicalOpportunityMergeRepair(applyInput(fixture.storage, dryRun.planChecksum, {
-        backupVerification: verifiedBackupEvidence({ ok: false, errors: ['checksum mismatch'] }),
+        backupPath: missingBundlePath,
       })),
       /verified SQLite backup/i,
     );
   });
-  await t.test('non-SQLite backup verification', async () => {
+  await t.test('legacy v1 backup cannot be apply evidence', async () => {
     await assert.rejects(
       runCanonicalOpportunityMergeRepair(applyInput(fixture.storage, dryRun.planChecksum, {
-        backupVerification: verifiedBackupEvidence({
-          manifest: { ...verifiedBackupEvidence().manifest, provider: 'supabase' },
-        }),
+        backupPath: legacyBundlePath,
       })),
       /verified SQLite backup/i,
     );
   });
-  await t.test('malformed backup digest', async () => {
+  await t.test('non-SQLite on-disk backup manifest', async () => {
     await assert.rejects(
       runCanonicalOpportunityMergeRepair(applyInput(fixture.storage, dryRun.planChecksum, {
-        backupVerification: verifiedBackupEvidence({
-          manifest: {
-            ...verifiedBackupEvidence().manifest,
-            database: { ...verifiedBackupEvidence().manifest.database, sha256: 'not-a-digest' },
-          },
-        }),
+        backupPath: invalidProviderPath,
+      })),
+      /verified SQLite backup/i,
+    );
+  });
+  await t.test('malformed on-disk backup digest', async () => {
+    await assert.rejects(
+      runCanonicalOpportunityMergeRepair(applyInput(fixture.storage, dryRun.planChecksum, {
+        backupPath: malformedDigestPath,
       })),
       /verified SQLite backup/i,
     );
@@ -2071,8 +2450,7 @@ test('apply refuses a verified SQLite backup whose pre-merge plan differs from t
   await seedApprovedRepair(fixture.storage);
   await pauseOutreach(fixture.storage);
   const dryRun = await runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage }));
-  const backupPath = repairStoragePaths.get(fixture.storage).backupPath;
-  withRawDatabase(backupPath, (database) => {
+  withRawDatabase(fixture.sqlitePath, (database) => {
     const row = database.prepare(`
       SELECT metadata FROM deal_hunter_opportunity_aliases WHERE alias_key = ?
     `).get('listing-id:costar:2542991');
@@ -2083,6 +2461,7 @@ test('apply refuses a verified SQLite backup whose pre-merge plan differs from t
       'listing-id:costar:2542991',
     );
   });
+  await createCurrentCanonicalBackupBundle(fixture.storage);
   const before = await repairState(fixture.storage);
 
   await assert.rejects(
@@ -2114,7 +2493,7 @@ test('apply rehashes the verified backup immediately before plan reconstruction'
   await pauseOutreach(fixture.storage);
   const dryRun = await runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage }));
   const input = applyInput(fixture.storage, dryRun.planChecksum);
-  const backupPath = repairStoragePaths.get(fixture.storage).backupPath;
+  const backupPath = path.join(repairStoragePaths.get(fixture.storage).bundlePath, 'database.sqlite');
   withRawDatabase(backupPath, (database) => database.pragma('user_version = 42'));
   const before = await repairState(fixture.storage);
 
@@ -2126,22 +2505,178 @@ test('apply rehashes the verified backup immediately before plan reconstruction'
   assert.deepEqual(await repairState(fixture.storage), before);
 });
 
+test('canonical merge reconstructs the reviewed plan from a sidecar-free application backup bundle', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  await pauseOutreach(fixture.storage, { refreshBackup: false });
+  const dryRun = await runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage }));
+  const before = await repairState(fixture.storage);
+  const root = path.dirname(fixture.sqlitePath);
+  const config = canonicalBackupConfig(root, fixture.sqlitePath);
+
+  const backup = await createBackupBundle({ storage: fixture.storage, config, now: fixtureNow });
+  const verification = await verifyBackupBundle(backup.path);
+
+  assert.equal(verification.ok, true, verification.errors.join(' '));
+  assert.equal(verification.current, true);
+  assert.equal(verification.classification, 'current');
+  assert.equal(verification.manifest.version, 2);
+  const databasePath = path.join(backup.path, verification.manifest.database.relativePath);
+  assert.deepEqual([...fs.readFileSync(databasePath).subarray(18, 20)], [1, 1]);
+  assert.deepEqual(
+    ['-wal', '-shm', '-journal'].filter((suffix) => fs.existsSync(`${databasePath}${suffix}`)),
+    [],
+  );
+  const calls = [];
+  let strictReconstructionInput = null;
+  let mutationInput = null;
+  const nonMutatingStorageBoundary = {
+    provider: 'sqlite',
+    inspectDealHunterCanonicalOpportunityMerge:
+      fixture.storage.inspectDealHunterCanonicalOpportunityMerge.bind(fixture.storage),
+    getDealHunterCimSafetySettings: async () => {
+      calls.push('pause');
+      return fixture.storage.getDealHunterCimSafetySettings();
+    },
+    verifyDealHunterCanonicalOpportunityMergeBackupPlan: async (input) => {
+      calls.push('strict-reconstruction');
+      strictReconstructionInput = input;
+      return fixture.storage.verifyDealHunterCanonicalOpportunityMergeBackupPlan(input);
+    },
+    applyDealHunterCanonicalOpportunityMerge: async (input) => {
+      calls.push('mutation-boundary');
+      mutationInput = input;
+      return { ok: true, mode: 'apply', applied: false, planChecksum: input.expectedPlanChecksum };
+    },
+  };
+  const reconstructed = await runCanonicalOpportunityMergeRepair(repairInput({
+    storage: nonMutatingStorageBoundary,
+    apply: true,
+    confirmation: CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION,
+    expectedPlanChecksum: dryRun.planChecksum,
+    backupPath: backup.path,
+    backupVerification: verifiedBackupEvidence({
+      path: '/forged/caller-selected-bundle',
+      manifest: {
+        ...verifiedBackupEvidence().manifest,
+        database: {
+          ...verifiedBackupEvidence().manifest.database,
+          sha256: 'f'.repeat(64),
+        },
+      },
+    }),
+  }));
+  assert.deepEqual(reconstructed, {
+    ok: true,
+    mode: 'apply',
+    applied: false,
+    planChecksum: dryRun.planChecksum,
+  });
+  assert.deepEqual(calls, ['pause', 'strict-reconstruction', 'mutation-boundary']);
+  assert.equal(strictReconstructionInput.backupEvidence.path, path.resolve(backup.path));
+  assert.equal(strictReconstructionInput.backupEvidence.path, verification.path);
+  assert.equal(
+    strictReconstructionInput.backupEvidence.databaseSha256,
+    verification.manifest.database.sha256,
+  );
+  assert.equal(mutationInput.backupEvidence.path, verification.path);
+  assert.equal(
+    mutationInput.backupEvidence.databaseRelativePath,
+    verification.manifest.database.relativePath,
+  );
+  assert.equal(mutationInput.backupEvidence.databaseSizeBytes, verification.manifest.database.sizeBytes);
+  assert.equal(mutationInput.backupEvidence.databaseSha256, verification.manifest.database.sha256);
+  assert.equal(mutationInput.backupEvidence.createdAt, verification.manifest.createdAt);
+  assert.equal(mutationInput.backupEvidence.reviewedPlanChecksum, dryRun.planChecksum);
+  assert.equal(mutationInput.backupEvidence.pauseUpdatedAt, fixtureNowIso);
+  assert.deepEqual(await repairState(fixture.storage), before, 'backup reconstruction must not apply the repair');
+});
+
+test('canonical merge operator gate rejects ambiguous legacy v1 backup evidence without running repair', async (t) => {
+  const fixture = repairStorage(t);
+  const bundlePath = path.join(path.dirname(fixture.sqlitePath), 'legacy-canonical-bundle');
+  const legacy = await createLegacyCanonicalBackupBundle(fixture.storage, bundlePath);
+  const beforeFiles = directoryFileSha256(bundlePath);
+  const verification = await verifyBackupBundle(bundlePath);
+  assert.equal(verification.ok, false);
+  assert.equal(verification.legacy, true);
+  assert.equal(verification.classification, 'legacy');
+  assert.deepEqual([...fs.readFileSync(legacy.databasePath).subarray(18, 20)], [2, 2]);
+  let storageCalls = 0;
+  let repairCalls = 0;
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeCli({
+      argv: [
+        ...cliBaseArgs,
+        '--apply',
+        '--expected-plan-checksum', 'a'.repeat(64),
+        '--backup', bundlePath,
+        '--confirm', CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION,
+      ],
+      getConfigFn: () => canonicalBackupConfig(path.dirname(fixture.sqlitePath), fixture.sqlitePath),
+      getStorageFn: () => { storageCalls += 1; return fixture.storage; },
+      verifyBackupBundleFn: verifyBackupBundle,
+      runRepairFn: async () => { repairCalls += 1; return { applied: true }; },
+    }),
+    /legacy pre-invariant backup.*not eligible/i,
+  );
+
+  assert.equal(storageCalls, 0);
+  assert.equal(repairCalls, 0);
+  assert.deepEqual(directoryFileSha256(bundlePath), beforeFiles);
+});
+
+test('canonical merge verified-backup reconstruction keeps strict rejection for every SQLite sidecar', async (t) => {
+  for (const { suffix, bytes } of [
+    { suffix: '-wal', bytes: Buffer.alloc(0) },
+    { suffix: '-shm', bytes: Buffer.alloc(32 * 1024) },
+    { suffix: '-journal', bytes: Buffer.alloc(0) },
+  ]) {
+    await t.test(suffix, async (caseTest) => {
+      const fixture = repairStorage(caseTest);
+      const approval = await seedApprovedRepair(fixture.storage);
+      await pauseOutreach(fixture.storage, { refreshBackup: false });
+      const dryRun = await runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage }));
+      const before = await repairState(fixture.storage);
+      const backupPath = path.join(path.dirname(fixture.sqlitePath), `strict-sidecar${suffix}.sqlite`);
+      await fixture.storage.createApplicationBackup(backupPath);
+      const backupBytes = fs.readFileSync(backupPath);
+      const backupEvidence = {
+        path: path.dirname(backupPath),
+        databaseRelativePath: path.basename(backupPath),
+        databaseSizeBytes: backupBytes.length,
+        databaseSha256: createHash('sha256').update(backupBytes).digest('hex'),
+      };
+      fs.writeFileSync(`${backupPath}${suffix}`, bytes);
+
+      await assert.rejects(
+        fixture.storage.verifyDealHunterCanonicalOpportunityMergeBackupPlan({
+          approval,
+          actor: fixtureActor,
+          reason: fixtureReason,
+          backupEvidence,
+          expectedPlanChecksum: dryRun.planChecksum,
+        }),
+        new RegExp(`unverified SQLite sidecars: ${suffix}`),
+      );
+      assert.deepEqual(await repairState(fixture.storage), before);
+    });
+  }
+});
+
 test('apply backup verification never creates or mutates files inside the verified bundle', async (t) => {
   const fixture = repairStorage(t);
   await seedApprovedRepair(fixture.storage);
   await pauseOutreach(fixture.storage);
   const dryRun = await runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage }));
-  const backupPath = repairStoragePaths.get(fixture.storage).backupPath;
-  const backupDirectory = path.dirname(backupPath);
-  const backupName = path.basename(backupPath);
-  const backupArtifacts = () => Object.fromEntries(Object.entries(directoryFileSha256(backupDirectory))
-    .filter(([name]) => name === backupName || name.startsWith(`${backupName}-`)));
-  const beforeFiles = backupArtifacts();
+  const backupPath = repairStoragePaths.get(fixture.storage).bundlePath;
+  const beforeFiles = directoryFileSha256(backupPath);
 
   const result = await runCanonicalOpportunityMergeRepair(applyInput(fixture.storage, dryRun.planChecksum));
 
   assert.equal(result.applied, true);
-  assert.deepEqual(backupArtifacts(), beforeFiles);
+  assert.deepEqual(directoryFileSha256(backupPath), beforeFiles);
 });
 
 test('the SQLite transaction independently rechecks the global outreach pause', async (t) => {
@@ -2261,7 +2796,7 @@ test('apply atomically moves only approved aliases, supersedes the loser, resolv
   assert.equal(manifest.mode, 'canonical-opportunity-merge');
   assert.equal(manifest.status, 'applied');
   assert.equal(manifest.actor, fixtureActor);
-  assert.equal(manifest.backup_reference, path.dirname(repairStoragePaths.get(fixture.storage).backupPath));
+  assert.equal(manifest.backup_reference, repairStoragePaths.get(fixture.storage).bundlePath);
   assert.equal(manifest.checksum, dryRun.planChecksum);
   assert.equal(manifest.manifest.repairType, 'canonical-opportunity-merge');
   assert.equal(manifest.manifest.manifestSchema, 'canonical-opportunity-merge-manifest-v1');
@@ -2272,7 +2807,7 @@ test('apply atomically moves only approved aliases, supersedes the loser, resolv
     supersededId,
   });
   assert.deepEqual(manifest.manifest.aliasMoves, dryRun.plan.aliasMoves);
-  const fixtureBackup = repairStoragePaths.get(fixture.storage).backupPath;
+  const fixtureBackup = path.join(repairStoragePaths.get(fixture.storage).bundlePath, 'database.sqlite');
   assert.equal(
     manifest.manifest.backupEvidence.databaseSha256,
     createHash('sha256').update(fs.readFileSync(fixtureBackup)).digest('hex'),

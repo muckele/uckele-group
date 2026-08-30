@@ -17,6 +17,12 @@ npm run backup:verify
 
 This verifies the newest bundle, including the complete manifest schema, SQLite snapshot integrity, one-to-one correspondence between every secure-document manifest entry and its SQLite row, manifest row counts, and every recorded size and checksum. A malformed or row-mismatched manifest is never considered restorable, even when it represents a database with no secure documents. To select a bundle:
 
+A current, fully verified application bundle uses manifest version 2 and is a self-contained SQLite snapshot: `database.sqlite`, `manifest.json`, and any manifest-listed secure documents. Its persisted `database.sqlite` must contain SQLite rollback-format header bytes `1/1` at offsets 18 and 19. SQLite `database.sqlite-wal`, `database.sqlite-shm`, and `database.sqlite-journal` sidecars are not valid current-bundle members.
+
+Creation first uses SQLite's online backup API, so committed data still resident in the live source WAL is captured without copying or checkpointing the source main file. While the destination bundle is still `.incomplete`, creation reads the exact sidecar-free online-backup bytes, validates the SQLite header, changes only a valid destination `2/2` journal header to `1/1` in a private copy, runs query-only `quick_check`, and atomically replaces `database.sqlite` with that normalized representation using restrictive permissions. It then re-reads and requires persisted `1/1`, computes size and SHA-256 from those final bytes, copies the matching secure documents, writes manifest v2, runs ordinary verification, and only then renames the bundle into place. Ordinary v2 verification never normalizes a stored `2/2` file: even with a matching manifest checksum, it fails closed.
+
+Manifest-version-1 bundles are historical, pre-invariant artifacts. Their stored bytes may be useful for forensic or explicitly reviewed recovery work, but ordinary verification reports them as `legacy` with `ok: false`; they are not eligible for normal restore or repair apply evidence and are never rewritten in place. Retention preserves legacy bundles rather than treating inability to prove the v2 standalone invariant as corruption. A malformed manifest, checksum mismatch, missing file, or failed database/document consistency check is still classified as genuinely `invalid`.
+
 ```sh
 npm run backup:verify -- --bundle /data/backups/backup-...
 ```
@@ -29,7 +35,7 @@ npm run backup:drill
 
 The drill creates realistic SQLite/document data, snapshots it, checks retention and hashes, restores it to temporary paths, opens the restored database, runs SQLite integrity verification, and reads the restored confidential file.
 
-The Operations backup status also reports valid, invalid, and incomplete bundle counts. A valid newest backup with a recent invalid or incomplete artifact is reported as degraded. In-progress bundles carry a process marker, and retention preserves both live work and every recent `.incomplete` directory. Incomplete and invalid bundle directories older than 24 hours are treated as abandoned and removed on the next successful retention pass only when no marked backup process is still running. Investigate degraded status before that grace period expires if the failed artifact is needed for diagnosis.
+The Operations backup status reports current-valid, legacy, invalid, and incomplete bundle counts. A current-valid newest backup alongside any legacy, invalid, or incomplete artifact is reported as degraded; legacy-only inventory reports that no current fully verified backup is available. In-progress bundles carry a process marker, and retention preserves both live work and every recent `.incomplete` directory. Incomplete and invalid bundle directories older than 24 hours are treated as abandoned and removed on the next successful retention pass only when no marked backup process is still running. Legacy bundles are excluded from that automatic cleanup and from current age/count pruning. Investigate degraded status before the grace period expires if an invalid or incomplete artifact is needed for diagnosis.
 
 The slim production image does not include the test suite. On a Fly Machine, perform the equivalent rehearsal with `backup:verify` and `backup:restore` into `/tmp` as shown below.
 
@@ -80,7 +86,7 @@ npm run backup:restore -- \
   --confirm-live
 ```
 
-The restore command refuses a live destination without `--confirm-live`, verifies the complete bundle before copying, cleans its temporary staging directory after both success and failure, and retains the prior database and document directory with a `.before-restore-...` suffix. Do not delete those safety copies until the restored application has passed validation.
+The restore command refuses a live destination without `--confirm-live`, requires a current manifest-v2 bundle with persisted `1/1` database bytes, verifies the complete bundle before copying, cleans its temporary staging directory after both success and failure, and retains the prior database and document directory with a `.before-restore-...` suffix. Current-format restore uses the stored rollback-format database naturally and does not depend on WAL/SHM/journal sidecars. Do not delete those safety copies until the restored application has passed validation.
 
 ## Fly volume-snapshot restore
 
