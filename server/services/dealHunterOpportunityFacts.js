@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 export const opportunityFactFields = Object.freeze([
   'seller_name',
@@ -75,6 +75,35 @@ export const opportunitySourceObservationFields = Object.freeze([
 
 const opportunitySourceObservationFieldSet = new Set(opportunitySourceObservationFields);
 
+const sourceObservationFieldMappings = Object.freeze([
+  ['name', 'name'],
+  ['business_name', 'name'],
+  ['industry', 'industry'],
+  ['description', 'description'],
+  ['city', 'city'],
+  ['county', 'county'],
+  ['state', 'state'],
+  ['country', 'country'],
+  ['location', 'location'],
+  ['annual_profit', 'annualProfit'],
+  ['annual_revenue', 'annualRevenue'],
+  ['asking_price', 'askingPrice'],
+  ['profit_multiple', 'profitMultiple'],
+  ['net_margin', 'netMargin'],
+  ['years_established', 'yearsEstablished'],
+  ['remote_flag', 'remoteFlag'],
+  ['franchise_flag', 'franchiseFlag'],
+  ['five_years_flag', 'fiveYearsFlag'],
+  ['broker_name', 'brokerName'],
+  ['broker_company', 'brokerCompany'],
+  ['broker_contact', 'brokerContact'],
+  ['broker_email', 'brokerEmail'],
+  ['listing_url', 'listingUrl'],
+  ['listing_source', 'listingSource'],
+  ['date_added', 'dateAdded'],
+  ['last_updated', 'lastUpdated'],
+]);
+
 function normalizeText(value, label, { required = true, maxLength = 4000 } = {}) {
   if (value === null || value === undefined) {
     if (!required) return null;
@@ -121,6 +150,59 @@ function normalizeTimestamp(value, label) {
   const timestamp = Date.parse(normalized);
   if (!Number.isFinite(timestamp)) throw new Error(`${label} must be a valid timestamp.`);
   return new Date(timestamp).toISOString();
+}
+
+function sourceObservationDigest(value) {
+  return createHash('sha256').update(String(value)).digest('hex');
+}
+
+function sourceObservationRecordId(deal = {}) {
+  const sourceId = String(deal.sourceId || '').trim();
+  const externalId = String(deal.id || '').trim();
+  if (sourceId && deal.stableExternalId && externalId) return `external:${externalId}`;
+  const listingUrl = String(deal.listingUrl || '').trim();
+  if (sourceId && listingUrl) return `listing:${sourceObservationDigest(listingUrl).slice(0, 40)}`;
+  return '';
+}
+
+function observationTimestamp(deal = {}, fallback) {
+  const sourceTimestamp = deal.lastUpdated || deal.dateAdded;
+  return Number.isFinite(Date.parse(sourceTimestamp || '')) ? new Date(sourceTimestamp).toISOString() : fallback;
+}
+
+/**
+ * Projects one normalized source record into bounded, scalar provenance rows.
+ * It intentionally never reads `deal.raw`, so uploaded workbooks and arbitrary
+ * source payloads cannot become durable observations.
+ */
+export function buildOpportunitySourceObservations({ opportunityId, deal, now = new Date().toISOString() } = {}) {
+  const canonicalOpportunityId = normalizeText(opportunityId, 'Canonical opportunity id', { maxLength: 200 });
+  const sourceId = normalizeText(deal?.sourceId, 'Opportunity source id', { maxLength: 160 });
+  const sourceName = normalizeText(deal?.sourceName, 'Opportunity source name', { maxLength: 220 });
+  const sourceRecordId = sourceObservationRecordId(deal);
+  if (!sourceRecordId) return [];
+  const timestamp = normalizeTimestamp(now, 'Opportunity source observation timestamp');
+  const observedAt = observationTimestamp(deal, timestamp);
+  const observations = [];
+  const add = (field, value) => {
+    if (value === null || value === undefined || String(value).trim() === '') return;
+    observations.push(normalizeOpportunitySourceObservation({
+      id: `source-observation:${sourceObservationDigest([canonicalOpportunityId, sourceId, sourceRecordId, field].join('\u0000'))}`,
+      opportunity_id: canonicalOpportunityId,
+      source_id: sourceId,
+      source_name: sourceName,
+      source_record_id: sourceRecordId,
+      field,
+      value,
+      observed_at: observedAt,
+      created_at: timestamp,
+      updated_at: timestamp,
+    }));
+  };
+
+  for (const [field, property] of sourceObservationFieldMappings) add(field, deal?.[property]);
+  if (deal?.stableExternalId && deal?.id) add('listing_id', deal.id);
+  return observations;
 }
 
 export function normalizeOpportunitySourceObservation(observation = {}) {

@@ -41,6 +41,7 @@ import {
   recordCimSafetyMetric,
   resolveDealHunterOpportunity,
 } from './cimOpportunityIdentity.js';
+import { buildOpportunitySourceObservations } from './dealHunterOpportunityFacts.js';
 
 const defaultTimeoutMs = 45000;
 const sheetWorkbookExpandedMaxBytes = 32 * 1024 * 1024;
@@ -2846,6 +2847,7 @@ function initializeDealIdentity(deal = {}) {
     identityAliases,
     dealKeyAliases,
     sourceRecords: deal.sourceRecords?.length ? deal.sourceRecords : [sourceRecord(deal)],
+    sourceObservationDeals: Array.isArray(deal.sourceObservationDeals) ? deal.sourceObservationDeals : [deal],
     fieldProvenance: initialFieldProvenance(deal),
     fieldConflicts: Array.isArray(deal.fieldConflicts) ? deal.fieldConflicts : [],
     deduplicationMatches: deal.deduplicationMatches || [],
@@ -3072,6 +3074,10 @@ function mergeSyndicatedDeals(canonical, duplicate, decision) {
       ...(duplicate.dealKeyAliases || []), buildDealKey(duplicate), contentFingerprintDealKey(duplicate),
     ]),
     sourceRecords: [...(canonical.sourceRecords || [sourceRecord(canonical)]), ...(duplicate.sourceRecords || [sourceRecord(duplicate)])],
+    sourceObservationDeals: [
+      ...(canonical.sourceObservationDeals || [canonical]),
+      ...(duplicate.sourceObservationDeals || [duplicate]),
+    ],
     deduplicationMatches: [
       ...(canonical.deduplicationMatches || []),
       {
@@ -5142,6 +5148,15 @@ async function attachCanonicalOpportunityIdentities(storage, deals = []) {
       const candidateIndex = candidates.findIndex((item) => item.opportunity_id === resolution.opportunity.opportunity_id);
       if (candidateIndex >= 0) candidates[candidateIndex] = resolution.opportunity;
       else candidates.push(resolution.opportunity);
+    }
+    if (resolution.ok && resolution.opportunityId && typeof storage.upsertDealHunterOpportunitySourceObservation === 'function') {
+      const now = new Date().toISOString();
+      const observations = (deal.sourceObservationDeals || [deal]).flatMap((sourceDeal) => (
+        buildOpportunitySourceObservations({ opportunityId: resolution.opportunityId, deal: sourceDeal, now })
+      ));
+      for (const observation of observations) {
+        await storage.upsertDealHunterOpportunitySourceObservation(observation);
+      }
     }
     resolvedDeals.push({
       ...deal,

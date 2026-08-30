@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { after, beforeEach, test } from 'node:test';
 import { strToU8, zipSync } from 'fflate';
+import { createSqliteStorage } from '../server/storage/sqlite.js';
+import { setOperatorOpportunityFact } from '../server/services/dealHunterOpportunityFacts.js';
 
 process.env.DEAL_HUNTER_SHEET_CSV_URL = 'https://docs.google.com/spreadsheets/d/test/gviz/tq?tqx=out:csv&gid=123';
 process.env.DEAL_HUNTER_AIRTABLE_TOKEN = 'test-token';
@@ -60,6 +65,8 @@ function freshDealOsImport() {
     accepted_row_count: 1,
     rejected_row_count: 0,
     canonical_record_count: 1,
+    parser_version: 'deal-os-export-v2',
+    row_accounting: [],
     row_count: 1,
     duplicate_count: 0,
     stable_id_count: 1,
@@ -194,4 +201,95 @@ test('a header-only required Sheet suppresses every scored output even when Deal
   assert.equal(sheet.rowCount, 0);
   assertFailClosedReview(reviewed);
   assert.equal(JSON.stringify(reviewed).includes('Deal OS Must Stay Supplemental'), false);
+});
+
+test('canonical ingestion retains separate bounded Sheet and Deal OS observations, refreshes the Sheet record, and leaves operator facts untouched', async (t) => {
+  // Break caught: canonical ingestion drops source-specific values, grows
+  // duplicate observations across refreshes, or rewrites operator facts.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-observations-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const description = 'Commercial HVAC maintenance company with recurring service agreements, trained field technicians, and diversified B2B customers.';
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Broker Name,Broker Email,Description,Unbounded Workbook Blob',
+    `SHEET-42,Observation HVAC Services,https://broker.example/sheet-observation,CA,${new Date().toISOString().slice(0, 10)},450000,1200000,900000,Sheet Broker,sheet@example.test,${description},RAW_WORKBOOK_CONTENT_MUST_NOT_PERSIST`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  dealOsImport = {
+    ...freshDealOsImport(),
+    id: 'observation-deal-os-import',
+    records: [{
+      stableId: 'DEAL-OS-42',
+      name: 'Observation HVAC Services',
+      listingUrl: 'https://broker.example/sheet-observation',
+      state: 'CA',
+      annualProfit: 455000,
+      annualRevenue: 1200000,
+      askingPrice: 900000,
+      brokerName: 'Deal OS Broker',
+      brokerEmail: 'deal-os@example.test',
+      description,
+      brokerContacts: [],
+    }],
+  };
+  await storage.insertDealHunterDealOsImport(dealOsImport);
+
+  const first = await reviewDailyDeals({ storage, withScoredDeals: true });
+  assert.equal(first.review.sources.find((source) => source.id === 'deal-os-export').fetched, true);
+  assert.equal(first.scoredDeals.length, 1);
+  assert.deepEqual(new Set(first.scoredDeals[0].sourceRecords.map((record) => record.sourceId)), new Set(['sheet-0', 'deal-os-export']));
+  const opportunityId = first.scoredDeals[0].opportunityId;
+  assert.ok(opportunityId);
+  await setOperatorOpportunityFact({
+    opportunityId,
+    field: 'seller_name',
+    value: 'Operator-verified seller',
+    actor: 'acquisition-admin',
+    verified: true,
+    storage,
+  });
+  const operatorFactsBeforeRefresh = await storage.listDealHunterOpportunityFacts(opportunityId);
+
+  const firstObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  const firstSheetProfit = firstObservations.find((observation) => (
+    observation.source_id === 'sheet-0' && observation.field === 'annual_profit'
+  ));
+  assert.ok(firstSheetProfit);
+  assert.doesNotMatch(JSON.stringify(firstObservations), /RAW_WORKBOOK_CONTENT_MUST_NOT_PERSIST/);
+  assert.deepEqual(
+    firstObservations
+      .filter((observation) => observation.field === 'annual_profit')
+      .map((observation) => [observation.source_id, observation.value])
+      .sort(([left], [right]) => left.localeCompare(right)),
+    [
+      ['deal-os-export', '455000'],
+      ['sheet-0', '450000'],
+    ],
+  );
+
+  sourceCsv = sourceCsv.replace(',450000,', ',475000,');
+  await reviewDailyDeals({ storage, withScoredDeals: true });
+
+  const refreshedObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  const refreshedSheetProfit = refreshedObservations.find((observation) => (
+    observation.source_id === 'sheet-0' && observation.field === 'annual_profit'
+  ));
+  assert.equal(refreshedObservations.length, firstObservations.length);
+  assert.equal(refreshedSheetProfit.id, firstSheetProfit.id);
+  assert.equal(refreshedSheetProfit.created_at, firstSheetProfit.created_at);
+  assert.deepEqual(
+    refreshedObservations
+      .filter((observation) => observation.field === 'annual_profit')
+      .map((observation) => [observation.source_id, observation.value])
+      .sort(([left], [right]) => left.localeCompare(right)),
+    [
+      ['deal-os-export', '455000'],
+      ['sheet-0', '475000'],
+    ],
+  );
+  assert.deepEqual(await storage.listDealHunterOpportunityFacts(opportunityId), operatorFactsBeforeRefresh);
 });
