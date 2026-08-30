@@ -115,7 +115,6 @@ export async function runCanonicalOpportunityMergeCli({
         reason: options.reason,
         confirmation: options.confirmation,
         expectedPlanChecksum: options.expectedPlanChecksum,
-        backupVerification: null,
         storage,
       });
     } finally {
@@ -123,7 +122,8 @@ export async function runCanonicalOpportunityMergeCli({
     }
   }
 
-  const backupVerification = await verifyBackupBundleFn(path.resolve(options.backupReference));
+  const backupPath = path.resolve(options.backupReference);
+  const backupVerification = await verifyBackupBundleFn(backupPath);
   if (!backupVerification?.ok) {
     const errors = Array.isArray(backupVerification?.errors) ? backupVerification.errors.slice(0, 3) : [];
     throw new Error(`Backup verification failed${errors.length ? `: ${errors.join('; ')}` : '.'}`);
@@ -141,7 +141,7 @@ export async function runCanonicalOpportunityMergeCli({
     reason: options.reason,
     confirmation: options.confirmation,
     expectedPlanChecksum: options.expectedPlanChecksum,
-    backupVerification,
+    backupPath,
     storage,
   });
 }
