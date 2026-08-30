@@ -166,3 +166,43 @@ test('detail sends bounded storage reads and closed, safe URL projections', asyn
   assert.equal(JSON.stringify(detail.cimSummary).includes('private'), false);
   assert.equal(JSON.stringify(detail.cimSummary).includes('provider_message_id'), false);
 });
+
+test('detail closes every nested projection and strips injected storage metadata', async (t) => {
+  const { storage, opportunityId } = await detailStorage(t);
+  const sentinel = 'DO-NOT-LEAK-DETAIL-SENTINEL';
+  const hostile = new Proxy(storage, {
+    get(target, property) {
+      if (property === 'getCurrentDealHunterOpportunityScore') return async () => ({
+        ...currentScore(opportunityId),
+        listing_url: 'https://broker.example/score',
+        dimensions: [{ id: 'financial-fit', label: 'x'.repeat(900), contribution: 20, private: sentinel }],
+        gates: [{ rule_id: 'gate', reason: 'x'.repeat(900), private: sentinel }],
+        applied_caps: [{ rule_id: 'cap', cap: 10, private: sentinel }],
+        confidence_reasons: ['x'.repeat(900), { private: sentinel }],
+        missing_evidence: ['x'.repeat(900), { private: sentinel }],
+        summary: { strengths: ['x'.repeat(900)], concerns: ['x'.repeat(900)], private: sentinel },
+      });
+      if (property === 'listDealHunterScoreEvidence') return async () => Array.from({ length: 600 }, (_, index) => ({
+        dimension: 'financial-fit', rule_id: `rule-${index}`, rule_label: 'x'.repeat(900), evidence_class: 'observed',
+        field: 'annual_profit', value: { private: sentinel }, observed_value: [sentinel], terms: ['x'.repeat(900), { private: sentinel }],
+        source_id: 'source', source_name: 'x'.repeat(900), source_record_id: 'record', listing_url: 'https://user:pass@broker.example/private',
+        observed_at: '2026-08-30T10:00:00.000Z', private: sentinel,
+      }));
+      if (property === 'listDealHunterOpportunityFacts') return async () => [{ id: 'fact', field: 'seller_name', value: 'x'.repeat(9000), verified: true, actor: 'x'.repeat(900), note: 'x'.repeat(9000), created_at: '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z', private: sentinel }];
+      if (property === 'listDealHunterCimRequests') return async () => [{ id: 'cim', status: 'requested', request_state: sentinel, delivery_state: sentinel, provider: sentinel, reply_to: sentinel, metadata: { private: sentinel }, updated_at: '2026-08-30T10:00:00.000Z' }];
+      if (property === 'listCrmCommunications') return async () => ({ rows: [{ id: 'comm', direction: 'outbound', channel: 'email', kind: 'cim', occurred_at: '2026-08-30T10:00:00.000Z', provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }] });
+      if (property === 'getSubmission') return async () => ({ id: 'submission', status: 'open', company: 'x'.repeat(900), seller_name: 'x'.repeat(900), metadata: { private: sentinel, dealHunter: { sellerPhone: '555' } } });
+      const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage: hostile });
+  assert.deepEqual(Object.keys(detail.score).sort(), ['appliedCaps', 'completenessScore', 'confidence', 'confidenceReasons', 'dimensions', 'fitScore', 'gates', 'missingEvidence', 'scoreStatus', 'summary', 'unattributedEvidence']);
+  assert.deepEqual(Object.keys(detail.score.dimensions[0]).sort(), ['contribution', 'evidence', 'id', 'label']);
+  assert.deepEqual(Object.keys(detail.operatorFacts[0]).sort(), ['actor', 'createdAt', 'field', 'id', 'note', 'updatedAt', 'value', 'verified']);
+  assert.deepEqual(Object.keys(detail.cimSummary.requests[0]).sort(), ['id', 'status', 'updatedAt']);
+  assert.deepEqual(Object.keys(detail.crmSummary.communications[0]).sort(), ['channel', 'cimRequestId', 'direction', 'id', 'kind', 'occurredAt']);
+  assert.ok(detail.score.dimensions[0].evidence.length <= 100);
+  assert.ok(detail.score.dimensions[0].label.length <= 160);
+  assert.ok(detail.operatorFacts[0].value.length <= 4000);
+  assert.equal(JSON.stringify(detail).includes(sentinel), false);
+});

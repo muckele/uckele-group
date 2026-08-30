@@ -28,9 +28,8 @@ async function withServer(run) {
   }
 }
 
-async function seedCurrentOpportunity() {
+async function seedCurrentOpportunity(opportunityId = 'opp-http-triage-actions') {
   const storage = getStorage();
-  const opportunityId = 'opp-http-triage-actions';
   await storage.upsertDealHunterOpportunity({
     opportunity_id: opportunityId, created_at: '2026-08-30T09:00:00.000Z', updated_at: '2026-08-30T09:00:00.000Z',
     canonical_name: 'HTTP Action Opportunity', canonical_recipient: null, canonical_location: 'Dallas, TX',
@@ -60,6 +59,31 @@ async function login(origin, username, password) {
 test.after(() => {
   getStorage().close?.();
   fs.rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('Pass rejects non-primitive action and every invalid reason or note before either dismissal or review', async () => {
+  const { storage, opportunityId } = await seedCurrentOpportunity('opp-http-triage-invalid-pass');
+  await withServer(async (origin) => {
+    const adminCookie = await login(origin, 'admin', 'change-me-now');
+    const actionPath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/action`;
+    const invalid = [
+      { action: { value: 'pass' } }, { action: ['pass'] }, { action: true },
+      { action: 'pass', reason: {} }, { action: 'pass', reason: [] }, { action: 'pass', reason: true },
+      { action: 'pass', reason: '   ' }, { action: 'pass', reason: 'x'.repeat(81) }, { action: 'pass' },
+      { action: 'pass', reason: 'not-a-fit', note: {} }, { action: 'pass', reason: 'not-a-fit', note: [] },
+      { action: 'pass', reason: 'not-a-fit', note: true }, { action: 'pass', reason: 'not-a-fit', note: 'x'.repeat(2001) },
+    ];
+    for (const body of invalid) {
+      const response = await fetch(actionPath, { method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify(body) });
+      assert.equal(response.status, 400, JSON.stringify(body));
+      const score = await storage.getDealHunterOpportunityScore(opportunityId);
+      assert.equal(score.reviewed_at, null, JSON.stringify(body));
+      assert.equal(score.reviewed_by, null, JSON.stringify(body));
+      assert.equal(score.reviewed_fingerprint, null, JSON.stringify(body));
+      assert.equal(score.reviewed_semantic_digest, null, JSON.stringify(body));
+      assert.equal((await storage.listDealHunterDispositions({ dealKeys: [`deal-${opportunityId}`], limit: 20 })).length, 0, JSON.stringify(body));
+    }
+  });
 });
 
 test('triage detail remains readable while only administrators may enrich facts or run bounded Pursue, Watch, and Pass actions', async () => {

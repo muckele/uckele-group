@@ -962,7 +962,11 @@ export function createApp() {
         response.status(403).json({ success: false, error: 'Administrator access is required.' });
         return;
       }
-      const action = String(request.body?.action || '').trim().toLowerCase();
+      if (typeof request.body?.action !== 'string') {
+        response.status(400).json({ success: false, error: 'Action must be pursue, watch, or pass.' });
+        return;
+      }
+      const action = request.body.action.trim().toLowerCase();
       const expectedUpdatedAt = String(request.body?.expectedSubmissionVersion || request.body?.expected_updated_at || '');
       let fields;
       if (action === 'snooze' || action === 'reschedule') {

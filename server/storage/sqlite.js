@@ -7867,7 +7867,7 @@ export function createSqliteStorage(config) {
         WHERE opportunity_id = ?
         ORDER BY created_at DESC, id DESC
         LIMIT ?
-      `).all(String(opportunityId || '').trim(), Math.max(1, Math.min(Number(limit) || 500, 500))).map(normalizeDealHunterOpportunityFactRow);
+      `).all(String(opportunityId || '').trim(), Number.isFinite(Number(limit)) ? Math.max(1, Math.min(Math.trunc(Number(limit)), 500)) : 500).map(normalizeDealHunterOpportunityFactRow);
     },
 
     async insertCurrentDealHunterOpportunityFact(fact = {}) {
@@ -7914,7 +7914,7 @@ export function createSqliteStorage(config) {
         WHERE opportunity_id = ?
         ORDER BY observed_at DESC, id ASC
         LIMIT ?
-      `).all(String(opportunityId || '').trim(), Math.max(1, Math.min(Number(limit) || 500, 500))).map(normalizeDealHunterOpportunitySourceObservationRow);
+      `).all(String(opportunityId || '').trim(), Number.isFinite(Number(limit)) ? Math.max(1, Math.min(Math.trunc(Number(limit)), 500)) : 500).map(normalizeDealHunterOpportunitySourceObservationRow);
     },
 
     async upsertDealHunterOpportunitySourceObservation(observation = {}) {

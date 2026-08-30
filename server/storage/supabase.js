@@ -3023,7 +3023,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         .eq('opportunity_id', String(opportunityId || '').trim())
         .order('created_at', { ascending: false })
         .order('id', { ascending: false })
-        .limit(Math.max(1, Math.min(Number(limit) || 500, 500)));
+        .limit(Number.isFinite(Number(limit)) ? Math.max(1, Math.min(Math.trunc(Number(limit)), 500)) : 500);
       if (error) throw error;
       return (data || []).map(normalizeDealHunterOpportunityFactRow);
     },
@@ -3063,7 +3063,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         .eq('opportunity_id', String(opportunityId || '').trim())
         .order('observed_at', { ascending: false })
         .order('id')
-        .limit(Math.max(1, Math.min(Number(limit) || 500, 500)));
+        .limit(Number.isFinite(Number(limit)) ? Math.max(1, Math.min(Math.trunc(Number(limit)), 500)) : 500);
       if (error) throw error;
       return (data || []).map(normalizeDealHunterOpportunitySourceObservationRow);
     },

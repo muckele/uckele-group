@@ -197,6 +197,35 @@ function safeListingUrl(value) {
   }
 }
 
+function detailText(value, max = 500) {
+  return ['string', 'number', 'boolean'].includes(typeof value) ? normalizeText(value, max) : '';
+}
+
+function detailNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
+}
+
+function detailStrings(values, { limit = 50, max = 500 } = {}) {
+  return (Array.isArray(values) ? values : []).map((value) => detailText(value, max)).filter(Boolean).slice(0, limit);
+}
+
+function projectOperatorFact(item = {}) {
+  return {
+    id: detailText(item.id, 200), field: detailText(item.field, 80), value: detailText(item.value, 4000), verified: Boolean(item.verified),
+    actor: detailText(item.actor, 160), note: detailText(item.note, 500), createdAt: detailText(item.created_at, 80), updatedAt: detailText(item.updated_at, 80),
+  };
+}
+
+function projectEvidence(row = {}) {
+  return {
+    ruleId: detailText(row.rule_id, 160), ruleLabel: detailText(row.rule_label, 160), evidenceClass: detailText(row.evidence_class, 80),
+    field: detailText(row.field, 80), value: detailText(row.value, 500), observedValue: detailText(row.observed_value, 500),
+    terms: detailStrings(row.terms, { limit: 20, max: 160 }), sourceId: detailText(row.source_id, 200), sourceName: detailText(row.source_name, 160),
+    sourceRecordId: detailText(row.source_record_id, 200), listingUrl: safeListingUrl(row.listing_url), observedAt: detailText(row.observed_at, 80),
+  };
+}
+
 function directCrmFactRows(submission = {}) {
   if (!submission || typeof submission !== 'object') return [];
   const dealHunter = submission.metadata?.dealHunter && typeof submission.metadata.dealHunter === 'object'
@@ -280,26 +309,23 @@ function criticalMissingFields({ effectiveFacts, sourceRows, summary, listingUrl
 }
 
 function projectScore(score, byDimension, unattributed) {
+  const projectRule = (item) => ({ ruleId: detailText(item?.rule_id || item?.ruleId, 160), reason: detailText(item?.reason, 500), cap: detailNumber(item?.cap), value: detailNumber(item?.value) });
   return {
-    fitScore: Number(score.fit_score || 0),
-    scoreStatus: score.score_status || 'provisional',
-    confidence: score.confidence || 'low',
-    completenessScore: Number(score.completeness_score || 0),
-    dimensions: (score.dimensions || []).map((dimension) => ({ ...dimension, evidence: byDimension.get(dimension.id) || [] })),
-    unattributedEvidence: unattributed,
-    appliedCaps: score.applied_caps || [], gates: score.gates || [], confidenceReasons: score.confidence_reasons || [],
-    missingEvidence: score.missing_evidence || [], summary: score.summary || {},
+    fitScore: detailNumber(score.fit_score), scoreStatus: detailText(score.score_status, 80) || 'provisional', confidence: detailText(score.confidence, 80) || 'low', completenessScore: detailNumber(score.completeness_score),
+    dimensions: (Array.isArray(score.dimensions) ? score.dimensions : []).slice(0, 7).map((dimension) => ({ id: detailText(dimension?.id, 80), label: detailText(dimension?.label, 160), contribution: detailNumber(dimension?.contribution), evidence: (byDimension.get(dimension?.id) || []).slice(0, 100) })),
+    unattributedEvidence: unattributed.slice(0, 100), appliedCaps: detailStrings(score.applied_caps, { limit: 50, max: 500 }).length ? detailStrings(score.applied_caps, { limit: 50, max: 500 }) : (Array.isArray(score.applied_caps) ? score.applied_caps.slice(0, 50).map(projectRule) : []),
+    gates: Array.isArray(score.gates) ? score.gates.slice(0, 50).map(projectRule) : [], confidenceReasons: detailStrings(score.confidence_reasons),
+    missingEvidence: detailStrings(score.missing_evidence), summary: { strengths: detailStrings(score.summary?.strengths, { limit: 20 }), concerns: detailStrings(score.summary?.concerns, { limit: 20 }) },
   };
 }
 
 function projectCrmSubmission(submission) {
   if (!submission) return null;
   return {
-    id: submission.id || '', status: submission.status || '', company: submission.company || '',
-    sellerName: submission.seller_name || submission.sellerName || '', sellerEmail: submission.seller_email || submission.sellerEmail || '',
-    brokerName: submission.broker_name || submission.brokerName || submission.metadata?.dealHunter?.brokerName || '',
-    brokerEmail: submission.broker_email || submission.brokerEmail || submission.metadata?.dealHunter?.brokerEmail || '',
-    updatedAt: submission.updated_at || '',
+    id: detailText(submission.id, 200), status: detailText(submission.status, 80), company: detailText(submission.company, 500),
+    sellerName: detailText(submission.seller_name || submission.sellerName, 500), sellerEmail: detailText(submission.seller_email || submission.sellerEmail, 500),
+    brokerName: detailText(submission.broker_name || submission.brokerName || submission.metadata?.dealHunter?.brokerName, 500),
+    brokerEmail: detailText(submission.broker_email || submission.brokerEmail || submission.metadata?.dealHunter?.brokerEmail, 500), updatedAt: detailText(submission.updated_at, 80),
   };
 }
 
@@ -323,20 +349,7 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
   const byDimension = new Map();
   const unattributed = [];
   for (const row of evidence) {
-    const projected = {
-      ruleId: row.rule_id,
-      ruleLabel: row.rule_label,
-      evidenceClass: row.evidence_class,
-      field: row.field || '',
-      value: row.value,
-      observedValue: row.observed_value,
-      terms: row.terms || [],
-      sourceId: row.source_id || '',
-      sourceName: row.source_name || '',
-      sourceRecordId: row.source_record_id || '',
-      listingUrl: safeListingUrl(row.listing_url),
-      observedAt: row.observed_at || '',
-    };
+    const projected = projectEvidence(row);
     if (!row.dimension) {
       unattributed.push(projected);
       continue;
@@ -380,34 +393,33 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
   opportunity.listingUrl = safeListingUrl(score.listing_url);
   const projectedScore = projectScore(score, byDimension, unattributed);
   const communications = (crmCommunications?.rows || []).slice(0, 100).map((communication) => ({
-    id: communication.id || '', direction: communication.direction || '', channel: communication.channel || '',
-    kind: communication.kind || '', occurredAt: communication.occurred_at || '', deliveryState: communication.delivery_state || '',
-    cimRequestId: communication.cim_request_id || '',
+    id: detailText(communication.id, 200), direction: detailText(communication.direction, 80), channel: detailText(communication.channel, 80),
+    kind: detailText(communication.kind, 80), occurredAt: detailText(communication.occurred_at, 80), cimRequestId: detailText(communication.cim_request_id, 200),
   }));
   return {
     ok: true,
     status: 200,
     opportunity,
     effectiveFacts,
-    operatorFacts: operatorFacts.slice(0, 100),
+    operatorFacts: operatorFacts.slice(0, 100).map(projectOperatorFact),
     sourceObservations,
     missingCriticalFields: criticalMissingFields({ effectiveFacts, sourceRows, summary: opportunity, listingUrls }),
     listingUrls,
     score: projectedScore,
     cimSummary: {
-      requests: cimRequests.slice(0, 100).map((item) => ({ id: item.id || '', status: item.status || '', requestState: item.request_state || '', deliveryState: item.delivery_state || '', updatedAt: item.updated_at || '' })),
+      requests: cimRequests.slice(0, 100).map((item) => ({ id: detailText(item.id, 200), status: detailText(item.status, 80), updatedAt: detailText(item.updated_at, 80) })),
       communications: communications.filter((communication) => communication.cimRequestId),
     },
     crmSummary: {
       submission: projectCrmSubmission(submission), communications,
-      factObservations: crmFacts.slice(0, 13).map((fact) => ({ field: fact.field, value: normalizeText(fact.value, 4000), provenance: 'crm' })),
+      factObservations: crmFacts.slice(0, 13).map((fact) => ({ field: detailText(fact.field, 80), value: detailText(fact.value, 4000), provenance: 'crm' })),
       conflicts: crmFacts.filter((fact) => effectiveFacts[fact.field]?.provenance !== 'crm' && effectiveFacts[fact.field]?.value !== String(fact.value).trim())
-        .map((fact) => ({ field: fact.field, winningProvenance: effectiveFacts[fact.field]?.provenance || '', crmValue: normalizeText(fact.value, 4000) })),
+        .map((fact) => ({ field: detailText(fact.field, 80), winningProvenance: detailText(effectiveFacts[fact.field]?.provenance, 80), crmValue: detailText(fact.value, 4000) })).slice(0, 13),
     },
     history: {
-      activities: activities.slice(0, 100).map((item) => ({ id: item.id || '', eventType: item.event_type || '', summary: normalizeText(item.summary, 500), createdAt: item.created_at || '', actor: normalizeText(item.actor, 160) })),
-      dispositions: dispositions.slice(0, 20).map((item) => ({ id: item.id || '', disposition: item.disposition || '', reason: item.reason || '', note: normalizeText(item.note, 500), dismissedAt: item.dismissed_at || '', dismissedBy: normalizeText(item.dismissed_by, 160) })),
-      operatorFacts: operatorFacts.slice(0, 100).map((item) => ({ id: item.id || '', field: item.field || '', value: normalizeText(item.value, 4000), verified: Boolean(item.verified), actor: normalizeText(item.actor, 160), note: normalizeText(item.note, 500), createdAt: item.created_at || '', updatedAt: item.updated_at || '' })),
+      activities: activities.slice(0, 100).map((item) => ({ id: detailText(item.id, 200), eventType: detailText(item.event_type, 80), summary: detailText(item.summary, 500), createdAt: detailText(item.created_at, 80), actor: detailText(item.actor, 160) })),
+      dispositions: dispositions.slice(0, 20).map((item) => ({ id: detailText(item.id, 200), disposition: detailText(item.disposition, 80), reason: detailText(item.reason, 160), note: detailText(item.note, 500), dismissedAt: detailText(item.dismissed_at, 80), dismissedBy: detailText(item.dismissed_by, 160) })),
+      operatorFacts: operatorFacts.slice(0, 100).map(projectOperatorFact),
       operatorState: {
         priority: opportunity.operatorPriority, note: opportunity.operatorNote,
         reviewed: opportunity.reviewed, reviewedAt: opportunity.reviewedAt, reviewedBy: opportunity.reviewedBy,

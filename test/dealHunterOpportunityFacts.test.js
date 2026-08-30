@@ -30,6 +30,10 @@ const opportunitySourceObservationSnapshotMigrationUrl = new URL(
   '../supabase/migrations/20260830140000_deal_hunter_source_observation_snapshot.sql',
   import.meta.url,
 );
+const currentOperatorFactMigrationUrl = new URL(
+  '../supabase/migrations/20260830170000_current_operator_fact_write.sql',
+  import.meta.url,
+);
 const supabaseSchemaUrl = new URL('../supabase/schema.sql', import.meta.url);
 const dealHunterServiceUrl = new URL('../server/services/dealHunter.js', import.meta.url);
 const submissionsServiceUrl = new URL('../server/services/submissions.js', import.meta.url);
@@ -333,6 +337,42 @@ test('atomic current operator-fact write refuses a superseded opportunity withou
   await sqlite.upsertDealHunterOpportunity({ ...current, status: 'superseded', updated_at: '2026-08-30T01:00:00.000Z' });
   await assert.rejects(setCurrentOperatorOpportunityFact({ opportunityId, field: 'seller_phone', value: '555-0100', actor: 'admin', verified: true, storage: sqlite }), /no longer current/);
   assert.equal((await sqlite.listDealHunterOpportunityFacts(opportunityId)).length, 1);
+});
+
+test('provider fact and observation read limits normalize to integer bounds consistently', async (t) => {
+  const sqlite = withStorage(t);
+  await seedOpportunity(sqlite);
+  await sqlite.upsertDealHunterOpportunityFact(factRecord());
+  await sqlite.upsertDealHunterOpportunitySourceObservation(observationRecord());
+  for (const limit of [1.9, Number.NaN, 'oops', 0, -2, 9999]) {
+    await sqlite.listDealHunterOpportunityFacts(opportunityId, { limit });
+    await sqlite.listDealHunterOpportunitySourceObservations(opportunityId, { limit });
+  }
+  const calls = [];
+  const client = {
+    from() {
+      const chain = { select() { return chain; }, eq() { return chain; }, order() { return chain; }, limit(value) { calls.push(value); return Promise.resolve({ data: [], error: null }); } };
+      return chain;
+    },
+  };
+  const supabase = supabaseModule.createSupabaseStorage({ storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'key' } }, { client });
+  for (const limit of [1.9, Number.NaN, 'oops', 0, -2, 9999]) {
+    await supabase.listDealHunterOpportunityFacts(opportunityId, { limit });
+    await supabase.listDealHunterOpportunitySourceObservations(opportunityId, { limit });
+  }
+  assert.deepEqual(calls, [1, 1, 500, 500, 500, 500, 1, 1, 1, 1, 500, 500]);
+});
+
+test('current-fact RPC has the exact service-role fail-closed locking contract in both SQL sources', async () => {
+  const migration = fs.readFileSync(currentOperatorFactMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(supabaseSchemaUrl, 'utf8');
+  for (const sql of [migration, schema]) {
+    assert.match(sql, /create or replace function public\.insert_current_deal_hunter_opportunity_fact\(/i);
+    assert.match(sql, /security definer[\s\S]*set search_path = public/i);
+    assert.match(sql, /status = 'active' for update[\s\S]*if not found[\s\S]*errcode = 'P0002'[\s\S]*insert into public\.deal_hunter_opportunity_facts/i);
+    assert.match(sql, /revoke all privileges on function public\.insert_current_deal_hunter_opportunity_fact[\s\S]*from public, anon, authenticated/i);
+    assert.match(sql, /grant execute on function public\.insert_current_deal_hunter_opportunity_fact[\s\S]*to service_role/i);
+  }
 });
 
 test('effective facts use operator, CRM, structured-source, then enrichment-suggestion precedence', () => {
