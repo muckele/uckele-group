@@ -45,6 +45,7 @@ import {
   getTriageOpportunityDetail,
   listTriageQueue,
   passTriageOpportunity,
+  restoreDealHunterOpportunityWithInboxAuthority,
   setTriageOperatorDecision,
 } from './services/dealHunterTriage.js';
 import { setCurrentOperatorOpportunityFact } from './services/dealHunterOpportunityFacts.js';
@@ -88,7 +89,6 @@ import {
 } from './services/communications.js';
 import {
   archiveLead,
-  restoreDealHunterOpportunity,
   restoreLead,
 } from './services/leadLifecycle.js';
 import { recordAnalyticsEvent } from './services/analytics.js';
@@ -1711,7 +1711,7 @@ export function createApp() {
 
       const action = String(request.body?.action || 'dismiss').toLowerCase();
       const result = action === 'restore'
-        ? await restoreDealHunterOpportunity({
+        ? await restoreDealHunterOpportunityWithInboxAuthority({
             dealKey: request.body?.dealKey || '',
             actor: session.username || 'admin',
           })

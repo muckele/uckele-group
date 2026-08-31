@@ -75,6 +75,49 @@ async function linkCanonicalDealKey(storage, { opportunityId, dealKey }) {
   });
 }
 
+async function supersedeOpportunity(storage, opportunityId) {
+  const current = await storage.getDealHunterOpportunity(opportunityId);
+  await storage.upsertDealHunterOpportunity({
+    ...current,
+    status: 'superseded',
+    updated_at: '2026-08-30T11:00:00.000Z',
+  });
+  await storage.reconcileDealHunterCurrentScoreEligibility([opportunityId]);
+}
+
+async function seedCimAuthority(storage, {
+  id,
+  dealKey,
+  opportunityId,
+  submissionId = null,
+  recipientEmail,
+  updatedAt = '2026-08-30T10:30:00.000Z',
+}) {
+  return storage.upsertDealHunterCimRequest({
+    id,
+    created_at: updatedAt,
+    updated_at: updatedAt,
+    opportunity_id: opportunityId,
+    submission_id: submissionId,
+    deal_key: dealKey,
+    recipient_email: recipientEmail,
+    requested_by: 'triage-admin',
+    status: 'sent',
+    provider_message_id: `${id}-provider-message`,
+    subject: `CIM / NDA request for ${dealKey}`,
+    deal_name: 'HTTP Authority Opportunity',
+    source_name: 'test',
+    listing_url: 'https://broker.example/http-authority',
+    score: 72,
+    request_state: 'provider_accepted',
+    delivery_state: 'accepted',
+    follow_up_state: 'not-scheduled',
+    first_requested_at: updatedAt,
+    follow_up_count: 0,
+    metadata: {},
+  });
+}
+
 async function login(origin, username, password) {
   if (authenticatedCookies.has(username)) return authenticatedCookies.get(username);
   loginSequence += 1;
@@ -444,6 +487,241 @@ test('legacy disposition HTTP route cannot rewrite a repeated source-only canoni
       reviewTimePreserved: true,
       reviewed: true,
     });
+  });
+});
+
+test('legacy disposition HTTP route fails closed when its CRM-import authority points to a stale canonical opportunity', async () => {
+  // Break caught: the dispatcher discarded a durable import owner after the
+  // current-only reread returned null, then treated the same import as legacy
+  // authority and archived its CRM submission outside atomic Pass.
+  const storage = getStorage();
+  const opportunityId = 'opp-http-stale-import-authority';
+  const dealKey = 'source:http-stale-import-authority';
+  const leadResult = await createManualSubmission({
+    company: 'Stale Import Authority Services',
+    lead_type: 'broker',
+    broker_name: 'Stale Import Broker',
+    broker_email: 'stale-import@example.com',
+    listing_url: 'https://broker.example/stale-import-authority',
+    status: 'review',
+    follow_up_state: 'scheduled',
+    metadata: {},
+  }, 'triage-admin', { storage });
+  assert.equal(leadResult.ok, true);
+  const submissionId = leadResult.submission.id;
+  await seedCurrentOpportunity(opportunityId, submissionId, dealKey);
+  await storage.claimDealHunterCrmImport({
+    id: 'import-http-stale-authority',
+    created_at: '2026-08-30T09:00:00.000Z',
+    updated_at: '2026-08-30T10:00:00.000Z',
+    opportunity_id: opportunityId,
+    deal_key: dealKey,
+    listing_identity: 'listing-http-stale-import-authority',
+    listing_url: 'https://broker.example/stale-import-authority',
+    submission_id: submissionId,
+    status: 'completed',
+    source_name: 'http-authority-test',
+    metadata: {},
+  });
+  await supersedeOpportunity(storage, opportunityId);
+  const beforeActivities = await storage.listCrmActivityEvents({ submissionId, limit: 100 });
+
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const response = await fetch(`${origin}/api/admin/deal-hunter/dispositions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ dealKey, reason: 'valuation', note: 'Stale import must fail closed.' }),
+    });
+    const submission = await storage.getSubmission(submissionId);
+    const score = await storage.getDealHunterOpportunityScore(opportunityId);
+    const dispositions = await storage.listDealHunterDispositions({ dealKeys: [dealKey], limit: 20 });
+    const activities = await storage.listCrmActivityEvents({ submissionId, limit: 100 });
+    assert.deepEqual({
+      status: response.status,
+      submissionStatus: submission.status,
+      dispositionCount: dispositions.length,
+      reviewedAt: score.reviewed_at,
+      activityCount: activities.length,
+    }, {
+      status: 409,
+      submissionStatus: 'review',
+      dispositionCount: 0,
+      reviewedAt: null,
+      activityCount: beforeActivities.length,
+    });
+  });
+});
+
+test('legacy disposition HTTP route fails closed when its CIM authority points to a stale canonical opportunity', async () => {
+  // Break caught: a stale CIM owner was filtered away before fallback, while
+  // the generic route reused that CIM row to authorize and archive CRM.
+  const storage = getStorage();
+  const opportunityId = 'opp-http-stale-cim-authority';
+  const dealKey = 'source:http-stale-cim-authority';
+  const leadResult = await createManualSubmission({
+    company: 'Stale CIM Authority Services',
+    lead_type: 'broker',
+    broker_name: 'Stale CIM Broker',
+    broker_email: 'stale-cim@example.com',
+    listing_url: 'https://broker.example/stale-cim-authority',
+    status: 'review',
+    follow_up_state: 'scheduled',
+    metadata: {},
+  }, 'triage-admin', { storage });
+  assert.equal(leadResult.ok, true);
+  const submissionId = leadResult.submission.id;
+  await seedCurrentOpportunity(opportunityId, submissionId, dealKey);
+  await seedCimAuthority(storage, {
+    id: 'cim-http-stale-authority',
+    dealKey,
+    opportunityId,
+    submissionId,
+    recipientEmail: 'stale-cim@example.com',
+  });
+  await supersedeOpportunity(storage, opportunityId);
+  const beforeActivities = await storage.listCrmActivityEvents({ submissionId, limit: 100 });
+  const beforeCim = await storage.getDealHunterCimRequestById('cim-http-stale-authority');
+
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const response = await fetch(`${origin}/api/admin/deal-hunter/dispositions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({
+        dealKey,
+        reason: 'valuation',
+        note: 'Stale CIM must fail closed.',
+        submissionId,
+      }),
+    });
+    const submission = await storage.getSubmission(submissionId);
+    const score = await storage.getDealHunterOpportunityScore(opportunityId);
+    const dispositions = await storage.listDealHunterDispositions({ dealKeys: [dealKey], limit: 20 });
+    const activities = await storage.listCrmActivityEvents({ submissionId, limit: 100 });
+    const cim = await storage.getDealHunterCimRequestById('cim-http-stale-authority');
+    assert.deepEqual({
+      status: response.status,
+      submissionStatus: submission.status,
+      dispositionCount: dispositions.length,
+      reviewedAt: score.reviewed_at,
+      activityCount: activities.length,
+      cimStatePreserved: cim.request_state === beforeCim.request_state
+        && cim.follow_up_state === beforeCim.follow_up_state,
+    }, {
+      status: 409,
+      submissionStatus: 'review',
+      dispositionCount: 0,
+      reviewedAt: null,
+      activityCount: beforeActivities.length,
+      cimStatePreserved: true,
+    });
+  });
+});
+
+test('legacy disposition HTTP route detects an older conflicting CIM authority beyond the newest 100 records', async () => {
+  // Break caught: a limit of 100 made canonical authority depend on recency.
+  // The older conflicting current owner was omitted and the newer owner passed.
+  const storage = getStorage();
+  const opportunityId = 'opp-http-cim-window-primary';
+  const conflictingOpportunityId = 'opp-http-cim-window-conflict';
+  const dealKey = 'source:http-cim-window-conflict';
+  await seedCurrentOpportunity(opportunityId, null, dealKey);
+  await seedCurrentOpportunity(conflictingOpportunityId, null, 'source:http-cim-window-other-score');
+  await storage.reconcileDealHunterCurrentScoreEligibility([opportunityId, conflictingOpportunityId]);
+  await seedCimAuthority(storage, {
+    id: 'cim-http-window-older-conflict',
+    dealKey,
+    opportunityId: conflictingOpportunityId,
+    recipientEmail: 'older-conflict@example.com',
+    updatedAt: '2026-08-29T10:00:00.000Z',
+  });
+  for (let index = 0; index < 100; index += 1) {
+    await seedCimAuthority(storage, {
+      id: `cim-http-window-newer-${index}`,
+      dealKey,
+      opportunityId,
+      recipientEmail: `newer-${index}@example.com`,
+      updatedAt: new Date(Date.UTC(2026, 7, 30, 10, 0, index)).toISOString(),
+    });
+  }
+  const newestHundred = await storage.listDealHunterCimRequests({ dealKeys: [dealKey], limit: 100 });
+  const completeAuthority = await storage.listDealHunterCimRequests({ dealKeys: [dealKey], limit: 100000 });
+  assert.equal(newestHundred.length, 100);
+  assert.equal(newestHundred.some((request) => request.id === 'cim-http-window-older-conflict'), false,
+    'the conflicting authority must actually sit outside the former 100-row window');
+  assert.equal(completeAuthority.length, 101);
+
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const response = await fetch(`${origin}/api/admin/deal-hunter/dispositions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ dealKey, reason: 'valuation', note: 'All CIM authority must be considered.' }),
+    });
+    const responseBody = await response.json();
+    const score = await storage.getDealHunterOpportunityScore(opportunityId);
+    const dispositions = await storage.listDealHunterDispositions({ dealKeys: [dealKey], limit: 20 });
+    assert.deepEqual({
+      status: response.status,
+      error: responseBody.error,
+      dispositionCount: dispositions.length,
+      reviewedAt: score.reviewed_at,
+    }, {
+      status: 409,
+      error: 'This Deal Hunter key has conflicting current canonical links.',
+      dispositionCount: 0,
+      reviewedAt: null,
+    });
+  });
+});
+
+test('legacy alias restore resolves the canonical Inbox disposition and makes operator actions actionable again', async () => {
+  // Break caught: Pass canonicalized this durable alias to the score deal key,
+  // but restore exact-looked up the alias and returned 404.
+  const opportunityId = 'opp-http-alias-restore';
+  const aliasDealKey = 'source:http-alias-restore-observed';
+  const canonicalDealKey = 'source:http-alias-restore-canonical';
+  const { storage } = await seedCurrentOpportunity(opportunityId, null, canonicalDealKey);
+  await linkCanonicalDealKey(storage, { opportunityId, dealKey: aliasDealKey });
+
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const dispositionPath = `${origin}/api/admin/deal-hunter/dispositions`;
+    const pass = await fetch(dispositionPath, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ dealKey: aliasDealKey, reason: 'timing', note: 'Restore this persisted alias.' }),
+    });
+    assert.equal(pass.status, 200);
+    const passedDisposition = await storage.getDealHunterDisposition({ dealKey: canonicalDealKey });
+    assert.equal(passedDisposition.disposition, 'dismissed');
+    assert.equal(await storage.getDealHunterDisposition({ dealKey: aliasDealKey }), null);
+
+    const restore = await fetch(dispositionPath, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ action: 'restore', dealKey: aliasDealKey }),
+    });
+    const canonicalDisposition = await storage.getDealHunterDisposition({ dealKey: canonicalDealKey });
+    const dispositions = await storage.listDealHunterDispositions({ dealKeys: [aliasDealKey, canonicalDealKey], limit: 20 });
+    assert.deepEqual({
+      status: restore.status,
+      disposition: canonicalDisposition.disposition,
+      dispositionCount: dispositions.length,
+      dispositionIdentityPreserved: canonicalDisposition.id === passedDisposition.id,
+      aliasDispositionExists: Boolean(await storage.getDealHunterDisposition({ dealKey: aliasDealKey })),
+    }, {
+      status: 200,
+      disposition: 'restored',
+      dispositionCount: 1,
+      dispositionIdentityPreserved: true,
+      aliasDispositionExists: false,
+    });
+
+    const actionPath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/action`;
+    for (const action of ['watch', 'pursue']) {
+      const response = await fetch(actionPath, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify({ action }),
+      });
+      assert.equal(response.status, 200, `${action} must be actionable after alias restore`);
+    }
   });
 });
 

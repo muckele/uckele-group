@@ -15,6 +15,7 @@ import { getStorage } from '../storage/index.js';
 import {
   dismissDealHunterOpportunity,
   normalizeDealHunterDispositionReason,
+  restoreDealHunterOpportunity,
 } from './leadLifecycle.js';
 import { buildCimOpportunityAliases } from './cimOpportunityIdentity.js';
 import {
@@ -40,6 +41,7 @@ export const triageViews = Object.freeze([
 export const triageSorts = Object.freeze(['acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed']);
 
 const maxNoteLength = 2000;
+const maxDispositionAuthorityCimRecords = 100000;
 
 function normalizeText(value = '', maxLength = 400) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
@@ -626,21 +628,10 @@ export async function passTriageOpportunity({
   };
 }
 
-export async function dismissDealHunterOpportunityWithInboxAuthority({
-  dealKey = '',
-  listingUrl = '',
-  dealName = '',
-  reason = '',
-  note = '',
-  submissionId = '',
-  actor = 'admin',
-  storage = getStorage(),
-} = {}) {
+async function resolveDealHunterDispositionAuthority({ dealKey = '', storage = getStorage() } = {}) {
   const normalizedDealKey = typeof dealKey === 'string' ? normalizeText(dealKey, 1000) : '';
   if (!normalizedDealKey) {
-    return dismissDealHunterOpportunity({
-      dealKey, listingUrl, dealName, reason, note, submissionId, actor, storage,
-    });
+    return { ok: true, canonical: false, dealKey: normalizedDealKey };
   }
   const authorityMethods = [
     'findCurrentDealHunterOpportunityByAliases',
@@ -684,17 +675,36 @@ export async function dismissDealHunterOpportunityWithInboxAuthority({
 
   const [importRecord, cimRequests] = await Promise.all([
     storage.getDealHunterCrmImport({ dealKey: normalizedDealKey }),
-    storage.listDealHunterCimRequests({ dealKeys: [normalizedDealKey], limit: 100 }),
+    storage.listDealHunterCimRequests({
+      dealKeys: [normalizedDealKey],
+      limit: maxDispositionAuthorityCimRecords,
+    }),
   ]);
+  if ((cimRequests || []).length >= maxDispositionAuthorityCimRecords) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'This Deal Hunter key has too many CIM authority records to resolve safely.',
+    };
+  }
   const candidateIds = [...new Set([
     aliasOwner?.opportunity_id,
     scoreOwner?.opportunity_id,
     importRecord?.opportunity_id,
     ...(cimRequests || []).map((request) => request?.opportunity_id),
   ].map((value) => normalizeText(value, 200)).filter(Boolean))];
-  const currentCandidates = (await Promise.all(candidateIds.map(async (opportunityId) => (
-    storage.getCurrentDealHunterOpportunity(opportunityId)
-  )))).filter(Boolean);
+  const resolvedCandidates = await Promise.all(candidateIds.map(async (opportunityId) => ({
+    opportunityId,
+    current: await storage.getCurrentDealHunterOpportunity(opportunityId),
+  })));
+  if (resolvedCandidates.some((candidate) => !candidate.current)) {
+    return {
+      ok: false,
+      status: 409,
+      error: 'This Deal Hunter key references a non-current canonical opportunity.',
+    };
+  }
+  const currentCandidates = resolvedCandidates.map((candidate) => candidate.current);
   const currentIds = [...new Set(currentCandidates.map((opportunity) => opportunity.opportunity_id))];
 
   if (currentIds.length > 1) {
@@ -708,12 +718,49 @@ export async function dismissDealHunterOpportunityWithInboxAuthority({
     if (!currentScore) {
       return { ok: false, status: 409, error: 'This canonical opportunity has no current Acquisition Inbox score.' };
     }
-    return passTriageOpportunity({ opportunityId, reason, note, actor, storage });
+    const canonicalDealKey = normalizeText(currentScore.deal_key, 1000);
+    if (!canonicalDealKey) {
+      return { ok: false, status: 409, error: 'This canonical opportunity has no current Acquisition Inbox deal key.' };
+    }
+    return {
+      ok: true,
+      canonical: true,
+      dealKey: canonicalDealKey,
+      opportunityId,
+    };
   }
 
   // No active canonical owner and no current Inbox score means this is a true
   // pre-Inbox lifecycle record. Preserve that bounded compatibility path.
+  return { ok: true, canonical: false, dealKey: normalizedDealKey };
+}
+
+export async function dismissDealHunterOpportunityWithInboxAuthority({
+  dealKey = '',
+  listingUrl = '',
+  dealName = '',
+  reason = '',
+  note = '',
+  submissionId = '',
+  actor = 'admin',
+  storage = getStorage(),
+} = {}) {
+  const authority = await resolveDealHunterDispositionAuthority({ dealKey, storage });
+  if (!authority.ok) return authority;
+  if (authority.canonical) {
+    return passTriageOpportunity({ opportunityId: authority.opportunityId, reason, note, actor, storage });
+  }
   return dismissDealHunterOpportunity({
-    dealKey: normalizedDealKey, listingUrl, dealName, reason, note, submissionId, actor, storage,
+    dealKey: authority.dealKey, listingUrl, dealName, reason, note, submissionId, actor, storage,
   });
+}
+
+export async function restoreDealHunterOpportunityWithInboxAuthority({
+  dealKey = '',
+  actor = 'admin',
+  storage = getStorage(),
+} = {}) {
+  const authority = await resolveDealHunterDispositionAuthority({ dealKey, storage });
+  if (!authority.ok) return authority;
+  return restoreDealHunterOpportunity({ dealKey: authority.dealKey, actor, storage });
 }
