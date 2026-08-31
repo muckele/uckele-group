@@ -403,11 +403,14 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
       ? storage.listCrmCommunications({ submissionId: currentOpportunity.primary_submission_id, page: 1, pageSize: 100 })
       : { rows: [] },
   ]);
+  const sanitizedOperatorFacts = operatorFacts
+    .filter((fact) => fact && typeof fact === 'object' && opportunityFactFields.includes(fact.field))
+    .slice(0, 100);
   const sourceFacts = sourceRows.filter((row) => opportunityFactFields.includes(row.field));
   const crmFacts = directCrmFactRows(submission);
   const effectiveFacts = getEffectiveOpportunityFacts({
     opportunityId: id,
-    operatorFacts,
+    operatorFacts: sanitizedOperatorFacts,
     crmFacts,
     sourceFacts,
   });
@@ -429,7 +432,7 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
     status: 200,
     opportunity,
     effectiveFacts,
-    operatorFacts: operatorFacts.slice(0, 100).map(projectOperatorFact),
+    operatorFacts: sanitizedOperatorFacts.map(projectOperatorFact),
     sourceObservations,
     missingCriticalFields: criticalMissingFields({ effectiveFacts, sourceRows, summary: opportunity, listingUrls }),
     listingUrls,
@@ -447,7 +450,7 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
     history: {
       activities: activities.slice(0, 100).map((item) => ({ id: detailText(item.id, 200), eventType: detailText(item.event_type, 80), summary: detailText(item.summary, 500), createdAt: detailText(item.created_at, 80), actor: detailText(item.actor, 160) })),
       dispositions: dispositions.slice(0, 20).map((item) => ({ id: detailText(item.id, 200), disposition: detailText(item.disposition, 80), reason: detailText(item.reason, 160), note: detailText(item.note, 500), dismissedAt: detailText(item.dismissed_at, 80), dismissedBy: detailText(item.dismissed_by, 160) })),
-      operatorFacts: operatorFacts.slice(0, 100).map(projectOperatorFact),
+      operatorFacts: sanitizedOperatorFacts.map(projectOperatorFact),
       operatorState: { priority: detailText(opportunity.operatorPriority, 40), note: detailText(opportunity.operatorNote, 2000), reviewed: Boolean(opportunity.reviewed), reviewedAt: detailText(opportunity.reviewedAt, 80), reviewedBy: detailText(opportunity.reviewedBy, 160) },
     },
   };

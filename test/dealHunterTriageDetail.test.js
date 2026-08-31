@@ -4,9 +4,38 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { opportunityFactFields, opportunitySourceObservationFields, setOperatorOpportunityFact } from '../server/services/dealHunterOpportunityFacts.js';
+import { setOperatorOpportunityFact } from '../server/services/dealHunterOpportunityFacts.js';
 import { getTriageOpportunityDetail } from '../server/services/dealHunterTriage.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
+
+// These response contracts are deliberately independent literals. Importing
+// either production allowlist would let implementation and proof widen together.
+const approvedPhase1FactFields = Object.freeze([
+  'seller_name',
+  'seller_email',
+  'seller_phone',
+  'broker_name',
+  'broker_company',
+  'broker_email',
+  'broker_phone',
+  'reason_for_sale',
+  'real_estate_included',
+  'seller_financing',
+  'management_structure',
+  'customer_concentration',
+  'operator_contact_notes',
+]);
+
+const approvedSourceObservationFields = Object.freeze([
+  'name', 'business_name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
+  'annual_profit', 'annual_revenue', 'asking_price', 'profit_multiple', 'net_margin', 'years_established',
+  'remote_flag', 'franchise_flag', 'five_years_flag', 'broker_name', 'broker_company', 'broker_contact',
+  'broker_email', 'broker_phone', 'company', 'role', 'seller_name', 'seller_email', 'seller_phone',
+  'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure',
+  'customer_concentration', 'operator_contact_notes', 'listing_url', 'listing_source', 'listing_id',
+  'deal_key', 'source_identity', 'date_added', 'last_updated', 'business_website', 'prospectus_url',
+  'ttm_revenue', 'ttm_ebitda', 'ebitda_multiple', 'business_age', 'sba_eligible', 'lead_type',
+]);
 
 function currentScore(opportunityId) {
   return {
@@ -168,101 +197,334 @@ test('detail sends bounded storage reads and closed, safe URL projections', asyn
 });
 
 test('detail closes every nested projection and strips injected storage metadata', async (t) => {
+  // Breaks caught: widening either fact allowlist, raising/removing any detail
+  // collection cap, dropping a scalar truncation, coercing an object/array into
+  // a scalar, or spreading a raw provider row into the response.
   const { storage, opportunityId } = await detailStorage(t);
   const sentinel = 'DO-NOT-LEAK-DETAIL-SENTINEL';
+  const overlong = 'x'.repeat(9000);
+  const calls = {};
+  const sourceConflictFields = [
+    'seller_name',
+    ...approvedSourceObservationFields.filter((field) => field !== 'seller_name'),
+  ].slice(0, 21);
+  const sourceRows = Array.from({ length: 101 }, (_, index) => {
+    const fields = index < 2 ? sourceConflictFields : ['seller_name'];
+    return [
+      ...fields.map((field) => ({
+        source_id: `source-${index}`,
+        source_name: overlong,
+        source_record_id: `record-${index}`,
+        field,
+        value: field === 'seller_name' ? `${index}-${overlong}` : `${field}-${index}-${overlong}`,
+        observed_at: overlong,
+        updated_at: overlong,
+        metadata: { private: sentinel },
+      })),
+      {
+        source_id: `source-${index}`,
+        source_name: overlong,
+        source_record_id: `record-${index}`,
+        field: 'listing_url',
+        value: `https://broker.example/source/${index}`,
+        observed_at: overlong,
+        updated_at: overlong,
+        metadata: { private: sentinel },
+      },
+    ];
+  }).flat();
+  sourceRows.push(
+    { source_id: { private: sentinel }, source_name: [sentinel], source_record_id: { private: sentinel }, field: 'secret_provider_metadata', value: { private: sentinel }, observed_at: [sentinel] },
+    { source_id: 'object-source', source_name: 'Object source', source_record_id: 'object-record', field: { private: sentinel }, value: [sentinel], observed_at: { private: sentinel } },
+  );
+  const operatorRows = [
+    ...Array.from({ length: 99 }, (_, index) => ({
+      id: index === 0 ? overlong : `fact-${index}`,
+      field: approvedPhase1FactFields[index % approvedPhase1FactFields.length],
+      value: overlong,
+      verified: index % 2,
+      actor: overlong,
+      note: overlong,
+      created_at: overlong,
+      updated_at: overlong,
+      metadata: { private: sentinel },
+    })),
+    {
+      id: 'unsupported-fact', field: 'secret_provider_fact', value: sentinel, verified: true,
+      actor: sentinel, note: sentinel, created_at: overlong, updated_at: overlong,
+    },
+    ...Array.from({ length: 2 }, (_, offset) => ({
+      id: `fact-${99 + offset}`,
+      field: approvedPhase1FactFields[(99 + offset) % approvedPhase1FactFields.length],
+      value: overlong,
+      verified: true,
+      actor: overlong,
+      note: overlong,
+      created_at: overlong,
+      updated_at: overlong,
+      metadata: { private: sentinel },
+    })),
+  ];
+  const crmFactValues = {
+    sellerName: `seller_name-${overlong}`,
+    sellerEmail: `seller_email-${overlong}`,
+    sellerPhone: `seller_phone-${overlong}`,
+    brokerName: `broker_name-${overlong}`,
+    brokerCompany: `broker_company-${overlong}`,
+    brokerEmail: `broker_email-${overlong}`,
+    brokerPhone: `broker_phone-${overlong}`,
+    reasonForSale: `reason_for_sale-${overlong}`,
+    realEstateIncluded: false,
+    sellerFinancing: 0,
+    managementStructure: `management_structure-${overlong}`,
+    customerConcentration: `customer_concentration-${overlong}`,
+    operatorContactNotes: `operator_contact_notes-${overlong}`,
+  };
   const hostile = new Proxy(storage, {
     get(target, property) {
       if (property === 'getCurrentDealHunterOpportunityScore') return async () => ({
         ...currentScore(opportunityId),
-        opportunity_id: { private: sentinel }, name: { private: sentinel }, state: { private: sentinel }, operator_priority: { private: sentinel }, operator_note: { private: sentinel }, reviewed_at: { private: sentinel }, reviewed_by: { private: sentinel }, reviewed_fingerprint: { private: sentinel },
+        opportunity_id: { private: sentinel }, deal_key: overlong, name: overlong, state: overlong,
+        industry: overlong, annual_profit: '123', annual_revenue: { private: sentinel }, asking_price: [sentinel], profit_multiple: '4.5',
+        top_strength: overlong, top_concern: overlong, crm_status: overlong, cim_status: overlong,
+        operator_priority: { private: sentinel }, operator_note: overlong, reviewed_at: { private: sentinel },
+        reviewed_by: [sentinel], reviewed_fingerprint: { private: sentinel }, dismissed_reason: overlong,
+        missing_evidence_count: 52, contradiction_count: 23, rules_version: overlong, scored_at: overlong,
         listing_url: 'https://broker.example/score',
-        dimensions: [{ id: 'financial-fit', label: 'x'.repeat(900), contribution: 20, private: sentinel }],
-        gates: [{ rule_id: 'gate', reason: 'x'.repeat(900), private: sentinel }],
-        applied_caps: [{ rule_id: 'cap', cap: 10, private: sentinel }],
-        confidence_reasons: ['x'.repeat(900), { private: sentinel }],
-        missing_evidence: ['x'.repeat(900), { private: sentinel }],
-        summary: { strengths: ['x'.repeat(900)], concerns: ['x'.repeat(900)], private: sentinel },
+        dimensions: Array.from({ length: 8 }, (_, index) => ({ id: `dimension-${index}`, label: overlong, contribution: index, private: sentinel })),
+        gates: Array.from({ length: 51 }, (_, index) => ({ rule_id: `gate-${index}`, reason: overlong, cap: index, value: index, private: sentinel })),
+        applied_caps: Array.from({ length: 51 }, (_, index) => ({ rule_id: `cap-${index}`, reason: overlong, cap: index, value: index, private: sentinel })),
+        confidence_reasons: [...Array.from({ length: 51 }, () => overlong), { private: sentinel }],
+        missing_evidence: [...Array.from({ length: 51 }, () => overlong), [sentinel]],
+        summary: {
+          strengths: [...Array.from({ length: 21 }, () => overlong), { private: sentinel }],
+          concerns: [...Array.from({ length: 21 }, () => overlong), [sentinel]],
+          private: sentinel,
+        },
       });
-      if (property === 'listDealHunterScoreEvidence') return async () => Array.from({ length: 600 }, (_, index) => ({
-        dimension: 'financial-fit', rule_id: `rule-${index}`, rule_label: 'x'.repeat(900), evidence_class: 'observed',
-        field: 'annual_profit', value: { private: sentinel }, observed_value: [sentinel], terms: ['x'.repeat(900), { private: sentinel }],
-        source_id: 'source', source_name: 'x'.repeat(900), source_record_id: 'record', listing_url: 'https://user:pass@broker.example/private',
-        observed_at: '2026-08-30T10:00:00.000Z', private: sentinel,
-      }));
-      if (property === 'listDealHunterOpportunitySourceObservations') return async () => Array.from({ length: 700 }, (_, index) => ({
-        source_id: index === 0 ? { private: sentinel } : `source-${index}`, source_name: index === 0 ? { private: sentinel } : 'Source',
-        source_record_id: index === 0 ? { private: sentinel } : `record-${index}`, field: index === 0 ? { private: sentinel } : 'seller_name',
-        value: index === 0 ? { private: sentinel } : `Seller ${index}`, observed_at: index === 0 ? { private: sentinel } : '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z',
-      }));
-      if (property === 'listDealHunterOpportunityFacts') return async () => [{ id: 'fact', field: 'seller_name', value: 'x'.repeat(9000), verified: true, actor: 'x'.repeat(900), note: 'x'.repeat(9000), created_at: '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z', private: sentinel }];
-      if (property === 'listDealHunterCimRequests') return async () => Array.from({ length: 101 }, (_, index) => ({ id: `cim-${index}`, status: 'x'.repeat(900), request_state: sentinel, delivery_state: sentinel, provider: sentinel, reply_to: sentinel, metadata: { private: sentinel }, updated_at: 'x'.repeat(900) }));
-      if (property === 'listCrmActivityEvents') return async () => Array.from({ length: 101 }, (_, index) => ({ id: `activity-${index}`, event_type: 'x'.repeat(900), summary: 'x'.repeat(9000), created_at: 'x'.repeat(900), actor: 'x'.repeat(900), provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }));
-      if (property === 'listDealHunterDispositions') return async () => Array.from({ length: 21 }, (_, index) => ({ id: `disposition-${index}`, disposition: 'x'.repeat(900), reason: 'x'.repeat(900), note: 'x'.repeat(9000), dismissed_at: 'x'.repeat(900), dismissed_by: 'x'.repeat(900), provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }));
-      if (property === 'listCrmCommunications') return async () => ({ rows: [{ id: 'comm', direction: 'x'.repeat(900), channel: 'x'.repeat(900), kind: 'x'.repeat(900), occurred_at: 'x'.repeat(900), cim_request_id: 'cim-0', provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }] });
-      if (property === 'getSubmission') return async () => ({ id: 'submission', status: 'x'.repeat(900), company: 'x'.repeat(900), seller_name: 'x'.repeat(900), seller_email: 'x'.repeat(900), broker_name: 'x'.repeat(900), broker_email: 'x'.repeat(900), updated_at: 'x'.repeat(900), provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel, dealHunter: { sellerPhone: { private: sentinel } } } });
+      if (property === 'listDealHunterScoreEvidence') return async (...args) => {
+        calls.evidence = args;
+        const makeEvidence = (index, dimension, prefix) => ({
+          dimension,
+          rule_id: `${prefix}-${index}`,
+          rule_label: index === 1 ? { private: sentinel } : overlong,
+          evidence_class: index === 1 ? [sentinel] : overlong,
+          field: index === 1 ? { private: sentinel } : overlong,
+          value: index === 1 ? { private: sentinel } : overlong,
+          observed_value: index === 1 ? [sentinel] : overlong,
+          terms: [...Array.from({ length: 21 }, () => overlong), { private: sentinel }],
+          source_id: index === 1 ? { private: sentinel } : overlong,
+          source_name: index === 1 ? [sentinel] : overlong,
+          source_record_id: index === 1 ? { private: sentinel } : overlong,
+          listing_url: 'https://user:pass@broker.example/private',
+          observed_at: index === 1 ? { private: sentinel } : overlong,
+          metadata: { private: sentinel },
+        });
+        return [
+          ...Array.from({ length: 101 }, (_, index) => makeEvidence(index, 'dimension-0', 'rule')),
+          ...Array.from({ length: 101 }, (_, index) => makeEvidence(index, '', 'unattributed')),
+        ];
+      };
+      if (property === 'listDealHunterOpportunitySourceObservations') return async (...args) => { calls.sources = args; return sourceRows; };
+      if (property === 'listDealHunterOpportunityFacts') return async (...args) => { calls.facts = args; return operatorRows; };
+      if (property === 'listDealHunterCimRequests') return async (...args) => {
+        calls.cimRequests = args;
+        return Array.from({ length: 101 }, (_, index) => ({ id: `cim-${index}`, status: overlong, request_state: sentinel, delivery_state: sentinel, provider: sentinel, reply_to: sentinel, metadata: { private: sentinel }, updated_at: overlong }));
+      };
+      if (property === 'listCrmActivityEvents') return async (...args) => {
+        calls.activities = args;
+        return Array.from({ length: 101 }, (_, index) => ({ id: `activity-${index}`, event_type: overlong, summary: overlong, created_at: overlong, actor: overlong, provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }));
+      };
+      if (property === 'listDealHunterDispositions') return async (...args) => {
+        calls.dispositions = args;
+        return Array.from({ length: 21 }, (_, index) => ({ id: `disposition-${index}`, disposition: overlong, reason: overlong, note: overlong, dismissed_at: overlong, dismissed_by: overlong, provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }));
+      };
+      if (property === 'listCrmCommunications') return async (...args) => {
+        calls.communications = args;
+        return { rows: Array.from({ length: 101 }, (_, index) => ({ id: `comm-${index}`, direction: overlong, channel: overlong, kind: overlong, occurred_at: overlong, cim_request_id: `cim-${index}`, provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } })) };
+      };
+      if (property === 'getSubmission') return async () => ({
+        id: overlong,
+        status: overlong,
+        company: { private: sentinel },
+        seller_name: { private: sentinel },
+        seller_email: [sentinel],
+        broker_name: { private: sentinel },
+        broker_email: [sentinel],
+        updated_at: overlong,
+        provider: sentinel,
+        reply_to: sentinel,
+        delivery_state: sentinel,
+        metadata: { private: sentinel, dealHunter: { ...crmFactValues, providerPrivate: sentinel } },
+      });
       const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
     },
   });
   const detail = await getTriageOpportunityDetail({ opportunityId, storage: hostile });
-  const assertExactRecord = (record, keys, label) => assert.deepEqual(Object.keys(record).sort(), [...keys].sort(), label);
-  const assertBoundedPrimitive = (value, max, label) => {
-    assert.equal(['string', 'number', 'boolean'].includes(typeof value), true, `${label} is primitive`);
-    if (typeof value === 'string') assert.ok(value.length <= max, `${label} is bounded`);
+  const assertRecordContract = (record, contract, label) => {
+    assert.deepEqual(Object.keys(record).sort(), Object.keys(contract).sort(), `${label} has exact keys`);
+    for (const [key, rule] of Object.entries(contract)) {
+      const value = record[key];
+      if (rule.nullable && value === null) continue;
+      assert.equal(typeof value, rule.type, `${label}.${key} has ${rule.type} type`);
+      if (rule.type === 'string') assert.ok(value.length <= rule.max, `${label}.${key} is at most ${rule.max} chars`);
+    }
   };
-  const assertBoundedNullablePrimitive = (value, max, label) => {
-    if (value === null) return;
-    assertBoundedPrimitive(value, max, label);
+  const text = (max) => ({ type: 'string', max });
+  const number = { type: 'number' };
+  const boolean = { type: 'boolean' };
+  const nullableNumber = { type: 'number', nullable: true };
+  const opportunityContract = {
+    opportunityId: text(200), dealKey: text(200), name: text(500), state: text(40), listingUrl: text(2000),
+    fitScore: number, scoreStatus: text(80), confidence: text(80), completenessScore: number,
+    missingEvidenceCount: number, contradictionCount: number, shouldRemove: boolean, highFit: boolean,
+    geography: { type: 'object' }, industry: text(240), financials: { type: 'object' }, topStrength: text(400),
+    topConcern: text(400), workflow: { type: 'object' }, observationFreshness: text(80), operatorPriority: text(40),
+    operatorNote: text(2000), reviewed: boolean, reviewedAt: text(80), reviewedBy: text(160),
+    changedSinceReview: boolean, dismissed: boolean, dismissedReason: text(160), scoredAt: text(80),
+    scoreFingerprint: text(200), rulesVersion: text(160),
   };
-  assertExactRecord(detail.opportunity, ['opportunityId', 'dealKey', 'name', 'state', 'listingUrl', 'fitScore', 'scoreStatus', 'confidence', 'completenessScore', 'missingEvidenceCount', 'contradictionCount', 'shouldRemove', 'highFit', 'geography', 'industry', 'financials', 'topStrength', 'topConcern', 'workflow', 'observationFreshness', 'operatorPriority', 'operatorNote', 'reviewed', 'reviewedAt', 'reviewedBy', 'changedSinceReview', 'dismissed', 'dismissedReason', 'scoredAt', 'scoreFingerprint', 'rulesVersion'], 'opportunity is closed');
-  assert.deepEqual(Object.keys(detail.score).sort(), ['appliedCaps', 'completenessScore', 'confidence', 'confidenceReasons', 'dimensions', 'fitScore', 'gates', 'missingEvidence', 'scoreStatus', 'summary', 'unattributedEvidence']);
-  assert.deepEqual(Object.keys(detail.score.dimensions[0]).sort(), ['contribution', 'evidence', 'id', 'label']);
-  assert.deepEqual(Object.keys(detail.operatorFacts[0]).sort(), ['actor', 'createdAt', 'field', 'id', 'note', 'updatedAt', 'value', 'verified']);
-  assert.deepEqual(Object.keys(detail.effectiveFacts).every((field) => opportunityFactFields.includes(field)), true);
+  const operatorFactContract = { id: text(200), field: text(80), value: text(4000), verified: boolean, actor: text(160), note: text(500), createdAt: text(80), updatedAt: text(80) };
+  const evidenceContract = {
+    ruleId: text(160), ruleLabel: text(160), evidenceClass: text(80), field: text(80), value: text(500),
+    observedValue: text(500), terms: { type: 'object' }, sourceId: text(200), sourceName: text(160),
+    sourceRecordId: text(200), listingUrl: text(2000), observedAt: text(80),
+  };
+  const communicationContract = { id: text(200), direction: text(80), channel: text(80), kind: text(80), occurredAt: text(80), cimRequestId: text(200) };
+  assertRecordContract(detail.opportunity, opportunityContract, 'opportunity');
+  assertRecordContract(detail.opportunity.geography, { city: text(160), state: text(40), label: text(240) }, 'opportunity.geography');
+  assertRecordContract(detail.opportunity.financials, { annualProfit: nullableNumber, annualRevenue: nullableNumber, askingPrice: nullableNumber, profitMultiple: nullableNumber }, 'opportunity.financials');
+  assertRecordContract(detail.opportunity.workflow, { crmStatus: text(80), cimStatus: text(80) }, 'opportunity.workflow');
+  assert.equal(detail.opportunity.missingEvidenceCount, 52, 'persisted missing-evidence count remains exact');
+  assert.equal(detail.opportunity.contradictionCount, 23, 'persisted contradiction count remains exact');
+
+  assert.deepEqual(calls.evidence, [opportunityId, { limit: 500 }], 'evidence read is capped at 500');
+  assert.deepEqual(calls.sources, [opportunityId, { limit: 500 }], 'source-observation read is capped at 500');
+  assert.deepEqual(calls.facts, [opportunityId, { limit: 100 }], 'operator-fact read is capped at 100');
+  assert.deepEqual(calls.cimRequests, [{ opportunityIds: [opportunityId], limit: 100 }], 'CIM request read is independently capped at 100');
+  assert.deepEqual(calls.activities, [{ submissionId: 'submission-detail', limit: 100 }], 'CRM activity read is capped at 100');
+  assert.equal(calls.dispositions.length, 1);
+  assert.equal(calls.dispositions[0].limit, 20, 'disposition read is capped at 20');
+  assert.equal(Array.isArray(calls.dispositions[0].dealKeys), true);
+  assert.deepEqual(calls.communications, [{ submissionId: 'submission-detail', page: 1, pageSize: 100 }], 'CRM communication read is capped at 100');
+
+  assert.deepEqual(Object.keys(detail.effectiveFacts).sort(), [...approvedPhase1FactFields].sort(), 'effective facts expose exactly the literal 13-field Phase 1 contract');
   for (const [field, fact] of Object.entries(detail.effectiveFacts)) {
-    assertExactRecord(fact, ['value', 'provenance', 'verified', 'actor', 'note'], `effective fact ${field} is closed`);
-    assertBoundedPrimitive(fact.value, 4000, `effective fact ${field} value`);
-    assertBoundedPrimitive(fact.provenance, 80, `effective fact ${field} provenance`);
-    assert.equal(typeof fact.verified, 'boolean', `effective fact ${field} verification is boolean`);
-    assertBoundedNullablePrimitive(fact.actor, 200, `effective fact ${field} actor`);
-    assertBoundedNullablePrimitive(fact.note, 500, `effective fact ${field} note`);
+    assert.ok(approvedPhase1FactFields.includes(field), `effective fact ${field} is approved`);
+    assertRecordContract(fact, { value: text(4000), provenance: text(80), verified: boolean, actor: { ...text(200), nullable: true }, note: { ...text(500), nullable: true } }, `effectiveFacts.${field}`);
   }
-  assert.deepEqual(Object.keys(detail.history.operatorState).sort(), ['note', 'priority', 'reviewed', 'reviewedAt', 'reviewedBy']);
-  assert.deepEqual(Object.keys(detail.opportunity.geography).sort(), ['city', 'label', 'state']);
-  assert.deepEqual(Object.keys(detail.opportunity.financials).sort(), ['annualProfit', 'annualRevenue', 'askingPrice', 'profitMultiple']);
-  assert.deepEqual(Object.keys(detail.opportunity.workflow).sort(), ['cimStatus', 'crmStatus']);
-  assertExactRecord(detail.sourceObservations[0], ['sourceId', 'sourceName', 'sourceRecordId', 'observedAt', 'values', 'conflicts'], 'source group is closed');
-  assert.equal(Object.keys(detail.sourceObservations[0].values).every((field) => opportunitySourceObservationFields.includes(field)), true);
-  assertExactRecord(detail.sourceObservations[0].conflicts[0], ['field', 'observations'], 'source conflict is closed');
-  assertExactRecord(detail.sourceObservations[0].conflicts[0].observations[0], ['sourceId', 'sourceName', 'sourceRecordId', 'value', 'observedAt'], 'source conflict observation is closed');
-  assertExactRecord(detail.cimSummary, ['requests', 'communications'], 'CIM summary is closed');
-  assertExactRecord(detail.crmSummary, ['submission', 'communications', 'factObservations', 'conflicts'], 'CRM summary is closed');
-  assert.deepEqual(Object.keys(detail.cimSummary.requests[0]).sort(), ['id', 'status', 'updatedAt']);
-  assertExactRecord(detail.cimSummary.communications[0], ['id', 'direction', 'channel', 'kind', 'occurredAt', 'cimRequestId'], 'CIM communication is closed');
-  assertExactRecord(detail.crmSummary.submission, ['id', 'status', 'company', 'sellerName', 'sellerEmail', 'brokerName', 'brokerEmail', 'updatedAt'], 'CRM submission is closed');
-  assert.deepEqual(Object.keys(detail.crmSummary.communications[0]).sort(), ['channel', 'cimRequestId', 'direction', 'id', 'kind', 'occurredAt']);
-  assertExactRecord(detail.crmSummary.factObservations[0], ['field', 'value', 'provenance'], 'CRM fact observation is closed');
-  assertExactRecord(detail.crmSummary.conflicts[0], ['field', 'winningProvenance', 'crmValue'], 'CRM conflict is closed');
-  assertExactRecord(detail.history, ['activities', 'dispositions', 'operatorFacts', 'operatorState'], 'history is closed');
-  assertExactRecord(detail.history.activities[0], ['id', 'eventType', 'summary', 'createdAt', 'actor'], 'activity is closed');
-  assertExactRecord(detail.history.dispositions[0], ['id', 'disposition', 'reason', 'note', 'dismissedAt', 'dismissedBy'], 'disposition is closed');
-  assertExactRecord(detail.history.operatorFacts[0], ['id', 'field', 'value', 'verified', 'actor', 'note', 'createdAt', 'updatedAt'], 'history operator fact is closed');
-  assert.ok(detail.score.dimensions[0].evidence.length <= 100);
-  assert.ok(detail.score.dimensions[0].label.length <= 160);
-  assert.ok(detail.operatorFacts[0].value.length <= 4000);
-  assert.equal(detail.history.activities.length, 100);
-  assert.equal(detail.history.dispositions.length, 20);
-  for (const activity of detail.history.activities) {
-    for (const [key, max] of [['id', 200], ['eventType', 80], ['summary', 500], ['createdAt', 80], ['actor', 160]]) assertBoundedPrimitive(activity[key], max, `activity ${key}`);
+  assert.equal(Object.hasOwn(detail.effectiveFacts, 'secret_provider_fact'), false, 'hostile provider fact cannot widen effective facts');
+  assert.equal(detail.operatorFacts.length, 100, 'operator facts retain the literal 100-record cap');
+  assert.equal(detail.operatorFacts.at(-1).id, 'fact-99', 'operator facts retain the deterministic first 100 approved records');
+  assert.deepEqual([
+    ...detail.operatorFacts.map(({ field }) => ({ container: 'operatorFacts', field })),
+    ...detail.history.operatorFacts.map(({ field }) => ({ container: 'history.operatorFacts', field })),
+  ].filter(({ field }) => !approvedPhase1FactFields.includes(field)), [], 'top-level and history operator facts reject hostile fields outside the literal Phase 1 contract');
+  for (const fact of detail.operatorFacts) {
+    assertRecordContract(fact, operatorFactContract, 'operator fact');
+    assert.ok(approvedPhase1FactFields.includes(fact.field), `operator fact ${fact.field} is approved`);
   }
-  for (const disposition of detail.history.dispositions) {
-    for (const [key, max] of [['id', 200], ['disposition', 80], ['reason', 160], ['note', 500], ['dismissedAt', 80], ['dismissedBy', 160]]) assertBoundedPrimitive(disposition[key], max, `disposition ${key}`);
+
+  assert.equal(detail.sourceObservations.length, 100, 'source groups retain the literal 100-group cap');
+  assert.equal(detail.sourceObservations[0].sourceRecordId, 'record-0');
+  assert.equal(detail.sourceObservations.at(-1).sourceRecordId, 'record-99');
+  assert.equal(detail.sourceObservations.some((group) => group.sourceRecordId === 'record-100'), false, 'source group 101 is truncated');
+  for (const group of detail.sourceObservations) {
+    assertRecordContract(group, { sourceId: text(200), sourceName: text(160), sourceRecordId: text(200), observedAt: text(80), values: { type: 'object' }, conflicts: { type: 'object' } }, 'source group');
+    for (const [field, value] of Object.entries(group.values)) {
+      assert.ok(approvedSourceObservationFields.includes(field), `source value ${field} is approved`);
+      assert.equal(typeof value, 'string', `source value ${field} is a string`);
+      assert.ok(value.length <= (['listing_url', 'prospectus_url', 'business_website'].includes(field) ? 2000 : 5000), `source value ${field} is bounded`);
+    }
+    for (const conflict of group.conflicts) {
+      assertRecordContract(conflict, { field: text(80), observations: { type: 'object' } }, 'source conflict');
+      assert.ok(conflict.observations.length <= 20, 'conflict observations retain the 20-record cap');
+      for (const observation of conflict.observations) {
+        assertRecordContract(observation, { sourceId: text(200), sourceName: text(160), sourceRecordId: text(200), value: text(5000), observedAt: text(80) }, 'conflict observation');
+      }
+    }
   }
-  assert.equal(typeof detail.opportunity.reviewed, 'boolean');
-  assert.ok(detail.history.operatorState.note.length <= 2000);
-  assert.equal(detail.sourceObservations.some((item) => JSON.stringify(item).includes(sentinel)), false);
-  assert.ok(detail.sourceObservations.length <= 100);
-  assert.ok(detail.sourceObservations.every((item) => Object.keys(item.values).every((field) => ['seller_name'].includes(field))));
-  assert.equal(JSON.stringify(detail).includes(sentinel), false);
+  assert.equal(detail.sourceObservations[0].conflicts.length, 20, 'conflicts per source group retain the literal 20-field cap');
+  assert.deepEqual(detail.sourceObservations[0].conflicts.map(({ field }) => field), sourceConflictFields.slice(0, 20), 'conflict truncation retains the first 20 fields');
+  const sellerConflict = detail.sourceObservations[0].conflicts.find(({ field }) => field === 'seller_name');
+  assert.equal(sellerConflict.observations.length, 20, 'conflict observations retain the literal 20-record cap');
+  assert.deepEqual(sellerConflict.observations.map(({ sourceRecordId }) => sourceRecordId), Array.from({ length: 20 }, (_, index) => `record-${index}`), 'conflict truncation retains this group and the first 19 peers');
+
+  assert.equal(detail.listingUrls.length, 100, 'listing URLs retain the literal 100-URL cap');
+  assert.equal(detail.listingUrls[0], 'https://broker.example/score');
+  assert.equal(detail.listingUrls.at(-1), 'https://broker.example/source/98');
+  assert.equal(detail.listingUrls.includes('https://broker.example/source/99'), false, 'listing URL 101 is truncated');
+  for (const url of detail.listingUrls) { assert.equal(typeof url, 'string'); assert.ok(url.length <= 2000); }
+
+  assertRecordContract(detail.score, {
+    fitScore: number, scoreStatus: text(80), confidence: text(80), completenessScore: number,
+    dimensions: { type: 'object' }, unattributedEvidence: { type: 'object' }, appliedCaps: { type: 'object' },
+    gates: { type: 'object' }, confidenceReasons: { type: 'object' }, missingEvidence: { type: 'object' }, summary: { type: 'object' },
+  }, 'score');
+  assert.equal(detail.score.dimensions.length, 7, 'score dimensions retain the literal seven-dimension cap');
+  assert.deepEqual(detail.score.dimensions.map(({ id }) => id), Array.from({ length: 7 }, (_, index) => `dimension-${index}`));
+  for (const dimension of detail.score.dimensions) assertRecordContract(dimension, { id: text(80), label: text(160), contribution: number, evidence: { type: 'object' } }, 'score dimension');
+  assert.equal(detail.score.dimensions[0].evidence.length, 100, 'dimension evidence retains the literal 100-record cap');
+  assert.equal(detail.score.dimensions[0].evidence.at(-1).ruleId, 'rule-99');
+  assert.equal(detail.score.unattributedEvidence.length, 100, 'unattributed evidence retains the literal 100-record cap');
+  assert.equal(detail.score.unattributedEvidence.at(-1).ruleId, 'unattributed-99');
+  for (const evidence of [...detail.score.dimensions[0].evidence, ...detail.score.unattributedEvidence]) {
+    assertRecordContract(evidence, evidenceContract, 'score evidence');
+    assert.equal(evidence.terms.length, 20, 'evidence terms retain the literal 20-item cap');
+    for (const term of evidence.terms) { assert.equal(typeof term, 'string'); assert.ok(term.length <= 160); }
+  }
+  const ruleContract = { ruleId: text(160), reason: text(500), cap: number, value: number };
+  for (const [name, prefix] of [['appliedCaps', 'cap'], ['gates', 'gate']]) {
+    assert.equal(detail.score[name].length, 50, `${name} retains the literal 50-record cap`);
+    assert.equal(detail.score[name].at(-1).ruleId, `${prefix}-49`);
+    for (const rule of detail.score[name]) assertRecordContract(rule, ruleContract, `score.${name}`);
+  }
+  for (const name of ['confidenceReasons', 'missingEvidence']) {
+    assert.equal(detail.score[name].length, 50, `${name} retains the literal 50-item cap`);
+    for (const value of detail.score[name]) { assert.equal(typeof value, 'string'); assert.ok(value.length <= 500); }
+  }
+  assertRecordContract(detail.score.summary, { strengths: { type: 'object' }, concerns: { type: 'object' } }, 'score summary');
+  for (const name of ['strengths', 'concerns']) {
+    assert.equal(detail.score.summary[name].length, 20, `summary ${name} retains the literal 20-item cap`);
+    for (const value of detail.score.summary[name]) { assert.equal(typeof value, 'string'); assert.ok(value.length <= 500); }
+  }
+
+  assertRecordContract(detail.cimSummary, { requests: { type: 'object' }, communications: { type: 'object' } }, 'CIM summary');
+  assert.equal(detail.cimSummary.requests.length, 100, 'CIM requests retain the literal 100-record response cap');
+  assert.equal(detail.cimSummary.requests.at(-1).id, 'cim-99', 'CIM request 101 is deterministically truncated');
+  for (const request of detail.cimSummary.requests) assertRecordContract(request, { id: text(200), status: text(80), updatedAt: text(80) }, 'CIM request');
+  assert.equal(detail.cimSummary.communications.length, 100, 'CIM communications retain the literal 100-record cap');
+  assert.equal(detail.cimSummary.communications.at(-1).id, 'comm-99');
+  for (const communication of detail.cimSummary.communications) assertRecordContract(communication, communicationContract, 'CIM communication');
+
+  assertRecordContract(detail.crmSummary, { submission: { type: 'object' }, communications: { type: 'object' }, factObservations: { type: 'object' }, conflicts: { type: 'object' } }, 'CRM summary');
+  assertRecordContract(detail.crmSummary.submission, { id: text(200), status: text(80), company: text(500), sellerName: text(500), sellerEmail: text(500), brokerName: text(500), brokerEmail: text(500), updatedAt: text(80) }, 'CRM submission');
+  assert.equal(detail.crmSummary.communications.length, 100, 'CRM communications retain the literal 100-record cap');
+  assert.equal(detail.crmSummary.communications.at(-1).id, 'comm-99');
+  for (const communication of detail.crmSummary.communications) assertRecordContract(communication, communicationContract, 'CRM communication');
+  assert.equal(detail.crmSummary.factObservations.length, 13, 'CRM facts retain the literal 13-field cap');
+  assert.deepEqual(detail.crmSummary.factObservations.map(({ field }) => field).sort(), [...approvedPhase1FactFields].sort());
+  for (const fact of detail.crmSummary.factObservations) assertRecordContract(fact, { field: text(80), value: text(4000), provenance: text(80) }, 'CRM fact observation');
+  assert.equal(detail.crmSummary.conflicts.length, 13, 'CRM conflicts retain the literal 13-field cap');
+  assert.deepEqual(detail.crmSummary.conflicts.map(({ field }) => field).sort(), [...approvedPhase1FactFields].sort());
+  for (const conflict of detail.crmSummary.conflicts) assertRecordContract(conflict, { field: text(80), winningProvenance: text(80), crmValue: text(4000) }, 'CRM conflict');
+
+  assertRecordContract(detail.history, { activities: { type: 'object' }, dispositions: { type: 'object' }, operatorFacts: { type: 'object' }, operatorState: { type: 'object' } }, 'history');
+  assert.equal(detail.history.activities.length, 100, 'activities retain the literal 100-record cap');
+  assert.equal(detail.history.activities.at(-1).id, 'activity-99');
+  for (const activity of detail.history.activities) assertRecordContract(activity, { id: text(200), eventType: text(80), summary: text(500), createdAt: text(80), actor: text(160) }, 'activity');
+  assert.equal(detail.history.dispositions.length, 20, 'dispositions retain the literal 20-record cap');
+  assert.equal(detail.history.dispositions.at(-1).id, 'disposition-19');
+  for (const disposition of detail.history.dispositions) assertRecordContract(disposition, { id: text(200), disposition: text(80), reason: text(160), note: text(500), dismissedAt: text(80), dismissedBy: text(160) }, 'disposition');
+  assert.equal(detail.history.operatorFacts.length, 100, 'history operator facts retain the literal 100-record cap');
+  assert.equal(detail.history.operatorFacts.at(-1).id, 'fact-99');
+  for (const fact of detail.history.operatorFacts) {
+    assertRecordContract(fact, operatorFactContract, 'history operator fact');
+    assert.ok(approvedPhase1FactFields.includes(fact.field), `history operator fact ${fact.field} is approved`);
+  }
+  assertRecordContract(detail.history.operatorState, { priority: text(40), note: text(2000), reviewed: boolean, reviewedAt: text(80), reviewedBy: text(160) }, 'history operator state');
+
+  assert.equal(JSON.stringify(detail).includes(sentinel), false, 'raw provider/storage metadata and hostile object/array values never cross the API boundary');
 });
 
 test('source conflicts retain late source-record membership while each serialized conflict stays bounded', async (t) => {
