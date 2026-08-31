@@ -3033,16 +3033,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       const record = normalizeOperatorOpportunityFactRecord(fact);
       const { data, error } = await client
         .rpc('upsert_deal_hunter_opportunity_fact', {
-          p_id: record.id,
-          p_opportunity_id: record.opportunity_id,
-          p_field: record.field,
-          p_value: record.value,
-          p_source: record.source,
-          p_verified: record.verified,
-          p_actor: record.actor,
-          p_note: record.note,
-          p_created_at: record.created_at,
-          p_updated_at: record.updated_at,
+          p_fact: record,
         });
       if (error) throw error;
       return normalizeDealHunterOpportunityFactRow(data);
@@ -3051,9 +3042,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     async insertCurrentDealHunterOpportunityFact(fact = {}) {
       const record = normalizeOperatorOpportunityFactRecord(fact);
       const { data, error } = await client.rpc('insert_current_deal_hunter_opportunity_fact', {
-        p_id: record.id, p_opportunity_id: record.opportunity_id, p_field: record.field, p_value: record.value,
-        p_source: record.source, p_verified: record.verified, p_actor: record.actor,
-        p_note: record.note, p_created_at: record.created_at, p_updated_at: record.updated_at,
+        p_fact: record,
       });
       if (error) throw error;
       return normalizeDealHunterOpportunityFactRow(data);

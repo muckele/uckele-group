@@ -2442,6 +2442,8 @@ export function createSqliteStorage(config) {
           AND verified IN (0, 1)
           AND actor = trim(actor) AND length(actor) BETWEEN 1 AND 200
           AND (note IS NULL OR (note = trim(note) AND length(note) BETWEEN 1 AND 4000))
+          AND created_at = trim(created_at) AND length(created_at) BETWEEN 1 AND 80 AND julianday(created_at) IS NOT NULL
+          AND updated_at = trim(updated_at) AND length(updated_at) BETWEEN 1 AND 80 AND julianday(updated_at) IS NOT NULL
         ),
         FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE
       );
@@ -2458,6 +2460,8 @@ export function createSqliteStorage(config) {
           AND NEW.verified IN (0, 1)
           AND NEW.actor = trim(NEW.actor) AND length(NEW.actor) BETWEEN 1 AND 200
           AND (NEW.note IS NULL OR (NEW.note = trim(NEW.note) AND length(NEW.note) BETWEEN 1 AND 4000))
+          AND NEW.created_at = trim(NEW.created_at) AND length(NEW.created_at) BETWEEN 1 AND 80 AND julianday(NEW.created_at) IS NOT NULL
+          AND NEW.updated_at = trim(NEW.updated_at) AND length(NEW.updated_at) BETWEEN 1 AND 80 AND julianday(NEW.updated_at) IS NOT NULL
         ) THEN RAISE(ABORT, 'invalid operator opportunity fact') END;
       END;
 
@@ -2473,6 +2477,8 @@ export function createSqliteStorage(config) {
           AND NEW.verified IN (0, 1)
           AND NEW.actor = trim(NEW.actor) AND length(NEW.actor) BETWEEN 1 AND 200
           AND (NEW.note IS NULL OR (NEW.note = trim(NEW.note) AND length(NEW.note) BETWEEN 1 AND 4000))
+          AND NEW.created_at = trim(NEW.created_at) AND length(NEW.created_at) BETWEEN 1 AND 80 AND julianday(NEW.created_at) IS NOT NULL
+          AND NEW.updated_at = trim(NEW.updated_at) AND length(NEW.updated_at) BETWEEN 1 AND 80 AND julianday(NEW.updated_at) IS NOT NULL
         ) THEN RAISE(ABORT, 'invalid operator opportunity fact') END;
       END;
 

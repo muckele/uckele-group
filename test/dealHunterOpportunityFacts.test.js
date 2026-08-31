@@ -31,7 +31,7 @@ const opportunitySourceObservationSnapshotMigrationUrl = new URL(
   import.meta.url,
 );
 const currentOperatorFactMigrationUrl = new URL(
-  '../supabase/migrations/20260830180000_operator_fact_storage_boundary.sql',
+  '../supabase/migrations/20260830190000_operator_fact_raw_json_rpc.sql',
   import.meta.url,
 );
 const supabaseSchemaUrl = new URL('../supabase/schema.sql', import.meta.url);
@@ -150,29 +150,30 @@ function constrainedSupabaseBoundary() {
       async rpc(name, payload) {
         calls.push({ name, payload });
         if (name === 'upsert_deal_hunter_opportunity_fact') {
-          const existing = facts.get(payload.p_id);
+          const incoming = payload.p_fact;
+          const existing = facts.get(incoming.id);
           const row = existing
             ? {
                 ...existing,
-                field: payload.p_field,
-                value: payload.p_value,
-                source: payload.p_source,
-                verified: payload.p_verified,
-                actor: payload.p_actor,
-                note: payload.p_note,
-                updated_at: payload.p_updated_at,
+                field: incoming.field,
+                value: incoming.value,
+                source: incoming.source,
+                verified: incoming.verified,
+                actor: incoming.actor,
+                note: incoming.note,
+                updated_at: incoming.updated_at,
               }
             : {
-                id: payload.p_id,
-                opportunity_id: payload.p_opportunity_id,
-                field: payload.p_field,
-                value: payload.p_value,
-                source: payload.p_source,
-                verified: payload.p_verified,
-                actor: payload.p_actor,
-                note: payload.p_note,
-                created_at: payload.p_created_at,
-                updated_at: payload.p_updated_at,
+                id: incoming.id,
+                opportunity_id: incoming.opportunity_id,
+                field: incoming.field,
+                value: incoming.value,
+                source: incoming.source,
+                verified: incoming.verified,
+                actor: incoming.actor,
+                note: incoming.note,
+                created_at: incoming.created_at,
+                updated_at: incoming.updated_at,
               };
           facts.set(row.id, row);
           return { data: row, error: null };
@@ -357,11 +358,11 @@ test('Supabase current-fact adapter uses exactly one atomic RPC, normalizes its 
   assert.deepEqual(saved, { ...returned, verified: true });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].name, 'insert_current_deal_hunter_opportunity_fact');
-  assert.deepEqual(Object.keys(calls[0].payload).sort(), ['p_actor', 'p_created_at', 'p_field', 'p_id', 'p_note', 'p_opportunity_id', 'p_source', 'p_updated_at', 'p_value', 'p_verified']);
-  assert.deepEqual({ p_opportunity_id: calls[0].payload.p_opportunity_id, p_field: calls[0].payload.p_field, p_value: calls[0].payload.p_value, p_source: calls[0].payload.p_source, p_verified: calls[0].payload.p_verified, p_actor: calls[0].payload.p_actor, p_note: calls[0].payload.p_note }, { p_opportunity_id: opportunityId, p_field: 'seller_name', p_value: 'Current Seller', p_source: 'operator', p_verified: true, p_actor: 'admin', p_note: 'confirmed' });
-  assert.match(calls[0].payload.p_id, /^[0-9a-f-]{36}$/i);
-  assert.match(calls[0].payload.p_created_at, /^\d{4}-\d\d-\d\dT/);
-  assert.equal(calls[0].payload.p_updated_at, calls[0].payload.p_created_at);
+  assert.deepEqual(Object.keys(calls[0].payload), ['p_fact']);
+  assert.deepEqual({ opportunity_id: calls[0].payload.p_fact.opportunity_id, field: calls[0].payload.p_fact.field, value: calls[0].payload.p_fact.value, source: calls[0].payload.p_fact.source, verified: calls[0].payload.p_fact.verified, actor: calls[0].payload.p_fact.actor, note: calls[0].payload.p_fact.note }, { opportunity_id: opportunityId, field: 'seller_name', value: 'Current Seller', source: 'operator', verified: true, actor: 'admin', note: 'confirmed' });
+  assert.match(calls[0].payload.p_fact.id, /^[0-9a-f-]{36}$/i);
+  assert.match(calls[0].payload.p_fact.created_at, /^\d{4}-\d\d-\d\dT/);
+  assert.equal(calls[0].payload.p_fact.updated_at, calls[0].payload.p_fact.created_at);
 
   const failed = supabaseModule.createSupabaseStorage({ storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'key' } }, { client: { rpc: async () => ({ data: null, error: new Error('P0002 unavailable') }) } });
   await assert.rejects(failed.insertCurrentDealHunterOpportunityFact(factRecord()), /P0002 unavailable/);
@@ -429,7 +430,7 @@ test('current-fact RPC has the exact service-role fail-closed locking contract i
   assert.equal(normalizeRpc(migration), normalizeRpc(schema), 'forward migration and fresh schema must carry the identical current-fact RPC');
   for (const sql of [migration, schema]) {
     const definition = rpcDefinition(sql, 'insert_current_deal_hunter_opportunity_fact');
-    assert.match(definition, /^create or replace function public\.insert_current_deal_hunter_opportunity_fact\(\s*p_id text, p_opportunity_id text, p_field text, p_value text, p_source text,\s*p_verified boolean, p_actor text, p_note text, p_created_at timestamptz, p_updated_at timestamptz\s*\)/i);
+    assert.match(definition, /^create or replace function public\.insert_current_deal_hunter_opportunity_fact\(\s*p_fact jsonb\s*\)/i);
     assert.match(definition, /security definer[\s\S]*set search_path = public/i);
     assert.match(definition, /status = 'active' for update[\s\S]*if not found[\s\S]*errcode = 'P0002'[\s\S]*insert into public\.deal_hunter_opportunity_facts[\s\S]*returning \* into v_fact[\s\S]*return v_fact/i);
     assert.match(sql, /revoke all privileges on function public\.insert_current_deal_hunter_opportunity_fact[\s\S]*from public, anon, authenticated/i);
@@ -437,19 +438,95 @@ test('current-fact RPC has the exact service-role fail-closed locking contract i
   }
 });
 
+test('PostgREST fact RPCs receive raw JSON and reject non-boolean verification before conversion', () => {
+  // Break caught: PostgREST coerces a string, number, null, or missing
+  // verification value into the typed SQL boolean parameter before the RPC can
+  // distinguish it from a JSON boolean.
+  const migration = fs.readFileSync(currentOperatorFactMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(supabaseSchemaUrl, 'utf8');
+  for (const [label, sql] of [['forward migration', migration], ['fresh schema', schema]]) {
+    for (const functionName of ['upsert_deal_hunter_opportunity_fact', 'insert_current_deal_hunter_opportunity_fact']) {
+      const definition = rpcDefinition(sql, functionName);
+      assert.match(definition, new RegExp(`function public\\.${functionName}\\(\\s*p_fact jsonb\\s*\\)`, 'i'), `${label} ${functionName} must retain raw JSON`);
+      assert.match(definition, /jsonb_typeof\(p_fact\) = 'object'/i, `${label} ${functionName} must require an object payload`);
+      assert.match(definition, /jsonb_typeof\(p_fact -> 'verified'\) = 'boolean'/i, `${label} ${functionName} must reject string/number/null/missing verification before cast`);
+      assert.match(definition, /p_fact \?& array\['id', 'opportunity_id', 'field', 'value', 'source', 'verified', 'actor', 'note', 'created_at', 'updated_at'\]/i, `${label} ${functionName} must require the complete bounded record`);
+      assert.match(definition, /p_fact - array\['id', 'opportunity_id', 'field', 'value', 'source', 'verified', 'actor', 'note', 'created_at', 'updated_at'\] <> '\{\}'::jsonb/i, `${label} ${functionName} must reject metadata and unknown keys`);
+      assert.match(definition, /\(p_fact ->> 'field'\) not in \([\s\S]*'seller_name'[\s\S]*'operator_contact_notes'/i, `${label} ${functionName} must reject unsupported raw fields`);
+      assert.match(definition, /\(p_fact ->> 'value'\)[\s\S]*char_length\(p_fact ->> 'value'\) not between 1 and 4000/i, `${label} ${functionName} must reject unbounded raw values`);
+      assert.match(definition, /\(p_fact ->> 'source'\) <> 'operator'/i, `${label} ${functionName} must reject raw source spoofing`);
+      assert.match(definition, /security definer[\s\S]*set search_path = public/i, `${label} ${functionName} must retain hardened execution`);
+      assert.match(sql, new RegExp(`revoke all privileges on function public\\.${functionName}\\(\\s*jsonb\\s*\\)[\\s\\S]*from public, anon, authenticated`, 'i'), `${label} ${functionName} must remain service-role only`);
+      assert.match(sql, new RegExp(`grant execute on function public\\.${functionName}\\(\\s*jsonb\\s*\\)[\\s\\S]*to service_role`, 'i'), `${label} ${functionName} must grant only service role`);
+    }
+  }
+});
+
+test('initialized SQLite fact triggers retain legacy rows and reject raw invalid timestamps on insert and update', async (t) => {
+  // Break caught: initialized databases have no timestamp predicate (or lose
+  // either trigger), so a raw SQLite caller can append or mutate invalid facts.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-opportunity-facts-legacy-'));
+  const sqlitePath = path.join(directory, 'facts.sqlite');
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const legacy = new Database(sqlitePath);
+  legacy.exec(`
+    CREATE TABLE deal_hunter_opportunities (
+      opportunity_id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      canonical_name TEXT NOT NULL,
+      canonical_recipient TEXT,
+      canonical_location TEXT,
+      primary_submission_id TEXT,
+      identity_version TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      metadata TEXT NOT NULL DEFAULT '{}'
+    );
+    CREATE TABLE deal_hunter_opportunity_facts (
+      id TEXT PRIMARY KEY,
+      opportunity_id TEXT NOT NULL,
+      field TEXT NOT NULL,
+      value TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'operator',
+      verified INTEGER NOT NULL DEFAULT 0,
+      actor TEXT NOT NULL,
+      note TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO deal_hunter_opportunities VALUES ('opp-facts-1', '2026-08-30T11:00:00.000Z', '2026-08-30T11:00:00.000Z', 'Legacy Facts', NULL, NULL, NULL, 'legacy-v1', 'active', '{}');
+    INSERT INTO deal_hunter_opportunity_facts VALUES ('legacy-provider-fact', 'opp-facts-1', 'legacy_field', 'Legacy provider value', 'provider', 0, 'legacy-import', NULL, '2026-08-30T11:00:00.000Z', '2026-08-30T11:00:00.000Z');
+    INSERT INTO deal_hunter_opportunity_facts VALUES ('existing-operator-fact', 'opp-facts-1', 'seller_name', 'Existing operator', 'operator', 1, 'admin', NULL, '2026-08-30T11:00:00.000Z', '2026-08-30T11:00:00.000Z');
+  `);
+  legacy.close();
+
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  assert.equal((await storage.listDealHunterOpportunityFacts(opportunityId)).find((fact) => fact.id === 'legacy-provider-fact')?.value, 'Legacy provider value');
+  storage.close();
+
+  const initialized = new Database(sqlitePath);
+  const rawInsert = initialized.prepare(`INSERT INTO deal_hunter_opportunity_facts (id, opportunity_id, field, value, source, verified, actor, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  assert.throws(() => rawInsert.run('raw-invalid-timestamp', opportunityId, 'seller_name', 'Raw insert', 'operator', 1, 'admin', null, 'not-a-timestamp', '2026-08-30T12:00:00.000Z'), /invalid operator opportunity fact/);
+  assert.throws(() => initialized.prepare(`UPDATE deal_hunter_opportunity_facts SET updated_at = ? WHERE id = ?`).run('not-a-timestamp', 'existing-operator-fact'), /invalid operator opportunity fact/);
+  assert.equal(initialized.prepare(`SELECT count(*) AS count FROM deal_hunter_opportunity_facts WHERE id = 'raw-invalid-timestamp'`).get().count, 0);
+  assert.equal(initialized.prepare(`SELECT updated_at FROM deal_hunter_opportunity_facts WHERE id = 'existing-operator-fact'`).get().updated_at, '2026-08-30T11:00:00.000Z');
+  initialized.close();
+});
+
 test('operator-fact forward migration and fresh schema share the strict source and bound contract', () => {
   // Break caught: a later migration leaves either direct RPC permissive or lets
   // fresh and upgraded databases disagree about the operator-fact boundary.
   const migration = fs.readFileSync(currentOperatorFactMigrationUrl, 'utf8');
+  const constraintMigration = fs.readFileSync(new URL('../supabase/migrations/20260830180000_operator_fact_storage_boundary.sql', import.meta.url), 'utf8');
   const schema = fs.readFileSync(supabaseSchemaUrl, 'utf8');
   const normalizeSql = (sql) => sql.replace(/--[^\n]*/g, '').replace(/\s+/g, ' ').trim();
   for (const functionName of ['upsert_deal_hunter_opportunity_fact', 'insert_current_deal_hunter_opportunity_fact']) {
     const migrationRpc = rpcDefinition(migration, functionName);
     const schemaRpc = rpcDefinition(schema, functionName);
     assert.equal(normalizeSql(migrationRpc), normalizeSql(schemaRpc), `${functionName} must be identical after forward migration`);
-    assert.match(migrationRpc, /p_source is distinct from 'operator'/i, `${functionName} must reject source spoofing server-side`);
+    assert.match(migrationRpc, /\(p_fact ->> 'source'\) <> 'operator'/i, `${functionName} must reject source spoofing server-side`);
   }
-  for (const [label, sql] of [['forward migration', migration], ['fresh schema', schema]]) {
+  for (const [label, sql] of [['forward constraint migration', constraintMigration], ['fresh schema', schema]]) {
     assert.match(sql, /deal_hunter_opportunity_facts_operator_boundary_check/i, `${label} must constrain operator facts`);
     assert.match(sql, /char_length\(id\) between 1 and 240/i, `${label} must bound fact IDs`);
     assert.match(sql, /field in \([\s\S]*'seller_name'[\s\S]*'operator_contact_notes'/i, `${label} must use the approved field allowlist`);
@@ -458,7 +535,7 @@ test('operator-fact forward migration and fresh schema share the strict source a
     assert.match(sql, /char_length\(actor\) between 1 and 200/i, `${label} must bound actors`);
     assert.match(sql, /char_length\(note\) between 1 and 4000/i, `${label} must bound notes`);
   }
-  assert.match(migration, /\) not valid;/i, 'forward migration must preserve existing legacy/provider history without rewriting it');
+  assert.match(constraintMigration, /\) not valid;/i, 'forward migration must preserve existing legacy/provider history without rewriting it');
 });
 
 test('direct SQLite current operator-fact storage rejects every hostile probe atomically', async (t) => {
@@ -645,18 +722,7 @@ test('fact conflicts preserve immutable identity while both providers update onl
   });
   assert.deepEqual(supabaseFinal, sqliteFinal);
   assert.equal(boundary.calls[1].name, 'upsert_deal_hunter_opportunity_fact');
-  assert.deepEqual(boundary.calls[1].payload, {
-    p_id: second.id,
-    p_opportunity_id: second.opportunity_id,
-    p_field: second.field,
-    p_value: second.value,
-    p_source: second.source,
-    p_verified: second.verified,
-    p_actor: second.actor,
-    p_note: second.note,
-    p_created_at: second.created_at,
-    p_updated_at: second.updated_at,
-  });
+  assert.deepEqual(boundary.calls[1].payload, { p_fact: second });
 });
 
 test('source-observation conflicts preserve immutable source identity while both providers refresh mutable values', async (t) => {
