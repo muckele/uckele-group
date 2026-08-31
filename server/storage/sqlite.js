@@ -10,6 +10,10 @@ import {
   normalizeOpportunitySourceObservation,
   normalizeOpportunitySourceObservationSnapshot,
 } from '../services/dealHunterOpportunityFacts.js';
+import {
+  firstStrictDetailAuthorityTimestamp,
+  strictDetailAuthorityTimestampSortKey,
+} from '../services/detailAuthorityTimestamp.js';
 import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
 import {
   buildCanonicalOpportunityMergePlan,
@@ -1915,6 +1919,13 @@ export function createSqliteStorage(config) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
 
   const database = new Database(config.storage.sqlitePath);
+  database.function('deal_hunter_cim_authority_sort_key', { deterministic: true }, (updatedAt, createdAt) => {
+    const authorityAt = firstStrictDetailAuthorityTimestamp(
+      { updated_at: updatedAt, created_at: createdAt },
+      [['updated_at'], ['created_at']],
+    );
+    return strictDetailAuthorityTimestampSortKey(authorityAt);
+  });
   fs.chmodSync(config.storage.sqlitePath, 0o600);
   database.pragma('journal_mode = WAL');
   for (const suffix of ['-wal', '-shm']) {
@@ -8993,12 +9004,24 @@ export function createSqliteStorage(config) {
 
       const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
       const safeLimit = Math.max(1, Math.min(Number(limit) || 1000, 100000));
+      // Detail authority supplies canonical opportunity IDs and needs strict
+      // created_at fallback before its bounded candidate window. Scope that
+      // semantic UDF to canonical-opportunity filters; generic CIM listings
+      // retain direct timestamp/ID ordering instead of parsing every row.
+      const orderClause = canonicalIds.length > 0
+        ? `
+          ORDER BY
+            CASE WHEN deal_hunter_cim_authority_sort_key(updated_at, created_at) IS NULL THEN 1 ELSE 0 END ASC,
+            deal_hunter_cim_authority_sort_key(updated_at, created_at) DESC,
+            id ASC
+        `
+        : 'ORDER BY updated_at DESC, id ASC';
       return database
         .prepare(
           `
             SELECT * FROM deal_hunter_cim_requests
             ${whereClause}
-            ORDER BY updated_at DESC
+            ${orderClause}
             LIMIT ?
           `,
         )

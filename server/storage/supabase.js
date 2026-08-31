@@ -3465,8 +3465,8 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         let query = client
           .from('deal_hunter_cim_requests')
           .select('*')
-          .order('updated_at', { ascending: false })
-          .order('id', { ascending: true });
+          .order('updated_at', { ascending: false, nullsFirst: false })
+          .order('id', { ascending: true, nullsFirst: false });
         if (keys.length > 0) query = query.in('deal_key', keys);
         if (canonicalIds.length > 0) query = query.in('opportunity_id', canonicalIds);
         if (recipients.length > 0) query = query.in('recipient_email', recipients);

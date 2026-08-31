@@ -27,6 +27,7 @@ import {
   opportunityFactFields,
   opportunitySourceObservationFields,
 } from './dealHunterOpportunityFacts.js';
+import { firstStrictDetailAuthorityTimestamp } from './detailAuthorityTimestamp.js';
 import { getSourceHealth } from './acquisitionCommandCenter.js';
 
 export const triageViews = Object.freeze([
@@ -208,8 +209,9 @@ function safeListingUrl(value) {
   // newline/tab can be transformed into a harmless-looking encoded space.
   if (typeof value !== 'string') return '';
   const rawInput = value;
+  if (rawInput.length === 0 || rawInput.length > 2000) return '';
   if ([...rawInput].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) return '';
-  const raw = rawInput.trim().slice(0, 2000);
+  const raw = rawInput.trim();
   if (!raw) return '';
   try {
     const parsed = new URL(raw);
@@ -317,17 +319,6 @@ function projectSourceObservations(rows = []) {
   return { sourceObservations: [...groups.values()].slice(0, 100), conflicts: conflicts.map(({ field, values }) => ({ field, observations: values.slice(0, 20) })) };
 }
 
-function firstValidDetailTimestamp(record = {}, fieldGroups = []) {
-  for (const fields of fieldGroups) {
-    for (const field of fields) {
-      const value = detailText(record?.[field], 80);
-      const timestamp = Date.parse(value);
-      if (Number.isFinite(timestamp)) return { timestamp, value };
-    }
-  }
-  return { timestamp: null, value: '' };
-}
-
 function detailAuthoritySignature(values = []) {
   return JSON.stringify(values.map(([value, maximum]) => detailText(value, maximum)));
 }
@@ -336,6 +327,9 @@ function compareDetailAuthorityCandidates(left, right, { conservativeDismissal =
   if (left.timestamp !== null && right.timestamp === null) return -1;
   if (left.timestamp === null && right.timestamp !== null) return 1;
   if (left.timestamp !== null && right.timestamp !== null && left.timestamp !== right.timestamp) return right.timestamp - left.timestamp;
+  if (left.timestamp !== null && right.timestamp !== null && left.fractionalNanoseconds !== right.fractionalNanoseconds) {
+    return right.fractionalNanoseconds - left.fractionalNanoseconds;
+  }
   if (conservativeDismissal && left.state !== right.state) {
     if (left.state === 'dismissed') return -1;
     if (right.state === 'dismissed') return 1;
@@ -355,10 +349,10 @@ function currentDetailSourceRows(rows = []) {
   return (Array.isArray(rows) ? rows : []).slice(0, 500).flatMap((row) => {
     if (!row || typeof row !== 'object') return [];
     const field = detailText(row.field, 80).toLowerCase();
-    const rawValue = typeof row.value === 'string' ? row.value : '';
-    const value = detailText(row.value, 5000);
+    const canonicalUrl = field === 'listing_url' ? safeListingUrl(row.value) : '';
+    const value = field === 'listing_url' ? canonicalUrl : detailText(row.value, 5000);
     if (!field || !value) return [];
-    const authorityAt = firstValidDetailTimestamp(row, [
+    const authorityAt = firstStrictDetailAuthorityTimestamp(row, [
       ['observed_at', 'observedAt'],
       ['updated_at', 'updatedAt'],
       ['created_at', 'createdAt'],
@@ -366,14 +360,15 @@ function currentDetailSourceRows(rows = []) {
     return [{
       field,
       value,
-      rawValue,
+      canonicalUrl,
       observedAt: authorityAt.value,
       timestamp: authorityAt.timestamp,
+      fractionalNanoseconds: authorityAt.fractionalNanoseconds,
       recordId: detailText(row.id, 200),
       signature: detailAuthoritySignature([
         [field, 80], [value, 5000], [row.source_id ?? row.sourceId, 200],
         [row.source_name ?? row.sourceName, 160], [row.source_record_id ?? row.sourceRecordId, 200],
-        [authorityAt.value, 80],
+        [authorityAt.value, 80], ...(field === 'listing_url' ? [[canonicalUrl, 2000]] : []),
       ]),
     }];
   }).sort(compareDetailAuthorityCandidates);
@@ -397,8 +392,7 @@ function currentDetailSourceNumber(rows, fields, fallback) {
 function currentDetailSourceListingUrl(rows) {
   for (const row of rows) {
     if (row.field !== 'listing_url') continue;
-    const url = safeListingUrl(row.rawValue);
-    if (url) return url;
+    if (row.canonicalUrl) return row.canonicalUrl;
   }
   return '';
 }
@@ -412,13 +406,14 @@ function currentDetailCimStatus(records, fallback) {
   const candidates = (Array.isArray(records) ? records : []).slice(0, 100).flatMap((record) => {
     const status = detailText(record?.status, 80);
     if (!status) return [];
-    const authorityAt = firstValidDetailTimestamp(record, [
+    const authorityAt = firstStrictDetailAuthorityTimestamp(record, [
       ['updated_at', 'updatedAt'],
       ['created_at', 'createdAt'],
     ]);
     return [{
       status,
       timestamp: authorityAt.timestamp,
+      fractionalNanoseconds: authorityAt.fractionalNanoseconds,
       recordId: detailText(record?.id, 200),
       signature: detailAuthoritySignature([
         [status, 80], [authorityAt.value, 80],
@@ -435,7 +430,7 @@ function currentDetailDisposition(records) {
     if (!state) return [];
     const dismissedAt = detailText(record?.dismissed_at ?? record?.dismissedAt, 80);
     const restoredAt = detailText(record?.restored_at ?? record?.restoredAt, 80);
-    const authorityAt = firstValidDetailTimestamp(record, [
+    const authorityAt = firstStrictDetailAuthorityTimestamp(record, [
       ['updated_at', 'updatedAt'],
       ...(state === 'dismissed'
         ? [['dismissed_at', 'dismissedAt']]
@@ -451,6 +446,7 @@ function currentDetailDisposition(records) {
       dismissedAt,
       dismissedBy: detailText(record?.dismissed_by ?? record?.dismissedBy, 160),
       timestamp: authorityAt.timestamp,
+      fractionalNanoseconds: authorityAt.fractionalNanoseconds,
       recordId: detailText(record?.id, 200),
       signature: detailAuthoritySignature([
         [state, 80], [record?.reason, 160], [record?.note, 500], [dismissedAt, 80], [restoredAt, 80],

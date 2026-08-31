@@ -7,6 +7,7 @@ import test from 'node:test';
 import { setOperatorOpportunityFact } from '../server/services/dealHunterOpportunityFacts.js';
 import { getTriageOpportunityDetail } from '../server/services/dealHunterTriage.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
+import { createSupabaseStorage } from '../server/storage/supabase.js';
 
 // These response contracts are deliberately independent literals. Importing
 // either production allowlist would let implementation and proof widen together.
@@ -362,6 +363,260 @@ test('equal-currentness Pass ambiguity remains non-actionable until a definitive
       }, expected);
     });
   }
+});
+
+test('detail authority rejects non-instant primary literals and continues each documented strict fallback chain', async (t) => {
+  // Break caught: Date.parse accepts numeric, locale, date-only, timezone-less,
+  // overflowing-calendar/clock, and unknown-offset values that must not mask a
+  // newer explicit-offset durable timestamp.
+  const { storage, opportunityId } = await detailStorage(t);
+  // The strict fallback is after every timestamp that the old permissive
+  // parser normalized (including 24:00), while the older competitor is before
+  // the fallback. That makes each accepting malformed primary change current
+  // source/CIM/disposition authority rather than merely its freshness literal.
+  const olderAt = '2026-09-01T12:00:00.000Z';
+  const strictFallbackAt = '2026-09-02T00:00:00.123456+00:00';
+  const malformedPrimaryValues = [
+    ['numeric zero', 0],
+    ['numeric string zero', '0'],
+    ['numeric one', 1],
+    ['numeric string one', '1'],
+    ['locale date', '01/02/2026'],
+    ['date-only literal', '2026-08-31'],
+    ['timezone-less literal', '2026-08-31T12:00:00'],
+    ['overflowing calendar date', '2026-02-30T12:00:00Z'],
+    ['overflowing clock hour', '2026-08-31T24:00:00Z'],
+    ['out-of-range offset', '2026-08-31T12:00:00+24:00'],
+    ['unknown negative-zero offset', '2026-08-31T13:00:00-00:00'],
+  ];
+
+  for (const [kind, primary] of malformedPrimaryValues) {
+    await t.test(`${kind}: source authority uses its explicit-offset fallback`, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, {
+          sourceRows: [
+            {
+              id: 'source-older-strict', source_id: 'source-older', source_name: 'Older source', source_record_id: 'older-record',
+              field: 'industry', value: 'older-source-value', observed_at: olderAt, updated_at: olderAt, created_at: olderAt,
+            },
+            {
+              id: 'source-fallback-strict', source_id: 'source-fallback', source_name: 'Fallback source', source_record_id: 'fallback-record',
+              field: 'industry', value: 'strict-fallback-source-value', observed_at: primary, updated_at: strictFallbackAt, created_at: olderAt,
+            },
+          ],
+        }),
+      });
+      assert.deepEqual({
+        industry: detail.opportunity.industry,
+        observationFreshness: detail.opportunity.observationFreshness,
+      }, {
+        industry: 'strict-fallback-source-value',
+        observationFreshness: strictFallbackAt,
+      });
+    });
+
+    await t.test(`${kind}: CIM authority uses its explicit-offset fallback`, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, {
+          cimRequests: [
+            { id: 'cim-older-strict', status: 'requested', updated_at: olderAt, created_at: olderAt },
+            { id: 'cim-fallback-strict', status: 'documents received', updated_at: primary, created_at: strictFallbackAt },
+          ],
+        }),
+      });
+      assert.equal(detail.opportunity.workflow.cimStatus, 'documents received');
+    });
+
+    await t.test(`${kind}: disposition authority uses its explicit-offset fallback`, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, {
+          dispositions: [
+            {
+              id: 'disposition-older-strict', disposition: 'dismissed', reason: 'older dismissal',
+              updated_at: olderAt, dismissed_at: olderAt, created_at: olderAt,
+            },
+            {
+              id: 'disposition-fallback-strict', disposition: 'restored', reason: 'strict fallback restore',
+              updated_at: primary, restored_at: strictFallbackAt, created_at: olderAt,
+            },
+          ],
+        }),
+      });
+      assert.deepEqual({
+        state: detail.opportunity.disposition.state,
+        reason: detail.opportunity.disposition.reason,
+        dismissed: detail.opportunity.dismissed,
+      }, {
+        state: 'restored',
+        reason: 'strict fallback restore',
+        dismissed: false,
+      });
+    });
+  }
+});
+
+test('equal-time listing authority uses the raw-safe canonical URL signature independently of source row order', async (t) => {
+  // Break caught: detailText collapses a normal space and a non-breaking space
+  // before a source signature is built, so the prior stable sort preserved
+  // provider array order instead of choosing one canonical URL deterministically.
+  const { storage, opportunityId } = await detailStorage(t);
+  const observedAt = '2026-08-31T12:00:00.000Z';
+  const canonicalNormalSpace = 'https://broker.example/a%20b';
+  const normalSpace = {
+    source_id: 'shared-source', source_name: 'Shared source', source_record_id: 'shared-record',
+    field: 'listing_url', value: 'https://broker.example/a b', observed_at: observedAt, updated_at: observedAt, created_at: observedAt,
+  };
+  const nonBreakingSpace = {
+    source_id: 'shared-source', source_name: 'Shared source', source_record_id: 'shared-record',
+    field: 'listing_url', value: 'https://broker.example/a\u00a0b', observed_at: observedAt, updated_at: observedAt, created_at: observedAt,
+  };
+  const identifierCases = [
+    ['missing IDs', [{ ...normalSpace }, { ...nonBreakingSpace }]],
+    ['duplicate IDs', [{ ...normalSpace, id: 'duplicate-listing-id' }, { ...nonBreakingSpace, id: 'duplicate-listing-id' }]],
+  ];
+
+  for (const [kind, rows] of identifierCases) {
+    for (const [order, sourceRows] of [
+      ['normal-first', rows],
+      ['non-breaking-first', [...rows].reverse()],
+    ]) {
+      await t.test(`${kind}: ${order}`, async () => {
+        const detail = await getTriageOpportunityDetail({
+          opportunityId,
+          storage: withDetailAuthorityRows(storage, { sourceRows }),
+        });
+        assert.deepEqual({
+          listingUrl: detail.opportunity.listingUrl,
+          observationFreshness: detail.opportunity.observationFreshness,
+        }, {
+          listingUrl: canonicalNormalSpace,
+          observationFreshness: observedAt,
+        });
+      });
+    }
+  }
+});
+
+test('SQLite detail CIM window applies strict timestamp fallback and ID ordering before its 100-row cap', async (t) => {
+  // Break caught: SQLite used only lexical updated_at DESC before LIMIT, so a
+  // reverse-inserted equal-time set excluded the id-ascending member and a
+  // loose primary timestamp hid a newer strict created_at candidate entirely.
+  const { storage, opportunityId } = await detailStorage(t);
+  const equalUpdatedAt = '2026-08-31T12:00:00.000Z';
+  const strictCreatedFallbackAt = '2026-08-31T13:00:00.123456+00:00';
+  const dealKey = `deal-${opportunityId}`;
+
+  for (let index = 100; index >= 1; index -= 1) {
+    const id = `cim-${String(index).padStart(3, '0')}`;
+    await storage.upsertDealHunterCimRequest({
+      id,
+      created_at: equalUpdatedAt,
+      updated_at: equalUpdatedAt,
+      opportunity_id: opportunityId,
+      deal_key: dealKey,
+      recipient_email: `${id}@example.test`,
+      requested_by: 'detail-test',
+      status: 'requested',
+      metadata: {},
+    });
+  }
+  await storage.upsertDealHunterCimRequest({
+    id: 'cim-000',
+    created_at: strictCreatedFallbackAt,
+    updated_at: '0',
+    opportunity_id: opportunityId,
+    deal_key: dealKey,
+    recipient_email: 'cim-000@example.test',
+    requested_by: 'detail-test',
+    status: 'documents received',
+    metadata: {},
+  });
+
+  const adapterWindow = await storage.listDealHunterCimRequests({ opportunityIds: [opportunityId], limit: 100 });
+  assert.equal(adapterWindow.length, 100);
+  assert.equal(adapterWindow[0].id, 'cim-000', 'the strict created_at fallback ranks before the equal updated_at group');
+  assert.equal(adapterWindow[1].id, 'cim-001', 'equal valid updated_at rows use ascending IDs before the cap');
+  assert.equal(adapterWindow.at(-1).id, 'cim-099', 'the final bounded equal-time member is deterministic');
+  assert.equal(adapterWindow.some((request) => request.id === 'cim-100'), false, 'the id-ascending group member beyond the cap is excluded');
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+  assert.equal(detail.opportunity.workflow.cimStatus, 'documents received');
+  assert.equal(detail.cimSummary.requests.some((request) => request.id === 'cim-000'), true,
+    'the detail service receives the strict-fallback candidate before its own comparator runs');
+  assert.equal(detail.cimSummary.requests.some((request) => request.id === 'cim-100'), false,
+    'detail reflects adapter-window membership instead of post-cap re-sorting a divergent set');
+});
+
+test('SQLite generic CIM listing keeps its deterministic updated_at and ID order outside detail authority', async (t) => {
+  // The strict fallback UDF is intentionally scoped to opportunity-ID detail
+  // windows. Generic listings retain their conventional updated_at DESC, id ASC
+  // contract instead of parsing every row with detail-authority semantics.
+  const { storage, opportunityId } = await detailStorage(t);
+  const equalUpdatedAt = '2026-08-31T12:00:00.000Z';
+  const strictCreatedFallbackAt = '2026-08-31T13:00:00.123456+00:00';
+  const dealKey = `deal-${opportunityId}`;
+
+  for (let index = 100; index >= 1; index -= 1) {
+    const id = `generic-cim-${String(index).padStart(3, '0')}`;
+    await storage.upsertDealHunterCimRequest({
+      id,
+      created_at: equalUpdatedAt,
+      updated_at: equalUpdatedAt,
+      opportunity_id: opportunityId,
+      deal_key: dealKey,
+      recipient_email: `${id}@example.test`,
+      requested_by: 'detail-test',
+      status: 'requested',
+      metadata: {},
+    });
+  }
+  await storage.upsertDealHunterCimRequest({
+    id: 'generic-cim-000',
+    created_at: strictCreatedFallbackAt,
+    updated_at: '0',
+    opportunity_id: opportunityId,
+    deal_key: dealKey,
+    recipient_email: 'generic-cim-000@example.test',
+    requested_by: 'detail-test',
+    status: 'documents received',
+    metadata: {},
+  });
+
+  const genericWindow = await storage.listDealHunterCimRequests({ limit: 100 });
+  assert.equal(genericWindow.length, 100);
+  assert.equal(genericWindow[0].id, 'generic-cim-001');
+  assert.equal(genericWindow.at(-1).id, 'generic-cim-100');
+  assert.equal(genericWindow.some((request) => request.id === 'generic-cim-000'), false);
+});
+
+test('Supabase CIM adapter declares the same explicit pre-cap ordering contract', async () => {
+  // Break caught: a provider query that omits an explicit null placement can
+  // form a different candidate window even when its visible sort fields match.
+  const calls = [];
+  const query = {
+    select() { return this; },
+    order(field, options) { calls.push(['order', field, options]); return this; },
+    in(field, values) { calls.push(['in', field, values]); return this; },
+    async range(start, end) {
+      calls.push(['range', start, end]);
+      return { data: [], error: null };
+    },
+  };
+  const storage = createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { from(table) { assert.equal(table, 'deal_hunter_cim_requests'); return query; } } },
+  );
+
+  assert.deepEqual(await storage.listDealHunterCimRequests({ opportunityIds: ['opp-detail'], limit: 100 }), []);
+  assert.deepEqual(calls, [
+    ['order', 'updated_at', { ascending: false, nullsFirst: false }],
+    ['order', 'id', { ascending: true, nullsFirst: false }],
+    ['in', 'opportunity_id', ['opp-detail']],
+    ['range', 0, 99],
+  ]);
 });
 
 test('detail opportunity consolidates current authoritative identity, source, score, CRM, and CIM values instead of score-row defaults', async (t) => {
