@@ -14,6 +14,10 @@ function detailFixture(overrides = {}) {
       scoreStatus: 'high-fit',
       confidence: 'high',
       completenessScore: 88,
+      missingEvidenceCount: 2,
+      contradictionCount: 1,
+      shouldRemove: false,
+      highFit: true,
       geography: { city: 'Sacramento', state: 'CA', label: 'Sacramento, CA' },
       industry: 'Fire protection services',
       financials: { annualProfit: 425000, annualRevenue: 2200000, askingPrice: null, profitMultiple: 4.24 },
@@ -27,6 +31,10 @@ function detailFixture(overrides = {}) {
       reviewedAt: '2026-08-29T18:00:00.000Z',
       reviewedBy: 'admin@example.com',
       changedSinceReview: false,
+      dismissed: false,
+      dismissedReason: '',
+      scoredAt: '2026-08-29T16:00:00.000Z',
+      rulesVersion: 'deal-hunter-fit-v2',
     },
     effectiveFacts: {
       broker_name: { value: 'Alex Broker', provenance: 'operator', verified: true, actor: 'admin@example.com', note: 'Confirmed by phone.' },
@@ -58,24 +66,39 @@ function detailFixture(overrides = {}) {
       completenessScore: 88,
       dimensions: [{
         id: 'financial-fit', label: 'Financial fit', contribution: 34,
-        evidence: [{ ruleId: 'profit.in-band', ruleLabel: 'Profit inside target band', evidenceClass: 'observed', field: 'annualProfit', value: '425000', sourceName: 'Deal Hunter Google Sheet' }],
+        evidence: [{
+          ruleId: 'profit.in-band', ruleLabel: 'Profit inside target band', evidenceClass: 'observed',
+          field: 'annualProfit', value: '425000', observedValue: '$425,000 reported', terms: ['recurring', 'inspection'],
+          sourceId: 'sheet', sourceName: 'Deal Hunter Google Sheet', sourceRecordId: 'row-9',
+          listingUrl: 'https://broker.example/evergreen', observedAt: '2026-08-28T17:00:00.000Z',
+        }],
       }],
-      gates: [], appliedCaps: [], confidenceReasons: ['Core financial fields are present.'], missingEvidence: ['customerConcentration'],
+      unattributedEvidence: [{
+        ruleId: 'market.fragmented', ruleLabel: 'Fragmented market signal', evidenceClass: 'inferred',
+        field: 'industry', value: 'fire protection', observedValue: 'regional operators', terms: ['fragmented'],
+        sourceId: 'deal-os', sourceName: 'Deal OS', sourceRecordId: 'listing-42', observedAt: '2026-08-29T17:00:00.000Z',
+      }],
+      gates: [{ ruleId: 'owner.transition', reason: 'Confirm transition support', value: 1 }],
+      appliedCaps: [{ ruleId: 'customer.concentration', reason: 'Concentration is unverified', cap: 90 }],
+      confidenceReasons: ['Core financial fields are present.'], missingEvidence: ['customerConcentration'],
       summary: { strengths: ['Profit is in range.'], concerns: ['Customer concentration is unknown.'] },
     },
     cimSummary: {
       requests: [{ id: 'cim-1', status: 'draft', updatedAt: '2026-08-28T18:00:00.000Z' }],
-      communications: [{ id: 'communication-1', direction: 'inbound', channel: 'email', kind: 'broker-reply', occurredAt: '2026-08-29T18:00:00.000Z' }],
+      communications: [{ id: 'communication-1', direction: 'inbound', channel: 'email', kind: 'broker-reply', occurredAt: '2026-08-29T18:00:00.000Z', cimRequestId: 'cim-1' }],
     },
     crmSummary: {
       submission: { id: 'crm-1', status: 'review', company: 'Evergreen Fire Protection', sellerName: 'Jamie Seller', sellerEmail: 'jamie@example.com', brokerName: 'Alex Broker', brokerEmail: 'alex@example.com', updatedAt: '2026-08-29T18:00:00.000Z' },
-      communications: [{ id: 'communication-1', direction: 'inbound', channel: 'email', kind: 'broker-reply', occurredAt: '2026-08-29T18:00:00.000Z' }],
-      factObservations: [{ field: 'seller_name', value: 'Jamie Seller', provenance: 'crm' }],
-      conflicts: [],
+      communications: [
+        { id: 'communication-1', direction: 'inbound', channel: 'email', kind: 'broker-reply', occurredAt: '2026-08-29T18:00:00.000Z', cimRequestId: 'cim-1' },
+        { id: 'communication-2', direction: 'outbound', channel: 'phone', kind: 'seller-call', occurredAt: '2026-08-28T18:00:00.000Z', cimRequestId: '' },
+      ],
+      factObservations: [{ field: 'seller_name', value: 'Jamie Seller from CRM', provenance: 'crm' }],
+      conflicts: [{ field: 'broker_name', winningProvenance: 'operator', crmValue: 'Alexander Broker' }],
     },
     history: {
       activities: [{ id: 'activity-1', eventType: 'deal-hunter-triage-decision', summary: 'Priority high; marked reviewed', createdAt: '2026-08-29T18:00:00.000Z', actor: 'admin@example.com' }],
-      dispositions: [],
+      dispositions: [{ id: 'disposition-1', disposition: 'dismissed', reason: 'valuation', note: 'Previously passed.', dismissedAt: '2026-08-27T18:00:00.000Z', dismissedBy: 'reviewer@example.com' }],
       operatorFacts: [{ id: 'fact-1', field: 'broker_name', value: 'Alex Broker', verified: true, actor: 'admin@example.com', note: 'Confirmed by phone.', updatedAt: '2026-08-29T18:00:00.000Z' }],
       operatorState: { priority: 'high', note: 'Confirm inspection contract retention.', reviewed: true, reviewedAt: '2026-08-29T18:00:00.000Z', reviewedBy: 'admin@example.com' },
     },
@@ -103,6 +126,28 @@ describe('Opportunity drawer', () => {
     expect(within(dialog).getByText(/Deal Hunter Google Sheet reported 425000/)).toBeVisible();
     expect(within(dialog).getByText(/Deal OS reported 390000/)).toBeVisible();
     expect(within(dialog).getByText(/Profit inside target band/)).toBeVisible();
+    expect(within(dialog).getByText('88%')).toBeVisible();
+    expect(within(dialog).getByText('Reviewed · Current')).toBeVisible();
+    expect(within(dialog).getByText(/CRM: Active · CIM: Not Requested/)).toBeVisible();
+    expect(within(dialog).getAllByText(/Observed Aug 29, 2026/)).toHaveLength(3);
+    expect(within(dialog).getByText(/2 missing evidence · 1 contradiction/)).toBeVisible();
+    expect(within(dialog).getByText('Profit is in range.')).toBeVisible();
+    expect(within(dialog).getByText('Customer concentration is unknown.')).toBeVisible();
+    expect(within(dialog).getByText(/Missing evidence: Customer Concentration/)).toBeVisible();
+    expect(within(dialog).getByText(/Fragmented market signal/)).toBeVisible();
+    expect(within(dialog).getByText(/Observed value: regional operators/)).toBeVisible();
+    expect(within(dialog).getByText(/Terms: fragmented/)).toBeVisible();
+    expect(within(dialog).getByText(/Source record: listing-42/)).toBeVisible();
+    expect(within(dialog).getByText(/Conflict: Annual Profit/)).toBeVisible();
+    expect(within(dialog).getByText(/CRM fact · Seller Name · Jamie Seller from CRM/)).toBeVisible();
+    expect(within(dialog).getByText(/CRM conflict · Broker Name · Alexander Broker · Operator wins/)).toBeVisible();
+    expect(within(dialog).getAllByText(/Inbound · Email · Broker Reply · Aug 29, 2026/)).toHaveLength(2);
+    expect(within(dialog).getByText(/Outbound · Phone · Seller Call · Aug 28, 2026/)).toBeVisible();
+    expect(within(dialog).getByText(/Review state · Reviewed by admin@example.com on Aug 29, 2026/)).toBeVisible();
+    expect(within(dialog).getByText(/Operator fact · Broker Name · Alex Broker · Verified/)).toBeVisible();
+    expect(within(dialog).getByText(/admin@example.com · Aug 29, 2026 · Confirmed by phone/)).toBeVisible();
+    expect(within(dialog).getByText(/Event: Deal Hunter Triage Decision/)).toBeVisible();
+    expect(within(dialog).getByText(/Passed: Valuation · Previously passed. · reviewer@example.com · Aug 27, 2026/)).toBeVisible();
     expect(within(dialog).getByText(/Priority high; marked reviewed/)).toBeVisible();
     expect(within(dialog).getByText(/draft/i)).toBeVisible();
 
@@ -141,7 +186,8 @@ describe('Opportunity drawer', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
     fireEvent.click(screen.getByRole('button', { name: 'Pass Evergreen Fire Protection' }));
 
-    expect(onAction.mock.calls.map(([action]) => action)).toEqual(['pursue', 'watch', 'pass']);
+    expect(onAction.mock.calls.map(([action]) => action)).toEqual(['pursue', 'watch']);
+    expect(screen.getByRole('form', { name: 'Pass Evergreen Fire Protection' })).toBeVisible();
     expect(screen.getByRole('dialog')).toHaveClass('h-full');
   });
 });

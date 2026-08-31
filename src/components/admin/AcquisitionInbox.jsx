@@ -1,7 +1,7 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, Search } from 'lucide-react';
 import { NavLink } from 'react-router-dom';
-import OpportunityDrawer from './OpportunityDrawer.jsx';
+import OpportunityDrawer, { PassForm } from './OpportunityDrawer.jsx';
 
 const emptySummary = { needsReview: 0, highPriority: 0, watchlist: 0, lowConfidence: 0, currentOpportunities: 0 };
 const summaryItems = [
@@ -21,7 +21,16 @@ function money(value) {
 }
 
 function formatLabel(value) {
-  return String(value || '').replace(/[-_]/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase());
+  return String(value || '').replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[-_]/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function formatDate(value) {
+  if (!value || !Number.isFinite(Date.parse(value))) return '';
+  return new Intl.DateTimeFormat('en-US', { dateStyle: 'medium' }).format(new Date(value));
+}
+
+function isAbortError(error) {
+  return error?.name === 'AbortError';
 }
 
 function ActionButtons({ disabled, name, onAction }) {
@@ -35,18 +44,22 @@ function ActionButtons({ disabled, name, onAction }) {
 }
 
 function OpportunityRow({ onAction, onOpen, pending, readOnly, row }) {
+  const reviewState = row.changedSinceReview ? 'Changed Since Review' : row.reviewed ? 'Reviewed' : 'Needs Review';
+  const observed = formatDate(row.observationFreshness);
   return (
     <li className="grid gap-4 rounded-2xl border border-line bg-white p-4 shadow-sm md:grid-cols-[minmax(15rem,1.35fr)_repeat(4,minmax(6.5rem,.65fr))_minmax(10rem,.8fr)] md:items-center md:rounded-none md:border-x-0 md:border-b-0 md:p-3 md:shadow-none">
       <div className="min-w-0">
         <button aria-label={`Open ${row.name}`} className="text-left text-base font-semibold text-ink underline decoration-transparent underline-offset-4 transition hover:text-moss hover:decoration-moss/30" onClick={onOpen} type="button">{row.name}</button>
         <p className="mt-1 text-xs text-ink/58">{row.geography?.label || row.state || 'Location not supplied'} · {row.industry || 'Industry not supplied'}</p>
         <div className="mt-2 flex flex-wrap gap-1.5 text-[11px] font-semibold">
-          {!row.reviewed ? <span className="rounded-full bg-amber-50 px-2 py-0.5 text-amber-800">Needs review</span> : null}
-          {row.changedSinceReview ? <span className="rounded-full bg-amber-50 px-2 py-0.5 text-amber-800">Changed</span> : null}
-          {row.operatorPriority !== 'normal' ? <span className="rounded-full bg-moss/10 px-2 py-0.5 text-moss">{formatLabel(row.operatorPriority)}</span> : null}
+          <span className="rounded-full bg-amber-50 px-2 py-0.5 text-amber-800">Review: {reviewState}</span>
+          <span className="rounded-full bg-moss/10 px-2 py-0.5 text-moss">Operator: {formatLabel(row.operatorPriority || 'normal')}</span>
+          <span className="rounded-full bg-fog px-2 py-0.5 text-ink/68">Machine: {formatLabel(row.scoreStatus || 'provisional')}</span>
           <span className="rounded-full bg-fog px-2 py-0.5 text-ink/68">CRM: {formatLabel(row.workflow?.crmStatus || 'not-started')}</span>
           <span className="rounded-full bg-fog px-2 py-0.5 text-ink/68">CIM: {formatLabel(row.workflow?.cimStatus || 'not-requested')}</span>
+          {row.dismissed ? <span className="rounded-full bg-red-50 px-2 py-0.5 text-red-800">Passed: {formatLabel(row.dismissedReason || 'dismissed')}</span> : null}
         </div>
+        {observed ? <p className="mt-2 text-[11px] text-ink/50">Observed {observed}</p> : null}
       </div>
       <div><p className="text-[10px] font-semibold uppercase text-ink/45 md:hidden">Fit</p><p className="text-xl font-semibold tabular-nums text-ink">{row.fitScore}</p><p className="text-[11px] font-semibold text-ink/58">{row.confidence} confidence</p></div>
       <div><p className="text-[10px] font-semibold uppercase text-ink/45">SDE / Profit</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{money(row.financials?.annualProfit)}</p></div>
@@ -58,6 +71,16 @@ function OpportunityRow({ onAction, onOpen, pending, readOnly, row }) {
         {!readOnly ? <div className="mt-2"><ActionButtons disabled={pending} name={row.name} onAction={onAction} /></div> : null}
       </div>
     </li>
+  );
+}
+
+function QueuePassDialog({ name, onCancel, onSubmit, pending }) {
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center bg-ink/40 p-4" role="presentation">
+      <div aria-label={`Pass ${name}`} aria-modal="true" className="w-full max-w-lg rounded-2xl border border-line bg-white p-5 shadow-2xl" role="dialog">
+        <PassForm name={name} onCancel={onCancel} onSubmit={onSubmit} pending={pending} />
+      </div>
+    </div>
   );
 }
 
@@ -73,9 +96,18 @@ export default function AcquisitionInbox({ readOnly = false }) {
   const [error, setError] = useState('');
   const [pendingId, setPendingId] = useState('');
   const [selectedId, setSelectedId] = useState('');
-  const [detail, setDetail] = useState({ data: null, loading: false, error: '' });
+  const [detail, setDetail] = useState({ requestedId: '', data: null, loading: false, error: '' });
+  const [passTarget, setPassTarget] = useState(null);
+  const queueRequestRef = useRef({ generation: 0, controller: null });
+  const detailRequestRef = useRef({ generation: 0, controller: null });
+  const selectionRef = useRef('');
+  const mutationGenerationRef = useRef(0);
 
   const loadQueue = useCallback(async () => {
+    queueRequestRef.current.controller?.abort();
+    const controller = new AbortController();
+    const generation = queueRequestRef.current.generation + 1;
+    queueRequestRef.current = { generation, controller };
     setLoading(true);
     setError('');
     try {
@@ -83,74 +115,131 @@ export default function AcquisitionInbox({ readOnly = false }) {
       if (search.trim()) params.set('search', search.trim());
       if (confidence) params.set('confidence', confidence);
       if (priority) params.set('priority', priority);
-      const response = await fetch(`/api/admin/deal-hunter/triage?${params}`, { credentials: 'same-origin' });
+      const response = await fetch(`/api/admin/deal-hunter/triage?${params}`, { credentials: 'same-origin', signal: controller.signal });
       const result = await response.json();
       if (!response.ok || !result.success) throw new Error(result.error || 'Unable to load Acquisition Inbox.');
+      if (queueRequestRef.current.generation !== generation || controller.signal.aborted) return false;
       setQueue(result);
+      return true;
     } catch (loadError) {
+      if (isAbortError(loadError) || queueRequestRef.current.generation !== generation || controller.signal.aborted) return false;
       setError(loadError.message || 'Unable to load Acquisition Inbox.');
+      return false;
     } finally {
-      setLoading(false);
+      if (queueRequestRef.current.generation === generation) {
+        queueRequestRef.current.controller = null;
+        setLoading(false);
+      }
     }
   }, [confidence, page, priority, search, sort, view]);
 
-  useEffect(() => { loadQueue(); }, [loadQueue]);
+  useEffect(() => {
+    loadQueue();
+    return () => {
+      queueRequestRef.current.controller?.abort();
+      queueRequestRef.current.generation += 1;
+    };
+  }, [loadQueue]);
 
   const loadDetail = useCallback(async (opportunityId) => {
-    setDetail({ data: null, loading: true, error: '' });
+    detailRequestRef.current.controller?.abort();
+    const controller = new AbortController();
+    const generation = detailRequestRef.current.generation + 1;
+    detailRequestRef.current = { generation, controller };
+    setDetail({ requestedId: opportunityId, data: null, loading: true, error: '' });
     try {
-      const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}`, { credentials: 'same-origin' });
+      const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}`, { credentials: 'same-origin', signal: controller.signal });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Unable to load opportunity detail.');
-      setDetail({ data: result, loading: false, error: '' });
+      if (result?.opportunity?.opportunityId !== opportunityId) throw new Error('Opportunity detail did not match the selected record.');
+      if (detailRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      setDetail({ requestedId: opportunityId, data: result, loading: false, error: '' });
+      return true;
     } catch (detailError) {
-      setDetail({ data: null, loading: false, error: detailError.message || 'Unable to load opportunity detail.' });
+      if (isAbortError(detailError) || detailRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      setDetail({ requestedId: opportunityId, data: null, loading: false, error: detailError.message || 'Unable to load opportunity detail.' });
+      return false;
+    } finally {
+      if (detailRequestRef.current.generation === generation) detailRequestRef.current.controller = null;
     }
   }, []);
 
   function openDetail(opportunityId) {
+    selectionRef.current = opportunityId;
     setSelectedId(opportunityId);
     loadDetail(opportunityId);
   }
 
-  async function recordAction(opportunityId, action) {
-    const reason = action === 'pass' ? window.prompt('Why are you passing on this opportunity?') : '';
-    if (action === 'pass' && !reason?.trim()) return;
+  const closeDetail = useCallback(() => {
+    selectionRef.current = '';
+    detailRequestRef.current.controller?.abort();
+    detailRequestRef.current = { generation: detailRequestRef.current.generation + 1, controller: null };
+    setSelectedId('');
+    setDetail({ requestedId: '', data: null, loading: false, error: '' });
+  }, []);
+
+  async function recordAction(opportunityId, action, pass = null) {
+    if (action === 'pass' && (!pass?.reason?.trim() || pass.reason.trim().length > 80 || (pass.note || '').length > 2000)) return false;
+    const mutationGeneration = mutationGenerationRef.current + 1;
+    mutationGenerationRef.current = mutationGeneration;
     setPendingId(opportunityId);
     setError('');
     try {
-      const body = action === 'pass' ? { action, reason: reason.trim() } : { action };
+      const body = action === 'pass'
+        ? { action, reason: pass.reason.trim(), note: (pass.note || '').trim() }
+        : { action };
       const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/action`, {
         method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       });
       const result = await response.json();
       if (!response.ok || !result.success) throw new Error(result.error || 'Unable to record this decision.');
       await loadQueue();
+      if (action === 'pass') {
+        if (selectionRef.current === opportunityId) closeDetail();
+        setPassTarget((current) => current?.opportunityId === opportunityId ? null : current);
+      } else if (selectionRef.current === opportunityId) {
+        await loadDetail(opportunityId);
+      }
+      return true;
     } catch (actionError) {
-      setError(actionError.message || 'Unable to record this decision.');
+      if (mutationGenerationRef.current === mutationGeneration) setError(actionError.message || 'Unable to record this decision.');
+      return false;
     } finally {
-      setPendingId('');
+      if (mutationGenerationRef.current === mutationGeneration) setPendingId('');
     }
   }
 
-  async function saveFact({ field, value, note, verified }) {
-    if (!selectedId) return;
-    setPendingId(selectedId);
+  async function saveFact(opportunityId, { field, value, note, verified }) {
+    if (!opportunityId || selectionRef.current !== opportunityId) return false;
+    const mutationGeneration = mutationGenerationRef.current + 1;
+    mutationGenerationRef.current = mutationGeneration;
+    setPendingId(opportunityId);
     setError('');
     try {
-      const response = await fetch(`/api/admin/deal-hunter/opportunities/${encodeURIComponent(selectedId)}/facts/${encodeURIComponent(field)}`, {
+      const response = await fetch(`/api/admin/deal-hunter/opportunities/${encodeURIComponent(opportunityId)}/facts/${encodeURIComponent(field)}`, {
         method: 'PUT', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ value, note, verified }),
       });
       const result = await response.json();
       if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save the verified fact.');
-      await loadDetail(selectedId);
+      if (selectionRef.current === opportunityId) await loadDetail(opportunityId);
+      return true;
     } catch (factError) {
-      setError(factError.message || 'Unable to save the verified fact.');
+      if (mutationGenerationRef.current === mutationGeneration) setError(factError.message || 'Unable to save the verified fact.');
+      return false;
     } finally {
-      setPendingId('');
+      if (mutationGenerationRef.current === mutationGeneration) setPendingId('');
     }
   }
+
+  useEffect(() => () => {
+    detailRequestRef.current.controller?.abort();
+    detailRequestRef.current.generation += 1;
+    selectionRef.current = '';
+  }, []);
+
+  const loadedDetailId = detail.data?.opportunity?.opportunityId || '';
+  const hasMatchingDetail = Boolean(selectedId && loadedDetailId === selectedId && detail.requestedId === selectedId);
 
   return (
     <section aria-label="Acquisition Inbox" className="section-shell mt-8 pb-8">
@@ -165,10 +254,10 @@ export default function AcquisitionInbox({ readOnly = false }) {
         <div className="border-b border-line/80 p-4 sm:p-5">
           <div aria-label="Opportunity queues" className="flex gap-2 overflow-x-auto" role="tablist">{views.map(([id, itemLabel]) => <button aria-selected={view === id} className={`shrink-0 rounded-full border px-3 py-1.5 text-xs font-semibold ${view === id ? 'border-moss bg-moss/10 text-moss' : 'border-line bg-white text-ink/62'}`} key={id} onClick={() => { setView(id); setPage(1); }} role="tab" type="button">{itemLabel}</button>)}</div>
           <div className="mt-4 grid gap-3 md:grid-cols-[minmax(15rem,1fr)_repeat(3,minmax(9rem,auto))]">
-            <label className="relative"><span className="sr-only">Search opportunities</span><Search aria-hidden="true" className="absolute left-3 top-3 h-4 w-4 text-ink/40" /><input aria-label="Search opportunities" className="form-control pl-9" onChange={(event) => { setSearch(event.target.value); setPage(1); }} placeholder="Business, geography, or deal key" type="search" value={search} /></label>
+            <label className="relative"><span className="sr-only">Search opportunities</span><Search aria-hidden="true" className="absolute left-3 top-3 h-4 w-4 text-ink/40" /><input aria-label="Search opportunities" className="form-control pl-9" onChange={(event) => { setSearch(event.target.value); setPage(1); }} placeholder="Business or deal key" type="search" value={search} /></label>
             <label className="text-xs font-semibold text-ink/58">Confidence<select className="form-control mt-1" onChange={(event) => { setConfidence(event.target.value); setPage(1); }} value={confidence}><option value="">All</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>
             <label className="text-xs font-semibold text-ink/58">Operator priority<select className="form-control mt-1" onChange={(event) => { setPriority(event.target.value); setPage(1); }} value={priority}><option value="">All</option><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="watch">Watch</option></select></label>
-            <label className="text-xs font-semibold text-ink/58">Sort opportunities<select className="form-control mt-1" onChange={(event) => { setSort(event.target.value); setPage(1); }} value={sort}><option value="acquisition-priority">Acquisition priority</option><option value="fit-score">Fit score</option><option value="confidence">Confidence</option><option value="scored-at">Newest observation</option><option value="name">Name</option></select></label>
+            <label className="text-xs font-semibold text-ink/58">Sort opportunities<select className="form-control mt-1" onChange={(event) => { setSort(event.target.value); setPage(1); }} value={sort}><option value="acquisition-priority">Acquisition priority</option><option value="fit-score">Fit score</option><option value="confidence">Confidence</option><option value="scored-at">Newest score</option><option value="name">Name</option></select></label>
           </div>
         </div>
 
@@ -176,13 +265,14 @@ export default function AcquisitionInbox({ readOnly = false }) {
           {error ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{error}</p> : null}
           {loading && queue.rows.length === 0 ? <p className="text-sm text-ink/62">Loading current opportunities…</p> : null}
           {!loading && !error && queue.rows.length === 0 ? <p className="rounded-xl border border-line bg-fog/60 p-4 text-sm text-ink/68">No opportunities in this view.</p> : null}
-          <ul aria-label="Opportunity queue" className="space-y-3 overflow-hidden md:space-y-0 md:rounded-2xl md:border md:border-line">{queue.rows.map((row) => <OpportunityRow key={row.opportunityId} onAction={(action) => recordAction(row.opportunityId, action)} onOpen={() => openDetail(row.opportunityId)} pending={pendingId === row.opportunityId} readOnly={readOnly} row={row} />)}</ul>
+          <ul aria-label="Opportunity queue" className="space-y-3 overflow-hidden md:space-y-0 md:rounded-2xl md:border md:border-line">{queue.rows.map((row) => <OpportunityRow key={row.opportunityId} onAction={(action) => action === 'pass' ? setPassTarget(row) : recordAction(row.opportunityId, action)} onOpen={() => openDetail(row.opportunityId)} pending={Boolean(pendingId)} readOnly={readOnly} row={row} />)}</ul>
           {queue.totalPages > 1 ? <div className="mt-4 flex items-center justify-between"><button aria-label="Previous page" className={buttonClass} disabled={page <= 1 || loading} onClick={() => setPage((current) => Math.max(1, current - 1))} type="button"><ChevronLeft className="h-4 w-4" />Previous</button><p className="text-xs font-semibold text-ink/58">Page {queue.page || page} of {queue.totalPages}</p><button aria-label="Next page" className={buttonClass} disabled={page >= queue.totalPages || loading} onClick={() => setPage((current) => current + 1)} type="button">Next<ChevronRight className="h-4 w-4" /></button></div> : null}
           {readOnly ? <p className="mt-4 text-sm font-semibold text-ink/62">Read-only access: decisions and verified-fact edits are unavailable.</p> : null}
         </div>
       </div>
 
-      {selectedId ? <OpportunityDrawer detail={detail.data} error={detail.error} loading={detail.loading} onAction={(action) => recordAction(selectedId, action)} onClose={() => { setSelectedId(''); setDetail({ data: null, loading: false, error: '' }); }} onSaveFact={saveFact} pending={pendingId === selectedId} readOnly={readOnly} /> : null}
+      {selectedId ? <OpportunityDrawer detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} loading={detail.requestedId === selectedId && detail.loading} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onClose={closeDetail} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} readOnly={readOnly} /> : null}
+      {passTarget ? <QueuePassDialog name={passTarget.name} onCancel={() => setPassTarget(null)} onSubmit={(payload) => recordAction(passTarget.opportunityId, 'pass', payload)} pending={pendingId === passTarget.opportunityId} /> : null}
     </section>
   );
 }
