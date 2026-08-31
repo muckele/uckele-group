@@ -2,8 +2,7 @@
 
 ## Status
 
-Implemented and verified locally. Commit SHA is recorded after the initial
-commit below and then amended into this report.
+Implemented and verified locally.
 
 ## Scope and starting state
 
@@ -167,7 +166,7 @@ Result: lint exited 0; `git diff --check` exited 0.
 
 ## Commit
 
-Pending initial commit; this report will be amended with the final SHA.
+`f231e941079a81b3c0546c2953748aa380dd478f` — `Enforce operator fact storage boundaries`
 
 ## Concerns
 
