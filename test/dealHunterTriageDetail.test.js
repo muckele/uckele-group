@@ -114,6 +114,120 @@ async function detailStorage(t) {
   return { storage, opportunityId };
 }
 
+test('detail opportunity consolidates current authoritative identity, source, score, CRM, and CIM values instead of score-row defaults', async (t) => {
+  // Break caught: projectDetailOpportunity reads only the score-row scan
+  // projection, so populated current canonical/source/CRM/CIM authority is
+  // discarded in favor of empty or default score-row fields.
+  const { storage, opportunityId } = await detailStorage(t);
+  const current = await storage.getCurrentDealHunterOpportunity(opportunityId);
+  await storage.upsertDealHunterOpportunity({
+    ...current,
+    canonical_name: 'Current Field Services Co',
+    canonical_location: 'Sacramento, California',
+    updated_at: '2026-08-30T11:00:00.000Z',
+  });
+  const observedAt = '2026-08-30T11:30:00.000Z';
+  const addCurrentSourceObservation = (field, value) => storage.upsertDealHunterOpportunitySourceObservation({
+    id: `current-projection-${field}`,
+    opportunity_id: opportunityId,
+    source_id: 'current-structured-source',
+    source_name: 'Current Structured Source',
+    source_record_id: 'field-services-1',
+    field,
+    value,
+    observed_at: observedAt,
+    created_at: observedAt,
+    updated_at: observedAt,
+  });
+  await Promise.all([
+    addCurrentSourceObservation('industry', 'Field services'),
+    addCurrentSourceObservation('location', 'Sacramento, California'),
+    addCurrentSourceObservation('city', 'Sacramento'),
+    addCurrentSourceObservation('state', 'California'),
+    addCurrentSourceObservation('annual_profit', '425000'),
+    addCurrentSourceObservation('annual_revenue', '2100000'),
+    addCurrentSourceObservation('asking_price', '1700000'),
+    addCurrentSourceObservation('profit_multiple', '4'),
+    addCurrentSourceObservation('listing_url', 'https://broker.example/listings/current-field-services'),
+  ]);
+  const authorityStorage = new Proxy(storage, {
+    get(target, property) {
+      if (property === 'getSubmission') return async () => ({ id: 'submission-detail', status: 'review' });
+      if (property === 'listDealHunterCimRequests') return async () => [
+        { id: 'cim-stale', opportunity_id: opportunityId, status: 'requested', updated_at: '2026-08-30T10:30:00.000Z' },
+        { id: 'cim-current', opportunity_id: opportunityId, status: 'documents received', updated_at: observedAt },
+      ];
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage: authorityStorage });
+
+  assert.deepEqual({
+    name: detail.opportunity.name,
+    industry: detail.opportunity.industry,
+    geography: detail.opportunity.geography,
+    financials: detail.opportunity.financials,
+    topStrength: detail.opportunity.topStrength,
+    topConcern: detail.opportunity.topConcern,
+    workflow: detail.opportunity.workflow,
+    listingUrl: detail.opportunity.listingUrl,
+    observationFreshness: detail.opportunity.observationFreshness,
+    dismissed: detail.opportunity.dismissed,
+  }, {
+    name: 'Current Field Services Co',
+    industry: 'Field services',
+    geography: { city: 'Sacramento', state: 'California', label: 'Sacramento, California' },
+    financials: { annualProfit: 425000, annualRevenue: 2100000, askingPrice: 1700000, profitMultiple: 4 },
+    topStrength: 'Strong financials',
+    topConcern: 'Seller contact missing',
+    workflow: { crmStatus: 'review', cimStatus: 'documents received' },
+    listingUrl: 'https://broker.example/listings/current-field-services',
+    observationFreshness: observedAt,
+    dismissed: false,
+  });
+});
+
+test('detail opportunity projects the current durable Pass disposition instead of score-row dismissal defaults', async (t) => {
+  // Break caught: the detail composer reads score-row dismissal defaults even
+  // though Pass is durably owned by the current disposition record.
+  const { storage, opportunityId } = await detailStorage(t);
+  await storage.upsertDealHunterDisposition({
+    id: 'detail-current-pass',
+    deal_key: `deal-${opportunityId}`,
+    disposition: 'dismissed',
+    reason: 'valuation',
+    note: 'Current price exceeds the underwriting range.',
+    dismissed_at: '2026-08-30T12:00:00.000Z',
+    dismissed_by: 'operator@example.test',
+    created_at: '2026-08-30T12:00:00.000Z',
+    updated_at: '2026-08-30T12:00:00.000Z',
+    created_by: 'operator@example.test',
+    updated_by: 'operator@example.test',
+    metadata: { providerSecret: 'must-not-leak' },
+  });
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+
+  assert.deepEqual({
+    dismissed: detail.opportunity.dismissed,
+    dismissedReason: detail.opportunity.dismissedReason,
+    disposition: detail.opportunity.disposition,
+  }, {
+    dismissed: true,
+    dismissedReason: 'valuation',
+    disposition: {
+      state: 'dismissed',
+      reason: 'valuation',
+      note: 'Current price exceeds the underwriting range.',
+      dismissedAt: '2026-08-30T12:00:00.000Z',
+      dismissedBy: 'operator@example.test',
+    },
+  });
+  assert.equal(JSON.stringify(detail.opportunity).includes('must-not-leak'), false);
+});
+
 test('consolidated detail returns the exact bounded view with authority, conflicts, safe URLs, and read-only history', async (t) => {
   const { storage, opportunityId } = await detailStorage(t);
   let scoreWrites = 0;
@@ -258,6 +372,39 @@ test('detail sends bounded storage reads and closed, safe URL projections', asyn
   assert.equal(detail.listingUrls.length, 100);
   assert.equal(JSON.stringify(detail.cimSummary).includes('private'), false);
   assert.equal(JSON.stringify(detail.cimSummary).includes('provider_message_id'), false);
+});
+
+test('detail rejects raw-control and credentialed newer source URLs before selecting a safe current listing', async (t) => {
+  // Break caught: whitespace normalization before URL validation can turn a
+  // raw-control URL into an apparently safe URL and let it replace the current
+  // safe source listing.
+  const { storage, opportunityId } = await detailStorage(t);
+  const sourceRows = (unsafeUrl) => [
+    {
+      source_id: 'newer-unsafe', source_name: 'Newer unsafe source', source_record_id: 'newer-unsafe',
+      field: 'listing_url', value: unsafeUrl, observed_at: '2026-08-30T12:00:00.000Z', updated_at: '2026-08-30T12:00:00.000Z',
+    },
+    {
+      source_id: 'current-safe', source_name: 'Current safe source', source_record_id: 'current-safe',
+      field: 'listing_url', value: 'https://broker.example/current-safe', observed_at: '2026-08-30T11:00:00.000Z', updated_at: '2026-08-30T11:00:00.000Z',
+    },
+  ];
+  for (const [kind, unsafeUrl] of [
+    ['newline', 'https://broker.example/new\nline'],
+    ['tab', 'https://broker.example/tab\tline'],
+    ['credentials', 'https://user:secret@broker.example/private'],
+  ]) {
+    const hostile = new Proxy(storage, {
+      get(target, property) {
+        if (property === 'listDealHunterOpportunitySourceObservations') return async () => sourceRows(unsafeUrl);
+        const value = target[property];
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const detail = await getTriageOpportunityDetail({ opportunityId, storage: hostile });
+    assert.equal(detail.opportunity.listingUrl, 'https://broker.example/current-safe', `${kind} source URL cannot replace safe current attribution`);
+    assert.equal(detail.listingUrls.includes(unsafeUrl), false, `${kind} source URL is absent from listing URLs`);
+  }
 });
 
 test('detail closes every nested projection and strips injected storage metadata', async (t) => {
@@ -445,7 +592,7 @@ test('detail closes every nested projection and strips injected storage metadata
     geography: { type: 'object' }, industry: text(240), financials: { type: 'object' }, topStrength: text(400),
     topConcern: text(400), workflow: { type: 'object' }, observationFreshness: text(80), operatorPriority: text(40),
     operatorNote: text(2000), reviewed: boolean, reviewedAt: text(80), reviewedBy: text(160),
-    changedSinceReview: boolean, dismissed: boolean, dismissedReason: text(160), scoredAt: text(80),
+    changedSinceReview: boolean, disposition: { type: 'object' }, dismissed: boolean, dismissedReason: text(160), scoredAt: text(80),
     scoreFingerprint: text(200), rulesVersion: text(160),
   };
   const operatorFactContract = { id: text(200), field: text(80), value: text(4000), verified: boolean, actor: text(160), note: text(500), createdAt: text(80), updatedAt: text(80) };
@@ -459,6 +606,7 @@ test('detail closes every nested projection and strips injected storage metadata
   assertRecordContract(detail.opportunity.geography, { city: text(160), state: text(40), label: text(240) }, 'opportunity.geography');
   assertRecordContract(detail.opportunity.financials, { annualProfit: nullableNumber, annualRevenue: nullableNumber, askingPrice: nullableNumber, profitMultiple: nullableNumber }, 'opportunity.financials');
   assertRecordContract(detail.opportunity.workflow, { crmStatus: text(80), cimStatus: text(80) }, 'opportunity.workflow');
+  assertRecordContract(detail.opportunity.disposition, { state: text(80), reason: text(160), note: text(500), dismissedAt: text(80), dismissedBy: text(160) }, 'opportunity.disposition');
   assert.equal(detail.opportunity.missingEvidenceCount, 52, 'persisted missing-evidence count remains exact');
   assert.equal(detail.opportunity.contradictionCount, 23, 'persisted contradiction count remains exact');
 
@@ -677,7 +825,7 @@ test('detail URL projection table-drives unsafe score and evidence URLs while re
       assert.equal(detail.sourceObservations.find((item) => item.sourceRecordId === '3').values.prospectus_url, 'https://broker.example/prospectus.pdf');
       assert.equal(detail.sourceObservations.find((item) => item.sourceRecordId === '4').values.business_website, 'https://business.example/');
       if (path === 'score') {
-        assert.equal(detail.opportunity.listingUrl, '', `${kind} score listing is omitted from opportunity`);
+        assert.equal(detail.opportunity.listingUrl, 'https://broker.example/listing', `${kind} score listing defers to the current safe source listing`);
         assert.equal(detail.listingUrls.includes(invalidUrl), false, `${kind} score listing is absent from listing URLs`);
       } else {
         assert.equal(detail.score.dimensions[0].evidence[0].listingUrl, '', `${kind} evidence listing is projected empty`);

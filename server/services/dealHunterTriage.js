@@ -317,14 +317,125 @@ function projectSourceObservations(rows = []) {
   return { sourceObservations: [...groups.values()].slice(0, 100), conflicts: conflicts.map(({ field, values }) => ({ field, observations: values.slice(0, 20) })) };
 }
 
-function projectDetailOpportunity(score = {}) {
+function currentDetailSourceRows(rows = []) {
+  return (Array.isArray(rows) ? rows : []).slice(0, 500).flatMap((row, index) => {
+    if (!row || typeof row !== 'object') return [];
+    const field = detailText(row.field, 80).toLowerCase();
+    const rawValue = typeof row.value === 'string' ? row.value : '';
+    const value = detailText(row.value, 5000);
+    if (!field || !value) return [];
+    const observedAt = detailText(row.observed_at ?? row.observedAt ?? row.updated_at ?? row.updatedAt, 80);
+    const timestamp = Date.parse(observedAt);
+    return [{ field, value, rawValue, observedAt, timestamp: Number.isFinite(timestamp) ? timestamp : null, index }];
+  }).sort((left, right) => {
+    if (left.timestamp !== null && right.timestamp === null) return -1;
+    if (left.timestamp === null && right.timestamp !== null) return 1;
+    if (left.timestamp !== null && right.timestamp !== null && left.timestamp !== right.timestamp) return right.timestamp - left.timestamp;
+    return left.index - right.index;
+  });
+}
+
+function currentDetailSourceValue(rows, fields, maximum = 500) {
+  const allowed = new Set(fields);
+  return detailText(rows.find((row) => allowed.has(row.field))?.value, maximum);
+}
+
+function currentDetailSourceNumber(rows, fields, fallback) {
+  const allowed = new Set(fields);
+  for (const row of rows) {
+    if (!allowed.has(row.field)) continue;
+    const value = nullableNumber(row.value);
+    if (value !== null) return value;
+  }
+  return nullableNumber(fallback);
+}
+
+function currentDetailSourceListingUrl(rows) {
+  for (const row of rows) {
+    if (row.field !== 'listing_url') continue;
+    const url = safeListingUrl(row.rawValue);
+    if (url) return url;
+  }
+  return '';
+}
+
+function detailLocationParts(value) {
+  const parts = detailText(value, 240).split(',').map((part) => detailText(part, 160)).filter(Boolean);
+  return { city: parts[0] || '', state: parts.slice(1).join(', ') };
+}
+
+function currentDetailCimStatus(records, fallback) {
+  const candidates = (Array.isArray(records) ? records : []).slice(0, 100).flatMap((record, index) => {
+    const status = detailText(record?.status, 80);
+    if (!status) return [];
+    const updatedAt = detailText(record?.updated_at ?? record?.updatedAt, 80);
+    const timestamp = Date.parse(updatedAt);
+    return [{ status, timestamp: Number.isFinite(timestamp) ? timestamp : null, index }];
+  }).sort((left, right) => {
+    if (left.timestamp !== null && right.timestamp === null) return -1;
+    if (left.timestamp === null && right.timestamp !== null) return 1;
+    if (left.timestamp !== null && right.timestamp !== null && left.timestamp !== right.timestamp) return right.timestamp - left.timestamp;
+    return left.index - right.index;
+  });
+  return candidates[0]?.status || fallback;
+}
+
+function currentDetailDisposition(records) {
+  const candidates = (Array.isArray(records) ? records : []).slice(0, 20).flatMap((record, index) => {
+    const state = detailText(record?.disposition, 80).toLowerCase();
+    if (!state) return [];
+    const updatedAt = detailText(record?.updated_at ?? record?.updatedAt, 80);
+    const timestamp = Date.parse(updatedAt);
+    return [{
+      state,
+      reason: detailText(record?.reason, 160),
+      note: detailText(record?.note, 500),
+      dismissedAt: detailText(record?.dismissed_at ?? record?.dismissedAt, 80),
+      dismissedBy: detailText(record?.dismissed_by ?? record?.dismissedBy, 160),
+      timestamp: Number.isFinite(timestamp) ? timestamp : null,
+      index,
+    }];
+  }).sort((left, right) => {
+    if (left.timestamp !== null && right.timestamp === null) return -1;
+    if (left.timestamp === null && right.timestamp !== null) return 1;
+    if (left.timestamp !== null && right.timestamp !== null && left.timestamp !== right.timestamp) return right.timestamp - left.timestamp;
+    return left.index - right.index;
+  });
+  const current = candidates[0];
+  return current
+    ? { state: current.state, reason: current.reason, note: current.note, dismissedAt: current.dismissedAt, dismissedBy: current.dismissedBy }
+    : { state: '', reason: '', note: '', dismissedAt: '', dismissedBy: '' };
+}
+
+function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceRows = [], submission = null, cimRequests = [], dispositions = [] } = {}) {
   const row = publicTriageRow(score, { includeOperatorNote: true });
+  const sources = currentDetailSourceRows(sourceRows);
+  const sourceLocation = currentDetailSourceValue(sources, ['location'], 240);
+  const sourceCity = currentDetailSourceValue(sources, ['city'], 160);
+  const sourceState = currentDetailSourceValue(sources, ['state'], 40);
+  const parsedLocation = detailLocationParts(sourceLocation || currentOpportunity?.canonical_location || row.geography?.label);
+  const city = sourceCity || parsedLocation.city || detailText(row.geography?.city, 160);
+  const state = sourceState || parsedLocation.state || detailText(row.geography?.state, 40);
+  const location = sourceLocation
+    || (sourceCity || sourceState ? [sourceCity, sourceState].filter(Boolean).join(', ') : '')
+    || detailText(currentOpportunity?.canonical_location, 240)
+    || detailText(row.geography?.label, 240)
+    || state;
+  const topStrength = detailStrings(score.summary?.strengths, { limit: 1, max: 400 })[0] || detailText(row.topStrength, 400);
+  const topConcern = detailStrings(score.summary?.concerns, { limit: 1, max: 400 })[0] || detailText(row.topConcern, 400);
+  const crmStatus = detailText(submission?.status, 80) || detailText(row.workflow?.crmStatus, 80) || 'not-started';
+  const cimStatus = currentDetailCimStatus(cimRequests, detailText(row.workflow?.cimStatus, 80) || 'not-requested');
+  const observationFreshness = sources.find((source) => source.observedAt)?.observedAt
+    || detailText(row.observationFreshness, 80);
+  const disposition = currentDetailDisposition(dispositions);
+  const dismissed = disposition.state === 'dismissed';
+  const listingUrl = currentDetailSourceListingUrl(sources) || safeListingUrl(row.listingUrl);
   return {
-    opportunityId: detailText(row.opportunityId, 200), dealKey: detailText(row.dealKey, 200), name: detailText(row.name, 500) || 'Unnamed opportunity', state: detailText(row.state, 40), listingUrl: safeListingUrl(row.listingUrl),
+    opportunityId: detailText(row.opportunityId, 200), dealKey: detailText(row.dealKey, 200), name: detailText(currentOpportunity?.canonical_name, 500) || currentDetailSourceValue(sources, ['name', 'business_name'], 500) || detailText(row.name, 500) || 'Unnamed opportunity', state: detailText(state, 40), listingUrl,
     fitScore: detailNumber(row.fitScore), scoreStatus: detailText(row.scoreStatus, 80), confidence: detailText(row.confidence, 80), completenessScore: detailNumber(row.completenessScore), missingEvidenceCount: detailNumber(row.missingEvidenceCount), contradictionCount: detailNumber(row.contradictionCount), shouldRemove: Boolean(row.shouldRemove), highFit: Boolean(row.highFit),
-    geography: { city: detailText(row.geography?.city, 160), state: detailText(row.geography?.state, 40), label: detailText(row.geography?.label, 240) }, industry: detailText(row.industry, 240),
-    financials: { annualProfit: nullableNumber(row.financials?.annualProfit), annualRevenue: nullableNumber(row.financials?.annualRevenue), askingPrice: nullableNumber(row.financials?.askingPrice), profitMultiple: nullableNumber(row.financials?.profitMultiple) },
-    topStrength: detailText(row.topStrength, 400), topConcern: detailText(row.topConcern, 400), workflow: { crmStatus: detailText(row.workflow?.crmStatus, 80), cimStatus: detailText(row.workflow?.cimStatus, 80) }, observationFreshness: detailText(row.observationFreshness, 80), operatorPriority: detailText(row.operatorPriority, 40) || 'normal', operatorNote: detailText(row.operatorNote, 2000), reviewed: Boolean(row.reviewed), reviewedAt: detailText(row.reviewedAt, 80), reviewedBy: detailText(row.reviewedBy, 160), changedSinceReview: Boolean(row.changedSinceReview), dismissed: Boolean(row.dismissed), dismissedReason: detailText(row.dismissedReason, 160), scoredAt: detailText(row.scoredAt, 80), scoreFingerprint: detailText(row.scoreFingerprint, 200), rulesVersion: detailText(row.rulesVersion, 160),
+    geography: { city: detailText(city, 160), state: detailText(state, 40), label: detailText(location, 240) }, industry: currentDetailSourceValue(sources, ['industry'], 240) || detailText(row.industry, 240),
+    financials: { annualProfit: currentDetailSourceNumber(sources, ['annual_profit', 'ttm_ebitda'], row.financials?.annualProfit), annualRevenue: currentDetailSourceNumber(sources, ['annual_revenue', 'ttm_revenue'], row.financials?.annualRevenue), askingPrice: currentDetailSourceNumber(sources, ['asking_price'], row.financials?.askingPrice), profitMultiple: currentDetailSourceNumber(sources, ['profit_multiple', 'ebitda_multiple'], row.financials?.profitMultiple) },
+    topStrength, topConcern, workflow: { crmStatus, cimStatus }, observationFreshness, operatorPriority: detailText(row.operatorPriority, 40) || 'normal', operatorNote: detailText(row.operatorNote, 2000), reviewed: Boolean(row.reviewed), reviewedAt: detailText(row.reviewedAt, 80), reviewedBy: detailText(row.reviewedBy, 160), changedSinceReview: Boolean(row.changedSinceReview), disposition, dismissed, dismissedReason: dismissed ? disposition.reason : '', scoredAt: detailText(row.scoredAt, 80), scoreFingerprint: detailText(row.scoreFingerprint, 200), rulesVersion: detailText(row.rulesVersion, 160),
   };
 }
 
@@ -433,7 +544,14 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
       .filter((row) => row.field === 'listing_url')
       .map((row) => safeListingUrl(row.value)),
   ].filter(Boolean))].slice(0, 100);
-  const opportunity = projectDetailOpportunity(score);
+  const opportunity = projectDetailOpportunity({
+    score,
+    currentOpportunity,
+    sourceRows,
+    submission,
+    cimRequests,
+    dispositions,
+  });
   const projectedScore = projectScore(score, byDimension, unattributed);
   const communications = (crmCommunications?.rows || []).slice(0, 100).map((communication) => ({
     id: detailText(communication.id, 200), direction: detailText(communication.direction, 80), channel: detailText(communication.channel, 80),
