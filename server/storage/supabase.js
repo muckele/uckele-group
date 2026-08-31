@@ -474,6 +474,18 @@ function normalizeAtomicMutationResult(operation, data) {
   };
 }
 
+function normalizeDealHunterPassResult(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return { applied: false, reason: 'invalid-result' };
+  return {
+    applied: Boolean(data.applied),
+    reason: String(data.reason || ''),
+    disposition: data.disposition ? normalizeDealHunterDispositionRow(data.disposition) : null,
+    score: data.score ? normalizeDealHunterOpportunityScoreRow(data.score) : null,
+    submission: data.submission ? normalizeSubmissionRow(data.submission) : null,
+    archived: Boolean(data.archived),
+  };
+}
+
 function normalizeList(values, maxLength = 5000) {
   return Array.from(
     new Set(
@@ -2682,6 +2694,25 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       });
       if (error) throw error;
       return normalizeDealHunterOpportunityScoreRow(data);
+    },
+
+    async passDealHunterOpportunity(command = {}) {
+      const opportunityId = String(command.opportunityId || '').trim();
+      if (!opportunityId) throw new Error('A canonical opportunity id is required for atomic Pass.');
+      const { data, error } = await client.rpc('pass_deal_hunter_opportunity', {
+        p_command: {
+          opportunity_id: opportunityId,
+          reason: String(command.reason || '').trim(),
+          note: String(command.note || '').trim(),
+          actor: String(command.actor || 'admin').trim() || 'admin',
+          occurred_at: command.occurredAt || new Date().toISOString(),
+          disposition_id: String(command.dispositionId || '').trim(),
+          archive_activity_id: String(command.archiveActivityId || '').trim(),
+          triage_activity_id: String(command.triageActivityId || '').trim(),
+        },
+      });
+      if (error) throw error;
+      return normalizeDealHunterPassResult(data);
     },
 
     async setDealHunterOpportunityOperatorDecision(decision = {}) {

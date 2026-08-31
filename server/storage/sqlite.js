@@ -6495,6 +6495,183 @@ export function createSqliteStorage(config) {
         return this.getDealHunterOpportunityScore(opportunityId);
       },
 
+      async passDealHunterOpportunity(command = {}) {
+        const opportunityId = String(command.opportunityId || '').trim();
+        const actor = String(command.actor || 'admin').trim() || 'admin';
+        const occurredAt = command.occurredAt || new Date().toISOString();
+        if (!opportunityId || !command.dispositionId || !command.archiveActivityId || !command.triageActivityId) {
+          throw new Error('Atomic opportunity Pass requires canonical command identity.');
+        }
+        const transaction = database.transaction(() => {
+          const opportunity = database.prepare(`
+            SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+          `).get(opportunityId);
+          if (!opportunity || opportunity.status !== 'active') return { applied: false, reason: 'not-current' };
+
+          const score = database.prepare(`
+            SELECT * FROM deal_hunter_opportunity_scores
+            WHERE opportunity_id = ? AND current_triage_eligible = 1
+            LIMIT 1
+          `).get(opportunityId);
+          if (!score) return { applied: false, reason: 'not-current' };
+          if (score.should_remove) return { applied: false, reason: 'not-actionable' };
+
+          const existingDisposition = database.prepare(`
+            SELECT * FROM deal_hunter_dispositions WHERE deal_key = ? LIMIT 1
+          `).get(score.deal_key);
+          if (existingDisposition?.disposition === 'dismissed') {
+            return {
+              applied: false,
+              reason: 'already-passed',
+              disposition: normalizeDealHunterDispositionRow(existingDisposition),
+              score: normalizeDealHunterOpportunityScoreRow(score),
+            };
+          }
+
+          const submission = opportunity.primary_submission_id
+            ? database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1').get(opportunity.primary_submission_id)
+            : null;
+          if (opportunity.primary_submission_id && !submission) {
+            return { applied: false, reason: 'linked-submission-missing' };
+          }
+          const archiveSubmission = Boolean(submission && submission.status !== 'archived');
+          if (archiveSubmission && activeCimClaimForSubmission(submission.id, occurredAt)) {
+            return { applied: false, reason: 'cim-send-in-progress' };
+          }
+
+          if (archiveSubmission) {
+            const existingMetadata = parseJsonColumn(submission.metadata, {});
+            updateRecord(
+              'contact_submissions',
+              submission.id,
+              {
+                updated_at: occurredAt,
+                status: 'archived',
+                status_updated_at: occurredAt,
+                follow_up_state: 'completed',
+                next_action_at: null,
+                archived_at: occurredAt,
+                archived_by: actor,
+                archive_reason: command.reason,
+                archive_note: command.note || null,
+                archive_communication_id: null,
+                metadata: {
+                  ...existingMetadata,
+                  acquisitionCommand: {
+                    ...(existingMetadata.acquisitionCommand || {}),
+                    pipelineStage: 'passed',
+                    passReason: command.reason,
+                    fitFeedback: 'false-positive',
+                    updatedAt: occurredAt,
+                    updatedBy: actor,
+                  },
+                  leadArchive: {
+                    previousStatus: submission.status,
+                    archivedAt: occurredAt,
+                    archivedBy: actor,
+                    reason: command.reason,
+                    communicationId: '',
+                  },
+                },
+              },
+              submissionUpdateFields,
+              submissionJsonFields,
+            );
+            database.prepare(`
+              UPDATE deal_hunter_cim_requests SET
+                request_state = CASE WHEN request_state = 'responded' THEN request_state ELSE 'stopped' END,
+                follow_up_state = CASE WHEN request_state = 'responded' THEN 'completed' ELSE 'stopped' END,
+                next_follow_up_at = NULL,
+                updated_at = ?,
+                last_activity_at = ?
+              WHERE submission_id = ?
+            `).run(occurredAt, occurredAt, submission.id);
+          }
+
+          const disposition = upsertDealHunterDispositionRecord({
+            id: command.dispositionId,
+            deal_key: score.deal_key,
+            submission_id: submission?.id || null,
+            listing_url: score.listing_url || null,
+            deal_name: score.name || opportunity.canonical_name || null,
+            created_at: occurredAt,
+            updated_at: occurredAt,
+            disposition: 'dismissed',
+            reason: command.reason,
+            note: command.note || null,
+            dismissed_at: occurredAt,
+            dismissed_by: actor,
+            restored_at: null,
+            restored_by: null,
+            created_by: actor,
+            updated_by: actor,
+            metadata: {},
+          });
+
+          database.prepare(`
+            UPDATE deal_hunter_opportunity_scores SET
+              reviewed_at = ?,
+              reviewed_by = ?,
+              reviewed_fingerprint = score_fingerprint,
+              reviewed_semantic_digest = semantic_digest,
+              operator_updated_at = ?
+            WHERE opportunity_id = ? AND current_triage_eligible = 1
+          `).run(occurredAt, actor, occurredAt, opportunityId);
+
+          if (submission) {
+            if (archiveSubmission) {
+              insertCrmActivityEvent({
+                id: command.archiveActivityId,
+                submission_id: submission.id,
+                opportunity_id: opportunityId,
+                created_at: occurredAt,
+                actor,
+                role: 'admin',
+                event_type: 'submission.archived',
+                summary: `Lead archived: ${String(command.reason || '').replace(/-/g, ' ')}.`,
+                metadata: {
+                  archiveReason: command.reason,
+                  communicationId: '',
+                  previousStatus: submission.status,
+                  dealKey: score.deal_key,
+                  dispositionId: disposition.id,
+                },
+              });
+            }
+            insertCrmActivityEvent({
+              id: command.triageActivityId,
+              submission_id: submission.id,
+              opportunity_id: opportunityId,
+              created_at: occurredAt,
+              actor,
+              role: 'admin',
+              event_type: 'opportunity.triaged',
+              summary: 'Operator triage: marked reviewed, passed.',
+              metadata: {
+                markedReviewed: true,
+                reviewedFingerprint: score.score_fingerprint,
+                fitScoreAtDecision: score.fit_score,
+                dispositionId: disposition.id,
+              },
+            });
+          }
+
+          return {
+            applied: true,
+            reason: '',
+            disposition,
+            score: normalizeDealHunterOpportunityScoreRow(database.prepare(`
+              SELECT * FROM deal_hunter_opportunity_scores WHERE opportunity_id = ? LIMIT 1
+            `).get(opportunityId)),
+            submission: submission
+              ? normalizeSubmissionRow(database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1').get(submission.id))
+              : null,
+            archived: Boolean(submission?.status === 'archived' || archiveSubmission),
+          };
+        });
+        return transaction.immediate();
+      },
+
       async setDealHunterOpportunityOperatorDecision(decision = {}) {
         const opportunityId = String(decision.opportunityId || '').trim();
         if (!opportunityId) throw new Error('A canonical opportunity id is required to record an operator decision.');
@@ -6529,9 +6706,18 @@ export function createSqliteStorage(config) {
             throw new Error('A superseded or otherwise non-current opportunity cannot receive a triage decision.');
           }
           const existing = database
-            .prepare('SELECT opportunity_id FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?')
+            .prepare('SELECT opportunity_id, deal_key FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?')
             .get(opportunityId);
           if (!existing) return false;
+          const disposition = database.prepare(`
+            SELECT disposition FROM deal_hunter_dispositions WHERE deal_key = ? LIMIT 1
+          `).get(existing.deal_key);
+          if (disposition?.disposition === 'dismissed') {
+            const error = new Error('This opportunity has already been passed and is durably dismissed.');
+            error.code = 'DEAL_HUNTER_OPPORTUNITY_DISMISSED';
+            error.status = 409;
+            throw error;
+          }
           database.prepare(`
             UPDATE deal_hunter_opportunity_scores
             SET ${assignments.join(', ')}, operator_updated_at = @operator_updated_at

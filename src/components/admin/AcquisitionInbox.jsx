@@ -200,12 +200,17 @@ export default function AcquisitionInbox({ readOnly = false }) {
     };
   }, [confidence, loadQueue, page, priority, search, sort, view]);
 
-  const loadDetail = useCallback(async (opportunityId) => {
+  const loadDetail = useCallback(async (opportunityId, { preserveData = false } = {}) => {
     detailRequestRef.current.controller?.abort();
     const controller = new AbortController();
     const generation = detailRequestRef.current.generation + 1;
     detailRequestRef.current = { generation, controller };
-    setDetail({ requestedId: opportunityId, data: null, loading: true, error: '' });
+    setDetail((current) => ({
+      requestedId: opportunityId,
+      data: preserveData && current.requestedId === opportunityId ? current.data : null,
+      loading: true,
+      error: '',
+    }));
     try {
       const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}`, { credentials: 'same-origin', signal: controller.signal });
       const result = await response.json();
@@ -216,7 +221,12 @@ export default function AcquisitionInbox({ readOnly = false }) {
       return true;
     } catch (detailError) {
       if (isAbortError(detailError) || detailRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
-      setDetail({ requestedId: opportunityId, data: null, loading: false, error: detailError.message || 'Unable to load opportunity detail.' });
+      setDetail((current) => ({
+        requestedId: opportunityId,
+        data: preserveData && current.requestedId === opportunityId ? current.data : null,
+        loading: false,
+        error: detailError.message || 'Unable to load opportunity detail.',
+      }));
       return false;
     } finally {
       if (detailRequestRef.current.generation === generation) detailRequestRef.current.controller = null;
@@ -279,12 +289,22 @@ export default function AcquisitionInbox({ readOnly = false }) {
       });
       const result = await response.json();
       if (!response.ok || !result.success) throw new Error(result.error || 'Unable to record this decision.');
+      const authoritativeOpportunity = result?.opportunity?.opportunityId === opportunityId ? result.opportunity : null;
+      if (authoritativeOpportunity) {
+        setQueue((current) => ({
+          ...current,
+          rows: current.rows.map((row) => row.opportunityId === opportunityId ? authoritativeOpportunity : row),
+        }));
+        setDetail((current) => current.requestedId === opportunityId && current.data
+          ? { ...current, data: { ...current.data, opportunity: authoritativeOpportunity }, error: '' }
+          : current);
+      }
       await loadQueue();
       if (action === 'pass') {
         if (selectionRef.current === opportunityId) closeDetail(true);
         if (passTarget?.opportunityId === opportunityId) closeQueuePass(true);
       } else if (selectionRef.current === opportunityId) {
-        await loadDetail(opportunityId);
+        await loadDetail(opportunityId, { preserveData: true });
       }
       return true;
     } catch (actionError) {

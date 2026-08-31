@@ -9,8 +9,10 @@
 // current one, dismissal comes from the existing disposition record, and
 // acquisition progress stays owned by the command center.
 
+import { randomUUID } from 'node:crypto';
 import { recordCrmActivity } from './activity.js';
 import { getStorage } from '../storage/index.js';
+import { normalizeDealHunterDispositionReason } from './leadLifecycle.js';
 import {
   dealOperatorPriorities,
   normalizeDealOperatorPriority,
@@ -509,7 +511,16 @@ export async function setTriageOperatorDecision({
     return { ok: false, status: 400, error: 'No operator decision was provided.' };
   }
 
-  const updated = await storage.setDealHunterOpportunityOperatorDecision(decision);
+  let updated;
+  try {
+    updated = await storage.setDealHunterOpportunityOperatorDecision(decision);
+  } catch (error) {
+    if (error?.code === 'DEAL_HUNTER_OPPORTUNITY_DISMISSED' || /already been passed|durably dismissed/i.test(error?.message || '')) {
+      return { ok: false, status: 409, error: 'This opportunity has already been passed. Restore it before recording another decision.' };
+    }
+    throw error;
+  }
+  if (!updated) return { ok: false, status: 404, error: 'No current score has been recorded for this opportunity.' };
 
   const opportunity = await storage.getCurrentDealHunterOpportunity?.(id);
   const submissionId = opportunity?.primary_submission_id || '';
@@ -536,4 +547,77 @@ export async function setTriageOperatorDecision({
   }
 
   return { ok: true, status: 200, opportunity: publicTriageRow(updated, { includeOperatorNote: true }) };
+}
+
+function publicPassDisposition(disposition = {}) {
+  return {
+    id: detailText(disposition.id, 200),
+    disposition: detailText(disposition.disposition, 40),
+    reason: detailText(disposition.reason, 80),
+    note: detailText(disposition.note, 2000),
+    dismissedAt: detailText(disposition.dismissed_at, 80),
+    dismissedBy: detailText(disposition.dismissed_by, 160),
+  };
+}
+
+export async function passTriageOpportunity({
+  opportunityId = '',
+  reason = '',
+  note = '',
+  actor = 'admin',
+  storage = getStorage(),
+} = {}) {
+  const id = normalizeText(opportunityId, 200);
+  if (!id) return { ok: false, status: 400, error: 'A canonical opportunity id is required.' };
+  if (typeof reason !== 'string' || !reason.trim() || reason.trim().length > 80) {
+    return { ok: false, status: 400, error: 'A bounded disposition reason is required.' };
+  }
+  if (note !== undefined && note !== null && (typeof note !== 'string' || note.length > maxNoteLength)) {
+    return { ok: false, status: 400, error: 'Disposition note must be a bounded string.' };
+  }
+  if (typeof storage.passDealHunterOpportunity !== 'function') {
+    return { ok: false, status: 503, error: 'Atomic opportunity Pass storage is unavailable.' };
+  }
+
+  const normalizedReason = normalizeDealHunterDispositionReason(reason);
+  if (!normalizedReason) return { ok: false, status: 400, error: 'A disposition reason is required.' };
+  const now = new Date().toISOString();
+  const normalizedActor = normalizeText(actor, 160) || 'admin';
+  const result = await storage.passDealHunterOpportunity({
+    opportunityId: id,
+    reason: normalizedReason,
+    note: note?.trim() || '',
+    actor: normalizedActor,
+    occurredAt: now,
+    dispositionId: randomUUID(),
+    archiveActivityId: randomUUID(),
+    triageActivityId: randomUUID(),
+  });
+
+  if (!result?.applied) {
+    const failures = {
+      'not-current': [404, 'No current score has been recorded for this opportunity.'],
+      'not-actionable': [409, 'This opportunity is not actionable in Acquisition Inbox.'],
+      'already-passed': [409, 'This opportunity has already been passed. Restore it before recording another decision.'],
+      'linked-submission-missing': [409, 'The linked CRM record is unavailable. Refresh before passing this opportunity.'],
+      'cim-send-in-progress': [409, 'A CIM transmission is in progress. Retry Pass after it finishes.'],
+    };
+    const [status, error] = failures[result?.reason] || [409, 'Opportunity state changed before Pass could be saved.'];
+    return { ok: false, status, error };
+  }
+
+  const disposition = publicPassDisposition(result.disposition);
+  const opportunity = publicTriageRow({
+    ...result.score,
+    dismissed_at: result.disposition?.dismissed_at,
+    dismissed_reason: result.disposition?.reason,
+  }, { includeOperatorNote: true });
+  return {
+    ok: true,
+    status: 200,
+    action: 'pass',
+    disposition,
+    opportunity,
+    archived: Boolean(result.archived),
+  };
 }

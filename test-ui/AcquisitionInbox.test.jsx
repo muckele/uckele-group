@@ -446,6 +446,75 @@ describe('Acquisition Inbox queue', () => {
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Pass Evergreen Fire Protection' })).not.toBeInTheDocument());
   });
 
+  test('keeps the authoritative Passed state visible when the post-success queue refresh fails', async () => {
+    // Break caught: a successful Pass followed by a failed queue reload leaves
+    // the stale actionable row mounted even though the server has durably
+    // dismissed it.
+    let queueReads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/action')) {
+        return jsonResponse({
+          success: true,
+          action: 'pass',
+          disposition: { disposition: 'dismissed', reason: 'valuation' },
+          opportunity: queueRow({ reviewed: true, dismissed: true, dismissedReason: 'valuation' }),
+        });
+      }
+      queueReads += 1;
+      return queueReads === 1
+        ? jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }))
+        : jsonResponse({ success: false, error: 'Authoritative queue refresh is unavailable.' }, { ok: false, status: 503 });
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Pass Evergreen Fire Protection' }));
+    const form = screen.getByRole('form', { name: 'Pass Evergreen Fire Protection' });
+    fireEvent.change(within(form).getByLabelText('Pass reason'), { target: { value: 'valuation' } });
+    fireEvent.click(within(form).getByRole('button', { name: 'Confirm Pass' }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Pass Evergreen Fire Protection' })).not.toBeInTheDocument());
+    expect(await screen.findByText('Passed: Valuation')).toBeVisible();
+    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+      expect(screen.queryByRole('button', { name: action })).not.toBeInTheDocument();
+    }
+    expect(screen.getByRole('alert')).toHaveTextContent('Authoritative queue refresh is unavailable.');
+  });
+
+  test('retains the authoritative Watch result when both post-success queue and detail refreshes fail', async () => {
+    // Break caught: post-success refresh failures replace the successful
+    // server result with stale queue controls and an empty detail drawer.
+    let queueReads = 0;
+    let detailReads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/action')) {
+        return jsonResponse({ success: true, action: 'watch', opportunity: queueRow({ reviewed: true, operatorPriority: 'watch' }) });
+      }
+      if (url.endsWith('/triage/opp-1')) {
+        detailReads += 1;
+        return detailReads === 1
+          ? jsonResponse(detailResponse())
+          : jsonResponse({ error: 'Authoritative detail refresh is unavailable.' }, { ok: false, status: 503 });
+      }
+      queueReads += 1;
+      return queueReads === 1
+        ? jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }))
+        : jsonResponse({ success: false, error: 'Authoritative queue refresh is unavailable.' }, { ok: false, status: 503 });
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
+
+    expect(await within(drawer).findByText('Reviewed · Current')).toBeVisible();
+    expect(within(drawer).getAllByText('Operator state')[0].parentElement).toHaveTextContent('Watch');
+    expect(within(drawer).getByRole('alert')).toHaveTextContent('Authoritative detail refresh is unavailable.');
+    expect(screen.getByText('Review: Reviewed')).toBeVisible();
+    expect(screen.getAllByText('Operator: Watch')).toHaveLength(1);
+  });
+
   test('keeps a persisted queue usable with a degraded cached-source warning and makes no prohibited read-flow request', async () => {
     const requests = [];
     const writes = [];

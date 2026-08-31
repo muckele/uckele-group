@@ -43,6 +43,7 @@ import {
 import {
   getTriageOpportunityDetail,
   listTriageQueue,
+  passTriageOpportunity,
   setTriageOperatorDecision,
 } from './services/dealHunterTriage.js';
 import { setCurrentOperatorOpportunityFact } from './services/dealHunterOpportunityFacts.js';
@@ -1557,48 +1558,13 @@ export function createApp() {
         return;
       }
 
-      const storage = getStorage();
-      const [opportunity, score] = await Promise.all([
-        storage.getCurrentDealHunterOpportunity?.(opportunityId),
-        storage.getCurrentDealHunterOpportunityScore?.(opportunityId),
-      ]);
-      if (!opportunity || !score) {
-        response.status(404).json({ success: false, error: 'No current score has been recorded for this opportunity.' });
-        return;
-      }
-      const reason = request.body?.reason;
-      const note = request.body?.note;
-      if (typeof reason !== 'string' || !reason.trim() || reason.trim().length > 80) {
-        response.status(400).json({ success: false, error: 'A bounded disposition reason is required.' });
-        return;
-      }
-      if (note !== undefined && note !== null && (typeof note !== 'string' || note.length > 2000)) {
-        response.status(400).json({ success: false, error: 'Disposition note must be a bounded string.' });
-        return;
-      }
-      const dismissal = await dismissDealHunterOpportunity({
-        dealKey: score.deal_key || '',
-        listingUrl: score.listing_url || '',
-        dealName: score.name || opportunity.canonical_name || '',
-        reason: reason.trim(),
-        note: note?.trim() || '',
-        submissionId: opportunity.primary_submission_id || '',
-        actor: session.username || 'admin',
-        storage,
-      });
-      if (!dismissal.ok) {
-        response.status(dismissal.status || 400).json({ success: false, action, ...dismissal });
-        return;
-      }
-      const review = await setTriageOperatorDecision({
+      const result = await passTriageOpportunity({
         opportunityId,
-        markReviewed: true,
+        reason: request.body?.reason,
+        note: request.body?.note,
         actor: session.username || 'admin',
-        storage,
       });
-      response.status(review.status || (review.ok ? 200 : 400)).json({
-        success: Boolean(review.ok), action, disposition: dismissal.disposition || null, ...review,
-      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), action, ...result });
     }),
   );
 
