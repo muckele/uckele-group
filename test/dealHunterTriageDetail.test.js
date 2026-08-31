@@ -114,6 +114,256 @@ async function detailStorage(t) {
   return { storage, opportunityId };
 }
 
+function withDetailAuthorityRows(storage, { sourceRows, cimRequests, dispositions } = {}) {
+  return new Proxy(storage, {
+    get(target, property) {
+      if (property === 'listDealHunterOpportunitySourceObservations' && sourceRows !== undefined) return async () => sourceRows;
+      if (property === 'listDealHunterCimRequests' && cimRequests !== undefined) return async () => cimRequests;
+      if (property === 'listDealHunterDispositions' && dispositions !== undefined) return async () => dispositions;
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+function currentDetailProjection(detail) {
+  return {
+    industry: detail.opportunity.industry,
+    freshness: detail.opportunity.observationFreshness,
+    cimStatus: detail.opportunity.workflow.cimStatus,
+    disposition: {
+      state: detail.opportunity.disposition.state,
+      reason: detail.opportunity.disposition.reason,
+      dismissedAt: detail.opportunity.disposition.dismissedAt,
+    },
+    dismissed: detail.opportunity.dismissed,
+  };
+}
+
+test('detail source authority uses the first valid timestamp in its documented fallback chain', async (t) => {
+  // Break caught: choosing the first non-null observation timestamp lets a
+  // malformed observed_at hide a newer, valid updated_at or created_at.
+  const { storage, opportunityId } = await detailStorage(t);
+  const olderAt = '2026-08-31T10:00:00.000Z';
+  const newerAt = '2026-08-31T12:00:00.000Z';
+  const olderSource = {
+    id: 'source-older', source_id: 'source-older', source_name: 'Older source', source_record_id: 'older-record',
+    field: 'industry', value: 'older-primary-value', observed_at: olderAt, updated_at: olderAt, created_at: olderAt,
+  };
+  const cases = [
+    {
+      name: 'falls from malformed observed_at to updated_at',
+      newerSource: { observed_at: 'not-a-date', updated_at: newerAt, created_at: '2026-08-31T09:00:00.000Z' },
+    },
+    {
+      name: 'falls from missing observedAt to updatedAt',
+      newerSource: { updatedAt: newerAt, createdAt: '2026-08-31T09:00:00.000Z' },
+    },
+    {
+      name: 'falls through malformed observedAt and updated_at to createdAt',
+      newerSource: { observedAt: 'not-a-date', updated_at: 'still-not-a-date', createdAt: newerAt },
+    },
+  ];
+
+  for (const { name, newerSource } of cases) {
+    await t.test(name, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, {
+          sourceRows: [
+            olderSource,
+            {
+              id: 'source-newer', source_id: 'source-newer', source_name: 'Newer source', source_record_id: 'newer-record',
+              field: 'industry', value: 'newer-fallback-value', ...newerSource,
+            },
+          ],
+        }),
+      });
+      assert.deepEqual({
+        industry: detail.opportunity.industry,
+        freshness: detail.opportunity.observationFreshness,
+      }, {
+        industry: 'newer-fallback-value',
+        freshness: newerAt,
+      });
+    });
+  }
+});
+
+test('detail CIM authority uses the first valid durable timestamp in its bounded fallback chain', async (t) => {
+  // Break caught: choosing the first non-null CIM updated timestamp lets a
+  // malformed primary hide a newer durable creation timestamp.
+  const { storage, opportunityId } = await detailStorage(t);
+  const olderAt = '2026-08-31T10:00:00.000Z';
+  const newerAt = '2026-08-31T12:00:00.000Z';
+  const olderRequest = { id: 'cim-older', status: 'requested', updated_at: olderAt, created_at: olderAt };
+  const cases = [
+    {
+      name: 'falls from malformed updated_at to created_at',
+      newerRequest: { updated_at: 'not-a-date', created_at: newerAt },
+    },
+    {
+      name: 'falls from malformed updatedAt to createdAt',
+      newerRequest: { updatedAt: 'not-a-date', createdAt: newerAt },
+    },
+  ];
+
+  for (const { name, newerRequest } of cases) {
+    await t.test(name, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, {
+          cimRequests: [
+            olderRequest,
+            { id: 'cim-newer', status: 'documents received', ...newerRequest },
+          ],
+        }),
+      });
+      assert.equal(detail.opportunity.workflow.cimStatus, 'documents received');
+    });
+  }
+});
+
+test('detail disposition authority uses the first valid durable state timestamp', async (t) => {
+  // Break caught: choosing the first non-null updated timestamp lets malformed
+  // rows hide a later durable dismissal, restoration, or creation record.
+  const { storage, opportunityId } = await detailStorage(t);
+  const olderAt = '2026-08-31T10:00:00.000Z';
+  const newerAt = '2026-08-31T12:00:00.000Z';
+  const cases = [
+    {
+      name: 'falls from malformed updated_at to dismissed_at',
+      records: [
+        { id: 'disposition-older', disposition: 'restored', reason: 'restored', updated_at: olderAt, restored_at: olderAt, created_at: olderAt },
+        { id: 'disposition-newer', disposition: 'dismissed', reason: 'valuation', updated_at: 'not-a-date', dismissed_at: newerAt, created_at: 'not-a-date' },
+      ],
+      expected: { state: 'dismissed', reason: 'valuation', dismissedAt: newerAt, dismissed: true },
+    },
+    {
+      name: 'falls from malformed updatedAt to restoredAt',
+      records: [
+        { id: 'disposition-older', disposition: 'dismissed', reason: 'valuation', updated_at: olderAt, dismissed_at: olderAt, created_at: olderAt },
+        { id: 'disposition-newer', disposition: 'restored', reason: 'operator restore', updatedAt: 'not-a-date', restoredAt: newerAt, createdAt: 'not-a-date' },
+      ],
+      expected: { state: 'restored', reason: 'operator restore', dismissedAt: '', dismissed: false },
+    },
+    {
+      name: 'falls through malformed action timestamps to createdAt',
+      records: [
+        { id: 'disposition-older', disposition: 'restored', reason: 'restored', updated_at: olderAt, restored_at: olderAt, created_at: olderAt },
+        { id: 'disposition-newer', disposition: 'dismissed', reason: 'valuation', updatedAt: 'not-a-date', dismissedAt: 'not-a-date', createdAt: newerAt },
+      ],
+      expected: { state: 'dismissed', reason: 'valuation', dismissedAt: 'not-a-date', dismissed: true },
+    },
+  ];
+
+  for (const { name, records, expected } of cases) {
+    await t.test(name, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, { dispositions: records }),
+      });
+      assert.deepEqual({
+        state: detail.opportunity.disposition.state,
+        reason: detail.opportunity.disposition.reason,
+        dismissedAt: detail.opportunity.disposition.dismissedAt,
+        dismissed: detail.opportunity.dismissed,
+      }, expected);
+    });
+  }
+});
+
+test('detail current authority is independent of equal-timestamp provider array order', async (t) => {
+  // Break caught: using array index after timestamp equality creates divergent
+  // SQLite/Supabase detail authority when providers return equal-time rows in
+  // different orders.
+  const { storage, opportunityId } = await detailStorage(t);
+  const equalAt = '2026-08-31T12:00:00.000Z';
+  const cases = [
+    {
+      name: 'uses ascending bounded record IDs before provider array order',
+      sourceRows: [
+        { id: 'source-a', source_id: 'source-a', source_name: 'Source A', source_record_id: 'record-a', field: 'industry', value: 'id-source-authority', observed_at: equalAt, updated_at: equalAt, created_at: equalAt },
+        { id: 'source-z', source_id: 'source-z', source_name: 'Source Z', source_record_id: 'record-z', field: 'industry', value: 'id-source-non-authority', observed_at: equalAt, updated_at: equalAt, created_at: equalAt },
+      ],
+      cimRequests: [
+        { id: 'cim-a', status: 'requested', updated_at: equalAt, created_at: equalAt },
+        { id: 'cim-z', status: 'documents received', updated_at: equalAt, created_at: equalAt },
+      ],
+      dispositions: [
+        { id: 'disposition-a', disposition: 'dismissed', reason: 'id-disposition-authority', updated_at: equalAt, dismissed_at: equalAt, created_at: equalAt },
+        { id: 'disposition-z', disposition: 'dismissed', reason: 'id-disposition-non-authority', updated_at: equalAt, dismissed_at: equalAt, created_at: equalAt },
+      ],
+      expected: {
+        industry: 'id-source-authority', freshness: equalAt, cimStatus: 'requested',
+        disposition: { state: 'dismissed', reason: 'id-disposition-authority', dismissedAt: equalAt }, dismissed: true,
+      },
+    },
+    {
+      name: 'uses a bounded deterministic signature when record IDs are absent',
+      sourceRows: [
+        { source_id: 'source-a', source_name: 'Source A', source_record_id: 'record-a', field: 'industry', value: 'signature-source-authority', observed_at: equalAt, updated_at: equalAt, created_at: equalAt },
+        { source_id: 'source-z', source_name: 'Source Z', source_record_id: 'record-z', field: 'industry', value: 'signature-source-non-authority', observed_at: equalAt, updated_at: equalAt, created_at: equalAt },
+      ],
+      cimRequests: [
+        { status: 'documents received', updated_at: equalAt, created_at: equalAt },
+        { status: 'requested', updated_at: equalAt, created_at: equalAt },
+      ],
+      dispositions: [
+        { disposition: 'dismissed', reason: 'alpha-signature-authority', updated_at: equalAt, dismissed_at: equalAt, created_at: equalAt },
+        { disposition: 'dismissed', reason: 'zeta-signature-non-authority', updated_at: equalAt, dismissed_at: equalAt, created_at: equalAt },
+      ],
+      expected: {
+        industry: 'signature-source-authority', freshness: equalAt, cimStatus: 'documents received',
+        disposition: { state: 'dismissed', reason: 'alpha-signature-authority', dismissedAt: equalAt }, dismissed: true,
+      },
+    },
+  ];
+
+  for (const authorityCase of cases) {
+    for (const [order, sourceRows, cimRequests, dispositions] of [
+      ['provider-id-order', authorityCase.sourceRows, authorityCase.cimRequests, authorityCase.dispositions],
+      ['reversed-provider-order', [...authorityCase.sourceRows].reverse(), [...authorityCase.cimRequests].reverse(), [...authorityCase.dispositions].reverse()],
+    ]) {
+      await t.test(`${authorityCase.name}: ${order}`, async () => {
+        const detail = await getTriageOpportunityDetail({
+          opportunityId,
+          storage: withDetailAuthorityRows(storage, { sourceRows, cimRequests, dispositions }),
+        });
+        assert.deepEqual(currentDetailProjection(detail), authorityCase.expected);
+      });
+    }
+  }
+});
+
+test('equal-currentness Pass ambiguity remains non-actionable until a definitive restore wins', async (t) => {
+  // Break caught: a tied restored row selected by incidental input order can
+  // silently make a durably dismissed opportunity actionable.
+  const { storage, opportunityId } = await detailStorage(t);
+  const equalAt = '2026-08-31T12:00:00.000Z';
+  const rows = [
+    { id: 'disposition-a-restored', disposition: 'restored', reason: 'restore', updated_at: equalAt, restored_at: equalAt, created_at: equalAt },
+    { id: 'disposition-z-dismissed', disposition: 'dismissed', reason: 'valuation', updated_at: equalAt, dismissed_at: equalAt, created_at: equalAt },
+  ];
+  const expected = { state: 'dismissed', reason: 'valuation', dismissed: true };
+  for (const [order, dispositions] of [
+    ['ascending-record-ID order', rows],
+    ['reversed-provider order', [...rows].reverse()],
+  ]) {
+    await t.test(order, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, { dispositions }),
+      });
+      assert.deepEqual({
+        state: detail.opportunity.disposition.state,
+        reason: detail.opportunity.disposition.reason,
+        dismissed: detail.opportunity.dismissed,
+      }, expected);
+    });
+  }
+});
+
 test('detail opportunity consolidates current authoritative identity, source, score, CRM, and CIM values instead of score-row defaults', async (t) => {
   // Break caught: projectDetailOpportunity reads only the score-row scan
   // projection, so populated current canonical/source/CRM/CIM authority is

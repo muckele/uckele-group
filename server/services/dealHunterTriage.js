@@ -317,22 +317,66 @@ function projectSourceObservations(rows = []) {
   return { sourceObservations: [...groups.values()].slice(0, 100), conflicts: conflicts.map(({ field, values }) => ({ field, observations: values.slice(0, 20) })) };
 }
 
+function firstValidDetailTimestamp(record = {}, fieldGroups = []) {
+  for (const fields of fieldGroups) {
+    for (const field of fields) {
+      const value = detailText(record?.[field], 80);
+      const timestamp = Date.parse(value);
+      if (Number.isFinite(timestamp)) return { timestamp, value };
+    }
+  }
+  return { timestamp: null, value: '' };
+}
+
+function detailAuthoritySignature(values = []) {
+  return JSON.stringify(values.map(([value, maximum]) => detailText(value, maximum)));
+}
+
+function compareDetailAuthorityCandidates(left, right, { conservativeDismissal = false } = {}) {
+  if (left.timestamp !== null && right.timestamp === null) return -1;
+  if (left.timestamp === null && right.timestamp !== null) return 1;
+  if (left.timestamp !== null && right.timestamp !== null && left.timestamp !== right.timestamp) return right.timestamp - left.timestamp;
+  if (conservativeDismissal && left.state !== right.state) {
+    if (left.state === 'dismissed') return -1;
+    if (right.state === 'dismissed') return 1;
+  }
+  if (left.recordId || right.recordId) {
+    if (!left.recordId) return 1;
+    if (!right.recordId) return -1;
+    if (left.recordId < right.recordId) return -1;
+    if (left.recordId > right.recordId) return 1;
+  }
+  if (left.signature < right.signature) return -1;
+  if (left.signature > right.signature) return 1;
+  return 0;
+}
+
 function currentDetailSourceRows(rows = []) {
-  return (Array.isArray(rows) ? rows : []).slice(0, 500).flatMap((row, index) => {
+  return (Array.isArray(rows) ? rows : []).slice(0, 500).flatMap((row) => {
     if (!row || typeof row !== 'object') return [];
     const field = detailText(row.field, 80).toLowerCase();
     const rawValue = typeof row.value === 'string' ? row.value : '';
     const value = detailText(row.value, 5000);
     if (!field || !value) return [];
-    const observedAt = detailText(row.observed_at ?? row.observedAt ?? row.updated_at ?? row.updatedAt, 80);
-    const timestamp = Date.parse(observedAt);
-    return [{ field, value, rawValue, observedAt, timestamp: Number.isFinite(timestamp) ? timestamp : null, index }];
-  }).sort((left, right) => {
-    if (left.timestamp !== null && right.timestamp === null) return -1;
-    if (left.timestamp === null && right.timestamp !== null) return 1;
-    if (left.timestamp !== null && right.timestamp !== null && left.timestamp !== right.timestamp) return right.timestamp - left.timestamp;
-    return left.index - right.index;
-  });
+    const authorityAt = firstValidDetailTimestamp(row, [
+      ['observed_at', 'observedAt'],
+      ['updated_at', 'updatedAt'],
+      ['created_at', 'createdAt'],
+    ]);
+    return [{
+      field,
+      value,
+      rawValue,
+      observedAt: authorityAt.value,
+      timestamp: authorityAt.timestamp,
+      recordId: detailText(row.id, 200),
+      signature: detailAuthoritySignature([
+        [field, 80], [value, 5000], [row.source_id ?? row.sourceId, 200],
+        [row.source_name ?? row.sourceName, 160], [row.source_record_id ?? row.sourceRecordId, 200],
+        [authorityAt.value, 80],
+      ]),
+    }];
+  }).sort(compareDetailAuthorityCandidates);
 }
 
 function currentDetailSourceValue(rows, fields, maximum = 500) {
@@ -365,42 +409,56 @@ function detailLocationParts(value) {
 }
 
 function currentDetailCimStatus(records, fallback) {
-  const candidates = (Array.isArray(records) ? records : []).slice(0, 100).flatMap((record, index) => {
+  const candidates = (Array.isArray(records) ? records : []).slice(0, 100).flatMap((record) => {
     const status = detailText(record?.status, 80);
     if (!status) return [];
-    const updatedAt = detailText(record?.updated_at ?? record?.updatedAt, 80);
-    const timestamp = Date.parse(updatedAt);
-    return [{ status, timestamp: Number.isFinite(timestamp) ? timestamp : null, index }];
-  }).sort((left, right) => {
-    if (left.timestamp !== null && right.timestamp === null) return -1;
-    if (left.timestamp === null && right.timestamp !== null) return 1;
-    if (left.timestamp !== null && right.timestamp !== null && left.timestamp !== right.timestamp) return right.timestamp - left.timestamp;
-    return left.index - right.index;
-  });
+    const authorityAt = firstValidDetailTimestamp(record, [
+      ['updated_at', 'updatedAt'],
+      ['created_at', 'createdAt'],
+    ]);
+    return [{
+      status,
+      timestamp: authorityAt.timestamp,
+      recordId: detailText(record?.id, 200),
+      signature: detailAuthoritySignature([
+        [status, 80], [authorityAt.value, 80],
+        [record?.updated_at ?? record?.updatedAt, 80], [record?.created_at ?? record?.createdAt, 80],
+      ]),
+    }];
+  }).sort(compareDetailAuthorityCandidates);
   return candidates[0]?.status || fallback;
 }
 
 function currentDetailDisposition(records) {
-  const candidates = (Array.isArray(records) ? records : []).slice(0, 20).flatMap((record, index) => {
+  const candidates = (Array.isArray(records) ? records : []).slice(0, 20).flatMap((record) => {
     const state = detailText(record?.disposition, 80).toLowerCase();
     if (!state) return [];
-    const updatedAt = detailText(record?.updated_at ?? record?.updatedAt, 80);
-    const timestamp = Date.parse(updatedAt);
+    const dismissedAt = detailText(record?.dismissed_at ?? record?.dismissedAt, 80);
+    const restoredAt = detailText(record?.restored_at ?? record?.restoredAt, 80);
+    const authorityAt = firstValidDetailTimestamp(record, [
+      ['updated_at', 'updatedAt'],
+      ...(state === 'dismissed'
+        ? [['dismissed_at', 'dismissedAt']]
+        : state === 'restored'
+          ? [['restored_at', 'restoredAt']]
+          : [['dismissed_at', 'dismissedAt'], ['restored_at', 'restoredAt']]),
+      ['created_at', 'createdAt'],
+    ]);
     return [{
       state,
       reason: detailText(record?.reason, 160),
       note: detailText(record?.note, 500),
-      dismissedAt: detailText(record?.dismissed_at ?? record?.dismissedAt, 80),
+      dismissedAt,
       dismissedBy: detailText(record?.dismissed_by ?? record?.dismissedBy, 160),
-      timestamp: Number.isFinite(timestamp) ? timestamp : null,
-      index,
+      timestamp: authorityAt.timestamp,
+      recordId: detailText(record?.id, 200),
+      signature: detailAuthoritySignature([
+        [state, 80], [record?.reason, 160], [record?.note, 500], [dismissedAt, 80], [restoredAt, 80],
+        [record?.dismissed_by ?? record?.dismissedBy, 160], [record?.restored_by ?? record?.restoredBy, 160],
+        [authorityAt.value, 80],
+      ]),
     }];
-  }).sort((left, right) => {
-    if (left.timestamp !== null && right.timestamp === null) return -1;
-    if (left.timestamp === null && right.timestamp !== null) return 1;
-    if (left.timestamp !== null && right.timestamp !== null && left.timestamp !== right.timestamp) return right.timestamp - left.timestamp;
-    return left.index - right.index;
-  });
+  }).sort((left, right) => compareDetailAuthorityCandidates(left, right, { conservativeDismissal: true }));
   const current = candidates[0];
   return current
     ? { state: current.state, reason: current.reason, note: current.note, dismissedAt: current.dismissedAt, dismissedBy: current.dismissedBy }
