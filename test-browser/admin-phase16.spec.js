@@ -204,27 +204,33 @@ const phase1DimensionLabels = [
   'Strategic and geographic fit',
 ];
 
-function phase1Opportunity(overrides = {}) {
+function phase1CanonicalOpportunity(overrides = {}) {
   return {
     opportunityId: 'opp-default',
     dealKey: 'deal-default',
     name: 'Default Opportunity',
     state: 'CA',
     listingUrl: 'https://broker.example/default',
+    geography: { city: 'Sacramento', state: 'CA', label: 'Sacramento, CA' },
+    industry: 'Commercial field services',
+    ...overrides,
+  };
+}
+
+function phase1ScoreRow(overrides = {}) {
+  return {
+    opportunityId: 'opp-default',
     fitScore: 80,
     scoreStatus: 'high-fit',
     confidence: 'high',
     completenessScore: 86,
     missingEvidenceCount: 2,
-    contradictionCount: 1,
+    contradictionCount: 0,
     shouldRemove: false,
     highFit: true,
-    geography: { city: 'Sacramento', state: 'CA', label: 'Sacramento, CA' },
-    industry: 'Commercial field services',
     financials: { annualProfit: 410000, annualRevenue: 2100000, askingPrice: 1700000, profitMultiple: 4.15 },
     topStrength: 'Contracted inspections support durable recurring demand.',
     topConcern: 'Customer concentration still needs verification.',
-    workflow: { crmStatus: 'active', cimStatus: 'documents-received' },
     observationFreshness: '2026-08-29T17:00:00.000Z',
     operatorPriority: 'normal',
     operatorNote: 'Confirm renewal terms before advancing.',
@@ -232,127 +238,117 @@ function phase1Opportunity(overrides = {}) {
     reviewedAt: '',
     reviewedBy: '',
     changedSinceReview: false,
-    dismissed: false,
-    dismissedReason: '',
     scoredAt: '2026-08-29T16:00:00.000Z',
+    evidenceObservedAt: '2026-08-29T15:30:00.000Z',
     scoreFingerprint: 'phase1-machine-score-default',
     rulesVersion: 'deal-hunter-fit-v2.1',
-    crmSellerName: 'Morgan CRM Seller',
-    sourceSellerName: 'Morgan Structured Seller',
-    sourceObservedAt: '2026-08-29T17:00:00.000Z',
-    operatorFacts: [],
-    activities: [],
-    dispositions: [],
     ...overrides,
   };
 }
 
+function phase1SourceRows(opportunity, score, {
+  sellerName = 'Morgan Structured Seller',
+  observedAt = score.observationFreshness,
+  annualProfit = score.financials.annualProfit,
+} = {}) {
+  return [
+    {
+      opportunityId: opportunity.opportunityId,
+      sourceId: 'sheet-0',
+      sourceName: 'Deal Hunter Google Sheet',
+      sourceRecordId: `${opportunity.dealKey}-sheet`,
+      observedAt,
+      values: {
+        name: opportunity.name,
+        city: opportunity.geography.city,
+        state: opportunity.geography.state,
+        location: opportunity.geography.label,
+        industry: opportunity.industry,
+        seller_name: sellerName,
+        seller_phone: '206-555-0147',
+        broker_name: 'Riley Structured Broker',
+        broker_company: 'Northwest Business Advisors',
+        broker_phone: '503-555-0110',
+        broker_contact: 'Call the main broker desk after 2 PM.',
+        reason_for_sale: 'Owner retirement',
+        real_estate_included: 'Lease only; real estate excluded',
+        seller_financing: 'Seller will consider 10%',
+        management_structure: 'General manager leads day-to-day operations',
+        annual_profit: String(annualProfit),
+        annual_revenue: String(score.financials.annualRevenue),
+        asking_price: String(score.financials.askingPrice),
+        profit_multiple: String(score.financials.profitMultiple),
+        listing_id: `${opportunity.dealKey}-sheet`,
+        listing_url: opportunity.listingUrl,
+      },
+    },
+    {
+      opportunityId: opportunity.opportunityId,
+      sourceId: 'deal-os',
+      sourceName: 'Deal OS',
+      sourceRecordId: `${opportunity.dealKey}-deal-os`,
+      observedAt: '2026-08-28T17:00:00.000Z',
+      values: {
+        seller_name: 'Deal OS Seller Claim',
+        annual_profit: String(score.financials.annualProfit - 45000),
+        listing_id: `${opportunity.dealKey}-deal-os`,
+        listing_url: `https://dealos.example/${opportunity.opportunityId}`,
+      },
+    },
+  ];
+}
+
 function createPhase1FixtureState() {
-  const cascade = phase1Opportunity({
-    opportunityId: 'opp-cascade',
-    dealKey: 'deal-cascade',
-    name: 'Cascade Field Compliance',
-    listingUrl: 'https://broker.example/cascade',
-    fitScore: 84,
-    scoreStatus: 'high-fit',
-    confidence: 'low',
-    completenessScore: 61,
-    missingEvidenceCount: 4,
-    geography: { city: 'Portland', state: 'OR', label: 'Portland, OR' },
-    state: 'OR',
-    industry: 'Field compliance services',
-    financials: { annualProfit: 360000, annualRevenue: 1900000, askingPrice: 1500000, profitMultiple: 4.17 },
-    observationFreshness: '2026-08-28T19:00:00.000Z',
-    scoredAt: '2026-08-28T18:00:00.000Z',
-    scoreFingerprint: 'phase1-machine-score-cascade-84',
-    crmSellerName: 'Casey CRM Seller',
-    sourceSellerName: 'Casey Structured Seller',
+  const canonicalOpportunities = [
+    phase1CanonicalOpportunity({ opportunityId: 'opp-cascade', dealKey: 'deal-cascade', name: 'Cascade Field Compliance', listingUrl: 'https://broker.example/cascade', geography: { city: 'Portland', state: 'OR', label: 'Portland, OR' }, state: 'OR', industry: 'Field compliance services' }),
+    phase1CanonicalOpportunity({ opportunityId: 'opp-heritage', dealKey: 'deal-heritage', name: 'Heritage Inspection Partners', listingUrl: 'https://broker.example/heritage', geography: { city: 'Reno', state: 'NV', label: 'Reno, NV' }, state: 'NV', industry: 'Commercial inspection services' }),
+    phase1CanonicalOpportunity({ opportunityId: 'opp-evergreen', dealKey: 'deal-evergreen', name: 'Evergreen Safety Services', listingUrl: 'https://broker.example/evergreen', geography: { city: 'Seattle', state: 'WA', label: 'Seattle, WA' }, state: 'WA', industry: 'Workplace safety services' }),
+    phase1CanonicalOpportunity({ opportunityId: 'opp-summit', dealKey: 'deal-summit', name: 'Summit Fire Systems', listingUrl: 'https://broker.example/summit', geography: { city: 'Boise', state: 'ID', label: 'Boise, ID' }, state: 'ID', industry: 'Fire protection systems' }),
+  ];
+  const scoreRows = [
+    phase1ScoreRow({ opportunityId: 'opp-cascade', fitScore: 84, scoreStatus: 'watchlist', confidence: 'low', completenessScore: 61, missingEvidenceCount: 4, financials: { annualProfit: 360000, annualRevenue: 1900000, askingPrice: 1500000, profitMultiple: 4.17 }, observationFreshness: '2026-08-28T19:00:00.000Z', scoredAt: '2026-08-28T18:00:00.000Z', scoreFingerprint: 'phase1-machine-score-cascade-84' }),
+    phase1ScoreRow({ opportunityId: 'opp-heritage', fitScore: 71, scoreStatus: 'high-fit', confidence: 'medium', completenessScore: 77, contradictionCount: 1, highFit: false, financials: { annualProfit: 275000, annualRevenue: 1400000, askingPrice: 1150000, profitMultiple: 4.18 }, reviewed: true, reviewedAt: '2026-08-27T18:00:00.000Z', reviewedBy: 'phase1-admin', observationFreshness: '2026-08-27T17:00:00.000Z', scoredAt: '2026-08-27T16:00:00.000Z', scoreFingerprint: 'phase1-machine-score-heritage-71' }),
+    phase1ScoreRow({ opportunityId: 'opp-evergreen', fitScore: 92, scoreStatus: 'high-fit', confidence: 'high', completenessScore: 91, financials: { annualProfit: 520000, annualRevenue: 2800000, askingPrice: 2100000, profitMultiple: 4.04 }, observationFreshness: '2026-08-30T16:00:00.000Z', scoredAt: '2026-08-30T15:00:00.000Z', evidenceObservedAt: '2026-08-30T14:30:00.000Z', scoreFingerprint: 'phase1-machine-score-evergreen-92' }),
+    phase1ScoreRow({ opportunityId: 'opp-summit', fitScore: 78, scoreStatus: 'high-fit', confidence: 'medium', completenessScore: 79, operatorPriority: 'high', financials: { annualProfit: 390000, annualRevenue: 2050000, askingPrice: 1600000, profitMultiple: 4.1 }, observationFreshness: '2026-08-26T17:00:00.000Z', scoredAt: '2026-08-26T16:00:00.000Z', scoreFingerprint: 'phase1-machine-score-summit-78' }),
+  ];
+  const sourceObservations = canonicalOpportunities.flatMap((opportunity) => {
+    const score = scoreRows.find((row) => row.opportunityId === opportunity.opportunityId);
+    if (opportunity.opportunityId === 'opp-cascade') return phase1SourceRows(opportunity, score, { sellerName: 'Casey Structured Seller' });
+    if (opportunity.opportunityId === 'opp-evergreen') return phase1SourceRows(opportunity, score, { annualProfit: 535000 });
+    return phase1SourceRows(opportunity, score);
   });
-  const heritage = phase1Opportunity({
-    opportunityId: 'opp-heritage',
-    dealKey: 'deal-heritage',
-    name: 'Heritage Inspection Partners',
-    listingUrl: 'https://broker.example/heritage',
-    fitScore: 71,
-    scoreStatus: 'watchlist',
-    confidence: 'medium',
-    completenessScore: 77,
-    highFit: false,
-    geography: { city: 'Reno', state: 'NV', label: 'Reno, NV' },
-    state: 'NV',
-    industry: 'Commercial inspection services',
-    financials: { annualProfit: 275000, annualRevenue: 1400000, askingPrice: 1150000, profitMultiple: 4.18 },
-    reviewed: true,
-    reviewedAt: '2026-08-27T18:00:00.000Z',
-    reviewedBy: 'phase1-admin',
-    observationFreshness: '2026-08-27T17:00:00.000Z',
-    scoredAt: '2026-08-27T16:00:00.000Z',
-    scoreFingerprint: 'phase1-machine-score-heritage-71',
-  });
-  const evergreen = phase1Opportunity({
-    opportunityId: 'opp-evergreen',
-    dealKey: 'deal-evergreen',
-    name: 'Evergreen Safety Services',
-    listingUrl: 'https://broker.example/evergreen',
-    fitScore: 92,
-    scoreStatus: 'high-fit',
-    confidence: 'high',
-    completenessScore: 91,
-    geography: { city: 'Seattle', state: 'WA', label: 'Seattle, WA' },
-    state: 'WA',
-    industry: 'Workplace safety services',
-    financials: { annualProfit: 520000, annualRevenue: 2800000, askingPrice: 2100000, profitMultiple: 4.04 },
-    observationFreshness: '2026-08-30T16:00:00.000Z',
-    scoredAt: '2026-08-30T15:00:00.000Z',
-    scoreFingerprint: 'phase1-machine-score-evergreen-92',
-    operatorFacts: [{
-      id: 'fact-evergreen-broker',
-      field: 'broker_name',
-      value: 'Riley Verified Broker',
-      verified: true,
-      actor: 'phase1-admin',
-      note: 'Broker identity confirmed by phone.',
-      createdAt: '2026-08-29T18:00:00.000Z',
-      updatedAt: '2026-08-29T18:00:00.000Z',
-    }],
-    activities: [{
-      id: 'activity-evergreen-change',
-      eventType: 'opportunity-rescored',
-      summary: 'Core source evidence changed and returned the opportunity to Needs Review.',
-      createdAt: '2026-08-30T15:00:00.000Z',
-      actor: 'deal-hunter',
-    }],
-    dispositions: [{
-      id: 'disposition-evergreen-prior',
-      disposition: 'dismissed',
-      reason: 'timing',
-      note: 'Previously passed, then restored after updated economics.',
-      dismissedAt: '2026-08-20T18:00:00.000Z',
-      dismissedBy: 'phase1-admin',
-    }],
-  });
-  const summit = phase1Opportunity({
-    opportunityId: 'opp-summit',
-    dealKey: 'deal-summit',
-    name: 'Summit Fire Systems',
-    listingUrl: 'https://broker.example/summit',
-    fitScore: 78,
-    scoreStatus: 'high-fit',
-    confidence: 'medium',
-    completenessScore: 79,
-    operatorPriority: 'high',
-    geography: { city: 'Boise', state: 'ID', label: 'Boise, ID' },
-    state: 'ID',
-    industry: 'Fire protection systems',
-    financials: { annualProfit: 390000, annualRevenue: 2050000, askingPrice: 1600000, profitMultiple: 4.1 },
-    observationFreshness: '2026-08-26T17:00:00.000Z',
-    scoredAt: '2026-08-26T16:00:00.000Z',
-    scoreFingerprint: 'phase1-machine-score-summit-78',
-  });
+  const crmSubmissions = canonicalOpportunities.map((opportunity) => ({
+    opportunityId: opportunity.opportunityId,
+    id: `crm-${opportunity.opportunityId}`,
+    status: 'review',
+    company: opportunity.name,
+    sellerName: opportunity.opportunityId === 'opp-cascade' ? 'Casey CRM Seller' : 'Morgan CRM Seller',
+    sellerEmail: '',
+    brokerName: 'Riley CRM Broker',
+    brokerEmail: 'riley.broker@example.test',
+    brokerPhone: '503-555-0121',
+    operatorContactNotes: 'Broker prefers scheduled calls.',
+    updatedAt: '2026-08-29T19:00:00.000Z',
+  }));
+  const cimRequests = canonicalOpportunities.map((opportunity) => ({ opportunityId: opportunity.opportunityId, id: `cim-${opportunity.opportunityId}`, status: 'documents-received', updatedAt: '2026-08-29T19:00:00.000Z' }));
   return {
-    // Deliberately not in acquisition-priority order. The intercepted server
-    // response owns ordering, while the rendered assertion proves the UI keeps it.
-    opportunities: [cascade, heritage, evergreen, summit],
+    // Provider-shaped inputs remain independent; responses are composed below.
+    canonicalOpportunities,
+    scoreRows,
+    sourceObservations,
+    operatorFacts: [
+      { opportunityId: 'opp-evergreen', id: 'fact-evergreen-broker', field: 'broker_name', value: 'Riley Verified Broker', verified: true, actor: 'phase1-admin', note: 'Broker identity confirmed by phone.', createdAt: '2026-08-29T18:00:00.000Z', updatedAt: '2026-08-29T18:00:00.000Z' },
+      { opportunityId: 'opp-evergreen', id: 'fact-evergreen-broker-phone', field: 'broker_phone', value: '503-555-0198', verified: true, actor: 'phase1-admin', note: 'Direct broker callback number verified by phone.', createdAt: '2026-08-29T18:05:00.000Z', updatedAt: '2026-08-29T18:05:00.000Z' },
+    ],
+    crmSubmissions,
+    crmCommunications: canonicalOpportunities.flatMap((opportunity) => [
+      { opportunityId: opportunity.opportunityId, id: `crm-email-${opportunity.opportunityId}`, direction: 'inbound', channel: 'email', kind: 'broker-reply', occurredAt: '2026-08-29T19:00:00.000Z', cimRequestId: `cim-${opportunity.opportunityId}` },
+      { opportunityId: opportunity.opportunityId, id: `crm-call-${opportunity.opportunityId}`, direction: 'outbound', channel: 'phone', kind: 'seller-call', occurredAt: '2026-08-28T19:00:00.000Z', cimRequestId: '' },
+    ]),
+    cimRequests,
+    cimCommunications: canonicalOpportunities.map((opportunity) => ({ opportunityId: opportunity.opportunityId, id: `cim-communication-${opportunity.opportunityId}`, direction: 'inbound', channel: 'email', kind: 'broker-reply', occurredAt: '2026-08-29T19:00:00.000Z', cimRequestId: `cim-${opportunity.opportunityId}` })),
+    activities: [{ opportunityId: 'opp-evergreen', id: 'activity-evergreen-change', eventType: 'opportunity-rescored', summary: 'Core source evidence changed and returned the opportunity to Needs Review.', createdAt: '2026-08-30T15:00:00.000Z', actor: 'deal-hunter' }],
+    dispositions: [{ opportunityId: 'opp-evergreen', id: 'disposition-evergreen-prior', disposition: 'dismissed', reason: 'timing', note: 'Previously passed, then restored after updated economics.', dismissedAt: '2026-08-20T18:00:00.000Z', dismissedBy: 'phase1-admin', restoredAt: '2026-08-21T18:00:00.000Z', restoredBy: 'phase1-admin' }],
     requests: [],
     apiRequests: [],
     unexpectedRequests: [],
@@ -360,6 +356,72 @@ function createPhase1FixtureState() {
     offOriginRequests: [],
     actionPayloads: [],
     factPayloads: [],
+  };
+}
+
+function phase1CurrentDisposition(state, opportunityId) {
+  return state.dispositions.find((disposition) => disposition.opportunityId === opportunityId
+    && disposition.disposition === 'dismissed'
+    && !disposition.restoredAt) || null;
+}
+
+function phase1CurrentOpportunity(state, opportunityId) {
+  const canonical = state.canonicalOpportunities.find((opportunity) => opportunity.opportunityId === opportunityId);
+  const score = state.scoreRows.find((row) => row.opportunityId === opportunityId);
+  if (!canonical || !score) return null;
+  const disposition = phase1CurrentDisposition(state, opportunityId);
+  const submission = state.crmSubmissions.find((row) => row.opportunityId === opportunityId);
+  const cimRequest = state.cimRequests.find((row) => row.opportunityId === opportunityId);
+  return {
+    ...canonical,
+    ...score,
+    workflow: { crmStatus: submission?.status || '', cimStatus: cimRequest?.status || '' },
+    dismissed: Boolean(disposition),
+    dismissedReason: disposition?.reason || '',
+  };
+}
+
+function phase1CurrentOpportunities(state) {
+  return state.canonicalOpportunities.map((opportunity) => phase1CurrentOpportunity(state, opportunity.opportunityId));
+}
+
+function phase1DetailOpportunity(state, opportunityId) {
+  const current = phase1CurrentOpportunity(state, opportunityId);
+  if (!current) return null;
+  const sources = state.sourceObservations
+    .filter((source) => source.opportunityId === opportunityId)
+    .sort((left, right) => Date.parse(right.observedAt || '') - Date.parse(left.observedAt || ''));
+  const value = (...fields) => {
+    for (const source of sources) {
+      for (const field of fields) {
+        if (source.values[field] !== undefined && source.values[field] !== '') return source.values[field];
+      }
+    }
+    return '';
+  };
+  const number = (fallback, ...fields) => {
+    const raw = value(...fields);
+    if (raw === '') return fallback;
+    const sourceValue = Number(raw);
+    return Number.isFinite(sourceValue) ? sourceValue : fallback;
+  };
+  const city = value('city') || current.geography.city;
+  const stateCode = value('state') || current.geography.state;
+  const location = value('location') || [city, stateCode].filter(Boolean).join(', ') || current.geography.label;
+  return {
+    ...current,
+    name: current.name || value('name', 'business_name') || 'Unnamed opportunity',
+    state: stateCode,
+    listingUrl: value('listing_url') || current.listingUrl,
+    geography: { city, state: stateCode, label: location },
+    industry: value('industry') || current.industry,
+    financials: {
+      annualProfit: number(current.financials.annualProfit, 'annual_profit', 'ttm_ebitda'),
+      annualRevenue: number(current.financials.annualRevenue, 'annual_revenue', 'ttm_revenue'),
+      askingPrice: number(current.financials.askingPrice, 'asking_price'),
+      profitMultiple: number(current.financials.profitMultiple, 'profit_multiple', 'ebitda_multiple'),
+    },
+    observationFreshness: sources.find((source) => source.observedAt)?.observedAt || current.observationFreshness,
   };
 }
 
@@ -399,12 +461,12 @@ function phase1QueueRow(opportunity) {
 }
 
 function phase1Summary(state) {
-  const current = state.opportunities.filter((opportunity) => !opportunity.dismissed);
+  const current = phase1CurrentOpportunities(state).filter((opportunity) => !opportunity.dismissed);
   return {
     needsReview: current.filter((opportunity) => !opportunity.reviewed || opportunity.changedSinceReview).length,
     highPriority: current.filter((opportunity) => opportunity.highFit || ['urgent', 'high'].includes(opportunity.operatorPriority)).length,
-    watchlist: current.filter((opportunity) => opportunity.scoreStatus === 'watchlist' || opportunity.operatorPriority === 'watch').length,
-    lowConfidence: current.filter((opportunity) => opportunity.confidence === 'low' || opportunity.contradictionCount > 1).length,
+    watchlist: current.filter((opportunity) => (opportunity.fitScore >= 60 && opportunity.fitScore < 75) || opportunity.operatorPriority === 'watch').length,
+    lowConfidence: current.filter((opportunity) => opportunity.confidence === 'low' || opportunity.contradictionCount > 0).length,
     currentOpportunities: current.length,
   };
 }
@@ -437,11 +499,11 @@ function phase1QueueResponse(state, url) {
     throw new Error(`Phase 1 fixture received malformed pagination: ${url.search}`);
   }
 
-  let rows = state.opportunities.filter((opportunity) => {
+  let rows = phase1CurrentOpportunities(state).filter((opportunity) => {
     if (view === 'needs-review') return !opportunity.dismissed && (!opportunity.reviewed || opportunity.changedSinceReview);
     if (view === 'high-priority') return !opportunity.dismissed && (opportunity.highFit || ['urgent', 'high'].includes(opportunity.operatorPriority));
-    if (view === 'watchlist') return !opportunity.dismissed && (opportunity.scoreStatus === 'watchlist' || opportunity.operatorPriority === 'watch');
-    if (view === 'low-confidence') return !opportunity.dismissed && (opportunity.confidence === 'low' || opportunity.contradictionCount > 1);
+    if (view === 'watchlist') return !opportunity.dismissed && ((opportunity.fitScore >= 60 && opportunity.fitScore < 75) || opportunity.operatorPriority === 'watch');
+    if (view === 'low-confidence') return !opportunity.dismissed && (opportunity.confidence === 'low' || opportunity.contradictionCount > 0);
     if (view === 'dismissed') return opportunity.dismissed;
     return !opportunity.dismissed;
   });
@@ -476,21 +538,30 @@ function phase1QueueResponse(state, url) {
   };
 }
 
-function phase1EffectiveFacts(opportunity) {
-  const effective = {
-    seller_name: { value: opportunity.crmSellerName, provenance: 'crm', verified: false, actor: '', note: '' },
-    seller_phone: { value: '206-555-0147', provenance: 'structured-source', verified: false, actor: '', note: '' },
-    broker_name: { value: 'Riley CRM Broker', provenance: 'crm', verified: false, actor: '', note: '' },
-    broker_company: { value: 'Northwest Business Advisors', provenance: 'structured-source', verified: false, actor: '', note: '' },
-    broker_email: { value: 'riley.broker@example.test', provenance: 'crm', verified: false, actor: '', note: '' },
-    broker_phone: { value: '425-555-0199', provenance: 'structured-source', verified: false, actor: '', note: '' },
-    reason_for_sale: { value: 'Owner retirement', provenance: 'structured-source', verified: false, actor: '', note: '' },
-    real_estate_included: { value: 'Lease only; real estate excluded', provenance: 'structured-source', verified: false, actor: '', note: '' },
-    seller_financing: { value: 'Seller will consider 10%', provenance: 'structured-source', verified: false, actor: '', note: '' },
-    management_structure: { value: 'General manager leads day-to-day operations', provenance: 'structured-source', verified: false, actor: '', note: '' },
-    operator_contact_notes: { value: 'Broker prefers scheduled calls.', provenance: 'crm', verified: false, actor: '', note: '' },
+function phase1EffectiveFacts(state, opportunityId) {
+  const effective = {};
+  const sources = state.sourceObservations.filter((source) => source.opportunityId === opportunityId);
+  for (const source of sources) {
+    for (const field of ['seller_name', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure']) {
+      if (!effective[field] && source.values[field]) effective[field] = { value: source.values[field], provenance: 'structured-source', verified: false, actor: '', note: '' };
+    }
+    if (!effective.broker_phone && /^\+?[\d().\-\s]{7,}$/.test(source.values.broker_contact || '')) {
+      effective.broker_phone = { value: source.values.broker_contact, provenance: 'structured-source', verified: false, actor: '', note: '' };
+    }
+  }
+  const submission = state.crmSubmissions.find((row) => row.opportunityId === opportunityId);
+  const crmFields = {
+    seller_name: submission?.sellerName,
+    seller_email: submission?.sellerEmail,
+    broker_name: submission?.brokerName,
+    broker_email: submission?.brokerEmail,
+    broker_phone: submission?.brokerPhone,
+    operator_contact_notes: submission?.operatorContactNotes,
   };
-  for (const fact of opportunity.operatorFacts) {
+  for (const [field, value] of Object.entries(crmFields)) {
+    if (value) effective[field] = { value, provenance: 'crm', verified: false, actor: '', note: '' };
+  }
+  for (const fact of state.operatorFacts.filter((row) => row.opportunityId === opportunityId)) {
     effective[fact.field] = {
       value: fact.value,
       provenance: 'operator',
@@ -502,60 +573,26 @@ function phase1EffectiveFacts(opportunity) {
   return effective;
 }
 
-function phase1DetailResponse(opportunity) {
-  const effectiveFacts = phase1EffectiveFacts(opportunity);
-  const sourceProfit = String(opportunity.financials.annualProfit);
-  const dealOsProfit = String(opportunity.financials.annualProfit - 45000);
-  const sourceConflict = {
-    field: 'annual_profit',
-    observations: [
-      { sourceId: 'sheet-0', sourceName: 'Deal Hunter Google Sheet', sourceRecordId: `${opportunity.dealKey}-sheet`, value: sourceProfit, observedAt: opportunity.sourceObservedAt },
-      { sourceId: 'deal-os', sourceName: 'Deal OS', sourceRecordId: `${opportunity.dealKey}-deal-os`, value: dealOsProfit, observedAt: '2026-08-28T17:00:00.000Z' },
-    ],
-  };
-  const sellerConflict = {
-    field: 'seller_name',
-    observations: [
-      { sourceId: 'sheet-0', sourceName: 'Deal Hunter Google Sheet', sourceRecordId: `${opportunity.dealKey}-sheet`, value: opportunity.sourceSellerName, observedAt: opportunity.sourceObservedAt },
-      { sourceId: 'deal-os', sourceName: 'Deal OS', sourceRecordId: `${opportunity.dealKey}-deal-os`, value: 'Deal OS Seller Claim', observedAt: '2026-08-28T17:00:00.000Z' },
-    ],
-  };
-  const operatorFacts = opportunity.operatorFacts.map((fact) => ({ ...fact }));
+function phase1DetailResponse(state, opportunityId) {
+  const opportunity = phase1DetailOpportunity(state, opportunityId);
+  const scoreRow = state.scoreRows.find((score) => score.opportunityId === opportunityId);
+  const sourceRows = state.sourceObservations.filter((source) => source.opportunityId === opportunityId);
+  const effectiveFacts = phase1EffectiveFacts(state, opportunityId);
+  const operatorFacts = state.operatorFacts.filter((fact) => fact.opportunityId === opportunityId).map(({ opportunityId: _opportunityId, ...fact }) => fact);
+  const conflictFields = ['annual_profit', 'seller_name'];
+  const conflicts = conflictFields.map((field) => ({
+    field,
+    observations: sourceRows.filter((source) => source.values[field]).map((source) => ({ sourceId: source.sourceId, sourceName: source.sourceName, sourceRecordId: source.sourceRecordId, value: source.values[field], observedAt: source.observedAt })),
+  })).filter((conflict) => new Set(conflict.observations.map((observation) => observation.value)).size > 1);
+  const submission = state.crmSubmissions.find((row) => row.opportunityId === opportunityId);
+  const sourceProfit = String(scoreRow.financials.annualProfit);
   return {
     opportunity: { ...phase1QueueRow(opportunity), operatorNote: opportunity.operatorNote },
     effectiveFacts,
     operatorFacts,
-    sourceObservations: [
-      {
-        sourceId: 'sheet-0',
-        sourceName: 'Deal Hunter Google Sheet',
-        sourceRecordId: `${opportunity.dealKey}-sheet`,
-        observedAt: opportunity.sourceObservedAt,
-        values: {
-          seller_name: opportunity.sourceSellerName,
-          broker_name: 'Riley Structured Broker',
-          annual_profit: sourceProfit,
-          listing_id: `${opportunity.dealKey}-sheet`,
-          listing_url: opportunity.listingUrl,
-        },
-        conflicts: [sourceConflict, sellerConflict],
-      },
-      {
-        sourceId: 'deal-os',
-        sourceName: 'Deal OS',
-        sourceRecordId: `${opportunity.dealKey}-deal-os`,
-        observedAt: '2026-08-28T17:00:00.000Z',
-        values: {
-          seller_name: 'Deal OS Seller Claim',
-          annual_profit: dealOsProfit,
-          listing_id: `${opportunity.dealKey}-deal-os`,
-          listing_url: `https://dealos.example/${opportunity.opportunityId}`,
-        },
-        conflicts: [sourceConflict, sellerConflict],
-      },
-    ],
-    missingCriticalFields: ['seller_email', 'customer_concentration'],
-    listingUrls: [opportunity.listingUrl, `https://dealos.example/${opportunity.opportunityId}`],
+    sourceObservations: sourceRows.map(({ opportunityId: _opportunityId, ...source }) => ({ ...source, values: { ...source.values }, conflicts })),
+    missingCriticalFields: [...(!effectiveFacts.seller_email ? ['seller_email'] : []), ...(!effectiveFacts.broker_phone ? ['broker_phone'] : []), 'customer_concentration'],
+    listingUrls: [...new Set(sourceRows.map((source) => source.values.listing_url).filter(Boolean))],
     score: {
       fitScore: opportunity.fitScore,
       scoreStatus: opportunity.scoreStatus,
@@ -577,7 +614,9 @@ function phase1DetailResponse(opportunity) {
           sourceName: 'Deal Hunter Google Sheet',
           sourceRecordId: `${opportunity.dealKey}-sheet`,
           listingUrl: opportunity.listingUrl,
-          observedAt: opportunity.sourceObservedAt,
+          // Score evidence is the persisted scoring-time observation. The
+          // independently current source row may legitimately be newer.
+          observedAt: scoreRow.evidenceObservedAt,
         }] : [],
       })),
       unattributedEvidence: [{
@@ -603,30 +642,27 @@ function phase1DetailResponse(opportunity) {
       },
     },
     cimSummary: {
-      requests: [{ id: `cim-${opportunity.opportunityId}`, status: 'documents-received', updatedAt: '2026-08-29T19:00:00.000Z' }],
-      communications: [{ id: `cim-communication-${opportunity.opportunityId}`, direction: 'inbound', channel: 'email', kind: 'broker-reply', occurredAt: '2026-08-29T19:00:00.000Z', cimRequestId: `cim-${opportunity.opportunityId}` }],
+      requests: state.cimRequests.filter((row) => row.opportunityId === opportunityId).map(({ opportunityId: _opportunityId, ...request }) => request),
+      communications: state.cimCommunications.filter((row) => row.opportunityId === opportunityId).map(({ opportunityId: _opportunityId, ...communication }) => communication),
     },
     crmSummary: {
-      submission: {
-        id: `crm-${opportunity.opportunityId}`,
-        status: 'review',
-        company: opportunity.name,
-        sellerName: opportunity.crmSellerName,
-        sellerEmail: 'seller.crm@example.test',
-        brokerName: 'Riley CRM Broker',
-        brokerEmail: 'riley.broker@example.test',
-        updatedAt: '2026-08-29T19:00:00.000Z',
-      },
-      communications: [
-        { id: `crm-email-${opportunity.opportunityId}`, direction: 'inbound', channel: 'email', kind: 'broker-reply', occurredAt: '2026-08-29T19:00:00.000Z', cimRequestId: `cim-${opportunity.opportunityId}` },
-        { id: `crm-call-${opportunity.opportunityId}`, direction: 'outbound', channel: 'phone', kind: 'seller-call', occurredAt: '2026-08-28T19:00:00.000Z', cimRequestId: '' },
-      ],
-      factObservations: [{ field: 'seller_name', value: opportunity.crmSellerName, provenance: 'crm' }],
+      submission: submission ? {
+        id: submission.id,
+        status: submission.status,
+        company: submission.company,
+        sellerName: submission.sellerName,
+        sellerEmail: submission.sellerEmail,
+        brokerName: submission.brokerName,
+        brokerEmail: submission.brokerEmail,
+        updatedAt: submission.updatedAt,
+      } : null,
+      communications: state.crmCommunications.filter((row) => row.opportunityId === opportunityId).map(({ opportunityId: _opportunityId, ...communication }) => communication),
+      factObservations: Object.entries({ seller_name: submission?.sellerName, broker_name: submission?.brokerName, broker_phone: submission?.brokerPhone }).filter(([, value]) => value).map(([field, value]) => ({ field, value, provenance: 'crm' })),
       conflicts: [{ field: 'broker_name', winningProvenance: effectiveFacts.broker_name.provenance, crmValue: 'Riley CRM Broker' }],
     },
     history: {
-      activities: opportunity.activities.map((activity) => ({ ...activity })),
-      dispositions: opportunity.dispositions.map((disposition) => ({ ...disposition })),
+      activities: state.activities.filter((activity) => activity.opportunityId === opportunityId).map(({ opportunityId: _opportunityId, ...activity }) => activity),
+      dispositions: state.dispositions.filter((disposition) => disposition.opportunityId === opportunityId).map(({ opportunityId: _opportunityId, ...disposition }) => disposition),
       operatorFacts,
       operatorState: {
         priority: opportunity.operatorPriority,
@@ -772,6 +808,13 @@ function phase1Body(request) {
   }
 }
 
+const phase1DispositionReasons = new Set(['not-a-fit', 'unavailable', 'duplicate', 'broker-declined', 'valuation', 'geography', 'timing', 'financing', 'other']);
+
+function phase1DispositionReason(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return phase1DispositionReasons.has(normalized) ? normalized : 'other';
+}
+
 async function installPhase1Fixture(page) {
   const state = createPhase1FixtureState();
   await installPhase1RequestAudit(page, state);
@@ -796,17 +839,19 @@ async function installPhase1Fixture(page) {
     if (method === 'PUT' && factMatch && !url.search) {
       const opportunityId = decodeURIComponent(factMatch[1]);
       const field = decodeURIComponent(factMatch[2]);
-      const opportunity = state.opportunities.find((item) => item.opportunityId === opportunityId);
+      const opportunity = state.canonicalOpportunities.find((item) => item.opportunityId === opportunityId);
+      const score = state.scoreRows.find((item) => item.opportunityId === opportunityId);
       const body = phase1Body(request);
-      if (!opportunity || field !== 'seller_name') throw new Error(`Unexpected Phase 1 fact target: ${path}`);
+      if (!opportunity || !score || field !== 'seller_name') throw new Error(`Unexpected Phase 1 fact target: ${path}`);
       if (JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(['note', 'value', 'verified'])) {
         throw new Error(`Malformed Phase 1 fact payload keys: ${JSON.stringify(body)}`);
       }
       if (body.verified !== true || body.value !== 'Morgan Verified Seller' || body.note !== 'Confirmed directly with the seller on Aug 30.') {
         throw new Error(`Malformed Phase 1 fact payload values: ${JSON.stringify(body)}`);
       }
-      const machineScore = opportunity.fitScore;
+      const machineScore = score.fitScore;
       const fact = {
+        opportunityId,
         id: 'fact-evergreen-seller',
         field,
         value: body.value,
@@ -816,60 +861,79 @@ async function installPhase1Fixture(page) {
         createdAt: '2026-08-30T20:00:00.000Z',
         updatedAt: '2026-08-30T20:00:00.000Z',
       };
-      opportunity.operatorFacts = [...opportunity.operatorFacts.filter((item) => item.field !== field), fact];
-      if (opportunity.fitScore !== machineScore) throw new Error('Verified fact changed the machine score in the Phase 1 fixture.');
+      state.operatorFacts = [...state.operatorFacts.filter((item) => item.opportunityId !== opportunityId || item.field !== field), fact];
+      if (score.fitScore !== machineScore) throw new Error('Verified fact changed the machine score in the Phase 1 fixture.');
       state.factPayloads.push({ method, path, body });
-      await fulfillPhase1Json(route, { success: true, fact });
+      const { opportunityId: _opportunityId, ...responseFact } = fact;
+      await fulfillPhase1Json(route, { success: true, fact: responseFact });
       return;
     }
 
     const actionMatch = path.match(/^\/api\/admin\/deal-hunter\/triage\/([^/]+)\/action$/);
     if (method === 'POST' && actionMatch && !url.search) {
       const opportunityId = decodeURIComponent(actionMatch[1]);
-      const opportunity = state.opportunities.find((item) => item.opportunityId === opportunityId);
+      const opportunity = state.canonicalOpportunities.find((item) => item.opportunityId === opportunityId);
+      const score = state.scoreRows.find((item) => item.opportunityId === opportunityId);
       const body = phase1Body(request);
-      if (!opportunity || !['pursue', 'watch', 'pass'].includes(body.action)) throw new Error(`Malformed Phase 1 action target or action: ${path}`);
+      if (!opportunity || !score || !['pursue', 'watch', 'pass'].includes(body.action)) throw new Error(`Malformed Phase 1 action target or action: ${path}`);
       const expectedKeys = body.action === 'pass' ? ['action', 'note', 'reason'] : ['action'];
       if (JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(expectedKeys)) {
         throw new Error(`Malformed Phase 1 action payload keys: ${JSON.stringify(body)}`);
       }
-      if (body.action === 'pass' && (body.reason !== 'strategic-fit' || body.note !== 'Focus outside the core acquisition market.')) {
+      if (body.action === 'pass' && (body.reason !== 'valuation' || body.note !== 'Asking price exceeds the current acquisition valuation.')) {
         throw new Error(`Malformed Phase 1 Pass payload values: ${JSON.stringify(body)}`);
       }
-      const machineScore = opportunity.fitScore;
-      opportunity.reviewed = true;
-      opportunity.reviewedAt = '2026-08-30T20:05:00.000Z';
-      opportunity.reviewedBy = 'phase1-admin';
-      opportunity.changedSinceReview = false;
-      if (body.action === 'pursue') opportunity.operatorPriority = 'high';
-      if (body.action === 'watch') opportunity.operatorPriority = 'watch';
+      if (phase1CurrentDisposition(state, opportunityId)) {
+        await fulfillPhase1Json(route, { success: false, error: 'Passed opportunities must be restored before another triage action.' }, 409);
+        return;
+      }
+      const machineScore = score.fitScore;
+      score.reviewed = true;
+      score.reviewedAt = '2026-08-30T20:05:00.000Z';
+      score.reviewedBy = 'phase1-admin';
+      score.changedSinceReview = false;
+      if (body.action === 'pursue') score.operatorPriority = 'high';
+      if (body.action === 'watch') score.operatorPriority = 'watch';
+      let disposition = null;
       if (body.action === 'pass') {
-        opportunity.dismissed = true;
-        opportunity.dismissedReason = body.reason;
-        opportunity.dispositions = [{
+        disposition = {
+          opportunityId,
           id: 'disposition-cascade-phase1',
           disposition: 'dismissed',
-          reason: body.reason,
+          reason: phase1DispositionReason(body.reason),
           note: body.note,
           dismissedAt: '2026-08-30T20:05:00.000Z',
           dismissedBy: 'phase1-admin',
-        }, ...opportunity.dispositions];
+        };
+        state.dispositions = [disposition, ...state.dispositions];
+        const submission = state.crmSubmissions.find((row) => row.opportunityId === opportunityId);
+        if (submission) {
+          submission.status = 'archived';
+          submission.updatedAt = '2026-08-30T20:05:00.000Z';
+        }
+        const cimRequest = state.cimRequests.find((row) => row.opportunityId === opportunityId);
+        if (cimRequest) {
+          cimRequest.status = 'stopped';
+          cimRequest.updatedAt = '2026-08-30T20:05:00.000Z';
+        }
       }
-      opportunity.activities = [{
+      state.activities = [{
+        opportunityId,
         id: `activity-${opportunity.opportunityId}-${body.action}`,
         eventType: body.action === 'pass' ? 'opportunity-disposition' : 'opportunity-triaged',
         summary: body.action === 'pursue' ? 'Priority high; marked reviewed.' : body.action === 'watch' ? 'Priority watch; marked reviewed.' : 'Passed with a durable disposition; marked reviewed.',
         createdAt: '2026-08-30T20:05:00.000Z',
         actor: 'phase1-admin',
-      }, ...opportunity.activities];
-      if (opportunity.fitScore !== machineScore) throw new Error(`${body.action} changed the machine score in the Phase 1 fixture.`);
+      }, ...state.activities];
+      if (score.fitScore !== machineScore) throw new Error(`${body.action} changed the machine score in the Phase 1 fixture.`);
       state.actionPayloads.push({ method, path, body, machineScore });
+      const current = phase1CurrentOpportunity(state, opportunityId);
       await fulfillPhase1Json(route, {
         success: true,
         ok: true,
         action: body.action,
-        opportunity: phase1QueueRow(opportunity),
-        ...(body.action === 'pass' ? { disposition: opportunity.dispositions[0] } : {}),
+        opportunity: phase1QueueRow(current),
+        ...(disposition ? { disposition: (({ opportunityId: _opportunityId, ...row }) => row)(disposition) } : {}),
       });
       return;
     }
@@ -877,9 +941,9 @@ async function installPhase1Fixture(page) {
     const detailMatch = path.match(/^\/api\/admin\/deal-hunter\/triage\/([^/]+)$/);
     if (method === 'GET' && detailMatch && !url.search) {
       const opportunityId = decodeURIComponent(detailMatch[1]);
-      const opportunity = state.opportunities.find((item) => item.opportunityId === opportunityId);
+      const opportunity = state.canonicalOpportunities.find((item) => item.opportunityId === opportunityId);
       if (!opportunity) throw new Error(`Unexpected Phase 1 detail target: ${path}`);
-      await fulfillPhase1Json(route, phase1DetailResponse(opportunity));
+      await fulfillPhase1Json(route, phase1DetailResponse(state, opportunityId));
       return;
     }
 
@@ -1132,10 +1196,18 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expectPhase1Summary(page, 'Needs Review', 3);
   await expectPhase1Summary(page, 'High Priority', 3);
   await expectPhase1Summary(page, 'Watchlist', 1);
-  await expectPhase1Summary(page, 'Low Confidence', 1);
+  await expectPhase1Summary(page, 'Low Confidence', 2);
   await expectPhase1Summary(page, 'Current Opportunities', 4);
 
   const queue = page.getByRole('list', { name: 'Opportunity queue' });
+  await page.getByRole('tab', { name: 'Watchlist' }).click();
+  await expect(queue.getByRole('button', { name: /^Open / })).toHaveText(['Heritage Inspection Partners']);
+  await page.getByRole('tab', { name: 'Low Confidence' }).click();
+  await expect(queue.getByRole('button', { name: /^Open / })).toHaveText([
+    'Cascade Field Compliance',
+    'Heritage Inspection Partners',
+  ]);
+  await page.getByRole('tab', { name: 'Needs Review' }).click();
   await expect(queue.getByRole('button', { name: /^Open / })).toHaveText([
     'Summit Fire Systems',
     'Evergreen Safety Services',
@@ -1204,13 +1276,15 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expectPhase1DetailValue(dialog, 'Fit', 92);
   await expectPhase1DetailValue(dialog, 'Confidence', 'High');
   await expectPhase1DetailValue(dialog, 'Machine state', 'High Fit');
-  await expect(dialog.getByText('$520,000', { exact: true })).toBeVisible();
-  await expect(dialog.getByText('$2,800,000', { exact: true })).toBeVisible();
-  await expect(dialog.getByText('$2,100,000', { exact: true })).toBeVisible();
-  await expect(dialog.getByText('4.04×', { exact: true })).toBeVisible();
+  const businessFinancials = dialog.getByRole('heading', { name: 'Business & Financials' }).locator('..');
+  await expect(businessFinancials.getByText('$535,000', { exact: true })).toBeVisible();
+  await expect(businessFinancials.getByText('$2,800,000', { exact: true })).toBeVisible();
+  await expect(businessFinancials.getByText('$2,100,000', { exact: true })).toBeVisible();
+  await expect(businessFinancials.getByText('4.04×', { exact: true })).toBeVisible();
   const brokerSellerSection = dialog.getByRole('heading', { name: 'Broker & Seller' }).locator('..');
   await expect(brokerSellerSection.getByText('Riley Verified Broker', { exact: true })).toBeVisible();
-  await expect(brokerSellerSection.getByText('Operator verified', { exact: true })).toBeVisible();
+  await expect(brokerSellerSection.getByText('503-555-0198', { exact: true })).toBeVisible();
+  await expect(brokerSellerSection.getByText('Operator verified', { exact: true })).toHaveCount(2);
   await expect(brokerSellerSection.getByText('Morgan CRM Seller', { exact: true })).toBeVisible();
   await expect(brokerSellerSection.getByText('CRM', { exact: true }).first()).toBeVisible();
   const missingInformation = dialog.getByRole('region', { name: 'Missing Information' });
@@ -1220,14 +1294,17 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   const scoreSection = dialog.getByRole('heading', { name: 'Score & Evidence' }).locator('..');
   for (const dimension of phase1DimensionLabels) await expect(scoreSection.getByRole('heading', { name: dimension })).toBeVisible();
   await expect(scoreSection.getByText('Profit inside target acquisition band')).toBeVisible();
+  await expect(scoreSection.getByText('Observed value: $520,000 reported', { exact: true })).toBeVisible();
   await expect(scoreSection.getByText(/Caps: Customer concentration is unverified/)).toBeVisible();
   await expect(scoreSection.getByText(/Missing evidence: Customer Concentration/)).toBeVisible();
   const sourcesSection = dialog.getByRole('heading', { name: 'Sources' }).locator('..');
   await expect(sourcesSection.getByRole('heading', { name: 'Deal Hunter Google Sheet' })).toBeVisible();
   await expect(sourcesSection.getByRole('heading', { name: 'Deal OS' })).toBeVisible();
   await expect(sourcesSection.getByText('Conflict: Annual Profit').first()).toBeVisible();
-  await expect(sourcesSection.getByText(/Deal Hunter Google Sheet reported 520000/).first()).toBeVisible();
+  await expect(sourcesSection.getByText(/Deal Hunter Google Sheet reported 535000/).first()).toBeVisible();
   await expect(sourcesSection.getByText(/Deal OS reported 475000/).first()).toBeVisible();
+  await expect(sourcesSection.getByText('503-555-0110', { exact: true })).toBeVisible();
+  await expect(sourcesSection.getByText('Call the main broker desk after 2 PM.', { exact: true })).toBeVisible();
   const originalListingLinks = sourcesSection.getByRole('link', { name: /View Original Listing/ });
   await expect(originalListingLinks).toHaveCount(2);
   await expect(originalListingLinks.first()).toHaveAttribute('href', 'https://broker.example/evergreen');
@@ -1260,19 +1337,20 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await dialog.getByRole('button', { name: 'Save verified fact' }).click();
   await expect.poll(() => state.factPayloads.length).toBe(1);
   await expect(dialog.getByRole('heading', { name: 'Broker & Seller' }).locator('..').getByText('Morgan Verified Seller', { exact: true }).first()).toBeVisible();
-  await expect(dialog.getByRole('heading', { name: 'Broker & Seller' }).locator('..').getByText('Operator verified', { exact: true })).toHaveCount(2);
+  await expect(dialog.getByRole('heading', { name: 'Broker & Seller' }).locator('..').getByText('Operator verified', { exact: true })).toHaveCount(3);
   await expect(dialog.getByRole('heading', { name: 'Notes & History' }).locator('..').getByText(/Operator fact · Seller Name · Morgan Verified Seller · Verified/)).toBeVisible();
   await expect(dialog.getByText(/Confirmed directly with the seller on Aug 30/).first()).toBeVisible();
 
-  const evergreen = state.opportunities.find((opportunity) => opportunity.opportunityId === 'opp-evergreen');
-  evergreen.sourceSellerName = 'Morgan Refreshed Structured Seller';
-  evergreen.sourceObservedAt = '2026-08-30T21:00:00.000Z';
+  const evergreen = state.scoreRows.find((score) => score.opportunityId === 'opp-evergreen');
+  const evergreenSource = state.sourceObservations.find((source) => source.opportunityId === 'opp-evergreen' && source.sourceId === 'sheet-0');
+  evergreenSource.values.seller_name = 'Morgan Refreshed Structured Seller';
+  evergreenSource.observedAt = '2026-08-30T21:00:00.000Z';
   await dialog.getByRole('button', { name: 'Close opportunity detail' }).click();
   await evergreenTrigger.click();
   dialog = page.getByRole('dialog', { name: 'Evergreen Safety Services' });
   const refreshedBrokerSeller = dialog.getByRole('heading', { name: 'Broker & Seller' }).locator('..');
   await expect(refreshedBrokerSeller.getByText('Morgan Verified Seller', { exact: true }).first()).toBeVisible();
-  await expect(refreshedBrokerSeller.getByText('Operator verified', { exact: true })).toHaveCount(2);
+  await expect(refreshedBrokerSeller.getByText('Operator verified', { exact: true })).toHaveCount(3);
   const refreshedSources = dialog.getByRole('heading', { name: 'Sources' }).locator('..');
   await expect(refreshedSources.getByText('Morgan Refreshed Structured Seller', { exact: true }).first()).toBeVisible();
   await expect(refreshedSources.getByText(/Observed Aug 30, 2026/).first()).toBeVisible();
@@ -1296,6 +1374,11 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(page.getByText('No opportunities in this view.')).toBeVisible();
 
   await search.fill('');
+  await page.getByRole('tab', { name: 'Watchlist' }).click();
+  await expect(queue.getByRole('button', { name: /^Open / })).toHaveText([
+    'Evergreen Safety Services',
+    'Heritage Inspection Partners',
+  ]);
   await page.getByRole('tab', { name: 'All Current' }).click();
   const cascadeTrigger = page.getByRole('button', { name: 'Open Cascade Field Compliance' });
   await expect(cascadeTrigger).toBeVisible();
@@ -1304,13 +1387,13 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   const passDialog = page.getByRole('dialog', { name: 'Pass Cascade Field Compliance' });
   await expect(passDialog).toBeVisible();
   expect(state.actionPayloads).toHaveLength(actionCountBeforePass);
-  await passDialog.getByLabel('Pass reason').fill('strategic-fit');
-  await passDialog.getByLabel('Pass note (optional)').fill('Focus outside the core acquisition market.');
+  await passDialog.getByLabel('Pass reason').fill('valuation');
+  await passDialog.getByLabel('Pass note (optional)').fill('Asking price exceeds the current acquisition valuation.');
   await passDialog.getByRole('button', { name: 'Confirm Pass' }).click();
   await expect.poll(() => state.actionPayloads.length).toBe(actionCountBeforePass + 1);
   await expect(passDialog).toBeHidden();
   await expect(cascadeTrigger).toHaveCount(0);
-  const cascade = state.opportunities.find((opportunity) => opportunity.opportunityId === 'opp-cascade');
+  const cascade = state.scoreRows.find((score) => score.opportunityId === 'opp-cascade');
   expect(cascade.fitScore).toBe(84);
 
   await page.getByRole('tab', { name: 'Passed' }).click();
@@ -1318,13 +1401,13 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(passedCascade).toBeVisible();
   const passedRow = passedCascade.locator('..').locator('..');
   await expect(passedRow.getByText('84', { exact: true })).toBeVisible();
-  await expect(passedRow.getByText('Passed: Strategic Fit')).toBeVisible();
+  await expect(passedRow.getByText('Passed: Valuation')).toBeVisible();
   await passedCascade.click();
   dialog = page.getByRole('dialog', { name: 'Cascade Field Compliance' });
   await expectPhase1DetailValue(dialog, 'Fit', 84);
-  await expect(dialog.getByText('Passed: Strategic Fit').first()).toBeVisible();
+  await expect(dialog.getByText('Passed: Valuation').first()).toBeVisible();
   await expect(dialog.getByRole('heading', { name: 'Disposition history' })).toBeVisible();
-  await expect(dialog.getByText(/Passed: Strategic Fit · Focus outside the core acquisition market. · phase1-admin/)).toBeVisible();
+  await expect(dialog.getByText(/Passed: Valuation · Asking price exceeds the current acquisition valuation. · phase1-admin/)).toBeVisible();
   await expect(dialog.getByRole('button', { name: 'Pursue Cascade Field Compliance' })).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Watch Cascade Field Compliance' })).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Pass Cascade Field Compliance' })).toHaveCount(0);
@@ -1407,6 +1490,10 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   const expectedDealHunterRequests = [
     'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
     'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
+    'GET /api/admin/deal-hunter/triage?view=watchlist&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
+    'GET /api/admin/deal-hunter/triage?view=watchlist&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
+    'GET /api/admin/deal-hunter/triage?view=low-confidence&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
+    'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
     'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
     'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
     'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
@@ -1435,11 +1522,11 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
     'POST /api/admin/deal-hunter/triage/opp-evergreen/action',
     'PUT /api/admin/deal-hunter/opportunities/opp-evergreen/facts/seller_name',
   ].sort();
-  expect(state.requests).toHaveLength(29);
+  expect(state.requests).toHaveLength(33);
   expect(state.requests.map(phase1RequestSignature).sort()).toEqual(expectedDealHunterRequests);
   const independentlyObservedDealHunterRequests = state.apiRequests
     .filter(({ path }) => path.startsWith('/api/admin/deal-hunter/'));
-  expect(independentlyObservedDealHunterRequests).toHaveLength(29);
+  expect(independentlyObservedDealHunterRequests).toHaveLength(33);
   expect(independentlyObservedDealHunterRequests.map(phase1RequestSignature).sort()).toEqual(expectedDealHunterRequests);
   const expectedInboxApiRequests = [
     ...expectedDealHunterRequests,
@@ -1448,12 +1535,12 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
     'GET /api/admin/onboarding',
     'GET /api/admin/onboarding',
   ].sort();
-  expect(state.apiRequests).toHaveLength(33);
+  expect(state.apiRequests).toHaveLength(37);
   expect(state.apiRequests.map(phase1RequestSignature).sort()).toEqual(expectedInboxApiRequests);
   expect(state.actionPayloads).toEqual([
     { method: 'POST', path: '/api/admin/deal-hunter/triage/opp-evergreen/action', body: { action: 'pursue' }, machineScore: 92 },
     { method: 'POST', path: '/api/admin/deal-hunter/triage/opp-evergreen/action', body: { action: 'watch' }, machineScore: 92 },
-    { method: 'POST', path: '/api/admin/deal-hunter/triage/opp-cascade/action', body: { action: 'pass', reason: 'strategic-fit', note: 'Focus outside the core acquisition market.' }, machineScore: 84 },
+    { method: 'POST', path: '/api/admin/deal-hunter/triage/opp-cascade/action', body: { action: 'pass', reason: 'valuation', note: 'Asking price exceeds the current acquisition valuation.' }, machineScore: 84 },
   ]);
   expect(state.factPayloads).toEqual([{
     method: 'PUT',
