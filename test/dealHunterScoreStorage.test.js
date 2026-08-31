@@ -144,6 +144,7 @@ test('only eligibility reconciliation can place historical scores in the current
 
   assert.ok(await storage.getDealHunterOpportunityScore('opp-score-1'), 'the historical score is durable');
   assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
+  assert.equal(await storage.getCurrentDealHunterOpportunityScoreByDealKey('deal-score-1'), null);
   assert.deepEqual(
     await storage.listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 1 }),
     {
@@ -156,6 +157,10 @@ test('only eligibility reconciliation can place historical scores in the current
   const activated = await storage.reconcileDealHunterCurrentScoreEligibility(['opp-score-1', 'opp-score-2']);
   assert.deepEqual(activated, { activated: 2, deactivated: 0 });
   assert.ok(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'));
+  assert.equal(
+    (await storage.getCurrentDealHunterOpportunityScoreByDealKey('deal-score-1')).opportunity_id,
+    'opp-score-1',
+  );
 
   const firstPage = await storage.listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 1 });
   const secondPage = await storage.listDealHunterOpportunityScores({ view: 'all', page: 2, pageSize: 1 });
@@ -168,6 +173,7 @@ test('only eligibility reconciliation can place historical scores in the current
   const narrowed = await storage.reconcileDealHunterCurrentScoreEligibility(['opp-score-2']);
   assert.deepEqual(narrowed, { activated: 0, deactivated: 1 });
   assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
+  assert.equal(await storage.getCurrentDealHunterOpportunityScoreByDealKey('deal-score-1'), null);
   const searched = await storage.listDealHunterOpportunityScores({
     view: 'all', search: 'Commercial Fire Safety', page: 1, pageSize: 25,
   });
@@ -797,6 +803,43 @@ test('Supabase: current score lookup rejects a superseded opportunity without hi
   assert.equal((await storage.getDealHunterOpportunityScore('opp-score-1')).score_fingerprint, 'fingerprint-a');
 });
 
+test('Supabase: exact deal-key lookup requires current Inbox and canonical authority', async () => {
+  const row = storedScoreRow();
+  const filters = [];
+  const chain = {
+    from(table) {
+      assert.equal(table, 'deal_hunter_opportunity_scores');
+      return chain;
+    },
+    select(fields) {
+      assert.equal(fields, '*,deal_hunter_opportunities!inner(status)');
+      return chain;
+    },
+    eq(column, value) {
+      filters.push([column, value]);
+      return chain;
+    },
+    async limit(value) {
+      assert.equal(value, 2);
+      return { data: [{ ...row, deal_hunter_opportunities: { status: 'active' } }], error: null };
+    },
+  };
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: chain },
+  );
+
+  assert.equal(
+    (await storage.getCurrentDealHunterOpportunityScoreByDealKey('deal-score-1')).opportunity_id,
+    'opp-score-1',
+  );
+  assert.deepEqual(filters, [
+    ['deal_key', 'deal-score-1'],
+    ['current_triage_eligible', true],
+    ['deal_hunter_opportunities.status', 'active'],
+  ]);
+});
+
 test('Supabase queue uses the bounded RPC and preserves its database summary', async () => {
   const calls = [];
   const storage = supabaseModule.createSupabaseStorage(
@@ -891,6 +934,7 @@ test('both storage providers expose the same scoring surface', () => {
       'setDealHunterOpportunityOperatorDecision',
       'getDealHunterOpportunityScore',
       'getCurrentDealHunterOpportunityScore',
+      'getCurrentDealHunterOpportunityScoreByDealKey',
       'reconcileDealHunterCurrentScoreEligibility',
       'listDealHunterOpportunityScores',
       'listDealHunterOpportunityScoreFingerprints',

@@ -6748,6 +6748,24 @@ export function createSqliteStorage(config) {
         );
       },
 
+      async getCurrentDealHunterOpportunityScoreByDealKey(dealKey) {
+        const rows = database.prepare(`
+          SELECT scores.*
+          FROM deal_hunter_opportunity_scores AS scores
+          JOIN deal_hunter_opportunities AS opportunity
+            ON opportunity.opportunity_id = scores.opportunity_id
+           AND opportunity.status = 'active'
+          WHERE scores.deal_key = ? AND scores.current_triage_eligible = 1
+          LIMIT 2
+        `).all(String(dealKey || '').trim());
+        if (rows.length > 1) {
+          const error = new Error('A Deal Hunter key maps to more than one current Inbox opportunity.');
+          error.code = 'DEAL_HUNTER_CURRENT_DEAL_KEY_CONFLICT';
+          throw error;
+        }
+        return normalizeDealHunterOpportunityScoreRow(rows[0]);
+      },
+
       async reconcileDealHunterCurrentScoreEligibility(opportunityIds = []) {
         const idsJson = JSON.stringify(normalizeList(opportunityIds, 100000));
         const transaction = database.transaction(() => {

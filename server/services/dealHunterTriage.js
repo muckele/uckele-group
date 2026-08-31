@@ -12,7 +12,11 @@
 import { randomUUID } from 'node:crypto';
 import { recordCrmActivity } from './activity.js';
 import { getStorage } from '../storage/index.js';
-import { normalizeDealHunterDispositionReason } from './leadLifecycle.js';
+import {
+  dismissDealHunterOpportunity,
+  normalizeDealHunterDispositionReason,
+} from './leadLifecycle.js';
+import { buildCimOpportunityAliases } from './cimOpportunityIdentity.js';
 import {
   dealOperatorPriorities,
   normalizeDealOperatorPriority,
@@ -620,4 +624,96 @@ export async function passTriageOpportunity({
     opportunity,
     archived: Boolean(result.archived),
   };
+}
+
+export async function dismissDealHunterOpportunityWithInboxAuthority({
+  dealKey = '',
+  listingUrl = '',
+  dealName = '',
+  reason = '',
+  note = '',
+  submissionId = '',
+  actor = 'admin',
+  storage = getStorage(),
+} = {}) {
+  const normalizedDealKey = typeof dealKey === 'string' ? normalizeText(dealKey, 1000) : '';
+  if (!normalizedDealKey) {
+    return dismissDealHunterOpportunity({
+      dealKey, listingUrl, dealName, reason, note, submissionId, actor, storage,
+    });
+  }
+  const authorityMethods = [
+    'findCurrentDealHunterOpportunityByAliases',
+    'getCurrentDealHunterOpportunity',
+    'getCurrentDealHunterOpportunityScore',
+    'getCurrentDealHunterOpportunityScoreByDealKey',
+    'getDealHunterCrmImport',
+    'listDealHunterCimRequests',
+  ];
+  if (authorityMethods.some((method) => typeof storage[method] !== 'function')) {
+    return { ok: false, status: 503, error: 'Canonical Acquisition Inbox authority storage is unavailable.' };
+  }
+
+  // The legacy Dashboard payload names a deal and may carry a submission ID,
+  // but canonical Pass authority comes only from durable server-owned links.
+  // Exact score ownership covers the primary Inbox key; aliases cover prior
+  // source keys; import and CIM rows preserve authoritative historical links.
+  const aliasKeys = buildCimOpportunityAliases({ dealKey: normalizedDealKey })
+    .map((item) => item.alias_key);
+  let aliasOwner = null;
+  try {
+    aliasOwner = aliasKeys.length > 0
+      ? await storage.findCurrentDealHunterOpportunityByAliases(aliasKeys)
+      : null;
+  } catch (error) {
+    if (['DEAL_HUNTER_OPPORTUNITY_ALIAS_CONFLICT', 'DEAL_HUNTER_OPPORTUNITY_NOT_CURRENT'].includes(error?.code)) {
+      return { ok: false, status: 409, error: 'This Deal Hunter key does not resolve to one current canonical opportunity.' };
+    }
+    throw error;
+  }
+
+  let scoreOwner = null;
+  try {
+    scoreOwner = await storage.getCurrentDealHunterOpportunityScoreByDealKey(normalizedDealKey);
+  } catch (error) {
+    if (error?.code === 'DEAL_HUNTER_CURRENT_DEAL_KEY_CONFLICT') {
+      return { ok: false, status: 409, error: 'This Deal Hunter key does not resolve to one current canonical opportunity.' };
+    }
+    throw error;
+  }
+
+  const [importRecord, cimRequests] = await Promise.all([
+    storage.getDealHunterCrmImport({ dealKey: normalizedDealKey }),
+    storage.listDealHunterCimRequests({ dealKeys: [normalizedDealKey], limit: 100 }),
+  ]);
+  const candidateIds = [...new Set([
+    aliasOwner?.opportunity_id,
+    scoreOwner?.opportunity_id,
+    importRecord?.opportunity_id,
+    ...(cimRequests || []).map((request) => request?.opportunity_id),
+  ].map((value) => normalizeText(value, 200)).filter(Boolean))];
+  const currentCandidates = (await Promise.all(candidateIds.map(async (opportunityId) => (
+    storage.getCurrentDealHunterOpportunity(opportunityId)
+  )))).filter(Boolean);
+  const currentIds = [...new Set(currentCandidates.map((opportunity) => opportunity.opportunity_id))];
+
+  if (currentIds.length > 1) {
+    return { ok: false, status: 409, error: 'This Deal Hunter key has conflicting current canonical links.' };
+  }
+  if (currentIds.length === 1) {
+    const opportunityId = currentIds[0];
+    const currentScore = scoreOwner?.opportunity_id === opportunityId
+      ? scoreOwner
+      : await storage.getCurrentDealHunterOpportunityScore(opportunityId);
+    if (!currentScore) {
+      return { ok: false, status: 409, error: 'This canonical opportunity has no current Acquisition Inbox score.' };
+    }
+    return passTriageOpportunity({ opportunityId, reason, note, actor, storage });
+  }
+
+  // No active canonical owner and no current Inbox score means this is a true
+  // pre-Inbox lifecycle record. Preserve that bounded compatibility path.
+  return dismissDealHunterOpportunity({
+    dealKey: normalizedDealKey, listingUrl, dealName, reason, note, submissionId, actor, storage,
+  });
 }

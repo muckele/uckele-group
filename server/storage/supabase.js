@@ -2762,6 +2762,25 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterOpportunityScoreRow(score);
     },
 
+    async getCurrentDealHunterOpportunityScoreByDealKey(dealKey) {
+      const { data, error } = await client
+        .from('deal_hunter_opportunity_scores')
+        .select('*,deal_hunter_opportunities!inner(status)')
+        .eq('deal_key', String(dealKey || '').trim())
+        .eq('current_triage_eligible', true)
+        .eq('deal_hunter_opportunities.status', 'active')
+        .limit(2);
+      if (error) throw error;
+      if ((data || []).length > 1) {
+        const conflict = new Error('A Deal Hunter key maps to more than one current Inbox opportunity.');
+        conflict.code = 'DEAL_HUNTER_CURRENT_DEAL_KEY_CONFLICT';
+        throw conflict;
+      }
+      if (!data?.[0]) return null;
+      const { deal_hunter_opportunities: _opportunity, ...score } = data[0];
+      return normalizeDealHunterOpportunityScoreRow(score);
+    },
+
     async reconcileDealHunterCurrentScoreEligibility(opportunityIds = []) {
       const { data, error } = await client.rpc('reconcile_deal_hunter_current_score_eligibility', {
         p_opportunity_ids: normalizeList(opportunityIds, 100000),

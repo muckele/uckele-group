@@ -19,6 +19,8 @@ delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
 const { createApp } = await import('../server/app.js');
 const { getStorage } = await import('../server/storage/index.js');
 const { createManualSubmission } = await import('../server/services/submissions.js');
+let loginSequence = 0;
+const authenticatedCookies = new Map();
 
 async function withServer(run) {
   const server = createApp().listen(0, '127.0.0.1');
@@ -30,7 +32,11 @@ async function withServer(run) {
   }
 }
 
-async function seedCurrentOpportunity(opportunityId = 'opp-http-triage-actions', primarySubmissionId = null) {
+async function seedCurrentOpportunity(
+  opportunityId = 'opp-http-triage-actions',
+  primarySubmissionId = null,
+  dealKey = `deal-${opportunityId}`,
+) {
   const storage = getStorage();
   await storage.upsertDealHunterOpportunity({
     opportunity_id: opportunityId, created_at: '2026-08-30T09:00:00.000Z', updated_at: '2026-08-30T09:00:00.000Z',
@@ -38,7 +44,7 @@ async function seedCurrentOpportunity(opportunityId = 'opp-http-triage-actions',
     primary_submission_id: primarySubmissionId, identity_version: 'http-triage-actions', status: 'active', metadata: {},
   });
   await storage.writeDealHunterOpportunityScore({
-    opportunity_id: opportunityId, scored_at: '2026-08-30T10:00:00.000Z', deal_key: `deal-${opportunityId}`,
+    opportunity_id: opportunityId, scored_at: '2026-08-30T10:00:00.000Z', deal_key: dealKey,
     name: 'HTTP Action Opportunity', state: 'TX', listing_url: 'https://broker.example/http-triage-actions',
     fit_score: 72, score_status: 'watchlist', confidence: 'medium', completeness_score: 70,
     contradiction_count: 0, missing_evidence_count: 1, should_remove: false, high_fit: false, gate_count: 0,
@@ -50,15 +56,38 @@ async function seedCurrentOpportunity(opportunityId = 'opp-http-triage-actions',
   return { storage, opportunityId };
 }
 
+async function linkCanonicalDealKey(storage, { opportunityId, dealKey }) {
+  const observedAt = '2026-08-30T09:30:00.000Z';
+  return storage.upsertDealHunterOpportunityAlias({
+    id: `alias-${opportunityId}`,
+    opportunity_id: opportunityId,
+    alias_type: 'deal-key',
+    alias_value: dealKey,
+    alias_key: `deal-key:${dealKey}`,
+    source: 'http-triage-actions-test',
+    first_observed_at: observedAt,
+    last_observed_at: observedAt,
+    evidence_version: 'http-triage-actions-v1',
+    resolution_method: 'exact-deal-key',
+    confidence_state: 'exact',
+    resolved_by: 'test',
+    metadata: {},
+  });
+}
+
 async function login(origin, username, password) {
+  if (authenticatedCookies.has(username)) return authenticatedCookies.get(username);
+  loginSequence += 1;
   const response = await fetch(`${origin}/api/admin/session`, {
     method: 'POST', headers: {
       'Content-Type': 'application/json',
-      'X-Real-IP': username === 'triage-viewer' ? '198.51.100.22' : '198.51.100.21',
+      'X-Real-IP': `198.51.100.${20 + loginSequence}`,
     }, body: JSON.stringify({ username, password }),
   });
   assert.equal(response.status, 200);
-  return response.headers.get('set-cookie').split(';')[0];
+  const cookie = response.headers.get('set-cookie').split(';')[0];
+  authenticatedCookies.set(username, cookie);
+  return cookie;
 }
 
 test.after(() => {
@@ -277,6 +306,145 @@ test('linked-CRM Pass rolls archive, CIM stop, disposition, review, and audit ba
     database.exec('DROP TRIGGER IF EXISTS fail_linked_atomic_pass_review');
     database.close();
   }
+});
+
+test('legacy disposition HTTP route delegates a current canonical Inbox target to the atomic Pass command', async () => {
+  // Break caught: Dashboard uses this older route. It archived CRM and wrote the
+  // disposition without touching the canonical score review, so the atomic
+  // command could be bypassed even after the Inbox action route was corrected.
+  const storage = getStorage();
+  const opportunityId = 'opp-http-legacy-route-atomic-pass';
+  const dealKey = 'source:http-legacy-route:observed-alias';
+  const canonicalDealKey = 'source:http-legacy-route:canonical-primary';
+  const leadResult = await createManualSubmission({
+    company: 'Legacy Route Atomic Pass Services',
+    lead_type: 'broker',
+    broker_name: 'Legacy Route Broker',
+    broker_email: 'legacy-route@example.com',
+    listing_url: 'https://broker.example/http-legacy-route-atomic-pass',
+    status: 'review',
+    follow_up_state: 'scheduled',
+    metadata: { dealHunter: { dealKey } },
+  }, 'triage-admin', { storage });
+  assert.equal(leadResult.ok, true);
+  const submissionId = leadResult.submission.id;
+  await seedCurrentOpportunity(opportunityId, submissionId, canonicalDealKey);
+  await linkCanonicalDealKey(storage, { opportunityId, dealKey });
+  const beforeActivities = await storage.listCrmActivityEvents({ submissionId, limit: 100 });
+  const database = new Database(process.env.SQLITE_PATH);
+  database.exec(`
+    CREATE TRIGGER fail_legacy_route_atomic_pass_review
+    BEFORE UPDATE OF reviewed_at ON deal_hunter_opportunity_scores
+    WHEN NEW.opportunity_id = '${opportunityId}' AND NEW.reviewed_at IS NOT NULL
+    BEGIN
+      SELECT RAISE(ABORT, 'injected legacy-route review persistence failure');
+    END;
+  `);
+  try {
+    await withServer(async (origin) => {
+      const cookie = await login(origin, 'admin', 'change-me-now');
+      const request = () => fetch(`${origin}/api/admin/deal-hunter/dispositions`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify({
+          dealKey,
+          listingUrl: 'https://broker.example/http-legacy-route-atomic-pass',
+          dealName: 'Legacy Route Atomic Pass Services',
+          reason: 'valuation',
+          note: 'The legacy Dashboard route must use atomic Pass.',
+          // This legacy compatibility field must not be trusted as canonical
+          // Pass authority. The server-owned alias owns that resolution.
+          submissionId,
+        }),
+      });
+
+      const failed = await request();
+      const failedSubmission = await storage.getSubmission(submissionId);
+      const failedDispositions = await storage.listDealHunterDispositions({ dealKeys: [dealKey, canonicalDealKey], limit: 20 });
+      const failedScore = await storage.getDealHunterOpportunityScore(opportunityId);
+      const failedActivities = await storage.listCrmActivityEvents({ submissionId, limit: 100 });
+      assert.deepEqual({
+        status: failed.status,
+        submissionStatus: failedSubmission.status,
+        dispositionCount: failedDispositions.length,
+        reviewedAt: failedScore.reviewed_at,
+        activityCount: failedActivities.length,
+      }, {
+        status: 500,
+        submissionStatus: 'review',
+        dispositionCount: 0,
+        reviewedAt: null,
+        activityCount: beforeActivities.length,
+      }, 'a review-boundary failure must not leave the legacy route partially Passed');
+
+      database.exec('DROP TRIGGER fail_legacy_route_atomic_pass_review');
+      const retry = await request();
+      assert.equal(retry.status, 200);
+      const retryBody = await retry.json();
+      assert.equal(retryBody.success, true);
+      assert.equal(retryBody.opportunity.dismissed, true);
+      assert.equal(retryBody.opportunity.reviewed, true);
+      assert.equal(retryBody.archived, true);
+      assert.equal(Object.hasOwn(retryBody, 'submission'), false,
+        'the canonical Pass response must not expose raw provider submission state');
+      assert.equal((await storage.getSubmission(submissionId)).status, 'archived');
+      const passedDisposition = await storage.getDealHunterDisposition({ dealKey: canonicalDealKey });
+      const passedScore = await storage.getDealHunterOpportunityScore(opportunityId);
+      const passedActivities = await storage.listCrmActivityEvents({ submissionId, limit: 100 });
+      assert.equal(passedActivities.length, beforeActivities.length + 2);
+
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      const repeated = await request();
+      assert.equal(repeated.status, 409);
+      assert.equal((await storage.getDealHunterDisposition({ dealKey: canonicalDealKey })).updated_at, passedDisposition.updated_at,
+        'repeating legacy dismissal must not rewrite the canonical Pass timestamp');
+      assert.equal((await storage.getDealHunterOpportunityScore(opportunityId)).reviewed_at, passedScore.reviewed_at,
+        'repeating legacy dismissal must not rewrite the review timestamp');
+      assert.equal((await storage.listCrmActivityEvents({ submissionId, limit: 100 })).length, passedActivities.length,
+        'repeating legacy dismissal must not duplicate archive or triage history');
+    });
+  } finally {
+    database.exec('DROP TRIGGER IF EXISTS fail_legacy_route_atomic_pass_review');
+    database.close();
+  }
+});
+
+test('legacy disposition HTTP route cannot rewrite a repeated source-only canonical Pass', async () => {
+  // Break caught: the legacy source-only path upserted the dismissal on every
+  // request. A repeat therefore returned success and replaced its timestamps
+  // without ever acknowledging the current canonical review.
+  const opportunityId = 'opp-http-legacy-route-source-only-repeat';
+  const dealKey = 'source:http-legacy-route:source-only-repeat';
+  const { storage } = await seedCurrentOpportunity(opportunityId, null, dealKey);
+
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const request = () => fetch(`${origin}/api/admin/deal-hunter/dispositions`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ dealKey, reason: 'timing', note: 'Canonical source-only repeat.' }),
+    });
+
+    const first = await request();
+    const firstDisposition = await storage.getDealHunterDisposition({ dealKey });
+    const firstScore = await storage.getDealHunterOpportunityScore(opportunityId);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const repeated = await request();
+    const repeatedDisposition = await storage.getDealHunterDisposition({ dealKey });
+    const repeatedScore = await storage.getDealHunterOpportunityScore(opportunityId);
+
+    assert.deepEqual({
+      firstStatus: first.status,
+      repeatedStatus: repeated.status,
+      dispositionTimePreserved: repeatedDisposition.updated_at === firstDisposition.updated_at,
+      reviewTimePreserved: repeatedScore.reviewed_at === firstScore.reviewed_at,
+      reviewed: Boolean(repeatedScore.reviewed_at),
+    }, {
+      firstStatus: 200,
+      repeatedStatus: 409,
+      dispositionTimePreserved: true,
+      reviewTimePreserved: true,
+      reviewed: true,
+    });
+  });
 });
 
 test('triage detail remains readable while only administrators may enrich facts or run bounded Pursue, Watch, and Pass actions', async () => {

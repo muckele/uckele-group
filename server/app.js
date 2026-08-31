@@ -41,6 +41,7 @@ import {
   requestOpportunityScoreRefresh,
 } from './services/dealHunterScoreStore.js';
 import {
+  dismissDealHunterOpportunityWithInboxAuthority,
   getTriageOpportunityDetail,
   listTriageQueue,
   passTriageOpportunity,
@@ -87,7 +88,6 @@ import {
 } from './services/communications.js';
 import {
   archiveLead,
-  dismissDealHunterOpportunity,
   restoreDealHunterOpportunity,
   restoreLead,
 } from './services/leadLifecycle.js';
@@ -1715,7 +1715,7 @@ export function createApp() {
             dealKey: request.body?.dealKey || '',
             actor: session.username || 'admin',
           })
-        : await dismissDealHunterOpportunity({
+        : await dismissDealHunterOpportunityWithInboxAuthority({
             dealKey: request.body?.dealKey || '',
             listingUrl: request.body?.listingUrl || '',
             dealName: request.body?.dealName || '',
