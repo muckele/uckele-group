@@ -192,6 +192,10 @@ describe('Acquisition Inbox queue', () => {
     expect(screen.getByText('Observed Aug 29, 2026')).toBeVisible();
     expect(screen.getByText('Review: Reviewed')).toBeVisible();
     expect(screen.getByText('Passed: Valuation')).toBeVisible();
+    const passedRow = screen.getByRole('button', { name: 'Open Passed Plumbing' }).closest('li');
+    expect(within(passedRow).queryByRole('button', { name: 'Pursue Passed Plumbing' })).not.toBeInTheDocument();
+    expect(within(passedRow).queryByRole('button', { name: 'Watch Passed Plumbing' })).not.toBeInTheDocument();
+    expect(within(passedRow).queryByRole('button', { name: 'Pass Passed Plumbing' })).not.toBeInTheDocument();
   });
 
   test('describes only supported search fields and labels scored-at as newest score', async () => {
@@ -203,7 +207,7 @@ describe('Acquisition Inbox queue', () => {
     expect(screen.queryByRole('option', { name: 'Newest observation' })).not.toBeInTheDocument();
   });
 
-  test('commits only the newest queue request when responses and finalizers resolve in reverse order', async () => {
+  test('keeps the current queue loading while a stale request resolves and finalizes', async () => {
     const first = deferred();
     const second = deferred();
     let queueReads = 0;
@@ -217,15 +221,55 @@ describe('Acquisition Inbox queue', () => {
     fireEvent.change(screen.getByRole('searchbox', { name: 'Search opportunities' }), { target: { value: 'current' } });
     await waitFor(() => expect(queueReads).toBe(2));
 
+    await act(async () => first.resolve(jsonResponse(queueResponse({ rows: [queueRow({ opportunityId: 'opp-stale', name: 'Stale Controls Co' })], total: 1, summary: { ...queueResponse().summary, needsReview: 99 } }))));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Stale Controls Co' })).not.toBeInTheDocument());
+    expect(screen.getByText('Loading current opportunities…')).toBeVisible();
+
     await act(async () => second.resolve(jsonResponse(queueResponse({ rows: [queueRow({ opportunityId: 'opp-current', name: 'Current Controls Co' })], total: 1, summary: { ...queueResponse().summary, needsReview: 7 } }))));
     expect(await screen.findByRole('button', { name: 'Open Current Controls Co' })).toBeVisible();
     expect(screen.getByText('7')).toBeVisible();
-
-    await act(async () => first.resolve(jsonResponse(queueResponse({ rows: [queueRow({ opportunityId: 'opp-stale', name: 'Stale Controls Co' })], total: 1, summary: { ...queueResponse().summary, needsReview: 99 } }))));
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Stale Controls Co' })).not.toBeInTheDocument());
     expect(screen.getByRole('button', { name: 'Open Current Controls Co' })).toBeVisible();
     expect(screen.queryByText('99')).not.toBeInTheDocument();
     expect(screen.queryByText('Loading current opportunities…')).not.toBeInTheDocument();
+  });
+
+  test('refreshes a completed action with the latest visible search and filter controls', async () => {
+    const action = deferred();
+    const visibleQuery = deferred();
+    const queueUrls = [];
+    let actionResolved = false;
+    vi.stubGlobal('fetch', vi.fn((input) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1/action')) return action.promise;
+      if (!url.startsWith('/api/admin/deal-hunter/triage?')) throw new Error(`Unexpected request: ${url}`);
+      queueUrls.push(url);
+      if (queueUrls.length === 1) return Promise.resolve(jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+      if (!actionResolved) return visibleQuery.promise;
+      const params = new URL(url, 'https://admin.example').searchParams;
+      const matchesVisibleControls = params.get('search') === 'fire' && params.get('confidence') === 'low';
+      return Promise.resolve(jsonResponse(queueResponse({
+        rows: [queueRow({
+          opportunityId: matchesVisibleControls ? 'opp-latest' : 'opp-stale',
+          name: matchesVisibleControls ? 'Latest Visible Query' : 'Stale Old Query',
+        })],
+        total: 1,
+      })));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Watch Evergreen Fire Protection' }));
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search opportunities' }), { target: { value: 'fire' } });
+    fireEvent.change(screen.getByLabelText('Confidence'), { target: { value: 'low' } });
+    await waitFor(() => expect(queueUrls.some((url) => url.includes('search=fire') && url.includes('confidence=low'))).toBe(true));
+
+    actionResolved = true;
+    await act(async () => action.resolve(jsonResponse({ success: true, action: 'watch' })));
+
+    expect(await screen.findByRole('button', { name: 'Open Latest Visible Query' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Open Stale Old Query' })).not.toBeInTheDocument();
+    const refreshParams = new URL(queueUrls.at(-1), 'https://admin.example').searchParams;
+    expect(refreshParams.get('search')).toBe('fire');
+    expect(refreshParams.get('confidence')).toBe('low');
   });
 
   test('sends search, filters, sorting, and pagination to the paginated queue boundary', async () => {
@@ -316,6 +360,51 @@ describe('Acquisition Inbox queue', () => {
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Evergreen Fire Protection' })).not.toBeInTheDocument());
   });
 
+  test('cancels a queue-row Pass without issuing an action request', async () => {
+    const writes = [];
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/action')) writes.push(JSON.parse(options.body));
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Pass Evergreen Fire Protection' }));
+    const passDialog = screen.getByRole('dialog', { name: 'Pass Evergreen Fire Protection' });
+    fireEvent.change(within(passDialog).getByLabelText('Pass reason'), { target: { value: 'valuation' } });
+    fireEvent.click(within(passDialog).getByRole('button', { name: 'Cancel' }));
+
+    expect(screen.queryByRole('dialog', { name: 'Pass Evergreen Fire Protection' })).not.toBeInTheDocument();
+    expect(writes).toEqual([]);
+  });
+
+  test('submits queue-row Pass once when the optional note is omitted and submit repeats', async () => {
+    const action = deferred();
+    const writes = [];
+    vi.stubGlobal('fetch', vi.fn((input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/action')) {
+        writes.push({ url, body: JSON.parse(options.body) });
+        return action.promise;
+      }
+      return Promise.resolve(jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Pass Evergreen Fire Protection' }));
+    const passForm = screen.getByRole('form', { name: 'Pass Evergreen Fire Protection' });
+    fireEvent.change(within(passForm).getByLabelText('Pass reason'), { target: { value: 'not strategic' } });
+    fireEvent.submit(passForm);
+    fireEvent.submit(passForm);
+
+    await waitFor(() => expect(writes).toEqual([{
+      url: '/api/admin/deal-hunter/triage/opp-1/action',
+      body: { action: 'pass', reason: 'not strategic', note: '' },
+    }]));
+    await act(async () => action.resolve(jsonResponse({ success: true, action: 'pass', disposition: { disposition: 'dismissed' } })));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Pass Evergreen Fire Protection' })).not.toBeInTheDocument());
+  });
+
   test('keeps loaded detail identity aligned with drawer actions when detail reads resolve in reverse order', async () => {
     const detailA = deferred();
     const detailB = deferred();
@@ -381,6 +470,37 @@ describe('Acquisition Inbox queue', () => {
     await waitFor(() => expect(detailLoads).toBe(2));
     expect(writes).toEqual([{ action: 'watch' }]);
     expect(within(screen.getByRole('dialog', { name: 'Evergreen Fire Protection' })).getAllByText('Watch')).toHaveLength(2);
+  });
+
+  test('does not refresh the old or newly selected detail when selection changes during an action', async () => {
+    const action = deferred();
+    const detailLoads = { 'opp-a': 0, 'opp-b': 0 };
+    const rows = [queueRow({ opportunityId: 'opp-a', name: 'Opportunity A' }), queueRow({ opportunityId: 'opp-b', name: 'Opportunity B' })];
+    vi.stubGlobal('fetch', vi.fn((input) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-a/action')) return action.promise;
+      if (url.endsWith('/triage/opp-a')) {
+        detailLoads['opp-a'] += 1;
+        return Promise.resolve(jsonResponse(detailResponse(rows[0])));
+      }
+      if (url.endsWith('/triage/opp-b')) {
+        detailLoads['opp-b'] += 1;
+        return Promise.resolve(jsonResponse(detailResponse(rows[1])));
+      }
+      return Promise.resolve(jsonResponse(queueResponse({ rows, total: 2 })));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Opportunity A' }));
+    const drawerA = await screen.findByRole('dialog', { name: 'Opportunity A' });
+    fireEvent.click(within(drawerA).getByRole('button', { name: 'Watch Opportunity A' }));
+    fireEvent.click(within(drawerA).getByRole('button', { name: 'Close opportunity detail' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open Opportunity B' }));
+    expect(await screen.findByRole('dialog', { name: 'Opportunity B' })).toBeVisible();
+
+    await act(async () => action.resolve(jsonResponse({ success: true, action: 'watch' })));
+    await waitFor(() => expect(detailLoads).toEqual({ 'opp-a': 1, 'opp-b': 1 }));
+    expect(screen.getByRole('dialog', { name: 'Opportunity B' })).toBeVisible();
   });
 
   test('keeps the queue mounted when an opportunity detail opens and hides writes for viewers', async () => {

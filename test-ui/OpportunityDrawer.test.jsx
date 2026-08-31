@@ -126,6 +126,16 @@ describe('Opportunity drawer', () => {
     expect(within(dialog).getByText(/Deal Hunter Google Sheet reported 425000/)).toBeVisible();
     expect(within(dialog).getByText(/Deal OS reported 390000/)).toBeVisible();
     expect(within(dialog).getByText(/Profit inside target band/)).toBeVisible();
+    expect(within(dialog).getByText('Financial fit')).toBeVisible();
+    expect(within(dialog).getByText('+34')).toBeVisible();
+    expect(within(dialog).getByText(/Scored Aug 29, 2026/)).toBeVisible();
+    expect(within(dialog).getByText(/deal-hunter-fit-v2/)).toBeVisible();
+    expect(within(dialog).getByText(/Class: Observed · Field: Annual Profit · Value: 425000/)).toBeVisible();
+    expect(within(dialog).getByText('Source: Deal Hunter Google Sheet')).toBeVisible();
+    expect(within(dialog).getByRole('link', { name: /Open evidence listing/ })).toHaveAttribute('href', 'https://broker.example/evergreen');
+    expect(within(dialog).getByText(/Gates: Confirm transition support/)).toBeVisible();
+    expect(within(dialog).getByText(/Caps: Concentration is unverified/)).toBeVisible();
+    expect(within(dialog).getByText(/Confidence: Core financial fields are present/)).toBeVisible();
     expect(within(dialog).getByText('88%')).toBeVisible();
     expect(within(dialog).getByText('Reviewed · Current')).toBeVisible();
     expect(within(dialog).getByText(/CRM: Active · CIM: Not Requested/)).toBeVisible();
@@ -138,12 +148,16 @@ describe('Opportunity drawer', () => {
     expect(within(dialog).getByText(/Observed value: regional operators/)).toBeVisible();
     expect(within(dialog).getByText(/Terms: fragmented/)).toBeVisible();
     expect(within(dialog).getByText(/Source record: listing-42/)).toBeVisible();
+    expect(within(dialog).getByText('sheet-9')).toBeVisible();
+    expect(within(dialog).getByText('General manager runs daily operations')).toBeVisible();
+    expect(within(dialog).getByText('Retirement')).toBeVisible();
     expect(within(dialog).getByText(/Conflict: Annual Profit/)).toBeVisible();
     expect(within(dialog).getByText(/CRM fact · Seller Name · Jamie Seller from CRM/)).toBeVisible();
     expect(within(dialog).getByText(/CRM conflict · Broker Name · Alexander Broker · Operator wins/)).toBeVisible();
     expect(within(dialog).getAllByText(/Inbound · Email · Broker Reply · Aug 29, 2026/)).toHaveLength(2);
     expect(within(dialog).getByText(/Outbound · Phone · Seller Call · Aug 28, 2026/)).toBeVisible();
     expect(within(dialog).getByText(/Review state · Reviewed by admin@example.com on Aug 29, 2026/)).toBeVisible();
+    expect(within(dialog).getByText(/Note: Confirm inspection contract retention/)).toBeVisible();
     expect(within(dialog).getByText(/Operator fact · Broker Name · Alex Broker · Verified/)).toBeVisible();
     expect(within(dialog).getByText(/admin@example.com · Aug 29, 2026 · Confirmed by phone/)).toBeVisible();
     expect(within(dialog).getByText(/Event: Deal Hunter Triage Decision/)).toBeVisible();
@@ -163,6 +177,55 @@ describe('Opportunity drawer', () => {
     expect(links[0]).toHaveAttribute('target', '_blank');
     expect(links[0]).toHaveAttribute('rel', expect.stringContaining('noopener'));
     expect(within(dialog).queryByRole('button', { name: /send|stage 2|refresh score|backfill|import/i })).not.toBeInTheDocument();
+  });
+
+  test('keeps all acquisition section headings while omitting empty low-value score and source rows', () => {
+    const sparse = detailFixture();
+    sparse.opportunity = {
+      ...sparse.opportunity,
+      completenessScore: 0,
+      missingEvidenceCount: 0,
+      contradictionCount: 0,
+      topStrength: '',
+      topConcern: '',
+    };
+    sparse.score = {
+      ...sparse.score,
+      summary: { strengths: [], concerns: [] },
+      dimensions: [],
+      unattributedEvidence: [],
+      gates: [],
+      appliedCaps: [],
+      confidenceReasons: [],
+      missingEvidence: [],
+    };
+    sparse.sourceObservations = [{
+      sourceId: 'sparse',
+      sourceName: 'Sparse Source',
+      sourceRecordId: 'sparse-1',
+      observedAt: '',
+      values: { empty_value: '', null_value: null, missing_value: undefined, zero_count: 0, false_flag: false },
+      conflicts: [],
+    }];
+
+    render(<OpportunityDrawer detail={sparse} onClose={vi.fn()} />);
+
+    const dialog = screen.getByRole('dialog', { name: 'Evergreen Fire Protection' });
+    for (const section of ['Overview', 'Business & Financials', 'Broker & Seller', 'Score & Evidence', 'Sources', 'CRM/CIM', 'Notes & History']) {
+      expect(within(dialog).getByRole('heading', { name: section })).toBeVisible();
+    }
+    expect(within(dialog).queryByRole('heading', { name: 'Strengths' })).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole('heading', { name: 'Concerns' })).not.toBeInTheDocument();
+    expect(within(dialog).queryByText('Empty Value')).not.toBeInTheDocument();
+    expect(within(dialog).queryByText('Null Value')).not.toBeInTheDocument();
+    expect(within(dialog).queryByText('Missing Value')).not.toBeInTheDocument();
+    expect(within(dialog).getByText('Zero Count')).toBeVisible();
+    expect(within(dialog).getByText('False Flag')).toBeVisible();
+    const sparseSource = within(dialog).getByRole('heading', { name: 'Sparse Source' }).parentElement.parentElement;
+    expect(within(sparseSource).getByText('0')).toBeVisible();
+    expect(within(sparseSource).getByText('false')).toBeVisible();
+    expect(within(dialog).getByText('0%')).toBeVisible();
+    expect(within(dialog).getByText(/0 missing evidence · 0 contradictions/)).toBeVisible();
   });
 
   test('adds or edits one verified operator fact without exposing machine-owned fields', () => {

@@ -68,7 +68,7 @@ function OpportunityRow({ onAction, onOpen, pending, readOnly, row }) {
       <div className="min-w-0">
         {row.topStrength ? <p className="text-xs leading-5 text-moss">{row.topStrength}</p> : null}
         {row.topConcern ? <p className="mt-1 text-xs leading-5 text-amber-800">{row.topConcern}</p> : null}
-        {!readOnly ? <div className="mt-2"><ActionButtons disabled={pending} name={row.name} onAction={onAction} /></div> : null}
+        {!readOnly && !row.dismissed ? <div className="mt-2"><ActionButtons disabled={pending} name={row.name} onAction={onAction} /></div> : null}
       </div>
     </li>
   );
@@ -99,9 +99,12 @@ export default function AcquisitionInbox({ readOnly = false }) {
   const [detail, setDetail] = useState({ requestedId: '', data: null, loading: false, error: '' });
   const [passTarget, setPassTarget] = useState(null);
   const queueRequestRef = useRef({ generation: 0, controller: null });
+  const queueQueryRef = useRef(null);
   const detailRequestRef = useRef({ generation: 0, controller: null });
   const selectionRef = useRef('');
   const mutationGenerationRef = useRef(0);
+  const mutationPendingRef = useRef(false);
+  queueQueryRef.current = { view, search, confidence, priority, sort, page };
 
   const loadQueue = useCallback(async () => {
     queueRequestRef.current.controller?.abort();
@@ -111,10 +114,11 @@ export default function AcquisitionInbox({ readOnly = false }) {
     setLoading(true);
     setError('');
     try {
-      const params = new URLSearchParams({ view, page: String(page), pageSize: '25', sort, direction: 'desc' });
-      if (search.trim()) params.set('search', search.trim());
-      if (confidence) params.set('confidence', confidence);
-      if (priority) params.set('priority', priority);
+      const { view: currentView, search: currentSearch, confidence: currentConfidence, priority: currentPriority, sort: currentSort, page: currentPage } = queueQueryRef.current;
+      const params = new URLSearchParams({ view: currentView, page: String(currentPage), pageSize: '25', sort: currentSort, direction: 'desc' });
+      if (currentSearch.trim()) params.set('search', currentSearch.trim());
+      if (currentConfidence) params.set('confidence', currentConfidence);
+      if (currentPriority) params.set('priority', currentPriority);
       const response = await fetch(`/api/admin/deal-hunter/triage?${params}`, { credentials: 'same-origin', signal: controller.signal });
       const result = await response.json();
       if (!response.ok || !result.success) throw new Error(result.error || 'Unable to load Acquisition Inbox.');
@@ -131,7 +135,7 @@ export default function AcquisitionInbox({ readOnly = false }) {
         setLoading(false);
       }
     }
-  }, [confidence, page, priority, search, sort, view]);
+  }, []);
 
   useEffect(() => {
     loadQueue();
@@ -139,7 +143,7 @@ export default function AcquisitionInbox({ readOnly = false }) {
       queueRequestRef.current.controller?.abort();
       queueRequestRef.current.generation += 1;
     };
-  }, [loadQueue]);
+  }, [confidence, loadQueue, page, priority, search, sort, view]);
 
   const loadDetail = useCallback(async (opportunityId) => {
     detailRequestRef.current.controller?.abort();
@@ -180,6 +184,8 @@ export default function AcquisitionInbox({ readOnly = false }) {
 
   async function recordAction(opportunityId, action, pass = null) {
     if (action === 'pass' && (!pass?.reason?.trim() || pass.reason.trim().length > 80 || (pass.note || '').length > 2000)) return false;
+    if (mutationPendingRef.current) return false;
+    mutationPendingRef.current = true;
     const mutationGeneration = mutationGenerationRef.current + 1;
     mutationGenerationRef.current = mutationGeneration;
     setPendingId(opportunityId);
@@ -205,12 +211,16 @@ export default function AcquisitionInbox({ readOnly = false }) {
       if (mutationGenerationRef.current === mutationGeneration) setError(actionError.message || 'Unable to record this decision.');
       return false;
     } finally {
-      if (mutationGenerationRef.current === mutationGeneration) setPendingId('');
+      if (mutationGenerationRef.current === mutationGeneration) {
+        mutationPendingRef.current = false;
+        setPendingId('');
+      }
     }
   }
 
   async function saveFact(opportunityId, { field, value, note, verified }) {
-    if (!opportunityId || selectionRef.current !== opportunityId) return false;
+    if (!opportunityId || selectionRef.current !== opportunityId || mutationPendingRef.current) return false;
+    mutationPendingRef.current = true;
     const mutationGeneration = mutationGenerationRef.current + 1;
     mutationGenerationRef.current = mutationGeneration;
     setPendingId(opportunityId);
@@ -228,7 +238,10 @@ export default function AcquisitionInbox({ readOnly = false }) {
       if (mutationGenerationRef.current === mutationGeneration) setError(factError.message || 'Unable to save the verified fact.');
       return false;
     } finally {
-      if (mutationGenerationRef.current === mutationGeneration) setPendingId('');
+      if (mutationGenerationRef.current === mutationGeneration) {
+        mutationPendingRef.current = false;
+        setPendingId('');
+      }
     }
   }
 
