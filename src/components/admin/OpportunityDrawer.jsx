@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ExternalLink, X } from 'lucide-react';
 
 const factFields = [
@@ -42,6 +42,12 @@ function hasValue(value) {
   return value !== null && value !== undefined && (typeof value !== 'string' || value.trim() !== '');
 }
 
+function focusableElements(container) {
+  if (!container) return [];
+  return [...container.querySelectorAll('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+    .filter((element) => !element.hasAttribute('hidden') && element.getAttribute('aria-hidden') !== 'true');
+}
+
 function Section({ children, title, ...props }) {
   return <section className={sectionClass} {...props}><h3 className="text-base font-semibold text-ink">{title}</h3><div className="mt-4">{children}</div></section>;
 }
@@ -62,7 +68,7 @@ function MissingInformation({ fields }) {
   return <section aria-label="Missing Information" className="rounded-xl border border-amber-200 bg-amber-50 p-4"><h4 className="text-sm font-semibold text-amber-950">Missing Information</h4><div className="mt-3 grid gap-2 sm:grid-cols-2">{fields.map((field) => <div className="flex items-center justify-between gap-3 rounded-lg bg-white/70 px-3 py-2 text-sm" key={field}><span className="font-medium text-ink">{missingLabels[field] || formatLabel(field)}</span><span className="text-amber-800">Not provided</span></div>)}</div></section>;
 }
 
-export function PassForm({ name, onCancel, onSubmit, pending = false }) {
+export function PassForm({ error = '', initialFocusRef, name, onCancel, onSubmit, pending = false }) {
   const [draft, setDraft] = useState({ reason: '', note: '' });
   function submit(event) {
     event.preventDefault();
@@ -74,7 +80,8 @@ export function PassForm({ name, onCancel, onSubmit, pending = false }) {
     <form aria-label={`Pass ${name}`} className="rounded-xl border border-red-200 bg-red-50 p-4" onSubmit={submit}>
       <h4 className="text-sm font-semibold text-red-950">Pass on {name}</h4>
       <p className="mt-1 text-xs leading-5 text-red-900/70">The opportunity stays in durable disposition history and can be restored later.</p>
-      <label className="mt-3 block text-xs font-semibold text-ink/62">Pass reason<input aria-label="Pass reason" className="form-control mt-1" maxLength={80} onChange={(event) => setDraft((current) => ({ ...current, reason: event.target.value }))} required value={draft.reason} /></label>
+      {error ? <p className="mt-3 rounded-lg border border-red-200 bg-white/75 p-3 text-sm text-red-800" role="alert">{error}</p> : null}
+      <label className="mt-3 block text-xs font-semibold text-ink/62">Pass reason<input aria-label="Pass reason" className="form-control mt-1" maxLength={80} onChange={(event) => setDraft((current) => ({ ...current, reason: event.target.value }))} ref={initialFocusRef} required value={draft.reason} /></label>
       <label className="mt-3 block text-xs font-semibold text-ink/62">Pass note (optional)<textarea aria-label="Pass note (optional)" className="form-control mt-1 min-h-24" maxLength={2000} onChange={(event) => setDraft((current) => ({ ...current, note: event.target.value }))} value={draft.note} /></label>
       <div className="mt-3 flex flex-wrap gap-2"><button className={`${secondaryButton} text-red-700`} disabled={pending || !draft.reason.trim()} type="submit">Confirm Pass</button>{onCancel ? <button className={secondaryButton} disabled={pending} onClick={onCancel} type="button">Cancel</button> : null}</div>
     </form>
@@ -122,8 +129,10 @@ function conflictKey(observation) {
   return `${observation.sourceId || observation.sourceName}-${observation.sourceRecordId || ''}-${observation.value}`;
 }
 
-export default function OpportunityDrawer({ detail, error = '', loading = false, onAction, onClose, onSaveFact, pending = false, readOnly = false }) {
+export default function OpportunityDrawer({ detail, error = '', focusGuardRef, loading = false, mutationError = '', onAction, onClose, onRetry, onSaveFact, pending = false, readOnly = false }) {
   const [passOpen, setPassOpen] = useState(false);
+  const dialogRef = useRef(null);
+  const closeButtonRef = useRef(null);
   const opportunity = detail?.opportunity;
   const name = opportunity?.name || 'Opportunity detail';
   const safeUrls = [...new Set((detail?.listingUrls || []).map(safeListingUrl).filter(Boolean))];
@@ -132,13 +141,65 @@ export default function OpportunityDrawer({ detail, error = '', loading = false,
   const concerns = (detail?.score?.summary?.concerns || []).filter(hasValue);
   const reviewState = opportunity?.reviewed ? 'Reviewed' : 'Needs Review';
   const changedState = opportunity?.changedSinceReview ? 'Changed' : 'Current';
+  useLayoutEffect(() => {
+    closeButtonRef.current?.focus();
+  }, [loading]);
+  function handleDialogKeyDown(event) {
+    if (event.key === 'Escape' && !pending) {
+      event.preventDefault();
+      onClose?.();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const focusable = focusableElements(dialogRef.current);
+    if (!focusable.length) {
+      event.preventDefault();
+      dialogRef.current?.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+  useEffect(() => {
+    function handleDocumentKeyDown(event) {
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      if (!dialog.contains(document.activeElement)) {
+        if (event.key === 'Tab') {
+          event.preventDefault();
+          closeButtonRef.current?.focus();
+        }
+        return;
+      }
+      handleDialogKeyDown(event);
+    }
+    document.addEventListener('keydown', handleDocumentKeyDown);
+    return () => document.removeEventListener('keydown', handleDocumentKeyDown);
+  });
+  useEffect(() => {
+    function handleDocumentFocusIn(event) {
+      const dialog = dialogRef.current;
+      if (focusGuardRef?.current && dialog && !dialog.contains(event.target)) closeButtonRef.current?.focus();
+    }
+    document.addEventListener('focusin', handleDocumentFocusIn);
+    return () => document.removeEventListener('focusin', handleDocumentFocusIn);
+  }, [focusGuardRef]);
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-ink/30" role="presentation">
-      <section aria-label={name} aria-modal="true" className="h-full w-full overflow-y-auto border-l border-line bg-fog shadow-2xl sm:max-w-3xl" role="dialog">
-        <header className="sticky top-0 z-10 flex items-start justify-between border-b border-line bg-white/95 p-5 backdrop-blur"><div className="min-w-0"><p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-moss">Opportunity View</p><h2 className="mt-1 truncate text-xl font-semibold text-ink">{name}</h2>{opportunity ? <p className="mt-1 text-xs text-ink/58">{opportunity.geography?.label || opportunity.state} · {opportunity.industry}</p> : null}</div><button aria-label="Close opportunity detail" className="rounded-full border border-line bg-white p-2 text-ink/60 hover:text-ink" onClick={onClose} type="button"><X className="h-5 w-5" /></button></header>
+      <section aria-labelledby="opportunity-detail-title" aria-modal="true" className="h-full w-full overflow-y-auto border-l border-line bg-fog shadow-2xl sm:max-w-3xl" ref={dialogRef} role="dialog" tabIndex={-1}>
+        <header className="sticky top-0 z-10 flex items-start justify-between border-b border-line bg-white/95 p-5 backdrop-blur"><div className="min-w-0"><p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-moss">Opportunity View</p><h2 className="mt-1 truncate text-xl font-semibold text-ink" id="opportunity-detail-title">{name}</h2>{opportunity ? <p className="mt-1 text-xs text-ink/58">{opportunity.geography?.label || opportunity.state} · {opportunity.industry}</p> : null}</div><button aria-label="Close opportunity detail" className="rounded-full border border-line bg-white p-2 text-ink/60 hover:text-ink disabled:opacity-50" disabled={pending} onClick={onClose} ref={closeButtonRef} type="button"><X className="h-5 w-5" /></button></header>
         <div className="space-y-5 p-4 sm:p-5">
           {loading ? <p className="text-sm text-ink/62">Loading everything currently known…</p> : null}
           {error ? <p className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{error}</p> : null}
+          {error && onRetry ? <button className={secondaryButton} onClick={onRetry} type="button">Retry opportunity detail</button> : null}
+          {mutationError ? <p className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{mutationError}</p> : null}
           {detail ? <>
             <Section title="Overview">
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">{[
@@ -149,7 +210,7 @@ export default function OpportunityDrawer({ detail, error = '', loading = false,
               {opportunity.observationFreshness ? <p className="mt-3 text-xs text-ink/55">Observed {formatDate(opportunity.observationFreshness)}{opportunity.scoredAt ? ` · Scored ${formatDate(opportunity.scoredAt)}` : ''}{opportunity.rulesVersion ? ` · ${opportunity.rulesVersion}` : ''}</p> : null}
               {opportunity.dismissed ? <p className="mt-3 rounded-xl bg-red-50 p-3 text-sm font-semibold text-red-800">Passed: {formatLabel(opportunity.dismissedReason || 'dismissed')}</p> : null}
               <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} pending={pending} /></div>
-              {passOpen && actionable ? <div className="mt-4"><PassForm name={name} onCancel={() => setPassOpen(false)} onSubmit={(payload) => onAction('pass', payload)} pending={pending} /></div> : null}
+              {passOpen && actionable ? <div className="mt-4"><PassForm error="" name={name} onCancel={() => setPassOpen(false)} onSubmit={(payload) => onAction('pass', payload)} pending={pending} /></div> : null}
               {opportunity.topStrength ? <p className="mt-4 rounded-xl bg-moss/8 p-3 text-sm leading-6 text-moss">{opportunity.topStrength}</p> : null}{opportunity.topConcern ? <p className="mt-2 rounded-xl bg-amber-50 p-3 text-sm leading-6 text-amber-900">{opportunity.topConcern}</p> : null}{detail.missingCriticalFields?.length ? <div className="mt-4"><MissingInformation fields={detail.missingCriticalFields} /></div> : null}
             </Section>
 

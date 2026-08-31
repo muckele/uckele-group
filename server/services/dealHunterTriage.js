@@ -20,6 +20,7 @@ import {
   opportunityFactFields,
   opportunitySourceObservationFields,
 } from './dealHunterOpportunityFacts.js';
+import { getSourceHealth } from './acquisitionCommandCenter.js';
 
 export const triageViews = Object.freeze([
   'needs-review',
@@ -149,6 +150,7 @@ export async function listTriageQueue({
   priority = '',
   state = '',
   storage = getStorage(),
+  getCachedSourceHealth = getSourceHealth,
 } = {}) {
   if (typeof storage.listDealHunterOpportunityScores !== 'function') {
     return { ok: false, status: 503, error: 'Opportunity scoring storage is unavailable.' };
@@ -173,6 +175,7 @@ export async function listTriageQueue({
     priority: priority ? normalizeDealOperatorPriority(priority, '') : '',
     state: normalizeText(state, 12),
   });
+  const sourceHealth = await getCachedSourceHealth(storage, { persistSnapshot: false, refresh: false });
 
   return {
     ok: true,
@@ -186,6 +189,7 @@ export async function listTriageQueue({
     pageSize: result.pageSize,
     totalPages: result.totalPages,
     summary: publicTriageSummary(result.summary),
+    sourceHealth,
     views: triageViews,
     priorities: dealOperatorPriorities,
   };

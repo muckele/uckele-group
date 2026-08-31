@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
 import React from 'react';
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, createEvent, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { HelmetProvider } from 'react-helmet-async';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { afterEach, describe, expect, test, vi } from 'vitest';
@@ -16,6 +16,47 @@ function deferred() {
   let resolve;
   const promise = new Promise((next) => { resolve = next; });
   return { promise, resolve };
+}
+
+function activateWithKeyboard(control, key = 'Enter') {
+  control.focus();
+  const keyDown = createEvent.keyDown(control, { key, code: key === ' ' ? 'Space' : key });
+  fireEvent(control, keyDown);
+  const keyUp = createEvent.keyUp(control, { key, code: key === ' ' ? 'Space' : key });
+  fireEvent(control, keyUp);
+  if (!keyDown.defaultPrevented && control instanceof HTMLButtonElement && (key === 'Enter' || key === ' ')) {
+    fireEvent.click(control, { detail: 0 });
+  }
+}
+
+function typeWithKeyboard(control, text) {
+  control.focus();
+  for (const key of text) {
+    fireEvent.keyDown(control, { key });
+    fireEvent.input(control, { target: { value: `${control.value}${key}` } });
+    fireEvent.keyUp(control, { key });
+  }
+}
+
+function selectWithKeyboard(control, value) {
+  control.focus();
+  fireEvent.keyDown(control, { key: 'ArrowDown', code: 'ArrowDown' });
+  fireEvent.input(control, { target: { value } });
+  fireEvent.change(control, { target: { value } });
+  fireEvent.keyUp(control, { key: 'ArrowDown', code: 'ArrowDown' });
+}
+
+function expectMobileReachable(control, container) {
+  expect(control).toBeVisible();
+  expect(control).not.toHaveAttribute('hidden');
+  expect(control).not.toHaveAttribute('aria-hidden', 'true');
+  for (let node = control; node && node !== document.body; node = node.parentElement) {
+    const className = typeof node.className === 'string' ? node.className : '';
+    expect(node).not.toHaveAttribute('hidden');
+    expect(node).not.toHaveAttribute('aria-hidden', 'true');
+    expect(className).not.toMatch(/(?:^|\s)(?:hidden|max-sm:hidden)(?:\s|$)/);
+  }
+  expect(container.contains(control)).toBe(true);
 }
 
 function detailResponse(row = queueRow()) {
@@ -403,6 +444,541 @@ describe('Acquisition Inbox queue', () => {
     }]));
     await act(async () => action.resolve(jsonResponse({ success: true, action: 'pass', disposition: { disposition: 'dismissed' } })));
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Pass Evergreen Fire Protection' })).not.toBeInTheDocument());
+  });
+
+  test('keeps a persisted queue usable with a degraded cached-source warning and makes no prohibited read-flow request', async () => {
+    const requests = [];
+    const writes = [];
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.endsWith('/action')) {
+        writes.push(JSON.parse(options.body));
+        return jsonResponse({ success: true, action: 'watch' });
+      }
+      return jsonResponse(queueResponse({
+        rows: [queueRow()], total: 1,
+        sourceHealth: { healthy: false, cached: true, issues: [{ title: 'Deal OS is stale', message: 'The last cached export is stale.' }] },
+      }));
+    }));
+
+    renderInbox();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/Deal OS is stale.*last cached export is stale/i);
+    expect(screen.getByRole('button', { name: 'Open Evergreen Fire Protection' })).toBeEnabled();
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search opportunities' }), { target: { value: 'evergreen' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
+    await waitFor(() => expect(writes).toEqual([{ action: 'watch' }]));
+    expect(requests.every((url) => url.startsWith('/api/admin/deal-hunter/triage'))).toBe(true);
+    expect(requests.some((url) => /\/refresh|\/backfill|\/import|\/send|\/stage.?2|\/outreach|\/cim-/i.test(url))).toBe(false);
+  });
+
+  test('keeps queue context in place when detail fails and retries the selected canonical opportunity only', async () => {
+    const reads = [];
+    let detailAttempts = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      const url = String(input);
+      reads.push(url);
+      if (url.endsWith('/triage/opp-1')) {
+        detailAttempts += 1;
+        return detailAttempts === 1
+          ? jsonResponse({ error: 'Detail service is temporarily unavailable.' }, { ok: false, status: 503 })
+          : jsonResponse(detailResponse());
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Opportunity detail' });
+    expect(within(dialog).getByRole('alert')).toHaveTextContent('Detail service is temporarily unavailable.');
+    expect(screen.getByRole('button', { name: 'Open Evergreen Fire Protection' })).toBeVisible();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Retry opportunity detail' }));
+    expect(await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' })).toBeVisible();
+    expect(reads.filter((url) => url.endsWith('/triage/opp-1'))).toHaveLength(2);
+    expect(reads.some((url) => /\/refresh|\/backfill|\/import|\/send|stage.?2|\/outreach|\/cim-/i.test(url))).toBe(false);
+  });
+
+  test('keeps queue Pass input and durable queue content visible after a failed write, then releases the lock for one retry', async () => {
+    const first = deferred();
+    const second = deferred();
+    const writes = [];
+    const reads = [];
+    vi.stubGlobal('fetch', vi.fn((input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/action')) {
+        writes.push(JSON.parse(options.body));
+        return writes.length === 1 ? first.promise : second.promise;
+      }
+      reads.push(url);
+      return Promise.resolve(jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+    }));
+
+    renderInbox();
+    const queuePass = await screen.findByRole('button', { name: 'Pass Evergreen Fire Protection' });
+    expect(screen.getByText('Review: Needs Review')).toBeVisible();
+    expect(screen.getAllByText('Operator: Normal')).toHaveLength(1);
+    expect(screen.queryByText(/^Passed:/)).not.toBeInTheDocument();
+    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+      expect(screen.getByRole('button', { name: action })).toBeEnabled();
+    }
+    fireEvent.click(queuePass);
+    const dialog = screen.getByRole('dialog', { name: 'Pass Evergreen Fire Protection' });
+    fireEvent.change(within(dialog).getByLabelText('Pass reason'), { target: { value: 'valuation' } });
+    fireEvent.change(within(dialog).getByLabelText('Pass note (optional)'), { target: { value: 'Retain the existing record.' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm Pass' }));
+    expect(writes).toHaveLength(1);
+    expect(reads).toHaveLength(1);
+    await act(async () => first.resolve(jsonResponse({ success: false, error: 'Pass could not be saved.' }, { ok: false, status: 409 })));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('Pass could not be saved.');
+    expect(within(dialog).getByLabelText('Pass reason')).toHaveValue('valuation');
+    expect(within(dialog).getByLabelText('Pass note (optional)')).toHaveValue('Retain the existing record.');
+    expect(screen.getByRole('button', { name: 'Open Evergreen Fire Protection' })).toBeVisible();
+    expect(screen.getByText('Review: Needs Review')).toBeVisible();
+    expect(screen.getAllByText('Operator: Normal')).toHaveLength(1);
+    expect(screen.queryByText(/^Passed:/)).not.toBeInTheDocument();
+    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+      expect(screen.getByRole('button', { name: action })).toBeEnabled();
+    }
+    expect(reads).toHaveLength(1);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Confirm Pass' }));
+    expect(writes).toHaveLength(2);
+  });
+
+  test('keeps drawer Pass open with its durable content and draft after a deferred write failure, then permits one retry', async () => {
+    const first = deferred();
+    const second = deferred();
+    const writes = [];
+    const reads = [];
+    const persistedDetail = detailResponse(queueRow());
+    persistedDetail.effectiveFacts = { seller_name: { value: 'Existing durable seller', provenance: 'operator', note: '' } };
+    vi.stubGlobal('fetch', vi.fn((input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/action')) { writes.push(JSON.parse(options.body)); return writes.length === 1 ? first.promise : second.promise; }
+      reads.push(url);
+      return Promise.resolve(url.endsWith('/triage/opp-1') ? jsonResponse(persistedDetail) : jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    expect(within(drawer).getByText('Needs Review · Current')).toBeVisible();
+    expect(within(drawer).getByText('Priority: Normal')).toBeVisible();
+    expect(within(drawer).queryByText(/^Passed:/)).not.toBeInTheDocument();
+    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+      expect(within(drawer).getByRole('button', { name: action })).toBeEnabled();
+    }
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Pass Evergreen Fire Protection' }));
+    const passForm = within(drawer).getByRole('form', { name: 'Pass Evergreen Fire Protection' });
+    fireEvent.change(within(passForm).getByLabelText('Pass reason'), { target: { value: 'valuation' } });
+    fireEvent.click(within(passForm).getByRole('button', { name: 'Confirm Pass' }));
+    expect(writes).toEqual([{ action: 'pass', reason: 'valuation', note: '' }]);
+    expect(reads).toHaveLength(2);
+    await act(async () => first.resolve(jsonResponse({ success: false, error: 'Drawer pass failed.' }, { ok: false, status: 409 })));
+    expect(await within(drawer).findByRole('alert')).toHaveTextContent('Drawer pass failed.');
+    expect(within(passForm).getByLabelText('Pass reason')).toHaveValue('valuation');
+    expect(within(drawer).getByText('Existing durable seller')).toBeVisible();
+    expect(within(drawer).getByText('Needs Review · Current')).toBeVisible();
+    expect(within(drawer).getByText('Priority: Normal')).toBeVisible();
+    expect(within(drawer).queryByText(/^Passed:/)).not.toBeInTheDocument();
+    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+      expect(within(drawer).getByRole('button', { name: action })).toBeEnabled();
+    }
+    expect(reads).toHaveLength(2);
+    fireEvent.click(within(passForm).getByRole('button', { name: 'Confirm Pass' }));
+    expect(writes).toHaveLength(2);
+  });
+
+  test('keeps verified-fact edit open with its prior durable value after a deferred save failure, then permits one retry', async () => {
+    const first = deferred();
+    const second = deferred();
+    const writes = [];
+    const reads = [];
+    const persistedDetail = detailResponse(queueRow());
+    persistedDetail.effectiveFacts = { seller_name: { value: 'Existing durable seller', provenance: 'operator', note: '' } };
+    vi.stubGlobal('fetch', vi.fn((input, options = {}) => {
+      const url = String(input);
+      if (url.includes('/facts/seller_name')) { writes.push(JSON.parse(options.body)); return writes.length === 1 ? first.promise : second.promise; }
+      reads.push(url);
+      return Promise.resolve(url.endsWith('/triage/opp-1') ? jsonResponse(persistedDetail) : jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    fireEvent.change(within(drawer).getByLabelText('Verified fact value'), { target: { value: 'Updated seller' } });
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Save verified fact' }));
+    expect(writes).toHaveLength(1);
+    expect(reads).toHaveLength(2);
+    await act(async () => first.resolve(jsonResponse({ success: false, error: 'Verified fact could not be saved.' }, { ok: false, status: 409 })));
+    expect(await within(drawer).findByRole('alert')).toHaveTextContent('Verified fact could not be saved.');
+    expect(within(drawer).getByLabelText('Verified fact value')).toHaveValue('Updated seller');
+    expect(within(drawer).getByText('Existing durable seller')).toBeVisible();
+    expect(reads).toHaveLength(2);
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Save verified fact' }));
+    expect(writes).toHaveLength(2);
+  });
+
+  test('announces a failed row Watch in queue context without a success refresh and permits one retry', async () => {
+    const first = deferred();
+    const second = deferred();
+    const writes = [];
+    const reads = [];
+    vi.stubGlobal('fetch', vi.fn((input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/action')) { writes.push(JSON.parse(options.body)); return writes.length === 1 ? first.promise : second.promise; }
+      reads.push(url);
+      return Promise.resolve(jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+    }));
+
+    renderInbox();
+    const watch = await screen.findByRole('button', { name: 'Watch Evergreen Fire Protection' });
+    expect(screen.getByText('Review: Needs Review')).toBeVisible();
+    expect(screen.getAllByText('Operator: Normal')).toHaveLength(1);
+    expect(screen.queryByText(/^Passed:/)).not.toBeInTheDocument();
+    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+      expect(screen.getByRole('button', { name: action })).toBeEnabled();
+    }
+    fireEvent.click(watch);
+    expect(writes).toEqual([{ action: 'watch' }]);
+    await act(async () => first.resolve(jsonResponse({ success: false, error: 'Watch could not be saved.' }, { ok: false, status: 409 })));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Watch could not be saved.');
+    expect(reads).toHaveLength(1);
+    expect(screen.getByText('Review: Needs Review')).toBeVisible();
+    expect(screen.getAllByText('Operator: Normal')).toHaveLength(1);
+    expect(screen.queryByText(/^Passed:/)).not.toBeInTheDocument();
+    for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection']) {
+      expect(screen.getByRole('button', { name: action })).toBeEnabled();
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
+    expect(writes).toHaveLength(2);
+  });
+
+  test('traps keyboard focus in drawer and queue Pass dialogs, closes by Escape or controls, and restores each triggering control', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1')) return jsonResponse(detailResponse());
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    const open = await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' });
+    open.focus();
+    fireEvent.click(open);
+    const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    expect(drawer).toHaveAttribute('aria-modal', 'true');
+    const firstDrawerControl = within(drawer).getByRole('button', { name: 'Close opportunity detail' });
+    const lastDrawerControl = within(drawer).getByLabelText('Verification note');
+    await waitFor(() => expect(document.activeElement).toBe(firstDrawerControl));
+    lastDrawerControl.focus();
+    fireEvent.keyDown(lastDrawerControl, { key: 'Tab', code: 'Tab' });
+    expect(document.activeElement).toBe(firstDrawerControl);
+    fireEvent.keyDown(firstDrawerControl, { key: 'Tab', code: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(lastDrawerControl);
+    open.focus();
+    fireEvent.keyDown(open, { key: 'Tab', code: 'Tab' });
+    expect(document.activeElement).toBe(firstDrawerControl);
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Close opportunity detail' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Evergreen Fire Protection' })).not.toBeInTheDocument());
+    expect(document.activeElement).toBe(open);
+
+    fireEvent.click(open);
+    const escapeDrawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    within(escapeDrawer).getByRole('button', { name: 'Close opportunity detail' }).focus();
+    fireEvent.keyDown(document.activeElement, { key: 'Escape', code: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Evergreen Fire Protection' })).not.toBeInTheDocument());
+    expect(document.activeElement).toBe(open);
+
+    const pass = screen.getByRole('button', { name: 'Pass Evergreen Fire Protection' });
+    pass.focus();
+    fireEvent.click(pass);
+    const queueDialog = screen.getByRole('dialog', { name: 'Pass Evergreen Fire Protection' });
+    expect(queueDialog).toHaveAttribute('aria-modal', 'true');
+    expect(document.activeElement).toBe(within(queueDialog).getByLabelText('Pass reason'));
+    fireEvent.keyDown(document.activeElement, { key: 'Tab', code: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(within(queueDialog).getByRole('button', { name: 'Cancel' }));
+    fireEvent.keyDown(document.activeElement, { key: 'Tab', code: 'Tab' });
+    expect(document.activeElement).toBe(within(queueDialog).getByLabelText('Pass reason'));
+    pass.focus();
+    fireEvent.keyDown(pass, { key: 'Tab', code: 'Tab' });
+    expect(document.activeElement).toBe(within(queueDialog).getByLabelText('Pass reason'));
+    fireEvent.click(within(queueDialog).getByRole('button', { name: 'Cancel' }));
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Pass Evergreen Fire Protection' })).not.toBeInTheDocument());
+    expect(document.activeElement).toBe(pass);
+
+    fireEvent.click(pass);
+    const escapeQueueDialog = screen.getByRole('dialog', { name: 'Pass Evergreen Fire Protection' });
+    within(escapeQueueDialog).getByLabelText('Pass reason').focus();
+    fireEvent.keyDown(document.activeElement, { key: 'Escape', code: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Pass Evergreen Fire Protection' })).not.toBeInTheDocument());
+    expect(document.activeElement).toBe(pass);
+  });
+
+  test('immediately redirects background focus before it can activate queue controls behind either modal', async () => {
+    const writes = [];
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/action')) writes.push(JSON.parse(options.body));
+      if (url.endsWith('/triage/opp-1')) return jsonResponse(detailResponse());
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    const open = await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' });
+    const watch = screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' });
+    fireEvent.click(open);
+    const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    const drawerClose = within(drawer).getByRole('button', { name: 'Close opportunity detail' });
+    watch.focus();
+    expect(document.activeElement).toBe(drawerClose);
+    activateWithKeyboard(document.activeElement, 'Enter');
+    expect(writes).toHaveLength(0);
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Evergreen Fire Protection' })).not.toBeInTheDocument());
+
+    const pass = screen.getByRole('button', { name: 'Pass Evergreen Fire Protection' });
+    fireEvent.click(pass);
+    const passDialog = screen.getByRole('dialog', { name: 'Pass Evergreen Fire Protection' });
+    const passReason = within(passDialog).getByLabelText('Pass reason');
+    watch.focus();
+    expect(document.activeElement).toBe(passReason);
+    activateWithKeyboard(document.activeElement, ' ');
+    expect(writes).toHaveLength(0);
+    expect(passDialog).toBeVisible();
+  });
+
+  test('uses the connected triggering control only and falls back to Inbox search after filters remove it', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1')) return jsonResponse(detailResponse());
+      const params = new URL(url, 'https://admin.example').searchParams;
+      return jsonResponse(queueResponse({ rows: params.get('search') ? [] : [queueRow()], total: params.get('search') ? 0 : 1 }));
+    }));
+
+    renderInbox();
+    const open = await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' });
+    fireEvent.click(open);
+    await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search opportunities' }), { target: { value: 'no-match' } });
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Evergreen Fire Protection' })).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: 'Close opportunity detail' }));
+    expect(document.activeElement).toBe(screen.getByRole('searchbox', { name: 'Search opportunities' }));
+  });
+
+  test('confines every Inbox and read-only-detail transition to the exact GET queue/detail allowlist', async () => {
+    const calls = [];
+    let detailAttempts = 0;
+    const fetchMock = vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      calls.push({ method: options.method || 'GET', path: new URL(url, 'https://admin.example').pathname });
+      if (url.endsWith('/triage/opp-1')) {
+        detailAttempts += 1;
+        return detailAttempts === 1
+          ? jsonResponse({ error: 'Temporary detail failure.' }, { ok: false, status: 503 })
+          : jsonResponse(detailResponse());
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 51, totalPages: 3 }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const first = renderInbox();
+    await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' });
+    fireEvent.click(screen.getByRole('tab', { name: 'Watchlist' }));
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search opportunities' }), { target: { value: 'fire' } });
+    fireEvent.change(screen.getByLabelText('Confidence'), { target: { value: 'high' } });
+    fireEvent.change(screen.getByLabelText('Operator priority'), { target: { value: 'watch' } });
+    fireEvent.change(screen.getByLabelText('Sort opportunities'), { target: { value: 'fit-score' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    await waitFor(() => expect(calls.filter(({ path }) => path === '/api/admin/deal-hunter/triage').length).toBeGreaterThan(1));
+    fireEvent.click(screen.getByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    const failedDrawer = await screen.findByRole('dialog', { name: 'Opportunity detail' });
+    fireEvent.click(within(failedDrawer).getByRole('button', { name: 'Retry opportunity detail' }));
+    await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    fireEvent.click(screen.getByRole('button', { name: 'Close opportunity detail' }));
+    first.unmount();
+
+    renderInbox({ readOnly: true });
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    expect(calls).not.toHaveLength(0);
+    expect(calls.every(({ method }) => method === 'GET')).toBe(true);
+    expect(calls.every(({ path }) => path === '/api/admin/deal-hunter/triage' || path === '/api/admin/deal-hunter/triage/opp-1')).toBe(true);
+    expect(calls.filter(({ path }) => path === '/api/admin/deal-hunter/triage/opp-1')).toHaveLength(3);
+  });
+
+  test('keeps all primary mobile controls visible and keyboard-operable at a small viewport', async () => {
+    const originalWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 375 });
+    const detail = detailResponse();
+    let detailAttempts = 0;
+    const writes = [];
+    const queueRequests = [];
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1')) {
+        detailAttempts += 1;
+        return detailAttempts === 1 ? jsonResponse({ error: 'Retry on mobile.' }, { ok: false, status: 503 }) : jsonResponse(detail);
+      }
+      if (url.endsWith('/action') || url.includes('/facts/')) {
+        writes.push({ url, body: JSON.parse(options.body) });
+        return jsonResponse({ success: true, action: JSON.parse(options.body).action });
+      }
+      queueRequests.push(url);
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 51, totalPages: 3 }));
+    }));
+
+    try {
+      renderInbox();
+      await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' });
+      const tablist = screen.getByRole('tablist', { name: 'Opportunity queues' });
+      expect(tablist).toHaveClass('overflow-x-auto');
+      const queueControls = [
+        ...within(tablist).getAllByRole('tab'),
+        screen.getByRole('button', { name: 'Open Evergreen Fire Protection' }),
+        screen.getByRole('button', { name: 'Pursue Evergreen Fire Protection' }),
+        screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }),
+        screen.getByRole('button', { name: 'Pass Evergreen Fire Protection' }),
+        screen.getByRole('button', { name: 'Previous page' }),
+        screen.getByRole('button', { name: 'Next page' }),
+        screen.getByRole('searchbox', { name: 'Search opportunities' }),
+        screen.getByRole('combobox', { name: 'Confidence' }),
+        screen.getByRole('combobox', { name: 'Operator priority' }),
+        screen.getByRole('combobox', { name: 'Sort opportunities' }),
+      ];
+      expect(within(tablist).getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['Needs Review', 'High Priority', 'Watchlist', 'Low Confidence', 'Passed', 'All Current']);
+      for (const control of queueControls) {
+        expectMobileReachable(control, tablist.closest('section'));
+      }
+      expect(screen.getByRole('button', { name: 'Previous page' })).toBeDisabled();
+      for (const tab of within(tablist).getAllByRole('tab')) {
+        activateWithKeyboard(tab, ' ');
+        await waitFor(() => expect(tab).toHaveAttribute('aria-selected', 'true'));
+      }
+      const search = screen.getByRole('searchbox', { name: 'Search opportunities' });
+      typeWithKeyboard(search, 'fire');
+      await waitFor(() => expect(queueRequests.some((url) => new URL(url, 'https://admin.example').searchParams.get('search') === 'fire')).toBe(true));
+      const confidence = screen.getByRole('combobox', { name: 'Confidence' });
+      selectWithKeyboard(confidence, 'high');
+      await waitFor(() => expect(confidence).toHaveValue('high'));
+      const priority = screen.getByRole('combobox', { name: 'Operator priority' });
+      selectWithKeyboard(priority, 'watch');
+      await waitFor(() => expect(priority).toHaveValue('watch'));
+      const sort = screen.getByRole('combobox', { name: 'Sort opportunities' });
+      selectWithKeyboard(sort, 'fit-score');
+      await waitFor(() => expect(sort).toHaveValue('fit-score'));
+      activateWithKeyboard(screen.getByRole('button', { name: 'Next page' }), 'Enter');
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Previous page' })).toBeEnabled());
+      activateWithKeyboard(screen.getByRole('button', { name: 'Previous page' }), ' ');
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Previous page' })).toBeDisabled());
+
+      for (const action of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection']) {
+        const button = screen.getByRole('button', { name: action });
+        activateWithKeyboard(button, 'Enter');
+        await waitFor(() => expect(writes).toHaveLength(action.startsWith('Watch') ? 2 : 1));
+      }
+      const pass = screen.getByRole('button', { name: 'Pass Evergreen Fire Protection' });
+      activateWithKeyboard(pass, ' ');
+      let passDialog = screen.getByRole('dialog', { name: 'Pass Evergreen Fire Protection' });
+      for (const control of [within(passDialog).getByLabelText('Pass reason'), within(passDialog).getByLabelText('Pass note (optional)'), within(passDialog).getByRole('button', { name: 'Confirm Pass' }), within(passDialog).getByRole('button', { name: 'Cancel' })]) expectMobileReachable(control, passDialog);
+      activateWithKeyboard(within(passDialog).getByRole('button', { name: 'Cancel' }), 'Enter');
+      activateWithKeyboard(pass, 'Enter');
+      passDialog = screen.getByRole('dialog', { name: 'Pass Evergreen Fire Protection' });
+      typeWithKeyboard(within(passDialog).getByLabelText('Pass reason'), 'mobile review');
+      activateWithKeyboard(within(passDialog).getByRole('button', { name: 'Confirm Pass' }), ' ');
+      await waitFor(() => expect(writes).toHaveLength(3));
+
+      activateWithKeyboard(screen.getByRole('button', { name: 'Open Evergreen Fire Protection' }), 'Enter');
+      const retryDrawer = await screen.findByRole('dialog', { name: 'Opportunity detail' });
+      const retry = within(retryDrawer).getByRole('button', { name: 'Retry opportunity detail' });
+      expectMobileReachable(retry, retryDrawer);
+      activateWithKeyboard(retry, ' ');
+      let drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+      for (const control of ['Pursue Evergreen Fire Protection', 'Watch Evergreen Fire Protection', 'Pass Evergreen Fire Protection', 'Save verified fact', 'Close opportunity detail']) {
+        expectMobileReachable(within(drawer).getByRole('button', { name: control }), drawer);
+      }
+      expect(drawer).toHaveClass('h-full');
+      expect(drawer).toHaveClass('overflow-y-auto');
+      expect(drawer).not.toHaveClass('hidden');
+      expect(drawer).not.toHaveClass('overflow-hidden');
+      const factValue = within(drawer).getByRole('textbox', { name: 'Verified fact value' });
+      expectMobileReachable(factValue, drawer);
+      typeWithKeyboard(factValue, 'Mobile verified seller');
+      activateWithKeyboard(within(drawer).getByRole('button', { name: 'Save verified fact' }), 'Enter');
+      await waitFor(() => expect(writes).toHaveLength(4));
+      drawer = screen.getByRole('dialog', { name: 'Evergreen Fire Protection' });
+      activateWithKeyboard(within(drawer).getByRole('button', { name: 'Pursue Evergreen Fire Protection' }), 'Enter');
+      await waitFor(() => expect(writes).toHaveLength(5));
+      drawer = screen.getByRole('dialog', { name: 'Evergreen Fire Protection' });
+      activateWithKeyboard(within(drawer).getByRole('button', { name: 'Watch Evergreen Fire Protection' }), ' ');
+      await waitFor(() => expect(writes).toHaveLength(6));
+      drawer = screen.getByRole('dialog', { name: 'Evergreen Fire Protection' });
+      activateWithKeyboard(within(drawer).getByRole('button', { name: 'Pass Evergreen Fire Protection' }), 'Enter');
+      const drawerPassForm = within(drawer).getByRole('form', { name: 'Pass Evergreen Fire Protection' });
+      typeWithKeyboard(within(drawerPassForm).getByLabelText('Pass reason'), 'mobile drawer pass');
+      activateWithKeyboard(within(drawerPassForm).getByRole('button', { name: 'Confirm Pass' }), ' ');
+      await waitFor(() => expect(writes).toHaveLength(7));
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Evergreen Fire Protection' })).not.toBeInTheDocument());
+      activateWithKeyboard(screen.getByRole('button', { name: 'Open Evergreen Fire Protection' }), ' ');
+      drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+      activateWithKeyboard(within(drawer).getByRole('button', { name: 'Close opportunity detail' }), ' ');
+      expect(writes.map(({ body }) => body.action || body.value)).toEqual(['pursue', 'watch', 'pass', 'Mobile verified seller', 'pursue', 'watch', 'pass']);
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalWidth });
+    }
+  });
+
+  test('refuses Escape and explicit drawer Close synchronously while a Pass write is unresolved', async () => {
+    const action = deferred();
+    let close;
+    vi.stubGlobal('fetch', vi.fn((input) => {
+      const url = String(input);
+      if (url.endsWith('/action')) {
+        fireEvent.click(close);
+        return action.promise;
+      }
+      return Promise.resolve(url.endsWith('/triage/opp-1') ? jsonResponse(detailResponse()) : jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Pass Evergreen Fire Protection' }));
+    const form = within(drawer).getByRole('form', { name: 'Pass Evergreen Fire Protection' });
+    fireEvent.change(within(form).getByLabelText('Pass reason'), { target: { value: 'valuation' } });
+    close = within(drawer).getByRole('button', { name: 'Close opportunity detail' });
+    fireEvent.click(within(form).getByRole('button', { name: 'Confirm Pass' }));
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(screen.getByRole('dialog', { name: 'Evergreen Fire Protection' })).toBeVisible();
+    fireEvent.keyDown(close, { key: 'Escape' });
+    fireEvent.click(close);
+    expect(screen.getByRole('dialog', { name: 'Evergreen Fire Protection' })).toBeVisible();
+    await act(async () => action.resolve(jsonResponse({ success: false, error: 'Pass failed.' }, { ok: false, status: 409 })));
+  });
+
+  test('refuses Escape and explicit drawer Close synchronously while a verified-fact write is unresolved', async () => {
+    const save = deferred();
+    let close;
+    vi.stubGlobal('fetch', vi.fn((input) => {
+      const url = String(input);
+      if (url.includes('/facts/seller_name')) {
+        fireEvent.click(close);
+        return save.promise;
+      }
+      return Promise.resolve(url.endsWith('/triage/opp-1') ? jsonResponse(detailResponse()) : jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    fireEvent.change(within(drawer).getByLabelText('Verified fact value'), { target: { value: 'Updated seller' } });
+    close = within(drawer).getByRole('button', { name: 'Close opportunity detail' });
+    const saveButton = within(drawer).getByRole('button', { name: 'Save verified fact' });
+    fireEvent.click(saveButton);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(screen.getByRole('dialog', { name: 'Evergreen Fire Protection' })).toBeVisible();
+    fireEvent.keyDown(close, { key: 'Escape' });
+    fireEvent.click(close);
+    expect(screen.getByRole('dialog', { name: 'Evergreen Fire Protection' })).toBeVisible();
+    await act(async () => save.resolve(jsonResponse({ success: false, error: 'Fact failed.' }, { ok: false, status: 409 })));
   });
 
   test('keeps loaded detail identity aligned with drawer actions when detail reads resolve in reverse order', async () => {

@@ -608,3 +608,20 @@ test('triage reports unavailable storage rather than failing opaquely', async ()
   assert.equal(decision.ok, false);
   assert.equal(decision.status, 503);
 });
+
+test('queue projects cached source health without refreshing source data', async (t) => {
+  const storage = await seedQueue(t);
+  const calls = [];
+  const cachedHealth = { cached: true, healthy: false, issues: [{ title: 'Cached source warning' }], sources: [] };
+  const queue = await listTriageQueue({
+    storage,
+    getCachedSourceHealth: async (...args) => {
+      calls.push(args);
+      return cachedHealth;
+    },
+  });
+
+  assert.equal(queue.ok, true);
+  assert.deepEqual(queue.sourceHealth, cachedHealth);
+  assert.deepEqual(calls, [[storage, { persistSnapshot: false, refresh: false }]], 'queue allows only the non-persisting, non-refreshing cached health read');
+});
