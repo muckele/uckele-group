@@ -248,48 +248,6 @@ export function normalizeOpportunitySourceObservationSnapshot(snapshot = {}) {
 }
 
 /**
- * A complete current projection for one already-resolved canonical opportunity
- * and one source. Unlike the per-source-record snapshot above, this replaces
- * every current record position for that `(opportunity_id, source_id)` scope.
- * It contains only bounded observations, never source raw payloads.
- */
-export function normalizeDealHunterOpportunitySourceSnapshot(snapshot = {}) {
-  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot) || Buffer.isBuffer(snapshot)) {
-    throw new Error('Complete opportunity source-observation snapshot must be an object.');
-  }
-  if (!Array.isArray(snapshot.records)) {
-    throw new Error('Complete opportunity source-observation snapshot records must be an array.');
-  }
-  if (snapshot.records.length === 0) {
-    throw new Error('Complete opportunity source-observation snapshot must include at least one source record.');
-  }
-  if (snapshot.records.length > 10_000) {
-    throw new Error('Complete opportunity source-observation snapshot has too many records.');
-  }
-  const normalized = {
-    opportunity_id: normalizeText(snapshot.opportunity_id, 'Canonical opportunity id', { maxLength: 200 }),
-    source_id: normalizeText(snapshot.source_id, 'Opportunity source id', { maxLength: 160 }),
-    source_name: normalizeText(snapshot.source_name, 'Opportunity source name', { maxLength: 220 }),
-    records: snapshot.records.map(normalizeOpportunitySourceObservationSnapshot),
-  };
-  const recordIds = new Set();
-  for (const record of normalized.records) {
-    if (
-      record.opportunity_id !== normalized.opportunity_id
-      || record.source_id !== normalized.source_id
-      || record.source_name !== normalized.source_name
-    ) {
-      throw new Error('Complete opportunity source-observation snapshot records must share one canonical opportunity and source identity.');
-    }
-    if (recordIds.has(record.source_record_id)) {
-      throw new Error('Complete opportunity source-observation snapshot record identities must be unique.');
-    }
-    recordIds.add(record.source_record_id);
-  }
-  return normalized;
-}
-
-/**
  * A complete current projection for one authoritative source across every
  * canonical opportunity it represented. This is used only after collection
  * proves the raw source is complete and every source record has resolved. Its

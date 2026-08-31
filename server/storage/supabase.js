@@ -2,7 +2,6 @@ import { createClient } from '@supabase/supabase-js';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
 import {
   normalizeDealHunterSourceSnapshot,
-  normalizeDealHunterOpportunitySourceSnapshot,
   normalizeOperatorOpportunityFactRecord,
   normalizeOpportunitySourceObservation,
   normalizeOpportunitySourceObservationSnapshot,
@@ -3147,17 +3146,8 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return (data || []).map(normalizeDealHunterOpportunitySourceObservationRow);
     },
 
-    async replaceDealHunterOpportunitySourceSnapshot(snapshot = {}) {
-      const normalizedSnapshot = normalizeDealHunterOpportunitySourceSnapshot(snapshot);
-      const { data, error } = await client
-        .rpc('replace_deal_hunter_opportunity_source_snapshot', {
-          p_opportunity_id: normalizedSnapshot.opportunity_id,
-          p_source_id: normalizedSnapshot.source_id,
-          p_source_name: normalizedSnapshot.source_name,
-          p_records: normalizedSnapshot.records,
-        });
-      if (error) throw error;
-      return (data || []).map(normalizeDealHunterOpportunitySourceObservationRow);
+    async replaceDealHunterOpportunitySourceSnapshot() {
+      throw new Error('Complete per-opportunity source snapshot replacement is not admitted.');
     },
 
     async replaceDealHunterSourceSnapshot(snapshot = {}) {
