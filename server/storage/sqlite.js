@@ -3663,6 +3663,21 @@ export function createSqliteStorage(config) {
       last_activity_at = COALESCE(excluded.last_activity_at, excluded.updated_at, deal_hunter_cim_requests.last_activity_at),
       metadata = excluded.metadata
   `);
+  const getDealHunterCimRequestConflictStatement = database.prepare(`
+    SELECT id
+    FROM deal_hunter_cim_requests
+    WHERE deal_key = ? AND recipient_email = ?
+    LIMIT 1
+  `);
+  function runDealHunterCimRequestUpsert(request) {
+    const existing = getDealHunterCimRequestConflictStatement.get(request.deal_key, request.recipient_email);
+    if (existing && !normalizeCanonicalCimRequestId(existing.id)) {
+      const error = new Error('A legacy CIM request with a noncanonical CIM request ID cannot be updated.');
+      error.code = 'DEAL_HUNTER_CIM_LEGACY_ID_COLLISION';
+      throw error;
+    }
+    return upsertDealHunterCimRequestStatement.run(request);
+  }
   const insertDealHunterCimRequestStatement = database.prepare(`
     INSERT INTO deal_hunter_cim_requests (
       id,
@@ -4568,7 +4583,7 @@ export function createSqliteStorage(config) {
         };
       }
 
-      upsertDealHunterCimRequestStatement.run({ ...request, submission_id: submissionId });
+      runDealHunterCimRequestUpsert({ ...request, submission_id: submissionId });
       record = normalizeDealHunterCimRequestRow(
         database.prepare('SELECT * FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1').get(request.id),
       );
@@ -4620,7 +4635,7 @@ export function createSqliteStorage(config) {
         };
       }
 
-      upsertDealHunterCimRequestStatement.run(request);
+      runDealHunterCimRequestUpsert(request);
       record = normalizeDealHunterCimRequestRow(
         database
           .prepare('SELECT * FROM deal_hunter_cim_requests WHERE deal_key = ? AND LOWER(recipient_email) = ? LIMIT 1')
@@ -8976,7 +8991,15 @@ export function createSqliteStorage(config) {
       return normalizeDealHunterCimRequestRow(row);
     },
 
-    async listDealHunterCimRequests({ dealKeys = [], opportunityIds = [], recipientEmails = [], statuses = [], dueBefore = '', limit = 1000 } = {}) {
+    async listDealHunterCimRequests({
+      dealKeys = [],
+      opportunityIds = [],
+      recipientEmails = [],
+      statuses = [],
+      dueBefore = '',
+      detailAuthority = false,
+      limit = 1000,
+    } = {}) {
       const keys = normalizeList(dealKeys);
       const canonicalIds = normalizeList(opportunityIds);
       const recipients = normalizeList(recipientEmails).map((value) => value.toLowerCase());
@@ -8992,6 +9015,15 @@ export function createSqliteStorage(config) {
       if (canonicalIds.length > 0) {
         clauses.push(`opportunity_id IN (${placeholders(canonicalIds.length)})`);
         params.push(...canonicalIds);
+      }
+
+      const useDetailAuthority = detailAuthority === true
+        && canonicalIds.length > 0
+        && keys.length === 0
+        && recipients.length === 0
+        && safeStatuses.length === 0
+        && !dueBefore;
+      if (useDetailAuthority) {
         clauses.push('deal_hunter_cim_record_id_sort_key(id) IS NOT NULL');
       }
 
@@ -9012,11 +9044,11 @@ export function createSqliteStorage(config) {
 
       const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
       const safeLimit = Math.max(1, Math.min(Number(limit) || 1000, 100000));
-      // Detail authority supplies canonical opportunity IDs and needs strict
-      // created_at fallback before its bounded candidate window. Scope that
-      // semantic UDF to canonical-opportunity filters; generic CIM listings
-      // retain direct timestamp/ID ordering instead of parsing every row.
-      const orderClause = canonicalIds.length > 0
+      // Only the detail projection explicitly requests strict timestamp and
+      // canonical-ID authority before its bounded candidate window. Generic
+      // opportunity history retains its established provider-native order and
+      // malformed legacy membership for audit and operational safety.
+      const orderClause = useDetailAuthority
         ? `
           ORDER BY
             CASE WHEN deal_hunter_cim_authority_sort_key(updated_at, created_at) IS NULL THEN 1 ELSE 0 END ASC,
@@ -9172,7 +9204,7 @@ export function createSqliteStorage(config) {
 	    async upsertDealHunterCimRequest(request = {}) {
 	      const serialized = serializeDealHunterCimRequest(request);
 	      return database.transaction(() => {
-	        upsertDealHunterCimRequestStatement.run(serialized);
+	        runDealHunterCimRequestUpsert(serialized);
 	        const stored = database.prepare(`
 	          SELECT * FROM deal_hunter_cim_requests
 	          WHERE deal_key = ? AND LOWER(recipient_email) = ?

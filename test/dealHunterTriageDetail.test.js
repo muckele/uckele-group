@@ -597,7 +597,11 @@ test('SQLite detail CIM window applies strict timestamp fallback and ID ordering
     metadata: {},
   });
 
-  const adapterWindow = await storage.listDealHunterCimRequests({ opportunityIds: [opportunityId], limit: 100 });
+  const adapterWindow = await storage.listDealHunterCimRequests({
+    opportunityIds: [opportunityId],
+    detailAuthority: true,
+    limit: 100,
+  });
   assert.equal(adapterWindow.length, 100);
   assert.equal(adapterWindow[0].id, 'cim-000', 'the strict created_at fallback ranks before the equal updated_at group');
   assert.equal(adapterWindow[1].id, 'cim-001', 'equal valid updated_at rows use ascending IDs before the cap');
@@ -668,7 +672,33 @@ test('SQLite detail CIM window excludes legacy noncanonical IDs before its deter
       }
       database.close();
 
-      const adapterWindow = await storage.listDealHunterCimRequests({ opportunityIds: [opportunityId], limit: 100 });
+      const genericWindow = await storage.listDealHunterCimRequests({ opportunityIds: [opportunityId], limit: 100 });
+      assert.deepEqual(genericWindow.slice(0, 5).map((request) => request.id), [
+        null,
+        '',
+        ' cim-000 ',
+        'cim-é',
+        'cim-😀',
+      ], 'generic opportunity history retains malformed legacy rows in provider order');
+      assert.deepEqual(
+        genericWindow.slice(5).map((request) => request.id),
+        canonicalIds.slice(0, 95),
+        'generic opportunity history keeps its established updated_at/id window',
+      );
+
+      const combinedGenericWindow = await storage.listDealHunterCimRequests({
+        opportunityIds: [opportunityId],
+        statuses: ['invalid-padded-authority'],
+        limit: 100,
+      });
+      assert.deepEqual(combinedGenericWindow.map((request) => request.id), [' cim-000 '],
+        'combined generic filters do not silently opt into detail authority');
+
+      const adapterWindow = await storage.listDealHunterCimRequests({
+        opportunityIds: [opportunityId],
+        detailAuthority: true,
+        limit: 100,
+      });
       assert.equal(adapterWindow.length, 100);
       assert.equal(adapterWindow[0].id, 'cim-000');
       assert.equal(adapterWindow.at(-1).id, 'cim-099');
@@ -725,6 +755,111 @@ test('SQLite and Supabase reject new noncanonical CIM IDs while preserving bound
   assert.equal(supabaseUpserts.length, 0, 'invalid IDs are rejected before a Supabase write');
   assert.equal((await supabase.upsertDealHunterCimRequest(request(validId, 'supabase-valid'))).id, validId);
   assert.equal(supabaseUpserts.length, 1);
+});
+
+test('SQLite rejects canonical writes that collide with a malformed legacy CIM primary key without mutation', async (t) => {
+  const actions = [
+    ['public upsert', async (storage, request) => storage.upsertDealHunterCimRequest(request)],
+    ['atomic CIM mutation', async (storage, request, suffix) => storage.mutateWithCrmActivity({
+      operation: 'upsert_deal_hunter_cim_request',
+      payload: { request },
+      activity: {
+        id: `legacy-collision-activity-${suffix}`,
+        submission_id: `legacy-collision-submission-${suffix}`,
+        opportunity_id: request.opportunity_id,
+        created_at: request.updated_at,
+        actor: 'detail-test',
+        role: 'system',
+        event_type: 'cim.delivery-updated',
+        summary: 'This activity must roll back with the rejected legacy collision.',
+        metadata: { mustNotPersist: true },
+      },
+    })],
+  ];
+
+  for (const [label, action] of actions) {
+    await t.test(label, async (t) => {
+      const { storage, opportunityId, sqlitePath } = await detailStorage(t);
+      const suffix = label.toLowerCase().replaceAll(' ', '-');
+      const dealKey = `legacy-collision-${suffix}`;
+      const recipientEmail = `${suffix}@example.test`;
+      const legacyId = ` legacy-${suffix} `;
+      const database = new Database(sqlitePath);
+      t.after(() => database.close());
+      database.prepare(`
+        INSERT INTO deal_hunter_cim_requests (
+          id, created_at, updated_at, opportunity_id, deal_key, recipient_email,
+          requested_by, status, delivery_error, provider_message_id, subject,
+          request_state, delivery_state, follow_up_state, attempt_count,
+          last_activity_at, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        legacyId,
+        '2026-08-31T08:00:00.000Z',
+        '2026-08-31T09:00:00.000Z',
+        opportunityId,
+        dealKey,
+        recipientEmail,
+        'legacy-import',
+        'legacy-pending',
+        'legacy-error',
+        'legacy-provider-id',
+        'Legacy subject',
+        'pending',
+        'not-attempted',
+        'scheduled',
+        7,
+        '2026-08-31T09:00:00.000Z',
+        JSON.stringify({ audit: 'preserve-exactly' }),
+      );
+      const snapshot = () => ({
+        row: database.prepare(`
+          SELECT * FROM deal_hunter_cim_requests
+          WHERE deal_key = ? AND LOWER(recipient_email) = ?
+          LIMIT 1
+        `).get(dealKey, recipientEmail),
+        activityCount: database.prepare('SELECT COUNT(*) AS count FROM crm_activity_events').get().count,
+      });
+      const before = snapshot();
+
+      let caught = null;
+      try {
+        await action(storage, {
+          id: `canonical-${suffix}`,
+          created_at: '2026-08-31T10:00:00.000Z',
+          updated_at: '2026-08-31T11:00:00.000Z',
+          opportunity_id: opportunityId,
+          deal_key: dealKey,
+          recipient_email: recipientEmail,
+          requested_by: 'new-writer',
+          status: 'sent',
+          delivery_error: 'new-error',
+          provider_message_id: 'new-provider-id',
+          subject: 'New subject',
+          request_state: 'provider_accepted',
+          delivery_state: 'accepted',
+          follow_up_state: 'scheduled',
+          attempt_count: 8,
+          last_activity_at: '2026-08-31T11:00:00.000Z',
+          metadata: { audit: 'must-not-replace' },
+        }, suffix);
+      } catch (error) {
+        caught = { code: error.code, message: error.message };
+      }
+
+      assert.deepEqual(
+        { caught, after: snapshot() },
+        {
+          caught: {
+            code: 'DEAL_HUNTER_CIM_LEGACY_ID_COLLISION',
+            message: 'A legacy CIM request with a noncanonical CIM request ID cannot be updated.',
+          },
+          after: before,
+        },
+        'the malformed legacy row and transaction activity remain byte-for-byte unchanged',
+      );
+    });
+  }
 });
 
 test('detail defensively filters noncanonical CIM IDs before status authority and the 100-request response cap', async (t) => {
@@ -801,18 +936,19 @@ test('SQLite generic CIM listing keeps its deterministic updated_at and ID order
   assert.equal(genericWindow.some((request) => request.id === 'generic-cim-000'), false);
 });
 
-test('Supabase routes canonical-opportunity CIM detail reads through the canonical ID policy before the cap', async () => {
+test('Supabase scopes canonical CIM detail authority explicitly and keeps generic opportunity history direct', async () => {
   // Break caught: direct PostgREST ID ordering uses the database collation and
   // does not share SQLite's legacy-ID handling, so the provider can choose a
   // different 100-row detail window before the service comparator runs.
   const calls = [];
+  let directRows = [];
   const query = {
     select() { calls.push(['select']); return this; },
     order(field, options) { calls.push(['order', field, options]); return this; },
     in(field, values) { calls.push(['in', field, values]); return this; },
     async range(start, end) {
       calls.push(['range', start, end]);
-      return { data: [], error: null };
+      return { data: directRows, error: null };
     },
   };
   const storage = createSupabaseStorage(
@@ -825,7 +961,11 @@ test('Supabase routes canonical-opportunity CIM detail reads through the canonic
     },
   );
 
-  assert.deepEqual(await storage.listDealHunterCimRequests({ opportunityIds: ['opp-detail'], limit: 100 }), []);
+  assert.deepEqual(await storage.listDealHunterCimRequests({
+    opportunityIds: ['opp-detail'],
+    detailAuthority: true,
+    limit: 100,
+  }), []);
   assert.deepEqual(calls, [
     ['rpc', 'list_deal_hunter_cim_detail_authority', {
       p_opportunity_ids: ['opp-detail'],
@@ -834,15 +974,39 @@ test('Supabase routes canonical-opportunity CIM detail reads through the canonic
   ]);
 
   calls.length = 0;
-  assert.deepEqual(await storage.listDealHunterCimRequests({ dealKeys: ['deal-detail'], limit: 2 }), []);
+  directRows = [{ id: ' legacy-history ', opportunity_id: 'opp-detail', status: 'legacy-pending', metadata: {} }];
+  assert.deepEqual(
+    (await storage.listDealHunterCimRequests({ opportunityIds: ['opp-detail'], limit: 2 })).map((request) => request.id),
+    [' legacy-history '],
+  );
   assert.deepEqual(calls, [
     ['from', 'deal_hunter_cim_requests'],
     ['select'],
     ['order', 'updated_at', { ascending: false, nullsFirst: false }],
     ['order', 'id', { ascending: true, nullsFirst: false }],
-    ['in', 'deal_key', ['deal-detail']],
+    ['in', 'opportunity_id', ['opp-detail']],
     ['range', 0, 1],
-  ], 'generic listings retain the direct provider query');
+  ], 'generic opportunity history retains the direct provider query');
+
+  calls.length = 0;
+  directRows = [{ id: ' legacy-history ', opportunity_id: 'opp-detail', status: 'legacy-pending', metadata: {} }];
+  assert.deepEqual(
+    (await storage.listDealHunterCimRequests({
+      opportunityIds: ['opp-detail'],
+      statuses: ['legacy-pending'],
+      limit: 2,
+    })).map((request) => request.id),
+    [' legacy-history '],
+  );
+  assert.deepEqual(calls, [
+    ['from', 'deal_hunter_cim_requests'],
+    ['select'],
+    ['order', 'updated_at', { ascending: false, nullsFirst: false }],
+    ['order', 'id', { ascending: true, nullsFirst: false }],
+    ['in', 'opportunity_id', ['opp-detail']],
+    ['in', 'status', ['legacy-pending']],
+    ['range', 0, 1],
+  ], 'combined generic filters do not route through detail authority');
 });
 
 test('detail opportunity consolidates current authoritative identity, source, score, CRM, and CIM values instead of score-row defaults', async (t) => {
@@ -1344,7 +1508,8 @@ test('detail closes every nested projection and strips injected storage metadata
   assert.deepEqual(calls.evidence, [opportunityId, { limit: 500 }], 'evidence read is capped at 500');
   assert.deepEqual(calls.sources, [opportunityId, { limit: 500 }], 'source-observation read is capped at 500');
   assert.deepEqual(calls.facts, [opportunityId, { limit: 100 }], 'operator-fact read is capped at 100');
-  assert.deepEqual(calls.cimRequests, [{ opportunityIds: [opportunityId], limit: 100 }], 'CIM request read is independently capped at 100');
+  assert.deepEqual(calls.cimRequests, [{ opportunityIds: [opportunityId], detailAuthority: true, limit: 100 }],
+    'only the detail service explicitly opts into bounded canonical CIM authority');
   assert.deepEqual(calls.activities, [{ submissionId: 'submission-detail', limit: 100 }], 'CRM activity read is capped at 100');
   assert.equal(calls.dispositions.length, 1);
   assert.equal(calls.dispositions[0].limit, 20, 'disposition read is capped at 20');

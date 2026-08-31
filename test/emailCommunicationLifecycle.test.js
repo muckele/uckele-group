@@ -962,6 +962,7 @@ test('reply events stop the CIM request without overwriting the outbound deliver
     communications: [{
       id: 'communication-reply-1',
       submission_id: 'submission-1',
+      opportunity_id: 'opportunity-reply-1',
       cim_request_id: 'cim-request-reply-1',
       direction: 'outbound',
       channel: 'email',
@@ -974,6 +975,7 @@ test('reply events stop the CIM request without overwriting the outbound deliver
     }],
     cimRequests: [{
       id: 'cim-request-reply-1',
+      opportunity_id: 'opportunity-reply-1',
       status: 'sent',
       request_state: 'provider_accepted',
       follow_up_state: 'pending',
@@ -981,11 +983,21 @@ test('reply events stop the CIM request without overwriting the outbound deliver
       metadata: {},
     }],
   });
+  const cimHistoryCalls = [];
+  storage.listDealHunterCimRequests = async (options) => {
+    cimHistoryCalls.push(clone(options));
+    return storage.state.cimRequests.map(clone);
+  };
   const replied = {
     id: 'payload-replied-id',
     type: 'email.replied',
     created_at: '2026-08-06T18:00:00.000Z',
-    data: { email_id: 'outbound-email-reply-1', from: 'broker@example.com', to: ['deals@example.com'] },
+    data: {
+      email_id: 'outbound-email-reply-1',
+      from: 'broker@example.com',
+      to: ['deals@example.com'],
+      tags: [{ name: 'communication_id', value: 'communication-reply-1' }],
+    },
   };
 
   const result = await recordEmailEventsFromWebhook(sharedSecretRequest(replied), { storage });
@@ -997,6 +1009,8 @@ test('reply events stop the CIM request without overwriting the outbound deliver
   assert.equal(storage.state.cimRequests[0].request_state, 'responded');
   assert.equal(storage.state.cimRequests[0].follow_up_state, 'stopped');
   assert.equal(storage.state.cimRequests[0].next_follow_up_at, null);
+  assert.deepEqual(cimHistoryCalls, [{ opportunityIds: ['opportunity-reply-1'], limit: 500 }],
+    'reply stopping retains generic operational history semantics');
 });
 
 test('suppression is normalized as a terminal non-actionable email outcome', () => {

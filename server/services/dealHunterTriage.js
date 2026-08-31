@@ -589,7 +589,7 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
     currentOpportunity.primary_submission_id && storage.getSubmission
       ? storage.getSubmission(currentOpportunity.primary_submission_id)
       : null,
-    storage.listDealHunterCimRequests?.({ opportunityIds: [id], limit: 100 }) || [],
+    storage.listDealHunterCimRequests?.({ opportunityIds: [id], detailAuthority: true, limit: 100 }) || [],
     currentOpportunity.primary_submission_id && storage.listCrmActivityEvents
       ? storage.listCrmActivityEvents({ submissionId: currentOpportunity.primary_submission_id, limit: 100 })
       : [],

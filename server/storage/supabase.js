@@ -3453,7 +3453,15 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterCimRequestRow(data);
     },
 
-    async listDealHunterCimRequests({ dealKeys = [], opportunityIds = [], recipientEmails = [], statuses = [], dueBefore = '', limit = 1000 } = {}) {
+    async listDealHunterCimRequests({
+      dealKeys = [],
+      opportunityIds = [],
+      recipientEmails = [],
+      statuses = [],
+      dueBefore = '',
+      detailAuthority = false,
+      limit = 1000,
+    } = {}) {
       const keys = normalizeList(dealKeys);
       const canonicalIds = normalizeList(opportunityIds);
       const recipients = normalizeList(recipientEmails).map((value) => value.toLowerCase());
@@ -3461,7 +3469,8 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
 
       const safeLimit = Math.max(1, Math.min(Number(limit) || 1000, 100000));
       if (
-        canonicalIds.length > 0
+        detailAuthority === true
+        && canonicalIds.length > 0
         && keys.length === 0
         && recipients.length === 0
         && safeStatuses.length === 0
