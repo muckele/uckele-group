@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
 import {
+  consumeCompleteGoogleSheetSourceSnapshotAdmission,
   normalizeDealHunterSourceSnapshot,
   normalizeDealHunterOpportunitySourceSnapshot,
   normalizeOperatorOpportunityFactRecord,
@@ -3159,11 +3160,19 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     async replaceDealHunterSourceSnapshot(snapshot = {}) {
+      normalizeDealHunterSourceSnapshot(snapshot);
+      throw new Error('Complete Google Sheet source snapshot admission is required.');
+    },
+
+    async replaceAdmittedCompleteGoogleSheetSourceSnapshot(snapshot = {}) {
+      const admission = consumeCompleteGoogleSheetSourceSnapshotAdmission({
+        admission: snapshot.admission,
+        snapshot,
+      });
       const normalizedSnapshot = normalizeDealHunterSourceSnapshot(snapshot);
       const { data, error } = await client
-        .rpc('replace_deal_hunter_source_snapshot', {
-          p_source_id: normalizedSnapshot.source_id,
-          p_source_name: normalizedSnapshot.source_name,
+        .rpc('replace_admitted_complete_google_sheet_source_snapshot', {
+          p_admission: admission,
           p_records: normalizedSnapshot.records,
         });
       if (error) throw error;

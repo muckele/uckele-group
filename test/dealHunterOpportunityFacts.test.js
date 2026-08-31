@@ -9,6 +9,7 @@ import { createSqliteStorage } from '../server/storage/sqlite.js';
 import {
   getEffectiveOpportunityFacts,
   buildOpportunitySourceObservationSnapshot,
+  createCompleteGoogleSheetSourceSnapshotAdmission,
   opportunityFactFields,
   opportunitySourceObservationFields,
   normalizeOpportunityFactField,
@@ -32,6 +33,10 @@ const opportunitySourceObservationSnapshotMigrationUrl = new URL(
 );
 const opportunitySourceSnapshotReconciliationMigrationUrl = new URL(
   '../supabase/migrations/20260830210000_deal_hunter_source_snapshot_reconciliation.sql',
+  import.meta.url,
+);
+const sourceSnapshotAdmissionMigrationUrl = new URL(
+  '../supabase/migrations/20260831090000_deal_hunter_source_snapshot_admission.sql',
   import.meta.url,
 );
 const currentOperatorFactMigrationUrl = new URL(
@@ -102,14 +107,30 @@ function completeOpportunitySourceSnapshot({
 }
 
 function completeSourceSnapshot({
-  sourceId = 'deal-hunter-sheet',
-  sourceName = 'Deal Hunter Google Sheet',
+  sourceId = 'sheet-0',
+  sourceName = 'SMB Deal Hunter Google Sheet',
   records = [observationSnapshot({ source_id: sourceId, source_name: sourceName })],
 } = {}) {
   return {
     source_id: sourceId,
     source_name: sourceName,
-    records,
+    records: records.map((record) => ({
+      ...record,
+      source_id: sourceId,
+      source_name: sourceName,
+      observations: record.observations.map((observation) => ({
+        ...observation,
+        source_id: sourceId,
+        source_name: sourceName,
+      })),
+    })),
+  };
+}
+
+function admittedCompleteSourceSnapshot(snapshot) {
+  return {
+    ...snapshot,
+    admission: createCompleteGoogleSheetSourceSnapshotAdmission(snapshot),
   };
 }
 
@@ -324,14 +345,16 @@ function constrainedSupabaseBoundary() {
             row.opportunity_id === payload.p_opportunity_id && row.source_id === payload.p_source_id
           )), error: null };
         }
-        if (name === 'replace_deal_hunter_source_snapshot') {
+        if (name === 'replace_admitted_complete_google_sheet_source_snapshot') {
           const incomingRecords = Array.isArray(payload.p_records) ? payload.p_records : [];
+          const sourceId = payload.p_admission?.source_id;
+          const sourceName = payload.p_admission?.source_name;
           const snapshotRows = incomingRecords.flatMap((record) => (
             (Array.isArray(record.observations) ? record.observations : []).map((observation) => ({
               id: observation.id,
               opportunity_id: record.opportunity_id,
-              source_id: payload.p_source_id,
-              source_name: payload.p_source_name,
+              source_id: sourceId,
+              source_name: sourceName,
               source_record_id: record.source_record_id,
               field: observation.field,
               value: observation.value,
@@ -343,7 +366,7 @@ function constrainedSupabaseBoundary() {
           const nextObservations = new Map(observations);
           const nextIds = new Map(observationKeysById);
           for (const [key, row] of nextObservations) {
-            if (row.source_id === payload.p_source_id) {
+            if (row.source_id === sourceId) {
               nextObservations.delete(key);
               nextIds.delete(row.id);
             }
@@ -363,7 +386,7 @@ function constrainedSupabaseBoundary() {
           for (const [key, row] of nextObservations) observations.set(key, row);
           observationKeysById.clear();
           for (const [id, key] of nextIds) observationKeysById.set(id, key);
-          return { data: [...nextObservations.values()].filter((row) => row.source_id === payload.p_source_id), error: null };
+          return { data: [...nextObservations.values()].filter((row) => row.source_id === sourceId), error: null };
         }
         throw new Error(`Unexpected RPC: ${name}`);
       },
@@ -1158,7 +1181,7 @@ test('SQLite complete source snapshot removes observations for an absent canonic
   await seedOpportunity(storage);
   await seedOpportunity(storage, removedOpportunityId);
 
-  await storage.replaceDealHunterSourceSnapshot(completeSourceSnapshot({
+  const initialSnapshot = completeSourceSnapshot({
     records: [
       observationSnapshot({
         id: 'source-scope-retained',
@@ -1174,7 +1197,8 @@ test('SQLite complete source snapshot removes observations for an absent canonic
         value: '500000',
       }),
     ],
-  }));
+  });
+  await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(admittedCompleteSourceSnapshot(initialSnapshot));
   await storage.upsertDealHunterOpportunitySourceObservation(observationRecord({
     id: 'source-scope-deal-os',
     opportunity_id: removedOpportunityId,
@@ -1193,18 +1217,155 @@ test('SQLite complete source snapshot removes observations for an absent canonic
       value: '475000',
     })],
   });
-  await storage.replaceDealHunterSourceSnapshot(retainedSnapshot);
+  await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(admittedCompleteSourceSnapshot(retainedSnapshot));
   const removedAfter = await storage.listDealHunterOpportunitySourceObservations(removedOpportunityId);
-  assert.equal(removedAfter.some((row) => row.source_id === 'deal-hunter-sheet'), false);
+  assert.equal(removedAfter.some((row) => row.source_id === 'sheet-0'), false);
   assert.equal(removedAfter.some((row) => row.source_id === 'deal-os-export' && row.value === '505000'), true);
 
   const retainedAfter = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
   assert.deepEqual(
-    retainedAfter.filter((row) => row.source_id === 'deal-hunter-sheet').map((row) => [row.source_record_id, row.value]),
+    retainedAfter.filter((row) => row.source_id === 'sheet-0').map((row) => [row.source_record_id, row.value]),
     [['sheet-row:1', '475000']],
   );
-  await storage.replaceDealHunterSourceSnapshot(retainedSnapshot);
+  await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(admittedCompleteSourceSnapshot(retainedSnapshot));
   assert.deepEqual(await storage.listDealHunterOpportunitySourceObservations(removedOpportunityId), removedAfter);
+});
+
+test('SQLite rejects generic, empty, or non-Sheet source-wide replacement commands without changing either last-good source', async (t) => {
+  // Break caught: a generic storage caller can name any source and make a
+  // nonempty source-record wrapper with no observations, turning source-wide
+  // reconciliation into a broad delete command. Both malformed and
+  // unadmitted/non-Sheet requests must fail before the SQLite transaction.
+  const storage = withStorage(t);
+  await seedOpportunity(storage);
+  await storage.upsertDealHunterOpportunitySourceObservation(observationRecord({
+    id: 'admission-sheet-last-good',
+    source_id: 'sheet-0',
+    source_name: 'SMB Deal Hunter Google Sheet',
+    source_record_id: 'sheet-row:1',
+    field: 'annual_profit',
+    value: '450000',
+  }));
+  await storage.upsertDealHunterOpportunitySourceObservation(observationRecord({
+    id: 'admission-deal-os-last-good',
+    source_id: 'deal-os-export',
+    source_name: 'Deal OS Export',
+    source_record_id: 'external:DEAL-OS-1',
+    field: 'annual_profit',
+    value: '500000',
+  }));
+  const before = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  const emptySheetRecord = {
+    opportunity_id: opportunityId,
+    source_id: 'sheet-0',
+    source_name: 'SMB Deal Hunter Google Sheet',
+    source_record_id: 'sheet-row:1',
+    observations: [],
+  };
+  const unadmittedDealOs = completeSourceSnapshot({
+    sourceId: 'deal-os-export',
+    sourceName: 'Deal OS Export',
+    records: [observationSnapshot({
+      id: 'admission-deal-os-replacement',
+      source_id: 'deal-os-export',
+      source_name: 'Deal OS Export',
+      source_record_id: 'external:DEAL-OS-1',
+      field: 'annual_profit',
+      value: '555000',
+    })],
+  });
+
+  const outcomes = await Promise.all([
+    storage.replaceDealHunterSourceSnapshot({
+      source_id: 'sheet-0',
+      source_name: 'SMB Deal Hunter Google Sheet',
+      records: [emptySheetRecord],
+    }).then(() => 'fulfilled', (error) => error.message),
+    storage.replaceDealHunterSourceSnapshot(unadmittedDealOs)
+      .then(() => 'fulfilled', (error) => error.message),
+  ]);
+
+  assert.deepEqual(outcomes, [
+    'Complete source-observation snapshot records must include at least one observation.',
+    'Complete Google Sheet source snapshot admission is required.',
+  ]);
+  assert.deepEqual(
+    await storage.listDealHunterOpportunitySourceObservations(opportunityId),
+    before,
+    'all rejected source-wide commands leave both Sheet and Deal OS last-good observations byte-for-byte unchanged',
+  );
+});
+
+test('SQLite consumes complete-Sheet admissions on first attempt and rejects payload mismatch, replay, and cross-source use before mutation', async (t) => {
+  // Break caught: an opaque admission can be replayed or rebound to a different
+  // source/payload after the collector proved a complete Sheet result.
+  const storage = withStorage(t);
+  await seedOpportunity(storage);
+  await storage.upsertDealHunterOpportunitySourceObservation(observationRecord({
+    id: 'capability-sheet-last-good',
+    source_id: 'sheet-0',
+    source_name: 'SMB Deal Hunter Google Sheet',
+    source_record_id: 'sheet-row:1',
+    field: 'annual_profit',
+    value: '450000',
+  }));
+  await storage.upsertDealHunterOpportunitySourceObservation(observationRecord({
+    id: 'capability-deal-os-last-good',
+    source_id: 'deal-os-export',
+    source_name: 'Deal OS Export',
+    source_record_id: 'external:DEAL-OS-1',
+    field: 'annual_profit',
+    value: '500000',
+  }));
+  const before = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  const admittedSheet = completeSourceSnapshot({
+    records: [observationSnapshot({ id: 'capability-sheet-new', source_record_id: 'sheet-row:1', field: 'annual_profit', value: '475000' })],
+  });
+  const tamperedSheet = completeSourceSnapshot({
+    records: [observationSnapshot({ id: 'capability-sheet-tampered', source_record_id: 'sheet-row:1', field: 'annual_profit', value: '490000' })],
+  });
+  await assert.rejects(
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(admittedSheet),
+    /admission is required/,
+    'the admitted storage entrypoint must also reject an absent capability',
+  );
+  assert.deepEqual(await storage.listDealHunterOpportunitySourceObservations(opportunityId), before);
+  const mismatchedAdmission = createCompleteGoogleSheetSourceSnapshotAdmission(admittedSheet);
+  await assert.rejects(
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...tamperedSheet, admission: mismatchedAdmission }),
+    /does not match the normalized source payload/,
+  );
+  await assert.rejects(
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...admittedSheet, admission: mismatchedAdmission }),
+    /admission is required/,
+    'a tampered first attempt consumes the one-shot capability',
+  );
+  assert.deepEqual(await storage.listDealHunterOpportunitySourceObservations(opportunityId), before);
+
+  const crossSource = completeSourceSnapshot({
+    sourceId: 'deal-os-export',
+    sourceName: 'Deal OS Export',
+    records: [observationSnapshot({ id: 'capability-deal-os-new', source_record_id: 'external:DEAL-OS-1', field: 'annual_profit', value: '555000' })],
+  });
+  const crossSourceAdmission = createCompleteGoogleSheetSourceSnapshotAdmission(admittedSheet);
+  await assert.rejects(
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...crossSource, admission: crossSourceAdmission }),
+    /deterministic Sheet source slot/,
+  );
+  assert.deepEqual(await storage.listDealHunterOpportunitySourceObservations(opportunityId), before);
+
+  const validAdmission = createCompleteGoogleSheetSourceSnapshotAdmission(admittedSheet);
+  await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...admittedSheet, admission: validAdmission });
+  const afterValid = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  assert.deepEqual(
+    afterValid.map((row) => [row.source_id, row.value]).sort((left, right) => left.join('|').localeCompare(right.join('|'))),
+    [['deal-os-export', '500000'], ['sheet-0', '475000']],
+  );
+  await assert.rejects(
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...admittedSheet, admission: validAdmission }),
+    /admission is required/,
+  );
+  assert.deepEqual(await storage.listDealHunterOpportunitySourceObservations(opportunityId), afterValid, 'a replay is rejected before opening SQLite mutation');
 });
 
 test('SQLite complete source snapshot rolls back source-wide stale deletion and incoming writes together', async (t) => {
@@ -1221,12 +1382,13 @@ test('SQLite complete source snapshot rolls back source-wide stale deletion and 
   const removedOpportunityId = 'opp-facts-sourcewide-rollback-removed';
   await seedOpportunity(storage);
   await seedOpportunity(storage, removedOpportunityId);
-  await storage.replaceDealHunterSourceSnapshot(completeSourceSnapshot({
+  const initialSnapshot = completeSourceSnapshot({
     records: [
       observationSnapshot({ id: 'sourcewide-rollback-old-retained', source_record_id: 'sheet-row:1', field: 'annual_profit', value: '450000' }),
       observationSnapshot({ id: 'sourcewide-rollback-old-removed', opportunity_id: removedOpportunityId, source_record_id: 'sheet-row:2', field: 'annual_profit', value: '500000' }),
     ],
-  }));
+  });
+  await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(admittedCompleteSourceSnapshot(initialSnapshot));
   const beforeRetained = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
   const beforeRemoved = await storage.listDealHunterOpportunitySourceObservations(removedOpportunityId);
 
@@ -1242,9 +1404,9 @@ test('SQLite complete source snapshot rolls back source-wide stale deletion and 
   database.close();
 
   await assert.rejects(
-    storage.replaceDealHunterSourceSnapshot(completeSourceSnapshot({
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(admittedCompleteSourceSnapshot(completeSourceSnapshot({
       records: [observationSnapshot({ id: 'sourcewide-rollback-new-retained', source_record_id: 'sheet-row:3', field: 'annual_profit', value: '475000' })],
-    })),
+    }))),
     /injected complete source snapshot sourcewide failure/,
   );
   assert.deepEqual(await storage.listDealHunterOpportunitySourceObservations(opportunityId), beforeRetained);
@@ -1310,7 +1472,7 @@ test('Supabase complete source snapshot uses one constrained RPC and removes an 
       observationSnapshot({ id: 'supabase-source-removed', opportunity_id: removedOpportunityId, source_record_id: 'sheet-row:2', field: 'annual_profit', value: '500000' }),
     ],
   });
-  await storage.replaceDealHunterSourceSnapshot(first);
+  await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(admittedCompleteSourceSnapshot(first));
   await storage.upsertDealHunterOpportunitySourceObservation(observationRecord({
     id: 'supabase-source-removed-deal-os',
     opportunity_id: removedOpportunityId,
@@ -1324,26 +1486,128 @@ test('Supabase complete source snapshot uses one constrained RPC and removes an 
   const retained = completeSourceSnapshot({
     records: [observationSnapshot({ id: 'supabase-source-retained', source_record_id: 'sheet-row:1', field: 'annual_profit', value: '475000' })],
   });
-  await storage.replaceDealHunterSourceSnapshot(retained);
+  await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(admittedCompleteSourceSnapshot(retained));
   assert.deepEqual(boundary.calls.map((call) => call.name), [
-    'replace_deal_hunter_source_snapshot',
+    'replace_admitted_complete_google_sheet_source_snapshot',
     'upsert_deal_hunter_opportunity_source_observation',
-    'replace_deal_hunter_source_snapshot',
+    'replace_admitted_complete_google_sheet_source_snapshot',
   ]);
   assert.deepEqual(boundary.calls[2].payload, {
-    p_source_id: 'deal-hunter-sheet',
-    p_source_name: 'Deal Hunter Google Sheet',
+    p_admission: boundary.calls[2].payload.p_admission,
     p_records: retained.records,
+  });
+  assert.deepEqual(boundary.calls[2].payload.p_admission, {
+    policy: 'complete-google-sheet-source-snapshot-v1',
+    source_id: 'sheet-0',
+    source_name: 'SMB Deal Hunter Google Sheet',
+    source_slot: 0,
+    record_count: 1,
+    observation_count: 1,
+    source_record_ids: ['sheet-row:1'],
+    snapshot_digest: boundary.calls[2].payload.p_admission.snapshot_digest,
   });
   assert.deepEqual(
     [...boundary.observations.values()]
       .map((row) => [row.opportunity_id, row.source_id, row.source_record_id, row.field, row.value])
       .sort((left, right) => left.join('\u0000').localeCompare(right.join('\u0000'))),
     [
-      [opportunityId, 'deal-hunter-sheet', 'sheet-row:1', 'annual_profit', '475000'],
+      [opportunityId, 'sheet-0', 'sheet-row:1', 'annual_profit', '475000'],
       [removedOpportunityId, 'deal-os-export', 'external:DEAL-OS-REMOVED', 'annual_profit', '505000'],
     ],
   );
+});
+
+test('Supabase rejects malformed or unadmitted source-wide snapshot commands before issuing an RPC', async () => {
+  // Break caught: client-side normalization accepts an empty record wrapper or
+  // arbitrary source ID, then invokes a broad server-side delete RPC. The
+  // adapter must reject both shapes locally without touching the RPC boundary.
+  const boundary = constrainedSupabaseBoundary();
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: boundary.client },
+  );
+  const emptySheetRecord = {
+    opportunity_id: opportunityId,
+    source_id: 'sheet-0',
+    source_name: 'SMB Deal Hunter Google Sheet',
+    source_record_id: 'sheet-row:1',
+    observations: [],
+  };
+  const unadmittedDealOs = completeSourceSnapshot({
+    sourceId: 'deal-os-export',
+    sourceName: 'Deal OS Export',
+    records: [observationSnapshot({
+      id: 'supabase-admission-deal-os',
+      source_id: 'deal-os-export',
+      source_name: 'Deal OS Export',
+      source_record_id: 'external:DEAL-OS-1',
+      field: 'annual_profit',
+      value: '555000',
+    })],
+  });
+
+  const outcomes = await Promise.all([
+    storage.replaceDealHunterSourceSnapshot({
+      source_id: 'sheet-0',
+      source_name: 'SMB Deal Hunter Google Sheet',
+      records: [emptySheetRecord],
+    }).then(() => 'fulfilled', (error) => error.message),
+    storage.replaceDealHunterSourceSnapshot(unadmittedDealOs)
+      .then(() => 'fulfilled', (error) => error.message),
+  ]);
+
+  assert.deepEqual(outcomes, [
+    'Complete source-observation snapshot records must include at least one observation.',
+    'Complete Google Sheet source snapshot admission is required.',
+  ]);
+  assert.deepEqual(boundary.calls, [], 'invalid source-wide commands must not reach the Supabase RPC boundary');
+});
+
+test('Supabase consumes complete-Sheet admissions once and rejects mismatch, replay, and cross-source use before RPC', async () => {
+  // Break caught: the remote adapter forwards a capability-shaped object after
+  // it has been rebound, or sends a second broad-replacement RPC on replay.
+  const boundary = constrainedSupabaseBoundary();
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: boundary.client },
+  );
+  const admittedSheet = completeSourceSnapshot({
+    records: [observationSnapshot({ id: 'supabase-capability-sheet-new', source_record_id: 'sheet-row:1', field: 'annual_profit', value: '475000' })],
+  });
+  const tamperedSheet = completeSourceSnapshot({
+    records: [observationSnapshot({ id: 'supabase-capability-sheet-tampered', source_record_id: 'sheet-row:1', field: 'annual_profit', value: '490000' })],
+  });
+  await assert.rejects(
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(admittedSheet),
+    /admission is required/,
+  );
+  const mismatchAdmission = createCompleteGoogleSheetSourceSnapshotAdmission(admittedSheet);
+  await assert.rejects(
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...tamperedSheet, admission: mismatchAdmission }),
+    /does not match the normalized source payload/,
+  );
+  const crossSource = completeSourceSnapshot({
+    sourceId: 'deal-os-export',
+    sourceName: 'Deal OS Export',
+    records: [observationSnapshot({ id: 'supabase-capability-deal-os-new', source_record_id: 'external:DEAL-OS-1', field: 'annual_profit', value: '555000' })],
+  });
+  await assert.rejects(
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({
+      ...crossSource,
+      admission: createCompleteGoogleSheetSourceSnapshotAdmission(admittedSheet),
+    }),
+    /deterministic Sheet source slot/,
+  );
+  assert.deepEqual(boundary.calls, [], 'absent, mismatched, and non-Sheet admissions must not reach the RPC boundary');
+
+  const validAdmission = createCompleteGoogleSheetSourceSnapshotAdmission(admittedSheet);
+  await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...admittedSheet, admission: validAdmission });
+  assert.deepEqual(boundary.calls.map((call) => call.name), ['replace_admitted_complete_google_sheet_source_snapshot']);
+  await assert.rejects(
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...admittedSheet, admission: validAdmission }),
+    /admission is required/,
+  );
+  assert.equal(boundary.calls.length, 1, 'a replay must not issue a second RPC');
 });
 
 test('Supabase source-observation snapshot replacement is one constrained RPC with SQLite-equivalent replacement semantics', async () => {
@@ -1449,23 +1713,23 @@ test('Supabase complete opportunity/source reconciliation is source-scoped, lock
   assert.doesNotMatch(migration, /alter table|create table|drop table/i, 'function-only forward migration preserves existing durable observations');
 });
 
-test('Supabase complete Sheet-source reconciliation removes absent canonical opportunities only within the proven source boundary', () => {
-  // Break caught: an opportunity-scoped reconciler cannot remove a business
-  // absent entirely from a complete Sheet run. The source-wide RPC must remain
-  // bounded to `source_id`, serialize against narrower writers, and match the
-  // fresh schema exactly.
-  const migration = fs.readFileSync(opportunitySourceSnapshotReconciliationMigrationUrl, 'utf8');
+test('Supabase complete Sheet-source reconciliation retains original source-wide atomic semantics behind the admission boundary', () => {
+  // Break caught: retiring the generic RPC accidentally weakens source-wide
+  // reconciliation, leaves its internal helper callable, or changes the
+  // lock/delete semantics that remove a business absent from a complete run.
+  const originalMigration = fs.readFileSync(opportunitySourceSnapshotReconciliationMigrationUrl, 'utf8');
+  const admissionMigration = fs.readFileSync(sourceSnapshotAdmissionMigrationUrl, 'utf8');
   const schema = fs.readFileSync(supabaseSchemaUrl, 'utf8');
   const normalizeSql = (sql) => sql.replace(/--[^\n]*/g, '').replace(/\s+/g, ' ').trim();
-  for (const [label, sql] of [['migration', migration], ['fresh schema', schema]]) {
-    const definition = rpcDefinition(sql, 'replace_deal_hunter_source_snapshot');
+  const original = rpcDefinition(originalMigration, 'replace_deal_hunter_source_snapshot');
+  const internal = rpcDefinition(schema, 'replace_deal_hunter_source_snapshot_internal');
+  for (const [label, definition] of [['original source-wide RPC', original], ['fresh-schema internal helper', internal]]) {
     assert.match(definition, /returns setof public\.deal_hunter_opportunity_source_observations/i, `${label} must return the reconciled complete source`);
-    assert.match(definition, /security definer/i, `${label} must retain server-owned deletion`);
+    assert.match(definition, /security definer/i, `${label} must keep atomic replacement server-owned`);
     assert.match(definition, /set search_path = public/i, `${label} must pin the definer search path`);
     assert.match(definition, /jsonb_array_elements\(p_records\)/i, `${label} must derive the full current source payload from every record`);
-    assert.match(definition, /record\.value ->> 'opportunity_id'/i, `${label} must preserve each canonical opportunity identity inside the source payload`);
     assert.match(definition, /stored\.source_id = p_source_id/i, `${label} must delete only rows owned by the authoritative source ID`);
-    assert.doesNotMatch(definition, /stored\.opportunity_id = p_opportunity_id/i, `${label} must be able to remove an opportunity absent from the new source payload`);
+    assert.doesNotMatch(definition, /stored\.opportunity_id = p_opportunity_id/i, `${label} must remove an opportunity absent from the new source payload`);
     assert.match(definition, /on conflict \(opportunity_id, source_id, source_record_id, field\) do update/i, `${label} must preserve durable identities for retained source records`);
     assert.match(
       definition,
@@ -1476,31 +1740,55 @@ test('Supabase complete Sheet-source reconciliation removes absent canonical opp
     const deleteIndex = definition.search(/delete from public\.deal_hunter_opportunity_source_observations/i);
     const insertIndex = definition.search(/insert into public\.deal_hunter_opportunity_source_observations/i);
     assert.ok(lockIndex >= 0 && lockIndex < deleteIndex && lockIndex < insertIndex, `${label} must lock before full-source reconciliation`);
-    assert.match(sql, /revoke all privileges on function public\.replace_deal_hunter_source_snapshot/i, `${label} must revoke public execution`);
-    assert.match(sql, /grant execute on function public\.replace_deal_hunter_source_snapshot/i, `${label} must grant only service-role execution`);
   }
   assert.equal(
-    normalizeSql(rpcDefinition(migration, 'replace_deal_hunter_source_snapshot')),
-    normalizeSql(rpcDefinition(schema, 'replace_deal_hunter_source_snapshot')),
-    'forward migration and fresh schema must have identical complete-source reconciliation semantics',
+    normalizeSql(original).replace('replace_deal_hunter_source_snapshot(', 'replace_deal_hunter_source_snapshot_internal('),
+    normalizeSql(internal),
+    'the fresh internal helper must retain the previous complete-source reconciliation body exactly',
   );
+  assert.match(admissionMigration, /alter function public\.replace_deal_hunter_source_snapshot\(text, text, jsonb\)\s+rename to replace_deal_hunter_source_snapshot_internal/i);
+  assert.match(admissionMigration, /revoke all privileges on function public\.replace_deal_hunter_source_snapshot_internal[\s\S]*from public, anon, authenticated, service_role/i);
+  assert.match(schema, /revoke all privileges on function public\.replace_deal_hunter_source_snapshot_internal[\s\S]*from public, anon, authenticated, service_role/i);
+  assert.doesNotMatch(schema, /grant execute on function public\.replace_deal_hunter_source_snapshot_internal/i, 'the internal source-wide delete helper must not be directly executable');
+});
+
+test('Supabase complete-Sheet snapshot admission command is bounded, service-only, and forward/fresh equivalent', () => {
+  // Break caught: a generic `{ source_id, source_name, records }` RPC can
+  // delete any source. The complete Sheet policy must be explicit and bind the
+  // source slot, exact record/observation counts, and raw identity set.
+  const migration = fs.readFileSync(sourceSnapshotAdmissionMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(supabaseSchemaUrl, 'utf8');
+  const normalizeSql = (sql) => sql.replace(/--[^\n]*/g, '').replace(/\s+/g, ' ').trim();
   for (const [label, sql] of [['migration', migration], ['fresh schema', schema]]) {
-    const direct = rpcDefinition(sql, 'upsert_deal_hunter_opportunity_source_observation');
-    const perRecord = rpcDefinition(sql, 'replace_deal_hunter_opportunity_source_observation_snapshot');
-    const perOpportunity = rpcDefinition(sql, 'replace_deal_hunter_opportunity_source_snapshot');
-    for (const [functionName, definition] of [
-      ['upsert_deal_hunter_opportunity_source_observation', direct],
-      ['replace_deal_hunter_opportunity_source_observation_snapshot', perRecord],
-      ['replace_deal_hunter_opportunity_source_snapshot', perOpportunity],
-    ]) {
-      const sourceLock = definition.search(/jsonb_build_array\(\s*p_source_id\s*\)::text/is);
-      const opportunityLock = definition.search(/jsonb_build_array\(\s*p_opportunity_id\s*,\s*p_source_id\s*\)::text/is);
-      assert.ok(sourceLock >= 0 && opportunityLock > sourceLock, `${label} ${functionName} must lock the whole source before the canonical-opportunity/source scope`);
-    }
-    const recordLock = perRecord.search(/jsonb_build_array\(\s*p_opportunity_id\s*,\s*p_source_id\s*,\s*p_source_record_id\s*\)::text/is);
-    const perRecordOpportunityLock = perRecord.search(/jsonb_build_array\(\s*p_opportunity_id\s*,\s*p_source_id\s*\)::text/is);
-    assert.ok(recordLock > perRecordOpportunityLock, `${label} per-record replacement must keep the complete source lock order through its narrowest lock`);
+    const definition = rpcDefinition(sql, 'replace_admitted_complete_google_sheet_source_snapshot');
+    assert.match(definition, /p_admission\s+jsonb[\s\S]*p_records\s+jsonb/i, `${label} must accept an explicit admission instead of generic source arguments`);
+    assert.match(definition, /complete-google-sheet-source-snapshot-v1/i, `${label} must require the complete Google Sheet admission policy`);
+    assert.match(definition, /source_id.*~\s*'\^sheet-\[0-9\]\+\$'/is, `${label} must admit only deterministic Google Sheet source slots`);
+    assert.match(definition, /record_count/i, `${label} must bind the admitted record count`);
+    assert.match(definition, /observation_count/i, `${label} must bind the admitted observation count`);
+    assert.match(definition, /source_record_ids/i, `${label} must bind the admitted source identity set`);
+    assert.match(definition, /p_admission\s*-\s*array\[[\s\S]*snapshot_digest[\s\S]*\]\s*<>\s*'\{\}'::jsonb/i, `${label} must reject unknown direct-RPC admission keys`);
+    assert.match(definition, /not\s*\(p_admission\s*\?&\s*array\[[\s\S]*source_record_ids[\s\S]*\]\)/i, `${label} must reject a direct-RPC admission missing required keys`);
+    assert.match(definition, /v_source_id\s*!~\s*'\^sheet-\[0-9\]\+\$'/i, `${label} must reject a direct-RPC non-Sheet source scope`);
+    assert.match(definition, /jsonb_array_length\(p_records\)\s*<>\s*v_record_count/i, `${label} must reject a direct-RPC record-count mismatch`);
+    assert.match(definition, /group by record\.value\s*->>\s*'source_record_id'[\s\S]*having count\(\*\)\s*>\s*1/i, `${label} must reject duplicate direct-RPC source-record identities`);
+    assert.match(definition, /v_actual_observation_count\s*<>\s*v_observation_count/i, `${label} must reject a direct-RPC observation-count mismatch`);
+    assert.match(definition, /v_actual_digest\s*<>\s*v_snapshot_digest/i, `${label} must reject a direct-RPC digest mismatch`);
+    assert.match(definition, /pg_catalog\.encode\(pg_catalog\.convert_to\([\s\S]*'UTF8'\),\s*'hex'\)/i, `${label} must use unwrapped canonical text encoding for digest parity with Node`);
+    assert.doesNotMatch(definition, /'base64'/i, `${label} must not use line-wrapping PostgreSQL base64 in the cross-provider digest`);
+    assert.match(definition, /jsonb_array_length\(record\.value\s*->\s*'observations'\)\s+not between\s+1\s+and\s+51/i, `${label} must reject empty or oversized record observation arrays`);
+    assert.match(definition, /security definer/i, `${label} must retain server-owned source replacement`);
+    assert.match(definition, /set search_path = public/i, `${label} must pin the definer search path`);
+    assert.doesNotMatch(sql, /create or replace function public\.replace_deal_hunter_source_snapshot\(/i, `${label} must not retain the generic broad-delete RPC`);
+    assert.match(sql, /revoke all privileges on function public\.replace_admitted_complete_google_sheet_source_snapshot/i, `${label} must revoke public execution`);
+    assert.match(sql, /grant execute on function public\.replace_admitted_complete_google_sheet_source_snapshot/i, `${label} must grant only service-role execution`);
+    assert.match(definition, /from public\.replace_deal_hunter_source_snapshot_internal\(v_source_id, v_source_name, p_records\)/i, `${label} must reach the source-wide mutation only after policy validation`);
   }
+  assert.equal(
+    normalizeSql(rpcDefinition(migration, 'replace_admitted_complete_google_sheet_source_snapshot')),
+    normalizeSql(rpcDefinition(schema, 'replace_admitted_complete_google_sheet_source_snapshot')),
+    'forward migration and fresh schema must use the identical admitted complete-Sheet replacement contract',
+  );
 });
 
 test('Supabase durable-write RPCs enforce the SQLite-compatible immutable conflict contract', () => {

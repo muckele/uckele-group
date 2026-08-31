@@ -587,6 +587,55 @@ test('a full Sheet refresh with an unresolved row leaves its prior Sheet observa
   );
 });
 
+test('a complete Sheet payload with duplicate stable source-record identities fails closed before any Sheet observation write', async (t) => {
+  // Break caught: duplicate stable Listing IDs make the raw source identity
+  // set ambiguous. A full backfill must defer/fail rather than write one row
+  // while deleting or updating the last-known-good snapshot for another.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-duplicate-stable-sheet-observations-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const currentDate = new Date().toISOString().slice(0, 10);
+  const listingUrl = 'https://broker.example/listings/duplicate-stable-sheet-hvac';
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `SHEET-STABLE-42,Duplicate Stable HVAC,${listingUrl},CA,${currentDate},450000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  const initial = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'duplicate-stable-sheet-test' });
+  assert.equal(initial.ok, true);
+  const [opportunity] = (await storage.listCurrentDealHunterOpportunities({ limit: 20 }))
+    .filter((item) => item.metadata?.identitySnapshot?.listingUrl === listingUrl);
+  assert.ok(opportunity);
+  const before = await storage.listDealHunterOpportunitySourceObservations(opportunity.opportunity_id);
+  assert.ok(before.some((observation) => observation.source_id === 'sheet-0'));
+
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `SHEET-STABLE-42,Duplicate Stable HVAC,${listingUrl},CA,${currentDate},475000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+    `SHEET-STABLE-42,Duplicate Stable Plumbing,https://broker.example/listings/duplicate-stable-sheet-plumbing,TX,${currentDate},500000,1500000,1000000,Commercial plumbing maintenance with recurring service agreements.`,
+  ].join('\n');
+  const duplicate = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'duplicate-stable-sheet-test' });
+
+  assert.equal(duplicate.ok, false, 'a successfully fetched but duplicate-identity Sheet cannot authorize a complete snapshot');
+  assert.equal(duplicate.status, 503, 'the admission proof fails closed before a full-backfill score write');
+  assert.equal(duplicate.scoringDeferred, true);
+  assert.deepEqual(duplicate.review.sourceSnapshotAdmissionDeferredSources, ['sheet-0']);
+  assert.equal(
+    duplicate.review.sources.find((source) => source.id === 'sheet-0')?.fetched,
+    true,
+    'the rejection is an identity/admission failure, not a source collection failure',
+  );
+  assert.deepEqual(
+    await storage.listDealHunterOpportunitySourceObservations(opportunity.opportunity_id),
+    before,
+    'the last-known-good Sheet observations remain byte-for-byte unchanged with no partial source write',
+  );
+});
+
 test('a failed complete Sheet collection leaves current source observations untouched', async (t) => {
   // Break caught: a failed collection is interpreted as an empty complete
   // source snapshot and deletes the last known-good source observations.

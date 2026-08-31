@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 import {
+  consumeCompleteGoogleSheetSourceSnapshotAdmission,
   normalizeDealHunterSourceSnapshot,
   normalizeDealHunterOpportunitySourceSnapshot,
   normalizeOperatorOpportunityFactRecord,
@@ -8284,6 +8285,15 @@ export function createSqliteStorage(config) {
     },
 
     async replaceDealHunterSourceSnapshot(snapshot = {}) {
+      normalizeDealHunterSourceSnapshot(snapshot);
+      throw new Error('Complete Google Sheet source snapshot admission is required.');
+    },
+
+    async replaceAdmittedCompleteGoogleSheetSourceSnapshot(snapshot = {}) {
+      consumeCompleteGoogleSheetSourceSnapshotAdmission({
+        admission: snapshot.admission,
+        snapshot,
+      });
       const normalizedSnapshot = normalizeDealHunterSourceSnapshot(snapshot);
       const replace = database.transaction((value) => {
         const desiredKeys = new Set();

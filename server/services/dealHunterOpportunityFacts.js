@@ -75,6 +75,19 @@ export const opportunitySourceObservationFields = Object.freeze([
 
 const opportunitySourceObservationFieldSet = new Set(opportunitySourceObservationFields);
 
+// A source-wide reconciliation can delete every current observation for a
+// source. It is therefore deliberately narrower than the record-level source
+// snapshot APIs: only the Deal Hunter collector may mint this opaque,
+// single-use capability after it has proved a required Google Sheet was fully
+// collected, uncapped, uniquely identified, and resolved. The WeakMap keeps
+// the capability unforgeable to normal callers of the storage adapters while
+// the serializable envelope lets the Supabase RPC independently validate the
+// bounded source policy and payload shape. A database cannot independently
+// prove a remote Sheet fetch was complete without a durable ingestion ledger
+// or provider-owned fetch, neither of which belongs in this Phase 1 boundary.
+export const completeGoogleSheetSourceSnapshotPolicy = 'complete-google-sheet-source-snapshot-v1';
+const completeGoogleSheetSourceSnapshotAdmissions = new WeakMap();
+
 const sourceObservationFieldMappings = Object.freeze([
   ['name', 'name'],
   ['business_name', 'name'],
@@ -185,6 +198,80 @@ function normalizeTimestamp(value, label) {
 
 function sourceObservationDigest(value) {
   return createHash('sha256').update(String(value)).digest('hex');
+}
+
+function completeGoogleSheetSourceSlot(sourceId) {
+  const match = /^sheet-(0|[1-9][0-9]*)$/.exec(String(sourceId || ''));
+  if (!match) throw new Error('Complete Google Sheet source snapshot admission requires a deterministic Sheet source slot.');
+  const sourceSlot = Number(match[1]);
+  if (!Number.isSafeInteger(sourceSlot) || sourceSlot > 9999) {
+    throw new Error('Complete Google Sheet source snapshot admission requires a configured Sheet source slot.');
+  }
+  return sourceSlot;
+}
+
+function sourceSnapshotAdmissionText(value) {
+  // Postgres's base64 encoder inserts RFC 2045 line breaks for long values;
+  // hexadecimal is delimiter-safe and byte-for-byte identical across Node and
+  // PostgreSQL without a line-wrapping normalization step.
+  return Buffer.from(String(value), 'utf8').toString('hex');
+}
+
+// PostgreSQL's core `md5` lets the SECURITY DEFINER RPC recompute this exact
+// canonical token without relying on an optional extension. It is a
+// consistency checksum, not the authorization secret: the unforgeable,
+// one-shot in-process capability is the authorization layer.
+function completeGoogleSheetSourceSnapshotFingerprint(snapshot) {
+  const sourceSlot = completeGoogleSheetSourceSlot(snapshot.source_id);
+  const observationCount = snapshot.records.reduce((count, record) => count + record.observations.length, 0);
+  const parts = [
+    completeGoogleSheetSourceSnapshotPolicy,
+    sourceSnapshotAdmissionText(snapshot.source_id),
+    sourceSnapshotAdmissionText(snapshot.source_name),
+    String(sourceSlot),
+    String(snapshot.records.length),
+    String(observationCount),
+  ];
+  for (const record of snapshot.records) {
+    parts.push(
+      'r',
+      sourceSnapshotAdmissionText(record.opportunity_id),
+      sourceSnapshotAdmissionText(record.source_id),
+      sourceSnapshotAdmissionText(record.source_name),
+      sourceSnapshotAdmissionText(record.source_record_id),
+      String(record.observations.length),
+    );
+    for (const observation of record.observations) {
+      parts.push(
+        'o',
+        sourceSnapshotAdmissionText(observation.id),
+        sourceSnapshotAdmissionText(observation.opportunity_id),
+        sourceSnapshotAdmissionText(observation.source_id),
+        sourceSnapshotAdmissionText(observation.source_name),
+        sourceSnapshotAdmissionText(observation.source_record_id),
+        sourceSnapshotAdmissionText(observation.field),
+        sourceSnapshotAdmissionText(observation.value),
+        sourceSnapshotAdmissionText(observation.observed_at),
+        sourceSnapshotAdmissionText(observation.created_at),
+        sourceSnapshotAdmissionText(observation.updated_at),
+      );
+    }
+  }
+  return parts.join('|');
+}
+
+function completeGoogleSheetSourceSnapshotAdmissionMetadata(snapshot) {
+  const source_record_ids = snapshot.records.map((record) => record.source_record_id).sort();
+  return Object.freeze({
+    policy: completeGoogleSheetSourceSnapshotPolicy,
+    source_id: snapshot.source_id,
+    source_name: snapshot.source_name,
+    source_slot: completeGoogleSheetSourceSlot(snapshot.source_id),
+    record_count: snapshot.records.length,
+    observation_count: snapshot.records.reduce((count, record) => count + record.observations.length, 0),
+    source_record_ids: Object.freeze(source_record_ids),
+    snapshot_digest: createHash('md5').update(completeGoogleSheetSourceSnapshotFingerprint(snapshot)).digest('hex'),
+  });
 }
 
 function sourceObservationRecordId(deal = {}) {
@@ -322,9 +409,70 @@ export function normalizeDealHunterSourceSnapshot(snapshot = {}) {
     if (recordIds.has(record.source_record_id)) {
       throw new Error('Complete source-observation snapshot record identities must be unique within the source.');
     }
+    if (record.observations.length === 0) {
+      throw new Error('Complete source-observation snapshot records must include at least one observation.');
+    }
     recordIds.add(record.source_record_id);
   }
   return normalized;
+}
+
+/**
+ * Mints the one-use capability for a complete Google Sheet source projection.
+ * The collector invokes this only after its raw result has passed every
+ * completeness and canonical-resolution gate. This utility intentionally
+ * refuses Deal OS and arbitrary source identifiers even before a storage
+ * provider sees the request.
+ */
+export function createCompleteGoogleSheetSourceSnapshotAdmission(snapshot = {}) {
+  const normalizedSnapshot = normalizeDealHunterSourceSnapshot(snapshot);
+  const admission = completeGoogleSheetSourceSnapshotAdmissionMetadata(normalizedSnapshot);
+  completeGoogleSheetSourceSnapshotAdmissions.set(admission, admission);
+  return admission;
+}
+
+/**
+ * Consumes a collector-issued admission exactly once. Storage adapters call
+ * this before opening SQLite's transaction or invoking a Supabase RPC, so an
+ * ordinary `{ source_id, source_name, records }` object cannot become a
+ * source-wide delete command.
+ */
+export function consumeCompleteGoogleSheetSourceSnapshotAdmission({ admission, snapshot } = {}) {
+  const issued = admission && typeof admission === 'object'
+    ? completeGoogleSheetSourceSnapshotAdmissions.get(admission)
+    : null;
+  if (!issued) throw new Error('Complete Google Sheet source snapshot admission is required.');
+
+  // A recognized capability is single-attempt as well as single-success. If a
+  // caller presents it with a tampered payload, fail closed rather than leave
+  // it reusable for a later source-wide mutation attempt.
+  completeGoogleSheetSourceSnapshotAdmissions.delete(admission);
+
+  const normalizedSnapshot = normalizeDealHunterSourceSnapshot(snapshot);
+  const actual = completeGoogleSheetSourceSnapshotAdmissionMetadata(normalizedSnapshot);
+  const matches = (
+    actual.policy === issued.policy
+    && actual.source_id === issued.source_id
+    && actual.source_name === issued.source_name
+    && actual.source_slot === issued.source_slot
+    && actual.record_count === issued.record_count
+    && actual.observation_count === issued.observation_count
+    && actual.snapshot_digest === issued.snapshot_digest
+    && actual.source_record_ids.length === issued.source_record_ids.length
+    && actual.source_record_ids.every((sourceRecordId, index) => sourceRecordId === issued.source_record_ids[index])
+  );
+  if (!matches) throw new Error('Complete Google Sheet source snapshot admission does not match the normalized source payload.');
+
+  return {
+    policy: issued.policy,
+    source_id: issued.source_id,
+    source_name: issued.source_name,
+    source_slot: issued.source_slot,
+    record_count: issued.record_count,
+    observation_count: issued.observation_count,
+    source_record_ids: [...issued.source_record_ids],
+    snapshot_digest: issued.snapshot_digest,
+  };
 }
 
 export function buildOpportunitySourceObservationSnapshot({ opportunityId, deal, now = new Date().toISOString() } = {}) {

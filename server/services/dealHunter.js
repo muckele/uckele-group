@@ -43,6 +43,7 @@ import {
 } from './cimOpportunityIdentity.js';
 import {
   buildOpportunitySourceObservationSnapshot,
+  createCompleteGoogleSheetSourceSnapshotAdmission,
   getOpportunitySourceObservationRecordId,
 } from './dealHunterOpportunityFacts.js';
 
@@ -5175,9 +5176,20 @@ function buildCompleteSheetObservationScopes(sourceResults = [], reviewMode = 'd
       representedRecordIds: new Set(),
       recordsByOpportunity: new Map(),
       complete: true,
+      identityComplete: true,
     };
-    if (scopes.has(sourceId)) scope.complete = false;
+    if (scopes.has(sourceId)) {
+      const priorScope = scopes.get(sourceId);
+      priorScope.complete = false;
+      priorScope.identityComplete = false;
+      scope.complete = false;
+      scope.identityComplete = false;
+    }
     scopes.set(sourceId, scope);
+    const markIdentityIncomplete = () => {
+      scope.complete = false;
+      scope.identityComplete = false;
+    };
 
     const collectedDeals = Array.isArray(result?.deals) ? result.deals : [];
     const sourceRowCount = Number(source.sourceRowCount);
@@ -5197,23 +5209,23 @@ function buildCompleteSheetObservationScopes(sourceResults = [], reviewMode = 'd
 
     for (const deal of collectedDeals) {
       if (String(deal?.sourceId || '').trim() !== sourceId) {
-        scope.complete = false;
+        markIdentityIncomplete();
         continue;
       }
       let sourceRecordId = '';
       try {
         sourceRecordId = getOpportunitySourceObservationRecordId(deal);
       } catch {
-        scope.complete = false;
+        markIdentityIncomplete();
         continue;
       }
       const sourceName = String(deal?.sourceName || '').trim();
       if (!sourceRecordId || !sourceName || scope.expectedRecordIds.has(sourceRecordId)) {
-        scope.complete = false;
+        markIdentityIncomplete();
         continue;
       }
       if (scope.sourceName && scope.sourceName !== sourceName) {
-        scope.complete = false;
+        markIdentityIncomplete();
         continue;
       }
       scope.sourceName = sourceName;
@@ -5306,7 +5318,7 @@ async function attachCanonicalOpportunityIdentities(storage, deals = [], complet
       await storage.replaceDealHunterOpportunitySourceObservationSnapshot(snapshot);
     }
   }
-  if (typeof storage.replaceDealHunterSourceSnapshot === 'function') {
+  if (typeof storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot === 'function') {
     for (const scope of deferredSourceScopes.values()) {
       if (
         !scope.complete
@@ -5320,10 +5332,19 @@ async function attachCanonicalOpportunityIdentities(storage, deals = [], complet
       if (!everyExpectedRecordIsRepresented) continue;
       const records = [...scope.recordsByOpportunity.values()].flat();
       if (records.length !== scope.expectedRecordIds.size) continue;
-      await storage.replaceDealHunterSourceSnapshot({
+      const snapshot = {
         source_id: scope.sourceId,
         source_name: scope.sourceName,
         records,
+      };
+      // Mint only after the raw source has passed the complete/uncapped/unique
+      // gate and every expected source identity has been canonically resolved
+      // into this exact normalized payload. The storage adapter consumes the
+      // capability before it can open a source-wide reconciliation boundary.
+      const admission = createCompleteGoogleSheetSourceSnapshotAdmission(snapshot);
+      await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({
+        ...snapshot,
+        admission,
       });
     }
   }
@@ -6570,6 +6591,14 @@ async function buildDailyDealReview({ reviewMode = 'daily', dealOsImportId = '',
     candidateDeals.map((candidateDeal) => scoreDeal(candidateDeal)),
     completeSheetObservationScopes,
   );
+  // A cap or an incremental review is intentionally merely ineligible for
+  // source-wide replacement. Ambiguous raw source-record identities are more
+  // serious: a full backfill cannot safely claim a complete canonical set, so
+  // defer scoring without touching the last-good Sheet observations.
+  const ambiguousCompleteSheetIdentitySourceIds = [...completeSheetObservationScopes.values()]
+    .filter((scope) => scope.identityComplete === false)
+    .map((scope) => scope.sourceId)
+    .sort();
   const seenDeals = await loadDealHunterHistory(storage);
   const scoredDealsWithHistory = attachHistory(scoredDealsWithIdentity, seenDeals, generatedAt);
   const dealKeys = uniqueStrings(scoredDealsWithHistory.flatMap((deal) => [
@@ -6669,8 +6698,11 @@ async function buildDailyDealReview({ reviewMode = 'daily', dealOsImportId = '',
     coverageWarnings: coverage.warnings,
     optionalSourceWarnings: coverage.optionalSourceWarnings,
     stage2CoverageWarnings: coverage.stage2Warnings,
-    scoringDeferred: false,
-    scoringDeferredReason: '',
+    scoringDeferred: ambiguousCompleteSheetIdentitySourceIds.length > 0,
+    scoringDeferredReason: ambiguousCompleteSheetIdentitySourceIds.length > 0
+      ? 'Scoring and scored-opportunity actions are deferred until every required Google Sheet has a complete, uniquely identified source snapshot.'
+      : '',
+    sourceSnapshotAdmissionDeferredSources: ambiguousCompleteSheetIdentitySourceIds,
     cimOutreachPause: outreachGate.status,
     dealOsImportPolicy: coverage.dealOsImportPolicy,
     crmSyncPreview: {
