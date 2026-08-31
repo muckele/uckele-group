@@ -868,6 +868,55 @@ test('effective facts never classify email-only or ambiguous legacy broker_conta
   }
 });
 
+test('legacy broker_contact compatibility accepts only bounded conventional phone forms', () => {
+  // Break caught: loosening the legacy fallback promotes date, ZIP, SSN, label,
+  // vanity, malformed, or overlong generic contacts; over-tightening it drops
+  // conventional local, national, international, or extension-bearing phones.
+  const overlongGenericContact = `+1${' '.repeat(70)}310 555 0199`;
+  const cases = [
+    ['local hyphenated', '555-1212', true],
+    ['local spaced', '555 1212', true],
+    ['national parenthesized', '(310) 555-0199', true],
+    ['national country code', '+1 (310) 555-0199', true],
+    ['international United Kingdom', '+44 20 7946 0958', true],
+    ['international Australia', '+61 2 9374 4000', true],
+    ['bounded x extension', '555-1212 x42', true],
+    ['bounded ext extension', '+1 (310) 555-0199 ext. 12345678', true],
+    ['email', 'broker@example.test', false],
+    ['prose', 'Contact the broker office for details', false],
+    ['labelled contact', 'Broker: 555-1212', false],
+    ['vanity number', '1-800-FLOWERS', false],
+    ['ISO date', '2026-08-30', false],
+    ['numeric date', '20260830', false],
+    ['ZIP plus four', '12345-6789', false],
+    ['SSN-shaped identifier', '123-45-6789', false],
+    ['slash date', '08/30/2026', false],
+    ['unbalanced opening parenthesis', '(310 555-0199', false],
+    ['unbalanced closing parenthesis', '310) 555-0199', false],
+    ['repeated punctuation', '310--555-0199', false],
+    ['too few digits', '555-121', false],
+    ['too many digits', '+1 234 567 890 123 456', false],
+    ['extension overflow', '555-1212 ext. 123456789', false],
+    ['overlength generic contact', overlongGenericContact, false],
+  ];
+
+  for (const [label, value, expectsFallback] of cases) {
+    const effective = getEffectiveOpportunityFacts({
+      opportunityId,
+      operatorFacts: [],
+      crmFacts: [],
+      sourceFacts: [{ field: 'broker_contact', value }],
+    });
+    assert.deepEqual(
+      effective.broker_phone,
+      expectsFallback
+        ? { value, provenance: 'structured-source', verified: false, actor: null, note: null }
+        : undefined,
+      label,
+    );
+  }
+});
+
 test('explicit structured broker_phone wins over a phone-like legacy broker_contact fallback', () => {
   // Break caught: introducing legacy read compatibility lets the first generic
   // contact shadow the explicitly attributed broker_phone source fact.
@@ -883,6 +932,24 @@ test('explicit structured broker_phone wins over a phone-like legacy broker_cont
 
   assert.deepEqual(effective.broker_phone, {
     value: '310-555-0199', provenance: 'structured-source', verified: false, actor: null, note: null,
+  });
+});
+
+test('explicit structured broker_phone bypasses legacy generic-contact validation', () => {
+  // Break caught: hardening the legacy broker_contact fallback accidentally
+  // validates, drops, or rewrites an explicitly attributed broker_phone.
+  const effective = getEffectiveOpportunityFacts({
+    opportunityId,
+    operatorFacts: [],
+    crmFacts: [],
+    sourceFacts: [
+      { field: 'broker_contact', value: '12345-6789' },
+      { field: 'broker_phone', value: '2026-08-30' },
+    ],
+  });
+
+  assert.deepEqual(effective.broker_phone, {
+    value: '2026-08-30', provenance: 'structured-source', verified: false, actor: null, note: null,
   });
 });
 

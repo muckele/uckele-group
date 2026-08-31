@@ -500,14 +500,30 @@ function addFirstFacts(target, rows, provenance, predicate = () => true) {
   }
 }
 
+const legacyBrokerContactNonPhonePatterns = Object.freeze([
+  /^\+?\d{4}[-/.]\d{2}[-/.]\d{2}$/, // ISO-like date
+  /^\+?\d{2}[-/.]\d{2}[-/.]\d{4}$/, // local date-like identifier
+  /^\+?\d{5}-\d{4}$/, // ZIP+4
+  /^\+?\d{3}[-/.]\d{2}[-/.]\d{4}$/, // SSN-like identifier
+]);
+
+const legacyBrokerContactPhonePatterns = Object.freeze([
+  /^\d{3}[ .-]\d{4}$/, // local, deliberately requires conventional grouping
+  /^(?:\+?1[ .-]?)?(?:\(\d{3}\)|\d{3})[ .-]\d{3}[ .-]\d{4}$/, // North American
+  /^\+[1-9]\d{0,2}([ .-])\d{1,5}(?:\1\d{2,5}){1,4}$/, // international, one consistent separator
+]);
+
 function isPhoneLikeLegacyBrokerContact(value) {
   if (!['string', 'number'].includes(typeof value)) return false;
   const text = String(value).trim();
   if (!text || text.length > 80) return false;
-  const match = text.match(/^(\+?[\d().\s-]+)(?:\s*(?:x|ext\.?|extension)\s*\d{1,8})?$/i);
+  const match = text.match(/^([+\d().\s-]+?)(?:\s*(?:x|ext\.?|extension)\s*\d{1,8})?$/i);
   if (!match) return false;
-  const digits = match[1].replace(/\D/g, '');
-  return digits.length >= 7 && digits.length <= 15;
+  const main = match[1].trim();
+  const digits = main.replace(/\D/g, '');
+  if (digits.length < 7 || digits.length > 15) return false;
+  if (legacyBrokerContactNonPhonePatterns.some((pattern) => pattern.test(main))) return false;
+  return legacyBrokerContactPhonePatterns.some((pattern) => pattern.test(main));
 }
 
 function sourceFactsForEffectiveComposition(sourceFacts) {

@@ -188,6 +188,41 @@ test('detail reads a phone-like legacy broker_contact without relabeling its sou
   });
 });
 
+test('detail keeps date-like and ZIP-plus-four legacy broker_contact generic and marks broker_phone missing', async (t) => {
+  // Break caught: loose legacy fallback promotion turns generic identifiers
+  // into effective broker_phone facts and incorrectly clears the missing flag.
+  const { storage, opportunityId } = await detailStorage(t);
+  for (const [id, value] of [
+    ['legacy-broker-contact-date', '2026-08-30'],
+    ['legacy-broker-contact-zip', '12345-6789'],
+  ]) {
+    await storage.upsertDealHunterOpportunitySourceObservation({
+      id, opportunity_id: opportunityId,
+      source_id: id, source_name: 'Legacy Deal Hunter Sheet', source_record_id: id,
+      field: 'broker_contact', value,
+      observed_at: '2026-08-30T10:00:00.000Z', created_at: '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z',
+    });
+  }
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+  assert.deepEqual(
+    detail.sourceObservations
+      .filter((source) => source.sourceName === 'Legacy Deal Hunter Sheet')
+      .map((source) => ({
+        sourceId: source.sourceId,
+        brokerContact: source.values.broker_contact,
+        hasBrokerPhone: Object.hasOwn(source.values, 'broker_phone'),
+      }))
+      .sort((left, right) => left.sourceId.localeCompare(right.sourceId)),
+    [
+      { sourceId: 'legacy-broker-contact-date', brokerContact: '2026-08-30', hasBrokerPhone: false },
+      { sourceId: 'legacy-broker-contact-zip', brokerContact: '12345-6789', hasBrokerPhone: false },
+    ],
+  );
+  assert.equal(detail.effectiveFacts.broker_phone, undefined);
+  assert.equal(detail.missingCriticalFields.includes('broker_phone'), true);
+});
+
 test('consolidated detail rejects a superseded opportunity even when its historical facts and score remain', async (t) => {
   const { storage, opportunityId } = await detailStorage(t);
   const historical = await storage.getDealHunterOpportunity(opportunityId);
