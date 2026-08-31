@@ -19,7 +19,7 @@ process.env.DEAL_HUNTER_AIRTABLE_TABLE_ID = 'tblTest';
 process.env.DEAL_HUNTER_AIRTABLE_VIEW_ID = 'viwTest';
 
 const originalFetch = globalThis.fetch;
-const { parseSheetCsvDeals, reviewDailyDeals } = await import('../server/services/dealHunter.js');
+const { importDealOsExport, parseSheetCsvDeals, reviewDailyDeals } = await import('../server/services/dealHunter.js');
 let sourceCsv;
 let sourceWorkbook;
 let airtableFetchCount;
@@ -301,6 +301,107 @@ test('canonical ingestion retains separate bounded Sheet and Deal OS observation
     observation.source_id === 'sheet-0' && observation.field === 'broker_email'
   )), false);
   assert.deepEqual(await storage.listDealHunterOpportunityFacts(opportunityId), operatorFactsBeforeRefresh);
+});
+
+test('a literal Broker Phone Deal OS value survives import canonicalization with distinct generic contact provenance', async (t) => {
+  // Break caught: the real Deal OS importer parses `Broker Phone`, but its
+  // bounded canonical record drops that field before SQLite persistence and
+  // later rehydrates only the generic `Broker Contact` value.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-deal-os-broker-phone-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const now = new Date();
+  const observedDate = now.toISOString().slice(0, 10);
+  const listingUrl = 'https://broker.example/listings/deal-os-literal-broker-phone';
+  const description = 'Commercial HVAC maintenance company with recurring service agreements and trained field technicians.';
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `SHEET-DEAL-OS-BROKER-PHONE,Deal OS Literal Broker Phone Services,${listingUrl},NY,${observedDate},450000,1200000,900000,${description}`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  const imported = await importDealOsExport({
+    fileBuffer: Buffer.from([
+      'Listing ID,Business Name,View Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Broker Contact,Broker Phone,Description',
+      `DEAL-OS-BROKER-PHONE,Deal OS Literal Broker Phone Services,${listingUrl},NY,${observedDate},450000,1200000,900000,broker@example.test,+1 315 555 1212,${description}`,
+    ].join('\n')),
+    fileName: 'deal-os-broker-phone.csv',
+    mimeType: 'text/csv',
+    exportedAt: now.toISOString(),
+    scope: 'saved-search',
+    coverageLabel: 'Explicit Deal OS broker phone regression',
+    expectedRowCount: 1,
+    importedBy: 'acquisition-admin@example.test',
+    storage,
+    now,
+  });
+  assert.equal(imported.ok, true);
+
+  const refreshed = await refreshOpportunityScores({
+    storage,
+    reviewMode: 'full-backfill',
+    actor: 'deal-os-broker-phone-source-test',
+  });
+  assert.equal(refreshed.ok, true);
+  const [opportunity] = (await storage.listCurrentDealHunterOpportunities({ limit: 20 }))
+    .filter((item) => item.metadata?.identitySnapshot?.listingUrl === listingUrl);
+  assert.ok(opportunity, 'the matched Sheet and Deal OS records resolve to one canonical opportunity');
+  const opportunityId = opportunity.opportunity_id;
+
+  const storedImport = await storage.getLatestDealHunterDealOsImport();
+  const storedRecord = storedImport.records[0];
+  const sourceRows = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+  assert.equal(detail.ok, true);
+  const sourceGroup = detail.sourceObservations.find((source) => (
+    source.sourceId === 'deal-os-export'
+    && source.sourceRecordId === 'external:DEAL-OS-BROKER-PHONE'
+  ));
+
+  assert.deepEqual({
+    storedBrokerContact: storedRecord.brokerContact,
+    storedBrokerPhone: storedRecord.brokerPhone,
+    storedBrokerPhoneOwnProperty: Object.hasOwn(storedRecord, 'brokerPhone'),
+    durableBrokerRows: sourceRows
+      .filter((row) => row.source_id === 'deal-os-export' && row.field.startsWith('broker_'))
+      .map((row) => ({ field: row.field, value: row.value, sourceName: row.source_name, sourceRecordId: row.source_record_id }))
+      .sort((left, right) => left.field.localeCompare(right.field)),
+    sourceBrokerContact: sourceGroup?.values.broker_contact,
+    sourceBrokerPhone: sourceGroup?.values.broker_phone,
+    effectiveBrokerPhone: detail.effectiveFacts.broker_phone,
+    brokerPhoneMissing: detail.missingCriticalFields.includes('broker_phone'),
+  }, {
+    storedBrokerContact: 'broker@example.test',
+    storedBrokerPhone: '+1 315 555 1212',
+    storedBrokerPhoneOwnProperty: true,
+    durableBrokerRows: [
+      {
+        field: 'broker_contact',
+        value: 'broker@example.test',
+        sourceName: 'SMB Deal OS export',
+        sourceRecordId: 'external:DEAL-OS-BROKER-PHONE',
+      },
+      {
+        field: 'broker_phone',
+        value: '+1 315 555 1212',
+        sourceName: 'SMB Deal OS export',
+        sourceRecordId: 'external:DEAL-OS-BROKER-PHONE',
+      },
+    ],
+    sourceBrokerContact: 'broker@example.test',
+    sourceBrokerPhone: '+1 315 555 1212',
+    effectiveBrokerPhone: {
+      value: '+1 315 555 1212',
+      provenance: 'structured-source',
+      verified: false,
+      actor: null,
+      note: null,
+    },
+    brokerPhoneMissing: false,
+  });
 });
 
 test('a literal Broker Phone Sheet value retains phone identity and provenance through persisted detail', async (t) => {
