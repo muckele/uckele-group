@@ -830,6 +830,62 @@ test('enrichment suggestions cannot overwrite a verified operator fact', () => {
   });
 });
 
+test('effective facts derive broker_phone only from a phone-like legacy broker_contact', () => {
+  // Break caught: compatibility either drops an existing legacy phone contact
+  // or treats email/free-text generic contacts as a broker phone.
+  const effective = getEffectiveOpportunityFacts({
+    opportunityId,
+    operatorFacts: [],
+    crmFacts: [],
+    sourceFacts: [
+      { field: 'broker_contact', value: 'broker@example.test' },
+      { field: 'broker_contact', value: 'Contact the broker office for details' },
+      { field: 'broker_contact', value: '555-1212' },
+    ],
+  });
+
+  assert.deepEqual(effective, {
+    broker_phone: {
+      value: '555-1212', provenance: 'structured-source', verified: false, actor: null, note: null,
+    },
+  });
+});
+
+test('effective facts never classify email-only or ambiguous legacy broker_contact values as a phone', () => {
+  // Break caught: a compatibility matcher sees every nonempty generic contact
+  // as phone data, exposing an email or free-text instruction as broker_phone.
+  for (const [label, value] of [
+    ['email-only contact', 'broker@example.test'],
+    ['ambiguous free text', 'Contact the broker office for details'],
+  ]) {
+    const effective = getEffectiveOpportunityFacts({
+      opportunityId,
+      operatorFacts: [],
+      crmFacts: [],
+      sourceFacts: [{ field: 'broker_contact', value }],
+    });
+    assert.equal(effective.broker_phone, undefined, label);
+  }
+});
+
+test('explicit structured broker_phone wins over a phone-like legacy broker_contact fallback', () => {
+  // Break caught: introducing legacy read compatibility lets the first generic
+  // contact shadow the explicitly attributed broker_phone source fact.
+  const effective = getEffectiveOpportunityFacts({
+    opportunityId,
+    operatorFacts: [],
+    crmFacts: [],
+    sourceFacts: [
+      { field: 'broker_contact', value: '555-1212' },
+      { field: 'broker_phone', value: '310-555-0199' },
+    ],
+  });
+
+  assert.deepEqual(effective.broker_phone, {
+    value: '310-555-0199', provenance: 'structured-source', verified: false, actor: null, note: null,
+  });
+});
+
 test('malformed or unsupported operator fact fields reject before persistence', async () => {
   // Break caught: a caller can persist an unapproved field identifier or a malformed fact payload.
   assert.equal(normalizeOpportunityFactField(' Seller Name '), 'seller_name');
@@ -849,17 +905,21 @@ test('malformed or unsupported operator fact fields reject before persistence', 
 });
 
 test('SQLite and Supabase adapters expose matching fact and source-observation shapes', async (t) => {
-  // Break caught: one provider serializes booleans, names, or bounded columns differently from the other.
+  // Break caught: one provider serializes booleans, names, bounded columns, or
+  // the explicit-vs-legacy broker-contact field identity differently.
   const storage = withStorage(t);
   await seedOpportunity(storage);
   const fact = factRecord();
-  const observation = observationRecord();
+  const observations = [
+    observationRecord({ id: 'broker-contact-legacy', field: 'broker_contact', value: '555-1212' }),
+    observationRecord({ id: 'broker-phone-explicit', field: 'broker_phone', value: '310-555-0199' }),
+  ];
   await storage.upsertDealHunterOpportunityFact(fact);
-  await storage.upsertDealHunterOpportunitySourceObservation(observation);
+  for (const observation of observations) await storage.upsertDealHunterOpportunitySourceObservation(observation);
 
   const sqliteFacts = await storage.listDealHunterOpportunityFacts(opportunityId);
   const sqliteObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
-  const chain = supabaseChain({ facts: [fact], observations: [observation] });
+  const chain = supabaseChain({ facts: [fact], observations });
   const supabase = supabaseModule.createSupabaseStorage(
     { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
     { client: chain.client },
@@ -869,7 +929,7 @@ test('SQLite and Supabase adapters expose matching fact and source-observation s
 
   assert.deepEqual(sqliteFacts, [fact]);
   assert.deepEqual(supabaseFacts, sqliteFacts);
-  assert.deepEqual(sqliteObservations, [observation]);
+  assert.deepEqual(sqliteObservations, observations);
   assert.deepEqual(supabaseObservations, sqliteObservations);
   assert.deepEqual(chain.calls, []);
 });

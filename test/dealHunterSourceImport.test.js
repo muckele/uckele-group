@@ -303,6 +303,98 @@ test('canonical ingestion retains separate bounded Sheet and Deal OS observation
   assert.deepEqual(await storage.listDealHunterOpportunityFacts(opportunityId), operatorFactsBeforeRefresh);
 });
 
+test('a literal Broker Phone Sheet value retains phone identity and provenance through persisted detail', async (t) => {
+  // Break caught: the real Sheet `Broker Phone` column is normalized as a
+  // generic broker contact, so a durable current source record exists but the
+  // consolidated detail reports broker_phone as missing.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-broker-phone-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const observedDate = new Date().toISOString().slice(0, 10);
+  const listingUrl = 'https://broker.example/listings/literal-broker-phone';
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Broker Phone,Description',
+    `SHEET-BROKER-PHONE,Literal Broker Phone Services,${listingUrl},CA,${observedDate},450000,1200000,900000,555-1212,Commercial HVAC maintenance company with recurring service agreements and trained field technicians.`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+
+  const refreshed = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'broker-phone-source-test' });
+  assert.equal(refreshed.ok, true);
+  const [opportunity] = (await storage.listCurrentDealHunterOpportunities({ limit: 20 }))
+    .filter((item) => item.metadata?.identitySnapshot?.listingUrl === listingUrl);
+  assert.ok(opportunity, 'the real Sheet row resolves to a current canonical opportunity');
+
+  const sourceRows = await storage.listDealHunterOpportunitySourceObservations(opportunity.opportunity_id);
+  assert.equal(
+    sourceRows.some((row) => row.source_id === 'sheet-0' && row.source_name === 'SMB Deal Hunter Google Sheet' && row.source_record_id === 'external:SHEET-BROKER-PHONE'),
+    true,
+    'the current Sheet source record is durably attributable before its contact fact is composed',
+  );
+
+  const sourceDetail = await getTriageOpportunityDetail({ opportunityId: opportunity.opportunity_id, storage });
+  await setOperatorOpportunityFact({
+    opportunityId: opportunity.opportunity_id,
+    field: 'broker_phone',
+    value: '310-555-0199',
+    verified: true,
+    actor: 'acquisition-admin',
+    storage,
+  });
+  const operatorDetail = await getTriageOpportunityDetail({ opportunityId: opportunity.opportunity_id, storage });
+  const sourceGroup = sourceDetail.sourceObservations.find((source) => source.sourceId === 'sheet-0');
+
+  assert.deepEqual({
+    brokerRows: sourceRows
+      .filter((row) => row.source_id === 'sheet-0' && row.field.startsWith('broker_'))
+      .map((row) => ({ field: row.field, value: row.value, sourceId: row.source_id, sourceName: row.source_name, sourceRecordId: row.source_record_id })),
+    sourcePhone: sourceGroup?.values.broker_phone,
+    effectiveSourcePhone: sourceDetail.effectiveFacts.broker_phone,
+    sourceClaimsPhoneMissing: sourceDetail.missingCriticalFields.includes('broker_phone'),
+    effectiveOperatorPhone: operatorDetail.effectiveFacts.broker_phone,
+  }, {
+    brokerRows: [{
+      field: 'broker_phone', value: '555-1212', sourceId: 'sheet-0', sourceName: 'SMB Deal Hunter Google Sheet', sourceRecordId: 'external:SHEET-BROKER-PHONE',
+    }],
+    sourcePhone: '555-1212',
+    effectiveSourcePhone: {
+      value: '555-1212', provenance: 'structured-source', verified: false, actor: null, note: null,
+    },
+    sourceClaimsPhoneMissing: false,
+    effectiveOperatorPhone: {
+      value: '310-555-0199', provenance: 'operator', verified: true, actor: 'acquisition-admin', note: null,
+    },
+  });
+});
+
+test('a Sheet with distinct Broker Contact and Broker Phone values retains both truthful source fields', () => {
+  // Break caught: recognizing an explicit phone silently removes a separate
+  // generic source contact, making the retained provenance claim incomplete.
+  const [deal] = parseSheetCsvDeals([
+    'Listing ID,Business Name,Listing URL,State,Broker Contact,Broker Phone',
+    'SHEET-BOTH-CONTACTS,Separate Contact Fields Co,https://broker.example/listings/separate-contact-fields,CA,broker@example.test,555-1212',
+  ].join('\n')).deals;
+  const snapshot = buildOpportunitySourceObservationSnapshot({
+    opportunityId: 'opp-separate-broker-contact-fields',
+    deal,
+    now: '2026-08-31T00:00:00.000Z',
+  });
+
+  assert.deepEqual(
+    snapshot.observations
+      .filter((observation) => observation.field.startsWith('broker_'))
+      .map(({ field, value }) => ({ field, value }))
+      .sort((left, right) => left.field.localeCompare(right.field)),
+    [
+      { field: 'broker_contact', value: 'broker@example.test' },
+      { field: 'broker_phone', value: '555-1212' },
+    ],
+  );
+});
+
 test('a no-explicit-ID Sheet row keeps one source observation snapshot when its listing URL is corrected', async (t) => {
   // Break caught: the supported positional Sheet record shape uses a mutable
   // listing URL as its observation identity and forks observations after the

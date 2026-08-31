@@ -159,6 +159,35 @@ test('consolidated detail returns the exact bounded view with authority, conflic
   assert.equal(scoreWrites, 0);
 });
 
+test('detail reads a phone-like legacy broker_contact without relabeling its source observation', async (t) => {
+  // Break caught: legacy durable source rows either remain invisible to the
+  // Broker & Seller fact model or are rewritten as if their original source
+  // field had been broker_phone.
+  const { storage, opportunityId } = await detailStorage(t);
+  await storage.upsertDealHunterOpportunitySourceObservation({
+    id: 'legacy-broker-contact-phone', opportunity_id: opportunityId,
+    source_id: 'legacy-sheet', source_name: 'Legacy Deal Hunter Sheet', source_record_id: 'row-42',
+    field: 'broker_contact', value: '555-1212',
+    observed_at: '2026-08-30T10:00:00.000Z', created_at: '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z',
+  });
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+  const legacySource = detail.sourceObservations.find((source) => source.sourceId === 'legacy-sheet');
+  assert.deepEqual({
+    sourceFieldValue: legacySource?.values.broker_contact,
+    sourceWasRelabeled: Object.hasOwn(legacySource?.values || {}, 'broker_phone'),
+    effectiveBrokerPhone: detail.effectiveFacts.broker_phone,
+    brokerPhoneMissing: detail.missingCriticalFields.includes('broker_phone'),
+  }, {
+    sourceFieldValue: '555-1212',
+    sourceWasRelabeled: false,
+    effectiveBrokerPhone: {
+      value: '555-1212', provenance: 'structured-source', verified: false, actor: null, note: null,
+    },
+    brokerPhoneMissing: false,
+  });
+});
+
 test('consolidated detail rejects a superseded opportunity even when its historical facts and score remain', async (t) => {
   const { storage, opportunityId } = await detailStorage(t);
   const historical = await storage.getDealHunterOpportunity(opportunityId);

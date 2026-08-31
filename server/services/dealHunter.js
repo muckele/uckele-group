@@ -729,6 +729,7 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
   const extractedBrokerContacts = extractBrokerContacts(rawRow, { broker: sourceBrokerName, contact: sourceContactName });
   const sourceBrokerEmail = extractEmailAddresses(getField(rawRow, ['Broker Email']))[0] || '';
   const brokerCompany = normalizeText(getField(rawRow, ['Broker Company', 'Company']), 160);
+  const brokerPhone = normalizeText(getField(rawRow, ['Broker Phone']), 200);
   const brokerContact = normalizeText(getField(rawRow, ['Broker Contact', 'Broker Phone', 'Phone', 'Contact Phone']), 200);
   const name = normalizeText(getField(rawRow, ['Name', 'Business Name', 'Business', 'Company', 'Title', 'Listing Title', 'Deal Name', 'Listing']), 220) || 'Unnamed business';
   const dateAdded = parseDate(getField(rawRow, ['Date Added', 'Created', 'Created At', 'Added Date', 'Posted Date', 'Date Listed', 'Listing Date']));
@@ -784,6 +785,7 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
     brokerContacts,
     brokerCompany,
     brokerContact,
+    brokerPhone,
     listingUrl,
     listingSource,
     dateAdded,
@@ -2787,7 +2789,7 @@ function sourceObservationDeal(deal = {}) {
     'sourceId', 'sourceName', 'sourceRowId', 'id', 'stableExternalId', 'idFromSourceRowPosition',
     'name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
     'annualProfit', 'annualRevenue', 'askingPrice', 'profitMultiple', 'netMargin', 'yearsEstablished',
-    'remoteFlag', 'franchiseFlag', 'fiveYearsFlag', 'brokerName', 'brokerCompany', 'brokerContact',
+    'remoteFlag', 'franchiseFlag', 'fiveYearsFlag', 'brokerName', 'brokerCompany', 'brokerContact', 'brokerPhone',
     'brokerEmail', 'listingUrl', 'listingSource', 'dateAdded', 'lastUpdated',
   ];
   return Object.fromEntries(fields.map((field) => [field, deal[field]]));

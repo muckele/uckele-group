@@ -418,7 +418,7 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
   const sanitizedOperatorFacts = operatorFacts
     .filter((fact) => fact && typeof fact === 'object' && opportunityFactFields.includes(fact.field))
     .slice(0, 100);
-  const sourceFacts = sourceRows.filter((row) => opportunityFactFields.includes(row.field));
+  const sourceFacts = sourceRows.filter((row) => opportunityFactFields.includes(row.field) || row.field === 'broker_contact');
   const crmFacts = directCrmFactRows(submission);
   const effectiveFacts = getEffectiveOpportunityFacts({
     opportunityId: id,

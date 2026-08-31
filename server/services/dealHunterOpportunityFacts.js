@@ -96,8 +96,8 @@ const sourceObservationFieldMappings = Object.freeze([
   ['five_years_flag', 'fiveYearsFlag'],
   ['broker_name', 'brokerName'],
   ['broker_company', 'brokerCompany'],
-  ['broker_contact', 'brokerContact'],
   ['broker_email', 'brokerEmail'],
+  ['broker_phone', 'brokerPhone'],
   ['listing_url', 'listingUrl'],
   ['listing_source', 'listingSource'],
   ['date_added', 'dateAdded'],
@@ -356,6 +356,10 @@ export function buildOpportunitySourceObservationSnapshot({ opportunityId, deal,
   };
 
   for (const [field, property] of sourceObservationFieldMappings) add(field, deal?.[property]);
+  if (
+    deal?.brokerContact
+    && (!deal?.brokerPhone || String(deal.brokerContact).trim() !== String(deal.brokerPhone).trim())
+  ) add('broker_contact', deal.brokerContact);
   if (deal?.stableExternalId && deal?.id) add('listing_id', deal.id);
   return normalizeOpportunitySourceObservationSnapshot({
     opportunity_id: canonicalOpportunityId,
@@ -496,6 +500,36 @@ function addFirstFacts(target, rows, provenance, predicate = () => true) {
   }
 }
 
+function isPhoneLikeLegacyBrokerContact(value) {
+  if (!['string', 'number'].includes(typeof value)) return false;
+  const text = String(value).trim();
+  if (!text || text.length > 80) return false;
+  const match = text.match(/^(\+?[\d().\s-]+)(?:\s*(?:x|ext\.?|extension)\s*\d{1,8})?$/i);
+  if (!match) return false;
+  const digits = match[1].replace(/\D/g, '');
+  return digits.length >= 7 && digits.length <= 15;
+}
+
+function sourceFactsForEffectiveComposition(sourceFacts) {
+  const directFacts = [];
+  const legacyBrokerPhoneFallbacks = [];
+  for (const fact of toFactRows(sourceFacts)) {
+    const field = typeof fact?.field === 'string'
+      ? fact.field.trim().toLowerCase().replace(/[\s-]+/g, '_')
+      : '';
+    if (field !== 'broker_contact') {
+      directFacts.push(fact);
+      continue;
+    }
+    if (isPhoneLikeLegacyBrokerContact(fact.value)) {
+      legacyBrokerPhoneFallbacks.push({ ...fact, field: 'broker_phone' });
+    }
+  }
+  // Preserve an explicitly attributed phone as the structured-source winner,
+  // regardless of the provider's source-row ordering for legacy contacts.
+  return [...directFacts, ...legacyBrokerPhoneFallbacks];
+}
+
 export function getEffectiveOpportunityFacts({ opportunityId, sourceFacts = [], crmFacts = [], operatorFacts = [] } = {}) {
   normalizeText(opportunityId, 'Canonical opportunity id', { maxLength: 200 });
   const effective = {};
@@ -508,7 +542,8 @@ export function getEffectiveOpportunityFacts({ opportunityId, sourceFacts = [], 
   }
   for (const [field, fact] of groupedOperatorFacts) effective[field] = projectEffectiveFact(fact, 'operator');
   addFirstFacts(effective, crmFacts, 'crm');
-  addFirstFacts(effective, sourceFacts, 'structured-source', (fact) => !fact.suggestion);
-  addFirstFacts(effective, sourceFacts, 'enrichment-suggestion', (fact) => Boolean(fact.suggestion));
+  const composableSourceFacts = sourceFactsForEffectiveComposition(sourceFacts);
+  addFirstFacts(effective, composableSourceFacts, 'structured-source', (fact) => !fact.suggestion);
+  addFirstFacts(effective, composableSourceFacts, 'enrichment-suggestion', (fact) => Boolean(fact.suggestion));
   return effective;
 }
