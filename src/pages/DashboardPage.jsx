@@ -35,6 +35,7 @@ const AdminOnboarding = lazy(() => import('../components/admin/AdminOnboarding')
 const CimRequestHistory = lazy(() => import('../components/admin/CimRequestHistory'));
 const CrmCommunications = lazy(() => import('../components/admin/CrmCommunications'));
 const DealActivityTimeline = lazy(() => import('../components/admin/DealActivityTimeline'));
+const AcquisitionInbox = lazy(() => import('../components/admin/AcquisitionInbox'));
 const DealHunterTriage = lazy(() => import('../components/admin/DealHunterTriage'));
 const DealHunterWorkspace = lazy(() => import('../components/admin/DealHunterWorkspace'));
 const FollowUpsWorkspace = lazy(() => import('../components/admin/FollowUpsWorkspace'));
@@ -1390,15 +1391,23 @@ export default function DashboardPage() {
   const deferredCimHistorySearch = useDeferredValue(cimHistoryQuery.search);
   const isReadOnly = authState.role === 'viewer';
   const requestedDealHunterView = new URLSearchParams(location.search).get('view');
+  const showDealHunterOperations = requestedDealHunterView === 'operations' || requestedDealHunterView === 'cim-approvals';
   const crmListSearch = crmSearchFromFilters(filters);
   const crmListHref = `/admin/crm${crmListSearch ? `?${crmListSearch}` : ''}`;
-  const pageMeta = adminSectionMeta[isCrmDetailView ? 'crm-detail' : activeSection] || adminSectionMeta.overview;
+  const basePageMeta = adminSectionMeta[isCrmDetailView ? 'crm-detail' : activeSection] || adminSectionMeta.overview;
+  const pageMeta = activeSection === 'deal-hunter' && !showDealHunterOperations ? {
+    eyebrow: 'Acquisition review',
+    title: 'Deal Hunter',
+    description: 'Work the authoritative current opportunity queue, understand the evidence, and record Pursue, Watch, or Pass decisions.',
+    guidance: 'Start with Needs Review, then open an opportunity to inspect the consolidated record without leaving the queue.',
+  } : basePageMeta;
   const onboardingScope = isCrmDetailView ? 'crm-detail' : activeSection === 'crm' ? 'crm-index' : activeSection;
   const showNewRecordAction = !isReadOnly
     && !isCrmDetailView
     && ['overview', 'crm', 'command-center', 'deal-hunter', 'follow-ups'].includes(activeSection);
   const showExportAction = !isReadOnly && !isCrmDetailView && ['overview', 'crm'].includes(activeSection);
-  const showDailyUpdateAction = !isCrmDetailView && ['overview', 'command-center', 'deal-hunter'].includes(activeSection);
+  const showDailyUpdateAction = !isCrmDetailView
+    && (['overview', 'command-center'].includes(activeSection) || (activeSection === 'deal-hunter' && showDealHunterOperations));
 
   async function checkSession() {
     setAuthBootstrapError('');
@@ -2110,16 +2119,16 @@ export default function DashboardPage() {
   }, [activeSection, authState.authenticated, isReadOnly]);
 
   useEffect(() => {
-    if (authState.authenticated && activeSection === 'deal-hunter' && !dealHunterReview && !dealHunterLoading && !dealHunterAutoReviewAttemptedRef.current) {
+    if (authState.authenticated && activeSection === 'deal-hunter' && showDealHunterOperations && !dealHunterReview && !dealHunterLoading && !dealHunterAutoReviewAttemptedRef.current) {
       dealHunterAutoReviewAttemptedRef.current = true;
       handleLoadDealHunterReview();
     }
   // The review loader is intentionally bounded by the loaded/loading state.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSection, authState.authenticated, dealHunterLoading, dealHunterReview]);
+  }, [activeSection, authState.authenticated, dealHunterLoading, dealHunterReview, showDealHunterOperations]);
 
   useEffect(() => {
-    if (!authState.authenticated || activeSection !== 'deal-hunter') {
+    if (!authState.authenticated || activeSection !== 'deal-hunter' || !showDealHunterOperations) {
       cimHistoryRequestRef.current.controller?.abort();
       return;
     }
@@ -2138,10 +2147,11 @@ export default function DashboardPage() {
     cimHistoryQuery.replyState,
     cimHistoryQuery.requestState,
     cimHistoryQuery.sort,
+    showDealHunterOperations,
   ]);
 
   useEffect(() => {
-    if (!authState.authenticated || activeSection !== 'deal-hunter' || isReadOnly) {
+    if (!authState.authenticated || activeSection !== 'deal-hunter' || !showDealHunterOperations || isReadOnly) {
       unassignedCommunicationsRequestRef.current.controller?.abort();
       if (isReadOnly) {
         setUnassignedCommunications((current) => ({ ...current, rows: [], total: 0, page: 1, loading: false, loadingMore: false, error: '', assigningId: '' }));
@@ -2151,7 +2161,7 @@ export default function DashboardPage() {
     loadUnassignedCommunications();
   // Unassigned inbox bootstrap is intentionally scoped to section and permission changes.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSection, authState.authenticated, isReadOnly]);
+  }, [activeSection, authState.authenticated, isReadOnly, showDealHunterOperations]);
 
   useEffect(() => {
     if (activeSection === 'deal-hunter' && requestedDealHunterView === 'cim-approvals' && dealHunterReview) {
@@ -3900,6 +3910,14 @@ export default function DashboardPage() {
 
       {activeSection === 'deal-hunter' ? (
         <Suspense fallback={<div className="section-shell mt-8"><WorkspaceFallback /></div>}>
+          {!showDealHunterOperations ? <AcquisitionInbox readOnly={isReadOnly} /> : (
+          <>
+          <section className="section-shell mt-8">
+            <nav aria-label="Deal Hunter views" className="mb-5 flex w-fit rounded-full border border-line bg-white p-1">
+              <NavLink className="rounded-full px-4 py-2 text-sm font-semibold text-ink/68 hover:text-moss" end to="/admin/deal-hunter">Inbox</NavLink>
+              <NavLink className="rounded-full bg-moss px-4 py-2 text-sm font-semibold text-white" to="/admin/deal-hunter?view=operations">Operations</NavLink>
+            </nav>
+          </section>
           <section className="section-shell mt-8">
             <DealHunterTriage readOnly={isReadOnly} />
           </section>
@@ -3985,6 +4003,8 @@ export default function DashboardPage() {
               />
             </section>
           ) : null}
+          </>
+          )}
         </Suspense>
       ) : null}
 

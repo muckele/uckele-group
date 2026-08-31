@@ -358,7 +358,7 @@ describe('Dashboard Deal Hunter communications integration', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    renderDashboard('/admin/deal-hunter');
+    renderDashboard('/admin/deal-hunter?view=operations');
 
     const backfillButton = await screen.findByRole('button', { name: 'Score Full Backfill' });
     await waitFor(() => expect(backfillButton).toBeEnabled());
@@ -385,7 +385,7 @@ describe('Dashboard Deal Hunter communications integration', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    renderDashboard('/admin/deal-hunter');
+    renderDashboard('/admin/deal-hunter?view=operations');
 
     const backfillButton = await screen.findByRole('button', { name: 'Score Full Backfill' });
     await waitFor(() => expect(backfillButton).toBeEnabled());
@@ -410,7 +410,7 @@ describe('Dashboard Deal Hunter communications integration', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    renderDashboard('/admin/deal-hunter');
+    renderDashboard('/admin/deal-hunter?view=operations');
 
     const backfillButton = await screen.findByRole('button', { name: 'Score Full Backfill' });
     await waitFor(() => expect(backfillButton).toBeEnabled());
@@ -427,7 +427,7 @@ describe('Dashboard Deal Hunter communications integration', () => {
     vi.stubGlobal('fetch', fetchMock);
     vi.stubGlobal('confirm', vi.fn(() => true));
 
-    renderDashboard('/admin/deal-hunter');
+    renderDashboard('/admin/deal-hunter?view=operations');
 
     expect(await screen.findByRole('heading', { name: 'CIM Request History' })).toBeVisible();
     expect(await screen.findByRole('heading', { name: 'Unassigned inbound communications' })).toBeVisible();
@@ -490,7 +490,7 @@ describe('Dashboard Deal Hunter communications integration', () => {
     const fetchMock = createDealHunterFetch('viewer');
     vi.stubGlobal('fetch', fetchMock);
 
-    renderDashboard('/admin/deal-hunter');
+    renderDashboard('/admin/deal-hunter?view=operations');
 
     expect(await screen.findByRole('heading', { name: 'CIM Request History' })).toBeVisible();
     expect(screen.getByText('Mailbox unavailable.')).toBeVisible();
