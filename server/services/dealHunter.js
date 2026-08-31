@@ -43,9 +43,9 @@ import {
 } from './cimOpportunityIdentity.js';
 import {
   buildOpportunitySourceObservationSnapshot,
-  createCompleteGoogleSheetSourceSnapshotAdmission,
   getOpportunitySourceObservationRecordId,
 } from './dealHunterOpportunityFacts.js';
+import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from './dealHunterSourceSnapshotAdmission.js';
 
 const defaultTimeoutMs = 45000;
 const sheetWorkbookExpandedMaxBytes = 32 * 1024 * 1024;
@@ -5172,6 +5172,7 @@ function buildCompleteSheetObservationScopes(sourceResults = [], reviewMode = 'd
     const scope = {
       sourceId,
       sourceName: '',
+      sourceResult: result,
       expectedRecordIds: new Set(),
       representedRecordIds: new Set(),
       recordsByOpportunity: new Map(),
@@ -5337,14 +5338,11 @@ async function attachCanonicalOpportunityIdentities(storage, deals = [], complet
         source_name: scope.sourceName,
         records,
       };
-      // Mint only after the raw source has passed the complete/uncapped/unique
-      // gate and every expected source identity has been canonically resolved
-      // into this exact normalized payload. The storage adapter consumes the
-      // capability before it can open a source-wide reconciliation boundary.
-      const admission = createCompleteGoogleSheetSourceSnapshotAdmission(snapshot);
-      await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({
-        ...snapshot,
-        admission,
+      await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
+        storage,
+        reviewMode: 'full-backfill',
+        sourceResult: scope.sourceResult,
+        records: snapshot.records,
       });
     }
   }

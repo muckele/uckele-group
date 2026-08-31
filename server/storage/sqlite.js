@@ -4,13 +4,13 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 import {
-  consumeCompleteGoogleSheetSourceSnapshotAdmission,
   normalizeDealHunterSourceSnapshot,
   normalizeDealHunterOpportunitySourceSnapshot,
   normalizeOperatorOpportunityFactRecord,
   normalizeOpportunitySourceObservation,
   normalizeOpportunitySourceObservationSnapshot,
 } from '../services/dealHunterOpportunityFacts.js';
+import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
 import {
   buildCanonicalOpportunityMergePlan,
   canonicalOpportunityMergeManifestId,

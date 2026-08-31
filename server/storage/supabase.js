@@ -1,13 +1,13 @@
 import { createClient } from '@supabase/supabase-js';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
 import {
-  consumeCompleteGoogleSheetSourceSnapshotAdmission,
   normalizeDealHunterSourceSnapshot,
   normalizeDealHunterOpportunitySourceSnapshot,
   normalizeOperatorOpportunityFactRecord,
   normalizeOpportunitySourceObservation,
   normalizeOpportunitySourceObservationSnapshot,
 } from '../services/dealHunterOpportunityFacts.js';
+import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
 
 const dealHunterQueueSorts = new Set([
   'acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed',
