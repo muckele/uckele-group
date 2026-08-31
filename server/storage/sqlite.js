@@ -14,6 +14,10 @@ import {
   firstStrictDetailAuthorityTimestamp,
   strictDetailAuthorityTimestampSortKey,
 } from '../services/detailAuthorityTimestamp.js';
+import {
+  normalizeCanonicalCimRequestId,
+  requireCanonicalCimRequestId,
+} from '../services/cimRequestIdPolicy.js';
 import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
 import {
   buildCanonicalOpportunityMergePlan,
@@ -696,7 +700,7 @@ function serializeDealHunterCimRequest(request) {
           : 'not-attempted';
 
   return {
-    id: String(request.id || '').trim(),
+    id: requireCanonicalCimRequestId(request.id),
     created_at: createdAt,
     updated_at: updatedAt,
     deal_key: String(request.deal_key || '').trim(),
@@ -1926,6 +1930,9 @@ export function createSqliteStorage(config) {
     );
     return strictDetailAuthorityTimestampSortKey(authorityAt);
   });
+  database.function('deal_hunter_cim_record_id_sort_key', { deterministic: true }, (recordId) => (
+    normalizeCanonicalCimRequestId(recordId) || null
+  ));
   fs.chmodSync(config.storage.sqlitePath, 0o600);
   database.pragma('journal_mode = WAL');
   for (const suffix of ['-wal', '-shm']) {
@@ -8985,6 +8992,7 @@ export function createSqliteStorage(config) {
       if (canonicalIds.length > 0) {
         clauses.push(`opportunity_id IN (${placeholders(canonicalIds.length)})`);
         params.push(...canonicalIds);
+        clauses.push('deal_hunter_cim_record_id_sort_key(id) IS NOT NULL');
       }
 
       if (recipients.length > 0) {
@@ -9013,7 +9021,7 @@ export function createSqliteStorage(config) {
           ORDER BY
             CASE WHEN deal_hunter_cim_authority_sort_key(updated_at, created_at) IS NULL THEN 1 ELSE 0 END ASC,
             deal_hunter_cim_authority_sort_key(updated_at, created_at) DESC,
-            id ASC
+            deal_hunter_cim_record_id_sort_key(id) ASC
         `
         : 'ORDER BY updated_at DESC, id ASC';
       return database

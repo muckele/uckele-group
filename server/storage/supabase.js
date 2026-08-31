@@ -8,6 +8,7 @@ import {
   normalizeOpportunitySourceObservationSnapshot,
 } from '../services/dealHunterOpportunityFacts.js';
 import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
+import { requireCanonicalCimRequestId } from '../services/cimRequestIdPolicy.js';
 
 const dealHunterQueueSorts = new Set([
   'acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed',
@@ -697,7 +698,7 @@ function safeDealHunterCimRequest(request = {}) {
           : 'not-attempted';
   return {
     ...request,
-    id: String(request.id || '').trim(),
+    id: requireCanonicalCimRequestId(request.id),
     created_at: createdAt,
     updated_at: updatedAt,
     deal_key: String(request.deal_key || '').trim(),
@@ -3459,6 +3460,20 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       const safeStatuses = normalizeList(statuses);
 
       const safeLimit = Math.max(1, Math.min(Number(limit) || 1000, 100000));
+      if (
+        canonicalIds.length > 0
+        && keys.length === 0
+        && recipients.length === 0
+        && safeStatuses.length === 0
+        && !dueBefore
+      ) {
+        const { data, error } = await client.rpc('list_deal_hunter_cim_detail_authority', {
+          p_opportunity_ids: canonicalIds,
+          p_limit: safeLimit,
+        });
+        if (error) throw error;
+        return (data || []).map(normalizeDealHunterCimRequestRow);
+      }
       const pageSize = Math.min(1000, safeLimit);
       const rows = [];
       for (let offset = 0; offset < safeLimit; offset += pageSize) {

@@ -28,6 +28,7 @@ import {
   opportunitySourceObservationFields,
 } from './dealHunterOpportunityFacts.js';
 import { firstStrictDetailAuthorityTimestamp } from './detailAuthorityTimestamp.js';
+import { normalizeCanonicalCimRequestId } from './cimRequestIdPolicy.js';
 import { getSourceHealth } from './acquisitionCommandCenter.js';
 
 export const triageViews = Object.freeze([
@@ -215,7 +216,12 @@ function safeListingUrl(value) {
   if (!raw) return '';
   try {
     const parsed = new URL(raw);
-    return ['http:', 'https:'].includes(parsed.protocol) && !parsed.username && !parsed.password ? parsed.href : '';
+    return ['http:', 'https:'].includes(parsed.protocol)
+      && !parsed.username
+      && !parsed.password
+      && parsed.href.length <= 2000
+      ? parsed.href
+      : '';
   } catch {
     return '';
   }
@@ -424,6 +430,18 @@ function currentDetailCimStatus(records, fallback) {
   return candidates[0]?.status || fallback;
 }
 
+function canonicalDetailCimRequests(records) {
+  const canonical = [];
+  for (const record of Array.isArray(records) ? records : []) {
+    if (!record || typeof record !== 'object') continue;
+    const id = normalizeCanonicalCimRequestId(record.id);
+    if (!id) continue;
+    canonical.push({ ...record, id });
+    if (canonical.length >= 100) break;
+  }
+  return canonical;
+}
+
 function currentDetailDisposition(records) {
   const candidates = (Array.isArray(records) ? records : []).slice(0, 20).flatMap((record) => {
     const state = detailText(record?.disposition, 80).toLowerCase();
@@ -583,6 +601,7 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
   const sanitizedOperatorFacts = operatorFacts
     .filter((fact) => fact && typeof fact === 'object' && opportunityFactFields.includes(fact.field))
     .slice(0, 100);
+  const canonicalCimRequests = canonicalDetailCimRequests(cimRequests);
   const sourceFacts = sourceRows.filter((row) => opportunityFactFields.includes(row.field) || row.field === 'broker_contact');
   const crmFacts = directCrmFactRows(submission);
   const effectiveFacts = getEffectiveOpportunityFacts({
@@ -603,7 +622,7 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
     currentOpportunity,
     sourceRows,
     submission,
-    cimRequests,
+    cimRequests: canonicalCimRequests,
     dispositions,
   });
   const projectedScore = projectScore(score, byDimension, unattributed);
@@ -622,7 +641,7 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
     listingUrls,
     score: projectedScore,
     cimSummary: {
-      requests: cimRequests.slice(0, 100).map((item) => ({ id: detailText(item.id, 200), status: detailText(item.status, 80), updatedAt: detailText(item.updated_at, 80) })),
+      requests: canonicalCimRequests.map((item) => ({ id: item.id, status: detailText(item.status, 80), updatedAt: detailText(item.updated_at, 80) })),
       communications: communications.filter((communication) => communication.cimRequestId),
     },
     crmSummary: {

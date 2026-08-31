@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 
 import { setOperatorOpportunityFact } from '../server/services/dealHunterOpportunityFacts.js';
 import { getTriageOpportunityDetail } from '../server/services/dealHunterTriage.js';
@@ -72,7 +73,8 @@ function currentScore(opportunityId) {
 
 async function detailStorage(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-triage-detail-'));
-  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'detail.sqlite') } });
+  const sqlitePath = path.join(directory, 'detail.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
   t.after(() => {
     storage.close();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -112,7 +114,7 @@ async function detailStorage(t) {
     opportunityId, field: 'seller_name', value: 'Verified Operator Seller', verified: true,
     note: 'Confirmed by phone.', actor: 'operator@example.test', storage,
   });
-  return { storage, opportunityId };
+  return { storage, opportunityId, sqlitePath };
 }
 
 function withDetailAuthorityRows(storage, { sourceRows, cimRequests, dispositions } = {}) {
@@ -301,7 +303,7 @@ test('detail current authority is independent of equal-timestamp provider array 
       },
     },
     {
-      name: 'uses a bounded deterministic signature when record IDs are absent',
+      name: 'uses a bounded deterministic signature for non-CIM rows and excludes ID-less CIM records',
       sourceRows: [
         { source_id: 'source-a', source_name: 'Source A', source_record_id: 'record-a', field: 'industry', value: 'signature-source-authority', observed_at: equalAt, updated_at: equalAt, created_at: equalAt },
         { source_id: 'source-z', source_name: 'Source Z', source_record_id: 'record-z', field: 'industry', value: 'signature-source-non-authority', observed_at: equalAt, updated_at: equalAt, created_at: equalAt },
@@ -315,7 +317,7 @@ test('detail current authority is independent of equal-timestamp provider array 
         { disposition: 'dismissed', reason: 'zeta-signature-non-authority', updated_at: equalAt, dismissed_at: equalAt, created_at: equalAt },
       ],
       expected: {
-        industry: 'signature-source-authority', freshness: equalAt, cimStatus: 'documents received',
+        industry: 'signature-source-authority', freshness: equalAt, cimStatus: 'not-requested',
         disposition: { state: 'dismissed', reason: 'alpha-signature-authority', dismissedAt: equalAt }, dismissed: true,
       },
     },
@@ -500,6 +502,66 @@ test('equal-time listing authority uses the raw-safe canonical URL signature ind
   }
 });
 
+test('detail rejects raw-bounded listing URLs whose canonical href expands past the public response bound', async (t) => {
+  // Break caught: a raw URL under 2,000 UTF-16 code units can percent-expand
+  // into an 11K+ canonical href, leak through every public URL projection, and
+  // be truncated inside an authority signature so reversed equal-time rows win
+  // differently when their IDs are missing or duplicated.
+  const { storage, opportunityId } = await detailStorage(t);
+  const observedAt = '2026-08-31T12:00:00.000Z';
+  const expandedAlpha = `https://broker.example/${'é'.repeat(1940)}alpha`;
+  const expandedOmega = `https://broker.example/${'é'.repeat(1940)}omega`;
+  const fallbackListingUrl = 'https://broker.example/listings/detail-services';
+  assert.ok(expandedAlpha.length <= 2000);
+  assert.ok(expandedOmega.length <= 2000);
+  assert.ok(new URL(expandedAlpha).href.length > 2000);
+  assert.ok(new URL(expandedOmega).href.length > 2000);
+
+  const rowsByIdentifierPolicy = [
+    ['missing IDs', [
+      { source_id: 'shared-source', source_name: 'Shared source', source_record_id: 'shared-record', field: 'listing_url', value: expandedAlpha, observed_at: observedAt },
+      { source_id: 'shared-source', source_name: 'Shared source', source_record_id: 'shared-record', field: 'listing_url', value: expandedOmega, observed_at: observedAt },
+    ]],
+    ['duplicate IDs', [
+      { id: 'duplicate-expanded-url', source_id: 'shared-source', source_name: 'Shared source', source_record_id: 'shared-record', field: 'listing_url', value: expandedAlpha, observed_at: observedAt },
+      { id: 'duplicate-expanded-url', source_id: 'shared-source', source_name: 'Shared source', source_record_id: 'shared-record', field: 'listing_url', value: expandedOmega, observed_at: observedAt },
+    ]],
+  ];
+
+  for (const [identifierCase, rows] of rowsByIdentifierPolicy) {
+    const projections = [];
+    for (const [order, sourceRows] of [
+      ['alpha-first', rows],
+      ['omega-first', [...rows].reverse()],
+    ]) {
+      await t.test(`${identifierCase}: ${order}`, async () => {
+        const detail = await getTriageOpportunityDetail({
+          opportunityId,
+          storage: withDetailAuthorityRows(storage, { sourceRows }),
+        });
+        const publicUrls = [];
+        const visit = (value, key = '') => {
+          if (typeof value === 'string' && /urls?$/i.test(key)) publicUrls.push(value);
+          if (Array.isArray(value)) {
+            for (const item of value) visit(item, key);
+          } else if (value && typeof value === 'object') {
+            for (const [childKey, childValue] of Object.entries(value)) visit(childValue, childKey);
+          }
+        };
+        visit(detail);
+
+        assert.equal(detail.opportunity.listingUrl, fallbackListingUrl);
+        assert.deepEqual(detail.listingUrls, [fallbackListingUrl]);
+        assert.equal(JSON.stringify(detail).includes(new URL(expandedAlpha).href), false);
+        assert.equal(JSON.stringify(detail).includes(new URL(expandedOmega).href), false);
+        assert.ok(publicUrls.every((url) => url.length <= 2000), 'every emitted public URL stays within the 2,000-character contract');
+        projections.push({ listingUrl: detail.opportunity.listingUrl, listingUrls: detail.listingUrls });
+      });
+    }
+    assert.deepEqual(projections[0], projections[1], `${identifierCase} authority is independent of provider row order`);
+  }
+});
+
 test('SQLite detail CIM window applies strict timestamp fallback and ID ordering before its 100-row cap', async (t) => {
   // Break caught: SQLite used only lexical updated_at DESC before LIMIT, so a
   // reverse-inserted equal-time set excluded the id-ascending member and a
@@ -550,6 +612,153 @@ test('SQLite detail CIM window applies strict timestamp fallback and ID ordering
     'detail reflects adapter-window membership instead of post-cap re-sorting a divergent set');
 });
 
+test('SQLite detail CIM window excludes legacy noncanonical IDs before its deterministic 100-row authority cap', async (t) => {
+  // Break caught: SQLite admits NULL primary keys and empty/Unicode text IDs,
+  // then applies provider-native ID ordering before LIMIT even though the
+  // service treats missing IDs differently and JavaScript compares non-BMP
+  // strings by UTF-16 code units.
+  const equalAt = '2026-08-31T12:00:00.000Z';
+  const invalidNewerAt = '2026-08-31T13:00:00.000Z';
+
+  for (const insertionOrder of ['ascending', 'descending']) {
+    await t.test(insertionOrder, async (t) => {
+      const { storage, opportunityId, sqlitePath } = await detailStorage(t);
+      const dealKey = `deal-${opportunityId}`;
+      const canonicalIds = Array.from({ length: 101 }, (_, index) => `cim-${String(index).padStart(3, '0')}`);
+      const insertionIds = insertionOrder === 'ascending' ? canonicalIds : [...canonicalIds].reverse();
+
+      for (const id of insertionIds) {
+        await storage.upsertDealHunterCimRequest({
+          id,
+          created_at: equalAt,
+          updated_at: equalAt,
+          opportunity_id: opportunityId,
+          deal_key: dealKey,
+          recipient_email: `${id}@example.test`,
+          requested_by: 'detail-test',
+          status: id === 'cim-000' ? 'documents received' : 'requested',
+          metadata: {},
+        });
+      }
+
+      const database = new Database(sqlitePath);
+      const insertLegacy = database.prepare(`
+        INSERT INTO deal_hunter_cim_requests (
+          id, created_at, updated_at, opportunity_id, deal_key,
+          recipient_email, requested_by, status, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}')
+      `);
+      for (const [label, id] of [
+        ['null', null],
+        ['empty', ''],
+        ['padded', ' cim-000 '],
+        ['non-ascii', 'cim-é'],
+        ['non-bmp', 'cim-😀'],
+      ]) {
+        insertLegacy.run(
+          id,
+          invalidNewerAt,
+          invalidNewerAt,
+          opportunityId,
+          dealKey,
+          `legacy-${label}@example.test`,
+          'legacy-import',
+          `invalid-${label}-authority`,
+        );
+      }
+      database.close();
+
+      const adapterWindow = await storage.listDealHunterCimRequests({ opportunityIds: [opportunityId], limit: 100 });
+      assert.equal(adapterWindow.length, 100);
+      assert.equal(adapterWindow[0].id, 'cim-000');
+      assert.equal(adapterWindow.at(-1).id, 'cim-099');
+      assert.equal(adapterWindow.some((request) => request.id === 'cim-100'), false);
+      assert.equal(adapterWindow.some((request) => !request.id || request.id !== request.id.trim()
+        || [...request.id].some((character) => character.codePointAt(0) > 127)), false,
+      'legacy empty, NULL, padded, non-ASCII, and non-BMP IDs are outside detail authority');
+
+      const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+      assert.equal(detail.opportunity.workflow.cimStatus, 'documents received');
+      assert.deepEqual(detail.cimSummary.requests.map((request) => request.id), canonicalIds.slice(0, 100));
+    });
+  }
+});
+
+test('SQLite and Supabase reject new noncanonical CIM IDs while preserving bounded ASCII historical IDs', async (t) => {
+  // Break caught: both serializers currently trim and accept empty, Unicode,
+  // non-BMP, and unbounded IDs, allowing new rows that cannot participate in a
+  // provider-independent detail-authority window.
+  const { storage: sqlite, opportunityId } = await detailStorage(t);
+  const invalidIds = [null, '', '   ', ' cim-padded ', 'cim-é', 'cim-😀', `cim-${'a'.repeat(197)}`];
+  const request = (id, suffix) => ({
+    id,
+    created_at: '2026-08-31T12:00:00.000Z',
+    updated_at: '2026-08-31T12:00:00.000Z',
+    opportunity_id: opportunityId,
+    deal_key: `deal-invalid-${suffix}`,
+    recipient_email: `invalid-${suffix}@example.test`,
+    requested_by: 'detail-test',
+    status: 'requested',
+    metadata: {},
+  });
+
+  for (const [index, id] of invalidIds.entries()) {
+    await assert.rejects(sqlite.upsertDealHunterCimRequest(request(id, `sqlite-${index}`)), /canonical CIM request ID/i);
+  }
+  const validId = 'Legacy.Request:ABC_123-xyz';
+  assert.equal((await sqlite.upsertDealHunterCimRequest(request(validId, 'sqlite-valid'))).id, validId);
+
+  const supabaseUpserts = [];
+  const query = {
+    payload: null,
+    upsert(payload) { this.payload = payload; supabaseUpserts.push(payload); return this; },
+    select() { return this; },
+    async single() { return { data: this.payload, error: null }; },
+  };
+  const supabase = createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { from(table) { assert.equal(table, 'deal_hunter_cim_requests'); return query; } } },
+  );
+  for (const [index, id] of invalidIds.entries()) {
+    await assert.rejects(supabase.upsertDealHunterCimRequest(request(id, `supabase-${index}`)), /canonical CIM request ID/i);
+  }
+  assert.equal(supabaseUpserts.length, 0, 'invalid IDs are rejected before a Supabase write');
+  assert.equal((await supabase.upsertDealHunterCimRequest(request(validId, 'supabase-valid'))).id, validId);
+  assert.equal(supabaseUpserts.length, 1);
+});
+
+test('detail defensively filters noncanonical CIM IDs before status authority and the 100-request response cap', async (t) => {
+  // Break caught: custom and legacy adapters can return noncanonical records;
+  // slicing before eligibility filtering lets one padded newer row control
+  // workflow status and displace a legitimate request from the public summary.
+  const { storage, opportunityId } = await detailStorage(t);
+  const canonicalIds = Array.from({ length: 101 }, (_, index) => `service-cim-${String(index).padStart(3, '0')}`);
+  const canonicalRequests = canonicalIds.map((id, index) => ({
+    id,
+    status: index === 0 ? 'documents received' : 'requested',
+    updated_at: index === 0 ? '2026-08-31T12:00:00.000Z' : '2026-08-31T10:00:00.000Z',
+    created_at: '2026-08-31T09:00:00.000Z',
+  }));
+  const detail = await getTriageOpportunityDetail({
+    opportunityId,
+    storage: withDetailAuthorityRows(storage, {
+      cimRequests: [
+        {
+          id: ' service-cim-padded ',
+          status: 'invalid-legacy-authority',
+          updated_at: '2026-08-31T13:00:00.000Z',
+          created_at: '2026-08-31T13:00:00.000Z',
+        },
+        ...canonicalRequests,
+      ],
+    }),
+  });
+
+  assert.equal(detail.opportunity.workflow.cimStatus, 'documents received');
+  assert.deepEqual(detail.cimSummary.requests.map((request) => request.id), canonicalIds.slice(0, 100));
+  assert.equal(detail.cimSummary.requests.length, 100);
+});
+
 test('SQLite generic CIM listing keeps its deterministic updated_at and ID order outside detail authority', async (t) => {
   // The strict fallback UDF is intentionally scoped to opportunity-ID detail
   // windows. Generic listings retain their conventional updated_at DESC, id ASC
@@ -592,12 +801,13 @@ test('SQLite generic CIM listing keeps its deterministic updated_at and ID order
   assert.equal(genericWindow.some((request) => request.id === 'generic-cim-000'), false);
 });
 
-test('Supabase CIM adapter declares the same explicit pre-cap ordering contract', async () => {
-  // Break caught: a provider query that omits an explicit null placement can
-  // form a different candidate window even when its visible sort fields match.
+test('Supabase routes canonical-opportunity CIM detail reads through the canonical ID policy before the cap', async () => {
+  // Break caught: direct PostgREST ID ordering uses the database collation and
+  // does not share SQLite's legacy-ID handling, so the provider can choose a
+  // different 100-row detail window before the service comparator runs.
   const calls = [];
   const query = {
-    select() { return this; },
+    select() { calls.push(['select']); return this; },
     order(field, options) { calls.push(['order', field, options]); return this; },
     in(field, values) { calls.push(['in', field, values]); return this; },
     async range(start, end) {
@@ -607,16 +817,32 @@ test('Supabase CIM adapter declares the same explicit pre-cap ordering contract'
   };
   const storage = createSupabaseStorage(
     { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
-    { client: { from(table) { assert.equal(table, 'deal_hunter_cim_requests'); return query; } } },
+    {
+      client: {
+        from(table) { calls.push(['from', table]); return query; },
+        async rpc(name, args) { calls.push(['rpc', name, args]); return { data: [], error: null }; },
+      },
+    },
   );
 
   assert.deepEqual(await storage.listDealHunterCimRequests({ opportunityIds: ['opp-detail'], limit: 100 }), []);
   assert.deepEqual(calls, [
+    ['rpc', 'list_deal_hunter_cim_detail_authority', {
+      p_opportunity_ids: ['opp-detail'],
+      p_limit: 100,
+    }],
+  ]);
+
+  calls.length = 0;
+  assert.deepEqual(await storage.listDealHunterCimRequests({ dealKeys: ['deal-detail'], limit: 2 }), []);
+  assert.deepEqual(calls, [
+    ['from', 'deal_hunter_cim_requests'],
+    ['select'],
     ['order', 'updated_at', { ascending: false, nullsFirst: false }],
     ['order', 'id', { ascending: true, nullsFirst: false }],
-    ['in', 'opportunity_id', ['opp-detail']],
-    ['range', 0, 99],
-  ]);
+    ['in', 'deal_key', ['deal-detail']],
+    ['range', 0, 1],
+  ], 'generic listings retain the direct provider query');
 });
 
 test('detail opportunity consolidates current authoritative identity, source, score, CRM, and CIM values instead of score-row defaults', async (t) => {

@@ -75,6 +75,10 @@ const acquisitionInboxQueueMigrationUrl = new URL(
   '../supabase/migrations/20260830150000_acquisition_inbox_queue.sql',
   import.meta.url,
 );
+const cimDetailAuthorityMigrationUrl = new URL(
+  '../supabase/migrations/20260831210000_deal_hunter_cim_detail_authority.sql',
+  import.meta.url,
+);
 const canonicalCurrentSemanticsMigrationUrl = new URL(
   '../supabase/migrations/20260827120000_canonical_opportunity_current_semantics.sql',
   import.meta.url,
@@ -221,6 +225,45 @@ test('Acquisition Inbox queue migration and fresh schema keep the same function 
     return start >= 0 && end >= start ? sql.slice(start, end + 4) : '';
   };
   assert.equal(normalize(definition(migration)), normalize(definition(schema)));
+});
+
+test('CIM detail authority migration and fresh schema enforce one bounded service-role ID window', () => {
+  // Break caught: the adapter cannot promise provider parity if the deployed
+  // RPC is missing, publicly executable, differs from the fresh schema, admits
+  // legacy noncanonical IDs, or relies on database-locale text ordering.
+  assert.equal(fs.existsSync(cimDetailAuthorityMigrationUrl), true, 'the deployable detail-authority migration exists');
+  const migration = fs.existsSync(cimDetailAuthorityMigrationUrl)
+    ? fs.readFileSync(cimDetailAuthorityMigrationUrl, 'utf8')
+    : '';
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  const functionName = 'list_deal_hunter_cim_detail_authority';
+  const definition = (sql) => {
+    const start = sql.indexOf(`create or replace function public.${functionName}`);
+    const end = sql.indexOf('\n$$;', start);
+    return start >= 0 && end >= start ? sql.slice(start, end + 4) : '';
+  };
+  const constraint = (sql) => {
+    const start = sql.indexOf('add constraint deal_hunter_cim_requests_canonical_id_check');
+    const end = sql.indexOf(';', start);
+    return start >= 0 && end >= start ? sql.slice(start, end + 1) : '';
+  };
+  const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
+
+  for (const [sourceLabel, sql] of [
+    ['CIM detail authority migration', migration],
+    ['fresh schema', schema],
+  ]) {
+    const functionSql = definition(sql);
+    assertServiceRoleOnlyFunction(sql, sourceLabel, functionName);
+    assert.match(functionSql, /security invoker[\s\S]*set search_path = public/i);
+    assert.match(functionSql, /opportunity_id = any\(p_opportunity_ids\)/i);
+    assert.match(functionSql, /\(request\.id collate "C"\) ~ '\^\[A-Za-z0-9\]\[A-Za-z0-9\._:-\]\{0,199\}\$'/i);
+    assert.match(functionSql, /order by[\s\S]*updated_at desc nulls last[\s\S]*id collate "C" asc/i);
+    assert.match(functionSql, /limit greatest\(1, least\(coalesce\(p_limit, 100\), 100000\)\)/i);
+    assert.match(constraint(sql), /check \(\(id collate "C"\) ~ '\^\[A-Za-z0-9\]\[A-Za-z0-9\._:-\]\{0,199\}\$'\) not valid/i);
+  }
+  assert.equal(normalize(definition(migration)), normalize(definition(schema)));
+  assert.equal(normalize(constraint(migration)), normalize(constraint(schema)));
 });
 
 test('every canonical alias lock participant acquires the complete sorted alias lock set before opportunity rows', () => {
