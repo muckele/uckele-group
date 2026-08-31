@@ -136,7 +136,7 @@ For recovery audits, compare deterministic **core evidence** separately from ful
 - After a full backfill review.
 - On explicit admin refresh: `POST /api/admin/deal-hunter/scores/refresh`.
 
-Scoring never runs on page load. The triage queue reads persisted rows only, so opening the workspace or paging through it cannot trigger a rebuild.
+Scoring never runs on page load. Acquisition Inbox and Opportunity View read persisted rows only, so opening the Inbox, paging or filtering the queue, and opening an opportunity cannot trigger a rebuild or refresh a source.
 
 A refresh is bounded and resumable. Pass `opportunityIds` to scope it. A failure on one opportunity is recorded and the batch continues, so a retry redoes only what did not land. Forcing a rebuild of every score requires typing `REBUILD ALL SCORES`.
 
@@ -169,7 +169,13 @@ These are written by two separate storage operations with disjoint column lists.
 
 An operator sets **priority** — `urgent`, `high`, `normal`, `watch` — rather than rewriting the machine's number. "Machine says 71, operator says urgent" stays legible; an artificial 83 would not. The machine score keeps updating underneath a priority, and the queue shows the divergence rather than resolving it.
 
-## Triage views
+## Acquisition Inbox and triage views
+
+`/admin/deal-hunter` opens **Inbox** as the default daily decision surface. Start in **Needs Review**, which presents the authoritative persisted current opportunity set in acquisition-priority order. Open an opportunity in the right-side Opportunity View to inspect financials, broker/seller facts, evidence, source provenance, CRM/CIM context, and history without leaving or resetting the queue.
+
+**Operations** is the separate administrative surface for source review, Deal OS import, score refresh/backfill, diagnostics, daily email, CIM/follow-up controls, and other explicitly triggered work. Merely browsing Inbox or Opportunity View does not run scoring, import data, refresh sources, send a CIM request, activate Stage 2, or send outreach.
+
+Pursue and Watch acknowledge the current semantic score state and set operator-owned priority while leaving the machine score unchanged. Pass uses the durable disposition path, records a reason and optional note, and remains visible in the Passed view and history. Verified operator facts are stored separately from source observations, outrank lower-authority source/CRM claims, and survive later source refreshes; the lower-authority claims remain visible as provenance.
 
 Views are derived from state that already exists. No new workflow state machine was introduced.
 
@@ -179,14 +185,14 @@ Views are derived from state that already exists. No new workflow state machine 
 | High priority | High-fit listings, plus anything the operator marked `urgent` or `high`. |
 | Watchlist | The existing 60–74 band, plus anything marked `watch`. |
 | Low confidence | `confidence = low`, or the sources contradict each other. |
-| Dismissed | The existing `deal_hunter_dispositions` record. |
-| All scored | Everything with a persisted score. |
+| Passed | The existing `deal_hunter_dispositions` record. |
+| All current | Every nondismissed opportunity with a persisted current score. |
 
 Working views exclude dismissed and gated listings. **Changed since reviewed** is derived from the semantic digest the operator acknowledged, with the same legacy fingerprint fallback, rather than stored as its own flag. A version-only or volatile-provenance-only rewrite therefore does not manufacture human review work.
 
 Dismissal remains owned by the existing disposition mechanism, and acquisition progress remains owned by the command center's pipeline stage. Triage does not duplicate either.
 
-Default sort is fit score descending, then confidence, then opportunity id. The final key means pagination stays stable when rows tie.
+Needs Review defaults to acquisition-priority order: urgent/high operator priority; high-fit opportunities that are new or materially changed; fit score; confidence; observation freshness; and a deterministic final tie-breaker. Other views retain their explicit selected sort. The final key means pagination stays stable when rows tie.
 
 ## Audit trail
 
@@ -204,9 +210,9 @@ Both attach to the opportunity's linked CRM record. A sourced opportunity with n
 
 ## Operating checklist
 
-1. Import a Deal OS export or run a full backfill. Both score the affected listings automatically.
-2. Open **Deal Hunter → Triage** and work **Needs review**.
-3. Use **Why this score** to check the evidence before acting, especially where confidence is low or fields are missing.
-4. Set priority where your judgment differs from the machine's. The score stays as it was.
-5. Mark reviewed. The opportunity leaves the queue until its human-relevant scoring conclusions or core contradiction evidence change.
-6. Dismiss through the existing disposition action, not by lowering a score.
+1. Use **Deal Hunter → Operations** only when you intentionally need source review, Deal OS import, or a full backfill. Those explicit operations score affected listings; opening Inbox does not.
+2. Open **Deal Hunter → Inbox → Needs Review** and work the acquisition-priority queue.
+3. Open **Opportunity View** to inspect Score & Evidence, source provenance, financials, contacts, missing information, CRM/CIM context, and history before acting.
+4. Choose **Pursue** or **Watch** to acknowledge the current semantic score state and set operator priority. The machine score stays unchanged, and neither action sends a CIM request or activates Stage 2.
+5. Add or correct a verified operator fact when direct information outranks a source claim. Later source refreshes remain visible but cannot overwrite the verified value.
+6. Choose **Pass**, enter the reason and optional note, and confirm. The opportunity leaves active daily triage but remains available in **Passed** with its original score and disposition history.
