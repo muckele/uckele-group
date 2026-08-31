@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 import {
+  normalizeOperatorOpportunityFactRecord,
   normalizeOpportunitySourceObservation,
   normalizeOpportunitySourceObservationSnapshot,
 } from '../services/dealHunterOpportunityFacts.js';
@@ -2432,8 +2433,48 @@ export function createSqliteStorage(config) {
         note TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
+        CHECK(
+          id = trim(id) AND length(id) BETWEEN 1 AND 240
+          AND opportunity_id = trim(opportunity_id) AND length(opportunity_id) BETWEEN 1 AND 200
+          AND field IN ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes')
+          AND value = trim(value) AND length(value) BETWEEN 1 AND 4000
+          AND source = 'operator'
+          AND verified IN (0, 1)
+          AND actor = trim(actor) AND length(actor) BETWEEN 1 AND 200
+          AND (note IS NULL OR (note = trim(note) AND length(note) BETWEEN 1 AND 4000))
+        ),
         FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE
       );
+
+      CREATE TRIGGER IF NOT EXISTS deal_hunter_opportunity_facts_operator_boundary_insert
+      BEFORE INSERT ON deal_hunter_opportunity_facts
+      BEGIN
+        SELECT CASE WHEN NOT (
+          NEW.id = trim(NEW.id) AND length(NEW.id) BETWEEN 1 AND 240
+          AND NEW.opportunity_id = trim(NEW.opportunity_id) AND length(NEW.opportunity_id) BETWEEN 1 AND 200
+          AND NEW.field IN ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes')
+          AND NEW.value = trim(NEW.value) AND length(NEW.value) BETWEEN 1 AND 4000
+          AND NEW.source = 'operator'
+          AND NEW.verified IN (0, 1)
+          AND NEW.actor = trim(NEW.actor) AND length(NEW.actor) BETWEEN 1 AND 200
+          AND (NEW.note IS NULL OR (NEW.note = trim(NEW.note) AND length(NEW.note) BETWEEN 1 AND 4000))
+        ) THEN RAISE(ABORT, 'invalid operator opportunity fact') END;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS deal_hunter_opportunity_facts_operator_boundary_update
+      BEFORE UPDATE ON deal_hunter_opportunity_facts
+      BEGIN
+        SELECT CASE WHEN NOT (
+          NEW.id = trim(NEW.id) AND length(NEW.id) BETWEEN 1 AND 240
+          AND NEW.opportunity_id = trim(NEW.opportunity_id) AND length(NEW.opportunity_id) BETWEEN 1 AND 200
+          AND NEW.field IN ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes')
+          AND NEW.value = trim(NEW.value) AND length(NEW.value) BETWEEN 1 AND 4000
+          AND NEW.source = 'operator'
+          AND NEW.verified IN (0, 1)
+          AND NEW.actor = trim(NEW.actor) AND length(NEW.actor) BETWEEN 1 AND 200
+          AND (NEW.note IS NULL OR (NEW.note = trim(NEW.note) AND length(NEW.note) BETWEEN 1 AND 4000))
+        ) THEN RAISE(ABORT, 'invalid operator opportunity fact') END;
+      END;
 
       CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_source_observations (
         id TEXT PRIMARY KEY,
@@ -7871,18 +7912,20 @@ export function createSqliteStorage(config) {
     },
 
     async insertCurrentDealHunterOpportunityFact(fact = {}) {
+      const record = normalizeOperatorOpportunityFactRecord(fact);
       const transaction = database.transaction(() => {
         const current = database.prepare(`SELECT opportunity_id FROM deal_hunter_opportunities WHERE opportunity_id = ? AND status = 'active' LIMIT 1`)
-          .get(String(fact.opportunity_id || '').trim());
+          .get(record.opportunity_id);
         if (!current) return null;
         database.prepare(`INSERT INTO deal_hunter_opportunity_facts (id, opportunity_id, field, value, source, verified, actor, note, created_at, updated_at)
-          VALUES (@id, @opportunity_id, @field, @value, @source, @verified, @actor, @note, @created_at, @updated_at)`).run({ ...fact, source: fact.source || 'operator', verified: fact.verified ? 1 : 0, note: fact.note || null });
-        return normalizeDealHunterOpportunityFactRow(database.prepare(`SELECT * FROM deal_hunter_opportunity_facts WHERE id = ?`).get(fact.id));
+          VALUES (@id, @opportunity_id, @field, @value, @source, @verified, @actor, @note, @created_at, @updated_at)`).run({ ...record, verified: record.verified ? 1 : 0 });
+        return normalizeDealHunterOpportunityFactRow(database.prepare(`SELECT * FROM deal_hunter_opportunity_facts WHERE id = ?`).get(record.id));
       });
       return transaction.immediate();
     },
 
     async upsertDealHunterOpportunityFact(fact = {}) {
+      const record = normalizeOperatorOpportunityFactRecord(fact);
       database.prepare(`
         INSERT INTO deal_hunter_opportunity_facts (
           id, opportunity_id, field, value, source, verified, actor, note, created_at, updated_at
@@ -7897,15 +7940,10 @@ export function createSqliteStorage(config) {
           actor = excluded.actor,
           note = excluded.note,
           updated_at = excluded.updated_at
-      `).run({
-        ...fact,
-        source: fact.source || 'operator',
-        verified: fact.verified ? 1 : 0,
-        note: fact.note || null,
-      });
+      `).run({ ...record, verified: record.verified ? 1 : 0 });
       return normalizeDealHunterOpportunityFactRow(database.prepare(`
         SELECT * FROM deal_hunter_opportunity_facts WHERE id = ? LIMIT 1
-      `).get(fact.id));
+      `).get(record.id));
     },
 
     async listDealHunterOpportunitySourceObservations(opportunityId, { limit = 500 } = {}) {

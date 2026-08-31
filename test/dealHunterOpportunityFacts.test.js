@@ -31,7 +31,7 @@ const opportunitySourceObservationSnapshotMigrationUrl = new URL(
   import.meta.url,
 );
 const currentOperatorFactMigrationUrl = new URL(
-  '../supabase/migrations/20260830170000_current_operator_fact_write.sql',
+  '../supabase/migrations/20260830180000_operator_fact_storage_boundary.sql',
   import.meta.url,
 );
 const supabaseSchemaUrl = new URL('../supabase/schema.sql', import.meta.url);
@@ -437,6 +437,88 @@ test('current-fact RPC has the exact service-role fail-closed locking contract i
   }
 });
 
+test('operator-fact forward migration and fresh schema share the strict source and bound contract', () => {
+  // Break caught: a later migration leaves either direct RPC permissive or lets
+  // fresh and upgraded databases disagree about the operator-fact boundary.
+  const migration = fs.readFileSync(currentOperatorFactMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(supabaseSchemaUrl, 'utf8');
+  const normalizeSql = (sql) => sql.replace(/--[^\n]*/g, '').replace(/\s+/g, ' ').trim();
+  for (const functionName of ['upsert_deal_hunter_opportunity_fact', 'insert_current_deal_hunter_opportunity_fact']) {
+    const migrationRpc = rpcDefinition(migration, functionName);
+    const schemaRpc = rpcDefinition(schema, functionName);
+    assert.equal(normalizeSql(migrationRpc), normalizeSql(schemaRpc), `${functionName} must be identical after forward migration`);
+    assert.match(migrationRpc, /p_source is distinct from 'operator'/i, `${functionName} must reject source spoofing server-side`);
+  }
+  for (const [label, sql] of [['forward migration', migration], ['fresh schema', schema]]) {
+    assert.match(sql, /deal_hunter_opportunity_facts_operator_boundary_check/i, `${label} must constrain operator facts`);
+    assert.match(sql, /char_length\(id\) between 1 and 240/i, `${label} must bound fact IDs`);
+    assert.match(sql, /field in \([\s\S]*'seller_name'[\s\S]*'operator_contact_notes'/i, `${label} must use the approved field allowlist`);
+    assert.match(sql, /char_length\(value\) between 1 and 4000/i, `${label} must bound fact values`);
+    assert.match(sql, /source = 'operator'/i, `${label} must require operator source for new facts`);
+    assert.match(sql, /char_length\(actor\) between 1 and 200/i, `${label} must bound actors`);
+    assert.match(sql, /char_length\(note\) between 1 and 4000/i, `${label} must bound notes`);
+  }
+  assert.match(migration, /\) not valid;/i, 'forward migration must preserve existing legacy/provider history without rewriting it');
+});
+
+test('direct SQLite current operator-fact storage rejects every hostile probe atomically', async (t) => {
+  // Break caught: callers that bypass the fact service can persist unsupported,
+  // unbounded, spoofed, blank, or truthily-coerced operator facts.
+  const storage = withStorage(t);
+  await seedOpportunity(storage);
+  const hostileFacts = [
+    ['unsupported field', { id: 'hostile-field', field: 'machine_score' }, /field/i],
+    ['250-character id', { id: 'i'.repeat(250) }, /id/i],
+    ['6,000-character value', { id: 'hostile-value', value: 'v'.repeat(6000) }, /value/i],
+    ['arbitrary source', { id: 'hostile-source', source: 'structured-source' }, /source/i],
+    ['empty actor', { id: 'hostile-actor', actor: '' }, /actor/i],
+    ['5,000-character note', { id: 'hostile-note', note: 'n'.repeat(5000) }, /note/i],
+    ['truthy verification coercion', { id: 'hostile-verified', verified: 'false' }, /verification|verified/i],
+    ['unbounded metadata', { id: 'hostile-metadata', metadata: { raw: 'm'.repeat(5000) } }, /metadata/i],
+  ];
+
+  for (const [writerLabel, write] of [
+    ['current', (fact) => storage.insertCurrentDealHunterOpportunityFact(fact)],
+    ['direct upsert', (fact) => storage.upsertDealHunterOpportunityFact(fact)],
+  ]) {
+    for (const [label, overrides, expected] of hostileFacts) {
+      await assert.rejects(write(factRecord(overrides)), expected, `${writerLabel}: ${label}`);
+      assert.deepEqual(await storage.listDealHunterOpportunityFacts(opportunityId), [], `${writerLabel}: ${label} must leave no partial fact`);
+    }
+  }
+});
+
+test('direct Supabase current operator-fact adapter rejects every hostile probe before RPC', async () => {
+  // Break caught: the provider adapter serializes hostile operator facts to its
+  // security-definer RPC, relying on truthy JavaScript coercion or a caller's
+  // convention instead of the bounded persistence contract.
+  const calls = [];
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'key' } },
+    { client: { rpc: async (name, payload) => { calls.push({ name, payload }); return { data: payload, error: null }; } } },
+  );
+  const hostileFacts = [
+    ['unsupported field', { id: 'provider-hostile-field', field: 'machine_score' }, /field/i],
+    ['250-character id', { id: 'i'.repeat(250) }, /id/i],
+    ['6,000-character value', { id: 'provider-hostile-value', value: 'v'.repeat(6000) }, /value/i],
+    ['arbitrary source', { id: 'provider-hostile-source', source: 'structured-source' }, /source/i],
+    ['empty actor', { id: 'provider-hostile-actor', actor: '' }, /actor/i],
+    ['5,000-character note', { id: 'provider-hostile-note', note: 'n'.repeat(5000) }, /note/i],
+    ['truthy verification coercion', { id: 'provider-hostile-verified', verified: 'false' }, /verification|verified/i],
+    ['unbounded metadata', { id: 'provider-hostile-metadata', metadata: { raw: 'm'.repeat(5000) } }, /metadata/i],
+  ];
+
+  for (const [writerLabel, write] of [
+    ['current', (fact) => storage.insertCurrentDealHunterOpportunityFact(fact)],
+    ['direct upsert', (fact) => storage.upsertDealHunterOpportunityFact(fact)],
+  ]) {
+    for (const [label, overrides, expected] of hostileFacts) {
+      await assert.rejects(write(factRecord(overrides)), expected, `${writerLabel}: ${label}`);
+    }
+  }
+  assert.deepEqual(calls, [], 'rejected direct writes must not reach the provider RPC');
+});
+
 test('effective facts use operator, CRM, structured-source, then enrichment-suggestion precedence', () => {
   // Break caught: a lower-authority source wins when the same field is present at multiple authority levels.
   const effective = getEffectiveOpportunityFacts({
@@ -538,7 +620,7 @@ test('fact conflicts preserve immutable identity while both providers update onl
     opportunity_id: 'opp-reassignment-attempt',
     field: 'broker_name',
     value: 'Updated Broker',
-    source: 'operator-correction',
+    source: 'operator',
     verified: false,
     actor: 'second-operator',
     note: 'Corrected value',

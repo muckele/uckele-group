@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
 import {
+  normalizeOperatorOpportunityFactRecord,
   normalizeOpportunitySourceObservation,
   normalizeOpportunitySourceObservationSnapshot,
 } from '../services/dealHunterOpportunityFacts.js';
@@ -3029,28 +3030,30 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     async upsertDealHunterOpportunityFact(fact = {}) {
+      const record = normalizeOperatorOpportunityFactRecord(fact);
       const { data, error } = await client
         .rpc('upsert_deal_hunter_opportunity_fact', {
-          p_id: fact.id,
-          p_opportunity_id: fact.opportunity_id,
-          p_field: fact.field,
-          p_value: fact.value,
-          p_source: fact.source || 'operator',
-          p_verified: Boolean(fact.verified),
-          p_actor: fact.actor,
-          p_note: fact.note || null,
-          p_created_at: fact.created_at,
-          p_updated_at: fact.updated_at,
+          p_id: record.id,
+          p_opportunity_id: record.opportunity_id,
+          p_field: record.field,
+          p_value: record.value,
+          p_source: record.source,
+          p_verified: record.verified,
+          p_actor: record.actor,
+          p_note: record.note,
+          p_created_at: record.created_at,
+          p_updated_at: record.updated_at,
         });
       if (error) throw error;
       return normalizeDealHunterOpportunityFactRow(data);
     },
 
     async insertCurrentDealHunterOpportunityFact(fact = {}) {
+      const record = normalizeOperatorOpportunityFactRecord(fact);
       const { data, error } = await client.rpc('insert_current_deal_hunter_opportunity_fact', {
-        p_id: fact.id, p_opportunity_id: fact.opportunity_id, p_field: fact.field, p_value: fact.value,
-        p_source: fact.source || 'operator', p_verified: Boolean(fact.verified), p_actor: fact.actor,
-        p_note: fact.note || null, p_created_at: fact.created_at, p_updated_at: fact.updated_at,
+        p_id: record.id, p_opportunity_id: record.opportunity_id, p_field: record.field, p_value: record.value,
+        p_source: record.source, p_verified: record.verified, p_actor: record.actor,
+        p_note: record.note, p_created_at: record.created_at, p_updated_at: record.updated_at,
       });
       if (error) throw error;
       return normalizeDealHunterOpportunityFactRow(data);

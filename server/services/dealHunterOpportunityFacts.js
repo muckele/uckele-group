@@ -123,6 +123,37 @@ function normalizeText(value, label, { required = true, maxLength = 4000 } = {})
   return normalized;
 }
 
+// The service generates these records itself, but provider methods are also a
+// supported storage boundary. Keep their contract here so SQLite and Supabase
+// reject the same bypass attempts before any write is attempted.
+export function normalizeOperatorOpportunityFactRecord(fact = {}) {
+  if (!fact || typeof fact !== 'object' || Array.isArray(fact) || Buffer.isBuffer(fact)) {
+    throw new Error('Operator opportunity fact must be an object.');
+  }
+  if (Object.hasOwn(fact, 'metadata')) {
+    throw new Error('Operator opportunity fact metadata is not supported.');
+  }
+  if (typeof fact.verified !== 'boolean') {
+    throw new Error('Opportunity fact verification state must be boolean.');
+  }
+  const source = normalizeText(fact.source ?? 'operator', 'Opportunity fact source', { maxLength: 80 });
+  if (source !== 'operator') {
+    throw new Error('Opportunity fact source must be operator.');
+  }
+  return {
+    id: normalizeText(fact.id, 'Opportunity fact id', { maxLength: 240 }),
+    opportunity_id: normalizeText(fact.opportunity_id, 'Canonical opportunity id', { maxLength: 200 }),
+    field: normalizeOpportunityFactField(fact.field),
+    value: normalizeText(fact.value, 'Opportunity fact value', { maxLength: 4000 }),
+    source,
+    verified: fact.verified,
+    actor: normalizeText(fact.actor, 'Opportunity fact actor', { maxLength: 200 }),
+    note: normalizeText(fact.note, 'Opportunity fact note', { required: false, maxLength: 4000 }),
+    created_at: normalizeTimestamp(fact.created_at, 'Opportunity fact creation timestamp'),
+    updated_at: normalizeTimestamp(fact.updated_at, 'Opportunity fact update timestamp'),
+  };
+}
+
 export function normalizeOpportunityFactField(field) {
   if (typeof field !== 'string') {
     throw new Error('Unsupported opportunity fact field.');
