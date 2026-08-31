@@ -41,7 +41,10 @@ import {
   recordCimSafetyMetric,
   resolveDealHunterOpportunity,
 } from './cimOpportunityIdentity.js';
-import { buildOpportunitySourceObservationSnapshot } from './dealHunterOpportunityFacts.js';
+import {
+  buildOpportunitySourceObservationSnapshot,
+  getOpportunitySourceObservationRecordId,
+} from './dealHunterOpportunityFacts.js';
 
 const defaultTimeoutMs = 45000;
 const sheetWorkbookExpandedMaxBytes = 32 * 1024 * 1024;
@@ -2107,6 +2110,8 @@ async function fetchSheetCsvDeals(url, sourceIndex, config) {
     source: {
       ...result.source,
       url,
+      sourceRowCount: allRows.length,
+      coverageLimitReached: allRows.length > rows.length,
       listingUrlCount,
       listingUrlExpectedCount,
       listingUrlUnresolvedCount,
@@ -5142,12 +5147,99 @@ async function loadDealHunterCimRequests(storage, dealKeys, opportunityIds = [])
   }
 }
 
-async function attachCanonicalOpportunityIdentities(storage, deals = []) {
+function sourceObservationDealsForDeal(deal = {}) {
+  return Array.isArray(deal.sourceObservationDeals) && deal.sourceObservationDeals.length > 0
+    ? deal.sourceObservationDeals
+    : [sourceObservationDeal(deal)];
+}
+
+// Full Sheet reconciliation is allowed only when the collector can prove that
+// its normalized raw rows are every row it received from that authoritative
+// Sheet. This deliberately happens before dedupe/candidate selection: a
+// dropped candidate may never authorize deletion of a still-current source
+// observation. Daily and supplemental imports do not create these scopes.
+function buildCompleteSheetObservationScopes(sourceResults = [], reviewMode = 'daily') {
+  const scopes = new Map();
+  if (reviewMode !== 'full-backfill') return scopes;
+
+  for (const result of sourceResults) {
+    const source = result?.source || {};
+    if (source.required !== true && source.sourceRole !== 'required-primary') continue;
+    const sourceId = String(source.id || '').trim();
+    if (!sourceId) continue;
+
+    const scope = {
+      sourceId,
+      sourceName: '',
+      expectedRecordIds: new Set(),
+      representedRecordIds: new Set(),
+      recordsByOpportunity: new Map(),
+      complete: true,
+    };
+    if (scopes.has(sourceId)) scope.complete = false;
+    scopes.set(sourceId, scope);
+
+    const collectedDeals = Array.isArray(result?.deals) ? result.deals : [];
+    const sourceRowCount = Number(source.sourceRowCount);
+    const rowCount = Number(source.rowCount);
+    if (
+      !source.fetched
+      || source.error
+      || source.coverageLimitReached
+      || !Number.isInteger(sourceRowCount)
+      || !Number.isInteger(rowCount)
+      || sourceRowCount <= 0
+      || sourceRowCount !== rowCount
+      || collectedDeals.length !== sourceRowCount
+    ) {
+      scope.complete = false;
+    }
+
+    for (const deal of collectedDeals) {
+      if (String(deal?.sourceId || '').trim() !== sourceId) {
+        scope.complete = false;
+        continue;
+      }
+      let sourceRecordId = '';
+      try {
+        sourceRecordId = getOpportunitySourceObservationRecordId(deal);
+      } catch {
+        scope.complete = false;
+        continue;
+      }
+      const sourceName = String(deal?.sourceName || '').trim();
+      if (!sourceRecordId || !sourceName || scope.expectedRecordIds.has(sourceRecordId)) {
+        scope.complete = false;
+        continue;
+      }
+      if (scope.sourceName && scope.sourceName !== sourceName) {
+        scope.complete = false;
+        continue;
+      }
+      scope.sourceName = sourceName;
+      scope.expectedRecordIds.add(sourceRecordId);
+    }
+    if (scope.expectedRecordIds.size !== sourceRowCount) scope.complete = false;
+  }
+
+  return scopes;
+}
+
+function mergeSourceObservationRecordSnapshot(target, snapshot) {
+  const fields = new Set(target.observations.map((observation) => observation.field));
+  target.observations.push(...snapshot.observations.filter((observation) => !fields.has(observation.field)));
+}
+
+async function attachCanonicalOpportunityIdentities(storage, deals = [], completeSheetObservationScopes = new Map()) {
   if (!storage.listCurrentDealHunterOpportunities) {
     return deals.map((deal) => ({ ...deal, identityStatus: 'unavailable', opportunityId: '' }));
   }
   const candidates = await storage.listCurrentDealHunterOpportunities({ limit: 100000 });
   const resolvedDeals = [];
+  const deferredSourceScopes = completeSheetObservationScopes instanceof Map
+    ? completeSheetObservationScopes
+    : new Map();
+  const perRecordSnapshots = new Map();
   for (const deal of deals) {
     const resolution = await resolveDealHunterOpportunity({
       deal,
@@ -5160,23 +5252,43 @@ async function attachCanonicalOpportunityIdentities(storage, deals = []) {
       if (candidateIndex >= 0) candidates[candidateIndex] = resolution.opportunity;
       else candidates.push(resolution.opportunity);
     }
-    if (resolution.ok && resolution.opportunityId && typeof storage.replaceDealHunterOpportunitySourceObservationSnapshot === 'function') {
+    const sourceDeals = sourceObservationDealsForDeal(deal);
+    if (!resolution.ok || !resolution.opportunityId) {
+      for (const sourceDeal of sourceDeals) {
+        const scope = deferredSourceScopes.get(String(sourceDeal?.sourceId || '').trim());
+        if (scope) scope.complete = false;
+      }
+    } else {
       const now = new Date().toISOString();
-      const snapshotsBySourceRecord = new Map();
-      for (const sourceDeal of deal.sourceObservationDeals || [sourceObservationDeal(deal)]) {
+      for (const sourceDeal of sourceDeals) {
         const snapshot = buildOpportunitySourceObservationSnapshot({ opportunityId: resolution.opportunityId, deal: sourceDeal, now });
-        if (!snapshot) continue;
-        const key = [snapshot.opportunity_id, snapshot.source_id, snapshot.source_record_id].join('\u0000');
-        const current = snapshotsBySourceRecord.get(key);
-        if (!current) {
-          snapshotsBySourceRecord.set(key, snapshot);
+        const completeScope = deferredSourceScopes.get(String(sourceDeal?.sourceId || '').trim());
+        if (!snapshot) {
+          if (completeScope) completeScope.complete = false;
           continue;
         }
-        const fields = new Set(current.observations.map((observation) => observation.field));
-        current.observations.push(...snapshot.observations.filter((observation) => !fields.has(observation.field)));
-      }
-      for (const snapshot of snapshotsBySourceRecord.values()) {
-        await storage.replaceDealHunterOpportunitySourceObservationSnapshot(snapshot);
+        if (completeScope) {
+          if (
+            !completeScope.expectedRecordIds.has(snapshot.source_record_id)
+            || completeScope.representedRecordIds.has(snapshot.source_record_id)
+            || snapshot.source_name !== completeScope.sourceName
+          ) {
+            completeScope.complete = false;
+            continue;
+          }
+          completeScope.representedRecordIds.add(snapshot.source_record_id);
+          const records = completeScope.recordsByOpportunity.get(snapshot.opportunity_id) || [];
+          records.push(snapshot);
+          completeScope.recordsByOpportunity.set(snapshot.opportunity_id, records);
+          continue;
+        }
+        const key = [snapshot.opportunity_id, snapshot.source_id, snapshot.source_record_id].join('\u0000');
+        const current = perRecordSnapshots.get(key);
+        if (current) {
+          mergeSourceObservationRecordSnapshot(current, snapshot);
+        } else {
+          perRecordSnapshots.set(key, snapshot);
+        }
       }
     }
     const { sourceObservationDeals: _sourceObservationDeals, ...resolvedDeal } = deal;
@@ -5187,6 +5299,33 @@ async function attachCanonicalOpportunityIdentities(storage, deals = []) {
       identityResolution: resolution.resolution || '',
       identityExceptionId: resolution.identityException?.id || '',
     });
+  }
+
+  if (typeof storage.replaceDealHunterOpportunitySourceObservationSnapshot === 'function') {
+    for (const snapshot of perRecordSnapshots.values()) {
+      await storage.replaceDealHunterOpportunitySourceObservationSnapshot(snapshot);
+    }
+  }
+  if (typeof storage.replaceDealHunterSourceSnapshot === 'function') {
+    for (const scope of deferredSourceScopes.values()) {
+      if (
+        !scope.complete
+        || scope.expectedRecordIds.size === 0
+        || scope.representedRecordIds.size !== scope.expectedRecordIds.size
+      ) {
+        continue;
+      }
+      const everyExpectedRecordIsRepresented = [...scope.expectedRecordIds]
+        .every((sourceRecordId) => scope.representedRecordIds.has(sourceRecordId));
+      if (!everyExpectedRecordIsRepresented) continue;
+      const records = [...scope.recordsByOpportunity.values()].flat();
+      if (records.length !== scope.expectedRecordIds.size) continue;
+      await storage.replaceDealHunterSourceSnapshot({
+        source_id: scope.sourceId,
+        source_name: scope.sourceName,
+        records,
+      });
+    }
   }
 
   const opportunityIds = uniqueStrings(resolvedDeals.map((deal) => deal.opportunityId));
@@ -6422,12 +6561,14 @@ async function buildDailyDealReview({ reviewMode = 'daily', dealOsImportId = '',
     : recentDeals.length > 0
       ? recentDeals
       : allDeals;
+  const completeSheetObservationScopes = buildCompleteSheetObservationScopes(sourceResults, normalizedReviewMode);
   // Called explicitly rather than as a bare map callback: `scoreDeal` takes an
   // optional ledger as its second argument, which a callback would fill with the
   // array index.
   const scoredDealsWithIdentity = await attachCanonicalOpportunityIdentities(
     storage,
     candidateDeals.map((candidateDeal) => scoreDeal(candidateDeal)),
+    completeSheetObservationScopes,
   );
   const seenDeals = await loadDealHunterHistory(storage);
   const scoredDealsWithHistory = attachHistory(scoredDealsWithIdentity, seenDeals, generatedAt);

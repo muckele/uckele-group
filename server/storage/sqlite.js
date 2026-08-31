@@ -4,6 +4,8 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 import {
+  normalizeDealHunterSourceSnapshot,
+  normalizeDealHunterOpportunitySourceSnapshot,
   normalizeOperatorOpportunityFactRecord,
   normalizeOpportunitySourceObservation,
   normalizeOpportunitySourceObservationSnapshot,
@@ -8228,6 +8230,108 @@ export function createSqliteStorage(config) {
           .map(normalizeDealHunterOpportunitySourceObservationRow);
       });
       return replace(normalizedSnapshot);
+    },
+
+    async replaceDealHunterOpportunitySourceSnapshot(snapshot = {}) {
+      const normalizedSnapshot = normalizeDealHunterOpportunitySourceSnapshot(snapshot);
+      const replace = database.transaction((value) => {
+        const desiredKeys = new Set();
+        const upsert = database.prepare(`
+          INSERT INTO deal_hunter_opportunity_source_observations (
+            id, opportunity_id, source_id, source_name, source_record_id, field, value,
+            observed_at, created_at, updated_at
+          ) VALUES (
+            @id, @opportunity_id, @source_id, @source_name, @source_record_id, @field, @value,
+            @observed_at, @created_at, @updated_at
+          )
+          ON CONFLICT(opportunity_id, source_id, source_record_id, field) DO UPDATE SET
+            source_name = excluded.source_name,
+            value = excluded.value,
+            observed_at = excluded.observed_at,
+            updated_at = excluded.updated_at
+        `);
+        for (const record of value.records) {
+          for (const observation of record.observations) {
+            desiredKeys.add([observation.source_record_id, observation.field].join('\u0000'));
+            upsert.run(observation);
+          }
+        }
+
+        const current = database.prepare(`
+          SELECT source_record_id, field
+          FROM deal_hunter_opportunity_source_observations
+          WHERE opportunity_id = ? AND source_id = ?
+        `).all(value.opportunity_id, value.source_id);
+        const remove = database.prepare(`
+          DELETE FROM deal_hunter_opportunity_source_observations
+          WHERE opportunity_id = ? AND source_id = ? AND source_record_id = ? AND field = ?
+        `);
+        for (const observation of current) {
+          const key = [observation.source_record_id, observation.field].join('\u0000');
+          if (!desiredKeys.has(key)) {
+            remove.run(value.opportunity_id, value.source_id, observation.source_record_id, observation.field);
+          }
+        }
+
+        return database.prepare(`
+          SELECT * FROM deal_hunter_opportunity_source_observations
+          WHERE opportunity_id = ? AND source_id = ?
+          ORDER BY observed_at DESC, id ASC
+        `).all(value.opportunity_id, value.source_id)
+          .map(normalizeDealHunterOpportunitySourceObservationRow);
+      });
+      return replace.immediate(normalizedSnapshot);
+    },
+
+    async replaceDealHunterSourceSnapshot(snapshot = {}) {
+      const normalizedSnapshot = normalizeDealHunterSourceSnapshot(snapshot);
+      const replace = database.transaction((value) => {
+        const desiredKeys = new Set();
+        const upsert = database.prepare(`
+          INSERT INTO deal_hunter_opportunity_source_observations (
+            id, opportunity_id, source_id, source_name, source_record_id, field, value,
+            observed_at, created_at, updated_at
+          ) VALUES (
+            @id, @opportunity_id, @source_id, @source_name, @source_record_id, @field, @value,
+            @observed_at, @created_at, @updated_at
+          )
+          ON CONFLICT(opportunity_id, source_id, source_record_id, field) DO UPDATE SET
+            source_name = excluded.source_name,
+            value = excluded.value,
+            observed_at = excluded.observed_at,
+            updated_at = excluded.updated_at
+        `);
+        for (const record of value.records) {
+          for (const observation of record.observations) {
+            desiredKeys.add([observation.opportunity_id, observation.source_record_id, observation.field].join('\u0000'));
+            upsert.run(observation);
+          }
+        }
+
+        const current = database.prepare(`
+          SELECT opportunity_id, source_record_id, field
+          FROM deal_hunter_opportunity_source_observations
+          WHERE source_id = ?
+        `).all(value.source_id);
+        const remove = database.prepare(`
+          DELETE FROM deal_hunter_opportunity_source_observations
+          WHERE source_id = ? AND opportunity_id = ? AND source_record_id = ? AND field = ?
+        `);
+        for (const observation of current) {
+          const key = [observation.opportunity_id, observation.source_record_id, observation.field].join('\u0000');
+          if (!desiredKeys.has(key)) {
+            remove.run(value.source_id, observation.opportunity_id, observation.source_record_id, observation.field);
+          }
+        }
+
+        return database.prepare(`
+          SELECT * FROM deal_hunter_opportunity_source_observations
+          WHERE source_id = ?
+          ORDER BY observed_at DESC, id ASC
+        `).all(value.source_id)
+          .map(normalizeDealHunterOpportunitySourceObservationRow);
+      });
+      return replace.immediate(normalizedSnapshot);
     },
 
     async linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt = '' } = {}) {

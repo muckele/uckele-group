@@ -197,6 +197,16 @@ function sourceObservationRecordId(deal = {}) {
   return '';
 }
 
+// This is an observation identity, never a canonical company identity. The
+// complete-source reconciler uses it only to prove the rows supplied by a
+// complete collection are the exact records it is about to replace.
+export function getOpportunitySourceObservationRecordId(deal = {}) {
+  const id = sourceObservationRecordId(deal);
+  return id
+    ? normalizeText(id, 'Opportunity source record id', { maxLength: 200 })
+    : '';
+}
+
 function observationTimestamp(deal = {}, fallback) {
   const sourceTimestamp = deal.lastUpdated || deal.dateAdded;
   return Number.isFinite(Date.parse(sourceTimestamp || '')) ? new Date(sourceTimestamp).toISOString() : fallback;
@@ -237,11 +247,91 @@ export function normalizeOpportunitySourceObservationSnapshot(snapshot = {}) {
   return normalized;
 }
 
+/**
+ * A complete current projection for one already-resolved canonical opportunity
+ * and one source. Unlike the per-source-record snapshot above, this replaces
+ * every current record position for that `(opportunity_id, source_id)` scope.
+ * It contains only bounded observations, never source raw payloads.
+ */
+export function normalizeDealHunterOpportunitySourceSnapshot(snapshot = {}) {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot) || Buffer.isBuffer(snapshot)) {
+    throw new Error('Complete opportunity source-observation snapshot must be an object.');
+  }
+  if (!Array.isArray(snapshot.records)) {
+    throw new Error('Complete opportunity source-observation snapshot records must be an array.');
+  }
+  if (snapshot.records.length === 0) {
+    throw new Error('Complete opportunity source-observation snapshot must include at least one source record.');
+  }
+  if (snapshot.records.length > 10_000) {
+    throw new Error('Complete opportunity source-observation snapshot has too many records.');
+  }
+  const normalized = {
+    opportunity_id: normalizeText(snapshot.opportunity_id, 'Canonical opportunity id', { maxLength: 200 }),
+    source_id: normalizeText(snapshot.source_id, 'Opportunity source id', { maxLength: 160 }),
+    source_name: normalizeText(snapshot.source_name, 'Opportunity source name', { maxLength: 220 }),
+    records: snapshot.records.map(normalizeOpportunitySourceObservationSnapshot),
+  };
+  const recordIds = new Set();
+  for (const record of normalized.records) {
+    if (
+      record.opportunity_id !== normalized.opportunity_id
+      || record.source_id !== normalized.source_id
+      || record.source_name !== normalized.source_name
+    ) {
+      throw new Error('Complete opportunity source-observation snapshot records must share one canonical opportunity and source identity.');
+    }
+    if (recordIds.has(record.source_record_id)) {
+      throw new Error('Complete opportunity source-observation snapshot record identities must be unique.');
+    }
+    recordIds.add(record.source_record_id);
+  }
+  return normalized;
+}
+
+/**
+ * A complete current projection for one authoritative source across every
+ * canonical opportunity it represented. This is used only after collection
+ * proves the raw source is complete and every source record has resolved. Its
+ * unique source-record identities prevent a source-wide delete from being
+ * authorized by a deduped or partial candidate subset.
+ */
+export function normalizeDealHunterSourceSnapshot(snapshot = {}) {
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot) || Buffer.isBuffer(snapshot)) {
+    throw new Error('Complete source-observation snapshot must be an object.');
+  }
+  if (!Array.isArray(snapshot.records)) {
+    throw new Error('Complete source-observation snapshot records must be an array.');
+  }
+  if (snapshot.records.length === 0) {
+    throw new Error('Complete source-observation snapshot must include at least one source record.');
+  }
+  if (snapshot.records.length > 10_000) {
+    throw new Error('Complete source-observation snapshot has too many records.');
+  }
+  const normalized = {
+    source_id: normalizeText(snapshot.source_id, 'Opportunity source id', { maxLength: 160 }),
+    source_name: normalizeText(snapshot.source_name, 'Opportunity source name', { maxLength: 220 }),
+    records: snapshot.records.map(normalizeOpportunitySourceObservationSnapshot),
+  };
+  const recordIds = new Set();
+  for (const record of normalized.records) {
+    if (record.source_id !== normalized.source_id || record.source_name !== normalized.source_name) {
+      throw new Error('Complete source-observation snapshot records must share one source identity.');
+    }
+    if (recordIds.has(record.source_record_id)) {
+      throw new Error('Complete source-observation snapshot record identities must be unique within the source.');
+    }
+    recordIds.add(record.source_record_id);
+  }
+  return normalized;
+}
+
 export function buildOpportunitySourceObservationSnapshot({ opportunityId, deal, now = new Date().toISOString() } = {}) {
   const canonicalOpportunityId = normalizeText(opportunityId, 'Canonical opportunity id', { maxLength: 200 });
   const sourceId = normalizeText(deal?.sourceId, 'Opportunity source id', { maxLength: 160 });
   const sourceName = normalizeText(deal?.sourceName, 'Opportunity source name', { maxLength: 220 });
-  const sourceRecordId = sourceObservationRecordId(deal);
+  const sourceRecordId = getOpportunitySourceObservationRecordId(deal);
   if (!sourceRecordId) return null;
   const timestamp = normalizeTimestamp(now, 'Opportunity source observation timestamp');
   const observedAt = observationTimestamp(deal, timestamp);
