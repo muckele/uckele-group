@@ -64,9 +64,34 @@ function detailResponse(row = queueRow()) {
     opportunity: row, effectiveFacts: {}, operatorFacts: [], sourceObservations: [],
     missingCriticalFields: [], listingUrls: [],
     score: { dimensions: [], summary: {}, confidenceReasons: [], gates: [], appliedCaps: [], missingEvidence: [], unattributedEvidence: [] },
+    brokerMaterials: {
+      existingRequest: null, pursued: true, preparationBlockers: [], sendBlockers: [], warnings: [],
+      recipientOptions: [{ recipientContactRef: 'contact-ref-1', email: 'jane@example.test', displayName: 'Jane Broker', provenance: 'structured_source', provenanceLabel: 'Deal Hunter Sheet · row-42', primary: true }],
+    },
     cimSummary: { requests: [], communications: [] },
     crmSummary: { submission: null, communications: [], factObservations: [], conflicts: [] },
     history: { activities: [], dispositions: [], operatorFacts: [], operatorState: {} },
+  };
+}
+
+function preparedBrokerMaterials(overrides = {}) {
+  return {
+    success: true,
+    previewOnly: false,
+    preparationToken: 'signed.preparation',
+    proposalDigest: 'a'.repeat(64),
+    preparedAt: '2026-09-01T17:00:00.000Z',
+    expiresAt: '2099-09-01T17:15:00.000Z',
+    review: {
+      opportunity: { canonicalOpportunityId: 'opp-1', displayName: 'Evergreen Fire Protection', sourceLabel: 'Deal Hunter Sheet', pursued: true, current: true, score: 68, automatedScoreThreshold: 75, annualProfit: null },
+      recipient: { contactRef: 'contact-ref-1', displayName: 'Jane Broker', email: 'jane@example.test', provenance: 'structured_source' },
+      sender: { displayName: 'Mathew Uckele', email: 'buyer@example.test', replyTo: 'reply@example.test' },
+      message: { requestType: 'cim_request', channel: 'email', greeting: 'Hi Jane,', subject: 'CIM / NDA request for Evergreen Fire Protection', body: 'Hi Jane,\n\nPlease share the CIM.\n\nThank you,\nMathew', templateVersion: 'deal-hunter-cim-manual-stage1-v1' },
+    },
+    recipientOptions: [{ recipientContactRef: 'contact-ref-1', email: 'jane@example.test', displayName: 'Jane Broker', provenance: 'structured_source', provenanceLabel: 'Deal Hunter Sheet · row-42', primary: true }],
+    warnings: [{ code: 'below_automated_cim_score_threshold', message: 'Automated eligibility remains stricter.' }],
+    sendBlockers: [],
+    ...overrides,
   };
 }
 
@@ -1208,5 +1233,182 @@ describe('Acquisition Inbox queue', () => {
       body: { value: 'Alex Broker', note: 'Confirmed with seller.', verified: true },
     }]));
     await waitFor(() => expect(detailLoads).toBe(2));
+  });
+});
+
+describe('Acquisition Inbox Broker Materials authority', () => {
+  test('prepares the canonical selected opportunity with only contactRef/greeting and stores the complete returned proposal', async () => {
+    const writes = [];
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1/broker-materials/prepare')) {
+        writes.push({ url, body: JSON.parse(options.body) });
+        return jsonResponse(preparedBrokerMaterials());
+      }
+      if (url.endsWith('/triage/opp-1')) return jsonResponse(detailResponse());
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Request Broker Materials' }));
+
+    expect(await within(drawer).findByDisplayValue('CIM / NDA request for Evergreen Fire Protection')).toBeVisible();
+    expect(within(drawer).getByDisplayValue(/Please share the CIM/)).toBeVisible();
+    expect(writes).toEqual([{ url: '/api/admin/deal-hunter/triage/opp-1/broker-materials/prepare', body: {} }]);
+
+    fireEvent.change(within(drawer).getByLabelText('Greeting'), { target: { value: 'Hello Jane,' } });
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Update Preview' }));
+    await waitFor(() => expect(writes.at(-1)).toEqual({
+      url: '/api/admin/deal-hunter/triage/opp-1/broker-materials/prepare',
+      body: { recipientContactRef: 'contact-ref-1', greeting: 'Hello Jane,' },
+    }));
+  });
+
+  test('approves with only token/digest, locks duplicate activation, consumes durable authority, and reloads detail', async () => {
+    const approval = deferred();
+    const writes = [];
+    let detailLoads = 0;
+    vi.stubGlobal('fetch', vi.fn((input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/broker-materials/prepare')) return Promise.resolve(jsonResponse(preparedBrokerMaterials()));
+      if (url.endsWith('/broker-materials/approve')) {
+        writes.push({ url, body: JSON.parse(options.body) });
+        return approval.promise;
+      }
+      if (url.endsWith('/triage/opp-1')) {
+        detailLoads += 1;
+        const detail = detailResponse();
+        if (detailLoads > 1) detail.brokerMaterials.existingRequest = {
+          id: 'request-1', status: 'sent', requestState: 'provider_accepted', deliveryState: 'accepted', followUpState: 'not-scheduled',
+          recipient: { email: 'jane@example.test', displayName: 'Jane Broker' }, providerAcceptedAt: '2026-09-01T17:01:00.000Z', updatedAt: '2026-09-01T17:01:00.000Z',
+        };
+        return Promise.resolve(jsonResponse(detail));
+      }
+      return Promise.resolve(jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Request Broker Materials' }));
+    const approve = await screen.findByRole('button', { name: 'Approve & Send' });
+    fireEvent.click(approve);
+    fireEvent.click(approve);
+    fireEvent.keyDown(approve, { key: 'Enter', code: 'Enter' });
+    expect(writes).toEqual([{
+      url: '/api/admin/deal-hunter/triage/opp-1/broker-materials/approve',
+      body: { preparationToken: 'signed.preparation', approvedProposalDigest: 'a'.repeat(64) },
+    }]);
+    expect(approve).toBeDisabled();
+
+    await act(async () => approval.resolve(jsonResponse({
+      success: true, canonicalOpportunityId: 'opp-1', durableResult: { cimRequest: { id: 'request-1', status: 'sent' } },
+    })));
+    expect(await screen.findByText('Sent')).toBeVisible();
+    expect(detailLoads).toBe(2);
+    expect(screen.queryByRole('button', { name: 'Approve & Send' })).not.toBeInTheDocument();
+  });
+
+  test.each([
+    ['durable owner', jsonResponse({ success: true, canonicalOpportunityId: 'opp-1', durableResult: { cimRequest: { id: 'request-1', status: 'sent' } } })],
+    ['preparation stale', jsonResponse({ success: false, code: 'preparation_stale', error: 'Prepare again.' }, { ok: false, status: 409 })],
+    ['send blocker', jsonResponse({ success: false, code: 'cim_outreach_paused', error: 'Sending paused.', sendBlockers: [{ code: 'cim_outreach_paused', message: 'Sending paused.' }] }, { ok: false, status: 409 })],
+    ['definite pre-claim error', jsonResponse({ success: false, code: 'provider_not_ready', error: 'Provider not ready.' }, { ok: false, status: 409 })],
+  ])('reloads authoritative detail after the %s approval response', async (_name, approvalResponse) => {
+    let detailLoads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/broker-materials/prepare')) return jsonResponse(preparedBrokerMaterials());
+      if (url.endsWith('/broker-materials/approve')) return approvalResponse;
+      if (url.endsWith('/triage/opp-1')) { detailLoads += 1; return jsonResponse(detailResponse()); }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Request Broker Materials' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve & Send' }));
+    await waitFor(() => expect(detailLoads).toBe(2));
+  });
+
+  test('unknown approval outcome enters Checking, never retries approval, and Check Again performs GET detail only', async () => {
+    const calls = [];
+    let detailLoads = 0;
+    let failDetail = false;
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      calls.push({ url, method: options.method || 'GET' });
+      if (url.endsWith('/broker-materials/prepare')) return jsonResponse(preparedBrokerMaterials());
+      if (url.endsWith('/broker-materials/approve')) throw new TypeError('Network connection lost');
+      if (url.endsWith('/triage/opp-1')) {
+        detailLoads += 1;
+        if (failDetail) throw new TypeError('Detail unavailable');
+        if (detailLoads > 1) { failDetail = true; throw new TypeError('Detail unavailable'); }
+        return jsonResponse(detailResponse());
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Request Broker Materials' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve & Send' }));
+    expect(await screen.findByText('Checking')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Approve & Send' })).not.toBeInTheDocument();
+    const approveCount = calls.filter(({ url }) => url.endsWith('/broker-materials/approve')).length;
+    fireEvent.click(await screen.findByRole('button', { name: 'Check Again' }));
+    await waitFor(() => expect(detailLoads).toBe(3));
+    expect(calls.filter(({ url }) => url.endsWith('/broker-materials/approve'))).toHaveLength(approveCount);
+    expect(calls.at(-1)).toEqual({ url: '/api/admin/deal-hunter/triage/opp-1', method: 'GET' });
+  });
+
+  test('ignores late prepare and approve responses after selecting a different canonical opportunity', async () => {
+    const latePrepare = deferred();
+    const lateApprove = deferred();
+    const rows = [queueRow({ opportunityId: 'opp-a', name: 'Opportunity A' }), queueRow({ opportunityId: 'opp-b', name: 'Opportunity B' })];
+    let prepareMode = 'late';
+    vi.stubGlobal('fetch', vi.fn((input) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-a/broker-materials/prepare')) return prepareMode === 'late' ? latePrepare.promise : Promise.resolve(jsonResponse(preparedBrokerMaterials({ review: { ...preparedBrokerMaterials().review, opportunity: { ...preparedBrokerMaterials().review.opportunity, canonicalOpportunityId: 'opp-a', displayName: 'Opportunity A' } } })));
+      if (url.endsWith('/triage/opp-a/broker-materials/approve')) return lateApprove.promise;
+      if (url.endsWith('/triage/opp-a')) return Promise.resolve(jsonResponse(detailResponse(rows[0])));
+      if (url.endsWith('/triage/opp-b')) return Promise.resolve(jsonResponse(detailResponse(rows[1])));
+      return Promise.resolve(jsonResponse(queueResponse({ rows, total: 2 })));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Opportunity A' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Request Broker Materials' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Close opportunity detail' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open Opportunity B' }));
+    expect(await screen.findByRole('dialog', { name: 'Opportunity B' })).toBeVisible();
+    await act(async () => latePrepare.resolve(jsonResponse(preparedBrokerMaterials())));
+    expect(screen.queryByDisplayValue('CIM / NDA request for Evergreen Fire Protection')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close opportunity detail' }));
+    prepareMode = 'ready';
+    fireEvent.click(screen.getByRole('button', { name: 'Open Opportunity A' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Request Broker Materials' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve & Send' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Close opportunity detail' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Open Opportunity B' }));
+    await act(async () => lateApprove.resolve(jsonResponse({ success: true, canonicalOpportunityId: 'opp-a', durableResult: { cimRequest: { id: 'late-a', status: 'sent' } } })));
+    expect(screen.getByRole('dialog', { name: 'Opportunity B' })).toBeVisible();
+    expect(screen.queryByText('Sent')).not.toBeInTheDocument();
+  });
+
+  test('viewer can inspect preview authority but can never approve or invoke mutation controls', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/broker-materials/prepare')) return jsonResponse(preparedBrokerMaterials({ previewOnly: true, preparationToken: undefined, proposalDigest: undefined }));
+      if (url.endsWith('/triage/opp-1')) return jsonResponse(detailResponse());
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+    renderInbox({ readOnly: true });
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Preview Broker Materials' }));
+    expect(await screen.findByLabelText('Complete message body')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Approve & Send' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Save verified fact|Correct Recipient|Retry/i })).not.toBeInTheDocument();
   });
 });

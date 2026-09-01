@@ -83,6 +83,14 @@ function detailFixture(overrides = {}) {
       confidenceReasons: ['Core financial fields are present.'], missingEvidence: ['customerConcentration'],
       summary: { strengths: ['Profit is in range.'], concerns: ['Customer concentration is unknown.'] },
     },
+    brokerMaterials: {
+      existingRequest: null,
+      pursued: true,
+      preparationBlockers: [],
+      sendBlockers: [],
+      warnings: [],
+      recipientOptions: [{ recipientContactRef: 'contact-ref-1', email: 'alex@example.com', displayName: 'Alex Broker', provenance: 'structured_source', provenanceLabel: 'Deal Hunter Google Sheet · row-9', primary: true }],
+    },
     cimSummary: {
       requests: [{ id: 'cim-1', status: 'draft', updatedAt: '2026-08-28T18:00:00.000Z' }],
       communications: [{ id: 'communication-1', direction: 'inbound', channel: 'email', kind: 'broker-reply', occurredAt: '2026-08-29T18:00:00.000Z', cimRequestId: 'cim-1' }],
@@ -252,5 +260,24 @@ describe('Opportunity drawer', () => {
     expect(onAction.mock.calls.map(([action]) => action)).toEqual(['pursue', 'watch']);
     expect(screen.getByRole('form', { name: 'Pass Evergreen Fire Protection' })).toBeVisible();
     expect(screen.getByRole('dialog')).toHaveClass('h-full');
+  });
+
+  test('places one Broker Materials card directly below decisions before strengths and keeps durable history in CRM/CIM', () => {
+    const onBrokerMaterialsPrepare = vi.fn();
+    render(<OpportunityDrawer detail={detailFixture()} onAction={vi.fn()} onBrokerMaterialsPrepare={onBrokerMaterialsPrepare} onClose={vi.fn()} />);
+
+    const dialog = screen.getByRole('dialog', { name: 'Evergreen Fire Protection' });
+    const pursue = within(dialog).getByRole('button', { name: 'Pursue Evergreen Fire Protection' });
+    const card = within(dialog).getByRole('region', { name: 'Broker Materials' });
+    const strength = within(dialog).getByText('Recurring inspections support durable demand.');
+    expect(pursue.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(card.compareDocumentPosition(strength) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    fireEvent.click(within(card).getByRole('button', { name: 'Request Broker Materials' }));
+    expect(onBrokerMaterialsPrepare).toHaveBeenCalledWith({});
+    expect(within(card).queryByText(/CIM history|CRM communications|CIM communications/i)).not.toBeInTheDocument();
+    const crmCim = within(dialog).getByRole('heading', { name: 'CRM/CIM' }).parentElement;
+    expect(within(crmCim).getByText('CIM history')).toBeVisible();
+    expect(within(crmCim).getByText('CRM communications')).toBeVisible();
+    expect(within(crmCim).getByText('CIM communications')).toBeVisible();
   });
 });
