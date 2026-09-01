@@ -1,5 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ExternalLink, X } from 'lucide-react';
+import BrokerMaterialsCard from './BrokerMaterialsCard.jsx';
 
 const factFields = [
   ['seller_name', 'Seller name'], ['seller_email', 'Seller email'], ['seller_phone', 'Seller phone'],
@@ -48,8 +49,8 @@ function focusableElements(container) {
     .filter((element) => !element.hasAttribute('hidden') && element.getAttribute('aria-hidden') !== 'true');
 }
 
-function Section({ children, title, ...props }) {
-  return <section className={sectionClass} {...props}><h3 className="text-base font-semibold text-ink">{title}</h3><div className="mt-4">{children}</div></section>;
+function Section({ children, sectionRef, title, ...props }) {
+  return <section className={sectionClass} ref={sectionRef} {...props}><h3 className="text-base font-semibold text-ink">{title}</h3><div className="mt-4">{children}</div></section>;
 }
 
 function Provenance({ fact }) {
@@ -93,8 +94,9 @@ function DetailActions({ name, onAction, onPass, pending }) {
   return <div className="flex flex-wrap gap-2"><button aria-label={`Pursue ${name}`} className={primaryButton} disabled={pending} onClick={() => onAction('pursue')} type="button">Pursue</button><button aria-label={`Watch ${name}`} className={secondaryButton} disabled={pending} onClick={() => onAction('watch')} type="button">Watch</button><button aria-label={`Pass ${name}`} className={`${secondaryButton} text-red-700`} disabled={pending} onClick={onPass} type="button">Pass</button></div>;
 }
 
-function VerifiedFactForm({ detail, onSaveFact, pending }) {
+function VerifiedFactForm({ detail, focusFieldRequest = 0, onSaveFact, pending }) {
   const [draft, setDraft] = useState({ field: factFields[0][0], value: detail.effectiveFacts?.[factFields[0][0]]?.value || '', note: '' });
+  const valueRef = useRef(null);
   function selectField(field) {
     const current = detail.effectiveFacts?.[field];
     setDraft({ field, value: current?.value || '', note: current?.note || '' });
@@ -104,11 +106,18 @@ function VerifiedFactForm({ detail, onSaveFact, pending }) {
     if (!String(draft.value).trim()) return;
     onSaveFact({ field: draft.field, value: String(draft.value).trim(), note: draft.note.trim(), verified: true });
   }
+  useEffect(() => {
+    if (!focusFieldRequest) return;
+    selectField('broker_email');
+    valueRef.current?.focus();
+  // A monotonically increasing request deliberately re-focuses the existing form.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusFieldRequest]);
   return (
     <form className="rounded-xl border border-moss/20 bg-moss/5 p-4" onSubmit={submit}>
       <h4 className="text-sm font-semibold text-ink">Add or edit a verified operator fact</h4>
       <p className="mt-1 text-xs leading-5 text-ink/58">Verified facts remain separate from machine scoring and outrank refreshed source observations.</p>
-      <div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-xs font-semibold text-ink/62">Verified fact field<select aria-label="Verified fact field" className="form-control mt-1" onChange={(event) => selectField(event.target.value)} value={draft.field}>{factFields.map(([field, label]) => <option key={field} value={field}>{label}</option>)}</select></label><label className="text-xs font-semibold text-ink/62">Verified fact value<input aria-label="Verified fact value" className="form-control mt-1" onChange={(event) => setDraft((current) => ({ ...current, value: event.target.value }))} value={draft.value} /></label></div>
+      <div className="mt-3 grid gap-3 sm:grid-cols-2"><label className="text-xs font-semibold text-ink/62">Verified fact field<select aria-label="Verified fact field" className="form-control mt-1" onChange={(event) => selectField(event.target.value)} value={draft.field}>{factFields.map(([field, label]) => <option key={field} value={field}>{label}</option>)}</select></label><label className="text-xs font-semibold text-ink/62">Verified fact value<input aria-label="Verified fact value" className="form-control mt-1" onChange={(event) => setDraft((current) => ({ ...current, value: event.target.value }))} ref={valueRef} value={draft.value} /></label></div>
       <label className="mt-3 block text-xs font-semibold text-ink/62">Verification note<textarea aria-label="Verification note" className="form-control mt-1 min-h-20" onChange={(event) => setDraft((current) => ({ ...current, note: event.target.value }))} value={draft.note} /></label>
       <button className={`${primaryButton} mt-3`} disabled={pending || !String(draft.value).trim()} type="submit">Save verified fact</button>
     </form>
@@ -129,10 +138,16 @@ function conflictKey(observation) {
   return `${observation.sourceId || observation.sourceName}-${observation.sourceRecordId || ''}-${observation.value}`;
 }
 
-export default function OpportunityDrawer({ detail, error = '', focusGuardRef, loading = false, mutationError = '', onAction, onClose, onRetry, onSaveFact, pending = false, readOnly = false }) {
+export default function OpportunityDrawer({
+  brokerMaterialsState = {}, detail, error = '', focusGuardRef, loading = false, mutationError = '', onAction,
+  onBrokerMaterialsApprove, onBrokerMaterialsCheckStatus, onBrokerMaterialsInvalidate, onBrokerMaterialsPrepare,
+  onClose, onRetry, onSaveFact, pending = false, readOnly = false,
+}) {
   const [passOpen, setPassOpen] = useState(false);
+  const [brokerEmailFocusRequest, setBrokerEmailFocusRequest] = useState(0);
   const dialogRef = useRef(null);
   const closeButtonRef = useRef(null);
+  const crmCimRef = useRef(null);
   const opportunity = detail?.opportunity;
   const name = opportunity?.name || 'Opportunity detail';
   const safeUrls = [...new Set((detail?.listingUrls || []).map(safeListingUrl).filter(Boolean))];
@@ -143,7 +158,7 @@ export default function OpportunityDrawer({ detail, error = '', focusGuardRef, l
   const changedState = opportunity?.changedSinceReview ? 'Changed' : 'Current';
   useLayoutEffect(() => {
     closeButtonRef.current?.focus();
-  }, [loading]);
+  }, [opportunity?.opportunityId]);
   function handleDialogKeyDown(event) {
     if (event.key === 'Escape' && !pending) {
       event.preventDefault();
@@ -211,6 +226,25 @@ export default function OpportunityDrawer({ detail, error = '', focusGuardRef, l
               {opportunity.dismissed ? <p className="mt-3 rounded-xl bg-red-50 p-3 text-sm font-semibold text-red-800">Passed: {formatLabel(opportunity.dismissedReason || 'dismissed')}</p> : null}
               <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} pending={pending} /></div>
               {passOpen && actionable ? <div className="mt-4"><PassForm error="" name={name} onCancel={() => setPassOpen(false)} onSubmit={(payload) => onAction('pass', payload)} pending={pending} /></div> : null}
+              <div className="mt-4"><BrokerMaterialsCard
+                brokerMaterials={detail.brokerMaterials}
+                checking={brokerMaterialsState.checking}
+                checkingFailed={brokerMaterialsState.checkingFailed}
+                error={brokerMaterialsState.error}
+                onAddBrokerEmail={() => setBrokerEmailFocusRequest((current) => current + 1)}
+                onApprove={onBrokerMaterialsApprove}
+                onCheckStatus={onBrokerMaterialsCheckStatus}
+                onInvalidatePreparation={onBrokerMaterialsInvalidate}
+                onPrepare={onBrokerMaterialsPrepare}
+                onViewRequest={() => crmCimRef.current?.scrollIntoView?.({ block: 'start' })}
+                preparation={brokerMaterialsState.preparation}
+                preparing={brokerMaterialsState.preparing}
+                readOnly={readOnly}
+                recipientSelection={brokerMaterialsState.recipientSelection}
+                sending={brokerMaterialsState.sending}
+                stale={brokerMaterialsState.stale}
+                updating={brokerMaterialsState.updating}
+              /></div>
               {opportunity.topStrength ? <p className="mt-4 rounded-xl bg-moss/8 p-3 text-sm leading-6 text-moss">{opportunity.topStrength}</p> : null}{opportunity.topConcern ? <p className="mt-2 rounded-xl bg-amber-50 p-3 text-sm leading-6 text-amber-900">{opportunity.topConcern}</p> : null}{detail.missingCriticalFields?.length ? <div className="mt-4"><MissingInformation fields={detail.missingCriticalFields} /></div> : null}
             </Section>
 
@@ -219,7 +253,7 @@ export default function OpportunityDrawer({ detail, error = '', focusGuardRef, l
               <div className="mt-3 grid gap-3 sm:grid-cols-2">{['management_structure', 'customer_concentration', 'reason_for_sale', 'real_estate_included', 'seller_financing'].map((field) => <Fact detail={detail} field={field} key={field} />)}</div>
             </Section>
 
-            <Section title="Broker & Seller"><div className="grid gap-3 sm:grid-cols-2">{['broker_name', 'broker_company', 'broker_email', 'broker_phone', 'seller_name', 'seller_email', 'seller_phone', 'operator_contact_notes'].map((field) => <Fact detail={detail} field={field} key={field} />)}</div>{!readOnly && onSaveFact ? <div className="mt-4"><VerifiedFactForm detail={detail} key={opportunity.opportunityId} onSaveFact={onSaveFact} pending={pending} /></div> : null}</Section>
+            <Section title="Broker & Seller"><div className="grid gap-3 sm:grid-cols-2">{['broker_name', 'broker_company', 'broker_email', 'broker_phone', 'seller_name', 'seller_email', 'seller_phone', 'operator_contact_notes'].map((field) => <Fact detail={detail} field={field} key={field} />)}</div>{!readOnly && onSaveFact ? <div className="mt-4"><VerifiedFactForm detail={detail} focusFieldRequest={brokerEmailFocusRequest} key={opportunity.opportunityId} onSaveFact={onSaveFact} pending={pending} /></div> : null}</Section>
 
             <Section title="Score & Evidence">
               {strengths.length || concerns.length ? <div className="grid gap-3 sm:grid-cols-2">{strengths.length ? <div className="rounded-xl bg-moss/8 p-3"><h4 className="text-sm font-semibold text-moss">Strengths</h4>{strengths.map((item) => <p className="mt-1 text-sm text-ink/70" key={item}>{item}</p>)}</div> : null}{concerns.length ? <div className="rounded-xl bg-amber-50 p-3"><h4 className="text-sm font-semibold text-amber-900">Concerns</h4>{concerns.map((item) => <p className="mt-1 text-sm text-ink/70" key={item}>{item}</p>)}</div> : null}</div> : null}
@@ -233,7 +267,7 @@ export default function OpportunityDrawer({ detail, error = '', focusGuardRef, l
               <div className={safeUrls.length ? 'mt-4 space-y-3' : 'space-y-3'}>{detail.sourceObservations?.map((source) => <div className="rounded-xl border border-line/70 p-3" key={`${source.sourceId}-${source.sourceRecordId}`}><div className="flex flex-wrap items-center gap-2"><h4 className="text-sm font-semibold text-ink">{source.sourceName || source.sourceId}</h4>{source.sourceRecordId ? <span className="text-xs text-ink/48">{source.sourceRecordId}</span> : null}{source.observedAt ? <span className="text-xs text-ink/48">Observed {formatDate(source.observedAt)}</span> : null}</div><dl className="mt-2 grid gap-1 text-xs sm:grid-cols-2">{Object.entries(source.values || {}).filter(([, value]) => hasValue(value)).map(([field, value]) => <div className="flex gap-2" key={field}><dt className="font-semibold text-ink/55">{formatLabel(field)}</dt><dd className="break-all text-ink/72">{String(value)}</dd></div>)}</dl>{source.conflicts?.map((conflict) => <div className="mt-2 rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-900" key={conflict.field}><h5 className="font-semibold">Conflict: {formatLabel(conflict.field)}</h5>{conflict.observations?.map((observation, index) => <p className="mt-1" key={`${conflictKey(observation)}-${index}`}>{observation.sourceName || observation.sourceId} reported {observation.value}</p>)}</div>)}</div>)}</div>
             </Section>
 
-            <Section title="CRM/CIM">
+            <Section sectionRef={crmCimRef} title="CRM/CIM">
               {detail.crmSummary?.submission ? <div className="rounded-xl bg-fog/70 p-3"><h4 className="text-sm font-semibold text-ink">CRM record</h4><p className="mt-2 text-sm text-ink/68">{detail.crmSummary.submission.company} · {formatLabel(detail.crmSummary.submission.status)}{detail.crmSummary.submission.updatedAt ? ` · ${formatDate(detail.crmSummary.submission.updatedAt)}` : ''}</p>{[['Seller', detail.crmSummary.submission.sellerName, detail.crmSummary.submission.sellerEmail], ['Broker', detail.crmSummary.submission.brokerName, detail.crmSummary.submission.brokerEmail]].map(([label, person, email]) => person || email ? <p className="mt-1 text-sm text-ink/68" key={label}>{label}: {[person, email].filter(Boolean).join(' · ')}</p> : null)}</div> : null}
               {detail.crmSummary?.factObservations?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">CRM facts</h4>{detail.crmSummary.factObservations.map((fact) => <p className="mt-2 rounded-lg bg-fog/60 p-3 text-sm text-ink/68" key={fact.field}>CRM fact · {formatLabel(fact.field)} · {String(fact.value)}</p>)}</div> : null}{detail.crmSummary?.conflicts?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">CRM conflicts</h4>{detail.crmSummary.conflicts.map((conflict) => <p className="mt-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-900" key={conflict.field}>CRM conflict · {formatLabel(conflict.field)} · {conflict.crmValue} · {formatLabel(conflict.winningProvenance)} wins</p>)}</div> : null}
               {detail.cimSummary?.requests?.length ? <div className="mt-4"><h4 className="text-sm font-semibold text-ink">CIM history</h4>{detail.cimSummary.requests.map((request) => <p className="mt-2 rounded-lg bg-fog/60 p-3 text-sm text-ink/68" key={request.id}>{formatLabel(request.status)}{request.updatedAt ? ` · ${formatDate(request.updatedAt)}` : ''}</p>)}</div> : null}<CommunicationList communications={detail.crmSummary?.communications} title="CRM communications" /><CommunicationList communications={detail.cimSummary?.communications} title="CIM communications" />

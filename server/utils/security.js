@@ -12,6 +12,44 @@ export function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function canonicalJsonValue(value, path = '$') {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError(`Unsupported non-finite number at ${path}.`);
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (Object.getOwnPropertySymbols(value).length > 0) throw new TypeError(`Unsupported symbol key at ${path}.`);
+    const propertyNames = Object.getOwnPropertyNames(value);
+    const allowedNames = new Set(['length', ...Array.from({ length: value.length }, (_, index) => String(index))]);
+    if (propertyNames.some((key) => !allowedNames.has(key))) throw new TypeError(`Unsupported array property at ${path}.`);
+    const result = [];
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) throw new TypeError(`Unsupported sparse array at ${path}.`);
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) throw new TypeError(`Unsupported array property at ${path}[${index}].`);
+      result.push(canonicalJsonValue(descriptor.value, `${path}[${index}]`));
+    }
+    return result;
+  }
+  if (typeof value === 'object') {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) throw new TypeError(`Unsupported object at ${path}.`);
+    if (Object.getOwnPropertySymbols(value).length > 0) throw new TypeError(`Unsupported symbol key at ${path}.`);
+    return Object.getOwnPropertyNames(value).sort().reduce((result, key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) throw new TypeError(`Unsupported object property at ${path}.${key}.`);
+      result[key] = canonicalJsonValue(descriptor.value, `${path}.${key}`);
+      return result;
+    }, Object.create(null));
+  }
+  throw new TypeError(`Unsupported JSON value at ${path}.`);
+}
+
+export function stableCanonicalJson(value) {
+  return JSON.stringify(canonicalJsonValue(value));
+}
+
 export function hashIp(value) {
   return sha256(value).slice(0, 24);
 }

@@ -8582,6 +8582,13 @@ export function createSqliteStorage(config) {
       return row ? { ...row, metadata: parseJsonColumn(row.metadata, {}) } : null;
     },
 
+    async getDealHunterCimRecipientClaim(recipientEmail) {
+      const recipient = String(recipientEmail || '').trim().toLowerCase();
+      if (!recipient) return null;
+      const row = database.prepare(`SELECT * FROM deal_hunter_cim_recipient_claims WHERE recipient_email = ? LIMIT 1`).get(recipient);
+      return row ? { ...row, metadata: parseJsonColumn(row.metadata, {}) } : null;
+    },
+
     async claimDealHunterCimRecipient({ recipientEmail = '', requestId = '', opportunityId = '', nowIso = '', expiresAt = '', metadata = {} } = {}) {
       if (!recipientEmail || !requestId || !opportunityId || !nowIso || !expiresAt) return { claimed: false, reason: 'invalid-claim' };
       const recipient = String(recipientEmail).trim().toLowerCase();

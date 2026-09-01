@@ -14,6 +14,14 @@ const views = [
 ];
 const buttonClass = 'inline-flex min-h-9 items-center justify-center rounded-full border border-line bg-white px-3 py-1.5 text-xs font-semibold text-ink transition hover:border-moss/35 hover:text-moss disabled:cursor-not-allowed disabled:opacity-50';
 const primaryButtonClass = 'inline-flex min-h-9 items-center justify-center rounded-full border border-moss bg-moss px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-pine disabled:opacity-50';
+const emptyBrokerMaterialsState = {
+  preparation: null, recipientSelection: null, preparing: false, updating: false, sending: false,
+  checking: false, checkingFailed: false, stale: false, error: '',
+};
+
+function withoutApprovalAuthority(preparation) {
+  return preparation ? { ...preparation, preparationToken: '', proposalDigest: '' } : null;
+}
 
 function money(value) {
   if (value === null || value === undefined || value === '') return '—';
@@ -147,10 +155,14 @@ export default function AcquisitionInbox({ readOnly = false }) {
   const [pendingId, setPendingId] = useState('');
   const [selectedId, setSelectedId] = useState('');
   const [detail, setDetail] = useState({ requestedId: '', data: null, loading: false, error: '' });
+  const [brokerMaterialsState, setBrokerMaterialsState] = useState(emptyBrokerMaterialsState);
   const [passTarget, setPassTarget] = useState(null);
   const queueRequestRef = useRef({ generation: 0, controller: null });
   const queueQueryRef = useRef(null);
   const detailRequestRef = useRef({ generation: 0, controller: null });
+  const brokerPrepareRequestRef = useRef({ generation: 0, controller: null });
+  const brokerApprovalRequestRef = useRef({ generation: 0, controller: null });
+  const brokerApprovalPendingRef = useRef(false);
   const selectionRef = useRef('');
   const mutationGenerationRef = useRef(0);
   const mutationPendingRef = useRef(false);
@@ -218,7 +230,13 @@ export default function AcquisitionInbox({ readOnly = false }) {
       if (result?.opportunity?.opportunityId !== opportunityId) throw new Error('Opportunity detail did not match the selected record.');
       if (detailRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
       setDetail({ requestedId: opportunityId, data: result, loading: false, error: '' });
-      return true;
+      setBrokerMaterialsState((current) => {
+        if (result.brokerMaterials?.existingRequest) return emptyBrokerMaterialsState;
+        return current.preparation && Array.isArray(result.brokerMaterials?.sendBlockers)
+          ? { ...current, preparation: { ...current.preparation, sendBlockers: result.brokerMaterials.sendBlockers } }
+          : current;
+      });
+      return result;
     } catch (detailError) {
       if (isAbortError(detailError) || detailRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
       setDetail((current) => ({
@@ -234,6 +252,12 @@ export default function AcquisitionInbox({ readOnly = false }) {
   }, []);
 
   function openDetail(opportunityId, trigger) {
+    brokerPrepareRequestRef.current.controller?.abort();
+    brokerPrepareRequestRef.current = { generation: brokerPrepareRequestRef.current.generation + 1, controller: null };
+    brokerApprovalRequestRef.current.controller?.abort();
+    brokerApprovalRequestRef.current = { generation: brokerApprovalRequestRef.current.generation + 1, controller: null };
+    brokerApprovalPendingRef.current = false;
+    setBrokerMaterialsState(emptyBrokerMaterialsState);
     detailTriggerRef.current = trigger || null;
     detailFocusGuardRef.current = true;
     selectionRef.current = opportunityId;
@@ -249,6 +273,12 @@ export default function AcquisitionInbox({ readOnly = false }) {
     detailRequestRef.current = { generation: detailRequestRef.current.generation + 1, controller: null };
     setSelectedId('');
     setDetail({ requestedId: '', data: null, loading: false, error: '' });
+    brokerPrepareRequestRef.current.controller?.abort();
+    brokerPrepareRequestRef.current = { generation: brokerPrepareRequestRef.current.generation + 1, controller: null };
+    brokerApprovalRequestRef.current.controller?.abort();
+    brokerApprovalRequestRef.current = { generation: brokerApprovalRequestRef.current.generation + 1, controller: null };
+    brokerApprovalPendingRef.current = false;
+    setBrokerMaterialsState(emptyBrokerMaterialsState);
     setMutationError('');
     const trigger = detailTriggerRef.current;
     if (trigger?.isConnected) trigger.focus();
@@ -332,7 +362,7 @@ export default function AcquisitionInbox({ readOnly = false }) {
       });
       const result = await response.json();
       if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save the verified fact.');
-      if (selectionRef.current === opportunityId) await loadDetail(opportunityId);
+      if (selectionRef.current === opportunityId) await loadDetail(opportunityId, { preserveData: true });
       return true;
     } catch (factError) {
       if (mutationGenerationRef.current === mutationGeneration) setMutationError(factError.message || 'Unable to save the verified fact.');
@@ -345,11 +375,144 @@ export default function AcquisitionInbox({ readOnly = false }) {
     }
   }
 
+  function invalidateBrokerMaterialsPreparation() {
+    setBrokerMaterialsState((current) => ({ ...current, preparation: withoutApprovalAuthority(current.preparation), stale: false }));
+  }
+
+  async function prepareBrokerMaterials(opportunityId, requestedBody = {}) {
+    if (!opportunityId || selectionRef.current !== opportunityId) return false;
+    brokerPrepareRequestRef.current.controller?.abort();
+    const controller = new AbortController();
+    const generation = brokerPrepareRequestRef.current.generation + 1;
+    brokerPrepareRequestRef.current = { generation, controller };
+    const body = {};
+    if (requestedBody.recipientContactRef) body.recipientContactRef = requestedBody.recipientContactRef;
+    if (requestedBody.greeting !== undefined) body.greeting = requestedBody.greeting;
+    setBrokerMaterialsState((current) => ({
+      ...current,
+      preparation: current.preparation ? withoutApprovalAuthority(current.preparation) : null,
+      preparing: !current.preparation && !current.recipientSelection,
+      updating: Boolean(current.preparation || current.recipientSelection),
+      checking: false,
+      checkingFailed: false,
+      stale: false,
+      error: '',
+    }));
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/prepare`, {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: controller.signal,
+      });
+      const result = await response.json();
+      if (brokerPrepareRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      if (result.code === 'recipient_selection_required' && !result.review) {
+        setBrokerMaterialsState({
+          ...emptyBrokerMaterialsState,
+          recipientSelection: {
+            code: result.code,
+            message: result.error || 'Select one authoritative broker recipient before preparing the request.',
+            recipientOptions: Array.isArray(result.recipientOptions) ? result.recipientOptions : [],
+            warnings: Array.isArray(result.warnings) ? result.warnings : [],
+            sendBlockers: Array.isArray(result.sendBlockers) ? result.sendBlockers : [],
+          },
+          error: response.ok && result.success ? '' : result.error || 'Unable to prepare broker materials.',
+        });
+        return false;
+      }
+      if (!response.ok || !result.success) {
+        const isStale = result.code === 'preparation_stale' || result.code === 'preparation_expired';
+        setBrokerMaterialsState((current) => ({
+          ...current,
+          preparation: result.review ? { ...result, preparationToken: '', proposalDigest: '' } : withoutApprovalAuthority(current.preparation),
+          preparing: false, updating: false, stale: isStale,
+          error: result.error || 'Unable to prepare broker materials.',
+        }));
+        return false;
+      }
+      setBrokerMaterialsState({ ...emptyBrokerMaterialsState, preparation: result });
+      return true;
+    } catch (prepareError) {
+      if (isAbortError(prepareError) || brokerPrepareRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      setBrokerMaterialsState((current) => ({ ...current, preparing: false, updating: false, error: prepareError.message || 'Unable to prepare broker materials.' }));
+      return false;
+    } finally {
+      if (brokerPrepareRequestRef.current.generation === generation) brokerPrepareRequestRef.current.controller = null;
+    }
+  }
+
+  async function reconcileBrokerMaterials(opportunityId) {
+    const refreshed = await loadDetail(opportunityId, { preserveData: true });
+    if (!refreshed || selectionRef.current !== opportunityId) return refreshed;
+    if (refreshed.brokerMaterials?.existingRequest) setBrokerMaterialsState(emptyBrokerMaterialsState);
+    return refreshed;
+  }
+
+  async function approveBrokerMaterials(opportunityId, preparation) {
+    if (!opportunityId || selectionRef.current !== opportunityId || readOnly || brokerApprovalPendingRef.current || !preparation?.preparationToken || !preparation?.proposalDigest) return false;
+    brokerApprovalPendingRef.current = true;
+    const controller = new AbortController();
+    const generation = brokerApprovalRequestRef.current.generation + 1;
+    brokerApprovalRequestRef.current.controller?.abort();
+    brokerApprovalRequestRef.current = { generation, controller };
+    setBrokerMaterialsState((current) => ({ ...current, sending: true, checking: false, checkingFailed: false, error: '' }));
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/approve`, {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ preparationToken: preparation.preparationToken, approvedProposalDigest: preparation.proposalDigest }), signal: controller.signal,
+      });
+      const result = await response.json();
+      if (brokerApprovalRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      const stale = result.code === 'preparation_stale' || result.code === 'preparation_expired';
+      const durable = Boolean(result.durableResult || result.code === 'existing_request');
+      setBrokerMaterialsState((current) => ({
+        ...current,
+        preparation: stale || durable ? withoutApprovalAuthority(current.preparation) : result.sendBlockers?.length ? { ...current.preparation, sendBlockers: result.sendBlockers } : current.preparation,
+        sending: false, stale, error: response.ok && result.success ? '' : result.error || 'Unable to send broker materials.',
+      }));
+      const refreshed = await reconcileBrokerMaterials(opportunityId);
+      if (brokerApprovalRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      if (durable && !refreshed?.brokerMaterials?.existingRequest) {
+        setBrokerMaterialsState((current) => ({ ...current, preparation: null, sending: false, checking: true, checkingFailed: !refreshed, stale: false, error: '' }));
+      } else if (!refreshed?.brokerMaterials?.existingRequest) {
+        setBrokerMaterialsState((current) => ({ ...current, sending: false, stale, error: response.ok && result.success ? '' : result.error || current.error }));
+      }
+      return response.ok && result.success;
+    } catch (approvalError) {
+      if (isAbortError(approvalError) || brokerApprovalRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      setBrokerMaterialsState((current) => ({ ...current, preparation: withoutApprovalAuthority(current.preparation), sending: false, checking: true, checkingFailed: false, stale: false, error: '' }));
+      const refreshed = await reconcileBrokerMaterials(opportunityId);
+      if (brokerApprovalRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      if (!refreshed) setBrokerMaterialsState((current) => ({ ...current, preparation: null, sending: false, checking: true, checkingFailed: true, error: '' }));
+      else if (!refreshed.brokerMaterials?.existingRequest) setBrokerMaterialsState((current) => ({ ...current, preparation: null, sending: false, checking: true, checkingFailed: false, error: '' }));
+      return false;
+    } finally {
+      if (brokerApprovalRequestRef.current.generation === generation) {
+        brokerApprovalRequestRef.current.controller = null;
+        brokerApprovalPendingRef.current = false;
+        setBrokerMaterialsState((current) => ({ ...current, sending: false }));
+      }
+    }
+  }
+
+  async function checkBrokerMaterialsStatus(opportunityId) {
+    if (!opportunityId || selectionRef.current !== opportunityId) return false;
+    setBrokerMaterialsState((current) => ({ ...current, preparation: null, checking: true, checkingFailed: false, error: '' }));
+    const refreshed = await reconcileBrokerMaterials(opportunityId);
+    if (selectionRef.current !== opportunityId) return false;
+    if (!refreshed) setBrokerMaterialsState((current) => ({ ...current, checking: true, checkingFailed: true }));
+    else if (!refreshed.brokerMaterials?.existingRequest) setBrokerMaterialsState((current) => ({ ...current, checking: true, checkingFailed: false }));
+    return Boolean(refreshed);
+  }
+
   useEffect(() => () => {
     detailFocusGuardRef.current = false;
     passFocusGuardRef.current = false;
     detailRequestRef.current.controller?.abort();
     detailRequestRef.current.generation += 1;
+    brokerPrepareRequestRef.current.controller?.abort();
+    brokerPrepareRequestRef.current.generation += 1;
+    brokerApprovalRequestRef.current.controller?.abort();
+    brokerApprovalRequestRef.current.generation += 1;
+    brokerApprovalPendingRef.current = false;
     selectionRef.current = '';
   }, []);
 
@@ -388,7 +551,7 @@ export default function AcquisitionInbox({ readOnly = false }) {
         </div>
       </div>
 
-      {selectedId ? <OpportunityDrawer detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onClose={closeDetail} onRetry={() => loadDetail(selectedId)} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} readOnly={readOnly} /> : null}
+      {selectedId ? <OpportunityDrawer brokerMaterialsState={brokerMaterialsState} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onClose={closeDetail} onRetry={() => loadDetail(selectedId)} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} readOnly={readOnly} /> : null}
       {passTarget ? <QueuePassDialog error={mutationError} focusGuardRef={passFocusGuardRef} name={passTarget.name} onCancel={closeQueuePass} onSubmit={(payload) => recordAction(passTarget.opportunityId, 'pass', payload)} pending={pendingId === passTarget.opportunityId} /> : null}
     </section>
   );

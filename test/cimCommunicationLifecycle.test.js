@@ -37,6 +37,20 @@ const originalFetch = globalThis.fetch;
 let activeStorage = null;
 let resendMode = 'ok';
 let resendCalls = [];
+const boundedCimRequestKeys = [
+  'canCorrectRecipient', 'canRetry', 'correctionRoute', 'createdAt', 'deliveredAt', 'deliveryState',
+  'errorSummary', 'followUpState', 'id', 'providerAcceptedAt', 'recipient', 'requestedAt', 'requestState',
+  'respondedAt', 'retryRoute', 'status', 'subject', 'updatedAt',
+].sort();
+
+function assertBoundedCimRequest(request) {
+  assert.deepEqual(Object.keys(request).sort(), boundedCimRequestKeys);
+  assert.deepEqual(Object.keys(request.recipient).sort(), ['displayName', 'email']);
+  for (const rawKey of [
+    'metadata', 'administratorPrincipalId', 'proposalDigest', 'nonce', 'preparedAt', 'delivery_error',
+    'provider_response', 'request_state', 'delivery_state', 'follow_up_state', 'signature', 'approvalClaims',
+  ]) assert.equal(Object.hasOwn(request, rawKey), false, `${rawKey} must not cross the approval boundary`);
+}
 
 before(() => {
   globalThis.fetch = async (url, options = {}) => {
@@ -98,6 +112,83 @@ async function reviewedDeal(storage) {
   const deal = review.qualified.find((item) => item.cimRequest?.canRequest);
   assert.ok(deal, 'fixture should produce a CIM-ready opportunity');
   return deal;
+}
+
+async function preparedManualApproval(storage) {
+  const deal = await reviewedDeal(storage);
+  const scoredAt = new Date().toISOString();
+  await storage.writeDealHunterOpportunityScore({
+    opportunity_id: deal.opportunityId,
+    scored_at: scoredAt,
+    deal_key: deal.dealKey,
+    name: deal.name,
+    state: deal.state || '',
+    listing_url: deal.listingUrl || '',
+    fit_score: 70,
+    score_status: 'watchlist',
+    confidence: 'medium',
+    completeness_score: 70,
+    contradiction_count: 0,
+    missing_evidence_count: 0,
+    should_remove: false,
+    high_fit: false,
+    gate_count: 0,
+    score_fingerprint: `manual-score-${deal.opportunityId}`,
+    semantic_digest: `manual-semantic-${deal.opportunityId}`,
+    engine_version: 'manual-approval-test',
+    rules_version: 'manual-approval-test',
+    profile_version: 'manual-approval-test',
+    completeness_policy_version: 'manual-approval-test',
+    dimensions: [], gates: [], applied_caps: [], missing_evidence: [], confidence_reasons: [], summary: {},
+  }, []);
+  await storage.reconcileDealHunterCurrentScoreEligibility([deal.opportunityId]);
+  const { setTriageOperatorDecision } = await import('../server/services/dealHunterTriage.js');
+  const decision = await setTriageOperatorDecision({
+    opportunityId: deal.opportunityId,
+    priority: 'high',
+    markReviewed: true,
+    actor: 'manual-approval-admin',
+    storage,
+  });
+  assert.equal(decision.ok, true, decision.error);
+  const {
+    loadBrokerMaterialsAuthority,
+    prepareDealHunterBrokerMaterials,
+  } = await import('../server/services/dealHunterBrokerMaterials.js');
+  const authority = await loadBrokerMaterialsAuthority({ opportunityId: deal.opportunityId, storage });
+  const recipient = authority.recipientOptions.find((option) => option.email === deal.brokerEmail)
+    || authority.recipientOptions[0];
+  assert.ok(recipient, 'fixture must expose an authoritative recipient');
+  const preparation = await prepareDealHunterBrokerMaterials({
+    opportunityId: deal.opportunityId,
+    recipientContactRef: recipient.recipientContactRef,
+    greeting: 'Hello Erin,',
+    session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+    storage,
+  });
+  assert.equal(preparation.success, true, preparation.error);
+  return { deal, preparation };
+}
+
+async function approvePreparedManual({ storage, preparation }) {
+  const { approveDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
+  return approveDealHunterBrokerMaterials({
+    opportunityId: preparation.review.opportunity.canonicalOpportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+    storage,
+  });
+}
+
+function observeApprovalDispositionReads(storage) {
+  const listDispositions = storage.listDealHunterDispositions.bind(storage);
+  let reads = 0;
+  storage.listDealHunterDispositions = async (...args) => {
+    reads += 1;
+    return listDispositions(...args);
+  };
+  return () => reads;
 }
 
 test('production EmailJS CIM delivery fails closed before any provider call', () => {
@@ -285,6 +376,339 @@ test('direct CIM send preserves the signed approved copy when a later healthy re
   assert.equal(result.request.metadata.industry, deal.industry);
   assert.doesNotMatch(communication.body_text, /changed after approval/i);
   assert.doesNotMatch(communication.body_html_sanitized, /changed after approval/i);
+});
+
+test('approved manual Stage 1 uses the existing durable executor once, persists exact signed copy, and never schedules follow-up', async (t) => {
+  // Break caught: Task 2 has no trusted entry into the existing executor and
+  // therefore cannot preserve exact approved copy or the manual no-follow-up policy.
+  const storage = testStorage(t);
+  const { preparation } = await preparedManualApproval(storage);
+  const service = await import('../server/services/dealHunterBrokerMaterials.js');
+  const dealHunter = await import('../server/services/dealHunter.js');
+  const { getConfig } = await import('../server/config.js');
+  const { verifySignedPayload } = await import('../server/utils/security.js');
+  assert.equal(typeof service.approveDealHunterBrokerMaterials, 'function');
+  assert.equal(typeof dealHunter.executeApprovedDealHunterCimRequest, 'function');
+  const signedClaims = verifySignedPayload(preparation.preparationToken, getConfig().admin.sessionSecret);
+  assert.ok(signedClaims);
+
+  const first = await service.approveDealHunterBrokerMaterials({
+    opportunityId: preparation.review.opportunity.canonicalOpportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+    storage,
+  });
+  assert.equal(first.success, true);
+  const request = first.durableResult.cimRequest;
+  assert.equal(request.id, signedClaims.approvalBoundPayload.prospectiveRequestId);
+  assert.equal(resendCalls.length, 1);
+  assert.equal(
+    resendCalls[0].body.from,
+    `${preparation.review.sender.displayName} <${preparation.review.sender.email}>`,
+  );
+  assert.deepEqual(resendCalls[0].body.to, [preparation.review.recipient.email]);
+  assert.equal(resendCalls[0].body.reply_to, preparation.review.sender.replyTo);
+  assert.equal(resendCalls[0].body.subject, preparation.review.message.subject);
+  assert.equal(resendCalls[0].body.text, preparation.review.message.body);
+  assert.equal(resendCalls[0].body.html, preparation.review.message.html);
+
+  assertBoundedCimRequest(request);
+  assert.equal(request.recipient.email, preparation.review.recipient.email);
+  assert.equal(request.followUpState, 'not-scheduled');
+  const storedRequest = await storage.getDealHunterCimRequestById(request.id);
+  assert.equal(storedRequest.next_follow_up_at, null);
+  assert.equal(storedRequest.metadata?.manualApproval?.intent, 'manual_stage_1');
+  assert.equal(storedRequest.metadata?.manualApproval?.followUpPolicy, 'none');
+  const page = await storage.listCrmCommunications({ submissionId: storedRequest.submission_id, page: 1, pageSize: 25 });
+  assert.equal(page.total, 1);
+  const [communication] = page.rows;
+  assert.equal(communication.cim_request_id, request.id);
+  assert.equal(communication.kind, 'deal-hunter-cim-request');
+  assert.equal(communication.from_address, preparation.review.sender.email);
+  assert.deepEqual(communication.to_addresses, [preparation.review.recipient.email]);
+  assert.equal(communication.reply_to_address, preparation.review.sender.replyTo);
+  assert.equal(communication.subject, preparation.review.message.subject);
+  assert.equal(communication.body_text, preparation.review.message.body);
+  assert.equal(communication.body_html_sanitized, preparation.review.message.html);
+  assert.equal(communication.metadata?.templateVersion, preparation.review.message.templateVersion);
+  assert.equal(resendCalls[0].idempotencyKey, communication.idempotency_key);
+
+  const replay = await service.approveDealHunterBrokerMaterials({
+    opportunityId: preparation.review.opportunity.canonicalOpportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+    storage,
+  });
+  assert.equal(replay.success, true);
+  assertBoundedCimRequest(replay.durableResult.cimRequest);
+  assert.equal(replay.durableResult.cimRequest.id, request.id);
+  assert.deepEqual(Object.keys(replay.durableResult.cimRequest).sort(), Object.keys(request).sort());
+  assert.equal(resendCalls.length, 1, 'replaying the approval must not call the provider twice');
+});
+
+test('manual approval fails closed when final disposition authority throws after approval revalidation', async (t) => {
+  // Break caught: the shared executor treats an indeterminate final disposition
+  // as clear authority for trusted manual Stage 1 and reaches the provider.
+  const storage = testStorage(t);
+  const { preparation } = await preparedManualApproval(storage);
+  const approvalDispositionReads = observeApprovalDispositionReads(storage);
+  let finalDispositionReads = 0;
+  storage.getDealHunterDisposition = async () => {
+    finalDispositionReads += 1;
+    throw new Error('simulated final disposition authority outage');
+  };
+
+  const result = await approvePreparedManual({ storage, preparation });
+  const request = result.durableResult?.cimRequest;
+  const storedRequest = request?.id ? await storage.getDealHunterCimRequestById(request.id) : null;
+
+  assert.equal(approvalDispositionReads(), 1, 'approval revalidation must first establish current disposition authority');
+  assert.equal(finalDispositionReads, 1, 'the durable executor must perform its final disposition read');
+  assert.equal(resendCalls.length, 0, 'indeterminate final disposition authority must block provider work');
+  assert.equal(result.success, true, 'the already-created durable request remains authoritative');
+  assert.equal(request.status, 'failed');
+  assert.equal(request.providerAcceptedAt, '');
+  assert.equal(storedRequest.provider_message_id || '', '');
+  assert.equal(storedRequest.first_provider_accepted_at, null);
+  assert.match(storedRequest.delivery_error, /final dismissal check is unavailable/i);
+});
+
+test('manual approval fails closed when final disposition capability is unavailable', async (t) => {
+  // Break caught: an absent final disposition reader is treated as clear
+  // authority for trusted manual Stage 1 and reaches the provider.
+  const storage = testStorage(t);
+  const { preparation } = await preparedManualApproval(storage);
+  const approvalDispositionReads = observeApprovalDispositionReads(storage);
+  storage.getDealHunterDisposition = undefined;
+
+  const result = await approvePreparedManual({ storage, preparation });
+  const request = result.durableResult?.cimRequest;
+  const storedRequest = request?.id ? await storage.getDealHunterCimRequestById(request.id) : null;
+
+  assert.equal(approvalDispositionReads(), 1, 'approval revalidation must first establish current disposition authority');
+  assert.equal(resendCalls.length, 0, 'missing final disposition capability must block provider work');
+  assert.equal(result.success, true, 'the already-created durable request remains authoritative');
+  assert.equal(request.status, 'failed');
+  assert.equal(request.providerAcceptedAt, '');
+  assert.equal(storedRequest.provider_message_id || '', '');
+  assert.equal(storedRequest.first_provider_accepted_at, null);
+  assert.match(storedRequest.delivery_error, /final dismissal check is unavailable/i);
+});
+
+test('manual approval blocks a late Pass returned after approval revalidation', async (t) => {
+  // Break caught: a Pass winning the approval-to-claim race reaches the
+  // provider instead of becoming durable no-send evidence.
+  const storage = testStorage(t);
+  const { deal, preparation } = await preparedManualApproval(storage);
+  const approvalDispositionReads = observeApprovalDispositionReads(storage);
+  let finalDispositionReads = 0;
+  storage.getDealHunterDisposition = async () => {
+    finalDispositionReads += 1;
+    return { id: 'manual-late-pass', deal_key: deal.dealKey, disposition: 'dismissed' };
+  };
+
+  const result = await approvePreparedManual({ storage, preparation });
+  const request = result.durableResult?.cimRequest;
+  const storedRequest = request?.id ? await storage.getDealHunterCimRequestById(request.id) : null;
+
+  assert.equal(approvalDispositionReads(), 1, 'approval revalidation must first establish current disposition authority');
+  assert.equal(finalDispositionReads, 1);
+  assert.equal(resendCalls.length, 0, 'a late returned Pass must block provider work');
+  assert.equal(result.success, true, 'the already-created durable request remains authoritative');
+  assert.equal(request.status, 'failed');
+  assert.equal(request.providerAcceptedAt, '');
+  assert.equal(storedRequest.provider_message_id || '', '');
+  assert.equal(storedRequest.first_provider_accepted_at, null);
+  assert.match(storedRequest.delivery_error, /dismissed before provider work/i);
+});
+
+test('manual approval returns a durable failed request instead of an unsafe transport error', async (t) => {
+  const storage = testStorage(t);
+  const { preparation } = await preparedManualApproval(storage);
+  const { approveDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
+  assert.equal(typeof approveDealHunterBrokerMaterials, 'function');
+  resendMode = 'fail';
+  const result = await approveDealHunterBrokerMaterials({
+    opportunityId: preparation.review.opportunity.canonicalOpportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+    storage,
+  });
+  assert.equal(result.success, true);
+  assertBoundedCimRequest(result.durableResult.cimRequest);
+  assert.equal(result.durableResult.cimRequest.status, 'failed');
+  assert.equal(result.durableResult.cimRequest.followUpState, 'not-scheduled');
+  assert.equal((await storage.getDealHunterCimRequestById(result.durableResult.cimRequest.id)).next_follow_up_at, null);
+  assert.equal(resendCalls.length, 1);
+});
+
+test('manual approval keeps an ambiguous provider outcome durable and replay cannot retransmit it', async (t) => {
+  const storage = testStorage(t);
+  const { preparation } = await preparedManualApproval(storage);
+  const { approveDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
+  assert.equal(typeof approveDealHunterBrokerMaterials, 'function');
+  resendMode = 'ambiguous';
+  const first = await approveDealHunterBrokerMaterials({
+    opportunityId: preparation.review.opportunity.canonicalOpportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+    storage,
+  });
+  assert.equal(first.success, true);
+  assertBoundedCimRequest(first.durableResult.cimRequest);
+  assert.equal(first.durableResult.cimRequest.status, 'ambiguous');
+  assert.equal(resendCalls.length, 1);
+
+  resendMode = 'ok';
+  const replay = await approveDealHunterBrokerMaterials({
+    opportunityId: preparation.review.opportunity.canonicalOpportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+    storage,
+  });
+  assert.equal(replay.success, true);
+  assertBoundedCimRequest(replay.durableResult.cimRequest);
+  assert.equal(replay.durableResult.cimRequest.id, first.durableResult.cimRequest.id);
+  assert.equal(replay.durableResult.cimRequest.status, 'ambiguous');
+  assert.equal(resendCalls.length, 1, 'ambiguous approval replay must never retransmit');
+});
+
+test('manual approval final readiness drift persists one unscheduled durable failure before provider work', async (t) => {
+  const storage = testStorage(t);
+  const { preparation } = await preparedManualApproval(storage);
+  const { approveDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
+  const { getConfig } = await import('../server/config.js');
+  const config = getConfig();
+  const originalApiKey = config.delivery.resendApiKey;
+  const mutateWithCrmActivity = storage.mutateWithCrmActivity.bind(storage);
+  t.after(() => {
+    config.delivery.resendApiKey = originalApiKey;
+    storage.mutateWithCrmActivity = mutateWithCrmActivity;
+  });
+  storage.mutateWithCrmActivity = async (mutation) => {
+    const result = await mutateWithCrmActivity(mutation);
+    if (mutation.operation === 'insert_crm_communication') config.delivery.resendApiKey = '';
+    return result;
+  };
+
+  const result = await approveDealHunterBrokerMaterials({
+    opportunityId: preparation.review.opportunity.canonicalOpportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+    storage,
+  });
+
+  assert.equal(result.success, true);
+  assertBoundedCimRequest(result.durableResult.cimRequest);
+  assert.equal(result.durableResult.cimRequest.status, 'failed');
+  assert.equal(result.durableResult.cimRequest.followUpState, 'not-scheduled');
+  assert.equal(result.durableResult.cimRequest.errorSummary, 'Delivery failed.');
+  assert.equal(resendCalls.length, 0, 'final readiness drift must stop before provider work');
+  const storedRequest = await storage.getDealHunterCimRequestById(result.durableResult.cimRequest.id);
+  assert.equal(storedRequest.next_follow_up_at, null);
+  assert.match(storedRequest.delivery_error, /outbound delivery is not fully configured/i);
+  const page = await storage.listCrmCommunications({
+    submissionId: storedRequest.submission_id,
+    page: 1,
+    pageSize: 25,
+  });
+  assert.equal(page.total, 1, 'the exact communication remains durable for authoritative reconciliation');
+});
+
+test('manual approval reconciles a provider-accepted communication after final request persistence fails without retransmission', async (t) => {
+  const storage = testStorage(t);
+  const { preparation } = await preparedManualApproval(storage);
+  const { approveDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
+  const mutateWithCrmActivity = storage.mutateWithCrmActivity.bind(storage);
+  let injectFailure = true;
+  storage.mutateWithCrmActivity = async (mutation) => {
+    if (injectFailure && mutation.activity?.event_type === 'cim.request-sent') {
+      injectFailure = false;
+      throw new Error('injected manual request/activity finalization failure');
+    }
+    return mutateWithCrmActivity(mutation);
+  };
+
+  const approvalInput = {
+    opportunityId: preparation.review.opportunity.canonicalOpportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+    storage,
+  };
+  const first = await approveDealHunterBrokerMaterials(approvalInput);
+
+  assert.equal(first.success, true);
+  assertBoundedCimRequest(first.durableResult.cimRequest);
+  assert.equal(first.durableResult.cimRequest.requestState, 'provider_accepted');
+  assert.equal(first.durableResult.cimRequest.deliveryState, 'accepted');
+  assert.equal(first.durableResult.cimRequest.followUpState, 'not-scheduled');
+  assert.equal(resendCalls.length, 1);
+  const storedRequest = await storage.getDealHunterCimRequestById(first.durableResult.cimRequest.id);
+  const beforeReplay = await storage.listCrmCommunications({ submissionId: storedRequest.submission_id, page: 1, pageSize: 25 });
+  assert.equal(beforeReplay.total, 1);
+  assert.equal(beforeReplay.rows[0].delivery_state, 'accepted');
+  assert.equal(beforeReplay.rows[0].body_text, preparation.review.message.body);
+  assert.equal(beforeReplay.rows[0].body_html_sanitized, preparation.review.message.html);
+  const originalIdempotencyKey = beforeReplay.rows[0].idempotency_key;
+  const activity = await storage.listCrmActivityEvents({ submissionId: storedRequest.submission_id, limit: 100 });
+  assert.ok(activity.some((event) => event.event_type === 'cim.request-reconciled'));
+
+  const replay = await approveDealHunterBrokerMaterials(approvalInput);
+  assert.equal(replay.success, true);
+  assertBoundedCimRequest(replay.durableResult.cimRequest);
+  assert.equal(replay.durableResult.cimRequest.id, first.durableResult.cimRequest.id);
+  assert.equal(replay.durableResult.cimRequest.requestState, 'provider_accepted');
+  assert.equal(resendCalls.length, 1, 'recovery and replay must not retransmit');
+  const afterReplay = await storage.listCrmCommunications({ submissionId: storedRequest.submission_id, page: 1, pageSize: 25 });
+  assert.equal(afterReplay.total, 1);
+  assert.equal(afterReplay.rows[0].idempotency_key, originalIdempotencyKey);
+  assert.equal(afterReplay.rows[0].body_text, preparation.review.message.body);
+  assert.equal(afterReplay.rows[0].body_html_sanitized, preparation.review.message.html);
+});
+
+test('manual approval rejects sender display-name or email drift before provider work', async (t) => {
+  const { getConfig } = await import('../server/config.js');
+  const config = getConfig();
+  for (const [name, mutate, restore] of [
+    [
+      'display name',
+      () => { const original = config.workflow.defaultAssignee; config.workflow.defaultAssignee = 'Changed Sender'; return original; },
+      (original) => { config.workflow.defaultAssignee = original; },
+    ],
+    [
+      'email',
+      () => { const original = config.delivery.resendFromEmail; config.delivery.resendFromEmail = 'changed-sender@example.test'; return original; },
+      (original) => { config.delivery.resendFromEmail = original; },
+    ],
+  ]) {
+    await t.test(name, async () => {
+      const storage = testStorage(t);
+      const { preparation } = await preparedManualApproval(storage);
+      const original = mutate();
+      try {
+        const { approveDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
+        const result = await approveDealHunterBrokerMaterials({
+          opportunityId: preparation.review.opportunity.canonicalOpportunityId,
+          preparationToken: preparation.preparationToken,
+          approvedProposalDigest: preparation.proposalDigest,
+          session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+          storage,
+        });
+        assert.equal(result.success, false);
+        assert.equal(result.code, 'preparation_stale');
+        assert.equal(resendCalls.length, 0);
+      } finally {
+        restore(original);
+      }
+    });
+  }
 });
 
 test('daily summary and Stage 2 shadow evaluation never transmit a broker first contact', async (t) => {

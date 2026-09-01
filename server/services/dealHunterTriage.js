@@ -30,6 +30,7 @@ import {
 import { firstStrictDetailAuthorityTimestamp } from './detailAuthorityTimestamp.js';
 import { normalizeCanonicalCimRequestId } from './cimRequestIdPolicy.js';
 import { getSourceHealth } from './acquisitionCommandCenter.js';
+import { projectDealHunterBrokerMaterials } from './dealHunterBrokerMaterials.js';
 
 export const triageViews = Object.freeze([
   'needs-review',
@@ -630,10 +631,12 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
     id: detailText(communication.id, 200), direction: detailText(communication.direction, 80), channel: detailText(communication.channel, 80),
     kind: detailText(communication.kind, 80), occurredAt: detailText(communication.occurred_at, 80), cimRequestId: detailText(communication.cim_request_id, 200),
   }));
+  const brokerMaterials = await projectDealHunterBrokerMaterials({ opportunityId: id, storage });
   return {
     ok: true,
     status: 200,
     opportunity,
+    brokerMaterials,
     effectiveFacts,
     operatorFacts: sanitizedOperatorFacts.map(projectOperatorFact),
     sourceObservations,

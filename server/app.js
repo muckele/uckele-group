@@ -50,6 +50,12 @@ import {
 } from './services/dealHunterTriage.js';
 import { setCurrentOperatorOpportunityFact } from './services/dealHunterOpportunityFacts.js';
 import {
+  approveDealHunterBrokerMaterials,
+  parseBrokerMaterialsApprovalInput,
+  parseBrokerMaterialsPreparationInput,
+  prepareDealHunterBrokerMaterials,
+} from './services/dealHunterBrokerMaterials.js';
+import {
   dealHunterCrmSyncConfirmation,
   auditDealHunterCrmIntegrity,
   executeDealOsCrmReconciliation,
@@ -1476,6 +1482,64 @@ export function createApp() {
       }
       const { ok: _ok, status: _status, ...detail } = result;
       response.status(200).json(detail);
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/broker-materials/prepare',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      let input;
+      try {
+        input = parseBrokerMaterialsPreparationInput(request.body ?? {});
+      } catch (error) {
+        response.status(400).json({ success: false, code: 'invalid_preparation_input', error: error.message });
+        return;
+      }
+      const result = await prepareDealHunterBrokerMaterials({
+        opportunityId: request.params.opportunityId,
+        ...input,
+        session: {
+          principal_id: session.principal_id,
+          role: session.role,
+          username: session.username,
+        },
+        storage: getStorage(),
+      });
+      response.status(result.status || (result.success ? 200 : 409)).json(result);
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/broker-materials/approve',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      let input;
+      try {
+        input = parseBrokerMaterialsApprovalInput(request.body ?? {});
+      } catch (error) {
+        response.status(400).json({ success: false, code: 'invalid_approval_input', error: error.message });
+        return;
+      }
+      const result = await approveDealHunterBrokerMaterials({
+        opportunityId: request.params.opportunityId,
+        ...input,
+        session: {
+          principal_id: session.principal_id,
+          role: session.role,
+          username: session.username,
+        },
+        storage: getStorage(),
+      });
+      response.status(result.status || (result.success ? 200 : 409)).json(result);
     }),
   );
 
