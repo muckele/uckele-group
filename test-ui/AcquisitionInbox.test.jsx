@@ -1237,6 +1237,60 @@ describe('Acquisition Inbox queue', () => {
 });
 
 describe('Acquisition Inbox Broker Materials authority', () => {
+  test('requires explicit authoritative recipient selection before creating a complete preparation', async () => {
+    const writes = [];
+    let prepareAttempts = 0;
+    const recipientOptions = [
+      { recipientContactRef: 'ref-1', email: 'jane@example.test', displayName: 'Jane Broker', provenance: 'structured_source', provenanceLabel: 'Deal Hunter Sheet · row-42', primary: false },
+      { recipientContactRef: 'ref-2', email: 'alex@example.test', displayName: 'Alex Broker', provenance: 'crm', provenanceLabel: 'Current CRM broker', primary: false },
+    ];
+    const selectedPreparation = preparedBrokerMaterials({
+      review: {
+        ...preparedBrokerMaterials().review,
+        recipient: { contactRef: 'ref-2', displayName: 'Alex Broker', email: 'alex@example.test', provenance: 'crm' },
+        message: { ...preparedBrokerMaterials().review.message, greeting: 'Hi Alex,', body: 'Hi Alex,\n\nPlease share the CIM.\n\nThank you,\nMathew' },
+      },
+      recipientOptions,
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1/broker-materials/prepare')) {
+        prepareAttempts += 1;
+        writes.push(JSON.parse(options.body));
+        return prepareAttempts === 1
+          ? jsonResponse({
+            success: false,
+            code: 'recipient_selection_required',
+            error: 'Select one authoritative broker recipient before preparing the request.',
+            recipientOptions,
+            warnings: [],
+            sendBlockers: [],
+          }, { ok: false, status: 409 })
+          : jsonResponse(selectedPreparation);
+      }
+      if (url.endsWith('/triage/opp-1')) {
+        const detail = detailResponse();
+        detail.brokerMaterials.recipientOptions = recipientOptions;
+        return jsonResponse(detail);
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Request Broker Materials' }));
+
+    const selector = await screen.findByLabelText('Authoritative broker recipient');
+    expect(selector).toHaveValue('');
+    expect(screen.queryByRole('button', { name: 'Approve & Send' })).not.toBeInTheDocument();
+    fireEvent.change(selector, { target: { value: 'ref-2' } });
+
+    expect(await screen.findByDisplayValue('Hi Alex,')).toBeVisible();
+    expect(screen.getByLabelText('Complete message body')).toHaveValue('Hi Alex,\n\nPlease share the CIM.\n\nThank you,\nMathew');
+    expect(writes).toEqual([{}, { recipientContactRef: 'ref-2' }]);
+    expect(JSON.stringify(writes)).not.toContain('alex@example.test');
+  });
+
   test('prepares the canonical selected opportunity with only contactRef/greeting and stores the complete returned proposal', async () => {
     const writes = [];
     vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
@@ -1308,6 +1362,48 @@ describe('Acquisition Inbox Broker Materials authority', () => {
     expect(await screen.findByText('Sent')).toBeVisible();
     expect(detailLoads).toBe(2);
     expect(screen.queryByRole('button', { name: 'Approve & Send' })).not.toBeInTheDocument();
+  });
+
+  test('non-approval authoritative refresh consumes retained preparation when an existing request appears', async () => {
+    const approvalWrites = [];
+    let detailLoads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/broker-materials/prepare')) return jsonResponse(preparedBrokerMaterials());
+      if (url.endsWith('/broker-materials/approve')) {
+        approvalWrites.push(JSON.parse(options.body));
+        return jsonResponse({ success: false, error: 'Old approval must not be reachable.' }, { ok: false, status: 409 });
+      }
+      if (url === '/api/admin/deal-hunter/opportunities/opp-1/facts/broker_name') {
+        return jsonResponse({ success: true, fact: { field: 'broker_name', value: 'Alex Broker', verified: true } });
+      }
+      if (url.endsWith('/triage/opp-1')) {
+        detailLoads += 1;
+        const detail = detailResponse();
+        if (detailLoads > 1) detail.brokerMaterials.existingRequest = {
+          id: 'request-concurrent', status: 'sent', requestState: 'provider_accepted', deliveryState: 'accepted', followUpState: 'not-scheduled',
+          recipient: { email: 'jane@example.test', displayName: 'Jane Broker' }, providerAcceptedAt: '2026-09-01T17:01:00.000Z', updatedAt: '2026-09-01T17:01:00.000Z',
+          canRetry: false, canCorrectRecipient: false, retryRoute: '', correctionRoute: '',
+        };
+        return jsonResponse(detail);
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Request Broker Materials' }));
+    expect(await screen.findByRole('button', { name: 'Approve & Send' })).toBeEnabled();
+    fireEvent.change(screen.getByLabelText('Verified fact field'), { target: { value: 'broker_name' } });
+    fireEvent.change(screen.getByLabelText('Verified fact value'), { target: { value: 'Alex Broker' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save verified fact' }));
+
+    expect(await screen.findByText('Sent')).toBeVisible();
+    expect(screen.queryByText('Prepared')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Approve & Send' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Regenerate Request' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Request Broker Materials' })).not.toBeInTheDocument();
+    expect(approvalWrites).toEqual([]);
   });
 
   test.each([

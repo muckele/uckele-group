@@ -93,7 +93,7 @@ describe('Broker Materials card', () => {
     ['Sending / Pending', projection({ existingRequest: existingRequest({ status: 'pending', requestState: 'pending', deliveryState: 'pending', providerAcceptedAt: '' }) }), 'A broker materials request is pending.', 'View Request Status'],
     ['Sent', projection({ existingRequest: existingRequest() }), 'Sent to jane@example.test', 'View Sent Request'],
     ['Ambiguous', projection({ existingRequest: existingRequest({ status: 'ambiguous', requestState: 'provider_ambiguous', deliveryState: 'ambiguous' }) }), 'Delivery could not be confirmed. Do not send another request.', 'Review Ambiguous Result'],
-    ['Delivery Issue', projection({ existingRequest: existingRequest({ status: 'delivery_issue', deliveryState: 'bounced', errorSummary: 'Delivery failed.', canCorrectRecipient: true, correctionRoute: '/correct' }) }), 'Delivery failed.', 'Correct Recipient'],
+    ['Delivery Issue', projection({ existingRequest: existingRequest({ status: 'delivery_issue', deliveryState: 'bounced', errorSummary: 'Delivery failed.', canCorrectRecipient: true, correctionRoute: '/correct' }) }), 'Delivery failed.', 'Review Delivery Issue'],
     ['Replied', projection({ existingRequest: existingRequest({ status: 'responded', requestState: 'responded', deliveryState: 'responded', respondedAt: '2026-09-01T18:00:00.000Z' }) }), 'The broker replied to this request.', 'View Broker Reply'],
   ])('renders the collapsed %s presentation from authoritative fields only', (badge, brokerMaterials, sentence, action) => {
     render(<BrokerMaterialsCard brokerMaterials={brokerMaterials} onAddBrokerEmail={vi.fn()} onPrepare={vi.fn()} onViewRequest={vi.fn()} />);
@@ -159,6 +159,28 @@ describe('Broker Materials card', () => {
     await waitFor(() => expect(onPrepare).toHaveBeenCalledWith({ recipientContactRef: 'contact-ref-1', greeting: 'Hello Jane,' }));
   });
 
+  test('restores the original signed preparation when greeting is changed back exactly without another request', async () => {
+    const activePreparation = preparation();
+    const onPrepare = vi.fn(async () => true);
+    const onApprove = vi.fn(async () => true);
+    render(<BrokerMaterialsCard brokerMaterials={projection()} onApprove={onApprove} onPrepare={onPrepare} preparation={activePreparation} />);
+
+    const greeting = screen.getByLabelText('Greeting');
+    fireEvent.change(greeting, { target: { value: 'Hello Jane,' } });
+    expect(screen.getByText('Preview needs updating before approval.')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Update Preview' })).toBeVisible();
+    fireEvent.change(greeting, { target: { value: 'Hi Jane,' } });
+
+    expect(onPrepare).not.toHaveBeenCalled();
+    expect(screen.queryByText('Preview needs updating before approval.')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Update Preview' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Regenerate Request' })).not.toBeInTheDocument();
+    const approve = screen.getByRole('button', { name: 'Approve & Send' });
+    expect(approve).toBeEnabled();
+    fireEvent.click(approve);
+    await waitFor(() => expect(onApprove).toHaveBeenCalledWith(activePreparation));
+  });
+
   test('Enter in greeting updates preview but never approves, and non-approval card activation never sends', async () => {
     const onPrepare = vi.fn(async () => true);
     const onApprove = vi.fn(async () => true);
@@ -195,6 +217,47 @@ describe('Broker Materials card', () => {
     expect(screen.getByText('Sent')).toBeVisible();
     expect(screen.queryByRole('button', { name: 'Approve & Send' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Request Broker Materials' })).not.toBeInTheDocument();
+  });
+
+  test('authoritative existing request independently outranks the same retained local preparation', () => {
+    const activePreparation = preparation();
+    const { rerender } = render(<BrokerMaterialsCard brokerMaterials={projection()} onApprove={vi.fn()} onPrepare={vi.fn()} preparation={activePreparation} />);
+    expect(screen.getByRole('button', { name: 'Approve & Send' })).toBeVisible();
+
+    rerender(<BrokerMaterialsCard brokerMaterials={projection({ existingRequest: existingRequest() })} onApprove={vi.fn()} onPrepare={vi.fn()} preparation={activePreparation} />);
+
+    expect(screen.getByText('Sent')).toBeVisible();
+    expect(screen.queryByText('Prepared')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Approve & Send' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Regenerate Request' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Request Broker Materials' })).not.toBeInTheDocument();
+  });
+
+  test('downgrades unreachable retry and correction capabilities to a real review-only action', () => {
+    const onApprove = vi.fn();
+    const onPrepare = vi.fn();
+    const onViewRequest = vi.fn();
+    const retryable = existingRequest({
+      status: 'failed', requestState: 'failed', deliveryState: 'not-attempted', providerAcceptedAt: '',
+      canRetry: true, retryRoute: '/api/admin/deal-hunter/cim-requests/request-1/retry',
+    });
+    const correctable = existingRequest({
+      status: 'delivery_issue', requestState: 'provider_accepted', deliveryState: 'bounced',
+      canCorrectRecipient: true, correctionRoute: '/api/admin/deal-hunter/cim-requests/request-1/correct-recipient',
+    });
+    const { rerender } = render(<BrokerMaterialsCard brokerMaterials={projection({ existingRequest: retryable })} onApprove={onApprove} onPrepare={onPrepare} onViewRequest={onViewRequest} />);
+
+    expect(screen.queryByRole('button', { name: 'Review & Retry Saved Request' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Review Delivery Issue' }));
+    expect(onViewRequest).toHaveBeenLastCalledWith(retryable);
+
+    rerender(<BrokerMaterialsCard brokerMaterials={projection({ existingRequest: correctable })} onApprove={onApprove} onPrepare={onPrepare} onViewRequest={onViewRequest} />);
+    expect(screen.queryByRole('button', { name: 'Correct Recipient' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Review Delivery Issue' }));
+    expect(onViewRequest).toHaveBeenLastCalledWith(correctable);
+    expect(onViewRequest).toHaveBeenCalledTimes(2);
+    expect(onPrepare).not.toHaveBeenCalled();
+    expect(onApprove).not.toHaveBeenCalled();
   });
 
   test('retains stale reviewed copy for orientation while removing approval authority and requiring regeneration', () => {

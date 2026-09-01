@@ -8,7 +8,7 @@ function formatDateTime(value) {
   return new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
 }
 
-function lifecyclePresentation(request, readOnly) {
+function lifecyclePresentation(request) {
   if (request?.respondedAt || request?.status === 'responded' || request?.requestState === 'responded') {
     return { badge: 'Replied', sentence: 'The broker replied to this request.', action: 'View Broker Reply' };
   }
@@ -18,7 +18,7 @@ function lifecyclePresentation(request, readOnly) {
   if (request?.status === 'delivery_issue' || request?.status === 'failed' || request?.requestState === 'failed' || ['bounced', 'failed', 'rejected', 'suppressed', 'complained'].includes(request?.deliveryState)) {
     return {
       badge: 'Delivery Issue', sentence: request.errorSummary || 'The request has a delivery issue.',
-      action: !readOnly && request.canCorrectRecipient ? 'Correct Recipient' : !readOnly && request.canRetry ? 'Review & Retry Saved Request' : 'Review Delivery Issue',
+      action: 'Review Delivery Issue',
     };
   }
   if (request?.status === 'logged' || request?.requestState === 'logged') {
@@ -48,22 +48,25 @@ function MessageList({ empty = 'None', items }) {
 
 export default function BrokerMaterialsCard({
   brokerMaterials = {}, checking = false, checkingFailed = false, error = '', onAddBrokerEmail, onApprove,
-  onCheckStatus, onInvalidatePreparation, onPrepare, onViewRequest, preparation = null, preparing = false,
+  onCheckStatus, onInvalidatePreparation, onPrepare, onViewRequest, preparation: providedPreparation = null,
+  preparing = false, recipientSelection: providedRecipientSelection = null,
   readOnly = false, sending = false, stale = false, updating = false,
 }) {
   const contentId = useId();
   const recipientHelpId = useId();
   const recipientRef = useRef(null);
   const approvalLockRef = useRef(false);
-  const [expanded, setExpanded] = useState(Boolean(preparation || preparing || checking));
-  const [greeting, setGreeting] = useState(preparation?.review?.message?.greeting || '');
+  const [expanded, setExpanded] = useState(Boolean(providedPreparation || providedRecipientSelection || preparing || checking));
+  const [greeting, setGreeting] = useState(providedPreparation?.review?.message?.greeting || '');
   const [localInvalid, setLocalInvalid] = useState(false);
   const [localUpdating, setLocalUpdating] = useState(false);
   const [localSending, setLocalSending] = useState(false);
   const [announcement, setAnnouncement] = useState('');
   const existingRequest = brokerMaterials?.existingRequest || null;
+  const preparation = existingRequest ? null : providedPreparation;
+  const recipientSelection = existingRequest ? null : providedRecipientSelection;
   const blocker = blockerPresentation(brokerMaterials);
-  const lifecycle = existingRequest ? lifecyclePresentation(existingRequest, readOnly) : null;
+  const lifecycle = existingRequest ? lifecyclePresentation(existingRequest) : null;
   const review = preparation?.review;
   const message = review?.message;
   const recipient = review?.recipient;
@@ -76,8 +79,8 @@ export default function BrokerMaterialsCard({
   const busy = preparing || updating || sending || localUpdating || localSending;
 
   useEffect(() => {
-    if (preparation || preparing || checking) setExpanded(true);
-  }, [checking, preparation, preparing]);
+    if (preparation || recipientSelection || preparing || checking) setExpanded(true);
+  }, [checking, preparation, preparing, recipientSelection]);
 
   useEffect(() => {
     setGreeting(preparation?.review?.message?.greeting || '');
@@ -115,12 +118,13 @@ export default function BrokerMaterialsCard({
   }
 
   function lifecycleAction() {
-    if (!readOnly && lifecycle?.action === 'Correct Recipient') return onAddBrokerEmail?.();
     return onViewRequest?.(existingRequest);
   }
 
   const collapsed = lifecycle || (checking
     ? { badge: 'Checking', sentence: checkingFailed ? 'Unable to confirm request status. Do not resend until authoritative status is available.' : 'The request outcome is not yet confirmed. Checking authoritative status…', action: checkingFailed ? 'Check Again' : 'Check Request Status' }
+    : recipientSelection
+      ? { badge: 'Recipient required', sentence: recipientSelection.message || 'Select one authoritative broker recipient before preparing the request.', action: '' }
     : blocker || {
       badge: sendingPaused ? 'Ready · Sending paused' : 'Ready',
       sentence: sendingPaused ? 'You can prepare and review while CIM sending is paused.' : 'Prepare a reviewed request using current broker details.',
@@ -141,7 +145,7 @@ export default function BrokerMaterialsCard({
       <p aria-live="polite" className="sr-only" role="status">{announcement || (busy ? preparing ? 'Preparing broker materials preview…' : localSending || sending ? 'Submitting the approved request…' : 'Updating broker materials preview…' : '')}</p>
       {error ? <p className="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{error}</p> : null}
 
-      {!preparation && !checking ? <div className="mt-3">
+      {!preparation && !recipientSelection && !checking ? <div className="mt-3">
         {blocker?.recipientBlocker && !readOnly ? <button className={secondaryButton} onClick={onAddBrokerEmail} type="button">{collapsed.action}</button>
           : blocker ? <button className={secondaryButton} onClick={() => setExpanded(true)} type="button">{collapsed.action}</button>
             : lifecycle ? <button className={secondaryButton} onClick={lifecycleAction} type="button">{collapsed.action}</button>
@@ -153,6 +157,14 @@ export default function BrokerMaterialsCard({
       <div hidden={!expanded} id={contentId}>
         {preparing && !preparation ? <div className="mt-4"><p className="text-sm text-ink/68">Preparing a review from current opportunity and broker information…</p><div className="mt-3 animate-pulse space-y-2" aria-hidden="true"><div className="h-4 rounded bg-moss/10" /><div className="h-20 rounded bg-moss/10" /></div></div> : null}
         {blocker && !preparation && expanded ? <MessageList items={brokerMaterials.preparationBlockers} /> : null}
+        {recipientSelection ? <div className="mt-4 space-y-4 border-t border-moss/15 pt-4">
+          <section><h5 className="text-sm font-semibold text-ink">Recipient and provenance</h5>
+            <label className="mt-2 block text-xs font-semibold text-ink/62">Authoritative broker recipient<select aria-describedby={recipientHelpId} aria-label="Authoritative broker recipient" className="form-control mt-1" disabled={busy || readOnly} onChange={(event) => { if (event.target.value) regenerate({ recipientContactRef: event.target.value }, { keepFocus: true }); }} ref={recipientRef} value=""><option disabled value="">Select an authoritative recipient</option>{recipientSelection.recipientOptions?.map((option) => <option key={option.recipientContactRef} value={option.recipientContactRef}>{option.displayName || option.email} · {option.email}</option>)}</select></label>
+            <p className="mt-1 text-xs text-ink/55" id={recipientHelpId}>Choose one server-authoritative contact. No request can be approved before preparation succeeds.</p>
+          </section>
+          {recipientSelection.warnings?.length ? <section><h5 className="text-sm font-semibold text-ink">Manual Stage 1 warnings</h5><MessageList items={recipientSelection.warnings} /></section> : null}
+          {recipientSelection.sendBlockers?.length ? <section><h5 className="text-sm font-semibold text-ink">Current send blockers</h5><MessageList items={recipientSelection.sendBlockers} /></section> : null}
+        </div> : null}
         {review ? <div className="mt-4 space-y-5 border-t border-moss/15 pt-4">
           <section><h5 className="text-sm font-semibold text-ink">Opportunity context</h5><p className="mt-2 text-sm text-ink/68">{review.opportunity?.displayName || 'Opportunity'} · {review.opportunity?.sourceLabel || 'Authoritative source'} · {review.opportunity?.pursued ? 'Pursued' : 'Not pursued'} · {review.opportunity?.current ? 'Current' : 'Not current'}</p></section>
           <section><h5 className="text-sm font-semibold text-ink">Manual Stage 1 warnings</h5><MessageList empty="No warnings." items={warnings} /></section>
@@ -162,7 +174,7 @@ export default function BrokerMaterialsCard({
             <p className="mt-1 text-xs text-ink/55" id={recipientHelpId}>Provenance: {recipientOptions.find((option) => option.recipientContactRef === recipient?.contactRef)?.provenanceLabel || recipient?.provenance || 'Authoritative contact source'}</p>
           </section>
           <section><h5 className="text-sm font-semibold text-ink">Sender</h5><p className="mt-2 text-sm text-ink/68">{review.sender?.displayName} · {review.sender?.email}{review.sender?.replyTo ? ` · Reply to ${review.sender.replyTo}` : ''}</p></section>
-          <section><h5 className="text-sm font-semibold text-ink">Greeting</h5><label className="sr-only" htmlFor={`${contentId}-greeting`}>Greeting</label><input aria-label="Greeting" className="form-control mt-2" id={`${contentId}-greeting`} onChange={(event) => { setGreeting(event.target.value); setLocalInvalid(true); }} onKeyDown={(event) => { if (event.key === 'Enter' && greetingDirty) { event.preventDefault(); regenerate({ recipientContactRef: recipient?.contactRef, greeting }); } }} readOnly={readOnly} value={greeting} />{greetingDirty ? <p className="mt-2 text-sm text-amber-800">Preview needs updating before approval.</p> : null}{greetingDirty && !readOnly ? <button className={`${secondaryButton} mt-2`} disabled={busy} onClick={() => regenerate({ recipientContactRef: recipient?.contactRef, greeting })} type="button">Update Preview</button> : null}</section>
+          <section><h5 className="text-sm font-semibold text-ink">Greeting</h5><label className="sr-only" htmlFor={`${contentId}-greeting`}>Greeting</label><input aria-label="Greeting" className="form-control mt-2" id={`${contentId}-greeting`} onChange={(event) => setGreeting(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && greetingDirty) { event.preventDefault(); regenerate({ recipientContactRef: recipient?.contactRef, greeting }); } }} readOnly={readOnly} value={greeting} />{greetingDirty ? <p className="mt-2 text-sm text-amber-800">Preview needs updating before approval.</p> : null}{greetingDirty && !readOnly ? <button className={`${secondaryButton} mt-2`} disabled={busy} onClick={() => regenerate({ recipientContactRef: recipient?.contactRef, greeting })} type="button">Update Preview</button> : null}</section>
           <section><h5 className="text-sm font-semibold text-ink">Subject</h5><label className="sr-only" htmlFor={`${contentId}-subject`}>Subject</label><input aria-label="Subject" className="form-control mt-2" id={`${contentId}-subject`} readOnly value={message?.subject || ''} /></section>
           <section><h5 className="text-sm font-semibold text-ink">Complete message body</h5><label className="sr-only" htmlFor={`${contentId}-body`}>Complete message body</label><textarea aria-label="Complete message body" className="form-control mt-2 min-h-52 whitespace-pre-wrap" id={`${contentId}-body`} readOnly value={message?.body || ''} /></section>
           <section><h5 className="text-sm font-semibold text-ink">Current send blockers</h5><MessageList empty="No current send blockers." items={sendBlockers} /></section>

@@ -240,6 +240,7 @@ export default function OpportunityDrawer({
                 preparation={brokerMaterialsState.preparation}
                 preparing={brokerMaterialsState.preparing}
                 readOnly={readOnly}
+                recipientSelection={brokerMaterialsState.recipientSelection}
                 sending={brokerMaterialsState.sending}
                 stale={brokerMaterialsState.stale}
                 updating={brokerMaterialsState.updating}

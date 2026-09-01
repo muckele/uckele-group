@@ -15,7 +15,7 @@ const views = [
 const buttonClass = 'inline-flex min-h-9 items-center justify-center rounded-full border border-line bg-white px-3 py-1.5 text-xs font-semibold text-ink transition hover:border-moss/35 hover:text-moss disabled:cursor-not-allowed disabled:opacity-50';
 const primaryButtonClass = 'inline-flex min-h-9 items-center justify-center rounded-full border border-moss bg-moss px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-pine disabled:opacity-50';
 const emptyBrokerMaterialsState = {
-  preparation: null, preparing: false, updating: false, sending: false,
+  preparation: null, recipientSelection: null, preparing: false, updating: false, sending: false,
   checking: false, checkingFailed: false, stale: false, error: '',
 };
 
@@ -230,9 +230,12 @@ export default function AcquisitionInbox({ readOnly = false }) {
       if (result?.opportunity?.opportunityId !== opportunityId) throw new Error('Opportunity detail did not match the selected record.');
       if (detailRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
       setDetail({ requestedId: opportunityId, data: result, loading: false, error: '' });
-      setBrokerMaterialsState((current) => current.preparation && Array.isArray(result.brokerMaterials?.sendBlockers)
-        ? { ...current, preparation: { ...current.preparation, sendBlockers: result.brokerMaterials.sendBlockers } }
-        : current);
+      setBrokerMaterialsState((current) => {
+        if (result.brokerMaterials?.existingRequest) return emptyBrokerMaterialsState;
+        return current.preparation && Array.isArray(result.brokerMaterials?.sendBlockers)
+          ? { ...current, preparation: { ...current.preparation, sendBlockers: result.brokerMaterials.sendBlockers } }
+          : current;
+      });
       return result;
     } catch (detailError) {
       if (isAbortError(detailError) || detailRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
@@ -388,8 +391,8 @@ export default function AcquisitionInbox({ readOnly = false }) {
     setBrokerMaterialsState((current) => ({
       ...current,
       preparation: current.preparation ? withoutApprovalAuthority(current.preparation) : null,
-      preparing: !current.preparation,
-      updating: Boolean(current.preparation),
+      preparing: !current.preparation && !current.recipientSelection,
+      updating: Boolean(current.preparation || current.recipientSelection),
       checking: false,
       checkingFailed: false,
       stale: false,
@@ -401,6 +404,20 @@ export default function AcquisitionInbox({ readOnly = false }) {
       });
       const result = await response.json();
       if (brokerPrepareRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      if (result.code === 'recipient_selection_required' && !result.review) {
+        setBrokerMaterialsState({
+          ...emptyBrokerMaterialsState,
+          recipientSelection: {
+            code: result.code,
+            message: result.error || 'Select one authoritative broker recipient before preparing the request.',
+            recipientOptions: Array.isArray(result.recipientOptions) ? result.recipientOptions : [],
+            warnings: Array.isArray(result.warnings) ? result.warnings : [],
+            sendBlockers: Array.isArray(result.sendBlockers) ? result.sendBlockers : [],
+          },
+          error: response.ok && result.success ? '' : result.error || 'Unable to prepare broker materials.',
+        });
+        return false;
+      }
       if (!response.ok || !result.success) {
         const isStale = result.code === 'preparation_stale' || result.code === 'preparation_expired';
         setBrokerMaterialsState((current) => ({
