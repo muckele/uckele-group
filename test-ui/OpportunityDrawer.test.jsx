@@ -114,6 +114,29 @@ function detailFixture(overrides = {}) {
   };
 }
 
+function brokerPreparation() {
+  return {
+    success: true,
+    previewOnly: false,
+    preparationToken: 'signed.preparation',
+    proposalDigest: 'a'.repeat(64),
+    preparedAt: '2026-09-01T17:00:00.000Z',
+    expiresAt: '2099-09-01T17:15:00.000Z',
+    review: {
+      opportunity: { canonicalOpportunityId: 'opp-1', displayName: 'Evergreen Fire Protection', sourceLabel: 'Deal Hunter Sheet', pursued: true, current: true },
+      recipient: { contactRef: 'contact-ref-1', displayName: 'Jane Broker', email: 'jane@example.test', provenance: 'structured_source' },
+      sender: { displayName: 'Mathew Uckele', email: 'buyer@example.test' },
+      message: { greeting: 'Hi Jane,', subject: 'CIM request', body: 'Hi Jane,\n\nPlease share the CIM.' },
+    },
+    recipientOptions: [
+      { recipientContactRef: 'contact-ref-1', email: 'jane@example.test', displayName: 'Jane Broker', provenanceLabel: 'Deal Hunter Sheet' },
+      { recipientContactRef: 'contact-ref-2', email: 'alex@example.test', displayName: 'Alex Broker', provenanceLabel: 'Current CRM broker' },
+    ],
+    warnings: [],
+    sendBlockers: [],
+  };
+}
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -279,5 +302,26 @@ describe('Opportunity drawer', () => {
     expect(within(crmCim).getByText('CIM history')).toBeVisible();
     expect(within(crmCim).getByText('CRM communications')).toBeVisible();
     expect(within(crmCim).getByText('CIM communications')).toBeVisible();
+  });
+
+  test('does not steal focus when authoritative detail refreshes in the background', () => {
+    const { rerender } = render(<OpportunityDrawer detail={detailFixture()} loading={false} onClose={vi.fn()} />);
+    const disclosure = screen.getByRole('button', { name: 'Broker Materials review' });
+    disclosure.focus();
+    rerender(<OpportunityDrawer detail={detailFixture()} loading onClose={vi.fn()} />);
+    expect(disclosure).toHaveFocus();
+    rerender(<OpportunityDrawer detail={detailFixture()} loading={false} onClose={vi.fn()} />);
+    expect(disclosure).toHaveFocus();
+  });
+
+  test('lets Escape close an active contact selector before a later Escape closes the drawer', () => {
+    const onClose = vi.fn();
+    render(<OpportunityDrawer brokerMaterialsState={{ preparation: brokerPreparation() }} detail={detailFixture()} onBrokerMaterialsPrepare={vi.fn()} onClose={onClose} />);
+    const selector = screen.getByLabelText('Authoritative broker recipient');
+    fireEvent.mouseDown(selector);
+    fireEvent.keyDown(selector, { key: 'Escape', code: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.keyDown(selector, { key: 'Escape', code: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
   });
 });

@@ -1396,9 +1396,12 @@ describe('Acquisition Inbox Broker Materials authority', () => {
     expect(await screen.findByRole('button', { name: 'Approve & Send' })).toBeEnabled();
     fireEvent.change(screen.getByLabelText('Verified fact field'), { target: { value: 'broker_name' } });
     fireEvent.change(screen.getByLabelText('Verified fact value'), { target: { value: 'Alex Broker' } });
+    const disclosure = screen.getByRole('button', { name: 'Broker Materials review' });
+    disclosure.focus();
     fireEvent.click(screen.getByRole('button', { name: 'Save verified fact' }));
 
     expect(await screen.findByText('Sent')).toBeVisible();
+    expect(disclosure).toHaveFocus();
     expect(screen.queryByText('Prepared')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Approve & Send' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Regenerate Request' })).not.toBeInTheDocument();

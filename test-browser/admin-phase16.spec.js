@@ -356,6 +356,28 @@ function createPhase1FixtureState() {
     offOriginRequests: [],
     actionPayloads: [],
     factPayloads: [],
+    brokerPreparePayloads: [],
+    brokerApprovePayloads: [],
+    brokerApprovalCount: 0,
+    brokerDetailLoads: {},
+    brokerMaterialsByOpportunity: Object.fromEntries(canonicalOpportunities.map((opportunity) => [opportunity.opportunityId, {
+      recipientOptions: [{
+        recipientContactRef: `contact-${opportunity.opportunityId}-structured`,
+        email: `broker-${opportunity.opportunityId}@example.test`,
+        displayName: 'Riley Structured Broker',
+        provenance: 'structured_source',
+        provenanceLabel: `Deal Hunter Google Sheet · ${opportunity.dealKey}-sheet`,
+        primary: true,
+      }],
+      warnings: [],
+      sendBlockers: [],
+      existingRequest: null,
+      multipleContacts: false,
+      approvalMode: 'success',
+      detailFailuresRemaining: 0,
+      allowBrokerVerification: false,
+    }])),
+    sessionRole: 'admin',
   };
 }
 
@@ -573,6 +595,82 @@ function phase1EffectiveFacts(state, opportunityId) {
   return effective;
 }
 
+function phase2BrokerProjection(state, opportunityId) {
+  const opportunity = phase1CurrentOpportunity(state, opportunityId);
+  const fixture = state.brokerMaterialsByOpportunity[opportunityId];
+  if (!opportunity || !fixture) return undefined;
+  const pursued = opportunity.operatorPriority === 'high'
+    && opportunity.reviewed
+    && !opportunity.changedSinceReview
+    && !opportunity.dismissed;
+  const preparationBlockers = fixture.existingRequest
+    ? []
+    : !pursued
+      ? [{ code: 'pursue_required', message: 'Pursue this opportunity before requesting broker materials.' }]
+      : fixture.recipientOptions.length
+        ? []
+        : [{ code: 'broker_email_required', message: 'Add and verify a broker email before preparing this request.' }];
+  return {
+    existingRequest: fixture.existingRequest,
+    pursued,
+    preparationBlockers,
+    sendBlockers: fixture.sendBlockers,
+    warnings: fixture.warnings,
+    recipientOptions: fixture.recipientOptions,
+  };
+}
+
+function phase2PreparedResponse(state, opportunityId, body) {
+  const fixture = state.brokerMaterialsByOpportunity[opportunityId];
+  const opportunity = phase1CurrentOpportunity(state, opportunityId);
+  const selected = fixture.recipientOptions.find((option) => option.recipientContactRef === body.recipientContactRef)
+    || fixture.recipientOptions.find((option) => option.primary)
+    || fixture.recipientOptions[0];
+  const greeting = body.greeting === undefined ? 'Hi Riley,' : body.greeting;
+  const subject = `CIM / NDA request for ${opportunity.name}`;
+  const messageBody = `${greeting}\n\nPlease share the CIM and NDA for ${opportunity.name}.\n\nThank you,\nMathew`;
+  return {
+    success: true,
+    previewOnly: state.sessionRole !== 'admin',
+    ...(state.sessionRole === 'admin' ? {
+      preparationToken: `signed-${opportunityId}-${state.brokerPreparePayloads.length}`,
+      proposalDigest: String(state.brokerPreparePayloads.length).padStart(64, 'a'),
+    } : {}),
+    preparedAt: '2026-09-01T17:00:00.000Z',
+    expiresAt: '2099-09-01T17:15:00.000Z',
+    review: {
+      opportunity: {
+        canonicalOpportunityId: opportunityId,
+        displayName: opportunity.name,
+        sourceLabel: 'Deal Hunter Google Sheet',
+        pursued: true,
+        current: true,
+        score: opportunity.fitScore,
+        automatedScoreThreshold: 75,
+        annualProfit: opportunity.financials.annualProfit,
+      },
+      recipient: {
+        contactRef: selected.recipientContactRef,
+        displayName: selected.displayName,
+        email: selected.email,
+        provenance: selected.provenance,
+      },
+      sender: { displayName: 'Mathew Uckele', email: 'mathew@uckelegroup.com', replyTo: 'reply+browser@example.test' },
+      message: {
+        requestType: 'cim_request',
+        channel: 'email',
+        greeting,
+        subject,
+        body: messageBody,
+        templateVersion: 'deal-hunter-cim-manual-stage1-v1',
+      },
+    },
+    recipientOptions: fixture.recipientOptions,
+    warnings: fixture.warnings,
+    sendBlockers: fixture.sendBlockers,
+  };
+}
+
 function phase1DetailResponse(state, opportunityId) {
   const opportunity = phase1DetailOpportunity(state, opportunityId);
   const scoreRow = state.scoreRows.find((score) => score.opportunityId === opportunityId);
@@ -641,6 +739,7 @@ function phase1DetailResponse(state, opportunityId) {
         concerns: ['Customer concentration has not been verified.'],
       },
     },
+    brokerMaterials: phase2BrokerProjection(state, opportunityId),
     cimSummary: {
       requests: state.cimRequests.filter((row) => row.opportunityId === opportunityId).map(({ opportunityId: _opportunityId, ...request }) => request),
       communications: state.cimCommunications.filter((row) => row.opportunityId === opportunityId).map(({ opportunityId: _opportunityId, ...communication }) => communication),
@@ -740,7 +839,7 @@ async function installPhase1RequestAudit(page, state) {
   });
 }
 
-async function installPhase1AdminRoutes(page, state, { commandCenter = false } = {}) {
+async function installPhase1AdminRoutes(page, state, { commandCenter = false, role = 'admin' } = {}) {
   await page.route('**/api/admin/session', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -751,7 +850,7 @@ async function installPhase1AdminRoutes(page, state, { commandCenter = false } =
     await fulfillPhase1Json(route, {
       authenticated: true,
       username: 'phase1-admin',
-      role: 'admin',
+      role,
       authMode: 'hybrid',
       magicLinkEnabled: true,
       passwordEnabled: true,
@@ -815,10 +914,11 @@ function phase1DispositionReason(value) {
   return phase1DispositionReasons.has(normalized) ? normalized : 'other';
 }
 
-async function installPhase1Fixture(page) {
+async function installPhase1Fixture(page, { role = 'admin' } = {}) {
   const state = createPhase1FixtureState();
+  state.sessionRole = role;
   await installPhase1RequestAudit(page, state);
-  await installPhase1AdminRoutes(page, state);
+  await installPhase1AdminRoutes(page, state, { role });
   await page.route('**/api/admin/deal-hunter/**', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -835,6 +935,100 @@ async function installPhase1Fixture(page) {
       return;
     }
 
+    const prepareMatch = path.match(/^\/api\/admin\/deal-hunter\/triage\/([^/]+)\/broker-materials\/prepare$/);
+    if (method === 'POST' && prepareMatch && !url.search) {
+      const opportunityId = decodeURIComponent(prepareMatch[1]);
+      const fixture = state.brokerMaterialsByOpportunity[opportunityId];
+      const projection = phase2BrokerProjection(state, opportunityId);
+      const body = phase1Body(request);
+      const keys = Object.keys(body).sort();
+      if (!fixture || keys.some((key) => !['greeting', 'recipientContactRef'].includes(key))) {
+        await rejectPhase1Request(route, state, `Malformed Broker Materials prepare payload: ${JSON.stringify(body)}`);
+        return;
+      }
+      if ((body.greeting !== undefined && typeof body.greeting !== 'string')
+        || (body.recipientContactRef !== undefined && typeof body.recipientContactRef !== 'string')) {
+        await rejectPhase1Request(route, state, `Malformed Broker Materials prepare values: ${JSON.stringify(body)}`);
+        return;
+      }
+      state.brokerPreparePayloads.push({ method, path, body });
+      if (projection.preparationBlockers.length) {
+        await fulfillPhase1Json(route, { success: false, code: projection.preparationBlockers[0].code, error: projection.preparationBlockers[0].message }, 409);
+        return;
+      }
+      if (fixture.multipleContacts && !body.recipientContactRef) {
+        await fulfillPhase1Json(route, {
+          success: false,
+          code: 'recipient_selection_required',
+          error: 'Select one authoritative broker recipient before preparing the request.',
+          recipientOptions: fixture.recipientOptions,
+          warnings: fixture.warnings,
+          sendBlockers: fixture.sendBlockers,
+        }, 409);
+        return;
+      }
+      if (body.recipientContactRef && !fixture.recipientOptions.some((option) => option.recipientContactRef === body.recipientContactRef)) {
+        await fulfillPhase1Json(route, { success: false, code: 'recipient_stale', error: 'The selected recipient is no longer authoritative.' }, 409);
+        return;
+      }
+      const prepared = phase2PreparedResponse(state, opportunityId, body);
+      state.lastBrokerPreparationByOpportunity ||= {};
+      state.lastBrokerPreparationByOpportunity[opportunityId] = prepared;
+      await fulfillPhase1Json(route, prepared);
+      return;
+    }
+
+    const approveMatch = path.match(/^\/api\/admin\/deal-hunter\/triage\/([^/]+)\/broker-materials\/approve$/);
+    if (method === 'POST' && approveMatch && !url.search) {
+      const opportunityId = decodeURIComponent(approveMatch[1]);
+      const fixture = state.brokerMaterialsByOpportunity[opportunityId];
+      const prepared = state.lastBrokerPreparationByOpportunity?.[opportunityId];
+      const body = phase1Body(request);
+      const keys = Object.keys(body).sort();
+      if (state.sessionRole !== 'admin'
+        || !fixture
+        || !prepared
+        || JSON.stringify(keys) !== JSON.stringify(['approvedProposalDigest', 'preparationToken'])
+        || body.preparationToken !== prepared.preparationToken
+        || body.approvedProposalDigest !== prepared.proposalDigest) {
+        await rejectPhase1Request(route, state, `Malformed Broker Materials approval payload: ${JSON.stringify(body)}`);
+        return;
+      }
+      state.brokerApprovalCount += 1;
+      state.brokerApprovePayloads.push({ method, path, body });
+      fixture.existingRequest = {
+        id: `browser-request-${opportunityId}`,
+        status: 'sent',
+        requestState: 'provider_accepted',
+        deliveryState: 'accepted',
+        followUpState: 'not-scheduled',
+        recipient: prepared.review.recipient,
+        subject: prepared.review.message.subject,
+        createdAt: '2026-09-01T17:00:30.000Z',
+        updatedAt: '2026-09-01T17:00:31.000Z',
+        requestedAt: '2026-09-01T17:00:30.000Z',
+        providerAcceptedAt: '2026-09-01T17:00:31.000Z',
+        deliveredAt: '',
+        respondedAt: '',
+        errorSummary: '',
+        canRetry: false,
+        canCorrectRecipient: false,
+        retryRoute: '',
+        correctionRoute: '',
+      };
+      if (fixture.approvalMode === 'unknown') {
+        fixture.detailFailuresRemaining = 1;
+        await route.abort('failed');
+        return;
+      }
+      await fulfillPhase1Json(route, {
+        success: true,
+        canonicalOpportunityId: opportunityId,
+        durableResult: { cimRequest: fixture.existingRequest },
+      });
+      return;
+    }
+
     const factMatch = path.match(/^\/api\/admin\/deal-hunter\/opportunities\/([^/]+)\/facts\/([^/]+)$/);
     if (method === 'PUT' && factMatch && !url.search) {
       const opportunityId = decodeURIComponent(factMatch[1]);
@@ -842,11 +1036,21 @@ async function installPhase1Fixture(page) {
       const opportunity = state.canonicalOpportunities.find((item) => item.opportunityId === opportunityId);
       const score = state.scoreRows.find((item) => item.opportunityId === opportunityId);
       const body = phase1Body(request);
-      if (!opportunity || !score || field !== 'seller_name') throw new Error(`Unexpected Phase 1 fact target: ${path}`);
+      const brokerFixture = state.brokerMaterialsByOpportunity[opportunityId];
+      const allowedBrokerVerification = field === 'broker_email' && brokerFixture?.allowBrokerVerification;
+      if (!opportunity || !score || (field !== 'seller_name' && !allowedBrokerVerification)) throw new Error(`Unexpected Phase 1 fact target: ${path}`);
       if (JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(['note', 'value', 'verified'])) {
         throw new Error(`Malformed Phase 1 fact payload keys: ${JSON.stringify(body)}`);
       }
-      if (body.verified !== true || body.value !== 'Morgan Verified Seller' || body.note !== 'Confirmed directly with the seller on Aug 30.') {
+      const validSellerFact = field === 'seller_name'
+        && body.verified === true
+        && body.value === 'Morgan Verified Seller'
+        && body.note === 'Confirmed directly with the seller on Aug 30.';
+      const validBrokerFact = allowedBrokerVerification
+        && body.verified === true
+        && body.value === 'verified-browser-broker@example.test'
+        && body.note === 'Verified for the broker materials request.';
+      if (!validSellerFact && !validBrokerFact) {
         throw new Error(`Malformed Phase 1 fact payload values: ${JSON.stringify(body)}`);
       }
       const machineScore = score.fitScore;
@@ -862,6 +1066,16 @@ async function installPhase1Fixture(page) {
         updatedAt: '2026-08-30T20:00:00.000Z',
       };
       state.operatorFacts = [...state.operatorFacts.filter((item) => item.opportunityId !== opportunityId || item.field !== field), fact];
+      if (validBrokerFact) {
+        brokerFixture.recipientOptions = [{
+          recipientContactRef: `contact-${opportunityId}-verified-fact`,
+          email: body.value,
+          displayName: 'Verified Browser Broker',
+          provenance: 'operator_verified_fact',
+          provenanceLabel: 'Operator verified broker email',
+          primary: true,
+        }];
+      }
       if (score.fitScore !== machineScore) throw new Error('Verified fact changed the machine score in the Phase 1 fixture.');
       state.factPayloads.push({ method, path, body });
       const { opportunityId: _opportunityId, ...responseFact } = fact;
@@ -943,6 +1157,13 @@ async function installPhase1Fixture(page) {
       const opportunityId = decodeURIComponent(detailMatch[1]);
       const opportunity = state.canonicalOpportunities.find((item) => item.opportunityId === opportunityId);
       if (!opportunity) throw new Error(`Unexpected Phase 1 detail target: ${path}`);
+      state.brokerDetailLoads[opportunityId] = (state.brokerDetailLoads[opportunityId] || 0) + 1;
+      const fixture = state.brokerMaterialsByOpportunity[opportunityId];
+      if (fixture?.detailFailuresRemaining > 0) {
+        fixture.detailFailuresRemaining -= 1;
+        await route.abort('failed');
+        return;
+      }
       await fulfillPhase1Json(route, phase1DetailResponse(state, opportunityId));
       return;
     }
@@ -1050,6 +1271,36 @@ async function expectHorizontallyReachable(locator, viewportWidth) {
   expect(box).not.toBeNull();
   expect(box.x).toBeGreaterThanOrEqual(-0.5);
   expect(box.x + box.width).toBeLessThanOrEqual(viewportWidth + 0.5);
+}
+
+function markBrokerOpportunityPursued(state, opportunityId = 'opp-cascade') {
+  const score = state.scoreRows.find((row) => row.opportunityId === opportunityId);
+  score.operatorPriority = 'high';
+  score.reviewed = true;
+  score.reviewedAt = '2026-09-01T16:55:00.000Z';
+  score.reviewedBy = 'phase1-admin';
+  score.changedSinceReview = false;
+}
+
+async function openBrokerOpportunity(page, name = 'Cascade Field Compliance') {
+  await page.goto('/admin/deal-hunter');
+  await expect(page.getByRole('list', { name: 'Opportunity queue' })).toBeVisible();
+  const trigger = page.getByRole('button', { name: `Open ${name}` });
+  if (await trigger.count() === 0) {
+    await page.getByRole('tab', { name: 'All' }).click();
+    await expect(trigger).toBeVisible();
+  }
+  await trigger.click();
+  const dialog = page.getByRole('dialog', { name });
+  await expect(dialog).toBeVisible();
+  return { dialog, trigger, card: dialog.getByRole('region', { name: 'Broker Materials' }) };
+}
+
+function expectBrokerRouteAuditClean(state) {
+  expect(state.unexpectedRequests).toEqual([]);
+  expect(state.unexpectedApiRequests).toEqual([]);
+  expect(state.offOriginRequests).toEqual([]);
+  expect(state.requests.filter(({ path }) => /provider|reconcil|send-again|retry-approval/i.test(path))).toEqual([]);
 }
 
 test('overview summary cards are keyboard-accessible drill-down links', async ({ page }) => {
@@ -1554,4 +1805,228 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   expect(state.offOriginRequests).toEqual([]);
   expect(consoleErrors).toEqual([]);
   expect(pageErrors).toEqual([]);
+});
+
+test('Request Broker Materials desktop review sends the exact approved proposal once and reloads durable lifecycle', async ({ page }) => {
+  const state = await installPhase1Fixture(page);
+  const fixture = state.brokerMaterialsByOpportunity['opp-cascade'];
+  fixture.warnings = [
+    { code: 'below_automated_cim_score_threshold', message: 'Score 68 is below the automated CIM threshold; manual review remains allowed.' },
+    { code: 'annual_profit_incomplete', message: 'Annual profit is incomplete; automated eligibility remains stricter.' },
+  ];
+  const score = state.scoreRows.find((row) => row.opportunityId === 'opp-cascade');
+  score.fitScore = 68;
+  score.financials.annualProfit = null;
+  const { dialog, card } = await openBrokerOpportunity(page);
+
+  await dialog.getByRole('button', { name: 'Pursue Cascade Field Compliance' }).click();
+  await expect(card.getByRole('button', { name: 'Request Broker Materials' })).toBeVisible();
+  await card.getByRole('button', { name: 'Request Broker Materials' }).click();
+
+  await expect(card.getByRole('heading', { name: 'Prepared Broker Materials review' })).toBeFocused();
+  await expect(card.getByText(/broker-opp-cascade@example\.test/).first()).toBeVisible();
+  await expect(card.getByText(/Provenance: Deal Hunter Google Sheet · deal-cascade-sheet/)).toBeVisible();
+  await expect(card.getByText(/Mathew Uckele · mathew@uckelegroup.com · Reply to reply\+browser@example.test/)).toBeVisible();
+  await expect(card.getByText(/Score 68 is below the automated CIM threshold/)).toBeVisible();
+  await expect(card.getByText(/Annual profit is incomplete/)).toBeVisible();
+  await expect(card.getByLabel('Greeting')).toHaveValue('Hi Riley,');
+  await expect(card.getByLabel('Subject')).toHaveValue('CIM / NDA request for Cascade Field Compliance');
+  await expect(card.getByLabel('Complete message body')).toHaveValue('Hi Riley,\n\nPlease share the CIM and NDA for Cascade Field Compliance.\n\nThank you,\nMathew');
+  await expect(card.getByRole('button', { name: 'Approve & Send' })).toBeEnabled();
+
+  await card.getByLabel('Greeting').fill('Hello Riley,');
+  await expect(card.getByRole('button', { name: 'Approve & Send' })).toBeDisabled();
+  expect(state.brokerApprovalCount).toBe(0);
+  await card.getByRole('button', { name: 'Update Preview' }).click();
+  await expect(card.getByLabel('Complete message body')).toHaveValue('Hello Riley,\n\nPlease share the CIM and NDA for Cascade Field Compliance.\n\nThank you,\nMathew');
+  await expect(card.getByLabel('Greeting')).toBeFocused();
+
+  const approve = card.getByRole('button', { name: 'Approve & Send' });
+  await approve.click();
+  await expect(card.getByRole('heading', { name: 'Broker Materials status: Sent' })).toBeFocused();
+  await expect(card.getByText('Sent', { exact: true })).toBeVisible();
+  expect(state.brokerApprovalCount).toBe(1);
+  expect(state.brokerApprovePayloads).toHaveLength(1);
+  expect(state.brokerApprovePayloads[0].body).toEqual({
+    preparationToken: state.lastBrokerPreparationByOpportunity['opp-cascade'].preparationToken,
+    approvedProposalDigest: state.lastBrokerPreparationByOpportunity['opp-cascade'].proposalDigest,
+  });
+  expect(Object.keys(state.brokerApprovePayloads[0].body).sort()).toEqual(['approvedProposalDigest', 'preparationToken']);
+  expect(state.brokerPreparePayloads.map(({ body }) => body)).toEqual([
+    {},
+    { recipientContactRef: 'contact-opp-cascade-structured', greeting: 'Hello Riley,' },
+  ]);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Request Broker Materials keeps global-pause review available while disabling approval with a reason', async ({ page }) => {
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  state.brokerMaterialsByOpportunity['opp-cascade'].sendBlockers = [{ code: 'cim_outreach_paused', message: 'CIM sending is globally paused.' }];
+  const { card } = await openBrokerOpportunity(page);
+
+  await card.getByRole('button', { name: 'Request Broker Materials' }).click();
+  await expect(card.getByLabel('Complete message body')).toBeVisible();
+  const approval = card.getByTestId('broker-materials-final-approval');
+  await expect(approval.getByText(/CIM sending is globally paused\./)).toBeVisible();
+  await expect(approval).toHaveAttribute('data-mobile-sticky', 'true');
+  await expect(card.getByRole('button', { name: 'Approve & Send' })).toBeDisabled();
+  expect(state.brokerApprovalCount).toBe(0);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Request Broker Materials requires an explicit opaque contact and verified manual email authority', async ({ page }) => {
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  const fixture = state.brokerMaterialsByOpportunity['opp-cascade'];
+  fixture.multipleContacts = true;
+  fixture.recipientOptions = [
+    { recipientContactRef: 'contact-cascade-structured', email: 'structured@example.test', displayName: 'Structured Broker', provenance: 'structured_source', provenanceLabel: 'Deal Hunter Sheet · cascade', primary: false },
+    { recipientContactRef: 'contact-cascade-crm', email: 'crm@example.test', displayName: 'CRM Broker', provenance: 'crm', provenanceLabel: 'Current CRM broker', primary: false },
+  ];
+  let opened = await openBrokerOpportunity(page);
+  await opened.card.getByRole('button', { name: 'Request Broker Materials' }).click();
+  await expect(opened.card.getByText('Recipient required', { exact: true })).toBeVisible();
+  await expect(opened.card.getByRole('button', { name: 'Approve & Send' })).toHaveCount(0);
+  await opened.card.getByLabel('Authoritative broker recipient').selectOption('contact-cascade-crm');
+  await expect(opened.card.getByLabel('Complete message body')).toBeVisible();
+  expect(state.brokerPreparePayloads.map(({ body }) => body)).toEqual([{}, { recipientContactRef: 'contact-cascade-crm' }]);
+  expect(Object.values(state.brokerPreparePayloads[1].body)).not.toContain('crm@example.test');
+  await opened.dialog.getByRole('button', { name: 'Close opportunity detail' }).click();
+
+  const manualState = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(manualState);
+  const manualFixture = manualState.brokerMaterialsByOpportunity['opp-cascade'];
+  manualFixture.recipientOptions = [];
+  manualFixture.allowBrokerVerification = true;
+  manualState.operatorFacts.push({
+    opportunityId: 'opp-cascade', id: 'fact-unverified-browser-broker', field: 'broker_email',
+    value: 'verified-browser-broker@example.test', verified: false, actor: 'phase1-admin', note: '',
+    createdAt: '2026-09-01T16:00:00.000Z', updatedAt: '2026-09-01T16:00:00.000Z',
+  });
+  opened = await openBrokerOpportunity(page);
+  await expect(opened.card.getByText(/Add and verify a broker email/)).toBeVisible();
+  expect(manualState.brokerPreparePayloads).toEqual([]);
+  await opened.card.getByRole('button', { name: 'Add / Verify Broker Email' }).click();
+  await expect(opened.dialog.getByLabel('Verified fact field')).toHaveValue('broker_email');
+  await expect(opened.dialog.getByLabel('Verified fact value')).toBeFocused();
+  await opened.dialog.getByLabel('Verified fact value').fill('verified-browser-broker@example.test');
+  await opened.dialog.getByLabel('Verification note').fill('Verified for the broker materials request.');
+  await opened.dialog.getByRole('button', { name: 'Save verified fact' }).click();
+  await expect(opened.card.getByRole('button', { name: 'Request Broker Materials' })).toBeVisible();
+  await opened.card.getByRole('button', { name: 'Request Broker Materials' }).click();
+  await expect(opened.card.getByText(/verified-browser-broker@example\.test/).first()).toBeVisible();
+  expect(manualState.factPayloads.at(-1).body).toEqual({ value: 'verified-browser-broker@example.test', note: 'Verified for the broker materials request.', verified: true });
+  expectBrokerRouteAuditClean(manualState);
+});
+
+test('Request Broker Materials unknown approval outcome checks authority without retrying approval', async ({ page }) => {
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  state.brokerMaterialsByOpportunity['opp-cascade'].approvalMode = 'unknown';
+  const { card } = await openBrokerOpportunity(page);
+  await card.getByRole('button', { name: 'Request Broker Materials' }).click();
+  await card.getByRole('button', { name: 'Approve & Send' }).click();
+
+  await expect(card.getByText('Checking', { exact: true })).toBeVisible();
+  await expect(card.getByRole('button', { name: 'Check Again' })).toBeVisible();
+  await expect(card.getByRole('button', { name: /Approve & Send|Send Again/i })).toHaveCount(0);
+  expect(state.brokerApprovalCount).toBe(1);
+  const detailLoadsBeforeCheck = state.brokerDetailLoads['opp-cascade'];
+  await card.getByRole('button', { name: 'Check Again' }).click();
+  await expect(card.getByText('Sent', { exact: true })).toBeVisible();
+  expect(state.brokerDetailLoads['opp-cascade']).toBe(detailLoadsBeforeCheck + 1);
+  expect(state.brokerApprovalCount).toBe(1);
+  expect(state.brokerApprovePayloads).toHaveLength(1);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Request Broker Materials viewer can inspect preview and status but cannot mutate', async ({ page }) => {
+  const state = await installPhase1Fixture(page, { role: 'viewer' });
+  markBrokerOpportunityPursued(state);
+  const { dialog, card } = await openBrokerOpportunity(page);
+  await expect(dialog.getByRole('button', { name: /Pursue|Watch|Pass/ })).toHaveCount(0);
+  await expect(dialog.getByRole('button', { name: 'Save verified fact' })).toHaveCount(0);
+  await card.getByRole('button', { name: 'Preview Broker Materials' }).click();
+  await expect(card.getByLabel('Greeting')).toHaveAttribute('readonly');
+  await expect(card.getByLabel('Complete message body')).toBeVisible();
+  await expect(card.getByRole('button', { name: /Approve & Send|Update Preview|Regenerate|Correct Recipient|Retry/i })).toHaveCount(0);
+  await expect(card.getByTestId('broker-materials-final-approval')).not.toHaveAttribute('data-mobile-sticky', 'true');
+  const detailLoadsBeforeCheck = state.brokerDetailLoads['opp-cascade'];
+  await card.getByRole('button', { name: 'Check Request Status' }).click();
+  await expect.poll(() => state.brokerDetailLoads['opp-cascade']).toBe(detailLoadsBeforeCheck + 1);
+  expect(state.brokerApprovalCount).toBe(0);
+  expect(state.factPayloads).toEqual([]);
+  expect(state.actionPayloads).toEqual([]);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Request Broker Materials mobile Prepared review is sticky, reachable, and greeting Enter cannot send', async ({ page }) => {
+  const mobileWidth = 390;
+  await page.setViewportSize({ width: mobileWidth, height: 844 });
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  const { dialog, card } = await openBrokerOpportunity(page);
+  await expect(dialog).toHaveClass(/h-full/);
+  await card.getByRole('button', { name: 'Request Broker Materials' }).click();
+  const approval = card.getByTestId('broker-materials-final-approval');
+  await expect(approval).toHaveCSS('position', 'sticky');
+  await expect(approval.getByText(/broker-opp-cascade@example\.test/)).toBeVisible();
+  const approve = approval.getByRole('button', { name: 'Approve & Send' });
+  await expectHorizontallyReachable(approve, mobileWidth);
+
+  const greeting = card.getByLabel('Greeting');
+  await greeting.scrollIntoViewIfNeeded();
+  await greeting.fill('Hello mobile Riley,');
+  await greeting.press('Enter');
+  await expect(greeting).toBeFocused();
+  await expect(card.getByLabel('Complete message body')).toHaveValue('Hello mobile Riley,\n\nPlease share the CIM and NDA for Cascade Field Compliance.\n\nThank you,\nMathew');
+  expect(state.brokerApprovalCount).toBe(0);
+  await expect(approval).toHaveCSS('position', 'sticky');
+
+  const body = card.getByLabel('Complete message body');
+  await body.scrollIntoViewIfNeeded();
+  const [bodyBox, approvalBox, reviewPadding] = await Promise.all([
+    body.boundingBox(),
+    approval.boundingBox(),
+    card.getByTestId('broker-materials-review-content').evaluate((element) => Number.parseFloat(getComputedStyle(element).paddingBottom)),
+  ]);
+  expect(bodyBox).not.toBeNull();
+  expect(approvalBox).not.toBeNull();
+  expect(bodyBox.y + bodyBox.height).toBeLessThanOrEqual(approvalBox.y + 1);
+  expect(reviewPadding).toBeGreaterThanOrEqual(128);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Request Broker Materials ambiguous lifecycle announces no resend and exposes no initial-request retry', async ({ page }) => {
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  state.brokerMaterialsByOpportunity['opp-cascade'].existingRequest = {
+    id: 'browser-request-ambiguous',
+    status: 'ambiguous',
+    requestState: 'provider_ambiguous',
+    deliveryState: 'ambiguous',
+    followUpState: 'not-scheduled',
+    recipient: { email: 'broker-opp-cascade@example.test', displayName: 'Riley Structured Broker' },
+    subject: 'CIM request',
+    createdAt: '2026-09-01T17:00:00.000Z',
+    updatedAt: '2026-09-01T17:00:30.000Z',
+    requestedAt: '2026-09-01T17:00:00.000Z',
+    providerAcceptedAt: '',
+    deliveredAt: '',
+    respondedAt: '',
+    errorSummary: 'Provider outcome is ambiguous.',
+    canRetry: false,
+    canCorrectRecipient: false,
+    retryRoute: '',
+    correctionRoute: '',
+  };
+  const { card } = await openBrokerOpportunity(page);
+  await expect(card.getByText('Ambiguous', { exact: true })).toBeVisible();
+  await expect(card.getByText('Delivery could not be confirmed. Do not send another request.')).toBeVisible();
+  await expect(card.getByRole('status')).toContainText('Ambiguous. Do not send another request.');
+  await expect(card.getByRole('button', { name: /Approve & Send|Send Again|Retry|Regenerate|Request Broker Materials/i })).toHaveCount(0);
+  await expect(card.getByTestId('broker-materials-final-approval')).toHaveCount(0);
+  expect(state.brokerApprovalCount).toBe(0);
+  expectBrokerRouteAuditClean(state);
 });

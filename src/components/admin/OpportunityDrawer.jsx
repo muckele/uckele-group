@@ -158,7 +158,7 @@ export default function OpportunityDrawer({
   const changedState = opportunity?.changedSinceReview ? 'Changed' : 'Current';
   useLayoutEffect(() => {
     closeButtonRef.current?.focus();
-  }, [loading]);
+  }, [opportunity?.opportunityId]);
   function handleDialogKeyDown(event) {
     if (event.key === 'Escape' && !pending) {
       event.preventDefault();

@@ -362,7 +362,7 @@ export default function AcquisitionInbox({ readOnly = false }) {
       });
       const result = await response.json();
       if (!response.ok || !result.success) throw new Error(result.error || 'Unable to save the verified fact.');
-      if (selectionRef.current === opportunityId) await loadDetail(opportunityId);
+      if (selectionRef.current === opportunityId) await loadDetail(opportunityId, { preserveData: true });
       return true;
     } catch (factError) {
       if (mutationGenerationRef.current === mutationGeneration) setMutationError(factError.message || 'Unable to save the verified fact.');

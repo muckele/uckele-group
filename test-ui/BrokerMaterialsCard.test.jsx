@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import '@testing-library/jest-dom/vitest';
-import React from 'react';
+import React, { useState } from 'react';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import BrokerMaterialsCard from '../src/components/admin/BrokerMaterialsCard.jsx';
@@ -81,6 +81,20 @@ function existingRequest(overrides = {}) {
   };
 }
 
+function preparationWithGreeting(greeting) {
+  const current = preparation();
+  return preparation({
+    review: {
+      ...current.review,
+      message: {
+        ...current.review.message,
+        greeting,
+        body: `${greeting}\n\nPlease share the CIM and NDA for Evergreen Fire Protection.\n\nThank you,\nMathew`,
+      },
+    },
+  });
+}
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -126,7 +140,7 @@ describe('Broker Materials card', () => {
     expect(screen.getByRole('button', { name: 'Approve & Send' })).toBeEnabled();
     rerender(<BrokerMaterialsCard brokerMaterials={projection({ sendBlockers: paused.sendBlockers })} onApprove={vi.fn()} onPrepare={vi.fn()} preparation={paused} />);
     expect(screen.getByLabelText('Complete message body')).toBeVisible();
-    expect(screen.getByText('CIM sending is globally paused.')).toBeVisible();
+    expect(screen.getAllByText(/CIM sending is globally paused\./)[0]).toBeVisible();
     expect(screen.getByRole('button', { name: 'Approve & Send' })).toBeDisabled();
   });
 
@@ -206,7 +220,7 @@ describe('Broker Materials card', () => {
     fireEvent.keyDown(button, { key: 'Enter', code: 'Enter' });
     expect(onApprove).toHaveBeenCalledTimes(1);
     expect(button).toBeDisabled();
-    expect(screen.getByText('Submitting the approved request…')).toBeVisible();
+    expect(screen.getByRole('status')).toHaveTextContent('Submitting the approved request…');
     await act(async () => approval.resolve(true));
   });
 
@@ -298,5 +312,146 @@ describe('Broker Materials card', () => {
     rerender(<BrokerMaterialsCard brokerMaterials={projection()} error="Preparation failed safely." onPrepare={vi.fn()} preparation={preparation()} />);
     expect(screen.getByRole('alert')).toHaveTextContent('Preparation failed safely.');
     expect(screen.getByLabelText('Authoritative broker recipient')).toHaveAttribute('aria-describedby');
+  });
+
+  test('makes only a valid administrator Prepared approval sticky on mobile with safe-area and non-obscuring spacing', () => {
+    const { rerender } = render(<BrokerMaterialsCard brokerMaterials={projection()} onApprove={vi.fn()} onPrepare={vi.fn()} preparation={preparation()} />);
+    const card = screen.getByRole('region', { name: 'Broker Materials' });
+    const approval = within(card).getByTestId('broker-materials-final-approval');
+    expect(approval).toHaveAttribute('data-mobile-sticky', 'true');
+    expect(approval).toHaveClass('sticky', 'bottom-0', 'sm:static');
+    expect(approval.className).toContain('env(safe-area-inset-bottom)');
+    expect(within(approval).getByText(/jane@example\.test/)).toBeVisible();
+    expect(within(approval).getByRole('button', { name: 'Approve & Send' })).toHaveClass('w-full', 'sm:w-auto');
+    expect(within(card).getByTestId('broker-materials-review-content')).toHaveClass('pb-32', 'sm:pb-0');
+
+    const nonPrepared = [
+      { brokerMaterials: projection(), preparation: null },
+      { brokerMaterials: projection({ preparationBlockers: [{ code: 'recipient_required', message: 'Recipient required.' }] }), preparation: null },
+      { brokerMaterials: projection(), preparation: null, preparing: true },
+      { brokerMaterials: projection(), preparation: null, recipientSelection: { message: 'Choose one recipient.', recipientOptions: preparation().recipientOptions } },
+      { brokerMaterials: projection(), preparation: null, checking: true },
+      { brokerMaterials: projection(), preparation: preparation(), updating: true },
+      { brokerMaterials: projection(), preparation: preparation(), sending: true },
+      { brokerMaterials: projection(), preparation: preparation({ preparationToken: '', proposalDigest: '' }), stale: true },
+      { brokerMaterials: projection({ existingRequest: existingRequest() }), preparation: null },
+      { brokerMaterials: projection({ existingRequest: existingRequest({ status: 'ambiguous', requestState: 'provider_ambiguous' }) }), preparation: null },
+      { brokerMaterials: projection({ existingRequest: existingRequest({ status: 'delivery_issue', deliveryState: 'bounced' }) }), preparation: null },
+      { brokerMaterials: projection({ existingRequest: existingRequest({ status: 'responded', requestState: 'responded', deliveryState: 'responded' }) }), preparation: null },
+      { brokerMaterials: projection(), preparation: preparation({ previewOnly: true, preparationToken: undefined, proposalDigest: undefined }), readOnly: true },
+    ];
+    for (const props of nonPrepared) {
+      rerender(<BrokerMaterialsCard {...props} onApprove={vi.fn()} onPrepare={vi.fn()} />);
+      expect(document.querySelector('[data-mobile-sticky="true"]')).toBeNull();
+    }
+
+    rerender(<BrokerMaterialsCard brokerMaterials={projection()} onApprove={vi.fn()} onPrepare={vi.fn()} preparation={preparation()} />);
+    fireEvent.change(screen.getByLabelText('Greeting'), { target: { value: 'Hello Jane,' } });
+    expect(document.querySelector('[data-mobile-sticky="true"]')).toBeNull();
+  });
+
+  test('keeps a paused Prepared sticky review visible with recipient context and a textual disabled reason', () => {
+    const paused = preparation({ sendBlockers: [{ code: 'cim_outreach_paused', message: 'CIM sending is globally paused.' }] });
+    render(<BrokerMaterialsCard brokerMaterials={projection()} onApprove={vi.fn()} onPrepare={vi.fn()} preparation={paused} />);
+    const approval = screen.getByTestId('broker-materials-final-approval');
+    expect(approval).toHaveAttribute('data-mobile-sticky', 'true');
+    expect(within(approval).getByText(/jane@example\.test/)).toBeVisible();
+    expect(within(approval).getByText(/CIM sending is globally paused\./)).toBeVisible();
+    expect(within(approval).getByRole('button', { name: 'Approve & Send' })).toBeDisabled();
+  });
+
+  test('focuses the prepared review after preparation and preserves greeting focus after keyboard preview update', async () => {
+    function Harness() {
+      const [current, setCurrent] = useState(null);
+      async function onPrepare(body) {
+        setCurrent(body.greeting ? preparationWithGreeting(body.greeting) : preparation());
+        return true;
+      }
+      return <BrokerMaterialsCard brokerMaterials={projection()} onApprove={vi.fn()} onPrepare={onPrepare} preparation={current} />;
+    }
+    render(<Harness />);
+    fireEvent.click(screen.getByRole('button', { name: 'Request Broker Materials' }));
+    expect(await screen.findByRole('heading', { name: 'Prepared Broker Materials review' })).toHaveFocus();
+
+    const greeting = screen.getByLabelText('Greeting');
+    fireEvent.change(greeting, { target: { value: 'Hello Jane,' } });
+    fireEvent.keyDown(greeting, { key: 'Enter', code: 'Enter' });
+    await waitFor(() => expect(screen.getByLabelText('Greeting')).toHaveValue('Hello Jane,'));
+    expect(screen.getByLabelText('Greeting')).toHaveFocus();
+    expect(screen.getByRole('status')).toHaveTextContent('Updated');
+  });
+
+  test('focuses operator-triggered preparation and stale-approval errors, then returns focus to disclosure when collapsing', async () => {
+    function Harness() {
+      const [error, setError] = useState('');
+      async function onPrepare() {
+        setError('Preparation failed safely.');
+        return false;
+      }
+      return <BrokerMaterialsCard brokerMaterials={projection()} error={error} onPrepare={onPrepare} />;
+    }
+    const { unmount } = render(<Harness />);
+    fireEvent.click(screen.getByRole('button', { name: 'Request Broker Materials' }));
+    expect(await screen.findByRole('alert')).toHaveFocus();
+    unmount();
+
+    function StaleHarness() {
+      const [staleState, setStaleState] = useState({ error: '', stale: false });
+      async function onApprove() {
+        setStaleState({ error: 'The prepared proposal is stale. Review a fresh proposal.', stale: true });
+        return false;
+      }
+      return <BrokerMaterialsCard brokerMaterials={projection()} error={staleState.error} onApprove={onApprove} onPrepare={vi.fn()} preparation={preparation()} stale={staleState.stale} />;
+    }
+    const staleRender = render(<StaleHarness />);
+    fireEvent.click(screen.getByRole('button', { name: 'Approve & Send' }));
+    expect(await screen.findByRole('alert')).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Regenerate Request' })).toBeVisible();
+    staleRender.unmount();
+
+    render(<BrokerMaterialsCard brokerMaterials={projection()} onApprove={vi.fn()} onPrepare={vi.fn()} preparation={preparation()} />);
+    const reviewHeading = screen.getByRole('heading', { name: 'Prepared Broker Materials review' });
+    reviewHeading.focus();
+    fireEvent.click(screen.getByRole('button', { name: 'Broker Materials review' }));
+    expect(screen.getByRole('button', { name: 'Broker Materials review' })).toHaveFocus();
+  });
+
+  test('focuses authoritative lifecycle only after approval while a background refresh preserves focus', async () => {
+    const approval = deferred();
+    const onApprove = vi.fn(() => approval.promise);
+    const { rerender } = render(<BrokerMaterialsCard brokerMaterials={projection()} onApprove={onApprove} onPrepare={vi.fn()} preparation={preparation()} />);
+    fireEvent.click(screen.getByRole('button', { name: 'Approve & Send' }));
+    rerender(<BrokerMaterialsCard brokerMaterials={projection({ existingRequest: existingRequest() })} onApprove={onApprove} onPrepare={vi.fn()} />);
+    expect(screen.getByRole('heading', { name: 'Broker Materials status: Sent' })).toHaveFocus();
+    await act(async () => approval.resolve(true));
+
+    cleanup();
+    const background = render(<BrokerMaterialsCard brokerMaterials={projection()} onApprove={vi.fn()} onPrepare={vi.fn()} preparation={preparation()} />);
+    const disclosure = screen.getByRole('button', { name: 'Broker Materials review' });
+    disclosure.focus();
+    background.rerender(<BrokerMaterialsCard brokerMaterials={projection({ existingRequest: existingRequest() })} onApprove={vi.fn()} onPrepare={vi.fn()} />);
+    expect(disclosure).toHaveFocus();
+    expect(screen.getByRole('status')).toHaveTextContent('Broker Materials status: Sent');
+  });
+
+  test('keeps one stable live region explicit for ambiguous no-resend status', () => {
+    render(<BrokerMaterialsCard brokerMaterials={projection({ existingRequest: existingRequest({ status: 'ambiguous', requestState: 'provider_ambiguous', deliveryState: 'ambiguous' }) })} onPrepare={vi.fn()} />);
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+    expect(screen.getByRole('status')).toHaveTextContent('Ambiguous. Do not send another request.');
+    expect(screen.queryByRole('button', { name: /send|retry|regenerate/i })).not.toBeInTheDocument();
+  });
+
+  test('greeting Enter updates only and cannot submit a surrounding form or approve', async () => {
+    const onPrepare = vi.fn(async () => true);
+    const onApprove = vi.fn(async () => true);
+    const onSubmit = vi.fn((event) => event.preventDefault());
+    render(<form onSubmit={onSubmit}><BrokerMaterialsCard brokerMaterials={projection()} onApprove={onApprove} onPrepare={onPrepare} preparation={preparation()} /></form>);
+    const greeting = screen.getByLabelText('Greeting');
+    fireEvent.change(greeting, { target: { value: 'Hello Jane,' } });
+    fireEvent.keyDown(greeting, { key: 'Enter', code: 'Enter' });
+    await waitFor(() => expect(onPrepare).toHaveBeenCalledTimes(1));
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(onApprove).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Approve & Send' })).toHaveAttribute('type', 'button');
   });
 });
