@@ -8733,18 +8733,21 @@ async function sendCimRequestForScoredDeal({
     const activeRequest = renewal.request || pendingRequest || pendingRecord;
     let finalDisposition = null;
     let dispositionCheckFailed = false;
+    const requiresFailClosedFinalDisposition = automaticSend || manualSend;
     if (storage.getDealHunterDisposition) {
       try {
         finalDisposition = await storage.getDealHunterDisposition({ dealKey: deal.dealKey });
       } catch {
-        dispositionCheckFailed = automaticSend;
+        dispositionCheckFailed = requiresFailClosedFinalDisposition;
       }
-    } else if (automaticSend) {
+    } else if (requiresFailClosedFinalDisposition) {
       dispositionCheckFailed = true;
     }
     if (dispositionCheckFailed || finalDisposition?.disposition === 'dismissed') {
       const dispositionError = dispositionCheckFailed
-        ? 'The final dismissal check is unavailable. No automatic email was transmitted.'
+        ? automaticSend
+          ? 'The final dismissal check is unavailable. No automatic email was transmitted.'
+          : 'The final dismissal check is unavailable. No email was transmitted.'
         : 'This Deal Hunter opportunity was dismissed before provider work. No email was transmitted.';
       const blockedRequest = await finalizeCimRequestClaimWithActivity(
         storage,

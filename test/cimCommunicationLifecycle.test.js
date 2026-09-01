@@ -170,6 +170,27 @@ async function preparedManualApproval(storage) {
   return { deal, preparation };
 }
 
+async function approvePreparedManual({ storage, preparation }) {
+  const { approveDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
+  return approveDealHunterBrokerMaterials({
+    opportunityId: preparation.review.opportunity.canonicalOpportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+    storage,
+  });
+}
+
+function observeApprovalDispositionReads(storage) {
+  const listDispositions = storage.listDealHunterDispositions.bind(storage);
+  let reads = 0;
+  storage.listDealHunterDispositions = async (...args) => {
+    reads += 1;
+    return listDispositions(...args);
+  };
+  return () => reads;
+}
+
 test('production EmailJS CIM delivery fails closed before any provider call', () => {
   const deliveryModuleUrl = new URL('../server/services/delivery.js', import.meta.url).href;
   const script = `
@@ -425,6 +446,82 @@ test('approved manual Stage 1 uses the existing durable executor once, persists 
   assert.equal(replay.durableResult.cimRequest.id, request.id);
   assert.deepEqual(Object.keys(replay.durableResult.cimRequest).sort(), Object.keys(request).sort());
   assert.equal(resendCalls.length, 1, 'replaying the approval must not call the provider twice');
+});
+
+test('manual approval fails closed when final disposition authority throws after approval revalidation', async (t) => {
+  // Break caught: the shared executor treats an indeterminate final disposition
+  // as clear authority for trusted manual Stage 1 and reaches the provider.
+  const storage = testStorage(t);
+  const { preparation } = await preparedManualApproval(storage);
+  const approvalDispositionReads = observeApprovalDispositionReads(storage);
+  let finalDispositionReads = 0;
+  storage.getDealHunterDisposition = async () => {
+    finalDispositionReads += 1;
+    throw new Error('simulated final disposition authority outage');
+  };
+
+  const result = await approvePreparedManual({ storage, preparation });
+  const request = result.durableResult?.cimRequest;
+  const storedRequest = request?.id ? await storage.getDealHunterCimRequestById(request.id) : null;
+
+  assert.equal(approvalDispositionReads(), 1, 'approval revalidation must first establish current disposition authority');
+  assert.equal(finalDispositionReads, 1, 'the durable executor must perform its final disposition read');
+  assert.equal(resendCalls.length, 0, 'indeterminate final disposition authority must block provider work');
+  assert.equal(result.success, true, 'the already-created durable request remains authoritative');
+  assert.equal(request.status, 'failed');
+  assert.equal(request.providerAcceptedAt, '');
+  assert.equal(storedRequest.provider_message_id || '', '');
+  assert.equal(storedRequest.first_provider_accepted_at, null);
+  assert.match(storedRequest.delivery_error, /final dismissal check is unavailable/i);
+});
+
+test('manual approval fails closed when final disposition capability is unavailable', async (t) => {
+  // Break caught: an absent final disposition reader is treated as clear
+  // authority for trusted manual Stage 1 and reaches the provider.
+  const storage = testStorage(t);
+  const { preparation } = await preparedManualApproval(storage);
+  const approvalDispositionReads = observeApprovalDispositionReads(storage);
+  storage.getDealHunterDisposition = undefined;
+
+  const result = await approvePreparedManual({ storage, preparation });
+  const request = result.durableResult?.cimRequest;
+  const storedRequest = request?.id ? await storage.getDealHunterCimRequestById(request.id) : null;
+
+  assert.equal(approvalDispositionReads(), 1, 'approval revalidation must first establish current disposition authority');
+  assert.equal(resendCalls.length, 0, 'missing final disposition capability must block provider work');
+  assert.equal(result.success, true, 'the already-created durable request remains authoritative');
+  assert.equal(request.status, 'failed');
+  assert.equal(request.providerAcceptedAt, '');
+  assert.equal(storedRequest.provider_message_id || '', '');
+  assert.equal(storedRequest.first_provider_accepted_at, null);
+  assert.match(storedRequest.delivery_error, /final dismissal check is unavailable/i);
+});
+
+test('manual approval blocks a late Pass returned after approval revalidation', async (t) => {
+  // Break caught: a Pass winning the approval-to-claim race reaches the
+  // provider instead of becoming durable no-send evidence.
+  const storage = testStorage(t);
+  const { deal, preparation } = await preparedManualApproval(storage);
+  const approvalDispositionReads = observeApprovalDispositionReads(storage);
+  let finalDispositionReads = 0;
+  storage.getDealHunterDisposition = async () => {
+    finalDispositionReads += 1;
+    return { id: 'manual-late-pass', deal_key: deal.dealKey, disposition: 'dismissed' };
+  };
+
+  const result = await approvePreparedManual({ storage, preparation });
+  const request = result.durableResult?.cimRequest;
+  const storedRequest = request?.id ? await storage.getDealHunterCimRequestById(request.id) : null;
+
+  assert.equal(approvalDispositionReads(), 1, 'approval revalidation must first establish current disposition authority');
+  assert.equal(finalDispositionReads, 1);
+  assert.equal(resendCalls.length, 0, 'a late returned Pass must block provider work');
+  assert.equal(result.success, true, 'the already-created durable request remains authoritative');
+  assert.equal(request.status, 'failed');
+  assert.equal(request.providerAcceptedAt, '');
+  assert.equal(storedRequest.provider_message_id || '', '');
+  assert.equal(storedRequest.first_provider_accepted_at, null);
+  assert.match(storedRequest.delivery_error, /dismissed before provider work/i);
 });
 
 test('manual approval returns a durable failed request instead of an unsafe transport error', async (t) => {
