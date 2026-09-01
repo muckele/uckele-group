@@ -109,6 +109,40 @@ test('acquisition pipeline derives stage from command override, CIM response, an
   );
 });
 
+test('acquisition command center uses shared acquisition materials authority instead of documents length', () => {
+  assert.equal(
+    deriveAcquisitionPipelineStage({
+      submission: { metadata: {} },
+      documents: [{ document_type: 'nda', original_name: 'signed-nda.pdf' }],
+    }),
+    'new-fit',
+  );
+  assert.equal(
+    deriveAcquisitionPipelineStage({
+      submission: { metadata: {} },
+      documents: [{ document_type: 'other', original_name: 'internal-note.txt', note: 'CIM may arrive later' }],
+    }),
+    'new-fit',
+  );
+  assert.equal(
+    deriveAcquisitionPipelineStage({
+      submission: { metadata: {} },
+      documents: [{ document_type: 'cim', original_name: 'materials.pdf' }],
+    }),
+    'docs-received',
+  );
+  assert.equal(
+    deriveAcquisitionPipelineStage({
+      submission: { metadata: {} },
+      latestUploadRequest: {
+        status: 'completed',
+        requested_documents: [{ category: 'financials' }],
+      },
+    }),
+    'docs-received',
+  );
+});
+
 test('source health flags row drops and missing post-window updates', () => {
   const health = buildAcquisitionSourceHealth({
     now: new Date('2026-06-16T18:00:00.000Z'),

@@ -9,6 +9,7 @@ import { normalizeDiligenceReview } from './submissions.js';
 import { buildFollowUpPrompt } from './workflow.js';
 import { commitCrmActivityMutation } from './activity.js';
 import { archiveLead } from './leadLifecycle.js';
+import { evaluateAcquisitionMaterialsState } from './acquisitionMaterials.js';
 
 export const acquisitionPipelineStages = [
   'new-fit',
@@ -529,7 +530,13 @@ export function deriveAcquisitionPipelineStage({ submission = {}, cimRequest = n
     return 'diligence';
   }
 
-  if (documents.length > 0 || latestUploadRequest?.status === 'documents-received' || submission.prospectus_url) {
+  const materials = evaluateAcquisitionMaterialsState({
+    submission,
+    secureDocuments: documents,
+    latestUploadRequest,
+  });
+
+  if (materials.materialsReceived) {
     return 'docs-received';
   }
 

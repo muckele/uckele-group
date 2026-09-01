@@ -185,6 +185,21 @@ test('CIM touch identifiers are deterministic and isolated by request and follow
   assert.equal(buildCimEmailIdempotencyKey(), '');
 });
 
+test('CIM follow-up idempotency keys are stable and distinct for one through five', () => {
+  const keys = [1, 2, 3, 4, 5].map((followUpNumber) => (
+    buildCimEmailIdempotencyKey({ requestId: 'request-1', followUpNumber })
+  ));
+
+  assert.deepEqual(keys, [
+    'deal-hunter-cim-request-1-follow-up-1',
+    'deal-hunter-cim-request-1-follow-up-2',
+    'deal-hunter-cim-request-1-follow-up-3',
+    'deal-hunter-cim-request-1-follow-up-4',
+    'deal-hunter-cim-request-1-follow-up-5',
+  ]);
+  assert.equal(new Set(keys).size, 5);
+});
+
 test('CIM requests get stable request-specific reply addresses on the configured inbound domain', () => {
   assert.equal(
     buildCimReplyToAddress({
@@ -423,5 +438,75 @@ test('CIM follow-up emails keep internal score and deal economics out of broker-
     assert.equal(message.html.includes('>Follow-Up</td>'), false);
     assert.equal(message.html.includes(`>#${followUpNumber}</td>`), false);
     assertBrokerEmailHidesInternalDetails(message);
+  }
+});
+
+test('CIM follow-up copy has explicit distinct branches for four and five', () => {
+  const request = {
+    id: 'request-1',
+    deal_key: sampleDeal.dealKey,
+    deal_name: sampleDeal.name,
+    listing_url: sampleDeal.listingUrl,
+    metadata: { industry: sampleDeal.industry, location: sampleDeal.location },
+  };
+  const fourth = buildDealHunterCimFollowUpEmail({
+    to: 'broker@example.com', request, followUpNumber: 4, requestedBy: 'Mathew Uckele',
+  });
+  const fifth = buildDealHunterCimFollowUpEmail({
+    to: 'broker@example.com', request, followUpNumber: 5, requestedBy: 'Mathew Uckele',
+  });
+
+  assert.match(fourth.text, /If the opportunity is still active/i);
+  assert.match(fourth.text, /CIM, teaser, offering materials, or the next step in the NDA process/i);
+  assert.match(fourth.text, /brief status update/i);
+  assert.doesNotMatch(fourth.text, /proof of funds|buyer profile/i);
+  assert.match(fifth.text, /one final time/i);
+  assert.match(fifth.text, /no further action is needed/i);
+  assert.match(fifth.text, /close the loop/i);
+  assert.notEqual(fourth.text, fifth.text);
+  assert.notEqual(fourth.html, fifth.html);
+  assert.equal(fourth.templateVersion, 'deal-hunter-cim-follow-up-4-v1');
+  assert.equal(fifth.templateVersion, 'deal-hunter-cim-follow-up-5-v1');
+});
+
+test('CIM follow-up builder accepts a trusted greeting for one through five and rejects out of range', () => {
+  const request = {
+    id: 'request-1',
+    deal_key: sampleDeal.dealKey,
+    deal_name: sampleDeal.name,
+    listing_url: sampleDeal.listingUrl,
+    metadata: { industry: sampleDeal.industry, location: sampleDeal.location },
+  };
+
+  for (const followUpNumber of [1, 2, 3, 4, 5]) {
+    const message = buildDealHunterCimFollowUpEmail({
+      to: 'broker@example.com',
+      request,
+      followUpNumber,
+      requestedBy: 'Mathew Uckele',
+      manualFollowUp: { greeting: 'Hi Avery,' },
+    });
+    assert.equal(message.greeting, 'Hi Avery,');
+    assert.equal(message.text.startsWith('Hi Avery,\n'), true);
+    assert.match(message.html, /Hi Avery,/);
+    assert.equal(message.templateVersion, `deal-hunter-cim-follow-up-${followUpNumber}-v1`);
+  }
+
+  for (const followUpNumber of [0, 6, -1, 1.5, '2']) {
+    assert.throws(() => buildDealHunterCimFollowUpEmail({
+      to: 'broker@example.com', request, followUpNumber, manualFollowUp: { greeting: 'Hi Avery,' },
+    }), /follow-up number/i);
+  }
+  for (const manualFollowUp of [
+    {},
+    { greeting: '' },
+    { greeting: 'Hello\nthere,' },
+    { greeting: '<Hello>,' },
+    { greeting: 'x'.repeat(121) },
+    { greeting: 'Hello,', subject: 'override' },
+  ]) {
+    assert.throws(() => buildDealHunterCimFollowUpEmail({
+      to: 'broker@example.com', request, followUpNumber: 1, manualFollowUp,
+    }), /manual follow-up/i);
   }
 });

@@ -39,7 +39,10 @@ const boundedCimRequestKeys = [
 ].sort();
 
 function assertBoundedCimRequest(request) {
-  assert.deepEqual(Object.keys(request).sort(), boundedCimRequestKeys);
+  const expectedKeys = request.followUps
+    ? [...boundedCimRequestKeys, 'followUps'].sort()
+    : boundedCimRequestKeys;
+  assert.deepEqual(Object.keys(request).sort(), expectedKeys);
   assert.deepEqual(Object.keys(request.recipient).sort(), ['displayName', 'email']);
   for (const rawKey of [
     'metadata',
@@ -326,6 +329,60 @@ test('projected broker materials exposes current Pursue, bounded lifecycle, warn
   assert.equal(projection.existingRequest.followUpState, 'not-scheduled');
   const serialized = JSON.stringify(projection.existingRequest);
   for (const secret of ['secret-provider-id', 'providerPayload', 'signature']) assert.equal(serialized.includes(secret), false);
+});
+
+test('broker materials detail exposes bounded public manual follow-up projection without raw metadata', async () => {
+  const privateSentinel = 'private-manual-follow-up-authority';
+  const storage = authorityStorage({
+    requests: [{
+      id: 'request-manual-follow-up',
+      opportunity_id: opportunityId,
+      submission_id: 'submission-1',
+      status: 'sent',
+      request_state: 'provider_accepted',
+      delivery_state: 'accepted',
+      follow_up_state: 'scheduled',
+      follow_up_count: 2,
+      next_follow_up_at: '2026-09-03T16:00:00.000Z',
+      recipient_email: 'source-broker@example.test',
+      created_at: '2026-08-31T17:40:00.000Z',
+      updated_at: '2026-09-01T17:41:00.000Z',
+      metadata: {
+        privateSentinel,
+        manualApproval: { signature: privateSentinel },
+        manualFollowUp: {
+          version: 'deal-hunter-manual-follow-up-v1',
+          mode: 'operator-approved',
+          maximumFollowUps: 5,
+          cadencePolicy: 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1',
+          enrolledAt: '2026-09-01T16:00:00.000Z',
+          enrolledBy: privateSentinel,
+        },
+      },
+    }],
+  });
+
+  const projection = await projectDealHunterBrokerMaterials({
+    opportunityId,
+    storage,
+    now: new Date('2026-09-02T17:00:00.000Z'),
+  });
+
+  assert.deepEqual(projection.existingRequest.followUps, {
+    enrolled: true,
+    policyVersion: 'deal-hunter-manual-follow-up-v1',
+    maximumFollowUps: 5,
+    followUpCount: 2,
+    currentFollowUpNumber: 3,
+    nextFollowUpAt: '2026-09-03T16:00:00.000Z',
+    state: 'scheduled',
+    terminalReason: '',
+    retryEligible: false,
+    preparationBlockers: [],
+    sendBlockers: [],
+  });
+  assert.equal(JSON.stringify(projection.existingRequest).includes(privateSentinel), false);
+  assertBoundedCimRequest(projection.existingRequest);
 });
 
 test('critical authority read failures fail closed without issuing a preparation token', async (t) => {

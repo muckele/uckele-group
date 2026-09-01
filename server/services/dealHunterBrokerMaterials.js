@@ -11,6 +11,8 @@ import {
 import { evaluateCimRecipientPolicy, getCimOutreachPauseStatus } from './cimOpportunityIdentity.js';
 import { buildDealHunterCimRequestEmail } from './delivery.js';
 import { getEmailReadiness } from './emailReadiness.js';
+import { evaluateAcquisitionMaterialsState } from './acquisitionMaterials.js';
+import { projectManualFollowUpState } from './dealHunterManualFollowUpPolicy.js';
 import {
   buildDealHunterCimRequestId,
   evaluateDealHunterCimEligibility,
@@ -238,7 +240,7 @@ function issueContactOptions({ opportunityId, contacts, secret }) {
   }).sort((left, right) => left.email.localeCompare(right.email) || left.provenance.localeCompare(right.provenance));
 }
 
-function projectExistingRequest(records = []) {
+function projectExistingRequest(records = [], { now = new Date(), terminalReason = '' } = {}) {
   const request = [...records].filter((item) => item?.id).sort((left, right) => (
     (Date.parse(right.responded_at || right.respondedAt || right.updated_at || right.updatedAt || right.created_at || right.createdAt || '') || 0)
     - (Date.parse(left.responded_at || left.respondedAt || left.updated_at || left.updatedAt || left.created_at || left.createdAt || '') || 0)
@@ -250,6 +252,12 @@ function projectExistingRequest(records = []) {
   const providerAcceptedAt = iso(request.first_provider_accepted_at || request.providerAcceptedAt);
   const preAcceptanceFailure = status === 'failed' && !providerAcceptedAt && !['accepted', 'delivered', 'bounced', 'complained', 'suppressed'].includes(deliveryState);
   const deliveryIssue = status === 'delivery_issue' || ['bounced', 'complained', 'suppressed'].includes(deliveryState);
+  const followUps = projectManualFollowUpState({
+    request,
+    communications: [],
+    authority: { terminalReason },
+    now,
+  });
   return {
     id: text(request.id, 200),
     status,
@@ -268,6 +276,7 @@ function projectExistingRequest(records = []) {
     deliveredAt: iso(request.delivered_at || request.deliveredAt),
     respondedAt: iso(request.responded_at || request.respondedAt),
     errorSummary: safeRequestErrorSummary({ status, deliveryState }),
+    ...(followUps.enrolled ? { followUps } : {}),
     canRetry: preAcceptanceFailure,
     canCorrectRecipient: deliveryIssue,
     retryRoute: preAcceptanceFailure ? `/api/admin/deal-hunter/cim-requests/${encodeURIComponent(request.id)}/retry` : '',
@@ -362,6 +371,8 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   let opportunityClaim;
   let safety;
   let identityExceptions;
+  let secureDocuments;
+  let latestUploadRequest;
   try {
     [aliases, facts, sourceRows, submission, opportunityClaim, safety, identityExceptions] = await Promise.all([
       requiredAuthorityRead(storage, 'listDealHunterOpportunityAliases', { opportunityIds: [id], limit: 500 }),
@@ -373,6 +384,12 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
       requiredAuthorityRead(storage, 'listDealHunterIdentityExceptions', { statuses: ['open'], limit: 5000 }),
     ]);
     const dealKeys = knownDealKeys(score, aliases);
+    [secureDocuments, latestUploadRequest] = submission
+      ? await Promise.all([
+          optionalRead(() => storage?.listSecureDocumentsForSubmission?.(submission.id), []),
+          optionalRead(() => storage?.getLatestSecureUploadRequestForSubmission?.(submission.id), null),
+        ])
+      : [[], null];
     const [canonicalRequests, aliasRequests, knownDispositions] = await Promise.all([
       requiredAuthorityRead(storage, 'listDealHunterCimRequests', { opportunityIds: [id], detailAuthority: true, limit: 100 }),
       dealKeys.length > 0 ? requiredAuthorityRead(storage, 'listDealHunterCimRequests', { dealKeys, limit: 500 }) : [],
@@ -391,7 +408,13 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   ];
   const recipientOptions = issueContactOptions({ opportunityId: id, contacts, secret: config.admin.sessionSecret });
   const state = pursuedState(score);
-  const existingRequest = projectExistingRequest(requests);
+  const materialsState = evaluateAcquisitionMaterialsState({ submission, secureDocuments, latestUploadRequest });
+  const terminalReason = materialsState.materialsReceived
+    ? 'materials-received'
+    : materialsState.advancedBeyondBrokerOutreach
+      ? 'advanced-beyond-broker-outreach'
+      : '';
+  const existingRequest = projectExistingRequest(requests, { now: at, terminalReason });
   const manualEligibility = evaluateDealHunterCimEligibility({
     deal: {
       opportunityId: id,
@@ -444,6 +467,7 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
     sourceRows: trustedSourceRows,
     submission,
     requests,
+    materialsState,
     existingRequest,
     opportunityClaim,
     safety,
