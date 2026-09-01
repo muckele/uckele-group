@@ -434,6 +434,52 @@ describe('Broker Materials card', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Broker Materials status: Sent');
   });
 
+  test('moves focus to authoritative lifecycle when a background refresh removes the focused approval control', () => {
+    const activePreparation = preparation();
+    const view = render(<BrokerMaterialsCard brokerMaterials={projection()} onApprove={vi.fn()} onPrepare={vi.fn()} preparation={activePreparation} />);
+    screen.getByRole('button', { name: 'Approve & Send' }).focus();
+
+    view.rerender(<BrokerMaterialsCard brokerMaterials={projection({ existingRequest: existingRequest() })} onApprove={vi.fn()} onPrepare={vi.fn()} preparation={activePreparation} />);
+
+    expect(screen.getByRole('heading', { name: 'Broker Materials status: Sent' })).toHaveFocus();
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  test('leaves focus on the alert when greeting preview regeneration fails', async () => {
+    function Harness() {
+      const [error, setError] = useState('');
+      async function onPrepare() {
+        setError('Preview regeneration failed safely.');
+        return false;
+      }
+      return <BrokerMaterialsCard brokerMaterials={projection()} error={error} onApprove={vi.fn()} onPrepare={onPrepare} preparation={preparation()} />;
+    }
+    render(<Harness />);
+    fireEvent.change(screen.getByLabelText('Greeting'), { target: { value: 'Hello Jane,' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Update Preview' }));
+
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Preview update was not completed.'));
+    expect(screen.getByRole('alert')).toHaveFocus();
+    expect(screen.getByLabelText('Greeting')).not.toHaveFocus();
+  });
+
+  test('leaves focus on the alert when recipient regeneration fails', async () => {
+    function Harness() {
+      const [error, setError] = useState('');
+      async function onPrepare() {
+        setError('Recipient regeneration failed safely.');
+        return false;
+      }
+      return <BrokerMaterialsCard brokerMaterials={projection()} error={error} onApprove={vi.fn()} onPrepare={onPrepare} preparation={preparation()} />;
+    }
+    render(<Harness />);
+    fireEvent.change(screen.getByLabelText('Authoritative broker recipient'), { target: { value: 'contact-ref-2' } });
+
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Preview update was not completed.'));
+    expect(screen.getByRole('alert')).toHaveFocus();
+    expect(screen.getByLabelText('Authoritative broker recipient')).not.toHaveFocus();
+  });
+
   test('keeps one stable live region explicit for ambiguous no-resend status', () => {
     render(<BrokerMaterialsCard brokerMaterials={projection({ existingRequest: existingRequest({ status: 'ambiguous', requestState: 'provider_ambiguous', deliveryState: 'ambiguous' }) })} onPrepare={vi.fn()} />);
     expect(screen.getAllByRole('status')).toHaveLength(1);

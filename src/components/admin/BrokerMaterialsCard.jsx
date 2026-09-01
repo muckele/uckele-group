@@ -60,11 +60,13 @@ export default function BrokerMaterialsCard({
   const greetingRef = useRef(null);
   const disclosureRef = useRef(null);
   const reviewHeadingRef = useRef(null);
+  const reviewContentRef = useRef(null);
   const statusHeadingRef = useRef(null);
   const alertRef = useRef(null);
   const approvalLockRef = useRef(false);
   const contactMenuOpenRef = useRef(false);
   const operatorActionRef = useRef('');
+  const transientReviewFocusRef = useRef(null);
   const [expanded, setExpanded] = useState(Boolean(providedPreparation || providedRecipientSelection || preparing || checking));
   const [greeting, setGreeting] = useState(providedPreparation?.review?.message?.greeting || '');
   const [localInvalid, setLocalInvalid] = useState(false);
@@ -115,7 +117,11 @@ export default function BrokerMaterialsCard({
     setAnnouncement(existingRequest.status === 'ambiguous' || existingRequest.requestState === 'provider_ambiguous' || existingRequest.deliveryState === 'ambiguous'
       ? 'Ambiguous. Do not send another request.'
       : `Broker Materials status: ${lifecycle?.badge || 'Current'}`);
-    if (operatorActionRef.current === 'approve') statusHeadingRef.current?.focus();
+    const activeElement = document.activeElement;
+    const transientFocusWasRemoved = Boolean(transientReviewFocusRef.current && !transientReviewFocusRef.current.isConnected);
+    const focusWasLost = !activeElement || activeElement === document.body || !activeElement.isConnected;
+    if (operatorActionRef.current === 'approve' || (transientFocusWasRemoved && focusWasLost)) statusHeadingRef.current?.focus();
+    transientReviewFocusRef.current = null;
     operatorActionRef.current = '';
   }, [existingRequest, lifecycle?.badge]);
 
@@ -153,14 +159,16 @@ export default function BrokerMaterialsCard({
     setLocalUpdating(true);
     setAnnouncement(keepFocus ? 'Updating recipient and preview…' : 'Updating broker materials preview…');
     onInvalidatePreparation?.();
+    let succeeded = false;
     try {
       const result = await onPrepare(body);
+      succeeded = result !== false;
       setAnnouncement(result === false ? 'Preview update was not completed.' : 'Updated');
       return result;
     } finally {
       setLocalUpdating(false);
-      if (keepFocus) recipientRef.current?.focus();
-      else if (focusGreeting) greetingRef.current?.focus();
+      if (succeeded && keepFocus) recipientRef.current?.focus();
+      else if (succeeded && focusGreeting) greetingRef.current?.focus();
     }
   }
 
@@ -203,7 +211,7 @@ export default function BrokerMaterialsCard({
         : announcement;
 
   return (
-    <section aria-busy={busy ? 'true' : 'false'} aria-labelledby={`${contentId}-title`} className="rounded-xl border border-moss/20 bg-moss/5 p-4">
+    <section aria-busy={busy ? 'true' : 'false'} aria-labelledby={`${contentId}-title`} className="rounded-xl border border-moss/20 bg-moss/5 p-4" onFocusCapture={(event) => { transientReviewFocusRef.current = reviewContentRef.current?.contains(event.target) ? event.target : null; }}>
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h4 className="text-sm font-semibold text-ink" id={`${contentId}-title`}>Broker Materials</h4>
@@ -236,7 +244,7 @@ export default function BrokerMaterialsCard({
           {recipientSelection.warnings?.length ? <section><h5 className="text-sm font-semibold text-ink">Manual Stage 1 warnings</h5><MessageList items={recipientSelection.warnings} /></section> : null}
           {recipientSelection.sendBlockers?.length ? <section><h5 className="text-sm font-semibold text-ink">Current send blockers</h5><MessageList items={recipientSelection.sendBlockers} /></section> : null}
         </div> : null}
-        {review ? <div className={`mt-4 space-y-5 border-t border-moss/15 pt-4 ${mobileSticky ? 'pb-32 sm:pb-0' : ''}`} data-testid="broker-materials-review-content">
+        {review ? <div className={`mt-4 space-y-5 border-t border-moss/15 pt-4 ${mobileSticky ? 'pb-32 sm:pb-0' : ''}`} data-testid="broker-materials-review-content" ref={reviewContentRef}>
           <h5 className="text-base font-semibold text-ink outline-none" ref={reviewHeadingRef} tabIndex={-1}>Prepared Broker Materials review</h5>
           <section><h5 className="text-sm font-semibold text-ink">Opportunity context</h5><p className="mt-2 text-sm text-ink/68">{review.opportunity?.displayName || 'Opportunity'} · {review.opportunity?.sourceLabel || 'Authoritative source'} · {review.opportunity?.pursued ? 'Pursued' : 'Not pursued'} · {review.opportunity?.current ? 'Current' : 'Not current'}</p></section>
           <section><h5 className="text-sm font-semibold text-ink">Manual Stage 1 warnings</h5><MessageList empty="No warnings." items={warnings} /></section>
