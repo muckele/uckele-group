@@ -66,7 +66,7 @@ The selected architecture has four boundaries:
 
 1. **Sequence authority and projection** loads the canonical request and related acquisition state, validates enrollment/terminal conditions, calculates due dates, and projects UI states.
 2. **Side-effect-free preparation** renders the exact proposed follow-up and signs all material authority into a short-lived, principal-bound proposal.
-3. **Approval and durable execution** verifies the proposal, revalidates current authority, claims the exact due touch, persists the exact communication, performs the final safety check, and calls the existing provider seam.
+3. **Approval and durable execution** is entered only through the explicit administrator Approve Follow-Up endpoint. That endpoint verifies the proposal, revalidates current authority, and invokes the existing single-request durable follow-up executor with a trusted approved-message context. The executor claims the exact due touch, persists the exact communication, performs the final safety check, and calls the existing provider seam.
 4. **Atomic finalization and reconciliation** establishes provider acceptance exactly once, increments `follow_up_count` exactly once, and either schedules the next due date or closes the sequence.
 
 Two alternatives remain rejected:
@@ -210,17 +210,20 @@ Automatic scheduling is allowed while the global pause is active. Reconciliation
 
 ## 9. No automatic sending and the runner hard boundary
 
-The automatic runner may list a due marked request, but due is not authorization.
+The automatic runner may list a due marked request, but due is not authorization. The runner never accepts, verifies, forwards, or consumes a human approval artifact.
 
 At the earliest per-request authorization boundary, before request claim, recipient claim, communication creation, activity creation, or provider work:
 
 ```text
 if metadata.manualFollowUp.mode == "operator-approved"
-and no verified exact approved proposal is supplied to the executor
-then return approval-required
+then return approval-required and skip
 ```
 
-The scheduler and Operations → Run Follow-Ups never possess a browser approval artifact, so they can only report/skip the marked request as `approval-required`. This remains true if someone enables `DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED`, invokes the run route, changes cadence configuration, or changes scheduler configuration.
+This condition is unconditional. The automatic runner has no code path by which an approval artifact can convert a marked request into an authorized transmission. It reports/skips the request as `approval-required` with zero request transmission claims, recipient claims, send-attempt communications, send-attempt activities, or provider calls.
+
+Only the explicit administrator Phase 3 Approve Follow-Up endpoint may verify a signed approval artifact. After verification and current-authority revalidation, that endpoint alone may invoke the existing single-request durable follow-up executor for a marked request.
+
+This remains true if someone enables `DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED`, invokes Operations → Run Follow-Ups, changes cadence configuration, or changes scheduler configuration.
 
 The production flag remains false. The hard boundary is defense in depth and must be tested with the flag true.
 
@@ -452,15 +455,16 @@ Once approval is submitted, the client synchronously locks the action and discar
 
 ## 20. Durable executor seam
 
-The existing follow-up processor is refactored into one policy-aware durable executor, not duplicated. It accepts an optional verified approved proposal:
+The existing single-request follow-up processor is refactored into one policy-aware durable executor, not duplicated, with two strictly separated callers:
 
-- marked operator-approved request + no proposal: `approval-required` before side effects;
-- marked request + valid exact proposal: human-approved path;
-- unmarked legacy request: existing legacy runner policy.
+- the automatic runner may invoke it only for unmarked legacy requests under existing legacy runner policy;
+- the explicit administrator Phase 3 Approve Follow-Up endpoint may invoke it for a marked request only after verifying the signed proposal and reproducing a trusted exact approved-message context.
+
+The automatic runner checks the marker before invoking the executor. It cannot accept an approval token/digest and cannot call the marked-request executor path under any condition. The durable executor does not itself expose signed-artifact verification to the scheduler/runner; signed-artifact verification belongs exclusively to the administrator approval service.
 
 For the approved path, the executor order is:
 
-1. verify the already authenticated proposal contract;
+1. receive the already verified, server-trusted approved-message context from the administrator approval service;
 2. load and revalidate all authority and due state;
 3. obtain a Phase 3-specific atomic request claim matching request version, marker, count, number, due timestamp, and active submission;
 4. obtain the existing recipient claim;
@@ -572,7 +576,7 @@ No Phase 3 idempotency table is added.
 | global pause or cadence block in those windows | approval or final gate defers; original due retained; no provider call |
 | Stop while review is open | atomic stop changes request version; old token fails; no provider call |
 | another administrator approves same touch | one claim/communication/call; other result converges to current state or locked/checking |
-| automatic runner discovers marked due request | `approval-required`; zero claims, communication, activity, or provider work |
+| automatic runner discovers marked due request | unconditional `approval-required`/skip before invoking the marked-request executor path; zero claims, send-attempt communication/activity, or provider work; the runner cannot accept an approval artifact |
 | definitive provider failure | count unchanged; same-number exact Review Retry; no automatic retry |
 | ambiguous provider result | no schedule/no resend; reconciliation only |
 | provider acceptance plus request/activity failure | accepted communication proof; reconcile without retransmission; count/schedule exactly once |
@@ -800,8 +804,9 @@ Add equivalent service-role-only RPC behavior, either as bounded new operations 
 
 ### 33.3 Human approval invariant
 
-- No due date, scheduler, Operations run, feature flag, or config change sends a marked request without a fresh exact proposal.
-- Automatic discovery returns approval-required with zero claims, communications, activities, or provider calls.
+- No due date, scheduler, Operations run, feature flag, config change, or supplied approval artifact can cause the automatic runner to send a marked request.
+- Automatic discovery unconditionally returns approval-required/skip with zero request transmission claims, recipient claims, send-attempt communications, send-attempt activities, or provider calls.
+- Only the explicit administrator Approve Follow-Up endpoint verifies signed approval artifacts and invokes the marked-request durable executor path.
 - Before due, no Review action appears and both prepare/approve fail closed.
 - Every successful provider call traces to a current, principal-bound, unexpired exact approval.
 
@@ -877,10 +882,10 @@ Risk is concentrated in concurrency/finalization and the shared materials author
 
 This is a delivery decomposition, not an implementation plan. Keep it to four independently testable commits/tasks:
 
-1. **Phase 3 policy and acquisition authority:** shared narrow materials predicate; marker/policy selection; timezone calendar cadence; 1–5 copy/identity; projections; pure/unit tests. No routes or sending.
-2. **Atomic persistence and approval-safe executor:** SQLite/Supabase parity, service-role RPC migration, runner approval-required boundary, exact claims/finalization/reconciliation, failure/ambiguity behavior, storage/lifecycle tests.
-3. **Human review API:** strict start/stop/prepare/approve services and routes, signed proposals, staleness/race revalidation, HTTP/service tests. Keep production scheduler disabled.
-4. **Broker Materials UI and full verification:** Follow-Ups subsection, Acquisition Inbox/Drawer wiring, viewer/mobile/accessibility/unknown-outcome behavior, UI and end-to-end regression evidence, production-safety configuration checks.
+1. **Phase 3 policy and acquisition authority:** shared narrow acquisition-materials predicate; Phase 3 marker/policy; exact +2-calendar-day/weekend-rollover/09:00 PT cadence; follow-up numbering 1–5; deterministic communication/idempotency identities; explicit Follow-Up 4/5 message branches; due/overdue/status projections; pure/unit tests. No routes or durable sending.
+2. **Atomic persistence and provider parity:** SQLite Start Sequence atomic mutation; SQLite Stop Follow-Ups atomic mutation; SQLite accepted-follow-up finalization plus next-date scheduling; equivalent Supabase service-role RPC/function behavior; required database-function migration; concurrency/conflict/idempotency/provider-parity tests. No UI and no human approval route.
+3. **Human review and durable follow-up execution:** Start/Stop/Prepare/Approve services and HTTP routes; principal-bound signed preparation; exact greeting/subject/body behavior; early-send prevention; material-staleness revalidation; automatic-runner unconditional approval-required boundary for manual sequences; trusted approved-message seam into the existing follow-up executor; exact retry after definitive pre-acceptance failure; ambiguity/no-retransmission; accepted-message reconciliation; and current stop-condition/race checks. No frontend.
+4. **Broker Materials UI and final Phase 3 acceptance:** Follow-Ups subsection in the existing Broker Materials card; Start Follow-Up Sequence; future scheduled/due/overdue/completed/stopped states; Review Follow-Up; Stop Follow-Ups; exact preview/greeting update/Approve & Send Follow-Up; Checking/unknown-client-outcome; viewer/read-only behavior; mobile sticky approval; accessibility/focus; browser acceptance; and full regression/build/provider-parity verification.
 
 Each task must preserve a working closed-production boundary and may be reviewed independently.
 
