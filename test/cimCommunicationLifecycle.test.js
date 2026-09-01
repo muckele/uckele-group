@@ -37,6 +37,20 @@ const originalFetch = globalThis.fetch;
 let activeStorage = null;
 let resendMode = 'ok';
 let resendCalls = [];
+const boundedCimRequestKeys = [
+  'canCorrectRecipient', 'canRetry', 'correctionRoute', 'createdAt', 'deliveredAt', 'deliveryState',
+  'errorSummary', 'followUpState', 'id', 'providerAcceptedAt', 'recipient', 'requestedAt', 'requestState',
+  'respondedAt', 'retryRoute', 'status', 'subject', 'updatedAt',
+].sort();
+
+function assertBoundedCimRequest(request) {
+  assert.deepEqual(Object.keys(request).sort(), boundedCimRequestKeys);
+  assert.deepEqual(Object.keys(request.recipient).sort(), ['displayName', 'email']);
+  for (const rawKey of [
+    'metadata', 'administratorPrincipalId', 'proposalDigest', 'nonce', 'preparedAt', 'delivery_error',
+    'provider_response', 'request_state', 'delivery_state', 'follow_up_state', 'signature', 'approvalClaims',
+  ]) assert.equal(Object.hasOwn(request, rawKey), false, `${rawKey} must not cross the approval boundary`);
+}
 
 before(() => {
   globalThis.fetch = async (url, options = {}) => {
@@ -367,14 +381,25 @@ test('approved manual Stage 1 uses the existing durable executor once, persists 
   assert.equal(first.success, true);
   const request = first.durableResult.cimRequest;
   assert.equal(request.id, signedClaims.approvalBoundPayload.prospectiveRequestId);
-  assert.equal(request.recipient_email, preparation.review.recipient.email);
-  assert.equal(request.follow_up_state, 'not-scheduled');
-  assert.equal(request.next_follow_up_at, null);
-  assert.equal(request.metadata?.manualApproval?.intent, 'manual_stage_1');
-  assert.equal(request.metadata?.manualApproval?.followUpPolicy, 'none');
   assert.equal(resendCalls.length, 1);
+  assert.equal(
+    resendCalls[0].body.from,
+    `${preparation.review.sender.displayName} <${preparation.review.sender.email}>`,
+  );
+  assert.deepEqual(resendCalls[0].body.to, [preparation.review.recipient.email]);
+  assert.equal(resendCalls[0].body.reply_to, preparation.review.sender.replyTo);
+  assert.equal(resendCalls[0].body.subject, preparation.review.message.subject);
+  assert.equal(resendCalls[0].body.text, preparation.review.message.body);
+  assert.equal(resendCalls[0].body.html, preparation.review.message.html);
 
-  const page = await storage.listCrmCommunications({ submissionId: request.submission_id, page: 1, pageSize: 25 });
+  assertBoundedCimRequest(request);
+  assert.equal(request.recipient.email, preparation.review.recipient.email);
+  assert.equal(request.followUpState, 'not-scheduled');
+  const storedRequest = await storage.getDealHunterCimRequestById(request.id);
+  assert.equal(storedRequest.next_follow_up_at, null);
+  assert.equal(storedRequest.metadata?.manualApproval?.intent, 'manual_stage_1');
+  assert.equal(storedRequest.metadata?.manualApproval?.followUpPolicy, 'none');
+  const page = await storage.listCrmCommunications({ submissionId: storedRequest.submission_id, page: 1, pageSize: 25 });
   assert.equal(page.total, 1);
   const [communication] = page.rows;
   assert.equal(communication.cim_request_id, request.id);
@@ -386,12 +411,6 @@ test('approved manual Stage 1 uses the existing durable executor once, persists 
   assert.equal(communication.body_text, preparation.review.message.body);
   assert.equal(communication.body_html_sanitized, preparation.review.message.html);
   assert.equal(communication.metadata?.templateVersion, preparation.review.message.templateVersion);
-  assert.equal(resendCalls[0].body.from, preparation.review.sender.email);
-  assert.deepEqual(resendCalls[0].body.to, [preparation.review.recipient.email]);
-  assert.equal(resendCalls[0].body.reply_to, preparation.review.sender.replyTo);
-  assert.equal(resendCalls[0].body.subject, preparation.review.message.subject);
-  assert.equal(resendCalls[0].body.text, preparation.review.message.body);
-  assert.equal(resendCalls[0].body.html, preparation.review.message.html);
   assert.equal(resendCalls[0].idempotencyKey, communication.idempotency_key);
 
   const replay = await service.approveDealHunterBrokerMaterials({
@@ -402,7 +421,9 @@ test('approved manual Stage 1 uses the existing durable executor once, persists 
     storage,
   });
   assert.equal(replay.success, true);
+  assertBoundedCimRequest(replay.durableResult.cimRequest);
   assert.equal(replay.durableResult.cimRequest.id, request.id);
+  assert.deepEqual(Object.keys(replay.durableResult.cimRequest).sort(), Object.keys(request).sort());
   assert.equal(resendCalls.length, 1, 'replaying the approval must not call the provider twice');
 });
 
@@ -420,9 +441,10 @@ test('manual approval returns a durable failed request instead of an unsafe tran
     storage,
   });
   assert.equal(result.success, true);
+  assertBoundedCimRequest(result.durableResult.cimRequest);
   assert.equal(result.durableResult.cimRequest.status, 'failed');
-  assert.equal(result.durableResult.cimRequest.follow_up_state, 'not-scheduled');
-  assert.equal(result.durableResult.cimRequest.next_follow_up_at, null);
+  assert.equal(result.durableResult.cimRequest.followUpState, 'not-scheduled');
+  assert.equal((await storage.getDealHunterCimRequestById(result.durableResult.cimRequest.id)).next_follow_up_at, null);
   assert.equal(resendCalls.length, 1);
 });
 
@@ -440,6 +462,7 @@ test('manual approval keeps an ambiguous provider outcome durable and replay can
     storage,
   });
   assert.equal(first.success, true);
+  assertBoundedCimRequest(first.durableResult.cimRequest);
   assert.equal(first.durableResult.cimRequest.status, 'ambiguous');
   assert.equal(resendCalls.length, 1);
 
@@ -452,6 +475,7 @@ test('manual approval keeps an ambiguous provider outcome durable and replay can
     storage,
   });
   assert.equal(replay.success, true);
+  assertBoundedCimRequest(replay.durableResult.cimRequest);
   assert.equal(replay.durableResult.cimRequest.id, first.durableResult.cimRequest.id);
   assert.equal(replay.durableResult.cimRequest.status, 'ambiguous');
   assert.equal(resendCalls.length, 1, 'ambiguous approval replay must never retransmit');
@@ -484,17 +508,110 @@ test('manual approval final readiness drift persists one unscheduled durable fai
   });
 
   assert.equal(result.success, true);
+  assertBoundedCimRequest(result.durableResult.cimRequest);
   assert.equal(result.durableResult.cimRequest.status, 'failed');
-  assert.equal(result.durableResult.cimRequest.follow_up_state, 'not-scheduled');
-  assert.equal(result.durableResult.cimRequest.next_follow_up_at, null);
-  assert.match(result.durableResult.cimRequest.delivery_error, /outbound delivery is not fully configured/i);
+  assert.equal(result.durableResult.cimRequest.followUpState, 'not-scheduled');
+  assert.equal(result.durableResult.cimRequest.errorSummary, 'Delivery failed.');
   assert.equal(resendCalls.length, 0, 'final readiness drift must stop before provider work');
+  const storedRequest = await storage.getDealHunterCimRequestById(result.durableResult.cimRequest.id);
+  assert.equal(storedRequest.next_follow_up_at, null);
+  assert.match(storedRequest.delivery_error, /outbound delivery is not fully configured/i);
   const page = await storage.listCrmCommunications({
-    submissionId: result.durableResult.cimRequest.submission_id,
+    submissionId: storedRequest.submission_id,
     page: 1,
     pageSize: 25,
   });
   assert.equal(page.total, 1, 'the exact communication remains durable for authoritative reconciliation');
+});
+
+test('manual approval reconciles a provider-accepted communication after final request persistence fails without retransmission', async (t) => {
+  const storage = testStorage(t);
+  const { preparation } = await preparedManualApproval(storage);
+  const { approveDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
+  const mutateWithCrmActivity = storage.mutateWithCrmActivity.bind(storage);
+  let injectFailure = true;
+  storage.mutateWithCrmActivity = async (mutation) => {
+    if (injectFailure && mutation.activity?.event_type === 'cim.request-sent') {
+      injectFailure = false;
+      throw new Error('injected manual request/activity finalization failure');
+    }
+    return mutateWithCrmActivity(mutation);
+  };
+
+  const approvalInput = {
+    opportunityId: preparation.review.opportunity.canonicalOpportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+    storage,
+  };
+  const first = await approveDealHunterBrokerMaterials(approvalInput);
+
+  assert.equal(first.success, true);
+  assertBoundedCimRequest(first.durableResult.cimRequest);
+  assert.equal(first.durableResult.cimRequest.requestState, 'provider_accepted');
+  assert.equal(first.durableResult.cimRequest.deliveryState, 'accepted');
+  assert.equal(first.durableResult.cimRequest.followUpState, 'not-scheduled');
+  assert.equal(resendCalls.length, 1);
+  const storedRequest = await storage.getDealHunterCimRequestById(first.durableResult.cimRequest.id);
+  const beforeReplay = await storage.listCrmCommunications({ submissionId: storedRequest.submission_id, page: 1, pageSize: 25 });
+  assert.equal(beforeReplay.total, 1);
+  assert.equal(beforeReplay.rows[0].delivery_state, 'accepted');
+  assert.equal(beforeReplay.rows[0].body_text, preparation.review.message.body);
+  assert.equal(beforeReplay.rows[0].body_html_sanitized, preparation.review.message.html);
+  const originalIdempotencyKey = beforeReplay.rows[0].idempotency_key;
+  const activity = await storage.listCrmActivityEvents({ submissionId: storedRequest.submission_id, limit: 100 });
+  assert.ok(activity.some((event) => event.event_type === 'cim.request-reconciled'));
+
+  const replay = await approveDealHunterBrokerMaterials(approvalInput);
+  assert.equal(replay.success, true);
+  assertBoundedCimRequest(replay.durableResult.cimRequest);
+  assert.equal(replay.durableResult.cimRequest.id, first.durableResult.cimRequest.id);
+  assert.equal(replay.durableResult.cimRequest.requestState, 'provider_accepted');
+  assert.equal(resendCalls.length, 1, 'recovery and replay must not retransmit');
+  const afterReplay = await storage.listCrmCommunications({ submissionId: storedRequest.submission_id, page: 1, pageSize: 25 });
+  assert.equal(afterReplay.total, 1);
+  assert.equal(afterReplay.rows[0].idempotency_key, originalIdempotencyKey);
+  assert.equal(afterReplay.rows[0].body_text, preparation.review.message.body);
+  assert.equal(afterReplay.rows[0].body_html_sanitized, preparation.review.message.html);
+});
+
+test('manual approval rejects sender display-name or email drift before provider work', async (t) => {
+  const { getConfig } = await import('../server/config.js');
+  const config = getConfig();
+  for (const [name, mutate, restore] of [
+    [
+      'display name',
+      () => { const original = config.workflow.defaultAssignee; config.workflow.defaultAssignee = 'Changed Sender'; return original; },
+      (original) => { config.workflow.defaultAssignee = original; },
+    ],
+    [
+      'email',
+      () => { const original = config.delivery.resendFromEmail; config.delivery.resendFromEmail = 'changed-sender@example.test'; return original; },
+      (original) => { config.delivery.resendFromEmail = original; },
+    ],
+  ]) {
+    await t.test(name, async () => {
+      const storage = testStorage(t);
+      const { preparation } = await preparedManualApproval(storage);
+      const original = mutate();
+      try {
+        const { approveDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
+        const result = await approveDealHunterBrokerMaterials({
+          opportunityId: preparation.review.opportunity.canonicalOpportunityId,
+          preparationToken: preparation.preparationToken,
+          approvedProposalDigest: preparation.proposalDigest,
+          session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+          storage,
+        });
+        assert.equal(result.success, false);
+        assert.equal(result.code, 'preparation_stale');
+        assert.equal(resendCalls.length, 0);
+      } finally {
+        restore(original);
+      }
+    });
+  }
 });
 
 test('daily summary and Stage 2 shadow evaluation never transmit a broker first contact', async (t) => {

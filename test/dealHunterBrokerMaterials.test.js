@@ -17,6 +17,45 @@ import { sha256, signPayload, stableCanonicalJson, verifySignedPayload } from '.
 
 const now = new Date();
 const opportunityId = 'opp-broker-materials';
+const boundedCimRequestKeys = [
+  'canCorrectRecipient',
+  'canRetry',
+  'correctionRoute',
+  'createdAt',
+  'deliveredAt',
+  'deliveryState',
+  'errorSummary',
+  'followUpState',
+  'id',
+  'providerAcceptedAt',
+  'recipient',
+  'requestedAt',
+  'requestState',
+  'respondedAt',
+  'retryRoute',
+  'status',
+  'subject',
+  'updatedAt',
+].sort();
+
+function assertBoundedCimRequest(request) {
+  assert.deepEqual(Object.keys(request).sort(), boundedCimRequestKeys);
+  assert.deepEqual(Object.keys(request.recipient).sort(), ['displayName', 'email']);
+  for (const rawKey of [
+    'metadata',
+    'administratorPrincipalId',
+    'proposalDigest',
+    'nonce',
+    'preparedAt',
+    'delivery_error',
+    'provider_response',
+    'request_state',
+    'delivery_state',
+    'follow_up_state',
+    'signature',
+    'approvalClaims',
+  ]) assert.equal(Object.hasOwn(request, rawKey), false, `${rawKey} must not cross the approval boundary`);
+}
 
 function sourceRow(overrides = {}) {
   return {
@@ -578,6 +617,7 @@ test('existing durable ownership takes precedence over staleness without crossin
   assert.equal(result.canonicalOpportunityId, opportunityId);
   assert.equal(result.durableResult.cimRequest.id, 'existing-durable-request');
   assert.equal(result.durableResult.cimRequest.status, 'ambiguous');
+  assertBoundedCimRequest(result.durableResult.cimRequest);
   assert.equal(executions, 0);
 });
 
@@ -586,7 +626,32 @@ test('verified approval crosses the trusted durable boundary exactly once with s
   const { storage, preparation } = await preparedApproval();
   const claims = verifySignedPayload(preparation.preparationToken, getConfig().admin.sessionSecret);
   const calls = [];
-  const durableRequest = { id: claims.approvalBoundPayload.prospectiveRequestId, status: 'sent', request_state: 'provider_accepted', delivery_state: 'accepted', follow_up_state: 'not-scheduled' };
+  const durableRequest = {
+    id: claims.approvalBoundPayload.prospectiveRequestId,
+    status: 'sent',
+    request_state: 'provider_accepted',
+    delivery_state: 'accepted',
+    follow_up_state: 'not-scheduled',
+    recipient_email: 'source-broker@example.test',
+    recipient_name: 'Avery Broker',
+    subject: 'Approved request',
+    created_at: '2026-08-31T18:00:00.000Z',
+    updated_at: '2026-08-31T18:01:00.000Z',
+    first_requested_at: '2026-08-31T18:00:00.000Z',
+    first_provider_accepted_at: '2026-08-31T18:01:00.000Z',
+    metadata: {
+      manualApproval: {
+        administratorPrincipalId: 'principal-admin-1',
+        proposalDigest: claims.proposalDigest,
+        nonce: claims.nonce,
+        preparedAt: claims.preparedAt,
+      },
+    },
+    delivery_error: 'raw provider error',
+    provider_response: { secret: 'raw provider response' },
+    signature: 'must-not-escape',
+    approvalClaims: claims,
+  };
   const result = await approveDealHunterBrokerMaterials({
     opportunityId,
     preparationToken: preparation.preparationToken,
@@ -609,15 +674,41 @@ test('verified approval crosses the trusted durable boundary exactly once with s
   assert.equal(calls[0].requestedBy, 'admin');
   assert.equal(calls[0].storage, storage);
   assert.equal(result.success, true);
-  assert.equal(result.durableResult.cimRequest, durableRequest);
+  assertBoundedCimRequest(result.durableResult.cimRequest);
+  assert.equal(result.durableResult.cimRequest.id, durableRequest.id);
+  assert.equal(result.durableResult.cimRequest.requestState, 'provider_accepted');
+  assert.equal(result.durableResult.cimRequest.deliveryState, 'accepted');
+  assert.deepEqual(result.durableResult.cimRequest.recipient, {
+    email: 'source-broker@example.test',
+    displayName: 'Avery Broker',
+  });
 });
 
 test('every executor result containing a durable request normalizes safely regardless of delivery outcome', async (t) => {
   const { approveDealHunterBrokerMaterials } = await task2Api();
-  for (const status of ['pending', 'sent', 'logged', 'failed', 'ambiguous', 'delivery_issue', 'responded']) {
+  const cases = [
+    ['pending', 'pending', 'pending'],
+    ['sent', 'provider_accepted', 'accepted'],
+    ['logged', 'development_only', 'development-only'],
+    ['failed', 'failed', 'failed'],
+    ['ambiguous', 'provider_ambiguous', 'ambiguous'],
+    ['delivery_issue', 'stopped', 'bounced'],
+    ['responded', 'responded', 'responded'],
+  ];
+  for (const [status, requestState, deliveryState] of cases) {
     await t.test(status, async () => {
       const { storage, preparation } = await preparedApproval();
-      const request = { id: `durable-${status}`, status, request_state: status, delivery_state: status, follow_up_state: 'not-scheduled' };
+      const request = {
+        id: `durable-${status}`,
+        status,
+        request_state: requestState,
+        delivery_state: deliveryState,
+        follow_up_state: 'not-scheduled',
+        recipient_email: 'source-broker@example.test',
+        metadata: { manualApproval: { administratorPrincipalId: 'must-not-escape' } },
+        delivery_error: 'must-not-escape',
+        provider_response: { raw: true },
+      };
       const result = await approveDealHunterBrokerMaterials({
         opportunityId,
         preparationToken: preparation.preparationToken,
@@ -628,7 +719,11 @@ test('every executor result containing a durable request normalizes safely regar
       });
       assert.equal(result.success, true);
       assert.equal(result.canonicalOpportunityId, opportunityId);
-      assert.equal(result.durableResult.cimRequest, request);
+      assertBoundedCimRequest(result.durableResult.cimRequest);
+      assert.equal(result.durableResult.cimRequest.id, request.id);
+      assert.equal(result.durableResult.cimRequest.status, status);
+      assert.equal(result.durableResult.cimRequest.requestState, requestState);
+      assert.equal(result.durableResult.cimRequest.deliveryState, deliveryState);
       assert.equal(Object.hasOwn(result, 'error'), false);
     });
   }
@@ -645,4 +740,23 @@ test('every executor result containing a durable request normalizes safely regar
   assert.equal(blocked.success, false);
   assert.equal(blocked.code, 'cim_outreach_paused');
   assert.equal(Object.hasOwn(blocked, 'durableResult'), false);
+});
+
+test('an arbitrary pre-durable executor exception remains a non-durable failure', async () => {
+  const { approveDealHunterBrokerMaterials } = await task2Api();
+  const { storage, preparation } = await preparedApproval();
+
+  await assert.rejects(
+    approveDealHunterBrokerMaterials({
+      opportunityId,
+      preparationToken: preparation.preparationToken,
+      approvedProposalDigest: preparation.proposalDigest,
+      session: adminSession(),
+      storage,
+      executeApprovedCimRequest: async () => {
+        throw new Error('pre-durable infrastructure unavailable');
+      },
+    }),
+    /pre-durable infrastructure unavailable/,
+  );
 });

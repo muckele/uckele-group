@@ -411,6 +411,12 @@ function normalizeEmail(value = '') {
   return normalizeText(value, 320).toLowerCase();
 }
 
+function formatCimSenderAddress(displayName = '', senderEmail = '') {
+  const safeName = normalizeText(displayName, 120).replace(/[<>\r\n]/g, '');
+  const normalizedEmail = normalizeEmail(senderEmail);
+  return safeName ? `${safeName} <${normalizedEmail}>` : normalizedEmail;
+}
+
 function normalizeComparableText(value = '') {
   return normalizeText(value, 1000)
     .toLowerCase()
@@ -8640,6 +8646,7 @@ async function sendCimRequestForScoredDeal({
     const renderedMessage = manualSend
       ? {
           ...generatedMessage,
+          from: formatCimSenderAddress(manualApproval.senderDisplayName, manualApproval.senderEmail),
           to: recipientEmail,
           replyTo: manualApproval.replyTo,
           subject: manualApproval.subject,
@@ -9086,7 +9093,7 @@ export async function executeApprovedDealHunterCimRequest({
     annualProfit: annualProfitValue === '' ? null : parseNumber(annualProfitValue),
     shouldRemove: Boolean(score.should_remove),
   };
-  return sendCimRequestForScoredDeal({
+  const sendApprovedRequest = () => sendCimRequestForScoredDeal({
     deal,
     requestedBy,
     storage,
@@ -9096,6 +9103,28 @@ export async function executeApprovedDealHunterCimRequest({
       followUpPolicy: 'none',
     },
   });
+  try {
+    return await sendApprovedRequest();
+  } catch (error) {
+    if (!error?.providerAcceptedAmbiguous) throw error;
+    let recoveryError = error;
+    try {
+      const recovered = await sendApprovedRequest();
+      if (recovered?.request?.id) return recovered;
+    } catch (candidateError) {
+      recoveryError = candidateError;
+    }
+    const durableRequest = await storage.getDealHunterCimRequestById?.(proposal.prospectiveRequestId);
+    if (!durableRequest?.id) throw recoveryError;
+    return {
+      ok: false,
+      status: 503,
+      alreadySent: true,
+      providerOutcomeAmbiguous: true,
+      request: durableRequest,
+      error: error.message,
+    };
+  }
 }
 
 export async function sendDealHunterCimRequest({ dealKey = '', snapshotToken = '', requestedBy = '', storage = getStorage() } = {}) {

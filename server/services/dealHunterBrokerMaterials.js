@@ -240,29 +240,33 @@ function issueContactOptions({ opportunityId, contacts, secret }) {
 
 function projectExistingRequest(records = []) {
   const request = [...records].filter((item) => item?.id).sort((left, right) => (
-    (Date.parse(right.responded_at || right.updated_at || right.created_at || '') || 0)
-    - (Date.parse(left.responded_at || left.updated_at || left.created_at || '') || 0)
+    (Date.parse(right.responded_at || right.respondedAt || right.updated_at || right.updatedAt || right.created_at || right.createdAt || '') || 0)
+    - (Date.parse(left.responded_at || left.respondedAt || left.updated_at || left.updatedAt || left.created_at || left.createdAt || '') || 0)
     || String(left.id).localeCompare(String(right.id))
   ))[0];
   if (!request) return null;
   const status = vocabulary(request.status, requestStatuses);
-  const deliveryState = vocabulary(request.delivery_state, deliveryStates);
-  const preAcceptanceFailure = status === 'failed' && !request.first_provider_accepted_at && !['accepted', 'delivered', 'bounced', 'complained', 'suppressed'].includes(deliveryState);
+  const deliveryState = vocabulary(request.delivery_state || request.deliveryState, deliveryStates);
+  const providerAcceptedAt = iso(request.first_provider_accepted_at || request.providerAcceptedAt);
+  const preAcceptanceFailure = status === 'failed' && !providerAcceptedAt && !['accepted', 'delivered', 'bounced', 'complained', 'suppressed'].includes(deliveryState);
   const deliveryIssue = status === 'delivery_issue' || ['bounced', 'complained', 'suppressed'].includes(deliveryState);
   return {
     id: text(request.id, 200),
     status,
-    requestState: vocabulary(request.request_state, requestStates),
+    requestState: vocabulary(request.request_state || request.requestState, requestStates),
     deliveryState,
-    followUpState: vocabulary(request.follow_up_state, followUpStates),
-    recipient: { email: email(request.recipient_email), displayName: text(request.recipient_name || request.broker_name, 300) },
+    followUpState: vocabulary(request.follow_up_state || request.followUpState, followUpStates),
+    recipient: {
+      email: email(request.recipient_email || request.recipient?.email),
+      displayName: text(request.recipient_name || request.broker_name || request.recipient?.displayName, 300),
+    },
     subject: text(request.subject, 500),
-    createdAt: iso(request.created_at),
-    updatedAt: iso(request.updated_at),
-    requestedAt: iso(request.first_requested_at || request.requested_at),
-    providerAcceptedAt: iso(request.first_provider_accepted_at),
-    deliveredAt: iso(request.delivered_at),
-    respondedAt: iso(request.responded_at),
+    createdAt: iso(request.created_at || request.createdAt),
+    updatedAt: iso(request.updated_at || request.updatedAt),
+    requestedAt: iso(request.first_requested_at || request.requested_at || request.requestedAt),
+    providerAcceptedAt,
+    deliveredAt: iso(request.delivered_at || request.deliveredAt),
+    respondedAt: iso(request.responded_at || request.respondedAt),
     errorSummary: safeRequestErrorSummary({ status, deliveryState }),
     canRetry: preAcceptanceFailure,
     canCorrectRecipient: deliveryIssue,
@@ -714,7 +718,7 @@ function durableApprovalResult(canonicalOpportunityId, cimRequest) {
   return {
     success: true,
     canonicalOpportunityId,
-    durableResult: { cimRequest },
+    durableResult: { cimRequest: projectExistingRequest([cimRequest]) },
   };
 }
 
