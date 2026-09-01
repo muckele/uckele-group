@@ -1,6 +1,16 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { after, beforeEach, test } from 'node:test';
 import { strToU8, zipSync } from 'fflate';
+import { createSqliteStorage } from '../server/storage/sqlite.js';
+import {
+  buildOpportunitySourceObservationSnapshot,
+  setOperatorOpportunityFact,
+} from '../server/services/dealHunterOpportunityFacts.js';
+import { refreshOpportunityScores } from '../server/services/dealHunterScoreStore.js';
+import { getTriageOpportunityDetail } from '../server/services/dealHunterTriage.js';
 
 process.env.DEAL_HUNTER_SHEET_CSV_URL = 'https://docs.google.com/spreadsheets/d/test/gviz/tq?tqx=out:csv&gid=123';
 process.env.DEAL_HUNTER_AIRTABLE_TOKEN = 'test-token';
@@ -9,7 +19,7 @@ process.env.DEAL_HUNTER_AIRTABLE_TABLE_ID = 'tblTest';
 process.env.DEAL_HUNTER_AIRTABLE_VIEW_ID = 'viwTest';
 
 const originalFetch = globalThis.fetch;
-const { reviewDailyDeals } = await import('../server/services/dealHunter.js');
+const { importDealOsExport, parseSheetCsvDeals, reviewDailyDeals } = await import('../server/services/dealHunter.js');
 let sourceCsv;
 let sourceWorkbook;
 let airtableFetchCount;
@@ -60,6 +70,8 @@ function freshDealOsImport() {
     accepted_row_count: 1,
     rejected_row_count: 0,
     canonical_record_count: 1,
+    parser_version: 'deal-os-export-v2',
+    row_accounting: [],
     row_count: 1,
     duplicate_count: 0,
     stable_id_count: 1,
@@ -194,4 +206,654 @@ test('a header-only required Sheet suppresses every scored output even when Deal
   assert.equal(sheet.rowCount, 0);
   assertFailClosedReview(reviewed);
   assert.equal(JSON.stringify(reviewed).includes('Deal OS Must Stay Supplemental'), false);
+});
+
+test('canonical ingestion retains separate bounded Sheet and Deal OS observations, refreshes the Sheet record, and leaves operator facts untouched', async (t) => {
+  // Break caught: canonical ingestion drops source-specific values, grows
+  // duplicate observations across refreshes, or rewrites operator facts.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-observations-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const description = 'Commercial HVAC maintenance company with recurring service agreements, trained field technicians, and diversified B2B customers.';
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Broker Name,Broker Email,Description,Unbounded Workbook Blob',
+    `SHEET-42,Observation HVAC Services,https://broker.example/sheet-observation,CA,${new Date().toISOString().slice(0, 10)},450000,1200000,900000,Sheet Broker,sheet@example.test,${description},RAW_WORKBOOK_CONTENT_MUST_NOT_PERSIST`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  dealOsImport = {
+    ...freshDealOsImport(),
+    id: 'observation-deal-os-import',
+    records: [{
+      stableId: 'DEAL-OS-42',
+      name: 'Observation HVAC Services',
+      listingUrl: 'https://broker.example/sheet-observation',
+      state: 'CA',
+      annualProfit: 455000,
+      annualRevenue: 1200000,
+      askingPrice: 900000,
+      brokerName: 'Deal OS Broker',
+      brokerEmail: 'deal-os@example.test',
+      description,
+      brokerContacts: [],
+    }],
+  };
+  await storage.insertDealHunterDealOsImport(dealOsImport);
+
+  const first = await reviewDailyDeals({ storage, withScoredDeals: true });
+  assert.equal(first.review.sources.find((source) => source.id === 'deal-os-export').fetched, true);
+  assert.equal(first.scoredDeals.length, 1);
+  assert.equal(Object.hasOwn(first.scoredDeals[0], 'sourceObservationDeals'), false);
+  assert.deepEqual(new Set(first.scoredDeals[0].sourceRecords.map((record) => record.sourceId)), new Set(['sheet-0', 'deal-os-export']));
+  const opportunityId = first.scoredDeals[0].opportunityId;
+  assert.ok(opportunityId);
+  await setOperatorOpportunityFact({
+    opportunityId,
+    field: 'seller_name',
+    value: 'Operator-verified seller',
+    actor: 'acquisition-admin',
+    verified: true,
+    storage,
+  });
+  const operatorFactsBeforeRefresh = await storage.listDealHunterOpportunityFacts(opportunityId);
+
+  const firstObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  const firstSheetProfit = firstObservations.find((observation) => (
+    observation.source_id === 'sheet-0' && observation.field === 'annual_profit'
+  ));
+  assert.ok(firstSheetProfit);
+  assert.doesNotMatch(JSON.stringify(firstObservations), /RAW_WORKBOOK_CONTENT_MUST_NOT_PERSIST/);
+  assert.deepEqual(
+    firstObservations
+      .filter((observation) => observation.field === 'annual_profit')
+      .map((observation) => [observation.source_id, observation.value])
+      .sort(([left], [right]) => left.localeCompare(right)),
+    [
+      ['deal-os-export', '455000'],
+      ['sheet-0', '450000'],
+    ],
+  );
+
+  sourceCsv = sourceCsv.replace(',450000,', ',475000,').replace(',sheet@example.test,', ',,');
+  await reviewDailyDeals({ storage, withScoredDeals: true });
+
+  const refreshedObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  const refreshedSheetProfit = refreshedObservations.find((observation) => (
+    observation.source_id === 'sheet-0' && observation.field === 'annual_profit'
+  ));
+  assert.equal(refreshedObservations.length, firstObservations.length - 1);
+  assert.equal(refreshedSheetProfit.id, firstSheetProfit.id);
+  assert.equal(refreshedSheetProfit.created_at, firstSheetProfit.created_at);
+  assert.deepEqual(
+    refreshedObservations
+      .filter((observation) => observation.field === 'annual_profit')
+      .map((observation) => [observation.source_id, observation.value])
+      .sort(([left], [right]) => left.localeCompare(right)),
+    [
+      ['deal-os-export', '455000'],
+      ['sheet-0', '475000'],
+    ],
+  );
+  assert.equal(refreshedObservations.some((observation) => (
+    observation.source_id === 'sheet-0' && observation.field === 'broker_email'
+  )), false);
+  assert.deepEqual(await storage.listDealHunterOpportunityFacts(opportunityId), operatorFactsBeforeRefresh);
+});
+
+test('a literal Broker Phone Deal OS value survives import canonicalization with distinct generic contact provenance', async (t) => {
+  // Break caught: the real Deal OS importer parses `Broker Phone`, but its
+  // bounded canonical record drops that field before SQLite persistence and
+  // later rehydrates only the generic `Broker Contact` value.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-deal-os-broker-phone-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const now = new Date();
+  const observedDate = now.toISOString().slice(0, 10);
+  const listingUrl = 'https://broker.example/listings/deal-os-literal-broker-phone';
+  const description = 'Commercial HVAC maintenance company with recurring service agreements and trained field technicians.';
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `SHEET-DEAL-OS-BROKER-PHONE,Deal OS Literal Broker Phone Services,${listingUrl},NY,${observedDate},450000,1200000,900000,${description}`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  const imported = await importDealOsExport({
+    fileBuffer: Buffer.from([
+      'Listing ID,Business Name,View Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Broker Contact,Broker Phone,Description',
+      `DEAL-OS-BROKER-PHONE,Deal OS Literal Broker Phone Services,${listingUrl},NY,${observedDate},450000,1200000,900000,broker@example.test,+1 315 555 1212,${description}`,
+    ].join('\n')),
+    fileName: 'deal-os-broker-phone.csv',
+    mimeType: 'text/csv',
+    exportedAt: now.toISOString(),
+    scope: 'saved-search',
+    coverageLabel: 'Explicit Deal OS broker phone regression',
+    expectedRowCount: 1,
+    importedBy: 'acquisition-admin@example.test',
+    storage,
+    now,
+  });
+  assert.equal(imported.ok, true);
+
+  const refreshed = await refreshOpportunityScores({
+    storage,
+    reviewMode: 'full-backfill',
+    actor: 'deal-os-broker-phone-source-test',
+  });
+  assert.equal(refreshed.ok, true);
+  const [opportunity] = (await storage.listCurrentDealHunterOpportunities({ limit: 20 }))
+    .filter((item) => item.metadata?.identitySnapshot?.listingUrl === listingUrl);
+  assert.ok(opportunity, 'the matched Sheet and Deal OS records resolve to one canonical opportunity');
+  const opportunityId = opportunity.opportunity_id;
+
+  const storedImport = await storage.getLatestDealHunterDealOsImport();
+  const storedRecord = storedImport.records[0];
+  const sourceRows = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+  assert.equal(detail.ok, true);
+  const sourceGroup = detail.sourceObservations.find((source) => (
+    source.sourceId === 'deal-os-export'
+    && source.sourceRecordId === 'external:DEAL-OS-BROKER-PHONE'
+  ));
+
+  assert.deepEqual({
+    storedBrokerContact: storedRecord.brokerContact,
+    storedBrokerPhone: storedRecord.brokerPhone,
+    storedBrokerPhoneOwnProperty: Object.hasOwn(storedRecord, 'brokerPhone'),
+    durableBrokerRows: sourceRows
+      .filter((row) => row.source_id === 'deal-os-export' && row.field.startsWith('broker_'))
+      .map((row) => ({ field: row.field, value: row.value, sourceName: row.source_name, sourceRecordId: row.source_record_id }))
+      .sort((left, right) => left.field.localeCompare(right.field)),
+    sourceBrokerContact: sourceGroup?.values.broker_contact,
+    sourceBrokerPhone: sourceGroup?.values.broker_phone,
+    effectiveBrokerPhone: detail.effectiveFacts.broker_phone,
+    brokerPhoneMissing: detail.missingCriticalFields.includes('broker_phone'),
+  }, {
+    storedBrokerContact: 'broker@example.test',
+    storedBrokerPhone: '+1 315 555 1212',
+    storedBrokerPhoneOwnProperty: true,
+    durableBrokerRows: [
+      {
+        field: 'broker_contact',
+        value: 'broker@example.test',
+        sourceName: 'SMB Deal OS export',
+        sourceRecordId: 'external:DEAL-OS-BROKER-PHONE',
+      },
+      {
+        field: 'broker_phone',
+        value: '+1 315 555 1212',
+        sourceName: 'SMB Deal OS export',
+        sourceRecordId: 'external:DEAL-OS-BROKER-PHONE',
+      },
+    ],
+    sourceBrokerContact: 'broker@example.test',
+    sourceBrokerPhone: '+1 315 555 1212',
+    effectiveBrokerPhone: {
+      value: '+1 315 555 1212',
+      provenance: 'structured-source',
+      verified: false,
+      actor: null,
+      note: null,
+    },
+    brokerPhoneMissing: false,
+  });
+});
+
+test('a literal Broker Phone Sheet value retains phone identity and provenance through persisted detail', async (t) => {
+  // Break caught: the real Sheet `Broker Phone` column is normalized as a
+  // generic broker contact, so a durable current source record exists but the
+  // consolidated detail reports broker_phone as missing.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-broker-phone-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const observedDate = new Date().toISOString().slice(0, 10);
+  const listingUrl = 'https://broker.example/listings/literal-broker-phone';
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Broker Phone,Description',
+    `SHEET-BROKER-PHONE,Literal Broker Phone Services,${listingUrl},CA,${observedDate},450000,1200000,900000,555-1212,Commercial HVAC maintenance company with recurring service agreements and trained field technicians.`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+
+  const refreshed = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'broker-phone-source-test' });
+  assert.equal(refreshed.ok, true);
+  const [opportunity] = (await storage.listCurrentDealHunterOpportunities({ limit: 20 }))
+    .filter((item) => item.metadata?.identitySnapshot?.listingUrl === listingUrl);
+  assert.ok(opportunity, 'the real Sheet row resolves to a current canonical opportunity');
+
+  const sourceRows = await storage.listDealHunterOpportunitySourceObservations(opportunity.opportunity_id);
+  assert.equal(
+    sourceRows.some((row) => row.source_id === 'sheet-0' && row.source_name === 'SMB Deal Hunter Google Sheet' && row.source_record_id === 'external:SHEET-BROKER-PHONE'),
+    true,
+    'the current Sheet source record is durably attributable before its contact fact is composed',
+  );
+
+  const sourceDetail = await getTriageOpportunityDetail({ opportunityId: opportunity.opportunity_id, storage });
+  await setOperatorOpportunityFact({
+    opportunityId: opportunity.opportunity_id,
+    field: 'broker_phone',
+    value: '310-555-0199',
+    verified: true,
+    actor: 'acquisition-admin',
+    storage,
+  });
+  const operatorDetail = await getTriageOpportunityDetail({ opportunityId: opportunity.opportunity_id, storage });
+  const sourceGroup = sourceDetail.sourceObservations.find((source) => source.sourceId === 'sheet-0');
+
+  assert.deepEqual({
+    brokerRows: sourceRows
+      .filter((row) => row.source_id === 'sheet-0' && row.field.startsWith('broker_'))
+      .map((row) => ({ field: row.field, value: row.value, sourceId: row.source_id, sourceName: row.source_name, sourceRecordId: row.source_record_id })),
+    sourcePhone: sourceGroup?.values.broker_phone,
+    effectiveSourcePhone: sourceDetail.effectiveFacts.broker_phone,
+    sourceClaimsPhoneMissing: sourceDetail.missingCriticalFields.includes('broker_phone'),
+    effectiveOperatorPhone: operatorDetail.effectiveFacts.broker_phone,
+  }, {
+    brokerRows: [{
+      field: 'broker_phone', value: '555-1212', sourceId: 'sheet-0', sourceName: 'SMB Deal Hunter Google Sheet', sourceRecordId: 'external:SHEET-BROKER-PHONE',
+    }],
+    sourcePhone: '555-1212',
+    effectiveSourcePhone: {
+      value: '555-1212', provenance: 'structured-source', verified: false, actor: null, note: null,
+    },
+    sourceClaimsPhoneMissing: false,
+    effectiveOperatorPhone: {
+      value: '310-555-0199', provenance: 'operator', verified: true, actor: 'acquisition-admin', note: null,
+    },
+  });
+});
+
+test('a Sheet with distinct Broker Contact and Broker Phone values retains both truthful source fields', () => {
+  // Break caught: recognizing an explicit phone silently removes a separate
+  // generic source contact, making the retained provenance claim incomplete.
+  const [deal] = parseSheetCsvDeals([
+    'Listing ID,Business Name,Listing URL,State,Broker Contact,Broker Phone',
+    'SHEET-BOTH-CONTACTS,Separate Contact Fields Co,https://broker.example/listings/separate-contact-fields,CA,broker@example.test,555-1212',
+  ].join('\n')).deals;
+  const snapshot = buildOpportunitySourceObservationSnapshot({
+    opportunityId: 'opp-separate-broker-contact-fields',
+    deal,
+    now: '2026-08-31T00:00:00.000Z',
+  });
+
+  assert.deepEqual(
+    snapshot.observations
+      .filter((observation) => observation.field.startsWith('broker_'))
+      .map(({ field, value }) => ({ field, value }))
+      .sort((left, right) => left.field.localeCompare(right.field)),
+    [
+      { field: 'broker_contact', value: 'broker@example.test' },
+      { field: 'broker_phone', value: '555-1212' },
+    ],
+  );
+});
+
+test('a no-explicit-ID Sheet row keeps one source observation snapshot when its listing URL is corrected', async (t) => {
+  // Break caught: the supported positional Sheet record shape uses a mutable
+  // listing URL as its observation identity and forks observations after the
+  // existing canonical resolver has identified the same opportunity.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-sheet-url-correction-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const firstCsv = [
+    'Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Broker Name,Broker Email,Description',
+    `No-ID URL Correction HVAC,https://broker.example/no-id-original,CA,${new Date().toISOString().slice(0, 10)},450000,1200000,900000,Sheet Broker,sheet@example.test,Commercial HVAC maintenance company`,
+  ].join('\n');
+  const correctedCsv = firstCsv.replace('https://broker.example/no-id-original', 'https://broker.example/no-id-corrected');
+  const [firstDeal] = parseSheetCsvDeals(firstCsv).deals;
+  const [correctedDeal] = parseSheetCsvDeals(correctedCsv).deals;
+  const opportunityId = 'opp-no-id-sheet-url-correction';
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: opportunityId,
+    created_at: '2026-08-30T12:00:00.000Z',
+    updated_at: '2026-08-30T12:00:00.000Z',
+    canonical_name: 'No-ID URL Correction HVAC',
+    canonical_recipient: null,
+    canonical_location: 'CA',
+    primary_submission_id: null,
+    identity_version: 'test',
+    status: 'active',
+    metadata: {},
+  });
+  await storage.replaceDealHunterOpportunitySourceObservationSnapshot(
+    buildOpportunitySourceObservationSnapshot({ opportunityId, deal: firstDeal, now: '2026-08-30T12:30:00.000Z' }),
+  );
+  const firstObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  const firstListing = firstObservations.find((observation) => observation.field === 'listing_url');
+  assert.equal(firstListing.source_record_id, 'sheet-row:1');
+
+  await storage.replaceDealHunterOpportunitySourceObservationSnapshot(
+    buildOpportunitySourceObservationSnapshot({ opportunityId, deal: correctedDeal, now: '2026-08-30T13:30:00.000Z' }),
+  );
+  const refreshedObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  const refreshedListing = refreshedObservations.find((observation) => observation.field === 'listing_url');
+  assert.equal(refreshedListing.source_record_id, 'sheet-row:1');
+  assert.equal(refreshedListing.id, firstListing.id);
+  assert.equal(refreshedListing.value, 'https://broker.example/no-id-corrected');
+  assert.equal(refreshedObservations.length, firstObservations.length);
+});
+
+test('a complete Sheet refresh removes the stale positional observation when a listing moves to a new row', async (t) => {
+  // Break caught: a complete Sheet refresh treats a position-derived source
+  // record as independently current after the same listing moves rows, so the
+  // old value remains authoritative and conflicts with the refreshed value.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-sheet-row-movement-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const observedDate = new Date().toISOString().slice(0, 10);
+  const moverListingUrl = 'https://broker.example/listings/moving-hvac';
+  sourceCsv = [
+    'Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `Moving HVAC Services,${moverListingUrl},CA,${observedDate},450000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  dealOsImport = {
+    ...freshDealOsImport(),
+    id: 'row-movement-deal-os-import',
+    records: [{
+      stableId: 'DEAL-OS-MOVING-HVAC',
+      name: 'Moving HVAC Services',
+      listingUrl: moverListingUrl,
+      state: 'CA',
+      annualProfit: 455000,
+      annualRevenue: 1200000,
+      askingPrice: 900000,
+      description: 'Commercial HVAC maintenance with recurring service agreements.',
+      brokerContacts: [],
+    }],
+  };
+  await storage.insertDealHunterDealOsImport(dealOsImport);
+
+  const firstRefresh = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'sheet-row-movement-test' });
+  assert.equal(firstRefresh.ok, true);
+  const [firstOpportunity] = (await storage.listCurrentDealHunterOpportunities({ limit: 20 }))
+    .filter((opportunity) => opportunity.metadata?.identitySnapshot?.listingUrl === moverListingUrl);
+  assert.ok(firstOpportunity, 'the first full refresh resolves a canonical opportunity by listing identity');
+  const opportunityId = firstOpportunity.opportunity_id;
+  const aliases = await storage.listDealHunterOpportunityAliases({ opportunityIds: [opportunityId], limit: 20 });
+  assert.equal(
+    aliases.some((alias) => alias.alias_type === 'listing-url' && alias.alias_value === moverListingUrl),
+    true,
+    'the reproduction is anchored by the durable listing identity, not business name or location matching',
+  );
+  const firstObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  assert.deepEqual(
+    firstObservations.filter((observation) => observation.source_id === 'sheet-0' && observation.field === 'annual_profit')
+      .map((observation) => [observation.source_record_id, observation.value]),
+    [['sheet-row:1', '450000']],
+  );
+
+  sourceCsv = [
+    'Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `Inserted Roofing,https://broker.example/listings/inserted-roofing,TX,${observedDate},300000,1000000,700000,Commercial roofing repair company with contracted work.`,
+    `Moving HVAC Services,${moverListingUrl},CA,${observedDate},475000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+  ].join('\n');
+  const secondRefresh = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'sheet-row-movement-test' });
+  assert.equal(secondRefresh.ok, true);
+
+  const [refreshedOpportunity] = (await storage.listCurrentDealHunterOpportunities({ limit: 20 }))
+    .filter((opportunity) => opportunity.metadata?.identitySnapshot?.listingUrl === moverListingUrl);
+  assert.equal(refreshedOpportunity.opportunity_id, opportunityId, 'the listing remains the same canonical opportunity after row movement');
+  const refreshedObservations = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
+  assert.deepEqual(
+    refreshedObservations.filter((observation) => observation.source_id === 'sheet-0' && observation.field === 'annual_profit')
+      .map((observation) => [observation.source_record_id, observation.value]),
+    [['sheet-row:2', '475000']],
+    'only the moved Sheet row contributes the refreshed profit',
+  );
+  assert.equal(refreshedObservations.length, firstObservations.length, 'the complete refresh does not grow durable current observations');
+  assert.equal(
+    refreshedObservations.some((observation) => observation.source_id === 'deal-os-export' && observation.field === 'annual_profit' && observation.value === '455000'),
+    true,
+    'the unrelated Deal OS observation remains current',
+  );
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+  assert.equal(detail.ok, true);
+  const sheetGroups = detail.sourceObservations.filter((source) => source.sourceId === 'sheet-0');
+  assert.equal(sheetGroups.length, 1, 'only one current Sheet source record remains in the authoritative detail projection');
+  assert.equal(sheetGroups[0].sourceRecordId, 'sheet-row:2');
+  const profitConflict = sheetGroups[0].conflicts.find((conflict) => conflict.field === 'annual_profit');
+  assert.ok(profitConflict, 'the current Sheet and Deal OS values remain visibly attributable as a real cross-source conflict');
+  assert.equal(
+    profitConflict.observations.some((observation) => observation.value === '450000'),
+    false,
+    'the stale pre-move Sheet value no longer participates in current conflict authority',
+  );
+});
+
+test('a complete Sheet refresh removes observations for a business absent from the authoritative source while preserving Deal OS', async (t) => {
+  // Break caught: reconciling only canonical opportunities still represented
+  // by the new Sheet leaves a fully removed business's old Sheet source rows
+  // current forever. A proven complete source snapshot must remove every stale
+  // `(opportunity, source-record, field)` triple for that source ID.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-sheet-removed-business-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const currentDate = new Date().toISOString().slice(0, 10);
+  const retainedListingUrl = 'https://broker.example/listings/retained-hvac';
+  const removedListingUrl = 'https://broker.example/listings/removed-plumbing';
+  sourceCsv = [
+    'Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `Retained HVAC Services,${retainedListingUrl},CA,${currentDate},450000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+    `Removed Plumbing Services,${removedListingUrl},TX,${currentDate},500000,1500000,1000000,Commercial plumbing maintenance with recurring service agreements.`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  dealOsImport = {
+    ...freshDealOsImport(),
+    id: 'removed-sheet-business-deal-os-import',
+    records: [{
+      stableId: 'DEAL-OS-REMOVED-PLUMBING',
+      name: 'Removed Plumbing Services',
+      listingUrl: removedListingUrl,
+      state: 'TX',
+      annualProfit: 505000,
+      annualRevenue: 1500000,
+      askingPrice: 1000000,
+      description: 'Commercial plumbing maintenance with recurring service agreements.',
+      brokerContacts: [],
+    }],
+  };
+  await storage.insertDealHunterDealOsImport(dealOsImport);
+  assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'removed-sheet-business-test' })).ok, true);
+
+  const [removedOpportunity] = (await storage.listCurrentDealHunterOpportunities({ limit: 20 }))
+    .filter((opportunity) => opportunity.metadata?.identitySnapshot?.listingUrl === removedListingUrl);
+  assert.ok(removedOpportunity, 'the first complete source run resolves the later-removed business by durable listing identity');
+  const before = await storage.listDealHunterOpportunitySourceObservations(removedOpportunity.opportunity_id);
+  assert.equal(before.some((observation) => observation.source_id === 'sheet-0'), true);
+  assert.equal(before.some((observation) => observation.source_id === 'deal-os-export' && observation.value === '505000'), true);
+
+  sourceCsv = [
+    'Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `Retained HVAC Services,${retainedListingUrl},CA,${currentDate},475000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+  ].join('\n');
+  const refreshed = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'removed-sheet-business-test' });
+  assert.equal(refreshed.ok, true);
+
+  const after = await storage.listDealHunterOpportunitySourceObservations(removedOpportunity.opportunity_id);
+  assert.equal(
+    after.some((observation) => observation.source_id === 'sheet-0'),
+    false,
+    'the complete current Sheet snapshot removes source evidence for an absent business',
+  );
+  assert.equal(
+    after.some((observation) => observation.source_id === 'deal-os-export' && observation.value === '505000'),
+    true,
+    'the source-wide deletion boundary excludes the unrelated Deal OS source ID',
+  );
+});
+
+test('an incremental Sheet review preserves observations outside its partial candidate set', async (t) => {
+  // Break caught: source-wide reconciliation runs for a partial/incremental
+  // review and deletes a valid Sheet observation the run did not represent.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-incremental-sheet-observations-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const currentDate = new Date().toISOString().slice(0, 10);
+  const olderListingUrl = 'https://broker.example/listings/older-preserved';
+  sourceCsv = [
+    'Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `Fresh HVAC Services,https://broker.example/listings/fresh-hvac,CA,${currentDate},450000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+    `Older Plumbing Services,${olderListingUrl},CA,2020-01-01,500000,1500000,1000000,Commercial plumbing maintenance with recurring service agreements.`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'partial-sheet-test' })).ok, true);
+  const [olderOpportunity] = (await storage.listCurrentDealHunterOpportunities({ limit: 20 }))
+    .filter((opportunity) => opportunity.metadata?.identitySnapshot?.listingUrl === olderListingUrl);
+  assert.ok(olderOpportunity);
+  const before = await storage.listDealHunterOpportunitySourceObservations(olderOpportunity.opportunity_id);
+  assert.ok(before.length > 0);
+
+  sourceCsv = [
+    'Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `Fresh HVAC Services,https://broker.example/listings/fresh-hvac,CA,${currentDate},475000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+  ].join('\n');
+  const incremental = await refreshOpportunityScores({ storage, reviewMode: 'daily', actor: 'partial-sheet-test' });
+  assert.equal(incremental.ok, true);
+  assert.deepEqual(
+    await storage.listDealHunterOpportunitySourceObservations(olderOpportunity.opportunity_id),
+    before,
+    'a non-complete review does not erase the valid older Sheet source record it did not carry',
+  );
+});
+
+test('a full Sheet refresh with an unresolved row leaves its prior Sheet observation snapshot intact', async (t) => {
+  // Break caught: a source-wide delete proceeds when one authoritative Sheet
+  // row lacks durable identity evidence, discarding valid prior observations;
+  // record-by-record writes would also leave a hybrid snapshot behind.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-partial-identity-sheet-observations-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const currentDate = new Date().toISOString().slice(0, 10);
+  const moverListingUrl = 'https://broker.example/listings/identity-gated-hvac';
+  sourceCsv = [
+    'Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `Identity Gated HVAC,${moverListingUrl},CA,${currentDate},450000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'partial-identity-test' })).ok, true);
+  const [moverOpportunity] = (await storage.listCurrentDealHunterOpportunities({ limit: 20 }))
+    .filter((opportunity) => opportunity.metadata?.identitySnapshot?.listingUrl === moverListingUrl);
+  assert.ok(moverOpportunity);
+  const before = await storage.listDealHunterOpportunitySourceObservations(moverOpportunity.opportunity_id);
+
+  sourceCsv = [
+    'Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `Identity Missing Listing,,TX,${currentDate},300000,1000000,700000,Short description.`,
+    `Identity Gated HVAC,${moverListingUrl},CA,${currentDate},475000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+  ].join('\n');
+  const partialIdentity = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'partial-identity-test' });
+  assert.equal(partialIdentity.ok, false);
+  assert.equal(partialIdentity.status, 409);
+  assert.deepEqual(
+    await storage.listDealHunterOpportunitySourceObservations(moverOpportunity.opportunity_id),
+    before,
+    'an unresolved authoritative Sheet row prevents both stale deletion and a hybrid replacement for that source',
+  );
+});
+
+test('a complete Sheet payload with duplicate stable source-record identities fails closed before any Sheet observation write', async (t) => {
+  // Break caught: duplicate stable Listing IDs make the raw source identity
+  // set ambiguous. A full backfill must defer/fail rather than write one row
+  // while deleting or updating the last-known-good snapshot for another.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-duplicate-stable-sheet-observations-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const currentDate = new Date().toISOString().slice(0, 10);
+  const listingUrl = 'https://broker.example/listings/duplicate-stable-sheet-hvac';
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `SHEET-STABLE-42,Duplicate Stable HVAC,${listingUrl},CA,${currentDate},450000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  const initial = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'duplicate-stable-sheet-test' });
+  assert.equal(initial.ok, true);
+  const [opportunity] = (await storage.listCurrentDealHunterOpportunities({ limit: 20 }))
+    .filter((item) => item.metadata?.identitySnapshot?.listingUrl === listingUrl);
+  assert.ok(opportunity);
+  const before = await storage.listDealHunterOpportunitySourceObservations(opportunity.opportunity_id);
+  assert.ok(before.some((observation) => observation.source_id === 'sheet-0'));
+
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `SHEET-STABLE-42,Duplicate Stable HVAC,${listingUrl},CA,${currentDate},475000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+    `SHEET-STABLE-42,Duplicate Stable Plumbing,https://broker.example/listings/duplicate-stable-sheet-plumbing,TX,${currentDate},500000,1500000,1000000,Commercial plumbing maintenance with recurring service agreements.`,
+  ].join('\n');
+  const duplicate = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'duplicate-stable-sheet-test' });
+
+  assert.equal(duplicate.ok, false, 'a successfully fetched but duplicate-identity Sheet cannot authorize a complete snapshot');
+  assert.equal(duplicate.status, 503, 'the admission proof fails closed before a full-backfill score write');
+  assert.equal(duplicate.scoringDeferred, true);
+  assert.deepEqual(duplicate.review.sourceSnapshotAdmissionDeferredSources, ['sheet-0']);
+  assert.equal(
+    duplicate.review.sources.find((source) => source.id === 'sheet-0')?.fetched,
+    true,
+    'the rejection is an identity/admission failure, not a source collection failure',
+  );
+  assert.deepEqual(
+    await storage.listDealHunterOpportunitySourceObservations(opportunity.opportunity_id),
+    before,
+    'the last-known-good Sheet observations remain byte-for-byte unchanged with no partial source write',
+  );
+});
+
+test('a failed complete Sheet collection leaves current source observations untouched', async (t) => {
+  // Break caught: a failed collection is interpreted as an empty complete
+  // source snapshot and deletes the last known-good source observations.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-deal-hunter-failed-sheet-observations-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'observations.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const currentDate = new Date().toISOString().slice(0, 10);
+  const listingUrl = 'https://broker.example/listings/failed-collection-hvac';
+  sourceCsv = [
+    'Business Name,Listing URL,State,Date Added,Annual Profit,Annual Revenue,Asking Price,Description',
+    `Failed Collection HVAC,${listingUrl},CA,${currentDate},450000,1200000,900000,Commercial HVAC maintenance with recurring service agreements.`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'failed-sheet-test' })).ok, true);
+  const [opportunity] = (await storage.listCurrentDealHunterOpportunities({ limit: 20 }))
+    .filter((item) => item.metadata?.identitySnapshot?.listingUrl === listingUrl);
+  const before = await storage.listDealHunterOpportunitySourceObservations(opportunity.opportunity_id);
+
+  sheetFetchStatus = 503;
+  const failed = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'failed-sheet-test' });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.status, 503);
+  assert.deepEqual(await storage.listDealHunterOpportunitySourceObservations(opportunity.opportunity_id), before);
 });

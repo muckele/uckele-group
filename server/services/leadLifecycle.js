@@ -173,7 +173,7 @@ export async function restoreLead({
   return { ok: true, status: 200, submission: mutation.record };
 }
 
-function mapDealHunterReason(reason) {
+export function normalizeDealHunterDispositionReason(reason) {
   const normalized = compactText(reason, 80).toLowerCase().replace(/[ _]+/g, '-');
   if (archiveReasons.includes(normalized)) return normalized;
   if (['industry', 'quality', 'owner-dependence', 'profit', 'recipient'].includes(normalized)) return 'not-a-fit';
@@ -191,7 +191,7 @@ export async function dismissDealHunterOpportunity({
   storage = getStorage(),
 } = {}) {
   const normalizedDealKey = compactText(dealKey, 1000);
-  const normalizedReason = mapDealHunterReason(reason);
+  const normalizedReason = normalizeDealHunterDispositionReason(reason);
   if (!normalizedDealKey) return { ok: false, status: 400, error: 'Deal key is required.' };
   if (!normalizedReason) return { ok: false, status: 400, error: 'A disposition reason is required.' };
 

@@ -1818,7 +1818,7 @@ test('dry run returns the exact deterministic plan and writes nothing', async (t
 test('relationship inventory classifies every reviewed omission exactly once in all four categories', () => {
   const entries = CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries;
   const keys = entries.map((entry) => `${entry.table}.${entry.column}`);
-  assert.equal(entries.length, 231);
+  assert.equal(entries.length, 235);
   assert.equal(new Set(keys).size, keys.length);
   assert.deepEqual(
     [...new Set(entries.map((entry) => entry.category))].sort(),
@@ -1830,8 +1830,8 @@ test('relationship inventory classifies every reviewed omission exactly once in 
       entries.filter((entry) => entry.category === category).length,
     ])),
     {
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 91,
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT]: 51,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 93,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT]: 53,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.PRESERVED_GLOBAL_RECIPIENT_OPERATIONAL_STATE]: 54,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED]: 35,
     },
@@ -1847,7 +1847,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
       entries.filter((entry) => entry.enforcement === enforcement).length,
     ])),
     {
-      [materialScannerPathEnforcement]: 186,
+      [materialScannerPathEnforcement]: 190,
       [independentGateEnforcement]: 10,
       [approvalPreconditionEnforcement]: 11,
       [explicitExclusionEnforcement]: 24,
@@ -1864,7 +1864,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
     [...new Set(optionalLegacyEntries.map((entry) => entry.table))].sort(),
     ['admin_magic_links_legacy_v1', 'deal_hunter_candidates', 'prospect_discoveries'],
   );
-  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 224);
+  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 228);
   for (const entry of entries) {
     assert.ok(entry.reason, `${entry.table}.${entry.column} must document its classification`);
     assert.ok(entry.enforcement, `${entry.table}.${entry.column} must declare its enforcement class`);
@@ -1935,8 +1935,8 @@ test('relationship inventory checksum is deterministic over the complete presenc
   const first = canonicalOpportunityMergeRelationshipInventorySummary();
   const second = canonicalOpportunityMergeRelationshipInventorySummary();
   assert.deepEqual(first, second);
-  assert.equal(first.entryCount, 231);
-  assert.equal(first.checksum, '64e4e3376bca92e17a33f9f7ac5b1ccdd0f5954478d3eaf54f546723e52a404e');
+  assert.equal(first.entryCount, 235);
+  assert.equal(first.checksum, '34252f068faf62022ae8b24d7e3b7eb5bcc0848bd1825d6e6305621a1a6108aa');
   assert.equal(
     first.checksum,
     createHash('sha256')

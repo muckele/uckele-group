@@ -41,10 +41,14 @@ import {
   requestOpportunityScoreRefresh,
 } from './services/dealHunterScoreStore.js';
 import {
+  dismissDealHunterOpportunityWithInboxAuthority,
   getTriageOpportunityDetail,
   listTriageQueue,
+  passTriageOpportunity,
+  restoreDealHunterOpportunityWithInboxAuthority,
   setTriageOperatorDecision,
 } from './services/dealHunterTriage.js';
+import { setCurrentOperatorOpportunityFact } from './services/dealHunterOpportunityFacts.js';
 import {
   dealHunterCrmSyncConfirmation,
   auditDealHunterCrmIntegrity,
@@ -85,8 +89,6 @@ import {
 } from './services/communications.js';
 import {
   archiveLead,
-  dismissDealHunterOpportunity,
-  restoreDealHunterOpportunity,
   restoreLead,
 } from './services/leadLifecycle.js';
 import { recordAnalyticsEvent } from './services/analytics.js';
@@ -1468,7 +1470,43 @@ export function createApp() {
         return;
       }
       const result = await getTriageOpportunityDetail({ opportunityId: request.params.opportunityId });
-      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+      if (!result.ok) {
+        response.status(result.status || 400).json({ success: false, error: result.error || 'Opportunity detail is unavailable.' });
+        return;
+      }
+      const { ok: _ok, status: _status, ...detail } = result;
+      response.status(200).json(detail);
+    }),
+  );
+
+  app.put(
+    '/api/admin/deal-hunter/opportunities/:opportunityId/facts/:field',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      if (typeof request.body?.verified !== 'boolean') {
+        response.status(400).json({ success: false, error: 'Opportunity fact verification state must be boolean.' });
+        return;
+      }
+      try {
+        const fact = await setCurrentOperatorOpportunityFact({
+          opportunityId: request.params.opportunityId,
+          field: request.params.field,
+          value: request.body?.value,
+          verified: request.body.verified,
+          note: request.body?.note ?? null,
+          actor: session.username || 'admin',
+          storage: getStorage(),
+        });
+        response.status(200).json({ success: true, fact });
+      } catch (error) {
+        const message = String(error?.message || 'Opportunity fact could not be saved.');
+        const status = /no longer current|current canonical opportunity/i.test(message) ? 409 : /was not found/i.test(message) ? 404 : 400;
+        response.status(status).json({ success: false, error: message });
+      }
     }),
   );
 
@@ -1488,6 +1526,45 @@ export function createApp() {
         actor: session.username || 'admin',
       });
       response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/action',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      if (typeof request.body?.action !== 'string') {
+        response.status(400).json({ success: false, error: 'Action must be pursue, watch, or pass.' });
+        return;
+      }
+      const action = request.body.action.trim().toLowerCase();
+      if (!['pursue', 'watch', 'pass'].includes(action)) {
+        response.status(400).json({ success: false, error: 'Action must be pursue, watch, or pass.' });
+        return;
+      }
+      const opportunityId = request.params.opportunityId;
+      if (action === 'pursue' || action === 'watch') {
+        const result = await setTriageOperatorDecision({
+          opportunityId,
+          priority: action === 'pursue' ? 'high' : 'watch',
+          markReviewed: true,
+          actor: session.username || 'admin',
+        });
+        response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), action, ...result });
+        return;
+      }
+
+      const result = await passTriageOpportunity({
+        opportunityId,
+        reason: request.body?.reason,
+        note: request.body?.note,
+        actor: session.username || 'admin',
+      });
+      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), action, ...result });
     }),
   );
 
@@ -1634,11 +1711,11 @@ export function createApp() {
 
       const action = String(request.body?.action || 'dismiss').toLowerCase();
       const result = action === 'restore'
-        ? await restoreDealHunterOpportunity({
+        ? await restoreDealHunterOpportunityWithInboxAuthority({
             dealKey: request.body?.dealKey || '',
             actor: session.username || 'admin',
           })
-        : await dismissDealHunterOpportunity({
+        : await dismissDealHunterOpportunityWithInboxAuthority({
             dealKey: request.body?.dealKey || '',
             listingUrl: request.body?.listingUrl || '',
             dealName: request.body?.dealName || '',

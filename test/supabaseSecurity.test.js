@@ -59,6 +59,26 @@ const currentTriageEligibilityMigrationUrl = new URL(
   '../supabase/migrations/20260826120000_deal_hunter_current_triage_eligibility.sql',
   import.meta.url,
 );
+const opportunityFactsMigrationUrl = new URL(
+  '../supabase/migrations/20260830120000_deal_hunter_opportunity_facts.sql',
+  import.meta.url,
+);
+const opportunityFactWriteBoundaryMigrationUrl = new URL(
+  '../supabase/migrations/20260830130000_deal_hunter_opportunity_fact_write_boundary.sql',
+  import.meta.url,
+);
+const currentOperatorFactMigrationUrl = new URL(
+  '../supabase/migrations/20260830170000_current_operator_fact_write.sql',
+  import.meta.url,
+);
+const acquisitionInboxQueueMigrationUrl = new URL(
+  '../supabase/migrations/20260830150000_acquisition_inbox_queue.sql',
+  import.meta.url,
+);
+const cimDetailAuthorityMigrationUrl = new URL(
+  '../supabase/migrations/20260831210000_deal_hunter_cim_detail_authority.sql',
+  import.meta.url,
+);
 const canonicalCurrentSemanticsMigrationUrl = new URL(
   '../supabase/migrations/20260827120000_canonical_opportunity_current_semantics.sql',
   import.meta.url,
@@ -169,6 +189,82 @@ function mutatesCanonicalOpportunityAliases(functionSql) {
   return /(?:insert\s+into|update|delete\s+from)\s+public\.deal_hunter_opportunity_aliases\b/i
     .test(functionSql);
 }
+
+test('Acquisition Inbox queue SQL keeps filtering, ordering, summary, and lightweight projection in the database', () => {
+  const migration = fs.readFileSync(acquisitionInboxQueueMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  for (const [sourceLabel, sql] of [
+    ['Acquisition Inbox migration', migration],
+    ['fresh schema', schema],
+  ]) {
+    const functionSql = sqlFunctionDefinitions(sql).find(({ name }) => name === 'list_deal_hunter_opportunity_scores')?.sql || '';
+    assertServiceRoleOnlyFunction(sql, sourceLabel, 'list_deal_hunter_opportunity_scores');
+    assert.match(functionSql, /security definer[\s\S]*?set search_path = public/i);
+    assert.match(functionSql, /current_triage_eligible = true[\s\S]*?row_number\(\) over \(order by[\s\S]*?\) as ordinal[\s\S]*?ordinal >/i);
+    assert.match(functionSql, /needsReview[\s\S]*?highPriority[\s\S]*?watchlist[\s\S]*?lowConfidence[\s\S]*?currentOpportunities/i);
+    assert.match(functionSql, /operator_priority in \('urgent', 'high'\)[\s\S]*?high_fit[\s\S]*?fit_score[\s\S]*?confidence[\s\S]*?observation_freshness[\s\S]*?opportunity_id asc/i);
+    assert.match(functionSql, /when 'scored-at' then scored_at/i);
+    assert.match(functionSql, /when 'name' then lower\(coalesce\(name, ''\)\)/i);
+    assert.match(functionSql, /source\.field = 'annual_profit'[\s\S]*?source\.field = 'profit_multiple'/i);
+    assert.match(functionSql, /row_number\(\) over \(order by[\s\S]*?\) as ordinal/i);
+    assert.match(functionSql, /jsonb_agg\(\(to_jsonb\(ordered\) - 'ordinal'\) order by ordinal\)/i);
+    assert.doesNotMatch(functionSql, /scores\.\*|scores\.(?:dimensions|gates|missing_evidence|confidence_reasons|operator_note)\b/i,
+      `${sourceLabel} queue RPC must not return full score/evidence JSON`);
+    assert.match(sql, /idx_deal_hunter_scores_acquisition_priority/i);
+    assert.match(sql, /idx_deal_hunter_source_observations_queue_projection/i);
+  }
+});
+
+test('Acquisition Inbox queue migration and fresh schema keep the same function contract', () => {
+  const migration = fs.readFileSync(acquisitionInboxQueueMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
+  const definition = (sql) => {
+    const start = sql.indexOf('create or replace function public.list_deal_hunter_opportunity_scores');
+    const end = sql.indexOf('\n$$;', start);
+    return start >= 0 && end >= start ? sql.slice(start, end + 4) : '';
+  };
+  assert.equal(normalize(definition(migration)), normalize(definition(schema)));
+});
+
+test('CIM detail authority migration and fresh schema enforce one bounded service-role ID window', () => {
+  // Break caught: the adapter cannot promise provider parity if the deployed
+  // RPC is missing, publicly executable, differs from the fresh schema, admits
+  // legacy noncanonical IDs, or relies on database-locale text ordering.
+  assert.equal(fs.existsSync(cimDetailAuthorityMigrationUrl), true, 'the deployable detail-authority migration exists');
+  const migration = fs.existsSync(cimDetailAuthorityMigrationUrl)
+    ? fs.readFileSync(cimDetailAuthorityMigrationUrl, 'utf8')
+    : '';
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  const functionName = 'list_deal_hunter_cim_detail_authority';
+  const definition = (sql) => {
+    const start = sql.indexOf(`create or replace function public.${functionName}`);
+    const end = sql.indexOf('\n$$;', start);
+    return start >= 0 && end >= start ? sql.slice(start, end + 4) : '';
+  };
+  const constraint = (sql) => {
+    const start = sql.indexOf('add constraint deal_hunter_cim_requests_canonical_id_check');
+    const end = sql.indexOf(';', start);
+    return start >= 0 && end >= start ? sql.slice(start, end + 1) : '';
+  };
+  const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
+
+  for (const [sourceLabel, sql] of [
+    ['CIM detail authority migration', migration],
+    ['fresh schema', schema],
+  ]) {
+    const functionSql = definition(sql);
+    assertServiceRoleOnlyFunction(sql, sourceLabel, functionName);
+    assert.match(functionSql, /security invoker[\s\S]*set search_path = public/i);
+    assert.match(functionSql, /opportunity_id = any\(p_opportunity_ids\)/i);
+    assert.match(functionSql, /\(request\.id collate "C"\) ~ '\^\[A-Za-z0-9\]\[A-Za-z0-9\._:-\]\{0,199\}\$'/i);
+    assert.match(functionSql, /order by[\s\S]*updated_at desc nulls last[\s\S]*id collate "C" asc/i);
+    assert.match(functionSql, /limit greatest\(1, least\(coalesce\(p_limit, 100\), 100000\)\)/i);
+    assert.match(constraint(sql), /check \(\(id collate "C"\) ~ '\^\[A-Za-z0-9\]\[A-Za-z0-9\._:-\]\{0,199\}\$'\) not valid/i);
+  }
+  assert.equal(normalize(definition(migration)), normalize(definition(schema)));
+  assert.equal(normalize(constraint(migration)), normalize(constraint(schema)));
+});
 
 test('every canonical alias lock participant acquires the complete sorted alias lock set before opportunity rows', () => {
   const migration = fs.readFileSync(canonicalCurrentSemanticsMigrationUrl, 'utf8');
@@ -300,7 +396,7 @@ test('canonical current semantics migration is function-only and guards every at
     assert.match(sql, /claim_deal_hunter_cim_recipient[\s\S]*?opportunity-not-current/i);
     assert.match(sql, /link_deal_hunter_crm_submission[\s\S]*?status\s*=\s*'active'/i);
     assert.match(sql, /reconcile_deal_hunter_current_score_eligibility[\s\S]*?join\s+public\.deal_hunter_opportunities[\s\S]*?status\s*=\s*'active'/i);
-    assert.match(sql, /list_deal_hunter_opportunity_scores[\s\S]*?with\s+candidates[\s\S]*?join\s+public\.deal_hunter_opportunities[\s\S]*?status\s*=\s*'active'[\s\S]*?limit\s+least/i,
+    assert.match(sql, /list_deal_hunter_opportunity_scores[\s\S]*?with\s+candidates[\s\S]*?join\s+public\.deal_hunter_opportunities[\s\S]*?status\s*=\s*'active'[\s\S]*?(?:limit\s+least|row_number\(\)\s+over\s*\(order\s+by[\s\S]*?ordinal\s*>)/i,
       `${sourceLabel} must filter active opportunities in the database before triage pagination`);
     assert.match(sql, /upsert_deal_hunter_cim_recipient_override[\s\S]*?select\s+opportunity_id\s+into\s+v_existing_opportunity_id[\s\S]*?v_existing_opportunity_id\s*<>\s*v_opportunity_id/i,
       `${sourceLabel} must reject recipient-override ID collisions across canonical owners`);
@@ -325,7 +421,10 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const opportunityScoringMigration = fs.readFileSync(opportunityScoringMigrationUrl, 'utf8');
   const semanticScoringMigration = fs.readFileSync(semanticScoringMigrationUrl, 'utf8');
   const currentTriageEligibilityMigration = fs.readFileSync(currentTriageEligibilityMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}`;
+  const opportunityFactsMigration = fs.readFileSync(opportunityFactsMigrationUrl, 'utf8');
+  const opportunityFactWriteBoundaryMigration = fs.readFileSync(opportunityFactWriteBoundaryMigrationUrl, 'utf8');
+  const currentOperatorFactMigration = fs.readFileSync(currentOperatorFactMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
@@ -340,6 +439,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   assert.doesNotMatch(cimIdentityMigration, /create\s+policy/i, 'canonical CIM identity tables must not add public RLS policies');
   assert.doesNotMatch(cimStage2Migration, /create\s+policy/i, 'Stage 2 authorization tables must not add public RLS policies');
   assert.doesNotMatch(crmReconciliationMigration, /create\s+policy/i, 'CRM reconciliation tables must not add public RLS policies');
+  assert.doesNotMatch(opportunityFactsMigration, /create\s+policy/i, 'opportunity fact tables must not add public RLS policies');
+  assert.doesNotMatch(opportunityFactWriteBoundaryMigration, /create\s+policy/i, 'opportunity fact write boundary must not add public RLS policies');
   assertServerOnlyPrivileges(migration, 'forward migration');
   assert.match(analyticsMigration, /revoke all privileges on table public\.analytics_events from public, anon, authenticated;/i);
   assert.match(analyticsMigration, /grant all privileges on table public\.analytics_events to service_role;/i);
@@ -368,6 +469,35 @@ test('Supabase migration and fresh schema isolate every current app table to the
   assert.match(adminOnboardingMigration, /revoke all privileges on table public\.admin_onboarding_progress from public, anon, authenticated;/i);
   assert.match(adminOnboardingMigration, /grant all privileges on table public\.admin_onboarding_progress to service_role;/i);
   assert.match(adminOnboardingMigration, /p_step_ids\s+text\[\]/i);
+  for (const tableName of ['deal_hunter_opportunity_facts', 'deal_hunter_opportunity_source_observations']) {
+    assert.match(
+      opportunityFactsMigration,
+      new RegExp(`revoke all privileges on table public\\.${tableName} from public, anon, authenticated;`, 'i'),
+    );
+    assert.match(
+      opportunityFactsMigration,
+      new RegExp(`grant all privileges on table public\\.${tableName} to service_role;`, 'i'),
+    );
+  }
+  for (const [sourceLabel, sql] of [
+    ['opportunity fact write-boundary migration', opportunityFactWriteBoundaryMigration],
+    ['fresh schema', schema],
+  ]) {
+    assertServiceRoleOnlyFunction(sql, sourceLabel, 'upsert_deal_hunter_opportunity_fact');
+    assertServiceRoleOnlyFunction(sql, sourceLabel, 'upsert_deal_hunter_opportunity_source_observation');
+  }
+  assertServiceRoleOnlyFunction(currentOperatorFactMigration, 'current operator fact migration', 'insert_current_deal_hunter_opportunity_fact');
+  assertServiceRoleOnlyFunction(schema, 'fresh schema', 'insert_current_deal_hunter_opportunity_fact');
+  assert.match(opportunityFactWriteBoundaryMigration, /deal_hunter_opportunity_source_observations_bounded_check/i);
+  assert.match(
+    opportunityFactWriteBoundaryMigration,
+    /add constraint deal_hunter_opportunity_source_observations_bounded_check[\s\S]*?\) not valid;/i,
+  );
+  assert.doesNotMatch(
+    opportunityFactWriteBoundaryMigration,
+    /validate constraint deal_hunter_opportunity_source_observations_bounded_check/i,
+  );
+  assert.match(schema, /deal_hunter_opportunity_source_observations_bounded_check/i);
   assert.match(adminOnboardingMigration, /array_position\(p_step_ids,\s*excluded\.last_completed_step_id\)/i);
   assertServiceRoleOnlyFunction(adminOnboardingMigration, 'admin onboarding migration', 'upsert_admin_onboarding_progress');
   assertServiceRoleOnlyFunction(schema, 'fresh schema', 'upsert_admin_onboarding_progress');
@@ -497,9 +627,12 @@ test('Supabase migration and fresh schema isolate every current app table to the
     'count_crm_follow_up_sends',
     'get_crm_follow_up_operational_metrics',
     'list_follow_up_submissions_page',
+    'insert_current_deal_hunter_opportunity_fact',
   ];
   for (const functionName of serviceRoleFunctions) {
-    const sourceSql = [
+    const sourceSql = functionName === 'insert_current_deal_hunter_opportunity_fact'
+      ? currentOperatorFactMigration
+      : [
       'count_crm_follow_up_sends',
       'get_crm_follow_up_operational_metrics',
       'list_follow_up_submissions_page',
@@ -512,7 +645,7 @@ test('Supabase migration and fresh schema isolate every current app table to the
           'finish_crm_email_outbox_claim',
         ].includes(functionName)
         ? followUpWorkspaceMigration
-        : communicationsLifecycleMigration;
+      : communicationsLifecycleMigration;
     const sourceLabel = sourceSql === followUpQueueMigration
       ? 'follow-up queue migration'
       : sourceSql === followUpWorkspaceMigration

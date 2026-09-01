@@ -4,6 +4,21 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
 import {
+  normalizeDealHunterSourceSnapshot,
+  normalizeOperatorOpportunityFactRecord,
+  normalizeOpportunitySourceObservation,
+  normalizeOpportunitySourceObservationSnapshot,
+} from '../services/dealHunterOpportunityFacts.js';
+import {
+  firstStrictDetailAuthorityTimestamp,
+  strictDetailAuthorityTimestampSortKey,
+} from '../services/detailAuthorityTimestamp.js';
+import {
+  normalizeCanonicalCimRequestId,
+  requireCanonicalCimRequestId,
+} from '../services/cimRequestIdPolicy.js';
+import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
+import {
   buildCanonicalOpportunityMergePlan,
   canonicalOpportunityMergeManifestId,
   CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION,
@@ -391,6 +406,14 @@ function normalizeDealHunterScoreEvidenceRow(row) {
   return row ? { ...row, terms: parseJsonColumn(row.terms, []) } : null;
 }
 
+function normalizeDealHunterOpportunityFactRow(row) {
+  return row ? { ...row, verified: Boolean(row.verified) } : null;
+}
+
+function normalizeDealHunterOpportunitySourceObservationRow(row) {
+  return row ? { ...row } : null;
+}
+
 function normalizeDealHunterOpportunityAliasRow(row) {
   return row ? { ...row, metadata: parseJsonColumn(row.metadata, {}) } : null;
 }
@@ -676,7 +699,7 @@ function serializeDealHunterCimRequest(request) {
           : 'not-attempted';
 
   return {
-    id: String(request.id || '').trim(),
+    id: requireCanonicalCimRequestId(request.id),
     created_at: createdAt,
     updated_at: updatedAt,
     deal_key: String(request.deal_key || '').trim(),
@@ -1032,6 +1055,12 @@ function inspectCanonicalMergeDependentState(database, approval) {
     { column: 'opportunity_id', values: opportunityIds },
     { column: 'listing_url', values: listingUrls },
   ]);
+  const operatorFacts = selectCanonicalMergeRows(database, 'deal_hunter_opportunity_facts', [
+    { column: 'opportunity_id', values: opportunityIds },
+  ]);
+  const sourceObservations = selectCanonicalMergeRows(database, 'deal_hunter_opportunity_source_observations', [
+    { column: 'opportunity_id', values: opportunityIds },
+  ]);
   const contactSubmissions = selectCanonicalMergeRows(database, 'contact_submissions', [
     { column: 'deal_hunter_opportunity_id', values: opportunityIds },
     { column: 'listing_url', values: listingUrls },
@@ -1191,6 +1220,8 @@ function inspectCanonicalMergeDependentState(database, approval) {
   const records = {
     opportunityScores: canonicalMergeRecordIds('deal_hunter_opportunity_scores', opportunityScores, 'opportunity_id'),
     scoreEvidence: canonicalMergeRecordIds('deal_hunter_score_evidence', scoreEvidence),
+    operatorFacts: canonicalMergeRecordIds('deal_hunter_opportunity_facts', operatorFacts),
+    sourceObservations: canonicalMergeRecordIds('deal_hunter_opportunity_source_observations', sourceObservations),
     contactSubmissions: canonicalMergeRecordIds('contact_submissions', contactSubmissions),
     crmImports: canonicalMergeRecordIds('deal_hunter_crm_imports', crmImports),
     crmReconciliationItems: canonicalMergeRecordIds('deal_hunter_crm_reconciliation_items', crmReconciliationItems),
@@ -1378,6 +1409,8 @@ const canonicalOpportunityMergeRequiredSchema = Object.freeze({
   ],
   deal_hunter_opportunity_scores: ['opportunity_id', 'deal_key', 'listing_url'],
   deal_hunter_score_evidence: ['id', 'opportunity_id', 'listing_url'],
+  deal_hunter_opportunity_facts: ['id', 'opportunity_id'],
+  deal_hunter_opportunity_source_observations: ['id', 'opportunity_id', 'source_id', 'source_record_id'],
   deal_hunter_cim_reviews: ['id', 'deal_key', 'opportunity_id', 'metadata'],
   deal_hunter_crm_imports: [
     'id',
@@ -1889,6 +1922,16 @@ export function createSqliteStorage(config) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
 
   const database = new Database(config.storage.sqlitePath);
+  database.function('deal_hunter_cim_authority_sort_key', { deterministic: true }, (updatedAt, createdAt) => {
+    const authorityAt = firstStrictDetailAuthorityTimestamp(
+      { updated_at: updatedAt, created_at: createdAt },
+      [['updated_at'], ['created_at']],
+    );
+    return strictDetailAuthorityTimestampSortKey(authorityAt);
+  });
+  database.function('deal_hunter_cim_record_id_sort_key', { deterministic: true }, (recordId) => (
+    normalizeCanonicalCimRequestId(recordId) || null
+  ));
   fs.chmodSync(config.storage.sqlitePath, 0o600);
   database.pragma('journal_mode = WAL');
   for (const suffix of ['-wal', '-shm']) {
@@ -2394,6 +2437,104 @@ export function createSqliteStorage(config) {
         metadata TEXT NOT NULL DEFAULT '{}'
       );
 
+      -- Operator corrections create a new immutable revision ID so history
+      -- retains the values an operator previously recorded; a same-ID retry
+      -- may update only the mutable revision fields. Source
+      -- observations use a bounded source-record identity and are refreshed in
+      -- place; neither projection stores raw source payloads.
+      CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_facts (
+        id TEXT PRIMARY KEY,
+        opportunity_id TEXT NOT NULL,
+        field TEXT NOT NULL,
+        value TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'operator',
+        verified INTEGER NOT NULL DEFAULT 0,
+        actor TEXT NOT NULL,
+        note TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK(
+          id = trim(id) AND length(id) BETWEEN 1 AND 240
+          AND opportunity_id = trim(opportunity_id) AND length(opportunity_id) BETWEEN 1 AND 200
+          AND field IN ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes')
+          AND value = trim(value) AND length(value) BETWEEN 1 AND 4000
+          AND source = 'operator'
+          AND verified IN (0, 1)
+          AND actor = trim(actor) AND length(actor) BETWEEN 1 AND 200
+          AND (note IS NULL OR (note = trim(note) AND length(note) BETWEEN 1 AND 4000))
+          AND created_at = trim(created_at) AND length(created_at) BETWEEN 1 AND 80 AND julianday(created_at) IS NOT NULL
+          AND updated_at = trim(updated_at) AND length(updated_at) BETWEEN 1 AND 80 AND julianday(updated_at) IS NOT NULL
+        ),
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE
+      );
+
+      CREATE TRIGGER IF NOT EXISTS deal_hunter_opportunity_facts_operator_boundary_insert
+      BEFORE INSERT ON deal_hunter_opportunity_facts
+      BEGIN
+        SELECT CASE WHEN NOT (
+          NEW.id = trim(NEW.id) AND length(NEW.id) BETWEEN 1 AND 240
+          AND NEW.opportunity_id = trim(NEW.opportunity_id) AND length(NEW.opportunity_id) BETWEEN 1 AND 200
+          AND NEW.field IN ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes')
+          AND NEW.value = trim(NEW.value) AND length(NEW.value) BETWEEN 1 AND 4000
+          AND NEW.source = 'operator'
+          AND NEW.verified IN (0, 1)
+          AND NEW.actor = trim(NEW.actor) AND length(NEW.actor) BETWEEN 1 AND 200
+          AND (NEW.note IS NULL OR (NEW.note = trim(NEW.note) AND length(NEW.note) BETWEEN 1 AND 4000))
+          AND NEW.created_at = trim(NEW.created_at) AND length(NEW.created_at) BETWEEN 1 AND 80 AND julianday(NEW.created_at) IS NOT NULL
+          AND NEW.updated_at = trim(NEW.updated_at) AND length(NEW.updated_at) BETWEEN 1 AND 80 AND julianday(NEW.updated_at) IS NOT NULL
+        ) THEN RAISE(ABORT, 'invalid operator opportunity fact') END;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS deal_hunter_opportunity_facts_operator_boundary_update
+      BEFORE UPDATE ON deal_hunter_opportunity_facts
+      BEGIN
+        SELECT CASE WHEN NOT (
+          NEW.id = trim(NEW.id) AND length(NEW.id) BETWEEN 1 AND 240
+          AND NEW.opportunity_id = trim(NEW.opportunity_id) AND length(NEW.opportunity_id) BETWEEN 1 AND 200
+          AND NEW.field IN ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes')
+          AND NEW.value = trim(NEW.value) AND length(NEW.value) BETWEEN 1 AND 4000
+          AND NEW.source = 'operator'
+          AND NEW.verified IN (0, 1)
+          AND NEW.actor = trim(NEW.actor) AND length(NEW.actor) BETWEEN 1 AND 200
+          AND (NEW.note IS NULL OR (NEW.note = trim(NEW.note) AND length(NEW.note) BETWEEN 1 AND 4000))
+          AND NEW.created_at = trim(NEW.created_at) AND length(NEW.created_at) BETWEEN 1 AND 80 AND julianday(NEW.created_at) IS NOT NULL
+          AND NEW.updated_at = trim(NEW.updated_at) AND length(NEW.updated_at) BETWEEN 1 AND 80 AND julianday(NEW.updated_at) IS NOT NULL
+        ) THEN RAISE(ABORT, 'invalid operator opportunity fact') END;
+      END;
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_source_observations (
+        id TEXT PRIMARY KEY,
+        opportunity_id TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        source_name TEXT NOT NULL,
+        source_record_id TEXT NOT NULL,
+        field TEXT NOT NULL,
+        value TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(opportunity_id, source_id, source_record_id, field),
+        CHECK(
+          length(trim(id)) BETWEEN 1 AND 240 AND id = trim(id)
+          AND length(trim(opportunity_id)) BETWEEN 1 AND 200 AND opportunity_id = trim(opportunity_id)
+          AND length(trim(source_id)) BETWEEN 1 AND 160 AND source_id = trim(source_id)
+          AND length(trim(source_name)) BETWEEN 1 AND 220 AND source_name = trim(source_name)
+          AND length(trim(source_record_id)) BETWEEN 1 AND 200 AND source_record_id = trim(source_record_id)
+          AND field IN (
+            'name', 'business_name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
+            'annual_profit', 'annual_revenue', 'asking_price', 'profit_multiple', 'net_margin', 'years_established',
+            'remote_flag', 'franchise_flag', 'five_years_flag', 'broker_name', 'broker_company', 'broker_contact', 'broker_email',
+            'broker_phone', 'company', 'role', 'seller_name', 'seller_email', 'seller_phone', 'reason_for_sale', 'real_estate_included',
+            'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes', 'listing_url',
+            'listing_source', 'listing_id', 'deal_key', 'source_identity', 'date_added', 'last_updated',
+            'business_website', 'prospectus_url', 'ttm_revenue', 'ttm_ebitda', 'ebitda_multiple', 'business_age',
+            'sba_eligible', 'lead_type'
+          )
+          AND length(trim(value)) BETWEEN 1 AND 5000 AND value = trim(value)
+        ),
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_aliases (
         id TEXT PRIMARY KEY,
         opportunity_id TEXT NOT NULL,
@@ -2741,6 +2882,8 @@ export function createSqliteStorage(config) {
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_crm_imports_submission_id ON deal_hunter_crm_imports(submission_id);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_opportunities_updated ON deal_hunter_opportunities(updated_at DESC, opportunity_id);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_opportunities_recipient ON deal_hunter_opportunities(canonical_recipient, updated_at DESC);
+	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_opportunity_facts_history ON deal_hunter_opportunity_facts(opportunity_id, created_at DESC, id DESC);
+	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_source_observations_history ON deal_hunter_opportunity_source_observations(opportunity_id, observed_at DESC, id ASC);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_opportunity_aliases_opportunity ON deal_hunter_opportunity_aliases(opportunity_id, alias_type);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_identity_exceptions_status ON deal_hunter_identity_exceptions(status, updated_at DESC);
 	    CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_overrides_lookup ON deal_hunter_cim_recipient_overrides(opportunity_id, recipient_email, expires_at DESC);
@@ -2948,6 +3091,13 @@ export function createSqliteStorage(config) {
       ON deal_hunter_opportunity_scores(current_triage_eligible, should_remove, fit_score DESC, opportunity_id);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_priority
       ON deal_hunter_opportunity_scores(operator_priority, fit_score DESC, opportunity_id);
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_acquisition_priority
+      ON deal_hunter_opportunity_scores(
+        current_triage_eligible, should_remove, operator_priority, high_fit,
+        fit_score DESC, confidence, scored_at DESC, opportunity_id
+      );
+    CREATE INDEX IF NOT EXISTS idx_deal_hunter_source_observations_queue_projection
+      ON deal_hunter_opportunity_source_observations(opportunity_id, field, observed_at DESC, id ASC);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_scores_fingerprint
       ON deal_hunter_opportunity_scores(score_fingerprint);
     CREATE INDEX IF NOT EXISTS idx_deal_hunter_score_evidence_opportunity
@@ -3512,6 +3662,21 @@ export function createSqliteStorage(config) {
       last_activity_at = COALESCE(excluded.last_activity_at, excluded.updated_at, deal_hunter_cim_requests.last_activity_at),
       metadata = excluded.metadata
   `);
+  const getDealHunterCimRequestConflictStatement = database.prepare(`
+    SELECT id
+    FROM deal_hunter_cim_requests
+    WHERE deal_key = ? AND recipient_email = ?
+    LIMIT 1
+  `);
+  function runDealHunterCimRequestUpsert(request) {
+    const existing = getDealHunterCimRequestConflictStatement.get(request.deal_key, request.recipient_email);
+    if (existing && !normalizeCanonicalCimRequestId(existing.id)) {
+      const error = new Error('A legacy CIM request with a noncanonical CIM request ID cannot be updated.');
+      error.code = 'DEAL_HUNTER_CIM_LEGACY_ID_COLLISION';
+      throw error;
+    }
+    return upsertDealHunterCimRequestStatement.run(request);
+  }
   const insertDealHunterCimRequestStatement = database.prepare(`
     INSERT INTO deal_hunter_cim_requests (
       id,
@@ -4417,7 +4582,7 @@ export function createSqliteStorage(config) {
         };
       }
 
-      upsertDealHunterCimRequestStatement.run({ ...request, submission_id: submissionId });
+      runDealHunterCimRequestUpsert({ ...request, submission_id: submissionId });
       record = normalizeDealHunterCimRequestRow(
         database.prepare('SELECT * FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1').get(request.id),
       );
@@ -4469,7 +4634,7 @@ export function createSqliteStorage(config) {
         };
       }
 
-      upsertDealHunterCimRequestStatement.run(request);
+      runDealHunterCimRequestUpsert(request);
       record = normalizeDealHunterCimRequestRow(
         database
           .prepare('SELECT * FROM deal_hunter_cim_requests WHERE deal_key = ? AND LOWER(recipient_email) = ? LIMIT 1')
@@ -6365,6 +6530,183 @@ export function createSqliteStorage(config) {
         return this.getDealHunterOpportunityScore(opportunityId);
       },
 
+      async passDealHunterOpportunity(command = {}) {
+        const opportunityId = String(command.opportunityId || '').trim();
+        const actor = String(command.actor || 'admin').trim() || 'admin';
+        const occurredAt = command.occurredAt || new Date().toISOString();
+        if (!opportunityId || !command.dispositionId || !command.archiveActivityId || !command.triageActivityId) {
+          throw new Error('Atomic opportunity Pass requires canonical command identity.');
+        }
+        const transaction = database.transaction(() => {
+          const opportunity = database.prepare(`
+            SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+          `).get(opportunityId);
+          if (!opportunity || opportunity.status !== 'active') return { applied: false, reason: 'not-current' };
+
+          const score = database.prepare(`
+            SELECT * FROM deal_hunter_opportunity_scores
+            WHERE opportunity_id = ? AND current_triage_eligible = 1
+            LIMIT 1
+          `).get(opportunityId);
+          if (!score) return { applied: false, reason: 'not-current' };
+          if (score.should_remove) return { applied: false, reason: 'not-actionable' };
+
+          const existingDisposition = database.prepare(`
+            SELECT * FROM deal_hunter_dispositions WHERE deal_key = ? LIMIT 1
+          `).get(score.deal_key);
+          if (existingDisposition?.disposition === 'dismissed') {
+            return {
+              applied: false,
+              reason: 'already-passed',
+              disposition: normalizeDealHunterDispositionRow(existingDisposition),
+              score: normalizeDealHunterOpportunityScoreRow(score),
+            };
+          }
+
+          const submission = opportunity.primary_submission_id
+            ? database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1').get(opportunity.primary_submission_id)
+            : null;
+          if (opportunity.primary_submission_id && !submission) {
+            return { applied: false, reason: 'linked-submission-missing' };
+          }
+          const archiveSubmission = Boolean(submission && submission.status !== 'archived');
+          if (archiveSubmission && activeCimClaimForSubmission(submission.id, occurredAt)) {
+            return { applied: false, reason: 'cim-send-in-progress' };
+          }
+
+          if (archiveSubmission) {
+            const existingMetadata = parseJsonColumn(submission.metadata, {});
+            updateRecord(
+              'contact_submissions',
+              submission.id,
+              {
+                updated_at: occurredAt,
+                status: 'archived',
+                status_updated_at: occurredAt,
+                follow_up_state: 'completed',
+                next_action_at: null,
+                archived_at: occurredAt,
+                archived_by: actor,
+                archive_reason: command.reason,
+                archive_note: command.note || null,
+                archive_communication_id: null,
+                metadata: {
+                  ...existingMetadata,
+                  acquisitionCommand: {
+                    ...(existingMetadata.acquisitionCommand || {}),
+                    pipelineStage: 'passed',
+                    passReason: command.reason,
+                    fitFeedback: 'false-positive',
+                    updatedAt: occurredAt,
+                    updatedBy: actor,
+                  },
+                  leadArchive: {
+                    previousStatus: submission.status,
+                    archivedAt: occurredAt,
+                    archivedBy: actor,
+                    reason: command.reason,
+                    communicationId: '',
+                  },
+                },
+              },
+              submissionUpdateFields,
+              submissionJsonFields,
+            );
+            database.prepare(`
+              UPDATE deal_hunter_cim_requests SET
+                request_state = CASE WHEN request_state = 'responded' THEN request_state ELSE 'stopped' END,
+                follow_up_state = CASE WHEN request_state = 'responded' THEN 'completed' ELSE 'stopped' END,
+                next_follow_up_at = NULL,
+                updated_at = ?,
+                last_activity_at = ?
+              WHERE submission_id = ?
+            `).run(occurredAt, occurredAt, submission.id);
+          }
+
+          const disposition = upsertDealHunterDispositionRecord({
+            id: command.dispositionId,
+            deal_key: score.deal_key,
+            submission_id: submission?.id || null,
+            listing_url: score.listing_url || null,
+            deal_name: score.name || opportunity.canonical_name || null,
+            created_at: occurredAt,
+            updated_at: occurredAt,
+            disposition: 'dismissed',
+            reason: command.reason,
+            note: command.note || null,
+            dismissed_at: occurredAt,
+            dismissed_by: actor,
+            restored_at: null,
+            restored_by: null,
+            created_by: actor,
+            updated_by: actor,
+            metadata: {},
+          });
+
+          database.prepare(`
+            UPDATE deal_hunter_opportunity_scores SET
+              reviewed_at = ?,
+              reviewed_by = ?,
+              reviewed_fingerprint = score_fingerprint,
+              reviewed_semantic_digest = semantic_digest,
+              operator_updated_at = ?
+            WHERE opportunity_id = ? AND current_triage_eligible = 1
+          `).run(occurredAt, actor, occurredAt, opportunityId);
+
+          if (submission) {
+            if (archiveSubmission) {
+              insertCrmActivityEvent({
+                id: command.archiveActivityId,
+                submission_id: submission.id,
+                opportunity_id: opportunityId,
+                created_at: occurredAt,
+                actor,
+                role: 'admin',
+                event_type: 'submission.archived',
+                summary: `Lead archived: ${String(command.reason || '').replace(/-/g, ' ')}.`,
+                metadata: {
+                  archiveReason: command.reason,
+                  communicationId: '',
+                  previousStatus: submission.status,
+                  dealKey: score.deal_key,
+                  dispositionId: disposition.id,
+                },
+              });
+            }
+            insertCrmActivityEvent({
+              id: command.triageActivityId,
+              submission_id: submission.id,
+              opportunity_id: opportunityId,
+              created_at: occurredAt,
+              actor,
+              role: 'admin',
+              event_type: 'opportunity.triaged',
+              summary: 'Operator triage: marked reviewed, passed.',
+              metadata: {
+                markedReviewed: true,
+                reviewedFingerprint: score.score_fingerprint,
+                fitScoreAtDecision: score.fit_score,
+                dispositionId: disposition.id,
+              },
+            });
+          }
+
+          return {
+            applied: true,
+            reason: '',
+            disposition,
+            score: normalizeDealHunterOpportunityScoreRow(database.prepare(`
+              SELECT * FROM deal_hunter_opportunity_scores WHERE opportunity_id = ? LIMIT 1
+            `).get(opportunityId)),
+            submission: submission
+              ? normalizeSubmissionRow(database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1').get(submission.id))
+              : null,
+            archived: Boolean(submission?.status === 'archived' || archiveSubmission),
+          };
+        });
+        return transaction.immediate();
+      },
+
       async setDealHunterOpportunityOperatorDecision(decision = {}) {
         const opportunityId = String(decision.opportunityId || '').trim();
         if (!opportunityId) throw new Error('A canonical opportunity id is required to record an operator decision.');
@@ -6399,9 +6741,18 @@ export function createSqliteStorage(config) {
             throw new Error('A superseded or otherwise non-current opportunity cannot receive a triage decision.');
           }
           const existing = database
-            .prepare('SELECT opportunity_id FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?')
+            .prepare('SELECT opportunity_id, deal_key FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?')
             .get(opportunityId);
           if (!existing) return false;
+          const disposition = database.prepare(`
+            SELECT disposition FROM deal_hunter_dispositions WHERE deal_key = ? LIMIT 1
+          `).get(existing.deal_key);
+          if (disposition?.disposition === 'dismissed') {
+            const error = new Error('This opportunity has already been passed and is durably dismissed.');
+            error.code = 'DEAL_HUNTER_OPPORTUNITY_DISMISSED';
+            error.status = 409;
+            throw error;
+          }
           database.prepare(`
             UPDATE deal_hunter_opportunity_scores
             SET ${assignments.join(', ')}, operator_updated_at = @operator_updated_at
@@ -6430,6 +6781,24 @@ export function createSqliteStorage(config) {
             WHERE scores.opportunity_id = ? AND scores.current_triage_eligible = 1
           `).get(String(opportunityId || '').trim()),
         );
+      },
+
+      async getCurrentDealHunterOpportunityScoreByDealKey(dealKey) {
+        const rows = database.prepare(`
+          SELECT scores.*
+          FROM deal_hunter_opportunity_scores AS scores
+          JOIN deal_hunter_opportunities AS opportunity
+            ON opportunity.opportunity_id = scores.opportunity_id
+           AND opportunity.status = 'active'
+          WHERE scores.deal_key = ? AND scores.current_triage_eligible = 1
+          LIMIT 2
+        `).all(String(dealKey || '').trim());
+        if (rows.length > 1) {
+          const error = new Error('A Deal Hunter key maps to more than one current Inbox opportunity.');
+          error.code = 'DEAL_HUNTER_CURRENT_DEAL_KEY_CONFLICT';
+          throw error;
+        }
+        return normalizeDealHunterOpportunityScoreRow(rows[0]);
       },
 
       async reconcileDealHunterCurrentScoreEligibility(opportunityIds = []) {
@@ -6530,8 +6899,10 @@ export function createSqliteStorage(config) {
         view = 'needs-review', page = 1, pageSize = 25, search = '', sort = 'fit-score', direction = 'desc',
         minScore = null, confidence = '', priority = '', state = '',
       } = {}) {
-        const safePage = Math.max(1, Math.min(Number(page) || 1, 10000));
-        const safePageSize = Math.max(1, Math.min(Number(pageSize) || 25, 100));
+        const parsedPage = Number(page);
+        const parsedPageSize = Number(pageSize);
+        const safePage = Number.isFinite(parsedPage) ? Math.max(1, Math.min(Math.trunc(parsedPage), 10000)) : 1;
+        const safePageSize = Number.isFinite(parsedPageSize) ? Math.max(1, Math.min(Math.trunc(parsedPageSize), 100)) : 25;
         const clauses = ['scores.current_triage_eligible = 1'];
         const params = [];
 
@@ -6592,6 +6963,17 @@ export function createSqliteStorage(config) {
         const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
         const safeDirection = String(direction || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
         const sortColumns = {
+          'acquisition-priority': `CASE WHEN scores.operator_priority IN ('urgent', 'high') THEN 1 ELSE 0 END DESC,
+            CASE WHEN scores.high_fit = 1 AND (scores.reviewed_at IS NULL OR
+              CASE WHEN scores.reviewed_semantic_digest IS NOT NULL
+                THEN scores.reviewed_semantic_digest <> COALESCE(scores.semantic_digest, '')
+                ELSE scores.reviewed_fingerprint IS NULL OR scores.reviewed_fingerprint <> scores.score_fingerprint
+              END) THEN 1 ELSE 0 END DESC,
+            scores.fit_score DESC,
+            CASE scores.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC,
+            COALESCE((SELECT MAX(observed_at) FROM deal_hunter_opportunity_source_observations AS freshness
+              WHERE freshness.opportunity_id = scores.opportunity_id), scores.scored_at) DESC,
+            scores.opportunity_id ASC`,
           'fit-score': 'scores.fit_score',
           confidence: "CASE scores.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END",
           completeness: 'scores.completeness_score',
@@ -6603,18 +6985,73 @@ export function createSqliteStorage(config) {
             WHEN scores.reviewed_fingerprint IS NULL OR scores.reviewed_fingerprint <> scores.score_fingerprint THEN 1
             ELSE 0 END`,
         };
-        const sortColumn = sortColumns[String(sort || 'fit-score')] || sortColumns['fit-score'];
+        const normalizedSort = String(sort || 'fit-score');
+        const sortColumn = sortColumns[normalizedSort] || sortColumns['fit-score'];
         // opportunity_id is always the final key so pagination is stable when
         // rows tie on the requested sort.
-        const orderBy = `ORDER BY ${sortColumn} ${safeDirection}, `
-          + "CASE scores.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC, "
-          + 'scores.opportunity_id ASC';
+        const orderBy = normalizedSort === 'acquisition-priority'
+          ? `ORDER BY ${sortColumn}`
+          : `ORDER BY ${sortColumn} ${safeDirection}, `
+            + "CASE scores.confidence WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END DESC, "
+            + 'scores.opportunity_id ASC';
 
         const total = Number(database.prepare(`
           SELECT COUNT(*) AS total FROM deal_hunter_opportunity_scores AS scores ${dismissedJoin} ${where}
         `).get(...params)?.total || 0);
+        const summary = database.prepare(`
+          SELECT
+            COALESCE(SUM(CASE WHEN disposition.deal_key IS NULL AND scores.should_remove = 0 AND (
+              scores.reviewed_at IS NULL OR CASE WHEN scores.reviewed_semantic_digest IS NOT NULL
+                THEN scores.reviewed_semantic_digest <> COALESCE(scores.semantic_digest, '')
+                ELSE scores.reviewed_fingerprint IS NULL OR scores.reviewed_fingerprint <> scores.score_fingerprint
+              END
+            ) THEN 1 ELSE 0 END), 0) AS needsReview,
+            COALESCE(SUM(CASE WHEN disposition.deal_key IS NULL AND scores.should_remove = 0
+              AND (scores.high_fit = 1 OR scores.operator_priority IN ('urgent', 'high')) THEN 1 ELSE 0 END), 0) AS highPriority,
+            COALESCE(SUM(CASE WHEN disposition.deal_key IS NULL AND scores.should_remove = 0
+              AND ((scores.fit_score >= 60 AND scores.fit_score < 75) OR scores.operator_priority = 'watch') THEN 1 ELSE 0 END), 0) AS watchlist,
+            COALESCE(SUM(CASE WHEN disposition.deal_key IS NULL AND scores.should_remove = 0
+              AND (scores.confidence = 'low' OR scores.contradiction_count > 0) THEN 1 ELSE 0 END), 0) AS lowConfidence,
+            COALESCE(SUM(CASE WHEN disposition.deal_key IS NULL THEN 1 ELSE 0 END), 0) AS currentOpportunities
+          FROM deal_hunter_opportunity_scores AS scores ${dismissedJoin}
+          WHERE scores.current_triage_eligible = 1
+        `).get() || {};
         const rows = database.prepare(`
-          SELECT scores.*, disposition.reason AS dismissed_reason, disposition.dismissed_at AS dismissed_at
+          SELECT
+            scores.opportunity_id, scores.deal_key, scores.name, scores.state, scores.listing_url,
+            scores.fit_score, scores.score_status, scores.confidence, scores.completeness_score,
+            scores.contradiction_count, scores.missing_evidence_count, scores.should_remove,
+            scores.high_fit, scores.score_fingerprint, scores.semantic_digest, scores.scored_at,
+            scores.rules_version, scores.operator_priority, scores.reviewed_at,
+            scores.reviewed_by, scores.reviewed_fingerprint, scores.reviewed_semantic_digest,
+            disposition.reason AS dismissed_reason, disposition.dismissed_at AS dismissed_at,
+            json_extract(scores.summary, '$.strengths[0]') AS top_strength,
+            json_extract(scores.summary, '$.concerns[0]') AS top_concern,
+            (SELECT value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'industry'
+              ORDER BY source.observed_at DESC, source.id ASC LIMIT 1) AS industry,
+            (SELECT value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'location'
+              ORDER BY source.observed_at DESC, source.id ASC LIMIT 1) AS location,
+            (SELECT value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'annual_profit'
+              ORDER BY source.observed_at DESC, source.id ASC LIMIT 1) AS annual_profit,
+            (SELECT value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'annual_revenue'
+              ORDER BY source.observed_at DESC, source.id ASC LIMIT 1) AS annual_revenue,
+            (SELECT value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'asking_price'
+              ORDER BY source.observed_at DESC, source.id ASC LIMIT 1) AS asking_price,
+            (SELECT value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'profit_multiple'
+              ORDER BY source.observed_at DESC, source.id ASC LIMIT 1) AS profit_multiple,
+            (SELECT MAX(observed_at) FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id) AS observation_freshness,
+            COALESCE((SELECT submission.status FROM contact_submissions AS submission
+              WHERE submission.id = opportunity.primary_submission_id LIMIT 1), 'not-started') AS crm_status,
+            COALESCE((SELECT cim.status FROM deal_hunter_cim_requests AS cim
+              WHERE cim.opportunity_id = scores.opportunity_id
+              ORDER BY cim.updated_at DESC, cim.id DESC LIMIT 1), 'not-requested') AS cim_status
           FROM deal_hunter_opportunity_scores AS scores
           ${dismissedJoin}
           ${where}
@@ -6622,7 +7059,7 @@ export function createSqliteStorage(config) {
           LIMIT ? OFFSET ?
         `).all(...params, safePageSize, (safePage - 1) * safePageSize).map(normalizeDealHunterOpportunityScoreRow);
 
-        return { rows, total, page: safePage, pageSize: safePageSize, totalPages: Math.max(1, Math.ceil(total / safePageSize)) };
+        return { rows, total, summary, page: safePage, pageSize: safePageSize, totalPages: Math.max(1, Math.ceil(total / safePageSize)) };
       },
 
       async listDealHunterCrmReconciliationItems(runId, { limit = 5000 } = {}) {
@@ -7710,6 +8147,188 @@ export function createSqliteStorage(config) {
       return this.getDealHunterOpportunity(record.opportunity_id);
     },
 
+    async listDealHunterOpportunityFacts(opportunityId, { limit = 500 } = {}) {
+      return database.prepare(`
+        SELECT * FROM deal_hunter_opportunity_facts
+        WHERE opportunity_id = ?
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+      `).all(String(opportunityId || '').trim(), Number.isFinite(Number(limit)) ? Math.max(1, Math.min(Math.trunc(Number(limit)), 500)) : 500).map(normalizeDealHunterOpportunityFactRow);
+    },
+
+    async insertCurrentDealHunterOpportunityFact(fact = {}) {
+      const record = normalizeOperatorOpportunityFactRecord(fact);
+      const transaction = database.transaction(() => {
+        const current = database.prepare(`SELECT opportunity_id FROM deal_hunter_opportunities WHERE opportunity_id = ? AND status = 'active' LIMIT 1`)
+          .get(record.opportunity_id);
+        if (!current) return null;
+        database.prepare(`INSERT INTO deal_hunter_opportunity_facts (id, opportunity_id, field, value, source, verified, actor, note, created_at, updated_at)
+          VALUES (@id, @opportunity_id, @field, @value, @source, @verified, @actor, @note, @created_at, @updated_at)`).run({ ...record, verified: record.verified ? 1 : 0 });
+        return normalizeDealHunterOpportunityFactRow(database.prepare(`SELECT * FROM deal_hunter_opportunity_facts WHERE id = ?`).get(record.id));
+      });
+      return transaction.immediate();
+    },
+
+    async upsertDealHunterOpportunityFact(fact = {}) {
+      const record = normalizeOperatorOpportunityFactRecord(fact);
+      database.prepare(`
+        INSERT INTO deal_hunter_opportunity_facts (
+          id, opportunity_id, field, value, source, verified, actor, note, created_at, updated_at
+        ) VALUES (
+          @id, @opportunity_id, @field, @value, @source, @verified, @actor, @note, @created_at, @updated_at
+        )
+        ON CONFLICT(id) DO UPDATE SET
+          field = excluded.field,
+          value = excluded.value,
+          source = excluded.source,
+          verified = excluded.verified,
+          actor = excluded.actor,
+          note = excluded.note,
+          updated_at = excluded.updated_at
+      `).run({ ...record, verified: record.verified ? 1 : 0 });
+      return normalizeDealHunterOpportunityFactRow(database.prepare(`
+        SELECT * FROM deal_hunter_opportunity_facts WHERE id = ? LIMIT 1
+      `).get(record.id));
+    },
+
+    async listDealHunterOpportunitySourceObservations(opportunityId, { limit = 500 } = {}) {
+      return database.prepare(`
+        SELECT * FROM deal_hunter_opportunity_source_observations
+        WHERE opportunity_id = ?
+        ORDER BY observed_at DESC, id ASC
+        LIMIT ?
+      `).all(String(opportunityId || '').trim(), Number.isFinite(Number(limit)) ? Math.max(1, Math.min(Math.trunc(Number(limit)), 500)) : 500).map(normalizeDealHunterOpportunitySourceObservationRow);
+    },
+
+    async upsertDealHunterOpportunitySourceObservation(observation = {}) {
+      const normalizedObservation = normalizeOpportunitySourceObservation(observation);
+      database.prepare(`
+        INSERT INTO deal_hunter_opportunity_source_observations (
+          id, opportunity_id, source_id, source_name, source_record_id, field, value,
+          observed_at, created_at, updated_at
+        ) VALUES (
+          @id, @opportunity_id, @source_id, @source_name, @source_record_id, @field, @value,
+          @observed_at, @created_at, @updated_at
+        )
+        ON CONFLICT(opportunity_id, source_id, source_record_id, field) DO UPDATE SET
+          source_name = excluded.source_name,
+          value = excluded.value,
+          observed_at = excluded.observed_at,
+          updated_at = excluded.updated_at
+      `).run(normalizedObservation);
+      return normalizeDealHunterOpportunitySourceObservationRow(database.prepare(`
+        SELECT * FROM deal_hunter_opportunity_source_observations
+        WHERE opportunity_id = ? AND source_id = ? AND source_record_id = ? AND field = ?
+        LIMIT 1
+      `).get(
+        normalizedObservation.opportunity_id,
+        normalizedObservation.source_id,
+        normalizedObservation.source_record_id,
+        normalizedObservation.field,
+      ));
+    },
+
+    async replaceDealHunterOpportunitySourceObservationSnapshot(snapshot = {}) {
+      const normalizedSnapshot = normalizeOpportunitySourceObservationSnapshot(snapshot);
+      const replace = database.transaction((value) => {
+        for (const observation of value.observations) {
+          database.prepare(`
+            INSERT INTO deal_hunter_opportunity_source_observations (
+              id, opportunity_id, source_id, source_name, source_record_id, field, value,
+              observed_at, created_at, updated_at
+            ) VALUES (
+              @id, @opportunity_id, @source_id, @source_name, @source_record_id, @field, @value,
+              @observed_at, @created_at, @updated_at
+            )
+            ON CONFLICT(opportunity_id, source_id, source_record_id, field) DO UPDATE SET
+              source_name = excluded.source_name,
+              value = excluded.value,
+              observed_at = excluded.observed_at,
+              updated_at = excluded.updated_at
+          `).run(observation);
+        }
+        const fields = value.observations.map((observation) => observation.field);
+        const condition = fields.length > 0
+          ? `AND field NOT IN (${fields.map(() => '?').join(', ')})`
+          : '';
+        database.prepare(`
+          DELETE FROM deal_hunter_opportunity_source_observations
+          WHERE opportunity_id = ? AND source_id = ? AND source_record_id = ? ${condition}
+        `).run(value.opportunity_id, value.source_id, value.source_record_id, ...fields);
+        return database.prepare(`
+          SELECT * FROM deal_hunter_opportunity_source_observations
+          WHERE opportunity_id = ? AND source_id = ? AND source_record_id = ?
+          ORDER BY observed_at DESC, id ASC
+        `).all(value.opportunity_id, value.source_id, value.source_record_id)
+          .map(normalizeDealHunterOpportunitySourceObservationRow);
+      });
+      return replace(normalizedSnapshot);
+    },
+
+    async replaceDealHunterOpportunitySourceSnapshot() {
+      throw new Error('Complete per-opportunity source snapshot replacement is not admitted.');
+    },
+
+    async replaceDealHunterSourceSnapshot(snapshot = {}) {
+      normalizeDealHunterSourceSnapshot(snapshot);
+      throw new Error('Complete Google Sheet source snapshot admission is required.');
+    },
+
+    async replaceAdmittedCompleteGoogleSheetSourceSnapshot(snapshot = {}) {
+      consumeCompleteGoogleSheetSourceSnapshotAdmission({
+        admission: snapshot.admission,
+        snapshot,
+      });
+      const normalizedSnapshot = normalizeDealHunterSourceSnapshot(snapshot);
+      const replace = database.transaction((value) => {
+        const desiredKeys = new Set();
+        const upsert = database.prepare(`
+          INSERT INTO deal_hunter_opportunity_source_observations (
+            id, opportunity_id, source_id, source_name, source_record_id, field, value,
+            observed_at, created_at, updated_at
+          ) VALUES (
+            @id, @opportunity_id, @source_id, @source_name, @source_record_id, @field, @value,
+            @observed_at, @created_at, @updated_at
+          )
+          ON CONFLICT(opportunity_id, source_id, source_record_id, field) DO UPDATE SET
+            source_name = excluded.source_name,
+            value = excluded.value,
+            observed_at = excluded.observed_at,
+            updated_at = excluded.updated_at
+        `);
+        for (const record of value.records) {
+          for (const observation of record.observations) {
+            desiredKeys.add([observation.opportunity_id, observation.source_record_id, observation.field].join('\u0000'));
+            upsert.run(observation);
+          }
+        }
+
+        const current = database.prepare(`
+          SELECT opportunity_id, source_record_id, field
+          FROM deal_hunter_opportunity_source_observations
+          WHERE source_id = ?
+        `).all(value.source_id);
+        const remove = database.prepare(`
+          DELETE FROM deal_hunter_opportunity_source_observations
+          WHERE source_id = ? AND opportunity_id = ? AND source_record_id = ? AND field = ?
+        `);
+        for (const observation of current) {
+          const key = [observation.opportunity_id, observation.source_record_id, observation.field].join('\u0000');
+          if (!desiredKeys.has(key)) {
+            remove.run(value.source_id, observation.opportunity_id, observation.source_record_id, observation.field);
+          }
+        }
+
+        return database.prepare(`
+          SELECT * FROM deal_hunter_opportunity_source_observations
+          WHERE source_id = ?
+          ORDER BY observed_at DESC, id ASC
+        `).all(value.source_id)
+          .map(normalizeDealHunterOpportunitySourceObservationRow);
+      });
+      return replace.immediate(normalizedSnapshot);
+    },
+
     async linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt = '' } = {}) {
       const timestamp = updatedAt || new Date().toISOString();
       const transaction = database.transaction(() => {
@@ -8324,7 +8943,15 @@ export function createSqliteStorage(config) {
       return normalizeDealHunterCimRequestRow(row);
     },
 
-    async listDealHunterCimRequests({ dealKeys = [], opportunityIds = [], recipientEmails = [], statuses = [], dueBefore = '', limit = 1000 } = {}) {
+    async listDealHunterCimRequests({
+      dealKeys = [],
+      opportunityIds = [],
+      recipientEmails = [],
+      statuses = [],
+      dueBefore = '',
+      detailAuthority = false,
+      limit = 1000,
+    } = {}) {
       const keys = normalizeList(dealKeys);
       const canonicalIds = normalizeList(opportunityIds);
       const recipients = normalizeList(recipientEmails).map((value) => value.toLowerCase());
@@ -8340,6 +8967,16 @@ export function createSqliteStorage(config) {
       if (canonicalIds.length > 0) {
         clauses.push(`opportunity_id IN (${placeholders(canonicalIds.length)})`);
         params.push(...canonicalIds);
+      }
+
+      const useDetailAuthority = detailAuthority === true
+        && canonicalIds.length > 0
+        && keys.length === 0
+        && recipients.length === 0
+        && safeStatuses.length === 0
+        && !dueBefore;
+      if (useDetailAuthority) {
+        clauses.push('deal_hunter_cim_record_id_sort_key(id) IS NOT NULL');
       }
 
       if (recipients.length > 0) {
@@ -8359,12 +8996,24 @@ export function createSqliteStorage(config) {
 
       const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
       const safeLimit = Math.max(1, Math.min(Number(limit) || 1000, 100000));
+      // Only the detail projection explicitly requests strict timestamp and
+      // canonical-ID authority before its bounded candidate window. Generic
+      // opportunity history retains its established provider-native order and
+      // malformed legacy membership for audit and operational safety.
+      const orderClause = useDetailAuthority
+        ? `
+          ORDER BY
+            CASE WHEN deal_hunter_cim_authority_sort_key(updated_at, created_at) IS NULL THEN 1 ELSE 0 END ASC,
+            deal_hunter_cim_authority_sort_key(updated_at, created_at) DESC,
+            deal_hunter_cim_record_id_sort_key(id) ASC
+        `
+        : 'ORDER BY updated_at DESC, id ASC';
       return database
         .prepare(
           `
             SELECT * FROM deal_hunter_cim_requests
             ${whereClause}
-            ORDER BY updated_at DESC
+            ${orderClause}
             LIMIT ?
           `,
         )
@@ -8507,7 +9156,7 @@ export function createSqliteStorage(config) {
 	    async upsertDealHunterCimRequest(request = {}) {
 	      const serialized = serializeDealHunterCimRequest(request);
 	      return database.transaction(() => {
-	        upsertDealHunterCimRequestStatement.run(serialized);
+	        runDealHunterCimRequestUpsert(serialized);
 	        const stored = database.prepare(`
 	          SELECT * FROM deal_hunter_cim_requests
 	          WHERE deal_key = ? AND LOWER(recipient_email) = ?

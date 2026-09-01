@@ -144,14 +144,23 @@ test('only eligibility reconciliation can place historical scores in the current
 
   assert.ok(await storage.getDealHunterOpportunityScore('opp-score-1'), 'the historical score is durable');
   assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
+  assert.equal(await storage.getCurrentDealHunterOpportunityScoreByDealKey('deal-score-1'), null);
   assert.deepEqual(
     await storage.listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 1 }),
-    { rows: [], total: 0, page: 1, pageSize: 1, totalPages: 1 },
+    {
+      rows: [], total: 0,
+      summary: { needsReview: 0, highPriority: 0, watchlist: 0, lowConfidence: 0, currentOpportunities: 0 },
+      page: 1, pageSize: 1, totalPages: 1,
+    },
   );
 
   const activated = await storage.reconcileDealHunterCurrentScoreEligibility(['opp-score-1', 'opp-score-2']);
   assert.deepEqual(activated, { activated: 2, deactivated: 0 });
   assert.ok(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'));
+  assert.equal(
+    (await storage.getCurrentDealHunterOpportunityScoreByDealKey('deal-score-1')).opportunity_id,
+    'opp-score-1',
+  );
 
   const firstPage = await storage.listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 1 });
   const secondPage = await storage.listDealHunterOpportunityScores({ view: 'all', page: 2, pageSize: 1 });
@@ -164,6 +173,7 @@ test('only eligibility reconciliation can place historical scores in the current
   const narrowed = await storage.reconcileDealHunterCurrentScoreEligibility(['opp-score-2']);
   assert.deepEqual(narrowed, { activated: 0, deactivated: 1 });
   assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
+  assert.equal(await storage.getCurrentDealHunterOpportunityScoreByDealKey('deal-score-1'), null);
   const searched = await storage.listDealHunterOpportunityScores({
     view: 'all', search: 'Commercial Fire Safety', page: 1, pageSize: 25,
   });
@@ -193,7 +203,11 @@ test('superseded opportunities retain score history but cannot be scored, reacti
   assert.equal(await storage.getCurrentDealHunterOpportunityScore('opp-score-1'), null);
   assert.deepEqual(
     await storage.listDealHunterOpportunityScores({ view: 'all', page: 1, pageSize: 25 }),
-    { rows: [], total: 0, page: 1, pageSize: 25, totalPages: 1 },
+    {
+      rows: [], total: 0,
+      summary: { needsReview: 0, highPriority: 0, watchlist: 0, lowConfidence: 0, currentOpportunities: 0 },
+      page: 1, pageSize: 25, totalPages: 1,
+    },
   );
   assert.deepEqual(
     await storage.reconcileDealHunterCurrentScoreEligibility(['opp-score-1']),
@@ -245,6 +259,7 @@ test('SQLite forward migration preserves existing scores as last-good current bu
   const legacy = new Database(sqlitePath);
   legacy.exec(`
     DROP INDEX IF EXISTS idx_deal_hunter_scores_current_queue;
+    DROP INDEX IF EXISTS idx_deal_hunter_scores_acquisition_priority;
     ALTER TABLE deal_hunter_opportunity_scores DROP COLUMN current_triage_eligible;
   `);
   legacy.close();
@@ -788,6 +803,124 @@ test('Supabase: current score lookup rejects a superseded opportunity without hi
   assert.equal((await storage.getDealHunterOpportunityScore('opp-score-1')).score_fingerprint, 'fingerprint-a');
 });
 
+test('Supabase: exact deal-key lookup requires current Inbox and canonical authority', async () => {
+  const row = storedScoreRow();
+  const filters = [];
+  const chain = {
+    from(table) {
+      assert.equal(table, 'deal_hunter_opportunity_scores');
+      return chain;
+    },
+    select(fields) {
+      assert.equal(fields, '*,deal_hunter_opportunities!inner(status)');
+      return chain;
+    },
+    eq(column, value) {
+      filters.push([column, value]);
+      return chain;
+    },
+    async limit(value) {
+      assert.equal(value, 2);
+      return { data: [{ ...row, deal_hunter_opportunities: { status: 'active' } }], error: null };
+    },
+  };
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: chain },
+  );
+
+  assert.equal(
+    (await storage.getCurrentDealHunterOpportunityScoreByDealKey('deal-score-1')).opportunity_id,
+    'opp-score-1',
+  );
+  assert.deepEqual(filters, [
+    ['deal_key', 'deal-score-1'],
+    ['current_triage_eligible', true],
+    ['deal_hunter_opportunities.status', 'active'],
+  ]);
+});
+
+test('Supabase queue uses the bounded RPC and preserves its database summary', async () => {
+  const calls = [];
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    {
+      client: {
+        async rpc(name, payload) {
+          calls.push({ name, payload });
+          return {
+            data: {
+              total: 1,
+              summary: {
+                needsReview: 1, highPriority: 1, watchlist: 0, lowConfidence: 0, currentOpportunities: 1,
+              },
+              rows: [storedScoreRow({ opportunity_id: 'opp-queue', dimensions: undefined, summary: undefined })],
+            },
+            error: null,
+          };
+        },
+      },
+    },
+  );
+
+  const result = await storage.listDealHunterOpportunityScores({ page: 0, pageSize: 1000 });
+  assert.deepEqual(calls, [{
+    name: 'list_deal_hunter_opportunity_scores',
+    payload: {
+      p_view: 'needs-review', p_page: 1, p_page_size: 100, p_search: '',
+      p_sort: 'fit-score', p_direction: 'desc', p_min_score: null,
+      p_confidence: '', p_priority: '', p_state: '',
+    },
+  }]);
+  assert.deepEqual(result.summary, {
+    needsReview: 1, highPriority: 1, watchlist: 0, lowConfidence: 0, currentOpportunities: 1,
+  });
+  assert.equal(result.rows.length, 1);
+});
+
+test('Supabase queue forwards every advertised sort and normalizes the fixed acquisition ladder direction', async () => {
+  const calls = [];
+  const storage = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { async rpc(name, payload) { calls.push({ name, payload }); return { data: { total: 0, rows: [], summary: {} }, error: null }; } } },
+  );
+  const sorts = ['acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed'];
+  for (const sort of sorts) {
+    await storage.listDealHunterOpportunityScores({ sort, direction: 'asc' });
+    await storage.listDealHunterOpportunityScores({ sort, direction: 'desc' });
+  }
+  await storage.listDealHunterOpportunityScores({ sort: 'not-an-advertised-sort' });
+  assert.deepEqual(
+    calls.map(({ name, payload }) => [name, payload.p_sort, payload.p_direction]),
+    [
+      ...sorts.flatMap((sort) => [
+        ['list_deal_hunter_opportunity_scores', sort, sort === 'acquisition-priority' ? 'desc' : 'asc'],
+        ['list_deal_hunter_opportunity_scores', sort, 'desc'],
+      ]),
+      ['list_deal_hunter_opportunity_scores', 'fit-score', 'desc'],
+    ],
+  );
+});
+
+test('both storage adapters normalize fractional and malformed queue pagination before SQL or RPC', async (t) => {
+  const sqlite = withStorage(t);
+  const sqlitePage = await sqlite.listDealHunterOpportunityScores({ page: '1.9', pageSize: '1.9' });
+  assert.equal(sqlitePage.page, 1);
+  assert.equal(sqlitePage.pageSize, 1);
+  const sqliteMalformed = await sqlite.listDealHunterOpportunityScores({ page: 'not-a-number', pageSize: Infinity });
+  assert.equal(sqliteMalformed.page, 1);
+  assert.equal(sqliteMalformed.pageSize, 25);
+
+  const calls = [];
+  const supabase = supabaseModule.createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { async rpc(name, payload) { calls.push({ name, payload }); return { data: { total: 0, rows: [], summary: {} }, error: null }; } } },
+  );
+  await supabase.listDealHunterOpportunityScores({ page: '1.9', pageSize: '1.9' });
+  await supabase.listDealHunterOpportunityScores({ page: 'not-a-number', pageSize: Infinity });
+  assert.deepEqual(calls.map(({ payload }) => [payload.p_page, payload.p_page_size]), [[1, 1], [1, 25]]);
+});
+
 test('both storage providers expose the same scoring surface', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-score-parity-'));
   const sqlite = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'parity.sqlite') } });
@@ -801,6 +934,7 @@ test('both storage providers expose the same scoring surface', () => {
       'setDealHunterOpportunityOperatorDecision',
       'getDealHunterOpportunityScore',
       'getCurrentDealHunterOpportunityScore',
+      'getCurrentDealHunterOpportunityScoreByDealKey',
       'reconcileDealHunterCurrentScoreEligibility',
       'listDealHunterOpportunityScores',
       'listDealHunterOpportunityScoreFingerprints',

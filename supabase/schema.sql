@@ -3032,6 +3032,67 @@ create table if not exists public.deal_hunter_opportunities (
   metadata jsonb not null default '{}'::jsonb
 );
 
+-- Operator fact revisions retain historical corrections. Structured source
+-- observations are refreshed by a bounded source-record identity; neither
+-- table accepts arbitrary raw source blobs.
+create table if not exists public.deal_hunter_opportunity_facts (
+  id text primary key,
+  opportunity_id text not null references public.deal_hunter_opportunities(opportunity_id) on delete cascade,
+  field text not null,
+  value text not null,
+  source text not null default 'operator',
+  verified boolean not null default false,
+  actor text not null,
+  note text,
+  created_at timestamptz not null,
+  updated_at timestamptz not null,
+  constraint deal_hunter_opportunity_facts_operator_boundary_check check (
+    id = btrim(id) and char_length(id) between 1 and 240
+    and opportunity_id = btrim(opportunity_id) and char_length(opportunity_id) between 1 and 200
+    and field in (
+      'seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone',
+      'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration',
+      'operator_contact_notes'
+    )
+    and value = btrim(value) and char_length(value) between 1 and 4000
+    and source = 'operator'
+    and actor = btrim(actor) and char_length(actor) between 1 and 200
+    and (note is null or (note = btrim(note) and char_length(note) between 1 and 4000))
+  )
+);
+
+create table if not exists public.deal_hunter_opportunity_source_observations (
+  id text primary key,
+  opportunity_id text not null references public.deal_hunter_opportunities(opportunity_id) on delete cascade,
+  source_id text not null,
+  source_name text not null,
+  source_record_id text not null,
+  field text not null,
+  value text not null,
+  observed_at timestamptz not null,
+  created_at timestamptz not null,
+  updated_at timestamptz not null,
+  unique(opportunity_id, source_id, source_record_id, field),
+  constraint deal_hunter_opportunity_source_observations_bounded_check check (
+    id = btrim(id) and char_length(id) between 1 and 240
+    and opportunity_id = btrim(opportunity_id) and char_length(opportunity_id) between 1 and 200
+    and source_id = btrim(source_id) and char_length(source_id) between 1 and 160
+    and source_name = btrim(source_name) and char_length(source_name) between 1 and 220
+    and source_record_id = btrim(source_record_id) and char_length(source_record_id) between 1 and 200
+    and field in (
+      'name', 'business_name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
+      'annual_profit', 'annual_revenue', 'asking_price', 'profit_multiple', 'net_margin', 'years_established',
+      'remote_flag', 'franchise_flag', 'five_years_flag', 'broker_name', 'broker_company', 'broker_contact', 'broker_email',
+      'broker_phone', 'company', 'role', 'seller_name', 'seller_email', 'seller_phone', 'reason_for_sale', 'real_estate_included',
+      'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes', 'listing_url',
+      'listing_source', 'listing_id', 'deal_key', 'source_identity', 'date_added', 'last_updated',
+      'business_website', 'prospectus_url', 'ttm_revenue', 'ttm_ebitda', 'ebitda_multiple', 'business_age',
+      'sba_eligible', 'lead_type'
+    )
+    and value = btrim(value) and char_length(value) between 1 and 5000
+  )
+);
+
 create table if not exists public.deal_hunter_opportunity_aliases (
   id text primary key,
   opportunity_id text not null references public.deal_hunter_opportunities(opportunity_id) on delete restrict,
@@ -3266,6 +3327,12 @@ create index if not exists idx_deal_hunter_opportunities_updated
   on public.deal_hunter_opportunities(updated_at desc, opportunity_id);
 create index if not exists idx_deal_hunter_opportunities_recipient
   on public.deal_hunter_opportunities(canonical_recipient, updated_at desc);
+create index if not exists idx_deal_hunter_opportunity_facts_history
+  on public.deal_hunter_opportunity_facts(opportunity_id, created_at desc, id desc);
+create index if not exists idx_deal_hunter_source_observations_history
+  on public.deal_hunter_opportunity_source_observations(opportunity_id, observed_at desc, id);
+create index if not exists idx_deal_hunter_source_observations_queue_projection
+  on public.deal_hunter_opportunity_source_observations(opportunity_id, field, observed_at desc, id);
 create index if not exists idx_deal_hunter_opportunity_aliases_opportunity
   on public.deal_hunter_opportunity_aliases(opportunity_id, alias_type);
 create index if not exists idx_deal_hunter_identity_exceptions_status
@@ -4158,7 +4225,661 @@ begin
 end;
 $$;
 
+create or replace function public.upsert_deal_hunter_opportunity_fact(p_fact jsonb)
+returns public.deal_hunter_opportunity_facts
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_fact public.deal_hunter_opportunity_facts;
+  v_created_at timestamptz;
+  v_updated_at timestamptz;
+begin
+  if not (jsonb_typeof(p_fact) = 'object')
+    or not (p_fact ?& array['id', 'opportunity_id', 'field', 'value', 'source', 'verified', 'actor', 'note', 'created_at', 'updated_at'])
+    or p_fact - array['id', 'opportunity_id', 'field', 'value', 'source', 'verified', 'actor', 'note', 'created_at', 'updated_at'] <> '{}'::jsonb
+    or jsonb_typeof(p_fact -> 'id') <> 'string'
+    or jsonb_typeof(p_fact -> 'opportunity_id') <> 'string'
+    or jsonb_typeof(p_fact -> 'field') <> 'string'
+    or jsonb_typeof(p_fact -> 'value') <> 'string'
+    or jsonb_typeof(p_fact -> 'source') <> 'string'
+    or not (jsonb_typeof(p_fact -> 'verified') = 'boolean')
+    or jsonb_typeof(p_fact -> 'actor') <> 'string'
+    or jsonb_typeof(p_fact -> 'note') not in ('string', 'null')
+    or jsonb_typeof(p_fact -> 'created_at') <> 'string'
+    or jsonb_typeof(p_fact -> 'updated_at') <> 'string' then
+    raise exception 'invalid operator fact payload' using errcode = '22023';
+  end if;
+  if (p_fact ->> 'id') <> btrim(p_fact ->> 'id') or char_length(p_fact ->> 'id') not between 1 and 240
+    or (p_fact ->> 'opportunity_id') <> btrim(p_fact ->> 'opportunity_id') or char_length(p_fact ->> 'opportunity_id') not between 1 and 200
+    or (p_fact ->> 'field') not in ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes')
+    or (p_fact ->> 'value') <> btrim(p_fact ->> 'value') or char_length(p_fact ->> 'value') not between 1 and 4000
+    or (p_fact ->> 'source') <> 'operator'
+    or (p_fact ->> 'actor') <> btrim(p_fact ->> 'actor') or char_length(p_fact ->> 'actor') not between 1 and 200
+    or ((p_fact ->> 'note') is not null and ((p_fact ->> 'note') <> btrim(p_fact ->> 'note') or char_length(p_fact ->> 'note') not between 1 and 4000))
+    or (p_fact ->> 'created_at') <> btrim(p_fact ->> 'created_at') or char_length(p_fact ->> 'created_at') not between 1 and 80
+    or (p_fact ->> 'updated_at') <> btrim(p_fact ->> 'updated_at') or char_length(p_fact ->> 'updated_at') not between 1 and 80 then
+    raise exception 'operator fact payload is outside the allowed contract' using errcode = '22023';
+  end if;
+  begin
+    v_created_at := (p_fact ->> 'created_at')::timestamptz;
+    v_updated_at := (p_fact ->> 'updated_at')::timestamptz;
+  exception when others then
+    raise exception 'operator fact timestamps must be valid' using errcode = '22023';
+  end;
+  insert into public.deal_hunter_opportunity_facts (
+    id, opportunity_id, field, value, source, verified, actor, note, created_at, updated_at
+  ) values (
+    p_fact ->> 'id', p_fact ->> 'opportunity_id', p_fact ->> 'field', p_fact ->> 'value', p_fact ->> 'source', (p_fact ->> 'verified')::boolean, p_fact ->> 'actor', p_fact ->> 'note', v_created_at, v_updated_at
+  )
+  on conflict (id) do update set
+    field = excluded.field, value = excluded.value, source = excluded.source,
+    verified = excluded.verified, actor = excluded.actor, note = excluded.note,
+    updated_at = excluded.updated_at
+  returning * into v_fact;
+  return v_fact;
+end;
+$$;
+
+create or replace function public.insert_current_deal_hunter_opportunity_fact(p_fact jsonb)
+returns public.deal_hunter_opportunity_facts
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_fact public.deal_hunter_opportunity_facts;
+  v_created_at timestamptz;
+  v_updated_at timestamptz;
+begin
+  if not (jsonb_typeof(p_fact) = 'object')
+    or not (p_fact ?& array['id', 'opportunity_id', 'field', 'value', 'source', 'verified', 'actor', 'note', 'created_at', 'updated_at'])
+    or p_fact - array['id', 'opportunity_id', 'field', 'value', 'source', 'verified', 'actor', 'note', 'created_at', 'updated_at'] <> '{}'::jsonb
+    or jsonb_typeof(p_fact -> 'id') <> 'string'
+    or jsonb_typeof(p_fact -> 'opportunity_id') <> 'string'
+    or jsonb_typeof(p_fact -> 'field') <> 'string'
+    or jsonb_typeof(p_fact -> 'value') <> 'string'
+    or jsonb_typeof(p_fact -> 'source') <> 'string'
+    or not (jsonb_typeof(p_fact -> 'verified') = 'boolean')
+    or jsonb_typeof(p_fact -> 'actor') <> 'string'
+    or jsonb_typeof(p_fact -> 'note') not in ('string', 'null')
+    or jsonb_typeof(p_fact -> 'created_at') <> 'string'
+    or jsonb_typeof(p_fact -> 'updated_at') <> 'string' then
+    raise exception 'invalid operator fact payload' using errcode = '22023';
+  end if;
+  if (p_fact ->> 'id') <> btrim(p_fact ->> 'id') or char_length(p_fact ->> 'id') not between 1 and 240
+    or (p_fact ->> 'opportunity_id') <> btrim(p_fact ->> 'opportunity_id') or char_length(p_fact ->> 'opportunity_id') not between 1 and 200
+    or (p_fact ->> 'field') not in ('seller_name', 'seller_email', 'seller_phone', 'broker_name', 'broker_company', 'broker_email', 'broker_phone', 'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes')
+    or (p_fact ->> 'value') <> btrim(p_fact ->> 'value') or char_length(p_fact ->> 'value') not between 1 and 4000
+    or (p_fact ->> 'source') <> 'operator'
+    or (p_fact ->> 'actor') <> btrim(p_fact ->> 'actor') or char_length(p_fact ->> 'actor') not between 1 and 200
+    or ((p_fact ->> 'note') is not null and ((p_fact ->> 'note') <> btrim(p_fact ->> 'note') or char_length(p_fact ->> 'note') not between 1 and 4000))
+    or (p_fact ->> 'created_at') <> btrim(p_fact ->> 'created_at') or char_length(p_fact ->> 'created_at') not between 1 and 80
+    or (p_fact ->> 'updated_at') <> btrim(p_fact ->> 'updated_at') or char_length(p_fact ->> 'updated_at') not between 1 and 80 then
+    raise exception 'operator fact payload is outside the allowed contract' using errcode = '22023';
+  end if;
+  begin
+    v_created_at := (p_fact ->> 'created_at')::timestamptz;
+    v_updated_at := (p_fact ->> 'updated_at')::timestamptz;
+  exception when others then
+    raise exception 'operator fact timestamps must be valid' using errcode = '22023';
+  end;
+  perform 1 from public.deal_hunter_opportunities where opportunity_id = p_fact ->> 'opportunity_id' and status = 'active' for update;
+  if not found then raise exception 'current canonical opportunity is unavailable' using errcode = 'P0002'; end if;
+  insert into public.deal_hunter_opportunity_facts (id, opportunity_id, field, value, source, verified, actor, note, created_at, updated_at)
+  values (p_fact ->> 'id', p_fact ->> 'opportunity_id', p_fact ->> 'field', p_fact ->> 'value', p_fact ->> 'source', (p_fact ->> 'verified')::boolean, p_fact ->> 'actor', p_fact ->> 'note', v_created_at, v_updated_at)
+  returning * into v_fact;
+  return v_fact;
+end;
+$$;
+
+revoke all privileges on function public.insert_current_deal_hunter_opportunity_fact(jsonb) from public, anon, authenticated;
+grant execute on function public.insert_current_deal_hunter_opportunity_fact(jsonb) to service_role;
+
+revoke all privileges on function public.upsert_deal_hunter_opportunity_fact(jsonb) from public, anon, authenticated;
+grant execute on function public.upsert_deal_hunter_opportunity_fact(jsonb) to service_role;
+
+create or replace function public.upsert_deal_hunter_opportunity_source_observation(
+  p_id text, p_opportunity_id text, p_source_id text, p_source_name text, p_source_record_id text,
+  p_field text, p_value text, p_observed_at timestamptz, p_created_at timestamptz, p_updated_at timestamptz
+)
+returns public.deal_hunter_opportunity_source_observations
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_observation public.deal_hunter_opportunity_source_observations;
+begin
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(p_source_id)::text,
+      0
+    )
+  );
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(p_opportunity_id, p_source_id)::text,
+      0
+    )
+  );
+  insert into public.deal_hunter_opportunity_source_observations (
+    id, opportunity_id, source_id, source_name, source_record_id, field, value,
+    observed_at, created_at, updated_at
+  ) values (
+    p_id, p_opportunity_id, p_source_id, p_source_name, p_source_record_id, p_field, p_value,
+    p_observed_at, p_created_at, p_updated_at
+  )
+  on conflict (opportunity_id, source_id, source_record_id, field) do update set
+    source_name = excluded.source_name, value = excluded.value, observed_at = excluded.observed_at,
+    updated_at = excluded.updated_at
+  returning * into v_observation;
+  return v_observation;
+end;
+$$;
+
+revoke all privileges on function public.upsert_deal_hunter_opportunity_source_observation(
+  text, text, text, text, text, text, text, timestamptz, timestamptz, timestamptz
+) from public, anon, authenticated;
+grant execute on function public.upsert_deal_hunter_opportunity_source_observation(
+  text, text, text, text, text, text, text, timestamptz, timestamptz, timestamptz
+) to service_role;
+
+create or replace function public.replace_deal_hunter_opportunity_source_observation_snapshot(
+  p_opportunity_id text,
+  p_source_id text,
+  p_source_name text,
+  p_source_record_id text,
+  p_observations jsonb
+)
+returns setof public.deal_hunter_opportunity_source_observations
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if jsonb_typeof(p_observations) <> 'array' then
+    raise exception 'source observation snapshot must be a JSON array';
+  end if;
+
+  if exists (
+    select 1
+    from jsonb_to_recordset(p_observations) as incoming(
+      id text, opportunity_id text, source_id text, source_name text, source_record_id text,
+      field text, value text, observed_at timestamptz, created_at timestamptz, updated_at timestamptz
+    )
+    where incoming.opportunity_id is distinct from p_opportunity_id
+      or incoming.source_id is distinct from p_source_id
+      or incoming.source_name is distinct from p_source_name
+      or incoming.source_record_id is distinct from p_source_record_id
+  ) then
+    raise exception 'source observation snapshot rows must share one source record identity';
+  end if;
+
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(p_source_id)::text,
+      0
+    )
+  );
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(p_opportunity_id, p_source_id)::text,
+      0
+    )
+  );
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(p_opportunity_id, p_source_id, p_source_record_id)::text,
+      0
+    )
+  );
+
+  delete from public.deal_hunter_opportunity_source_observations as stored
+  where stored.opportunity_id = p_opportunity_id
+    and stored.source_id = p_source_id
+    and stored.source_record_id = p_source_record_id
+    and not exists (
+      select 1
+      from jsonb_to_recordset(p_observations) as incoming(field text)
+      where incoming.field = stored.field
+    );
+
+  insert into public.deal_hunter_opportunity_source_observations (
+    id, opportunity_id, source_id, source_name, source_record_id, field, value,
+    observed_at, created_at, updated_at
+  )
+  select
+    incoming.id, incoming.opportunity_id, incoming.source_id, incoming.source_name, incoming.source_record_id,
+    incoming.field, incoming.value, incoming.observed_at, incoming.created_at, incoming.updated_at
+  from jsonb_to_recordset(p_observations) as incoming(
+    id text, opportunity_id text, source_id text, source_name text, source_record_id text,
+    field text, value text, observed_at timestamptz, created_at timestamptz, updated_at timestamptz
+  )
+  on conflict (opportunity_id, source_id, source_record_id, field) do update set
+    source_name = excluded.source_name,
+    value = excluded.value,
+    observed_at = excluded.observed_at,
+    updated_at = excluded.updated_at;
+
+  return query
+  select *
+  from public.deal_hunter_opportunity_source_observations
+  where opportunity_id = p_opportunity_id
+    and source_id = p_source_id
+    and source_record_id = p_source_record_id
+  order by observed_at desc, id asc;
+end;
+$$;
+
+revoke all privileges on function public.replace_deal_hunter_opportunity_source_observation_snapshot(
+  text, text, text, text, jsonb
+) from public, anon, authenticated;
+grant execute on function public.replace_deal_hunter_opportunity_source_observation_snapshot(
+  text, text, text, text, jsonb
+) to service_role;
+
+
+create or replace function public.replace_deal_hunter_source_snapshot_internal(
+  p_source_id text,
+  p_source_name text,
+  p_records jsonb
+)
+returns setof public.deal_hunter_opportunity_source_observations
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_record_count integer;
+begin
+  if p_source_id is null or p_source_id <> btrim(p_source_id) or char_length(p_source_id) not between 1 and 160
+    or p_source_name is null or p_source_name <> btrim(p_source_name) or char_length(p_source_name) not between 1 and 220 then
+    raise exception 'complete source snapshot identity is outside the allowed contract' using errcode = '22023';
+  end if;
+  if pg_catalog.jsonb_typeof(p_records) <> 'array' then
+    raise exception 'complete source snapshot records must be a JSON array' using errcode = '22023';
+  end if;
+  v_record_count := pg_catalog.jsonb_array_length(p_records);
+  if v_record_count not between 1 and 10000 then
+    raise exception 'complete source snapshot must contain between 1 and 10000 records' using errcode = '22023';
+  end if;
+  if exists (
+    select 1
+    from pg_catalog.jsonb_array_elements(p_records) as record(value)
+    where pg_catalog.jsonb_typeof(record.value) <> 'object'
+      or not (record.value ?& array['opportunity_id', 'source_id', 'source_name', 'source_record_id', 'observations'])
+      or record.value - array['opportunity_id', 'source_id', 'source_name', 'source_record_id', 'observations'] <> '{}'::jsonb
+      or pg_catalog.jsonb_typeof(record.value -> 'opportunity_id') <> 'string'
+      or pg_catalog.jsonb_typeof(record.value -> 'source_id') <> 'string'
+      or pg_catalog.jsonb_typeof(record.value -> 'source_name') <> 'string'
+      or pg_catalog.jsonb_typeof(record.value -> 'source_record_id') <> 'string'
+      or pg_catalog.jsonb_typeof(record.value -> 'observations') <> 'array'
+      or (record.value ->> 'opportunity_id') <> btrim(record.value ->> 'opportunity_id')
+      or char_length(record.value ->> 'opportunity_id') not between 1 and 200
+      or (record.value ->> 'source_id') is distinct from p_source_id
+      or (record.value ->> 'source_name') is distinct from p_source_name
+      or (record.value ->> 'source_record_id') <> btrim(record.value ->> 'source_record_id')
+      or char_length(record.value ->> 'source_record_id') not between 1 and 200
+      or pg_catalog.jsonb_array_length(record.value -> 'observations') > 51
+  ) then
+    raise exception 'complete source snapshot records are outside the allowed contract' using errcode = '22023';
+  end if;
+  if exists (
+    select 1
+    from pg_catalog.jsonb_array_elements(p_records) as record(value)
+    group by record.value ->> 'source_record_id'
+    having count(*) > 1
+  ) then
+    raise exception 'complete source snapshot record identities must be unique within the source' using errcode = '22023';
+  end if;
+  if exists (
+    select 1
+    from pg_catalog.jsonb_array_elements(p_records) as record(value)
+    cross join lateral pg_catalog.jsonb_array_elements(record.value -> 'observations') as observation(value)
+    where pg_catalog.jsonb_typeof(observation.value) <> 'object'
+      or not (observation.value ?& array['id', 'opportunity_id', 'source_id', 'source_name', 'source_record_id', 'field', 'value', 'observed_at', 'created_at', 'updated_at'])
+      or observation.value - array['id', 'opportunity_id', 'source_id', 'source_name', 'source_record_id', 'field', 'value', 'observed_at', 'created_at', 'updated_at'] <> '{}'::jsonb
+      or pg_catalog.jsonb_typeof(observation.value -> 'id') <> 'string'
+      or pg_catalog.jsonb_typeof(observation.value -> 'opportunity_id') <> 'string'
+      or pg_catalog.jsonb_typeof(observation.value -> 'source_id') <> 'string'
+      or pg_catalog.jsonb_typeof(observation.value -> 'source_name') <> 'string'
+      or pg_catalog.jsonb_typeof(observation.value -> 'source_record_id') <> 'string'
+      or pg_catalog.jsonb_typeof(observation.value -> 'field') <> 'string'
+      or pg_catalog.jsonb_typeof(observation.value -> 'value') <> 'string'
+      or pg_catalog.jsonb_typeof(observation.value -> 'observed_at') <> 'string'
+      or pg_catalog.jsonb_typeof(observation.value -> 'created_at') <> 'string'
+      or pg_catalog.jsonb_typeof(observation.value -> 'updated_at') <> 'string'
+      or (observation.value ->> 'opportunity_id') is distinct from (record.value ->> 'opportunity_id')
+      or (observation.value ->> 'source_id') is distinct from p_source_id
+      or (observation.value ->> 'source_name') is distinct from p_source_name
+      or (observation.value ->> 'source_record_id') is distinct from (record.value ->> 'source_record_id')
+      or (observation.value ->> 'id') <> btrim(observation.value ->> 'id')
+      or char_length(observation.value ->> 'id') not between 1 and 240
+      or (observation.value ->> 'field') not in (
+        'name', 'business_name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
+        'annual_profit', 'annual_revenue', 'asking_price', 'profit_multiple', 'net_margin', 'years_established',
+        'remote_flag', 'franchise_flag', 'five_years_flag', 'broker_name', 'broker_company', 'broker_contact', 'broker_email',
+        'broker_phone', 'company', 'role', 'seller_name', 'seller_email', 'seller_phone', 'reason_for_sale', 'real_estate_included',
+        'seller_financing', 'management_structure', 'customer_concentration', 'operator_contact_notes', 'listing_url',
+        'listing_source', 'listing_id', 'deal_key', 'source_identity', 'date_added', 'last_updated',
+        'business_website', 'prospectus_url', 'ttm_revenue', 'ttm_ebitda', 'ebitda_multiple', 'business_age',
+        'sba_eligible', 'lead_type'
+      )
+      or (observation.value ->> 'value') <> btrim(observation.value ->> 'value')
+      or char_length(observation.value ->> 'value') not between 1 and 5000
+      or (observation.value ->> 'observed_at') <> btrim(observation.value ->> 'observed_at')
+      or char_length(observation.value ->> 'observed_at') not between 1 and 80
+      or (observation.value ->> 'created_at') <> btrim(observation.value ->> 'created_at')
+      or char_length(observation.value ->> 'created_at') not between 1 and 80
+      or (observation.value ->> 'updated_at') <> btrim(observation.value ->> 'updated_at')
+      or char_length(observation.value ->> 'updated_at') not between 1 and 80
+  ) then
+    raise exception 'complete source snapshot observations are outside the allowed contract' using errcode = '22023';
+  end if;
+  if exists (
+    select 1
+    from pg_catalog.jsonb_array_elements(p_records) as record(value)
+    cross join lateral pg_catalog.jsonb_array_elements(record.value -> 'observations') as observation(value)
+    group by record.value ->> 'source_record_id', observation.value ->> 'field'
+    having count(*) > 1
+  ) then
+    raise exception 'complete source snapshot observation fields must be unique per source record' using errcode = '22023';
+  end if;
+  begin
+    perform
+      (observation.value ->> 'observed_at')::timestamptz,
+      (observation.value ->> 'created_at')::timestamptz,
+      (observation.value ->> 'updated_at')::timestamptz
+    from pg_catalog.jsonb_array_elements(p_records) as record(value)
+    cross join lateral pg_catalog.jsonb_array_elements(record.value -> 'observations') as observation(value);
+  exception when others then
+    raise exception 'complete source snapshot timestamps must be valid' using errcode = '22023';
+  end;
+
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(p_source_id)::text,
+      0
+    )
+  );
+
+  with incoming as materialized (
+    select
+      record.value ->> 'opportunity_id' as opportunity_id,
+      record.value ->> 'source_record_id' as source_record_id,
+      observation.value ->> 'field' as field
+    from pg_catalog.jsonb_array_elements(p_records) as record(value)
+    cross join lateral pg_catalog.jsonb_array_elements(record.value -> 'observations') as observation(value)
+  )
+  delete from public.deal_hunter_opportunity_source_observations as stored
+  where stored.source_id = p_source_id
+    and not exists (
+      select 1
+      from incoming
+      where incoming.opportunity_id = stored.opportunity_id
+        and incoming.source_record_id = stored.source_record_id
+        and incoming.field = stored.field
+    );
+
+  insert into public.deal_hunter_opportunity_source_observations (
+    id, opportunity_id, source_id, source_name, source_record_id, field, value,
+    observed_at, created_at, updated_at
+  )
+  select
+    observation.value ->> 'id',
+    record.value ->> 'opportunity_id',
+    p_source_id,
+    p_source_name,
+    record.value ->> 'source_record_id',
+    observation.value ->> 'field',
+    observation.value ->> 'value',
+    (observation.value ->> 'observed_at')::timestamptz,
+    (observation.value ->> 'created_at')::timestamptz,
+    (observation.value ->> 'updated_at')::timestamptz
+  from pg_catalog.jsonb_array_elements(p_records) as record(value)
+  cross join lateral pg_catalog.jsonb_array_elements(record.value -> 'observations') as observation(value)
+  on conflict (opportunity_id, source_id, source_record_id, field) do update set
+    source_name = excluded.source_name,
+    value = excluded.value,
+    observed_at = excluded.observed_at,
+    updated_at = excluded.updated_at;
+
+  return query
+  select *
+  from public.deal_hunter_opportunity_source_observations
+  where source_id = p_source_id
+  order by observed_at desc, id asc;
+end;
+$$;
+
+revoke all privileges on function public.replace_deal_hunter_source_snapshot_internal(
+  text, text, jsonb
+) from public, anon, authenticated, service_role;
+
+-- The RPC validates the serializable Sheet policy and exact payload
+-- self-consistency; it cannot itself attest a remote fetch was complete.
+-- The collector establishes that fact before minting its in-process one-shot
+-- admission capability. Durable external attestation would require an
+-- ingestion ledger or provider-owned fetch outside this Phase 1 boundary.
+create or replace function public.replace_admitted_complete_google_sheet_source_snapshot(
+  p_admission jsonb,
+  p_records jsonb
+)
+returns setof public.deal_hunter_opportunity_source_observations
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_source_id text;
+  v_source_name text;
+  v_source_slot integer;
+  v_record_count integer;
+  v_observation_count integer;
+  v_actual_observation_count integer;
+  v_snapshot_digest text;
+  v_record_digest text;
+  v_actual_digest text;
+begin
+  if pg_catalog.jsonb_typeof(p_admission) <> 'object'
+    or p_admission - array[
+      'policy', 'source_id', 'source_name', 'source_slot', 'record_count',
+      'observation_count', 'source_record_ids', 'snapshot_digest'
+    ] <> '{}'::jsonb
+    or not (p_admission ?& array[
+      'policy', 'source_id', 'source_name', 'source_slot', 'record_count',
+      'observation_count', 'source_record_ids', 'snapshot_digest'
+    ])
+    or pg_catalog.jsonb_typeof(p_admission -> 'policy') <> 'string'
+    or pg_catalog.jsonb_typeof(p_admission -> 'source_id') <> 'string'
+    or pg_catalog.jsonb_typeof(p_admission -> 'source_name') <> 'string'
+    or pg_catalog.jsonb_typeof(p_admission -> 'source_slot') <> 'number'
+    or pg_catalog.jsonb_typeof(p_admission -> 'record_count') <> 'number'
+    or pg_catalog.jsonb_typeof(p_admission -> 'observation_count') <> 'number'
+    or pg_catalog.jsonb_typeof(p_admission -> 'source_record_ids') <> 'array'
+    or pg_catalog.jsonb_typeof(p_admission -> 'snapshot_digest') <> 'string'
+  then
+    raise exception 'complete Google Sheet source snapshot admission is outside the allowed contract' using errcode = '22023';
+  end if;
+  if p_admission ->> 'policy' <> 'complete-google-sheet-source-snapshot-v1'
+    or p_admission ->> 'source_slot' !~ '^(0|[1-9][0-9]{0,3})$'
+    or p_admission ->> 'record_count' !~ '^[1-9][0-9]*$'
+    or p_admission ->> 'observation_count' !~ '^[1-9][0-9]*$'
+    or p_admission ->> 'snapshot_digest' !~ '^[a-f0-9]{32}$'
+  then
+    raise exception 'complete Google Sheet source snapshot admission is malformed' using errcode = '22023';
+  end if;
+
+  v_source_id := p_admission ->> 'source_id';
+  v_source_name := p_admission ->> 'source_name';
+  v_source_slot := (p_admission ->> 'source_slot')::integer;
+  v_record_count := (p_admission ->> 'record_count')::integer;
+  v_observation_count := (p_admission ->> 'observation_count')::integer;
+  v_snapshot_digest := p_admission ->> 'snapshot_digest';
+  if v_source_id <> btrim(v_source_id) or char_length(v_source_id) not between 1 and 160
+    or v_source_name <> btrim(v_source_name) or char_length(v_source_name) not between 1 and 220
+    or v_source_slot not between 0 and 9999
+    or v_source_id !~ '^sheet-[0-9]+$'
+    or v_source_id <> ('sheet-' || v_source_slot::text)
+    or v_record_count not between 1 and 10000
+    or v_observation_count not between 1 and 510000
+    or pg_catalog.jsonb_array_length(p_admission -> 'source_record_ids') <> v_record_count
+  then
+    raise exception 'complete Google Sheet source snapshot admission is not an admitted Sheet scope' using errcode = '22023';
+  end if;
+  if exists (
+    select 1
+    from pg_catalog.jsonb_array_elements(p_admission -> 'source_record_ids') as identity(value)
+    where pg_catalog.jsonb_typeof(identity.value) <> 'string'
+      or (identity.value #>> '{}') <> btrim(identity.value #>> '{}')
+      or char_length(identity.value #>> '{}') not between 1 and 200
+  )
+    or exists (
+      select 1
+      from pg_catalog.jsonb_array_elements(p_admission -> 'source_record_ids') as identity(value)
+      group by identity.value #>> '{}'
+      having count(*) > 1
+    )
+  then
+    raise exception 'complete Google Sheet source snapshot admission identities are outside the allowed contract' using errcode = '22023';
+  end if;
+
+  if pg_catalog.jsonb_typeof(p_records) <> 'array'
+    or pg_catalog.jsonb_array_length(p_records) <> v_record_count
+  then
+    raise exception 'complete Google Sheet source snapshot records do not match the admission' using errcode = '22023';
+  end if;
+  if exists (
+    select 1
+    from pg_catalog.jsonb_array_elements(p_records) as record(value)
+    where pg_catalog.jsonb_typeof(record.value) <> 'object'
+      or not (record.value ?& array['opportunity_id', 'source_id', 'source_name', 'source_record_id', 'observations'])
+      or record.value - array['opportunity_id', 'source_id', 'source_name', 'source_record_id', 'observations'] <> '{}'::jsonb
+      or pg_catalog.jsonb_typeof(record.value -> 'opportunity_id') <> 'string'
+      or pg_catalog.jsonb_typeof(record.value -> 'source_id') <> 'string'
+      or pg_catalog.jsonb_typeof(record.value -> 'source_name') <> 'string'
+      or pg_catalog.jsonb_typeof(record.value -> 'source_record_id') <> 'string'
+      or pg_catalog.jsonb_typeof(record.value -> 'observations') <> 'array'
+      or (record.value ->> 'opportunity_id') <> btrim(record.value ->> 'opportunity_id')
+      or char_length(record.value ->> 'opportunity_id') not between 1 and 200
+      or (record.value ->> 'source_id') is distinct from v_source_id
+      or (record.value ->> 'source_name') is distinct from v_source_name
+      or (record.value ->> 'source_record_id') <> btrim(record.value ->> 'source_record_id')
+      or char_length(record.value ->> 'source_record_id') not between 1 and 200
+      or pg_catalog.jsonb_array_length(record.value -> 'observations') not between 1 and 51
+  ) then
+    raise exception 'complete Google Sheet source snapshot records are outside the allowed contract' using errcode = '22023';
+  end if;
+  if exists (
+    select 1
+    from pg_catalog.jsonb_array_elements(p_records) as record(value)
+    group by record.value ->> 'source_record_id'
+    having count(*) > 1
+  )
+    or exists (
+      select 1
+      from pg_catalog.jsonb_array_elements(p_records) as record(value)
+      where not exists (
+        select 1
+        from pg_catalog.jsonb_array_elements(p_admission -> 'source_record_ids') as identity(value)
+        where identity.value #>> '{}' = record.value ->> 'source_record_id'
+      )
+    )
+    or exists (
+      select 1
+      from pg_catalog.jsonb_array_elements(p_admission -> 'source_record_ids') as identity(value)
+      where not exists (
+        select 1
+        from pg_catalog.jsonb_array_elements(p_records) as record(value)
+        where record.value ->> 'source_record_id' = identity.value #>> '{}'
+      )
+    )
+  then
+    raise exception 'complete Google Sheet source snapshot records do not match the admitted identity set' using errcode = '22023';
+  end if;
+  select count(*)
+  into v_actual_observation_count
+  from pg_catalog.jsonb_array_elements(p_records) as record(value)
+  cross join lateral pg_catalog.jsonb_array_elements(record.value -> 'observations') as observation(value);
+  if v_actual_observation_count <> v_observation_count then
+    raise exception 'complete Google Sheet source snapshot observation count does not match the admission' using errcode = '22023';
+  end if;
+
+  select coalesce(
+    pg_catalog.string_agg(
+      pg_catalog.concat_ws(
+        '|',
+        'r',
+        pg_catalog.encode(pg_catalog.convert_to(record.value ->> 'opportunity_id', 'UTF8'), 'hex'),
+        pg_catalog.encode(pg_catalog.convert_to(record.value ->> 'source_id', 'UTF8'), 'hex'),
+        pg_catalog.encode(pg_catalog.convert_to(record.value ->> 'source_name', 'UTF8'), 'hex'),
+        pg_catalog.encode(pg_catalog.convert_to(record.value ->> 'source_record_id', 'UTF8'), 'hex'),
+        pg_catalog.jsonb_array_length(record.value -> 'observations')::text,
+        (
+          select pg_catalog.string_agg(
+            pg_catalog.concat_ws(
+              '|',
+              'o',
+              pg_catalog.encode(pg_catalog.convert_to(observation.value ->> 'id', 'UTF8'), 'hex'),
+              pg_catalog.encode(pg_catalog.convert_to(observation.value ->> 'opportunity_id', 'UTF8'), 'hex'),
+              pg_catalog.encode(pg_catalog.convert_to(observation.value ->> 'source_id', 'UTF8'), 'hex'),
+              pg_catalog.encode(pg_catalog.convert_to(observation.value ->> 'source_name', 'UTF8'), 'hex'),
+              pg_catalog.encode(pg_catalog.convert_to(observation.value ->> 'source_record_id', 'UTF8'), 'hex'),
+              pg_catalog.encode(pg_catalog.convert_to(observation.value ->> 'field', 'UTF8'), 'hex'),
+              pg_catalog.encode(pg_catalog.convert_to(observation.value ->> 'value', 'UTF8'), 'hex'),
+              pg_catalog.encode(pg_catalog.convert_to(observation.value ->> 'observed_at', 'UTF8'), 'hex'),
+              pg_catalog.encode(pg_catalog.convert_to(observation.value ->> 'created_at', 'UTF8'), 'hex'),
+              pg_catalog.encode(pg_catalog.convert_to(observation.value ->> 'updated_at', 'UTF8'), 'hex')
+            ),
+            '|' order by observation.ordinality
+          )
+          from pg_catalog.jsonb_array_elements(record.value -> 'observations') with ordinality as observation(value, ordinality)
+        )
+      ),
+      '|' order by record.ordinality
+    ),
+    ''
+  )
+  into v_record_digest
+  from pg_catalog.jsonb_array_elements(p_records) with ordinality as record(value, ordinality);
+  v_actual_digest := pg_catalog.md5(pg_catalog.concat_ws(
+    '|',
+    'complete-google-sheet-source-snapshot-v1',
+    pg_catalog.encode(pg_catalog.convert_to(v_source_id, 'UTF8'), 'hex'),
+    pg_catalog.encode(pg_catalog.convert_to(v_source_name, 'UTF8'), 'hex'),
+    v_source_slot::text,
+    v_record_count::text,
+    v_observation_count::text,
+    v_record_digest
+  ));
+  if v_actual_digest <> v_snapshot_digest then
+    raise exception 'complete Google Sheet source snapshot digest does not match the admission' using errcode = '22023';
+  end if;
+
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(v_source_id)::text,
+      0
+    )
+  );
+  return query
+  select *
+  from public.replace_deal_hunter_source_snapshot_internal(v_source_id, v_source_name, p_records);
+end;
+$$;
+
+revoke all privileges on function public.replace_admitted_complete_google_sheet_source_snapshot(
+  jsonb, jsonb
+) from public, anon, authenticated;
+grant execute on function public.replace_admitted_complete_google_sheet_source_snapshot(
+  jsonb, jsonb
+) to service_role;
+
 alter table public.deal_hunter_opportunities enable row level security;
+alter table public.deal_hunter_opportunity_facts enable row level security;
+alter table public.deal_hunter_opportunity_source_observations enable row level security;
 alter table public.deal_hunter_opportunity_aliases enable row level security;
 alter table public.deal_hunter_identity_exceptions enable row level security;
 alter table public.deal_hunter_cim_opportunity_claims enable row level security;
@@ -4171,6 +4892,8 @@ alter table public.deal_hunter_cim_stage2_runs enable row level security;
 alter table public.deal_hunter_cim_stage2_decisions enable row level security;
 
 revoke all privileges on table public.deal_hunter_opportunities from public, anon, authenticated;
+revoke all privileges on table public.deal_hunter_opportunity_facts from public, anon, authenticated;
+revoke all privileges on table public.deal_hunter_opportunity_source_observations from public, anon, authenticated;
 revoke all privileges on table public.deal_hunter_opportunity_aliases from public, anon, authenticated;
 revoke all privileges on table public.deal_hunter_identity_exceptions from public, anon, authenticated;
 revoke all privileges on table public.deal_hunter_cim_opportunity_claims from public, anon, authenticated;
@@ -4191,6 +4914,8 @@ revoke all privileges on function public.create_cim_stage2_activation(jsonb) fro
 revoke all privileges on function public.claim_cim_stage2_decision(uuid, text, timestamptz, uuid) from public, anon, authenticated;
 
 grant all privileges on table public.deal_hunter_opportunities to service_role;
+grant all privileges on table public.deal_hunter_opportunity_facts to service_role;
+grant all privileges on table public.deal_hunter_opportunity_source_observations to service_role;
 grant all privileges on table public.deal_hunter_opportunity_aliases to service_role;
 grant all privileges on table public.deal_hunter_identity_exceptions to service_role;
 grant all privileges on table public.deal_hunter_cim_opportunity_claims to service_role;
@@ -4448,6 +5173,11 @@ create index if not exists idx_deal_hunter_scores_current_queue
   on public.deal_hunter_opportunity_scores(current_triage_eligible, should_remove, fit_score desc, opportunity_id);
 create index if not exists idx_deal_hunter_scores_priority
   on public.deal_hunter_opportunity_scores(operator_priority, fit_score desc, opportunity_id);
+create index if not exists idx_deal_hunter_scores_acquisition_priority
+  on public.deal_hunter_opportunity_scores(
+    current_triage_eligible, should_remove, operator_priority, high_fit,
+    fit_score desc, confidence, scored_at desc, opportunity_id
+  );
 create index if not exists idx_deal_hunter_scores_fingerprint
   on public.deal_hunter_opportunity_scores(score_fingerprint);
 create index if not exists idx_deal_hunter_score_evidence_opportunity
@@ -4611,8 +5341,41 @@ security definer
 set search_path = public
 as $$
   with candidates as (
-    select scores.*, disposition.deal_key as dismissed_deal_key,
-           disposition.reason as dismissed_reason, disposition.dismissed_at as dismissed_at
+    select
+           scores.opportunity_id, scores.deal_key, scores.name, scores.state, scores.listing_url,
+           scores.fit_score, scores.score_status, scores.confidence, scores.completeness_score,
+           scores.contradiction_count, scores.missing_evidence_count, scores.should_remove,
+           scores.high_fit, scores.score_fingerprint, scores.semantic_digest, scores.scored_at,
+           scores.rules_version, scores.operator_priority, scores.reviewed_at,
+           scores.reviewed_by, scores.reviewed_fingerprint, scores.reviewed_semantic_digest,
+           disposition.deal_key as dismissed_deal_key,
+           disposition.reason as dismissed_reason, disposition.dismissed_at as dismissed_at,
+           scores.summary->'strengths'->>0 as top_strength,
+           scores.summary->'concerns'->>0 as top_concern,
+           (select value from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id and source.field = 'industry'
+             order by source.observed_at desc, source.id asc limit 1) as industry,
+           (select value from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id and source.field = 'location'
+             order by source.observed_at desc, source.id asc limit 1) as location,
+           (select value from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id and source.field = 'annual_profit'
+             order by source.observed_at desc, source.id asc limit 1) as annual_profit,
+           (select value from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id and source.field = 'annual_revenue'
+             order by source.observed_at desc, source.id asc limit 1) as annual_revenue,
+           (select value from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id and source.field = 'asking_price'
+             order by source.observed_at desc, source.id asc limit 1) as asking_price,
+           (select value from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id and source.field = 'profit_multiple'
+             order by source.observed_at desc, source.id asc limit 1) as profit_multiple,
+           coalesce((select max(observed_at) from public.deal_hunter_opportunity_source_observations as source
+             where source.opportunity_id = scores.opportunity_id), scores.scored_at) as observation_freshness,
+           coalesce((select submission.status from public.contact_submissions as submission
+             where submission.id = opportunity.primary_submission_id limit 1), 'not-started') as crm_status,
+           coalesce((select cim.status from public.deal_hunter_cim_requests as cim
+             where cim.opportunity_id = scores.opportunity_id order by cim.updated_at desc, cim.id desc limit 1), 'not-requested') as cim_status
     from public.deal_hunter_opportunity_scores as scores
     join public.deal_hunter_opportunities as opportunity
       on opportunity.opportunity_id = scores.opportunity_id
@@ -4644,41 +5407,69 @@ as $$
       and (coalesce(p_confidence, '') = '' or confidence = p_confidence)
       and (coalesce(p_priority, '') = '' or operator_priority = p_priority)
       and (coalesce(p_state, '') = '' or upper(coalesce(state, '')) = upper(p_state))
-  ), ordered as (
-    select * from filtered
-    order by
-      -- One sort key per direction; opportunity_id is always the final key so
-      -- pagination stays stable when rows tie.
+  ), ranked as (
+    select filtered.*, row_number() over (order by
+      case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority'
+        then case when operator_priority in ('urgent', 'high') then 1 else 0 end end desc,
+      case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority'
+        then case when high_fit and (reviewed_at is null or (case
+          when reviewed_semantic_digest is not null then reviewed_semantic_digest <> coalesce(semantic_digest, '')
+          else reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint
+        end)) then 1 else 0 end end desc,
+      case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority' then fit_score end desc nulls last,
+      case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority'
+        then case confidence when 'high' then 3 when 'medium' then 2 else 1 end end desc nulls last,
+      case when coalesce(p_sort, 'acquisition-priority') = 'acquisition-priority' then observation_freshness end desc nulls last,
       case when lower(coalesce(p_direction, 'desc')) = 'asc' then
         case coalesce(p_sort, 'fit-score')
           when 'confidence' then (case confidence when 'high' then 3 when 'medium' then 2 else 1 end)::numeric
           when 'completeness' then completeness_score::numeric
+          when 'fit-score' then fit_score::numeric
           when 'changed' then (case when reviewed_at is null then 1
             when reviewed_semantic_digest is not null then (case when reviewed_semantic_digest <> coalesce(semantic_digest, '') then 1 else 0 end)
             when reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint then 1 else 0 end)::numeric
-          else fit_score::numeric
         end
       end asc nulls last,
       case when lower(coalesce(p_direction, 'desc')) <> 'asc' then
         case coalesce(p_sort, 'fit-score')
           when 'confidence' then (case confidence when 'high' then 3 when 'medium' then 2 else 1 end)::numeric
           when 'completeness' then completeness_score::numeric
+          when 'fit-score' then fit_score::numeric
           when 'changed' then (case when reviewed_at is null then 1
             when reviewed_semantic_digest is not null then (case when reviewed_semantic_digest <> coalesce(semantic_digest, '') then 1 else 0 end)
             when reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint then 1 else 0 end)::numeric
-          else fit_score::numeric
         end
       end desc nulls last,
-      case confidence when 'high' then 3 when 'medium' then 2 else 1 end desc,
+      case when lower(coalesce(p_direction, 'desc')) = 'asc' then case coalesce(p_sort, 'fit-score') when 'scored-at' then scored_at end end asc nulls last,
+      case when lower(coalesce(p_direction, 'desc')) <> 'asc' then case coalesce(p_sort, 'fit-score') when 'scored-at' then scored_at end end desc nulls last,
+      case when lower(coalesce(p_direction, 'desc')) = 'asc' then case coalesce(p_sort, 'fit-score') when 'name' then lower(coalesce(name, '')) end end asc nulls last,
+      case when lower(coalesce(p_direction, 'desc')) <> 'asc' then case coalesce(p_sort, 'fit-score') when 'name' then lower(coalesce(name, '')) end end desc nulls last,
+      case when coalesce(p_sort, 'fit-score') <> 'acquisition-priority' then case confidence when 'high' then 3 when 'medium' then 2 else 1 end end desc,
       opportunity_id asc
-    -- Page size is clamped in SQL as well as in the application caller, so a
-    -- direct RPC invocation cannot request an unbounded page.
-    limit least(greatest(coalesce(p_page_size, 25), 1), 100)
-    offset greatest(0, (greatest(coalesce(p_page, 1), 1) - 1) * least(greatest(coalesce(p_page_size, 25), 1), 100))
+    ) as ordinal
+    from filtered
+  ), ordered as (
+    select * from ranked
+    where ordinal > greatest(0, (greatest(coalesce(p_page, 1), 1) - 1) * least(greatest(coalesce(p_page_size, 25), 1), 100))
+      and ordinal <= greatest(0, (greatest(coalesce(p_page, 1), 1) - 1) * least(greatest(coalesce(p_page_size, 25), 1), 100))
+        + least(greatest(coalesce(p_page_size, 25), 1), 100)
   )
   select jsonb_build_object(
     'total', (select count(*) from filtered),
-    'rows', coalesce((select jsonb_agg(to_jsonb(ordered)) from ordered), '[]'::jsonb)
+    'summary', (select jsonb_build_object(
+      'needsReview', count(*) filter (where dismissed_deal_key is null and should_remove = false
+        and (reviewed_at is null or (case when reviewed_semantic_digest is not null
+          then reviewed_semantic_digest <> coalesce(semantic_digest, '')
+          else reviewed_fingerprint is null or reviewed_fingerprint <> score_fingerprint end))),
+      'highPriority', count(*) filter (where dismissed_deal_key is null and should_remove = false
+        and (high_fit or operator_priority in ('urgent', 'high'))),
+      'watchlist', count(*) filter (where dismissed_deal_key is null and should_remove = false
+        and ((fit_score >= 60 and fit_score < 75) or operator_priority = 'watch')),
+      'lowConfidence', count(*) filter (where dismissed_deal_key is null and should_remove = false
+        and (confidence = 'low' or contradiction_count > 0)),
+      'currentOpportunities', count(*) filter (where dismissed_deal_key is null)
+    ) from candidates),
+    'rows', coalesce((select jsonb_agg((to_jsonb(ordered) - 'ordinal') order by ordinal) from ordered), '[]'::jsonb)
   );
 $$;
 
@@ -4770,6 +5561,229 @@ begin
 end;
 $$;
 
+create or replace function public.pass_deal_hunter_opportunity(p_command jsonb)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_opportunity public.deal_hunter_opportunities;
+  v_score public.deal_hunter_opportunity_scores;
+  v_disposition public.deal_hunter_dispositions;
+  v_submission public.contact_submissions;
+  v_now timestamptz := coalesce(nullif(p_command->>'occurred_at', '')::timestamptz, now());
+  v_actor text := coalesce(nullif(p_command->>'actor', ''), 'admin');
+  v_reason text := nullif(p_command->>'reason', '');
+  v_note text := nullif(p_command->>'note', '');
+  v_archived boolean := false;
+  v_archive_submission boolean := false;
+begin
+  if nullif(p_command->>'opportunity_id', '') is null
+    or v_reason is null
+    or nullif(p_command->>'disposition_id', '') is null
+    or nullif(p_command->>'archive_activity_id', '') is null
+    or nullif(p_command->>'triage_activity_id', '') is null then
+    raise exception 'Atomic opportunity Pass command is incomplete';
+  end if;
+
+  select * into v_opportunity
+  from public.deal_hunter_opportunities
+  where opportunity_id = p_command->>'opportunity_id'
+  for update;
+  if not found or v_opportunity.status <> 'active' then
+    return jsonb_build_object('applied', false, 'reason', 'not-current');
+  end if;
+
+  select * into v_score
+  from public.deal_hunter_opportunity_scores
+  where opportunity_id = v_opportunity.opportunity_id
+    and current_triage_eligible = true
+  for update;
+  if not found then
+    return jsonb_build_object('applied', false, 'reason', 'not-current');
+  end if;
+  if v_score.should_remove then
+    return jsonb_build_object('applied', false, 'reason', 'not-actionable');
+  end if;
+
+  select * into v_disposition
+  from public.deal_hunter_dispositions
+  where deal_key = v_score.deal_key
+  for update;
+  if found and v_disposition.disposition = 'dismissed' then
+    return jsonb_build_object(
+      'applied', false,
+      'reason', 'already-passed',
+      'disposition', to_jsonb(v_disposition),
+      'score', to_jsonb(v_score)
+    );
+  end if;
+
+  if v_opportunity.primary_submission_id is not null then
+    select * into v_submission
+    from public.contact_submissions
+    where id = v_opportunity.primary_submission_id
+    for update;
+    if not found then
+      return jsonb_build_object('applied', false, 'reason', 'linked-submission-missing');
+    end if;
+    v_archive_submission := v_submission.status <> 'archived';
+    v_archived := true;
+  end if;
+
+  if v_archive_submission and exists (
+    select 1
+    from public.deal_hunter_cim_requests as request
+    where request.submission_id = v_submission.id
+      and (
+        (request.status = 'pending' and request.updated_at > v_now - interval '10 minutes')
+        or (request.status = 'follow_up_pending' and request.updated_at > v_now - interval '30 minutes')
+      )
+  ) then
+    return jsonb_build_object('applied', false, 'reason', 'cim-send-in-progress');
+  end if;
+
+  if v_archive_submission then
+    update public.contact_submissions
+    set
+      updated_at = v_now,
+      status = 'archived',
+      status_updated_at = v_now,
+      follow_up_state = 'completed',
+      next_action_at = null,
+      archived_at = v_now,
+      archived_by = v_actor,
+      archive_reason = v_reason,
+      archive_note = v_note,
+      archive_communication_id = null,
+      metadata = coalesce(v_submission.metadata, '{}'::jsonb) || jsonb_build_object(
+        'acquisitionCommand', coalesce(v_submission.metadata->'acquisitionCommand', '{}'::jsonb) || jsonb_build_object(
+          'pipelineStage', 'passed',
+          'passReason', v_reason,
+          'fitFeedback', 'false-positive',
+          'updatedAt', v_now,
+          'updatedBy', v_actor
+        ),
+        'leadArchive', jsonb_build_object(
+          'previousStatus', v_submission.status,
+          'archivedAt', v_now,
+          'archivedBy', v_actor,
+          'reason', v_reason,
+          'communicationId', ''
+        )
+      )
+    where id = v_submission.id
+    returning * into v_submission;
+
+    update public.deal_hunter_cim_requests
+    set
+      request_state = case when request_state = 'responded' then request_state else 'stopped' end,
+      follow_up_state = case when request_state = 'responded' then 'completed' else 'stopped' end,
+      next_follow_up_at = null,
+      updated_at = v_now,
+      last_activity_at = v_now
+    where submission_id = v_submission.id;
+  end if;
+
+  insert into public.deal_hunter_dispositions as disposition (
+    id, deal_key, submission_id, communication_id, listing_url, deal_name,
+    created_at, updated_at, disposition, reason, note, dismissed_at,
+    dismissed_by, restored_at, restored_by, created_by, updated_by, metadata
+  ) values (
+    (p_command->>'disposition_id')::uuid,
+    v_score.deal_key,
+    v_opportunity.primary_submission_id,
+    null,
+    nullif(v_score.listing_url, ''),
+    coalesce(nullif(v_score.name, ''), nullif(v_opportunity.canonical_name, '')),
+    v_now, v_now, 'dismissed', v_reason, v_note, v_now,
+    v_actor, null, null, v_actor, v_actor, '{}'::jsonb
+  )
+  on conflict (deal_key) do update set
+    submission_id = excluded.submission_id,
+    communication_id = excluded.communication_id,
+    listing_url = coalesce(excluded.listing_url, disposition.listing_url),
+    deal_name = coalesce(excluded.deal_name, disposition.deal_name),
+    updated_at = excluded.updated_at,
+    disposition = excluded.disposition,
+    reason = excluded.reason,
+    note = excluded.note,
+    dismissed_at = coalesce(excluded.dismissed_at, disposition.dismissed_at),
+    dismissed_by = coalesce(excluded.dismissed_by, disposition.dismissed_by),
+    restored_at = excluded.restored_at,
+    restored_by = excluded.restored_by,
+    updated_by = excluded.updated_by,
+    metadata = excluded.metadata
+  returning * into v_disposition;
+
+  update public.deal_hunter_opportunity_scores
+  set
+    reviewed_at = v_now,
+    reviewed_by = v_actor,
+    reviewed_fingerprint = score_fingerprint,
+    reviewed_semantic_digest = semantic_digest,
+    operator_updated_at = v_now
+  where opportunity_id = v_opportunity.opportunity_id
+    and current_triage_eligible = true
+  returning * into v_score;
+  if not found then
+    raise exception 'Current opportunity score changed during Pass';
+  end if;
+
+  if v_opportunity.primary_submission_id is not null then
+    if v_archive_submission then
+      insert into public.crm_activity_events (
+        id, submission_id, opportunity_id, created_at, actor, role, event_type, summary, metadata
+      ) values (
+        (p_command->>'archive_activity_id')::uuid,
+        v_submission.id,
+        v_opportunity.opportunity_id,
+        v_now,
+        v_actor,
+        'admin',
+        'submission.archived',
+        'Lead archived: ' || replace(v_reason, '-', ' ') || '.',
+        jsonb_build_object(
+          'archiveReason', v_reason,
+          'communicationId', '',
+          'previousStatus', coalesce(v_submission.metadata->'leadArchive'->>'previousStatus', ''),
+          'dealKey', v_score.deal_key,
+          'dispositionId', v_disposition.id
+        )
+      );
+    end if;
+    insert into public.crm_activity_events (
+      id, submission_id, opportunity_id, created_at, actor, role, event_type, summary, metadata
+    ) values (
+      (p_command->>'triage_activity_id')::uuid,
+      v_submission.id,
+      v_opportunity.opportunity_id,
+      v_now,
+      v_actor,
+      'admin',
+      'opportunity.triaged',
+      'Operator triage: marked reviewed, passed.',
+      jsonb_build_object(
+        'markedReviewed', true,
+        'reviewedFingerprint', v_score.reviewed_fingerprint,
+        'fitScoreAtDecision', v_score.fit_score,
+        'dispositionId', v_disposition.id
+      )
+    );
+  end if;
+
+  return jsonb_build_object(
+    'applied', true,
+    'reason', '',
+    'disposition', to_jsonb(v_disposition),
+    'score', to_jsonb(v_score),
+    'submission', case when v_opportunity.primary_submission_id is null then null else to_jsonb(v_submission) end,
+    'archived', v_archived
+  );
+end;
+$$;
+
 create or replace function public.set_deal_hunter_opportunity_operator_decision(
   p_opportunity_id text,
   p_decision jsonb
@@ -4792,6 +5806,23 @@ begin
   end if;
   if v_opportunity_status <> 'active' then
     raise exception 'canonical opportunity is superseded or otherwise not current';
+  end if;
+
+  select * into v_score
+  from public.deal_hunter_opportunity_scores
+  where opportunity_id = p_opportunity_id
+  for update;
+  if not found then
+    return null;
+  end if;
+
+  perform 1
+  from public.deal_hunter_dispositions as disposition
+  where disposition.deal_key = v_score.deal_key
+    and disposition.disposition = 'dismissed'
+  for update;
+  if found then
+    raise exception 'This opportunity has already been passed and is durably dismissed';
   end if;
 
   update public.deal_hunter_opportunity_scores
@@ -4818,6 +5849,7 @@ revoke all privileges on function public.reconcile_deal_hunter_current_score_eli
 revoke all privileges on function public.list_deal_hunter_opportunity_scores(text, integer, integer, text, text, text, integer, text, text, text) from public, anon, authenticated;
 revoke all privileges on function public.upsert_deal_hunter_cim_recipient_override(jsonb) from public, anon, authenticated;
 revoke all privileges on function public.set_deal_hunter_opportunity_operator_decision(text, jsonb) from public, anon, authenticated;
+revoke all privileges on function public.pass_deal_hunter_opportunity(jsonb) from public, anon, authenticated;
 grant all privileges on table public.deal_hunter_opportunity_scores to service_role;
 grant all privileges on table public.deal_hunter_score_evidence to service_role;
 grant execute on function public.insert_submission_with_crm_activity(jsonb, jsonb) to service_role;
@@ -4826,3 +5858,44 @@ grant execute on function public.reconcile_deal_hunter_current_score_eligibility
 grant execute on function public.list_deal_hunter_opportunity_scores(text, integer, integer, text, text, text, integer, text, text, text) to service_role;
 grant execute on function public.upsert_deal_hunter_cim_recipient_override(jsonb) to service_role;
 grant execute on function public.set_deal_hunter_opportunity_operator_decision(text, jsonb) to service_role;
+grant execute on function public.pass_deal_hunter_opportunity(jsonb) to service_role;
+
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'deal_hunter_cim_requests_canonical_id_check'
+      and conrelid = 'public.deal_hunter_cim_requests'::regclass
+  ) then
+    alter table public.deal_hunter_cim_requests
+      add constraint deal_hunter_cim_requests_canonical_id_check
+      check ((id collate "C") ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$') not valid;
+  end if;
+end
+$$;
+
+create or replace function public.list_deal_hunter_cim_detail_authority(
+  p_opportunity_ids text[],
+  p_limit integer default 100
+)
+returns setof public.deal_hunter_cim_requests
+language sql
+stable
+security invoker
+set search_path = public
+as $$
+  select request.*
+  from public.deal_hunter_cim_requests as request
+  where request.opportunity_id = any(p_opportunity_ids)
+    and (request.id collate "C") ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$'
+  order by
+    request.updated_at desc nulls last,
+    request.id collate "C" asc
+  limit greatest(1, least(coalesce(p_limit, 100), 100000));
+$$;
+
+revoke all on function public.list_deal_hunter_cim_detail_authority(text[], integer)
+  from public, anon, authenticated;
+grant execute on function public.list_deal_hunter_cim_detail_authority(text[], integer)
+  to service_role;

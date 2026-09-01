@@ -1,5 +1,17 @@
 import { createClient } from '@supabase/supabase-js';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
+import {
+  normalizeDealHunterSourceSnapshot,
+  normalizeOperatorOpportunityFactRecord,
+  normalizeOpportunitySourceObservation,
+  normalizeOpportunitySourceObservationSnapshot,
+} from '../services/dealHunterOpportunityFacts.js';
+import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
+import { requireCanonicalCimRequestId } from '../services/cimRequestIdPolicy.js';
+
+const dealHunterQueueSorts = new Set([
+  'acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed',
+]);
 
 function normalizeSubmissionRow(row) {
   return {
@@ -357,6 +369,14 @@ function normalizeDealHunterScoreEvidenceRow(row) {
   return row ? { ...row, terms: Array.isArray(row.terms) ? row.terms : [] } : null;
 }
 
+function normalizeDealHunterOpportunityFactRow(row) {
+  return row ? { ...row, verified: Boolean(row.verified) } : null;
+}
+
+function normalizeDealHunterOpportunitySourceObservationRow(row) {
+  return row ? { ...row } : null;
+}
+
 function normalizeDealHunterOpportunityRow(row) {
   return row
     ? { ...row, metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {} }
@@ -454,6 +474,18 @@ function normalizeAtomicMutationResult(operation, data) {
     reason: data.reason || '',
     record: data.record ? normalizeRecord(data.record) : null,
     activity: data.activity ? normalizeCrmActivityEventRow(data.activity) : null,
+  };
+}
+
+function normalizeDealHunterPassResult(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return { applied: false, reason: 'invalid-result' };
+  return {
+    applied: Boolean(data.applied),
+    reason: String(data.reason || ''),
+    disposition: data.disposition ? normalizeDealHunterDispositionRow(data.disposition) : null,
+    score: data.score ? normalizeDealHunterOpportunityScoreRow(data.score) : null,
+    submission: data.submission ? normalizeSubmissionRow(data.submission) : null,
+    archived: Boolean(data.archived),
   };
 }
 
@@ -665,7 +697,7 @@ function safeDealHunterCimRequest(request = {}) {
           : 'not-attempted';
   return {
     ...request,
-    id: String(request.id || '').trim(),
+    id: requireCanonicalCimRequestId(request.id),
     created_at: createdAt,
     updated_at: updatedAt,
     deal_key: String(request.deal_key || '').trim(),
@@ -2667,6 +2699,25 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterOpportunityScoreRow(data);
     },
 
+    async passDealHunterOpportunity(command = {}) {
+      const opportunityId = String(command.opportunityId || '').trim();
+      if (!opportunityId) throw new Error('A canonical opportunity id is required for atomic Pass.');
+      const { data, error } = await client.rpc('pass_deal_hunter_opportunity', {
+        p_command: {
+          opportunity_id: opportunityId,
+          reason: String(command.reason || '').trim(),
+          note: String(command.note || '').trim(),
+          actor: String(command.actor || 'admin').trim() || 'admin',
+          occurred_at: command.occurredAt || new Date().toISOString(),
+          disposition_id: String(command.dispositionId || '').trim(),
+          archive_activity_id: String(command.archiveActivityId || '').trim(),
+          triage_activity_id: String(command.triageActivityId || '').trim(),
+        },
+      });
+      if (error) throw error;
+      return normalizeDealHunterPassResult(data);
+    },
+
     async setDealHunterOpportunityOperatorDecision(decision = {}) {
       const opportunityId = String(decision.opportunityId || '').trim();
       if (!opportunityId) throw new Error('A canonical opportunity id is required to record an operator decision.');
@@ -2711,6 +2762,25 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       if (error) throw error;
       if (!data) return null;
       const { deal_hunter_opportunities: _opportunity, ...score } = data;
+      return normalizeDealHunterOpportunityScoreRow(score);
+    },
+
+    async getCurrentDealHunterOpportunityScoreByDealKey(dealKey) {
+      const { data, error } = await client
+        .from('deal_hunter_opportunity_scores')
+        .select('*,deal_hunter_opportunities!inner(status)')
+        .eq('deal_key', String(dealKey || '').trim())
+        .eq('current_triage_eligible', true)
+        .eq('deal_hunter_opportunities.status', 'active')
+        .limit(2);
+      if (error) throw error;
+      if ((data || []).length > 1) {
+        const conflict = new Error('A Deal Hunter key maps to more than one current Inbox opportunity.');
+        conflict.code = 'DEAL_HUNTER_CURRENT_DEAL_KEY_CONFLICT';
+        throw conflict;
+      }
+      if (!data?.[0]) return null;
+      const { deal_hunter_opportunities: _opportunity, ...score } = data[0];
       return normalizeDealHunterOpportunityScoreRow(score);
     },
 
@@ -2782,15 +2852,22 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       view = 'needs-review', page = 1, pageSize = 25, search = '', sort = 'fit-score', direction = 'desc',
       minScore = null, confidence = '', priority = '', state = '',
     } = {}) {
-      const safePage = Math.max(1, Math.min(Number(page) || 1, 10000));
-      const safePageSize = Math.max(1, Math.min(Number(pageSize) || 25, 100));
+      const parsedPage = Number(page);
+      const parsedPageSize = Number(pageSize);
+      const safePage = Number.isFinite(parsedPage) ? Math.max(1, Math.min(Math.trunc(parsedPage), 10000)) : 1;
+      const safePageSize = Number.isFinite(parsedPageSize) ? Math.max(1, Math.min(Math.trunc(parsedPageSize), 100)) : 25;
+      const requestedSort = String(sort || 'fit-score');
+      const safeSort = dealHunterQueueSorts.has(requestedSort) ? requestedSort : 'fit-score';
+      const safeDirection = safeSort === 'acquisition-priority'
+        ? 'desc'
+        : (String(direction || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc');
       const { data, error } = await client.rpc('list_deal_hunter_opportunity_scores', {
         p_view: String(view || 'needs-review'),
         p_page: safePage,
         p_page_size: safePageSize,
         p_search: String(search || ''),
-        p_sort: String(sort || 'fit-score'),
-        p_direction: String(direction || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc',
+        p_sort: safeSort,
+        p_direction: safeDirection,
         p_min_score: minScore === null || minScore === '' ? null : Number(minScore),
         p_confidence: String(confidence || ''),
         p_priority: String(priority || ''),
@@ -2801,6 +2878,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return {
         rows: (data?.rows || []).map(normalizeDealHunterOpportunityScoreRow),
         total,
+        summary: data?.summary || {},
         page: safePage,
         pageSize: safePageSize,
         totalPages: Math.max(1, Math.ceil(total / safePageSize)),
@@ -2990,6 +3068,106 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       });
       if (error) throw error;
       return normalizeDealHunterOpportunityRow(data);
+    },
+
+    async listDealHunterOpportunityFacts(opportunityId, { limit = 500 } = {}) {
+      const { data, error } = await client
+        .from('deal_hunter_opportunity_facts')
+        .select('*')
+        .eq('opportunity_id', String(opportunityId || '').trim())
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(Number.isFinite(Number(limit)) ? Math.max(1, Math.min(Math.trunc(Number(limit)), 500)) : 500);
+      if (error) throw error;
+      return (data || []).map(normalizeDealHunterOpportunityFactRow);
+    },
+
+    async upsertDealHunterOpportunityFact(fact = {}) {
+      const record = normalizeOperatorOpportunityFactRecord(fact);
+      const { data, error } = await client
+        .rpc('upsert_deal_hunter_opportunity_fact', {
+          p_fact: record,
+        });
+      if (error) throw error;
+      return normalizeDealHunterOpportunityFactRow(data);
+    },
+
+    async insertCurrentDealHunterOpportunityFact(fact = {}) {
+      const record = normalizeOperatorOpportunityFactRecord(fact);
+      const { data, error } = await client.rpc('insert_current_deal_hunter_opportunity_fact', {
+        p_fact: record,
+      });
+      if (error) throw error;
+      return normalizeDealHunterOpportunityFactRow(data);
+    },
+
+    async listDealHunterOpportunitySourceObservations(opportunityId, { limit = 500 } = {}) {
+      const { data, error } = await client
+        .from('deal_hunter_opportunity_source_observations')
+        .select('*')
+        .eq('opportunity_id', String(opportunityId || '').trim())
+        .order('observed_at', { ascending: false })
+        .order('id')
+        .limit(Number.isFinite(Number(limit)) ? Math.max(1, Math.min(Math.trunc(Number(limit)), 500)) : 500);
+      if (error) throw error;
+      return (data || []).map(normalizeDealHunterOpportunitySourceObservationRow);
+    },
+
+    async upsertDealHunterOpportunitySourceObservation(observation = {}) {
+      const normalizedObservation = normalizeOpportunitySourceObservation(observation);
+      const { data, error } = await client
+        .rpc('upsert_deal_hunter_opportunity_source_observation', {
+          p_id: normalizedObservation.id,
+          p_opportunity_id: normalizedObservation.opportunity_id,
+          p_source_id: normalizedObservation.source_id,
+          p_source_name: normalizedObservation.source_name,
+          p_source_record_id: normalizedObservation.source_record_id,
+          p_field: normalizedObservation.field,
+          p_value: normalizedObservation.value,
+          p_observed_at: normalizedObservation.observed_at,
+          p_created_at: normalizedObservation.created_at,
+          p_updated_at: normalizedObservation.updated_at,
+        });
+      if (error) throw error;
+      return normalizeDealHunterOpportunitySourceObservationRow(data);
+    },
+
+    async replaceDealHunterOpportunitySourceObservationSnapshot(snapshot = {}) {
+      const normalizedSnapshot = normalizeOpportunitySourceObservationSnapshot(snapshot);
+      const { data, error } = await client
+        .rpc('replace_deal_hunter_opportunity_source_observation_snapshot', {
+          p_opportunity_id: normalizedSnapshot.opportunity_id,
+          p_source_id: normalizedSnapshot.source_id,
+          p_source_name: normalizedSnapshot.source_name,
+          p_source_record_id: normalizedSnapshot.source_record_id,
+          p_observations: normalizedSnapshot.observations,
+        });
+      if (error) throw error;
+      return (data || []).map(normalizeDealHunterOpportunitySourceObservationRow);
+    },
+
+    async replaceDealHunterOpportunitySourceSnapshot() {
+      throw new Error('Complete per-opportunity source snapshot replacement is not admitted.');
+    },
+
+    async replaceDealHunterSourceSnapshot(snapshot = {}) {
+      normalizeDealHunterSourceSnapshot(snapshot);
+      throw new Error('Complete Google Sheet source snapshot admission is required.');
+    },
+
+    async replaceAdmittedCompleteGoogleSheetSourceSnapshot(snapshot = {}) {
+      const admission = consumeCompleteGoogleSheetSourceSnapshotAdmission({
+        admission: snapshot.admission,
+        snapshot,
+      });
+      const normalizedSnapshot = normalizeDealHunterSourceSnapshot(snapshot);
+      const { data, error } = await client
+        .rpc('replace_admitted_complete_google_sheet_source_snapshot', {
+          p_admission: admission,
+          p_records: normalizedSnapshot.records,
+        });
+      if (error) throw error;
+      return (data || []).map(normalizeDealHunterOpportunitySourceObservationRow);
     },
 
     async listDealHunterOpportunityAliases({ opportunityIds = [], aliasKeys = [], limit = 5000 } = {}) {
@@ -3265,21 +3443,44 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterCimRequestRow(data);
     },
 
-    async listDealHunterCimRequests({ dealKeys = [], opportunityIds = [], recipientEmails = [], statuses = [], dueBefore = '', limit = 1000 } = {}) {
+    async listDealHunterCimRequests({
+      dealKeys = [],
+      opportunityIds = [],
+      recipientEmails = [],
+      statuses = [],
+      dueBefore = '',
+      detailAuthority = false,
+      limit = 1000,
+    } = {}) {
       const keys = normalizeList(dealKeys);
       const canonicalIds = normalizeList(opportunityIds);
       const recipients = normalizeList(recipientEmails).map((value) => value.toLowerCase());
       const safeStatuses = normalizeList(statuses);
 
       const safeLimit = Math.max(1, Math.min(Number(limit) || 1000, 100000));
+      if (
+        detailAuthority === true
+        && canonicalIds.length > 0
+        && keys.length === 0
+        && recipients.length === 0
+        && safeStatuses.length === 0
+        && !dueBefore
+      ) {
+        const { data, error } = await client.rpc('list_deal_hunter_cim_detail_authority', {
+          p_opportunity_ids: canonicalIds,
+          p_limit: safeLimit,
+        });
+        if (error) throw error;
+        return (data || []).map(normalizeDealHunterCimRequestRow);
+      }
       const pageSize = Math.min(1000, safeLimit);
       const rows = [];
       for (let offset = 0; offset < safeLimit; offset += pageSize) {
         let query = client
           .from('deal_hunter_cim_requests')
           .select('*')
-          .order('updated_at', { ascending: false })
-          .order('id', { ascending: true });
+          .order('updated_at', { ascending: false, nullsFirst: false })
+          .order('id', { ascending: true, nullsFirst: false });
         if (keys.length > 0) query = query.in('deal_key', keys);
         if (canonicalIds.length > 0) query = query.in('opportunity_id', canonicalIds);
         if (recipients.length > 0) query = query.in('recipient_email', recipients);

@@ -69,6 +69,7 @@ function createCimStorage() {
   const identityExceptions = new Map();
   const opportunityClaims = new Map();
   const recipientClaims = new Map();
+  const cimRequestReadCalls = [];
 
   function requestKey(request) {
     return `${request.deal_key}|${request.recipient_email}`;
@@ -85,10 +86,13 @@ function createCimStorage() {
     communications,
     activities,
     opportunities,
+    cimRequestReadCalls,
     async listDealHunterSeenDeals() {
       return [];
     },
-    async listDealHunterCimRequests({ dealKeys = [], opportunityIds = [], recipientEmails = [] } = {}) {
+    async listDealHunterCimRequests(options = {}) {
+      cimRequestReadCalls.push(structuredClone(options));
+      const { dealKeys = [], opportunityIds = [], recipientEmails = [] } = options;
       return Array.from(requests.values()).filter((request) => (
         (dealKeys.length === 0 || dealKeys.includes(request.deal_key))
         && (opportunityIds.length === 0 || opportunityIds.includes(request.opportunity_id))
@@ -392,6 +396,21 @@ function enableCrmImportClaims(storage) {
   };
   return crmImports;
 }
+
+test('Deal Hunter operational history reads keep opportunity filters in generic scope', async () => {
+  const { reviewDailyDeals } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+
+  await reviewDailyDeals({ storage });
+
+  const opportunityHistoryReads = storage.cimRequestReadCalls
+    .filter((options) => Array.isArray(options.opportunityIds) && options.opportunityIds.length > 0);
+  assert.ok(opportunityHistoryReads.length > 0, 'the real review path performs canonical-opportunity history reads');
+  assert.equal(opportunityHistoryReads.every((options) => options.detailAuthority !== true), true,
+    'history safety never opts into detail-only filtering');
+  assert.equal(opportunityHistoryReads.every((options) => options.limit === 5000), true,
+    'history safety retains its established operational bound');
+});
 
 test('bulk CIM send fails when every selected email fails', async () => {
   const { reviewDailyDeals, sendDealHunterReadyCimRequests } = await import('../server/services/dealHunter.js');

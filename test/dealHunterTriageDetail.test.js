@@ -1,0 +1,1731 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import test from 'node:test';
+import Database from 'better-sqlite3';
+
+import { setOperatorOpportunityFact } from '../server/services/dealHunterOpportunityFacts.js';
+import { getTriageOpportunityDetail } from '../server/services/dealHunterTriage.js';
+import { createSqliteStorage } from '../server/storage/sqlite.js';
+import { createSupabaseStorage } from '../server/storage/supabase.js';
+
+// These response contracts are deliberately independent literals. Importing
+// either production allowlist would let implementation and proof widen together.
+const approvedPhase1FactFields = Object.freeze([
+  'seller_name',
+  'seller_email',
+  'seller_phone',
+  'broker_name',
+  'broker_company',
+  'broker_email',
+  'broker_phone',
+  'reason_for_sale',
+  'real_estate_included',
+  'seller_financing',
+  'management_structure',
+  'customer_concentration',
+  'operator_contact_notes',
+]);
+
+const approvedSourceObservationFields = Object.freeze([
+  'name', 'business_name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
+  'annual_profit', 'annual_revenue', 'asking_price', 'profit_multiple', 'net_margin', 'years_established',
+  'remote_flag', 'franchise_flag', 'five_years_flag', 'broker_name', 'broker_company', 'broker_contact',
+  'broker_email', 'broker_phone', 'company', 'role', 'seller_name', 'seller_email', 'seller_phone',
+  'reason_for_sale', 'real_estate_included', 'seller_financing', 'management_structure',
+  'customer_concentration', 'operator_contact_notes', 'listing_url', 'listing_source', 'listing_id',
+  'deal_key', 'source_identity', 'date_added', 'last_updated', 'business_website', 'prospectus_url',
+  'ttm_revenue', 'ttm_ebitda', 'ebitda_multiple', 'business_age', 'sba_eligible', 'lead_type',
+]);
+
+function currentScore(opportunityId) {
+  return {
+    opportunity_id: opportunityId,
+    scored_at: '2026-08-30T10:00:00.000Z',
+    deal_key: `deal-${opportunityId}`,
+    name: 'Detail Services Co',
+    state: 'TX',
+    listing_url: 'https://broker.example/listings/detail-services',
+    fit_score: 81,
+    score_status: 'high-fit',
+    confidence: 'high',
+    completeness_score: 78,
+    contradiction_count: 1,
+    missing_evidence_count: 2,
+    should_remove: false,
+    high_fit: true,
+    gate_count: 0,
+    score_fingerprint: `fingerprint-${opportunityId}`,
+    semantic_digest: `digest-${opportunityId}`,
+    engine_version: 'detail-test',
+    rules_version: 'detail-test',
+    profile_version: 'detail-test',
+    completeness_policy_version: 'detail-test',
+    dimensions: [{ id: 'financial-fit', label: 'Financial fit', contribution: 20 }],
+    gates: [],
+    applied_caps: [],
+    missing_evidence: ['seller name'],
+    confidence_reasons: ['Revenue observed'],
+    summary: { strengths: ['Strong financials'], concerns: ['Seller contact missing'] },
+  };
+}
+
+async function detailStorage(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-triage-detail-'));
+  const sqlitePath = path.join(directory, 'detail.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const opportunityId = 'opp-detail';
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: opportunityId,
+    created_at: '2026-08-30T09:00:00.000Z',
+    updated_at: '2026-08-30T09:00:00.000Z',
+    canonical_name: 'Detail Services Co',
+    canonical_recipient: null,
+    canonical_location: 'Austin, TX',
+    primary_submission_id: 'submission-detail',
+    identity_version: 'detail-test',
+    status: 'active',
+    metadata: {},
+  });
+  await storage.writeDealHunterOpportunityScore(currentScore(opportunityId), [{
+    id: 'detail-evidence', opportunity_id: opportunityId, dimension: 'financial-fit', rule_id: 'financial.sde',
+    rule_label: 'SDE fits target', evidence_class: 'observed', field: 'annual_profit', value: '$450,000',
+    observed_value: '$450,000', terms: [], source_id: 'deal-os', source_name: 'Deal OS', source_record_id: 'detail-1',
+    listing_url: 'https://broker.example/listings/detail-services', observed_at: '2026-08-30T09:30:00.000Z',
+  }]);
+  await storage.reconcileDealHunterCurrentScoreEligibility([opportunityId]);
+  const addObservation = async (id, sourceId, sourceName, recordId, field, value) => storage.upsertDealHunterOpportunitySourceObservation({
+    id, opportunity_id: opportunityId, source_id: sourceId, source_name: sourceName, source_record_id: recordId,
+    field, value, observed_at: '2026-08-30T09:30:00.000Z', created_at: '2026-08-30T09:30:00.000Z', updated_at: '2026-08-30T09:30:00.000Z',
+  });
+  await addObservation('source-seller', 'sheet', 'Deal Hunter Sheet', 'sheet-1', 'seller_name', 'Sheet Seller');
+  await addObservation('source-broker', 'sheet', 'Deal Hunter Sheet', 'sheet-1', 'broker_email', 'sheet-broker@example.test');
+  await addObservation('source-url-a', 'sheet', 'Deal Hunter Sheet', 'sheet-1', 'listing_url', 'https://broker.example/listings/detail-services');
+  await addObservation('source-profit-sheet', 'sheet', 'Deal Hunter Sheet', 'sheet-1', 'annual_profit', '450000');
+  await addObservation('source-url-b', 'deal-os', 'Deal OS', 'deal-1', 'listing_url', 'https://broker.example/listings/detail-services');
+  await addObservation('source-url-bad', 'deal-os', 'Deal OS', 'deal-1', 'prospectus_url', 'javascript:alert(1)');
+  await addObservation('source-conflict', 'deal-os', 'Deal OS', 'deal-1', 'annual_profit', '200000');
+  await setOperatorOpportunityFact({
+    opportunityId, field: 'seller_name', value: 'Verified Operator Seller', verified: true,
+    note: 'Confirmed by phone.', actor: 'operator@example.test', storage,
+  });
+  return { storage, opportunityId, sqlitePath };
+}
+
+function withDetailAuthorityRows(storage, { sourceRows, cimRequests, dispositions } = {}) {
+  return new Proxy(storage, {
+    get(target, property) {
+      if (property === 'listDealHunterOpportunitySourceObservations' && sourceRows !== undefined) return async () => sourceRows;
+      if (property === 'listDealHunterCimRequests' && cimRequests !== undefined) return async () => cimRequests;
+      if (property === 'listDealHunterDispositions' && dispositions !== undefined) return async () => dispositions;
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+function currentDetailProjection(detail) {
+  return {
+    industry: detail.opportunity.industry,
+    freshness: detail.opportunity.observationFreshness,
+    cimStatus: detail.opportunity.workflow.cimStatus,
+    disposition: {
+      state: detail.opportunity.disposition.state,
+      reason: detail.opportunity.disposition.reason,
+      dismissedAt: detail.opportunity.disposition.dismissedAt,
+    },
+    dismissed: detail.opportunity.dismissed,
+  };
+}
+
+test('detail source authority uses the first valid timestamp in its documented fallback chain', async (t) => {
+  // Break caught: choosing the first non-null observation timestamp lets a
+  // malformed observed_at hide a newer, valid updated_at or created_at.
+  const { storage, opportunityId } = await detailStorage(t);
+  const olderAt = '2026-08-31T10:00:00.000Z';
+  const newerAt = '2026-08-31T12:00:00.000Z';
+  const olderSource = {
+    id: 'source-older', source_id: 'source-older', source_name: 'Older source', source_record_id: 'older-record',
+    field: 'industry', value: 'older-primary-value', observed_at: olderAt, updated_at: olderAt, created_at: olderAt,
+  };
+  const cases = [
+    {
+      name: 'falls from malformed observed_at to updated_at',
+      newerSource: { observed_at: 'not-a-date', updated_at: newerAt, created_at: '2026-08-31T09:00:00.000Z' },
+    },
+    {
+      name: 'falls from missing observedAt to updatedAt',
+      newerSource: { updatedAt: newerAt, createdAt: '2026-08-31T09:00:00.000Z' },
+    },
+    {
+      name: 'falls through malformed observedAt and updated_at to createdAt',
+      newerSource: { observedAt: 'not-a-date', updated_at: 'still-not-a-date', createdAt: newerAt },
+    },
+  ];
+
+  for (const { name, newerSource } of cases) {
+    await t.test(name, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, {
+          sourceRows: [
+            olderSource,
+            {
+              id: 'source-newer', source_id: 'source-newer', source_name: 'Newer source', source_record_id: 'newer-record',
+              field: 'industry', value: 'newer-fallback-value', ...newerSource,
+            },
+          ],
+        }),
+      });
+      assert.deepEqual({
+        industry: detail.opportunity.industry,
+        freshness: detail.opportunity.observationFreshness,
+      }, {
+        industry: 'newer-fallback-value',
+        freshness: newerAt,
+      });
+    });
+  }
+});
+
+test('detail CIM authority uses the first valid durable timestamp in its bounded fallback chain', async (t) => {
+  // Break caught: choosing the first non-null CIM updated timestamp lets a
+  // malformed primary hide a newer durable creation timestamp.
+  const { storage, opportunityId } = await detailStorage(t);
+  const olderAt = '2026-08-31T10:00:00.000Z';
+  const newerAt = '2026-08-31T12:00:00.000Z';
+  const olderRequest = { id: 'cim-older', status: 'requested', updated_at: olderAt, created_at: olderAt };
+  const cases = [
+    {
+      name: 'falls from malformed updated_at to created_at',
+      newerRequest: { updated_at: 'not-a-date', created_at: newerAt },
+    },
+    {
+      name: 'falls from malformed updatedAt to createdAt',
+      newerRequest: { updatedAt: 'not-a-date', createdAt: newerAt },
+    },
+  ];
+
+  for (const { name, newerRequest } of cases) {
+    await t.test(name, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, {
+          cimRequests: [
+            olderRequest,
+            { id: 'cim-newer', status: 'documents received', ...newerRequest },
+          ],
+        }),
+      });
+      assert.equal(detail.opportunity.workflow.cimStatus, 'documents received');
+    });
+  }
+});
+
+test('detail disposition authority uses the first valid durable state timestamp', async (t) => {
+  // Break caught: choosing the first non-null updated timestamp lets malformed
+  // rows hide a later durable dismissal, restoration, or creation record.
+  const { storage, opportunityId } = await detailStorage(t);
+  const olderAt = '2026-08-31T10:00:00.000Z';
+  const newerAt = '2026-08-31T12:00:00.000Z';
+  const cases = [
+    {
+      name: 'falls from malformed updated_at to dismissed_at',
+      records: [
+        { id: 'disposition-older', disposition: 'restored', reason: 'restored', updated_at: olderAt, restored_at: olderAt, created_at: olderAt },
+        { id: 'disposition-newer', disposition: 'dismissed', reason: 'valuation', updated_at: 'not-a-date', dismissed_at: newerAt, created_at: 'not-a-date' },
+      ],
+      expected: { state: 'dismissed', reason: 'valuation', dismissedAt: newerAt, dismissed: true },
+    },
+    {
+      name: 'falls from malformed updatedAt to restoredAt',
+      records: [
+        { id: 'disposition-older', disposition: 'dismissed', reason: 'valuation', updated_at: olderAt, dismissed_at: olderAt, created_at: olderAt },
+        { id: 'disposition-newer', disposition: 'restored', reason: 'operator restore', updatedAt: 'not-a-date', restoredAt: newerAt, createdAt: 'not-a-date' },
+      ],
+      expected: { state: 'restored', reason: 'operator restore', dismissedAt: '', dismissed: false },
+    },
+    {
+      name: 'falls through malformed action timestamps to createdAt',
+      records: [
+        { id: 'disposition-older', disposition: 'restored', reason: 'restored', updated_at: olderAt, restored_at: olderAt, created_at: olderAt },
+        { id: 'disposition-newer', disposition: 'dismissed', reason: 'valuation', updatedAt: 'not-a-date', dismissedAt: 'not-a-date', createdAt: newerAt },
+      ],
+      expected: { state: 'dismissed', reason: 'valuation', dismissedAt: 'not-a-date', dismissed: true },
+    },
+  ];
+
+  for (const { name, records, expected } of cases) {
+    await t.test(name, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, { dispositions: records }),
+      });
+      assert.deepEqual({
+        state: detail.opportunity.disposition.state,
+        reason: detail.opportunity.disposition.reason,
+        dismissedAt: detail.opportunity.disposition.dismissedAt,
+        dismissed: detail.opportunity.dismissed,
+      }, expected);
+    });
+  }
+});
+
+test('detail current authority is independent of equal-timestamp provider array order', async (t) => {
+  // Break caught: using array index after timestamp equality creates divergent
+  // SQLite/Supabase detail authority when providers return equal-time rows in
+  // different orders.
+  const { storage, opportunityId } = await detailStorage(t);
+  const equalAt = '2026-08-31T12:00:00.000Z';
+  const cases = [
+    {
+      name: 'uses ascending bounded record IDs before provider array order',
+      sourceRows: [
+        { id: 'source-a', source_id: 'source-a', source_name: 'Source A', source_record_id: 'record-a', field: 'industry', value: 'id-source-authority', observed_at: equalAt, updated_at: equalAt, created_at: equalAt },
+        { id: 'source-z', source_id: 'source-z', source_name: 'Source Z', source_record_id: 'record-z', field: 'industry', value: 'id-source-non-authority', observed_at: equalAt, updated_at: equalAt, created_at: equalAt },
+      ],
+      cimRequests: [
+        { id: 'cim-a', status: 'requested', updated_at: equalAt, created_at: equalAt },
+        { id: 'cim-z', status: 'documents received', updated_at: equalAt, created_at: equalAt },
+      ],
+      dispositions: [
+        { id: 'disposition-a', disposition: 'dismissed', reason: 'id-disposition-authority', updated_at: equalAt, dismissed_at: equalAt, created_at: equalAt },
+        { id: 'disposition-z', disposition: 'dismissed', reason: 'id-disposition-non-authority', updated_at: equalAt, dismissed_at: equalAt, created_at: equalAt },
+      ],
+      expected: {
+        industry: 'id-source-authority', freshness: equalAt, cimStatus: 'requested',
+        disposition: { state: 'dismissed', reason: 'id-disposition-authority', dismissedAt: equalAt }, dismissed: true,
+      },
+    },
+    {
+      name: 'uses a bounded deterministic signature for non-CIM rows and excludes ID-less CIM records',
+      sourceRows: [
+        { source_id: 'source-a', source_name: 'Source A', source_record_id: 'record-a', field: 'industry', value: 'signature-source-authority', observed_at: equalAt, updated_at: equalAt, created_at: equalAt },
+        { source_id: 'source-z', source_name: 'Source Z', source_record_id: 'record-z', field: 'industry', value: 'signature-source-non-authority', observed_at: equalAt, updated_at: equalAt, created_at: equalAt },
+      ],
+      cimRequests: [
+        { status: 'documents received', updated_at: equalAt, created_at: equalAt },
+        { status: 'requested', updated_at: equalAt, created_at: equalAt },
+      ],
+      dispositions: [
+        { disposition: 'dismissed', reason: 'alpha-signature-authority', updated_at: equalAt, dismissed_at: equalAt, created_at: equalAt },
+        { disposition: 'dismissed', reason: 'zeta-signature-non-authority', updated_at: equalAt, dismissed_at: equalAt, created_at: equalAt },
+      ],
+      expected: {
+        industry: 'signature-source-authority', freshness: equalAt, cimStatus: 'not-requested',
+        disposition: { state: 'dismissed', reason: 'alpha-signature-authority', dismissedAt: equalAt }, dismissed: true,
+      },
+    },
+  ];
+
+  for (const authorityCase of cases) {
+    for (const [order, sourceRows, cimRequests, dispositions] of [
+      ['provider-id-order', authorityCase.sourceRows, authorityCase.cimRequests, authorityCase.dispositions],
+      ['reversed-provider-order', [...authorityCase.sourceRows].reverse(), [...authorityCase.cimRequests].reverse(), [...authorityCase.dispositions].reverse()],
+    ]) {
+      await t.test(`${authorityCase.name}: ${order}`, async () => {
+        const detail = await getTriageOpportunityDetail({
+          opportunityId,
+          storage: withDetailAuthorityRows(storage, { sourceRows, cimRequests, dispositions }),
+        });
+        assert.deepEqual(currentDetailProjection(detail), authorityCase.expected);
+      });
+    }
+  }
+});
+
+test('equal-currentness Pass ambiguity remains non-actionable until a definitive restore wins', async (t) => {
+  // Break caught: a tied restored row selected by incidental input order can
+  // silently make a durably dismissed opportunity actionable.
+  const { storage, opportunityId } = await detailStorage(t);
+  const equalAt = '2026-08-31T12:00:00.000Z';
+  const rows = [
+    { id: 'disposition-a-restored', disposition: 'restored', reason: 'restore', updated_at: equalAt, restored_at: equalAt, created_at: equalAt },
+    { id: 'disposition-z-dismissed', disposition: 'dismissed', reason: 'valuation', updated_at: equalAt, dismissed_at: equalAt, created_at: equalAt },
+  ];
+  const expected = { state: 'dismissed', reason: 'valuation', dismissed: true };
+  for (const [order, dispositions] of [
+    ['ascending-record-ID order', rows],
+    ['reversed-provider order', [...rows].reverse()],
+  ]) {
+    await t.test(order, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, { dispositions }),
+      });
+      assert.deepEqual({
+        state: detail.opportunity.disposition.state,
+        reason: detail.opportunity.disposition.reason,
+        dismissed: detail.opportunity.dismissed,
+      }, expected);
+    });
+  }
+});
+
+test('detail authority rejects non-instant primary literals and continues each documented strict fallback chain', async (t) => {
+  // Break caught: Date.parse accepts numeric, locale, date-only, timezone-less,
+  // overflowing-calendar/clock, and unknown-offset values that must not mask a
+  // newer explicit-offset durable timestamp.
+  const { storage, opportunityId } = await detailStorage(t);
+  // The strict fallback is after every timestamp that the old permissive
+  // parser normalized (including 24:00), while the older competitor is before
+  // the fallback. That makes each accepting malformed primary change current
+  // source/CIM/disposition authority rather than merely its freshness literal.
+  const olderAt = '2026-09-01T12:00:00.000Z';
+  const strictFallbackAt = '2026-09-02T00:00:00.123456+00:00';
+  const malformedPrimaryValues = [
+    ['numeric zero', 0],
+    ['numeric string zero', '0'],
+    ['numeric one', 1],
+    ['numeric string one', '1'],
+    ['locale date', '01/02/2026'],
+    ['date-only literal', '2026-08-31'],
+    ['timezone-less literal', '2026-08-31T12:00:00'],
+    ['overflowing calendar date', '2026-02-30T12:00:00Z'],
+    ['overflowing clock hour', '2026-08-31T24:00:00Z'],
+    ['out-of-range offset', '2026-08-31T12:00:00+24:00'],
+    ['unknown negative-zero offset', '2026-08-31T13:00:00-00:00'],
+  ];
+
+  for (const [kind, primary] of malformedPrimaryValues) {
+    await t.test(`${kind}: source authority uses its explicit-offset fallback`, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, {
+          sourceRows: [
+            {
+              id: 'source-older-strict', source_id: 'source-older', source_name: 'Older source', source_record_id: 'older-record',
+              field: 'industry', value: 'older-source-value', observed_at: olderAt, updated_at: olderAt, created_at: olderAt,
+            },
+            {
+              id: 'source-fallback-strict', source_id: 'source-fallback', source_name: 'Fallback source', source_record_id: 'fallback-record',
+              field: 'industry', value: 'strict-fallback-source-value', observed_at: primary, updated_at: strictFallbackAt, created_at: olderAt,
+            },
+          ],
+        }),
+      });
+      assert.deepEqual({
+        industry: detail.opportunity.industry,
+        observationFreshness: detail.opportunity.observationFreshness,
+      }, {
+        industry: 'strict-fallback-source-value',
+        observationFreshness: strictFallbackAt,
+      });
+    });
+
+    await t.test(`${kind}: CIM authority uses its explicit-offset fallback`, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, {
+          cimRequests: [
+            { id: 'cim-older-strict', status: 'requested', updated_at: olderAt, created_at: olderAt },
+            { id: 'cim-fallback-strict', status: 'documents received', updated_at: primary, created_at: strictFallbackAt },
+          ],
+        }),
+      });
+      assert.equal(detail.opportunity.workflow.cimStatus, 'documents received');
+    });
+
+    await t.test(`${kind}: disposition authority uses its explicit-offset fallback`, async () => {
+      const detail = await getTriageOpportunityDetail({
+        opportunityId,
+        storage: withDetailAuthorityRows(storage, {
+          dispositions: [
+            {
+              id: 'disposition-older-strict', disposition: 'dismissed', reason: 'older dismissal',
+              updated_at: olderAt, dismissed_at: olderAt, created_at: olderAt,
+            },
+            {
+              id: 'disposition-fallback-strict', disposition: 'restored', reason: 'strict fallback restore',
+              updated_at: primary, restored_at: strictFallbackAt, created_at: olderAt,
+            },
+          ],
+        }),
+      });
+      assert.deepEqual({
+        state: detail.opportunity.disposition.state,
+        reason: detail.opportunity.disposition.reason,
+        dismissed: detail.opportunity.dismissed,
+      }, {
+        state: 'restored',
+        reason: 'strict fallback restore',
+        dismissed: false,
+      });
+    });
+  }
+});
+
+test('equal-time listing authority uses the raw-safe canonical URL signature independently of source row order', async (t) => {
+  // Break caught: detailText collapses a normal space and a non-breaking space
+  // before a source signature is built, so the prior stable sort preserved
+  // provider array order instead of choosing one canonical URL deterministically.
+  const { storage, opportunityId } = await detailStorage(t);
+  const observedAt = '2026-08-31T12:00:00.000Z';
+  const canonicalNormalSpace = 'https://broker.example/a%20b';
+  const normalSpace = {
+    source_id: 'shared-source', source_name: 'Shared source', source_record_id: 'shared-record',
+    field: 'listing_url', value: 'https://broker.example/a b', observed_at: observedAt, updated_at: observedAt, created_at: observedAt,
+  };
+  const nonBreakingSpace = {
+    source_id: 'shared-source', source_name: 'Shared source', source_record_id: 'shared-record',
+    field: 'listing_url', value: 'https://broker.example/a\u00a0b', observed_at: observedAt, updated_at: observedAt, created_at: observedAt,
+  };
+  const identifierCases = [
+    ['missing IDs', [{ ...normalSpace }, { ...nonBreakingSpace }]],
+    ['duplicate IDs', [{ ...normalSpace, id: 'duplicate-listing-id' }, { ...nonBreakingSpace, id: 'duplicate-listing-id' }]],
+  ];
+
+  for (const [kind, rows] of identifierCases) {
+    for (const [order, sourceRows] of [
+      ['normal-first', rows],
+      ['non-breaking-first', [...rows].reverse()],
+    ]) {
+      await t.test(`${kind}: ${order}`, async () => {
+        const detail = await getTriageOpportunityDetail({
+          opportunityId,
+          storage: withDetailAuthorityRows(storage, { sourceRows }),
+        });
+        assert.deepEqual({
+          listingUrl: detail.opportunity.listingUrl,
+          observationFreshness: detail.opportunity.observationFreshness,
+        }, {
+          listingUrl: canonicalNormalSpace,
+          observationFreshness: observedAt,
+        });
+      });
+    }
+  }
+});
+
+test('detail rejects raw-bounded listing URLs whose canonical href expands past the public response bound', async (t) => {
+  // Break caught: a raw URL under 2,000 UTF-16 code units can percent-expand
+  // into an 11K+ canonical href, leak through every public URL projection, and
+  // be truncated inside an authority signature so reversed equal-time rows win
+  // differently when their IDs are missing or duplicated.
+  const { storage, opportunityId } = await detailStorage(t);
+  const observedAt = '2026-08-31T12:00:00.000Z';
+  const expandedAlpha = `https://broker.example/${'é'.repeat(1940)}alpha`;
+  const expandedOmega = `https://broker.example/${'é'.repeat(1940)}omega`;
+  const fallbackListingUrl = 'https://broker.example/listings/detail-services';
+  assert.ok(expandedAlpha.length <= 2000);
+  assert.ok(expandedOmega.length <= 2000);
+  assert.ok(new URL(expandedAlpha).href.length > 2000);
+  assert.ok(new URL(expandedOmega).href.length > 2000);
+
+  const rowsByIdentifierPolicy = [
+    ['missing IDs', [
+      { source_id: 'shared-source', source_name: 'Shared source', source_record_id: 'shared-record', field: 'listing_url', value: expandedAlpha, observed_at: observedAt },
+      { source_id: 'shared-source', source_name: 'Shared source', source_record_id: 'shared-record', field: 'listing_url', value: expandedOmega, observed_at: observedAt },
+    ]],
+    ['duplicate IDs', [
+      { id: 'duplicate-expanded-url', source_id: 'shared-source', source_name: 'Shared source', source_record_id: 'shared-record', field: 'listing_url', value: expandedAlpha, observed_at: observedAt },
+      { id: 'duplicate-expanded-url', source_id: 'shared-source', source_name: 'Shared source', source_record_id: 'shared-record', field: 'listing_url', value: expandedOmega, observed_at: observedAt },
+    ]],
+  ];
+
+  for (const [identifierCase, rows] of rowsByIdentifierPolicy) {
+    const projections = [];
+    for (const [order, sourceRows] of [
+      ['alpha-first', rows],
+      ['omega-first', [...rows].reverse()],
+    ]) {
+      await t.test(`${identifierCase}: ${order}`, async () => {
+        const detail = await getTriageOpportunityDetail({
+          opportunityId,
+          storage: withDetailAuthorityRows(storage, { sourceRows }),
+        });
+        const publicUrls = [];
+        const visit = (value, key = '') => {
+          if (typeof value === 'string' && /urls?$/i.test(key)) publicUrls.push(value);
+          if (Array.isArray(value)) {
+            for (const item of value) visit(item, key);
+          } else if (value && typeof value === 'object') {
+            for (const [childKey, childValue] of Object.entries(value)) visit(childValue, childKey);
+          }
+        };
+        visit(detail);
+
+        assert.equal(detail.opportunity.listingUrl, fallbackListingUrl);
+        assert.deepEqual(detail.listingUrls, [fallbackListingUrl]);
+        assert.equal(JSON.stringify(detail).includes(new URL(expandedAlpha).href), false);
+        assert.equal(JSON.stringify(detail).includes(new URL(expandedOmega).href), false);
+        assert.ok(publicUrls.every((url) => url.length <= 2000), 'every emitted public URL stays within the 2,000-character contract');
+        projections.push({ listingUrl: detail.opportunity.listingUrl, listingUrls: detail.listingUrls });
+      });
+    }
+    assert.deepEqual(projections[0], projections[1], `${identifierCase} authority is independent of provider row order`);
+  }
+});
+
+test('SQLite detail CIM window applies strict timestamp fallback and ID ordering before its 100-row cap', async (t) => {
+  // Break caught: SQLite used only lexical updated_at DESC before LIMIT, so a
+  // reverse-inserted equal-time set excluded the id-ascending member and a
+  // loose primary timestamp hid a newer strict created_at candidate entirely.
+  const { storage, opportunityId } = await detailStorage(t);
+  const equalUpdatedAt = '2026-08-31T12:00:00.000Z';
+  const strictCreatedFallbackAt = '2026-08-31T13:00:00.123456+00:00';
+  const dealKey = `deal-${opportunityId}`;
+
+  for (let index = 100; index >= 1; index -= 1) {
+    const id = `cim-${String(index).padStart(3, '0')}`;
+    await storage.upsertDealHunterCimRequest({
+      id,
+      created_at: equalUpdatedAt,
+      updated_at: equalUpdatedAt,
+      opportunity_id: opportunityId,
+      deal_key: dealKey,
+      recipient_email: `${id}@example.test`,
+      requested_by: 'detail-test',
+      status: 'requested',
+      metadata: {},
+    });
+  }
+  await storage.upsertDealHunterCimRequest({
+    id: 'cim-000',
+    created_at: strictCreatedFallbackAt,
+    updated_at: '0',
+    opportunity_id: opportunityId,
+    deal_key: dealKey,
+    recipient_email: 'cim-000@example.test',
+    requested_by: 'detail-test',
+    status: 'documents received',
+    metadata: {},
+  });
+
+  const adapterWindow = await storage.listDealHunterCimRequests({
+    opportunityIds: [opportunityId],
+    detailAuthority: true,
+    limit: 100,
+  });
+  assert.equal(adapterWindow.length, 100);
+  assert.equal(adapterWindow[0].id, 'cim-000', 'the strict created_at fallback ranks before the equal updated_at group');
+  assert.equal(adapterWindow[1].id, 'cim-001', 'equal valid updated_at rows use ascending IDs before the cap');
+  assert.equal(adapterWindow.at(-1).id, 'cim-099', 'the final bounded equal-time member is deterministic');
+  assert.equal(adapterWindow.some((request) => request.id === 'cim-100'), false, 'the id-ascending group member beyond the cap is excluded');
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+  assert.equal(detail.opportunity.workflow.cimStatus, 'documents received');
+  assert.equal(detail.cimSummary.requests.some((request) => request.id === 'cim-000'), true,
+    'the detail service receives the strict-fallback candidate before its own comparator runs');
+  assert.equal(detail.cimSummary.requests.some((request) => request.id === 'cim-100'), false,
+    'detail reflects adapter-window membership instead of post-cap re-sorting a divergent set');
+});
+
+test('SQLite detail CIM window excludes legacy noncanonical IDs before its deterministic 100-row authority cap', async (t) => {
+  // Break caught: SQLite admits NULL primary keys and empty/Unicode text IDs,
+  // then applies provider-native ID ordering before LIMIT even though the
+  // service treats missing IDs differently and JavaScript compares non-BMP
+  // strings by UTF-16 code units.
+  const equalAt = '2026-08-31T12:00:00.000Z';
+  const invalidNewerAt = '2026-08-31T13:00:00.000Z';
+
+  for (const insertionOrder of ['ascending', 'descending']) {
+    await t.test(insertionOrder, async (t) => {
+      const { storage, opportunityId, sqlitePath } = await detailStorage(t);
+      const dealKey = `deal-${opportunityId}`;
+      const canonicalIds = Array.from({ length: 101 }, (_, index) => `cim-${String(index).padStart(3, '0')}`);
+      const insertionIds = insertionOrder === 'ascending' ? canonicalIds : [...canonicalIds].reverse();
+
+      for (const id of insertionIds) {
+        await storage.upsertDealHunterCimRequest({
+          id,
+          created_at: equalAt,
+          updated_at: equalAt,
+          opportunity_id: opportunityId,
+          deal_key: dealKey,
+          recipient_email: `${id}@example.test`,
+          requested_by: 'detail-test',
+          status: id === 'cim-000' ? 'documents received' : 'requested',
+          metadata: {},
+        });
+      }
+
+      const database = new Database(sqlitePath);
+      const insertLegacy = database.prepare(`
+        INSERT INTO deal_hunter_cim_requests (
+          id, created_at, updated_at, opportunity_id, deal_key,
+          recipient_email, requested_by, status, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '{}')
+      `);
+      for (const [label, id] of [
+        ['null', null],
+        ['empty', ''],
+        ['padded', ' cim-000 '],
+        ['non-ascii', 'cim-é'],
+        ['non-bmp', 'cim-😀'],
+      ]) {
+        insertLegacy.run(
+          id,
+          invalidNewerAt,
+          invalidNewerAt,
+          opportunityId,
+          dealKey,
+          `legacy-${label}@example.test`,
+          'legacy-import',
+          `invalid-${label}-authority`,
+        );
+      }
+      database.close();
+
+      const genericWindow = await storage.listDealHunterCimRequests({ opportunityIds: [opportunityId], limit: 100 });
+      assert.deepEqual(genericWindow.slice(0, 5).map((request) => request.id), [
+        null,
+        '',
+        ' cim-000 ',
+        'cim-é',
+        'cim-😀',
+      ], 'generic opportunity history retains malformed legacy rows in provider order');
+      assert.deepEqual(
+        genericWindow.slice(5).map((request) => request.id),
+        canonicalIds.slice(0, 95),
+        'generic opportunity history keeps its established updated_at/id window',
+      );
+
+      const combinedGenericWindow = await storage.listDealHunterCimRequests({
+        opportunityIds: [opportunityId],
+        statuses: ['invalid-padded-authority'],
+        limit: 100,
+      });
+      assert.deepEqual(combinedGenericWindow.map((request) => request.id), [' cim-000 '],
+        'combined generic filters do not silently opt into detail authority');
+
+      const adapterWindow = await storage.listDealHunterCimRequests({
+        opportunityIds: [opportunityId],
+        detailAuthority: true,
+        limit: 100,
+      });
+      assert.equal(adapterWindow.length, 100);
+      assert.equal(adapterWindow[0].id, 'cim-000');
+      assert.equal(adapterWindow.at(-1).id, 'cim-099');
+      assert.equal(adapterWindow.some((request) => request.id === 'cim-100'), false);
+      assert.equal(adapterWindow.some((request) => !request.id || request.id !== request.id.trim()
+        || [...request.id].some((character) => character.codePointAt(0) > 127)), false,
+      'legacy empty, NULL, padded, non-ASCII, and non-BMP IDs are outside detail authority');
+
+      const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+      assert.equal(detail.opportunity.workflow.cimStatus, 'documents received');
+      assert.deepEqual(detail.cimSummary.requests.map((request) => request.id), canonicalIds.slice(0, 100));
+    });
+  }
+});
+
+test('SQLite and Supabase reject new noncanonical CIM IDs while preserving bounded ASCII historical IDs', async (t) => {
+  // Break caught: both serializers currently trim and accept empty, Unicode,
+  // non-BMP, and unbounded IDs, allowing new rows that cannot participate in a
+  // provider-independent detail-authority window.
+  const { storage: sqlite, opportunityId } = await detailStorage(t);
+  const invalidIds = [null, '', '   ', ' cim-padded ', 'cim-é', 'cim-😀', `cim-${'a'.repeat(197)}`];
+  const request = (id, suffix) => ({
+    id,
+    created_at: '2026-08-31T12:00:00.000Z',
+    updated_at: '2026-08-31T12:00:00.000Z',
+    opportunity_id: opportunityId,
+    deal_key: `deal-invalid-${suffix}`,
+    recipient_email: `invalid-${suffix}@example.test`,
+    requested_by: 'detail-test',
+    status: 'requested',
+    metadata: {},
+  });
+
+  for (const [index, id] of invalidIds.entries()) {
+    await assert.rejects(sqlite.upsertDealHunterCimRequest(request(id, `sqlite-${index}`)), /canonical CIM request ID/i);
+  }
+  const validId = 'Legacy.Request:ABC_123-xyz';
+  assert.equal((await sqlite.upsertDealHunterCimRequest(request(validId, 'sqlite-valid'))).id, validId);
+
+  const supabaseUpserts = [];
+  const query = {
+    payload: null,
+    upsert(payload) { this.payload = payload; supabaseUpserts.push(payload); return this; },
+    select() { return this; },
+    async single() { return { data: this.payload, error: null }; },
+  };
+  const supabase = createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { from(table) { assert.equal(table, 'deal_hunter_cim_requests'); return query; } } },
+  );
+  for (const [index, id] of invalidIds.entries()) {
+    await assert.rejects(supabase.upsertDealHunterCimRequest(request(id, `supabase-${index}`)), /canonical CIM request ID/i);
+  }
+  assert.equal(supabaseUpserts.length, 0, 'invalid IDs are rejected before a Supabase write');
+  assert.equal((await supabase.upsertDealHunterCimRequest(request(validId, 'supabase-valid'))).id, validId);
+  assert.equal(supabaseUpserts.length, 1);
+});
+
+test('SQLite rejects canonical writes that collide with a malformed legacy CIM primary key without mutation', async (t) => {
+  const actions = [
+    ['public upsert', async (storage, request) => storage.upsertDealHunterCimRequest(request)],
+    ['atomic CIM mutation', async (storage, request, suffix) => storage.mutateWithCrmActivity({
+      operation: 'upsert_deal_hunter_cim_request',
+      payload: { request },
+      activity: {
+        id: `legacy-collision-activity-${suffix}`,
+        submission_id: `legacy-collision-submission-${suffix}`,
+        opportunity_id: request.opportunity_id,
+        created_at: request.updated_at,
+        actor: 'detail-test',
+        role: 'system',
+        event_type: 'cim.delivery-updated',
+        summary: 'This activity must roll back with the rejected legacy collision.',
+        metadata: { mustNotPersist: true },
+      },
+    })],
+  ];
+
+  for (const [label, action] of actions) {
+    await t.test(label, async (t) => {
+      const { storage, opportunityId, sqlitePath } = await detailStorage(t);
+      const suffix = label.toLowerCase().replaceAll(' ', '-');
+      const dealKey = `legacy-collision-${suffix}`;
+      const recipientEmail = `${suffix}@example.test`;
+      const legacyId = ` legacy-${suffix} `;
+      const database = new Database(sqlitePath);
+      t.after(() => database.close());
+      database.prepare(`
+        INSERT INTO deal_hunter_cim_requests (
+          id, created_at, updated_at, opportunity_id, deal_key, recipient_email,
+          requested_by, status, delivery_error, provider_message_id, subject,
+          request_state, delivery_state, follow_up_state, attempt_count,
+          last_activity_at, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        legacyId,
+        '2026-08-31T08:00:00.000Z',
+        '2026-08-31T09:00:00.000Z',
+        opportunityId,
+        dealKey,
+        recipientEmail,
+        'legacy-import',
+        'legacy-pending',
+        'legacy-error',
+        'legacy-provider-id',
+        'Legacy subject',
+        'pending',
+        'not-attempted',
+        'scheduled',
+        7,
+        '2026-08-31T09:00:00.000Z',
+        JSON.stringify({ audit: 'preserve-exactly' }),
+      );
+      const snapshot = () => ({
+        row: database.prepare(`
+          SELECT * FROM deal_hunter_cim_requests
+          WHERE deal_key = ? AND LOWER(recipient_email) = ?
+          LIMIT 1
+        `).get(dealKey, recipientEmail),
+        activityCount: database.prepare('SELECT COUNT(*) AS count FROM crm_activity_events').get().count,
+      });
+      const before = snapshot();
+
+      let caught = null;
+      try {
+        await action(storage, {
+          id: `canonical-${suffix}`,
+          created_at: '2026-08-31T10:00:00.000Z',
+          updated_at: '2026-08-31T11:00:00.000Z',
+          opportunity_id: opportunityId,
+          deal_key: dealKey,
+          recipient_email: recipientEmail,
+          requested_by: 'new-writer',
+          status: 'sent',
+          delivery_error: 'new-error',
+          provider_message_id: 'new-provider-id',
+          subject: 'New subject',
+          request_state: 'provider_accepted',
+          delivery_state: 'accepted',
+          follow_up_state: 'scheduled',
+          attempt_count: 8,
+          last_activity_at: '2026-08-31T11:00:00.000Z',
+          metadata: { audit: 'must-not-replace' },
+        }, suffix);
+      } catch (error) {
+        caught = { code: error.code, message: error.message };
+      }
+
+      assert.deepEqual(
+        { caught, after: snapshot() },
+        {
+          caught: {
+            code: 'DEAL_HUNTER_CIM_LEGACY_ID_COLLISION',
+            message: 'A legacy CIM request with a noncanonical CIM request ID cannot be updated.',
+          },
+          after: before,
+        },
+        'the malformed legacy row and transaction activity remain byte-for-byte unchanged',
+      );
+    });
+  }
+});
+
+test('detail defensively filters noncanonical CIM IDs before status authority and the 100-request response cap', async (t) => {
+  // Break caught: custom and legacy adapters can return noncanonical records;
+  // slicing before eligibility filtering lets one padded newer row control
+  // workflow status and displace a legitimate request from the public summary.
+  const { storage, opportunityId } = await detailStorage(t);
+  const canonicalIds = Array.from({ length: 101 }, (_, index) => `service-cim-${String(index).padStart(3, '0')}`);
+  const canonicalRequests = canonicalIds.map((id, index) => ({
+    id,
+    status: index === 0 ? 'documents received' : 'requested',
+    updated_at: index === 0 ? '2026-08-31T12:00:00.000Z' : '2026-08-31T10:00:00.000Z',
+    created_at: '2026-08-31T09:00:00.000Z',
+  }));
+  const detail = await getTriageOpportunityDetail({
+    opportunityId,
+    storage: withDetailAuthorityRows(storage, {
+      cimRequests: [
+        {
+          id: ' service-cim-padded ',
+          status: 'invalid-legacy-authority',
+          updated_at: '2026-08-31T13:00:00.000Z',
+          created_at: '2026-08-31T13:00:00.000Z',
+        },
+        ...canonicalRequests,
+      ],
+    }),
+  });
+
+  assert.equal(detail.opportunity.workflow.cimStatus, 'documents received');
+  assert.deepEqual(detail.cimSummary.requests.map((request) => request.id), canonicalIds.slice(0, 100));
+  assert.equal(detail.cimSummary.requests.length, 100);
+});
+
+test('SQLite generic CIM listing keeps its deterministic updated_at and ID order outside detail authority', async (t) => {
+  // The strict fallback UDF is intentionally scoped to opportunity-ID detail
+  // windows. Generic listings retain their conventional updated_at DESC, id ASC
+  // contract instead of parsing every row with detail-authority semantics.
+  const { storage, opportunityId } = await detailStorage(t);
+  const equalUpdatedAt = '2026-08-31T12:00:00.000Z';
+  const strictCreatedFallbackAt = '2026-08-31T13:00:00.123456+00:00';
+  const dealKey = `deal-${opportunityId}`;
+
+  for (let index = 100; index >= 1; index -= 1) {
+    const id = `generic-cim-${String(index).padStart(3, '0')}`;
+    await storage.upsertDealHunterCimRequest({
+      id,
+      created_at: equalUpdatedAt,
+      updated_at: equalUpdatedAt,
+      opportunity_id: opportunityId,
+      deal_key: dealKey,
+      recipient_email: `${id}@example.test`,
+      requested_by: 'detail-test',
+      status: 'requested',
+      metadata: {},
+    });
+  }
+  await storage.upsertDealHunterCimRequest({
+    id: 'generic-cim-000',
+    created_at: strictCreatedFallbackAt,
+    updated_at: '0',
+    opportunity_id: opportunityId,
+    deal_key: dealKey,
+    recipient_email: 'generic-cim-000@example.test',
+    requested_by: 'detail-test',
+    status: 'documents received',
+    metadata: {},
+  });
+
+  const genericWindow = await storage.listDealHunterCimRequests({ limit: 100 });
+  assert.equal(genericWindow.length, 100);
+  assert.equal(genericWindow[0].id, 'generic-cim-001');
+  assert.equal(genericWindow.at(-1).id, 'generic-cim-100');
+  assert.equal(genericWindow.some((request) => request.id === 'generic-cim-000'), false);
+});
+
+test('Supabase scopes canonical CIM detail authority explicitly and keeps generic opportunity history direct', async () => {
+  // Break caught: direct PostgREST ID ordering uses the database collation and
+  // does not share SQLite's legacy-ID handling, so the provider can choose a
+  // different 100-row detail window before the service comparator runs.
+  const calls = [];
+  let directRows = [];
+  const query = {
+    select() { calls.push(['select']); return this; },
+    order(field, options) { calls.push(['order', field, options]); return this; },
+    in(field, values) { calls.push(['in', field, values]); return this; },
+    async range(start, end) {
+      calls.push(['range', start, end]);
+      return { data: directRows, error: null };
+    },
+  };
+  const storage = createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    {
+      client: {
+        from(table) { calls.push(['from', table]); return query; },
+        async rpc(name, args) { calls.push(['rpc', name, args]); return { data: [], error: null }; },
+      },
+    },
+  );
+
+  assert.deepEqual(await storage.listDealHunterCimRequests({
+    opportunityIds: ['opp-detail'],
+    detailAuthority: true,
+    limit: 100,
+  }), []);
+  assert.deepEqual(calls, [
+    ['rpc', 'list_deal_hunter_cim_detail_authority', {
+      p_opportunity_ids: ['opp-detail'],
+      p_limit: 100,
+    }],
+  ]);
+
+  calls.length = 0;
+  directRows = [{ id: ' legacy-history ', opportunity_id: 'opp-detail', status: 'legacy-pending', metadata: {} }];
+  assert.deepEqual(
+    (await storage.listDealHunterCimRequests({ opportunityIds: ['opp-detail'], limit: 2 })).map((request) => request.id),
+    [' legacy-history '],
+  );
+  assert.deepEqual(calls, [
+    ['from', 'deal_hunter_cim_requests'],
+    ['select'],
+    ['order', 'updated_at', { ascending: false, nullsFirst: false }],
+    ['order', 'id', { ascending: true, nullsFirst: false }],
+    ['in', 'opportunity_id', ['opp-detail']],
+    ['range', 0, 1],
+  ], 'generic opportunity history retains the direct provider query');
+
+  calls.length = 0;
+  directRows = [{ id: ' legacy-history ', opportunity_id: 'opp-detail', status: 'legacy-pending', metadata: {} }];
+  assert.deepEqual(
+    (await storage.listDealHunterCimRequests({
+      opportunityIds: ['opp-detail'],
+      statuses: ['legacy-pending'],
+      limit: 2,
+    })).map((request) => request.id),
+    [' legacy-history '],
+  );
+  assert.deepEqual(calls, [
+    ['from', 'deal_hunter_cim_requests'],
+    ['select'],
+    ['order', 'updated_at', { ascending: false, nullsFirst: false }],
+    ['order', 'id', { ascending: true, nullsFirst: false }],
+    ['in', 'opportunity_id', ['opp-detail']],
+    ['in', 'status', ['legacy-pending']],
+    ['range', 0, 1],
+  ], 'combined generic filters do not route through detail authority');
+});
+
+test('detail opportunity consolidates current authoritative identity, source, score, CRM, and CIM values instead of score-row defaults', async (t) => {
+  // Break caught: projectDetailOpportunity reads only the score-row scan
+  // projection, so populated current canonical/source/CRM/CIM authority is
+  // discarded in favor of empty or default score-row fields.
+  const { storage, opportunityId } = await detailStorage(t);
+  const current = await storage.getCurrentDealHunterOpportunity(opportunityId);
+  await storage.upsertDealHunterOpportunity({
+    ...current,
+    canonical_name: 'Current Field Services Co',
+    canonical_location: 'Sacramento, California',
+    updated_at: '2026-08-30T11:00:00.000Z',
+  });
+  const observedAt = '2026-08-30T11:30:00.000Z';
+  const addCurrentSourceObservation = (field, value) => storage.upsertDealHunterOpportunitySourceObservation({
+    id: `current-projection-${field}`,
+    opportunity_id: opportunityId,
+    source_id: 'current-structured-source',
+    source_name: 'Current Structured Source',
+    source_record_id: 'field-services-1',
+    field,
+    value,
+    observed_at: observedAt,
+    created_at: observedAt,
+    updated_at: observedAt,
+  });
+  await Promise.all([
+    addCurrentSourceObservation('industry', 'Field services'),
+    addCurrentSourceObservation('location', 'Sacramento, California'),
+    addCurrentSourceObservation('city', 'Sacramento'),
+    addCurrentSourceObservation('state', 'California'),
+    addCurrentSourceObservation('annual_profit', '425000'),
+    addCurrentSourceObservation('annual_revenue', '2100000'),
+    addCurrentSourceObservation('asking_price', '1700000'),
+    addCurrentSourceObservation('profit_multiple', '4'),
+    addCurrentSourceObservation('listing_url', 'https://broker.example/listings/current-field-services'),
+  ]);
+  const authorityStorage = new Proxy(storage, {
+    get(target, property) {
+      if (property === 'getSubmission') return async () => ({ id: 'submission-detail', status: 'review' });
+      if (property === 'listDealHunterCimRequests') return async () => [
+        { id: 'cim-stale', opportunity_id: opportunityId, status: 'requested', updated_at: '2026-08-30T10:30:00.000Z' },
+        { id: 'cim-current', opportunity_id: opportunityId, status: 'documents received', updated_at: observedAt },
+      ];
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage: authorityStorage });
+
+  assert.deepEqual({
+    name: detail.opportunity.name,
+    industry: detail.opportunity.industry,
+    geography: detail.opportunity.geography,
+    financials: detail.opportunity.financials,
+    topStrength: detail.opportunity.topStrength,
+    topConcern: detail.opportunity.topConcern,
+    workflow: detail.opportunity.workflow,
+    listingUrl: detail.opportunity.listingUrl,
+    observationFreshness: detail.opportunity.observationFreshness,
+    dismissed: detail.opportunity.dismissed,
+  }, {
+    name: 'Current Field Services Co',
+    industry: 'Field services',
+    geography: { city: 'Sacramento', state: 'California', label: 'Sacramento, California' },
+    financials: { annualProfit: 425000, annualRevenue: 2100000, askingPrice: 1700000, profitMultiple: 4 },
+    topStrength: 'Strong financials',
+    topConcern: 'Seller contact missing',
+    workflow: { crmStatus: 'review', cimStatus: 'documents received' },
+    listingUrl: 'https://broker.example/listings/current-field-services',
+    observationFreshness: observedAt,
+    dismissed: false,
+  });
+});
+
+test('detail opportunity projects the current durable Pass disposition instead of score-row dismissal defaults', async (t) => {
+  // Break caught: the detail composer reads score-row dismissal defaults even
+  // though Pass is durably owned by the current disposition record.
+  const { storage, opportunityId } = await detailStorage(t);
+  await storage.upsertDealHunterDisposition({
+    id: 'detail-current-pass',
+    deal_key: `deal-${opportunityId}`,
+    disposition: 'dismissed',
+    reason: 'valuation',
+    note: 'Current price exceeds the underwriting range.',
+    dismissed_at: '2026-08-30T12:00:00.000Z',
+    dismissed_by: 'operator@example.test',
+    created_at: '2026-08-30T12:00:00.000Z',
+    updated_at: '2026-08-30T12:00:00.000Z',
+    created_by: 'operator@example.test',
+    updated_by: 'operator@example.test',
+    metadata: { providerSecret: 'must-not-leak' },
+  });
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+
+  assert.deepEqual({
+    dismissed: detail.opportunity.dismissed,
+    dismissedReason: detail.opportunity.dismissedReason,
+    disposition: detail.opportunity.disposition,
+  }, {
+    dismissed: true,
+    dismissedReason: 'valuation',
+    disposition: {
+      state: 'dismissed',
+      reason: 'valuation',
+      note: 'Current price exceeds the underwriting range.',
+      dismissedAt: '2026-08-30T12:00:00.000Z',
+      dismissedBy: 'operator@example.test',
+    },
+  });
+  assert.equal(JSON.stringify(detail.opportunity).includes('must-not-leak'), false);
+});
+
+test('consolidated detail returns the exact bounded view with authority, conflicts, safe URLs, and read-only history', async (t) => {
+  const { storage, opportunityId } = await detailStorage(t);
+  let scoreWrites = 0;
+  const readOnlyStorage = new Proxy(storage, {
+    get(target, property) {
+      if (property === 'writeDealHunterOpportunityScore') return async () => { scoreWrites += 1; throw new Error('detail must not score'); };
+      if (property === 'getSubmission') return async () => ({
+        id: 'submission-detail', seller_name: 'CRM Seller', seller_email: 'crm-seller@example.test',
+        broker_name: 'CRM Broker', broker_email: 'crm-broker@example.test', metadata: {},
+      });
+      if (property === 'listDealHunterCimRequests') return async () => [{ id: 'cim-detail', opportunity_id: opportunityId, status: 'requested' }];
+      if (property === 'listCrmActivityEvents') return async () => [{ id: 'activity-detail', event_type: 'opportunity.triaged', created_at: '2026-08-30T10:00:00.000Z' }];
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage: readOnlyStorage });
+
+  assert.equal(detail.ok, true);
+  assert.deepEqual(Object.keys(detail).sort(), [
+    'cimSummary', 'crmSummary', 'effectiveFacts', 'history', 'listingUrls', 'missingCriticalFields',
+    'ok', 'operatorFacts', 'opportunity', 'score', 'sourceObservations', 'status',
+  ]);
+  assert.equal(detail.effectiveFacts.seller_name.value, 'Verified Operator Seller');
+  assert.equal(detail.effectiveFacts.seller_name.provenance, 'operator');
+  assert.equal(detail.effectiveFacts.broker_email.value, 'crm-broker@example.test');
+  assert.equal(detail.effectiveFacts.broker_email.provenance, 'crm');
+  assert.equal(detail.operatorFacts[0].field, 'seller_name');
+  assert.equal(detail.sourceObservations.length, 2);
+  assert.equal(detail.sourceObservations.some((source) => source.conflicts.some((conflict) => conflict.field === 'annual_profit')), true);
+  assert.deepEqual(detail.listingUrls, ['https://broker.example/listings/detail-services']);
+  assert.equal(detail.listingUrls.some((url) => url.startsWith('javascript:')), false);
+  assert.equal(detail.missingCriticalFields.includes('seller_name'), false);
+  assert.equal(detail.missingCriticalFields.includes('annual_profit'), false);
+  assert.equal(detail.missingCriticalFields.includes('seller_email'), false);
+  assert.equal(detail.missingCriticalFields.includes('asking_price'), true);
+  assert.deepEqual(detail.score.fitScore, 81);
+  assert.equal(detail.score.dimensions[0].evidence[0].ruleId, 'financial.sde');
+  assert.equal(detail.cimSummary.requests[0].id, 'cim-detail');
+  assert.equal(detail.crmSummary.submission.id, 'submission-detail');
+  assert.equal(detail.history.activities[0].id, 'activity-detail');
+  assert.equal(scoreWrites, 0);
+});
+
+test('detail reads a phone-like legacy broker_contact without relabeling its source observation', async (t) => {
+  // Break caught: legacy durable source rows either remain invisible to the
+  // Broker & Seller fact model or are rewritten as if their original source
+  // field had been broker_phone.
+  const { storage, opportunityId } = await detailStorage(t);
+  await storage.upsertDealHunterOpportunitySourceObservation({
+    id: 'legacy-broker-contact-phone', opportunity_id: opportunityId,
+    source_id: 'legacy-sheet', source_name: 'Legacy Deal Hunter Sheet', source_record_id: 'row-42',
+    field: 'broker_contact', value: '555-1212',
+    observed_at: '2026-08-30T10:00:00.000Z', created_at: '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z',
+  });
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+  const legacySource = detail.sourceObservations.find((source) => source.sourceId === 'legacy-sheet');
+  assert.deepEqual({
+    sourceFieldValue: legacySource?.values.broker_contact,
+    sourceWasRelabeled: Object.hasOwn(legacySource?.values || {}, 'broker_phone'),
+    effectiveBrokerPhone: detail.effectiveFacts.broker_phone,
+    brokerPhoneMissing: detail.missingCriticalFields.includes('broker_phone'),
+  }, {
+    sourceFieldValue: '555-1212',
+    sourceWasRelabeled: false,
+    effectiveBrokerPhone: {
+      value: '555-1212', provenance: 'structured-source', verified: false, actor: null, note: null,
+    },
+    brokerPhoneMissing: false,
+  });
+});
+
+test('detail keeps date-like and ZIP-plus-four legacy broker_contact generic and marks broker_phone missing', async (t) => {
+  // Break caught: loose legacy fallback promotion turns generic identifiers
+  // into effective broker_phone facts and incorrectly clears the missing flag.
+  const { storage, opportunityId } = await detailStorage(t);
+  for (const [id, value] of [
+    ['legacy-broker-contact-date', '2026-08-30'],
+    ['legacy-broker-contact-zip', '12345-6789'],
+  ]) {
+    await storage.upsertDealHunterOpportunitySourceObservation({
+      id, opportunity_id: opportunityId,
+      source_id: id, source_name: 'Legacy Deal Hunter Sheet', source_record_id: id,
+      field: 'broker_contact', value,
+      observed_at: '2026-08-30T10:00:00.000Z', created_at: '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z',
+    });
+  }
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+  assert.deepEqual(
+    detail.sourceObservations
+      .filter((source) => source.sourceName === 'Legacy Deal Hunter Sheet')
+      .map((source) => ({
+        sourceId: source.sourceId,
+        brokerContact: source.values.broker_contact,
+        hasBrokerPhone: Object.hasOwn(source.values, 'broker_phone'),
+      }))
+      .sort((left, right) => left.sourceId.localeCompare(right.sourceId)),
+    [
+      { sourceId: 'legacy-broker-contact-date', brokerContact: '2026-08-30', hasBrokerPhone: false },
+      { sourceId: 'legacy-broker-contact-zip', brokerContact: '12345-6789', hasBrokerPhone: false },
+    ],
+  );
+  assert.equal(detail.effectiveFacts.broker_phone, undefined);
+  assert.equal(detail.missingCriticalFields.includes('broker_phone'), true);
+});
+
+test('consolidated detail rejects a superseded opportunity even when its historical facts and score remain', async (t) => {
+  const { storage, opportunityId } = await detailStorage(t);
+  const historical = await storage.getDealHunterOpportunity(opportunityId);
+  await storage.upsertDealHunterOpportunity({ ...historical, status: 'superseded', updated_at: '2026-08-30T11:00:00.000Z' });
+
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage });
+  assert.equal(detail.ok, false);
+  assert.equal(detail.status, 404);
+  assert.ok(await storage.getDealHunterOpportunityScore(opportunityId));
+  assert.ok((await storage.listDealHunterOpportunityFacts(opportunityId)).length > 0);
+});
+
+test('detail sends bounded storage reads and closed, safe URL projections', async (t) => {
+  const { storage, opportunityId } = await detailStorage(t);
+  const calls = [];
+  const boundedStorage = new Proxy(storage, {
+    get(target, property) {
+      if (property === 'listDealHunterOpportunitySourceObservations') return async (...args) => {
+        calls.push(args);
+        return Array.from({ length: 700 }, (_, index) => ({
+          id: `source-${index}`, opportunity_id: opportunityId, source_id: `source-${index}`, source_name: `Source ${index}`,
+          source_record_id: `record-${index}`, field: 'listing_url', value: `https://broker.example/${index}`,
+          observed_at: '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z', metadata: { private: 'x'.repeat(2000) },
+        }));
+      };
+      if (property === 'listDealHunterCimRequests') return async () => [{ id: 'cim', status: 'requested', metadata: { private: 'x'.repeat(2000) }, provider_message_id: 'secret' }];
+      const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage: boundedStorage });
+  assert.deepEqual(calls[0][1], { limit: 500 });
+  assert.equal(detail.sourceObservations.length, 100);
+  assert.equal(detail.listingUrls.length, 100);
+  assert.equal(JSON.stringify(detail.cimSummary).includes('private'), false);
+  assert.equal(JSON.stringify(detail.cimSummary).includes('provider_message_id'), false);
+});
+
+test('detail rejects raw-control and credentialed newer source URLs before selecting a safe current listing', async (t) => {
+  // Break caught: whitespace normalization before URL validation can turn a
+  // raw-control URL into an apparently safe URL and let it replace the current
+  // safe source listing.
+  const { storage, opportunityId } = await detailStorage(t);
+  const sourceRows = (unsafeUrl) => [
+    {
+      source_id: 'newer-unsafe', source_name: 'Newer unsafe source', source_record_id: 'newer-unsafe',
+      field: 'listing_url', value: unsafeUrl, observed_at: '2026-08-30T12:00:00.000Z', updated_at: '2026-08-30T12:00:00.000Z',
+    },
+    {
+      source_id: 'current-safe', source_name: 'Current safe source', source_record_id: 'current-safe',
+      field: 'listing_url', value: 'https://broker.example/current-safe', observed_at: '2026-08-30T11:00:00.000Z', updated_at: '2026-08-30T11:00:00.000Z',
+    },
+  ];
+  for (const [kind, unsafeUrl] of [
+    ['newline', 'https://broker.example/new\nline'],
+    ['tab', 'https://broker.example/tab\tline'],
+    ['credentials', 'https://user:secret@broker.example/private'],
+  ]) {
+    const hostile = new Proxy(storage, {
+      get(target, property) {
+        if (property === 'listDealHunterOpportunitySourceObservations') return async () => sourceRows(unsafeUrl);
+        const value = target[property];
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    const detail = await getTriageOpportunityDetail({ opportunityId, storage: hostile });
+    assert.equal(detail.opportunity.listingUrl, 'https://broker.example/current-safe', `${kind} source URL cannot replace safe current attribution`);
+    assert.equal(detail.listingUrls.includes(unsafeUrl), false, `${kind} source URL is absent from listing URLs`);
+  }
+});
+
+test('detail closes every nested projection and strips injected storage metadata', async (t) => {
+  // Breaks caught: widening either fact allowlist, raising/removing any detail
+  // collection cap, dropping a scalar truncation, coercing an object/array into
+  // a scalar, or spreading a raw provider row into the response.
+  const { storage, opportunityId } = await detailStorage(t);
+  const sentinel = 'DO-NOT-LEAK-DETAIL-SENTINEL';
+  const overlong = 'x'.repeat(9000);
+  const calls = {};
+  const sourceConflictFields = [
+    'seller_name',
+    ...approvedSourceObservationFields.filter((field) => field !== 'seller_name'),
+  ].slice(0, 21);
+  const sourceRows = Array.from({ length: 101 }, (_, index) => {
+    const fields = index < 2 ? sourceConflictFields : ['seller_name'];
+    return [
+      ...fields.map((field) => ({
+        source_id: `source-${index}`,
+        source_name: overlong,
+        source_record_id: `record-${index}`,
+        field,
+        value: field === 'seller_name' ? `${index}-${overlong}` : `${field}-${index}-${overlong}`,
+        observed_at: overlong,
+        updated_at: overlong,
+        metadata: { private: sentinel },
+      })),
+      {
+        source_id: `source-${index}`,
+        source_name: overlong,
+        source_record_id: `record-${index}`,
+        field: 'listing_url',
+        value: `https://broker.example/source/${index}`,
+        observed_at: overlong,
+        updated_at: overlong,
+        metadata: { private: sentinel },
+      },
+    ];
+  }).flat();
+  sourceRows.push(
+    { source_id: { private: sentinel }, source_name: [sentinel], source_record_id: { private: sentinel }, field: 'secret_provider_metadata', value: { private: sentinel }, observed_at: [sentinel] },
+    { source_id: 'object-source', source_name: 'Object source', source_record_id: 'object-record', field: { private: sentinel }, value: [sentinel], observed_at: { private: sentinel } },
+  );
+  const operatorRows = [
+    ...Array.from({ length: 99 }, (_, index) => ({
+      id: index === 0 ? overlong : `fact-${index}`,
+      field: approvedPhase1FactFields[index % approvedPhase1FactFields.length],
+      value: overlong,
+      verified: index % 2,
+      actor: overlong,
+      note: overlong,
+      created_at: overlong,
+      updated_at: overlong,
+      metadata: { private: sentinel },
+    })),
+    {
+      id: 'unsupported-fact', field: 'secret_provider_fact', value: sentinel, verified: true,
+      actor: sentinel, note: sentinel, created_at: overlong, updated_at: overlong,
+    },
+    ...Array.from({ length: 2 }, (_, offset) => ({
+      id: `fact-${99 + offset}`,
+      field: approvedPhase1FactFields[(99 + offset) % approvedPhase1FactFields.length],
+      value: overlong,
+      verified: true,
+      actor: overlong,
+      note: overlong,
+      created_at: overlong,
+      updated_at: overlong,
+      metadata: { private: sentinel },
+    })),
+  ];
+  const crmFactValues = {
+    sellerName: `seller_name-${overlong}`,
+    sellerEmail: `seller_email-${overlong}`,
+    sellerPhone: `seller_phone-${overlong}`,
+    brokerName: `broker_name-${overlong}`,
+    brokerCompany: `broker_company-${overlong}`,
+    brokerEmail: `broker_email-${overlong}`,
+    brokerPhone: `broker_phone-${overlong}`,
+    reasonForSale: `reason_for_sale-${overlong}`,
+    realEstateIncluded: false,
+    sellerFinancing: 0,
+    managementStructure: `management_structure-${overlong}`,
+    customerConcentration: `customer_concentration-${overlong}`,
+    operatorContactNotes: `operator_contact_notes-${overlong}`,
+  };
+  const hostile = new Proxy(storage, {
+    get(target, property) {
+      if (property === 'getCurrentDealHunterOpportunityScore') return async () => ({
+        ...currentScore(opportunityId),
+        opportunity_id: { private: sentinel }, deal_key: overlong, name: overlong, state: overlong,
+        industry: overlong, annual_profit: '123', annual_revenue: { private: sentinel }, asking_price: [sentinel], profit_multiple: '4.5',
+        top_strength: overlong, top_concern: overlong, crm_status: overlong, cim_status: overlong,
+        operator_priority: { private: sentinel }, operator_note: overlong, reviewed_at: { private: sentinel },
+        reviewed_by: [sentinel], reviewed_fingerprint: { private: sentinel }, dismissed_reason: overlong,
+        missing_evidence_count: 52, contradiction_count: 23, rules_version: overlong, scored_at: overlong,
+        listing_url: 'https://broker.example/score',
+        dimensions: Array.from({ length: 8 }, (_, index) => ({ id: `dimension-${index}`, label: overlong, contribution: index, private: sentinel })),
+        gates: Array.from({ length: 51 }, (_, index) => ({ rule_id: `gate-${index}`, reason: overlong, cap: index, value: index, private: sentinel })),
+        applied_caps: Array.from({ length: 51 }, (_, index) => ({ rule_id: `cap-${index}`, reason: overlong, cap: index, value: index, private: sentinel })),
+        confidence_reasons: [...Array.from({ length: 51 }, () => overlong), { private: sentinel }],
+        missing_evidence: [...Array.from({ length: 51 }, () => overlong), [sentinel]],
+        summary: {
+          strengths: [...Array.from({ length: 21 }, () => overlong), { private: sentinel }],
+          concerns: [...Array.from({ length: 21 }, () => overlong), [sentinel]],
+          private: sentinel,
+        },
+      });
+      if (property === 'listDealHunterScoreEvidence') return async (...args) => {
+        calls.evidence = args;
+        const makeEvidence = (index, dimension, prefix) => ({
+          dimension,
+          rule_id: `${prefix}-${index}`,
+          rule_label: index === 1 ? { private: sentinel } : overlong,
+          evidence_class: index === 1 ? [sentinel] : overlong,
+          field: index === 1 ? { private: sentinel } : overlong,
+          value: index === 1 ? { private: sentinel } : overlong,
+          observed_value: index === 1 ? [sentinel] : overlong,
+          terms: [...Array.from({ length: 21 }, () => overlong), { private: sentinel }],
+          source_id: index === 1 ? { private: sentinel } : overlong,
+          source_name: index === 1 ? [sentinel] : overlong,
+          source_record_id: index === 1 ? { private: sentinel } : overlong,
+          listing_url: 'https://user:pass@broker.example/private',
+          observed_at: index === 1 ? { private: sentinel } : overlong,
+          metadata: { private: sentinel },
+        });
+        return [
+          ...Array.from({ length: 101 }, (_, index) => makeEvidence(index, 'dimension-0', 'rule')),
+          ...Array.from({ length: 101 }, (_, index) => makeEvidence(index, '', 'unattributed')),
+        ];
+      };
+      if (property === 'listDealHunterOpportunitySourceObservations') return async (...args) => { calls.sources = args; return sourceRows; };
+      if (property === 'listDealHunterOpportunityFacts') return async (...args) => { calls.facts = args; return operatorRows; };
+      if (property === 'listDealHunterCimRequests') return async (...args) => {
+        calls.cimRequests = args;
+        return Array.from({ length: 101 }, (_, index) => ({ id: `cim-${index}`, status: overlong, request_state: sentinel, delivery_state: sentinel, provider: sentinel, reply_to: sentinel, metadata: { private: sentinel }, updated_at: overlong }));
+      };
+      if (property === 'listCrmActivityEvents') return async (...args) => {
+        calls.activities = args;
+        return Array.from({ length: 101 }, (_, index) => ({ id: `activity-${index}`, event_type: overlong, summary: overlong, created_at: overlong, actor: overlong, provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }));
+      };
+      if (property === 'listDealHunterDispositions') return async (...args) => {
+        calls.dispositions = args;
+        return Array.from({ length: 21 }, (_, index) => ({ id: `disposition-${index}`, disposition: overlong, reason: overlong, note: overlong, dismissed_at: overlong, dismissed_by: overlong, provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }));
+      };
+      if (property === 'listCrmCommunications') return async (...args) => {
+        calls.communications = args;
+        return { rows: Array.from({ length: 101 }, (_, index) => ({ id: `comm-${index}`, direction: overlong, channel: overlong, kind: overlong, occurred_at: overlong, cim_request_id: `cim-${index}`, provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } })) };
+      };
+      if (property === 'getSubmission') return async () => ({
+        id: overlong,
+        status: overlong,
+        company: { private: sentinel },
+        seller_name: { private: sentinel },
+        seller_email: [sentinel],
+        broker_name: { private: sentinel },
+        broker_email: [sentinel],
+        updated_at: overlong,
+        provider: sentinel,
+        reply_to: sentinel,
+        delivery_state: sentinel,
+        metadata: { private: sentinel, dealHunter: { ...crmFactValues, providerPrivate: sentinel } },
+      });
+      const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage: hostile });
+  const assertRecordContract = (record, contract, label) => {
+    assert.deepEqual(Object.keys(record).sort(), Object.keys(contract).sort(), `${label} has exact keys`);
+    for (const [key, rule] of Object.entries(contract)) {
+      const value = record[key];
+      if (rule.nullable && value === null) continue;
+      assert.equal(typeof value, rule.type, `${label}.${key} has ${rule.type} type`);
+      if (rule.type === 'string') assert.ok(value.length <= rule.max, `${label}.${key} is at most ${rule.max} chars`);
+    }
+  };
+  const text = (max) => ({ type: 'string', max });
+  const number = { type: 'number' };
+  const boolean = { type: 'boolean' };
+  const nullableNumber = { type: 'number', nullable: true };
+  const opportunityContract = {
+    opportunityId: text(200), dealKey: text(200), name: text(500), state: text(40), listingUrl: text(2000),
+    fitScore: number, scoreStatus: text(80), confidence: text(80), completenessScore: number,
+    missingEvidenceCount: number, contradictionCount: number, shouldRemove: boolean, highFit: boolean,
+    geography: { type: 'object' }, industry: text(240), financials: { type: 'object' }, topStrength: text(400),
+    topConcern: text(400), workflow: { type: 'object' }, observationFreshness: text(80), operatorPriority: text(40),
+    operatorNote: text(2000), reviewed: boolean, reviewedAt: text(80), reviewedBy: text(160),
+    changedSinceReview: boolean, disposition: { type: 'object' }, dismissed: boolean, dismissedReason: text(160), scoredAt: text(80),
+    scoreFingerprint: text(200), rulesVersion: text(160),
+  };
+  const operatorFactContract = { id: text(200), field: text(80), value: text(4000), verified: boolean, actor: text(160), note: text(500), createdAt: text(80), updatedAt: text(80) };
+  const evidenceContract = {
+    ruleId: text(160), ruleLabel: text(160), evidenceClass: text(80), field: text(80), value: text(500),
+    observedValue: text(500), terms: { type: 'object' }, sourceId: text(200), sourceName: text(160),
+    sourceRecordId: text(200), listingUrl: text(2000), observedAt: text(80),
+  };
+  const communicationContract = { id: text(200), direction: text(80), channel: text(80), kind: text(80), occurredAt: text(80), cimRequestId: text(200) };
+  assertRecordContract(detail.opportunity, opportunityContract, 'opportunity');
+  assertRecordContract(detail.opportunity.geography, { city: text(160), state: text(40), label: text(240) }, 'opportunity.geography');
+  assertRecordContract(detail.opportunity.financials, { annualProfit: nullableNumber, annualRevenue: nullableNumber, askingPrice: nullableNumber, profitMultiple: nullableNumber }, 'opportunity.financials');
+  assertRecordContract(detail.opportunity.workflow, { crmStatus: text(80), cimStatus: text(80) }, 'opportunity.workflow');
+  assertRecordContract(detail.opportunity.disposition, { state: text(80), reason: text(160), note: text(500), dismissedAt: text(80), dismissedBy: text(160) }, 'opportunity.disposition');
+  assert.equal(detail.opportunity.missingEvidenceCount, 52, 'persisted missing-evidence count remains exact');
+  assert.equal(detail.opportunity.contradictionCount, 23, 'persisted contradiction count remains exact');
+
+  assert.deepEqual(calls.evidence, [opportunityId, { limit: 500 }], 'evidence read is capped at 500');
+  assert.deepEqual(calls.sources, [opportunityId, { limit: 500 }], 'source-observation read is capped at 500');
+  assert.deepEqual(calls.facts, [opportunityId, { limit: 100 }], 'operator-fact read is capped at 100');
+  assert.deepEqual(calls.cimRequests, [{ opportunityIds: [opportunityId], detailAuthority: true, limit: 100 }],
+    'only the detail service explicitly opts into bounded canonical CIM authority');
+  assert.deepEqual(calls.activities, [{ submissionId: 'submission-detail', limit: 100 }], 'CRM activity read is capped at 100');
+  assert.equal(calls.dispositions.length, 1);
+  assert.equal(calls.dispositions[0].limit, 20, 'disposition read is capped at 20');
+  assert.equal(Array.isArray(calls.dispositions[0].dealKeys), true);
+  assert.deepEqual(calls.communications, [{ submissionId: 'submission-detail', page: 1, pageSize: 100 }], 'CRM communication read is capped at 100');
+
+  assert.deepEqual(Object.keys(detail.effectiveFacts).sort(), [...approvedPhase1FactFields].sort(), 'effective facts expose exactly the literal 13-field Phase 1 contract');
+  for (const [field, fact] of Object.entries(detail.effectiveFacts)) {
+    assert.ok(approvedPhase1FactFields.includes(field), `effective fact ${field} is approved`);
+    assertRecordContract(fact, { value: text(4000), provenance: text(80), verified: boolean, actor: { ...text(200), nullable: true }, note: { ...text(500), nullable: true } }, `effectiveFacts.${field}`);
+  }
+  assert.equal(Object.hasOwn(detail.effectiveFacts, 'secret_provider_fact'), false, 'hostile provider fact cannot widen effective facts');
+  assert.equal(detail.operatorFacts.length, 100, 'operator facts retain the literal 100-record cap');
+  assert.equal(detail.operatorFacts.at(-1).id, 'fact-99', 'operator facts retain the deterministic first 100 approved records');
+  assert.deepEqual([
+    ...detail.operatorFacts.map(({ field }) => ({ container: 'operatorFacts', field })),
+    ...detail.history.operatorFacts.map(({ field }) => ({ container: 'history.operatorFacts', field })),
+  ].filter(({ field }) => !approvedPhase1FactFields.includes(field)), [], 'top-level and history operator facts reject hostile fields outside the literal Phase 1 contract');
+  for (const fact of detail.operatorFacts) {
+    assertRecordContract(fact, operatorFactContract, 'operator fact');
+    assert.ok(approvedPhase1FactFields.includes(fact.field), `operator fact ${fact.field} is approved`);
+  }
+
+  assert.equal(detail.sourceObservations.length, 100, 'source groups retain the literal 100-group cap');
+  assert.equal(detail.sourceObservations[0].sourceRecordId, 'record-0');
+  assert.equal(detail.sourceObservations.at(-1).sourceRecordId, 'record-99');
+  assert.equal(detail.sourceObservations.some((group) => group.sourceRecordId === 'record-100'), false, 'source group 101 is truncated');
+  for (const group of detail.sourceObservations) {
+    assertRecordContract(group, { sourceId: text(200), sourceName: text(160), sourceRecordId: text(200), observedAt: text(80), values: { type: 'object' }, conflicts: { type: 'object' } }, 'source group');
+    for (const [field, value] of Object.entries(group.values)) {
+      assert.ok(approvedSourceObservationFields.includes(field), `source value ${field} is approved`);
+      assert.equal(typeof value, 'string', `source value ${field} is a string`);
+      assert.ok(value.length <= (['listing_url', 'prospectus_url', 'business_website'].includes(field) ? 2000 : 5000), `source value ${field} is bounded`);
+    }
+    for (const conflict of group.conflicts) {
+      assertRecordContract(conflict, { field: text(80), observations: { type: 'object' } }, 'source conflict');
+      assert.ok(conflict.observations.length <= 20, 'conflict observations retain the 20-record cap');
+      for (const observation of conflict.observations) {
+        assertRecordContract(observation, { sourceId: text(200), sourceName: text(160), sourceRecordId: text(200), value: text(5000), observedAt: text(80) }, 'conflict observation');
+      }
+    }
+  }
+  assert.equal(detail.sourceObservations[0].conflicts.length, 20, 'conflicts per source group retain the literal 20-field cap');
+  assert.deepEqual(detail.sourceObservations[0].conflicts.map(({ field }) => field), sourceConflictFields.slice(0, 20), 'conflict truncation retains the first 20 fields');
+  const sellerConflict = detail.sourceObservations[0].conflicts.find(({ field }) => field === 'seller_name');
+  assert.equal(sellerConflict.observations.length, 20, 'conflict observations retain the literal 20-record cap');
+  assert.deepEqual(sellerConflict.observations.map(({ sourceRecordId }) => sourceRecordId), Array.from({ length: 20 }, (_, index) => `record-${index}`), 'conflict truncation retains this group and the first 19 peers');
+
+  assert.equal(detail.listingUrls.length, 100, 'listing URLs retain the literal 100-URL cap');
+  assert.equal(detail.listingUrls[0], 'https://broker.example/score');
+  assert.equal(detail.listingUrls.at(-1), 'https://broker.example/source/98');
+  assert.equal(detail.listingUrls.includes('https://broker.example/source/99'), false, 'listing URL 101 is truncated');
+  for (const url of detail.listingUrls) { assert.equal(typeof url, 'string'); assert.ok(url.length <= 2000); }
+
+  assertRecordContract(detail.score, {
+    fitScore: number, scoreStatus: text(80), confidence: text(80), completenessScore: number,
+    dimensions: { type: 'object' }, unattributedEvidence: { type: 'object' }, appliedCaps: { type: 'object' },
+    gates: { type: 'object' }, confidenceReasons: { type: 'object' }, missingEvidence: { type: 'object' }, summary: { type: 'object' },
+  }, 'score');
+  assert.equal(detail.score.dimensions.length, 7, 'score dimensions retain the literal seven-dimension cap');
+  assert.deepEqual(detail.score.dimensions.map(({ id }) => id), Array.from({ length: 7 }, (_, index) => `dimension-${index}`));
+  for (const dimension of detail.score.dimensions) assertRecordContract(dimension, { id: text(80), label: text(160), contribution: number, evidence: { type: 'object' } }, 'score dimension');
+  assert.equal(detail.score.dimensions[0].evidence.length, 100, 'dimension evidence retains the literal 100-record cap');
+  assert.equal(detail.score.dimensions[0].evidence.at(-1).ruleId, 'rule-99');
+  assert.equal(detail.score.unattributedEvidence.length, 100, 'unattributed evidence retains the literal 100-record cap');
+  assert.equal(detail.score.unattributedEvidence.at(-1).ruleId, 'unattributed-99');
+  for (const evidence of [...detail.score.dimensions[0].evidence, ...detail.score.unattributedEvidence]) {
+    assertRecordContract(evidence, evidenceContract, 'score evidence');
+    assert.equal(evidence.terms.length, 20, 'evidence terms retain the literal 20-item cap');
+    for (const term of evidence.terms) { assert.equal(typeof term, 'string'); assert.ok(term.length <= 160); }
+  }
+  const ruleContract = { ruleId: text(160), reason: text(500), cap: number, value: number };
+  for (const [name, prefix] of [['appliedCaps', 'cap'], ['gates', 'gate']]) {
+    assert.equal(detail.score[name].length, 50, `${name} retains the literal 50-record cap`);
+    assert.equal(detail.score[name].at(-1).ruleId, `${prefix}-49`);
+    for (const rule of detail.score[name]) assertRecordContract(rule, ruleContract, `score.${name}`);
+  }
+  for (const name of ['confidenceReasons', 'missingEvidence']) {
+    assert.equal(detail.score[name].length, 50, `${name} retains the literal 50-item cap`);
+    for (const value of detail.score[name]) { assert.equal(typeof value, 'string'); assert.ok(value.length <= 500); }
+  }
+  assertRecordContract(detail.score.summary, { strengths: { type: 'object' }, concerns: { type: 'object' } }, 'score summary');
+  for (const name of ['strengths', 'concerns']) {
+    assert.equal(detail.score.summary[name].length, 20, `summary ${name} retains the literal 20-item cap`);
+    for (const value of detail.score.summary[name]) { assert.equal(typeof value, 'string'); assert.ok(value.length <= 500); }
+  }
+
+  assertRecordContract(detail.cimSummary, { requests: { type: 'object' }, communications: { type: 'object' } }, 'CIM summary');
+  assert.equal(detail.cimSummary.requests.length, 100, 'CIM requests retain the literal 100-record response cap');
+  assert.equal(detail.cimSummary.requests.at(-1).id, 'cim-99', 'CIM request 101 is deterministically truncated');
+  for (const request of detail.cimSummary.requests) assertRecordContract(request, { id: text(200), status: text(80), updatedAt: text(80) }, 'CIM request');
+  assert.equal(detail.cimSummary.communications.length, 100, 'CIM communications retain the literal 100-record cap');
+  assert.equal(detail.cimSummary.communications.at(-1).id, 'comm-99');
+  for (const communication of detail.cimSummary.communications) assertRecordContract(communication, communicationContract, 'CIM communication');
+
+  assertRecordContract(detail.crmSummary, { submission: { type: 'object' }, communications: { type: 'object' }, factObservations: { type: 'object' }, conflicts: { type: 'object' } }, 'CRM summary');
+  assertRecordContract(detail.crmSummary.submission, { id: text(200), status: text(80), company: text(500), sellerName: text(500), sellerEmail: text(500), brokerName: text(500), brokerEmail: text(500), updatedAt: text(80) }, 'CRM submission');
+  assert.equal(detail.crmSummary.communications.length, 100, 'CRM communications retain the literal 100-record cap');
+  assert.equal(detail.crmSummary.communications.at(-1).id, 'comm-99');
+  for (const communication of detail.crmSummary.communications) assertRecordContract(communication, communicationContract, 'CRM communication');
+  assert.equal(detail.crmSummary.factObservations.length, 13, 'CRM facts retain the literal 13-field cap');
+  assert.deepEqual(detail.crmSummary.factObservations.map(({ field }) => field).sort(), [...approvedPhase1FactFields].sort());
+  for (const fact of detail.crmSummary.factObservations) assertRecordContract(fact, { field: text(80), value: text(4000), provenance: text(80) }, 'CRM fact observation');
+  assert.equal(detail.crmSummary.conflicts.length, 13, 'CRM conflicts retain the literal 13-field cap');
+  assert.deepEqual(detail.crmSummary.conflicts.map(({ field }) => field).sort(), [...approvedPhase1FactFields].sort());
+  for (const conflict of detail.crmSummary.conflicts) assertRecordContract(conflict, { field: text(80), winningProvenance: text(80), crmValue: text(4000) }, 'CRM conflict');
+
+  assertRecordContract(detail.history, { activities: { type: 'object' }, dispositions: { type: 'object' }, operatorFacts: { type: 'object' }, operatorState: { type: 'object' } }, 'history');
+  assert.equal(detail.history.activities.length, 100, 'activities retain the literal 100-record cap');
+  assert.equal(detail.history.activities.at(-1).id, 'activity-99');
+  for (const activity of detail.history.activities) assertRecordContract(activity, { id: text(200), eventType: text(80), summary: text(500), createdAt: text(80), actor: text(160) }, 'activity');
+  assert.equal(detail.history.dispositions.length, 20, 'dispositions retain the literal 20-record cap');
+  assert.equal(detail.history.dispositions.at(-1).id, 'disposition-19');
+  for (const disposition of detail.history.dispositions) assertRecordContract(disposition, { id: text(200), disposition: text(80), reason: text(160), note: text(500), dismissedAt: text(80), dismissedBy: text(160) }, 'disposition');
+  assert.equal(detail.history.operatorFacts.length, 100, 'history operator facts retain the literal 100-record cap');
+  assert.equal(detail.history.operatorFacts.at(-1).id, 'fact-99');
+  for (const fact of detail.history.operatorFacts) {
+    assertRecordContract(fact, operatorFactContract, 'history operator fact');
+    assert.ok(approvedPhase1FactFields.includes(fact.field), `history operator fact ${fact.field} is approved`);
+  }
+  assertRecordContract(detail.history.operatorState, { priority: text(40), note: text(2000), reviewed: boolean, reviewedAt: text(80), reviewedBy: text(160) }, 'history operator state');
+
+  assert.equal(JSON.stringify(detail).includes(sentinel), false, 'raw provider/storage metadata and hostile object/array values never cross the API boundary');
+});
+
+test('source conflicts retain late source-record membership while each serialized conflict stays bounded', async (t) => {
+  // Break caught: selecting the first 20 observations before membership
+  // attribution makes a real, later source record appear conflict-free.
+  const { storage, opportunityId } = await detailStorage(t);
+  const hostile = new Proxy(storage, {
+    get(target, property) {
+      if (property === 'listDealHunterOpportunitySourceObservations') return async () => Array.from({ length: 25 }, (_, index) => ({
+        source_id: `source-${index}`, source_name: `Source ${index}`, source_record_id: `record-${index}`,
+        field: 'reason_for_sale', value: index % 2 ? 'retirement' : 'relocation',
+        observed_at: '2026-08-30T10:00:00.000Z', updated_at: '2026-08-30T10:00:00.000Z',
+      }));
+      const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage: hostile });
+  const late = detail.sourceObservations.find((group) => group.sourceRecordId === 'record-24');
+  assert.ok(late, 'late bounded source group is emitted');
+  assert.equal(late.conflicts.some((conflict) => conflict.field === 'reason_for_sale'), true);
+  const conflict = late.conflicts.find((item) => item.field === 'reason_for_sale');
+  assert.ok(conflict.observations.length <= 20);
+  assert.equal(conflict.observations.some((item) => item.sourceRecordId === 'record-24'), true);
+});
+
+test('detail projects all thirteen scalar CRM facts and rejects non-scalar CRM values', async (t) => {
+  // Break caught: false/zero CRM facts vanish or untrusted CRM objects cross
+  // the authority boundary instead of producing all supported observations.
+  const { storage, opportunityId } = await detailStorage(t);
+  const values = {
+    seller_name: 'crm-seller_name', seller_email: 'crm-seller_email', seller_phone: 'crm-seller_phone',
+    broker_name: 'crm-broker_name', broker_company: 'crm-broker_company', broker_email: 'crm-broker_email', broker_phone: 'crm-broker_phone',
+    reason_for_sale: 'crm-reason_for_sale', real_estate_included: false, seller_financing: 0,
+    management_structure: 'crm-management_structure', customer_concentration: 'crm-customer_concentration', operator_contact_notes: 'crm-operator_contact_notes',
+  };
+  const hostile = new Proxy(storage, {
+    get(target, property) {
+      if (property === 'getSubmission') return async () => ({ id: 'submission-detail', metadata: { dealHunter: { ...values, sellerName: { private: 'nope' } } } });
+      if (property === 'listDealHunterOpportunityFacts') return async () => Object.entries(values).map(([field]) => ({
+        id: `operator-${field}`, field, value: `operator-${field}`, verified: true, actor: 'admin', note: 'verified', created_at: '2026-08-30T12:00:00.000Z', updated_at: '2026-08-30T12:00:00.000Z',
+      }));
+      const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage: hostile });
+  assert.deepEqual(detail.crmSummary.factObservations.map((item) => item.field).sort(), Object.keys(values).sort());
+  assert.equal(detail.crmSummary.factObservations.find((item) => item.field === 'real_estate_included').value, 'false');
+  assert.equal(detail.crmSummary.factObservations.find((item) => item.field === 'seller_financing').value, '0');
+  assert.deepEqual(detail.crmSummary.conflicts.map((item) => item.field).sort(), Object.keys(values).sort());
+  assert.equal(detail.crmSummary.conflicts.every((item) => item.winningProvenance === 'operator'), true);
+  assert.equal(JSON.stringify(detail.crmSummary).includes('nope'), false);
+});
+
+test('detail URL projection table-drives unsafe score and evidence URLs while retaining canonical listing categories', async (t) => {
+  // Break caught: either score/evidence branch can return a credentialed,
+  // control-character, or non-HTTP(S) link after source URLs stay safe.
+  const { storage, opportunityId } = await detailStorage(t);
+  const invalidUrls = [
+    ['credentials', 'https://user:pass@broker.example/private'],
+    ['ASCII control', 'https://broker.example/new\nline'],
+    ['unsupported scheme', 'ftp://broker.example/listing'],
+  ];
+  const sourceRows = [
+    // The first pair canonicalizes to the same link, proving dedupe remains
+    // independent of the invalid score/evidence cases below.
+    { source_id: 'a', source_name: 'A', source_record_id: '1', field: 'listing_url', value: 'https://broker.example/a/../listing', observed_at: '2026-08-30T10:00:00Z' },
+    { source_id: 'b', source_name: 'B', source_record_id: '2', field: 'listing_url', value: 'https://broker.example/listing', observed_at: '2026-08-30T10:00:00Z' },
+    { source_id: 'c', source_name: 'C', source_record_id: '3', field: 'prospectus_url', value: 'https://broker.example/prospectus.pdf', observed_at: '2026-08-30T10:00:00Z' },
+    { source_id: 'd', source_name: 'D', source_record_id: '4', field: 'business_website', value: 'https://business.example/', observed_at: '2026-08-30T10:00:00Z' },
+  ];
+  for (const [kind, invalidUrl] of invalidUrls) {
+    for (const [path, scoreUrl, evidenceUrl] of [
+      ['score', invalidUrl, 'https://broker.example/a/../listing'],
+      ['evidence', 'https://broker.example/a/../listing', invalidUrl],
+    ]) {
+      const hostile = new Proxy(storage, {
+        get(target, property) {
+          if (property === 'getCurrentDealHunterOpportunityScore') return async () => ({ ...currentScore(opportunityId), listing_url: scoreUrl });
+          if (property === 'listDealHunterScoreEvidence') return async () => [{ listing_url: evidenceUrl, value: 'evidence', terms: [], dimension: 'financial-fit' }];
+          if (property === 'listDealHunterOpportunitySourceObservations') return async () => sourceRows;
+          const value = target[property]; return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const detail = await getTriageOpportunityDetail({ opportunityId, storage: hostile });
+      assert.deepEqual(detail.listingUrls, ['https://broker.example/listing'], `${kind} ${path} preserves canonical source-listing dedupe`);
+      assert.equal(detail.sourceObservations.find((item) => item.sourceRecordId === '3').values.prospectus_url, 'https://broker.example/prospectus.pdf');
+      assert.equal(detail.sourceObservations.find((item) => item.sourceRecordId === '4').values.business_website, 'https://business.example/');
+      if (path === 'score') {
+        assert.equal(detail.opportunity.listingUrl, 'https://broker.example/listing', `${kind} score listing defers to the current safe source listing`);
+        assert.equal(detail.listingUrls.includes(invalidUrl), false, `${kind} score listing is absent from listing URLs`);
+      } else {
+        assert.equal(detail.score.dimensions[0].evidence[0].listingUrl, '', `${kind} evidence listing is projected empty`);
+      }
+    }
+  }
+});

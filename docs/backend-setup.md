@@ -17,6 +17,7 @@ The site now includes:
 - Secure upload request generation and a seller-facing upload page at `/secure-documents`
 - Email engagement event tracking and follow-up triage via `/api/webhooks/resend`
 - Acquisition Command Center for 75+ deals, active CIM conversations, pass reasons, source health, and diligence readiness
+- Acquisition Inbox as the default persisted Deal Hunter decision surface, with Operations kept separate for source and administrative controls
 - Spam protection with honeypot, time-to-submit checks, rate limiting, message heuristics, and optional Cloudflare Turnstile
 
 ## Local Development
@@ -42,7 +43,9 @@ Vite proxies `/api/*` requests to the backend during development.
 
 ## Daily Deal Hunter Review
 
-The private admin CRM includes a Deal Hunter scoring panel that pulls the SMB Deal Hunter Google Sheet CSV, accepts a manually exported SMB Deal OS saved search or Deal Radar result as supplemental data, scores recent listings, and sends the daily email. Google Sheets is the current required primary source. Deal OS will become required only after its separate rollout. Airtable is retired and is never fetched or included in source health.
+The private admin CRM opens **Deal Hunter → Inbox** as the default daily decision surface. **Needs Review** reads the persisted authoritative current opportunity set; opening, searching, filtering, paging, or opening Opportunity View does not pull a source, import data, run scoring/backfill, send a CIM request, activate Stage 2, or send outreach. Operators use Inbox to inspect provenance and history, save verified facts, and record Pursue, Watch, or Pass decisions without changing the machine score.
+
+**Deal Hunter → Operations** is the secondary administrative surface for source review, Deal OS import, refresh/backfill, diagnostics, daily email, CIM/follow-up, and other separately governed controls. Its source-review panel pulls the SMB Deal Hunter Google Sheet CSV, accepts a manually exported SMB Deal OS saved search or Deal Radar result as supplemental data, scores recent listings when an explicit operation calls for it, and governs the daily email. Google Sheets is the current required primary source. Deal OS will become required only after its separate rollout. Airtable is retired and is never fetched or included in source health.
 
 Configure:
 
@@ -64,7 +67,7 @@ For the `Mathew  Uckele - Daily Deal Update` **On-Market** tab, CRM synchronizat
 
 ### Manual SMB Deal OS export bridge
 
-A full administrator can upload a `.csv` or `.xlsx` export under **Deal Hunter → Import SMB Deal OS export**. Viewer sessions cannot upload. The administrator must select `Saved search` or `Deal Radar filters`, describe the covered search/filter, record when the export was generated, and may enter the listing count shown by Deal OS. If an expected count is supplied, it must exactly match the file.
+A full administrator can upload a `.csv` or `.xlsx` export under **Deal Hunter → Operations → Import SMB Deal OS export**. Viewer sessions cannot upload. The administrator must select `Saved search` or `Deal Radar filters`, describe the covered search/filter, record when the export was generated, and may enter the listing count shown by Deal OS. If an expected count is supplied, it must exactly match the file.
 
 The importer requires every row to contain a business name and either a stable Deal OS/listing ID or a safe HTTP(S) View Listing URL. It normalizes listing identity, source, dates, business details, financial fields, and broker contacts; deduplicates repeated identities; and stores only allowlisted normalized fields plus file hash, size, type, coverage, export/import timestamps, and authenticated importer. The uploaded file and arbitrary spreadsheet columns are not retained. CSV must be valid UTF-8. XLSX formulas are never evaluated, external listing hyperlinks are extracted, compressed entries are bounded, and macro-enabled/legacy Excel formats are rejected.
 
@@ -72,7 +75,7 @@ An upload is rejected when it is empty, oversized, older than the configured fre
 
 Exports at the 1,000-listing ceiling are accepted but prominently marked as potentially truncated. Source health records the covered search/filter, export and import timestamps, importer, age, expected/actual count, deduplication count, stable-ID count, link count, and cap warning.
 
-For each Pacific business date, the daily job uses one durable claim for either a normal digest or a degraded operational alert. A failed or empty required Google Sheet produces the action-required alert instead of recommendations. The alert instructs the operator to restore published-CSV access and confirms that no stale recommendations, CRM synchronization, CIM request, follow-up, Stage 2 run, or other broker outreach occurred. After correcting access, refresh **Deal Hunter → Review Sources**; the next business date returns to the normal digest once the required Sheet is healthy. A failed provider attempt remains retryable, while provider acceptance and the date-scoped marker prevent a second outcome for the same date.
+For each Pacific business date, the daily job uses one durable claim for either a normal digest or a degraded operational alert. A failed or empty required Google Sheet produces the action-required alert instead of recommendations. The alert instructs the operator to restore published-CSV access and confirms that no stale recommendations, CRM synchronization, CIM request, follow-up, Stage 2 run, or other broker outreach occurred. After correcting access, open **Deal Hunter → Operations** and select **Review Recent** in the source-review panel; the next business date returns to the normal digest once the required Sheet is healthy. A failed provider attempt remains retryable, while provider acceptance and the date-scoped marker prevent a second outcome for the same date.
 
 Admin endpoints:
 
@@ -89,7 +92,7 @@ Read-only viewer access can be enabled for the SMB Deal Hunter team without gran
 - `ADMIN_VIEWER_EMAILS=person1@example.com,person2@example.com` allows magic-link viewer sign-in.
 - `ADMIN_VIEWER_USERNAME` and `ADMIN_VIEWER_PASSWORD` allow password viewer sign-in when password auth is enabled.
 
-Viewer sessions can load the protected CRM, Acquisition Command Center, and Deal Hunter source review. They cannot create or edit CRM records, export CSVs, send daily emails, send CIM requests, run CIM follow-ups, create secure upload links, or update command-center feedback.
+Viewer sessions can load the protected CRM, Acquisition Command Center, Acquisition Inbox, and the read-only Deal Hunter Operations source review. They cannot create or edit CRM records, record Inbox decisions or verified facts, import Deal OS data, refresh/backfill scores, export CSVs, send daily emails, send CIM requests, run CIM follow-ups, create secure upload links, or update command-center feedback.
 
 The production Fly machine runs the in-app scheduler once daily at the configured local time. The scheduler records successful Daily Deal Hunter sends in `email_events` and also writes a local send marker under the configured data directory, so a server restart does not resend the same day's email.
 

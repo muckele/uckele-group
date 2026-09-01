@@ -636,6 +636,17 @@ test('full-backfill scoring and explicit CRM sync require administrator access a
     const viewerTriageResult = await viewerTriage.json();
     assert.equal(viewerTriageResult.success, true);
     assert.ok(Array.isArray(viewerTriageResult.rows));
+    assert.equal(viewerTriageResult.sort, 'acquisition-priority');
+    assert.deepEqual(Object.keys(viewerTriageResult.summary).sort(), [
+      'currentOpportunities', 'highPriority', 'lowConfidence', 'needsReview', 'watchlist',
+    ]);
+    const fractionalTriage = await fetch(`${origin}/api/admin/deal-hunter/triage?page=1.9&pageSize=1.9`, {
+      headers: { Cookie: viewerCookie },
+    });
+    assert.equal(fractionalTriage.status, 200);
+    const fractionalTriageResult = await fractionalTriage.json();
+    assert.equal(fractionalTriageResult.page, 1);
+    assert.equal(fractionalTriageResult.pageSize, 1);
 
     const anonymousTriage = await fetch(`${origin}/api/admin/deal-hunter/triage`);
     assert.equal(anonymousTriage.status, 401);
@@ -887,10 +898,9 @@ test('communication assignment, corrected retry, and Deal Hunter disposition enf
       body: JSON.stringify({ reason: 'not-a-fit' }),
     });
     assert.equal(invalidDisposition.status, 400);
-    const dispositionRequestId = 'http-deal-hunter-disposition';
-    const dispositionResponse = await fetch(`${origin}/api/admin/deal-hunter/dispositions`, {
+    const canonicalWithoutScoreResponse = await fetch(`${origin}/api/admin/deal-hunter/dispositions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Cookie: adminCookie, 'X-Request-ID': dispositionRequestId },
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
       body: JSON.stringify({
         dealKey: 'http-boundary-deal',
         listingUrl: 'https://broker.example.test/http-boundary-deal',
@@ -900,15 +910,48 @@ test('communication assignment, corrected retry, and Deal Hunter disposition enf
         submissionId: submission.id,
       }),
     });
+    assert.equal(canonicalWithoutScoreResponse.status, 409,
+      'an active canonical record must not fall back around the current Inbox-score check');
+    assert.match((await canonicalWithoutScoreResponse.json()).error, /no current Acquisition Inbox score/i);
+    assert.equal((await storage.getSubmission(submission.id)).status, 'review');
+
+    const legacyCreateResponse = await fetch(`${origin}/api/admin/submissions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({
+        company: 'HTTP Legacy Disposition Services',
+        broker_name: 'Legacy Boundary Broker',
+        broker_email: 'legacy-boundary@example.com',
+        listing_url: 'https://broker.example.test/http-legacy-boundary-deal',
+        lead_type: 'broker',
+        status: 'review',
+      }),
+    });
+    assert.equal(legacyCreateResponse.status, 201);
+    const legacySubmission = (await legacyCreateResponse.json()).submission;
+    const legacyDealKey = 'url:https://broker.example.test/http-legacy-boundary-deal';
+    const dispositionRequestId = 'http-deal-hunter-disposition';
+    const dispositionResponse = await fetch(`${origin}/api/admin/deal-hunter/dispositions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie, 'X-Request-ID': dispositionRequestId },
+      body: JSON.stringify({
+        dealKey: legacyDealKey,
+        listingUrl: 'https://broker.example.test/http-legacy-boundary-deal',
+        dealName: 'HTTP Legacy Disposition Services',
+        reason: 'not-a-fit',
+        note: 'Dismissed through the confined pre-Inbox fallback.',
+        submissionId: legacySubmission.id,
+      }),
+    });
     assert.equal(dispositionResponse.status, 200);
     const dispositionResult = await dispositionResponse.json();
     assert.equal(dispositionResult.archived, true);
     assert.equal(dispositionResult.submission.status, 'archived');
-    assert.equal(dispositionResult.disposition.deal_key, 'http-boundary-deal');
+    assert.equal(dispositionResult.disposition.deal_key, legacyDealKey);
     const repeatedDisposition = await fetch(`${origin}/api/admin/deal-hunter/dispositions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
-      body: JSON.stringify({ dealKey: 'http-boundary-deal', reason: 'not-a-fit', submissionId: submission.id }),
+      body: JSON.stringify({ dealKey: legacyDealKey, reason: 'not-a-fit', submissionId: legacySubmission.id }),
     });
     assert.equal(repeatedDisposition.status, 200);
 
