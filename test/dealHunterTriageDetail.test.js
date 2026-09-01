@@ -1243,7 +1243,7 @@ test('Opportunity Detail exposes a bounded existing Broker Materials lifecycle w
     subject: 'CIM / NDA request for Detail Services Co', createdAt: '2026-08-31T15:00:00.000Z',
     updatedAt: '2026-08-31T16:00:00.000Z', requestedAt: '2026-08-31T15:00:00.000Z',
     providerAcceptedAt: '2026-08-31T15:01:00.000Z', deliveredAt: '', respondedAt: '',
-    errorSummary: 'Mailbox bounced.', canRetry: false, canCorrectRecipient: true,
+    errorSummary: 'Delivery failed.', canRetry: false, canCorrectRecipient: true,
     retryRoute: '', correctionRoute: `/api/admin/deal-hunter/cim-requests/cim-bounded/correct-recipient`,
   });
   assert.equal(JSON.stringify(projected).includes('provider-secret'), false);
@@ -1502,7 +1502,7 @@ test('detail closes every nested projection and strips injected storage metadata
       if (property === 'listDealHunterOpportunitySourceObservations') return async (...args) => { calls.sources = args; return sourceRows; };
       if (property === 'listDealHunterOpportunityFacts') return async (...args) => { calls.facts = args; return operatorRows; };
       if (property === 'listDealHunterCimRequests') return async (...args) => {
-        calls.cimRequests = args;
+        calls.cimRequests = [...(calls.cimRequests || []), args];
         return Array.from({ length: 101 }, (_, index) => ({ id: `cim-${index}`, status: overlong, request_state: sentinel, delivery_state: sentinel, provider: sentinel, reply_to: sentinel, metadata: { private: sentinel }, updated_at: overlong }));
       };
       if (property === 'listCrmActivityEvents') return async (...args) => {
@@ -1510,7 +1510,7 @@ test('detail closes every nested projection and strips injected storage metadata
         return Array.from({ length: 101 }, (_, index) => ({ id: `activity-${index}`, event_type: overlong, summary: overlong, created_at: overlong, actor: overlong, provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }));
       };
       if (property === 'listDealHunterDispositions') return async (...args) => {
-        calls.dispositions = args;
+        calls.dispositions = [...(calls.dispositions || []), args];
         return Array.from({ length: 21 }, (_, index) => ({ id: `disposition-${index}`, disposition: overlong, reason: overlong, note: overlong, dismissed_at: overlong, dismissed_by: overlong, provider: sentinel, reply_to: sentinel, delivery_state: sentinel, metadata: { private: sentinel } }));
       };
       if (property === 'listCrmCommunications') return async (...args) => {
@@ -1576,12 +1576,17 @@ test('detail closes every nested projection and strips injected storage metadata
   assert.deepEqual(calls.evidence, [opportunityId, { limit: 500 }], 'evidence read is capped at 500');
   assert.deepEqual(calls.sources, [opportunityId, { limit: 500 }], 'source-observation read is capped at 500');
   assert.deepEqual(calls.facts, [opportunityId, { limit: 100 }], 'operator-fact read is capped at 100');
-  assert.deepEqual(calls.cimRequests, [{ opportunityIds: [opportunityId], detailAuthority: true, limit: 100 }],
-    'only the detail service explicitly opts into bounded canonical CIM authority');
+  assert.deepEqual(calls.cimRequests, [
+    [{ opportunityIds: [opportunityId], detailAuthority: true, limit: 100 }],
+    [{ opportunityIds: [opportunityId], detailAuthority: true, limit: 100 }],
+    [{ dealKeys: [overlong.slice(0, 1000)], limit: 500 }],
+  ], 'detail and Broker Materials use their bounded canonical and alias-aware CIM authority reads');
   assert.deepEqual(calls.activities, [{ submissionId: 'submission-detail', limit: 100 }], 'CRM activity read is capped at 100');
-  assert.equal(calls.dispositions.length, 1);
-  assert.equal(calls.dispositions[0].limit, 20, 'disposition read is capped at 20');
-  assert.equal(Array.isArray(calls.dispositions[0].dealKeys), true);
+  assert.equal(calls.dispositions.length, 2);
+  assert.equal(calls.dispositions[0][0].limit, 20, 'detail disposition read is capped at 20');
+  assert.equal(Array.isArray(calls.dispositions[0][0].dealKeys), true);
+  assert.deepEqual(calls.dispositions[1], [{ dealKeys: [overlong.slice(0, 1000)], limit: 500 }],
+    'Broker Materials checks bounded Pass authority across known deal keys');
   assert.deepEqual(calls.communications, [{ submissionId: 'submission-detail', page: 1, pageSize: 100 }], 'CRM communication read is capped at 100');
 
   assert.deepEqual(Object.keys(detail.effectiveFacts).sort(), [...approvedPhase1FactFields].sort(), 'effective facts expose exactly the literal 13-field Phase 1 contract');

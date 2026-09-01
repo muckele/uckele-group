@@ -69,7 +69,15 @@ function authorityStorage(overrides = {}) {
     async listDealHunterOpportunityFacts() { return state.facts; },
     async listDealHunterOpportunitySourceObservations() { return state.sources; },
     async getSubmission() { return state.submission; },
-    async listDealHunterCimRequests() { return state.requests; },
+    async listDealHunterCimRequests({ opportunityIds = [], dealKeys = [], recipientEmails = [] } = {}) {
+      return state.requests.filter((request) => (
+        (!opportunityIds.length || opportunityIds.includes(request.opportunity_id))
+        && (!dealKeys.length || dealKeys.includes(request.deal_key))
+        && (!recipientEmails.length || recipientEmails.includes(request.recipient_email))
+      ));
+    },
+    async listDealHunterDispositions() { return []; },
+    async listDealHunterIdentityExceptions() { return []; },
     async getDealHunterCimOpportunityClaim() { return state.opportunityClaim; },
     async getDealHunterCimRecipientClaim(email) { return state.recipientClaims.get(String(email).toLowerCase()) || null; },
     async getActiveEmailSuppression() { return state.suppression; },
@@ -117,7 +125,7 @@ test('manual preparation requires current explicit Pursue and actionable source 
   }
 });
 
-test('trusted source, current CRM, and verified operator contacts are selectable but unverified operator facts are excluded', async () => {
+test('trusted source and current CRM contacts remain selectable when the newest operator email fact is unverified', async () => {
   const storage = authorityStorage({
     facts: [
       { id: 'fact-unverified', opportunity_id: opportunityId, field: 'broker_email', value: 'unverified@example.test', verified: false, updated_at: '2026-08-31T17:59:00.000Z' },
@@ -128,9 +136,10 @@ test('trusted source, current CRM, and verified operator contacts are selectable
   const authority = await loadBrokerMaterialsAuthority({ opportunityId, storage, now });
   const emails = authority.recipientOptions.map(({ email }) => email).sort();
 
-  assert.deepEqual(emails, ['crm@example.test', 'source-broker@example.test', 'verified@example.test']);
+  assert.deepEqual(emails, ['crm@example.test', 'source-broker@example.test']);
   assert.equal(emails.includes('unverified@example.test'), false);
-  assert.deepEqual(new Set(authority.recipientOptions.map(({ provenance }) => provenance)), new Set(['crm', 'operator_verified', 'structured_source']));
+  assert.equal(emails.includes('verified@example.test'), false);
+  assert.deepEqual(new Set(authority.recipientOptions.map(({ provenance }) => provenance)), new Set(['crm', 'structured_source']));
 });
 
 test('contact references are opaque, stable across ordering, canonical/provenance bound, and stale after authority identity changes', async () => {
@@ -278,4 +287,147 @@ test('projected broker materials exposes current Pursue, bounded lifecycle, warn
   assert.equal(projection.existingRequest.followUpState, 'not-scheduled');
   const serialized = JSON.stringify(projection.existingRequest);
   for (const secret of ['secret-provider-id', 'providerPayload', 'signature']) assert.equal(serialized.includes(secret), false);
+});
+
+test('critical authority read failures fail closed without issuing a preparation token', async (t) => {
+  const cases = [
+    ['persisted Pass authority', 'listDealHunterDispositions'],
+    ['existing request authority', 'listDealHunterCimRequests'],
+    ['opportunity claim authority', 'getDealHunterCimOpportunityClaim'],
+    ['identity ambiguity authority', 'listDealHunterIdentityExceptions'],
+  ];
+  for (const [name, method] of cases) {
+    await t.test(name, async () => {
+      const storage = authorityStorage();
+      storage[method] = async () => { throw new Error(`${method} unavailable`); };
+      const result = await prepareDealHunterBrokerMaterials({ opportunityId, session: adminSession(), storage, now });
+      assert.equal(result.success, false);
+      assert.equal(result.status, 503);
+      assert.equal(result.code, 'broker_materials_authority_unavailable');
+      assert.equal(Object.hasOwn(result, 'preparationToken'), false);
+    });
+  }
+});
+
+test('only the newest operator broker email fact can authorize a recipient', async () => {
+  const verifiedA = {
+    id: 'fact-email-a', opportunity_id: opportunityId, field: 'broker_email', value: 'operator-a@example.test',
+    verified: true, created_at: '2026-08-31T17:20:00.000Z', updated_at: '2026-08-31T17:20:00.000Z',
+  };
+  const firstStorage = authorityStorage({ facts: [verifiedA] });
+  const first = await loadBrokerMaterialsAuthority({ opportunityId, storage: firstStorage, now });
+  const oldOption = first.recipientOptions.find(({ email }) => email === 'operator-a@example.test');
+  assert.ok(oldOption);
+
+  const verifiedB = {
+    ...verifiedA, id: 'fact-email-b', value: 'operator-b@example.test',
+    created_at: '2026-08-31T17:40:00.000Z', updated_at: '2026-08-31T17:40:00.000Z',
+  };
+  const replacementStorage = authorityStorage({ facts: [verifiedA, verifiedB] });
+  const replacement = await loadBrokerMaterialsAuthority({ opportunityId, storage: replacementStorage, now });
+  assert.equal(replacement.recipientOptions.some(({ email }) => email === 'operator-a@example.test'), false);
+  assert.equal(replacement.recipientOptions.some(({ email }) => email === 'operator-b@example.test'), true);
+
+  const stale = await prepareDealHunterBrokerMaterials({
+    opportunityId, recipientContactRef: oldOption.recipientContactRef,
+    session: adminSession(), storage: replacementStorage, now,
+  });
+  assert.equal(stale.code, 'recipient_contact_stale');
+  assert.equal(Object.hasOwn(stale, 'preparationToken'), false);
+
+  const unverifiedB = { ...verifiedB, verified: false };
+  const unverifiedReplacement = await loadBrokerMaterialsAuthority({
+    opportunityId, storage: authorityStorage({ facts: [verifiedA, unverifiedB] }), now,
+  });
+  assert.equal(unverifiedReplacement.recipientOptions.some(({ provenance }) => provenance === 'operator_verified'), false);
+});
+
+test('known deal-key aliases retain existing request and Pass ownership', async (t) => {
+  const legacyAlias = {
+    id: 'alias-legacy', opportunity_id: opportunityId, alias_type: 'deal-key', alias_value: 'legacy-key',
+    alias_key: 'deal-key:legacy-key', evidence_version: 'legacy-v1', confidence_state: 'exact',
+  };
+  await t.test('existing request under a known alias', async () => {
+    const storage = authorityStorage({ aliases: [legacyAlias], requests: [] });
+    storage.listDealHunterCimRequests = async (options = {}) => (
+      options.dealKeys?.includes('legacy-key')
+        ? [{ id: 'legacy-request', deal_key: 'legacy-key', opportunity_id: null, status: 'sent', updated_at: '2026-08-31T17:50:00.000Z' }]
+        : []
+    );
+    const result = await prepareDealHunterBrokerMaterials({ opportunityId, session: adminSession(), storage, now });
+    assert.equal(result.success, false);
+    assert.equal(result.code, 'existing_request');
+    assert.equal(Object.hasOwn(result, 'preparationToken'), false);
+  });
+
+  await t.test('Pass under a known alias with no current deal key', async () => {
+    const storage = authorityStorage({
+      aliases: [legacyAlias],
+      score: { ...authorityStorage().state.score, deal_key: '' },
+    });
+    storage.listDealHunterDispositions = async (options = {}) => (
+      options.dealKeys?.includes('legacy-key')
+        ? [{ id: 'legacy-pass', deal_key: 'legacy-key', disposition: 'dismissed', updated_at: '2026-08-31T17:50:00.000Z' }]
+        : []
+    );
+    const result = await prepareDealHunterBrokerMaterials({ opportunityId, session: adminSession(), storage, now });
+    assert.equal(result.success, false);
+    assert.equal(result.code, 'opportunity_passed');
+    assert.equal(Object.hasOwn(result, 'preparationToken'), false);
+  });
+});
+
+test('Broker Materials projection preserves production CIM lifecycle vocabulary', async (t) => {
+  const cases = [
+    ['ambiguous', { status: 'ambiguous', request_state: 'provider_ambiguous', delivery_state: 'ambiguous', follow_up_state: 'stopped' }],
+    ['development', { status: 'logged', request_state: 'development_only', delivery_state: 'development-only', follow_up_state: 'not-scheduled' }],
+    ['stopped', { status: 'delivery_issue', request_state: 'stopped', delivery_state: 'bounced', follow_up_state: 'completed' }],
+  ];
+  for (const [name, lifecycle] of cases) {
+    await t.test(name, async () => {
+      const projection = await projectDealHunterBrokerMaterials({
+        opportunityId,
+        storage: authorityStorage({ requests: [{
+          id: `request-${name}`, opportunity_id: opportunityId, recipient_email: 'source-broker@example.test',
+          created_at: '2026-08-31T17:40:00.000Z', updated_at: '2026-08-31T17:41:00.000Z', ...lifecycle,
+        }] }),
+        now,
+      });
+      assert.equal(projection.existingRequest.requestState, lifecycle.request_state);
+      assert.equal(projection.existingRequest.deliveryState, lifecycle.delivery_state);
+      assert.equal(projection.existingRequest.followUpState, lifecycle.follow_up_state);
+    });
+  }
+});
+
+test('Broker Materials projection replaces raw provider diagnostics with a closed safe summary', async () => {
+  const rawProviderError = '{"message":"provider-private-sentinel"}';
+  const projection = await projectDealHunterBrokerMaterials({
+    opportunityId,
+    storage: authorityStorage({ requests: [{
+      id: 'request-provider-error', opportunity_id: opportunityId, recipient_email: 'source-broker@example.test',
+      status: 'failed', request_state: 'ready', delivery_state: 'failed', follow_up_state: 'stopped',
+      delivery_error: rawProviderError, created_at: '2026-08-31T17:40:00.000Z', updated_at: '2026-08-31T17:41:00.000Z',
+    }] }),
+    now,
+  });
+  assert.equal(projection.existingRequest.errorSummary, 'Delivery failed.');
+  const serialized = JSON.stringify(projection.existingRequest);
+  assert.equal(serialized.includes('provider-private-sentinel'), false);
+  assert.equal(serialized.includes(rawProviderError), false);
+});
+
+test('stableCanonicalJson preserves prototype-named data and rejects collision-prone containers', () => {
+  const withPrototypeKey = JSON.parse('{"a":1,"__proto__":{"x":2}}');
+  const canonicalWithPrototypeKey = stableCanonicalJson(withPrototypeKey);
+  assert.notEqual(canonicalWithPrototypeKey, stableCanonicalJson({ a: 1 }));
+  const parsed = JSON.parse(canonicalWithPrototypeKey);
+  assert.equal(Object.hasOwn(parsed, '__proto__'), true);
+  assert.deepEqual(parsed.__proto__, { x: 2 });
+
+  assert.throws(() => stableCanonicalJson(Array(1)), /sparse array/i);
+  const symbol = Symbol('private');
+  assert.throws(() => stableCanonicalJson({ a: 1, [symbol]: 2 }), /symbol key/i);
+  assert.equal(stableCanonicalJson(['second', 'first']), '["second","first"]');
+  assert.throws(() => stableCanonicalJson({ value: Number.POSITIVE_INFINITY }), /non-finite/i);
 });

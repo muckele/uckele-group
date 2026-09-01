@@ -13,9 +13,9 @@ const preparationLifetimeMs = 15 * 60 * 1000;
 const contactReferenceType = 'deal-hunter-broker-contact-reference';
 const preparationType = 'deal-hunter-broker-materials-preparation';
 const requestStatuses = new Set(['pending', 'sent', 'logged', 'failed', 'ambiguous', 'responded', 'delivery_issue', 'follow_up_failed', 'follow_up_pending', 'follow_up_ambiguous']);
-const requestStates = new Set(['not_requested', 'ready', 'claimed', 'pending', 'provider_accepted', 'provider_unknown', 'failed', 'responded']);
-const deliveryStates = new Set(['not-attempted', 'pending', 'accepted', 'sent', 'delivered', 'delayed', 'bounced', 'failed', 'complained', 'suppressed', 'unknown', 'responded']);
-const followUpStates = new Set(['not-scheduled', 'scheduled', 'pending', 'sent', 'failed', 'ambiguous', 'stopped']);
+const requestStates = new Set(['not_requested', 'ready', 'claimed', 'pending', 'provider_accepted', 'provider_unknown', 'provider_ambiguous', 'development_only', 'failed', 'responded', 'stopped']);
+const deliveryStates = new Set(['not-attempted', 'pending', 'accepted', 'sent', 'delivered', 'delayed', 'bounced', 'failed', 'complained', 'suppressed', 'unknown', 'ambiguous', 'development-only', 'responded']);
+const followUpStates = new Set(['not-scheduled', 'scheduled', 'pending', 'sent', 'failed', 'ambiguous', 'stopped', 'completed']);
 
 function text(value, maximum = 500) {
   return ['string', 'number', 'boolean'].includes(typeof value)
@@ -153,20 +153,22 @@ function crmContactCandidates(submission) {
 }
 
 function operatorContactCandidates(facts = []) {
-  return facts.flatMap((fact) => {
-    if (text(fact?.field, 80).toLowerCase() !== 'broker_email' || fact?.verified !== true) return [];
-    const brokerEmail = email(fact.value);
-    if (!validEmail(brokerEmail)) return [];
-    return [{
-      email: brokerEmail,
-      displayName: '',
-      firstName: '',
-      provenance: 'operator_verified',
-      provenanceLabel: 'Verified operator fact',
-      primary: false,
-      identity: { factId: text(fact.id, 200), field: 'broker_email', updatedAt: currentTimestamp(fact) },
-    }];
-  });
+  const current = facts.filter((fact) => text(fact?.field, 80).toLowerCase() === 'broker_email').sort((left, right) => (
+    (Date.parse(currentTimestamp(right)) || 0) - (Date.parse(currentTimestamp(left)) || 0)
+    || text(right?.id, 200).localeCompare(text(left?.id, 200))
+  ))[0];
+  if (!current || current.verified !== true) return [];
+  const brokerEmail = email(current.value);
+  if (!validEmail(brokerEmail)) return [];
+  return [{
+    email: brokerEmail,
+    displayName: '',
+    firstName: '',
+    provenance: 'operator_verified',
+    provenanceLabel: 'Verified operator fact',
+    primary: false,
+    identity: { factId: text(current.id, 200), field: 'broker_email', updatedAt: currentTimestamp(current) },
+  }];
 }
 
 function issueContactOptions({ opportunityId, contacts, secret }) {
@@ -232,12 +234,21 @@ function projectExistingRequest(records = []) {
     providerAcceptedAt: iso(request.first_provider_accepted_at),
     deliveredAt: iso(request.delivered_at),
     respondedAt: iso(request.responded_at),
-    errorSummary: text(request.delivery_error || request.error, 500),
+    errorSummary: safeRequestErrorSummary({ status, deliveryState }),
     canRetry: preAcceptanceFailure,
     canCorrectRecipient: deliveryIssue,
     retryRoute: preAcceptanceFailure ? `/api/admin/deal-hunter/cim-requests/${encodeURIComponent(request.id)}/retry` : '',
     correctionRoute: deliveryIssue ? `/api/admin/deal-hunter/cim-requests/${encodeURIComponent(request.id)}/correct-recipient` : '',
   };
+}
+
+function safeRequestErrorSummary({ status = '', deliveryState = '' } = {}) {
+  if (deliveryState === 'suppressed') return 'The recipient is suppressed.';
+  if (deliveryState === 'complained') return 'The recipient reported the message.';
+  if (status === 'ambiguous' || deliveryState === 'ambiguous' || deliveryState === 'unknown') return 'Delivery could not be confirmed.';
+  if (status === 'failed' || status === 'delivery_issue' || status === 'follow_up_failed'
+    || ['failed', 'bounced'].includes(deliveryState)) return 'Delivery failed.';
+  return '';
 }
 
 function pursuedState(score = {}) {
@@ -257,14 +268,51 @@ async function optionalRead(call, fallback) {
   }
 }
 
+async function requiredAuthorityRead(storage, method, ...args) {
+  if (typeof storage?.[method] !== 'function') throw new Error(`${method} is unavailable.`);
+  return storage[method](...args);
+}
+
+function unavailableAuthority({ opportunityId, opportunity = null, score = null, now }) {
+  return {
+    opportunityId, opportunity, score, recipientOptions: [], warnings: [], existingRequest: null,
+    preparationBlockers: [blocker('broker_materials_authority_unavailable', 'Broker Materials authority could not be verified.')],
+    sendBlockers: [], pursued: false, authorityRevision: '', aliasResolutionFingerprint: '', requiredAuthorityExpiresAt: '',
+    authorityStatus: 503, now,
+  };
+}
+
+function knownDealKeys(score, aliases = []) {
+  return [...new Set([
+    text(score?.deal_key, 1000),
+    ...aliases.filter((item) => ['deal-key', 'deal_key'].includes(text(item?.alias_type, 80).toLowerCase()))
+      .map((item) => text(item?.alias_value, 1000)),
+  ].filter(Boolean))].slice(0, 500);
+}
+
+function unionRequests(...collections) {
+  const byId = new Map();
+  for (const request of collections.flat()) {
+    const id = text(request?.id, 200);
+    if (id && !byId.has(id)) byId.set(id, request);
+  }
+  return [...byId.values()];
+}
+
 export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage, now = new Date() } = {}) {
   const id = text(opportunityId, 200);
   const config = getConfig();
   const at = normalizedNow(now);
-  const [opportunity, score] = await Promise.all([
-    optionalRead(() => storage?.getCurrentDealHunterOpportunity?.(id), null),
-    optionalRead(() => storage?.getCurrentDealHunterOpportunityScore?.(id), null),
-  ]);
+  let opportunity;
+  let score;
+  try {
+    [opportunity, score] = await Promise.all([
+      requiredAuthorityRead(storage, 'getCurrentDealHunterOpportunity', id),
+      requiredAuthorityRead(storage, 'getCurrentDealHunterOpportunityScore', id),
+    ]);
+  } catch {
+    return unavailableAuthority({ opportunityId: id, now: at });
+  }
   if (!opportunity || !score) {
     return {
       opportunityId: id, opportunity, score, recipientOptions: [], warnings: [], existingRequest: null,
@@ -272,17 +320,36 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
       sendBlockers: [], pursued: false, authorityRevision: '', aliasResolutionFingerprint: '', requiredAuthorityExpiresAt: '', now: at,
     };
   }
-  const [aliases, facts, sourceRows, submission, requests, dispositions, opportunityClaim, safety, identityExceptions] = await Promise.all([
-    optionalRead(() => storage?.listDealHunterOpportunityAliases?.({ opportunityIds: [id], limit: 500 }), []),
-    optionalRead(() => storage?.listDealHunterOpportunityFacts?.(id, { limit: 100 }), []),
-    optionalRead(() => storage?.listDealHunterOpportunitySourceObservations?.(id, { limit: 500 }), []),
-    opportunity.primary_submission_id ? optionalRead(() => storage?.getSubmission?.(opportunity.primary_submission_id), null) : null,
-    optionalRead(() => storage?.listDealHunterCimRequests?.({ opportunityIds: [id], detailAuthority: true, limit: 100 }), []),
-    score.deal_key ? optionalRead(() => storage?.listDealHunterDispositions?.({ dealKeys: [score.deal_key], limit: 20 }), []) : [],
-    optionalRead(() => storage?.getDealHunterCimOpportunityClaim?.(id), null),
-    optionalRead(() => storage?.getDealHunterCimSafetySettings?.(), null),
-    optionalRead(() => storage?.listDealHunterIdentityExceptions?.({ statuses: ['open'], limit: 5000 }), []),
-  ]);
+  let aliases;
+  let facts;
+  let sourceRows;
+  let submission;
+  let requests;
+  let dispositions;
+  let opportunityClaim;
+  let safety;
+  let identityExceptions;
+  try {
+    [aliases, facts, sourceRows, submission, opportunityClaim, safety, identityExceptions] = await Promise.all([
+      requiredAuthorityRead(storage, 'listDealHunterOpportunityAliases', { opportunityIds: [id], limit: 500 }),
+      requiredAuthorityRead(storage, 'listDealHunterOpportunityFacts', id, { limit: 100 }),
+      requiredAuthorityRead(storage, 'listDealHunterOpportunitySourceObservations', id, { limit: 500 }),
+      opportunity.primary_submission_id ? requiredAuthorityRead(storage, 'getSubmission', opportunity.primary_submission_id) : null,
+      requiredAuthorityRead(storage, 'getDealHunterCimOpportunityClaim', id),
+      optionalRead(() => storage?.getDealHunterCimSafetySettings?.(), null),
+      requiredAuthorityRead(storage, 'listDealHunterIdentityExceptions', { statuses: ['open'], limit: 5000 }),
+    ]);
+    const dealKeys = knownDealKeys(score, aliases);
+    const [canonicalRequests, aliasRequests, knownDispositions] = await Promise.all([
+      requiredAuthorityRead(storage, 'listDealHunterCimRequests', { opportunityIds: [id], detailAuthority: true, limit: 100 }),
+      dealKeys.length > 0 ? requiredAuthorityRead(storage, 'listDealHunterCimRequests', { dealKeys, limit: 500 }) : [],
+      dealKeys.length > 0 ? requiredAuthorityRead(storage, 'listDealHunterDispositions', { dealKeys, limit: 500 }) : [],
+    ]);
+    requests = unionRequests(canonicalRequests, aliasRequests);
+    dispositions = knownDispositions;
+  } catch {
+    return unavailableAuthority({ opportunityId: id, opportunity, score, now: at });
+  }
   const trustedSourceRows = sourceRows.filter((row) => text(row?.source_id || row?.sourceId, 200) && text(row?.source_record_id || row?.sourceRecordId, 200));
   const contacts = [
     ...sourceContactCandidates(trustedSourceRows),
@@ -291,7 +358,7 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   ];
   const recipientOptions = issueContactOptions({ opportunityId: id, contacts, secret: config.admin.sessionSecret });
   const state = pursuedState(score);
-  const existingRequest = projectExistingRequest(requests.filter((request) => !request?.opportunity_id || request.opportunity_id === id));
+  const existingRequest = projectExistingRequest(requests);
   const manualEligibility = evaluateDealHunterCimEligibility({
     deal: {
       opportunityId: id,
@@ -442,7 +509,7 @@ export async function prepareDealHunterBrokerMaterials({
   const authority = await loadBrokerMaterialsAuthority({ opportunityId, storage, now });
   if (authority.preparationBlockers.length > 0) {
     const first = authority.preparationBlockers[0];
-    return preparationError(authority, first.code, first.message);
+    return preparationError(authority, first.code, first.message, authority.authorityStatus || 409);
   }
   let selectedRecipient = null;
   if (session.role === 'admin' && input.recipientContactRef) {
