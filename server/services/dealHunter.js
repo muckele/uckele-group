@@ -5460,6 +5460,7 @@ function buildCimRequestRecord({
   retryOfRequestId = '',
   correctedRecipient = null,
   communicationId = '',
+  manualApprovalAudit = null,
 } = {}) {
   const now = new Date().toISOString();
   const businessName = normalizeText(deal.name || 'Unnamed business', 220);
@@ -5481,12 +5482,18 @@ function buildCimRequestRecord({
     ),
   );
   const existingMetadata = existingRequest?.metadata && typeof existingRequest.metadata === 'object' ? existingRequest.metadata : {};
+  const inheritedManualApproval = existingMetadata.manualApproval && typeof existingMetadata.manualApproval === 'object'
+    ? existingMetadata.manualApproval
+    : null;
+  const manualApprovalMarker = manualApprovalAudit || inheritedManualApproval;
+  const noFollowUp = manualApprovalMarker?.intent === 'manual_stage_1'
+    && manualApprovalMarker?.followUpPolicy === 'none';
   const resolvedRequestId = requestId || existingRequest?.id || buildDealHunterCimRequestId(deal.opportunityId, recipientEmail);
   const replyToAddress = buildCimReplyToAddress({
     requestId: resolvedRequestId,
     replyTo: getConfig().delivery.resendReplyTo || '',
   });
-  const nextFollowUpAt = nextCimFollowUpAt({
+  const nextFollowUpAt = noFollowUp ? null : nextCimFollowUpAt({
     status,
     followUpCount,
     lastTouchAt: now,
@@ -5523,7 +5530,7 @@ function buildCimRequestRecord({
         : failed
           ? 'failed'
           : existingRequest?.delivery_state || 'not-attempted',
-    follow_up_state: ambiguous ? 'stopped' : nextFollowUpAt ? 'scheduled' : (failed ? 'stopped' : existingRequest?.follow_up_state || 'not-scheduled'),
+    follow_up_state: noFollowUp ? 'not-scheduled' : ambiguous ? 'stopped' : nextFollowUpAt ? 'scheduled' : (failed ? 'stopped' : existingRequest?.follow_up_state || 'not-scheduled'),
     delivery_error: emailResult.error || '',
     provider_message_id: emailResult.providerMessageId || '',
     subject: `CIM / NDA request for ${businessName}`,
@@ -5574,6 +5581,7 @@ function buildCimRequestRecord({
       providerMessageIds,
       opportunityId: deal.opportunityId || existingRequest?.opportunity_id || '',
       initialCommunicationId: existingMetadata.initialCommunicationId || communicationId || '',
+      ...(manualApprovalMarker ? { manualApproval: manualApprovalMarker } : {}),
       ...(correctedRecipient ? { correctedRecipient } : {}),
     },
   };
@@ -5617,6 +5625,13 @@ async function persistPreparedCimCommunication({
     submissionId,
     createdBy: actor || 'deal-hunter',
   });
+  if (message.manualApprovalAudit) {
+    communication.metadata = {
+      ...(communication.metadata || {}),
+      templateVersion: message.templateVersion || '',
+      manualApproval: message.manualApprovalAudit,
+    };
+  }
   return createCommunicationWithActivity({
     communication,
     actor: actor || 'deal-hunter',
@@ -5734,6 +5749,11 @@ function applyAcceptedCommunicationProof(request, communication, proof) {
   };
 }
 
+function cimRequestHasNoFollowUpPolicy(request = {}) {
+  const marker = request?.metadata?.manualApproval;
+  return marker?.intent === 'manual_stage_1' && marker?.followUpPolicy === 'none';
+}
+
 async function reconcileAcceptedInitialCimCommunication({
   storage,
   request,
@@ -5755,7 +5775,7 @@ async function reconcileAcceptedInitialCimCommunication({
     requestId: request.id,
     retryOfRequestId: request.retry_of_request_id || '',
   });
-  const nextFollowUpAt = nextCimFollowUpAt({
+  const nextFollowUpAt = cimRequestHasNoFollowUpPolicy(request) ? null : nextCimFollowUpAt({
     status: proof.emailResult.status,
     followUpCount: Number(request.follow_up_count || 0),
     lastTouchAt: proof.occurredAt,
@@ -5763,7 +5783,7 @@ async function reconcileAcceptedInitialCimCommunication({
   const reconciledRecord = applyAcceptedCommunicationProof({
     ...baseRecord,
     next_follow_up_at: nextFollowUpAt,
-    follow_up_state: nextFollowUpAt ? 'scheduled' : baseRecord.follow_up_state,
+    follow_up_state: nextFollowUpAt ? 'scheduled' : cimRequestHasNoFollowUpPolicy(request) ? 'not-scheduled' : baseRecord.follow_up_state,
   }, communication, proof);
   const savedRequest = await finalizeCimRequestClaimWithActivity(storage, reconciledRecord, request, {
     expectedStatuses: ['pending', 'failed'],
@@ -8123,6 +8143,7 @@ async function sendCimRequestForScoredDeal({
   retryOfRequest = null,
   correctedRecipient = null,
   automationAuthorization = null,
+  manualApproval = null,
 } = {}) {
   if (normalizeText(requestedBy, 160).toLowerCase() === 'automation-stage-3') {
     return { ok: false, status: 409, error: 'Stage 3 automatic transmission is not implemented or authorized in this release.' };
@@ -8136,6 +8157,31 @@ async function sendCimRequestForScoredDeal({
   ) {
     return { ok: false, status: 500, error: 'CIM request tracking storage is not configured.' };
   }
+
+  const manualSend = Boolean(manualApproval);
+  if (manualSend && (
+    manualApproval.intent !== 'manual_stage_1'
+    || manualApproval.requestType !== 'cim_request'
+    || manualApproval.followUpPolicy !== 'none'
+    || !normalizeText(manualApproval.administratorPrincipalId, 300)
+    || !/^[a-f0-9]{64}$/i.test(normalizeText(manualApproval.proposalDigest, 64))
+  )) {
+    return { ok: false, status: 400, error: 'The trusted manual Stage 1 approval is invalid.' };
+  }
+  const inheritedManualMarker = retryOfRequest?.metadata?.manualApproval;
+  const manualApprovalAudit = manualSend
+    ? {
+        intent: 'manual_stage_1',
+        followUpPolicy: 'none',
+        administratorPrincipalId: normalizeText(manualApproval.administratorPrincipalId, 300),
+        proposalDigest: normalizeText(manualApproval.proposalDigest, 64),
+        nonce: normalizeText(manualApproval.nonce, 200),
+        preparedAt: normalizeText(manualApproval.preparedAt, 80),
+        templateVersion: normalizeText(manualApproval.templateVersion, 160),
+      }
+    : inheritedManualMarker?.intent === 'manual_stage_1' && inheritedManualMarker?.followUpPolicy === 'none'
+      ? { ...inheritedManualMarker }
+      : null;
 
   const outreachGate = await assertCimOutreachAllowed({ storage });
   if (!outreachGate.allowed) {
@@ -8225,7 +8271,12 @@ async function sendCimRequestForScoredDeal({
     }
   }
   const recipientEmail = normalizeEmail(approvedMessageDeal?.brokerEmail);
-  const unavailableReason = getCimRequestUnavailableReason(deal, recipientEmail);
+  const eligibility = evaluateDealHunterCimEligibility({
+    deal,
+    recipientEmail,
+    policy: manualSend ? 'manual_stage_1' : 'automated',
+  });
+  const unavailableReason = eligibility.blockers[0]?.message || '';
 
   if (unavailableReason) {
     return {
@@ -8234,6 +8285,50 @@ async function sendCimRequestForScoredDeal({
       error: unavailableReason,
       deal: publicDeal(attachCimRequestStatus([deal], [])[0]),
     };
+  }
+
+  if (manualSend) {
+    const currentScore = await storage.getCurrentDealHunterOpportunityScore?.(deal.opportunityId);
+    const reviewChanged = Boolean(currentScore?.changed_since_review)
+      || Boolean(currentScore?.reviewed_fingerprint && currentScore?.score_fingerprint
+        && currentScore.reviewed_fingerprint !== currentScore.score_fingerprint)
+      || Boolean(currentScore?.reviewed_semantic_digest && currentScore?.semantic_digest
+        && currentScore.reviewed_semantic_digest !== currentScore.semantic_digest);
+    const pursued = normalizeText(currentScore?.operator_priority, 40).toLowerCase() === 'high'
+      && Boolean(currentScore?.reviewed_at)
+      && !reviewChanged
+      && !currentScore?.should_remove;
+    if (!pursued) {
+      return { ok: false, status: 409, code: 'preparation_stale', error: 'Current explicit Pursue authority is required before manual Stage 1 execution.' };
+    }
+    const readiness = await getEmailReadiness({ storage });
+    if (!readiness.outboundConfigured) {
+      return { ok: false, status: 409, code: 'provider_not_ready', error: readiness.issues?.[0] || 'The outbound email provider is not ready.' };
+    }
+    const prospectiveRequestId = buildDealHunterCimRequestId(deal.opportunityId, recipientEmail);
+    const expectedCommunicationId = sha256(`crm-communication:${prospectiveRequestId}:initial`);
+    const currentEnvelope = buildDealHunterCimRequestEmail({
+      to: recipientEmail,
+      deal: approvedMessageDeal,
+      requestedBy,
+      cimRequestId: prospectiveRequestId,
+      communicationId: expectedCommunicationId,
+      manualStage1: { greeting: manualApproval.greeting },
+    });
+    const config = getConfig();
+    const exactMatch = manualApproval.canonicalOpportunityId === deal.opportunityId
+      && normalizeEmail(manualApproval.recipientEmail) === recipientEmail
+      && manualApproval.prospectiveRequestId === prospectiveRequestId
+      && normalizeEmail(manualApproval.senderEmail) === normalizeEmail(config.delivery.resendFromEmail || config.delivery.fallbackRecipient)
+      && manualApproval.senderDisplayName === (normalizeText(config.workflow?.defaultAssignee, 120) || 'Mathew Uckele')
+      && normalizeEmail(manualApproval.replyTo) === normalizeEmail(currentEnvelope.replyTo)
+      && manualApproval.templateVersion === currentEnvelope.templateVersion
+      && manualApproval.subject === currentEnvelope.subject
+      && manualApproval.bodyText === currentEnvelope.text
+      && manualApproval.bodyHtml === currentEnvelope.html;
+    if (!exactMatch) {
+      return { ok: false, status: 409, code: 'preparation_stale', error: 'The approved exact message no longer matches the durable CIM executor.' };
+    }
   }
 
   const lockKey = buildCimDealSendLockKey(deal.opportunityId);
@@ -8418,6 +8513,7 @@ async function sendCimRequestForScoredDeal({
       submissionId: submission.id,
       retryOfRequestId: retryOfRequest?.id || '',
       correctedRecipient,
+      manualApprovalAudit,
     });
     const pendingRecord = automaticSend
       ? {
@@ -8532,14 +8628,28 @@ async function sendCimRequestForScoredDeal({
     }
 
     const communicationId = sha256(`crm-communication:${pendingRequest?.id || pendingRecord.id}:initial`);
-    const renderedMessage = buildDealHunterCimRequestEmail({
+    const generatedMessage = buildDealHunterCimRequestEmail({
       to: recipientEmail,
       deal: approvedMessageDeal,
       requestedBy,
       cimRequestId: pendingRequest?.id || pendingRecord.id,
       submissionId: submission.id,
       communicationId,
+      ...(manualSend ? { manualStage1: { greeting: manualApproval.greeting } } : {}),
     });
+    const renderedMessage = manualSend
+      ? {
+          ...generatedMessage,
+          to: recipientEmail,
+          replyTo: manualApproval.replyTo,
+          subject: manualApproval.subject,
+          headline: manualApproval.subject,
+          text: manualApproval.bodyText,
+          html: manualApproval.bodyHtml,
+          templateVersion: manualApproval.templateVersion,
+          manualApprovalAudit,
+        }
+      : generatedMessage;
     let communication;
 
     try {
@@ -8659,6 +8769,41 @@ async function sendCimRequestForScoredDeal({
         deal: publicDeal(attachCimRequestStatus([deal], [blockedRequest])[0]),
       };
     }
+    const finalManualReadiness = manualSend ? await getEmailReadiness({ storage }) : null;
+    if (manualSend && !finalManualReadiness.outboundConfigured) {
+      const readinessError = finalManualReadiness.issues?.[0] || 'The outbound email provider is not ready. No email was transmitted.';
+      const blockedRequest = await finalizeCimRequestClaimWithActivity(
+        storage,
+        buildCimRequestRecord({
+          deal: approvedMessageDeal,
+          recipientEmail,
+          requestedBy,
+          emailResult: { status: 'failed', error: readinessError, providerMessageId: '' },
+          existingRequest: activeRequest,
+          submissionId: submission.id,
+          retryOfRequestId: retryOfRequest?.id || '',
+          correctedRecipient,
+          communicationId: communication.id,
+          manualApprovalAudit,
+        }),
+        activeRequest,
+        {
+          expectedStatuses: ['pending'],
+          eventType: 'cim.readiness-blocked',
+          summary: readinessError,
+          actor: requestedBy,
+          metadata: { communicationId: communication.id, provider: finalManualReadiness.provider || '' },
+        },
+      );
+      return {
+        ok: false,
+        status: 409,
+        code: 'provider_not_ready',
+        error: readinessError,
+        request: blockedRequest,
+        deal: publicDeal(attachCimRequestStatus([deal], [blockedRequest])[0]),
+      };
+    }
     const finalOutreachGate = await assertCimOutreachAllowed({ storage });
     const finalRecipientPolicy = finalOutreachGate.allowed
       ? await evaluateCimRecipientPolicy({
@@ -8704,11 +8849,13 @@ async function sendCimRequestForScoredDeal({
         deal: publicDeal(attachCimRequestStatus([deal], [blockedRequest])[0]),
       };
     }
-    const finalSuppression = automaticSend
+    const finalSuppression = automaticSend || manualSend
       ? await storage.getActiveEmailSuppression?.(recipientEmail)
       : null;
-    if (automaticSend && finalSuppression) {
-      const suppressionError = 'The recipient became suppressed before Stage 2 provider work. No email was transmitted.';
+    if ((automaticSend || manualSend) && finalSuppression) {
+      const suppressionError = automaticSend
+        ? 'The recipient became suppressed before Stage 2 provider work. No email was transmitted.'
+        : 'The recipient became suppressed before provider work. No email was transmitted.';
       const blockedRequest = await finalizeCimRequestClaimWithActivity(
         storage,
         buildCimRequestRecord({
@@ -8725,7 +8872,7 @@ async function sendCimRequestForScoredDeal({
         activeRequest,
         {
           expectedStatuses: ['pending'],
-          eventType: 'cim.stage2-suppression-blocked',
+          eventType: automaticSend ? 'cim.stage2-suppression-blocked' : 'cim.suppression-blocked',
           summary: suppressionError,
           actor: requestedBy,
           metadata: { suppressionReason: finalSuppression.reason || 'active-suppression' },
@@ -8735,7 +8882,7 @@ async function sendCimRequestForScoredDeal({
         ok: false,
         status: 409,
         error: suppressionError,
-        automationBlockerCode: 'recipient_suppressed',
+        ...(automaticSend ? { automationBlockerCode: 'recipient_suppressed' } : { code: 'recipient_suppressed' }),
         request: blockedRequest,
         deal: publicDeal(attachCimRequestStatus([deal], [blockedRequest])[0]),
       };
@@ -8872,6 +9019,83 @@ async function sendCimRequestForScoredDeal({
     releaseLock(cimRequestSendLocks, lockKey);
     releaseLock(cimRecipientSendLocks, recipientLockKey);
   }
+}
+
+export async function executeApprovedDealHunterCimRequest({
+  approvedProposal,
+  requestedBy = '',
+  administratorPrincipalId = '',
+  storage = getStorage(),
+} = {}) {
+  const proposal = approvedProposal && typeof approvedProposal === 'object' && !Array.isArray(approvedProposal)
+    ? approvedProposal
+    : null;
+  const opportunityId = normalizeText(proposal?.canonicalOpportunityId, 200);
+  const recipientEmail = normalizeEmail(proposal?.recipientEmail);
+  if (
+    !proposal
+    || proposal.intent !== 'manual_stage_1'
+    || proposal.requestType !== 'cim_request'
+    || !opportunityId
+    || !isValidEmail(recipientEmail)
+    || !normalizeText(administratorPrincipalId, 300)
+    || proposal.prospectiveRequestId !== buildDealHunterCimRequestId(opportunityId, recipientEmail)
+  ) {
+    return { ok: false, status: 400, error: 'The trusted approved Broker Materials proposal is invalid.' };
+  }
+
+  const [opportunity, score, aliases, sourceRows] = await Promise.all([
+    storage.getCurrentDealHunterOpportunity?.(opportunityId),
+    storage.getCurrentDealHunterOpportunityScore?.(opportunityId),
+    storage.listDealHunterOpportunityAliases?.({ opportunityIds: [opportunityId], limit: 500 }),
+    storage.listDealHunterOpportunitySourceObservations?.(opportunityId, { limit: 500 }),
+  ]);
+  if (!opportunity || !score || !Array.isArray(aliases) || !Array.isArray(sourceRows)) {
+    return { ok: false, status: 409, code: 'preparation_stale', error: 'Current canonical authority is unavailable for the approved request.' };
+  }
+  const fieldValue = (...fields) => sourceRows.find((row) => fields.includes(normalizeText(row?.field, 80).toLowerCase()))?.value || '';
+  const dealKeyAliases = aliases
+    .filter((alias) => ['deal-key', 'deal_key'].includes(normalizeText(alias?.alias_type, 80).toLowerCase()))
+    .map((alias) => normalizeText(alias.alias_value, 1200))
+    .filter(Boolean);
+  const identityAliases = aliases
+    .filter((alias) => ['listing-id', 'source-identity'].includes(normalizeText(alias?.alias_type, 80).toLowerCase()))
+    .map((alias) => normalizeText(alias.alias_value, 1200))
+    .filter(Boolean);
+  const listingUrl = normalizeText(fieldValue('listing_url') || score.listing_url, 2000);
+  const sourceRow = sourceRows.find((row) => row?.source_id && row?.source_record_id) || {};
+  const annualProfitValue = fieldValue('annual_profit', 'ttm_ebitda');
+  const deal = {
+    id: normalizeText(sourceRow.source_record_id, 240),
+    opportunityId,
+    identityStatus: 'resolved',
+    dealKey: normalizeText(score.deal_key, 1200),
+    dealKeyAliases,
+    identityAliases,
+    sourceId: normalizeText(sourceRow.source_id, 200),
+    sourceName: normalizeText(sourceRow.source_name, 200),
+    stableExternalId: Boolean(sourceRow.source_record_id),
+    name: normalizeText(opportunity.canonical_name || score.name || 'the listed business', 300),
+    description: normalizeText(fieldValue('description'), 4000),
+    industry: normalizeText(fieldValue('industry'), 220),
+    location: normalizeText(opportunity.canonical_location, 220),
+    listingUrl,
+    brokerName: normalizeText(fieldValue('broker_name'), 220),
+    brokerEmail: recipientEmail,
+    score: Number(score.fit_score || 0),
+    annualProfit: annualProfitValue === '' ? null : parseNumber(annualProfitValue),
+    shouldRemove: Boolean(score.should_remove),
+  };
+  return sendCimRequestForScoredDeal({
+    deal,
+    requestedBy,
+    storage,
+    manualApproval: {
+      ...proposal,
+      administratorPrincipalId: normalizeText(administratorPrincipalId, 300),
+      followUpPolicy: 'none',
+    },
+  });
 }
 
 export async function sendDealHunterCimRequest({ dealKey = '', snapshotToken = '', requestedBy = '', storage = getStorage() } = {}) {

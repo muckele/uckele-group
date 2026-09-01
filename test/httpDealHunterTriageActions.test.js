@@ -880,3 +880,74 @@ test('prepare Broker Materials enforces auth and the strict canonical input whil
     assert.deepEqual(after, before);
   });
 });
+
+test('approve Broker Materials requires admin, accepts only token plus digest, and returns the durable owner envelope', async () => {
+  // Break caught: Task 2 has no administrator-only approval route and a durable
+  // owner could otherwise be flattened into a retry-encouraging HTTP failure.
+  const dealKey = 'deal-http-broker-materials-approve';
+  const { storage, opportunityId } = await seedCurrentOpportunity('opp-http-broker-materials-approve', null, dealKey);
+  await linkCanonicalDealKey(storage, { opportunityId, dealKey });
+  const observedAt = '2026-08-30T10:15:00.000Z';
+  for (const [id, field, value] of [
+    ['source-name', 'name', 'HTTP Broker Approval Co'],
+    ['source-email', 'broker_email', 'broker-approval@example.test'],
+  ]) await storage.upsertDealHunterOpportunitySourceObservation({
+    id: `${id}-${opportunityId}`, opportunity_id: opportunityId, source_id: 'sheet', source_name: 'Deal Hunter Sheet',
+    source_record_id: 'row-http-broker-materials-approve', field, value, observed_at: observedAt, created_at: observedAt, updated_at: observedAt,
+  });
+
+  await withServer(async (origin) => {
+    const adminCookie = await login(origin, 'admin', 'change-me-now');
+    const viewerCookie = await login(origin, 'triage-viewer', 'triage-viewer-password');
+    const actionPath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/action`;
+    const preparePath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/prepare`;
+    const approvePath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/approve`;
+    assert.equal((await fetch(actionPath, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify({ action: 'pursue' }),
+    })).status, 200);
+    const preparationResponse = await fetch(preparePath, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: '{}',
+    });
+    assert.equal(preparationResponse.status, 200);
+    const preparation = await preparationResponse.json();
+
+    assert.equal((await fetch(approvePath, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ preparationToken: preparation.preparationToken, approvedProposalDigest: preparation.proposalDigest }),
+    })).status, 401);
+    assert.equal((await fetch(approvePath, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: viewerCookie }, body: JSON.stringify({ preparationToken: preparation.preparationToken, approvedProposalDigest: preparation.proposalDigest }),
+    })).status, 401);
+
+    for (const extra of [
+      { recipient: 'raw@example.test' }, { recipientEmail: 'raw@example.test' }, { recipientContactRef: 'client-ref' },
+      { greeting: 'Hello,' }, { subject: 'override' }, { body: 'override' }, { html: '<p>override</p>' },
+      { sender: 'override' }, { replyTo: 'override@example.test' }, { dealKey: 'client-key' },
+      { policy: 'manual_stage_1' }, { pauseOverride: true }, { cadenceOverride: true },
+      { suppressionOverride: true }, { readinessOverride: true }, { followUp: true },
+      { scheduledAt: new Date().toISOString() }, { pipelineState: 'contacted' },
+    ]) {
+      const response = await fetch(approvePath, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+        body: JSON.stringify({ preparationToken: preparation.preparationToken, approvedProposalDigest: preparation.proposalDigest, ...extra }),
+      });
+      assert.equal(response.status, 400, JSON.stringify(extra));
+    }
+
+    await seedCimAuthority(storage, {
+      id: 'http-broker-materials-existing-owner',
+      dealKey,
+      opportunityId,
+      recipientEmail: 'broker-approval@example.test',
+    });
+    const approvedResponse = await fetch(approvePath, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({ preparationToken: preparation.preparationToken, approvedProposalDigest: preparation.proposalDigest }),
+    });
+    assert.equal(approvedResponse.status, 200);
+    const approved = await approvedResponse.json();
+    assert.equal(approved.success, true);
+    assert.equal(approved.canonicalOpportunityId, opportunityId);
+    assert.equal(approved.durableResult.cimRequest.id, 'http-broker-materials-existing-owner');
+    assert.equal(approved.durableResult.cimRequest.status, 'sent');
+  });
+});

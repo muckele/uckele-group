@@ -50,6 +50,8 @@ import {
 } from './services/dealHunterTriage.js';
 import { setCurrentOperatorOpportunityFact } from './services/dealHunterOpportunityFacts.js';
 import {
+  approveDealHunterBrokerMaterials,
+  parseBrokerMaterialsApprovalInput,
   parseBrokerMaterialsPreparationInput,
   prepareDealHunterBrokerMaterials,
 } from './services/dealHunterBrokerMaterials.js';
@@ -1499,6 +1501,35 @@ export function createApp() {
         return;
       }
       const result = await prepareDealHunterBrokerMaterials({
+        opportunityId: request.params.opportunityId,
+        ...input,
+        session: {
+          principal_id: session.principal_id,
+          role: session.role,
+          username: session.username,
+        },
+        storage: getStorage(),
+      });
+      response.status(result.status || (result.success ? 200 : 409)).json(result);
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/broker-materials/approve',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      let input;
+      try {
+        input = parseBrokerMaterialsApprovalInput(request.body ?? {});
+      } catch (error) {
+        response.status(400).json({ success: false, code: 'invalid_approval_input', error: error.message });
+        return;
+      }
+      const result = await approveDealHunterBrokerMaterials({
         opportunityId: request.params.opportunityId,
         ...input,
         session: {

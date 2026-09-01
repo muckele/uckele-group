@@ -13,7 +13,7 @@ import {
   buildDealHunterCimRequestId,
   evaluateDealHunterCimEligibility,
 } from '../server/services/dealHunter.js';
-import { sha256, stableCanonicalJson, verifySignedPayload } from '../server/utils/security.js';
+import { sha256, signPayload, stableCanonicalJson, verifySignedPayload } from '../server/utils/security.js';
 
 const now = new Date();
 const opportunityId = 'opp-broker-materials';
@@ -430,4 +430,219 @@ test('stableCanonicalJson preserves prototype-named data and rejects collision-p
   assert.throws(() => stableCanonicalJson({ a: 1, [symbol]: 2 }), /symbol key/i);
   assert.equal(stableCanonicalJson(['second', 'first']), '["second","first"]');
   assert.throws(() => stableCanonicalJson({ value: Number.POSITIVE_INFINITY }), /non-finite/i);
+});
+
+async function task2Api() {
+  const service = await import('../server/services/dealHunterBrokerMaterials.js');
+  assert.equal(typeof service.parseBrokerMaterialsApprovalInput, 'function', 'Task 2 must export the strict approval parser');
+  assert.equal(typeof service.approveDealHunterBrokerMaterials, 'function', 'Task 2 must export the approval adapter');
+  return service;
+}
+
+async function preparedApproval({ storage = authorityStorage(), principalId = 'principal-admin-1', preparedAt = now } = {}) {
+  const preparation = await prepareDealHunterBrokerMaterials({
+    opportunityId,
+    session: adminSession(principalId),
+    storage,
+    now: preparedAt,
+  });
+  assert.equal(preparation.success, true);
+  return { storage, preparation };
+}
+
+function resignedPreparation(preparationToken, mutate) {
+  const claims = verifySignedPayload(preparationToken, getConfig().admin.sessionSecret);
+  assert.ok(claims);
+  return signPayload(mutate(structuredClone(claims)), getConfig().admin.sessionSecret);
+}
+
+test('approval accepts only token plus digest and rejects every browser-authored authority field', async () => {
+  const { parseBrokerMaterialsApprovalInput } = await task2Api();
+  assert.deepEqual(parseBrokerMaterialsApprovalInput({ preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64) }), {
+    preparationToken: 'signed.token',
+    approvedProposalDigest: 'a'.repeat(64),
+  });
+  for (const body of [
+    {}, { preparationToken: 'signed.token' }, { approvedProposalDigest: 'a'.repeat(64) },
+    { preparationToken: '', approvedProposalDigest: 'a'.repeat(64) },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'not-a-digest' },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), recipient: 'raw@example.test' },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), recipientEmail: 'raw@example.test' },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), recipientContactRef: 'client-ref' },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), greeting: 'Hello,' },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), subject: 'override' },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), body: 'override' },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), html: '<p>override</p>' },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), sender: 'override' },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), replyTo: 'override@example.test' },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), dealKey: 'client-deal' },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), policy: 'manual_stage_1' },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), pauseOverride: true },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), cadenceOverride: true },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), suppressionOverride: true },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), readinessOverride: true },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), followUp: true },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), scheduledAt: now.toISOString() },
+    { preparationToken: 'signed.token', approvedProposalDigest: 'a'.repeat(64), pipelineState: 'contacted' },
+  ]) assert.throws(() => parseBrokerMaterialsApprovalInput(body), /approval|unknown|token|digest/i, JSON.stringify(body));
+});
+
+test('approval rejects invalid signed claims, route, principal, and digest before durable execution', async (t) => {
+  const { approveDealHunterBrokerMaterials } = await task2Api();
+  const { storage, preparation } = await preparedApproval();
+  const claims = verifySignedPayload(preparation.preparationToken, getConfig().admin.sessionSecret);
+  const cases = [
+    ['invalid signature', `${preparation.preparationToken}tampered`, preparation.proposalDigest, opportunityId, adminSession(), 'invalid_preparation'],
+    ['wrong type', resignedPreparation(preparation.preparationToken, (value) => ({ ...value, typ: 'wrong-type' })), preparation.proposalDigest, opportunityId, adminSession(), 'invalid_preparation'],
+    ['wrong version', resignedPreparation(preparation.preparationToken, (value) => ({ ...value, version: 2 })), preparation.proposalDigest, opportunityId, adminSession(), 'invalid_preparation'],
+    ['wrong intent', resignedPreparation(preparation.preparationToken, (value) => ({ ...value, intent: 'automated' })), preparation.proposalDigest, opportunityId, adminSession(), 'invalid_preparation'],
+    ['wrong request type', resignedPreparation(preparation.preparationToken, (value) => ({ ...value, requestType: 'other' })), preparation.proposalDigest, opportunityId, adminSession(), 'invalid_preparation'],
+    ['expired', signPayload({ ...claims, exp: Date.now() - 1 }, getConfig().admin.sessionSecret), preparation.proposalDigest, opportunityId, adminSession(), 'preparation_stale'],
+    ['wrong route', preparation.preparationToken, preparation.proposalDigest, 'opp-other', adminSession(), 'preparation_mismatch'],
+    ['wrong principal', preparation.preparationToken, preparation.proposalDigest, opportunityId, adminSession('principal-other'), 'preparation_mismatch'],
+    ['submitted digest mismatch', preparation.preparationToken, 'b'.repeat(64), opportunityId, adminSession(), 'proposal_digest_mismatch'],
+    ['signed digest mismatch', resignedPreparation(preparation.preparationToken, (value) => ({ ...value, proposalDigest: 'c'.repeat(64) })), 'c'.repeat(64), opportunityId, adminSession(), 'proposal_digest_mismatch'],
+    ['recomputed digest mismatch', resignedPreparation(preparation.preparationToken, (value) => ({ ...value, approvalBoundPayload: { ...value.approvalBoundPayload, subject: 'tampered but signed' } })), preparation.proposalDigest, opportunityId, adminSession(), 'proposal_digest_mismatch'],
+  ];
+  for (const [name, preparationToken, approvedProposalDigest, routeId, session, code] of cases) {
+    await t.test(name, async () => {
+      let executions = 0;
+      const result = await approveDealHunterBrokerMaterials({
+        opportunityId: routeId,
+        preparationToken,
+        approvedProposalDigest,
+        session,
+        storage,
+        executeApprovedCimRequest: async () => { executions += 1; return { ok: true }; },
+      });
+      assert.equal(result.success, false);
+      assert.equal(result.code, code);
+      assert.equal(executions, 0);
+      assert.equal(Object.hasOwn(result, 'durableResult'), false);
+    });
+  }
+});
+
+test('approval revalidates every material authority binding and returns preparation_stale before execution', async (t) => {
+  const { approveDealHunterBrokerMaterials } = await task2Api();
+  const mutations = [
+    ['current authority', (storage) => { storage.state.opportunity = { ...storage.state.opportunity, status: 'superseded' }; }],
+    ['Pursue authority', (storage) => { storage.state.score = { ...storage.state.score, operator_priority: 'watch' }; }],
+    ['actionability', (storage) => { storage.state.score = { ...storage.state.score, should_remove: true }; }],
+    ['source authority', (storage) => { storage.state.sources = storage.state.sources.map((row) => row.id === 'source-name' ? { ...row, value: 'Changed Co', updated_at: '2026-08-31T17:59:00.000Z' } : row); }],
+    ['alias fingerprint', (storage) => { storage.state.aliases = storage.state.aliases.map((row) => ({ ...row, alias_value: 'changed-key', alias_key: 'deal-key:changed-key' })); }],
+    ['contact provenance', (storage) => { storage.state.sources = storage.state.sources.map((row) => row.id === 'source-email' ? { ...row, id: 'source-email-v2', updated_at: '2026-08-31T17:59:00.000Z' } : row); }],
+    ['recipient email', (storage) => { storage.state.sources = storage.state.sources.map((row) => row.id === 'source-email' ? { ...row, value: 'changed@example.test' } : row); }],
+    ['warning score', (storage) => { storage.state.score = { ...storage.state.score, fit_score: 71 }; }],
+    ['warning profit', (storage) => { storage.state.sources = storage.state.sources.map((row) => row.id === 'source-profit' ? { ...row, value: '100000' } : row); }],
+  ];
+  for (const [name, mutate] of mutations) {
+    await t.test(name, async () => {
+      const { storage, preparation } = await preparedApproval();
+      mutate(storage);
+      let executions = 0;
+      const result = await approveDealHunterBrokerMaterials({
+        opportunityId,
+        preparationToken: preparation.preparationToken,
+        approvedProposalDigest: preparation.proposalDigest,
+        session: adminSession(),
+        storage,
+        executeApprovedCimRequest: async () => { executions += 1; return { ok: true }; },
+      });
+      assert.equal(result.success, false);
+      assert.equal(result.code, 'preparation_stale');
+      assert.equal(executions, 0);
+    });
+  }
+});
+
+test('existing durable ownership takes precedence over staleness without crossing the executor', async () => {
+  const { approveDealHunterBrokerMaterials } = await task2Api();
+  const { storage, preparation } = await preparedApproval();
+  storage.state.score = { ...storage.state.score, operator_priority: 'watch' };
+  storage.state.requests = [{
+    id: 'existing-durable-request', opportunity_id: opportunityId, deal_key: 'deal-42', recipient_email: 'source-broker@example.test',
+    status: 'ambiguous', request_state: 'provider_ambiguous', delivery_state: 'ambiguous', follow_up_state: 'not-scheduled',
+    created_at: '2026-08-31T17:50:00.000Z', updated_at: '2026-08-31T17:51:00.000Z',
+  }];
+  let executions = 0;
+  const result = await approveDealHunterBrokerMaterials({
+    opportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: adminSession(),
+    storage,
+    executeApprovedCimRequest: async () => { executions += 1; return { ok: true }; },
+  });
+  assert.equal(result.success, true);
+  assert.equal(result.canonicalOpportunityId, opportunityId);
+  assert.equal(result.durableResult.cimRequest.id, 'existing-durable-request');
+  assert.equal(result.durableResult.cimRequest.status, 'ambiguous');
+  assert.equal(executions, 0);
+});
+
+test('verified approval crosses the trusted durable boundary exactly once with signed claims and server audit identity only', async () => {
+  const { approveDealHunterBrokerMaterials } = await task2Api();
+  const { storage, preparation } = await preparedApproval();
+  const claims = verifySignedPayload(preparation.preparationToken, getConfig().admin.sessionSecret);
+  const calls = [];
+  const durableRequest = { id: claims.approvalBoundPayload.prospectiveRequestId, status: 'sent', request_state: 'provider_accepted', delivery_state: 'accepted', follow_up_state: 'not-scheduled' };
+  const result = await approveDealHunterBrokerMaterials({
+    opportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: adminSession(),
+    storage,
+    executeApprovedCimRequest: async (input) => { calls.push(input); return { ok: true, status: 201, request: durableRequest }; },
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(Object.keys(calls[0]).sort(), ['administratorPrincipalId', 'approvedProposal', 'requestedBy', 'storage']);
+  assert.deepEqual(calls[0].approvedProposal, {
+    ...claims.approvalBoundPayload,
+    proposalDigest: claims.proposalDigest,
+    nonce: claims.nonce,
+    preparedAt: claims.preparedAt,
+    intent: claims.intent,
+    requestType: claims.requestType,
+  });
+  assert.equal(calls[0].administratorPrincipalId, 'principal-admin-1');
+  assert.equal(calls[0].requestedBy, 'admin');
+  assert.equal(calls[0].storage, storage);
+  assert.equal(result.success, true);
+  assert.equal(result.durableResult.cimRequest, durableRequest);
+});
+
+test('every executor result containing a durable request normalizes safely regardless of delivery outcome', async (t) => {
+  const { approveDealHunterBrokerMaterials } = await task2Api();
+  for (const status of ['pending', 'sent', 'logged', 'failed', 'ambiguous', 'delivery_issue', 'responded']) {
+    await t.test(status, async () => {
+      const { storage, preparation } = await preparedApproval();
+      const request = { id: `durable-${status}`, status, request_state: status, delivery_state: status, follow_up_state: 'not-scheduled' };
+      const result = await approveDealHunterBrokerMaterials({
+        opportunityId,
+        preparationToken: preparation.preparationToken,
+        approvedProposalDigest: preparation.proposalDigest,
+        session: adminSession(),
+        storage,
+        executeApprovedCimRequest: async () => ({ ok: false, status: 503, error: 'provider outcome', request }),
+      });
+      assert.equal(result.success, true);
+      assert.equal(result.canonicalOpportunityId, opportunityId);
+      assert.equal(result.durableResult.cimRequest, request);
+      assert.equal(Object.hasOwn(result, 'error'), false);
+    });
+  }
+
+  const { storage, preparation } = await preparedApproval();
+  const blocked = await approveDealHunterBrokerMaterials({
+    opportunityId,
+    preparationToken: preparation.preparationToken,
+    approvedProposalDigest: preparation.proposalDigest,
+    session: adminSession(),
+    storage,
+    executeApprovedCimRequest: async () => ({ ok: false, status: 409, error: 'paused before claim', code: 'cim_outreach_paused' }),
+  });
+  assert.equal(blocked.success, false);
+  assert.equal(blocked.code, 'cim_outreach_paused');
+  assert.equal(Object.hasOwn(blocked, 'durableResult'), false);
 });

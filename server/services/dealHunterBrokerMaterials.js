@@ -1,11 +1,21 @@
 import { randomUUID } from 'node:crypto';
 
 import { getConfig } from '../config.js';
-import { sha256, signPayload, stableCanonicalJson } from '../utils/security.js';
+import {
+  safeCompareText,
+  sha256,
+  signPayload,
+  stableCanonicalJson,
+  verifySignedPayload,
+} from '../utils/security.js';
 import { evaluateCimRecipientPolicy, getCimOutreachPauseStatus } from './cimOpportunityIdentity.js';
 import { buildDealHunterCimRequestEmail } from './delivery.js';
 import { getEmailReadiness } from './emailReadiness.js';
-import { buildDealHunterCimRequestId, evaluateDealHunterCimEligibility } from './dealHunter.js';
+import {
+  buildDealHunterCimRequestId,
+  evaluateDealHunterCimEligibility,
+  executeApprovedDealHunterCimRequest,
+} from './dealHunter.js';
 
 export const BROKER_MATERIALS_TEMPLATE_VERSION = 'deal-hunter-cim-manual-stage1-v1';
 
@@ -95,6 +105,25 @@ export function parseBrokerMaterialsPreparationInput(input = {}) {
   }
   if (Object.hasOwn(input, 'greeting') && input.greeting !== undefined) result.greeting = parseGreeting(input.greeting);
   return result;
+}
+
+export function parseBrokerMaterialsApprovalInput(input = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new TypeError('The Broker Materials approval input is invalid.');
+  }
+  const allowed = new Set(['preparationToken', 'approvedProposalDigest']);
+  const unknown = Object.keys(input).filter((key) => !allowed.has(key));
+  if (unknown.length > 0) throw new TypeError(`Unknown Broker Materials approval field: ${unknown[0]}.`);
+  if (typeof input.preparationToken !== 'string' || !input.preparationToken.trim() || input.preparationToken.length > 20000) {
+    throw new TypeError('A valid Broker Materials preparation token is required.');
+  }
+  if (typeof input.approvedProposalDigest !== 'string' || !/^[a-f0-9]{64}$/i.test(input.approvedProposalDigest)) {
+    throw new TypeError('A valid Broker Materials proposal digest is required.');
+  }
+  return {
+    preparationToken: input.preparationToken.trim(),
+    approvedProposalDigest: input.approvedProposalDigest.toLowerCase(),
+  };
 }
 
 function sourceContactCandidates(rows = []) {
@@ -489,6 +518,81 @@ function defaultGreeting(recipient) {
   return recipient.firstName ? `Hi ${recipient.firstName},` : 'Hello,';
 }
 
+function buildCurrentApprovedProposal({ authority, selectedRecipient, greeting, requestedBy = 'admin' } = {}) {
+  const prospectiveRequestId = buildDealHunterCimRequestId(authority.opportunityId, selectedRecipient.email);
+  const message = buildDealHunterCimRequestEmail({
+    to: selectedRecipient.email,
+    deal: {
+      opportunityId: authority.opportunityId,
+      dealKey: authority.score.deal_key || '',
+      name: authority.opportunity.canonical_name || authority.score.name || 'the listed business',
+      industry: authority.sourceRows.find((row) => text(row.field, 80).toLowerCase() === 'industry')?.value || '',
+      location: authority.opportunity.canonical_location || '',
+      listingUrl: authority.sourceRows.find((row) => text(row.field, 80).toLowerCase() === 'listing_url')?.value || authority.score.listing_url || '',
+      brokerName: selectedRecipient.displayName,
+      score: authority.score.fit_score,
+    },
+    requestedBy,
+    cimRequestId: prospectiveRequestId,
+    submissionId: authority.submission?.id || '',
+    manualStage1: { greeting },
+  });
+  const config = getConfig();
+  const sender = {
+    displayName: text(config.workflow?.defaultAssignee, 120) || 'Mathew Uckele',
+    email: email(config.delivery?.resendFromEmail || config.delivery?.fallbackRecipient),
+    replyTo: email(message.replyTo),
+  };
+  const review = {
+    opportunity: {
+      canonicalOpportunityId: authority.opportunityId,
+      displayName: text(authority.opportunity.canonical_name || authority.score.name, 500),
+      sourceLabel: text(authority.sourceRows[0]?.source_name, 160),
+      listingUrl: text(authority.sourceRows.find((row) => text(row.field, 80).toLowerCase() === 'listing_url')?.value || authority.score.listing_url, 2000),
+      pursued: true,
+      current: true,
+      score: numberOrNull(authority.score.fit_score),
+      automatedScoreThreshold: 75,
+      annualProfit: numberOrNull(authority.sourceRows.find((row) => ['annual_profit', 'ttm_ebitda'].includes(text(row.field, 80).toLowerCase()))?.value),
+    },
+    recipient: {
+      contactRef: selectedRecipient.recipientContactRef,
+      displayName: selectedRecipient.displayName,
+      email: selectedRecipient.email,
+      provenance: selectedRecipient.provenance,
+    },
+    sender,
+    message: {
+      requestType: 'cim_request',
+      channel: 'email',
+      greeting,
+      subject: message.subject,
+      body: message.text,
+      html: message.html,
+      templateVersion: message.templateVersion,
+    },
+  };
+  const approvalBoundPayload = {
+    canonicalOpportunityId: authority.opportunityId,
+    authorityRevision: authority.authorityRevision,
+    aliasResolutionFingerprint: authority.aliasResolutionFingerprint,
+    prospectiveRequestId,
+    recipientContactRef: selectedRecipient.recipientContactRef,
+    recipientEmail: selectedRecipient.email,
+    recipientProvenanceFingerprint: selectedRecipient.provenanceFingerprint,
+    senderEmail: sender.email,
+    senderDisplayName: sender.displayName,
+    replyTo: sender.replyTo,
+    greeting,
+    subject: message.subject,
+    bodyText: message.text,
+    bodyHtml: message.html,
+    templateVersion: BROKER_MATERIALS_TEMPLATE_VERSION,
+    warningContext: authority.warnings.map(({ code, value, automatedThreshold }) => ({ code, value, ...(automatedThreshold !== undefined ? { automatedThreshold } : {}) })),
+  };
+  return { prospectiveRequestId, message, sender, review, approvalBoundPayload };
+}
+
 export async function prepareDealHunterBrokerMaterials({
   opportunityId = '',
   recipientContactRef,
@@ -537,59 +641,12 @@ export async function prepareDealHunterBrokerMaterials({
   }
   const preparedAt = normalizedNow(now);
   const selectedGreeting = session.role === 'admin' && input.greeting ? input.greeting : defaultGreeting(selectedRecipient);
-  const prospectiveRequestId = buildDealHunterCimRequestId(authority.opportunityId, selectedRecipient.email);
-  const message = buildDealHunterCimRequestEmail({
-    to: selectedRecipient.email,
-    deal: {
-      opportunityId: authority.opportunityId,
-      dealKey: authority.score.deal_key || '',
-      name: authority.opportunity.canonical_name || authority.score.name || 'the listed business',
-      industry: authority.sourceRows.find((row) => text(row.field, 80).toLowerCase() === 'industry')?.value || '',
-      location: authority.opportunity.canonical_location || '',
-      listingUrl: authority.sourceRows.find((row) => text(row.field, 80).toLowerCase() === 'listing_url')?.value || authority.score.listing_url || '',
-      brokerName: selectedRecipient.displayName,
-      score: authority.score.fit_score,
-    },
+  const { review, approvalBoundPayload } = buildCurrentApprovedProposal({
+    authority,
+    selectedRecipient,
+    greeting: selectedGreeting,
     requestedBy: session.username || 'admin',
-    cimRequestId: prospectiveRequestId,
-    submissionId: authority.submission?.id || '',
-    manualStage1: { greeting: selectedGreeting },
   });
-  const config = getConfig();
-  const sender = {
-    displayName: text(config.workflow?.defaultAssignee, 120) || 'Mathew Uckele',
-    email: email(config.delivery?.resendFromEmail || config.delivery?.fallbackRecipient),
-    replyTo: email(message.replyTo),
-  };
-  const review = {
-    opportunity: {
-      canonicalOpportunityId: authority.opportunityId,
-      displayName: text(authority.opportunity.canonical_name || authority.score.name, 500),
-      sourceLabel: text(authority.sourceRows[0]?.source_name, 160),
-      listingUrl: text(authority.sourceRows.find((row) => text(row.field, 80).toLowerCase() === 'listing_url')?.value || authority.score.listing_url, 2000),
-      pursued: true,
-      current: true,
-      score: numberOrNull(authority.score.fit_score),
-      automatedScoreThreshold: 75,
-      annualProfit: numberOrNull(authority.sourceRows.find((row) => ['annual_profit', 'ttm_ebitda'].includes(text(row.field, 80).toLowerCase()))?.value),
-    },
-    recipient: {
-      contactRef: selectedRecipient.recipientContactRef,
-      displayName: selectedRecipient.displayName,
-      email: selectedRecipient.email,
-      provenance: selectedRecipient.provenance,
-    },
-    sender,
-    message: {
-      requestType: 'cim_request',
-      channel: 'email',
-      greeting: selectedGreeting,
-      subject: message.subject,
-      body: message.text,
-      html: message.html,
-      templateVersion: message.templateVersion,
-    },
-  };
   const sendBlockers = await selectedSendBlockers({ authority, selectedRecipient, storage, now: preparedAt });
   if (session.role !== 'admin') {
     return {
@@ -601,29 +658,12 @@ export async function prepareDealHunterBrokerMaterials({
       sendBlockers: [blocker('administrator_required', 'An administrator must prepare and approve this request.')],
     };
   }
+  const config = getConfig();
   const expiry = Math.min(
     preparedAt.getTime() + preparationLifetimeMs,
     authority.requiredAuthorityExpiresAt ? Date.parse(authority.requiredAuthorityExpiresAt) : Number.POSITIVE_INFINITY,
   );
   const expiresAt = new Date(expiry).toISOString();
-  const approvalBoundPayload = {
-    canonicalOpportunityId: authority.opportunityId,
-    authorityRevision: authority.authorityRevision,
-    aliasResolutionFingerprint: authority.aliasResolutionFingerprint,
-    prospectiveRequestId,
-    recipientContactRef: selectedRecipient.recipientContactRef,
-    recipientEmail: selectedRecipient.email,
-    recipientProvenanceFingerprint: selectedRecipient.provenanceFingerprint,
-    senderEmail: sender.email,
-    senderDisplayName: sender.displayName,
-    replyTo: sender.replyTo,
-    greeting: selectedGreeting,
-    subject: message.subject,
-    bodyText: message.text,
-    bodyHtml: message.html,
-    templateVersion: BROKER_MATERIALS_TEMPLATE_VERSION,
-    warningContext: authority.warnings.map(({ code, value, automatedThreshold }) => ({ code, value, ...(automatedThreshold !== undefined ? { automatedThreshold } : {}) })),
-  };
   const proposalDigest = sha256(stableCanonicalJson(approvalBoundPayload));
   const claims = {
     typ: preparationType,
@@ -650,4 +690,140 @@ export async function prepareDealHunterBrokerMaterials({
     warnings: authority.warnings,
     sendBlockers,
   };
+}
+
+function decodeAuthenticPreparationToken(token, secret) {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) return { claims: null, expired: false };
+    const claims = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    if (!claims || typeof claims !== 'object' || Array.isArray(claims)) return { claims: null, expired: false };
+    if (!safeCompareText(signPayload(claims, secret), String(token))) return { claims: null, expired: false };
+    if (!Number.isFinite(claims.exp) || claims.exp <= Date.now()) return { claims: null, expired: true };
+    return { claims: verifySignedPayload(token, secret), expired: false };
+  } catch {
+    return { claims: null, expired: false };
+  }
+}
+
+function approvalFailure(code, error, status = 409, extras = {}) {
+  return { success: false, status, code, error, ...extras };
+}
+
+function durableApprovalResult(canonicalOpportunityId, cimRequest) {
+  return {
+    success: true,
+    canonicalOpportunityId,
+    durableResult: { cimRequest },
+  };
+}
+
+export async function approveDealHunterBrokerMaterials({
+  opportunityId = '',
+  preparationToken,
+  approvedProposalDigest,
+  session = {},
+  storage,
+  now = new Date(),
+  executeApprovedCimRequest = executeApprovedDealHunterCimRequest,
+} = {}) {
+  let input;
+  try {
+    input = parseBrokerMaterialsApprovalInput({ preparationToken, approvedProposalDigest });
+  } catch (error) {
+    return approvalFailure('invalid_approval_input', error.message, 400);
+  }
+  const config = getConfig();
+  const verified = decodeAuthenticPreparationToken(input.preparationToken, config.admin.sessionSecret);
+  if (verified.expired) {
+    return approvalFailure('preparation_stale', 'The Broker Materials preparation expired. Prepare and review it again.', 409);
+  }
+  const claims = verified.claims;
+  if (
+    claims?.typ !== preparationType
+    || claims.version !== 1
+    || claims.intent !== 'manual_stage_1'
+    || claims.requestType !== 'cim_request'
+    || !claims.approvalBoundPayload
+    || typeof claims.approvalBoundPayload !== 'object'
+    || Array.isArray(claims.approvalBoundPayload)
+  ) {
+    return approvalFailure('invalid_preparation', 'The Broker Materials preparation is invalid.', 400);
+  }
+  const canonicalOpportunityId = text(opportunityId, 200);
+  if (
+    !safeCompareText(claims.canonicalOpportunityId, canonicalOpportunityId)
+    || !safeCompareText(claims.approvalBoundPayload.canonicalOpportunityId, canonicalOpportunityId)
+  ) {
+    return approvalFailure('preparation_mismatch', 'The preparation does not match this canonical opportunity.', 409);
+  }
+  const principalId = text(session.principal_id, 300);
+  if (!principalId || !safeCompareText(claims.administratorPrincipalId, principalId)) {
+    return approvalFailure('preparation_mismatch', 'The preparation belongs to a different administrator.', 403);
+  }
+  let recomputedDigest = '';
+  try {
+    recomputedDigest = sha256(stableCanonicalJson(claims.approvalBoundPayload));
+  } catch {
+    return approvalFailure('invalid_preparation', 'The Broker Materials preparation is invalid.', 400);
+  }
+  if (
+    !safeCompareText(claims.proposalDigest, input.approvedProposalDigest)
+    || !safeCompareText(recomputedDigest, input.approvedProposalDigest)
+  ) {
+    return approvalFailure('proposal_digest_mismatch', 'The approved proposal digest does not match the signed preparation.', 409);
+  }
+
+  const authority = await loadBrokerMaterialsAuthority({ opportunityId: canonicalOpportunityId, storage, now });
+  if (authority.existingRequest) {
+    return durableApprovalResult(canonicalOpportunityId, authority.existingRequest);
+  }
+  if (authority.preparationBlockers.length > 0) {
+    return approvalFailure('preparation_stale', 'Current opportunity authority changed after preparation. Prepare and review it again.', 409);
+  }
+  const signed = claims.approvalBoundPayload;
+  const selectedRecipient = authority.recipientOptions.find((candidate) => (
+    safeCompareText(candidate.recipientContactRef, signed.recipientContactRef)
+    && safeCompareText(candidate.email, signed.recipientEmail)
+    && safeCompareText(candidate.provenanceFingerprint, signed.recipientProvenanceFingerprint)
+  ));
+  if (!selectedRecipient) {
+    return approvalFailure('preparation_stale', 'The approved broker recipient is no longer current. Prepare and review it again.', 409);
+  }
+  let currentProposal;
+  try {
+    currentProposal = buildCurrentApprovedProposal({
+      authority,
+      selectedRecipient,
+      greeting: signed.greeting,
+      requestedBy: session.username || 'admin',
+    }).approvalBoundPayload;
+  } catch {
+    return approvalFailure('preparation_stale', 'The approved message can no longer be reproduced from current authority.', 409);
+  }
+  if (!safeCompareText(stableCanonicalJson(currentProposal), stableCanonicalJson(signed))) {
+    return approvalFailure('preparation_stale', 'Material Broker Materials authority changed after preparation. Prepare and review it again.', 409);
+  }
+
+  const approvedProposal = {
+    ...signed,
+    proposalDigest: claims.proposalDigest,
+    nonce: claims.nonce,
+    preparedAt: claims.preparedAt,
+    intent: claims.intent,
+    requestType: claims.requestType,
+  };
+  const result = await executeApprovedCimRequest({
+    approvedProposal,
+    requestedBy: session.username || 'admin',
+    administratorPrincipalId: principalId,
+    storage,
+  });
+  if (result?.request?.id) return durableApprovalResult(canonicalOpportunityId, result.request);
+  return approvalFailure(
+    result?.code || (result?.outreachPause ? 'cim_outreach_paused' : 'approval_blocked'),
+    result?.error || 'The approved CIM request could not enter durable execution.',
+    result?.status || 409,
+    result?.outreachPause ? { sendBlockers: [blocker('cim_outreach_paused', result.error)] } : {},
+  );
 }
