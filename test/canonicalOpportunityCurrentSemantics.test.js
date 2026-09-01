@@ -1582,6 +1582,47 @@ test('SQLite atomically rejects new CIM claims for a superseded opportunity whil
   }), false);
 });
 
+test('SQLite reads the current recipient claim by normalized recipient without mutating it', async (t) => {
+  // Break caught: preparation has no read-only recipient-claim lookup and
+  // would otherwise need to claim/release merely to explain a blocker.
+  const storage = sqliteStorage(t);
+  await seedOpportunity(storage, { opportunityId: 'opp-recipient-claim-read' });
+  const claimed = await storage.claimDealHunterCimRecipient({
+    opportunityId: 'opp-recipient-claim-read', requestId: 'request-recipient-read',
+    recipientEmail: ' Broker@Example.Test ', nowIso: '2026-08-31T17:00:00.000Z',
+    expiresAt: '2026-08-31T18:30:00.000Z', metadata: { purpose: 'read-parity' },
+  });
+  assert.equal(claimed.claimed, true);
+  const first = await storage.getDealHunterCimRecipientClaim('BROKER@example.test');
+  const second = await storage.getDealHunterCimRecipientClaim(' broker@example.test ');
+  assert.equal(first.request_id, 'request-recipient-read');
+  assert.deepEqual(first, second);
+  assert.deepEqual(first.metadata, { purpose: 'read-parity' });
+});
+
+test('Supabase recipient-claim getter uses one normalized read-only maybeSingle lookup', async () => {
+  // Break caught: adapter parity accidentally routes through claim/delete RPCs
+  // or queries an unnormalized recipient.
+  const calls = [];
+  const row = { recipient_email: 'broker@example.test', request_id: 'request-1', opportunity_id: 'opp-1' };
+  const query = {
+    select(columns) { calls.push(['select', columns]); return query; },
+    eq(column, value) { calls.push(['eq', column, value]); return query; },
+    async maybeSingle() { calls.push(['maybeSingle']); return { data: row, error: null }; },
+  };
+  const storage = createSupabaseStorage({ storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } }, {
+    client: {
+      from(table) { calls.push(['from', table]); return query; },
+      async rpc(name) { assert.fail(`recipient read must not call RPC ${name}`); },
+    },
+  });
+  assert.deepEqual(await storage.getDealHunterCimRecipientClaim(' Broker@Example.Test '), row);
+  assert.deepEqual(calls, [
+    ['from', 'deal_hunter_cim_recipient_claims'], ['select', '*'],
+    ['eq', 'recipient_email', 'broker@example.test'], ['maybeSingle'],
+  ]);
+});
+
 test('SQLite alias mutation primitives atomically reject a superseded target', async (t) => {
   const storage = sqliteStorage(t);
   await seedOpportunity(storage, { opportunityId: 'opp-alias-target', status: 'superseded' });

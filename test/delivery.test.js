@@ -309,6 +309,66 @@ test('CIM broker emails never expose an internal automation actor as the sender 
   assert.match(message.text, /Mathew Uckele/);
 });
 
+test('manual Stage 1 CIM copy accepts only a validated greeting and returns its explicit template version', () => {
+  // Break caught: the existing builder owns its greeting and has no exact,
+  // versioned manual-review envelope.
+  const message = buildDealHunterCimRequestEmail({
+    to: 'broker@example.com',
+    deal: sampleDeal,
+    requestedBy: 'Mathew Uckele',
+    cimRequestId: 'request-manual',
+    manualStage1: { greeting: 'Hi Avery,' },
+  });
+
+  assert.equal(message.templateVersion, 'deal-hunter-cim-manual-stage1-v1');
+  assert.equal(message.greeting, 'Hi Avery,');
+  assert.equal(message.text.startsWith('Hi Avery,\n'), true);
+  assert.match(message.html, />Hi Avery,</);
+  assert.doesNotMatch(message.html, /Hello Test Broker/);
+  for (const greeting of ['Hi\nAvery,', 'Hi\rAvery,', '\nHello,', 'Hello,\r', 'Hi\0Avery,', '<b>Hello</b>', 'x'.repeat(121)]) {
+    assert.throws(() => buildDealHunterCimRequestEmail({
+      to: 'broker@example.com', deal: sampleDeal, cimRequestId: 'request-manual', manualStage1: { greeting },
+    }), /greeting|plain text|invalid/i);
+  }
+});
+
+test('manual Stage 1 provider HTML adds no substantive copy absent from the reviewed subject and complete text', () => {
+  // Break caught: the branded template currently adds preview/title/CTA copy
+  // that an administrator cannot see in the plain-text review.
+  const message = buildDealHunterCimRequestEmail({
+    to: 'broker@example.com',
+    deal: sampleDeal,
+    requestedBy: 'Mathew Uckele',
+    cimRequestId: 'request-manual-parity',
+    manualStage1: { greeting: 'Hello,' },
+  });
+  const visibleHtml = message.html
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&(?:nbsp|amp|quot|#39);/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const reviewed = `${message.subject} ${message.text}`.replace(/\s+/g, ' ');
+  for (const phrase of visibleHtml.split(/[.!?]\s+/).map((value) => value.trim()).filter((value) => value.length > 20)) {
+    assert.equal(reviewed.includes(phrase), true, `HTML-only phrase: ${phrase}`);
+  }
+});
+
+test('default and Stage 2 CIM copy remain unchanged without the trusted manual option', () => {
+  // Break caught: adding manual greeting support accidentally changes legacy
+  // direct copy or removes Stage 2 compliance disclosures.
+  const direct = buildDealHunterCimRequestEmail({ to: 'broker@example.com', deal: sampleDeal, requestedBy: 'Mathew Uckele', cimRequestId: 'direct' });
+  const stage2 = buildDealHunterCimRequestEmail({ to: 'broker@example.com', deal: sampleDeal, requestedBy: 'automation-stage-2', cimRequestId: 'stage-2' });
+  assert.equal(direct.subject, 'CIM / NDA request for Commercial HVAC Maintenance Co');
+  assert.equal(direct.text.startsWith('Hello Test Broker,\n'), true);
+  assert.match(direct.text, /Best,\nMathew Uckele\nUckele Group$/);
+  assert.equal(Object.hasOwn(direct, 'templateVersion'), false);
+  assert.match(stage2.text, /commercial acquisition-outreach message/);
+  assert.match(stage2.text, /reply with “unsubscribe” or “stop”/);
+  assert.match(stage2.text, /Postal address:/);
+  assert.equal(Object.hasOwn(stage2, 'templateVersion'), false);
+});
+
 test('CIM request email tags are safe for Resend when deal keys contain punctuation', () => {
   const message = buildDealHunterCimRequestEmail({
     to: 'broker@example.com',

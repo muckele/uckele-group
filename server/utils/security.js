@@ -12,6 +12,28 @@ export function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function canonicalJsonValue(value, path = '$') {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError(`Unsupported non-finite number at ${path}.`);
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((item, index) => canonicalJsonValue(item, `${path}[${index}]`));
+  if (typeof value === 'object') {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) throw new TypeError(`Unsupported object at ${path}.`);
+    return Object.keys(value).sort().reduce((result, key) => {
+      result[key] = canonicalJsonValue(value[key], `${path}.${key}`);
+      return result;
+    }, {});
+  }
+  throw new TypeError(`Unsupported JSON value at ${path}.`);
+}
+
+export function stableCanonicalJson(value) {
+  return JSON.stringify(canonicalJsonValue(value));
+}
+
 export function hashIp(value) {
   return sha256(value).slice(0, 24);
 }

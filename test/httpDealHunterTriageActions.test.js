@@ -17,8 +17,10 @@ process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
 delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
 
 const { createApp } = await import('../server/app.js');
+const { getConfig } = await import('../server/config.js');
 const { getStorage } = await import('../server/storage/index.js');
 const { createManualSubmission } = await import('../server/services/submissions.js');
+const { verifySignedPayload } = await import('../server/utils/security.js');
 let loginSequence = 0;
 const authenticatedCookies = new Map();
 
@@ -737,7 +739,7 @@ test('triage detail remains readable while only administrators may enrich facts 
     const viewerDetail = await fetch(detailPath.replace(/^/, origin), { headers: { Cookie: viewerCookie } });
     assert.equal(viewerDetail.status, 200);
     assert.deepEqual(Object.keys(await viewerDetail.json()).sort(), [
-      'cimSummary', 'crmSummary', 'effectiveFacts', 'history', 'listingUrls', 'missingCriticalFields',
+      'brokerMaterials', 'cimSummary', 'crmSummary', 'effectiveFacts', 'history', 'listingUrls', 'missingCriticalFields',
       'operatorFacts', 'opportunity', 'score', 'sourceObservations',
     ]);
     assert.equal((await fetch(factPath.replace(/^/, origin), {
@@ -802,5 +804,79 @@ test('triage detail remains readable while only administrators may enrich facts 
     assert.equal(after.operator_priority, 'high');
     assert.ok(after.reviewed_at);
     assert.equal(forbiddenCalls, 0, 'triage actions do not refresh or alter machine scoring');
+  });
+});
+
+test('prepare Broker Materials enforces auth and the strict canonical input while remaining side-effect free', async () => {
+  // Break caught: the canonical prepare route and viewer-safe principal-bound
+  // contract do not yet exist.
+  const { storage, opportunityId } = await seedCurrentOpportunity('opp-http-broker-materials');
+  const observedAt = '2026-08-30T10:15:00.000Z';
+  for (const [id, field, value] of [
+    ['source-name', 'name', 'HTTP Broker Materials Co'],
+    ['source-email', 'broker_email', 'broker-http@example.test'],
+  ]) await storage.upsertDealHunterOpportunitySourceObservation({
+    id: `${id}-${opportunityId}`, opportunity_id: opportunityId, source_id: 'sheet', source_name: 'Deal Hunter Sheet',
+    source_record_id: 'row-http-broker-materials', field, value, observed_at: observedAt, created_at: observedAt, updated_at: observedAt,
+  });
+
+  await withServer(async (origin) => {
+    const adminCookie = await login(origin, 'admin', 'change-me-now');
+    const viewerCookie = await login(origin, 'triage-viewer', 'triage-viewer-password');
+    const actionPath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/action`;
+    const preparePath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/prepare`;
+    assert.equal((await fetch(actionPath, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify({ action: 'pursue' }),
+    })).status, 200);
+
+    const before = {
+      score: await storage.getDealHunterOpportunityScore(opportunityId),
+      opportunity: await storage.getDealHunterOpportunity(opportunityId),
+      requests: await storage.listDealHunterCimRequests({ opportunityIds: [opportunityId], detailAuthority: true, limit: 100 }),
+      facts: await storage.listDealHunterOpportunityFacts(opportunityId),
+      sources: await storage.listDealHunterOpportunitySourceObservations(opportunityId),
+      activities: await storage.listCrmActivityEvents({ submissionId: 'missing', limit: 100 }),
+    };
+    assert.equal((await fetch(preparePath, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 401);
+    for (const body of [
+      { recipientEmail: 'raw@example.test' }, { subject: 'override' }, { body: 'override' }, { sender: 'override' },
+      { dealKey: 'client-key' }, { score: 99 }, { annualProfit: 1 }, { policy: 'manual_stage_1' },
+      { pauseOverride: true }, { followUp: true },
+    ]) {
+      const response = await fetch(preparePath, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 400, JSON.stringify(body));
+    }
+
+    const adminResponse = await fetch(preparePath, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify({ greeting: '  Hello,  ' }),
+    });
+    assert.equal(adminResponse.status, 200);
+    const admin = await adminResponse.json();
+    assert.equal(admin.success, true);
+    assert.equal(admin.previewOnly, false);
+    const claims = verifySignedPayload(admin.preparationToken, getConfig().admin.sessionSecret);
+    assert.equal(claims.canonicalOpportunityId, opportunityId);
+    assert.ok(claims.administratorPrincipalId);
+    assert.equal(claims.approvalBoundPayload.greeting, 'Hello,');
+
+    const viewerResponse = await fetch(preparePath, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: viewerCookie }, body: '{}',
+    });
+    assert.equal(viewerResponse.status, 200);
+    const viewer = await viewerResponse.json();
+    assert.equal(viewer.previewOnly, true);
+    for (const key of ['preparationToken', 'proposalDigest', 'nonce']) assert.equal(Object.hasOwn(viewer, key), false);
+
+    const after = {
+      score: await storage.getDealHunterOpportunityScore(opportunityId),
+      opportunity: await storage.getDealHunterOpportunity(opportunityId),
+      requests: await storage.listDealHunterCimRequests({ opportunityIds: [opportunityId], detailAuthority: true, limit: 100 }),
+      facts: await storage.listDealHunterOpportunityFacts(opportunityId),
+      sources: await storage.listDealHunterOpportunitySourceObservations(opportunityId),
+      activities: await storage.listCrmActivityEvents({ submissionId: 'missing', limit: 100 }),
+    };
+    assert.deepEqual(after, before);
   });
 });

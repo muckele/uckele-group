@@ -4668,7 +4668,7 @@ async function performHighFitDealsCrmSync(scoredDeals = [], storage = getStorage
   return summary;
 }
 
-function buildCimRequestId(opportunityId, recipientEmail) {
+export function buildDealHunterCimRequestId(opportunityId, recipientEmail) {
   return sha256(`deal-hunter-cim-request:${opportunityId}:${normalizeEmail(recipientEmail)}`);
 }
 
@@ -4939,40 +4939,51 @@ function findCimStopEvent(request, events = []) {
     .sort((left, right) => Date.parse(right.created_at || '') - Date.parse(left.created_at || ''))[0] || null;
 }
 
-function getCimRequestUnavailableReason(deal, recipientEmail) {
+export function evaluateDealHunterCimEligibility({ deal = {}, recipientEmail = '', policy = 'automated' } = {}) {
+  const manualStage1 = policy === 'manual_stage_1';
+  const blockers = [];
+  const warnings = [];
+  const addBlocker = (code, message) => blockers.push({ code, message });
+
   if (deal?.identityStatus === 'ambiguous') {
-    return 'Opportunity identity is ambiguous. An administrator must resolve it before outreach.';
+    addBlocker('canonical_identity_ambiguous', 'Opportunity identity is ambiguous. An administrator must resolve it before outreach.');
   }
-
   if (!deal?.opportunityId) {
-    return 'Canonical opportunity identity is unavailable. Outreach is blocked until identity storage is healthy.';
+    addBlocker('canonical_identity_unavailable', 'Canonical opportunity identity is unavailable. Outreach is blocked until identity storage is healthy.');
   }
-
-  if (!deal?.dealKey) {
-    return 'Deal tracking key is missing.';
-  }
-
-  if (deal.shouldRemove) {
-    return 'Deal is marked for removal and should not receive outreach.';
-  }
-
+  if (!manualStage1 && !deal?.dealKey) addBlocker('deal_key_missing', 'Deal tracking key is missing.');
+  if (deal.shouldRemove) addBlocker('opportunity_removed', 'Deal is marked for removal and should not receive outreach.');
   if (deal.score < cimRequestScoreThreshold) {
-    return `Score must be ${cimRequestScoreThreshold}+ before requesting a CIM.`;
+    if (manualStage1) {
+      warnings.push({
+        code: 'below_automated_cim_score_threshold',
+        message: `Score is below the automated CIM threshold of ${cimRequestScoreThreshold}; manual review is required.`,
+        value: Number.isFinite(Number(deal.score)) ? Number(deal.score) : null,
+        automatedThreshold: cimRequestScoreThreshold,
+      });
+    } else {
+      addBlocker('below_cim_score_threshold', `Score must be ${cimRequestScoreThreshold}+ before requesting a CIM.`);
+    }
   }
-
   if (deal.annualProfit === null) {
-    return 'Annual profit is missing; confirm trailing SDE or EBITDA before requesting a CIM.';
+    if (manualStage1) {
+      warnings.push({
+        code: 'annual_profit_incomplete',
+        message: 'Annual profit is incomplete; confirm trailing SDE or EBITDA during manual review.',
+        value: null,
+      });
+    } else {
+      addBlocker('annual_profit_incomplete', 'Annual profit is missing; confirm trailing SDE or EBITDA before requesting a CIM.');
+    }
   }
+  if (!recipientEmail) addBlocker('recipient_missing', 'No broker or contact email is available for this listing.');
+  else if (!isValidEmail(recipientEmail)) addBlocker('recipient_invalid', 'Broker or contact email is not valid.');
 
-  if (!recipientEmail) {
-    return 'No broker or contact email is available for this listing.';
-  }
+  return { eligible: blockers.length === 0, blockers, warnings };
+}
 
-  if (!isValidEmail(recipientEmail)) {
-    return 'Broker or contact email is not valid.';
-  }
-
-  return '';
+function getCimRequestUnavailableReason(deal, recipientEmail) {
+  return evaluateDealHunterCimEligibility({ deal, recipientEmail }).blockers[0]?.message || '';
 }
 
 function mapCimRequestsByDealRecipient(requests = []) {
@@ -5470,7 +5481,7 @@ function buildCimRequestRecord({
     ),
   );
   const existingMetadata = existingRequest?.metadata && typeof existingRequest.metadata === 'object' ? existingRequest.metadata : {};
-  const resolvedRequestId = requestId || existingRequest?.id || buildCimRequestId(deal.opportunityId, recipientEmail);
+  const resolvedRequestId = requestId || existingRequest?.id || buildDealHunterCimRequestId(deal.opportunityId, recipientEmail);
   const replyToAddress = buildCimReplyToAddress({
     requestId: resolvedRequestId,
     replyTo: getConfig().delivery.resendReplyTo || '',

@@ -1144,7 +1144,7 @@ test('consolidated detail returns the exact bounded view with authority, conflic
 
   assert.equal(detail.ok, true);
   assert.deepEqual(Object.keys(detail).sort(), [
-    'cimSummary', 'crmSummary', 'effectiveFacts', 'history', 'listingUrls', 'missingCriticalFields',
+    'brokerMaterials', 'cimSummary', 'crmSummary', 'effectiveFacts', 'history', 'listingUrls', 'missingCriticalFields',
     'ok', 'operatorFacts', 'opportunity', 'score', 'sourceObservations', 'status',
   ]);
   assert.equal(detail.effectiveFacts.seller_name.value, 'Verified Operator Seller');
@@ -1195,6 +1195,74 @@ test('detail reads a phone-like legacy broker_contact without relabeling its sou
     },
     brokerPhoneMissing: false,
   });
+});
+
+test('Opportunity Detail derives Broker Materials Pursue, blockers, warnings, and contacts from persisted read-only authority', async (t) => {
+  // Break caught: detail has no brokerMaterials projection, or derives it by
+  // importing/rescoring instead of reading current persisted authority.
+  const { storage, opportunityId } = await detailStorage(t);
+  const current = await storage.getCurrentDealHunterOpportunityScore(opportunityId);
+  const mutations = /^(write|upsert|insert|claim|create|update|delete|record|reconcile|resolve|refresh|import)/i;
+  const readOnly = new Proxy(storage, {
+    get(target, property) {
+      if (property === 'getCurrentDealHunterOpportunityScore') return async () => ({
+        ...current, fit_score: 70, operator_priority: 'high', reviewed_at: '2026-08-31T17:00:00.000Z',
+        reviewed_fingerprint: current.score_fingerprint, reviewed_semantic_digest: current.semantic_digest,
+        changed_since_review: false,
+      });
+      if (mutations.test(String(property))) return async () => { throw new Error(`detail mutation: ${String(property)}`); };
+      const value = target[property];
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage: readOnly });
+
+  assert.equal(detail.brokerMaterials.pursued, true);
+  assert.deepEqual(detail.brokerMaterials.preparationBlockers, []);
+  assert.deepEqual(detail.brokerMaterials.warnings.map(({ code }) => code), ['below_automated_cim_score_threshold']);
+  assert.equal(detail.brokerMaterials.recipientOptions.some(({ email }) => email === 'sheet-broker@example.test'), true);
+});
+
+test('Opportunity Detail exposes a bounded existing Broker Materials lifecycle without raw provider or metadata fields', async (t) => {
+  // Break caught: the legacy three-field request summary is too small for the
+  // card, while returning the row directly would leak provider internals.
+  const { storage, opportunityId } = await detailStorage(t);
+  const request = {
+    id: 'cim-bounded', opportunity_id: opportunityId, status: 'delivery_issue', request_state: 'provider_accepted',
+    delivery_state: 'bounced', follow_up_state: 'not-scheduled', recipient_email: 'sheet-broker@example.test',
+    subject: 'CIM / NDA request for Detail Services Co', created_at: '2026-08-31T15:00:00.000Z',
+    updated_at: '2026-08-31T16:00:00.000Z', first_requested_at: '2026-08-31T15:00:00.000Z',
+    first_provider_accepted_at: '2026-08-31T15:01:00.000Z', delivered_at: '', responded_at: '',
+    delivery_error: 'Mailbox bounced.', provider_message_id: 'provider-secret', metadata: { signature: 'secret', providerPayload: { private: true } },
+  };
+  const detail = await getTriageOpportunityDetail({ opportunityId, storage: withDetailAuthorityRows(storage, { cimRequests: [request] }) });
+  const projected = detail.brokerMaterials.existingRequest;
+  assert.deepEqual(projected, {
+    id: 'cim-bounded', status: 'delivery_issue', requestState: 'provider_accepted', deliveryState: 'bounced',
+    followUpState: 'not-scheduled', recipient: { email: 'sheet-broker@example.test', displayName: '' },
+    subject: 'CIM / NDA request for Detail Services Co', createdAt: '2026-08-31T15:00:00.000Z',
+    updatedAt: '2026-08-31T16:00:00.000Z', requestedAt: '2026-08-31T15:00:00.000Z',
+    providerAcceptedAt: '2026-08-31T15:01:00.000Z', deliveredAt: '', respondedAt: '',
+    errorSummary: 'Mailbox bounced.', canRetry: false, canCorrectRecipient: true,
+    retryRoute: '', correctionRoute: `/api/admin/deal-hunter/cim-requests/cim-bounded/correct-recipient`,
+  });
+  assert.equal(JSON.stringify(projected).includes('provider-secret'), false);
+  assert.equal(JSON.stringify(projected).includes('providerPayload'), false);
+  assert.equal(JSON.stringify(projected).includes('signature'), false);
+});
+
+test('Broker Materials lifecycle projection is invariant to provider/request row order', async (t) => {
+  // Break caught: selecting the first storage row makes lifecycle authority
+  // depend on provider-return ordering.
+  const { storage, opportunityId } = await detailStorage(t);
+  const requests = [
+    { id: 'cim-old', opportunity_id: opportunityId, status: 'sent', updated_at: '2026-08-31T15:00:00.000Z', recipient_email: 'old@example.test' },
+    { id: 'cim-current', opportunity_id: opportunityId, status: 'responded', request_state: 'responded', delivery_state: 'delivered', follow_up_state: 'stopped', responded_at: '2026-08-31T17:00:00.000Z', updated_at: '2026-08-31T17:00:00.000Z', recipient_email: 'current@example.test' },
+  ];
+  const forward = await getTriageOpportunityDetail({ opportunityId, storage: withDetailAuthorityRows(storage, { cimRequests: requests }) });
+  const reverse = await getTriageOpportunityDetail({ opportunityId, storage: withDetailAuthorityRows(storage, { cimRequests: [...requests].reverse() }) });
+  assert.deepEqual(forward.brokerMaterials.existingRequest, reverse.brokerMaterials.existingRequest);
+  assert.equal(forward.brokerMaterials.existingRequest.id, 'cim-current');
 });
 
 test('detail keeps date-like and ZIP-plus-four legacy broker_contact generic and marks broker_phone missing', async (t) => {

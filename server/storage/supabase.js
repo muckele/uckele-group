@@ -3290,6 +3290,15 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return data || null;
     },
 
+    async getDealHunterCimRecipientClaim(recipientEmail) {
+      const recipient = String(recipientEmail || '').trim().toLowerCase();
+      if (!recipient) return null;
+      const { data, error } = await client.from('deal_hunter_cim_recipient_claims').select('*')
+        .eq('recipient_email', recipient).maybeSingle();
+      if (error) throw error;
+      return data || null;
+    },
+
     async claimDealHunterCimRecipient({ recipientEmail = '', requestId = '', opportunityId = '', nowIso = '', expiresAt = '', metadata = {} } = {}) {
       if (!recipientEmail || !requestId || !opportunityId || !nowIso || !expiresAt) return { claimed: false, reason: 'invalid-claim' };
       const { data, error } = await client.rpc('claim_deal_hunter_cim_recipient', {

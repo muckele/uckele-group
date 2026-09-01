@@ -961,8 +961,26 @@ export function buildDealHunterCimRequestEmail({
   cimRequestId = '',
   submissionId = '',
   communicationId = '',
+  manualStage1 = null,
 } = {}) {
   const config = getConfig();
+  const manualTemplate = manualStage1 !== null && manualStage1 !== undefined;
+  let manualGreeting = '';
+  if (manualTemplate) {
+    if (!manualStage1 || typeof manualStage1 !== 'object' || Array.isArray(manualStage1)
+      || Object.keys(manualStage1).some((key) => key !== 'greeting')) {
+      throw new TypeError('The manual Stage 1 message option is invalid.');
+    }
+    const providedGreeting = typeof manualStage1.greeting === 'string' ? manualStage1.greeting : '';
+    const hasUnsafeCharacter = [...providedGreeting].some((character) => {
+      const codePoint = character.codePointAt(0);
+      return codePoint <= 31 || codePoint === 127 || character === '<' || character === '>';
+    });
+    manualGreeting = providedGreeting.trim();
+    if (!manualGreeting || manualGreeting.length > 120 || hasUnsafeCharacter) {
+      throw new TypeError('The manual Stage 1 greeting must be one plain-text line of at most 120 characters.');
+    }
+  }
   const stage2Automatic = /^automation-stage-(2|3)$/i.test(normalizeText(requestedBy, 160));
   const stage2PostalAddress = normalizeText(config.dealHunter?.cimAutomation?.physicalPostalAddress, 500);
   const stage2PurposeDisclosure = 'This is a commercial acquisition-outreach message about a possible purchase of the listed business.';
@@ -978,7 +996,7 @@ export function buildDealHunterCimRequestEmail({
     { label: 'Request', value: 'CIM, teaser, or NDA process' },
   ].filter(Boolean);
   const paragraphs = [
-    `Hello${deal.brokerName ? ` ${deal.brokerName}` : ''},`,
+    manualTemplate ? manualGreeting : `Hello${deal.brokerName ? ` ${deal.brokerName}` : ''},`,
     `I am reaching out regarding ${businessName}. Based on the information available, it looks like the type of durable service business I would like to evaluate further.`,
     'By way of background, I am an operator and small business buyer focused on acquiring a cash-flowing service business with repeat or recurring demand, a strong local reputation, and a transition path where the team and customers are protected.',
     'I am currently the co-founder and President of Golden Behavior Connection, an ABA therapy company I helped build from the ground up. My day-to-day work includes operations, staffing, compliance, revenue cycle management, sales execution, and financial performance. Earlier in my career, I held operating and sales roles at Tripadvisor, Better Mortgage, and Wayfair.',
@@ -992,7 +1010,7 @@ export function buildDealHunterCimRequestEmail({
     'Uckele Group',
   ];
   const text = [
-    `Hello${deal.brokerName ? ` ${deal.brokerName}` : ''},`,
+    manualTemplate ? manualGreeting : `Hello${deal.brokerName ? ` ${deal.brokerName}` : ''},`,
     '',
     `I am reaching out regarding ${businessName}. Based on the information available, it looks like the type of durable service business I would like to evaluate further.`,
     '',
@@ -1017,19 +1035,22 @@ export function buildDealHunterCimRequestEmail({
   ]
     .filter((line) => line !== '')
     .join('\n');
-  const html = brandedEmailHtml({
-    preheader: `Requesting the CIM or teaser for ${businessName}.`,
-    title: subject,
-    showTitle: false,
-    paragraphs,
-    details,
-    ctas: listingUrl ? [{ label: 'View Listing', href: listingUrl }] : [],
-    footerNote: stage2Automatic
-      ? escapeHtml(`Postal address: ${stage2PostalAddress}`)
-      : '',
-  });
+  const html = manualTemplate
+    ? `<!doctype html><html><body>${text.split('\n').map((line) => `<p>${escapeHtml(line)}</p>`).join('')}</body></html>`
+    : brandedEmailHtml({
+        preheader: `Requesting the CIM or teaser for ${businessName}.`,
+        title: subject,
+        showTitle: false,
+        paragraphs,
+        details,
+        ctas: listingUrl ? [{ label: 'View Listing', href: listingUrl }] : [],
+        footerNote: stage2Automatic
+          ? escapeHtml(`Postal address: ${stage2PostalAddress}`)
+          : '',
+      });
 
   return {
+    ...(manualTemplate ? { templateVersion: 'deal-hunter-cim-manual-stage1-v1', greeting: manualGreeting } : {}),
     communicationId,
     kind: 'deal-hunter-cim-request',
     idempotencyKey: buildCimEmailIdempotencyKey({ requestId: cimRequestId }),
