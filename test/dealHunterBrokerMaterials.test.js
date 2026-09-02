@@ -95,6 +95,8 @@ function authorityStorage(overrides = {}) {
       id: 'submission-1', status: 'active', company: 'Durable Services Co', broker_name: 'CRM Broker',
       broker_email: '', updated_at: '2026-08-31T17:00:00.000Z', metadata: {},
     },
+    secureDocuments: [],
+    latestUploadRequest: null,
     requests: [],
     opportunityClaim: null,
     recipientClaims: new Map(),
@@ -111,6 +113,8 @@ function authorityStorage(overrides = {}) {
     async listDealHunterOpportunityFacts() { return state.facts; },
     async listDealHunterOpportunitySourceObservations() { return state.sources; },
     async getSubmission() { return state.submission; },
+    async listSecureDocumentsForSubmission() { return state.secureDocuments; },
+    async getLatestSecureUploadRequestForSubmission() { return state.latestUploadRequest; },
     async listDealHunterCimRequests({ opportunityIds = [], dealKeys = [], recipientEmails = [] } = {}) {
       return state.requests.filter((request) => (
         (!opportunityIds.length || opportunityIds.includes(request.opportunity_id))
@@ -125,6 +129,34 @@ function authorityStorage(overrides = {}) {
     async getActiveEmailSuppression() { return state.suppression; },
     async getDealHunterCimSafetySettings() { return state.safety; },
     async getBrokerMaterialsEmailReadiness() { return state.readiness; },
+  };
+}
+
+function markedFollowUpRequest(overrides = {}) {
+  return {
+    id: 'request-manual-follow-up',
+    opportunity_id: opportunityId,
+    submission_id: 'submission-1',
+    status: 'sent',
+    request_state: 'provider_accepted',
+    delivery_state: 'accepted',
+    follow_up_state: 'failed',
+    follow_up_count: 0,
+    next_follow_up_at: '2026-09-01T16:00:00.000Z',
+    recipient_email: 'source-broker@example.test',
+    created_at: '2026-08-31T17:40:00.000Z',
+    updated_at: '2026-09-01T17:41:00.000Z',
+    metadata: {
+      manualFollowUp: {
+        version: 'deal-hunter-manual-follow-up-v1',
+        mode: 'operator-approved',
+        maximumFollowUps: 5,
+        cadencePolicy: 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1',
+        enrolledAt: '2026-09-01T16:00:00.000Z',
+        enrolledBy: 'admin@example.test',
+      },
+    },
+    ...overrides,
   };
 }
 
@@ -401,6 +433,60 @@ test('critical authority read failures fail closed without issuing a preparation
       assert.equal(result.status, 503);
       assert.equal(result.code, 'broker_materials_authority_unavailable');
       assert.equal(Object.hasOwn(result, 'preparationToken'), false);
+    });
+  }
+});
+
+test('marked follow-up projection fails closed when secure-document authority cannot be read', async (t) => {
+  const privateSentinel = 'private-secure-document-read-error';
+  for (const [name, configure] of [
+    ['thrown read', (storage) => { storage.listSecureDocumentsForSubmission = async () => { throw new Error(privateSentinel); }; }],
+    ['missing capability', (storage) => { delete storage.listSecureDocumentsForSubmission; }],
+  ]) {
+    await t.test(name, async () => {
+      const storage = authorityStorage({ requests: [markedFollowUpRequest()] });
+      configure(storage);
+      const projection = await projectDealHunterBrokerMaterials({
+        opportunityId,
+        storage,
+        now: new Date('2026-09-02T17:00:00.000Z'),
+      });
+
+      assert.equal(projection.existingRequest.followUps.state, 'closed');
+      assert.equal(projection.existingRequest.followUps.retryEligible, false);
+      assert.equal(projection.existingRequest.followUps.currentFollowUpNumber, null);
+      assert.deepEqual(projection.existingRequest.followUps.preparationBlockers, [{
+        code: 'materials-authority-unavailable',
+        message: 'Acquisition materials authority could not be verified.',
+      }]);
+      assert.equal(JSON.stringify(projection).includes(privateSentinel), false);
+    });
+  }
+});
+
+test('marked follow-up projection fails closed when upload-request authority cannot be read', async (t) => {
+  const privateSentinel = 'private-upload-request-read-error';
+  for (const [name, configure] of [
+    ['thrown read', (storage) => { storage.getLatestSecureUploadRequestForSubmission = async () => { throw new Error(privateSentinel); }; }],
+    ['missing capability', (storage) => { delete storage.getLatestSecureUploadRequestForSubmission; }],
+  ]) {
+    await t.test(name, async () => {
+      const storage = authorityStorage({ requests: [markedFollowUpRequest()] });
+      configure(storage);
+      const projection = await projectDealHunterBrokerMaterials({
+        opportunityId,
+        storage,
+        now: new Date('2026-09-02T17:00:00.000Z'),
+      });
+
+      assert.equal(projection.existingRequest.followUps.state, 'closed');
+      assert.equal(projection.existingRequest.followUps.retryEligible, false);
+      assert.equal(projection.existingRequest.followUps.currentFollowUpNumber, null);
+      assert.deepEqual(projection.existingRequest.followUps.preparationBlockers, [{
+        code: 'materials-authority-unavailable',
+        message: 'Acquisition materials authority could not be verified.',
+      }]);
+      assert.equal(JSON.stringify(projection).includes(privateSentinel), false);
     });
   }
 });

@@ -137,3 +137,21 @@ test('acquisition materials evidence codes are stable bounded and contain no raw
     'materialsReceived',
   ]);
 });
+
+test('acquisition materials recognizes a qualifying controlled document beyond the first 500 unrelated rows', () => {
+  const state = evaluateAcquisitionMaterialsState({
+    secureDocuments: [
+      ...Array.from({ length: 500 }, (_, index) => ({
+        document_type: 'other',
+        original_name: `insurance-certificate-${index}.pdf`,
+      })),
+      { document_type: 'cim', original_name: 'controlled-material.pdf' },
+    ],
+  });
+
+  assert.deepEqual(state, {
+    materialsReceived: true,
+    advancedBeyondBrokerOutreach: false,
+    evidenceCodes: ['secure-document-cim'],
+  });
+});

@@ -51,6 +51,31 @@ test('manual follow-up marker is fixed to operator-approved version cadence and 
   assert.equal(isOperatorApprovedFollowUpRequest({ metadata: {} }), false);
 });
 
+test('manual follow-up detection rejects mode-only wrong-version wrong-maximum wrong-cadence string-maximum and malformed markers', () => {
+  const validMarker = markedRequest().metadata.manualFollowUp;
+  const invalidMarkers = [
+    { mode: MANUAL_FOLLOW_UP_MODE },
+    { version: MANUAL_FOLLOW_UP_VERSION },
+    { ...validMarker, version: 'deal-hunter-manual-follow-up-v2' },
+    { ...validMarker, maximumFollowUps: 4 },
+    { ...validMarker, maximumFollowUps: '5' },
+    { ...validMarker, cadencePolicy: 'accepted-plus-48-hours' },
+    [],
+    'operator-approved',
+    5,
+    null,
+  ];
+
+  assert.equal(isOperatorApprovedFollowUpRequest(markedRequest()), true);
+  for (const manualFollowUp of invalidMarkers) {
+    assert.equal(
+      isOperatorApprovedFollowUpRequest({ metadata: { manualFollowUp } }),
+      false,
+      JSON.stringify(manualFollowUp),
+    );
+  }
+});
+
 test('manual follow-up cadence uses Pacific calendar dates across PST PDT and weekend rollover', () => {
   assert.equal(nextManualFollowUpAt('2026-01-05T18:30:00.000Z'), '2026-01-07T17:00:00.000Z');
   assert.equal(nextManualFollowUpAt('2026-07-06T17:30:00.000Z'), '2026-07-08T16:00:00.000Z');
@@ -166,4 +191,72 @@ test('manual follow-up projection separates preparation blockers from current se
     { code: 'recipient-cadence', message: 'Recipient cadence is blocked.' },
   ]);
   assert.equal(JSON.stringify(projection).includes('must-not-leak'), false);
+});
+
+test('manual follow-up projection fails closed for negative fractional NaN nonnumeric and above-maximum durable counts', () => {
+  for (const followUpCount of [-1, 1.5, Number.NaN, 'not-a-number', 6]) {
+    const projection = projectManualFollowUpState({
+      request: markedRequest({ follow_up_count: followUpCount, follow_up_state: 'failed' }),
+      communications: [{ follow_up_number: 1, status: 'failed', delivery_state: 'failed' }],
+      now: new Date('2026-09-02T17:00:00.000Z'),
+    });
+
+    assert.equal(projection.state, 'closed', String(followUpCount));
+    assert.equal(projection.followUpCount, null, String(followUpCount));
+    assert.equal(projection.currentFollowUpNumber, null, String(followUpCount));
+    assert.equal(projection.retryEligible, false, String(followUpCount));
+    assert.deepEqual(projection.preparationBlockers, [{
+      code: 'manual-follow-up-authority-invalid',
+      message: 'Manual follow-up count authority is invalid.',
+    }]);
+  }
+
+  const absentInitialCount = markedRequest();
+  delete absentInitialCount.follow_up_count;
+  const initialProjection = projectManualFollowUpState({ request: absentInitialCount });
+  assert.equal(initialProjection.followUpCount, 0);
+  assert.equal(initialProjection.currentFollowUpNumber, 1);
+
+  const completeProjection = projectManualFollowUpState({
+    request: markedRequest({ follow_up_count: 5 }),
+  });
+  assert.equal(completeProjection.state, 'completed');
+  assert.equal(completeProjection.currentFollowUpNumber, null);
+});
+
+test('operator stop outranks failed ambiguous and stale-due state and never exposes retry', () => {
+  const stoppedMarker = {
+    ...markedRequest().metadata.manualFollowUp,
+    stoppedAt: '2026-09-02T16:30:00.000Z',
+  };
+  const scenarios = [
+    {
+      follow_up_state: 'failed',
+      next_follow_up_at: '2026-09-01T16:00:00.000Z',
+      communications: [{ follow_up_number: 1, status: 'failed', delivery_state: 'failed' }],
+    },
+    {
+      follow_up_state: 'ambiguous',
+      next_follow_up_at: '2026-09-01T16:00:00.000Z',
+      communications: [{ follow_up_number: 1, status: 'ambiguous', delivery_state: 'unknown' }],
+    },
+    { follow_up_state: 'scheduled', next_follow_up_at: '2026-09-01T16:00:00.000Z' },
+    { follow_up_state: 'scheduled', next_follow_up_at: '2026-09-03T16:00:00.000Z' },
+  ];
+
+  for (const { communications = [], ...requestOverrides } of scenarios) {
+    const projection = projectManualFollowUpState({
+      request: markedRequest({
+        ...requestOverrides,
+        metadata: { ...markedRequest().metadata, manualFollowUp: stoppedMarker },
+      }),
+      communications,
+      now: new Date('2026-09-02T17:00:00.000Z'),
+    });
+
+    assert.equal(projection.state, 'stopped');
+    assert.equal(projection.retryEligible, false);
+    assert.equal(projection.currentFollowUpNumber, null);
+    assert.equal(projection.nextFollowUpAt, '');
+  }
 });

@@ -12,7 +12,10 @@ import { evaluateCimRecipientPolicy, getCimOutreachPauseStatus } from './cimOppo
 import { buildDealHunterCimRequestEmail } from './delivery.js';
 import { getEmailReadiness } from './emailReadiness.js';
 import { evaluateAcquisitionMaterialsState } from './acquisitionMaterials.js';
-import { projectManualFollowUpState } from './dealHunterManualFollowUpPolicy.js';
+import {
+  isOperatorApprovedFollowUpRequest,
+  projectManualFollowUpState,
+} from './dealHunterManualFollowUpPolicy.js';
 import {
   buildDealHunterCimRequestId,
   evaluateDealHunterCimEligibility,
@@ -240,7 +243,11 @@ function issueContactOptions({ opportunityId, contacts, secret }) {
   }).sort((left, right) => left.email.localeCompare(right.email) || left.provenance.localeCompare(right.provenance));
 }
 
-function projectExistingRequest(records = [], { now = new Date(), terminalReason = '' } = {}) {
+function projectExistingRequest(records = [], {
+  now = new Date(),
+  terminalReason = '',
+  materialsAuthorityAvailable = true,
+} = {}) {
   const request = [...records].filter((item) => item?.id).sort((left, right) => (
     (Date.parse(right.responded_at || right.respondedAt || right.updated_at || right.updatedAt || right.created_at || right.createdAt || '') || 0)
     - (Date.parse(left.responded_at || left.respondedAt || left.updated_at || left.updatedAt || left.created_at || left.createdAt || '') || 0)
@@ -252,10 +259,18 @@ function projectExistingRequest(records = [], { now = new Date(), terminalReason
   const providerAcceptedAt = iso(request.first_provider_accepted_at || request.providerAcceptedAt);
   const preAcceptanceFailure = status === 'failed' && !providerAcceptedAt && !['accepted', 'delivered', 'bounced', 'complained', 'suppressed'].includes(deliveryState);
   const deliveryIssue = status === 'delivery_issue' || ['bounced', 'complained', 'suppressed'].includes(deliveryState);
+  const materialsAuthorityUnavailable = !terminalReason
+    && !materialsAuthorityAvailable
+    && isOperatorApprovedFollowUpRequest(request);
   const followUps = projectManualFollowUpState({
     request,
     communications: [],
-    authority: { terminalReason },
+    authority: {
+      terminalReason: materialsAuthorityUnavailable ? 'materials-authority-unavailable' : terminalReason,
+      preparationBlockers: materialsAuthorityUnavailable
+        ? [blocker('materials-authority-unavailable', 'Acquisition materials authority could not be verified.')]
+        : [],
+    },
     now,
   });
   return {
@@ -307,6 +322,16 @@ async function optionalRead(call, fallback) {
     return value ?? fallback;
   } catch {
     return fallback;
+  }
+}
+
+async function boundedAuthorityRead(storage, method, fallback, ...args) {
+  if (typeof storage?.[method] !== 'function') return { available: false, value: fallback };
+  try {
+    const value = await storage[method](...args);
+    return { available: true, value: value ?? fallback };
+  } catch {
+    return { available: false, value: fallback };
   }
 }
 
@@ -373,6 +398,7 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   let identityExceptions;
   let secureDocuments;
   let latestUploadRequest;
+  let materialsAuthorityAvailable = true;
   try {
     [aliases, facts, sourceRows, submission, opportunityClaim, safety, identityExceptions] = await Promise.all([
       requiredAuthorityRead(storage, 'listDealHunterOpportunityAliases', { opportunityIds: [id], limit: 500 }),
@@ -384,12 +410,18 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
       requiredAuthorityRead(storage, 'listDealHunterIdentityExceptions', { statuses: ['open'], limit: 5000 }),
     ]);
     const dealKeys = knownDealKeys(score, aliases);
-    [secureDocuments, latestUploadRequest] = submission
-      ? await Promise.all([
-          optionalRead(() => storage?.listSecureDocumentsForSubmission?.(submission.id), []),
-          optionalRead(() => storage?.getLatestSecureUploadRequestForSubmission?.(submission.id), null),
-        ])
-      : [[], null];
+    if (submission) {
+      const [secureDocumentAuthority, uploadRequestAuthority] = await Promise.all([
+        boundedAuthorityRead(storage, 'listSecureDocumentsForSubmission', [], submission.id),
+        boundedAuthorityRead(storage, 'getLatestSecureUploadRequestForSubmission', null, submission.id),
+      ]);
+      secureDocuments = secureDocumentAuthority.value;
+      latestUploadRequest = uploadRequestAuthority.value;
+      materialsAuthorityAvailable = secureDocumentAuthority.available && uploadRequestAuthority.available;
+    } else {
+      secureDocuments = [];
+      latestUploadRequest = null;
+    }
     const [canonicalRequests, aliasRequests, knownDispositions] = await Promise.all([
       requiredAuthorityRead(storage, 'listDealHunterCimRequests', { opportunityIds: [id], detailAuthority: true, limit: 100 }),
       dealKeys.length > 0 ? requiredAuthorityRead(storage, 'listDealHunterCimRequests', { dealKeys, limit: 500 }) : [],
@@ -414,7 +446,11 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
     : materialsState.advancedBeyondBrokerOutreach
       ? 'advanced-beyond-broker-outreach'
       : '';
-  const existingRequest = projectExistingRequest(requests, { now: at, terminalReason });
+  const existingRequest = projectExistingRequest(requests, {
+    now: at,
+    terminalReason,
+    materialsAuthorityAvailable,
+  });
   const manualEligibility = evaluateDealHunterCimEligibility({
     deal: {
       opportunityId: id,

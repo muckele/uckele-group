@@ -56,9 +56,15 @@ function pacificDateKey(value) {
 }
 
 function normalizedFollowUpCount(request = {}) {
-  const raw = request.follow_up_count ?? request.followUpCount ?? 0;
-  const count = Number(raw);
-  return Number.isInteger(count) && count >= 0 ? Math.min(count, MANUAL_FOLLOW_UP_MAXIMUM) : 0;
+  const hasSnakeCaseCount = Object.hasOwn(request, 'follow_up_count');
+  const hasCamelCaseCount = Object.hasOwn(request, 'followUpCount');
+  if (!hasSnakeCaseCount && !hasCamelCaseCount) return { count: 0, valid: true };
+  const raw = hasSnakeCaseCount ? request.follow_up_count : request.followUpCount;
+  if (raw === null || raw === undefined) return { count: 0, valid: true };
+  if (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0 || raw > MANUAL_FOLLOW_UP_MAXIMUM) {
+    return { count: null, valid: false };
+  }
+  return { count: raw, valid: true };
 }
 
 function publicBlockers(value) {
@@ -98,14 +104,17 @@ export function buildManualFollowUpMarker({ enrolledAt, enrolledBy } = {}) {
 }
 
 export function isOperatorApprovedFollowUpRequest(request = {}) {
-  return objectValue(objectValue(request).metadata).manualFollowUp?.mode === MANUAL_FOLLOW_UP_MODE;
+  const marker = objectValue(objectValue(objectValue(request).metadata).manualFollowUp);
+  return marker.version === MANUAL_FOLLOW_UP_VERSION
+    && marker.mode === MANUAL_FOLLOW_UP_MODE
+    && marker.maximumFollowUps === MANUAL_FOLLOW_UP_MAXIMUM
+    && marker.cadencePolicy === MANUAL_FOLLOW_UP_CADENCE;
 }
 
 export function getManualFollowUpNumber(request = {}) {
   if (!isOperatorApprovedFollowUpRequest(request)) return null;
-  const raw = request.follow_up_count ?? request.followUpCount ?? 0;
-  const count = Number(raw);
-  if (!Number.isInteger(count) || count < 0 || count >= MANUAL_FOLLOW_UP_MAXIMUM) return null;
+  const { count, valid } = normalizedFollowUpCount(objectValue(request));
+  if (!valid || count >= MANUAL_FOLLOW_UP_MAXIMUM) return null;
   return count + 1;
 }
 
@@ -137,16 +146,20 @@ export function projectManualFollowUpState({
   const safeRequest = objectValue(request);
   const metadata = objectValue(safeRequest.metadata);
   const marker = objectValue(metadata.manualFollowUp);
-  const enrolled = marker.mode === MANUAL_FOLLOW_UP_MODE;
-  const followUpCount = normalizedFollowUpCount(safeRequest);
-  const currentFollowUpNumber = enrolled && followUpCount < MANUAL_FOLLOW_UP_MAXIMUM ? followUpCount + 1 : null;
+  const enrolled = isOperatorApprovedFollowUpRequest(safeRequest);
+  const countAuthority = normalizedFollowUpCount(safeRequest);
+  const followUpCount = countAuthority.count;
+  const authorityInvalid = enrolled && !countAuthority.valid;
+  const candidateFollowUpNumber = enrolled && countAuthority.valid && followUpCount < MANUAL_FOLLOW_UP_MAXIMUM
+    ? followUpCount + 1
+    : null;
   const nextFollowUpAt = iso(safeRequest.next_follow_up_at || safeRequest.nextFollowUpAt);
   const followUpState = boundedText(safeRequest.follow_up_state || safeRequest.followUpState, 80).toLowerCase();
   const requestState = boundedText(safeRequest.request_state || safeRequest.requestState, 80).toLowerCase();
   const requestStatus = boundedText(safeRequest.status, 80).toLowerCase();
   const deliveryState = boundedText(safeRequest.delivery_state || safeRequest.deliveryState, 80).toLowerCase();
   const terminalReason = boundedText(authority?.terminalReason, 160);
-  const communication = currentCommunication(communications, currentFollowUpNumber);
+  const communication = currentCommunication(communications, candidateFollowUpNumber);
   const communicationStatus = boundedText(communication?.status, 80).toLowerCase();
   const communicationDelivery = boundedText(communication?.delivery_state || communication?.deliveryState, 80).toLowerCase();
   const ambiguous = [followUpState, requestState, requestStatus, deliveryState, communicationStatus, communicationDelivery]
@@ -161,10 +174,11 @@ export function projectManualFollowUpState({
   let state = 'not-enrolled';
   if (enrolled) {
     if (terminalReason) state = 'closed';
+    else if (authorityInvalid) state = 'closed';
+    else if (followUpState === 'stopped' || marker.stoppedAt || marker.stopped_at) state = 'stopped';
     else if (followUpCount >= MANUAL_FOLLOW_UP_MAXIMUM || followUpState === 'completed') state = 'completed';
     else if (ambiguous) state = 'ambiguous';
     else if (retryEligible) state = 'retry';
-    else if (followUpState === 'stopped' || marker.stoppedAt || marker.stopped_at) state = 'stopped';
     else if (nextFollowUpAt) {
       const nowDate = now instanceof Date ? new Date(now) : new Date(now || '');
       if (!Number.isNaN(nowDate.getTime()) && nowDate.getTime() >= Date.parse(nextFollowUpAt)) {
@@ -176,6 +190,12 @@ export function projectManualFollowUpState({
       state = 'stopped';
     }
   }
+  const terminalState = ['closed', 'completed', 'stopped'].includes(state);
+  const currentFollowUpNumber = terminalState ? null : candidateFollowUpNumber;
+  const publicNextFollowUpAt = terminalState ? '' : nextFollowUpAt;
+  const invalidCountBlocker = authorityInvalid
+    ? [{ code: 'manual-follow-up-authority-invalid', message: 'Manual follow-up count authority is invalid.' }]
+    : [];
 
   return {
     enrolled,
@@ -183,11 +203,11 @@ export function projectManualFollowUpState({
     maximumFollowUps: MANUAL_FOLLOW_UP_MAXIMUM,
     followUpCount,
     currentFollowUpNumber,
-    nextFollowUpAt,
+    nextFollowUpAt: publicNextFollowUpAt,
     state,
     terminalReason,
     retryEligible: state === 'retry',
-    preparationBlockers: publicBlockers(authority?.preparationBlockers),
+    preparationBlockers: publicBlockers([...invalidCountBlocker, ...(Array.isArray(authority?.preparationBlockers) ? authority.preparationBlockers : [])]),
     sendBlockers: publicBlockers(authority?.sendBlockers),
   };
 }

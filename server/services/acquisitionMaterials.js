@@ -103,8 +103,8 @@ export function evaluateAcquisitionMaterialsState({
   const uploadStatus = normalizedToken(upload.status).replace(/_/g, '-');
   const requestedTypes = requestedDocumentTypes(upload);
   if (
-    uploadStatus === 'documents-received'
-    || (uploadStatus === 'completed' && requestedTypes.some((type) => relevantDocumentTypes.has(type)))
+    ['completed', 'documents-received'].includes(uploadStatus)
+    && requestedTypes.some((type) => relevantDocumentTypes.has(type))
   ) {
     evidence.add('broker-upload-completed');
   }
@@ -116,7 +116,7 @@ export function evaluateAcquisitionMaterialsState({
 
   let hasCimDocument = false;
   let hasFinancialDocument = false;
-  for (const document of documents.slice(0, 500)) {
+  for (const document of documents) {
     const type = normalizedToken(document?.document_type || document?.documentType);
     const filenameKind = filenameMaterialKind(document);
     if (cimDocumentTypes.has(type) || filenameKind === 'cim') hasCimDocument = true;
