@@ -33,6 +33,13 @@ const preparationLifetimeMs = 15 * 60 * 1000;
 const replyEventTypes = new Set(['received', 'replied']);
 const terminalDeliveryStates = new Set(['bounced', 'failed', 'complained', 'suppressed']);
 const ambiguousStates = new Set(['ambiguous', 'unknown', 'provider_unknown', 'provider_ambiguous', 'follow_up_ambiguous']);
+const approvedManualFollowUpCapabilities = new WeakSet();
+
+export function consumeDealHunterManualFollowUpCapability(candidate) {
+  if (!candidate || typeof candidate !== 'object' || !approvedManualFollowUpCapabilities.has(candidate)) return false;
+  approvedManualFollowUpCapabilities.delete(candidate);
+  return true;
+}
 
 function objectValue(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
@@ -269,8 +276,11 @@ function requestBelongsToRoute(authority, opportunityId, requestId) {
     authority.request
     && authority.request.id === requestId
     && authority.request.opportunity_id === opportunityId
+    && authority.existingRequest?.id === requestId
+    && text(authority.opportunity?.status, 80).toLowerCase() === 'active'
     && authority.submission
     && authority.request.submission_id === authority.submission.id
+    && text(authority.submission.status, 80).toLowerCase() !== 'archived'
     && authority.opportunity?.primary_submission_id === authority.submission.id,
   );
 }
@@ -490,7 +500,21 @@ export async function stopDealHunterManualFollowUps({
   });
   if (!result?.applied && !result?.alreadyFinalized) return publicFailure('authority_changed', 'Current request authority changed before Stop could be applied.');
   const current = { ...authority, request: result.request || authority.request, now: authority.now };
-  return { success: true, status: 200, canonicalOpportunityId: authority.opportunityId, requestId: authority.request.id, followUps: projection(current) };
+  const durable = {
+    canonicalOpportunityId: authority.opportunityId,
+    requestId: authority.request.id,
+    followUps: projection(current),
+  };
+  if (result.reason === 'stopped-in-flight') {
+    return {
+      success: false,
+      status: 503,
+      code: 'outcome_unresolved',
+      error: 'Future follow-ups are permanently stopped, but the provider-authorized current touch may still complete. Check status.',
+      ...durable,
+    };
+  }
+  return { success: true, status: 200, ...durable };
 }
 
 function exactRetryMessage(authority, communication, followUpNumber) {
@@ -651,7 +675,7 @@ function proposalForAuthority(authority, { greeting } = {}) {
   return { material, message, sender, currentCommunication, retry };
 }
 
-function reviewForProposal(authority, proposal) {
+function reviewForProposal(authority, proposal, { greetingEditable = false } = {}) {
   return {
     mode: proposal.retry ? 'exact-retry' : 'first-attempt',
     followUpNumber: proposal.material.followUpNumber,
@@ -660,7 +684,7 @@ function reviewForProposal(authority, proposal) {
     sender: proposal.sender,
     message: {
       greeting: proposal.material.message.greeting,
-      greetingEditable: !proposal.retry,
+      greetingEditable: Boolean(greetingEditable) && !proposal.retry,
       subject: proposal.material.message.subject,
       body: proposal.material.message.text,
       html: proposal.material.message.html,
@@ -691,9 +715,11 @@ export async function prepareDealHunterManualFollowUp({
   const state = projection(authority);
   if (!['due', 'overdue', 'retry'].includes(state.state)) return publicFailure('blocked', 'This follow-up is not eligible for review.');
   if (state.retryEligible && Object.hasOwn(parsed, 'greeting')) return publicFailure('retry_message_immutable', 'A retry must use the exact persisted communication.');
-  const proposal = proposalForAuthority(authority, { greeting: parsed.greeting });
+  const proposal = proposalForAuthority(authority, {
+    greeting: session.role === 'admin' ? parsed.greeting : undefined,
+  });
   if (!proposal) return publicFailure('preparation_authority_missing', 'Exact communication authority is unavailable.');
-  const review = reviewForProposal(authority, proposal);
+  const review = reviewForProposal(authority, proposal, { greetingEditable: session.role === 'admin' });
   const sendBlockers = currentSendBlockers(authority);
   if (session.role !== 'admin') {
     return { success: true, status: 200, previewOnly: true, review, followUps: projection(authority, { sendBlockers }), sendBlockers };
@@ -833,6 +859,22 @@ export async function approveDealHunterManualFollowUp({
     followUpNumber: proposal.material.followUpNumber,
     expectedNextFollowUpAt: proposal.material.nextFollowUpAt,
     actor: session.username || session.principal_id,
+    revalidateCurrentAuthority: async () => {
+      try {
+        const currentAuthority = await loadDealHunterManualFollowUpAuthority({
+          opportunityId: canonicalOpportunityId,
+          requestId: canonicalRequestId,
+          storage,
+          now: new Date(),
+          dependencies,
+        });
+        return requestBelongsToRoute(currentAuthority, canonicalOpportunityId, canonicalRequestId)
+          && !criticalAuthorityUnavailable(currentAuthority)
+          && isOperatorApprovedFollowUpRequest(currentAuthority.request);
+      } catch {
+        return false;
+      }
+    },
     sender: proposal.sender,
     message: {
       ...proposal.message,
@@ -849,7 +891,13 @@ export async function approveDealHunterManualFollowUp({
       },
     },
   };
-  const execution = await executeApprovedFollowUp({ storage, request: authority.request, now: at, approvedContext, dependencies });
+  approvedManualFollowUpCapabilities.add(approvedContext);
+  let execution;
+  try {
+    execution = await executeApprovedFollowUp({ storage, request: authority.request, now: at, approvedContext, dependencies });
+  } finally {
+    approvedManualFollowUpCapabilities.delete(approvedContext);
+  }
   if (!execution || ['approval-required', 'invalid-approved-context'].includes(execution.status)) {
     return publicFailure('execution_rejected', 'The trusted approved follow-up context was rejected.');
   }
@@ -870,6 +918,17 @@ export async function approveDealHunterManualFollowUp({
     stopped: 'Current terminal authority stopped the follow-up before transmission.',
     responded: 'The broker has replied, so the follow-up was not transmitted.',
   }[execution.status] || '';
+  if (execution.status === 'development-only') {
+    return {
+      success: true,
+      status: 200,
+      code: 'development_only',
+      canonicalOpportunityId,
+      requestId: canonicalRequestId,
+      durableResult: durableResult(authority, request, at),
+      error: '',
+    };
+  }
   return {
     success: !failure,
     status: failure?.status || 200,

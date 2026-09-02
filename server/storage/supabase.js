@@ -1819,7 +1819,9 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         || communication.submission_id !== submissionId
         || requestResult.data.submission_id !== submissionId
         || communication.idempotency_key !== idempotencyKey
-        || communication.delivery_state !== 'ambiguous') return null;
+        || communication.delivery_state !== 'ambiguous'
+        || !Number.isFinite(Date.parse(communication.delivery_state_at || ''))
+        || new Date(communication.delivery_state_at).toISOString() !== new Date(ambiguousAt).toISOString()) return null;
       const proofId = createHash('sha256').update(`deal-hunter-manual-follow-up-ambiguity:${communicationId}`).digest('hex');
       const proof = {
         id: proofId,
@@ -1847,6 +1849,9 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return duplicate.data?.state === 'ambiguous'
         && duplicate.data?.cim_request_id === requestId
         && duplicate.data?.submission_id === submissionId
+        && duplicate.data?.idempotency_key === `${idempotencyKey}:ambiguity-proof`
+        && Number.isFinite(Date.parse(duplicate.data?.ambiguous_at || ''))
+        && new Date(duplicate.data.ambiguous_at).toISOString() === new Date(ambiguousAt).toISOString()
         ? normalizeCrmEmailOutboxRow(duplicate.data)
         : null;
     },

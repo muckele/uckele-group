@@ -395,6 +395,8 @@ function insertCommunication(containerName, database, fixture, {
   followUpNumber = 1,
   deliveryState = 'accepted',
   occurredAt = '2026-09-01T17:05:00.000Z',
+  providerMessageId = deliveryState === 'accepted' ? `provider-${id}` : null,
+  firstProviderAcceptedAt = null,
 } = {}) {
   psql(containerName, database, `
     insert into public.crm_communications (
@@ -406,13 +408,17 @@ function insertCommunication(containerName, database, fixture, {
     ) values (
       ${quote(id)}, ${quote(fixture.submissionId)}::uuid, ${quote(`deal-${fixture.suffix}`)},
       ${quote(fixture.requestId)}, 'outbound', 'email', 'deal-hunter', 'cim-follow-up',
-      'resend', ${deliveryState === 'accepted' ? quote(`provider-${id}`) : 'null'},
+      'resend', ${providerMessageId ? quote(providerMessageId) : 'null'},
       ${quote(`deal-hunter-cim-${fixture.requestId}-follow-up-${followUpNumber}`)}, 'team@example.test',
       ${json([`${fixture.suffix}@example.test`])}, 'Requested materials follow-up',
       ${quote(`Follow-Up ${followUpNumber}`)}, ${quote(`<p>Follow-Up ${followUpNumber}</p>`)},
       ${quote(occurredAt)}::timestamptz, ${quote(occurredAt)}::timestamptz, ${quote(occurredAt)}::timestamptz,
       ${quote(deliveryState)}, ${quote(occurredAt)}::timestamptz, 'complete', 1,
-      'storage-admin', 'storage-admin', ${json({ followUpNumber, templateVersion: 'deal-hunter-cim-follow-up-v1' })}
+      'storage-admin', 'storage-admin', ${json({
+        followUpNumber,
+        templateVersion: 'deal-hunter-cim-follow-up-v1',
+        ...(firstProviderAcceptedAt ? { manualFollowUp: { firstProviderAcceptedAt } } : {}),
+      })}
     );
   `);
 }
@@ -737,6 +743,50 @@ test('real PostgreSQL enforces Phase 3 Task 2 storage authority and parity', {
     }
   });
 
+  await t.test('later provider lifecycle states retain the original accepted instant and terminal scheduling semantics', () => {
+    const acceptedAt = '2026-09-01T17:05:00.000Z';
+    const laterAt = '2026-09-01T18:05:00.000Z';
+    const dueAt = '2026-09-03T16:00:00.000Z';
+    for (const deliveryState of ['delivered', 'delayed', 'bounced', 'complained', 'suppressed']) {
+      const fixture = seedFixture(containerName, database, `accepted-then-${deliveryState}`);
+      const started = start(containerName, database, fixture);
+      const claimed = claim(containerName, database, fixture, { expectedRequestUpdatedAt: started.request.updated_at });
+      const communicationId = deterministicCommunicationId(fixture.requestId, 1);
+      insertCommunication(containerName, database, fixture, {
+        id: communicationId,
+        deliveryState,
+        occurredAt: laterAt,
+        providerMessageId: `provider-${communicationId}`,
+        firstProviderAcceptedAt: acceptedAt,
+      });
+      const terminalDelivery = ['bounced', 'complained', 'suppressed'].includes(deliveryState);
+      psql(containerName, database, `
+        update public.deal_hunter_cim_requests set
+          status = ${quote(terminalDelivery ? 'delivery_issue' : 'follow_up_pending')},
+          delivery_state = ${quote(deliveryState)},
+          delivery_state_at = ${quote(laterAt)}::timestamptz
+        where id = ${quote(fixture.requestId)};
+      `);
+      const accepted = finalize(containerName, database, fixture, {
+        expectedRequestUpdatedAt: claimed.request.updated_at,
+        expectedCommunicationId: communicationId,
+        acceptedAt,
+        nextFollowUpAt: dueAt,
+      });
+      assert.equal(accepted.applied, true, deliveryState);
+      assert.equal(accepted.request.follow_up_count, 1, deliveryState);
+      assert.equal(accepted.request.last_follow_up_at, acceptedAt.replace('.000Z', '+00:00'), deliveryState);
+      assert.equal(normalizedTimestamp(accepted.request.metadata.manualFollowUp.acceptedTouches[0].acceptedAt), acceptedAt, deliveryState);
+      if (terminalDelivery) {
+        assert.equal(accepted.request.follow_up_state, 'stopped', deliveryState);
+        assert.equal(accepted.request.next_follow_up_at, null, deliveryState);
+      } else {
+        assert.equal(accepted.request.follow_up_state, 'scheduled', deliveryState);
+        assert.equal(accepted.request.next_follow_up_at, dueAt.replace('.000Z', '+00:00'), deliveryState);
+      }
+    }
+  });
+
   await t.test('claim accepts only the current due logical N and rejects stopped or count-five requests', () => {
     const fixture = seedFixture(containerName, database, 'claim-contract');
     const started = start(containerName, database, fixture);
@@ -901,6 +951,7 @@ test('real PostgreSQL enforces Phase 3 Task 2 storage authority and parity', {
     const acceptedAt = '2026-09-01T17:06:00.000Z';
     psql(containerName, database, `
       update public.crm_communications set
+        provider_message_id = ${quote(`provider-${communicationId}`)},
         delivery_state = 'accepted', delivery_state_at = ${quote(acceptedAt)}::timestamptz,
         updated_at = ${quote(acceptedAt)}::timestamptz
       where id = ${quote(communicationId)};

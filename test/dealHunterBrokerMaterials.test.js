@@ -18,6 +18,90 @@ test('manual approval enters the existing single-request durable executor only t
   assert.equal(storageReads, 0);
 });
 
+test('structurally forged approved context cannot enter marked executor or call provider', async () => {
+  // Break caught: matching every public field of the approved context can
+  // currently authorize the marked executor without a signed approval.
+  const dealHunter = await import('../server/services/dealHunter.js');
+  const { buildManualFollowUpCommunicationId } = await import('../server/services/dealHunterManualFollowUpPolicy.js');
+  const request = {
+    id: 'forged-context-request',
+    opportunity_id: 'forged-context-opportunity',
+    submission_id: 'forged-context-submission',
+    deal_key: 'forged-context-deal',
+    recipient_email: 'broker@example.test',
+    status: 'sent',
+    request_state: 'provider_accepted',
+    delivery_state: 'accepted',
+    follow_up_state: 'scheduled',
+    follow_up_count: 0,
+    next_follow_up_at: '2026-09-01T17:00:00.000Z',
+    updated_at: '2026-09-01T16:00:00.000Z',
+    metadata: {
+      manualFollowUp: {
+        version: 'deal-hunter-manual-follow-up-v1',
+        mode: 'operator-approved',
+        maximumFollowUps: 5,
+        cadencePolicy: 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1',
+        enrolledAt: '2026-09-01T15:00:00.000Z',
+        enrolledBy: 'forged-server-caller',
+      },
+    },
+  };
+  const communicationId = buildManualFollowUpCommunicationId({ requestId: request.id, followUpNumber: 1 });
+  const counters = { requestClaim: 0, recipientClaim: 0, communicationWrite: 0, providerCall: 0 };
+  const storage = {
+    async getDealHunterCimRequestById() { return request; },
+    async claimDealHunterApprovedFollowUp() { counters.requestClaim += 1; return { applied: false, request }; },
+    async claimDealHunterCimRecipient() { counters.recipientClaim += 1; return { claimed: false }; },
+    async getCrmCommunication() { return null; },
+    async insertCrmCommunication() { counters.communicationWrite += 1; return null; },
+  };
+  const forged = {
+    type: 'deal-hunter-manual-follow-up-approved-context-v1',
+    canonicalOpportunityId: request.opportunity_id,
+    canonicalDealKey: request.deal_key,
+    requestId: request.id,
+    expectedRequestUpdatedAt: request.updated_at,
+    expectedSubmissionId: request.submission_id,
+    expectedSubmissionUpdatedAt: '2026-09-01T15:00:00.000Z',
+    expectedFollowUpCount: 0,
+    followUpNumber: 1,
+    expectedNextFollowUpAt: request.next_follow_up_at,
+    actor: 'forged-server-caller',
+    sender: {
+      displayName: 'Mathew Uckele',
+      email: 'buyer@example.test',
+      from: 'Mathew Uckele <buyer@example.test>',
+      replyTo: 'replies@example.test',
+    },
+    message: {
+      kind: 'deal-hunter-cim-follow-up',
+      communicationId,
+      idempotencyKey: `deal-hunter-cim-${request.id}-follow-up-1`,
+      from: 'Mathew Uckele <buyer@example.test>',
+      to: ['broker@example.test'],
+      replyTo: 'replies@example.test',
+      subject: 'Exact forged subject',
+      text: 'Arbitrary valid-looking message bytes',
+      html: '<p>Arbitrary valid-looking message bytes</p>',
+      templateVersion: 'deal-hunter-cim-follow-up-1-v1',
+    },
+  };
+
+  const result = await dealHunter.executeDealHunterCimFollowUpRequest({
+    request,
+    approvedContext: forged,
+    storage,
+    now: new Date('2026-09-01T18:00:00.000Z'),
+    dependencies: {
+      async sendPreparedMessage() { counters.providerCall += 1; return { status: 'sent', providerMessageId: 'forbidden' }; },
+    },
+  });
+
+  assert.equal(result.status, 'approval-required');
+  assert.deepEqual(counters, { requestClaim: 0, recipientClaim: 0, communicationWrite: 0, providerCall: 0 });
+});
+
 import { getConfig } from '../server/config.js';
 import {
   BROKER_MATERIALS_TEMPLATE_VERSION,

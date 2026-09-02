@@ -4168,6 +4168,7 @@ export function createSqliteStorage(config) {
       return manualFollowUpResult({ reason: 'authority-changed', request: authority.request });
     }
     const marker = manualFollowUpMarker(authority.request);
+    const stoppedInFlight = authority.request.status === 'follow_up_pending';
     if (!hasStrictManualFollowUpCore(marker)
       || isManualFollowUpTerminal(authority.request, authority.submission)
       || Number(authority.request.follow_up_count) >= MANUAL_FOLLOW_UP_MAXIMUM
@@ -4200,6 +4201,7 @@ export function createSqliteStorage(config) {
     const storedActivity = insertCrmActivityEvent(activity);
     return manualFollowUpResult({
       applied: true,
+      reason: stoppedInFlight ? 'stopped-in-flight' : '',
       request: loadManualFollowUpAuthority(requestId).request,
       activity: storedActivity,
     });
@@ -4348,8 +4350,13 @@ export function createSqliteStorage(config) {
       ? nextManualFollowUpAt(acceptedAt)
       : null;
     if (outcome === 'accepted') {
-      if (!['accepted', 'delivered'].includes(communication.delivery_state)
+      const firstProviderAcceptedAt = communication.metadata?.manualFollowUp?.firstProviderAcceptedAt
+        || (communication.delivery_state === 'accepted' ? communication.delivery_state_at : null);
+      if (!['accepted', 'delivered', 'delayed', 'bounced', 'complained', 'suppressed', 'replied'].includes(communication.delivery_state)
+        || !communication.provider_message_id
         || !Number.isFinite(Date.parse(acceptedAt || ''))
+        || !Number.isFinite(Date.parse(firstProviderAcceptedAt || ''))
+        || new Date(firstProviderAcceptedAt).toISOString() !== new Date(acceptedAt).toISOString()
         || (expectedFollowUpNumber < MANUAL_FOLLOW_UP_MAXIMUM
           && (!derivedNextFollowUpAt
             || Date.parse(nextFollowUpAt || '') !== Date.parse(derivedNextFollowUpAt)))) {
@@ -6280,12 +6287,17 @@ export function createSqliteStorage(config) {
           || communication.submission_id !== submissionId
           || request.submission_id !== submissionId
           || communication.idempotency_key !== idempotencyKey
-          || communication.delivery_state !== 'ambiguous') return null;
+          || communication.delivery_state !== 'ambiguous'
+          || !Number.isFinite(Date.parse(communication.delivery_state_at || ''))
+          || new Date(communication.delivery_state_at).toISOString() !== new Date(ambiguousAt).toISOString()) return null;
         const existing = database.prepare('SELECT * FROM crm_email_outbox WHERE communication_id = ? LIMIT 1').get(communicationId);
         if (existing) {
           return existing.state === 'ambiguous'
             && existing.cim_request_id === requestId
             && existing.submission_id === submissionId
+            && existing.idempotency_key === `${idempotencyKey}:ambiguity-proof`
+            && Number.isFinite(Date.parse(existing.ambiguous_at || ''))
+            && new Date(existing.ambiguous_at).toISOString() === new Date(ambiguousAt).toISOString()
             ? normalizeCrmEmailOutboxRow(existing)
             : null;
         }

@@ -131,6 +131,7 @@ declare
   v_marker jsonb;
   v_enrolled_at timestamptz;
   v_activity jsonb;
+  v_stopped_in_flight boolean;
 begin
   select * into v_submission
   from public.contact_submissions as submission
@@ -154,6 +155,7 @@ begin
   end if;
 
   v_marker := coalesce(v_current.metadata -> 'manualFollowUp', '{}'::jsonb);
+  v_stopped_in_flight := v_current.status = 'follow_up_pending';
   if jsonb_typeof(v_marker) is distinct from 'object'
     or v_marker -> 'version' is distinct from to_jsonb('deal-hunter-manual-follow-up-v1'::text)
     or v_marker -> 'mode' is distinct from to_jsonb('operator-approved'::text)
@@ -206,7 +208,7 @@ begin
   insert into public.crm_activity_events
   select * from jsonb_populate_record(null::public.crm_activity_events, p_activity)
   returning to_jsonb(crm_activity_events) into v_activity;
-  return jsonb_build_object('applied', true, 'reason', '', 'request', to_jsonb(v_current), 'activity', v_activity, 'alreadyFinalized', false);
+  return jsonb_build_object('applied', true, 'reason', case when v_stopped_in_flight then 'stopped-in-flight' else '' end, 'request', to_jsonb(v_current), 'activity', v_activity, 'alreadyFinalized', false);
 end;
 $$;
 
@@ -331,6 +333,7 @@ declare
   v_status text;
   v_request_state text;
   v_delivery_state text;
+  v_provider_accepted_at timestamptz;
   v_due_date date;
   v_derived_next_follow_up_at timestamptz;
 begin
@@ -427,8 +430,20 @@ begin
     or v_marker ? 'stoppedAt';
 
   if p_outcome = 'accepted' then
-    if v_communication.delivery_state not in ('accepted', 'delivered')
-      or p_accepted_at is null then
+    begin
+      v_provider_accepted_at := case
+        when nullif(v_communication.metadata #>> '{manualFollowUp,firstProviderAcceptedAt}', '') is not null
+          then (v_communication.metadata #>> '{manualFollowUp,firstProviderAcceptedAt}')::timestamptz
+        when v_communication.delivery_state = 'accepted' then v_communication.delivery_state_at
+        else null
+      end;
+    exception when others then
+      v_provider_accepted_at := null;
+    end;
+    if v_communication.delivery_state not in ('accepted', 'delivered', 'delayed', 'bounced', 'complained', 'suppressed', 'replied')
+      or nullif(btrim(v_communication.provider_message_id), '') is null
+      or p_accepted_at is null
+      or v_provider_accepted_at is distinct from p_accepted_at then
       return jsonb_build_object('applied', false, 'reason', 'accepted-proof-missing', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
     end if;
     if p_expected_follow_up_number < 5 then

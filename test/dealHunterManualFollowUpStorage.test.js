@@ -530,6 +530,50 @@ test('SQLite manual follow-up stop atomically clears schedule preserves count an
   }
 });
 
+test('SQLite ambiguity proof rejects a timestamp that does not exactly match durable communication authority', async (t) => {
+  // Break caught: callers can currently choose any parseable ambiguity time,
+  // including on the duplicate/idempotent path.
+  const storage = createStorage(t, 'ambiguity-timestamp');
+  const seeded = await seed(storage, 'ambiguity-timestamp');
+  const ambiguousAt = '2026-09-01T18:00:00.000Z';
+  const communication = outboundCommunication({
+    requestId: seeded.request.id,
+    submissionId: seeded.submission.id,
+    followUpNumber: 1,
+    deliveryState: 'ambiguous',
+    occurredAt: ambiguousAt,
+  });
+  await storage.insertCrmCommunication(communication);
+  const input = {
+    requestId: seeded.request.id,
+    submissionId: seeded.submission.id,
+    communicationId: communication.id,
+    idempotencyKey: communication.idempotency_key,
+    actor: 'storage-admin',
+    ambiguousAt,
+    error: 'provider result unknown',
+  };
+  assert.equal(await storage.recordDealHunterManualFollowUpAmbiguity({
+    ...input,
+    ambiguousAt: '2026-09-01T18:00:01.000Z',
+  }), null);
+  assert.equal((await storage.listCrmEmailOutbox({ submissionId: seeded.submission.id, states: ['ambiguous'] })).length, 0);
+
+  const first = await storage.recordDealHunterManualFollowUpAmbiguity(input);
+  assert.equal(first.state, 'ambiguous');
+  assert.equal(first.ambiguous_at, ambiguousAt);
+  assert.deepEqual(await storage.recordDealHunterManualFollowUpAmbiguity(input), first);
+  assert.equal(await storage.recordDealHunterManualFollowUpAmbiguity({
+    ...input,
+    ambiguousAt: '2026-09-01T18:00:02.000Z',
+  }), null);
+  assert.equal(await storage.recordDealHunterManualFollowUpAmbiguity({
+    ...input,
+    idempotencyKey: 'wrong-provider-idempotency-key',
+  }), null);
+  assert.equal((await storage.listCrmEmailOutbox({ submissionId: seeded.submission.id, states: ['ambiguous'] })).length, 1);
+});
+
 test('SQLite approved follow-up claim requires marker request version count number due timestamp due-now and active submission', async (t) => {
   // Break caught: a claim can authorize a stale, early, wrong-number, or
   // detached request.
@@ -988,6 +1032,7 @@ test('SQLite ambiguity clears the schedule and cannot become retry without recon
   assert.equal(forbiddenRelabel.applied, false);
 
   await storage.updateCrmCommunication(exactCommunication.id, {
+    provider_message_id: 'provider-ambiguity-reconciled',
     delivery_state: 'accepted',
     delivery_state_at: '2026-09-01T17:06:00.000Z',
     updated_at: '2026-09-01T17:06:00.000Z',

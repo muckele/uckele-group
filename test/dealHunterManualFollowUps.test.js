@@ -113,6 +113,7 @@ function task3Storage({ request = baseRequest(), communications = [initialCommun
       broker_email: 'broker@example.test', updated_at: new Date(acceptedAt.getTime() + 500).toISOString(), metadata: {},
     },
     request,
+    requests: [request],
     communications: [...communications],
     dispositions: [], secureDocuments: [], latestUploadRequest: null, suppression: null,
     recipientClaim: null, opportunityClaim: null, safety: { outreach_paused: false, metadata: {} },
@@ -133,12 +134,16 @@ function task3Storage({ request = baseRequest(), communications = [initialCommun
     async listSecureDocumentsForSubmission() { return state.secureDocuments; },
     async getLatestSecureUploadRequestForSubmission() { return state.latestUploadRequest; },
     async listDealHunterCimRequests({ opportunityIds = [], dealKeys = [], recipientEmails = [] } = {}) {
-      const candidate = state.request;
-      return (!opportunityIds.length || opportunityIds.includes(candidate.opportunity_id))
+      const candidates = [...new Map([...state.requests, state.request].map((candidate) => [candidate.id, candidate])).values()];
+      return candidates.filter((candidate) => (
+        (!opportunityIds.length || opportunityIds.includes(candidate.opportunity_id))
         && (!dealKeys.length || dealKeys.includes(candidate.deal_key))
-        && (!recipientEmails.length || recipientEmails.includes(candidate.recipient_email)) ? [candidate] : [];
+        && (!recipientEmails.length || recipientEmails.includes(candidate.recipient_email))
+      ));
     },
-    async getDealHunterCimRequestById(id) { return id === state.request.id ? state.request : null; },
+    async getDealHunterCimRequestById(id) {
+      return state.request.id === id ? state.request : state.requests.find((candidate) => candidate.id === id) || null;
+    },
     async listDealHunterDispositions() { return state.dispositions; },
     async listDealHunterIdentityExceptions() { return []; },
     async getDealHunterCimOpportunityClaim() { return state.opportunityClaim; },
@@ -155,11 +160,13 @@ function task3Storage({ request = baseRequest(), communications = [initialCommun
     async startDealHunterManualFollowUps(input) {
       state.calls.start += 1;
       state.request = { ...state.request, updated_at: input.marker.enrolledAt, follow_up_state: 'scheduled', next_follow_up_at: input.nextFollowUpAt, metadata: { ...state.request.metadata, manualFollowUp: input.marker } };
+      state.requests = state.requests.map((candidate) => candidate.id === state.request.id ? state.request : candidate);
       return { applied: true, reason: '', request: state.request, activity: input.activity, alreadyFinalized: false };
     },
     async stopDealHunterManualFollowUps(input) {
       state.calls.stop += 1;
       state.request = { ...state.request, updated_at: input.stoppedAt, follow_up_state: 'stopped', next_follow_up_at: null, metadata: { ...state.request.metadata, manualFollowUp: { ...state.request.metadata.manualFollowUp, stoppedAt: input.stoppedAt, stoppedBy: input.stoppedBy, stopReason: input.reason } } };
+      state.requests = state.requests.map((candidate) => candidate.id === state.request.id ? state.request : candidate);
       return { applied: true, reason: '', request: state.request, activity: input.activity, alreadyFinalized: false };
     },
   };
@@ -205,6 +212,95 @@ test('Start Follow-Up Sequence atomically enrolls without claim communication ac
   assert.equal(storage.state.calls.provider, 0);
   assert.equal(storage.state.communications.length, communicationCount);
   assert.equal(storage.state.request.follow_up_count, 0);
+});
+
+test('Start and final executor reject a stale accepted request when a newer canonical request owns the current opportunity', async () => {
+  // Break caught: route membership alone can authorize an older accepted
+  // conversation after a newer request becomes the canonical current owner.
+  const stale = baseRequest({ updated_at: '2026-08-28T18:00:00.000Z' });
+  const currentId = 'request-task3-current-owner';
+  const currentInitialId = 'initial-communication-task3-current-owner';
+  const current = baseRequest({
+    id: currentId,
+    recipient_email: 'current-broker@example.test',
+    updated_at: '2026-09-01T18:00:00.000Z',
+    metadata: {
+      ...baseRequest().metadata,
+      initialCommunicationId: currentInitialId,
+    },
+  });
+  const currentInitial = initialCommunication({
+    id: currentInitialId,
+    cim_request_id: currentId,
+    to_addresses: ['current-broker@example.test'],
+  });
+  const staleStorage = task3Storage({ request: stale, communications: [initialCommunication(), currentInitial] });
+  staleStorage.state.requests = [stale, current];
+
+  const staleStart = await startDealHunterManualFollowUps({
+    opportunityId, requestId, session: administrator, storage: staleStorage, now: new Date(), dependencies,
+  });
+  assert.equal(staleStart.success, false);
+  assert.equal(staleStart.code, 'request_not_found');
+  assert.equal(staleStorage.state.calls.start, 0);
+
+  const staleMarked = markedRequest({ updated_at: '2026-08-28T19:00:00.000Z' });
+  staleStorage.state.request = staleMarked;
+  staleStorage.state.requests = [staleMarked, current];
+  const stalePreparation = await prepare(staleStorage);
+  assert.equal(stalePreparation.success, false);
+  assert.equal(stalePreparation.code, 'request_not_found');
+
+  const currentStorage = task3Storage({ request: current, communications: [currentInitial] });
+  const currentStart = await startDealHunterManualFollowUps({
+    opportunityId, requestId: currentId, session: administrator, storage: currentStorage, now: new Date(), dependencies,
+  });
+  assert.equal(currentStart.success, true, currentStart.error);
+
+  const approvalStorage = task3Storage({ request: markedRequest() });
+  const prepared = await prepare(approvalStorage);
+  assert.equal(prepared.success, true, prepared.error);
+  approvalStorage.state.requests.push(current);
+  let executorCalls = 0;
+  const staleApproval = await approveDealHunterManualFollowUp({
+    opportunityId,
+    requestId,
+    preparationToken: prepared.preparationToken,
+    approvedProposalDigest: prepared.proposalDigest,
+    session: administrator,
+    storage: approvalStorage,
+    now: new Date(),
+    dependencies,
+    executeApprovedFollowUp: async () => { executorCalls += 1; },
+  });
+  assert.equal(staleApproval.success, false);
+  assert.equal(staleApproval.code, 'request_not_found');
+  assert.equal(executorCalls, 0);
+
+  const finalBoundaryStorage = task3Storage({ request: markedRequest() });
+  const finalBoundaryPreparation = await prepare(finalBoundaryStorage);
+  assert.equal(finalBoundaryPreparation.success, true, finalBoundaryPreparation.error);
+  let finalProviderCalls = 0;
+  const finalBoundary = await approveDealHunterManualFollowUp({
+    opportunityId,
+    requestId,
+    preparationToken: finalBoundaryPreparation.preparationToken,
+    approvedProposalDigest: finalBoundaryPreparation.proposalDigest,
+    session: administrator,
+    storage: finalBoundaryStorage,
+    now: new Date(),
+    dependencies,
+    executeApprovedFollowUp: async ({ approvedContext }) => {
+      finalBoundaryStorage.state.requests.push(current);
+      const stillCurrent = await approvedContext.revalidateCurrentAuthority();
+      if (!stillCurrent) return { status: 'locked', request: finalBoundaryStorage.state.request };
+      finalProviderCalls += 1;
+      return { status: 'sent', request: finalBoundaryStorage.state.request };
+    },
+  });
+  assert.equal(finalBoundary.success, false);
+  assert.equal(finalBoundary.code, 'authority_changed');
+  assert.equal(finalProviderCalls, 0);
 });
 
 test('Start Follow-Up Sequence rejects reply materials pass archive suppression ambiguity active legacy schedule stopped and count five', async (t) => {
@@ -279,6 +375,28 @@ test('Prepare Follow-Up is side-effect-free principal-bound expires in fifteen m
   assert.equal(Object.hasOwn(preview, 'proposalDigest'), false);
   const unauthenticatedViewer = await prepareDealHunterManualFollowUp({ opportunityId, requestId, session: { role: 'viewer' }, storage, now: new Date(), dependencies });
   assert.equal(unauthenticatedViewer.code, 'authenticated_access_required');
+});
+
+test('viewer preview ignores or rejects greeting input and advertises no editable message fields', async () => {
+  // Break caught: a viewer-supplied greeting can alter the server preview and
+  // the response advertises an edit capability the viewer does not own.
+  const storage = task3Storage({ request: markedRequest() });
+  const defaultPreview = await prepareDealHunterManualFollowUp({
+    opportunityId, requestId, session: viewer, storage, now: new Date(), dependencies,
+  });
+  const customized = await prepareDealHunterManualFollowUp({
+    opportunityId, requestId, input: { greeting: 'Forged viewer greeting,' },
+    session: viewer, storage, now: new Date(), dependencies,
+  });
+  assert.equal(customized.success, true, customized.error);
+  assert.equal(customized.review.message.greeting, defaultPreview.review.message.greeting);
+  assert.equal(customized.review.message.greetingEditable, false);
+  assert.equal(Object.hasOwn(customized, 'preparationToken'), false);
+  assert.equal(Object.hasOwn(customized, 'proposalDigest'), false);
+
+  const administratorPreview = await prepare(storage, { greeting: 'Administrator greeting,' });
+  assert.equal(administratorPreview.review.message.greeting, 'Administrator greeting,');
+  assert.equal(administratorPreview.review.message.greetingEditable, true);
 });
 
 test('Prepare Follow-Up rejects early terminal ambiguous stopped completed and missing-authority states', async (t) => {
@@ -483,7 +601,7 @@ test('ambiguous follow-up permits status and reconciliation but never retransmis
   assert.equal(storage.state.calls.provider, 0);
 });
 
-test('Supabase ambiguity proof is relationship-bound and idempotent for the Task 2 finalizer', async () => {
+test('ambiguity proof requires the communication exact ambiguous timestamp in SQLite and Supabase', async () => {
   const communicationId = buildManualFollowUpCommunicationId({ requestId, followUpNumber: 1 });
   const rows = {
     crm_communications: [{
@@ -492,6 +610,7 @@ test('Supabase ambiguity proof is relationship-bound and idempotent for the Task
       submission_id: submissionId,
       idempotency_key: `deal-hunter-cim-${requestId}-follow-up-1`,
       delivery_state: 'ambiguous',
+      delivery_state_at: '2026-09-01T18:00:00.000Z',
       provider: 'resend',
       provider_message_id: null,
     }],
@@ -535,6 +654,12 @@ test('Supabase ambiguity proof is relationship-bound and idempotent for the Task
     ambiguousAt: '2026-09-01T18:00:00.000Z',
     error: 'provider outcome unknown',
   };
+  const wrongTimestamp = await storage.recordDealHunterManualFollowUpAmbiguity({
+    ...input,
+    ambiguousAt: '2026-09-01T18:00:01.000Z',
+  });
+  assert.equal(wrongTimestamp, null);
+  assert.equal(rows.crm_email_outbox.length, 0);
   const first = await storage.recordDealHunterManualFollowUpAmbiguity(input);
   const second = await storage.recordDealHunterManualFollowUpAmbiguity(input);
   assert.equal(first.state, 'ambiguous');
@@ -542,6 +667,11 @@ test('Supabase ambiguity proof is relationship-bound and idempotent for the Task
   assert.equal(rows.crm_email_outbox.length, 1);
   const mismatched = await storage.recordDealHunterManualFollowUpAmbiguity({ ...input, idempotencyKey: 'wrong-key' });
   assert.equal(mismatched, null);
+  const duplicateWrongTimestamp = await storage.recordDealHunterManualFollowUpAmbiguity({
+    ...input,
+    ambiguousAt: '2026-09-01T18:00:02.000Z',
+  });
+  assert.equal(duplicateWrongTimestamp, null);
   assert.equal(rows.crm_email_outbox.length, 1);
 });
 
