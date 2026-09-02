@@ -1,6 +1,23 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+test('manual approval enters the existing single-request durable executor only through trusted approved context', async () => {
+  const dealHunter = await import('../server/services/dealHunter.js');
+  assert.equal(typeof dealHunter.executeDealHunterCimFollowUpRequest, 'function');
+  let storageReads = 0;
+  const invalid = await dealHunter.executeDealHunterCimFollowUpRequest({
+    request: { id: 'marked-request', metadata: { manualFollowUp: { mode: 'operator-approved' } } },
+    approvedContext: {
+      preparationToken: 'a forged browser artifact',
+      approvedProposalDigest: 'c'.repeat(64),
+    },
+    storage: new Proxy({}, { get() { storageReads += 1; return async () => null; } }),
+    now: new Date('2026-09-01T18:00:00.000Z'),
+  });
+  assert.equal(invalid.status, 'approval-required');
+  assert.equal(storageReads, 0);
+});
+
 import { getConfig } from '../server/config.js';
 import {
   BROKER_MATERIALS_TEMPLATE_VERSION,
@@ -556,6 +573,23 @@ test('known deal-key aliases retain existing request and Pass ownership', async 
     assert.equal(result.success, false);
     assert.equal(result.code, 'opportunity_passed');
     assert.equal(Object.hasOwn(result, 'preparationToken'), false);
+  });
+
+  await t.test('later durable restore supersedes historical Pass', async () => {
+    const storage = authorityStorage({ aliases: [legacyAlias] });
+    storage.listDealHunterDispositions = async () => [
+      {
+        id: 'legacy-pass', deal_key: 'legacy-key', disposition: 'dismissed',
+        updated_at: '2026-08-31T17:50:00.000Z', dismissed_at: '2026-08-31T17:50:00.000Z',
+      },
+      {
+        id: 'legacy-restore', deal_key: 'legacy-key', disposition: 'restored',
+        updated_at: '2026-08-31T17:55:00.000Z', restored_at: '2026-08-31T17:55:00.000Z',
+      },
+    ];
+    const authority = await loadBrokerMaterialsAuthority({ opportunityId, storage, now });
+    assert.equal(authority.currentDispositionState, 'restored');
+    assert.equal(authority.preparationBlockers.some(({ code }) => code === 'opportunity_passed'), false);
   });
 });
 

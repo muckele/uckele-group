@@ -12,6 +12,7 @@ import { evaluateCimRecipientPolicy, getCimOutreachPauseStatus } from './cimOppo
 import { buildDealHunterCimRequestEmail } from './delivery.js';
 import { getEmailReadiness } from './emailReadiness.js';
 import { evaluateAcquisitionMaterialsState } from './acquisitionMaterials.js';
+import { firstStrictDetailAuthorityTimestamp } from './detailAuthorityTimestamp.js';
 import {
   isOperatorApprovedFollowUpRequest,
   projectManualFollowUpState,
@@ -247,6 +248,7 @@ function projectExistingRequest(records = [], {
   now = new Date(),
   terminalReason = '',
   materialsAuthorityAvailable = true,
+  communications = [],
 } = {}) {
   const request = [...records].filter((item) => item?.id).sort((left, right) => (
     (Date.parse(right.responded_at || right.respondedAt || right.updated_at || right.updatedAt || right.created_at || right.createdAt || '') || 0)
@@ -264,7 +266,7 @@ function projectExistingRequest(records = [], {
     && isOperatorApprovedFollowUpRequest(request);
   const followUps = projectManualFollowUpState({
     request,
-    communications: [],
+    communications,
     authority: {
       terminalReason: materialsAuthorityUnavailable ? 'materials-authority-unavailable' : terminalReason,
       preparationBlockers: materialsAuthorityUnavailable
@@ -345,7 +347,7 @@ function unavailableAuthority({ opportunityId, opportunity = null, score = null,
     opportunityId, opportunity, score, recipientOptions: [], warnings: [], existingRequest: null,
     preparationBlockers: [blocker('broker_materials_authority_unavailable', 'Broker Materials authority could not be verified.')],
     sendBlockers: [], pursued: false, authorityRevision: '', aliasResolutionFingerprint: '', requiredAuthorityExpiresAt: '',
-    authorityStatus: 503, now,
+    authorityStatus: 503, materialsAuthorityAvailable: false, communicationsAuthorityAvailable: false, now,
   };
 }
 
@@ -366,7 +368,56 @@ function unionRequests(...collections) {
   return [...byId.values()];
 }
 
-export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage, now = new Date() } = {}) {
+function currentDisposition(records = []) {
+  const candidates = (Array.isArray(records) ? records : []).slice(0, 500).flatMap((record) => {
+    const state = text(record?.disposition, 80).toLowerCase();
+    if (!state) return [];
+    const authorityAt = firstStrictDetailAuthorityTimestamp(record, [
+      ['updated_at', 'updatedAt'],
+      ...(state === 'dismissed'
+        ? [['dismissed_at', 'dismissedAt']]
+        : state === 'restored'
+          ? [['restored_at', 'restoredAt']]
+          : [['dismissed_at', 'dismissedAt'], ['restored_at', 'restoredAt']]),
+      ['created_at', 'createdAt'],
+    ]);
+    return [{
+      state,
+      timestamp: authorityAt.timestamp,
+      fractionalNanoseconds: authorityAt.fractionalNanoseconds,
+      recordId: text(record?.id, 200),
+      signature: stableCanonicalJson({
+        state,
+        reason: text(record?.reason, 160),
+        note: text(record?.note, 500),
+        dismissedAt: text(record?.dismissed_at ?? record?.dismissedAt, 80),
+        restoredAt: text(record?.restored_at ?? record?.restoredAt, 80),
+        authorityAt: authorityAt.value,
+      }),
+    }];
+  }).sort((left, right) => {
+    if (left.timestamp !== null && right.timestamp === null) return -1;
+    if (left.timestamp === null && right.timestamp !== null) return 1;
+    if (left.timestamp !== null && right.timestamp !== null && left.timestamp !== right.timestamp) return right.timestamp - left.timestamp;
+    if (left.timestamp !== null && right.timestamp !== null && left.fractionalNanoseconds !== right.fractionalNanoseconds) {
+      return right.fractionalNanoseconds - left.fractionalNanoseconds;
+    }
+    if (left.state !== right.state) {
+      if (left.state === 'dismissed') return -1;
+      if (right.state === 'dismissed') return 1;
+    }
+    if (left.recordId || right.recordId) {
+      if (!left.recordId) return 1;
+      if (!right.recordId) return -1;
+      const byId = left.recordId.localeCompare(right.recordId);
+      if (byId !== 0) return byId;
+    }
+    return left.signature.localeCompare(right.signature);
+  });
+  return candidates[0]?.state || '';
+}
+
+export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage, now = new Date(), communicationSnapshot } = {}) {
   const id = text(opportunityId, 200);
   const config = getConfig();
   const at = normalizedNow(now);
@@ -398,7 +449,9 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   let identityExceptions;
   let secureDocuments;
   let latestUploadRequest;
+  let communications = [];
   let materialsAuthorityAvailable = true;
+  let communicationsAuthorityAvailable = true;
   try {
     [aliases, facts, sourceRows, submission, opportunityClaim, safety, identityExceptions] = await Promise.all([
       requiredAuthorityRead(storage, 'listDealHunterOpportunityAliases', { opportunityIds: [id], limit: 500 }),
@@ -429,6 +482,20 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
     ]);
     requests = unionRequests(canonicalRequests, aliasRequests);
     dispositions = knownDispositions;
+    if (Array.isArray(communicationSnapshot)) {
+      communications = communicationSnapshot;
+    } else if (submission) {
+      const communicationAuthority = await boundedAuthorityRead(
+        storage,
+        'listCrmCommunications',
+        { rows: [] },
+        { submissionId: submission.id, page: 1, pageSize: 100 },
+      );
+      communications = Array.isArray(communicationAuthority.value?.rows)
+        ? communicationAuthority.value.rows
+        : [];
+      communicationsAuthorityAvailable = communicationAuthority.available;
+    }
   } catch {
     return unavailableAuthority({ opportunityId: id, opportunity, score, now: at });
   }
@@ -450,6 +517,7 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
     now: at,
     terminalReason,
     materialsAuthorityAvailable,
+    communications,
   });
   const manualEligibility = evaluateDealHunterCimEligibility({
     deal: {
@@ -467,7 +535,8 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   if (text(opportunity.status, 80).toLowerCase() !== 'active') preparationBlockers.push(blocker('canonical_authority_unavailable', 'The canonical opportunity is no longer current.'));
   if (!state.pursued) preparationBlockers.push(blocker(state.changed ? 'pursue_not_current' : 'not_pursued', state.changed ? 'The Pursue review is no longer current.' : 'Explicit current Pursue is required.'));
   if (score.should_remove) preparationBlockers.push(blocker('opportunity_not_actionable', 'The opportunity is removed or otherwise non-actionable.'));
-  if (dispositions.some((item) => text(item.disposition, 80).toLowerCase() === 'dismissed')) preparationBlockers.push(blocker('opportunity_passed', 'The opportunity is currently Passed.'));
+  const currentDispositionState = currentDisposition(dispositions);
+  if (currentDispositionState === 'dismissed') preparationBlockers.push(blocker('opportunity_passed', 'The opportunity is currently Passed.'));
   if (trustedSourceRows.length === 0) preparationBlockers.push(blocker('required_source_authority_unavailable', 'Required current source authority is unavailable.'));
   if (submission && text(submission.status, 80).toLowerCase() === 'archived') preparationBlockers.push(blocker('crm_owner_archived', 'The linked CRM record is archived.'));
   if (recipientOptions.length === 0) preparationBlockers.push(blocker('recipient_authority_unavailable', 'No current authoritative broker recipient is available.'));
@@ -503,7 +572,13 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
     sourceRows: trustedSourceRows,
     submission,
     requests,
+    dispositions,
+    currentDispositionState,
+    communications,
     materialsState,
+    materialsAuthorityAvailable,
+    communicationsAuthorityAvailable,
+    terminalReason,
     existingRequest,
     opportunityClaim,
     safety,
@@ -543,8 +618,8 @@ async function selectedSendBlockers({ authority, selectedRecipient, storage, now
   return uniqueBlockers(blockers);
 }
 
-export async function projectDealHunterBrokerMaterials({ opportunityId = '', storage, now = new Date() } = {}) {
-  const authority = await loadBrokerMaterialsAuthority({ opportunityId, storage, now });
+export async function projectDealHunterBrokerMaterials({ opportunityId = '', storage, now = new Date(), communicationSnapshot } = {}) {
+  const authority = await loadBrokerMaterialsAuthority({ opportunityId, storage, now, communicationSnapshot });
   const autoSelected = authority.recipientOptions.length === 1
     ? authority.recipientOptions[0]
     : authority.recipientOptions.filter((item) => item.primary).length === 1

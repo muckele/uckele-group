@@ -6265,6 +6265,55 @@ export function createSqliteStorage(config) {
       return command.immediate();
     },
 
+    async recordDealHunterManualFollowUpAmbiguity({
+      requestId = '', submissionId = '', communicationId = '', idempotencyKey = '',
+      actor = '', ambiguousAt = '', error = '',
+    } = {}) {
+      if (!requestId || !submissionId || !communicationId || !idempotencyKey || !actor
+        || !Number.isFinite(Date.parse(ambiguousAt || ''))) return null;
+      return database.transaction(() => {
+        const communication = database.prepare('SELECT * FROM crm_communications WHERE id = ? LIMIT 1').get(communicationId);
+        const request = database.prepare('SELECT * FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1').get(requestId);
+        const submission = database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1').get(submissionId);
+        if (!communication || !request || !submission
+          || communication.cim_request_id !== requestId
+          || communication.submission_id !== submissionId
+          || request.submission_id !== submissionId
+          || communication.idempotency_key !== idempotencyKey
+          || communication.delivery_state !== 'ambiguous') return null;
+        const existing = database.prepare('SELECT * FROM crm_email_outbox WHERE communication_id = ? LIMIT 1').get(communicationId);
+        if (existing) {
+          return existing.state === 'ambiguous'
+            && existing.cim_request_id === requestId
+            && existing.submission_id === submissionId
+            ? normalizeCrmEmailOutboxRow(existing)
+            : null;
+        }
+        const proofId = createHash('sha256').update(`deal-hunter-manual-follow-up-ambiguity:${communicationId}`).digest('hex');
+        insertCrmEmailOutboxStatement.run(serializeCrmEmailOutbox({
+          id: proofId,
+          communication_id: communicationId,
+          submission_id: submissionId,
+          cim_request_id: requestId,
+          idempotency_key: `${idempotencyKey}:ambiguity-proof`,
+          client_request_key: `${proofId}:ambiguity-proof`,
+          state: 'ambiguous',
+          provider: communication.provider || null,
+          provider_message_id: communication.provider_message_id || null,
+          attempt_count: 1,
+          ambiguous_at: ambiguousAt,
+          expected_submission_version: submission.updated_at,
+          actor: String(actor).slice(0, 300),
+          created_at: ambiguousAt,
+          updated_at: ambiguousAt,
+          metadata: { kind: 'deal-hunter-manual-follow-up-ambiguity-proof', error: String(error || '').slice(0, 500) },
+        }));
+        return normalizeCrmEmailOutboxRow(
+          database.prepare('SELECT * FROM crm_email_outbox WHERE communication_id = ? LIMIT 1').get(communicationId),
+        );
+      }).immediate();
+    },
+
     async getCrmEmailOutbox(id) {
       if (!id) return null;
       return normalizeCrmEmailOutboxRow(

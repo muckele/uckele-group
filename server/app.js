@@ -56,6 +56,16 @@ import {
   prepareDealHunterBrokerMaterials,
 } from './services/dealHunterBrokerMaterials.js';
 import {
+  approveDealHunterManualFollowUp,
+  parseManualFollowUpApprovalInput,
+  parseManualFollowUpPreparationInput,
+  parseManualFollowUpStartInput,
+  parseManualFollowUpStopInput,
+  prepareDealHunterManualFollowUp,
+  startDealHunterManualFollowUps,
+  stopDealHunterManualFollowUps,
+} from './services/dealHunterManualFollowUps.js';
+import {
   dealHunterCrmSyncConfirmation,
   auditDealHunterCrmIntegrity,
   executeDealOsCrmReconciliation,
@@ -1475,7 +1485,11 @@ export function createApp() {
         response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
         return;
       }
-      const result = await getTriageOpportunityDetail({ opportunityId: request.params.opportunityId });
+      const result = await getTriageOpportunityDetail({
+        opportunityId: request.params.opportunityId,
+        reconcileAcceptedManualFollowUps: session.role === 'admin',
+        actor: session.username || session.principal_id,
+      });
       if (!result.ok) {
         response.status(result.status || 400).json({ success: false, error: result.error || 'Opportunity detail is unavailable.' });
         return;
@@ -1537,6 +1551,110 @@ export function createApp() {
           role: session.role,
           username: session.username,
         },
+        storage: getStorage(),
+      });
+      response.status(result.status || (result.success ? 200 : 409)).json(result);
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/broker-materials/follow-ups/:requestId/start',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      let input;
+      try {
+        input = parseManualFollowUpStartInput(request.body ?? {});
+      } catch (error) {
+        response.status(400).json({ success: false, code: 'invalid_start_input', error: error.message });
+        return;
+      }
+      const result = await startDealHunterManualFollowUps({
+        opportunityId: request.params.opportunityId,
+        requestId: request.params.requestId,
+        input,
+        session: { principal_id: session.principal_id, role: session.role, username: session.username },
+        storage: getStorage(),
+      });
+      response.status(result.status || (result.success ? 200 : 409)).json(result);
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/broker-materials/follow-ups/:requestId/stop',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      let input;
+      try {
+        input = parseManualFollowUpStopInput(request.body ?? {});
+      } catch (error) {
+        response.status(400).json({ success: false, code: 'invalid_stop_input', error: error.message });
+        return;
+      }
+      const result = await stopDealHunterManualFollowUps({
+        opportunityId: request.params.opportunityId,
+        requestId: request.params.requestId,
+        input,
+        session: { principal_id: session.principal_id, role: session.role, username: session.username },
+        storage: getStorage(),
+      });
+      response.status(result.status || (result.success ? 200 : 409)).json(result);
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/broker-materials/follow-ups/:requestId/prepare',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdminAccess(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Authenticated admin access is required.' });
+        return;
+      }
+      let input;
+      try {
+        input = parseManualFollowUpPreparationInput(request.body ?? {});
+      } catch (error) {
+        response.status(400).json({ success: false, code: 'invalid_preparation_input', error: error.message });
+        return;
+      }
+      const result = await prepareDealHunterManualFollowUp({
+        opportunityId: request.params.opportunityId,
+        requestId: request.params.requestId,
+        input,
+        session: { principal_id: session.principal_id, role: session.role, username: session.username },
+        storage: getStorage(),
+      });
+      response.status(result.status || (result.success ? 200 : 409)).json(result);
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/broker-materials/follow-ups/:requestId/approve',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      let input;
+      try {
+        input = parseManualFollowUpApprovalInput(request.body ?? {});
+      } catch (error) {
+        response.status(400).json({ success: false, code: 'invalid_approval_input', error: error.message });
+        return;
+      }
+      const result = await approveDealHunterManualFollowUp({
+        opportunityId: request.params.opportunityId,
+        requestId: request.params.requestId,
+        input,
+        session: { principal_id: session.principal_id, role: session.role, username: session.username },
         storage: getStorage(),
       });
       response.status(result.status || (result.success ? 200 : 409)).json(result);
@@ -2074,8 +2192,15 @@ export function createApp() {
         return;
       }
 
+      const body = request.body ?? {};
+      if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).some((key) => key !== 'limit')) {
+        response.status(400).json({ success: false, error: 'Unknown Run Follow-Ups input; approval artifacts are not accepted here.' });
+        return;
+      }
+
       const result = await runDealHunterCimFollowUps({
-        limit: Number(request.body?.limit) || undefined,
+        limit: Number(body.limit) || undefined,
       });
 
       response.status(result.status || (result.ok ? 200 : 400)).json({

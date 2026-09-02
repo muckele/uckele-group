@@ -1265,6 +1265,53 @@ test('Broker Materials lifecycle projection is invariant to provider/request row
   assert.equal(forward.brokerMaterials.existingRequest.id, 'cim-current');
 });
 
+test('opportunity detail projects authoritative Phase 3 follow-up status and blockers', async (t) => {
+  const { storage, opportunityId } = await detailStorage(t);
+  let reconciliationCalls = 0;
+  storage.finalizeDealHunterApprovedFollowUp = async () => {
+    reconciliationCalls += 1;
+    throw new Error('read-only detail must not finalize');
+  };
+  const request = {
+    id: 'cim-manual-follow-up-detail', opportunity_id: opportunityId, submission_id: 'submission-detail',
+    deal_key: `deal-${opportunityId}`, status: 'follow_up_failed', request_state: 'provider_accepted',
+    delivery_state: 'failed', follow_up_state: 'failed', follow_up_count: 2,
+    next_follow_up_at: '2026-09-01T16:00:00.000Z', recipient_email: 'sheet-broker@example.test',
+    subject: 'CIM / NDA request for Detail Services Co', first_provider_accepted_at: '2026-08-25T16:00:00.000Z',
+    created_at: '2026-08-25T16:00:00.000Z', updated_at: '2026-09-01T17:00:00.000Z',
+    metadata: {
+      manualApproval: { intent: 'manual_stage_1', followUpPolicy: 'none' },
+      manualFollowUp: {
+        version: 'deal-hunter-manual-follow-up-v1', mode: 'operator-approved', maximumFollowUps: 5,
+        cadencePolicy: 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1',
+        enrolledAt: '2026-08-25T17:00:00.000Z', enrolledBy: 'detail-admin',
+      },
+    },
+  };
+  const detail = await getTriageOpportunityDetail({
+    opportunityId,
+    storage: withDetailAuthorityRows(storage, { cimRequests: [request] }),
+  });
+  const followUps = detail.brokerMaterials.existingRequest.followUps;
+  assert.deepEqual({
+    enrolled: followUps.enrolled,
+    count: followUps.followUpCount,
+    number: followUps.currentFollowUpNumber,
+    state: followUps.state,
+    due: followUps.nextFollowUpAt,
+  }, {
+    enrolled: true,
+    count: 2,
+    number: 3,
+    state: 'retry',
+    due: '2026-09-01T16:00:00.000Z',
+  });
+  assert.equal(Array.isArray(followUps.preparationBlockers), true);
+  assert.equal(Array.isArray(followUps.sendBlockers), true);
+  assert.equal(JSON.stringify(followUps).includes('manualApproval'), false);
+  assert.equal(reconciliationCalls, 0, 'default/viewer detail projection remains read-only');
+});
+
 test('detail keeps date-like and ZIP-plus-four legacy broker_contact generic and marks broker_phone missing', async (t) => {
   // Break caught: loose legacy fallback promotion turns generic identifiers
   // into effective broker_phone facts and incorrectly clears the missing flag.

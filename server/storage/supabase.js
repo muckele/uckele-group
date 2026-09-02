@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import { createHash } from 'node:crypto';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
 import {
   normalizeDealHunterSourceSnapshot,
@@ -1796,6 +1797,58 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         outbox: normalizeCrmEmailOutboxRow(data?.outbox || null),
         submission: data?.submission ? normalizeSubmissionRow(data.submission) : null,
       };
+    },
+
+    async recordDealHunterManualFollowUpAmbiguity({
+      requestId = '', submissionId = '', communicationId = '', idempotencyKey = '',
+      actor = '', ambiguousAt = '', error: outcomeError = '',
+    } = {}) {
+      if (!requestId || !submissionId || !communicationId || !idempotencyKey || !actor
+        || !Number.isFinite(Date.parse(ambiguousAt || ''))) return null;
+      const [communicationResult, requestResult, submissionResult] = await Promise.all([
+        client.from('crm_communications').select('*').eq('id', communicationId).maybeSingle(),
+        client.from('deal_hunter_cim_requests').select('id, submission_id').eq('id', requestId).maybeSingle(),
+        client.from('contact_submissions').select('id, updated_at').eq('id', submissionId).maybeSingle(),
+      ]);
+      if (communicationResult.error) throw communicationResult.error;
+      if (requestResult.error) throw requestResult.error;
+      if (submissionResult.error) throw submissionResult.error;
+      const communication = communicationResult.data;
+      if (!communication || !requestResult.data || !submissionResult.data
+        || communication.cim_request_id !== requestId
+        || communication.submission_id !== submissionId
+        || requestResult.data.submission_id !== submissionId
+        || communication.idempotency_key !== idempotencyKey
+        || communication.delivery_state !== 'ambiguous') return null;
+      const proofId = createHash('sha256').update(`deal-hunter-manual-follow-up-ambiguity:${communicationId}`).digest('hex');
+      const proof = {
+        id: proofId,
+        communication_id: communicationId,
+        submission_id: submissionId,
+        cim_request_id: requestId,
+        idempotency_key: `${idempotencyKey}:ambiguity-proof`,
+        client_request_key: `${proofId}:ambiguity-proof`,
+        state: 'ambiguous',
+        provider: communication.provider || null,
+        provider_message_id: communication.provider_message_id || null,
+        attempt_count: 1,
+        ambiguous_at: ambiguousAt,
+        expected_submission_version: submissionResult.data.updated_at,
+        actor: String(actor).slice(0, 300),
+        created_at: ambiguousAt,
+        updated_at: ambiguousAt,
+        metadata: { kind: 'deal-hunter-manual-follow-up-ambiguity-proof', error: String(outcomeError || '').slice(0, 500) },
+      };
+      const { data, error } = await client.from('crm_email_outbox').insert(proof).select().single();
+      if (!error) return normalizeCrmEmailOutboxRow(data);
+      if (error.code !== '23505') throw error;
+      const duplicate = await client.from('crm_email_outbox').select('*').eq('communication_id', communicationId).maybeSingle();
+      if (duplicate.error) throw duplicate.error;
+      return duplicate.data?.state === 'ambiguous'
+        && duplicate.data?.cim_request_id === requestId
+        && duplicate.data?.submission_id === submissionId
+        ? normalizeCrmEmailOutboxRow(duplicate.data)
+        : null;
     },
 
     async getCrmEmailOutbox(id) {

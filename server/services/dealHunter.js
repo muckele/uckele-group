@@ -37,6 +37,7 @@ import {
   assertCimOutreachAllowed,
   evaluateCimFollowUpWindow,
   evaluateCimRecipientPolicy,
+  getCimOutreachPauseStatus,
   logicalCimTouchesForRecipient,
   recordCimSafetyMetric,
   resolveDealHunterOpportunity,
@@ -46,6 +47,12 @@ import {
   getOpportunitySourceObservationRecordId,
 } from './dealHunterOpportunityFacts.js';
 import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from './dealHunterSourceSnapshotAdmission.js';
+import { evaluateAcquisitionMaterialsState } from './acquisitionMaterials.js';
+import {
+  buildManualFollowUpCommunicationId,
+  isOperatorApprovedFollowUpRequest,
+  nextManualFollowUpAt,
+} from './dealHunterManualFollowUpPolicy.js';
 
 const defaultTimeoutMs = 45000;
 const sheetWorkbookExpandedMaxBytes = 32 * 1024 * 1024;
@@ -5636,6 +5643,9 @@ async function persistPreparedCimCommunication({
       ...(communication.metadata || {}),
       templateVersion: message.templateVersion || '',
       manualApproval: message.manualApprovalAudit,
+      providerTags: Array.isArray(message.tags)
+        ? message.tags.map((tag) => ({ name: String(tag?.name || ''), value: String(tag?.value || '') }))
+        : [],
     };
   }
   return createCommunicationWithActivity({
@@ -5851,7 +5861,7 @@ async function reconcileAcceptedCimFollowUp({
   };
 }
 
-function postProviderPersistenceError(kind, { communicationStatePersisted = false } = {}) {
+function postProviderPersistenceError(kind, { communicationStatePersisted = false, cause } = {}) {
   const error = new Error(
     `${kind} was accepted by the provider, but ${communicationStatePersisted
       ? 'its request state and audit activity could not be finalized'
@@ -5861,6 +5871,7 @@ function postProviderPersistenceError(kind, { communicationStatePersisted = fals
   );
   error.status = 503;
   error.providerAcceptedAmbiguous = true;
+  if (cause) error.cause = cause;
   return error;
 }
 
@@ -6077,7 +6088,488 @@ function dealFromCimRequest(request = {}) {
   };
 }
 
-async function processCimFollowUpRequest(storage, request, nowIso) {
+function validApprovedManualFollowUpContext(request, approvedContext) {
+  if (!approvedContext || typeof approvedContext !== 'object' || Array.isArray(approvedContext)) return false;
+  if (Object.hasOwn(approvedContext, 'preparationToken') || Object.hasOwn(approvedContext, 'approvedProposalDigest')) return false;
+  const message = approvedContext.message;
+  const count = Number(approvedContext.expectedFollowUpCount);
+  const number = Number(approvedContext.followUpNumber);
+  const sender = approvedContext.sender;
+  const recipients = Array.isArray(message?.to) ? message.to : [message?.to];
+  const deterministicCommunicationId = buildManualFollowUpCommunicationId({ requestId: request?.id, followUpNumber: number });
+  return approvedContext.type === 'deal-hunter-manual-follow-up-approved-context-v1'
+    && isOperatorApprovedFollowUpRequest(request)
+    && approvedContext.requestId === request.id
+    && approvedContext.canonicalOpportunityId === request.opportunity_id
+    && Boolean(normalizeText(approvedContext.canonicalDealKey, 1000))
+    && approvedContext.expectedRequestUpdatedAt === request.updated_at
+    && approvedContext.expectedSubmissionId === request.submission_id
+    && Number.isInteger(count)
+    && Number.isInteger(number)
+    && number === count + 1
+    && number >= 1
+    && number <= 5
+    && approvedContext.expectedNextFollowUpAt === request.next_follow_up_at
+    && sender && typeof sender === 'object' && !Array.isArray(sender)
+    && Boolean(normalizeText(sender.displayName, 120))
+    && Boolean(normalizeEmail(sender.email))
+    && sender.from === formatCimSenderAddress(sender.displayName, sender.email)
+    && normalizeEmail(sender.replyTo) === normalizeEmail(message?.replyTo)
+    && message && typeof message === 'object' && !Array.isArray(message)
+    && message.kind === 'deal-hunter-cim-follow-up'
+    && message.communicationId === deterministicCommunicationId
+    && message.idempotencyKey === `deal-hunter-cim-${request.id}-follow-up-${number}`
+    && message.from === sender.from
+    && recipients.length === 1
+    && normalizeEmail(recipients[0]) === normalizeEmail(request.recipient_email)
+    && Boolean(normalizeText(message.subject, 500))
+    && typeof message.text === 'string'
+    && typeof message.html === 'string'
+    && Boolean(normalizeText(message.templateVersion, 200));
+}
+
+function manualFollowUpActivity({ request, approvedContext, eventType, summary, createdAt, metadata = {} }) {
+  return {
+    id: randomUUID(),
+    submission_id: request.submission_id,
+    opportunity_id: request.opportunity_id,
+    created_at: createdAt,
+    actor: approvedContext.actor || 'admin',
+    role: 'admin',
+    event_type: eventType,
+    summary,
+    metadata: {
+      cimRequestId: request.id,
+      followUpNumber: approvedContext.followUpNumber,
+      communicationId: approvedContext.message.communicationId,
+      ...metadata,
+    },
+  };
+}
+
+function manualCommunicationMatchesApprovedMessage(communication, request, approvedContext) {
+  const message = approvedContext.message;
+  const recipients = Array.isArray(communication?.to_addresses) ? communication.to_addresses.map(normalizeEmail) : [];
+  const approvedRecipients = (Array.isArray(message.to) ? message.to : [message.to]).map(normalizeEmail).filter(Boolean);
+  return communication?.id === message.communicationId
+    && communication?.cim_request_id === request.id
+    && communication?.submission_id === request.submission_id
+    && communication?.kind === message.kind
+    && communication?.idempotency_key === message.idempotencyKey
+    && JSON.stringify(recipients) === JSON.stringify(approvedRecipients)
+    && (communication.reply_to_address || '') === (message.replyTo || '')
+    && extractEmailAddresses(communication.from_address)[0] === normalizeEmail(approvedContext.sender?.email)
+    && communication.metadata?.manualApproval?.senderDisplayName === approvedContext.sender?.displayName
+    && communication.metadata?.manualApproval?.senderEmail === approvedContext.sender?.email
+    && communication.metadata?.manualApproval?.senderFrom === message.from
+    && communication.metadata?.manualApproval?.replyTo === message.replyTo
+    && communication.subject === message.subject
+    && communication.body_text === message.text
+    && communication.body_html_sanitized === message.html
+    && Number(communication.metadata?.followUpNumber || 0) === approvedContext.followUpNumber;
+}
+
+function manualAcceptedCommunicationProof(communication) {
+  const state = normalizeText(communication?.delivery_state, 80).toLowerCase().replaceAll('_', '-');
+  const providerId = normalizeText(communication?.provider_message_id, 240);
+  if (!['accepted', 'delivered'].includes(state) || !providerId) return null;
+  const acceptedAt = communication.delivery_state_at || communication.updated_at || communication.occurred_at || communication.created_at;
+  return Number.isFinite(Date.parse(acceptedAt || '')) ? { acceptedAt: new Date(acceptedAt).toISOString(), providerId } : null;
+}
+
+export async function reconcileDealHunterApprovedFollowUp({
+  storage = getStorage(), request = {}, actor = 'deal-hunter',
+} = {}) {
+  const current = await storage.getDealHunterCimRequestById?.(request?.id) || request;
+  if (!isOperatorApprovedFollowUpRequest(current) || !storage.getCrmCommunication || !storage.finalizeDealHunterApprovedFollowUp) return null;
+  const marker = current.metadata?.manualFollowUp || {};
+  const followUpNumber = Number(marker.currentAttempt?.followUpNumber || Number(current.follow_up_count || 0) + 1);
+  if (!Number.isInteger(followUpNumber) || followUpNumber < 1 || followUpNumber > 5) return null;
+  const communicationId = buildManualFollowUpCommunicationId({ requestId: current.id, followUpNumber });
+  const communication = await storage.getCrmCommunication(communicationId);
+  const proof = manualAcceptedCommunicationProof(communication);
+  const recipients = Array.isArray(communication?.to_addresses) ? communication.to_addresses : [communication?.to_addresses];
+  if (!proof
+    || communication.direction !== 'outbound'
+    || communication.kind !== 'deal-hunter-cim-follow-up'
+    || communication.cim_request_id !== current.id
+    || communication.submission_id !== current.submission_id
+    || communication.idempotency_key !== `deal-hunter-cim-${current.id}-follow-up-${followUpNumber}`
+    || Number(communication.metadata?.followUpNumber || 0) !== followUpNumber
+    || recipients.length !== 1
+    || normalizeEmail(recipients[0]) !== normalizeEmail(current.recipient_email)) {
+    return null;
+  }
+  const approvedContext = {
+    type: 'deal-hunter-manual-follow-up-approved-context-v1',
+    canonicalOpportunityId: current.opportunity_id,
+    requestId: current.id,
+    expectedRequestUpdatedAt: current.updated_at,
+    expectedSubmissionId: current.submission_id,
+    expectedSubmissionUpdatedAt: '',
+    expectedFollowUpCount: Number(current.follow_up_count || 0),
+    followUpNumber,
+    expectedNextFollowUpAt: current.next_follow_up_at,
+    actor,
+    message: {
+      communicationId,
+      idempotencyKey: communication.idempotency_key,
+      kind: communication.kind,
+      to: communication.to_addresses,
+      replyTo: communication.reply_to_address || '',
+      subject: communication.subject || '',
+      text: communication.body_text || '',
+      html: communication.body_html_sanitized || '',
+      templateVersion: communication.metadata?.templateVersion || '',
+    },
+  };
+  const finalized = await finalizeApprovedManualFollowUp({
+    storage,
+    request: current,
+    approvedContext,
+    outcome: 'accepted',
+    acceptedAt: proof.acceptedAt,
+  });
+  if (!finalized?.applied && !finalized?.alreadyFinalized) {
+    return { status: 'reconciliation-pending', reason: finalized?.reason || 'accepted-finalization-pending', request: finalized?.request || current, communication };
+  }
+  return {
+    status: 'sent',
+    request: finalized.request || current,
+    communication,
+    emailResult: { status: 'sent', providerMessageId: proof.providerId },
+    reconciled: true,
+  };
+}
+
+async function finalizeApprovedManualFollowUp({ storage, request, approvedContext, outcome, acceptedAt = null, error = '' }) {
+  const at = acceptedAt || new Date().toISOString();
+  const nextFollowUpAt = outcome === 'accepted' && approvedContext.followUpNumber < 5
+    ? nextManualFollowUpAt(at)
+    : null;
+  const result = await storage.finalizeDealHunterApprovedFollowUp({
+    requestId: request.id,
+    expectedRequestUpdatedAt: request.updated_at,
+    expectedSubmissionId: request.submission_id,
+    expectedFollowUpNumber: approvedContext.followUpNumber,
+    expectedCommunicationId: approvedContext.message.communicationId,
+    outcome,
+    acceptedAt: outcome === 'accepted' ? at : null,
+    nextFollowUpAt,
+    activity: manualFollowUpActivity({
+      request,
+      approvedContext,
+      eventType: outcome === 'accepted'
+        ? 'cim.manual-follow-up-accepted'
+        : outcome === 'ambiguous'
+          ? 'cim.manual-follow-up-ambiguous'
+          : 'cim.manual-follow-up-failed',
+      summary: outcome === 'accepted'
+        ? `Human-approved CIM Follow-Up ${approvedContext.followUpNumber} was accepted by the provider.`
+        : outcome === 'ambiguous'
+          ? `Human-approved CIM Follow-Up ${approvedContext.followUpNumber} has an ambiguous provider outcome.`
+          : `Human-approved CIM Follow-Up ${approvedContext.followUpNumber} failed before provider acceptance.`,
+      createdAt: at,
+      metadata: { outcome, error: normalizeText(error, 500), nextFollowUpAt: nextFollowUpAt || '' },
+    }),
+  });
+  return result;
+}
+
+async function deferApprovedManualClaim({ storage, request, approvedContext, reason, terminal = false }) {
+  const nowIso = new Date().toISOString();
+  const stopped = terminal;
+  try {
+    const updated = await finalizeCimRequestClaimWithActivity(
+      storage,
+      buildCimRequestStorageUpdate(request, {
+        status: stopped ? (request.status === 'responded' ? 'responded' : 'sent') : 'sent',
+        follow_up_state: stopped ? 'stopped' : 'scheduled',
+        next_follow_up_at: stopped ? null : approvedContext.expectedNextFollowUpAt,
+        delivery_error: '',
+        updated_at: nowIso,
+        last_activity_at: nowIso,
+      }),
+      request,
+      {
+        expectedStatuses: ['follow_up_pending'],
+        eventType: stopped ? 'cim.manual-follow-up-stopped' : 'cim.manual-follow-up-deferred',
+        summary: stopped
+          ? `Human-approved CIM Follow-Up ${approvedContext.followUpNumber} was stopped by current authority.`
+          : `Human-approved CIM Follow-Up ${approvedContext.followUpNumber} remains due and was deferred by current safety authority.`,
+        actor: approvedContext.actor || 'deal-hunter',
+        metadata: { reason, followUpNumber: approvedContext.followUpNumber, retransmitted: false },
+      },
+    );
+    return { status: stopped ? 'stopped' : 'deferred', reason, request: updated };
+  } catch (error) {
+    const current = await storage.getDealHunterCimRequestById?.(request.id) || error?.request || request;
+    return {
+      status: current.request_state === 'responded' ? 'responded' : current.follow_up_state === 'stopped' ? 'stopped' : 'locked',
+      reason,
+      request: current,
+    };
+  }
+}
+
+async function loadApprovedManualTerminalAuthority({ storage, request, approvedContext }) {
+  let submission;
+  let opportunity;
+  let score;
+  try {
+    [submission, opportunity, score] = await Promise.all([
+      storage.getSubmission?.(request.submission_id),
+      storage.getCurrentDealHunterOpportunity?.(request.opportunity_id),
+      storage.getCurrentDealHunterOpportunityScore?.(request.opportunity_id),
+    ]);
+  } catch {
+    return { terminal: true, reason: 'terminal-authority-unavailable' };
+  }
+  if (!submission || submission.status === 'archived') return { terminal: true, reason: 'submission-archived' };
+  const canonicalDealKey = normalizeText(score?.deal_key || request.deal_key, 1000);
+  if (!opportunity || !score
+    || opportunity.status !== 'active'
+    || opportunity.primary_submission_id !== request.submission_id
+    || score.opportunity_id !== request.opportunity_id
+    || canonicalDealKey !== approvedContext.canonicalDealKey) {
+    return { terminal: true, reason: 'canonical-authority-changed' };
+  }
+  const dispositionKeys = [...new Set([canonicalDealKey, normalizeText(request.deal_key, 1000)].filter(Boolean))];
+  const [documentsResult, uploadResult, dispositionResult, suppressionResult, eventsResult] = await Promise.all([
+    typeof storage.listSecureDocumentsForSubmission === 'function'
+      ? storage.listSecureDocumentsForSubmission(submission.id).then((value) => ({ available: true, value })).catch(() => ({ available: false, value: [] }))
+      : Promise.resolve({ available: false, value: [] }),
+    typeof storage.getLatestSecureUploadRequestForSubmission === 'function'
+      ? storage.getLatestSecureUploadRequestForSubmission(submission.id).then((value) => ({ available: true, value })).catch(() => ({ available: false, value: null }))
+      : Promise.resolve({ available: false, value: null }),
+    typeof storage.getDealHunterDisposition === 'function'
+      ? Promise.all(dispositionKeys.map((dealKey) => storage.getDealHunterDisposition({ dealKey })))
+        .then((value) => ({ available: true, value })).catch(() => ({ available: false, value: [] }))
+      : Promise.resolve({ available: false, value: [] }),
+    typeof storage.getActiveEmailSuppression === 'function'
+      ? storage.getActiveEmailSuppression(request.recipient_email).then((value) => ({ available: true, value })).catch(() => ({ available: false, value: null }))
+      : Promise.resolve({ available: false, value: null }),
+    typeof storage.listEmailEvents === 'function' || typeof storage.listEmailEventsByMessageIds === 'function'
+      ? loadCimRequestEvents(storage, request).then((value) => ({ available: true, value })).catch(() => ({ available: false, value: [] }))
+      : Promise.resolve({ available: false, value: [] }),
+  ]);
+  if (!documentsResult.available || !uploadResult.available || !dispositionResult.available || !suppressionResult.available || !eventsResult.available) {
+    return { terminal: true, reason: 'terminal-authority-unavailable' };
+  }
+  const materials = evaluateAcquisitionMaterialsState({
+    submission,
+    secureDocuments: documentsResult.value,
+    latestUploadRequest: uploadResult.value,
+  });
+  if (materials.materialsReceived) return { terminal: true, reason: 'materials-received' };
+  if (materials.advancedBeyondBrokerOutreach) return { terminal: true, reason: 'advanced-beyond-broker-outreach' };
+  if (dispositionResult.value.some((item) => normalizeText(item?.disposition, 80).toLowerCase() === 'dismissed')) {
+    return { terminal: true, reason: 'opportunity-passed' };
+  }
+  if (suppressionResult.value) return { terminal: true, reason: 'recipient-suppressed' };
+  if (findCimReplyEvent(request, eventsResult.value)) return { terminal: true, reason: 'reply-received' };
+  if (findCimStopEvent(request, eventsResult.value)) return { terminal: true, reason: 'terminal-delivery-event' };
+  return { terminal: false, reason: '' };
+}
+
+async function processApprovedManualCimFollowUp({ storage, request, now, approvedContext, dependencies = {} }) {
+  const nowDate = now instanceof Date ? new Date(now) : new Date(now || Date.now());
+  const nowIso = nowDate.toISOString();
+  const lockKey = request.id;
+  let durableRecipientClaimId = '';
+  if (!acquireLock(cimFollowUpLocks, lockKey)) return { status: 'locked', request };
+  try {
+    let current = await storage.getDealHunterCimRequestById?.(request.id) || request;
+    if (!validApprovedManualFollowUpContext(current, approvedContext)) {
+      const communication = await storage.getCrmCommunication?.(approvedContext.message.communicationId);
+      const proof = manualAcceptedCommunicationProof(communication);
+      if (!proof) return { status: current.follow_up_state === 'ambiguous' ? 'ambiguous' : 'locked', request: current };
+      const reconciled = await finalizeApprovedManualFollowUp({ storage, request: current, approvedContext, outcome: 'accepted', acceptedAt: proof.acceptedAt });
+      return { status: 'sent', request: reconciled.request || current, communication, emailResult: { status: 'sent', providerMessageId: proof.providerId }, reconciled: true };
+    }
+    if (!storage.claimDealHunterApprovedFollowUp) return { status: 'failed', reason: 'approved-claim-storage-unavailable', request: current };
+    const claim = await storage.claimDealHunterApprovedFollowUp({
+      requestId: current.id,
+      expectedRequestUpdatedAt: approvedContext.expectedRequestUpdatedAt,
+      expectedSubmissionId: approvedContext.expectedSubmissionId,
+      expectedSubmissionUpdatedAt: approvedContext.expectedSubmissionUpdatedAt,
+      expectedFollowUpCount: approvedContext.expectedFollowUpCount,
+      expectedFollowUpNumber: approvedContext.followUpNumber,
+      expectedNextFollowUpAt: approvedContext.expectedNextFollowUpAt,
+      claimedAt: nowIso,
+    });
+    if (!claim?.applied) {
+      current = claim?.request || await storage.getDealHunterCimRequestById?.(request.id) || current;
+      const communication = await storage.getCrmCommunication?.(approvedContext.message.communicationId);
+      const proof = manualAcceptedCommunicationProof(communication);
+      if (proof) {
+        const reconciled = await finalizeApprovedManualFollowUp({ storage, request: current, approvedContext, outcome: 'accepted', acceptedAt: proof.acceptedAt });
+        return { status: 'sent', request: reconciled.request || current, communication, emailResult: { status: 'sent', providerMessageId: proof.providerId }, reconciled: true };
+      }
+      return { status: current.follow_up_state === 'ambiguous' ? 'ambiguous' : 'locked', reason: claim?.reason || 'claim-ineligible', request: current };
+    }
+    current = claim.request || current;
+    if (!storage.claimDealHunterCimRecipient) return deferApprovedManualClaim({ storage, request: current, approvedContext, reason: 'recipient-claim-storage-unavailable' });
+    durableRecipientClaimId = `${current.id}:manual-follow-up:${approvedContext.followUpNumber}`;
+    const recipientClaim = await storage.claimDealHunterCimRecipient({
+      recipientEmail: current.recipient_email,
+      requestId: durableRecipientClaimId,
+      opportunityId: current.opportunity_id,
+      nowIso,
+      expiresAt: new Date(nowDate.getTime() + 10 * 60 * 1000).toISOString(),
+      metadata: { kind: 'human-approved-cim-follow-up', followUpNumber: approvedContext.followUpNumber },
+    });
+    if (!recipientClaim?.claimed) return deferApprovedManualClaim({ storage, request: current, approvedContext, reason: 'recipient-send-in-progress' });
+
+    let communication;
+    try {
+      communication = await persistPreparedCimCommunication({
+        storage,
+        request: current,
+        submissionId: current.submission_id,
+        message: approvedContext.message,
+        actor: approvedContext.actor,
+        summary: `Exact human-approved CIM Follow-Up ${approvedContext.followUpNumber} saved before transmission.`,
+      });
+    } catch {
+      return deferApprovedManualClaim({ storage, request: current, approvedContext, reason: 'communication-persistence-failed' });
+    }
+    if (!manualCommunicationMatchesApprovedMessage(communication, current, approvedContext)) {
+      return deferApprovedManualClaim({ storage, request: current, approvedContext, reason: 'persisted-communication-mismatch', terminal: true });
+    }
+    const acceptedProof = manualAcceptedCommunicationProof(communication);
+    if (acceptedProof) {
+      const finalized = await finalizeApprovedManualFollowUp({ storage, request: current, approvedContext, outcome: 'accepted', acceptedAt: acceptedProof.acceptedAt });
+      return { status: 'sent', request: finalized.request || current, communication, emailResult: { status: 'sent', providerMessageId: acceptedProof.providerId }, reconciled: true };
+    }
+    if (normalizeText(communication.delivery_state, 80).toLowerCase() === 'ambiguous') {
+      return { status: 'ambiguous', request: current, communication, providerOutcomeAmbiguous: true };
+    }
+
+    const terminalAuthority = await loadApprovedManualTerminalAuthority({ storage, request: current, approvedContext });
+    if (terminalAuthority.terminal) return deferApprovedManualClaim({ storage, request: current, approvedContext, reason: terminalAuthority.reason, terminal: true });
+    const getPause = dependencies.getPause || getCimOutreachPauseStatus;
+    const evaluateRecipient = dependencies.evaluateRecipientPolicy || evaluateCimRecipientPolicy;
+    const getReadiness = dependencies.getReadiness || getEmailReadiness;
+    const [fresh, pause, recipientPolicy, readiness] = await Promise.all([
+      storage.getDealHunterCimRequestById(current.id),
+      getPause({ storage, config: getConfig() }),
+      evaluateRecipient({ recipientEmail: current.recipient_email, opportunityId: current.opportunity_id, storage, config: getConfig(), now: nowDate }),
+      getReadiness({ storage, config: getConfig() }),
+    ]);
+    if (!fresh || fresh.updated_at !== current.updated_at || fresh.status !== 'follow_up_pending'
+      || !isOperatorApprovedFollowUpRequest(fresh) || fresh.metadata?.manualFollowUp?.stoppedAt) {
+      return { status: fresh?.request_state === 'responded' ? 'responded' : fresh?.follow_up_state === 'stopped' ? 'stopped' : 'locked', request: fresh || current };
+    }
+    const evaluateWindow = dependencies.evaluateWindow || evaluateCimFollowUpWindow;
+    const window = evaluateWindow({
+      now: nowDate,
+      settings: {
+        ...getCimFollowUpSettings(),
+        weekdaysOnly: true,
+        timezone: 'America/Los_Angeles',
+      },
+    });
+    if (pause?.paused || !recipientPolicy?.allowed || recipientPolicy?.override?.id || !readiness?.outboundConfigured || !window.allowed || fresh.delivery_state === 'delayed') {
+      return deferApprovedManualClaim({ storage, request: fresh, approvedContext, reason: pause?.paused
+        ? 'outreach-paused'
+        : !recipientPolicy?.allowed || recipientPolicy?.override?.id
+          ? 'recipient-cadence'
+          : !readiness?.outboundConfigured
+            ? 'provider-not-ready'
+            : !window.allowed
+              ? window.reason
+              : 'delivery-delayed' });
+    }
+    const currentConfig = getConfig();
+    const currentSenderEmail = extractEmailAddresses(currentConfig.delivery.resendFromEmail || currentConfig.delivery.fallbackRecipient)[0] || '';
+    const currentSenderName = normalizeText(currentConfig.workflow?.defaultAssignee || 'Mathew Uckele', 120);
+    const currentReplyTo = normalizeEmail(currentConfig.delivery.resendReplyTo
+      ? buildCimReplyToAddress({ requestId: fresh.id, replyTo: currentConfig.delivery.resendReplyTo })
+      : currentConfig.delivery.fallbackRecipient || '');
+    if (currentSenderEmail !== normalizeEmail(approvedContext.sender.email)
+      || currentSenderName !== approvedContext.sender.displayName
+      || currentReplyTo !== normalizeEmail(approvedContext.sender.replyTo)) {
+      return deferApprovedManualClaim({ storage, request: fresh, approvedContext, reason: 'sender-authority-changed' });
+    }
+    const renewal = await renewCimRequestClaim(storage, fresh, 'follow_up_pending');
+    if (!renewal?.renewed) return { status: renewal?.request?.follow_up_state === 'stopped' ? 'stopped' : 'locked', request: renewal?.request || fresh };
+    current = renewal.request || fresh;
+
+    let emailResult;
+    try {
+      emailResult = await sendPreparedMessage(preparedMessageFromCommunication(communication, approvedContext.message));
+    } catch (error) {
+      emailResult = { status: 'failed', error: error.message || 'The follow-up provider attempt failed.', providerMessageId: '' };
+    }
+    let updatedCommunication = communication;
+    try {
+      updatedCommunication = await updateCimCommunicationAfterSend(storage, communication, emailResult, approvedContext.actor) || communication;
+    } catch (error) {
+      if (['sent', 'logged'].includes(emailResult.status)) throw postProviderPersistenceError(`CIM Follow-Up ${approvedContext.followUpNumber}`, { cause: error });
+    }
+    const outcome = ['sent', 'logged'].includes(emailResult.status)
+      ? 'accepted'
+      : emailResult.status === 'ambiguous'
+        ? 'ambiguous'
+        : 'definitive-failure';
+    if (outcome === 'ambiguous' && storage.recordDealHunterManualFollowUpAmbiguity) {
+      await storage.recordDealHunterManualFollowUpAmbiguity({
+        requestId: current.id,
+        submissionId: current.submission_id,
+        communicationId: communication.id,
+        idempotencyKey: communication.idempotency_key,
+        actor: approvedContext.actor,
+        ambiguousAt: updatedCommunication.delivery_state_at || new Date().toISOString(),
+        error: emailResult.error || '',
+      });
+    }
+    const acceptedAt = outcome === 'accepted'
+      ? updatedCommunication.delivery_state_at || updatedCommunication.updated_at || new Date().toISOString()
+      : null;
+    const finalized = await finalizeApprovedManualFollowUp({
+      storage,
+      request: current,
+      approvedContext,
+      outcome,
+      acceptedAt,
+      error: emailResult.error || '',
+    });
+    if (!finalized?.applied && !finalized?.alreadyFinalized) {
+      if (outcome === 'accepted') throw postProviderPersistenceError(`CIM Follow-Up ${approvedContext.followUpNumber}`, { communicationStatePersisted: true });
+      return { status: outcome === 'ambiguous' ? 'ambiguous' : 'failed', request: finalized?.request || current, emailResult, error: finalized?.reason || emailResult.error || '' };
+    }
+    return {
+      status: outcome === 'accepted' ? 'sent' : outcome === 'ambiguous' ? 'ambiguous' : 'failed',
+      request: finalized.request || current,
+      communication: updatedCommunication,
+      emailResult,
+      providerOutcomeAmbiguous: outcome === 'ambiguous',
+      error: outcome === 'accepted' ? '' : emailResult.error || '',
+    };
+  } finally {
+    if (durableRecipientClaimId && storage.releaseDealHunterCimRecipientClaim) {
+      await storage.releaseDealHunterCimRecipientClaim({ recipientEmail: request.recipient_email, requestId: durableRecipientClaimId });
+    }
+    releaseLock(cimFollowUpLocks, lockKey);
+  }
+}
+
+export async function executeDealHunterCimFollowUpRequest({
+  storage = getStorage(), request = {}, now = new Date(), approvedContext = null, dependencies = {},
+} = {}) {
+  if (request?.metadata?.manualFollowUp?.mode === 'operator-approved') {
+    if (!validApprovedManualFollowUpContext(request, approvedContext)) return { status: 'approval-required', request };
+    // The approved branch performs persistPreparedCimCommunication before
+    // sendPreparedMessage, with a final terminal-authority revalidation.
+    return processApprovedManualCimFollowUp({ storage, request, now, approvedContext, dependencies });
+  }
+  if (approvedContext) return { status: 'invalid-approved-context', request };
+  const at = now instanceof Date ? now : new Date(now);
+  return processLegacyCimFollowUpRequest(storage, request, at.toISOString());
+}
+
+async function processLegacyCimFollowUpRequest(storage, request, nowIso) {
   const lockKey = request?.id || buildCimRequestLockKey(request?.deal_key, request?.recipient_email);
   let durableRecipientClaimId = '';
 
@@ -9747,7 +10239,9 @@ export async function runDealHunterCimFollowUps({
 
   for (const request of requests) {
     try {
-      const result = await processCimFollowUpRequest(storage, request, nowIso);
+      const result = request?.metadata?.manualFollowUp?.mode === 'operator-approved'
+        ? { status: 'approval-required', request }
+        : await executeDealHunterCimFollowUpRequest({ storage, request, now });
       summary.results.push({
         id: result.request?.id || request.id,
         dealKey: request.deal_key,
