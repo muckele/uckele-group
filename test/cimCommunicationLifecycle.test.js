@@ -2194,6 +2194,108 @@ test('manual executor persists exact communication before provider call and perf
     assert.equal(activities.filter((event) => event.event_type === 'cim.manual-follow-up-accepted').length, 1);
   });
 
+  await t.test('claim renewal cannot restore a stale CIM request as canonical owner before provider authorization', async (subtest) => {
+    // Break caught: renewing an older request's operational claim updates
+    // updated_at and can make that stale conversation look canonical again.
+    const storage = testStorage(subtest);
+    const fixture = await makeDuePreparation(storage);
+    const { buildDealHunterCimRequestId } = await import('../server/services/dealHunter.js');
+    const { loadBrokerMaterialsAuthority } = await import('../server/services/dealHunterBrokerMaterials.js');
+    const currentOwnerEmail = 'new-canonical-owner@example.test';
+    const currentOwnerId = buildDealHunterCimRequestId(fixture.request.opportunity_id, currentOwnerEmail);
+    const listSecureDocumentsForSubmission = storage.listSecureDocumentsForSubmission.bind(storage);
+    const renewDealHunterCimRequestClaim = storage.renewDealHunterCimRequestClaim.bind(storage);
+    let insertedCurrentOwner = false;
+    let claimObserved = false;
+    let renewalCalls = 0;
+    let ownerBeforeRenewal = '';
+    let ownerAfterRenewal = '';
+    let staleUpdatedAtBeforeRenewal = '';
+    let staleUpdatedAtAfterRenewal = '';
+
+    storage.listSecureDocumentsForSubmission = async (submissionId) => {
+      const communication = await storage.getCrmCommunication(fixture.preparation.review.communication.id);
+      if (communication && !insertedCurrentOwner) {
+        const claimedStaleRequest = await storage.getDealHunterCimRequestById(fixture.request.id);
+        claimObserved = claimedStaleRequest.status === 'follow_up_pending';
+        const currentOwnerAtMs = Date.parse(claimedStaleRequest.updated_at) + 1;
+        const currentOwnerAt = new Date(currentOwnerAtMs).toISOString();
+        const metadata = { ...(claimedStaleRequest.metadata || {}) };
+        delete metadata.manualFollowUp;
+        await storage.upsertDealHunterCimRequest({
+          ...claimedStaleRequest,
+          id: currentOwnerId,
+          created_at: currentOwnerAt,
+          updated_at: currentOwnerAt,
+          recipient_email: currentOwnerEmail,
+          status: 'sent',
+          request_state: 'provider_accepted',
+          delivery_state: 'accepted',
+          delivery_state_at: currentOwnerAt,
+          follow_up_state: 'not-scheduled',
+          follow_up_count: 0,
+          next_follow_up_at: null,
+          first_requested_at: currentOwnerAt,
+          first_provider_accepted_at: currentOwnerAt,
+          provider_message_id: 'provider-new-canonical-owner',
+          reply_to_address: 'new-canonical-owner@inbound.example.test',
+          retry_of_request_id: fixture.request.id,
+          last_attempt_at: currentOwnerAt,
+          last_activity_at: currentOwnerAt,
+          metadata,
+        });
+        insertedCurrentOwner = true;
+        const delayMs = Math.max(0, currentOwnerAtMs - Date.now() + 1);
+        if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+      return listSecureDocumentsForSubmission(submissionId);
+    };
+
+    storage.renewDealHunterCimRequestClaim = async (input) => {
+      renewalCalls += 1;
+      const before = await loadBrokerMaterialsAuthority({ opportunityId: fixture.request.opportunity_id, storage });
+      ownerBeforeRenewal = before.existingRequest?.id || '';
+      staleUpdatedAtBeforeRenewal = (await storage.getDealHunterCimRequestById(fixture.request.id)).updated_at;
+      const result = await renewDealHunterCimRequestClaim(input);
+      staleUpdatedAtAfterRenewal = result.request?.updated_at || '';
+      const after = await loadBrokerMaterialsAuthority({ opportunityId: fixture.request.opportunity_id, storage });
+      ownerAfterRenewal = after.existingRequest?.id || '';
+      return result;
+    };
+
+    const providerCallsBefore = resendCalls.length;
+    const approved = await fixture.service.approveDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      preparationToken: fixture.preparation.preparationToken,
+      approvedProposalDigest: fixture.preparation.proposalDigest,
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+
+    assert.equal(insertedCurrentOwner, true);
+    assert.equal(claimObserved, true);
+    assert.equal(renewalCalls, 1);
+    assert.notEqual(staleUpdatedAtAfterRenewal, staleUpdatedAtBeforeRenewal);
+    assert.equal(
+      resendCalls.length,
+      providerCallsBefore,
+      `provider call escaped after renewal changed owner from ${ownerBeforeRenewal} to ${ownerAfterRenewal}`,
+    );
+    assert.equal(ownerBeforeRenewal, currentOwnerId);
+    assert.equal(ownerAfterRenewal, currentOwnerId);
+    const finalAuthority = await loadBrokerMaterialsAuthority({ opportunityId: fixture.request.opportunity_id, storage });
+    assert.equal(finalAuthority.existingRequest?.id, currentOwnerId);
+    assert.equal(approved.success, false);
+    assert.equal(approved.code, 'blocked');
+    const staleRequest = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(staleRequest.follow_up_count, 0);
+    assert.equal(staleRequest.follow_up_state, 'stopped');
+    assert.equal(staleRequest.next_follow_up_at, null);
+  });
+
   await t.test('materials arriving after communication persistence stop final provider authorization', async (subtest) => {
     const storage = testStorage(subtest);
     const fixture = await makeDuePreparation(storage);

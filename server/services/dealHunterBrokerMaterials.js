@@ -251,8 +251,8 @@ function projectExistingRequest(records = [], {
   communications = [],
 } = {}) {
   const request = [...records].filter((item) => item?.id).sort((left, right) => (
-    (Date.parse(right.responded_at || right.respondedAt || right.updated_at || right.updatedAt || right.created_at || right.createdAt || '') || 0)
-    - (Date.parse(left.responded_at || left.respondedAt || left.updated_at || left.updatedAt || left.created_at || left.createdAt || '') || 0)
+    (Date.parse(right.first_requested_at || right.firstRequestedAt || right.created_at || right.createdAt || '') || 0)
+    - (Date.parse(left.first_requested_at || left.firstRequestedAt || left.created_at || left.createdAt || '') || 0)
     || String(left.id).localeCompare(String(right.id))
   ))[0];
   if (!request) return null;

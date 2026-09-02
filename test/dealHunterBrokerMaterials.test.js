@@ -464,6 +464,70 @@ test('projected broker materials exposes current Pursue, bounded lifecycle, warn
   for (const secret of ['secret-provider-id', 'providerPayload', 'signature']) assert.equal(serialized.includes(secret), false);
 });
 
+test('canonical CIM owner uses stable first-request order across claim maintenance and deterministic ties', async (t) => {
+  // Break caught: operational updated_at writes from claiming or renewing an
+  // older request can replace the newer business conversation owner.
+  const request = ({ id, requestedAt, updatedAt, recipient }) => ({
+    id,
+    opportunity_id: opportunityId,
+    submission_id: 'submission-1',
+    deal_key: 'deal-42',
+    recipient_email: recipient,
+    status: 'sent',
+    request_state: 'provider_accepted',
+    delivery_state: 'accepted',
+    follow_up_state: 'not-scheduled',
+    follow_up_count: 0,
+    created_at: requestedAt,
+    first_requested_at: requestedAt,
+    first_provider_accepted_at: requestedAt,
+    updated_at: updatedAt,
+    metadata: {},
+  });
+  const oldRequestedAt = '2026-08-31T17:40:00.000Z';
+  const newRequestedAt = '2026-08-31T17:45:00.000Z';
+  const oldId = 'request-old-owner';
+  const newId = 'request-new-owner';
+  const old = request({ id: oldId, requestedAt: oldRequestedAt, updatedAt: oldRequestedAt, recipient: 'old-owner@example.test' });
+  const current = request({ id: newId, requestedAt: newRequestedAt, updatedAt: newRequestedAt, recipient: 'new-owner@example.test' });
+
+  const ownerFor = async (requests) => (
+    await loadBrokerMaterialsAuthority({ opportunityId, storage: authorityStorage({ requests }), now })
+  ).existingRequest?.id;
+
+  await t.test('ordinary unmarked Phase 2 requests select the newer first request', async () => {
+    assert.equal(await ownerFor([old, current]), newId);
+  });
+
+  await t.test('an old request claim acquisition cannot make it current', async () => {
+    assert.equal(await ownerFor([
+      { ...old, status: 'follow_up_pending', updated_at: '2026-08-31T17:50:00.000Z' },
+      current,
+    ]), newId);
+  });
+
+  await t.test('an old request claim renewal cannot make it current', async () => {
+    assert.equal(await ownerFor([
+      { ...old, status: 'follow_up_pending', updated_at: '2026-08-31T18:00:00.000Z' },
+      current,
+    ]), newId);
+  });
+
+  await t.test('renewing the current request keeps the current request', async () => {
+    assert.equal(await ownerFor([
+      old,
+      { ...current, status: 'follow_up_pending', updated_at: '2026-08-31T18:05:00.000Z' },
+    ]), newId);
+  });
+
+  await t.test('equal first-request timestamps use the existing ascending request-id tie-breaker', async () => {
+    assert.equal(await ownerFor([
+      request({ id: 'request-b', requestedAt: newRequestedAt, updatedAt: '2026-08-31T18:10:00.000Z', recipient: 'b@example.test' }),
+      request({ id: 'request-a', requestedAt: newRequestedAt, updatedAt: '2026-08-31T17:50:00.000Z', recipient: 'a@example.test' }),
+    ]), 'request-a');
+  });
+});
+
 test('broker materials detail exposes bounded public manual follow-up projection without raw metadata', async () => {
   const privateSentinel = 'private-manual-follow-up-authority';
   const storage = authorityStorage({
