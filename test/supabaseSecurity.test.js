@@ -744,7 +744,7 @@ test('manual follow-up RPCs revoke public anon and authenticated and grant servi
   }
 });
 
-test('manual follow-up RPCs enforce marker count due version active submission and idempotent finalization', () => {
+test('manual follow-up RPCs enforce strict marker identity cadence proof and idempotent finalization', () => {
   // Break caught: SQLite/Supabase parity can appear shape-correct while the
   // database omits a material compare-and-set or exactly-once invariant.
   const migration = fs.existsSync(manualFollowUpAtomicityMigrationUrl)
@@ -771,7 +771,11 @@ test('manual follow-up RPCs enforce marker count due version active submission a
   const start = sqlFunctionDefinitions(migration)
     .find(({ name }) => name === 'start_deal_hunter_manual_follow_ups')?.sql || '';
   assert.match(start, /expected_request_updated_at[\s\S]*?expected_submission_updated_at/i);
-  assert.match(start, /manualFollowUp[\s\S]*?operator-approved[\s\S]*?follow_up_state[\s\S]*?next_follow_up_at/i);
+  assert.match(start, /jsonb_typeof\(p_marker\)\s+is\s+distinct\s+from\s+'object'/i);
+  assert.match(start, /count\(\*\)\s+from\s+jsonb_object_keys\(p_marker\)\)\s*<>\s*6/i);
+  assert.match(start, /p_marker\s*->\s*'maximumFollowUps'\s+is\s+distinct\s+from\s+'5'::jsonb/i);
+  assert.match(start, /operator-approved[\s\S]*?follow_up_state[\s\S]*?next_follow_up_at/i);
+  assert.match(start, /jsonb_build_object\('manualFollowUp',\s*v_marker\)/i);
   assert.match(start, /request_state\s+is\s+distinct\s+from\s+'provider_accepted'/i);
   assert.match(start, /coalesce\(v_current\.delivery_state,\s*''\)\s+not\s+in\s*\('accepted',\s*'delivered'\)/i);
   assert.match(start, /crm_activity_events/i);
@@ -780,6 +784,7 @@ test('manual follow-up RPCs enforce marker count due version active submission a
     .find(({ name }) => name === 'stop_deal_hunter_manual_follow_ups')?.sql || '';
   assert.match(stop, /follow_up_state\s*=\s*'stopped'[\s\S]*?next_follow_up_at\s*=\s*null/i);
   assert.match(stop, /stoppedAt[\s\S]*?stoppedBy[\s\S]*?stopReason/i);
+  assert.match(stop, /stopReason',\s*left\([\s\S]*?,\s*240\)/i);
   assert.match(stop, /crm_activity_events/i);
 
   const claim = sqlFunctionDefinitions(migration)
@@ -793,9 +798,13 @@ test('manual follow-up RPCs enforce marker count due version active submission a
 
   const finalize = sqlFunctionDefinitions(migration)
     .find(({ name }) => name === 'finalize_deal_hunter_approved_follow_up')?.sql || '';
+  assert.match(finalize, /sha256\([\s\S]*?crm-communication:[\s\S]*?:follow-up:/i);
   assert.match(finalize, /crm_communications[\s\S]*?expected_communication_id/i);
+  assert.match(finalize, /crm_email_outbox[\s\S]*?ambiguous_at\s+is\s+null/i);
   assert.match(finalize, /acceptedTouches[\s\S]*?alreadyFinalized/i);
   assert.match(finalize, /currentAttempt[\s\S]*?communicationId[\s\S]*?already-finalized/i);
+  assert.match(finalize, /accepted_at\s+at\s+time\s+zone\s+'America\/Los_Angeles'[\s\S]*?v_derived_next_follow_up_at/i);
+  assert.match(finalize, /p_next_follow_up_at\s+is\s+distinct\s+from\s+v_derived_next_follow_up_at/i);
   assert.match(finalize, /follow_up_count\s*=\s*(?:request\.)?follow_up_count\s*\+\s*1/i);
   assert.match(finalize, /next_follow_up_at\s*=\s*case[\s\S]*?expected_follow_up_number\s*=\s*5\s+then\s+null/i);
   assert.match(finalize, /crm_activity_events/i);

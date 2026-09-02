@@ -18,9 +18,13 @@ import {
   requireCanonicalCimRequestId,
 } from '../services/cimRequestIdPolicy.js';
 import {
-  isOperatorApprovedFollowUpRequest,
+  buildManualFollowUpCommunicationId,
+  buildManualFollowUpMarker,
+  MANUAL_FOLLOW_UP_CADENCE,
   MANUAL_FOLLOW_UP_MAXIMUM,
   MANUAL_FOLLOW_UP_MODE,
+  MANUAL_FOLLOW_UP_VERSION,
+  nextManualFollowUpAt,
 } from '../services/dealHunterManualFollowUpPolicy.js';
 import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
 import {
@@ -337,6 +341,39 @@ function boundedManualFollowUpText(value, maximum = 500) {
 
 function manualFollowUpMarker(request) {
   return objectRecord(objectRecord(objectRecord(request).metadata).manualFollowUp);
+}
+
+const initialManualFollowUpMarkerKeys = [
+  'cadencePolicy',
+  'enrolledAt',
+  'enrolledBy',
+  'maximumFollowUps',
+  'mode',
+  'version',
+];
+
+function hasStrictManualFollowUpCore(marker) {
+  return marker && typeof marker === 'object' && !Array.isArray(marker)
+    && marker.version === MANUAL_FOLLOW_UP_VERSION
+    && marker.mode === MANUAL_FOLLOW_UP_MODE
+    && marker.maximumFollowUps === MANUAL_FOLLOW_UP_MAXIMUM
+    && marker.cadencePolicy === MANUAL_FOLLOW_UP_CADENCE
+    && typeof marker.enrolledAt === 'string'
+    && Number.isFinite(Date.parse(marker.enrolledAt))
+    && typeof marker.enrolledBy === 'string'
+    && Boolean(boundedManualFollowUpText(marker.enrolledBy, 300));
+}
+
+function canonicalInitialManualFollowUpMarker(marker) {
+  if (!hasStrictManualFollowUpCore(marker)
+    || Object.keys(marker).sort().join('\n') !== initialManualFollowUpMarkerKeys.join('\n')) {
+    return null;
+  }
+  try {
+    return buildManualFollowUpMarker({ enrolledAt: marker.enrolledAt, enrolledBy: marker.enrolledBy });
+  } catch {
+    return null;
+  }
 }
 
 function isMarkedManualFollowUpRequest(request) {
@@ -4059,6 +4096,7 @@ export function createSqliteStorage(config) {
     }
     const count = Number(authority.request.follow_up_count);
     const existingMarker = manualFollowUpMarker(authority.request);
+    const canonicalMarker = canonicalInitialManualFollowUpMarker(marker);
     const eligible = authority.submission.status !== 'archived'
       && authority.request.status === 'sent'
       && authority.request.request_state === 'provider_accepted'
@@ -4070,7 +4108,7 @@ export function createSqliteStorage(config) {
       && !authority.request.next_follow_up_at
       && ['', 'not-scheduled'].includes(authority.request.follow_up_state || '')
       && Object.keys(existingMarker).length === 0
-      && isOperatorApprovedFollowUpRequest({ metadata: { manualFollowUp: marker } })
+      && Boolean(canonicalMarker)
       && Number.isFinite(Date.parse(nextFollowUpAt || ''))
       && activity?.submission_id === expectedSubmissionId;
     if (!eligible) {
@@ -4079,9 +4117,9 @@ export function createSqliteStorage(config) {
 
     const metadata = {
       ...objectRecord(authority.request.metadata),
-      manualFollowUp: { ...marker },
+      manualFollowUp: canonicalMarker,
     };
-    const updatedAt = marker.enrolledAt;
+    const updatedAt = canonicalMarker.enrolledAt;
     const update = database.prepare(`
       UPDATE deal_hunter_cim_requests
       SET updated_at = ?, follow_up_state = 'scheduled', next_follow_up_at = ?, metadata = ?
@@ -4130,7 +4168,7 @@ export function createSqliteStorage(config) {
       return manualFollowUpResult({ reason: 'authority-changed', request: authority.request });
     }
     const marker = manualFollowUpMarker(authority.request);
-    if (!isOperatorApprovedFollowUpRequest(authority.request)
+    if (!hasStrictManualFollowUpCore(marker)
       || isManualFollowUpTerminal(authority.request, authority.submission)
       || Number(authority.request.follow_up_count) >= MANUAL_FOLLOW_UP_MAXIMUM
       || marker.stoppedAt
@@ -4145,7 +4183,7 @@ export function createSqliteStorage(config) {
         ...marker,
         stoppedAt,
         stoppedBy: boundedManualFollowUpText(stoppedBy, 300),
-        stopReason: boundedManualFollowUpText(reason, 500),
+        stopReason: boundedManualFollowUpText(reason, 240),
       },
     };
     const update = database.prepare(`
@@ -4182,6 +4220,7 @@ export function createSqliteStorage(config) {
     if (!authority.submission) {
       return manualFollowUpResult({ reason: 'submission-missing', request: authority.request });
     }
+    const marker = manualFollowUpMarker(authority.request);
     const count = Number(authority.request.follow_up_count);
     const claimedTimestamp = Date.parse(claimedAt || '');
     const dueTimestamp = Date.parse(authority.request.next_follow_up_at || '');
@@ -4190,7 +4229,7 @@ export function createSqliteStorage(config) {
       && authority.submission.id === expectedSubmissionId
       && authority.submission.updated_at === expectedSubmissionUpdatedAt
       && authority.submission.status !== 'archived'
-      && isOperatorApprovedFollowUpRequest(authority.request)
+      && hasStrictManualFollowUpCore(marker)
       && !isManualFollowUpTerminal(authority.request, authority.submission)
       && Number.isInteger(count)
       && count === expectedFollowUpCount
@@ -4241,8 +4280,18 @@ export function createSqliteStorage(config) {
     if (!authority.submission) {
       return manualFollowUpResult({ reason: 'submission-missing', request: authority.request });
     }
+    const deterministicCommunicationId = buildManualFollowUpCommunicationId({
+      requestId,
+      followUpNumber: expectedFollowUpNumber,
+    });
+    if (!deterministicCommunicationId || expectedCommunicationId !== deterministicCommunicationId) {
+      return manualFollowUpResult({ reason: 'finalize-ineligible', request: authority.request });
+    }
     const communication = normalizeCrmCommunicationRow(database.prepare(`
       SELECT * FROM crm_communications WHERE id = ? LIMIT 1
+    `).get(expectedCommunicationId));
+    const outbox = normalizeCrmEmailOutboxRow(database.prepare(`
+      SELECT * FROM crm_email_outbox WHERE communication_id = ? LIMIT 1
     `).get(expectedCommunicationId));
     const marker = manualFollowUpMarker(authority.request);
     const acceptedTouches = Array.isArray(marker.acceptedTouches) ? marker.acceptedTouches : [];
@@ -4278,7 +4327,7 @@ export function createSqliteStorage(config) {
       communication?.metadata?.followUpNumber ?? communication?.metadata?.follow_up_number,
     );
     const commonEligible = allowedOutcomes.has(outcome)
-      && isOperatorApprovedFollowUpRequest(authority.request)
+      && hasStrictManualFollowUpCore(marker)
       && authority.request.submission_id === expectedSubmissionId
       && authority.submission.id === expectedSubmissionId
       && Number.isInteger(expectedFollowUpNumber)
@@ -4294,10 +4343,16 @@ export function createSqliteStorage(config) {
     if (!commonEligible) {
       return manualFollowUpResult({ reason: 'finalize-ineligible', request: authority.request });
     }
+    const derivedNextFollowUpAt = outcome === 'accepted'
+      && expectedFollowUpNumber < MANUAL_FOLLOW_UP_MAXIMUM
+      ? nextManualFollowUpAt(acceptedAt)
+      : null;
     if (outcome === 'accepted') {
       if (!['accepted', 'delivered'].includes(communication.delivery_state)
         || !Number.isFinite(Date.parse(acceptedAt || ''))
-        || (expectedFollowUpNumber < MANUAL_FOLLOW_UP_MAXIMUM && !Number.isFinite(Date.parse(nextFollowUpAt || '')))) {
+        || (expectedFollowUpNumber < MANUAL_FOLLOW_UP_MAXIMUM
+          && (!derivedNextFollowUpAt
+            || Date.parse(nextFollowUpAt || '') !== Date.parse(derivedNextFollowUpAt)))) {
         return manualFollowUpResult({ reason: 'accepted-proof-missing', request: authority.request });
       }
     } else {
@@ -4312,7 +4367,13 @@ export function createSqliteStorage(config) {
       if (outcome === 'definitive-failure' && !['failed', 'bounced', 'complained', 'suppressed'].includes(communication.delivery_state)) {
         return manualFollowUpResult({ reason: 'definitive-proof-missing', request: authority.request });
       }
-      if (outcome === 'ambiguous' && !['ambiguous', 'unknown', 'provider-unknown'].includes(communication.delivery_state)) {
+      if (outcome === 'ambiguous' && (
+        outbox?.state !== 'ambiguous'
+        || outbox.communication_id !== expectedCommunicationId
+        || outbox.cim_request_id !== requestId
+        || outbox.submission_id !== expectedSubmissionId
+        || !Number.isFinite(Date.parse(outbox.ambiguous_at || ''))
+      )) {
         return manualFollowUpResult({ reason: 'ambiguous-proof-missing', request: authority.request });
       }
     }
@@ -4347,7 +4408,7 @@ export function createSqliteStorage(config) {
       const terminal = isManualFollowUpTerminal(authority.request, authority.submission);
       followUpCount += 1;
       lastFollowUpAt = acceptedAt;
-      nextDueAt = terminal || expectedFollowUpNumber === MANUAL_FOLLOW_UP_MAXIMUM ? null : nextFollowUpAt;
+      nextDueAt = terminal || expectedFollowUpNumber === MANUAL_FOLLOW_UP_MAXIMUM ? null : derivedNextFollowUpAt;
       followUpState = terminal
         ? (authority.request.follow_up_state === 'completed' ? 'completed' : 'stopped')
         : expectedFollowUpNumber === MANUAL_FOLLOW_UP_MAXIMUM

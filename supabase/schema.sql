@@ -5918,6 +5918,9 @@ as $$
 declare
   v_current public.deal_hunter_cim_requests%rowtype;
   v_submission public.contact_submissions%rowtype;
+  v_marker jsonb;
+  v_enrolled_at timestamptz;
+  v_enrolled_by text;
   v_activity jsonb;
 begin
   select * into v_submission
@@ -5940,6 +5943,37 @@ begin
     or v_submission.updated_at is distinct from p_expected_submission_updated_at then
     return jsonb_build_object('applied', false, 'reason', 'authority-changed', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
   end if;
+  if jsonb_typeof(p_marker) is distinct from 'object' then
+    return jsonb_build_object('applied', false, 'reason', 'not-eligible', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end if;
+  if (select count(*) from jsonb_object_keys(p_marker)) <> 6
+    or p_marker -> 'version' is distinct from to_jsonb('deal-hunter-manual-follow-up-v1'::text)
+    or p_marker -> 'mode' is distinct from to_jsonb('operator-approved'::text)
+    or p_marker -> 'maximumFollowUps' is distinct from '5'::jsonb
+    or p_marker -> 'cadencePolicy' is distinct from to_jsonb('accepted-local-date-plus-2-weekend-forward-0900-pt-v1'::text)
+    or jsonb_typeof(p_marker -> 'enrolledAt') is distinct from 'string'
+    or jsonb_typeof(p_marker -> 'enrolledBy') is distinct from 'string'
+    or nullif(p_marker ->> 'enrolledAt', '') is null
+    or nullif(btrim(p_marker ->> 'enrolledBy'), '') is null then
+    return jsonb_build_object('applied', false, 'reason', 'not-eligible', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end if;
+  begin
+    v_enrolled_at := (p_marker ->> 'enrolledAt')::timestamptz;
+  exception when others then
+    return jsonb_build_object('applied', false, 'reason', 'not-eligible', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end;
+  v_enrolled_by := left(regexp_replace(btrim(p_marker ->> 'enrolledBy'), '\s+', ' ', 'g'), 300);
+  if v_enrolled_at is null or v_enrolled_by = '' then
+    return jsonb_build_object('applied', false, 'reason', 'not-eligible', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end if;
+  v_marker := jsonb_build_object(
+    'version', 'deal-hunter-manual-follow-up-v1',
+    'mode', 'operator-approved',
+    'maximumFollowUps', 5,
+    'cadencePolicy', 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1',
+    'enrolledAt', to_char(v_enrolled_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+    'enrolledBy', v_enrolled_by
+  );
   if v_submission.status = 'archived'
     or v_current.status <> 'sent'
     or v_current.request_state is distinct from 'provider_accepted'
@@ -5949,12 +5983,6 @@ begin
     or v_current.next_follow_up_at is not null
     or coalesce(v_current.follow_up_state, '') not in ('', 'not-scheduled')
     or coalesce(v_current.metadata, '{}'::jsonb) ? 'manualFollowUp'
-    or p_marker ->> 'version' <> 'deal-hunter-manual-follow-up-v1'
-    or p_marker ->> 'mode' <> 'operator-approved'
-    or p_marker ->> 'maximumFollowUps' is distinct from '5'
-    or p_marker ->> 'cadencePolicy' <> 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1'
-    or nullif(p_marker ->> 'enrolledAt', '') is null
-    or nullif(btrim(p_marker ->> 'enrolledBy'), '') is null
     or p_next_follow_up_at is null
     or p_activity #>> '{submission_id}' is distinct from p_expected_submission_id::text then
     return jsonb_build_object('applied', false, 'reason', 'not-eligible', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
@@ -5962,10 +5990,10 @@ begin
 
   update public.deal_hunter_cim_requests as request
   set
-    updated_at = (p_marker ->> 'enrolledAt')::timestamptz,
+    updated_at = v_enrolled_at,
     follow_up_state = 'scheduled',
     next_follow_up_at = p_next_follow_up_at,
-    metadata = coalesce(request.metadata, '{}'::jsonb) || jsonb_build_object('manualFollowUp', p_marker)
+    metadata = coalesce(request.metadata, '{}'::jsonb) || jsonb_build_object('manualFollowUp', v_marker)
   where request.id = p_request_id
     and request.updated_at = p_expected_request_updated_at
     and request.submission_id = p_expected_submission_id
@@ -6003,6 +6031,7 @@ declare
   v_current public.deal_hunter_cim_requests%rowtype;
   v_submission public.contact_submissions%rowtype;
   v_marker jsonb;
+  v_enrolled_at timestamptz;
   v_activity jsonb;
 begin
   select * into v_submission
@@ -6027,10 +6056,22 @@ begin
   end if;
 
   v_marker := coalesce(v_current.metadata -> 'manualFollowUp', '{}'::jsonb);
-  if v_marker ->> 'version' <> 'deal-hunter-manual-follow-up-v1'
-    or v_marker ->> 'mode' <> 'operator-approved'
-    or v_marker ->> 'maximumFollowUps' is distinct from '5'
-    or v_marker ->> 'cadencePolicy' <> 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1'
+  if jsonb_typeof(v_marker) is distinct from 'object'
+    or v_marker -> 'version' is distinct from to_jsonb('deal-hunter-manual-follow-up-v1'::text)
+    or v_marker -> 'mode' is distinct from to_jsonb('operator-approved'::text)
+    or v_marker -> 'maximumFollowUps' is distinct from '5'::jsonb
+    or v_marker -> 'cadencePolicy' is distinct from to_jsonb('accepted-local-date-plus-2-weekend-forward-0900-pt-v1'::text)
+    or jsonb_typeof(v_marker -> 'enrolledAt') is distinct from 'string'
+    or jsonb_typeof(v_marker -> 'enrolledBy') is distinct from 'string'
+    or nullif(btrim(v_marker ->> 'enrolledBy'), '') is null then
+    return jsonb_build_object('applied', false, 'reason', 'not-eligible', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end if;
+  begin
+    v_enrolled_at := (v_marker ->> 'enrolledAt')::timestamptz;
+  exception when others then
+    return jsonb_build_object('applied', false, 'reason', 'not-eligible', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end;
+  if v_enrolled_at is null
     or v_submission.status = 'archived'
     or v_current.responded_at is not null
     or v_current.request_state = 'responded'
@@ -6047,7 +6088,7 @@ begin
   v_marker := v_marker || jsonb_build_object(
     'stoppedAt', p_stopped_at,
     'stoppedBy', left(regexp_replace(btrim(p_stopped_by), '\s+', ' ', 'g'), 300),
-    'stopReason', left(regexp_replace(btrim(coalesce(p_reason, '')), '\s+', ' ', 'g'), 500)
+    'stopReason', left(regexp_replace(btrim(coalesce(p_reason, '')), '\s+', ' ', 'g'), 240)
   );
   update public.deal_hunter_cim_requests as request
   set
@@ -6091,6 +6132,7 @@ declare
   v_current public.deal_hunter_cim_requests%rowtype;
   v_submission public.contact_submissions%rowtype;
   v_marker jsonb;
+  v_enrolled_at timestamptz;
 begin
   select * into v_submission
   from public.contact_submissions as submission
@@ -6109,13 +6151,25 @@ begin
     return jsonb_build_object('applied', false, 'reason', 'submission-missing', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
   end if;
   v_marker := coalesce(v_current.metadata -> 'manualFollowUp', '{}'::jsonb);
-  if v_current.updated_at is distinct from p_expected_request_updated_at
+  if jsonb_typeof(v_marker) is distinct from 'object'
+    or v_marker -> 'version' is distinct from to_jsonb('deal-hunter-manual-follow-up-v1'::text)
+    or v_marker -> 'mode' is distinct from to_jsonb('operator-approved'::text)
+    or v_marker -> 'maximumFollowUps' is distinct from '5'::jsonb
+    or v_marker -> 'cadencePolicy' is distinct from to_jsonb('accepted-local-date-plus-2-weekend-forward-0900-pt-v1'::text)
+    or jsonb_typeof(v_marker -> 'enrolledAt') is distinct from 'string'
+    or jsonb_typeof(v_marker -> 'enrolledBy') is distinct from 'string'
+    or nullif(btrim(v_marker ->> 'enrolledBy'), '') is null then
+    return jsonb_build_object('applied', false, 'reason', 'claim-ineligible', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end if;
+  begin
+    v_enrolled_at := (v_marker ->> 'enrolledAt')::timestamptz;
+  exception when others then
+    return jsonb_build_object('applied', false, 'reason', 'claim-ineligible', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end;
+  if v_enrolled_at is null
+    or v_current.updated_at is distinct from p_expected_request_updated_at
     or v_submission.updated_at is distinct from p_expected_submission_updated_at
     or v_submission.status = 'archived'
-    or v_marker ->> 'version' <> 'deal-hunter-manual-follow-up-v1'
-    or v_marker ->> 'mode' <> 'operator-approved'
-    or v_marker ->> 'maximumFollowUps' is distinct from '5'
-    or v_marker ->> 'cadencePolicy' <> 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1'
     or v_marker ? 'stoppedAt'
     or v_current.responded_at is not null
     or v_current.request_state = 'responded'
@@ -6166,7 +6220,10 @@ declare
   v_current public.deal_hunter_cim_requests%rowtype;
   v_submission public.contact_submissions%rowtype;
   v_communication public.crm_communications%rowtype;
+  v_outbox public.crm_email_outbox%rowtype;
+  v_expected_communication_id text;
   v_marker jsonb;
+  v_enrolled_at timestamptz;
   v_touches jsonb;
   v_follow_ups jsonb;
   v_activity jsonb;
@@ -6176,6 +6233,8 @@ declare
   v_status text;
   v_request_state text;
   v_delivery_state text;
+  v_due_date date;
+  v_derived_next_follow_up_at timestamptz;
 begin
   select * into v_submission
   from public.contact_submissions as submission
@@ -6194,9 +6253,25 @@ begin
     return jsonb_build_object('applied', false, 'reason', 'submission-missing', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
   end if;
 
+  v_expected_communication_id := pg_catalog.encode(
+    pg_catalog.sha256(pg_catalog.convert_to(
+      'crm-communication:' || p_request_id || ':follow-up:' || p_expected_follow_up_number::text,
+      'UTF8'
+    )),
+    'hex'
+  );
+  if p_expected_communication_id is distinct from v_expected_communication_id then
+    return jsonb_build_object('applied', false, 'reason', 'finalize-ineligible', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end if;
+
   select * into v_communication
   from public.crm_communications as communication
   where communication.id = p_expected_communication_id
+  for update;
+
+  select * into v_outbox
+  from public.crm_email_outbox as outbox
+  where outbox.communication_id = p_expected_communication_id
   for update;
 
   v_marker := coalesce(v_current.metadata -> 'manualFollowUp', '{}'::jsonb);
@@ -6219,11 +6294,23 @@ begin
     return jsonb_build_object('applied', false, 'reason', 'already-finalized', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', true);
   end if;
 
-  if p_outcome not in ('accepted', 'definitive-failure', 'ambiguous')
-    or v_marker ->> 'version' <> 'deal-hunter-manual-follow-up-v1'
-    or v_marker ->> 'mode' <> 'operator-approved'
-    or v_marker ->> 'maximumFollowUps' is distinct from '5'
-    or v_marker ->> 'cadencePolicy' <> 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1'
+  if jsonb_typeof(v_marker) is distinct from 'object'
+    or v_marker -> 'version' is distinct from to_jsonb('deal-hunter-manual-follow-up-v1'::text)
+    or v_marker -> 'mode' is distinct from to_jsonb('operator-approved'::text)
+    or v_marker -> 'maximumFollowUps' is distinct from '5'::jsonb
+    or v_marker -> 'cadencePolicy' is distinct from to_jsonb('accepted-local-date-plus-2-weekend-forward-0900-pt-v1'::text)
+    or jsonb_typeof(v_marker -> 'enrolledAt') is distinct from 'string'
+    or jsonb_typeof(v_marker -> 'enrolledBy') is distinct from 'string'
+    or nullif(btrim(v_marker ->> 'enrolledBy'), '') is null then
+    return jsonb_build_object('applied', false, 'reason', 'finalize-ineligible', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end if;
+  begin
+    v_enrolled_at := (v_marker ->> 'enrolledAt')::timestamptz;
+  exception when others then
+    return jsonb_build_object('applied', false, 'reason', 'finalize-ineligible', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+  end;
+  if v_enrolled_at is null
+    or p_outcome not in ('accepted', 'definitive-failure', 'ambiguous')
     or p_expected_follow_up_number not between 1 and 5
     or v_current.follow_up_count <> p_expected_follow_up_number - 1
     or v_communication.id is null
@@ -6243,9 +6330,22 @@ begin
 
   if p_outcome = 'accepted' then
     if v_communication.delivery_state not in ('accepted', 'delivered')
-      or p_accepted_at is null
-      or (p_expected_follow_up_number < 5 and p_next_follow_up_at is null) then
+      or p_accepted_at is null then
       return jsonb_build_object('applied', false, 'reason', 'accepted-proof-missing', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+    end if;
+    if p_expected_follow_up_number < 5 then
+      v_due_date := (p_accepted_at at time zone 'America/Los_Angeles')::date + 2;
+      if extract(isodow from v_due_date) = 6 then
+        v_due_date := v_due_date + 2;
+      elsif extract(isodow from v_due_date) = 7 then
+        v_due_date := v_due_date + 1;
+      end if;
+      v_derived_next_follow_up_at := (v_due_date + time '09:00') at time zone 'America/Los_Angeles';
+      if p_next_follow_up_at is distinct from v_derived_next_follow_up_at then
+        return jsonb_build_object('applied', false, 'reason', 'accepted-proof-missing', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
+      end if;
+    else
+      v_derived_next_follow_up_at := null;
     end if;
   else
     if v_current.updated_at is distinct from p_expected_request_updated_at
@@ -6259,7 +6359,14 @@ begin
     if p_outcome = 'definitive-failure' and v_communication.delivery_state not in ('failed', 'bounced', 'complained', 'suppressed') then
       return jsonb_build_object('applied', false, 'reason', 'definitive-proof-missing', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
     end if;
-    if p_outcome = 'ambiguous' and v_communication.delivery_state not in ('ambiguous', 'unknown', 'provider-unknown') then
+    if p_outcome = 'ambiguous' and (
+      v_outbox.id is null
+      or v_outbox.state is distinct from 'ambiguous'
+      or v_outbox.communication_id is distinct from p_expected_communication_id
+      or v_outbox.cim_request_id is distinct from p_request_id
+      or v_outbox.submission_id is distinct from p_expected_submission_id
+      or v_outbox.ambiguous_at is null
+    ) then
       return jsonb_build_object('applied', false, 'reason', 'ambiguous-proof-missing', 'request', to_jsonb(v_current), 'activity', null, 'alreadyFinalized', false);
     end if;
   end if;
@@ -6319,7 +6426,7 @@ begin
       next_follow_up_at = case
         when v_terminal then null
         when p_expected_follow_up_number = 5 then null
-        else p_next_follow_up_at
+        else v_derived_next_follow_up_at
       end,
       follow_up_state = v_follow_up_state,
       last_activity_at = v_mutation_at,

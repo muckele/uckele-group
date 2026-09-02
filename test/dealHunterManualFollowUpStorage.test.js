@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { fork } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 import {
   buildManualFollowUpCommunicationId,
   buildManualFollowUpMarker,
@@ -14,6 +16,8 @@ import { createSupabaseStorage } from '../server/storage/supabase.js';
 const initialAt = '2026-08-28T18:00:00.000Z';
 const enrolledAt = '2026-09-01T16:00:00.000Z';
 const firstDueAt = '2026-09-01T17:00:00.000Z';
+const sqlitePaths = new WeakMap();
+const sqliteWorkerUrl = new URL('./fixtures/dealHunterManualFollowUpSqliteWorker.js', import.meta.url);
 
 function submission(id, overrides = {}) {
   return {
@@ -111,8 +115,8 @@ function activity(id, submissionId, createdAt, eventType = 'cim.manual-follow-up
   };
 }
 
-function outboundCommunication({ requestId, submissionId, followUpNumber, deliveryState, occurredAt }) {
-  const id = buildManualFollowUpCommunicationId({ requestId, followUpNumber });
+function outboundCommunication({ requestId, submissionId, followUpNumber, deliveryState, occurredAt, id: suppliedId = '' }) {
+  const id = suppliedId || buildManualFollowUpCommunicationId({ requestId, followUpNumber });
   return {
     id,
     submission_id: submissionId,
@@ -169,15 +173,134 @@ function assertNormalizedResult(result) {
 
 function createStorage(t, prefix = 'manual-follow-up-storage') {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `ug-${prefix}-`));
+  const sqlitePath = path.join(tempDir, 'crm.sqlite');
   const storage = createSqliteStorage({
-    storage: { sqlitePath: path.join(tempDir, 'crm.sqlite') },
+    storage: { sqlitePath },
     protection: { rateLimitRetentionMs: 0 },
   });
+  sqlitePaths.set(storage, sqlitePath);
   t.after(() => {
     storage.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
   return storage;
+}
+
+function writeOutboxProof(storage, {
+  communicationId,
+  submissionId,
+  requestId,
+  state,
+  occurredAt,
+} = {}) {
+  const database = new Database(sqlitePaths.get(storage));
+  try {
+    database.prepare(`
+      INSERT INTO crm_email_outbox (
+        id, communication_id, submission_id, cim_request_id, idempotency_key,
+        client_request_key, state, provider, provider_message_id, attempt_count,
+        next_attempt_at, accepted_at, ambiguous_at, expected_submission_version,
+        actor, created_at, updated_at, metadata
+      ) VALUES (
+        @id, @communication_id, @submission_id, @cim_request_id, @idempotency_key,
+        @client_request_key, @state, 'resend', @provider_message_id, 1,
+        NULL, @accepted_at, @ambiguous_at, @expected_submission_version,
+        'storage-admin', @occurred_at, @occurred_at, '{}'
+      )
+      ON CONFLICT(communication_id) DO UPDATE SET
+        state = excluded.state,
+        provider_message_id = excluded.provider_message_id,
+        accepted_at = excluded.accepted_at,
+        ambiguous_at = excluded.ambiguous_at,
+        updated_at = excluded.updated_at
+    `).run({
+      id: `outbox-${communicationId}`,
+      communication_id: communicationId,
+      submission_id: submissionId,
+      cim_request_id: requestId,
+      idempotency_key: `outbox-key-${communicationId}`,
+      client_request_key: `outbox-client-${communicationId}`,
+      state,
+      provider_message_id: state === 'accepted' ? `provider-${communicationId}` : null,
+      accepted_at: state === 'accepted' ? occurredAt : null,
+      ambiguous_at: state === 'ambiguous' ? occurredAt : null,
+      expected_submission_version: initialAt,
+      occurred_at: occurredAt,
+    });
+  } finally {
+    database.close();
+  }
+}
+
+function waitForWorkerMessage(worker, predicate, timeoutMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for SQLite worker ${worker.pid}.`));
+    }, timeoutMs);
+    const onMessage = (message) => {
+      if (!predicate(message)) return;
+      cleanup();
+      resolve(message);
+    };
+    const onExit = (code, signal) => {
+      cleanup();
+      reject(new Error(`SQLite worker ${worker.pid} exited before its expected message (${code ?? signal}).`));
+    };
+    const cleanup = () => {
+      clearTimeout(timeout);
+      worker.off('message', onMessage);
+      worker.off('exit', onExit);
+    };
+    worker.on('message', onMessage);
+    worker.on('exit', onExit);
+  });
+}
+
+async function runOverlappingSqlitePair({ sqlitePath, operation, input }) {
+  const argumentsList = [sqlitePath, operation, JSON.stringify(input)];
+  const workers = [
+    fork(sqliteWorkerUrl, argumentsList, { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }),
+    fork(sqliteWorkerUrl, argumentsList, { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] }),
+  ];
+  const trace = [];
+  const errors = [];
+  let blocker = null;
+  for (const worker of workers) {
+    worker.stderr.on('data', (chunk) => errors.push(chunk.toString()));
+    worker.on('message', (message) => trace.push({ worker: worker.pid, phase: message.phase }));
+  }
+  try {
+    await Promise.all(workers.map((worker) => waitForWorkerMessage(worker, ({ phase }) => phase === 'ready')));
+    blocker = new Database(sqlitePath);
+    blocker.exec('BEGIN IMMEDIATE');
+    trace.push({ worker: 'parent', phase: 'blocker-held' });
+    const attempts = workers.map((worker) => waitForWorkerMessage(worker, ({ phase }) => phase === 'attempting'));
+    for (const worker of workers) worker.send('go');
+    await Promise.all(attempts);
+    assert.equal(trace.filter(({ phase }) => phase === 'attempting').length, 2);
+    assert.equal(trace.some(({ phase }) => phase === 'result'), false, 'neither writer may finish while the blocker owns BEGIN IMMEDIATE');
+    const completions = workers.map((worker) => waitForWorkerMessage(
+      worker,
+      ({ phase }) => ['result', 'error'].includes(phase),
+    ));
+    blocker.exec('COMMIT');
+    blocker.close();
+    blocker = null;
+    trace.push({ worker: 'parent', phase: 'blocker-released' });
+    const messages = await Promise.all(completions);
+    for (const message of messages) {
+      assert.equal(message.phase, 'result', message.error || errors.join('\n'));
+    }
+    return { results: messages.map(({ result }) => result), trace };
+  } finally {
+    if (blocker?.inTransaction) blocker.exec('ROLLBACK');
+    blocker?.close();
+    for (const worker of workers) {
+      if (worker.connected) worker.disconnect();
+      if (worker.exitCode === null) worker.kill();
+    }
+  }
 }
 
 async function seed(storage, suffix, { submissionOverrides = {}, requestOverrides = {} } = {}) {
@@ -253,6 +376,74 @@ test('SQLite manual follow-up start compare-and-set loses to reply pass archive 
   assert.equal((await storage.listCrmActivityEvents({ limit: 100 })).length, 0);
 });
 
+test('SQLite manual follow-up start accepts only the canonical server-owned marker', async (t) => {
+  // Break caught: caller JSON can seed or replace policy/audit authority during
+  // enrollment instead of being validated and reconstructed canonically.
+  const storage = createStorage(t, 'manual-start-marker-authority');
+  const canonical = marker();
+  const invalidMarkers = [
+    ['missing-version', Object.fromEntries(Object.entries(canonical).filter(([key]) => key !== 'version'))],
+    ['missing-cadence', Object.fromEntries(Object.entries(canonical).filter(([key]) => key !== 'cadencePolicy'))],
+    ['string-maximum', { ...canonical, maximumFollowUps: '5' }],
+    ['malformed-enrolled-at', { ...canonical, enrolledAt: 'not-an-instant' }],
+    ['blank-enrolled-by', { ...canonical, enrolledBy: '   ' }],
+    ['seeded-accepted-touches', { ...canonical, acceptedTouches: [{ followUpNumber: 1 }] }],
+    ['seeded-stop', { ...canonical, stoppedAt: enrolledAt }],
+    ['unknown-field', { ...canonical, callerAuthority: true }],
+    ['array-marker', [canonical]],
+    ['primitive-marker', 'operator-approved'],
+  ];
+
+  for (const [name, suppliedMarker] of invalidMarkers) {
+    const seeded = await seed(storage, `strict-marker-${name}`);
+    const result = await storage.startDealHunterManualFollowUps({
+      requestId: seeded.request.id,
+      expectedRequestUpdatedAt: seeded.request.updated_at,
+      expectedSubmissionId: seeded.submission.id,
+      expectedSubmissionUpdatedAt: seeded.submission.updated_at,
+      marker: suppliedMarker,
+      nextFollowUpAt: firstDueAt,
+      activity: activity(`strict-marker-${name}`, seeded.submission.id, enrolledAt, 'cim.manual-follow-ups-enrolled'),
+    });
+    assert.equal(result.applied, false, name);
+    const unchanged = await storage.getDealHunterCimRequestById(seeded.request.id);
+    assert.equal(unchanged.updated_at, seeded.request.updated_at, name);
+    assert.equal(unchanged.follow_up_state, 'not-scheduled', name);
+    assert.equal(Object.hasOwn(unchanged.metadata, 'manualFollowUp'), false, name);
+  }
+
+  assert.equal((await storage.listCrmActivityEvents({ limit: 100 })).length, 0);
+});
+
+test('SQLite approved claim rejects a partial operator-approved marker', async (t) => {
+  // Break caught: a mode-only or partial marker becomes durable Phase 3 claim
+  // authority even though it was never canonically enrolled.
+  const storage = createStorage(t, 'manual-claim-partial-marker');
+  const seeded = await seed(storage, 'claim-partial-marker', {
+    requestOverrides: {
+      follow_up_state: 'scheduled',
+      next_follow_up_at: firstDueAt,
+      metadata: {
+        manualApproval: { followUpPolicy: 'none' },
+        manualFollowUp: { mode: 'operator-approved', maximumFollowUps: 5 },
+      },
+    },
+  });
+  const result = await storage.claimDealHunterApprovedFollowUp({
+    requestId: seeded.request.id,
+    expectedRequestUpdatedAt: seeded.request.updated_at,
+    expectedSubmissionId: seeded.submission.id,
+    expectedSubmissionUpdatedAt: seeded.submission.updated_at,
+    expectedFollowUpCount: 0,
+    expectedFollowUpNumber: 1,
+    expectedNextFollowUpAt: firstDueAt,
+    claimedAt: firstDueAt,
+  });
+  assert.equal(result.applied, false);
+  assert.equal(result.reason, 'claim-ineligible');
+  assert.equal((await storage.getDealHunterCimRequestById(seeded.request.id)).status, 'sent');
+});
+
 test('SQLite manual follow-up stop atomically clears schedule preserves count and history and records bounded audit', async (t) => {
   // Break caught: Stop can erase accepted history/count, leave a schedule, or
   // allow re-enrollment after the permanent stop.
@@ -268,7 +459,7 @@ test('SQLite manual follow-up stop atomically clears schedule preserves count an
     },
   });
   const started = await enroll(storage, seeded);
-  const longReason = `  ${'operator requested stop '.repeat(40)}  `;
+  const longReason = `  ${'operator \n requested\t stop   '.repeat(40)}  `;
   const stoppedAt = '2026-09-01T18:00:00.000Z';
   const stopped = await storage.stopDealHunterManualFollowUps({
     requestId: started.request.id,
@@ -289,7 +480,10 @@ test('SQLite manual follow-up stop atomically clears schedule preserves count an
   assert.deepEqual(stopped.request.metadata.followUps, [{ followUpNumber: 1 }, { followUpNumber: 2 }]);
   assert.equal(stopped.request.metadata.manualFollowUp.stoppedAt, stoppedAt);
   assert.equal(stopped.request.metadata.manualFollowUp.stoppedBy, 'storage-admin');
-  assert.ok(stopped.request.metadata.manualFollowUp.stopReason.length <= 500);
+  const expectedStopReason = 'operator requested stop operator requested stop operator requested stop operator requested stop operator requested stop '
+    + 'operator requested stop operator requested stop operator requested stop operator requested stop operator requested stop ';
+  assert.equal(stopped.request.metadata.manualFollowUp.stopReason.length, 240);
+  assert.equal(stopped.request.metadata.manualFollowUp.stopReason, expectedStopReason);
   assert.equal(stopped.request.metadata.manualFollowUp.stopReason.includes('\n'), false);
   assert.equal((await storage.listCrmActivityEvents({ submissionId: seeded.submission.id })).length, 2);
 
@@ -530,6 +724,132 @@ test('SQLite accepted finalization is idempotent by communication identity and p
   assert.equal((await storage.listCrmActivityEvents({ submissionId: seeded.submission.id })).length, 3);
 });
 
+test('SQLite accepted finalization rejects a noncanonical communication ID without mutation', async (t) => {
+  // Break caught: any communication sharing request/submission/N can be
+  // counted even when it is not the deterministic logical Follow-Up N.
+  const storage = createStorage(t, 'accepted-wrong-communication');
+  const seeded = await seed(storage, 'accepted-wrong-communication');
+  const started = await enroll(storage, seeded);
+  const claimed = await storage.claimDealHunterApprovedFollowUp({
+    requestId: started.request.id,
+    expectedRequestUpdatedAt: started.request.updated_at,
+    expectedSubmissionId: seeded.submission.id,
+    expectedSubmissionUpdatedAt: seeded.submission.updated_at,
+    expectedFollowUpCount: 0,
+    expectedFollowUpNumber: 1,
+    expectedNextFollowUpAt: firstDueAt,
+    claimedAt: firstDueAt,
+  });
+  const acceptedAt = '2026-09-01T17:05:00.000Z';
+  const wrongCommunication = outboundCommunication({
+    requestId: started.request.id,
+    submissionId: seeded.submission.id,
+    followUpNumber: 1,
+    deliveryState: 'accepted',
+    occurredAt: acceptedAt,
+    id: 'not-the-deterministic-sha256-identity',
+  });
+  await storage.insertCrmCommunication(wrongCommunication);
+  const result = await storage.finalizeDealHunterApprovedFollowUp({
+    requestId: started.request.id,
+    expectedRequestUpdatedAt: claimed.request.updated_at,
+    expectedSubmissionId: seeded.submission.id,
+    expectedFollowUpNumber: 1,
+    expectedCommunicationId: wrongCommunication.id,
+    outcome: 'accepted',
+    acceptedAt,
+    nextFollowUpAt: '2026-09-03T16:00:00.000Z',
+    activity: activity('wrong-communication-accepted', seeded.submission.id, acceptedAt, 'cim.follow-up-accepted'),
+  });
+  assert.equal(result.applied, false);
+  assert.equal(result.reason, 'finalize-ineligible');
+  const unchanged = await storage.getDealHunterCimRequestById(started.request.id);
+  assert.equal(unchanged.updated_at, claimed.request.updated_at);
+  assert.equal(unchanged.follow_up_count, 0);
+  assert.equal(unchanged.last_follow_up_at, null);
+  assert.equal(unchanged.next_follow_up_at, firstDueAt);
+  assert.deepEqual(unchanged.metadata.manualFollowUp.acceptedTouches || [], []);
+  assert.deepEqual(
+    (await storage.listCrmActivityEvents({ submissionId: seeded.submission.id })).map(({ id }) => id),
+    ['start-request-accepted-wrong-communication'],
+  );
+});
+
+test('SQLite accepted finalization derives Pacific cadence from acceptedAt and rejects a wrong assertion', async (t) => {
+  // Break caught: a caller can persist an arbitrary next due unrelated to the
+  // provider acceptance instant.
+  const cases = [
+    {
+      name: 'thursday',
+      acceptedAt: '2026-09-03T23:37:00.000Z',
+      wrongDueAt: '2026-09-07T17:00:00.000Z',
+      expectedDueAt: '2026-09-07T16:00:00.000Z',
+    },
+    {
+      name: 'friday',
+      acceptedAt: '2026-09-04T20:00:00.000Z',
+      wrongDueAt: '2026-09-08T16:00:00.000Z',
+      expectedDueAt: '2026-09-07T16:00:00.000Z',
+    },
+    {
+      name: 'spring-dst',
+      acceptedAt: '2026-03-06T20:00:00.000Z',
+      wrongDueAt: '2026-03-09T17:00:00.000Z',
+      expectedDueAt: '2026-03-09T16:00:00.000Z',
+    },
+    {
+      name: 'fall-dst',
+      acceptedAt: '2026-10-30T20:00:00.000Z',
+      wrongDueAt: '2026-11-02T16:00:00.000Z',
+      expectedDueAt: '2026-11-02T17:00:00.000Z',
+    },
+  ];
+
+  for (const probe of cases) {
+    const storage = createStorage(t, `accepted-cadence-${probe.name}`);
+    const seeded = await seed(storage, `accepted-cadence-${probe.name}`);
+    const started = await enroll(storage, seeded);
+    const claimed = await storage.claimDealHunterApprovedFollowUp({
+      requestId: started.request.id,
+      expectedRequestUpdatedAt: started.request.updated_at,
+      expectedSubmissionId: seeded.submission.id,
+      expectedSubmissionUpdatedAt: seeded.submission.updated_at,
+      expectedFollowUpCount: 0,
+      expectedFollowUpNumber: 1,
+      expectedNextFollowUpAt: firstDueAt,
+      claimedAt: firstDueAt,
+    });
+    const communication = outboundCommunication({
+      requestId: started.request.id,
+      submissionId: seeded.submission.id,
+      followUpNumber: 1,
+      deliveryState: 'accepted',
+      occurredAt: probe.acceptedAt,
+    });
+    await storage.insertCrmCommunication(communication);
+    const base = {
+      requestId: started.request.id,
+      expectedRequestUpdatedAt: claimed.request.updated_at,
+      expectedSubmissionId: seeded.submission.id,
+      expectedFollowUpNumber: 1,
+      expectedCommunicationId: communication.id,
+      outcome: 'accepted',
+      acceptedAt: probe.acceptedAt,
+      activity: activity(`accepted-cadence-${probe.name}`, seeded.submission.id, probe.acceptedAt, 'cim.follow-up-accepted'),
+    };
+    const wrong = await storage.finalizeDealHunterApprovedFollowUp({ ...base, nextFollowUpAt: probe.wrongDueAt });
+    assert.equal(wrong.applied, false, `${probe.name} wrong assertion`);
+    const unchanged = await storage.getDealHunterCimRequestById(started.request.id);
+    assert.equal(unchanged.follow_up_count, 0, probe.name);
+    assert.equal(unchanged.updated_at, claimed.request.updated_at, probe.name);
+
+    const correct = await storage.finalizeDealHunterApprovedFollowUp({ ...base, nextFollowUpAt: probe.expectedDueAt });
+    assert.equal(correct.applied, true, `${probe.name} correct assertion`);
+    assert.equal(correct.request.last_follow_up_at, probe.acceptedAt, probe.name);
+    assert.equal(correct.request.next_follow_up_at, probe.expectedDueAt, probe.name);
+  }
+});
+
 test('SQLite definitive failure preserves count number exact communication and original due without automatic retry', async (t) => {
   // Break caught: a provider rejection advances the sequence, changes exact
   // identity, or invents an automatic retry schedule.
@@ -612,10 +932,17 @@ test('SQLite ambiguity clears the schedule and cannot become retry without recon
     requestId: started.request.id,
     submissionId: seeded.submission.id,
     followUpNumber: 1,
-    deliveryState: 'ambiguous',
+    deliveryState: 'not-attempted',
     occurredAt: ambiguousAt,
   });
   await storage.insertCrmCommunication(exactCommunication);
+  writeOutboxProof(storage, {
+    communicationId: exactCommunication.id,
+    submissionId: seeded.submission.id,
+    requestId: started.request.id,
+    state: 'ambiguous',
+    occurredAt: ambiguousAt,
+  });
   const ambiguityInput = {
     requestId: started.request.id,
     expectedRequestUpdatedAt: claimed.request.updated_at,
@@ -665,6 +992,13 @@ test('SQLite ambiguity clears the schedule and cannot become retry without recon
     delivery_state_at: '2026-09-01T17:06:00.000Z',
     updated_at: '2026-09-01T17:06:00.000Z',
   });
+  writeOutboxProof(storage, {
+    communicationId: exactCommunication.id,
+    submissionId: seeded.submission.id,
+    requestId: started.request.id,
+    state: 'accepted',
+    occurredAt: '2026-09-01T17:06:00.000Z',
+  });
   const reconciled = await storage.finalizeDealHunterApprovedFollowUp({
     requestId: ambiguous.request.id,
     expectedRequestUpdatedAt: ambiguous.request.updated_at,
@@ -681,22 +1015,21 @@ test('SQLite ambiguity clears the schedule and cannot become retry without recon
   assert.equal(reconciled.request.follow_up_state, 'scheduled');
 });
 
-test('SQLite concurrent start stop approval finalization and accepted reconciliation converge without duplicate activity or count', async (t) => {
-  // Break caught: independent SQLite connections can both linearize the same
-  // sequence mutation, duplicating activity/count or reopening after Stop.
+test('SQLite independent processes overlap Start claim and accepted finalization with one logical winner', async (t) => {
+  // Break caught: a sequential Promise.all test can stay green even if two
+  // genuinely contending SQLite writers duplicate activity or accepted count.
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-manual-concurrency-'));
+  const sqlitePath = path.join(tempDir, 'crm.sqlite');
   const config = {
-    storage: { sqlitePath: path.join(tempDir, 'crm.sqlite') },
+    storage: { sqlitePath },
     protection: { rateLimitRetentionMs: 0 },
   };
-  const first = createSqliteStorage(config);
-  const second = createSqliteStorage(config);
+  const storage = createSqliteStorage(config);
   t.after(() => {
-    first.close();
-    second.close();
+    storage.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
-  const seeded = await seed(first, 'concurrency');
+  const seeded = await seed(storage, 'concurrency');
   const startInput = {
     requestId: seeded.request.id,
     expectedRequestUpdatedAt: seeded.request.updated_at,
@@ -706,12 +1039,13 @@ test('SQLite concurrent start stop approval finalization and accepted reconcilia
     nextFollowUpAt: firstDueAt,
     activity: activity('concurrent-start', seeded.submission.id, enrolledAt, 'cim.manual-follow-ups-enrolled'),
   };
-  const starts = await Promise.all([
-    first.startDealHunterManualFollowUps(startInput),
-    second.startDealHunterManualFollowUps(startInput),
-  ]);
-  assert.equal(starts.filter((result) => result.applied).length, 1);
-  const started = starts.find((result) => result.applied).request;
+  const startRace = await runOverlappingSqlitePair({ sqlitePath, operation: 'startDealHunterManualFollowUps', input: startInput });
+  assert.equal(startRace.trace.filter(({ phase }) => phase === 'ready').length, 2);
+  assert.equal(startRace.trace.filter(({ phase }) => phase === 'attempting').length, 2);
+  assert.equal(startRace.trace.some(({ phase }) => phase === 'blocker-held'), true);
+  assert.equal(startRace.results.filter((result) => result.applied).length, 1);
+  const started = await storage.getDealHunterCimRequestById(seeded.request.id);
+  assert.equal((await storage.listCrmActivityEvents({ submissionId: seeded.submission.id })).length, 1);
 
   const claimInput = {
     requestId: started.id,
@@ -723,12 +1057,10 @@ test('SQLite concurrent start stop approval finalization and accepted reconcilia
     expectedNextFollowUpAt: firstDueAt,
     claimedAt: firstDueAt,
   };
-  const claims = await Promise.all([
-    first.claimDealHunterApprovedFollowUp(claimInput),
-    second.claimDealHunterApprovedFollowUp(claimInput),
-  ]);
-  assert.equal(claims.filter((result) => result.applied).length, 1);
-  const claimed = claims.find((result) => result.applied).request;
+  const claimRace = await runOverlappingSqlitePair({ sqlitePath, operation: 'claimDealHunterApprovedFollowUp', input: claimInput });
+  assert.equal(claimRace.trace.filter(({ phase }) => phase === 'attempting').length, 2);
+  assert.equal(claimRace.results.filter((result) => result.applied).length, 1);
+  const claimed = await storage.getDealHunterCimRequestById(started.id);
   const acceptedAt = '2026-09-01T17:05:00.000Z';
   const exactCommunication = outboundCommunication({
     requestId: started.id,
@@ -737,7 +1069,7 @@ test('SQLite concurrent start stop approval finalization and accepted reconcilia
     deliveryState: 'accepted',
     occurredAt: acceptedAt,
   });
-  await first.insertCrmCommunication(exactCommunication);
+  await storage.insertCrmCommunication(exactCommunication);
   const finalizeInput = {
     requestId: started.id,
     expectedRequestUpdatedAt: claimed.updated_at,
@@ -749,48 +1081,21 @@ test('SQLite concurrent start stop approval finalization and accepted reconcilia
     nextFollowUpAt: nextManualFollowUpAt(acceptedAt),
     activity: activity('concurrent-accepted', seeded.submission.id, acceptedAt, 'cim.follow-up-accepted'),
   };
-  const finalizations = await Promise.all([
-    first.finalizeDealHunterApprovedFollowUp(finalizeInput),
-    second.finalizeDealHunterApprovedFollowUp(finalizeInput),
-  ]);
-  assert.equal(finalizations.filter((result) => result.applied).length, 1);
-  assert.equal(finalizations.filter((result) => result.alreadyFinalized).length, 1);
-  const accepted = await first.getDealHunterCimRequestById(started.id);
+  const finalizeRace = await runOverlappingSqlitePair({
+    sqlitePath,
+    operation: 'finalizeDealHunterApprovedFollowUp',
+    input: finalizeInput,
+  });
+  assert.equal(finalizeRace.trace.filter(({ phase }) => phase === 'attempting').length, 2);
+  assert.equal(finalizeRace.results.filter((result) => result.applied).length, 1);
+  assert.equal(finalizeRace.results.filter((result) => result.alreadyFinalized).length, 1);
+  const accepted = await storage.getDealHunterCimRequestById(started.id);
   assert.equal(accepted.follow_up_count, 1);
-
-  const stoppedAt = '2026-09-03T18:00:00.000Z';
-  const stopInput = {
-    requestId: accepted.id,
-    expectedRequestUpdatedAt: accepted.updated_at,
-    expectedSubmissionId: seeded.submission.id,
-    expectedSubmissionUpdatedAt: seeded.submission.updated_at,
-    stoppedAt,
-    stoppedBy: 'storage-admin',
-    reason: 'Concurrent stop wins.',
-    activity: activity('concurrent-stop', seeded.submission.id, stoppedAt, 'cim.manual-follow-ups-stopped'),
-  };
-  const nextClaimInput = {
-    requestId: accepted.id,
-    expectedRequestUpdatedAt: accepted.updated_at,
-    expectedSubmissionId: seeded.submission.id,
-    expectedSubmissionUpdatedAt: seeded.submission.updated_at,
-    expectedFollowUpCount: 1,
-    expectedFollowUpNumber: 2,
-    expectedNextFollowUpAt: accepted.next_follow_up_at,
-    claimedAt: stoppedAt,
-  };
-  await Promise.all([
-    first.stopDealHunterManualFollowUps(stopInput),
-    second.claimDealHunterApprovedFollowUp(nextClaimInput),
-  ]);
-  const converged = await first.getDealHunterCimRequestById(started.id);
-  assert.equal(converged.follow_up_count, 1);
-  assert.equal(converged.follow_up_state, 'stopped');
-  assert.equal(converged.next_follow_up_at, null);
-  const activities = await first.listCrmActivityEvents({ submissionId: seeded.submission.id });
+  assert.equal(accepted.metadata.manualFollowUp.acceptedTouches.length, 1);
+  const activities = await storage.listCrmActivityEvents({ submissionId: seeded.submission.id });
   assert.deepEqual(
     activities.map((event) => event.id).sort(),
-    ['concurrent-accepted', 'concurrent-start', 'concurrent-stop'],
+    ['concurrent-accepted', 'concurrent-start'],
   );
 });
 
