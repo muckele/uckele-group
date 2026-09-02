@@ -3,6 +3,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import {
+  buildManualFollowUpCommunicationId,
+  buildManualFollowUpMarker,
+  nextManualFollowUpAt,
+} from '../server/services/dealHunterManualFollowUpPolicy.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 
@@ -1356,4 +1361,205 @@ test('direct Supabase communication and CIM-history pagination clamps non-finite
   assert.equal((await storage.listDealHunterCimRequestHistory({ page: 10001 })).page, 10000);
   assert.deepEqual(ranges, [[0, 24], [249975, 249999]]);
   assert.deepEqual(historyPages, [1, 10000]);
+});
+
+test('accepted manual follow-up reconciliation is exactly once across communication request and activity state', async (t) => {
+  // Break caught: accepted communication proof can increment the request or
+  // append its reconciliation activity more than once.
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-manual-reconciliation-'));
+  const storage = createSqliteStorage({
+    storage: { sqlitePath: path.join(tempDir, 'crm.sqlite') },
+    protection: { rateLimitRetentionMs: 0 },
+  });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+  const submissionId = 'manual-reconciliation-submission';
+  const requestId = 'manual-reconciliation-request';
+  await storage.insertSubmission(submission(submissionId));
+  const marker = buildManualFollowUpMarker({
+    enrolledAt: '2026-09-01T16:00:00.000Z',
+    enrolledBy: 'storage-admin',
+  });
+  const storedRequest = await storage.upsertDealHunterCimRequest(cimClaimRequest({
+    id: requestId,
+    deal_key: 'manual-reconciliation-deal',
+    recipient_email: 'manual-reconciliation@example.test',
+    submission_id: submissionId,
+    status: 'sent',
+    request_state: 'provider_accepted',
+    delivery_state: 'accepted',
+    follow_up_state: 'scheduled',
+    next_follow_up_at: '2026-09-01T17:00:00.000Z',
+    metadata: { manualFollowUp: marker },
+  }));
+  const acceptedAt = '2026-09-01T17:05:00.000Z';
+  const communicationId = buildManualFollowUpCommunicationId({ requestId, followUpNumber: 1 });
+  await storage.insertCrmCommunication(communication({
+    id: communicationId,
+    submission_id: submissionId,
+    deal_key: storedRequest.deal_key,
+    cim_request_id: requestId,
+    direction: 'outbound',
+    kind: 'cim-follow-up',
+    provider_message_id: 'manual-reconciliation-provider-message',
+    source_event_id: null,
+    idempotency_key: 'deal-hunter-cim-manual-reconciliation-request-follow-up-1',
+    from_address: 'team@example.test',
+    to_addresses: ['manual-reconciliation@example.test'],
+    occurred_at: acceptedAt,
+    created_at: acceptedAt,
+    updated_at: acceptedAt,
+    delivery_state: 'accepted',
+    delivery_state_at: acceptedAt,
+    metadata: { followUpNumber: 1 },
+  }));
+  const input = {
+    requestId,
+    expectedRequestUpdatedAt: storedRequest.updated_at,
+    expectedSubmissionId: submissionId,
+    expectedFollowUpNumber: 1,
+    expectedCommunicationId: communicationId,
+    outcome: 'accepted',
+    acceptedAt,
+    nextFollowUpAt: nextManualFollowUpAt(acceptedAt),
+    activity: {
+      id: 'manual-reconciliation-activity',
+      submission_id: submissionId,
+      created_at: acceptedAt,
+      actor: 'system',
+      role: 'system',
+      event_type: 'cim.follow-up-reconciled',
+      summary: 'Accepted follow-up reconciled.',
+      metadata: { communicationId, followUpNumber: 1 },
+    },
+  };
+
+  const first = await storage.finalizeDealHunterApprovedFollowUp(input);
+  const replay = await storage.finalizeDealHunterApprovedFollowUp(input);
+  assert.equal(first.applied, true);
+  assert.equal(replay.applied, false);
+  assert.equal(replay.alreadyFinalized, true);
+  const current = await storage.getDealHunterCimRequestById(requestId);
+  assert.equal(current.follow_up_count, 1);
+  assert.equal(current.metadata.manualFollowUp.acceptedTouches.length, 1);
+  assert.equal(current.metadata.followUps.length, 1);
+  assert.equal(current.metadata.followUps[0].communicationId, communicationId);
+  assert.equal((await storage.listCrmActivityEvents({ submissionId })).length, 1);
+});
+
+test('reply stop pass archive and materials terminal mutations never reopen a manual schedule', async (t) => {
+  // Break caught: accepted reconciliation overwrites a newer terminal request
+  // or submission authority with a new schedule.
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-manual-terminal-dominance-'));
+  const storage = createSqliteStorage({
+    storage: { sqlitePath: path.join(tempDir, 'crm.sqlite') },
+    protection: { rateLimitRetentionMs: 0 },
+  });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+  const acceptedAt = '2026-09-01T17:05:00.000Z';
+  const terminalAt = '2026-09-01T17:06:00.000Z';
+  const marker = buildManualFollowUpMarker({
+    enrolledAt: '2026-09-01T16:00:00.000Z',
+    enrolledBy: 'storage-admin',
+  });
+  const cases = [
+    {
+      name: 'reply',
+      submission: {},
+      request: { status: 'responded', request_state: 'responded', responded_at: terminalAt, follow_up_state: 'completed' },
+    },
+    {
+      name: 'stop',
+      submission: {},
+      request: { follow_up_state: 'stopped', metadata: { manualFollowUp: { ...marker, stoppedAt: terminalAt } } },
+    },
+    {
+      name: 'pass',
+      submission: { status: 'archived', metadata: { acquisitionCommand: { decision: 'pass' } } },
+      request: { follow_up_state: 'stopped' },
+    },
+    {
+      name: 'archive',
+      submission: { status: 'archived', archived_at: terminalAt },
+      request: { follow_up_state: 'stopped' },
+    },
+    {
+      name: 'materials',
+      submission: { prospectus_url: 'https://example.test/cim.pdf' },
+      request: { follow_up_state: 'stopped', metadata: { manualFollowUp: marker, terminalReason: 'materials-received' } },
+    },
+  ];
+
+  for (const entry of cases) {
+    const submissionId = `terminal-${entry.name}-submission`;
+    const requestId = `terminal-${entry.name}-request`;
+    await storage.insertSubmission(submission(submissionId, {
+      ...entry.submission,
+      updated_at: terminalAt,
+    }));
+    const storedRequest = await storage.upsertDealHunterCimRequest(cimClaimRequest({
+      id: requestId,
+      created_at: timestamp,
+      updated_at: terminalAt,
+      deal_key: `terminal-${entry.name}-deal`,
+      recipient_email: `terminal-${entry.name}@example.test`,
+      submission_id: submissionId,
+      status: 'sent',
+      request_state: 'provider_accepted',
+      delivery_state: 'accepted',
+      follow_up_state: 'stopped',
+      next_follow_up_at: null,
+      metadata: { manualFollowUp: marker },
+      ...entry.request,
+    }));
+    const communicationId = buildManualFollowUpCommunicationId({ requestId, followUpNumber: 1 });
+    await storage.insertCrmCommunication(communication({
+      id: communicationId,
+      submission_id: submissionId,
+      deal_key: storedRequest.deal_key,
+      cim_request_id: requestId,
+      direction: 'outbound',
+      kind: 'cim-follow-up',
+      provider_message_id: `terminal-${entry.name}-provider-message`,
+      source_event_id: null,
+      idempotency_key: `terminal-${entry.name}-idempotency`,
+      from_address: 'team@example.test',
+      to_addresses: [`terminal-${entry.name}@example.test`],
+      occurred_at: acceptedAt,
+      created_at: acceptedAt,
+      updated_at: acceptedAt,
+      delivery_state: 'accepted',
+      delivery_state_at: acceptedAt,
+      metadata: { followUpNumber: 1 },
+    }));
+    const finalized = await storage.finalizeDealHunterApprovedFollowUp({
+      requestId,
+      expectedRequestUpdatedAt: timestamp,
+      expectedSubmissionId: submissionId,
+      expectedFollowUpNumber: 1,
+      expectedCommunicationId: communicationId,
+      outcome: 'accepted',
+      acceptedAt,
+      nextFollowUpAt: nextManualFollowUpAt(acceptedAt),
+      activity: {
+        id: `terminal-${entry.name}-activity`,
+        submission_id: submissionId,
+        created_at: terminalAt,
+        actor: 'system',
+        role: 'system',
+        event_type: 'cim.follow-up-reconciled',
+        summary: `Accepted result preserved ${entry.name}.`,
+        metadata: { communicationId },
+      },
+    });
+    assert.equal(finalized.applied, true, entry.name);
+    assert.equal(finalized.request.follow_up_count, 1, entry.name);
+    assert.equal(finalized.request.next_follow_up_at, null, entry.name);
+    assert.ok(['stopped', 'completed'].includes(finalized.request.follow_up_state), entry.name);
+  }
 });

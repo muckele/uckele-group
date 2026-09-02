@@ -17,6 +17,11 @@ import {
   normalizeCanonicalCimRequestId,
   requireCanonicalCimRequestId,
 } from '../services/cimRequestIdPolicy.js';
+import {
+  isOperatorApprovedFollowUpRequest,
+  MANUAL_FOLLOW_UP_MAXIMUM,
+  MANUAL_FOLLOW_UP_MODE,
+} from '../services/dealHunterManualFollowUpPolicy.js';
 import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
 import {
   buildCanonicalOpportunityMergePlan,
@@ -318,6 +323,45 @@ function normalizeDealHunterCimRequestRow(row) {
         metadata: parseJsonColumn(row.metadata, {}),
       }
     : null;
+}
+
+function objectRecord(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function boundedManualFollowUpText(value, maximum = 500) {
+  return ['string', 'number', 'boolean'].includes(typeof value)
+    ? String(value).replace(/\s+/g, ' ').trim().slice(0, maximum)
+    : '';
+}
+
+function manualFollowUpMarker(request) {
+  return objectRecord(objectRecord(objectRecord(request).metadata).manualFollowUp);
+}
+
+function isMarkedManualFollowUpRequest(request) {
+  return manualFollowUpMarker(request).mode === MANUAL_FOLLOW_UP_MODE;
+}
+
+function isManualFollowUpTerminal(request, submission) {
+  const marker = manualFollowUpMarker(request);
+  return submission?.status === 'archived'
+    || Boolean(request?.responded_at)
+    || request?.request_state === 'responded'
+    || request?.status === 'responded'
+    || request?.status === 'delivery_issue'
+    || ['stopped', 'completed'].includes(request?.follow_up_state)
+    || Boolean(marker.stoppedAt || marker.stopped_at);
+}
+
+function manualFollowUpResult({ applied = false, reason = '', request = null, activity = null, alreadyFinalized = false } = {}) {
+  return {
+    applied: Boolean(applied),
+    reason: String(reason || ''),
+    request: request || null,
+    activity: activity || null,
+    alreadyFinalized: Boolean(alreadyFinalized),
+  };
 }
 
 function normalizeDealHunterCrmImportRow(row) {
@@ -3931,6 +3975,13 @@ export function createSqliteStorage(config) {
 	    nowIso,
 	  }) => {
 	    const current = database.prepare('SELECT * FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1').get(id);
+	    if (isMarkedManualFollowUpRequest(normalizeDealHunterCimRequestRow(current))) {
+	      return {
+	        claimed: false,
+	        reason: 'approval-required',
+	        request: normalizeDealHunterCimRequestRow(current),
+	      };
+	    }
 	    const submission = current?.submission_id
 	      ? database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1').get(current.submission_id)
 	      : null;
@@ -3968,6 +4019,414 @@ export function createSqliteStorage(config) {
 	      request: normalizeDealHunterCimRequestRow(row),
 	    };
 	  });
+
+  function loadManualFollowUpAuthority(requestId) {
+    const requestRow = database.prepare(`
+      SELECT * FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1
+    `).get(requestId);
+    const submissionRow = requestRow?.submission_id
+      ? database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1').get(requestRow.submission_id)
+      : null;
+    return {
+      requestRow,
+      request: normalizeDealHunterCimRequestRow(requestRow),
+      submissionRow,
+      submission: submissionRow ? normalizeSubmissionRow(submissionRow) : null,
+    };
+  }
+
+  const startDealHunterManualFollowUpsTransaction = database.transaction(({
+    requestId,
+    expectedRequestUpdatedAt,
+    expectedSubmissionId,
+    expectedSubmissionUpdatedAt,
+    marker,
+    nextFollowUpAt,
+    activity,
+  }) => {
+    const authority = loadManualFollowUpAuthority(requestId);
+    if (!authority.request) {
+      return manualFollowUpResult({ reason: 'request-missing' });
+    }
+    if (!authority.submission) {
+      return manualFollowUpResult({ reason: 'submission-missing', request: authority.request });
+    }
+    if (authority.request.updated_at !== expectedRequestUpdatedAt
+      || authority.request.submission_id !== expectedSubmissionId
+      || authority.submission.id !== expectedSubmissionId
+      || authority.submission.updated_at !== expectedSubmissionUpdatedAt) {
+      return manualFollowUpResult({ reason: 'authority-changed', request: authority.request });
+    }
+    const count = Number(authority.request.follow_up_count);
+    const existingMarker = manualFollowUpMarker(authority.request);
+    const eligible = authority.submission.status !== 'archived'
+      && authority.request.status === 'sent'
+      && authority.request.request_state === 'provider_accepted'
+      && ['accepted', 'delivered'].includes(authority.request.delivery_state)
+      && !authority.request.responded_at
+      && Number.isInteger(count)
+      && count >= 0
+      && count < MANUAL_FOLLOW_UP_MAXIMUM
+      && !authority.request.next_follow_up_at
+      && ['', 'not-scheduled'].includes(authority.request.follow_up_state || '')
+      && Object.keys(existingMarker).length === 0
+      && isOperatorApprovedFollowUpRequest({ metadata: { manualFollowUp: marker } })
+      && Number.isFinite(Date.parse(nextFollowUpAt || ''))
+      && activity?.submission_id === expectedSubmissionId;
+    if (!eligible) {
+      return manualFollowUpResult({ reason: 'not-eligible', request: authority.request });
+    }
+
+    const metadata = {
+      ...objectRecord(authority.request.metadata),
+      manualFollowUp: { ...marker },
+    };
+    const updatedAt = marker.enrolledAt;
+    const update = database.prepare(`
+      UPDATE deal_hunter_cim_requests
+      SET updated_at = ?, follow_up_state = 'scheduled', next_follow_up_at = ?, metadata = ?
+      WHERE id = ? AND updated_at = ? AND submission_id = ?
+    `).run(
+      updatedAt,
+      nextFollowUpAt,
+      JSON.stringify(metadata),
+      requestId,
+      expectedRequestUpdatedAt,
+      expectedSubmissionId,
+    );
+    if (update.changes !== 1) {
+      return manualFollowUpResult({
+        reason: 'authority-changed',
+        request: loadManualFollowUpAuthority(requestId).request,
+      });
+    }
+    const storedActivity = insertCrmActivityEvent(activity);
+    return manualFollowUpResult({
+      applied: true,
+      request: loadManualFollowUpAuthority(requestId).request,
+      activity: storedActivity,
+    });
+  });
+
+  const stopDealHunterManualFollowUpsTransaction = database.transaction(({
+    requestId,
+    expectedRequestUpdatedAt,
+    expectedSubmissionId,
+    expectedSubmissionUpdatedAt,
+    stoppedAt,
+    stoppedBy,
+    reason,
+    activity,
+  }) => {
+    const authority = loadManualFollowUpAuthority(requestId);
+    if (!authority.request) return manualFollowUpResult({ reason: 'request-missing' });
+    if (!authority.submission) {
+      return manualFollowUpResult({ reason: 'submission-missing', request: authority.request });
+    }
+    if (authority.request.updated_at !== expectedRequestUpdatedAt
+      || authority.request.submission_id !== expectedSubmissionId
+      || authority.submission.id !== expectedSubmissionId
+      || authority.submission.updated_at !== expectedSubmissionUpdatedAt) {
+      return manualFollowUpResult({ reason: 'authority-changed', request: authority.request });
+    }
+    const marker = manualFollowUpMarker(authority.request);
+    if (!isOperatorApprovedFollowUpRequest(authority.request)
+      || isManualFollowUpTerminal(authority.request, authority.submission)
+      || Number(authority.request.follow_up_count) >= MANUAL_FOLLOW_UP_MAXIMUM
+      || marker.stoppedAt
+      || !Number.isFinite(Date.parse(stoppedAt || ''))
+      || !boundedManualFollowUpText(stoppedBy, 300)
+      || activity?.submission_id !== expectedSubmissionId) {
+      return manualFollowUpResult({ reason: 'not-eligible', request: authority.request });
+    }
+    const metadata = {
+      ...objectRecord(authority.request.metadata),
+      manualFollowUp: {
+        ...marker,
+        stoppedAt,
+        stoppedBy: boundedManualFollowUpText(stoppedBy, 300),
+        stopReason: boundedManualFollowUpText(reason, 500),
+      },
+    };
+    const update = database.prepare(`
+      UPDATE deal_hunter_cim_requests
+      SET updated_at = ?, follow_up_state = 'stopped', next_follow_up_at = NULL, metadata = ?
+      WHERE id = ? AND updated_at = ? AND submission_id = ?
+    `).run(stoppedAt, JSON.stringify(metadata), requestId, expectedRequestUpdatedAt, expectedSubmissionId);
+    if (update.changes !== 1) {
+      return manualFollowUpResult({
+        reason: 'authority-changed',
+        request: loadManualFollowUpAuthority(requestId).request,
+      });
+    }
+    const storedActivity = insertCrmActivityEvent(activity);
+    return manualFollowUpResult({
+      applied: true,
+      request: loadManualFollowUpAuthority(requestId).request,
+      activity: storedActivity,
+    });
+  });
+
+  const claimDealHunterApprovedFollowUpTransaction = database.transaction(({
+    requestId,
+    expectedRequestUpdatedAt,
+    expectedSubmissionId,
+    expectedSubmissionUpdatedAt,
+    expectedFollowUpCount,
+    expectedFollowUpNumber,
+    expectedNextFollowUpAt,
+    claimedAt,
+  }) => {
+    const authority = loadManualFollowUpAuthority(requestId);
+    if (!authority.request) return manualFollowUpResult({ reason: 'request-missing' });
+    if (!authority.submission) {
+      return manualFollowUpResult({ reason: 'submission-missing', request: authority.request });
+    }
+    const count = Number(authority.request.follow_up_count);
+    const claimedTimestamp = Date.parse(claimedAt || '');
+    const dueTimestamp = Date.parse(authority.request.next_follow_up_at || '');
+    const eligible = authority.request.updated_at === expectedRequestUpdatedAt
+      && authority.request.submission_id === expectedSubmissionId
+      && authority.submission.id === expectedSubmissionId
+      && authority.submission.updated_at === expectedSubmissionUpdatedAt
+      && authority.submission.status !== 'archived'
+      && isOperatorApprovedFollowUpRequest(authority.request)
+      && !isManualFollowUpTerminal(authority.request, authority.submission)
+      && Number.isInteger(count)
+      && count === expectedFollowUpCount
+      && Number.isInteger(expectedFollowUpNumber)
+      && expectedFollowUpNumber >= 1
+      && expectedFollowUpNumber <= MANUAL_FOLLOW_UP_MAXIMUM
+      && expectedFollowUpNumber === count + 1
+      && authority.request.next_follow_up_at === expectedNextFollowUpAt
+      && Number.isFinite(dueTimestamp)
+      && Number.isFinite(claimedTimestamp)
+      && claimedTimestamp >= dueTimestamp
+      && ['scheduled', 'failed'].includes(authority.request.follow_up_state)
+      && ['sent', 'failed', 'follow_up_failed'].includes(authority.request.status)
+      && authority.request.request_state === 'provider_accepted';
+    if (!eligible) {
+      return manualFollowUpResult({ reason: 'claim-ineligible', request: authority.request });
+    }
+    const update = database.prepare(`
+      UPDATE deal_hunter_cim_requests
+      SET status = 'follow_up_pending', delivery_error = '', updated_at = ?
+      WHERE id = ? AND updated_at = ? AND submission_id = ?
+    `).run(claimedAt, requestId, expectedRequestUpdatedAt, expectedSubmissionId);
+    if (update.changes !== 1) {
+      return manualFollowUpResult({
+        reason: 'authority-changed',
+        request: loadManualFollowUpAuthority(requestId).request,
+      });
+    }
+    return manualFollowUpResult({
+      applied: true,
+      request: loadManualFollowUpAuthority(requestId).request,
+    });
+  });
+
+  const finalizeDealHunterApprovedFollowUpTransaction = database.transaction(({
+    requestId,
+    expectedRequestUpdatedAt,
+    expectedSubmissionId,
+    expectedFollowUpNumber,
+    expectedCommunicationId,
+    outcome,
+    acceptedAt,
+    nextFollowUpAt,
+    activity,
+  }) => {
+    const authority = loadManualFollowUpAuthority(requestId);
+    if (!authority.request) return manualFollowUpResult({ reason: 'request-missing' });
+    if (!authority.submission) {
+      return manualFollowUpResult({ reason: 'submission-missing', request: authority.request });
+    }
+    const communication = normalizeCrmCommunicationRow(database.prepare(`
+      SELECT * FROM crm_communications WHERE id = ? LIMIT 1
+    `).get(expectedCommunicationId));
+    const marker = manualFollowUpMarker(authority.request);
+    const acceptedTouches = Array.isArray(marker.acceptedTouches) ? marker.acceptedTouches : [];
+    const existingFollowUps = Array.isArray(authority.request.metadata?.followUps)
+      ? authority.request.metadata.followUps
+      : [];
+    const alreadyAccepted = acceptedTouches.some((touch) => (
+      Number(touch?.followUpNumber) === expectedFollowUpNumber
+      && touch?.communicationId === expectedCommunicationId
+    ));
+    if (alreadyAccepted) {
+      return manualFollowUpResult({
+        reason: 'already-finalized',
+        request: authority.request,
+        alreadyFinalized: true,
+      });
+    }
+    const previousAttempt = objectRecord(marker.currentAttempt);
+    if (outcome !== 'accepted'
+      && Number(previousAttempt.followUpNumber) === expectedFollowUpNumber
+      && previousAttempt.communicationId === expectedCommunicationId
+      && previousAttempt.outcome === outcome
+      && authority.request.updated_at !== expectedRequestUpdatedAt) {
+      return manualFollowUpResult({
+        reason: 'already-finalized',
+        request: authority.request,
+        alreadyFinalized: true,
+      });
+    }
+    const allowedOutcomes = new Set(['accepted', 'definitive-failure', 'ambiguous']);
+    const count = Number(authority.request.follow_up_count);
+    const communicationFollowUpNumber = Number(
+      communication?.metadata?.followUpNumber ?? communication?.metadata?.follow_up_number,
+    );
+    const commonEligible = allowedOutcomes.has(outcome)
+      && isOperatorApprovedFollowUpRequest(authority.request)
+      && authority.request.submission_id === expectedSubmissionId
+      && authority.submission.id === expectedSubmissionId
+      && Number.isInteger(expectedFollowUpNumber)
+      && expectedFollowUpNumber >= 1
+      && expectedFollowUpNumber <= MANUAL_FOLLOW_UP_MAXIMUM
+      && Number.isInteger(count)
+      && count === expectedFollowUpNumber - 1
+      && communication?.id === expectedCommunicationId
+      && communication?.cim_request_id === requestId
+      && communication?.submission_id === expectedSubmissionId
+      && communicationFollowUpNumber === expectedFollowUpNumber
+      && activity?.submission_id === expectedSubmissionId;
+    if (!commonEligible) {
+      return manualFollowUpResult({ reason: 'finalize-ineligible', request: authority.request });
+    }
+    if (outcome === 'accepted') {
+      if (!['accepted', 'delivered'].includes(communication.delivery_state)
+        || !Number.isFinite(Date.parse(acceptedAt || ''))
+        || (expectedFollowUpNumber < MANUAL_FOLLOW_UP_MAXIMUM && !Number.isFinite(Date.parse(nextFollowUpAt || '')))) {
+        return manualFollowUpResult({ reason: 'accepted-proof-missing', request: authority.request });
+      }
+    } else {
+      if (authority.request.updated_at !== expectedRequestUpdatedAt
+        || authority.request.status !== 'follow_up_pending'
+        || isManualFollowUpTerminal(authority.request, authority.submission)) {
+        return manualFollowUpResult({ reason: 'authority-changed', request: authority.request });
+      }
+      if (marker.currentAttempt?.outcome === 'ambiguous') {
+        return manualFollowUpResult({ reason: 'reconciliation-required', request: authority.request });
+      }
+      if (outcome === 'definitive-failure' && !['failed', 'bounced', 'complained', 'suppressed'].includes(communication.delivery_state)) {
+        return manualFollowUpResult({ reason: 'definitive-proof-missing', request: authority.request });
+      }
+      if (outcome === 'ambiguous' && !['ambiguous', 'unknown', 'provider-unknown'].includes(communication.delivery_state)) {
+        return manualFollowUpResult({ reason: 'ambiguous-proof-missing', request: authority.request });
+      }
+    }
+
+    const mutationAt = [authority.request.updated_at, activity?.created_at, acceptedAt]
+      .filter((value) => Number.isFinite(Date.parse(value || '')))
+      .sort()
+      .at(-1);
+    const currentAttempt = {
+      followUpNumber: expectedFollowUpNumber,
+      communicationId: expectedCommunicationId,
+      outcome,
+      originalDueAt: marker.currentAttempt?.originalDueAt || authority.request.next_follow_up_at || null,
+      updatedAt: mutationAt,
+    };
+    let metadata = {
+      ...objectRecord(authority.request.metadata),
+      manualFollowUp: {
+        ...marker,
+        currentAttempt,
+      },
+    };
+    let status = authority.request.status;
+    let requestState = authority.request.request_state;
+    let deliveryState = authority.request.delivery_state;
+    let followUpState = authority.request.follow_up_state;
+    let followUpCount = count;
+    let lastFollowUpAt = authority.request.last_follow_up_at;
+    let nextDueAt = authority.request.next_follow_up_at;
+
+    if (outcome === 'accepted') {
+      const terminal = isManualFollowUpTerminal(authority.request, authority.submission);
+      followUpCount += 1;
+      lastFollowUpAt = acceptedAt;
+      nextDueAt = terminal || expectedFollowUpNumber === MANUAL_FOLLOW_UP_MAXIMUM ? null : nextFollowUpAt;
+      followUpState = terminal
+        ? (authority.request.follow_up_state === 'completed' ? 'completed' : 'stopped')
+        : expectedFollowUpNumber === MANUAL_FOLLOW_UP_MAXIMUM
+          ? 'completed'
+          : 'scheduled';
+      status = ['responded', 'delivery_issue'].includes(authority.request.status) ? authority.request.status : 'sent';
+      requestState = authority.request.request_state === 'responded' ? 'responded' : 'provider_accepted';
+      deliveryState = ['bounced', 'complained', 'suppressed'].includes(authority.request.delivery_state)
+        ? authority.request.delivery_state
+        : 'accepted';
+      metadata = {
+        ...metadata,
+        followUps: [
+          ...existingFollowUps,
+          {
+            number: expectedFollowUpNumber,
+            attemptedAt: acceptedAt,
+            acceptedAt,
+            status: 'accepted',
+            communicationId: expectedCommunicationId,
+            providerMessageId: communication.provider_message_id || '',
+            error: '',
+          },
+        ],
+        manualFollowUp: {
+          ...metadata.manualFollowUp,
+          acceptedTouches: [
+            ...acceptedTouches,
+            {
+              followUpNumber: expectedFollowUpNumber,
+              communicationId: expectedCommunicationId,
+              acceptedAt,
+            },
+          ],
+          ...(expectedFollowUpNumber === MANUAL_FOLLOW_UP_MAXIMUM ? { completedAt: acceptedAt } : {}),
+        },
+      };
+    } else if (outcome === 'definitive-failure') {
+      status = 'follow_up_failed';
+      followUpState = 'failed';
+    } else {
+      status = 'follow_up_failed';
+      followUpState = 'ambiguous';
+      nextDueAt = null;
+    }
+
+    const update = database.prepare(`
+      UPDATE deal_hunter_cim_requests
+      SET updated_at = ?, status = ?, request_state = ?, delivery_state = ?,
+          follow_up_count = ?, last_follow_up_at = ?, next_follow_up_at = ?,
+          follow_up_state = ?, last_activity_at = ?, metadata = ?
+      WHERE id = ? AND submission_id = ?
+    `).run(
+      mutationAt,
+      status,
+      requestState,
+      deliveryState,
+      followUpCount,
+      lastFollowUpAt,
+      nextDueAt,
+      followUpState,
+      mutationAt,
+      JSON.stringify(metadata),
+      requestId,
+      expectedSubmissionId,
+    );
+    if (update.changes !== 1) {
+      return manualFollowUpResult({
+        reason: 'authority-changed',
+        request: loadManualFollowUpAuthority(requestId).request,
+      });
+    }
+    const storedActivity = insertCrmActivityEvent(activity);
+    return manualFollowUpResult({
+      applied: true,
+      request: loadManualFollowUpAuthority(requestId).request,
+      activity: storedActivity,
+    });
+  });
 	  const renewDealHunterCimRequestClaimStatement = database.prepare(`
 	    UPDATE deal_hunter_cim_requests SET
 	      updated_at = @now_iso
@@ -9188,6 +9647,111 @@ export function createSqliteStorage(config) {
 	        pendingCutoff: pendingCutoff || '',
 	      });
 	    },
+
+      async startDealHunterManualFollowUps({
+        requestId = '',
+        expectedRequestUpdatedAt = '',
+        expectedSubmissionId = '',
+        expectedSubmissionUpdatedAt = '',
+        marker = {},
+        nextFollowUpAt = '',
+        activity = null,
+      } = {}) {
+        if (!requestId || !expectedRequestUpdatedAt || !expectedSubmissionId
+          || !expectedSubmissionUpdatedAt || !nextFollowUpAt || !activity) {
+          return manualFollowUpResult({ reason: 'invalid-input' });
+        }
+        return startDealHunterManualFollowUpsTransaction.immediate({
+          requestId,
+          expectedRequestUpdatedAt,
+          expectedSubmissionId,
+          expectedSubmissionUpdatedAt,
+          marker,
+          nextFollowUpAt,
+          activity,
+        });
+      },
+
+      async stopDealHunterManualFollowUps({
+        requestId = '',
+        expectedRequestUpdatedAt = '',
+        expectedSubmissionId = '',
+        expectedSubmissionUpdatedAt = '',
+        stoppedAt = '',
+        stoppedBy = '',
+        reason = '',
+        activity = null,
+      } = {}) {
+        if (!requestId || !expectedRequestUpdatedAt || !expectedSubmissionId
+          || !expectedSubmissionUpdatedAt || !stoppedAt || !stoppedBy || !activity) {
+          return manualFollowUpResult({ reason: 'invalid-input' });
+        }
+        return stopDealHunterManualFollowUpsTransaction.immediate({
+          requestId,
+          expectedRequestUpdatedAt,
+          expectedSubmissionId,
+          expectedSubmissionUpdatedAt,
+          stoppedAt,
+          stoppedBy,
+          reason,
+          activity,
+        });
+      },
+
+      async claimDealHunterApprovedFollowUp({
+        requestId = '',
+        expectedRequestUpdatedAt = '',
+        expectedSubmissionId = '',
+        expectedSubmissionUpdatedAt = '',
+        expectedFollowUpCount = null,
+        expectedFollowUpNumber = null,
+        expectedNextFollowUpAt = '',
+        claimedAt = '',
+      } = {}) {
+        if (!requestId || !expectedRequestUpdatedAt || !expectedSubmissionId
+          || !expectedSubmissionUpdatedAt || !expectedNextFollowUpAt || !claimedAt
+          || !Number.isInteger(expectedFollowUpCount) || !Number.isInteger(expectedFollowUpNumber)) {
+          return manualFollowUpResult({ reason: 'invalid-input' });
+        }
+        return claimDealHunterApprovedFollowUpTransaction.immediate({
+          requestId,
+          expectedRequestUpdatedAt,
+          expectedSubmissionId,
+          expectedSubmissionUpdatedAt,
+          expectedFollowUpCount,
+          expectedFollowUpNumber,
+          expectedNextFollowUpAt,
+          claimedAt,
+        });
+      },
+
+      async finalizeDealHunterApprovedFollowUp({
+        requestId = '',
+        expectedRequestUpdatedAt = '',
+        expectedSubmissionId = '',
+        expectedFollowUpNumber = null,
+        expectedCommunicationId = '',
+        outcome = '',
+        acceptedAt = null,
+        nextFollowUpAt = null,
+        activity = null,
+      } = {}) {
+        if (!requestId || !expectedRequestUpdatedAt || !expectedSubmissionId
+          || !expectedCommunicationId || !Number.isInteger(expectedFollowUpNumber) || !activity) {
+          return manualFollowUpResult({ reason: 'invalid-input' });
+        }
+        return finalizeDealHunterApprovedFollowUpTransaction.immediate({
+          requestId,
+          expectedRequestUpdatedAt,
+          expectedSubmissionId,
+          expectedFollowUpNumber,
+          expectedCommunicationId,
+          outcome,
+          acceptedAt,
+          nextFollowUpAt,
+          activity,
+        });
+      },
 
 	    async claimDealHunterCimFollowUpRequest({ id = '', dueBefore = '', staleBefore = '', nowIso = '' } = {}) {
 	      if (!id || !dueBefore || !nowIso) {

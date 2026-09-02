@@ -83,6 +83,10 @@ const canonicalCurrentSemanticsMigrationUrl = new URL(
   '../supabase/migrations/20260827120000_canonical_opportunity_current_semantics.sql',
   import.meta.url,
 );
+const manualFollowUpAtomicityMigrationUrl = new URL(
+  '../supabase/migrations/20260901120000_deal_hunter_manual_follow_up_atomicity.sql',
+  import.meta.url,
+);
 
 function currentAppTables(schema) {
   return Array.from(
@@ -686,4 +690,117 @@ test('Supabase migration and fresh schema isolate every current app table to the
     );
   }
   assertServerOnlyPrivileges(schema, 'fresh schema');
+});
+
+test('manual follow-up RPC migration changes functions only and adds no table or column', () => {
+  // Break caught: Phase 3 persistence silently expands/backfills the database
+  // instead of remaining a function-only atomicity migration.
+  assert.equal(
+    fs.existsSync(manualFollowUpAtomicityMigrationUrl),
+    true,
+    'the deployable manual follow-up atomicity migration exists',
+  );
+  const migration = fs.existsSync(manualFollowUpAtomicityMigrationUrl)
+    ? fs.readFileSync(manualFollowUpAtomicityMigrationUrl, 'utf8')
+    : '';
+  assert.doesNotMatch(migration, /\b(?:create|alter|drop|truncate)\s+table\b/i);
+  assert.doesNotMatch(migration, /\b(?:add|drop)\s+column\b/i);
+  assert.doesNotMatch(migration, /\bcreate\s+(?:unique\s+)?index\b/i);
+  assert.doesNotMatch(migration, /\b(?:create|alter|drop)\s+type\b/i);
+  assert.deepEqual(
+    sqlFunctionDefinitions(migration).map(({ name }) => name).sort(),
+    [
+      'claim_deal_hunter_approved_follow_up',
+      'claim_deal_hunter_cim_follow_up_request',
+      'finalize_deal_hunter_approved_follow_up',
+      'start_deal_hunter_manual_follow_ups',
+      'stop_deal_hunter_manual_follow_ups',
+    ],
+  );
+});
+
+test('manual follow-up RPCs revoke public anon and authenticated and grant service_role only', () => {
+  // Break caught: any Phase 3 atomic authority function is callable outside
+  // the server's service-role boundary.
+  const migration = fs.existsSync(manualFollowUpAtomicityMigrationUrl)
+    ? fs.readFileSync(manualFollowUpAtomicityMigrationUrl, 'utf8')
+    : '';
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  const functionNames = [
+    'start_deal_hunter_manual_follow_ups',
+    'stop_deal_hunter_manual_follow_ups',
+    'claim_deal_hunter_approved_follow_up',
+    'finalize_deal_hunter_approved_follow_up',
+  ];
+  for (const [sourceLabel, sql] of [
+    ['manual follow-up atomicity migration', migration],
+    ['fresh schema', schema],
+  ]) {
+    for (const functionName of functionNames) {
+      assertServiceRoleOnlyFunction(sql, sourceLabel, functionName);
+      const definition = sqlFunctionDefinitions(sql).find(({ name }) => name === functionName)?.sql || '';
+      assert.match(definition, /security definer[\s\S]*?set search_path = public/i);
+    }
+  }
+});
+
+test('manual follow-up RPCs enforce marker count due version active submission and idempotent finalization', () => {
+  // Break caught: SQLite/Supabase parity can appear shape-correct while the
+  // database omits a material compare-and-set or exactly-once invariant.
+  const migration = fs.existsSync(manualFollowUpAtomicityMigrationUrl)
+    ? fs.readFileSync(manualFollowUpAtomicityMigrationUrl, 'utf8')
+    : '';
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
+  const names = [
+    'start_deal_hunter_manual_follow_ups',
+    'stop_deal_hunter_manual_follow_ups',
+    'claim_deal_hunter_approved_follow_up',
+    'finalize_deal_hunter_approved_follow_up',
+  ];
+
+  for (const name of names) {
+    const migrationFunction = sqlFunctionDefinitions(migration).find((item) => item.name === name)?.sql || '';
+    const schemaFunction = sqlFunctionDefinitions(schema).find((item) => item.name === name)?.sql || '';
+    assert.equal(normalize(schemaFunction), normalize(migrationFunction), `${name} schema/migration parity`);
+    assert.match(migrationFunction, /deal_hunter_cim_requests[\s\S]*?for update/i);
+    assert.match(migrationFunction, /contact_submissions[\s\S]*?for update/i);
+    assert.doesNotMatch(migrationFunction, /(?:maximumFollowUps|followUpNumber)'\)?::integer/i);
+  }
+
+  const start = sqlFunctionDefinitions(migration)
+    .find(({ name }) => name === 'start_deal_hunter_manual_follow_ups')?.sql || '';
+  assert.match(start, /expected_request_updated_at[\s\S]*?expected_submission_updated_at/i);
+  assert.match(start, /manualFollowUp[\s\S]*?operator-approved[\s\S]*?follow_up_state[\s\S]*?next_follow_up_at/i);
+  assert.match(start, /request_state\s+is\s+distinct\s+from\s+'provider_accepted'/i);
+  assert.match(start, /coalesce\(v_current\.delivery_state,\s*''\)\s+not\s+in\s*\('accepted',\s*'delivered'\)/i);
+  assert.match(start, /crm_activity_events/i);
+
+  const stop = sqlFunctionDefinitions(migration)
+    .find(({ name }) => name === 'stop_deal_hunter_manual_follow_ups')?.sql || '';
+  assert.match(stop, /follow_up_state\s*=\s*'stopped'[\s\S]*?next_follow_up_at\s*=\s*null/i);
+  assert.match(stop, /stoppedAt[\s\S]*?stoppedBy[\s\S]*?stopReason/i);
+  assert.match(stop, /crm_activity_events/i);
+
+  const claim = sqlFunctionDefinitions(migration)
+    .find(({ name }) => name === 'claim_deal_hunter_approved_follow_up')?.sql || '';
+  assert.match(claim, /manualFollowUp[\s\S]*?operator-approved/i);
+  assert.match(claim, /follow_up_count[\s\S]*?expected_follow_up_number[\s\S]*?next_follow_up_at/i);
+  assert.match(claim, /coalesce\(v_current\.follow_up_state,\s*''\)\s+not\s+in\s*\('scheduled',\s*'failed'\)/i);
+  assert.match(claim, /v_current\.request_state\s+is\s+distinct\s+from\s+'provider_accepted'/i);
+  assert.match(claim, /p_claimed_at\s*<\s*v_current\.next_follow_up_at/i);
+  assert.match(claim, /v_submission\.status\s*=\s*'archived'/i);
+
+  const finalize = sqlFunctionDefinitions(migration)
+    .find(({ name }) => name === 'finalize_deal_hunter_approved_follow_up')?.sql || '';
+  assert.match(finalize, /crm_communications[\s\S]*?expected_communication_id/i);
+  assert.match(finalize, /acceptedTouches[\s\S]*?alreadyFinalized/i);
+  assert.match(finalize, /currentAttempt[\s\S]*?communicationId[\s\S]*?already-finalized/i);
+  assert.match(finalize, /follow_up_count\s*=\s*(?:request\.)?follow_up_count\s*\+\s*1/i);
+  assert.match(finalize, /next_follow_up_at\s*=\s*case[\s\S]*?expected_follow_up_number\s*=\s*5\s+then\s+null/i);
+  assert.match(finalize, /crm_activity_events/i);
+
+  const legacyClaim = sqlFunctionDefinitions(migration)
+    .find(({ name }) => name === 'claim_deal_hunter_cim_follow_up_request')?.sql || '';
+  assert.match(legacyClaim, /manualFollowUp[\s\S]*?operator-approved[\s\S]*?approval-required/i);
 });
