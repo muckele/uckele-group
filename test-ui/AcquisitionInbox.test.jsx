@@ -254,6 +254,7 @@ describe('Acquisition Inbox dashboard entry', () => {
         });
       }
       if (url.startsWith('/api/admin/deal-hunter/triage?')) return jsonResponse(queueResponse());
+      if (url === '/api/admin/onboarding') return jsonResponse({ success: true, progress: [] });
       return jsonResponse({ success: false, error: `Unexpected request: ${url}` }, { ok: false, status: 404 });
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -267,12 +268,16 @@ describe('Acquisition Inbox dashboard entry', () => {
     expect(screen.getAllByText('Needs Review').length).toBeGreaterThan(0);
 
     await waitFor(() => {
-      expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
-        '/api/admin/session',
-        expect.stringMatching(/^\/api\/admin\/deal-hunter\/triage\?/),
-      ]);
+      expect(fetchMock.mock.calls.map(([url]) => String(url))).toContain('/api/admin/onboarding');
     });
-    expect(fetchMock.mock.calls.some(([url]) => /\/review|\/backfill-review|\/send|\/cim-|\/deal-os-import/.test(String(url)))).toBe(false);
+    const requestedUrls = fetchMock.mock.calls.map(([url]) => String(url));
+    expect(requestedUrls).toHaveLength(3);
+    expect(requestedUrls).toEqual(expect.arrayContaining([
+      '/api/admin/session',
+      expect.stringMatching(/^\/api\/admin\/deal-hunter\/triage\?/),
+      '/api/admin/onboarding',
+    ]));
+    expect(requestedUrls.some((url) => /\/review|\/backfill-review|\/send|\/cim-|\/deal-os-import/.test(url))).toBe(false);
   });
 });
 
@@ -1514,6 +1519,75 @@ describe('Acquisition Inbox Broker Materials authority', () => {
     await waitFor(() => expect(detailLoads).toBe(3));
     expect(calls.filter(({ url }) => url.endsWith('/broker-materials/approve'))).toHaveLength(approveCount);
     expect(calls.at(-1)).toEqual({ url: '/api/admin/deal-hunter/triage/opp-1', method: 'GET' });
+  });
+
+  test('Stop transport failure never claims permanent Stop when authoritative refresh remains scheduled', async () => {
+    const reconciliation = deferred();
+    const calls = [];
+    let detailLoads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      const method = options.method || 'GET';
+      calls.push({ url, method });
+      if (url.endsWith('/follow-ups/request-1/stop')) throw new TypeError('Network connection lost');
+      if (url.endsWith('/triage/opp-1')) {
+        detailLoads += 1;
+        if (detailLoads === 1) return jsonResponse(detailWithFollowUps(manualFollowUps({ state: 'scheduled' })));
+        return reconciliation.promise;
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop Follow-Up Sequence' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Permanently Stop' }));
+
+    expect(await screen.findByText('Stop outcome is unknown.')).toBeVisible();
+    expect(screen.getByRole('status')).toHaveTextContent('Checking Stop status.');
+    expect(screen.queryByText(/Future follow-ups are permanently stopped/i)).not.toBeInTheDocument();
+
+    await act(async () => reconciliation.resolve(jsonResponse(detailWithFollowUps(manualFollowUps({ state: 'scheduled' })))));
+    await waitFor(() => expect(screen.queryByText('Stop outcome is unknown.')).not.toBeInTheDocument());
+    expect(screen.getByText('Scheduled')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Stop Follow-Up Sequence' })).toBeEnabled();
+    expect(screen.queryByText(/Future follow-ups are permanently stopped/i)).not.toBeInTheDocument();
+    expect(calls.filter(({ url }) => url.endsWith('/follow-ups/request-1/stop'))).toHaveLength(1);
+    expect(calls.filter(({ url }) => url.endsWith('/triage/opp-1'))).toHaveLength(2);
+    expect(calls.filter(({ url }) => url.endsWith('/follow-ups/request-1/approve'))).toHaveLength(0);
+  });
+
+  test('explicit server outcome_unresolved Stop retains permanent-future-stop wording', async () => {
+    let detailLoads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/follow-ups/request-1/stop')) {
+        return jsonResponse({
+          success: false,
+          code: 'outcome_unresolved',
+          error: 'Future follow-ups are permanently stopped, but the provider-authorized current touch may still complete. Check status.',
+          followUps: manualFollowUps({ state: 'stopped', currentFollowUpNumber: null, nextFollowUpAt: '' }),
+        }, { ok: false, status: 503 });
+      }
+      if (url.endsWith('/triage/opp-1')) {
+        detailLoads += 1;
+        const projection = detailLoads === 1
+          ? manualFollowUps({ state: 'due' })
+          : manualFollowUps({ state: 'stopped', currentFollowUpNumber: null, nextFollowUpAt: '' });
+        return jsonResponse(detailWithFollowUps(projection));
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop Follow-Up Sequence' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Permanently Stop' }));
+
+    expect(await screen.findByText('Future follow-ups are stopped.')).toBeVisible();
+    expect(screen.getByText('The current follow-up outcome is still being checked.')).toBeVisible();
+    expect(screen.getByText('Stopped')).toBeVisible();
+    expect(screen.queryByText('Stop outcome is unknown.')).not.toBeInTheDocument();
   });
 
   test('Acquisition Inbox refreshes Phase 3 detail without background focus theft', async () => {

@@ -293,7 +293,7 @@ export default function BrokerMaterialsCard({
         readOnly={readOnly}
         sending={followUpState.sending}
         stale={followUpState.stale}
-        stopOutcomeUnresolved={followUpState.stopOutcomeUnresolved}
+        stopStatus={followUpState.stopStatus}
         updated={followUpState.updated}
         updating={followUpState.updating}
       /> : null}

@@ -20,7 +20,7 @@ const emptyBrokerMaterialsState = {
 };
 const emptyFollowUpState = {
   preparation: null, preparing: false, updating: false, sending: false,
-  checking: false, checkingFailed: false, stale: false, stopOutcomeUnresolved: false,
+  checking: false, checkingFailed: false, stale: false, stopStatus: '',
   updated: false, error: '',
 };
 
@@ -570,15 +570,17 @@ export default function AcquisitionInbox({ readOnly = false }) {
     const controller = new AbortController();
     const generation = followUpMutationRequestRef.current.generation + 1;
     followUpMutationRequestRef.current = { generation, controller };
-    setFollowUpState((current) => ({ ...current, checking: false, checkingFailed: false, error: '', stopOutcomeUnresolved: false, updated: false }));
+    setFollowUpState((current) => ({ ...current, checking: false, checkingFailed: false, error: '', stopStatus: '', updated: false }));
     let result = null;
     let responseOk = false;
+    let stopStatus = '';
     try {
       const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/follow-ups/${encodeURIComponent(requestId)}/${action}`, {
         method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: controller.signal,
       });
       result = await response.json();
       responseOk = response.ok && result.success;
+      stopStatus = action === 'stop' && result.code === 'outcome_unresolved' ? 'server-in-flight' : '';
       if (followUpMutationRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
       setFollowUpState((current) => ({
         ...current,
@@ -586,19 +588,20 @@ export default function AcquisitionInbox({ readOnly = false }) {
         checking: result.code === 'outcome_unresolved',
         checkingFailed: false,
         stale: false,
-        stopOutcomeUnresolved: action === 'stop' && result.code === 'outcome_unresolved',
+        stopStatus,
         updated: false,
         error: responseOk || result.code === 'outcome_unresolved' ? '' : result.error || `Unable to ${action} follow-ups.`,
       }));
     } catch (mutationError) {
       if (isAbortError(mutationError) || followUpMutationRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      stopStatus = action === 'stop' ? 'client-unknown' : '';
       setFollowUpState((current) => ({
         ...current,
         preparation: null,
         checking: action === 'stop',
         checkingFailed: false,
         stale: false,
-        stopOutcomeUnresolved: action === 'stop',
+        stopStatus,
         updated: false,
         error: action === 'stop' ? '' : mutationError.message || `Unable to ${action} follow-ups.`,
       }));
@@ -608,9 +611,10 @@ export default function AcquisitionInbox({ readOnly = false }) {
     if (followUpMutationRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
     setFollowUpState((current) => ({
       ...current,
-      checking: Boolean(current.stopOutcomeUnresolved && !refreshed),
-      checkingFailed: Boolean(current.stopOutcomeUnresolved && !refreshed),
-      error: refreshed ? current.error : current.stopOutcomeUnresolved ? '' : current.error || 'Unable to reload authoritative follow-up status.',
+      checking: Boolean(stopStatus && !refreshed),
+      checkingFailed: Boolean(stopStatus && !refreshed),
+      stopStatus: refreshed && stopStatus === 'client-unknown' ? '' : stopStatus,
+      error: refreshed ? current.error : stopStatus ? '' : current.error || 'Unable to reload authoritative follow-up status.',
     }));
     if (followUpMutationRequestRef.current.generation === generation) {
       followUpMutationRequestRef.current.controller = null;
@@ -634,7 +638,7 @@ export default function AcquisitionInbox({ readOnly = false }) {
       checking: false,
       checkingFailed: false,
       stale: false,
-      stopOutcomeUnresolved: false,
+      stopStatus: '',
       updated: false,
       error: '',
     }));
@@ -696,7 +700,7 @@ export default function AcquisitionInbox({ readOnly = false }) {
       checking: false,
       checkingFailed: false,
       stale: false,
-      stopOutcomeUnresolved: false,
+      stopStatus: '',
       updated: false,
       error: '',
     }));
@@ -757,7 +761,7 @@ export default function AcquisitionInbox({ readOnly = false }) {
       ...current,
       checking: !refreshed,
       checkingFailed: !refreshed,
-      stopOutcomeUnresolved: refreshed ? false : current.stopOutcomeUnresolved,
+      stopStatus: refreshed ? '' : current.stopStatus,
     }));
     return Boolean(refreshed);
   }

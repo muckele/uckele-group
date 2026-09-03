@@ -108,6 +108,33 @@ describe('Broker Materials Follow-Ups', () => {
     expect(screen.getByText('The broker has replied.')).toBeVisible();
   });
 
+  test('enrolled terminal-closed state renders its server-authoritative reason without start blockers', () => {
+    const terminalProjection = {
+      enrolled: true,
+      state: 'closed',
+      currentFollowUpNumber: null,
+      nextFollowUpAt: '',
+      startBlockers: [],
+      preparationBlockers: [],
+      sendBlockers: [],
+    };
+    const { rerender } = renderFollowUps({
+      followUps: followUps({ ...terminalProjection, terminalReason: 'reply_received' }),
+    });
+
+    expect(screen.getByText('Closed')).toBeVisible();
+    expect(screen.getByText('Broker replied.')).toBeVisible();
+    expect(screen.getByRole('status')).toHaveTextContent('Follow-up sequence closed. Broker replied.');
+    expect(screen.queryByRole('button', { name: /Start|Review|Stop|Retry|Approve/i })).not.toBeInTheDocument();
+
+    rerender(<BrokerMaterialsFollowUps followUps={followUps({ ...terminalProjection, terminalReason: 'materials_received' })} />);
+    expect(screen.getByText('Broker materials were received.')).toBeVisible();
+
+    rerender(<BrokerMaterialsFollowUps followUps={followUps({ ...terminalProjection, terminalReason: 'not_safe_for_display' })} />);
+    expect(screen.getByText('This request is closed to follow-ups.')).toBeVisible();
+    expect(screen.queryByText(/not_safe_for_display/i)).not.toBeInTheDocument();
+  });
+
   test('administrator can start and stop while viewer receives no mutation controls or approval authority', async () => {
     const onStart = vi.fn();
     const { rerender } = renderFollowUps({ followUps: followUps({ enrolled: false, state: 'not-enrolled', nextFollowUpAt: '', startEligible: true, startBlockers: [] }), onStart });

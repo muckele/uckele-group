@@ -15,6 +15,24 @@ const statePresentation = {
   closed: { badge: 'Closed', description: 'This request is closed to follow-ups.' },
 };
 
+const terminalReasonMessages = {
+  reply_received: 'Broker replied.',
+  materials_received: 'Broker materials were received.',
+  advanced_beyond_broker_outreach: 'This opportunity advanced beyond broker outreach.',
+  opportunity_passed: 'This opportunity was passed.',
+  crm_archived: 'The linked CRM opportunity is archived.',
+  recipient_suppressed: 'The recipient is suppressed from outreach.',
+  terminal_delivery: 'A delivery issue closed this follow-up sequence.',
+  outcome_unresolved: 'The current delivery outcome is unresolved.',
+  existing_follow_up_lifecycle: 'An existing follow-up lifecycle already owns this request.',
+  manual_follow_up_stopped: 'Follow-Ups stopped.',
+  follow_up_complete: 'Follow-up sequence complete.',
+};
+
+function terminalReasonMessage(reason) {
+  return terminalReasonMessages[String(reason || '')] || '';
+}
+
 function validTimestamp(value) {
   return Boolean(value && Number.isFinite(Date.parse(value)));
 }
@@ -51,11 +69,11 @@ function MessageList({ items, empty = '' }) {
   return <ul className="mt-2 space-y-2">{items.map((item, index) => <li className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900" key={`${item.code || item.message}-${index}`}>{item.message || item.code}</li>)}</ul>;
 }
 
-function lifecycleAnnouncement(followUps) {
+function lifecycleAnnouncement(followUps, terminalMessage = '') {
   const state = followUps?.state;
   if (state === 'completed') return 'Follow-up sequence completed.';
   if (state === 'stopped') return 'Follow-up sequence permanently stopped.';
-  if (state === 'closed') return 'Follow-up sequence closed.';
+  if (state === 'closed') return `Follow-up sequence closed.${terminalMessage ? ` ${terminalMessage}` : ''}`;
   if (state === 'scheduled') return `Follow-Up ${followUps.currentFollowUpNumber || ''} scheduled.`.replace('  ', ' ');
   if (state === 'due') return `Follow-Up ${followUps.currentFollowUpNumber || ''} is due.`.replace('  ', ' ');
   if (state === 'overdue') return `Follow-Up ${followUps.currentFollowUpNumber || ''} is overdue.`.replace('  ', ' ');
@@ -82,7 +100,7 @@ export default function BrokerMaterialsFollowUps({
   readOnly = false,
   sending = false,
   stale = false,
-  stopOutcomeUnresolved = false,
+  stopStatus = '',
   updated = false,
   updating = false,
 }) {
@@ -93,6 +111,7 @@ export default function BrokerMaterialsFollowUps({
   const stopButtonRef = useRef(null);
   const stopReasonRef = useRef(null);
   const errorRef = useRef(null);
+  const stopStatusRef = useRef(null);
   const approvalLockRef = useRef(false);
   const approvalAuthorityRef = useRef(preparation?.preparationToken || '');
   const actionRef = useRef('');
@@ -105,6 +124,8 @@ export default function BrokerMaterialsFollowUps({
   const [reviewClosed, setReviewClosed] = useState(false);
 
   const state = followUps?.state || 'not-enrolled';
+  const serverStopInFlight = stopStatus === 'server-in-flight';
+  const clientStopUnknown = stopStatus === 'client-unknown';
   const presentation = statePresentation[state] || statePresentation.closed;
   const review = reviewClosed ? null : preparation?.review;
   const message = review?.message;
@@ -120,11 +141,13 @@ export default function BrokerMaterialsFollowUps({
   const maximum = followUps?.maximumFollowUps || 5;
   const showReviewAction = !readOnly && !review && ['due', 'overdue', 'retry'].includes(state);
   const showViewerPreview = readOnly && !review && ['due', 'overdue', 'retry'].includes(state);
-  const canStop = !readOnly && followUps?.enrolled && ['scheduled', 'due', 'overdue', 'retry'].includes(state);
+  const canStop = !readOnly && !stopStatus && followUps?.enrolled && ['scheduled', 'due', 'overdue', 'retry'].includes(state);
   const mobileSticky = Boolean(review && !readOnly && !approvalInvalid);
   const terminalMessage = followUps?.startBlockers?.find((item) => item.code === followUps?.terminalReason)?.message
     || followUps?.startBlockers?.[0]?.message
-    || followUps?.preparationBlockers?.find((item) => item.code === followUps?.terminalReason)?.message;
+    || followUps?.preparationBlockers?.find((item) => item.code === followUps?.terminalReason)?.message
+    || followUps?.sendBlockers?.find((item) => item.code === followUps?.terminalReason)?.message
+    || terminalReasonMessage(followUps?.terminalReason);
   const effectiveError = localError || error;
   const preparationKey = preparation?.review ? [
     preparation.preparedAt,
@@ -135,12 +158,14 @@ export default function BrokerMaterialsFollowUps({
     preparation.review.message?.body,
   ].join('|') : '';
 
-  let announcement = lifecycleAnnouncement(followUps);
+  let announcement = lifecycleAnnouncement(followUps, terminalMessage);
   if (preparing || localBusy === 'prepare') announcement = 'Preparing follow-up review.';
   else if (updating || localBusy === 'update') announcement = 'Updating follow-up preview.';
   else if (updated) announcement = 'Follow-up preview updated.';
   else if (sending || localBusy === 'approve') announcement = 'Sending approved follow-up.';
-  else if (checking) announcement = checkingFailed
+  else if (checking) announcement = clientStopUnknown
+    ? 'Checking Stop status.'
+    : checkingFailed
     ? 'Authoritative follow-up status is still unavailable.'
     : 'Checking authoritative follow-up status.';
   else if (effectiveError) announcement = effectiveError;
@@ -178,6 +203,10 @@ export default function BrokerMaterialsFollowUps({
       setStopReason('');
     }
   }, [canStop, stopOpen]);
+
+  useEffect(() => {
+    if (clientStopUnknown && actionRef.current === 'stop') stopStatusRef.current?.focus();
+  }, [clientStopUnknown]);
 
   useEffect(() => {
     if (!effectiveError || !actionRef.current) return;
@@ -304,7 +333,8 @@ export default function BrokerMaterialsFollowUps({
       </dl>
 
       {state === 'closed' && terminalMessage ? <p className="mt-3 rounded-lg border border-line bg-fog/70 px-3 py-2 text-sm text-ink/68">{terminalMessage}</p> : null}
-      {stopOutcomeUnresolved ? <p className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">Future follow-ups are permanently stopped, but the provider-authorized current touch may still complete. Check status.</p> : null}
+      {serverStopInFlight ? <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"><p>Future follow-ups are stopped.</p><p className="mt-1">The current follow-up outcome is still being checked.</p></div> : null}
+      {clientStopUnknown ? <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900 outline-none" ref={stopStatusRef} tabIndex={-1}><p>Stop outcome is unknown.</p><p className="mt-1">Checking current follow-up status…</p></div> : null}
       {effectiveError ? <p className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 outline-none" ref={errorRef} role="alert" tabIndex={-1}>{effectiveError}</p> : null}
 
       {!review && blockers.length ? <MessageList items={blockers} /> : null}
@@ -314,7 +344,7 @@ export default function BrokerMaterialsFollowUps({
         {showReviewAction ? <button className={primaryButton} disabled={busy || followUps.preparationBlockers?.length > 0} onClick={() => runAction('prepare', onPrepare, {})} type="button">{state === 'retry' ? 'Review Retry' : 'Review Follow-Up'}</button> : null}
         {showViewerPreview ? <button className={secondaryButton} disabled={busy || followUps.preparationBlockers?.length > 0} onClick={() => runAction('prepare', onPrepare, {})} type="button">Preview Follow-Up</button> : null}
         {canStop ? <button className={`${secondaryButton} text-red-700`} disabled={busy} onClick={() => setStopOpen(true)} ref={stopButtonRef} type="button">Stop Follow-Up Sequence</button> : null}
-        {state === 'ambiguous' || checking || stopOutcomeUnresolved ? <button className={secondaryButton} disabled={!onCheckStatus || (checking && !checkingFailed)} onClick={onCheckStatus} type="button">{checkingFailed || state === 'ambiguous' ? 'Check Again' : 'Check Status'}</button> : null}
+        {state === 'ambiguous' || checking || stopStatus ? <button className={secondaryButton} disabled={!onCheckStatus || (checking && !checkingFailed)} onClick={onCheckStatus} type="button">{checkingFailed || state === 'ambiguous' ? 'Check Again' : 'Check Status'}</button> : null}
       </div>
 
       {stopOpen ? <div aria-label="Permanently stop follow-ups" aria-modal="true" className="mt-4 rounded-xl border border-red-200 bg-red-50 p-4" role="dialog">

@@ -382,6 +382,8 @@ function createPhase1FixtureState() {
       existingRequest: null,
       multipleContacts: false,
       approvalMode: 'success',
+      followUpStopMode: 'success',
+      followUpStopReconciliationPending: false,
       detailFailuresRemaining: 0,
       allowBrokerVerification: false,
     }])),
@@ -1064,6 +1066,11 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
           return;
         }
         state.followUpStopPayloads.push({ method, path, body });
+        if (fixture.followUpStopMode === 'unknown') {
+          fixture.followUpStopReconciliationPending = true;
+          await route.fulfill({ status: 200, contentType: 'application/json', body: '{malformed' });
+          return;
+        }
         fixture.existingRequest.followUps = phase3FollowUps({
           state: 'stopped', followUpCount: fixture.existingRequest.followUps.followUpCount,
           currentFollowUpNumber: null, nextFollowUpAt: '',
@@ -1369,6 +1376,10 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
       if (!opportunity) throw new Error(`Unexpected Phase 1 detail target: ${path}`);
       state.brokerDetailLoads[opportunityId] = (state.brokerDetailLoads[opportunityId] || 0) + 1;
       const fixture = state.brokerMaterialsByOpportunity[opportunityId];
+      if (fixture?.followUpStopReconciliationPending) {
+        fixture.followUpStopReconciliationPending = false;
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
       if (fixture?.detailFailuresRemaining > 0) {
         fixture.detailFailuresRemaining -= 1;
         await route.abort('failed');
@@ -2342,6 +2353,76 @@ test('Phase 3 automatic runner action cannot send a marked due follow-up', async
   expect(state.automaticFollowUpRuns).toBe(1);
   expect(state.followUpProviderCalls).toBe(0);
   expect(state.followUpApprovalCount).toBe(0);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Phase 3 Stop network uncertainty restores authoritative active state without claiming permanent Stop', async ({ page }, testInfo) => {
+  const consoleErrors = [];
+  const pageErrors = [];
+  page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  const fixture = state.brokerMaterialsByOpportunity['opp-cascade'];
+  fixture.existingRequest = phase3ExistingRequest({ followUps: phase3FollowUps({ state: 'scheduled' }) });
+  fixture.followUpStopMode = 'unknown';
+  const { card } = await openBrokerOpportunity(page);
+  const followUps = card.getByRole('region', { name: 'Follow-Ups' });
+  const detailLoadsBeforeStop = state.brokerDetailLoads['opp-cascade'];
+
+  await followUps.getByRole('button', { name: 'Stop Follow-Up Sequence' }).click();
+  await followUps.getByRole('button', { name: 'Permanently Stop' }).click();
+  const unknownStatus = followUps.getByText('Stop outcome is unknown.').locator('..');
+  await expect(unknownStatus).toBeVisible();
+  await expect(unknownStatus).toBeFocused();
+  await expect(followUps.getByRole('status')).toContainText('Checking Stop status.');
+  await page.screenshot({ path: testInfo.outputPath('phase3-stop-network-checking-desktop.png'), fullPage: false });
+
+  await expect(followUps.getByText('Scheduled', { exact: true })).toBeVisible();
+  await expect(followUps.getByText('Stop outcome is unknown.')).toHaveCount(0);
+  await expect(followUps.getByText(/Future follow-ups are (?:permanently )?stopped/i)).toHaveCount(0);
+  await expect(followUps.getByRole('button', { name: 'Stop Follow-Up Sequence' })).toBeEnabled();
+  await expect(followUps.getByRole('heading', { name: 'Follow-Ups' })).toBeFocused();
+  await expect.poll(() => state.brokerDetailLoads['opp-cascade']).toBe(detailLoadsBeforeStop + 1);
+  expect(state.followUpStopPayloads).toHaveLength(1);
+  expect(state.followUpApprovePayloads).toHaveLength(0);
+  expect(state.followUpApprovalCount).toBe(0);
+  expect(state.followUpProviderCalls).toBe(0);
+  await expect(page.locator('vite-error-overlay, [data-vite-dev-id]')).toHaveCount(0);
+  expect(consoleErrors).toEqual([]);
+  expect(pageErrors).toEqual([]);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Phase 3 enrolled terminal closure renders server reason without blocker duplication', async ({ page }, testInfo) => {
+  const mobileWidth = 390;
+  await page.setViewportSize({ width: mobileWidth, height: 844 });
+  const consoleErrors = [];
+  const pageErrors = [];
+  page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  state.brokerMaterialsByOpportunity['opp-cascade'].existingRequest = phase3ExistingRequest({
+    followUps: phase3FollowUps({
+      state: 'closed', terminalReason: 'reply_received', currentFollowUpNumber: null,
+      nextFollowUpAt: '', startBlockers: [], preparationBlockers: [], sendBlockers: [],
+    }),
+  });
+  const { card } = await openBrokerOpportunity(page);
+  const followUps = card.getByRole('region', { name: 'Follow-Ups' });
+
+  await expect(followUps.getByText('Closed', { exact: true })).toBeVisible();
+  await expect(followUps.getByText('Broker replied.', { exact: true })).toBeVisible();
+  await expect(followUps.getByRole('status')).toContainText('Follow-up sequence closed. Broker replied.');
+  await expect(followUps.getByRole('button', { name: /Start|Review|Stop|Retry|Approve/i })).toHaveCount(0);
+  const overflow = await page.evaluate(() => ({ clientWidth: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth }));
+  expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth);
+  await followUps.getByText('Broker replied.', { exact: true }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath('phase3-terminal-reason-mobile.png'), fullPage: false });
+  await expect(page.locator('vite-error-overlay, [data-vite-dev-id]')).toHaveCount(0);
+  expect(consoleErrors).toEqual([]);
+  expect(pageErrors).toEqual([]);
   expectBrokerRouteAuditClean(state);
 });
 
