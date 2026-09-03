@@ -324,4 +324,46 @@ describe('Opportunity drawer', () => {
     fireEvent.keyDown(selector, { key: 'Escape', code: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+
+  test('Opportunity Drawer preserves Escape order contact menu then review then drawer', () => {
+    const onClose = vi.fn();
+    const onFollowUpCloseReview = vi.fn();
+    const { rerender } = render(<OpportunityDrawer brokerMaterialsState={{ preparation: brokerPreparation() }} detail={detailFixture()} onBrokerMaterialsPrepare={vi.fn()} onClose={onClose} />);
+    const selector = screen.getByLabelText('Authoritative broker recipient');
+    fireEvent.mouseDown(selector);
+    fireEvent.keyDown(selector, { key: 'Escape', code: 'Escape' });
+    expect(onClose).not.toHaveBeenCalled();
+
+    const followUpDetail = detailFixture();
+    followUpDetail.brokerMaterials.existingRequest = {
+      id: 'request-1', status: 'sent', requestState: 'provider_accepted', deliveryState: 'accepted',
+      recipient: { email: 'jane@example.test', displayName: 'Jane Broker' },
+      followUps: {
+        enrolled: true, maximumFollowUps: 5, followUpCount: 0, currentFollowUpNumber: 1,
+        nextFollowUpAt: '2026-09-03T16:00:00.000Z', state: 'due', terminalReason: '',
+        retryEligible: false, preparationBlockers: [], sendBlockers: [],
+      },
+    };
+    const followUpPreparation = {
+      success: true, preparationToken: 'signed.follow-up', proposalDigest: 'b'.repeat(64),
+      preparedAt: '2026-09-03T16:01:00.000Z', expiresAt: '2099-09-03T16:16:00.000Z', sendBlockers: [],
+      review: {
+        mode: 'first-attempt', followUpNumber: 1, dueAt: '2026-09-03T16:00:00.000Z',
+        initialRequestedAt: '2026-09-01T16:00:00.000Z', previousAcceptedAt: '2026-09-01T16:01:00.000Z',
+        recipient: { displayName: 'Jane Broker', email: 'jane@example.test' },
+        sender: { displayName: 'Mathew Uckele', email: 'mathew@example.test' },
+        message: { greeting: 'Hello Jane,', greetingEditable: true, subject: 'Follow-up', body: 'Exact body.' },
+      },
+    };
+    rerender(<OpportunityDrawer detail={followUpDetail} followUpState={{ preparation: followUpPreparation }} onClose={onClose} onFollowUpCloseReview={onFollowUpCloseReview} />);
+    const body = screen.getByLabelText('Complete follow-up body');
+    body.focus();
+    fireEvent.keyDown(body, { key: 'Escape', code: 'Escape' });
+    expect(onFollowUpCloseReview).toHaveBeenCalledTimes(1);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText('Complete follow-up body')).not.toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByRole('dialog', { name: 'Evergreen Fire Protection' }), { key: 'Escape', code: 'Escape' });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
 });

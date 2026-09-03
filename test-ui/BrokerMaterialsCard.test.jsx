@@ -118,6 +118,31 @@ describe('Broker Materials card', () => {
     expect(within(card).queryByText(/CIM history|CRM communications|CIM communications/i)).not.toBeInTheDocument();
   });
 
+  test('Broker Materials card places Follow-Ups after the initial request lifecycle without duplicating history', () => {
+    render(<BrokerMaterialsCard
+      brokerMaterials={projection({
+        existingRequest: existingRequest({
+          followUps: {
+            enrolled: false, maximumFollowUps: 5, followUpCount: 0, currentFollowUpNumber: 1,
+            nextFollowUpAt: '', state: 'not-enrolled', terminalReason: '', startEligible: true,
+            startBlockers: [], preparationBlockers: [], sendBlockers: [],
+          },
+        }),
+      })}
+      businessName="Evergreen Fire Protection"
+      onFollowUpStart={vi.fn()}
+      onViewRequest={vi.fn()}
+    />);
+
+    const card = screen.getByRole('region', { name: 'Broker Materials' });
+    const initialStatus = within(card).getByLabelText('Broker Materials status: Sent');
+    const followUps = within(card).getByRole('region', { name: 'Follow-Ups' });
+    expect(initialStatus.compareDocumentPosition(followUps) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(followUps).getByText('Not Scheduled')).toBeVisible();
+    expect(within(card).queryByText(/CIM history|CRM communications|CIM communications/i)).not.toBeInTheDocument();
+    expect(within(card).getAllByRole('status')).toHaveLength(1);
+  });
+
   test('renders one continuous Prepared review in the required order with copyable exact subject and body', () => {
     render(<BrokerMaterialsCard brokerMaterials={projection()} onApprove={vi.fn()} onPrepare={vi.fn()} preparation={preparation()} />);
     const card = screen.getByRole('region', { name: 'Broker Materials' });
