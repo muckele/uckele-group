@@ -24,6 +24,7 @@ const {
 const { verifySignedPayload } = await import('../server/utils/security.js');
 const { getConfig } = await import('../server/config.js');
 const { buildManualFollowUpCommunicationId } = await import('../server/services/dealHunterManualFollowUpPolicy.js');
+const { projectDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
 
 const opportunityId = 'opp-task3-manual-follow-up';
 const requestId = 'request-task3-manual-follow-up';
@@ -55,6 +56,7 @@ function baseRequest(overrides = {}) {
     follow_up_count: 0, next_follow_up_at: null, last_follow_up_at: null, responded_at: null,
     first_provider_accepted_at: acceptedAt.toISOString(), subject: 'CIM / NDA request for Durable Services Co',
     deal_name: 'Durable Services Co', listing_url: 'https://broker.example.test/durable-services',
+    first_requested_at: new Date(acceptedAt.getTime() - 60_000).toISOString(),
     created_at: acceptedAt.toISOString(), updated_at: new Date(acceptedAt.getTime() + 1000).toISOString(),
     metadata: {
       initialCommunicationId: 'initial-communication-task3',
@@ -72,6 +74,25 @@ function manualMarker(overrides = {}) {
     enrolledAt: new Date(acceptedAt.getTime() + 2000).toISOString(), enrolledBy: administrator.username,
     ...overrides,
   };
+}
+
+function acceptedFollowUpCommunication(followUpNumber, firstProviderAcceptedAt, overrides = {}) {
+  return initialCommunication({
+    id: buildManualFollowUpCommunicationId({ requestId, followUpNumber }),
+    kind: 'deal-hunter-cim-follow-up',
+    provider_message_id: `resend-follow-up-${followUpNumber}`,
+    delivery_state: 'accepted',
+    delivery_state_at: firstProviderAcceptedAt,
+    occurred_at: firstProviderAcceptedAt,
+    created_at: firstProviderAcceptedAt,
+    updated_at: firstProviderAcceptedAt,
+    metadata: {
+      followUpNumber,
+      firstProviderAcceptedAt,
+      manualFollowUp: { firstProviderAcceptedAt },
+    },
+    ...overrides,
+  });
 }
 
 function markedRequest(overrides = {}) {
@@ -115,7 +136,7 @@ function task3Storage({ request = baseRequest(), communications = [initialCommun
     request,
     requests: [request],
     communications: [...communications],
-    dispositions: [], secureDocuments: [], latestUploadRequest: null, suppression: null,
+    dispositions: [], secureDocuments: [], latestUploadRequest: null, suppression: null, events: [],
     recipientClaim: null, opportunityClaim: null, safety: { outreach_paused: false, metadata: {} },
     calls: { start: 0, stop: 0, claim: 0, finalize: 0, provider: 0 },
   };
@@ -155,8 +176,8 @@ function task3Storage({ request = baseRequest(), communications = [initialCommun
       return { rows, total: rows.length };
     },
     async getCrmCommunication(id) { return state.communications.find((row) => row.id === id) || null; },
-    async listEmailEvents() { return []; },
-    async listEmailEventsByMessageIds() { return []; },
+    async listEmailEvents() { return state.events; },
+    async listEmailEventsByMessageIds() { return state.events; },
     async startDealHunterManualFollowUps(input) {
       state.calls.start += 1;
       state.request = { ...state.request, updated_at: input.marker.enrolledAt, follow_up_state: 'scheduled', next_follow_up_at: input.nextFollowUpAt, metadata: { ...state.request.metadata, manualFollowUp: input.marker } };
@@ -185,6 +206,84 @@ async function prepare(storage, options = {}) {
     ...options,
   });
 }
+
+test('detail emits authoritative not-enrolled follow-up projection for eligible accepted Phase 2 request', async () => {
+  const projection = await projectDealHunterBrokerMaterials({ opportunityId, storage: task3Storage(), now: new Date() });
+  assert.deepEqual(projection.existingRequest.followUps, {
+    enrolled: false,
+    policyVersion: '',
+    maximumFollowUps: 5,
+    followUpCount: 0,
+    currentFollowUpNumber: null,
+    nextFollowUpAt: '',
+    state: 'not-enrolled',
+    terminalReason: '',
+    retryEligible: false,
+    startEligible: true,
+    startBlockers: [],
+    preparationBlockers: [],
+    sendBlockers: [],
+  });
+});
+
+test('not-enrolled projection blocks Start with bounded reasons for terminal authority', async (t) => {
+  const cases = [
+    ['missing accepted proof', (storage) => { storage.state.communications = []; }, 'accepted_proof_missing'],
+    ['reply', (storage) => { storage.state.request.responded_at = new Date().toISOString(); storage.state.request.request_state = 'responded'; }, 'reply_received'],
+    ['materials', (storage) => { storage.state.secureDocuments = [{ id: 'cim', document_type: 'cim' }]; }, 'materials_received'],
+    ['pass', (storage) => { storage.state.dispositions = [{ id: 'pass', disposition: 'dismissed' }]; }, 'opportunity_passed'],
+    ['archive', (storage) => { storage.state.submission.status = 'archived'; }, 'crm_archived'],
+    ['suppression or complaint', (storage) => { storage.state.suppression = { id: 'suppression', reason: 'complaint' }; }, 'recipient_suppressed'],
+    ['ambiguity', (storage) => { storage.state.request.delivery_state = 'ambiguous'; }, 'outcome_unresolved'],
+    ['terminal delivery', (storage) => { storage.state.request.delivery_state = 'bounced'; }, 'terminal_delivery'],
+    ['stopped', (storage) => { storage.state.request.follow_up_state = 'stopped'; }, 'manual_follow_up_stopped'],
+    ['completed', (storage) => { storage.state.request.follow_up_count = 5; }, 'follow_up_complete'],
+  ];
+  for (const [name, mutate, expectedCode] of cases) {
+    await t.test(name, async () => {
+      const storage = task3Storage();
+      mutate(storage);
+      const projection = await projectDealHunterBrokerMaterials({ opportunityId, storage, now: new Date() });
+      const followUps = projection.existingRequest.followUps;
+      assert.equal(followUps.enrolled, false);
+      assert.equal(followUps.startEligible, false);
+      assert.equal(followUps.state, 'closed');
+      assert.equal(followUps.startBlockers.some(({ code }) => code === expectedCode), true);
+      for (const blocker of followUps.startBlockers) {
+        assert.match(blocker.code, /^[a-z0-9_-]{1,120}$/);
+        assert.ok(blocker.message.length > 0 && blocker.message.length <= 500);
+      }
+    });
+  }
+});
+
+test('not-enrolled legacy lifecycle is not exposed as Phase 3 Start eligible', async (t) => {
+  for (const request of [
+    baseRequest({ next_follow_up_at: dueNow.toISOString() }),
+    baseRequest({ metadata: { ...baseRequest().metadata, manualFollowUp: { version: 'legacy-v0' } } }),
+  ]) {
+    await t.test(request.next_follow_up_at ? 'legacy next timestamp' : 'legacy marker', async () => {
+      const projection = await projectDealHunterBrokerMaterials({ opportunityId, storage: task3Storage({ request }), now: new Date() });
+      assert.equal(projection.existingRequest.followUps.startEligible, false);
+      assert.equal(projection.existingRequest.followUps.state, 'closed');
+      assert.equal(projection.existingRequest.followUps.startBlockers.some(({ code }) => code === 'existing_follow_up_lifecycle'), true);
+    });
+  }
+});
+
+test('detail and Start service use the same manual follow-up Start eligibility authority', async () => {
+  const storage = task3Storage();
+  storage.state.request.responded_at = new Date().toISOString();
+  storage.state.request.request_state = 'responded';
+  const detail = await projectDealHunterBrokerMaterials({ opportunityId, storage, now: new Date() });
+  const start = await startDealHunterManualFollowUps({ opportunityId, requestId, session: administrator, storage, now: new Date(), dependencies });
+  const blocker = detail.existingRequest.followUps.startBlockers.find(({ code }) => code === 'reply_received');
+  assert.equal(detail.existingRequest.followUps.startEligible, false);
+  assert.equal(start.success, false);
+  assert.equal(start.code, 'blocked');
+  assert.equal(start.error, blocker.message);
+  assert.equal(storage.state.calls.start, 0);
+});
 
 test('Start Follow-Up Sequence requires administrator canonical request accepted proof and strict empty input', async () => {
   assert.deepEqual(parseManualFollowUpStartInput({}), {});
@@ -397,6 +496,156 @@ test('viewer preview ignores or rejects greeting input and advertises no editabl
   const administratorPreview = await prepare(storage, { greeting: 'Administrator greeting,' });
   assert.equal(administratorPreview.review.message.greeting, 'Administrator greeting,');
   assert.equal(administratorPreview.review.message.greetingEditable, true);
+});
+
+test('Prepare review exposes initialRequestedAt and previousAcceptedAt for Follow-Up 1', async () => {
+  const initialRequestedAt = '2026-08-20T16:45:00.000Z';
+  const initialAcceptedAt = '2026-08-20T17:02:03.000Z';
+  const request = markedRequest({
+    first_requested_at: initialRequestedAt,
+    first_provider_accepted_at: initialAcceptedAt,
+  });
+  const storage = task3Storage({
+    request,
+    communications: [initialCommunication({
+      delivery_state: 'delivered',
+      delivery_state_at: '2026-08-21T10:00:00.000Z',
+      metadata: { firstProviderAcceptedAt: initialAcceptedAt },
+    })],
+  });
+  for (const session of [administrator, viewer]) {
+    const result = await prepareDealHunterManualFollowUp({ opportunityId, requestId, session, storage, now: new Date(), dependencies });
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.review.followUpNumber, 1);
+    assert.equal(result.review.initialRequestedAt, initialRequestedAt);
+    assert.equal(result.review.previousAcceptedAt, initialAcceptedAt);
+  }
+});
+
+test('Prepare review exposes immediately preceding accepted touch for Follow-Ups 2 through 5', async (t) => {
+  const initialRequestedAt = '2026-08-01T15:00:00.000Z';
+  const touchTimes = [
+    '2026-08-03T16:00:00.000Z',
+    '2026-08-05T16:01:00.000Z',
+    '2026-08-07T16:02:00.000Z',
+    '2026-08-10T16:03:00.000Z',
+  ];
+  for (const followUpNumber of [2, 3, 4, 5]) {
+    await t.test(`N${followUpNumber}`, async () => {
+      const acceptedTouches = touchTimes.slice(0, followUpNumber - 1).map((acceptedAtValue, index) => ({
+        followUpNumber: index + 1,
+        communicationId: buildManualFollowUpCommunicationId({ requestId, followUpNumber: index + 1 }),
+        acceptedAt: acceptedAtValue,
+      }));
+      const request = markedRequest({
+        first_requested_at: initialRequestedAt,
+        follow_up_count: followUpNumber - 1,
+        metadata: {
+          ...baseRequest().metadata,
+          manualFollowUp: manualMarker({ acceptedTouches }),
+        },
+      });
+      const communications = [
+        initialCommunication(),
+        ...acceptedTouches.map((touch) => acceptedFollowUpCommunication(touch.followUpNumber, touch.acceptedAt)),
+      ];
+      const result = await prepare(task3Storage({ request, communications }));
+      assert.equal(result.success, true, result.error);
+      assert.equal(result.review.followUpNumber, followUpNumber);
+      assert.equal(result.review.initialRequestedAt, initialRequestedAt);
+      assert.equal(result.review.previousAcceptedAt, touchTimes[followUpNumber - 2]);
+    });
+  }
+});
+
+test('retry review previousAcceptedAt ignores failed current attempt', async () => {
+  const priorAcceptedAt = '2026-08-26T16:00:00.000Z';
+  const failedAt = '2026-08-28T16:00:00.000Z';
+  const failedId = buildManualFollowUpCommunicationId({ requestId, followUpNumber: 2 });
+  const request = markedRequest({
+    follow_up_count: 1,
+    follow_up_state: 'failed',
+    status: 'follow_up_failed',
+    metadata: {
+      ...baseRequest().metadata,
+      manualFollowUp: manualMarker({
+        acceptedTouches: [{
+          followUpNumber: 1,
+          communicationId: buildManualFollowUpCommunicationId({ requestId, followUpNumber: 1 }),
+          acceptedAt: priorAcceptedAt,
+        }],
+        currentAttempt: { followUpNumber: 2, communicationId: failedId, outcome: 'definitive-failure', originalDueAt: dueNow.toISOString() },
+      }),
+    },
+  });
+  const failed = acceptedFollowUpCommunication(2, failedAt, {
+    delivery_state: 'failed',
+    provider_message_id: null,
+    delivery_state_at: failedAt,
+    idempotency_key: `deal-hunter-cim-${requestId}-follow-up-2`,
+    from_address: 'buyer@example.test',
+    reply_to_address: `cim-${requestId.slice(0, 32)}@example.test`,
+    subject: 'Persisted retry subject',
+    body_text: 'Persisted retry body',
+    body_html_sanitized: '<p>Persisted retry body</p>',
+    metadata: {
+      followUpNumber: 2,
+      greeting: 'Hello Avery,',
+      templateVersion: 'deal-hunter-cim-follow-up-2-v1',
+      manualApproval: {
+        greeting: 'Hello Avery,', senderDisplayName: 'Mathew Uckele', senderEmail: 'buyer@example.test',
+        senderFrom: 'Mathew Uckele <buyer@example.test>', replyTo: `cim-${requestId.slice(0, 32)}@example.test`,
+      },
+    },
+  });
+  const result = await prepare(task3Storage({
+    request,
+    communications: [initialCommunication(), acceptedFollowUpCommunication(1, priorAcceptedAt), failed],
+  }));
+  assert.equal(result.success, true, result.error);
+  assert.equal(result.review.mode, 'exact-retry');
+  assert.equal(result.review.followUpNumber, 2);
+  assert.equal(result.review.previousAcceptedAt, priorAcceptedAt);
+  assert.notEqual(result.review.previousAcceptedAt, failedAt);
+});
+
+test('previousAcceptedAt uses immutable provider acceptance rather than later delivery timestamp', async () => {
+  const immutableAcceptedAt = '2026-08-26T16:00:00.000Z';
+  const laterDeliveredAt = '2026-08-27T19:30:00.000Z';
+  const request = markedRequest({
+    follow_up_count: 1,
+    metadata: {
+      ...baseRequest().metadata,
+      manualFollowUp: manualMarker({
+        acceptedTouches: [{
+          followUpNumber: 1,
+          communicationId: buildManualFollowUpCommunicationId({ requestId, followUpNumber: 1 }),
+          acceptedAt: immutableAcceptedAt,
+        }],
+      }),
+    },
+  });
+  const prior = acceptedFollowUpCommunication(1, immutableAcceptedAt, {
+    delivery_state: 'delivered',
+    delivery_state_at: laterDeliveredAt,
+    updated_at: laterDeliveredAt,
+    metadata: {
+      followUpNumber: 1,
+      firstProviderAcceptedAt: immutableAcceptedAt,
+      manualFollowUp: { firstProviderAcceptedAt: immutableAcceptedAt },
+    },
+  });
+  const result = await prepare(task3Storage({ request, communications: [initialCommunication(), prior] }));
+  assert.equal(result.success, true, result.error);
+  assert.equal(result.review.followUpNumber, 2);
+  assert.equal(result.review.previousAcceptedAt, immutableAcceptedAt);
+  assert.notEqual(result.review.previousAcceptedAt, laterDeliveredAt);
+
+  const disagreement = structuredClone(request);
+  disagreement.metadata.manualFollowUp.acceptedTouches[0].acceptedAt = '2026-08-26T16:00:01.000Z';
+  const rejected = await prepare(task3Storage({ request: disagreement, communications: [initialCommunication(), prior] }));
+  assert.equal(rejected.success, false);
+  assert.equal(rejected.code, 'preparation_authority_missing');
 });
 
 test('Prepare Follow-Up rejects early terminal ambiguous stopped completed and missing-authority states', async (t) => {

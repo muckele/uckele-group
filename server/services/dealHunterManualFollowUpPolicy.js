@@ -158,7 +158,13 @@ export function projectManualFollowUpState({
   const requestState = boundedText(safeRequest.request_state || safeRequest.requestState, 80).toLowerCase();
   const requestStatus = boundedText(safeRequest.status, 80).toLowerCase();
   const deliveryState = boundedText(safeRequest.delivery_state || safeRequest.deliveryState, 80).toLowerCase();
-  const terminalReason = boundedText(authority?.terminalReason, 160);
+  const hasStartAuthority = typeof authority?.startEligible === 'boolean';
+  const startEligible = hasStartAuthority && !enrolled && authority.startEligible;
+  const startBlockers = publicBlockers(authority?.startBlockers);
+  const terminalReason = boundedText(
+    authority?.terminalReason || (!enrolled && hasStartAuthority && !startEligible ? startBlockers[0]?.code : ''),
+    160,
+  );
   const communication = currentCommunication(communications, candidateFollowUpNumber);
   const communicationStatus = boundedText(communication?.status, 80).toLowerCase();
   const communicationDelivery = boundedText(communication?.delivery_state || communication?.deliveryState, 80).toLowerCase();
@@ -172,7 +178,9 @@ export function projectManualFollowUpState({
   );
 
   let state = 'not-enrolled';
-  if (enrolled) {
+  if (!enrolled && hasStartAuthority && !startEligible) {
+    state = 'closed';
+  } else if (enrolled) {
     if (terminalReason) state = 'closed';
     else if (authorityInvalid) state = 'closed';
     else if (followUpState === 'stopped' || marker.stoppedAt || marker.stopped_at) state = 'stopped';
@@ -207,6 +215,7 @@ export function projectManualFollowUpState({
     state,
     terminalReason,
     retryEligible: state === 'retry',
+    ...(hasStartAuthority ? { startEligible, startBlockers } : {}),
     preparationBlockers: publicBlockers([...invalidCountBlocker, ...(Array.isArray(authority?.preparationBlockers) ? authority.preparationBlockers : [])]),
     sendBlockers: publicBlockers(authority?.sendBlockers),
   };

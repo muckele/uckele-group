@@ -18,8 +18,15 @@ import {
   projectManualFollowUpState,
 } from './dealHunterManualFollowUpPolicy.js';
 import {
+  evaluateManualFollowUpStartEligibility,
+  loadManualFollowUpRequestEvents,
+  manualFollowUpHasAmbiguity,
+  manualFollowUpTerminalAuthority,
+} from './dealHunterManualFollowUpEligibility.js';
+import {
   buildDealHunterCimRequestId,
   evaluateDealHunterCimEligibility,
+  eventMatchesCimRequest,
   executeApprovedDealHunterCimRequest,
 } from './dealHunter.js';
 
@@ -244,17 +251,22 @@ function issueContactOptions({ opportunityId, contacts, secret }) {
   }).sort((left, right) => left.email.localeCompare(right.email) || left.provenance.localeCompare(right.provenance));
 }
 
+function selectCurrentRequest(records = []) {
+  return [...records].filter((item) => item?.id).sort((left, right) => (
+    (Date.parse(right.first_requested_at || right.firstRequestedAt || right.created_at || right.createdAt || '') || 0)
+    - (Date.parse(left.first_requested_at || left.firstRequestedAt || left.created_at || left.createdAt || '') || 0)
+    || String(left.id).localeCompare(String(right.id))
+  ))[0] || null;
+}
+
 function projectExistingRequest(records = [], {
   now = new Date(),
   terminalReason = '',
   materialsAuthorityAvailable = true,
   communications = [],
+  startEligibility = null,
 } = {}) {
-  const request = [...records].filter((item) => item?.id).sort((left, right) => (
-    (Date.parse(right.first_requested_at || right.firstRequestedAt || right.created_at || right.createdAt || '') || 0)
-    - (Date.parse(left.first_requested_at || left.firstRequestedAt || left.created_at || left.createdAt || '') || 0)
-    || String(left.id).localeCompare(String(right.id))
-  ))[0];
+  const request = selectCurrentRequest(records);
   if (!request) return null;
   const status = vocabulary(request.status, requestStatuses);
   const deliveryState = vocabulary(request.delivery_state || request.deliveryState, deliveryStates);
@@ -264,14 +276,20 @@ function projectExistingRequest(records = [], {
   const materialsAuthorityUnavailable = !terminalReason
     && !materialsAuthorityAvailable
     && isOperatorApprovedFollowUpRequest(request);
+  const publicStartEligibility = isOperatorApprovedFollowUpRequest(request) ? null : startEligibility;
+  const publicTerminalReason = publicStartEligibility && !publicStartEligibility.eligible
+    ? publicStartEligibility.blockers[0]?.code || terminalReason
+    : terminalReason;
   const followUps = projectManualFollowUpState({
     request,
     communications,
     authority: {
-      terminalReason: materialsAuthorityUnavailable ? 'materials-authority-unavailable' : terminalReason,
+      terminalReason: materialsAuthorityUnavailable ? 'materials-authority-unavailable' : publicTerminalReason,
       preparationBlockers: materialsAuthorityUnavailable
         ? [blocker('materials-authority-unavailable', 'Acquisition materials authority could not be verified.')]
         : [],
+      startEligible: publicStartEligibility?.eligible,
+      startBlockers: publicStartEligibility?.blockers,
     },
     now,
   });
@@ -293,7 +311,7 @@ function projectExistingRequest(records = [], {
     deliveredAt: iso(request.delivered_at || request.deliveredAt),
     respondedAt: iso(request.responded_at || request.respondedAt),
     errorSummary: safeRequestErrorSummary({ status, deliveryState }),
-    ...(followUps.enrolled ? { followUps } : {}),
+    ...(followUps.enrolled || publicStartEligibility ? { followUps } : {}),
     canRetry: preAcceptanceFailure,
     canCorrectRecipient: deliveryIssue,
     retryRoute: preAcceptanceFailure ? `/api/admin/deal-hunter/cim-requests/${encodeURIComponent(request.id)}/retry` : '',
@@ -508,16 +526,47 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   const recipientOptions = issueContactOptions({ opportunityId: id, contacts, secret: config.admin.sessionSecret });
   const state = pursuedState(score);
   const materialsState = evaluateAcquisitionMaterialsState({ submission, secureDocuments, latestUploadRequest });
-  const terminalReason = materialsState.materialsReceived
-    ? 'materials-received'
-    : materialsState.advancedBeyondBrokerOutreach
-      ? 'advanced-beyond-broker-outreach'
-      : '';
+  const currentRequest = selectCurrentRequest(requests);
+  const eventAuthority = currentRequest
+    ? await loadManualFollowUpRequestEvents(storage, currentRequest, eventMatchesCimRequest)
+    : { available: true, events: [] };
+  const suppressionAuthority = currentRequest?.recipient_email
+    ? await boundedAuthorityRead(storage, 'getActiveEmailSuppression', null, currentRequest.recipient_email)
+    : { available: true, value: null };
+  const currentDispositionState = currentDisposition(dispositions);
+  const followUpAuthority = {
+    request: currentRequest,
+    opportunity,
+    submission,
+    existingRequest: currentRequest ? { id: currentRequest.id } : null,
+    communications: communications.filter((item) => !currentRequest || item.cim_request_id === currentRequest.id),
+    events: eventAuthority.events,
+    materialsState,
+    currentDispositionState,
+    passed: currentDispositionState === 'dismissed',
+    suppression: suppressionAuthority.value,
+    routeCurrent: Boolean(
+      currentRequest
+      && currentRequest.opportunity_id === id
+      && currentRequest.submission_id === submission?.id
+      && opportunity.primary_submission_id === submission?.id
+      && text(opportunity.status, 80).toLowerCase() === 'active'
+    ),
+    authorityAvailable: materialsAuthorityAvailable
+      && communicationsAuthorityAvailable
+      && eventAuthority.available
+      && suppressionAuthority.available,
+  };
+  followUpAuthority.terminal = currentRequest ? manualFollowUpTerminalAuthority(followUpAuthority) : null;
+  followUpAuthority.ambiguous = currentRequest ? manualFollowUpHasAmbiguity(followUpAuthority) : false;
+  const startEligibility = currentRequest ? evaluateManualFollowUpStartEligibility(followUpAuthority) : null;
+  const terminalReason = followUpAuthority.terminal?.code || '';
   const existingRequest = projectExistingRequest(requests, {
     now: at,
     terminalReason,
     materialsAuthorityAvailable,
     communications,
+    startEligibility,
   });
   const manualEligibility = evaluateDealHunterCimEligibility({
     deal: {
@@ -535,7 +584,6 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   if (text(opportunity.status, 80).toLowerCase() !== 'active') preparationBlockers.push(blocker('canonical_authority_unavailable', 'The canonical opportunity is no longer current.'));
   if (!state.pursued) preparationBlockers.push(blocker(state.changed ? 'pursue_not_current' : 'not_pursued', state.changed ? 'The Pursue review is no longer current.' : 'Explicit current Pursue is required.'));
   if (score.should_remove) preparationBlockers.push(blocker('opportunity_not_actionable', 'The opportunity is removed or otherwise non-actionable.'));
-  const currentDispositionState = currentDisposition(dispositions);
   if (currentDispositionState === 'dismissed') preparationBlockers.push(blocker('opportunity_passed', 'The opportunity is currently Passed.'));
   if (trustedSourceRows.length === 0) preparationBlockers.push(blocker('required_source_authority_unavailable', 'Required current source authority is unavailable.'));
   if (submission && text(submission.status, 80).toLowerCase() === 'archived') preparationBlockers.push(blocker('crm_owner_archived', 'The linked CRM record is archived.'));
@@ -575,6 +623,10 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
     dispositions,
     currentDispositionState,
     communications,
+    events: eventAuthority.events,
+    eventAuthorityAvailable: eventAuthority.available,
+    suppression: suppressionAuthority.value,
+    suppressionAuthorityAvailable: suppressionAuthority.available,
     materialsState,
     materialsAuthorityAvailable,
     communicationsAuthorityAvailable,

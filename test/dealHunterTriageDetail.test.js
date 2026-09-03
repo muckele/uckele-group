@@ -1228,7 +1228,7 @@ test('Opportunity Detail exposes a bounded existing Broker Materials lifecycle w
   // card, while returning the row directly would leak provider internals.
   const { storage, opportunityId } = await detailStorage(t);
   const request = {
-    id: 'cim-bounded', opportunity_id: opportunityId, status: 'delivery_issue', request_state: 'provider_accepted',
+    id: 'cim-bounded', opportunity_id: opportunityId, submission_id: 'submission-detail', status: 'delivery_issue', request_state: 'provider_accepted',
     delivery_state: 'bounced', follow_up_state: 'not-scheduled', recipient_email: 'sheet-broker@example.test',
     subject: 'CIM / NDA request for Detail Services Co', created_at: '2026-08-31T15:00:00.000Z',
     updated_at: '2026-08-31T16:00:00.000Z', first_requested_at: '2026-08-31T15:00:00.000Z',
@@ -1243,7 +1243,15 @@ test('Opportunity Detail exposes a bounded existing Broker Materials lifecycle w
     subject: 'CIM / NDA request for Detail Services Co', createdAt: '2026-08-31T15:00:00.000Z',
     updatedAt: '2026-08-31T16:00:00.000Z', requestedAt: '2026-08-31T15:00:00.000Z',
     providerAcceptedAt: '2026-08-31T15:01:00.000Z', deliveredAt: '', respondedAt: '',
-    errorSummary: 'Delivery failed.', canRetry: false, canCorrectRecipient: true,
+    errorSummary: 'Delivery failed.',
+    followUps: {
+      enrolled: false, policyVersion: '', maximumFollowUps: 5, followUpCount: 0,
+      currentFollowUpNumber: null, nextFollowUpAt: '', state: 'closed',
+      terminalReason: 'request_not_current', retryEligible: false, startEligible: false,
+      startBlockers: [{ code: 'request_not_current', message: 'The canonical CIM request is not current.' }],
+      preparationBlockers: [], sendBlockers: [],
+    },
+    canRetry: false, canCorrectRecipient: true,
     retryRoute: '', correctionRoute: `/api/admin/deal-hunter/cim-requests/cim-bounded/correct-recipient`,
   });
   assert.equal(JSON.stringify(projected).includes('provider-secret'), false);

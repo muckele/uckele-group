@@ -24,6 +24,17 @@ import {
   nextManualFollowUpAt,
   projectManualFollowUpState,
 } from './dealHunterManualFollowUpPolicy.js';
+import {
+  evaluateManualFollowUpStartEligibility,
+  findManualFollowUpCommunication as findFollowUpCommunication,
+  findManualFollowUpInitialCommunication as findInitialCommunication,
+  loadManualFollowUpRequestEvents as loadRequestEvents,
+  manualFollowUpCommunicationNumber as communicationFollowUpNumber,
+  manualFollowUpHasAmbiguity as hasAmbiguity,
+  manualFollowUpInitialRequestedAt,
+  manualFollowUpPreviousAcceptedAt,
+  manualFollowUpTerminalAuthority as authorityTerminal,
+} from './dealHunterManualFollowUpEligibility.js';
 import { buildDealHunterCimFollowUpEmail } from './delivery.js';
 import { getEmailReadiness } from './emailReadiness.js';
 
@@ -31,8 +42,6 @@ export const MANUAL_FOLLOW_UP_PREPARATION_TYPE = 'deal-hunter-manual-follow-up-p
 
 const preparationLifetimeMs = 15 * 60 * 1000;
 const replyEventTypes = new Set(['received', 'replied']);
-const terminalDeliveryStates = new Set(['bounced', 'failed', 'complained', 'suppressed']);
-const ambiguousStates = new Set(['ambiguous', 'unknown', 'provider_unknown', 'provider_ambiguous', 'follow_up_ambiguous']);
 const approvedManualFollowUpCapabilities = new WeakSet();
 
 export function consumeDealHunterManualFollowUpCapability(candidate) {
@@ -148,10 +157,6 @@ function activity({ request, actor, eventType, summary, createdAt, metadata = {}
   };
 }
 
-function communicationFollowUpNumber(communication = {}) {
-  return Number(communication?.metadata?.followUpNumber ?? communication?.metadata?.follow_up_number ?? 0);
-}
-
 function communicationVersion(communication) {
   if (!communication) return null;
   return {
@@ -176,99 +181,13 @@ function communicationVersion(communication) {
   };
 }
 
-function communicationBelongsToConversation(communication, request) {
-  const recipients = (Array.isArray(communication?.to_addresses) ? communication.to_addresses : [communication?.to_addresses])
-    .map(email).filter(Boolean);
-  return communication?.direction === 'outbound'
-    && communication?.cim_request_id === request?.id
-    && communication?.submission_id === request?.submission_id
-    && recipients.length === 1
-    && recipients[0] === email(request?.recipient_email);
-}
-
-function acceptedCommunicationProof(communication) {
-  if (!communication || communication.direction !== 'outbound') return null;
-  const state = text(communication.delivery_state, 80).toLowerCase().replaceAll('_', '-');
-  const provider = text(communication.provider, 80).toLowerCase();
-  const providerId = text(communication.provider_message_id, 240);
-  const accepted = ['accepted', 'delivered', 'delayed', 'bounced', 'failed', 'complained', 'suppressed', 'replied'].includes(state)
-    && (Boolean(providerId) || provider === 'emailjs');
-  if (!accepted) return null;
-  return {
-    acceptedAt: iso(communication.delivery_state_at || communication.updated_at || communication.occurred_at || communication.created_at),
-    state,
-  };
-}
-
 function eventType(event) {
   return text(event?.event_type, 80).toLowerCase().replace(/^email[._-]/, '').replace(/[._-]/g, '_');
-}
-
-async function loadRequestEvents(storage, request) {
-  const messageIds = [
-    request.provider_message_id,
-    ...(Array.isArray(request.metadata?.providerMessageIds) ? request.metadata.providerMessageIds : []),
-  ].map((value) => text(value, 240)).filter(Boolean);
-  const batches = [];
-  if (typeof storage.listEmailEvents !== 'function' && typeof storage.listEmailEventsByMessageIds !== 'function') {
-    return { available: false, events: [] };
-  }
-  if (messageIds.length > 0 && storage.listEmailEventsByMessageIds) batches.push(storage.listEmailEventsByMessageIds(messageIds, 1000));
-  if (request.recipient_email && storage.listEmailEvents) batches.push(storage.listEmailEvents({ recipientEmail: request.recipient_email, limit: 500 }));
-  try {
-    return { available: true, events: (await Promise.all(batches)).flat().filter((event) => eventMatchesCimRequest(event, request)) };
-  } catch {
-    return { available: false, events: [] };
-  }
 }
 
 function defaultGreeting(authority) {
   const name = text(authority.request?.metadata?.brokerName || authority.submission?.broker_name, 120).split(' ')[0];
   return name ? `Hello ${name},` : 'Hello,';
-}
-
-function findInitialCommunication(authority) {
-  const requestedId = text(authority.request?.metadata?.initialCommunicationId, 200);
-  return authority.communications.find((item) => item.id === requestedId)
-    || authority.communications.find((item) => item.cim_request_id === authority.request.id && item.kind === 'deal-hunter-cim-request')
-    || null;
-}
-
-function findFollowUpCommunication(authority, followUpNumber) {
-  const expectedId = buildManualFollowUpCommunicationId({ requestId: authority.request.id, followUpNumber });
-  return authority.communications.find((item) => item.id === expectedId)
-    || authority.communications.find((item) => item.cim_request_id === authority.request.id && communicationFollowUpNumber(item) === followUpNumber)
-    || null;
-}
-
-function authorityTerminal(authority) {
-  const request = authority.request;
-  const marker = objectValue(request?.metadata?.manualFollowUp);
-  const states = [request?.status, request?.request_state, request?.delivery_state, request?.follow_up_state]
-    .map((value) => text(value, 80).toLowerCase());
-  if (authority.replyEvent || request?.responded_at || states.includes('responded')) return { code: 'reply_received', message: 'The broker has replied.' };
-  if (authority.materialsState?.materialsReceived) return { code: 'materials_received', message: 'Acquisition materials have been received.' };
-  if (authority.materialsState?.advancedBeyondBrokerOutreach) return { code: 'advanced_beyond_broker_outreach', message: 'The opportunity has advanced beyond initial broker-material outreach.' };
-  if (authority.passed) return { code: 'opportunity_passed', message: 'The opportunity is currently Passed.' };
-  if (text(authority.submission?.status, 80).toLowerCase() === 'archived') return { code: 'crm_archived', message: 'The linked CRM record is archived.' };
-  if (authority.suppression) return { code: 'recipient_suppressed', message: 'The durable recipient is globally suppressed.' };
-  const initialDeliveryState = text(findInitialCommunication(authority)?.delivery_state, 80).toLowerCase();
-  if (!isOperatorApprovedFollowUpRequest(request) && terminalDeliveryStates.has(initialDeliveryState)) {
-    return { code: 'terminal_delivery', message: 'The durable initial conversation has a terminal delivery state.' };
-  }
-  if (terminalDeliveryStates.has(text(request?.delivery_state, 80).toLowerCase())) return { code: 'terminal_delivery', message: 'The durable recipient has a terminal delivery state.' };
-  if (marker.stoppedAt || marker.stopped_at || request?.follow_up_state === 'stopped') return { code: 'manual_follow_up_stopped', message: 'Manual follow-ups were stopped.' };
-  return null;
-}
-
-function hasAmbiguity(authority) {
-  const request = authority.request;
-  const values = [request?.status, request?.request_state, request?.delivery_state, request?.follow_up_state]
-    .map((value) => text(value, 80).toLowerCase());
-  const number = getManualFollowUpNumber(request);
-  const communication = number ? findFollowUpCommunication(authority, number) : null;
-  return values.some((value) => ambiguousStates.has(value))
-    || ambiguousStates.has(text(communication?.delivery_state, 80).toLowerCase());
 }
 
 function requestBelongsToRoute(authority, opportunityId, requestId) {
@@ -280,7 +199,6 @@ function requestBelongsToRoute(authority, opportunityId, requestId) {
     && text(authority.opportunity?.status, 80).toLowerCase() === 'active'
     && authority.submission
     && authority.request.submission_id === authority.submission.id
-    && text(authority.submission.status, 80).toLowerCase() !== 'archived'
     && authority.opportunity?.primary_submission_id === authority.submission.id,
   );
 }
@@ -311,7 +229,7 @@ export async function loadDealHunterManualFollowUpAuthority({
     const page = await storage.listCrmCommunications({ submissionId: request.submission_id, page: 1, pageSize: 100 });
     communications.push(...(page?.rows || []).filter((item) => item.cim_request_id === request.id));
   }
-  const eventAuthority = request ? await loadRequestEvents(storage, request) : { available: true, events: [] };
+  const eventAuthority = request ? await loadRequestEvents(storage, request, eventMatchesCimRequest) : { available: true, events: [] };
   const events = eventAuthority.events;
   const replyEvent = events.find((event) => replyEventTypes.has(eventType(event))) || null;
   const dispositions = Array.isArray(brokerAuthority.dispositions) ? brokerAuthority.dispositions : [];
@@ -362,6 +280,8 @@ export async function loadDealHunterManualFollowUpAuthority({
   };
   authority.terminal = request ? authorityTerminal(authority) : null;
   authority.ambiguous = request ? hasAmbiguity(authority) : false;
+  authority.routeCurrent = requestBelongsToRoute(authority, canonicalOpportunityId, canonicalRequestId);
+  authority.authorityAvailable = !criticalAuthorityUnavailable(authority);
   return authority;
 }
 
@@ -406,41 +326,17 @@ function routeFailure() {
   return publicFailure('request_not_found', 'The canonical CIM request does not belong to this opportunity.', 404);
 }
 
-function enrollmentFailure(authority) {
-  const request = authority.request;
-  if (authority.terminal) return publicFailure('blocked', authority.terminal.message);
-  if (authority.ambiguous) return publicFailure('outcome_unresolved', 'The current provider outcome must be reconciled before follow-ups can be enrolled.');
-  if (request.follow_up_count >= 5) return publicFailure('already_finalized', 'The follow-up sequence is already complete.');
-  if (request.metadata?.manualFollowUp || request.next_follow_up_at || !['', 'not-scheduled'].includes(request.follow_up_state || '')) {
-    return publicFailure('sequence_already_active', 'This request already has follow-up lifecycle authority.');
-  }
-  const manualApproval = objectValue(request.metadata?.manualApproval);
-  if (manualApproval.intent !== 'manual_stage_1' || manualApproval.followUpPolicy !== 'none') {
-    return publicFailure('initial_approval_authority_missing', 'Only an accepted Phase 2 manual request can start this sequence.');
-  }
-  const initial = findInitialCommunication(authority);
-  const previous = Number(request.follow_up_count || 0) > 0
-    ? findFollowUpCommunication(authority, Number(request.follow_up_count))
-    : initial;
-  if (!communicationBelongsToConversation(previous, request) || !acceptedCommunicationProof(previous)) {
-    return publicFailure('accepted_proof_missing', 'Durable provider acceptance proof is required before enrollment.');
-  }
-  return null;
-}
-
 export async function startDealHunterManualFollowUps({
   opportunityId = '', requestId = '', input = {}, session = {}, storage = getStorage(), now = new Date(), dependencies = {},
 } = {}) {
   try { parseManualFollowUpStartInput(input); } catch (error) { return publicFailure('invalid_start_input', error.message, 400); }
   if (!isAdministrator(session)) return publicFailure('administrator_required', 'Administrator access is required.', 403);
   const authority = await loadDealHunterManualFollowUpAuthority({ opportunityId, requestId, storage, now, dependencies });
-  if (!requestBelongsToRoute(authority, text(opportunityId, 200), text(requestId, 200))) return routeFailure(authority);
-  if (criticalAuthorityUnavailable(authority)) return publicFailure('authority_unavailable', 'Current follow-up authority could not be verified.', 503);
-  const blocked = enrollmentFailure(authority);
-  if (blocked) return blocked;
-  const count = Number(authority.request.follow_up_count || 0);
-  const previous = count > 0 ? findFollowUpCommunication(authority, count) : findInitialCommunication(authority);
-  const acceptedAt = acceptedCommunicationProof(previous).acceptedAt;
+  const eligibility = evaluateManualFollowUpStartEligibility(authority);
+  if (!eligibility.eligible) {
+    return publicFailure(eligibility.failure.code, eligibility.failure.message, eligibility.failure.status);
+  }
+  const acceptedAt = eligibility.acceptedAt;
   const nextFollowUpAt = nextManualFollowUpAt(acceptedAt);
   if (!nextFollowUpAt) return publicFailure('accepted_proof_missing', 'The preceding acceptance time is invalid.');
   const enrolledAt = authority.now.toISOString();
@@ -680,6 +576,8 @@ function reviewForProposal(authority, proposal, { greetingEditable = false } = {
     mode: proposal.retry ? 'exact-retry' : 'first-attempt',
     followUpNumber: proposal.material.followUpNumber,
     dueAt: proposal.material.nextFollowUpAt,
+    initialRequestedAt: manualFollowUpInitialRequestedAt(authority.request),
+    previousAcceptedAt: manualFollowUpPreviousAcceptedAt(authority, proposal.material.followUpNumber),
     recipient: { email: proposal.material.recipientEmail, displayName: text(authority.request.metadata?.brokerName, 160) },
     sender: proposal.sender,
     message: {
@@ -720,6 +618,9 @@ export async function prepareDealHunterManualFollowUp({
   });
   if (!proposal) return publicFailure('preparation_authority_missing', 'Exact communication authority is unavailable.');
   const review = reviewForProposal(authority, proposal, { greetingEditable: session.role === 'admin' });
+  if (!review.initialRequestedAt || !review.previousAcceptedAt) {
+    return publicFailure('preparation_authority_missing', 'Exact communication chronology authority is unavailable.');
+  }
   const sendBlockers = currentSendBlockers(authority);
   if (session.role !== 'admin') {
     return { success: true, status: 200, previewOnly: true, review, followUps: projection(authority, { sendBlockers }), sendBlockers };
