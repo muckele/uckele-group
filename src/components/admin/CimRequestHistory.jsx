@@ -85,7 +85,12 @@ function addressList(value) {
 
 function exactCommunicationLabel(communication, index) {
   const kind = normalizeState(valueFrom(communication, 'kind'));
-  if (kind.includes('follow-up')) return `CIM follow-up ${Math.max(1, index - 1)}`;
+  const metadata = valueFrom(communication, 'metadata');
+  const authoritativeFollowUpNumber = Number(valueFrom(communication, 'follow_up_number', 'followUpNumber')
+    ?? valueFrom(metadata, 'follow_up_number', 'followUpNumber'));
+  if (kind.includes('follow-up')) {
+    return `CIM follow-up ${Number.isInteger(authoritativeFollowUpNumber) && authoritativeFollowUpNumber > 0 ? authoritativeFollowUpNumber : Math.max(1, index - 1)}`;
+  }
   if (kind.includes('request')) return 'Initial CIM request';
   return index === 1 ? 'Initial CIM request' : `CIM email ${index}`;
 }

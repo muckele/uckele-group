@@ -124,6 +124,27 @@ describe('CimRequestHistory', () => {
     expect(document.querySelector('script')).toBeNull();
   });
 
+  test('CIM Request History renders deterministic Follow-Up four and five communications', () => {
+    render(<CimRequestHistory
+      query={defaultQuery}
+      requests={[{
+        ...bouncedRequest,
+        communications: [
+          { id: 'initial', direction: 'outbound', kind: 'deal-hunter-cim-request', subject: 'Initial', body_text: 'Initial body.' },
+          { id: 'five', direction: 'outbound', kind: 'deal-hunter-cim-follow-up', follow_up_number: 5, subject: 'Fifth', body_text: 'Exact fifth follow-up.' },
+          { id: 'four', direction: 'outbound', kind: 'deal-hunter-cim-follow-up', metadata: { followUpNumber: 4 }, subject: 'Fourth', body_text: 'Exact fourth follow-up.' },
+        ],
+      }]}
+    />);
+
+    fireEvent.click(screen.getByText('View exact sent emails (3)'));
+    expect(screen.getByRole('heading', { name: 'CIM follow-up 4' })).toBeVisible();
+    expect(screen.getByRole('heading', { name: 'CIM follow-up 5' })).toBeVisible();
+    expect(screen.queryByRole('heading', { name: 'CIM follow-up 1' })).not.toBeInTheDocument();
+    expect(screen.getByText('Exact fourth follow-up.')).toBeVisible();
+    expect(screen.getByText('Exact fifth follow-up.')).toBeVisible();
+  });
+
   test('offers corrected-recipient retry only to administrators for delivery issues', () => {
     const onRetryCorrectedRecipient = vi.fn();
     const { rerender } = render(

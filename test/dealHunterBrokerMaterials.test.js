@@ -1,6 +1,107 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+test('manual approval enters the existing single-request durable executor only through trusted approved context', async () => {
+  const dealHunter = await import('../server/services/dealHunter.js');
+  assert.equal(typeof dealHunter.executeDealHunterCimFollowUpRequest, 'function');
+  let storageReads = 0;
+  const invalid = await dealHunter.executeDealHunterCimFollowUpRequest({
+    request: { id: 'marked-request', metadata: { manualFollowUp: { mode: 'operator-approved' } } },
+    approvedContext: {
+      preparationToken: 'a forged browser artifact',
+      approvedProposalDigest: 'c'.repeat(64),
+    },
+    storage: new Proxy({}, { get() { storageReads += 1; return async () => null; } }),
+    now: new Date('2026-09-01T18:00:00.000Z'),
+  });
+  assert.equal(invalid.status, 'approval-required');
+  assert.equal(storageReads, 0);
+});
+
+test('structurally forged approved context cannot enter marked executor or call provider', async () => {
+  // Break caught: matching every public field of the approved context can
+  // currently authorize the marked executor without a signed approval.
+  const dealHunter = await import('../server/services/dealHunter.js');
+  const { buildManualFollowUpCommunicationId } = await import('../server/services/dealHunterManualFollowUpPolicy.js');
+  const request = {
+    id: 'forged-context-request',
+    opportunity_id: 'forged-context-opportunity',
+    submission_id: 'forged-context-submission',
+    deal_key: 'forged-context-deal',
+    recipient_email: 'broker@example.test',
+    status: 'sent',
+    request_state: 'provider_accepted',
+    delivery_state: 'accepted',
+    follow_up_state: 'scheduled',
+    follow_up_count: 0,
+    next_follow_up_at: '2026-09-01T17:00:00.000Z',
+    updated_at: '2026-09-01T16:00:00.000Z',
+    metadata: {
+      manualFollowUp: {
+        version: 'deal-hunter-manual-follow-up-v1',
+        mode: 'operator-approved',
+        maximumFollowUps: 5,
+        cadencePolicy: 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1',
+        enrolledAt: '2026-09-01T15:00:00.000Z',
+        enrolledBy: 'forged-server-caller',
+      },
+    },
+  };
+  const communicationId = buildManualFollowUpCommunicationId({ requestId: request.id, followUpNumber: 1 });
+  const counters = { requestClaim: 0, recipientClaim: 0, communicationWrite: 0, providerCall: 0 };
+  const storage = {
+    async getDealHunterCimRequestById() { return request; },
+    async claimDealHunterApprovedFollowUp() { counters.requestClaim += 1; return { applied: false, request }; },
+    async claimDealHunterCimRecipient() { counters.recipientClaim += 1; return { claimed: false }; },
+    async getCrmCommunication() { return null; },
+    async insertCrmCommunication() { counters.communicationWrite += 1; return null; },
+  };
+  const forged = {
+    type: 'deal-hunter-manual-follow-up-approved-context-v1',
+    canonicalOpportunityId: request.opportunity_id,
+    canonicalDealKey: request.deal_key,
+    requestId: request.id,
+    expectedRequestUpdatedAt: request.updated_at,
+    expectedSubmissionId: request.submission_id,
+    expectedSubmissionUpdatedAt: '2026-09-01T15:00:00.000Z',
+    expectedFollowUpCount: 0,
+    followUpNumber: 1,
+    expectedNextFollowUpAt: request.next_follow_up_at,
+    actor: 'forged-server-caller',
+    sender: {
+      displayName: 'Mathew Uckele',
+      email: 'buyer@example.test',
+      from: 'Mathew Uckele <buyer@example.test>',
+      replyTo: 'replies@example.test',
+    },
+    message: {
+      kind: 'deal-hunter-cim-follow-up',
+      communicationId,
+      idempotencyKey: `deal-hunter-cim-${request.id}-follow-up-1`,
+      from: 'Mathew Uckele <buyer@example.test>',
+      to: ['broker@example.test'],
+      replyTo: 'replies@example.test',
+      subject: 'Exact forged subject',
+      text: 'Arbitrary valid-looking message bytes',
+      html: '<p>Arbitrary valid-looking message bytes</p>',
+      templateVersion: 'deal-hunter-cim-follow-up-1-v1',
+    },
+  };
+
+  const result = await dealHunter.executeDealHunterCimFollowUpRequest({
+    request,
+    approvedContext: forged,
+    storage,
+    now: new Date('2026-09-01T18:00:00.000Z'),
+    dependencies: {
+      async sendPreparedMessage() { counters.providerCall += 1; return { status: 'sent', providerMessageId: 'forbidden' }; },
+    },
+  });
+
+  assert.equal(result.status, 'approval-required');
+  assert.deepEqual(counters, { requestClaim: 0, recipientClaim: 0, communicationWrite: 0, providerCall: 0 });
+});
+
 import { getConfig } from '../server/config.js';
 import {
   BROKER_MATERIALS_TEMPLATE_VERSION,
@@ -39,7 +140,10 @@ const boundedCimRequestKeys = [
 ].sort();
 
 function assertBoundedCimRequest(request) {
-  assert.deepEqual(Object.keys(request).sort(), boundedCimRequestKeys);
+  const expectedKeys = request.followUps
+    ? [...boundedCimRequestKeys, 'followUps'].sort()
+    : boundedCimRequestKeys;
+  assert.deepEqual(Object.keys(request).sort(), expectedKeys);
   assert.deepEqual(Object.keys(request.recipient).sort(), ['displayName', 'email']);
   for (const rawKey of [
     'metadata',
@@ -92,6 +196,8 @@ function authorityStorage(overrides = {}) {
       id: 'submission-1', status: 'active', company: 'Durable Services Co', broker_name: 'CRM Broker',
       broker_email: '', updated_at: '2026-08-31T17:00:00.000Z', metadata: {},
     },
+    secureDocuments: [],
+    latestUploadRequest: null,
     requests: [],
     opportunityClaim: null,
     recipientClaims: new Map(),
@@ -108,6 +214,8 @@ function authorityStorage(overrides = {}) {
     async listDealHunterOpportunityFacts() { return state.facts; },
     async listDealHunterOpportunitySourceObservations() { return state.sources; },
     async getSubmission() { return state.submission; },
+    async listSecureDocumentsForSubmission() { return state.secureDocuments; },
+    async getLatestSecureUploadRequestForSubmission() { return state.latestUploadRequest; },
     async listDealHunterCimRequests({ opportunityIds = [], dealKeys = [], recipientEmails = [] } = {}) {
       return state.requests.filter((request) => (
         (!opportunityIds.length || opportunityIds.includes(request.opportunity_id))
@@ -122,6 +230,34 @@ function authorityStorage(overrides = {}) {
     async getActiveEmailSuppression() { return state.suppression; },
     async getDealHunterCimSafetySettings() { return state.safety; },
     async getBrokerMaterialsEmailReadiness() { return state.readiness; },
+  };
+}
+
+function markedFollowUpRequest(overrides = {}) {
+  return {
+    id: 'request-manual-follow-up',
+    opportunity_id: opportunityId,
+    submission_id: 'submission-1',
+    status: 'sent',
+    request_state: 'provider_accepted',
+    delivery_state: 'accepted',
+    follow_up_state: 'failed',
+    follow_up_count: 0,
+    next_follow_up_at: '2026-09-01T16:00:00.000Z',
+    recipient_email: 'source-broker@example.test',
+    created_at: '2026-08-31T17:40:00.000Z',
+    updated_at: '2026-09-01T17:41:00.000Z',
+    metadata: {
+      manualFollowUp: {
+        version: 'deal-hunter-manual-follow-up-v1',
+        mode: 'operator-approved',
+        maximumFollowUps: 5,
+        cadencePolicy: 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1',
+        enrolledAt: '2026-09-01T16:00:00.000Z',
+        enrolledBy: 'admin@example.test',
+      },
+    },
+    ...overrides,
   };
 }
 
@@ -328,6 +464,124 @@ test('projected broker materials exposes current Pursue, bounded lifecycle, warn
   for (const secret of ['secret-provider-id', 'providerPayload', 'signature']) assert.equal(serialized.includes(secret), false);
 });
 
+test('canonical CIM owner uses stable first-request order across claim maintenance and deterministic ties', async (t) => {
+  // Break caught: operational updated_at writes from claiming or renewing an
+  // older request can replace the newer business conversation owner.
+  const request = ({ id, requestedAt, updatedAt, recipient }) => ({
+    id,
+    opportunity_id: opportunityId,
+    submission_id: 'submission-1',
+    deal_key: 'deal-42',
+    recipient_email: recipient,
+    status: 'sent',
+    request_state: 'provider_accepted',
+    delivery_state: 'accepted',
+    follow_up_state: 'not-scheduled',
+    follow_up_count: 0,
+    created_at: requestedAt,
+    first_requested_at: requestedAt,
+    first_provider_accepted_at: requestedAt,
+    updated_at: updatedAt,
+    metadata: {},
+  });
+  const oldRequestedAt = '2026-08-31T17:40:00.000Z';
+  const newRequestedAt = '2026-08-31T17:45:00.000Z';
+  const oldId = 'request-old-owner';
+  const newId = 'request-new-owner';
+  const old = request({ id: oldId, requestedAt: oldRequestedAt, updatedAt: oldRequestedAt, recipient: 'old-owner@example.test' });
+  const current = request({ id: newId, requestedAt: newRequestedAt, updatedAt: newRequestedAt, recipient: 'new-owner@example.test' });
+
+  const ownerFor = async (requests) => (
+    await loadBrokerMaterialsAuthority({ opportunityId, storage: authorityStorage({ requests }), now })
+  ).existingRequest?.id;
+
+  await t.test('ordinary unmarked Phase 2 requests select the newer first request', async () => {
+    assert.equal(await ownerFor([old, current]), newId);
+  });
+
+  await t.test('an old request claim acquisition cannot make it current', async () => {
+    assert.equal(await ownerFor([
+      { ...old, status: 'follow_up_pending', updated_at: '2026-08-31T17:50:00.000Z' },
+      current,
+    ]), newId);
+  });
+
+  await t.test('an old request claim renewal cannot make it current', async () => {
+    assert.equal(await ownerFor([
+      { ...old, status: 'follow_up_pending', updated_at: '2026-08-31T18:00:00.000Z' },
+      current,
+    ]), newId);
+  });
+
+  await t.test('renewing the current request keeps the current request', async () => {
+    assert.equal(await ownerFor([
+      old,
+      { ...current, status: 'follow_up_pending', updated_at: '2026-08-31T18:05:00.000Z' },
+    ]), newId);
+  });
+
+  await t.test('equal first-request timestamps use the existing ascending request-id tie-breaker', async () => {
+    assert.equal(await ownerFor([
+      request({ id: 'request-b', requestedAt: newRequestedAt, updatedAt: '2026-08-31T18:10:00.000Z', recipient: 'b@example.test' }),
+      request({ id: 'request-a', requestedAt: newRequestedAt, updatedAt: '2026-08-31T17:50:00.000Z', recipient: 'a@example.test' }),
+    ]), 'request-a');
+  });
+});
+
+test('broker materials detail exposes bounded public manual follow-up projection without raw metadata', async () => {
+  const privateSentinel = 'private-manual-follow-up-authority';
+  const storage = authorityStorage({
+    requests: [{
+      id: 'request-manual-follow-up',
+      opportunity_id: opportunityId,
+      submission_id: 'submission-1',
+      status: 'sent',
+      request_state: 'provider_accepted',
+      delivery_state: 'accepted',
+      follow_up_state: 'scheduled',
+      follow_up_count: 2,
+      next_follow_up_at: '2026-09-03T16:00:00.000Z',
+      recipient_email: 'source-broker@example.test',
+      created_at: '2026-08-31T17:40:00.000Z',
+      updated_at: '2026-09-01T17:41:00.000Z',
+      metadata: {
+        privateSentinel,
+        manualApproval: { signature: privateSentinel },
+        manualFollowUp: {
+          version: 'deal-hunter-manual-follow-up-v1',
+          mode: 'operator-approved',
+          maximumFollowUps: 5,
+          cadencePolicy: 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1',
+          enrolledAt: '2026-09-01T16:00:00.000Z',
+          enrolledBy: privateSentinel,
+        },
+      },
+    }],
+  });
+
+  const projection = await projectDealHunterBrokerMaterials({
+    opportunityId,
+    storage,
+    now: new Date('2026-09-02T17:00:00.000Z'),
+  });
+
+  assert.deepEqual(projection.existingRequest.followUps, {
+    enrolled: true,
+    policyVersion: 'deal-hunter-manual-follow-up-v1',
+    maximumFollowUps: 5,
+    followUpCount: 2,
+    currentFollowUpNumber: 3,
+    nextFollowUpAt: '2026-09-03T16:00:00.000Z',
+    state: 'scheduled',
+    terminalReason: '',
+    retryEligible: false,
+    preparationBlockers: [],
+    sendBlockers: [],
+  });
+  assert.equal(JSON.stringify(projection.existingRequest).includes(privateSentinel), false);
+  assertBoundedCimRequest(projection.existingRequest);
+});
+
 test('critical authority read failures fail closed without issuing a preparation token', async (t) => {
   const cases = [
     ['persisted Pass authority', 'listDealHunterDispositions'],
@@ -344,6 +598,60 @@ test('critical authority read failures fail closed without issuing a preparation
       assert.equal(result.status, 503);
       assert.equal(result.code, 'broker_materials_authority_unavailable');
       assert.equal(Object.hasOwn(result, 'preparationToken'), false);
+    });
+  }
+});
+
+test('marked follow-up projection fails closed when secure-document authority cannot be read', async (t) => {
+  const privateSentinel = 'private-secure-document-read-error';
+  for (const [name, configure] of [
+    ['thrown read', (storage) => { storage.listSecureDocumentsForSubmission = async () => { throw new Error(privateSentinel); }; }],
+    ['missing capability', (storage) => { delete storage.listSecureDocumentsForSubmission; }],
+  ]) {
+    await t.test(name, async () => {
+      const storage = authorityStorage({ requests: [markedFollowUpRequest()] });
+      configure(storage);
+      const projection = await projectDealHunterBrokerMaterials({
+        opportunityId,
+        storage,
+        now: new Date('2026-09-02T17:00:00.000Z'),
+      });
+
+      assert.equal(projection.existingRequest.followUps.state, 'closed');
+      assert.equal(projection.existingRequest.followUps.retryEligible, false);
+      assert.equal(projection.existingRequest.followUps.currentFollowUpNumber, null);
+      assert.deepEqual(projection.existingRequest.followUps.preparationBlockers, [{
+        code: 'materials-authority-unavailable',
+        message: 'Acquisition materials authority could not be verified.',
+      }]);
+      assert.equal(JSON.stringify(projection).includes(privateSentinel), false);
+    });
+  }
+});
+
+test('marked follow-up projection fails closed when upload-request authority cannot be read', async (t) => {
+  const privateSentinel = 'private-upload-request-read-error';
+  for (const [name, configure] of [
+    ['thrown read', (storage) => { storage.getLatestSecureUploadRequestForSubmission = async () => { throw new Error(privateSentinel); }; }],
+    ['missing capability', (storage) => { delete storage.getLatestSecureUploadRequestForSubmission; }],
+  ]) {
+    await t.test(name, async () => {
+      const storage = authorityStorage({ requests: [markedFollowUpRequest()] });
+      configure(storage);
+      const projection = await projectDealHunterBrokerMaterials({
+        opportunityId,
+        storage,
+        now: new Date('2026-09-02T17:00:00.000Z'),
+      });
+
+      assert.equal(projection.existingRequest.followUps.state, 'closed');
+      assert.equal(projection.existingRequest.followUps.retryEligible, false);
+      assert.equal(projection.existingRequest.followUps.currentFollowUpNumber, null);
+      assert.deepEqual(projection.existingRequest.followUps.preparationBlockers, [{
+        code: 'materials-authority-unavailable',
+        message: 'Acquisition materials authority could not be verified.',
+      }]);
+      assert.equal(JSON.stringify(projection).includes(privateSentinel), false);
     });
   }
 });
@@ -413,6 +721,23 @@ test('known deal-key aliases retain existing request and Pass ownership', async 
     assert.equal(result.success, false);
     assert.equal(result.code, 'opportunity_passed');
     assert.equal(Object.hasOwn(result, 'preparationToken'), false);
+  });
+
+  await t.test('later durable restore supersedes historical Pass', async () => {
+    const storage = authorityStorage({ aliases: [legacyAlias] });
+    storage.listDealHunterDispositions = async () => [
+      {
+        id: 'legacy-pass', deal_key: 'legacy-key', disposition: 'dismissed',
+        updated_at: '2026-08-31T17:50:00.000Z', dismissed_at: '2026-08-31T17:50:00.000Z',
+      },
+      {
+        id: 'legacy-restore', deal_key: 'legacy-key', disposition: 'restored',
+        updated_at: '2026-08-31T17:55:00.000Z', restored_at: '2026-08-31T17:55:00.000Z',
+      },
+    ];
+    const authority = await loadBrokerMaterialsAuthority({ opportunityId, storage, now });
+    assert.equal(authority.currentDispositionState, 'restored');
+    assert.equal(authority.preparationBlockers.some(({ code }) => code === 'opportunity_passed'), false);
   });
 });
 

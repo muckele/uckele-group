@@ -1228,7 +1228,7 @@ test('Opportunity Detail exposes a bounded existing Broker Materials lifecycle w
   // card, while returning the row directly would leak provider internals.
   const { storage, opportunityId } = await detailStorage(t);
   const request = {
-    id: 'cim-bounded', opportunity_id: opportunityId, status: 'delivery_issue', request_state: 'provider_accepted',
+    id: 'cim-bounded', opportunity_id: opportunityId, submission_id: 'submission-detail', status: 'delivery_issue', request_state: 'provider_accepted',
     delivery_state: 'bounced', follow_up_state: 'not-scheduled', recipient_email: 'sheet-broker@example.test',
     subject: 'CIM / NDA request for Detail Services Co', created_at: '2026-08-31T15:00:00.000Z',
     updated_at: '2026-08-31T16:00:00.000Z', first_requested_at: '2026-08-31T15:00:00.000Z',
@@ -1243,7 +1243,15 @@ test('Opportunity Detail exposes a bounded existing Broker Materials lifecycle w
     subject: 'CIM / NDA request for Detail Services Co', createdAt: '2026-08-31T15:00:00.000Z',
     updatedAt: '2026-08-31T16:00:00.000Z', requestedAt: '2026-08-31T15:00:00.000Z',
     providerAcceptedAt: '2026-08-31T15:01:00.000Z', deliveredAt: '', respondedAt: '',
-    errorSummary: 'Delivery failed.', canRetry: false, canCorrectRecipient: true,
+    errorSummary: 'Delivery failed.',
+    followUps: {
+      enrolled: false, policyVersion: '', maximumFollowUps: 5, followUpCount: 0,
+      currentFollowUpNumber: null, nextFollowUpAt: '', state: 'closed',
+      terminalReason: 'request_not_current', retryEligible: false, startEligible: false,
+      startBlockers: [{ code: 'request_not_current', message: 'The canonical CIM request is not current.' }],
+      preparationBlockers: [], sendBlockers: [],
+    },
+    canRetry: false, canCorrectRecipient: true,
     retryRoute: '', correctionRoute: `/api/admin/deal-hunter/cim-requests/cim-bounded/correct-recipient`,
   });
   assert.equal(JSON.stringify(projected).includes('provider-secret'), false);
@@ -1263,6 +1271,53 @@ test('Broker Materials lifecycle projection is invariant to provider/request row
   const reverse = await getTriageOpportunityDetail({ opportunityId, storage: withDetailAuthorityRows(storage, { cimRequests: [...requests].reverse() }) });
   assert.deepEqual(forward.brokerMaterials.existingRequest, reverse.brokerMaterials.existingRequest);
   assert.equal(forward.brokerMaterials.existingRequest.id, 'cim-current');
+});
+
+test('opportunity detail projects authoritative Phase 3 follow-up status and blockers', async (t) => {
+  const { storage, opportunityId } = await detailStorage(t);
+  let reconciliationCalls = 0;
+  storage.finalizeDealHunterApprovedFollowUp = async () => {
+    reconciliationCalls += 1;
+    throw new Error('read-only detail must not finalize');
+  };
+  const request = {
+    id: 'cim-manual-follow-up-detail', opportunity_id: opportunityId, submission_id: 'submission-detail',
+    deal_key: `deal-${opportunityId}`, status: 'follow_up_failed', request_state: 'provider_accepted',
+    delivery_state: 'failed', follow_up_state: 'failed', follow_up_count: 2,
+    next_follow_up_at: '2026-09-01T16:00:00.000Z', recipient_email: 'sheet-broker@example.test',
+    subject: 'CIM / NDA request for Detail Services Co', first_provider_accepted_at: '2026-08-25T16:00:00.000Z',
+    created_at: '2026-08-25T16:00:00.000Z', updated_at: '2026-09-01T17:00:00.000Z',
+    metadata: {
+      manualApproval: { intent: 'manual_stage_1', followUpPolicy: 'none' },
+      manualFollowUp: {
+        version: 'deal-hunter-manual-follow-up-v1', mode: 'operator-approved', maximumFollowUps: 5,
+        cadencePolicy: 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1',
+        enrolledAt: '2026-08-25T17:00:00.000Z', enrolledBy: 'detail-admin',
+      },
+    },
+  };
+  const detail = await getTriageOpportunityDetail({
+    opportunityId,
+    storage: withDetailAuthorityRows(storage, { cimRequests: [request] }),
+  });
+  const followUps = detail.brokerMaterials.existingRequest.followUps;
+  assert.deepEqual({
+    enrolled: followUps.enrolled,
+    count: followUps.followUpCount,
+    number: followUps.currentFollowUpNumber,
+    state: followUps.state,
+    due: followUps.nextFollowUpAt,
+  }, {
+    enrolled: true,
+    count: 2,
+    number: 3,
+    state: 'retry',
+    due: '2026-09-01T16:00:00.000Z',
+  });
+  assert.equal(Array.isArray(followUps.preparationBlockers), true);
+  assert.equal(Array.isArray(followUps.sendBlockers), true);
+  assert.equal(JSON.stringify(followUps).includes('manualApproval'), false);
+  assert.equal(reconciliationCalls, 0, 'default/viewer detail projection remains read-only');
 });
 
 test('detail keeps date-like and ZIP-plus-four legacy broker_contact generic and marks broker_phone missing', async (t) => {

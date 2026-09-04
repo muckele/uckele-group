@@ -12,6 +12,7 @@ import {
   getSourceHealth,
   updateAcquisitionCommandCenterRecord,
 } from '../server/services/acquisitionCommandCenter.js';
+import { evaluateAcquisitionMaterialsState } from '../server/services/acquisitionMaterials.js';
 
 test('diligence readiness scores complete core acquisition checks', () => {
   const readiness = calculateDiligenceReadiness({
@@ -107,6 +108,67 @@ test('acquisition pipeline derives stage from command override, CIM response, an
     }),
     'docs-received',
   );
+});
+
+test('acquisition command center uses shared acquisition materials authority instead of documents length', () => {
+  assert.equal(
+    deriveAcquisitionPipelineStage({
+      submission: { metadata: {} },
+      documents: [{ document_type: 'nda', original_name: 'signed-nda.pdf' }],
+    }),
+    'new-fit',
+  );
+  assert.equal(
+    deriveAcquisitionPipelineStage({
+      submission: { metadata: {} },
+      documents: [{ document_type: 'other', original_name: 'internal-note.txt', note: 'CIM may arrive later' }],
+    }),
+    'new-fit',
+  );
+  assert.equal(
+    deriveAcquisitionPipelineStage({
+      submission: { metadata: {} },
+      documents: [{ document_type: 'cim', original_name: 'materials.pdf' }],
+    }),
+    'docs-received',
+  );
+  assert.equal(
+    deriveAcquisitionPipelineStage({
+      submission: { metadata: {} },
+      latestUploadRequest: {
+        status: 'completed',
+        requested_documents: [{ category: 'financials' }],
+      },
+    }),
+    'docs-received',
+  );
+});
+
+test('documents-received upload requested only for NDA does not count as acquisition materials or advance Command Center stage', () => {
+  const latestUploadRequest = {
+    status: 'documents-received',
+    requested_documents: [{ category: 'nda' }],
+  };
+
+  assert.deepEqual(evaluateAcquisitionMaterialsState({ latestUploadRequest }), {
+    materialsReceived: false,
+    advancedBeyondBrokerOutreach: false,
+    evidenceCodes: [],
+  });
+  assert.equal(deriveAcquisitionPipelineStage({
+    submission: { metadata: {} },
+    latestUploadRequest,
+  }), 'new-fit');
+
+  const financialUploadRequest = {
+    status: 'documents-received',
+    requested_documents: [{ category: 'financials' }],
+  };
+  assert.equal(evaluateAcquisitionMaterialsState({ latestUploadRequest: financialUploadRequest }).materialsReceived, true);
+  assert.equal(deriveAcquisitionPipelineStage({
+    submission: { metadata: {} },
+    latestUploadRequest: financialUploadRequest,
+  }), 'docs-received');
 });
 
 test('source health flags row drops and missing post-window updates', () => {

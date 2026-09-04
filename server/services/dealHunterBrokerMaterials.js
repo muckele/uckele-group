@@ -11,9 +11,22 @@ import {
 import { evaluateCimRecipientPolicy, getCimOutreachPauseStatus } from './cimOpportunityIdentity.js';
 import { buildDealHunterCimRequestEmail } from './delivery.js';
 import { getEmailReadiness } from './emailReadiness.js';
+import { evaluateAcquisitionMaterialsState } from './acquisitionMaterials.js';
+import { firstStrictDetailAuthorityTimestamp } from './detailAuthorityTimestamp.js';
+import {
+  isOperatorApprovedFollowUpRequest,
+  projectManualFollowUpState,
+} from './dealHunterManualFollowUpPolicy.js';
+import {
+  evaluateManualFollowUpStartEligibility,
+  loadManualFollowUpRequestEvents,
+  manualFollowUpHasAmbiguity,
+  manualFollowUpTerminalAuthority,
+} from './dealHunterManualFollowUpEligibility.js';
 import {
   buildDealHunterCimRequestId,
   evaluateDealHunterCimEligibility,
+  eventMatchesCimRequest,
   executeApprovedDealHunterCimRequest,
 } from './dealHunter.js';
 
@@ -238,18 +251,48 @@ function issueContactOptions({ opportunityId, contacts, secret }) {
   }).sort((left, right) => left.email.localeCompare(right.email) || left.provenance.localeCompare(right.provenance));
 }
 
-function projectExistingRequest(records = []) {
-  const request = [...records].filter((item) => item?.id).sort((left, right) => (
-    (Date.parse(right.responded_at || right.respondedAt || right.updated_at || right.updatedAt || right.created_at || right.createdAt || '') || 0)
-    - (Date.parse(left.responded_at || left.respondedAt || left.updated_at || left.updatedAt || left.created_at || left.createdAt || '') || 0)
+function selectCurrentRequest(records = []) {
+  return [...records].filter((item) => item?.id).sort((left, right) => (
+    (Date.parse(right.first_requested_at || right.firstRequestedAt || right.created_at || right.createdAt || '') || 0)
+    - (Date.parse(left.first_requested_at || left.firstRequestedAt || left.created_at || left.createdAt || '') || 0)
     || String(left.id).localeCompare(String(right.id))
-  ))[0];
+  ))[0] || null;
+}
+
+function projectExistingRequest(records = [], {
+  now = new Date(),
+  terminalReason = '',
+  materialsAuthorityAvailable = true,
+  communications = [],
+  startEligibility = null,
+} = {}) {
+  const request = selectCurrentRequest(records);
   if (!request) return null;
   const status = vocabulary(request.status, requestStatuses);
   const deliveryState = vocabulary(request.delivery_state || request.deliveryState, deliveryStates);
   const providerAcceptedAt = iso(request.first_provider_accepted_at || request.providerAcceptedAt);
   const preAcceptanceFailure = status === 'failed' && !providerAcceptedAt && !['accepted', 'delivered', 'bounced', 'complained', 'suppressed'].includes(deliveryState);
   const deliveryIssue = status === 'delivery_issue' || ['bounced', 'complained', 'suppressed'].includes(deliveryState);
+  const materialsAuthorityUnavailable = !terminalReason
+    && !materialsAuthorityAvailable
+    && isOperatorApprovedFollowUpRequest(request);
+  const publicStartEligibility = isOperatorApprovedFollowUpRequest(request) ? null : startEligibility;
+  const publicTerminalReason = publicStartEligibility && !publicStartEligibility.eligible
+    ? publicStartEligibility.blockers[0]?.code || terminalReason
+    : terminalReason;
+  const followUps = projectManualFollowUpState({
+    request,
+    communications,
+    authority: {
+      terminalReason: materialsAuthorityUnavailable ? 'materials-authority-unavailable' : publicTerminalReason,
+      preparationBlockers: materialsAuthorityUnavailable
+        ? [blocker('materials-authority-unavailable', 'Acquisition materials authority could not be verified.')]
+        : [],
+      startEligible: publicStartEligibility?.eligible,
+      startBlockers: publicStartEligibility?.blockers,
+    },
+    now,
+  });
   return {
     id: text(request.id, 200),
     status,
@@ -268,6 +311,7 @@ function projectExistingRequest(records = []) {
     deliveredAt: iso(request.delivered_at || request.deliveredAt),
     respondedAt: iso(request.responded_at || request.respondedAt),
     errorSummary: safeRequestErrorSummary({ status, deliveryState }),
+    ...(followUps.enrolled || publicStartEligibility ? { followUps } : {}),
     canRetry: preAcceptanceFailure,
     canCorrectRecipient: deliveryIssue,
     retryRoute: preAcceptanceFailure ? `/api/admin/deal-hunter/cim-requests/${encodeURIComponent(request.id)}/retry` : '',
@@ -301,6 +345,16 @@ async function optionalRead(call, fallback) {
   }
 }
 
+async function boundedAuthorityRead(storage, method, fallback, ...args) {
+  if (typeof storage?.[method] !== 'function') return { available: false, value: fallback };
+  try {
+    const value = await storage[method](...args);
+    return { available: true, value: value ?? fallback };
+  } catch {
+    return { available: false, value: fallback };
+  }
+}
+
 async function requiredAuthorityRead(storage, method, ...args) {
   if (typeof storage?.[method] !== 'function') throw new Error(`${method} is unavailable.`);
   return storage[method](...args);
@@ -311,7 +365,7 @@ function unavailableAuthority({ opportunityId, opportunity = null, score = null,
     opportunityId, opportunity, score, recipientOptions: [], warnings: [], existingRequest: null,
     preparationBlockers: [blocker('broker_materials_authority_unavailable', 'Broker Materials authority could not be verified.')],
     sendBlockers: [], pursued: false, authorityRevision: '', aliasResolutionFingerprint: '', requiredAuthorityExpiresAt: '',
-    authorityStatus: 503, now,
+    authorityStatus: 503, materialsAuthorityAvailable: false, communicationsAuthorityAvailable: false, now,
   };
 }
 
@@ -332,7 +386,56 @@ function unionRequests(...collections) {
   return [...byId.values()];
 }
 
-export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage, now = new Date() } = {}) {
+function currentDisposition(records = []) {
+  const candidates = (Array.isArray(records) ? records : []).slice(0, 500).flatMap((record) => {
+    const state = text(record?.disposition, 80).toLowerCase();
+    if (!state) return [];
+    const authorityAt = firstStrictDetailAuthorityTimestamp(record, [
+      ['updated_at', 'updatedAt'],
+      ...(state === 'dismissed'
+        ? [['dismissed_at', 'dismissedAt']]
+        : state === 'restored'
+          ? [['restored_at', 'restoredAt']]
+          : [['dismissed_at', 'dismissedAt'], ['restored_at', 'restoredAt']]),
+      ['created_at', 'createdAt'],
+    ]);
+    return [{
+      state,
+      timestamp: authorityAt.timestamp,
+      fractionalNanoseconds: authorityAt.fractionalNanoseconds,
+      recordId: text(record?.id, 200),
+      signature: stableCanonicalJson({
+        state,
+        reason: text(record?.reason, 160),
+        note: text(record?.note, 500),
+        dismissedAt: text(record?.dismissed_at ?? record?.dismissedAt, 80),
+        restoredAt: text(record?.restored_at ?? record?.restoredAt, 80),
+        authorityAt: authorityAt.value,
+      }),
+    }];
+  }).sort((left, right) => {
+    if (left.timestamp !== null && right.timestamp === null) return -1;
+    if (left.timestamp === null && right.timestamp !== null) return 1;
+    if (left.timestamp !== null && right.timestamp !== null && left.timestamp !== right.timestamp) return right.timestamp - left.timestamp;
+    if (left.timestamp !== null && right.timestamp !== null && left.fractionalNanoseconds !== right.fractionalNanoseconds) {
+      return right.fractionalNanoseconds - left.fractionalNanoseconds;
+    }
+    if (left.state !== right.state) {
+      if (left.state === 'dismissed') return -1;
+      if (right.state === 'dismissed') return 1;
+    }
+    if (left.recordId || right.recordId) {
+      if (!left.recordId) return 1;
+      if (!right.recordId) return -1;
+      const byId = left.recordId.localeCompare(right.recordId);
+      if (byId !== 0) return byId;
+    }
+    return left.signature.localeCompare(right.signature);
+  });
+  return candidates[0]?.state || '';
+}
+
+export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage, now = new Date(), communicationSnapshot } = {}) {
   const id = text(opportunityId, 200);
   const config = getConfig();
   const at = normalizedNow(now);
@@ -362,6 +465,11 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   let opportunityClaim;
   let safety;
   let identityExceptions;
+  let secureDocuments;
+  let latestUploadRequest;
+  let communications = [];
+  let materialsAuthorityAvailable = true;
+  let communicationsAuthorityAvailable = true;
   try {
     [aliases, facts, sourceRows, submission, opportunityClaim, safety, identityExceptions] = await Promise.all([
       requiredAuthorityRead(storage, 'listDealHunterOpportunityAliases', { opportunityIds: [id], limit: 500 }),
@@ -373,6 +481,18 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
       requiredAuthorityRead(storage, 'listDealHunterIdentityExceptions', { statuses: ['open'], limit: 5000 }),
     ]);
     const dealKeys = knownDealKeys(score, aliases);
+    if (submission) {
+      const [secureDocumentAuthority, uploadRequestAuthority] = await Promise.all([
+        boundedAuthorityRead(storage, 'listSecureDocumentsForSubmission', [], submission.id),
+        boundedAuthorityRead(storage, 'getLatestSecureUploadRequestForSubmission', null, submission.id),
+      ]);
+      secureDocuments = secureDocumentAuthority.value;
+      latestUploadRequest = uploadRequestAuthority.value;
+      materialsAuthorityAvailable = secureDocumentAuthority.available && uploadRequestAuthority.available;
+    } else {
+      secureDocuments = [];
+      latestUploadRequest = null;
+    }
     const [canonicalRequests, aliasRequests, knownDispositions] = await Promise.all([
       requiredAuthorityRead(storage, 'listDealHunterCimRequests', { opportunityIds: [id], detailAuthority: true, limit: 100 }),
       dealKeys.length > 0 ? requiredAuthorityRead(storage, 'listDealHunterCimRequests', { dealKeys, limit: 500 }) : [],
@@ -380,6 +500,20 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
     ]);
     requests = unionRequests(canonicalRequests, aliasRequests);
     dispositions = knownDispositions;
+    if (Array.isArray(communicationSnapshot)) {
+      communications = communicationSnapshot;
+    } else if (submission) {
+      const communicationAuthority = await boundedAuthorityRead(
+        storage,
+        'listCrmCommunications',
+        { rows: [] },
+        { submissionId: submission.id, page: 1, pageSize: 100 },
+      );
+      communications = Array.isArray(communicationAuthority.value?.rows)
+        ? communicationAuthority.value.rows
+        : [];
+      communicationsAuthorityAvailable = communicationAuthority.available;
+    }
   } catch {
     return unavailableAuthority({ opportunityId: id, opportunity, score, now: at });
   }
@@ -391,7 +525,49 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   ];
   const recipientOptions = issueContactOptions({ opportunityId: id, contacts, secret: config.admin.sessionSecret });
   const state = pursuedState(score);
-  const existingRequest = projectExistingRequest(requests);
+  const materialsState = evaluateAcquisitionMaterialsState({ submission, secureDocuments, latestUploadRequest });
+  const currentRequest = selectCurrentRequest(requests);
+  const eventAuthority = currentRequest
+    ? await loadManualFollowUpRequestEvents(storage, currentRequest, eventMatchesCimRequest)
+    : { available: true, events: [] };
+  const suppressionAuthority = currentRequest?.recipient_email
+    ? await boundedAuthorityRead(storage, 'getActiveEmailSuppression', null, currentRequest.recipient_email)
+    : { available: true, value: null };
+  const currentDispositionState = currentDisposition(dispositions);
+  const followUpAuthority = {
+    request: currentRequest,
+    opportunity,
+    submission,
+    existingRequest: currentRequest ? { id: currentRequest.id } : null,
+    communications: communications.filter((item) => !currentRequest || item.cim_request_id === currentRequest.id),
+    events: eventAuthority.events,
+    materialsState,
+    currentDispositionState,
+    passed: currentDispositionState === 'dismissed',
+    suppression: suppressionAuthority.value,
+    routeCurrent: Boolean(
+      currentRequest
+      && currentRequest.opportunity_id === id
+      && currentRequest.submission_id === submission?.id
+      && opportunity.primary_submission_id === submission?.id
+      && text(opportunity.status, 80).toLowerCase() === 'active'
+    ),
+    authorityAvailable: materialsAuthorityAvailable
+      && communicationsAuthorityAvailable
+      && eventAuthority.available
+      && suppressionAuthority.available,
+  };
+  followUpAuthority.terminal = currentRequest ? manualFollowUpTerminalAuthority(followUpAuthority) : null;
+  followUpAuthority.ambiguous = currentRequest ? manualFollowUpHasAmbiguity(followUpAuthority) : false;
+  const startEligibility = currentRequest ? evaluateManualFollowUpStartEligibility(followUpAuthority) : null;
+  const terminalReason = followUpAuthority.terminal?.code || '';
+  const existingRequest = projectExistingRequest(requests, {
+    now: at,
+    terminalReason,
+    materialsAuthorityAvailable,
+    communications,
+    startEligibility,
+  });
   const manualEligibility = evaluateDealHunterCimEligibility({
     deal: {
       opportunityId: id,
@@ -408,7 +584,7 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   if (text(opportunity.status, 80).toLowerCase() !== 'active') preparationBlockers.push(blocker('canonical_authority_unavailable', 'The canonical opportunity is no longer current.'));
   if (!state.pursued) preparationBlockers.push(blocker(state.changed ? 'pursue_not_current' : 'not_pursued', state.changed ? 'The Pursue review is no longer current.' : 'Explicit current Pursue is required.'));
   if (score.should_remove) preparationBlockers.push(blocker('opportunity_not_actionable', 'The opportunity is removed or otherwise non-actionable.'));
-  if (dispositions.some((item) => text(item.disposition, 80).toLowerCase() === 'dismissed')) preparationBlockers.push(blocker('opportunity_passed', 'The opportunity is currently Passed.'));
+  if (currentDispositionState === 'dismissed') preparationBlockers.push(blocker('opportunity_passed', 'The opportunity is currently Passed.'));
   if (trustedSourceRows.length === 0) preparationBlockers.push(blocker('required_source_authority_unavailable', 'Required current source authority is unavailable.'));
   if (submission && text(submission.status, 80).toLowerCase() === 'archived') preparationBlockers.push(blocker('crm_owner_archived', 'The linked CRM record is archived.'));
   if (recipientOptions.length === 0) preparationBlockers.push(blocker('recipient_authority_unavailable', 'No current authoritative broker recipient is available.'));
@@ -444,6 +620,17 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
     sourceRows: trustedSourceRows,
     submission,
     requests,
+    dispositions,
+    currentDispositionState,
+    communications,
+    events: eventAuthority.events,
+    eventAuthorityAvailable: eventAuthority.available,
+    suppression: suppressionAuthority.value,
+    suppressionAuthorityAvailable: suppressionAuthority.available,
+    materialsState,
+    materialsAuthorityAvailable,
+    communicationsAuthorityAvailable,
+    terminalReason,
     existingRequest,
     opportunityClaim,
     safety,
@@ -483,8 +670,8 @@ async function selectedSendBlockers({ authority, selectedRecipient, storage, now
   return uniqueBlockers(blockers);
 }
 
-export async function projectDealHunterBrokerMaterials({ opportunityId = '', storage, now = new Date() } = {}) {
-  const authority = await loadBrokerMaterialsAuthority({ opportunityId, storage, now });
+export async function projectDealHunterBrokerMaterials({ opportunityId = '', storage, now = new Date(), communicationSnapshot } = {}) {
+  const authority = await loadBrokerMaterialsAuthority({ opportunityId, storage, now, communicationSnapshot });
   const autoSelected = authority.recipientOptions.length === 1
     ? authority.recipientOptions[0]
     : authority.recipientOptions.filter((item) => item.primary).length === 1

@@ -18,6 +18,11 @@ const emptyBrokerMaterialsState = {
   preparation: null, recipientSelection: null, preparing: false, updating: false, sending: false,
   checking: false, checkingFailed: false, stale: false, error: '',
 };
+const emptyFollowUpState = {
+  preparation: null, preparing: false, updating: false, sending: false,
+  checking: false, checkingFailed: false, stale: false, stopStatus: '',
+  updated: false, error: '',
+};
 
 function withoutApprovalAuthority(preparation) {
   return preparation ? { ...preparation, preparationToken: '', proposalDigest: '' } : null;
@@ -156,6 +161,7 @@ export default function AcquisitionInbox({ readOnly = false }) {
   const [selectedId, setSelectedId] = useState('');
   const [detail, setDetail] = useState({ requestedId: '', data: null, loading: false, error: '' });
   const [brokerMaterialsState, setBrokerMaterialsState] = useState(emptyBrokerMaterialsState);
+  const [followUpState, setFollowUpState] = useState(emptyFollowUpState);
   const [passTarget, setPassTarget] = useState(null);
   const queueRequestRef = useRef({ generation: 0, controller: null });
   const queueQueryRef = useRef(null);
@@ -163,6 +169,11 @@ export default function AcquisitionInbox({ readOnly = false }) {
   const brokerPrepareRequestRef = useRef({ generation: 0, controller: null });
   const brokerApprovalRequestRef = useRef({ generation: 0, controller: null });
   const brokerApprovalPendingRef = useRef(false);
+  const followUpPrepareRequestRef = useRef({ generation: 0, controller: null });
+  const followUpApprovalRequestRef = useRef({ generation: 0, controller: null });
+  const followUpMutationRequestRef = useRef({ generation: 0, controller: null });
+  const followUpApprovalPendingRef = useRef(false);
+  const followUpMutationPendingRef = useRef(false);
   const selectionRef = useRef('');
   const mutationGenerationRef = useRef(0);
   const mutationPendingRef = useRef(false);
@@ -236,6 +247,21 @@ export default function AcquisitionInbox({ readOnly = false }) {
           ? { ...current, preparation: { ...current.preparation, sendBlockers: result.brokerMaterials.sendBlockers } }
           : current;
       });
+      setFollowUpState((current) => {
+        const projection = result.brokerMaterials?.existingRequest?.followUps;
+        if (!projection) return emptyFollowUpState;
+        if (!current.preparation) return current;
+        return {
+          ...current,
+          preparation: {
+            ...withoutApprovalAuthority(current.preparation),
+            followUps: projection,
+            sendBlockers: Array.isArray(projection.sendBlockers) ? projection.sendBlockers : current.preparation.sendBlockers,
+          },
+          stale: true,
+          updated: false,
+        };
+      });
       return result;
     } catch (detailError) {
       if (isAbortError(detailError) || detailRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
@@ -257,7 +283,16 @@ export default function AcquisitionInbox({ readOnly = false }) {
     brokerApprovalRequestRef.current.controller?.abort();
     brokerApprovalRequestRef.current = { generation: brokerApprovalRequestRef.current.generation + 1, controller: null };
     brokerApprovalPendingRef.current = false;
+    followUpPrepareRequestRef.current.controller?.abort();
+    followUpPrepareRequestRef.current = { generation: followUpPrepareRequestRef.current.generation + 1, controller: null };
+    followUpApprovalRequestRef.current.controller?.abort();
+    followUpApprovalRequestRef.current = { generation: followUpApprovalRequestRef.current.generation + 1, controller: null };
+    followUpMutationRequestRef.current.controller?.abort();
+    followUpMutationRequestRef.current = { generation: followUpMutationRequestRef.current.generation + 1, controller: null };
+    followUpApprovalPendingRef.current = false;
+    followUpMutationPendingRef.current = false;
     setBrokerMaterialsState(emptyBrokerMaterialsState);
+    setFollowUpState(emptyFollowUpState);
     detailTriggerRef.current = trigger || null;
     detailFocusGuardRef.current = true;
     selectionRef.current = opportunityId;
@@ -278,7 +313,16 @@ export default function AcquisitionInbox({ readOnly = false }) {
     brokerApprovalRequestRef.current.controller?.abort();
     brokerApprovalRequestRef.current = { generation: brokerApprovalRequestRef.current.generation + 1, controller: null };
     brokerApprovalPendingRef.current = false;
+    followUpPrepareRequestRef.current.controller?.abort();
+    followUpPrepareRequestRef.current = { generation: followUpPrepareRequestRef.current.generation + 1, controller: null };
+    followUpApprovalRequestRef.current.controller?.abort();
+    followUpApprovalRequestRef.current = { generation: followUpApprovalRequestRef.current.generation + 1, controller: null };
+    followUpMutationRequestRef.current.controller?.abort();
+    followUpMutationRequestRef.current = { generation: followUpMutationRequestRef.current.generation + 1, controller: null };
+    followUpApprovalPendingRef.current = false;
+    followUpMutationPendingRef.current = false;
     setBrokerMaterialsState(emptyBrokerMaterialsState);
+    setFollowUpState(emptyFollowUpState);
     setMutationError('');
     const trigger = detailTriggerRef.current;
     if (trigger?.isConnected) trigger.focus();
@@ -503,6 +547,225 @@ export default function AcquisitionInbox({ readOnly = false }) {
     return Boolean(refreshed);
   }
 
+  function invalidateFollowUpPreparation() {
+    setFollowUpState((current) => ({
+      ...current,
+      preparation: withoutApprovalAuthority(current.preparation),
+      stale: false,
+      updated: false,
+    }));
+  }
+
+  function closeFollowUpReview() {
+    followUpPrepareRequestRef.current.controller?.abort();
+    followUpPrepareRequestRef.current = { generation: followUpPrepareRequestRef.current.generation + 1, controller: null };
+    setFollowUpState(emptyFollowUpState);
+  }
+
+  async function mutateFollowUps(opportunityId, requestId, action, requestedBody = {}) {
+    if (!opportunityId || !requestId || selectionRef.current !== opportunityId || readOnly || followUpMutationPendingRef.current) return false;
+    const body = action === 'stop' && requestedBody.reason ? { reason: requestedBody.reason } : {};
+    followUpMutationPendingRef.current = true;
+    followUpMutationRequestRef.current.controller?.abort();
+    const controller = new AbortController();
+    const generation = followUpMutationRequestRef.current.generation + 1;
+    followUpMutationRequestRef.current = { generation, controller };
+    setFollowUpState((current) => ({ ...current, checking: false, checkingFailed: false, error: '', stopStatus: '', updated: false }));
+    let result = null;
+    let responseOk = false;
+    let stopStatus = '';
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/follow-ups/${encodeURIComponent(requestId)}/${action}`, {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: controller.signal,
+      });
+      result = await response.json();
+      responseOk = response.ok && result.success;
+      stopStatus = action === 'stop' && result.code === 'outcome_unresolved' ? 'server-in-flight' : '';
+      if (followUpMutationRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      setFollowUpState((current) => ({
+        ...current,
+        preparation: null,
+        checking: result.code === 'outcome_unresolved',
+        checkingFailed: false,
+        stale: false,
+        stopStatus,
+        updated: false,
+        error: responseOk || result.code === 'outcome_unresolved' ? '' : result.error || `Unable to ${action} follow-ups.`,
+      }));
+    } catch (mutationError) {
+      if (isAbortError(mutationError) || followUpMutationRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      stopStatus = action === 'stop' ? 'client-unknown' : '';
+      setFollowUpState((current) => ({
+        ...current,
+        preparation: null,
+        checking: action === 'stop',
+        checkingFailed: false,
+        stale: false,
+        stopStatus,
+        updated: false,
+        error: action === 'stop' ? '' : mutationError.message || `Unable to ${action} follow-ups.`,
+      }));
+    }
+
+    const refreshed = await loadDetail(opportunityId, { preserveData: true });
+    if (followUpMutationRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+    setFollowUpState((current) => ({
+      ...current,
+      checking: Boolean(stopStatus && !refreshed),
+      checkingFailed: Boolean(stopStatus && !refreshed),
+      stopStatus: refreshed && stopStatus === 'client-unknown' ? '' : stopStatus,
+      error: refreshed ? current.error : stopStatus ? '' : current.error || 'Unable to reload authoritative follow-up status.',
+    }));
+    if (followUpMutationRequestRef.current.generation === generation) {
+      followUpMutationRequestRef.current.controller = null;
+      followUpMutationPendingRef.current = false;
+    }
+    return responseOk;
+  }
+
+  async function prepareFollowUp(opportunityId, requestId, requestedBody = {}) {
+    if (!opportunityId || !requestId || selectionRef.current !== opportunityId) return false;
+    followUpPrepareRequestRef.current.controller?.abort();
+    const controller = new AbortController();
+    const generation = followUpPrepareRequestRef.current.generation + 1;
+    followUpPrepareRequestRef.current = { generation, controller };
+    const body = Object.hasOwn(requestedBody, 'greeting') ? { greeting: requestedBody.greeting } : {};
+    setFollowUpState((current) => ({
+      ...current,
+      preparation: current.preparation ? withoutApprovalAuthority(current.preparation) : null,
+      preparing: !current.preparation,
+      updating: Boolean(current.preparation),
+      checking: false,
+      checkingFailed: false,
+      stale: false,
+      stopStatus: '',
+      updated: false,
+      error: '',
+    }));
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/follow-ups/${encodeURIComponent(requestId)}/prepare`, {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: controller.signal,
+      });
+      const result = await response.json();
+      if (followUpPrepareRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      if (!response.ok || !result.success) {
+        const stale = ['preparation_stale', 'preparation_expired', 'authority_changed'].includes(result.code);
+        const unresolved = result.code === 'outcome_unresolved';
+        setFollowUpState((current) => ({
+          ...current,
+          preparation: result.review ? { ...result, preparationToken: '', proposalDigest: '' } : null,
+          preparing: false,
+          updating: false,
+          checking: unresolved,
+          checkingFailed: false,
+          stale,
+          updated: false,
+          error: unresolved ? '' : result.error || 'Unable to prepare the follow-up review.',
+        }));
+        if (unresolved) {
+          const refreshed = await loadDetail(opportunityId, { preserveData: true });
+          if (followUpPrepareRequestRef.current.generation === generation && !controller.signal.aborted && selectionRef.current === opportunityId) {
+            setFollowUpState((current) => ({ ...current, checking: !refreshed, checkingFailed: !refreshed }));
+          }
+        }
+        return false;
+      }
+      setFollowUpState({
+        ...emptyFollowUpState,
+        preparation: readOnly ? withoutApprovalAuthority(result) : result,
+        updated: Object.hasOwn(body, 'greeting'),
+      });
+      return true;
+    } catch (prepareError) {
+      if (isAbortError(prepareError) || followUpPrepareRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      setFollowUpState((current) => ({ ...current, preparing: false, updating: false, error: prepareError.message || 'Unable to prepare the follow-up review.' }));
+      return false;
+    } finally {
+      if (followUpPrepareRequestRef.current.generation === generation) followUpPrepareRequestRef.current.controller = null;
+    }
+  }
+
+  async function approveFollowUp(opportunityId, requestId, preparation) {
+    if (!opportunityId || !requestId || selectionRef.current !== opportunityId || readOnly || followUpApprovalPendingRef.current || !preparation?.preparationToken || !preparation?.proposalDigest) return false;
+    followUpApprovalPendingRef.current = true;
+    followUpApprovalRequestRef.current.controller?.abort();
+    const controller = new AbortController();
+    const generation = followUpApprovalRequestRef.current.generation + 1;
+    followUpApprovalRequestRef.current = { generation, controller };
+    const body = { preparationToken: preparation.preparationToken, approvedProposalDigest: preparation.proposalDigest };
+    setFollowUpState((current) => ({
+      ...current,
+      preparation: withoutApprovalAuthority(current.preparation),
+      sending: true,
+      checking: false,
+      checkingFailed: false,
+      stale: false,
+      stopStatus: '',
+      updated: false,
+      error: '',
+    }));
+    let responseResult = null;
+    let responseOk = false;
+    let unknownOutcome = false;
+    try {
+      const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/follow-ups/${encodeURIComponent(requestId)}/approve`, {
+        method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: controller.signal,
+      });
+      responseResult = await response.json();
+      if (followUpApprovalRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      responseOk = response.ok && responseResult.success;
+      unknownOutcome = responseResult.code === 'outcome_unresolved';
+      const stale = ['preparation_stale', 'preparation_expired', 'authority_changed'].includes(responseResult.code);
+      const sendBlocked = responseResult.code === 'send_blocked' || Array.isArray(responseResult.sendBlockers) && responseResult.sendBlockers.length > 0;
+      setFollowUpState((current) => ({
+        ...current,
+        preparation: sendBlocked ? {
+          ...withoutApprovalAuthority(preparation),
+          sendBlockers: responseResult.sendBlockers || responseResult.followUps?.sendBlockers || [],
+        } : null,
+        sending: false,
+        checking: unknownOutcome,
+        checkingFailed: false,
+        stale: stale || sendBlocked,
+        updated: false,
+        error: responseOk || unknownOutcome || sendBlocked ? '' : responseResult.error || 'Unable to send the approved follow-up.',
+      }));
+    } catch (approvalError) {
+      if (isAbortError(approvalError) || followUpApprovalRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+      unknownOutcome = true;
+      setFollowUpState((current) => ({ ...current, preparation: null, sending: false, checking: true, checkingFailed: false, stale: false, updated: false, error: '' }));
+    }
+
+    const refreshed = await loadDetail(opportunityId, { preserveData: true });
+    if (followUpApprovalRequestRef.current.generation !== generation || controller.signal.aborted || selectionRef.current !== opportunityId) return false;
+    setFollowUpState((current) => ({
+      ...current,
+      sending: false,
+      checking: Boolean(unknownOutcome && !refreshed),
+      checkingFailed: Boolean(unknownOutcome && !refreshed),
+      error: refreshed ? current.error : unknownOutcome ? '' : current.error || 'Unable to reload authoritative follow-up status.',
+    }));
+    if (followUpApprovalRequestRef.current.generation === generation) {
+      followUpApprovalRequestRef.current.controller = null;
+      followUpApprovalPendingRef.current = false;
+    }
+    return responseOk;
+  }
+
+  async function checkFollowUpStatus(opportunityId) {
+    if (!opportunityId || selectionRef.current !== opportunityId) return false;
+    setFollowUpState((current) => ({ ...current, preparation: null, checking: true, checkingFailed: false, stale: false, updated: false, error: '' }));
+    const refreshed = await loadDetail(opportunityId, { preserveData: true });
+    if (selectionRef.current !== opportunityId) return false;
+    setFollowUpState((current) => ({
+      ...current,
+      checking: !refreshed,
+      checkingFailed: !refreshed,
+      stopStatus: refreshed ? '' : current.stopStatus,
+    }));
+    return Boolean(refreshed);
+  }
+
   useEffect(() => () => {
     detailFocusGuardRef.current = false;
     passFocusGuardRef.current = false;
@@ -513,6 +776,14 @@ export default function AcquisitionInbox({ readOnly = false }) {
     brokerApprovalRequestRef.current.controller?.abort();
     brokerApprovalRequestRef.current.generation += 1;
     brokerApprovalPendingRef.current = false;
+    followUpPrepareRequestRef.current.controller?.abort();
+    followUpPrepareRequestRef.current.generation += 1;
+    followUpApprovalRequestRef.current.controller?.abort();
+    followUpApprovalRequestRef.current.generation += 1;
+    followUpMutationRequestRef.current.controller?.abort();
+    followUpMutationRequestRef.current.generation += 1;
+    followUpApprovalPendingRef.current = false;
+    followUpMutationPendingRef.current = false;
     selectionRef.current = '';
   }, []);
 
@@ -551,7 +822,7 @@ export default function AcquisitionInbox({ readOnly = false }) {
         </div>
       </div>
 
-      {selectedId ? <OpportunityDrawer brokerMaterialsState={brokerMaterialsState} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onClose={closeDetail} onRetry={() => loadDetail(selectedId)} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} readOnly={readOnly} /> : null}
+      {selectedId ? <OpportunityDrawer brokerMaterialsState={brokerMaterialsState} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} followUpState={followUpState} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onClose={closeDetail} onFollowUpApprove={hasMatchingDetail ? (preparation) => approveFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, preparation) : undefined} onFollowUpCheckStatus={hasMatchingDetail ? () => checkFollowUpStatus(loadedDetailId) : undefined} onFollowUpCloseReview={closeFollowUpReview} onFollowUpInvalidate={invalidateFollowUpPreparation} onFollowUpPrepare={hasMatchingDetail ? (body) => prepareFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, body) : undefined} onFollowUpStart={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'start', body) : undefined} onFollowUpStop={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'stop', body) : undefined} onRetry={() => loadDetail(selectedId)} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} readOnly={readOnly} /> : null}
       {passTarget ? <QueuePassDialog error={mutationError} focusGuardRef={passFocusGuardRef} name={passTarget.name} onCancel={closeQueuePass} onSubmit={(payload) => recordAction(passTarget.opportunityId, 'pass', payload)} pending={pendingId === passTarget.opportunityId} /> : null}
     </section>
   );

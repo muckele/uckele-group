@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import { createHash } from 'node:crypto';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
 import {
   normalizeDealHunterSourceSnapshot,
@@ -278,6 +279,17 @@ function normalizeDealHunterCimRequestRow(row) {
         metadata: typeof row.metadata === 'object' && row.metadata !== null ? row.metadata : {},
       }
     : null;
+}
+
+function normalizeDealHunterManualFollowUpResult(value) {
+  const result = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  return {
+    applied: Boolean(result.applied),
+    reason: String(result.reason || ''),
+    request: result.request ? normalizeDealHunterCimRequestRow(result.request) : null,
+    activity: result.activity ? normalizeCrmActivityEventRow(result.activity) : null,
+    alreadyFinalized: Boolean(result.alreadyFinalized ?? result.already_finalized),
+  };
 }
 
 function normalizeDealHunterDispositionRow(row) {
@@ -1785,6 +1797,63 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         outbox: normalizeCrmEmailOutboxRow(data?.outbox || null),
         submission: data?.submission ? normalizeSubmissionRow(data.submission) : null,
       };
+    },
+
+    async recordDealHunterManualFollowUpAmbiguity({
+      requestId = '', submissionId = '', communicationId = '', idempotencyKey = '',
+      actor = '', ambiguousAt = '', error: outcomeError = '',
+    } = {}) {
+      if (!requestId || !submissionId || !communicationId || !idempotencyKey || !actor
+        || !Number.isFinite(Date.parse(ambiguousAt || ''))) return null;
+      const [communicationResult, requestResult, submissionResult] = await Promise.all([
+        client.from('crm_communications').select('*').eq('id', communicationId).maybeSingle(),
+        client.from('deal_hunter_cim_requests').select('id, submission_id').eq('id', requestId).maybeSingle(),
+        client.from('contact_submissions').select('id, updated_at').eq('id', submissionId).maybeSingle(),
+      ]);
+      if (communicationResult.error) throw communicationResult.error;
+      if (requestResult.error) throw requestResult.error;
+      if (submissionResult.error) throw submissionResult.error;
+      const communication = communicationResult.data;
+      if (!communication || !requestResult.data || !submissionResult.data
+        || communication.cim_request_id !== requestId
+        || communication.submission_id !== submissionId
+        || requestResult.data.submission_id !== submissionId
+        || communication.idempotency_key !== idempotencyKey
+        || communication.delivery_state !== 'ambiguous'
+        || !Number.isFinite(Date.parse(communication.delivery_state_at || ''))
+        || new Date(communication.delivery_state_at).toISOString() !== new Date(ambiguousAt).toISOString()) return null;
+      const proofId = createHash('sha256').update(`deal-hunter-manual-follow-up-ambiguity:${communicationId}`).digest('hex');
+      const proof = {
+        id: proofId,
+        communication_id: communicationId,
+        submission_id: submissionId,
+        cim_request_id: requestId,
+        idempotency_key: `${idempotencyKey}:ambiguity-proof`,
+        client_request_key: `${proofId}:ambiguity-proof`,
+        state: 'ambiguous',
+        provider: communication.provider || null,
+        provider_message_id: communication.provider_message_id || null,
+        attempt_count: 1,
+        ambiguous_at: ambiguousAt,
+        expected_submission_version: submissionResult.data.updated_at,
+        actor: String(actor).slice(0, 300),
+        created_at: ambiguousAt,
+        updated_at: ambiguousAt,
+        metadata: { kind: 'deal-hunter-manual-follow-up-ambiguity-proof', error: String(outcomeError || '').slice(0, 500) },
+      };
+      const { data, error } = await client.from('crm_email_outbox').insert(proof).select().single();
+      if (!error) return normalizeCrmEmailOutboxRow(data);
+      if (error.code !== '23505') throw error;
+      const duplicate = await client.from('crm_email_outbox').select('*').eq('communication_id', communicationId).maybeSingle();
+      if (duplicate.error) throw duplicate.error;
+      return duplicate.data?.state === 'ambiguous'
+        && duplicate.data?.cim_request_id === requestId
+        && duplicate.data?.submission_id === submissionId
+        && duplicate.data?.idempotency_key === `${idempotencyKey}:ambiguity-proof`
+        && Number.isFinite(Date.parse(duplicate.data?.ambiguous_at || ''))
+        && new Date(duplicate.data.ambiguous_at).toISOString() === new Date(ambiguousAt).toISOString()
+        ? normalizeCrmEmailOutboxRow(duplicate.data)
+        : null;
     },
 
     async getCrmEmailOutbox(id) {
@@ -3626,6 +3695,119 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
 	        request: result.request ? normalizeDealHunterCimRequestRow(result.request) : null,
 	      };
 	    },
+
+      async startDealHunterManualFollowUps({
+        requestId = '',
+        expectedRequestUpdatedAt = '',
+        expectedSubmissionId = '',
+        expectedSubmissionUpdatedAt = '',
+        marker = {},
+        nextFollowUpAt = '',
+        activity = null,
+      } = {}) {
+        if (!requestId || !expectedRequestUpdatedAt || !expectedSubmissionId
+          || !expectedSubmissionUpdatedAt || !nextFollowUpAt || !activity) {
+          return normalizeDealHunterManualFollowUpResult({ reason: 'invalid-input' });
+        }
+        const { data, error } = await client.rpc('start_deal_hunter_manual_follow_ups', {
+          p_request_id: requestId,
+          p_expected_request_updated_at: expectedRequestUpdatedAt,
+          p_expected_submission_id: expectedSubmissionId,
+          p_expected_submission_updated_at: expectedSubmissionUpdatedAt,
+          p_marker: marker,
+          p_next_follow_up_at: nextFollowUpAt,
+          p_activity: activity,
+        });
+        if (error) throw error;
+        return normalizeDealHunterManualFollowUpResult(data);
+      },
+
+      async stopDealHunterManualFollowUps({
+        requestId = '',
+        expectedRequestUpdatedAt = '',
+        expectedSubmissionId = '',
+        expectedSubmissionUpdatedAt = '',
+        stoppedAt = '',
+        stoppedBy = '',
+        reason = '',
+        activity = null,
+      } = {}) {
+        if (!requestId || !expectedRequestUpdatedAt || !expectedSubmissionId
+          || !expectedSubmissionUpdatedAt || !stoppedAt || !stoppedBy || !activity) {
+          return normalizeDealHunterManualFollowUpResult({ reason: 'invalid-input' });
+        }
+        const { data, error } = await client.rpc('stop_deal_hunter_manual_follow_ups', {
+          p_request_id: requestId,
+          p_expected_request_updated_at: expectedRequestUpdatedAt,
+          p_expected_submission_id: expectedSubmissionId,
+          p_expected_submission_updated_at: expectedSubmissionUpdatedAt,
+          p_stopped_at: stoppedAt,
+          p_stopped_by: stoppedBy,
+          p_reason: reason,
+          p_activity: activity,
+        });
+        if (error) throw error;
+        return normalizeDealHunterManualFollowUpResult(data);
+      },
+
+      async claimDealHunterApprovedFollowUp({
+        requestId = '',
+        expectedRequestUpdatedAt = '',
+        expectedSubmissionId = '',
+        expectedSubmissionUpdatedAt = '',
+        expectedFollowUpCount = null,
+        expectedFollowUpNumber = null,
+        expectedNextFollowUpAt = '',
+        claimedAt = '',
+      } = {}) {
+        if (!requestId || !expectedRequestUpdatedAt || !expectedSubmissionId
+          || !expectedSubmissionUpdatedAt || !expectedNextFollowUpAt || !claimedAt
+          || !Number.isInteger(expectedFollowUpCount) || !Number.isInteger(expectedFollowUpNumber)) {
+          return normalizeDealHunterManualFollowUpResult({ reason: 'invalid-input' });
+        }
+        const { data, error } = await client.rpc('claim_deal_hunter_approved_follow_up', {
+          p_request_id: requestId,
+          p_expected_request_updated_at: expectedRequestUpdatedAt,
+          p_expected_submission_id: expectedSubmissionId,
+          p_expected_submission_updated_at: expectedSubmissionUpdatedAt,
+          p_expected_follow_up_count: expectedFollowUpCount,
+          p_expected_follow_up_number: expectedFollowUpNumber,
+          p_expected_next_follow_up_at: expectedNextFollowUpAt,
+          p_claimed_at: claimedAt,
+        });
+        if (error) throw error;
+        return normalizeDealHunterManualFollowUpResult(data);
+      },
+
+      async finalizeDealHunterApprovedFollowUp({
+        requestId = '',
+        expectedRequestUpdatedAt = '',
+        expectedSubmissionId = '',
+        expectedFollowUpNumber = null,
+        expectedCommunicationId = '',
+        outcome = '',
+        acceptedAt = null,
+        nextFollowUpAt = null,
+        activity = null,
+      } = {}) {
+        if (!requestId || !expectedRequestUpdatedAt || !expectedSubmissionId
+          || !expectedCommunicationId || !Number.isInteger(expectedFollowUpNumber) || !activity) {
+          return normalizeDealHunterManualFollowUpResult({ reason: 'invalid-input' });
+        }
+        const { data, error } = await client.rpc('finalize_deal_hunter_approved_follow_up', {
+          p_request_id: requestId,
+          p_expected_request_updated_at: expectedRequestUpdatedAt,
+          p_expected_submission_id: expectedSubmissionId,
+          p_expected_follow_up_number: expectedFollowUpNumber,
+          p_expected_communication_id: expectedCommunicationId,
+          p_outcome: outcome,
+          p_accepted_at: acceptedAt,
+          p_next_follow_up_at: nextFollowUpAt,
+          p_activity: activity,
+        });
+        if (error) throw error;
+        return normalizeDealHunterManualFollowUpResult(data);
+      },
 
 	    async claimDealHunterCimFollowUpRequest({ id = '', dueBefore = '', staleBefore = '', nowIso = '' } = {}) {
 	      if (!id || !dueBefore || !nowIso) {

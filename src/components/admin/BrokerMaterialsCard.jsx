@@ -1,4 +1,5 @@
 import React, { useEffect, useId, useRef, useState } from 'react';
+import BrokerMaterialsFollowUps from './BrokerMaterialsFollowUps.jsx';
 
 const primaryButton = 'inline-flex min-h-10 items-center justify-center rounded-full border border-moss bg-moss px-4 py-2 text-sm font-semibold text-white transition hover:bg-pine disabled:cursor-not-allowed disabled:opacity-50';
 const secondaryButton = 'inline-flex min-h-10 items-center justify-center rounded-full border border-line bg-white px-4 py-2 text-sm font-semibold text-ink transition hover:border-moss/35 hover:text-moss disabled:cursor-not-allowed disabled:opacity-50';
@@ -51,6 +52,8 @@ export default function BrokerMaterialsCard({
   onCheckStatus, onInvalidatePreparation, onPrepare, onViewRequest, preparation: providedPreparation = null,
   preparing = false, recipientSelection: providedRecipientSelection = null,
   readOnly = false, sending = false, stale = false, updating = false,
+  businessName = '', followUpState = {}, onFollowUpApprove, onFollowUpCheckStatus, onFollowUpCloseReview,
+  onFollowUpInvalidate, onFollowUpPrepare, onFollowUpStart, onFollowUpStop,
 }) {
   const contentId = useId();
   const recipientHelpId = useId();
@@ -74,6 +77,7 @@ export default function BrokerMaterialsCard({
   const [localSending, setLocalSending] = useState(false);
   const [announcement, setAnnouncement] = useState('');
   const existingRequest = brokerMaterials?.existingRequest || null;
+  const followUps = existingRequest?.followUps || null;
   const preparation = existingRequest ? null : providedPreparation;
   const recipientSelection = existingRequest ? null : providedRecipientSelection;
   const blocker = blockerPresentation(brokerMaterials);
@@ -221,7 +225,7 @@ export default function BrokerMaterialsCard({
       </div>
 
       {!preparation || checking ? <p className="mt-3 text-sm leading-6 text-ink/68">{collapsed.sentence}</p> : null}
-      <p aria-atomic="true" aria-live="polite" className="sr-only" role="status">{liveMessage}</p>
+      {!followUps ? <p aria-atomic="true" aria-live="polite" className="sr-only" role="status">{liveMessage}</p> : null}
       {error ? <p className="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800" ref={alertRef} role="alert" tabIndex={-1}>{error}</p> : null}
 
       {!preparation && !recipientSelection && !checking ? <div className="mt-3">
@@ -270,6 +274,29 @@ export default function BrokerMaterialsCard({
           </div></section>
         </div> : null}
       </div>
+      {followUps ? <BrokerMaterialsFollowUps
+        businessName={businessName}
+        checking={followUpState.checking}
+        checkingFailed={followUpState.checkingFailed}
+        developmentOnly={existingRequest.deliveryState === 'development-only' || existingRequest.developmentOnly}
+        error={followUpState.error}
+        followUps={followUps}
+        onApprove={onFollowUpApprove}
+        onCheckStatus={onFollowUpCheckStatus}
+        onCloseReview={onFollowUpCloseReview}
+        onInvalidatePreparation={onFollowUpInvalidate}
+        onPrepare={onFollowUpPrepare}
+        onStart={onFollowUpStart}
+        onStop={onFollowUpStop}
+        preparation={followUpState.preparation}
+        preparing={followUpState.preparing}
+        readOnly={readOnly}
+        sending={followUpState.sending}
+        stale={followUpState.stale}
+        stopStatus={followUpState.stopStatus}
+        updated={followUpState.updated}
+        updating={followUpState.updating}
+      /> : null}
     </section>
   );
 }

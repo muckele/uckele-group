@@ -2,6 +2,37 @@ import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import test from 'node:test';
 
+test('manual follow-up never consumes initial-contact cadence override', async () => {
+  const dealHunter = await import('../server/services/dealHunter.js');
+  assert.equal(typeof dealHunter.executeDealHunterCimFollowUpRequest, 'function');
+  const source = dealHunter.executeDealHunterCimFollowUpRequest.toString();
+  assert.doesNotMatch(source, /consumeDealHunterCimRecipientOverride/);
+});
+
+test('communication lifecycle renders Follow-Up four and five and reconciles accepted proof without duplicate send', async () => {
+  const { buildDealHunterCimFollowUpEmail } = await import('../server/services/delivery.js');
+  const request = {
+    id: 'manual-copy-request', opportunity_id: 'manual-copy-opportunity', submission_id: 'manual-copy-submission',
+    deal_key: 'manual-copy-deal', deal_name: 'Durable Service Co', listing_url: 'https://example.test/deal',
+    recipient_email: 'broker@example.test', metadata: { industry: 'Commercial services', location: 'California' },
+  };
+  const fourth = buildDealHunterCimFollowUpEmail({
+    to: request.recipient_email, request, followUpNumber: 4, communicationId: 'communication-four',
+    manualFollowUp: { greeting: 'Hello Avery,' },
+  });
+  const fifth = buildDealHunterCimFollowUpEmail({
+    to: request.recipient_email, request, followUpNumber: 5, communicationId: 'communication-five',
+    manualFollowUp: { greeting: 'Hello Avery,' },
+  });
+  assert.match(fourth.text, /follow up once more/i);
+  assert.match(fifth.text, /final note|close the loop/i);
+  assert.notEqual(fourth.text, fifth.text);
+  assert.equal(fourth.communicationId, 'communication-four');
+  assert.equal(fifth.communicationId, 'communication-five');
+  const dealHunter = await import('../server/services/dealHunter.js');
+  assert.equal(typeof dealHunter.executeDealHunterCimFollowUpRequest, 'function', 'accepted proof needs the shared durable executor');
+});
+
 const signingKey = Buffer.from('fixture-resend-webhook-signing-key');
 process.env.EMAIL_WEBHOOK_SECRET = `whsec_${signingKey.toString('base64')}`;
 process.env.RESEND_API_KEY = 're_fixture_received_email_key';

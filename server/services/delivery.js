@@ -1097,6 +1097,42 @@ export async function sendDealHunterCimRequestEmail(options) {
 }
 
 function buildCimFollowUpCopy({ businessName, followUpNumber }) {
+  if (followUpNumber === 5) {
+    return {
+      preheader: `One final check on the CIM or NDA process for ${businessName}.`,
+      paragraphs: [
+        `I am checking in one final time regarding ${businessName}.`,
+        'If the opportunity remains available, please send the CIM, teaser, or offering materials, or let me know the NDA process.',
+        'If it is no longer active or the process has moved on, no further action is needed and I will close the loop. Thank you for your time.',
+      ],
+      textLines: [
+        `I am checking in one final time regarding ${businessName}.`,
+        '',
+        'If the opportunity remains available, please send the CIM, teaser, or offering materials, or let me know the NDA process.',
+        '',
+        'If it is no longer active or the process has moved on, no further action is needed and I will close the loop. Thank you for your time.',
+      ],
+    };
+  }
+
+  if (followUpNumber === 4) {
+    return {
+      preheader: `Checking the current status of ${businessName}.`,
+      paragraphs: [
+        `I wanted to follow up once more regarding ${businessName}.`,
+        'If the opportunity is still active, I would appreciate the CIM, teaser, offering materials, or the next step in the NDA process.',
+        'If the process has moved forward or the materials are not available, a brief status update would be helpful.',
+      ],
+      textLines: [
+        `I wanted to follow up once more regarding ${businessName}.`,
+        '',
+        'If the opportunity is still active, I would appreciate the CIM, teaser, offering materials, or the next step in the NDA process.',
+        '',
+        'If the process has moved forward or the materials are not available, a brief status update would be helpful.',
+      ],
+    };
+  }
+
   if (followUpNumber >= 3) {
     return {
       preheader: `Checking in on the CIM or NDA process for ${businessName}.`,
@@ -1159,8 +1195,29 @@ export function buildDealHunterCimFollowUpEmail({
   followUpNumber = 1,
   requestedBy = '',
   communicationId = '',
+  manualFollowUp = null,
 } = {}) {
   const config = getConfig();
+  const manualTemplate = manualFollowUp !== null && manualFollowUp !== undefined;
+  let manualGreeting = '';
+  if (manualTemplate) {
+    if (!manualFollowUp || typeof manualFollowUp !== 'object' || Array.isArray(manualFollowUp)
+      || Object.keys(manualFollowUp).some((key) => key !== 'greeting')) {
+      throw new TypeError('The manual follow-up message option is invalid.');
+    }
+    if (!Number.isInteger(followUpNumber) || followUpNumber < 1 || followUpNumber > 5) {
+      throw new TypeError('The manual follow-up number must be an integer from 1 through 5.');
+    }
+    const providedGreeting = typeof manualFollowUp.greeting === 'string' ? manualFollowUp.greeting : '';
+    const hasUnsafeCharacter = [...providedGreeting].some((character) => {
+      const codePoint = character.codePointAt(0);
+      return codePoint <= 31 || codePoint === 127 || character === '<' || character === '>';
+    });
+    manualGreeting = providedGreeting.trim();
+    if (!manualGreeting || manualGreeting.length > 120 || hasUnsafeCharacter) {
+      throw new TypeError('The manual follow-up greeting must be one plain-text line of at most 120 characters.');
+    }
+  }
   const metadata = request.metadata && typeof request.metadata === 'object' ? request.metadata : {};
   const businessName = normalizeText(request.deal_name || 'the listed business', 160);
   const requester = normalizeText(config.workflow?.defaultAssignee || requestedBy || request.requested_by || 'Mathew Uckele', 120);
@@ -1173,14 +1230,14 @@ export function buildDealHunterCimFollowUpEmail({
     metadata.location ? { label: 'Location', value: metadata.location } : null,
   ].filter(Boolean);
   const paragraphs = [
-    'Hello,',
+    manualTemplate ? manualGreeting : 'Hello,',
     ...copy.paragraphs,
     'Best,',
     requester,
     'Uckele Group',
   ];
   const text = [
-    'Hello,',
+    manualTemplate ? manualGreeting : 'Hello,',
     '',
     ...copy.textLines,
     '',
@@ -1204,6 +1261,8 @@ export function buildDealHunterCimFollowUpEmail({
   });
 
   return {
+    templateVersion: `deal-hunter-cim-follow-up-${followUpNumber}-v1`,
+    ...(manualTemplate ? { greeting: manualGreeting } : {}),
     communicationId,
     kind: 'deal-hunter-cim-follow-up',
     idempotencyKey: buildCimEmailIdempotencyKey({ requestId: request.id, followUpNumber }),

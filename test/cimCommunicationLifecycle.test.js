@@ -37,6 +37,9 @@ const originalFetch = globalThis.fetch;
 let activeStorage = null;
 let resendMode = 'ok';
 let resendCalls = [];
+let heldProviderEntered = null;
+let releaseHeldProvider = null;
+let expectedManualProviderInvariant = null;
 const boundedCimRequestKeys = [
   'canCorrectRecipient', 'canRetry', 'correctionRoute', 'createdAt', 'deliveredAt', 'deliveryState',
   'errorSummary', 'followUpState', 'id', 'providerAcceptedAt', 'recipient', 'requestedAt', 'requestState',
@@ -69,10 +72,29 @@ before(() => {
       if (/^CIM \/ NDA request/i.test(providerBody.subject || '')) {
         assert.ok(storedBeforeProviderCall.total > 0, 'exact CIM communication must exist before provider transmission');
       }
+      if (expectedManualProviderInvariant) {
+        const expected = expectedManualProviderInvariant;
+        const durable = storedBeforeProviderCall.rows.find((row) => row.id === expected.communicationId);
+        assert.ok(durable, 'manual follow-up communication must already be durable during provider invocation');
+        assert.equal(durable.subject, expected.subject);
+        assert.equal(durable.body_text, expected.text);
+        assert.equal(durable.body_html_sanitized, expected.html);
+        assert.deepEqual(durable.to_addresses, [expected.recipient]);
+        assert.equal(durable.from_address, expected.senderEmail);
+        assert.equal(durable.metadata?.manualApproval?.senderDisplayName, expected.senderDisplayName);
+        assert.equal(durable.metadata?.manualApproval?.senderEmail, expected.senderEmail);
+        assert.equal(durable.metadata?.manualApproval?.senderFrom, expected.senderFrom);
+        assert.equal(durable.idempotency_key, expected.providerIdempotencyKey);
+        assert.equal(options.headers['Idempotency-Key'], expected.providerIdempotencyKey);
+      }
       resendCalls.push({
         body: providerBody,
         idempotencyKey: options.headers['Idempotency-Key'],
       });
+      if (resendMode === 'hold') {
+        heldProviderEntered?.();
+        await new Promise((resolve) => { releaseHeldProvider = resolve; });
+      }
       if (resendMode === 'ambiguous') throw new Error('simulated transport timeout after request dispatch');
       if (resendMode === 'fail') return new Response('provider rejected test message', { status: 503 });
       return Response.json({ id: `resend-message-${resendCalls.length}` }, { status: 200 });
@@ -84,6 +106,9 @@ before(() => {
 beforeEach(() => {
   resendMode = 'ok';
   resendCalls = [];
+  heldProviderEntered = null;
+  releaseHeldProvider = null;
+  expectedManualProviderInvariant = null;
   activeSourceCsv = sourceCsv;
 });
 
@@ -1669,4 +1694,657 @@ test('CIM history preserves hyphenated delivery filters and maps display aliases
   assert.deepEqual(captured.requestStates, ['provider_accepted']);
   assert.deepEqual(captured.deliveryStates, ['development-only', 'accepted']);
   assert.equal(captured.followUpState, 'not-scheduled');
+});
+
+test('manual executor persists exact communication before provider call and performs final terminal revalidation', async (t) => {
+  const dependencies = {
+    async getPause() { return { paused: false }; },
+    async getReadiness() { return { outboundConfigured: true, issues: [] }; },
+    async evaluateRecipientPolicy() { return { allowed: true, reason: '', override: null }; },
+    evaluateWindow() { return { allowed: true, reason: '' }; },
+  };
+  const makeDuePreparation = async (storage) => {
+    const { preparation } = await preparedManualApproval(storage);
+    const initial = await approvePreparedManual({ storage, preparation });
+    assert.equal(initial.success, true, initial.error);
+    let request = await storage.getDealHunterCimRequestById(initial.durableResult.cimRequest.id);
+    const service = await import('../server/services/dealHunterManualFollowUps.js');
+    const enrolled = await service.startDealHunterManualFollowUps({
+      opportunityId: request.opportunity_id,
+      requestId: request.id,
+      input: {},
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(enrolled.success, true, enrolled.error);
+    request = await storage.getDealHunterCimRequestById(request.id);
+    request = await storage.upsertDealHunterCimRequest({
+      ...request,
+      next_follow_up_at: new Date(Date.now() - 60_000).toISOString(),
+      updated_at: new Date(Date.now() - 30_000).toISOString(),
+    });
+    const followUpPreparation = await service.prepareDealHunterManualFollowUp({
+      opportunityId: request.opportunity_id,
+      requestId: request.id,
+      greeting: 'Hello Erin,',
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(followUpPreparation.success, true, followUpPreparation.error);
+    return { service, request, preparation: followUpPreparation };
+  };
+
+  await t.test('exact bytes are durable before the provider boundary', async (subtest) => {
+    const storage = testStorage(subtest);
+    const fixture = await makeDuePreparation(storage);
+    const providerCallsBefore = resendCalls.length;
+    expectedManualProviderInvariant = {
+      communicationId: fixture.preparation.review.communication.id,
+      providerIdempotencyKey: fixture.preparation.review.communication.providerIdempotencyKey,
+      recipient: fixture.preparation.review.recipient.email,
+      senderDisplayName: fixture.preparation.review.sender.displayName,
+      senderEmail: fixture.preparation.review.sender.email,
+      senderFrom: fixture.preparation.review.sender.from,
+      subject: fixture.preparation.review.message.subject,
+      text: fixture.preparation.review.message.body,
+      html: fixture.preparation.review.message.html,
+    };
+    const approved = await fixture.service.approveDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      preparationToken: fixture.preparation.preparationToken,
+      approvedProposalDigest: fixture.preparation.proposalDigest,
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(approved.success, true, approved.error);
+    assert.equal(Object.hasOwn(approved, 'emailResult'), false);
+    assert.equal(Object.hasOwn(approved, 'providerOutcomeAmbiguous'), false);
+    const communications = await storage.listCrmCommunications({ cimRequestId: fixture.request.id, page: 1, pageSize: 25 });
+    const followUp = communications.rows.find((item) => item.kind === 'deal-hunter-cim-follow-up');
+    assert.ok(followUp);
+    assert.equal(resendCalls.length, providerCallsBefore + 1);
+    assert.equal(resendCalls.at(-1).body.from, `${fixture.preparation.review.sender.displayName} <${fixture.preparation.review.sender.email}>`);
+    assert.equal(resendCalls.at(-1).body.reply_to, fixture.preparation.review.sender.replyTo);
+    assert.equal(followUp.from_address, fixture.preparation.review.sender.email);
+    assert.equal(followUp.metadata?.manualApproval?.senderFrom, fixture.preparation.review.sender.from);
+    assert.equal(followUp.subject, fixture.preparation.review.message.subject);
+    assert.equal(followUp.body_text, fixture.preparation.review.message.body);
+    assert.equal(followUp.body_html_sanitized, fixture.preparation.review.message.html);
+    assert.equal(followUp.idempotency_key, fixture.preparation.review.communication.providerIdempotencyKey);
+    assert.equal(followUp.delivery_state, 'accepted');
+    const current = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(current.follow_up_count, 1);
+    assert.equal(current.follow_up_state, 'scheduled');
+  });
+
+  await t.test('Stop during an in-flight provider call returns Checking while preserving the permanent stop and later accepted reconciliation', async (subtest) => {
+    // Break caught: Stop can report that the current touch was stopped even
+    // after provider authorization has begun and the outcome is unknowable.
+    const storage = testStorage(subtest);
+    const fixture = await makeDuePreparation(storage);
+    const providerCallsBefore = resendCalls.length;
+    const entered = new Promise((resolve) => { heldProviderEntered = resolve; });
+    resendMode = 'hold';
+    const approval = fixture.service.approveDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      preparationToken: fixture.preparation.preparationToken,
+      approvedProposalDigest: fixture.preparation.proposalDigest,
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    await entered;
+    const inFlight = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(inFlight.status, 'follow_up_pending');
+
+    const stopped = await fixture.service.stopDealHunterManualFollowUps({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      reason: 'Stop future follow-ups while current provider outcome resolves.',
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    releaseHeldProvider();
+    resendMode = 'ok';
+    const accepted = await approval;
+    assert.equal(stopped.code, 'outcome_unresolved');
+    assert.equal(stopped.followUps.state, 'stopped');
+    assert.equal(accepted.success, true, accepted.error);
+    assert.equal(resendCalls.length, providerCallsBefore + 1);
+    const current = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(current.follow_up_count, 1);
+    assert.equal(current.follow_up_state, 'stopped');
+    assert.equal(current.next_follow_up_at, null);
+    assert.equal(current.metadata.manualFollowUp.acceptedTouches.length, 1);
+  });
+
+  await t.test('accepted reconciliation preserves the original provider acceptance timestamp across delivered delayed bounced complained and suppressed transitions', async (subtest) => {
+    // Break caught: a later webhook state can erase accepted proof or replace
+    // the cadence anchor with that later event timestamp.
+    const { applyEmailLifecycleToCommunication } = await import('../server/services/communications.js');
+    const { reconcileDealHunterApprovedFollowUp } = await import('../server/services/dealHunter.js');
+    for (const deliveryState of ['delivered', 'delayed', 'bounced', 'complained', 'suppressed']) {
+      await subtest.test(deliveryState, async (stateTest) => {
+        const storage = testStorage(stateTest);
+        const fixture = await makeDuePreparation(storage);
+        const finalize = storage.finalizeDealHunterApprovedFollowUp.bind(storage);
+        let rejectFinalization = true;
+        storage.finalizeDealHunterApprovedFollowUp = async (input) => {
+          if (rejectFinalization) {
+            rejectFinalization = false;
+            return { applied: false, reason: 'simulated-finalization-failure', request: await storage.getDealHunterCimRequestById(input.requestId) };
+          }
+          return finalize(input);
+        };
+        const providerCallsBefore = resendCalls.length;
+        await assert.rejects(
+          fixture.service.approveDealHunterManualFollowUp({
+            opportunityId: fixture.request.opportunity_id,
+            requestId: fixture.request.id,
+            preparationToken: fixture.preparation.preparationToken,
+            approvedProposalDigest: fixture.preparation.proposalDigest,
+            session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+            storage,
+            now: new Date(),
+            dependencies,
+          }),
+          /accepted by the provider/i,
+        );
+        const communicationId = fixture.preparation.review.communication.id;
+        const acceptedCommunication = await storage.getCrmCommunication(communicationId);
+        const originalAcceptedAt = acceptedCommunication.metadata?.manualFollowUp?.firstProviderAcceptedAt;
+        assert.ok(originalAcceptedAt, 'the original provider-acceptance instant must be durable before lifecycle transitions');
+        const laterAt = new Date(Date.parse(originalAcceptedAt) + 60_000).toISOString();
+        await applyEmailLifecycleToCommunication({
+          id: `manual-${deliveryState}-event`,
+          provider: 'resend',
+          event_type: deliveryState,
+          message_id: acceptedCommunication.provider_message_id,
+          communication_id: communicationId,
+          created_at: laterAt,
+          metadata: {},
+        }, { storage });
+
+        const beforeReconciliation = await storage.getDealHunterCimRequestById(fixture.request.id);
+        const reconciled = await reconcileDealHunterApprovedFollowUp({
+          storage,
+          request: beforeReconciliation,
+          actor: 'manual-reconciliation-test',
+        });
+        assert.equal(reconciled.status, 'sent', reconciled.reason);
+        assert.equal(resendCalls.length, providerCallsBefore + 1);
+        const current = await storage.getDealHunterCimRequestById(fixture.request.id);
+        assert.equal(current.follow_up_count, 1);
+        assert.equal(current.last_follow_up_at, originalAcceptedAt);
+        assert.equal(current.metadata.manualFollowUp.acceptedTouches[0].acceptedAt, originalAcceptedAt);
+        if (['bounced', 'complained', 'suppressed'].includes(deliveryState)) {
+          assert.equal(current.follow_up_state, 'stopped');
+          assert.equal(current.next_follow_up_at, null);
+        } else {
+          assert.equal(current.follow_up_state, 'scheduled');
+          assert.notEqual(current.next_follow_up_at, laterAt);
+        }
+      });
+    }
+  });
+
+  await t.test('development-only logging does not count or report provider acceptance and leaves the touch safely reviewable', async (subtest) => {
+    // Break caught: the console provider's logged result is finalized as if a
+    // real provider accepted the private broker message.
+    const storage = testStorage(subtest);
+    const fixture = await makeDuePreparation(storage);
+    const { getConfig } = await import('../server/config.js');
+    const config = getConfig();
+    const priorProvider = config.delivery.provider;
+    const originalConsoleLog = console.log;
+    let developmentProviderCalls = 0;
+    config.delivery.provider = 'console';
+    console.log = (...args) => {
+      if (String(args[0] || '').startsWith('[mail:deal-hunter-cim-follow-up]')) developmentProviderCalls += 1;
+    };
+    try {
+      const result = await fixture.service.approveDealHunterManualFollowUp({
+        opportunityId: fixture.request.opportunity_id,
+        requestId: fixture.request.id,
+        preparationToken: fixture.preparation.preparationToken,
+        approvedProposalDigest: fixture.preparation.proposalDigest,
+        session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+        storage,
+        now: new Date(),
+        dependencies,
+      });
+      assert.equal(result.code, 'development_only');
+      assert.equal(developmentProviderCalls, 1);
+      const communication = await storage.getCrmCommunication(fixture.preparation.review.communication.id);
+      assert.equal(communication.delivery_state, 'development-only');
+      const current = await storage.getDealHunterCimRequestById(fixture.request.id);
+      assert.equal(current.follow_up_count, 0);
+      assert.equal(current.metadata.manualFollowUp.acceptedTouches, undefined);
+      assert.equal(current.next_follow_up_at, fixture.request.next_follow_up_at);
+      assert.notEqual(current.status, 'follow_up_pending');
+      assert.equal(await storage.getDealHunterCimRecipientClaim(current.recipient_email), null);
+    } finally {
+      config.delivery.provider = priorProvider;
+      console.log = originalConsoleLog;
+    }
+  });
+
+  await t.test('definitive failure preserves the logical touch for an exact newly approved retry', async (subtest) => {
+    const storage = testStorage(subtest);
+    const fixture = await makeDuePreparation(storage);
+    const providerCallsBefore = resendCalls.length;
+    resendMode = 'fail';
+    const failed = await fixture.service.approveDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      preparationToken: fixture.preparation.preparationToken,
+      approvedProposalDigest: fixture.preparation.proposalDigest,
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(failed.success, false);
+    assert.equal(failed.code, 'provider_failed');
+    assert.equal(resendCalls.length, providerCallsBefore + 1);
+    const firstAttempt = resendCalls.at(-1);
+    let current = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(current.follow_up_count, 0);
+    assert.equal(current.follow_up_state, 'failed');
+    assert.equal(current.next_follow_up_at, fixture.request.next_follow_up_at);
+
+    const retry = await fixture.service.prepareDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      input: {},
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(retry.success, true, retry.error);
+    assert.equal(retry.review.mode, 'exact-retry');
+    assert.equal(retry.review.message.greetingEditable, false);
+    assert.equal(retry.review.message.subject, fixture.preparation.review.message.subject);
+    assert.equal(retry.review.message.body, fixture.preparation.review.message.body);
+    assert.equal(retry.review.message.html, fixture.preparation.review.message.html);
+    assert.equal(retry.review.communication.id, fixture.preparation.review.communication.id);
+    assert.equal(retry.review.communication.providerIdempotencyKey, fixture.preparation.review.communication.providerIdempotencyKey);
+
+    resendMode = 'ok';
+    const accepted = await fixture.service.approveDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      preparationToken: retry.preparationToken,
+      approvedProposalDigest: retry.proposalDigest,
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(accepted.success, true, accepted.error);
+    assert.equal(resendCalls.length, providerCallsBefore + 2);
+    assert.equal(resendCalls.at(-1).idempotencyKey, firstAttempt.idempotencyKey);
+    assert.deepEqual(resendCalls.at(-1).body, firstAttempt.body);
+    const communications = await storage.listCrmCommunications({ cimRequestId: fixture.request.id, page: 1, pageSize: 25 });
+    assert.equal(communications.rows.filter((item) => item.kind === 'deal-hunter-cim-follow-up').length, 1);
+    current = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(current.follow_up_count, 1);
+    assert.equal(current.follow_up_state, 'scheduled');
+  });
+
+  await t.test('ambiguous outcome blocks retransmission and later accepted proof reconciles once', async (subtest) => {
+    const storage = testStorage(subtest);
+    const fixture = await makeDuePreparation(storage);
+    const providerCallsBefore = resendCalls.length;
+    resendMode = 'ambiguous';
+    const ambiguous = await fixture.service.approveDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      preparationToken: fixture.preparation.preparationToken,
+      approvedProposalDigest: fixture.preparation.proposalDigest,
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(ambiguous.success, false);
+    assert.equal(ambiguous.code, 'outcome_unresolved');
+    assert.equal(resendCalls.length, providerCallsBefore + 1);
+    let current = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(current.follow_up_count, 0);
+    assert.equal(current.follow_up_state, 'ambiguous');
+    assert.equal(current.next_follow_up_at, null);
+    const outbox = await storage.listCrmEmailOutbox({ submissionId: current.submission_id, states: ['ambiguous'], limit: 10 });
+    assert.equal(outbox.length, 1);
+    assert.equal(outbox[0].communication_id, fixture.preparation.review.communication.id);
+    const mismatchedProof = await storage.recordDealHunterManualFollowUpAmbiguity({
+      requestId: 'wrong-request',
+      submissionId: current.submission_id,
+      communicationId: fixture.preparation.review.communication.id,
+      idempotencyKey: fixture.preparation.review.communication.providerIdempotencyKey,
+      actor: 'manual-approval-admin',
+      ambiguousAt: new Date().toISOString(),
+    });
+    assert.equal(mismatchedProof, null);
+
+    const retry = await fixture.service.prepareDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      input: {},
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(retry.success, false);
+    assert.equal(retry.code, 'outcome_unresolved');
+    const replayBeforeProof = await fixture.service.approveDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      preparationToken: fixture.preparation.preparationToken,
+      approvedProposalDigest: fixture.preparation.proposalDigest,
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(replayBeforeProof.success, false);
+    assert.equal(replayBeforeProof.code, 'outcome_unresolved');
+    assert.equal(resendCalls.length, providerCallsBefore + 1);
+
+    const communication = await storage.getCrmCommunication(fixture.preparation.review.communication.id);
+    const reconciledAt = new Date().toISOString();
+    await storage.updateCrmCommunication(communication.id, {
+      provider_message_id: `reconciled-provider-${providerCallsBefore}`,
+      delivery_state: 'accepted',
+      delivery_state_at: reconciledAt,
+      updated_at: reconciledAt,
+      updated_by: 'reconciliation-test',
+    });
+    const reconciled = await fixture.service.approveDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      preparationToken: fixture.preparation.preparationToken,
+      approvedProposalDigest: fixture.preparation.proposalDigest,
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(reconciled.success, true, reconciled.error);
+    assert.equal(resendCalls.length, providerCallsBefore + 1);
+    current = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(current.follow_up_count, 1);
+    assert.equal(current.follow_up_state, 'scheduled');
+  });
+
+  await t.test('accepted communication proof repairs failed finalization without a second provider call', async (subtest) => {
+    const storage = testStorage(subtest);
+    const fixture = await makeDuePreparation(storage);
+    const finalize = storage.finalizeDealHunterApprovedFollowUp.bind(storage);
+    let finalizationCalls = 0;
+    storage.finalizeDealHunterApprovedFollowUp = async (input) => {
+      finalizationCalls += 1;
+      if (finalizationCalls === 1) return { applied: false, reason: 'simulated-finalization-failure', request: await storage.getDealHunterCimRequestById(input.requestId) };
+      return finalize(input);
+    };
+    const providerCallsBefore = resendCalls.length;
+    await assert.rejects(
+      fixture.service.approveDealHunterManualFollowUp({
+        opportunityId: fixture.request.opportunity_id,
+        requestId: fixture.request.id,
+        preparationToken: fixture.preparation.preparationToken,
+        approvedProposalDigest: fixture.preparation.proposalDigest,
+        session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+        storage,
+        now: new Date(),
+        dependencies,
+      }),
+      /accepted by the provider/i,
+    );
+    assert.equal(resendCalls.length, providerCallsBefore + 1);
+    let current = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(current.follow_up_count, 0);
+    assert.equal(current.status, 'follow_up_pending');
+    const { getTriageOpportunityDetail } = await import('../server/services/dealHunterTriage.js');
+    const detail = await getTriageOpportunityDetail({
+      opportunityId: fixture.request.opportunity_id,
+      storage,
+      reconcileAcceptedManualFollowUps: true,
+      actor: 'manual-approval-admin',
+    });
+    assert.equal(detail.ok, true, detail.error);
+    assert.equal(detail.brokerMaterials.existingRequest.followUps.followUpCount, 1);
+    assert.equal(resendCalls.length, providerCallsBefore + 1);
+    const reconciled = await fixture.service.approveDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      preparationToken: fixture.preparation.preparationToken,
+      approvedProposalDigest: fixture.preparation.proposalDigest,
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(reconciled.success, true, reconciled.error);
+    assert.equal(resendCalls.length, providerCallsBefore + 1);
+    current = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(current.follow_up_count, 1);
+    assert.equal(current.follow_up_state, 'scheduled');
+    const activities = await storage.listCrmActivityEvents({ submissionId: current.submission_id, limit: 500 });
+    assert.equal(activities.filter((event) => event.event_type === 'cim.manual-follow-up-accepted').length, 1);
+    assert.ok(finalizationCalls >= 2);
+  });
+
+  await t.test('concurrent administrator approvals converge through the real claim and executor', async (subtest) => {
+    const storage = testStorage(subtest);
+    const fixture = await makeDuePreparation(storage);
+    const secondPrincipal = { principal_id: 'manual-principal-2', role: 'admin', username: 'manual-approval-admin-2' };
+    const secondPreparation = await fixture.service.prepareDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      input: { greeting: 'Hello Erin,' },
+      session: secondPrincipal,
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(secondPreparation.success, true, secondPreparation.error);
+    const providerCallsBefore = resendCalls.length;
+    const [first, second] = await Promise.all([
+      fixture.service.approveDealHunterManualFollowUp({
+        opportunityId: fixture.request.opportunity_id,
+        requestId: fixture.request.id,
+        preparationToken: fixture.preparation.preparationToken,
+        approvedProposalDigest: fixture.preparation.proposalDigest,
+        session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+        storage,
+        now: new Date(),
+        dependencies,
+      }),
+      fixture.service.approveDealHunterManualFollowUp({
+        opportunityId: fixture.request.opportunity_id,
+        requestId: fixture.request.id,
+        preparationToken: secondPreparation.preparationToken,
+        approvedProposalDigest: secondPreparation.proposalDigest,
+        session: secondPrincipal,
+        storage,
+        now: new Date(),
+        dependencies,
+      }),
+    ]);
+    assert.equal(resendCalls.length, providerCallsBefore + 1, JSON.stringify([first, second]));
+    const communications = await storage.listCrmCommunications({ cimRequestId: fixture.request.id, page: 1, pageSize: 25 });
+    assert.equal(communications.rows.filter((item) => item.kind === 'deal-hunter-cim-follow-up').length, 1);
+    const current = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(current.follow_up_count, 1);
+    const activities = await storage.listCrmActivityEvents({ submissionId: current.submission_id, limit: 500 });
+    assert.equal(activities.filter((event) => event.event_type === 'cim.manual-follow-up-accepted').length, 1);
+  });
+
+  await t.test('claim renewal cannot restore a stale CIM request as canonical owner before provider authorization', async (subtest) => {
+    // Break caught: renewing an older request's operational claim updates
+    // updated_at and can make that stale conversation look canonical again.
+    const storage = testStorage(subtest);
+    const fixture = await makeDuePreparation(storage);
+    const { buildDealHunterCimRequestId } = await import('../server/services/dealHunter.js');
+    const { loadBrokerMaterialsAuthority } = await import('../server/services/dealHunterBrokerMaterials.js');
+    const currentOwnerEmail = 'new-canonical-owner@example.test';
+    const currentOwnerId = buildDealHunterCimRequestId(fixture.request.opportunity_id, currentOwnerEmail);
+    const listSecureDocumentsForSubmission = storage.listSecureDocumentsForSubmission.bind(storage);
+    const renewDealHunterCimRequestClaim = storage.renewDealHunterCimRequestClaim.bind(storage);
+    let insertedCurrentOwner = false;
+    let claimObserved = false;
+    let renewalCalls = 0;
+    let ownerBeforeRenewal = '';
+    let ownerAfterRenewal = '';
+    let staleUpdatedAtBeforeRenewal = '';
+    let staleUpdatedAtAfterRenewal = '';
+
+    storage.listSecureDocumentsForSubmission = async (submissionId) => {
+      const communication = await storage.getCrmCommunication(fixture.preparation.review.communication.id);
+      if (communication && !insertedCurrentOwner) {
+        const claimedStaleRequest = await storage.getDealHunterCimRequestById(fixture.request.id);
+        claimObserved = claimedStaleRequest.status === 'follow_up_pending';
+        const currentOwnerAtMs = Date.parse(claimedStaleRequest.updated_at) + 1;
+        const currentOwnerAt = new Date(currentOwnerAtMs).toISOString();
+        const metadata = { ...(claimedStaleRequest.metadata || {}) };
+        delete metadata.manualFollowUp;
+        await storage.upsertDealHunterCimRequest({
+          ...claimedStaleRequest,
+          id: currentOwnerId,
+          created_at: currentOwnerAt,
+          updated_at: currentOwnerAt,
+          recipient_email: currentOwnerEmail,
+          status: 'sent',
+          request_state: 'provider_accepted',
+          delivery_state: 'accepted',
+          delivery_state_at: currentOwnerAt,
+          follow_up_state: 'not-scheduled',
+          follow_up_count: 0,
+          next_follow_up_at: null,
+          first_requested_at: currentOwnerAt,
+          first_provider_accepted_at: currentOwnerAt,
+          provider_message_id: 'provider-new-canonical-owner',
+          reply_to_address: 'new-canonical-owner@inbound.example.test',
+          retry_of_request_id: fixture.request.id,
+          last_attempt_at: currentOwnerAt,
+          last_activity_at: currentOwnerAt,
+          metadata,
+        });
+        insertedCurrentOwner = true;
+        const delayMs = Math.max(0, currentOwnerAtMs - Date.now() + 1);
+        if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+      return listSecureDocumentsForSubmission(submissionId);
+    };
+
+    storage.renewDealHunterCimRequestClaim = async (input) => {
+      renewalCalls += 1;
+      const before = await loadBrokerMaterialsAuthority({ opportunityId: fixture.request.opportunity_id, storage });
+      ownerBeforeRenewal = before.existingRequest?.id || '';
+      staleUpdatedAtBeforeRenewal = (await storage.getDealHunterCimRequestById(fixture.request.id)).updated_at;
+      const result = await renewDealHunterCimRequestClaim(input);
+      staleUpdatedAtAfterRenewal = result.request?.updated_at || '';
+      const after = await loadBrokerMaterialsAuthority({ opportunityId: fixture.request.opportunity_id, storage });
+      ownerAfterRenewal = after.existingRequest?.id || '';
+      return result;
+    };
+
+    const providerCallsBefore = resendCalls.length;
+    const approved = await fixture.service.approveDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      preparationToken: fixture.preparation.preparationToken,
+      approvedProposalDigest: fixture.preparation.proposalDigest,
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+
+    assert.equal(insertedCurrentOwner, true);
+    assert.equal(claimObserved, true);
+    assert.equal(renewalCalls, 1);
+    assert.notEqual(staleUpdatedAtAfterRenewal, staleUpdatedAtBeforeRenewal);
+    assert.equal(
+      resendCalls.length,
+      providerCallsBefore,
+      `provider call escaped after renewal changed owner from ${ownerBeforeRenewal} to ${ownerAfterRenewal}`,
+    );
+    assert.equal(ownerBeforeRenewal, currentOwnerId);
+    assert.equal(ownerAfterRenewal, currentOwnerId);
+    const finalAuthority = await loadBrokerMaterialsAuthority({ opportunityId: fixture.request.opportunity_id, storage });
+    assert.equal(finalAuthority.existingRequest?.id, currentOwnerId);
+    assert.equal(approved.success, false);
+    assert.equal(approved.code, 'blocked');
+    const staleRequest = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(staleRequest.follow_up_count, 0);
+    assert.equal(staleRequest.follow_up_state, 'stopped');
+    assert.equal(staleRequest.next_follow_up_at, null);
+  });
+
+  await t.test('materials arriving after communication persistence stop final provider authorization', async (subtest) => {
+    const storage = testStorage(subtest);
+    const fixture = await makeDuePreparation(storage);
+    const listSecureDocumentsForSubmission = storage.listSecureDocumentsForSubmission.bind(storage);
+    let insertedLateCim = false;
+    storage.listSecureDocumentsForSubmission = async (submissionId) => {
+      const communication = await storage.getCrmCommunication(fixture.preparation.review.communication.id);
+      if (communication && !insertedLateCim) {
+        insertedLateCim = true;
+        const arrivedAt = new Date().toISOString();
+        await storage.insertSecureDocument({
+          id: 'late-cim-after-follow-up-communication',
+          request_id: fixture.request.id,
+          submission_id: submissionId,
+          created_at: arrivedAt,
+          document_type: 'cim',
+          file_name: 'late-cim.pdf',
+          original_name: 'CIM.pdf',
+          mime_type: 'application/pdf',
+          size_bytes: 1,
+          storage_path: '/test/late-cim.pdf',
+          uploaded_by_email: 'broker@example.test',
+          note: 'Arrived during final manual follow-up authorization.',
+          nda_accepted_at: null,
+        });
+      }
+      return listSecureDocumentsForSubmission(submissionId);
+    };
+    const providerCallsBefore = resendCalls.length;
+    const approved = await fixture.service.approveDealHunterManualFollowUp({
+      opportunityId: fixture.request.opportunity_id,
+      requestId: fixture.request.id,
+      preparationToken: fixture.preparation.preparationToken,
+      approvedProposalDigest: fixture.preparation.proposalDigest,
+      session: { principal_id: 'manual-principal-1', role: 'admin', username: 'manual-approval-admin' },
+      storage,
+      now: new Date(),
+      dependencies,
+    });
+    assert.equal(approved.success, false);
+    assert.equal(approved.code, 'blocked');
+    assert.equal(resendCalls.length, providerCallsBefore);
+    const communications = await storage.listCrmCommunications({ cimRequestId: fixture.request.id, page: 1, pageSize: 25 });
+    assert.equal(communications.rows.filter((item) => item.kind === 'deal-hunter-cim-follow-up').length, 1);
+    assert.equal(insertedLateCim, true);
+    assert.ok(await storage.getSecureDocument('late-cim-after-follow-up-communication'));
+    const current = await storage.getDealHunterCimRequestById(fixture.request.id);
+    assert.equal(current.follow_up_count, 0);
+    assert.equal(current.follow_up_state, 'stopped');
+    assert.equal(current.next_follow_up_at, null);
+  });
 });

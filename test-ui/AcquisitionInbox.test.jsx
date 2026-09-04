@@ -95,6 +95,61 @@ function preparedBrokerMaterials(overrides = {}) {
   };
 }
 
+function manualFollowUps(overrides = {}) {
+  return {
+    enrolled: true,
+    policyVersion: 'deal-hunter-manual-follow-up-v1',
+    maximumFollowUps: 5,
+    followUpCount: 0,
+    currentFollowUpNumber: 1,
+    nextFollowUpAt: '2026-09-03T16:00:00.000Z',
+    state: 'due',
+    terminalReason: '',
+    retryEligible: false,
+    preparationBlockers: [],
+    sendBlockers: [],
+    ...overrides,
+  };
+}
+
+function detailWithFollowUps(projection = manualFollowUps()) {
+  const detail = detailResponse();
+  detail.brokerMaterials.existingRequest = {
+    id: 'request-1', status: 'sent', requestState: 'provider_accepted', deliveryState: 'accepted', followUpState: 'scheduled',
+    recipient: { email: 'jane@example.test', displayName: 'Jane Broker' }, subject: 'Approved initial subject',
+    providerAcceptedAt: '2026-09-01T16:01:00.000Z', requestedAt: '2026-09-01T16:00:00.000Z',
+    updatedAt: '2026-09-01T16:01:00.000Z', followUps: projection,
+  };
+  return detail;
+}
+
+function preparedFollowUp(overrides = {}) {
+  return {
+    success: true,
+    previewOnly: false,
+    preparationToken: 'signed.follow-up',
+    proposalDigest: 'b'.repeat(64),
+    preparedAt: '2026-09-03T16:01:00.000Z',
+    expiresAt: '2099-09-03T16:16:00.000Z',
+    followUps: manualFollowUps(),
+    sendBlockers: [],
+    review: {
+      mode: 'first-attempt', followUpNumber: 1, dueAt: '2026-09-03T16:00:00.000Z',
+      initialRequestedAt: '2026-09-01T16:00:00.000Z', previousAcceptedAt: '2026-09-01T16:01:00.000Z',
+      recipient: { displayName: 'Jane Broker', email: 'jane@example.test' },
+      sender: { displayName: 'Mathew Uckele', email: 'mathew@example.test', replyTo: 'request@example.test' },
+      message: {
+        greeting: 'Hello Jane,', greetingEditable: true,
+        subject: 'Following up on Evergreen Fire Protection',
+        body: 'Hello Jane,\n\nFollowing up on Evergreen Fire Protection.\n\nThank you,\nMathew',
+        html: '<p>Hello Jane,</p>', templateVersion: 'deal-hunter-cim-follow-up-1-v1',
+      },
+      communication: { id: 'follow-up-communication-1', providerIdempotencyKey: 'follow-up-1' },
+    },
+    ...overrides,
+  };
+}
+
 function queueResponse(overrides = {}) {
   return {
     success: true,
@@ -185,8 +240,9 @@ afterEach(() => {
 
 describe('Acquisition Inbox dashboard entry', () => {
   test('opens Inbox by default and keeps legacy operations separately reachable', async () => {
-    const fetchMock = vi.fn(async (input) => {
+    const fetchMock = vi.fn(async (input, options = {}) => {
       const url = String(input);
+      const method = String(options.method || 'GET').toUpperCase();
       if (url === '/api/admin/session') {
         return jsonResponse({
           authenticated: true,
@@ -199,6 +255,9 @@ describe('Acquisition Inbox dashboard entry', () => {
         });
       }
       if (url.startsWith('/api/admin/deal-hunter/triage?')) return jsonResponse(queueResponse());
+      if (method === 'GET' && url === '/api/admin/onboarding') {
+        return jsonResponse({ success: true, progress: [] });
+      }
       return jsonResponse({ success: false, error: `Unexpected request: ${url}` }, { ok: false, status: 404 });
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -212,12 +271,25 @@ describe('Acquisition Inbox dashboard entry', () => {
     expect(screen.getAllByText('Needs Review').length).toBeGreaterThan(0);
 
     await waitFor(() => {
-      expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
-        '/api/admin/session',
-        expect.stringMatching(/^\/api\/admin\/deal-hunter\/triage\?/),
-      ]);
+      expect(fetchMock.mock.calls.map(([url]) => String(url))).toContain('/api/admin/onboarding');
     });
-    expect(fetchMock.mock.calls.some(([url]) => /\/review|\/backfill-review|\/send|\/cim-|\/deal-os-import/.test(String(url)))).toBe(false);
+    const requestedUrls = fetchMock.mock.calls.map(([url]) => String(url));
+    const requestSignatures = fetchMock.mock.calls.map(([url, options = {}]) => (
+      `${String(options.method || 'GET').toUpperCase()} ${String(url)}`
+    ));
+    expect(requestedUrls).toHaveLength(3);
+    expect(requestedUrls).toEqual(expect.arrayContaining([
+      '/api/admin/session',
+      expect.stringMatching(/^\/api\/admin\/deal-hunter\/triage\?/),
+      '/api/admin/onboarding',
+    ]));
+    expect(requestSignatures).toEqual(expect.arrayContaining([
+      'GET /api/admin/session',
+      expect.stringMatching(/^GET \/api\/admin\/deal-hunter\/triage\?/),
+      'GET /api/admin/onboarding',
+    ]));
+    expect(requestSignatures.some((signature) => /^(POST|PUT|PATCH|DELETE) /.test(signature))).toBe(false);
+    expect(requestedUrls.some((url) => /\/review|\/backfill-review|\/send|\/cim-|\/deal-os-import/.test(url))).toBe(false);
   });
 });
 
@@ -1461,6 +1533,157 @@ describe('Acquisition Inbox Broker Materials authority', () => {
     expect(calls.at(-1)).toEqual({ url: '/api/admin/deal-hunter/triage/opp-1', method: 'GET' });
   });
 
+  test('Stop transport failure never claims permanent Stop when authoritative refresh remains scheduled', async () => {
+    const reconciliation = deferred();
+    const calls = [];
+    let detailLoads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      const method = options.method || 'GET';
+      calls.push({ url, method });
+      if (url.endsWith('/follow-ups/request-1/stop')) throw new TypeError('Network connection lost');
+      if (url.endsWith('/triage/opp-1')) {
+        detailLoads += 1;
+        if (detailLoads === 1) return jsonResponse(detailWithFollowUps(manualFollowUps({ state: 'scheduled' })));
+        return reconciliation.promise;
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop Follow-Up Sequence' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Permanently Stop' }));
+
+    expect(await screen.findByText('Stop outcome is unknown.')).toBeVisible();
+    expect(screen.getByRole('status')).toHaveTextContent('Checking Stop status.');
+    expect(screen.queryByText(/Future follow-ups are permanently stopped/i)).not.toBeInTheDocument();
+
+    await act(async () => reconciliation.resolve(jsonResponse(detailWithFollowUps(manualFollowUps({ state: 'scheduled' })))));
+    await waitFor(() => expect(screen.queryByText('Stop outcome is unknown.')).not.toBeInTheDocument());
+    expect(screen.getByText('Scheduled')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Stop Follow-Up Sequence' })).toBeEnabled();
+    expect(screen.queryByText(/Future follow-ups are permanently stopped/i)).not.toBeInTheDocument();
+    expect(calls.filter(({ url }) => url.endsWith('/follow-ups/request-1/stop'))).toHaveLength(1);
+    expect(calls.filter(({ url }) => url.endsWith('/triage/opp-1'))).toHaveLength(2);
+    expect(calls.filter(({ url }) => url.endsWith('/follow-ups/request-1/approve'))).toHaveLength(0);
+  });
+
+  test('explicit server outcome_unresolved Stop retains permanent-future-stop wording', async () => {
+    let detailLoads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input) => {
+      const url = String(input);
+      if (url.endsWith('/follow-ups/request-1/stop')) {
+        return jsonResponse({
+          success: false,
+          code: 'outcome_unresolved',
+          error: 'Future follow-ups are permanently stopped, but the provider-authorized current touch may still complete. Check status.',
+          followUps: manualFollowUps({ state: 'stopped', currentFollowUpNumber: null, nextFollowUpAt: '' }),
+        }, { ok: false, status: 503 });
+      }
+      if (url.endsWith('/triage/opp-1')) {
+        detailLoads += 1;
+        const projection = detailLoads === 1
+          ? manualFollowUps({ state: 'due' })
+          : manualFollowUps({ state: 'stopped', currentFollowUpNumber: null, nextFollowUpAt: '' });
+        return jsonResponse(detailWithFollowUps(projection));
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop Follow-Up Sequence' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Permanently Stop' }));
+
+    expect(await screen.findByText('Future follow-ups are stopped.')).toBeVisible();
+    expect(screen.getByText('The current follow-up outcome is still being checked.')).toBeVisible();
+    expect(screen.getByText('Stopped')).toBeVisible();
+    expect(screen.queryByText('Stop outcome is unknown.')).not.toBeInTheDocument();
+  });
+
+  test('Acquisition Inbox refreshes Phase 3 detail without background focus theft', async () => {
+    const phase3Writes = [];
+    let projection = manualFollowUps({
+      enrolled: false, state: 'not-enrolled', currentFollowUpNumber: 1, nextFollowUpAt: '',
+      startEligible: true, startBlockers: [],
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/follow-ups/request-1/start')) {
+        phase3Writes.push({ url, body: JSON.parse(options.body) });
+        projection = manualFollowUps({ state: 'scheduled' });
+        return jsonResponse({ success: true, requestId: 'request-1', followUps: projection });
+      }
+      if (url.endsWith('/follow-ups/request-1/prepare')) {
+        const body = JSON.parse(options.body);
+        phase3Writes.push({ url, body });
+        const greeting = body.greeting || 'Hello Jane,';
+        const prepared = preparedFollowUp();
+        return jsonResponse({
+          ...prepared,
+          review: { ...prepared.review, message: { ...prepared.review.message, greeting, body: `${greeting}\n\nFollowing up on Evergreen Fire Protection.` } },
+        });
+      }
+      if (url.endsWith('/follow-ups/request-1/approve')) {
+        phase3Writes.push({ url, body: JSON.parse(options.body) });
+        const sendBlockers = [{ code: 'cim_outreach_paused', message: 'Deal Hunter CIM outreach is globally paused.' }];
+        projection = manualFollowUps({ sendBlockers });
+        return jsonResponse({ success: false, code: 'send_blocked', error: sendBlockers[0].message, sendBlockers, followUps: projection }, { ok: false, status: 409 });
+      }
+      if (url.endsWith('/follow-ups/request-1/stop')) {
+        phase3Writes.push({ url, body: JSON.parse(options.body) });
+        projection = manualFollowUps({ state: 'stopped', currentFollowUpNumber: null, nextFollowUpAt: '' });
+        return jsonResponse({ success: true, requestId: 'request-1', followUps: projection });
+      }
+      if (url === '/api/admin/deal-hunter/opportunities/opp-1/facts/broker_name') {
+        return jsonResponse({ success: true, fact: { field: 'broker_name', value: 'Jane Broker', verified: true } });
+      }
+      if (url.endsWith('/triage/opp-1')) return jsonResponse(detailWithFollowUps(projection));
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Start Follow-Up Sequence' }));
+    expect(await screen.findByText('Scheduled')).toBeVisible();
+
+    projection = manualFollowUps({ state: 'due' });
+    fireEvent.change(screen.getByLabelText('Verified fact field'), { target: { value: 'broker_name' } });
+    fireEvent.change(screen.getByLabelText('Verified fact value'), { target: { value: 'Jane Broker' } });
+    const save = screen.getByRole('button', { name: 'Save verified fact' });
+    save.focus();
+    fireEvent.click(save);
+    expect(await screen.findByText('Due')).toBeVisible();
+    expect(save).toHaveFocus();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Review Follow-Up' }));
+    expect(await screen.findByRole('heading', { name: 'Review Follow-Up 1 of 5' })).toBeVisible();
+    fireEvent.change(screen.getByLabelText('Follow-up greeting'), { target: { value: 'Hi Jane,' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Update Preview' }));
+    await waitFor(() => expect(screen.getByLabelText('Follow-up greeting')).toHaveValue('Hi Jane,'));
+    fireEvent.click(screen.getByRole('button', { name: 'Approve & Send Follow-Up' }));
+    expect(await screen.findByText('Deal Hunter CIM outreach is globally paused.')).toBeVisible();
+    expect(screen.getByLabelText('Complete follow-up body')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Approve & Send Follow-Up' })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop Follow-Up Sequence' }));
+    fireEvent.change(screen.getByLabelText('Stop reason (optional)'), { target: { value: 'Broker asked us to stop.' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Permanently Stop' }));
+    expect(await screen.findByText('Stopped')).toBeVisible();
+
+    expect(phase3Writes).toEqual([
+      { url: '/api/admin/deal-hunter/triage/opp-1/broker-materials/follow-ups/request-1/start', body: {} },
+      { url: '/api/admin/deal-hunter/triage/opp-1/broker-materials/follow-ups/request-1/prepare', body: {} },
+      { url: '/api/admin/deal-hunter/triage/opp-1/broker-materials/follow-ups/request-1/prepare', body: { greeting: 'Hi Jane,' } },
+      {
+        url: '/api/admin/deal-hunter/triage/opp-1/broker-materials/follow-ups/request-1/approve',
+        body: { preparationToken: 'signed.follow-up', approvedProposalDigest: 'b'.repeat(64) },
+      },
+      { url: '/api/admin/deal-hunter/triage/opp-1/broker-materials/follow-ups/request-1/stop', body: { reason: 'Broker asked us to stop.' } },
+    ]);
+  });
+
   test('ignores late prepare and approve responses after selecting a different canonical opportunity', async () => {
     const latePrepare = deferred();
     const lateApprove = deferred();
@@ -1509,5 +1732,30 @@ describe('Acquisition Inbox Broker Materials authority', () => {
     expect(await screen.findByLabelText('Complete message body')).toBeVisible();
     expect(screen.queryByRole('button', { name: 'Approve & Send' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Save verified fact|Correct Recipient|Retry/i })).not.toBeInTheDocument();
+  });
+
+  test('viewer never receives preparation token digest greeting editor approve retry stop or start controls', async () => {
+    const calls = [];
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      calls.push({ url, method: options.method || 'GET', body: options.body ? JSON.parse(options.body) : undefined });
+      if (url.endsWith('/follow-ups/request-1/prepare')) {
+        return jsonResponse(preparedFollowUp({ previewOnly: true, preparationToken: undefined, proposalDigest: undefined }));
+      }
+      if (url.endsWith('/triage/opp-1')) return jsonResponse(detailWithFollowUps(manualFollowUps({ state: 'due' })));
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox({ readOnly: true });
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Preview Follow-Up' }));
+    expect(await screen.findByLabelText('Complete follow-up body')).toBeVisible();
+    expect(screen.queryByLabelText('Follow-up greeting')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Approve|Review Retry|Stop Follow-Up|Start Follow-Up/i })).not.toBeInTheDocument();
+    expect(document.body).not.toHaveTextContent('signed.follow-up');
+    expect(document.body).not.toHaveTextContent('bbbbbbbb');
+    expect(calls.filter(({ method }) => method === 'POST')).toEqual([{
+      url: '/api/admin/deal-hunter/triage/opp-1/broker-materials/follow-ups/request-1/prepare', method: 'POST', body: {},
+    }]);
   });
 });

@@ -360,6 +360,14 @@ function createPhase1FixtureState() {
     brokerApprovePayloads: [],
     brokerApprovalCount: 0,
     brokerDetailLoads: {},
+    followUpStartPayloads: [],
+    followUpStopPayloads: [],
+    followUpPreparePayloads: [],
+    followUpApprovePayloads: [],
+    followUpApprovalCount: 0,
+    followUpProviderCalls: 0,
+    automaticFollowUpRuns: 0,
+    lastFollowUpPreparationByRequest: {},
     brokerMaterialsByOpportunity: Object.fromEntries(canonicalOpportunities.map((opportunity) => [opportunity.opportunityId, {
       recipientOptions: [{
         recipientContactRef: `contact-${opportunity.opportunityId}-structured`,
@@ -374,6 +382,8 @@ function createPhase1FixtureState() {
       existingRequest: null,
       multipleContacts: false,
       approvalMode: 'success',
+      followUpStopMode: 'success',
+      followUpStopReconciliationPending: false,
       detailFailuresRemaining: 0,
       allowBrokerVerification: false,
     }])),
@@ -671,6 +681,86 @@ function phase2PreparedResponse(state, opportunityId, body) {
   };
 }
 
+function phase3FollowUps(overrides = {}) {
+  return {
+    enrolled: true,
+    policyVersion: 'deal-hunter-manual-follow-up-v1',
+    maximumFollowUps: 5,
+    followUpCount: 0,
+    currentFollowUpNumber: 1,
+    nextFollowUpAt: '2026-09-03T16:00:00.000Z',
+    state: 'due',
+    terminalReason: '',
+    retryEligible: false,
+    preparationBlockers: [],
+    sendBlockers: [],
+    ...overrides,
+  };
+}
+
+function phase3ExistingRequest(overrides = {}) {
+  return {
+    id: 'browser-request-opp-cascade',
+    status: 'sent',
+    requestState: 'provider_accepted',
+    deliveryState: 'accepted',
+    followUpState: 'not-scheduled',
+    recipient: { email: 'broker-opp-cascade@example.test', displayName: 'Riley Structured Broker' },
+    subject: 'CIM / NDA request for Cascade Field Compliance',
+    createdAt: '2026-09-01T16:00:00.000Z',
+    updatedAt: '2026-09-01T16:01:00.000Z',
+    requestedAt: '2026-09-01T16:00:00.000Z',
+    providerAcceptedAt: '2026-09-01T16:01:00.000Z',
+    deliveredAt: '', respondedAt: '', errorSummary: '', canRetry: false, canCorrectRecipient: false,
+    retryRoute: '', correctionRoute: '',
+    followUps: phase3FollowUps(),
+    ...overrides,
+  };
+}
+
+function phase3PreparedResponse(state, opportunityId, requestId, body) {
+  const fixture = state.brokerMaterialsByOpportunity[opportunityId];
+  const projection = fixture.existingRequest.followUps;
+  const retry = projection.state === 'retry';
+  const followUpNumber = projection.currentFollowUpNumber;
+  const greeting = retry ? 'Hello Riley,' : body.greeting === undefined ? 'Hello Riley,' : body.greeting;
+  const subject = retry ? 'Exact persisted retry subject' : `Follow-Up ${followUpNumber}: ${phase1CurrentOpportunity(state, opportunityId).name}`;
+  const messageBody = retry
+    ? 'Exact persisted failed communication. This content cannot be edited.'
+    : `${greeting}\n\nFollowing up on the CIM and NDA request for ${phase1CurrentOpportunity(state, opportunityId).name}.\n\nThank you,\nMathew`;
+  const sequence = state.followUpPreparePayloads.length;
+  return {
+    success: true,
+    previewOnly: state.sessionRole !== 'admin',
+    ...(state.sessionRole === 'admin' ? {
+      preparationToken: `signed-follow-up-${requestId}-${sequence}`,
+      proposalDigest: String(sequence).padStart(64, 'c'),
+    } : {}),
+    preparedAt: `2026-09-03T16:${String(sequence).padStart(2, '0')}:00.000Z`,
+    expiresAt: '2099-09-03T16:16:00.000Z',
+    followUps: projection,
+    sendBlockers: projection.sendBlockers || [],
+    review: {
+      mode: retry ? 'exact-retry' : 'first-attempt',
+      followUpNumber,
+      dueAt: projection.nextFollowUpAt,
+      initialRequestedAt: fixture.existingRequest.requestedAt,
+      previousAcceptedAt: followUpNumber === 1 ? fixture.existingRequest.providerAcceptedAt : `2026-09-0${followUpNumber}T16:01:00.000Z`,
+      recipient: fixture.existingRequest.recipient,
+      sender: { displayName: 'Mathew Uckele', email: 'mathew@uckelegroup.com', replyTo: 'reply+browser@example.test' },
+      message: {
+        greeting,
+        greetingEditable: state.sessionRole === 'admin' && !retry,
+        subject,
+        body: messageBody,
+        html: `<p>${messageBody}</p>`,
+        templateVersion: `deal-hunter-cim-follow-up-${followUpNumber}-v1`,
+      },
+      communication: { id: `browser-follow-up-${requestId}-${followUpNumber}`, providerIdempotencyKey: `browser-idempotency-${requestId}-${followUpNumber}` },
+    },
+  };
+}
+
 function phase1DetailResponse(state, opportunityId) {
   const opportunity = phase1DetailOpportunity(state, opportunityId);
   const scoreRow = state.scoreRows.find((score) => score.opportunityId === opportunityId);
@@ -935,6 +1025,133 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
       return;
     }
 
+    if (method === 'POST' && path === '/api/admin/deal-hunter/cim-follow-ups/run' && !url.search) {
+      const body = phase1Body(request);
+      if (JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(['limit']) || body.limit !== 1) {
+        await rejectPhase1Request(route, state, `Malformed automatic follow-up runner payload: ${JSON.stringify(body)}`);
+        return;
+      }
+      state.automaticFollowUpRuns += 1;
+      await fulfillPhase1Json(route, { success: true, results: [{ requestId: 'browser-request-opp-cascade', status: 'approval-required' }], providerCalls: 0 });
+      return;
+    }
+
+    const followUpRouteMatch = path.match(/^\/api\/admin\/deal-hunter\/triage\/([^/]+)\/broker-materials\/follow-ups\/([^/]+)\/(start|stop|prepare|approve)$/);
+    if (method === 'POST' && followUpRouteMatch && !url.search) {
+      const opportunityId = decodeURIComponent(followUpRouteMatch[1]);
+      const requestId = decodeURIComponent(followUpRouteMatch[2]);
+      const action = followUpRouteMatch[3];
+      const fixture = state.brokerMaterialsByOpportunity[opportunityId];
+      const body = phase1Body(request);
+      if (!fixture?.existingRequest || fixture.existingRequest.id !== requestId) {
+        await rejectPhase1Request(route, state, `Phase 3 request did not match canonical fixture: ${path}`);
+        return;
+      }
+
+      if (action === 'start') {
+        if (state.sessionRole !== 'admin' || Object.keys(body).length !== 0) {
+          await rejectPhase1Request(route, state, `Malformed Phase 3 Start payload: ${JSON.stringify(body)}`);
+          return;
+        }
+        state.followUpStartPayloads.push({ method, path, body });
+        fixture.existingRequest.followUps = phase3FollowUps({ state: 'scheduled' });
+        await fulfillPhase1Json(route, { success: true, canonicalOpportunityId: opportunityId, requestId, followUps: fixture.existingRequest.followUps });
+        return;
+      }
+
+      if (action === 'stop') {
+        const keys = Object.keys(body);
+        if (state.sessionRole !== 'admin' || keys.some((key) => key !== 'reason') || (body.reason !== undefined && (typeof body.reason !== 'string' || body.reason.length > 240))) {
+          await rejectPhase1Request(route, state, `Malformed Phase 3 Stop payload: ${JSON.stringify(body)}`);
+          return;
+        }
+        state.followUpStopPayloads.push({ method, path, body });
+        if (fixture.followUpStopMode === 'unknown') {
+          fixture.followUpStopReconciliationPending = true;
+          await route.fulfill({ status: 200, contentType: 'application/json', body: '{malformed' });
+          return;
+        }
+        fixture.existingRequest.followUps = phase3FollowUps({
+          state: 'stopped', followUpCount: fixture.existingRequest.followUps.followUpCount,
+          currentFollowUpNumber: null, nextFollowUpAt: '',
+        });
+        await fulfillPhase1Json(route, { success: true, canonicalOpportunityId: opportunityId, requestId, followUps: fixture.existingRequest.followUps });
+        return;
+      }
+
+      if (action === 'prepare') {
+        const keys = Object.keys(body);
+        if (keys.some((key) => key !== 'greeting') || (body.greeting !== undefined && typeof body.greeting !== 'string')) {
+          await rejectPhase1Request(route, state, `Malformed Phase 3 Prepare payload: ${JSON.stringify(body)}`);
+          return;
+        }
+        if (!['due', 'overdue', 'retry'].includes(fixture.existingRequest.followUps.state)) {
+          await fulfillPhase1Json(route, { success: false, code: 'not_due', error: 'This follow-up is not due yet.' }, 409);
+          return;
+        }
+        if (fixture.existingRequest.followUps.state === 'retry' && Object.hasOwn(body, 'greeting')) {
+          await fulfillPhase1Json(route, { success: false, code: 'retry_message_immutable', error: 'A retry must use the exact persisted communication.' }, 409);
+          return;
+        }
+        state.followUpPreparePayloads.push({ method, path, body });
+        const prepared = phase3PreparedResponse(state, opportunityId, requestId, body);
+        state.lastFollowUpPreparationByRequest[requestId] = prepared;
+        await fulfillPhase1Json(route, prepared);
+        return;
+      }
+
+      const prepared = state.lastFollowUpPreparationByRequest[requestId];
+      if (state.sessionRole !== 'admin'
+        || !prepared
+        || JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(['approvedProposalDigest', 'preparationToken'])
+        || body.preparationToken !== prepared.preparationToken
+        || body.approvedProposalDigest !== prepared.proposalDigest) {
+        await rejectPhase1Request(route, state, `Malformed Phase 3 Approve payload: ${JSON.stringify(body)}`);
+        return;
+      }
+      state.followUpApprovalCount += 1;
+      state.followUpApprovePayloads.push({ method, path, body });
+      const approvalMode = fixture.followUpApprovalMode || 'success';
+      if (approvalMode === 'blocked') {
+        const sendBlockers = fixture.existingRequest.followUps.sendBlockers?.length
+          ? fixture.existingRequest.followUps.sendBlockers
+          : [{ code: 'cim_outreach_paused', message: 'Deal Hunter CIM outreach is globally paused.' }];
+        fixture.existingRequest.followUps = { ...fixture.existingRequest.followUps, sendBlockers };
+        await fulfillPhase1Json(route, { success: false, code: 'send_blocked', error: sendBlockers[0].message, sendBlockers, followUps: fixture.existingRequest.followUps }, 409);
+        return;
+      }
+
+      state.followUpProviderCalls += 1;
+      if (approvalMode === 'unknown') {
+        fixture.existingRequest.followUps = phase3FollowUps({ state: 'ambiguous' });
+        await route.abort('failed');
+        return;
+      }
+      if (approvalMode === 'failure') {
+        fixture.existingRequest.followUps = phase3FollowUps({ state: 'retry', retryEligible: true });
+        await fulfillPhase1Json(route, { success: false, code: 'provider_failed', error: 'The provider did not accept the approved follow-up. A fresh review is required before an exact retry.', durableResult: { requestId, followUps: fixture.existingRequest.followUps } }, 502);
+        return;
+      }
+
+      const sentNumber = prepared.review.followUpNumber;
+      const completed = sentNumber >= 5;
+      fixture.existingRequest.deliveryState = approvalMode === 'development-only' ? 'development-only' : 'accepted';
+      fixture.existingRequest.followUps = phase3FollowUps({
+        followUpCount: sentNumber,
+        currentFollowUpNumber: completed ? null : sentNumber + 1,
+        nextFollowUpAt: completed ? '' : `2026-09-${String(sentNumber + 3).padStart(2, '0')}T16:00:00.000Z`,
+        state: completed ? 'completed' : 'scheduled',
+      });
+      await fulfillPhase1Json(route, {
+        success: true,
+        code: approvalMode === 'development-only' ? 'development_only' : '',
+        canonicalOpportunityId: opportunityId,
+        requestId,
+        durableResult: { requestId, followUps: fixture.existingRequest.followUps },
+      });
+      return;
+    }
+
     const prepareMatch = path.match(/^\/api\/admin\/deal-hunter\/triage\/([^/]+)\/broker-materials\/prepare$/);
     if (method === 'POST' && prepareMatch && !url.search) {
       const opportunityId = decodeURIComponent(prepareMatch[1]);
@@ -1159,6 +1376,10 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
       if (!opportunity) throw new Error(`Unexpected Phase 1 detail target: ${path}`);
       state.brokerDetailLoads[opportunityId] = (state.brokerDetailLoads[opportunityId] || 0) + 1;
       const fixture = state.brokerMaterialsByOpportunity[opportunityId];
+      if (fixture?.followUpStopReconciliationPending) {
+        fixture.followUpStopReconciliationPending = false;
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
       if (fixture?.detailFailuresRemaining > 0) {
         fixture.detailFailuresRemaining -= 1;
         await route.abort('failed');
@@ -2028,5 +2249,327 @@ test('Request Broker Materials ambiguous lifecycle announces no resend and expos
   await expect(card.getByRole('button', { name: /Approve & Send|Send Again|Retry|Regenerate|Request Broker Materials/i })).toHaveCount(0);
   await expect(card.getByTestId('broker-materials-final-approval')).toHaveCount(0);
   expect(state.brokerApprovalCount).toBe(0);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Phase 3 admin completes start future due review update preview approve and next schedule lifecycle', async ({ page }, testInfo) => {
+  const consoleErrors = [];
+  const pageErrors = [];
+  page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  const fixture = state.brokerMaterialsByOpportunity['opp-cascade'];
+  fixture.existingRequest = phase3ExistingRequest({
+    followUps: phase3FollowUps({
+      enrolled: false, policyVersion: '', state: 'not-enrolled', currentFollowUpNumber: 1,
+      nextFollowUpAt: '', startEligible: true, startBlockers: [],
+    }),
+  });
+  let opened = await openBrokerOpportunity(page);
+  const followUps = opened.card.getByRole('region', { name: 'Follow-Ups' });
+  await expect(followUps.getByText('Not Scheduled', { exact: true })).toBeVisible();
+  await followUps.getByRole('button', { name: 'Start Follow-Up Sequence' }).click();
+  await expect(followUps.getByText('Scheduled', { exact: true })).toBeVisible();
+  await expect(followUps.getByText(/Follow-Up 1 of 5/)).toBeVisible();
+  await expect(followUps.getByRole('button', { name: 'Review Follow-Up' })).toHaveCount(0);
+  expect(state.followUpStartPayloads.map(({ body }) => body)).toEqual([{}]);
+
+  fixture.existingRequest.followUps = phase3FollowUps({
+    state: 'due',
+    sendBlockers: [{ code: 'cim_outreach_paused', message: 'Deal Hunter CIM outreach is globally paused.' }],
+  });
+  fixture.followUpApprovalMode = 'blocked';
+  await opened.dialog.getByRole('button', { name: 'Close opportunity detail' }).click();
+  opened = await openBrokerOpportunity(page);
+  const dueFollowUps = opened.card.getByRole('region', { name: 'Follow-Ups' });
+  await expect(dueFollowUps.getByText('Due', { exact: true })).toBeVisible();
+  await dueFollowUps.getByRole('button', { name: 'Review Follow-Up' }).click();
+  await expect(dueFollowUps.getByRole('heading', { name: 'Review Follow-Up 1 of 5' })).toBeFocused();
+  await expect(dueFollowUps.getByText(/Initial request.*Sep 1, 2026/i)).toBeVisible();
+  await expect(dueFollowUps.getByText(/Previous provider acceptance.*Sep 1, 2026/i)).toBeVisible();
+  await expect(dueFollowUps.getByText(/^Riley Structured Broker · broker-opp-cascade@example\.test$/)).toBeVisible();
+  await expect(dueFollowUps.getByLabel('Follow-up subject')).toHaveValue('Follow-Up 1: Cascade Field Compliance');
+  await expect(dueFollowUps.getByLabel('Complete follow-up body')).toHaveValue(/Following up on the CIM and NDA request/);
+  await expect(dueFollowUps.getByText('Deal Hunter CIM outreach is globally paused.')).toBeVisible();
+  await expect(dueFollowUps.getByRole('button', { name: 'Approve & Send Follow-Up' })).toBeDisabled();
+  expect(state.followUpProviderCalls).toBe(0);
+
+  await dueFollowUps.getByLabel('Complete follow-up body').press('Escape');
+  await expect(dueFollowUps.getByLabel('Complete follow-up body')).toHaveCount(0);
+  fixture.existingRequest.followUps = phase3FollowUps({ state: 'due', sendBlockers: [] });
+  fixture.followUpApprovalMode = 'success';
+  await opened.dialog.getByRole('button', { name: 'Close opportunity detail' }).click();
+  opened = await openBrokerOpportunity(page);
+  const activeFollowUps = opened.card.getByRole('region', { name: 'Follow-Ups' });
+  await activeFollowUps.getByRole('button', { name: 'Review Follow-Up' }).click();
+  const greeting = activeFollowUps.getByLabel('Follow-up greeting');
+  await greeting.fill('Hi Riley,');
+  await expect(activeFollowUps.getByRole('button', { name: 'Approve & Send Follow-Up' })).toBeDisabled();
+  await activeFollowUps.getByRole('button', { name: 'Update Preview' }).click();
+  await expect(greeting).toHaveValue('Hi Riley,');
+  await expect(greeting).toBeFocused();
+  const approval = activeFollowUps.getByRole('button', { name: 'Approve & Send Follow-Up' });
+  await expect(approval).toBeEnabled();
+  await approval.click();
+  await expect(activeFollowUps.getByText('Scheduled', { exact: true })).toBeVisible();
+  await expect(activeFollowUps.getByText('1 of 5 sent')).toBeVisible();
+  await expect(activeFollowUps.getByText('Follow-Up 2 of 5')).toBeVisible();
+  expect(state.followUpApprovalCount).toBe(1);
+  expect(state.followUpProviderCalls).toBe(1);
+  expect(state.followUpPreparePayloads.map(({ body }) => body)).toEqual([{}, {}, { greeting: 'Hi Riley,' }]);
+  expect(state.followUpApprovePayloads[0].body).toEqual({
+    preparationToken: state.lastFollowUpPreparationByRequest[fixture.existingRequest.id].preparationToken,
+    approvedProposalDigest: state.lastFollowUpPreparationByRequest[fixture.existingRequest.id].proposalDigest,
+  });
+
+  await activeFollowUps.getByRole('button', { name: 'Stop Follow-Up Sequence' }).click();
+  await activeFollowUps.getByLabel('Stop reason (optional)').fill('Broker asked us not to follow up again.');
+  await activeFollowUps.getByRole('button', { name: 'Permanently Stop' }).click();
+  await expect(activeFollowUps.getByText('Stopped', { exact: true })).toBeVisible();
+  await expect(activeFollowUps.getByRole('button', { name: /Start|Review|Approve|Stop/i })).toHaveCount(0);
+  expect(state.followUpStopPayloads[0].body).toEqual({ reason: 'Broker asked us not to follow up again.' });
+
+  await page.screenshot({ path: testInfo.outputPath('phase3-admin-follow-ups-desktop.png'), fullPage: false });
+  await expect(page.locator('vite-error-overlay, [data-vite-dev-id]')).toHaveCount(0);
+  expect(await page.locator('body').innerText()).not.toBe('');
+  expect(consoleErrors).toEqual([]);
+  expect(pageErrors).toEqual([]);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Phase 3 automatic runner action cannot send a marked due follow-up', async ({ page }) => {
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  state.brokerMaterialsByOpportunity['opp-cascade'].existingRequest = phase3ExistingRequest({ followUps: phase3FollowUps({ state: 'due' }) });
+  await page.goto('/admin/deal-hunter');
+  const result = await page.evaluate(async () => {
+    const response = await fetch('/api/admin/deal-hunter/cim-follow-ups/run', {
+      method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ limit: 1 }),
+    });
+    return response.json();
+  });
+  expect(result.results).toEqual([{ requestId: 'browser-request-opp-cascade', status: 'approval-required' }]);
+  expect(state.automaticFollowUpRuns).toBe(1);
+  expect(state.followUpProviderCalls).toBe(0);
+  expect(state.followUpApprovalCount).toBe(0);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Phase 3 Stop network uncertainty restores authoritative active state without claiming permanent Stop', async ({ page }, testInfo) => {
+  const consoleErrors = [];
+  const pageErrors = [];
+  page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  const fixture = state.brokerMaterialsByOpportunity['opp-cascade'];
+  fixture.existingRequest = phase3ExistingRequest({ followUps: phase3FollowUps({ state: 'scheduled' }) });
+  fixture.followUpStopMode = 'unknown';
+  const { card } = await openBrokerOpportunity(page);
+  const followUps = card.getByRole('region', { name: 'Follow-Ups' });
+  const detailLoadsBeforeStop = state.brokerDetailLoads['opp-cascade'];
+
+  await followUps.getByRole('button', { name: 'Stop Follow-Up Sequence' }).click();
+  await followUps.getByRole('button', { name: 'Permanently Stop' }).click();
+  const unknownStatus = followUps.getByText('Stop outcome is unknown.').locator('..');
+  await expect(unknownStatus).toBeVisible();
+  await expect(unknownStatus).toBeFocused();
+  await expect(followUps.getByRole('status')).toContainText('Checking Stop status.');
+  await page.screenshot({ path: testInfo.outputPath('phase3-stop-network-checking-desktop.png'), fullPage: false });
+
+  await expect(followUps.getByText('Scheduled', { exact: true })).toBeVisible();
+  await expect(followUps.getByText('Stop outcome is unknown.')).toHaveCount(0);
+  await expect(followUps.getByText(/Future follow-ups are (?:permanently )?stopped/i)).toHaveCount(0);
+  await expect(followUps.getByRole('button', { name: 'Stop Follow-Up Sequence' })).toBeEnabled();
+  await expect(followUps.getByRole('heading', { name: 'Follow-Ups' })).toBeFocused();
+  await expect.poll(() => state.brokerDetailLoads['opp-cascade']).toBe(detailLoadsBeforeStop + 1);
+  expect(state.followUpStopPayloads).toHaveLength(1);
+  expect(state.followUpApprovePayloads).toHaveLength(0);
+  expect(state.followUpApprovalCount).toBe(0);
+  expect(state.followUpProviderCalls).toBe(0);
+  await expect(page.locator('vite-error-overlay, [data-vite-dev-id]')).toHaveCount(0);
+  expect(consoleErrors).toEqual([]);
+  expect(pageErrors).toEqual([]);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Phase 3 enrolled terminal closure renders server reason without blocker duplication', async ({ page }, testInfo) => {
+  const mobileWidth = 390;
+  await page.setViewportSize({ width: mobileWidth, height: 844 });
+  const consoleErrors = [];
+  const pageErrors = [];
+  page.on('console', (message) => { if (message.type() === 'error') consoleErrors.push(message.text()); });
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  state.brokerMaterialsByOpportunity['opp-cascade'].existingRequest = phase3ExistingRequest({
+    followUps: phase3FollowUps({
+      state: 'closed', terminalReason: 'reply_received', currentFollowUpNumber: null,
+      nextFollowUpAt: '', startBlockers: [], preparationBlockers: [], sendBlockers: [],
+    }),
+  });
+  const { card } = await openBrokerOpportunity(page);
+  const followUps = card.getByRole('region', { name: 'Follow-Ups' });
+
+  await expect(followUps.getByText('Closed', { exact: true })).toBeVisible();
+  await expect(followUps.getByText('Broker replied.', { exact: true })).toBeVisible();
+  await expect(followUps.getByRole('status')).toContainText('Follow-up sequence closed. Broker replied.');
+  await expect(followUps.getByRole('button', { name: /Start|Review|Stop|Retry|Approve/i })).toHaveCount(0);
+  const overflow = await page.evaluate(() => ({ clientWidth: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth }));
+  expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth);
+  await followUps.getByText('Broker replied.', { exact: true }).scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath('phase3-terminal-reason-mobile.png'), fullPage: false });
+  await expect(page.locator('vite-error-overlay, [data-vite-dev-id]')).toHaveCount(0);
+  expect(consoleErrors).toEqual([]);
+  expect(pageErrors).toEqual([]);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Phase 3 viewer is read-only and never receives approval artifacts', async ({ page }) => {
+  const state = await installPhase1Fixture(page, { role: 'viewer' });
+  markBrokerOpportunityPursued(state);
+  state.brokerMaterialsByOpportunity['opp-cascade'].existingRequest = phase3ExistingRequest({ followUps: phase3FollowUps({ state: 'due' }) });
+  const { card } = await openBrokerOpportunity(page);
+  const followUps = card.getByRole('region', { name: 'Follow-Ups' });
+  await expect(followUps.getByRole('button', { name: 'Preview Follow-Up' })).toBeVisible();
+  await followUps.getByRole('button', { name: 'Preview Follow-Up' }).click();
+  await expect(followUps.getByLabel('Complete follow-up body')).toBeVisible();
+  await expect(followUps.getByLabel('Follow-up greeting')).toHaveCount(0);
+  await expect(followUps.getByRole('button', { name: /Approve|Review Retry|Stop Follow-Up|Start Follow-Up/i })).toHaveCount(0);
+  const text = await followUps.innerText();
+  expect(text).not.toContain('signed-follow-up');
+  expect(text).not.toContain('cccccccc');
+  expect(state.followUpPreparePayloads.map(({ body }) => body)).toEqual([{}]);
+  expect(state.followUpApprovePayloads).toEqual([]);
+  expect(state.followUpStartPayloads).toEqual([]);
+  expect(state.followUpStopPayloads).toEqual([]);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Phase 3 unknown approval outcome checks authoritative status without retransmission', async ({ page }) => {
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  const fixture = state.brokerMaterialsByOpportunity['opp-cascade'];
+  fixture.existingRequest = phase3ExistingRequest({ followUps: phase3FollowUps({ state: 'due' }) });
+  fixture.followUpApprovalMode = 'unknown';
+  const { card } = await openBrokerOpportunity(page);
+  const followUps = card.getByRole('region', { name: 'Follow-Ups' });
+  await followUps.getByRole('button', { name: 'Review Follow-Up' }).click();
+  await followUps.getByRole('button', { name: 'Approve & Send Follow-Up' }).click();
+  await expect(followUps.getByText('Checking', { exact: true })).toBeVisible();
+  await expect(followUps.getByText(/retransmission is prohibited/i)).toBeVisible();
+  await expect(followUps.getByRole('button', { name: 'Check Again' })).toBeVisible();
+  await expect(followUps.getByRole('button', { name: /Approve|Retry|Send Again|Review/i })).toHaveCount(0);
+  const detailLoads = state.brokerDetailLoads['opp-cascade'];
+  await followUps.getByRole('button', { name: 'Check Again' }).click();
+  await expect.poll(() => state.brokerDetailLoads['opp-cascade']).toBe(detailLoads + 1);
+  expect(state.followUpApprovalCount).toBe(1);
+  expect(state.followUpProviderCalls).toBe(1);
+  expect(state.followUpApprovePayloads).toHaveLength(1);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Phase 3 definitive failure retries exact persisted communication after fresh review', async ({ page }) => {
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  const fixture = state.brokerMaterialsByOpportunity['opp-cascade'];
+  fixture.existingRequest = phase3ExistingRequest({ followUps: phase3FollowUps({ state: 'due' }) });
+  fixture.followUpApprovalMode = 'failure';
+  const { card } = await openBrokerOpportunity(page);
+  const followUps = card.getByRole('region', { name: 'Follow-Ups' });
+  await followUps.getByRole('button', { name: 'Review Follow-Up' }).click();
+  await followUps.getByRole('button', { name: 'Approve & Send Follow-Up' }).click();
+  await expect(followUps.getByRole('button', { name: 'Review Retry' })).toBeVisible();
+  await followUps.getByRole('button', { name: 'Review Retry' }).click();
+  await expect(followUps.getByRole('heading', { name: 'Review Retry Follow-Up 1 of 5' })).toBeVisible();
+  await expect(followUps.getByLabel('Follow-up greeting')).toHaveCount(0);
+  await expect(followUps.getByLabel('Follow-up subject')).toHaveValue('Exact persisted retry subject');
+  await expect(followUps.getByLabel('Complete follow-up body')).toHaveValue('Exact persisted failed communication. This content cannot be edited.');
+  fixture.followUpApprovalMode = 'success';
+  await followUps.getByRole('button', { name: 'Approve & Send Follow-Up' }).click();
+  await expect(followUps.getByText('Scheduled', { exact: true })).toBeVisible();
+  expect(state.followUpApprovalCount).toBe(2);
+  expect(state.followUpProviderCalls).toBe(2);
+  expect(state.followUpPreparePayloads.map(({ body }) => body)).toEqual([{}, {}]);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Phase 3 mobile drawer keeps review actions reachable above keyboard and sticky controls do not obscure content', async ({ page }, testInfo) => {
+  const mobileWidth = 390;
+  await page.setViewportSize({ width: mobileWidth, height: 844 });
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  state.brokerMaterialsByOpportunity['opp-cascade'].existingRequest = phase3ExistingRequest({ followUps: phase3FollowUps({ state: 'due' }) });
+  const { dialog, card } = await openBrokerOpportunity(page);
+  const followUps = card.getByRole('region', { name: 'Follow-Ups' });
+  await followUps.getByRole('button', { name: 'Review Follow-Up' }).click();
+  const approval = followUps.getByTestId('broker-materials-follow-up-approval');
+  await expect(approval).toHaveCSS('position', 'sticky');
+  await expect(approval).toHaveAttribute('data-mobile-sticky', 'true');
+  await expectHorizontallyReachable(approval.getByRole('button', { name: 'Approve & Send Follow-Up' }), mobileWidth);
+  const body = followUps.getByLabel('Complete follow-up body');
+  await body.scrollIntoViewIfNeeded();
+  const [bodyBox, approvalBox, reviewPadding, safePadding] = await Promise.all([
+    body.boundingBox(),
+    approval.boundingBox(),
+    followUps.getByTestId('broker-materials-follow-up-review').evaluate((element) => Number.parseFloat(getComputedStyle(element).paddingBottom)),
+    approval.evaluate((element) => getComputedStyle(element).paddingBottom),
+  ]);
+  expect(bodyBox).not.toBeNull();
+  expect(approvalBox).not.toBeNull();
+  expect(bodyBox.y + bodyBox.height).toBeLessThanOrEqual(approvalBox.y + 1);
+  expect(reviewPadding).toBeGreaterThanOrEqual(128);
+  expect(safePadding).not.toBe('0px');
+  const overflow = await page.evaluate(() => ({ clientWidth: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth }));
+  expect(overflow.scrollWidth).toBeLessThanOrEqual(overflow.clientWidth);
+  await page.screenshot({ path: testInfo.outputPath('phase3-mobile-follow-up-review.png'), fullPage: false });
+  await expect(dialog).toHaveClass(/h-full/);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Phase 3 keyboard flow never sends on Enter and preserves Escape and focus restoration', async ({ page }) => {
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  state.brokerMaterialsByOpportunity['opp-cascade'].existingRequest = phase3ExistingRequest({ followUps: phase3FollowUps({ state: 'due' }) });
+  const { dialog, card, trigger } = await openBrokerOpportunity(page);
+  const followUps = card.getByRole('region', { name: 'Follow-Ups' });
+  await followUps.getByRole('button', { name: 'Review Follow-Up' }).click();
+  const greeting = followUps.getByLabel('Follow-up greeting');
+  await greeting.fill('Hello keyboard Riley,');
+  await greeting.press('Enter');
+  await expect(greeting).toHaveValue('Hello keyboard Riley,');
+  await expect(greeting).toBeFocused();
+  expect(state.followUpApprovalCount).toBe(0);
+  expect(state.followUpProviderCalls).toBe(0);
+  await followUps.getByLabel('Complete follow-up body').press('Escape');
+  await expect(followUps.getByRole('heading', { name: 'Follow-Ups' })).toBeFocused();
+  await expect(followUps.getByLabel('Complete follow-up body')).toHaveCount(0);
+  await dialog.press('Escape');
+  await expect(dialog).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+  expect(state.followUpApprovalCount).toBe(0);
+  expectBrokerRouteAuditClean(state);
+});
+
+test('Phase 3 Follow-Up five completes with no Follow-Up six control request or communication', async ({ page }) => {
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  const fixture = state.brokerMaterialsByOpportunity['opp-cascade'];
+  fixture.existingRequest = phase3ExistingRequest({ followUps: phase3FollowUps({ followUpCount: 4, currentFollowUpNumber: 5, state: 'due' }) });
+  const { card } = await openBrokerOpportunity(page);
+  const followUps = card.getByRole('region', { name: 'Follow-Ups' });
+  await expect(followUps.getByText('Follow-Up 5 of 5')).toBeVisible();
+  await followUps.getByRole('button', { name: 'Review Follow-Up' }).click();
+  await expect(followUps.getByRole('heading', { name: 'Review Follow-Up 5 of 5' })).toBeVisible();
+  await followUps.getByRole('button', { name: 'Approve & Send Follow-Up' }).click();
+  await expect(followUps.getByText('Completed', { exact: true })).toBeVisible();
+  await expect(followUps.getByText('5 of 5 sent')).toBeVisible();
+  await expect(followUps.getByText(/Follow-Up 6/i)).toHaveCount(0);
+  await expect(followUps.getByRole('button', { name: /Review|Start|Stop|Approve/i })).toHaveCount(0);
+  expect(state.followUpPreparePayloads).toHaveLength(1);
+  expect(state.followUpApprovePayloads).toHaveLength(1);
+  expect(state.followUpProviderCalls).toBe(1);
+  expect(state.requests.filter(({ path }) => /follow-up-?6/i.test(path))).toEqual([]);
   expectBrokerRouteAuditClean(state);
 });

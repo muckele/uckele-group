@@ -139,9 +139,10 @@ function conflictKey(observation) {
 }
 
 export default function OpportunityDrawer({
-  brokerMaterialsState = {}, detail, error = '', focusGuardRef, loading = false, mutationError = '', onAction,
+  brokerMaterialsState = {}, detail, error = '', focusGuardRef, followUpState = {}, loading = false, mutationError = '', onAction,
   onBrokerMaterialsApprove, onBrokerMaterialsCheckStatus, onBrokerMaterialsInvalidate, onBrokerMaterialsPrepare,
-  onClose, onRetry, onSaveFact, pending = false, readOnly = false,
+  onClose, onFollowUpApprove, onFollowUpCheckStatus, onFollowUpCloseReview, onFollowUpInvalidate,
+  onFollowUpPrepare, onFollowUpStart, onFollowUpStop, onRetry, onSaveFact, pending = false, readOnly = false,
 }) {
   const [passOpen, setPassOpen] = useState(false);
   const [brokerEmailFocusRequest, setBrokerEmailFocusRequest] = useState(0);
@@ -228,6 +229,7 @@ export default function OpportunityDrawer({
               {passOpen && actionable ? <div className="mt-4"><PassForm error="" name={name} onCancel={() => setPassOpen(false)} onSubmit={(payload) => onAction('pass', payload)} pending={pending} /></div> : null}
               <div className="mt-4"><BrokerMaterialsCard
                 brokerMaterials={detail.brokerMaterials}
+                businessName={name}
                 checking={brokerMaterialsState.checking}
                 checkingFailed={brokerMaterialsState.checkingFailed}
                 error={brokerMaterialsState.error}
@@ -237,6 +239,14 @@ export default function OpportunityDrawer({
                 onInvalidatePreparation={onBrokerMaterialsInvalidate}
                 onPrepare={onBrokerMaterialsPrepare}
                 onViewRequest={() => crmCimRef.current?.scrollIntoView?.({ block: 'start' })}
+                followUpState={followUpState}
+                onFollowUpApprove={onFollowUpApprove}
+                onFollowUpCheckStatus={onFollowUpCheckStatus}
+                onFollowUpCloseReview={onFollowUpCloseReview}
+                onFollowUpInvalidate={onFollowUpInvalidate}
+                onFollowUpPrepare={onFollowUpPrepare}
+                onFollowUpStart={onFollowUpStart}
+                onFollowUpStop={onFollowUpStop}
                 preparation={brokerMaterialsState.preparation}
                 preparing={brokerMaterialsState.preparing}
                 readOnly={readOnly}

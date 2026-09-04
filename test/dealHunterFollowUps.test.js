@@ -202,3 +202,149 @@ test('central CIM outreach pause blocks a follow-up run before reading or claimi
   assert.match(result.error, /globally paused/i);
   assert.equal(queueRead, false);
 });
+
+function operatorApprovedRunnerFixture(forbidden, overrides = {}) {
+  const request = {
+    id: 'manual-runner-request',
+    opportunity_id: 'manual-runner-opportunity',
+    submission_id: 'manual-runner-submission',
+    deal_key: 'manual-runner-deal',
+    deal_name: 'Manual Runner Deal',
+    recipient_email: 'manual-runner@example.test',
+    status: 'sent',
+    request_state: 'provider_accepted',
+    delivery_state: 'accepted',
+    follow_up_state: 'scheduled',
+    follow_up_count: 0,
+    next_follow_up_at: '2026-09-01T17:00:00.000Z',
+    updated_at: '2026-09-01T16:00:00.000Z',
+    metadata: {
+      manualFollowUp: {
+        mode: 'operator-approved',
+        // Deliberately malformed beyond mode: the runner boundary is mode-only.
+        version: 'future-or-corrupt-version',
+      },
+      preparationToken: 'must-never-be-read',
+      approvedProposalDigest: 'b'.repeat(64),
+    },
+    ...overrides,
+  };
+  return {
+    request,
+    storage: {
+      async getDealHunterCimSafetySettings() { return { outreach_paused: false, metadata: {} }; },
+      async listDealHunterCimRequests() { return [request]; },
+      async upsertDealHunterCimRequest(value) { forbidden.activityWrite += 1; return value; },
+      async mutateWithCrmActivity() { forbidden.activityWrite += 1; throw new Error('marked runner wrote activity'); },
+      async claimDealHunterCimFollowUpRequest() { forbidden.requestClaim += 1; throw new Error('marked runner claimed request'); },
+      async claimDealHunterApprovedFollowUp() { forbidden.requestClaim += 1; throw new Error('marked runner claimed approval'); },
+      async claimDealHunterCimRecipient() { forbidden.recipientClaim += 1; throw new Error('marked runner claimed recipient'); },
+      async insertCrmCommunication() { forbidden.communicationWrite += 1; throw new Error('marked runner wrote communication'); },
+      async upsertCrmCommunication() { forbidden.communicationWrite += 1; throw new Error('marked runner wrote communication'); },
+    },
+  };
+}
+
+test('automatic runner returns approval-required for operator-approved requests before every claim communication activity and provider seam', async () => {
+  const forbidden = {
+    requestClaim: 0,
+    recipientClaim: 0,
+    communicationWrite: 0,
+    activityWrite: 0,
+    providerCall: 0,
+    proposalVerify: 0,
+  };
+  const { storage } = operatorApprovedRunnerFixture(forbidden);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    forbidden.providerCall += 1;
+    throw new Error('marked runner called provider');
+  };
+  try {
+    const result = await runDealHunterCimFollowUps({
+      storage,
+      now: new Date('2026-09-01T18:00:00.000Z'),
+      settings: {
+        ...weekdaySettings,
+        enabled: true,
+        maxCount: 99,
+        delaysHours: [1],
+        maximumFollowUps: 99,
+        weekdaysOnly: false,
+        sendWindowStart: '00:00',
+        sendWindowEnd: '23:59',
+      },
+    });
+    assert.equal(result.results[0].status, 'approval-required');
+    assert.deepEqual(forbidden, {
+      requestClaim: 0,
+      recipientClaim: 0,
+      communicationWrite: 0,
+      activityWrite: 0,
+      providerCall: 0,
+      proposalVerify: 0,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('automatic runner hard boundary holds with follow-up flag enabled Operations invocation and changed cadence settings', async () => {
+  const forbidden = { requestClaim: 0, recipientClaim: 0, communicationWrite: 0, activityWrite: 0, providerCall: 0, proposalVerify: 0 };
+  const { storage } = operatorApprovedRunnerFixture(forbidden, { follow_up_count: 4 });
+  const result = await runDealHunterCimFollowUps({
+    storage,
+    limit: 500,
+    now: new Date('2026-09-01T18:00:00.000Z'),
+    settings: {
+      enabled: true,
+      firstDelayHours: 0,
+      intervalHours: 0,
+      delaySequenceHours: [0, 0, 0, 0, 0, 0],
+      maxCount: 999,
+      weekdaysOnly: false,
+      timezone: 'America/Los_Angeles',
+      sendWindowStart: '00:00',
+      sendWindowEnd: '23:59',
+    },
+  });
+  assert.equal(result.reviewed, 1);
+  assert.equal(result.sent, 0);
+  assert.equal(result.skipped, 1);
+  assert.equal(result.results[0].status, 'approval-required');
+  assert.deepEqual(forbidden, { requestClaim: 0, recipientClaim: 0, communicationWrite: 0, activityWrite: 0, providerCall: 0, proposalVerify: 0 });
+});
+
+test('automatic runner has no approval token digest verifier or marked executor input path', () => {
+  const source = runDealHunterCimFollowUps.toString();
+  assert.doesNotMatch(source, /preparationToken|approvedProposalDigest|verifySignedPayload/);
+  assert.doesNotMatch(source, /approvedContext|executeApproved/);
+});
+
+test('unmarked legacy runner retains existing delays maximum and executor behavior', async () => {
+  assert.equal(nextCimFollowUpAt({
+    status: 'sent', followUpCount: 0, lastTouchAt: '2026-09-01T18:00:00.000Z', settings: weekdaySettings,
+  }), '2026-09-03T18:00:00.000Z');
+  assert.equal(nextCimFollowUpAt({
+    status: 'sent', followUpCount: 3, lastTouchAt: '2026-09-01T18:00:00.000Z', settings: weekdaySettings,
+  }), null);
+  let requestWrites = 0;
+  const request = {
+    id: 'legacy-runner-request', opportunity_id: 'legacy-opportunity', submission_id: 'legacy-submission',
+    deal_key: 'legacy-deal', deal_name: 'Legacy Deal', recipient_email: 'legacy@example.test', status: 'sent',
+    request_state: 'provider_accepted', delivery_state: 'accepted', follow_up_state: 'scheduled', follow_up_count: 0,
+    next_follow_up_at: '2026-09-01T17:00:00.000Z', updated_at: '2026-09-01T16:00:00.000Z', metadata: {},
+  };
+  const result = await runDealHunterCimFollowUps({
+    storage: {
+      async getDealHunterCimSafetySettings() { return { outreach_paused: false, metadata: {} }; },
+      async listDealHunterCimRequests() { return [request]; },
+      async getActiveEmailSuppression() { return { id: 'legacy-suppression', reason: 'complaint' }; },
+      async upsertDealHunterCimRequest(value) { requestWrites += 1; return value; },
+    },
+    now: new Date('2026-09-01T18:00:00.000Z'),
+    settings: { ...weekdaySettings, weekdaysOnly: false, sendWindowStart: '00:00', sendWindowEnd: '23:59' },
+  });
+  assert.equal(result.results[0].status, 'stopped');
+  assert.equal(requestWrites, 1, 'an unmarked request still enters the legacy single-request executor');
+});

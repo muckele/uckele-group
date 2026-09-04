@@ -31,6 +31,7 @@ import { firstStrictDetailAuthorityTimestamp } from './detailAuthorityTimestamp.
 import { normalizeCanonicalCimRequestId } from './cimRequestIdPolicy.js';
 import { getSourceHealth } from './acquisitionCommandCenter.js';
 import { projectDealHunterBrokerMaterials } from './dealHunterBrokerMaterials.js';
+import { reconcileDealHunterApprovedFollowUp } from './dealHunter.js';
 
 export const triageViews = Object.freeze([
   'needs-review',
@@ -554,8 +555,14 @@ function projectCrmSubmission(submission) {
   };
 }
 
-export async function getTriageOpportunityDetail({ opportunityId = '', storage = getStorage() } = {}) {
+export async function getTriageOpportunityDetail({
+  opportunityId = '',
+  storage = getStorage(),
+  reconcileAcceptedManualFollowUps = false,
+  actor = 'deal-hunter-status',
+} = {}) {
   const id = normalizeText(opportunityId, 200);
+  const projectedAt = new Date();
   if (!id) return { ok: false, status: 400, error: 'A canonical opportunity id is required.' };
   if (
     typeof storage.getCurrentDealHunterOpportunityScore !== 'function'
@@ -602,7 +609,14 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
   const sanitizedOperatorFacts = operatorFacts
     .filter((fact) => fact && typeof fact === 'object' && opportunityFactFields.includes(fact.field))
     .slice(0, 100);
-  const canonicalCimRequests = canonicalDetailCimRequests(cimRequests);
+  let canonicalCimRequests = canonicalDetailCimRequests(cimRequests);
+  if (reconcileAcceptedManualFollowUps) {
+    canonicalCimRequests = await Promise.all(canonicalCimRequests.map(async (request) => {
+      if (request?.metadata?.manualFollowUp?.mode !== 'operator-approved') return request;
+      const reconciliation = await reconcileDealHunterApprovedFollowUp({ storage, request, actor });
+      return reconciliation?.status === 'sent' ? reconciliation.request || request : request;
+    }));
+  }
   const sourceFacts = sourceRows.filter((row) => opportunityFactFields.includes(row.field) || row.field === 'broker_contact');
   const crmFacts = directCrmFactRows(submission);
   const effectiveFacts = getEffectiveOpportunityFacts({
@@ -631,7 +645,14 @@ export async function getTriageOpportunityDetail({ opportunityId = '', storage =
     id: detailText(communication.id, 200), direction: detailText(communication.direction, 80), channel: detailText(communication.channel, 80),
     kind: detailText(communication.kind, 80), occurredAt: detailText(communication.occurred_at, 80), cimRequestId: detailText(communication.cim_request_id, 200),
   }));
-  const brokerMaterials = await projectDealHunterBrokerMaterials({ opportunityId: id, storage });
+  // Use one projection instant so due/overdue Phase 3 status cannot disagree
+  // within the opportunity-detail status response.
+  const brokerMaterials = await projectDealHunterBrokerMaterials({
+    opportunityId: id,
+    storage,
+    now: projectedAt,
+    communicationSnapshot: crmCommunications?.rows || [],
+  });
   return {
     ok: true,
     status: 200,
