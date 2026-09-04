@@ -122,6 +122,14 @@ function healthyQueue(rows = [queueRow(1), queueRow(2)]) {
   };
 }
 
+function assertActionRequired(projection) {
+  assert.equal(projection.status, 'action-required');
+  assert.equal(projection.notificationType, 'required-source-alert');
+  assert.equal(projection.actionsAllowed, false);
+  assert.equal(projection.summary, null);
+  assert.deepEqual(projection.topOpportunities, []);
+}
+
 test('daily digest projection uses the Acquisition Inbox summary and exact acquisition-priority order', async () => {
   const storage = { name: 'injected-storage' };
   const review = healthyReview();
@@ -395,4 +403,152 @@ test('daily digest authority never calls CRM CIM follow-up Stage 2 or operator m
 
   assert.equal(projection.notificationType, 'normal-digest');
   assert.deepEqual(forbiddenCalls, []);
+});
+
+test('daily digest alert never includes raw refresh source-health or queue diagnostics', async (t) => {
+  const diagnostic = 'Acme Solar opp-secret broker@example.invalid 555-0101 $1300000 Authorization: Bearer TOPSECRET /srv/private/app.js:99';
+  const cases = [
+    {
+      name: 'score refresh exception',
+      expectedMessage: 'Current opportunity scores could not be refreshed.',
+      dependencies: {
+        refreshScores: async () => { throw new Error(diagnostic); },
+      },
+    },
+    {
+      name: 'source-health exception',
+      expectedMessage: 'Required source data is currently unavailable.',
+      dependencies: {
+        refreshScores: async () => healthyScoreRefresh(),
+        readSourceHealth: async () => { throw new Error(diagnostic); },
+      },
+    },
+    {
+      name: 'queue exception',
+      expectedMessage: 'Current acquisition queue could not be built.',
+      dependencies: {
+        refreshScores: async () => healthyScoreRefresh(),
+        readSourceHealth: async () => healthySourceHealth(),
+        readTriageQueue: async () => { throw new Error(diagnostic); },
+      },
+    },
+    {
+      name: 'required-source issue',
+      expectedMessage: 'Required source data is currently unavailable.',
+      dependencies: {
+        refreshScores: async () => healthyScoreRefresh(),
+        readSourceHealth: async () => healthySourceHealth({
+          healthy: false,
+          sources: healthyReview().sources.map((source) => source.required
+            ? { ...source, name: diagnostic, fetched: false, rowCount: 0 }
+            : source),
+          issues: [{
+            sourceId: 'google-sheet-1',
+            sourceName: diagnostic,
+            affectsHealth: true,
+            sourceUnavailable: true,
+            title: diagnostic,
+            message: diagnostic,
+            error: diagnostic,
+          }],
+        }),
+      },
+    },
+  ];
+
+  for (const { name, expectedMessage, dependencies } of cases) {
+    await t.test(name, async () => {
+      const projection = await buildCurrentDailyDealHunterDigest({
+        businessDate,
+        storage: {},
+        refreshScores: async () => healthyScoreRefresh(),
+        readSourceHealth: async () => healthySourceHealth(),
+        readTriageQueue: async () => healthyQueue(),
+        ...dependencies,
+      });
+
+      assertActionRequired(projection);
+      const serialized = JSON.stringify(projection);
+      assert.doesNotMatch(
+        serialized,
+        /Acme Solar|opp-secret|broker@example\.invalid|555-0101|1300000|TOPSECRET|private\/app\.js/,
+      );
+      assert.ok(
+        projection.sourceAuthority.blockingIssues.some((issue) => issue.message === expectedMessage),
+        JSON.stringify(projection.sourceAuthority.blockingIssues),
+      );
+    });
+  }
+});
+
+test('malformed digest authority fails closed without fabricated counts or rows', async (t) => {
+  const missingSummaryField = healthyQueue();
+  delete missingSummaryField.summary.currentOpportunities;
+  const stringSummaryCount = healthyQueue();
+  stringSummaryCount.summary.needsReview = '2';
+  const nanSummaryCount = healthyQueue();
+  nanSummaryCount.summary.highPriority = Number.NaN;
+  const negativeSummaryCount = healthyQueue();
+  negativeSummaryCount.summary.watchlist = -1;
+
+  const cases = [
+    ['incomplete source health', { sourceHealth: { healthy: true }, queue: healthyQueue() }],
+    ['empty summary', { sourceHealth: healthySourceHealth(), queue: { ...healthyQueue(), summary: {} } }],
+    ['missing summary field', { sourceHealth: healthySourceHealth(), queue: missingSummaryField }],
+    ['string summary count', { sourceHealth: healthySourceHealth(), queue: stringSummaryCount }],
+    ['NaN summary count', { sourceHealth: healthySourceHealth(), queue: nanSummaryCount }],
+    ['negative summary count', { sourceHealth: healthySourceHealth(), queue: negativeSummaryCount }],
+    ['empty object row', { sourceHealth: healthySourceHealth(), queue: healthyQueue([{}]) }],
+    ['null row', { sourceHealth: healthySourceHealth(), queue: healthyQueue([null]) }],
+    ['empty opportunity ID', {
+      sourceHealth: healthySourceHealth(),
+      queue: healthyQueue([queueRow(1, { opportunityId: '' })]),
+    }],
+    ['missing display identity', {
+      sourceHealth: healthySourceHealth(),
+      queue: healthyQueue([queueRow(1, { name: undefined })]),
+    }],
+    ['string fit score', {
+      sourceHealth: healthySourceHealth(),
+      queue: healthyQueue([queueRow(1, { fitScore: '89' })]),
+    }],
+    ['missing workflow', {
+      sourceHealth: healthySourceHealth(),
+      queue: healthyQueue([queueRow(1, { workflow: null })]),
+    }],
+  ];
+
+  for (const [name, { sourceHealth, queue }] of cases) {
+    await t.test(name, async () => {
+      const inputs = {
+        businessDate,
+        generatedAt,
+        sourceHealth,
+        scoreRefresh: healthyScoreRefresh(),
+        queue,
+      };
+      const direct = await Promise.resolve().then(() => projectDailyDealHunterDigest(inputs));
+      const built = await buildCurrentDailyDealHunterDigest({
+        businessDate,
+        storage: {},
+        refreshScores: async () => inputs.scoreRefresh,
+        readSourceHealth: async () => sourceHealth,
+        readTriageQueue: async () => queue,
+      });
+
+      for (const projection of [direct, built]) {
+        assertActionRequired(projection);
+        const serialized = JSON.stringify(projection);
+        assert.doesNotMatch(serialized, /Unnamed opportunity/);
+        assert.doesNotMatch(serialized, /"needsReview":0/);
+        assert.ok(
+          projection.sourceAuthority.blockingIssues.some((issue) => (
+            issue.classification === 'authority-invalid'
+            || issue.classification === 'queue-unavailable'
+          )),
+          JSON.stringify(projection.sourceAuthority.blockingIssues),
+        );
+      }
+    });
+  }
 });
