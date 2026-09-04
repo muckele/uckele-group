@@ -1,6 +1,6 @@
 # Uckele Group / Deal Hunter Phase 4: Daily Deal Hunter Digest
 
-**Status:** Ready for human design approval; implementation is not authorized by this document
+**Status:** Human approved; implementation remains limited to explicitly authorized plan tasks
 
 **Date:** 2026-09-04
 
@@ -227,9 +227,9 @@ If the application starts or recovers after 08:00, it attempts that date once, s
 - 08:00 PST is 16:00 UTC;
 - 08:00 PDT is 15:00 UTC.
 
-### Weekend design decision
+### Calendar-day schedule decision
 
-The current scheduler runs every calendar day and has no weekday product rule. “Daily” supports preserving that behavior, while the phrase “business date” could be read as weekday-only. This specification recommends that **Pacific business date mean the Pacific calendar date and that Saturday/Sunday continue to run** for the smallest behavior-preserving MVP. Human approval must explicitly confirm this. If weekday-only behavior is desired, the design must be amended before implementation; implementation must not silently add a weekend skip or holiday calendar.
+The Daily Deal Hunter Digest runs every calendar day at 08:00 `America/Los_Angeles`, including Saturday and Sunday. “Pacific business date” means the timezone-local Pacific calendar date. The MVP does not skip holidays and must not add a weekday or holiday-calendar rule.
 
 ## 9. Recipient authority
 
@@ -525,7 +525,7 @@ Tests must use explicit UTC instants and `America/Los_Angeles`, never the machin
 - instants straddling Pacific midnight produce different job keys;
 - a date completed before an offset transition remains completed after it;
 - invalid IANA zone and invalid `HH:MM` fail configuration validation; and
-- current calendar-day weekend behavior has explicit Saturday and Sunday tests if approved. If weekday-only is selected instead, tests must prove Monday catch-up does not send identities for skipped weekend dates.
+- calendar-day behavior has explicit Saturday and Sunday tests proving each date is due at 08:00 Pacific with no weekday or holiday skip.
 
 ## 22. Security/safety invariants
 
@@ -654,10 +654,10 @@ The specification was reviewed against the requested contradiction, authority, c
 - **Crash before provider:** stale pending recovers after one hour. A crash after the boundary but before the call is intentionally treated as ambiguous rather than assumed safe.
 - **Crash after acceptance:** exact marker, local event, signed webhook, or provider identity reconciles without a send.
 - **Payload drift:** the prepared envelope is durable and reused on definitive failure; source recovery cannot silently turn an attempted alert into a digest under the same provider key.
-- **Timezone ambiguity:** the IANA wall-clock/date conversion and concrete PST/PDT/DST instants are specified. Weekend behavior is surfaced for human approval.
+- **Timezone ambiguity:** the IANA wall-clock/date conversion and concrete PST/PDT/DST instants are specified. Human approval locks every-calendar-day behavior, including Saturday and Sunday, with no holiday skipping in MVP.
 - **Production safety:** internal-digest authority is structurally independent of CIM flags, while rollout explicitly verifies and preserves the supplied pause posture.
 - **Storage parity:** no new table/column is needed; the Supabase gap is closed by additive, service-role-only functions over the existing table.
 - **Sensitive metadata:** Operations must redact the prepared envelope and effective recipient.
 - **Overbroad MVP:** no generic notification center, per-row deep-link feature, AI prose, financial analysis, new manual control, or separate scheduler remains in scope.
 
-No unresolved contradiction remains. The only product decision awaiting explicit human approval is whether “daily” includes Saturday and Sunday; this document recommends preserving the existing calendar-day behavior.
+No unresolved contradiction remains. The approved schedule runs every calendar day, including Saturday and Sunday, at 08:00 `America/Los_Angeles`; the Pacific business date is the timezone-local calendar date and the MVP does not skip holidays.

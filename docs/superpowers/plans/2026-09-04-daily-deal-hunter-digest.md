@@ -1,6 +1,6 @@
 # Uckele Group / Deal Hunter Phase 4: Daily Deal Hunter Digest Implementation Plan
 
-> **For implementation workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement exactly one top-level task per implementation run. Use `superpowers:test-driven-development` for that task and `superpowers:verification-before-completion` before returning its commit. Stop after the task commit for one focused human/code review. Do not begin any task until the Phase 4 design, including the weekend decision, receives human approval.
+> **For implementation workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` to implement exactly one top-level task per implementation run. Use `superpowers:test-driven-development` for that task and `superpowers:verification-before-completion` before returning its commit. Stop after the task commit for one focused human/code review. The Phase 4 design, including the calendar-day schedule, is human approved.
 
 **Goal:** Deliver one reliable, server-owned internal briefing at 08:00 `America/Los_Angeles` that produces either a concise current Acquisition Inbox digest or a bounded required-source action alert, with exactly one completed result per Pacific date and no CRM/CIM/follow-up/Stage 2 side effects.
 
@@ -8,13 +8,13 @@
 
 **Tech stack:** Node.js 22.23.2, Express, ES modules, SQLite/`better-sqlite3`, Supabase/PostgreSQL RPCs, React, Vitest/Testing Library, Node test runner, Playwright, Vite, Resend.
 
-**Approved-design candidate:** `docs/superpowers/specs/2026-09-04-daily-deal-hunter-digest-design.md` at planning commit `9ed2272`. Human approval is still required.
+**Approved design:** `docs/superpowers/specs/2026-09-04-daily-deal-hunter-digest-design.md` at planning commit `9ed2272`. Human approval includes operation every calendar day, Saturday and Sunday included, at 08:00 `America/Los_Angeles`, with no holiday skipping in MVP.
 
 **Planning base:** `ba4a73f78ba1213373b46e6c5ac6aa6b6caa50a8` on branch `codex/daily-deal-hunter-phase-4` in `/Users/Matt/Documents/uckele-group-phase4-daily-digest`.
 
 ## Mandatory implementation preflight
 
-Do not use `/Users/Matt/Documents/uckele-group`; it was intentionally left untouched because it contains unrelated user-owned changes. Continue only in the isolated Phase 4 worktree after a human approves the specification and resolves the weekend decision.
+Do not use `/Users/Matt/Documents/uckele-group`; it was intentionally left untouched because it contains unrelated user-owned changes. Continue only in the isolated Phase 4 worktree. The approved Pacific business date is the `America/Los_Angeles` timezone-local calendar date, including Saturday and Sunday.
 
 ```sh
 cd /Users/Matt/Documents/uckele-group-phase4-daily-digest
