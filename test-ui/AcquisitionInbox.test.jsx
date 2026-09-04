@@ -240,8 +240,9 @@ afterEach(() => {
 
 describe('Acquisition Inbox dashboard entry', () => {
   test('opens Inbox by default and keeps legacy operations separately reachable', async () => {
-    const fetchMock = vi.fn(async (input) => {
+    const fetchMock = vi.fn(async (input, options = {}) => {
       const url = String(input);
+      const method = String(options.method || 'GET').toUpperCase();
       if (url === '/api/admin/session') {
         return jsonResponse({
           authenticated: true,
@@ -254,7 +255,9 @@ describe('Acquisition Inbox dashboard entry', () => {
         });
       }
       if (url.startsWith('/api/admin/deal-hunter/triage?')) return jsonResponse(queueResponse());
-      if (url === '/api/admin/onboarding') return jsonResponse({ success: true, progress: [] });
+      if (method === 'GET' && url === '/api/admin/onboarding') {
+        return jsonResponse({ success: true, progress: [] });
+      }
       return jsonResponse({ success: false, error: `Unexpected request: ${url}` }, { ok: false, status: 404 });
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -271,12 +274,21 @@ describe('Acquisition Inbox dashboard entry', () => {
       expect(fetchMock.mock.calls.map(([url]) => String(url))).toContain('/api/admin/onboarding');
     });
     const requestedUrls = fetchMock.mock.calls.map(([url]) => String(url));
+    const requestSignatures = fetchMock.mock.calls.map(([url, options = {}]) => (
+      `${String(options.method || 'GET').toUpperCase()} ${String(url)}`
+    ));
     expect(requestedUrls).toHaveLength(3);
     expect(requestedUrls).toEqual(expect.arrayContaining([
       '/api/admin/session',
       expect.stringMatching(/^\/api\/admin\/deal-hunter\/triage\?/),
       '/api/admin/onboarding',
     ]));
+    expect(requestSignatures).toEqual(expect.arrayContaining([
+      'GET /api/admin/session',
+      expect.stringMatching(/^GET \/api\/admin\/deal-hunter\/triage\?/),
+      'GET /api/admin/onboarding',
+    ]));
+    expect(requestSignatures.some((signature) => /^(POST|PUT|PATCH|DELETE) /.test(signature))).toBe(false);
     expect(requestedUrls.some((url) => /\/review|\/backfill-review|\/send|\/cim-|\/deal-os-import/.test(url))).toBe(false);
   });
 });
