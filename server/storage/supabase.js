@@ -1,5 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
 import {
   normalizeDealHunterSourceSnapshot,
@@ -13,6 +13,67 @@ import { requireCanonicalCimRequestId } from '../services/cimRequestIdPolicy.js'
 const dealHunterQueueSorts = new Set([
   'acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed',
 ]);
+
+const scheduledJobStatuses = new Set(['pending', 'transmitting', 'failed', 'ambiguous', 'completed']);
+const scheduledJobResultReasons = new Set([
+  'claimed', 'active', 'retry-not-due', 'not-owner', 'wrong-state', 'completed', 'missing',
+]);
+const scheduledJobClaimTokenPattern = /^[A-Za-z0-9_-]{16,200}$/;
+const scheduledJobMetadataMaxBytes = 512 * 1024;
+
+function normalizeScheduledJobText(value, fieldName, maxLength, { required = true } = {}) {
+  if (typeof value !== 'string' || value.trim() !== value || (required && value.length === 0) || value.length > maxLength) {
+    throw new Error(`${fieldName} must be ${required ? 'a non-empty' : 'an'} unpadded string of at most ${maxLength} characters.`);
+  }
+  return value;
+}
+
+function normalizeScheduledJobToken(value, { generate = false } = {}) {
+  const token = value || (generate ? randomUUID() : '');
+  if (!scheduledJobClaimTokenPattern.test(token)) {
+    throw new Error('Scheduled-job claim token must be a 16-200 character URL-safe opaque value.');
+  }
+  return token;
+}
+
+function normalizeScheduledJobMetadata(value, fieldName) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    if (value === undefined || value === null) return {};
+    throw new Error(`${fieldName} must be a JSON object.`);
+  }
+  let serialized;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new Error(`${fieldName} must be JSON serializable.`);
+  }
+  if (!serialized || Buffer.byteLength(serialized, 'utf8') > scheduledJobMetadataMaxBytes) {
+    throw new Error(`${fieldName} exceeds the scheduled-job metadata limit.`);
+  }
+  return JSON.parse(serialized);
+}
+
+function normalizeScheduledJobRow(row) {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+  return {
+    ...row,
+    attempt_count: Number(row.attempt_count || 0),
+    metadata: row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+      ? row.metadata
+      : {},
+  };
+}
+
+function normalizeScheduledJobResult(data) {
+  const result = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+  const applied = Boolean(result.applied);
+  return {
+    applied,
+    claimed: applied,
+    reason: scheduledJobResultReasons.has(result.reason) ? result.reason : 'wrong-state',
+    run: normalizeScheduledJobRow(result.run),
+  };
+}
 
 function normalizeSubmissionRow(row) {
   return {
@@ -3886,97 +3947,95 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return (data || []).map(normalizeDealHunterDispositionRow);
     },
 
-    async claimScheduledJob({ jobKey = '', jobName = '', triggeredBy = '', nowIso = '', staleBefore = '', metadata = {} } = {}) {
-      if (!jobKey || !jobName || !nowIso) {
-        return { claimed: false, run: null };
+    async claimScheduledJob({
+      jobKey = '',
+      jobName = '',
+      triggeredBy = '',
+      claimToken = '',
+      nowIso = '',
+      staleBefore = '',
+      retryDueAt = '',
+      metadata = {},
+    } = {}) {
+      if (!jobKey || !jobName || !nowIso) return normalizeScheduledJobResult({ reason: 'missing' });
+      const safeJobKey = normalizeScheduledJobText(jobKey, 'Scheduled-job key', 240);
+      const safeJobName = normalizeScheduledJobText(jobName, 'Scheduled-job name', 120);
+      const safeTriggeredBy = normalizeScheduledJobText(
+        triggeredBy,
+        'Scheduled-job trigger',
+        200,
+        { required: false },
+      );
+      const safeClaimToken = normalizeScheduledJobToken(claimToken, { generate: true });
+      const safeNow = normalizeCanonicalUtcIso(nowIso, 'Scheduled-job claim time');
+      const safeStaleBefore = staleBefore
+        ? normalizeCanonicalUtcIso(staleBefore, 'Scheduled-job stale cutoff')
+        : null;
+      const safeRetryDueAt = retryDueAt
+        ? normalizeCanonicalUtcIso(retryDueAt, 'Scheduled-job retry cutoff')
+        : null;
+      const safeMetadata = normalizeScheduledJobMetadata(metadata, 'Scheduled-job claim metadata');
+      const { data, error } = await client.rpc('claim_scheduled_job', {
+        p_job_key: safeJobKey,
+        p_job_name: safeJobName,
+        p_triggered_by: safeTriggeredBy || null,
+        p_claim_token: safeClaimToken,
+        p_now: safeNow,
+        p_stale_before: safeStaleBefore,
+        p_retry_due_at: safeRetryDueAt,
+        p_metadata: safeMetadata,
+      });
+      if (error) throw error;
+      return normalizeScheduledJobResult(data);
+    },
+
+    async transitionScheduledJob({
+      jobKey = '',
+      claimToken = '',
+      expectedStatuses = [],
+      status = '',
+      nowIso = '',
+      providerMessageId = '',
+      lastError = '',
+      metadataPatch = {},
+      completedAt = '',
+    } = {}) {
+      if (!jobKey || !claimToken || !nowIso) return normalizeScheduledJobResult({ reason: 'missing' });
+      const safeJobKey = normalizeScheduledJobText(jobKey, 'Scheduled-job key', 240);
+      const safeClaimToken = normalizeScheduledJobToken(claimToken);
+      const safeNow = normalizeCanonicalUtcIso(nowIso, 'Scheduled-job transition time');
+      const safeStatus = normalizeScheduledJobText(status, 'Scheduled-job status', 40);
+      if (!scheduledJobStatuses.has(safeStatus)) throw new Error('Scheduled-job status is not supported.');
+      if (!Array.isArray(expectedStatuses)) throw new Error('Scheduled-job expected statuses must be an array.');
+      const safeExpectedStatuses = [...new Set(expectedStatuses.map((value) => (
+        normalizeScheduledJobText(value, 'Scheduled-job expected status', 40)
+      )))];
+      if (safeExpectedStatuses.length === 0 || safeExpectedStatuses.some((value) => !scheduledJobStatuses.has(value))) {
+        throw new Error('At least one supported expected scheduled-job status is required.');
       }
-
-      const record = {
-        job_key: jobKey,
-        job_name: jobName,
-        created_at: nowIso,
-        updated_at: nowIso,
-        started_at: nowIso,
-        completed_at: null,
-        status: 'pending',
-        triggered_by: triggeredBy,
-        attempt_count: 1,
-        provider_message_id: null,
-        last_error: null,
-        metadata: metadata || {},
-      };
-      const inserted = await client.from('scheduled_job_runs').insert(record).select().single();
-
-      if (!inserted.error) {
-        return { claimed: true, run: inserted.data };
-      }
-
-      if (!isUniqueViolation(inserted.error)) {
-        throw inserted.error;
-      }
-
-      const reclaimPayload = {
-        updated_at: nowIso,
-        started_at: nowIso,
-        completed_at: null,
-        status: 'pending',
-        triggered_by: triggeredBy,
-        provider_message_id: null,
-        last_error: null,
-        metadata: metadata || {},
-      };
-      const failedClaim = await client
-        .from('scheduled_job_runs')
-        .update(reclaimPayload)
-        .eq('job_key', jobKey)
-        .eq('status', 'failed')
-        .select()
-        .maybeSingle();
-
-      if (failedClaim.error) {
-        throw failedClaim.error;
-      }
-
-      let claimedData = failedClaim.data;
-
-      if (!claimedData && staleBefore) {
-        const staleClaim = await client
-          .from('scheduled_job_runs')
-          .update(reclaimPayload)
-          .eq('job_key', jobKey)
-          .eq('status', 'pending')
-          .lte('updated_at', staleBefore)
-          .select()
-          .maybeSingle();
-
-        if (staleClaim.error) {
-          throw staleClaim.error;
-        }
-
-        claimedData = staleClaim.data;
-      }
-
-      if (claimedData) {
-        const attemptCount = Number(claimedData.attempt_count || 1) + 1;
-        const updated = await client
-          .from('scheduled_job_runs')
-          .update({ attempt_count: attemptCount })
-          .eq('job_key', jobKey)
-          .select()
-          .single();
-
-        if (updated.error) {
-          throw updated.error;
-        }
-
-        return { claimed: true, run: updated.data };
-      }
-
-      const existing = await client.from('scheduled_job_runs').select('*').eq('job_key', jobKey).maybeSingle();
-      if (existing.error) {
-        throw existing.error;
-      }
-      return { claimed: false, run: existing.data || null };
+      const safeProviderMessageId = providerMessageId
+        ? normalizeScheduledJobText(providerMessageId, 'Scheduled-job provider message ID', 500)
+        : null;
+      const safeLastError = lastError
+        ? normalizeScheduledJobText(lastError, 'Scheduled-job error', 1000)
+        : null;
+      const safeMetadataPatch = normalizeScheduledJobMetadata(metadataPatch, 'Scheduled-job metadata patch');
+      const safeCompletedAt = completedAt
+        ? normalizeCanonicalUtcIso(completedAt, 'Scheduled-job completion time')
+        : null;
+      const { data, error } = await client.rpc('transition_scheduled_job', {
+        p_job_key: safeJobKey,
+        p_claim_token: safeClaimToken,
+        p_expected_statuses: safeExpectedStatuses,
+        p_status: safeStatus,
+        p_now: safeNow,
+        p_provider_message_id: safeProviderMessageId,
+        p_last_error: safeLastError,
+        p_metadata_patch: safeMetadataPatch,
+        p_completed_at: safeCompletedAt,
+      });
+      if (error) throw error;
+      return normalizeScheduledJobResult(data);
     },
 
     async completeScheduledJob(jobKey, values = {}) {
@@ -4005,7 +4064,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       if (error) {
         throw error;
       }
-      return data || null;
+      return normalizeScheduledJobRow(data);
     },
 
     async listScheduledJobs({ limit = 100 } = {}) {
@@ -4015,7 +4074,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         .order('updated_at', { ascending: false })
         .limit(Math.max(1, Math.min(Number(limit) || 100, 500)));
       if (error) throw error;
-      return data || [];
+      return (data || []).map(normalizeScheduledJobRow);
     },
 
     async getDatabaseStatus() {

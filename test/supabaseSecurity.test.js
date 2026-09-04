@@ -87,6 +87,16 @@ const manualFollowUpAtomicityMigrationUrl = new URL(
   '../supabase/migrations/20260901120000_deal_hunter_manual_follow_up_atomicity.sql',
   import.meta.url,
 );
+const scheduledJobFencingMigrationUrl = new URL(
+  '../supabase/migrations/20260904120000_daily_digest_scheduled_job_fencing.sql',
+  import.meta.url,
+);
+
+function dailyDigestScheduledJobMigration() {
+  return fs.existsSync(scheduledJobFencingMigrationUrl)
+    ? fs.readFileSync(scheduledJobFencingMigrationUrl, 'utf8')
+    : '';
+}
 
 function currentAppTables(schema) {
   return Array.from(
@@ -812,4 +822,101 @@ test('manual follow-up RPCs enforce strict marker identity cadence proof and ide
   const legacyClaim = sqlFunctionDefinitions(migration)
     .find(({ name }) => name === 'claim_deal_hunter_cim_follow_up_request')?.sql || '';
   assert.match(legacyClaim, /manualFollowUp[\s\S]*?operator-approved[\s\S]*?approval-required/i);
+});
+
+test('scheduled job claim function atomically fences stale failed and completed states', () => {
+  const migration = dailyDigestScheduledJobMigration();
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  for (const [sourceLabel, sql] of [
+    ['scheduled-job fencing migration', migration],
+    ['fresh schema', schema],
+  ]) {
+    const claim = sqlFunctionDefinitions(sql)
+      .find(({ name }) => name === 'claim_scheduled_job')?.sql || '';
+    assert.match(claim, /security definer[\s\S]*?set search_path = public/i, `${sourceLabel} hardens claim execution`);
+    assert.match(claim, /scheduled_job_runs[\s\S]*?for update/i, `${sourceLabel} locks the one canonical row`);
+    assert.match(claim, /status\s*=\s*'pending'[\s\S]*?p_stale_before[\s\S]*?updated_at\s*>\s*p_stale_before/i);
+    assert.match(claim, /status\s*=\s*'failed'[\s\S]*?nextRetryAt[\s\S]*?p_retry_due_at/i);
+    assert.match(claim, /transmitting[\s\S]*?ambiguous[\s\S]*?completed/i);
+    assert.match(claim, /attempt_count\s*=\s*(?:v_current\.)?attempt_count\s*\+\s*1/i);
+  }
+});
+
+test('scheduled job transition function requires expected status and claim token', () => {
+  const migration = dailyDigestScheduledJobMigration();
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  for (const [sourceLabel, sql] of [
+    ['scheduled-job fencing migration', migration],
+    ['fresh schema', schema],
+  ]) {
+    const transition = sqlFunctionDefinitions(sql)
+      .find(({ name }) => name === 'transition_scheduled_job')?.sql || '';
+    assert.match(transition, /security definer[\s\S]*?set search_path = public/i, `${sourceLabel} hardens transition execution`);
+    assert.match(transition, /scheduled_job_runs[\s\S]*?for update/i, `${sourceLabel} locks the transition row`);
+    assert.match(transition, /metadata\s*->>\s*'claimToken'[\s\S]*?p_claim_token/i);
+    assert.match(transition, /p_expected_statuses[\s\S]*?v_current\.status/i);
+    assert.match(transition, /p_status\s+is\s+null[\s\S]*?p_status\s+not\s+in/i);
+    assert.match(transition, /expected\.status\s+is\s+null[\s\S]*?expected\.status\s+not\s+in/i);
+    assert.match(transition, /not-owner[\s\S]*?wrong-state[\s\S]*?completed/i);
+    assert.match(transition, /ambiguous[\s\S]*?completed/i);
+  }
+});
+
+test('scheduled job functions preserve immutable prepared metadata and increment attempts atomically', () => {
+  const migration = dailyDigestScheduledJobMigration();
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
+  const functionDefinition = (sql, functionName) => {
+    const start = sql.indexOf(`create or replace function public.${functionName}`);
+    const end = sql.indexOf('\n$$;', start);
+    return start >= 0 && end >= start ? sql.slice(start, end + 4) : '';
+  };
+  for (const [sourceLabel, sql] of [
+    ['scheduled-job fencing migration', migration],
+    ['fresh schema', schema],
+  ]) {
+    const functions = sqlFunctionDefinitions(sql)
+      .filter(({ name }) => ['claim_scheduled_job', 'transition_scheduled_job'].includes(name));
+    assert.equal(functions.length, 2, `${sourceLabel} contains both scheduled-job functions`);
+    for (const immutableField of [
+      'preparedEnvelope', 'payloadDigest', 'firstPreparedAt', 'businessDate', 'notificationType',
+    ]) {
+      assert.match(functions[0].sql, new RegExp(immutableField, 'i'), `${sourceLabel} claim preserves ${immutableField}`);
+      assert.match(functions[1].sql, new RegExp(immutableField, 'i'), `${sourceLabel} transition preserves ${immutableField}`);
+    }
+    assert.match(functions[0].sql, /attempt_count\s*=\s*(?:v_current\.)?attempt_count\s*\+\s*1/i);
+    assert.match(functions[0].sql, /claimToken[\s\S]*?claimedAt/i);
+    assert.match(functions[1].sql, /nextRetryAt[\s\S]*?interval\s+'30 minutes'/i);
+  }
+  for (const functionName of ['claim_scheduled_job', 'transition_scheduled_job']) {
+    const migrationFunction = functionDefinition(migration, functionName);
+    const schemaFunction = functionDefinition(schema, functionName);
+    assert.ok(migrationFunction, `${functionName} must exist in the migration`);
+    assert.ok(schemaFunction, `${functionName} must exist in the fresh schema`);
+    assert.equal(normalize(schemaFunction), normalize(migrationFunction), `${functionName} schema/migration parity`);
+  }
+});
+
+test('scheduled job functions are service-role-only', () => {
+  const migration = dailyDigestScheduledJobMigration();
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  for (const [sourceLabel, sql] of [
+    ['scheduled-job fencing migration', migration],
+    ['fresh schema', schema],
+  ]) {
+    assertServiceRoleOnlyFunction(sql, sourceLabel, 'claim_scheduled_job');
+    assertServiceRoleOnlyFunction(sql, sourceLabel, 'transition_scheduled_job');
+  }
+});
+
+test('scheduled job fencing migration adds no table or column', () => {
+  const migration = dailyDigestScheduledJobMigration();
+  assert.notEqual(migration, '', 'the deployable scheduled-job fencing migration exists');
+  assert.doesNotMatch(migration, /\b(?:create|alter|drop)\s+table\b/i);
+  assert.doesNotMatch(migration, /\b(?:add|drop)\s+column\b/i);
+  assert.doesNotMatch(migration, /\b(?:create|drop)\s+(?:unique\s+)?index\b/i);
+  assert.doesNotMatch(migration, /\bcreate\s+trigger\b/i);
+  assert.doesNotMatch(migration, /\b(?:insert|update|delete)\s+(?:into|from)?\s*public\.(?!scheduled_job_runs\b)/i);
+  const definitions = sqlFunctionDefinitions(migration).map(({ name }) => name).sort();
+  assert.deepEqual(definitions, ['claim_scheduled_job', 'transition_scheduled_job']);
 });
