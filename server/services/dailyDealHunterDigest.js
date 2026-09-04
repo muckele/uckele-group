@@ -9,6 +9,7 @@ export const DAILY_DEAL_HUNTER_TOP_LIMIT = 5;
 
 const MAX_BLOCKING_ISSUES = 3;
 const MAX_OPTIONAL_WARNINGS = 1;
+const TRIAGE_MISSING_NAME = 'Unnamed opportunity';
 const SUMMARY_FIELDS = Object.freeze([
   'needsReview',
   'highPriority',
@@ -67,11 +68,40 @@ function safeDisplayText(value = '', maximum = 400) {
     .slice(0, maximum);
 }
 
-function safeTimestamp(value) {
-  const normalized = normalizeText(value, 80);
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(normalized)
-    ? normalized
-    : '';
+function normalizeIsoTimestamp(value) {
+  if (typeof value !== 'string') return '';
+  const normalized = value.trim();
+  const match = normalized.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/,
+  );
+  if (!match) return '';
+
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, timezone] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1
+    || month > 12
+    || day < 1
+    || day > daysInMonth[month - 1]
+    || hour > 23
+    || minute > 59
+    || second > 59) {
+    return '';
+  }
+  if (timezone !== 'Z') {
+    const timezoneHour = Number(timezone.slice(1, 3));
+    const timezoneMinute = Number(timezone.slice(4, 6));
+    if (timezoneHour > 23 || timezoneMinute > 59) return '';
+  }
+
+  const timestamp = Date.parse(normalized);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : '';
 }
 
 function isRecord(value) {
@@ -125,7 +155,7 @@ function validSourceHealthSource(source) {
 function validSourceHealth(sourceHealth) {
   if (!isRecord(sourceHealth)
     || typeof sourceHealth.healthy !== 'boolean'
-    || !safeTimestamp(sourceHealth.generatedAt)
+    || !normalizeIsoTimestamp(sourceHealth.generatedAt)
     || !Array.isArray(sourceHealth.issues)
     || !Array.isArray(sourceHealth.sources)
     || !sourceHealth.issues.every(validSourceHealthIssue)
@@ -163,6 +193,7 @@ function validOpportunityRow(row) {
   return isRecord(row)
     && isNonemptyString(row.opportunityId)
     && isNonemptyString(row.name)
+    && row.name !== TRIAGE_MISSING_NAME
     && typeof row.state === 'string'
     && typeof row.fitScore === 'number'
     && Number.isFinite(row.fitScore)
@@ -176,7 +207,8 @@ function validOpportunityRow(row) {
     && isRecord(row.workflow)
     && isNonemptyString(row.workflow.crmStatus)
     && isNonemptyString(row.workflow.cimStatus)
-    && typeof row.observationFreshness === 'string';
+    && typeof row.observationFreshness === 'string'
+    && (row.observationFreshness === '' || Boolean(normalizeIsoTimestamp(row.observationFreshness)));
 }
 
 function validQueue(queue) {
@@ -241,11 +273,11 @@ function projectedIssue(issue = {}, fallback = 'source-unhealthy') {
     classification,
     title: presentation.title,
     message: presentation.message,
-    checkedAt: safeTimestamp(issue.checkedAt),
+    checkedAt: normalizeIsoTimestamp(issue.checkedAt),
   };
 }
 
-function sourceAuthority({ sourceHealth, scoreRefresh, queue }) {
+function sourceAuthority({ generatedAt, sourceHealth, scoreRefresh, queue }) {
   const sourceHealthIsAuthoritative = validSourceHealth(sourceHealth);
   const issues = sourceHealthIsAuthoritative ? sourceHealth.issues : [];
   const blockingIssues = issues
@@ -296,6 +328,13 @@ function sourceAuthority({ sourceHealth, scoreRefresh, queue }) {
     }, 'queue-unavailable'));
   }
 
+  if (!generatedAt) {
+    blockingIssues.push(projectedIssue({
+      sourceId: 'acquisition-authority',
+      classification: 'authority-invalid',
+    }, 'authority-invalid'));
+  }
+
   const boundedBlockingIssues = blockingIssues.slice(0, MAX_BLOCKING_ISSUES);
   return {
     requiredHealthy: boundedBlockingIssues.length === 0,
@@ -321,7 +360,7 @@ function projectedOpportunity(row = {}) {
       crmStatus: safeDisplayText(row.workflow.crmStatus, 80),
       cimStatus: safeDisplayText(row.workflow.cimStatus, 80),
     },
-    observationFreshness: safeDisplayText(row.observationFreshness, 80),
+    observationFreshness: normalizeIsoTimestamp(row.observationFreshness),
   };
 }
 
@@ -329,7 +368,7 @@ function projectedJob(job = {}, notificationType = '') {
   return {
     status: safeDisplayText(job.status, 40),
     attemptCount: boundedCount(job.attemptCount),
-    completedAt: safeDisplayText(job.completedAt, 80),
+    completedAt: normalizeIsoTimestamp(job.completedAt),
     notificationType: safeDisplayText(job.notificationType || notificationType, 40),
   };
 }
@@ -350,14 +389,20 @@ export function projectDailyDealHunterDigest({
   queue,
   job,
 } = {}) {
-  const authority = sourceAuthority({ sourceHealth, scoreRefresh, queue });
+  const normalizedGeneratedAt = normalizeIsoTimestamp(generatedAt);
+  const authority = sourceAuthority({
+    generatedAt: normalizedGeneratedAt,
+    sourceHealth,
+    scoreRefresh,
+    queue,
+  });
   const alert = !authority.requiredHealthy;
   const notificationType = alert ? 'required-source-alert' : 'normal-digest';
 
   return {
     version: DAILY_DEAL_HUNTER_DIGEST_VERSION,
     businessDate: safeDisplayText(businessDate, 20),
-    generatedAt: safeDisplayText(generatedAt || sourceHealth?.generatedAt, 80),
+    generatedAt: normalizedGeneratedAt,
     status: alert ? 'action-required' : authority.optionalWarnings.length > 0 ? 'optional-warning' : 'ready',
     notificationType,
     sourceAuthority: authority,
@@ -417,7 +462,7 @@ export async function buildCurrentDailyDealHunterDigest({
   if (scoreRefresh?.ok !== true || sourceHealth?.healthy !== true) {
     return projectDailyDealHunterDigest({
       businessDate,
-      generatedAt: sourceHealth?.generatedAt || scoreRefresh?.review?.generatedAt,
+      generatedAt: scoreRefresh?.review?.generatedAt ?? sourceHealth?.generatedAt,
       sourceHealth,
       scoreRefresh,
       queue: { ok: true, rows: [], summary: {} },
@@ -440,7 +485,7 @@ export async function buildCurrentDailyDealHunterDigest({
 
   return projectDailyDealHunterDigest({
     businessDate,
-    generatedAt: sourceHealth.generatedAt || scoreRefresh.review.generatedAt,
+    generatedAt: scoreRefresh.review.generatedAt ?? sourceHealth.generatedAt,
     sourceHealth,
     scoreRefresh,
     queue,

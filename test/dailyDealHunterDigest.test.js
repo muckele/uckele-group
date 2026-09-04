@@ -7,6 +7,7 @@ const {
   buildCurrentDailyDealHunterDigest,
   projectDailyDealHunterDigest,
 } = await import('../server/services/dailyDealHunterDigest.js');
+const { listTriageQueue } = await import('../server/services/dealHunterTriage.js');
 
 const generatedAt = '2026-09-05T15:00:00.000Z';
 const businessDate = '2026-09-05';
@@ -549,6 +550,244 @@ test('malformed digest authority fails closed without fabricated counts or rows'
           JSON.stringify(projection.sourceAuthority.blockingIssues),
         );
       }
+    });
+  }
+});
+
+test('digest projection never serializes malformed timestamp diagnostics', async (t) => {
+  const diagnostic = 'Acme Solar opp-secret broker@example.invalid 555-0101 $1300000 Authorization: Bearer TOPSECRET /srv/private/app.js:99';
+  const unsafePattern = /Acme Solar|opp-secret|broker@example\.invalid|555-0101|1300000|TOPSECRET|private\/app\.js/;
+
+  await t.test('source-health generatedAt', async () => {
+    const projection = await buildCurrentDailyDealHunterDigest({
+      businessDate,
+      storage: {},
+      refreshScores: async () => healthyScoreRefresh(),
+      readSourceHealth: async () => healthySourceHealth({ generatedAt: diagnostic }),
+      readTriageQueue: async () => healthyQueue(),
+    });
+
+    assertActionRequired(projection);
+    assert.equal(projection.generatedAt, generatedAt);
+    assert.doesNotMatch(JSON.stringify(projection), unsafePattern);
+  });
+
+  await t.test('source issue checkedAt', () => {
+    const projection = projectDailyDealHunterDigest({
+      businessDate,
+      generatedAt,
+      sourceHealth: healthySourceHealth({
+        healthy: false,
+        sources: healthyReview().sources.map((source) => source.required
+          ? { ...source, fetched: false, rowCount: 0 }
+          : source),
+        issues: [{
+          sourceId: 'google-sheet-1',
+          affectsHealth: true,
+          sourceUnavailable: true,
+          checkedAt: diagnostic,
+        }],
+      }),
+      scoreRefresh: healthyScoreRefresh(),
+      queue: healthyQueue(),
+    });
+
+    assertActionRequired(projection);
+    assert.equal(projection.sourceAuthority.blockingIssues[0].checkedAt, '');
+    assert.doesNotMatch(JSON.stringify(projection), unsafePattern);
+  });
+
+  await t.test('explicit projector generatedAt', () => {
+    const projection = projectDailyDealHunterDigest({
+      businessDate,
+      generatedAt: diagnostic,
+      sourceHealth: healthySourceHealth(),
+      scoreRefresh: healthyScoreRefresh(),
+      queue: healthyQueue(),
+    });
+
+    assertActionRequired(projection);
+    assert.equal(projection.generatedAt, '');
+    assert.doesNotMatch(JSON.stringify(projection), unsafePattern);
+  });
+
+  await t.test('opportunity observation freshness', () => {
+    const projection = projectDailyDealHunterDigest({
+      businessDate,
+      generatedAt,
+      sourceHealth: healthySourceHealth(),
+      scoreRefresh: healthyScoreRefresh(),
+      queue: healthyQueue([queueRow(1, { observationFreshness: diagnostic })]),
+    });
+
+    assert.doesNotMatch(JSON.stringify(projection), unsafePattern);
+  });
+
+  await t.test('job completion timestamp', () => {
+    const projection = projectDailyDealHunterDigest({
+      businessDate,
+      generatedAt,
+      sourceHealth: healthySourceHealth(),
+      scoreRefresh: healthyScoreRefresh(),
+      queue: healthyQueue(),
+      job: { status: 'pending', attemptCount: 1, completedAt: diagnostic },
+    });
+
+    assert.equal(projection.job.completedAt, '');
+    assert.doesNotMatch(JSON.stringify(projection), unsafePattern);
+  });
+
+  for (const invalid of ['2026-02-30T15:00:00.000Z', Number.NaN, Number.POSITIVE_INFINITY]) {
+    await t.test(`invalid explicit timestamp ${String(invalid)}`, () => {
+      const projection = projectDailyDealHunterDigest({
+        businessDate,
+        generatedAt: invalid,
+        sourceHealth: healthySourceHealth(),
+        scoreRefresh: healthyScoreRefresh(),
+        queue: healthyQueue(),
+      });
+
+      assertActionRequired(projection);
+      assert.equal(projection.generatedAt, '');
+    });
+  }
+});
+
+test('digest projection normalizes valid timestamps deterministically', () => {
+  const offsetTimestamp = '2026-09-05T08:00:00-07:00';
+  const normal = projectDailyDealHunterDigest({
+    businessDate,
+    generatedAt: offsetTimestamp,
+    sourceHealth: healthySourceHealth(),
+    scoreRefresh: healthyScoreRefresh(),
+    queue: healthyQueue([queueRow(1, { observationFreshness: offsetTimestamp })]),
+    job: { status: 'completed', attemptCount: 1, completedAt: offsetTimestamp },
+  });
+  const alert = projectDailyDealHunterDigest({
+    businessDate,
+    generatedAt: offsetTimestamp,
+    sourceHealth: healthySourceHealth({
+      healthy: false,
+      sources: healthyReview().sources.map((source) => source.required
+        ? { ...source, fetched: false, rowCount: 0 }
+        : source),
+      issues: [{
+        sourceId: 'google-sheet-1',
+        affectsHealth: true,
+        sourceUnavailable: true,
+        checkedAt: offsetTimestamp,
+      }],
+    }),
+    scoreRefresh: healthyScoreRefresh(),
+    queue: healthyQueue(),
+  });
+
+  assert.equal(normal.generatedAt, generatedAt);
+  assert.equal(normal.topOpportunities[0].observationFreshness, generatedAt);
+  assert.equal(normal.job.completedAt, generatedAt);
+  assert.equal(alert.generatedAt, generatedAt);
+  assert.equal(alert.sourceAuthority.blockingIssues[0].checkedAt, generatedAt);
+  assert.deepEqual(
+    projectDailyDealHunterDigest({
+      businessDate,
+      generatedAt: offsetTimestamp,
+      sourceHealth: healthySourceHealth(),
+      scoreRefresh: healthyScoreRefresh(),
+      queue: healthyQueue([queueRow(1, { observationFreshness: offsetTimestamp })]),
+      job: { status: 'completed', attemptCount: 1, completedAt: offsetTimestamp },
+    }),
+    normal,
+  );
+});
+
+test('daily digest rejects the real triage adapter missing-name fallback', async () => {
+  const queue = await listTriageQueue({
+    storage: {
+      listDealHunterOpportunityScores: async () => ({
+        rows: [{
+          opportunity_id: 'opp-real-adapter',
+          deal_key: 'real-adapter-deal',
+          name: null,
+          state: 'CA',
+          fit_score: 90,
+          score_status: 'qualified',
+          confidence: 'high',
+          completeness_score: 90,
+          missing_evidence_count: 0,
+          contradiction_count: 0,
+          should_remove: false,
+          high_fit: true,
+          top_strength: 'Strong fit',
+          top_concern: '',
+          observation_freshness: generatedAt,
+          operator_priority: 'normal',
+          reviewed: false,
+          changed_since_review: false,
+          crm_status: 'not-started',
+          cim_status: 'not-requested',
+          scored_at: generatedAt,
+        }],
+        total: 1,
+        page: 1,
+        pageSize: 5,
+        totalPages: 1,
+        summary: {
+          needsReview: 1,
+          highPriority: 1,
+          watchlist: 0,
+          lowConfidence: 0,
+          currentOpportunities: 1,
+        },
+      }),
+    },
+    getCachedSourceHealth: async () => healthySourceHealth(),
+    view: 'needs-review',
+    sort: 'acquisition-priority',
+    direction: 'desc',
+    page: 1,
+    pageSize: 5,
+  });
+
+  assert.equal(queue.rows[0].name, 'Unnamed opportunity');
+  const projection = await buildCurrentDailyDealHunterDigest({
+    businessDate,
+    storage: {},
+    refreshScores: async () => healthyScoreRefresh(),
+    readSourceHealth: async () => healthySourceHealth(),
+    readTriageQueue: async () => queue,
+  });
+
+  assertActionRequired(projection);
+  assert.doesNotMatch(JSON.stringify(projection), /Unnamed opportunity/);
+});
+
+test('daily digest projector rejects the exact triage missing-name fallback', () => {
+  const projection = projectDailyDealHunterDigest({
+    businessDate,
+    generatedAt,
+    sourceHealth: healthySourceHealth(),
+    scoreRefresh: healthyScoreRefresh(),
+    queue: healthyQueue([queueRow(1, { name: 'Unnamed opportunity' })]),
+  });
+
+  assertActionRequired(projection);
+  assert.doesNotMatch(JSON.stringify(projection), /Unnamed opportunity/);
+});
+
+test('daily digest keeps legitimate names without creating a broader name policy', async (t) => {
+  for (const name of ['Acme', 'Acme Field Services LLC', '123 Industries, Inc.']) {
+    await t.test(name, () => {
+      const projection = projectDailyDealHunterDigest({
+        businessDate,
+        generatedAt,
+        sourceHealth: healthySourceHealth(),
+        scoreRefresh: healthyScoreRefresh(),
+        queue: healthyQueue([queueRow(1, { name })]),
+      });
+
+      assert.equal(projection.status, 'ready');
+      assert.equal(projection.actionsAllowed, true);
+      assert.equal(projection.topOpportunities[0].name, name);
     });
   }
 });
