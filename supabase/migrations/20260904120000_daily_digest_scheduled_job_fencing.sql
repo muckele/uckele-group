@@ -6,6 +6,7 @@ create or replace function public.claim_scheduled_job(
   p_now timestamptz,
   p_stale_before timestamptz,
   p_retry_due_at timestamptz,
+  p_legacy_mode boolean,
   p_metadata jsonb
 )
 returns jsonb
@@ -25,6 +26,8 @@ begin
     or p_job_name is null or btrim(p_job_name) = '' or length(p_job_name) > 120
     or p_claim_token is null or p_claim_token !~ '^[A-Za-z0-9_-]{16,200}$'
     or p_now is null
+    or p_legacy_mode is null
+    or (p_legacy_mode and p_retry_due_at is not null)
     or p_metadata is null or jsonb_typeof(p_metadata) is distinct from 'object'
     or octet_length(p_metadata::text) > 524288
     or length(coalesce(p_triggered_by, '')) > 200
@@ -36,6 +39,9 @@ begin
     'claimToken', p_claim_token,
     'claimedAt', p_now
   );
+  if octet_length(v_metadata::text) > 524288 then
+    return jsonb_build_object('applied', false, 'reason', 'wrong-state', 'run', null);
+  end if;
 
   insert into public.scheduled_job_runs (
     job_key,
@@ -97,7 +103,7 @@ begin
   elsif v_current.status = 'failed' then
     v_next_retry_text := v_current.metadata ->> 'nextRetryAt';
     if v_next_retry_text is null or v_next_retry_text = '' then
-      if p_retry_due_at is not null then
+      if not p_legacy_mode then
         return jsonb_build_object('applied', false, 'reason', 'retry-not-due', 'run', to_jsonb(v_current));
       end if;
     else
@@ -142,6 +148,9 @@ begin
     'claimToken', p_claim_token,
     'claimedAt', p_now
   );
+  if octet_length(v_metadata::text) > 524288 then
+    return jsonb_build_object('applied', false, 'reason', 'wrong-state', 'run', to_jsonb(v_current));
+  end if;
 
   update public.scheduled_job_runs
   set updated_at = p_now,
@@ -276,6 +285,9 @@ begin
     v_metadata := jsonb_set(v_metadata, '{failedAt}', to_jsonb(p_now), true);
     v_metadata := jsonb_set(v_metadata, '{nextRetryAt}', to_jsonb(p_now + interval '30 minutes'), true);
   end if;
+  if octet_length(v_metadata::text) > 524288 then
+    return jsonb_build_object('applied', false, 'reason', 'wrong-state', 'run', to_jsonb(v_current));
+  end if;
 
   update public.scheduled_job_runs
   set updated_at = p_now,
@@ -308,9 +320,9 @@ begin
 end;
 $$;
 
-revoke all on function public.claim_scheduled_job(text, text, text, text, timestamptz, timestamptz, timestamptz, jsonb)
+revoke all on function public.claim_scheduled_job(text, text, text, text, timestamptz, timestamptz, timestamptz, boolean, jsonb)
   from public, anon, authenticated;
-grant execute on function public.claim_scheduled_job(text, text, text, text, timestamptz, timestamptz, timestamptz, jsonb)
+grant execute on function public.claim_scheduled_job(text, text, text, text, timestamptz, timestamptz, timestamptz, boolean, jsonb)
   to service_role;
 
 revoke all on function public.transition_scheduled_job(text, text, text[], text, timestamptz, text, text, jsonb, timestamptz)

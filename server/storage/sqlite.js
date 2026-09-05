@@ -112,6 +112,10 @@ function normalizeScheduledJobMetadata(value, fieldName) {
   return JSON.parse(serialized);
 }
 
+function scheduledJobMetadataFits(value) {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8') <= scheduledJobMetadataMaxBytes;
+}
+
 function mergeScheduledJobMetadata(existing, incoming) {
   const current = normalizeScheduledJobMetadata(existing, 'Existing scheduled-job metadata');
   const patch = normalizeScheduledJobMetadata(incoming, 'Scheduled-job metadata');
@@ -10078,6 +10082,9 @@ export function createSqliteStorage(config) {
           claimToken: safeToken,
           claimedAt: safeNow,
         };
+        if (!scheduledJobMetadataFits(initialMetadata)) {
+          return scheduledJobResult(false, 'wrong-state', null);
+        }
         const insertResult = database.prepare(`
           INSERT OR IGNORE INTO scheduled_job_runs (
             job_key, job_name, created_at, updated_at, started_at, status, triggered_by, attempt_count, metadata
@@ -10114,6 +10121,9 @@ export function createSqliteStorage(config) {
         const nextMetadata = mergeScheduledJobMetadata(parseJsonColumn(current.metadata, {}), safeMetadata);
         nextMetadata.claimToken = safeToken;
         nextMetadata.claimedAt = safeNow;
+        if (!scheduledJobMetadataFits(nextMetadata)) {
+          return scheduledJobResult(false, 'wrong-state', current);
+        }
         const updateResult = database.prepare(`
           UPDATE scheduled_job_runs SET
             updated_at = ?, started_at = ?, completed_at = NULL, status = 'pending',
@@ -10193,6 +10203,9 @@ export function createSqliteStorage(config) {
         if (safeStatus === 'failed') {
           nextMetadata.failedAt = safeNow;
           nextMetadata.nextRetryAt = new Date(Date.parse(safeNow) + scheduledJobRetryDelayMs).toISOString();
+        }
+        if (!scheduledJobMetadataFits(nextMetadata)) {
+          return scheduledJobResult(false, 'wrong-state', current);
         }
         const expectedPlaceholders = safeExpectedStatuses.map(() => '?').join(', ');
         const updateResult = database.prepare(`

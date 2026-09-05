@@ -12,6 +12,7 @@ import { createSupabaseStorage } from '../server/storage/supabase.js';
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dailyJobName = 'daily-deal-hunter-email';
 const oneHourMs = 60 * 60 * 1000;
+const scheduledJobMetadataMaxBytes = 512 * 1024;
 const startingHead = '7865e08feca43731865f3196cfec0b98837fe4cd';
 const scheduledJobMigrationPath = path.join(
   repositoryRoot,
@@ -178,6 +179,129 @@ function preparedMetadata(businessDate) {
     volatile: 'initial',
   };
 }
+
+function metadataForFinalSize(targetBytes, claimToken, claimedAt) {
+  const empty = { pad: '', claimToken, claimedAt };
+  const padLength = targetBytes - Buffer.byteLength(JSON.stringify(empty), 'utf8');
+  assert.ok(padLength >= 0);
+  return { pad: 'x'.repeat(padLength) };
+}
+
+function metadataPatchForFinalSize(existingMetadata, targetBytes) {
+  const empty = { ...existingMetadata, pad: '' };
+  const padLength = targetBytes - Buffer.byteLength(JSON.stringify(empty), 'utf8');
+  assert.ok(padLength >= 0);
+  return { pad: 'x'.repeat(padLength) };
+}
+
+function scheduledJobRpcRow({
+  jobKey,
+  jobName = dailyJobName,
+  status = 'pending',
+  claimToken,
+  attemptCount = 1,
+  metadata = {},
+} = {}) {
+  return {
+    job_key: jobKey,
+    job_name: jobName,
+    created_at: '2026-09-15T15:00:00.000Z',
+    updated_at: '2026-09-15T15:01:00.000Z',
+    started_at: '2026-09-15T15:00:00.000Z',
+    completed_at: status === 'completed' ? '2026-09-15T15:01:00.000Z' : null,
+    status,
+    triggered_by: 'scheduler',
+    attempt_count: attemptCount,
+    provider_message_id: null,
+    last_error: null,
+    metadata: { ...metadata, ...(claimToken ? { claimToken } : {}) },
+  };
+}
+
+test('scheduled job metadata limit includes persisted authority fields and never strands an accepted job', async (t) => {
+  const { storage } = createAtomicStorage(t, 'ug-scheduled-job-metadata-boundary-');
+
+  const oversizedKey = `${dailyJobName}:2026-09-16`;
+  const oversizedToken = `claim_metadata_oversized_${randomUUID()}`;
+  const oversizedNow = '2026-09-16T15:00:00.000Z';
+  const oversizedMetadata = metadataForFinalSize(
+    scheduledJobMetadataMaxBytes + 1,
+    oversizedToken,
+    oversizedNow,
+  );
+  assert.ok(Buffer.byteLength(JSON.stringify(oversizedMetadata), 'utf8') < scheduledJobMetadataMaxBytes);
+
+  const oversizedClaim = await storage.claimScheduledJob(atomicClaimInput(
+    oversizedKey,
+    oversizedToken,
+    oversizedNow,
+    { metadata: oversizedMetadata },
+  ));
+  assert.equal(oversizedClaim.applied, false);
+  assert.equal(oversizedClaim.claimed, false);
+  assert.equal(oversizedClaim.reason, 'wrong-state');
+  assert.equal(oversizedClaim.run, null);
+  assert.equal(await storage.getScheduledJob(oversizedKey), null);
+
+  const patchKey = `${dailyJobName}:2026-09-17`;
+  const patchToken = `claim_metadata_patch_${randomUUID()}`;
+  const patchClaim = await storage.claimScheduledJob(atomicClaimInput(
+    patchKey,
+    patchToken,
+    '2026-09-17T15:00:00.000Z',
+    { metadata: { stable: 'original' } },
+  ));
+  const beforePatch = structuredClone(await storage.getScheduledJob(patchKey));
+  const oversizedPatch = metadataPatchForFinalSize(
+    patchClaim.run.metadata,
+    scheduledJobMetadataMaxBytes + 1,
+  );
+  assert.ok(Buffer.byteLength(JSON.stringify(oversizedPatch), 'utf8') < scheduledJobMetadataMaxBytes);
+
+  const rejectedPatch = await storage.transitionScheduledJob({
+    jobKey: patchKey,
+    claimToken: patchToken,
+    expectedStatuses: ['pending'],
+    status: 'transmitting',
+    nowIso: '2026-09-17T15:01:00.000Z',
+    providerMessageId: 'must-not-persist',
+    metadataPatch: oversizedPatch,
+  });
+  assert.equal(rejectedPatch.applied, false);
+  assert.equal(rejectedPatch.claimed, false);
+  assert.equal(rejectedPatch.reason, 'wrong-state');
+  assert.deepEqual(rejectedPatch.run, beforePatch);
+  assert.deepEqual(await storage.getScheduledJob(patchKey), beforePatch);
+
+  const boundaryKey = `${dailyJobName}:2026-09-18`;
+  const boundaryToken = `claim_metadata_boundary_${randomUUID()}`;
+  const boundaryNow = '2026-09-18T15:00:00.000Z';
+  const boundaryMetadata = metadataForFinalSize(
+    scheduledJobMetadataMaxBytes - 8,
+    boundaryToken,
+    boundaryNow,
+  );
+  const boundaryClaim = await storage.claimScheduledJob(atomicClaimInput(
+    boundaryKey,
+    boundaryToken,
+    boundaryNow,
+    { metadata: boundaryMetadata },
+  ));
+  assert.equal(boundaryClaim.applied, true);
+  assert.equal(
+    Buffer.byteLength(JSON.stringify(boundaryClaim.run.metadata), 'utf8'),
+    scheduledJobMetadataMaxBytes - 8,
+  );
+  const boundaryTransition = await storage.transitionScheduledJob({
+    jobKey: boundaryKey,
+    claimToken: boundaryToken,
+    expectedStatuses: ['pending'],
+    status: 'pending',
+    nowIso: '2026-09-18T15:01:00.000Z',
+  });
+  assert.equal(boundaryTransition.applied, true);
+  assert.equal(boundaryTransition.run.status, 'pending');
+});
 
 test('scheduled job claim returns one token owner across ten concurrent attempts', async (t) => {
   const { storage, sqlitePath } = createAtomicStorage(t, 'ug-scheduled-job-first-race-');
@@ -521,30 +645,87 @@ test('legacy backup scheduled job callers remain compatible', async (t) => {
   assert.equal(completed.metadata.backupId, 'backup-1');
 });
 
+test('explicit-token scheduled job claim without retryDueAt cannot use the legacy failed-row exception', async (t) => {
+  const { storage } = createAtomicStorage(t, 'ug-scheduled-job-explicit-token-');
+  const sqliteKey = 'backup:2026-09-19';
+  await storage.claimScheduledJob({
+    jobKey: sqliteKey,
+    jobName: 'backup',
+    triggeredBy: 'scheduler',
+    nowIso: '2026-09-19T15:00:00.000Z',
+    metadata: { dateKey: '2026-09-19' },
+  });
+  await storage.completeScheduledJob(sqliteKey, {
+    status: 'failed',
+    completed_at: '2026-09-19T15:01:00.000Z',
+    last_error: 'legacy failure',
+    metadata: { dateKey: '2026-09-19' },
+  });
+  const beforeExplicitClaim = structuredClone(await storage.getScheduledJob(sqliteKey));
+  const explicitTokenClaim = await storage.claimScheduledJob({
+    jobKey: sqliteKey,
+    jobName: 'backup',
+    triggeredBy: 'scheduler',
+    claimToken: `claim_explicit_no_cutoff_${randomUUID()}`,
+    nowIso: '2026-09-19T15:02:00.000Z',
+    metadata: { dateKey: '2026-09-19' },
+  });
+  assert.equal(explicitTokenClaim.applied, false);
+  assert.equal(explicitTokenClaim.claimed, false);
+  assert.equal(explicitTokenClaim.reason, 'retry-not-due');
+  assert.deepEqual(await storage.getScheduledJob(sqliteKey), beforeExplicitClaim);
+
+  const calls = [];
+  const supabaseStorage = createSupabaseStorage(
+    { storage: { supabaseUrl: '', supabaseServiceRoleKey: '' } },
+    {
+      client: {
+        async rpc(name, parameters) {
+          calls.push({ name, parameters });
+          return { data: { applied: false, reason: 'missing', run: null }, error: null };
+        },
+      },
+    },
+  );
+  await supabaseStorage.claimScheduledJob({
+    jobKey: `${dailyJobName}:2026-09-19`,
+    jobName: dailyJobName,
+    triggeredBy: 'scheduler',
+    claimToken: `claim_supabase_explicit_${randomUUID()}`,
+    nowIso: '2026-09-19T15:02:00.000Z',
+  });
+  await supabaseStorage.claimScheduledJob({
+    jobKey: 'backup:2026-09-19',
+    jobName: 'backup',
+    triggeredBy: 'scheduler',
+    nowIso: '2026-09-19T15:02:00.000Z',
+  });
+  assert.equal(calls[0].parameters.p_legacy_mode, false);
+  assert.equal(calls[1].parameters.p_legacy_mode, true);
+  assert.match(calls[1].parameters.p_claim_token, /^[A-Za-z0-9_-]{16,200}$/);
+});
+
 test('Supabase scheduled job adapter delegates claim and transition authority to atomic RPCs', async () => {
   const calls = [];
   const token = `claim_supabase_${randomUUID()}`;
-  const row = {
-    job_key: `${dailyJobName}:2026-09-15`,
-    job_name: dailyJobName,
-    created_at: '2026-09-15T15:00:00.000Z',
-    updated_at: '2026-09-15T15:01:00.000Z',
-    started_at: '2026-09-15T15:00:00.000Z',
-    completed_at: null,
-    status: 'transmitting',
-    triggered_by: 'scheduler',
-    attempt_count: 1,
-    provider_message_id: null,
-    last_error: null,
-    metadata: { claimToken: token },
-  };
+  const jobKey = `${dailyJobName}:2026-09-15`;
+  const row = scheduledJobRpcRow({ jobKey, status: 'transmitting', claimToken: token });
   const storage = createSupabaseStorage(
     { storage: { supabaseUrl: '', supabaseServiceRoleKey: '' } },
     {
       client: {
         async rpc(name, parameters) {
           calls.push({ name, parameters });
-          return { data: { applied: true, reason: 'claimed', run: row }, error: null };
+          return {
+            data: {
+              applied: true,
+              reason: 'claimed',
+              run: name === 'claim_scheduled_job'
+                ? scheduledJobRpcRow({ jobKey, status: 'pending', claimToken: token })
+                : row,
+            },
+            error: null,
+          };
         },
       },
     },
@@ -575,6 +756,7 @@ test('Supabase scheduled job adapter delegates claim and transition authority to
         p_now: claim.nowIso,
         p_stale_before: claim.staleBefore,
         p_retry_due_at: claim.retryDueAt,
+        p_legacy_mode: false,
         p_metadata: claim.metadata,
       },
     },
@@ -598,6 +780,83 @@ test('Supabase scheduled job adapter delegates claim and transition authority to
   assert.deepEqual(claimed.run.metadata, { claimToken: token });
   assert.equal(transitioned.applied, true);
   assert.equal(transitioned.run.status, 'transmitting');
+});
+
+test('Supabase scheduled job operations fail closed on malformed RPC authority results', async () => {
+  const jobKey = `${dailyJobName}:2026-09-20`;
+  const claimToken = `claim_malformed_${randomUUID()}`;
+  const validClaimRow = scheduledJobRpcRow({ jobKey, status: 'pending', claimToken });
+  const validTransitionRow = scheduledJobRpcRow({ jobKey, status: 'transmitting', claimToken });
+  const malformedClaimResults = [
+    null,
+    [],
+    'invalid',
+    { applied: 'false', reason: 'claimed', run: validClaimRow },
+    { applied: 1, reason: 'claimed', run: validClaimRow },
+    { applied: true, reason: 'claimed', run: null },
+    { applied: true, reason: 'active', run: validClaimRow },
+    { applied: true, reason: 'claimed', run: { ...validClaimRow, job_key: `${jobKey}-wrong` } },
+    { applied: true, reason: 'claimed', run: { ...validClaimRow, job_name: 'wrong-job' } },
+    { applied: true, reason: 'claimed', run: { ...validClaimRow, status: 'transmitting' } },
+    { applied: true, reason: 'claimed', run: { ...validClaimRow, metadata: {} } },
+    {
+      applied: true,
+      reason: 'claimed',
+      run: { ...validClaimRow, metadata: { claimToken: `claim_wrong_${randomUUID()}` } },
+    },
+    { applied: true, reason: 'claimed', run: { ...validClaimRow, attempt_count: 0 } },
+    { applied: false, reason: 'unknown', run: validClaimRow },
+    { applied: false, reason: 'active', run: { ...validClaimRow, status: 'failed' } },
+  ];
+  const malformedTransitionResults = [
+    null,
+    [],
+    'invalid',
+    { applied: 'false', reason: 'claimed', run: validTransitionRow },
+    { applied: 1, reason: 'claimed', run: validTransitionRow },
+    { applied: true, reason: 'claimed', run: null },
+    { applied: true, reason: 'wrong-state', run: validTransitionRow },
+    { applied: true, reason: 'claimed', run: { ...validTransitionRow, job_key: `${jobKey}-wrong` } },
+    { applied: true, reason: 'claimed', run: { ...validTransitionRow, status: 'pending' } },
+    { applied: true, reason: 'claimed', run: { ...validTransitionRow, metadata: {} } },
+    {
+      applied: true,
+      reason: 'claimed',
+      run: { ...validTransitionRow, metadata: { claimToken: `claim_wrong_${randomUUID()}` } },
+    },
+    { applied: true, reason: 'claimed', run: { ...validTransitionRow, attempt_count: -1 } },
+    { applied: false, reason: 'unknown', run: validTransitionRow },
+    { applied: false, reason: 'completed', run: validTransitionRow },
+  ];
+
+  for (const [operation, results] of [
+    ['claim', malformedClaimResults],
+    ['transition', malformedTransitionResults],
+  ]) {
+    for (const data of results) {
+      const storage = createSupabaseStorage(
+        { storage: { supabaseUrl: '', supabaseServiceRoleKey: '' } },
+        { client: { async rpc() { return { data, error: null }; } } },
+      );
+      const result = operation === 'claim'
+        ? await storage.claimScheduledJob(atomicClaimInput(
+            jobKey,
+            claimToken,
+            '2026-09-20T15:00:00.000Z',
+          ))
+        : await storage.transitionScheduledJob({
+            jobKey,
+            claimToken,
+            expectedStatuses: ['pending'],
+            status: 'transmitting',
+            nowIso: '2026-09-20T15:01:00.000Z',
+          });
+      assert.equal(result.applied, false, `${operation} must fail closed for ${JSON.stringify(data)}`);
+      assert.equal(result.claimed, false, `${operation} must not confer authority for ${JSON.stringify(data)}`);
+      assert.equal(result.reason, 'wrong-state', `${operation} must bound its reason for ${JSON.stringify(data)}`);
+      assert.equal(result.run, null, `${operation} must not expose malformed authority for ${JSON.stringify(data)}`);
+    }
+  }
 });
 
 function runLocal(command, args, { input, allowFailure = false } = {}) {
@@ -680,6 +939,7 @@ function postgresClaim(jobKey, claimToken, nowIso, metadata = {}, overrides = {}
     ${sqlQuote(nowIso)}::timestamptz,
     ${overrides.staleBefore === null ? 'null' : `${sqlQuote(overrides.staleBefore || new Date(Date.parse(nowIso) - oneHourMs).toISOString())}::timestamptz`},
     ${overrides.retryDueAt === null ? 'null' : `${sqlQuote(overrides.retryDueAt || nowIso)}::timestamptz`},
+    ${overrides.legacyMode === true ? 'true' : 'false'},
     ${sqlJson(metadata)}
   );`;
 }
@@ -697,6 +957,44 @@ function postgresTransition(jobKey, claimToken, expectedStatuses, status, nowIso
     ${sqlJson(overrides.metadataPatch || {})},
     ${overrides.completedAt ? `${sqlQuote(overrides.completedAt)}::timestamptz` : 'null'}
   );`;
+}
+
+function psqlBackedScheduledJobRpcClient(containerName, database) {
+  return {
+    async rpc(name, parameters) {
+      const sql = name === 'claim_scheduled_job'
+        ? postgresClaim(
+            parameters.p_job_key,
+            parameters.p_claim_token,
+            parameters.p_now,
+            parameters.p_metadata,
+            {
+              jobName: parameters.p_job_name,
+              triggeredBy: parameters.p_triggered_by,
+              staleBefore: parameters.p_stale_before,
+              retryDueAt: parameters.p_retry_due_at,
+              legacyMode: parameters.p_legacy_mode,
+            },
+          )
+        : postgresTransition(
+            parameters.p_job_key,
+            parameters.p_claim_token,
+            parameters.p_expected_statuses,
+            parameters.p_status,
+            parameters.p_now,
+            {
+              providerMessageId: parameters.p_provider_message_id,
+              lastError: parameters.p_last_error,
+              metadataPatch: parameters.p_metadata_patch,
+              completedAt: parameters.p_completed_at,
+            },
+          );
+      const result = psql(containerName, database, sql, { allowFailure: true });
+      return result.status === 0
+        ? { data: parsePostgresJson(result), error: null }
+        : { data: null, error: new Error(result.stderr || `PostgreSQL RPC ${name} failed`) };
+    },
+  };
 }
 
 test('real PostgreSQL enforces atomic scheduled-job claims and token-fenced transitions', {
@@ -744,8 +1042,8 @@ test('real PostgreSQL enforces atomic scheduled-job claims and token-fenced tran
     assert.equal(functionCount, 2);
     const privileges = psql(containerName, database, `
       select concat_ws(',',
-        has_function_privilege('service_role', 'public.claim_scheduled_job(text,text,text,text,timestamptz,timestamptz,timestamptz,jsonb)', 'execute'),
-        has_function_privilege('anon', 'public.claim_scheduled_job(text,text,text,text,timestamptz,timestamptz,timestamptz,jsonb)', 'execute'),
+        has_function_privilege('service_role', 'public.claim_scheduled_job(text,text,text,text,timestamptz,timestamptz,timestamptz,boolean,jsonb)', 'execute'),
+        has_function_privilege('anon', 'public.claim_scheduled_job(text,text,text,text,timestamptz,timestamptz,timestamptz,boolean,jsonb)', 'execute'),
         has_function_privilege('authenticated', 'public.transition_scheduled_job(text,text,text[],text,timestamptz,text,text,jsonb,timestamptz)', 'execute')
       );
     `).stdout.trim();
@@ -753,6 +1051,31 @@ test('real PostgreSQL enforces atomic scheduled-job claims and token-fenced tran
   }
 
   const database = 'task2_upgrade';
+  const adapterStorage = createSupabaseStorage(
+    { storage: { supabaseUrl: '', supabaseServiceRoleKey: '' } },
+    { client: psqlBackedScheduledJobRpcClient(containerName, database) },
+  );
+  const adapterKey = `${dailyJobName}:2026-09-19`;
+  const adapterToken = `claim_pg_adapter_${randomUUID()}`;
+  const adapterClaim = await adapterStorage.claimScheduledJob(atomicClaimInput(
+    adapterKey,
+    adapterToken,
+    '2026-09-19T15:00:00.000Z',
+  ));
+  assert.equal(adapterClaim.applied, true);
+  assert.equal(adapterClaim.run.status, 'pending');
+  assert.equal(adapterClaim.run.metadata.claimToken, adapterToken);
+  const adapterTransition = await adapterStorage.transitionScheduledJob({
+    jobKey: adapterKey,
+    claimToken: adapterToken,
+    expectedStatuses: ['pending'],
+    status: 'transmitting',
+    nowIso: '2026-09-19T15:01:00.000Z',
+  });
+  assert.equal(adapterTransition.applied, true);
+  assert.equal(adapterTransition.run.status, 'transmitting');
+  assert.equal(adapterTransition.run.metadata.claimToken, adapterToken);
+
   const firstKey = `${dailyJobName}:2026-09-20`;
   const firstTokens = [`claim_pg_first_A_${randomUUID()}`, `claim_pg_first_B_${randomUUID()}`];
   const firstClaims = await Promise.all(firstTokens.map((token) => psqlAsync(
@@ -929,6 +1252,132 @@ test('real PostgreSQL enforces atomic scheduled-job claims and token-fenced tran
     assert.equal(denied.run.status, status);
     assert.equal(denied.run.attempt_count, 1);
   }
+
+  await t.test('PostgreSQL enforces the final persisted scheduled-job metadata limit', () => {
+    const oversizedKey = `${dailyJobName}:2026-09-26`;
+    const oversizedToken = `claim_pg_metadata_oversized_${randomUUID()}`;
+    const oversizedNow = '2026-09-26T15:00:00.000Z';
+    const oversizedMetadata = metadataForFinalSize(
+      scheduledJobMetadataMaxBytes + 1,
+      oversizedToken,
+      oversizedNow,
+    );
+    const oversizedClaim = parsePostgresJson(psql(
+      containerName,
+      database,
+      postgresClaim(oversizedKey, oversizedToken, oversizedNow, oversizedMetadata),
+    ));
+    assert.equal(oversizedClaim.applied, false);
+    assert.equal(oversizedClaim.reason, 'wrong-state');
+    assert.equal(oversizedClaim.run, null);
+    assert.equal(Number(psql(containerName, database, `
+      select count(*) from public.scheduled_job_runs where job_key = ${sqlQuote(oversizedKey)};
+    `).stdout.trim()), 0);
+
+    const patchKey = `${dailyJobName}:2026-09-27`;
+    const patchToken = `claim_pg_metadata_patch_${randomUUID()}`;
+    const patchClaim = parsePostgresJson(psql(
+      containerName,
+      database,
+      postgresClaim(patchKey, patchToken, '2026-09-27T15:00:00.000Z', { stable: 'original' }),
+    ));
+    const oversizedPatch = metadataPatchForFinalSize(
+      patchClaim.run.metadata,
+      scheduledJobMetadataMaxBytes + 1,
+    );
+    const beforePatch = parsePostgresJson(psql(containerName, database, `
+      select to_jsonb(run) from public.scheduled_job_runs run where job_key = ${sqlQuote(patchKey)};
+    `));
+    const rejectedPatch = parsePostgresJson(psql(containerName, database, postgresTransition(
+      patchKey,
+      patchToken,
+      ['pending'],
+      'transmitting',
+      '2026-09-27T15:01:00.000Z',
+      { providerMessageId: 'must-not-persist', metadataPatch: oversizedPatch },
+    )));
+    const afterPatch = parsePostgresJson(psql(containerName, database, `
+      select to_jsonb(run) from public.scheduled_job_runs run where job_key = ${sqlQuote(patchKey)};
+    `));
+    assert.equal(rejectedPatch.applied, false);
+    assert.equal(rejectedPatch.reason, 'wrong-state');
+    assert.deepEqual(rejectedPatch.run, beforePatch);
+    assert.deepEqual(afterPatch, beforePatch);
+
+    const boundaryKey = `${dailyJobName}:2026-09-28`;
+    const boundaryToken = `claim_pg_metadata_boundary_${randomUUID()}`;
+    const boundaryNow = '2026-09-28T15:00:00.000Z';
+    const boundaryMetadata = metadataForFinalSize(
+      scheduledJobMetadataMaxBytes - 8,
+      boundaryToken,
+      boundaryNow,
+    );
+    const boundaryClaim = parsePostgresJson(psql(
+      containerName,
+      database,
+      postgresClaim(boundaryKey, boundaryToken, boundaryNow, boundaryMetadata),
+    ));
+    assert.equal(boundaryClaim.applied, true);
+    const boundaryTransition = parsePostgresJson(psql(containerName, database, postgresTransition(
+      boundaryKey,
+      boundaryToken,
+      ['pending'],
+      'pending',
+      '2026-09-28T15:01:00.000Z',
+    )));
+    assert.equal(boundaryTransition.applied, true);
+    assert.equal(boundaryTransition.run.status, 'pending');
+  });
+
+  await t.test('PostgreSQL preserves explicit versus legacy failed-row claim intent', () => {
+    const explicitKey = 'backup:2026-09-29';
+    const originalToken = `claim_pg_legacy_seed_${randomUUID()}`;
+    parsePostgresJson(psql(containerName, database, postgresClaim(
+      explicitKey,
+      originalToken,
+      '2026-09-29T15:00:00.000Z',
+      { dateKey: '2026-09-29' },
+      { jobName: 'backup' },
+    )));
+    psql(containerName, database, `
+      update public.scheduled_job_runs
+      set status = 'failed',
+          updated_at = '2026-09-29T15:01:00.000Z'::timestamptz,
+          completed_at = '2026-09-29T15:01:00.000Z'::timestamptz,
+          last_error = 'legacy failure',
+          metadata = '{"dateKey":"2026-09-29"}'::jsonb
+      where job_key = ${sqlQuote(explicitKey)};
+    `);
+    const beforeExplicit = parsePostgresJson(psql(containerName, database, `
+      select to_jsonb(run) from public.scheduled_job_runs run where job_key = ${sqlQuote(explicitKey)};
+    `));
+    const explicitClaim = parsePostgresJson(psql(containerName, database, postgresClaim(
+      explicitKey,
+      `claim_pg_explicit_no_cutoff_${randomUUID()}`,
+      '2026-09-29T15:02:00.000Z',
+      { dateKey: '2026-09-29' },
+      { jobName: 'backup', retryDueAt: null },
+    )));
+    const afterExplicit = parsePostgresJson(psql(containerName, database, `
+      select to_jsonb(run) from public.scheduled_job_runs run where job_key = ${sqlQuote(explicitKey)};
+    `));
+    assert.equal(explicitClaim.applied, false);
+    assert.equal(explicitClaim.reason, 'retry-not-due');
+    assert.deepEqual(explicitClaim.run, beforeExplicit);
+    assert.deepEqual(afterExplicit, beforeExplicit);
+
+    const legacyClaim = parsePostgresJson(psql(containerName, database, postgresClaim(
+      explicitKey,
+      `claim_pg_true_legacy_${randomUUID()}`,
+      '2026-09-29T15:03:00.000Z',
+      { dateKey: '2026-09-29' },
+      { jobName: 'backup', retryDueAt: null, legacyMode: true },
+    )));
+    assert.equal(legacyClaim.applied, true);
+    assert.equal(legacyClaim.reason, 'claimed');
+    assert.equal(legacyClaim.run.status, 'pending');
+    assert.equal(legacyClaim.run.attempt_count, 2);
+  });
 
   const anonCall = psql(containerName, database, `
     set role anon;

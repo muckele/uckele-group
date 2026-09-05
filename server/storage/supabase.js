@@ -18,6 +18,12 @@ const scheduledJobStatuses = new Set(['pending', 'transmitting', 'failed', 'ambi
 const scheduledJobResultReasons = new Set([
   'claimed', 'active', 'retry-not-due', 'not-owner', 'wrong-state', 'completed', 'missing',
 ]);
+const scheduledJobClaimDenialReasons = new Set([
+  'active', 'retry-not-due', 'wrong-state', 'completed', 'missing',
+]);
+const scheduledJobTransitionDenialReasons = new Set([
+  'not-owner', 'wrong-state', 'completed', 'missing',
+]);
 const scheduledJobClaimTokenPattern = /^[A-Za-z0-9_-]{16,200}$/;
 const scheduledJobMetadataMaxBytes = 512 * 1024;
 
@@ -53,6 +59,10 @@ function normalizeScheduledJobMetadata(value, fieldName) {
   return JSON.parse(serialized);
 }
 
+function scheduledJobMetadataFits(value) {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8') <= scheduledJobMetadataMaxBytes;
+}
+
 function normalizeScheduledJobRow(row) {
   if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
   return {
@@ -64,15 +74,86 @@ function normalizeScheduledJobRow(row) {
   };
 }
 
-function normalizeScheduledJobResult(data) {
-  const result = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
-  const applied = Boolean(result.applied);
+function scheduledJobFailure(reason = 'wrong-state') {
   return {
-    applied,
-    claimed: applied,
-    reason: scheduledJobResultReasons.has(result.reason) ? result.reason : 'wrong-state',
-    run: normalizeScheduledJobRow(result.run),
+    applied: false,
+    claimed: false,
+    reason: scheduledJobResultReasons.has(reason) && reason !== 'claimed' ? reason : 'wrong-state',
+    run: null,
   };
+}
+
+function normalizeScheduledJobAuthorityRow(row, {
+  jobKey,
+  jobName = '',
+  status = '',
+  claimToken = '',
+  requireClaimToken = false,
+} = {}) {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+  if (row.job_key !== jobKey) return null;
+  if (
+    typeof row.job_name !== 'string' ||
+    row.job_name.trim() !== row.job_name ||
+    row.job_name.length === 0 ||
+    row.job_name.length > 120 ||
+    (jobName && row.job_name !== jobName)
+  ) return null;
+  if (!scheduledJobStatuses.has(row.status) || (status && row.status !== status)) return null;
+  if (!Number.isSafeInteger(row.attempt_count) || row.attempt_count <= 0) return null;
+
+  let metadata;
+  try {
+    metadata = normalizeScheduledJobMetadata(row.metadata, 'Scheduled-job RPC metadata');
+  } catch {
+    return null;
+  }
+  if (
+    Object.hasOwn(metadata, 'claimToken') &&
+    (typeof metadata.claimToken !== 'string' || !scheduledJobClaimTokenPattern.test(metadata.claimToken))
+  ) return null;
+  if (requireClaimToken && metadata.claimToken !== claimToken) return null;
+
+  return { ...row, attempt_count: row.attempt_count, metadata };
+}
+
+function scheduledJobDenialMatchesRow(reason, run) {
+  if (reason === 'missing') return run === null;
+  if (!run) return true;
+  if (reason === 'active') return run.status === 'pending';
+  if (reason === 'retry-not-due') return run.status === 'failed';
+  if (reason === 'completed') return run.status === 'completed';
+  if (reason === 'not-owner') return run.status !== 'completed';
+  return true;
+}
+
+function normalizeScheduledJobResult(data, context) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return scheduledJobFailure();
+  if (data.applied !== true && data.applied !== false) return scheduledJobFailure();
+
+  if (data.applied === true) {
+    if (data.reason !== 'claimed') return scheduledJobFailure();
+    const run = normalizeScheduledJobAuthorityRow(data.run, {
+      ...context,
+      status: context.operation === 'claim' ? 'pending' : context.status,
+      requireClaimToken: true,
+    });
+    return run
+      ? { applied: true, claimed: true, reason: 'claimed', run }
+      : scheduledJobFailure();
+  }
+
+  const denialReasons = context.operation === 'claim'
+    ? scheduledJobClaimDenialReasons
+    : scheduledJobTransitionDenialReasons;
+  if (!denialReasons.has(data.reason)) return scheduledJobFailure();
+  const run = data.run === null || data.run === undefined
+    ? null
+    : normalizeScheduledJobAuthorityRow(data.run, context);
+  if ((data.run !== null && data.run !== undefined && !run) || !scheduledJobDenialMatchesRow(data.reason, run)) {
+    return scheduledJobFailure();
+  }
+  return { applied: false, claimed: false, reason: data.reason, run };
 }
 
 function normalizeSubmissionRow(row) {
@@ -3957,7 +4038,8 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       retryDueAt = '',
       metadata = {},
     } = {}) {
-      if (!jobKey || !jobName || !nowIso) return normalizeScheduledJobResult({ reason: 'missing' });
+      if (!jobKey || !jobName || !nowIso) return scheduledJobFailure('missing');
+      const legacyMode = !claimToken && !retryDueAt;
       const safeJobKey = normalizeScheduledJobText(jobKey, 'Scheduled-job key', 240);
       const safeJobName = normalizeScheduledJobText(jobName, 'Scheduled-job name', 120);
       const safeTriggeredBy = normalizeScheduledJobText(
@@ -3975,6 +4057,11 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         ? normalizeCanonicalUtcIso(retryDueAt, 'Scheduled-job retry cutoff')
         : null;
       const safeMetadata = normalizeScheduledJobMetadata(metadata, 'Scheduled-job claim metadata');
+      if (!scheduledJobMetadataFits({
+        ...safeMetadata,
+        claimToken: safeClaimToken,
+        claimedAt: safeNow,
+      })) return scheduledJobFailure();
       const { data, error } = await client.rpc('claim_scheduled_job', {
         p_job_key: safeJobKey,
         p_job_name: safeJobName,
@@ -3983,10 +4070,16 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         p_now: safeNow,
         p_stale_before: safeStaleBefore,
         p_retry_due_at: safeRetryDueAt,
+        p_legacy_mode: legacyMode,
         p_metadata: safeMetadata,
       });
       if (error) throw error;
-      return normalizeScheduledJobResult(data);
+      return normalizeScheduledJobResult(data, {
+        operation: 'claim',
+        jobKey: safeJobKey,
+        jobName: safeJobName,
+        claimToken: safeClaimToken,
+      });
     },
 
     async transitionScheduledJob({
@@ -4000,7 +4093,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       metadataPatch = {},
       completedAt = '',
     } = {}) {
-      if (!jobKey || !claimToken || !nowIso) return normalizeScheduledJobResult({ reason: 'missing' });
+      if (!jobKey || !claimToken || !nowIso) return scheduledJobFailure('missing');
       const safeJobKey = normalizeScheduledJobText(jobKey, 'Scheduled-job key', 240);
       const safeClaimToken = normalizeScheduledJobToken(claimToken);
       const safeNow = normalizeCanonicalUtcIso(nowIso, 'Scheduled-job transition time');
@@ -4035,7 +4128,12 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         p_completed_at: safeCompletedAt,
       });
       if (error) throw error;
-      return normalizeScheduledJobResult(data);
+      return normalizeScheduledJobResult(data, {
+        operation: 'transition',
+        jobKey: safeJobKey,
+        claimToken: safeClaimToken,
+        status: safeStatus,
+      });
     },
 
     async completeScheduledJob(jobKey, values = {}) {

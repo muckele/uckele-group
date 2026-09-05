@@ -897,6 +897,34 @@ test('scheduled job functions preserve immutable prepared metadata and increment
   }
 });
 
+test('scheduled job functions bound final metadata and preserve explicit legacy intent', () => {
+  const migration = dailyDigestScheduledJobMigration();
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  for (const [sourceLabel, sql] of [
+    ['scheduled-job fencing migration', migration],
+    ['fresh schema', schema],
+  ]) {
+    const claim = sqlFunctionDefinitions(sql)
+      .find(({ name }) => name === 'claim_scheduled_job')?.sql || '';
+    const transition = sqlFunctionDefinitions(sql)
+      .find(({ name }) => name === 'transition_scheduled_job')?.sql || '';
+    assert.match(claim, /p_legacy_mode\s+boolean/i, `${sourceLabel} receives original legacy intent`);
+    assert.match(
+      claim,
+      /nextRetryAt[\s\S]*?not\s+p_legacy_mode[\s\S]*?retry-not-due/i,
+      `${sourceLabel} does not infer legacy intent from a null retry cutoff`,
+    );
+    assert.ok(
+      (claim.match(/octet_length\(v_metadata::text\)\s*>\s*524288/gi) || []).length >= 2,
+      `${sourceLabel} bounds initial and reclaimed final metadata`,
+    );
+    assert.ok(
+      (transition.match(/octet_length\(v_metadata::text\)\s*>\s*524288/gi) || []).length >= 1,
+      `${sourceLabel} bounds transitioned final metadata`,
+    );
+  }
+});
+
 test('scheduled job functions are service-role-only', () => {
   const migration = dailyDigestScheduledJobMigration();
   const schema = fs.readFileSync(schemaUrl, 'utf8');
