@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { signPayload } from '../server/utils/security.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-http-app-'));
 process.env.ADMIN_SESSION_SECRET = 'http-app-session-secret-for-tests';
@@ -10,6 +12,7 @@ process.env.SECURE_DOCUMENTS_TOKEN_SECRET = 'http-app-document-secret-for-tests'
 process.env.SQLITE_PATH = path.join(tempDir, 'http-app.sqlite');
 process.env.SECURE_DOCUMENTS_STORAGE_DIR = path.join(tempDir, 'secure-documents');
 process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
+process.env.DEAL_HUNTER_CRON_SECRET = 'task-three-cron-secret';
 delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
 
 const { createApp } = await import('../server/app.js');
@@ -18,9 +21,11 @@ const { createManualSubmission } = await import('../server/services/submissions.
 const { getStorage } = await import('../server/storage/index.js');
 let lifecycleAdminCookie = '';
 let lifecycleViewerCookie = '';
+let taskThreeAdminCookie = '';
+let taskThreeViewerCookie = '';
 
-async function withServer(run) {
-  const server = createApp().listen(0, '127.0.0.1');
+async function withServer(run, app = createApp()) {
+  const server = app.listen(0, '127.0.0.1');
   await new Promise((resolve, reject) => {
     server.once('listening', resolve);
     server.once('error', reject);
@@ -32,6 +37,37 @@ async function withServer(run) {
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+}
+
+async function signInForCookie(_origin, credentials = { username: 'admin', password: 'change-me-now' }) {
+  const isViewer = credentials.username === 'smb-deal-hunter';
+  const cached = isViewer ? taskThreeViewerCookie : taskThreeAdminCookie;
+  if (cached) return cached;
+  const now = new Date();
+  const session = {
+    id: randomUUID(),
+    role: isViewer ? 'viewer' : 'admin',
+    username: credentials.username,
+    principal_id: isViewer ? `viewer:identity:${credentials.username}` : 'admin:primary',
+    created_at: now.toISOString(),
+    expires_at: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+    last_seen_at: now.toISOString(),
+    revoked_at: null,
+    created_ip_hash: null,
+    user_agent: 'task-three-http-test',
+    metadata: { auth_method: 'test-fixture' },
+  };
+  await getStorage().insertAdminSession(session);
+  const token = signPayload({
+    sid: session.id,
+    role: session.role,
+    username: session.username,
+    exp: Date.parse(session.expires_at),
+  }, process.env.ADMIN_SESSION_SECRET);
+  const cookie = `ug_admin_session=${token}`;
+  if (isViewer) taskThreeViewerCookie = cookie;
+  else taskThreeAdminCookie = cookie;
+  return cookie;
 }
 
 test('protected APIs reject cross-site mutations and disable caching', async () => {
@@ -126,6 +162,132 @@ test('unknown API routes return a JSON 404 instead of falling through to the app
       error: 'API endpoint not found.',
     });
   });
+});
+
+test('viewer and unauthenticated callers cannot trigger daily digest', async () => {
+  let runnerCalls = 0;
+  const app = createApp({
+    dailyDealHunterRunner: async () => {
+      runnerCalls += 1;
+      return { emailResult: { status: 'sent', providerMessageId: 'must-not-run' } };
+    },
+  });
+  await withServer(async (origin) => {
+    const anonymous = await fetch(`${origin}/api/admin/deal-hunter/send`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    assert.equal(anonymous.status, 401);
+
+    const viewerCookie = await signInForCookie(origin, {
+      username: 'smb-deal-hunter', password: 'view-only-local',
+    });
+    const viewer = await fetch(`${origin}/api/admin/deal-hunter/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: viewerCookie },
+      body: '{}',
+    });
+    assert.equal(viewer.status, 401);
+    assert.equal(runnerCalls, 0);
+  }, app);
+});
+
+test('daily digest admin route rejects recipient subject body and unknown input', async () => {
+  let runnerCalls = 0;
+  const app = createApp({
+    dailyDealHunterRunner: async () => {
+      runnerCalls += 1;
+      return {
+        jobKey: 'daily-deal-hunter-email:2026-07-15',
+        notificationType: 'normal-digest',
+        emailResult: { status: 'sent', providerMessageId: 'resend-1' },
+        jobRun: { status: 'completed', metadata: { preparedEnvelope: { to: 'digest@example.test', text: 'secret' } } },
+      };
+    },
+  });
+  await withServer(async (origin) => {
+    const cookie = await signInForCookie(origin);
+    for (const body of [
+      { recipient: 'attacker@example.test' },
+      { subject: 'Override' },
+      { body: 'Override' },
+      { html: '<p>Override</p>' },
+      { notificationType: 'required-source-alert' },
+      { providerKey: 'new-key' },
+      { unknown: true },
+    ]) {
+      const response = await fetch(`${origin}/api/admin/deal-hunter/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 400);
+    }
+    assert.equal(runnerCalls, 0);
+
+    const allowed = await fetch(`${origin}/api/admin/deal-hunter/send`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: '{}',
+    });
+    assert.equal(allowed.status, 200);
+    const payload = await allowed.json();
+    assert.equal(runnerCalls, 1);
+    assert.doesNotMatch(JSON.stringify(payload), /digest@example\.test|preparedEnvelope|secret/);
+  }, app);
+});
+
+test('daily digest cron route requires secret enforces due time and accepts no content', async () => {
+  const calls = [];
+  const app = createApp({
+    dailyDealHunterRunner: async (input) => {
+      calls.push(input);
+      return { jobKey: 'daily-deal-hunter-email:2026-07-15', emailResult: { status: 'not-due' } };
+    },
+  });
+  await withServer(async (origin) => {
+    const unauthorized = await fetch(`${origin}/api/deal-hunter/daily-email`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    assert.equal(unauthorized.status, 401);
+
+    const rejected = await fetch(`${origin}/api/deal-hunter/daily-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Deal-Hunter-Secret': 'task-three-cron-secret' },
+      body: JSON.stringify({ recipient: 'attacker@example.test' }),
+    });
+    assert.equal(rejected.status, 400);
+
+    const dueControlled = await fetch(`${origin}/api/deal-hunter/daily-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Deal-Hunter-Secret': 'task-three-cron-secret' },
+      body: '{}',
+    });
+    assert.equal(dueControlled.status, 409);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].enforceDueTime, true);
+    assert.equal(calls[0].triggeredBy, 'external-cron');
+  }, app);
+});
+
+test('daily digest routes return completed active retry-not-due failed and ambiguous states precisely', async () => {
+  const cases = [
+    ['completed', { alreadySent: true, emailResult: { status: 'already-sent' }, jobRun: { status: 'completed' } }, 200],
+    ['active', { inProgress: true, emailResult: { status: 'in-progress' }, jobRun: { status: 'pending' } }, 409],
+    ['retry-not-due', { emailResult: { status: 'retry-not-due' }, jobRun: { status: 'failed' } }, 409],
+    ['failed', { emailResult: { status: 'failed', errorCategory: 'provider-nonacceptance' }, jobRun: { status: 'failed' } }, 502],
+    ['ambiguous', { emailResult: { status: 'ambiguous', errorCategory: 'provider-timeout' }, jobRun: { status: 'ambiguous' } }, 409],
+  ];
+  for (const [label, result, expectedStatus] of cases) {
+    const app = createApp({ dailyDealHunterRunner: async () => ({ jobKey: `${label}:2026-07-15`, ...result }) });
+    await withServer(async (origin) => {
+      const cookie = await signInForCookie(origin);
+      const response = await fetch(`${origin}/api/admin/deal-hunter/send`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: '{}',
+      });
+      assert.equal(response.status, expectedStatus, label);
+      const payload = await response.json();
+      assert.equal(payload.status, result.emailResult.status, label);
+      assert.doesNotMatch(JSON.stringify(payload), /metadata|preparedEnvelope|recipient/);
+    }, app);
+  }
 });
 
 test('readiness checks storage and the document vault', async () => {

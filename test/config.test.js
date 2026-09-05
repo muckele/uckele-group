@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { validateConfig } from '../server/config.js';
@@ -55,6 +56,83 @@ test('production configuration accepts independently secured enabled services', 
   const result = validateConfig(productionConfig());
   assert.equal(result.ok, true);
   assert.deepEqual(result.errors, []);
+});
+
+test('enabled production daily digest requires Resend recipient sender and signed webhook', () => {
+  const ready = productionConfig();
+  ready.dealHunter.recipient = 'digest@example.test';
+  ready.dealHunter.dailyEmail = {
+    enabled: true,
+    timezone: 'America/Los_Angeles',
+    time: '08:00',
+    checkIntervalMs: 60_000,
+    retryIntervalMs: 1_800_000,
+    markerDir: os.tmpdir(),
+  };
+  assert.equal(validateConfig(ready).ok, true);
+
+  const cases = [
+    ['provider', (config) => { config.delivery.provider = 'emailjs'; }],
+    ['recipient', (config) => { config.dealHunter.recipient = ''; config.admin.email = ''; }],
+    ['invalid recipient', (config) => { config.dealHunter.recipient = 'digest@example.test, attacker@example.test'; }],
+    ['sender', (config) => { config.delivery.resendFromEmail = ''; }],
+    ['api key', (config) => { config.delivery.resendApiKey = ''; }],
+    ['signed webhook', (config) => { config.delivery.emailWebhookSecret = ''; }],
+    ['marker', (config) => { config.dealHunter.dailyEmail.markerDir = '/definitely/missing/task-three/path'; }],
+  ];
+  for (const [label, mutate] of cases) {
+    const config = structuredClone(ready);
+    mutate(config);
+    const result = validateConfig(config);
+    assert.equal(result.ok, false, label);
+    assert.ok(result.errors.some((error) => /daily digest|DEAL_HUNTER|RESEND|marker/i.test(error)), label);
+  }
+});
+
+test('daily digest config accepts 08:00 America Los Angeles and rejects invalid wall time or zone', () => {
+  const config = productionConfig();
+  config.dealHunter.recipient = 'digest@example.test';
+  config.dealHunter.dailyEmail = {
+    enabled: true,
+    timezone: 'America/Los_Angeles',
+    time: '08:00',
+    checkIntervalMs: 60_000,
+    retryIntervalMs: 1_800_000,
+    markerDir: os.tmpdir(),
+  };
+  assert.equal(validateConfig(config).ok, true);
+
+  config.dealHunter.dailyEmail.time = '8:00';
+  assert.ok(validateConfig(config).errors.some((error) => error.includes('DEAL_HUNTER_DAILY_EMAIL_TIME')));
+  config.dealHunter.dailyEmail.time = '08:00';
+  config.dealHunter.dailyEmail.timezone = 'Not/A-Timezone';
+  assert.ok(validateConfig(config).errors.some((error) => error.includes('DEAL_HUNTER_DAILY_EMAIL_TIMEZONE')));
+});
+
+test('daily digest enablement is independent of every CIM follow-up and Stage 2 flag', () => {
+  const config = productionConfig();
+  config.dealHunter.recipient = 'digest@example.test';
+  config.dealHunter.dailyEmail = {
+    enabled: true,
+    timezone: 'America/Los_Angeles',
+    time: '08:00',
+    checkIntervalMs: 60_000,
+    retryIntervalMs: 1_800_000,
+    markerDir: os.tmpdir(),
+  };
+  config.dealHunter.cimFollowUp.enabled = false;
+  config.dealHunter.cimOutreach = { paused: true, recipientCap24Hours: 1, recipientCap30Days: 4, overrideMaxHours: 24 };
+  config.dealHunter.cimAutomation = {
+    paused: true,
+    stage: 1,
+    schedulerEnabled: false,
+    schedulerCheckIntervalMs: 900_000,
+    timezone: 'America/Los_Angeles',
+    sendWindowStart: '08:00',
+    sendWindowEnd: '17:00',
+  };
+  const result = validateConfig(config);
+  assert.equal(result.ok, true, result.errors.join('\n'));
 });
 
 test('production configuration rejects missing and shared security secrets', () => {

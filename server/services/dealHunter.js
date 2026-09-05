@@ -7503,6 +7503,11 @@ export async function listDealHunterCimRequestHistory({
   };
 }
 
+/**
+ * Compatibility-only manual review sender retained for verified legacy callers.
+ * The Phase 4 daily scheduler must use the bounded projection/envelope workflow
+ * in dealHunterScheduler.js; this function is no longer a scheduler authority.
+ */
 export async function sendDailyDealHunterReview({
   idempotencyKey = '',
   storage = getStorage(),

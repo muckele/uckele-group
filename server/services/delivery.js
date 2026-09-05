@@ -6,6 +6,8 @@ const cimMessageKinds = new Set([
   'deal-hunter-cim-request',
   'deal-hunter-cim-follow-up',
 ]);
+const dailyDealHunterMessageKind = 'daily-deal-hunter';
+const resendIdentityMessageKinds = new Set([...cimMessageKinds, dailyDealHunterMessageKind]);
 
 function escapeHtml(value = '') {
   return String(value)
@@ -20,9 +22,13 @@ function normalizeRecipients(to) {
   return Array.isArray(to) ? to.filter(Boolean) : [to].filter(Boolean);
 }
 
-function hasOnlyValidEmailRecipients(to) {
+function hasOnlyValidEmailRecipients(to, { allowDisplayNames = false } = {}) {
   const recipients = normalizeRecipients(to).map((recipient) => String(recipient).trim());
-  return recipients.length > 0 && recipients.every((recipient) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient));
+  return recipients.length > 0 && recipients.every((recipient) => (
+    allowDisplayNames
+      ? Boolean(extractEmailAddress(recipient) && /^(?:[^<>\r\n]+\s)?<[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+>$|^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(recipient))
+      : /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipient)
+  ));
 }
 
 function normalizeText(value = '', maxLength = 1000) {
@@ -258,21 +264,43 @@ function brandedEmailHtml({
 async function sendViaConsole(message) {
   const textBytes = Buffer.byteLength(String(message.text || ''), 'utf8');
   const htmlBytes = Buffer.byteLength(String(message.html || ''), 'utf8');
-  console.log(
-    `[mail:${message.kind}] to=${normalizeRecipients(message.to).join(', ')} subject=${message.subject} textBytes=${textBytes} htmlBytes=${htmlBytes}`,
-  );
-  return { status: 'logged', error: '', providerMessageId: '' };
+  if (message.kind === dailyDealHunterMessageKind) {
+    console.log(`[mail:${message.kind}] development-only textBytes=${textBytes} htmlBytes=${htmlBytes}`);
+  } else {
+    console.log(
+      `[mail:${message.kind}] to=${normalizeRecipients(message.to).join(', ')} subject=${message.subject} textBytes=${textBytes} htmlBytes=${htmlBytes}`,
+    );
+  }
+  return { status: 'logged', error: '', provider: 'console', providerMessageId: '', developmentOnly: true };
 }
 
-async function sendViaResend(message) {
-  const config = getConfig();
+async function providerFetch(url, options, fetcher) {
+  return typeof fetcher === 'function' ? fetcher(url, options) : fetchWithTimeout(url, options);
+}
+
+function providerErrorCategory(error) {
+  const message = String(error?.message || error || '').toLowerCase();
+  if (/timed out|timeout|aborted/.test(message)) return 'provider-timeout';
+  if (/reset|socket|network|fetch failed|connection/.test(message)) return 'provider-connection-unknown';
+  return 'provider-outcome-unknown';
+}
+
+async function sendViaResend(message, { config, fetcher } = {}) {
+  const protectedIdentity = resendIdentityMessageKinds.has(message.kind);
 
   if (!config.delivery.resendApiKey || !config.delivery.resendFromEmail) {
-    return { status: 'failed', error: 'Resend is selected but RESEND_API_KEY or RESEND_FROM_EMAIL is missing.' };
+    return {
+      status: 'failed',
+      error: 'Resend is selected but RESEND_API_KEY or RESEND_FROM_EMAIL is missing.',
+      errorCategory: 'provider-not-ready',
+      definitiveFailure: true,
+      provider: 'resend',
+      providerMessageId: '',
+    };
   }
 
   const tags = normalizeResendTags(message.tags);
-  const response = await fetchWithTimeout('https://api.resend.com/emails', {
+  const response = await providerFetch('https://api.resend.com/emails', {
     method: 'POST',
     timeoutMs: config.server.outboundRequestTimeoutMs,
     timeoutMessage: 'Resend delivery timed out.',
@@ -291,19 +319,60 @@ async function sendViaResend(message) {
       headers: message.headers || undefined,
       tags: tags.length > 0 ? tags : undefined,
     }),
-  });
+  }, fetcher);
 
   if (!response.ok) {
-    const text = await response.text();
+    const text = typeof response.text === 'function' ? await response.text().catch(() => '') : '';
+    const concurrentIdempotency = /concurrent[_ -]?idempotent[_ -]?requests/i.test(text);
+    const uncertainDailyHttp = message.kind === dailyDealHunterMessageKind
+      && (response.status === 408 || response.status === 409 || response.status >= 500);
+    const ambiguous = protectedIdentity && (concurrentIdempotency || uncertainDailyHttp);
     return {
-      status: 'failed',
-      error: `Resend delivery failed with ${response.status}: ${text.slice(0, 240)}`,
+      status: ambiguous ? 'ambiguous' : 'failed',
+      error: ambiguous
+        ? 'Resend returned an uncertain delivery outcome; reconcile before any retry.'
+        : `Resend delivery failed with ${response.status}: ${text.slice(0, 240)}`,
+      errorCategory: ambiguous
+        ? concurrentIdempotency ? 'concurrent-idempotency-unknown' : 'provider-http-unknown'
+        : 'provider-nonacceptance',
+      definitiveFailure: !ambiguous,
+      provider: 'resend',
+      providerMessageId: '',
     };
   }
 
-  const data = await response.json().catch(() => ({}));
+  let data;
+  try {
+    data = typeof response.json === 'function' ? await response.json() : null;
+  } catch {
+    return protectedIdentity
+      ? {
+          status: 'ambiguous',
+          error: 'Resend accepted the request but its acceptance response could not be parsed.',
+          errorCategory: 'accepted-response-parse-unknown',
+          provider: 'resend',
+          providerMessageId: '',
+        }
+      : { status: 'sent', error: '', provider: 'resend', providerMessageId: '' };
+  }
 
-  return { status: 'sent', error: '', providerMessageId: data.id || data.email_id || '' };
+  const providerMessageId = boundedProviderIdentity(data?.id || data?.email_id || '');
+  if (protectedIdentity && !providerMessageId) {
+    return {
+      status: 'ambiguous',
+      error: 'Resend accepted the request without a coherent provider message identity.',
+      errorCategory: 'missing-provider-id',
+      provider: 'resend',
+      providerMessageId: '',
+    };
+  }
+
+  return { status: 'sent', error: '', errorCategory: '', provider: 'resend', providerMessageId };
+}
+
+function boundedProviderIdentity(value = '') {
+  const normalized = normalizeText(value, 241);
+  return /^[A-Za-z0-9_.:@-]{1,240}$/.test(normalized) ? normalized : '';
 }
 
 async function sendViaEmailJs(message) {
@@ -419,9 +488,22 @@ async function recordTrackedEmailDelivery(message, result) {
   }
 }
 
-async function sendMessage(message) {
-  const config = getConfig();
+async function sendMessage(message, { configOverride, fetcher } = {}) {
+  const config = configOverride || getConfig();
   let result;
+
+  if (message.kind === dailyDealHunterMessageKind
+    && (['emailjs', 'formspree'].includes(config.delivery.provider)
+      || (config.delivery.provider === 'console' && config.isProduction))) {
+    return {
+      status: 'failed',
+      error: 'Daily Deal Hunter delivery requires Resend acceptance identity and reconciliation support.',
+      errorCategory: 'provider-ineligible',
+      definitiveFailure: true,
+      provider: config.delivery.provider,
+      providerMessageId: '',
+    };
+  }
 
   // EmailJS returns a successful response without a provider message ID and
   // does not offer the provider-side idempotency guarantee used by CIM sends.
@@ -439,7 +521,7 @@ async function sendMessage(message) {
   try {
     switch (config.delivery.provider) {
       case 'resend':
-        result = await sendViaResend(message);
+        result = await sendViaResend(message, { config, fetcher });
         break;
       case 'emailjs':
         result = await sendViaEmailJs(message);
@@ -454,13 +536,16 @@ async function sendMessage(message) {
     }
   } catch (error) {
     const providerOutcomeAmbiguous = config.delivery.provider === 'resend'
-      && cimMessageKinds.has(message.kind);
+      && resendIdentityMessageKinds.has(message.kind);
     result = {
       status: providerOutcomeAmbiguous ? 'ambiguous' : 'failed',
       error: providerOutcomeAmbiguous
         ? `Resend delivery outcome is ambiguous: ${error.message}. Reconcile the persisted communication before any retry.`
         : `${config.delivery.provider} delivery failed: ${error.message}`,
       providerMessageId: '',
+      provider: config.delivery.provider,
+      errorCategory: providerOutcomeAmbiguous ? providerErrorCategory(error) : 'provider-error',
+      definitiveFailure: !providerOutcomeAmbiguous,
       providerOutcomeAmbiguous,
     };
   }
@@ -472,16 +557,70 @@ async function sendMessage(message) {
 // CIM workflows persist the fully-rendered message before calling this entry
 // point, then pass the same immutable object here. Keeping this small public
 // seam prevents template changes between persistence and transmission.
-export async function sendPreparedMessage(message = {}) {
-  if (!hasOnlyValidEmailRecipients(message.to)) {
+export async function sendPreparedMessage(message = {}, options = {}) {
+  if (!hasOnlyValidEmailRecipients(message.to, {
+    allowDisplayNames: message.kind === dailyDealHunterMessageKind,
+  })) {
     return {
       status: 'failed',
       error: 'A valid broker or contact email is required before sending this email.',
+      errorCategory: 'invalid-recipient',
+      definitiveFailure: true,
       providerMessageId: '',
     };
   }
 
-  return sendMessage(message);
+  return sendMessage(message, options);
+}
+
+export async function lookupDailyDealHunterProviderMessages({
+  envelope,
+  maximumCandidates = 20,
+  configOverride,
+  fetcher,
+} = {}) {
+  const config = configOverride || getConfig();
+  if (config.delivery.provider !== 'resend' || !config.delivery.resendApiKey || !envelope) return [];
+  const boundedLimit = Math.max(1, Math.min(Number(maximumCandidates) || 20, 20));
+  const headers = { Authorization: `Bearer ${config.delivery.resendApiKey}`, Accept: 'application/json' };
+  const listing = await providerFetch('https://api.resend.com/emails?limit=100', {
+    method: 'GET',
+    timeoutMs: config.server.outboundRequestTimeoutMs,
+    timeoutMessage: 'Resend reconciliation lookup timed out.',
+    headers,
+  }, fetcher);
+  if (!listing.ok) return [];
+  const listedPayload = await listing.json().catch(() => ({}));
+  const listed = Array.isArray(listedPayload?.data) ? listedPayload.data : Array.isArray(listedPayload) ? listedPayload : [];
+  const recipient = normalizeRecipients(envelope.to).map((value) => extractEmailAddress(value).toLowerCase());
+  const candidates = listed.filter((item) => {
+    const itemRecipients = normalizeRecipients(item?.to).map((value) => extractEmailAddress(value).toLowerCase());
+    return boundedProviderIdentity(item?.id)
+      && normalizeText(item?.subject, 300) === envelope.subject
+      && itemRecipients.some((value) => recipient.includes(value));
+  }).slice(0, boundedLimit);
+  const detailed = [];
+  for (const item of candidates) {
+    const id = boundedProviderIdentity(item.id);
+    const response = await providerFetch(`https://api.resend.com/emails/${encodeURIComponent(id)}`, {
+      method: 'GET',
+      timeoutMs: config.server.outboundRequestTimeoutMs,
+      timeoutMessage: 'Resend reconciliation candidate lookup timed out.',
+      headers,
+    }, fetcher);
+    if (!response.ok) continue;
+    const payload = await response.json().catch(() => null);
+    const detail = payload?.data || payload;
+    if (!detail) continue;
+    detailed.push({
+      id: boundedProviderIdentity(detail.id || id),
+      to: normalizeRecipients(detail.to),
+      subject: normalizeText(detail.subject, 300),
+      createdAt: detail.created_at || detail.createdAt || item.created_at || item.createdAt || '',
+      tags: normalizeResendTags(detail.tags),
+    });
+  }
+  return detailed;
 }
 
 function buildSubmissionMessage(submission) {

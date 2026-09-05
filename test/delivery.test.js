@@ -9,7 +9,75 @@ import {
   buildDailyDealHunterSourceAlertEmail,
   buildAdminEmailTestEmail,
   normalizeResendTags,
+  sendPreparedMessage,
 } from '../server/services/delivery.js';
+import { buildDailyDealHunterEmailEnvelope } from '../server/services/dailyDealHunterDigest.js';
+
+function taskThreeProjection(notificationType = 'normal-digest') {
+  const alert = notificationType === 'required-source-alert';
+  return {
+    version: 'daily-deal-hunter-digest-v1',
+    businessDate: '2026-07-15',
+    generatedAt: '2026-07-15T15:00:00.000Z',
+    status: alert ? 'action-required' : 'ready',
+    notificationType,
+    sourceAuthority: {
+      requiredHealthy: !alert,
+      blockingIssues: alert ? [{
+        sourceId: 'sheet-0',
+        sourceName: 'SMB Deal Hunter Google Sheet',
+        classification: 'unavailable',
+        title: 'Required source is unavailable',
+        message: 'Required source data is currently unavailable.',
+        checkedAt: '2026-07-15T15:00:00.000Z',
+      }] : [],
+      optionalWarnings: [],
+    },
+    summary: alert ? null : {
+      needsReview: 2,
+      highPriority: 1,
+      watchlist: 1,
+      lowConfidence: 0,
+      currentOpportunities: 2,
+    },
+    topOpportunities: alert ? [] : [{
+      opportunityId: 'opportunity-1',
+      name: 'Durable Services <script>alert(1)</script>',
+      state: 'CA',
+      fitScore: 91,
+      scoreStatus: 'current',
+      confidence: 'high',
+      operatorPriority: 'pursue',
+      reviewed: false,
+      changedSinceReview: true,
+      topStrength: `Recurring revenue <strong>${'x'.repeat(800)}`,
+      topConcern: `Customer concentration & diligence ${'y'.repeat(800)}`,
+      workflow: { crmStatus: 'not-started', cimStatus: 'not-requested' },
+      observationFreshness: '2026-07-15T14:55:00.000Z',
+    }],
+    job: { status: '', attemptCount: 0, completedAt: '', notificationType },
+    actionsAllowed: !alert,
+    links: {
+      inbox: 'https://internal.example.test/admin/deal-hunter',
+      operations: 'https://internal.example.test/admin/deal-hunter?view=operations',
+    },
+    rawSourceRows: [{ brokerEmail: 'broker-private@example.test', annualProfit: 999999 }],
+    operatorNotes: 'Private operator note must not render.',
+  };
+}
+
+function taskThreeDeliveryConfig(provider = 'resend', isProduction = true) {
+  return {
+    isProduction,
+    server: { outboundRequestTimeoutMs: 100 },
+    delivery: {
+      provider,
+      resendApiKey: 're_test_only',
+      resendFromEmail: 'Uckele Group <sender@example.test>',
+      resendReplyTo: '',
+    },
+  };
+}
 
 test('controlled email test is clearly marked and asks for an unchanged-subject reply', () => {
   const message = buildAdminEmailTestEmail({
@@ -148,6 +216,173 @@ test('required-source alert is bounded, escaped, date-scoped, and contains no re
   assert.match(message.html, /&lt;script&gt;/);
   assert.doesNotMatch(message.text, /END-OF-UNBOUNDED-ERROR/);
   assert.doesNotMatch(message.html, /END-OF-UNBOUNDED-ERROR/);
+});
+
+test('daily digest normal email renders only the approved projection fields', () => {
+  const message = buildDailyDealHunterEmailEnvelope({
+    projection: taskThreeProjection(),
+    recipient: 'digest@example.test',
+    sender: 'Uckele Group <sender@example.test>',
+    preparedAt: '2026-07-15T15:00:00.000Z',
+  });
+
+  assert.equal(message.subject, 'Daily Deal Hunter — 2 to review — 2026-07-15');
+  assert.match(message.text, /Durable Services/);
+  assert.match(message.text, /High priority: 1/);
+  assert.match(message.html, /Durable Services &lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.doesNotMatch(`${message.text}\n${message.html}`, /broker-private@example\.test|999999|Private operator note/);
+  assert.doesNotMatch(`${message.text}\n${message.html}`, /rawSourceRows|annualProfit|operatorNotes/);
+});
+
+test('daily digest source alert renders no opportunity counts names or recommendations', () => {
+  const projection = taskThreeProjection('required-source-alert');
+  projection.summary = { needsReview: 57, currentOpportunities: 90 };
+  projection.topOpportunities = [{ name: 'Must Never Render', topStrength: 'Buy this business' }];
+  const message = buildDailyDealHunterEmailEnvelope({
+    projection,
+    recipient: 'digest@example.test',
+    sender: 'Uckele Group <sender@example.test>',
+    preparedAt: '2026-07-15T15:00:00.000Z',
+  });
+
+  assert.equal(message.subject, 'ACTION REQUIRED — Deal Hunter source health — 2026-07-15');
+  assert.match(message.text, /Required source data is currently unavailable/);
+  assert.doesNotMatch(`${message.text}\n${message.html}`, /Must Never Render|Buy this business|57|90/);
+});
+
+test('daily digest uses deterministic key and exact source business-date notification tags', () => {
+  const inputs = {
+    projection: taskThreeProjection(),
+    recipient: 'digest@example.test',
+    sender: 'Uckele Group <sender@example.test>',
+    preparedAt: '2026-07-15T15:00:00.000Z',
+  };
+  const first = buildDailyDealHunterEmailEnvelope(inputs);
+  const second = buildDailyDealHunterEmailEnvelope(inputs);
+
+  assert.deepEqual(first, second);
+  assert.equal(first.idempotencyKey, 'daily-deal-hunter-email:2026-07-15');
+  assert.deepEqual(first.tags.slice(0, 3), [
+    { name: 'source', value: 'daily-deal-hunter' },
+    { name: 'business_date', value: '2026-07-15' },
+    { name: 'notification', value: 'normal-digest' },
+  ]);
+  assert.equal(first.tags.find((tag) => tag.name === 'payload_digest')?.value, first.payloadDigest);
+  assert.match(first.payloadDigest, /^[a-f0-9]{64}$/);
+});
+
+test('daily digest fails closed before network on EmailJS Formspree and production console', async () => {
+  const message = buildDailyDealHunterEmailEnvelope({
+    projection: taskThreeProjection(), recipient: 'digest@example.test', sender: 'sender@example.test',
+  });
+  for (const provider of ['emailjs', 'formspree', 'console']) {
+    let networkCalls = 0;
+    const result = await sendPreparedMessage(message, {
+      configOverride: taskThreeDeliveryConfig(provider, true),
+      fetcher: async () => { networkCalls += 1; throw new Error('network must not run'); },
+    });
+    assert.equal(result.status, 'failed');
+    assert.equal(result.definitiveFailure, true);
+    assert.equal(networkCalls, 0);
+  }
+});
+
+test('daily digest Resend timeout is ambiguous', async () => {
+  const message = buildDailyDealHunterEmailEnvelope({
+    projection: taskThreeProjection(), recipient: 'digest@example.test', sender: 'sender@example.test',
+  });
+  let networkCalls = 0;
+  const result = await sendPreparedMessage(message, {
+    configOverride: taskThreeDeliveryConfig(),
+    fetcher: async () => { networkCalls += 1; throw new Error('Resend delivery timed out.'); },
+  });
+  assert.equal(result.status, 'ambiguous');
+  assert.equal(result.errorCategory, 'provider-timeout');
+  assert.equal(networkCalls, 1);
+});
+
+test('daily digest connection reset parse failure and uncertain HTTP response are ambiguous', async () => {
+  const message = buildDailyDealHunterEmailEnvelope({
+    projection: taskThreeProjection(), recipient: 'Digest Admin <digest@example.test>', sender: 'sender@example.test',
+  });
+  const cases = [
+    [async () => { throw new Error('socket connection reset'); }, 'provider-connection-unknown'],
+    [async () => new Response('not-json', { status: 200 }), 'accepted-response-parse-unknown'],
+    [async () => new Response('upstream result unknown', { status: 503 }), 'provider-http-unknown'],
+    [async () => new Response(JSON.stringify({ id: 'invalid provider id' }), { status: 200 }), 'missing-provider-id'],
+  ];
+  for (const [fetcher, errorCategory] of cases) {
+    const result = await sendPreparedMessage(message, {
+      configOverride: taskThreeDeliveryConfig(),
+      fetcher,
+    });
+    assert.equal(result.status, 'ambiguous', errorCategory);
+    assert.equal(result.errorCategory, errorCategory);
+    assert.notEqual(result.definitiveFailure, true);
+  }
+});
+
+test('daily digest display-name recipient does not broaden unrelated prepared-message validation', async () => {
+  const dailyMessage = buildDailyDealHunterEmailEnvelope({
+    projection: taskThreeProjection(), recipient: 'Digest Admin <digest@example.test>', sender: 'sender@example.test',
+  });
+  const dailyResult = await sendPreparedMessage(dailyMessage, {
+    configOverride: taskThreeDeliveryConfig('console', false),
+  });
+  const unrelatedResult = await sendPreparedMessage({
+    kind: 'admin-magic-link',
+    to: 'Admin <admin@example.test>',
+    subject: 'Sign in',
+    text: 'Test',
+    html: '<p>Test</p>',
+  }, {
+    configOverride: taskThreeDeliveryConfig('console', false),
+  });
+
+  assert.equal(dailyResult.status, 'logged');
+  assert.equal(unrelatedResult.status, 'failed');
+  assert.equal(unrelatedResult.errorCategory, 'invalid-recipient');
+  assert.throws(() => buildDailyDealHunterEmailEnvelope({
+    projection: taskThreeProjection(),
+    recipient: 'digest@example.test, attacker@example.test',
+    sender: 'sender@example.test',
+  }), /valid server-owned email address/);
+});
+
+test('daily digest accepted response without provider id is ambiguous', async () => {
+  const message = buildDailyDealHunterEmailEnvelope({
+    projection: taskThreeProjection(), recipient: 'digest@example.test', sender: 'sender@example.test',
+  });
+  const result = await sendPreparedMessage(message, {
+    configOverride: taskThreeDeliveryConfig(),
+    fetcher: async () => new Response('{}', { status: 200 }),
+  });
+  assert.equal(result.status, 'ambiguous');
+  assert.equal(result.errorCategory, 'missing-provider-id');
+});
+
+test('daily digest authoritative nonacceptance is definitive failure', async () => {
+  const message = buildDailyDealHunterEmailEnvelope({
+    projection: taskThreeProjection(), recipient: 'digest@example.test', sender: 'sender@example.test',
+  });
+  const result = await sendPreparedMessage(message, {
+    configOverride: taskThreeDeliveryConfig(),
+    fetcher: async () => new Response(JSON.stringify({ message: 'rejected' }), { status: 422 }),
+  });
+  assert.equal(result.status, 'failed');
+  assert.equal(result.definitiveFailure, true);
+  assert.equal(result.errorCategory, 'provider-nonacceptance');
+});
+
+test('daily digest renderer bounds and escapes source issues strengths and concerns', () => {
+  const message = buildDailyDealHunterEmailEnvelope({
+    projection: taskThreeProjection(), recipient: 'digest@example.test', sender: 'sender@example.test',
+  });
+  assert.doesNotMatch(message.html, /<script>|<strong>x/i);
+  assert.match(message.html, /&lt;script&gt;|&lt;strong&gt;/);
+  assert.ok(Buffer.byteLength(message.text, 'utf8') < 32 * 1024);
+  assert.ok(Buffer.byteLength(message.html, 'utf8') < 96 * 1024);
+  assert.doesNotMatch(message.text, /x{401}|y{401}/);
 });
 
 test('daily Deal Hunter email only makes HTTP(S) listing URLs clickable', () => {

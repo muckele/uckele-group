@@ -1,24 +1,31 @@
-import fs from 'node:fs/promises';
-import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
-import { runCimStage2Automation, runDealHunterCimFollowUps, sendDailyDealHunterReview } from './dealHunter.js';
+import { runCimStage2Automation, runDealHunterCimFollowUps } from './dealHunter.js';
 import { evaluateCimStage2Window, getCimAutomationStatus, getCimStage2Policy } from './cimAutomation.js';
+import {
+  buildCurrentDailyDealHunterDigest,
+  buildDailyDealHunterEmailEnvelope,
+  verifyDailyDealHunterEmailEnvelope,
+} from './dailyDealHunterDigest.js';
+import {
+  lookupDailyDealHunterProviderMessages,
+  sendPreparedMessage,
+} from './delivery.js';
+import { recordEmailEvent } from './emailEvents.js';
+import {
+  reconcileDailyDealHunterJob,
+  writeDailyDealHunterMarker,
+} from './dailyDealHunterReconciliation.js';
 
 const dailyEmailSource = 'daily-deal-hunter';
 const dailyEmailJobName = 'daily-deal-hunter-email';
 const dailyEmailClaimStaleMs = 60 * 60 * 1000;
 
-function parseScheduleTime(value = '10:15') {
-  const match = String(value || '').trim().match(/^(\d{1,2}):(\d{2})$/);
-
-  if (!match) {
-    return { hour: 10, minute: 15 };
-  }
-
-  const hour = Math.max(0, Math.min(Number(match[1]), 23));
-  const minute = Math.max(0, Math.min(Number(match[2]), 59));
-  return { hour, minute };
+function parseScheduleTime(value = '08:00') {
+  const match = String(value || '').match(/^(\d{2}):(\d{2})$/);
+  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) return null;
+  return { hour: Number(match[1]), minute: Number(match[2]) };
 }
 
 function getZonedParts(date, timezone) {
@@ -40,86 +47,21 @@ function getZonedParts(date, timezone) {
   };
 }
 
-function dailyEmailMarkerPath(markerDir, dateKey) {
-  return path.join(markerDir, `${dateKey}.json`);
-}
-
-async function hasSentDailyEmailMarker(markerDir, dateKey) {
-  if (!markerDir) {
-    return false;
-  }
-
-  try {
-    await fs.access(dailyEmailMarkerPath(markerDir, dateKey));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function writeSentDailyEmailMarker(markerDir, dateKey, result) {
-  if (!markerDir) {
-    return;
-  }
-
-  await fs.mkdir(markerDir, { recursive: true });
-  await fs.writeFile(
-    dailyEmailMarkerPath(markerDir, dateKey),
-    JSON.stringify(
-      {
-        dateKey,
-        createdAt: new Date().toISOString(),
-        emailStatus: result.emailResult.status,
-        notificationType: result.notificationType || 'normal-digest',
-        providerMessageId: result.emailResult.providerMessageId || '',
-        totals: result.review?.totals || {},
-        crmSync: result.crmSync || result.review?.crmSync || {},
-      },
-      null,
-      2,
-    ),
-  );
-}
-
 export function shouldRunDailyDealHunterEmail({
   now = new Date(),
   timezone = 'America/Los_Angeles',
-  scheduleTime = '10:15',
+  scheduleTime = '08:00',
 } = {}) {
   const scheduled = parseScheduleTime(scheduleTime);
-  const zoned = getZonedParts(now, timezone);
-
-  return {
-    dateKey: zoned.dateKey,
-    due: zoned.minutesSinceMidnight >= scheduled.hour * 60 + scheduled.minute,
-  };
-}
-
-async function hasSentDailyEmailForDate(storage, dateKey, timezone, markerDir) {
-  if (await hasSentDailyEmailMarker(markerDir, dateKey)) {
-    return true;
-  }
-
-  if (!storage.listEmailEvents) {
-    return false;
-  }
-
   try {
-    const events = await storage.listEmailEvents({
-      source: dailyEmailSource,
-      limit: 50,
-    });
-
-    return events.some((event) => {
-      if (event.event_type !== 'sent' || !event.created_at) {
-        return false;
-      }
-
-      return getZonedParts(new Date(event.created_at), timezone).dateKey === dateKey;
-    });
-  } catch (error) {
-    console.warn(`[deal-hunter:scheduler] sent-email history lookup failed: ${error.message}`);
-    return false;
+    if (!scheduled || !(now instanceof Date) || !Number.isFinite(now.getTime())) throw new Error('invalid schedule');
+    const zoned = getZonedParts(now, timezone);
+    return {
+      dateKey: zoned.dateKey,
+      due: zoned.minutesSinceMidnight >= scheduled.hour * 60 + scheduled.minute,
+    };
+  } catch {
+    return { dateKey: '', due: false };
   }
 }
 
@@ -127,116 +69,353 @@ export async function runClaimedDailyDealHunterEmail({
   triggeredBy = 'admin',
   now = new Date(),
   storage = getStorage(),
-  sendReview = sendDailyDealHunterReview,
+  buildDigest = buildCurrentDailyDealHunterDigest,
+  buildEnvelope = buildDailyDealHunterEmailEnvelope,
+  sendPrepared = sendPreparedMessage,
+  reconcile = reconcileDailyDealHunterJob,
+  recordEvent = recordEmailEvent,
+  writeMarker = writeDailyDealHunterMarker,
+  providerLookup,
+  claimTokenFactory = randomUUID,
+  configOverride,
+  enforceDueTime = false,
   markerDir,
 } = {}) {
-  const config = getConfig();
+  const config = configOverride || getConfig();
   const schedule = config.dealHunter.dailyEmail;
   const effectiveMarkerDir = markerDir === undefined ? schedule.markerDir : markerDir;
-  const { dateKey } = shouldRunDailyDealHunterEmail({
+  const dueState = shouldRunDailyDealHunterEmail({
     now,
     timezone: schedule.timezone,
     scheduleTime: schedule.time,
   });
-  const jobKey = `${dailyEmailJobName}:${dateKey}`;
-
-  if (await hasSentDailyEmailForDate(storage, dateKey, schedule.timezone, effectiveMarkerDir)) {
-    let jobRun = null;
-
-    try {
-      const existingRun = await storage.getScheduledJob?.(jobKey);
-      jobRun = existingRun?.status === 'completed'
-        ? existingRun
-        : await storage.completeScheduledJob?.(jobKey, {
-            status: 'completed',
-            provider_message_id: existingRun?.provider_message_id || '',
-            metadata: {
-              ...(existingRun?.metadata || {}),
-              dateKey,
-              timezone: schedule.timezone,
-              reconciledFromDeliveryEvidence: true,
-            },
-          });
-    } catch (error) {
-      console.warn(`[deal-hunter:scheduler] sent-email reconciliation failed: ${error.message}`);
-    }
-
+  const { dateKey } = dueState;
+  const automaticScheduleDisabled = enforceDueTime && schedule.enabled !== true;
+  if (!dateKey || automaticScheduleDisabled || (enforceDueTime && !dueState.due)) {
     return {
-      alreadySent: true,
-      jobKey,
-      jobRun,
-      emailResult: { status: 'already-sent', error: '', providerMessageId: '' },
+      alreadySent: false,
+      inProgress: false,
+      jobKey: dateKey ? `${dailyEmailJobName}:${dateKey}` : '',
+      jobRun: null,
+      emailResult: {
+        status: 'not-due',
+        error: '',
+        errorCategory: automaticScheduleDisabled ? 'schedule-disabled' : dateKey ? '' : 'invalid-schedule',
+        providerMessageId: '',
+      },
       review: null,
     };
   }
-
+  const jobKey = `${dailyEmailJobName}:${dateKey}`;
   const nowIso = now.toISOString();
+  const effectiveProviderLookup = providerLookup === undefined && !configOverride
+    ? (input) => lookupDailyDealHunterProviderMessages(input)
+    : providerLookup;
+  let reconciliation = null;
+  try {
+    reconciliation = await reconcile({
+      storage,
+      jobKey,
+      markerDir: effectiveMarkerDir,
+      now,
+      providerLookup: effectiveProviderLookup,
+    });
+  } catch {
+    reconciliation = { status: 'reconciliation-unavailable', jobRun: await storage.getScheduledJob?.(jobKey) || null };
+  }
+  if (reconciliation?.status === 'completed') {
+    return {
+      alreadySent: true,
+      inProgress: false,
+      jobKey,
+      jobRun: reconciliation.jobRun,
+      emailResult: {
+        status: 'already-sent',
+        error: '',
+        errorCategory: '',
+        providerMessageId: reconciliation.jobRun?.provider_message_id || '',
+      },
+      review: null,
+      reconciliationSource: reconciliation.source || '',
+    };
+  }
+
+  const claimToken = claimTokenFactory();
   const claim = await storage.claimScheduledJob({
     jobKey,
     jobName: dailyEmailJobName,
     triggeredBy,
+    claimToken,
     nowIso,
     staleBefore: new Date(now.getTime() - dailyEmailClaimStaleMs).toISOString(),
-    metadata: { dateKey, timezone: schedule.timezone },
+    retryDueAt: nowIso,
+    metadata: {
+      businessDate: dateKey,
+      pacificDate: dateKey,
+      dateKey,
+      timezone: schedule.timezone,
+      trigger: String(triggeredBy || '').slice(0, 80),
+    },
   });
 
-  if (!claim.claimed) {
+  if (!(claim.applied ?? claim.claimed)) {
+    const status = claim.run?.status || '';
+    const resultStatus = status === 'completed'
+      ? 'already-sent'
+      : status === 'pending'
+        ? 'in-progress'
+        : claim.reason === 'retry-not-due'
+          ? 'retry-not-due'
+          : ['transmitting', 'ambiguous'].includes(status)
+            ? status
+            : claim.reason || 'unavailable';
     return {
-      alreadySent: claim.run?.status === 'completed',
-      inProgress: claim.run?.status === 'pending',
+      alreadySent: status === 'completed',
+      inProgress: status === 'pending',
       jobKey,
       jobRun: claim.run,
       emailResult: {
-        status: claim.run?.status === 'completed' ? 'already-sent' : 'in-progress',
+        status: resultStatus,
         error: '',
+        errorCategory: '',
         providerMessageId: claim.run?.provider_message_id || '',
       },
       review: null,
     };
   }
 
-  let result;
-  let deliveryConfirmed = false;
-
-  try {
-    result = await sendReview({ idempotencyKey: jobKey });
-    const failed = result.emailResult.status === 'failed';
-    deliveryConfirmed = !failed;
-
-    if (deliveryConfirmed) {
-      await writeSentDailyEmailMarker(effectiveMarkerDir, dateKey, result).catch((error) => {
-        console.warn(`[deal-hunter:scheduler] daily email marker write failed: ${error.message}`);
-      });
-    }
-
-    const completedAt = new Date().toISOString();
-    const jobRun = await storage.completeScheduledJob(jobKey, {
-      completed_at: completedAt,
-      status: failed ? 'failed' : 'completed',
-      provider_message_id: result.emailResult.providerMessageId || '',
-      last_error: result.emailResult.error || '',
-      metadata: {
+  let jobRun = claim.run;
+  let projection = null;
+  let envelope = jobRun?.metadata?.preparedEnvelope || null;
+  if (!envelope) {
+    projection = await buildDigest({ businessDate: dateKey, storage });
+    envelope = buildEnvelope({
+      projection,
+      recipient: config.dealHunter.recipient || config.admin?.email || '',
+      sender: config.delivery.resendFromEmail || '',
+      replyTo: config.delivery.resendReplyTo || '',
+      preparedAt: nowIso,
+    });
+    const prepared = await storage.transitionScheduledJob({
+      jobKey,
+      claimToken,
+      expectedStatuses: ['pending'],
+      status: 'pending',
+      nowIso,
+      metadataPatch: {
+        preparedEnvelope: envelope,
+        payloadDigest: envelope.payloadDigest,
+        firstPreparedAt: envelope.preparedAt,
+        preparedAt: envelope.preparedAt,
+        businessDate: dateKey,
+        pacificDate: dateKey,
         dateKey,
         timezone: schedule.timezone,
-        totals: result.review?.totals || {},
-        crmSync: result.crmSync || result.review?.crmSync || {},
-        notificationType: result.notificationType || 'normal-digest',
+        notificationType: envelope.notificationType,
+        projectionSummary: projection.summary ? {
+          needsReview: projection.summary.needsReview,
+          highPriority: projection.summary.highPriority,
+          watchlist: projection.summary.watchlist,
+          lowConfidence: projection.summary.lowConfidence,
+          currentOpportunities: projection.summary.currentOpportunities,
+        } : null,
       },
     });
-
-    return { ...result, jobKey, jobRun, alreadySent: false };
-  } catch (error) {
-    if (!deliveryConfirmed) {
-      await storage.completeScheduledJob(jobKey, {
-        status: 'failed',
-        last_error: error.message || 'Daily Deal Hunter email failed.',
-        metadata: { dateKey, timezone: schedule.timezone },
-      }).catch(() => {});
-    } else {
-      error.deliveryConfirmed = true;
+    if (!prepared.applied) {
+      return {
+        alreadySent: prepared.run?.status === 'completed',
+        inProgress: prepared.run?.status === 'pending',
+        jobKey,
+        jobRun: prepared.run,
+        emailResult: { status: prepared.run?.status || prepared.reason, error: '', errorCategory: 'prepare-fence-denied', providerMessageId: '' },
+        review: projection,
+      };
     }
-    throw error;
+    jobRun = prepared.run;
+    envelope = jobRun.metadata.preparedEnvelope;
   }
+
+  const envelopeVerification = verifyDailyDealHunterEmailEnvelope(envelope);
+  if (!envelopeVerification.ok || envelope.idempotencyKey !== jobKey || envelope.businessDate !== dateKey) {
+    const failed = await storage.transitionScheduledJob({
+      jobKey,
+      claimToken,
+      expectedStatuses: ['pending'],
+      status: 'failed',
+      nowIso,
+      lastError: 'Persisted Daily Deal Hunter envelope failed integrity validation.',
+      metadataPatch: { failureCategory: envelopeVerification.errorCategory || 'invalid-prepared-envelope' },
+    });
+    return {
+      alreadySent: false,
+      inProgress: false,
+      jobKey,
+      jobRun: failed.run || jobRun,
+      emailResult: { status: 'failed', error: 'Prepared email authority is invalid.', errorCategory: envelopeVerification.errorCategory || 'invalid-prepared-envelope', providerMessageId: '' },
+      review: projection,
+    };
+  }
+
+  const boundary = await storage.transitionScheduledJob({
+    jobKey,
+    claimToken,
+    expectedStatuses: ['pending'],
+    status: 'transmitting',
+    nowIso,
+    metadataPatch: { provider: 'resend', providerBoundaryAt: nowIso, lastTrigger: String(triggeredBy || '').slice(0, 80) },
+  });
+  if (!boundary.applied) {
+    return {
+      alreadySent: boundary.run?.status === 'completed',
+      inProgress: boundary.run?.status === 'pending',
+      jobKey,
+      jobRun: boundary.run,
+      emailResult: { status: boundary.run?.status || boundary.reason, error: '', errorCategory: 'provider-boundary-denied', providerMessageId: boundary.run?.provider_message_id || '' },
+      review: projection,
+    };
+  }
+  jobRun = boundary.run;
+
+  let emailResult;
+  try {
+    emailResult = await sendPrepared(envelope, configOverride ? { configOverride: config } : undefined);
+  } catch (error) {
+    const message = String(error?.message || '').toLowerCase();
+    emailResult = {
+      status: 'ambiguous',
+      provider: 'resend',
+      providerMessageId: '',
+      error: 'Provider outcome is unknown and requires reconciliation.',
+      errorCategory: /timeout|timed out|aborted/.test(message)
+        ? 'provider-timeout'
+        : /reset|connection|socket|network/.test(message)
+          ? 'provider-connection-unknown'
+          : 'provider-outcome-unknown',
+    };
+  }
+
+  const acceptedProviderId = emailResult.status === 'sent' && emailResult.providerMessageId
+    ? String(emailResult.providerMessageId).slice(0, 240)
+    : emailResult.status === 'logged' && !config.isProduction
+      ? `development-only-${dateKey}`
+      : '';
+  if (acceptedProviderId) {
+    const acceptedAt = nowIso;
+    const evidence = {
+      jobKey,
+      businessDate: dateKey,
+      notificationType: envelope.notificationType,
+      payloadDigest: envelope.payloadDigest,
+      providerMessageId: acceptedProviderId,
+      acceptedAt,
+    };
+    let markerWritten = false;
+    try {
+      markerWritten = Boolean((await writeMarker({ markerDir: effectiveMarkerDir, evidence })).written || !effectiveMarkerDir);
+    } catch {
+      markerWritten = false;
+    }
+    let completed = null;
+    try {
+      completed = await storage.transitionScheduledJob({
+        jobKey,
+        claimToken,
+        expectedStatuses: ['transmitting'],
+        status: 'completed',
+        nowIso,
+        completedAt: acceptedAt,
+        providerMessageId: acceptedProviderId,
+        lastError: '',
+        metadataPatch: {
+          provider: emailResult.provider || (emailResult.status === 'logged' ? 'console' : 'resend'),
+          providerMessageId: acceptedProviderId,
+          acceptedAt,
+          markerWritten,
+          completionSource: emailResult.status === 'logged' ? 'development-console' : 'provider-response',
+        },
+      });
+    } catch {
+      completed = null;
+    }
+    try {
+      await recordEvent({
+        event_key: `resend:daily-deal-hunter:${acceptedProviderId}:sent`,
+        created_at: acceptedAt,
+        provider: emailResult.provider || (emailResult.status === 'logged' ? 'console' : 'resend'),
+        event_type: 'sent',
+        message_id: acceptedProviderId,
+        recipient_email: envelope.to,
+        subject: envelope.subject,
+        source: dailyEmailSource,
+        metadata: {
+          tags: envelope.tags,
+          tracking: { jobKey, businessDate: dateKey, notificationType: envelope.notificationType, payloadDigest: envelope.payloadDigest },
+        },
+      }, { storage });
+    } catch {
+      // The completed row and marker remain authoritative even if history is temporarily unavailable.
+    }
+    if (completed?.applied || completed?.reason === 'completed') {
+      return {
+        alreadySent: false,
+        inProgress: false,
+        jobKey,
+        jobRun: completed.run || jobRun,
+        notificationType: envelope.notificationType,
+        emailResult: { ...emailResult, providerMessageId: acceptedProviderId },
+        review: projection,
+      };
+    }
+    return {
+      alreadySent: false,
+      inProgress: false,
+      jobKey,
+      jobRun: completed?.run || jobRun,
+      notificationType: envelope.notificationType,
+      emailResult: { status: 'ambiguous', provider: 'resend', providerMessageId: acceptedProviderId, error: 'Provider acceptance requires durable reconciliation.', errorCategory: 'post-acceptance-finalization-unknown' },
+      review: projection,
+    };
+  }
+
+  if (emailResult.status === 'failed' && emailResult.definitiveFailure === true) {
+    const failed = await storage.transitionScheduledJob({
+      jobKey,
+      claimToken,
+      expectedStatuses: ['transmitting'],
+      status: 'failed',
+      nowIso,
+      lastError: String(emailResult.errorCategory || 'provider-nonacceptance').slice(0, 200),
+      metadataPatch: { failureCategory: emailResult.errorCategory || 'provider-nonacceptance' },
+    });
+    return {
+      alreadySent: false,
+      inProgress: false,
+      jobKey,
+      jobRun: failed.run || jobRun,
+      notificationType: envelope.notificationType,
+      emailResult,
+      review: projection,
+    };
+  }
+
+  const afterAmbiguity = await reconcile({
+    storage,
+    jobKey,
+    markerDir: effectiveMarkerDir,
+    now,
+    providerLookup: effectiveProviderLookup,
+  }).catch(() => null);
+  return {
+    alreadySent: afterAmbiguity?.status === 'completed',
+    inProgress: false,
+    jobKey,
+    jobRun: afterAmbiguity?.jobRun || jobRun,
+    notificationType: envelope.notificationType,
+    emailResult: afterAmbiguity?.status === 'completed'
+      ? { status: 'already-sent', error: '', errorCategory: '', providerMessageId: afterAmbiguity.jobRun?.provider_message_id || '' }
+      : { ...emailResult, status: 'ambiguous', providerMessageId: emailResult.providerMessageId || '', errorCategory: emailResult.errorCategory || 'provider-outcome-unknown' },
+    review: projection,
+  };
 }
 
 export async function getDailyDealHunterJobStatus(now = new Date()) {
@@ -308,15 +487,17 @@ export function startDealHunterDailyEmailScheduler({
         return;
       }
 
-      if (result.emailResult.status === 'failed') {
-        console.error(`[deal-hunter:scheduler] daily email failed: ${result.emailResult.error || 'unknown error'}`);
+      if (['failed', 'ambiguous', 'transmitting', 'retry-not-due', 'not-due'].includes(result.emailResult.status)) {
+        console.error(
+          `[deal-hunter:scheduler] daily email state=${result.emailResult.status} category=${result.emailResult.errorCategory || 'none'} date=${dateKey}`,
+        );
         return;
       }
 
-      sentDates.add(dateKey);
-      console.log(`[deal-hunter:scheduler] daily email ${result.emailResult.status} for ${dateKey}`);
-    } catch (error) {
-      console.error(`[deal-hunter:scheduler] daily email crashed: ${error.message}`);
+      if (['sent', 'logged', 'already-sent'].includes(result.emailResult.status)) sentDates.add(dateKey);
+      console.log(`[deal-hunter:scheduler] daily email state=${result.emailResult.status} date=${dateKey}`);
+    } catch {
+      console.error(`[deal-hunter:scheduler] daily email state=crashed category=pre-boundary-error date=${dateKey}`);
     } finally {
       inFlight = false;
     }

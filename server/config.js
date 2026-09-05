@@ -1,3 +1,4 @@
+import { accessSync, constants, existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -322,6 +323,25 @@ export function validateConfig(config = getConfig()) {
       errors.push(`${label} must be a valid HTTP(S)${originOnly ? ' origin without a path, query, or fragment' : ' URL'}.`);
     }
   };
+  const configuredEmailAddress = (value) => {
+    const normalized = String(value || '').trim();
+    if (/^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(normalized)) return normalized;
+    return normalized.match(/^[^<>\r\n,]{1,160}<([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})>$/i)?.[1] || '';
+  };
+  const markerParentIsWritable = (value) => {
+    let candidate = path.resolve(String(value || ''));
+    while (!existsSync(candidate)) {
+      const parent = path.dirname(candidate);
+      if (parent === candidate) return false;
+      candidate = parent;
+    }
+    try {
+      accessSync(candidate, constants.W_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   if (!['sqlite', 'supabase'].includes(config.storage.provider)) {
     errors.push('STORAGE_PROVIDER must be sqlite or supabase.');
@@ -401,7 +421,7 @@ export function validateConfig(config = getConfig()) {
   requireHttpUrl(config.crm?.webhookUrl, 'CRM_WEBHOOK_URL');
 
   const scheduledTime = String(config.dealHunter.dailyEmail.time || '10:15');
-  const scheduledTimeMatch = scheduledTime.match(/^(\d{1,2}):(\d{2})$/);
+  const scheduledTimeMatch = scheduledTime.match(/^(\d{2}):(\d{2})$/);
   if (!scheduledTimeMatch || Number(scheduledTimeMatch[1]) > 23 || Number(scheduledTimeMatch[2]) > 59) {
     errors.push('DEAL_HUNTER_DAILY_EMAIL_TIME must use a valid 24-hour HH:MM value.');
   }
@@ -596,6 +616,36 @@ export function validateConfig(config = getConfig()) {
 
     if (config.delivery.provider === 'formspree') {
       errors.push('DELIVERY_PROVIDER=formspree is inbound-only and cannot support production admin or Deal Hunter email. Use resend or emailjs.');
+    }
+
+    if (config.dealHunter.dailyEmail?.enabled) {
+      const recipient = config.dealHunter.recipient || config.admin.email || '';
+      if (config.delivery.provider !== 'resend') {
+        errors.push('DELIVERY_PROVIDER=resend is required when the production Daily Deal Hunter digest is enabled.');
+      }
+      requireValue(config.delivery.resendApiKey, 'RESEND_API_KEY for the enabled Daily Deal Hunter digest');
+      requireValue(recipient, 'DEAL_HUNTER_EMAIL_RECIPIENT or ADMIN_EMAIL for the enabled Daily Deal Hunter digest');
+      requireValue(config.delivery.resendFromEmail, 'RESEND_FROM_EMAIL for the enabled Daily Deal Hunter digest');
+      requireValue(config.delivery.emailWebhookSecret, 'RESEND_WEBHOOK_SECRET or EMAIL_WEBHOOK_SECRET for the enabled Daily Deal Hunter digest');
+      if (recipient && !configuredEmailAddress(recipient)) {
+        errors.push('DEAL_HUNTER_EMAIL_RECIPIENT or ADMIN_EMAIL must be a valid Daily Deal Hunter digest recipient.');
+      }
+      if (config.delivery.resendFromEmail && !configuredEmailAddress(config.delivery.resendFromEmail)) {
+        errors.push('RESEND_FROM_EMAIL must contain a valid Daily Deal Hunter digest sender address.');
+      }
+      if (config.dealHunter.dailyEmail.time !== '08:00') {
+        errors.push('DEAL_HUNTER_DAILY_EMAIL_TIME must be 08:00 when the production Daily Deal Hunter digest is enabled.');
+      }
+      if (config.dealHunter.dailyEmail.timezone !== 'America/Los_Angeles') {
+        errors.push('DEAL_HUNTER_DAILY_EMAIL_TIMEZONE must be America/Los_Angeles when the production Daily Deal Hunter digest is enabled.');
+      }
+      if (Number(config.dealHunter.dailyEmail.retryIntervalMs) < 30 * 60 * 1000) {
+        errors.push('DEAL_HUNTER_DAILY_EMAIL_RETRY_INTERVAL_MS must be at least 1800000 for definitive provider retries.');
+      }
+      if (!config.dealHunter.dailyEmail.markerDir
+        || !markerParentIsWritable(config.dealHunter.dailyEmail.markerDir)) {
+        errors.push('DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR must have a writable existing parent for the enabled Daily Deal Hunter digest.');
+      }
     }
 
     const magicLinkUsable = ['magic-link', 'hybrid'].includes(config.admin.authMode)

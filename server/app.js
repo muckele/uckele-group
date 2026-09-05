@@ -153,6 +153,45 @@ function requireDealHunterCron(request, config) {
   return Boolean(config.dealHunter.cronSecret && providedSecret && safeCompareText(providedSecret, config.dealHunter.cronSecret));
 }
 
+function hasStrictEmptyBody(body) {
+  return body === undefined
+    || (Boolean(body) && typeof body === 'object' && !Array.isArray(body) && Object.keys(body).length === 0);
+}
+
+function dailyDealHunterHttpStatus(status) {
+  if (status === 'failed') return 502;
+  if (['in-progress', 'retry-not-due', 'transmitting', 'ambiguous', 'not-due'].includes(status)) return 409;
+  if (['sent', 'logged', 'already-sent'].includes(status)) return 200;
+  return 503;
+}
+
+function dailyDealHunterRouteResult(result = {}) {
+  const emailResult = result.emailResult || {};
+  const status = String(emailResult.status || 'unavailable').slice(0, 80);
+  const jobRun = result.jobRun && typeof result.jobRun === 'object' ? {
+    status: String(result.jobRun.status || '').slice(0, 40),
+    attemptCount: Number.isInteger(result.jobRun.attempt_count) ? result.jobRun.attempt_count : null,
+    completedAt: String(result.jobRun.completed_at || '').slice(0, 40),
+    nextRetryAt: String(result.jobRun.next_retry_at || result.jobRun.nextRetryAt || '').slice(0, 40),
+    providerMessageId: String(result.jobRun.provider_message_id || '').slice(0, 240),
+  } : null;
+  return {
+    success: ['sent', 'logged', 'already-sent'].includes(status),
+    status,
+    jobKey: String(result.jobKey || '').slice(0, 240),
+    notificationType: String(result.notificationType || '').slice(0, 40),
+    alreadySent: Boolean(result.alreadySent),
+    inProgress: Boolean(result.inProgress),
+    emailResult: {
+      status,
+      provider: String(emailResult.provider || '').slice(0, 40),
+      providerMessageId: String(emailResult.providerMessageId || '').slice(0, 240),
+      errorCategory: String(emailResult.errorCategory || '').slice(0, 120),
+    },
+    jobRun,
+  };
+}
+
 function captureRawBody(request, _response, buffer) {
   request.rawBody = buffer.toString('utf8');
 }
@@ -410,7 +449,9 @@ function publicScoreRefreshResult(scoreRefresh) {
   return result;
 }
 
-export function createApp() {
+export function createApp({
+  dailyDealHunterRunner = runClaimedDailyDealHunterEmail,
+} = {}) {
   const config = getConfig();
   const app = express();
   const dealOsRawParser = express.raw({
@@ -1827,15 +1868,14 @@ export function createApp() {
         return;
       }
 
-      const result = await runClaimedDailyDealHunterEmail({ triggeredBy: session.username || 'admin' });
-      if (result.review) {
-        result.review.dailyEmailJob = result.jobRun || await getDailyDealHunterJobStatus();
-        result.review.emailReadiness = await getEmailReadiness();
+      if (!hasStrictEmptyBody(request.body)) {
+        response.status(400).json({ success: false, error: 'Daily Deal Hunter accepts an empty request body only.' });
+        return;
       }
-      response.status(result.emailResult.status === 'failed' ? 502 : result.inProgress ? 409 : 200).json({
-        success: !['failed', 'in-progress'].includes(result.emailResult.status),
-        ...result,
-      });
+
+      const result = await dailyDealHunterRunner({ triggeredBy: session.username || 'admin' });
+      const projected = dailyDealHunterRouteResult(result);
+      response.status(dailyDealHunterHttpStatus(projected.status)).json(projected);
     }),
   );
 
@@ -2218,11 +2258,14 @@ export function createApp() {
         return;
       }
 
-      const result = await runClaimedDailyDealHunterEmail({ triggeredBy: 'external-cron' });
-      response.status(result.emailResult.status === 'failed' ? 502 : result.inProgress ? 409 : 200).json({
-        success: !['failed', 'in-progress'].includes(result.emailResult.status),
-        ...result,
-      });
+      if (!hasStrictEmptyBody(request.body)) {
+        response.status(400).json({ success: false, error: 'Daily Deal Hunter accepts an empty request body only.' });
+        return;
+      }
+
+      const result = await dailyDealHunterRunner({ triggeredBy: 'external-cron', enforceDueTime: true });
+      const projected = dailyDealHunterRouteResult(result);
+      response.status(dailyDealHunterHttpStatus(projected.status)).json(projected);
     }),
   );
 
