@@ -1,5 +1,6 @@
 import { getConfig } from '../config.js';
 import { fetchWithTimeout } from '../utils/http.js';
+import { canonicalDailyDealHunterMailbox } from './dailyDealHunterDigest.js';
 import { recordEmailEvent } from './emailEvents.js';
 
 const cimMessageKinds = new Set([
@@ -356,23 +357,54 @@ async function sendViaResend(message, { config, fetcher } = {}) {
       : { status: 'sent', error: '', provider: 'resend', providerMessageId: '' };
   }
 
-  const providerMessageId = boundedProviderIdentity(data?.id || data?.email_id || '');
-  if (protectedIdentity && !providerMessageId) {
+  const identity = protectedIdentity
+    ? strictResendAcceptanceIdentity(data)
+    : { providerMessageId: boundedProviderIdentity(data?.id || data?.email_id || ''), errorCategory: '' };
+  if (protectedIdentity && !identity.providerMessageId) {
     return {
       status: 'ambiguous',
       error: 'Resend accepted the request without a coherent provider message identity.',
-      errorCategory: 'missing-provider-id',
+      errorCategory: identity.errorCategory,
       provider: 'resend',
       providerMessageId: '',
     };
   }
 
-  return { status: 'sent', error: '', errorCategory: '', provider: 'resend', providerMessageId };
+  return {
+    status: 'sent',
+    error: '',
+    errorCategory: '',
+    provider: 'resend',
+    providerMessageId: identity.providerMessageId,
+  };
 }
 
 function boundedProviderIdentity(value = '') {
-  const normalized = normalizeText(value, 241);
+  if (typeof value !== 'string') return '';
+  const normalized = value.replace(/\s+/g, ' ').trim().slice(0, 241);
   return /^[A-Za-z0-9_.:@-]{1,240}$/.test(normalized) ? normalized : '';
+}
+
+function strictResendAcceptanceIdentity(data) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return { providerMessageId: '', errorCategory: 'missing-provider-id' };
+  }
+  const aliases = ['id', 'email_id'].filter((field) => Object.hasOwn(data, field));
+  if (aliases.length === 0) {
+    return { providerMessageId: '', errorCategory: 'missing-provider-id' };
+  }
+  const identities = [];
+  for (const field of aliases) {
+    const identity = boundedProviderIdentity(data[field]);
+    if (!identity) {
+      return { providerMessageId: '', errorCategory: 'missing-provider-id' };
+    }
+    identities.push(identity);
+  }
+  const unique = [...new Set(identities)];
+  return unique.length === 1
+    ? { providerMessageId: unique[0], errorCategory: '' }
+    : { providerMessageId: '', errorCategory: 'conflicting-provider-id' };
 }
 
 async function sendViaEmailJs(message) {
@@ -592,9 +624,9 @@ export async function lookupDailyDealHunterProviderMessages({
   if (!listing.ok) return [];
   const listedPayload = await listing.json().catch(() => ({}));
   const listed = Array.isArray(listedPayload?.data) ? listedPayload.data : Array.isArray(listedPayload) ? listedPayload : [];
-  const recipient = normalizeRecipients(envelope.to).map((value) => extractEmailAddress(value).toLowerCase());
+  const recipient = normalizeRecipients(envelope.to).map(canonicalDailyDealHunterMailbox).filter(Boolean);
   const candidates = listed.filter((item) => {
-    const itemRecipients = normalizeRecipients(item?.to).map((value) => extractEmailAddress(value).toLowerCase());
+    const itemRecipients = normalizeRecipients(item?.to).map(canonicalDailyDealHunterMailbox).filter(Boolean);
     return boundedProviderIdentity(item?.id)
       && normalizeText(item?.subject, 300) === envelope.subject
       && itemRecipients.some((value) => recipient.includes(value));

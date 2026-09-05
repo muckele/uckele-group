@@ -173,7 +173,155 @@ test('matching marker reconciles provider acceptance without a send', async (t) 
   assert.equal(result.status, 'completed');
   assert.equal(result.source, 'marker');
   assert.equal(storage.run.provider_message_id, providerId);
-  assert.equal(providerLookups, 0);
+  assert.equal(providerLookups, 1);
+});
+
+test('daily digest aggregates all available reconciliation evidence before completion', async (t) => {
+  const conflictingMarkerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'daily-digest-conflicting-marker-'));
+  const duplicateMarkerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'daily-digest-duplicate-marker-'));
+  t.after(() => {
+    fs.rmSync(conflictingMarkerDir, { recursive: true, force: true });
+    fs.rmSync(duplicateMarkerDir, { recursive: true, force: true });
+  });
+
+  await writeDailyDealHunterMarker({
+    markerDir: conflictingMarkerDir,
+    evidence: markerEvidence({ providerMessageId: 'provider-marker-a' }),
+  });
+  const markerLocalConflict = createStorage({
+    events: [exactEvent({ message_id: 'provider-local-b' })],
+  });
+  const markerLocalConflictResult = await reconcileDailyDealHunterJob({
+    storage: markerLocalConflict,
+    jobKey,
+    markerDir: conflictingMarkerDir,
+    now: new Date('2026-07-15T15:05:00.000Z'),
+  });
+  assert.equal(markerLocalConflictResult.status, 'ambiguous');
+  assert.equal(markerLocalConflictResult.reason, 'conflicting-provider-evidence');
+  assert.equal(markerLocalConflict.run.provider_message_id, null);
+  assert.equal(markerLocalConflict.run.metadata.reconciliation.severity, 'high');
+
+  const localWebhookConflict = createStorage({
+    events: [
+      exactEvent({ message_id: 'provider-local-a' }),
+      exactEvent({
+        source: 'webhook',
+        message_id: 'provider-webhook-b',
+        provider_event_id: 'svix-conflicting-webhook',
+        metadata: { ...exactEvent().metadata, svixId: 'svix-conflicting-webhook', rawType: 'email.sent' },
+      }),
+    ],
+  });
+  const localWebhookConflictResult = await reconcileDailyDealHunterJob({
+    storage: localWebhookConflict,
+    jobKey,
+    markerDir: '',
+    now: new Date('2026-07-15T15:05:00.000Z'),
+  });
+  assert.equal(localWebhookConflictResult.status, 'ambiguous');
+  assert.equal(localWebhookConflictResult.reason, 'conflicting-provider-evidence');
+  assert.equal(localWebhookConflict.run.provider_message_id, null);
+
+  const webhookProviderConflict = createStorage({
+    events: [exactEvent({
+      source: 'webhook',
+      message_id: 'provider-webhook-a',
+      provider_event_id: 'svix-provider-conflict',
+      metadata: { ...exactEvent().metadata, svixId: 'svix-provider-conflict', rawType: 'email.sent' },
+    })],
+  });
+  const webhookProviderConflictResult = await reconcileDailyDealHunterJob({
+    storage: webhookProviderConflict,
+    jobKey,
+    markerDir: '',
+    now: new Date('2026-07-15T15:05:00.000Z'),
+    providerLookup: async () => [providerCandidate({ id: 'provider-lookup-b' })],
+  });
+  assert.equal(webhookProviderConflictResult.status, 'ambiguous');
+  assert.equal(webhookProviderConflictResult.reason, 'conflicting-provider-evidence');
+  assert.equal(webhookProviderConflict.run.provider_message_id, null);
+
+  await writeDailyDealHunterMarker({
+    markerDir: duplicateMarkerDir,
+    evidence: markerEvidence({ providerMessageId: 'provider-same-a' }),
+  });
+  const duplicateIdentity = createStorage({
+    events: [exactEvent({ message_id: 'provider-same-a' })],
+  });
+  const duplicateIdentityResult = await reconcileDailyDealHunterJob({
+    storage: duplicateIdentity,
+    jobKey,
+    markerDir: duplicateMarkerDir,
+    now: new Date('2026-07-15T15:05:00.000Z'),
+  });
+  assert.equal(duplicateIdentityResult.status, 'completed');
+  assert.equal(duplicateIdentity.run.provider_message_id, 'provider-same-a');
+
+  const alreadyAmbiguous = createStorage({
+    run: scheduledRun({ status: 'ambiguous' }),
+    events: [
+      exactEvent({ message_id: 'provider-local-a' }),
+      exactEvent({
+        source: 'webhook',
+        message_id: 'provider-webhook-b',
+        provider_event_id: 'svix-existing-ambiguous-conflict',
+        metadata: { ...exactEvent().metadata, svixId: 'svix-existing-ambiguous-conflict', rawType: 'email.sent' },
+      }),
+    ],
+  });
+  const alreadyAmbiguousResult = await reconcileDailyDealHunterJob({
+    storage: alreadyAmbiguous,
+    jobKey,
+    markerDir: '',
+    now: new Date('2026-07-15T16:05:00.000Z'),
+  });
+  assert.equal(alreadyAmbiguousResult.status, 'ambiguous');
+  assert.equal(alreadyAmbiguousResult.reason, 'conflicting-provider-evidence');
+  assert.equal(alreadyAmbiguousResult.severity, 'high');
+  assert.equal(alreadyAmbiguous.run.status, 'ambiguous');
+  assert.equal(alreadyAmbiguous.run.provider_message_id, null);
+});
+
+test('provider lookup outage does not bypass daily digest ambiguity window', async () => {
+  const lookupFailure = async () => { throw new Error('provider lookup unavailable with private details'); };
+  const beforeWindow = createStorage();
+  const beforeResult = await reconcileDailyDealHunterJob({
+    storage: beforeWindow,
+    jobKey,
+    markerDir: '',
+    now: new Date('2026-07-15T15:59:00.000Z'),
+    providerLookup: lookupFailure,
+  });
+  assert.equal(beforeResult.status, 'transmitting');
+  assert.equal(beforeResult.reason, 'provider-lookup-unavailable');
+  assert.equal(beforeWindow.run.status, 'transmitting');
+
+  const afterWindow = createStorage();
+  const afterResult = await reconcileDailyDealHunterJob({
+    storage: afterWindow,
+    jobKey,
+    markerDir: '',
+    now: new Date('2026-07-15T16:01:00.000Z'),
+    providerLookup: lookupFailure,
+  });
+  assert.equal(afterResult.status, 'ambiguous');
+  assert.equal(afterResult.reason, 'provider-lookup-unavailable');
+  assert.equal(afterWindow.run.status, 'ambiguous');
+  assert.equal(afterWindow.run.metadata.reconciliation.errorCategory, 'provider-lookup-unavailable');
+  assert.doesNotMatch(JSON.stringify(afterResult), /private details/);
+
+  const exactLocal = createStorage({ events: [exactEvent()] });
+  const exactResult = await reconcileDailyDealHunterJob({
+    storage: exactLocal,
+    jobKey,
+    markerDir: '',
+    now: new Date('2026-07-15T16:01:00.000Z'),
+    providerLookup: lookupFailure,
+  });
+  assert.equal(exactResult.status, 'completed');
+  assert.equal(exactResult.source, 'local-event');
+  assert.equal(exactLocal.run.provider_message_id, providerId);
 });
 
 test('matching local email event reconciles provider acceptance without a send', async () => {

@@ -3,7 +3,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
-import { verifyDailyDealHunterEmailEnvelope } from './dailyDealHunterDigest.js';
+import {
+  canonicalDailyDealHunterMailbox,
+  verifyDailyDealHunterEmailEnvelope,
+} from './dailyDealHunterDigest.js';
 
 export const DAILY_DEAL_HUNTER_RECONCILIATION_WINDOW_MS = 60 * 60 * 1000;
 const MAX_RECONCILIATION_EVENTS = 100;
@@ -18,6 +21,12 @@ function boundedText(value = '', maximum = 500) {
 
 function isRecord(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function providerIdentity(value) {
+  if (typeof value !== 'string') return '';
+  const normalized = value.trim();
+  return /^[A-Za-z0-9_.:@-]{1,240}$/.test(normalized) ? normalized : '';
 }
 
 function eventTags(event = {}) {
@@ -71,7 +80,7 @@ function normalizedMarker(evidence = {}) {
     businessDate: boundedText(evidence.businessDate, 20),
     notificationType: boundedText(evidence.notificationType, 40),
     payloadDigest: boundedText(evidence.payloadDigest, 64),
-    providerMessageId: boundedText(evidence.providerMessageId, 240),
+    providerMessageId: providerIdentity(evidence.providerMessageId),
     acceptedAt: boundedText(evidence.acceptedAt, 40),
   };
   if (marker.version !== 1
@@ -128,7 +137,7 @@ function exactMarker(marker, authority) {
 function exactEvent(event, authority, { signedWebhook = false } = {}) {
   const tags = eventTags(event);
   const tracking = isRecord(event.metadata?.tracking) ? event.metadata.tracking : {};
-  const providerId = boundedText(event.message_id || event.provider_message_id || event.metadata?.resendEmailId, 240);
+  const providerId = providerIdentity(event.message_id || event.provider_message_id || event.metadata?.resendEmailId);
   if (!providerId
     || boundedText(event.provider, 60).toLowerCase() !== 'resend'
     || !acceptedEventTypes.has(boundedText(event.event_type, 80).toLowerCase())
@@ -143,8 +152,8 @@ function exactEvent(event, authority, { signedWebhook = false } = {}) {
     return null;
   }
   if (signedWebhook && (!event.provider_event_id || !event.metadata?.svixId)) return null;
-  if (event.recipient_email && boundedText(event.recipient_email, 320).toLowerCase()
-    !== boundedText(authority.envelope.to, 320).match(/<?([^<>\s]+@[^<>\s]+)>?/)?.[1]?.toLowerCase()) {
+  if (event.recipient_email && canonicalDailyDealHunterMailbox(event.recipient_email)
+    !== canonicalDailyDealHunterMailbox(authority.envelope.to)) {
     return null;
   }
   if (event.subject && boundedText(event.subject, 300) !== authority.envelope.subject) return null;
@@ -159,12 +168,12 @@ function exactEvent(event, authority, { signedWebhook = false } = {}) {
 function exactProviderCandidate(candidate, authority, now) {
   const tags = eventTags({ metadata: { tags: candidate?.tags } });
   const recipients = Array.isArray(candidate?.to) ? candidate.to : [candidate?.to];
-  const recipient = boundedText(authority.envelope.to, 320).match(/<?([^<>\s]+@[^<>\s]+)>?/)?.[1]?.toLowerCase() || '';
+  const recipient = canonicalDailyDealHunterMailbox(authority.envelope.to);
   const candidateTime = Date.parse(candidate?.createdAt || candidate?.created_at || '');
   const earliest = Date.parse(authority.envelope.preparedAt) - 5 * 60 * 1000;
   const latest = now.getTime() + 5 * 60 * 1000;
-  if (!boundedText(candidate?.id, 240)
-    || !recipients.map((value) => boundedText(value, 320).toLowerCase()).includes(recipient)
+  if (!providerIdentity(candidate?.id)
+    || !recipients.map(canonicalDailyDealHunterMailbox).includes(recipient)
     || boundedText(candidate?.subject, 300) !== authority.envelope.subject
     || !Number.isFinite(candidateTime) || candidateTime < earliest || candidateTime > latest
     || tags.get('source') !== 'daily-deal-hunter'
@@ -173,12 +182,20 @@ function exactProviderCandidate(candidate, authority, now) {
     || tags.get('payload_digest') !== authority.payloadDigest) {
     return null;
   }
-  return { providerMessageId: boundedText(candidate.id, 240), acceptedAt: new Date(candidateTime).toISOString() };
+  return { providerMessageId: providerIdentity(candidate.id), acceptedAt: new Date(candidateTime).toISOString() };
 }
 
 async function markAmbiguous({ storage, run, authority, nowIso, errorCategory, reason }) {
+  const severity = errorCategory === 'conflicting-provider-evidence' ? 'high' : 'warning';
   if (run.status === 'ambiguous') {
-    return { status: 'ambiguous', source: '', reason: errorCategory, jobRun: run };
+    return {
+      status: 'ambiguous',
+      source: '',
+      reason: errorCategory,
+      severity,
+      attentionRequired: true,
+      jobRun: run,
+    };
   }
   const transition = await storage.transitionScheduledJob({
     jobKey: run.job_key,
@@ -192,7 +209,7 @@ async function markAmbiguous({ storage, run, authority, nowIso, errorCategory, r
       reconciliation: {
         checkedAt: nowIso,
         errorCategory,
-        severity: errorCategory === 'conflicting-provider-evidence' ? 'high' : 'warning',
+        severity,
       },
     },
   });
@@ -200,6 +217,8 @@ async function markAmbiguous({ storage, run, authority, nowIso, errorCategory, r
     status: transition.run?.status || 'ambiguous',
     source: '',
     reason: errorCategory,
+    severity,
+    attentionRequired: true,
     jobRun: transition.run || run,
   };
 }
@@ -242,7 +261,7 @@ async function completeFromEvidence({ storage, run, authority, evidence, source,
 }
 
 function completedEvidence(run) {
-  const providerMessageId = boundedText(run.provider_message_id, 240);
+  const providerMessageId = providerIdentity(run.provider_message_id);
   const acceptedAt = run.metadata?.acceptedAt || run.completed_at || run.updated_at;
   return providerMessageId && Number.isFinite(Date.parse(acceptedAt))
     ? { providerMessageId, acceptedAt: new Date(acceptedAt).toISOString() }
@@ -281,62 +300,86 @@ export async function reconcileDailyDealHunterJob({
     return { status: run.status, source: '', reason: '', jobRun: run };
   }
 
+  const evidence = [];
   if (markerResult.status === 'valid' && exactMarker(markerResult.marker, authority)) {
-    return completeFromEvidence({ storage, run, authority, evidence: {
+    evidence.push({
+      source: 'marker',
       providerMessageId: markerResult.marker.providerMessageId,
       acceptedAt: markerResult.marker.acceptedAt,
-    }, source: 'marker', now, markerDir });
+    });
   }
 
   const localEvents = await storage.listEmailEvents?.({ source: 'daily-deal-hunter', limit: MAX_RECONCILIATION_EVENTS }) || [];
   const localMatches = localEvents.map((event) => exactEvent(event, authority)).filter(Boolean);
-  const localIds = [...new Set(localMatches.map((item) => item.providerMessageId))];
-  if (localIds.length === 1) {
-    return completeFromEvidence({ storage, run, authority, evidence: localMatches.find((item) => item.providerMessageId === localIds[0]), source: 'local-event', now, markerDir });
-  }
-  if (localIds.length > 1) {
-    return markAmbiguous({ storage, run, authority, nowIso: now.toISOString(), errorCategory: 'conflicting-provider-evidence', reason: 'Multiple exact local provider identities require review.' });
-  }
+  evidence.push(...localMatches.map((item) => ({ ...item, source: 'local-event' })));
 
   const webhookEvents = await storage.listEmailEvents?.({ source: 'webhook', limit: MAX_RECONCILIATION_EVENTS }) || [];
   const webhookMatches = webhookEvents.map((event) => exactEvent(event, authority, { signedWebhook: true })).filter(Boolean);
-  const webhookIds = [...new Set(webhookMatches.map((item) => item.providerMessageId))];
-  if (webhookIds.length === 1) {
-    return completeFromEvidence({ storage, run, authority, evidence: webhookMatches.find((item) => item.providerMessageId === webhookIds[0]), source: 'signed-webhook', now, markerDir });
-  }
-  if (webhookIds.length > 1) {
-    return markAmbiguous({ storage, run, authority, nowIso: now.toISOString(), errorCategory: 'conflicting-provider-evidence', reason: 'Multiple exact webhook provider identities require review.' });
+  evidence.push(...webhookMatches.map((item) => ({ ...item, source: 'signed-webhook' })));
+
+  let providerLookupUnavailable = false;
+  if (typeof providerLookup === 'function') {
+    try {
+      const candidates = await providerLookup({
+        envelope: authority.envelope,
+        jobKey,
+        businessDate: authority.businessDate,
+        maximumCandidates: MAX_PROVIDER_CANDIDATES,
+      });
+      const matches = (Array.isArray(candidates) ? candidates : [])
+        .slice(0, MAX_PROVIDER_CANDIDATES)
+        .map((candidate) => exactProviderCandidate(candidate, authority, now))
+        .filter(Boolean);
+      evidence.push(...matches.map((item) => ({ ...item, source: 'provider-lookup' })));
+    } catch {
+      providerLookupUnavailable = true;
+    }
   }
 
-  if (typeof providerLookup === 'function') {
-    const candidates = await providerLookup({
-      envelope: authority.envelope,
-      jobKey,
-      businessDate: authority.businessDate,
-      maximumCandidates: MAX_PROVIDER_CANDIDATES,
+  const providerIds = [...new Set(evidence.map((item) => item.providerMessageId))];
+  if (providerIds.length > 1) {
+    return markAmbiguous({
+      storage,
+      run,
+      authority,
+      nowIso: now.toISOString(),
+      errorCategory: 'conflicting-provider-evidence',
+      reason: 'Multiple exact provider identities require review.',
     });
-    const matches = (Array.isArray(candidates) ? candidates : [])
-      .slice(0, MAX_PROVIDER_CANDIDATES)
-      .map((candidate) => exactProviderCandidate(candidate, authority, now))
-      .filter(Boolean);
-    const providerIds = [...new Set(matches.map((item) => item.providerMessageId))];
-    if (providerIds.length === 1) {
-      return completeFromEvidence({ storage, run, authority, evidence: matches.find((item) => item.providerMessageId === providerIds[0]), source: 'provider-lookup', now, markerDir });
-    }
-    if (providerIds.length > 1) {
-      return markAmbiguous({ storage, run, authority, nowIso: now.toISOString(), errorCategory: 'conflicting-provider-evidence', reason: 'Multiple exact provider identities require review.' });
-    }
+  }
+  if (providerIds.length === 1) {
+    const accepted = evidence.find((item) => item.providerMessageId === providerIds[0]);
+    return completeFromEvidence({
+      storage,
+      run,
+      authority,
+      evidence: accepted,
+      source: accepted.source,
+      now,
+      markerDir,
+    });
   }
 
   const boundaryAt = Date.parse(run.metadata?.providerBoundaryAt || run.updated_at || run.started_at || '');
   if (run.status === 'transmitting' && Number.isFinite(boundaryAt)
     && now.getTime() - boundaryAt >= DAILY_DEAL_HUNTER_RECONCILIATION_WINDOW_MS) {
-    return markAmbiguous({ storage, run, authority, nowIso: now.toISOString(), errorCategory: 'no-provider-proof', reason: 'No exact provider acceptance proof was found during the reconciliation window.' });
+    return markAmbiguous({
+      storage,
+      run,
+      authority,
+      nowIso: now.toISOString(),
+      errorCategory: providerLookupUnavailable ? 'provider-lookup-unavailable' : 'no-provider-proof',
+      reason: providerLookupUnavailable
+        ? 'Provider reconciliation lookup was unavailable after the evidence window.'
+        : 'No exact provider acceptance proof was found during the reconciliation window.',
+    });
   }
   return {
     status: run.status,
     source: '',
-    reason: markerResult.status === 'valid' ? 'marker-mismatch' : 'awaiting-provider-proof',
+    reason: providerLookupUnavailable
+      ? 'provider-lookup-unavailable'
+      : markerResult.status === 'valid' ? 'marker-mismatch' : 'awaiting-provider-proof',
     jobRun: run,
   };
 }

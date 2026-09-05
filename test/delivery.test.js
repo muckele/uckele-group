@@ -361,6 +361,47 @@ test('daily digest accepted response without provider id is ambiguous', async ()
   assert.equal(result.errorCategory, 'missing-provider-id');
 });
 
+test('daily digest rejects malformed and conflicting provider acceptance identities', async () => {
+  const message = buildDailyDealHunterEmailEnvelope({
+    projection: taskThreeProjection(), recipient: 'digest@example.test', sender: 'sender@example.test',
+  });
+  const invalidResponses = [
+    ['boolean id', { id: true }],
+    ['numeric id', { id: 123 }],
+    ['array id', { id: ['abc'] }],
+    ['object id', { id: {} }],
+    ['empty id', { id: '' }],
+    ['whitespace id', { id: '   ' }],
+    ['conflicting aliases', { id: 'accepted-a', email_id: 'accepted-b' }],
+  ];
+
+  for (const [label, providerBody] of invalidResponses) {
+    const result = await sendPreparedMessage(message, {
+      configOverride: taskThreeDeliveryConfig(),
+      fetcher: async () => new Response(JSON.stringify(providerBody), { status: 200 }),
+    });
+    assert.equal(result.status, 'ambiguous', label);
+    assert.equal(result.provider, 'resend', label);
+    assert.equal(result.providerMessageId, '', label);
+    assert.notEqual(result.definitiveFailure, true, label);
+  }
+
+  const accepted = await sendPreparedMessage(message, {
+    configOverride: taskThreeDeliveryConfig(),
+    fetcher: async () => new Response(JSON.stringify({
+      id: 'resend-canonical-accepted-1',
+      email_id: 'resend-canonical-accepted-1',
+    }), { status: 200 }),
+  });
+  assert.deepEqual(accepted, {
+    status: 'sent',
+    error: '',
+    errorCategory: '',
+    provider: 'resend',
+    providerMessageId: 'resend-canonical-accepted-1',
+  });
+});
+
 test('daily digest authoritative nonacceptance is definitive failure', async () => {
   const message = buildDailyDealHunterEmailEnvelope({
     projection: taskThreeProjection(), recipient: 'digest@example.test', sender: 'sender@example.test',

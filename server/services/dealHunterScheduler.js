@@ -22,6 +22,82 @@ const dailyEmailSource = 'daily-deal-hunter';
 const dailyEmailJobName = 'daily-deal-hunter-email';
 const dailyEmailClaimStaleMs = 60 * 60 * 1000;
 
+function boundedProviderIdentity(value) {
+  if (typeof value !== 'string') return '';
+  const normalized = value.trim();
+  return /^[A-Za-z0-9_.:@-]{1,240}$/.test(normalized) ? normalized : '';
+}
+
+function acceptedResendProviderIdentity(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)
+    || result.status !== 'sent'
+    || result.provider !== 'resend') {
+    return '';
+  }
+  const providerMessageId = boundedProviderIdentity(result.providerMessageId);
+  if (!providerMessageId) return '';
+  for (const alias of ['id', 'email_id']) {
+    if (Object.hasOwn(result, alias) && boundedProviderIdentity(result[alias]) !== providerMessageId) {
+      return '';
+    }
+  }
+  return providerMessageId;
+}
+
+function boundedIsoTimestamp(value) {
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) return '';
+  return new Date(value).toISOString();
+}
+
+function boundedStatusText(value, maximum) {
+  return typeof value === 'string'
+    ? value.replace(/\s+/g, ' ').trim().slice(0, maximum)
+    : '';
+}
+
+export function projectDailyDealHunterJobStatus(run) {
+  if (!run || typeof run !== 'object' || Array.isArray(run)) return null;
+  const metadata = run.metadata && typeof run.metadata === 'object' && !Array.isArray(run.metadata)
+    ? run.metadata
+    : {};
+  const reconciliation = metadata.reconciliation
+    && typeof metadata.reconciliation === 'object'
+    && !Array.isArray(metadata.reconciliation)
+    ? metadata.reconciliation
+    : {};
+  const status = boundedStatusText(run.status, 40);
+  const attemptCount = Number.isInteger(run.attempt_count) && run.attempt_count >= 0
+    ? run.attempt_count
+    : 0;
+  const completedAt = boundedIsoTimestamp(run.completed_at);
+  const projectedReconciliation = {
+    checkedAt: boundedIsoTimestamp(reconciliation.checkedAt),
+    source: boundedStatusText(reconciliation.source || metadata.reconciliationSource, 80),
+    errorCategory: boundedStatusText(reconciliation.errorCategory, 120),
+    severity: boundedStatusText(reconciliation.severity, 20),
+  };
+  return {
+    status,
+    notificationType: boundedStatusText(metadata.notificationType, 40),
+    businessDate: boundedStatusText(metadata.businessDate || metadata.pacificDate || metadata.dateKey, 20),
+    attemptCount,
+    attempt_count: attemptCount,
+    completedAt,
+    completed_at: completedAt,
+    failedAt: boundedIsoTimestamp(metadata.failedAt),
+    nextRetryAt: boundedIsoTimestamp(metadata.nextRetryAt),
+    provider: boundedStatusText(metadata.provider, 40),
+    providerMessageId: boundedProviderIdentity(run.provider_message_id),
+    errorCategory: boundedStatusText(
+      reconciliation.errorCategory || metadata.failureCategory,
+      120,
+    ),
+    reconciliation: projectedReconciliation,
+    prepared: Boolean(metadata.preparedEnvelope),
+    attentionRequired: status === 'ambiguous' || projectedReconciliation.severity === 'high',
+  };
+}
+
 function parseScheduleTime(value = '08:00') {
   const match = String(value || '').match(/^(\d{2}):(\d{2})$/);
   if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) return null;
@@ -80,6 +156,7 @@ export async function runClaimedDailyDealHunterEmail({
   configOverride,
   enforceDueTime = false,
   markerDir,
+  getNow = () => new Date(),
 } = {}) {
   const config = configOverride || getConfig();
   const schedule = config.dealHunter.dailyEmail;
@@ -177,7 +254,9 @@ export async function runClaimedDailyDealHunterEmail({
       emailResult: {
         status: resultStatus,
         error: '',
-        errorCategory: '',
+        errorCategory: ['transmitting', 'ambiguous'].includes(status)
+          ? boundedStatusText(reconciliation?.reason, 120)
+          : '',
         providerMessageId: claim.run?.provider_message_id || '',
       },
       review: null,
@@ -294,11 +373,10 @@ export async function runClaimedDailyDealHunterEmail({
     };
   }
 
-  const acceptedProviderId = emailResult.status === 'sent' && emailResult.providerMessageId
-    ? String(emailResult.providerMessageId).slice(0, 240)
-    : emailResult.status === 'logged' && !config.isProduction
+  const acceptedProviderId = acceptedResendProviderIdentity(emailResult)
+    || (emailResult.status === 'logged' && emailResult.provider === 'console' && !config.isProduction
       ? `development-only-${dateKey}`
-      : '';
+      : '');
   if (acceptedProviderId) {
     const acceptedAt = nowIso;
     const evidence = {
@@ -378,12 +456,16 @@ export async function runClaimedDailyDealHunterEmail({
   }
 
   if (emailResult.status === 'failed' && emailResult.definitiveFailure === true) {
+    const failureNow = getNow();
+    const failureNowIso = failureNow instanceof Date && Number.isFinite(failureNow.getTime())
+      ? failureNow.toISOString()
+      : nowIso;
     const failed = await storage.transitionScheduledJob({
       jobKey,
       claimToken,
       expectedStatuses: ['transmitting'],
       status: 'failed',
-      nowIso,
+      nowIso: failureNowIso,
       lastError: String(emailResult.errorCategory || 'provider-nonacceptance').slice(0, 200),
       metadataPatch: { failureCategory: emailResult.errorCategory || 'provider-nonacceptance' },
     });
@@ -413,7 +495,17 @@ export async function runClaimedDailyDealHunterEmail({
     notificationType: envelope.notificationType,
     emailResult: afterAmbiguity?.status === 'completed'
       ? { status: 'already-sent', error: '', errorCategory: '', providerMessageId: afterAmbiguity.jobRun?.provider_message_id || '' }
-      : { ...emailResult, status: 'ambiguous', providerMessageId: emailResult.providerMessageId || '', errorCategory: emailResult.errorCategory || 'provider-outcome-unknown' },
+      : {
+          ...emailResult,
+          status: 'ambiguous',
+          providerMessageId: '',
+          errorCategory: boundedStatusText(
+            afterAmbiguity?.reason
+              || emailResult.errorCategory
+              || (emailResult.status === 'sent' ? 'invalid-provider-acceptance' : 'provider-outcome-unknown'),
+            120,
+          ),
+        },
     review: projection,
   };
 }
@@ -425,7 +517,8 @@ export async function getDailyDealHunterJobStatus(now = new Date()) {
     timezone: config.dealHunter.dailyEmail.timezone,
     scheduleTime: config.dealHunter.dailyEmail.time,
   });
-  return getStorage().getScheduledJob(`${dailyEmailJobName}:${dateKey}`);
+  const run = await getStorage().getScheduledJob(`${dailyEmailJobName}:${dateKey}`);
+  return projectDailyDealHunterJobStatus(run);
 }
 
 export function startDealHunterDailyEmailScheduler({
@@ -476,7 +569,7 @@ export function startDealHunterDailyEmailScheduler({
 
     try {
       console.log(`[deal-hunter:scheduler] sending daily email for ${dateKey} at ${schedule.time} ${schedule.timezone}`);
-      const result = await runEmail({ triggeredBy: 'scheduler', now });
+      const result = await runEmail({ triggeredBy: 'scheduler', now, getNow });
 
       if (result.alreadySent) {
         sentDates.add(dateKey);

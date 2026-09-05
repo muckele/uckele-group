@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync } from 'node:fs';
+import { accessSync, constants, existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -336,7 +336,8 @@ export function validateConfig(config = getConfig()) {
       candidate = parent;
     }
     try {
-      accessSync(candidate, constants.W_OK);
+      if (!statSync(candidate).isDirectory()) return false;
+      accessSync(candidate, constants.W_OK | constants.X_OK);
       return true;
     } catch {
       return false;

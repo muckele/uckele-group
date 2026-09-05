@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { validateConfig } from '../server/config.js';
@@ -107,6 +109,38 @@ test('daily digest config accepts 08:00 America Los Angeles and rejects invalid 
   config.dealHunter.dailyEmail.time = '08:00';
   config.dealHunter.dailyEmail.timezone = 'Not/A-Timezone';
   assert.ok(validateConfig(config).errors.some((error) => error.includes('DEAL_HUNTER_DAILY_EMAIL_TIMEZONE')));
+});
+
+test('daily digest marker readiness rejects regular-file ancestors', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'daily-digest-marker-readiness-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const regularFile = path.join(root, 'not-a-directory');
+  fs.writeFileSync(regularFile, 'test-only marker ancestor');
+
+  const configured = (markerDir) => {
+    const config = productionConfig();
+    config.dealHunter.recipient = 'digest@example.test';
+    config.dealHunter.dailyEmail = {
+      enabled: true,
+      timezone: 'America/Los_Angeles',
+      time: '08:00',
+      checkIntervalMs: 60_000,
+      retryIntervalMs: 1_800_000,
+      markerDir,
+    };
+    return config;
+  };
+  const markerError = (markerDir) => validateConfig(configured(markerDir)).errors
+    .some((error) => error.includes('DEAL_HUNTER_DAILY_EMAIL_MARKER_DIR'));
+
+  assert.equal(markerError(regularFile), true, 'an existing regular-file target must fail readiness');
+  assert.equal(markerError(path.join(regularFile, 'child')), true, 'a child beneath a regular file must fail readiness');
+  assert.equal(validateConfig(configured(root)).ok, true, 'an existing writable directory remains ready');
+  assert.equal(
+    validateConfig(configured(path.join(root, 'missing', 'descendant'))).ok,
+    true,
+    'missing descendants beneath a writable directory remain ready',
+  );
 });
 
 test('daily digest enablement is independent of every CIM follow-up and Stage 2 flag', () => {

@@ -7,6 +7,7 @@ import {
   applyEmailLifecycleToCommunication,
   ingestResendReceivedEmail,
 } from './communications.js';
+import { canonicalDailyDealHunterMailbox } from './dailyDealHunterDigest.js';
 import { reconcileDailyDealHunterWebhookEvent } from './dailyDealHunterReconciliation.js';
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -387,9 +388,11 @@ function exactDailyDealHunterWebhookEvidence(event) {
 }
 
 export async function recordEmailEvent(input, { storage = getStorage() } = {}) {
-  const recipientEmail = normalizeEmail(input.recipient_email || input.recipientEmail);
   const eventType = normalizeEmailEventType(input.event_type || input.eventType);
   const internalDailyDigest = hasDailyDealHunterTagIdentity(input);
+  const recipientEmail = internalDailyDigest
+    ? canonicalDailyDealHunterMailbox(input.recipient_email || input.recipientEmail)
+    : normalizeEmail(input.recipient_email || input.recipientEmail);
   const explicitSubmissionId = internalDailyDigest
     ? ''
     : normalizeText(input.submission_id || input.submissionId, 80);

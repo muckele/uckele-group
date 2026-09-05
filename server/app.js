@@ -153,9 +153,27 @@ function requireDealHunterCron(request, config) {
   return Boolean(config.dealHunter.cronSecret && providedSecret && safeCompareText(providedSecret, config.dealHunter.cronSecret));
 }
 
-function hasStrictEmptyBody(body) {
-  return body === undefined
-    || (Boolean(body) && typeof body === 'object' && !Array.isArray(body) && Object.keys(body).length === 0);
+function hasStrictEmptyBody(request) {
+  const body = request?.body;
+  if (Buffer.isBuffer(body)) {
+    if (body.length === 0) return true;
+    const contentType = String(request.headers?.['content-type'] || '').split(';')[0].trim().toLowerCase();
+    if (contentType !== 'application/json') return false;
+    try {
+      const parsed = JSON.parse(body.toString('utf8'));
+      return Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed)
+        && Object.keys(parsed).length === 0;
+    } catch {
+      return false;
+    }
+  }
+  if (body === undefined) {
+    const contentLength = String(request.headers?.['content-length'] || '').trim();
+    const transferEncoding = String(request.headers?.['transfer-encoding'] || '').trim();
+    return (!contentLength || contentLength === '0') && !transferEncoding;
+  }
+  return Boolean(body) && typeof body === 'object' && !Array.isArray(body)
+    && Object.keys(body).length === 0;
 }
 
 function dailyDealHunterHttpStatus(status) {
@@ -458,6 +476,10 @@ export function createApp({
     type: () => true,
     limit: config.dealHunter.dealOsExportMaxPayloadBytes,
   });
+  const strictEmptyDigestBodyParser = express.raw({
+    type: () => true,
+    limit: '1kb',
+  });
   let activeSecureUploads = 0;
 
   app.disable('x-powered-by');
@@ -597,6 +619,16 @@ export function createApp({
         return;
       }
       dealOsRawParser(request, response, next);
+    },
+  );
+  app.use(
+    ['/api/admin/deal-hunter/send', '/api/deal-hunter/daily-email'],
+    (request, response, next) => {
+      if (request.method !== 'POST') {
+        next();
+        return;
+      }
+      strictEmptyDigestBodyParser(request, response, next);
     },
   );
   app.use(express.json(jsonParserOptions('512kb')));
@@ -1868,7 +1900,7 @@ export function createApp({
         return;
       }
 
-      if (!hasStrictEmptyBody(request.body)) {
+      if (!hasStrictEmptyBody(request)) {
         response.status(400).json({ success: false, error: 'Daily Deal Hunter accepts an empty request body only.' });
         return;
       }
@@ -2258,7 +2290,7 @@ export function createApp({
         return;
       }
 
-      if (!hasStrictEmptyBody(request.body)) {
+      if (!hasStrictEmptyBody(request)) {
         response.status(400).json({ success: false, error: 'Daily Deal Hunter accepts an empty request body only.' });
         return;
       }

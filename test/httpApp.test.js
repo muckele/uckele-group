@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -37,6 +38,29 @@ async function withServer(run, app = createApp()) {
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
+}
+
+async function postChunked(url, { headers = {}, body = '' } = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const request = httpRequest({
+      hostname: target.hostname,
+      port: target.port,
+      path: target.pathname,
+      method: 'POST',
+      headers,
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve({
+        status: response.statusCode,
+        body: Buffer.concat(chunks).toString('utf8'),
+      }));
+    });
+    request.once('error', reject);
+    request.write(body);
+    request.end();
+  });
 }
 
 async function signInForCookie(_origin, credentials = { username: 'admin', password: 'change-me-now' }) {
@@ -288,6 +312,169 @@ test('daily digest routes return completed active retry-not-due failed and ambig
       assert.doesNotMatch(JSON.stringify(payload), /metadata|preparedEnvelope|recipient/);
     }, app);
   }
+});
+
+test('daily digest privileged routes reject unsupported nonempty wire bodies', async () => {
+  let runnerCalls = 0;
+  const app = createApp({
+    dailyDealHunterRunner: async () => {
+      runnerCalls += 1;
+      return {
+        jobKey: 'daily-deal-hunter-email:2026-07-15',
+        notificationType: 'normal-digest',
+        emailResult: { status: 'sent', provider: 'resend', providerMessageId: 'wire-body-test-1' },
+        jobRun: { status: 'completed' },
+      };
+    },
+  });
+  await withServer(async (origin) => {
+    const adminCookie = await signInForCookie(origin);
+    const routes = [
+      ['/api/admin/deal-hunter/send', { Cookie: adminCookie }],
+      ['/api/deal-hunter/daily-email', { 'X-Deal-Hunter-Secret': 'task-three-cron-secret' }],
+    ];
+
+    for (const [route, authorization] of routes) {
+      for (const contentType of ['text/plain', 'application/octet-stream']) {
+        const response = await fetch(`${origin}${route}`, {
+          method: 'POST',
+          headers: { ...authorization, 'Content-Type': contentType },
+          body: 'nonempty privileged trigger payload',
+        });
+        assert.ok([400, 415].includes(response.status), `${route} ${contentType}`);
+      }
+      const chunked = await postChunked(`${origin}${route}`, {
+        headers: { ...authorization, 'Content-Type': 'text/plain' },
+        body: 'chunked nonempty privileged trigger payload',
+      });
+      assert.ok([400, 415].includes(chunked.status), `${route} chunked`);
+    }
+    assert.equal(runnerCalls, 0);
+
+    for (const [route, authorization] of routes) {
+      const empty = await fetch(`${origin}${route}`, { method: 'POST', headers: authorization });
+      assert.ok([200, 409].includes(empty.status), `${route} truly empty`);
+      const emptyJson = await fetch(`${origin}${route}`, {
+        method: 'POST',
+        headers: { ...authorization, 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      assert.ok([200, 409].includes(emptyJson.status), `${route} exact empty JSON object`);
+      const property = await fetch(`${origin}${route}`, {
+        method: 'POST',
+        headers: { ...authorization, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ unexpected: true }),
+      });
+      assert.equal(property.status, 400, `${route} JSON property`);
+    }
+    assert.equal(runnerCalls, 4);
+  }, app);
+});
+
+test('daily digest browser responses exclude the raw prepared envelope and job metadata', async () => {
+  const storage = getStorage();
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
+  });
+  const dateParts = Object.fromEntries(formatter.formatToParts(now).map((part) => [part.type, part.value]));
+  const businessDate = `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
+  const jobKey = `daily-deal-hunter-email:${businessDate}`;
+  const nowIso = now.toISOString();
+  const sentinels = {
+    recipient: 'sentinel-recipient@example.test',
+    sender: 'sentinel-sender@example.test',
+    subject: 'SENTINEL PRIVATE SUBJECT',
+    text: 'SENTINEL PRIVATE TEXT BODY',
+    html: '<strong>SENTINEL PRIVATE HTML BODY</strong>',
+    claimToken: 'http-sensitive-claim-token-0001',
+    rawMetadata: 'SENTINEL RAW METADATA',
+  };
+  const claim = await storage.claimScheduledJob({
+    jobKey,
+    jobName: 'daily-deal-hunter-email',
+    triggeredBy: 'test',
+    claimToken: sentinels.claimToken,
+    nowIso,
+    staleBefore: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+    retryDueAt: nowIso,
+    metadata: {
+      businessDate,
+      notificationType: 'normal-digest',
+      rawMetadata: sentinels.rawMetadata,
+      recipient: sentinels.recipient,
+      preparedEnvelope: {
+        to: sentinels.recipient,
+        from: sentinels.sender,
+        subject: sentinels.subject,
+        text: sentinels.text,
+        html: sentinels.html,
+        idempotencyKey: jobKey,
+      },
+    },
+  });
+  assert.equal(claim.applied, true);
+
+  await withServer(async (origin) => {
+    const adminCookie = await signInForCookie(origin);
+    const viewerCookie = await signInForCookie(origin, {
+      username: 'smb-deal-hunter', password: 'view-only-local',
+    });
+    const payloads = [];
+
+    for (const cookie of [adminCookie, viewerCookie]) {
+      const response = await fetch(`${origin}/api/admin/deal-hunter/review`, { headers: { Cookie: cookie } });
+      assert.equal(response.status, 200);
+      payloads.push(await response.json());
+    }
+
+    const csv = Buffer.from([
+      'Listing ID,Business Name,View Listing URL,SDE',
+      'HTTP-SAFE-STATUS-1,Safe Status Fixture,https://broker.example/http-safe-status,425000',
+    ].join('\n'));
+    const imported = await fetch(`${origin}/api/admin/deal-hunter/deal-os-import`, {
+      method: 'POST',
+      headers: {
+        Cookie: adminCookie,
+        'Content-Type': 'text/csv',
+        'X-Deal-OS-File-Name': encodeURIComponent('deal-os-safe-status.csv'),
+        'X-Deal-OS-Exported-At': nowIso,
+        'X-Deal-OS-Scope': 'saved-search',
+        'X-Deal-OS-Coverage-Label': encodeURIComponent('Daily digest status projection test'),
+        'X-Deal-OS-Expected-Row-Count': '1',
+      },
+      body: csv,
+    });
+    assert.equal(imported.status, 201);
+    payloads.push(await imported.json());
+
+    const backfill = await fetch(`${origin}/api/admin/deal-hunter/backfill-review`, {
+      method: 'POST', headers: { Cookie: adminCookie },
+    });
+    assert.equal(backfill.status, 200);
+    payloads.push(await backfill.json());
+
+    const crmSync = await fetch(`${origin}/api/admin/deal-hunter/crm-sync`, {
+      method: 'POST',
+      headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        confirmation: 'SYNC HIGH FITS',
+        expectedDealKeys: ['source:test:nonexistent-safe-status'],
+        reviewMode: 'daily',
+      }),
+    });
+    assert.ok([400, 409, 503].includes(crmSync.status));
+    payloads.push(await crmSync.json());
+
+    const serialized = JSON.stringify(payloads);
+    assert.doesNotMatch(serialized, /preparedEnvelope/);
+    for (const [label, sentinel] of Object.entries(sentinels)) {
+      assert.equal(serialized.includes(sentinel), false, label);
+    }
+    for (const payload of payloads) {
+      assert.equal(payload.review.dailyEmailJob.status, 'pending');
+    }
+  });
 });
 
 test('readiness checks storage and the document vault', async () => {

@@ -383,12 +383,20 @@ function applicationLinks() {
   };
 }
 
+export function canonicalDailyDealHunterMailbox(value = '') {
+  if (typeof value !== 'string') return '';
+  const normalized = normalizeText(value, 320);
+  if (/^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(normalized)) {
+    return normalized.toLowerCase();
+  }
+  const display = normalized.match(/^[^<>\r\n,]{1,160}<([^<>\s@]+@[^<>\s@]+\.[^<>\s@]+)>$/);
+  return display?.[1]?.toLowerCase() || '';
+}
+
 function envelopeEmail(value = '', { optional = false } = {}) {
   const normalized = normalizeText(value, 320);
   if (!normalized && optional) return '';
-  const plain = /^[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+$/.test(normalized);
-  const display = /^[^<>\r\n,]{1,160}<[^<>\s@]+@[^<>\s@]+\.[^<>\s@]+>$/.test(normalized);
-  if (!plain && !display) {
+  if (!canonicalDailyDealHunterMailbox(normalized)) {
     throw new TypeError('Daily Deal Hunter email authority requires a valid server-owned email address.');
   }
   return normalized;
