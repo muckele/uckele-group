@@ -171,6 +171,23 @@ function queueResponse(overrides = {}) {
     },
     views: ['needs-review', 'high-priority', 'watchlist', 'low-confidence', 'dismissed', 'all'],
     priorities: ['urgent', 'high', 'normal', 'watch'],
+    dailyDigest: digestProjection(),
+    ...overrides,
+  };
+}
+
+function digestProjection(overrides = {}) {
+  return {
+    businessDate: '2026-09-05',
+    generatedAt: '2026-09-05T15:00:00.000Z',
+    status: 'ready',
+    notificationType: 'normal-digest',
+    sourceAuthority: { requiredHealthy: true, blockingIssues: [], optionalWarnings: [] },
+    summary: { needsReview: 4, highPriority: 2, watchlist: 3, lowConfidence: 1, currentOpportunities: 12 },
+    topOpportunities: [],
+    job: { status: 'completed', attemptCount: 1, completedAt: '2026-09-05T15:02:00.000Z', notificationType: 'normal-digest' },
+    actionsAllowed: true,
+    links: { inbox: '/admin/deal-hunter', operations: '/admin/deal-hunter?view=operations' },
     ...overrides,
   };
 }
@@ -294,6 +311,122 @@ describe('Acquisition Inbox dashboard entry', () => {
 });
 
 describe('Acquisition Inbox queue', () => {
+  test('Acquisition Inbox renders the ready morning briefing above filters', async () => {
+    const first = queueRow({ opportunityId: 'server-first', name: 'Server-ranked first', fitScore: 61, operatorPriority: 'urgent' });
+    const second = queueRow({ opportunityId: 'server-second', name: 'Server-ranked second', fitScore: 99 });
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({
+      rows: [first, second], total: 2,
+      dailyDigest: digestProjection({
+        summary: { needsReview: 7, highPriority: 3, watchlist: 2, lowConfidence: 1, currentOpportunities: 12 },
+        topOpportunities: [first, second].map(({ opportunityId, name, state, fitScore, scoreStatus, confidence, operatorPriority, reviewed, changedSinceReview, topStrength, topConcern, workflow, observationFreshness }) => ({ opportunityId, name, state, fitScore, scoreStatus, confidence, operatorPriority, reviewed, changedSinceReview, topStrength, topConcern, workflow, observationFreshness })),
+      }),
+    }))));
+
+    const { container } = renderInbox();
+    const briefing = await screen.findByRole('region', { name: 'Morning briefing' });
+    const filter = screen.getByRole('searchbox', { name: 'Search opportunities' });
+
+    expect(briefing.compareDocumentPosition(filter) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(briefing).getByRole('heading', { name: 'Morning briefing' })).toBeVisible();
+    for (const [label, value] of [['Needs Review', '7'], ['High Priority', '3'], ['Watchlist', '2'], ['Low Confidence', '1'], ['Current Opportunities', '12']]) {
+      expect(within(briefing).getByText(label)).toBeVisible();
+      expect(within(briefing).getByText(value)).toBeVisible();
+    }
+    const topItems = within(briefing).getAllByRole('listitem').map((item) => item.textContent);
+    expect(topItems[0]).toContain('Server-ranked first');
+    expect(topItems[1]).toContain('Server-ranked second');
+    expect(container.scrollWidth).toBeLessThanOrEqual(container.clientWidth || container.scrollWidth);
+  });
+
+  test('Acquisition Inbox renders one bounded optional Deal OS warning and usable primary summary', async () => {
+    const row = queueRow();
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({
+      rows: [row], total: 1,
+      dailyDigest: digestProjection({
+        status: 'optional-warning',
+        sourceAuthority: {
+          requiredHealthy: true,
+          blockingIssues: [],
+          optionalWarnings: [{ sourceId: 'deal-os-export', sourceName: 'SMB Deal OS export', classification: 'optional-source-unavailable', title: 'Optional Deal OS context is unavailable', message: 'Optional Deal OS context is currently unavailable.', checkedAt: '2026-09-05T15:00:00.000Z' }],
+        },
+        topOpportunities: [row],
+      }),
+    }))));
+
+    renderInbox();
+    const briefing = await screen.findByRole('region', { name: 'Morning briefing' });
+    expect(within(briefing).getAllByRole('status')).toHaveLength(1);
+    expect(within(briefing).getByText(/Optional Deal OS context is unavailable/)).toBeVisible();
+    expect(within(briefing).getByText('4')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Pursue Evergreen Fire Protection' })).toBeEnabled();
+  });
+
+  test('Acquisition Inbox renders prominent required-source action and hides trusted recommendations', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({
+      rows: [queueRow()], total: 1,
+      dailyDigest: digestProjection({
+        status: 'action-required', notificationType: 'required-source-alert', summary: null, topOpportunities: [], actionsAllowed: false,
+        sourceAuthority: { requiredHealthy: false, optionalWarnings: [], blockingIssues: [{ sourceId: 'sheet-0', sourceName: 'SMB Deal Hunter Google Sheet', classification: 'unavailable', title: 'Required source is unavailable', message: 'Required source data is currently unavailable.', checkedAt: '2026-09-05T15:00:00.000Z' }] },
+      }),
+    }))));
+
+    renderInbox();
+    const briefing = await screen.findByRole('region', { name: 'Morning briefing' });
+    expect(within(briefing).getByText('ACTION REQUIRED')).toBeVisible();
+    expect(within(briefing).getByText(/Required source data is currently unavailable/)).toBeVisible();
+    expect(within(briefing).queryByText('Current Opportunities')).not.toBeInTheDocument();
+    expect(within(briefing).queryByText('Evergreen Fire Protection')).not.toBeInTheDocument();
+  });
+
+  test('required-source state labels persisted rows last-known and disables decision controls', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({
+      rows: [queueRow()], total: 1,
+      dailyDigest: digestProjection({ status: 'action-required', notificationType: 'required-source-alert', summary: null, topOpportunities: [], actionsAllowed: false, sourceAuthority: { requiredHealthy: false, optionalWarnings: [], blockingIssues: [{ sourceId: 'sheet-0', sourceName: 'Required Google Sheet', classification: 'unavailable', title: 'Required source is unavailable', message: 'Required source data is currently unavailable.', checkedAt: '' }] } }),
+    }))));
+
+    renderInbox();
+    expect(await screen.findByText(/last known/i)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Pursue Evergreen Fire Protection' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Pass Evergreen Fire Protection' })).toBeDisabled();
+  });
+
+  test('viewer sees briefing but no mutation or send control', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }))));
+    renderInbox({ readOnly: true });
+
+    expect(await screen.findByRole('region', { name: 'Morning briefing' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: /Pursue|Watch|Pass|Run Daily Digest|Send Daily Digest|Retry Daily Digest/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/Read-only access/)).toBeVisible();
+  });
+
+  test('briefing error fails closed and links to Operations', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse({ success: false, error: 'Unable to load Acquisition Inbox.' }, { ok: false, status: 503 })));
+    renderInbox();
+
+    const briefing = await screen.findByRole('region', { name: 'Morning briefing' });
+    expect(within(briefing).getByText('ACTION REQUIRED')).toBeVisible();
+    expect(within(briefing).getByText(/briefing is unavailable/i)).toBeVisible();
+    expect(within(briefing).getByRole('link', { name: 'Open Operations' })).toHaveAttribute('href', '/admin/deal-hunter?view=operations');
+  });
+
+  test('briefing announces asynchronous source status accessibly without stealing focus', async () => {
+    const response = deferred();
+    vi.stubGlobal('fetch', vi.fn(async () => response.promise));
+    renderInbox();
+    const search = screen.getByRole('searchbox', { name: 'Search opportunities' });
+    search.focus();
+    response.resolve(jsonResponse(queueResponse({
+      dailyDigest: digestProjection({
+        status: 'optional-warning',
+        sourceAuthority: { requiredHealthy: true, blockingIssues: [], optionalWarnings: [{ sourceId: 'deal-os-export', sourceName: 'SMB Deal OS export', classification: 'optional-source-unavailable', title: 'Optional Deal OS context is unavailable', message: 'Optional Deal OS context is currently unavailable.', checkedAt: '' }] },
+      }),
+    })));
+
+    expect(await screen.findByRole('status', { name: /Optional source status/i })).toBeVisible();
+    expect(search).toHaveFocus();
+  });
+
   test('renders the acquisition summary and scan-ready opportunity fields', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ rows: [
       queueRow(),
@@ -359,11 +492,21 @@ describe('Acquisition Inbox queue', () => {
     fireEvent.change(screen.getByRole('searchbox', { name: 'Search opportunities' }), { target: { value: 'current' } });
     await waitFor(() => expect(queueReads).toBe(2));
 
-    await act(async () => first.resolve(jsonResponse(queueResponse({ rows: [queueRow({ opportunityId: 'opp-stale', name: 'Stale Controls Co' })], total: 1, summary: { ...queueResponse().summary, needsReview: 99 } }))));
+    await act(async () => first.resolve(jsonResponse(queueResponse({
+      rows: [queueRow({ opportunityId: 'opp-stale', name: 'Stale Controls Co' })],
+      total: 1,
+      summary: { ...queueResponse().summary, needsReview: 99 },
+      dailyDigest: digestProjection({ summary: { ...digestProjection().summary, needsReview: 99 } }),
+    }))));
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Open Stale Controls Co' })).not.toBeInTheDocument());
     expect(screen.getByText('Loading current opportunities…')).toBeVisible();
 
-    await act(async () => second.resolve(jsonResponse(queueResponse({ rows: [queueRow({ opportunityId: 'opp-current', name: 'Current Controls Co' })], total: 1, summary: { ...queueResponse().summary, needsReview: 7 } }))));
+    await act(async () => second.resolve(jsonResponse(queueResponse({
+      rows: [queueRow({ opportunityId: 'opp-current', name: 'Current Controls Co' })],
+      total: 1,
+      summary: { ...queueResponse().summary, needsReview: 7 },
+      dailyDigest: digestProjection({ summary: { ...digestProjection().summary, needsReview: 7 } }),
+    }))));
     expect(await screen.findByRole('button', { name: 'Open Current Controls Co' })).toBeVisible();
     expect(screen.getByText('7')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Open Current Controls Co' })).toBeVisible();
@@ -624,13 +767,17 @@ describe('Acquisition Inbox queue', () => {
       }
       return jsonResponse(queueResponse({
         rows: [queueRow()], total: 1,
-        sourceHealth: { healthy: false, cached: true, issues: [{ title: 'Deal OS is stale', message: 'The last cached export is stale.' }] },
+        dailyDigest: digestProjection({
+          status: 'optional-warning',
+          sourceAuthority: { requiredHealthy: true, blockingIssues: [], optionalWarnings: [{ sourceId: 'deal-os-export', sourceName: 'SMB Deal OS export', classification: 'optional-source-unavailable', title: 'Optional Deal OS context is unavailable', message: 'Optional Deal OS context is currently unavailable.', checkedAt: '' }] },
+          topOpportunities: [queueRow()],
+        }),
       }));
     }));
 
     renderInbox();
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(/Deal OS is stale.*last cached export is stale/i);
+    expect(await screen.findByRole('status', { name: /Optional source status/i })).toHaveTextContent(/Optional Deal OS context is unavailable/i);
     expect(screen.getByRole('button', { name: 'Open Evergreen Fire Protection' })).toBeEnabled();
     fireEvent.change(screen.getByRole('searchbox', { name: 'Search opportunities' }), { target: { value: 'evergreen' } });
     fireEvent.click(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }));

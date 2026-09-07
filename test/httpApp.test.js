@@ -12,6 +12,7 @@ process.env.ADMIN_SESSION_SECRET = 'http-app-session-secret-for-tests';
 process.env.SECURE_DOCUMENTS_TOKEN_SECRET = 'http-app-document-secret-for-tests';
 process.env.SQLITE_PATH = path.join(tempDir, 'http-app.sqlite');
 process.env.SECURE_DOCUMENTS_STORAGE_DIR = path.join(tempDir, 'secure-documents');
+process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH = path.join(tempDir, 'task-four-source-health.json');
 process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
 process.env.DEAL_HUNTER_CRON_SECRET = 'task-three-cron-secret';
 delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
@@ -92,6 +93,52 @@ async function signInForCookie(_origin, credentials = { username: 'admin', passw
   if (isViewer) taskThreeViewerCookie = cookie;
   else taskThreeAdminCookie = cookie;
   return cookie;
+}
+
+function writeTaskFourSourceSnapshot({ requiredHealthy = true, optionalWarning = false } = {}) {
+  const now = new Date();
+  const issues = requiredHealthy ? [] : [{
+    sourceId: 'sheet-0', affectsHealth: true, sourceUnavailable: true,
+    title: 'Required source unavailable', message: 'Private source diagnostic must not be returned.',
+  }];
+  const exportedAt = optionalWarning ? new Date(now.getTime() - 73 * 60 * 60 * 1000).toISOString() : now.toISOString();
+  fs.writeFileSync(process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH, JSON.stringify({
+    generatedAt: now.toISOString(),
+    issues,
+    totals: { reviewedDeals: 1 },
+    sources: {
+      'sheet-0': {
+        rowCount: 1, name: 'SMB Deal Hunter Google Sheet', mode: 'csv', required: true,
+        sourceRole: 'required-primary', checkedAt: now.toISOString(),
+      },
+      'deal-os-export': {
+        rowCount: 1, name: 'SMB Deal OS export', mode: 'manual-export', required: false,
+        sourceRole: 'optional-supplemental', checkedAt: now.toISOString(), exportedAt, maxAgeHours: 72,
+      },
+    },
+  }));
+}
+
+async function seedTaskFourOpportunity(opportunityId) {
+  const storage = getStorage();
+  const now = new Date().toISOString();
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: opportunityId, created_at: now, updated_at: now,
+    canonical_name: 'Task Four HTTP Authority', canonical_recipient: null, canonical_location: 'Los Angeles, CA',
+    primary_submission_id: null, identity_version: 'task-four-http', status: 'active', metadata: {},
+  });
+  await storage.writeDealHunterOpportunityScore({
+    opportunity_id: opportunityId, scored_at: now, deal_key: `deal-${opportunityId}`,
+    name: 'Task Four HTTP Authority', state: 'CA', listing_url: 'https://broker.example/task-four',
+    fit_score: 82, score_status: 'high-fit', confidence: 'high', completeness_score: 90,
+    contradiction_count: 0, missing_evidence_count: 0, should_remove: false, high_fit: true, gate_count: 0,
+    score_fingerprint: `fingerprint-${opportunityId}`, semantic_digest: `digest-${opportunityId}`,
+    engine_version: 'task-four-http', rules_version: 'task-four-http', profile_version: 'task-four-http',
+    completeness_policy_version: 'task-four-http', dimensions: [], gates: [], applied_caps: [], missing_evidence: [],
+    confidence_reasons: [], summary: { strengths: ['Current primary authority'], concerns: ['Needs operator review'] },
+  }, []);
+  await storage.reconcileDealHunterCurrentScoreEligibility([opportunityId]);
+  return storage;
 }
 
 test('protected APIs reject cross-site mutations and disable caching', async () => {
@@ -1456,6 +1503,76 @@ test('follow-up APIs paginate without bodies and enforce admin-only context, rec
       body: JSON.stringify({ action: 'reopen', expectedSubmissionVersion: selected.updated_at }),
     });
     assert.equal(staleResponse.status, 409);
+  });
+});
+
+test('required source authority blocks direct Acquisition Inbox decision mutation', async () => {
+  const opportunityId = 'task-four-http-required-failure';
+  const storage = await seedTaskFourOpportunity(opportunityId);
+  writeTaskFourSourceSnapshot({ requiredHealthy: false });
+  let digestRuns = 0;
+  const app = createApp({ dailyDealHunterRunner: async () => { digestRuns += 1; return {}; } });
+
+  await withServer(async (origin) => {
+    const cookie = await signInForCookie(origin);
+    const before = await storage.getCurrentDealHunterOpportunityScore(opportunityId);
+    const response = await fetch(`${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ action: 'pursue' }),
+    });
+    const result = await response.json();
+    const after = await storage.getCurrentDealHunterOpportunityScore(opportunityId);
+
+    assert.equal(response.status, 503);
+    assert.equal(result.success, false);
+    assert.equal(result.code, 'required_source_authority_unavailable');
+    assert.deepEqual(
+      { priority: after.operator_priority, reviewedAt: after.reviewed_at, reviewedBy: after.reviewed_by },
+      { priority: before.operator_priority, reviewedAt: before.reviewed_at, reviewedBy: before.reviewed_by },
+    );
+    assert.equal(digestRuns, 0);
+  }, app);
+});
+
+test('optional Deal OS warning does not block a current primary-backed decision', async () => {
+  const opportunityId = 'task-four-http-optional-warning';
+  const storage = await seedTaskFourOpportunity(opportunityId);
+  writeTaskFourSourceSnapshot({ requiredHealthy: true, optionalWarning: true });
+
+  await withServer(async (origin) => {
+    const cookie = await signInForCookie(origin);
+    const response = await fetch(`${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ action: 'watch' }),
+    });
+    const result = await response.json();
+    const after = await storage.getCurrentDealHunterOpportunityScore(opportunityId);
+
+    assert.equal(response.status, 200);
+    assert.equal(result.success, true);
+    assert.equal(after.operator_priority, 'watch');
+    assert.ok(after.reviewed_at);
+  });
+});
+
+test('viewer can read but cannot mutate the Daily Digest briefing', async () => {
+  const opportunityId = 'task-four-http-viewer';
+  const storage = await seedTaskFourOpportunity(opportunityId);
+  writeTaskFourSourceSnapshot({ requiredHealthy: true });
+
+  await withServer(async (origin) => {
+    const viewerCookie = await signInForCookie(origin, { username: 'smb-deal-hunter', password: 'view-only-local' });
+    const read = await fetch(`${origin}/api/admin/deal-hunter/triage?view=needs-review`, { headers: { Cookie: viewerCookie } });
+    const readResult = await read.json();
+    assert.equal(read.status, 200);
+    assert.equal(readResult.dailyDigest?.actionsAllowed, true);
+    assert.equal(readResult.dailyDigest?.status, 'ready');
+
+    const mutation = await fetch(`${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: viewerCookie }, body: JSON.stringify({ action: 'pursue' }),
+    });
+    const after = await storage.getCurrentDealHunterOpportunityScore(opportunityId);
+    assert.equal(mutation.status, 401);
+    assert.equal(after.operator_priority, 'normal');
+    assert.equal(after.reviewed_at, null);
   });
 });
 

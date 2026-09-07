@@ -12,9 +12,37 @@ process.env.ADMIN_VIEWER_USERNAME = 'triage-viewer';
 process.env.ADMIN_VIEWER_PASSWORD = 'triage-viewer-password';
 process.env.SQLITE_PATH = path.join(tempDir, 'triage-actions.sqlite');
 process.env.SECURE_DOCUMENTS_STORAGE_DIR = path.join(tempDir, 'secure-documents');
+process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH = path.join(tempDir, 'daily-digest-source-health.json');
 process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
 process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
 delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
+
+const sourceCheckedAt = new Date().toISOString();
+fs.writeFileSync(process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH, JSON.stringify({
+  generatedAt: sourceCheckedAt,
+  issues: [],
+  totals: { reviewedDeals: 1 },
+  sources: {
+    'sheet-0': {
+      rowCount: 1,
+      name: 'SMB Deal Hunter Google Sheet',
+      mode: 'csv',
+      required: true,
+      sourceRole: 'required-primary',
+      checkedAt: sourceCheckedAt,
+    },
+    'deal-os-export': {
+      rowCount: 1,
+      name: 'SMB Deal OS export',
+      mode: 'manual-export',
+      required: false,
+      sourceRole: 'optional-supplemental',
+      checkedAt: sourceCheckedAt,
+      exportedAt: sourceCheckedAt,
+      maxAgeHours: 72,
+    },
+  },
+}));
 
 const { createApp } = await import('../server/app.js');
 const { getConfig } = await import('../server/config.js');

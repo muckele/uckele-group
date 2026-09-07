@@ -23,7 +23,10 @@ const {
 } = await import('../server/services/dealHunterManualFollowUps.js');
 const { verifySignedPayload } = await import('../server/utils/security.js');
 const { getConfig } = await import('../server/config.js');
-const { buildManualFollowUpCommunicationId } = await import('../server/services/dealHunterManualFollowUpPolicy.js');
+const {
+  buildManualFollowUpCommunicationId,
+  nextManualFollowUpAt,
+} = await import('../server/services/dealHunterManualFollowUpPolicy.js');
 const { projectDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
 
 const opportunityId = 'opp-task3-manual-follow-up';
@@ -303,7 +306,9 @@ test('Start Follow-Up Sequence requires administrator canonical request accepted
 test('Start Follow-Up Sequence atomically enrolls without claim communication activity duplication or provider work', async () => {
   const storage = task3Storage();
   const communicationCount = storage.state.communications.length;
-  const result = await startDealHunterManualFollowUps({ opportunityId, requestId, input: {}, session: administrator, storage, now: new Date(), dependencies });
+  const overdueEvaluationAt = new Date(nextManualFollowUpAt(acceptedAt));
+  overdueEvaluationAt.setUTCDate(overdueEvaluationAt.getUTCDate() + 1);
+  const result = await startDealHunterManualFollowUps({ opportunityId, requestId, input: {}, session: administrator, storage, now: overdueEvaluationAt, dependencies });
   assert.equal(result.success, true);
   assert.equal(result.followUps.state, 'overdue');
   assert.equal(storage.state.calls.start, 1);

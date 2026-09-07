@@ -46,6 +46,10 @@ function formatGateValue(value) {
   return String(value);
 }
 
+function formatStatus(value) {
+  return String(value || 'not-recorded').replace(/[-_]/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
 export default function OperationsCenter({
   data, loading = false, error = '', onSendEmailTest, emailTestSending = false,
   onToggleCimAutomation, cimAutomationUpdating = false, onToggleCimOutreach,
@@ -82,6 +86,18 @@ export default function OperationsCenter({
   const stage2Gates = cimAutomation.stage2Readiness || [];
   const shadowRun = cimAutomation.latestShadowRun || null;
   const liveRun = cimAutomation.latestLiveRun || null;
+  const dailyDigest = data.dailyDigest || {};
+  const digestSource = dailyDigest.sourceAuthority || {};
+  const digestHighAttention = Boolean(dailyDigest.attentionRequired || dailyDigest.status === 'ambiguous');
+  const digestWarning = !digestHighAttention && (dailyDigest.status === 'failed' || dailyDigest.stale || digestSource.status === 'optional-degraded');
+  const digestHealthy = !digestHighAttention && !digestWarning && dailyDigest.status === 'completed' && digestSource.status === 'healthy';
+  const sourceStatusLabel = digestSource.status === 'required-source-action-required'
+    ? 'REQUIRED SOURCE ACTION REQUIRED'
+    : digestSource.status === 'optional-degraded'
+      ? 'OPTIONAL DEGRADED'
+      : digestSource.status === 'healthy'
+        ? 'HEALTHY'
+        : 'SOURCE STATUS UNAVAILABLE';
 
   async function loadDecisionAudit(run, page = 1) {
     if (readOnly || !run?.id) return;
@@ -142,6 +158,7 @@ export default function OperationsCenter({
         <div className="mt-2 flex gap-2 overflow-x-auto pb-1">
           {[
             ...(data.email ? [['#email-readiness-heading', 'Email']] : []),
+            ['#daily-digest-heading', 'Daily Digest'],
             ['#cim-automation-heading', 'Automation'],
             ['#communication-ingestion-heading', 'Communications'],
             ['#core-systems-heading', 'Core systems'],
@@ -195,6 +212,27 @@ export default function OperationsCenter({
           <h3 className="mt-2 text-xl font-semibold text-ink" id="core-systems-heading">Core systems at a glance</h3>
         </div>
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
+        <article className="panel p-5 md:col-span-2 xl:col-span-2" aria-labelledby="daily-digest-heading">
+          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">Daily Deal Hunter</p>
+          <h4 className="mt-2 text-lg font-semibold text-ink" id="daily-digest-heading">Daily Digest status</h4>
+          <div className="mt-3"><StatusBadge healthy={digestHealthy} warning={digestWarning}>{digestHighAttention ? `HIGH ATTENTION · ${formatStatus(dailyDigest.status)}` : formatStatus(dailyDigest.status)}</StatusBadge></div>
+          <p className={`mt-3 text-sm font-semibold ${digestSource.status === 'required-source-action-required' ? 'text-red-800' : digestSource.status === 'optional-degraded' ? 'text-amber-800' : 'text-emerald-800'}`}>Source authority: {sourceStatusLabel}</p>
+          <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 text-xs text-ink/65 sm:grid-cols-3">
+            <div><dt className="font-semibold text-ink/50">Pacific date</dt><dd>{dailyDigest.businessDate || 'Not recorded'}</dd></div>
+            <div><dt className="font-semibold text-ink/50">Notification</dt><dd>{formatStatus(dailyDigest.notificationType || 'not prepared')}</dd></div>
+            <div><dt className="font-semibold text-ink/50">Prepared</dt><dd>{dailyDigest.prepared ? 'Yes' : 'No'}</dd></div>
+            <div><dt className="font-semibold text-ink/50">Attempts</dt><dd>{dailyDigest.attemptCount ?? 0}</dd></div>
+            <div><dt className="font-semibold text-ink/50">Completed</dt><dd>{formatDate(dailyDigest.completedAt)}</dd></div>
+            <div><dt className="font-semibold text-ink/50">Failed</dt><dd>{formatDate(dailyDigest.failedAt)}</dd></div>
+            <div><dt className="font-semibold text-ink/50">Next retry</dt><dd>{formatDate(dailyDigest.nextRetryAt)}</dd></div>
+            <div><dt className="font-semibold text-ink/50">Reconciliation</dt><dd>{formatStatus(dailyDigest.reconciliation?.source || dailyDigest.reconciliation?.errorCategory || 'not recorded')}</dd></div>
+            <div><dt className="font-semibold text-ink/50">Marker</dt><dd>{formatStatus(dailyDigest.markerStatus)}</dd></div>
+          </dl>
+          {dailyDigest.provider ? <p className="mt-3 break-words text-xs text-ink/55">Provider {dailyDigest.provider}{dailyDigest.providerMessageId ? ` · message ${dailyDigest.providerMessageId}` : ''}</p> : null}
+          <p className="mt-2 text-xs text-ink/55">Daily failures {dailyDigest.failedCount ?? 0} · ambiguous {dailyDigest.ambiguousCount ?? 0}</p>
+          {digestHighAttention ? <p className="mt-3 rounded-xl border border-red-200 bg-red-50 p-3 text-sm font-semibold text-red-900" role="alert">Do not send another digest. Reconcile provider identity and durable evidence first.</p> : null}
+          {dailyDigest.status === 'failed' && dailyDigest.nextRetryAt ? <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">Retry is scheduled for {formatDate(dailyDigest.nextRetryAt)}. No manual resend is available.</p> : null}
+        </article>
         <article className="panel p-5" aria-labelledby="communication-ingestion-heading">
           <p className="text-xs font-semibold uppercase tracking-[0.16em] text-moss">Inbound communications</p>
           <h4 className="sr-only" id="communication-ingestion-heading">Communication ingestion status</h4>
