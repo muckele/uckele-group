@@ -183,6 +183,34 @@ function dailyDealHunterHttpStatus(status) {
   return 503;
 }
 
+const dealHunterReviewBuckets = ['newlySeenMatches', 'qualified', 'watchlist', 'removalCandidates'];
+
+export function sanitizeViewerDealHunterReview(review = {}) {
+  const dailyEmailJob = review.dailyEmailJob && typeof review.dailyEmailJob === 'object'
+    ? { ...review.dailyEmailJob }
+    : review.dailyEmailJob;
+  if (dailyEmailJob) delete dailyEmailJob.providerMessageId;
+
+  const sanitized = {
+    ...review,
+    dailyEmailJob,
+  };
+
+  for (const bucket of dealHunterReviewBuckets) {
+    if (!Array.isArray(review[bucket])) continue;
+    sanitized[bucket] = review[bucket].map((deal) => {
+      if (!deal || typeof deal !== 'object') return deal;
+      const cimRequest = deal.cimRequest && typeof deal.cimRequest === 'object'
+        ? { ...deal.cimRequest }
+        : deal.cimRequest;
+      if (cimRequest) delete cimRequest.providerMessageId;
+      return { ...deal, cimRequest };
+    });
+  }
+
+  return sanitized;
+}
+
 function dailyDealHunterRouteResult(result = {}) {
   const emailResult = result.emailResult || {};
   const status = String(emailResult.status || 'unavailable').slice(0, 80);
@@ -1341,7 +1369,7 @@ export function createApp({
       });
       response.json({
         success: true,
-        review,
+        review: session.role === 'viewer' ? sanitizeViewerDealHunterReview(review) : review,
       });
     }),
   );

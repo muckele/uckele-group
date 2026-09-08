@@ -17,7 +17,8 @@ process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
 process.env.DEAL_HUNTER_CRON_SECRET = 'task-three-cron-secret';
 delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
 
-const { createApp } = await import('../server/app.js');
+const appModule = await import('../server/app.js');
+const { createApp } = appModule;
 const { createSecureUploadRequest } = await import('../server/services/documentVault.js');
 const { createManualSubmission } = await import('../server/services/submissions.js');
 const { getStorage } = await import('../server/storage/index.js');
@@ -418,6 +419,54 @@ test('daily digest privileged routes reject unsupported nonempty wire bodies', a
   }, app);
 });
 
+test('viewer Deal Hunter review sanitizer removes provider identities without changing safe status fields', () => {
+  const sanitizeViewerDealHunterReview = appModule.sanitizeViewerDealHunterReview;
+  assert.equal(typeof sanitizeViewerDealHunterReview, 'function');
+
+  const reviewBuckets = ['newlySeenMatches', 'qualified', 'watchlist', 'removalCandidates'];
+  const review = {
+    generatedAt: '2026-09-08T16:00:00.000Z',
+    dailyEmailJob: {
+      status: 'completed',
+      businessDate: '2026-09-08',
+      attemptCount: 1,
+      providerMessageId: 'viewer-digest-provider-sentinel',
+    },
+    ...Object.fromEntries(reviewBuckets.map((bucket, index) => [bucket, [{
+      dealKey: `viewer-provider-privacy-${index}`,
+      score: 80 + index,
+      cimRequest: {
+        status: 'sent',
+        requestState: 'provider_accepted',
+        deliveryState: 'accepted',
+        followUpState: 'not-scheduled',
+        requestedAt: '2026-09-08T15:00:00.000Z',
+        firstProviderAcceptedAt: '2026-09-08T15:00:01.000Z',
+        lastActivityAt: '2026-09-08T15:00:01.000Z',
+        followUpCount: index,
+        recipientPolicy: { blocked: false, touches24Hours: 1, touches30Days: 1 },
+        providerMessageId: `viewer-cim-provider-sentinel-${index}`,
+      },
+    }]])),
+  };
+  const originalReview = structuredClone(review);
+
+  const sanitized = sanitizeViewerDealHunterReview(review);
+
+  assert.notStrictEqual(sanitized, review);
+  assert.notStrictEqual(sanitized.dailyEmailJob, review.dailyEmailJob);
+  const { providerMessageId: _digestProviderMessageId, ...safeDailyEmailJob } = originalReview.dailyEmailJob;
+  assert.deepEqual(sanitized.dailyEmailJob, safeDailyEmailJob);
+  for (const bucket of reviewBuckets) {
+    assert.notStrictEqual(sanitized[bucket], review[bucket]);
+    assert.notStrictEqual(sanitized[bucket][0], review[bucket][0]);
+    assert.notStrictEqual(sanitized[bucket][0].cimRequest, review[bucket][0].cimRequest);
+    const { providerMessageId: _cimProviderMessageId, ...safeCimRequest } = originalReview[bucket][0].cimRequest;
+    assert.deepEqual(sanitized[bucket][0].cimRequest, safeCimRequest, bucket);
+  }
+  assert.deepEqual(review, originalReview);
+});
+
 test('daily digest browser responses exclude the raw prepared envelope and job metadata', async () => {
   const storage = getStorage();
   const now = new Date();
@@ -534,6 +583,20 @@ test('daily digest browser responses exclude the raw prepared envelope and job m
       metadataPatch: { provider: 'resend', payloadDigest: 'a'.repeat(64) },
     });
     assert.equal(completed.applied, true);
+
+    const adminReviewResponse = await fetch(`${origin}/api/admin/deal-hunter/review`, { headers: { Cookie: adminCookie } });
+    const viewerReviewResponse = await fetch(`${origin}/api/admin/deal-hunter/review`, { headers: { Cookie: viewerCookie } });
+    const adminReview = await adminReviewResponse.json();
+    const viewerReview = await viewerReviewResponse.json();
+    assert.equal(adminReviewResponse.status, 200);
+    assert.equal(viewerReviewResponse.status, 200);
+
+    const { providerMessageId: adminDigestProviderMessageId, ...adminSafeDailyEmailJob } = adminReview.review.dailyEmailJob;
+    assert.equal(adminDigestProviderMessageId, viewerProviderSentinel);
+    assert.equal(Object.hasOwn(viewerReview.review.dailyEmailJob, 'providerMessageId'), false);
+    assert.deepEqual(viewerReview.review.dailyEmailJob, adminSafeDailyEmailJob);
+    const serializedViewerReview = JSON.stringify(viewerReview);
+    assert.equal(serializedViewerReview.includes(viewerProviderSentinel), false);
 
     const adminOperationsResponse = await fetch(`${origin}/api/admin/operations`, { headers: { Cookie: adminCookie } });
     const viewerOperationsResponse = await fetch(`${origin}/api/admin/operations`, { headers: { Cookie: viewerCookie } });
