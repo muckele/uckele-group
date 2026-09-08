@@ -143,6 +143,8 @@ The following are **MUST VERIFY DURING AUTHORIZED RELEASE**, both before and aft
 - `cimAutomationPaused = true`
 - `cimAutomationSchedulerEnabled = false`
 
+For the Phase 4 Daily Digest release, do not perform live CIM requests or sends, broker sends, Phase 3 follow-up transmissions, or Stage 2 execution/sends; do not lift the CIM outreach pause or enable follow-up automation. The first natural 08:00 Pacific Daily Digest result is the only email smoke, so do not send a second or manual Daily Digest message. Those broader workflows are outside this release check and require separate explicit authorization.
+
 The release is **NO-GO** for any failed test/browser gate, unexpected dirty worktree, release/base mismatch, backup or SQLite integrity failure, non-unique/invalid recipient resolution, Resend or signed-webhook unreadiness, non-durable/unwritable marker path, multiple scheduler registrations, changed frozen safety value, unresolved current-date `transmitting`/`ambiguous` job, or unexpected unhealthy required source when a normal first result is intended. A known required-source problem may intentionally yield the approved `required-source-alert`; that is not permission to ignore an unexpected rollout blocker. An existing same-date completion is also a stop condition for using that date as the first-result smoke.
 
 At the first natural 08:00 Pacific result, observe without creating another send:
@@ -159,6 +161,10 @@ For a normal result, confirm required source healthy, any optional warning bound
 Rollback may revert only the approved application release or Daily Digest configuration. Preserve `scheduled_job_runs`, claim/state metadata, marker, `email_events`, provider evidence, the prepared-envelope/idempotency identity, and every ambiguity clue. Never “clean up” an ambiguous date by deleting it. Production GO remains conditional on the live checklist; the non-production conclusion is only **CODE READY FOR AUTHORIZED RELEASE CHECK**.
 
 SQLite production must not receive the Supabase migration. If Supabase/PostgreSQL is deployed later, apply `20260904120000_daily_digest_scheduled_job_fencing.sql` through normal migration handling and verify `claim_scheduled_job` and `transition_scheduled_job` remain service-role-only. No table/column expansion is authorized.
+
+### Broader-product go-live checks: outside Phase 4
+
+The checklist below is not part of Phase 4 Daily Digest release verification. Any live CIM, follow-up, broker-outreach, or other broader-product transmission requires separate explicit authorization, must not be performed while validating the Phase 4 release, and must not require changing any of the five frozen Phase 4 safety values above.
 
 - Confirm the contact form is delivering to the configured internal recipient without printing it
 - Confirm `/admin` renders the bounded Morning Briefing and sanitized Operations authority; do not use the admin trigger as a production smoke
