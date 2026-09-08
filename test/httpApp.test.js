@@ -521,6 +521,29 @@ test('daily digest browser responses exclude the raw prepared envelope and job m
     for (const payload of payloads) {
       assert.equal(payload.review.dailyEmailJob.status, 'pending');
     }
+
+    const viewerProviderSentinel = 'viewer-raw-provider-sentinel-9f2';
+    const completed = await storage.transitionScheduledJob({
+      jobKey,
+      claimToken: sentinels.claimToken,
+      expectedStatuses: ['pending'],
+      status: 'completed',
+      nowIso,
+      completedAt: nowIso,
+      providerMessageId: viewerProviderSentinel,
+      metadataPatch: { provider: 'resend', payloadDigest: 'a'.repeat(64) },
+    });
+    assert.equal(completed.applied, true);
+
+    const adminOperationsResponse = await fetch(`${origin}/api/admin/operations`, { headers: { Cookie: adminCookie } });
+    const viewerOperationsResponse = await fetch(`${origin}/api/admin/operations`, { headers: { Cookie: viewerCookie } });
+    const adminOperations = await adminOperationsResponse.json();
+    const viewerOperations = await viewerOperationsResponse.json();
+    assert.equal(adminOperationsResponse.status, 200);
+    assert.equal(viewerOperationsResponse.status, 200);
+    assert.equal(adminOperations.operations.dailyDigest.providerMessageId, viewerProviderSentinel);
+    assert.equal(Object.hasOwn(viewerOperations.operations.dailyDigest, 'providerMessageId'), false);
+    assert.equal(JSON.stringify(viewerOperations).includes(viewerProviderSentinel), false);
   });
 });
 

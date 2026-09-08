@@ -8,6 +8,7 @@ import { getEmailReadiness } from './emailReadiness.js';
 import { getCimAutomationStatus } from './cimAutomation.js';
 import { getCommunicationOperationsStatus } from './communications.js';
 import { getCimIdentityOperationsStatus } from './cimOpportunityIdentity.js';
+import { readDailyDealHunterMarker } from './dailyDealHunterReconciliation.js';
 import { projectDailyDealHunterJobStatus, shouldRunDailyDealHunterEmail } from './dealHunterScheduler.js';
 
 function safeError(error) {
@@ -118,13 +119,36 @@ function sourceAuthorityStatus(sourceHealth = {}, sourceError = '') {
   };
 }
 
-function markerStatus(job = {}) {
-  if (job?.errorCategory === 'marker-mismatch' || job?.reconciliation?.errorCategory === 'marker-mismatch') return 'mismatch';
-  if (job?.reconciliation?.source === 'marker' && job.status === 'completed') return 'agreed';
-  return 'not-recorded';
+function currentAttemptTimestamp(job = {}) {
+  const metadata = job.metadata && typeof job.metadata === 'object' && !Array.isArray(job.metadata)
+    ? job.metadata
+    : {};
+  for (const candidate of [metadata.claimedAt, job.started_at, job.updated_at, job.created_at]) {
+    const timestamp = boundedTimestamp(candidate);
+    if (timestamp) return timestamp;
+  }
+  return '';
 }
 
-function dailyDigestOperationsStatus({ scheduledJobs = [], sourceHealth = {}, sourceError = '', now, config } = {}) {
+async function markerStatus({ projected, raw, markerDir, businessDate } = {}) {
+  if (projected?.errorCategory === 'marker-mismatch'
+    || projected?.reconciliation?.errorCategory === 'marker-mismatch') return 'mismatch';
+  if (!projected || !raw) return 'not-recorded';
+  const result = await readDailyDealHunterMarker({ markerDir, businessDate });
+  if (result.status === 'missing') return 'not-recorded';
+  if (result.status !== 'valid') return 'mismatch';
+  const marker = result.marker;
+  const payloadDigest = boundedText(raw.metadata?.payloadDigest, 64);
+  return marker.jobKey === boundedText(raw.job_key, 240)
+    && marker.businessDate === projected.businessDate
+    && marker.notificationType === projected.notificationType
+    && marker.payloadDigest === payloadDigest
+    && marker.providerMessageId === projected.providerMessageId
+    ? 'agreed'
+    : 'mismatch';
+}
+
+async function dailyDigestOperationsStatus({ scheduledJobs = [], sourceHealth = {}, sourceError = '', now, config } = {}) {
   const schedule = config.dealHunter?.dailyEmail || {};
   const { dateKey: businessDate } = shouldRunDailyDealHunterEmail({
     now,
@@ -135,14 +159,13 @@ function dailyDigestOperationsStatus({ scheduledJobs = [], sourceHealth = {}, so
     raw: run,
     projected: projectDailyDealHunterJobStatus(run),
   })).filter((item) => item.projected);
-  const today = dailyJobs.find((item) => item.projected.businessDate === businessDate
-    || item.raw.job_key === `daily-deal-hunter-email:${businessDate}`)?.projected || null;
-  const pendingSince = today
-    ? boundedTimestamp(dailyJobs.find((item) => item.projected === today)?.raw.created_at)
-    : '';
+  const todayJob = dailyJobs.find((item) => item.projected.businessDate === businessDate
+    || item.raw.job_key === `daily-deal-hunter-email:${businessDate}`) || null;
+  const today = todayJob?.projected || null;
+  const pendingSince = todayJob ? currentAttemptTimestamp(todayJob.raw) : '';
   const stale = today?.status === 'pending'
     && Boolean(pendingSince)
-    && now.getTime() - Date.parse(pendingSince) > 60 * 60 * 1000;
+    && now.getTime() - Date.parse(pendingSince) >= 60 * 60 * 1000;
   const sourceAuthority = sourceAuthorityStatus(sourceHealth, sourceError);
 
   return {
@@ -158,9 +181,14 @@ function dailyDigestOperationsStatus({ scheduledJobs = [], sourceHealth = {}, so
     providerMessageId: today?.providerMessageId || '',
     errorCategory: today?.errorCategory || '',
     reconciliation: today?.reconciliation || { checkedAt: '', source: '', errorCategory: '', severity: '' },
-    markerStatus: markerStatus(today),
+    markerStatus: await markerStatus({
+      projected: today,
+      raw: todayJob?.raw,
+      markerDir: schedule.markerDir,
+      businessDate,
+    }),
     stale,
-    attentionRequired: Boolean(today?.attentionRequired || stale),
+    attentionRequired: Boolean(today?.attentionRequired),
     sourceAuthority,
     failedCount: dailyJobs.filter((item) => item.projected.status === 'failed').length,
     ambiguousCount: dailyJobs.filter((item) => item.projected.status === 'ambiguous').length,
@@ -281,8 +309,11 @@ function sanitizeViewerCimIdentity(status = {}) {
 }
 
 export function sanitizeViewerOperations(operations = {}) {
+  const dailyDigest = operations.dailyDigest ? { ...operations.dailyDigest } : operations.dailyDigest;
+  if (dailyDigest) delete dailyDigest.providerMessageId;
   return {
     ...operations,
+    dailyDigest,
     scheduler: {
       ...operations.scheduler,
       runs: (operations.scheduler?.runs || []).map((run) => ({
@@ -414,7 +445,7 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
       pending: sanitizedScheduledJobs.filter((job) => job.status === 'pending').length,
       error: scheduledPanel.error,
     },
-    dailyDigest: dailyDigestOperationsStatus({
+    dailyDigest: await dailyDigestOperationsStatus({
       scheduledJobs,
       sourceHealth: sourceHealthPanel.value,
       sourceError: sourceHealthPanel.error,

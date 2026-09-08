@@ -386,15 +386,19 @@ export default function AcquisitionInbox({ readOnly = false }) {
     setPassTarget(row);
   }
 
-  function closeQueuePass(force = false) {
+  const closeQueuePass = useCallback((force = false) => {
     if (mutationPendingRef.current && force !== true) return;
     passFocusGuardRef.current = false;
     setPassTarget(null);
     setMutationError('');
     const trigger = passTriggerRef.current;
-    if (trigger?.isConnected) trigger.focus();
+    if (trigger?.isConnected && !trigger.disabled && trigger.getAttribute('aria-disabled') !== 'true') trigger.focus();
     else if (searchInputRef.current?.isConnected) searchInputRef.current.focus();
-  }
+  }, []);
+
+  useEffect(() => {
+    if (!actionsAllowed && passTarget) closeQueuePass(true);
+  }, [actionsAllowed, closeQueuePass, passTarget]);
 
   async function recordAction(opportunityId, action, pass = null) {
     if (!actionsAllowed) return false;

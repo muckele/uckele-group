@@ -39,6 +39,32 @@ dueNow.setUTCHours(dueNow.getUTCHours() - 2);
 const acceptedAt = new Date(dueNow);
 acceptedAt.setUTCDate(acceptedAt.getUTCDate() - 4);
 
+function pacificDateKey(value) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(value).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function incrementCivilDateKey(dateKey) {
+  const [year, month, day] = dateKey.split('-').map(Number);
+  const next = new Date(Date.UTC(year, month - 1, day + 1));
+  return [next.getUTCFullYear(), String(next.getUTCMonth() + 1).padStart(2, '0'), String(next.getUTCDate()).padStart(2, '0')].join('-');
+}
+
+function nextPacificCalendarEvaluation(value) {
+  const [year, month, day] = incrementCivilDateKey(pacificDateKey(value)).split('-').map(Number);
+  const utcNoon = new Date(Date.UTC(year, month - 1, day, 12));
+  const offsetLabel = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles', timeZoneName: 'longOffset',
+  }).formatToParts(utcNoon).find((part) => part.type === 'timeZoneName')?.value || '';
+  const match = offsetLabel.match(/^GMT([+-])(\d{2}):(\d{2})$/);
+  assert.ok(match, `Pacific offset unavailable for ${incrementCivilDateKey(pacificDateKey(value))}`);
+  const direction = match[1] === '+' ? 1 : -1;
+  const offsetMinutes = direction * (Number(match[2]) * 60 + Number(match[3]));
+  return new Date(utcNoon.getTime() - offsetMinutes * 60_000);
+}
+
 function initialCommunication(overrides = {}) {
   return {
     id: 'initial-communication-task3', submission_id: submissionId, opportunity_id: opportunityId,
@@ -303,11 +329,26 @@ test('Start Follow-Up Sequence requires administrator canonical request accepted
   assert.equal(storage.state.calls.start, 0);
 });
 
+test('Pacific overdue fixture advances exactly one civil date across DST and midnight', async (t) => {
+  for (const [name, input] of [
+    ['ordinary date', '2026-02-10T20:00:00.000Z'],
+    ['spring-forward boundary', '2026-03-08T08:30:00.000Z'],
+    ['fall-back boundary', '2026-11-01T07:30:00.000Z'],
+    ['Pacific-midnight edge', '2026-06-01T07:05:00.000Z'],
+  ]) {
+    await t.test(name, () => {
+      assert.equal(
+        pacificDateKey(nextPacificCalendarEvaluation(new Date(input))),
+        incrementCivilDateKey(pacificDateKey(new Date(input))),
+      );
+    });
+  }
+});
+
 test('Start Follow-Up Sequence atomically enrolls without claim communication activity duplication or provider work', async () => {
   const storage = task3Storage();
   const communicationCount = storage.state.communications.length;
-  const overdueEvaluationAt = new Date(nextManualFollowUpAt(acceptedAt));
-  overdueEvaluationAt.setUTCDate(overdueEvaluationAt.getUTCDate() + 1);
+  const overdueEvaluationAt = nextPacificCalendarEvaluation(new Date(nextManualFollowUpAt(acceptedAt)));
   const result = await startDealHunterManualFollowUps({ opportunityId, requestId, input: {}, session: administrator, storage, now: overdueEvaluationAt, dependencies });
   assert.equal(result.success, true);
   assert.equal(result.followUps.state, 'overdue');

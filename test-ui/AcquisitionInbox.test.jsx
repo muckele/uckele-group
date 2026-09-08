@@ -659,6 +659,49 @@ describe('Acquisition Inbox queue', () => {
     expect(writes).toEqual([]);
   });
 
+  test('closes an open queue Pass when refreshed server authority revokes actions', async () => {
+    const authorityLoss = deferred();
+    const writes = [];
+    let queueReads = 0;
+    vi.stubGlobal('fetch', vi.fn((input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/action')) {
+        writes.push(JSON.parse(options.body));
+        return Promise.resolve(jsonResponse({ success: true, action: 'pass' }));
+      }
+      queueReads += 1;
+      if (queueReads === 1) return Promise.resolve(jsonResponse(queueResponse({ rows: [queueRow()], total: 1 })));
+      return authorityLoss.promise;
+    }));
+
+    renderInbox();
+    const pass = await screen.findByRole('button', { name: 'Pass Evergreen Fire Protection' });
+    pass.focus();
+    fireEvent.click(pass);
+    expect(screen.getByRole('dialog', { name: 'Pass Evergreen Fire Protection' })).toBeVisible();
+
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search opportunities' }), { target: { value: 'evergreen' } });
+    await waitFor(() => expect(queueReads).toBe(2));
+    await act(async () => authorityLoss.resolve(jsonResponse(queueResponse({
+      rows: [queueRow()],
+      total: 1,
+      dailyDigest: digestProjection({
+        status: 'action-required',
+        actionsAllowed: false,
+        sourceAuthority: {
+          requiredHealthy: false,
+          blockingIssues: [{ title: 'Required Sheet unavailable', message: 'Current required-source authority is unavailable.' }],
+          optionalWarnings: [],
+        },
+      }),
+    }))));
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Pass Evergreen Fire Protection' })).not.toBeInTheDocument());
+    expect(screen.getByRole('searchbox', { name: 'Search opportunities' })).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Pass Evergreen Fire Protection' })).toBeDisabled();
+    expect(writes).toEqual([]);
+  });
+
   test('submits queue-row Pass once when the optional note is omitted and submit repeats', async () => {
     const action = deferred();
     const writes = [];

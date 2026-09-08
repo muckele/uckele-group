@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { getOperationsCenter, sanitizeViewerOperations } from '../server/services/operations.js';
 
 const appOrigin = 'http://127.0.0.1:4173';
 const privateSentinels = [
@@ -12,6 +13,7 @@ const privateSentinels = [
   'PRIVATE_RAW_METADATA_PHASE4',
   'PRIVATE_PROVIDER_ERROR_PHASE4',
 ];
+const viewerProviderSentinel = 'viewer-raw-provider-sentinel-9f2';
 
 function opportunity(overrides = {}) {
   return {
@@ -143,87 +145,100 @@ function detailResponse(row) {
   };
 }
 
-function dailyOperationsProjection(mode) {
-  const common = {
-    businessDate: '2026-09-05',
-    notificationType: 'normal-digest',
-    prepared: true,
-    attemptCount: 2,
-    completedAt: '',
-    failedAt: '',
-    nextRetryAt: '',
-    provider: 'resend',
-    providerMessageId: 'provider-safe-id-42',
-    errorCategory: '',
-    reconciliation: { source: 'provider-status', errorCategory: '' },
-    markerStatus: 'agreed',
-    stale: false,
-    attentionRequired: false,
-    sourceAuthority: { status: 'healthy' },
-    failedCount: 0,
-    ambiguousCount: 0,
+function rawOperationsJob(state) {
+  const failed = state.operationsMode === 'failed' || state.operationsMode === 'required-source';
+  const transmitting = state.operationsMode === 'transmitting';
+  const ambiguous = state.operationsMode === 'ambiguous';
+  const completed = !failed && !transmitting && !ambiguous;
+  return {
+    job_key: 'daily-deal-hunter-email:2026-09-05',
+    job_name: 'daily-deal-hunter-email',
+    status: failed ? 'failed' : transmitting ? 'transmitting' : ambiguous ? 'ambiguous' : 'completed',
+    created_at: '2026-09-05T15:00:00.000Z',
+    started_at: '2026-09-05T15:00:30.000Z',
+    updated_at: '2026-09-05T15:03:00.000Z',
+    completed_at: completed ? '2026-09-05T15:02:00.000Z' : null,
+    attempt_count: 2,
+    provider_message_id: state.role === 'viewer' ? viewerProviderSentinel : 'provider-safe-id-42',
+    last_error: privateSentinels[8],
+    metadata: {
+      businessDate: '2026-09-05',
+      notificationType: state.operationsMode === 'required-source' ? 'required-source-alert' : 'normal-digest',
+      provider: 'resend',
+      payloadDigest: 'a'.repeat(64),
+      failedAt: failed ? '2026-09-05T15:03:00.000Z' : '',
+      nextRetryAt: state.operationsMode === 'failed' ? '2026-09-05T15:18:00.000Z' : '',
+      failureCategory: failed ? 'provider-temporary' : '',
+      reconciliation: transmitting
+        ? { checkedAt: '2026-09-05T15:03:00.000Z', source: 'provider-status', errorCategory: 'reconciling', severity: '' }
+        : ambiguous
+          ? { checkedAt: '2026-09-05T15:03:00.000Z', source: 'marker', errorCategory: 'marker-mismatch', severity: 'high' }
+          : { checkedAt: '2026-09-05T15:02:00.000Z', source: 'provider-status', errorCategory: '', severity: '' },
+      recipient: privateSentinels[0],
+      sender: privateSentinels[1],
+      subject: privateSentinels[2],
+      text: privateSentinels[3],
+      html: privateSentinels[4],
+      claimToken: privateSentinels[5],
+      idempotencyKey: privateSentinels[6],
+      rawMetadata: privateSentinels[7],
+      preparedEnvelope: {
+        to: privateSentinels[0],
+        from: privateSentinels[1],
+        subject: privateSentinels[2],
+        text: privateSentinels[3],
+        html: privateSentinels[4],
+        idempotencyKey: privateSentinels[6],
+      },
+      providerResponse: { error: privateSentinels[8] },
+    },
   };
-  if (mode === 'failed') return {
-    ...common,
-    status: 'failed',
-    failedAt: '2026-09-05T15:03:00.000Z',
-    nextRetryAt: '2026-09-05T15:18:00.000Z',
-    errorCategory: 'provider-temporary',
-    failedCount: 1,
-  };
-  if (mode === 'transmitting') return {
-    ...common,
-    status: 'transmitting',
-    prepared: true,
-    markerStatus: 'pending',
-    reconciliation: { source: 'provider-status', errorCategory: 'reconciling' },
-  };
-  if (mode === 'ambiguous') return {
-    ...common,
-    status: 'ambiguous',
-    markerStatus: 'mismatch',
-    attentionRequired: true,
-    errorCategory: 'provider-identity-conflict',
-    reconciliation: { source: 'marker', errorCategory: 'marker-mismatch' },
-    ambiguousCount: 1,
-  };
-  if (mode === 'required-source') return {
-    ...common,
-    status: 'failed',
-    prepared: false,
-    notificationType: 'alert',
-    failedAt: '2026-09-05T15:01:00.000Z',
-    attentionRequired: true,
-    sourceAuthority: { status: 'required-source-action-required' },
-    failedCount: 1,
-  };
-  if (mode === 'optional-source') return {
-    ...common,
-    status: 'completed',
-    completedAt: '2026-09-05T15:02:00.000Z',
-    sourceAuthority: { status: 'optional-degraded' },
-  };
-  return { ...common, status: 'completed', completedAt: '2026-09-05T15:02:00.000Z' };
 }
 
-function operationsResponse(state) {
+async function operationsResponse(state) {
+  const rawJob = rawOperationsJob(state);
+  state.rawOperationsJob = rawJob;
+  const optionalIssue = state.operationsMode === 'optional-source'
+    ? [{ sourceId: 'deal-os', affectsHealth: false }]
+    : [];
+  const requiredIssue = state.operationsMode === 'required-source'
+    ? [{ sourceId: 'sheet-0', affectsHealth: true }]
+    : [];
+  const operations = await getOperationsCenter({
+    now: new Date('2026-09-05T16:00:00.000Z'),
+    config: {
+      storage: { provider: 'sqlite', sqlitePath: '/tmp/phase4-browser.sqlite' },
+      delivery: { provider: 'resend' },
+      dealHunter: { dailyEmail: { timezone: 'America/Los_Angeles', time: '08:00', markerDir: '' }, cimFollowUp: {} },
+    },
+    storage: {
+      async listScheduledJobs() { return [rawJob]; },
+      async listAdminAuditEvents() { return []; },
+      async listSecureDocumentCleanupJobs() { return []; },
+      async listSourceHealthSnapshots() { return []; },
+    },
+    checks: {
+      async sourceHealth() {
+        return {
+          generatedAt: '2026-09-05T15:00:00.000Z',
+          healthy: state.operationsMode !== 'required-source',
+          issues: [...requiredIssue, ...optionalIssue],
+          sources: [],
+          totals: {},
+        };
+      },
+      async disk() { return { ok: true, totalBytes: 1000, freeBytes: 700, usedBytes: 300, freePercent: 70 }; },
+      async database() { return { ok: true, provider: 'sqlite', integrity: 'ok', fileBytes: 300 }; },
+      async backup() { return { status: 'healthy', message: 'Latest backup verified.', latest: { createdAt: '2026-09-05T10:00:00.000Z', documentCount: 2 } }; },
+      async emailReadiness() { return { provider: 'resend', issues: [] }; },
+      async cimAutomation() { return { configuredStage: 1, evidenceStage: 1, effectiveStage: 1, activationMode: 'off', automaticTransmissionAllowed: false, stage2Readiness: [], safeNextAction: 'Keep Stage 2 off.', metrics: {}, policy: {} }; },
+      async communications() { return { pending: 0, failed: 0, unassigned: 0 }; },
+      async cimIdentity() { return { pause: { paused: true }, storageHealthy: true }; },
+    },
+  });
   return {
     success: true,
-    operations: {
-      dailyDigest: dailyOperationsProjection(state.operationsMode),
-      scheduler: { runs: [], failures: state.operationsMode === 'failed' ? 1 : 0, pending: state.operationsMode === 'transmitting' ? 1 : 0 },
-      sources: { current: { healthy: state.operationsMode !== 'required-source', generatedAt: '2026-09-05T15:00:00.000Z', issues: [] }, history: [] },
-      audit: { events: [] },
-      cleanup: { jobs: [], failures: [] },
-      storage: {
-        disk: { ok: true, totalBytes: 1000, freeBytes: 700, usedBytes: 300, freePercent: 70 },
-        database: { ok: true, provider: 'sqlite', integrity: 'ok', fileBytes: 300 },
-      },
-      backup: { status: 'healthy', message: 'Latest backup verified.', latest: { createdAt: '2026-09-05T10:00:00.000Z', documentCount: 2 } },
-      communications: { pending: 0, failed: 0, unassigned: 0 },
-      cimAutomation: { configuredStage: 1, evidenceStage: 1, effectiveStage: 1, activationMode: 'off', automaticTransmissionAllowed: false, stage2Readiness: [], safeNextAction: 'Keep Stage 2 off.' },
-      cimIdentity: { pause: { paused: true } },
-    },
+    operations: state.role === 'viewer' ? sanitizeViewerOperations(operations) : operations,
   };
 }
 
@@ -242,16 +257,6 @@ function createFixtureState({ role = 'admin', sourceMode = 'healthy', operations
     consoleErrors: [],
     pageErrors: [],
     sideEffects: { dailyDigest: 0, crm: 0, cim: 0, broker: 0, followUp: 0, stage2: 0, provider: 0, scoreRefresh: 0 },
-    privateJobMetadata: {
-      preparedEnvelope: {
-        recipient: privateSentinels[0], sender: privateSentinels[1], subject: privateSentinels[2],
-        text: privateSentinels[3], html: privateSentinels[4],
-      },
-      claimToken: privateSentinels[5],
-      idempotencyKey: privateSentinels[6],
-      rawMetadata: privateSentinels[7],
-      providerRawError: privateSentinels[8],
-    },
   };
 }
 
@@ -339,7 +344,7 @@ async function installFixture(page, options = {}) {
       await fulfillJson(route, state, { success: false, error: 'Operations is read-only.' }, 418);
       return;
     }
-    await fulfillJson(route, state, operationsResponse(state));
+    await fulfillJson(route, state, await operationsResponse(state));
   });
 
   await page.route('**/api/admin/deal-hunter/**', async (route) => {
@@ -397,6 +402,7 @@ async function installFixture(page, options = {}) {
 function assertNoPrivateProjection(state) {
   const serialized = state.responseBodies.join('\n');
   for (const sentinel of privateSentinels) expect(serialized).not.toContain(sentinel);
+  if (state.role === 'viewer') expect(serialized).not.toContain(viewerProviderSentinel);
   expect(serialized).not.toContain('preparedEnvelope');
 }
 
@@ -517,6 +523,13 @@ test('viewer can read briefing and sanitized Operations but has no mutation or d
   await expect(page.getByRole('heading', { name: 'Daily Digest status' })).toBeVisible();
   await expect(page.getByText('Source authority: HEALTHY')).toBeVisible();
   await expect(page.getByRole('button', { name: /Run Daily Digest|Send Daily Digest|Retry Daily Digest|Send Again/i })).toHaveCount(0);
+  const rawOperationsInput = JSON.stringify(state.rawOperationsJob);
+  for (const sentinel of privateSentinels) expect(rawOperationsInput).toContain(sentinel);
+  expect(rawOperationsInput).toContain(viewerProviderSentinel);
+  const interceptedOperations = state.responseBodies.filter((body) => body.includes('"dailyDigest"')).join('\n');
+  for (const sentinel of [...privateSentinels, viewerProviderSentinel]) expect(interceptedOperations).not.toContain(sentinel);
+  const visibleOperations = await page.locator('body').innerText();
+  for (const sentinel of [...privateSentinels, viewerProviderSentinel]) expect(visibleOperations).not.toContain(sentinel);
   expect(state.acceptedMutations).toEqual([]);
   await assertNoOutreachOrAuthoritySideEffects(page, state);
 });

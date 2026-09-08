@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { getOperationsCenter, sanitizeViewerOperations } from '../server/services/operations.js';
+import { writeDailyDealHunterMarker } from '../server/services/dailyDealHunterReconciliation.js';
 
 const operationsNow = new Date('2026-09-05T16:00:00.000Z');
 
@@ -21,12 +24,12 @@ function completeOperationsChecks(sourceHealth = {
   };
 }
 
-function operationsConfig() {
+function operationsConfig({ markerDir = '' } = {}) {
   return {
     storage: { provider: 'sqlite', sqlitePath: path.join('/tmp', 'operations.sqlite') },
     delivery: { provider: 'resend' },
     dealHunter: {
-      dailyEmail: { timezone: 'America/Los_Angeles', time: '08:00' },
+      dailyEmail: { timezone: 'America/Los_Angeles', time: '08:00', markerDir },
       cimFollowUp: {},
     },
   };
@@ -143,6 +146,7 @@ test('Operations communication ingestion failure is isolated and never exposes t
 });
 
 test('viewer Operations projection retains aggregate Stage 2 gates and strips identities, addresses, bodies, and protected decision context', () => {
+  const viewerProviderSentinel = 'viewer-raw-provider-sentinel-9f2';
   const projected = sanitizeViewerOperations({
     scheduler: { runs: [{ job_key: 'job-1', job_name: 'shadow', status: 'completed', updated_at: '2026-08-12T12:00:00.000Z', last_error: 'private path' }] },
     audit: { events: [{ id: 'audit-1', actor: 'release-owner@example.test' }] },
@@ -167,6 +171,7 @@ test('viewer Operations projection retains aggregate Stage 2 gates and strips id
       canonicalOpportunities: 12,
       lastAudit: { mode: 'read-only', generatedAt: '2026-08-12T12:00:00.000Z', counts: { exceptions: 0 }, privateRows: ['broker-two@example.test'] },
     },
+    dailyDigest: { status: 'completed', provider: 'resend', providerMessageId: viewerProviderSentinel },
   });
   const serialized = JSON.stringify(projected);
 
@@ -178,9 +183,11 @@ test('viewer Operations projection retains aggregate Stage 2 gates and strips id
   assert.equal(projected.cimIdentity.canonicalOpportunities, 12);
   assert.equal(projected.cimIdentity.pause.updatedBy, undefined);
   assert.equal(projected.cleanup.failureCount, 1);
+  assert.equal(Object.hasOwn(projected.dailyDigest, 'providerMessageId'), false);
   for (const forbidden of ['release-owner@example.test', 'admin@example.test', 'broker@example.test', 'pause-owner@example.test', 'broker-two@example.test', '123 Private Address', 'private-compliance-reference', 'private body', 'private-deal-key', 'private candidate', 'private path', 'private filename']) {
     assert.equal(serialized.includes(forbidden), false, forbidden);
   }
+  assert.equal(serialized.includes(viewerProviderSentinel), false);
 });
 
 test('operations sanitizes daily digest envelope and recipient from every scheduled job', async () => {
@@ -226,7 +233,7 @@ test('operations surfaces daily completed alert failed retry pending stale and a
     ['completed', { status: 'completed', completed_at: '2026-09-05T15:02:00.000Z', metadata: { notificationType: 'normal-digest' } }, false],
     ['alert', { status: 'completed', completed_at: '2026-09-05T15:02:00.000Z', metadata: { notificationType: 'required-source-alert' } }, false],
     ['failed retry pending', { status: 'failed', metadata: { notificationType: 'normal-digest', failedAt: '2026-09-05T15:02:00.000Z', nextRetryAt: '2026-09-05T16:30:00.000Z', failureCategory: 'provider-nonacceptance' } }, false],
-    ['stale pending', { status: 'pending', created_at: '2026-09-05T13:00:00.000Z', metadata: { notificationType: 'normal-digest' } }, true],
+    ['stale pending', { status: 'pending', created_at: '2026-09-05T13:00:00.000Z', metadata: { notificationType: 'normal-digest' } }, false],
     ['ambiguous', { status: 'ambiguous', metadata: { notificationType: 'normal-digest', reconciliation: { checkedAt: '2026-09-05T15:30:00.000Z', source: 'provider-lookup', errorCategory: 'conflicting-provider-evidence', severity: 'high' } } }, true],
   ];
 
@@ -244,6 +251,116 @@ test('operations surfaces daily completed alert failed retry pending stale and a
       assert.equal(operations.dailyDigest?.status, run.status);
       assert.equal(operations.dailyDigest?.notificationType, run.metadata.notificationType);
       assert.equal(operations.dailyDigest?.attentionRequired, attentionRequired);
+    });
+  }
+});
+
+test('Daily Digest Operations stale age uses the current claim attempt', async (t) => {
+  const cases = [
+    ['fresh metadata claim overrides older row timestamps', {
+      created_at: '2026-09-05T13:00:00.000Z',
+      started_at: '2026-09-05T13:01:00.000Z',
+      updated_at: '2026-09-05T13:02:00.000Z',
+      metadata: { claimedAt: '2026-09-05T15:59:00.000Z' },
+    }, false],
+    ['stale metadata claim overrides newer fallback timestamps', {
+      created_at: '2026-09-05T15:59:00.000Z',
+      started_at: '2026-09-05T15:59:00.000Z',
+      updated_at: '2026-09-05T15:59:00.000Z',
+      metadata: { claimedAt: '2026-09-05T14:59:59.999Z' },
+    }, true],
+    ['started timestamp is the first valid fallback', {
+      created_at: '2026-09-05T13:00:00.000Z',
+      started_at: '2026-09-05T15:58:00.000Z',
+      updated_at: '2026-09-05T13:02:00.000Z',
+      metadata: { claimedAt: 'invalid' },
+    }, false],
+    ['updated timestamp precedes the legacy created fallback', {
+      created_at: '2026-09-05T13:00:00.000Z',
+      started_at: 'invalid',
+      updated_at: '2026-09-05T15:57:00.000Z',
+      metadata: {},
+    }, false],
+    ['created timestamp remains the backward-compatible fallback', {
+      created_at: '2026-09-05T14:00:00.000Z',
+      started_at: 'invalid',
+      updated_at: 'invalid',
+      metadata: {},
+    }, true],
+  ];
+
+  for (const [name, timestamps, stale] of cases) {
+    await t.test(name, async () => {
+      const operations = await getOperationsCenter({
+        now: operationsNow,
+        config: operationsConfig(),
+        checks: completeOperationsChecks(),
+        storage: operationsStorage([{
+          job_key: 'daily-deal-hunter-email:2026-09-05',
+          job_name: 'daily-deal-hunter-email',
+          status: 'pending',
+          attempt_count: 2,
+          ...timestamps,
+          metadata: { notificationType: 'normal-digest', ...timestamps.metadata },
+        }]),
+      });
+      assert.equal(operations.dailyDigest?.stale, stale);
+      assert.equal(operations.dailyDigest?.attentionRequired, false);
+      assert.equal(operations.dailyDigest?.status, 'pending');
+    });
+  }
+});
+
+test('Daily Digest Operations marker status reads matching missing and conflicting marker evidence', async (t) => {
+  const baseRun = {
+    job_key: 'daily-deal-hunter-email:2026-09-05',
+    job_name: 'daily-deal-hunter-email',
+    status: 'completed',
+    created_at: '2026-09-05T15:00:00.000Z',
+    updated_at: '2026-09-05T15:02:00.000Z',
+    completed_at: '2026-09-05T15:02:00.000Z',
+    attempt_count: 1,
+    provider_message_id: 'resend-marker-provider-42',
+    metadata: {
+      businessDate: '2026-09-05',
+      notificationType: 'normal-digest',
+      provider: 'resend',
+      payloadDigest: 'a'.repeat(64),
+    },
+  };
+
+  for (const [name, marker, expected] of [
+    ['matching', {
+      jobKey: baseRun.job_key,
+      businessDate: '2026-09-05',
+      notificationType: 'normal-digest',
+      payloadDigest: 'a'.repeat(64),
+      providerMessageId: baseRun.provider_message_id,
+      acceptedAt: baseRun.completed_at,
+    }, 'agreed'],
+    ['missing', null, 'not-recorded'],
+    ['conflicting', {
+      jobKey: baseRun.job_key,
+      businessDate: '2026-09-05',
+      notificationType: 'normal-digest',
+      payloadDigest: 'b'.repeat(64),
+      providerMessageId: baseRun.provider_message_id,
+      acceptedAt: baseRun.completed_at,
+    }, 'mismatch'],
+  ]) {
+    await t.test(name, async (context) => {
+      const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), `operations-marker-${name}-`));
+      context.after(() => fs.rm(markerDir, { recursive: true, force: true }));
+      if (marker) await writeDailyDealHunterMarker({ markerDir, evidence: marker });
+      const operations = await getOperationsCenter({
+        now: operationsNow,
+        config: operationsConfig({ markerDir }),
+        checks: completeOperationsChecks(),
+        storage: operationsStorage([baseRun]),
+      });
+      assert.equal(operations.dailyDigest?.markerStatus, expected);
+      assert.equal(Object.hasOwn(operations.dailyDigest, 'marker'), false);
+      assert.equal(JSON.stringify(operations).includes(marker?.payloadDigest || 'no-marker-content'), false);
     });
   }
 });
