@@ -384,6 +384,7 @@ function createPhase1FixtureState() {
       approvalMode: 'success',
       followUpStopMode: 'success',
       followUpStopReconciliationPending: false,
+      followUpStopReconciliationGate: null,
       detailFailuresRemaining: 0,
       allowBrokerVerification: false,
     }])),
@@ -1413,7 +1414,9 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
       const fixture = state.brokerMaterialsByOpportunity[opportunityId];
       if (fixture?.followUpStopReconciliationPending) {
         fixture.followUpStopReconciliationPending = false;
-        await new Promise((resolve) => setTimeout(resolve, 150));
+        const reconciliationGate = fixture.followUpStopReconciliationGate;
+        fixture.followUpStopReconciliationGate = null;
+        if (reconciliationGate) await reconciliationGate;
       }
       if (fixture?.detailFailuresRemaining > 0) {
         fixture.detailFailuresRemaining -= 1;
@@ -2401,6 +2404,10 @@ test('Phase 3 Stop network uncertainty restores authoritative active state witho
   const fixture = state.brokerMaterialsByOpportunity['opp-cascade'];
   fixture.existingRequest = phase3ExistingRequest({ followUps: phase3FollowUps({ state: 'scheduled' }) });
   fixture.followUpStopMode = 'unknown';
+  let releaseStopReconciliation;
+  fixture.followUpStopReconciliationGate = new Promise((resolve) => {
+    releaseStopReconciliation = resolve;
+  });
   const { card } = await openBrokerOpportunity(page);
   const followUps = card.getByRole('region', { name: 'Follow-Ups' });
   const detailLoadsBeforeStop = state.brokerDetailLoads['opp-cascade'];
@@ -2413,6 +2420,7 @@ test('Phase 3 Stop network uncertainty restores authoritative active state witho
   await expect(followUps.getByRole('status')).toContainText('Checking Stop status.');
   await page.screenshot({ path: testInfo.outputPath('phase3-stop-network-checking-desktop.png'), fullPage: false });
 
+  releaseStopReconciliation();
   await expect(followUps.getByText('Scheduled', { exact: true })).toBeVisible();
   await expect(followUps.getByText('Stop outcome is unknown.')).toHaveCount(0);
   await expect(followUps.getByText(/Future follow-ups are (?:permanently )?stopped/i)).toHaveCount(0);
