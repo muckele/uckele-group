@@ -8,6 +8,8 @@ import { getEmailReadiness } from './emailReadiness.js';
 import { getCimAutomationStatus } from './cimAutomation.js';
 import { getCommunicationOperationsStatus } from './communications.js';
 import { getCimIdentityOperationsStatus } from './cimOpportunityIdentity.js';
+import { readDailyDealHunterMarker } from './dailyDealHunterReconciliation.js';
+import { projectDailyDealHunterJobStatus, shouldRunDailyDealHunterEmail } from './dealHunterScheduler.js';
 
 function safeError(error) {
   return error?.message || 'Status check failed.';
@@ -67,6 +69,129 @@ function sanitizeCommunicationOperations(status = {}) {
     pending: count(status.pending),
     failed: count(status.failed),
     unassigned: count(status.unassigned),
+  };
+}
+
+function boundedText(value, maximum = 240) {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, maximum) : '';
+}
+
+function boundedTimestamp(value) {
+  if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) return '';
+  return new Date(value).toISOString();
+}
+
+function isDailyDealHunterJob(job = {}) {
+  return job.job_name === 'daily-deal-hunter-email'
+    || String(job.job_key || '').startsWith('daily-deal-hunter-email:');
+}
+
+function sanitizeScheduledJob(job = {}) {
+  const daily = isDailyDealHunterJob(job) ? projectDailyDealHunterJobStatus(job) : null;
+  return {
+    job_key: boundedText(job.job_key, 240),
+    job_name: boundedText(job.job_name, 120),
+    status: boundedText(daily?.status || job.status, 40),
+    created_at: boundedTimestamp(job.created_at),
+    updated_at: boundedTimestamp(job.updated_at),
+    completed_at: boundedTimestamp(daily?.completedAt || job.completed_at),
+    attempt_count: daily?.attemptCount ?? Math.max(0, Math.trunc(Number(job.attempt_count) || 0)),
+    last_error: (daily?.errorCategory || job.last_error) ? 'Scheduled job needs attention.' : '',
+  };
+}
+
+function sourceAuthorityStatus(sourceHealth = {}, sourceError = '') {
+  const issues = Array.isArray(sourceHealth.issues) ? sourceHealth.issues : [];
+  const blockingIssueCount = issues.filter((issue) => issue?.affectsHealth !== false).length;
+  const optionalWarningCount = issues.filter((issue) => issue?.affectsHealth === false).length;
+  const requiredHealthy = !sourceError && sourceHealth.healthy === true && blockingIssueCount === 0;
+  const status = !requiredHealthy
+    ? 'required-source-action-required'
+    : optionalWarningCount > 0
+      ? 'optional-degraded'
+      : 'healthy';
+  return {
+    status,
+    requiredHealthy,
+    blockingIssueCount,
+    optionalWarningCount,
+    checkedAt: boundedTimestamp(sourceHealth.generatedAt),
+  };
+}
+
+function currentAttemptTimestamp(job = {}) {
+  const metadata = job.metadata && typeof job.metadata === 'object' && !Array.isArray(job.metadata)
+    ? job.metadata
+    : {};
+  for (const candidate of [metadata.claimedAt, job.started_at, job.updated_at, job.created_at]) {
+    const timestamp = boundedTimestamp(candidate);
+    if (timestamp) return timestamp;
+  }
+  return '';
+}
+
+async function markerStatus({ projected, raw, markerDir, businessDate } = {}) {
+  if (projected?.errorCategory === 'marker-mismatch'
+    || projected?.reconciliation?.errorCategory === 'marker-mismatch') return 'mismatch';
+  if (!projected || !raw) return 'not-recorded';
+  const result = await readDailyDealHunterMarker({ markerDir, businessDate });
+  if (result.status === 'missing') return 'not-recorded';
+  if (result.status !== 'valid') return 'mismatch';
+  const marker = result.marker;
+  const payloadDigest = boundedText(raw.metadata?.payloadDigest, 64);
+  return marker.jobKey === boundedText(raw.job_key, 240)
+    && marker.businessDate === projected.businessDate
+    && marker.notificationType === projected.notificationType
+    && marker.payloadDigest === payloadDigest
+    && marker.providerMessageId === projected.providerMessageId
+    ? 'agreed'
+    : 'mismatch';
+}
+
+async function dailyDigestOperationsStatus({ scheduledJobs = [], sourceHealth = {}, sourceError = '', now, config } = {}) {
+  const schedule = config.dealHunter?.dailyEmail || {};
+  const { dateKey: businessDate } = shouldRunDailyDealHunterEmail({
+    now,
+    timezone: schedule.timezone || 'America/Los_Angeles',
+    scheduleTime: schedule.time || '08:00',
+  });
+  const dailyJobs = scheduledJobs.filter(isDailyDealHunterJob).map((run) => ({
+    raw: run,
+    projected: projectDailyDealHunterJobStatus(run),
+  })).filter((item) => item.projected);
+  const todayJob = dailyJobs.find((item) => item.projected.businessDate === businessDate
+    || item.raw.job_key === `daily-deal-hunter-email:${businessDate}`) || null;
+  const today = todayJob?.projected || null;
+  const pendingSince = todayJob ? currentAttemptTimestamp(todayJob.raw) : '';
+  const stale = today?.status === 'pending'
+    && Boolean(pendingSince)
+    && now.getTime() - Date.parse(pendingSince) >= 60 * 60 * 1000;
+  const sourceAuthority = sourceAuthorityStatus(sourceHealth, sourceError);
+
+  return {
+    businessDate,
+    status: today?.status || 'not-recorded',
+    notificationType: today?.notificationType || '',
+    prepared: Boolean(today?.prepared),
+    attemptCount: today?.attemptCount || 0,
+    completedAt: today?.completedAt || '',
+    failedAt: today?.failedAt || '',
+    nextRetryAt: today?.nextRetryAt || '',
+    provider: today?.provider || '',
+    providerMessageId: today?.providerMessageId || '',
+    errorCategory: today?.errorCategory || '',
+    reconciliation: today?.reconciliation || { checkedAt: '', source: '', errorCategory: '', severity: '' },
+    markerStatus: await markerStatus({
+      projected: today,
+      raw: todayJob?.raw,
+      markerDir: schedule.markerDir,
+      businessDate,
+    }),
+    stale,
+    attentionRequired: Boolean(today?.attentionRequired),
+    sourceAuthority,
+    failedCount: dailyJobs.filter((item) => item.projected.status === 'failed').length,
+    ambiguousCount: dailyJobs.filter((item) => item.projected.status === 'ambiguous').length,
   };
 }
 
@@ -183,9 +308,82 @@ function sanitizeViewerCimIdentity(status = {}) {
   };
 }
 
+function projectBrowserEmailReadinessEvent(event) {
+  if (!event || typeof event !== 'object' || Array.isArray(event)) return null;
+  return {
+    createdAt: String(event.createdAt || '').slice(0, 100),
+    eventType: String(event.eventType || '').slice(0, 80),
+    source: String(event.source || '').slice(0, 100),
+  };
+}
+
+export function projectBrowserEmailReadiness(readiness = {}) {
+  const source = readiness && typeof readiness === 'object' && !Array.isArray(readiness)
+    ? readiness
+    : {};
+  const recipientConfigured = Boolean(
+    source.testRecipient
+    || (Array.isArray(source.allowedTestRecipients) && source.allowedTestRecipients.some(Boolean)),
+  );
+
+  return {
+    provider: source.provider || 'unknown',
+    recipientConfigured,
+    recipientPresent: recipientConfigured,
+    recipientValid: recipientConfigured,
+    senderConfigured: Boolean(source.fromAddress),
+    replyToConfigured: Boolean(source.replyToAddress),
+    followUpSenderConfigured: Boolean(source.followUpSenderAddress),
+    followUpReplyToConfigured: Boolean(source.followUpReplyToAddress),
+    inboundDomain: source.inboundDomain || '',
+    webhookEndpoint: source.webhookEndpoint || '',
+    outboundConfigured: Boolean(source.outboundConfigured),
+    webhookConfigured: Boolean(source.webhookConfigured),
+    webhookVerified: Boolean(source.webhookVerified),
+    deliveryTrackingConfigured: Boolean(source.deliveryTrackingConfigured),
+    deliveryTrackingVerified: Boolean(source.deliveryTrackingVerified),
+    replyTrackingConfigured: Boolean(source.replyTrackingConfigured),
+    replyTrackingVerified: Boolean(source.replyTrackingVerified),
+    replyAddressMatchesInboundDomain: Boolean(source.replyAddressMatchesInboundDomain),
+    cimFollowUpsEnabled: Boolean(source.cimFollowUpsEnabled),
+    genericFollowUpsEnabled: Boolean(source.genericFollowUpsEnabled),
+    genericFollowUpsSafe: Boolean(source.genericFollowUpsSafe),
+    followUpSenderMatchesDelivery: Boolean(source.followUpSenderMatchesDelivery),
+    followUpReplyToMatchesDelivery: Boolean(source.followUpReplyToMatchesDelivery),
+    physicalPostalAddressConfigured: Boolean(source.physicalPostalAddressConfigured),
+    replyOptOutConfigured: Boolean(source.replyOptOutConfigured),
+    optOutLinkConfigured: Boolean(source.optOutLinkConfigured),
+    oneClickOptOutVerified: Boolean(source.oneClickOptOutVerified),
+    optOutConfigured: Boolean(source.optOutConfigured),
+    suppressionOperational: Boolean(source.suppressionOperational),
+    aiEnabled: Boolean(source.aiEnabled),
+    deterministicRecommendationsAvailable: Boolean(source.deterministicRecommendationsAvailable),
+    aiModel: source.aiModel || '',
+    aiModelConfigured: Boolean(source.aiModelConfigured),
+    aiApiKeyConfigured: Boolean(source.aiApiKeyConfigured),
+    aiReady: Boolean(source.aiReady),
+    aiReadiness: structuredClone(source.aiReadiness || {}),
+    domainAuthentication: structuredClone(source.domainAuthentication || {}),
+    followUpsEnabled: Boolean(source.followUpsEnabled),
+    followUpsSafe: Boolean(source.followUpsSafe),
+    latestWebhookEvent: projectBrowserEmailReadinessEvent(source.latestWebhookEvent),
+    latestDeliveryEvent: projectBrowserEmailReadinessEvent(source.latestDeliveryEvent),
+    latestReplyEvent: projectBrowserEmailReadinessEvent(source.latestReplyEvent),
+    latestVerifiedReplyEvent: projectBrowserEmailReadinessEvent(source.latestVerifiedReplyEvent),
+    latestTestEvent: projectBrowserEmailReadinessEvent(source.latestTestEvent),
+    metricsAvailable: Boolean(source.metricsAvailable),
+    metrics: structuredClone(source.metrics || {}),
+    issues: Array.isArray(source.issues) ? [...source.issues] : [],
+    error: source.error ? 'Email readiness is temporarily unavailable.' : '',
+  };
+}
+
 export function sanitizeViewerOperations(operations = {}) {
+  const dailyDigest = operations.dailyDigest ? { ...operations.dailyDigest } : operations.dailyDigest;
+  if (dailyDigest) delete dailyDigest.providerMessageId;
   return {
     ...operations,
+    dailyDigest,
     scheduler: {
       ...operations.scheduler,
       runs: (operations.scheduler?.runs || []).map((run) => ({
@@ -206,7 +404,7 @@ export function sanitizeViewerOperations(operations = {}) {
       error: operations.cleanup?.error ? 'Secure-document cleanup history is temporarily unavailable.' : '',
     },
     email: {
-      ...operations.email,
+      ...projectBrowserEmailReadiness(operations.email),
       testRecipient: '',
       allowedTestRecipients: [],
     },
@@ -222,7 +420,7 @@ function settledPanel(result, fallback, error) {
     : { value: fallback, error };
 }
 
-export async function getOperationsCenter({ storage = getStorage(), config = getConfig(), checks = {} } = {}) {
+export async function getOperationsCenter({ storage = getStorage(), config = getConfig(), checks = {}, now = new Date() } = {}) {
   const sourceHealthCheck = checks.sourceHealth || getSourceHealth;
   const diskStatusCheck = checks.disk || getDiskStatus;
   const databaseStatusCheck = checks.database || getDatabaseStatus;
@@ -302,6 +500,7 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
   }, 'CIM identity and outreach safety status is temporarily unavailable.');
 
   const scheduledJobs = Array.isArray(scheduledPanel.value) ? scheduledPanel.value : [];
+  const sanitizedScheduledJobs = scheduledJobs.map(sanitizeScheduledJob);
   const auditEvents = Array.isArray(auditPanel.value) ? auditPanel.value : [];
   const cleanupJobs = Array.isArray(cleanupPanel.value) ? cleanupPanel.value : [];
   const sourceHistory = Array.isArray(sourceHistoryPanel.value) ? sourceHistoryPanel.value : [];
@@ -311,11 +510,18 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
   return {
     generatedAt: new Date().toISOString(),
     scheduler: {
-      runs: scheduledJobs,
-      failures: scheduledJobs.filter((job) => job.status === 'failed').length,
-      pending: scheduledJobs.filter((job) => job.status === 'pending').length,
+      runs: sanitizedScheduledJobs,
+      failures: sanitizedScheduledJobs.filter((job) => job.status === 'failed').length,
+      pending: sanitizedScheduledJobs.filter((job) => job.status === 'pending').length,
       error: scheduledPanel.error,
     },
+    dailyDigest: await dailyDigestOperationsStatus({
+      scheduledJobs,
+      sourceHealth: sourceHealthPanel.value,
+      sourceError: sourceHealthPanel.error,
+      now,
+      config,
+    }),
     sources: {
       current: sourceHealthPanel.value,
       history: sourceHistory,

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import {
   normalizeDealHunterSourceSnapshot,
@@ -52,6 +52,113 @@ function parseJsonColumn(value, fallback) {
   } catch {
     return fallback;
   }
+}
+
+const scheduledJobStatuses = new Set(['pending', 'transmitting', 'failed', 'ambiguous', 'completed']);
+const scheduledJobClaimReasons = new Set([
+  'claimed', 'active', 'retry-not-due', 'not-owner', 'wrong-state', 'completed', 'missing',
+]);
+const scheduledJobImmutableMetadataFields = [
+  'preparedEnvelope',
+  'payloadDigest',
+  'firstPreparedAt',
+  'preparedAt',
+  'businessDate',
+  'pacificDate',
+  'dateKey',
+  'timezone',
+  'notificationType',
+];
+const scheduledJobTransitions = new Map([
+  ['pending', new Set(['pending', 'transmitting', 'failed', 'ambiguous', 'completed'])],
+  ['transmitting', new Set(['failed', 'ambiguous', 'completed'])],
+  ['failed', new Set()],
+  ['ambiguous', new Set(['completed'])],
+  ['completed', new Set()],
+]);
+const scheduledJobClaimTokenPattern = /^[A-Za-z0-9_-]{16,200}$/;
+const scheduledJobRetryDelayMs = 30 * 60 * 1000;
+const scheduledJobMetadataMaxBytes = 512 * 1024;
+
+function normalizeScheduledJobText(value, fieldName, maxLength, { required = true } = {}) {
+  if (typeof value !== 'string' || value.trim() !== value || (required && value.length === 0) || value.length > maxLength) {
+    throw new Error(`${fieldName} must be ${required ? 'a non-empty' : 'an'} unpadded string of at most ${maxLength} characters.`);
+  }
+  return value;
+}
+
+function normalizeScheduledJobToken(value, { generate = false } = {}) {
+  const token = value || (generate ? randomUUID() : '');
+  if (!scheduledJobClaimTokenPattern.test(token)) {
+    throw new Error('Scheduled-job claim token must be a 16-200 character URL-safe opaque value.');
+  }
+  return token;
+}
+
+function normalizeScheduledJobMetadata(value, fieldName) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    if (value === undefined || value === null) return {};
+    throw new Error(`${fieldName} must be a JSON object.`);
+  }
+  let serialized;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new Error(`${fieldName} must be JSON serializable.`);
+  }
+  if (!serialized || Buffer.byteLength(serialized, 'utf8') > scheduledJobMetadataMaxBytes) {
+    throw new Error(`${fieldName} exceeds the scheduled-job metadata limit.`);
+  }
+  return JSON.parse(serialized);
+}
+
+function scheduledJobMetadataFits(value) {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8') <= scheduledJobMetadataMaxBytes;
+}
+
+function mergeScheduledJobMetadata(existing, incoming) {
+  const current = normalizeScheduledJobMetadata(existing, 'Existing scheduled-job metadata');
+  const patch = normalizeScheduledJobMetadata(incoming, 'Scheduled-job metadata');
+  const merged = { ...current, ...patch };
+  for (const field of scheduledJobImmutableMetadataFields) {
+    if (Object.hasOwn(current, field)) merged[field] = current[field];
+  }
+  return merged;
+}
+
+function normalizeScheduledJobRow(row) {
+  if (!row) return null;
+  return {
+    ...row,
+    attempt_count: Number(row.attempt_count || 0),
+    metadata: parseJsonColumn(row.metadata, {}),
+  };
+}
+
+function scheduledJobResult(applied, reason, row) {
+  const normalizedReason = scheduledJobClaimReasons.has(reason) ? reason : 'wrong-state';
+  return {
+    applied: Boolean(applied),
+    claimed: Boolean(applied),
+    reason: normalizedReason,
+    run: normalizeScheduledJobRow(row),
+  };
+}
+
+function scheduledJobClaimDenialReason(row, { staleBefore, retryDueAt, legacy }) {
+  if (!row) return 'missing';
+  if (row.status === 'completed') return 'completed';
+  if (row.status === 'transmitting' || row.status === 'ambiguous') return 'wrong-state';
+  if (row.status === 'pending') {
+    return staleBefore && row.updated_at <= staleBefore ? 'claimed' : 'active';
+  }
+  if (row.status === 'failed') {
+    const metadata = parseJsonColumn(row.metadata, {});
+    const nextRetryAt = typeof metadata.nextRetryAt === 'string' ? metadata.nextRetryAt : '';
+    if (!nextRetryAt) return legacy ? 'claimed' : 'retry-not-due';
+    return retryDueAt && nextRetryAt <= retryDueAt ? 'claimed' : 'retry-not-due';
+  }
+  return 'wrong-state';
 }
 
 function normalizeSubmissionRow(row) {
@@ -9938,39 +10045,201 @@ export function createSqliteStorage(config) {
       `).all(...params, safeLimit).map(normalizeDealHunterDispositionRow);
     },
 
-    async claimScheduledJob({ jobKey = '', jobName = '', triggeredBy = '', nowIso = '', staleBefore = '', metadata = {} } = {}) {
-      if (!jobKey || !jobName || !nowIso) {
-        return { claimed: false, run: null };
-      }
+    async claimScheduledJob({
+      jobKey = '',
+      jobName = '',
+      triggeredBy = '',
+      claimToken = '',
+      nowIso = '',
+      staleBefore = '',
+      retryDueAt = '',
+      metadata = {},
+    } = {}) {
+      if (!jobKey || !jobName || !nowIso) return scheduledJobResult(false, 'missing', null);
 
-      const insertResult = database
-        .prepare(`
+      const legacy = !claimToken && !retryDueAt;
+      const safeJobKey = normalizeScheduledJobText(jobKey, 'Scheduled-job key', 240);
+      const safeJobName = normalizeScheduledJobText(jobName, 'Scheduled-job name', 120);
+      const safeTriggeredBy = normalizeScheduledJobText(
+        triggeredBy,
+        'Scheduled-job trigger',
+        200,
+        { required: false },
+      );
+      const safeToken = normalizeScheduledJobToken(claimToken, { generate: true });
+      const safeNow = normalizeCanonicalUtcIso(nowIso, 'Scheduled-job claim time');
+      const safeStaleBefore = staleBefore
+        ? normalizeCanonicalUtcIso(staleBefore, 'Scheduled-job stale cutoff')
+        : '';
+      const safeRetryDueAt = retryDueAt
+        ? normalizeCanonicalUtcIso(retryDueAt, 'Scheduled-job retry cutoff')
+        : '';
+      const safeMetadata = normalizeScheduledJobMetadata(metadata, 'Scheduled-job claim metadata');
+
+      return database.transaction(() => {
+        const initialMetadata = {
+          ...safeMetadata,
+          claimToken: safeToken,
+          claimedAt: safeNow,
+        };
+        if (!scheduledJobMetadataFits(initialMetadata)) {
+          return scheduledJobResult(false, 'wrong-state', null);
+        }
+        const insertResult = database.prepare(`
           INSERT OR IGNORE INTO scheduled_job_runs (
             job_key, job_name, created_at, updated_at, started_at, status, triggered_by, attempt_count, metadata
           ) VALUES (?, ?, ?, ?, ?, 'pending', ?, 1, ?)
-        `)
-        .run(jobKey, jobName, nowIso, nowIso, nowIso, triggeredBy, JSON.stringify(metadata || {}));
-      let reclaimed = false;
+        `).run(
+          safeJobKey,
+          safeJobName,
+          safeNow,
+          safeNow,
+          safeNow,
+          safeTriggeredBy || null,
+          JSON.stringify(initialMetadata),
+        );
 
-      if (insertResult.changes === 0) {
-        const updateResult = database
-          .prepare(`
-            UPDATE scheduled_job_runs SET
-              updated_at = ?, started_at = ?, completed_at = NULL, status = 'pending',
-              triggered_by = ?, attempt_count = attempt_count + 1,
-              provider_message_id = NULL, last_error = NULL, metadata = ?
-            WHERE job_key = ?
-              AND (status = 'failed' OR (status = 'pending' AND ? <> '' AND updated_at <= ?))
-          `)
-          .run(nowIso, nowIso, triggeredBy, JSON.stringify(metadata || {}), jobKey, staleBefore, staleBefore);
-        reclaimed = updateResult.changes > 0;
+        if (insertResult.changes > 0) {
+          const inserted = database.prepare('SELECT * FROM scheduled_job_runs WHERE job_key = ?').get(safeJobKey);
+          return scheduledJobResult(true, 'claimed', inserted);
+        }
+
+        const current = database.prepare('SELECT * FROM scheduled_job_runs WHERE job_key = ?').get(safeJobKey);
+        if (!current) return scheduledJobResult(false, 'missing', null);
+        if (current.job_name !== safeJobName) return scheduledJobResult(false, 'wrong-state', current);
+
+        const reason = scheduledJobClaimDenialReason(current, {
+          staleBefore: safeStaleBefore,
+          retryDueAt: safeRetryDueAt,
+          legacy,
+        });
+        if (reason !== 'claimed') return scheduledJobResult(false, reason, current);
+        if (parseJsonColumn(current.metadata, {}).claimToken === safeToken) {
+          return scheduledJobResult(false, 'wrong-state', current);
+        }
+
+        const nextMetadata = mergeScheduledJobMetadata(parseJsonColumn(current.metadata, {}), safeMetadata);
+        nextMetadata.claimToken = safeToken;
+        nextMetadata.claimedAt = safeNow;
+        if (!scheduledJobMetadataFits(nextMetadata)) {
+          return scheduledJobResult(false, 'wrong-state', current);
+        }
+        const updateResult = database.prepare(`
+          UPDATE scheduled_job_runs SET
+            updated_at = ?, started_at = ?, completed_at = NULL, status = 'pending',
+            triggered_by = ?, attempt_count = attempt_count + 1,
+            provider_message_id = NULL, last_error = NULL, metadata = ?
+          WHERE job_key = ? AND job_name = ? AND status = ? AND updated_at = ?
+        `).run(
+          safeNow,
+          safeNow,
+          safeTriggeredBy || null,
+          JSON.stringify(nextMetadata),
+          safeJobKey,
+          safeJobName,
+          current.status,
+          current.updated_at,
+        );
+        const run = database.prepare('SELECT * FROM scheduled_job_runs WHERE job_key = ?').get(safeJobKey);
+        return updateResult.changes > 0
+          ? scheduledJobResult(true, 'claimed', run)
+          : scheduledJobResult(false, scheduledJobClaimDenialReason(run, {
+              staleBefore: safeStaleBefore,
+              retryDueAt: safeRetryDueAt,
+              legacy,
+            }), run);
+      }).immediate();
+    },
+
+    async transitionScheduledJob({
+      jobKey = '',
+      claimToken = '',
+      expectedStatuses = [],
+      status = '',
+      nowIso = '',
+      providerMessageId = '',
+      lastError = '',
+      metadataPatch = {},
+      completedAt = '',
+    } = {}) {
+      if (!jobKey || !claimToken || !nowIso) return scheduledJobResult(false, 'missing', null);
+      const safeJobKey = normalizeScheduledJobText(jobKey, 'Scheduled-job key', 240);
+      const safeToken = normalizeScheduledJobToken(claimToken);
+      const safeNow = normalizeCanonicalUtcIso(nowIso, 'Scheduled-job transition time');
+      const safeStatus = normalizeScheduledJobText(status, 'Scheduled-job status', 40);
+      if (!scheduledJobStatuses.has(safeStatus)) throw new Error('Scheduled-job status is not supported.');
+      if (!Array.isArray(expectedStatuses)) throw new Error('Scheduled-job expected statuses must be an array.');
+      const safeExpectedStatuses = [...new Set(expectedStatuses.map((value) => (
+        normalizeScheduledJobText(value, 'Scheduled-job expected status', 40)
+      )))];
+      if (safeExpectedStatuses.length === 0 || safeExpectedStatuses.some((value) => !scheduledJobStatuses.has(value))) {
+        throw new Error('At least one supported expected scheduled-job status is required.');
       }
+      const safeProviderMessageId = providerMessageId
+        ? normalizeScheduledJobText(providerMessageId, 'Scheduled-job provider message ID', 500)
+        : '';
+      const safeLastError = lastError
+        ? normalizeScheduledJobText(lastError, 'Scheduled-job error', 1000)
+        : '';
+      const safeMetadataPatch = normalizeScheduledJobMetadata(metadataPatch, 'Scheduled-job metadata patch');
+      const safeCompletedAt = completedAt
+        ? normalizeCanonicalUtcIso(completedAt, 'Scheduled-job completion time')
+        : '';
 
-      const run = database.prepare('SELECT * FROM scheduled_job_runs WHERE job_key = ?').get(jobKey);
-      return {
-        claimed: insertResult.changes > 0 || reclaimed,
-        run: run ? { ...run, metadata: parseJsonColumn(run.metadata, {}) } : null,
-      };
+      return database.transaction(() => {
+        const current = database.prepare('SELECT * FROM scheduled_job_runs WHERE job_key = ?').get(safeJobKey);
+        if (!current) return scheduledJobResult(false, 'missing', null);
+        if (current.status === 'completed') return scheduledJobResult(false, 'completed', current);
+        const currentMetadata = parseJsonColumn(current.metadata, {});
+        if (currentMetadata.claimToken !== safeToken) return scheduledJobResult(false, 'not-owner', current);
+        if (!safeExpectedStatuses.includes(current.status)) return scheduledJobResult(false, 'wrong-state', current);
+        if (!scheduledJobTransitions.get(current.status)?.has(safeStatus)) {
+          return scheduledJobResult(false, 'wrong-state', current);
+        }
+
+        const nextMetadata = mergeScheduledJobMetadata(currentMetadata, safeMetadataPatch);
+        nextMetadata.claimToken = currentMetadata.claimToken;
+        nextMetadata.claimedAt = currentMetadata.claimedAt;
+        if (safeStatus === 'failed') {
+          nextMetadata.failedAt = safeNow;
+          nextMetadata.nextRetryAt = new Date(Date.parse(safeNow) + scheduledJobRetryDelayMs).toISOString();
+        }
+        if (!scheduledJobMetadataFits(nextMetadata)) {
+          return scheduledJobResult(false, 'wrong-state', current);
+        }
+        const expectedPlaceholders = safeExpectedStatuses.map(() => '?').join(', ');
+        const updateResult = database.prepare(`
+          UPDATE scheduled_job_runs SET
+            updated_at = ?,
+            completed_at = ?,
+            status = ?,
+            provider_message_id = CASE WHEN ? <> '' THEN ? ELSE provider_message_id END,
+            last_error = ?,
+            metadata = ?
+          WHERE job_key = ?
+            AND status IN (${expectedPlaceholders})
+            AND json_extract(metadata, '$.claimToken') = ?
+        `).run(
+          safeNow,
+          safeStatus === 'completed' ? (safeCompletedAt || safeNow) : current.completed_at,
+          safeStatus,
+          safeProviderMessageId,
+          safeProviderMessageId,
+          safeLastError || null,
+          JSON.stringify(nextMetadata),
+          safeJobKey,
+          ...safeExpectedStatuses,
+          safeToken,
+        );
+        const run = database.prepare('SELECT * FROM scheduled_job_runs WHERE job_key = ?').get(safeJobKey);
+        if (updateResult.changes > 0) return scheduledJobResult(true, 'claimed', run);
+        if (!run) return scheduledJobResult(false, 'missing', null);
+        if (run.status === 'completed') return scheduledJobResult(false, 'completed', run);
+        if (parseJsonColumn(run.metadata, {}).claimToken !== safeToken) {
+          return scheduledJobResult(false, 'not-owner', run);
+        }
+        return scheduledJobResult(false, 'wrong-state', run);
+      }).immediate();
     },
 
     async completeScheduledJob(jobKey, values = {}) {
@@ -9995,14 +10264,14 @@ export function createSqliteStorage(config) {
 
     async getScheduledJob(jobKey) {
       const run = database.prepare('SELECT * FROM scheduled_job_runs WHERE job_key = ?').get(jobKey);
-      return run ? { ...run, metadata: parseJsonColumn(run.metadata, {}) } : null;
+      return normalizeScheduledJobRow(run);
     },
 
     async listScheduledJobs({ limit = 100 } = {}) {
       return database
         .prepare('SELECT * FROM scheduled_job_runs ORDER BY updated_at DESC LIMIT ?')
         .all(Math.max(1, Math.min(Number(limit) || 100, 500)))
-        .map((run) => ({ ...run, metadata: parseJsonColumn(run.metadata, {}) }));
+        .map(normalizeScheduledJobRow);
     },
 
     async getDatabaseStatus() {

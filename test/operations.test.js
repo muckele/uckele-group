@@ -1,7 +1,52 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { getOperationsCenter, sanitizeViewerOperations } from '../server/services/operations.js';
+import {
+  getOperationsCenter,
+  projectBrowserEmailReadiness,
+  sanitizeViewerOperations,
+} from '../server/services/operations.js';
+import { writeDailyDealHunterMarker } from '../server/services/dailyDealHunterReconciliation.js';
+
+const operationsNow = new Date('2026-09-05T16:00:00.000Z');
+
+function completeOperationsChecks(sourceHealth = {
+  generatedAt: operationsNow.toISOString(), healthy: true, issues: [],
+  sources: [{ id: 'sheet-0', name: 'SMB Deal Hunter Google Sheet', required: true, sourceRole: 'required-primary', fetched: true, rowCount: 12 }], totals: {},
+}) {
+  return {
+    async sourceHealth() { return sourceHealth; },
+    async disk() { return { ok: true, totalBytes: 100, freeBytes: 50, usedBytes: 50, freePercent: 50 }; },
+    async database() { return { ok: true, provider: 'sqlite', integrity: 'ok', fileBytes: 10 }; },
+    async backup() { return { status: 'healthy', message: 'Backup is healthy.', latest: null }; },
+    async emailReadiness() { return { provider: 'resend', issues: [] }; },
+    async cimAutomation() { return { configuredStage: 1, effectiveStage: 1, paused: true, metrics: {}, policy: {} }; },
+    async communications() { return { pending: 0, failed: 0, unassigned: 0 }; },
+    async cimIdentity() { return { pause: { paused: true, source: 'configuration' }, storageHealthy: true }; },
+  };
+}
+
+function operationsConfig({ markerDir = '' } = {}) {
+  return {
+    storage: { provider: 'sqlite', sqlitePath: path.join('/tmp', 'operations.sqlite') },
+    delivery: { provider: 'resend' },
+    dealHunter: {
+      dailyEmail: { timezone: 'America/Los_Angeles', time: '08:00', markerDir },
+      cimFollowUp: {},
+    },
+  };
+}
+
+function operationsStorage(runs = []) {
+  return {
+    async listScheduledJobs() { return runs; },
+    async listAdminAuditEvents() { return []; },
+    async listSecureDocumentCleanupJobs() { return []; },
+    async listSourceHealthSnapshots() { return []; },
+  };
+}
 
 test('Operations remains available with a sanitized per-panel error when one source rejects', async () => {
   const sensitiveFailure = '/private/data/operations.sqlite failed with secret-token';
@@ -105,6 +150,7 @@ test('Operations communication ingestion failure is isolated and never exposes t
 });
 
 test('viewer Operations projection retains aggregate Stage 2 gates and strips identities, addresses, bodies, and protected decision context', () => {
+  const viewerProviderSentinel = 'viewer-raw-provider-sentinel-9f2';
   const projected = sanitizeViewerOperations({
     scheduler: { runs: [{ job_key: 'job-1', job_name: 'shadow', status: 'completed', updated_at: '2026-08-12T12:00:00.000Z', last_error: 'private path' }] },
     audit: { events: [{ id: 'audit-1', actor: 'release-owner@example.test' }] },
@@ -129,6 +175,7 @@ test('viewer Operations projection retains aggregate Stage 2 gates and strips id
       canonicalOpportunities: 12,
       lastAudit: { mode: 'read-only', generatedAt: '2026-08-12T12:00:00.000Z', counts: { exceptions: 0 }, privateRows: ['broker-two@example.test'] },
     },
+    dailyDigest: { status: 'completed', provider: 'resend', providerMessageId: viewerProviderSentinel },
   });
   const serialized = JSON.stringify(projected);
 
@@ -140,7 +187,396 @@ test('viewer Operations projection retains aggregate Stage 2 gates and strips id
   assert.equal(projected.cimIdentity.canonicalOpportunities, 12);
   assert.equal(projected.cimIdentity.pause.updatedBy, undefined);
   assert.equal(projected.cleanup.failureCount, 1);
+  assert.equal(Object.hasOwn(projected.dailyDigest, 'providerMessageId'), false);
   for (const forbidden of ['release-owner@example.test', 'admin@example.test', 'broker@example.test', 'pause-owner@example.test', 'broker-two@example.test', '123 Private Address', 'private-compliance-reference', 'private body', 'private-deal-key', 'private candidate', 'private path', 'private filename']) {
     assert.equal(serialized.includes(forbidden), false, forbidden);
   }
+  assert.equal(serialized.includes(viewerProviderSentinel), false);
+});
+
+test('viewer Operations projects realistic internal email readiness without mutating source state', async () => {
+  const providerMessageId = 'operations-admin-provider-id-51c';
+  const readinessError = 'PRIVATE OPERATIONS READINESS PROVIDER ERROR';
+  const addressSentinels = {
+    recipient: 'operations-recipient-alias@example.invalid',
+    sender: 'operations-sender-alias@example.invalid',
+    replyTo: 'operations-reply-alias@example.invalid',
+    reply_to: 'operations-reply-snake-alias@example.invalid',
+    recipientAddress: 'operations-recipient-address-alias@example.invalid',
+    senderAddress: 'operations-sender-address-alias@example.invalid',
+    testRecipient: 'operations-test-recipient@example.invalid',
+    allowedTestRecipient: 'operations-allowed-recipient@example.invalid',
+    fromAddress: 'Operations Sender <operations-from@example.invalid>',
+    replyToAddress: 'operations-reply-to@example.invalid',
+    followUpSenderAddress: 'operations-follow-sender@example.invalid',
+    followUpReplyToAddress: 'operations-follow-reply@example.invalid',
+  };
+  const readiness = {
+    provider: 'resend',
+    recipient: addressSentinels.recipient,
+    sender: addressSentinels.sender,
+    replyTo: addressSentinels.replyTo,
+    reply_to: addressSentinels.reply_to,
+    recipientAddress: addressSentinels.recipientAddress,
+    senderAddress: addressSentinels.senderAddress,
+    testRecipient: addressSentinels.testRecipient,
+    allowedTestRecipients: [addressSentinels.allowedTestRecipient],
+    fromAddress: addressSentinels.fromAddress,
+    replyToAddress: addressSentinels.replyToAddress,
+    followUpSenderAddress: addressSentinels.followUpSenderAddress,
+    followUpReplyToAddress: addressSentinels.followUpReplyToAddress,
+    outboundConfigured: true,
+    webhookConfigured: true,
+    webhookVerified: true,
+    deliveryTrackingConfigured: true,
+    deliveryTrackingVerified: true,
+    replyTrackingConfigured: true,
+    replyTrackingVerified: true,
+    metricsAvailable: true,
+    metrics: { sentLast24Hours: 2 },
+    issues: ['Bounded readiness issue.'],
+    error: readinessError,
+  };
+  const operations = await getOperationsCenter({
+    now: operationsNow,
+    config: operationsConfig(),
+    checks: {
+      ...completeOperationsChecks(),
+      async emailReadiness() { return readiness; },
+    },
+    storage: operationsStorage([{
+      job_key: 'daily-deal-hunter-email:2026-09-05',
+      job_name: 'daily-deal-hunter-email',
+      status: 'completed',
+      completed_at: '2026-09-05T15:02:00.000Z',
+      attempt_count: 1,
+      provider_message_id: providerMessageId,
+      metadata: { businessDate: '2026-09-05', notificationType: 'normal-digest', provider: 'resend' },
+    }]),
+  });
+  const originalOperations = structuredClone(operations);
+  const originalReadiness = structuredClone(readiness);
+
+  for (const sentinel of Object.values(addressSentinels)) {
+    assert.equal(JSON.stringify(operations).includes(sentinel), true, `internal ${sentinel}`);
+  }
+
+  const adminEmail = projectBrowserEmailReadiness(readiness);
+  assert.equal(JSON.stringify(adminEmail).includes(readinessError), false);
+  assert.equal(adminEmail.error, 'Email readiness is temporarily unavailable.');
+
+  const viewerSource = { ...operations, email: readiness };
+  const originalViewerSource = structuredClone(viewerSource);
+  const viewer = sanitizeViewerOperations(viewerSource);
+  const serializedViewer = JSON.stringify(viewer);
+
+  for (const sentinel of Object.values(addressSentinels)) {
+    assert.equal(serializedViewer.includes(sentinel), false, sentinel);
+  }
+  assert.equal(serializedViewer.includes(readinessError), false);
+  for (const field of [
+    'recipient', 'sender', 'replyTo', 'reply_to', 'recipientAddress', 'senderAddress',
+    'fromAddress', 'replyToAddress', 'followUpSenderAddress', 'followUpReplyToAddress',
+  ]) {
+    assert.equal(Object.hasOwn(viewer.email, field), false, field);
+  }
+  assert.equal(viewer.email.testRecipient, '');
+  assert.deepEqual(viewer.email.allowedTestRecipients, []);
+  assert.equal(viewer.email.provider, 'resend');
+  assert.equal(viewer.email.outboundConfigured, true);
+  assert.equal(viewer.email.recipientConfigured, true);
+  assert.equal(viewer.email.senderConfigured, true);
+  assert.equal(viewer.email.replyToConfigured, true);
+  assert.equal(viewer.email.followUpSenderConfigured, true);
+  assert.equal(viewer.email.followUpReplyToConfigured, true);
+  assert.equal(viewer.email.webhookConfigured, true);
+  assert.deepEqual(viewer.email.metrics, { sentLast24Hours: 2 });
+  assert.deepEqual(viewer.email.issues, ['Bounded readiness issue.']);
+  assert.equal(viewer.email.error, 'Email readiness is temporarily unavailable.');
+  assert.equal(operations.dailyDigest.providerMessageId, providerMessageId);
+  assert.equal(Object.hasOwn(viewer.dailyDigest, 'providerMessageId'), false);
+  assert.deepEqual(operations, originalOperations);
+  assert.deepEqual(readiness, originalReadiness);
+  assert.deepEqual(viewerSource, originalViewerSource);
+});
+
+test('browser email readiness removes subjects from every latest event projection', () => {
+  const eventFields = [
+    'latestWebhookEvent',
+    'latestDeliveryEvent',
+    'latestReplyEvent',
+    'latestVerifiedReplyEvent',
+    'latestTestEvent',
+  ];
+  const readiness = { provider: 'resend' };
+  for (const [index, field] of eventFields.entries()) {
+    readiness[field] = {
+      createdAt: `2026-09-08T15:0${index}:00.000Z`,
+      eventType: index % 2 === 0 ? 'delivered' : 'replied',
+      source: 'webhook',
+      subject: `PRIVATE SUBJECT SENTINEL ${index}`,
+    };
+  }
+  const original = structuredClone(readiness);
+
+  const projected = projectBrowserEmailReadiness(readiness);
+
+  for (const [index, field] of eventFields.entries()) {
+    assert.notStrictEqual(projected[field], readiness[field], field);
+    assert.deepEqual(projected[field], {
+      createdAt: `2026-09-08T15:0${index}:00.000Z`,
+      eventType: index % 2 === 0 ? 'delivered' : 'replied',
+      source: 'webhook',
+    }, field);
+    assert.equal(Object.hasOwn(projected[field], 'subject'), false, field);
+  }
+  assert.equal(JSON.stringify(projected).includes('PRIVATE SUBJECT SENTINEL'), false);
+  assert.deepEqual(readiness, original);
+});
+
+test('browser email readiness latest events fail closed against future private aliases', () => {
+  const eventFields = [
+    'latestWebhookEvent',
+    'latestDeliveryEvent',
+    'latestReplyEvent',
+    'latestVerifiedReplyEvent',
+    'latestTestEvent',
+  ];
+  const privateFields = [
+    'recipient', 'recipientAddress', 'sender', 'senderAddress', 'replyTo', 'replyToAddress',
+    'providerMessageId', 'provider_message_id', 'messageId', 'message_id', 'emailId', 'email_id',
+    'rawProviderResponse', 'error', 'privateDiagnostic', 'futureAddress', 'futureSecret',
+  ];
+  const readiness = { provider: 'resend' };
+  const privateSentinels = [];
+  for (const [eventIndex, eventField] of eventFields.entries()) {
+    const event = {
+      createdAt: `2026-09-08T16:0${eventIndex}:00.000Z`,
+      eventType: 'delivered',
+      source: 'webhook',
+    };
+    for (const privateField of privateFields) {
+      const sentinel = `PRIVATE EVENT ${eventIndex} ${privateField}`;
+      event[privateField] = privateField === 'rawProviderResponse' ? { sentinel } : sentinel;
+      privateSentinels.push(sentinel);
+    }
+    readiness[eventField] = event;
+  }
+  const original = structuredClone(readiness);
+
+  const projected = projectBrowserEmailReadiness(readiness);
+  const serialized = JSON.stringify(projected);
+
+  for (const eventField of eventFields) {
+    assert.notStrictEqual(projected[eventField], readiness[eventField], eventField);
+    assert.deepEqual(projected[eventField], {
+      createdAt: readiness[eventField].createdAt,
+      eventType: 'delivered',
+      source: 'webhook',
+    }, eventField);
+    for (const privateField of privateFields) {
+      assert.equal(Object.hasOwn(projected[eventField], privateField), false, `${eventField}.${privateField}`);
+    }
+  }
+  for (const sentinel of privateSentinels) assert.equal(serialized.includes(sentinel), false, sentinel);
+  assert.deepEqual(readiness, original);
+});
+
+test('operations sanitizes daily digest envelope and recipient from every scheduled job', async () => {
+  const sentinels = [
+    'recipient-sentinel@example.test', 'sender-sentinel@example.test', 'PRIVATE SUBJECT SENTINEL',
+    'PRIVATE TEXT SENTINEL', 'PRIVATE HTML SENTINEL', 'CLAIM TOKEN SENTINEL',
+    'IDEMPOTENCY SENTINEL', 'RAW METADATA SENTINEL', 'RAW PROVIDER ERROR SENTINEL',
+  ];
+  const operations = await getOperationsCenter({
+    now: operationsNow,
+    config: operationsConfig(),
+    checks: completeOperationsChecks(),
+    storage: operationsStorage([{
+      job_key: 'daily-deal-hunter-email:2026-09-05',
+      job_name: 'daily-deal-hunter-email',
+      status: 'completed',
+      created_at: '2026-09-05T15:00:00.000Z',
+      updated_at: '2026-09-05T15:02:00.000Z',
+      completed_at: '2026-09-05T15:02:00.000Z',
+      attempt_count: 1,
+      provider_message_id: 'resend-safe-123',
+      last_error: sentinels[8],
+      metadata: {
+        businessDate: '2026-09-05', notificationType: 'normal-digest', provider: 'resend',
+        recipient: sentinels[0], sender: sentinels[1], subject: sentinels[2], text: sentinels[3], html: sentinels[4],
+        claimToken: sentinels[5], idempotencyKey: sentinels[6], rawMetadata: sentinels[7],
+        preparedEnvelope: { to: sentinels[0], from: sentinels[1], subject: sentinels[2], text: sentinels[3], html: sentinels[4] },
+        providerResponse: { error: sentinels[8] },
+      },
+    }]),
+  });
+  const serialized = JSON.stringify(operations);
+
+  assert.equal(operations.dailyDigest?.status, 'completed');
+  assert.equal(operations.dailyDigest?.providerMessageId, 'resend-safe-123');
+  assert.equal(Object.hasOwn(operations.scheduler.runs[0], 'metadata'), false);
+  for (const sentinel of sentinels) assert.equal(serialized.includes(sentinel), false, sentinel);
+  assert.equal(serialized.includes('preparedEnvelope'), false);
+});
+
+test('operations surfaces daily completed alert failed retry pending stale and ambiguous states', async (t) => {
+  const cases = [
+    ['completed', { status: 'completed', completed_at: '2026-09-05T15:02:00.000Z', metadata: { notificationType: 'normal-digest' } }, false],
+    ['alert', { status: 'completed', completed_at: '2026-09-05T15:02:00.000Z', metadata: { notificationType: 'required-source-alert' } }, false],
+    ['failed retry pending', { status: 'failed', metadata: { notificationType: 'normal-digest', failedAt: '2026-09-05T15:02:00.000Z', nextRetryAt: '2026-09-05T16:30:00.000Z', failureCategory: 'provider-nonacceptance' } }, false],
+    ['stale pending', { status: 'pending', created_at: '2026-09-05T13:00:00.000Z', metadata: { notificationType: 'normal-digest' } }, false],
+    ['ambiguous', { status: 'ambiguous', metadata: { notificationType: 'normal-digest', reconciliation: { checkedAt: '2026-09-05T15:30:00.000Z', source: 'provider-lookup', errorCategory: 'conflicting-provider-evidence', severity: 'high' } } }, true],
+  ];
+
+  for (const [name, run, attentionRequired] of cases) {
+    await t.test(name, async () => {
+      const operations = await getOperationsCenter({
+        now: operationsNow,
+        config: operationsConfig(),
+        checks: completeOperationsChecks(),
+        storage: operationsStorage([{
+          job_key: 'daily-deal-hunter-email:2026-09-05', job_name: 'daily-deal-hunter-email', attempt_count: 2,
+          ...run,
+        }]),
+      });
+      assert.equal(operations.dailyDigest?.status, run.status);
+      assert.equal(operations.dailyDigest?.notificationType, run.metadata.notificationType);
+      assert.equal(operations.dailyDigest?.attentionRequired, attentionRequired);
+    });
+  }
+});
+
+test('Daily Digest Operations stale age uses the current claim attempt', async (t) => {
+  const cases = [
+    ['fresh metadata claim overrides older row timestamps', {
+      created_at: '2026-09-05T13:00:00.000Z',
+      started_at: '2026-09-05T13:01:00.000Z',
+      updated_at: '2026-09-05T13:02:00.000Z',
+      metadata: { claimedAt: '2026-09-05T15:59:00.000Z' },
+    }, false],
+    ['stale metadata claim overrides newer fallback timestamps', {
+      created_at: '2026-09-05T15:59:00.000Z',
+      started_at: '2026-09-05T15:59:00.000Z',
+      updated_at: '2026-09-05T15:59:00.000Z',
+      metadata: { claimedAt: '2026-09-05T14:59:59.999Z' },
+    }, true],
+    ['started timestamp is the first valid fallback', {
+      created_at: '2026-09-05T13:00:00.000Z',
+      started_at: '2026-09-05T15:58:00.000Z',
+      updated_at: '2026-09-05T13:02:00.000Z',
+      metadata: { claimedAt: 'invalid' },
+    }, false],
+    ['updated timestamp precedes the legacy created fallback', {
+      created_at: '2026-09-05T13:00:00.000Z',
+      started_at: 'invalid',
+      updated_at: '2026-09-05T15:57:00.000Z',
+      metadata: {},
+    }, false],
+    ['created timestamp remains the backward-compatible fallback', {
+      created_at: '2026-09-05T14:00:00.000Z',
+      started_at: 'invalid',
+      updated_at: 'invalid',
+      metadata: {},
+    }, true],
+  ];
+
+  for (const [name, timestamps, stale] of cases) {
+    await t.test(name, async () => {
+      const operations = await getOperationsCenter({
+        now: operationsNow,
+        config: operationsConfig(),
+        checks: completeOperationsChecks(),
+        storage: operationsStorage([{
+          job_key: 'daily-deal-hunter-email:2026-09-05',
+          job_name: 'daily-deal-hunter-email',
+          status: 'pending',
+          attempt_count: 2,
+          ...timestamps,
+          metadata: { notificationType: 'normal-digest', ...timestamps.metadata },
+        }]),
+      });
+      assert.equal(operations.dailyDigest?.stale, stale);
+      assert.equal(operations.dailyDigest?.attentionRequired, false);
+      assert.equal(operations.dailyDigest?.status, 'pending');
+    });
+  }
+});
+
+test('Daily Digest Operations marker status reads matching missing and conflicting marker evidence', async (t) => {
+  const baseRun = {
+    job_key: 'daily-deal-hunter-email:2026-09-05',
+    job_name: 'daily-deal-hunter-email',
+    status: 'completed',
+    created_at: '2026-09-05T15:00:00.000Z',
+    updated_at: '2026-09-05T15:02:00.000Z',
+    completed_at: '2026-09-05T15:02:00.000Z',
+    attempt_count: 1,
+    provider_message_id: 'resend-marker-provider-42',
+    metadata: {
+      businessDate: '2026-09-05',
+      notificationType: 'normal-digest',
+      provider: 'resend',
+      payloadDigest: 'a'.repeat(64),
+    },
+  };
+
+  for (const [name, marker, expected] of [
+    ['matching', {
+      jobKey: baseRun.job_key,
+      businessDate: '2026-09-05',
+      notificationType: 'normal-digest',
+      payloadDigest: 'a'.repeat(64),
+      providerMessageId: baseRun.provider_message_id,
+      acceptedAt: baseRun.completed_at,
+    }, 'agreed'],
+    ['missing', null, 'not-recorded'],
+    ['conflicting', {
+      jobKey: baseRun.job_key,
+      businessDate: '2026-09-05',
+      notificationType: 'normal-digest',
+      payloadDigest: 'b'.repeat(64),
+      providerMessageId: baseRun.provider_message_id,
+      acceptedAt: baseRun.completed_at,
+    }, 'mismatch'],
+  ]) {
+    await t.test(name, async (context) => {
+      const markerDir = await fs.mkdtemp(path.join(os.tmpdir(), `operations-marker-${name}-`));
+      context.after(() => fs.rm(markerDir, { recursive: true, force: true }));
+      if (marker) await writeDailyDealHunterMarker({ markerDir, evidence: marker });
+      const operations = await getOperationsCenter({
+        now: operationsNow,
+        config: operationsConfig({ markerDir }),
+        checks: completeOperationsChecks(),
+        storage: operationsStorage([baseRun]),
+      });
+      assert.equal(operations.dailyDigest?.markerStatus, expected);
+      assert.equal(Object.hasOwn(operations.dailyDigest, 'marker'), false);
+      assert.equal(JSON.stringify(operations).includes(marker?.payloadDigest || 'no-marker-content'), false);
+    });
+  }
+});
+
+test('operations reports marker mismatch without exposing marker content', async () => {
+  const markerSentinel = 'PRIVATE MARKER PAYLOAD SENTINEL';
+  const operations = await getOperationsCenter({
+    now: operationsNow,
+    config: operationsConfig(),
+    checks: completeOperationsChecks(),
+    storage: operationsStorage([{
+      job_key: 'daily-deal-hunter-email:2026-09-05', job_name: 'daily-deal-hunter-email', status: 'ambiguous', attempt_count: 1,
+      metadata: {
+        businessDate: '2026-09-05', notificationType: 'normal-digest',
+        reconciliation: { checkedAt: '2026-09-05T15:30:00.000Z', source: 'marker', errorCategory: 'marker-mismatch', severity: 'high' },
+        marker: { raw: markerSentinel, payloadDigest: markerSentinel },
+      },
+    }]),
+  });
+  const serialized = JSON.stringify(operations);
+
+  assert.equal(operations.dailyDigest?.markerStatus, 'mismatch');
+  assert.equal(operations.dailyDigest?.attentionRequired, true);
+  assert.equal(serialized.includes(markerSentinel), false);
+  assert.equal(Object.hasOwn(operations.scheduler.runs[0], 'metadata'), false);
+  assert.equal(Object.hasOwn(operations.dailyDigest, 'marker'), false);
 });

@@ -26,17 +26,17 @@ Set these in Fly before the first deploy:
 ```bash
 fly secrets set \
   DELIVERY_PROVIDER=resend \
-  LEAD_NOTIFICATION_EMAIL=mathew@uckelegroup.com \
+  LEAD_NOTIFICATION_EMAIL='<configured internal address>' \
   RESEND_API_KEY=... \
-  RESEND_FROM_EMAIL="Uckele Group <mathew@uckelegroup.com>" \
-  RESEND_REPLY_TO=deals@replies.uckelegroup.com \
+  RESEND_FROM_EMAIL='<verified sender>' \
+  RESEND_REPLY_TO='<configured reply address>' \
   RESEND_INBOUND_DOMAIN=replies.uckelegroup.com \
   RESEND_WEBHOOK_SECRET=... \
   EMAIL_BRAND_COMPANY_NAME="Uckele Group" \
-  DEAL_HUNTER_EMAIL_RECIPIENT=mathew@uckelegroup.com \
+  DEAL_HUNTER_EMAIL_RECIPIENT='<configured internal address>' \
   DEAL_HUNTER_SHEET_CSV_URL="https://docs.google.com/spreadsheets/d/.../gviz/tq?tqx=out:csv&gid=..." \
   ADMIN_AUTH_MODE=magic-link \
-  ADMIN_EMAIL=mathew@uckelegroup.com \
+  ADMIN_EMAIL='<configured administrator address>' \
   ADMIN_SESSION_SECRET=... \
   ADMIN_MAGIC_LINK_SECRET=... \
   SECURE_DOCUMENTS_TOKEN_SECRET=... \
@@ -129,16 +129,53 @@ Then update DNS:
 
 ## Before Go-Live
 
-- Confirm the contact form is delivering to `mathew@uckelegroup.com`
-- Confirm `/admin` can run Deal Hunter scoring and send the daily email
+### Daily Deal Hunter Digest: authorized-release handoff
+
+Task 5 is non-production evidence only. The historical/current-known baseline is Fly release 116, SQLite at `/data/uckele-group.sqlite`, and persistent `/data`; reverify all three during a separately authorized release and do not treat them as current assertions. Deploy only in a separately approved **pre-08:00 Pacific** window so the first natural scheduled result is the smoke. **DO NOT SEND A MANUAL TEST DAILY DIGEST AFTER DEPLOYMENT.** Do not manually trigger another same-date result to test delivery.
+
+Immediately before an authorized deployment, verify the intended release SHA and production-base ancestry; rerun the complete Node v22.23.2 release suite; create and verify an application-consistent production SQLite backup; run SQLite integrity/`quick_check`; confirm persistent `/data`; confirm Daily Digest readiness; verify the server-owned recipient only as configured/valid plus a non-reversible fingerprint or suffix; confirm Resend and signed webhook readiness; confirm the durable marker path exists and is writable; prove exactly one `startDealHunterDailyEmailScheduler()` registration and no legacy/duplicate scheduler; and confirm source authority is healthy enough for the intended first result. Never print an address, secret, source key/private URL, session/token, claim token, prepared envelope, raw provider payload, or private broker/contact data.
+
+The following are **MUST VERIFY DURING AUTHORIZED RELEASE**, both before and after deployment—not verified by Task 5:
+
+- `cimOutreachPaused = true`
+- `cimFollowUpEnabled = false`
+- `cimAutomationStage = 1`
+- `cimAutomationPaused = true`
+- `cimAutomationSchedulerEnabled = false`
+
+For the Phase 4 Daily Digest release, do not perform live CIM requests or sends, broker sends, Phase 3 follow-up transmissions, or Stage 2 execution/sends; do not lift the CIM outreach pause or enable follow-up automation. The first natural 08:00 Pacific Daily Digest result is the only email smoke, so do not send a second or manual Daily Digest message. Those broader workflows are outside this release check and require separate explicit authorization.
+
+The release is **NO-GO** for any failed test/browser gate, unexpected dirty worktree, release/base mismatch, backup or SQLite integrity failure, non-unique/invalid recipient resolution, Resend or signed-webhook unreadiness, non-durable/unwritable marker path, multiple scheduler registrations, changed frozen safety value, unresolved current-date `transmitting`/`ambiguous` job, or unexpected unhealthy required source when a normal first result is intended. A known required-source problem may intentionally yield the approved `required-source-alert`; that is not permission to ignore an unexpected rollout blocker. An existing same-date completion is also a stop condition for using that date as the first-result smoke.
+
+At the first natural 08:00 Pacific result, observe without creating another send:
+
+1. correct Pacific calendar date and one `daily-deal-hunter-email:<date>` key;
+2. exactly one current claim owner and exactly one result type, `normal-digest` or `required-source-alert`;
+3. for an accepted result, exactly one provider identity, a matching completed `scheduled_job_runs` row, matching marker, and agreeing local/signed provider evidence;
+4. repeated ordinary scheduler ticks produce no duplicate provider invocation;
+5. Acquisition Inbox Morning Briefing and sanitized Operations state match durable authority; and
+6. no CRM mutation, CIM request/send, broker-material send, Phase 3 follow-up send, or Stage 2 execution/send occurred, and all five frozen values remain unchanged.
+
+For a normal result, confirm required source healthy, any optional warning bounded, trusted counts present, and no more than five existing-priority recommendations. For a required-source alert, confirm **ACTION REQUIRED**, no trusted counts/recommendations, persisted rows labeled last known, and protected mutations blocked by the server. If the result is `transmitting` or `ambiguous`, **STOP: do not retry transmission, delete the job, marker, or email events, or reset the date claim.** Reconcile only from the exact durable marker, local email event, signed/replay-safe Resend evidence, or bounded read-only provider lookup. One exact provider identity may complete; zero remains unresolved/ambiguous according to the window; multiple identities are high attention and must not resend. Favor a missed digest over a duplicate.
+
+Rollback may revert only the approved application release or Daily Digest configuration. Preserve `scheduled_job_runs`, claim/state metadata, marker, `email_events`, provider evidence, the prepared-envelope/idempotency identity, and every ambiguity clue. Never “clean up” an ambiguous date by deleting it. Production GO remains conditional on the live checklist; the non-production conclusion is only **CODE READY FOR AUTHORIZED RELEASE CHECK**.
+
+SQLite production must not receive the Supabase migration. If Supabase/PostgreSQL is deployed later, apply `20260904120000_daily_digest_scheduled_job_fencing.sql` through normal migration handling and verify `claim_scheduled_job` and `transition_scheduled_job` remain service-role-only. No table/column expansion is authorized.
+
+### Broader-product go-live checks: outside Phase 4
+
+The checklist below is not part of Phase 4 Daily Digest release verification. Any live CIM, follow-up, broker-outreach, or other broader-product transmission requires separate explicit authorization, must not be performed while validating the Phase 4 release, and must not require changing any of the five frozen Phase 4 safety values above.
+
+- Confirm the contact form is delivering to the configured internal recipient without printing it
+- Confirm `/admin` renders the bounded Morning Briefing and sanitized Operations authority; do not use the admin trigger as a production smoke
 - Confirm no Airtable request is made and the admin/email label Airtable as retired
-- Confirm a healthy Google Sheet with no Deal OS import sends a normal digest with a supplemental-data warning
+- In non-production with fake provider seams, confirm a healthy Google Sheet with no Deal OS import prepares a normal digest with a supplemental-data warning
 - Upload controlled CSV and XLSX Deal OS fixtures as a full administrator; confirm viewer upload is denied, provenance/age/coverage appear in source health, duplicates collapse, and a stale export is excluded without blocking a Sheet-backed digest
-- Make the Google Sheet CSV temporarily unavailable in a controlled environment; confirm exactly one Pacific-date action-required alert is sent with no recommendations, CRM sync, CIM request, follow-up, or Stage 2 provider work, then restore access and verify source health
+- In non-production, make the Google Sheet CSV temporarily unavailable; confirm exactly one Pacific-date action-required alert is prepared through fake provider seams with no recommendations, CRM sync, CIM request, follow-up, or Stage 2 provider work, then restore access and verify source health
 - With Resend configured, confirm `/admin` can send a controlled 75+ Deal Hunter CIM request and run the CIM follow-up check
-- Confirm the in-app scheduler logs `deal-hunter:scheduler` startup and sends after the configured Pacific time
-- If using an external scheduler, confirm it posts to `/api/deal-hunter/daily-email` with `Authorization: Bearer DEAL_HUNTER_CRON_SECRET`
-- Confirm the first successful daily email creates Deal Hunter history rows so later emails can separate newly seen matches from already reviewed listings
+- Confirm startup logs show exactly one `deal-hunter:scheduler` registration; observe only the first natural scheduled result after the configured Pacific time
+- If an external scheduler is configured, verify its zero-payload request and `Authorization: Bearer DEAL_HUNTER_CRON_SECRET` configuration without invoking a second same-date production result
+- Confirm the first accepted result creates one completed scheduled-job row, matching marker, and matching email/provider evidence without writing CRM or legacy seen-deal history
 - Confirm magic-link sign-in emails are being delivered
 - If SMB Deal Hunter viewer access is needed, configure `ADMIN_VIEWER_EMAILS` or `ADMIN_VIEWER_USERNAME` / `ADMIN_VIEWER_PASSWORD` and verify a viewer cannot save, export, send emails, or run imports
 - Confirm Resend webhook events create email engagement records in the admin CRM

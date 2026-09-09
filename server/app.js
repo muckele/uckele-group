@@ -96,7 +96,12 @@ import {
 import { asyncRoute } from './utils/http.js';
 import { safeCompareText } from './utils/security.js';
 import { listCrmActivity, projectCrmActivityTimeline } from './services/activity.js';
-import { getOperationsCenter, sanitizeViewerOperations } from './services/operations.js';
+import {
+  getOperationsCenter,
+  projectBrowserEmailReadiness,
+  sanitizeViewerOperations,
+} from './services/operations.js';
+export { projectBrowserEmailReadiness } from './services/operations.js';
 import {
   assignUnassignedCommunication,
   createManualCommunication,
@@ -151,6 +156,91 @@ function requireDealHunterCron(request, config) {
   const providedSecret = extractBearerSecret(request);
 
   return Boolean(config.dealHunter.cronSecret && providedSecret && safeCompareText(providedSecret, config.dealHunter.cronSecret));
+}
+
+function hasStrictEmptyBody(request) {
+  const body = request?.body;
+  if (Buffer.isBuffer(body)) {
+    if (body.length === 0) return true;
+    const contentType = String(request.headers?.['content-type'] || '').split(';')[0].trim().toLowerCase();
+    if (contentType !== 'application/json') return false;
+    try {
+      const parsed = JSON.parse(body.toString('utf8'));
+      return Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed)
+        && Object.keys(parsed).length === 0;
+    } catch {
+      return false;
+    }
+  }
+  if (body === undefined) {
+    const contentLength = String(request.headers?.['content-length'] || '').trim();
+    const transferEncoding = String(request.headers?.['transfer-encoding'] || '').trim();
+    return (!contentLength || contentLength === '0') && !transferEncoding;
+  }
+  return Boolean(body) && typeof body === 'object' && !Array.isArray(body)
+    && Object.keys(body).length === 0;
+}
+
+function dailyDealHunterHttpStatus(status) {
+  if (status === 'failed') return 502;
+  if (['in-progress', 'retry-not-due', 'transmitting', 'ambiguous', 'not-due'].includes(status)) return 409;
+  if (['sent', 'logged', 'already-sent'].includes(status)) return 200;
+  return 503;
+}
+
+const dealHunterReviewBuckets = ['newlySeenMatches', 'qualified', 'watchlist', 'removalCandidates'];
+
+export function sanitizeViewerDealHunterReview(review = {}) {
+  const dailyEmailJob = review.dailyEmailJob && typeof review.dailyEmailJob === 'object'
+    ? { ...review.dailyEmailJob }
+    : review.dailyEmailJob;
+  if (dailyEmailJob) delete dailyEmailJob.providerMessageId;
+
+  const sanitized = {
+    ...review,
+    dailyEmailJob,
+  };
+
+  for (const bucket of dealHunterReviewBuckets) {
+    if (!Array.isArray(review[bucket])) continue;
+    sanitized[bucket] = review[bucket].map((deal) => {
+      if (!deal || typeof deal !== 'object') return deal;
+      const cimRequest = deal.cimRequest && typeof deal.cimRequest === 'object'
+        ? { ...deal.cimRequest }
+        : deal.cimRequest;
+      if (cimRequest) delete cimRequest.providerMessageId;
+      return { ...deal, cimRequest };
+    });
+  }
+
+  return sanitized;
+}
+
+function dailyDealHunterRouteResult(result = {}) {
+  const emailResult = result.emailResult || {};
+  const status = String(emailResult.status || 'unavailable').slice(0, 80);
+  const jobRun = result.jobRun && typeof result.jobRun === 'object' ? {
+    status: String(result.jobRun.status || '').slice(0, 40),
+    attemptCount: Number.isInteger(result.jobRun.attempt_count) ? result.jobRun.attempt_count : null,
+    completedAt: String(result.jobRun.completed_at || '').slice(0, 40),
+    nextRetryAt: String(result.jobRun.next_retry_at || result.jobRun.nextRetryAt || '').slice(0, 40),
+    providerMessageId: String(result.jobRun.provider_message_id || '').slice(0, 240),
+  } : null;
+  return {
+    success: ['sent', 'logged', 'already-sent'].includes(status),
+    status,
+    jobKey: String(result.jobKey || '').slice(0, 240),
+    notificationType: String(result.notificationType || '').slice(0, 40),
+    alreadySent: Boolean(result.alreadySent),
+    inProgress: Boolean(result.inProgress),
+    emailResult: {
+      status,
+      provider: String(emailResult.provider || '').slice(0, 40),
+      providerMessageId: String(emailResult.providerMessageId || '').slice(0, 240),
+      errorCategory: String(emailResult.errorCategory || '').slice(0, 120),
+    },
+    jobRun,
+  };
 }
 
 function captureRawBody(request, _response, buffer) {
@@ -410,12 +500,18 @@ function publicScoreRefreshResult(scoreRefresh) {
   return result;
 }
 
-export function createApp() {
+export function createApp({
+  dailyDealHunterRunner = runClaimedDailyDealHunterEmail,
+} = {}) {
   const config = getConfig();
   const app = express();
   const dealOsRawParser = express.raw({
     type: () => true,
     limit: config.dealHunter.dealOsExportMaxPayloadBytes,
+  });
+  const strictEmptyDigestBodyParser = express.raw({
+    type: () => true,
+    limit: '1kb',
   });
   let activeSecureUploads = 0;
 
@@ -556,6 +652,16 @@ export function createApp() {
         return;
       }
       dealOsRawParser(request, response, next);
+    },
+  );
+  app.use(
+    ['/api/admin/deal-hunter/send', '/api/deal-hunter/daily-email'],
+    (request, response, next) => {
+      if (request.method !== 'POST') {
+        next();
+        return;
+      }
+      strictEmptyDigestBodyParser(request, response, next);
     },
   );
   app.use(express.json(jsonParserOptions('512kb')));
@@ -766,7 +872,9 @@ export function createApp() {
       const operations = await getOperationsCenter();
       response.json({
         success: true,
-        operations: session.role === 'viewer' ? sanitizeViewerOperations(operations) : operations,
+        operations: session.role === 'viewer'
+          ? sanitizeViewerOperations(operations)
+          : { ...operations, email: projectBrowserEmailReadiness(operations.email) },
       });
     }),
   );
@@ -1266,9 +1374,13 @@ export function createApp() {
         refresh: true,
         review,
       });
+      const browserReview = {
+        ...review,
+        emailReadiness: projectBrowserEmailReadiness(review.emailReadiness),
+      };
       response.json({
         success: true,
-        review,
+        review: session.role === 'viewer' ? sanitizeViewerDealHunterReview(browserReview) : browserReview,
       });
     }),
   );
@@ -1827,15 +1939,14 @@ export function createApp() {
         return;
       }
 
-      const result = await runClaimedDailyDealHunterEmail({ triggeredBy: session.username || 'admin' });
-      if (result.review) {
-        result.review.dailyEmailJob = result.jobRun || await getDailyDealHunterJobStatus();
-        result.review.emailReadiness = await getEmailReadiness();
+      if (!hasStrictEmptyBody(request)) {
+        response.status(400).json({ success: false, error: 'Daily Deal Hunter accepts an empty request body only.' });
+        return;
       }
-      response.status(result.emailResult.status === 'failed' ? 502 : result.inProgress ? 409 : 200).json({
-        success: !['failed', 'in-progress'].includes(result.emailResult.status),
-        ...result,
-      });
+
+      const result = await dailyDealHunterRunner({ triggeredBy: session.username || 'admin' });
+      const projected = dailyDealHunterRouteResult(result);
+      response.status(dailyDealHunterHttpStatus(projected.status)).json(projected);
     }),
   );
 
@@ -2218,11 +2329,14 @@ export function createApp() {
         return;
       }
 
-      const result = await runClaimedDailyDealHunterEmail({ triggeredBy: 'external-cron' });
-      response.status(result.emailResult.status === 'failed' ? 502 : result.inProgress ? 409 : 200).json({
-        success: !['failed', 'in-progress'].includes(result.emailResult.status),
-        ...result,
-      });
+      if (!hasStrictEmptyBody(request)) {
+        response.status(400).json({ success: false, error: 'Daily Deal Hunter accepts an empty request body only.' });
+        return;
+      }
+
+      const result = await dailyDealHunterRunner({ triggeredBy: 'external-cron', enforceDueTime: true });
+      const projected = dailyDealHunterRouteResult(result);
+      response.status(dailyDealHunterHttpStatus(projected.status)).json(projected);
     }),
   );
 

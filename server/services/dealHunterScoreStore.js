@@ -232,6 +232,7 @@ export async function refreshOpportunityScores({
   force = false,
   reviewMode = 'full-backfill',
   actor = 'deal-hunter',
+  recordActivity = true,
   storage = getStorage(),
 } = {}) {
   const missingMethods = requiredStorageMethods(storage);
@@ -248,8 +249,10 @@ export async function refreshOpportunityScores({
   const requested = new Set(opportunityIds.map((id) => String(id || '').trim()).filter(Boolean));
   let candidates = callerSuppliedDeals ? deals : null;
   let authoritativeOpportunityIds = null;
+  let authoritativeReview = null;
   if (!candidates) {
     const collected = await collectScoredOpportunities({ reviewMode, storage });
+    authoritativeReview = collected.review || null;
     if (collected.review?.scoringDeferred) {
       return {
         ok: false,
@@ -273,6 +276,7 @@ export async function refreshOpportunityScores({
           status: 409,
           error: 'The canonical full-backfill review could not prove a complete authoritative opportunity set.',
           authorityProblems,
+          review: authoritativeReview,
           counts: { considered: 0, scored: 0, skipped: 0, failed: 0, changed: 0, versionOnly: 0 },
           errors: [],
           rulesVersion: DEAL_SCORING_RULES_VERSION,
@@ -286,6 +290,7 @@ export async function refreshOpportunityScores({
           status: 503,
           error: 'Durable current-triage eligibility reconciliation is unavailable.',
           missingMethods: ['reconcileDealHunterCurrentScoreEligibility'],
+          review: authoritativeReview,
         };
       }
       // Capture the complete builder-owned set before the per-run score-write
@@ -344,13 +349,16 @@ export async function refreshOpportunityScores({
         && stored.semantic_digest !== result.semanticDigest) {
         row.semantic_digest = stored.semantic_digest;
       }
-      // The previous row is read only when an event will actually describe it.
+      // Keep the score/currentness data flow identical when activity recording
+      // is suppressed; only the operator-facing event emission is optional.
       const previous = semanticallyChanged
         ? await storage.getDealHunterOpportunityScore(deal.opportunityId)
         : null;
       await storage.writeDealHunterOpportunityScore(row, result.evidence);
-      if (semanticallyChanged) {
+      if (semanticallyChanged && recordActivity) {
         await emitRescoreEvent({ storage, deal, previous, row, actor });
+      }
+      if (semanticallyChanged) {
         counts.changed += 1;
       } else {
         counts.versionOnly += 1;
@@ -371,6 +379,7 @@ export async function refreshOpportunityScores({
         ok: false,
         status: 503,
         error: `Current-triage eligibility could not be reconciled: ${normalizeText(error.message, 500)}`,
+        review: authoritativeReview,
         counts,
         errors: [],
         rulesVersion: DEAL_SCORING_RULES_VERSION,
@@ -383,6 +392,7 @@ export async function refreshOpportunityScores({
   return {
     ok: counts.failed === 0,
     status: counts.failed > 0 ? 207 : 200,
+    ...(authoritativeReview ? { review: authoritativeReview } : {}),
     counts,
     errors: errors.slice(0, 100),
     eligibilityReconciliation,

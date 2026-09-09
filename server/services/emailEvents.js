@@ -7,6 +7,8 @@ import {
   applyEmailLifecycleToCommunication,
   ingestResendReceivedEmail,
 } from './communications.js';
+import { canonicalDailyDealHunterMailbox } from './dailyDealHunterDigest.js';
+import { reconcileDailyDealHunterWebhookEvent } from './dailyDealHunterReconciliation.js';
 
 const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const maxEmailEventMetadataBytes = 32 * 1024;
@@ -366,34 +368,64 @@ function buildEventKey(event) {
   return null;
 }
 
+function hasDailyDealHunterTagIdentity(event) {
+  const tags = event?.metadata?.tags;
+  const source = getTagValue(tags, 'source');
+  const businessDate = getTagValue(tags, 'business_date');
+  const notificationType = getTagValue(tags, 'notification');
+  const payloadDigest = getTagValue(tags, 'payload_digest');
+  return source === 'daily-deal-hunter'
+    && /^\d{4}-\d{2}-\d{2}$/.test(businessDate)
+    && ['normal-digest', 'required-source-alert'].includes(notificationType)
+    && /^[a-f0-9]{64}$/.test(payloadDigest);
+}
+
+function exactDailyDealHunterWebhookEvidence(event) {
+  return event?.provider === 'resend'
+    && Boolean(event?.message_id)
+    && ['sent', 'delivered', 'delayed', 'opened', 'clicked', 'bounced', 'complained', 'failed', 'suppressed'].includes(event?.event_type)
+    && hasDailyDealHunterTagIdentity(event);
+}
+
 export async function recordEmailEvent(input, { storage = getStorage() } = {}) {
-  const recipientEmail = normalizeEmail(input.recipient_email || input.recipientEmail);
   const eventType = normalizeEmailEventType(input.event_type || input.eventType);
-  const explicitSubmissionId = normalizeText(input.submission_id || input.submissionId, 80);
-  const submissionId = await resolveSubmissionId(storage, {
-    submissionId: explicitSubmissionId,
-    recipientEmail,
-    inboundRecipients: normalizeText(input.metadata?.rawType, 80).toLowerCase().replace(/_/g, '.') === 'email.received'
-      ? input.metadata?.to
-      : [],
-  });
+  const internalDailyDigest = hasDailyDealHunterTagIdentity(input);
+  const recipientEmail = internalDailyDigest
+    ? canonicalDailyDealHunterMailbox(input.recipient_email || input.recipientEmail)
+    : normalizeEmail(input.recipient_email || input.recipientEmail);
+  const explicitSubmissionId = internalDailyDigest
+    ? ''
+    : normalizeText(input.submission_id || input.submissionId, 80);
+  const submissionId = internalDailyDigest
+    ? null
+    : await resolveSubmissionId(storage, {
+        submissionId: explicitSubmissionId,
+        recipientEmail,
+        inboundRecipients: normalizeText(input.metadata?.rawType, 80).toLowerCase().replace(/_/g, '.') === 'email.received'
+          ? input.metadata?.to
+          : [],
+      });
   const provider = normalizeText(input.provider, 60) || 'unknown';
   const createdAt = normalizeEventDate(input.created_at || input.createdAt);
   const providerEventId = normalizeText(input.provider_event_id || input.providerEventId || input.metadata?.providerEventId, 240);
-  const communicationId = normalizeText(
-    input.communication_id || input.communicationId || input.metadata?.tracking?.communicationId,
-    120,
-  ) || null;
+  const communicationId = internalDailyDigest
+    ? null
+    : normalizeText(
+        input.communication_id || input.communicationId || input.metadata?.tracking?.communicationId,
+        120,
+      ) || null;
   const linkedCommunication = communicationId && storage.getCrmCommunication
     ? await storage.getCrmCommunication(communicationId)
     : null;
   const linkedRequest = !linkedCommunication?.opportunity_id && submissionId && storage.getLatestDealHunterCimRequestForSubmission
     ? await storage.getLatestDealHunterCimRequestForSubmission(submissionId)
     : null;
-  const opportunityId = normalizeText(
-    input.opportunity_id || input.opportunityId || linkedCommunication?.opportunity_id || linkedRequest?.opportunity_id,
-    160,
-  ) || null;
+  const opportunityId = internalDailyDigest
+    ? null
+    : normalizeText(
+        input.opportunity_id || input.opportunityId || linkedCommunication?.opportunity_id || linkedRequest?.opportunity_id,
+        160,
+      ) || null;
   const event = {
     id: input.id || randomUUID(),
     created_at: createdAt,
@@ -489,7 +521,11 @@ async function stopCanonicalCimSequencesForReply(event, storage) {
   }
 }
 
-export async function recordEmailEventsFromWebhook(request, { storage = getStorage(), fetcher } = {}) {
+export async function recordEmailEventsFromWebhook(request, {
+  storage = getStorage(),
+  fetcher,
+  reconcileDailyDigestWebhook = reconcileDailyDealHunterWebhookEvent,
+} = {}) {
   const authorization = authorizeWebhook(request);
 
   if (!authorization.ok) {
@@ -513,6 +549,9 @@ export async function recordEmailEventsFromWebhook(request, { storage = getStora
   const events = [];
   const ingestion = [];
   const svixId = headerValue(request.headers['svix-id']);
+  const signedSvix = Boolean(
+    svixId && headerValue(request.headers['svix-timestamp']) && headerValue(request.headers['svix-signature']),
+  );
 
   for (const [index, payload] of payloads.entries()) {
     const providerEventId = svixId
@@ -521,16 +560,23 @@ export async function recordEmailEventsFromWebhook(request, { storage = getStora
     const eventInput = buildEventInputFromWebhook(payload, { providerEventId, svixId });
     const event = await recordEmailEvent(eventInput, { storage });
     events.push(event);
+    const internalDailyDigest = hasDailyDealHunterTagIdentity(event);
 
-    try {
-      await applyEmailLifecycleToCommunication(event, { storage });
-      await stopCanonicalCimSequencesForReply(event, storage);
-    } catch {
-      return {
-        ok: false,
-        status: 503,
-        error: 'Email lifecycle processing is temporarily unavailable.',
-      };
+    if (!internalDailyDigest) {
+      try {
+        await applyEmailLifecycleToCommunication(event, { storage });
+        await stopCanonicalCimSequencesForReply(event, storage);
+      } catch {
+        return {
+          ok: false,
+          status: 503,
+          error: 'Email lifecycle processing is temporarily unavailable.',
+        };
+      }
+    }
+
+    if (signedSvix && exactDailyDealHunterWebhookEvidence(event)) {
+      await reconcileDailyDigestWebhook({ storage, event }).catch(() => {});
     }
 
     if (normalizeText(eventInput.metadata?.rawType, 80).toLowerCase().replace(/_/g, '.') === 'email.received') {

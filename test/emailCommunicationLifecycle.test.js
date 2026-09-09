@@ -284,6 +284,71 @@ function receivedPayload({
   };
 }
 
+test('signed Daily Deal Hunter webhook hands only exact acceptance evidence to reconciliation', async () => {
+  const storage = createStorage({
+    submissions: [{
+      id: 'must-not-link-daily-digest',
+      status: 'new',
+      company: 'Internal Recipient Collision',
+      email: 'digest@example.test',
+    }],
+  });
+  const reconciled = [];
+  const reconcileDailyDigestWebhook = async (input) => {
+    reconciled.push(clone(input.event));
+    return { status: 'completed', source: 'signed-webhook' };
+  };
+  const exact = {
+    id: 'payload-daily-digest-sent',
+    type: 'email.sent',
+    created_at: '2026-07-15T15:00:01.000Z',
+    data: {
+      email_id: 'resend-daily-001',
+      to: ['digest@example.test'],
+      subject: 'Daily Deal Hunter — 2 to review — 2026-07-15',
+      tags: [
+        { name: 'source', value: 'daily-deal-hunter' },
+        { name: 'business_date', value: '2026-07-15' },
+        { name: 'notification', value: 'normal-digest' },
+        { name: 'payload_digest', value: 'a'.repeat(64) },
+      ],
+    },
+  };
+  const unrelated = {
+    ...exact,
+    id: 'payload-unrelated-sent',
+    data: {
+      ...exact.data,
+      email_id: 'resend-other-001',
+      tags: exact.data.tags.map((tag) => (
+        tag.name === 'source' ? { ...tag, value: 'deal-hunter-cim' } : tag
+      )),
+    },
+  };
+
+  const accepted = await recordEmailEventsFromWebhook(signedRequest(exact, 'svix-daily-digest-1'), {
+    storage,
+    reconcileDailyDigestWebhook,
+  });
+  const digestActivities = storage.state.activities.length;
+  const ignored = await recordEmailEventsFromWebhook(signedRequest(unrelated, 'svix-unrelated-1'), {
+    storage,
+    reconcileDailyDigestWebhook,
+  });
+
+  assert.equal(accepted.ok, true);
+  assert.equal(ignored.ok, true);
+  assert.equal(reconciled.length, 1);
+  assert.equal(reconciled[0].provider_event_id, 'svix-daily-digest-1');
+  assert.equal(reconciled[0].message_id, 'resend-daily-001');
+  assert.equal(reconciled[0].metadata.svixId, 'svix-daily-digest-1');
+  const storedDigestEvent = storage.state.emailEvents.find((event) => event.message_id === 'resend-daily-001');
+  assert.equal(storedDigestEvent.submission_id, null);
+  assert.equal(storedDigestEvent.communication_id, null);
+  assert.equal(storedDigestEvent.opportunity_id, null);
+  assert.equal(digestActivities, 0);
+});
+
 test('received email uses only the fixed Resend API, persists bounded body and attachment metadata, and replays idempotently', async () => {
   const storage = createStorage({
     submissions: [{ id: 'submission-1', status: 'new', company: 'Unique Broker Co', broker_email: 'broker@example.com' }],

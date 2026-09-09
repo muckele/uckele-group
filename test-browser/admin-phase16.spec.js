@@ -515,6 +515,40 @@ function phase1AcquisitionOrder(left, right) {
     || left.opportunityId.localeCompare(right.opportunityId);
 }
 
+function phase4DailyDigestProjection(state) {
+  const topOpportunities = phase1CurrentOpportunities(state)
+    .filter((opportunity) => !opportunity.dismissed && (!opportunity.reviewed || opportunity.changedSinceReview))
+    .sort(phase1AcquisitionOrder)
+    .slice(0, 5)
+    .map((opportunity) => ({
+      opportunityId: opportunity.opportunityId,
+      name: opportunity.name,
+      state: opportunity.state,
+      fitScore: opportunity.fitScore,
+      scoreStatus: opportunity.scoreStatus,
+      confidence: opportunity.confidence,
+      operatorPriority: opportunity.operatorPriority,
+      reviewed: opportunity.reviewed,
+      changedSinceReview: opportunity.changedSinceReview,
+      topStrength: opportunity.topStrength,
+      topConcern: opportunity.topConcern,
+      workflow: { ...opportunity.workflow },
+      observationFreshness: opportunity.observationFreshness,
+    }));
+  return {
+    businessDate: '2026-08-30',
+    generatedAt: '2026-08-30T18:00:00.000Z',
+    status: 'ready',
+    notificationType: 'normal-digest',
+    sourceAuthority: { requiredHealthy: true, blockingIssues: [], optionalWarnings: [] },
+    summary: phase1Summary(state),
+    topOpportunities,
+    job: { status: 'completed', attemptCount: 1, completedAt: '2026-08-30T18:02:00.000Z', notificationType: 'normal-digest' },
+    actionsAllowed: true,
+    links: { inbox: '/admin/deal-hunter', operations: '/admin/deal-hunter?view=operations' },
+  };
+}
+
 function phase1QueueResponse(state, url) {
   const view = url.searchParams.get('view');
   const sort = url.searchParams.get('sort');
@@ -565,6 +599,7 @@ function phase1QueueResponse(state, url) {
     totalPages: Math.max(1, Math.ceil(total / pageSize)),
     summary: phase1Summary(state),
     sourceHealth: { healthy: true, generatedAt: '2026-08-30T18:00:00.000Z', issues: [] },
+    dailyDigest: phase4DailyDigestProjection(state),
     views: ['needs-review', 'high-priority', 'watchlist', 'low-confidence', 'dismissed', 'all'],
     priorities: ['urgent', 'high', 'normal', 'watch'],
   };

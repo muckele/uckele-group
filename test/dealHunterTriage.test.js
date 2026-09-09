@@ -12,6 +12,24 @@ const { refreshOpportunityScores } = await import('../server/services/dealHunter
 const { getTriageOpportunityDetail, listTriageQueue, setTriageOperatorDecision } =
   await import('../server/services/dealHunterTriage.js');
 
+const briefingGeneratedAt = '2026-09-05T15:00:00.000Z';
+
+function briefingSourceHealth(overrides = {}) {
+  return {
+    generatedAt: briefingGeneratedAt,
+    dateKey: '2026-09-05',
+    healthy: true,
+    issues: [],
+    sources: [
+      { id: 'sheet-0', name: 'SMB Deal Hunter Google Sheet', mode: 'csv', required: true, sourceRole: 'required-primary', fetched: true, rowCount: 12 },
+      { id: 'deal-os-export', name: 'SMB Deal OS export', mode: 'manual-export', required: false, sourceRole: 'optional-supplemental', fetched: true, rowCount: 4 },
+    ],
+    totals: { reviewedDeals: 12 },
+    cached: true,
+    ...overrides,
+  };
+}
+
 function scoredDeal(id, overrides = {}) {
   const deal = {
     id: `source-${id}`,
@@ -624,4 +642,154 @@ test('queue projects cached source health without refreshing source data', async
   assert.equal(queue.ok, true);
   assert.deepEqual(queue.sourceHealth, cachedHealth);
   assert.deepEqual(calls, [[storage, { persistSnapshot: false, refresh: false }]], 'queue allows only the non-persisting, non-refreshing cached health read');
+});
+
+test('triage response includes the bounded server-owned morning briefing projection', async () => {
+  const requestedPages = [];
+  const ordered = [
+    queueScore('briefing-first', { name: 'Server first', fit_score: 61, operator_priority: 'urgent', top_strength: 'Urgent operator attention.', top_concern: 'Margin detail is incomplete.', crm_status: 'reviewing', cim_status: 'not-requested', observation_freshness: briefingGeneratedAt }),
+    queueScore('briefing-second', { name: 'Server second', fit_score: 99, confidence: 'high', top_strength: 'Strong service revenue.', top_concern: 'Customer concentration needs review.', crm_status: 'active', cim_status: 'received', observation_freshness: briefingGeneratedAt }),
+  ];
+  const storage = {
+    async listDealHunterOpportunityScores(options) {
+      requestedPages.push(options);
+      const briefing = options.view === 'needs-review'
+        && options.page === 1
+        && options.pageSize === 5
+        && options.search === ''
+        && options.confidence === ''
+        && options.priority === ''
+        && options.state === '';
+      const rows = briefing ? ordered : [ordered[1]];
+      return {
+        rows,
+        total: rows.length,
+        page: options.page,
+        pageSize: options.pageSize,
+        totalPages: 1,
+        summary: { needsReview: 7, highPriority: 3, watchlist: 2, lowConfidence: 1, currentOpportunities: 12 },
+      };
+    },
+    async getScheduledJob() {
+      return {
+        status: 'completed', attempt_count: 2, completed_at: '2026-09-05T15:02:00.000Z',
+        metadata: { notificationType: 'normal-digest', recipient: 'private@example.test', preparedEnvelope: { text: 'private body' } },
+      };
+    },
+  };
+
+  const response = await listTriageQueue({
+    storage,
+    view: 'all',
+    search: 'Server second',
+    getCachedSourceHealth: async () => briefingSourceHealth(),
+  });
+
+  assert.equal(response.dailyDigest?.status, 'ready');
+  assert.deepEqual(response.dailyDigest?.summary, {
+    needsReview: 7,
+    highPriority: 3,
+    watchlist: 2,
+    lowConfidence: 1,
+    currentOpportunities: 12,
+  });
+  assert.deepEqual(response.dailyDigest?.topOpportunities.map((row) => row.name), ['Server first', 'Server second']);
+  assert.deepEqual(Object.keys(response.dailyDigest?.topOpportunities[0] || {}).sort(), [
+    'changedSinceReview', 'confidence', 'fitScore', 'name', 'observationFreshness', 'operatorPriority',
+    'opportunityId', 'reviewed', 'scoreStatus', 'state', 'topConcern', 'topStrength', 'workflow',
+  ]);
+  assert.equal(response.dailyDigest?.actionsAllowed, true);
+  assert.equal(requestedPages.length, 2, 'the bounded briefing query is independent of the visible filtered page');
+  assert.doesNotMatch(JSON.stringify(response.dailyDigest), /private@example\.test|private body|preparedEnvelope|dealKey|listingUrl/);
+});
+
+test('required source failure returns null briefing summary no recommendations and actions disallowed', async (t) => {
+  const storage = await seedQueue(t);
+  const requiredFailure = briefingSourceHealth({
+    healthy: false,
+    issues: [{ sourceId: 'sheet-0', affectsHealth: true, sourceUnavailable: true, title: 'Private raw source failure', message: 'https://private.example.test/token=secret', checkedAt: briefingGeneratedAt }],
+    sources: [{ id: 'sheet-0', name: 'SMB Deal Hunter Google Sheet', mode: 'csv', required: true, sourceRole: 'required-primary', fetched: false, rowCount: 0 }],
+  });
+
+  const response = await listTriageQueue({ storage, getCachedSourceHealth: async () => requiredFailure });
+
+  assert.equal(response.dailyDigest?.status, 'action-required');
+  assert.equal(response.dailyDigest?.summary, null);
+  assert.deepEqual(response.dailyDigest?.topOpportunities, []);
+  assert.equal(response.dailyDigest?.actionsAllowed, false);
+  assert.doesNotMatch(JSON.stringify(response.dailyDigest), /private\.example|token=secret|Synthetic Opportunity/);
+});
+
+test('optional stale Deal OS returns warning with primary-backed briefing and actions allowed', async (t) => {
+  const storage = await seedQueue(t);
+  const optionalWarning = briefingSourceHealth({
+    issues: [{ sourceId: 'deal-os-export', affectsHealth: false, sourceUnavailable: true, title: 'Private stale export path', message: '/private/deal-os.csv is stale', checkedAt: briefingGeneratedAt }],
+    sources: [
+      { id: 'sheet-0', name: 'SMB Deal Hunter Google Sheet', mode: 'csv', required: true, sourceRole: 'required-primary', fetched: true, rowCount: 12 },
+      { id: 'deal-os-export', name: 'SMB Deal OS export', mode: 'manual-export', required: false, sourceRole: 'optional-supplemental', fetched: false, rowCount: 0 },
+    ],
+  });
+
+  const response = await listTriageQueue({ storage, getCachedSourceHealth: async () => optionalWarning });
+
+  assert.equal(response.dailyDigest?.status, 'optional-warning');
+  assert.equal(response.dailyDigest?.sourceAuthority.optionalWarnings.length, 1);
+  assert.equal(response.dailyDigest?.summary.needsReview, response.summary.needsReview);
+  assert.ok(response.dailyDigest?.topOpportunities.length > 0);
+  assert.equal(response.dailyDigest?.actionsAllowed, true);
+  assert.doesNotMatch(JSON.stringify(response.dailyDigest), /private stale export path|private\/deal-os\.csv/);
+});
+
+test('triage decision mutation rechecks required source authority server-side', async (t) => {
+  const storage = await seedQueue(t);
+  const before = await storage.getCurrentDealHunterOpportunityScore('opp-high');
+  const failure = briefingSourceHealth({
+    healthy: false,
+    issues: [{ sourceId: 'sheet-0', affectsHealth: true, sourceUnavailable: true, checkedAt: briefingGeneratedAt }],
+    sources: [{ id: 'sheet-0', name: 'SMB Deal Hunter Google Sheet', mode: 'csv', required: true, sourceRole: 'required-primary', fetched: false, rowCount: 0 }],
+  });
+
+  const result = await setTriageOperatorDecision({
+    opportunityId: 'opp-high',
+    priority: 'urgent',
+    markReviewed: true,
+    storage,
+    getCachedSourceHealth: async () => failure,
+  });
+  const after = await storage.getCurrentDealHunterOpportunityScore('opp-high');
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 503);
+  assert.equal(result.code, 'required_source_authority_unavailable');
+  assert.deepEqual(
+    { priority: after.operator_priority, reviewedAt: after.reviewed_at, reviewedBy: after.reviewed_by },
+    { priority: before.operator_priority, reviewedAt: before.reviewed_at, reviewedBy: before.reviewed_by },
+  );
+});
+
+test('viewer projection contains no recipient envelope provider secret or operator note', async (t) => {
+  const storage = await seedQueue(t);
+  const operatorNote = 'PRIVATE OPERATOR NOTE SENTINEL';
+  await setTriageOperatorDecision({ opportunityId: 'opp-high', note: operatorNote, storage });
+  const unsafeStorage = {
+    ...storage,
+    async getScheduledJob() {
+      return {
+        status: 'pending', attempt_count: 1,
+        metadata: {
+          recipient: 'recipient-sentinel@example.test',
+          providerSecret: 'PROVIDER SECRET SENTINEL',
+          preparedEnvelope: { from: 'sender-sentinel@example.test', text: 'PRIVATE ENVELOPE BODY' },
+        },
+      };
+    },
+  };
+
+  const response = await listTriageQueue({ storage: unsafeStorage, getCachedSourceHealth: async () => briefingSourceHealth() });
+  const serialized = JSON.stringify(response);
+
+  assert.equal(response.dailyDigest?.actionsAllowed, true);
+  for (const forbidden of [operatorNote, 'recipient-sentinel@example.test', 'PROVIDER SECRET SENTINEL', 'sender-sentinel@example.test', 'PRIVATE ENVELOPE BODY', 'preparedEnvelope']) {
+    assert.equal(serialized.includes(forbidden), false, forbidden);
+  }
 });

@@ -1,26 +1,36 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { signPayload } from '../server/utils/security.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-http-app-'));
 process.env.ADMIN_SESSION_SECRET = 'http-app-session-secret-for-tests';
 process.env.SECURE_DOCUMENTS_TOKEN_SECRET = 'http-app-document-secret-for-tests';
 process.env.SQLITE_PATH = path.join(tempDir, 'http-app.sqlite');
 process.env.SECURE_DOCUMENTS_STORAGE_DIR = path.join(tempDir, 'secure-documents');
+process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH = path.join(tempDir, 'task-four-source-health.json');
 process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
+process.env.DEAL_HUNTER_CRON_SECRET = 'task-three-cron-secret';
 delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
 
-const { createApp } = await import('../server/app.js');
+const appModule = await import('../server/app.js');
+const { createApp } = appModule;
+const { getConfig } = await import('../server/config.js');
+const { buildEmailReadiness } = await import('../server/services/emailReadiness.js');
 const { createSecureUploadRequest } = await import('../server/services/documentVault.js');
 const { createManualSubmission } = await import('../server/services/submissions.js');
 const { getStorage } = await import('../server/storage/index.js');
 let lifecycleAdminCookie = '';
 let lifecycleViewerCookie = '';
+let taskThreeAdminCookie = '';
+let taskThreeViewerCookie = '';
 
-async function withServer(run) {
-  const server = createApp().listen(0, '127.0.0.1');
+async function withServer(run, app = createApp()) {
+  const server = app.listen(0, '127.0.0.1');
   await new Promise((resolve, reject) => {
     server.once('listening', resolve);
     server.once('error', reject);
@@ -31,6 +41,159 @@ async function withServer(run) {
     await run(`http://127.0.0.1:${port}`);
   } finally {
     await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+async function postChunked(url, { headers = {}, body = '' } = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const request = httpRequest({
+      hostname: target.hostname,
+      port: target.port,
+      path: target.pathname,
+      method: 'POST',
+      headers,
+    }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve({
+        status: response.statusCode,
+        body: Buffer.concat(chunks).toString('utf8'),
+      }));
+    });
+    request.once('error', reject);
+    request.write(body);
+    request.end();
+  });
+}
+
+async function signInForCookie(_origin, credentials = { username: 'admin', password: 'change-me-now' }) {
+  const isViewer = credentials.username === 'smb-deal-hunter';
+  const cached = isViewer ? taskThreeViewerCookie : taskThreeAdminCookie;
+  if (cached) return cached;
+  const now = new Date();
+  const session = {
+    id: randomUUID(),
+    role: isViewer ? 'viewer' : 'admin',
+    username: credentials.username,
+    principal_id: isViewer ? `viewer:identity:${credentials.username}` : 'admin:primary',
+    created_at: now.toISOString(),
+    expires_at: new Date(now.getTime() + 60 * 60 * 1000).toISOString(),
+    last_seen_at: now.toISOString(),
+    revoked_at: null,
+    created_ip_hash: null,
+    user_agent: 'task-three-http-test',
+    metadata: { auth_method: 'test-fixture' },
+  };
+  await getStorage().insertAdminSession(session);
+  const token = signPayload({
+    sid: session.id,
+    role: session.role,
+    username: session.username,
+    exp: Date.parse(session.expires_at),
+  }, process.env.ADMIN_SESSION_SECRET);
+  const cookie = `ug_admin_session=${token}`;
+  if (isViewer) taskThreeViewerCookie = cookie;
+  else taskThreeAdminCookie = cookie;
+  return cookie;
+}
+
+function writeTaskFourSourceSnapshot({ requiredHealthy = true, optionalWarning = false } = {}) {
+  const now = new Date();
+  const issues = requiredHealthy ? [] : [{
+    sourceId: 'sheet-0', affectsHealth: true, sourceUnavailable: true,
+    title: 'Required source unavailable', message: 'Private source diagnostic must not be returned.',
+  }];
+  const exportedAt = optionalWarning ? new Date(now.getTime() - 73 * 60 * 60 * 1000).toISOString() : now.toISOString();
+  fs.writeFileSync(process.env.ACQUISITION_COMMAND_CENTER_SOURCE_HEALTH_PATH, JSON.stringify({
+    generatedAt: now.toISOString(),
+    issues,
+    totals: { reviewedDeals: 1 },
+    sources: {
+      'sheet-0': {
+        rowCount: 1, name: 'SMB Deal Hunter Google Sheet', mode: 'csv', required: true,
+        sourceRole: 'required-primary', checkedAt: now.toISOString(),
+      },
+      'deal-os-export': {
+        rowCount: 1, name: 'SMB Deal OS export', mode: 'manual-export', required: false,
+        sourceRole: 'optional-supplemental', checkedAt: now.toISOString(), exportedAt, maxAgeHours: 72,
+      },
+    },
+  }));
+}
+
+async function seedTaskFourOpportunity(opportunityId) {
+  const storage = getStorage();
+  const now = new Date().toISOString();
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: opportunityId, created_at: now, updated_at: now,
+    canonical_name: 'Task Four HTTP Authority', canonical_recipient: null, canonical_location: 'Los Angeles, CA',
+    primary_submission_id: null, identity_version: 'task-four-http', status: 'active', metadata: {},
+  });
+  await storage.writeDealHunterOpportunityScore({
+    opportunity_id: opportunityId, scored_at: now, deal_key: `deal-${opportunityId}`,
+    name: 'Task Four HTTP Authority', state: 'CA', listing_url: 'https://broker.example/task-four',
+    fit_score: 82, score_status: 'high-fit', confidence: 'high', completeness_score: 90,
+    contradiction_count: 0, missing_evidence_count: 0, should_remove: false, high_fit: true, gate_count: 0,
+    score_fingerprint: `fingerprint-${opportunityId}`, semantic_digest: `digest-${opportunityId}`,
+    engine_version: 'task-four-http', rules_version: 'task-four-http', profile_version: 'task-four-http',
+    completeness_policy_version: 'task-four-http', dimensions: [], gates: [], applied_caps: [], missing_evidence: [],
+    confidence_reasons: [], summary: { strengths: ['Current primary authority'], concerns: ['Needs operator review'] },
+  }, []);
+  await storage.reconcileDealHunterCurrentScoreEligibility([opportunityId]);
+  return storage;
+}
+
+async function withEmailReadinessAddressConfig({
+  adminEmail,
+  fallbackRecipient,
+  dealHunterRecipient,
+  fromAddress,
+  replyToAddress,
+  followUpSenderAddress,
+  followUpReplyToAddress,
+}, run) {
+  const config = getConfig();
+  const original = {
+    adminEmail: config.admin.email,
+    fallbackRecipient: config.delivery.fallbackRecipient,
+    dealHunterRecipient: config.dealHunter.recipient,
+    deliveryProvider: config.delivery.provider,
+    resendApiKey: config.delivery.resendApiKey,
+    resendFromEmail: config.delivery.resendFromEmail,
+    resendReplyTo: config.delivery.resendReplyTo,
+    resendInboundDomain: config.delivery.resendInboundDomain,
+    emailWebhookSecret: config.delivery.emailWebhookSecret,
+    followUpSenderEmail: config.followUp.senderEmail,
+    followUpReplyTo: config.followUp.replyTo,
+  };
+
+  config.admin.email = adminEmail;
+  config.delivery.fallbackRecipient = fallbackRecipient;
+  config.dealHunter.recipient = dealHunterRecipient;
+  config.delivery.provider = 'resend';
+  config.delivery.resendApiKey = 're_browser_readiness_fixture';
+  config.delivery.resendFromEmail = fromAddress;
+  config.delivery.resendReplyTo = replyToAddress;
+  config.delivery.resendInboundDomain = replyToAddress.split('@')[1];
+  config.delivery.emailWebhookSecret = 'browser-readiness-webhook-fixture';
+  config.followUp.senderEmail = followUpSenderAddress;
+  config.followUp.replyTo = followUpReplyToAddress;
+
+  try {
+    await run(config);
+  } finally {
+    config.admin.email = original.adminEmail;
+    config.delivery.fallbackRecipient = original.fallbackRecipient;
+    config.dealHunter.recipient = original.dealHunterRecipient;
+    config.delivery.provider = original.deliveryProvider;
+    config.delivery.resendApiKey = original.resendApiKey;
+    config.delivery.resendFromEmail = original.resendFromEmail;
+    config.delivery.resendReplyTo = original.resendReplyTo;
+    config.delivery.resendInboundDomain = original.resendInboundDomain;
+    config.delivery.emailWebhookSecret = original.emailWebhookSecret;
+    config.followUp.senderEmail = original.followUpSenderEmail;
+    config.followUp.replyTo = original.followUpReplyTo;
   }
 }
 
@@ -125,6 +288,659 @@ test('unknown API routes return a JSON 404 instead of falling through to the app
       success: false,
       error: 'API endpoint not found.',
     });
+  });
+});
+
+test('viewer and unauthenticated callers cannot trigger daily digest', async () => {
+  let runnerCalls = 0;
+  const app = createApp({
+    dailyDealHunterRunner: async () => {
+      runnerCalls += 1;
+      return { emailResult: { status: 'sent', providerMessageId: 'must-not-run' } };
+    },
+  });
+  await withServer(async (origin) => {
+    const anonymous = await fetch(`${origin}/api/admin/deal-hunter/send`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    assert.equal(anonymous.status, 401);
+
+    const viewerCookie = await signInForCookie(origin, {
+      username: 'smb-deal-hunter', password: 'view-only-local',
+    });
+    const viewer = await fetch(`${origin}/api/admin/deal-hunter/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: viewerCookie },
+      body: '{}',
+    });
+    assert.equal(viewer.status, 401);
+    assert.equal(runnerCalls, 0);
+  }, app);
+});
+
+test('daily digest admin route rejects recipient subject body and unknown input', async () => {
+  let runnerCalls = 0;
+  const app = createApp({
+    dailyDealHunterRunner: async () => {
+      runnerCalls += 1;
+      return {
+        jobKey: 'daily-deal-hunter-email:2026-07-15',
+        notificationType: 'normal-digest',
+        emailResult: { status: 'sent', providerMessageId: 'resend-1' },
+        jobRun: { status: 'completed', metadata: { preparedEnvelope: { to: 'digest@example.test', text: 'secret' } } },
+      };
+    },
+  });
+  await withServer(async (origin) => {
+    const cookie = await signInForCookie(origin);
+    for (const body of [
+      { recipient: 'attacker@example.test' },
+      { subject: 'Override' },
+      { body: 'Override' },
+      { html: '<p>Override</p>' },
+      { notificationType: 'required-source-alert' },
+      { providerKey: 'new-key' },
+      { unknown: true },
+    ]) {
+      const response = await fetch(`${origin}/api/admin/deal-hunter/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 400);
+    }
+    assert.equal(runnerCalls, 0);
+
+    const allowed = await fetch(`${origin}/api/admin/deal-hunter/send`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: '{}',
+    });
+    assert.equal(allowed.status, 200);
+    const payload = await allowed.json();
+    assert.equal(runnerCalls, 1);
+    assert.doesNotMatch(JSON.stringify(payload), /digest@example\.test|preparedEnvelope|secret/);
+  }, app);
+});
+
+test('daily digest cron route requires secret enforces due time and accepts no content', async () => {
+  const calls = [];
+  const app = createApp({
+    dailyDealHunterRunner: async (input) => {
+      calls.push(input);
+      return { jobKey: 'daily-deal-hunter-email:2026-07-15', emailResult: { status: 'not-due' } };
+    },
+  });
+  await withServer(async (origin) => {
+    const unauthorized = await fetch(`${origin}/api/deal-hunter/daily-email`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    assert.equal(unauthorized.status, 401);
+
+    const rejected = await fetch(`${origin}/api/deal-hunter/daily-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Deal-Hunter-Secret': 'task-three-cron-secret' },
+      body: JSON.stringify({ recipient: 'attacker@example.test' }),
+    });
+    assert.equal(rejected.status, 400);
+
+    const dueControlled = await fetch(`${origin}/api/deal-hunter/daily-email`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Deal-Hunter-Secret': 'task-three-cron-secret' },
+      body: '{}',
+    });
+    assert.equal(dueControlled.status, 409);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].enforceDueTime, true);
+    assert.equal(calls[0].triggeredBy, 'external-cron');
+  }, app);
+});
+
+test('daily digest routes return completed active retry-not-due failed and ambiguous states precisely', async () => {
+  const cases = [
+    ['completed', { alreadySent: true, emailResult: { status: 'already-sent' }, jobRun: { status: 'completed' } }, 200],
+    ['active', { inProgress: true, emailResult: { status: 'in-progress' }, jobRun: { status: 'pending' } }, 409],
+    ['retry-not-due', { emailResult: { status: 'retry-not-due' }, jobRun: { status: 'failed' } }, 409],
+    ['failed', { emailResult: { status: 'failed', errorCategory: 'provider-nonacceptance' }, jobRun: { status: 'failed' } }, 502],
+    ['ambiguous', { emailResult: { status: 'ambiguous', errorCategory: 'provider-timeout' }, jobRun: { status: 'ambiguous' } }, 409],
+  ];
+  for (const [label, result, expectedStatus] of cases) {
+    const app = createApp({ dailyDealHunterRunner: async () => ({ jobKey: `${label}:2026-07-15`, ...result }) });
+    await withServer(async (origin) => {
+      const cookie = await signInForCookie(origin);
+      const response = await fetch(`${origin}/api/admin/deal-hunter/send`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: '{}',
+      });
+      assert.equal(response.status, expectedStatus, label);
+      const payload = await response.json();
+      assert.equal(payload.status, result.emailResult.status, label);
+      assert.doesNotMatch(JSON.stringify(payload), /metadata|preparedEnvelope|recipient/);
+    }, app);
+  }
+});
+
+test('daily digest privileged routes reject unsupported nonempty wire bodies', async () => {
+  let runnerCalls = 0;
+  const app = createApp({
+    dailyDealHunterRunner: async () => {
+      runnerCalls += 1;
+      return {
+        jobKey: 'daily-deal-hunter-email:2026-07-15',
+        notificationType: 'normal-digest',
+        emailResult: { status: 'sent', provider: 'resend', providerMessageId: 'wire-body-test-1' },
+        jobRun: { status: 'completed' },
+      };
+    },
+  });
+  await withServer(async (origin) => {
+    const adminCookie = await signInForCookie(origin);
+    const routes = [
+      ['/api/admin/deal-hunter/send', { Cookie: adminCookie }],
+      ['/api/deal-hunter/daily-email', { 'X-Deal-Hunter-Secret': 'task-three-cron-secret' }],
+    ];
+
+    for (const [route, authorization] of routes) {
+      for (const contentType of ['text/plain', 'application/octet-stream']) {
+        const response = await fetch(`${origin}${route}`, {
+          method: 'POST',
+          headers: { ...authorization, 'Content-Type': contentType },
+          body: 'nonempty privileged trigger payload',
+        });
+        assert.ok([400, 415].includes(response.status), `${route} ${contentType}`);
+      }
+      const chunked = await postChunked(`${origin}${route}`, {
+        headers: { ...authorization, 'Content-Type': 'text/plain' },
+        body: 'chunked nonempty privileged trigger payload',
+      });
+      assert.ok([400, 415].includes(chunked.status), `${route} chunked`);
+    }
+    assert.equal(runnerCalls, 0);
+
+    for (const [route, authorization] of routes) {
+      const empty = await fetch(`${origin}${route}`, { method: 'POST', headers: authorization });
+      assert.ok([200, 409].includes(empty.status), `${route} truly empty`);
+      const emptyJson = await fetch(`${origin}${route}`, {
+        method: 'POST',
+        headers: { ...authorization, 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      assert.ok([200, 409].includes(emptyJson.status), `${route} exact empty JSON object`);
+      const property = await fetch(`${origin}${route}`, {
+        method: 'POST',
+        headers: { ...authorization, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ unexpected: true }),
+      });
+      assert.equal(property.status, 400, `${route} JSON property`);
+    }
+    assert.equal(runnerCalls, 4);
+  }, app);
+});
+
+test('viewer Deal Hunter review sanitizer removes provider identities without changing safe status fields', () => {
+  const sanitizeViewerDealHunterReview = appModule.sanitizeViewerDealHunterReview;
+  assert.equal(typeof sanitizeViewerDealHunterReview, 'function');
+
+  const reviewBuckets = ['newlySeenMatches', 'qualified', 'watchlist', 'removalCandidates'];
+  const review = {
+    generatedAt: '2026-09-08T16:00:00.000Z',
+    dailyEmailJob: {
+      status: 'completed',
+      businessDate: '2026-09-08',
+      attemptCount: 1,
+      providerMessageId: 'viewer-digest-provider-sentinel',
+    },
+    ...Object.fromEntries(reviewBuckets.map((bucket, index) => [bucket, [{
+      dealKey: `viewer-provider-privacy-${index}`,
+      score: 80 + index,
+      cimRequest: {
+        status: 'sent',
+        requestState: 'provider_accepted',
+        deliveryState: 'accepted',
+        followUpState: 'not-scheduled',
+        requestedAt: '2026-09-08T15:00:00.000Z',
+        firstProviderAcceptedAt: '2026-09-08T15:00:01.000Z',
+        lastActivityAt: '2026-09-08T15:00:01.000Z',
+        followUpCount: index,
+        recipientPolicy: { blocked: false, touches24Hours: 1, touches30Days: 1 },
+        providerMessageId: `viewer-cim-provider-sentinel-${index}`,
+      },
+    }]])),
+  };
+  const originalReview = structuredClone(review);
+
+  const sanitized = sanitizeViewerDealHunterReview(review);
+
+  assert.notStrictEqual(sanitized, review);
+  assert.notStrictEqual(sanitized.dailyEmailJob, review.dailyEmailJob);
+  const { providerMessageId: _digestProviderMessageId, ...safeDailyEmailJob } = originalReview.dailyEmailJob;
+  assert.deepEqual(sanitized.dailyEmailJob, safeDailyEmailJob);
+  for (const bucket of reviewBuckets) {
+    assert.notStrictEqual(sanitized[bucket], review[bucket]);
+    assert.notStrictEqual(sanitized[bucket][0], review[bucket][0]);
+    assert.notStrictEqual(sanitized[bucket][0].cimRequest, review[bucket][0].cimRequest);
+    const { providerMessageId: _cimProviderMessageId, ...safeCimRequest } = originalReview[bucket][0].cimRequest;
+    assert.deepEqual(sanitized[bucket][0].cimRequest, safeCimRequest, bucket);
+  }
+  assert.deepEqual(review, originalReview);
+});
+
+test('Deal Hunter review hides explicit configured delivery addresses from administrator and viewer browsers', async () => {
+  const sentinels = {
+    admin: 'browser-private-admin@example.invalid',
+    fallback: 'browser-private-fallback@example.invalid',
+    recipient: 'digest-private-recipient@example.invalid',
+    sender: 'digest-private-sender@example.invalid',
+    replyTo: 'digest-private-reply@example.invalid',
+    followUpSender: 'follow-private-sender@example.invalid',
+    followUpReplyTo: 'follow-private-reply@example.invalid',
+  };
+
+  await withEmailReadinessAddressConfig({
+    adminEmail: sentinels.admin,
+    fallbackRecipient: sentinels.fallback,
+    dealHunterRecipient: sentinels.recipient,
+    fromAddress: `Private Sender <${sentinels.sender}>`,
+    replyToAddress: sentinels.replyTo,
+    followUpSenderAddress: sentinels.followUpSender,
+    followUpReplyToAddress: sentinels.followUpReplyTo,
+  }, async () => {
+    await withServer(async (origin) => {
+      const adminCookie = await signInForCookie(origin);
+      const viewerCookie = await signInForCookie(origin, {
+        username: 'smb-deal-hunter', password: 'view-only-local',
+      });
+      const unauthenticated = await fetch(`${origin}/api/admin/deal-hunter/review`);
+      assert.equal(unauthenticated.status, 401);
+
+      for (const [role, cookie] of [['administrator', adminCookie], ['viewer', viewerCookie]]) {
+        const response = await fetch(`${origin}/api/admin/deal-hunter/review`, { headers: { Cookie: cookie } });
+        const payload = await response.json();
+        assert.equal(response.status, 200, role);
+        for (const field of [
+          'fromAddress', 'replyToAddress', 'followUpSenderAddress', 'followUpReplyToAddress',
+          'testRecipient', 'allowedTestRecipients',
+        ]) {
+          assert.equal(Object.hasOwn(payload.review.emailReadiness, field), false, `${role} ${field}`);
+        }
+        const serialized = JSON.stringify(payload);
+        for (const sentinel of Object.values(sentinels)) {
+          assert.equal(serialized.includes(sentinel), false, `${role} ${sentinel}`);
+        }
+        assert.equal(payload.review.emailReadiness.provider, 'resend', role);
+        assert.equal(payload.review.emailReadiness.outboundConfigured, true, role);
+        assert.equal(payload.review.emailReadiness.recipientConfigured, true, role);
+        assert.equal(payload.review.emailReadiness.senderConfigured, true, role);
+        assert.equal(payload.review.emailReadiness.replyToConfigured, true, role);
+        assert.equal(payload.review.emailReadiness.webhookConfigured, true, role);
+        assert.ok(Array.isArray(payload.review.emailReadiness.issues), role);
+        assert.equal(typeof payload.review.emailReadiness.metrics, 'object', role);
+      }
+    });
+  });
+});
+
+test('Deal Hunter review hides the ADMIN_EMAIL Daily Digest recipient fallback for both browser roles', async () => {
+  const fallbackSentinel = 'digest-admin-fallback-private@example.invalid';
+
+  await withEmailReadinessAddressConfig({
+    adminEmail: fallbackSentinel,
+    fallbackRecipient: 'lead-notification-private@example.invalid',
+    dealHunterRecipient: '',
+    fromAddress: 'fallback-private-sender@example.invalid',
+    replyToAddress: 'fallback-private-reply@example.invalid',
+    followUpSenderAddress: 'fallback-follow-sender@example.invalid',
+    followUpReplyToAddress: 'fallback-follow-reply@example.invalid',
+  }, async () => {
+    await withServer(async (origin) => {
+      const adminCookie = await signInForCookie(origin);
+      const viewerCookie = await signInForCookie(origin, {
+        username: 'smb-deal-hunter', password: 'view-only-local',
+      });
+
+      for (const [role, cookie] of [['administrator', adminCookie], ['viewer', viewerCookie]]) {
+        const response = await fetch(`${origin}/api/admin/deal-hunter/review`, { headers: { Cookie: cookie } });
+        const payload = await response.json();
+        assert.equal(response.status, 200, role);
+        assert.equal(JSON.stringify(payload).includes(fallbackSentinel), false, role);
+        assert.equal(payload.review.emailReadiness.recipientConfigured, true, role);
+        assert.equal(payload.review.emailReadiness.recipientValid, true, role);
+      }
+    });
+  });
+});
+
+test('browser email readiness projection is an explicit non-mutating safe-field projection', async () => {
+  await withEmailReadinessAddressConfig({
+    adminEmail: 'projection-private-admin@example.invalid',
+    fallbackRecipient: 'projection-private-fallback@example.invalid',
+    dealHunterRecipient: 'projection-private-digest@example.invalid',
+    fromAddress: 'Projection Sender <projection-private-sender@example.invalid>',
+    replyToAddress: 'projection-private-reply@example.invalid',
+    followUpSenderAddress: 'projection-private-follow-sender@example.invalid',
+    followUpReplyToAddress: 'projection-private-follow-reply@example.invalid',
+  }, async (config) => {
+    const internal = buildEmailReadiness({
+      config,
+      metricsAvailable: true,
+      sentLast24Hours: 2,
+      operationalMetrics: { suppressions: { active: 1 } },
+    });
+    const original = structuredClone(internal);
+    const projectBrowserEmailReadiness = appModule.projectBrowserEmailReadiness;
+    assert.equal(typeof projectBrowserEmailReadiness, 'function');
+
+    const projected = projectBrowserEmailReadiness(internal);
+
+    assert.notStrictEqual(projected, internal);
+    assert.notStrictEqual(projected.metrics, internal.metrics);
+    assert.notStrictEqual(projected.issues, internal.issues);
+    assert.deepEqual(internal, original);
+    assert.deepEqual({
+      provider: projected.provider,
+      outboundConfigured: projected.outboundConfigured,
+      recipientConfigured: projected.recipientConfigured,
+      recipientValid: projected.recipientValid,
+      senderConfigured: projected.senderConfigured,
+      replyToConfigured: projected.replyToConfigured,
+      webhookConfigured: projected.webhookConfigured,
+      metricsAvailable: projected.metricsAvailable,
+      sentLast24Hours: projected.metrics.sentLast24Hours,
+    }, {
+      provider: 'resend',
+      outboundConfigured: true,
+      recipientConfigured: true,
+      recipientValid: true,
+      senderConfigured: true,
+      replyToConfigured: true,
+      webhookConfigured: true,
+      metricsAvailable: true,
+      sentLast24Hours: 2,
+    });
+    for (const field of [
+      'fromAddress', 'replyToAddress', 'followUpSenderAddress', 'followUpReplyToAddress',
+      'testRecipient', 'allowedTestRecipients',
+    ]) {
+      assert.equal(Object.hasOwn(projected, field), false, field);
+    }
+  });
+});
+
+test('Operations hides configured readiness addresses from administrator and viewer browsers', async () => {
+  const sentinels = {
+    testRecipient: 'operations-private-admin@example.invalid',
+    allowedRecipient: 'operations-private-fallback@example.invalid',
+    recipient: 'operations-private-digest@example.invalid',
+    sender: 'operations-private-sender@example.invalid',
+    replyTo: 'operations-private-reply@example.invalid',
+    followUpSender: 'operations-private-follow-sender@example.invalid',
+    followUpReplyTo: 'operations-private-follow-reply@example.invalid',
+  };
+
+  await withEmailReadinessAddressConfig({
+    adminEmail: sentinels.testRecipient,
+    fallbackRecipient: sentinels.allowedRecipient,
+    dealHunterRecipient: sentinels.recipient,
+    fromAddress: `Operations Sender <${sentinels.sender}>`,
+    replyToAddress: sentinels.replyTo,
+    followUpSenderAddress: sentinels.followUpSender,
+    followUpReplyToAddress: sentinels.followUpReplyTo,
+  }, async () => {
+    await withServer(async (origin) => {
+      const adminCookie = await signInForCookie(origin);
+      const viewerCookie = await signInForCookie(origin, {
+        username: 'smb-deal-hunter', password: 'view-only-local',
+      });
+      const unauthenticated = await fetch(`${origin}/api/admin/operations`);
+      assert.equal(unauthenticated.status, 401);
+
+      for (const [role, cookie] of [['administrator', adminCookie], ['viewer', viewerCookie]]) {
+        const response = await fetch(`${origin}/api/admin/operations`, { headers: { Cookie: cookie } });
+        const payload = await response.json();
+        assert.equal(response.status, 200, role);
+        for (const field of [
+          'fromAddress', 'replyToAddress', 'followUpSenderAddress', 'followUpReplyToAddress',
+        ]) {
+          assert.equal(Object.hasOwn(payload.operations.email, field), false, `${role} ${field}`);
+        }
+        if (role === 'administrator') {
+          assert.equal(Object.hasOwn(payload.operations.email, 'testRecipient'), false, role);
+          assert.equal(Object.hasOwn(payload.operations.email, 'allowedTestRecipients'), false, role);
+        } else {
+          assert.equal(payload.operations.email.testRecipient, '', role);
+          assert.deepEqual(payload.operations.email.allowedTestRecipients, [], role);
+        }
+        const serialized = JSON.stringify(payload);
+        for (const sentinel of Object.values(sentinels)) {
+          assert.equal(serialized.includes(sentinel), false, `${role} ${sentinel}`);
+        }
+        assert.equal(payload.operations.email.provider, 'resend', role);
+        assert.equal(payload.operations.email.outboundConfigured, true, role);
+        assert.equal(payload.operations.email.recipientConfigured, true, role);
+        assert.equal(payload.operations.email.senderConfigured, true, role);
+        assert.equal(payload.operations.email.replyToConfigured, true, role);
+        assert.equal(payload.operations.email.followUpSenderConfigured, true, role);
+        assert.equal(payload.operations.email.followUpReplyToConfigured, true, role);
+        assert.equal(payload.operations.email.webhookConfigured, true, role);
+        assert.ok(Array.isArray(payload.operations.email.issues), role);
+        assert.equal(typeof payload.operations.email.metrics, 'object', role);
+      }
+    });
+  });
+});
+
+test('Review and Operations hide readiness event content and identities from both browser roles', async () => {
+  const storage = getStorage();
+  const sentinels = {
+    subject: 'PRIVATE HTTP READINESS SUBJECT SENTINEL',
+    recipient: 'private-http-readiness-recipient@example.invalid',
+    sender: 'private-http-readiness-sender@example.invalid',
+    replyTo: 'private-http-readiness-reply@example.invalid',
+    providerMessageId: 'private-http-readiness-provider-id',
+    rawProviderResponse: 'PRIVATE HTTP READINESS RAW PROVIDER RESPONSE',
+    error: 'PRIVATE HTTP READINESS ERROR STACK PATH CREDENTIAL',
+    futureSecret: 'PRIVATE HTTP READINESS FUTURE SECRET',
+  };
+  const createdAt = '2099-09-08T15:00:00.000Z';
+  await storage.insertEmailEvent({
+    id: 'browser-readiness-event-privacy',
+    event_key: 'browser-readiness-event-privacy',
+    created_at: createdAt,
+    provider: 'resend',
+    event_type: 'delivered',
+    message_id: sentinels.providerMessageId,
+    provider_event_id: 'private-http-readiness-provider-event-id',
+    recipient_email: sentinels.recipient,
+    subject: Object.values(sentinels).join(' | '),
+    submission_id: null,
+    source: 'admin-email-test',
+    metadata: {
+      sender: sentinels.sender,
+      replyTo: sentinels.replyTo,
+      rawProviderResponse: sentinels.rawProviderResponse,
+      error: sentinels.error,
+      futureSecret: sentinels.futureSecret,
+    },
+  });
+
+  await withEmailReadinessAddressConfig({
+    adminEmail: sentinels.recipient,
+    fallbackRecipient: 'private-http-readiness-fallback@example.invalid',
+    dealHunterRecipient: 'private-http-readiness-digest@example.invalid',
+    fromAddress: `Private HTTP Sender <${sentinels.sender}>`,
+    replyToAddress: sentinels.replyTo,
+    followUpSenderAddress: 'private-http-readiness-follow-sender@example.invalid',
+    followUpReplyToAddress: 'private-http-readiness-follow-reply@example.invalid',
+  }, async () => {
+    await withServer(async (origin) => {
+      const adminCookie = await signInForCookie(origin);
+      const viewerCookie = await signInForCookie(origin, {
+        username: 'smb-deal-hunter', password: 'view-only-local',
+      });
+      for (const [role, cookie] of [['administrator', adminCookie], ['viewer', viewerCookie]]) {
+        for (const [route, responseKey] of [
+          ['/api/admin/deal-hunter/review', 'review'],
+          ['/api/admin/operations', 'operations'],
+        ]) {
+          const response = await fetch(`${origin}${route}`, { headers: { Cookie: cookie } });
+          const payload = await response.json();
+          assert.equal(response.status, 200, `${role} ${route}`);
+          const readiness = payload[responseKey].emailReadiness || payload[responseKey].email;
+          assert.deepEqual(readiness.latestTestEvent, {
+            createdAt,
+            eventType: 'delivered',
+            source: 'admin-email-test',
+          }, `${role} ${route}`);
+          const serialized = JSON.stringify(payload);
+          for (const sentinel of Object.values(sentinels)) {
+            assert.equal(serialized.includes(sentinel), false, `${role} ${route} ${sentinel}`);
+          }
+          if (role === 'viewer') {
+            assert.equal(serialized.includes('providerMessageId'), false, `${role} ${route}`);
+          }
+        }
+      }
+    });
+  });
+});
+
+test('daily digest browser responses exclude the raw prepared envelope and job metadata', async () => {
+  const storage = getStorage();
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
+  });
+  const dateParts = Object.fromEntries(formatter.formatToParts(now).map((part) => [part.type, part.value]));
+  const businessDate = `${dateParts.year}-${dateParts.month}-${dateParts.day}`;
+  const jobKey = `daily-deal-hunter-email:${businessDate}`;
+  const nowIso = now.toISOString();
+  const sentinels = {
+    recipient: 'sentinel-recipient@example.test',
+    sender: 'sentinel-sender@example.test',
+    subject: 'SENTINEL PRIVATE SUBJECT',
+    text: 'SENTINEL PRIVATE TEXT BODY',
+    html: '<strong>SENTINEL PRIVATE HTML BODY</strong>',
+    claimToken: 'http-sensitive-claim-token-0001',
+    rawMetadata: 'SENTINEL RAW METADATA',
+  };
+  const claim = await storage.claimScheduledJob({
+    jobKey,
+    jobName: 'daily-deal-hunter-email',
+    triggeredBy: 'test',
+    claimToken: sentinels.claimToken,
+    nowIso,
+    staleBefore: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+    retryDueAt: nowIso,
+    metadata: {
+      businessDate,
+      notificationType: 'normal-digest',
+      rawMetadata: sentinels.rawMetadata,
+      recipient: sentinels.recipient,
+      preparedEnvelope: {
+        to: sentinels.recipient,
+        from: sentinels.sender,
+        subject: sentinels.subject,
+        text: sentinels.text,
+        html: sentinels.html,
+        idempotencyKey: jobKey,
+      },
+    },
+  });
+  assert.equal(claim.applied, true);
+
+  await withServer(async (origin) => {
+    const adminCookie = await signInForCookie(origin);
+    const viewerCookie = await signInForCookie(origin, {
+      username: 'smb-deal-hunter', password: 'view-only-local',
+    });
+    const payloads = [];
+
+    for (const cookie of [adminCookie, viewerCookie]) {
+      const response = await fetch(`${origin}/api/admin/deal-hunter/review`, { headers: { Cookie: cookie } });
+      assert.equal(response.status, 200);
+      payloads.push(await response.json());
+    }
+
+    const csv = Buffer.from([
+      'Listing ID,Business Name,View Listing URL,SDE',
+      'HTTP-SAFE-STATUS-1,Safe Status Fixture,https://broker.example/http-safe-status,425000',
+    ].join('\n'));
+    const imported = await fetch(`${origin}/api/admin/deal-hunter/deal-os-import`, {
+      method: 'POST',
+      headers: {
+        Cookie: adminCookie,
+        'Content-Type': 'text/csv',
+        'X-Deal-OS-File-Name': encodeURIComponent('deal-os-safe-status.csv'),
+        'X-Deal-OS-Exported-At': nowIso,
+        'X-Deal-OS-Scope': 'saved-search',
+        'X-Deal-OS-Coverage-Label': encodeURIComponent('Daily digest status projection test'),
+        'X-Deal-OS-Expected-Row-Count': '1',
+      },
+      body: csv,
+    });
+    assert.equal(imported.status, 201);
+    payloads.push(await imported.json());
+
+    const backfill = await fetch(`${origin}/api/admin/deal-hunter/backfill-review`, {
+      method: 'POST', headers: { Cookie: adminCookie },
+    });
+    assert.equal(backfill.status, 200);
+    payloads.push(await backfill.json());
+
+    const crmSync = await fetch(`${origin}/api/admin/deal-hunter/crm-sync`, {
+      method: 'POST',
+      headers: { Cookie: adminCookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        confirmation: 'SYNC HIGH FITS',
+        expectedDealKeys: ['source:test:nonexistent-safe-status'],
+        reviewMode: 'daily',
+      }),
+    });
+    assert.ok([400, 409, 503].includes(crmSync.status));
+    payloads.push(await crmSync.json());
+
+    const serialized = JSON.stringify(payloads);
+    assert.doesNotMatch(serialized, /preparedEnvelope/);
+    for (const [label, sentinel] of Object.entries(sentinels)) {
+      assert.equal(serialized.includes(sentinel), false, label);
+    }
+    for (const payload of payloads) {
+      assert.equal(payload.review.dailyEmailJob.status, 'pending');
+    }
+
+    const viewerProviderSentinel = 'viewer-raw-provider-sentinel-9f2';
+    const completed = await storage.transitionScheduledJob({
+      jobKey,
+      claimToken: sentinels.claimToken,
+      expectedStatuses: ['pending'],
+      status: 'completed',
+      nowIso,
+      completedAt: nowIso,
+      providerMessageId: viewerProviderSentinel,
+      metadataPatch: { provider: 'resend', payloadDigest: 'a'.repeat(64) },
+    });
+    assert.equal(completed.applied, true);
+
+    const adminReviewResponse = await fetch(`${origin}/api/admin/deal-hunter/review`, { headers: { Cookie: adminCookie } });
+    const viewerReviewResponse = await fetch(`${origin}/api/admin/deal-hunter/review`, { headers: { Cookie: viewerCookie } });
+    const adminReview = await adminReviewResponse.json();
+    const viewerReview = await viewerReviewResponse.json();
+    assert.equal(adminReviewResponse.status, 200);
+    assert.equal(viewerReviewResponse.status, 200);
+
+    const { providerMessageId: adminDigestProviderMessageId, ...adminSafeDailyEmailJob } = adminReview.review.dailyEmailJob;
+    assert.equal(adminDigestProviderMessageId, viewerProviderSentinel);
+    assert.equal(Object.hasOwn(viewerReview.review.dailyEmailJob, 'providerMessageId'), false);
+    assert.deepEqual(viewerReview.review.dailyEmailJob, adminSafeDailyEmailJob);
+    const serializedViewerReview = JSON.stringify(viewerReview);
+    assert.equal(serializedViewerReview.includes(viewerProviderSentinel), false);
+
+    const adminOperationsResponse = await fetch(`${origin}/api/admin/operations`, { headers: { Cookie: adminCookie } });
+    const viewerOperationsResponse = await fetch(`${origin}/api/admin/operations`, { headers: { Cookie: viewerCookie } });
+    const adminOperations = await adminOperationsResponse.json();
+    const viewerOperations = await viewerOperationsResponse.json();
+    assert.equal(adminOperationsResponse.status, 200);
+    assert.equal(viewerOperationsResponse.status, 200);
+    assert.equal(adminOperations.operations.dailyDigest.providerMessageId, viewerProviderSentinel);
+    assert.equal(Object.hasOwn(viewerOperations.operations.dailyDigest, 'providerMessageId'), false);
+    assert.equal(JSON.stringify(viewerOperations).includes(viewerProviderSentinel), false);
   });
 });
 
@@ -1107,6 +1923,76 @@ test('follow-up APIs paginate without bodies and enforce admin-only context, rec
       body: JSON.stringify({ action: 'reopen', expectedSubmissionVersion: selected.updated_at }),
     });
     assert.equal(staleResponse.status, 409);
+  });
+});
+
+test('required source authority blocks direct Acquisition Inbox decision mutation', async () => {
+  const opportunityId = 'task-four-http-required-failure';
+  const storage = await seedTaskFourOpportunity(opportunityId);
+  writeTaskFourSourceSnapshot({ requiredHealthy: false });
+  let digestRuns = 0;
+  const app = createApp({ dailyDealHunterRunner: async () => { digestRuns += 1; return {}; } });
+
+  await withServer(async (origin) => {
+    const cookie = await signInForCookie(origin);
+    const before = await storage.getCurrentDealHunterOpportunityScore(opportunityId);
+    const response = await fetch(`${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ action: 'pursue' }),
+    });
+    const result = await response.json();
+    const after = await storage.getCurrentDealHunterOpportunityScore(opportunityId);
+
+    assert.equal(response.status, 503);
+    assert.equal(result.success, false);
+    assert.equal(result.code, 'required_source_authority_unavailable');
+    assert.deepEqual(
+      { priority: after.operator_priority, reviewedAt: after.reviewed_at, reviewedBy: after.reviewed_by },
+      { priority: before.operator_priority, reviewedAt: before.reviewed_at, reviewedBy: before.reviewed_by },
+    );
+    assert.equal(digestRuns, 0);
+  }, app);
+});
+
+test('optional Deal OS warning does not block a current primary-backed decision', async () => {
+  const opportunityId = 'task-four-http-optional-warning';
+  const storage = await seedTaskFourOpportunity(opportunityId);
+  writeTaskFourSourceSnapshot({ requiredHealthy: true, optionalWarning: true });
+
+  await withServer(async (origin) => {
+    const cookie = await signInForCookie(origin);
+    const response = await fetch(`${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ action: 'watch' }),
+    });
+    const result = await response.json();
+    const after = await storage.getCurrentDealHunterOpportunityScore(opportunityId);
+
+    assert.equal(response.status, 200);
+    assert.equal(result.success, true);
+    assert.equal(after.operator_priority, 'watch');
+    assert.ok(after.reviewed_at);
+  });
+});
+
+test('viewer can read but cannot mutate the Daily Digest briefing', async () => {
+  const opportunityId = 'task-four-http-viewer';
+  const storage = await seedTaskFourOpportunity(opportunityId);
+  writeTaskFourSourceSnapshot({ requiredHealthy: true });
+
+  await withServer(async (origin) => {
+    const viewerCookie = await signInForCookie(origin, { username: 'smb-deal-hunter', password: 'view-only-local' });
+    const read = await fetch(`${origin}/api/admin/deal-hunter/triage?view=needs-review`, { headers: { Cookie: viewerCookie } });
+    const readResult = await read.json();
+    assert.equal(read.status, 200);
+    assert.equal(readResult.dailyDigest?.actionsAllowed, true);
+    assert.equal(readResult.dailyDigest?.status, 'ready');
+
+    const mutation = await fetch(`${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: viewerCookie }, body: JSON.stringify({ action: 'pursue' }),
+    });
+    const after = await storage.getCurrentDealHunterOpportunityScore(opportunityId);
+    assert.equal(mutation.status, 401);
+    assert.equal(after.operator_priority, 'normal');
+    assert.equal(after.reviewed_at, null);
   });
 });
 

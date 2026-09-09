@@ -46,6 +46,13 @@ export const triageSorts = Object.freeze(['acquisition-priority', 'fit-score', '
 
 const maxNoteLength = 2000;
 const maxDispositionAuthorityCimRecords = 100000;
+const dailyDigestTopLimit = 5;
+const sourceAuthorityUnavailable = Object.freeze({
+  ok: false,
+  status: 503,
+  code: 'required_source_authority_unavailable',
+  error: 'Current required acquisition source authority is unavailable. Open Operations before recording a decision.',
+});
 
 function normalizeText(value = '', maxLength = 400) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
@@ -101,6 +108,126 @@ function publicTriageSummary(summary = {}) {
     lowConfidence: Number(summary.lowConfidence || summary.low_confidence || 0),
     currentOpportunities: Number(summary.currentOpportunities || summary.current_opportunities || 0),
   };
+}
+
+function triageQuery({
+  view = 'needs-review', page = 1, pageSize = 25, search = '', sort = '', direction = 'desc',
+  minScore = null, confidence = '', priority = '', state = '',
+} = {}) {
+  const normalizedView = normalizeView(view);
+  const normalizedSort = normalizeSort(
+    sort,
+    normalizedView === 'needs-review' ? 'acquisition-priority' : 'fit-score',
+  );
+  const normalizedDirection = normalizedSort === 'acquisition-priority'
+    ? 'desc'
+    : (normalizeText(direction, 8).toLowerCase() === 'asc' ? 'asc' : 'desc');
+  return {
+    normalizedView,
+    normalizedSort,
+    normalizedDirection,
+    storageQuery: {
+      view: normalizedView,
+      page: normalizeBoundedInteger(page, 1, 10000),
+      pageSize: normalizeBoundedInteger(pageSize, 25, 100),
+      search: normalizeText(search, 160),
+      sort: normalizedSort,
+      direction: normalizedDirection,
+      minScore: minScore === null || minScore === '' || !Number.isFinite(Number(minScore)) ? null : Number(minScore),
+      confidence: normalizeConfidence(confidence),
+      priority: priority ? normalizeDealOperatorPriority(priority, '') : '',
+      state: normalizeText(state, 12),
+    },
+  };
+}
+
+function projectedDigestJob(run) {
+  if (!run || typeof run !== 'object' || Array.isArray(run)) return {};
+  const metadata = run.metadata && typeof run.metadata === 'object' && !Array.isArray(run.metadata)
+    ? run.metadata
+    : {};
+  return {
+    status: normalizeText(run.status, 40),
+    attemptCount: Number.isInteger(run.attempt_count) && run.attempt_count >= 0 ? run.attempt_count : 0,
+    completedAt: typeof run.completed_at === 'string' ? run.completed_at : '',
+    notificationType: normalizeText(metadata.notificationType, 40),
+  };
+}
+
+function unavailableDailyDigest(sourceHealth = {}) {
+  const generatedAt = typeof sourceHealth.generatedAt === 'string' ? sourceHealth.generatedAt : '';
+  return {
+    businessDate: normalizeText(sourceHealth.dateKey, 20),
+    generatedAt,
+    status: 'unavailable',
+    notificationType: 'required-source-alert',
+    sourceAuthority: {
+      requiredHealthy: false,
+      blockingIssues: [{
+        sourceId: 'acquisition-authority',
+        sourceName: 'Acquisition authority',
+        classification: 'authority-invalid',
+        title: 'Morning briefing is unavailable',
+        message: 'Current acquisition authority could not be established.',
+        checkedAt: generatedAt,
+      }],
+      optionalWarnings: [],
+    },
+    summary: null,
+    topOpportunities: [],
+    job: { status: '', attemptCount: 0, completedAt: '', notificationType: 'required-source-alert' },
+    actionsAllowed: false,
+    links: { inbox: '/admin/deal-hunter', operations: '/admin/deal-hunter?view=operations' },
+  };
+}
+
+async function buildTriageDailyDigest({ storage, sourceHealth, visibleResult = null } = {}) {
+  try {
+    let digestResult = visibleResult;
+    if (sourceHealth?.healthy === true) {
+      digestResult = await storage.listDealHunterOpportunityScores({
+        view: 'needs-review', page: 1, pageSize: dailyDigestTopLimit, search: '',
+        sort: 'acquisition-priority', direction: 'desc', minScore: null, confidence: '', priority: '', state: '',
+      });
+    }
+    const queue = {
+      ok: Boolean(digestResult),
+      rows: (digestResult?.rows || []).map(publicTriageRow),
+      summary: publicTriageSummary(digestResult?.summary),
+    };
+    let job = {};
+    const businessDate = normalizeText(sourceHealth?.dateKey, 20);
+    if (businessDate && typeof storage.getScheduledJob === 'function') {
+      try {
+        job = projectedDigestJob(await storage.getScheduledJob(`daily-deal-hunter-email:${businessDate}`));
+      } catch {
+        job = {};
+      }
+    }
+    const { projectDailyDealHunterDigest } = await import('./dailyDealHunterDigest.js');
+    return projectDailyDealHunterDigest({
+      businessDate,
+      generatedAt: sourceHealth?.generatedAt,
+      sourceHealth,
+      scoreRefresh: { ok: true },
+      queue,
+      job,
+    });
+  } catch {
+    return unavailableDailyDigest(sourceHealth);
+  }
+}
+
+async function requiredSourceMutationGate({ storage, getCachedSourceHealth }) {
+  if (typeof getCachedSourceHealth !== 'function') return null;
+  let sourceHealth;
+  try {
+    sourceHealth = await getCachedSourceHealth(storage, { persistSnapshot: false, refresh: false });
+  } catch {
+    return { ...sourceAuthorityUnavailable };
+  }
+  const dailyDigest = await buildTriageDailyDigest({ storage, sourceHealth });
+  return dailyDigest.actionsAllowed === true ? null : { ...sourceAuthorityUnavailable };
 }
 
 // The list row an operator scans. Fit and confidence stay separate values;
@@ -167,27 +294,12 @@ export async function listTriageQueue({
   if (typeof storage.listDealHunterOpportunityScores !== 'function') {
     return { ok: false, status: 503, error: 'Opportunity scoring storage is unavailable.' };
   }
-  const normalizedView = normalizeView(view);
-  const normalizedSort = normalizeSort(
-    sort,
-    normalizedView === 'needs-review' ? 'acquisition-priority' : 'fit-score',
-  );
-  const normalizedDirection = normalizedSort === 'acquisition-priority'
-    ? 'desc'
-    : (normalizeText(direction, 8).toLowerCase() === 'asc' ? 'asc' : 'desc');
-  const result = await storage.listDealHunterOpportunityScores({
-    view: normalizedView,
-    page: normalizeBoundedInteger(page, 1, 10000),
-    pageSize: normalizeBoundedInteger(pageSize, 25, 100),
-    search: normalizeText(search, 160),
-    sort: normalizedSort,
-    direction: normalizedDirection,
-    minScore: minScore === null || minScore === '' || !Number.isFinite(Number(minScore)) ? null : Number(minScore),
-    confidence: normalizeConfidence(confidence),
-    priority: priority ? normalizeDealOperatorPriority(priority, '') : '',
-    state: normalizeText(state, 12),
+  const { normalizedView, normalizedSort, normalizedDirection, storageQuery } = triageQuery({
+    view, page, pageSize, search, sort, direction, minScore, confidence, priority, state,
   });
+  const result = await storage.listDealHunterOpportunityScores(storageQuery);
   const sourceHealth = await getCachedSourceHealth(storage, { persistSnapshot: false, refresh: false });
+  const dailyDigest = await buildTriageDailyDigest({ storage, sourceHealth, visibleResult: result });
 
   return {
     ok: true,
@@ -202,6 +314,7 @@ export async function listTriageQueue({
     totalPages: result.totalPages,
     summary: publicTriageSummary(result.summary),
     sourceHealth,
+    dailyDigest,
     views: triageViews,
     priorities: dealOperatorPriorities,
   };
@@ -697,6 +810,7 @@ export async function setTriageOperatorDecision({
   markReviewed = false,
   actor = 'admin',
   storage = getStorage(),
+  getCachedSourceHealth = storage === getStorage() ? getSourceHealth : null,
 } = {}) {
   const id = normalizeText(opportunityId, 200);
   if (!id) return { ok: false, status: 400, error: 'A canonical opportunity id is required.' };
@@ -706,6 +820,9 @@ export async function setTriageOperatorDecision({
   ) {
     return { ok: false, status: 503, error: 'Opportunity scoring storage is unavailable.' };
   }
+
+  const sourceGate = await requiredSourceMutationGate({ storage, getCachedSourceHealth });
+  if (sourceGate) return sourceGate;
 
   const current = await storage.getCurrentDealHunterOpportunityScore(id);
   if (!current) return { ok: false, status: 404, error: 'No score has been recorded for this opportunity.' };
@@ -787,6 +904,7 @@ export async function passTriageOpportunity({
   note = '',
   actor = 'admin',
   storage = getStorage(),
+  getCachedSourceHealth = storage === getStorage() ? getSourceHealth : null,
 } = {}) {
   const id = normalizeText(opportunityId, 200);
   if (!id) return { ok: false, status: 400, error: 'A canonical opportunity id is required.' };
@@ -799,6 +917,9 @@ export async function passTriageOpportunity({
   if (typeof storage.passDealHunterOpportunity !== 'function') {
     return { ok: false, status: 503, error: 'Atomic opportunity Pass storage is unavailable.' };
   }
+
+  const sourceGate = await requiredSourceMutationGate({ storage, getCachedSourceHealth });
+  if (sourceGate) return sourceGate;
 
   const normalizedReason = normalizeDealHunterDispositionReason(reason);
   if (!normalizedReason) return { ok: false, status: 400, error: 'A disposition reason is required.' };

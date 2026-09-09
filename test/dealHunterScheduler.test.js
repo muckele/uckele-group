@@ -3,180 +3,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { runClaimedDailyDealHunterEmail, startDealHunterDailyEmailScheduler } from '../server/services/dealHunterScheduler.js';
-
-function createJobStorage() {
-  let run = null;
-
-  return {
-    async listEmailEvents() {
-      return [];
-    },
-    async claimScheduledJob(input) {
-      if (run && run.status !== 'failed') {
-        return { claimed: false, run };
-      }
-
-      run = {
-        ...run,
-        job_key: input.jobKey,
-        status: 'pending',
-        started_at: input.nowIso,
-        attempt_count: Number(run?.attempt_count || 0) + 1,
-      };
-      return { claimed: true, run };
-    },
-    async completeScheduledJob(jobKey, values) {
-      run = {
-        ...run,
-        job_key: jobKey,
-        status: values.status,
-        completed_at: values.completed_at || new Date().toISOString(),
-        provider_message_id: values.provider_message_id || '',
-        last_error: values.last_error || '',
-        metadata: values.metadata || {},
-      };
-      return run;
-    },
-    get run() {
-      return run;
-    },
-  };
-}
-
-test('overlapping daily email triggers share one persistent claim', async () => {
-  const storage = createJobStorage();
-  let sendCount = 0;
-  const sendReview = async () => {
-    sendCount += 1;
-    await Promise.resolve();
-    return {
-      emailResult: { status: 'sent', error: '', providerMessageId: 'email-1' },
-      review: { totals: { reviewedDeals: 2 } },
-      crmSync: { reviewed: 2 },
-    };
-  };
-  const now = new Date('2026-07-12T18:00:00.000Z');
-  const results = await Promise.all(
-    Array.from({ length: 10 }, (_, index) =>
-      runClaimedDailyDealHunterEmail({
-        triggeredBy: `worker-${index}`,
-        now,
-        storage,
-        sendReview,
-        markerDir: '',
-      }),
-    ),
-  );
-
-  assert.equal(sendCount, 1);
-  assert.equal(results.filter((result) => result.emailResult.status === 'sent').length, 1);
-  assert.equal(results.filter((result) => result.inProgress).length, 9);
-  assert.equal(storage.run.status, 'completed');
-});
-
-test('ten overlapping degraded-alert triggers make one provider call', async () => {
-  const storage = createJobStorage();
-  let providerCalls = 0;
-  const sendReview = async () => {
-    providerCalls += 1;
-    await Promise.resolve();
-    return {
-      notificationType: 'required-source-alert',
-      emailResult: { status: 'sent', error: '', providerMessageId: 'alert-1' },
-      review: { totals: {}, sources: [{ id: 'sheet-0', fetched: false }] },
-      crmSync: { paused: true },
-    };
-  };
-  const now = new Date('2026-07-13T18:00:00.000Z');
-  const results = await Promise.all(Array.from({ length: 10 }, (_, index) => (
-    runClaimedDailyDealHunterEmail({
-      triggeredBy: `alert-worker-${index}`,
-      now,
-      storage,
-      sendReview,
-      markerDir: '',
-    })
-  )));
-
-  assert.equal(providerCalls, 1);
-  assert.equal(results.filter((result) => result.emailResult.status === 'sent').length, 1);
-  assert.equal(results.filter((result) => result.inProgress).length, 9);
-  assert.equal(storage.run.status, 'completed');
-  assert.equal(storage.run.metadata.notificationType, 'required-source-alert');
-});
-
-test('failed daily email claims are persisted for a later retry', async () => {
-  const storage = createJobStorage();
-  const result = await runClaimedDailyDealHunterEmail({
-    triggeredBy: 'scheduler',
-    now: new Date('2026-07-15T18:00:00.000Z'),
-    storage,
-    markerDir: '',
-    sendReview: async () => ({
-      emailResult: { status: 'failed', error: 'provider unavailable', providerMessageId: '' },
-      review: { totals: {} },
-    }),
-  });
-
-  assert.equal(result.emailResult.status, 'failed');
-  assert.equal(storage.run.status, 'failed');
-  assert.equal(storage.run.last_error, 'provider unavailable');
-});
-
-test('a failed provider attempt remains retryable under the same date claim', async () => {
-  const storage = createJobStorage();
-  const now = new Date('2026-07-15T18:00:00.000Z');
-  let providerCalls = 0;
-  const sendReview = async () => {
-    providerCalls += 1;
-    return providerCalls === 1
-      ? { emailResult: { status: 'failed', error: 'provider unavailable', providerMessageId: '' }, review: { totals: {} } }
-      : { emailResult: { status: 'sent', error: '', providerMessageId: 'retry-accepted' }, review: { totals: {} } };
-  };
-
-  const first = await runClaimedDailyDealHunterEmail({ now, storage, markerDir: '', sendReview });
-  const second = await runClaimedDailyDealHunterEmail({ now, storage, markerDir: '', sendReview });
-
-  assert.equal(first.emailResult.status, 'failed');
-  assert.equal(second.emailResult.status, 'sent');
-  assert.equal(providerCalls, 2);
-  assert.equal(storage.run.status, 'completed');
-  assert.equal(storage.run.attempt_count, 2);
-});
-
-test('one completed date cannot alternate from an alert to a normal digest', async () => {
-  const storage = createJobStorage();
-  const now = new Date('2026-07-18T18:00:00.000Z');
-  let providerCalls = 0;
-  const alert = await runClaimedDailyDealHunterEmail({
-    now,
-    storage,
-    markerDir: '',
-    sendReview: async () => {
-      providerCalls += 1;
-      return {
-        notificationType: 'required-source-alert',
-        emailResult: { status: 'sent', error: '', providerMessageId: 'alert-first' },
-        review: { totals: {} },
-      };
-    },
-  });
-  const normal = await runClaimedDailyDealHunterEmail({
-    now,
-    storage,
-    markerDir: '',
-    sendReview: async () => {
-      providerCalls += 1;
-      return { emailResult: { status: 'sent', error: '', providerMessageId: 'digest-second' }, review: { totals: {} } };
-    },
-  });
-
-  assert.equal(alert.notificationType, 'required-source-alert');
-  assert.equal(normal.alreadySent, true);
-  assert.equal(normal.emailResult.status, 'already-sent');
-  assert.equal(providerCalls, 1);
-});
+import {
+  runClaimedDailyDealHunterEmail,
+  shouldRunDailyDealHunterEmail,
+  startDealHunterDailyEmailScheduler,
+} from '../server/services/dealHunterScheduler.js';
+import { buildDailyDealHunterEmailEnvelope } from '../server/services/dailyDealHunterDigest.js';
+import { writeDailyDealHunterMarker } from '../server/services/dailyDealHunterReconciliation.js';
 
 test('scheduler keeps an in-progress date retryable', async () => {
   let attempts = 0;
@@ -203,45 +36,709 @@ test('scheduler keeps an in-progress date retryable', async () => {
   assert.equal(attempts, 2);
 });
 
-test('confirmed delivery is not marked failed when completion bookkeeping crashes', async (t) => {
-  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-email-marker-'));
-  t.after(() => fs.rmSync(markerDir, { recursive: true, force: true }));
-  const storage = createJobStorage();
-  const originalComplete = storage.completeScheduledJob;
-  let completeAttempts = 0;
-  storage.completeScheduledJob = async (...args) => {
-    completeAttempts += 1;
-    if (completeAttempts === 1) {
-      throw new Error('database unavailable after provider acceptance');
-    }
-    return originalComplete.apply(storage, args);
+function taskThreeConfig(markerDir = '') {
+  return {
+    isProduction: true,
+    server: { origin: 'https://internal.example.test', outboundRequestTimeoutMs: 100 },
+    admin: { email: 'admin@example.test' },
+    delivery: {
+      provider: 'resend',
+      resendApiKey: 're_test_only',
+      resendFromEmail: 'Uckele Group <sender@example.test>',
+      resendReplyTo: '',
+      emailWebhookSecret: 'whsec_test_only',
+    },
+    dealHunter: {
+      recipient: 'digest@example.test',
+      dailyEmail: {
+        enabled: true,
+        time: '08:00',
+        timezone: 'America/Los_Angeles',
+        checkIntervalMs: 60_000,
+        retryIntervalMs: 1_800_000,
+        markerDir,
+      },
+    },
   };
-  let sendCount = 0;
-  const now = new Date('2026-07-17T18:00:00.000Z');
+}
 
-  await assert.rejects(
-    runClaimedDailyDealHunterEmail({
-      now,
-      storage,
-      markerDir,
-      sendReview: async ({ idempotencyKey }) => {
-        sendCount += 1;
-        assert.match(idempotencyKey, /2026-07-17/);
-        return {
-          notificationType: 'required-source-alert',
-          emailResult: { status: 'sent', error: '', providerMessageId: 'accepted-message' },
-          review: { totals: {} },
+function taskThreeProjection(notificationType = 'normal-digest', businessDate = '2026-07-15') {
+  const alert = notificationType === 'required-source-alert';
+  return {
+    version: 'daily-deal-hunter-digest-v1',
+    businessDate,
+    generatedAt: `${businessDate}T15:00:00.000Z`,
+    status: alert ? 'action-required' : 'ready',
+    notificationType,
+    sourceAuthority: {
+      requiredHealthy: !alert,
+      blockingIssues: alert ? [{
+        sourceId: 'sheet-0', sourceName: 'SMB Deal Hunter Google Sheet', classification: 'unavailable',
+        title: 'Required source is unavailable', message: 'Required source data is currently unavailable.',
+        checkedAt: `${businessDate}T15:00:00.000Z`,
+      }] : [],
+      optionalWarnings: [],
+    },
+    summary: alert ? null : {
+      needsReview: 1, highPriority: 1, watchlist: 0, lowConfidence: 0, currentOpportunities: 1,
+    },
+    topOpportunities: alert ? [] : [{
+      opportunityId: 'opportunity-1', name: 'Durable Services', state: 'CA', fitScore: 91,
+      scoreStatus: 'current', confidence: 'high', operatorPriority: 'pursue', reviewed: false,
+      changedSinceReview: true, topStrength: 'Recurring revenue', topConcern: 'Customer concentration',
+      workflow: { crmStatus: 'not-started', cimStatus: 'not-requested' },
+      observationFreshness: `${businessDate}T14:55:00.000Z`,
+    }],
+    job: { status: '', attemptCount: 0, completedAt: '', notificationType },
+    actionsAllowed: !alert,
+    links: {
+      inbox: 'https://internal.example.test/admin/deal-hunter',
+      operations: 'https://internal.example.test/admin/deal-hunter?view=operations',
+    },
+  };
+}
+
+function createTaskThreeStorage(initialRun = null) {
+  let run = initialRun ? structuredClone(initialRun) : null;
+  const state = { events: [], transitions: [], claims: [], failCompletionCount: 0 };
+  const allowed = {
+    pending: new Set(['pending', 'transmitting', 'failed', 'ambiguous', 'completed']),
+    transmitting: new Set(['failed', 'ambiguous', 'completed']),
+    ambiguous: new Set(['completed']),
+  };
+  const immutable = new Set([
+    'preparedEnvelope', 'payloadDigest', 'firstPreparedAt', 'preparedAt', 'businessDate',
+    'pacificDate', 'dateKey', 'timezone', 'notificationType',
+  ]);
+
+  return {
+    state,
+    async getScheduledJob(key) {
+      return run?.job_key === key ? structuredClone(run) : null;
+    },
+    async listEmailEvents({ source } = {}) {
+      return state.events
+        .filter((event) => !source || event.source === source)
+        .map((event) => structuredClone(event));
+    },
+    async insertEmailEvent(event) {
+      if (!state.events.some((item) => item.event_key && item.event_key === event.event_key)) {
+        state.events.push(structuredClone(event));
+      }
+      return structuredClone(event);
+    },
+    async claimScheduledJob(input) {
+      state.claims.push(structuredClone(input));
+      if (!run) {
+        run = {
+          job_key: input.jobKey, job_name: input.jobName, status: 'pending',
+          created_at: input.nowIso, updated_at: input.nowIso, started_at: input.nowIso,
+          completed_at: null, triggered_by: input.triggeredBy, attempt_count: 1,
+          provider_message_id: null, last_error: null,
+          metadata: { ...(input.metadata || {}), claimToken: input.claimToken, claimedAt: input.nowIso },
         };
+        return { applied: true, claimed: true, reason: 'claimed', run: structuredClone(run) };
+      }
+      if (run.status === 'completed') return { applied: false, claimed: false, reason: 'completed', run: structuredClone(run) };
+      if (['transmitting', 'ambiguous'].includes(run.status)) {
+        return { applied: false, claimed: false, reason: 'wrong-state', run: structuredClone(run) };
+      }
+      if (run.status === 'pending' && (!input.staleBefore || run.updated_at > input.staleBefore)) {
+        return { applied: false, claimed: false, reason: 'active', run: structuredClone(run) };
+      }
+      if (run.status === 'failed' && (!run.metadata.nextRetryAt || !input.retryDueAt || run.metadata.nextRetryAt > input.retryDueAt)) {
+        return { applied: false, claimed: false, reason: 'retry-not-due', run: structuredClone(run) };
+      }
+      const merged = { ...run.metadata, ...(input.metadata || {}) };
+      for (const key of immutable) if (Object.hasOwn(run.metadata, key)) merged[key] = run.metadata[key];
+      run = {
+        ...run,
+        status: 'pending', updated_at: input.nowIso, started_at: input.nowIso, completed_at: null,
+        triggered_by: input.triggeredBy, attempt_count: run.attempt_count + 1,
+        provider_message_id: null, last_error: null,
+        metadata: { ...merged, claimToken: input.claimToken, claimedAt: input.nowIso },
+      };
+      return { applied: true, claimed: true, reason: 'claimed', run: structuredClone(run) };
+    },
+    async transitionScheduledJob(input) {
+      state.transitions.push(structuredClone(input));
+      if (!run || run.job_key !== input.jobKey) return { applied: false, reason: 'missing', run: null };
+      if (run.status === 'completed') return { applied: false, reason: 'completed', run: structuredClone(run) };
+      if (run.metadata.claimToken !== input.claimToken) return { applied: false, reason: 'not-owner', run: structuredClone(run) };
+      if (!input.expectedStatuses.includes(run.status) || !allowed[run.status]?.has(input.status)) {
+        return { applied: false, reason: 'wrong-state', run: structuredClone(run) };
+      }
+      if (input.status === 'completed' && state.failCompletionCount > 0) {
+        state.failCompletionCount -= 1;
+        throw new Error('database unavailable after provider acceptance');
+      }
+      const merged = { ...run.metadata, ...(input.metadataPatch || {}) };
+      for (const key of immutable) if (Object.hasOwn(run.metadata, key)) merged[key] = run.metadata[key];
+      if (input.status === 'failed') {
+        merged.failedAt = input.nowIso;
+        merged.nextRetryAt = new Date(Date.parse(input.nowIso) + 30 * 60 * 1000).toISOString();
+      }
+      run = {
+        ...run,
+        status: input.status,
+        updated_at: input.nowIso,
+        completed_at: input.status === 'completed' ? (input.completedAt || input.nowIso) : run.completed_at,
+        provider_message_id: input.providerMessageId || run.provider_message_id,
+        last_error: input.lastError || null,
+        metadata: merged,
+      };
+      return { applied: true, reason: 'claimed', run: structuredClone(run) };
+    },
+    get run() { return run ? structuredClone(run) : null; },
+  };
+}
+
+function taskThreeRunOptions({ storage, now, markerDir = '', projection, sendPrepared, buildDigest, ...rest }) {
+  return {
+    triggeredBy: 'scheduler',
+    now,
+    getNow: () => now,
+    storage,
+    markerDir,
+    configOverride: taskThreeConfig(markerDir),
+    buildDigest: buildDigest || (async () => projection || taskThreeProjection('normal-digest', shouldRunDailyDealHunterEmail({ now }).dateKey)),
+    buildEnvelope: buildDailyDealHunterEmailEnvelope,
+    sendPrepared: sendPrepared || (async () => ({
+      status: 'sent', provider: 'resend', providerMessageId: 'resend-task-three-1', error: '', errorCategory: '',
+    })),
+    claimTokenFactory: () => `task-three-token-${String(storage.state.claims.length + 1).padStart(4, '0')}`,
+    ...rest,
+  };
+}
+
+test('daily scheduler is due at 08:00 Pacific in winter PST', () => {
+  const before = shouldRunDailyDealHunterEmail({ now: new Date('2026-01-15T15:59:59.000Z'), scheduleTime: '08:00' });
+  const due = shouldRunDailyDealHunterEmail({ now: new Date('2026-01-15T16:00:00.000Z'), scheduleTime: '08:00' });
+  assert.deepEqual(before, { dateKey: '2026-01-15', due: false });
+  assert.deepEqual(due, { dateKey: '2026-01-15', due: true });
+});
+
+test('daily scheduler is due at 08:00 Pacific in summer PDT', () => {
+  assert.equal(shouldRunDailyDealHunterEmail({ now: new Date('2026-07-15T14:59:59.000Z'), scheduleTime: '08:00' }).due, false);
+  assert.equal(shouldRunDailyDealHunterEmail({ now: new Date('2026-07-15T15:00:00.000Z'), scheduleTime: '08:00' }).due, true);
+});
+
+test('daily scheduler remains one-date once-only across the spring DST transition', () => {
+  const instants = ['2026-03-08T14:59:59.000Z', '2026-03-08T15:00:00.000Z', '2026-03-08T16:00:00.000Z'];
+  assert.deepEqual(instants.map((now) => shouldRunDailyDealHunterEmail({ now: new Date(now), scheduleTime: '08:00' })), [
+    { dateKey: '2026-03-08', due: false }, { dateKey: '2026-03-08', due: true }, { dateKey: '2026-03-08', due: true },
+  ]);
+});
+
+test('daily scheduler remains one-date once-only across the fall DST transition', () => {
+  const instants = ['2026-11-01T15:59:59.000Z', '2026-11-01T16:00:00.000Z', '2026-11-01T17:00:00.000Z'];
+  assert.deepEqual(instants.map((now) => shouldRunDailyDealHunterEmail({ now: new Date(now), scheduleTime: '08:00' })), [
+    { dateKey: '2026-11-01', due: false }, { dateKey: '2026-11-01', due: true }, { dateKey: '2026-11-01', due: true },
+  ]);
+});
+
+test('daily scheduler derives different keys across Pacific midnight', () => {
+  const before = shouldRunDailyDealHunterEmail({ now: new Date('2026-07-15T06:59:59.000Z'), scheduleTime: '08:00' });
+  const after = shouldRunDailyDealHunterEmail({ now: new Date('2026-07-15T07:00:00.000Z'), scheduleTime: '08:00' });
+  assert.equal(before.dateKey, '2026-07-14');
+  assert.equal(after.dateKey, '2026-07-15');
+});
+
+test('daily scheduler applies the approved weekend decision explicitly', () => {
+  const saturday = shouldRunDailyDealHunterEmail({ now: new Date('2026-07-18T15:00:00.000Z'), scheduleTime: '08:00' });
+  const sunday = shouldRunDailyDealHunterEmail({ now: new Date('2026-07-19T15:00:00.000Z'), scheduleTime: '08:00' });
+  assert.deepEqual(saturday, { dateKey: '2026-07-18', due: true });
+  assert.deepEqual(sunday, { dateKey: '2026-07-19', due: true });
+});
+
+test('daily scheduler delayed start after 08:00 attempts the same Pacific date', () => {
+  assert.deepEqual(
+    shouldRunDailyDealHunterEmail({ now: new Date('2026-07-15T17:00:00.000Z'), scheduleTime: '08:00' }),
+    { dateKey: '2026-07-15', due: true },
+  );
+});
+
+test('daily scheduler invalid timezone or wall time fails safely', () => {
+  assert.deepEqual(shouldRunDailyDealHunterEmail({ timezone: 'Not/A-Timezone', scheduleTime: '08:00' }), { dateKey: '', due: false });
+  assert.deepEqual(shouldRunDailyDealHunterEmail({ timezone: 'America/Los_Angeles', scheduleTime: '8:00' }), { dateKey: '', due: false });
+});
+
+test('automatic cron execution cannot bypass disabled daily scheduling', async () => {
+  const storage = createTaskThreeStorage();
+  const configOverride = taskThreeConfig();
+  configOverride.dealHunter.dailyEmail.enabled = false;
+  let providerCalls = 0;
+  const result = await runClaimedDailyDealHunterEmail({
+    ...taskThreeRunOptions({
+      storage,
+      now: new Date('2026-07-15T15:00:00.000Z'),
+      sendPrepared: async () => { providerCalls += 1; return { status: 'sent', providerMessageId: 'must-not-send' }; },
+    }),
+    configOverride,
+    enforceDueTime: true,
+  });
+  assert.equal(result.emailResult.status, 'not-due');
+  assert.equal(result.emailResult.errorCategory, 'schedule-disabled');
+  assert.equal(storage.state.claims.length, 0);
+  assert.equal(providerCalls, 0);
+});
+
+test('duplicate scheduler admin and cron triggers make one provider call', async () => {
+  const storage = createTaskThreeStorage();
+  const now = new Date('2026-07-15T15:00:00.000Z');
+  let providerCalls = 0;
+  const sendPrepared = async () => {
+    providerCalls += 1;
+    await Promise.resolve();
+    return { status: 'sent', provider: 'resend', providerMessageId: 'resend-concurrent-1', error: '' };
+  };
+  const results = await Promise.all(['scheduler', 'admin', 'external-cron'].map((triggeredBy) => (
+    runClaimedDailyDealHunterEmail({
+      ...taskThreeRunOptions({ storage, now, sendPrepared }), triggeredBy,
+    })
+  )));
+  assert.equal(providerCalls, 1);
+  assert.equal(results.filter((result) => result.emailResult.status === 'sent').length, 1);
+  assert.equal(storage.run.status, 'completed');
+});
+
+test('first claim durably prepares the exact envelope before provider transmission', async () => {
+  const storage = createTaskThreeStorage();
+  const transition = storage.transitionScheduledJob.bind(storage);
+  let persistedEnvelope = null;
+  let providerCalls = 0;
+  storage.transitionScheduledJob = async (input) => {
+    const result = await transition(input);
+    if (input.status === 'pending' && input.metadataPatch?.preparedEnvelope) {
+      assert.equal(result.applied, true);
+      assert.equal(result.run.status, 'pending');
+      persistedEnvelope = structuredClone(result.run.metadata.preparedEnvelope);
+    }
+    if (input.status === 'transmitting') assert.ok(persistedEnvelope);
+    return result;
+  };
+  const result = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage,
+    now: new Date('2026-07-15T15:00:00.000Z'),
+    sendPrepared: async (message) => {
+      providerCalls += 1;
+      assert.equal(storage.run.status, 'transmitting');
+      assert.deepEqual(message, persistedEnvelope);
+      return { status: 'sent', provider: 'resend', providerMessageId: 'prepared-before-provider-1' };
+    },
+  }));
+  assert.equal(result.emailResult.status, 'sent');
+  assert.equal(providerCalls, 1);
+  assert.equal(storage.run.metadata.payloadDigest, persistedEnvelope.payloadDigest);
+});
+
+test('completed source alert prevents a normal digest after same-date source recovery', async () => {
+  const storage = createTaskThreeStorage();
+  const now = new Date('2026-07-15T15:00:00.000Z');
+  let projectionCalls = 0;
+  let providerCalls = 0;
+  const first = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage,
+    now,
+    buildDigest: async () => { projectionCalls += 1; return taskThreeProjection('required-source-alert'); },
+    sendPrepared: async () => { providerCalls += 1; return { status: 'sent', provider: 'resend', providerMessageId: 'alert-1' }; },
+  }));
+  const second = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage,
+    now: new Date('2026-07-15T16:00:00.000Z'),
+    buildDigest: async () => { projectionCalls += 1; return taskThreeProjection('normal-digest'); },
+    sendPrepared: async () => { providerCalls += 1; return { status: 'sent', provider: 'resend', providerMessageId: 'normal-1' }; },
+  }));
+  assert.equal(first.notificationType, 'required-source-alert');
+  assert.equal(second.emailResult.status, 'already-sent');
+  assert.equal(projectionCalls, 1);
+  assert.equal(providerCalls, 1);
+});
+
+test('fresh pending returns in-progress and stale pending reuses its prepared envelope', async () => {
+  const envelope = buildDailyDealHunterEmailEnvelope({
+    projection: taskThreeProjection(), recipient: 'digest@example.test', sender: 'sender@example.test',
+    preparedAt: '2026-07-15T15:00:00.000Z',
+  });
+  const storage = createTaskThreeStorage({
+    job_key: 'daily-deal-hunter-email:2026-07-15', job_name: 'daily-deal-hunter-email', status: 'pending',
+    created_at: '2026-07-15T15:00:00.000Z', updated_at: '2026-07-15T15:00:00.000Z', started_at: '2026-07-15T15:00:00.000Z',
+    completed_at: null, attempt_count: 1, provider_message_id: null,
+    metadata: { claimToken: 'old-task-three-token', claimedAt: '2026-07-15T15:00:00.000Z', businessDate: '2026-07-15', notificationType: 'normal-digest', preparedEnvelope: envelope, payloadDigest: envelope.payloadDigest },
+  });
+  let projectionCalls = 0;
+  let providerCalls = 0;
+  const fresh = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage, now: new Date('2026-07-15T15:59:59.000Z'), buildDigest: async () => { projectionCalls += 1; throw new Error('must not rebuild'); },
+    sendPrepared: async () => { providerCalls += 1; return { status: 'sent', provider: 'resend', providerMessageId: 'stale-1' }; },
+  }));
+  const stale = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage, now: new Date('2026-07-15T16:00:00.000Z'), buildDigest: async () => { projectionCalls += 1; throw new Error('must not rebuild'); },
+    sendPrepared: async (message) => { providerCalls += 1; assert.deepEqual(message, envelope); return { status: 'sent', provider: 'resend', providerMessageId: 'stale-1' }; },
+  }));
+  assert.equal(fresh.emailResult.status, 'in-progress');
+  assert.equal(stale.emailResult.status, 'sent');
+  assert.equal(projectionCalls, 0);
+  assert.equal(providerCalls, 1);
+});
+
+test('definitive failure retries the exact envelope no earlier than thirty minutes', async () => {
+  const storage = createTaskThreeStorage();
+  const envelopes = [];
+  let projectionCalls = 0;
+  let providerCalls = 0;
+  const sendPrepared = async (message) => {
+    providerCalls += 1;
+    envelopes.push(structuredClone(message));
+    return providerCalls === 1
+      ? { status: 'failed', provider: 'resend', definitiveFailure: true, errorCategory: 'provider-nonacceptance', error: 'rejected' }
+      : { status: 'sent', provider: 'resend', providerMessageId: 'retry-accepted', error: '' };
+  };
+  const first = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage, now: new Date('2026-07-15T15:00:00.000Z'), sendPrepared,
+    buildDigest: async () => { projectionCalls += 1; return taskThreeProjection(); },
+  }));
+  const early = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage, now: new Date('2026-07-15T15:29:59.000Z'), sendPrepared,
+    buildDigest: async () => { projectionCalls += 1; return taskThreeProjection('required-source-alert'); },
+  }));
+  const retry = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage, now: new Date('2026-07-15T15:30:00.000Z'), sendPrepared,
+    buildDigest: async () => { projectionCalls += 1; return taskThreeProjection('required-source-alert'); },
+  }));
+  assert.equal(first.emailResult.status, 'failed');
+  assert.equal(first.jobRun.metadata.nextRetryAt, '2026-07-15T15:30:00.000Z');
+  assert.equal(early.emailResult.status, 'retry-not-due');
+  assert.equal(retry.emailResult.status, 'sent');
+  assert.equal(providerCalls, 2);
+  assert.equal(projectionCalls, 1);
+  assert.deepEqual(envelopes[1], envelopes[0]);
+  assert.equal(envelopes[1].idempotencyKey, 'daily-deal-hunter-email:2026-07-15');
+});
+
+test('ambiguous provider outcome never makes a second provider call', async () => {
+  const storage = createTaskThreeStorage();
+  let providerCalls = 0;
+  const sendPrepared = async () => {
+    providerCalls += 1;
+    return { status: 'ambiguous', provider: 'resend', errorCategory: 'provider-timeout', error: 'timeout' };
+  };
+  const first = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({ storage, now: new Date('2026-07-15T15:00:00.000Z'), sendPrepared }));
+  const replay = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({ storage, now: new Date('2026-07-15T15:10:00.000Z'), sendPrepared }));
+  assert.equal(first.emailResult.status, 'ambiguous');
+  assert.ok(['transmitting', 'ambiguous'].includes(replay.emailResult.status));
+  assert.equal(providerCalls, 1);
+  assert.ok(['transmitting', 'ambiguous'].includes(storage.run.status));
+});
+
+test('crash before provider boundary recovers after one hour', async () => {
+  const storage = createTaskThreeStorage();
+  let providerCalls = 0;
+  await assert.rejects(runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage,
+    now: new Date('2026-07-15T15:00:00.000Z'),
+    buildDigest: async () => { throw new Error('crash before envelope persistence'); },
+    sendPrepared: async () => { providerCalls += 1; return { status: 'sent', providerMessageId: 'must-not-send' }; },
+  })), /crash before envelope persistence/);
+  assert.equal(storage.run.status, 'pending');
+  assert.equal(providerCalls, 0);
+  const recovered = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage,
+    now: new Date('2026-07-15T16:00:00.000Z'),
+    sendPrepared: async () => { providerCalls += 1; return { status: 'sent', provider: 'resend', providerMessageId: 'recovered-1' }; },
+  }));
+  assert.equal(recovered.emailResult.status, 'sent');
+  assert.equal(providerCalls, 1);
+});
+
+test('crash after envelope persistence but before transmitting reuses the durable envelope', async () => {
+  const storage = createTaskThreeStorage();
+  const transition = storage.transitionScheduledJob.bind(storage);
+  let failBoundary = true;
+  let providerCalls = 0;
+  storage.transitionScheduledJob = async (input) => {
+    if (failBoundary && input.status === 'transmitting') {
+      failBoundary = false;
+      throw new Error('crash between preparation and provider boundary');
+    }
+    return transition(input);
+  };
+  await assert.rejects(runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage,
+    now: new Date('2026-07-15T15:00:00.000Z'),
+    sendPrepared: async () => { providerCalls += 1; throw new Error('must not send before boundary'); },
+  })), /between preparation and provider boundary/);
+  const persistedEnvelope = structuredClone(storage.run.metadata.preparedEnvelope);
+  assert.equal(storage.run.status, 'pending');
+  assert.equal(providerCalls, 0);
+
+  const recovered = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage,
+    now: new Date('2026-07-15T16:00:00.000Z'),
+    buildDigest: async () => { throw new Error('must not rebuild prepared authority'); },
+    sendPrepared: async (message) => {
+      providerCalls += 1;
+      assert.deepEqual(message, persistedEnvelope);
+      return { status: 'sent', provider: 'resend', providerMessageId: 'prepared-recovery-1' };
+    },
+  }));
+  assert.equal(recovered.emailResult.status, 'sent');
+  assert.equal(providerCalls, 1);
+});
+
+test('crash after provider boundary remains reconciliation-only', async () => {
+  const storage = createTaskThreeStorage();
+  let providerCalls = 0;
+  const first = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage,
+    now: new Date('2026-07-15T15:00:00.000Z'),
+    sendPrepared: async () => { providerCalls += 1; throw new Error('connection reset'); },
+  }));
+  const second = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage,
+    now: new Date('2026-07-15T16:01:00.000Z'),
+    sendPrepared: async () => { providerCalls += 1; throw new Error('must not send'); },
+    providerLookup: async () => [],
+  }));
+  assert.equal(first.emailResult.status, 'ambiguous');
+  assert.equal(second.emailResult.status, 'ambiguous');
+  assert.equal(providerCalls, 1);
+  assert.equal(storage.run.status, 'ambiguous');
+});
+
+test('crash after provider acceptance reconciles from marker without resend', async (t) => {
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-task-three-marker-'));
+  t.after(() => fs.rmSync(markerDir, { recursive: true, force: true }));
+  const storage = createTaskThreeStorage();
+  storage.state.failCompletionCount = 1;
+  let providerCalls = 0;
+  const first = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage, markerDir, now: new Date('2026-07-15T15:00:00.000Z'),
+    sendPrepared: async () => { providerCalls += 1; return { status: 'sent', provider: 'resend', providerMessageId: 'accepted-marker-1' }; },
+  }));
+  const second = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage, markerDir, now: new Date('2026-07-15T15:05:00.000Z'),
+    sendPrepared: async () => { providerCalls += 1; throw new Error('must not resend'); },
+  }));
+  assert.equal(first.emailResult.status, 'ambiguous');
+  assert.equal(second.emailResult.status, 'already-sent');
+  assert.equal(providerCalls, 1);
+  assert.equal(storage.run.status, 'completed');
+  assert.equal(storage.run.provider_message_id, 'accepted-marker-1');
+});
+
+test('marker and database finalization failure reconciles from the durable local event', async () => {
+  const storage = createTaskThreeStorage();
+  storage.state.failCompletionCount = 1;
+  let providerCalls = 0;
+  const first = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage,
+    now: new Date('2026-07-15T15:00:00.000Z'),
+    writeMarker: async () => { throw new Error('marker unavailable'); },
+    sendPrepared: async () => {
+      providerCalls += 1;
+      return { status: 'sent', provider: 'resend', providerMessageId: 'accepted-event-1' };
+    },
+  }));
+  assert.equal(first.emailResult.status, 'ambiguous');
+  assert.equal(storage.run.status, 'transmitting');
+  assert.equal(storage.state.events.length, 1);
+
+  const reconciled = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage,
+    now: new Date('2026-07-15T15:05:00.000Z'),
+    sendPrepared: async () => { providerCalls += 1; throw new Error('must not resend'); },
+  }));
+  assert.equal(reconciled.emailResult.status, 'already-sent');
+  assert.equal(storage.run.status, 'completed');
+  assert.equal(storage.run.provider_message_id, 'accepted-event-1');
+  assert.equal(providerCalls, 1);
+});
+
+test('completed database row prevents resend when marker is missing', async () => {
+  const envelope = buildDailyDealHunterEmailEnvelope({ projection: taskThreeProjection(), recipient: 'digest@example.test', sender: 'sender@example.test' });
+  const storage = createTaskThreeStorage({
+    job_key: 'daily-deal-hunter-email:2026-07-15', job_name: 'daily-deal-hunter-email', status: 'completed',
+    created_at: '2026-07-15T15:00:00.000Z', updated_at: '2026-07-15T15:01:00.000Z', started_at: '2026-07-15T15:00:00.000Z',
+    completed_at: '2026-07-15T15:01:00.000Z', attempt_count: 1, provider_message_id: 'completed-db-1',
+    metadata: { claimToken: 'completed-task-three-token', businessDate: '2026-07-15', notificationType: 'normal-digest', preparedEnvelope: envelope, payloadDigest: envelope.payloadDigest, acceptedAt: '2026-07-15T15:01:00.000Z' },
+  });
+  let providerCalls = 0;
+  const result = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage, now: new Date('2026-07-15T16:00:00.000Z'),
+    sendPrepared: async () => { providerCalls += 1; throw new Error('must not resend'); },
+  }));
+  assert.equal(result.emailResult.status, 'already-sent');
+  assert.equal(providerCalls, 0);
+});
+
+test('marker mismatch never authorizes completion or transmission', async (t) => {
+  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-task-three-marker-mismatch-'));
+  t.after(() => fs.rmSync(markerDir, { recursive: true, force: true }));
+  const envelope = buildDailyDealHunterEmailEnvelope({ projection: taskThreeProjection(), recipient: 'digest@example.test', sender: 'sender@example.test' });
+  const storage = createTaskThreeStorage({
+    job_key: 'daily-deal-hunter-email:2026-07-15', job_name: 'daily-deal-hunter-email', status: 'transmitting',
+    created_at: '2026-07-15T15:00:00.000Z', updated_at: '2026-07-15T15:00:00.000Z', started_at: '2026-07-15T15:00:00.000Z',
+    completed_at: null, attempt_count: 1, provider_message_id: null,
+    metadata: { claimToken: 'mismatch-task-three-token', businessDate: '2026-07-15', notificationType: 'normal-digest', preparedEnvelope: envelope, payloadDigest: envelope.payloadDigest, providerBoundaryAt: '2026-07-15T15:00:00.000Z' },
+  });
+  await writeDailyDealHunterMarker({
+    markerDir,
+    evidence: { version: 1, jobKey: storage.run.job_key, businessDate: '2026-07-15', notificationType: 'normal-digest', payloadDigest: 'b'.repeat(64), providerMessageId: 'mismatched-1', acceptedAt: '2026-07-15T15:00:01.000Z' },
+  });
+  let providerCalls = 0;
+  const result = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage, markerDir, now: new Date('2026-07-15T15:10:00.000Z'), providerLookup: async () => [],
+    sendPrepared: async () => { providerCalls += 1; throw new Error('must not send'); },
+  }));
+  assert.equal(result.emailResult.status, 'transmitting');
+  assert.equal(storage.run.status, 'transmitting');
+  assert.equal(providerCalls, 0);
+});
+
+test('daily digest runner independently rejects malformed provider acceptance', async () => {
+  const cases = [
+    ['boolean id', { status: 'sent', provider: 'resend', providerMessageId: true }],
+    ['numeric id', { status: 'sent', provider: 'resend', providerMessageId: 123 }],
+    ['array id', { status: 'sent', provider: 'resend', providerMessageId: ['abc'] }],
+    ['object id', { status: 'sent', provider: 'resend', providerMessageId: {} }],
+    ['empty id', { status: 'sent', provider: 'resend', providerMessageId: '' }],
+    ['whitespace id', { status: 'sent', provider: 'resend', providerMessageId: '   ' }],
+    ['wrong provider', { status: 'sent', provider: 'emailjs', providerMessageId: 'accepted-a' }],
+    ['missing provider', { status: 'sent', providerMessageId: 'accepted-a' }],
+    ['noncanonical status', { status: 'accepted', provider: 'resend', providerMessageId: 'accepted-a' }],
+    ['conflicting aliases', {
+      status: 'sent', provider: 'resend', providerMessageId: 'accepted-a', email_id: 'accepted-b',
+    }],
+  ];
+
+  for (const [label, providerResult] of cases) {
+    const storage = createTaskThreeStorage();
+    let providerCalls = 0;
+    const sendPrepared = async () => {
+      providerCalls += 1;
+      return providerResult;
+    };
+    const first = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+      storage,
+      now: new Date('2026-07-15T15:00:00.000Z'),
+      sendPrepared,
+    }));
+    const second = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+      storage,
+      now: new Date('2026-07-15T15:05:00.000Z'),
+      sendPrepared,
+      providerLookup: async () => [],
+    }));
+
+    assert.equal(first.emailResult.status, 'ambiguous', label);
+    assert.ok(['transmitting', 'ambiguous'].includes(first.jobRun.status), label);
+    assert.ok(['transmitting', 'ambiguous'].includes(second.emailResult.status), label);
+    assert.notEqual(storage.run.status, 'completed', label);
+    assert.notEqual(storage.run.status, 'failed', label);
+    assert.equal(storage.run.provider_message_id, null, label);
+    assert.equal(providerCalls, 1, label);
+  }
+});
+
+test('daily digest runner retains valid canonical Resend acceptance', async () => {
+  const storage = createTaskThreeStorage();
+  let providerCalls = 0;
+  const result = await runClaimedDailyDealHunterEmail(taskThreeRunOptions({
+    storage,
+    now: new Date('2026-07-15T15:00:00.000Z'),
+    sendPrepared: async () => {
+      providerCalls += 1;
+      return {
+        status: 'sent', provider: 'resend', providerMessageId: 'resend-canonical-accepted-1',
+      };
+    },
+  }));
+  assert.equal(result.emailResult.status, 'sent');
+  assert.equal(storage.run.status, 'completed');
+  assert.equal(storage.run.provider_message_id, 'resend-canonical-accepted-1');
+  assert.equal(providerCalls, 1);
+});
+
+test('daily digest retry cutoff is thirty minutes after definitive provider failure', async () => {
+  const storage = createTaskThreeStorage();
+  const entry = new Date('2026-07-15T15:00:00.000Z');
+  let clock = entry;
+  let providerCalls = 0;
+  const envelopes = [];
+  const sendPrepared = async (envelope) => {
+    providerCalls += 1;
+    envelopes.push(structuredClone(envelope));
+    if (providerCalls === 1) {
+      clock = new Date('2026-07-15T15:05:00.000Z');
+      return {
+        status: 'failed', provider: 'resend', definitiveFailure: true,
+        errorCategory: 'provider-nonacceptance', error: 'rejected',
+      };
+    }
+    return { status: 'sent', provider: 'resend', providerMessageId: 'retry-accepted-1' };
+  };
+
+  const first = await runClaimedDailyDealHunterEmail({
+    ...taskThreeRunOptions({ storage, now: entry, sendPrepared }),
+    getNow: () => clock,
+  });
+  assert.equal(first.jobRun.metadata.failedAt, '2026-07-15T15:05:00.000Z');
+  assert.equal(first.jobRun.metadata.nextRetryAt, '2026-07-15T15:35:00.000Z');
+
+  clock = new Date('2026-07-15T15:30:00.000Z');
+  const early = await runClaimedDailyDealHunterEmail({
+    ...taskThreeRunOptions({ storage, now: clock, sendPrepared }),
+    getNow: () => clock,
+  });
+  assert.equal(early.emailResult.status, 'retry-not-due');
+  assert.equal(providerCalls, 1);
+
+  clock = new Date('2026-07-15T15:35:00.000Z');
+  const retry = await runClaimedDailyDealHunterEmail({
+    ...taskThreeRunOptions({ storage, now: clock, sendPrepared }),
+    getNow: () => clock,
+  });
+  assert.equal(retry.emailResult.status, 'sent');
+  assert.equal(providerCalls, 2);
+  assert.deepEqual(envelopes[1], envelopes[0]);
+  assert.equal(envelopes[1].idempotencyKey, 'daily-deal-hunter-email:2026-07-15');
+});
+
+test('display-name recipient reconciles the exact local event after acceptance finalization crashes', async () => {
+  const storage = createTaskThreeStorage();
+  storage.state.failCompletionCount = 1;
+  const configOverride = taskThreeConfig();
+  configOverride.dealHunter.recipient = 'Digest Admin <digest@example.test>';
+  let providerCalls = 0;
+  const first = await runClaimedDailyDealHunterEmail({
+    ...taskThreeRunOptions({
+      storage,
+      now: new Date('2026-07-15T15:00:00.000Z'),
+      writeMarker: async () => { throw new Error('marker unavailable'); },
+      sendPrepared: async () => {
+        providerCalls += 1;
+        return { status: 'sent', provider: 'resend', providerMessageId: 'display-recipient-accepted-1' };
       },
     }),
-    (error) => error.deliveryConfirmed === true,
-  );
+    configOverride,
+  });
+  assert.equal(first.emailResult.status, 'ambiguous');
+  assert.equal(storage.state.events[0].recipient_email, 'digest@example.test');
 
-  const retry = await runClaimedDailyDealHunterEmail({ now, storage, markerDir, sendReview: async () => {
-    sendCount += 1;
-    throw new Error('must not resend');
-  } });
-  assert.equal(retry.alreadySent, true);
-  assert.equal(sendCount, 1);
-  assert.notEqual(storage.run?.status, 'failed');
+  const reconciled = await runClaimedDailyDealHunterEmail({
+    ...taskThreeRunOptions({
+      storage,
+      now: new Date('2026-07-15T15:05:00.000Z'),
+      sendPrepared: async () => {
+        providerCalls += 1;
+        throw new Error('must not resend');
+      },
+    }),
+    configOverride,
+  });
+  assert.equal(reconciled.emailResult.status, 'already-sent');
+  assert.equal(storage.run.status, 'completed');
+  assert.equal(storage.run.provider_message_id, 'display-recipient-accepted-1');
+  assert.equal(providerCalls, 1);
 });

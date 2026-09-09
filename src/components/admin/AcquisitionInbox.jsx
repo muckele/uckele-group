@@ -56,7 +56,53 @@ function ActionButtons({ disabled, name, onAction }) {
   );
 }
 
-function OpportunityRow({ onAction, onOpen, pending, readOnly, row }) {
+function MorningBriefing({ digest, error = '', loading = false }) {
+  const unavailable = Boolean(error) || digest?.status === 'unavailable' || !digest && !loading;
+  const requiredAction = unavailable || digest?.status === 'action-required' || digest?.actionsAllowed !== true;
+  const operationsLink = digest?.links?.operations || '/admin/deal-hunter?view=operations';
+
+  if (loading && !digest && !error) {
+    return (
+      <section aria-labelledby="morning-briefing-heading" aria-live="polite" className="border-b border-line/80 bg-fog/35 p-5 sm:p-7">
+        <h3 className="text-lg font-semibold text-ink" id="morning-briefing-heading">Morning briefing</h3>
+        <p className="mt-2 text-sm text-ink/62" role="status">Loading current source authority…</p>
+      </section>
+    );
+  }
+
+  if (requiredAction) {
+    const issues = digest?.sourceAuthority?.blockingIssues || [];
+    return (
+      <section aria-labelledby="morning-briefing-heading" className="border-b border-red-200 bg-red-50/70 p-5 sm:p-7">
+        <p className="text-xs font-bold uppercase tracking-[0.16em] text-red-800">ACTION REQUIRED</p>
+        <h3 className="mt-2 text-xl font-semibold text-red-950" id="morning-briefing-heading">Morning briefing</h3>
+        <div aria-label="Required source status" aria-live="polite" className="mt-3 text-sm leading-6 text-red-900" role="status">
+          <p>{unavailable ? 'The current Morning briefing is unavailable. Treat persisted queue rows as last known.' : 'Current required-source authority could not be established. No summary or recommendations are presented as current.'}</p>
+          {issues.length > 0 ? <ul className="mt-3 space-y-2">{issues.map((issue, index) => <li key={`${issue.sourceId || issue.classification}-${index}`}><strong>{issue.title || issue.sourceName || 'Required source needs attention'}.</strong>{issue.message ? ` ${issue.message}` : ''}</li>)}</ul> : null}
+        </div>
+        <a className="mt-4 inline-flex min-h-9 items-center rounded-full border border-red-300 bg-white px-4 text-xs font-semibold text-red-900" href={operationsLink}>Open Operations</a>
+      </section>
+    );
+  }
+
+  const summary = digest.summary || emptySummary;
+  const topOpportunities = Array.isArray(digest.topOpportunities) ? digest.topOpportunities : [];
+  const optionalWarning = digest.sourceAuthority?.optionalWarnings?.[0] || null;
+  return (
+    <section aria-labelledby="morning-briefing-heading" className="border-b border-line/80 bg-fog/35 p-5 sm:p-7">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+        <div><p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-moss">Daily Deal Hunter</p><h3 className="mt-1 text-xl font-semibold text-ink" id="morning-briefing-heading">Morning briefing</h3></div>
+        {digest.businessDate ? <p className="text-xs font-semibold text-ink/55">Pacific date {digest.businessDate}</p> : null}
+      </div>
+      {optionalWarning ? <div aria-label="Optional source status" aria-live="polite" className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm leading-6 text-amber-950" role="status"><strong>{optionalWarning.title || 'Optional source warning'}.</strong>{optionalWarning.message ? ` ${optionalWarning.message}` : ''} Primary Sheet-backed review remains available.</div> : null}
+      <div className="mt-4 grid grid-cols-2 overflow-hidden rounded-2xl border border-line/80 bg-white sm:grid-cols-3 xl:grid-cols-5">{summaryItems.map(([key, itemLabel]) => <div className="min-w-0 border-b border-r border-line/70 px-3 py-3 last:border-r-0 xl:border-b-0" key={key}><p className="text-2xl font-semibold tabular-nums text-ink">{summary[key] ?? 0}</p><p className="mt-1 text-[11px] font-semibold uppercase tracking-[0.06em] text-ink/55">{itemLabel}</p></div>)}</div>
+      {summary.needsReview === 0 && topOpportunities.length === 0 ? <p className="mt-4 rounded-xl border border-line bg-white p-4 text-sm text-ink/68">No opportunities need review this morning.</p> : null}
+      {topOpportunities.length > 0 ? <ol aria-label="Morning briefing opportunities" className="mt-4 grid gap-3 lg:grid-cols-2">{topOpportunities.map((row) => <li className="min-w-0 rounded-xl border border-line/80 bg-white p-4" key={row.opportunityId}><div className="flex flex-wrap items-start justify-between gap-2"><div className="min-w-0"><p className="break-words text-sm font-semibold text-ink">{row.name}</p><p className="mt-1 text-xs text-ink/58">{row.state || 'State not supplied'} · Fit {row.fitScore} · {formatLabel(row.confidence)} confidence</p></div><span className="rounded-full bg-moss/10 px-2 py-1 text-[11px] font-semibold text-moss">{formatLabel(row.operatorPriority || 'normal')}</span></div><p className="mt-3 text-xs leading-5 text-moss">{row.topStrength || 'No bounded strength supplied.'}</p>{row.topConcern ? <p className="mt-1 text-xs leading-5 text-amber-800">{row.topConcern}</p> : null}<p className="mt-3 text-[11px] text-ink/55">{row.changedSinceReview ? 'Changed since review' : row.reviewed ? 'Reviewed' : 'Needs review'} · CRM {formatLabel(row.workflow?.crmStatus)} · CIM {formatLabel(row.workflow?.cimStatus)}{formatDate(row.observationFreshness) ? ` · Observed ${formatDate(row.observationFreshness)}` : ''}</p></li>)}</ol> : null}
+    </section>
+  );
+}
+
+function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, row }) {
   const reviewState = row.changedSinceReview ? 'Changed Since Review' : row.reviewed ? 'Reviewed' : 'Needs Review';
   const observed = formatDate(row.observationFreshness);
   return (
@@ -81,7 +127,7 @@ function OpportunityRow({ onAction, onOpen, pending, readOnly, row }) {
       <div className="min-w-0">
         {row.topStrength ? <p className="text-xs leading-5 text-moss">{row.topStrength}</p> : null}
         {row.topConcern ? <p className="mt-1 text-xs leading-5 text-amber-800">{row.topConcern}</p> : null}
-        {!readOnly && !row.dismissed ? <div className="mt-2"><ActionButtons disabled={pending} name={row.name} onAction={onAction} /></div> : null}
+        {!readOnly && !row.dismissed ? <div className="mt-2"><ActionButtons disabled={pending || !actionsAllowed} name={row.name} onAction={onAction} /></div> : null}
       </div>
     </li>
   );
@@ -183,6 +229,9 @@ export default function AcquisitionInbox({ readOnly = false }) {
   const passTriggerRef = useRef(null);
   const searchInputRef = useRef(null);
   queueQueryRef.current = { view, search, confidence, priority, sort, page };
+  const dailyDigest = queue.dailyDigest || null;
+  const actionsAllowed = !readOnly && !queueError && dailyDigest?.actionsAllowed === true;
+  const queueIsLastKnown = Boolean(queue.rows.length > 0 && (!dailyDigest || dailyDigest.actionsAllowed !== true || queueError));
 
   const loadQueue = useCallback(async () => {
     queueRequestRef.current.controller?.abort();
@@ -330,23 +379,29 @@ export default function AcquisitionInbox({ readOnly = false }) {
   }, []);
 
   function openQueuePass(row, trigger) {
+    if (!actionsAllowed) return;
     passTriggerRef.current = trigger || null;
     passFocusGuardRef.current = true;
     setMutationError('');
     setPassTarget(row);
   }
 
-  function closeQueuePass(force = false) {
+  const closeQueuePass = useCallback((force = false) => {
     if (mutationPendingRef.current && force !== true) return;
     passFocusGuardRef.current = false;
     setPassTarget(null);
     setMutationError('');
     const trigger = passTriggerRef.current;
-    if (trigger?.isConnected) trigger.focus();
+    if (trigger?.isConnected && !trigger.disabled && trigger.getAttribute('aria-disabled') !== 'true') trigger.focus();
     else if (searchInputRef.current?.isConnected) searchInputRef.current.focus();
-  }
+  }, []);
+
+  useEffect(() => {
+    if (!actionsAllowed && passTarget) closeQueuePass(true);
+  }, [actionsAllowed, closeQueuePass, passTarget]);
 
   async function recordAction(opportunityId, action, pass = null) {
+    if (!actionsAllowed) return false;
     if (action === 'pass' && (!pass?.reason?.trim() || pass.reason.trim().length > 80 || (pass.note || '').length > 2000)) return false;
     if (mutationPendingRef.current) return false;
     mutationPendingRef.current = true;
@@ -798,7 +853,7 @@ export default function AcquisitionInbox({ readOnly = false }) {
           <nav aria-label="Deal Hunter views" className="flex rounded-full border border-line bg-fog/70 p-1"><NavLink className="rounded-full bg-moss px-4 py-2 text-sm font-semibold text-white" end to="/admin/deal-hunter">Inbox</NavLink><NavLink className="rounded-full px-4 py-2 text-sm font-semibold text-ink/68 hover:text-moss" to="/admin/deal-hunter?view=operations">Operations</NavLink></nav>
         </header>
 
-        <div className="grid grid-cols-2 border-b border-line/80 sm:grid-cols-3 xl:grid-cols-5">{summaryItems.map(([key, itemLabel]) => <div className="border-b border-r border-line/70 px-4 py-4 last:border-r-0 xl:border-b-0" key={key}><p className="text-2xl font-semibold tabular-nums text-ink">{queue.summary?.[key] || 0}</p><p className="mt-1 text-xs font-semibold uppercase tracking-[0.08em] text-ink/55">{itemLabel}</p></div>)}</div>
+        <MorningBriefing digest={dailyDigest} error={queueError} loading={loading} />
 
         <div className="border-b border-line/80 p-4 sm:p-5">
           <div aria-label="Opportunity queues" className="flex gap-2 overflow-x-auto" role="tablist">{views.map(([id, itemLabel]) => <button aria-selected={view === id} className={`shrink-0 rounded-full border px-3 py-1.5 text-xs font-semibold ${view === id ? 'border-moss bg-moss/10 text-moss' : 'border-line bg-white text-ink/62'}`} key={id} onClick={() => { setView(id); setPage(1); }} role="tab" type="button">{itemLabel}</button>)}</div>
@@ -811,18 +866,18 @@ export default function AcquisitionInbox({ readOnly = false }) {
         </div>
 
         <div className="p-4 sm:p-5">
-          {queue.sourceHealth && !queue.sourceHealth.healthy ? <div className="mb-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900" role="alert"><p className="font-semibold">Source health is degraded. Persisted Inbox results remain available.</p>{queue.sourceHealth.issues?.map((issue, index) => <p className="mt-1" key={`${issue.sourceId || issue.title}-${index}`}>{issue.title}{issue.message ? `: ${issue.message}` : ''}</p>)}</div> : null}
           {queueError ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{queueError}</p> : null}
           {mutationError && !selectedId && !passTarget ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800" role="alert">{mutationError}</p> : null}
+          {queueIsLastKnown ? <p className="mb-4 rounded-xl border border-red-200 bg-red-50/70 p-3 text-sm font-semibold text-red-900">Last known queue — persisted rows are retained for reference, but current required-source authority is unavailable.</p> : null}
           {loading && queue.rows.length === 0 ? <p className="text-sm text-ink/62">Loading current opportunities…</p> : null}
           {!loading && !queueError && queue.rows.length === 0 ? <p className="rounded-xl border border-line bg-fog/60 p-4 text-sm text-ink/68">No opportunities in this view.</p> : null}
-          <ul aria-label="Opportunity queue" className="space-y-3 overflow-hidden md:space-y-0 md:rounded-2xl md:border md:border-line">{queue.rows.map((row) => <OpportunityRow key={row.opportunityId} onAction={(action, event) => action === 'pass' ? openQueuePass(row, event.currentTarget) : recordAction(row.opportunityId, action)} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} row={row} />)}</ul>
+          <ul aria-label="Opportunity queue" className="space-y-3 overflow-hidden md:space-y-0 md:rounded-2xl md:border md:border-line">{queue.rows.map((row) => <OpportunityRow actionsAllowed={actionsAllowed} key={row.opportunityId} onAction={(action, event) => action === 'pass' ? openQueuePass(row, event.currentTarget) : recordAction(row.opportunityId, action)} onOpen={(event) => openDetail(row.opportunityId, event.currentTarget)} pending={Boolean(pendingId)} readOnly={readOnly} row={row} />)}</ul>
           {queue.totalPages > 1 ? <div className="mt-4 flex items-center justify-between"><button aria-label="Previous page" className={buttonClass} disabled={page <= 1 || loading} onClick={() => setPage((current) => Math.max(1, current - 1))} type="button"><ChevronLeft className="h-4 w-4" />Previous</button><p className="text-xs font-semibold text-ink/58">Page {queue.page || page} of {queue.totalPages}</p><button aria-label="Next page" className={buttonClass} disabled={page >= queue.totalPages || loading} onClick={() => setPage((current) => current + 1)} type="button">Next<ChevronRight className="h-4 w-4" /></button></div> : null}
           {readOnly ? <p className="mt-4 text-sm font-semibold text-ink/62">Read-only access: decisions and verified-fact edits are unavailable.</p> : null}
         </div>
       </div>
 
-      {selectedId ? <OpportunityDrawer brokerMaterialsState={brokerMaterialsState} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} followUpState={followUpState} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onClose={closeDetail} onFollowUpApprove={hasMatchingDetail ? (preparation) => approveFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, preparation) : undefined} onFollowUpCheckStatus={hasMatchingDetail ? () => checkFollowUpStatus(loadedDetailId) : undefined} onFollowUpCloseReview={closeFollowUpReview} onFollowUpInvalidate={invalidateFollowUpPreparation} onFollowUpPrepare={hasMatchingDetail ? (body) => prepareFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, body) : undefined} onFollowUpStart={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'start', body) : undefined} onFollowUpStop={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'stop', body) : undefined} onRetry={() => loadDetail(selectedId)} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} readOnly={readOnly} /> : null}
+      {selectedId ? <OpportunityDrawer brokerMaterialsState={brokerMaterialsState} detail={hasMatchingDetail ? detail.data : null} error={detail.requestedId === selectedId ? detail.error : ''} focusGuardRef={detailFocusGuardRef} followUpState={followUpState} loading={detail.requestedId === selectedId && detail.loading} mutationError={mutationError} onAction={hasMatchingDetail ? (action, payload) => recordAction(loadedDetailId, action, payload) : undefined} onBrokerMaterialsApprove={hasMatchingDetail ? (preparation) => approveBrokerMaterials(loadedDetailId, preparation) : undefined} onBrokerMaterialsCheckStatus={hasMatchingDetail ? () => checkBrokerMaterialsStatus(loadedDetailId) : undefined} onBrokerMaterialsInvalidate={invalidateBrokerMaterialsPreparation} onBrokerMaterialsPrepare={hasMatchingDetail ? (body) => prepareBrokerMaterials(loadedDetailId, body) : undefined} onClose={closeDetail} onFollowUpApprove={hasMatchingDetail ? (preparation) => approveFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, preparation) : undefined} onFollowUpCheckStatus={hasMatchingDetail ? () => checkFollowUpStatus(loadedDetailId) : undefined} onFollowUpCloseReview={closeFollowUpReview} onFollowUpInvalidate={invalidateFollowUpPreparation} onFollowUpPrepare={hasMatchingDetail ? (body) => prepareFollowUp(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, body) : undefined} onFollowUpStart={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'start', body) : undefined} onFollowUpStop={hasMatchingDetail ? (body) => mutateFollowUps(loadedDetailId, detail.data?.brokerMaterials?.existingRequest?.id, 'stop', body) : undefined} onRetry={() => loadDetail(selectedId)} onSaveFact={hasMatchingDetail ? (payload) => saveFact(loadedDetailId, payload) : undefined} pending={pendingId === loadedDetailId} readOnly={!actionsAllowed} /> : null}
       {passTarget ? <QueuePassDialog error={mutationError} focusGuardRef={passFocusGuardRef} name={passTarget.name} onCancel={closeQueuePass} onSubmit={(payload) => recordAction(passTarget.opportunityId, 'pass', payload)} pending={pendingId === passTarget.opportunityId} /> : null}
     </section>
   );

@@ -22,7 +22,7 @@ const {
   refreshOpportunityScores,
   requestOpportunityScoreRefresh,
 } = await import('../server/services/dealHunterScoreStore.js');
-const { listTriageQueue } = await import('../server/services/dealHunterTriage.js');
+const { listTriageQueue, setTriageOperatorDecision } = await import('../server/services/dealHunterTriage.js');
 const { createManualSubmission } = await import('../server/services/submissions.js');
 const { scoreOpportunity } = await import('../server/services/dealHunterScoring.js');
 const { DEAL_SCORING_RULES_VERSION } = await import('../server/services/dealHunterScoringPolicy.js');
@@ -1240,6 +1240,141 @@ test('an unavailable supplemental import lookup is excluded by the next healthy 
   assert.equal(await storage.getCurrentDealHunterOpportunityScore(supplemental.opportunityId), null);
   assert.ok(await storage.getDealHunterOpportunityScore(supplemental.opportunityId));
   assert.ok((await storage.listDealHunterScoreEvidence(supplemental.opportunityId)).length > 0);
+});
+
+test('daily digest score refresh returns the authoritative full-backfill review', async (t) => {
+  const storage = withStorage(t);
+  await seedFreshCanonicalSources(t, storage);
+
+  const refreshed = await refreshOpportunityScores({ storage, recordActivity: false });
+
+  assert.equal(refreshed.ok, true, JSON.stringify(refreshed));
+  assert.equal(refreshed.review.reviewMode, 'full-backfill');
+  assert.equal(refreshed.review.selection.strategy, 'all-canonical-listings');
+  assert.ok(refreshed.review.sources.some((source) => (
+    source.required === true
+    && source.sourceRole === 'required-primary'
+    && source.fetched === true
+  )));
+
+  const reconcileEligibility = storage.reconcileDealHunterCurrentScoreEligibility;
+  storage.reconcileDealHunterCurrentScoreEligibility = undefined;
+  const unavailable = await refreshOpportunityScores({ storage, recordActivity: false });
+  storage.reconcileDealHunterCurrentScoreEligibility = reconcileEligibility;
+  assert.equal(unavailable.ok, false);
+  assert.equal(unavailable.status, 503);
+  assert.equal(unavailable.review.reviewMode, 'full-backfill');
+});
+
+test('daily digest score refresh suppresses CRM activity without suppressing machine score writes', async (t) => {
+  const storage = withStorage(t);
+  const created = await createManualSubmission({
+    name: 'Broker',
+    email: 'broker@example.invalid',
+    company: 'Digest Activity Suppression Co',
+    message: 'Seed a linked CRM record for digest score ownership verification.',
+  }, 'admin', { storage });
+  assert.equal(created.ok, true, JSON.stringify(created.errors));
+  await seedOpportunity(storage, 'opp-refresh-1', created.submission.id);
+  const beforeEvents = await storage.listCrmActivityEvents({ submissionId: created.submission.id, limit: 50 });
+
+  const refreshed = await refreshOpportunityScores({
+    deals: [scoredDeal({ name: 'Digest Activity Suppression Co' })],
+    recordActivity: false,
+    storage,
+  });
+
+  assert.equal(refreshed.ok, true, JSON.stringify(refreshed));
+  assert.equal(refreshed.counts.scored, 1);
+  assert.ok(await storage.getDealHunterOpportunityScore('opp-refresh-1'));
+  assert.ok((await storage.listDealHunterScoreEvidence('opp-refresh-1')).length > 0);
+  const afterEvents = await storage.listCrmActivityEvents({ submissionId: created.submission.id, limit: 50 });
+  assert.deepEqual(afterEvents, beforeEvents);
+});
+
+test('daily digest score refresh preserves operator priority note and review acknowledgement', async (t) => {
+  const storage = withStorage(t);
+  const created = await createManualSubmission({
+    name: 'Broker',
+    email: 'broker@example.invalid',
+    company: 'Digest Operator Ownership Co',
+    message: 'Seed a linked CRM record for digest operator ownership verification.',
+  }, 'admin', { storage });
+  await seedOpportunity(storage, 'opp-refresh-1', created.submission.id);
+  await refreshOpportunityScores({ deals: [scoredDeal()], storage });
+  await storage.reconcileDealHunterCurrentScoreEligibility(['opp-refresh-1']);
+  const decision = await setTriageOperatorDecision({
+    opportunityId: 'opp-refresh-1',
+    priority: 'high',
+    note: 'Owner-authored durable note.',
+    markReviewed: true,
+    actor: 'owner@example.invalid',
+    storage,
+  });
+  assert.equal(decision.ok, true, JSON.stringify(decision));
+  const eventsBefore = await storage.listCrmActivityEvents({ submissionId: created.submission.id, limit: 50 });
+
+  const refreshed = await refreshOpportunityScores({
+    deals: [scoredDeal({ annualProfit: 120000 })],
+    recordActivity: false,
+    storage,
+  });
+  const stored = await storage.getDealHunterOpportunityScore('opp-refresh-1');
+
+  assert.equal(refreshed.ok, true, JSON.stringify(refreshed));
+  assert.equal(stored.operator_priority, 'high');
+  assert.equal(stored.operator_note, 'Owner-authored durable note.');
+  assert.equal(stored.reviewed_by, 'owner@example.invalid');
+  assert.ok(stored.reviewed_at);
+  assert.equal(stored.changed_since_review, true);
+  const eventsAfter = await storage.listCrmActivityEvents({ submissionId: created.submission.id, limit: 50 });
+  assert.deepEqual(eventsAfter, eventsBefore);
+});
+
+test('existing score refresh callers still emit CRM activity by default', async (t) => {
+  const storage = withStorage(t);
+  const created = await createManualSubmission({
+    name: 'Broker',
+    email: 'broker@example.invalid',
+    company: 'Default Activity Co',
+    message: 'Seed a linked CRM record for the default score activity contract.',
+  }, 'admin', { storage });
+  await seedOpportunity(storage, 'opp-refresh-1', created.submission.id);
+
+  const refreshed = await refreshOpportunityScores({ deals: [scoredDeal()], storage });
+
+  assert.equal(refreshed.ok, true, JSON.stringify(refreshed));
+  const events = await storage.listCrmActivityEvents({ submissionId: created.submission.id, limit: 50 });
+  assert.equal(events.filter((event) => event.event_type === 'opportunity.rescored').length, 1);
+});
+
+test('stale Deal OS contributes no refreshed score or current eligibility when required Sheet is healthy', async (t) => {
+  const storage = withStorage(t);
+  const sources = await seedFreshCanonicalSources(t, storage);
+  const first = await refreshOpportunityScores({ storage });
+  assert.equal(first.ok, true, JSON.stringify(first));
+  const before = await listTriageQueue({ view: 'all', pageSize: 100, storage });
+  const supplemental = before.rows.find((row) => row.name === 'Supplemental Deal OS Co');
+  assert.ok(supplemental);
+  const historicalScore = await storage.getDealHunterOpportunityScore(supplemental.opportunityId);
+  sources.advanceBeyondFreshness();
+
+  const refreshed = await refreshOpportunityScores({ storage, recordActivity: false });
+
+  assert.equal(refreshed.ok, true, JSON.stringify(refreshed));
+  assert.equal(refreshed.review.reviewMode, 'full-backfill');
+  assert.ok(refreshed.review.sources.some((source) => (
+    source.id === 'deal-os-export'
+    && source.sourceRole === 'optional-supplemental'
+    && source.fetched === false
+  )));
+  const current = await listTriageQueue({ view: 'all', pageSize: 100, storage });
+  assert.deepEqual(current.rows.map((row) => row.name), ['Current Required Sheet Co']);
+  assert.equal(await storage.getCurrentDealHunterOpportunityScore(supplemental.opportunityId), null);
+  assert.equal(
+    (await storage.getDealHunterOpportunityScore(supplemental.opportunityId)).score_fingerprint,
+    historicalScore.score_fingerprint,
+  );
 });
 
 test('a full forced rebuild requires the typed confirmation', async (t) => {
