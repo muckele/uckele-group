@@ -726,6 +726,81 @@ test('Operations hides configured readiness addresses from administrator and vie
   });
 });
 
+test('Review and Operations hide readiness event content and identities from both browser roles', async () => {
+  const storage = getStorage();
+  const sentinels = {
+    subject: 'PRIVATE HTTP READINESS SUBJECT SENTINEL',
+    recipient: 'private-http-readiness-recipient@example.invalid',
+    sender: 'private-http-readiness-sender@example.invalid',
+    replyTo: 'private-http-readiness-reply@example.invalid',
+    providerMessageId: 'private-http-readiness-provider-id',
+    rawProviderResponse: 'PRIVATE HTTP READINESS RAW PROVIDER RESPONSE',
+    error: 'PRIVATE HTTP READINESS ERROR STACK PATH CREDENTIAL',
+    futureSecret: 'PRIVATE HTTP READINESS FUTURE SECRET',
+  };
+  const createdAt = '2099-09-08T15:00:00.000Z';
+  await storage.insertEmailEvent({
+    id: 'browser-readiness-event-privacy',
+    event_key: 'browser-readiness-event-privacy',
+    created_at: createdAt,
+    provider: 'resend',
+    event_type: 'delivered',
+    message_id: sentinels.providerMessageId,
+    provider_event_id: 'private-http-readiness-provider-event-id',
+    recipient_email: sentinels.recipient,
+    subject: Object.values(sentinels).join(' | '),
+    submission_id: null,
+    source: 'admin-email-test',
+    metadata: {
+      sender: sentinels.sender,
+      replyTo: sentinels.replyTo,
+      rawProviderResponse: sentinels.rawProviderResponse,
+      error: sentinels.error,
+      futureSecret: sentinels.futureSecret,
+    },
+  });
+
+  await withEmailReadinessAddressConfig({
+    adminEmail: sentinels.recipient,
+    fallbackRecipient: 'private-http-readiness-fallback@example.invalid',
+    dealHunterRecipient: 'private-http-readiness-digest@example.invalid',
+    fromAddress: `Private HTTP Sender <${sentinels.sender}>`,
+    replyToAddress: sentinels.replyTo,
+    followUpSenderAddress: 'private-http-readiness-follow-sender@example.invalid',
+    followUpReplyToAddress: 'private-http-readiness-follow-reply@example.invalid',
+  }, async () => {
+    await withServer(async (origin) => {
+      const adminCookie = await signInForCookie(origin);
+      const viewerCookie = await signInForCookie(origin, {
+        username: 'smb-deal-hunter', password: 'view-only-local',
+      });
+      for (const [role, cookie] of [['administrator', adminCookie], ['viewer', viewerCookie]]) {
+        for (const [route, responseKey] of [
+          ['/api/admin/deal-hunter/review', 'review'],
+          ['/api/admin/operations', 'operations'],
+        ]) {
+          const response = await fetch(`${origin}${route}`, { headers: { Cookie: cookie } });
+          const payload = await response.json();
+          assert.equal(response.status, 200, `${role} ${route}`);
+          const readiness = payload[responseKey].emailReadiness || payload[responseKey].email;
+          assert.deepEqual(readiness.latestTestEvent, {
+            createdAt,
+            eventType: 'delivered',
+            source: 'admin-email-test',
+          }, `${role} ${route}`);
+          const serialized = JSON.stringify(payload);
+          for (const sentinel of Object.values(sentinels)) {
+            assert.equal(serialized.includes(sentinel), false, `${role} ${route} ${sentinel}`);
+          }
+          if (role === 'viewer') {
+            assert.equal(serialized.includes('providerMessageId'), false, `${role} ${route}`);
+          }
+        }
+      }
+    });
+  });
+});
+
 test('daily digest browser responses exclude the raw prepared envelope and job metadata', async () => {
   const storage = getStorage();
   const now = new Date();

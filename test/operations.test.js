@@ -300,6 +300,88 @@ test('viewer Operations projects realistic internal email readiness without muta
   assert.deepEqual(viewerSource, originalViewerSource);
 });
 
+test('browser email readiness removes subjects from every latest event projection', () => {
+  const eventFields = [
+    'latestWebhookEvent',
+    'latestDeliveryEvent',
+    'latestReplyEvent',
+    'latestVerifiedReplyEvent',
+    'latestTestEvent',
+  ];
+  const readiness = { provider: 'resend' };
+  for (const [index, field] of eventFields.entries()) {
+    readiness[field] = {
+      createdAt: `2026-09-08T15:0${index}:00.000Z`,
+      eventType: index % 2 === 0 ? 'delivered' : 'replied',
+      source: 'webhook',
+      subject: `PRIVATE SUBJECT SENTINEL ${index}`,
+    };
+  }
+  const original = structuredClone(readiness);
+
+  const projected = projectBrowserEmailReadiness(readiness);
+
+  for (const [index, field] of eventFields.entries()) {
+    assert.notStrictEqual(projected[field], readiness[field], field);
+    assert.deepEqual(projected[field], {
+      createdAt: `2026-09-08T15:0${index}:00.000Z`,
+      eventType: index % 2 === 0 ? 'delivered' : 'replied',
+      source: 'webhook',
+    }, field);
+    assert.equal(Object.hasOwn(projected[field], 'subject'), false, field);
+  }
+  assert.equal(JSON.stringify(projected).includes('PRIVATE SUBJECT SENTINEL'), false);
+  assert.deepEqual(readiness, original);
+});
+
+test('browser email readiness latest events fail closed against future private aliases', () => {
+  const eventFields = [
+    'latestWebhookEvent',
+    'latestDeliveryEvent',
+    'latestReplyEvent',
+    'latestVerifiedReplyEvent',
+    'latestTestEvent',
+  ];
+  const privateFields = [
+    'recipient', 'recipientAddress', 'sender', 'senderAddress', 'replyTo', 'replyToAddress',
+    'providerMessageId', 'provider_message_id', 'messageId', 'message_id', 'emailId', 'email_id',
+    'rawProviderResponse', 'error', 'privateDiagnostic', 'futureAddress', 'futureSecret',
+  ];
+  const readiness = { provider: 'resend' };
+  const privateSentinels = [];
+  for (const [eventIndex, eventField] of eventFields.entries()) {
+    const event = {
+      createdAt: `2026-09-08T16:0${eventIndex}:00.000Z`,
+      eventType: 'delivered',
+      source: 'webhook',
+    };
+    for (const privateField of privateFields) {
+      const sentinel = `PRIVATE EVENT ${eventIndex} ${privateField}`;
+      event[privateField] = privateField === 'rawProviderResponse' ? { sentinel } : sentinel;
+      privateSentinels.push(sentinel);
+    }
+    readiness[eventField] = event;
+  }
+  const original = structuredClone(readiness);
+
+  const projected = projectBrowserEmailReadiness(readiness);
+  const serialized = JSON.stringify(projected);
+
+  for (const eventField of eventFields) {
+    assert.notStrictEqual(projected[eventField], readiness[eventField], eventField);
+    assert.deepEqual(projected[eventField], {
+      createdAt: readiness[eventField].createdAt,
+      eventType: 'delivered',
+      source: 'webhook',
+    }, eventField);
+    for (const privateField of privateFields) {
+      assert.equal(Object.hasOwn(projected[eventField], privateField), false, `${eventField}.${privateField}`);
+    }
+  }
+  for (const sentinel of privateSentinels) assert.equal(serialized.includes(sentinel), false, sentinel);
+  assert.deepEqual(readiness, original);
+});
+
 test('operations sanitizes daily digest envelope and recipient from every scheduled job', async () => {
   const sentinels = [
     'recipient-sentinel@example.test', 'sender-sentinel@example.test', 'PRIVATE SUBJECT SENTINEL',

@@ -308,6 +308,15 @@ function sanitizeViewerCimIdentity(status = {}) {
   };
 }
 
+function projectBrowserEmailReadinessEvent(event) {
+  if (!event || typeof event !== 'object' || Array.isArray(event)) return null;
+  return {
+    createdAt: String(event.createdAt || '').slice(0, 100),
+    eventType: String(event.eventType || '').slice(0, 80),
+    source: String(event.source || '').slice(0, 100),
+  };
+}
+
 export function projectBrowserEmailReadiness(readiness = {}) {
   const source = readiness && typeof readiness === 'object' && !Array.isArray(readiness)
     ? readiness
@@ -357,11 +366,11 @@ export function projectBrowserEmailReadiness(readiness = {}) {
     domainAuthentication: structuredClone(source.domainAuthentication || {}),
     followUpsEnabled: Boolean(source.followUpsEnabled),
     followUpsSafe: Boolean(source.followUpsSafe),
-    latestWebhookEvent: source.latestWebhookEvent ? { ...source.latestWebhookEvent } : null,
-    latestDeliveryEvent: source.latestDeliveryEvent ? { ...source.latestDeliveryEvent } : null,
-    latestReplyEvent: source.latestReplyEvent ? { ...source.latestReplyEvent } : null,
-    latestVerifiedReplyEvent: source.latestVerifiedReplyEvent ? { ...source.latestVerifiedReplyEvent } : null,
-    latestTestEvent: source.latestTestEvent ? { ...source.latestTestEvent } : null,
+    latestWebhookEvent: projectBrowserEmailReadinessEvent(source.latestWebhookEvent),
+    latestDeliveryEvent: projectBrowserEmailReadinessEvent(source.latestDeliveryEvent),
+    latestReplyEvent: projectBrowserEmailReadinessEvent(source.latestReplyEvent),
+    latestVerifiedReplyEvent: projectBrowserEmailReadinessEvent(source.latestVerifiedReplyEvent),
+    latestTestEvent: projectBrowserEmailReadinessEvent(source.latestTestEvent),
     metricsAvailable: Boolean(source.metricsAvailable),
     metrics: structuredClone(source.metrics || {}),
     issues: Array.isArray(source.issues) ? [...source.issues] : [],
