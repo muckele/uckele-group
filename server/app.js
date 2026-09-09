@@ -96,7 +96,12 @@ import {
 import { asyncRoute } from './utils/http.js';
 import { safeCompareText } from './utils/security.js';
 import { listCrmActivity, projectCrmActivityTimeline } from './services/activity.js';
-import { getOperationsCenter, sanitizeViewerOperations } from './services/operations.js';
+import {
+  getOperationsCenter,
+  projectBrowserEmailReadiness,
+  sanitizeViewerOperations,
+} from './services/operations.js';
+export { projectBrowserEmailReadiness } from './services/operations.js';
 import {
   assignUnassignedCommunication,
   createManualCommunication,
@@ -184,66 +189,6 @@ function dailyDealHunterHttpStatus(status) {
 }
 
 const dealHunterReviewBuckets = ['newlySeenMatches', 'qualified', 'watchlist', 'removalCandidates'];
-
-export function projectBrowserEmailReadiness(readiness = {}) {
-  const source = readiness && typeof readiness === 'object' && !Array.isArray(readiness)
-    ? readiness
-    : {};
-  const recipientConfigured = Boolean(
-    source.testRecipient
-    || (Array.isArray(source.allowedTestRecipients) && source.allowedTestRecipients.some(Boolean)),
-  );
-
-  return {
-    provider: source.provider || 'unknown',
-    recipientConfigured,
-    recipientPresent: recipientConfigured,
-    recipientValid: recipientConfigured,
-    senderConfigured: Boolean(source.fromAddress),
-    replyToConfigured: Boolean(source.replyToAddress),
-    followUpSenderConfigured: Boolean(source.followUpSenderAddress),
-    followUpReplyToConfigured: Boolean(source.followUpReplyToAddress),
-    inboundDomain: source.inboundDomain || '',
-    webhookEndpoint: source.webhookEndpoint || '',
-    outboundConfigured: Boolean(source.outboundConfigured),
-    webhookConfigured: Boolean(source.webhookConfigured),
-    webhookVerified: Boolean(source.webhookVerified),
-    deliveryTrackingConfigured: Boolean(source.deliveryTrackingConfigured),
-    deliveryTrackingVerified: Boolean(source.deliveryTrackingVerified),
-    replyTrackingConfigured: Boolean(source.replyTrackingConfigured),
-    replyTrackingVerified: Boolean(source.replyTrackingVerified),
-    replyAddressMatchesInboundDomain: Boolean(source.replyAddressMatchesInboundDomain),
-    cimFollowUpsEnabled: Boolean(source.cimFollowUpsEnabled),
-    genericFollowUpsEnabled: Boolean(source.genericFollowUpsEnabled),
-    genericFollowUpsSafe: Boolean(source.genericFollowUpsSafe),
-    followUpSenderMatchesDelivery: Boolean(source.followUpSenderMatchesDelivery),
-    followUpReplyToMatchesDelivery: Boolean(source.followUpReplyToMatchesDelivery),
-    physicalPostalAddressConfigured: Boolean(source.physicalPostalAddressConfigured),
-    replyOptOutConfigured: Boolean(source.replyOptOutConfigured),
-    optOutLinkConfigured: Boolean(source.optOutLinkConfigured),
-    oneClickOptOutVerified: Boolean(source.oneClickOptOutVerified),
-    optOutConfigured: Boolean(source.optOutConfigured),
-    suppressionOperational: Boolean(source.suppressionOperational),
-    aiEnabled: Boolean(source.aiEnabled),
-    deterministicRecommendationsAvailable: Boolean(source.deterministicRecommendationsAvailable),
-    aiModel: source.aiModel || '',
-    aiModelConfigured: Boolean(source.aiModelConfigured),
-    aiApiKeyConfigured: Boolean(source.aiApiKeyConfigured),
-    aiReady: Boolean(source.aiReady),
-    aiReadiness: structuredClone(source.aiReadiness || {}),
-    domainAuthentication: structuredClone(source.domainAuthentication || {}),
-    followUpsEnabled: Boolean(source.followUpsEnabled),
-    followUpsSafe: Boolean(source.followUpsSafe),
-    latestWebhookEvent: source.latestWebhookEvent ? { ...source.latestWebhookEvent } : null,
-    latestDeliveryEvent: source.latestDeliveryEvent ? { ...source.latestDeliveryEvent } : null,
-    latestReplyEvent: source.latestReplyEvent ? { ...source.latestReplyEvent } : null,
-    latestVerifiedReplyEvent: source.latestVerifiedReplyEvent ? { ...source.latestVerifiedReplyEvent } : null,
-    latestTestEvent: source.latestTestEvent ? { ...source.latestTestEvent } : null,
-    metricsAvailable: Boolean(source.metricsAvailable),
-    metrics: structuredClone(source.metrics || {}),
-    issues: Array.isArray(source.issues) ? [...source.issues] : [],
-  };
-}
 
 export function sanitizeViewerDealHunterReview(review = {}) {
   const dailyEmailJob = review.dailyEmailJob && typeof review.dailyEmailJob === 'object'
@@ -927,7 +872,9 @@ export function createApp({
       const operations = await getOperationsCenter();
       response.json({
         success: true,
-        operations: session.role === 'viewer' ? sanitizeViewerOperations(operations) : operations,
+        operations: session.role === 'viewer'
+          ? sanitizeViewerOperations(operations)
+          : { ...operations, email: projectBrowserEmailReadiness(operations.email) },
       });
     }),
   );

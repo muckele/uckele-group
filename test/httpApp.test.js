@@ -663,6 +663,69 @@ test('browser email readiness projection is an explicit non-mutating safe-field 
   });
 });
 
+test('Operations hides configured readiness addresses from administrator and viewer browsers', async () => {
+  const sentinels = {
+    testRecipient: 'operations-private-admin@example.invalid',
+    allowedRecipient: 'operations-private-fallback@example.invalid',
+    recipient: 'operations-private-digest@example.invalid',
+    sender: 'operations-private-sender@example.invalid',
+    replyTo: 'operations-private-reply@example.invalid',
+    followUpSender: 'operations-private-follow-sender@example.invalid',
+    followUpReplyTo: 'operations-private-follow-reply@example.invalid',
+  };
+
+  await withEmailReadinessAddressConfig({
+    adminEmail: sentinels.testRecipient,
+    fallbackRecipient: sentinels.allowedRecipient,
+    dealHunterRecipient: sentinels.recipient,
+    fromAddress: `Operations Sender <${sentinels.sender}>`,
+    replyToAddress: sentinels.replyTo,
+    followUpSenderAddress: sentinels.followUpSender,
+    followUpReplyToAddress: sentinels.followUpReplyTo,
+  }, async () => {
+    await withServer(async (origin) => {
+      const adminCookie = await signInForCookie(origin);
+      const viewerCookie = await signInForCookie(origin, {
+        username: 'smb-deal-hunter', password: 'view-only-local',
+      });
+      const unauthenticated = await fetch(`${origin}/api/admin/operations`);
+      assert.equal(unauthenticated.status, 401);
+
+      for (const [role, cookie] of [['administrator', adminCookie], ['viewer', viewerCookie]]) {
+        const response = await fetch(`${origin}/api/admin/operations`, { headers: { Cookie: cookie } });
+        const payload = await response.json();
+        assert.equal(response.status, 200, role);
+        for (const field of [
+          'fromAddress', 'replyToAddress', 'followUpSenderAddress', 'followUpReplyToAddress',
+        ]) {
+          assert.equal(Object.hasOwn(payload.operations.email, field), false, `${role} ${field}`);
+        }
+        if (role === 'administrator') {
+          assert.equal(Object.hasOwn(payload.operations.email, 'testRecipient'), false, role);
+          assert.equal(Object.hasOwn(payload.operations.email, 'allowedTestRecipients'), false, role);
+        } else {
+          assert.equal(payload.operations.email.testRecipient, '', role);
+          assert.deepEqual(payload.operations.email.allowedTestRecipients, [], role);
+        }
+        const serialized = JSON.stringify(payload);
+        for (const sentinel of Object.values(sentinels)) {
+          assert.equal(serialized.includes(sentinel), false, `${role} ${sentinel}`);
+        }
+        assert.equal(payload.operations.email.provider, 'resend', role);
+        assert.equal(payload.operations.email.outboundConfigured, true, role);
+        assert.equal(payload.operations.email.recipientConfigured, true, role);
+        assert.equal(payload.operations.email.senderConfigured, true, role);
+        assert.equal(payload.operations.email.replyToConfigured, true, role);
+        assert.equal(payload.operations.email.followUpSenderConfigured, true, role);
+        assert.equal(payload.operations.email.followUpReplyToConfigured, true, role);
+        assert.equal(payload.operations.email.webhookConfigured, true, role);
+        assert.ok(Array.isArray(payload.operations.email.issues), role);
+        assert.equal(typeof payload.operations.email.metrics, 'object', role);
+      }
+    });
+  });
+});
+
 test('daily digest browser responses exclude the raw prepared envelope and job metadata', async () => {
   const storage = getStorage();
   const now = new Date();

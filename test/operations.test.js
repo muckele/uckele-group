@@ -3,7 +3,11 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { getOperationsCenter, sanitizeViewerOperations } from '../server/services/operations.js';
+import {
+  getOperationsCenter,
+  projectBrowserEmailReadiness,
+  sanitizeViewerOperations,
+} from '../server/services/operations.js';
 import { writeDailyDealHunterMarker } from '../server/services/dailyDealHunterReconciliation.js';
 
 const operationsNow = new Date('2026-09-05T16:00:00.000Z');
@@ -188,6 +192,112 @@ test('viewer Operations projection retains aggregate Stage 2 gates and strips id
     assert.equal(serialized.includes(forbidden), false, forbidden);
   }
   assert.equal(serialized.includes(viewerProviderSentinel), false);
+});
+
+test('viewer Operations projects realistic internal email readiness without mutating source state', async () => {
+  const providerMessageId = 'operations-admin-provider-id-51c';
+  const readinessError = 'PRIVATE OPERATIONS READINESS PROVIDER ERROR';
+  const addressSentinels = {
+    recipient: 'operations-recipient-alias@example.invalid',
+    sender: 'operations-sender-alias@example.invalid',
+    replyTo: 'operations-reply-alias@example.invalid',
+    reply_to: 'operations-reply-snake-alias@example.invalid',
+    recipientAddress: 'operations-recipient-address-alias@example.invalid',
+    senderAddress: 'operations-sender-address-alias@example.invalid',
+    testRecipient: 'operations-test-recipient@example.invalid',
+    allowedTestRecipient: 'operations-allowed-recipient@example.invalid',
+    fromAddress: 'Operations Sender <operations-from@example.invalid>',
+    replyToAddress: 'operations-reply-to@example.invalid',
+    followUpSenderAddress: 'operations-follow-sender@example.invalid',
+    followUpReplyToAddress: 'operations-follow-reply@example.invalid',
+  };
+  const readiness = {
+    provider: 'resend',
+    recipient: addressSentinels.recipient,
+    sender: addressSentinels.sender,
+    replyTo: addressSentinels.replyTo,
+    reply_to: addressSentinels.reply_to,
+    recipientAddress: addressSentinels.recipientAddress,
+    senderAddress: addressSentinels.senderAddress,
+    testRecipient: addressSentinels.testRecipient,
+    allowedTestRecipients: [addressSentinels.allowedTestRecipient],
+    fromAddress: addressSentinels.fromAddress,
+    replyToAddress: addressSentinels.replyToAddress,
+    followUpSenderAddress: addressSentinels.followUpSenderAddress,
+    followUpReplyToAddress: addressSentinels.followUpReplyToAddress,
+    outboundConfigured: true,
+    webhookConfigured: true,
+    webhookVerified: true,
+    deliveryTrackingConfigured: true,
+    deliveryTrackingVerified: true,
+    replyTrackingConfigured: true,
+    replyTrackingVerified: true,
+    metricsAvailable: true,
+    metrics: { sentLast24Hours: 2 },
+    issues: ['Bounded readiness issue.'],
+    error: readinessError,
+  };
+  const operations = await getOperationsCenter({
+    now: operationsNow,
+    config: operationsConfig(),
+    checks: {
+      ...completeOperationsChecks(),
+      async emailReadiness() { return readiness; },
+    },
+    storage: operationsStorage([{
+      job_key: 'daily-deal-hunter-email:2026-09-05',
+      job_name: 'daily-deal-hunter-email',
+      status: 'completed',
+      completed_at: '2026-09-05T15:02:00.000Z',
+      attempt_count: 1,
+      provider_message_id: providerMessageId,
+      metadata: { businessDate: '2026-09-05', notificationType: 'normal-digest', provider: 'resend' },
+    }]),
+  });
+  const originalOperations = structuredClone(operations);
+  const originalReadiness = structuredClone(readiness);
+
+  for (const sentinel of Object.values(addressSentinels)) {
+    assert.equal(JSON.stringify(operations).includes(sentinel), true, `internal ${sentinel}`);
+  }
+
+  const adminEmail = projectBrowserEmailReadiness(readiness);
+  assert.equal(JSON.stringify(adminEmail).includes(readinessError), false);
+  assert.equal(adminEmail.error, 'Email readiness is temporarily unavailable.');
+
+  const viewerSource = { ...operations, email: readiness };
+  const originalViewerSource = structuredClone(viewerSource);
+  const viewer = sanitizeViewerOperations(viewerSource);
+  const serializedViewer = JSON.stringify(viewer);
+
+  for (const sentinel of Object.values(addressSentinels)) {
+    assert.equal(serializedViewer.includes(sentinel), false, sentinel);
+  }
+  assert.equal(serializedViewer.includes(readinessError), false);
+  for (const field of [
+    'recipient', 'sender', 'replyTo', 'reply_to', 'recipientAddress', 'senderAddress',
+    'fromAddress', 'replyToAddress', 'followUpSenderAddress', 'followUpReplyToAddress',
+  ]) {
+    assert.equal(Object.hasOwn(viewer.email, field), false, field);
+  }
+  assert.equal(viewer.email.testRecipient, '');
+  assert.deepEqual(viewer.email.allowedTestRecipients, []);
+  assert.equal(viewer.email.provider, 'resend');
+  assert.equal(viewer.email.outboundConfigured, true);
+  assert.equal(viewer.email.recipientConfigured, true);
+  assert.equal(viewer.email.senderConfigured, true);
+  assert.equal(viewer.email.replyToConfigured, true);
+  assert.equal(viewer.email.followUpSenderConfigured, true);
+  assert.equal(viewer.email.followUpReplyToConfigured, true);
+  assert.equal(viewer.email.webhookConfigured, true);
+  assert.deepEqual(viewer.email.metrics, { sentLast24Hours: 2 });
+  assert.deepEqual(viewer.email.issues, ['Bounded readiness issue.']);
+  assert.equal(viewer.email.error, 'Email readiness is temporarily unavailable.');
+  assert.equal(operations.dailyDigest.providerMessageId, providerMessageId);
+  assert.equal(Object.hasOwn(viewer.dailyDigest, 'providerMessageId'), false);
+  assert.deepEqual(operations, originalOperations);
+  assert.deepEqual(readiness, originalReadiness);
+  assert.deepEqual(viewerSource, originalViewerSource);
 });
 
 test('operations sanitizes daily digest envelope and recipient from every scheduled job', async () => {
