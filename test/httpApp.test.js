@@ -19,6 +19,8 @@ delete process.env.DEAL_HUNTER_SHEET_CSV_URLS;
 
 const appModule = await import('../server/app.js');
 const { createApp } = appModule;
+const { getConfig } = await import('../server/config.js');
+const { buildEmailReadiness } = await import('../server/services/emailReadiness.js');
 const { createSecureUploadRequest } = await import('../server/services/documentVault.js');
 const { createManualSubmission } = await import('../server/services/submissions.js');
 const { getStorage } = await import('../server/storage/index.js');
@@ -140,6 +142,59 @@ async function seedTaskFourOpportunity(opportunityId) {
   }, []);
   await storage.reconcileDealHunterCurrentScoreEligibility([opportunityId]);
   return storage;
+}
+
+async function withEmailReadinessAddressConfig({
+  adminEmail,
+  fallbackRecipient,
+  dealHunterRecipient,
+  fromAddress,
+  replyToAddress,
+  followUpSenderAddress,
+  followUpReplyToAddress,
+}, run) {
+  const config = getConfig();
+  const original = {
+    adminEmail: config.admin.email,
+    fallbackRecipient: config.delivery.fallbackRecipient,
+    dealHunterRecipient: config.dealHunter.recipient,
+    deliveryProvider: config.delivery.provider,
+    resendApiKey: config.delivery.resendApiKey,
+    resendFromEmail: config.delivery.resendFromEmail,
+    resendReplyTo: config.delivery.resendReplyTo,
+    resendInboundDomain: config.delivery.resendInboundDomain,
+    emailWebhookSecret: config.delivery.emailWebhookSecret,
+    followUpSenderEmail: config.followUp.senderEmail,
+    followUpReplyTo: config.followUp.replyTo,
+  };
+
+  config.admin.email = adminEmail;
+  config.delivery.fallbackRecipient = fallbackRecipient;
+  config.dealHunter.recipient = dealHunterRecipient;
+  config.delivery.provider = 'resend';
+  config.delivery.resendApiKey = 're_browser_readiness_fixture';
+  config.delivery.resendFromEmail = fromAddress;
+  config.delivery.resendReplyTo = replyToAddress;
+  config.delivery.resendInboundDomain = replyToAddress.split('@')[1];
+  config.delivery.emailWebhookSecret = 'browser-readiness-webhook-fixture';
+  config.followUp.senderEmail = followUpSenderAddress;
+  config.followUp.replyTo = followUpReplyToAddress;
+
+  try {
+    await run(config);
+  } finally {
+    config.admin.email = original.adminEmail;
+    config.delivery.fallbackRecipient = original.fallbackRecipient;
+    config.dealHunter.recipient = original.dealHunterRecipient;
+    config.delivery.provider = original.deliveryProvider;
+    config.delivery.resendApiKey = original.resendApiKey;
+    config.delivery.resendFromEmail = original.resendFromEmail;
+    config.delivery.resendReplyTo = original.resendReplyTo;
+    config.delivery.resendInboundDomain = original.resendInboundDomain;
+    config.delivery.emailWebhookSecret = original.emailWebhookSecret;
+    config.followUp.senderEmail = original.followUpSenderEmail;
+    config.followUp.replyTo = original.followUpReplyTo;
+  }
 }
 
 test('protected APIs reject cross-site mutations and disable caching', async () => {
@@ -465,6 +520,147 @@ test('viewer Deal Hunter review sanitizer removes provider identities without ch
     assert.deepEqual(sanitized[bucket][0].cimRequest, safeCimRequest, bucket);
   }
   assert.deepEqual(review, originalReview);
+});
+
+test('Deal Hunter review hides explicit configured delivery addresses from administrator and viewer browsers', async () => {
+  const sentinels = {
+    admin: 'browser-private-admin@example.invalid',
+    fallback: 'browser-private-fallback@example.invalid',
+    recipient: 'digest-private-recipient@example.invalid',
+    sender: 'digest-private-sender@example.invalid',
+    replyTo: 'digest-private-reply@example.invalid',
+    followUpSender: 'follow-private-sender@example.invalid',
+    followUpReplyTo: 'follow-private-reply@example.invalid',
+  };
+
+  await withEmailReadinessAddressConfig({
+    adminEmail: sentinels.admin,
+    fallbackRecipient: sentinels.fallback,
+    dealHunterRecipient: sentinels.recipient,
+    fromAddress: `Private Sender <${sentinels.sender}>`,
+    replyToAddress: sentinels.replyTo,
+    followUpSenderAddress: sentinels.followUpSender,
+    followUpReplyToAddress: sentinels.followUpReplyTo,
+  }, async () => {
+    await withServer(async (origin) => {
+      const adminCookie = await signInForCookie(origin);
+      const viewerCookie = await signInForCookie(origin, {
+        username: 'smb-deal-hunter', password: 'view-only-local',
+      });
+      const unauthenticated = await fetch(`${origin}/api/admin/deal-hunter/review`);
+      assert.equal(unauthenticated.status, 401);
+
+      for (const [role, cookie] of [['administrator', adminCookie], ['viewer', viewerCookie]]) {
+        const response = await fetch(`${origin}/api/admin/deal-hunter/review`, { headers: { Cookie: cookie } });
+        const payload = await response.json();
+        assert.equal(response.status, 200, role);
+        for (const field of [
+          'fromAddress', 'replyToAddress', 'followUpSenderAddress', 'followUpReplyToAddress',
+          'testRecipient', 'allowedTestRecipients',
+        ]) {
+          assert.equal(Object.hasOwn(payload.review.emailReadiness, field), false, `${role} ${field}`);
+        }
+        const serialized = JSON.stringify(payload);
+        for (const sentinel of Object.values(sentinels)) {
+          assert.equal(serialized.includes(sentinel), false, `${role} ${sentinel}`);
+        }
+        assert.equal(payload.review.emailReadiness.provider, 'resend', role);
+        assert.equal(payload.review.emailReadiness.outboundConfigured, true, role);
+        assert.equal(payload.review.emailReadiness.recipientConfigured, true, role);
+        assert.equal(payload.review.emailReadiness.senderConfigured, true, role);
+        assert.equal(payload.review.emailReadiness.replyToConfigured, true, role);
+        assert.equal(payload.review.emailReadiness.webhookConfigured, true, role);
+        assert.ok(Array.isArray(payload.review.emailReadiness.issues), role);
+        assert.equal(typeof payload.review.emailReadiness.metrics, 'object', role);
+      }
+    });
+  });
+});
+
+test('Deal Hunter review hides the ADMIN_EMAIL Daily Digest recipient fallback for both browser roles', async () => {
+  const fallbackSentinel = 'digest-admin-fallback-private@example.invalid';
+
+  await withEmailReadinessAddressConfig({
+    adminEmail: fallbackSentinel,
+    fallbackRecipient: 'lead-notification-private@example.invalid',
+    dealHunterRecipient: '',
+    fromAddress: 'fallback-private-sender@example.invalid',
+    replyToAddress: 'fallback-private-reply@example.invalid',
+    followUpSenderAddress: 'fallback-follow-sender@example.invalid',
+    followUpReplyToAddress: 'fallback-follow-reply@example.invalid',
+  }, async () => {
+    await withServer(async (origin) => {
+      const adminCookie = await signInForCookie(origin);
+      const viewerCookie = await signInForCookie(origin, {
+        username: 'smb-deal-hunter', password: 'view-only-local',
+      });
+
+      for (const [role, cookie] of [['administrator', adminCookie], ['viewer', viewerCookie]]) {
+        const response = await fetch(`${origin}/api/admin/deal-hunter/review`, { headers: { Cookie: cookie } });
+        const payload = await response.json();
+        assert.equal(response.status, 200, role);
+        assert.equal(JSON.stringify(payload).includes(fallbackSentinel), false, role);
+        assert.equal(payload.review.emailReadiness.recipientConfigured, true, role);
+        assert.equal(payload.review.emailReadiness.recipientValid, true, role);
+      }
+    });
+  });
+});
+
+test('browser email readiness projection is an explicit non-mutating safe-field projection', async () => {
+  await withEmailReadinessAddressConfig({
+    adminEmail: 'projection-private-admin@example.invalid',
+    fallbackRecipient: 'projection-private-fallback@example.invalid',
+    dealHunterRecipient: 'projection-private-digest@example.invalid',
+    fromAddress: 'Projection Sender <projection-private-sender@example.invalid>',
+    replyToAddress: 'projection-private-reply@example.invalid',
+    followUpSenderAddress: 'projection-private-follow-sender@example.invalid',
+    followUpReplyToAddress: 'projection-private-follow-reply@example.invalid',
+  }, async (config) => {
+    const internal = buildEmailReadiness({
+      config,
+      metricsAvailable: true,
+      sentLast24Hours: 2,
+      operationalMetrics: { suppressions: { active: 1 } },
+    });
+    const original = structuredClone(internal);
+    const projectBrowserEmailReadiness = appModule.projectBrowserEmailReadiness;
+    assert.equal(typeof projectBrowserEmailReadiness, 'function');
+
+    const projected = projectBrowserEmailReadiness(internal);
+
+    assert.notStrictEqual(projected, internal);
+    assert.notStrictEqual(projected.metrics, internal.metrics);
+    assert.notStrictEqual(projected.issues, internal.issues);
+    assert.deepEqual(internal, original);
+    assert.deepEqual({
+      provider: projected.provider,
+      outboundConfigured: projected.outboundConfigured,
+      recipientConfigured: projected.recipientConfigured,
+      recipientValid: projected.recipientValid,
+      senderConfigured: projected.senderConfigured,
+      replyToConfigured: projected.replyToConfigured,
+      webhookConfigured: projected.webhookConfigured,
+      metricsAvailable: projected.metricsAvailable,
+      sentLast24Hours: projected.metrics.sentLast24Hours,
+    }, {
+      provider: 'resend',
+      outboundConfigured: true,
+      recipientConfigured: true,
+      recipientValid: true,
+      senderConfigured: true,
+      replyToConfigured: true,
+      webhookConfigured: true,
+      metricsAvailable: true,
+      sentLast24Hours: 2,
+    });
+    for (const field of [
+      'fromAddress', 'replyToAddress', 'followUpSenderAddress', 'followUpReplyToAddress',
+      'testRecipient', 'allowedTestRecipients',
+    ]) {
+      assert.equal(Object.hasOwn(projected, field), false, field);
+    }
+  });
 });
 
 test('daily digest browser responses exclude the raw prepared envelope and job metadata', async () => {
