@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
+import fileSystem from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import * as acquisitionCommandCenter from '../server/services/acquisitionCommandCenter.js';
 import {
   buildActionQueue,
   buildAcquisitionSourceHealth,
@@ -649,4 +652,395 @@ test('passing a command center record atomically archives it and completes CRM f
   assert.equal(capturedUpdate.metadata.acquisitionCommand.passReason, 'too-expensive');
   assert.equal(capturedUpdate.metadata.diligence.stage, 'passed');
   assert.equal(capturedUpdate.metadata.diligence.decision, 'pass');
+});
+
+const authorityConfirmation = 'ACCEPT_REQUIRED_SOURCE_POPULATION_REDUCTION';
+const authorityReasonCode = 'business-confirmed-active-population-reset';
+const authorityFingerprintVersion = 'required-source-authority-v1';
+
+function sha256Bytes(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function expectedAuthorityFingerprint(sourceId, sourceUrl) {
+  return sha256Bytes(`${authorityFingerprintVersion}\0${sourceId}\0${sourceUrl}`);
+}
+
+function deepFreeze(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const child of Object.values(value)) deepFreeze(child);
+  return value;
+}
+
+function createAuthorityRevalidationFixture(t, {
+  previousRowCount = 871,
+  currentRowCount = 346,
+  targetOverrides = {},
+  optionalOverrides = {},
+} = {}) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-authority-revalidation-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const snapshotPath = path.join(directory, 'source-health.json');
+  const sourceUrl = 'https://docs.google.com/spreadsheets/d/synthetic-workbook/export?format=csv&gid=123';
+  const optionalSource = {
+    rowCount: 120,
+    name: 'SMB Deal OS export',
+    mode: 'manual-export',
+    required: false,
+    sourceRole: 'optional-supplemental',
+    checkedAt: '2026-09-08T16:00:00.000Z',
+    exportedAt: '2026-09-08T15:00:00.000Z',
+    importedAt: '2026-09-08T15:05:00.000Z',
+    importedBy: 'bounded-existing-provenance',
+    scope: 'saved-search',
+    coverageLabel: 'Synthetic active criteria',
+    ...optionalOverrides,
+  };
+  const previousSnapshot = {
+    generatedAt: '2026-09-08T16:00:00.000Z',
+    dateKey: '2026-09-08',
+    issues: [{
+      sourceId: 'sheet-0',
+      tone: 'warning',
+      title: 'SMB Deal Hunter Google Sheet needs attention',
+      message: `Row count dropped from ${previousRowCount} to ${currentRowCount}.`,
+      affectsHealth: true,
+      sourceUnavailable: false,
+    }],
+    totals: { sourceRows: previousRowCount + 120, normalizedDeals: 500, newDeals: 4 },
+    sources: {
+      'sheet-0': {
+        rowCount: previousRowCount,
+        name: 'SMB Deal Hunter Google Sheet',
+        mode: 'csv',
+        required: true,
+        sourceRole: 'required-primary',
+        checkedAt: '2026-09-08T16:00:00.000Z',
+        stableIdCount: 800,
+        preservedCustomMetadata: { sourceOwner: 'operations' },
+      },
+      'deal-os-export': optionalSource,
+    },
+  };
+  const previousBytes = Buffer.from(`${JSON.stringify(previousSnapshot, null, 2)}\n`);
+  fs.writeFileSync(snapshotPath, previousBytes, { mode: 0o640 });
+  const previousSnapshotSha256 = sha256Bytes(previousBytes);
+  const sourceFingerprint = expectedAuthorityFingerprint('sheet-0', sourceUrl);
+  const liveReview = deepFreeze({
+    generatedAt: '2026-09-09T16:30:00.000Z',
+    totals: { sourceRows: currentRowCount, normalizedDeals: currentRowCount, newDeals: 3 },
+    sources: [
+      {
+        id: 'sheet-0',
+        name: 'SMB Deal Hunter Google Sheet',
+        mode: 'csv',
+        required: true,
+        sourceRole: 'required-primary',
+        fetched: true,
+        rowCount: currentRowCount,
+        stableIdCount: currentRowCount,
+        listingUrlCount: currentRowCount,
+        ...targetOverrides,
+      },
+      {
+        id: 'deal-os-export',
+        name: 'SMB Deal OS export',
+        mode: 'manual-export',
+        required: false,
+        sourceRole: 'optional-supplemental',
+        fetched: false,
+        rowCount: 0,
+        error: 'Optional synthetic export is stale.',
+      },
+    ],
+  });
+  const liveReviewBefore = JSON.stringify(liveReview);
+  const audits = [];
+  const storage = new Proxy({
+    async insertSourceHealthSnapshot(snapshot) {
+      audits.push(snapshot);
+    },
+  }, {
+    get(target, property, receiver) {
+      if (property in target || typeof property === 'symbol') return Reflect.get(target, property, receiver);
+      throw new Error(`unexpected storage side effect: ${String(property)}`);
+    },
+  });
+  const config = {
+    storage: { sqlitePath: path.join(directory, 'synthetic.sqlite') },
+    dealHunter: {
+      sheetCsvUrls: [sourceUrl],
+      dailyEmail: { time: '23:59', timezone: 'America/Los_Angeles' },
+    },
+  };
+  const baseInput = {
+    sourceId: 'sheet-0',
+    expectedPreviousRowCount: previousRowCount,
+    expectedCurrentRowCount: currentRowCount,
+    expectedSnapshotSha256: previousSnapshotSha256,
+    expectedSourceFingerprint: sourceFingerprint,
+    confirmation: authorityConfirmation,
+    reasonCode: authorityReasonCode,
+  };
+  let reviewCalls = 0;
+
+  async function invoke({
+    input = baseInput,
+    review = liveReview,
+    fsAdapter = fileSystem,
+  } = {}) {
+    assert.equal(
+      typeof acquisitionCommandCenter.revalidateRequiredSourceAuthority,
+      'function',
+      'required source authority revalidation service must exist',
+    );
+    return acquisitionCommandCenter.revalidateRequiredSourceAuthority({
+      input,
+      actor: { principal_id: 'admin:primary', username: 'admin@example.invalid' },
+      config,
+      storage,
+      fileSystem: fsAdapter,
+      snapshotPath,
+      reviewSources: async () => {
+        reviewCalls += 1;
+        return review;
+      },
+      now: () => new Date('2026-09-09T16:30:00.000Z'),
+    });
+  }
+
+  return {
+    audits,
+    baseInput,
+    config,
+    directory,
+    invoke,
+    liveReview,
+    liveReviewBefore,
+    optionalSource,
+    previousBytes,
+    previousSnapshot,
+    previousSnapshotSha256,
+    reviewCalls: () => reviewCalls,
+    snapshotPath,
+    sourceFingerprint,
+    sourceUrl,
+  };
+}
+
+async function assertAuthorityRevalidationRejects(fixture, expectedStatus, options = {}) {
+  await assert.rejects(
+    fixture.invoke(options),
+    (error) => {
+      assert.equal(error.name, 'RequiredSourceAuthorityRevalidationError');
+      assert.equal(error.status, expectedStatus);
+      return true;
+    },
+  );
+  assert.deepEqual(fs.readFileSync(fixture.snapshotPath), fixture.previousBytes);
+}
+
+test('required source authority deliberately replaces 871 with verified 346 while preserving unrelated authority', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t);
+  const result = await fixture.invoke();
+  const persistedBytes = fs.readFileSync(fixture.snapshotPath);
+  const persisted = JSON.parse(persistedBytes);
+
+  assert.equal(result.sourceId, 'sheet-0');
+  assert.equal(result.previousRowCount, 871);
+  assert.equal(result.acceptedRowCount, 346);
+  assert.equal(result.sourceFingerprint, fixture.sourceFingerprint);
+  assert.equal(result.previousSnapshotSha256, fixture.previousSnapshotSha256);
+  assert.equal(result.newSnapshotSha256, sha256Bytes(persistedBytes));
+  assert.notEqual(result.newSnapshotSha256, result.previousSnapshotSha256);
+  assert.equal(result.targetSourceHealthy, true);
+  assert.equal(persisted.sources['sheet-0'].rowCount, 346);
+  assert.equal(persisted.sources['sheet-0'].checkedAt, '2026-09-09T16:30:00.000Z');
+  assert.deepEqual(persisted.sources['deal-os-export'], fixture.optionalSource);
+  assert.equal(JSON.stringify(fixture.liveReview), fixture.liveReviewBefore, 'source review input is immutable');
+});
+
+test('required source authority validates previous count, current count, snapshot SHA, and fingerprint before writing', async (t) => {
+  const cases = [
+    ['previous count', { expectedPreviousRowCount: 870 }],
+    ['current count', { expectedCurrentRowCount: 345 }],
+    ['snapshot SHA', { expectedSnapshotSha256: 'a'.repeat(64) }],
+    ['source fingerprint', { expectedSourceFingerprint: 'b'.repeat(64) }],
+  ];
+
+  for (const [label, overrides] of cases) {
+    await t.test(label, async (subtest) => {
+      const fixture = createAuthorityRevalidationFixture(subtest);
+      await assertAuthorityRevalidationRejects(fixture, 409, {
+        input: { ...fixture.baseInput, ...overrides },
+      });
+    });
+  }
+});
+
+test('required source authority rejects missing confirmation and an unrecognized reason', async (t) => {
+  await t.test('missing confirmation', async (subtest) => {
+    const fixture = createAuthorityRevalidationFixture(subtest);
+    const input = { ...fixture.baseInput };
+    delete input.confirmation;
+    await assertAuthorityRevalidationRejects(fixture, 400, { input });
+  });
+  await t.test('unknown reason', async (subtest) => {
+    const fixture = createAuthorityRevalidationFixture(subtest);
+    await assertAuthorityRevalidationRejects(fixture, 400, {
+      input: { ...fixture.baseInput, reasonCode: 'free-form-reason' },
+    });
+  });
+});
+
+test('required source authority rejects optional, unavailable, zero-row, and otherwise defective sources', async (t) => {
+  await t.test('optional source', async (subtest) => {
+    const fixture = createAuthorityRevalidationFixture(subtest);
+    await assertAuthorityRevalidationRejects(fixture, 422, {
+      input: {
+        ...fixture.baseInput,
+        sourceId: 'deal-os-export',
+        expectedPreviousRowCount: 120,
+      },
+    });
+    assert.equal(fixture.reviewCalls(), 0);
+  });
+  await t.test('fetch failure', async (subtest) => {
+    const fixture = createAuthorityRevalidationFixture(subtest, {
+      targetOverrides: { fetched: false, rowCount: 0, error: 'Synthetic fetch failed.' },
+    });
+    await assertAuthorityRevalidationRejects(fixture, 503);
+  });
+  await t.test('zero rows', async (subtest) => {
+    const fixture = createAuthorityRevalidationFixture(subtest, {
+      targetOverrides: { fetched: true, rowCount: 0 },
+    });
+    await assertAuthorityRevalidationRejects(fixture, 503);
+  });
+  await t.test('parser/source error', async (subtest) => {
+    const fixture = createAuthorityRevalidationFixture(subtest, {
+      targetOverrides: { error: 'Synthetic parser defect.' },
+    });
+    await assertAuthorityRevalidationRejects(fixture, 503);
+  });
+});
+
+test('required source authority rejects an already healthy source because no row-drop acceptance is needed', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t, { currentRowCount: 700 });
+  await assertAuthorityRevalidationRejects(fixture, 422);
+});
+
+test('required source authority creates and verifies an exact backup before the atomic replacement', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t);
+  const events = [];
+  const tracedFileSystem = {
+    ...fileSystem,
+    async open(filePath, ...args) {
+      events.push(`open:${filePath}`);
+      return fileSystem.open(filePath, ...args);
+    },
+    async rename(from, to) {
+      events.push(`rename:${from}:${to}`);
+      return fileSystem.rename(from, to);
+    },
+  };
+  const result = await fixture.invoke({ fsAdapter: tracedFileSystem });
+  const backupPath = path.join(`${fixture.snapshotPath}.backups`, `${result.backupId}.json`);
+  const backupBytes = fs.readFileSync(backupPath);
+  const backupEventIndex = events.findIndex((event) => event === `open:${backupPath}`);
+  const renameEventIndex = events.findIndex((event) => event.endsWith(`:${fixture.snapshotPath}`) && event.startsWith('rename:'));
+
+  assert.ok(backupEventIndex >= 0);
+  assert.ok(renameEventIndex > backupEventIndex);
+  assert.deepEqual(backupBytes, fixture.previousBytes);
+  assert.equal(sha256Bytes(backupBytes), fixture.previousSnapshotSha256);
+  assert.deepEqual(JSON.parse(backupBytes), fixture.previousSnapshot);
+});
+
+test('required source authority does not write when backup creation fails', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t);
+  const failingFileSystem = {
+    ...fileSystem,
+    async open(filePath, ...args) {
+      if (String(filePath).startsWith(`${fixture.snapshotPath}.backups${path.sep}`)) {
+        throw new Error('synthetic backup failure');
+      }
+      return fileSystem.open(filePath, ...args);
+    },
+  };
+
+  await assertAuthorityRevalidationRejects(fixture, 503, { fsAdapter: failingFileSystem });
+});
+
+test('required source authority atomic rename failure preserves the old readable snapshot', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t);
+  const failingFileSystem = {
+    ...fileSystem,
+    async rename(from, to) {
+      if (to === fixture.snapshotPath) throw new Error('synthetic atomic rename failure');
+      return fileSystem.rename(from, to);
+    },
+  };
+
+  await assertAuthorityRevalidationRejects(fixture, 503, { fsAdapter: failingFileSystem });
+  assert.deepEqual(JSON.parse(fs.readFileSync(fixture.snapshotPath)), fixture.previousSnapshot);
+});
+
+test('required source authority readback and post-acceptance evaluation remove only the target row-drop issue', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t);
+  const result = await fixture.invoke();
+  const snapshot = JSON.parse(fs.readFileSync(fixture.snapshotPath));
+  const audit = fixture.audits.at(-1);
+
+  assert.equal(result.targetSourceHealthy, true);
+  assert.equal(snapshot.issues.some((issue) => issue.sourceId === 'sheet-0'), false);
+  assert.deepEqual(snapshot.sources['deal-os-export'], fixture.optionalSource);
+  assert.equal(snapshot.latestAuthorityRevalidation.eventType, 'required-source-authority-revalidated');
+  assert.match(snapshot.latestAuthorityRevalidation.actorFingerprint, /^[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(snapshot).includes('admin@example.invalid'), false);
+  assert.equal(audit.snapshot.authorityRevalidation.newSnapshotSha256, result.newSnapshotSha256);
+  assert.equal(audit.snapshot.issues.some((issue) => issue.sourceId === 'deal-os-export'), true);
+  assert.equal(audit.snapshot.issues.some((issue) => issue.sourceId === 'sheet-0'), false);
+});
+
+test('required source authority serializes requests so a repeated stale approval cannot rewrite authority', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t);
+  const [first, second] = await Promise.allSettled([fixture.invoke(), fixture.invoke()]);
+
+  assert.equal(first.status, 'fulfilled');
+  assert.equal(second.status, 'rejected');
+  assert.equal(second.reason.status, 409);
+  assert.equal(fixture.audits.length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(fixture.snapshotPath)).sources['sheet-0'].rowCount, 346);
+  assert.equal(fs.readdirSync(`${fixture.snapshotPath}.backups`).length, 1);
+});
+
+test('normal source snapshot persistence preserves latest bounded authority-revalidation provenance', () => {
+  const latestAuthorityRevalidation = {
+    eventType: 'required-source-authority-revalidated',
+    sourceId: 'sheet-0',
+    previousRowCount: 871,
+    acceptedRowCount: 346,
+    sourceFingerprint: 'a'.repeat(64),
+    previousSnapshotSha256: 'b'.repeat(64),
+    acceptedAt: '2026-09-09T16:30:00.000Z',
+    reasonCode: authorityReasonCode,
+    actorFingerprint: 'c'.repeat(64),
+  };
+  const next = buildNextSourceSnapshot({
+    generatedAt: '2026-09-10T16:30:00.000Z',
+    dateKey: '2026-09-10',
+    totals: { newDeals: 1 },
+    issues: [],
+    sources: [{
+      id: 'sheet-0', name: 'SMB Deal Hunter Google Sheet', mode: 'csv', fetched: true, rowCount: 347,
+      required: true, sourceRole: 'required-primary',
+    }],
+  }, {
+    latestAuthorityRevalidation,
+    sources: { 'sheet-0': { rowCount: 346 } },
+  }, '2026-09-10T16:30:00.000Z');
+
+  assert.deepEqual(next.latestAuthorityRevalidation, latestAuthorityRevalidation);
 });

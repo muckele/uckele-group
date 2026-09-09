@@ -1996,6 +1996,186 @@ test('viewer can read but cannot mutate the Daily Digest briefing', async () => 
   });
 });
 
+const sourceAuthorityRequest = {
+  sourceId: 'sheet-0',
+  expectedPreviousRowCount: 871,
+  expectedCurrentRowCount: 346,
+  expectedSnapshotSha256: 'a'.repeat(64),
+  expectedSourceFingerprint: 'b'.repeat(64),
+  confirmation: 'ACCEPT_REQUIRED_SOURCE_POPULATION_REDUCTION',
+  reasonCode: 'business-confirmed-active-population-reset',
+};
+
+const sourceAuthoritySuccess = {
+  sourceId: 'sheet-0',
+  previousRowCount: 871,
+  acceptedRowCount: 346,
+  sourceFingerprint: 'b'.repeat(64),
+  previousSnapshotSha256: 'a'.repeat(64),
+  newSnapshotSha256: 'c'.repeat(64),
+  backupId: '20260909T163000000Z-a1b2c3d4-bounded',
+  acceptedAt: '2026-09-09T16:30:00.000Z',
+  reasonCode: 'business-confirmed-active-population-reset',
+  targetSourceHealthy: true,
+};
+
+function sourceAuthorityHttpError(status, code) {
+  const error = new Error('Bounded source-authority request rejected.');
+  error.name = 'RequiredSourceAuthorityRevalidationError';
+  error.status = status;
+  error.code = code;
+  return error;
+}
+
+test('administrator can invoke the exact required-source authority revalidation contract', async () => {
+  let received = null;
+  const app = createApp({
+    sourceAuthorityRevalidator: async (request) => {
+      received = request;
+      return sourceAuthoritySuccess;
+    },
+  });
+
+  await withServer(async (origin) => {
+    const adminCookie = await signInForCookie(origin);
+    const response = await fetch(`${origin}/api/admin/deal-hunter/source-authority/revalidate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify(sourceAuthorityRequest),
+    });
+    const result = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(result, { success: true, ...sourceAuthoritySuccess });
+    assert.deepEqual(received.input, sourceAuthorityRequest);
+    assert.equal(received.actor.role, 'admin');
+    assert.equal(received.actor.principal_id, 'admin:primary');
+    assert.equal('actor' in received.input, false);
+  }, app);
+});
+
+test('required-source authority revalidation rejects viewer and unauthenticated callers before service execution', async () => {
+  let serviceCalls = 0;
+  const app = createApp({
+    sourceAuthorityRevalidator: async () => {
+      serviceCalls += 1;
+      return sourceAuthoritySuccess;
+    },
+  });
+
+  await withServer(async (origin) => {
+    const viewerCookie = await signInForCookie(origin, { username: 'smb-deal-hunter', password: 'view-only-local' });
+    for (const headers of [
+      { 'Content-Type': 'application/json', Cookie: viewerCookie },
+      { 'Content-Type': 'application/json' },
+    ]) {
+      const response = await fetch(`${origin}/api/admin/deal-hunter/source-authority/revalidate`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(sourceAuthorityRequest),
+      });
+      assert.equal(response.status, 401);
+    }
+    assert.equal(serviceCalls, 0);
+  }, app);
+});
+
+test('required-source authority HTTP schema rejects unknown fields and the wrong confirmation before service execution', async () => {
+  let serviceCalls = 0;
+  const app = createApp({
+    sourceAuthorityRevalidator: async () => {
+      serviceCalls += 1;
+      return sourceAuthoritySuccess;
+    },
+  });
+
+  await withServer(async (origin) => {
+    const adminCookie = await signInForCookie(origin);
+    const invalidBodies = [
+      { ...sourceAuthorityRequest, actor: 'caller-controlled' },
+      { ...sourceAuthorityRequest, confirmation: 'accept' },
+    ];
+    for (const body of invalidBodies) {
+      const response = await fetch(`${origin}/api/admin/deal-hunter/source-authority/revalidate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+        body: JSON.stringify(body),
+      });
+      const result = await response.json();
+      assert.equal(response.status, 400);
+      assert.equal(result.success, false);
+    }
+    assert.equal(serviceCalls, 0);
+  }, app);
+});
+
+test('required-source authority HTTP route returns conflicts for stale SHA, fingerprint, and changed live count', async (t) => {
+  const cases = [
+    ['stale snapshot SHA', 'source_authority_snapshot_conflict'],
+    ['wrong source fingerprint', 'source_authority_fingerprint_conflict'],
+    ['live count changed', 'source_authority_current_count_conflict'],
+  ];
+
+  for (const [label, code] of cases) {
+    await t.test(label, async () => {
+      let serviceCalls = 0;
+      const app = createApp({
+        sourceAuthorityRevalidator: async () => {
+          serviceCalls += 1;
+          throw sourceAuthorityHttpError(409, code);
+        },
+      });
+      await withServer(async (origin) => {
+        const adminCookie = await signInForCookie(origin);
+        const response = await fetch(`${origin}/api/admin/deal-hunter/source-authority/revalidate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+          body: JSON.stringify(sourceAuthorityRequest),
+        });
+        const result = await response.json();
+        assert.equal(response.status, 409);
+        assert.equal(result.success, false);
+        assert.equal(result.code, code);
+        assert.equal(serviceCalls, 1);
+      }, app);
+    });
+  }
+});
+
+test('required-source authority success response is an exact bounded privacy projection', async () => {
+  const app = createApp({ sourceAuthorityRevalidator: async () => sourceAuthoritySuccess });
+
+  await withServer(async (origin) => {
+    const adminCookie = await signInForCookie(origin);
+    const response = await fetch(`${origin}/api/admin/deal-hunter/source-authority/revalidate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify(sourceAuthorityRequest),
+    });
+    const result = await response.json();
+    const serialized = JSON.stringify(result).toLowerCase();
+
+    assert.deepEqual(Object.keys(result).sort(), [
+      'acceptedAt',
+      'acceptedRowCount',
+      'backupId',
+      'newSnapshotSha256',
+      'previousRowCount',
+      'previousSnapshotSha256',
+      'reasonCode',
+      'sourceFingerprint',
+      'sourceId',
+      'success',
+      'targetSourceHealthy',
+    ].sort());
+    for (const forbidden of [
+      'docs.google.com', 'snapshot contents', 'private row', 'secret', 'recipient', 'provider', 'sender', 'claim token',
+    ]) {
+      assert.equal(serialized.includes(forbidden), false, forbidden);
+    }
+  }, app);
+});
+
 test.after(() => {
   fs.rmSync(tempDir, { recursive: true, force: true });
 });

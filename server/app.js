@@ -8,6 +8,8 @@ import { getStorage } from './storage/index.js';
 import {
   getAcquisitionCommandCenter,
   getSourceHealth,
+  parseRequiredSourceAuthorityRevalidationRequest,
+  revalidateRequiredSourceAuthority,
   updateAcquisitionCommandCenterRecord,
 } from './services/acquisitionCommandCenter.js';
 import {
@@ -502,6 +504,7 @@ function publicScoreRefreshResult(scoreRefresh) {
 
 export function createApp({
   dailyDealHunterRunner = runClaimedDailyDealHunterEmail,
+  sourceAuthorityRevalidator = revalidateRequiredSourceAuthority,
 } = {}) {
   const config = getConfig();
   const app = express();
@@ -1382,6 +1385,46 @@ export function createApp({
         success: true,
         review: session.role === 'viewer' ? sanitizeViewerDealHunterReview(browserReview) : browserReview,
       });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/source-authority/revalidate',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      try {
+        const input = parseRequiredSourceAuthorityRevalidationRequest(request.body);
+        const result = await sourceAuthorityRevalidator({ input, actor: session });
+        response.json({
+          success: true,
+          sourceId: result.sourceId,
+          previousRowCount: result.previousRowCount,
+          acceptedRowCount: result.acceptedRowCount,
+          sourceFingerprint: result.sourceFingerprint,
+          previousSnapshotSha256: result.previousSnapshotSha256,
+          newSnapshotSha256: result.newSnapshotSha256,
+          backupId: result.backupId,
+          acceptedAt: result.acceptedAt,
+          reasonCode: result.reasonCode,
+          targetSourceHealthy: Boolean(result.targetSourceHealthy),
+        });
+      } catch (error) {
+        if (error?.name !== 'RequiredSourceAuthorityRevalidationError') throw error;
+        const status = [400, 409, 422, 503].includes(error.status) ? error.status : 503;
+        const code = /^[a-z0-9_]{1,100}$/.test(error.code || '')
+          ? error.code
+          : 'source_authority_revalidation_failed';
+        response.status(status).json({
+          success: false,
+          code,
+          error: 'Source-authority revalidation was rejected.',
+        });
+      }
     }),
   );
 
