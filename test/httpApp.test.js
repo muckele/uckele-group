@@ -2016,14 +2016,17 @@ const sourceAuthoritySuccess = {
   backupId: '20260909T163000000Z-a1b2c3d4-bounded',
   acceptedAt: '2026-09-09T16:30:00.000Z',
   reasonCode: 'business-confirmed-active-population-reset',
+  authorityState: 'committed',
+  safeToRetry: false,
   targetSourceHealthy: true,
 };
 
-function sourceAuthorityHttpError(status, code) {
+function sourceAuthorityHttpError(status, code, metadata = {}) {
   const error = new Error('Bounded source-authority request rejected.');
   error.name = 'RequiredSourceAuthorityRevalidationError';
   error.status = status;
   error.code = code;
+  Object.assign(error, metadata);
   return error;
 }
 
@@ -2142,6 +2145,92 @@ test('required-source authority HTTP route returns conflicts for stale SHA, fing
   }
 });
 
+test('required-source authority HTTP failures project explicit bounded mutation outcomes', async (t) => {
+  const reconciliation = {
+    expectedPreviousSnapshotSha256: 'a'.repeat(64),
+    candidateSnapshotSha256: 'c'.repeat(64),
+    observedSnapshotSha256: 'c'.repeat(64),
+    backupId: '20260909T163000000Z-a1b2c3d4-bounded',
+    rollbackAttempted: false,
+    rollbackSucceeded: false,
+    sourceId: 'sheet-0',
+    previousRowCount: 871,
+    acceptedRowCount: 346,
+    rawSnapshot: 'private row contents',
+    backupPath: '/private/synthetic/source-health.json.backups/secret.json',
+    sourceUrl: 'https://docs.google.com/spreadsheets/d/private',
+    actorIdentity: 'admin@example.invalid',
+  };
+  const cases = [
+    ['committed', false, 'authority_committed_readback_failed', reconciliation],
+    ['restored', false, 'authority_restored_after_audit_failure', {
+      ...reconciliation,
+      observedSnapshotSha256: 'a'.repeat(64),
+      rollbackAttempted: true,
+      rollbackSucceeded: true,
+    }],
+    ['indeterminate', false, 'authority_state_indeterminate', {
+      ...reconciliation,
+      observedSnapshotSha256: undefined,
+      rollbackAttempted: true,
+      rollbackSucceeded: false,
+    }],
+    ['unchanged', true, 'source_authority_atomic_write_failed', undefined],
+  ];
+
+  for (const [authorityState, safeToRetry, recoveryCode, evidence] of cases) {
+    await t.test(authorityState, async () => {
+      const app = createApp({
+        sourceAuthorityRevalidator: async () => {
+          throw sourceAuthorityHttpError(503, 'source_authority_revalidation_failed', {
+            authorityState,
+            safeToRetry,
+            recoveryCode,
+            reconciliation: evidence,
+          });
+        },
+      });
+
+      await withServer(async (origin) => {
+        const adminCookie = await signInForCookie(origin);
+        const response = await fetch(`${origin}/api/admin/deal-hunter/source-authority/revalidate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+          body: JSON.stringify(sourceAuthorityRequest),
+        });
+        const result = await response.json();
+        const serialized = JSON.stringify(result).toLowerCase();
+
+        assert.equal(response.status, 503);
+        assert.equal(result.success, false);
+        assert.equal(result.authorityState, authorityState);
+        assert.equal(result.safeToRetry, safeToRetry);
+        assert.equal(result.recoveryCode, recoveryCode);
+        if (evidence) {
+          assert.deepEqual(Object.keys(result.reconciliation).sort(), [
+            'acceptedRowCount',
+            'backupId',
+            'candidateSnapshotSha256',
+            'expectedPreviousSnapshotSha256',
+            ...(evidence.observedSnapshotSha256 ? ['observedSnapshotSha256'] : []),
+            'previousRowCount',
+            'rollbackAttempted',
+            'rollbackSucceeded',
+            'sourceId',
+          ].sort());
+        } else {
+          assert.equal(result.reconciliation, undefined);
+        }
+        for (const forbidden of [
+          'docs.google.com', 'private row', '/private/', 'secret.json', 'admin@example.invalid',
+        ]) {
+          assert.equal(serialized.includes(forbidden), false, forbidden);
+        }
+      }, app);
+    });
+  }
+});
+
 test('required-source authority success response is an exact bounded privacy projection', async () => {
   const app = createApp({ sourceAuthorityRevalidator: async () => sourceAuthoritySuccess });
 
@@ -2158,11 +2247,13 @@ test('required-source authority success response is an exact bounded privacy pro
     assert.deepEqual(Object.keys(result).sort(), [
       'acceptedAt',
       'acceptedRowCount',
+      'authorityState',
       'backupId',
       'newSnapshotSha256',
       'previousRowCount',
       'previousSnapshotSha256',
       'reasonCode',
+      'safeToRetry',
       'sourceFingerprint',
       'sourceId',
       'success',

@@ -789,6 +789,8 @@ function createAuthorityRevalidationFixture(t, {
     input = baseInput,
     review = liveReview,
     fsAdapter = fileSystem,
+    storageAdapter = storage,
+    sourceHealthBuilder = buildAcquisitionSourceHealth,
   } = {}) {
     assert.equal(
       typeof acquisitionCommandCenter.revalidateRequiredSourceAuthority,
@@ -799,13 +801,14 @@ function createAuthorityRevalidationFixture(t, {
       input,
       actor: { principal_id: 'admin:primary', username: 'admin@example.invalid' },
       config,
-      storage,
+      storage: storageAdapter,
       fileSystem: fsAdapter,
       snapshotPath,
       reviewSources: async () => {
         reviewCalls += 1;
         return review;
       },
+      buildSourceHealth: sourceHealthBuilder,
       now: () => new Date('2026-09-09T16:30:00.000Z'),
     });
   }
@@ -841,6 +844,26 @@ async function assertAuthorityRevalidationRejects(fixture, expectedStatus, optio
   assert.deepEqual(fs.readFileSync(fixture.snapshotPath), fixture.previousBytes);
 }
 
+async function captureAuthorityRevalidationError(fixture, expectedStatus, options = {}) {
+  try {
+    await fixture.invoke(options);
+  } catch (error) {
+    assert.equal(error.name, 'RequiredSourceAuthorityRevalidationError');
+    assert.equal(error.status, expectedStatus);
+    return error;
+  }
+  assert.fail('expected source-authority revalidation to fail');
+}
+
+function assertVerifiedAuthorityBackup(fixture, error) {
+  const backupId = error.reconciliation?.backupId;
+  assert.match(backupId || '', /^[A-Za-z0-9-]+$/);
+  const backupPath = path.join(`${fixture.snapshotPath}.backups`, `${backupId}.json`);
+  const backupBytes = fs.readFileSync(backupPath);
+  assert.deepEqual(backupBytes, fixture.previousBytes);
+  assert.equal(sha256Bytes(backupBytes), fixture.previousSnapshotSha256);
+}
+
 test('required source authority deliberately replaces 871 with verified 346 while preserving unrelated authority', async (t) => {
   const fixture = createAuthorityRevalidationFixture(t);
   const result = await fixture.invoke();
@@ -854,6 +877,8 @@ test('required source authority deliberately replaces 871 with verified 346 whil
   assert.equal(result.previousSnapshotSha256, fixture.previousSnapshotSha256);
   assert.equal(result.newSnapshotSha256, sha256Bytes(persistedBytes));
   assert.notEqual(result.newSnapshotSha256, result.previousSnapshotSha256);
+  assert.equal(result.authorityState, 'committed');
+  assert.equal(result.safeToRetry, false);
   assert.equal(result.targetSourceHealthy, true);
   assert.equal(persisted.sources['sheet-0'].rowCount, 346);
   assert.equal(persisted.sources['sheet-0'].checkedAt, '2026-09-09T16:30:00.000Z');
@@ -985,6 +1010,238 @@ test('required source authority atomic rename failure preserves the old readable
 
   await assertAuthorityRevalidationRejects(fixture, 503, { fsAdapter: failingFileSystem });
   assert.deepEqual(JSON.parse(fs.readFileSync(fixture.snapshotPath)), fixture.previousSnapshot);
+});
+
+test('required source authority reports committed when directory sync fails after rename and candidate is observed', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t);
+  const failingFileSystem = {
+    ...fileSystem,
+    async open(filePath, ...args) {
+      const handle = await fileSystem.open(filePath, ...args);
+      if (filePath !== fixture.directory) return handle;
+      return {
+        async sync() {
+          throw new Error('synthetic post-rename directory sync failure');
+        },
+        close: () => handle.close(),
+      };
+    },
+  };
+
+  const error = await captureAuthorityRevalidationError(fixture, 503, { fsAdapter: failingFileSystem });
+  const currentBytes = fs.readFileSync(fixture.snapshotPath);
+
+  assert.equal(error.authorityState, 'committed');
+  assert.equal(error.safeToRetry, false);
+  assert.equal(error.recoveryCode, 'authority_committed_directory_sync_failed');
+  assert.equal(error.reconciliation.observedSnapshotSha256, sha256Bytes(currentBytes));
+  assert.equal(error.reconciliation.candidateSnapshotSha256, sha256Bytes(currentBytes));
+  assert.equal(JSON.parse(currentBytes).sources['sheet-0'].rowCount, 346);
+  assertVerifiedAuthorityBackup(fixture, error);
+
+  const repeatedError = await captureAuthorityRevalidationError(fixture, 409);
+  assert.equal(repeatedError.code, 'source_authority_snapshot_conflict');
+  assert.equal(repeatedError.authorityState, 'unchanged');
+  assert.equal(repeatedError.safeToRetry, false);
+  assert.deepEqual(fs.readFileSync(fixture.snapshotPath), currentBytes);
+  assert.equal(fs.readdirSync(`${fixture.snapshotPath}.backups`).length, 1);
+});
+
+test('required source authority reports indeterminate when post-rename readback cannot classify installed bytes', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t);
+  let snapshotReads = 0;
+  const failingFileSystem = {
+    ...fileSystem,
+    async readFile(filePath, ...args) {
+      if (filePath === fixture.snapshotPath) {
+        snapshotReads += 1;
+        if (snapshotReads >= 3) throw new Error('synthetic post-rename readback failure');
+      }
+      return fileSystem.readFile(filePath, ...args);
+    },
+  };
+
+  const error = await captureAuthorityRevalidationError(fixture, 503, { fsAdapter: failingFileSystem });
+  const currentBytes = fs.readFileSync(fixture.snapshotPath);
+
+  assert.equal(error.authorityState, 'indeterminate');
+  assert.equal(error.safeToRetry, false);
+  assert.equal(error.recoveryCode, 'authority_state_indeterminate');
+  assert.equal(error.reconciliation.observedSnapshotSha256, undefined);
+  assert.equal(error.reconciliation.candidateSnapshotSha256, sha256Bytes(currentBytes));
+  assert.equal(JSON.parse(currentBytes).sources['sheet-0'].rowCount, 346);
+  assertVerifiedAuthorityBackup(fixture, error);
+});
+
+test('required source authority reports restored only after audit rollback restores and verifies old bytes', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t);
+  const failingStorage = {
+    async insertSourceHealthSnapshot() {
+      throw new Error('synthetic audit insertion failure');
+    },
+  };
+
+  const error = await captureAuthorityRevalidationError(fixture, 503, { storageAdapter: failingStorage });
+  const currentBytes = fs.readFileSync(fixture.snapshotPath);
+
+  assert.equal(error.authorityState, 'restored');
+  assert.equal(error.safeToRetry, false);
+  assert.equal(error.recoveryCode, 'authority_restored_after_audit_failure');
+  assert.equal(error.reconciliation.rollbackAttempted, true);
+  assert.equal(error.reconciliation.rollbackSucceeded, true);
+  assert.equal(error.reconciliation.observedSnapshotSha256, fixture.previousSnapshotSha256);
+  assert.equal(sha256Bytes(currentBytes), fixture.previousSnapshotSha256);
+  assert.deepEqual(currentBytes, fixture.previousBytes);
+  assertVerifiedAuthorityBackup(fixture, error);
+});
+
+test('required source authority reports committed when audit rollback fails and candidate remains observed', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t);
+  let authorityRenames = 0;
+  const failingFileSystem = {
+    ...fileSystem,
+    async rename(from, to) {
+      if (to === fixture.snapshotPath) {
+        authorityRenames += 1;
+        if (authorityRenames === 2) throw new Error('synthetic rollback rename failure');
+      }
+      return fileSystem.rename(from, to);
+    },
+  };
+  const failingStorage = {
+    async insertSourceHealthSnapshot() {
+      throw new Error('synthetic audit insertion failure');
+    },
+  };
+
+  const error = await captureAuthorityRevalidationError(fixture, 503, {
+    fsAdapter: failingFileSystem,
+    storageAdapter: failingStorage,
+  });
+  const currentBytes = fs.readFileSync(fixture.snapshotPath);
+
+  assert.equal(error.authorityState, 'committed');
+  assert.equal(error.safeToRetry, false);
+  assert.equal(error.recoveryCode, 'authority_committed_audit_failed');
+  assert.equal(error.reconciliation.rollbackAttempted, true);
+  assert.equal(error.reconciliation.rollbackSucceeded, false);
+  assert.equal(error.reconciliation.observedSnapshotSha256, sha256Bytes(currentBytes));
+  assert.equal(error.reconciliation.candidateSnapshotSha256, sha256Bytes(currentBytes));
+  assert.equal(JSON.parse(currentBytes).latestAuthorityRevalidation.eventType, 'required-source-authority-revalidated');
+  assertVerifiedAuthorityBackup(fixture, error);
+});
+
+test('required source authority reports indeterminate when audit rollback and final readback both fail', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t);
+  let authorityRenames = 0;
+  let rollbackRenameFailed = false;
+  const failingFileSystem = {
+    ...fileSystem,
+    async readFile(filePath, ...args) {
+      if (filePath === fixture.snapshotPath && rollbackRenameFailed) {
+        throw new Error('synthetic final reconciliation readback failure');
+      }
+      return fileSystem.readFile(filePath, ...args);
+    },
+    async rename(from, to) {
+      if (to === fixture.snapshotPath) {
+        authorityRenames += 1;
+        if (authorityRenames === 2) {
+          rollbackRenameFailed = true;
+          throw new Error('synthetic rollback rename failure');
+        }
+      }
+      return fileSystem.rename(from, to);
+    },
+  };
+  const failingStorage = {
+    async insertSourceHealthSnapshot() {
+      throw new Error('synthetic audit insertion failure');
+    },
+  };
+
+  const error = await captureAuthorityRevalidationError(fixture, 503, {
+    fsAdapter: failingFileSystem,
+    storageAdapter: failingStorage,
+  });
+  const currentBytes = fs.readFileSync(fixture.snapshotPath);
+
+  assert.equal(error.authorityState, 'indeterminate');
+  assert.equal(error.safeToRetry, false);
+  assert.equal(error.recoveryCode, 'authority_state_indeterminate');
+  assert.equal(error.reconciliation.rollbackAttempted, true);
+  assert.equal(error.reconciliation.rollbackSucceeded, false);
+  assert.equal(error.reconciliation.observedSnapshotSha256, undefined);
+  assert.equal(JSON.parse(currentBytes).sources['sheet-0'].rowCount, 346);
+  assertVerifiedAuthorityBackup(fixture, error);
+});
+
+test('required source authority reports committed when post-write source health fails', async (t) => {
+  const fixture = createAuthorityRevalidationFixture(t);
+  let healthBuilds = 0;
+  const sourceHealthBuilder = (options) => {
+    healthBuilds += 1;
+    const sourceHealth = buildAcquisitionSourceHealth(options);
+    if (healthBuilds !== 3) return sourceHealth;
+    return {
+      ...sourceHealth,
+      healthy: false,
+      issues: [...sourceHealth.issues, {
+        sourceId: 'sheet-0',
+        affectsHealth: true,
+        sourceUnavailable: false,
+      }],
+    };
+  };
+
+  const error = await captureAuthorityRevalidationError(fixture, 503, { sourceHealthBuilder });
+  const currentBytes = fs.readFileSync(fixture.snapshotPath);
+
+  assert.equal(error.authorityState, 'committed');
+  assert.equal(error.safeToRetry, false);
+  assert.equal(error.recoveryCode, 'authority_committed_post_health_failed');
+  assert.equal(error.reconciliation.candidateSnapshotSha256, sha256Bytes(currentBytes));
+  assert.equal(JSON.parse(currentBytes).sources['sheet-0'].rowCount, 346);
+  assertVerifiedAuthorityBackup(fixture, error);
+});
+
+test('required source authority reports unchanged and retry-safe for failures before replacement', async (t) => {
+  const cases = [
+    ['temporary write', (fixture) => ({
+      ...fileSystem,
+      async open(filePath, ...args) {
+        const name = path.basename(String(filePath));
+        if (path.dirname(String(filePath)) === fixture.directory
+          && name.startsWith('.source-health.json.')
+          && name.endsWith('.tmp')) {
+          throw new Error('synthetic temporary write failure');
+        }
+        return fileSystem.open(filePath, ...args);
+      },
+    })],
+    ['rename', (fixture) => ({
+      ...fileSystem,
+      async rename(from, to) {
+        if (to === fixture.snapshotPath) throw new Error('synthetic atomic rename failure');
+        return fileSystem.rename(from, to);
+      },
+    })],
+  ];
+
+  for (const [label, adapter] of cases) {
+    await t.test(label, async (subtest) => {
+      const fixture = createAuthorityRevalidationFixture(subtest);
+      const error = await captureAuthorityRevalidationError(fixture, 503, {
+        fsAdapter: adapter(fixture),
+      });
+
+      assert.equal(error.authorityState, 'unchanged');
+      assert.equal(error.safeToRetry, true);
+      assert.equal(error.recoveryCode, 'source_authority_atomic_write_failed');
+      assert.deepEqual(fs.readFileSync(fixture.snapshotPath), fixture.previousBytes);
+      assertVerifiedAuthorityBackup(fixture, error);
+    });
+  }
 });
 
 test('required source authority readback and post-acceptance evaluation remove only the target row-drop issue', async (t) => {

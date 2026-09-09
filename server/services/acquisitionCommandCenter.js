@@ -54,6 +54,7 @@ const sourceAuthorityRequestKeys = [
   'reasonCode',
   'sourceId',
 ];
+const sourceAuthorityStates = new Set(['unchanged', 'committed', 'restored', 'indeterminate']);
 const sourceAuthorityRevalidationQueues = new Map();
 
 function normalizeText(value = '', maxLength = 1000) {
@@ -867,16 +868,27 @@ function isRequiredDealHunterSource(source = {}) {
 }
 
 export class RequiredSourceAuthorityRevalidationError extends Error {
-  constructor(status, code, message) {
+  constructor(status, code, message, {
+    authorityState = 'unchanged',
+    safeToRetry = false,
+    recoveryCode = code,
+    reconciliation,
+  } = {}) {
     super(message);
     this.name = 'RequiredSourceAuthorityRevalidationError';
     this.status = status;
     this.code = code;
+    this.authorityState = sourceAuthorityStates.has(authorityState) ? authorityState : 'indeterminate';
+    this.safeToRetry = ['committed', 'indeterminate'].includes(this.authorityState)
+      ? false
+      : safeToRetry === true;
+    this.recoveryCode = recoveryCode;
+    if (reconciliation) this.reconciliation = reconciliation;
   }
 }
 
-function sourceAuthorityError(status, code, message) {
-  return new RequiredSourceAuthorityRevalidationError(status, code, message);
+function sourceAuthorityError(status, code, message, mutation) {
+  return new RequiredSourceAuthorityRevalidationError(status, code, message, mutation);
 }
 
 function hashSourceAuthorityBytes(value) {
@@ -1023,11 +1035,109 @@ async function strictAtomicSourceAuthorityWrite({
     await fileSystem.rename(temporaryPath, filePath);
     renamed = true;
     await syncSourceAuthorityDirectory(fileSystem, directory);
+  } catch (error) {
+    if (!renamed && error instanceof RequiredSourceAuthorityRevalidationError) throw error;
+    const writeError = new Error('Source-authority atomic write failed.');
+    writeError.name = 'SourceAuthorityAtomicWriteError';
+    writeError.replacementCompleted = renamed;
+    throw writeError;
   } finally {
     if (!renamed) {
       await fileSystem.unlink(temporaryPath).catch(() => {});
     }
   }
+}
+
+function sourceAuthorityReconciliation({
+  request,
+  previousSnapshotSha256,
+  candidateSnapshotSha256,
+  observedSnapshotSha256,
+  backupId,
+  rollbackAttempted = false,
+  rollbackSucceeded = false,
+}) {
+  return {
+    expectedPreviousSnapshotSha256: previousSnapshotSha256,
+    candidateSnapshotSha256,
+    ...(observedSnapshotSha256 ? { observedSnapshotSha256 } : {}),
+    backupId,
+    rollbackAttempted,
+    rollbackSucceeded,
+    sourceId: request.sourceId,
+    previousRowCount: request.expectedPreviousRowCount,
+    acceptedRowCount: request.expectedCurrentRowCount,
+  };
+}
+
+async function observeSourceAuthoritySnapshot({
+  fileSystem,
+  filePath,
+  previousSnapshotSha256,
+  candidateSnapshotSha256,
+  observedBytes,
+  allowRestored = false,
+}) {
+  let bytes = observedBytes;
+  try {
+    if (!bytes) bytes = await fileSystem.readFile(filePath);
+    const observedSnapshotSha256 = hashSourceAuthorityBytes(bytes);
+    if (observedSnapshotSha256 === candidateSnapshotSha256) {
+      return { authorityState: 'committed', observedSnapshotSha256 };
+    }
+    if (allowRestored && observedSnapshotSha256 === previousSnapshotSha256) {
+      return { authorityState: 'restored', observedSnapshotSha256 };
+    }
+    return { authorityState: 'indeterminate', observedSnapshotSha256 };
+  } catch {
+    return { authorityState: 'indeterminate' };
+  }
+}
+
+async function postReplacementSourceAuthorityError({
+  fileSystem,
+  filePath,
+  request,
+  previousSnapshotSha256,
+  candidateSnapshotSha256,
+  backupId,
+  code,
+  message,
+  committedRecoveryCode,
+  restoredRecoveryCode,
+  observedBytes,
+  allowRestored = false,
+  rollbackAttempted = false,
+}) {
+  const observation = await observeSourceAuthoritySnapshot({
+    fileSystem,
+    filePath,
+    previousSnapshotSha256,
+    candidateSnapshotSha256,
+    observedBytes,
+    allowRestored,
+  });
+  const rollbackSucceeded = rollbackAttempted && observation.authorityState === 'restored';
+  const recoveryCode = observation.authorityState === 'committed'
+    ? committedRecoveryCode
+    : observation.authorityState === 'restored'
+      ? restoredRecoveryCode
+      : 'authority_state_indeterminate';
+
+  return sourceAuthorityError(503, code, message, {
+    authorityState: observation.authorityState,
+    safeToRetry: false,
+    recoveryCode,
+    reconciliation: sourceAuthorityReconciliation({
+      request,
+      previousSnapshotSha256,
+      candidateSnapshotSha256,
+      observedSnapshotSha256: observation.observedSnapshotSha256,
+      backupId,
+      rollbackAttempted,
+      rollbackSucceeded,
+    }),
+  });
 }
 
 function boundedSourceAuthorityTimestamp(date) {
@@ -1130,6 +1240,11 @@ async function rollbackSourceAuthorityAfterAuditFailure({
       }
     },
   });
+  const restoredBytes = await fileSystem.readFile(filePath);
+  if (hashSourceAuthorityBytes(restoredBytes) !== hashSourceAuthorityBytes(oldBytes)) {
+    throw new Error('Source-authority rollback verification failed.');
+  }
+  return restoredBytes;
 }
 
 export async function revalidateRequiredSourceAuthority({
@@ -1140,6 +1255,7 @@ export async function revalidateRequiredSourceAuthority({
   fileSystem = fs,
   snapshotPath = sourceSnapshotPath(config),
   reviewSources = reviewDealHunterSources,
+  buildSourceHealth = buildAcquisitionSourceHealth,
   now = () => new Date(),
 } = {}) {
   const request = parseRequiredSourceAuthorityRevalidationRequest(input);
@@ -1204,7 +1320,7 @@ export async function revalidateRequiredSourceAuthority({
       throw sourceAuthorityError(503, 'source_authority_time_invalid', 'The source-authority acceptance time is unavailable.');
     }
     const acceptedAt = acceptedDate.toISOString();
-    const sourceHealth = buildAcquisitionSourceHealth({
+    const sourceHealth = buildSourceHealth({
       review,
       previousSnapshot,
       now: acceptedDate,
@@ -1265,7 +1381,7 @@ export async function revalidateRequiredSourceAuthority({
       },
       latestAuthorityRevalidation: provenance,
     };
-    const candidateHealth = buildAcquisitionSourceHealth({
+    const candidateHealth = buildSourceHealth({
       review,
       previousSnapshot: candidateSnapshot,
       now: acceptedDate,
@@ -1300,7 +1416,36 @@ export async function revalidateRequiredSourceAuthority({
       });
     } catch (error) {
       if (error instanceof RequiredSourceAuthorityRevalidationError) throw error;
-      throw sourceAuthorityError(503, 'source_authority_atomic_write_failed', 'The source-authority snapshot could not be atomically replaced.');
+      if (error?.replacementCompleted === true) {
+        throw await postReplacementSourceAuthorityError({
+          fileSystem,
+          filePath: snapshotPath,
+          request,
+          previousSnapshotSha256,
+          candidateSnapshotSha256: newSnapshotSha256,
+          backupId: backup.backupId,
+          code: 'source_authority_directory_sync_failed',
+          message: 'The source-authority snapshot was replaced but directory durability could not be confirmed.',
+          committedRecoveryCode: 'authority_committed_directory_sync_failed',
+        });
+      }
+      throw sourceAuthorityError(
+        503,
+        'source_authority_atomic_write_failed',
+        'The source-authority snapshot could not be atomically replaced.',
+        {
+          authorityState: 'unchanged',
+          safeToRetry: true,
+          recoveryCode: 'source_authority_atomic_write_failed',
+          reconciliation: sourceAuthorityReconciliation({
+            request,
+            previousSnapshotSha256,
+            candidateSnapshotSha256: newSnapshotSha256,
+            observedSnapshotSha256: previousSnapshotSha256,
+            backupId: backup.backupId,
+          }),
+        },
+      );
     }
 
     let persistedBytes;
@@ -1322,26 +1467,52 @@ export async function revalidateRequiredSourceAuthority({
         }
       }
     } catch {
-      throw sourceAuthorityError(503, 'source_authority_readback_failed', 'The persisted source-authority snapshot could not be verified.');
+      throw await postReplacementSourceAuthorityError({
+        fileSystem,
+        filePath: snapshotPath,
+        request,
+        previousSnapshotSha256,
+        candidateSnapshotSha256: newSnapshotSha256,
+        backupId: backup.backupId,
+        code: 'source_authority_readback_failed',
+        message: 'The persisted source-authority snapshot could not be verified after replacement.',
+        committedRecoveryCode: 'authority_committed_readback_failed',
+        observedBytes: persistedBytes,
+      });
     }
 
-    const postHealth = buildAcquisitionSourceHealth({
-      review,
-      previousSnapshot: persistedSnapshot,
-      now: acceptedDate,
-      config,
-    });
-    const targetSourceHealthy = !postHealth.issues.some((issue) => issue.sourceId === request.sourceId)
-      && postHealth.sources.some((source) => (
-        source.id === request.sourceId
-        && source.fetched
-        && !source.error
-        && source.rowCount === request.expectedCurrentRowCount
-      ));
-    if (!targetSourceHealthy) {
-      throw sourceAuthorityError(503, 'source_authority_post_health_failed', 'The target source did not validate against the accepted authority.');
+    let postHealth;
+    let targetSourceHealthy;
+    try {
+      postHealth = buildSourceHealth({
+        review,
+        previousSnapshot: persistedSnapshot,
+        now: acceptedDate,
+        config,
+      });
+      targetSourceHealthy = !postHealth.issues.some((issue) => issue.sourceId === request.sourceId)
+        && postHealth.sources.some((source) => (
+          source.id === request.sourceId
+          && source.fetched
+          && !source.error
+          && source.rowCount === request.expectedCurrentRowCount
+        ));
+      if (!targetSourceHealthy) throw new Error('Source-authority post-write health check failed.');
+      assertNoOtherRequiredSourceAuthorityIssue(postHealth, request.sourceId);
+    } catch {
+      throw await postReplacementSourceAuthorityError({
+        fileSystem,
+        filePath: snapshotPath,
+        request,
+        previousSnapshotSha256,
+        candidateSnapshotSha256: newSnapshotSha256,
+        backupId: backup.backupId,
+        code: 'source_authority_post_health_failed',
+        message: 'The target source did not validate against the accepted authority.',
+        committedRecoveryCode: 'authority_committed_post_health_failed',
+        observedBytes: persistedBytes,
+      });
     }
-    assertNoOtherRequiredSourceAuthorityIssue(postHealth, request.sourceId);
 
     try {
       await storage.insertSourceHealthSnapshot({
@@ -1361,8 +1532,9 @@ export async function revalidateRequiredSourceAuthority({
         },
       });
     } catch {
+      let restoredBytes;
       try {
-        await rollbackSourceAuthorityAfterAuditFailure({
+        restoredBytes = await rollbackSourceAuthorityAfterAuditFailure({
           fileSystem,
           filePath: snapshotPath,
           oldBytes: previousBytes,
@@ -1370,10 +1542,23 @@ export async function revalidateRequiredSourceAuthority({
           mode: fileMode,
         });
       } catch {
-        // The durable file provenance remains bounded if a concurrent change
-        // prevents safe rollback; never overwrite that newer authority.
+        // Bounded readback below classifies the file without another mutation.
       }
-      throw sourceAuthorityError(503, 'source_authority_audit_failed', 'Source-authority audit persistence failed.');
+      throw await postReplacementSourceAuthorityError({
+        fileSystem,
+        filePath: snapshotPath,
+        request,
+        previousSnapshotSha256,
+        candidateSnapshotSha256: newSnapshotSha256,
+        backupId: backup.backupId,
+        code: 'source_authority_audit_failed',
+        message: 'Source-authority audit persistence failed after replacement.',
+        committedRecoveryCode: 'authority_committed_audit_failed',
+        restoredRecoveryCode: 'authority_restored_after_audit_failure',
+        observedBytes: restoredBytes,
+        allowRestored: true,
+        rollbackAttempted: true,
+      });
     }
 
     return {
@@ -1386,6 +1571,8 @@ export async function revalidateRequiredSourceAuthority({
       backupId: backup.backupId,
       acceptedAt,
       reasonCode: request.reasonCode,
+      authorityState: 'committed',
+      safeToRetry: false,
       targetSourceHealthy,
     };
   });
