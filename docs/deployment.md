@@ -127,6 +127,40 @@ Then update DNS:
 - Application-consistent SQLite backups run daily at `03:30 America/Los_Angeles`, retain 14 verified bundles/days by default, and are visible in the admin-only Operations page.
 - Fly volume snapshots and application backup bundles are complementary. Follow [sqlite-recovery.md](/Users/Matt/Documents/uckele-group/docs/sqlite-recovery.md) for verification and restore drills.
 
+### Required-source authority revalidation
+
+Required-source authority revalidation is an exceptional administrator-only procedure for accepting a business-owner-confirmed, intentional reduction in the active/export-visible population of a configured required Google Sheet. It is not normal source review, a generic baseline setter, or a way to waive a source failure. Never lower the 70% guard and never edit the source-health JSON directly.
+
+Before using `POST /api/admin/deal-hunter/source-authority/revalidate`, an authorized operator must:
+
+1. obtain explicit business-owner confirmation that excluded rows are intentionally outside the active/export-visible population;
+2. perform a fresh, read-only source review and record the current positive row count;
+3. hash the exact current source-health snapshot bytes with SHA-256 and record its current authoritative row count;
+4. obtain the safe server-computed source fingerprint for the configured required Sheet identity, without printing or copying the configured URL into the request; and
+5. use an authenticated full-administrator session and submit only the exact expected fields.
+
+For example, using synthetic counts and synthetic 64-character digests:
+
+```json
+{
+  "sourceId": "sheet-0",
+  "expectedPreviousRowCount": 1000,
+  "expectedCurrentRowCount": 600,
+  "expectedSnapshotSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "expectedSourceFingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "confirmation": "ACCEPT_REQUIRED_SOURCE_POPULATION_REDUCTION",
+  "reasonCode": "business-confirmed-active-population-reset"
+}
+```
+
+The service recomputes the configured-source fingerprint, hashes the exact current snapshot bytes before any live fetch or write, verifies the previous count, fetches the current source through the read-only Deal Hunter source path, and requires the observed count to equal the expected current count. It accepts only a valid required-primary Google Sheet whose sole target issue is the existing greater-than-30% row-count reduction. Unknown, retired, optional, unavailable, zero-row, parser-error, identity-mismatched, or already-healthy sources fail closed. Viewer and unauthenticated sessions cannot invoke it.
+
+After validation, the service writes a unique no-overwrite backup of the exact old bytes beside the configured snapshot, verifies its SHA-256 and JSON, and only then performs a serialized same-directory atomic replacement. It rechecks the old snapshot SHA immediately before rename, preserves every unrelated source entry (including optional Deal OS authority), records one bounded latest revalidation provenance object plus source-health history evidence, reads the new snapshot back, and reruns source health. A stale SHA, changed fingerprint, changed count, backup failure, write failure, concurrent update, audit failure, or remaining required-source defect fails closed. The API response exposes only bounded identifiers, counts, digests, a backup identifier, time, reason, target-health result, and mutation-reconciliation state; it never exposes a source URL, snapshot contents, rows, credentials, recipients, or provider data.
+
+Failures before replacement report `authorityState: "unchanged"`; they mean that request did not change authority. Once rename succeeds, a later failure reports one of `committed`, `restored`, or `indeterminate` together with `safeToRetry`, a stable recovery code, and bounded previous/candidate/observed hashes when available. If the response reports `committed`, do not retry: perform bounded readback/reconciliation against the supplied hashes. If it reports `indeterminate`, do not retry: inspect the current snapshot hash against the previous and candidate hashes and preserve the verified backup evidence. If it reports `restored`, confirm the old SHA before preparing a fresh authorized request after the underlying failure is resolved. Never directly edit the cache or delete backup evidence. Revalidation still does not authorize deployment or a manual Daily Digest.
+
+After a successful revalidation, inspect the bounded audit/readback evidence and rerun the complete production preflight before making any separate release decision. This operation does not authorize deployment and must never trigger a manual Daily Digest, CIM/broker message, follow-up, Stage 2 action, scoring refresh, or CRM mutation.
+
 ## Before Go-Live
 
 ### Daily Deal Hunter Digest: authorized-release handoff

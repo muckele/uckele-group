@@ -2709,6 +2709,35 @@ async function collectSources(config, storage, { dealOsImportId = '' } = {}) {
   return sourceResults;
 }
 
+/**
+ * Fetches and parses the configured Deal Hunter sources without running
+ * opportunity identity, scoring, CRM, outreach, or source-observation writes.
+ * This is intentionally narrower than reviewDailyDeals for administrative
+ * source-authority verification.
+ */
+export async function reviewDealHunterSources({ storage = getStorage(), config = getConfig() } = {}) {
+  const generatedAt = new Date().toISOString();
+  const sourceResults = await collectSources(config, storage);
+  const includedResults = sourceResults.filter((result) => result.source.fetched && !result.source.error);
+  const includedSourceRows = includedResults.reduce(
+    (sum, result) => sum + Number(result.source.rowCount || 0),
+    0,
+  );
+  const allDeals = dedupeDeals(includedResults.flatMap((result) => result.deals));
+  const seenDeals = await loadDealHunterHistory(storage);
+  const dealsWithHistory = attachHistory(allDeals, seenDeals, generatedAt);
+
+  return {
+    generatedAt,
+    sources: sourceResults.map((result) => ({ ...result.source })),
+    totals: {
+      sourceRows: includedSourceRows,
+      normalizedDeals: allDeals.length,
+      newDeals: dealsWithHistory.filter((deal) => deal.isNew).length,
+    },
+  };
+}
+
 function uniqueStrings(values = []) {
   return [...new Set(values.map((value) => normalizeText(value, 1000)).filter(Boolean))];
 }

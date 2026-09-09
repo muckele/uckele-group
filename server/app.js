@@ -8,6 +8,8 @@ import { getStorage } from './storage/index.js';
 import {
   getAcquisitionCommandCenter,
   getSourceHealth,
+  parseRequiredSourceAuthorityRevalidationRequest,
+  revalidateRequiredSourceAuthority,
   updateAcquisitionCommandCenterRecord,
 } from './services/acquisitionCommandCenter.js';
 import {
@@ -500,8 +502,31 @@ function publicScoreRefreshResult(scoreRefresh) {
   return result;
 }
 
+const sourceAuthorityMutationStates = new Set(['unchanged', 'committed', 'restored', 'indeterminate']);
+
+function projectSourceAuthorityReconciliation(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const result = {};
+  for (const key of [
+    'expectedPreviousSnapshotSha256',
+    'candidateSnapshotSha256',
+    'observedSnapshotSha256',
+  ]) {
+    if (/^[a-f0-9]{64}$/.test(value[key] || '')) result[key] = value[key];
+  }
+  if (/^[A-Za-z0-9-]{1,200}$/.test(value.backupId || '')) result.backupId = value.backupId;
+  if (/^[a-z0-9-]{1,80}$/.test(value.sourceId || '')) result.sourceId = value.sourceId;
+  for (const key of ['previousRowCount', 'acceptedRowCount']) {
+    if (Number.isInteger(value[key]) && value[key] > 0) result[key] = value[key];
+  }
+  result.rollbackAttempted = value.rollbackAttempted === true;
+  result.rollbackSucceeded = value.rollbackSucceeded === true;
+  return Object.keys(result).length > 2 ? result : undefined;
+}
+
 export function createApp({
   dailyDealHunterRunner = runClaimedDailyDealHunterEmail,
+  sourceAuthorityRevalidator = revalidateRequiredSourceAuthority,
 } = {}) {
   const config = getConfig();
   const app = express();
@@ -1382,6 +1407,64 @@ export function createApp({
         success: true,
         review: session.role === 'viewer' ? sanitizeViewerDealHunterReview(browserReview) : browserReview,
       });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/source-authority/revalidate',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+
+      try {
+        const input = parseRequiredSourceAuthorityRevalidationRequest(request.body);
+        const result = await sourceAuthorityRevalidator({ input, actor: session });
+        response.json({
+          success: true,
+          sourceId: result.sourceId,
+          previousRowCount: result.previousRowCount,
+          acceptedRowCount: result.acceptedRowCount,
+          sourceFingerprint: result.sourceFingerprint,
+          previousSnapshotSha256: result.previousSnapshotSha256,
+          newSnapshotSha256: result.newSnapshotSha256,
+          backupId: result.backupId,
+          acceptedAt: result.acceptedAt,
+          reasonCode: result.reasonCode,
+          authorityState: 'committed',
+          safeToRetry: false,
+          targetSourceHealthy: Boolean(result.targetSourceHealthy),
+        });
+      } catch (error) {
+        if (error?.name !== 'RequiredSourceAuthorityRevalidationError') throw error;
+        const status = [400, 409, 422, 503].includes(error.status) ? error.status : 503;
+        const code = /^[a-z0-9_]{1,100}$/.test(error.code || '')
+          ? error.code
+          : 'source_authority_revalidation_failed';
+        const authorityState = sourceAuthorityMutationStates.has(error.authorityState)
+          ? error.authorityState
+          : 'unchanged';
+        const safeToRetry = ['committed', 'indeterminate'].includes(authorityState)
+          ? false
+          : error.safeToRetry === true;
+        const recoveryCode = /^[a-z0-9_]{1,100}$/.test(error.recoveryCode || '')
+          ? error.recoveryCode
+          : code;
+        const reconciliation = projectSourceAuthorityReconciliation(error.reconciliation);
+        response.status(status).json({
+          success: false,
+          code,
+          error: authorityState === 'unchanged'
+            ? 'Source-authority revalidation was rejected.'
+            : 'Required source authority needs reconciliation.',
+          authorityState,
+          safeToRetry,
+          recoveryCode,
+          ...(reconciliation ? { reconciliation } : {}),
+        });
+      }
     }),
   );
 

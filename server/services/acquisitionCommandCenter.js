@@ -1,10 +1,10 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { summarizeEmailEngagement } from './emailEvents.js';
-import { reviewDailyDeals } from './dealHunter.js';
+import { reviewDailyDeals, reviewDealHunterSources } from './dealHunter.js';
 import { normalizeDiligenceReview } from './submissions.js';
 import { buildFollowUpPrompt } from './workflow.js';
 import { commitCrmActivityMutation } from './activity.js';
@@ -41,6 +41,21 @@ const commandCenterLimit = 5000;
 const batchSize = 250;
 const sourceHealthWarningDropRatio = 0.7;
 const sourceHealthUpdateBufferMinutes = 30;
+const sourceAuthorityConfirmation = 'ACCEPT_REQUIRED_SOURCE_POPULATION_REDUCTION';
+const sourceAuthorityReasonCode = 'business-confirmed-active-population-reset';
+const sourceAuthorityFingerprintVersion = 'required-source-authority-v1';
+const sourceAuthorityActorFingerprintVersion = 'required-source-authority-actor-v1';
+const sourceAuthorityRequestKeys = [
+  'confirmation',
+  'expectedCurrentRowCount',
+  'expectedPreviousRowCount',
+  'expectedSnapshotSha256',
+  'expectedSourceFingerprint',
+  'reasonCode',
+  'sourceId',
+];
+const sourceAuthorityStates = new Set(['unchanged', 'committed', 'restored', 'indeterminate']);
+const sourceAuthorityRevalidationQueues = new Map();
 
 function normalizeText(value = '', maxLength = 1000) {
   return String(value || '')
@@ -852,6 +867,717 @@ function isRequiredDealHunterSource(source = {}) {
   return true;
 }
 
+export class RequiredSourceAuthorityRevalidationError extends Error {
+  constructor(status, code, message, {
+    authorityState = 'unchanged',
+    safeToRetry = false,
+    recoveryCode = code,
+    reconciliation,
+  } = {}) {
+    super(message);
+    this.name = 'RequiredSourceAuthorityRevalidationError';
+    this.status = status;
+    this.code = code;
+    this.authorityState = sourceAuthorityStates.has(authorityState) ? authorityState : 'indeterminate';
+    this.safeToRetry = ['committed', 'indeterminate'].includes(this.authorityState)
+      ? false
+      : safeToRetry === true;
+    this.recoveryCode = recoveryCode;
+    if (reconciliation) this.reconciliation = reconciliation;
+  }
+}
+
+function sourceAuthorityError(status, code, message, mutation) {
+  return new RequiredSourceAuthorityRevalidationError(status, code, message, mutation);
+}
+
+function hashSourceAuthorityBytes(value) {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+export function parseRequiredSourceAuthorityRevalidationRequest(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw sourceAuthorityError(400, 'invalid_source_authority_request', 'The source-authority request is invalid.');
+  }
+
+  const keys = Object.keys(value).sort();
+  if (keys.length !== sourceAuthorityRequestKeys.length
+    || keys.some((key, index) => key !== sourceAuthorityRequestKeys[index])) {
+    throw sourceAuthorityError(400, 'invalid_source_authority_request', 'The source-authority request contains invalid fields.');
+  }
+
+  if (!/^[a-z0-9-]{1,80}$/.test(value.sourceId)) {
+    throw sourceAuthorityError(400, 'invalid_source_authority_request', 'The source identifier is invalid.');
+  }
+  if (!Number.isInteger(value.expectedPreviousRowCount) || value.expectedPreviousRowCount <= 0
+    || !Number.isInteger(value.expectedCurrentRowCount) || value.expectedCurrentRowCount <= 0) {
+    throw sourceAuthorityError(400, 'invalid_source_authority_request', 'Expected source row counts must be positive integers.');
+  }
+  if (!/^[a-f0-9]{64}$/.test(value.expectedSnapshotSha256)
+    || !/^[a-f0-9]{64}$/.test(value.expectedSourceFingerprint)) {
+    throw sourceAuthorityError(400, 'invalid_source_authority_request', 'Expected source-authority fingerprints are invalid.');
+  }
+  if (value.confirmation !== sourceAuthorityConfirmation) {
+    throw sourceAuthorityError(400, 'invalid_source_authority_confirmation', 'Exact source-authority confirmation is required.');
+  }
+  if (value.reasonCode !== sourceAuthorityReasonCode) {
+    throw sourceAuthorityError(400, 'invalid_source_authority_reason', 'The source-authority reason code is invalid.');
+  }
+
+  return Object.fromEntries(sourceAuthorityRequestKeys.map((key) => [key, value[key]]));
+}
+
+function configuredRequiredSheetSource(sourceId, config) {
+  const match = /^sheet-(0|[1-9]\d*)$/.exec(sourceId);
+  const index = match ? Number(match[1]) : -1;
+  const configuredUrl = index >= 0 ? config?.dealHunter?.sheetCsvUrls?.[index] : '';
+
+  if (!configuredUrl) {
+    throw sourceAuthorityError(422, 'source_authority_source_ineligible', 'Only a configured required Google Sheet source can be revalidated.');
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(String(configuredUrl).trim());
+  } catch {
+    throw sourceAuthorityError(422, 'source_authority_source_ineligible', 'Only a configured required Google Sheet source can be revalidated.');
+  }
+
+  if (parsedUrl.protocol !== 'https:'
+    || parsedUrl.hostname !== 'docs.google.com'
+    || !parsedUrl.pathname.startsWith('/spreadsheets/d/')
+    || parsedUrl.username
+    || parsedUrl.password) {
+    throw sourceAuthorityError(422, 'source_authority_source_ineligible', 'Only a configured required Google Sheet source can be revalidated.');
+  }
+
+  return { sourceId, configuredUrl: String(configuredUrl).trim() };
+}
+
+export function getRequiredSourceAuthorityFingerprint(sourceId, config = getConfig()) {
+  const source = configuredRequiredSheetSource(sourceId, config);
+  return hashSourceAuthorityBytes(
+    `${sourceAuthorityFingerprintVersion}\0${source.sourceId}\0${source.configuredUrl}`,
+  );
+}
+
+function actorSourceAuthorityFingerprint(actor = {}) {
+  const identity = normalizeText(
+    actor.principal_id || actor.principalId || actor.id || actor.username || '',
+    320,
+  );
+  if (!identity) {
+    throw sourceAuthorityError(400, 'invalid_source_authority_actor', 'An authenticated administrator actor is required.');
+  }
+  return hashSourceAuthorityBytes(`${sourceAuthorityActorFingerprintVersion}\0${identity}`);
+}
+
+async function withSerializedSourceAuthoritySnapshot(snapshotPath, operation) {
+  const previous = sourceAuthorityRevalidationQueues.get(snapshotPath) || Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.catch(() => {}).then(() => gate);
+  sourceAuthorityRevalidationQueues.set(snapshotPath, tail);
+  await previous.catch(() => {});
+
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (sourceAuthorityRevalidationQueues.get(snapshotPath) === tail) {
+      sourceAuthorityRevalidationQueues.delete(snapshotPath);
+    }
+  }
+}
+
+async function syncSourceAuthorityDirectory(fileSystem, directory) {
+  let handle;
+  try {
+    handle = await fileSystem.open(directory, 'r');
+    await handle.sync();
+  } catch (error) {
+    if (!['EBADF', 'EINVAL', 'ENOTSUP'].includes(error?.code)) throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function writeExclusiveSourceAuthorityFile(fileSystem, filePath, bytes, mode) {
+  let handle;
+  try {
+    handle = await fileSystem.open(filePath, 'wx', mode);
+    await handle.writeFile(bytes);
+    await handle.sync();
+  } finally {
+    await handle?.close();
+  }
+}
+
+async function strictAtomicSourceAuthorityWrite({
+  fileSystem,
+  filePath,
+  bytes,
+  mode,
+  beforeRename,
+}) {
+  const directory = path.dirname(filePath);
+  const temporaryPath = path.join(
+    directory,
+    `.${path.basename(filePath)}.${randomUUID()}.tmp`,
+  );
+  let renamed = false;
+
+  try {
+    await writeExclusiveSourceAuthorityFile(fileSystem, temporaryPath, bytes, mode);
+    await beforeRename();
+    await fileSystem.rename(temporaryPath, filePath);
+    renamed = true;
+    await syncSourceAuthorityDirectory(fileSystem, directory);
+  } catch (error) {
+    if (!renamed && error instanceof RequiredSourceAuthorityRevalidationError) throw error;
+    const writeError = new Error('Source-authority atomic write failed.');
+    writeError.name = 'SourceAuthorityAtomicWriteError';
+    writeError.replacementCompleted = renamed;
+    throw writeError;
+  } finally {
+    if (!renamed) {
+      await fileSystem.unlink(temporaryPath).catch(() => {});
+    }
+  }
+}
+
+function sourceAuthorityReconciliation({
+  request,
+  previousSnapshotSha256,
+  candidateSnapshotSha256,
+  observedSnapshotSha256,
+  backupId,
+  rollbackAttempted = false,
+  rollbackSucceeded = false,
+}) {
+  return {
+    expectedPreviousSnapshotSha256: previousSnapshotSha256,
+    candidateSnapshotSha256,
+    ...(observedSnapshotSha256 ? { observedSnapshotSha256 } : {}),
+    backupId,
+    rollbackAttempted,
+    rollbackSucceeded,
+    sourceId: request.sourceId,
+    previousRowCount: request.expectedPreviousRowCount,
+    acceptedRowCount: request.expectedCurrentRowCount,
+  };
+}
+
+async function observeSourceAuthoritySnapshot({
+  fileSystem,
+  filePath,
+  previousSnapshotSha256,
+  candidateSnapshotSha256,
+  observedBytes,
+  allowRestored = false,
+}) {
+  let bytes = observedBytes;
+  try {
+    if (!bytes) bytes = await fileSystem.readFile(filePath);
+    const observedSnapshotSha256 = hashSourceAuthorityBytes(bytes);
+    if (observedSnapshotSha256 === candidateSnapshotSha256) {
+      return { authorityState: 'committed', observedSnapshotSha256 };
+    }
+    if (allowRestored && observedSnapshotSha256 === previousSnapshotSha256) {
+      return { authorityState: 'restored', observedSnapshotSha256 };
+    }
+    return { authorityState: 'indeterminate', observedSnapshotSha256 };
+  } catch {
+    return { authorityState: 'indeterminate' };
+  }
+}
+
+async function postReplacementSourceAuthorityError({
+  fileSystem,
+  filePath,
+  request,
+  previousSnapshotSha256,
+  candidateSnapshotSha256,
+  backupId,
+  code,
+  message,
+  committedRecoveryCode,
+  restoredRecoveryCode,
+  observedBytes,
+  allowRestored = false,
+  rollbackAttempted = false,
+}) {
+  const observation = await observeSourceAuthoritySnapshot({
+    fileSystem,
+    filePath,
+    previousSnapshotSha256,
+    candidateSnapshotSha256,
+    observedBytes,
+    allowRestored,
+  });
+  const rollbackSucceeded = rollbackAttempted && observation.authorityState === 'restored';
+  const recoveryCode = observation.authorityState === 'committed'
+    ? committedRecoveryCode
+    : observation.authorityState === 'restored'
+      ? restoredRecoveryCode
+      : 'authority_state_indeterminate';
+
+  return sourceAuthorityError(503, code, message, {
+    authorityState: observation.authorityState,
+    safeToRetry: false,
+    recoveryCode,
+    reconciliation: sourceAuthorityReconciliation({
+      request,
+      previousSnapshotSha256,
+      candidateSnapshotSha256,
+      observedSnapshotSha256: observation.observedSnapshotSha256,
+      backupId,
+      rollbackAttempted,
+      rollbackSucceeded,
+    }),
+  });
+}
+
+function boundedSourceAuthorityTimestamp(date) {
+  const timestamp = date.toISOString().replace(/[-:.]/g, '');
+  return timestamp.replace('Z', 'Z');
+}
+
+async function createSourceAuthorityBackup({
+  fileSystem,
+  filePath,
+  bytes,
+  expectedSha256,
+  mode,
+  acceptedAt,
+}) {
+  const backupDirectory = `${filePath}.backups`;
+  const backupId = `${boundedSourceAuthorityTimestamp(new Date(acceptedAt))}-${expectedSha256.slice(0, 12)}-${randomUUID()}`;
+  const backupPath = path.join(backupDirectory, `${backupId}.json`);
+
+  await fileSystem.mkdir(backupDirectory, { recursive: true });
+  await writeExclusiveSourceAuthorityFile(fileSystem, backupPath, bytes, mode);
+  await syncSourceAuthorityDirectory(fileSystem, backupDirectory);
+
+  const verifiedBytes = await fileSystem.readFile(backupPath);
+  if (hashSourceAuthorityBytes(verifiedBytes) !== expectedSha256
+    || !verifiedBytes.equals(bytes)) {
+    throw sourceAuthorityError(503, 'source_authority_backup_verification_failed', 'The source-authority backup could not be verified.');
+  }
+  try {
+    JSON.parse(verifiedBytes.toString('utf8'));
+  } catch {
+    throw sourceAuthorityError(503, 'source_authority_backup_verification_failed', 'The source-authority backup could not be verified.');
+  }
+
+  return { backupId, backupPath };
+}
+
+function liveSourceSnapshotEntry(source, previous, acceptedAt) {
+  return {
+    ...previous,
+    rowCount: source.rowCount,
+    name: source.name,
+    mode: source.mode,
+    required: true,
+    sourceRole: 'required-primary',
+    checkedAt: acceptedAt,
+    exportedAt: source.exportedAt || '',
+    importedAt: source.importedAt || '',
+    importedBy: source.importedBy || '',
+    importAgeHours: source.importAgeHours ?? null,
+    maxAgeHours: source.maxAgeHours ?? null,
+    scope: source.scope || '',
+    coverageLabel: source.coverageLabel || '',
+    expectedRowCount: source.expectedRowCount ?? null,
+    duplicateCount: Number(source.duplicateCount || 0),
+    stableIdCount: Number(source.stableIdCount || 0),
+    listingUrlCount: Number(source.listingUrlCount || 0),
+    coverageLimitReached: Boolean(source.coverageLimitReached),
+  };
+}
+
+function sameSourceAuthorityValue(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function assertNoOtherRequiredSourceAuthorityIssue(sourceHealth, targetSourceId) {
+  const blockingIssue = (sourceHealth.issues || []).find(
+    (issue) => issue.sourceId !== targetSourceId && issue.affectsHealth !== false,
+  );
+  if (blockingIssue) {
+    throw sourceAuthorityError(503, 'source_authority_other_required_issue', 'Another required source-health issue must be resolved first.');
+  }
+}
+
+function projectSourceAuthorityAuditIssue(issue) {
+  return {
+    sourceId: normalizeText(issue?.sourceId, 80),
+    tone: ['success', 'warning', 'danger'].includes(issue?.tone) ? issue.tone : 'warning',
+    affectsHealth: issue?.affectsHealth !== false,
+    sourceUnavailable: issue?.sourceUnavailable === true,
+  };
+}
+
+async function rollbackSourceAuthorityAfterAuditFailure({
+  fileSystem,
+  filePath,
+  oldBytes,
+  newSnapshotSha256,
+  mode,
+}) {
+  await strictAtomicSourceAuthorityWrite({
+    fileSystem,
+    filePath,
+    bytes: oldBytes,
+    mode,
+    beforeRename: async () => {
+      const currentBytes = await fileSystem.readFile(filePath);
+      if (hashSourceAuthorityBytes(currentBytes) !== newSnapshotSha256) {
+        throw sourceAuthorityError(409, 'source_authority_rollback_conflict', 'The source-authority snapshot changed during audit rollback.');
+      }
+    },
+  });
+  const restoredBytes = await fileSystem.readFile(filePath);
+  if (hashSourceAuthorityBytes(restoredBytes) !== hashSourceAuthorityBytes(oldBytes)) {
+    throw new Error('Source-authority rollback verification failed.');
+  }
+  return restoredBytes;
+}
+
+export async function revalidateRequiredSourceAuthority({
+  input,
+  actor,
+  config = getConfig(),
+  storage = getStorage(),
+  fileSystem = fs,
+  snapshotPath = sourceSnapshotPath(config),
+  reviewSources = reviewDealHunterSources,
+  buildSourceHealth = buildAcquisitionSourceHealth,
+  now = () => new Date(),
+} = {}) {
+  const request = parseRequiredSourceAuthorityRevalidationRequest(input);
+  configuredRequiredSheetSource(request.sourceId, config);
+  const sourceFingerprint = getRequiredSourceAuthorityFingerprint(request.sourceId, config);
+  if (sourceFingerprint !== request.expectedSourceFingerprint) {
+    throw sourceAuthorityError(409, 'source_authority_fingerprint_conflict', 'The configured source identity no longer matches the approved source.');
+  }
+  const actorFingerprint = actorSourceAuthorityFingerprint(actor);
+
+  return withSerializedSourceAuthoritySnapshot(snapshotPath, async () => {
+    let previousBytes;
+    try {
+      previousBytes = await fileSystem.readFile(snapshotPath);
+    } catch {
+      throw sourceAuthorityError(409, 'source_authority_snapshot_unavailable', 'The existing source-authority snapshot is unavailable.');
+    }
+    const previousSnapshotSha256 = hashSourceAuthorityBytes(previousBytes);
+    if (previousSnapshotSha256 !== request.expectedSnapshotSha256) {
+      throw sourceAuthorityError(409, 'source_authority_snapshot_conflict', 'The source-authority snapshot changed after approval.');
+    }
+
+    let previousSnapshot;
+    try {
+      previousSnapshot = JSON.parse(previousBytes.toString('utf8'));
+    } catch {
+      throw sourceAuthorityError(409, 'source_authority_snapshot_invalid', 'The existing source-authority snapshot is invalid.');
+    }
+    const previousSource = objectValue(previousSnapshot.sources)[request.sourceId];
+    if (!previousSource || Number(previousSource.rowCount || 0) <= 0) {
+      throw sourceAuthorityError(422, 'source_authority_previous_missing', 'A previous required-source authority is required.');
+    }
+    if (Number(previousSource.rowCount) !== request.expectedPreviousRowCount) {
+      throw sourceAuthorityError(409, 'source_authority_previous_count_conflict', 'The previous source row count changed after approval.');
+    }
+
+    let review;
+    try {
+      review = await reviewSources({ storage, config });
+    } catch {
+      throw sourceAuthorityError(503, 'source_authority_live_review_failed', 'The live required source could not be verified.');
+    }
+    const liveSource = (review?.sources || []).find((source) => source.id === request.sourceId);
+    if (!liveSource
+      || liveSource.required !== true
+      || liveSource.sourceRole !== 'required-primary'
+      || liveSource.fetched !== true
+      || Boolean(liveSource.error)
+      || Boolean(liveSource.requiresConfiguration)
+      || Number(liveSource.rowCount || 0) <= 0) {
+      throw sourceAuthorityError(503, 'source_authority_live_source_invalid', 'The live required source could not be verified.');
+    }
+    if (Number(liveSource.rowCount) !== request.expectedCurrentRowCount) {
+      throw sourceAuthorityError(409, 'source_authority_current_count_conflict', 'The live source row count changed after approval.');
+    }
+    if (request.expectedCurrentRowCount >= request.expectedPreviousRowCount * sourceHealthWarningDropRatio) {
+      throw sourceAuthorityError(422, 'source_authority_revalidation_not_required', 'The source does not require deliberate row-drop acceptance.');
+    }
+
+    const acceptedDate = now();
+    if (!(acceptedDate instanceof Date) || !Number.isFinite(acceptedDate.getTime())) {
+      throw sourceAuthorityError(503, 'source_authority_time_invalid', 'The source-authority acceptance time is unavailable.');
+    }
+    const acceptedAt = acceptedDate.toISOString();
+    const sourceHealth = buildSourceHealth({
+      review,
+      previousSnapshot,
+      now: acceptedDate,
+      config,
+    });
+    const targetIssues = (sourceHealth.issues || []).filter((issue) => issue.sourceId === request.sourceId);
+    if (targetIssues.length !== 1
+      || targetIssues[0].sourceUnavailable
+      || !/^Row count dropped from \d+ to \d+\.$/.test(targetIssues[0].message || '')) {
+      throw sourceAuthorityError(422, 'source_authority_target_issue_ineligible', 'The target source has a defect that cannot be accepted by this operation.');
+    }
+    assertNoOtherRequiredSourceAuthorityIssue(sourceHealth, request.sourceId);
+    if (typeof storage.insertSourceHealthSnapshot !== 'function') {
+      throw sourceAuthorityError(503, 'source_authority_audit_unavailable', 'Source-authority audit persistence is unavailable.');
+    }
+
+    let snapshotStat;
+    try {
+      snapshotStat = await fileSystem.stat(snapshotPath);
+    } catch {
+      throw sourceAuthorityError(503, 'source_authority_snapshot_stat_failed', 'The existing source-authority snapshot could not be verified.');
+    }
+    const fileMode = snapshotStat.mode & 0o777;
+    let backup;
+    try {
+      backup = await createSourceAuthorityBackup({
+        fileSystem,
+        filePath: snapshotPath,
+        bytes: previousBytes,
+        expectedSha256: previousSnapshotSha256,
+        mode: fileMode,
+        acceptedAt,
+      });
+    } catch (error) {
+      if (error instanceof RequiredSourceAuthorityRevalidationError) throw error;
+      throw sourceAuthorityError(503, 'source_authority_backup_failed', 'The source-authority backup could not be created.');
+    }
+
+    const targetStatus = sourceHealth.sources.find((source) => source.id === request.sourceId);
+    const provenance = {
+      eventType: 'required-source-authority-revalidated',
+      sourceId: request.sourceId,
+      previousRowCount: request.expectedPreviousRowCount,
+      acceptedRowCount: request.expectedCurrentRowCount,
+      sourceFingerprint,
+      previousSnapshotSha256,
+      acceptedAt,
+      reasonCode: request.reasonCode,
+      actorFingerprint,
+    };
+    const candidateSnapshot = {
+      ...previousSnapshot,
+      generatedAt: acceptedAt,
+      dateKey: sourceHealth.dateKey || previousSnapshot.dateKey || '',
+      sources: {
+        ...objectValue(previousSnapshot.sources),
+        [request.sourceId]: liveSourceSnapshotEntry(targetStatus, previousSource, acceptedAt),
+      },
+      latestAuthorityRevalidation: provenance,
+    };
+    const candidateHealth = buildSourceHealth({
+      review,
+      previousSnapshot: candidateSnapshot,
+      now: acceptedDate,
+      config,
+    });
+    const candidateTargetIssues = candidateHealth.issues.filter((issue) => issue.sourceId === request.sourceId);
+    if (candidateTargetIssues.length > 0) {
+      throw sourceAuthorityError(503, 'source_authority_post_health_failed', 'The target source did not validate against the candidate authority.');
+    }
+    assertNoOtherRequiredSourceAuthorityIssue(candidateHealth, request.sourceId);
+    candidateSnapshot.issues = candidateHealth.issues;
+    candidateSnapshot.totals = candidateHealth.totals;
+
+    const candidateBytes = Buffer.from(`${JSON.stringify(candidateSnapshot, null, 2)}\n`);
+    const newSnapshotSha256 = hashSourceAuthorityBytes(candidateBytes);
+    if (newSnapshotSha256 === previousSnapshotSha256) {
+      throw sourceAuthorityError(503, 'source_authority_identical_snapshot', 'The candidate source-authority snapshot is unexpectedly unchanged.');
+    }
+
+    try {
+      await strictAtomicSourceAuthorityWrite({
+        fileSystem,
+        filePath: snapshotPath,
+        bytes: candidateBytes,
+        mode: fileMode,
+        beforeRename: async () => {
+          const currentBytes = await fileSystem.readFile(snapshotPath);
+          if (hashSourceAuthorityBytes(currentBytes) !== request.expectedSnapshotSha256) {
+            throw sourceAuthorityError(409, 'source_authority_snapshot_conflict', 'The source-authority snapshot changed during verification.');
+          }
+        },
+      });
+    } catch (error) {
+      if (error instanceof RequiredSourceAuthorityRevalidationError) throw error;
+      if (error?.replacementCompleted === true) {
+        throw await postReplacementSourceAuthorityError({
+          fileSystem,
+          filePath: snapshotPath,
+          request,
+          previousSnapshotSha256,
+          candidateSnapshotSha256: newSnapshotSha256,
+          backupId: backup.backupId,
+          code: 'source_authority_directory_sync_failed',
+          message: 'The source-authority snapshot was replaced but directory durability could not be confirmed.',
+          committedRecoveryCode: 'authority_committed_directory_sync_failed',
+        });
+      }
+      throw sourceAuthorityError(
+        503,
+        'source_authority_atomic_write_failed',
+        'The source-authority snapshot could not be atomically replaced.',
+        {
+          authorityState: 'unchanged',
+          safeToRetry: true,
+          recoveryCode: 'source_authority_atomic_write_failed',
+          reconciliation: sourceAuthorityReconciliation({
+            request,
+            previousSnapshotSha256,
+            candidateSnapshotSha256: newSnapshotSha256,
+            observedSnapshotSha256: previousSnapshotSha256,
+            backupId: backup.backupId,
+          }),
+        },
+      );
+    }
+
+    let persistedBytes;
+    let persistedSnapshot;
+    try {
+      persistedBytes = await fileSystem.readFile(snapshotPath);
+      persistedSnapshot = JSON.parse(persistedBytes.toString('utf8'));
+      const backupBytes = await fileSystem.readFile(backup.backupPath);
+      if (hashSourceAuthorityBytes(persistedBytes) !== newSnapshotSha256
+        || hashSourceAuthorityBytes(backupBytes) !== previousSnapshotSha256
+        || Number(persistedSnapshot.sources?.[request.sourceId]?.rowCount) !== request.expectedCurrentRowCount
+        || persistedSnapshot.sources?.[request.sourceId]?.checkedAt !== acceptedAt) {
+        throw new Error('source authority readback mismatch');
+      }
+      for (const [sourceId, source] of Object.entries(objectValue(previousSnapshot.sources))) {
+        if (sourceId !== request.sourceId
+          && !sameSourceAuthorityValue(persistedSnapshot.sources?.[sourceId], source)) {
+          throw new Error('unrelated source authority changed');
+        }
+      }
+    } catch {
+      throw await postReplacementSourceAuthorityError({
+        fileSystem,
+        filePath: snapshotPath,
+        request,
+        previousSnapshotSha256,
+        candidateSnapshotSha256: newSnapshotSha256,
+        backupId: backup.backupId,
+        code: 'source_authority_readback_failed',
+        message: 'The persisted source-authority snapshot could not be verified after replacement.',
+        committedRecoveryCode: 'authority_committed_readback_failed',
+        observedBytes: persistedBytes,
+      });
+    }
+
+    let postHealth;
+    let targetSourceHealthy;
+    try {
+      postHealth = buildSourceHealth({
+        review,
+        previousSnapshot: persistedSnapshot,
+        now: acceptedDate,
+        config,
+      });
+      targetSourceHealthy = !postHealth.issues.some((issue) => issue.sourceId === request.sourceId)
+        && postHealth.sources.some((source) => (
+          source.id === request.sourceId
+          && source.fetched
+          && !source.error
+          && source.rowCount === request.expectedCurrentRowCount
+        ));
+      if (!targetSourceHealthy) throw new Error('Source-authority post-write health check failed.');
+      assertNoOtherRequiredSourceAuthorityIssue(postHealth, request.sourceId);
+    } catch {
+      throw await postReplacementSourceAuthorityError({
+        fileSystem,
+        filePath: snapshotPath,
+        request,
+        previousSnapshotSha256,
+        candidateSnapshotSha256: newSnapshotSha256,
+        backupId: backup.backupId,
+        code: 'source_authority_post_health_failed',
+        message: 'The target source did not validate against the accepted authority.',
+        committedRecoveryCode: 'authority_committed_post_health_failed',
+        observedBytes: persistedBytes,
+      });
+    }
+
+    try {
+      await storage.insertSourceHealthSnapshot({
+        id: randomUUID(),
+        created_at: acceptedAt,
+        healthy: Boolean(postHealth.healthy),
+        source_count: postHealth.sources.length,
+        issue_count: postHealth.issues.length,
+        snapshot: {
+          generatedAt: acceptedAt,
+          healthy: Boolean(postHealth.healthy),
+          issues: postHealth.issues.map(projectSourceAuthorityAuditIssue),
+          authorityRevalidation: {
+            ...provenance,
+            newSnapshotSha256,
+          },
+        },
+      });
+    } catch {
+      let restoredBytes;
+      try {
+        restoredBytes = await rollbackSourceAuthorityAfterAuditFailure({
+          fileSystem,
+          filePath: snapshotPath,
+          oldBytes: previousBytes,
+          newSnapshotSha256,
+          mode: fileMode,
+        });
+      } catch {
+        // Bounded readback below classifies the file without another mutation.
+      }
+      throw await postReplacementSourceAuthorityError({
+        fileSystem,
+        filePath: snapshotPath,
+        request,
+        previousSnapshotSha256,
+        candidateSnapshotSha256: newSnapshotSha256,
+        backupId: backup.backupId,
+        code: 'source_authority_audit_failed',
+        message: 'Source-authority audit persistence failed after replacement.',
+        committedRecoveryCode: 'authority_committed_audit_failed',
+        restoredRecoveryCode: 'authority_restored_after_audit_failure',
+        observedBytes: restoredBytes,
+        allowRestored: true,
+        rollbackAttempted: true,
+      });
+    }
+
+    return {
+      sourceId: request.sourceId,
+      previousRowCount: request.expectedPreviousRowCount,
+      acceptedRowCount: request.expectedCurrentRowCount,
+      sourceFingerprint,
+      previousSnapshotSha256,
+      newSnapshotSha256,
+      backupId: backup.backupId,
+      acceptedAt,
+      reasonCode: request.reasonCode,
+      authorityState: 'committed',
+      safeToRetry: false,
+      targetSourceHealthy,
+    };
+  });
+}
+
 export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}, generatedAt = new Date().toISOString()) {
   const previousSources = objectValue(previousSnapshot.sources);
   const issueSourceIds = new Set(
@@ -907,6 +1633,9 @@ export function buildNextSourceSnapshot(sourceHealth = {}, previousSnapshot = {}
     issues: (sourceHealth.issues || []).filter((issue) => !isRetiredAirtableSource(issue?.sourceId || '')),
     totals: sourceHealth.totals || {},
     sources: nextSources,
+    ...(previousSnapshot.latestAuthorityRevalidation
+      ? { latestAuthorityRevalidation: previousSnapshot.latestAuthorityRevalidation }
+      : {}),
   };
 }
 
