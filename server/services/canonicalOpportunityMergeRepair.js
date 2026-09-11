@@ -67,6 +67,7 @@ function verifiedBackupSummary(verification, requestedBundlePath) {
 
 export async function runCanonicalOpportunityMergeRepair({
   apply = false,
+  incident = '',
   exceptionId = '',
   survivorId = '',
   supersededId = '',
@@ -84,7 +85,12 @@ export async function runCanonicalOpportunityMergeRepair({
   if (storage?.provider !== 'sqlite') {
     throw new Error('Canonical opportunity merge repair is SQLite-only and refused the active storage provider.');
   }
-  const approval = getCanonicalOpportunityMergeApproval({ exceptionId, survivorId, supersededId });
+  const approval = getCanonicalOpportunityMergeApproval({
+    incident,
+    exceptionId,
+    survivorId,
+    supersededId,
+  });
   if (!storage.inspectDealHunterCanonicalOpportunityMerge) {
     throw new Error('SQLite canonical opportunity merge inspection is unavailable.');
   }
@@ -93,8 +99,9 @@ export async function runCanonicalOpportunityMergeRepair({
   if (!normalizedActor) throw new Error('Canonical opportunity merge requires an accountable actor.');
   if (normalizedReason.length < 20) throw new Error('Canonical opportunity merge requires a specific human reason.');
   if (apply) {
-    if (confirmation !== CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION) {
-      throw new Error(`Apply refused: pass the exact confirmation phrase ${CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION}.`);
+    const requiredConfirmation = approval.confirmation || CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION;
+    if (confirmation !== requiredConfirmation) {
+      throw new Error(`Apply refused: pass the exact confirmation phrase ${requiredConfirmation}.`);
     }
     if (!/^[a-f0-9]{64}$/.test(String(expectedPlanChecksum || ''))) {
       throw new Error('Apply refused: an exact 64-character dry-run plan checksum is required.');
@@ -156,6 +163,7 @@ export async function runCanonicalOpportunityMergeRepair({
     applyBlockers: [],
     generatedAt: now.toISOString(),
     approval: {
+      ...(approval.incident ? { incident: approval.incident } : {}),
       repairType: approval.repairType,
       approvalSchema: approval.approvalSchema,
       exceptionId: approval.exceptionId,

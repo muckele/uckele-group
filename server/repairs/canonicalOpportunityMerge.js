@@ -10,9 +10,15 @@ export const CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY_SCHEMA =
 const exceptionId = '8672a029686c9c6f7a6cdcc42972816127e34a991ae23fd123c262dc9180a571';
 const survivorId = 'opp_cd57a315-feaf-4158-a02e-4bdde97a922e';
 const supersededId = 'opp_c92d0c73-6a47-4fed-b528-6f310745e448';
+const garageIncident = 'garage-door-2026-09-11';
+const garageExceptionId = '9b0502e83bb7deee1791b87169873a00a8565c61c76f7ba47699618d4af500df';
+const garageSurvivorId = 'opp_e0237cfb-5d23-43ab-a2f6-c3e66ce188f6';
+const garageSupersededId = 'opp_a8289b2f-4be2-4a34-81d1-21b046b2f615';
 
 export const CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION =
   `MERGE ${supersededId} INTO ${survivorId} FOR EXCEPTION ${exceptionId}`;
+
+export const GARAGE_DOOR_CANONICAL_OPPORTUNITY_MERGE_INCIDENT = garageIncident;
 
 function deeplyFreeze(value) {
   if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
@@ -737,11 +743,13 @@ export function validateCanonicalOpportunityMergeRelationshipInventory({
   return true;
 }
 
-function alias(aliasType, aliasValue, opportunityId) {
+function alias(aliasType, aliasValue, opportunityId, { deterministicId = false } = {}) {
+  const aliasKey = `${aliasType}:${aliasValue}`;
   return {
+    ...(deterministicId ? { id: sha256(`cim-opportunity-alias:${aliasKey}`) } : {}),
     aliasType,
     aliasValue,
-    aliasKey: `${aliasType}:${aliasValue}`,
+    aliasKey,
     opportunityId,
   };
 }
@@ -824,7 +832,122 @@ const hvacApproval = deeplyFreeze({
   ],
 });
 
-const approvals = [hvacApproval];
+const garageAlias = (aliasType, aliasValue, opportunityId) => (
+  alias(aliasType, aliasValue, opportunityId, { deterministicId: true })
+);
+
+const garageDoorApproval = deeplyFreeze({
+  incident: garageIncident,
+  repairType: CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE,
+  approvalSchema: CANONICAL_OPPORTUNITY_MERGE_APPROVAL_SCHEMA,
+  exceptionId: garageExceptionId,
+  survivorId: garageSurvivorId,
+  supersededId: garageSupersededId,
+  confirmation: `MERGE ${garageSupersededId} INTO ${garageSurvivorId} FOR EXCEPTION ${garageExceptionId}`,
+  expectedOpportunityStatus: 'active',
+  expectedExceptionStatus: 'open',
+  expectedExceptionReason: 'conflicting-canonical-aliases',
+  expectedEvidenceVersion: 'cim-opportunity-v1',
+  expectedExceptionCandidateOpportunityIds: [],
+  expectedAliasOwnerIds: [garageSupersededId, garageSurvivorId],
+  expectedDependentCounts: {
+    opportunityScores: 1,
+    scoreEvidence: 12,
+    sourceObservations: 217,
+    historicalIdentityEvidence: 3,
+  },
+  expectedPreservedState: {
+    sourceObservations: {
+      supersededCount: 49,
+      survivorCount: 168,
+      collisionCount: 45,
+    },
+    opportunityScores: { supersededCount: 0, survivorCount: 1 },
+    scoreEvidence: { supersededCount: 0, survivorCount: 12 },
+    historicalIdentityEvidence: { count: 3 },
+  },
+  approvedFactsByOpportunityId: {
+    [garageSupersededId]: {
+      canonicalName: 'Garage Door Service Business With Property',
+      canonicalLocation: 'New York, NY, US',
+      identityLocation: 'new york ny us',
+      askingPrice: 1_499_000,
+      revenue: 1_142_235,
+      profit: 435_000,
+      recipientPresent: true,
+      listingIds: [],
+      listingUrl: '',
+    },
+    [garageSurvivorId]: {
+      canonicalName: 'Garage Door Service Business With Property',
+      canonicalLocation: 'Suffolk County, NY, US',
+      identityLocation: 'suffolk county ny us',
+      askingPrice: 1_499_000,
+      revenue: 1_142_235,
+      profit: 435_000,
+      recipientPresent: true,
+      listingIds: ['costar:2548773'],
+      listingUrl: 'https://bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773',
+    },
+  },
+  pairCompatibility: {
+    requireEqualCanonicalRecipient: true,
+    requireEqualRecipientEvidence: true,
+    requireEqualDescriptionEvidence: true,
+    requireEqualSourceIds: true,
+    requireEqualLocationEvidence: false,
+  },
+  expectedAliases: [
+    garageAlias('fingerprint-v1', 'a4088c416937e7a58de28ca885e22500be3234a556d7a808281bf4c4ddc50454', garageSupersededId),
+    garageAlias('deal-key', 'url:https://us.businessesforsale.com/us/garage-door-service-business-with-property.aspx', garageSurvivorId),
+    garageAlias('deal-key', 'url:https://www.bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773/', garageSurvivorId),
+    garageAlias('deal-key', 'url:https://www.businessmart.com/business-for-sale/bid/323470/garage-door-service-business-with-property-long-island-new-york', garageSurvivorId),
+    garageAlias('fingerprint-v1', '28b982c1e44b79cd7f58abac5d16801b7055a06b1486ba50141a4682d5ff6c9a', garageSurvivorId),
+    garageAlias('fingerprint-v1', '2e29d8de0c8acb0716388350ad5c622624434dce88d2d3a1b8f188e2fbdbbf5f', garageSurvivorId),
+    garageAlias('listing-id', 'costar:2548773', garageSurvivorId),
+    garageAlias('listing-url', 'https://bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773', garageSurvivorId),
+    garageAlias('listing-url', 'https://businessmart.com/business-for-sale/bid/323470/garage-door-service-business-with-property-long-island-new-york', garageSurvivorId),
+    garageAlias('listing-url', 'https://us.businessesforsale.com/us/garage-door-service-business-with-property.aspx', garageSurvivorId),
+    garageAlias('source-identity', 'url:bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773', garageSurvivorId),
+    garageAlias('source-identity', 'url:businessmart.com/business-for-sale/bid/323470/garage-door-service-business-with-property-long-island-new-york', garageSurvivorId),
+    garageAlias('source-identity', 'url:us.businessesforsale.com/us/garage-door-service-business-with-property.aspx', garageSurvivorId),
+  ],
+  sourceObservations: [
+    {
+      sourceRecordId: 'garage-businesses-for-sale',
+      listingUrl: 'https://us.businessesforsale.com/us/garage-door-service-business-with-property.aspx',
+      durableAliasKeys: [
+        'deal-key:url:https://us.businessesforsale.com/us/garage-door-service-business-with-property.aspx',
+        'listing-url:https://us.businessesforsale.com/us/garage-door-service-business-with-property.aspx',
+        'source-identity:url:us.businessesforsale.com/us/garage-door-service-business-with-property.aspx',
+      ],
+      identityAliases: ['url:us.businessesforsale.com/us/garage-door-service-business-with-property.aspx'],
+    },
+    {
+      sourceRecordId: 'garage-businessmart',
+      listingUrl: 'https://www.businessmart.com/business-for-sale/bid/323470/garage-door-service-business-with-property-long-island-new-york',
+      durableAliasKeys: [
+        'deal-key:url:https://www.businessmart.com/business-for-sale/bid/323470/garage-door-service-business-with-property-long-island-new-york',
+        'listing-url:https://businessmart.com/business-for-sale/bid/323470/garage-door-service-business-with-property-long-island-new-york',
+        'source-identity:url:businessmart.com/business-for-sale/bid/323470/garage-door-service-business-with-property-long-island-new-york',
+      ],
+      identityAliases: ['url:businessmart.com/business-for-sale/bid/323470/garage-door-service-business-with-property-long-island-new-york'],
+    },
+    {
+      sourceRecordId: 'garage-bizbuysell',
+      listingUrl: 'https://www.bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773/',
+      durableAliasKeys: [
+        'deal-key:url:https://www.bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773/',
+        'listing-id:costar:2548773',
+        'listing-url:https://bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773',
+        'source-identity:url:bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773',
+      ],
+      identityAliases: ['costar:2548773', 'url:bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773'],
+    },
+  ],
+});
+
+const approvals = [hvacApproval, garageDoorApproval];
 
 function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
@@ -900,12 +1023,14 @@ function validateOpportunity(opportunity, opportunityId, approval) {
   if (opportunity.metadata?.canonicalOpportunityMerge || opportunity.metadata?.mergedInto) {
     throw new Error(`Canonical opportunity ${opportunityId} already has supersession metadata.`);
   }
-  const facts = approval.approvedFacts;
+  const facts = approval.approvedFactsByOpportunityId?.[opportunityId] || approval.approvedFacts;
+  if (!facts) throw new Error(`Canonical opportunity ${opportunityId} has no checked-in fact approval.`);
   const snapshot = opportunity.metadata?.identitySnapshot || {};
   const exactFacts = [
     [opportunity.canonical_name, facts.canonicalName, 'canonical name'],
     [opportunity.canonical_location, facts.canonicalLocation, 'canonical location'],
     [snapshot.name, facts.identityName, 'identity name'],
+    [snapshot.location, facts.identityLocation, 'location evidence'],
     [snapshot.city, facts.city, 'city'],
     [snapshot.county, facts.county, 'county'],
     [snapshot.state, facts.state, 'state'],
@@ -916,9 +1041,14 @@ function validateOpportunity(opportunity, opportunityId, approval) {
     [snapshot.listingUrl, facts.listingUrl, 'listing URL'],
   ];
   for (const [actual, expected, label] of exactFacts) {
-    if (actual !== expected) throw new Error(`Canonical opportunity ${opportunityId} ${label} drifted from approval.`);
+    if (expected !== undefined && actual !== expected) {
+      throw new Error(`Canonical opportunity ${opportunityId} ${label} drifted from approval.`);
+    }
   }
-  if (String(snapshot.description || '').length !== facts.identityDescriptionLength) {
+  if (
+    facts.identityDescriptionLength !== undefined
+    && String(snapshot.description || '').length !== facts.identityDescriptionLength
+  ) {
     throw new Error(`Canonical opportunity ${opportunityId} description evidence drifted from approval.`);
   }
   if (facts.recipientPresent && (!opportunity.canonical_recipient || !snapshot.recipient)) {
@@ -929,21 +1059,31 @@ function validateOpportunity(opportunity, opportunityId, approval) {
   }
 }
 
-function validateOpportunityPairCompatibility(survivor, superseded) {
+function validateOpportunityPairCompatibility(survivor, superseded, approval) {
   const survivorSnapshot = survivor?.metadata?.identitySnapshot || {};
   const supersededSnapshot = superseded?.metadata?.identitySnapshot || {};
+  const policy = approval?.pairCompatibility || {
+    requireEqualCanonicalRecipient: true,
+    requireEqualRecipientEvidence: true,
+    requireEqualDescriptionEvidence: true,
+    requireEqualLocationEvidence: true,
+    requireEqualSourceIds: true,
+  };
   const comparisons = [
-    [survivor?.canonical_recipient, superseded?.canonical_recipient, 'canonical recipient'],
-    [survivorSnapshot.recipient, supersededSnapshot.recipient, 'recipient evidence'],
-    [survivorSnapshot.description, supersededSnapshot.description, 'description evidence'],
-    [survivorSnapshot.location, supersededSnapshot.location, 'location evidence'],
+    [policy.requireEqualCanonicalRecipient, survivor?.canonical_recipient, superseded?.canonical_recipient, 'canonical recipient'],
+    [policy.requireEqualRecipientEvidence, survivorSnapshot.recipient, supersededSnapshot.recipient, 'recipient evidence'],
+    [policy.requireEqualDescriptionEvidence, survivorSnapshot.description, supersededSnapshot.description, 'description evidence'],
+    [policy.requireEqualLocationEvidence, survivorSnapshot.location, supersededSnapshot.location, 'location evidence'],
   ];
-  for (const [survivorValue, supersededValue, label] of comparisons) {
-    if (survivorValue !== supersededValue) {
+  for (const [required, survivorValue, supersededValue, label] of comparisons) {
+    if (required && survivorValue !== supersededValue) {
       throw new Error(`The approved canonical opportunity pair is no longer compatible: ${label} diverged.`);
     }
   }
-  if (!sameStringSet(survivorSnapshot.sourceIds || [], supersededSnapshot.sourceIds || [])) {
+  if (
+    policy.requireEqualSourceIds
+    && !sameStringSet(survivorSnapshot.sourceIds || [], supersededSnapshot.sourceIds || [])
+  ) {
     throw new Error('The approved canonical opportunity pair is no longer compatible: source evidence diverged.');
   }
 }
@@ -966,19 +1106,24 @@ function validateException(identityException, approval) {
   if (identityException.evidence_version !== approval.expectedEvidenceVersion) {
     throw new Error('The approved identity exception evidence version drifted.');
   }
-  if (!sameStringSet(identityException.candidate_opportunity_ids || [], [approval.survivorId, approval.supersededId])) {
+  const expectedCandidateIds = approval.expectedExceptionCandidateOpportunityIds
+    ?? [approval.survivorId, approval.supersededId];
+  if (!sameStringSet(identityException.candidate_opportunity_ids || [], expectedCandidateIds)) {
     throw new Error('The approved identity exception candidate set drifted.');
   }
 }
 
 function validateAliases(inspection, approval) {
+  const validateIds = approval.expectedAliases.some((item) => item.id);
   const expected = sortedAliases(approval.expectedAliases).map((item) => ({
+    ...(validateIds ? { id: item.id } : {}),
     aliasType: item.aliasType,
     aliasValue: item.aliasValue,
     aliasKey: item.aliasKey,
     opportunityId: item.opportunityId,
   }));
   const observed = sortedAliases(inspection.aliases).map((item) => ({
+    ...(validateIds ? { id: item.id } : {}),
     aliasType: item.alias_type,
     aliasValue: item.alias_value,
     aliasKey: item.alias_key,
@@ -996,7 +1141,11 @@ function validateAliases(inspection, approval) {
       throw new Error(`Approved alias ${approvedAlias.aliasKey} has missing, duplicate, or third-party ownership.`);
     }
     const [row] = rows;
-    if (row.opportunity_id !== approvedAlias.opportunityId || row.alias_key !== approvedAlias.aliasKey) {
+    if (
+      row.opportunity_id !== approvedAlias.opportunityId
+      || row.alias_key !== approvedAlias.aliasKey
+      || (approvedAlias.id && row.id !== approvedAlias.id)
+    ) {
       throw new Error(`Approved alias ${approvedAlias.aliasKey} changed owner or identity key.`);
     }
   }
@@ -1012,10 +1161,53 @@ function validateManifestNamespace(inspection, approval) {
   }
 }
 
-function validateDependentState(dependentState = {}) {
-  const nonzero = Object.entries(dependentState.counts || {}).filter(([, count]) => Number(count) !== 0);
-  if (nonzero.length > 0) {
-    throw new Error(`Canonical opportunity merge found unexpected dependent state: ${nonzero.map(([name]) => name).join(', ')}.`);
+function validateDependentState(dependentState = {}, approval = {}) {
+  const expected = approval.expectedDependentCounts || {};
+  const drifted = Object.entries(dependentState.counts || {}).filter(([name, count]) => (
+    Number(count) !== Number(expected[name] || 0)
+  ));
+  const missingExpected = Object.keys(expected).filter((name) => !(name in (dependentState.counts || {})));
+  if (drifted.length > 0 || missingExpected.length > 0) {
+    throw new Error(`Canonical opportunity merge found unexpected dependent state: ${[
+      ...drifted.map(([name]) => name),
+      ...missingExpected,
+    ].join(', ')}.`);
+  }
+}
+
+function validatePreservedIncidentState(state, approval) {
+  const expected = approval.expectedPreservedState;
+  if (!expected) return;
+  const digestValid = (value) => /^[a-f0-9]{64}$/.test(String(value || ''));
+  for (const category of ['sourceObservations', 'opportunityScores', 'scoreEvidence']) {
+    const actual = state?.[category];
+    const approved = expected[category];
+    if (
+      !actual
+      || actual.superseded?.opportunityId !== approval.supersededId
+      || actual.survivor?.opportunityId !== approval.survivorId
+      || actual.superseded?.count !== approved.supersededCount
+      || actual.survivor?.count !== approved.survivorCount
+      || !digestValid(actual.superseded?.digest)
+      || !digestValid(actual.survivor?.digest)
+    ) {
+      throw new Error(`Canonical opportunity merge ${category} preservation topology drifted.`);
+    }
+  }
+  if (state.sourceObservations.collisionCount !== expected.sourceObservations.collisionCount) {
+    throw new Error('Canonical opportunity merge source observation collision topology drifted.');
+  }
+  const history = state?.historicalIdentityEvidence;
+  if (
+    !history
+    || history.count !== expected.historicalIdentityEvidence.count
+    || history.records?.length !== expected.historicalIdentityEvidence.count
+    || !digestValid(history.digest)
+    || history.records.some((record) => (
+      !record.id || !validDate(record.firstSeenAt) || !validDate(record.lastSeenAt)
+    ))
+  ) {
+    throw new Error('Canonical opportunity merge seen-history preservation topology drifted.');
   }
 }
 
@@ -1181,13 +1373,14 @@ export function validateCanonicalOpportunityMergeReplayManifest({
   try {
     validateOpportunity(plan.opportunities?.survivor, approval.survivorId, approval);
     validateOpportunity(plan.opportunities?.superseded, approval.supersededId, approval);
-    validateOpportunityPairCompatibility(plan.opportunities?.survivor, plan.opportunities?.superseded);
+    validateOpportunityPairCompatibility(plan.opportunities?.survivor, plan.opportunities?.superseded, approval);
     validateException(plan.identityException, approval);
     validateAliases({
       aliases: plan.observedAliases,
       globalAliasOwnership: plan.globalAliasOwnership,
     }, approval);
-    validateDependentState(plan.dependentState);
+    validateDependentState(plan.dependentState, approval);
+    validatePreservedIncidentState(plan.preservedIncidentState, approval);
     validatePreservedOperationalState(plan.preservedOperationalState);
     validateAuthorityGrantingOperationalState(plan.authorityGrantingOperationalState);
     validateCanonicalOpportunityMergeRelationshipInventory({ inspection: plan });
@@ -1203,6 +1396,9 @@ export function validateCanonicalOpportunityMergeReplayManifest({
     || plan.resolutionSafety?.approvedObservationCount !== approval.sourceObservations.length
     || plan.resolutionSafety?.expectedFinalAliasOwner !== approval.survivorId
     || plan.resolutionSafety?.expectedSupersededAliasCount !== 0
+    || (approval.expectedAliasOwnerIds
+      && stableCanonicalJson(plan.resolutionSafety?.aliasDerivedExpectedOwnerIds)
+        !== stableCanonicalJson([...approval.expectedAliasOwnerIds].sort()))
     || plan.mutation?.survivorStatus !== 'active'
     || plan.mutation?.supersededStatus !== 'superseded'
     || plan.mutation?.exceptionStatus !== 'resolved'
@@ -1251,11 +1447,12 @@ export function buildCanonicalOpportunityMergePlan({ approval, inspection, actor
   const superseded = opportunityById.get(approval.supersededId);
   validateOpportunity(survivor, approval.survivorId, approval);
   validateOpportunity(superseded, approval.supersededId, approval);
-  validateOpportunityPairCompatibility(survivor, superseded);
+  validateOpportunityPairCompatibility(survivor, superseded, approval);
   validateException(inspection.identityException, approval);
   validateAliases(inspection, approval);
   validateManifestNamespace(inspection, approval);
-  validateDependentState(inspection.dependentState);
+  validateDependentState(inspection.dependentState, approval);
+  validatePreservedIncidentState(inspection.preservedIncidentState, approval);
   validatePreservedOperationalState(inspection.preservedOperationalState);
   validateAuthorityGrantingOperationalState(inspection.authorityGrantingOperationalState);
   validateCanonicalOpportunityMergeRelationshipInventory({ inspection });
@@ -1284,6 +1481,7 @@ export function buildCanonicalOpportunityMergePlan({ approval, inspection, actor
     globalAliasOwnership: sortedAliases(inspection.globalAliasOwnership),
     aliasMoves,
     dependentState: inspection.dependentState,
+    ...(approval.expectedPreservedState ? { preservedIncidentState: inspection.preservedIncidentState } : {}),
     preservedOperationalState: inspection.preservedOperationalState,
     authorityGrantingOperationalState: inspection.authorityGrantingOperationalState,
     relationshipInventory: canonicalOpportunityMergeRelationshipInventorySummary(),
@@ -1291,6 +1489,9 @@ export function buildCanonicalOpportunityMergePlan({ approval, inspection, actor
       approvedObservationCount: approval.sourceObservations.length,
       expectedFinalAliasOwner: approval.survivorId,
       expectedSupersededAliasCount: 0,
+      ...(approval.expectedAliasOwnerIds ? {
+        aliasDerivedExpectedOwnerIds: [...approval.expectedAliasOwnerIds].sort(),
+      } : {}),
       structuralInvariantSatisfied: true,
       blockers: [],
     },
@@ -1315,12 +1516,23 @@ export function buildCanonicalOpportunityMergePlan({ approval, inspection, actor
 }
 
 export function getCanonicalOpportunityMergeApproval({
+  incident: requestedIncident = '',
   exceptionId: requestedExceptionId = '',
   survivorId: requestedSurvivorId = '',
   supersededId: requestedSupersededId = '',
 } = {}) {
+  const incident = String(requestedIncident).trim();
+  if (incident) {
+    if (requestedExceptionId || requestedSurvivorId || requestedSupersededId) {
+      throw new Error('The canonical opportunity merge incident selector does not accept opportunity IDs or an exception ID.');
+    }
+    const incidentMatch = approvals.find((approval) => approval.incident === incident);
+    if (!incidentMatch) throw new Error('This is not an approved canonical opportunity merge incident.');
+    return incidentMatch;
+  }
   const match = approvals.find((approval) => (
-    approval.exceptionId === String(requestedExceptionId).trim()
+    !approval.incident
+    && approval.exceptionId === String(requestedExceptionId).trim()
     && approval.survivorId === String(requestedSurvivorId).trim()
     && approval.supersededId === String(requestedSupersededId).trim()
   ));
