@@ -38,6 +38,7 @@ import {
   canonicalOpportunityMergeRelationshipSchemaPresenceByTable,
   getCanonicalOpportunityMergeApproval,
   isCanonicalOpportunityMergeRelationshipColumn,
+  stableCanonicalJson,
   validateCanonicalOpportunityMergeReplayManifest,
 } from '../repairs/canonicalOpportunityMerge.js';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
@@ -1171,6 +1172,65 @@ function canonicalMergeRecordIds(table, rows = [], idColumn = 'id') {
   return uniqueCanonicalMergeValues(rows.map((row) => `${table}:${row[idColumn]}`));
 }
 
+function canonicalMergeRowsDigest(rows = []) {
+  const canonicalRows = rows
+    .map((row) => stableCanonicalJson(row))
+    .sort();
+  return createHash('sha256').update(stableCanonicalJson(canonicalRows)).digest('hex');
+}
+
+function inspectCanonicalMergePreservedIncidentState({
+  approval,
+  opportunityScores,
+  scoreEvidence,
+  sourceObservations,
+  historicalIdentityEvidence,
+}) {
+  if (!approval.expectedPreservedState) return null;
+  const ownerState = (rows) => {
+    const supersededRows = rows.filter((row) => row.opportunity_id === approval.supersededId);
+    const survivorRows = rows.filter((row) => row.opportunity_id === approval.survivorId);
+    return {
+      superseded: {
+        opportunityId: approval.supersededId,
+        count: supersededRows.length,
+        digest: canonicalMergeRowsDigest(supersededRows),
+      },
+      survivor: {
+        opportunityId: approval.survivorId,
+        count: survivorRows.length,
+        digest: canonicalMergeRowsDigest(survivorRows),
+      },
+    };
+  };
+  const sourceObservationState = ownerState(sourceObservations);
+  const supersededKeys = new Set(sourceObservations
+    .filter((row) => row.opportunity_id === approval.supersededId)
+    .map((row) => `${row.source_id}\u0000${row.source_record_id}\u0000${row.field}`));
+  const survivorKeys = new Set(sourceObservations
+    .filter((row) => row.opportunity_id === approval.survivorId)
+    .map((row) => `${row.source_id}\u0000${row.source_record_id}\u0000${row.field}`));
+  return {
+    sourceObservations: {
+      ...sourceObservationState,
+      collisionCount: [...supersededKeys].filter((key) => survivorKeys.has(key)).length,
+    },
+    opportunityScores: ownerState(opportunityScores),
+    scoreEvidence: ownerState(scoreEvidence),
+    historicalIdentityEvidence: {
+      count: historicalIdentityEvidence.length,
+      records: [...historicalIdentityEvidence]
+        .sort((left, right) => String(left.id).localeCompare(String(right.id)))
+        .map((row) => ({
+          id: row.id,
+          firstSeenAt: row.first_seen_at,
+          lastSeenAt: row.last_seen_at,
+        })),
+      digest: canonicalMergeRowsDigest(historicalIdentityEvidence),
+    },
+  };
+}
+
 function canonicalMergeApprovedListingUrls(approval) {
   const dealKeys = approval.expectedAliases
     .filter((item) => item.aliasType === 'deal-key')
@@ -1439,7 +1499,18 @@ function inspectCanonicalMergeDependentState(database, approval) {
   };
   const counts = Object.fromEntries(Object.entries(records).map(([category, ids]) => [category, ids.length]));
   counts.legacyDealHunterCandidates = legacyDealHunterCandidates.count;
-  return { counts, records };
+  const preservedIncidentState = inspectCanonicalMergePreservedIncidentState({
+    approval,
+    opportunityScores,
+    scoreEvidence,
+    sourceObservations,
+    historicalIdentityEvidence,
+  });
+  return {
+    counts,
+    records,
+    ...(preservedIncidentState ? { preservedIncidentState } : {}),
+  };
 }
 
 function inspectCanonicalMergeOperationalState(database, approval) {
@@ -1532,6 +1603,7 @@ function inspectCanonicalOpportunityMergeState(database, approval) {
     .map(normalizeDealHunterRepairManifestRow)
     .filter((manifest) => canonicalMergeManifestClaimsTuple(manifest, approval));
   const operationalState = inspectCanonicalMergeOperationalState(database, approval);
+  const dependentState = inspectCanonicalMergeDependentState(database, approval);
   return {
     opportunities,
     identityException,
@@ -1539,17 +1611,22 @@ function inspectCanonicalOpportunityMergeState(database, approval) {
     globalAliasOwnership,
     manifestAtId,
     typedManifests,
-    dependentState: inspectCanonicalMergeDependentState(database, approval),
+    dependentState,
+    ...(dependentState.preservedIncidentState
+      ? { preservedIncidentState: dependentState.preservedIncidentState }
+      : {}),
     ...operationalState,
   };
 }
 
 function checkedCanonicalOpportunityMergeApproval(approval = {}) {
-  return getCanonicalOpportunityMergeApproval({
-    exceptionId: approval.exceptionId,
-    survivorId: approval.survivorId,
-    supersededId: approval.supersededId,
-  });
+  return getCanonicalOpportunityMergeApproval(approval.incident
+    ? { incident: approval.incident }
+    : {
+      exceptionId: approval.exceptionId,
+      survivorId: approval.survivorId,
+      supersededId: approval.supersededId,
+    });
 }
 
 const canonicalOpportunityMergeRequiredSchema = Object.freeze({
@@ -1899,13 +1976,14 @@ function canonicalMergeManifestClaimsTuple(manifest, approval) {
 function assertCanonicalMergeAliasPostconditions(database, approval) {
   const canonicalIds = [approval.survivorId, approval.supersededId];
   const ownedAliases = database.prepare(`
-    SELECT alias_key, alias_type, alias_value, opportunity_id
+    SELECT id, alias_key, alias_type, alias_value, opportunity_id
     FROM deal_hunter_opportunity_aliases
     WHERE opportunity_id IN (${placeholders(canonicalIds.length)})
     ORDER BY alias_key, opportunity_id
   `).all(...canonicalIds);
   const expectedOwnedAliases = approval.expectedAliases
     .map((item) => ({
+      ...(item.id ? { id: item.id } : {}),
       alias_key: item.aliasKey,
       alias_type: item.aliasType,
       alias_value: item.aliasValue,
@@ -1916,6 +1994,7 @@ function assertCanonicalMergeAliasPostconditions(database, approval) {
     ownedAliases.length !== expectedOwnedAliases.length
     || ownedAliases.some((row, index) => (
       row.alias_key !== expectedOwnedAliases[index].alias_key
+      || (expectedOwnedAliases[index].id && row.id !== expectedOwnedAliases[index].id)
       || row.alias_type !== expectedOwnedAliases[index].alias_type
       || row.alias_value !== expectedOwnedAliases[index].alias_value
       || row.opportunity_id !== expectedOwnedAliases[index].opportunity_id
@@ -1933,6 +2012,7 @@ function assertCanonicalMergeAliasPostconditions(database, approval) {
     const rows = findOwners.all(expected.aliasType, expected.aliasValue);
     if (
       rows.length !== 1
+      || (expected.id && rows[0].id !== expected.id)
       || rows[0].opportunity_id !== approval.survivorId
       || rows[0].alias_key !== expected.aliasKey
     ) {
@@ -2006,7 +2086,10 @@ function validateCanonicalMergeFinalState(database, {
   `).get(approval.exceptionId));
   const exceptionMerge = identityException?.metadata?.canonicalOpportunityMerge;
   const candidateIds = uniqueCanonicalMergeValues(identityException?.candidate_opportunity_ids);
-  const expectedCandidateIds = uniqueCanonicalMergeValues([approval.survivorId, approval.supersededId]);
+  const expectedCandidateIds = uniqueCanonicalMergeValues(
+    approval.expectedExceptionCandidateOpportunityIds
+      ?? [approval.survivorId, approval.supersededId],
+  );
   if (
     identityException?.status !== 'resolved'
     || identityException?.updated_at !== appliedAt
@@ -2052,9 +2135,18 @@ function validateCanonicalMergeFinalState(database, {
     throw new Error('Canonical opportunity merge manifest failed typed final validation.');
   }
   const dependentState = inspectCanonicalMergeDependentState(database, approval);
-  const unexpected = Object.entries(dependentState.counts).filter(([, count]) => count !== 0);
+  const unexpected = Object.entries(dependentState.counts).filter(([name, count]) => (
+    count !== Number(approval.expectedDependentCounts?.[name] || 0)
+  ));
   if (unexpected.length > 0) {
     throw new Error(`Canonical opportunity merge final state acquired unexpected dependents: ${unexpected.map(([name]) => name).join(', ')}.`);
+  }
+  if (
+    approval.expectedPreservedState
+    && stableCanonicalJson(dependentState.preservedIncidentState)
+      !== stableCanonicalJson(manifest.manifest?.plan?.preservedIncidentState)
+  ) {
+    throw new Error('Canonical opportunity merge final state changed approved preserved incident rows.');
   }
   return { survivor, superseded, identityException, aliases, manifest, dependentState };
 }
@@ -8279,7 +8371,7 @@ export function createSqliteStorage(config) {
       nowIso = '',
     } = {}) {
       const checkedApproval = checkedCanonicalOpportunityMergeApproval(approval);
-      if (confirmation !== CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION) {
+      if (confirmation !== (checkedApproval.confirmation || CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION)) {
         throw new Error('Canonical opportunity merge transaction requires the exact confirmation phrase.');
       }
       if (!/^[a-f0-9]{64}$/.test(String(expectedPlanChecksum || ''))) {

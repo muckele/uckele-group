@@ -102,6 +102,11 @@ const fixtureNow = new Date('2026-08-26T20:00:00.000Z');
 const fixtureNowIso = fixtureNow.toISOString();
 const fixtureActor = 'incident-owner@example.test';
 const fixtureReason = 'Reviewed syndicated HVAC listings are the same business; preserve the approved survivor.';
+const garageIncident = 'garage-door-2026-09-11';
+const garageExceptionId = '9b0502e83bb7deee1791b87169873a00a8565c61c76f7ba47699618d4af500df';
+const garageSurvivorId = 'opp_e0237cfb-5d23-43ab-a2f6-c3e66ce188f6';
+const garageSupersededId = 'opp_a8289b2f-4be2-4a34-81d1-21b046b2f615';
+const garageReason = 'Reviewed Garage Door identities are one business; preserve all historical observations and score evidence.';
 const cliBaseArgs = [
   '--exception-id', exceptionId,
   '--survivor-id', survivorId,
@@ -110,6 +115,117 @@ const cliBaseArgs = [
   '--reason', fixtureReason,
 ];
 const repairStoragePaths = new WeakMap();
+
+test('Garage repair requires the checked-in incident selector and exposes the exact reviewed tuple', () => {
+  const approval = getCanonicalOpportunityMergeApproval({ incident: 'garage-door-2026-09-11' });
+
+  assert.equal(approval.incident, 'garage-door-2026-09-11');
+  assert.equal(approval.exceptionId, '9b0502e83bb7deee1791b87169873a00a8565c61c76f7ba47699618d4af500df');
+  assert.equal(approval.survivorId, 'opp_e0237cfb-5d23-43ab-a2f6-c3e66ce188f6');
+  assert.equal(approval.supersededId, 'opp_a8289b2f-4be2-4a34-81d1-21b046b2f615');
+  assert.equal(approval.expectedAliases.length, 13);
+  assert.equal(approval.expectedAliases.filter(({ opportunityId }) => opportunityId === approval.supersededId).length, 1);
+  assert.deepEqual(approval.expectedDependentCounts, {
+    opportunityScores: 1,
+    scoreEvidence: 12,
+    sourceObservations: 217,
+    historicalIdentityEvidence: 3,
+  });
+  assert.deepEqual(approval.expectedExceptionCandidateOpportunityIds, []);
+  assert.equal(
+    approval.expectedAliases.every(({ id, aliasKey }) => (
+      id === createHash('sha256').update(`cim-opportunity-alias:${aliasKey}`).digest('hex')
+    )),
+    true,
+  );
+  assert.throws(
+    () => getCanonicalOpportunityMergeApproval({
+      incident: 'garage-door-2026-09-11',
+      survivorId: approval.supersededId,
+      supersededId: approval.survivorId,
+    }),
+    /incident selector.*does not accept opportunity IDs/i,
+  );
+});
+
+test('Garage CLI selects only the checked-in incident and rejects arbitrary tuple overrides', () => {
+  const parsed = parseCanonicalOpportunityMergeArgs([
+    '--incident', garageIncident,
+    '--actor', fixtureActor,
+    '--reason', garageReason,
+  ]);
+  assert.equal(parsed.incident, garageIncident);
+  assert.equal(parsed.exceptionId, '');
+  assert.equal(parsed.survivorId, '');
+  assert.equal(parsed.supersededId, '');
+  assert.equal(parsed.apply, false);
+  assert.throws(
+    () => parseCanonicalOpportunityMergeArgs([
+      '--incident', garageIncident,
+      '--exception-id', garageExceptionId,
+      '--survivor-id', garageSurvivorId,
+      '--superseded-id', garageSupersededId,
+      '--actor', fixtureActor,
+      '--reason', garageReason,
+    ]),
+    /incident.*cannot be combined.*IDs/i,
+  );
+});
+
+test('Garage CLI refuses the exact Garage tuple without the incident selector', () => {
+  assert.throws(
+    () => parseCanonicalOpportunityMergeArgs([
+      '--exception-id', garageExceptionId,
+      '--survivor-id', garageSurvivorId,
+      '--superseded-id', garageSupersededId,
+      '--actor', fixtureActor,
+      '--reason', garageReason,
+    ]),
+    /not an approved canonical opportunity merge tuple/i,
+  );
+});
+
+test('Garage service refuses the exact Garage tuple before storage inspection', async () => {
+  let inspected = false;
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair({
+      exceptionId: garageExceptionId,
+      survivorId: garageSurvivorId,
+      supersededId: garageSupersededId,
+      actor: fixtureActor,
+      reason: garageReason,
+      storage: {
+        provider: 'sqlite',
+        inspectDealHunterCanonicalOpportunityMerge: async () => {
+          inspected = true;
+          return {};
+        },
+      },
+    }),
+    /not an approved canonical opportunity merge tuple/i,
+  );
+  assert.equal(inspected, false);
+});
+
+test('Garage service rejects incident selection combined with arbitrary IDs before inspection', async () => {
+  let inspected = false;
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(garageRepairInput({
+      exceptionId: garageExceptionId,
+      survivorId: garageSupersededId,
+      supersededId: garageSurvivorId,
+      storage: {
+        provider: 'sqlite',
+        inspectDealHunterCanonicalOpportunityMerge: async () => {
+          inspected = true;
+          return {};
+        },
+      },
+    })),
+    /incident selector.*does not accept opportunity IDs/i,
+  );
+  assert.equal(inspected, false);
+});
 
 function repairStorage(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-canonical-merge-'));
@@ -209,6 +325,596 @@ async function seedApprovedRepair(storage) {
   }
   return approval;
 }
+
+function garageOpportunity(opportunityId) {
+  const survivor = opportunityId === garageSurvivorId;
+  return {
+    opportunity_id: opportunityId,
+    created_at: survivor ? '2026-08-30T15:00:54.884Z' : '2026-09-03T15:01:12.476Z',
+    updated_at: survivor ? '2026-09-05T15:00:59.809Z' : '2026-09-03T15:01:12.476Z',
+    canonical_name: 'Garage Door Service Business With Property',
+    canonical_recipient: 'garage-broker@example.test',
+    canonical_location: survivor ? 'Suffolk County, NY, US' : 'New York, NY, US',
+    primary_submission_id: null,
+    identity_version: 'cim-opportunity-v1',
+    status: 'active',
+    metadata: {
+      retainedFixtureMetadata: `preserve-${opportunityId}`,
+      identitySnapshot: {
+        name: 'garage door service business with property',
+        description: 'Same reviewed Garage Door long-form description with seller listing 16235.',
+        recipient: 'garage-broker@example.test',
+        location: survivor ? 'suffolk county ny us' : 'new york ny us',
+        city: survivor ? '' : 'new york',
+        county: survivor ? 'suffolk' : '',
+        state: 'ny',
+        country: 'us',
+        askingPrice: 1_499_000,
+        revenue: 1_142_235,
+        profit: 435_000,
+        sourceIds: ['sheet 0'],
+        listingIds: survivor ? ['costar:2548773'] : [],
+        listingUrl: survivor
+          ? 'https://bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773'
+          : '',
+      },
+    },
+  };
+}
+
+const garageObservationFields = [
+  'name', 'business_name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
+  'annual_profit', 'annual_revenue', 'asking_price', 'profit_multiple', 'net_margin', 'years_established',
+  'remote_flag', 'franchise_flag', 'five_years_flag', 'broker_name',
+];
+
+function insertGaragePreservedState(sqlitePath) {
+  withRawDatabase(sqlitePath, (database) => {
+    const insertObservation = database.prepare(`
+      INSERT INTO deal_hunter_opportunity_source_observations (
+        id, opportunity_id, source_id, source_name, source_record_id,
+        field, value, observed_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertScoreEvidence = database.prepare(`
+      INSERT INTO deal_hunter_score_evidence (
+        id, opportunity_id, score_fingerprint, created_at, dimension,
+        rule_id, rule_label, evidence_class, field, value, observed_value,
+        terms, source_id, source_name, source_record_id, listing_url, observed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    database.transaction(() => {
+      const collisionKeys = [];
+      for (let index = 0; index < 49; index += 1) {
+        const sourceRecordId = `sheet-row:${[4, 6, 8][index % 3]}`;
+        const field = garageObservationFields[Math.floor(index / 3)];
+        if (index < 45) collisionKeys.push([sourceRecordId, field]);
+        insertObservation.run(
+          `garage-loser-observation-${String(index).padStart(3, '0')}`,
+          garageSupersededId,
+          'sheet 0',
+          'SMB Deal Hunter Google Sheet',
+          sourceRecordId,
+          field,
+          `loser historical value ${index}`,
+          `2026-09-0${3 + (index % 2)}T15:00:${String(index).padStart(2, '0')}.000Z`,
+          '2026-09-03T15:01:12.476Z',
+          '2026-09-05T15:00:59.809Z',
+        );
+      }
+      for (let index = 0; index < 168; index += 1) {
+        const colliding = index < collisionKeys.length;
+        const [sourceRecordId, field] = colliding
+          ? collisionKeys[index]
+          : [`survivor-row:${(index % 10) + 1}`, garageObservationFields[Math.floor((index - 45) / 10)]];
+        insertObservation.run(
+          `garage-survivor-observation-${String(index).padStart(3, '0')}`,
+          garageSurvivorId,
+          'sheet 0',
+          'SMB Deal Hunter Google Sheet',
+          sourceRecordId,
+          field,
+          `${colliding ? 'survivor colliding' : 'survivor'} historical value ${index}`,
+          `2026-08-${String(30 + (index % 2)).padStart(2, '0')}T15:00:${String(index % 60).padStart(2, '0')}.000Z`,
+          '2026-08-30T15:00:54.884Z',
+          '2026-09-05T15:00:59.809Z',
+        );
+      }
+      database.prepare(`
+        INSERT INTO deal_hunter_opportunity_scores (
+          opportunity_id, created_at, scored_at, deal_key, name, state, listing_url,
+          fit_score, score_status, confidence, completeness_score, contradiction_count,
+          missing_evidence_count, should_remove, high_fit, gate_count, score_fingerprint,
+          semantic_digest, engine_version, rules_version, profile_version,
+          completeness_policy_version, current_triage_eligible, operator_priority
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        garageSurvivorId, '2026-08-30T16:01:10.401Z', '2026-08-30T16:01:10.401Z',
+        'url:https://www.bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773/',
+        'Garage Door Service Business With Property', 'NY',
+        'https://bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773',
+        100, 'high-fit', 'high', 82, 0, 0, 0, 1, 0, 'garage-score-fingerprint',
+        'garage-semantic-digest', 'engine-v1', 'rules-v1', 'profile-v1', 'complete-v1', 1, 'normal',
+      );
+      for (let index = 0; index < 12; index += 1) {
+        insertScoreEvidence.run(
+          `garage-score-evidence-${String(index).padStart(2, '0')}`,
+          garageSurvivorId,
+          'garage-score-fingerprint',
+          '2026-08-30T16:01:10.401Z',
+          `dimension-${index}`,
+          `garage-rule-${index}`,
+          `Garage rule ${index}`,
+          'source',
+          'description',
+          `value-${index}`,
+          `observed-${index}`,
+          '[]',
+          'sheet 0',
+          'SMB Deal Hunter Google Sheet',
+          `sheet-row:${index + 1}`,
+          'https://bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773',
+          '2026-08-30T15:00:54.884Z',
+        );
+      }
+      const seen = [
+        ['deal-key:url:https://us.businessesforsale.com/us/garage-door-service-business-with-property.aspx', '2026-08-30T15:00:49.981Z', '2026-09-01T15:00:27.975Z', 'https://us.businessesforsale.com/us/garage-door-service-business-with-property.aspx'],
+        ['deal-key:url:https://www.businessmart.com/business-for-sale/bid/323470/garage-door-service-business-with-property-long-island-new-york', '2026-09-02T15:00:04.689Z', '2026-09-03T15:00:25.500Z', 'https://www.businessmart.com/business-for-sale/bid/323470/garage-door-service-business-with-property-long-island-new-york'],
+        ['deal-key:url:https://www.bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773/', '2026-09-04T15:00:22.782Z', '2026-09-05T15:00:54.617Z', 'https://www.bizbuysell.com/business-opportunity/garage-door-service-business-with-property/2548773/'],
+      ];
+      const insertSeen = database.prepare(`
+        INSERT INTO deal_hunter_seen_deals (
+          id, first_seen_at, last_seen_at, source_id, source_name, external_id,
+          listing_url, name, location, annual_profit, annual_revenue, asking_price,
+          should_remove, metadata
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const [id, firstSeenAt, lastSeenAt, listingUrl] of seen) {
+        insertSeen.run(
+          id, firstSeenAt, lastSeenAt, 'sheet 0', 'SMB Deal Hunter Google Sheet', null,
+          listingUrl, 'Garage Door Service Business With Property', 'Long Island, NY',
+          435_000, 1_142_235, 1_499_000, 0, JSON.stringify({ fixture: true }),
+        );
+      }
+    })();
+  });
+}
+
+async function seedGarageRepair(storage, sqlitePath) {
+  const approval = getCanonicalOpportunityMergeApproval({ incident: garageIncident });
+  await storage.upsertDealHunterOpportunity(garageOpportunity(garageSurvivorId));
+  await storage.upsertDealHunterOpportunity(garageOpportunity(garageSupersededId));
+  for (const item of approval.expectedAliases) {
+    await storage.upsertDealHunterOpportunityAlias({
+      id: item.id,
+      opportunity_id: item.opportunityId,
+      alias_type: item.aliasType,
+      alias_value: item.aliasValue,
+      alias_key: item.aliasKey,
+      source: 'SMB Deal Hunter Google Sheet',
+      first_observed_at: '2026-08-30T15:00:49.981Z',
+      last_observed_at: '2026-09-11T15:00:46.336Z',
+      evidence_version: 'cim-opportunity-v1',
+      resolution_method: item.opportunityId === garageSupersededId ? 'new-opportunity' : 'exact-alias',
+      confidence_state: 'exact',
+      resolved_by: 'deal-hunter-review',
+      metadata: { fixture: true },
+    });
+  }
+  await storage.upsertDealHunterIdentityException({
+    id: garageExceptionId,
+    created_at: '2026-09-11T15:00:46.336Z',
+    updated_at: '2026-09-11T15:00:46.336Z',
+    status: 'open',
+    observed_deal_key: null,
+    observed_name: 'Garage Door Service Business With Property',
+    observed_recipient: 'garage-broker@example.test',
+    candidate_opportunity_ids: [],
+    reason: 'conflicting-canonical-aliases',
+    evidence_version: 'cim-opportunity-v1',
+    resolved_at: null,
+    resolved_by: null,
+    resolution_reason: null,
+    metadata: { aliases: approval.expectedAliases.map(({ aliasKey }) => aliasKey), fixture: true },
+  });
+  insertGaragePreservedState(sqlitePath);
+  const paths = repairStoragePaths.get(storage);
+  await storage.createApplicationBackup(paths.backupPath);
+  await createCurrentCanonicalBackupBundle(storage, { now: new Date('2026-09-11T16:00:00.000Z') });
+  return approval;
+}
+
+function garageRepairInput(overrides = {}) {
+  return {
+    incident: garageIncident,
+    actor: fixtureActor,
+    reason: garageReason,
+    now: new Date('2026-09-11T16:30:00.000Z'),
+    ...overrides,
+  };
+}
+
+function garageApplyInput(storage, planChecksum, overrides = {}) {
+  const paths = repairStoragePaths.get(storage);
+  const approval = getCanonicalOpportunityMergeApproval({ incident: garageIncident });
+  return garageRepairInput({
+    storage,
+    apply: true,
+    confirmation: approval.confirmation,
+    expectedPlanChecksum: planChecksum,
+    backupPath: paths?.bundlePath || '',
+    ...overrides,
+  });
+}
+
+const garageForbiddenWriteTables = [
+  'deal_hunter_opportunity_source_observations',
+  'deal_hunter_opportunity_scores',
+  'deal_hunter_score_evidence',
+  'deal_hunter_seen_deals',
+  'contact_submissions',
+  'deal_hunter_crm_imports',
+  'deal_hunter_crm_reconciliation_items',
+  'deal_hunter_crm_reconciliation_runs',
+  'deal_hunter_cim_requests',
+  'deal_hunter_cim_reviews',
+  'deal_hunter_cim_opportunity_claims',
+  'deal_hunter_cim_recipient_claims',
+  'deal_hunter_cim_recipient_overrides',
+  'deal_hunter_cim_stage2_decisions',
+  'crm_communications',
+  'crm_activity_events',
+  'email_events',
+  'crm_email_outbox',
+  'crm_follow_up_recommendations',
+  'deal_hunter_opportunity_facts',
+  'deal_hunter_dispositions',
+  'source_health_snapshots',
+  'scheduled_job_runs',
+];
+
+function snapshotGarageTables(sqlitePath, tableNames = garageForbiddenWriteTables) {
+  return withRawDatabase(sqlitePath, (database) => Object.fromEntries(tableNames.map((table) => [
+    table,
+    database.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+  ])));
+}
+
+test('Garage dry run accepts and inventories the exact production-shaped preservation topology', async (t) => {
+  const fixture = repairStorage(t);
+  await seedGarageRepair(fixture.storage, fixture.sqlitePath);
+
+  const first = await runCanonicalOpportunityMergeRepair(garageRepairInput({ storage: fixture.storage }));
+  const second = await runCanonicalOpportunityMergeRepair(garageRepairInput({ storage: fixture.storage }));
+
+  assert.equal(first.mode, 'dry-run');
+  assert.equal(first.approval.incident, garageIncident);
+  assert.deepEqual(first.plan.approvalTuple, {
+    exceptionId: garageExceptionId,
+    survivorId: garageSurvivorId,
+    supersededId: garageSupersededId,
+  });
+  assert.equal(first.plan.observedAliases.length, 13);
+  assert.equal(first.plan.aliasMoves.length, 1);
+  assert.equal(first.plan.aliasMoves[0].aliasKey, 'fingerprint-v1:a4088c416937e7a58de28ca885e22500be3234a556d7a808281bf4c4ddc50454');
+  assert.deepEqual(first.plan.preservedIncidentState.sourceObservations, {
+    superseded: { opportunityId: garageSupersededId, count: 49, digest: first.plan.preservedIncidentState.sourceObservations.superseded.digest },
+    survivor: { opportunityId: garageSurvivorId, count: 168, digest: first.plan.preservedIncidentState.sourceObservations.survivor.digest },
+    collisionCount: 45,
+  });
+  assert.match(first.plan.preservedIncidentState.sourceObservations.superseded.digest, /^[a-f0-9]{64}$/);
+  assert.match(first.plan.preservedIncidentState.sourceObservations.survivor.digest, /^[a-f0-9]{64}$/);
+  assert.equal(first.plan.preservedIncidentState.opportunityScores.superseded.count, 0);
+  assert.equal(first.plan.preservedIncidentState.opportunityScores.survivor.count, 1);
+  assert.match(first.plan.preservedIncidentState.opportunityScores.survivor.digest, /^[a-f0-9]{64}$/);
+  assert.equal(first.plan.preservedIncidentState.scoreEvidence.superseded.count, 0);
+  assert.equal(first.plan.preservedIncidentState.scoreEvidence.survivor.count, 12);
+  assert.match(first.plan.preservedIncidentState.scoreEvidence.survivor.digest, /^[a-f0-9]{64}$/);
+  assert.equal(first.plan.preservedIncidentState.historicalIdentityEvidence.count, 3);
+  assert.equal(first.plan.preservedIncidentState.historicalIdentityEvidence.records.length, 3);
+  assert.equal(first.plan.preservedIncidentState.historicalIdentityEvidence.records.every(({ id, firstSeenAt, lastSeenAt }) => (
+    id && Number.isFinite(Date.parse(firstSeenAt)) && Number.isFinite(Date.parse(lastSeenAt))
+  )), true);
+  assert.match(first.plan.preservedIncidentState.historicalIdentityEvidence.digest, /^[a-f0-9]{64}$/);
+  assert.equal(first.plan.identityException.candidate_opportunity_ids.length, 0);
+  assert.deepEqual(first.plan.resolutionSafety.aliasDerivedExpectedOwnerIds, [garageSupersededId, garageSurvivorId]);
+  assert.equal(second.planChecksum, first.planChecksum);
+  assert.deepEqual(second.plan.preservedIncidentState, first.plan.preservedIncidentState);
+});
+
+test('Garage apply moves one alias and preserves observations, scores, evidence, history, and forbidden tables byte-for-byte', async (t) => {
+  const fixture = repairStorage(t);
+  const approval = await seedGarageRepair(fixture.storage, fixture.sqlitePath);
+  await pauseOutreach(fixture.storage);
+  const dryRun = await runCanonicalOpportunityMergeRepair(garageRepairInput({ storage: fixture.storage }));
+  const forbiddenBefore = snapshotGarageTables(fixture.sqlitePath);
+  const survivorBefore = garageOpportunity(garageSurvivorId);
+
+  const applied = await runCanonicalOpportunityMergeRepair(
+    garageApplyInput(fixture.storage, dryRun.planChecksum),
+  );
+
+  assert.equal(applied.ok, true);
+  assert.equal(applied.applied, true);
+  assert.equal(applied.alreadyApplied, false);
+  assert.equal(applied.movedAliasCount, 1);
+  assert.equal(applied.planChecksum, dryRun.planChecksum);
+  assert.deepEqual(snapshotGarageTables(fixture.sqlitePath), forbiddenBefore);
+  const aliases = await fixture.storage.listDealHunterOpportunityAliases({
+    opportunityIds: [garageSurvivorId, garageSupersededId],
+    limit: 100,
+  });
+  assert.equal(aliases.length, 13);
+  assert.equal(aliases.every((row) => row.opportunity_id === garageSurvivorId), true);
+  assert.deepEqual(
+    aliases.map(({ id, alias_key: aliasKey }) => [id, aliasKey]).sort(),
+    approval.expectedAliases.map(({ id, aliasKey }) => [id, aliasKey]).sort(),
+  );
+  const opportunities = await fixture.storage.listDealHunterOpportunities({
+    opportunityIds: [garageSurvivorId, garageSupersededId],
+    limit: 10,
+  });
+  const survivor = opportunities.find(({ opportunity_id: id }) => id === garageSurvivorId);
+  const loser = opportunities.find(({ opportunity_id: id }) => id === garageSupersededId);
+  assert.deepEqual(survivor, survivorBefore);
+  assert.equal(loser.status, 'superseded');
+  assert.equal(loser.metadata.canonicalOpportunityMerge.mergedInto, garageSurvivorId);
+  assert.equal(loser.metadata.canonicalOpportunityMerge.exceptionId, garageExceptionId);
+  assert.equal(loser.metadata.canonicalOpportunityMerge.planChecksum, dryRun.planChecksum);
+  const identityException = (await fixture.storage.listDealHunterIdentityExceptions({ limit: 100 }))
+    .find(({ id }) => id === garageExceptionId);
+  assert.equal(identityException.status, 'resolved');
+  assert.deepEqual(identityException.candidate_opportunity_ids, []);
+  assert.equal(identityException.metadata.canonicalOpportunityMerge.survivorId, garageSurvivorId);
+  assert.equal(identityException.metadata.canonicalOpportunityMerge.supersededId, garageSupersededId);
+  const manifests = (await fixture.storage.listDealHunterCimRepairManifests({ limit: 100 }))
+    .filter(({ mode }) => mode === CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE);
+  assert.equal(manifests.length, 1);
+  assert.deepEqual(manifests[0].manifest.plan.preservedIncidentState, dryRun.plan.preservedIncidentState);
+  assert.deepEqual(
+    manifests[0].manifest.plan.resolutionSafety.aliasDerivedExpectedOwnerIds,
+    [garageSupersededId, garageSurvivorId],
+  );
+});
+
+test('Garage dry run refuses representative unreviewed topology before mutation', async (t) => {
+  const cases = [
+    {
+      name: 'unexpected alias',
+      mutate: ({ storage }) => storage.upsertDealHunterOpportunityAlias({
+        id: 'garage-unexpected-alias',
+        opportunity_id: garageSurvivorId,
+        alias_type: 'listing-id',
+        alias_value: 'unexpected:garage',
+        alias_key: 'listing-id:unexpected:garage',
+        source: 'fixture',
+        first_observed_at: fixtureNowIso,
+        last_observed_at: fixtureNowIso,
+        evidence_version: 'cim-opportunity-v1',
+        resolution_method: 'fixture',
+        confidence_state: 'exact',
+        resolved_by: 'fixture',
+        metadata: {},
+      }),
+      pattern: /alias ownership set drifted/i,
+    },
+    {
+      name: 'approved alias ID changed',
+      mutate: ({ sqlitePath }) => withRawDatabase(sqlitePath, (database) => {
+        database.prepare('UPDATE deal_hunter_opportunity_aliases SET id = ? WHERE opportunity_id = ? LIMIT 1')
+          .run('garage-drifted-alias-id', garageSurvivorId);
+      }),
+      pattern: /alias ownership set drifted/i,
+    },
+    {
+      name: 'score appears on loser',
+      mutate: ({ sqlitePath }) => insertUnexpectedDependent(sqlitePath, 'opportunityScores', garageSupersededId),
+      pattern: /unexpected dependent state|preservation topology drifted/i,
+    },
+    {
+      name: 'survivor score missing',
+      mutate: ({ sqlitePath }) => withRawDatabase(sqlitePath, (database) => {
+        database.prepare('DELETE FROM deal_hunter_score_evidence WHERE opportunity_id = ?').run(garageSurvivorId);
+        database.prepare('DELETE FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?').run(garageSurvivorId);
+      }),
+      pattern: /unexpected dependent state|preservation topology drifted/i,
+    },
+    {
+      name: 'score evidence count drift',
+      mutate: ({ sqlitePath }) => withRawDatabase(sqlitePath, (database) => {
+        database.prepare('DELETE FROM deal_hunter_score_evidence WHERE id = ?').run('garage-score-evidence-00');
+      }),
+      pattern: /unexpected dependent state|preservation topology drifted/i,
+    },
+    {
+      name: 'unexpected CRM relationship',
+      mutate: ({ sqlitePath }) => insertUnexpectedDependent(sqlitePath, 'crmImports', garageSurvivorId),
+      pattern: /unexpected dependent state/i,
+    },
+    {
+      name: 'exception candidate array became nonempty',
+      mutate: ({ sqlitePath }) => withRawDatabase(sqlitePath, (database) => {
+        database.prepare('UPDATE deal_hunter_identity_exceptions SET candidate_opportunity_ids = ? WHERE id = ?')
+          .run(JSON.stringify([garageSupersededId, garageSurvivorId]), garageExceptionId);
+      }),
+      pattern: /candidate set drifted/i,
+    },
+    {
+      name: 'canonical location changed',
+      mutate: ({ sqlitePath }) => withRawDatabase(sqlitePath, (database) => {
+        database.prepare('UPDATE deal_hunter_opportunities SET canonical_location = ? WHERE opportunity_id = ?')
+          .run('Long Island, NY, US', garageSupersededId);
+      }),
+      pattern: /canonical location drifted/i,
+    },
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async (caseTest) => {
+      const fixture = repairStorage(caseTest);
+      await seedGarageRepair(fixture.storage, fixture.sqlitePath);
+      await item.mutate(fixture);
+      const before = snapshotGarageTables(fixture.sqlitePath, [
+        'deal_hunter_opportunity_aliases',
+        'deal_hunter_opportunities',
+        'deal_hunter_identity_exceptions',
+        'deal_hunter_cim_repair_manifests',
+      ]);
+
+      await assert.rejects(
+        runCanonicalOpportunityMergeRepair(garageRepairInput({ storage: fixture.storage })),
+        item.pattern,
+      );
+      assert.deepEqual(snapshotGarageTables(fixture.sqlitePath, Object.keys(before)), before);
+    });
+  }
+});
+
+test('Garage apply refuses preserved-row digest drift and a disabled outreach pause before mutation', async (t) => {
+  const cases = [
+    {
+      name: 'observation content digest changed',
+      mutate: ({ sqlitePath }) => withRawDatabase(sqlitePath, (database) => {
+        database.prepare('UPDATE deal_hunter_opportunity_source_observations SET value = ? WHERE id = ?')
+          .run('mutated historical observation', 'garage-loser-observation-000');
+      }),
+      pattern: /plan checksum is stale/i,
+    },
+    {
+      name: 'score content digest changed',
+      mutate: ({ sqlitePath }) => withRawDatabase(sqlitePath, (database) => {
+        database.prepare('UPDATE deal_hunter_opportunity_scores SET fit_score = ? WHERE opportunity_id = ?')
+          .run(99, garageSurvivorId);
+      }),
+      pattern: /plan checksum is stale/i,
+    },
+    {
+      name: 'score evidence content digest changed',
+      mutate: ({ sqlitePath }) => withRawDatabase(sqlitePath, (database) => {
+        database.prepare('UPDATE deal_hunter_score_evidence SET observed_value = ? WHERE id = ?')
+          .run('mutated evidence', 'garage-score-evidence-00');
+      }),
+      pattern: /plan checksum is stale/i,
+    },
+    {
+      name: 'seen history timestamp changed',
+      mutate: ({ sqlitePath }) => withRawDatabase(sqlitePath, (database) => {
+        database.prepare('UPDATE deal_hunter_seen_deals SET last_seen_at = ? WHERE id LIKE ? LIMIT 1')
+          .run('2026-09-06T00:00:00.000Z', 'deal-key:%garage-door%');
+      }),
+      pattern: /plan checksum is stale/i,
+    },
+    {
+      name: 'outreach pause disabled',
+      mutate: ({ sqlitePath }) => withRawDatabase(sqlitePath, (database) => {
+        database.prepare("UPDATE deal_hunter_cim_safety_settings SET outreach_paused = 0 WHERE id = 'global'").run();
+      }),
+      pattern: /outreach must already be paused/i,
+    },
+  ];
+
+  for (const item of cases) {
+    await t.test(item.name, async (caseTest) => {
+      const fixture = repairStorage(caseTest);
+      await seedGarageRepair(fixture.storage, fixture.sqlitePath);
+      await pauseOutreach(fixture.storage);
+      const dryRun = await runCanonicalOpportunityMergeRepair(garageRepairInput({ storage: fixture.storage }));
+      await item.mutate(fixture);
+      const before = snapshotGarageTables(fixture.sqlitePath, [
+        'deal_hunter_opportunity_aliases',
+        'deal_hunter_opportunities',
+        'deal_hunter_identity_exceptions',
+        'deal_hunter_cim_repair_manifests',
+      ]);
+
+      await assert.rejects(
+        runCanonicalOpportunityMergeRepair(garageApplyInput(fixture.storage, dryRun.planChecksum)),
+        item.pattern,
+      );
+      assert.deepEqual(snapshotGarageTables(fixture.sqlitePath, Object.keys(before)), before);
+    });
+  }
+});
+
+test('Garage repeated apply is write-free and revalidates all preserved rows', async (t) => {
+  const fixture = repairStorage(t);
+  await seedGarageRepair(fixture.storage, fixture.sqlitePath);
+  await pauseOutreach(fixture.storage);
+  const dryRun = await runCanonicalOpportunityMergeRepair(garageRepairInput({ storage: fixture.storage }));
+  await runCanonicalOpportunityMergeRepair(garageApplyInput(fixture.storage, dryRun.planChecksum));
+  const afterFirstApply = snapshotGarageTables(fixture.sqlitePath, [
+    ...garageForbiddenWriteTables,
+    'deal_hunter_opportunity_aliases',
+    'deal_hunter_opportunities',
+    'deal_hunter_identity_exceptions',
+    'deal_hunter_cim_repair_manifests',
+  ]);
+
+  const replay = await runCanonicalOpportunityMergeRepair(
+    garageApplyInput(fixture.storage, dryRun.planChecksum, { now: new Date('2026-09-11T17:00:00.000Z') }),
+  );
+
+  assert.equal(replay.applied, false);
+  assert.equal(replay.alreadyApplied, true);
+  assert.equal(replay.movedAliasCount, 0);
+  assert.deepEqual(snapshotGarageTables(fixture.sqlitePath, Object.keys(afterFirstApply)), afterFirstApply);
+});
+
+test('Garage replay refuses post-apply alias ID drift without writing', async (t) => {
+  const fixture = repairStorage(t);
+  await seedGarageRepair(fixture.storage, fixture.sqlitePath);
+  await pauseOutreach(fixture.storage);
+  const dryRun = await runCanonicalOpportunityMergeRepair(garageRepairInput({ storage: fixture.storage }));
+  await runCanonicalOpportunityMergeRepair(garageApplyInput(fixture.storage, dryRun.planChecksum));
+  withRawDatabase(fixture.sqlitePath, (database) => {
+    database.prepare('UPDATE deal_hunter_opportunity_aliases SET id = ? WHERE alias_key = ?').run(
+      'garage-post-apply-alias-id-drift',
+      'listing-id:costar:2548773',
+    );
+  });
+  const drifted = snapshotGarageTables(fixture.sqlitePath, [
+    'deal_hunter_opportunity_aliases',
+    'deal_hunter_opportunities',
+    'deal_hunter_identity_exceptions',
+    'deal_hunter_cim_repair_manifests',
+  ]);
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(garageApplyInput(fixture.storage, dryRun.planChecksum)),
+    /alias postcondition|alias ownership set/i,
+  );
+  assert.deepEqual(snapshotGarageTables(fixture.sqlitePath, Object.keys(drifted)), drifted);
+});
+
+test('Garage transaction failure after alias move rolls the complete repair back', async (t) => {
+  const fixture = repairStorage(t);
+  await seedGarageRepair(fixture.storage, fixture.sqlitePath);
+  await pauseOutreach(fixture.storage);
+  const dryRun = await runCanonicalOpportunityMergeRepair(garageRepairInput({ storage: fixture.storage }));
+  const before = snapshotGarageTables(fixture.sqlitePath, [
+    ...garageForbiddenWriteTables,
+    'deal_hunter_opportunity_aliases',
+    'deal_hunter_opportunities',
+    'deal_hunter_identity_exceptions',
+    'deal_hunter_cim_repair_manifests',
+  ]);
+  withRawDatabase(fixture.sqlitePath, (database) => {
+    database.exec(`
+      CREATE TRIGGER abort_garage_merge_exception_update
+      BEFORE UPDATE OF status ON deal_hunter_identity_exceptions
+      WHEN OLD.id = '${garageExceptionId}' AND NEW.status = 'resolved'
+      BEGIN
+        SELECT RAISE(ABORT, 'injected Garage merge transaction failure');
+      END;
+    `);
+  });
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(garageApplyInput(fixture.storage, dryRun.planChecksum)),
+    /injected Garage merge transaction failure/i,
+  );
+  assert.deepEqual(snapshotGarageTables(fixture.sqlitePath, Object.keys(before)), before);
+});
 
 async function repairState(storage) {
   return {

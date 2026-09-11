@@ -6,13 +6,22 @@
 
 `npm run cim:canonical-merge` is an operator-only, incident-specific repair command for a canonical Deal Hunter opportunity split that has already received an independent human identity decision. It is not an automatic merge heuristic and it must not be used to bypass the ordinary canonical resolver, current-triage policy, or full-backfill authority gate.
 
-The only checked-in approval currently accepted is:
+The checked-in approvals are intentionally incident-specific. The historical HVAC approval accepts only this exact tuple:
 
 - identity exception: `8672a029686c9c6f7a6cdcc42972816127e34a991ae23fd123c262dc9180a571`
 - survivor: `opp_cd57a315-feaf-4158-a02e-4bdde97a922e`
 - superseded duplicate: `opp_c92d0c73-6a47-4fed-b528-6f310745e448`
 
-The command refuses any other tuple. The checked-in descriptor also fixes the complete expected ownership of all twelve approved aliases, including the three aliases that may move. A missing, added, changed, duplicated, or third-party-owned alias refuses both dry run and apply.
+The September 11 Garage Door approval is selected only with `--incident garage-door-2026-09-11`; it does not accept tuple overrides:
+
+- identity exception: `9b0502e83bb7deee1791b87169873a00a8565c61c76f7ba47699618d4af500df`
+- survivor: `opp_e0237cfb-5d23-43ab-a2f6-c3e66ce188f6`
+- superseded duplicate: `opp_a8289b2f-4be2-4a34-81d1-21b046b2f615`
+- alias move: only `fingerprint-v1:a4088c416937e7a58de28ca885e22500be3234a556d7a808281bf4c4ddc50454`
+
+The command refuses every other incident or tuple. Each checked-in descriptor fixes the complete expected alias keys, values, and owners; the Garage approval also fixes every deterministic alias row ID. A missing, added, changed, duplicated, or third-party-owned alias refuses both dry run and apply.
+
+The Garage approval is the sole exception to the historical zero-dependency precondition. It permits exactly 49 loser observations, 168 survivor observations, 45 colliding observation keys, one survivor score, 12 survivor score-evidence rows, and three matching seen-history rows. The plan records full-row deterministic digests for each preserved owner set and for seen history. Those rows remain attached to their existing owners and receive no writes. All CRM, CIM, operator-fact, disposition, communication, email, source-health, and scheduled-job relationship categories remain exact-zero blockers.
 
 This tool is SQLite-only. It refuses every other active storage provider before backup verification or repair execution. The service requires explicitly supplied storage and never starts ordinary application storage implicitly. Do not adapt this command to a remote provider during an incident.
 
@@ -27,7 +36,7 @@ In one immediate SQLite transaction, the approved apply may:
 5. Resolve only the approved identity exception with the actor, reason, decision, timestamp, survivor, losing ID, and plan checksum.
 6. Insert one namespaced, typed `canonical-opportunity-merge-manifest-v1` record under its deterministic manifest key.
 
-The repair never deletes either opportunity and never generically reparents scores, score evidence, current-triage state, CRM records, CIM records, communications, provider events, activities, claims, follow-up state, or historical identity evidence. Any blocking entity-dependent state on or indirectly associated with either approved ID causes a refusal. Recipient-global suppression is deliberately different: it remains restrictive operational state, is reported only by counts, and is never removed, rewritten, or treated as entity ownership.
+The repair never deletes either opportunity and never generically reparents scores, score evidence, current-triage state, source observations, CRM records, CIM records, communications, provider events, activities, claims, follow-up state, or historical identity evidence. Except for the exact Garage preservation topology above, any blocking entity-dependent state on or indirectly associated with either approved ID causes a refusal. Recipient-global suppression is deliberately different: it remains restrictive operational state, is reported only by counts, and is never removed, rewritten, or treated as entity ownership.
 
 ## Preconditions
 
@@ -100,6 +109,17 @@ npm run cim:canonical-merge -- \
 Omitting `--apply` is what makes this a dry run. There is no separate mutation default or apply alias.
 
 Capture the formatted JSON output in the incident record. Do not treat a failed or partially captured invocation as approval to apply.
+
+For the Garage Door incident, select the immutable approval rather than supplying IDs:
+
+```bash
+npm run cim:canonical-merge -- \
+  --incident garage-door-2026-09-11 \
+  --actor '<accountable-operator>' \
+  --reason '<specific independently reviewed Garage Door merge reason>'
+```
+
+Review its `preservedIncidentState` counts, observation collision count, stable seen-history IDs/timestamps, row digests, empty historical exception candidate array, and alias-derived expected owners. A nonempty candidate array or any changed count/digest requires a new reviewed plan; the command does not repair the diagnostics candidate-array defect.
 
 ## 3. Review the exact dry-run plan
 

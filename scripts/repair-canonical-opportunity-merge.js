@@ -29,6 +29,7 @@ function assertSingleOccurrence(args, flag) {
 export function parseCanonicalOpportunityMergeArgs(args = []) {
   const optionNames = [
     '--apply',
+    '--incident',
     '--exception-id',
     '--survivor-id',
     '--superseded-id',
@@ -45,6 +46,7 @@ export function parseCanonicalOpportunityMergeArgs(args = []) {
     allowPositionals: false,
     options: {
       apply: { type: 'boolean', default: false },
+      incident: { type: 'string', default: '' },
       'exception-id': { type: 'string', default: '' },
       'survivor-id': { type: 'string', default: '' },
       'superseded-id': { type: 'string', default: '' },
@@ -55,11 +57,25 @@ export function parseCanonicalOpportunityMergeArgs(args = []) {
       confirm: { type: 'string', default: '' },
     },
   });
+  const incident = String(values.incident || '').trim();
+  const tupleValues = [values['exception-id'], values['survivor-id'], values['superseded-id']]
+    .map((value) => String(value || '').trim());
+  if (incident && tupleValues.some(Boolean)) {
+    throw new Error('--incident cannot be combined with exception or opportunity IDs.');
+  }
+  const approval = incident
+    ? getCanonicalOpportunityMergeApproval({ incident })
+    : getCanonicalOpportunityMergeApproval({
+      exceptionId: required(values, 'exception-id', '--exception-id ID'),
+      survivorId: required(values, 'survivor-id', '--survivor-id ID'),
+      supersededId: required(values, 'superseded-id', '--superseded-id ID'),
+    });
   const parsed = {
     apply: values.apply,
-    exceptionId: required(values, 'exception-id', '--exception-id ID'),
-    survivorId: required(values, 'survivor-id', '--survivor-id ID'),
-    supersededId: required(values, 'superseded-id', '--superseded-id ID'),
+    ...(incident ? { incident } : {}),
+    exceptionId: incident ? '' : approval.exceptionId,
+    survivorId: incident ? '' : approval.survivorId,
+    supersededId: incident ? '' : approval.supersededId,
     actor: required(values, 'actor', '--actor NAME'),
     reason: required(values, 'reason', '--reason TEXT'),
     expectedPlanChecksum: String(values['expected-plan-checksum'] || '').trim(),
@@ -75,8 +91,9 @@ export function parseCanonicalOpportunityMergeArgs(args = []) {
   }
   if (!parsed.backupReference) throw new Error('Apply requires --backup PATH.');
   if (!parsed.confirmation) throw new Error('Apply requires --confirm with the exact confirmation phrase.');
-  if (parsed.confirmation !== CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION) {
-    throw new Error(`Apply requires --confirm "${CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION}".`);
+  const requiredConfirmation = approval.confirmation || CANONICAL_OPPORTUNITY_MERGE_CONFIRMATION;
+  if (parsed.confirmation !== requiredConfirmation) {
+    throw new Error(`Apply requires --confirm "${requiredConfirmation}".`);
   }
   return parsed;
 }
@@ -94,11 +111,13 @@ export async function runCanonicalOpportunityMergeCli({
   if (config?.storage?.provider !== 'sqlite') {
     throw new Error('Canonical opportunity merge repair is SQLite-only and refused the active storage provider.');
   }
-  getCanonicalOpportunityMergeApproval({
-    exceptionId: options.exceptionId,
-    survivorId: options.survivorId,
-    supersededId: options.supersededId,
-  });
+  getCanonicalOpportunityMergeApproval(options.incident
+    ? { incident: options.incident }
+    : {
+      exceptionId: options.exceptionId,
+      survivorId: options.survivorId,
+      supersededId: options.supersededId,
+    });
 
   if (!options.apply) {
     const storage = createReadOnlyStorageFn(config);
@@ -108,6 +127,7 @@ export async function runCanonicalOpportunityMergeCli({
       }
       return await runRepairFn({
         apply: false,
+        incident: options.incident,
         exceptionId: options.exceptionId,
         survivorId: options.survivorId,
         supersededId: options.supersededId,
@@ -134,6 +154,7 @@ export async function runCanonicalOpportunityMergeCli({
   }
   return runRepairFn({
     apply: true,
+    incident: options.incident,
     exceptionId: options.exceptionId,
     survivorId: options.survivorId,
     supersededId: options.supersededId,
