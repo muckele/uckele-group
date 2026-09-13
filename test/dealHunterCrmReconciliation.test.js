@@ -189,6 +189,317 @@ test('exact-import reconciliation accounts for every row, creates one CRM owner 
   assert.equal(mismatchedAudit.counts.identityMismatches, 1);
 });
 
+test('exact-import reconciliation preserves crm-deleted tombstones', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-crm-reconciliation-tombstone-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'crm.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const now = new Date();
+  const imported = await importDealOsExport({
+    fileBuffer: Buffer.from(singleListingCsv()),
+    fileName: 'deal-os-reconciliation-tombstone.csv',
+    exportedAt: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+    scope: 'saved-search',
+    coverageLabel: 'Exact reconciliation tombstone test',
+    expectedRowCount: 1,
+    importedBy: 'admin@example.com',
+    storage,
+    now,
+  });
+  assert.equal(imported.ok, true);
+  assert.equal(imported.import.acceptedRowCount, 1);
+  assert.equal(imported.import.canonicalRecordCount, 1);
+
+  const initialPreview = await previewDealOsCrmReconciliation({
+    importId: imported.import.id,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+  assert.equal(initialPreview.ok, true);
+  assert.equal(initialPreview.items.length, 1);
+  assert.equal(initialPreview.counts.unmappedSourceRows, 0);
+  assert.equal(initialPreview.counts.ambiguous, 0);
+  const exactItem = initialPreview.items[0];
+  assert.ok(exactItem.opportunityId);
+  assert.ok(exactItem.dealKey);
+  assert.deepEqual(initialPreview.expectedOpportunityIds, [exactItem.opportunityId]);
+  assert.equal(exactItem.action, 'create');
+
+  const tombstonedAt = new Date().toISOString();
+  const claim = await storage.claimDealHunterCrmImport({
+    id: 'crm-deleted-dos-rec-1',
+    created_at: tombstonedAt,
+    updated_at: tombstonedAt,
+    opportunity_id: exactItem.opportunityId,
+    deal_key: exactItem.dealKey,
+    listing_identity: 'dealos.example/listing/dos-rec-1',
+    listing_url: 'https://dealos.example/listing/DOS-REC-1',
+    submission_id: null,
+    status: 'crm-deleted',
+    source_name: 'Deal OS tombstone acceptance fixture',
+    metadata: {
+      acceptanceFixture: 'exact-import-crm-deleted-non-recreation',
+      opportunityId: exactItem.opportunityId,
+    },
+  }, { pendingCutoff: tombstonedAt });
+  assert.equal(claim.claimed, true);
+  assert.equal(claim.importRecord.opportunity_id, exactItem.opportunityId);
+  assert.equal(claim.importRecord.status, 'crm-deleted');
+  assert.equal(claim.importRecord.submission_id, null);
+
+  const storedTombstone = await storage.getDealHunterCrmImport({ opportunityId: exactItem.opportunityId });
+  assert.equal(storedTombstone.id, claim.importRecord.id);
+  assert.equal(storedTombstone.opportunity_id, exactItem.opportunityId);
+  assert.equal(storedTombstone.deal_key, exactItem.dealKey);
+  assert.equal(storedTombstone.status, 'crm-deleted');
+  assert.equal(storedTombstone.submission_id, null);
+  assert.equal((await storage.listSubmissions({ status: 'all', page: 1, limit: 100 })).rows.length, 0);
+  const opportunityBefore = await storage.getCurrentDealHunterOpportunity(exactItem.opportunityId);
+  assert.ok(opportunityBefore);
+  assert.equal(opportunityBefore.primary_submission_id, null);
+
+  const tombstonePreview = await previewDealOsCrmReconciliation({
+    importId: imported.import.id,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+  assert.equal(tombstonePreview.ok, true);
+  assert.equal(tombstonePreview.items.length, 1);
+  assert.deepEqual(tombstonePreview.expectedOpportunityIds, [exactItem.opportunityId]);
+  assert.equal(tombstonePreview.items[0].opportunityId, exactItem.opportunityId);
+  assert.equal(tombstonePreview.items[0].dealKey, exactItem.dealKey);
+  assert.equal(tombstonePreview.items[0].action, 'tombstoned');
+  assert.equal(tombstonePreview.items.some((item) => item.action === 'create'), false);
+  assert.equal(tombstonePreview.items.some((item) => item.action === 'update'), false);
+  assert.equal(tombstonePreview.counts.tombstoned, 1);
+  assert.equal(tombstonePreview.counts.create, 0);
+  assert.equal(tombstonePreview.counts.update, 0);
+  assert.equal(tombstonePreview.counts.mutable, 0);
+  assert.equal(tombstonePreview.counts.ambiguous, 0);
+  assert.equal(tombstonePreview.counts.unmappedSourceRows, 0);
+  assert.equal(tombstonePreview.confirmationRequired, 'RECONCILE 0 CANONICAL');
+
+  const executed = await executeDealOsCrmReconciliation({
+    importId: tombstonePreview.import.id,
+    planDigest: tombstonePreview.planDigest,
+    previewGeneratedAt: tombstonePreview.generatedAt,
+    expectedOpportunityIds: tombstonePreview.expectedOpportunityIds,
+    confirmation: tombstonePreview.confirmationRequired,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+  assert.equal(executed.ok, true);
+  assert.equal(executed.status, 200);
+  assert.equal(executed.run.status, 'completed');
+  assert.equal(executed.resultCounts.tombstoned, 1);
+  assert.equal(executed.resultCounts.created, 0);
+  assert.equal(executed.resultCounts.updated, 0);
+  assert.equal(executed.resultCounts.enriched, 0);
+  assert.equal(executed.resultCounts.failed, 0);
+  const durableItems = await storage.listDealHunterCrmReconciliationItems(executed.run.id, { limit: 100 });
+  assert.equal(durableItems.length, 1);
+  assert.equal(durableItems[0].opportunity_id, exactItem.opportunityId);
+  assert.equal(durableItems[0].action, 'tombstoned');
+  assert.equal(durableItems[0].status, 'tombstoned');
+  assert.equal(durableItems[0].submission_id, null);
+
+  assert.equal((await storage.listSubmissions({ status: 'all', page: 1, limit: 100 })).rows.length, 0);
+  const tombstoneAfterExecution = await storage.getDealHunterCrmImport({ opportunityId: exactItem.opportunityId });
+  assert.equal(tombstoneAfterExecution.id, storedTombstone.id);
+  assert.equal(tombstoneAfterExecution.opportunity_id, exactItem.opportunityId);
+  assert.equal(tombstoneAfterExecution.deal_key, exactItem.dealKey);
+  assert.equal(tombstoneAfterExecution.status, 'crm-deleted');
+  assert.equal(tombstoneAfterExecution.submission_id, null);
+  assert.equal((await storage.getCurrentDealHunterOpportunity(exactItem.opportunityId)).primary_submission_id, null);
+
+  const repeatPreview = await previewDealOsCrmReconciliation({
+    importId: imported.import.id,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+  assert.equal(repeatPreview.ok, true);
+  assert.equal(repeatPreview.items.length, 1);
+  assert.equal(repeatPreview.items[0].opportunityId, exactItem.opportunityId);
+  assert.equal(repeatPreview.items[0].action, 'tombstoned');
+  assert.equal(repeatPreview.counts.tombstoned, 1);
+  assert.equal(repeatPreview.counts.create, 0);
+  assert.equal(repeatPreview.counts.update, 0);
+  assert.equal(repeatPreview.counts.mutable, 0);
+
+  const repeated = await executeDealOsCrmReconciliation({
+    importId: repeatPreview.import.id,
+    planDigest: repeatPreview.planDigest,
+    previewGeneratedAt: repeatPreview.generatedAt,
+    expectedOpportunityIds: repeatPreview.expectedOpportunityIds,
+    confirmation: repeatPreview.confirmationRequired,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+  assert.equal(repeated.ok, true);
+  assert.equal(repeated.status, 200);
+  assert.equal(repeated.idempotent, true);
+  assert.equal(repeated.run.status, 'completed');
+  assert.equal(repeated.run.counts.results.tombstoned, 1);
+  assert.equal((await storage.listSubmissions({ status: 'all', page: 1, limit: 100 })).rows.length, 0);
+  const tombstoneAfterRepeat = await storage.getDealHunterCrmImport({ opportunityId: exactItem.opportunityId });
+  assert.equal(tombstoneAfterRepeat.id, storedTombstone.id);
+  assert.equal(tombstoneAfterRepeat.status, 'crm-deleted');
+  assert.equal(tombstoneAfterRepeat.submission_id, null);
+  assert.equal((await storage.getCurrentDealHunterOpportunity(exactItem.opportunityId)).primary_submission_id, null);
+});
+
+test('exact-import reconciliation creates no outbound communication side effects', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-crm-reconciliation-no-outbound-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'crm.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+
+  const syntheticSheetFetch = globalThis.fetch;
+  const unexpectedNetworkUrls = [];
+  let syntheticSheetFetchCount = 0;
+  globalThis.fetch = async (url, options) => {
+    const requestedUrl = String(url);
+    if (requestedUrl === process.env.DEAL_HUNTER_SHEET_CSV_URL) {
+      syntheticSheetFetchCount += 1;
+      return syntheticSheetFetch(url, options);
+    }
+    unexpectedNetworkUrls.push(requestedUrl);
+    throw new Error(`Unexpected application network request: ${requestedUrl}`);
+  };
+  t.after(() => {
+    globalThis.fetch = syntheticSheetFetch;
+  });
+
+  const readOutboundEvidence = async () => {
+    const [
+      outboundCommunications,
+      emailOutbox,
+      emailEvents,
+      cimRequests,
+      stage2Activations,
+      stage2Runs,
+      stage2Decisions,
+      scheduledJobs,
+    ] = await Promise.all([
+      storage.countCrmCommunications({ direction: 'outbound' }),
+      storage.listCrmEmailOutbox({ limit: 100 }),
+      storage.listEmailEvents({ limit: 500 }),
+      storage.listDealHunterCimRequests({ limit: 100000 }),
+      storage.listCimStage2Activations({ limit: 500 }),
+      storage.listCimStage2Runs({ limit: 500 }),
+      storage.listCimStage2Decisions({ limit: 500 }),
+      storage.listScheduledJobs({ limit: 500 }),
+    ]);
+    return {
+      outboundCommunications,
+      emailOutbox: emailOutbox.length,
+      emailEvents: emailEvents.length,
+      cimRequests: cimRequests.length,
+      stage2Activations: stage2Activations.length,
+      stage2Runs: stage2Runs.length,
+      stage2Decisions: stage2Decisions.length,
+      dailyDigestJobs: scheduledJobs.filter((job) => (
+        job.job_name === 'daily-deal-hunter-email'
+        || String(job.job_key || '').startsWith('daily-deal-hunter-email:')
+      )).length,
+    };
+  };
+  const zeroOutboundEvidence = {
+    outboundCommunications: 0,
+    emailOutbox: 0,
+    emailEvents: 0,
+    cimRequests: 0,
+    stage2Activations: 0,
+    stage2Runs: 0,
+    stage2Decisions: 0,
+    dailyDigestJobs: 0,
+  };
+  assert.deepEqual(await readOutboundEvidence(), zeroOutboundEvidence);
+
+  const now = new Date();
+  const imported = await importDealOsExport({
+    fileBuffer: Buffer.from(singleListingCsv()),
+    fileName: 'deal-os-reconciliation-no-outbound.csv',
+    exportedAt: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+    scope: 'saved-search',
+    coverageLabel: 'Exact reconciliation zero-outbound test',
+    expectedRowCount: 1,
+    importedBy: 'admin@example.com',
+    storage,
+    now,
+  });
+  assert.equal(imported.ok, true);
+  assert.equal(imported.import.acceptedRowCount, 1);
+  assert.equal(imported.import.canonicalRecordCount, 1);
+
+  const preview = await previewDealOsCrmReconciliation({
+    importId: imported.import.id,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+  assert.equal(preview.ok, true, JSON.stringify({ error: preview.error, sources: preview.review?.sources }, null, 2));
+  assert.equal(preview.items.length, 1);
+  const item = preview.items[0];
+  assert.ok(item.opportunityId);
+  assert.equal(item.action, 'create');
+  assert.equal(item.actionable, true);
+  assert.equal(preview.counts.create, 1);
+  assert.equal(preview.counts.mutable, 1);
+  assert.equal(preview.counts.ambiguous, 0);
+  assert.equal(preview.counts.unmappedSourceRows, 0);
+  assert.deepEqual(preview.expectedOpportunityIds, [item.opportunityId]);
+  assert.ok(preview.confirmationRequired);
+
+  const preExecutionOutboundEvidence = await readOutboundEvidence();
+  assert.deepEqual(preExecutionOutboundEvidence, zeroOutboundEvidence);
+  assert.equal(await storage.getDealHunterCimOpportunityClaim(item.opportunityId), null);
+  assert.deepEqual(unexpectedNetworkUrls, []);
+  assert.ok(syntheticSheetFetchCount >= 1);
+
+  const executed = await executeDealOsCrmReconciliation({
+    importId: preview.import.id,
+    planDigest: preview.planDigest,
+    previewGeneratedAt: preview.generatedAt,
+    expectedOpportunityIds: preview.expectedOpportunityIds,
+    confirmation: preview.confirmationRequired,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+  assert.equal(executed.ok, true, JSON.stringify({ resultCounts: executed.resultCounts, run: executed.run }, null, 2));
+  assert.equal(executed.status, 200);
+  assert.equal(executed.run.status, 'completed');
+  assert.equal(executed.resultCounts.created, 1);
+  assert.equal(executed.resultCounts.failed, 0);
+
+  const durableItems = await storage.listDealHunterCrmReconciliationItems(executed.run.id, { limit: 100 });
+  assert.equal(durableItems.length, 1);
+  assert.equal(durableItems[0].opportunity_id, item.opportunityId);
+  assert.equal(durableItems[0].action, 'create');
+  assert.equal(durableItems[0].status, 'created');
+  assert.ok(durableItems[0].submission_id);
+
+  const submissions = await storage.listSubmissions({ status: 'all', page: 1, limit: 100 });
+  assert.equal(submissions.rows.length, 1);
+  const submission = submissions.rows.find((row) => row.deal_hunter_opportunity_id === item.opportunityId);
+  assert.ok(submission);
+  assert.equal(submission.status, 'review');
+  assert.equal(submission.tags.includes('high-fit'), true);
+  assert.equal(submission.delivery_provider, 'manual-entry');
+  assert.equal(submission.delivery_status, 'not-applicable');
+  assert.equal(submission.crm_status, 'manual-entry');
+
+  const postExecutionOutboundEvidence = await readOutboundEvidence();
+  assert.deepEqual(postExecutionOutboundEvidence, preExecutionOutboundEvidence);
+  assert.deepEqual(postExecutionOutboundEvidence, zeroOutboundEvidence);
+  assert.equal(await storage.getDealHunterCimOpportunityClaim(item.opportunityId), null);
+  assert.deepEqual(unexpectedNetworkUrls, []);
+  assert.ok(syntheticSheetFetchCount >= 1);
+});
+
 test('a re-run over unchanged listings plans no writes and keeps operator workflow', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-crm-reconciliation-unchanged-'));
   const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'crm.sqlite') } });
