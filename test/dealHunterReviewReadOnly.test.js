@@ -22,7 +22,7 @@ process.env.DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED = 'false';
 process.env.DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED = 'false';
 
 const originalFetch = globalThis.fetch;
-const sourceCsv = [
+let sourceCsv = [
   'Business Name,State,Earnings,Revenue,Asking Price,Date Added,View Listing URL,Description,Broker Email',
   `Read-Only Review Fire Safety,NY,$450000,$1200000,$900000,${new Date().toISOString().slice(0, 10)},https://listings.example.invalid/review-read-only,Recurring commercial fire inspection and monitoring contracts with trained technicians and stable customers.,broker@example.test`,
 ].join('\n');
@@ -101,6 +101,15 @@ function databaseState(tables) {
   return Object.fromEntries(tables.map((table) => [table, tableFingerprint(table)]));
 }
 
+function findReviewDeal(review, name) {
+  return [
+    ...(review.newlySeenMatches || []),
+    ...(review.qualified || []),
+    ...(review.watchlist || []),
+    ...(review.removalCandidates || []),
+  ].find((deal) => deal.name === name);
+}
+
 async function withServer(run) {
   const server = createApp().listen(0, '127.0.0.1');
   await new Promise((resolve, reject) => {
@@ -146,7 +155,7 @@ test.after(() => {
   fs.rmSync(tempDir, { recursive: true, force: true });
 });
 
-test('authenticated Deal Hunter review preserves business rows and only records source health', async () => {
+test('authenticated review stays read-only and materializes fresh ambiguity only at the explicit backfill boundary', async () => {
   const storage = getStorage();
 
   // Seed through the real persist-capable workflow so the GET encounters an
@@ -187,4 +196,111 @@ test('authenticated Deal Hunter review preserves business rows and only records 
     before,
     'an observational review must not alter canonical identity, CRM, score, scheduling, CIM, or outbound state',
   );
+
+  // A new listing can be strongly corroborated against the existing canonical
+  // opportunity while supplying a different recipient and durable listing URL.
+  // That is ambiguous rather than an automatic identity match.
+  sourceCsv = [
+    'Business Name,State,Earnings,Revenue,Asking Price,Date Added,View Listing URL,Description,Broker Email',
+    `Read-Only Review Fire Safety,NY,$450000,$1200000,$900000,${new Date().toISOString().slice(0, 10)},https://listings.example.invalid/review-read-only-new,Recurring commercial fire inspection and monitoring contracts with trained technicians and stable customers.,new-broker@example.test`,
+  ].join('\n');
+
+  assert.equal((await storage.listDealHunterIdentityExceptions({ statuses: ['open'] })).length, 0);
+  const ambiguousBefore = databaseState(businessTables);
+  let observedExceptionId = '';
+  let candidateOpportunityId = '';
+
+  await withServer(async (origin) => {
+    const response = await fetch(`${origin}/api/admin/deal-hunter/review`, {
+      headers: { Cookie: cookie },
+    });
+    const payload = await response.json();
+
+    assert.equal(response.status, 200, JSON.stringify(payload));
+    assert.equal(payload.success, true);
+    assert.deepEqual(payload.review.identityExceptions, [], 'GET exposes no unpersisted item as directly resolvable');
+    const observed = findReviewDeal(payload.review, 'Read-Only Review Fire Safety');
+    assert.ok(observed, 'the newly ambiguous listing remains visible in the Operations review');
+    assert.equal(observed.identityStatus, 'ambiguous');
+    assert.match(observed.identityExceptionId, /^[a-f0-9]{64}$/);
+    assert.equal(observed.cimRequest.canRequest, false);
+    assert.match(observed.cimRequest.reason, /identity is ambiguous.*resolve it before outreach/i);
+    assert.equal(
+      payload.review.cimAutomation.run.exceptions.some((item) => item.dealKey === observed.dealKey),
+      false,
+      'an ambiguous listing is excluded from the automation candidate preview rather than presented as sendable',
+    );
+    observedExceptionId = observed.identityExceptionId;
+
+    const listed = await fetch(`${origin}/api/admin/deal-hunter/identity-exceptions`, {
+      headers: { Cookie: cookie },
+    });
+    const listedPayload = await listed.json();
+    assert.equal(listed.status, 200);
+    assert.deepEqual(listedPayload.exceptions, []);
+  });
+
+  assert.deepEqual(
+    databaseState(businessTables),
+    ambiguousBefore,
+    'detecting a fresh ambiguity through GET must not persist the exception or alter business state',
+  );
+
+  await withServer(async (origin) => {
+    const backfill = await fetch(`${origin}/api/admin/deal-hunter/backfill-review`, {
+      method: 'POST',
+      headers: { Cookie: cookie },
+    });
+    const backfillPayload = await backfill.json();
+
+    assert.equal(backfill.status, 200, JSON.stringify(backfillPayload));
+    assert.equal(backfillPayload.success, true);
+    assert.equal(backfillPayload.review.scoringDeferred, true);
+    assert.match(backfillPayload.review.scoringDeferredReason, /canonical identity exception.*resolved/i);
+    assert.match(backfillPayload.reviewWarning, /identity exception.*resolved.*scores were left unchanged/i);
+    assert.equal(backfillPayload.scoreRefresh, null);
+    const persisted = backfillPayload.review.identityExceptions.find((item) => item.id === observedExceptionId);
+    assert.ok(persisted, 'the explicit full-backfill action materializes the observed exception');
+    assert.equal(persisted.reason, 'ambiguous-similarity');
+    assert.equal(persisted.candidateOpportunityIds.length, 1);
+    [candidateOpportunityId] = persisted.candidateOpportunityIds;
+    assert.equal(candidateOpportunityId, opportunity.opportunity_id);
+
+    const listed = await fetch(`${origin}/api/admin/deal-hunter/identity-exceptions`, {
+      headers: { Cookie: cookie },
+    });
+    const listedPayload = await listed.json();
+    assert.equal(listed.status, 200);
+    assert.equal(listedPayload.exceptions.some((item) => item.id === observedExceptionId && item.status === 'open'), true);
+
+    const resolved = await fetch(`${origin}/api/admin/deal-hunter/identity-exceptions/${observedExceptionId}/resolve`, {
+      method: 'POST',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'link',
+        opportunityId: candidateOpportunityId,
+        confirmed: true,
+        reason: 'Fresh listing is the existing canonical opportunity.',
+      }),
+    });
+    const resolvedPayload = await resolved.json();
+    assert.equal(resolved.status, 200, JSON.stringify(resolvedPayload));
+    assert.equal(resolvedPayload.success, true);
+    assert.equal(resolvedPayload.identityException.status, 'resolved');
+
+    const refreshed = await fetch(`${origin}/api/admin/deal-hunter/review`, {
+      headers: { Cookie: cookie },
+    });
+    const refreshedPayload = await refreshed.json();
+    assert.equal(refreshed.status, 200, JSON.stringify(refreshedPayload));
+    assert.deepEqual(refreshedPayload.review.identityExceptions, []);
+    const linked = findReviewDeal(refreshedPayload.review, 'Read-Only Review Fire Safety');
+    assert.equal(linked.identityStatus, 'resolved');
+    assert.equal(linked.opportunityId, candidateOpportunityId);
+  });
+
+  const [resolvedException] = await storage.listDealHunterIdentityExceptions({ statuses: ['resolved'] });
+  assert.equal(resolvedException.id, observedExceptionId);
+  assert.equal((await storage.listDealHunterCimRequests({ limit: 100 })).length, 0);
+  assert.equal((await storage.listEmailEvents({ limit: 100 })).length, 0);
 });

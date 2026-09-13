@@ -157,6 +157,61 @@ describe('Deal Hunter CIM lifecycle presentation', () => {
     expect(screen.getByText(/does not create CRM records or send email/i)).toBeVisible();
   });
 
+  test('keeps fresh ambiguity blocked until explicit backfill exposes a persisted resolution action', () => {
+    const onResolveIdentityException = vi.fn();
+    const review = reviewWithDeal({
+      eligible: false,
+      canRequest: false,
+      status: 'unavailable',
+      reason: 'Opportunity identity is ambiguous. An administrator must resolve it before outreach.',
+    });
+    Object.assign(review.qualified[0], {
+      identityStatus: 'ambiguous',
+      identityExceptionId: 'ephemeral-exception-id',
+    });
+
+    const { rerender } = render(
+      <DealHunterWorkspace
+        feedback={{ error: '', message: '' }}
+        onResolveIdentityException={onResolveIdentityException}
+        onReview={vi.fn()}
+        review={review}
+      />,
+    );
+
+    expect(screen.getByText(/identity is ambiguous.*resolve it before outreach/i)).toBeVisible();
+    expect(screen.queryByRole('region', { name: 'CIM identity exceptions' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Link to opp_existing/ })).not.toBeInTheDocument();
+
+    rerender(
+      <DealHunterWorkspace
+        feedback={{ error: '', message: '' }}
+        onResolveIdentityException={onResolveIdentityException}
+        onReview={vi.fn()}
+        review={{
+          ...review,
+          identityExceptions: [{
+            id: 'persisted-exception-id',
+            observedName: 'Recurring HVAC Services',
+            observedRecipient: 'broker@example.test',
+            candidateOpportunityIds: ['opp_existing'],
+            reason: 'ambiguous-similarity',
+            evidenceVersion: 'cim-opportunity-v1',
+            comparisons: [],
+          }],
+        }}
+      />,
+    );
+
+    const panel = screen.getByRole('region', { name: 'CIM identity exceptions' });
+    expect(panel).toHaveTextContent('Identity ambiguous—manual resolution required');
+    fireEvent.click(within(panel).getByRole('button', { name: /Link to opp_existing/ }));
+    expect(onResolveIdentityException).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'persisted-exception-id' }),
+      { action: 'link', opportunityId: 'opp_existing' },
+    );
+  });
+
   test('shows post-import counts and only enables explicit CRM sync for eligible reviewed deals', () => {
     const onSyncHighFits = vi.fn();
     const review = reviewWithDeal({ eligible: false, reason: 'No recipient.' });
