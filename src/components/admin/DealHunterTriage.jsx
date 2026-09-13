@@ -266,8 +266,10 @@ export default function DealHunterTriage({ readOnly = false }) {
       ) : null}
 
       <ul className="mt-4 space-y-3">
-        {queue.rows.map((row) => (
-          <li className="rounded-2xl border border-line bg-white p-4" key={row.opportunityId}>
+        {queue.rows.map((row) => {
+          const topReasons = Array.isArray(row.topReasons) ? row.topReasons : [];
+          return (
+            <li className="rounded-2xl border border-line bg-white p-4" key={row.opportunityId}>
             <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
@@ -279,8 +281,8 @@ export default function DealHunterTriage({ readOnly = false }) {
                   {row.dismissed ? <Chip tone="danger">Dismissed{row.dismissedReason ? `: ${row.dismissedReason}` : ''}</Chip> : null}
                 </div>
                 <DimensionBar dimensions={row.dimensions} />
-                {row.topReasons.length > 0 ? (
-                  <p className="mt-2 text-sm leading-6 text-ink/70">{row.topReasons.join(' · ')}</p>
+                {topReasons.length > 0 ? (
+                  <p className="mt-2 text-sm leading-6 text-ink/70">{topReasons.join(' · ')}</p>
                 ) : null}
                 <p className="mt-2 flex flex-wrap items-center gap-3 text-xs text-ink/60">
                   <span>Completeness {row.completenessScore}/100</span>
@@ -334,8 +336,9 @@ export default function DealHunterTriage({ readOnly = false }) {
             {expandedId === row.opportunityId ? (
               <EvidenceDrawer detail={detail.data} error={detail.error} loading={detail.loading} />
             ) : null}
-          </li>
-        ))}
+            </li>
+          );
+        })}
       </ul>
 
       {queue.totalPages > 1 ? (
