@@ -1510,6 +1510,309 @@ async function installPhase1OperationsFixture(page) {
   return state;
 }
 
+async function installPhase5DealOsReconciliationFixture(page) {
+  const state = await installPhase1OperationsFixture(page);
+  const fixture = {
+    csv: [
+      'Listing ID,Business Name,State,Earnings,Revenue,Asking Price,Industry,Description,View Listing URL',
+      'BROWSER-DOS-1,Browser HVAC Services,CA,450000,1800000,1400000,Commercial HVAC,"Recurring maintenance service agreements field technicians",https://dealos.example/listing/BROWSER-DOS-1',
+    ].join('\n'),
+    fileName: 'browser-deal-os.csv',
+    coverageLabel: 'CA Deal Radar filters',
+    exportedAtInput: '2026-09-11T09:15',
+    importId: '11111111-1111-4111-8111-111111111111',
+    opportunityId: '22222222-2222-4222-8222-222222222222',
+    runId: '33333333-3333-4333-8333-333333333333',
+    planDigest: 'a'.repeat(64),
+    previewGeneratedAt: '2026-09-11T16:20:00.000Z',
+    previewExpiresAt: '2026-09-11T16:30:00.000Z',
+    confirmation: 'RECONCILE 1 CANONICAL',
+    imported: false,
+    previewed: false,
+    executed: false,
+    importRequest: null,
+    previewRequest: null,
+    executeRequest: null,
+  };
+  const fieldCoverage = {
+    totalRecords: 1,
+    fields: [
+      { key: 'industry', label: 'Industry', present: 1, percent: 100 },
+      { key: 'description', label: 'Description', present: 1, percent: 100 },
+      { key: 'brokerEmail', label: 'Broker email', present: 0, percent: 0 },
+    ],
+  };
+  const importSummary = {
+    importId: fixture.importId,
+    reviewMode: 'daily',
+    importedRows: 1,
+    sourceRows: 1,
+    rejectedRows: 0,
+    canonicalImportRecords: 1,
+    canonicalListings: 1,
+    withinFileDuplicates: 0,
+    collapsedDuplicates: 0,
+    scoredListings: 1,
+    highFitListings: 1,
+    syncedListings: 0,
+    fieldCoverage,
+  };
+  const resultCounts = {
+    created: 1,
+    updated: 0,
+    enriched: 0,
+    tombstoned: 0,
+    unchanged: 0,
+    ambiguous: 0,
+    failed: 0,
+  };
+  const previewResult = {
+    ok: true,
+    status: 200,
+    preview: true,
+    import: {
+      id: fixture.importId,
+      fileName: fixture.fileName,
+      sourceRowCount: 1,
+      acceptedRowCount: 1,
+      rejectedRowCount: 0,
+      canonicalRecordCount: 1,
+      duplicateCount: 0,
+    },
+    generatedAt: fixture.previewGeneratedAt,
+    expiresAt: fixture.previewExpiresAt,
+    requestedBy: 'phase1-admin',
+    integrityAudit: { healthy: true, safeToReconcile: true, findings: [] },
+    planDigest: fixture.planDigest,
+    confirmationRequired: fixture.confirmation,
+    expectedOpportunityIds: [fixture.opportunityId],
+    counts: {
+      sourceRows: 1,
+      acceptedRows: 1,
+      rejectedRows: 0,
+      withinFileDuplicates: 0,
+      canonicalImportRecords: 1,
+      canonicalMatched: 1,
+      mappedSourceRows: 1,
+      unmappedSourceRows: 0,
+      total: 1,
+      create: 1,
+      update: 0,
+      unchanged: 0,
+      tombstoned: 0,
+      ambiguous: 0,
+      actionable: 1,
+      sourced: 0,
+      conflicts: 0,
+      mutable: 1,
+    },
+    items: [{
+      opportunityId: fixture.opportunityId,
+      dealKey: 'source:deal-os-export:BROWSER-DOS-1',
+      name: 'Browser HVAC Services',
+      action: 'create',
+      submissionId: '',
+      actionable: true,
+      fitScore: 92,
+      completenessScore: 90,
+      evidenceConfidence: 'high',
+      scoreStatus: 'high-fit',
+      scoringRuleVersion: 'deal-hunter-fit-v2',
+      missingEvidence: ['brokerEmail'],
+      fieldConflictCount: 0,
+      changedFields: [],
+      sourceRowNumbers: [2],
+    }],
+    itemsTruncated: false,
+    unmappedSourceRowNumbers: [],
+  };
+
+  function reviewResponse(includeDealOs) {
+    const sources = [{
+      id: 'sheet-0',
+      name: 'SMB Deal Hunter Google Sheet',
+      mode: 'csv',
+      fetched: true,
+      required: true,
+      sourceRole: 'required-primary',
+      rowCount: 1,
+    }];
+    if (includeDealOs) {
+      sources.push({
+        id: 'deal-os-export',
+        name: 'SMB Deal OS export',
+        mode: 'manual-export',
+        fetched: true,
+        required: false,
+        sourceRole: 'optional-supplemental',
+        rowCount: 1,
+        exportedAt: fixture.importRequest?.headers['x-deal-os-exported-at'] || '2026-09-11T16:15:00.000Z',
+        importedAt: fixture.previewGeneratedAt,
+        importedBy: 'phase1-admin',
+        importAgeHours: 0.08,
+        scope: 'deal-radar',
+        coverageLabel: fixture.coverageLabel,
+        stableIdCount: 1,
+        listingUrlCount: 1,
+      });
+    }
+    return {
+      reviewMode: 'daily',
+      lookbackDays: 1,
+      scoringDeferred: false,
+      totals: { reviewedDeals: 1, newMatches: 1, qualified: 1, cimReady: 0, watchlist: 0, removalCandidates: 0, crmEligible: 1 },
+      sources,
+      disabledSources: [],
+      dealOsImportPolicy: { maxRecords: 1000, maxAgeHours: 72 },
+      criteriaRecommendations: [],
+      newlySeenMatches: [],
+      qualified: [],
+      watchlist: [],
+      removalCandidates: [],
+      coverageWarnings: [],
+      identityExceptions: [],
+      crmSyncPreview: { count: 0, dealKeys: [] },
+      ...(includeDealOs ? { importSummary } : {}),
+    };
+  }
+
+  state.phase5 = fixture;
+
+  await page.route('**/api/admin/deal-hunter/review', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() !== 'GET' || url.search) {
+      await rejectPhase1Request(route, state, 'Unexpected Phase 5 source-review request.');
+      return;
+    }
+    await fulfillPhase1Json(route, { success: true, review: reviewResponse(fixture.imported) });
+  });
+
+  await page.route('**/api/admin/deal-hunter/deal-os-import', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() !== 'POST' || url.search || fixture.imported) {
+      await rejectPhase1Request(route, state, 'Unexpected Phase 5 Deal OS import request.');
+      return;
+    }
+    const headers = await request.allHeaders();
+    const expectedHeaderNames = [
+      'content-type',
+      'x-deal-os-file-name',
+      'x-deal-os-exported-at',
+      'x-deal-os-scope',
+      'x-deal-os-coverage-label',
+      'x-deal-os-review-mode',
+      'x-deal-os-expected-row-count',
+    ];
+    fixture.importRequest = {
+      ...phase1RequestRecord(request),
+      headers: Object.fromEntries(expectedHeaderNames.map((name) => [name, headers[name]])),
+      body: request.postDataBuffer(),
+    };
+    fixture.imported = true;
+    await fulfillPhase1Json(route, {
+      success: true,
+      import: {
+        id: fixture.importId,
+        fileName: fixture.fileName,
+        mimeType: 'text/csv',
+        exportedAt: headers['x-deal-os-exported-at'],
+        scope: 'deal-radar',
+        coverageLabel: fixture.coverageLabel,
+        importedAt: fixture.previewGeneratedAt,
+        importedBy: 'phase1-admin',
+        rowCount: 1,
+        sourceRowCount: 1,
+        acceptedRowCount: 1,
+        rejectedRowCount: 0,
+        canonicalRecordCount: 1,
+        duplicateCount: 0,
+        fieldCoverage,
+      },
+      review: reviewResponse(true),
+      scoreRefresh: { ok: true, counts: { total: 1, refreshed: 1, unchanged: 0, failed: 0 } },
+      summary: importSummary,
+    }, 201);
+  });
+
+  await page.route('**/api/admin/deal-hunter/crm-reconciliation/preview', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() !== 'POST' || url.search || !fixture.imported || fixture.previewed) {
+      await rejectPhase1Request(route, state, 'Unexpected Phase 5 reconciliation-preview request.');
+      return;
+    }
+    const headers = await request.allHeaders();
+    fixture.previewRequest = {
+      ...phase1RequestRecord(request),
+      contentType: headers['content-type'],
+      body: phase1Body(request),
+    };
+    fixture.previewed = true;
+    await fulfillPhase1Json(route, { success: true, ...previewResult });
+  });
+
+  await page.route('**/api/admin/deal-hunter/crm-reconciliation/execute', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (request.method() !== 'POST' || url.search || !fixture.previewed || fixture.executed) {
+      await rejectPhase1Request(route, state, 'Unexpected Phase 5 reconciliation-execute request.');
+      return;
+    }
+    const headers = await request.allHeaders();
+    fixture.executeRequest = {
+      ...phase1RequestRecord(request),
+      contentType: headers['content-type'],
+      body: phase1Body(request),
+    };
+    fixture.executed = true;
+    await fulfillPhase1Json(route, {
+      success: true,
+      ok: true,
+      status: 200,
+      run: {
+        id: fixture.runId,
+        import_id: fixture.importId,
+        mode: 'exact-import',
+        plan_digest: fixture.planDigest,
+        status: 'completed',
+        requested_by: 'phase1-admin',
+        counts: { ...previewResult.counts, results: resultCounts },
+        results: { items: [{ opportunityId: fixture.opportunityId, status: 'created', submissionId: 'browser-crm-submission-1' }] },
+        last_error: null,
+      },
+      resultCounts,
+      preview: previewResult,
+    });
+  });
+
+  await page.route('**/api/admin/submissions?*', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    const expectedSearch = '?page=1&pageSize=25&sort=created_at&direction=desc';
+    if (request.method() !== 'GET' || url.search !== expectedSearch || !fixture.executed) {
+      await rejectPhase1Request(route, state, `Unexpected Phase 5 submissions request: ${request.method()} ${url.pathname}${url.search}`);
+      return;
+    }
+    await fulfillPhase1Json(route, {
+      success: true,
+      summary: { ...emptySummary, total: 0 },
+      submissions: [],
+      notifications: [],
+      emailTriage: [],
+      total: 0,
+      page: 1,
+      pageSize: 25,
+      totalPages: 1,
+      sort: 'created_at',
+      direction: 'desc',
+    });
+  });
+
+  return state;
+}
+
 async function expectPhase1Summary(page, label, value) {
   const inbox = page.getByRole('region', { name: 'Acquisition Inbox' });
   const labelNode = inbox.locator('p').filter({ hasText: new RegExp(`^${label}$`) }).first();
@@ -1580,6 +1883,7 @@ test('overview summary cards are keyboard-accessible drill-down links', async ({
 });
 
 test('authenticated CRM navigation persists page, size, sort, search, and status in the URL', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' });
   await mockAuthenticatedAdmin(page);
   await page.goto('/admin/crm?search=HVAC&status=review&page=2&pageSize=10&sort=priority&direction=asc');
 
@@ -1590,11 +1894,30 @@ test('authenticated CRM navigation persists page, size, sort, search, and status
   await expect(page.getByLabel('Per page').first()).toHaveValue('10');
   await expect(page.getByText('11–15 of 15 records · Page 2 of 2').first()).toBeVisible();
 
+  const pageOneRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+
+    return (
+      request.method() === 'GET'
+      && url.pathname === '/api/admin/submissions'
+      && url.searchParams.get('page') === '1'
+      && url.searchParams.get('search') === 'HVAC'
+      && url.searchParams.get('status') === 'review'
+      && url.searchParams.get('pageSize') === '10'
+      && url.searchParams.get('sort') === 'priority'
+      && url.searchParams.get('direction') === 'asc'
+    );
+  });
+
   await page.getByRole('button', { name: /previous/i }).first().click();
+  await pageOneRequest;
   await expect(page.getByText('1–10 of 15 records · Page 1 of 2').first()).toBeVisible();
   await expect.poll(() => new URL(page.url()).searchParams.get('page')).toBeNull();
   expect(new URL(page.url()).searchParams.get('search')).toBe('HVAC');
+  expect(new URL(page.url()).searchParams.get('status')).toBe('review');
   expect(new URL(page.url()).searchParams.get('pageSize')).toBe('10');
+  expect(new URL(page.url()).searchParams.get('sort')).toBe('priority');
+  expect(new URL(page.url()).searchParams.get('direction')).toBe('asc');
 
   await page.getByLabel('Sort').first().selectOption('deal_score:desc');
   await expect.poll(() => new URL(page.url()).searchParams.get('sort')).toBe('deal_score');
@@ -1681,6 +2004,199 @@ test('Acquisition Inbox Phase 1 follows the real Operations destination under a 
   expect(state.offOriginRequests).toEqual([]);
   expect(consoleErrors).toEqual([]);
   expect(pageErrors).toEqual([]);
+});
+
+test('Deal OS import completes preview and exact reconciliation through Operations', async ({ page }) => {
+  const consoleErrors = [];
+  const pageErrors = [];
+  page.on('console', (message) => {
+    if (message.type() === 'error') consoleErrors.push(message.text());
+  });
+  page.on('pageerror', (error) => pageErrors.push(error.message));
+  const state = await installPhase5DealOsReconciliationFixture(page);
+  const fixture = state.phase5;
+
+  await page.goto('/admin/deal-hunter');
+  await expect(page.getByRole('heading', { level: 2, name: 'Acquisition Inbox' })).toBeVisible();
+  await page.getByRole('navigation', { name: 'Deal Hunter views' }).getByRole('link', { name: 'Operations' }).click();
+
+  await expect(page).toHaveURL('http://127.0.0.1:4173/admin/deal-hunter?view=operations');
+  await expect(page.getByRole('heading', { level: 2, name: 'Daily source review' })).toBeVisible();
+  const sheetSource = page.getByText('SMB Deal Hunter Google Sheet', { exact: true }).locator('..').locator('..');
+  await expect(sheetSource).toContainText('1 rows');
+  await expect(sheetSource).toContainText('required');
+  await expect(page.getByRole('button', { name: 'Build preview' })).toHaveCount(0);
+
+  const importHeading = page.getByRole('heading', { level: 3, name: 'Import SMB Deal OS export' });
+  const importForm = page.locator('form').filter({ has: importHeading });
+  await expect(importForm.getByLabel('Deal OS export file')).toBeVisible();
+  await expect(importForm.getByLabel('Export type')).toBeVisible();
+  await expect(importForm.getByLabel('Coverage description')).toBeVisible();
+  await expect(importForm.getByLabel('Exported at')).toBeVisible();
+  await expect(importForm.getByLabel(/Expected listings shown by Deal OS/)).toBeVisible();
+  await expect(importForm.getByRole('button', { name: 'Validate & Import' })).toBeDisabled();
+
+  await importForm.getByLabel('Deal OS export file').setInputFiles({
+    name: fixture.fileName,
+    mimeType: 'text/csv',
+    buffer: Buffer.from(fixture.csv),
+  });
+  await importForm.getByLabel('Export type').selectOption('deal-radar');
+  await importForm.getByLabel('Coverage description').fill(fixture.coverageLabel);
+  const exportedAtInput = importForm.getByLabel('Exported at');
+  await exportedAtInput.fill(fixture.exportedAtInput);
+  const expectedExportedAt = await exportedAtInput.evaluate((input) => new Date(input.value).toISOString());
+  await importForm.getByLabel(/Expected listings shown by Deal OS/).fill('1');
+  await expect(importForm.getByLabel('Score all current listings after import')).not.toBeChecked();
+  await expect(importForm.getByRole('button', { name: 'Validate & Import' })).toBeEnabled();
+  await importForm.getByRole('button', { name: 'Validate & Import' }).click();
+
+  await expect(page.getByText(
+    `Accepted 1 Deal OS row and retained 1 canonical import record from ${fixture.fileName}. Scored 1 listing in daily mode.`,
+    { exact: true },
+  )).toBeVisible();
+  await expect.poll(() => fixture.importRequest).not.toBeNull();
+  expect({
+    method: fixture.importRequest.method,
+    path: fixture.importRequest.path,
+    search: fixture.importRequest.search,
+    headers: fixture.importRequest.headers,
+  }).toEqual({
+    method: 'POST',
+    path: '/api/admin/deal-hunter/deal-os-import',
+    search: '',
+    headers: {
+      'content-type': 'text/csv',
+      'x-deal-os-file-name': fixture.fileName,
+      'x-deal-os-exported-at': expectedExportedAt,
+      'x-deal-os-scope': 'deal-radar',
+      'x-deal-os-coverage-label': 'CA%20Deal%20Radar%20filters',
+      'x-deal-os-review-mode': 'daily',
+      'x-deal-os-expected-row-count': '1',
+    },
+  });
+  expect(fixture.importRequest.body).not.toBeNull();
+  expect(fixture.importRequest.body.equals(Buffer.from(fixture.csv))).toBe(true);
+
+  const importSummary = page.getByRole('region', { name: 'Latest Deal OS import summary' });
+  await expect(importSummary).toContainText('Latest import result');
+  for (const [label, value] of [
+    ['Accepted rows', '1'],
+    ['Import canonical', '1'],
+    ['Cross-source canonical', '1'],
+    ['Duplicates collapsed', '0'],
+    ['Scored', '1'],
+    ['High fit', '1'],
+    ['Synced', '0'],
+  ]) {
+    await expect(importSummary.getByText(label, { exact: true }).locator('..').locator('dd')).toHaveText(value);
+  }
+  const dealOsSource = page.getByText('SMB Deal OS export', { exact: true }).locator('..').locator('..');
+  await expect(dealOsSource).toContainText('1 rows');
+  await expect(dealOsSource).toContainText('manual-export');
+  await expect(dealOsSource).toContainText('supplemental');
+  await expect(dealOsSource).toContainText('Deal Radar · CA Deal Radar filters');
+
+  const reconciliation = page.getByRole('region', { name: 'Deal OS CRM reconciliation' });
+  await expect(reconciliation.getByText('Preview required', { exact: true })).toBeVisible();
+  const buildPreview = reconciliation.getByRole('button', { name: 'Build preview' });
+  await expect(buildPreview).toBeEnabled();
+  await buildPreview.click();
+
+  await expect(page.getByText(
+    'Reconciliation preview is ready: 1 create, 0 update, 0 unchanged, 0 tombstoned, 0 ambiguous. No CRM records were changed.',
+    { exact: true },
+  )).toBeVisible();
+  await expect.poll(() => fixture.previewRequest).not.toBeNull();
+  expect(fixture.previewRequest).toEqual({
+    method: 'POST',
+    path: '/api/admin/deal-hunter/crm-reconciliation/preview',
+    search: '',
+    contentType: 'application/json',
+    body: { importId: fixture.importId },
+  });
+  await expect(reconciliation.getByText('Preview ready', { exact: true })).toBeVisible();
+  for (const [label, value] of [
+    ['Create', '1'],
+    ['Update', '0'],
+    ['Unchanged', '0'],
+    ['Tombstoned', '0'],
+    ['Ambiguous', '0'],
+    ['Field conflicts', '0'],
+  ]) {
+    await expect(reconciliation.getByText(label, { exact: true }).locator('..').locator('dd')).toHaveText(value);
+  }
+  const executePlan = reconciliation.getByRole('button', { name: 'Execute exact plan' });
+  await expect(executePlan).toBeEnabled();
+  expect(fixture.executeRequest).toBeNull();
+  expect(state.apiRequests.filter(({ path }) => path === '/api/admin/deal-hunter/crm-reconciliation/execute')).toEqual([]);
+
+  const dialogEvidence = new Promise((resolve) => {
+    page.once('dialog', async (dialog) => {
+      const evidence = { type: dialog.type(), message: dialog.message() };
+      await dialog.accept(fixture.confirmation);
+      resolve(evidence);
+    });
+  });
+  await executePlan.click();
+  expect(await dialogEvidence).toEqual({
+    type: 'prompt',
+    message: `This will reconcile the exact reviewed canonical set. It will not send email or CIM requests. Type ${fixture.confirmation} to continue.`,
+  });
+
+  await expect(page.getByText(
+    'CRM reconciliation completed: 1 created, 0 updated, 0 enriched, 0 unchanged, 0 tombstoned, 0 failed. No outbound messages were sent.',
+    { exact: true },
+  )).toBeVisible();
+  await expect.poll(() => fixture.executeRequest).not.toBeNull();
+  expect(fixture.executeRequest).toEqual({
+    method: 'POST',
+    path: '/api/admin/deal-hunter/crm-reconciliation/execute',
+    search: '',
+    contentType: 'application/json',
+    body: {
+      importId: fixture.importId,
+      planDigest: fixture.planDigest,
+      previewGeneratedAt: fixture.previewGeneratedAt,
+      expectedOpportunityIds: [fixture.opportunityId],
+      confirmation: fixture.confirmation,
+    },
+  });
+  await expect(reconciliation.getByText('Preview required', { exact: true })).toBeVisible();
+  await expect(reconciliation.getByRole('button', { name: 'Build preview' })).toBeEnabled();
+  await expect(reconciliation.getByRole('button', { name: 'Execute exact plan' })).toBeDisabled();
+
+  const expectedApiRequests = [
+    'GET /api/admin/session',
+    'GET /api/admin/onboarding',
+    'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
+    'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25',
+    'GET /api/admin/deal-hunter/review',
+    'GET /api/admin/deal-hunter/cim-requests?page=1&pageSize=25&sort=first_requested_at&direction=desc',
+    'GET /api/admin/communications/unassigned?page=1&pageSize=25',
+    'GET /api/admin/acquisition-command-center',
+    'POST /api/admin/deal-hunter/deal-os-import',
+    'GET /api/admin/acquisition-command-center',
+    'POST /api/admin/deal-hunter/crm-reconciliation/preview',
+    'POST /api/admin/deal-hunter/crm-reconciliation/execute',
+    'GET /api/admin/acquisition-command-center',
+    'GET /api/admin/submissions?page=1&pageSize=25&sort=created_at&direction=desc',
+  ].sort();
+  await expect.poll(() => state.apiRequests.length).toBe(expectedApiRequests.length);
+  expect(state.apiRequests.map(phase1RequestSignature).sort()).toEqual(expectedApiRequests);
+  expect(state.apiRequests.filter(({ method }) => method !== 'GET').map(phase1RequestSignature)).toEqual([
+    'POST /api/admin/deal-hunter/deal-os-import',
+    'POST /api/admin/deal-hunter/crm-reconciliation/preview',
+    'POST /api/admin/deal-hunter/crm-reconciliation/execute',
+  ]);
+  const outboundMutationPath = /(?:\/send(?:\/|$)|cim-requests\/.*(?:send|approve)|broker-materials|follow-up|stage[-_]?2|scores?\/refresh|backfill|daily[-_/]?digest|outreach)/i;
+  expect(state.apiRequests.filter(({ method, path }) => method !== 'GET' && outboundMutationPath.test(path))).toEqual([]);
+  expect(state.unexpectedRequests).toEqual([]);
+  expect(state.unexpectedApiRequests).toEqual([]);
+  expect(state.offOriginRequests).toEqual([]);
+  expect(consoleErrors).toEqual([]);
+  expect(pageErrors).toEqual([]);
+  await expect(page.locator('vite-error-overlay, #webpack-dev-server-client-overlay, nextjs-portal')).toHaveCount(0);
 });
 
 test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow', async ({ page }, testInfo) => {

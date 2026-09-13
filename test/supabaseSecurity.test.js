@@ -47,6 +47,10 @@ const crmReconciliationMigrationUrl = new URL(
   '../supabase/migrations/20260814120000_deal_os_crm_reconciliation.sql',
   import.meta.url,
 );
+const crmReconciliationConcurrencyMigrationUrl = new URL(
+  '../supabase/migrations/20260912120000_deal_os_crm_reconciliation_concurrency_idempotency.sql',
+  import.meta.url,
+);
 const opportunityScoringMigrationUrl = new URL(
   '../supabase/migrations/20260816120000_deal_hunter_opportunity_scoring.sql',
   import.meta.url,
@@ -700,6 +704,52 @@ test('Supabase migration and fresh schema isolate every current app table to the
     );
   }
   assertServerOnlyPrivileges(schema, 'fresh schema');
+});
+
+test('CRM reconciliation concurrency repair is function-only, fail-closed, and matches the fresh schema', () => {
+  const migration = fs.readFileSync(crmReconciliationConcurrencyMigrationUrl, 'utf8');
+  const schema = fs.readFileSync(schemaUrl, 'utf8');
+  const functionName = 'start_deal_hunter_crm_reconciliation';
+  const functionDefinition = (sql) => {
+    const start = sql.indexOf(`create or replace function public.${functionName}`);
+    const end = sql.indexOf('\n$$;', start);
+    return start >= 0 && end >= start ? sql.slice(start, end + 4) : '';
+  };
+  const normalize = (sql) => sql.replace(/\s+/g, ' ').trim();
+  const migrationFunction = functionDefinition(migration);
+  const schemaFunction = functionDefinition(schema);
+
+  assert.ok(migrationFunction, 'repair migration defines the reconciliation start function');
+  assert.ok(schemaFunction, 'fresh schema defines the reconciliation start function');
+  assert.equal(normalize(schemaFunction), normalize(migrationFunction), 'fresh and upgrade function definitions match');
+  assert.doesNotMatch(migration, /\b(?:create|alter|drop)\s+(?:table|index|policy|schema)\b/i);
+  assertServiceRoleOnlyFunction(migration, 'CRM reconciliation concurrency migration', functionName);
+  assert.match(migrationFunction, /language plpgsql[\s\S]*security definer[\s\S]*set search_path = public/i);
+  assert.match(
+    migrationFunction,
+    /pg_catalog\.hashtextextended\(\s*'deal-hunter-crm-reconciliation\/run-id\/'\s*\|\|\s*v_run_id/i,
+  );
+  assert.match(
+    migrationFunction,
+    /pg_catalog\.hashtextextended\(\s*'deal-hunter-crm-reconciliation\/idempotency-key\/'\s*\|\|\s*v_idempotency_key/i,
+  );
+  assert.match(migrationFunction, /least\(v_run_lock, v_idempotency_lock\)[\s\S]*greatest\(v_run_lock, v_idempotency_lock\)/i);
+  assert.match(migrationFunction, /where id = v_run_id[\s\S]*where idempotency_key = v_idempotency_key/i);
+  assert.match(migrationFunction, /errcode\s*=\s*'22023'[\s\S]*reconciliation authority conflict:/i);
+  assert.match(migrationFunction, /v_existing_by_id\.import_id is distinct from v_import_id/i);
+  assert.match(migrationFunction, /v_existing_by_id\.plan_digest is distinct from v_plan_digest/i);
+  assert.match(migrationFunction, /v_existing_by_id\.mode is distinct from v_mode/i);
+  assert.match(migrationFunction, /v_existing_by_id\.plan is distinct from v_plan/i);
+  assert.match(migrationFunction, /v_items_differ[\s\S]*reconciliation authority conflict: immutable item set differs/i);
+  assert.match(
+    migrationFunction,
+    /exception when unique_violation then[\s\S]*errcode\s*=\s*'22023'[\s\S]*reconciliation authority conflict: item identifier binding differs/i,
+  );
+  assert.doesNotMatch(
+    migrationFunction,
+    /v_existing_by_id\.(?:status|results|last_error|updated_at|completed_at|counts|requested_by|created_at|metadata)\s+is\s+distinct\s+from/i,
+  );
+  assert.match(migrationFunction, /if v_existing_by_id\.id is not null[\s\S]*return v_existing_by_id;[\s\S]*insert into public\.deal_hunter_crm_reconciliation_runs/i);
 });
 
 test('manual follow-up RPC migration changes functions only and adds no table or column', () => {
