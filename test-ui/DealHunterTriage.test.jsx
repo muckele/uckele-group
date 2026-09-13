@@ -148,6 +148,18 @@ describe('Deal Hunter triage queue', () => {
     expect(screen.getByText('Not yet reviewed')).toBeVisible();
   });
 
+  test('renders a triage row when topReasons is absent', async () => {
+    const row = triageRow();
+    delete row.topReasons;
+    vi.stubGlobal('fetch', mockFetch([['/api/admin/deal-hunter/triage', () => queueResponse([row])]]));
+    render(<DealHunterTriage />);
+
+    expect(await screen.findByText('Commercial Fire Safety Inspection Co')).toBeVisible();
+    expect(screen.getByText('81')).toBeVisible();
+    expect(screen.getByText('high confidence')).toBeVisible();
+    expect(screen.queryByText('Annual profit is inside the target $300k-$750k range.')).not.toBeInTheDocument();
+  });
+
   test('flags an opportunity that changed after the operator reviewed it', async () => {
     vi.stubGlobal('fetch', mockFetch([
       ['/api/admin/deal-hunter/triage', () => queueResponse([triageRow({ reviewed: true, changedSinceReview: true, reviewedBy: 'owner' })])],
