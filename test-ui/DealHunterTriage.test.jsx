@@ -49,6 +49,50 @@ function triageRow(overrides = {}) {
   };
 }
 
+// Mirrors the lightweight publicTriageRow queue contract. Detail-only arrays
+// such as dimensions, gates, evidence, confidenceReasons, missingEvidence, and
+// topReasons are intentionally absent.
+function publicQueueRow(overrides = {}) {
+  return {
+    opportunityId: 'opp-production-shape',
+    dealKey: 'source:sheet-0:production-shape',
+    name: 'Production-Shaped Fire Safety Services',
+    state: 'NY',
+    listingUrl: 'https://listings.example.invalid/production-shape',
+    fitScore: 81,
+    scoreStatus: 'high-fit',
+    confidence: 'high',
+    completenessScore: 92,
+    missingEvidenceCount: 1,
+    contradictionCount: 0,
+    shouldRemove: false,
+    highFit: true,
+    geography: { city: 'Albany', state: 'NY', country: 'US' },
+    industry: 'Commercial safety services',
+    financials: {
+      annualProfit: 450000,
+      annualRevenue: 1200000,
+      askingPrice: 900000,
+      profitMultiple: 2,
+    },
+    topStrength: 'Annual profit is inside the target range.',
+    topConcern: 'Revenue evidence needs confirmation.',
+    workflow: { crmStatus: 'not-started', cimStatus: 'not-requested' },
+    observationFreshness: '2026-09-13T12:00:00.000Z',
+    operatorPriority: 'normal',
+    reviewed: false,
+    reviewedAt: '',
+    reviewedBy: '',
+    changedSinceReview: false,
+    dismissed: false,
+    dismissedReason: '',
+    scoredAt: '2026-09-13T12:00:00.000Z',
+    scoreFingerprint: 'production-shape-fingerprint',
+    rulesVersion: 'deal-hunter-fit-v2',
+    ...overrides,
+  };
+}
+
 function queueResponse(rows, overrides = {}) {
   return {
     success: true, ok: true, view: 'needs-review', sort: 'fit-score', direction: 'desc',
@@ -148,15 +192,16 @@ describe('Deal Hunter triage queue', () => {
     expect(screen.getByText('Not yet reviewed')).toBeVisible();
   });
 
-  test('renders a triage row when topReasons is absent', async () => {
-    const row = triageRow();
-    delete row.topReasons;
-    vi.stubGlobal('fetch', mockFetch([['/api/admin/deal-hunter/triage', () => queueResponse([row])]]));
+  test('renders the production queue contract without detail-only arrays', async () => {
+    vi.stubGlobal('fetch', mockFetch([['/api/admin/deal-hunter/triage', () => queueResponse([publicQueueRow()])]]));
     render(<DealHunterTriage />);
 
-    expect(await screen.findByText('Commercial Fire Safety Inspection Co')).toBeVisible();
+    expect(await screen.findByText('Production-Shaped Fire Safety Services')).toBeVisible();
     expect(screen.getByText('81')).toBeVisible();
     expect(screen.getByText('high confidence')).toBeVisible();
+    expect(screen.getByText('Completeness 92/100')).toBeVisible();
+    expect(screen.getByText('1 missing field')).toBeVisible();
+    expect(screen.getByRole('button', { name: /Why this score/ })).toBeVisible();
     expect(screen.queryByText('Annual profit is inside the target $300k-$750k range.')).not.toBeInTheDocument();
   });
 

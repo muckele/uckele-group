@@ -73,6 +73,7 @@ import {
   executeDealOsCrmReconciliation,
   previewDealOsCrmReconciliation,
   reviewDailyDeals,
+  reviewDailyDealsReadOnly,
   importDealOsExport,
   runCimStage2Automation,
   runDealHunterCimFollowUps,
@@ -1391,7 +1392,7 @@ export function createApp({
         return;
       }
 
-      const review = await reviewDailyDeals();
+      const review = await reviewDailyDealsReadOnly();
       review.dailyEmailJob = await getDailyDealHunterJobStatus();
       review.emailReadiness = await getEmailReadiness();
       await getSourceHealth(undefined, {

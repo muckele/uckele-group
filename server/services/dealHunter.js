@@ -41,6 +41,7 @@ import {
   logicalCimTouchesForRecipient,
   recordCimSafetyMetric,
   resolveDealHunterOpportunity,
+  resolveDealHunterOpportunityReadOnly,
 } from './cimOpportunityIdentity.js';
 import {
   buildOpportunitySourceObservationSnapshot,
@@ -5301,7 +5302,12 @@ function mergeSourceObservationRecordSnapshot(target, snapshot) {
   target.observations.push(...snapshot.observations.filter((observation) => !fields.has(observation.field)));
 }
 
-async function attachCanonicalOpportunityIdentities(storage, deals = [], completeSheetObservationScopes = new Map()) {
+async function attachCanonicalOpportunityIdentities(
+  storage,
+  deals = [],
+  completeSheetObservationScopes = new Map(),
+  { readOnly = false } = {},
+) {
   if (!storage.listCurrentDealHunterOpportunities) {
     return deals.map((deal) => ({ ...deal, identityStatus: 'unavailable', opportunityId: '' }));
   }
@@ -5312,7 +5318,7 @@ async function attachCanonicalOpportunityIdentities(storage, deals = [], complet
     : new Map();
   const perRecordSnapshots = new Map();
   for (const deal of deals) {
-    const resolution = await resolveDealHunterOpportunity({
+    const resolution = await (readOnly ? resolveDealHunterOpportunityReadOnly : resolveDealHunterOpportunity)({
       deal,
       storage,
       actor: 'deal-hunter-review',
@@ -5323,42 +5329,44 @@ async function attachCanonicalOpportunityIdentities(storage, deals = [], complet
       if (candidateIndex >= 0) candidates[candidateIndex] = resolution.opportunity;
       else candidates.push(resolution.opportunity);
     }
-    const sourceDeals = sourceObservationDealsForDeal(deal);
-    if (!resolution.ok || !resolution.opportunityId) {
-      for (const sourceDeal of sourceDeals) {
-        const scope = deferredSourceScopes.get(String(sourceDeal?.sourceId || '').trim());
-        if (scope) scope.complete = false;
-      }
-    } else {
-      const now = new Date().toISOString();
-      for (const sourceDeal of sourceDeals) {
-        const snapshot = buildOpportunitySourceObservationSnapshot({ opportunityId: resolution.opportunityId, deal: sourceDeal, now });
-        const completeScope = deferredSourceScopes.get(String(sourceDeal?.sourceId || '').trim());
-        if (!snapshot) {
-          if (completeScope) completeScope.complete = false;
-          continue;
+    if (!readOnly) {
+      const sourceDeals = sourceObservationDealsForDeal(deal);
+      if (!resolution.ok || !resolution.opportunityId) {
+        for (const sourceDeal of sourceDeals) {
+          const scope = deferredSourceScopes.get(String(sourceDeal?.sourceId || '').trim());
+          if (scope) scope.complete = false;
         }
-        if (completeScope) {
-          if (
-            !completeScope.expectedRecordIds.has(snapshot.source_record_id)
-            || completeScope.representedRecordIds.has(snapshot.source_record_id)
-            || snapshot.source_name !== completeScope.sourceName
-          ) {
-            completeScope.complete = false;
+      } else {
+        const now = new Date().toISOString();
+        for (const sourceDeal of sourceDeals) {
+          const snapshot = buildOpportunitySourceObservationSnapshot({ opportunityId: resolution.opportunityId, deal: sourceDeal, now });
+          const completeScope = deferredSourceScopes.get(String(sourceDeal?.sourceId || '').trim());
+          if (!snapshot) {
+            if (completeScope) completeScope.complete = false;
             continue;
           }
-          completeScope.representedRecordIds.add(snapshot.source_record_id);
-          const records = completeScope.recordsByOpportunity.get(snapshot.opportunity_id) || [];
-          records.push(snapshot);
-          completeScope.recordsByOpportunity.set(snapshot.opportunity_id, records);
-          continue;
-        }
-        const key = [snapshot.opportunity_id, snapshot.source_id, snapshot.source_record_id].join('\u0000');
-        const current = perRecordSnapshots.get(key);
-        if (current) {
-          mergeSourceObservationRecordSnapshot(current, snapshot);
-        } else {
-          perRecordSnapshots.set(key, snapshot);
+          if (completeScope) {
+            if (
+              !completeScope.expectedRecordIds.has(snapshot.source_record_id)
+              || completeScope.representedRecordIds.has(snapshot.source_record_id)
+              || snapshot.source_name !== completeScope.sourceName
+            ) {
+              completeScope.complete = false;
+              continue;
+            }
+            completeScope.representedRecordIds.add(snapshot.source_record_id);
+            const records = completeScope.recordsByOpportunity.get(snapshot.opportunity_id) || [];
+            records.push(snapshot);
+            completeScope.recordsByOpportunity.set(snapshot.opportunity_id, records);
+            continue;
+          }
+          const key = [snapshot.opportunity_id, snapshot.source_id, snapshot.source_record_id].join('\u0000');
+          const current = perRecordSnapshots.get(key);
+          if (current) {
+            mergeSourceObservationRecordSnapshot(current, snapshot);
+          } else {
+            perRecordSnapshots.set(key, snapshot);
+          }
         }
       }
     }
@@ -5372,12 +5380,12 @@ async function attachCanonicalOpportunityIdentities(storage, deals = [], complet
     });
   }
 
-  if (typeof storage.replaceDealHunterOpportunitySourceObservationSnapshot === 'function') {
+  if (!readOnly && typeof storage.replaceDealHunterOpportunitySourceObservationSnapshot === 'function') {
     for (const snapshot of perRecordSnapshots.values()) {
       await storage.replaceDealHunterOpportunitySourceObservationSnapshot(snapshot);
     }
   }
-  if (typeof storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot === 'function') {
+  if (!readOnly && typeof storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot === 'function') {
     for (const scope of deferredSourceScopes.values()) {
       if (
         !scope.complete
@@ -7142,7 +7150,12 @@ function normalizeDealHunterReviewMode(value = '') {
   return value === 'full-backfill' ? 'full-backfill' : 'daily';
 }
 
-async function buildDailyDealReview({ reviewMode = 'daily', dealOsImportId = '', storage = getStorage() } = {}) {
+async function buildDailyDealReview({
+  reviewMode = 'daily',
+  dealOsImportId = '',
+  storage = getStorage(),
+  readOnly = false,
+} = {}) {
   const config = getConfig();
   const normalizedReviewMode = normalizeDealHunterReviewMode(reviewMode);
   const generatedAt = new Date().toISOString();
@@ -7224,6 +7237,7 @@ async function buildDailyDealReview({ reviewMode = 'daily', dealOsImportId = '',
     storage,
     candidateDeals.map((candidateDeal) => scoreDeal(candidateDeal)),
     completeSheetObservationScopes,
+    { readOnly },
   );
   // A cap or an incremental review is intentionally merely ineligible for
   // source-wide replacement. Ambiguous raw source-record identities are more
@@ -7420,6 +7434,38 @@ export async function reviewDailyDeals({
     await persistDealHunterHistory(result.storage, result.scoredDeals);
   }
 
+  return withScoredDeals ? { review: result.review, scoredDeals: result.scoredDeals } : result.review;
+}
+
+export async function reviewDailyDealsReadOnly({
+  reviewMode = 'daily',
+  withScoredDeals = false,
+  storage = getStorage(),
+} = {}) {
+  const result = await buildDailyDealReview({ reviewMode, storage, readOnly: true });
+  const automationStatus = await getCimAutomationStatus({ storage, config: getConfig() });
+  const [requests, events] = await Promise.all([
+    storage.listDealHunterCimRequests?.({ limit: 100000 }) || [],
+    storage.listEmailEvents?.({ limit: 100000 }) || [],
+  ]);
+  const evaluated = evaluateCimAutomationCandidates({
+    review: result.review,
+    scoredDeals: result.scoredDeals,
+    status: automationStatus,
+    requests,
+    events,
+  });
+  result.review.cimAutomation = {
+    ...automationStatus,
+    run: {
+      mode: 'preview-only',
+      ...evaluated,
+      sent: 0,
+      failed: 0,
+      providerCalls: 0,
+      results: [],
+    },
+  };
   return withScoredDeals ? { review: result.review, scoredDeals: result.scoredDeals } : result.review;
 }
 

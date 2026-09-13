@@ -384,6 +384,35 @@ function identityStorageAvailable(storage) {
   );
 }
 
+function readOnlyIdentityStorageAvailable(storage) {
+  return Boolean(
+    storage?.findCurrentDealHunterOpportunityByAliases
+    && storage?.listCurrentDealHunterOpportunities,
+  );
+}
+
+function buildObservedIdentityException({ deal, aliases, reason, candidates = [], comparisons = [], now }) {
+  return {
+    id: sha256(`cim-identity-exception:${aliases.map((item) => item.alias_key).sort().join('|')}`),
+    created_at: now,
+    updated_at: now,
+    status: 'open',
+    observed_deal_key: normalizeText(deal.dealKey || deal.deal_key, 1200),
+    observed_name: normalizeText(deal.name || deal.deal_name, 300),
+    observed_recipient: normalizeCimRecipient(deal.brokerEmail || deal.recipient_email),
+    candidate_opportunity_ids: candidates,
+    reason,
+    evidence_version: CIM_IDENTITY_EVIDENCE_VERSION,
+    resolved_at: null,
+    resolved_by: null,
+    resolution_reason: null,
+    metadata: {
+      aliases: aliases.map((item) => item.alias_key),
+      comparisons,
+    },
+  };
+}
+
 function identitySafetyStorageAvailable(storage) {
   return Boolean(
     identityStorageAvailable(storage)
@@ -561,6 +590,87 @@ export async function resolveDealHunterOpportunity({
     aliases,
     resolution: acquired.created ? 'new-opportunity' : 'concurrent-alias-reconciliation',
   };
+}
+
+/**
+ * Resolve an observed listing against existing canonical identity state without
+ * creating or updating opportunities, aliases, or identity exceptions.
+ */
+export async function resolveDealHunterOpportunityReadOnly({
+  deal,
+  storage = getStorage(),
+  candidateOpportunities = null,
+} = {}) {
+  if (!deal || !readOnlyIdentityStorageAvailable(storage)) {
+    return { ok: false, status: 'unavailable', error: 'Canonical Deal Hunter identity storage is unavailable.' };
+  }
+  const aliases = buildCimOpportunityAliases(deal);
+  if (aliases.length === 0) return { ok: false, status: 'ambiguous', error: 'The opportunity has no durable identity evidence.' };
+  const now = new Date().toISOString();
+  const observedException = ({ reason, candidates = [], comparisons = [] }) => ({
+    ok: false,
+    status: 'ambiguous',
+    error: 'Opportunity identity is ambiguous and requires administrator resolution before outreach.',
+    identityException: buildObservedIdentityException({ deal, aliases, reason, candidates, comparisons, now }),
+    aliases,
+  });
+
+  let exact;
+  try {
+    exact = await storage.findCurrentDealHunterOpportunityByAliases(aliases.map((item) => item.alias_key));
+  } catch (error) {
+    return observedException({
+      reason: error?.code === 'DEAL_HUNTER_OPPORTUNITY_NOT_CURRENT'
+        ? 'non-current-canonical-alias'
+        : 'conflicting-canonical-aliases',
+      candidates: error?.opportunityId ? [error.opportunityId] : [],
+    });
+  }
+  if (exact) {
+    if (exact.status !== 'active') {
+      return observedException({ reason: 'non-current-canonical-alias', candidates: [exact.opportunity_id] });
+    }
+    return {
+      ok: true,
+      status: 'resolved',
+      opportunity: exact,
+      opportunityId: exact.opportunity_id,
+      aliases,
+      resolution: 'exact-alias',
+    };
+  }
+
+  const opportunities = (Array.isArray(candidateOpportunities)
+    ? candidateOpportunities
+    : await storage.listCurrentDealHunterOpportunities({ limit: 100000 }))
+    .filter((opportunity) => opportunity?.status === 'active');
+  const comparisons = opportunities.map((opportunity) => ({ opportunity, ...compareCimOpportunityEvidence(deal, opportunity) }));
+  const automatic = comparisons.filter((item) => item.automatic);
+  const ambiguous = comparisons.filter((item) => item.ambiguous);
+  if (automatic.length === 1) {
+    const opportunity = automatic[0].opportunity;
+    return {
+      ok: true,
+      status: 'resolved',
+      opportunity,
+      opportunityId: opportunity.opportunity_id,
+      aliases,
+      resolution: 'high-confidence-transition',
+      evidence: automatic[0].evidence,
+    };
+  }
+  if (automatic.length > 1 || ambiguous.length > 0) {
+    const candidates = [...automatic, ...ambiguous].slice(0, 10);
+    return observedException({
+      reason: automatic.length > 1 ? 'multiple-high-confidence-candidates' : 'ambiguous-similarity',
+      candidates: candidates.map((item) => item.opportunity.opportunity_id),
+      comparisons: candidates.map((item) => ({
+        opportunityId: item.opportunity.opportunity_id,
+        evidence: item.evidence,
+      })),
+    });
+  }
+  return { ok: false, status: 'unresolved', error: 'No canonical opportunity could be resolved.', aliases };
 }
 
 export function isAcceptedCimRequest(request = {}) {
