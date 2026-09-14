@@ -73,6 +73,7 @@ import {
   executeDealOsCrmReconciliation,
   previewDealOsCrmReconciliation,
   reviewDailyDeals,
+  reviewDailyDealsReadOnly,
   importDealOsExport,
   runCimStage2Automation,
   runDealHunterCimFollowUps,
@@ -1391,7 +1392,7 @@ export function createApp({
         return;
       }
 
-      const review = await reviewDailyDeals();
+      const review = await reviewDailyDealsReadOnly();
       review.dailyEmailJob = await getDailyDealHunterJobStatus();
       review.emailReadiness = await getEmailReadiness();
       await getSourceHealth(undefined, {
@@ -1573,6 +1574,29 @@ export function createApp({
           summary: deferredReview.importSummary,
           scoreRefresh: null,
           reviewWarning: 'Full-backfill scoring is deferred until every required Google Sheet is healthy. Existing persisted scores were left unchanged.',
+        });
+        return;
+      }
+      const identityResolutionDeferred = scoreRefresh?.ok === false
+        && Array.isArray(scoreRefresh.authorityProblems)
+        && scoreRefresh.authorityProblems.length === 1
+        && scoreRefresh.authorityProblems[0] === 'the canonical candidate set contains an unresolved identity'
+        && Array.isArray(scoreRefresh.review?.identityExceptions)
+        && scoreRefresh.review.identityExceptions.length > 0;
+      if (identityResolutionDeferred) {
+        const deferredReview = {
+          ...scoreRefresh.review,
+          dailyEmailJob: review.dailyEmailJob,
+          emailReadiness: review.emailReadiness,
+          scoringDeferred: true,
+          scoringDeferredReason: 'Scoring is deferred until every canonical identity exception in this review is resolved.',
+        };
+        response.json({
+          success: true,
+          review: deferredReview,
+          summary: deferredReview.importSummary,
+          scoreRefresh: null,
+          reviewWarning: 'Full-backfill scoring is deferred until every canonical identity exception in this review is resolved. Existing persisted scores were left unchanged.',
         });
         return;
       }

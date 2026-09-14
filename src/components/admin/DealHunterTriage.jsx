@@ -55,9 +55,10 @@ function ScoreReadout({ row }) {
 }
 
 function DimensionBar({ dimensions }) {
+  const safeDimensions = Array.isArray(dimensions) ? dimensions : [];
   return (
     <div className="flex gap-1" aria-hidden="true">
-      {dimensions.map((dimension) => (
+      {safeDimensions.map((dimension) => (
         <span
           className={`h-1.5 w-6 rounded-full ${verdictTone[dimension.verdict] || verdictTone.absent}`}
           key={dimension.id}
