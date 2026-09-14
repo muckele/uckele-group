@@ -1,0 +1,25 @@
+{
+  "schema": "deal-hunter-crm-integrity-f02-repair2-diagnostic-attestation-v1",
+  "provenance": {
+    "source": "owner-reviewed-completed-read-only-production-diagnosis",
+    "release": "122",
+    "revision": "9fcfe65505348421373242aa304caefb4b30396b",
+    "observationContract": "Each raw SELECT-star fingerprint and its bounded relationship projection came from the same read-only row observation."
+  },
+  "collisionSubmissionObservation": {
+    "id": "daa9ea12-786f-4769-b702-d9309525c455",
+    "rawFingerprint": "6b811304f09d44b3737f73b2a479654c4a5c4b45fee4b5e2b6e67542eb674082",
+    "directOpportunityId": null,
+    "metadataOpportunityId": "opp_683681c2-bd49-4c46-be4f-6d969143d907"
+  },
+  "collisionOpportunityObservation": {
+    "id": "opp_683681c2-bd49-4c46-be4f-6d969143d907",
+    "previousRawFingerprint": "f8f3b6cd79a33551f0579642ddcd3a2691ad90e3b5c46afb95cc1eac0fc2d838",
+    "currentRawFingerprint": "a538b0ecd23b17a00a20bd6499de6ec922ec7aaeed4311aa84521c5eb668743e",
+    "currentUpdatedAt": "2026-09-13T15:00:39.347Z",
+    "changedFields": [
+      "updated_at"
+    ]
+  },
+  "attestationChecksum": "75a0286db7a8915e8612c966e7799658eb61196508adabf8577bda9419c6ab0e"
+}
