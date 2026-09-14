@@ -1,0 +1,100 @@
+{
+  "schema": "deal-hunter-crm-integrity-f02-repair3-context-attestation-v1",
+  "provenance": {
+    "access": "Read-only historical evidence derived from exactly the two named opportunity rows in verified retained backups; no live production query.",
+    "observationContract": "Each historical row matched Repair2 raw authority; its later row differed in exactly updated_at; both projected serializations produced the recorded context projection fingerprint.",
+    "rawSelectStarColumnOrder": [
+      "opportunity_id",
+      "created_at",
+      "updated_at",
+      "canonical_name",
+      "canonical_recipient",
+      "canonical_location",
+      "primary_submission_id",
+      "identity_version",
+      "status",
+      "metadata"
+    ],
+    "historicalBackup": {
+      "path": "/data/backups/backup-2026-09-14T10-38-34-370Z-90d965dd",
+      "id": "90d965dd-1f0a-44e6-bd03-baa7c3a34455",
+      "createdAt": "2026-09-14T10:38:34.370Z",
+      "databaseSha256": "805c44efa56c55650b00b2cdb688312a8b0f47f85731466b813fff1ffcf2f04c",
+      "manifestVersion": 2,
+      "quickCheck": "ok",
+      "verified": true
+    },
+    "laterBackup": {
+      "path": "/data/backups/backup-2026-09-14T17-18-02-783Z-6ae4b1f6",
+      "id": "6ae4b1f6-b384-4770-9760-04921532404c",
+      "createdAt": "2026-09-14T17:18:02.783Z",
+      "databaseSha256": "967fb311cab35ae3e6143fe4e2d6e4afd391dcfe9beade9c96832d16167d63a1",
+      "manifestVersion": 2,
+      "quickCheck": "ok",
+      "verified": true
+    }
+  },
+  "observations": {
+    "collisionOpportunity": {
+      "opportunityId": "opp_683681c2-bd49-4c46-be4f-6d969143d907",
+      "historicalRawFingerprint": "a538b0ecd23b17a00a20bd6499de6ec922ec7aaeed4311aa84521c5eb668743e",
+      "laterRawFingerprint": "c00302dcd3436861149419a6f3df655c95d984353c40879b959851466ccdabd3",
+      "historicalUpdatedAt": "2026-09-13T15:00:39.347Z",
+      "laterUpdatedAt": "2026-09-14T15:00:49.165Z",
+      "contextProjectionFingerprint": "e1f8e123556493101a6c9407d3df40c9034a181917c60cc0b1dd27d68581add3",
+      "changedFields": [
+        "updated_at"
+      ]
+    },
+    "reviewedUnrelatedOpportunity": {
+      "opportunityId": "opp_5ae93328-11e3-49de-b3f1-d28d4e76242e",
+      "historicalRawFingerprint": "7049798420b1a7bb5a6f027a5cbed6a707fa25a96599a754b56ddea47d3053e8",
+      "laterRawFingerprint": "f37f3fb4f97ae2da490a9842a19b845116896118d9ad8e8d6cc6ff0322509d63",
+      "historicalUpdatedAt": "2026-09-13T19:29:59.123Z",
+      "laterUpdatedAt": "2026-09-14T15:00:49.563Z",
+      "contextProjectionFingerprint": "7be900911fb0192da9d89fd1bc089eca774a8a735b4fd3a6c37661807248b3e0",
+      "changedFields": [
+        "updated_at"
+      ]
+    }
+  },
+  "historicalHelperValidation": {
+    "phase": "post-implementation-historical-validation",
+    "result": "PASS",
+    "scope": "Exactly the two opportunity IDs in observations, selected from each of the two verified backup bundles in provenance and streamed in memory through the implemented helpers.",
+    "rawRowCount": 4,
+    "rawRowsRetained": false,
+    "backupConnection": {
+      "readonly": true,
+      "fileMustExist": true,
+      "queryOnly": true
+    },
+    "helpers": [
+      "server/repairs/dealHunterCrmIntegrityF02.js#fingerprintDealHunterCrmIntegrityF02RawRow",
+      "server/repairs/dealHunterCrmIntegrityF02Repair2.js#fingerprintDealHunterCrmIntegrityF02Repair2RawRow",
+      "server/repairs/dealHunterCrmIntegrityF02Repair3.js#projectDealHunterCrmIntegrityF02Repair3ContextOpportunity",
+      "server/repairs/dealHunterCrmIntegrityF02Repair3.js#fingerprintDealHunterCrmIntegrityF02Repair3ContextOpportunity"
+    ],
+    "results": {
+      "collisionOpportunity": {
+        "selectStarColumnOrderMatches": true,
+        "changedFields": ["updated_at"],
+        "rawMetadataBytesEqual": true,
+        "historicalRawMatchesRepair2Authority": true,
+        "laterRawDiffersFromRepair2Authority": true,
+        "historicalProjectionFingerprint": "e1f8e123556493101a6c9407d3df40c9034a181917c60cc0b1dd27d68581add3",
+        "laterProjectionFingerprint": "e1f8e123556493101a6c9407d3df40c9034a181917c60cc0b1dd27d68581add3"
+      },
+      "reviewedUnrelatedOpportunity": {
+        "selectStarColumnOrderMatches": true,
+        "changedFields": ["updated_at"],
+        "rawMetadataBytesEqual": true,
+        "historicalRawMatchesRepair2Authority": true,
+        "laterRawDiffersFromRepair2Authority": true,
+        "historicalProjectionFingerprint": "7be900911fb0192da9d89fd1bc089eca774a8a735b4fd3a6c37661807248b3e0",
+        "laterProjectionFingerprint": "7be900911fb0192da9d89fd1bc089eca774a8a735b4fd3a6c37661807248b3e0"
+      }
+    }
+  },
+  "attestationChecksum": "f8eb391f4dcefc1d3c9cae70618e3bb36a949d30c368b6cbb78b1efcd0209802"
+}
