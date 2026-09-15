@@ -1500,9 +1500,9 @@ test('CRM preflight does not use a superseded opportunity primary submission as 
     status: 'superseded',
   });
 
-  assert.equal(
-    await findExistingDealHunterSubmission(storage, { opportunityId: 'opp-later-superseded' }),
-    null,
+  await assert.rejects(
+    findExistingDealHunterSubmission(storage, { opportunityId: 'opp-later-superseded' }),
+    (error) => error?.code === 'CRM_MATCH_AUTHORITY_STALE',
   );
   assert.equal((await storage.getSubmission(created.submission.id)).id, created.submission.id);
   assert.equal((await storage.getDealHunterOpportunity('opp-later-superseded')).primary_submission_id, created.submission.id);

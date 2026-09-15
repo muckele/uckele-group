@@ -1582,21 +1582,56 @@ test('follow-up processing does not assign a subject-only reply across a shared 
   });
   const firstSubmission = await storage.getSubmission(initial.request.submission_id);
   const secondSubmissionId = '00000000-0000-4000-8000-000000000202';
+  const secondOpportunityId = 'opp_shared_broker_second';
+  const secondCreatedAt = new Date(Date.now() - 60_000).toISOString();
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: secondOpportunityId,
+    created_at: secondCreatedAt,
+    updated_at: secondCreatedAt,
+    canonical_name: 'Second Commercial Safety Services',
+    canonical_recipient: initial.request.recipient_email,
+    canonical_location: 'CA',
+    primary_submission_id: null,
+    identity_version: 'shared-broker-test-v1',
+    status: 'active',
+    metadata: {},
+  });
+  await storage.upsertDealHunterOpportunityAlias({
+    id: 'alias_shared_broker_second',
+    opportunity_id: secondOpportunityId,
+    alias_type: 'listing-url',
+    alias_value: 'https://broker.example.test/listing-shared-broker-2',
+    alias_key: 'listing-url:https://broker.example.test/listing-shared-broker-2',
+    source: 'shared-broker-test',
+    first_observed_at: secondCreatedAt,
+    last_observed_at: secondCreatedAt,
+    evidence_version: 'shared-broker-test-v1',
+    resolution_method: 'fixture',
+    confidence_state: 'exact',
+    resolved_by: 'test',
+    metadata: {},
+  });
   await storage.insertSubmission({
     ...firstSubmission,
     id: secondSubmissionId,
-    created_at: new Date(Date.now() - 60_000).toISOString(),
-    updated_at: new Date(Date.now() - 60_000).toISOString(),
+    created_at: secondCreatedAt,
+    updated_at: secondCreatedAt,
     company: 'Second Commercial Safety Services',
     listing_url: 'https://broker.example.test/listing-shared-broker-2',
-    deal_hunter_opportunity_id: null,
+    deal_hunter_opportunity_id: secondOpportunityId,
     metadata: {
       ...(firstSubmission.metadata || {}),
       dealHunter: {
         ...(firstSubmission.metadata?.dealHunter || {}),
+        opportunityId: secondOpportunityId,
         dealKey: 'shared-broker-second-deal',
       },
     },
+  });
+  await storage.linkDealHunterCrmSubmission({
+    opportunityId: secondOpportunityId,
+    submissionId: secondSubmissionId,
+    updatedAt: secondCreatedAt,
   });
 
   const dueAt = new Date(Date.now() - 1000).toISOString();
@@ -1615,6 +1650,7 @@ test('follow-up processing does not assign a subject-only reply across a shared 
     deal_key: 'shared-broker-second-deal',
     deal_name: 'Second Commercial Safety Services',
     listing_url: 'https://broker.example.test/listing-shared-broker-2',
+    opportunity_id: secondOpportunityId,
     submission_id: secondSubmissionId,
     provider_message_id: 'shared-broker-second-provider-message',
     reply_to_address: 'shared-broker-second-request@inbound.example.test',

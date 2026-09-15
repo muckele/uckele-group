@@ -21,6 +21,7 @@ const appModule = await import('../server/app.js');
 const { createApp } = appModule;
 const { getConfig } = await import('../server/config.js');
 const { buildEmailReadiness } = await import('../server/services/emailReadiness.js');
+const { resolveDealHunterOpportunity } = await import('../server/services/cimOpportunityIdentity.js');
 const { createSecureUploadRequest } = await import('../server/services/documentVault.js');
 const { createManualSubmission } = await import('../server/services/submissions.js');
 const { getStorage } = await import('../server/storage/index.js');
@@ -1633,6 +1634,24 @@ test('communication assignment, corrected retry, and Deal Hunter disposition enf
     assert.equal(duplicateAssignment.status, 409);
 
     const cimRequestId = 'http-bounced-cim-request';
+    const resolvedOpportunity = await resolveDealHunterOpportunity({
+      storage,
+      actor: 'http-lifecycle-fixture',
+      deal: {
+        dealKey: 'http-boundary-deal',
+        name: 'HTTP Lifecycle Boundary Services',
+        listingUrl: 'https://broker.example.test/http-boundary-deal',
+        brokerEmail: 'failed-boundary@example.com',
+        annualProfit: 450000,
+      },
+    });
+    assert.equal(resolvedOpportunity.ok, true);
+    const opportunityId = resolvedOpportunity.opportunityId;
+    await storage.linkDealHunterCrmSubmission({
+      opportunityId,
+      submissionId: submission.id,
+      updatedAt: now,
+    });
     await storage.upsertDealHunterCimRequest({
       id: cimRequestId,
       created_at: now,
@@ -1642,6 +1661,7 @@ test('communication assignment, corrected retry, and Deal Hunter disposition enf
       last_attempt_at: now,
       last_delivery_event_at: now,
       last_activity_at: now,
+      opportunity_id: opportunityId,
       deal_key: 'http-boundary-deal',
       recipient_email: 'failed-boundary@example.com',
       subject: 'CIM request for HTTP Lifecycle Boundary Services',
@@ -1685,8 +1705,8 @@ test('communication assignment, corrected retry, and Deal Hunter disposition enf
       headers: { 'Content-Type': 'application/json', Cookie: adminCookie, 'X-Request-ID': retryRequestId },
       body: JSON.stringify({ newRecipientEmail: 'corrected-boundary@example.com' }),
     });
-    assert.equal(retryResponse.status, 201);
     const retryResult = await retryResponse.json();
+    assert.equal(retryResponse.status, 201, JSON.stringify(retryResult));
     assert.equal(retryResult.success, true);
     assert.equal(retryResult.request.delivery_state, 'development-only');
     const communicationsAfterRetry = await storage.listCrmCommunications({
