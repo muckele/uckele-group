@@ -406,7 +406,7 @@ test('CRM alias lookup prefers the active canonical card over an archived syndic
     async getSubmissionByListingUrl(listingUrl) {
       return listingUrl === syndicatedUrl ? archivedDuplicate : activeCanonical;
     },
-    async listSubmissions() { return { rows: [] }; },
+    async listSubmissions() { return { rows: [archivedDuplicate, activeCanonical], total: 2 }; },
   };
 
   const existing = await findExistingDealHunterSubmission(storage, {
@@ -416,7 +416,8 @@ test('CRM alias lookup prefers the active canonical card over an archived syndic
     listingAliases: [syndicatedUrl, canonicalUrl],
   });
 
-  assert.equal(existing.id, 'active-bizbuysell-card');
+  assert.equal(existing.status, 'unique-exact');
+  assert.equal(existing.submission.id, 'active-bizbuysell-card');
 });
 
 test('CRM lookup reuses a Daily Deal Update card for a corroborated Deal OS syndication', async () => {
@@ -444,7 +445,7 @@ test('CRM lookup reuses a Daily Deal Update card for a corroborated Deal OS synd
     async getSubmissionByListingUrl() { return null; },
     async listSubmissions({ search }) {
       searches.push(search);
-      return { rows: search === dailyDealRecord.company ? [dailyDealRecord] : [] };
+      return { rows: search ? [] : [dailyDealRecord], total: search ? 0 : 1 };
     },
   };
 
@@ -465,8 +466,9 @@ test('CRM lookup reuses a Daily Deal Update card for a corroborated Deal OS synd
     listingUrl: 'https://www.dealstream.com/d/biz-sale/hvac/tomhyp',
   });
 
-  assert.equal(existing.id, dailyDealRecord.id);
-  assert.equal(searches.includes(dailyDealRecord.company), true);
+  assert.equal(existing.status, 'unique-corroborated');
+  assert.equal(existing.submission.id, dailyDealRecord.id);
+  assert.deepEqual(searches, [undefined]);
 });
 
 test('CRM lookup does not reuse a same-name listing when geography conflicts', async () => {
@@ -490,8 +492,8 @@ test('CRM lookup does not reuse a same-name listing when geography conflicts', a
   };
   const storage = {
     async getSubmissionByListingUrl() { return null; },
-    async listSubmissions({ search }) {
-      return { rows: search === dailyDealRecord.company ? [dailyDealRecord] : [] };
+    async listSubmissions() {
+      return { rows: [dailyDealRecord], total: 1 };
     },
   };
 
@@ -510,7 +512,8 @@ test('CRM lookup does not reuse a same-name listing when geography conflicts', a
     listingUrl: 'https://www.dealstream.com/d/biz-sale/hvac/tomhyp',
   });
 
-  assert.equal(existing, null);
+  assert.equal(existing.status, 'none');
+  assert.equal(existing.submission, null);
 });
 
 test('canonical merge preserves field provenance and records deterministic non-identity conflicts', () => {

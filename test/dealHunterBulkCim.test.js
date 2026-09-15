@@ -69,6 +69,7 @@ function createCimStorage() {
   const identityExceptions = new Map();
   const opportunityClaims = new Map();
   const recipientClaims = new Map();
+  const crmImports = new Map();
   const cimRequestReadCalls = [];
 
   function requestKey(request) {
@@ -324,14 +325,33 @@ function createCimStorage() {
     async getSubmission(id) {
       return submissions.get(id) || null;
     },
-    async listSubmissions({ search = '' } = {}) {
-      const normalizedSearch = String(search || '').trim();
-      const rows = Array.from(submissions.values()).filter((submission) => (
+    async getDealHunterCrmImport({ id = '', opportunityId = '' } = {}) {
+      return Array.from(crmImports.values()).find((record) => (
+        (id && record.id === id) || (opportunityId && record.opportunity_id === opportunityId)
+      )) || null;
+    },
+    async claimDealHunterCrmImport(record) {
+      const existing = crmImports.get(record.id);
+      if (existing) return { claimed: false, importRecord: existing };
+      crmImports.set(record.id, record);
+      return { claimed: true, importRecord: record };
+    },
+    async updateDealHunterCrmImport(id, values) {
+      const updated = { ...crmImports.get(id), ...values };
+      crmImports.set(id, updated);
+      return updated;
+    },
+    async listSubmissions({ search = '', limit = 100, page = 1 } = {}) {
+      const normalizedSearch = String(search || '').trim().toLowerCase();
+      const matches = Array.from(submissions.values()).filter((submission) => (
         !normalizedSearch
-        || submission.metadata?.dealHunter?.dealKey === normalizedSearch
-        || String(submission.notes || '').includes(normalizedSearch)
+        || String(submission.company || '').toLowerCase().includes(normalizedSearch)
+        || String(submission.listing_url || '').toLowerCase().includes(normalizedSearch)
+        || String(submission.metadata?.dealHunter?.dealKey || '').toLowerCase().includes(normalizedSearch)
+        || String(submission.notes || '').toLowerCase().includes(normalizedSearch)
       ));
-      return { rows, total: rows.length, page: 1, pageSize: rows.length || 1 };
+      const offset = (page - 1) * limit;
+      return { rows: matches.slice(offset, offset + limit), total: matches.length, page, pageSize: limit };
     },
     async getLatestSecureUploadRequestForSubmission() {
       return null;
@@ -378,6 +398,11 @@ function createCimStorage() {
 
 function enableCrmImportClaims(storage) {
   const crmImports = new Map();
+  storage.getDealHunterCrmImport = async ({ id = '', opportunityId = '' } = {}) => (
+    Array.from(crmImports.values()).find((record) => (
+      (id && record.id === id) || (opportunityId && record.opportunity_id === opportunityId)
+    )) || null
+  );
   storage.claimDealHunterCrmImport = async (record) => {
     const existing = crmImports.get(record.id);
     if (existing) return { claimed: false, importRecord: existing };
@@ -395,6 +420,23 @@ function enableCrmImportClaims(storage) {
     return updated;
   };
   return crmImports;
+}
+
+function seedAmbiguousLegacyCandidates(storage, deal) {
+  const state = deal.state || String(deal.location || '').split(',').at(-1)?.trim() || 'CA';
+  for (const id of ['legacy-candidate-a', 'legacy-candidate-b']) {
+    storage.submissions.set(id, {
+      id,
+      status: 'review',
+      company: deal.name,
+      listing_url: '',
+      asking_price: `$${Number(deal.askingPrice || 0).toLocaleString('en-US')}`,
+      ttm_revenue: `$${Number(deal.annualRevenue || 0).toLocaleString('en-US')}`,
+      ttm_ebitda: `$${Number(deal.annualProfit || 0).toLocaleString('en-US')}`,
+      deal_hunter_opportunity_id: null,
+      metadata: { dealHunter: { raw: { State: state } } },
+    });
+  }
 }
 
 test('Deal Hunter operational history reads keep opportunity filters in generic scope', async () => {
@@ -1096,6 +1138,382 @@ test('daily internal summary never writes high-fit listings to CRM', async () =>
   assert.equal(result.crmSync.explicitActionRequired, true);
   assert.equal(crmClaimCalls, 0);
   assert.equal(storage.submissions.size, 0);
+});
+
+test('explicit high-fit CRM sync blocks ambiguous legacy matches before its durable import claim', async () => {
+  const { reviewDailyDeals, syncDealHunterHighFitsToCrm } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  enableCrmImportClaims(storage);
+  const originalClaim = storage.claimDealHunterCrmImport;
+  let claimCalls = 0;
+  storage.claimDealHunterCrmImport = async (...args) => {
+    claimCalls += 1;
+    return originalClaim(...args);
+  };
+  const reviewed = await reviewDailyDeals({ storage });
+  const [deal] = reviewed.qualified;
+  assert.ok(deal?.opportunityId);
+  seedAmbiguousLegacyCandidates(storage, deal);
+
+  const result = await syncDealHunterHighFitsToCrm({
+    confirmation: 'SYNC HIGH FITS',
+    expectedDealKeys: reviewed.qualified.map((item) => item.dealKey),
+    requestedBy: 'test-admin',
+    storage,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 409);
+  assert.equal(result.code, 'CRM_MATCH_AMBIGUOUS');
+  assert.deepEqual(result.candidateIds, ['legacy-candidate-a', 'legacy-candidate-b']);
+  assert.equal(result.crmSync.results[0].code, 'CRM_MATCH_AMBIGUOUS');
+  assert.equal(claimCalls, 0);
+  assert.equal(storage.submissions.size, 2);
+  assert.equal(storage.activities.length, 0);
+  assert.equal(storage.requests.size, 0);
+  assert.equal(storage.communications.size, 0);
+});
+
+test('direct and bulk CIM paths expose the ambiguity blocker before CRM claims, requests, or communication', async () => {
+  const {
+    reviewDailyDeals,
+    sendDealHunterCimRequest,
+    sendDealHunterReadyCimRequests,
+  } = await import('../server/services/dealHunter.js');
+
+  for (const mode of ['direct', 'bulk']) {
+    const storage = createCimStorage();
+    let claimCalls = 0;
+    storage.claimDealHunterCrmImport = async () => {
+      claimCalls += 1;
+      throw new Error('ambiguity must block before a claim');
+    };
+    const reviewed = await reviewDailyDeals({ storage });
+    const deal = reviewed.qualified.find((item) => item.cimRequest?.canRequest);
+    assert.ok(deal?.opportunityId, `${mode} fixture has a CIM-ready canonical deal`);
+    seedAmbiguousLegacyCandidates(storage, deal);
+
+    const result = mode === 'direct'
+      ? await sendDealHunterCimRequest({
+          dealKey: deal.dealKey,
+          snapshotToken: deal.cimRequest.snapshotToken,
+          requestedBy: 'test-admin',
+          storage,
+        })
+      : await sendDealHunterReadyCimRequests({
+          requestedBy: 'test-admin',
+          selections: [{
+            dealKey: deal.dealKey,
+            recipientEmail: deal.cimRequest.recipientEmail,
+            snapshotToken: deal.cimRequest.snapshotToken,
+          }],
+          storage,
+        });
+
+    assert.equal(result.ok, false, mode);
+    assert.equal(result.status, 409, mode);
+    assert.equal(result.code, 'CRM_MATCH_AMBIGUOUS', mode);
+    assert.deepEqual(result.candidateIds, ['legacy-candidate-a', 'legacy-candidate-b'], mode);
+    assert.equal(claimCalls, 0, mode);
+    assert.equal(storage.submissions.size, 2, mode);
+    assert.equal(storage.activities.length, 0, mode);
+    assert.equal(storage.requests.size, 0, mode);
+    assert.equal(storage.communications.size, 0, mode);
+  }
+});
+
+test('direct CIM refuses a durable crm-deleted tombstone even when one matching legacy residue exists', async () => {
+  const { reviewDailyDeals, sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const reviewed = await reviewDailyDeals({ storage });
+  const deal = reviewed.qualified.find((item) => item.cimRequest?.canRequest);
+  seedAmbiguousLegacyCandidates(storage, deal);
+  storage.submissions.delete('legacy-candidate-b');
+  storage.getDealHunterCrmImport = async () => ({
+    id: 'durable-tombstone',
+    opportunity_id: deal.opportunityId,
+    submission_id: null,
+    status: 'crm-deleted',
+    metadata: {},
+  });
+  let claimCalls = 0;
+  storage.claimDealHunterCrmImport = async () => {
+    claimCalls += 1;
+    throw new Error('tombstone must block before claiming');
+  };
+
+  const before = structuredClone(storage.submissions.get('legacy-candidate-a'));
+  const result = await sendDealHunterCimRequest({
+    dealKey: deal.dealKey,
+    snapshotToken: deal.cimRequest.snapshotToken,
+    requestedBy: 'test-admin',
+    storage,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 409);
+  assert.equal(result.code, 'CRM_MATCH_RECORD_INACTIVE');
+  assert.equal(claimCalls, 0);
+  assert.deepEqual(storage.submissions.get('legacy-candidate-a'), before);
+  assert.equal(storage.requests.size, 0);
+  assert.equal(storage.communications.size, 0);
+  assert.equal(storage.activities.length, 0);
+});
+
+test('direct CIM refuses existing-row linkage when tombstone authority is unavailable or changes at the write boundary', async () => {
+  const { reviewDailyDeals, sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
+  for (const scenario of ['missing-capability', 'late-tombstone']) {
+    const storage = createCimStorage();
+    const reviewed = await reviewDailyDeals({ storage });
+    const deal = reviewed.qualified.find((item) => item.cimRequest?.canRequest);
+    seedAmbiguousLegacyCandidates(storage, deal);
+    storage.submissions.delete('legacy-candidate-b');
+    if (scenario === 'missing-capability') {
+      delete storage.getDealHunterCrmImport;
+    } else {
+      let reads = 0;
+      storage.getDealHunterCrmImport = async () => {
+        reads += 1;
+        return reads === 1 ? null : {
+          id: 'late-tombstone',
+          opportunity_id: deal.opportunityId,
+          submission_id: null,
+          status: 'crm-deleted',
+        };
+      };
+    }
+    let linkCalls = 0;
+    storage.linkDealHunterCrmSubmission = async () => {
+      linkCalls += 1;
+      throw new Error('authority guard must block before linkage');
+    };
+
+    const result = await sendDealHunterCimRequest({
+      dealKey: deal.dealKey,
+      snapshotToken: deal.cimRequest.snapshotToken,
+      requestedBy: 'test-admin',
+      storage,
+    });
+
+    assert.equal(result.ok, false, scenario);
+    assert.equal(result.code, scenario === 'missing-capability'
+      ? 'CRM_MATCH_LOOKUP_INCOMPLETE'
+      : 'CRM_MATCH_RECORD_INACTIVE', scenario);
+    assert.equal(linkCalls, 0, scenario);
+    assert.equal(storage.requests.size, 0, scenario);
+    assert.equal(storage.communications.size, 0, scenario);
+  }
+});
+
+test('direct and bulk CIM mark a newly acquired import claim failed when a post-claim race becomes ambiguous', async () => {
+  const {
+    reviewDailyDeals,
+    sendDealHunterCimRequest,
+    sendDealHunterReadyCimRequests,
+  } = await import('../server/services/dealHunter.js');
+
+  for (const mode of ['direct', 'bulk']) {
+    const storage = createCimStorage();
+    const reviewed = await reviewDailyDeals({ storage });
+    const deal = reviewed.qualified.find((item) => item.cimRequest?.canRequest);
+    const imports = enableCrmImportClaims(storage);
+    const originalClaim = storage.claimDealHunterCrmImport;
+    storage.claimDealHunterCrmImport = async (...args) => {
+      const result = await originalClaim(...args);
+      seedAmbiguousLegacyCandidates(storage, deal);
+      return result;
+    };
+
+    const result = mode === 'direct'
+      ? await sendDealHunterCimRequest({
+          dealKey: deal.dealKey,
+          snapshotToken: deal.cimRequest.snapshotToken,
+          requestedBy: 'test-admin',
+          storage,
+        })
+      : await sendDealHunterReadyCimRequests({
+          requestedBy: 'test-admin',
+          selections: [{
+            dealKey: deal.dealKey,
+            recipientEmail: deal.cimRequest.recipientEmail,
+            snapshotToken: deal.cimRequest.snapshotToken,
+          }],
+          storage,
+        });
+
+    assert.equal(result.ok, false, mode);
+    assert.equal(result.code, 'CRM_MATCH_AMBIGUOUS', mode);
+    assert.equal(imports.size, 1, mode);
+    assert.equal([...imports.values()][0].status, 'failed', mode);
+    assert.match([...imports.values()][0].metadata.error, /multiple CRM records/i, mode);
+    assert.equal(storage.requests.size, 0, mode);
+    assert.equal(storage.communications.size, 0, mode);
+    assert.equal(storage.activities.length, 0, mode);
+  }
+});
+
+test('direct CIM fails closed on null or malformed durable CRM import claim results', async () => {
+  const { reviewDailyDeals, sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
+  for (const invalidClaim of [null, { claimed: true }, { claimed: undefined, importRecord: { id: 'malformed' } }]) {
+    const storage = createCimStorage();
+    const reviewed = await reviewDailyDeals({ storage });
+    const deal = reviewed.qualified.find((item) => item.cimRequest?.canRequest);
+    storage.getDealHunterCrmImport = async () => null;
+    storage.claimDealHunterCrmImport = async () => invalidClaim;
+
+    const result = await sendDealHunterCimRequest({
+      dealKey: deal.dealKey,
+      snapshotToken: deal.cimRequest.snapshotToken,
+      requestedBy: 'test-admin',
+      storage,
+    });
+
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 503);
+    assert.equal(result.code, 'CRM_MATCH_LOOKUP_FAILED');
+    assert.equal(storage.submissions.size, 0);
+    assert.equal(storage.requests.size, 0);
+    assert.equal(storage.communications.size, 0);
+    assert.equal(storage.activities.length, 0);
+  }
+});
+
+test('direct CIM refuses fresh CRM creation when durable import claim capability is missing', async () => {
+  const { reviewDailyDeals, sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const reviewed = await reviewDailyDeals({ storage });
+  const deal = reviewed.qualified.find((item) => item.cimRequest?.canRequest);
+  delete storage.claimDealHunterCrmImport;
+
+  const result = await sendDealHunterCimRequest({
+    dealKey: deal.dealKey,
+    snapshotToken: deal.cimRequest.snapshotToken,
+    requestedBy: 'test-admin',
+    storage,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 503);
+  assert.equal(result.code, 'CRM_MATCH_LOOKUP_INCOMPLETE');
+  assert.equal(storage.submissions.size, 0);
+  assert.equal(storage.requests.size, 0);
+  assert.equal(storage.communications.size, 0);
+  assert.equal(storage.activities.length, 0);
+});
+
+test('high-fit CRM sync rechecks after its claim and blocks ambiguity introduced by a race', async () => {
+  const { reviewDailyDeals, syncDealHunterHighFitsToCrm } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const reviewed = await reviewDailyDeals({ storage });
+  const [deal] = reviewed.qualified;
+  seedAmbiguousLegacyCandidates(storage, deal);
+  storage.submissions.delete('legacy-candidate-b');
+  const firstBefore = structuredClone(storage.submissions.get('legacy-candidate-a'));
+  const crmImports = enableCrmImportClaims(storage);
+  const originalClaim = storage.claimDealHunterCrmImport;
+  let claimCalls = 0;
+  storage.claimDealHunterCrmImport = async (...args) => {
+    claimCalls += 1;
+    const claimed = await originalClaim(...args);
+    seedAmbiguousLegacyCandidates(storage, deal);
+    return claimed;
+  };
+
+  const result = await syncDealHunterHighFitsToCrm({
+    confirmation: 'SYNC HIGH FITS',
+    expectedDealKeys: reviewed.qualified.map((item) => item.dealKey),
+    requestedBy: 'test-admin',
+    storage,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 409);
+  assert.equal(result.code, 'CRM_MATCH_AMBIGUOUS');
+  assert.equal(claimCalls, 1);
+  assert.equal(crmImports.size, 1, 'only durable claim bookkeeping is retained');
+  assert.deepEqual(storage.submissions.get('legacy-candidate-a'), firstBefore);
+  assert.equal(storage.submissions.size, 2);
+  assert.equal(storage.activities.length, 0);
+  assert.equal(storage.requests.size, 0);
+  assert.equal(storage.communications.size, 0);
+});
+
+test('high-fit CRM sync preserves a non-claimed crm-deleted tombstone despite matching residue', async () => {
+  const { reviewDailyDeals, syncDealHunterHighFitsToCrm } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const reviewed = await reviewDailyDeals({ storage });
+  const [deal] = reviewed.qualified;
+  seedAmbiguousLegacyCandidates(storage, deal);
+  storage.submissions.delete('legacy-candidate-b');
+  const residueBefore = structuredClone(storage.submissions.get('legacy-candidate-a'));
+  const tombstone = {
+    id: 'high-fit-tombstone',
+    opportunity_id: deal.opportunityId,
+    submission_id: null,
+    status: 'crm-deleted',
+    metadata: {},
+  };
+  storage.getDealHunterCrmImport = async () => tombstone;
+  storage.claimDealHunterCrmImport = async () => ({ claimed: false, importRecord: tombstone });
+  let importUpdates = 0;
+  storage.updateDealHunterCrmImport = async () => {
+    importUpdates += 1;
+    throw new Error('a tombstone must not be rewritten');
+  };
+
+  const result = await syncDealHunterHighFitsToCrm({
+    confirmation: 'SYNC HIGH FITS',
+    expectedDealKeys: reviewed.qualified.map((item) => item.dealKey),
+    requestedBy: 'test-admin',
+    storage,
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.crmSync.skipped, 1);
+  assert.equal(result.crmSync.failed, 0);
+  assert.equal(result.crmSync.results[0].status, 'tombstoned');
+  assert.equal(importUpdates, 0);
+  assert.deepEqual(storage.submissions.get('legacy-candidate-a'), residueBefore);
+  assert.equal(storage.activities.length, 0);
+});
+
+test('high-fit CRM sync rejects an unrelated cached submission when fresh matching finds none', async () => {
+  const { reviewDailyDeals, syncDealHunterHighFitsToCrm } = await import('../server/services/dealHunter.js');
+  const storage = createCimStorage();
+  const reviewed = await reviewDailyDeals({ storage });
+  const [deal] = reviewed.qualified;
+  assert.ok(deal?.opportunityId);
+  const unrelated = {
+    id: 'unrelated-cached-submission',
+    status: 'review',
+    company: 'Unrelated business',
+    listing_url: 'https://example.test/listing/unrelated',
+    asking_price: '$1',
+    ttm_revenue: '$1',
+    ttm_ebitda: '$1',
+    metadata: { dealHunter: {} },
+  };
+  storage.submissions.set(unrelated.id, structuredClone(unrelated));
+  storage.claimDealHunterCrmImport = async (record) => ({
+    claimed: false,
+    importRecord: { ...record, submission_id: unrelated.id, status: 'created' },
+  });
+
+  const result = await syncDealHunterHighFitsToCrm({
+    confirmation: 'SYNC HIGH FITS',
+    expectedDealKeys: reviewed.qualified.map((item) => item.dealKey),
+    requestedBy: 'test-admin',
+    storage,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 409);
+  assert.equal(result.code, 'CRM_MATCH_AUTHORITY_STALE');
+  assert.deepEqual(result.candidateIds, [unrelated.id]);
+  assert.deepEqual(storage.submissions.get(unrelated.id), unrelated);
+  assert.equal(storage.activities.length, 0);
+  assert.equal(storage.requests.size, 0);
+  assert.equal(storage.communications.size, 0);
 });
 
 test('explicit confirmed CRM sync is idempotent across repeated runs', async () => {

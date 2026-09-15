@@ -157,6 +157,7 @@ test('global suppression stops a due CIM follow-up before claim, persistence, or
     async listDealHunterCimRequests() { return [stored]; },
     async upsertDealHunterCimRequest(value) { stored = value; return value; },
     async getSubmission() { return { id: request.submission_id, status: 'review' }; },
+    async listSubmissions() { return { rows: [], total: 0 }; },
     async getActiveEmailSuppression(email) {
       assert.equal(email, request.recipient_email);
       return { id: 'suppression-1', reason: 'complaint', created_at: '2026-07-19T16:00:00.000Z' };
@@ -340,11 +341,180 @@ test('unmarked legacy runner retains existing delays maximum and executor behavi
       async getDealHunterCimSafetySettings() { return { outreach_paused: false, metadata: {} }; },
       async listDealHunterCimRequests() { return [request]; },
       async getActiveEmailSuppression() { return { id: 'legacy-suppression', reason: 'complaint' }; },
+      async getSubmission() { return { id: request.submission_id, status: 'review' }; },
+      async listSubmissions() { return { rows: [], total: 0 }; },
       async upsertDealHunterCimRequest(value) { requestWrites += 1; return value; },
+      async mutateWithCrmActivity({ operation, payload, activity }) {
+        assert.equal(operation, 'upsert_deal_hunter_cim_request');
+        requestWrites += 1;
+        return { applied: true, record: payload.request, activity };
+      },
     },
     now: new Date('2026-09-01T18:00:00.000Z'),
     settings: { ...weekdaySettings, weekdaysOnly: false, sendWindowStart: '00:00', sendWindowEnd: '23:59' },
   });
   assert.equal(result.results[0].status, 'stopped');
   assert.equal(requestWrites, 1, 'an unmarked request still enters the legacy single-request executor');
+});
+
+test('legacy follow-up runner exposes CRM match ambiguity before request claim or provider work', async () => {
+  const request = {
+    id: 'legacy-ambiguous-request',
+    opportunity_id: 'legacy-ambiguous-opportunity',
+    submission_id: 'legacy-ambiguous-a',
+    deal_key: 'url:https://example.test/listing/legacy-ambiguous',
+    deal_name: 'Legacy Ambiguous Deal',
+    listing_url: 'https://example.test/listing/legacy-ambiguous',
+    recipient_email: 'legacy-ambiguous@example.test',
+    status: 'sent',
+    request_state: 'provider_accepted',
+    delivery_state: 'accepted',
+    follow_up_state: 'scheduled',
+    follow_up_count: 0,
+    first_requested_at: '2026-08-01T16:00:00.000Z',
+    next_follow_up_at: '2026-09-01T17:00:00.000Z',
+    updated_at: '2026-09-01T16:00:00.000Z',
+    metadata: {},
+  };
+  const opportunity = {
+    opportunity_id: request.opportunity_id,
+    status: 'active',
+    primary_submission_id: null,
+    canonical_name: request.deal_name,
+    listing_url: request.listing_url,
+    created_at: '2026-08-01T16:00:00.000Z',
+    updated_at: '2026-09-01T16:00:00.000Z',
+    raw: {},
+    metadata: {},
+  };
+  const candidates = ['legacy-ambiguous-a', 'legacy-ambiguous-b'].map((id) => ({
+    id,
+    company: request.deal_name,
+    listing_url: request.listing_url,
+    status: 'review',
+    metadata: { dealHunter: {} },
+  }));
+  const effects = { requestClaims: 0, communicationWrites: 0, providerCalls: 0 };
+  const storage = {
+    async getDealHunterCimSafetySettings() { return { outreach_paused: false, metadata: {} }; },
+    async listDealHunterCimRequests() { return [request]; },
+    async upsertDealHunterCimRequest(value) { return value; },
+    async getActiveEmailSuppression() { return null; },
+    async findCurrentDealHunterOpportunityByAliases() { return opportunity; },
+    async getCurrentDealHunterOpportunity() { return opportunity; },
+    async listCurrentDealHunterOpportunities() { return [opportunity]; },
+    async upsertDealHunterOpportunity() { return opportunity; },
+    async upsertDealHunterOpportunityAlias(alias) { return alias; },
+    async upsertDealHunterIdentityException(exception) { return exception; },
+    async getDealHunterCrmImport() { return null; },
+    async getSubmission(id) { return candidates.find((candidate) => candidate.id === id) || null; },
+    async listSubmissions() { return { rows: candidates, total: candidates.length }; },
+    async claimDealHunterCimFollowUpRequest() { effects.requestClaims += 1; throw new Error('must not claim'); },
+    async insertCrmCommunication() { effects.communicationWrites += 1; throw new Error('must not write'); },
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    effects.providerCalls += 1;
+    throw new Error('must not call provider');
+  };
+  try {
+    const result = await runDealHunterCimFollowUps({
+      storage,
+      now: new Date('2026-09-01T18:00:00.000Z'),
+      settings: { ...weekdaySettings, weekdaysOnly: false, sendWindowStart: '00:00', sendWindowEnd: '23:59' },
+    });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.failed, 1);
+    assert.equal(result.results[0].status, 'failed');
+    assert.equal(result.results[0].code, 'CRM_MATCH_AMBIGUOUS');
+    assert.deepEqual(result.results[0].candidateIds, ['legacy-ambiguous-a', 'legacy-ambiguous-b']);
+    assert.deepEqual(result.results[0].evidenceCategories, ['stable-listing-identity']);
+    assert.deepEqual(effects, { requestClaims: 0, communicationWrites: 0, providerCalls: 0 });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('legacy follow-up marks a new CRM import claim failed when ambiguity appears after the claim', async () => {
+  const request = {
+    id: 'legacy-post-claim-request',
+    opportunity_id: 'legacy-post-claim-opportunity',
+    submission_id: null,
+    deal_key: 'url:https://example.test/listing/legacy-post-claim',
+    deal_name: 'Legacy Post Claim Deal',
+    listing_url: 'https://example.test/listing/legacy-post-claim',
+    recipient_email: 'legacy-post-claim@example.test',
+    status: 'sent',
+    request_state: 'provider_accepted',
+    delivery_state: 'accepted',
+    follow_up_state: 'scheduled',
+    follow_up_count: 0,
+    first_requested_at: '2026-08-01T16:00:00.000Z',
+    next_follow_up_at: '2026-09-01T17:00:00.000Z',
+    updated_at: '2026-09-01T16:00:00.000Z',
+    metadata: {},
+  };
+  const opportunity = {
+    opportunity_id: request.opportunity_id,
+    status: 'active',
+    primary_submission_id: null,
+    canonical_name: request.deal_name,
+    listing_url: request.listing_url,
+    raw: {},
+    metadata: {},
+  };
+  let candidates = [];
+  let importRecord = null;
+  const effects = { requestClaims: 0, communicationWrites: 0, providerCalls: 0 };
+  const storage = {
+    async getDealHunterCimSafetySettings() { return { outreach_paused: false, metadata: {} }; },
+    async listDealHunterCimRequests() { return [request]; },
+    async upsertDealHunterCimRequest(value) { return value; },
+    async getActiveEmailSuppression() { return null; },
+    async findCurrentDealHunterOpportunityByAliases() { return opportunity; },
+    async getCurrentDealHunterOpportunity() { return opportunity; },
+    async listCurrentDealHunterOpportunities() { return [opportunity]; },
+    async upsertDealHunterOpportunity() { return opportunity; },
+    async upsertDealHunterOpportunityAlias(alias) { return alias; },
+    async upsertDealHunterIdentityException(exception) { return exception; },
+    async getDealHunterCrmImport() { return importRecord; },
+    async listSubmissions() { return { rows: candidates, total: candidates.length }; },
+    async claimDealHunterCrmImport(record) {
+      importRecord = record;
+      candidates = ['post-claim-a', 'post-claim-b'].map((id) => ({
+        id,
+        company: request.deal_name,
+        listing_url: request.listing_url,
+        status: 'review',
+        metadata: { dealHunter: {} },
+      }));
+      return { claimed: true, importRecord };
+    },
+    async updateDealHunterCrmImport(id, values) {
+      assert.equal(id, importRecord.id);
+      importRecord = { ...importRecord, ...values };
+      return importRecord;
+    },
+    async claimDealHunterCimFollowUpRequest() { effects.requestClaims += 1; throw new Error('must not claim'); },
+    async insertCrmCommunication() { effects.communicationWrites += 1; throw new Error('must not write'); },
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    effects.providerCalls += 1;
+    throw new Error('must not call provider');
+  };
+  try {
+    const result = await runDealHunterCimFollowUps({
+      storage,
+      now: new Date('2026-09-01T18:00:00.000Z'),
+      settings: { ...weekdaySettings, weekdaysOnly: false, sendWindowStart: '00:00', sendWindowEnd: '23:59' },
+    });
+    assert.equal(result.failed, 1, JSON.stringify(result));
+    assert.equal(result.results[0].code, 'CRM_MATCH_AMBIGUOUS');
+    assert.equal(importRecord.status, 'failed');
+    assert.match(importRecord.metadata.error, /multiple CRM records/i);
+    assert.deepEqual(effects, { requestClaims: 0, communicationWrites: 0, providerCalls: 0 });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
