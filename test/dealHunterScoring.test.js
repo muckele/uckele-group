@@ -524,6 +524,19 @@ test('source-field repair safely enriches a stale syndicated CRM record', async 
     async getSubmission(id) {
       return id === submission.id ? submission : null;
     },
+    async getCurrentDealHunterOpportunity(opportunityId) {
+      return opportunityId === 'opp-current-source-repair'
+        ? { opportunity_id: opportunityId, status: 'active', primary_submission_id: null }
+        : null;
+    },
+    async readDealHunterCrmMatchAuthority() {
+      return {
+        rows: [submission],
+        count: 1,
+        complete: true,
+        revision: 'b'.repeat(64),
+      };
+    },
     async mutateWithCrmActivity({ operation, payload, activity }) {
       assert.equal(operation, 'update_submission');
       assert.equal(payload.expectedUpdatedAt, submission.updated_at);
@@ -534,10 +547,15 @@ test('source-field repair safely enriches a stale syndicated CRM record', async 
       activities.push(activity);
       return { applied: true, record: submission };
     },
-    async linkDealHunterCrmSubmission({ opportunityId, submissionId }) {
+    async linkDealHunterCrmSubmissionIfAuthorityCurrent({
+      opportunityId,
+      submissionId,
+      expectedAuthorityRevision,
+    }) {
       assert.equal(submissionMutationStarted, false, 'canonical linkage must precede CRM field mutation');
       assert.equal(opportunityId, 'opp-current-source-repair');
       assert.equal(submissionId, submission.id);
+      assert.equal(expectedAuthorityRevision, 'b'.repeat(64));
       currentLinkEstablished = true;
       submission = { ...submission, deal_hunter_opportunity_id: opportunityId };
       return { opportunity_id: opportunityId, status: 'active', primary_submission_id: submissionId };

@@ -25,6 +25,7 @@ const {
   importDealOsExport,
   previewDealOsCrmReconciliation,
 } = await import('../server/services/dealHunter.js');
+const { createManualSubmission } = await import('../server/services/submissions.js');
 const { createSqliteStorage } = await import('../server/storage/sqlite.js');
 
 function reconciliationCsv() {
@@ -146,12 +147,14 @@ test('exact-import reconciliation accounts for every row, creates one CRM owner 
     status: 'active',
     metadata: {},
   });
+  const crossLinkAuthority = await storage.readDealHunterCrmMatchAuthority();
   await assert.rejects(
-    storage.linkDealHunterCrmSubmission({
+    storage.linkDealHunterCrmSubmissionIfAuthorityCurrent({
       opportunityId: 'opportunity-regression-cross-link',
       submissionId: submissions.rows[0].id,
+      expectedAuthorityRevision: crossLinkAuthority.revision,
     }),
-    /already belongs to another canonical opportunity/i,
+    (error) => error?.code === 'CRM_MATCH_AUTHORITY_STALE',
   );
 
   const repeated = await executeDealOsCrmReconciliation({
@@ -255,7 +258,20 @@ test('exact-import reconciliation preserves crm-deleted tombstones', async (t) =
   assert.equal(storedTombstone.deal_key, exactItem.dealKey);
   assert.equal(storedTombstone.status, 'crm-deleted');
   assert.equal(storedTombstone.submission_id, null);
-  assert.equal((await storage.listSubmissions({ status: 'all', page: 1, limit: 100 })).rows.length, 0);
+  const residue = await createManualSubmission({
+    company: exactItem.name,
+    seller_name: 'Historical Seller',
+    seller_email: 'tombstone-residue@example.test',
+    listing_url: 'https://dealos.example/listing/DOS-REC-1',
+    asking_price: '$1,400,000',
+    ttm_revenue: '$1,800,000',
+    ttm_ebitda: '$450,000',
+    status: 'review',
+    metadata: {},
+  }, 'tombstone-residue-fixture', { storage });
+  assert.equal(residue.ok, true);
+  const residueBefore = structuredClone(await storage.getSubmission(residue.submission.id));
+  assert.equal((await storage.listSubmissions({ status: 'all', page: 1, limit: 100 })).rows.length, 1);
   const opportunityBefore = await storage.getCurrentDealHunterOpportunity(exactItem.opportunityId);
   assert.ok(opportunityBefore);
   assert.equal(opportunityBefore.primary_submission_id, null);
@@ -305,7 +321,7 @@ test('exact-import reconciliation preserves crm-deleted tombstones', async (t) =
   assert.equal(durableItems[0].status, 'tombstoned');
   assert.equal(durableItems[0].submission_id, null);
 
-  assert.equal((await storage.listSubmissions({ status: 'all', page: 1, limit: 100 })).rows.length, 0);
+  assert.deepEqual(await storage.getSubmission(residue.submission.id), residueBefore);
   const tombstoneAfterExecution = await storage.getDealHunterCrmImport({ opportunityId: exactItem.opportunityId });
   assert.equal(tombstoneAfterExecution.id, storedTombstone.id);
   assert.equal(tombstoneAfterExecution.opportunity_id, exactItem.opportunityId);
@@ -342,7 +358,7 @@ test('exact-import reconciliation preserves crm-deleted tombstones', async (t) =
   assert.equal(repeated.idempotent, true);
   assert.equal(repeated.run.status, 'completed');
   assert.equal(repeated.run.counts.results.tombstoned, 1);
-  assert.equal((await storage.listSubmissions({ status: 'all', page: 1, limit: 100 })).rows.length, 0);
+  assert.deepEqual(await storage.getSubmission(residue.submission.id), residueBefore);
   const tombstoneAfterRepeat = await storage.getDealHunterCrmImport({ opportunityId: exactItem.opportunityId });
   assert.equal(tombstoneAfterRepeat.id, storedTombstone.id);
   assert.equal(tombstoneAfterRepeat.status, 'crm-deleted');
@@ -656,6 +672,281 @@ test('a run that ended with failures resumes and retries the failed item', async
   });
   assert.equal(completed.idempotent, true);
   assert.equal((await storage.listSubmissions({ status: 'all', page: 1, limit: 100 })).rows.length, 1);
+});
+
+test('reconciliation marks its durable import claim failed when CRM ambiguity appears after claiming', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-crm-reconciliation-post-claim-race-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'crm.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const now = new Date();
+  const imported = await importDealOsExport({
+    fileBuffer: Buffer.from(singleListingCsv()),
+    fileName: 'deal-os-reconciliation-post-claim-race.csv',
+    exportedAt: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+    scope: 'saved-search',
+    coverageLabel: 'Post-claim ambiguity bookkeeping fixture',
+    expectedRowCount: 1,
+    importedBy: 'admin@example.com',
+    storage,
+    now,
+  });
+  const preview = await previewDealOsCrmReconciliation({
+    importId: imported.import.id,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+  const [deal] = [...preview.dealsByOpportunity.values()];
+  const realClaim = storage.claimDealHunterCrmImport.bind(storage);
+  storage.claimDealHunterCrmImport = async (...args) => {
+    const claim = await realClaim(...args);
+    for (const suffix of ['a', 'b']) {
+      const created = await createManualSubmission({
+        company: deal.name,
+        seller_name: 'Race Fixture',
+        seller_email: `reconciliation-race-${suffix}@example.test`,
+        listing_url: deal.listingUrl,
+        asking_price: `$${Number(deal.askingPrice).toLocaleString('en-US')}`,
+        ttm_revenue: `$${Number(deal.annualRevenue).toLocaleString('en-US')}`,
+        ttm_ebitda: `$${Number(deal.annualProfit).toLocaleString('en-US')}`,
+        status: 'review',
+        metadata: {},
+      }, 'post-claim-race-fixture', { storage });
+      assert.equal(created.ok, true);
+    }
+    return claim;
+  };
+
+  const executed = await executeDealOsCrmReconciliation({
+    importId: imported.import.id,
+    planDigest: preview.planDigest,
+    previewGeneratedAt: preview.generatedAt,
+    expectedOpportunityIds: preview.expectedOpportunityIds,
+    confirmation: preview.confirmationRequired,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+
+  assert.equal(executed.ok, false);
+  assert.equal(executed.status, 207);
+  assert.equal(executed.resultCounts.failed, 1);
+  assert.equal(executed.resultCounts.created, 0);
+  const [importRecord] = await storage.listDealHunterCrmImports({ limit: 100 });
+  assert.equal(importRecord.status, 'failed');
+  assert.match(importRecord.metadata.error, /multiple CRM records/i);
+  const [item] = await storage.listDealHunterCrmReconciliationItems(executed.run.id, { limit: 100 });
+  assert.equal(item.status, 'failed');
+  assert.match(item.error, /multiple CRM records/i);
+});
+
+test('reconciliation refuses a malformed durable CRM ownership claim result', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-crm-reconciliation-invalid-claim-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'crm.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const now = new Date();
+  const imported = await importDealOsExport({
+    fileBuffer: Buffer.from(singleListingCsv()),
+    fileName: 'deal-os-reconciliation-invalid-claim.csv',
+    exportedAt: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+    scope: 'saved-search',
+    coverageLabel: 'Malformed claim fixture',
+    expectedRowCount: 1,
+    importedBy: 'admin@example.com',
+    storage,
+    now,
+  });
+  const preview = await previewDealOsCrmReconciliation({
+    importId: imported.import.id,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+  storage.claimDealHunterCrmImport = async (record) => ({ importRecord: record });
+
+  const executed = await executeDealOsCrmReconciliation({
+    importId: imported.import.id,
+    planDigest: preview.planDigest,
+    previewGeneratedAt: preview.generatedAt,
+    expectedOpportunityIds: preview.expectedOpportunityIds,
+    confirmation: preview.confirmationRequired,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+
+  assert.equal(executed.ok, false);
+  assert.equal(executed.status, 207);
+  assert.equal(executed.resultCounts.failed, 1);
+  assert.equal(executed.resultCounts.created, 0);
+  assert.equal((await storage.listSubmissions({ status: 'all', page: 1, limit: 100 })).rows.length, 0);
+  assert.equal((await storage.listDealHunterCrmImports({ limit: 100 })).length, 0);
+  const [item] = await storage.listDealHunterCrmReconciliationItems(executed.run.id, { limit: 100 });
+  assert.match(item.error, /durable CRM ownership claim returned an invalid result/i);
+});
+
+test('Deal OS preview exposes CRM ambiguity and execution blocks before claims or run bookkeeping', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-crm-reconciliation-ambiguity-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'crm.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const now = new Date();
+  const imported = await importDealOsExport({
+    fileBuffer: Buffer.from(singleListingCsv()),
+    fileName: 'deal-os-reconciliation-ambiguity.csv',
+    exportedAt: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+    scope: 'saved-search',
+    coverageLabel: 'CRM ambiguity guard integration fixture',
+    expectedRowCount: 1,
+    importedBy: 'admin@example.com',
+    storage,
+    now,
+  });
+  const initial = await previewDealOsCrmReconciliation({
+    importId: imported.import.id,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+  assert.equal(initial.ok, true);
+  assert.equal(initial.items.length, 1);
+  const [deal] = [...initial.dealsByOpportunity.values()];
+  assert.ok(deal?.opportunityId);
+
+  const legacyIds = [];
+  for (const [label, updatedAt] of [
+    ['legacy-preview-a', '2026-08-01T00:00:00.000Z'],
+    ['legacy-preview-b', '2026-09-01T00:00:00.000Z'],
+  ]) {
+    const created = await createManualSubmission({
+      company: deal.name,
+      seller_name: 'Synthetic Seller',
+      seller_email: `${label}@example.test`,
+      asking_price: `$${Number(deal.askingPrice).toLocaleString('en-US')}`,
+      ttm_revenue: `$${Number(deal.annualRevenue).toLocaleString('en-US')}`,
+      ttm_ebitda: `$${Number(deal.annualProfit).toLocaleString('en-US')}`,
+      status: 'review',
+      metadata: { dealHunter: { raw: { State: deal.state } } },
+    }, 'ambiguity-fixture', { storage });
+    assert.equal(created.ok, true);
+    legacyIds.push(created.submission.id);
+    await storage.updateSubmission(created.submission.id, { updated_at: updatedAt });
+  }
+
+  const submissionsBefore = await storage.listSubmissions({ status: 'all', page: 1, limit: 100 });
+  const importsBefore = await storage.listDealHunterCrmImports({ limit: 100 });
+  const preview = await previewDealOsCrmReconciliation({
+    importId: imported.import.id,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+
+  assert.equal(preview.ok, true);
+  assert.equal(preview.counts.ambiguous, 1);
+  assert.equal(preview.counts.mutable, 0);
+  assert.equal(preview.items[0].action, 'ambiguous');
+  assert.equal(preview.items[0].blocker.code, 'CRM_MATCH_AMBIGUOUS');
+  assert.equal(preview.items[0].submissionId, '');
+  assert.deepEqual(preview.items[0].blocker.candidateIds, legacyIds.sort());
+  assert.equal((await storage.listSubmissions({ status: 'all', page: 1, limit: 100 })).rows.length, submissionsBefore.rows.length);
+  assert.equal((await storage.listDealHunterCrmImports({ limit: 100 })).length, importsBefore.length);
+
+  const executed = await executeDealOsCrmReconciliation({
+    importId: imported.import.id,
+    planDigest: preview.planDigest,
+    previewGeneratedAt: preview.generatedAt,
+    expectedOpportunityIds: preview.expectedOpportunityIds,
+    confirmation: preview.confirmationRequired,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+
+  assert.equal(executed.ok, false);
+  assert.equal(executed.status, 409);
+  assert.match(executed.error, /ambiguous/i);
+  assert.equal((await storage.listDealHunterCrmImports({ limit: 100 })).length, importsBefore.length);
+  assert.equal(await storage.getDealHunterCrmReconciliationRun({
+    idempotencyKey: `deal-os-crm-reconciliation:${preview.import.id}:${preview.planDigest}`,
+  }), null);
+  assert.equal((await storage.listSubmissions({ status: 'all', page: 1, limit: 100 })).rows.length, submissionsBefore.rows.length);
+  assert.equal((await storage.listDealHunterCimRequests({ limit: 100 })).length, 0);
+  assert.equal((await storage.listCrmEmailOutbox({ limit: 100 })).length, 0);
+  assert.equal((await storage.listEmailEvents({ limit: 100 })).length, 0);
+});
+
+test('Deal OS preview exposes CRM lookup failure as an explicit blocker instead of absence', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-crm-reconciliation-lookup-failure-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'crm.sqlite') } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const now = new Date();
+  const imported = await importDealOsExport({
+    fileBuffer: Buffer.from(singleListingCsv()),
+    fileName: 'deal-os-reconciliation-lookup-failure.csv',
+    exportedAt: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+    scope: 'saved-search',
+    coverageLabel: 'CRM lookup failure integration fixture',
+    expectedRowCount: 1,
+    importedBy: 'admin@example.com',
+    storage,
+    now,
+  });
+  const listSubmissions = storage.listSubmissions.bind(storage);
+  const readDealHunterCrmMatchAuthority = storage.readDealHunterCrmMatchAuthority.bind(storage);
+  const getDealHunterCrmImport = storage.getDealHunterCrmImport.bind(storage);
+  storage.readDealHunterCrmMatchAuthority = async () => {
+    throw new Error('synthetic CRM candidate lookup outage');
+  };
+
+  const preview = await previewDealOsCrmReconciliation({
+    importId: imported.import.id,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+
+  assert.equal(preview.ok, false);
+  assert.equal(preview.status, 503);
+  assert.equal(preview.code, 'CRM_MATCH_LOOKUP_FAILED');
+  assert.deepEqual(preview.candidateIds, []);
+  assert.deepEqual(preview.evidenceCategories, ['lookup-failure']);
+  assert.equal(await storage.getDealHunterCrmReconciliationRun({
+    idempotencyKey: `deal-os-crm-reconciliation:${imported.import.id}:not-created`,
+  }), null);
+  assert.equal((await storage.listDealHunterCrmImports({ limit: 100 })).length, 0);
+  assert.equal((await listSubmissions({ status: 'all', page: 1, limit: 100 })).rows.length, 0);
+  assert.equal((await storage.listDealHunterCimRequests({ limit: 100 })).length, 0);
+  assert.equal((await storage.listCrmEmailOutbox({ limit: 100 })).length, 0);
+
+  storage.readDealHunterCrmMatchAuthority = readDealHunterCrmMatchAuthority;
+  storage.getDealHunterCrmImport = async () => {
+    throw new Error('synthetic durable import authority outage');
+  };
+  const importAuthorityFailure = await previewDealOsCrmReconciliation({
+    importId: imported.import.id,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+  assert.equal(importAuthorityFailure.ok, false);
+  assert.equal(importAuthorityFailure.status, 503);
+  assert.equal(importAuthorityFailure.code, 'CRM_MATCH_LOOKUP_FAILED');
+  assert.deepEqual(importAuthorityFailure.evidenceCategories, ['import-authority-lookup-failure']);
+
+  storage.getDealHunterCrmImport = undefined;
+  const missingImportAuthority = await previewDealOsCrmReconciliation({
+    importId: imported.import.id,
+    requestedBy: 'admin@example.com',
+    storage,
+  });
+  assert.equal(missingImportAuthority.ok, false);
+  assert.equal(missingImportAuthority.status, 503);
+  assert.equal(missingImportAuthority.code, 'CRM_MATCH_LOOKUP_INCOMPLETE');
+  assert.deepEqual(missingImportAuthority.evidenceCategories, ['import-authority-lookup-incomplete']);
+  storage.getDealHunterCrmImport = getDealHunterCrmImport;
 });
 
 test('reconciliation execution rejects stale plan inputs before claiming CRM ownership', async (t) => {

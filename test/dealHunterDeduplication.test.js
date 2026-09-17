@@ -96,6 +96,15 @@ function allReviewDeals(review) {
   return [...review.qualified, ...review.watchlist, ...review.removalCandidates];
 }
 
+function crmMatchAuthority(rows) {
+  return {
+    rows,
+    count: rows.length,
+    complete: true,
+    revision: 'a'.repeat(64),
+  };
+}
+
 test('numeric Sheet positions are not durable identities while explicit numeric listing IDs are', () => {
   const positional = parseSheetCsvDeals(sheetCsv([{
     'Business Name': 'Commercial HVAC Services',
@@ -403,10 +412,9 @@ test('CRM alias lookup prefers the active canonical card over an archived syndic
     metadata: { dealHunter: { dealKey: canonicalKey, listingAliases: [canonicalUrl, syndicatedUrl] } },
   };
   const storage = {
-    async getSubmissionByListingUrl(listingUrl) {
-      return listingUrl === syndicatedUrl ? archivedDuplicate : activeCanonical;
+    async readDealHunterCrmMatchAuthority() {
+      return crmMatchAuthority([archivedDuplicate, activeCanonical]);
     },
-    async listSubmissions() { return { rows: [] }; },
   };
 
   const existing = await findExistingDealHunterSubmission(storage, {
@@ -416,11 +424,12 @@ test('CRM alias lookup prefers the active canonical card over an archived syndic
     listingAliases: [syndicatedUrl, canonicalUrl],
   });
 
-  assert.equal(existing.id, 'active-bizbuysell-card');
+  assert.equal(existing.status, 'unique-exact');
+  assert.equal(existing.submission.id, 'active-bizbuysell-card');
 });
 
 test('CRM lookup reuses a Daily Deal Update card for a corroborated Deal OS syndication', async () => {
-  const searches = [];
+  let authorityReads = 0;
   const dailyDealRecord = {
     id: 'daily-deal-update-card',
     status: 'review',
@@ -441,10 +450,9 @@ test('CRM lookup reuses a Daily Deal Update card for a corroborated Deal OS synd
     },
   };
   const storage = {
-    async getSubmissionByListingUrl() { return null; },
-    async listSubmissions({ search }) {
-      searches.push(search);
-      return { rows: search === dailyDealRecord.company ? [dailyDealRecord] : [] };
+    async readDealHunterCrmMatchAuthority() {
+      authorityReads += 1;
+      return crmMatchAuthority([dailyDealRecord]);
     },
   };
 
@@ -465,8 +473,9 @@ test('CRM lookup reuses a Daily Deal Update card for a corroborated Deal OS synd
     listingUrl: 'https://www.dealstream.com/d/biz-sale/hvac/tomhyp',
   });
 
-  assert.equal(existing.id, dailyDealRecord.id);
-  assert.equal(searches.includes(dailyDealRecord.company), true);
+  assert.equal(existing.status, 'unique-corroborated');
+  assert.equal(existing.submission.id, dailyDealRecord.id);
+  assert.equal(authorityReads, 1);
 });
 
 test('CRM lookup does not reuse a same-name listing when geography conflicts', async () => {
@@ -489,9 +498,8 @@ test('CRM lookup does not reuse a same-name listing when geography conflicts', a
     },
   };
   const storage = {
-    async getSubmissionByListingUrl() { return null; },
-    async listSubmissions({ search }) {
-      return { rows: search === dailyDealRecord.company ? [dailyDealRecord] : [] };
+    async readDealHunterCrmMatchAuthority() {
+      return crmMatchAuthority([dailyDealRecord]);
     },
   };
 
@@ -510,7 +518,8 @@ test('CRM lookup does not reuse a same-name listing when geography conflicts', a
     listingUrl: 'https://www.dealstream.com/d/biz-sale/hvac/tomhyp',
   });
 
-  assert.equal(existing, null);
+  assert.equal(existing.status, 'none');
+  assert.equal(existing.submission, null);
 });
 
 test('canonical merge preserves field provenance and records deterministic non-identity conflicts', () => {
