@@ -272,38 +272,6 @@ function createCimStorage() {
       opportunities.set(opportunity.opportunity_id, opportunity);
       return opportunity;
     },
-    async linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt }) {
-      const opportunity = opportunities.get(opportunityId);
-      if (!opportunity || opportunity.status !== 'active') {
-        throw new Error('canonical opportunity is superseded or otherwise not current');
-      }
-      if (opportunity.primary_submission_id && opportunity.primary_submission_id !== submissionId) {
-        throw new Error('canonical opportunity already owns another CRM submission');
-      }
-      const submission = submissions.get(submissionId);
-      if (!submission) throw new Error('CRM submission not found');
-      if (submission.deal_hunter_opportunity_id
-        && submission.deal_hunter_opportunity_id !== opportunityId) {
-        throw new Error('CRM submission already belongs to another canonical opportunity');
-      }
-      const conflict = Array.from(submissions.values()).find((candidate) => (
-        candidate.id !== submissionId && candidate.deal_hunter_opportunity_id === opportunityId
-      ));
-      if (conflict) throw new Error('canonical opportunity already owns another CRM submission');
-      const timestamp = updatedAt || new Date().toISOString();
-      submissions.set(submissionId, {
-        ...submission,
-        deal_hunter_opportunity_id: opportunityId,
-        updated_at: timestamp,
-      });
-      const linked = {
-        ...opportunity,
-        primary_submission_id: submissionId,
-        updated_at: timestamp,
-      };
-      opportunities.set(opportunityId, linked);
-      return linked;
-    },
     async readDealHunterCrmMatchAuthority({ limit = 5000 } = {}) {
       return fakeCrmMatchAuthority(submissions, limit);
     },
@@ -330,7 +298,26 @@ function createCimStorage() {
         || competingDirectLink) {
         throw fakeCrmMatchAuthorityStale(submissionId, ['authority-currentness']);
       }
-      return this.linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt });
+      const opportunity = opportunities.get(opportunityId);
+      if (!opportunity
+        || opportunity.status !== 'active'
+        || (opportunity.primary_submission_id
+          && opportunity.primary_submission_id !== submissionId)) {
+        throw fakeCrmMatchAuthorityStale(submissionId, ['authority-currentness']);
+      }
+      const timestamp = updatedAt || new Date().toISOString();
+      submissions.set(submissionId, {
+        ...submission,
+        deal_hunter_opportunity_id: opportunityId,
+        updated_at: timestamp,
+      });
+      const linked = {
+        ...opportunity,
+        primary_submission_id: submissionId,
+        updated_at: timestamp,
+      };
+      opportunities.set(opportunityId, linked);
+      return linked;
     },
     async listDealHunterOpportunityAliases({ opportunityIds = [] } = {}) {
       return Array.from(opportunityAliases.values()).filter((item) => (
@@ -1334,7 +1321,7 @@ test('direct CIM refuses existing-row linkage when tombstone authority is unavai
       };
     }
     let linkCalls = 0;
-    storage.linkDealHunterCrmSubmission = async () => {
+    storage.linkDealHunterCrmSubmissionIfAuthorityCurrent = async () => {
       linkCalls += 1;
       throw new Error('authority guard must block before linkage');
     };

@@ -1628,9 +1628,11 @@ test('follow-up processing does not assign a subject-only reply across a shared 
       },
     },
   });
-  await storage.linkDealHunterCrmSubmission({
+  const secondLinkAuthority = await storage.readDealHunterCrmMatchAuthority();
+  await storage.linkDealHunterCrmSubmissionIfAuthorityCurrent({
     opportunityId: secondOpportunityId,
     submissionId: secondSubmissionId,
+    expectedAuthorityRevision: secondLinkAuthority.revision,
     updatedAt: secondCreatedAt,
   });
 

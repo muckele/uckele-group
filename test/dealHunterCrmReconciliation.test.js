@@ -147,12 +147,14 @@ test('exact-import reconciliation accounts for every row, creates one CRM owner 
     status: 'active',
     metadata: {},
   });
+  const crossLinkAuthority = await storage.readDealHunterCrmMatchAuthority();
   await assert.rejects(
-    storage.linkDealHunterCrmSubmission({
+    storage.linkDealHunterCrmSubmissionIfAuthorityCurrent({
       opportunityId: 'opportunity-regression-cross-link',
       submissionId: submissions.rows[0].id,
+      expectedAuthorityRevision: crossLinkAuthority.revision,
     }),
-    /already belongs to another canonical opportunity/i,
+    (error) => error?.code === 'CRM_MATCH_AUTHORITY_STALE',
   );
 
   const repeated = await executeDealOsCrmReconciliation({

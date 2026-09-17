@@ -102,6 +102,7 @@ function dealOsAuthorityCsv() {
 
 test('SQLite CRM match authority read is complete, deterministic, bounded, and internally consistent across two connections', async (t) => {
   const [reader, writer] = sharedSqliteStorages(t);
+  assert.equal(reader.linkDealHunterCrmSubmission, undefined);
   await seedOpportunity(reader);
   const first = await seedSubmission(reader);
 
@@ -172,6 +173,7 @@ test('Supabase CRM match authority paths fail closed without querying or linking
     async rpc(name) { assert.fail(`fail-closed authority path called RPC ${name}`); },
   };
   const storage = createSupabaseStorage({ storage: {} }, { client });
+  assert.equal(storage.linkDealHunterCrmSubmission, undefined);
   const expected = (error) => error?.code === 'CRM_MATCH_LOOKUP_INCOMPLETE'
     && error?.status === 503
     && error?.candidateIds?.length === 0

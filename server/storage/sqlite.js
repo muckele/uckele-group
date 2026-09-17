@@ -9182,46 +9182,6 @@ export function createSqliteStorage(config) {
       return replace.immediate(normalizedSnapshot);
     },
 
-    async linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt = '' } = {}) {
-      const timestamp = updatedAt || new Date().toISOString();
-      const transaction = database.transaction(() => {
-        const opportunity = database.prepare(`
-          SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
-        `).get(opportunityId);
-        if (!opportunity) throw new Error('Canonical Deal Hunter opportunity not found.');
-        if (opportunity.status !== 'active') {
-          throw new Error('Canonical Deal Hunter opportunity is superseded or otherwise not current.');
-        }
-        if (opportunity.primary_submission_id && opportunity.primary_submission_id !== submissionId) {
-          throw new Error('Canonical opportunity already owns another CRM submission.');
-        }
-        const submission = database.prepare(`
-          SELECT id, deal_hunter_opportunity_id
-          FROM contact_submissions
-          WHERE id = ?
-          LIMIT 1
-        `).get(submissionId);
-        if (!submission) throw new Error('CRM submission not found.');
-        if (submission.deal_hunter_opportunity_id
-          && submission.deal_hunter_opportunity_id !== opportunityId) {
-          throw new Error('CRM submission already belongs to another canonical opportunity.');
-        }
-        const conflicting = database.prepare(`
-          SELECT id FROM contact_submissions
-          WHERE deal_hunter_opportunity_id = ? AND id <> ? LIMIT 1
-        `).get(opportunityId, submissionId);
-        if (conflicting) throw new Error('Canonical opportunity already owns another CRM submission.');
-        database.prepare(`
-          UPDATE contact_submissions SET deal_hunter_opportunity_id = ?, updated_at = ? WHERE id = ?
-        `).run(opportunityId, timestamp, submissionId);
-        database.prepare(`
-          UPDATE deal_hunter_opportunities SET primary_submission_id = ?, updated_at = ? WHERE opportunity_id = ?
-        `).run(submissionId, timestamp, opportunityId);
-      });
-      transaction.immediate();
-      return this.getDealHunterOpportunity(opportunityId);
-    },
-
     async linkDealHunterCrmSubmissionIfAuthorityCurrent({
       opportunityId,
       submissionId,

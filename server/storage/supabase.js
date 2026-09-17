@@ -3130,16 +3130,6 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterCrmReconciliationRunRow(data);
     },
 
-    async linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt = '' } = {}) {
-      const { data, error } = await client.rpc('link_deal_hunter_crm_submission', {
-        p_opportunity_id: opportunityId,
-        p_submission_id: submissionId,
-        p_updated_at: updatedAt || new Date().toISOString(),
-      });
-      if (error) throw error;
-      return normalizeDealHunterOpportunityRow(data);
-    },
-
     async readDealHunterCrmMatchAuthority() {
       throw unsupportedDealHunterCrmMatchAuthorityError();
     },

@@ -1467,14 +1467,16 @@ test('SQLite CRM linkage atomically rejects a superseded canonical opportunity',
     seller_email: 'seller@example.test',
   }, 'crm-admin', { storage });
   assert.equal(created.ok, true);
+  const authority = await storage.readDealHunterCrmMatchAuthority();
 
   await assert.rejects(
-    storage.linkDealHunterCrmSubmission({
+    storage.linkDealHunterCrmSubmissionIfAuthorityCurrent({
       opportunityId: 'opp-superseded',
       submissionId: created.submission.id,
+      expectedAuthorityRevision: authority.revision,
       updatedAt: '2026-08-27T10:00:00.000Z',
     }),
-    /superseded|not current/i,
+    (error) => error?.code === 'CRM_MATCH_AUTHORITY_STALE',
   );
   assert.equal((await storage.getSubmission(created.submission.id)).deal_hunter_opportunity_id, null);
   assert.equal((await storage.getDealHunterOpportunity('opp-superseded')).primary_submission_id, null);
@@ -1488,9 +1490,11 @@ test('CRM preflight does not use a superseded opportunity primary submission as 
     seller_name: 'Seller Example',
     seller_email: 'seller@example.test',
   }, 'crm-admin', { storage });
-  await storage.linkDealHunterCrmSubmission({
+  const authority = await storage.readDealHunterCrmMatchAuthority();
+  await storage.linkDealHunterCrmSubmissionIfAuthorityCurrent({
     opportunityId: 'opp-later-superseded',
     submissionId: created.submission.id,
+    expectedAuthorityRevision: authority.revision,
     updatedAt: '2026-08-27T10:00:00.000Z',
   });
   const historical = await storage.getDealHunterOpportunity('opp-later-superseded');

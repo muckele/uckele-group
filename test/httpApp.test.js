@@ -1647,9 +1647,11 @@ test('communication assignment, corrected retry, and Deal Hunter disposition enf
     });
     assert.equal(resolvedOpportunity.ok, true);
     const opportunityId = resolvedOpportunity.opportunityId;
-    await storage.linkDealHunterCrmSubmission({
+    const linkAuthority = await storage.readDealHunterCrmMatchAuthority();
+    await storage.linkDealHunterCrmSubmissionIfAuthorityCurrent({
       opportunityId,
       submissionId: submission.id,
+      expectedAuthorityRevision: linkAuthority.revision,
       updatedAt: now,
     });
     await storage.upsertDealHunterCimRequest({
