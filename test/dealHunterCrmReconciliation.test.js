@@ -895,8 +895,9 @@ test('Deal OS preview exposes CRM lookup failure as an explicit blocker instead 
     now,
   });
   const listSubmissions = storage.listSubmissions.bind(storage);
+  const readDealHunterCrmMatchAuthority = storage.readDealHunterCrmMatchAuthority.bind(storage);
   const getDealHunterCrmImport = storage.getDealHunterCrmImport.bind(storage);
-  storage.listSubmissions = async () => {
+  storage.readDealHunterCrmMatchAuthority = async () => {
     throw new Error('synthetic CRM candidate lookup outage');
   };
 
@@ -919,7 +920,7 @@ test('Deal OS preview exposes CRM lookup failure as an explicit blocker instead 
   assert.equal((await storage.listDealHunterCimRequests({ limit: 100 })).length, 0);
   assert.equal((await storage.listCrmEmailOutbox({ limit: 100 })).length, 0);
 
-  storage.listSubmissions = listSubmissions;
+  storage.readDealHunterCrmMatchAuthority = readDealHunterCrmMatchAuthority;
   storage.getDealHunterCrmImport = async () => {
     throw new Error('synthetic durable import authority outage');
   };

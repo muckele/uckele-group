@@ -365,6 +365,14 @@ test('current SMB Deal OS financial fields update the matched CRM record', async
     async getSubmission(id) {
       return id === existing.id ? existing : null;
     },
+    async readDealHunterCrmMatchAuthority() {
+      return {
+        rows: [existing],
+        count: 1,
+        complete: true,
+        revision: 'c'.repeat(64),
+      };
+    },
     async mutateWithCrmActivity({ operation, payload }) {
       assert.equal(operation, 'update_submission');
       updatedValues = payload.values;

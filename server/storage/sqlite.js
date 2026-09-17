@@ -173,6 +173,67 @@ function normalizeSubmissionRow(row) {
   };
 }
 
+const dealHunterCrmMatchAuthorityVersion = 'deal-hunter-crm-match-authority-v1';
+const dealHunterCrmMatchAuthorityMaximumRows = 5000;
+
+function dealHunterCrmMatchAuthorityError({ candidateIds = [] } = {}) {
+  const error = new Error('CRM match authority changed before canonical linkage. Refresh and review before retrying.');
+  error.code = 'CRM_MATCH_AUTHORITY_STALE';
+  error.status = 409;
+  error.candidateIds = [...new Set(candidateIds.filter(Boolean).map(String))].sort().slice(0, 25);
+  error.evidenceCategories = ['authority-stale'];
+  return error;
+}
+
+function dealHunterCrmMatchAuthoritySnapshot(database, { limit = dealHunterCrmMatchAuthorityMaximumRows } = {}) {
+  const parsedLimit = Number(limit);
+  const safeLimit = Number.isFinite(parsedLimit)
+    ? Math.max(1, Math.min(Math.trunc(parsedLimit), dealHunterCrmMatchAuthorityMaximumRows))
+    : dealHunterCrmMatchAuthorityMaximumRows;
+  const rawRows = database.prepare(`
+    SELECT * FROM contact_submissions
+    ORDER BY id ASC
+    LIMIT ?
+  `).all(safeLimit + 1);
+  if (rawRows.length > safeLimit) {
+    return {
+      rows: [],
+      rawRows: [],
+      count: null,
+      complete: false,
+      revision: null,
+      revisionVersion: dealHunterCrmMatchAuthorityVersion,
+    };
+  }
+  const columns = database.pragma('table_info(contact_submissions)')
+    .map((column) => String(column.name))
+    .sort();
+  const revisionPayload = JSON.stringify({
+    version: dealHunterCrmMatchAuthorityVersion,
+    columns,
+    rows: rawRows.map((row) => columns.map((column) => row[column])),
+  });
+  return {
+    rows: rawRows.map(normalizeSubmissionRow),
+    rawRows,
+    count: rawRows.length,
+    complete: true,
+    revision: createHash('sha256').update(revisionPayload).digest('hex'),
+    revisionVersion: dealHunterCrmMatchAuthorityVersion,
+  };
+}
+
+function rawDealHunterCrmMetadataOwner(row, candidateIds = []) {
+  let metadata;
+  try {
+    metadata = row?.metadata ? JSON.parse(row.metadata) : {};
+  } catch {
+    throw dealHunterCrmMatchAuthorityError({ candidateIds });
+  }
+  const owner = metadata?.dealHunter?.opportunityId;
+  return typeof owner === 'string' ? owner.trim() : '';
+}
+
 function normalizeUploadRequestRow(row) {
   return row
     ? {
@@ -5648,6 +5709,18 @@ export function createSqliteStorage(config) {
       return matchedRow ? normalizeSubmissionRow(matchedRow) : null;
     },
 
+    async readDealHunterCrmMatchAuthority({ limit = dealHunterCrmMatchAuthorityMaximumRows } = {}) {
+      const read = database.transaction(() => dealHunterCrmMatchAuthoritySnapshot(database, { limit }));
+      const snapshot = read.deferred();
+      return {
+        rows: snapshot.rows,
+        count: snapshot.count,
+        complete: snapshot.complete,
+        revision: snapshot.revision,
+        revisionVersion: snapshot.revisionVersion,
+      };
+    },
+
     async listSubmissions({ limit = 50, page = 1, search = '', status = 'all', createdAfter = '', sort = 'created_at', direction = 'desc' } = {}) {
       const clauses = [];
       const params = [];
@@ -9138,6 +9211,66 @@ export function createSqliteStorage(config) {
           WHERE deal_hunter_opportunity_id = ? AND id <> ? LIMIT 1
         `).get(opportunityId, submissionId);
         if (conflicting) throw new Error('Canonical opportunity already owns another CRM submission.');
+        database.prepare(`
+          UPDATE contact_submissions SET deal_hunter_opportunity_id = ?, updated_at = ? WHERE id = ?
+        `).run(opportunityId, timestamp, submissionId);
+        database.prepare(`
+          UPDATE deal_hunter_opportunities SET primary_submission_id = ?, updated_at = ? WHERE opportunity_id = ?
+        `).run(submissionId, timestamp, opportunityId);
+      });
+      transaction.immediate();
+      return this.getDealHunterOpportunity(opportunityId);
+    },
+
+    async linkDealHunterCrmSubmissionIfAuthorityCurrent({
+      opportunityId,
+      submissionId,
+      expectedAuthorityRevision,
+      updatedAt = '',
+    } = {}) {
+      const timestamp = updatedAt || new Date().toISOString();
+      const transaction = database.transaction(() => {
+        const candidateIds = [submissionId];
+        const authority = dealHunterCrmMatchAuthoritySnapshot(database, {
+          limit: dealHunterCrmMatchAuthorityMaximumRows,
+        });
+        if (!authority.complete
+          || typeof expectedAuthorityRevision !== 'string'
+          || !expectedAuthorityRevision
+          || authority.revision !== expectedAuthorityRevision) {
+          throw dealHunterCrmMatchAuthorityError({ candidateIds });
+        }
+
+        const opportunity = database.prepare(`
+          SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+        `).get(opportunityId);
+        if (!opportunity || opportunity.status !== 'active') {
+          throw dealHunterCrmMatchAuthorityError({ candidateIds });
+        }
+        if (opportunity.primary_submission_id && opportunity.primary_submission_id !== submissionId) {
+          throw dealHunterCrmMatchAuthorityError({ candidateIds: [opportunity.primary_submission_id, submissionId] });
+        }
+
+        const submission = authority.rawRows.find((row) => row.id === submissionId);
+        if (!submission || ['archived', 'spam'].includes(String(submission.status || '').trim().toLowerCase())) {
+          throw dealHunterCrmMatchAuthorityError({ candidateIds });
+        }
+        const directOwner = String(submission.deal_hunter_opportunity_id || '').trim();
+        const metadataOwner = rawDealHunterCrmMetadataOwner(submission, candidateIds);
+        if ((directOwner && directOwner !== opportunityId)
+          || (metadataOwner && metadataOwner !== opportunityId)
+          || (directOwner && metadataOwner && directOwner !== metadataOwner)) {
+          throw dealHunterCrmMatchAuthorityError({ candidateIds });
+        }
+
+        const conflicting = authority.rawRows.find((row) => (
+          row.id !== submissionId
+          && String(row.deal_hunter_opportunity_id || '').trim() === opportunityId
+        ));
+        if (conflicting) {
+          throw dealHunterCrmMatchAuthorityError({ candidateIds: [submissionId, conflicting.id] });
+        }
+
         database.prepare(`
           UPDATE contact_submissions SET deal_hunter_opportunity_id = ?, updated_at = ? WHERE id = ?
         `).run(opportunityId, timestamp, submissionId);

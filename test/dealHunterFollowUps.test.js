@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
   isCimFollowUpSendDay,
@@ -16,6 +17,16 @@ const weekdaySettings = {
   weekdaysOnly: true,
   timezone: 'America/Los_Angeles',
 };
+
+function crmMatchAuthority(rows) {
+  const ordered = structuredClone(rows).sort((left, right) => left.id.localeCompare(right.id));
+  return {
+    rows: ordered,
+    count: ordered.length,
+    complete: true,
+    revision: createHash('sha256').update(JSON.stringify(ordered)).digest('hex'),
+  };
+}
 
 test('CIM follow-up weekday guard uses the configured timezone', () => {
   assert.equal(
@@ -409,6 +420,7 @@ test('legacy follow-up runner exposes CRM match ambiguity before request claim o
     async getDealHunterCrmImport() { return null; },
     async getSubmission(id) { return candidates.find((candidate) => candidate.id === id) || null; },
     async listSubmissions() { return { rows: candidates, total: candidates.length }; },
+    async readDealHunterCrmMatchAuthority() { return crmMatchAuthority(candidates); },
     async claimDealHunterCimFollowUpRequest() { effects.requestClaims += 1; throw new Error('must not claim'); },
     async insertCrmCommunication() { effects.communicationWrites += 1; throw new Error('must not write'); },
   };
@@ -479,6 +491,7 @@ test('legacy follow-up marks a new CRM import claim failed when ambiguity appear
     async upsertDealHunterIdentityException(exception) { return exception; },
     async getDealHunterCrmImport() { return importRecord; },
     async listSubmissions() { return { rows: candidates, total: candidates.length }; },
+    async readDealHunterCrmMatchAuthority() { return crmMatchAuthority(candidates); },
     async claimDealHunterCrmImport(record) {
       importRecord = record;
       candidates = ['post-claim-a', 'post-claim-b'].map((id) => ({

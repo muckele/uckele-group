@@ -14,6 +14,15 @@ const dealHunterQueueSorts = new Set([
   'acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed',
 ]);
 
+function unsupportedDealHunterCrmMatchAuthorityError() {
+  const error = new Error('Atomic CRM match authority is unavailable for the configured Supabase provider.');
+  error.code = 'CRM_MATCH_LOOKUP_INCOMPLETE';
+  error.status = 503;
+  error.candidateIds = [];
+  error.evidenceCategories = ['lookup-incomplete', 'provider-unsupported'];
+  return error;
+}
+
 const scheduledJobStatuses = new Set(['pending', 'transmitting', 'failed', 'ambiguous', 'completed']);
 const scheduledJobResultReasons = new Set([
   'claimed', 'active', 'retry-not-due', 'not-owner', 'wrong-state', 'completed', 'missing',
@@ -3129,6 +3138,14 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       });
       if (error) throw error;
       return normalizeDealHunterOpportunityRow(data);
+    },
+
+    async readDealHunterCrmMatchAuthority() {
+      throw unsupportedDealHunterCrmMatchAuthorityError();
+    },
+
+    async linkDealHunterCrmSubmissionIfAuthorityCurrent() {
+      throw unsupportedDealHunterCrmMatchAuthorityError();
     },
 
     async getDealHunterOpportunity(opportunityId) {

@@ -3963,7 +3963,10 @@ function dealHunterCrmPayload(deal, options = {}) {
     message: actionable
       ? `High-fit Deal Hunter listing imported into the CRM with score ${deal.score}/100.`
       : `Deal Hunter listing synchronized as a non-actionable sourced record with score ${deal.score}/100.`,
-    deal_hunter_opportunity_id: deal.opportunityId || null,
+    // Automatic creation records the proposed owner in Deal Hunter metadata,
+    // but the direct canonical link is established only by the conditional
+    // authority-current transaction after a fresh unique-match review.
+    deal_hunter_opportunity_id: null,
     metadata: dealHunterCrmMetadata(deal, { ...options, actionable }),
   };
 }
@@ -3971,6 +3974,7 @@ function dealHunterCrmPayload(deal, options = {}) {
 const dealHunterCrmMatchMaximumRows = 5000;
 const dealHunterCrmMatchPublicCandidateLimit = 25;
 const dealHunterCrmMatchMaximumAliases = 500;
+const dealHunterCrmMatchAuthorityRevision = Symbol('dealHunterCrmMatchAuthorityRevision');
 
 function dealHunterCrmMatchError(code, message, { status = 409, candidateIds = [], evidenceCategories = [] } = {}) {
   const error = new Error(message);
@@ -4070,27 +4074,36 @@ function crmSubmissionStoredDeal(submission = {}) {
 
 async function listCompleteDealHunterCrmCandidates(storage) {
   let result;
+  if (typeof storage.readDealHunterCrmMatchAuthority !== 'function') {
+    throw dealHunterCrmMatchError(
+      'CRM_MATCH_LOOKUP_INCOMPLETE',
+      'The configured storage provider cannot complete an atomic CRM match authority review.',
+      { status: 503, evidenceCategories: ['lookup-incomplete'] },
+    );
+  }
   try {
-    // Both durable providers return rows and the matching total through one
-    // bounded provider call at this supported limit. Offset pagination cannot
-    // prove completeness while concurrent CRM inserts reorder the result set.
-    result = await storage.listSubmissions({
-      limit: dealHunterCrmMatchMaximumRows,
-      page: 1,
-      status: 'all',
-      sort: 'created_at',
-      direction: 'desc',
-    });
-  } catch {
+    result = await storage.readDealHunterCrmMatchAuthority({ limit: dealHunterCrmMatchMaximumRows });
+  } catch (error) {
+    if (normalizeText(error?.code, 120).startsWith('CRM_MATCH_')) throw error;
     throw dealHunterCrmMatchError(
       'CRM_MATCH_LOOKUP_FAILED',
       'CRM matching could not complete its candidate lookup, so no record was selected.',
       { status: 503, evidenceCategories: ['lookup-failure'] },
     );
   }
-  const reportedTotal = Number(result?.total);
+  if (result?.complete !== true) {
+    const candidateIds = Array.isArray(result?.rows)
+      ? result.rows.map((row) => row?.id).filter(Boolean)
+      : [];
+    throw dealHunterCrmMatchError(
+      'CRM_MATCH_LOOKUP_INCOMPLETE',
+      'CRM matching could not prove a complete unique candidate snapshot within its safety bound.',
+      { status: 503, candidateIds, evidenceCategories: ['lookup-incomplete'] },
+    );
+  }
+  const reportedTotal = Number(result?.count);
   if (!result || !Array.isArray(result.rows)
-    || result.total === null || result.total === undefined
+    || result.count === null || result.count === undefined
     || !Number.isInteger(reportedTotal) || reportedTotal < 0) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_LOOKUP_FAILED',
@@ -4104,24 +4117,25 @@ async function listCompleteDealHunterCrmCandidates(storage) {
   }
   if (reportedTotal > dealHunterCrmMatchMaximumRows
     || result.rows.length !== reportedTotal
-    || rowsById.size !== reportedTotal) {
+    || rowsById.size !== reportedTotal
+    || !/^[a-f0-9]{64}$/.test(String(result.revision || ''))) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_LOOKUP_INCOMPLETE',
       'CRM matching could not prove a complete unique candidate snapshot within its safety bound.',
       { status: 503, candidateIds: [...rowsById.keys()], evidenceCategories: ['lookup-incomplete'] },
     );
   }
-  return [...rowsById.values()];
+  return { rows: [...rowsById.values()], revision: result.revision };
 }
 
-function dealHunterCrmMatchResult(status, submission = null, candidates = []) {
+function dealHunterCrmMatchResult(status, submission = null, candidates = [], authorityRevision = '') {
   const boundedCandidates = candidates
     .map((candidate) => ({
       submissionId: candidate.submission.id,
       evidenceCategories: [...candidate.evidenceCategories].sort(),
     }))
     .sort((left, right) => left.submissionId.localeCompare(right.submissionId));
-  return {
+  const result = {
     status,
     submission,
     candidateIds: boundedCandidates.map((candidate) => candidate.submissionId)
@@ -4130,6 +4144,23 @@ function dealHunterCrmMatchResult(status, submission = null, candidates = []) {
     candidates: boundedCandidates.slice(0, dealHunterCrmMatchPublicCandidateLimit),
     candidatesTruncated: boundedCandidates.length > dealHunterCrmMatchPublicCandidateLimit,
   };
+  Object.defineProperty(result, dealHunterCrmMatchAuthorityRevision, {
+    value: authorityRevision,
+    enumerable: false,
+  });
+  return result;
+}
+
+function crmMatchAuthorityRevision(match) {
+  const revision = match?.[dealHunterCrmMatchAuthorityRevision];
+  if (!/^[a-f0-9]{64}$/.test(String(revision || ''))) {
+    throw dealHunterCrmMatchError(
+      'CRM_MATCH_LOOKUP_INCOMPLETE',
+      'CRM matching did not retain a complete authority revision, so canonical linkage was refused.',
+      { status: 503, evidenceCategories: ['lookup-incomplete'] },
+    );
+  }
+  return revision;
 }
 
 function selectedDealHunterCrmSubmission(match) {
@@ -4182,60 +4213,36 @@ function assertDealHunterCrmMatchStable(before, after) {
   return afterSubmission;
 }
 
-async function validatedCachedDealHunterCrmSubmission(storage, deal, submissionId, match) {
+async function validatedCachedDealHunterCrmSubmission(deal, submissionId, match) {
   const selected = selectedDealHunterCrmSubmission(match);
   if (!submissionId) return selected;
-  const getSubmission = storage.getSubmissionStrict || storage.getSubmission;
-  if (typeof getSubmission !== 'function') {
-    throw dealHunterCrmMatchError(
-      'CRM_MATCH_LOOKUP_INCOMPLETE',
-      'A cached CRM import owner cannot be verified with the configured storage provider.',
-      { status: 503, candidateIds: [submissionId], evidenceCategories: ['lookup-incomplete'] },
-    );
-  }
-  let cached;
-  try {
-    cached = await getSubmission.call(storage, submissionId);
-  } catch {
-    throw dealHunterCrmMatchError(
-      'CRM_MATCH_LOOKUP_FAILED',
-      'A cached CRM import owner could not be loaded, so no record was selected.',
-      { status: 503, candidateIds: [submissionId], evidenceCategories: ['lookup-failure'] },
-    );
-  }
-  if (!cached) {
+  if (!selected) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_AUTHORITY_STALE',
-      'A cached CRM import points to a missing record and requires operator review.',
-      { candidateIds: [submissionId], evidenceCategories: ['cached-import-missing'] },
+      'A cached CRM reference is not supported by current canonical or identity evidence.',
+      { candidateIds: [submissionId], evidenceCategories: ['cached-import-unmatched'] },
     );
   }
-  assertDealHunterCrmSubmissionOwnership(cached, deal.opportunityId || '');
-  if (isInactiveDealHunterCrmSubmission(cached)) {
+  assertDealHunterCrmSubmissionOwnership(selected, deal.opportunityId || '');
+  if (isInactiveDealHunterCrmSubmission(selected)) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_RECORD_INACTIVE',
       'A cached CRM import points to an inactive record and requires operator review.',
       { candidateIds: [submissionId], evidenceCategories: ['cached-import', 'inactive-record'] },
     );
   }
-  if (selected && selected.id !== cached.id) {
+  if (selected.id !== submissionId) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_AUTHORITY_CONFLICT',
       'The cached CRM import owner conflicts with the strongest current identity match.',
-      { candidateIds: [cached.id, selected.id], evidenceCategories: ['cached-import-conflict'] },
-    );
-  }
-  if (!selected) {
-    throw dealHunterCrmMatchError(
-      'CRM_MATCH_AUTHORITY_STALE',
-      'A cached CRM reference is not supported by current canonical or identity evidence.',
-      { candidateIds: [cached.id], evidenceCategories: ['cached-import-unmatched'] },
+      { candidateIds: [submissionId, selected.id], evidenceCategories: ['cached-import-conflict'] },
     );
   }
   return selected;
 }
 
 export async function findExistingDealHunterSubmission(storage, deal) {
+  let opportunity = null;
   if (deal.opportunityId) {
     if (typeof storage.getCurrentDealHunterOpportunity !== 'function') {
       throw dealHunterCrmMatchError(
@@ -4244,7 +4251,6 @@ export async function findExistingDealHunterSubmission(storage, deal) {
         { status: 503, evidenceCategories: ['lookup-incomplete'] },
       );
     }
-    let opportunity;
     try {
       opportunity = await storage.getCurrentDealHunterOpportunity(deal.opportunityId);
     } catch {
@@ -4261,25 +4267,11 @@ export async function findExistingDealHunterSubmission(storage, deal) {
         { evidenceCategories: ['canonical-authority-stale'] },
       );
     }
-    if (opportunity.primary_submission_id) {
-      const getSubmission = storage.getSubmissionStrict || storage.getSubmission;
-      if (typeof getSubmission !== 'function') {
-        throw dealHunterCrmMatchError(
-          'CRM_MATCH_LOOKUP_INCOMPLETE',
-          'The canonical primary CRM record cannot be verified with the configured storage provider.',
-          { status: 503, candidateIds: [opportunity.primary_submission_id], evidenceCategories: ['lookup-incomplete'] },
-        );
-      }
-      let primary;
-      try {
-        primary = await getSubmission.call(storage, opportunity.primary_submission_id);
-      } catch {
-        throw dealHunterCrmMatchError(
-          'CRM_MATCH_LOOKUP_FAILED',
-          'The canonical primary CRM record could not be loaded, so no record was selected.',
-          { status: 503, candidateIds: [opportunity.primary_submission_id], evidenceCategories: ['lookup-failure'] },
-        );
-      }
+  }
+
+  const authority = await listCompleteDealHunterCrmCandidates(storage);
+  if (opportunity?.primary_submission_id) {
+      const primary = authority.rows.find((row) => row.id === opportunity.primary_submission_id);
       if (!primary) {
         throw dealHunterCrmMatchError(
           'CRM_MATCH_AUTHORITY_STALE',
@@ -4305,8 +4297,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
       return dealHunterCrmMatchResult('unique-exact', primary, [{
         submission: primary,
         evidenceCategories: new Set(['canonical-primary']),
-      }]);
-    }
+      }], authority.revision);
   }
   const listingAliases = uniqueStrings([
     deal.listingUrl,
@@ -4338,18 +4329,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
     if (submission?.id) candidates.set(submission.id, submission);
   };
 
-  if (typeof storage.listSubmissions !== 'function') {
-    throw dealHunterCrmMatchError(
-      'CRM_MATCH_LOOKUP_INCOMPLETE',
-      'The configured storage provider cannot complete the bounded CRM candidate search.',
-      { status: 503, evidenceCategories: ['lookup-incomplete'] },
-    );
-  }
-  // The admissibility rules include metadata-only aliases and corroborated
-  // near-title evidence that the providers' public substring search does not
-  // index. A single complete, bounded pagination is therefore the smallest
-  // existing provider contract that can prove none or uniqueness.
-  for (const row of await listCompleteDealHunterCrmCandidates(storage)) addCandidate(row);
+  for (const row of authority.rows) addCandidate(row);
 
   const classified = [];
   for (const submission of candidates.values()) {
@@ -4388,7 +4368,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
     classified.push({ submission, tier, evidenceCategories });
   }
 
-  if (classified.length === 0) return dealHunterCrmMatchResult('none');
+  if (classified.length === 0) return dealHunterCrmMatchResult('none', null, [], authority.revision);
   for (const candidate of classified) {
     assertDealHunterCrmSubmissionOwnership(candidate.submission, deal.opportunityId || '');
   }
@@ -4405,23 +4385,39 @@ export async function findExistingDealHunterSubmission(storage, deal) {
       },
     );
   }
-  if (actionable.length > 1) return dealHunterCrmMatchResult('ambiguous', null, actionable);
+  if (actionable.length > 1) {
+    return dealHunterCrmMatchResult('ambiguous', null, actionable, authority.revision);
+  }
   const [selected] = actionable;
   return dealHunterCrmMatchResult(
     strongestTier === 3 ? 'unique-corroborated' : 'unique-exact',
     selected.submission,
     [selected],
+    authority.revision,
   );
 }
 
-async function linkDealHunterOpportunitySubmission(storage, deal, submissionId) {
+async function linkDealHunterOpportunitySubmission(storage, deal, submissionId, match) {
   if (!deal.opportunityId || !submissionId) return null;
-  if (typeof storage.linkDealHunterCrmSubmission !== 'function') {
-    throw new Error('Atomic canonical CRM linkage is unavailable for the configured storage provider.');
+  const selected = selectedDealHunterCrmSubmission(match);
+  if (!selected || selected.id !== submissionId) {
+    throw dealHunterCrmMatchError(
+      'CRM_MATCH_SELECTION_CHANGED',
+      'The selected CRM record no longer matches the reviewed authority decision.',
+      { candidateIds: [submissionId, selected?.id], evidenceCategories: ['selection-drift'] },
+    );
   }
-  return storage.linkDealHunterCrmSubmission({
+  if (typeof storage.linkDealHunterCrmSubmissionIfAuthorityCurrent !== 'function') {
+    throw dealHunterCrmMatchError(
+      'CRM_MATCH_LOOKUP_INCOMPLETE',
+      'Atomic CRM match authority linkage is unavailable for the configured storage provider.',
+      { status: 503, candidateIds: [submissionId], evidenceCategories: ['lookup-incomplete'] },
+    );
+  }
+  return storage.linkDealHunterCrmSubmissionIfAuthorityCurrent({
     opportunityId: deal.opportunityId,
     submissionId,
+    expectedAuthorityRevision: crmMatchAuthorityRevision(match),
     updatedAt: new Date().toISOString(),
   });
 }
@@ -4481,13 +4477,11 @@ async function ensureDealHunterSubmissionForCim(storage, deal, requestedBy = '')
   const existing = selectedDealHunterCrmSubmission(preflightMatch);
 
   if (existing) {
-    assertDealHunterCrmMatchStable(
-      preflightMatch,
-      await findExistingDealHunterSubmission(storage, deal),
-    );
+    const currentMatch = await findExistingDealHunterSubmission(storage, deal);
+    const current = assertDealHunterCrmMatchStable(preflightMatch, currentMatch);
     await assertNoDealHunterCrmTombstone(storage, deal);
-    await linkDealHunterOpportunitySubmission(storage, deal, existing.id);
-    return existing;
+    await linkDealHunterOpportunitySubmission(storage, deal, current.id, currentMatch);
+    return current;
   }
 
   const proposedImport = buildDealHunterCrmImportRecord(deal);
@@ -4518,7 +4512,6 @@ async function ensureDealHunterSubmissionForCim(storage, deal, requestedBy = '')
     }
     const currentMatch = await findExistingDealHunterSubmission(storage, deal);
     const concurrentlyCreated = await validatedCachedDealHunterCrmSubmission(
-      storage,
       deal,
       importRecord?.submission_id,
       currentMatch,
@@ -4526,7 +4519,7 @@ async function ensureDealHunterSubmissionForCim(storage, deal, requestedBy = '')
 
     if (concurrentlyCreated) {
       await assertNoDealHunterCrmTombstone(storage, deal);
-      await linkDealHunterOpportunitySubmission(storage, deal, concurrentlyCreated.id);
+      await linkDealHunterOpportunitySubmission(storage, deal, concurrentlyCreated.id, currentMatch);
       return concurrentlyCreated;
     }
 
@@ -4536,17 +4529,15 @@ async function ensureDealHunterSubmissionForCim(storage, deal, requestedBy = '')
   try {
     // Recheck after taking the durable import claim in case a prior review
     // created the CRM record between the initial lookup and the claim.
-    const afterClaim = assertDealHunterCrmMatchStable(
-      preflightMatch,
-      await findExistingDealHunterSubmission(storage, deal),
-    );
+    const afterClaimMatch = await findExistingDealHunterSubmission(storage, deal);
+    const afterClaim = assertDealHunterCrmMatchStable(preflightMatch, afterClaimMatch);
 
     if (afterClaim) {
       await updateDealHunterCrmImport(storage, importRecord, {
         submission_id: afterClaim.id,
         status: 'linked',
       });
-      await linkDealHunterOpportunitySubmission(storage, deal, afterClaim.id);
+      await linkDealHunterOpportunitySubmission(storage, deal, afterClaim.id, afterClaimMatch);
       return afterClaim;
     }
 
@@ -4565,8 +4556,17 @@ async function ensureDealHunterSubmissionForCim(storage, deal, requestedBy = '')
       opportunity_id: deal.opportunityId || null,
       status: 'created',
     });
-    await linkDealHunterOpportunitySubmission(storage, deal, created.submission.id);
-    return created.submission;
+    const createdMatch = await findExistingDealHunterSubmission(storage, deal);
+    const selectedCreated = selectedDealHunterCrmSubmission(createdMatch);
+    if (selectedCreated?.id !== created.submission.id) {
+      throw dealHunterCrmMatchError(
+        'CRM_MATCH_SELECTION_CHANGED',
+        'The newly created CRM record was not the unique reviewed match, so canonical linkage was refused.',
+        { candidateIds: [created.submission.id, selectedCreated?.id], evidenceCategories: ['selection-drift'] },
+      );
+    }
+    await linkDealHunterOpportunitySubmission(storage, deal, created.submission.id, createdMatch);
+    return selectedCreated;
   } catch (error) {
     if (acquiredClaim) {
       await updateDealHunterCrmImport(storage, importRecord, {
@@ -4591,7 +4591,6 @@ async function upsertCimRequestWithActivity(storage, request, {
   };
   const submission = crmMatchRequired
     ? await validatedCachedDealHunterCrmSubmission(
-        storage,
         deal,
         request.submission_id,
         await findExistingDealHunterSubmission(storage, deal),
@@ -4768,6 +4767,7 @@ function dealHunterCrmUpdate(existing, deal, options = {}) {
 }
 
 async function updateDealHunterCrmSubmission(storage, existing, deal, {
+  match = null,
   preserveExistingFields = false,
   actionable = true,
   actor = 'deal-hunter',
@@ -4776,7 +4776,7 @@ async function updateDealHunterCrmSubmission(storage, existing, deal, {
 } = {}) {
   let currentSubmission = existing;
   if (deal.opportunityId) {
-    await linkDealHunterOpportunitySubmission(storage, deal, existing.id);
+    await linkDealHunterOpportunitySubmission(storage, deal, existing.id, match);
     if (typeof storage.getSubmission !== 'function') {
       throw new Error('CRM submission reload is unavailable after canonical linkage.');
     }
@@ -4964,7 +4964,17 @@ export async function repairDealHunterCrmSourceFields({
     return { ok: true, applied: false, preview };
   }
 
+  const repairMatch = await findExistingDealHunterSubmission(storage, repairDeal);
+  const repairSelection = selectedDealHunterCrmSubmission(repairMatch);
+  if (repairSelection?.id !== existing.id) {
+    throw dealHunterCrmMatchError(
+      'CRM_MATCH_SELECTION_CHANGED',
+      'The repair target is no longer the unique reviewed CRM match.',
+      { candidateIds: [existing.id, repairSelection?.id], evidenceCategories: ['selection-drift'] },
+    );
+  }
   const updated = await updateDealHunterCrmSubmission(storage, existing, repairDeal, {
+    match: repairMatch,
     preserveExistingFields: false,
     actor: normalizedActor,
     summary: 'Deal Hunter CRM source fields repaired from the current listing data.',
@@ -5077,16 +5087,17 @@ async function performHighFitDealsCrmSync(scoredDeals = [], storage = getStorage
         const currentMatch = await findExistingDealHunterSubmission(storage, deal);
         assertDealHunterCrmMatchStable(preflightMatch, currentMatch);
         const claimedSubmission = await validatedCachedDealHunterCrmSubmission(
-          storage,
           deal,
           importRecord?.submission_id,
           currentMatch,
         );
 
         if (claimedSubmission && storage.updateSubmission) {
-          await linkDealHunterOpportunitySubmission(storage, deal, claimedSubmission.id);
           const preserveExistingFields = !isDealHunterManagedSubmission(claimedSubmission);
-          const updated = await updateDealHunterCrmSubmission(storage, claimedSubmission, deal, { preserveExistingFields });
+          const updated = await updateDealHunterCrmSubmission(storage, claimedSubmission, deal, {
+            match: currentMatch,
+            preserveExistingFields,
+          });
           const status = preserveExistingFields ? 'enriched' : 'updated';
           summary[status] += 1;
           summary.results.push({ dealKey: deal.dealKey, status, submissionId: updated?.id || claimedSubmission.id });
@@ -5098,16 +5109,16 @@ async function performHighFitDealsCrmSync(scoredDeals = [], storage = getStorage
         continue;
       }
 
-      const existing = assertDealHunterCrmMatchStable(
-        preflightMatch,
-        await findExistingDealHunterSubmission(storage, deal),
-      );
+      const currentMatch = await findExistingDealHunterSubmission(storage, deal);
+      const existing = assertDealHunterCrmMatchStable(preflightMatch, currentMatch);
 
       if (existing) {
         if (storage.updateSubmission) {
-          await linkDealHunterOpportunitySubmission(storage, deal, existing.id);
           const preserveExistingFields = !isDealHunterManagedSubmission(existing);
-          const updated = await updateDealHunterCrmSubmission(storage, existing, deal, { preserveExistingFields });
+          const updated = await updateDealHunterCrmSubmission(storage, existing, deal, {
+            match: currentMatch,
+            preserveExistingFields,
+          });
           const status = preserveExistingFields ? 'enriched' : 'updated';
           summary[status] += 1;
           summary.results.push({ dealKey: deal.dealKey, status, submissionId: updated?.id || existing.id });
@@ -5118,7 +5129,7 @@ async function performHighFitDealsCrmSync(scoredDeals = [], storage = getStorage
         } else {
           summary.skipped += 1;
           summary.results.push({ dealKey: deal.dealKey, status: 'duplicate-no-update', submissionId: existing.id });
-          await linkDealHunterOpportunitySubmission(storage, deal, existing.id);
+          await linkDealHunterOpportunitySubmission(storage, deal, existing.id, currentMatch);
         }
 
         continue;
@@ -5143,13 +5154,22 @@ async function performHighFitDealsCrmSync(scoredDeals = [], storage = getStorage
         continue;
       }
 
-      summary.created += 1;
-      summary.results.push({ dealKey: deal.dealKey, status: 'created', submissionId: created.submission?.id || '' });
       await updateDealHunterCrmImport(storage, importRecord, {
         submission_id: created.submission?.id || '',
         status: 'created',
       });
-      await linkDealHunterOpportunitySubmission(storage, deal, created.submission?.id || '');
+      const createdMatch = await findExistingDealHunterSubmission(storage, deal);
+      const selectedCreated = selectedDealHunterCrmSubmission(createdMatch);
+      if (selectedCreated?.id !== created.submission?.id) {
+        throw dealHunterCrmMatchError(
+          'CRM_MATCH_SELECTION_CHANGED',
+          'The newly created CRM record was not the unique reviewed match, so canonical linkage was refused.',
+          { candidateIds: [created.submission?.id, selectedCreated?.id], evidenceCategories: ['selection-drift'] },
+        );
+      }
+      await linkDealHunterOpportunitySubmission(storage, deal, created.submission.id, createdMatch);
+      summary.created += 1;
+      summary.results.push({ dealKey: deal.dealKey, status: 'created', submissionId: created.submission.id });
     } catch (error) {
       summary.failed += 1;
       summary.results.push({
@@ -7299,16 +7319,16 @@ async function processLegacyCimFollowUpRequest(storage, request, nowIso) {
       });
     } else if (storage.getSubmission) {
       const requestDeal = dealFromCimRequest(request);
+      const requestMatch = await findExistingDealHunterSubmission(storage, requestDeal);
       const linkedSubmission = await validatedCachedDealHunterCrmSubmission(
-        storage,
         requestDeal,
         request.submission_id,
-        await findExistingDealHunterSubmission(storage, requestDeal),
+        requestMatch,
       );
       if (!linkedSubmission || linkedSubmission.status === 'archived') {
         return { status: 'stopped', request };
       }
-      await linkDealHunterOpportunitySubmission(storage, requestDeal, linkedSubmission.id);
+      await linkDealHunterOpportunitySubmission(storage, requestDeal, linkedSubmission.id, requestMatch);
     }
 
     const events = await loadCimRequestEvents(storage, request);
@@ -8352,7 +8372,6 @@ export async function previewDealOsCrmReconciliation({
             changedFields = ['crm_match'];
           } else {
             const existing = await validatedCachedDealHunterCrmSubmission(
-              storage,
               deal,
               importRecord?.submission_id,
               match,
@@ -8460,15 +8479,14 @@ async function applyDealOsCrmReconciliationItem({ deal, item, storage, requested
     const currentMatch = await findExistingDealHunterSubmission(storage, deal);
     assertDealHunterCrmMatchStable(preflightMatch, currentMatch);
     const existing = await validatedCachedDealHunterCrmSubmission(
-      storage,
       deal,
       importRecord.submission_id,
       currentMatch,
     );
     if (existing) {
-      await linkDealHunterOpportunitySubmission(storage, deal, existing.id);
       const preserveExistingFields = !isDealHunterManagedSubmission(existing);
       const updated = await updateDealHunterCrmSubmission(storage, existing, deal, {
+        match: currentMatch,
         preserveExistingFields,
         actionable: item.actionable,
         actor: requestedBy,
@@ -8496,7 +8514,16 @@ async function applyDealOsCrmReconciliationItem({ deal, item, storage, requested
       submission_id: created.submission.id,
       status: 'created',
     });
-    await linkDealHunterOpportunitySubmission(storage, deal, created.submission.id);
+    const createdMatch = await findExistingDealHunterSubmission(storage, deal);
+    const selectedCreated = selectedDealHunterCrmSubmission(createdMatch);
+    if (selectedCreated?.id !== created.submission.id) {
+      throw dealHunterCrmMatchError(
+        'CRM_MATCH_SELECTION_CHANGED',
+        'The newly created CRM record was not the unique reviewed match, so canonical linkage was refused.',
+        { candidateIds: [created.submission.id, selectedCreated?.id], evidenceCategories: ['selection-drift'] },
+      );
+    }
+    await linkDealHunterOpportunitySubmission(storage, deal, created.submission.id, createdMatch);
     return { status: 'created', submissionId: created.submission.id };
   } catch (error) {
     if (claim.claimed) {
@@ -9530,13 +9557,13 @@ async function sendCimRequestForScoredDeal({
     try {
       await assertNoDealHunterCrmTombstone(storage, deal);
       if (retryOfRequest?.submission_id) {
+        const retryMatch = await findExistingDealHunterSubmission(storage, deal);
         submission = await validatedCachedDealHunterCrmSubmission(
-          storage,
           deal,
           retryOfRequest.submission_id,
-          await findExistingDealHunterSubmission(storage, deal),
+          retryMatch,
         );
-        await linkDealHunterOpportunitySubmission(storage, deal, submission.id);
+        await linkDealHunterOpportunitySubmission(storage, deal, submission.id, retryMatch);
       } else {
         submission = await ensureDealHunterSubmissionForCim(storage, deal, requestedBy);
       }
@@ -10258,17 +10285,26 @@ export async function executeApprovedDealHunterCimRequest({
     .filter(Boolean);
   const listingUrl = normalizeText(fieldValue('listing_url') || score.listing_url, 2000);
   const sourceRow = sourceRows.find((row) => row?.source_id && row?.source_record_id) || {};
+  const sourceRecordId = normalizeText(sourceRow.source_record_id, 240);
+  const sourceId = normalizeText(sourceRow.source_id, 200);
+  const sourceName = normalizeText(sourceRow.source_name, 200);
   const annualProfitValue = fieldValue('annual_profit', 'ttm_ebitda');
   const deal = {
-    id: normalizeText(sourceRow.source_record_id, 240),
+    id: sourceRecordId,
     opportunityId,
     identityStatus: 'resolved',
     dealKey: normalizeText(score.deal_key, 1200),
     dealKeyAliases,
     identityAliases,
-    sourceId: normalizeText(sourceRow.source_id, 200),
-    sourceName: normalizeText(sourceRow.source_name, 200),
-    stableExternalId: Boolean(sourceRow.source_record_id),
+    sourceId,
+    sourceName,
+    stableExternalId: Boolean(sourceRecordId),
+    sourceRecords: sourceRecordId ? [{
+      sourceId,
+      sourceName,
+      externalId: sourceRecordId,
+      stableExternalId: true,
+    }] : [],
     name: normalizeText(opportunity.canonical_name || score.name || 'the listed business', 300),
     description: normalizeText(fieldValue('description'), 4000),
     industry: normalizeText(fieldValue('industry'), 220),

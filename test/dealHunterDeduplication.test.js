@@ -96,6 +96,15 @@ function allReviewDeals(review) {
   return [...review.qualified, ...review.watchlist, ...review.removalCandidates];
 }
 
+function crmMatchAuthority(rows) {
+  return {
+    rows,
+    count: rows.length,
+    complete: true,
+    revision: 'a'.repeat(64),
+  };
+}
+
 test('numeric Sheet positions are not durable identities while explicit numeric listing IDs are', () => {
   const positional = parseSheetCsvDeals(sheetCsv([{
     'Business Name': 'Commercial HVAC Services',
@@ -403,10 +412,9 @@ test('CRM alias lookup prefers the active canonical card over an archived syndic
     metadata: { dealHunter: { dealKey: canonicalKey, listingAliases: [canonicalUrl, syndicatedUrl] } },
   };
   const storage = {
-    async getSubmissionByListingUrl(listingUrl) {
-      return listingUrl === syndicatedUrl ? archivedDuplicate : activeCanonical;
+    async readDealHunterCrmMatchAuthority() {
+      return crmMatchAuthority([archivedDuplicate, activeCanonical]);
     },
-    async listSubmissions() { return { rows: [archivedDuplicate, activeCanonical], total: 2 }; },
   };
 
   const existing = await findExistingDealHunterSubmission(storage, {
@@ -421,7 +429,7 @@ test('CRM alias lookup prefers the active canonical card over an archived syndic
 });
 
 test('CRM lookup reuses a Daily Deal Update card for a corroborated Deal OS syndication', async () => {
-  const searches = [];
+  let authorityReads = 0;
   const dailyDealRecord = {
     id: 'daily-deal-update-card',
     status: 'review',
@@ -442,10 +450,9 @@ test('CRM lookup reuses a Daily Deal Update card for a corroborated Deal OS synd
     },
   };
   const storage = {
-    async getSubmissionByListingUrl() { return null; },
-    async listSubmissions({ search }) {
-      searches.push(search);
-      return { rows: search ? [] : [dailyDealRecord], total: search ? 0 : 1 };
+    async readDealHunterCrmMatchAuthority() {
+      authorityReads += 1;
+      return crmMatchAuthority([dailyDealRecord]);
     },
   };
 
@@ -468,7 +475,7 @@ test('CRM lookup reuses a Daily Deal Update card for a corroborated Deal OS synd
 
   assert.equal(existing.status, 'unique-corroborated');
   assert.equal(existing.submission.id, dailyDealRecord.id);
-  assert.deepEqual(searches, [undefined]);
+  assert.equal(authorityReads, 1);
 });
 
 test('CRM lookup does not reuse a same-name listing when geography conflicts', async () => {
@@ -491,9 +498,8 @@ test('CRM lookup does not reuse a same-name listing when geography conflicts', a
     },
   };
   const storage = {
-    async getSubmissionByListingUrl() { return null; },
-    async listSubmissions() {
-      return { rows: [dailyDealRecord], total: 1 };
+    async readDealHunterCrmMatchAuthority() {
+      return crmMatchAuthority([dailyDealRecord]);
     },
   };
 

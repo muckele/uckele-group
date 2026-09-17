@@ -4,7 +4,43 @@ import { test } from 'node:test';
 process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
 process.env.ADMIN_SESSION_SECRET = 'deal-hunter-crm-match-ambiguity-test-secret';
 
-const { findExistingDealHunterSubmission } = await import('../server/services/dealHunter.js');
+const { findExistingDealHunterSubmission: findExistingDealHunterSubmissionWithAuthority } = await import('../server/services/dealHunter.js');
+
+function withMatchAuthority(storage) {
+  if (typeof storage?.listSubmissions !== 'function' || typeof storage.readDealHunterCrmMatchAuthority === 'function') {
+    return storage;
+  }
+  return {
+    ...storage,
+    async readDealHunterCrmMatchAuthority({ limit = 5000 } = {}) {
+      const result = await storage.listSubmissions({
+        limit,
+        page: 1,
+        status: 'all',
+        sort: 'created_at',
+        direction: 'desc',
+      });
+      const count = Number(result?.total);
+      const complete = Array.isArray(result?.rows)
+        && Number.isInteger(count)
+        && count >= 0
+        && count <= limit
+        && result.rows.length === count
+        && new Set(result.rows.map((row) => row?.id).filter(Boolean)).size === count;
+      return {
+        rows: Array.isArray(result?.rows) ? result.rows : [],
+        count: complete ? count : null,
+        complete,
+        revision: complete ? 'a'.repeat(64) : null,
+        revisionVersion: 'test-match-authority-v1',
+      };
+    },
+  };
+}
+
+function findExistingDealHunterSubmission(storage, deal) {
+  return findExistingDealHunterSubmissionWithAuthority(withMatchAuthority(storage), deal);
+}
 
 const corroboratedDeal = {
   id: '',
@@ -188,8 +224,7 @@ test('a valid canonical primary is exact authority even when unrelated legacy re
     async getCurrentDealHunterOpportunity() {
       return { opportunity_id: 'opp-current', status: 'active', primary_submission_id: primary.id };
     },
-    async getSubmissionStrict(id) { return id === primary.id ? primary : null; },
-    async listSubmissions() { searchCalls += 1; return { rows: [], total: 0 }; },
+    async listSubmissions() { searchCalls += 1; return { rows: [primary], total: 1 }; },
   };
 
   const result = await findExistingDealHunterSubmission(storage, {
@@ -200,7 +235,7 @@ test('a valid canonical primary is exact authority even when unrelated legacy re
   assert.equal(result.status, 'unique-exact');
   assert.equal(result.submission.id, primary.id);
   assert.deepEqual(result.evidenceCategories, ['canonical-primary']);
-  assert.equal(searchCalls, 0);
+  assert.equal(searchCalls, 1);
 });
 
 test('metadata-only canonical primary ownership remains valid authority', async () => {
@@ -213,7 +248,7 @@ test('metadata-only canonical primary ownership remains valid authority', async 
     async getCurrentDealHunterOpportunity() {
       return { opportunity_id: 'opp-current', status: 'active', primary_submission_id: primary.id };
     },
-    async getSubmissionStrict() { return primary; },
+    async listSubmissions() { return { rows: [primary], total: 1 }; },
   };
 
   const result = await findExistingDealHunterSubmission(storage, {
@@ -235,7 +270,7 @@ test('conflicting direct and metadata ownership blocks canonical primary selecti
     async getCurrentDealHunterOpportunity() {
       return { opportunity_id: 'opp-current', status: 'active', primary_submission_id: primary.id };
     },
-    async getSubmissionStrict() { return primary; },
+    async listSubmissions() { return { rows: [primary], total: 1 }; },
   };
 
   await assert.rejects(
@@ -260,7 +295,6 @@ test('missing or inactive canonical primary authority fails safely instead of se
     async getCurrentDealHunterOpportunity() {
       return { opportunity_id: 'opp-current', status: 'active', primary_submission_id: 'missing-primary' };
     },
-    async getSubmissionStrict() { return null; },
     async listSubmissions() { searchCalls += 1; return { rows: [], total: 0 }; },
   };
   await assert.rejects(
@@ -268,7 +302,7 @@ test('missing or inactive canonical primary authority fails safely instead of se
     (error) => error?.code === 'CRM_MATCH_AUTHORITY_STALE'
       && error.candidateIds?.[0] === 'missing-primary',
   );
-  assert.equal(searchCalls, 0);
+  assert.equal(searchCalls, 1);
 
   const archived = {
     ...legacyCandidate('archived-primary', '2026-09-01T00:00:00.000Z'),
@@ -280,7 +314,7 @@ test('missing or inactive canonical primary authority fails safely instead of se
       async getCurrentDealHunterOpportunity() {
         return { opportunity_id: 'opp-current', status: 'active', primary_submission_id: archived.id };
       },
-      async getSubmissionStrict() { return archived; },
+      async listSubmissions() { return { rows: [archived], total: 1 }; },
     }, { ...corroboratedDeal, opportunityId: 'opp-current' }),
     (error) => error?.code === 'CRM_MATCH_RECORD_INACTIVE',
   );
@@ -296,7 +330,7 @@ test('a passed canonical primary remains authoritative and is not converted into
     async getCurrentDealHunterOpportunity() {
       return { opportunity_id: 'opp-current', status: 'active', primary_submission_id: passed.id };
     },
-    async getSubmissionStrict() { return passed; },
+    async listSubmissions() { return { rows: [passed], total: 1 }; },
   }, { ...corroboratedDeal, opportunityId: 'opp-current' });
 
   assert.equal(result.status, 'unique-exact');

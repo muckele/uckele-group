@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { after, before, beforeEach, test } from 'node:test';
 
 process.env.DELIVERY_PROVIDER = 'resend';
@@ -26,6 +27,28 @@ const replacementSourceCsv = [
   `"Industrial Fire Safety Inspections","Fire safety inspection","NY","${today}","$525,000","$2,100,000","$1,500,000","River Broker","East Coast Business Brokers","212-555-0135","river@example.com","","","https://broker.example.test/industrial-fire-inspections","Recurring commercial inspection contracts, regulated compliance testing, essential field technicians, trained staff, management in place, SBA eligible, and seller financing available."`,
 ].join('\n');
 let activeSourceCsv = sourceCsv;
+
+function fakeCrmMatchAuthority(submissions, limit = 5000) {
+  const rows = Array.from(submissions.values()).sort((left, right) => left.id.localeCompare(right.id));
+  if (rows.length > limit) {
+    return { rows: [], count: null, complete: false, revision: null };
+  }
+  return {
+    rows: structuredClone(rows),
+    count: rows.length,
+    complete: true,
+    revision: createHash('sha256').update(JSON.stringify(rows)).digest('hex'),
+  };
+}
+
+function fakeCrmMatchAuthorityStale(submissionId, evidenceCategories = ['authority-revision']) {
+  const error = new Error('CRM match authority changed before the canonical link transaction.');
+  error.code = 'CRM_MATCH_AUTHORITY_STALE';
+  error.status = 409;
+  error.candidateIds = submissionId ? [submissionId] : [];
+  error.evidenceCategories = evidenceCategories;
+  return error;
+}
 
 before(() => {
   console.warn = () => {};
@@ -280,6 +303,34 @@ function createCimStorage() {
       };
       opportunities.set(opportunityId, linked);
       return linked;
+    },
+    async readDealHunterCrmMatchAuthority({ limit = 5000 } = {}) {
+      return fakeCrmMatchAuthority(submissions, limit);
+    },
+    async linkDealHunterCrmSubmissionIfAuthorityCurrent({
+      opportunityId,
+      submissionId,
+      expectedAuthorityRevision,
+      updatedAt,
+    }) {
+      const authority = fakeCrmMatchAuthority(submissions);
+      if (authority.revision !== expectedAuthorityRevision) {
+        throw fakeCrmMatchAuthorityStale(submissionId);
+      }
+      const submission = submissions.get(submissionId);
+      const directOwner = submission?.deal_hunter_opportunity_id || '';
+      const metadataOwner = submission?.metadata?.dealHunter?.opportunityId || '';
+      const competingDirectLink = Array.from(submissions.values()).some((candidate) => (
+        candidate.id !== submissionId && candidate.deal_hunter_opportunity_id === opportunityId
+      ));
+      if (!submission
+        || ['archived', 'spam'].includes(String(submission.status || '').toLowerCase())
+        || (directOwner && directOwner !== opportunityId)
+        || (metadataOwner && metadataOwner !== opportunityId)
+        || competingDirectLink) {
+        throw fakeCrmMatchAuthorityStale(submissionId, ['authority-currentness']);
+      }
+      return this.linkDealHunterCrmSubmission({ opportunityId, submissionId, updatedAt });
     },
     async listDealHunterOpportunityAliases({ opportunityIds = [] } = {}) {
       return Array.from(opportunityAliases.values()).filter((item) => (
