@@ -3976,6 +3976,7 @@ const dealHunterCrmMatchMaximumRows = 5000;
 const dealHunterCrmMatchPublicCandidateLimit = 25;
 const dealHunterCrmMatchMaximumAliases = 500;
 const dealHunterCrmMatchAuthorityRevision = Symbol('dealHunterCrmMatchAuthorityRevision');
+const dealHunterCrmMatchSupersessionMap = Symbol('dealHunterCrmMatchSupersessionMap');
 
 function dealHunterCrmMatchError(code, message, { status = 409, candidateIds = [], evidenceCategories = [] } = {}) {
   const error = new Error(message);
@@ -4166,7 +4167,7 @@ async function listCompleteDealHunterCrmCandidates(storage) {
   };
 }
 
-function dealHunterCrmMatchResult(status, submission = null, candidates = [], authorityRevision = '') {
+function dealHunterCrmMatchResult(status, submission = null, candidates = [], authorityRevision = '', survivorByLoser = new Map()) {
   const boundedCandidates = candidates
     .map((candidate) => ({
       submissionId: candidate.submission.id,
@@ -4185,6 +4186,10 @@ function dealHunterCrmMatchResult(status, submission = null, candidates = [], au
   };
   Object.defineProperty(result, dealHunterCrmMatchAuthorityRevision, {
     value: authorityRevision,
+    enumerable: false,
+  });
+  Object.defineProperty(result, dealHunterCrmMatchSupersessionMap, {
+    value: new Map(survivorByLoser),
     enumerable: false,
   });
   return result;
@@ -4255,6 +4260,7 @@ function assertDealHunterCrmMatchStable(before, after) {
 async function validatedCachedDealHunterCrmSubmission(deal, submissionId, match) {
   const selected = selectedDealHunterCrmSubmission(match);
   if (!submissionId) return selected;
+  const canonicalCachedSubmissionId = match?.[dealHunterCrmMatchSupersessionMap]?.get(submissionId) || submissionId;
   if (!selected) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_AUTHORITY_STALE',
@@ -4270,11 +4276,11 @@ async function validatedCachedDealHunterCrmSubmission(deal, submissionId, match)
       { candidateIds: [submissionId], evidenceCategories: ['cached-import', 'inactive-record'] },
     );
   }
-  if (selected.id !== submissionId) {
+  if (selected.id !== canonicalCachedSubmissionId) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_AUTHORITY_CONFLICT',
       'The cached CRM import owner conflicts with the strongest current identity match.',
-      { candidateIds: [submissionId, selected.id], evidenceCategories: ['cached-import-conflict'] },
+      { candidateIds: [canonicalCachedSubmissionId, selected.id], evidenceCategories: ['cached-import-conflict'] },
     );
   }
   return selected;
@@ -4350,7 +4356,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
         submission: primary,
         evidenceCategories: new Set(['canonical-primary']),
         evidenceOriginSubmissionIds: new Set([primary.id]),
-      }], authority.revision);
+      }], authority.revision, authority.survivorByLoser);
   }
   const listingAliases = uniqueStrings([
     deal.listingUrl,
@@ -4447,7 +4453,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
   }
 
   const classified = [...classifiedBySurvivor.values()];
-  if (classified.length === 0) return dealHunterCrmMatchResult('none', null, [], authority.revision);
+  if (classified.length === 0) return dealHunterCrmMatchResult('none', null, [], authority.revision, authority.survivorByLoser);
   for (const candidate of classified) {
     assertDealHunterCrmSubmissionOwnership(candidate.submission, deal.opportunityId || '');
   }
@@ -4465,7 +4471,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
     );
   }
   if (actionable.length > 1) {
-    return dealHunterCrmMatchResult('ambiguous', null, actionable, authority.revision);
+    return dealHunterCrmMatchResult('ambiguous', null, actionable, authority.revision, authority.survivorByLoser);
   }
   const [selected] = actionable;
   return dealHunterCrmMatchResult(
@@ -4473,6 +4479,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
     selected.submission,
     [selected],
     authority.revision,
+    authority.survivorByLoser,
   );
 }
 

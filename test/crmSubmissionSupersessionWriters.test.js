@@ -9,7 +9,11 @@ import Database from 'better-sqlite3';
 
 import { recordCrmActivity, commitCrmActivityMutation } from '../server/services/activity.js';
 import { assignUnassignedCommunication, createManualCommunication } from '../server/services/communications.js';
-import { createSecureUploadRequest, revokeSecureUploadRequest } from '../server/services/documentVault.js';
+import {
+  createSecureUploadRequest,
+  deleteSecureDocument,
+  revokeSecureUploadRequest,
+} from '../server/services/documentVault.js';
 import {
   previewCrmFollowUpEmail,
   processCrmEmailOutbox,
@@ -32,6 +36,7 @@ import {
   startDealHunterManualFollowUps,
   stopDealHunterManualFollowUps,
 } from '../server/services/dealHunterManualFollowUps.js';
+import { buildManualFollowUpCommunicationId } from '../server/services/dealHunterManualFollowUpPolicy.js';
 import {
   buildDealHunterCimRequestId,
   executeApprovedDealHunterCimRequest,
@@ -42,6 +47,7 @@ import {
   repairDealHunterCrmSourceFields,
   reviewDailyDeals,
   retryDealHunterCimRequestWithCorrectedRecipient,
+  sendDealHunterCimRequest,
   syncDealHunterHighFitsToCrm,
 } from '../server/services/dealHunter.js';
 import {
@@ -64,6 +70,13 @@ process.env.SECURE_DOCUMENTS_STORAGE_DIR = path.join(matrixHttpDirectory, 'secur
 process.env.DEAL_HUNTER_SHEET_CSV_URLS = 'https://example.test/writer-matrix.csv';
 process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
 process.env.DEAL_HUNTER_DEAL_OS_EXPORT_MAX_AGE_HOURS = '72';
+process.env.DELIVERY_PROVIDER = 'resend';
+process.env.RESEND_API_KEY = 'writer-matrix-resend-key';
+process.env.RESEND_FROM_EMAIL = 'Mathew Uckele <outreach@example.test>';
+process.env.RESEND_REPLY_TO = 'reply@inbound.example.test';
+process.env.RESEND_INBOUND_DOMAIN = 'inbound.example.test';
+process.env.EMAIL_WEBHOOK_SECRET = 'writer-matrix-webhook-secret';
+process.env.DEAL_HUNTER_CIM_OUTREACH_PAUSED = 'false';
 
 const matrixSourceCsv = [
   'Business Name,Industry,State,Date Added,Profit,Revenue,Asking Price,Broker Name,Broker Email,Listing URL,Description',
@@ -232,6 +245,27 @@ function stage2Config() {
         maximumSourceAgeHours: 24, shadowFreshnessHours: 24, activationMaxAgeHours: 168,
         physicalPostalAddress: '100 Main St, Los Angeles, CA 90001',
       },
+    },
+  };
+}
+
+function followUpConfig() {
+  return {
+    admin: { sessionSecret: 'writer-matrix-follow-up-secret-at-least-32-characters' },
+    brand: { companyName: 'Uckele Group' },
+    delivery: {
+      provider: 'resend', resendApiKey: 'configured', resendFromEmail: 'outreach@example.test',
+      resendReplyTo: 'reply@inbound.example.test', resendInboundDomain: 'inbound.example.test',
+      emailWebhookSecret: 'configured',
+    },
+    followUp: {
+      emailEnabled: true, aiEnabled: false, timezone: 'America/Los_Angeles',
+      sendWindowStart: '08:00', sendWindowEnd: '17:00', weekdaysOnly: true,
+      dailyCap: 25, recipientRollingCap: 4, maxTouches: 3, cadenceHours: [48, 72, 96],
+      senderName: 'Mathew Uckele', senderEmail: 'outreach@example.test',
+      replyTo: 'reply@inbound.example.test', requireSignedPreview: false,
+      physicalPostalAddress: '123 Main Street, San Diego, CA 92101',
+      optOutBaseUrl: '', replyOptOutEnabled: true,
     },
   };
 }
@@ -504,8 +538,10 @@ test('real SQLite email entry points and outbox claim refuse an active loser bef
 
 test('real SQLite upload, document, communication, and CIM storage boundaries refuse an active loser', async (t) => {
   const { storage, sqlitePath } = await fixture(t);
+  const filesBefore = filesystemSnapshot(process.env.SECURE_DOCUMENTS_STORAGE_DIR);
   const cases = [
     () => revokeSecureUploadRequest({ requestId: 'loser-upload', revokedBy: 'test', storage }),
+    () => deleteSecureDocument({ documentId: 'loser-document', deletedBy: 'test', storage }),
     () => storage.updateSecureUploadRequest('loser-upload', { updated_at: timestamp, status: 'revoked' }),
     () => storage.resetSecureUploadRequestIfUploading('loser-upload', { updated_at: timestamp, status: 'open' }),
     () => storage.claimSecureUploadRequest('loser-upload', { updated_at: timestamp, status: 'uploading' }),
@@ -531,6 +567,7 @@ test('real SQLite upload, document, communication, and CIM storage boundaries re
     }),
   ];
   for (const invoke of cases) await assertLoserRefusal({ sqlitePath, invoke });
+  assert.deepEqual(filesystemSnapshot(process.env.SECURE_DOCUMENTS_STORAGE_DIR), filesBefore);
 });
 
 test('real SQLite recommendation writers refuse dismiss and generation for an active loser', async (t) => {
@@ -593,7 +630,7 @@ test('real SQLite manual CIM start entry point refuses loser-owned request autho
   });
 });
 
-test('real HTTP secure upload refuses a valid loser token before rate-limit, parsing, stale recovery, filesystem, or durable work and preserves survivor upload', async () => {
+test('real HTTP secure upload refuses a stale loser before recovery and recovers a stale survivor only after authority validation', async () => {
   const storage = getStorage();
   const suffix = randomUUID();
   const now = new Date().toISOString();
@@ -637,6 +674,12 @@ test('real HTTP secure upload refuses a valid loser token before rate-limit, par
     manifest: { version: 1 }, metadata: {},
   });
   const database = new Database(process.env.SQLITE_PATH);
+  const staleUploadingAt = '2026-09-17T12:00:00.000Z';
+  database.prepare(`
+    UPDATE secure_upload_requests
+    SET status = 'uploading', updated_at = ?
+    WHERE id IN (?, ?)
+  `).run(staleUploadingAt, loserUpload.request.id, survivorUpload.request.id);
   database.prepare(`
     INSERT INTO crm_submission_supersessions (
       id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
@@ -649,6 +692,18 @@ test('real HTTP secure upload refuses a valid loser token before rate-limit, par
     opportunityId, now, receiptId, digest,
   );
   database.close();
+
+  const createBefore = rawBusinessState(process.env.SQLITE_PATH);
+  await assert.rejects(() => createSecureUploadRequest({
+    submissionId: loserResult.submission.id,
+    requestedBy: 'writer-matrix',
+    sendEmail: false,
+    request: requestShape,
+  }), {
+    code: CRM_SUBMISSION_SUPERSEDED,
+    submissionId: loserResult.submission.id,
+  });
+  assert.equal(rawBusinessState(process.env.SQLITE_PATH), createBefore);
 
   const beforeTables = rawBusinessSnapshot(process.env.SQLITE_PATH);
   const beforeFiles = filesystemSnapshot(process.env.SECURE_DOCUMENTS_STORAGE_DIR);
@@ -673,6 +728,20 @@ test('real HTTP secure upload refuses a valid loser token before rate-limit, par
   assert.deepEqual(filesystemSnapshot(process.env.SECURE_DOCUMENTS_STORAGE_DIR), beforeFiles);
   assert.equal(matrixProviderCalls.length, providerCountBefore);
 
+  const survivorRequest = await createSecureUploadRequest({
+    submissionId: survivorResult.submission.id,
+    requestedBy: 'writer-matrix',
+    sendEmail: false,
+    request: requestShape,
+  });
+  assert.equal(survivorRequest.ok, true, JSON.stringify(survivorRequest));
+  const survivorRevoked = await revokeSecureUploadRequest({
+    requestId: survivorRequest.request.id,
+    revokedBy: 'writer-matrix',
+    storage,
+  });
+  assert.equal(survivorRevoked.ok, true, JSON.stringify(survivorRevoked));
+
   await withHttpServer(async (origin) => {
     const response = await postRawJson(
       `${origin}/api/secure-documents/upload`,
@@ -688,6 +757,129 @@ test('real HTTP secure upload refuses a valid loser token before rate-limit, par
     assert.equal(response.status, 200, response.body);
     assert.equal(JSON.parse(response.body).submission.id, survivorResult.submission.id);
   });
+});
+
+test('real SQLite manual follow-up terminal replay returns exact stopped and finalized durable results for an active loser without mutation', async (t) => {
+  const session = { principal_id: 'admin-1', role: 'admin', username: 'test-admin' };
+  const dependencies = {
+    getPause: async () => ({ paused: false }),
+    getReadiness: async () => ({ outboundConfigured: true, issues: [] }),
+    evaluateRecipientPolicy: async () => ({ allowed: true }),
+    evaluateWindow: () => ({ allowed: true }),
+  };
+
+  {
+    const { storage, sqlitePath } = await fixture(t, { activateSupersession: false });
+    let database = new Database(sqlitePath);
+    database.prepare(`
+      UPDATE deal_hunter_cim_requests
+      SET status = 'sent', request_state = 'provider_accepted', delivery_state = 'accepted'
+      WHERE id = 'loser-cim-request'
+    `).run();
+    database.close();
+    forceLoserPrimary(sqlitePath);
+    const input = {
+      opportunityId: 'opportunity', requestId: 'loser-cim-request', reason: 'Reviewed stop',
+      session, storage, now: new Date(timestamp), dependencies,
+    };
+    const stopped = await stopDealHunterManualFollowUps(input);
+    assert.equal(stopped.success, true, JSON.stringify(stopped));
+    assert.equal(stopped.followUps.state, 'stopped');
+    const durableStopped = await stopDealHunterManualFollowUps(input);
+    assert.equal(durableStopped.success, true, JSON.stringify(durableStopped));
+    assert.equal(durableStopped.followUps.terminalReason, 'manual_follow_up_stopped');
+    database = new Database(sqlitePath);
+    database.prepare("UPDATE deal_hunter_opportunities SET primary_submission_id = 'survivor' WHERE opportunity_id = 'opportunity'").run();
+    database.close();
+    activateRelation(sqlitePath);
+    database = new Database(sqlitePath);
+    database.prepare("UPDATE deal_hunter_opportunities SET primary_submission_id = 'loser' WHERE opportunity_id = 'opportunity'").run();
+    database.close();
+    const before = rawBusinessState(sqlitePath);
+    const replay = await stopDealHunterManualFollowUps(input);
+    assert.deepEqual(replay, durableStopped, 'already-stopped replay must return the exact durable response');
+    assert.equal(rawBusinessState(sqlitePath), before);
+  }
+
+  {
+    const { storage, sqlitePath } = await fixture(t, { activateSupersession: false });
+    forceLoserPrimary(sqlitePath);
+    const communicationId = buildManualFollowUpCommunicationId({
+      requestId: 'loser-cim-request',
+      followUpNumber: 1,
+    });
+    let database = new Database(sqlitePath);
+    const current = database.prepare('SELECT metadata FROM deal_hunter_cim_requests WHERE id = ?').get('loser-cim-request');
+    const metadata = JSON.parse(current.metadata);
+    metadata.manualFollowUp = {
+      ...metadata.manualFollowUp,
+      currentAttempt: {
+        followUpNumber: 1,
+        communicationId,
+        outcome: 'accepted',
+        originalDueAt: timestamp,
+        updatedAt: timestamp,
+      },
+      acceptedTouches: [{ followUpNumber: 1, communicationId, acceptedAt: timestamp }],
+    };
+    metadata.followUps = [{
+      number: 1, attemptedAt: timestamp, acceptedAt: timestamp, status: 'accepted',
+      communicationId, providerMessageId: 'provider-accepted-1', error: '',
+    }];
+    database.prepare(`
+      UPDATE deal_hunter_cim_requests
+      SET status = 'sent', request_state = 'provider_accepted', delivery_state = 'accepted',
+          follow_up_count = 1, last_follow_up_at = ?, next_follow_up_at = ?,
+          follow_up_state = 'scheduled', last_activity_at = ?, metadata = ?
+      WHERE id = 'loser-cim-request'
+    `).run(timestamp, '2026-09-21T16:00:00.000Z', timestamp, JSON.stringify(metadata));
+    database.prepare(`
+      INSERT INTO crm_communications (
+        id, submission_id, cim_request_id, direction, channel, kind, source,
+        from_address, to_addresses, reply_to_address, subject, body_text,
+        body_html_sanitized, provider, provider_message_id, delivery_state,
+        delivery_state_at, idempotency_key, occurred_at, created_at, updated_at,
+        created_by, updated_by, metadata
+      ) VALUES (?, 'loser', 'loser-cim-request', 'outbound', 'email',
+        'deal-hunter-cim-follow-up', 'deal-hunter', 'owner@example.test', ?, '',
+        'Follow-up', 'Durable accepted follow-up', '<p>Durable accepted follow-up</p>',
+        'resend', 'provider-accepted-1', 'accepted', ?, ?, ?, ?, ?, 'test', 'test', ?)
+    `).run(
+      communicationId,
+      JSON.stringify(['broker@example.test']),
+      timestamp,
+      'deal-hunter-cim-loser-cim-request-follow-up-1',
+      timestamp,
+      timestamp,
+      timestamp,
+      JSON.stringify({
+        followUpNumber: 1,
+        manualFollowUp: { firstProviderAcceptedAt: timestamp },
+      }),
+    );
+    database.close();
+    const providerCalls = [];
+    const input = {
+      opportunityId: 'opportunity', requestId: 'loser-cim-request', ...signedManualFollowUpApproval(),
+      session, storage, now: new Date(timestamp), dependencies,
+      executeApprovedFollowUp: async () => { providerCalls.push('called'); },
+    };
+    const finalized = await approveDealHunterManualFollowUp(input);
+    assert.equal(finalized.success, true, JSON.stringify(finalized));
+    assert.equal(finalized.durableResult.followUps.followUpCount, 1);
+    database = new Database(sqlitePath);
+    database.prepare("UPDATE deal_hunter_opportunities SET primary_submission_id = 'survivor' WHERE opportunity_id = 'opportunity'").run();
+    database.close();
+    activateRelation(sqlitePath);
+    database = new Database(sqlitePath);
+    database.prepare("UPDATE deal_hunter_opportunities SET primary_submission_id = 'loser' WHERE opportunity_id = 'opportunity'").run();
+    database.close();
+    const before = rawBusinessState(sqlitePath);
+    const replay = await approveDealHunterManualFollowUp(input);
+    assert.deepEqual(replay, finalized, 'already-finalized replay must return the exact durable response');
+    assert.equal(rawBusinessState(sqlitePath), before);
+    assert.deepEqual(providerCalls, []);
+  }
 });
 
 test('real SQLite Broker Materials prepare and approve refuse a drifted loser primary before execution', async (t) => {
@@ -708,6 +900,112 @@ test('real SQLite Broker Materials prepare and approve refuse a drifted loser pr
         }),
     });
   }
+});
+
+test('real SQLite Broker Materials prepare and approve retain a survivor execution control', async (t) => {
+  const { storage, sqlitePath } = await fixture(t, { includeCimRequest: false });
+  const database = new Database(sqlitePath);
+  database.prepare(`
+    UPDATE deal_hunter_opportunity_scores
+    SET operator_priority = 'high', reviewed_at = ?,
+        reviewed_fingerprint = score_fingerprint,
+        reviewed_semantic_digest = semantic_digest
+    WHERE opportunity_id = 'opportunity'
+  `).run(timestamp);
+  database.close();
+  for (const [field, value] of [
+    ['broker_name', 'Survivor Broker'],
+    ['broker_email', 'survivor-broker@example.test'],
+    ['annual_profit', '450000'],
+    ['listing_url', 'https://example.test/canonical'],
+  ]) {
+    await storage.upsertDealHunterOpportunitySourceObservation({
+      id: `writer-matrix:${field}`,
+      opportunity_id: 'opportunity',
+      source_id: 'sheet-0',
+      source_name: 'Required Sheet',
+      source_record_id: 'writer-matrix-row',
+      field,
+      value,
+      observed_at: timestamp,
+      created_at: timestamp,
+      updated_at: timestamp,
+    });
+  }
+  for (const [id, aliasType, aliasValue, aliasKey] of [
+    ['writer-matrix-deal-key-alias', 'deal-key', 'writer-matrix-deal', 'deal-key:writer-matrix-deal'],
+    ['writer-matrix-listing-alias', 'listing-url', 'https://example.test/canonical', 'listing-url:https://example.test/canonical'],
+  ]) {
+    await storage.upsertDealHunterOpportunityAlias({
+      id,
+      opportunity_id: 'opportunity',
+      alias_type: aliasType,
+      alias_value: aliasValue,
+      alias_key: aliasKey,
+      source: 'writer-matrix',
+      first_observed_at: timestamp,
+      last_observed_at: timestamp,
+      evidence_version: 'writer-matrix-v1',
+      resolution_method: 'fixture',
+      confidence_state: 'exact',
+      resolved_by: 'writer-matrix',
+      metadata: {},
+    });
+  }
+  const session = { principal_id: 'admin-1', role: 'admin', username: 'test-admin' };
+  const controlNow = new Date();
+  const prepared = await prepareDealHunterBrokerMaterials({
+    opportunityId: 'opportunity', session, storage, now: controlNow,
+  });
+  assert.equal(prepared.success, true, JSON.stringify(prepared));
+  let executions = 0;
+  const approved = await approveDealHunterBrokerMaterials({
+    opportunityId: 'opportunity',
+    preparationToken: prepared.preparationToken,
+    approvedProposalDigest: prepared.proposalDigest,
+    session,
+    storage,
+    now: controlNow,
+    executeApprovedCimRequest: async (input) => {
+      executions += 1;
+      return executeApprovedDealHunterCimRequest(input);
+    },
+  });
+  assert.equal(approved.success, true, JSON.stringify({ approved, score: await storage.getCurrentDealHunterOpportunityScore('opportunity') }));
+  assert.equal(executions, 1);
+  const storedRequest = await storage.getDealHunterCimRequestById(approved.durableResult.cimRequest.id);
+  assert.equal(storedRequest.submission_id, 'survivor');
+
+  const dependencies = {
+    getPause: async () => ({ paused: false }),
+    getReadiness: async () => ({ outboundConfigured: true, provider: 'resend', issues: [] }),
+    evaluateRecipientPolicy: async () => ({ allowed: true }),
+    evaluateWindow: () => ({ allowed: true }),
+  };
+  const started = await startDealHunterManualFollowUps({
+    opportunityId: 'opportunity', requestId: storedRequest.id, input: {}, session, storage,
+    now: controlNow, dependencies,
+  });
+  assert.equal(started.success, true, JSON.stringify(started));
+  const followUpNow = new Date(controlNow.getTime() + 10 * 24 * 60 * 60 * 1000);
+  const followUpPrepared = await prepareDealHunterManualFollowUp({
+    opportunityId: 'opportunity', requestId: storedRequest.id, session, storage,
+    now: followUpNow, dependencies,
+  });
+  assert.equal(followUpPrepared.success, true, JSON.stringify(followUpPrepared));
+  const followUpApproved = await approveDealHunterManualFollowUp({
+    opportunityId: 'opportunity', requestId: storedRequest.id,
+    preparationToken: followUpPrepared.preparationToken,
+    approvedProposalDigest: followUpPrepared.proposalDigest,
+    session, storage, now: followUpNow, dependencies,
+  });
+  assert.equal(followUpApproved.success, true, JSON.stringify(followUpApproved));
+  const stopped = await stopDealHunterManualFollowUps({
+    opportunityId: 'opportunity', requestId: storedRequest.id,
+    reason: 'Writer matrix survivor stop control.', session, storage,
+    now: followUpNow, dependencies,
+  });
+  assert.equal(stopped.success, true, JSON.stringify(stopped));
 });
 
 test('real SQLite approved initial CIM execution refuses a drifted loser primary before provider or request work', async (t) => {
@@ -989,6 +1287,17 @@ test('real SQLite reconciliation preview/apply refuses a cached loser before cre
     assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_crm_reconciliation_runs').get().count, 0);
     assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_crm_reconciliation_items').get().count, 0);
     database.close();
+    const activePairPreview = await previewDealOsCrmReconciliation({
+      importId: imported.import.id,
+      requestedBy: 'admin@example.test',
+      storage,
+    });
+    assert.equal(activePairPreview.ok, true, JSON.stringify(activePairPreview));
+    assert.deepEqual(
+      activePairPreview.items.map((item) => item.submissionId),
+      [survivor.submission.id],
+      'active-pair reconciliation enumeration canonicalizes loser evidence to the survivor',
+    );
   }
 
   const survivorDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-writer-reconciliation-survivor-'));
@@ -1161,6 +1470,53 @@ test('real SQLite high-fit sync refuses a cached loser claim with no business/pr
   assert.equal(claimCalls, 1);
   assert.equal(rawBusinessState(sqlitePath), boundaryDigest);
   assert.equal(matrixProviderCalls.length, providerCountBefore);
+  const activePairReview = await reviewDailyDeals({ storage });
+  assert.equal(
+    activePairReview.qualified.filter((candidate) => candidate.dealKey === deal.dealKey).length,
+    1,
+    'active-pair high-fit enumeration retains the canonical deal exactly once',
+  );
+
+  const directDeal = reviewed.qualified.find((candidate) => candidate.dealKey === deal.dealKey);
+  assert.ok(directDeal?.cimRequest?.snapshotToken, JSON.stringify(directDeal));
+  const directSurvivor = await sendDealHunterCimRequest({
+    dealKey: directDeal.dealKey,
+    snapshotToken: directDeal.cimRequest.snapshotToken,
+    requestedBy: 'writer-matrix',
+    storage,
+  });
+  assert.equal(directSurvivor.request?.submission_id, survivor.submission.id, JSON.stringify(directSurvivor));
+  database = new Database(sqlitePath);
+  database.prepare(`
+    UPDATE deal_hunter_cim_requests
+    SET status = 'delivery_issue', request_state = 'failed', delivery_state = 'bounced',
+        delivery_error = 'Reviewed invalid recipient', updated_at = ?
+    WHERE id = ?
+  `).run(new Date().toISOString(), directSurvivor.request.id);
+  database.close();
+  const corrected = await retryDealHunterCimRequestWithCorrectedRecipient({
+    requestId: directSurvivor.request.id,
+    newRecipientEmail: 'corrected-survivor@example.test',
+    confirmed: true,
+    overrideReason: 'Writer matrix survivor correction.',
+    requestedBy: 'writer-matrix',
+    storage,
+  });
+  assert.equal(corrected.request?.submission_id, survivor.submission.id, JSON.stringify(corrected));
+
+  const repaired = await repairDealHunterCrmSourceFields({
+    submissionId: survivor.submission.id,
+    apply: true,
+    actor: 'writer-matrix',
+    backupVerified: true,
+    backupReference: 'disposable-writer-matrix-backup',
+    storage,
+    sourceResults: [{
+      source: { id: deal.sourceId || 'sheet-0', fetched: true },
+      deals: [deal],
+    }],
+  });
+  assert.equal(repaired.applied, true, JSON.stringify(repaired));
 });
 
 test('real SQLite Stage 2 final send authorization refuses a drifted loser primary and retains a survivor authorization control', async (t) => {
@@ -1261,7 +1617,7 @@ test('recommendation, Broker/CIM, reconciliation, high-fit, and Stage 2 candidat
   assert.equal((await storage.getSubmissionStrict('loser')).id, 'loser', 'historical strict reads remain available');
 });
 
-test('valid survivors retain writer behavior', async (t) => {
+test('valid survivors retain activity, Command Center, communication, follow-up, recommendation, and secure-document writer behavior', async (t) => {
   const { storage } = await fixture(t);
   const activity = await recordCrmActivity({
     storage, submissionId: 'survivor', eventType: 'writer.control', summary: 'survivor remains writable',
@@ -1272,4 +1628,83 @@ test('valid survivors retain writer behavior', async (t) => {
   });
   assert.equal(command.ok, true);
   assert.equal(command.submission.id, 'survivor');
+
+  const communication = await createManualCommunication({
+    submissionId: 'survivor', actor: 'writer-matrix', storage,
+    input: { channel: 'note', direction: 'outbound', occurredAt: timestamp, bodyText: 'Survivor control.' },
+  });
+  assert.equal(communication.ok, true, JSON.stringify(communication));
+  const assigned = await assignUnassignedCommunication({
+    communicationId: 'unassigned-communication', submissionId: 'survivor', actor: 'writer-matrix', storage,
+  });
+  assert.equal(assigned.ok, true, JSON.stringify(assigned));
+
+  const config = followUpConfig();
+  const emailInput = {
+    clientRequestToken: 'writer-matrix-survivor-token',
+    expectedSubmissionVersion: (await storage.getSubmission('survivor')).updated_at,
+    recipient: 'survivor@example.test',
+    subject: 'Survivor control next step',
+    bodyText: 'Thank you. Could we review the opportunity next week?',
+    nextFollowUpState: 'waiting-on-owner',
+    nextActionAt: '2026-09-21T18:00:00.000Z',
+  };
+  const preview = await previewCrmFollowUpEmail({
+    submissionId: 'survivor', actor: 'writer-matrix', input: emailInput,
+    storage, config, now: new Date(timestamp),
+  });
+  assert.equal(preview.ok, true, JSON.stringify(preview));
+  const emailProviderCalls = [];
+  const queued = await sendCrmFollowUpEmail({
+    submissionId: 'survivor', actor: 'writer-matrix', input: emailInput,
+    storage, config, now: new Date(timestamp), processImmediately: false,
+  });
+  assert.equal(queued.ok, true, JSON.stringify(queued));
+  const sent = await processCrmEmailOutbox({
+    outboxId: queued.outbox.id, storage, config, now: new Date(timestamp),
+    sender: async () => {
+      emailProviderCalls.push('called');
+      return { status: 'sent', providerMessageId: 'writer-matrix-survivor-provider', error: '' };
+    },
+  });
+  assert.equal(sent.ok, true, JSON.stringify(sent));
+  assert.deepEqual(emailProviderCalls, ['called']);
+
+  const generated = await generateCrmFollowUpRecommendation({
+    submissionId: 'survivor', storage,
+    config: { followUp: { aiEnabled: false, timezone: 'America/Los_Angeles' } },
+    now: new Date(timestamp),
+  });
+  assert.equal(generated.ok, true, JSON.stringify(generated));
+  const currentSurvivor = await storage.getSubmission('survivor');
+  const dismissed = await dismissCrmFollowUpRecommendation({
+    submissionId: 'survivor', recommendationId: generated.recommendation.id,
+    expectedSubmissionVersion: currentSurvivor.updated_at, actor: 'writer-matrix', storage,
+  });
+  assert.equal(dismissed.ok, true, JSON.stringify(dismissed));
+
+  const secureRoot = process.env.SECURE_DOCUMENTS_STORAGE_DIR;
+  const survivorDocumentDirectory = path.join(secureRoot, `writer-matrix-${randomUUID()}`);
+  const survivorDocumentPath = path.join(survivorDocumentDirectory, 'survivor-document.txt');
+  fs.mkdirSync(survivorDocumentDirectory, { recursive: true });
+  fs.writeFileSync(survivorDocumentPath, 'survivor document');
+  t.after(() => fs.rmSync(survivorDocumentDirectory, { recursive: true, force: true }));
+  await storage.insertSecureUploadRequest({
+    id: 'survivor-delete-upload', submission_id: 'survivor', created_at: timestamp, updated_at: timestamp,
+    email: 'survivor@example.test', contact_name: 'survivor', requested_by: 'writer-matrix',
+    status: 'open', expires_at: '2026-09-18T18:00:00.000Z', nda_required: true,
+    nda_accepted_at: null, last_uploaded_at: null, note: '', requested_documents: [],
+    revoked_at: null, closed_at: null, upload_batch_count: 0,
+  });
+  await storage.insertSecureDocument({
+    id: 'survivor-delete-document', request_id: 'survivor-delete-upload', submission_id: 'survivor',
+    created_at: timestamp, document_type: 'other', file_name: 'survivor-document.txt',
+    original_name: 'survivor-document.txt', mime_type: 'text/plain', size_bytes: 17,
+    storage_path: survivorDocumentPath, uploaded_by_email: null, note: null, nda_accepted_at: null,
+  });
+  const deleted = await deleteSecureDocument({
+    documentId: 'survivor-delete-document', deletedBy: 'writer-matrix', storage,
+  });
+  assert.equal(deleted.ok, true, JSON.stringify(deleted));
+  assert.equal(fs.existsSync(survivorDocumentPath), false);
 });

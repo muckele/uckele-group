@@ -572,7 +572,7 @@ export function createApp({
 
     try {
       const token = String(request.headers['x-secure-upload-token'] || '').trim();
-      const context = await getSecureUploadContext(token);
+      let context = await getSecureUploadContext(token);
 
       if (!context.ok) {
         response.status(400).json({ success: false, error: context.error });
@@ -583,6 +583,13 @@ export function createApp({
         storage: getStorage(),
         submissionId: context.request.submission_id,
       });
+
+      context = await getSecureUploadContext(token, { recoverStale: true });
+
+      if (!context.ok) {
+        response.status(400).json({ success: false, error: context.error });
+        return;
+      }
 
       if (!['awaiting-documents', 'open', 'partially-received'].includes(context.request.status)) {
         response.status(409).json({
