@@ -645,6 +645,7 @@ function enrichSubmissionWithRelatedData(
 
 async function enrichSubmission(submission, storage, nowValue = new Date(), supersession = null) {
   const historySubmissionIds = supersession?.historySubmissionIds || [submission.id];
+  const permittedHistorySubmissionIds = new Set(historySubmissionIds);
   const historySubmissions = historySubmissionIds.length > 1
     ? (await Promise.all(historySubmissionIds.map((id) => storage.getSubmission(id)))).filter(Boolean)
     : [submission];
@@ -666,7 +667,10 @@ async function enrichSubmission(submission, storage, nowValue = new Date(), supe
     {
       uploadRequest: documentHistory.latestUploadRequest,
       documents: documentHistory.documents,
-      emailEvents: emailEventResults.flat(),
+      emailEvents: emailEventResults
+        .flat()
+        .filter((event) => permittedHistorySubmissionIds.has(event.submission_id))
+        .map((event) => ({ ...event, originSubmissionId: event.submission_id })),
     },
     nowValue,
     ),

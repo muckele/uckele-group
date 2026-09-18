@@ -4933,7 +4933,10 @@ export default function DashboardPage() {
                           ))}
                         </ul>
                       ) : null}
-                      {!writesDisabled && latestUploadRequest && !['revoked', 'completed', 'documents-received'].includes(latestUploadRequest.status) ? (
+                      {!writesDisabled
+                        && latestUploadRequest
+                        && (!latestUploadRequest.originSubmissionId || latestUploadRequest.originSubmissionId === submission.id)
+                        && !['revoked', 'completed', 'documents-received'].includes(latestUploadRequest.status) ? (
                         <button className="mt-4 inline-flex rounded-full border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700" onClick={() => handleRevokeUploadRequest(latestUploadRequest)} type="button">Revoke Link</button>
                       ) : null}
                     </div>
@@ -4966,7 +4969,8 @@ export default function DashboardPage() {
                                       Download
                                     </a>
                                   ) : null}
-                                  {!writesDisabled ? (
+                                  {!writesDisabled
+                                    && (!document.originSubmissionId || document.originSubmissionId === submission.id) ? (
                                     <button
                                       className="inline-flex items-center gap-2 rounded-full border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700 transition hover:bg-red-100"
                                       onClick={() => handleDeleteSecureDocument(document)}

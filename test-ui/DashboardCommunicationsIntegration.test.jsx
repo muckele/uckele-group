@@ -339,6 +339,50 @@ describe('Dashboard communications and lead lifecycle integration', () => {
     expect(screen.queryByRole('button', { name: 'Permanently Delete Record' })).not.toBeInTheDocument();
     expect(fetchMock.mock.calls.filter(([, options]) => ['POST', 'PATCH', 'DELETE'].includes(options?.method)).length).toBe(0);
   });
+
+  test('a survivor exposes mutation controls only for documents and upload requests it owns', async () => {
+    const fetchMock = createCrmFetch('admin', crmSubmission({
+      latest_upload_request: {
+        id: 'loser-upload-request',
+        originSubmissionId: 'loser-2',
+        status: 'open',
+        expires_at: '2026-09-20T17:00:00.000Z',
+        nda_accepted_at: null,
+        last_uploaded_at: null,
+        upload_batch_count: 1,
+        requested_documents: [],
+      },
+      secure_documents: [
+        {
+          id: 'current-document',
+          request_id: 'current-request',
+          originSubmissionId: 'record-1',
+          original_name: 'current-survivor.txt',
+          document_type: 'other',
+        },
+        {
+          id: 'historical-document',
+          request_id: 'loser-upload-request',
+          originSubmissionId: 'loser-2',
+          original_name: 'historical-loser.txt',
+          document_type: 'other',
+        },
+      ],
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderDashboard('/admin/crm/record-1');
+
+    const currentRow = (await screen.findByText('current-survivor.txt')).closest('div.rounded-2xl');
+    const historicalRow = screen.getByText('historical-loser.txt').closest('div.rounded-2xl');
+    expect(within(currentRow).getByRole('button', { name: 'Delete' })).toBeVisible();
+    expect(within(historicalRow).queryByRole('button', { name: 'Delete' })).not.toBeInTheDocument();
+    expect(within(historicalRow).getByRole('link', { name: 'Download' })).toBeVisible();
+    expect(within(historicalRow).getByRole('button', { name: 'Copy Name' })).toBeVisible();
+    expect(screen.getAllByRole('button', { name: 'Delete' })).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: 'Revoke Link' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Save Updates' })).toBeVisible();
+  });
 });
 
 describe('Dashboard Deal Hunter communications integration', () => {

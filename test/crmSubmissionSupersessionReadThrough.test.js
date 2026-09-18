@@ -46,15 +46,26 @@ function communication(id, submissionId, occurredAt) {
   };
 }
 
-function tableDigest(sqlitePath) {
+function rawState(sqlitePath) {
   const database = new Database(sqlitePath, { readonly: true, fileMustExist: true });
   try {
-    const tables = ['contact_submissions', 'crm_activity_events', 'email_events', 'crm_communications', 'secure_upload_requests', 'secure_documents'];
-    const state = Object.fromEntries(tables.map((table) => [table, database.prepare(`SELECT * FROM ${table} ORDER BY id`).all()]));
-    return createHash('sha256').update(JSON.stringify(state)).digest('hex');
+    const tables = [
+      'contact_submissions',
+      'crm_activity_events',
+      'email_events',
+      'crm_communications',
+      'secure_upload_requests',
+      'secure_documents',
+      'secure_document_cleanup_jobs',
+    ];
+    return Object.fromEntries(tables.map((table) => [table, database.prepare(`SELECT * FROM ${table} ORDER BY id`).all()]));
   } finally {
     database.close();
   }
+}
+
+function stateDigest(state) {
+  return createHash('sha256').update(JSON.stringify(state)).digest('hex');
 }
 
 async function fixture(t) {
@@ -68,6 +79,7 @@ async function fixture(t) {
 
   await storage.insertSubmission(submission('survivor', { deal_hunter_opportunity_id: 'opportunity' }));
   await storage.insertSubmission(submission('loser'));
+  await storage.insertSubmission(submission('unrelated', { email: 'loser@example.test' }));
   await storage.upsertDealHunterOpportunity({
     opportunity_id: 'opportunity', created_at: timestamp, updated_at: timestamp,
     canonical_name: 'Read-through opportunity', canonical_recipient: null, canonical_location: null,
@@ -103,10 +115,12 @@ async function fixture(t) {
   for (const [id, submissionId, createdAt] of [
     ['legacy-survivor', 'survivor', '2026-09-17T18:04:00.000Z'],
     ['legacy-loser', 'loser', '2026-09-17T18:05:00.000Z'],
+    ['legacy-unrelated', 'unrelated', '2026-09-17T18:05:30.000Z'],
   ]) {
     await storage.insertEmailEvent({
       id, created_at: createdAt, provider: 'fixture', event_type: 'delivered', message_id: `${id}-message`,
-      provider_event_id: `${id}-provider`, event_key: `${id}-key`, recipient_email: `${submissionId}@example.test`,
+      provider_event_id: `${id}-provider`, event_key: `${id}-key`,
+      recipient_email: submissionId === 'unrelated' ? 'loser@example.test' : `${submissionId}@example.test`,
       subject: id, submission_id: submissionId, communication_id: null, source: 'fixture', metadata: {},
     });
   }
@@ -152,10 +166,25 @@ test('historical detail keeps the requested loser row and exposes bounded supers
   assert.equal(detail.email_engagement.total, 2);
 });
 
+test('legacy email enrichment excludes a third submission that shares the pair contact address', async (t) => {
+  const { storage } = await fixture(t);
+
+  const loserDetail = await getDashboardSubmission('loser', { storage });
+  const survivorDetail = await getDashboardSubmission('survivor', { storage });
+
+  assert.equal(loserDetail.email_engagement.total, 2);
+  assert.equal(survivorDetail.email_engagement.total, 2);
+  assert.equal(loserDetail.email_engagement.last_event_at, '2026-09-17T18:05:00.000Z');
+  assert.equal(survivorDetail.email_engagement.last_event_at, '2026-09-17T18:05:00.000Z');
+});
+
 test('survivor read-through unions direct histories, preserves ordering and leaves stored owners byte-identical', async (t) => {
   const { sqlitePath, storage } = await fixture(t);
-  const before = tableDigest(sqlitePath);
+  const before = rawState(sqlitePath);
   const context = await storage.getCrmSubmissionSupersessionContext('survivor');
+
+  const loserDetail = await getDashboardSubmission('loser', { storage });
+  const survivorDetail = await getDashboardSubmission('survivor', { storage });
 
   const rawEvents = await listCrmActivity({
     submissionId: 'survivor', historySubmissionIds: context.historySubmissionIds, storage,
@@ -168,6 +197,9 @@ test('survivor read-through unions direct histories, preserves ordering and leav
     submissionId: 'survivor', historySubmissionIds: context.historySubmissionIds, storage,
   });
 
+  assert.equal(loserDetail.email_engagement.total, 2);
+  assert.equal(survivorDetail.email_engagement.total, 2);
+
   assert.deepEqual(rawEvents.map((row) => row.id), ['activity-loser', 'activity-survivor']);
   assert.deepEqual(rawEvents.map((row) => row.originSubmissionId), ['loser', 'survivor']);
   assert.deepEqual(timeline.events.map((row) => row.originSubmissionId), ['loser', 'survivor']);
@@ -175,14 +207,31 @@ test('survivor read-through unions direct histories, preserves ordering and leav
   assert.deepEqual(communications.rows.map((row) => row.originSubmissionId), ['loser', 'survivor']);
   assert.deepEqual(documents.uploadRequests.map((row) => row.id), ['request-loser', 'request-survivor']);
   assert.deepEqual(documents.documents.map((row) => row.originSubmissionId), ['loser', 'survivor']);
-  assert.equal(tableDigest(sqlitePath), before);
-
-  const database = new Database(sqlitePath, { readonly: true, fileMustExist: true });
-  assert.deepEqual(database.prepare('SELECT id, submission_id FROM crm_activity_events ORDER BY id').all(), [
+  const after = rawState(sqlitePath);
+  assert.equal(stateDigest(after), stateDigest(before));
+  assert.deepEqual(after.contact_submissions, before.contact_submissions);
+  assert.deepEqual(after.secure_document_cleanup_jobs, []);
+  assert.deepEqual(after.crm_activity_events.map(({ id, submission_id }) => ({ id, submission_id })), [
     { id: 'activity-loser', submission_id: 'loser' },
     { id: 'activity-survivor', submission_id: 'survivor' },
   ]);
-  database.close();
+  assert.deepEqual(after.email_events.map(({ id, submission_id }) => ({ id, submission_id })), [
+    { id: 'legacy-loser', submission_id: 'loser' },
+    { id: 'legacy-survivor', submission_id: 'survivor' },
+    { id: 'legacy-unrelated', submission_id: 'unrelated' },
+  ]);
+  assert.deepEqual(after.crm_communications.map(({ id, submission_id }) => ({ id, submission_id })), [
+    { id: 'communication-loser', submission_id: 'loser' },
+    { id: 'communication-survivor', submission_id: 'survivor' },
+  ]);
+  assert.deepEqual(after.secure_upload_requests.map(({ id, submission_id }) => ({ id, submission_id })), [
+    { id: 'request-loser', submission_id: 'loser' },
+    { id: 'request-survivor', submission_id: 'survivor' },
+  ]);
+  assert.deepEqual(after.secure_documents.map(({ id, submission_id }) => ({ id, submission_id })), [
+    { id: 'document-loser', submission_id: 'loser' },
+    { id: 'document-survivor', submission_id: 'survivor' },
+  ]);
 });
 
 test('ordinary records retain single-record history behavior', async (t) => {

@@ -31,6 +31,7 @@ const {
 } = await import('../server/services/secureDocumentCleanupState.js');
 const { getStorage } = await import('../server/storage/index.js');
 const { signPayload } = await import('../server/utils/security.js');
+const { CrmSubmissionSupersededError } = await import('../server/services/crmSubmissionSupersession.js');
 
 const writableSubmissionGuard = {
   async assertCrmSubmissionWritable() {
@@ -971,6 +972,60 @@ test('admin can revoke an upload link and delete one secure document', async () 
   assert.equal(revoked.ok, true);
   assert.equal(revoked.request.status, 'revoked');
   assert.equal((await getSecureUploadContext(token)).ok, false);
+});
+
+test('individual document deletion refuses loser-owned history before cleanup staging or activity', async () => {
+  const storageDir = process.env.SECURE_DOCUMENTS_STORAGE_DIR;
+  const sourcePath = path.join(storageDir, 'historical-loser-document.txt');
+  fs.mkdirSync(storageDir, { recursive: true });
+  fs.writeFileSync(sourcePath, 'historical evidence');
+  const document = {
+    id: 'historical-loser-document',
+    submission_id: 'loser-id',
+    original_name: 'historical-loser-document.txt',
+    document_type: 'other',
+    storage_path: sourcePath,
+  };
+  let cleanupJobWrites = 0;
+  let activityMutations = 0;
+  const cleanupSidecarsBefore = readCleanupSidecars();
+  const storage = {
+    async getSecureDocument(id) {
+      return id === document.id ? document : null;
+    },
+    async assertCrmSubmissionWritable(submissionId) {
+      assert.equal(submissionId, 'loser-id');
+      throw new CrmSubmissionSupersededError({
+        submissionId,
+        survivorSubmissionId: 'survivor-id',
+        opportunityId: 'opportunity-id',
+      });
+    },
+    async insertSecureDocumentCleanupJob() {
+      cleanupJobWrites += 1;
+      throw new Error('cleanup intent must not be written');
+    },
+    async mutateWithCrmActivity() {
+      activityMutations += 1;
+      throw new Error('document/activity mutation must not run');
+    },
+  };
+
+  await assert.rejects(
+    deleteSecureDocument({ documentId: document.id, deletedBy: 'admin-test', storage }),
+    {
+      code: 'CRM_SUBMISSION_SUPERSEDED',
+      status: 409,
+      submissionId: 'loser-id',
+      survivorSubmissionId: 'survivor-id',
+      opportunityId: 'opportunity-id',
+    },
+  );
+  assert.equal(cleanupJobWrites, 0);
+  assert.equal(activityMutations, 0);
+  assert.equal(fs.existsSync(sourcePath), true);
+  assert.equal(fs.readFileSync(sourcePath, 'utf8'), 'historical evidence');
+  assert.deepEqual(readCleanupSidecars(), cleanupSidecarsBefore);
 });
 
 test('individual deletion persists a write-ahead cleanup intent before staging the file', async () => {

@@ -7,6 +7,7 @@ import { getClientIp, getRequestOrigin } from '../utils/http.js';
 import { hashIp, sha256, signPayload, verifySignedPayload } from '../utils/security.js';
 import { sendDocumentUploadNotificationEmail, sendSecureUploadInviteEmail } from './delivery.js';
 import { buildCrmActivityEvent, commitCrmActivityMutation } from './activity.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 import {
   persistSecureDocumentCleanupJob,
   registerSecureDocumentCleanupIntent,
@@ -1106,6 +1107,7 @@ export async function deleteSecureDocument({ documentId, deletedBy = 'admin', st
   const config = getConfig();
   const document = await storage.getSecureDocument(String(documentId || '').trim());
   if (!document) return { ok: false, status: 404, error: 'Secure document was not found.' };
+  await assertCrmSubmissionWritable({ storage, submissionId: document.submission_id });
   const sourcePath = resolveSecureStoragePath(document.storage_path, config.secureDocuments.storageDir);
   if (!sourcePath) return { ok: false, status: 500, error: 'Secure document path is invalid.' };
   const operationId = randomUUID();

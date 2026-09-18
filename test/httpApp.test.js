@@ -429,6 +429,82 @@ test('authenticated loser deep links remain readable and point safely to the sur
   });
 });
 
+test('survivor document read-through cannot delete a loser-owned document', async () => {
+  const fixture = await seedHttpSupersession();
+  const storage = getStorage();
+  const createdAt = new Date().toISOString();
+  const requestId = `historical-upload-${randomUUID()}`;
+  const documentId = `historical-document-${randomUUID()}`;
+  const storageRoot = getConfig().secureDocuments.storageDir;
+  const storagePath = path.join(storageRoot, `${documentId}.txt`);
+  fs.mkdirSync(storageRoot, { recursive: true });
+  fs.writeFileSync(storagePath, 'historical loser evidence');
+  await storage.insertSecureUploadRequest({
+    id: requestId,
+    submission_id: fixture.loser.id,
+    created_at: createdAt,
+    updated_at: createdAt,
+    email: fixture.loser.broker_email,
+    contact_name: fixture.loser.broker_name,
+    requested_by: 'http-test',
+    status: 'closed',
+    expires_at: new Date(Date.parse(createdAt) + 86_400_000).toISOString(),
+    nda_required: false,
+    nda_accepted_at: null,
+    last_uploaded_at: createdAt,
+    note: 'Historical document fixture.',
+    requested_documents: [],
+    revoked_at: null,
+    closed_at: createdAt,
+    upload_batch_count: 1,
+  });
+  await storage.insertSecureDocument({
+    id: documentId,
+    request_id: requestId,
+    submission_id: fixture.loser.id,
+    created_at: createdAt,
+    document_type: 'other',
+    file_name: `${documentId}.txt`,
+    original_name: 'historical-loser.txt',
+    mime_type: 'text/plain',
+    size_bytes: Buffer.byteLength('historical loser evidence'),
+    storage_path: storagePath,
+    uploaded_by_email: fixture.loser.broker_email,
+    note: 'Historical document fixture.',
+    nda_accepted_at: null,
+  });
+  const trashRoot = path.join(storageRoot, '.trash');
+  const treeBefore = fs.existsSync(trashRoot) ? fs.readdirSync(trashRoot, { recursive: true }).sort() : [];
+  const cleanupBefore = await storage.listSecureDocumentCleanupJobs({ limit: 500 });
+  const activityBefore = await storage.listCrmActivityEvents({ submissionId: fixture.loser.id, limit: 500 });
+  const documentBefore = await storage.getSecureDocument(documentId);
+
+  await withServer(async (origin) => {
+    const cookie = await signInForCookie(origin);
+    const response = await fetch(`${origin}/api/admin/secure-documents/${encodeURIComponent(documentId)}`, {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    });
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      success: false,
+      code: CRM_SUBMISSION_SUPERSEDED,
+      error: 'This CRM record is historical and cannot be changed.',
+      submissionId: fixture.loser.id,
+      survivorSubmissionId: fixture.survivor.id,
+      opportunityId: fixture.opportunityId,
+    });
+  });
+
+  assert.deepEqual(await storage.getSecureDocument(documentId), documentBefore);
+  assert.deepEqual(await storage.listSecureDocumentCleanupJobs({ limit: 500 }), cleanupBefore);
+  assert.deepEqual(await storage.listCrmActivityEvents({ submissionId: fixture.loser.id, limit: 500 }), activityBefore);
+  assert.equal(fs.existsSync(storagePath), true);
+  assert.equal(fs.readFileSync(storagePath, 'utf8'), 'historical loser evidence');
+  assert.deepEqual(fs.existsSync(trashRoot) ? fs.readdirSync(trashRoot, { recursive: true }).sort() : [], treeBefore);
+});
+
 test('legacy canonical disposition route refuses a superseded caller submission without redirecting to the survivor', async () => {
   const fixture = await seedHttpSupersession({ withScore: true });
   writeTaskFourSourceSnapshot();
