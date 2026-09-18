@@ -38,6 +38,47 @@ const secureUploadRateLimitEvents = new Map();
 const base64ExpansionRatio = 4 / 3;
 const jsonUploadEnvelopeBytes = 1024 * 1024;
 
+function boundedHistorySubmissionIds(submissionId, historySubmissionIds = []) {
+  const values = [submissionId, ...(Array.isArray(historySubmissionIds) ? historySubmissionIds : [])]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+  return [...new Set(values)].slice(0, 5000);
+}
+
+function compareCreatedAtDescending(left, right) {
+  return String(right?.created_at || '').localeCompare(String(left?.created_at || ''))
+    || String(right?.id || '').localeCompare(String(left?.id || ''));
+}
+
+export async function listCrmDocumentHistory({
+  submissionId = '',
+  historySubmissionIds = [],
+  storage = getStorage(),
+} = {}) {
+  const ids = boundedHistorySubmissionIds(submissionId, historySubmissionIds);
+  if (ids.length === 0) return { uploadRequests: [], documents: [], latestUploadRequest: null };
+
+  const [uploadRequests, documents] = await Promise.all([
+    storage.listLatestSecureUploadRequestsForSubmissions
+      ? storage.listLatestSecureUploadRequestsForSubmissions(ids)
+      : Promise.all(ids.map((id) => storage.getLatestSecureUploadRequestForSubmission(id))).then((rows) => rows.filter(Boolean)),
+    storage.listSecureDocumentsForSubmissions
+      ? storage.listSecureDocumentsForSubmissions(ids)
+      : Promise.all(ids.map((id) => storage.listSecureDocumentsForSubmission(id))).then((rows) => rows.flat()),
+  ]);
+  const projectedUploadRequests = uploadRequests
+    .map((request) => ({ ...request, originSubmissionId: request.submission_id }))
+    .sort(compareCreatedAtDescending);
+  const projectedDocuments = documents
+    .map((document) => ({ ...document, originSubmissionId: document.submission_id }))
+    .sort(compareCreatedAtDescending);
+  return {
+    uploadRequests: projectedUploadRequests,
+    documents: projectedDocuments,
+    latestUploadRequest: projectedUploadRequests[0] || null,
+  };
+}
+
 const mimeTypesByExtension = new Map([
   ['.pdf', 'application/pdf'],
   ['.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],

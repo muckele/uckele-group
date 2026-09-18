@@ -19,6 +19,7 @@ const {
   deleteSecureDocument,
   getSecureDocumentDownload,
   getSecureUploadContext,
+  listCrmDocumentHistory,
   revokeSecureUploadRequest,
   uploadSecureDocuments,
 } = await import('../server/services/documentVault.js');
@@ -70,6 +71,34 @@ function afterCleanupSettlement(options = {}) {
     now: new Date(Date.now() + secureDocumentCleanupSettlementMs + 1000).toISOString(),
   };
 }
+
+test('read-only document history preserves stored ownership while adding origin provenance', async () => {
+  const uploadRequests = [
+    { id: 'request-loser', submission_id: 'loser', created_at: '2026-09-17T11:00:00.000Z' },
+    { id: 'request-survivor', submission_id: 'survivor', created_at: '2026-09-17T10:00:00.000Z' },
+  ];
+  const documents = [
+    { id: 'document-loser', submission_id: 'loser', created_at: '2026-09-17T11:00:00.000Z' },
+    { id: 'document-survivor', submission_id: 'survivor', created_at: '2026-09-17T10:00:00.000Z' },
+  ];
+  const storage = {
+    async listLatestSecureUploadRequestsForSubmissions(ids) {
+      assert.deepEqual(ids, ['survivor', 'loser']);
+      return uploadRequests;
+    },
+    async listSecureDocumentsForSubmissions(ids) {
+      assert.deepEqual(ids, ['survivor', 'loser']);
+      return documents;
+    },
+  };
+  const result = await listCrmDocumentHistory({
+    submissionId: 'survivor', historySubmissionIds: ['survivor', 'loser'], storage,
+  });
+  assert.deepEqual(result.uploadRequests.map((row) => row.originSubmissionId), ['loser', 'survivor']);
+  assert.deepEqual(result.documents.map((row) => row.originSubmissionId), ['loser', 'survivor']);
+  assert.deepEqual(uploadRequests.map((row) => row.submission_id), ['loser', 'survivor']);
+  assert.deepEqual(documents.map((row) => row.submission_id), ['loser', 'survivor']);
+});
 
 async function createUploadToken(email = 'broker@example.com') {
   const submissionResult = await createManualSubmission(

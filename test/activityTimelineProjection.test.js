@@ -54,3 +54,13 @@ test('timeline lifecycle precedence retains complaint, bounce, reply, delay, and
     assert.equal(result.events[0].event_type, `email.${highest}`);
   }
 });
+
+test('timeline projection retains the stored submission provenance on logical and raw items', () => {
+  const events = [
+    lifecycle('loser-sent', 'sent', 'shared-message', '2026-08-12T10:00:00.000Z', { communicationId: 'shared' }),
+    lifecycle('loser-delivered', 'delivered', 'shared-message', '2026-08-12T10:00:01.000Z', { communicationId: 'shared' }),
+  ].map((event) => ({ ...event, submission_id: 'loser', originSubmissionId: 'loser' }));
+  const result = projectCrmActivityTimeline(events);
+  assert.equal(result.events[0].originSubmissionId, 'loser');
+  assert.deepEqual(result.events[0].metadata.auditEvents.map((event) => event.originSubmissionId), ['loser', 'loser']);
+});

@@ -198,4 +198,13 @@ describe('CrmCommunications', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Load More' }));
     expect(onLoadMore).toHaveBeenCalledTimes(1);
   });
+
+  test('labels correspondence retained on a different origin submission only', () => {
+    render(<CrmCommunications currentSubmissionId="survivor" communications={[
+      { ...communications[0], id: 'survivor-message', originSubmissionId: 'survivor' },
+      { ...communications[1], id: 'loser-message', originSubmissionId: 'loser' },
+    ]} />);
+    expect(screen.getByText('Historical origin: loser')).toBeVisible();
+    expect(screen.queryByText('Historical origin: survivor')).not.toBeInTheDocument();
+  });
 });

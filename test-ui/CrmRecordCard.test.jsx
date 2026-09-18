@@ -118,4 +118,20 @@ describe('CRM record summary card', () => {
       { reason: 'not-a-fit', note: 'Outside the acquisition profile.', communicationId: '' },
     ));
   });
+
+  test('shows historical supersession context and exposes no mutation control on a loser card', () => {
+    renderCard({
+      supersession: {
+        isSuperseded: true,
+        canonicalSubmissionId: 'survivor-456',
+        survivorUrl: '/admin/crm/survivor-456',
+        relation: { reasonText: 'Owner reviewed duplicate.' },
+      },
+    }, { onArchiveLead: vi.fn(), onRestoreLead: vi.fn() });
+
+    expect(screen.getByText(/historical CRM record/i)).toBeVisible();
+    expect(screen.getByRole('link', { name: /open surviving CRM record/i })).toHaveAttribute('href', '/admin/crm/survivor-456');
+    expect(screen.queryByRole('button', { name: /archive lead/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /restore lead/i })).not.toBeInTheDocument();
+  });
 });

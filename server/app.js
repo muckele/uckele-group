@@ -1304,6 +1304,7 @@ export function createApp({
         .filter(Boolean);
       const events = await listCrmActivity({
         submissionId: request.params.id,
+        historySubmissionIds: submission.supersession?.historySubmissionIds || [request.params.id],
         eventTypes,
         limit: Number(request.query.limit) || 200,
         before: String(request.query.before || ''),
@@ -1329,6 +1330,7 @@ export function createApp({
 
       const result = await listCrmCommunications({
         submissionId: submission.id,
+        historySubmissionIds: submission.supersession?.historySubmissionIds || [submission.id],
         page: Number(request.query.page) || 1,
         pageSize: Number(request.query.pageSize) || 25,
         before: String(request.query.before || ''),

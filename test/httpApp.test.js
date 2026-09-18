@@ -408,6 +408,27 @@ test('authenticated core CRM routes expose the bounded superseded-record conflic
   });
 });
 
+test('authenticated loser deep links remain readable and point safely to the survivor', async () => {
+  const fixture = await seedHttpSupersession();
+  await withServer(async (origin) => {
+    const cookie = await signInForCookie(origin);
+    const response = await fetch(`${origin}/api/admin/submissions/${fixture.loser.id}`, {
+      headers: { Cookie: cookie },
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.success, true);
+    assert.equal(body.submission.id, fixture.loser.id);
+    assert.equal(body.submission.notes, 'HTTP supersession loser.');
+    assert.equal(body.submission.supersession.isSuperseded, true);
+    assert.equal(body.submission.supersession.canonicalSubmissionId, fixture.survivor.id);
+    assert.equal(
+      body.submission.supersession.survivorUrl,
+      `/admin/crm/${encodeURIComponent(fixture.survivor.id)}`,
+    );
+  });
+});
+
 test('legacy canonical disposition route refuses a superseded caller submission without redirecting to the survivor', async () => {
   const fixture = await seedHttpSupersession({ withScore: true });
   writeTaskFourSourceSnapshot();

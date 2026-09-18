@@ -1031,9 +1031,17 @@ export function CrmRecordCard({ submission, detailHref, lifecyclePending = false
     { label: 'TTM EBITDA', value: submission.ttm_ebitda || 'Not set' },
     { label: 'Multiple', value: submission.ebitda_multiple || 'Not set' },
   ];
+  const isSuperseded = Boolean(submission.supersession?.isSuperseded);
 
   return (
     <article className="admin-crm-record-summary">
+      {isSuperseded ? (
+        <div className="mb-5 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900" role="status">
+          <strong>Historical CRM record.</strong>{' '}
+          This record is retained as duplicate evidence and cannot be changed.
+          {' '}<NavLink className="font-semibold underline underline-offset-4" to={submission.supersession.survivorUrl}>Open surviving CRM record</NavLink>
+        </div>
+      ) : null}
       <div className="flex min-w-0 flex-col gap-5 lg:flex-row lg:items-start lg:justify-between">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
@@ -1108,7 +1116,7 @@ export function CrmRecordCard({ submission, detailHref, lifecyclePending = false
         onArchive={onArchiveLead}
         onRestore={onRestoreLead}
         pending={lifecyclePending}
-        readOnly={readOnly}
+        readOnly={readOnly || isSuperseded}
         submission={submission}
       />
     </article>
@@ -4311,6 +4319,8 @@ export default function DashboardPage() {
             const secondaryDateLabel = sourceDateAdded ? 'Imported to CRM' : listingDate ? 'First seen' : 'Date listed';
             const secondaryDate = sourceDateAdded ? submission.created_at : listingDate;
             const brokerContactDetails = crmBrokerContactDetails(submission);
+            const isSuperseded = Boolean(submission.supersession?.isSuperseded);
+            const writesDisabled = isReadOnly || isSuperseded;
 
             return (
               <Reveal
@@ -4318,6 +4328,13 @@ export default function DashboardPage() {
                 delay={0}
                 key={submission.id}
               >
+                {isSuperseded ? (
+                  <div className="mb-6 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-4 text-sm leading-6 text-amber-900" role="status">
+                    <strong>Historical CRM record.</strong>{' '}
+                    This duplicate is retained unchanged and cannot be modified.
+                    {' '}<NavLink className="font-semibold underline underline-offset-4" to={submission.supersession.survivorUrl}>Open surviving CRM record</NavLink>
+                  </div>
+                ) : null}
                 <div className="flex flex-col gap-6 xl:flex-row xl:items-start xl:justify-between">
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-3">
@@ -4454,11 +4471,11 @@ export default function DashboardPage() {
                   onArchive={handleArchiveLead}
                   onRestore={handleRestoreLead}
                   pending={leadLifecyclePendingId === submission.id}
-                  readOnly={isReadOnly}
+                  readOnly={writesDisabled}
                   submission={submission}
                 />
 
-                <fieldset className={isReadOnly ? 'opacity-75' : ''} data-admin-tour="crm-detail-evidence" disabled={isReadOnly}>
+                <fieldset className={writesDisabled ? 'opacity-75' : ''} data-admin-tour="crm-detail-evidence" disabled={writesDisabled}>
                   <div className="mt-8 grid gap-5 sm:grid-cols-2 xl:grid-cols-6" data-admin-tour="crm-detail-next-action">
                     <SelectField
                       label="Status"
@@ -4916,7 +4933,7 @@ export default function DashboardPage() {
                           ))}
                         </ul>
                       ) : null}
-                      {!isReadOnly && latestUploadRequest && !['revoked', 'completed', 'documents-received'].includes(latestUploadRequest.status) ? (
+                      {!writesDisabled && latestUploadRequest && !['revoked', 'completed', 'documents-received'].includes(latestUploadRequest.status) ? (
                         <button className="mt-4 inline-flex rounded-full border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700" onClick={() => handleRevokeUploadRequest(latestUploadRequest)} type="button">Revoke Link</button>
                       ) : null}
                     </div>
@@ -4935,6 +4952,9 @@ export default function DashboardPage() {
                                 <div>
                                   <p className="font-semibold text-ink">{document.original_name}</p>
                                   <p className="mt-1 text-xs uppercase tracking-[0.14em] text-moss/70">{document.document_type}</p>
+                                  {document.originSubmissionId && document.originSubmissionId !== submission.id ? (
+                                    <p className="mt-1 text-xs font-semibold text-amber-800">Historical origin: {document.originSubmissionId}</p>
+                                  ) : null}
                                 </div>
                                 <div className="flex flex-wrap items-center gap-2">
                                   {!isReadOnly ? (
@@ -4946,7 +4966,7 @@ export default function DashboardPage() {
                                       Download
                                     </a>
                                   ) : null}
-                                  {!isReadOnly ? (
+                                  {!writesDisabled ? (
                                     <button
                                       className="inline-flex items-center gap-2 rounded-full border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700 transition hover:bg-red-100"
                                       onClick={() => handleDeleteSecureDocument(document)}
@@ -4981,6 +5001,7 @@ export default function DashboardPage() {
                   <CrmCommunications
                     cimRequestOptions={crmCimRequestOptions}
                     communications={crmCommunications.rows}
+                    currentSubmissionId={submission.id}
                     error={crmCommunications.error}
                     hasMore={crmCommunicationsHasMore}
                     loading={crmCommunications.loading}
@@ -4988,8 +5009,8 @@ export default function DashboardPage() {
                     logError={crmCommunications.logError}
                     logPending={crmCommunications.logPending}
                     onLoadMore={() => loadCrmCommunications(submission.id, { append: true })}
-                    onLogCommunication={isReadOnly ? undefined : handleLogCommunication}
-                    readOnly={isReadOnly}
+                    onLogCommunication={writesDisabled ? undefined : handleLogCommunication}
+                    readOnly={writesDisabled}
                     workflowUpdatesDisabled={submission.status === 'archived'}
                   />
                 </Suspense>
@@ -4997,13 +5018,14 @@ export default function DashboardPage() {
                 <div data-admin-tour="crm-detail-actions">
                   <Suspense fallback={<WorkspaceFallback />}>
                     <DealActivityTimeline
+                      currentSubmissionId={submission.id}
                       error={dealActivity.error}
                       events={dealActivity.events}
                       loading={dealActivity.loading}
                     />
                   </Suspense>
 
-                  {!isReadOnly ? (
+                  {!writesDisabled ? (
                   <>
                     <div className="mt-6 grid gap-3 sm:flex sm:flex-wrap">
                       <button

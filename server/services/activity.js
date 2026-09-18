@@ -65,17 +65,29 @@ export async function commitCrmActivityMutation({ storage = getStorage(), operat
   return storage.mutateWithCrmActivity({ operation, payload, activity: event });
 }
 
-export async function listCrmActivity({ submissionId, eventTypes = [], limit = 200, before = '', storage = getStorage() } = {}) {
+export async function listCrmActivity({ submissionId, historySubmissionIds = [], eventTypes = [], limit = 200, before = '', storage = getStorage() } = {}) {
   if (!storage.listCrmActivityEvents) {
     return [];
   }
 
-  return storage.listCrmActivityEvents({
-    submissionId: normalizeText(submissionId, 100),
-    eventTypes: Array.isArray(eventTypes) ? eventTypes : [],
-    limit,
-    before,
-  });
+  const boundedHistorySubmissionIds = [...new Set([
+    normalizeText(submissionId, 100),
+    ...(Array.isArray(historySubmissionIds) ? historySubmissionIds : [])
+      .map((value) => normalizeText(value, 100)),
+  ].filter(Boolean))].slice(0, 5000);
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 200, 500));
+  const rows = (await Promise.all(boundedHistorySubmissionIds.map(async (id) => (
+    (await storage.listCrmActivityEvents({
+      submissionId: id,
+      eventTypes: Array.isArray(eventTypes) ? eventTypes : [],
+      limit: safeLimit,
+      before,
+    })).map((event) => ({ ...event, originSubmissionId: event.submission_id }))
+  )))).flat();
+  return rows.sort((left, right) => (
+    String(right.created_at || '').localeCompare(String(left.created_at || ''))
+    || String(right.id || '').localeCompare(String(left.id || ''))
+  )).slice(0, safeLimit);
 }
 
 const emailLifecyclePrecedence = new Map([
@@ -155,6 +167,7 @@ export function projectCrmActivityTimeline(events = []) {
           provider: event.metadata?.provider || '',
           messageId: event.metadata?.messageId || '',
           communicationId: event.metadata?.communicationId || '',
+          originSubmissionId: event.originSubmissionId || event.submission_id || '',
         })),
       },
     });

@@ -75,7 +75,7 @@ function eventLabel(type) {
     .join(' ');
 }
 
-export default function DealActivityTimeline({ events = [], loading = false, error = '' }) {
+export default function DealActivityTimeline({ events = [], loading = false, error = '', currentSubmissionId = '' }) {
   const [activeFilter, setActiveFilter] = useState('all');
   const visibleEvents = useMemo(() => {
     const selected = filters.find((filter) => filter.id === activeFilter) || filters[0];
@@ -129,6 +129,9 @@ export default function DealActivityTimeline({ events = [], loading = false, err
                 <time className="shrink-0 text-xs text-ink/55" dateTime={event.created_at}>{formatTimestamp(event.created_at)}</time>
               </div>
               <p className="mt-2 text-xs text-ink/60">{event.actor || 'system'} · {event.role || 'system'}</p>
+              {currentSubmissionId && event.originSubmissionId && event.originSubmissionId !== currentSubmissionId ? (
+                <p className="mt-2 text-xs font-semibold text-amber-800">Historical origin: {event.originSubmissionId}</p>
+              ) : null}
               {event.metadata?.logicalMessage ? (
                 <>
                   <p className="mt-2 text-xs text-ink/60">First lifecycle event {formatTimestamp(event.metadata.firstLifecycleAt)} · latest lifecycle {formatTimestamp(event.metadata.latestLifecycleAt)}</p>

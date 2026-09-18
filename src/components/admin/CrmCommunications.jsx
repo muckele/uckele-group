@@ -146,7 +146,7 @@ function MessageBody({ communication, longBodyThreshold }) {
   return <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-7 text-ink/76">{bodyText}</p>;
 }
 
-function CommunicationCard({ communication, index, longBodyThreshold }) {
+function CommunicationCard({ communication, currentSubmissionId, index, longBodyThreshold }) {
   const id = communicationId(communication, index);
   const direction = String(communication.direction || 'inbound').toLowerCase();
   const channel = String(communication.channel || 'email').toLowerCase();
@@ -206,6 +206,10 @@ function CommunicationCard({ communication, index, longBodyThreshold }) {
         replied={replied}
         requestState={requestState}
       />
+
+      {currentSubmissionId && communication.originSubmissionId && communication.originSubmissionId !== currentSubmissionId ? (
+        <p className="mt-3 text-xs font-semibold text-amber-800">Historical origin: {communication.originSubmissionId}</p>
+      ) : null}
 
       {workflowWarning ? (
         <p className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-900" role="status">
@@ -322,6 +326,7 @@ export default function CrmCommunications({
   cimRequestOptions = [],
   longBodyThreshold = 600,
   workflowUpdatesDisabled = false,
+  currentSubmissionId = '',
 }) {
   const [showLogForm, setShowLogForm] = useState(false);
   const boundedLongBodyThreshold = Math.max(160, Math.min(5000, Number(longBodyThreshold) || 600));
@@ -353,7 +358,7 @@ export default function CrmCommunications({
 
       {chronologicalCommunications.length > 0 ? (
         <ol className="mt-6 space-y-4" data-layout="responsive-stack">
-          {chronologicalCommunications.map((communication, index) => <CommunicationCard communication={communication} index={index} key={communicationId(communication, index)} longBodyThreshold={boundedLongBodyThreshold} />)}
+          {chronologicalCommunications.map((communication, index) => <CommunicationCard communication={communication} currentSubmissionId={currentSubmissionId} index={index} key={communicationId(communication, index)} longBodyThreshold={boundedLongBodyThreshold} />)}
         </ol>
       ) : null}
 

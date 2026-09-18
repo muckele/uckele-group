@@ -385,12 +385,47 @@ export async function createCommunicationWithActivity({ communication, actor = '
   return mutation.record;
 }
 
-export async function listCrmCommunications({ submissionId = '', page = 1, pageSize = 25, before = '', storage = getStorage() } = {}) {
+export async function listCrmCommunications({ submissionId = '', historySubmissionIds = [], page = 1, pageSize = 25, before = '', storage = getStorage() } = {}) {
   const id = compactText(submissionId, 120);
   const safePage = boundedPositiveInteger(page, 1, maxListPage);
   const safePageSize = boundedPositiveInteger(pageSize, 25, 100);
   if (!id) return { rows: [], total: 0, page: safePage, pageSize: safePageSize };
-  return storage.listCrmCommunications({ submissionId: id, page: safePage, pageSize: safePageSize, before });
+  const ids = [...new Set([id, ...(Array.isArray(historySubmissionIds) ? historySubmissionIds : [])]
+    .map((value) => compactText(value, 120)).filter(Boolean))].slice(0, 5000);
+  if (ids.length === 1) {
+    const result = await storage.listCrmCommunications({ submissionId: id, page: safePage, pageSize: safePageSize, before });
+    return { ...result, rows: (result.rows || []).map((row) => ({ ...row, originSubmissionId: row.submission_id })) };
+  }
+  const requiredRows = before ? safePageSize : safePage * safePageSize;
+  const results = await Promise.all(ids.map(async (historyId) => {
+    const rows = [];
+    let total = 0;
+    for (let queryPage = 1; rows.length < requiredRows; queryPage += 1) {
+      const result = await storage.listCrmCommunications({
+        submissionId: historyId,
+        page: queryPage,
+        pageSize: Math.min(100, requiredRows - rows.length),
+        before,
+      });
+      total = Number(result.total || 0);
+      rows.push(...(result.rows || []));
+      if ((result.rows || []).length === 0 || rows.length >= total || before) break;
+    }
+    return { rows, total };
+  }));
+  const ordered = results.flatMap((result) => result.rows)
+    .map((row) => ({ ...row, originSubmissionId: row.submission_id }))
+    .sort((left, right) => (
+      String(right.occurred_at || '').localeCompare(String(left.occurred_at || ''))
+      || String(right.id || '').localeCompare(String(left.id || ''))
+    ));
+  const offset = before ? 0 : (safePage - 1) * safePageSize;
+  return {
+    rows: ordered.slice(offset, offset + safePageSize),
+    total: results.reduce((total, result) => total + Number(result.total || 0), 0),
+    page: safePage,
+    pageSize: safePageSize,
+  };
 }
 
 export async function createManualCommunication({ submissionId = '', input = {}, actor = 'admin', storage = getStorage() } = {}) {

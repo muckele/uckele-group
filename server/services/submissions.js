@@ -18,10 +18,10 @@ import {
   normalizePriority,
   normalizeSbaEligibility,
 } from './workflow.js';
-import { resolveSecureStoragePath } from './documentVault.js';
+import { listCrmDocumentHistory, resolveSecureStoragePath } from './documentVault.js';
 import { commitCrmActivityMutation, summarizeSubmissionChanges } from './activity.js';
 import { normalizeAttribution } from './analytics.js';
-import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
+import { assertCrmSubmissionWritable, getCrmSubmissionSupersessionContext } from './crmSubmissionSupersession.js';
 import {
   isSecureDocumentCleanupIntentActive,
   listSecureDocumentCleanupSidecars,
@@ -643,29 +643,36 @@ function enrichSubmissionWithRelatedData(
   };
 }
 
-async function enrichSubmission(submission, storage, nowValue = new Date()) {
-  const contactEmails = collectContactEmails(submission);
+async function enrichSubmission(submission, storage, nowValue = new Date(), supersession = null) {
+  const historySubmissionIds = supersession?.historySubmissionIds || [submission.id];
+  const historySubmissions = historySubmissionIds.length > 1
+    ? (await Promise.all(historySubmissionIds.map((id) => storage.getSubmission(id)))).filter(Boolean)
+    : [submission];
+  const contactEmails = uniqueValues(historySubmissions.flatMap(collectContactEmails));
   const emailEventQueries = storage.listEmailEvents
     ? [
-        storage.listEmailEvents({ submissionId: submission.id, limit: 100 }),
+        ...historySubmissionIds.map((submissionId) => storage.listEmailEvents({ submissionId, limit: 100 })),
         ...contactEmails.map((recipientEmail) => storage.listEmailEvents({ recipientEmail, limit: 100 })),
       ]
     : [];
-  const [uploadRequest, documents, ...emailEventResults] = await Promise.all([
-    storage.getLatestSecureUploadRequestForSubmission(submission.id),
-    storage.listSecureDocumentsForSubmission(submission.id),
+  const [documentHistory, ...emailEventResults] = await Promise.all([
+    listCrmDocumentHistory({ submissionId: submission.id, historySubmissionIds, storage }),
     ...emailEventQueries,
   ]);
 
-  return enrichSubmissionWithRelatedData(
+  return {
+    ...enrichSubmissionWithRelatedData(
     submission,
     {
-      uploadRequest,
-      documents,
+      uploadRequest: documentHistory.latestUploadRequest,
+      documents: documentHistory.documents,
       emailEvents: emailEventResults.flat(),
     },
     nowValue,
-  );
+    ),
+    secure_upload_requests: documentHistory.uploadRequests,
+    supersession,
+  };
 }
 
 async function enrichSubmissions(submissions, storage, nowValue = new Date()) {
@@ -1237,8 +1244,8 @@ export async function listDashboardSubmissions({ page, pageSize, search, status,
   };
 }
 
-export async function getDashboardSubmission(id) {
-  const storage = getStorage();
+export async function getDashboardSubmission(id, options = {}) {
+  const storage = options.storage || getStorage();
   const submissionId = String(id || '').trim();
 
   if (!submissionId) {
@@ -1251,7 +1258,14 @@ export async function getDashboardSubmission(id) {
     return null;
   }
 
-  return enrichSubmission(submission, storage);
+  const context = await getCrmSubmissionSupersessionContext({ storage, submissionId });
+  const supersession = {
+    ...context,
+    survivorUrl: context.isSuperseded
+      ? `/admin/crm/${encodeURIComponent(context.canonicalSubmissionId)}`
+      : '',
+  };
+  return enrichSubmission(submission, storage, new Date(), supersession);
 }
 
 function zonedDateParts(date, timeZone) {
