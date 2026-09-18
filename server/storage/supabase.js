@@ -21,6 +21,7 @@ function unsupportedDealHunterCrmMatchAuthorityError() {
   error.status = 503;
   error.candidateIds = [];
   error.evidenceCategories = ['lookup-incomplete', 'provider-unsupported'];
+  error.cause = new CrmSupersessionUnavailableError();
   return error;
 }
 

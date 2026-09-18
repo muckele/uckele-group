@@ -96,12 +96,16 @@ function allReviewDeals(review) {
   return [...review.qualified, ...review.watchlist, ...review.removalCandidates];
 }
 
-function crmMatchAuthority(rows) {
+function crmMatchAuthority(rows, supersessions = []) {
   return {
     rows,
     count: rows.length,
+    submissionCount: rows.length,
+    supersessions,
+    supersessionCount: supersessions.length,
     complete: true,
     revision: 'a'.repeat(64),
+    revisionVersion: 'deal-hunter-crm-match-authority-v2',
   };
 }
 

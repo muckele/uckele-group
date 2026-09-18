@@ -174,7 +174,7 @@ function normalizeSubmissionRow(row) {
   };
 }
 
-const dealHunterCrmMatchAuthorityVersion = 'deal-hunter-crm-match-authority-v1';
+const dealHunterCrmMatchAuthorityVersion = 'deal-hunter-crm-match-authority-v2';
 const dealHunterCrmMatchAuthorityMaximumRows = 5000;
 
 function dealHunterCrmMatchAuthorityError({ candidateIds = [] } = {}) {
@@ -186,38 +186,68 @@ function dealHunterCrmMatchAuthorityError({ candidateIds = [] } = {}) {
   return error;
 }
 
-function dealHunterCrmMatchAuthoritySnapshot(database, { limit = dealHunterCrmMatchAuthorityMaximumRows } = {}) {
+function dealHunterCrmMatchAuthoritySnapshot(database, {
+  limit = dealHunterCrmMatchAuthorityMaximumRows,
+  supersessionLimit = crmSubmissionSupersessionMaximumRows,
+} = {}) {
   const parsedLimit = Number(limit);
   const safeLimit = Number.isFinite(parsedLimit)
     ? Math.max(1, Math.min(Math.trunc(parsedLimit), dealHunterCrmMatchAuthorityMaximumRows))
     : dealHunterCrmMatchAuthorityMaximumRows;
+  const parsedSupersessionLimit = Number(supersessionLimit);
+  const safeSupersessionLimit = Number.isFinite(parsedSupersessionLimit)
+    ? Math.max(1, Math.min(Math.trunc(parsedSupersessionLimit), crmSubmissionSupersessionMaximumRows))
+    : crmSubmissionSupersessionMaximumRows;
   const rawRows = database.prepare(`
     SELECT * FROM contact_submissions
     ORDER BY id ASC
     LIMIT ?
   `).all(safeLimit + 1);
-  if (rawRows.length > safeLimit) {
+  const rawSupersessions = database.prepare(`
+    SELECT * FROM crm_submission_supersessions
+    WHERE status = 'active'
+    ORDER BY id ASC
+    LIMIT ?
+  `).all(safeSupersessionLimit + 1);
+  if (rawRows.length > safeLimit || rawSupersessions.length > safeSupersessionLimit) {
     return {
       rows: [],
       rawRows: [],
+      supersessions: [],
+      rawSupersessions: [],
       count: null,
+      submissionCount: null,
+      supersessionCount: null,
       complete: false,
       revision: null,
       revisionVersion: dealHunterCrmMatchAuthorityVersion,
     };
   }
-  const columns = database.pragma('table_info(contact_submissions)')
+  const submissionColumns = database.pragma('table_info(contact_submissions)')
+    .map((column) => String(column.name))
+    .sort();
+  const supersessionColumns = database.pragma('table_info(crm_submission_supersessions)')
     .map((column) => String(column.name))
     .sort();
   const revisionPayload = JSON.stringify({
     version: dealHunterCrmMatchAuthorityVersion,
-    columns,
-    rows: rawRows.map((row) => columns.map((column) => row[column])),
+    submissions: {
+      columns: submissionColumns,
+      rows: rawRows.map((row) => submissionColumns.map((column) => row[column])),
+    },
+    activeSupersessions: {
+      columns: supersessionColumns,
+      rows: rawSupersessions.map((row) => supersessionColumns.map((column) => row[column])),
+    },
   });
   return {
     rows: rawRows.map(normalizeSubmissionRow),
     rawRows,
+    supersessions: rawSupersessions.map(normalizeCrmSubmissionSupersessionRow),
+    rawSupersessions,
     count: rawRows.length,
+    submissionCount: rawRows.length,
+    supersessionCount: rawSupersessions.length,
     complete: true,
     revision: createHash('sha256').update(revisionPayload).digest('hex'),
     revisionVersion: dealHunterCrmMatchAuthorityVersion,
@@ -6271,12 +6301,21 @@ export function createSqliteStorage(config) {
       return matchedRow ? normalizeSubmissionRow(matchedRow) : null;
     },
 
-    async readDealHunterCrmMatchAuthority({ limit = dealHunterCrmMatchAuthorityMaximumRows } = {}) {
-      const read = database.transaction(() => dealHunterCrmMatchAuthoritySnapshot(database, { limit }));
+    async readDealHunterCrmMatchAuthority({
+      limit = dealHunterCrmMatchAuthorityMaximumRows,
+      supersessionLimit = crmSubmissionSupersessionMaximumRows,
+    } = {}) {
+      const read = database.transaction(() => dealHunterCrmMatchAuthoritySnapshot(database, {
+        limit,
+        supersessionLimit,
+      }));
       const snapshot = read.deferred();
       return {
         rows: snapshot.rows,
+        supersessions: snapshot.supersessions,
         count: snapshot.count,
+        submissionCount: snapshot.submissionCount,
+        supersessionCount: snapshot.supersessionCount,
         complete: snapshot.complete,
         revision: snapshot.revision,
         revisionVersion: snapshot.revisionVersion,
@@ -9798,10 +9837,10 @@ export function createSqliteStorage(config) {
     } = {}) {
       const timestamp = updatedAt || new Date().toISOString();
       const transaction = database.transaction(() => {
-        assertCrmSubmissionWritableInTransaction(submissionId);
         const candidateIds = [submissionId];
         const authority = dealHunterCrmMatchAuthoritySnapshot(database, {
           limit: dealHunterCrmMatchAuthorityMaximumRows,
+          supersessionLimit: crmSubmissionSupersessionMaximumRows,
         });
         if (!authority.complete
           || typeof expectedAuthorityRevision !== 'string'
@@ -9809,6 +9848,7 @@ export function createSqliteStorage(config) {
           || authority.revision !== expectedAuthorityRevision) {
           throw dealHunterCrmMatchAuthorityError({ candidateIds });
         }
+        assertCrmSubmissionWritableInTransaction(submissionId);
 
         const opportunity = database.prepare(`
           SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1

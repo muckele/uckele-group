@@ -4082,7 +4082,10 @@ async function listCompleteDealHunterCrmCandidates(storage) {
     );
   }
   try {
-    result = await storage.readDealHunterCrmMatchAuthority({ limit: dealHunterCrmMatchMaximumRows });
+    result = await storage.readDealHunterCrmMatchAuthority({
+      limit: dealHunterCrmMatchMaximumRows,
+      supersessionLimit: dealHunterCrmMatchMaximumRows,
+    });
   } catch (error) {
     if (normalizeText(error?.code, 120).startsWith('CRM_MATCH_')) throw error;
     throw dealHunterCrmMatchError(
@@ -4101,10 +4104,12 @@ async function listCompleteDealHunterCrmCandidates(storage) {
       { status: 503, candidateIds, evidenceCategories: ['lookup-incomplete'] },
     );
   }
-  const reportedTotal = Number(result?.count);
+  const reportedTotal = Number(result?.submissionCount ?? result?.count);
+  const supersessions = Array.isArray(result?.supersessions) ? result.supersessions : [];
+  const reportedSupersessionTotal = Number(result?.supersessionCount ?? supersessions.length);
   if (!result || !Array.isArray(result.rows)
-    || result.count === null || result.count === undefined
-    || !Number.isInteger(reportedTotal) || reportedTotal < 0) {
+    || !Number.isInteger(reportedTotal) || reportedTotal < 0
+    || !Number.isInteger(reportedSupersessionTotal) || reportedSupersessionTotal < 0) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_LOOKUP_FAILED',
       'CRM matching received an invalid candidate lookup result, so no record was selected.',
@@ -4115,9 +4120,35 @@ async function listCompleteDealHunterCrmCandidates(storage) {
   for (const row of result.rows) {
     if (row?.id) rowsById.set(row.id, row);
   }
+  const supersessionsById = new Map();
+  const survivorByLoser = new Map();
+  const activeLoserIds = new Set();
+  const activeSurvivorIds = new Set();
+  for (const relation of supersessions) {
+    const relationId = normalizeText(relation?.id, 300);
+    const loserId = normalizeText(relation?.supersededSubmissionId, 300);
+    const survivorId = normalizeText(relation?.survivorSubmissionId, 300);
+    if (!relationId || !loserId || !survivorId || loserId === survivorId
+      || relation?.status !== 'active' || supersessionsById.has(relationId)
+      || survivorByLoser.has(loserId) || !rowsById.has(loserId) || !rowsById.has(survivorId)) {
+      throw dealHunterCrmMatchError(
+        'CRM_MATCH_LOOKUP_INCOMPLETE',
+        'CRM matching received an invalid supersession authority snapshot, so no record was selected.',
+        { status: 503, candidateIds: [loserId, survivorId], evidenceCategories: ['lookup-incomplete'] },
+      );
+    }
+    supersessionsById.set(relationId, relation);
+    survivorByLoser.set(loserId, survivorId);
+    activeLoserIds.add(loserId);
+    activeSurvivorIds.add(survivorId);
+  }
   if (reportedTotal > dealHunterCrmMatchMaximumRows
+    || reportedSupersessionTotal > dealHunterCrmMatchMaximumRows
     || result.rows.length !== reportedTotal
     || rowsById.size !== reportedTotal
+    || supersessions.length !== reportedSupersessionTotal
+    || supersessionsById.size !== reportedSupersessionTotal
+    || [...activeSurvivorIds].some((submissionId) => activeLoserIds.has(submissionId))
     || !/^[a-f0-9]{64}$/.test(String(result.revision || ''))) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_LOOKUP_INCOMPLETE',
@@ -4125,7 +4156,13 @@ async function listCompleteDealHunterCrmCandidates(storage) {
       { status: 503, candidateIds: [...rowsById.keys()], evidenceCategories: ['lookup-incomplete'] },
     );
   }
-  return { rows: [...rowsById.values()], revision: result.revision };
+  return {
+    rows: [...rowsById.values()],
+    rowsById,
+    supersessions,
+    survivorByLoser,
+    revision: result.revision,
+  };
 }
 
 function dealHunterCrmMatchResult(status, submission = null, candidates = [], authorityRevision = '') {
@@ -4133,6 +4170,7 @@ function dealHunterCrmMatchResult(status, submission = null, candidates = [], au
     .map((candidate) => ({
       submissionId: candidate.submission.id,
       evidenceCategories: [...candidate.evidenceCategories].sort(),
+      evidenceOriginSubmissionIds: [...(candidate.evidenceOriginSubmissionIds || [candidate.submission.id])].sort(),
     }))
     .sort((left, right) => left.submissionId.localeCompare(right.submissionId));
   const result = {
@@ -4271,6 +4309,19 @@ export async function findExistingDealHunterSubmission(storage, deal) {
 
   const authority = await listCompleteDealHunterCrmCandidates(storage);
   if (opportunity?.primary_submission_id) {
+      if (authority.survivorByLoser.has(opportunity.primary_submission_id)) {
+        throw dealHunterCrmMatchError(
+          'CRM_MATCH_AUTHORITY_CONFLICT',
+          'The canonical opportunity primary is an active historical CRM record and requires operator review.',
+          {
+            candidateIds: [
+              opportunity.primary_submission_id,
+              authority.survivorByLoser.get(opportunity.primary_submission_id),
+            ],
+            evidenceCategories: ['canonical-primary', 'supersession-conflict'],
+          },
+        );
+      }
       const primary = authority.rows.find((row) => row.id === opportunity.primary_submission_id);
       if (!primary) {
         throw dealHunterCrmMatchError(
@@ -4297,6 +4348,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
       return dealHunterCrmMatchResult('unique-exact', primary, [{
         submission: primary,
         evidenceCategories: new Set(['canonical-primary']),
+        evidenceOriginSubmissionIds: new Set([primary.id]),
       }], authority.revision);
   }
   const listingAliases = uniqueStrings([
@@ -4331,7 +4383,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
 
   for (const row of authority.rows) addCandidate(row);
 
-  const classified = [];
+  const classifiedBySurvivor = new Map();
   for (const submission of candidates.values()) {
     const stored = crmSubmissionStoredDeal(submission);
     const listingMatch = stored.storedListings.some((listingUrl) => (
@@ -4365,9 +4417,35 @@ export async function findExistingDealHunterSubmission(storage, deal) {
         { candidateIds: [submission.id], evidenceCategories: ['identity-conflict', ...identityConflicts, ...evidenceCategories] },
       );
     }
-    classified.push({ submission, tier, evidenceCategories });
+    const survivorId = authority.survivorByLoser.get(submission.id) || submission.id;
+    const survivor = authority.rowsById.get(survivorId);
+    if (!survivor || authority.survivorByLoser.has(survivorId)) {
+      throw dealHunterCrmMatchError(
+        'CRM_MATCH_LOOKUP_INCOMPLETE',
+        'CRM matching could not resolve a direct current CRM survivor from its reviewed authority.',
+        {
+          status: 503,
+          candidateIds: [submission.id, survivorId],
+          evidenceCategories: ['lookup-incomplete', 'supersession-conflict'],
+        },
+      );
+    }
+    const existing = classifiedBySurvivor.get(survivorId);
+    if (!existing) {
+      classifiedBySurvivor.set(survivorId, {
+        submission: survivor,
+        tier,
+        evidenceCategories: new Set(evidenceCategories),
+        evidenceOriginSubmissionIds: new Set([submission.id]),
+      });
+      continue;
+    }
+    existing.tier = Math.min(existing.tier, tier);
+    for (const category of evidenceCategories) existing.evidenceCategories.add(category);
+    existing.evidenceOriginSubmissionIds.add(submission.id);
   }
 
+  const classified = [...classifiedBySurvivor.values()];
   if (classified.length === 0) return dealHunterCrmMatchResult('none', null, [], authority.revision);
   for (const candidate of classified) {
     assertDealHunterCrmSubmissionOwnership(candidate.submission, deal.opportunityId || '');
