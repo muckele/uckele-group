@@ -5274,6 +5274,110 @@ export function createSqliteStorage(config) {
 	    WHERE id = @id
 	  `);
 
+    function selectDealHunterCrmImportRow({ id = '', opportunityId = '', dealKey = '', listingIdentity = '' } = {}) {
+      const lookups = [
+        ['opportunity_id', opportunityId],
+        ['id', id],
+        ['deal_key', dealKey],
+        ['listing_identity', listingIdentity],
+      ];
+      for (const [field, value] of lookups) {
+        if (!value) continue;
+        const row = database.prepare(`SELECT * FROM deal_hunter_crm_imports WHERE ${field} = ? ORDER BY updated_at DESC LIMIT 1`).get(value);
+        if (row) return row;
+      }
+      return null;
+    }
+
+    const claimDealHunterCrmImportTransaction = database.transaction(({ record, pendingCutoff = '' }) => {
+      const serializedRecord = serializeDealHunterCrmImport(record);
+      let existing = selectDealHunterCrmImportRow({
+        id: record.id,
+        opportunityId: record.opportunity_id,
+        dealKey: record.deal_key,
+        listingIdentity: record.listing_identity,
+      });
+
+      if (existing?.submission_id) {
+        assertCrmSubmissionWritableInTransaction(existing.submission_id);
+      }
+
+      if (!existing) {
+        if (serializedRecord.submission_id) {
+          assertCrmSubmissionWritableInTransaction(serializedRecord.submission_id);
+        }
+        try {
+          insertDealHunterCrmImportStatement.run(serializedRecord);
+          return {
+            claimed: true,
+            importRecord: normalizeDealHunterCrmImportRow(selectDealHunterCrmImportRow({ id: record.id })),
+          };
+        } catch (error) {
+          if (error?.code !== 'SQLITE_CONSTRAINT_UNIQUE' && error?.code !== 'SQLITE_CONSTRAINT_PRIMARYKEY') {
+            throw error;
+          }
+          existing = selectDealHunterCrmImportRow({
+            id: record.id,
+            opportunityId: record.opportunity_id,
+            dealKey: record.deal_key,
+            listingIdentity: record.listing_identity,
+          });
+          if (existing?.submission_id) {
+            assertCrmSubmissionWritableInTransaction(existing.submission_id);
+          }
+        }
+      }
+
+      const claimTarget = existing
+        ? { ...serializedRecord, id: existing.id, pending_cutoff: pendingCutoff || '' }
+        : { ...serializedRecord, pending_cutoff: pendingCutoff || '' };
+      const updateResult = existing
+        ? claimDealHunterCrmImportStatement.run(claimTarget)
+        : { changes: 0 };
+      return {
+        claimed: updateResult.changes > 0,
+        importRecord: normalizeDealHunterCrmImportRow(selectDealHunterCrmImportRow({
+          id: existing?.id || record.id,
+          opportunityId: record.opportunity_id,
+          dealKey: record.deal_key,
+          listingIdentity: record.listing_identity,
+        })),
+      };
+    });
+
+    const updateDealHunterCrmImportTransaction = database.transaction(({ id, values = {} }) => {
+      const current = database.prepare('SELECT * FROM deal_hunter_crm_imports WHERE id = ? LIMIT 1').get(id);
+      if (!current) return null;
+
+      const sourceSubmissionId = String(current.submission_id || '').trim();
+      if (sourceSubmissionId) {
+        assertCrmSubmissionWritableInTransaction(sourceSubmissionId);
+      }
+
+      const targetSubmissionId = Object.hasOwn(values, 'submission_id')
+        ? String(values.submission_id || '').trim()
+        : '';
+      if (targetSubmissionId && targetSubmissionId !== sourceSubmissionId) {
+        assertCrmSubmissionWritableInTransaction(targetSubmissionId);
+      }
+
+      updateDealHunterCrmImportStatement.run({
+        id,
+        updated_at: values.updated_at || null,
+        opportunity_id: values.opportunity_id || null,
+        listing_identity: values.listing_identity || null,
+        listing_url: values.listing_url || null,
+        submission_id: values.submission_id || null,
+        status: values.status || null,
+        source_name: values.source_name || null,
+        metadata: values.metadata ? JSON.stringify(values.metadata) : null,
+      });
+
+      return normalizeDealHunterCrmImportRow(
+        database.prepare('SELECT * FROM deal_hunter_crm_imports WHERE id = ? LIMIT 1').get(id),
+      );
+    });
+
   const upsertDealHunterDispositionStatement = database.prepare(`
     INSERT INTO deal_hunter_dispositions (
       id, deal_key, submission_id, communication_id, listing_url, deal_name,
@@ -7836,20 +7940,9 @@ export function createSqliteStorage(config) {
 	        return null;
 	      }
 
-        const lookups = [
-          ['opportunity_id', opportunityId],
-          ['id', id],
-          ['deal_key', dealKey],
-          ['listing_identity', listingIdentity],
-        ];
-        let row = null;
-        for (const [field, value] of lookups) {
-          if (!value) continue;
-          row = database.prepare(`SELECT * FROM deal_hunter_crm_imports WHERE ${field} = ? ORDER BY updated_at DESC LIMIT 1`).get(value);
-          if (row) break;
-        }
-
-	      return normalizeDealHunterCrmImportRow(row);
+	      return normalizeDealHunterCrmImportRow(selectDealHunterCrmImportRow({
+          id, opportunityId, dealKey, listingIdentity,
+        }));
 	    },
 
       async getDealHunterCanonicalCrmOwnershipHealth() {
@@ -8978,49 +9071,7 @@ export function createSqliteStorage(config) {
 	      if (!canonicalCrmOwnershipHealthy) {
           throw new Error('Canonical CRM ownership has duplicate opportunity claims. Run the integrity audit before reconciliation.');
         }
-	      const serializedRecord = serializeDealHunterCrmImport(record);
-
-	      try {
-	        insertDealHunterCrmImportStatement.run(serializedRecord);
-	      } catch (error) {
-	        if (error?.code !== 'SQLITE_CONSTRAINT_UNIQUE' && error?.code !== 'SQLITE_CONSTRAINT_PRIMARYKEY') {
-	          throw error;
-	        }
-
-	        const existingImport = await this.getDealHunterCrmImport({
-	          id: record.id,
-	          opportunityId: record.opportunity_id,
-	          dealKey: record.deal_key,
-	          listingIdentity: record.listing_identity,
-	        });
-	        const claimTarget = existingImport
-	          ? { ...serializedRecord, id: existingImport.id, pending_cutoff: pendingCutoff || '' }
-	          : { ...serializedRecord, pending_cutoff: pendingCutoff || '' };
-	        const updateResult = existingImport
-	          ? claimDealHunterCrmImportStatement.run(claimTarget)
-	          : { changes: 0 };
-	        const currentImport = await this.getDealHunterCrmImport({
-	          id: existingImport?.id || record.id,
-	          opportunityId: record.opportunity_id,
-	          dealKey: record.deal_key,
-	          listingIdentity: record.listing_identity,
-	        });
-
-	        return {
-	          claimed: updateResult.changes > 0,
-	          importRecord: currentImport,
-	        };
-	      }
-
-	      return {
-	        claimed: true,
-	        importRecord: await this.getDealHunterCrmImport({
-	          id: record.id,
-	          opportunityId: record.opportunity_id,
-	          dealKey: record.deal_key,
-	          listingIdentity: record.listing_identity,
-	        }),
-	      };
+	      return claimDealHunterCrmImportTransaction.immediate({ record, pendingCutoff });
 	    },
 
 	    async updateDealHunterCrmImport(id, values = {}) {
@@ -9028,19 +9079,7 @@ export function createSqliteStorage(config) {
 	        return null;
 	      }
 
-	      updateDealHunterCrmImportStatement.run({
-	        id,
-	        updated_at: values.updated_at || null,
-	        opportunity_id: values.opportunity_id || null,
-	        listing_identity: values.listing_identity || null,
-	        listing_url: values.listing_url || null,
-	        submission_id: values.submission_id || null,
-	        status: values.status || null,
-	        source_name: values.source_name || null,
-	        metadata: values.metadata ? JSON.stringify(values.metadata) : null,
-	      });
-
-	      return this.getDealHunterCrmImport({ id });
+	      return updateDealHunterCrmImportTransaction.immediate({ id, values });
 	    },
 
     async inspectDealHunterCanonicalOpportunityMerge({ approval, actor = '', reason = '' } = {}) {

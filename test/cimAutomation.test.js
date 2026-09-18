@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,6 +22,24 @@ import {
   recordCimReviewDecisions,
 } from '../server/services/cimAutomation.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
+
+function sqliteApplicationDigest(sqlitePath) {
+  const database = new Database(sqlitePath, { readonly: true, fileMustExist: true });
+  try {
+    const tables = database.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `).all().map(({ name }) => name);
+    const snapshot = Object.fromEntries(tables.map((name) => [
+      name,
+      database.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all(),
+    ]));
+    return createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
+  } finally {
+    database.close();
+  }
+}
 
 function automationConfig(stage = 2) {
   return {
@@ -736,9 +755,11 @@ test('real SQLite final Stage 2 authority rejects a primary that became an activ
     secondConnection.close();
   }
 
+  const beforeRefusal = sqliteApplicationDigest(sqlitePath);
   const result = await callBoundary();
   assert.equal(result.ok, false);
   assert.equal(result.code, 'opportunity_primary_superseded');
+  assert.equal(sqliteApplicationDigest(sqlitePath), beforeRefusal, 'final Stage 2 loser authority is read-only across every application table');
   assert.equal(
     (await storage.getCurrentDealHunterOpportunity('opp-stage2-authority')).primary_submission_id,
     'stage2-loser',

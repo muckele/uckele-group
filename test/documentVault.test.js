@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
+import Database from 'better-sqlite3';
+import { createHash } from 'node:crypto';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-document-vault-'));
 
@@ -64,6 +66,48 @@ function readCleanupSidecars() {
       if (!fs.existsSync(sidecarPath)) return [];
       return [{ path: sidecarPath, job: JSON.parse(fs.readFileSync(sidecarPath, 'utf8')) }];
     });
+}
+
+function applicationTableDigest(sqlitePath = process.env.SQLITE_PATH) {
+  const database = new Database(sqlitePath, { readonly: true, fileMustExist: true });
+  try {
+    const tables = database.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `).all().map(({ name }) => name);
+    const snapshot = Object.fromEntries(tables.map((name) => [
+      name,
+      database.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all(),
+    ]));
+    return createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
+  } finally {
+    database.close();
+  }
+}
+
+function secureDocumentFilesystemDigest(root = process.env.SECURE_DOCUMENTS_STORAGE_DIR) {
+  if (!fs.existsSync(root)) return createHash('sha256').update('missing').digest('hex');
+  const entries = [];
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+      const entryPath = path.join(directory, entry.name);
+      const relative = path.relative(root, entryPath);
+      if (entry.isDirectory()) {
+        entries.push(['directory', relative, fs.statSync(entryPath).mode & 0o777]);
+        visit(entryPath);
+      } else {
+        entries.push([
+          'file',
+          relative,
+          fs.statSync(entryPath).mode & 0o777,
+          createHash('sha256').update(fs.readFileSync(entryPath)).digest('hex'),
+        ]);
+      }
+    }
+  };
+  visit(root);
+  return createHash('sha256').update(JSON.stringify(entries)).digest('hex');
 }
 
 function afterCleanupSettlement(options = {}) {
@@ -897,10 +941,11 @@ test('ambiguous upload writes a private recovery sidecar when cleanup storage is
 });
 
 test('secure upload attempts are rate limited by token and source', async () => {
+  const { token } = await createUploadToken('rate-limited-valid-token@example.com');
   const request = requestFromIp('192.0.2.30');
   const body = {
-    token: 'not-a-real-token',
-    ndaAccepted: true,
+    token,
+    ndaAccepted: false,
     request,
     documents: [
       {
@@ -1026,6 +1071,160 @@ test('individual document deletion refuses loser-owned history before cleanup st
   assert.equal(fs.existsSync(sourcePath), true);
   assert.equal(fs.readFileSync(sourcePath, 'utf8'), 'historical evidence');
   assert.deepEqual(readCleanupSidecars(), cleanupSidecarsBefore);
+});
+
+test('valid loser upload token refuses before rate-limit, database, or filesystem mutation while survivor upload remains enabled', async () => {
+  const storage = getStorage();
+  const survivorResult = await createManualSubmission({
+    company: 'Upload Survivor Control', seller_name: 'Survivor', seller_email: 'upload-survivor-control@example.com',
+  }, 'admin-test');
+  const loserResult = await createManualSubmission({
+    company: 'Upload Historical Duplicate', seller_name: 'Loser', seller_email: 'upload-historical-duplicate@example.com',
+  }, 'admin-test');
+  assert.equal(survivorResult.ok, true);
+  assert.equal(loserResult.ok, true);
+
+  const opportunityId = 'document-vault-supersession-opportunity';
+  await storage.updateSubmission(survivorResult.submission.id, {
+    updated_at: new Date().toISOString(),
+    deal_hunter_opportunity_id: opportunityId,
+  });
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: opportunityId,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    canonical_name: 'Upload Survivor Control',
+    canonical_recipient: 'upload-survivor-control@example.com',
+    canonical_location: null,
+    primary_submission_id: survivorResult.submission.id,
+    identity_version: 'document-vault-test-v1',
+    status: 'active',
+    metadata: {},
+  });
+
+  const loserRequest = await createSecureUploadRequest({
+    submissionId: loserResult.submission.id,
+    requestedBy: 'admin-test',
+    sendEmail: false,
+    request: requestFromIp('192.0.2.201'),
+  });
+  assert.equal(loserRequest.ok, true);
+  const loserToken = new URL(loserRequest.uploadUrl).searchParams.get('token');
+  const receiptDigest = 'd'.repeat(64);
+  await storage.upsertDealHunterCimRepairManifest({
+    id: 'document-vault-supersession-receipt',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    mode: 'crm-duplicate-consolidation',
+    status: 'applied',
+    actor: 'test',
+    backup_reference: 'fixture',
+    checksum: receiptDigest,
+    manifest: { version: 1 },
+    metadata: {},
+  });
+  const database = new Database(process.env.SQLITE_PATH);
+  database.prepare(`
+    INSERT INTO crm_submission_supersessions (
+      id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
+      opportunity_id, reason_code, reason_text, approved_by, approved_at, actor,
+      repair_version, repair_manifest_id, repair_digest, metadata
+    ) VALUES (?, ?, ?, 'active', ?, ?, ?, 'confirmed-duplicate', ?, ?, ?, ?, ?, ?, ?, '{}')
+  `).run(
+    'document-vault-supersession-relation',
+    new Date().toISOString(),
+    new Date().toISOString(),
+    survivorResult.submission.id,
+    loserResult.submission.id,
+    opportunityId,
+    'Reviewed duplicate upload test.',
+    'owner@example.test',
+    new Date().toISOString(),
+    'test',
+    'document-vault-test-v1',
+    'document-vault-supersession-receipt',
+    receiptDigest,
+  );
+  database.close();
+
+  const beforeDatabaseDigest = applicationTableDigest();
+  const beforeFilesystemDigest = secureDocumentFilesystemDigest();
+  const beforeRateLimitRows = new Database(process.env.SQLITE_PATH, { readonly: true, fileMustExist: true });
+  const rateLimitCount = Number(beforeRateLimitRows.prepare('SELECT COUNT(*) AS count FROM contact_rate_limit_events').get().count);
+  beforeRateLimitRows.close();
+
+  const historicalContext = await getSecureUploadContext(loserToken);
+  assert.equal(historicalContext.ok, true, 'access-token context remains a read-only historical projection');
+  assert.equal(historicalContext.request.submission_id, loserResult.submission.id);
+  assert.equal(applicationTableDigest(), beforeDatabaseDigest, 'read-only loser token context must not mutate business tables');
+  assert.equal(secureDocumentFilesystemDigest(), beforeFilesystemDigest);
+
+  await assert.rejects(
+    () => createSecureUploadRequest({
+      submissionId: loserResult.submission.id,
+      requestedBy: 'admin-test',
+      sendEmail: false,
+      request: requestFromIp('192.0.2.205'),
+    }),
+    {
+      code: 'CRM_SUBMISSION_SUPERSEDED',
+      submissionId: loserResult.submission.id,
+      survivorSubmissionId: survivorResult.submission.id,
+      opportunityId,
+    },
+  );
+  assert.equal(applicationTableDigest(), beforeDatabaseDigest, 'loser secure-request creation must refuse before durable mutation');
+  assert.equal(secureDocumentFilesystemDigest(), beforeFilesystemDigest);
+
+  await assert.rejects(
+    () => uploadSecureDocuments({
+      token: loserToken,
+      ndaAccepted: true,
+      request: requestFromIp('192.0.2.202'),
+      documents: [{
+        name: 'must-not-write.txt',
+        mimeType: 'text/plain',
+        contentBase64: Buffer.from('must not persist').toString('base64'),
+      }],
+    }),
+    {
+      code: 'CRM_SUBMISSION_SUPERSEDED',
+      status: 409,
+      submissionId: loserResult.submission.id,
+      survivorSubmissionId: survivorResult.submission.id,
+      opportunityId,
+    },
+  );
+
+  assert.equal(applicationTableDigest(), beforeDatabaseDigest, 'loser upload refusal must preserve every application table');
+  assert.equal(secureDocumentFilesystemDigest(), beforeFilesystemDigest, 'loser upload refusal must not create or change files');
+  const afterRateLimitRows = new Database(process.env.SQLITE_PATH, { readonly: true, fileMustExist: true });
+  assert.equal(
+    Number(afterRateLimitRows.prepare('SELECT COUNT(*) AS count FROM contact_rate_limit_events').get().count),
+    rateLimitCount,
+    'valid loser-token refusal must precede durable rate-limit bookkeeping',
+  );
+  afterRateLimitRows.close();
+
+  const survivorRequest = await createSecureUploadRequest({
+    submissionId: survivorResult.submission.id,
+    requestedBy: 'admin-test',
+    sendEmail: false,
+    request: requestFromIp('192.0.2.203'),
+  });
+  const survivorUpload = await uploadSecureDocuments({
+    token: new URL(survivorRequest.uploadUrl).searchParams.get('token'),
+    ndaAccepted: true,
+    request: requestFromIp('192.0.2.204'),
+    documents: [{
+      name: 'survivor-control.txt',
+      mimeType: 'text/plain',
+      contentBase64: Buffer.from('survivor write remains enabled').toString('base64'),
+    }],
+  });
+  assert.equal(survivorUpload.ok, true);
+  assert.equal(survivorUpload.documents.length, 1);
+  assert.equal(survivorUpload.documents[0].submission_id, survivorResult.submission.id);
 });
 
 test('individual deletion persists a write-ahead cleanup intent before staging the file', async () => {

@@ -399,6 +399,93 @@ test('second-connection supersession after an earlier service check is revalidat
   for (const invoke of cases) await assertLoserRefusal({ sqlitePath, invoke });
 });
 
+test('real SQLite CRM import claims refuse stale and failed cached loser ownership before bookkeeping changes', async (t) => {
+  for (const status of ['failed', 'pending']) {
+    const { storage, sqlitePath } = await fixture(t, { activateSupersession: false });
+    const database = new Database(sqlitePath);
+    const importId = `cached-loser-${status}`;
+    const staleAt = status === 'pending' ? '2026-09-17T16:00:00.000Z' : timestamp;
+    database.prepare(`
+      INSERT INTO deal_hunter_crm_imports (
+        id, created_at, updated_at, opportunity_id, deal_key, listing_identity,
+        listing_url, submission_id, status, source_name, metadata
+      ) VALUES (?, ?, ?, 'opportunity', ?, ?, ?, 'loser', ?, 'writer-matrix', ?)
+    `).run(
+      importId,
+      staleAt,
+      staleAt,
+      `cached-loser-${status}-deal`,
+      `writer-matrix:${status}`,
+      `https://example.test/${status}`,
+      status,
+      JSON.stringify({ marker: 'unchanged' }),
+    );
+    database.close();
+    activateRelation(sqlitePath);
+
+    const before = rawBusinessState(sqlitePath);
+    await assert.rejects(
+      () => storage.claimDealHunterCrmImport({
+        id: importId,
+        created_at: timestamp,
+        updated_at: '2026-09-17T19:00:00.000Z',
+        opportunity_id: 'opportunity',
+        deal_key: `cached-loser-${status}-deal`,
+        listing_identity: `writer-matrix:${status}`,
+        listing_url: `https://example.test/${status}`,
+        submission_id: null,
+        status: 'pending',
+        source_name: 'writer-matrix-refresh',
+        metadata: { marker: 'must-not-replace' },
+      }, { pendingCutoff: '2026-09-17T17:00:00.000Z' }),
+      { code: 'CRM_SUBMISSION_SUPERSEDED', submissionId: 'loser' },
+    );
+    assert.equal(rawBusinessState(sqlitePath), before, `${status} loser claim must not mutate any application table`);
+  }
+});
+
+test('ordinary real SQLite CRM import updates protect source and distinct target ownership without reparenting losers', async (t) => {
+  const { storage, sqlitePath } = await fixture(t, { activateSupersession: false });
+  const database = new Database(sqlitePath);
+  const insert = database.prepare(`
+    INSERT INTO deal_hunter_crm_imports (
+      id, created_at, updated_at, opportunity_id, deal_key, listing_identity,
+      listing_url, submission_id, status, source_name, metadata
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'linked', 'writer-matrix', '{}')
+  `);
+  insert.run('loser-import', timestamp, timestamp, 'opportunity', 'loser-import-deal', 'writer-matrix:loser', 'https://example.test/loser', 'loser');
+  insert.run('survivor-import', timestamp, timestamp, null, 'survivor-import-deal', 'writer-matrix:survivor', 'https://example.test/survivor', 'survivor');
+  database.close();
+  activateRelation(sqlitePath);
+
+  for (const values of [
+    { updated_at: '2026-09-17T19:00:00.000Z', metadata: { changed: true } },
+    { updated_at: '2026-09-17T19:00:00.000Z', submission_id: 'survivor', status: 'linked' },
+    { updated_at: '2026-09-17T19:00:00.000Z', submission_id: null, status: 'failed' },
+  ]) {
+    await assertLoserRefusal({
+      sqlitePath,
+      invoke: () => storage.updateDealHunterCrmImport('loser-import', values),
+    });
+  }
+
+  await assertLoserRefusal({
+    sqlitePath,
+    invoke: () => storage.updateDealHunterCrmImport('survivor-import', {
+      updated_at: '2026-09-17T19:00:00.000Z',
+      submission_id: 'loser',
+      status: 'linked',
+    }),
+  });
+
+  const survivorUpdated = await storage.updateDealHunterCrmImport('survivor-import', {
+    updated_at: '2026-09-17T19:00:00.000Z',
+    metadata: { survivorControl: true },
+  });
+  assert.equal(survivorUpdated.submission_id, 'survivor');
+  assert.deepEqual(survivorUpdated.metadata, { survivorControl: true });
+});
+
 test('source-field repair rejects the loser contact boundary without touching source or opportunity state', async (t) => {
   const { storage, sqlitePath } = await fixture(t);
   await assertLoserRefusal({

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test, { after } from 'node:test';
+import Database from 'better-sqlite3';
 
 process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
 process.env.DEAL_HUNTER_SHEET_CSV_URL = 'https://example.test/required-sheet.csv';
@@ -39,6 +41,18 @@ function reconciliationCsv() {
 
 function singleListingCsv() {
   return reconciliationCsv().split('\n').slice(0, 2).join('\n');
+}
+
+function sqliteTableDigests(sqlitePath, tableNames) {
+  const database = new Database(sqlitePath, { readonly: true, fileMustExist: true });
+  try {
+    return Object.fromEntries([...tableNames].sort().map((name) => [
+      name,
+      createHash('sha256').update(JSON.stringify(database.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all())).digest('hex'),
+    ]));
+  } finally {
+    database.close();
+  }
 }
 
 test('exact-import reconciliation remains blocked when the selected Deal OS import is stale', async (t) => {
@@ -785,6 +799,156 @@ test('reconciliation refuses a malformed durable CRM ownership claim result', as
   assert.equal((await storage.listDealHunterCrmImports({ limit: 100 })).length, 0);
   const [item] = await storage.listDealHunterCrmReconciliationItems(executed.run.id, { limit: 100 });
   assert.match(item.error, /durable CRM ownership claim returned an invalid result/i);
+});
+
+test('real SQLite reconciliation refuses stale and failed claims cached to an active loser without CRM/CIM effects', async (t) => {
+  const protectedTables = [
+    'contact_submissions',
+    'deal_hunter_crm_imports',
+    'deal_hunter_opportunities',
+    'deal_hunter_cim_requests',
+    'crm_communications',
+    'crm_email_outbox',
+    'email_events',
+  ];
+
+  for (const claimStatus of ['failed', 'pending']) {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), `ug-reconciliation-cached-loser-${claimStatus}-`));
+    const sqlitePath = path.join(directory, 'crm.sqlite');
+    const storage = createSqliteStorage({ storage: { sqlitePath } });
+    t.after(() => {
+      storage.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    });
+    const now = new Date();
+    const imported = await importDealOsExport({
+      fileBuffer: Buffer.from(singleListingCsv()),
+      fileName: `deal-os-reconciliation-cached-loser-${claimStatus}.csv`,
+      exportedAt: new Date(now.getTime() - 60 * 60 * 1000).toISOString(),
+      scope: 'saved-search',
+      coverageLabel: `Cached loser ${claimStatus} fixture`,
+      expectedRowCount: 1,
+      importedBy: 'admin@example.com',
+      storage,
+      now,
+    });
+    const initialPreview = await previewDealOsCrmReconciliation({
+      importId: imported.import.id,
+      requestedBy: 'admin@example.com',
+      storage,
+    });
+    assert.equal(initialPreview.ok, true);
+    const [deal] = [...initialPreview.dealsByOpportunity.values()];
+    assert.ok(deal?.opportunityId);
+    const survivor = await createManualSubmission({
+      company: deal.name,
+      seller_name: 'Reconciliation Cached Claim Broker',
+      seller_email: 'reconciliation-cached-claim@example.test',
+      listing_url: deal.listingUrl,
+      asking_price: `$${Number(deal.askingPrice).toLocaleString('en-US')}`,
+      ttm_revenue: `$${Number(deal.annualRevenue).toLocaleString('en-US')}`,
+      ttm_ebitda: `$${Number(deal.annualProfit).toLocaleString('en-US')}`,
+      status: 'review',
+      metadata: { dealHunter: { managed: true, opportunityId: deal.opportunityId, dealKey: deal.dealKey } },
+    }, 'reconciliation-test', { storage });
+    const loser = await createManualSubmission({
+      company: `Unrelated reconciliation history ${claimStatus}`,
+      seller_email: `reconciliation-loser-${claimStatus}@example.test`,
+      listing_url: `https://example.test/reconciliation-unrelated-${claimStatus}`,
+      status: 'review',
+      metadata: {},
+    }, 'reconciliation-test', { storage });
+    assert.equal(survivor.ok, true);
+    assert.equal(loser.ok, true);
+    await storage.updateSubmission(survivor.submission.id, {
+      updated_at: new Date().toISOString(),
+      deal_hunter_opportunity_id: deal.opportunityId,
+    });
+    const currentOpportunity = await storage.getDealHunterOpportunity(deal.opportunityId);
+    await storage.upsertDealHunterOpportunity({
+      ...currentOpportunity,
+      updated_at: new Date().toISOString(),
+      primary_submission_id: survivor.submission.id,
+    });
+    const receiptDigest = createHash('sha256').update(`reconciliation-${claimStatus}`).digest('hex');
+    await storage.upsertDealHunterCimRepairManifest({
+      id: `reconciliation-${claimStatus}-receipt`, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      mode: 'crm-duplicate-consolidation', status: 'applied', actor: 'test', backup_reference: 'fixture',
+      checksum: receiptDigest, manifest: { version: 1 }, metadata: {},
+    });
+    const staleAt = claimStatus === 'pending'
+      ? new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()
+      : new Date().toISOString();
+    let database = new Database(sqlitePath);
+    database.prepare(`
+      INSERT INTO deal_hunter_crm_imports (
+        id, created_at, updated_at, opportunity_id, deal_key, listing_identity,
+        listing_url, submission_id, status, source_name, metadata
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'deal-os', '{}')
+    `).run(
+      `reconciliation-${claimStatus}-import`, staleAt, staleAt, deal.opportunityId, deal.dealKey,
+      `reconciliation:${claimStatus}`, deal.listingUrl, survivor.submission.id, claimStatus,
+    );
+    database.close();
+
+    const preview = await previewDealOsCrmReconciliation({
+      importId: imported.import.id,
+      requestedBy: 'admin@example.com',
+      storage,
+    });
+    assert.equal(preview.ok, true);
+    assert.equal(preview.items.length, 1);
+
+    const realClaim = storage.claimDealHunterCrmImport.bind(storage);
+    let claimCalls = 0;
+    let authorityRaceDigest = null;
+    storage.claimDealHunterCrmImport = async (...args) => {
+      claimCalls += 1;
+      database = new Database(sqlitePath);
+      database.prepare(`
+        UPDATE deal_hunter_crm_imports
+        SET submission_id = ?, status = ?, updated_at = ?
+        WHERE opportunity_id = ?
+      `).run(loser.submission.id, claimStatus, staleAt, deal.opportunityId);
+      database.prepare(`
+        INSERT INTO crm_submission_supersessions (
+          id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
+          opportunity_id, reason_code, reason_text, approved_by, approved_at, actor,
+          repair_version, repair_manifest_id, repair_digest, metadata
+        ) VALUES (?, ?, ?, 'active', ?, ?, ?, 'confirmed-duplicate', 'Reviewed duplicate.',
+          'owner@example.test', ?, 'test', 'reconciliation-cached-loser-v1', ?, ?, '{}')
+      `).run(
+        `reconciliation-${claimStatus}-relation`, new Date().toISOString(), new Date().toISOString(),
+        survivor.submission.id, loser.submission.id, deal.opportunityId, new Date().toISOString(),
+        `reconciliation-${claimStatus}-receipt`, receiptDigest,
+      );
+      database.close();
+      authorityRaceDigest = sqliteTableDigests(sqlitePath, protectedTables);
+      return realClaim(...args);
+    };
+
+    const executed = await executeDealOsCrmReconciliation({
+      importId: imported.import.id,
+      planDigest: preview.planDigest,
+      previewGeneratedAt: preview.generatedAt,
+      expectedOpportunityIds: preview.expectedOpportunityIds,
+      confirmation: preview.confirmationRequired,
+      requestedBy: 'admin@example.com',
+      storage,
+    });
+    assert.equal(executed.ok, false);
+    assert.equal(executed.status, 207);
+    assert.equal(executed.resultCounts.failed, 1);
+    assert.equal(executed.resultCounts.created, 0);
+    assert.equal(executed.resultCounts.updated, 0);
+    assert.equal(claimCalls, 1);
+    assert.ok(authorityRaceDigest);
+    assert.deepEqual(
+      sqliteTableDigests(sqlitePath, protectedTables),
+      authorityRaceDigest,
+      `cached ${claimStatus} loser claim must preserve protected CRM/CIM tables after authority invalidation`,
+    );
+  }
 });
 
 test('Deal OS preview exposes CRM ambiguity and execution blocks before claims or run bookkeeping', async (t) => {

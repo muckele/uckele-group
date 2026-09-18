@@ -747,12 +747,6 @@ export async function getSecureDocumentDownload(documentId, storage = getStorage
 export async function uploadSecureDocuments({ token, ndaAccepted, note = '', documents, completeRequest = false, request }) {
   const config = getConfig();
   const storage = getStorage();
-  const rateLimitResult = await enforceSecureUploadAttemptRateLimit({ token, request });
-
-  if (!rateLimitResult.ok) {
-    return rateLimitResult;
-  }
-
   const context = await getSecureUploadContext(token);
 
   if (!context.ok) {
@@ -760,6 +754,12 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
   }
 
   await assertCrmSubmissionWritable({ storage, submissionId: context.request.submission_id });
+
+  const rateLimitResult = await enforceSecureUploadAttemptRateLimit({ token, request });
+
+  if (!rateLimitResult.ok) {
+    return rateLimitResult;
+  }
 
   context.request = await recoverStaleUploadRequest(storage, context.request);
 
