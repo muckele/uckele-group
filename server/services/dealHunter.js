@@ -10497,6 +10497,20 @@ export async function sendDealHunterCimRequest({ dealKey = '', snapshotToken = '
     return { ok: false, status: 400, error: 'The CIM request does not match the signed approval queue.' };
   }
 
+  try {
+    const opportunity = await storage.getCurrentDealHunterOpportunity?.(snapshotDeal.opportunityId);
+    if (opportunity?.primary_submission_id) {
+      await assertCrmSubmissionWritable({ storage, submissionId: opportunity.primary_submission_id });
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      status: Number(error?.status) || 500,
+      ...(error?.code ? publicDealHunterCrmMatchBlocker(error) : {}),
+      error: error?.message || 'Current CRM authority could not be verified before sending this CIM request.',
+    };
+  }
+
   let result = null;
 
   try {

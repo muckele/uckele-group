@@ -191,11 +191,17 @@ function defaultGreeting(authority) {
   return name ? `Hello ${name},` : 'Hello,';
 }
 
-function requestBelongsToRoute(authority, opportunityId, requestId) {
+function requestBelongsToStableRoute(authority, opportunityId, requestId) {
   return Boolean(
     authority.request
     && authority.request.id === requestId
-    && authority.request.opportunity_id === opportunityId
+    && authority.request.opportunity_id === opportunityId,
+  );
+}
+
+function requestBelongsToRoute(authority, opportunityId, requestId) {
+  return Boolean(
+    requestBelongsToStableRoute(authority, opportunityId, requestId)
     && authority.existingRequest?.id === requestId
     && text(authority.opportunity?.status, 80).toLowerCase() === 'active'
     && authority.submission
@@ -371,6 +377,7 @@ export async function stopDealHunterManualFollowUps({
   try { parsed = parseManualFollowUpStopInput(input ?? (reason === undefined ? {} : { reason })); } catch (error) { return publicFailure('invalid_stop_input', error.message, 400); }
   if (!isAdministrator(session)) return publicFailure('administrator_required', 'Administrator access is required.', 403);
   const authority = await loadDealHunterManualFollowUpAuthority({ opportunityId, requestId, storage, now, dependencies });
+  if (!requestBelongsToStableRoute(authority, text(opportunityId, 200), text(requestId, 200))) return routeFailure(authority);
   if (!isOperatorApprovedFollowUpRequest(authority.request)) return publicFailure('approval_required', 'This request is not enrolled in manual follow-ups.');
   if (authority.request.follow_up_state === 'completed' || Number(authority.request.follow_up_count) >= 5) return publicFailure('already_finalized', 'The follow-up sequence is complete.');
   if (authority.request.follow_up_state === 'stopped' || authority.request.metadata?.manualFollowUp?.stoppedAt) {
@@ -717,6 +724,7 @@ export async function approveDealHunterManualFollowUp({
     return publicFailure('proposal_digest_mismatch', 'The approved proposal digest does not match the signed preparation.');
   }
   const authority = await loadDealHunterManualFollowUpAuthority({ opportunityId: canonicalOpportunityId, requestId: canonicalRequestId, storage, now: at, dependencies });
+  if (!requestBelongsToStableRoute(authority, canonicalOpportunityId, canonicalRequestId)) return routeFailure(authority);
   if (!isOperatorApprovedFollowUpRequest(authority.request)) return publicFailure('approval_required', 'This request is not enrolled in human-approved follow-ups.');
   const reconciliation = await reconcileDealHunterApprovedFollowUp({
     storage,

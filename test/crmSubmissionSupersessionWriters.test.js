@@ -694,6 +694,8 @@ test('real HTTP secure upload refuses a stale loser before recovery and recovers
   database.close();
 
   const createBefore = rawBusinessState(process.env.SQLITE_PATH);
+  const createFilesBefore = filesystemSnapshot(process.env.SECURE_DOCUMENTS_STORAGE_DIR);
+  const createProviderCountBefore = matrixProviderCalls.length;
   await assert.rejects(() => createSecureUploadRequest({
     submissionId: loserResult.submission.id,
     requestedBy: 'writer-matrix',
@@ -704,6 +706,8 @@ test('real HTTP secure upload refuses a stale loser before recovery and recovers
     submissionId: loserResult.submission.id,
   });
   assert.equal(rawBusinessState(process.env.SQLITE_PATH), createBefore);
+  assert.deepEqual(filesystemSnapshot(process.env.SECURE_DOCUMENTS_STORAGE_DIR), createFilesBefore);
+  assert.equal(matrixProviderCalls.length, createProviderCountBefore);
 
   const beforeTables = rawBusinessSnapshot(process.env.SQLITE_PATH);
   const beforeFiles = filesystemSnapshot(process.env.SECURE_DOCUMENTS_STORAGE_DIR);
@@ -799,6 +803,21 @@ test('real SQLite manual follow-up terminal replay returns exact stopped and fin
     const replay = await stopDealHunterManualFollowUps(input);
     assert.deepEqual(replay, durableStopped, 'already-stopped replay must return the exact durable response');
     assert.equal(rawBusinessState(sqlitePath), before);
+
+    database = new Database(sqlitePath);
+    database.prepare("UPDATE deal_hunter_cim_requests SET opportunity_id = 'reparented-opportunity' WHERE id = 'loser-cim-request'").run();
+    database.close();
+    const reparentedBefore = rawBusinessState(sqlitePath);
+    const reparentedProviderCountBefore = matrixProviderCalls.length;
+    const wrongRouteReplay = await stopDealHunterManualFollowUps(input);
+    assert.deepEqual(wrongRouteReplay, {
+      success: false,
+      status: 404,
+      code: 'request_not_found',
+      error: 'The canonical CIM request does not belong to this opportunity.',
+    });
+    assert.equal(rawBusinessState(sqlitePath), reparentedBefore);
+    assert.equal(matrixProviderCalls.length, reparentedProviderCountBefore);
   }
 
   {
@@ -864,6 +883,24 @@ test('real SQLite manual follow-up terminal replay returns exact stopped and fin
       session, storage, now: new Date(timestamp), dependencies,
       executeApprovedFollowUp: async () => { providerCalls.push('called'); },
     };
+    database = new Database(sqlitePath);
+    database.prepare("UPDATE deal_hunter_cim_requests SET opportunity_id = 'reparented-opportunity' WHERE id = 'loser-cim-request'").run();
+    database.close();
+    const reparentedBefore = rawBusinessState(sqlitePath);
+    const reparentedProviderCountBefore = matrixProviderCalls.length;
+    const wrongRouteReconciliation = await approveDealHunterManualFollowUp(input);
+    assert.deepEqual(wrongRouteReconciliation, {
+      success: false,
+      status: 404,
+      code: 'request_not_found',
+      error: 'The canonical CIM request does not belong to this opportunity.',
+    });
+    assert.equal(rawBusinessState(sqlitePath), reparentedBefore, 'wrong-route accepted authority must refuse before reconciliation writes');
+    assert.deepEqual(providerCalls, []);
+    assert.equal(matrixProviderCalls.length, reparentedProviderCountBefore);
+    database = new Database(sqlitePath);
+    database.prepare("UPDATE deal_hunter_cim_requests SET opportunity_id = 'opportunity' WHERE id = 'loser-cim-request'").run();
+    database.close();
     const finalized = await approveDealHunterManualFollowUp(input);
     assert.equal(finalized.success, true, JSON.stringify(finalized));
     assert.equal(finalized.durableResult.followUps.followUpCount, 1);
@@ -1479,6 +1516,37 @@ test('real SQLite high-fit sync refuses a cached loser claim with no business/pr
 
   const directDeal = reviewed.qualified.find((candidate) => candidate.dealKey === deal.dealKey);
   assert.ok(directDeal?.cimRequest?.snapshotToken, JSON.stringify(directDeal));
+  forceLoserPrimary(sqlitePath);
+  database = new Database(sqlitePath);
+  database.prepare(`
+    UPDATE deal_hunter_opportunities SET primary_submission_id = ?, updated_at = ?
+    WHERE opportunity_id = ?
+  `).run(loser.submission.id, new Date().toISOString(), deal.opportunityId);
+  database.close();
+  const driftedBefore = rawBusinessSnapshot(sqlitePath);
+  const driftedDigestBefore = rawBusinessState(sqlitePath);
+  const driftedProviderCountBefore = matrixProviderCalls.length;
+  const drifted = await sendDealHunterCimRequest({
+    dealKey: directDeal.dealKey,
+    snapshotToken: directDeal.cimRequest.snapshotToken,
+    requestedBy: 'writer-matrix',
+    storage,
+  });
+  assert.equal(drifted.ok, false, JSON.stringify(drifted));
+  assert.equal(drifted.status, 409, JSON.stringify(drifted));
+  assert.equal(drifted.code, CRM_SUBMISSION_SUPERSEDED, JSON.stringify(drifted));
+  assert.deepEqual(drifted.candidateIds, []);
+  assert.deepEqual(drifted.evidenceCategories, []);
+  assert.equal(rawBusinessState(sqlitePath), driftedDigestBefore);
+  assert.deepEqual(rawBusinessSnapshot(sqlitePath), driftedBefore);
+  assert.equal(matrixProviderCalls.length, driftedProviderCountBefore);
+  database = new Database(sqlitePath);
+  database.prepare(`
+    UPDATE deal_hunter_opportunities SET primary_submission_id = ?, updated_at = ?
+    WHERE opportunity_id = ?
+  `).run(survivor.submission.id, new Date().toISOString(), deal.opportunityId);
+  database.close();
+
   const directSurvivor = await sendDealHunterCimRequest({
     dealKey: directDeal.dealKey,
     snapshotToken: directDeal.cimRequest.snapshotToken,
