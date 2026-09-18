@@ -18,6 +18,7 @@ import { dismissCrmFollowUpRecommendation } from '../server/services/followUpWor
 import { createAdminEmailSuppression, liftAdminEmailSuppression } from '../server/services/followUpWorkspace.js';
 import { generateCrmFollowUpRecommendation } from '../server/services/followUpRecommendations.js';
 import { updateAcquisitionCommandCenterRecord } from '../server/services/acquisitionCommandCenter.js';
+import { startDealHunterManualFollowUps } from '../server/services/dealHunterManualFollowUps.js';
 import {
   executeDealHunterCimFollowUpRequest,
   repairDealHunterCrmSourceFields,
@@ -121,7 +122,7 @@ async function fixture(t, { withRecommendation = false, activateSupersession = t
   });
   await storage.upsertDealHunterCimRequest({
     id: 'loser-cim-request', created_at: timestamp, updated_at: timestamp,
-    deal_key: 'writer-matrix-deal', recipient_email: 'broker@example.test', submission_id: 'loser',
+    deal_key: 'writer-matrix-deal', opportunity_id: 'opportunity', recipient_email: 'broker@example.test', submission_id: 'loser',
     status: 'delivery_issue', requested_by: 'test', deal_name: 'Canonical', source_name: 'writer-matrix',
     listing_url: '', score: 95, request_state: 'failed', delivery_state: 'bounced',
     delivery_state_at: timestamp, metadata: {},
@@ -332,6 +333,18 @@ test('real SQLite follow-up suppression, legacy CIM execution, and corrected-rec
     }),
   ];
   for (const invoke of cases) await assertLoserRefusal({ sqlitePath, providerCalls, invoke });
+});
+
+test('real SQLite manual CIM start entry point refuses loser-owned request authority', async (t) => {
+  const { storage, sqlitePath } = await fixture(t);
+  const session = { principal_id: 'admin-1', role: 'admin', username: 'test-admin' };
+  await assertLoserRefusal({
+    sqlitePath,
+    invoke: () => startDealHunterManualFollowUps({
+      opportunityId: 'opportunity', requestId: 'loser-cim-request', input: {}, session, storage,
+      now: new Date(timestamp),
+    }),
+  });
 });
 
 test('second-connection supersession after an earlier service check is revalidated by every direct Task 6 SQLite writer', async (t) => {
