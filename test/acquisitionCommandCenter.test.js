@@ -616,6 +616,7 @@ test('command center action queue ignores passed records', () => {
 test('passing a command center record atomically archives it and completes CRM follow-up state', async () => {
   let capturedUpdate = null;
   const storage = {
+    async assertCrmSubmissionWritable() {},
     async getSubmission(id) {
       return {
         id,

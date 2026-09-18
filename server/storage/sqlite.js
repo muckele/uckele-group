@@ -1174,6 +1174,21 @@ function normalizePage(value, maxPage = 10000) {
     : 1;
 }
 
+const activeCrmProjectionAliases = new Set(['submission', 'submissions']);
+
+function activeCrmSubmissionPredicate(alias) {
+  if (!activeCrmProjectionAliases.has(alias)) {
+    throw new Error('Unsupported internal CRM projection alias.');
+  }
+
+  return `NOT EXISTS (
+    SELECT 1
+    FROM crm_submission_supersessions AS active_supersession
+    WHERE active_supersession.superseded_submission_id = ${alias}.id
+      AND active_supersession.status = 'active'
+  )`;
+}
+
 const sharedWebsiteDomains = [
   'facebook.com',
   'instagram.com',
@@ -6269,7 +6284,7 @@ export function createSqliteStorage(config) {
     },
 
     async listSubmissions({ limit = 50, page = 1, search = '', status = 'all', createdAfter = '', sort = 'created_at', direction = 'desc' } = {}) {
-      const clauses = [];
+      const clauses = [activeCrmSubmissionPredicate('submissions')];
       const params = [];
 
       if (status && status !== 'all') {
@@ -6302,7 +6317,7 @@ export function createSqliteStorage(config) {
         params.push(String(search).toLowerCase());
       }
 
-      const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+      const whereClause = `WHERE ${clauses.join(' AND ')}`;
       const requestedLimit = Number(limit);
       const requestedPage = Number(page);
       const safeLimit = Number.isFinite(requestedLimit)
@@ -6327,7 +6342,7 @@ export function createSqliteStorage(config) {
       const rows = database
         .prepare(
           `
-            SELECT * FROM contact_submissions
+            SELECT submissions.* FROM contact_submissions AS submissions
             ${whereClause}
             ORDER BY ${sortExpression} ${sortDirection}, created_at DESC, id ASC
             LIMIT ?
@@ -6337,7 +6352,11 @@ export function createSqliteStorage(config) {
         .all(...params, safeLimit, offset)
         .map(normalizeSubmissionRow);
 
-      const totalRow = database.prepare(`SELECT COUNT(*) AS count FROM contact_submissions ${whereClause}`).get(...params);
+      // List and count remain separate SQLite statements. Both independently
+      // carry the same active-row predicate so pagination cannot count losers.
+      const totalRow = database.prepare(`
+        SELECT COUNT(*) AS count FROM contact_submissions AS submissions ${whereClause}
+      `).get(...params);
 
       return {
         rows,
@@ -6363,7 +6382,10 @@ export function createSqliteStorage(config) {
       ]);
       const requestedView = normalizeList([view], 1)[0] || 'crm-actions';
       const safeView = allowedViews.has(requestedView) ? requestedView : 'crm-actions';
-      const clauses = ["submission.status NOT IN ('archived', 'spam')"];
+      const clauses = [
+        activeCrmSubmissionPredicate('submission'),
+        "submission.status NOT IN ('archived', 'spam')",
+      ];
       const params = [];
       const latestDirection = `(SELECT communication.direction FROM crm_communications AS communication
         WHERE communication.submission_id = submission.id
@@ -6499,19 +6521,38 @@ export function createSqliteStorage(config) {
     },
 
     async getSummary() {
-      const total = database.prepare('SELECT COUNT(*) AS count FROM contact_submissions').get()?.count || 0;
+      const activeSubmissionPredicate = activeCrmSubmissionPredicate('submission');
+      const total = database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM contact_submissions AS submission
+        WHERE ${activeSubmissionPredicate}
+      `).get()?.count || 0;
       const lastSevenDaysSince = new Date(Date.now() - 1000 * 60 * 60 * 24 * 7).toISOString();
       const lastSevenDays =
-        database.prepare('SELECT COUNT(*) AS count FROM contact_submissions WHERE created_at >= ?').get(lastSevenDaysSince)
+        database.prepare(`
+          SELECT COUNT(*) AS count
+          FROM contact_submissions AS submission
+          WHERE ${activeSubmissionPredicate} AND submission.created_at >= ?
+        `).get(lastSevenDaysSince)
           ?.count || 0;
       const dueToday =
         database
           .prepare(
-            `SELECT COUNT(*) AS count FROM contact_submissions WHERE next_action_at IS NOT NULL AND next_action_at <= ? AND status NOT IN ('archived', 'spam')`,
+            `SELECT COUNT(*) AS count
+             FROM contact_submissions AS submission
+             WHERE ${activeSubmissionPredicate}
+               AND submission.next_action_at IS NOT NULL
+               AND submission.next_action_at <= ?
+               AND submission.status NOT IN ('archived', 'spam')`,
           )
           .get(new Date().toISOString())?.count || 0;
       const grouped = database
-        .prepare('SELECT status, COUNT(*) AS count FROM contact_submissions GROUP BY status')
+        .prepare(`
+          SELECT submission.status, COUNT(*) AS count
+          FROM contact_submissions AS submission
+          WHERE ${activeSubmissionPredicate}
+          GROUP BY submission.status
+        `)
         .all()
         .reduce((accumulator, row) => {
           accumulator[row.status] = row.count;
