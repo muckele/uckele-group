@@ -9,6 +9,7 @@ import {
 } from '../services/dealHunterOpportunityFacts.js';
 import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
 import { requireCanonicalCimRequestId } from '../services/cimRequestIdPolicy.js';
+import { CrmSupersessionUnavailableError } from '../services/crmSubmissionSupersession.js';
 
 const dealHunterQueueSorts = new Set([
   'acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed',
@@ -1060,6 +1061,22 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
 
   return {
     provider: 'supabase',
+
+    async getCrmSubmissionSupersessionContext() {
+      throw new CrmSupersessionUnavailableError();
+    },
+
+    async listActiveCrmSubmissionSupersessions() {
+      throw new CrmSupersessionUnavailableError();
+    },
+
+    async assertCrmSubmissionWritable() {
+      throw new CrmSupersessionUnavailableError();
+    },
+
+    async auditCrmSubmissionSupersessions() {
+      throw new CrmSupersessionUnavailableError();
+    },
 
     async createApplicationBackup() {
       throw new Error('Application-managed backups are only available for SQLite storage. Use Supabase managed backups for this provider.');

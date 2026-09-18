@@ -27,6 +27,7 @@ import {
   nextManualFollowUpAt,
 } from '../services/dealHunterManualFollowUpPolicy.js';
 import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
+import { CrmSubmissionSupersededError } from '../services/crmSubmissionSupersession.js';
 import {
   buildCanonicalOpportunityMergePlan,
   canonicalOpportunityMergeManifestId,
@@ -688,6 +689,71 @@ function normalizeDealHunterRepairManifestRow(row) {
   return row
     ? { ...row, manifest: parseJsonColumn(row.manifest, {}), metadata: parseJsonColumn(row.metadata, {}) }
     : null;
+}
+
+const crmSubmissionSupersessionMaximumRows = 5000;
+
+function normalizeCrmSubmissionSupersessionRow(row) {
+  return row
+    ? {
+        id: row.id,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        status: row.status,
+        survivorSubmissionId: row.survivor_submission_id,
+        supersededSubmissionId: row.superseded_submission_id,
+        opportunityId: row.opportunity_id,
+        reasonCode: row.reason_code,
+        reasonText: row.reason_text,
+        approvedBy: row.approved_by,
+        approvedAt: row.approved_at,
+        actor: row.actor,
+        repairVersion: row.repair_version,
+        repairManifestId: row.repair_manifest_id,
+        repairDigest: row.repair_digest,
+        reversedAt: row.reversed_at || null,
+        reversedBy: row.reversed_by || null,
+        reversalReason: row.reversal_reason || null,
+        reversalManifestId: row.reversal_manifest_id || null,
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
+function selectActiveCrmSubmissionSupersessions(database, {
+  submissionIds = [],
+  opportunityIds = [],
+  limit = crmSubmissionSupersessionMaximumRows,
+} = {}) {
+  const safeSubmissionIds = normalizeList(submissionIds, crmSubmissionSupersessionMaximumRows);
+  const safeOpportunityIds = normalizeList(opportunityIds, crmSubmissionSupersessionMaximumRows);
+  const parsedLimit = Number(limit);
+  const safeLimit = Number.isFinite(parsedLimit)
+    ? Math.max(1, Math.min(Math.trunc(parsedLimit), crmSubmissionSupersessionMaximumRows))
+    : crmSubmissionSupersessionMaximumRows;
+  const clauses = ["status = 'active'"];
+  const parameters = [];
+  if (safeSubmissionIds.length > 0) {
+    const placeholders = safeSubmissionIds.map(() => '?').join(', ');
+    clauses.push(`(survivor_submission_id IN (${placeholders}) OR superseded_submission_id IN (${placeholders}))`);
+    parameters.push(...safeSubmissionIds, ...safeSubmissionIds);
+  }
+  if (safeOpportunityIds.length > 0) {
+    clauses.push(`opportunity_id IN (${safeOpportunityIds.map(() => '?').join(', ')})`);
+    parameters.push(...safeOpportunityIds);
+  }
+  return database.prepare(`
+    SELECT * FROM crm_submission_supersessions
+    WHERE ${clauses.join(' AND ')}
+    ORDER BY opportunity_id ASC, survivor_submission_id ASC,
+      superseded_submission_id ASC, id ASC
+    LIMIT ?
+  `).all(...parameters, safeLimit).map(normalizeCrmSubmissionSupersessionRow);
+}
+
+function crmSubmissionMetadataOwner(submission) {
+  const owner = submission?.metadata?.dealHunter?.opportunityId;
+  return typeof owner === 'string' ? owner.trim() : '';
 }
 
 function normalizeCimStage2ActivationRow(row) {
@@ -2960,6 +3026,279 @@ export function createSqliteStorage(config) {
         manifest TEXT NOT NULL DEFAULT '{}',
         metadata TEXT NOT NULL DEFAULT '{}'
       );
+
+      CREATE TABLE IF NOT EXISTS crm_submission_supersessions (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('active', 'reversed')),
+        survivor_submission_id TEXT NOT NULL,
+        superseded_submission_id TEXT NOT NULL,
+        opportunity_id TEXT NOT NULL,
+        reason_code TEXT NOT NULL CHECK (reason_code = 'confirmed-duplicate'),
+        reason_text TEXT NOT NULL,
+        approved_by TEXT NOT NULL,
+        approved_at TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        repair_version TEXT NOT NULL,
+        repair_manifest_id TEXT NOT NULL,
+        repair_digest TEXT NOT NULL,
+        reversed_at TEXT,
+        reversed_by TEXT,
+        reversal_reason TEXT,
+        reversal_manifest_id TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        CHECK (survivor_submission_id <> superseded_submission_id),
+        CHECK (
+          (status = 'active' AND reversed_at IS NULL AND reversed_by IS NULL AND reversal_manifest_id IS NULL)
+          OR
+          (status = 'reversed' AND reversed_at IS NOT NULL AND reversed_by IS NOT NULL AND reversal_manifest_id IS NOT NULL)
+        ),
+        FOREIGN KEY (survivor_submission_id) REFERENCES contact_submissions(id) ON DELETE RESTRICT,
+        FOREIGN KEY (superseded_submission_id) REFERENCES contact_submissions(id) ON DELETE RESTRICT,
+        FOREIGN KEY (opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT,
+        FOREIGN KEY (repair_manifest_id) REFERENCES deal_hunter_cim_repair_manifests(id) ON DELETE RESTRICT,
+        FOREIGN KEY (reversal_manifest_id) REFERENCES deal_hunter_cim_repair_manifests(id) ON DELETE RESTRICT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_crm_submission_supersessions_survivor
+        ON crm_submission_supersessions(survivor_submission_id, status);
+      CREATE INDEX IF NOT EXISTS idx_crm_submission_supersessions_opportunity
+        ON crm_submission_supersessions(opportunity_id, status);
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_crm_submission_supersessions_active_loser
+        ON crm_submission_supersessions(superseded_submission_id)
+        WHERE status = 'active';
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_duplicate_consolidation_receipt_no_update
+      BEFORE UPDATE ON deal_hunter_cim_repair_manifests
+      WHEN OLD.mode = 'crm-duplicate-consolidation'
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM duplicate consolidation receipt is append-only and immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_duplicate_consolidation_receipt_no_delete
+      BEFORE DELETE ON deal_hunter_cim_repair_manifests
+      WHEN OLD.mode = 'crm-duplicate-consolidation'
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM duplicate consolidation receipt is append-only and immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_validate_insert
+      BEFORE INSERT ON crm_submission_supersessions
+      BEGIN
+        SELECT CASE WHEN NEW.survivor_submission_id = NEW.superseded_submission_id
+          THEN RAISE(ABORT, 'CRM supersession survivor and loser cannot be the same') END;
+        SELECT CASE WHEN NEW.status <> 'active'
+          THEN RAISE(ABORT, 'CRM supersession must begin active') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM contact_submissions WHERE id = NEW.survivor_submission_id
+        ) THEN RAISE(ABORT, 'CRM supersession survivor is missing') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM contact_submissions WHERE id = NEW.superseded_submission_id
+        ) THEN RAISE(ABORT, 'CRM supersession superseded loser is missing') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM deal_hunter_opportunities
+          WHERE opportunity_id = NEW.opportunity_id AND status = 'active'
+        ) THEN RAISE(ABORT, 'CRM supersession requires an active opportunity') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM deal_hunter_opportunities
+          WHERE opportunity_id = NEW.opportunity_id
+            AND primary_submission_id = NEW.survivor_submission_id
+        ) THEN RAISE(ABORT, 'CRM supersession opportunity primary must be the survivor') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM contact_submissions AS submission
+          WHERE submission.id = NEW.survivor_submission_id
+            AND COALESCE(NULLIF(TRIM(submission.deal_hunter_opportunity_id), ''), '') IN ('', NEW.opportunity_id)
+            AND COALESCE(NULLIF(TRIM(json_extract(submission.metadata, '$.dealHunter.opportunityId')), ''), '') IN ('', NEW.opportunity_id)
+            AND (
+              NULLIF(TRIM(submission.deal_hunter_opportunity_id), '') = NEW.opportunity_id
+              OR NULLIF(TRIM(json_extract(submission.metadata, '$.dealHunter.opportunityId')), '') = NEW.opportunity_id
+            )
+        ) THEN RAISE(ABORT, 'CRM supersession survivor owner is incompatible') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM contact_submissions AS submission
+          WHERE submission.id = NEW.superseded_submission_id
+            AND COALESCE(NULLIF(TRIM(submission.deal_hunter_opportunity_id), ''), '') IN ('', NEW.opportunity_id)
+            AND COALESCE(NULLIF(TRIM(json_extract(submission.metadata, '$.dealHunter.opportunityId')), ''), '') IN ('', NEW.opportunity_id)
+        ) THEN RAISE(ABORT, 'CRM supersession superseded owner is incompatible') END;
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM deal_hunter_opportunities
+          WHERE primary_submission_id = NEW.superseded_submission_id
+        ) THEN RAISE(ABORT, 'CRM supersession loser cannot be an opportunity primary') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM deal_hunter_cim_repair_manifests
+          WHERE id = NEW.repair_manifest_id
+            AND mode = 'crm-duplicate-consolidation'
+            AND status = 'applied'
+            AND checksum = NEW.repair_digest
+        ) THEN RAISE(ABORT, 'CRM supersession receipt or digest is invalid') END;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_no_active_chain_insert
+      BEFORE INSERT ON crm_submission_supersessions
+      WHEN NEW.status = 'active'
+      BEGIN
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM crm_submission_supersessions
+          WHERE status = 'active'
+            AND (
+              superseded_submission_id = NEW.survivor_submission_id
+              OR survivor_submission_id = NEW.superseded_submission_id
+            )
+        ) THEN RAISE(ABORT, 'CRM supersession active role would create a chain') END;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_no_active_chain_update
+      BEFORE UPDATE ON crm_submission_supersessions
+      WHEN NEW.status = 'active'
+      BEGIN
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM crm_submission_supersessions
+          WHERE status = 'active' AND id <> OLD.id
+            AND (
+              superseded_submission_id = NEW.survivor_submission_id
+              OR survivor_submission_id = NEW.superseded_submission_id
+            )
+        ) THEN RAISE(ABORT, 'CRM supersession active role would create a chain') END;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_immutable_update
+      BEFORE UPDATE ON crm_submission_supersessions
+      WHEN NEW.id IS NOT OLD.id
+        OR NEW.created_at IS NOT OLD.created_at
+        OR NEW.survivor_submission_id IS NOT OLD.survivor_submission_id
+        OR NEW.superseded_submission_id IS NOT OLD.superseded_submission_id
+        OR NEW.opportunity_id IS NOT OLD.opportunity_id
+        OR NEW.reason_code IS NOT OLD.reason_code
+        OR NEW.reason_text IS NOT OLD.reason_text
+        OR NEW.approved_by IS NOT OLD.approved_by
+        OR NEW.approved_at IS NOT OLD.approved_at
+        OR NEW.actor IS NOT OLD.actor
+        OR NEW.repair_version IS NOT OLD.repair_version
+        OR NEW.repair_manifest_id IS NOT OLD.repair_manifest_id
+        OR NEW.repair_digest IS NOT OLD.repair_digest
+        OR NEW.metadata IS NOT OLD.metadata
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM supersession core fields are immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_reverse_only
+      BEFORE UPDATE ON crm_submission_supersessions
+      WHEN (
+        NEW.updated_at IS NOT OLD.updated_at
+        OR NEW.status IS NOT OLD.status
+        OR NEW.reversed_at IS NOT OLD.reversed_at
+        OR NEW.reversed_by IS NOT OLD.reversed_by
+        OR NEW.reversal_reason IS NOT OLD.reversal_reason
+        OR NEW.reversal_manifest_id IS NOT OLD.reversal_manifest_id
+      ) AND NOT (
+        OLD.status = 'active'
+        AND NEW.status = 'reversed'
+        AND NEW.reversed_at IS NOT NULL AND TRIM(NEW.reversed_at) <> ''
+        AND NEW.reversed_by IS NOT NULL AND TRIM(NEW.reversed_by) <> ''
+        AND NEW.reversal_reason IS NOT NULL AND TRIM(NEW.reversal_reason) <> ''
+        AND NEW.reversal_manifest_id IS NOT NULL AND TRIM(NEW.reversal_manifest_id) <> ''
+        AND EXISTS (
+          SELECT 1 FROM deal_hunter_cim_repair_manifests
+          WHERE id = NEW.reversal_manifest_id
+            AND mode = 'crm-duplicate-consolidation'
+            AND status = 'applied'
+        )
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM supersession permits only reviewed active to reversed transition');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_no_delete
+      BEFORE DELETE ON crm_submission_supersessions
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM supersession physical delete is forbidden');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_guard_contact_owner_update
+      BEFORE UPDATE OF id, deal_hunter_opportunity_id, metadata ON contact_submissions
+      BEGIN
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM crm_submission_supersessions AS relation
+          WHERE relation.status = 'active'
+            AND relation.survivor_submission_id = OLD.id
+            AND (
+              NEW.id <> OLD.id
+              OR COALESCE(NULLIF(TRIM(NEW.deal_hunter_opportunity_id), ''), '') NOT IN ('', relation.opportunity_id)
+              OR COALESCE(NULLIF(TRIM(json_extract(NEW.metadata, '$.dealHunter.opportunityId')), ''), '') NOT IN ('', relation.opportunity_id)
+              OR (
+                COALESCE(NULLIF(TRIM(NEW.deal_hunter_opportunity_id), ''), '') <> relation.opportunity_id
+                AND COALESCE(NULLIF(TRIM(json_extract(NEW.metadata, '$.dealHunter.opportunityId')), ''), '') <> relation.opportunity_id
+              )
+            )
+        ) THEN RAISE(ABORT, 'CRM supersession survivor owner cannot be invalidated') END;
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM crm_submission_supersessions AS relation
+          WHERE relation.status = 'active'
+            AND relation.superseded_submission_id = OLD.id
+            AND (
+              NEW.id <> OLD.id
+              OR COALESCE(NULLIF(TRIM(NEW.deal_hunter_opportunity_id), ''), '') NOT IN ('', relation.opportunity_id)
+              OR COALESCE(NULLIF(TRIM(json_extract(NEW.metadata, '$.dealHunter.opportunityId')), ''), '') NOT IN ('', relation.opportunity_id)
+            )
+        ) THEN RAISE(ABORT, 'CRM supersession superseded owner cannot be invalidated') END;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_guard_opportunity_update
+      BEFORE UPDATE OF opportunity_id, status, primary_submission_id ON deal_hunter_opportunities
+      BEGIN
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM crm_submission_supersessions AS relation
+          WHERE relation.status = 'active'
+            AND relation.opportunity_id = OLD.opportunity_id
+            AND (
+              NEW.opportunity_id <> OLD.opportunity_id
+              OR NEW.status <> 'active'
+              OR NEW.primary_submission_id IS NOT relation.survivor_submission_id
+            )
+        ) THEN RAISE(ABORT, 'CRM supersession opportunity authority cannot be invalidated') END;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_opportunities_reject_superseded_primary_insert
+      BEFORE INSERT ON deal_hunter_opportunities
+      WHEN NEW.primary_submission_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM crm_submission_supersessions
+          WHERE status = 'active' AND superseded_submission_id = NEW.primary_submission_id
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM superseded primary is forbidden');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_opportunities_reject_superseded_primary_update
+      BEFORE UPDATE OF primary_submission_id ON deal_hunter_opportunities
+      WHEN NEW.primary_submission_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM crm_submission_supersessions
+          WHERE status = 'active' AND superseded_submission_id = NEW.primary_submission_id
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM superseded primary is forbidden');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_guard_contact_delete
+      BEFORE DELETE ON contact_submissions
+      WHEN EXISTS (
+        SELECT 1 FROM crm_submission_supersessions
+        WHERE survivor_submission_id = OLD.id OR superseded_submission_id = OLD.id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM supersession referenced contact delete is forbidden');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_guard_opportunity_delete
+      BEFORE DELETE ON deal_hunter_opportunities
+      WHEN EXISTS (
+        SELECT 1 FROM crm_submission_supersessions WHERE opportunity_id = OLD.opportunity_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM supersession referenced opportunity delete is forbidden');
+      END;
 
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_stage2_activations (
         id TEXT PRIMARY KEY,
@@ -5448,6 +5787,147 @@ export function createSqliteStorage(config) {
 
   return {
     provider: 'sqlite',
+
+    async listActiveCrmSubmissionSupersessions(filters = {}) {
+      return selectActiveCrmSubmissionSupersessions(database, filters);
+    },
+
+    async getCrmSubmissionSupersessionContext(submissionId) {
+      const requestedSubmissionId = String(submissionId || '').trim();
+      const relations = selectActiveCrmSubmissionSupersessions(database, {
+        submissionIds: requestedSubmissionId ? [requestedSubmissionId] : [],
+      });
+      const supersededRelation = relations.find(
+        (relation) => relation.supersededSubmissionId === requestedSubmissionId,
+      ) || null;
+      if (supersededRelation) {
+        return {
+          requestedSubmissionId,
+          canonicalSubmissionId: supersededRelation.survivorSubmissionId,
+          opportunityId: supersededRelation.opportunityId,
+          isSuperseded: true,
+          relation: supersededRelation,
+          supersededSubmissions: [],
+          historySubmissionIds: [
+            supersededRelation.survivorSubmissionId,
+            supersededRelation.supersededSubmissionId,
+          ],
+        };
+      }
+      const survivorRelations = relations.filter(
+        (relation) => relation.survivorSubmissionId === requestedSubmissionId,
+      );
+      return {
+        requestedSubmissionId,
+        canonicalSubmissionId: requestedSubmissionId,
+        opportunityId: survivorRelations[0]?.opportunityId || null,
+        isSuperseded: false,
+        relation: null,
+        supersededSubmissions: survivorRelations,
+        historySubmissionIds: [
+          requestedSubmissionId,
+          ...survivorRelations.map((relation) => relation.supersededSubmissionId),
+        ],
+      };
+    },
+
+    async assertCrmSubmissionWritable(submissionId) {
+      const context = await this.getCrmSubmissionSupersessionContext(submissionId);
+      if (context.isSuperseded) {
+        throw new CrmSubmissionSupersededError({
+          submissionId: context.requestedSubmissionId,
+          survivorSubmissionId: context.canonicalSubmissionId,
+          opportunityId: context.opportunityId,
+        });
+      }
+      return context;
+    },
+
+    async auditCrmSubmissionSupersessions() {
+      const rawRows = database.prepare(`
+        SELECT * FROM crm_submission_supersessions
+        ORDER BY opportunity_id ASC, survivor_submission_id ASC,
+          superseded_submission_id ASC, id ASC
+        LIMIT ?
+      `).all(crmSubmissionSupersessionMaximumRows + 1);
+      const violations = [];
+      if (rawRows.length > crmSubmissionSupersessionMaximumRows) {
+        violations.push({ code: 'supersession-audit-bound-exceeded' });
+      }
+      const activeRoles = new Map();
+      for (const rawRow of rawRows.slice(0, crmSubmissionSupersessionMaximumRows)) {
+        const relation = normalizeCrmSubmissionSupersessionRow(rawRow);
+        const survivor = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(
+          relation.survivorSubmissionId,
+        );
+        const superseded = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(
+          relation.supersededSubmissionId,
+        );
+        const opportunity = database.prepare(
+          'SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ?',
+        ).get(relation.opportunityId);
+        const receipt = database.prepare(
+          'SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ?',
+        ).get(relation.repairManifestId);
+        if (!survivor) violations.push({ code: 'survivor-missing', relationId: relation.id });
+        if (!superseded) violations.push({ code: 'superseded-missing', relationId: relation.id });
+        if (
+          !receipt
+          || receipt.mode !== 'crm-duplicate-consolidation'
+          || receipt.status !== 'applied'
+          || receipt.checksum !== relation.repairDigest
+        ) violations.push({ code: 'repair-receipt-invalid', relationId: relation.id });
+        if (relation.status === 'active') {
+          if (
+            !opportunity
+            || opportunity.status !== 'active'
+            || opportunity.primary_submission_id !== relation.survivorSubmissionId
+          ) violations.push({ code: 'opportunity-authority-invalid', relationId: relation.id });
+          const survivorRow = survivor ? normalizeSubmissionRow(survivor) : null;
+          const supersededRow = superseded ? normalizeSubmissionRow(superseded) : null;
+          const survivorDirectOwner = String(survivorRow?.deal_hunter_opportunity_id || '').trim();
+          const survivorMetadataOwner = crmSubmissionMetadataOwner(survivorRow);
+          const supersededDirectOwner = String(supersededRow?.deal_hunter_opportunity_id || '').trim();
+          const supersededMetadataOwner = crmSubmissionMetadataOwner(supersededRow);
+          if (
+            ![survivorDirectOwner, survivorMetadataOwner].includes(relation.opportunityId)
+            || [survivorDirectOwner, survivorMetadataOwner].some(
+              (owner) => owner && owner !== relation.opportunityId,
+            )
+          ) violations.push({ code: 'survivor-owner-invalid', relationId: relation.id });
+          if ([supersededDirectOwner, supersededMetadataOwner].some(
+            (owner) => owner && owner !== relation.opportunityId,
+          )) violations.push({ code: 'superseded-owner-invalid', relationId: relation.id });
+          const supersededIsPrimary = database.prepare(`
+            SELECT 1 FROM deal_hunter_opportunities
+            WHERE primary_submission_id = ? LIMIT 1
+          `).get(relation.supersededSubmissionId);
+          if (supersededIsPrimary) {
+            violations.push({ code: 'superseded-is-primary', relationId: relation.id });
+          }
+          if (
+            activeRoles.get(relation.survivorSubmissionId) === 'superseded'
+            || activeRoles.has(relation.supersededSubmissionId)
+          ) {
+            violations.push({ code: 'active-role-conflict', relationId: relation.id });
+          }
+          if (!activeRoles.has(relation.survivorSubmissionId)) {
+            activeRoles.set(relation.survivorSubmissionId, 'survivor');
+          }
+          activeRoles.set(relation.supersededSubmissionId, 'superseded');
+        } else {
+          const reversalReceipt = database.prepare(`
+            SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ?
+          `).get(relation.reversalManifestId);
+          if (
+            !reversalReceipt
+            || reversalReceipt.mode !== 'crm-duplicate-consolidation'
+            || reversalReceipt.status !== 'applied'
+          ) violations.push({ code: 'reversal-receipt-invalid', relationId: relation.id });
+        }
+      }
+      return { ok: violations.length === 0, violationCount: violations.length, violations };
+    },
 
     async createApplicationBackup(destination) {
       await database.backup(destination);
