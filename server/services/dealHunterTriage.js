@@ -900,6 +900,7 @@ function publicPassDisposition(disposition = {}) {
 
 export async function passTriageOpportunity({
   opportunityId = '',
+  submissionId = '',
   reason = '',
   note = '',
   actor = 'admin',
@@ -927,6 +928,7 @@ export async function passTriageOpportunity({
   const normalizedActor = normalizeText(actor, 160) || 'admin';
   const result = await storage.passDealHunterOpportunity({
     opportunityId: id,
+    submissionId: normalizeText(submissionId, 120),
     reason: normalizedReason,
     note: note?.trim() || '',
     actor: normalizedActor,

@@ -5415,8 +5415,34 @@ export function createSqliteStorage(config) {
     `).get(submissionId, initialCutoff, followUpCutoff);
   }
 
+  function assertCrmSubmissionWritableInTransaction(submissionId) {
+    const requestedSubmissionId = String(submissionId || '').trim();
+    const relation = selectActiveCrmSubmissionSupersessions(database, {
+      submissionIds: requestedSubmissionId ? [requestedSubmissionId] : [],
+      limit: 1,
+    }).find((candidate) => candidate.supersededSubmissionId === requestedSubmissionId);
+    if (relation) {
+      throw new CrmSubmissionSupersededError({
+        submissionId: requestedSubmissionId,
+        survivorSubmissionId: relation.survivorSubmissionId,
+        opportunityId: relation.opportunityId,
+      });
+    }
+  }
+
   const mutateWithCrmActivityTransaction = database.transaction(({ operation, payload, activity }) => {
     let record = null;
+
+    const mutatedSubmissionId = operation === 'update_submission'
+      ? payload.id
+      : operation === 'archive_submission'
+        ? payload.id || payload.submissionId
+        : operation === 'dismiss_deal_hunter_opportunity'
+          ? payload.submissionId
+          : '';
+    if (mutatedSubmissionId) {
+      assertCrmSubmissionWritableInTransaction(mutatedSubmissionId);
+    }
 
     if (operation === 'insert_submission') {
       const canonicalOpportunityId = payload.submission?.deal_hunter_opportunity_id || '';
@@ -5872,15 +5898,8 @@ export function createSqliteStorage(config) {
     },
 
     async assertCrmSubmissionWritable(submissionId) {
-      const context = await this.getCrmSubmissionSupersessionContext(submissionId);
-      if (context.isSuperseded) {
-        throw new CrmSubmissionSupersededError({
-          submissionId: context.requestedSubmissionId,
-          survivorSubmissionId: context.canonicalSubmissionId,
-          opportunityId: context.opportunityId,
-        });
-      }
-      return context;
+      assertCrmSubmissionWritableInTransaction(submissionId);
+      return this.getCrmSubmissionSupersessionContext(submissionId);
     },
 
     async auditCrmSubmissionSupersessions() {
@@ -5991,28 +6010,37 @@ export function createSqliteStorage(config) {
     },
 
     async updateSubmission(id, values) {
-      updateRecord(
-        'contact_submissions',
-        id,
-        values,
-        submissionUpdateFields,
-        submissionJsonFields,
-      );
-
-      return this.getSubmission(id);
+      const transaction = database.transaction(() => {
+        assertCrmSubmissionWritableInTransaction(id);
+        updateRecord(
+          'contact_submissions',
+          id,
+          values,
+          submissionUpdateFields,
+          submissionJsonFields,
+        );
+        const row = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(id);
+        return row ? normalizeSubmissionRow(row) : null;
+      });
+      return transaction.immediate();
     },
 
     async updateSubmissionIfCurrent(id, expectedUpdatedAt, values) {
-      const result = updateRecord(
-        'contact_submissions',
-        id,
-        values,
-        submissionUpdateFields,
-        submissionJsonFields,
-        expectedUpdatedAt,
-      );
-
-      return result.changes > 0 ? this.getSubmission(id) : null;
+      const transaction = database.transaction(() => {
+        assertCrmSubmissionWritableInTransaction(id);
+        const result = updateRecord(
+          'contact_submissions',
+          id,
+          values,
+          submissionUpdateFields,
+          submissionJsonFields,
+          expectedUpdatedAt,
+        );
+        if (result.changes === 0) return null;
+        const row = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(id);
+        return row ? normalizeSubmissionRow(row) : null;
+      });
+      return transaction.immediate();
     },
 
     async getSubmission(id) {
@@ -6059,6 +6087,7 @@ export function createSqliteStorage(config) {
 
     async deleteSubmission(id, { deletedAt = '' } = {}) {
       const transaction = database.transaction((submissionId, requestedDeletedAt) => {
+        assertCrmSubmissionWritableInTransaction(submissionId);
         const existingRow = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(submissionId);
 
         if (!existingRow) {
@@ -6945,6 +6974,8 @@ export function createSqliteStorage(config) {
             ),
           };
         }
+
+        assertCrmSubmissionWritableInTransaction(serializedOutbox.submission_id);
 
         const submission = database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1')
           .get(serializedOutbox.submission_id);
@@ -7913,6 +7944,12 @@ export function createSqliteStorage(config) {
             SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
           `).get(opportunityId);
           if (!opportunity || opportunity.status !== 'active') return { applied: false, reason: 'not-current' };
+          if (command.submissionId) {
+            assertCrmSubmissionWritableInTransaction(command.submissionId);
+          }
+          if (opportunity.primary_submission_id) {
+            assertCrmSubmissionWritableInTransaction(opportunity.primary_submission_id);
+          }
 
           const score = database.prepare(`
             SELECT * FROM deal_hunter_opportunity_scores
@@ -7941,6 +7978,9 @@ export function createSqliteStorage(config) {
             return { applied: false, reason: 'linked-submission-missing' };
           }
           const archiveSubmission = Boolean(submission && submission.status !== 'archived');
+          if (archiveSubmission) {
+            assertCrmSubmissionWritableInTransaction(submission.id);
+          }
           if (archiveSubmission && activeCimClaimForSubmission(submission.id, occurredAt)) {
             return { applied: false, reason: 'cim-send-in-progress' };
           }
@@ -9708,6 +9748,7 @@ export function createSqliteStorage(config) {
     } = {}) {
       const timestamp = updatedAt || new Date().toISOString();
       const transaction = database.transaction(() => {
+        assertCrmSubmissionWritableInTransaction(submissionId);
         const candidateIds = [submissionId];
         const authority = dealHunterCrmMatchAuthoritySnapshot(database, {
           limit: dealHunterCrmMatchAuthorityMaximumRows,

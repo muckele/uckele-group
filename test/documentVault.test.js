@@ -31,6 +31,12 @@ const {
 const { getStorage } = await import('../server/storage/index.js');
 const { signPayload } = await import('../server/utils/security.js');
 
+const writableSubmissionGuard = {
+  async assertCrmSubmissionWritable() {
+    return { isSuperseded: false };
+  },
+};
+
 after(() => {
   fs.rmSync(tempDir, { force: true, recursive: true });
 });
@@ -294,6 +300,7 @@ test('dashboard submission delete keeps CRM record when secure file staging fail
   let cleanupJob = null;
   const result = await deleteDashboardSubmission('cleanup-failure-submission', {
     storage: {
+      ...writableSubmissionGuard,
       async getSubmission(id) {
         return { id };
       },
@@ -333,6 +340,7 @@ test('dashboard submission delete restores staged files when database deletion f
   fs.writeFileSync(documentPath, 'recoverable diligence document');
   let cleanupJob = null;
   const storage = {
+    ...writableSubmissionGuard,
     async getSubmission(id) {
       return { id };
     },
@@ -374,6 +382,7 @@ test('dashboard submission delete restores staged files when database deletion f
 test('dashboard submission delete reports a fresh CIM transmission lease as a retryable conflict', async () => {
   const result = await deleteDashboardSubmission('active-cim-delete-submission', {
     storage: {
+      ...writableSubmissionGuard,
       async getSubmission(id) {
         return { id };
       },
@@ -400,6 +409,7 @@ test('dashboard submission delete rejects secure document paths outside the vaul
   let unlinkCalled = false;
   const result = await deleteDashboardSubmission('outside-vault-submission', {
     storage: {
+      ...writableSubmissionGuard,
       async getSubmission(id) {
         return { id };
       },
@@ -431,6 +441,7 @@ test('failed post-delete purges are persisted and reconciled later', async () =>
   let submission = { id: 'queued-cleanup-submission' };
   let cleanupJob = null;
   const storage = {
+    ...writableSubmissionGuard,
     async getSubmission() {
       return submission;
     },
@@ -484,6 +495,7 @@ test('a missing secure file does not prevent later files from being staged and p
   let cleanupJob = null;
   const result = await deleteDashboardSubmission('missing-first-file-submission', {
     storage: {
+      ...writableSubmissionGuard,
       async getSubmission(id) {
         return { id };
       },
@@ -520,6 +532,7 @@ test('falsey database deletion reports a restore failure instead of a 404', asyn
   let cleanupJob = null;
   const result = await deleteDashboardSubmission('falsey-delete-submission', {
     storage: {
+      ...writableSubmissionGuard,
       async getSubmission(id) {
         return { id };
       },
@@ -1930,6 +1943,7 @@ test('dashboard deletion retains staged files whenever its commit response is am
   let cleanupJob = null;
   const storage = {
     provider: 'supabase',
+    ...writableSubmissionGuard,
     async getSubmissionStrict() {
       return { id: submissionId };
     },

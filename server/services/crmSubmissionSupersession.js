@@ -34,7 +34,7 @@ export async function assertCrmSubmissionWritable({ storage, submissionId } = {}
 }
 
 export function projectCrmSupersessionHttpError(error) {
-  if (error?.code === CRM_SUBMISSION_SUPERSEDED) {
+  if (error instanceof CrmSubmissionSupersededError) {
     return {
       status: 409,
       body: {
@@ -47,7 +47,7 @@ export function projectCrmSupersessionHttpError(error) {
       },
     };
   }
-  if (error?.code === CRM_SUPERSESSION_UNAVAILABLE) {
+  if (error instanceof CrmSupersessionUnavailableError) {
     return {
       status: 503,
       body: {

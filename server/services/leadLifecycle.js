@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { getStorage } from '../storage/index.js';
 import { commitCrmActivityMutation } from './activity.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 
 export const archiveReasons = [
   'not-a-fit',
@@ -59,6 +60,7 @@ export async function archiveLead({
 } = {}) {
   const id = compactText(submissionId, 120);
   const normalizedReason = normalizeArchiveReason(reason);
+  await assertCrmSubmissionWritable({ storage, submissionId: id });
   const existing = id ? await storage.getSubmission(id) : null;
 
   if (!existing) return { ok: false, status: 404, error: 'CRM record not found.' };
@@ -135,6 +137,7 @@ export async function restoreLead({
 } = {}) {
   const id = compactText(submissionId, 120);
   const nextStatus = compactText(status, 40).toLowerCase();
+  await assertCrmSubmissionWritable({ storage, submissionId: id });
   const existing = id ? await storage.getSubmission(id) : null;
 
   if (!existing) return { ok: false, status: 404, error: 'CRM record not found.' };

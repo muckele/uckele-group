@@ -21,6 +21,7 @@ import {
 import { resolveSecureStoragePath } from './documentVault.js';
 import { commitCrmActivityMutation, summarizeSubmissionChanges } from './activity.js';
 import { normalizeAttribution } from './analytics.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 import {
   isSecureDocumentCleanupIntentActive,
   listSecureDocumentCleanupSidecars,
@@ -1423,6 +1424,7 @@ export async function listDashboardFollowUps({
 
 export async function updateSubmissionWorkflow(id, fields, options = {}) {
   const storage = options.storage || getStorage();
+  await assertCrmSubmissionWritable({ storage, submissionId: id });
   const existing = await storage.getSubmission(id);
 
   if (!existing) {
@@ -2196,6 +2198,8 @@ export async function deleteDashboardSubmission(id, options = {}) {
   if (!submissionId || !storage.deleteSubmission) {
     return null;
   }
+
+  await assertCrmSubmissionWritable({ storage, submissionId });
 
   const existing = await getSubmissionStrictly(storage, submissionId);
 

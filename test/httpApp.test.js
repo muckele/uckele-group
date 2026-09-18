@@ -5,7 +5,13 @@ import { request as httpRequest } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 import { signPayload } from '../server/utils/security.js';
+import {
+  CRM_SUBMISSION_SUPERSEDED,
+  CRM_SUPERSESSION_UNAVAILABLE,
+} from '../server/services/crmSubmissionSupersession.js';
+import { createSupabaseStorage } from '../server/storage/supabase.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-http-app-'));
 process.env.ADMIN_SESSION_SECRET = 'http-app-session-secret-for-tests';
@@ -145,6 +151,85 @@ async function seedTaskFourOpportunity(opportunityId) {
   return storage;
 }
 
+async function seedHttpSupersession({ loserStatus = 'review', withScore = false } = {}) {
+  const suffix = randomUUID();
+  const storage = getStorage();
+  const survivorResult = await createManualSubmission({
+    company: `HTTP Survivor ${suffix}`,
+    lead_type: 'broker',
+    broker_name: 'Survivor Broker',
+    broker_email: `survivor-${suffix}@example.test`,
+    listing_url: `https://example.test/survivor/${suffix}`,
+    status: 'review',
+    notes: 'HTTP supersession survivor.',
+  }, 'http-test', { storage });
+  const loserResult = await createManualSubmission({
+    company: `HTTP Loser ${suffix}`,
+    lead_type: 'broker',
+    broker_name: 'Loser Broker',
+    broker_email: `loser-${suffix}@example.test`,
+    listing_url: `https://example.test/loser/${suffix}`,
+    status: 'review',
+    notes: 'HTTP supersession loser.',
+  }, 'http-test', { storage });
+  assert.equal(survivorResult.ok, true);
+  assert.equal(loserResult.ok, true);
+  const survivor = survivorResult.submission;
+  let loser = loserResult.submission;
+  const opportunityId = `http-supersession-${suffix}`;
+  const now = new Date().toISOString();
+  const digest = 'c'.repeat(64);
+  await storage.updateSubmission(survivor.id, {
+    deal_hunter_opportunity_id: opportunityId,
+    updated_at: now,
+  });
+  if (loserStatus === 'archived') {
+    loser = await storage.updateSubmission(loser.id, {
+      status: 'archived',
+      archived_at: now,
+      archive_reason: 'duplicate',
+      updated_at: now,
+    });
+  }
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: opportunityId, created_at: now, updated_at: now,
+    canonical_name: `HTTP Supersession ${suffix}`, canonical_recipient: null, canonical_location: null,
+    primary_submission_id: survivor.id, identity_version: 'http-supersession-v1', status: 'active', metadata: {},
+  });
+  if (withScore) {
+    await storage.writeDealHunterOpportunityScore({
+      opportunity_id: opportunityId, scored_at: now, deal_key: `http-supersession-deal-${suffix}`,
+      name: `HTTP Supersession ${suffix}`, state: 'CA', listing_url: `https://example.test/pass/${suffix}`,
+      fit_score: 82, score_status: 'high-fit', confidence: 'high', completeness_score: 90,
+      contradiction_count: 0, missing_evidence_count: 0, should_remove: false, high_fit: true, gate_count: 0,
+      score_fingerprint: `http-fingerprint-${suffix}`, semantic_digest: `http-digest-${suffix}`,
+      engine_version: 'http-test', rules_version: 'http-test', profile_version: 'http-test',
+      completeness_policy_version: 'http-test', dimensions: [], gates: [], applied_caps: [],
+      missing_evidence: [], confidence_reasons: [], summary: {},
+    }, []);
+    await storage.reconcileDealHunterCurrentScoreEligibility([opportunityId]);
+  }
+  const receiptId = `http-receipt-${suffix}`;
+  await storage.upsertDealHunterCimRepairManifest({
+    id: receiptId, created_at: now, updated_at: now, mode: 'crm-duplicate-consolidation',
+    status: 'applied', actor: 'http-test', backup_reference: 'backup', checksum: digest,
+    manifest: { version: 1 }, metadata: {},
+  });
+  const database = new Database(process.env.SQLITE_PATH);
+  database.prepare(`
+    INSERT INTO crm_submission_supersessions (
+      id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
+      opportunity_id, reason_code, reason_text, approved_by, approved_at, actor,
+      repair_version, repair_manifest_id, repair_digest, metadata
+    ) VALUES (?, ?, ?, 'active', ?, ?, ?, 'confirmed-duplicate', ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    `http-relation-${suffix}`, now, now, survivor.id, loser.id, opportunityId,
+    'Reviewed duplicate.', 'owner@example.test', now, 'http-test', 'v1', receiptId, digest, '{}',
+  );
+  database.close();
+  return { loser, survivor, opportunityId };
+}
+
 async function withEmailReadinessAddressConfig({
   adminEmail,
   fallbackRecipient,
@@ -231,6 +316,136 @@ test('malformed session cookies are treated as anonymous instead of crashing', a
     assert.equal(response.status, 200);
     assert.equal(result.authenticated, false);
   });
+});
+
+test('authenticated core CRM routes expose the bounded superseded-record conflict', async () => {
+  const patchFixture = await seedHttpSupersession();
+  const archiveFixture = await seedHttpSupersession();
+  const restoreFixture = await seedHttpSupersession({ loserStatus: 'archived' });
+  const passFixture = await seedHttpSupersession({ withScore: true });
+  const deleteFixture = await seedHttpSupersession();
+  writeTaskFourSourceSnapshot();
+
+  await withServer(async (origin) => {
+    const cookie = await signInForCookie(origin);
+    const cases = [
+      {
+        fixture: patchFixture,
+        path: `/api/admin/submissions/${patchFixture.loser.id}`,
+        method: 'PATCH',
+        body: { expected_updated_at: patchFixture.loser.updated_at, notes: 'must not change' },
+      },
+      {
+        fixture: archiveFixture,
+        path: `/api/admin/submissions/${archiveFixture.loser.id}/archive`,
+        method: 'POST',
+        body: { reason: 'duplicate', expectedUpdatedAt: archiveFixture.loser.updated_at },
+      },
+      {
+        fixture: restoreFixture,
+        path: `/api/admin/submissions/${restoreFixture.loser.id}/restore`,
+        method: 'POST',
+        body: { status: 'review', expectedUpdatedAt: restoreFixture.loser.updated_at },
+      },
+      {
+        fixture: passFixture,
+        path: `/api/admin/deal-hunter/triage/${passFixture.opportunityId}/action`,
+        method: 'POST',
+        body: { action: 'pass', reason: 'not-a-fit', submissionId: passFixture.loser.id },
+      },
+      {
+        fixture: deleteFixture,
+        path: `/api/admin/submissions/${deleteFixture.loser.id}`,
+        method: 'DELETE',
+        body: undefined,
+      },
+    ];
+    for (const testCase of cases) {
+      const response = await fetch(`${origin}${testCase.path}`, {
+        method: testCase.method,
+        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: testCase.body === undefined ? undefined : JSON.stringify(testCase.body),
+      });
+      assert.equal(response.status, 409, `${testCase.method} ${testCase.path}`);
+      assert.deepEqual(await response.json(), {
+        success: false,
+        code: CRM_SUBMISSION_SUPERSEDED,
+        error: 'This CRM record is historical and cannot be changed.',
+        submissionId: testCase.fixture.loser.id,
+        survivorSubmissionId: testCase.fixture.survivor.id,
+        opportunityId: testCase.fixture.opportunityId,
+      });
+    }
+  });
+});
+
+test('provider supersession unavailability fails closed before mutation and unrelated errors stay generic', async () => {
+  const storage = getStorage();
+  const fixture = await createManualSubmission({
+    company: `HTTP unavailable ${randomUUID()}`,
+    lead_type: 'broker',
+    broker_name: 'Unavailable Broker',
+    broker_email: `unavailable-${randomUUID()}@example.test`,
+    listing_url: `https://example.test/unavailable/${randomUUID()}`,
+    status: 'review',
+  }, 'http-test', { storage });
+  assert.equal(fixture.ok, true);
+  const originalAssert = storage.assertCrmSubmissionWritable;
+  const originalMutation = storage.mutateWithCrmActivity;
+  let mutationCalls = 0;
+  let supabaseClientCalls = 0;
+  const supabaseStorage = createSupabaseStorage({ storage: {} }, {
+    client: new Proxy({}, {
+      get() {
+        supabaseClientCalls += 1;
+        throw new Error('Supabase client must not be invoked by the fail-closed guard.');
+      },
+    }),
+  });
+  storage.mutateWithCrmActivity = async (...args) => {
+    mutationCalls += 1;
+    return originalMutation.apply(storage, args);
+  };
+
+  try {
+    await withServer(async (origin) => {
+      const cookie = await signInForCookie(origin);
+      storage.assertCrmSubmissionWritable = supabaseStorage.assertCrmSubmissionWritable.bind(supabaseStorage);
+      const unavailable = await fetch(`${origin}/api/admin/submissions/${fixture.submission.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify({ expected_updated_at: fixture.submission.updated_at, notes: 'must not change' }),
+      });
+      assert.equal(unavailable.status, 503);
+      assert.deepEqual(await unavailable.json(), {
+        success: false,
+        code: CRM_SUPERSESSION_UNAVAILABLE,
+        error: 'CRM supersession authority is unavailable for this storage provider.',
+      });
+      assert.equal(mutationCalls, 0);
+      assert.equal(supabaseClientCalls, 0);
+
+      storage.assertCrmSubmissionWritable = async () => {
+        const error = new Error('private provider detail');
+        error.status = 418;
+        throw error;
+      };
+      const unrelatedClientError = await fetch(`${origin}/api/admin/submissions/${fixture.submission.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify({ expected_updated_at: fixture.submission.updated_at, notes: 'must not change' }),
+      });
+      assert.equal(unrelatedClientError.status, 418);
+      assert.deepEqual(await unrelatedClientError.json(), {
+        success: false,
+        error: 'Something went wrong while processing the request.',
+      });
+      assert.equal(mutationCalls, 0);
+    });
+  } finally {
+    storage.assertCrmSubmissionWritable = originalAssert;
+    storage.mutateWithCrmActivity = originalMutation;
+  }
 });
 
 test('bodyless public and admin posts return controlled client errors', async () => {

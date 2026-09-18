@@ -116,6 +116,7 @@ import {
   restoreLead,
 } from './services/leadLifecycle.js';
 import { recordAnalyticsEvent } from './services/analytics.js';
+import { projectCrmSupersessionHttpError } from './services/crmSubmissionSupersession.js';
 import {
   createCimStage2Activation,
   getCimAutomationStatus,
@@ -346,6 +347,12 @@ async function auditAdminMutation(request, response, next) {
 export function handleAppError(error, request, response, next) {
   if (response.headersSent) {
     next(error);
+    return;
+  }
+
+  const crmSupersessionError = projectCrmSupersessionHttpError(error);
+  if (crmSupersessionError) {
+    response.status(crmSupersessionError.status).json(crmSupersessionError.body);
     return;
   }
 
@@ -1961,6 +1968,7 @@ export function createApp({
 
       const result = await passTriageOpportunity({
         opportunityId,
+        submissionId: request.body?.submissionId || '',
         reason: request.body?.reason,
         note: request.body?.note,
         actor: session.username || 'admin',

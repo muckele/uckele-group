@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,6 +17,8 @@ import {
 } from '../server/services/crmSubmissionSupersession.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
+import { archiveLead, restoreLead } from '../server/services/leadLifecycle.js';
+import { deleteDashboardSubmission, updateSubmissionWorkflow } from '../server/services/submissions.js';
 
 const timestamp = '2026-09-17T18:00:00.000Z';
 const digest = 'a'.repeat(64);
@@ -35,7 +38,7 @@ function baseSubmission(id, owner = null) {
   };
 }
 
-async function seededStorage(t) {
+async function seededStorage(t, { loserStatus = 'review' } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-crm-supersession-guard-'));
   const sqlitePath = path.join(directory, 'storage.sqlite');
   const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
@@ -44,7 +47,12 @@ async function seededStorage(t) {
     fs.rmSync(directory, { recursive: true, force: true });
   });
   await storage.insertSubmission(baseSubmission('survivor', 'opportunity'));
-  await storage.insertSubmission(baseSubmission('loser'));
+  await storage.insertSubmission({
+    ...baseSubmission('loser'),
+    status: loserStatus,
+    archived_at: loserStatus === 'archived' ? timestamp : null,
+    archive_reason: loserStatus === 'archived' ? 'duplicate' : null,
+  });
   await storage.upsertDealHunterOpportunity({
     opportunity_id: 'opportunity', created_at: timestamp, updated_at: timestamp,
     canonical_name: 'Canonical', canonical_recipient: null, canonical_location: null,
@@ -67,11 +75,45 @@ async function seededStorage(t) {
     'owner@example.test', timestamp, 'test', 'v1', 'receipt', digest, JSON.stringify({ safe: true }),
   );
   database.close();
-  return storage;
+  return { storage, sqlitePath };
+}
+
+function guardedStateHash(sqlitePath) {
+  const database = new Database(sqlitePath, { readonly: true });
+  const snapshot = {
+    contacts: database.prepare('SELECT * FROM contact_submissions ORDER BY id').all(),
+    dispositions: database.prepare('SELECT * FROM deal_hunter_dispositions ORDER BY id').all(),
+    activity: database.prepare('SELECT * FROM crm_activity_events ORDER BY id').all(),
+    cleanupJobs: database.prepare('SELECT * FROM secure_document_cleanup_jobs ORDER BY id').all(),
+    opportunityPrimary: database.prepare(`
+      SELECT opportunity_id, primary_submission_id
+      FROM deal_hunter_opportunities
+      ORDER BY opportunity_id
+    `).all(),
+  };
+  database.close();
+  return createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
+}
+
+function assertSupersededError(error) {
+  assert.deepEqual({
+    code: error.code,
+    status: error.status,
+    submissionId: error.submissionId,
+    survivorSubmissionId: error.survivorSubmissionId,
+    opportunityId: error.opportunityId,
+  }, {
+    code: CRM_SUBMISSION_SUPERSEDED,
+    status: 409,
+    submissionId: 'loser',
+    survivorSubmissionId: 'survivor',
+    opportunityId: 'opportunity',
+  });
+  return true;
 }
 
 test('SQLite returns the bounded stable context for loser, survivor, and unrelated submissions', async (t) => {
-  const storage = await seededStorage(t);
+  const { storage } = await seededStorage(t);
   await storage.insertSubmission(baseSubmission('unrelated'));
   const loser = await storage.getCrmSubmissionSupersessionContext('loser');
   assert.deepEqual(loser, {
@@ -105,7 +147,7 @@ test('SQLite returns the bounded stable context for loser, survivor, and unrelat
 });
 
 test('SQLite writable guard and service wrappers expose only typed safe fields', async (t) => {
-  const storage = await seededStorage(t);
+  const { storage } = await seededStorage(t);
   await assert.doesNotReject(storage.assertCrmSubmissionWritable('survivor'));
   await assert.rejects(storage.assertCrmSubmissionWritable('loser'), (error) => {
     assert.equal(error instanceof CrmSubmissionSupersededError, true);
@@ -131,15 +173,123 @@ test('SQLite writable guard and service wrappers expose only typed safe fields',
     },
   });
   assert.equal(projectCrmSupersessionHttpError(new Error('secret SQL')), null);
+  assert.equal(projectCrmSupersessionHttpError({
+    code: CRM_SUBMISSION_SUPERSEDED,
+    message: 'forged internal error',
+    submissionId: 'loser',
+    survivorSubmissionId: 'survivor',
+    opportunityId: 'opportunity',
+  }), null, 'only the typed public error may use the supersession projection');
 });
 
 test('SQLite supersession audit reports zero violations for a valid relation', async (t) => {
-  const storage = await seededStorage(t);
+  const { storage } = await seededStorage(t);
   assert.deepEqual(await storage.auditCrmSubmissionSupersessions(), {
     ok: true,
     violationCount: 0,
     violations: [],
   });
+});
+
+test('core services reject superseded CRM writes before any guarded state changes', async (t) => {
+  const cases = [
+    {
+      name: 'workflow update',
+      invoke: (storage) => updateSubmissionWorkflow('loser', {
+        expected_updated_at: timestamp,
+        notes: 'must not be written',
+      }, { storage }),
+    },
+    {
+      name: 'archive',
+      invoke: (storage) => archiveLead({ submissionId: 'loser', reason: 'duplicate', storage }),
+    },
+    {
+      name: 'delete',
+      invoke: (storage) => deleteDashboardSubmission('loser', { storage }),
+    },
+  ];
+
+  for (const testCase of cases) {
+    await t.test(testCase.name, async (subtest) => {
+      const { storage, sqlitePath } = await seededStorage(subtest);
+      const before = guardedStateHash(sqlitePath);
+      await assert.rejects(testCase.invoke(storage), assertSupersededError);
+      assert.equal(guardedStateHash(sqlitePath), before);
+    });
+  }
+
+  await t.test('restore', async (subtest) => {
+    const { storage, sqlitePath } = await seededStorage(subtest, { loserStatus: 'archived' });
+    const before = guardedStateHash(sqlitePath);
+    await assert.rejects(
+      restoreLead({ submissionId: 'loser', status: 'review', storage }),
+      assertSupersededError,
+    );
+    assert.equal(guardedStateHash(sqlitePath), before);
+  });
+});
+
+test('direct SQLite contact writers cannot bypass the supersession guard', async (t) => {
+  const cases = [
+    {
+      name: 'updateSubmission',
+      invoke: (storage) => storage.updateSubmission('loser', { notes: 'blocked' }),
+    },
+    {
+      name: 'updateSubmissionIfCurrent',
+      invoke: (storage) => storage.updateSubmissionIfCurrent('loser', timestamp, { notes: 'blocked' }),
+    },
+    {
+      name: 'deleteSubmission',
+      invoke: (storage) => storage.deleteSubmission('loser'),
+    },
+  ];
+  for (const testCase of cases) {
+    await t.test(testCase.name, async (subtest) => {
+      const { storage, sqlitePath } = await seededStorage(subtest);
+      const before = guardedStateHash(sqlitePath);
+      await assert.rejects(testCase.invoke(storage), assertSupersededError);
+      assert.equal(guardedStateHash(sqlitePath), before);
+    });
+  }
+});
+
+test('submission-mutating CRM activity transactions cannot bypass the supersession guard', async (t) => {
+  const cases = [
+    ['update_submission', { id: 'loser', expectedUpdatedAt: timestamp, values: { notes: 'blocked' } }],
+    ['archive_submission', {
+      id: 'loser', expectedUpdatedAt: timestamp,
+      values: { updated_at: '2026-09-17T18:00:01.000Z', archive_reason: 'duplicate' },
+    }],
+    ['dismiss_deal_hunter_opportunity', {
+      submissionId: 'loser', expectedUpdatedAt: timestamp,
+      values: { updated_at: '2026-09-17T18:00:01.000Z', archive_reason: 'duplicate' },
+      disposition: { id: 'blocked-disposition', deal_key: 'blocked', disposition: 'dismissed' },
+    }],
+  ];
+  for (const [operation, payload] of cases) {
+    await t.test(operation, async (subtest) => {
+      const { storage, sqlitePath } = await seededStorage(subtest);
+      const before = guardedStateHash(sqlitePath);
+      await assert.rejects(storage.mutateWithCrmActivity({
+        operation,
+        payload,
+        activity: {
+          id: `activity-${operation}`,
+          submission_id: 'loser',
+          opportunity_id: 'opportunity',
+          created_at: '2026-09-17T18:00:01.000Z',
+          actor: 'test',
+          role: 'admin',
+          event_type: 'submission.updated',
+          summary: 'This activity must not be written.',
+          metadata: {},
+        },
+      }), assertSupersededError);
+      assert.equal(guardedStateHash(sqlitePath), before);
+    });
+  }
 });
 
 test('all Supabase supersession methods fail closed before touching the client', async () => {
