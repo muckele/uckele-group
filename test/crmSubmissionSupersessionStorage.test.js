@@ -88,6 +88,36 @@ function relation(overrides = {}) {
   };
 }
 
+function reversalManifest(overrides = {}) {
+  return {
+    schema: 'crm-duplicate-consolidation-reversal-manifest-v1',
+    operation: 'reverse',
+    relationId: 'relation-loser-survivor',
+    applyManifestId: 'apply-receipt',
+    repairDigest: digest,
+    survivorSubmissionId: 'survivor',
+    supersededSubmissionId: 'loser',
+    opportunityId: 'opportunity',
+    ...overrides,
+  };
+}
+
+function runRelationReversal(database, reversalManifestId) {
+  return database.prepare(`
+    UPDATE crm_submission_supersessions
+    SET status = 'reversed', updated_at = ?, reversed_at = ?, reversed_by = ?,
+      reversal_reason = ?, reversal_manifest_id = ?
+    WHERE id = 'relation-loser-survivor'
+  `).run(
+    '2026-09-17T20:00:00.000Z', '2026-09-17T20:00:00.000Z',
+    'reviewer', 'Reviewed reversal.', reversalManifestId,
+  );
+}
+
+function reverseRelation(sqlitePath, reversalManifestId) {
+  return rawDatabase(sqlitePath, (database) => runRelationReversal(database, reversalManifestId));
+}
+
 const relationInsertSql = `
   INSERT INTO crm_submission_supersessions (
     id, created_at, updated_at, status, survivor_submission_id,
@@ -328,23 +358,68 @@ test('permits only a separately receipted active-to-reversed transition', async 
     id: 'reversal-receipt', created_at: timestamp, updated_at: timestamp,
     mode: 'crm-duplicate-consolidation', status: 'applied', actor: 'reviewer',
     backup_reference: 'reversal-backup', checksum: 'e'.repeat(64),
-    manifest: { operation: 'reverse' }, metadata: {},
+    manifest: reversalManifest(), metadata: {},
   });
-  assert.equal(rawDatabase(sqlitePath, (database) => database.prepare(`
-    UPDATE crm_submission_supersessions
-    SET status = 'reversed', updated_at = ?, reversed_at = ?, reversed_by = ?,
-      reversal_reason = ?, reversal_manifest_id = ?
-    WHERE id = 'relation-loser-survivor'
-  `).run(
-    '2026-09-17T20:00:00.000Z', '2026-09-17T20:00:00.000Z',
-    'reviewer', 'Reviewed reversal.', 'reversal-receipt',
-  )).changes, 1);
+  assert.equal(reverseRelation(sqlitePath, 'reversal-receipt').changes, 1);
+  assert.deepEqual(await storage.auditCrmSubmissionSupersessions(), {
+    ok: true,
+    violationCount: 0,
+    violations: [],
+  });
   assert.throws(() => rawDatabase(sqlitePath, (database) => database.prepare(`
     UPDATE crm_submission_supersessions
     SET status = 'active', reversed_at = NULL, reversed_by = NULL,
       reversal_reason = NULL, reversal_manifest_id = NULL
     WHERE id = 'relation-loser-survivor'
   `).run()), /reviewed|transition|constraint/i);
+});
+
+test('rejects reuse of the original apply receipt as reversal authority', async (t) => {
+  const { sqlitePath } = await fixture(t);
+  insertRelation(sqlitePath);
+  assert.throws(
+    () => reverseRelation(sqlitePath, 'apply-receipt'),
+    /reviewed|reverse|receipt|transition/i,
+  );
+});
+
+test('rejects an unrelated applied consolidation receipt as reversal authority', async (t) => {
+  const { sqlitePath, storage } = await fixture(t);
+  insertRelation(sqlitePath);
+  await storage.upsertDealHunterCimRepairManifest({
+    id: 'unrelated-reversal-receipt', created_at: timestamp, updated_at: timestamp,
+    mode: 'crm-duplicate-consolidation', status: 'applied', actor: 'reviewer',
+    backup_reference: 'unrelated-backup', checksum: 'f'.repeat(64),
+    manifest: reversalManifest({
+      relationId: 'another-relation',
+      supersededSubmissionId: 'another-loser',
+    }),
+    metadata: {},
+  });
+  assert.throws(
+    () => reverseRelation(sqlitePath, 'unrelated-reversal-receipt'),
+    /reviewed|reverse|receipt|transition/i,
+  );
+});
+
+test('supersession audit rejects a reversed row with an unbound reversal receipt', async (t) => {
+  const { sqlitePath, storage } = await fixture(t);
+  insertRelation(sqlitePath);
+  await storage.upsertDealHunterCimRepairManifest({
+    id: 'unrelated-reversal-receipt', created_at: timestamp, updated_at: timestamp,
+    mode: 'crm-duplicate-consolidation', status: 'applied', actor: 'reviewer',
+    backup_reference: 'unrelated-backup', checksum: 'f'.repeat(64),
+    manifest: reversalManifest({ relationId: 'another-relation' }), metadata: {},
+  });
+  rawDatabase(sqlitePath, (database) => {
+    database.exec('DROP TRIGGER trg_crm_submission_supersessions_reverse_only');
+    runRelationReversal(database, 'unrelated-reversal-receipt');
+  });
+  assert.deepEqual(await storage.auditCrmSubmissionSupersessions(), {
+    ok: false,
+    violationCount: 1,
+    violations: [{ code: 'reversal-receipt-invalid', relationId: 'relation-loser-survivor' }],
+  });
 });
 
 test('active relation authority cannot be invalidated by contact or opportunity updates', async (t) => {

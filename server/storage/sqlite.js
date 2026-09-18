@@ -692,6 +692,7 @@ function normalizeDealHunterRepairManifestRow(row) {
 }
 
 const crmSubmissionSupersessionMaximumRows = 5000;
+const crmSubmissionReversalManifestSchema = 'crm-duplicate-consolidation-reversal-manifest-v1';
 
 function normalizeCrmSubmissionSupersessionRow(row) {
   return row
@@ -754,6 +755,26 @@ function selectActiveCrmSubmissionSupersessions(database, {
 function crmSubmissionMetadataOwner(submission) {
   const owner = submission?.metadata?.dealHunter?.opportunityId;
   return typeof owner === 'string' ? owner.trim() : '';
+}
+
+function crmSubmissionReversalReceiptMatches(relation, receipt) {
+  const manifest = parseJsonColumn(receipt?.manifest, {});
+  return Boolean(
+    receipt
+    && relation.reversalManifestId
+    && relation.reversalManifestId !== relation.repairManifestId
+    && receipt.id === relation.reversalManifestId
+    && receipt.mode === 'crm-duplicate-consolidation'
+    && receipt.status === 'applied'
+    && manifest.schema === crmSubmissionReversalManifestSchema
+    && manifest.operation === 'reverse'
+    && manifest.relationId === relation.id
+    && manifest.applyManifestId === relation.repairManifestId
+    && manifest.repairDigest === relation.repairDigest
+    && manifest.survivorSubmissionId === relation.survivorSubmissionId
+    && manifest.supersededSubmissionId === relation.supersededSubmissionId
+    && manifest.opportunityId === relation.opportunityId
+  );
 }
 
 function normalizeCimStage2ActivationRow(row) {
@@ -3198,11 +3219,20 @@ export function createSqliteStorage(config) {
         AND NEW.reversed_by IS NOT NULL AND TRIM(NEW.reversed_by) <> ''
         AND NEW.reversal_reason IS NOT NULL AND TRIM(NEW.reversal_reason) <> ''
         AND NEW.reversal_manifest_id IS NOT NULL AND TRIM(NEW.reversal_manifest_id) <> ''
+        AND NEW.reversal_manifest_id <> NEW.repair_manifest_id
         AND EXISTS (
           SELECT 1 FROM deal_hunter_cim_repair_manifests
           WHERE id = NEW.reversal_manifest_id
             AND mode = 'crm-duplicate-consolidation'
             AND status = 'applied'
+            AND json_extract(manifest, '$.schema') = 'crm-duplicate-consolidation-reversal-manifest-v1'
+            AND json_extract(manifest, '$.operation') = 'reverse'
+            AND json_extract(manifest, '$.relationId') = NEW.id
+            AND json_extract(manifest, '$.applyManifestId') = NEW.repair_manifest_id
+            AND json_extract(manifest, '$.repairDigest') = NEW.repair_digest
+            AND json_extract(manifest, '$.survivorSubmissionId') = NEW.survivor_submission_id
+            AND json_extract(manifest, '$.supersededSubmissionId') = NEW.superseded_submission_id
+            AND json_extract(manifest, '$.opportunityId') = NEW.opportunity_id
         )
       )
       BEGIN
@@ -5919,11 +5949,9 @@ export function createSqliteStorage(config) {
           const reversalReceipt = database.prepare(`
             SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ?
           `).get(relation.reversalManifestId);
-          if (
-            !reversalReceipt
-            || reversalReceipt.mode !== 'crm-duplicate-consolidation'
-            || reversalReceipt.status !== 'applied'
-          ) violations.push({ code: 'reversal-receipt-invalid', relationId: relation.id });
+          if (!crmSubmissionReversalReceiptMatches(relation, reversalReceipt)) {
+            violations.push({ code: 'reversal-receipt-invalid', relationId: relation.id });
+          }
         }
       }
       return { ok: violations.length === 0, violationCount: violations.length, violations };
