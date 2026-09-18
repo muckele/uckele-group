@@ -230,6 +230,35 @@ async function seedHttpSupersession({ loserStatus = 'review', withScore = false 
   return { loser, survivor, opportunityId };
 }
 
+function readHttpPassState({ opportunityId, submissionIds = [] }) {
+  const database = new Database(process.env.SQLITE_PATH, { readonly: true });
+  try {
+    const score = database.prepare(`
+      SELECT * FROM deal_hunter_opportunity_scores WHERE opportunity_id = ? ORDER BY opportunity_id
+    `).all(opportunityId);
+    const dealKeys = score.map((row) => row.deal_key).filter(Boolean);
+    const submissionPlaceholders = submissionIds.map(() => '?').join(', ');
+    const dealKeyPlaceholders = dealKeys.map(() => '?').join(', ');
+    return {
+      contacts: submissionIds.length === 0 ? [] : database.prepare(`
+        SELECT * FROM contact_submissions WHERE id IN (${submissionPlaceholders}) ORDER BY id
+      `).all(...submissionIds),
+      dispositions: dealKeys.length === 0 ? [] : database.prepare(`
+        SELECT * FROM deal_hunter_dispositions WHERE deal_key IN (${dealKeyPlaceholders}) ORDER BY id
+      `).all(...dealKeys),
+      activity: submissionIds.length === 0 ? [] : database.prepare(`
+        SELECT * FROM crm_activity_events WHERE submission_id IN (${submissionPlaceholders}) ORDER BY id
+      `).all(...submissionIds),
+      opportunity: database.prepare(`
+        SELECT opportunity_id, primary_submission_id FROM deal_hunter_opportunities WHERE opportunity_id = ?
+      `).all(opportunityId),
+      score,
+    };
+  } finally {
+    database.close();
+  }
+}
+
 async function withEmailReadinessAddressConfig({
   adminEmail,
   fallbackRecipient,
@@ -377,6 +406,46 @@ test('authenticated core CRM routes expose the bounded superseded-record conflic
       });
     }
   });
+});
+
+test('legacy canonical disposition route refuses a superseded caller submission without redirecting to the survivor', async () => {
+  const fixture = await seedHttpSupersession({ withScore: true });
+  writeTaskFourSourceSnapshot();
+  const storage = getStorage();
+  const score = await storage.getCurrentDealHunterOpportunityScore(fixture.opportunityId);
+  const before = readHttpPassState({
+    opportunityId: fixture.opportunityId,
+    submissionIds: [fixture.loser.id, fixture.survivor.id],
+  });
+
+  await withServer(async (origin) => {
+    const cookie = await signInForCookie(origin);
+    const response = await fetch(`${origin}/api/admin/deal-hunter/dispositions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({
+        dealKey: score.deal_key,
+        reason: 'not-a-fit',
+        note: 'The explicit historical record must remain a refusal target.',
+        submissionId: fixture.loser.id,
+      }),
+    });
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      success: false,
+      code: CRM_SUBMISSION_SUPERSEDED,
+      error: 'This CRM record is historical and cannot be changed.',
+      submissionId: fixture.loser.id,
+      survivorSubmissionId: fixture.survivor.id,
+      opportunityId: fixture.opportunityId,
+    });
+  });
+
+  assert.deepEqual(readHttpPassState({
+    opportunityId: fixture.opportunityId,
+    submissionIds: [fixture.loser.id, fixture.survivor.id],
+  }), before, 'refusal must not change disposition, score, activity, contacts, or opportunity primary ownership');
 });
 
 test('provider supersession unavailability fails closed before mutation and unrelated errors stay generic', async () => {

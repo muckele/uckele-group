@@ -7,7 +7,11 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
-import { CRM_SUBMISSION_SUPERSEDED } from '../server/services/crmSubmissionSupersession.js';
+import {
+  CRM_SUBMISSION_SUPERSEDED,
+  CRM_SUPERSESSION_UNAVAILABLE,
+} from '../server/services/crmSubmissionSupersession.js';
+import { passTriageOpportunity } from '../server/services/dealHunterTriage.js';
 
 const migrationUrl = new URL('../supabase/migrations/20260830200000_atomic_acquisition_inbox_pass.sql', import.meta.url);
 const schemaUrl = new URL('../supabase/schema.sql', import.meta.url);
@@ -181,6 +185,32 @@ test('Supabase Pass uses one bounded RPC and normalizes its durable outcome', as
       triage_activity_id: command.triageActivityId,
     } },
   }]);
+});
+
+test('Supabase Pass refuses an explicit submission before its RPC through the real triage service', async () => {
+  let rpcCalls = 0;
+  const storage = createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { async rpc() {
+      rpcCalls += 1;
+      throw new Error('RPC must not run when explicit CRM supersession authority is unavailable.');
+    } } },
+  );
+
+  await assert.rejects(passTriageOpportunity({
+    opportunityId: 'opp-explicit-supabase-pass',
+    submissionId: 'submission-requiring-supersession-authority',
+    reason: 'not-a-fit',
+    note: 'Must fail closed before provider mutation.',
+    actor: 'owner@example.com',
+    storage,
+    getCachedSourceHealth: null,
+  }), (error) => {
+    assert.equal(error.code, CRM_SUPERSESSION_UNAVAILABLE);
+    assert.equal(error.status, 503);
+    return true;
+  });
+  assert.equal(rpcCalls, 0);
 });
 
 test('forward migration and fresh schema carry the identical atomic Pass RPC and hardened decision guard', () => {

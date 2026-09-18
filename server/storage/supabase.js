@@ -2939,6 +2939,9 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     async passDealHunterOpportunity(command = {}) {
       const opportunityId = String(command.opportunityId || '').trim();
       if (!opportunityId) throw new Error('A canonical opportunity id is required for atomic Pass.');
+      if (String(command.submissionId || '').trim()) {
+        throw new CrmSupersessionUnavailableError();
+      }
       const { data, error } = await client.rpc('pass_deal_hunter_opportunity', {
         p_command: {
           opportunity_id: opportunityId,

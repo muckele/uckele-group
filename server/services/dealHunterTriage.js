@@ -1086,7 +1086,14 @@ export async function dismissDealHunterOpportunityWithInboxAuthority({
   const authority = await resolveDealHunterDispositionAuthority({ dealKey, storage });
   if (!authority.ok) return authority;
   if (authority.canonical) {
-    return passTriageOpportunity({ opportunityId: authority.opportunityId, reason, note, actor, storage });
+    return passTriageOpportunity({
+      opportunityId: authority.opportunityId,
+      submissionId,
+      reason,
+      note,
+      actor,
+      storage,
+    });
   }
   return dismissDealHunterOpportunity({
     dealKey: authority.dealKey, listingUrl, dealName, reason, note, submissionId, actor, storage,
