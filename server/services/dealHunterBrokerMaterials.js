@@ -29,6 +29,7 @@ import {
   eventMatchesCimRequest,
   executeApprovedDealHunterCimRequest,
 } from './dealHunter.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 
 export const BROKER_MATERIALS_TEMPLATE_VERSION = 'deal-hunter-cim-manual-stage1-v1';
 
@@ -802,6 +803,9 @@ export async function prepareDealHunterBrokerMaterials({
     return { success: false, status: 400, code: 'invalid_preparation_input', error: error.message };
   }
   const authority = await loadBrokerMaterialsAuthority({ opportunityId, storage, now });
+  if (authority.submission?.id) {
+    await assertCrmSubmissionWritable({ storage, submissionId: authority.submission.id });
+  }
   if (authority.preparationBlockers.length > 0) {
     const first = authority.preparationBlockers[0];
     return preparationError(authority, first.code, first.message, authority.authorityStatus || 409);
@@ -968,6 +972,9 @@ export async function approveDealHunterBrokerMaterials({
   const authority = await loadBrokerMaterialsAuthority({ opportunityId: canonicalOpportunityId, storage, now });
   if (authority.existingRequest) {
     return durableApprovalResult(canonicalOpportunityId, authority.existingRequest);
+  }
+  if (authority.submission?.id) {
+    await assertCrmSubmissionWritable({ storage, submissionId: authority.submission.id });
   }
   if (authority.preparationBlockers.length > 0) {
     return approvalFailure('preparation_stale', 'Current opportunity authority changed after preparation. Prepare and review it again.', 409);

@@ -3,6 +3,7 @@ import OpenAI from 'openai';
 import { z } from 'zod';
 import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 import {
   FOLLOW_UP_AI_FALLBACK_REASONS,
   FOLLOW_UP_ENGINE_VERSION,
@@ -1126,6 +1127,7 @@ export async function generateCrmFollowUpRecommendation({
 } = {}) {
   const normalizedId = compactText(submissionId, 160);
   if (!normalizedId) return { ok: false, status: 400, error: 'A CRM record ID is required.' };
+  await assertCrmSubmissionWritable({ storage, submissionId: normalizedId });
   const loaded = await loadRecommendationContext({ submissionId: normalizedId, storage, config });
   if (!loaded) return { ok: false, status: 404, error: 'CRM record not found.' };
   const safeNow = safeDate(now) || new Date();

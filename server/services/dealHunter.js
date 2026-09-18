@@ -15,6 +15,7 @@ import {
 } from './delivery.js';
 import { createManualSubmission } from './submissions.js';
 import { commitCrmActivityMutation } from './activity.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 import { getEmailReadiness } from './emailReadiness.js';
 import {
   buildOutboundCommunication,
@@ -4995,6 +4996,9 @@ export async function repairDealHunterCrmSourceFields({
   if (!isDealHunterManagedSubmission(existing)) {
     throw new Error('Only Deal Hunter-managed CRM records can be repaired from the current source.');
   }
+  if (apply) {
+    await assertCrmSubmissionWritable({ storage, submissionId: existing.id });
+  }
 
   const resolvedSourceResults = sourceResults || await collectSources(getConfig(), storage);
   const failedSources = resolvedSourceResults
@@ -5164,6 +5168,9 @@ async function performHighFitDealsCrmSync(scoredDeals = [], storage = getStorage
         }
         const currentMatch = await findExistingDealHunterSubmission(storage, deal);
         assertDealHunterCrmMatchStable(preflightMatch, currentMatch);
+        if (importRecord?.submission_id) {
+          await assertCrmSubmissionWritable({ storage, submissionId: importRecord.submission_id });
+        }
         const claimedSubmission = await validatedCachedDealHunterCrmSubmission(
           deal,
           importRecord?.submission_id,
@@ -7230,11 +7237,17 @@ export async function executeDealHunterCimFollowUpRequest({
   if (request?.metadata?.manualFollowUp?.mode === 'operator-approved') {
     if (!consumeDealHunterManualFollowUpCapability(approvedContext)
       || !validApprovedManualFollowUpContext(request, approvedContext)) return { status: 'approval-required', request };
+    if (request?.submission_id) {
+      await assertCrmSubmissionWritable({ storage, submissionId: request.submission_id });
+    }
     // The approved branch performs persistPreparedCimCommunication before
     // sendPreparedMessage, with a final terminal-authority revalidation.
     return processApprovedManualCimFollowUp({ storage, request, now, approvedContext, dependencies });
   }
   if (approvedContext) return { status: 'invalid-approved-context', request };
+  if (request?.submission_id) {
+    await assertCrmSubmissionWritable({ storage, submissionId: request.submission_id });
+  }
   const at = now instanceof Date ? now : new Date(now);
   return processLegacyCimFollowUpRequest(storage, request, at.toISOString());
 }
@@ -8556,6 +8569,9 @@ async function applyDealOsCrmReconciliationItem({ deal, item, storage, requested
   try {
     const currentMatch = await findExistingDealHunterSubmission(storage, deal);
     assertDealHunterCrmMatchStable(preflightMatch, currentMatch);
+    if (importRecord?.submission_id) {
+      await assertCrmSubmissionWritable({ storage, submissionId: importRecord.submission_id });
+    }
     const existing = await validatedCachedDealHunterCrmSubmission(
       deal,
       importRecord.submission_id,
@@ -9666,6 +9682,7 @@ async function sendCimRequestForScoredDeal({
         deal: publicDealWithUnavailableCim(deal, archivedCimUnavailableReason, retryOfRequest ? [retryOfRequest] : []),
       };
     }
+    await assertCrmSubmissionWritable({ storage, submissionId: submission.id });
 
     const activeSuppression = await storage.getActiveEmailSuppression?.(recipientEmail);
     if (activeSuppression) {
@@ -10493,6 +10510,9 @@ export async function retryDealHunterCimRequestWithCorrectedRecipient({
 
   if (!original) {
     return { ok: false, status: 404, error: 'CIM request not found.' };
+  }
+  if (original.submission_id) {
+    await assertCrmSubmissionWritable({ storage, submissionId: original.submission_id });
   }
 
   const deliveryIssueStates = new Set(['bounced', 'failed', 'complained', 'suppressed']);

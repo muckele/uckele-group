@@ -171,6 +171,7 @@ function task3Storage({ request = baseRequest(), communications = [initialCommun
   };
   const storage = {
     state,
+    async assertCrmSubmissionWritable() {},
     async getCurrentDealHunterOpportunity(id) { return id === opportunityId ? state.opportunity : null; },
     async getCurrentDealHunterOpportunityScore(id) { return id === opportunityId ? state.score : null; },
     async listDealHunterOpportunityAliases() {

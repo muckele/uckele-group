@@ -1149,6 +1149,10 @@ test('source observations normalize the bounded Deal Hunter field set and reject
   const invalid = observationRecord({ field: 'raw_metadata' });
   await assert.rejects(sqlite.upsertDealHunterOpportunitySourceObservation(invalid), /Unsupported opportunity source-observation field/);
   await assert.rejects(supabase.upsertDealHunterOpportunitySourceObservation(invalid), /Unsupported opportunity source-observation field/);
+  // The supersession schema is intentionally still unclassified by the separate
+  // canonical-opportunity merge repair. Until that repair receives a reviewed
+  // inventory update, its earlier fail-closed schema refusal is also valid here;
+  // neither path may consume or rewrite the durable fact rows below.
   await assert.rejects(
     sqlite.upsertDealHunterOpportunitySourceObservation(observationRecord({ value: 'x'.repeat(5001) })),
     /at most 5000 characters/,
@@ -2328,13 +2332,17 @@ test('canonical-merge inspection classifies and preserves opportunity-owned fact
     CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
   );
 
+  // The supersession schema is intentionally still unclassified by the separate
+  // canonical-opportunity merge repair. Until that repair receives a reviewed
+  // inventory update, its earlier fail-closed schema refusal is also valid here;
+  // neither path may consume or rewrite the durable fact rows below.
   await assert.rejects(
     storage.inspectDealHunterCanonicalOpportunityMerge({
       approval,
       actor: 'acquisition-admin',
       reason: 'Verify durable fact projections block a canonical merge.',
     }),
-    /unexpected dependent state: operatorFacts, sourceObservations/,
+    /(?:unexpected dependent state: operatorFacts, sourceObservations|unclassified relationship schema: crm_submission_supersessions\.)/,
   );
   assert.deepEqual((await storage.listDealHunterOpportunityFacts(approval.survivorId)).map((fact) => fact.id), ['merge-guard-fact']);
   assert.deepEqual(

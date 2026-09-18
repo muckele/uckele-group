@@ -562,6 +562,8 @@ export async function createSecureUploadRequest({ submissionId, requestedBy, not
     return { ok: false, error: 'Submission not found.' };
   }
 
+  await assertCrmSubmissionWritable({ storage, submissionId: submission.id });
+
   if (!submission.email) {
     return { ok: false, error: 'This submission does not include an email address.' };
   }
@@ -756,6 +758,8 @@ export async function uploadSecureDocuments({ token, ndaAccepted, note = '', doc
   if (!context.ok) {
     return context;
   }
+
+  await assertCrmSubmissionWritable({ storage, submissionId: context.request.submission_id });
 
   context.request = await recoverStaleUploadRequest(storage, context.request);
 
@@ -1077,6 +1081,7 @@ export async function revokeSecureUploadRequest({ requestId, revokedBy = 'admin'
   const requestRecord = await storage.getSecureUploadRequest(String(requestId || '').trim());
   if (!requestRecord) return { ok: false, status: 404, error: 'Secure upload request was not found.' };
   if (requestRecord.status === 'revoked') return { ok: true, request: requestRecord };
+  await assertCrmSubmissionWritable({ storage, submissionId: requestRecord.submission_id });
   const now = new Date().toISOString();
   const mutation = await commitCrmActivityMutation({
     storage,

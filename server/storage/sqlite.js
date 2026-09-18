@@ -4557,6 +4557,7 @@ export function createSqliteStorage(config) {
   `);
 
   const claimDealHunterCimRequestTransaction = database.transaction(({ request, pendingCutoff }) => {
+    if (request.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
     const submission = request.submission_id
       ? database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1').get(request.submission_id)
       : null;
@@ -4695,6 +4696,8 @@ export function createSqliteStorage(config) {
 	    staleBefore,
 	    nowIso,
 	  }) => {
+	    const currentRequest = database.prepare('SELECT submission_id FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1').get(id);
+	    if (currentRequest?.submission_id) assertCrmSubmissionWritableInTransaction(currentRequest.submission_id);
 	    const current = database.prepare('SELECT * FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1').get(id);
 	    if (isMarkedManualFollowUpRequest(normalizeDealHunterCimRequestRow(current))) {
 	      return {
@@ -4765,6 +4768,7 @@ export function createSqliteStorage(config) {
     nextFollowUpAt,
     activity,
   }) => {
+    assertCrmSubmissionWritableInTransaction(expectedSubmissionId);
     const authority = loadManualFollowUpAuthority(requestId);
     if (!authority.request) {
       return manualFollowUpResult({ reason: 'request-missing' });
@@ -4840,6 +4844,7 @@ export function createSqliteStorage(config) {
     reason,
     activity,
   }) => {
+    assertCrmSubmissionWritableInTransaction(expectedSubmissionId);
     const authority = loadManualFollowUpAuthority(requestId);
     if (!authority.request) return manualFollowUpResult({ reason: 'request-missing' });
     if (!authority.submission) {
@@ -4901,6 +4906,7 @@ export function createSqliteStorage(config) {
     expectedNextFollowUpAt,
     claimedAt,
   }) => {
+    assertCrmSubmissionWritableInTransaction(expectedSubmissionId);
     const authority = loadManualFollowUpAuthority(requestId);
     if (!authority.request) return manualFollowUpResult({ reason: 'request-missing' });
     if (!authority.submission) {
@@ -5368,6 +5374,7 @@ export function createSqliteStorage(config) {
   }
 
   function insertCrmActivityEvent(event) {
+    assertCrmSubmissionWritableInTransaction(event?.submission_id);
     insertCrmActivityEventStatement.run(serializeCrmActivityEvent(event));
     return normalizeCrmActivityEventRow(serializeCrmActivityEvent(event));
   }
@@ -5477,6 +5484,10 @@ export function createSqliteStorage(config) {
 
   const mutateWithCrmActivityTransaction = database.transaction(({ operation, payload, activity }) => {
     let record = null;
+
+    if (activity?.submission_id) {
+      assertCrmSubmissionWritableInTransaction(activity.submission_id);
+    }
 
     const mutatedSubmissionId = operation === 'update_submission'
       ? payload.id
@@ -6658,11 +6669,14 @@ export function createSqliteStorage(config) {
     },
 
     async insertSecureUploadRequest(requestRecord) {
+      assertCrmSubmissionWritableInTransaction(requestRecord?.submission_id);
       insertSecureUploadRequestStatement.run(serializeUploadRequest(requestRecord));
       return requestRecord;
     },
 
     async updateSecureUploadRequest(id, values) {
+      const request = database.prepare('SELECT submission_id FROM secure_upload_requests WHERE id = ?').get(id);
+      if (request?.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
       updateRecord(
         'secure_upload_requests',
         id,
@@ -6674,6 +6688,8 @@ export function createSqliteStorage(config) {
     },
 
     async resetSecureUploadRequestIfUploading(id, values) {
+      const request = database.prepare('SELECT submission_id FROM secure_upload_requests WHERE id = ?').get(id);
+      if (request?.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
       const updates = Object.entries(serializeUploadRequestValues(values)).filter(([key]) =>
         ['updated_at', 'status'].includes(key),
       );
@@ -6693,6 +6709,8 @@ export function createSqliteStorage(config) {
     },
 
     async claimSecureUploadRequest(id, values, options = {}) {
+      const request = database.prepare('SELECT submission_id FROM secure_upload_requests WHERE id = ?').get(id);
+      if (request?.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
       const updates = Object.entries(serializeUploadRequestValues(values)).filter(([key]) =>
         ['updated_at', 'status', 'nda_accepted_at', 'last_uploaded_at', 'note', 'closed_at', 'upload_batch_count'].includes(key),
       );
@@ -6757,6 +6775,7 @@ export function createSqliteStorage(config) {
     },
 
     async insertSecureDocument(document) {
+      if (document?.submission_id) assertCrmSubmissionWritableInTransaction(document.submission_id);
       insertSecureDocumentStatement.run(document);
       if (document.submission_id) {
         database.prepare(`
@@ -6770,6 +6789,7 @@ export function createSqliteStorage(config) {
 
     async deleteSecureDocument(id) {
       const document = database.prepare('SELECT submission_id FROM secure_documents WHERE id = ? LIMIT 1').get(id);
+      if (document?.submission_id) assertCrmSubmissionWritableInTransaction(document.submission_id);
       deleteSecureDocumentStatement.run(id);
       if (document?.submission_id) {
         database.prepare(`
@@ -6990,6 +7010,7 @@ export function createSqliteStorage(config) {
     async insertCrmCommunication(communication = {}) {
       const serialized = serializeCrmCommunication(communication);
       return database.transaction(() => {
+        if (serialized.submission_id) assertCrmSubmissionWritableInTransaction(serialized.submission_id);
         const result = insertCrmCommunicationStatement.run(serialized);
         if (result.changes === 0) return getExistingCrmCommunication(serialized);
         const stored = normalizeCrmCommunicationRow(
@@ -7019,6 +7040,9 @@ export function createSqliteStorage(config) {
         'content_next_attempt_at', 'attachment_metadata', 'assigned_at', 'assigned_by', 'updated_by',
         'metadata',
       ];
+      const current = database.prepare('SELECT submission_id FROM crm_communications WHERE id = ? LIMIT 1').get(id);
+      const targetSubmissionId = Object.hasOwn(values, 'submission_id') ? values.submission_id : current?.submission_id;
+      if (targetSubmissionId) assertCrmSubmissionWritableInTransaction(targetSubmissionId);
       updateRecord(
         'crm_communications',
         id,
@@ -7284,6 +7308,10 @@ export function createSqliteStorage(config) {
     },
 
     async claimCrmEmailOutbox({ id = '', claimToken = '', claimedAt = '', claimExpiresAt = '' } = {}) {
+      const current = database.prepare('SELECT submission_id, state FROM crm_email_outbox WHERE id = ? LIMIT 1').get(id);
+      if (current?.submission_id && ['queued', 'retryable_failed', 'sending'].includes(current.state)) {
+        assertCrmSubmissionWritableInTransaction(current.submission_id);
+      }
       const row = database.prepare(`
         UPDATE crm_email_outbox SET
           state = 'sending',
@@ -7459,6 +7487,7 @@ export function createSqliteStorage(config) {
 
     async insertCrmFollowUpRecommendation(recommendation = {}) {
       const serialized = serializeCrmFollowUpRecommendation(recommendation);
+      assertCrmSubmissionWritableInTransaction(serialized.submission_id);
       insertCrmFollowUpRecommendationStatement.run(serialized);
       return normalizeCrmFollowUpRecommendationRow(database.prepare(`
         SELECT * FROM crm_follow_up_recommendations
@@ -7483,6 +7512,7 @@ export function createSqliteStorage(config) {
     },
 
     async supersedeCrmFollowUpRecommendations(submissionId, supersededAt) {
+      assertCrmSubmissionWritableInTransaction(submissionId);
       return database.prepare(`
         UPDATE crm_follow_up_recommendations
         SET status = 'superseded', superseded_at = ?
@@ -7491,6 +7521,8 @@ export function createSqliteStorage(config) {
     },
 
     async updateCrmFollowUpRecommendation(id, values = {}) {
+      const current = database.prepare('SELECT submission_id FROM crm_follow_up_recommendations WHERE id = ? LIMIT 1').get(id);
+      if (current?.submission_id) assertCrmSubmissionWritableInTransaction(current.submission_id);
       const allowedFields = ['status', 'acted_on_at', 'superseded_at', 'acted_on_by', 'outcome', 'metadata'];
       const safeValues = Object.fromEntries(Object.entries(values).filter(([field]) => allowedFields.includes(field)));
       if (Object.hasOwn(safeValues, 'metadata')) safeValues.metadata = JSON.stringify(safeValues.metadata || {});
@@ -10685,6 +10717,7 @@ export function createSqliteStorage(config) {
 	    async upsertDealHunterCimRequest(request = {}) {
 	      const serialized = serializeDealHunterCimRequest(request);
 	      return database.transaction(() => {
+	        if (serialized.submission_id) assertCrmSubmissionWritableInTransaction(serialized.submission_id);
 	        runDealHunterCimRequestUpsert(serialized);
 	        const stored = database.prepare(`
 	          SELECT * FROM deal_hunter_cim_requests

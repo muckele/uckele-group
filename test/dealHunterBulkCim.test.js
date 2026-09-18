@@ -111,6 +111,7 @@ function createCimStorage() {
     activities,
     opportunities,
     cimRequestReadCalls,
+    async assertCrmSubmissionWritable() {},
     async listDealHunterSeenDeals() {
       return [];
     },

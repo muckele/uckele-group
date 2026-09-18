@@ -208,6 +208,7 @@ function authorityStorage(overrides = {}) {
   };
   return {
     state,
+    async assertCrmSubmissionWritable() {},
     async getCurrentDealHunterOpportunity(id) { return id === opportunityId ? state.opportunity : null; },
     async getCurrentDealHunterOpportunityScore(id) { return id === opportunityId ? state.score : null; },
     async listDealHunterOpportunityAliases() { return state.aliases; },

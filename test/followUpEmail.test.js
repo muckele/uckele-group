@@ -320,6 +320,7 @@ test('storage command failure means the provider is never called', async () => {
   let providerCalls = 0;
   const record = submission();
   const storage = {
+    async assertCrmSubmissionWritable() {},
     async getSubmission() { return structuredClone(record); },
     async getCrmEmailOutboxByClientRequestKey() { return null; },
     async getActiveEmailSuppression() { return null; },
@@ -370,7 +371,7 @@ test('sender alignment, suppression-store health, and production reply verificat
   const missingSuppressionStore = await previewCrmFollowUpEmail({
     submissionId: submission().id,
     input: sendInput(),
-    storage: {},
+    storage: { async assertCrmSubmissionWritable() {} },
     config: readyConfig(),
     now: sendAt,
   });

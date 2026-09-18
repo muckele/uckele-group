@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { getStorage } from '../storage/index.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 
 const validEventTypePattern = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
 
@@ -46,6 +47,7 @@ export async function recordCrmActivity(options = {}) {
     return null;
   }
 
+  await assertCrmSubmissionWritable({ storage, submissionId: event.submission_id });
   return storage.insertCrmActivityEvent(event);
 }
 
@@ -62,6 +64,7 @@ export async function commitCrmActivityMutation({ storage = getStorage(), operat
     throw new Error('The configured storage provider does not support atomic CRM activity mutations.');
   }
 
+  await assertCrmSubmissionWritable({ storage, submissionId: event.submission_id });
   return storage.mutateWithCrmActivity({ operation, payload, activity: event });
 }
 

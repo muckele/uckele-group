@@ -3,6 +3,7 @@ import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { fetchWithTimeout } from '../utils/http.js';
 import { commitCrmActivityMutation } from './activity.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 
 const directions = new Set(['inbound', 'outbound']);
 const channels = new Set(['email', 'phone', 'meeting', 'text', 'note']);
@@ -356,6 +357,7 @@ export async function createCommunicationWithActivity({ communication, actor = '
   const normalized = normalizeCommunicationRecord(communication, { strict: true });
   if (normalized.error) throw new Error(normalized.error);
   if (!normalized.submission_id) return storage.insertCrmCommunication(normalized);
+  await assertCrmSubmissionWritable({ storage, submissionId: normalized.submission_id });
 
   const mutation = await commitCrmActivityMutation({
     storage,
@@ -429,6 +431,7 @@ export async function listCrmCommunications({ submissionId = '', historySubmissi
 }
 
 export async function createManualCommunication({ submissionId = '', input = {}, actor = 'admin', storage = getStorage() } = {}) {
+  await assertCrmSubmissionWritable({ storage, submissionId: compactText(submissionId, 120) });
   const submission = await storage.getSubmission(compactText(submissionId, 120));
   if (!submission) return { ok: false, status: 404, error: 'CRM record not found.' };
   const requestedStatus = compactText(input.status, 40).toLowerCase();
@@ -1119,6 +1122,7 @@ export async function assignUnassignedCommunication({ communicationId = '', subm
   const communication = await storage.getCrmCommunication(compactText(communicationId, 120));
   if (!communication) return { ok: false, status: 404, error: 'Communication not found.' };
   if (communication.submission_id) return { ok: false, status: 409, error: 'Communication is already assigned.' };
+  await assertCrmSubmissionWritable({ storage, submissionId: compactText(submissionId, 120) });
   const submission = await storage.getSubmission(compactText(submissionId, 120));
   if (!submission) return { ok: false, status: 404, error: 'CRM record not found.' };
   const now = new Date().toISOString();
