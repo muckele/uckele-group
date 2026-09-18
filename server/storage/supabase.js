@@ -1370,6 +1370,24 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       };
     },
 
+    async listHistoricalSubmissionsForAdminExport() {
+      const { data, error } = await client.rpc('list_submissions_page', {
+        p_limit: 5000,
+        p_page: 1,
+        p_search: '',
+        p_status: '',
+        p_created_after: '',
+        p_sort: 'created_at',
+        p_direction: 'desc',
+      });
+
+      if (error) {
+        throw error;
+      }
+
+      return (data?.rows || []).map(normalizeSubmissionRow);
+    },
+
     async listFollowUpSubmissions({
       page = 1, pageSize = 25, search = '', view = 'crm-actions', sort = 'urgency', direction = 'desc',
       now = '', todayStart = '', todayEnd = '',

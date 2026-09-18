@@ -6364,6 +6364,15 @@ export function createSqliteStorage(config) {
       };
     },
 
+    async listHistoricalSubmissionsForAdminExport() {
+      return database.prepare(`
+        SELECT *
+        FROM contact_submissions
+        ORDER BY created_at DESC, id ASC
+        LIMIT 5000
+      `).all().map(normalizeSubmissionRow);
+    },
+
     async listFollowUpSubmissions({
       page = 1, pageSize = 25, search = '', view = 'crm-actions', sort = 'urgency', direction = 'desc',
       now = '', todayStart = '', todayEnd = '',

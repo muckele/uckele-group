@@ -2444,7 +2444,7 @@ export async function deleteDashboardSubmission(id, options = {}) {
 export async function exportDashboardSubmissionsCsv() {
   const storage = getStorage();
   const now = new Date();
-  const result = await storage.listSubmissions({ limit: 5000, page: 1, status: 'all' });
-  const enriched = await enrichSubmissions(result.rows, storage, now);
+  const submissions = await storage.listHistoricalSubmissionsForAdminExport();
+  const enriched = await enrichSubmissions(submissions, storage, now);
   return buildCsv(enriched);
 }

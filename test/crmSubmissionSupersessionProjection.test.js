@@ -183,6 +183,27 @@ function dashboardProjectionsInIsolatedProcess(sqlitePath) {
   return JSON.parse(output.trim());
 }
 
+function dashboardExportInIsolatedProcess(sqlitePath) {
+  const submissionsModuleUrl = pathToFileURL(path.resolve('server/services/submissions.js')).href;
+  const storageModuleUrl = pathToFileURL(path.resolve('server/storage/index.js')).href;
+  const script = `
+    const { exportDashboardSubmissionsCsv } = await import(${JSON.stringify(submissionsModuleUrl)});
+    const { getStorage } = await import(${JSON.stringify(storageModuleUrl)});
+    const csv = await exportDashboardSubmissionsCsv();
+    console.log(JSON.stringify({ csv }));
+    getStorage().close();
+  `;
+  const output = execFileSync(process.execPath, ['--input-type=module', '--eval', script], {
+    cwd: process.cwd(),
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      SQLITE_PATH: sqlitePath,
+    },
+  });
+  return JSON.parse(output.trim()).csv;
+}
+
 test('active CRM projections exclude only the active loser and preserve direct history', async (t) => {
   const { sqlitePath, storage } = await projectionFixture(t);
 
@@ -241,6 +262,16 @@ test('active CRM projections exclude only the active loser and preserve direct h
   });
   assert.deepEqual(ids(commandCenter.records).sort(), ['historical-looking', 'survivor']);
   assert.equal(commandCenter.summary.totalRecords, 2);
+});
+
+test('admin CSV export retains the survivor, active superseded loser, and unrelated historical row', async (t) => {
+  const { sqlitePath } = await projectionFixture(t);
+
+  const csv = dashboardExportInIsolatedProcess(sqlitePath);
+
+  assert.match(csv, /"survivor"/);
+  assert.match(csv, /"loser"/);
+  assert.match(csv, /"historical-looking"/);
 });
 
 test('a separately receipted reversal returns the former loser to active projections', async (t) => {
