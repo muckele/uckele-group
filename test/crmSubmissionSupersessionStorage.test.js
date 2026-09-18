@@ -118,6 +118,38 @@ function reverseRelation(sqlitePath, reversalManifestId) {
   return rawDatabase(sqlitePath, (database) => runRelationReversal(database, reversalManifestId));
 }
 
+function installWeakReversalTrigger(sqlitePath) {
+  rawDatabase(sqlitePath, (database) => database.exec(`
+    DROP TRIGGER IF EXISTS trg_crm_submission_supersessions_reverse_only;
+    CREATE TRIGGER trg_crm_submission_supersessions_reverse_only
+    BEFORE UPDATE ON crm_submission_supersessions
+    WHEN (
+      NEW.updated_at IS NOT OLD.updated_at
+      OR NEW.status IS NOT OLD.status
+      OR NEW.reversed_at IS NOT OLD.reversed_at
+      OR NEW.reversed_by IS NOT OLD.reversed_by
+      OR NEW.reversal_reason IS NOT OLD.reversal_reason
+      OR NEW.reversal_manifest_id IS NOT OLD.reversal_manifest_id
+    ) AND NOT (
+      OLD.status = 'active'
+      AND NEW.status = 'reversed'
+      AND NEW.reversed_at IS NOT NULL AND TRIM(NEW.reversed_at) <> ''
+      AND NEW.reversed_by IS NOT NULL AND TRIM(NEW.reversed_by) <> ''
+      AND NEW.reversal_reason IS NOT NULL AND TRIM(NEW.reversal_reason) <> ''
+      AND NEW.reversal_manifest_id IS NOT NULL AND TRIM(NEW.reversal_manifest_id) <> ''
+      AND EXISTS (
+        SELECT 1 FROM deal_hunter_cim_repair_manifests
+        WHERE id = NEW.reversal_manifest_id
+          AND mode = 'crm-duplicate-consolidation'
+          AND status = 'applied'
+      )
+    )
+    BEGIN
+      SELECT RAISE(ABORT, 'CRM supersession permits only reviewed active to reversed transition');
+    END;
+  `));
+}
+
 const relationInsertSql = `
   INSERT INTO crm_submission_supersessions (
     id, created_at, updated_at, status, survivor_submission_id,
@@ -560,4 +592,33 @@ test('startup upgrades a pre-supersession database without losing existing rows'
     'trg_deal_hunter_opportunities_reject_superseded_primary_insert',
     'trg_deal_hunter_opportunities_reject_superseded_primary_update',
   ]) assert.equal(names.has(expected), true, expected);
+});
+
+test('startup replaces the prior weak reversal trigger on an existing database', async (t) => {
+  const { sqlitePath, storage } = await fixture(t);
+  insertRelation(sqlitePath);
+  await storage.upsertDealHunterCimRepairManifest({
+    id: 'unrelated-reversal-receipt', created_at: timestamp, updated_at: timestamp,
+    mode: 'crm-duplicate-consolidation', status: 'applied', actor: 'reviewer',
+    backup_reference: 'unrelated-backup', checksum: 'f'.repeat(64),
+    manifest: reversalManifest({ relationId: 'another-relation' }), metadata: {},
+  });
+  installWeakReversalTrigger(sqlitePath);
+
+  const reopened = createSqliteStorage({
+    storage: { sqlitePath },
+    protection: { rateLimitRetentionMs: 0 },
+  });
+  try {
+    assert.throws(
+      () => reverseRelation(sqlitePath, 'apply-receipt'),
+      /reviewed|reverse|receipt|transition/i,
+    );
+    assert.throws(
+      () => reverseRelation(sqlitePath, 'unrelated-reversal-receipt'),
+      /reviewed|reverse|receipt|transition/i,
+    );
+  } finally {
+    reopened.close();
+  }
 });

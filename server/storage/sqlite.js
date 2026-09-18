@@ -693,6 +693,43 @@ function normalizeDealHunterRepairManifestRow(row) {
 
 const crmSubmissionSupersessionMaximumRows = 5000;
 const crmSubmissionReversalManifestSchema = 'crm-duplicate-consolidation-reversal-manifest-v1';
+const crmSubmissionReversalTriggerSql = `
+  CREATE TRIGGER trg_crm_submission_supersessions_reverse_only
+  BEFORE UPDATE ON crm_submission_supersessions
+  WHEN (
+    NEW.updated_at IS NOT OLD.updated_at
+    OR NEW.status IS NOT OLD.status
+    OR NEW.reversed_at IS NOT OLD.reversed_at
+    OR NEW.reversed_by IS NOT OLD.reversed_by
+    OR NEW.reversal_reason IS NOT OLD.reversal_reason
+    OR NEW.reversal_manifest_id IS NOT OLD.reversal_manifest_id
+  ) AND NOT (
+    OLD.status = 'active'
+    AND NEW.status = 'reversed'
+    AND NEW.reversed_at IS NOT NULL AND TRIM(NEW.reversed_at) <> ''
+    AND NEW.reversed_by IS NOT NULL AND TRIM(NEW.reversed_by) <> ''
+    AND NEW.reversal_reason IS NOT NULL AND TRIM(NEW.reversal_reason) <> ''
+    AND NEW.reversal_manifest_id IS NOT NULL AND TRIM(NEW.reversal_manifest_id) <> ''
+    AND NEW.reversal_manifest_id <> NEW.repair_manifest_id
+    AND EXISTS (
+      SELECT 1 FROM deal_hunter_cim_repair_manifests
+      WHERE id = NEW.reversal_manifest_id
+        AND mode = 'crm-duplicate-consolidation'
+        AND status = 'applied'
+        AND json_extract(manifest, '$.schema') = '${crmSubmissionReversalManifestSchema}'
+        AND json_extract(manifest, '$.operation') = 'reverse'
+        AND json_extract(manifest, '$.relationId') = NEW.id
+        AND json_extract(manifest, '$.applyManifestId') = NEW.repair_manifest_id
+        AND json_extract(manifest, '$.repairDigest') = NEW.repair_digest
+        AND json_extract(manifest, '$.survivorSubmissionId') = NEW.survivor_submission_id
+        AND json_extract(manifest, '$.supersededSubmissionId') = NEW.superseded_submission_id
+        AND json_extract(manifest, '$.opportunityId') = NEW.opportunity_id
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'CRM supersession permits only reviewed active to reversed transition');
+  END;
+`;
 
 function normalizeCrmSubmissionSupersessionRow(row) {
   return row
@@ -775,6 +812,13 @@ function crmSubmissionReversalReceiptMatches(relation, receipt) {
     && manifest.supersededSubmissionId === relation.supersededSubmissionId
     && manifest.opportunityId === relation.opportunityId
   );
+}
+
+function migrateCrmSubmissionReversalTrigger(database) {
+  database.transaction(() => {
+    database.exec('DROP TRIGGER IF EXISTS trg_crm_submission_supersessions_reverse_only');
+    database.exec(crmSubmissionReversalTriggerSql);
+  }).immediate();
 }
 
 function normalizeCimStage2ActivationRow(row) {
@@ -3203,42 +3247,6 @@ export function createSqliteStorage(config) {
         SELECT RAISE(ABORT, 'CRM supersession core fields are immutable');
       END;
 
-      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_reverse_only
-      BEFORE UPDATE ON crm_submission_supersessions
-      WHEN (
-        NEW.updated_at IS NOT OLD.updated_at
-        OR NEW.status IS NOT OLD.status
-        OR NEW.reversed_at IS NOT OLD.reversed_at
-        OR NEW.reversed_by IS NOT OLD.reversed_by
-        OR NEW.reversal_reason IS NOT OLD.reversal_reason
-        OR NEW.reversal_manifest_id IS NOT OLD.reversal_manifest_id
-      ) AND NOT (
-        OLD.status = 'active'
-        AND NEW.status = 'reversed'
-        AND NEW.reversed_at IS NOT NULL AND TRIM(NEW.reversed_at) <> ''
-        AND NEW.reversed_by IS NOT NULL AND TRIM(NEW.reversed_by) <> ''
-        AND NEW.reversal_reason IS NOT NULL AND TRIM(NEW.reversal_reason) <> ''
-        AND NEW.reversal_manifest_id IS NOT NULL AND TRIM(NEW.reversal_manifest_id) <> ''
-        AND NEW.reversal_manifest_id <> NEW.repair_manifest_id
-        AND EXISTS (
-          SELECT 1 FROM deal_hunter_cim_repair_manifests
-          WHERE id = NEW.reversal_manifest_id
-            AND mode = 'crm-duplicate-consolidation'
-            AND status = 'applied'
-            AND json_extract(manifest, '$.schema') = 'crm-duplicate-consolidation-reversal-manifest-v1'
-            AND json_extract(manifest, '$.operation') = 'reverse'
-            AND json_extract(manifest, '$.relationId') = NEW.id
-            AND json_extract(manifest, '$.applyManifestId') = NEW.repair_manifest_id
-            AND json_extract(manifest, '$.repairDigest') = NEW.repair_digest
-            AND json_extract(manifest, '$.survivorSubmissionId') = NEW.survivor_submission_id
-            AND json_extract(manifest, '$.supersededSubmissionId') = NEW.superseded_submission_id
-            AND json_extract(manifest, '$.opportunityId') = NEW.opportunity_id
-        )
-      )
-      BEGIN
-        SELECT RAISE(ABORT, 'CRM supersession permits only reviewed active to reversed transition');
-      END;
-
       CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_no_delete
       BEFORE DELETE ON crm_submission_supersessions
       BEGIN
@@ -3619,6 +3627,8 @@ export function createSqliteStorage(config) {
 		CREATE INDEX IF NOT EXISTS idx_admin_onboarding_progress_principal_updated
 		  ON admin_onboarding_progress(principal_id, updated_at DESC);
 	  `);
+
+  migrateCrmSubmissionReversalTrigger(database);
 
   ensureColumn(database, 'contact_submissions', 'lead_type', "TEXT NOT NULL DEFAULT 'owner'");
   ensureColumn(database, 'contact_submissions', 'priority', "TEXT NOT NULL DEFAULT 'normal'");
