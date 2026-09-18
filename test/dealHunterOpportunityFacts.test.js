@@ -190,7 +190,9 @@ async function captureCollectorPrivateCompleteSheetAdmission(snapshot) {
 
 function withStorage(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-opportunity-facts-'));
-  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'facts.sqlite') } });
+  const sqlitePath = path.join(directory, 'facts.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  storage.testSqlitePath = sqlitePath;
   t.after(() => {
     storage.close();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -1149,10 +1151,6 @@ test('source observations normalize the bounded Deal Hunter field set and reject
   const invalid = observationRecord({ field: 'raw_metadata' });
   await assert.rejects(sqlite.upsertDealHunterOpportunitySourceObservation(invalid), /Unsupported opportunity source-observation field/);
   await assert.rejects(supabase.upsertDealHunterOpportunitySourceObservation(invalid), /Unsupported opportunity source-observation field/);
-  // The supersession schema is intentionally still unclassified by the separate
-  // canonical-opportunity merge repair. Until that repair receives a reviewed
-  // inventory update, its earlier fail-closed schema refusal is also valid here;
-  // neither path may consume or rewrite the durable fact rows below.
   await assert.rejects(
     sqlite.upsertDealHunterOpportunitySourceObservation(observationRecord({ value: 'x'.repeat(5001) })),
     /at most 5000 characters/,
@@ -2332,17 +2330,23 @@ test('canonical-merge inspection classifies and preserves opportunity-owned fact
     CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
   );
 
-  // The supersession schema is intentionally still unclassified by the separate
-  // canonical-opportunity merge repair. Until that repair receives a reviewed
-  // inventory update, its earlier fail-closed schema refusal is also valid here;
-  // neither path may consume or rewrite the durable fact rows below.
+  // This focused legacy-contract test predates the separately blocked
+  // supersession-schema inventory decision. Remove that unrelated, empty table
+  // from this disposable database so the fact dependency remains precise.
+  const database = new Database(storage.testSqlitePath);
+  try {
+    database.exec('DROP TABLE crm_submission_supersessions');
+  } finally {
+    database.close();
+  }
+
   await assert.rejects(
     storage.inspectDealHunterCanonicalOpportunityMerge({
       approval,
       actor: 'acquisition-admin',
       reason: 'Verify durable fact projections block a canonical merge.',
     }),
-    /(?:unexpected dependent state: operatorFacts, sourceObservations|unclassified relationship schema: crm_submission_supersessions\.)/,
+    /unexpected dependent state: operatorFacts, sourceObservations/,
   );
   assert.deepEqual((await storage.listDealHunterOpportunityFacts(approval.survivorId)).map((fact) => fact.id), ['merge-guard-fact']);
   assert.deepEqual(

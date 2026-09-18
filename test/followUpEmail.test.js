@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import {
   buildFollowUpEmailContent,
@@ -110,15 +111,61 @@ function submission(overrides = {}) {
 
 function createStorage(t, record = submission()) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-follow-up-email-'));
+  const sqlitePath = path.join(tempDir, 'crm.sqlite');
   const storage = createSqliteStorage({
-    storage: { sqlitePath: path.join(tempDir, 'crm.sqlite') },
+    storage: { sqlitePath },
     protection: { rateLimitRetentionMs: 0 },
   });
   t.after(() => {
     storage.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
+  storage.testSqlitePath = sqlitePath;
   return storage.insertSubmission(record).then(() => storage);
+}
+
+async function markSubmissionSuperseded(storage, loserId) {
+  const survivorId = `${loserId}-survivor`;
+  const opportunityId = `${loserId}-opportunity`;
+  const checksum = '7'.repeat(64);
+  await storage.insertSubmission(submission({
+    id: survivorId,
+    email: 'survivor@example.test',
+    deal_hunter_opportunity_id: opportunityId,
+  }));
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: opportunityId,
+    created_at: initialAt,
+    updated_at: initialAt,
+    canonical_name: 'Follow-up replay authority',
+    canonical_recipient: null,
+    canonical_location: null,
+    primary_submission_id: survivorId,
+    identity_version: 'follow-up-replay-v1',
+    status: 'active',
+    metadata: {},
+  });
+  await storage.upsertDealHunterCimRepairManifest({
+    id: `${loserId}-receipt`, created_at: initialAt, updated_at: initialAt,
+    mode: 'crm-duplicate-consolidation', status: 'applied', actor: 'test',
+    backup_reference: 'test', checksum, manifest: { version: 1 }, metadata: {},
+  });
+  const database = new Database(storage.testSqlitePath);
+  try {
+    database.prepare(`
+      INSERT INTO crm_submission_supersessions (
+        id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
+        opportunity_id, reason_code, reason_text, approved_by, approved_at, actor,
+        repair_version, repair_manifest_id, repair_digest, metadata
+      ) VALUES (?, ?, ?, 'active', ?, ?, ?, 'confirmed-duplicate', 'Reviewed duplicate.',
+        'owner@example.test', ?, 'test', 'follow-up-replay-v1', ?, ?, '{}')
+    `).run(
+      `${loserId}-relation`, initialAt, initialAt, survivorId, loserId, opportunityId,
+      initialAt, `${loserId}-receipt`, checksum,
+    );
+  } finally {
+    database.close();
+  }
 }
 
 function sendInput(overrides = {}) {
@@ -177,6 +224,83 @@ test('generic follow-up persists the exact command before provider transmission 
   assert.equal(replay.replayedCommand, true);
   assert.equal(replay.outbox.id, first.outbox.id);
   assert.equal(providerCalls.length, 1, 'a duplicate confirmation never calls the provider again');
+});
+
+test('terminal client-key replay precedes supersession refusal while nonterminal replay still refuses', async (t) => {
+  const terminalStorage = await createStorage(t);
+  let providerCalls = 0;
+  const first = await sendCrmFollowUpEmail({
+    submissionId: submission().id,
+    actor: 'admin@example.test',
+    input: sendInput(),
+    storage: terminalStorage,
+    sender: async () => {
+      providerCalls += 1;
+      return { status: 'sent', providerMessageId: 'terminal-before-supersession' };
+    },
+    config: readyConfig(),
+    now: sendAt,
+  });
+  assert.equal(first.outbox.state, 'accepted');
+  await markSubmissionSuperseded(terminalStorage, submission().id);
+  const replay = await sendCrmFollowUpEmail({
+    submissionId: submission().id,
+    actor: 'admin@example.test',
+    input: sendInput(),
+    storage: terminalStorage,
+    sender: async () => {
+      providerCalls += 1;
+      return { status: 'sent', providerMessageId: 'must-not-send' };
+    },
+    config: readyConfig(),
+    now: new Date('2026-08-10T17:01:00.000Z'),
+  });
+  assert.equal(replay.ok, true);
+  assert.equal(replay.replayedCommand, true);
+  assert.equal(replay.outbox.id, first.outbox.id);
+  assert.equal(providerCalls, 1, 'terminal replay does not cross the provider boundary again');
+  const queuedModeReplay = await sendCrmFollowUpEmail({
+    submissionId: submission().id,
+    actor: 'admin@example.test',
+    input: sendInput(),
+    storage: terminalStorage,
+    sender: async () => {
+      providerCalls += 1;
+      return { status: 'sent', providerMessageId: 'must-not-send' };
+    },
+    config: readyConfig(),
+    now: new Date('2026-08-10T17:02:00.000Z'),
+    processImmediately: false,
+  });
+  assert.equal(queuedModeReplay.status, 200);
+  assert.equal(queuedModeReplay.replayedCommand, true);
+  assert.equal(queuedModeReplay.outbox.state, 'accepted');
+  assert.equal(providerCalls, 1);
+
+  const nonterminalStorage = await createStorage(t, submission({ id: 'nonterminal-replay' }));
+  const queued = await sendCrmFollowUpEmail({
+    submissionId: 'nonterminal-replay',
+    actor: 'admin@example.test',
+    input: sendInput(),
+    storage: nonterminalStorage,
+    config: readyConfig(),
+    now: sendAt,
+    processImmediately: false,
+  });
+  assert.equal(queued.outbox.state, 'queued');
+  await markSubmissionSuperseded(nonterminalStorage, 'nonterminal-replay');
+  await assert.rejects(
+    sendCrmFollowUpEmail({
+      submissionId: 'nonterminal-replay',
+      actor: 'admin@example.test',
+      input: sendInput(),
+      storage: nonterminalStorage,
+      config: readyConfig(),
+      now: new Date('2026-08-10T17:01:00.000Z'),
+      processImmediately: false,
+    }),
+    { code: 'CRM_SUBMISSION_SUPERSEDED', submissionId: 'nonterminal-replay' },
+  );
 });
 
 test('disabled, suppressed, archived, stale, deceptive, and unapproved recipient states fail before provider work', async (t) => {

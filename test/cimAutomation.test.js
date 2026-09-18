@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
+import Database from 'better-sqlite3';
 import {
   CIM_STAGE2_EVIDENCE_VERSION,
   assessCimStage2StaticCandidate,
@@ -16,6 +20,7 @@ import {
   recordCimResponseOutcome,
   recordCimReviewDecisions,
 } from '../server/services/cimAutomation.js';
+import { createSqliteStorage } from '../server/storage/sqlite.js';
 
 function automationConfig(stage = 2) {
   return {
@@ -601,10 +606,13 @@ test('final Stage 2 authorization binds run, activation, claim, opportunity, rec
       async getCimStage2Decision() { return { ...decision, ...(overrides.decision || {}) }; },
       async getCimStage2Run() { return { ...run, ...(overrides.run || {}) }; },
       async getCurrentCimStage2Activation() { return { ...activation, ...(overrides.activation || {}) }; },
-      async getCurrentDealHunterOpportunity() {
-        return overrides.currentOpportunity === false
-          ? null
-          : { opportunity_id: deal.opportunityId, status: 'active' };
+      async getCimStage2SubmissionAuthority() {
+        return {
+          opportunity: overrides.currentOpportunity === false
+            ? null
+            : { opportunity_id: deal.opportunityId, status: 'active' },
+          primarySubmissionWritable: overrides.primarySubmissionWritable !== false,
+        };
       },
     },
     config,
@@ -623,6 +631,7 @@ test('final Stage 2 authorization binds run, activation, claim, opportunity, rec
     [{ decision: { claim_token: 'wrong-claim' } }, 'wrong_claim'],
     [{ decision: { consumed_at: '2026-07-13T15:59:00.000Z' } }, 'decision_consumed'],
     [{ currentOpportunity: false }, 'opportunity_not_current'],
+    [{ primarySubmissionWritable: false }, 'opportunity_primary_superseded'],
     [{ status: { ...validReservedStatus, blockerCodes: ['automation_pause'] } }, 'automatic_transmission_blocked'],
   ];
   for (const [overrides, expectedCode] of cases) {
@@ -630,6 +639,111 @@ test('final Stage 2 authorization binds run, activation, claim, opportunity, rec
     assert.equal(result.ok, false, expectedCode);
     assert.equal(result.code, expectedCode);
   }
+});
+
+test('real SQLite final Stage 2 authority rejects a primary that became an active loser after prior lookup', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-stage2-supersession-authority-'));
+  const sqlitePath = path.join(directory, 'crm.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => {
+    storage.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const timestamp = '2026-07-13T16:00:00.000Z';
+  const makeSubmission = (id, owner = null) => ({
+    id, created_at: timestamp, updated_at: timestamp, status: 'review', spam_score: 0,
+    spam_reasons: [], delivery_provider: 'manual', delivery_status: 'not-applicable', delivery_error: null,
+    crm_status: 'not-applicable', crm_error: null, source: 'stage2-authority-test', ip_hash: '',
+    user_agent: '', name: id, email: `${id}@example.test`, phone: '', company: id, role: 'Broker',
+    message: '', status_updated_at: timestamp, listing_url: '', business_website: '', prospectus_url: '',
+    asking_price: '', ttm_revenue: '', ttm_ebitda: '', ebitda_multiple: '', net_margin: '', business_age: '',
+    sba_eligible: 'unknown', broker_name: '', broker_email: '', broker_phone: '', seller_name: '',
+    seller_email: '', seller_phone: '', lead_type: 'broker', priority: 'normal', tags: [], assigned_to: '',
+    notes: '', follow_up_state: 'needs-response', next_action_at: null, last_contacted_at: null,
+    deal_hunter_opportunity_id: owner, metadata: {},
+  });
+  await storage.insertSubmission(makeSubmission('stage2-survivor', 'opp-stage2-authority'));
+  await storage.insertSubmission(makeSubmission('stage2-loser'));
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: 'opp-stage2-authority', created_at: timestamp, updated_at: timestamp,
+    canonical_name: 'Stage 2 authority', canonical_recipient: null, canonical_location: null,
+    primary_submission_id: 'stage2-survivor', identity_version: 'stage2-authority-v1', status: 'active', metadata: {},
+  });
+  const checksum = '8'.repeat(64);
+  await storage.upsertDealHunterCimRepairManifest({
+    id: 'stage2-authority-receipt', created_at: timestamp, updated_at: timestamp,
+    mode: 'crm-duplicate-consolidation', status: 'applied', actor: 'test', backup_reference: 'test',
+    checksum, manifest: { version: 1 }, metadata: {},
+  });
+  const beforeRace = await storage.getCurrentDealHunterOpportunity('opp-stage2-authority');
+  assert.equal(beforeRace.primary_submission_id, 'stage2-survivor');
+  const survivorAuthority = await storage.getCimStage2SubmissionAuthority('opp-stage2-authority');
+  assert.equal(survivorAuthority.primarySubmissionWritable, true, 'unchanged survivor authority remains eligible');
+
+  const config = automationConfig(2);
+  const policy = getCimStage2Policy(config);
+  const deal = trustedDeal({ opportunityId: 'opp-stage2-authority' });
+  const run = { id: 'run-race', mode: 'canary', policy_hash: policy.policyHash };
+  const activation = { id: 'activation-race', mode: 'canary', policy_hash: policy.policyHash };
+  const decision = {
+    ...buildCimStage2DecisionRecord({ run, deal, evaluation: { reasonCodes: [] }, activationId: activation.id, policy }),
+    decision_state: 'attempting', claim_token: 'claim-race', consumed_at: null,
+  };
+  const callBoundary = () => authorizeCimStage2SendBoundary({
+    decisionId: decision.id,
+    runId: run.id,
+    activationId: activation.id,
+    claimToken: 'claim-race',
+    deal,
+    snapshotDigest: cimStage2SnapshotDigest(deal),
+    storage: {
+      async getCimStage2Decision() { return decision; },
+      async getCimStage2Run() { return run; },
+      async getCurrentCimStage2Activation() { return activation; },
+      getCimStage2SubmissionAuthority: storage.getCimStage2SubmissionAuthority.bind(storage),
+    },
+    config,
+    now: new Date(timestamp),
+    statusCheck: async () => ({
+      configuredStage: 2, evidenceStage: 2, effectiveStage: 2, activationMode: 'canary',
+      automaticTransmissionAllowed: true, blockerCodes: [], capacity: { used: 0, limit: 1, remaining: 1 },
+    }),
+  });
+  assert.equal((await callBoundary()).ok, true, 'the real SQLite survivor-primary control remains authorized');
+
+  const secondConnection = new Database(sqlitePath);
+  try {
+    secondConnection.prepare(`
+      INSERT INTO crm_submission_supersessions (
+        id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
+        opportunity_id, reason_code, reason_text, approved_by, approved_at, actor,
+        repair_version, repair_manifest_id, repair_digest, metadata
+      ) VALUES ('stage2-authority-relation', ?, ?, 'active', 'stage2-survivor', 'stage2-loser',
+        'opp-stage2-authority', 'confirmed-duplicate', 'Reviewed duplicate.', 'owner@example.test', ?,
+        'test', 'stage2-authority-v1', 'stage2-authority-receipt', ?, '{}')
+    `).run(timestamp, timestamp, timestamp, checksum);
+    // Supported writers and the normal schema forbid this corrupting transition.
+    // Dropping only the disposable guards lets the final authority boundary prove
+    // it still fails closed if such drift appears between an earlier lookup and send.
+    secondConnection.exec(`
+      DROP TRIGGER trg_crm_submission_supersessions_guard_opportunity_update;
+      DROP TRIGGER trg_deal_hunter_opportunities_reject_superseded_primary_update;
+      UPDATE deal_hunter_opportunities
+      SET primary_submission_id = 'stage2-loser'
+      WHERE opportunity_id = 'opp-stage2-authority';
+    `);
+  } finally {
+    secondConnection.close();
+  }
+
+  const result = await callBoundary();
+  assert.equal(result.ok, false);
+  assert.equal(result.code, 'opportunity_primary_superseded');
+  assert.equal(
+    (await storage.getCurrentDealHunterOpportunity('opp-stage2-authority')).primary_submission_id,
+    'stage2-loser',
+    'read-only final authorization does not mutate the drifted business state',
+  );
 });
 
 test('ambiguous Stage 2 decisions reconcile from durable communication state before another live run', async () => {

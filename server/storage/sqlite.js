@@ -6669,78 +6669,71 @@ export function createSqliteStorage(config) {
     },
 
     async insertSecureUploadRequest(requestRecord) {
-      assertCrmSubmissionWritableInTransaction(requestRecord?.submission_id);
-      insertSecureUploadRequestStatement.run(serializeUploadRequest(requestRecord));
-      return requestRecord;
+      return database.transaction(() => {
+        assertCrmSubmissionWritableInTransaction(requestRecord?.submission_id);
+        insertSecureUploadRequestStatement.run(serializeUploadRequest(requestRecord));
+        return requestRecord;
+      }).immediate();
     },
 
     async updateSecureUploadRequest(id, values) {
-      const request = database.prepare('SELECT submission_id FROM secure_upload_requests WHERE id = ?').get(id);
-      if (request?.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
-      updateRecord(
-        'secure_upload_requests',
-        id,
-        serializeUploadRequestValues(values),
-        ['updated_at', 'status', 'expires_at', 'nda_required', 'nda_accepted_at', 'last_uploaded_at', 'note', 'requested_documents', 'revoked_at', 'closed_at', 'upload_batch_count'],
-      );
-
-      return this.getSecureUploadRequest(id);
+      return database.transaction(() => {
+        const request = database.prepare('SELECT submission_id FROM secure_upload_requests WHERE id = ?').get(id);
+        if (request?.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
+        updateRecord(
+          'secure_upload_requests',
+          id,
+          serializeUploadRequestValues(values),
+          ['updated_at', 'status', 'expires_at', 'nda_required', 'nda_accepted_at', 'last_uploaded_at', 'note', 'requested_documents', 'revoked_at', 'closed_at', 'upload_batch_count'],
+        );
+        return normalizeUploadRequestRow(database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(id));
+      }).immediate();
     },
 
     async resetSecureUploadRequestIfUploading(id, values) {
-      const request = database.prepare('SELECT submission_id FROM secure_upload_requests WHERE id = ?').get(id);
-      if (request?.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
-      const updates = Object.entries(serializeUploadRequestValues(values)).filter(([key]) =>
-        ['updated_at', 'status'].includes(key),
-      );
-
-      if (updates.length === 0) {
-        return null;
-      }
-
-      const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
-      const payload = Object.fromEntries(updates);
-      payload.id = id;
-      const result = database
-        .prepare(`UPDATE secure_upload_requests SET ${fields} WHERE id = @id AND status = 'uploading'`)
-        .run(payload);
-
-      return result.changes > 0 ? this.getSecureUploadRequest(id) : null;
+      return database.transaction(() => {
+        const request = database.prepare('SELECT submission_id FROM secure_upload_requests WHERE id = ?').get(id);
+        if (request?.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
+        const updates = Object.entries(serializeUploadRequestValues(values)).filter(([key]) =>
+          ['updated_at', 'status'].includes(key),
+        );
+        if (updates.length === 0) return null;
+        const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
+        const payload = Object.fromEntries(updates);
+        payload.id = id;
+        const result = database
+          .prepare(`UPDATE secure_upload_requests SET ${fields} WHERE id = @id AND status = 'uploading'`)
+          .run(payload);
+        return result.changes > 0
+          ? normalizeUploadRequestRow(database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(id))
+          : null;
+      }).immediate();
     },
 
     async claimSecureUploadRequest(id, values, options = {}) {
-      const request = database.prepare('SELECT submission_id FROM secure_upload_requests WHERE id = ?').get(id);
-      if (request?.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
       const updates = Object.entries(serializeUploadRequestValues(values)).filter(([key]) =>
         ['updated_at', 'status', 'nda_accepted_at', 'last_uploaded_at', 'note', 'closed_at', 'upload_batch_count'].includes(key),
       );
-
-      if (updates.length === 0) {
-        return null;
-      }
-
-      const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
-      const payload = updates.reduce((accumulator, [key, value]) => {
-        accumulator[key] = value;
-        return accumulator;
-      }, {});
-
-      payload.id = id;
-      payload.stale_before = options.staleBefore || '';
-      const result = database
-        .prepare(
-          `
-            UPDATE secure_upload_requests SET ${fields}
-            WHERE id = @id
-              AND (
-                status IN ('awaiting-documents', 'open', 'partially-received')
-                OR (status = 'uploading' AND @stale_before != '' AND updated_at <= @stale_before)
-              )
-          `,
-        )
-        .run(payload);
-
-      return result.changes > 0 ? this.getSecureUploadRequest(id) : null;
+      if (updates.length === 0) return null;
+      return database.transaction(() => {
+        const request = database.prepare('SELECT submission_id FROM secure_upload_requests WHERE id = ?').get(id);
+        if (request?.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
+        const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
+        const payload = Object.fromEntries(updates);
+        payload.id = id;
+        payload.stale_before = options.staleBefore || '';
+        const result = database.prepare(`
+          UPDATE secure_upload_requests SET ${fields}
+          WHERE id = @id
+            AND (
+              status IN ('awaiting-documents', 'open', 'partially-received')
+              OR (status = 'uploading' AND @stale_before != '' AND updated_at <= @stale_before)
+            )
+        `).run(payload);
+        return result.changes > 0
+          ? normalizeUploadRequestRow(database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(id))
+          : null;
+      }).immediate();
     },
 
     async getSecureUploadRequest(id) {
@@ -6775,29 +6768,33 @@ export function createSqliteStorage(config) {
     },
 
     async insertSecureDocument(document) {
-      if (document?.submission_id) assertCrmSubmissionWritableInTransaction(document.submission_id);
-      insertSecureDocumentStatement.run(document);
-      if (document.submission_id) {
-        database.prepare(`
-          UPDATE crm_follow_up_recommendations
-          SET status = 'superseded', superseded_at = ?
-          WHERE submission_id = ? AND status = 'current'
-        `).run(document.created_at || new Date().toISOString(), document.submission_id);
-      }
-      return document;
+      return database.transaction(() => {
+        if (document?.submission_id) assertCrmSubmissionWritableInTransaction(document.submission_id);
+        insertSecureDocumentStatement.run(document);
+        if (document.submission_id) {
+          database.prepare(`
+            UPDATE crm_follow_up_recommendations
+            SET status = 'superseded', superseded_at = ?
+            WHERE submission_id = ? AND status = 'current'
+          `).run(document.created_at || new Date().toISOString(), document.submission_id);
+        }
+        return document;
+      }).immediate();
     },
 
     async deleteSecureDocument(id) {
-      const document = database.prepare('SELECT submission_id FROM secure_documents WHERE id = ? LIMIT 1').get(id);
-      if (document?.submission_id) assertCrmSubmissionWritableInTransaction(document.submission_id);
-      deleteSecureDocumentStatement.run(id);
-      if (document?.submission_id) {
-        database.prepare(`
-          UPDATE crm_follow_up_recommendations
-          SET status = 'superseded', superseded_at = ?
-          WHERE submission_id = ? AND status = 'current'
-        `).run(new Date().toISOString(), document.submission_id);
-      }
+      return database.transaction(() => {
+        const document = database.prepare('SELECT submission_id FROM secure_documents WHERE id = ? LIMIT 1').get(id);
+        if (document?.submission_id) assertCrmSubmissionWritableInTransaction(document.submission_id);
+        deleteSecureDocumentStatement.run(id);
+        if (document?.submission_id) {
+          database.prepare(`
+            UPDATE crm_follow_up_recommendations
+            SET status = 'superseded', superseded_at = ?
+            WHERE submission_id = ? AND status = 'current'
+          `).run(new Date().toISOString(), document.submission_id);
+        }
+      }).immediate();
     },
 
     async getSecureDocument(id) {
@@ -7025,7 +7022,7 @@ export function createSqliteStorage(config) {
           `).run(stored.occurred_at || stored.updated_at || new Date().toISOString(), stored.submission_id);
         }
         return stored;
-      })();
+      }).immediate();
     },
 
     async updateCrmCommunication(id, values = {}) {
@@ -7040,24 +7037,34 @@ export function createSqliteStorage(config) {
         'content_next_attempt_at', 'attachment_metadata', 'assigned_at', 'assigned_by', 'updated_by',
         'metadata',
       ];
-      const current = database.prepare('SELECT submission_id FROM crm_communications WHERE id = ? LIMIT 1').get(id);
-      const targetSubmissionId = Object.hasOwn(values, 'submission_id') ? values.submission_id : current?.submission_id;
-      if (targetSubmissionId) assertCrmSubmissionWritableInTransaction(targetSubmissionId);
-      updateRecord(
-        'crm_communications',
-        id,
-        serializeCrmCommunicationValues(values),
-        allowedFields,
-      );
-      const updated = await this.getCrmCommunication(id);
-      if (updated?.submission_id) {
-        database.prepare(`
-          UPDATE crm_follow_up_recommendations
-          SET status = 'superseded', superseded_at = ?
-          WHERE submission_id = ? AND status = 'current'
-        `).run(updated.updated_at || new Date().toISOString(), updated.submission_id);
-      }
-      return updated;
+      return database.transaction(() => {
+        const current = database.prepare('SELECT submission_id FROM crm_communications WHERE id = ? LIMIT 1').get(id);
+        const existingSubmissionId = String(current?.submission_id || '').trim();
+        const targetSubmissionId = Object.hasOwn(values, 'submission_id')
+          ? String(values.submission_id || '').trim()
+          : existingSubmissionId;
+        if (existingSubmissionId) assertCrmSubmissionWritableInTransaction(existingSubmissionId);
+        if (targetSubmissionId && targetSubmissionId !== existingSubmissionId) {
+          assertCrmSubmissionWritableInTransaction(targetSubmissionId);
+        }
+        updateRecord(
+          'crm_communications',
+          id,
+          serializeCrmCommunicationValues(values),
+          allowedFields,
+        );
+        const updated = normalizeCrmCommunicationRow(
+          database.prepare('SELECT * FROM crm_communications WHERE id = ? LIMIT 1').get(id),
+        );
+        if (updated?.submission_id) {
+          database.prepare(`
+            UPDATE crm_follow_up_recommendations
+            SET status = 'superseded', superseded_at = ?
+            WHERE submission_id = ? AND status = 'current'
+          `).run(updated.updated_at || new Date().toISOString(), updated.submission_id);
+        }
+        return updated;
+      }).immediate();
     },
 
     async createCrmEmailCommand({
@@ -7308,27 +7315,34 @@ export function createSqliteStorage(config) {
     },
 
     async claimCrmEmailOutbox({ id = '', claimToken = '', claimedAt = '', claimExpiresAt = '' } = {}) {
-      const current = database.prepare('SELECT submission_id, state FROM crm_email_outbox WHERE id = ? LIMIT 1').get(id);
-      if (current?.submission_id && ['queued', 'retryable_failed', 'sending'].includes(current.state)) {
-        assertCrmSubmissionWritableInTransaction(current.submission_id);
-      }
-      const row = database.prepare(`
-        UPDATE crm_email_outbox SET
-          state = 'sending',
-          attempt_count = attempt_count + 1,
-          claim_token = ?,
-          claimed_at = ?,
-          claim_expires_at = ?,
-          updated_at = ?
-        WHERE id = ?
-          AND (
-            state = 'queued'
-            OR (state = 'retryable_failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
-            OR (state = 'sending' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?)
-          )
-        RETURNING *
-      `).get(claimToken, claimedAt, claimExpiresAt, claimedAt, id, claimedAt, claimedAt);
-      return { claimed: Boolean(row), outbox: normalizeCrmEmailOutboxRow(row || database.prepare('SELECT * FROM crm_email_outbox WHERE id = ? LIMIT 1').get(id)) };
+      return database.transaction(() => {
+        const current = database.prepare('SELECT submission_id, state FROM crm_email_outbox WHERE id = ? LIMIT 1').get(id);
+        if (current?.submission_id && ['queued', 'retryable_failed', 'sending'].includes(current.state)) {
+          assertCrmSubmissionWritableInTransaction(current.submission_id);
+        }
+        const row = database.prepare(`
+          UPDATE crm_email_outbox SET
+            state = 'sending',
+            attempt_count = attempt_count + 1,
+            claim_token = ?,
+            claimed_at = ?,
+            claim_expires_at = ?,
+            updated_at = ?
+          WHERE id = ?
+            AND (
+              state = 'queued'
+              OR (state = 'retryable_failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+              OR (state = 'sending' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?)
+            )
+          RETURNING *
+        `).get(claimToken, claimedAt, claimExpiresAt, claimedAt, id, claimedAt, claimedAt);
+        return {
+          claimed: Boolean(row),
+          outbox: normalizeCrmEmailOutboxRow(
+            row || database.prepare('SELECT * FROM crm_email_outbox WHERE id = ? LIMIT 1').get(id),
+          ),
+        };
+      }).immediate();
     },
 
     async finishCrmEmailOutboxClaim(id, claimToken, values = {}) {
@@ -7487,13 +7501,15 @@ export function createSqliteStorage(config) {
 
     async insertCrmFollowUpRecommendation(recommendation = {}) {
       const serialized = serializeCrmFollowUpRecommendation(recommendation);
-      assertCrmSubmissionWritableInTransaction(serialized.submission_id);
-      insertCrmFollowUpRecommendationStatement.run(serialized);
-      return normalizeCrmFollowUpRecommendationRow(database.prepare(`
-        SELECT * FROM crm_follow_up_recommendations
-        WHERE submission_id = ? AND input_fingerprint = ? AND engine_version = ?
-        LIMIT 1
-      `).get(serialized.submission_id, serialized.input_fingerprint, serialized.engine_version));
+      return database.transaction(() => {
+        assertCrmSubmissionWritableInTransaction(serialized.submission_id);
+        insertCrmFollowUpRecommendationStatement.run(serialized);
+        return normalizeCrmFollowUpRecommendationRow(database.prepare(`
+          SELECT * FROM crm_follow_up_recommendations
+          WHERE submission_id = ? AND input_fingerprint = ? AND engine_version = ?
+          LIMIT 1
+        `).get(serialized.submission_id, serialized.input_fingerprint, serialized.engine_version));
+      }).immediate();
     },
 
     async getCurrentCrmFollowUpRecommendation(submissionId) {
@@ -7512,27 +7528,31 @@ export function createSqliteStorage(config) {
     },
 
     async supersedeCrmFollowUpRecommendations(submissionId, supersededAt) {
-      assertCrmSubmissionWritableInTransaction(submissionId);
-      return database.prepare(`
-        UPDATE crm_follow_up_recommendations
-        SET status = 'superseded', superseded_at = ?
-        WHERE submission_id = ? AND status = 'current'
-      `).run(supersededAt, submissionId).changes;
+      return database.transaction(() => {
+        assertCrmSubmissionWritableInTransaction(submissionId);
+        return database.prepare(`
+          UPDATE crm_follow_up_recommendations
+          SET status = 'superseded', superseded_at = ?
+          WHERE submission_id = ? AND status = 'current'
+        `).run(supersededAt, submissionId).changes;
+      }).immediate();
     },
 
     async updateCrmFollowUpRecommendation(id, values = {}) {
-      const current = database.prepare('SELECT submission_id FROM crm_follow_up_recommendations WHERE id = ? LIMIT 1').get(id);
-      if (current?.submission_id) assertCrmSubmissionWritableInTransaction(current.submission_id);
       const allowedFields = ['status', 'acted_on_at', 'superseded_at', 'acted_on_by', 'outcome', 'metadata'];
       const safeValues = Object.fromEntries(Object.entries(values).filter(([field]) => allowedFields.includes(field)));
       if (Object.hasOwn(safeValues, 'metadata')) safeValues.metadata = JSON.stringify(safeValues.metadata || {});
-      if (Object.keys(safeValues).length === 0) return normalizeCrmFollowUpRecommendationRow(
-        database.prepare('SELECT * FROM crm_follow_up_recommendations WHERE id = ? LIMIT 1').get(id),
-      );
-      const assignments = Object.keys(safeValues).map((field) => `${field} = @${field}`).join(', ');
-      return normalizeCrmFollowUpRecommendationRow(database.prepare(`
-        UPDATE crm_follow_up_recommendations SET ${assignments} WHERE id = @id RETURNING *
-      `).get({ ...safeValues, id }));
+      return database.transaction(() => {
+        const current = database.prepare('SELECT submission_id FROM crm_follow_up_recommendations WHERE id = ? LIMIT 1').get(id);
+        if (current?.submission_id) assertCrmSubmissionWritableInTransaction(current.submission_id);
+        if (Object.keys(safeValues).length === 0) return normalizeCrmFollowUpRecommendationRow(
+          database.prepare('SELECT * FROM crm_follow_up_recommendations WHERE id = ? LIMIT 1').get(id),
+        );
+        const assignments = Object.keys(safeValues).map((field) => `${field} = @${field}`).join(', ');
+        return normalizeCrmFollowUpRecommendationRow(database.prepare(`
+          UPDATE crm_follow_up_recommendations SET ${assignments} WHERE id = @id RETURNING *
+        `).get({ ...safeValues, id }));
+      }).immediate();
     },
 
     async getActiveEmailSuppression(email) {
@@ -7705,7 +7725,7 @@ export function createSqliteStorage(config) {
     },
 
     async insertCrmActivityEvent(event) {
-      return insertCrmActivityEvent(event);
+      return database.transaction(() => insertCrmActivityEvent(event)).immediate();
     },
 
     async listCrmActivityEvents({ submissionId = '', eventTypes = [], limit = 200, before = '' } = {}) {
@@ -9366,6 +9386,34 @@ export function createSqliteStorage(config) {
         WHERE opportunity_id = ? AND status = 'active'
         LIMIT 1
       `).get(String(opportunityId).trim()));
+    },
+
+    async getCimStage2SubmissionAuthority(opportunityId) {
+      const normalizedOpportunityId = String(opportunityId || '').trim();
+      if (!normalizedOpportunityId) {
+        return { opportunity: null, primarySubmissionWritable: false, supersession: null };
+      }
+      const readAuthority = database.transaction(() => {
+        const opportunity = database.prepare(`
+          SELECT * FROM deal_hunter_opportunities
+          WHERE opportunity_id = ? AND status = 'active'
+          LIMIT 1
+        `).get(normalizedOpportunityId);
+        const primarySubmissionId = String(opportunity?.primary_submission_id || '').trim();
+        const supersession = primarySubmissionId
+          ? database.prepare(`
+            SELECT * FROM crm_submission_supersessions
+            WHERE status = 'active' AND superseded_submission_id = ?
+            LIMIT 1
+          `).get(primarySubmissionId)
+          : null;
+        return {
+          opportunity: normalizeDealHunterOpportunityRow(opportunity),
+          primarySubmissionWritable: Boolean(opportunity) && !supersession,
+          supersession: normalizeCrmSubmissionSupersessionRow(supersession),
+        };
+      });
+      return readAuthority.immediate();
     },
 
     async listDealHunterOpportunities({ opportunityIds = [], recipientEmails = [], limit = 1000 } = {}) {

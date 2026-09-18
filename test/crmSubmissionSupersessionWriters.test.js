@@ -15,9 +15,14 @@ import {
   sendCrmFollowUpEmail,
 } from '../server/services/followUpEmail.js';
 import { dismissCrmFollowUpRecommendation } from '../server/services/followUpWorkspace.js';
+import { createAdminEmailSuppression, liftAdminEmailSuppression } from '../server/services/followUpWorkspace.js';
 import { generateCrmFollowUpRecommendation } from '../server/services/followUpRecommendations.js';
 import { updateAcquisitionCommandCenterRecord } from '../server/services/acquisitionCommandCenter.js';
-import { repairDealHunterCrmSourceFields } from '../server/services/dealHunter.js';
+import {
+  executeDealHunterCimFollowUpRequest,
+  repairDealHunterCrmSourceFields,
+  retryDealHunterCimRequestWithCorrectedRecipient,
+} from '../server/services/dealHunter.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 
 const timestamp = '2026-09-17T18:00:00.000Z';
@@ -72,7 +77,26 @@ function recommendation(submissionId) {
   };
 }
 
-async function fixture(t, { withRecommendation = false } = {}) {
+function activateRelation(sqlitePath) {
+  const database = new Database(sqlitePath);
+  try {
+    database.prepare(`
+      INSERT INTO crm_submission_supersessions (
+        id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
+        opportunity_id, reason_code, reason_text, approved_by, approved_at, actor,
+        repair_version, repair_manifest_id, repair_digest, metadata
+      ) VALUES (
+        'writer-relation', ?, ?, 'active', 'survivor', 'loser', 'opportunity',
+        'confirmed-duplicate', 'Reviewed duplicate.', 'owner@example.test', ?, 'test',
+        'writer-matrix-v1', 'writer-receipt', ?, '{}'
+      )
+    `).run(timestamp, timestamp, timestamp, digest);
+  } finally {
+    database.close();
+  }
+}
+
+async function fixture(t, { withRecommendation = false, activateSupersession = true } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-crm-writer-matrix-'));
   const sqlitePath = path.join(directory, 'crm.sqlite');
   const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
@@ -94,6 +118,13 @@ async function fixture(t, { withRecommendation = false } = {}) {
     id: 'writer-receipt', created_at: timestamp, updated_at: timestamp, mode: 'crm-duplicate-consolidation',
     status: 'applied', actor: 'test', backup_reference: 'fixture', checksum: digest,
     manifest: { version: 1 }, metadata: {},
+  });
+  await storage.upsertDealHunterCimRequest({
+    id: 'loser-cim-request', created_at: timestamp, updated_at: timestamp,
+    deal_key: 'writer-matrix-deal', recipient_email: 'broker@example.test', submission_id: 'loser',
+    status: 'delivery_issue', requested_by: 'test', deal_name: 'Canonical', source_name: 'writer-matrix',
+    listing_url: '', score: 95, request_state: 'failed', delivery_state: 'bounced',
+    delivery_state_at: timestamp, metadata: {},
   });
   if (withRecommendation) await storage.insertCrmFollowUpRecommendation(recommendation('loser'));
   const database = new Database(sqlitePath);
@@ -133,18 +164,8 @@ async function fixture(t, { withRecommendation = false } = {}) {
       original_name, mime_type, size_bytes, storage_path
     ) VALUES (?, ?, ?, ?, 'other', 'fixture.pdf', 'fixture.pdf', 'application/pdf', 1, ?)
   `).run('loser-document', 'loser-upload', 'loser', timestamp, path.join(directory, 'fixture.pdf'));
-  database.prepare(`
-    INSERT INTO crm_submission_supersessions (
-      id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
-      opportunity_id, reason_code, reason_text, approved_by, approved_at, actor,
-      repair_version, repair_manifest_id, repair_digest, metadata
-    ) VALUES (
-      'writer-relation', ?, ?, 'active', 'survivor', 'loser', 'opportunity',
-      'confirmed-duplicate', 'Reviewed duplicate.', 'owner@example.test', ?, 'test',
-      'writer-matrix-v1', 'writer-receipt', ?, '{}'
-    )
-  `).run(timestamp, timestamp, timestamp, digest);
   database.close();
+  if (activateSupersession) activateRelation(sqlitePath);
   return { storage, sqlitePath };
 }
 
@@ -253,6 +274,8 @@ test('real SQLite upload, document, communication, and CIM storage boundaries re
       updated_at: timestamp, created_by: 'test', updated_by: 'test',
     }),
     () => storage.updateCrmCommunication('unassigned-communication', { submission_id: 'loser' }),
+    () => storage.updateCrmCommunication('loser-communication', { submission_id: 'survivor' }),
+    () => storage.updateCrmCommunication('loser-communication', { submission_id: null }),
     () => storage.upsertDealHunterCimRequest({
       id: 'loser-cim-request', created_at: timestamp, updated_at: timestamp,
       deal_key: 'writer-matrix-deal', recipient_email: 'broker@example.test', submission_id: 'loser',
@@ -280,6 +303,87 @@ test('real SQLite recommendation writers refuse dismiss and generation for an ac
       now: new Date(timestamp),
     }),
   });
+});
+
+test('real SQLite follow-up suppression, legacy CIM execution, and corrected-recipient retry refuse the loser with zero side effects', async (t) => {
+  const { storage, sqlitePath } = await fixture(t, { withRecommendation: true });
+  const providerCalls = [];
+  const cases = [
+    () => createAdminEmailSuppression({
+      submissionId: 'loser', email: 'loser@example.test', reason: 'must refuse', confirmed: true,
+      actor: 'test', storage,
+    }),
+    () => liftAdminEmailSuppression({
+      submissionId: 'loser', email: 'loser@example.test', liftReason: 'must refuse', confirmed: true,
+      actor: 'test', storage,
+    }),
+    () => executeDealHunterCimFollowUpRequest({
+      storage,
+      request: {
+        id: 'loser-cim-request', submission_id: 'loser', deal_key: 'writer-matrix-deal',
+        recipient_email: 'broker@example.test', metadata: {},
+      },
+      now: new Date(timestamp),
+      dependencies: { sendPreparedMessage: async () => { providerCalls.push('called'); } },
+    }),
+    () => retryDealHunterCimRequestWithCorrectedRecipient({
+      requestId: 'loser-cim-request', newRecipientEmail: 'corrected@example.test', confirmed: true,
+      overrideReason: 'Reviewed correction', requestedBy: 'test', storage,
+    }),
+  ];
+  for (const invoke of cases) await assertLoserRefusal({ sqlitePath, providerCalls, invoke });
+});
+
+test('second-connection supersession after an earlier service check is revalidated by every direct Task 6 SQLite writer', async (t) => {
+  const { storage, sqlitePath } = await fixture(t, {
+    withRecommendation: true,
+    activateSupersession: false,
+  });
+  await storage.assertCrmSubmissionWritable('loser');
+  activateRelation(sqlitePath);
+
+  const cases = [
+    () => storage.insertCrmActivityEvent({
+      id: 'race-activity', submission_id: 'loser', opportunity_id: null, created_at: timestamp,
+      actor: 'test', role: 'admin', event_type: 'race.test', summary: 'must refuse', metadata: {},
+    }),
+    () => storage.insertSecureUploadRequest({
+      id: 'race-upload', submission_id: 'loser', created_at: timestamp, updated_at: timestamp,
+      email: 'loser@example.test', contact_name: 'loser', requested_by: 'test', status: 'open',
+      expires_at: '2026-09-18T18:00:00.000Z', requested_documents: [],
+    }),
+    () => storage.updateSecureUploadRequest('loser-upload', { updated_at: timestamp, status: 'revoked' }),
+    () => storage.resetSecureUploadRequestIfUploading('loser-upload', { updated_at: timestamp, status: 'open' }),
+    () => storage.claimSecureUploadRequest('loser-upload', { updated_at: timestamp, status: 'uploading' }),
+    () => storage.insertSecureDocument({
+      id: 'race-document', request_id: 'loser-upload', submission_id: 'loser', created_at: timestamp,
+      document_type: 'other', file_name: 'race.pdf', original_name: 'race.pdf', mime_type: 'application/pdf',
+      size_bytes: 1, storage_path: '/tmp/race.pdf', uploaded_by_email: null, note: null, nda_accepted_at: null,
+    }),
+    () => storage.deleteSecureDocument('loser-document'),
+    () => storage.insertCrmCommunication({
+      id: 'race-communication', submission_id: 'loser', direction: 'outbound', channel: 'note',
+      source: 'writer-matrix', body_text: 'must refuse', occurred_at: timestamp, created_at: timestamp,
+      updated_at: timestamp, created_by: 'test', updated_by: 'test',
+    }),
+    () => storage.updateCrmCommunication('loser-communication', { submission_id: null }),
+    () => storage.claimCrmEmailOutbox({
+      id: 'loser-outbox', claimToken: 'race-claim', claimedAt: timestamp,
+      claimExpiresAt: '2026-09-17T18:05:00.000Z',
+    }),
+    () => storage.insertCrmFollowUpRecommendation({
+      ...recommendation('loser'), id: 'race-recommendation', input_fingerprint: 'race',
+    }),
+    () => storage.supersedeCrmFollowUpRecommendations('loser', timestamp),
+    () => storage.updateCrmFollowUpRecommendation('loser-recommendation', { status: 'dismissed' }),
+    () => storage.upsertDealHunterCimRequest({
+      id: 'race-cim-request', created_at: timestamp, updated_at: timestamp,
+      deal_key: 'writer-matrix-race', recipient_email: 'race@example.test', submission_id: 'loser',
+      status: 'pending', requested_by: 'test', deal_name: 'Canonical', source_name: 'writer-matrix',
+      listing_url: '', score: 95, metadata: {},
+    }),
+  ];
+  for (const invoke of cases) await assertLoserRefusal({ sqlitePath, invoke });
 });
 
 test('source-field repair rejects the loser contact boundary without touching source or opportunity state', async (t) => {

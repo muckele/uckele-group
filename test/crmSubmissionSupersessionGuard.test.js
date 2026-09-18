@@ -306,6 +306,7 @@ test('all Supabase supersession methods fail closed before touching the client',
     () => storage.listActiveCrmSubmissionSupersessions({ submissionIds: ['loser'] }),
     () => storage.assertCrmSubmissionWritable('loser'),
     () => storage.auditCrmSubmissionSupersessions(),
+    () => storage.getCimStage2SubmissionAuthority('opportunity'),
   ];
   for (const invoke of invocations) {
     await assert.rejects(invoke, (error) => {

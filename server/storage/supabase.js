@@ -3195,6 +3195,10 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return normalizeDealHunterOpportunityRow(data);
     },
 
+    async getCimStage2SubmissionAuthority() {
+      throw new CrmSupersessionUnavailableError();
+    },
+
     async listDealHunterOpportunities({ opportunityIds = [], recipientEmails = [], limit = 1000 } = {}) {
       const ids = normalizeList(opportunityIds);
       const recipients = normalizeList(recipientEmails).map((value) => value.toLowerCase());

@@ -792,12 +792,22 @@ export async function sendCrmFollowUpEmail({
     return policyFailure(422, 'invalid-client-token', 'A unique 16–200 character confirmation token is required.');
   }
   const scopedSubmissionId = compactText(submissionId, 160);
-  await assertCrmSubmissionWritable({ storage, submissionId: scopedSubmissionId });
   const scopedActor = compactText(actor, 160);
   const existingCommand = await storage.getCrmEmailOutboxByClientRequestKey?.(
     `${scopedSubmissionId}:${scopedActor}:${clientToken}`,
   );
   if (existingCommand) {
+    if (terminalOutboxStates.has(existingCommand.state)) {
+      const replay = await processCrmEmailOutbox({
+        outboxId: existingCommand.id,
+        storage,
+        sender,
+        config,
+        now,
+      });
+      return { ...replay, replayedCommand: true };
+    }
+    await assertCrmSubmissionWritable({ storage, submissionId: scopedSubmissionId });
     if (!processImmediately) {
       return {
         ok: true,
@@ -817,6 +827,7 @@ export async function sendCrmFollowUpEmail({
     });
     return { ...replay, replayedCommand: true };
   }
+  await assertCrmSubmissionWritable({ storage, submissionId: scopedSubmissionId });
   const previewResult = await previewCrmFollowUpEmail({ submissionId, actor: scopedActor, input, storage, config, now });
   if (!previewResult.ok) return previewResult;
   const { submission, preview } = previewResult;
