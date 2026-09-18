@@ -471,12 +471,15 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   let communications = [];
   let materialsAuthorityAvailable = true;
   let communicationsAuthorityAvailable = true;
+  const submissionReadMethod = typeof storage?.getSubmissionStrict === 'function'
+    ? 'getSubmissionStrict'
+    : 'getSubmission';
   try {
     [aliases, facts, sourceRows, submission, opportunityClaim, safety, identityExceptions] = await Promise.all([
       requiredAuthorityRead(storage, 'listDealHunterOpportunityAliases', { opportunityIds: [id], limit: 500 }),
       requiredAuthorityRead(storage, 'listDealHunterOpportunityFacts', id, { limit: 100 }),
       requiredAuthorityRead(storage, 'listDealHunterOpportunitySourceObservations', id, { limit: 500 }),
-      opportunity.primary_submission_id ? requiredAuthorityRead(storage, 'getSubmission', opportunity.primary_submission_id) : null,
+      opportunity.primary_submission_id ? requiredAuthorityRead(storage, submissionReadMethod, opportunity.primary_submission_id) : null,
       requiredAuthorityRead(storage, 'getDealHunterCimOpportunityClaim', id),
       optionalRead(() => storage?.getDealHunterCimSafetySettings?.(), null),
       requiredAuthorityRead(storage, 'listDealHunterIdentityExceptions', { statuses: ['open'], limit: 5000 }),

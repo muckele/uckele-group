@@ -8633,6 +8633,35 @@ async function applyDealOsCrmReconciliationItem({ deal, item, storage, requested
   }
 }
 
+async function assertDealOsCrmReconciliationWriteAuthority({ previewResult, storage }) {
+  const authorityBefore = await listCompleteDealHunterCrmCandidates(storage);
+  const checkedSubmissionIds = new Set();
+  const assertWritable = async (submissionId) => {
+    const normalizedSubmissionId = normalizeText(submissionId, 300);
+    if (!normalizedSubmissionId || checkedSubmissionIds.has(normalizedSubmissionId)) return;
+    await assertCrmSubmissionWritable({ storage, submissionId: normalizedSubmissionId });
+    checkedSubmissionIds.add(normalizedSubmissionId);
+  };
+
+  for (const item of previewResult.items) {
+    if (['create', 'update'].includes(item.action)) await assertWritable(item.submissionId);
+  }
+
+  for (const deal of previewResult.dealsByOpportunity.values()) {
+    const importRecord = await getDealHunterCrmImportAuthority(storage, deal);
+    await assertWritable(importRecord?.submission_id);
+  }
+
+  const authorityAfter = await listCompleteDealHunterCrmCandidates(storage);
+  if (authorityAfter.revision !== authorityBefore.revision) {
+    throw dealHunterCrmMatchError(
+      'CRM_MATCH_AUTHORITY_STALE',
+      'CRM match authority changed before reconciliation bookkeeping, so no reconciliation run was created.',
+      { candidateIds: [...checkedSubmissionIds], evidenceCategories: ['authority-stale'] },
+    );
+  }
+}
+
 export async function executeDealOsCrmReconciliation({
   importId = '',
   planDigest = '',
@@ -8692,6 +8721,7 @@ export async function executeDealOsCrmReconciliation({
   if (normalizeText(confirmation, 120) !== previewResult.confirmationRequired) {
     return { ok: false, status: 400, error: `Type ${previewResult.confirmationRequired} to execute this exact canonical set.`, preview: previewResult };
   }
+  await assertDealOsCrmReconciliationWriteAuthority({ previewResult, storage });
   const requiredMethods = [
     'claimDealHunterCrmImport', 'startDealHunterCrmReconciliationRun',
     'listDealHunterCrmReconciliationItems',
@@ -10366,6 +10396,9 @@ export async function executeApprovedDealHunterCimRequest({
     storage.listDealHunterOpportunityAliases?.({ opportunityIds: [opportunityId], limit: 500 }),
     storage.listDealHunterOpportunitySourceObservations?.(opportunityId, { limit: 500 }),
   ]);
+  if (opportunity?.primary_submission_id) {
+    await assertCrmSubmissionWritable({ storage, submissionId: opportunity.primary_submission_id });
+  }
   if (!opportunity || !score || !Array.isArray(aliases) || !Array.isArray(sourceRows)) {
     return { ok: false, status: 409, code: 'preparation_stale', error: 'Current canonical authority is unavailable for the approved request.' };
   }

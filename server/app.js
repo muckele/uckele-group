@@ -116,7 +116,10 @@ import {
   restoreLead,
 } from './services/leadLifecycle.js';
 import { recordAnalyticsEvent } from './services/analytics.js';
-import { projectCrmSupersessionHttpError } from './services/crmSubmissionSupersession.js';
+import {
+  assertCrmSubmissionWritable,
+  projectCrmSupersessionHttpError,
+} from './services/crmSubmissionSupersession.js';
 import {
   createCimStage2Activation,
   getCimAutomationStatus,
@@ -568,32 +571,18 @@ export function createApp({
     }
 
     try {
-      const result = await enforceSecureUploadBodyRateLimit(request);
-
-      if (!result.ok) {
-        response.status(result.status || 429).json({ success: false, error: result.error });
-        return;
-      }
-
-      next();
-    } catch (error) {
-      next(error);
-    }
-  });
-  app.use('/api/secure-documents/upload', async (request, response, next) => {
-    if (request.method !== 'POST') {
-      next();
-      return;
-    }
-
-    try {
       const token = String(request.headers['x-secure-upload-token'] || '').trim();
-      const context = await getSecureUploadContext(token, { recoverStale: true });
+      const context = await getSecureUploadContext(token);
 
       if (!context.ok) {
         response.status(400).json({ success: false, error: context.error });
         return;
       }
+
+      await assertCrmSubmissionWritable({
+        storage: getStorage(),
+        submissionId: context.request.submission_id,
+      });
 
       if (!['awaiting-documents', 'open', 'partially-received'].includes(context.request.status)) {
         response.status(409).json({
@@ -607,6 +596,25 @@ export function createApp({
 
       request.secureUploadToken = token;
       request.secureUploadContext = context;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.use('/api/secure-documents/upload', async (request, response, next) => {
+    if (request.method !== 'POST') {
+      next();
+      return;
+    }
+
+    try {
+      const result = await enforceSecureUploadBodyRateLimit(request);
+
+      if (!result.ok) {
+        response.status(result.status || 429).json({ success: false, error: result.error });
+        return;
+      }
+
       next();
     } catch (error) {
       next(error);

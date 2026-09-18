@@ -259,6 +259,44 @@ function readHttpPassState({ opportunityId, submissionIds = [] }) {
   }
 }
 
+function httpApplicationTableDigest() {
+  const database = new Database(process.env.SQLITE_PATH, { readonly: true, fileMustExist: true });
+  try {
+    const tables = database.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `).all().map(({ name }) => name);
+    const snapshot = Object.fromEntries(tables.map((name) => [
+      name,
+      database.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all(),
+    ]));
+    return JSON.stringify(snapshot);
+  } finally {
+    database.close();
+  }
+}
+
+function httpSecureDocumentFilesystemSnapshot() {
+  const root = process.env.SECURE_DOCUMENTS_STORAGE_DIR;
+  if (!fs.existsSync(root)) return [];
+  const entries = [];
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+      const entryPath = path.join(directory, entry.name);
+      const relative = path.relative(root, entryPath);
+      if (entry.isDirectory()) {
+        entries.push(['directory', relative, fs.statSync(entryPath).mode & 0o777]);
+        visit(entryPath);
+      } else {
+        entries.push(['file', relative, fs.statSync(entryPath).mode & 0o777, fs.readFileSync(entryPath).toString('base64')]);
+      }
+    }
+  };
+  visit(root);
+  return entries;
+}
+
 async function withEmailReadinessAddressConfig({
   adminEmail,
   fallbackRecipient,
@@ -439,40 +477,29 @@ test('survivor document read-through cannot delete a loser-owned document', asyn
   const storagePath = path.join(storageRoot, `${documentId}.txt`);
   fs.mkdirSync(storageRoot, { recursive: true });
   fs.writeFileSync(storagePath, 'historical loser evidence');
-  await storage.insertSecureUploadRequest({
-    id: requestId,
-    submission_id: fixture.loser.id,
-    created_at: createdAt,
-    updated_at: createdAt,
-    email: fixture.loser.broker_email,
-    contact_name: fixture.loser.broker_name,
-    requested_by: 'http-test',
-    status: 'closed',
-    expires_at: new Date(Date.parse(createdAt) + 86_400_000).toISOString(),
-    nda_required: false,
-    nda_accepted_at: null,
-    last_uploaded_at: createdAt,
-    note: 'Historical document fixture.',
-    requested_documents: [],
-    revoked_at: null,
-    closed_at: createdAt,
-    upload_batch_count: 1,
-  });
-  await storage.insertSecureDocument({
-    id: documentId,
-    request_id: requestId,
-    submission_id: fixture.loser.id,
-    created_at: createdAt,
-    document_type: 'other',
-    file_name: `${documentId}.txt`,
-    original_name: 'historical-loser.txt',
-    mime_type: 'text/plain',
-    size_bytes: Buffer.byteLength('historical loser evidence'),
-    storage_path: storagePath,
-    uploaded_by_email: fixture.loser.broker_email,
-    note: 'Historical document fixture.',
-    nda_accepted_at: null,
-  });
+  const database = new Database(process.env.SQLITE_PATH);
+  database.prepare(`
+    INSERT INTO secure_upload_requests (
+      id, submission_id, created_at, updated_at, email, contact_name, requested_by,
+      status, expires_at, nda_required, nda_accepted_at, last_uploaded_at, note,
+      requested_documents, revoked_at, closed_at, upload_batch_count
+    ) VALUES (?, ?, ?, ?, ?, ?, 'http-test', 'closed', ?, 0, NULL, ?, ?, '[]', NULL, ?, 1)
+  `).run(
+    requestId, fixture.loser.id, createdAt, createdAt, fixture.loser.broker_email,
+    fixture.loser.broker_name, new Date(Date.parse(createdAt) + 86_400_000).toISOString(),
+    createdAt, 'Historical document fixture.', createdAt,
+  );
+  database.prepare(`
+    INSERT INTO secure_documents (
+      id, request_id, submission_id, created_at, document_type, file_name, original_name,
+      mime_type, size_bytes, storage_path, uploaded_by_email, note, nda_accepted_at
+    ) VALUES (?, ?, ?, ?, 'other', ?, 'historical-loser.txt', 'text/plain', ?, ?, ?, ?, NULL)
+  `).run(
+    documentId, requestId, fixture.loser.id, createdAt, `${documentId}.txt`,
+    Buffer.byteLength('historical loser evidence'), storagePath, fixture.loser.broker_email,
+    'Historical document fixture.',
+  );
+  database.close();
   const trashRoot = path.join(storageRoot, '.trash');
   const treeBefore = fs.existsSync(trashRoot) ? fs.readdirSync(trashRoot, { recursive: true }).sort() : [];
   const cleanupBefore = await storage.listSecureDocumentCleanupJobs({ limit: 500 });
@@ -1355,6 +1382,113 @@ test('secure upload token is rejected before parsing the JSON payload', async ()
     const result = await response.json();
     assert.equal(response.status, 400);
     assert.match(result.error, /invalid or has expired/i);
+  });
+});
+
+test('real HTTP secure upload refuses a valid loser token before rate limiting or body parsing and preserves a survivor control', async () => {
+  const storage = getStorage();
+  const suffix = randomUUID();
+  const now = new Date().toISOString();
+  const survivorResult = await createManualSubmission({
+    company: `HTTP upload survivor ${suffix}`,
+    seller_name: 'Survivor',
+    seller_email: `http-upload-survivor-${suffix}@example.test`,
+  }, 'http-test', { storage });
+  const loserResult = await createManualSubmission({
+    company: `HTTP upload loser ${suffix}`,
+    seller_name: 'Loser',
+    seller_email: `http-upload-loser-${suffix}@example.test`,
+  }, 'http-test', { storage });
+  assert.equal(survivorResult.ok, true);
+  assert.equal(loserResult.ok, true);
+  const survivor = survivorResult.submission;
+  const loser = loserResult.submission;
+  const opportunityId = `http-upload-opportunity-${suffix}`;
+  await storage.updateSubmission(survivor.id, { updated_at: now, deal_hunter_opportunity_id: opportunityId });
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: opportunityId,
+    created_at: now,
+    updated_at: now,
+    canonical_name: survivor.company,
+    canonical_recipient: survivor.email,
+    canonical_location: null,
+    primary_submission_id: survivor.id,
+    identity_version: 'http-upload-supersession-v1',
+    status: 'active',
+    metadata: {},
+  });
+  const loserUpload = await createSecureUploadRequest({
+    submissionId: loser.id,
+    requestedBy: 'http-test',
+    sendEmail: false,
+    request: { headers: { host: 'localhost' }, ip: '192.0.2.181', socket: {} },
+  });
+  const survivorUpload = await createSecureUploadRequest({
+    submissionId: survivor.id,
+    requestedBy: 'http-test',
+    sendEmail: false,
+    request: { headers: { host: 'localhost' }, ip: '192.0.2.182', socket: {} },
+  });
+  const loserToken = new URL(loserUpload.uploadUrl).searchParams.get('token');
+  const survivorToken = new URL(survivorUpload.uploadUrl).searchParams.get('token');
+  const receiptId = `http-upload-receipt-${suffix}`;
+  const digest = 'e'.repeat(64);
+  await storage.upsertDealHunterCimRepairManifest({
+    id: receiptId, created_at: now, updated_at: now, mode: 'crm-duplicate-consolidation',
+    status: 'applied', actor: 'http-test', backup_reference: 'fixture', checksum: digest,
+    manifest: { version: 1 }, metadata: {},
+  });
+  const database = new Database(process.env.SQLITE_PATH);
+  database.prepare(`
+    INSERT INTO crm_submission_supersessions (
+      id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
+      opportunity_id, reason_code, reason_text, approved_by, approved_at, actor,
+      repair_version, repair_manifest_id, repair_digest, metadata
+    ) VALUES (?, ?, ?, 'active', ?, ?, ?, 'confirmed-duplicate', ?, ?, ?, ?, ?, ?, ?, '{}')
+  `).run(
+    `http-upload-relation-${suffix}`, now, now, survivor.id, loser.id, opportunityId,
+    'Reviewed duplicate upload.', 'owner@example.test', now, 'http-test', 'v1', receiptId, digest,
+  );
+  database.close();
+
+  const beforeTables = httpApplicationTableDigest();
+  const beforeFiles = httpSecureDocumentFilesystemSnapshot();
+  await withServer(async (origin) => {
+    const response = await fetch(`${origin}/api/secure-documents/upload`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Secure-Upload-Token': loserToken },
+      body: '{this loser body must never be parsed',
+    });
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), {
+      success: false,
+      code: CRM_SUBMISSION_SUPERSEDED,
+      error: 'This CRM record is historical and cannot be changed.',
+      submissionId: loser.id,
+      survivorSubmissionId: survivor.id,
+      opportunityId,
+    });
+  });
+  assert.equal(httpApplicationTableDigest(), beforeTables, 'loser HTTP upload must preserve every application table');
+  assert.deepEqual(httpSecureDocumentFilesystemSnapshot(), beforeFiles, 'loser HTTP upload must preserve the secure-document tree');
+
+  await withServer(async (origin) => {
+    const response = await fetch(`${origin}/api/secure-documents/upload`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Secure-Upload-Token': survivorToken },
+      body: JSON.stringify({
+        ndaAccepted: true,
+        documents: [{
+          name: 'survivor-control.txt', mimeType: 'text/plain',
+          contentBase64: Buffer.from('survivor control').toString('base64'),
+        }],
+      }),
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.success, true);
+    assert.equal(body.submission.id, survivor.id);
+    assert.equal(body.documents.length, 1);
   });
 });
 
