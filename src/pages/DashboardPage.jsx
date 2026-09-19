@@ -24,6 +24,7 @@ import PageHero from '../components/PageHero';
 import Reveal from '../components/Reveal';
 import Seo from '../components/Seo';
 import CrmNavigation from '../components/admin/CrmNavigation';
+import CrmDuplicateReview from '../components/admin/CrmDuplicateReview';
 import { adminSectionMeta } from '../content/adminSectionMeta';
 
 // Each of these renders behind a section gate or the CRM detail view, so the
@@ -4225,6 +4226,9 @@ export default function DashboardPage() {
 
       {activeSection === 'crm' && !isCrmDetailView ? (
       <section className="section-shell mt-8">
+        <Reveal className="panel mb-5 p-6 sm:p-7">
+          <CrmDuplicateReview />
+        </Reveal>
         <Reveal className="panel p-6 sm:p-7">
           <CrmNavigation
             disabled={loading}

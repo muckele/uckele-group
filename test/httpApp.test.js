@@ -2620,6 +2620,39 @@ test('required-source authority revalidation rejects viewer and unauthenticated 
   }, app);
 });
 
+test('CRM duplicate review is authenticated, read-only, and returns the bounded report contract', async () => {
+  await withServer(async (origin) => {
+    const unauthorized = await fetch(`${origin}/api/admin/crm-duplicates`);
+    assert.equal(unauthorized.status, 401);
+
+    const viewerCookie = await signInForCookie(origin, {
+      username: 'smb-deal-hunter',
+      password: 'view-only-local',
+    });
+    const response = await fetch(`${origin}/api/admin/crm-duplicates`, {
+      headers: { Cookie: viewerCookie },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.success, true);
+    assert.deepEqual(body.report.categories, [
+      'resolved/superseded',
+      'confirmed-duplicate',
+      'strong-candidate',
+      'uncertain',
+      'keep-distinct',
+    ]);
+    assert.ok(Array.isArray(body.report.rows));
+
+    const forbiddenMutation = await fetch(`${origin}/api/admin/crm-duplicates`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: viewerCookie },
+      body: JSON.stringify({ pair: ['one', 'two'] }),
+    });
+    assert.equal(forbiddenMutation.status, 404);
+  });
+});
+
 test('required-source authority HTTP schema rejects unknown fields and the wrong confirmation before service execution', async () => {
   let serviceCalls = 0;
   const app = createApp({

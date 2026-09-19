@@ -120,6 +120,7 @@ import {
   assertCrmSubmissionWritable,
   projectCrmSupersessionHttpError,
 } from './services/crmSubmissionSupersession.js';
+import { getCrmDuplicateReview } from './services/crmDuplicateReview.js';
 import {
   createCimStage2Activation,
   getCimAutomationStatus,
@@ -1020,6 +1021,21 @@ export function createApp({
       response.json({
         success: true,
         ...result,
+      });
+    }),
+  );
+
+  app.get(
+    '/api/admin/crm-duplicates',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      response.json({
+        success: true,
+        report: await getCrmDuplicateReview(),
       });
     }),
   );
