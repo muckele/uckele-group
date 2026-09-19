@@ -2329,15 +2329,18 @@ test('canonical-merge inspection classifies and preserves opportunity-owned fact
     inventory.get('deal_hunter_opportunity_source_observations.source_id')?.category,
     CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
   );
-
-  // This focused legacy-contract test predates the separately blocked
-  // supersession-schema inventory decision. Remove that unrelated, empty table
-  // from this disposable database so the fact dependency remains precise.
-  const database = new Database(storage.testSqlitePath);
-  try {
-    database.exec('DROP TABLE crm_submission_supersessions');
-  } finally {
-    database.close();
+  for (const column of [
+    'survivor_submission_id',
+    'superseded_submission_id',
+    'opportunity_id',
+    'repair_manifest_id',
+    'reversal_manifest_id',
+    'metadata',
+  ]) {
+    assert.equal(
+      inventory.get(`crm_submission_supersessions.${column}`)?.scannerPath,
+      'dependentState.records.crmSubmissionSupersessions',
+    );
   }
 
   await assert.rejects(

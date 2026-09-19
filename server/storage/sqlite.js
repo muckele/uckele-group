@@ -1512,7 +1512,7 @@ export function inspectCanonicalMergeLegacyDealHunterCandidates(database, approv
   return { count, records };
 }
 
-function inspectCanonicalMergeDependentState(database, approval) {
+export function inspectCanonicalMergeDependentState(database, approval) {
   const opportunityIds = [approval.survivorId, approval.supersededId];
   const aliasValues = approval.expectedAliases.map((item) => item.aliasValue);
   const aliasKeys = approval.expectedAliases.map((item) => item.aliasKey);
@@ -1530,6 +1530,12 @@ function inspectCanonicalMergeDependentState(database, approval) {
   const referenceValues = uniqueCanonicalMergeValues([...opportunityIds, ...aliasValues, ...aliasKeys]);
   const metadataFilter = { column: 'metadata', values: referenceValues, contains: true };
   const legacyDealHunterCandidates = inspectCanonicalMergeLegacyDealHunterCandidates(database, approval);
+  const crmSubmissionSupersessions = database.prepare(`
+    SELECT * FROM crm_submission_supersessions
+    WHERE opportunity_id IN (${placeholders(opportunityIds.length)})
+    ORDER BY opportunity_id ASC, survivor_submission_id ASC,
+      superseded_submission_id ASC, id ASC
+  `).all(...opportunityIds);
 
   const opportunityScores = selectCanonicalMergeRows(database, 'deal_hunter_opportunity_scores', [
     { column: 'opportunity_id', values: opportunityIds },
@@ -1703,6 +1709,7 @@ function inspectCanonicalMergeDependentState(database, approval) {
   ];
 
   const records = {
+    crmSubmissionSupersessions,
     opportunityScores: canonicalMergeRecordIds('deal_hunter_opportunity_scores', opportunityScores, 'opportunity_id'),
     scoreEvidence: canonicalMergeRecordIds('deal_hunter_score_evidence', scoreEvidence),
     operatorFacts: canonicalMergeRecordIds('deal_hunter_opportunity_facts', operatorFacts),
@@ -1867,6 +1874,28 @@ function checkedCanonicalOpportunityMergeApproval(approval = {}) {
 }
 
 const canonicalOpportunityMergeRequiredSchema = Object.freeze({
+  crm_submission_supersessions: [
+    'id',
+    'created_at',
+    'updated_at',
+    'status',
+    'survivor_submission_id',
+    'superseded_submission_id',
+    'opportunity_id',
+    'reason_code',
+    'reason_text',
+    'approved_by',
+    'approved_at',
+    'actor',
+    'repair_version',
+    'repair_manifest_id',
+    'repair_digest',
+    'reversed_at',
+    'reversed_by',
+    'reversal_reason',
+    'reversal_manifest_id',
+    'metadata',
+  ],
   contact_submissions: ['id', 'deal_hunter_opportunity_id', 'listing_url', 'metadata'],
   secure_upload_requests: ['id', 'submission_id'],
   secure_documents: ['id', 'request_id', 'submission_id'],
@@ -2372,9 +2401,15 @@ function validateCanonicalMergeFinalState(database, {
     throw new Error('Canonical opportunity merge manifest failed typed final validation.');
   }
   const dependentState = inspectCanonicalMergeDependentState(database, approval);
+  if (!Array.isArray(dependentState?.records?.crmSubmissionSupersessions)) {
+    throw new Error('Canonical opportunity merge final state could not inspect CRM submission supersession history completely.');
+  }
   const unexpected = Object.entries(dependentState.counts).filter(([name, count]) => (
     count !== Number(approval.expectedDependentCounts?.[name] || 0)
   ));
+  if (dependentState.records.crmSubmissionSupersessions.length !== 0) {
+    throw new Error('Canonical opportunity merge final state acquired unexpected dependents: crmSubmissionSupersessions.');
+  }
   if (unexpected.length > 0) {
     throw new Error(`Canonical opportunity merge final state acquired unexpected dependents: ${unexpected.map(([name]) => name).join(', ')}.`);
   }

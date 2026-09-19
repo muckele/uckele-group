@@ -279,6 +279,187 @@ function approvedOpportunity(opportunityId) {
   };
 }
 
+function canonicalMergeSupersessionSubmission(id, opportunityId = null) {
+  return {
+    id,
+    created_at: '2026-09-17T18:00:00.000Z',
+    updated_at: '2026-09-17T18:00:00.000Z',
+    status: 'review',
+    spam_score: 0,
+    spam_reasons: [],
+    delivery_provider: 'manual',
+    delivery_status: 'not-applicable',
+    delivery_error: null,
+    crm_status: 'not-applicable',
+    crm_error: null,
+    source: 'canonical-merge-supersession-test',
+    ip_hash: '',
+    user_agent: '',
+    name: `Submission ${id}`,
+    email: `${id}@example.test`,
+    phone: '',
+    company: `Company ${id}`,
+    role: 'Broker',
+    message: 'Synthetic canonical-merge supersession fixture.',
+    status_updated_at: '2026-09-17T18:00:00.000Z',
+    listing_url: '',
+    business_website: '',
+    prospectus_url: '',
+    asking_price: '',
+    ttm_revenue: '',
+    ttm_ebitda: '',
+    ebitda_multiple: '',
+    net_margin: '',
+    business_age: '',
+    sba_eligible: 'unknown',
+    broker_name: '',
+    broker_email: '',
+    broker_phone: '',
+    seller_name: '',
+    seller_email: '',
+    seller_phone: '',
+    lead_type: 'broker',
+    priority: 'normal',
+    tags: [],
+    assigned_to: '',
+    notes: '',
+    follow_up_state: 'needs-response',
+    next_action_at: null,
+    last_contacted_at: null,
+    deal_hunter_opportunity_id: opportunityId,
+    metadata: {},
+  };
+}
+
+async function seedCanonicalMergeSupersession({
+  storage,
+  sqlitePath,
+  opportunityId,
+  suffix,
+  status = 'active',
+}) {
+  const relationId = `canonical-merge-supersession-${suffix}`;
+  const survivorSubmissionId = `canonical-merge-survivor-${suffix}`;
+  const supersededSubmissionId = `canonical-merge-loser-${suffix}`;
+  const applyManifestId = `crm-consolidation-apply-${suffix}`;
+  const reversalManifestId = `crm-consolidation-reversal-${suffix}`;
+  const repairDigest = createHash('sha256').update(`repair-digest:${suffix}`).digest('hex');
+  const opportunity = approvedOpportunity(opportunityId);
+
+  await storage.insertSubmission(canonicalMergeSupersessionSubmission(
+    survivorSubmissionId,
+    opportunityId,
+  ));
+  await storage.insertSubmission(canonicalMergeSupersessionSubmission(supersededSubmissionId));
+  await storage.upsertDealHunterOpportunity({
+    ...opportunity,
+    primary_submission_id: survivorSubmissionId,
+  });
+  await storage.upsertDealHunterCimRepairManifest({
+    id: applyManifestId,
+    created_at: '2026-09-17T18:00:00.000Z',
+    updated_at: '2026-09-17T18:00:00.000Z',
+    mode: 'crm-duplicate-consolidation',
+    status: 'applied',
+    actor: 'canonical-merge-supersession-test',
+    backup_reference: 'fixture-backup',
+    checksum: repairDigest,
+    manifest: { schema: 'crm-duplicate-consolidation-manifest-v1', operation: 'apply' },
+    metadata: { fixture: true },
+  });
+
+  withRawDatabase(sqlitePath, (database) => {
+    database.prepare(`
+      INSERT INTO crm_submission_supersessions (
+        id, created_at, updated_at, status, survivor_submission_id,
+        superseded_submission_id, opportunity_id, reason_code, reason_text,
+        approved_by, approved_at, actor, repair_version, repair_manifest_id,
+        repair_digest, reversed_at, reversed_by, reversal_reason,
+        reversal_manifest_id, metadata
+      ) VALUES (?, ?, ?, 'active', ?, ?, ?, 'confirmed-duplicate', ?, ?, ?, ?, ?, ?, ?,
+        NULL, NULL, NULL, NULL, ?)
+    `).run(
+      relationId,
+      '2026-09-17T18:00:00.000Z',
+      '2026-09-17T18:00:00.000Z',
+      survivorSubmissionId,
+      supersededSubmissionId,
+      opportunityId,
+      'Reviewed duplicate CRM representation.',
+      'owner@example.test',
+      '2026-09-17T18:00:00.000Z',
+      'canonical-merge-supersession-test',
+      'crm-duplicate-consolidation-v1',
+      applyManifestId,
+      repairDigest,
+      JSON.stringify({ fixture: true, suffix }),
+    );
+  });
+
+  if (status === 'reversed') {
+    await storage.upsertDealHunterCimRepairManifest({
+      id: reversalManifestId,
+      created_at: '2026-09-17T19:00:00.000Z',
+      updated_at: '2026-09-17T19:00:00.000Z',
+      mode: 'crm-duplicate-consolidation',
+      status: 'applied',
+      actor: 'canonical-merge-supersession-test',
+      backup_reference: 'fixture-backup',
+      checksum: createHash('sha256').update(`reversal-digest:${suffix}`).digest('hex'),
+      manifest: {
+        schema: 'crm-duplicate-consolidation-reversal-manifest-v1',
+        operation: 'reverse',
+        relationId,
+        applyManifestId,
+        repairDigest,
+        survivorSubmissionId,
+        supersededSubmissionId,
+        opportunityId,
+      },
+      metadata: { fixture: true },
+    });
+    withRawDatabase(sqlitePath, (database) => database.prepare(`
+      UPDATE crm_submission_supersessions
+      SET status = 'reversed', updated_at = ?, reversed_at = ?, reversed_by = ?,
+        reversal_reason = ?, reversal_manifest_id = ?
+      WHERE id = ?
+    `).run(
+      '2026-09-17T19:00:00.000Z',
+      '2026-09-17T19:00:00.000Z',
+      'canonical-merge-supersession-test',
+      'Reviewed reversal.',
+      reversalManifestId,
+      relationId,
+    ));
+    await storage.upsertDealHunterOpportunity(opportunity);
+  }
+
+  return withRawDatabase(sqlitePath, (database) => database.prepare(`
+    SELECT * FROM crm_submission_supersessions WHERE id = ?
+  `).get(relationId));
+}
+
+function canonicalMergeSupersessionHistorySnapshot(sqlitePath) {
+  return withRawDatabase(sqlitePath, (database) => ({
+    supersessions: database.prepare(`
+      SELECT * FROM crm_submission_supersessions
+      ORDER BY opportunity_id, survivor_submission_id, superseded_submission_id, id
+    `).all(),
+    applyReceipts: database.prepare(`
+      SELECT * FROM deal_hunter_cim_repair_manifests
+      WHERE mode = 'crm-duplicate-consolidation'
+        AND COALESCE(json_extract(manifest, '$.operation'), '') <> 'reverse'
+      ORDER BY id
+    `).all(),
+    reversalReceipts: database.prepare(`
+      SELECT * FROM deal_hunter_cim_repair_manifests
+      WHERE mode = 'crm-duplicate-consolidation'
+        AND json_extract(manifest, '$.operation') = 'reverse'
+      ORDER BY id
+    `).all(),
+  }));
+}
+
 async function seedApprovedRepair(storage) {
   const approval = getCanonicalOpportunityMergeApproval({ exceptionId, survivorId, supersededId });
   await storage.upsertDealHunterOpportunity(approvedOpportunity(survivorId));
@@ -2521,10 +2702,225 @@ test('dry run returns the exact deterministic plan and writes nothing', async (t
   assert.deepEqual(await repairState(storage), before);
 });
 
+const relevantSupersessionRefusalCases = [
+  ['active supersession on the proposed survivor', 'active', survivorId],
+  ['active supersession on the proposed superseded opportunity', 'active', supersededId],
+  ['reversed supersession on the proposed survivor', 'reversed', survivorId],
+  ['reversed supersession on the proposed superseded opportunity', 'reversed', supersededId],
+];
+
+for (const [name, status, opportunityId] of relevantSupersessionRefusalCases) {
+  test(`${name} blocks canonical-merge inspection and apply before mutation`, async (t) => {
+    const fixture = repairStorage(t);
+    await seedApprovedRepair(fixture.storage);
+    const reviewed = await runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage }));
+    await seedCanonicalMergeSupersession({
+      storage: fixture.storage,
+      sqlitePath: fixture.sqlitePath,
+      opportunityId,
+      suffix: `${status}-${opportunityId === survivorId ? 'survivor' : 'superseded'}`,
+      status,
+    });
+    await pauseOutreach(fixture.storage);
+    const protectedBefore = canonicalMergeSupersessionHistorySnapshot(fixture.sqlitePath);
+    const mergeBefore = await repairState(fixture.storage);
+
+    await assert.rejects(
+      runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage })),
+      /crmSubmissionSupersessions/,
+    );
+    assert.deepEqual(canonicalMergeSupersessionHistorySnapshot(fixture.sqlitePath), protectedBefore);
+    assert.deepEqual(await repairState(fixture.storage), mergeBefore);
+
+    await assert.rejects(
+      runCanonicalOpportunityMergeRepair(applyInput(fixture.storage, reviewed.planChecksum)),
+      /crmSubmissionSupersessions/,
+    );
+    assert.deepEqual(canonicalMergeSupersessionHistorySnapshot(fixture.sqlitePath), protectedBefore);
+    assert.deepEqual(await repairState(fixture.storage), mergeBefore);
+  });
+}
+
+for (const status of ['active', 'reversed']) {
+  test(`unrelated ${status} supersession does not block canonical-merge inspection`, async (t) => {
+    const fixture = repairStorage(t);
+    await seedApprovedRepair(fixture.storage);
+    await seedCanonicalMergeSupersession({
+      storage: fixture.storage,
+      sqlitePath: fixture.sqlitePath,
+      opportunityId: `unrelated-${status}-opportunity`,
+      suffix: `unrelated-${status}`,
+      status,
+    });
+    const protectedBefore = canonicalMergeSupersessionHistorySnapshot(fixture.sqlitePath);
+
+    const inspected = await runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage }));
+
+    assert.deepEqual(inspected.plan.dependentState.records.crmSubmissionSupersessions, []);
+    assert.equal(inspected.plan.dependentState.counts.crmSubmissionSupersessions, 0);
+    assert.deepEqual(canonicalMergeSupersessionHistorySnapshot(fixture.sqlitePath), protectedBefore);
+  });
+}
+
+test('unrelated active and reversed supersessions survive a successful canonical merge byte-for-byte', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  await seedCanonicalMergeSupersession({
+    storage: fixture.storage,
+    sqlitePath: fixture.sqlitePath,
+    opportunityId: 'unrelated-active-control-opportunity',
+    suffix: 'unrelated-active-control',
+    status: 'active',
+  });
+  await seedCanonicalMergeSupersession({
+    storage: fixture.storage,
+    sqlitePath: fixture.sqlitePath,
+    opportunityId: 'unrelated-reversed-control-opportunity',
+    suffix: 'unrelated-reversed-control',
+    status: 'reversed',
+  });
+  await pauseOutreach(fixture.storage);
+  const protectedBefore = canonicalMergeSupersessionHistorySnapshot(fixture.sqlitePath);
+  const reviewed = await runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage }));
+
+  const result = await runCanonicalOpportunityMergeRepair(
+    applyInput(fixture.storage, reviewed.planChecksum),
+  );
+
+  assert.equal(result.applied, true);
+  assert.deepEqual(canonicalMergeSupersessionHistorySnapshot(fixture.sqlitePath), protectedBefore);
+});
+
+test('supersession scanner returns complete deterministic rows for both merge subjects without a status filter', async (t) => {
+  const fixture = repairStorage(t);
+  const approval = await seedApprovedRepair(fixture.storage);
+  await seedCanonicalMergeSupersession({
+    storage: fixture.storage,
+    sqlitePath: fixture.sqlitePath,
+    opportunityId: survivorId,
+    suffix: 'scanner-survivor-active',
+    status: 'active',
+  });
+  await seedCanonicalMergeSupersession({
+    storage: fixture.storage,
+    sqlitePath: fixture.sqlitePath,
+    opportunityId: supersededId,
+    suffix: 'scanner-superseded-reversed',
+    status: 'reversed',
+  });
+  await seedCanonicalMergeSupersession({
+    storage: fixture.storage,
+    sqlitePath: fixture.sqlitePath,
+    opportunityId: 'scanner-unrelated-opportunity',
+    suffix: 'scanner-unrelated',
+    status: 'active',
+  });
+  const sqliteModule = await import('../server/storage/sqlite.js');
+  assert.equal(typeof sqliteModule.inspectCanonicalMergeDependentState, 'function');
+
+  const scanned = withRawDatabase(fixture.sqlitePath, (database) => (
+    sqliteModule.inspectCanonicalMergeDependentState(database, approval)
+  ));
+  const expectedRows = withRawDatabase(fixture.sqlitePath, (database) => database.prepare(`
+    SELECT * FROM crm_submission_supersessions
+    WHERE opportunity_id IN (?, ?)
+    ORDER BY opportunity_id ASC, survivor_submission_id ASC,
+      superseded_submission_id ASC, id ASC
+  `).all(survivorId, supersededId));
+  const implementedColumns = withRawDatabase(fixture.sqlitePath, (database) => database.prepare(`
+    SELECT name FROM pragma_table_xinfo('crm_submission_supersessions')
+    ORDER BY cid
+  `).all().map(({ name }) => name));
+
+  assert.equal(scanned.counts.crmSubmissionSupersessions, 2);
+  assert.deepEqual(scanned.records.crmSubmissionSupersessions, expectedRows);
+  assert.deepEqual(scanned.records.crmSubmissionSupersessions.map((row) => row.status), [
+    'reversed',
+    'active',
+  ]);
+  assert.deepEqual(Object.keys(scanned.records.crmSubmissionSupersessions[0]), implementedColumns);
+  assert.deepEqual(Object.keys(scanned.records.crmSubmissionSupersessions[1]), implementedColumns);
+  assert.equal(
+    scanned.records.crmSubmissionSupersessions.some((row) => (
+      row.opportunity_id === 'scanner-unrelated-opportunity'
+    )),
+    false,
+  );
+});
+
+test('supersession table is required for canonical-merge inspection', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  withRawDatabase(fixture.sqlitePath, (database) => database.exec(
+    'DROP TABLE crm_submission_supersessions',
+  ));
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage })),
+    /unsupported SQLite schema.*crm_submission_supersessions.*table/i,
+  );
+});
+
+test('relationship inventory classifies the exact supersession relationship surface', () => {
+  const entries = CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries.filter((entry) => (
+    entry.table === 'crm_submission_supersessions'
+  ));
+  assert.deepEqual(entries.map((entry) => ({
+    column: entry.column,
+    category: entry.category,
+    enforcement: entry.enforcement,
+    scannerPath: entry.scannerPath,
+    schemaPresence: entry.schemaPresence,
+  })), [
+    {
+      column: 'metadata',
+      category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+      enforcement: materialScannerPathEnforcement,
+      scannerPath: 'dependentState.records.crmSubmissionSupersessions',
+      schemaPresence: 'required',
+    },
+    {
+      column: 'opportunity_id',
+      category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+      enforcement: materialScannerPathEnforcement,
+      scannerPath: 'dependentState.records.crmSubmissionSupersessions',
+      schemaPresence: 'required',
+    },
+    {
+      column: 'repair_manifest_id',
+      category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+      enforcement: materialScannerPathEnforcement,
+      scannerPath: 'dependentState.records.crmSubmissionSupersessions',
+      schemaPresence: 'required',
+    },
+    {
+      column: 'reversal_manifest_id',
+      category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+      enforcement: materialScannerPathEnforcement,
+      scannerPath: 'dependentState.records.crmSubmissionSupersessions',
+      schemaPresence: 'required',
+    },
+    {
+      column: 'superseded_submission_id',
+      category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+      enforcement: materialScannerPathEnforcement,
+      scannerPath: 'dependentState.records.crmSubmissionSupersessions',
+      schemaPresence: 'required',
+    },
+    {
+      column: 'survivor_submission_id',
+      category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+      enforcement: materialScannerPathEnforcement,
+      scannerPath: 'dependentState.records.crmSubmissionSupersessions',
+      schemaPresence: 'required',
+    },
+  ]);
+});
+
 test('relationship inventory classifies every reviewed omission exactly once in all four categories', () => {
   const entries = CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries;
   const keys = entries.map((entry) => `${entry.table}.${entry.column}`);
-  assert.equal(entries.length, 235);
+  assert.equal(entries.length, 241);
   assert.equal(new Set(keys).size, keys.length);
   assert.deepEqual(
     [...new Set(entries.map((entry) => entry.category))].sort(),
@@ -2536,8 +2932,8 @@ test('relationship inventory classifies every reviewed omission exactly once in 
       entries.filter((entry) => entry.category === category).length,
     ])),
     {
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 93,
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT]: 53,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 94,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT]: 58,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.PRESERVED_GLOBAL_RECIPIENT_OPERATIONAL_STATE]: 54,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED]: 35,
     },
@@ -2553,7 +2949,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
       entries.filter((entry) => entry.enforcement === enforcement).length,
     ])),
     {
-      [materialScannerPathEnforcement]: 190,
+      [materialScannerPathEnforcement]: 196,
       [independentGateEnforcement]: 10,
       [approvalPreconditionEnforcement]: 11,
       [explicitExclusionEnforcement]: 24,
@@ -2570,7 +2966,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
     [...new Set(optionalLegacyEntries.map((entry) => entry.table))].sort(),
     ['admin_magic_links_legacy_v1', 'deal_hunter_candidates', 'prospect_discoveries'],
   );
-  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 228);
+  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 234);
   for (const entry of entries) {
     assert.ok(entry.reason, `${entry.table}.${entry.column} must document its classification`);
     assert.ok(entry.enforcement, `${entry.table}.${entry.column} must declare its enforcement class`);
@@ -2641,8 +3037,8 @@ test('relationship inventory checksum is deterministic over the complete presenc
   const first = canonicalOpportunityMergeRelationshipInventorySummary();
   const second = canonicalOpportunityMergeRelationshipInventorySummary();
   assert.deepEqual(first, second);
-  assert.equal(first.entryCount, 235);
-  assert.equal(first.checksum, '34252f068faf62022ae8b24d7e3b7eb5bcc0848bd1825d6e6305621a1a6108aa');
+  assert.equal(first.entryCount, 241);
+  assert.equal(first.checksum, '6c7de82372753e688d054b905823f13fd2719aeff5fdb3c93c36d997bf91fbbd');
   assert.equal(
     first.checksum,
     createHash('sha256')
