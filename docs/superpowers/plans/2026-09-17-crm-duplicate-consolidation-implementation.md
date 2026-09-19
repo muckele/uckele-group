@@ -26,6 +26,8 @@ The following safety language is copied from the approved specification and rema
 
 > The safe default is refusal. Read-level canonicalization for matching/search is allowed because it does not mutate business state and produces one explicit survivor. Business mutations are never silently redirected.
 
+> Ordinary canonical-opportunity merge must fail closed when either proposed opportunity participates in any active or reversed CRM submission supersession relation. Unrelated supersession relations do not block the merge. No canonical merge retargets or rewrites a supersession tuple or its apply/reversal receipts.
+
 > Preview is the default and performs zero business mutation.
 
 > This must not become a general CRM rewrite.
@@ -65,6 +67,7 @@ The approved design branch is clean at `108fa677e0ecebd28190b1642862d13b7a20fcbb
 | HTTP | `server/app.js` — admin submission, activity, communication, document, follow-up, Command Center, reconciliation, sync, and CIM routes; `handleAppError` | Authentication stays unchanged. Only the two explicitly safe supersession errors gain typed public projections. |
 | Admin UI | `src/pages/DashboardPage.jsx`, `src/components/admin/CrmNavigation.jsx`, `src/components/admin/DealActivityTimeline.jsx`, `src/components/admin/CrmCommunications.jsx`, `src/components/admin/FollowUpsWorkspace.jsx` | No bulk merge action. Existing `/admin/crm/:submissionId` deep links remain valid. |
 | Repair pattern | `server/repairs/canonicalOpportunityMerge.js`, `server/services/canonicalOpportunityMergeRepair.js`, `scripts/repair-canonical-opportunity-merge.js`, `test/canonicalOpportunityMergeRepair.test.js` | Reuse canonical JSON, checksum, inventory, backup-verification, receipt, idempotency, and transaction patterns only—not canonical-merge business semantics. |
+| Canonical-merge compatibility | `server/repairs/canonicalOpportunityMerge.js` relationship inventory, canonical-merge dependent-state inspection in `server/storage/sqlite.js`, `test/canonicalOpportunityMergeRepair.test.js`, `test/dealHunterOpportunityFacts.test.js` | Any active or reversed supersession on either merge subject blocks before mutation; unrelated relations do not block; no supersession or consolidation receipt is rewritten. |
 | Receipt table | `deal_hunter_cim_repair_manifests` DDL and accessors in both storage adapters | The schema has no CIM-only `CHECK` constraint, so a namespaced receipt fits. The current SQLite `upsertDealHunterCimRepairManifest` is intentionally mutable for existing modes, so consolidation receipts require mode-scoped UPDATE/DELETE refusal triggers in addition to direct incident insertion and exact replay/collision validation. |
 | Authority tests | `test/dealHunterCrmMatchAuthorityBinding.test.js`, `test/dealHunterCrmMatchAmbiguity.test.js` | Preserve the 5,000-contact bound, typed incomplete result, exact-match ambiguity rules, and last-boundary transactional recheck. |
 
@@ -485,6 +488,66 @@ For a loser, `canonicalSubmissionId` is the survivor but `getDashboardSubmission
   git commit -m "feat: enforce supersession across CRM business writers"
   ```
 
+## Task 6A: Canonical opportunity merge compatibility — blocker resolution
+
+This owner-approved blocker-resolution task is performed after Tasks 1–6 and before Task 7. It does not rewrite the execution history of Tasks 1–6. Ordinary canonical-opportunity merge must refuse when either merge subject has any active or reversed CRM supersession history; unrelated supersessions remain eligible under the existing merge gates.
+
+**Files:**
+
+- Modify: `server/repairs/canonicalOpportunityMerge.js`
+- Modify: `server/storage/sqlite.js`
+- Modify: `test/canonicalOpportunityMergeRepair.test.js`
+- Modify: `test/dealHunterOpportunityFacts.test.js`
+- Modify if needed for shared regression coverage: `test/crmSubmissionSupersessionStorage.test.js`
+
+### 6A.1 Write failing compatibility and immutability tests
+
+- [ ] Add canonical-merge inspection/apply fixtures proving an active supersession on the proposed survivor opportunity blocks before mutation.
+- [ ] Prove an active supersession on the proposed superseded opportunity blocks before mutation.
+- [ ] Prove a reversed supersession on the proposed survivor opportunity still blocks before mutation.
+- [ ] Prove a reversed supersession on the proposed superseded opportunity still blocks before mutation.
+- [ ] Prove an unrelated active supersession does not block an otherwise eligible merge.
+- [ ] Prove an unrelated reversed supersession does not block an otherwise eligible merge.
+- [ ] Assert the relationship inventory classifies every relationship-like column in the implemented `crm_submission_supersessions` schema. Required classifications are:
+  - `opportunity_id`: `BLOCKING_ENTITY_DEPENDENCY`, `MATERIAL_SCANNER_PATH`, scanner `dependentState.records.crmSubmissionSupersessions`;
+  - `survivor_submission_id`, `superseded_submission_id`, `repair_manifest_id`, `reversal_manifest_id`, and `metadata`: `REDUNDANT_THROUGH_SCANNED_PARENT`, `MATERIAL_SCANNER_PATH`, using the same full-row scanner.
+- [ ] Prove the scanner selects all rows whose `opportunity_id` is either merge subject and does not filter by status.
+- [ ] Snapshot supersession rows, consolidation apply receipts, and consolidation reversal receipts before canonical-merge inspection/apply attempts. Require byte-identical state after every refusal and after an unrelated-history control merge.
+- [ ] Preserve the existing successful canonical-merge behavior when neither merge subject has supersession history.
+- [ ] Remove the temporary disposable-test workaround that drops `crm_submission_supersessions` merely to reach the older opportunity-fact assertion. Replace it with current-schema assertions that exercise the explicit inventory and scoped scanner.
+- [ ] Run:
+
+  ```bash
+  node --test test/canonicalOpportunityMergeRepair.test.js test/dealHunterOpportunityFacts.test.js test/crmSubmissionSupersessionStorage.test.js
+  ```
+
+  Expected RED: the current relationship inventory rejects the supersession table as unclassified, and no scoped active/reversed compatibility scanner exists.
+
+### 6A.2 Implement the bounded fail-closed scanner and inventory classification
+
+- [ ] In `server/repairs/canonicalOpportunityMerge.js`, add the six implemented relationship-like supersession columns to `CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY` with the exact classifications from 6A.1. Treat the table as required schema.
+- [ ] In `server/storage/sqlite.js`, add `dependentState.records.crmSubmissionSupersessions` as a complete-row scanner for `opportunity_id IN (approved survivor opportunity, approved superseded opportunity)`, with deterministic ordering and no status filter.
+- [ ] Require the scoped set to be empty in the existing canonical-merge dependent-state validation before any mutation, backup-dependent apply step, or receipt write.
+- [ ] Do not update, retarget, delete, migrate, or reinterpret any supersession row. Do not update or replace any consolidation apply or reversal receipt.
+- [ ] Preserve fail-closed behavior for malformed/unclassified schema and inability to inspect supersession state.
+- [ ] Preserve unrelated active and reversed relations exactly as stored; they do not block an otherwise valid merge.
+- [ ] Do not add transitive opportunity merging or a general combined repair.
+
+### 6A.3 Prove GREEN and stop for independent compatibility review
+
+- [ ] Run the focused command from 6A.1.
+- [ ] Run the canonical-opportunity merge and supersession suites together, including current schema, preview purity, apply rollback/idempotency, receipt immutability, quick-check, and foreign-key checks.
+- [ ] Run `git diff --check`; inspect the inventory against the implemented table definition so no relationship-like column remains unclassified.
+- [ ] Independently review the compatibility correction before Task 7. Specifically verify active and reversed blocking, unrelated-row eligibility, receipt truthfulness, zero retarget/rewrite behavior, and removal of the temporary table-drop characterization.
+- [ ] Commit normally without amending or rewriting Tasks 1–6:
+
+  ```bash
+  git add server/repairs/canonicalOpportunityMerge.js server/storage/sqlite.js test/canonicalOpportunityMergeRepair.test.js test/dealHunterOpportunityFacts.test.js test/crmSubmissionSupersessionStorage.test.js
+  git commit -m "fix: block canonical merge across CRM supersession history"
+  ```
+
+Task 7 must not resume until Task 6A is implemented, all named tests pass, and the compatibility correction passes independent review.
+
 ## Task 7: Read-only CRM duplicate-review projection
 
 **Files:**
@@ -800,6 +863,7 @@ The implementation must not include:
 | Direct historical detail, combined history, `originSubmissionId`, minimal banner/link | 4 |
 | Match authority v2, 5,000 bounds, canonicalize then dedupe, final `BEGIN IMMEDIATE` validation | 5 |
 | All remaining writers, sends, claims, documents, reconciliation, sync, facts, Stage 2 | 6 |
+| Canonical opportunity merge compatibility with immutable CRM supersession history: relevant active/reversed relation blocks, unrelated relation does not block, no retarget/rewrite, schema inventory remains fail closed | 6A |
 | Read-only pair report, no transitive grouping, no bulk merge, generic audit unchanged | 7 |
 | Exact approval descriptor, exhaustive reference classifier, preview purity, four-row transaction, idempotency/rollback | 8 |
 | Preview-default CLI, exact confirmation, runbook, no arbitrary pair arguments | 9 |
@@ -819,6 +883,7 @@ The implementation must not include:
 - [x] Pooler and Berlin remain separate and cannot merge through candidate transitivity.
 - [x] Supabase remains fail-closed before partial reads or writes.
 - [x] Every business writer has an identified central guard path and race-sensitive storage recheck.
+- [x] Canonical-opportunity merge compatibility is an explicit blocker-resolution task before Task 7: active and reversed scoped relations block, unrelated relations do not, and no supersession tuple or receipt is retargeted or rewritten.
 - [x] Active filtering uses the shared indexed SQLite anti-join rather than frontend hiding.
 - [x] PR #19 ambiguity, bounds, and final-link semantics remain covered.
 - [x] Generic CRM integrity audit semantics remain unchanged; supersession has its own audit.
