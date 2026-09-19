@@ -42,6 +42,22 @@ import {
   stableCanonicalJson,
   validateCanonicalOpportunityMergeReplayManifest,
 } from '../repairs/canonicalOpportunityMerge.js';
+import {
+  buildCrmDuplicateConsolidationPlan,
+  canonicalJsonSha256,
+  classifyCrmDuplicateConsolidationReference,
+  CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR,
+  CRM_DUPLICATE_CONSOLIDATION_EXPECTED_MUTATION_LEDGER,
+  CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
+  CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
+  CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+  crmDuplicateConsolidationManifestId,
+  crmDuplicateConsolidationRelationId,
+  findCrmDuplicateConsolidationUnclassifiedSchema,
+  isCrmDuplicateConsolidationRelationshipColumn,
+  stableCanonicalJson as stableCrmDuplicateConsolidationJson,
+  validateCrmDuplicateConsolidationReceipt,
+} from '../repairs/crmDuplicateConsolidation.js';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
 
 function parseJsonColumn(value, fallback) {
@@ -2421,6 +2437,570 @@ function validateCanonicalMergeFinalState(database, {
     throw new Error('Canonical opportunity merge final state changed approved preserved incident rows.');
   }
   return { survivor, superseded, identityException, aliases, manifest, dependentState };
+}
+
+const crmDuplicateConsolidationMaximumRows = 250000;
+
+function quoteCrmDuplicateConsolidationIdentifier(identifier) {
+  return `"${String(identifier).replaceAll('"', '""')}"`;
+}
+
+function compareCrmDuplicateConsolidationText(left, right) {
+  const leftText = String(left);
+  const rightText = String(right);
+  return leftText < rightText ? -1 : leftText > rightText ? 1 : 0;
+}
+
+function crmDuplicateConsolidationSchema(database) {
+  return database.prepare(`
+    SELECT name, sql
+    FROM sqlite_schema
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    ORDER BY name
+  `).all().map((table) => ({
+    name: table.name,
+    sqlDigest: createHash('sha256').update(String(table.sql || '')).digest('hex'),
+    columns: database.pragma(`table_info(${JSON.stringify(table.name)})`).map((column) => ({
+      cid: Number(column.cid),
+      name: column.name,
+      type: column.type,
+      notNull: Boolean(column.notnull),
+      defaultValue: column.dflt_value,
+      primaryKey: Number(column.pk),
+    })),
+  }));
+}
+
+function crmDuplicateConsolidationDatabaseState(database) {
+  const schema = crmDuplicateConsolidationSchema(database);
+  let totalRows = 0;
+  const rowsByTable = {};
+  const tableDigests = {};
+  for (const table of schema) {
+    const quotedTable = quoteCrmDuplicateConsolidationIdentifier(table.name);
+    const count = Number(database.prepare(`SELECT COUNT(*) AS count FROM ${quotedTable}`).get()?.count || 0);
+    totalRows += count;
+    if (totalRows > crmDuplicateConsolidationMaximumRows) {
+      throw new Error('CRM duplicate consolidation inspection row bound exceeded.');
+    }
+    const rows = database.prepare(`SELECT * FROM ${quotedTable}`).all()
+      .sort((left, right) => compareCrmDuplicateConsolidationText(
+        stableCrmDuplicateConsolidationJson(left),
+        stableCrmDuplicateConsolidationJson(right),
+      ));
+    rowsByTable[table.name] = rows;
+    tableDigests[table.name] = {
+      rowCount: rows.length,
+      digest: canonicalJsonSha256(rows),
+    };
+  }
+  return {
+    schema,
+    schemaDigest: canonicalJsonSha256(schema),
+    rowsByTable,
+    tableDigests,
+    logicalDigest: canonicalJsonSha256(rowsByTable),
+    totalRows,
+  };
+}
+
+function parseCrmDuplicateConsolidationMetadata(value) {
+  try {
+    const parsed = value ? JSON.parse(value) : {};
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function crmDuplicateConsolidationRawDigest(row) {
+  return canonicalJsonSha256(row || null);
+}
+
+function crmDuplicateConsolidationUnchangedMutationDigests(database) {
+  const exclusions = {
+    crm_submission_supersessions: new Set(
+      CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map(crmDuplicateConsolidationRelationId),
+    ),
+    deal_hunter_crm_imports: new Set([CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id]),
+    deal_hunter_cim_repair_manifests: new Set([crmDuplicateConsolidationManifestId()]),
+  };
+  return Object.fromEntries(Object.entries(exclusions).map(([table, excludedIds]) => {
+    const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
+      .filter((row) => !excludedIds.has(row.id))
+      .sort((left, right) => compareCrmDuplicateConsolidationText(
+        stableCrmDuplicateConsolidationJson(left),
+        stableCrmDuplicateConsolidationJson(right),
+      ));
+    return [table, { rowCount: rows.length, digest: canonicalJsonSha256(rows) }];
+  }));
+}
+
+function crmDuplicateConsolidationUnchangedBerlinColumns(row) {
+  return Object.fromEntries(Object.entries(row || {}).filter(([column]) => (
+    !['submission_id', 'updated_at', 'metadata'].includes(column)
+  )));
+}
+
+function crmDuplicateConsolidationListingMatches(row, pair, { allowMissing = false } = {}) {
+  const numericId = pair.listingIdentity.split(':')[1];
+  const metadata = parseCrmDuplicateConsolidationMetadata(row?.metadata);
+  const dealHunter = metadata?.dealHunter || {};
+  const listingUrl = String(row?.listing_url || '');
+  const aliases = [
+    ...(Array.isArray(dealHunter.listingAliases) ? dealHunter.listingAliases : []),
+    ...(Array.isArray(dealHunter.identityAliases) ? dealHunter.identityAliases : []),
+  ].map(String);
+  if (allowMissing && !listingUrl && aliases.length === 0) return true;
+  return listingUrl.includes(numericId) && aliases.includes(pair.listingIdentity);
+}
+
+function crmDuplicateConsolidationFinancialMatches(row, pair) {
+  const metadata = parseCrmDuplicateConsolidationMetadata(row?.metadata);
+  const provenance = metadata?.dealHunter?.financialProvenance || {};
+  return row?.asking_price === pair.askingPrice
+    && row?.ttm_revenue === pair.revenue
+    && row?.ttm_ebitda === pair.financialValue
+    && provenance.originalLabel === pair.financialLabel
+    && provenance.originalValue === pair.financialValue
+    && provenance.period === 'unknown';
+}
+
+function crmDuplicateConsolidationReferenceInventory(state) {
+  const tokens = [
+    ...CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.flatMap((pair) => [
+      pair.opportunityId,
+      pair.survivorSubmissionId,
+      pair.supersededSubmissionId,
+      pair.listingIdentity,
+    ]),
+    CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id,
+  ];
+  const references = [];
+  for (const table of state.schema) {
+    const rows = state.rowsByTable[table.name] || [];
+    for (const column of table.columns) {
+      if (!isCrmDuplicateConsolidationRelationshipColumn(column.name)) continue;
+      const classification = classifyCrmDuplicateConsolidationReference({
+        table: table.name,
+        column: column.name,
+      });
+      if (!classification) continue;
+      const matched = rows.filter((row) => {
+        const value = row[column.name];
+        if (value === null || value === undefined) return false;
+        const serialized = String(value);
+        return tokens.some((token) => serialized.includes(token));
+      });
+      references.push({
+        table: table.name,
+        column: column.name,
+        classification,
+        matchedRowCount: matched.length,
+        matchedRowsDigest: canonicalJsonSha256(matched),
+      });
+    }
+  }
+  return references.sort((left, right) => (
+    compareCrmDuplicateConsolidationText(left.table, right.table)
+      || compareCrmDuplicateConsolidationText(left.column, right.column)
+  ));
+}
+
+function crmDuplicateConsolidationRowsForIds(database, table, column, ids) {
+  const quotedTable = quoteCrmDuplicateConsolidationIdentifier(table);
+  const quotedColumn = quoteCrmDuplicateConsolidationIdentifier(column);
+  return database.prepare(`
+    SELECT * FROM ${quotedTable}
+    WHERE ${quotedColumn} IN (${placeholders(ids.length)})
+    ORDER BY ${quotedColumn}
+  `).all(...ids);
+}
+
+function crmDuplicateConsolidationSafety(database, blockers) {
+  const loserIds = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.supersededSubmissionId);
+  const pairIds = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.flatMap((pair) => [
+    pair.survivorSubmissionId,
+    pair.supersededSubmissionId,
+  ]);
+  const tableExists = (name) => Boolean(database.prepare(`
+    SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ? LIMIT 1
+  `).get(name));
+  const count = (sql, ...values) => Number(database.prepare(sql).get(...values)?.count || 0);
+  const safety = {};
+  const automation = tableExists('deal_hunter_automation_settings')
+    ? database.prepare("SELECT * FROM deal_hunter_automation_settings WHERE id = 'global' LIMIT 1").get()
+    : null;
+  const automationMetadata = parseCrmDuplicateConsolidationMetadata(automation?.metadata);
+  safety.activeWriterCount = !automation
+    || Number(automation.paused) !== 1
+    || automationMetadata.schedulerDisabled !== true
+    ? 1 : 0;
+  if (safety.activeWriterCount) blockers.push('active-writer-or-scheduler-not-disabled');
+
+  const outbound = tableExists('deal_hunter_cim_safety_settings')
+    ? database.prepare("SELECT * FROM deal_hunter_cim_safety_settings WHERE id = 'global' LIMIT 1").get()
+    : null;
+  const outboundMetadata = parseCrmDuplicateConsolidationMetadata(outbound?.metadata);
+  safety.outboundSafe = Boolean(outbound)
+    && Number(outbound.outreach_paused) === 1
+    && outboundMetadata.followUpsDisabled === true;
+  if (!safety.outboundSafe) blockers.push('unsafe-outbound-control');
+
+  const loserPlaceholders = placeholders(loserIds.length);
+  const pairPlaceholders = placeholders(pairIds.length);
+  safety.nonterminalLoserCommunications = count(`
+    SELECT COUNT(*) AS count FROM crm_communications
+    WHERE submission_id IN (${loserPlaceholders})
+      AND COALESCE(delivery_state, '') NOT IN ('accepted', 'delivered', 'failed', 'rejected', 'bounced', 'complained')
+  `, ...loserIds);
+  if (safety.nonterminalLoserCommunications) blockers.push('nonterminal-loser-communication');
+  safety.nonterminalLoserOutbox = count(`
+    SELECT COUNT(*) AS count FROM crm_email_outbox
+    WHERE submission_id IN (${loserPlaceholders})
+      AND state NOT IN ('accepted', 'permanent_failed', 'cancelled')
+  `, ...loserIds);
+  if (safety.nonterminalLoserOutbox) blockers.push('nonterminal-loser-outbox');
+  safety.nonterminalLoserCimRequests = count(`
+    SELECT COUNT(*) AS count FROM deal_hunter_cim_requests
+    WHERE submission_id IN (${loserPlaceholders})
+      AND NOT (
+        status = 'sent'
+        AND request_state IN ('provider_accepted', 'responded', 'stopped')
+        AND delivery_state IN ('accepted', 'delivered')
+        AND follow_up_state IN ('completed', 'stopped')
+        AND next_follow_up_at IS NULL
+      )
+  `, ...loserIds);
+  if (safety.nonterminalLoserCimRequests) blockers.push('nonterminal-loser-cim-request');
+  safety.nonterminalPairCimRequests = count(`
+    SELECT COUNT(*) AS count FROM deal_hunter_cim_requests
+    WHERE submission_id IN (${pairPlaceholders})
+      AND NOT (
+        status = 'sent'
+        AND request_state IN ('provider_accepted', 'responded', 'stopped')
+        AND delivery_state IN ('accepted', 'delivered')
+        AND follow_up_state IN ('completed', 'stopped')
+        AND next_follow_up_at IS NULL
+      )
+  `, ...pairIds);
+  if (safety.nonterminalPairCimRequests) blockers.push('nonterminal-pair-cim-request');
+  safety.actionableLoserRecommendations = count(`
+    SELECT COUNT(*) AS count FROM crm_follow_up_recommendations
+    WHERE submission_id IN (${loserPlaceholders}) AND status IN ('current', 'pending')
+  `, ...loserIds);
+  if (safety.actionableLoserRecommendations) blockers.push('nonterminal-loser-recommendation');
+  safety.activeLoserUploads = count(`
+    SELECT COUNT(*) AS count FROM secure_upload_requests
+    WHERE submission_id IN (${loserPlaceholders})
+      AND status NOT IN ('closed', 'revoked', 'expired', 'completed')
+  `, ...loserIds);
+  if (safety.activeLoserUploads) blockers.push('nonterminal-loser-upload');
+  safety.nonterminalLoserReconciliationItems = count(`
+    SELECT COUNT(*) AS count FROM deal_hunter_crm_reconciliation_items
+    WHERE submission_id IN (${loserPlaceholders})
+      AND status NOT IN ('completed', 'skipped', 'failed')
+  `, ...loserIds);
+  if (safety.nonterminalLoserReconciliationItems) blockers.push('nonterminal-loser-reconciliation');
+  safety.activeLoserCleanupJobs = count(`
+    SELECT COUNT(*) AS count FROM secure_document_cleanup_jobs
+    WHERE submission_id IN (${loserPlaceholders})
+      AND status NOT IN ('completed', 'restored')
+  `, ...loserIds);
+  if (safety.activeLoserCleanupJobs) blockers.push('nonterminal-loser-cleanup');
+  safety.activeStage2Activations = count(`
+    SELECT COUNT(*) AS count FROM deal_hunter_cim_stage2_activations
+    WHERE status = 'active'
+  `);
+  if (safety.activeStage2Activations) blockers.push('active-stage2-activation');
+  return safety;
+}
+
+function inspectCrmDuplicateConsolidationState(database, { connection } = {}) {
+  const state = crmDuplicateConsolidationDatabaseState(database);
+  const blockers = findCrmDuplicateConsolidationUnclassifiedSchema(state.schema);
+  const submissions = new Map(crmDuplicateConsolidationRowsForIds(
+    database,
+    'contact_submissions',
+    'id',
+    CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.flatMap((pair) => [
+      pair.survivorSubmissionId,
+      pair.supersededSubmissionId,
+    ]),
+  ).map((row) => [row.id, row]));
+  const opportunities = new Map(crmDuplicateConsolidationRowsForIds(
+    database,
+    'deal_hunter_opportunities',
+    'opportunity_id',
+    CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.opportunityId),
+  ).map((row) => [row.opportunity_id, row]));
+
+  const safePairs = [];
+  for (const pair of CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs) {
+    const survivor = submissions.get(pair.survivorSubmissionId);
+    const loser = submissions.get(pair.supersededSubmissionId);
+    const opportunity = opportunities.get(pair.opportunityId);
+    if (!survivor || !loser) blockers.push(`tuple-${pair.key}-submission-missing`);
+    if (!opportunity || opportunity.status !== 'active'
+      || opportunity.primary_submission_id !== pair.survivorSubmissionId) {
+      blockers.push(`primary-${pair.key}-authority-drift`);
+    }
+    const survivorOwner = parseCrmDuplicateConsolidationMetadata(survivor?.metadata)?.dealHunter?.opportunityId;
+    const loserOwner = parseCrmDuplicateConsolidationMetadata(loser?.metadata)?.dealHunter?.opportunityId;
+    if (survivorOwner !== pair.opportunityId
+      || (loserOwner && loserOwner !== pair.opportunityId)
+      || (survivor?.deal_hunter_opportunity_id && survivor.deal_hunter_opportunity_id !== pair.opportunityId)
+      || (loser?.deal_hunter_opportunity_id && loser.deal_hunter_opportunity_id !== pair.opportunityId)) {
+      blockers.push(`owner-${pair.key}-drift`);
+    }
+    if (!crmDuplicateConsolidationListingMatches(survivor, pair)
+      || !crmDuplicateConsolidationListingMatches(loser, pair, {
+        allowMissing: pair.key === 'berlin',
+      })) {
+      blockers.push(`listing-${pair.key}-drift`);
+    }
+    if (!crmDuplicateConsolidationFinancialMatches(survivor, pair)
+      || !crmDuplicateConsolidationFinancialMatches(loser, pair)) {
+      const survivorMetadata = parseCrmDuplicateConsolidationMetadata(survivor?.metadata);
+      const loserMetadata = parseCrmDuplicateConsolidationMetadata(loser?.metadata);
+      const labels = [
+        survivorMetadata?.dealHunter?.financialProvenance?.originalLabel,
+        loserMetadata?.dealHunter?.financialProvenance?.originalLabel,
+      ];
+      blockers.push(labels.some((label) => label !== pair.financialLabel)
+        ? `financial-label-${pair.key}-drift`
+        : `financial-value-${pair.key}-drift`);
+    }
+    safePairs.push({
+      key: pair.key,
+      opportunityId: pair.opportunityId,
+      survivorSubmissionId: pair.survivorSubmissionId,
+      supersededSubmissionId: pair.supersededSubmissionId,
+      listingIdentity: pair.listingIdentity,
+      opportunityStatus: opportunity?.status || null,
+      primarySubmissionId: opportunity?.primary_submission_id || null,
+      survivorStatus: survivor?.status || null,
+      supersededStatus: loser?.status || null,
+    });
+  }
+
+  const berlinImport = database.prepare(`
+    SELECT * FROM deal_hunter_crm_imports WHERE id = ? LIMIT 1
+  `).get(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id);
+  if (!berlinImport
+    || berlinImport.submission_id !== CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.beforeSubmissionId
+    || berlinImport.opportunity_id !== null) {
+    blockers.push('Berlin import tuple drift');
+  }
+  const existingRelations = database.prepare(`
+    SELECT * FROM crm_submission_supersessions
+    WHERE survivor_submission_id IN (${placeholders(2)})
+       OR superseded_submission_id IN (${placeholders(2)})
+       OR opportunity_id IN (${placeholders(2)})
+    ORDER BY id
+  `).all(
+    ...CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.survivorSubmissionId),
+    ...CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.supersededSubmissionId),
+    ...CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.opportunityId),
+  );
+  if (existingRelations.length) blockers.push('partial-or-independently-satisfied-supersession-state');
+  const safety = crmDuplicateConsolidationSafety(database, blockers);
+  const targetRows = [
+    ...submissions.values(),
+    ...opportunities.values(),
+    berlinImport,
+    database.prepare("SELECT * FROM deal_hunter_cim_safety_settings WHERE id = 'global'").get(),
+    database.prepare("SELECT * FROM deal_hunter_automation_settings WHERE id = 'global'").get(),
+  ].filter(Boolean);
+  const rawRows = targetRows.map((row) => ({
+    table: row.opportunity_id && Object.hasOwn(row, 'primary_submission_id')
+      ? 'deal_hunter_opportunities'
+      : row.id === CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id
+        ? 'deal_hunter_crm_imports'
+        : row.id === 'global' && Object.hasOwn(row, 'outreach_paused')
+          ? 'deal_hunter_cim_safety_settings'
+          : row.id === 'global' && Object.hasOwn(row, 'paused')
+            ? 'deal_hunter_automation_settings'
+            : 'contact_submissions',
+    id: row.id || row.opportunity_id,
+    digest: crmDuplicateConsolidationRawDigest(row),
+  })).sort((left, right) => (
+    compareCrmDuplicateConsolidationText(left.table, right.table)
+      || compareCrmDuplicateConsolidationText(left.id, right.id)
+  ));
+  return {
+    provider: 'sqlite',
+    connection: connection || {
+      readonly: Boolean(database.readonly),
+      fileMustExist: true,
+      queryOnly: Number(database.pragma('query_only', { simple: true })) === 1,
+      consistentReadTransaction: Boolean(database.inTransaction),
+    },
+    blockers: [...new Set(blockers)].sort(),
+    database: {
+      logicalDigest: state.logicalDigest,
+      totalRows: state.totalRows,
+      quickCheck: String(database.pragma('quick_check', { simple: true }) || ''),
+      foreignKeyViolationCount: database.pragma('foreign_key_check').length,
+    },
+    schema: {
+      digest: state.schemaDigest,
+      tables: state.schema.map((table) => ({
+        name: table.name,
+        sqlDigest: table.sqlDigest,
+        columns: table.columns.map((column) => column.name),
+      })),
+    },
+    relationshipInventory: crmDuplicateConsolidationReferenceInventory(state),
+    tableDigests: state.tableDigests,
+    rawRows,
+    safety,
+    currentState: {
+      pairs: safePairs,
+      berlinImport: berlinImport ? {
+        id: berlinImport.id,
+        submissionId: berlinImport.submission_id,
+        opportunityId: berlinImport.opportunity_id,
+        updatedAt: berlinImport.updated_at,
+        metadataDigest: canonicalJsonSha256(berlinImport.metadata || '{}'),
+        metadataObjectDigest: canonicalJsonSha256(parseCrmDuplicateConsolidationMetadata(berlinImport.metadata)),
+        unchangedColumnsDigest: canonicalJsonSha256(
+          crmDuplicateConsolidationUnchangedBerlinColumns(berlinImport),
+        ),
+        rawDigest: crmDuplicateConsolidationRawDigest(berlinImport),
+      } : null,
+      existingRelationCount: existingRelations.length,
+      unchangedMutationTableDigests: crmDuplicateConsolidationUnchangedMutationDigests(database),
+    },
+  };
+}
+
+function inspectCrmDuplicateConsolidation(database, connection = null) {
+  const read = database.transaction(() => inspectCrmDuplicateConsolidationState(database, {
+    connection: connection || {
+      readonly: Boolean(database.readonly),
+      fileMustExist: true,
+      queryOnly: Number(database.pragma('query_only', { simple: true })) === 1,
+      consistentReadTransaction: true,
+    },
+  }));
+  return read.deferred();
+}
+
+function crmDuplicateConsolidationFinalState(database, { artifact, actor, reason, backup }) {
+  const relations = database.prepare(`
+    SELECT * FROM crm_submission_supersessions
+    WHERE repair_manifest_id = ? ORDER BY id
+  `).all(artifact.manifestId);
+  const berlinImport = database.prepare(`
+    SELECT * FROM deal_hunter_crm_imports WHERE id = ? LIMIT 1
+  `).get(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id);
+  const rawReceipt = database.prepare(`
+    SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ? LIMIT 1
+  `).get(artifact.manifestId);
+  const receipt = normalizeDealHunterRepairManifestRow(rawReceipt);
+  const expectedRelations = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => ({
+    id: crmDuplicateConsolidationRelationId(pair),
+    created_at: receipt?.created_at,
+    updated_at: receipt?.created_at,
+    status: 'active',
+    survivor_submission_id: pair.survivorSubmissionId,
+    superseded_submission_id: pair.supersededSubmissionId,
+    opportunity_id: pair.opportunityId,
+    reason_code: 'confirmed-duplicate',
+    reason_text: reason,
+    approved_by: CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.approvedBy,
+    approved_at: CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.approvedAt,
+    actor,
+    repair_version: CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+    repair_manifest_id: artifact.manifestId,
+    repair_digest: artifact.planChecksum,
+    reversed_at: null,
+    reversed_by: null,
+    reversal_reason: null,
+    reversal_manifest_id: null,
+    metadata: stableCrmDuplicateConsolidationJson({
+      schema: 'crm-submission-supersession-metadata-v1',
+      pairKey: pair.key,
+      listingIdentity: pair.listingIdentity,
+      manifestId: artifact.manifestId,
+    }),
+  })).sort((left, right) => compareCrmDuplicateConsolidationText(left.id, right.id));
+  const validRelations = stableCrmDuplicateConsolidationJson(relations)
+    === stableCrmDuplicateConsolidationJson(expectedRelations);
+  const berlinMetadata = parseCrmDuplicateConsolidationMetadata(berlinImport?.metadata);
+  const { crmDuplicateConsolidation: berlinProvenance, ...berlinPriorMetadata } = berlinMetadata;
+  const expectedBerlinProvenance = {
+    schema: 'crm-duplicate-consolidation-import-provenance-v1',
+    manifestId: artifact.manifestId,
+    planChecksum: artifact.planChecksum,
+    priorSubmissionId: CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.beforeSubmissionId,
+    priorUpdatedAt: artifact.plan.currentState.berlinImport.updatedAt,
+    priorMetadataDigest: artifact.plan.currentState.berlinImport.metadataDigest,
+  };
+  const validImport = berlinImport?.submission_id
+      === CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.afterSubmissionId
+    && berlinImport?.opportunity_id === null
+    && berlinImport?.updated_at === receipt?.created_at
+    && canonicalJsonSha256(crmDuplicateConsolidationUnchangedBerlinColumns(berlinImport))
+      === artifact.plan.currentState.berlinImport.unchangedColumnsDigest
+    && canonicalJsonSha256(berlinPriorMetadata)
+      === artifact.plan.currentState.berlinImport.metadataObjectDigest
+    && stableCrmDuplicateConsolidationJson(berlinProvenance)
+      === stableCrmDuplicateConsolidationJson(expectedBerlinProvenance);
+  const validUnchangedMutationTables = stableCrmDuplicateConsolidationJson(
+    crmDuplicateConsolidationUnchangedMutationDigests(database),
+  ) === stableCrmDuplicateConsolidationJson(
+    artifact.plan.currentState.unchangedMutationTableDigests,
+  );
+  const appliedState = { valid: validRelations && validImport && validUnchangedMutationTables };
+  validateCrmDuplicateConsolidationReceipt({
+    row: receipt,
+    rawRow: rawReceipt,
+    artifact,
+    actor,
+    reason,
+    backup,
+    appliedState,
+  });
+  if (!appliedState.valid) throw new Error('CRM duplicate consolidation final state is partial or conflicting.');
+  const quickCheck = String(database.pragma('quick_check', { simple: true }) || '');
+  const foreignKeyViolations = database.pragma('foreign_key_check');
+  if (quickCheck !== 'ok' || foreignKeyViolations.length) {
+    throw new Error('CRM duplicate consolidation postcondition integrity check failed.');
+  }
+  return { relations, berlinImport, receipt, quickCheck, foreignKeyViolationCount: 0, valid: true };
+}
+
+export function createSqliteCrmDuplicateConsolidationReadOnlyStorage(config) {
+  if (config?.storage?.provider && config.storage.provider !== 'sqlite') {
+    throw new Error('CRM duplicate consolidation is SQLite-only.');
+  }
+  const sqlitePath = String(config?.storage?.sqlitePath || '').trim();
+  if (!sqlitePath) throw new Error('CRM duplicate consolidation requires an existing SQLite database path.');
+  const database = new Database(sqlitePath, { readonly: true, fileMustExist: true });
+  database.pragma('query_only = ON');
+  if (!database.readonly || Number(database.pragma('query_only', { simple: true })) !== 1) {
+    database.close();
+    throw new Error('CRM duplicate consolidation could not enforce read-only query-only preview.');
+  }
+  let closed = false;
+  return {
+    provider: 'sqlite',
+    close() {
+      if (closed) return;
+      closed = true;
+      database.close();
+    },
+    async inspectCrmDuplicateConsolidation() {
+      return inspectCrmDuplicateConsolidation(database, {
+        readonly: true,
+        fileMustExist: true,
+        queryOnly: true,
+        consistentReadTransaction: true,
+      });
+    },
+  };
 }
 
 export function createSqliteCanonicalOpportunityMergeReadOnlyStorage(config) {
@@ -9116,6 +9696,293 @@ export function createSqliteStorage(config) {
 
 	      return updateDealHunterCrmImportTransaction.immediate({ id, values });
 	    },
+
+    async inspectCrmDuplicateConsolidation() {
+      return inspectCrmDuplicateConsolidation(database);
+    },
+
+    async verifyCrmDuplicateConsolidationBackupPlan({ artifact, backup } = {}) {
+      const backupPath = path.resolve(String(backup?.path || ''));
+      const before = fs.statSync(backupPath, { bigint: true });
+      const bytes = fs.readFileSync(backupPath);
+      const after = fs.statSync(backupPath, { bigint: true });
+      if (!before.isFile()
+        || ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].some((field) => before[field] !== after[field])
+        || createHash('sha256').update(bytes).digest('hex') !== backup?.sha256) {
+        throw new Error('Apply refused: backup path or SHA changed during verification.');
+      }
+      for (const suffix of ['-wal', '-shm', '-journal']) {
+        if (fs.existsSync(`${backupPath}${suffix}`)) {
+          throw new Error('Apply refused: backup has an unverified SQLite sidecar.');
+        }
+      }
+      const snapshotBytes = Buffer.from(bytes);
+      snapshotBytes[18] = 1;
+      snapshotBytes[19] = 1;
+      const snapshot = new Database(snapshotBytes);
+      try {
+        snapshot.pragma('query_only = ON');
+        const inspection = inspectCrmDuplicateConsolidation(snapshot, {
+          readonly: true,
+          fileMustExist: true,
+          queryOnly: true,
+          consistentReadTransaction: true,
+        });
+        if (inspection.blockers.length) {
+          throw new Error(`backup inspection blockers: ${inspection.blockers.join(', ')}`);
+        }
+        const planned = buildCrmDuplicateConsolidationPlan({
+          inspection,
+          actor: artifact.plan.actor,
+          reason: artifact.plan.reason,
+          executionRelease: artifact.plan.execution.release,
+          toolingRevision: artifact.plan.execution.toolingRevision,
+          recoveryCheckpoint: artifact.plan.recoveryCheckpoint,
+        });
+        if (planned.planChecksum !== artifact.planChecksum
+          || inspection.database.logicalDigest !== artifact.plan.database.logicalDigest
+          || inspection.schema.digest !== artifact.plan.schema.digest) {
+          throw new Error('backup does not reproduce the reviewed plan and raw database digest');
+        }
+        return {
+          planChecksum: planned.planChecksum,
+          databaseLogicalDigest: inspection.database.logicalDigest,
+          schemaDigest: inspection.schema.digest,
+        };
+      } finally {
+        snapshot.close();
+      }
+    },
+
+    async applyCrmDuplicateConsolidation({
+      artifact,
+      backup,
+      actor,
+      reason,
+      executionRelease,
+      toolingRevision,
+      nowIso,
+      testHooks = null,
+    } = {}) {
+      const transaction = database.transaction(() => {
+        const existingReceipt = normalizeDealHunterRepairManifestRow(database.prepare(`
+          SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ? LIMIT 1
+        `).get(artifact.manifestId));
+        if (existingReceipt) {
+          const finalState = crmDuplicateConsolidationFinalState(database, {
+            artifact, actor, reason, backup,
+          });
+          for (const [table, expected] of Object.entries(artifact.plan.tableDigests)) {
+            if (['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests'].includes(table)) continue;
+            const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
+              .sort((left, right) => compareCrmDuplicateConsolidationText(
+                stableCrmDuplicateConsolidationJson(left),
+                stableCrmDuplicateConsolidationJson(right),
+              ));
+            if (rows.length !== expected.rowCount || canonicalJsonSha256(rows) !== expected.digest) {
+              throw new Error(`CRM duplicate consolidation replay protected-table drift: ${table}.`);
+            }
+          }
+          return {
+            status: 'verified-prior-apply',
+            mode: 'apply',
+            applied: false,
+            mutationCount: 0,
+            mutations: [],
+            manifestId: artifact.manifestId,
+            planChecksum: artifact.planChecksum,
+            finalState,
+          };
+        }
+
+        const inspection = inspectCrmDuplicateConsolidationState(database, {
+          connection: {
+            readonly: false,
+            fileMustExist: true,
+            queryOnly: false,
+            consistentReadTransaction: true,
+          },
+        });
+        if (inspection.blockers.length) {
+          throw new Error(`Apply refused: partial, satisfied-without-receipt, or unsafe state (${inspection.blockers.join(', ')}).`);
+        }
+        const planned = buildCrmDuplicateConsolidationPlan({
+          inspection,
+          actor,
+          reason,
+          executionRelease,
+          toolingRevision,
+          recoveryCheckpoint: artifact.plan.recoveryCheckpoint,
+        });
+        if (planned.manifestId !== artifact.manifestId
+          || planned.planChecksum !== artifact.planChecksum
+          || inspection.database.logicalDigest !== artifact.plan.database.logicalDigest
+          || inspection.schema.digest !== artifact.plan.schema.digest
+          || stableCrmDuplicateConsolidationJson(inspection.rawRows)
+            !== stableCrmDuplicateConsolidationJson(artifact.plan.rawRows)) {
+          throw new Error('Apply refused: live raw-row, schema, database, or reviewed plan drift.');
+        }
+
+        const receiptManifest = {
+          repairType: CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
+          repairVersion: CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+          manifestSchema: CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
+          approvalSchema: artifact.approvalSchema,
+          manifestId: artifact.manifestId,
+          planChecksum: artifact.planChecksum,
+          actor,
+          reason,
+          backup,
+          artifact,
+          appliedAt: nowIso,
+          mutationCount: 4,
+        };
+        const receiptMetadata = {
+          repairType: CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
+          repairVersion: CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+          manifestSchema: CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
+          approvalSchema: artifact.approvalSchema,
+          planChecksum: artifact.planChecksum,
+          pairKeys: ['pooler', 'berlin'],
+          berlinPriorSubmissionId: CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.beforeSubmissionId,
+        };
+        const receiptInsert = database.prepare(`
+          INSERT INTO deal_hunter_cim_repair_manifests (
+            id, created_at, updated_at, mode, status, actor,
+            backup_reference, checksum, manifest, metadata
+          ) VALUES (?, ?, ?, ?, 'applied', ?, ?, ?, ?, ?)
+        `).run(
+          artifact.manifestId,
+          nowIso,
+          nowIso,
+          CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
+          actor,
+          backup.path,
+          artifact.planChecksum,
+          stableCrmDuplicateConsolidationJson(receiptManifest),
+          stableCrmDuplicateConsolidationJson(receiptMetadata),
+        );
+        if (receiptInsert.changes !== 1) throw new Error('CRM duplicate consolidation receipt insert was not exact.');
+        if (testHooks?.failAfterWrite === 1) throw new Error('Injected failure after write 1.');
+
+        let writeNumber = 1;
+        for (const pair of CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs) {
+          const relationInsert = database.prepare(`
+            INSERT INTO crm_submission_supersessions (
+              id, created_at, updated_at, status, survivor_submission_id,
+              superseded_submission_id, opportunity_id, reason_code, reason_text,
+              approved_by, approved_at, actor, repair_version, repair_manifest_id,
+              repair_digest, reversed_at, reversed_by, reversal_reason,
+              reversal_manifest_id, metadata
+            ) VALUES (
+              ?, ?, ?, 'active', ?, ?, ?, 'confirmed-duplicate', ?,
+              ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?
+            )
+          `).run(
+            crmDuplicateConsolidationRelationId(pair),
+            nowIso,
+            nowIso,
+            pair.survivorSubmissionId,
+            pair.supersededSubmissionId,
+            pair.opportunityId,
+            reason,
+            CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.approvedBy,
+            CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.approvedAt,
+            actor,
+            CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+            artifact.manifestId,
+            artifact.planChecksum,
+            stableCrmDuplicateConsolidationJson({
+              schema: 'crm-submission-supersession-metadata-v1',
+              pairKey: pair.key,
+              listingIdentity: pair.listingIdentity,
+              manifestId: artifact.manifestId,
+            }),
+          );
+          if (relationInsert.changes !== 1) {
+            throw new Error(`CRM duplicate consolidation ${pair.key} relation insert was not exact.`);
+          }
+          writeNumber += 1;
+          if (testHooks?.failAfterWrite === writeNumber) {
+            throw new Error(`Injected failure after write ${writeNumber}.`);
+          }
+        }
+
+        const berlinBefore = database.prepare(`
+          SELECT * FROM deal_hunter_crm_imports WHERE id = ? LIMIT 1
+        `).get(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id);
+        if (crmDuplicateConsolidationRawDigest(berlinBefore)
+          !== artifact.plan.currentState.berlinImport.rawDigest) {
+          throw new Error('Apply refused: Berlin import raw-row digest changed before compare-and-set.');
+        }
+        if (testHooks?.forceBerlinCasConflict === true) {
+          database.prepare('UPDATE deal_hunter_crm_imports SET submission_id = ? WHERE id = ?')
+            .run('__TASK8_TEST_CAS_CONFLICT__', CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id);
+        }
+        const priorMetadata = berlinBefore.metadata;
+        const nextMetadata = {
+          ...parseCrmDuplicateConsolidationMetadata(priorMetadata),
+          crmDuplicateConsolidation: {
+            schema: 'crm-duplicate-consolidation-import-provenance-v1',
+            manifestId: artifact.manifestId,
+            planChecksum: artifact.planChecksum,
+            priorSubmissionId: berlinBefore.submission_id,
+            priorUpdatedAt: berlinBefore.updated_at,
+            priorMetadataDigest: canonicalJsonSha256(priorMetadata || '{}'),
+          },
+        };
+        const berlinUpdate = database.prepare(`
+          UPDATE deal_hunter_crm_imports
+          SET submission_id = ?, updated_at = ?, metadata = ?
+          WHERE id = ?
+            AND submission_id = ?
+            AND opportunity_id IS NULL
+            AND updated_at = ?
+            AND metadata = ?
+        `).run(
+          CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.afterSubmissionId,
+          nowIso,
+          JSON.stringify(nextMetadata),
+          CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id,
+          CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.beforeSubmissionId,
+          berlinBefore.updated_at,
+          priorMetadata,
+        );
+        if (berlinUpdate.changes !== 1) {
+          throw new Error('Apply refused: Berlin import compare-and-set did not change exactly one row.');
+        }
+        if (testHooks?.failAfterWrite === 4) throw new Error('Injected failure after write 4.');
+
+        const finalState = crmDuplicateConsolidationFinalState(database, {
+          artifact, actor, reason, backup,
+        });
+        for (const [table, expected] of Object.entries(artifact.plan.tableDigests)) {
+          if (['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests'].includes(table)) continue;
+          const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
+            .sort((left, right) => compareCrmDuplicateConsolidationText(
+              stableCrmDuplicateConsolidationJson(left),
+              stableCrmDuplicateConsolidationJson(right),
+            ));
+          if (rows.length !== expected.rowCount || canonicalJsonSha256(rows) !== expected.digest) {
+            throw new Error(`CRM duplicate consolidation prohibited-table postcondition failed: ${table}.`);
+          }
+        }
+        if (testHooks?.forcePostconditionFailure === true) {
+          throw new Error('Injected postcondition failure.');
+        }
+        return {
+          status: 'repair-required',
+          mode: 'apply',
+          applied: true,
+          mutationCount: 4,
+          mutations: CRM_DUPLICATE_CONSOLIDATION_EXPECTED_MUTATION_LEDGER,
+          manifestId: artifact.manifestId,
+          planChecksum: artifact.planChecksum,
+          finalState,
+        };
+      });
+      return transaction.immediate();
+    },
 
     async inspectDealHunterCanonicalOpportunityMerge({ approval, actor = '', reason = '' } = {}) {
       return inspectCanonicalOpportunityMerge(database, { approval, actor, reason });
