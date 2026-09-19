@@ -1,6 +1,12 @@
 import { createHash } from 'node:crypto';
 
 import { getStorage } from '../storage/index.js';
+import {
+  DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES,
+  dealHunterListingMarketplaceAliases,
+  normalizeDealHunterListingIdentity,
+  normalizeDealHunterListingUrl,
+} from './dealHunterListingIdentity.js';
 
 export const CRM_DUPLICATE_REVIEW_INCOMPLETE = 'CRM_DUPLICATE_REVIEW_INCOMPLETE';
 export const CRM_DUPLICATE_REVIEW_CATEGORIES = Object.freeze([
@@ -157,16 +163,36 @@ function pairOwner(submission = {}) {
 
 function identityTokens(submission = {}) {
   const metadata = submission.metadata?.dealHunter || {};
+  const identityAliases = Array.isArray(metadata.identityAliases) ? metadata.identityAliases : [];
+  const listingAliases = Array.isArray(metadata.listingAliases) ? metadata.listingAliases : [];
+  const dealKeyAliases = Array.isArray(metadata.dealKeyAliases) ? metadata.dealKeyAliases : [];
+  if (identityAliases.length > DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES
+    || listingAliases.length > DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES
+    || dealKeyAliases.length > DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES) {
+    return { complete: false, stableTokens: [], weakTokens: [] };
+  }
+  const normalizedListingAliases = unique([
+    submission.listing_url,
+    ...listingAliases,
+  ].map(normalizeDealHunterListingUrl));
   const stableTokens = unique([
-    ...(Array.isArray(metadata.identityAliases) ? metadata.identityAliases : []),
-    ...(Array.isArray(metadata.listingAliases) ? metadata.listingAliases : []),
-    compact(submission.listing_url, 2000),
-  ].map(normalizedToken)).filter((token) => token && !token.startsWith('fingerprint:'));
+    ...identityAliases.map(normalizedToken),
+    ...normalizedListingAliases.flatMap((listingUrl) => {
+      const listingIdentity = normalizeDealHunterListingIdentity(listingUrl);
+      return [
+        listingIdentity ? `url:${listingIdentity}` : '',
+        ...dealHunterListingMarketplaceAliases(listingUrl),
+      ];
+    }),
+  ]).filter((token) => token && !token.startsWith('fingerprint:'));
   const weakTokens = unique([
     metadata.dealKey,
-    ...(Array.isArray(metadata.dealKeyAliases) ? metadata.dealKeyAliases : []),
+    ...dealKeyAliases,
   ].map(normalizedToken)).filter((token) => token && !stableTokens.includes(token));
-  return { stableTokens, weakTokens };
+  const complete = normalizedListingAliases.length <= DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES
+    && stableTokens.length <= DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES
+    && weakTokens.length <= DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES;
+  return { complete, stableTokens, weakTokens };
 }
 
 function activeRelationFields(relation = {}) {
@@ -319,6 +345,7 @@ export function buildCrmDuplicateReview({
   }
 
   const submissionsById = new Map();
+  const tokensBySubmissionId = new Map();
   for (const submission of submissions) {
     const id = compact(submission?.id, 300);
     if (!id || submissionsById.has(id)) {
@@ -328,6 +355,14 @@ export function buildCrmDuplicateReview({
       });
     }
     submissionsById.set(id, submission);
+    const tokens = identityTokens(submission);
+    if (!tokens.complete) {
+      return incompleteReport('identity-alias-bound-exceeded', {
+        submissions: submissions.length,
+        candidatePairs: null,
+      });
+    }
+    tokensBySubmissionId.set(id, tokens);
   }
 
   const pairs = new Map();
@@ -375,10 +410,17 @@ export function buildCrmDuplicateReview({
     ));
   }
 
+  if ([...pairs.values()].some((record) => record.sources.keepDistinct && record.sources.relation)) {
+    return incompleteReport('durable-relation-conflicts-with-keep-distinct', {
+      submissions: submissions.length,
+      candidatePairs: pairs.size,
+    });
+  }
+
   const stableBuckets = new Map();
   const weakBuckets = new Map();
   for (const submission of submissions) {
-    const { stableTokens, weakTokens } = identityTokens(submission);
+    const { stableTokens, weakTokens } = tokensBySubmissionId.get(compact(submission.id, 300));
     for (const token of stableTokens) {
       const bucket = stableBuckets.get(token) || [];
       bucket.push(submission.id);

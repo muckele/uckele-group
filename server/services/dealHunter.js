@@ -56,6 +56,12 @@ import {
   nextManualFollowUpAt,
 } from './dealHunterManualFollowUpPolicy.js';
 import { consumeDealHunterManualFollowUpCapability } from './dealHunterManualFollowUps.js';
+import {
+  DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES,
+  dealHunterListingMarketplaceAliases as listingMarketplaceAliases,
+  normalizeDealHunterListingIdentity as normalizeListingIdentity,
+  normalizeDealHunterListingUrl as normalizeUrl,
+} from './dealHunterListingIdentity.js';
 
 const defaultTimeoutMs = 45000;
 const sheetWorkbookExpandedMaxBytes = 32 * 1024 * 1024;
@@ -573,50 +579,6 @@ function extractBrokerContacts(rawRow = {}, nameFallbacks = {}) {
 
 function normalizeKey(value = '') {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-function normalizeUrl(value = '') {
-  const normalized = normalizeText(value, 1000);
-
-  if (!normalized) {
-    return '';
-  }
-
-  const withProtocol = /^https?:\/\//i.test(normalized) ? normalized : `https://${normalized}`;
-
-  try {
-    const url = new URL(withProtocol);
-    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : '';
-  } catch {
-    return '';
-  }
-}
-
-function normalizeListingIdentity(value = '') {
-  const normalized = normalizeText(value, 1000).toLowerCase();
-
-  if (!normalized) {
-    return '';
-  }
-
-  const withProtocol = /^[a-z][a-z\d+\-.]*:\/\//i.test(normalized) ? normalized : `https://${normalized}`;
-
-  try {
-    const url = new URL(withProtocol);
-
-    if (!['http:', 'https:'].includes(url.protocol)) {
-      return '';
-    }
-
-    const params = Array.from(url.searchParams.entries())
-      .filter(([key]) => !/^utm_/i.test(key) && !['fbclid', 'gclid', 'mc_cid', 'mc_eid'].includes(key.toLowerCase()))
-      .sort(([left], [right]) => left.localeCompare(right));
-    const query = params.length > 0 ? `?${new URLSearchParams(params).toString()}` : '';
-
-    return `${url.hostname.replace(/^www\./i, '').toLowerCase()}${url.pathname.replace(/\/+$/, '') || '/'}${query}`;
-  } catch {
-    return normalized.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/#.*$/, '').replace(/[?&]utm_[^&]*/gi, '');
-  }
 }
 
 function normalizeIdentityPart(value = '', maxLength = 500) {
@@ -2764,26 +2726,6 @@ function tokenContainment(left = '', right = '') {
   return overlap / Math.min(leftTokens.size, rightTokens.size);
 }
 
-function listingMarketplaceAliases(listingUrl = '') {
-  const normalized = normalizeUrl(listingUrl);
-  if (!normalized) return [];
-
-  try {
-    const url = new URL(normalized);
-    const host = url.hostname.replace(/^www\./i, '').toLowerCase();
-    const pathname = decodeURIComponent(url.pathname).replace(/\/+$/, '').toLowerCase();
-    const aliases = [];
-    const numericAdId = pathname.match(/(?:\/|[-_])(\d{5,})(?:\.[a-z]+)?$/)?.[1];
-
-    if (numericAdId && /(bizbuysell|bizquest|loopnet)\./.test(host)) aliases.push(`costar:${numericAdId}`);
-    if (host.includes('dealstream.com') && pathname && pathname !== '/') aliases.push(`dealstream:${pathname}`);
-    if (numericAdId && host.includes('businessbroker.net')) aliases.push(`businessbroker:${numericAdId}`);
-    return aliases;
-  } catch {
-    return [];
-  }
-}
-
 function dealIdentityAliases(deal = {}) {
   const listingIdentity = normalizeListingIdentity(deal.listingUrl);
   const sourceIdentity = sourceExternalIdentity(deal.sourceId, deal.id, deal.stableExternalId);
@@ -3974,7 +3916,6 @@ function dealHunterCrmPayload(deal, options = {}) {
 
 const dealHunterCrmMatchMaximumRows = 5000;
 const dealHunterCrmMatchPublicCandidateLimit = 25;
-const dealHunterCrmMatchMaximumAliases = 500;
 const dealHunterCrmMatchAuthorityRevision = Symbol('dealHunterCrmMatchAuthorityRevision');
 const dealHunterCrmMatchSupersessionMap = Symbol('dealHunterCrmMatchSupersessionMap');
 
@@ -4374,9 +4315,9 @@ export async function findExistingDealHunterSubmission(storage, deal) {
       ...listingMarketplaceAliases(listingUrl),
     ]),
   ]));
-  if (listingAliases.length > dealHunterCrmMatchMaximumAliases
-    || dealKeyAliases.length > dealHunterCrmMatchMaximumAliases
-    || identityAliases.size > dealHunterCrmMatchMaximumAliases) {
+  if (listingAliases.length > DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES
+    || dealKeyAliases.length > DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES
+    || identityAliases.size > DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_LOOKUP_INCOMPLETE',
       'CRM matching received more identity aliases than its bounded authority review can safely evaluate.',

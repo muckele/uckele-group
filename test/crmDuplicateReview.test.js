@@ -24,6 +24,8 @@ const BERLIN = {
 
 function submission(id, {
   identityAliases = [],
+  listingAliases = [],
+  listingUrl = '',
   dealKey = '',
   dealKeyAliases = [],
   opportunityId = '',
@@ -31,6 +33,7 @@ function submission(id, {
 } = {}) {
   return {
     id,
+    listing_url: listingUrl,
     deal_hunter_opportunity_id: opportunityId,
     name: `private-contact-${id}`,
     email: `${id}@private.example`,
@@ -39,6 +42,7 @@ function submission(id, {
       dealHunter: {
         opportunityId,
         identityAliases,
+        listingAliases,
         dealKey,
         dealKeyAliases,
         raw: {
@@ -194,6 +198,73 @@ test('classifies exact stable-listing evidence as strong and weaker or conflicti
   assert.equal(conflict?.category, 'uncertain');
   assert.ok(conflict?.blockers.includes('canonical-opportunity-conflict'));
   assert.ok(conflict?.conflictingEvidence.every((item) => /^[a-f0-9]{64}$/.test(item.hash)));
+});
+
+test('uses canonical Deal Hunter listing and marketplace aliases for equivalent BizBuySell URL variants', () => {
+  const report = buildCrmDuplicateReview({
+    submissions: [
+      submission('bizbuysell-a', {
+        listingUrl: 'https://www.bizbuysell.com/business-opportunity/legacy-slug/2516010/?utm_source=mail',
+      }),
+      submission('bizbuysell-b', {
+        listingAliases: [
+          'https://bizbuysell.com/business-opportunity/current-slug/2516010?utm_campaign=syndication',
+        ],
+      }),
+    ],
+    supersessions: [],
+    approvedPairs: [],
+    keepDistinctPairs: [],
+  });
+
+  assert.equal(report.complete, true);
+  assert.equal(report.rows.length, 1);
+  assert.equal(report.rows[0].pairKey, pairKey('bizbuysell-a', 'bizbuysell-b'));
+  assert.equal(report.rows[0].category, 'strong-candidate');
+  assert.deepEqual(report.rows[0].corroboratingEvidence.map((item) => item.category), [
+    'stable-listing-identity',
+  ]);
+  assert.doesNotMatch(JSON.stringify(report), /legacy-slug|current-slug|utm_|2516010/i);
+});
+
+test('fails closed when a submission exceeds the established Deal Hunter identity-alias bound', () => {
+  const report = buildCrmDuplicateReview({
+    submissions: [
+      submission('bounded-aliases', {
+        identityAliases: Array.from({ length: 501 }, (_, index) => `costar:${index}`),
+      }),
+      submission('other'),
+    ],
+    supersessions: [],
+    approvedPairs: [],
+    keepDistinctPairs: [],
+  });
+
+  assert.equal(report.complete, false);
+  assert.equal(report.code, CRM_DUPLICATE_REVIEW_INCOMPLETE);
+  assert.equal(report.reason, 'identity-alias-bound-exceeded');
+  assert.deepEqual(report.rows, []);
+});
+
+test('fails closed when an active durable relation contradicts any hard Pooler/Berlin keep-distinct pair', () => {
+  for (const [index, decision] of CRM_DUPLICATE_REVIEW_KEEP_DISTINCT_PAIRS.entries()) {
+    const relation = activeRelation(`cross-${index}`, {
+      survivorSubmissionId: decision.leftSubmissionId,
+      supersededSubmissionId: decision.rightSubmissionId,
+      opportunityId: decision.opportunityIds[0],
+    });
+    const report = buildCrmDuplicateReview({
+      submissions: approvedSubmissions(),
+      supersessions: [relation],
+      approvedPairs: CRM_DUPLICATE_REVIEW_APPROVED_PAIRS,
+      keepDistinctPairs: CRM_DUPLICATE_REVIEW_KEEP_DISTINCT_PAIRS,
+    });
+
+    assert.equal(report.complete, false, decision.decisionReference);
+    assert.equal(report.code, CRM_DUPLICATE_REVIEW_INCOMPLETE, decision.decisionReference);
+    assert.equal(report.reason, 'durable-relation-conflicts-with-keep-distinct', decision.decisionReference);
+    assert.deepEqual(report.rows, [], decision.decisionReference);
+  }
 });
 
 test('projects privacy-safe evidence without contact text, bodies, notes, paths, or raw metadata', () => {
