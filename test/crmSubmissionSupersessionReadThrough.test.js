@@ -90,19 +90,6 @@ async function fixture(t) {
     status: 'applied', actor: 'test', backup_reference: 'fixture-backup', checksum: digest,
     manifest: { version: 1 }, metadata: {},
   });
-  const database = new Database(sqlitePath);
-  database.prepare(`
-    INSERT INTO crm_submission_supersessions (
-      id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
-      opportunity_id, reason_code, reason_text, approved_by, approved_at, actor,
-      repair_version, repair_manifest_id, repair_digest, metadata
-    ) VALUES (
-      'relation', ?, ?, 'active', 'survivor', 'loser', 'opportunity', 'confirmed-duplicate',
-      'Owner reviewed duplicate.', 'owner@example.test', ?, 'test', 'v1', 'receipt', ?, '{}'
-    )
-  `).run(timestamp, timestamp, timestamp, digest);
-  database.close();
-
   for (const [id, submissionId, createdAt] of [
     ['activity-survivor', 'survivor', '2026-09-17T18:02:00.000Z'],
     ['activity-loser', 'loser', '2026-09-17T18:03:00.000Z'],
@@ -144,6 +131,30 @@ async function fixture(t) {
       uploaded_by_email: `${submissionId}@example.test`, note: id, nda_accepted_at: null,
     });
   }
+
+  const database = new Database(sqlitePath);
+  database.prepare(`
+    INSERT INTO crm_submission_supersessions (
+      id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
+      opportunity_id, reason_code, reason_text, approved_by, approved_at, actor,
+      repair_version, repair_manifest_id, repair_digest, metadata
+    ) VALUES (
+      'relation', ?, ?, 'active', 'survivor', 'loser', 'opportunity', 'confirmed-duplicate',
+      'Owner reviewed duplicate.', 'owner@example.test', ?, 'test', 'v1', 'receipt', ?, '{}'
+    )
+  `).run(timestamp, timestamp, timestamp, digest);
+  database.close();
+
+  const beforeRefusedWrite = rawState(sqlitePath);
+  await assert.rejects(
+    () => storage.insertCrmActivityEvent({
+      id: 'activity-loser-after-supersession', submission_id: 'loser', opportunity_id: 'opportunity',
+      created_at: '2026-09-17T18:10:00.000Z', actor: 'fixture', role: 'system',
+      event_type: 'submission.updated', summary: 'must refuse', metadata: {},
+    }),
+    { code: 'CRM_SUBMISSION_SUPERSEDED', submissionId: 'loser' },
+  );
+  assert.deepEqual(rawState(sqlitePath), beforeRefusedWrite);
   return { sqlitePath, storage };
 }
 
