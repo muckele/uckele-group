@@ -12,6 +12,7 @@ import {
   CANONICAL_OPPORTUNITY_MERGE_REPAIR_TYPE,
   CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES,
   CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY,
+  buildCanonicalOpportunityMergePlan,
   canonicalOpportunityMergeManifestId,
   canonicalOpportunityMergePlanChecksum,
   canonicalOpportunityMergeRelationshipInventorySummary,
@@ -2859,6 +2860,113 @@ test('supersession table is required for canonical-merge inspection', async (t) 
     runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage })),
     /unsupported SQLite schema.*crm_submission_supersessions.*table/i,
   );
+});
+
+test('unknown relationship-like supersession schema refuses inspection and apply without changing protected history', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  const reviewed = await runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage }));
+  await seedCanonicalMergeSupersession({
+    storage: fixture.storage,
+    sqlitePath: fixture.sqlitePath,
+    opportunityId: 'unknown-schema-active-control-opportunity',
+    suffix: 'unknown-schema-active-control',
+    status: 'active',
+  });
+  await seedCanonicalMergeSupersession({
+    storage: fixture.storage,
+    sqlitePath: fixture.sqlitePath,
+    opportunityId: 'unknown-schema-reversed-control-opportunity',
+    suffix: 'unknown-schema-reversed-control',
+    status: 'reversed',
+  });
+  await pauseOutreach(fixture.storage);
+  withRawDatabase(fixture.sqlitePath, (database) => database.exec(`
+    ALTER TABLE crm_submission_supersessions
+    ADD COLUMN future_opportunity_id TEXT
+  `));
+  const protectedBefore = canonicalMergeSupersessionHistorySnapshot(fixture.sqlitePath);
+  const mergeBefore = await repairState(fixture.storage);
+  const expectedFailure = /unsupported SQLite schema.*unclassified relationship schema.*crm_submission_supersessions\.future_opportunity_id/i;
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage })),
+    expectedFailure,
+  );
+  assert.deepEqual(canonicalMergeSupersessionHistorySnapshot(fixture.sqlitePath), protectedBefore);
+  assert.deepEqual(await repairState(fixture.storage), mergeBefore);
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(applyInput(fixture.storage, reviewed.planChecksum)),
+    expectedFailure,
+  );
+  assert.deepEqual(canonicalMergeSupersessionHistorySnapshot(fixture.sqlitePath), protectedBefore);
+  assert.deepEqual(await repairState(fixture.storage), mergeBefore);
+});
+
+test('incomplete supersession scanner state fails closed at the real plan boundary without changing protected history', async (t) => {
+  const fixture = repairStorage(t);
+  const approval = await seedApprovedRepair(fixture.storage);
+  await seedCanonicalMergeSupersession({
+    storage: fixture.storage,
+    sqlitePath: fixture.sqlitePath,
+    opportunityId: 'incomplete-scanner-active-control-opportunity',
+    suffix: 'incomplete-scanner-active-control',
+    status: 'active',
+  });
+  await seedCanonicalMergeSupersession({
+    storage: fixture.storage,
+    sqlitePath: fixture.sqlitePath,
+    opportunityId: 'incomplete-scanner-reversed-control-opportunity',
+    suffix: 'incomplete-scanner-reversed-control',
+    status: 'reversed',
+  });
+  const reviewed = await runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage }));
+  const protectedBefore = canonicalMergeSupersessionHistorySnapshot(fixture.sqlitePath);
+  const mergeBefore = await repairState(fixture.storage);
+  const completeInspection = {
+    opportunities: [reviewed.plan.opportunities.survivor, reviewed.plan.opportunities.superseded],
+    identityException: reviewed.plan.identityException,
+    aliases: reviewed.plan.observedAliases,
+    globalAliasOwnership: reviewed.plan.globalAliasOwnership,
+    manifestAtId: null,
+    typedManifests: [],
+    dependentState: structuredClone(reviewed.plan.dependentState),
+    ...(reviewed.plan.preservedIncidentState
+      ? { preservedIncidentState: reviewed.plan.preservedIncidentState }
+      : {}),
+    preservedOperationalState: reviewed.plan.preservedOperationalState,
+    authorityGrantingOperationalState: reviewed.plan.authorityGrantingOperationalState,
+  };
+
+  for (const [name, corruptScannerState] of [
+    ['absent scanner state', (dependentState) => {
+      delete dependentState.records.crmSubmissionSupersessions;
+    }],
+    ['non-array scanner state', (dependentState) => {
+      dependentState.records.crmSubmissionSupersessions = null;
+    }],
+  ]) {
+    const inspection = structuredClone(completeInspection);
+    corruptScannerState(inspection.dependentState);
+
+    assert.throws(
+      () => buildCanonicalOpportunityMergePlan({
+        approval,
+        inspection,
+        actor: fixtureActor,
+        reason: fixtureReason,
+      }),
+      /could not inspect CRM submission supersession history completely/i,
+      name,
+    );
+    assert.deepEqual(
+      canonicalMergeSupersessionHistorySnapshot(fixture.sqlitePath),
+      protectedBefore,
+      name,
+    );
+    assert.deepEqual(await repairState(fixture.storage), mergeBefore, name);
+  }
 });
 
 test('relationship inventory classifies the exact supersession relationship surface', () => {
