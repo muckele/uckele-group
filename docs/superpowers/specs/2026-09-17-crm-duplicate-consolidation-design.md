@@ -276,6 +276,29 @@ Required trigger/application invariants:
 
 Production is SQLite. The incident repair must be SQLite-only. The optional Supabase adapter must fail closed with a typed `CRM_SUPERSESSION_UNAVAILABLE` response until separately reviewed table/RPC parity exists; SQLite evidence must not be described as Supabase evidence.
 
+### 6.1 Canonical-opportunity merge interaction — owner-approved addendum
+
+`crm_submission_supersessions` is immutable historical and canonical authority. An ordinary canonical-opportunity merge must inspect every supersession row whose `opportunity_id` equals either the proposed canonical survivor opportunity or the proposed canonical superseded opportunity. The inspection includes both `status = 'active'` and `status = 'reversed'`; it must not filter by status.
+
+If any scoped supersession row exists, the canonical-opportunity merge must fail closed before mutation. A reversed relation is no longer operationally active, but its immutable historical tuple and receipts still establish a canonical-history boundary that ordinary merge is not authorized to reinterpret. Supersession rows whose `opportunity_id` belongs only to unrelated opportunities do not block the merge, subject to every existing merge gate.
+
+The canonical-opportunity merge relationship inventory must classify the implemented supersession schema explicitly:
+
+| Column | Category | Enforcement | Scanner path |
+|---|---|---|---|
+| `crm_submission_supersessions.opportunity_id` | `BLOCKING_ENTITY_DEPENDENCY` | `MATERIAL_SCANNER_PATH` | `dependentState.records.crmSubmissionSupersessions` |
+| `crm_submission_supersessions.survivor_submission_id` | `REDUNDANT_THROUGH_SCANNED_PARENT` | `MATERIAL_SCANNER_PATH` | `dependentState.records.crmSubmissionSupersessions` |
+| `crm_submission_supersessions.superseded_submission_id` | `REDUNDANT_THROUGH_SCANNED_PARENT` | `MATERIAL_SCANNER_PATH` | `dependentState.records.crmSubmissionSupersessions` |
+| `crm_submission_supersessions.repair_manifest_id` | `REDUNDANT_THROUGH_SCANNED_PARENT` | `MATERIAL_SCANNER_PATH` | `dependentState.records.crmSubmissionSupersessions` |
+| `crm_submission_supersessions.reversal_manifest_id` | `REDUNDANT_THROUGH_SCANNED_PARENT` | `MATERIAL_SCANNER_PATH` | `dependentState.records.crmSubmissionSupersessions` |
+| `crm_submission_supersessions.metadata` | `REDUNDANT_THROUGH_SCANNED_PARENT` | `MATERIAL_SCANNER_PATH` | `dependentState.records.crmSubmissionSupersessions` |
+
+The scanner selects the complete supersession row through `opportunity_id`, so the remaining relationship-like fields are redundant through that parent scanner rather than independently queried identities. `status` is selected as part of the complete row and is never used to exclude reversed history. No relationship-like supersession column may remain unclassified. Malformed or unclassified supersession schema, or any inability to inspect supersession state completely, blocks the canonical merge.
+
+Ordinary canonical-opportunity merge must never retarget, rewrite, migrate, or reinterpret a supersession. It must not modify `opportunity_id`, `survivor_submission_id`, `superseded_submission_id`, `repair_manifest_id`, `reversal_manifest_id`, `status`, `metadata`, or either endpoint. It must not rewrite an existing `crm-duplicate-consolidation` apply receipt or reversal receipt. Retargeting either opportunity would make those immutable historical tuples and receipts ambiguous, so V1 refuses instead of transforming them.
+
+This is intentionally conservative V1 policy. A future business case that combines canonical-opportunity merge with existing CRM supersession history requires a new, explicit, separately owner-reviewed combined repair that explains the complete transformation and receipt truthfulness. Neither existing repair may generalize itself to perform that operation implicitly.
+
 ## 7. Active CRM and read-through semantics
 
 An active CRM submission is a row for which no `status = 'active'` supersession names it as `superseded_submission_id`, in addition to existing lifecycle filters. This is a storage/service contract, not a frontend hide.
@@ -627,4 +650,5 @@ Before any implementation plan:
 - Preview and apply are separate; apply binds the exact reviewed artifact/checksum and fails on drift.
 - Logical and disaster rollback are defined.
 - Current backup and snapshot were only read-verified, not created or restored.
+- Ordinary canonical-opportunity merge fails closed when either merge subject has active or reversed CRM supersession history, while unrelated supersessions do not block it; no supersession tuple or receipt is retargeted or rewritten.
 - Production business mutation, cleanup execution, transmission, deployment, and reconciliation: none.
