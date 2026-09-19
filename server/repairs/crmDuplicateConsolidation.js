@@ -145,6 +145,16 @@ export function classifyCrmDuplicateConsolidationReference({ table = '', column 
   return 'explicitly-irrelevant';
 }
 
+export function classifyCrmDuplicateConsolidationTextReference({ table = '', column = '' } = {}) {
+  const explicitColumnClassification = classifyCrmDuplicateConsolidationReference({ table, column });
+  if (explicitColumnClassification) return explicitColumnClassification;
+  if (retainedReferenceTables.has(table)) return 'retained-with-provenance';
+  if (table === 'deal_hunter_cim_repair_manifests') return 'retained-historical-receipt';
+  if (table === 'deal_hunter_crm_imports') return 'approved-import-preservation-matrix';
+  if (table === 'crm_submission_supersessions') return 'mutated-approved-relation';
+  return null;
+}
+
 export function findCrmDuplicateConsolidationUnclassifiedSchema(schema = []) {
   const blockers = [];
   for (const table of schema) {

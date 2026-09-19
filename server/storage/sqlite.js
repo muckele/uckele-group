@@ -45,7 +45,7 @@ import {
 import {
   buildCrmDuplicateConsolidationPlan,
   canonicalJsonSha256,
-  classifyCrmDuplicateConsolidationReference,
+  classifyCrmDuplicateConsolidationTextReference,
   CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
   CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR,
   CRM_DUPLICATE_CONSOLIDATION_EXPECTED_MUTATION_LEDGER,
@@ -2451,6 +2451,7 @@ const crmDuplicateConsolidationRequiredSchemaObjects = Object.freeze([
   ['trigger', 'trg_crm_submission_supersessions_no_active_chain_insert'],
   ['trigger', 'trg_crm_submission_supersessions_no_active_chain_update'],
   ['trigger', 'trg_crm_submission_supersessions_immutable_update'],
+  ['trigger', 'trg_crm_submission_supersessions_reverse_only'],
   ['trigger', 'trg_crm_submission_supersessions_no_delete'],
   ['trigger', 'trg_crm_submission_supersessions_guard_contact_owner_update'],
   ['trigger', 'trg_crm_submission_supersessions_guard_opportunity_update'],
@@ -2685,7 +2686,8 @@ function crmDuplicateConsolidationReferenceTokens(state) {
   return { approved, tokens };
 }
 
-function crmDuplicateConsolidationReferencePolicies(table, matchedRows) {
+function crmDuplicateConsolidationReferencePolicies(table, matchedRows, classification) {
+  if (classification === 'unclassified-positive-reference') return ['blocked-unclassified-reference'];
   if (table === 'deal_hunter_cim_repair_manifests') return ['retained-historical-receipt'];
   if (table === 'crm_submission_supersessions') return ['mutated-approved-relation'];
   if (table === 'deal_hunter_crm_imports') {
@@ -2708,7 +2710,7 @@ function crmDuplicateConsolidationReferenceInventory(state) {
     const rows = state.rowsByTable[table.name] || [];
     for (const column of table.columns) {
       if (!/TEXT/i.test(String(column.type))) continue;
-      const configuredClassification = classifyCrmDuplicateConsolidationReference({
+      const configuredClassification = classifyCrmDuplicateConsolidationTextReference({
         table: table.name,
         column: column.name,
       });
@@ -2724,12 +2726,12 @@ function crmDuplicateConsolidationReferenceInventory(state) {
         for (const token of rowMatches) matchedIdentifiers.add(token);
       }
       const classification = configuredClassification
-        || (matchedRows.length ? 'retained-with-provenance' : 'scanned-no-incident-reference');
+        || (matchedRows.length ? 'unclassified-positive-reference' : 'scanned-no-incident-reference');
       references.push({
         table: table.name,
         column: column.name,
         classification,
-        policies: crmDuplicateConsolidationReferencePolicies(table.name, matchedRows),
+        policies: crmDuplicateConsolidationReferencePolicies(table.name, matchedRows, classification),
         matchedRowCount: matchedRows.length,
         matchedRowsDigest: canonicalJsonSha256(matchedRows),
         matchedIdentifierCount: matchedIdentifiers.size,
@@ -2749,6 +2751,9 @@ function crmDuplicateConsolidationReferenceInventory(state) {
       totalCount: tokens.length,
       digest: canonicalJsonSha256(tokens),
     },
+    blockers: references.filter((entry) => (
+      entry.matchedRowCount > 0 && entry.classification === 'unclassified-positive-reference'
+    )).map((entry) => `unclassified positive incident reference: ${entry.table}.${entry.column}`),
   };
 }
 
@@ -2845,7 +2850,7 @@ function crmDuplicateConsolidationSafety(database, blockers) {
   if (safety.activeLoserCleanupJobs) blockers.push('nonterminal-loser-cleanup');
   safety.activeStage2Activations = count(`
     SELECT COUNT(*) AS count FROM deal_hunter_cim_stage2_activations
-    WHERE status = 'current' AND mode IN ('canary', 'active')
+    WHERE status = 'current'
   `);
   if (safety.activeStage2Activations) blockers.push('active-stage2-activation');
   return safety;
@@ -2967,6 +2972,7 @@ function inspectCrmDuplicateConsolidationState(database, { connection } = {}) {
       || compareCrmDuplicateConsolidationText(left.id, right.id)
   ));
   const referenceInventory = crmDuplicateConsolidationReferenceInventory(state);
+  blockers.push(...referenceInventory.blockers);
   return {
     provider: 'sqlite',
     connection: connection || {
@@ -10162,8 +10168,8 @@ export function createSqliteStorage(config) {
         }
         if (testHooks?.failAfterWrite === 4) throw new Error('Injected failure after write 4.');
 
-        if (testHooks?.dropRequiredSchemaBeforePostconditions === true) {
-          database.exec('DROP TRIGGER trg_crm_duplicate_consolidation_receipt_no_update');
+        if (testHooks?.dropReversalGuardBeforePostconditions === true) {
+          database.exec('DROP TRIGGER trg_crm_submission_supersessions_reverse_only');
         }
 
         const finalState = crmDuplicateConsolidationFinalState(database, {

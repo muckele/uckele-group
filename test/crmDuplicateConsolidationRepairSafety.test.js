@@ -3,7 +3,10 @@ import fs from 'node:fs';
 import test from 'node:test';
 
 import { applyCrmDuplicateConsolidation } from '../server/services/crmDuplicateConsolidationRepair.js';
-import { createSqliteCrmDuplicateConsolidationReadOnlyStorage } from '../server/storage/sqlite.js';
+import {
+  createSqliteCrmDuplicateConsolidationReadOnlyStorage,
+  createSqliteStorage,
+} from '../server/storage/sqlite.js';
 import {
   ACTOR,
   BERLIN,
@@ -48,6 +51,31 @@ async function refusedPreview(fixture) {
   } finally {
     storage.close();
   }
+}
+
+function backupEvidence(fixture) {
+  return {
+    path: fixture.recoveryCheckpoint.backupPath,
+    manifestId: fixture.recoveryCheckpoint.backupManifestId,
+    sha256: fixture.recoveryCheckpoint.backupSha256,
+    flySnapshotId: fixture.recoveryCheckpoint.flySnapshotId,
+    flySnapshotDigest: fixture.recoveryCheckpoint.flySnapshotDigest,
+  };
+}
+
+function directStorageApplyInput(fixture, artifact, backupVerification, overrides = {}) {
+  return {
+    artifact,
+    backup: backupEvidence(fixture),
+    confirmation: 'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1',
+    backupVerification,
+    actor: ACTOR,
+    reason: REASON,
+    executionRelease: RELEASE,
+    toolingRevision: TOOLING,
+    nowIso: NOW,
+    ...overrides,
+  };
 }
 
 test('preview blocks unknown relationship-like columns and tables from the checked-in schema probe', async (t) => {
@@ -220,24 +248,28 @@ test('preview retains terminal loser outbox provenance without treating it as ac
   )));
 });
 
-test('preview blocks a real current active Stage 2 activation persisted through the storage contract', async (t) => {
-  const fixture = await createFixture(t);
-  await fixture.storage.createCimStage2Activation({
-    id: 'task-8-current-active-stage2', created_at: NOW, updated_at: NOW,
-    mode: 'active', actor: ACTOR, reason: 'Current active Stage 2 authority must block repair.',
-    confirmation_phrase: 'ACTIVATE CIM STAGE 2 ACTIVE', policy_hash: 'policy',
-    rule_version: 'rules', source_policy_version: 'source-v1', source_policy_hash: 'source-hash',
-    evidence_checksum: '1'.repeat(64), evidence_generated_at: NOW,
-    backup_reference: 'stage2-backup', backup_checksum: '2'.repeat(64),
-    identity_audit_reference: 'stage2-identity', identity_audit_checksum: '3'.repeat(64),
-    compliance_reference: 'stage2-compliance', sender_auth_reference: 'stage2-sender',
-    timezone: 'America/Los_Angeles', window_start: '08:00', window_end: '17:00',
-    weekdays_only: true, canary_daily_cap: 1, active_daily_cap: 3,
-    recipient_cap_24_hours: 1, recipient_cap_30_days: 4,
-    expires_at: '2027-01-01T00:00:00.000Z', metadata: { automaticTransmissionAuthorized: true },
-  });
-  const error = await refusedPreview(fixture);
-  assert.ok(error.blockers.includes('active-stage2-activation'));
+test('preview blocks every persisted current Stage 2 activation regardless of mode', async (t) => {
+  for (const mode of ['off', 'shadow', 'canary', 'active']) {
+    await t.test(mode, async (subtest) => {
+      const fixture = await createFixture(subtest);
+      await fixture.storage.createCimStage2Activation({
+        id: `task-8-current-${mode}-stage2`, created_at: NOW, updated_at: NOW,
+        mode, actor: ACTOR, reason: `Current ${mode} Stage 2 authority must block repair.`,
+        confirmation_phrase: `ACTIVATE CIM STAGE 2 ${mode.toUpperCase()}`, policy_hash: 'policy',
+        rule_version: 'rules', source_policy_version: 'source-v1', source_policy_hash: 'source-hash',
+        evidence_checksum: '1'.repeat(64), evidence_generated_at: NOW,
+        backup_reference: 'stage2-backup', backup_checksum: '2'.repeat(64),
+        identity_audit_reference: 'stage2-identity', identity_audit_checksum: '3'.repeat(64),
+        compliance_reference: 'stage2-compliance', sender_auth_reference: 'stage2-sender',
+        timezone: 'America/Los_Angeles', window_start: '08:00', window_end: '17:00',
+        weekdays_only: true, canary_daily_cap: 1, active_daily_cap: 3,
+        recipient_cap_24_hours: 1, recipient_cap_30_days: 4,
+        expires_at: '2027-01-01T00:00:00.000Z', metadata: { automaticTransmissionAuthorized: true },
+      });
+      const error = await refusedPreview(fixture);
+      assert.ok(error.blockers.includes('active-stage2-activation'));
+    });
+  }
 });
 
 test('preview inventories every application TEXT column with all approved and scoped identity tokens', async (t) => {
@@ -307,6 +339,51 @@ test('preview inventories every application TEXT column with all approved and sc
   assert.doesNotMatch(JSON.stringify(artifact.plan.relationshipInventory), /private@|private note|private message/i);
 });
 
+test('preview blocks a positive incident reference in an unapproved TEXT authority surface', async (t) => {
+  const fixture = await createFixture(t);
+  rawDatabase(fixture.sqlitePath, (database) => {
+    database.exec(`
+      CREATE TABLE unexpected_live_authority (
+        id TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        note TEXT NOT NULL
+      )
+    `);
+    database.prepare(`
+      INSERT INTO unexpected_live_authority (id, payload, note)
+      VALUES ('unexpected-authority', ?, 'no incident reference here')
+    `).run(JSON.stringify({ submissionId: POOLER.supersededSubmissionId }));
+  });
+  const error = await refusedPreview(fixture);
+  assert.ok(error.blockers.some((blocker) => (
+    /unclassified.*positive.*reference/i.test(blocker)
+      && /unexpected_live_authority\.payload/i.test(blocker)
+  )), JSON.stringify(error.blockers));
+});
+
+test('preview scans an unknown TEXT column with no incident reference without approving the surface', async (t) => {
+  const fixture = await createFixture(t);
+  rawDatabase(fixture.sqlitePath, (database) => {
+    database.exec(`
+      CREATE TABLE unexpected_reference_free_text (
+        id TEXT PRIMARY KEY,
+        payload TEXT NOT NULL
+      )
+    `);
+    database.prepare(`
+      INSERT INTO unexpected_reference_free_text (id, payload)
+      VALUES ('unrelated', '{"scope":"unrelated"}')
+    `).run();
+  });
+  const artifact = await previewFixture(fixture);
+  const payload = artifact.plan.relationshipInventory.find((entry) => (
+    entry.table === 'unexpected_reference_free_text' && entry.column === 'payload'
+  ));
+  assert.equal(payload.classification, 'scanned-no-incident-reference');
+  assert.equal(payload.matchedRowCount, 0);
+  assert.deepEqual(payload.policies, ['scanned-no-incident-reference']);
+});
+
 test('plan binds every required supersession index and trigger and refuses schema-object drift', async (t) => {
   const requiredNames = [
     'idx_crm_submission_supersessions_survivor',
@@ -318,6 +395,7 @@ test('plan binds every required supersession index and trigger and refuses schem
     'trg_crm_submission_supersessions_no_active_chain_insert',
     'trg_crm_submission_supersessions_no_active_chain_update',
     'trg_crm_submission_supersessions_immutable_update',
+    'trg_crm_submission_supersessions_reverse_only',
     'trg_crm_submission_supersessions_no_delete',
     'trg_crm_submission_supersessions_guard_contact_owner_update',
     'trg_crm_submission_supersessions_guard_opportunity_update',
@@ -333,10 +411,13 @@ test('plan binds every required supersession index and trigger and refuses schem
 
   for (const [name, mutate] of [
     ['drop index', (database) => database.exec('DROP INDEX uq_crm_submission_supersessions_active_loser')],
+    ['drop reversal guard', (database) => (
+      database.exec('DROP TRIGGER trg_crm_submission_supersessions_reverse_only')
+    )],
     ['alter trigger', (database) => database.exec(`
-      DROP TRIGGER trg_crm_duplicate_consolidation_receipt_no_update;
-      CREATE TRIGGER trg_crm_duplicate_consolidation_receipt_no_update
-      BEFORE UPDATE ON deal_hunter_cim_repair_manifests BEGIN SELECT 1; END;
+      DROP TRIGGER trg_crm_submission_supersessions_reverse_only;
+      CREATE TRIGGER trg_crm_submission_supersessions_reverse_only
+      BEFORE UPDATE ON crm_submission_supersessions BEGIN SELECT 1; END;
     `)],
   ]) {
     await t.test(name, async (subtest) => {
@@ -355,7 +436,7 @@ test('plan binds every required supersession index and trigger and refuses schem
   await t.test('missing before preview', async (subtest) => {
     const scoped = await createFixture(subtest);
     rawDatabase(scoped.sqlitePath, (database) => (
-      database.exec('DROP TRIGGER trg_crm_duplicate_consolidation_receipt_no_delete')
+      database.exec('DROP TRIGGER trg_crm_submission_supersessions_reverse_only')
     ));
     const error = await refusedPreview(scoped);
     assert.ok(error.blockers.some((blocker) => /required.*trigger|schema.*object/i.test(blocker)));
@@ -367,14 +448,14 @@ test('plan binds every required supersession index and trigger and refuses schem
     const before = logicalSnapshot(scoped.sqlitePath);
     await assert.rejects(
       applyCrmDuplicateConsolidation(applyInput(scoped, reviewed, {
-        testHooks: { dropRequiredSchemaBeforePostconditions: true },
+        testHooks: { dropReversalGuardBeforePostconditions: true },
       })),
       /postcondition|required.*object|schema/i,
     );
     assert.deepEqual(logicalSnapshot(scoped.sqlitePath), before);
     assert.equal(rawDatabase(scoped.sqlitePath, (database) => Boolean(database.prepare(`
       SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
-        AND name = 'trg_crm_duplicate_consolidation_receipt_no_update'
+        AND name = 'trg_crm_submission_supersessions_reverse_only'
     `).get()), { readonly: true }), true);
   });
 });
@@ -407,6 +488,118 @@ test('SQLite apply sink independently rejects missing confirmation and forged ba
         nowIso: NOW,
         ...authority,
       }), /confirmation|verified backup|verification evidence/i);
+      assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
+    });
+  }
+});
+
+test('SQLite backup authority is instance-bound, single-use, fresh, and exactly rebound', async (t) => {
+  await t.test('cross-instance', async (subtest) => {
+    const fixture = await createFixture(subtest);
+    const artifact = await previewFixture(fixture);
+    const verification = await fixture.storage.verifyCrmDuplicateConsolidationBackupPlan({
+      artifact,
+      backup: backupEvidence(fixture),
+    });
+    const otherStorage = createSqliteStorage(fixture.config);
+    subtest.after(() => otherStorage.close());
+    const before = logicalSnapshot(fixture.sqlitePath);
+    await assert.rejects(
+      otherStorage.applyCrmDuplicateConsolidation(
+        directStorageApplyInput(fixture, artifact, verification),
+      ),
+      /non-forgeable|verified backup|verification evidence/i,
+    );
+    assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
+  });
+
+  await t.test('single-use', async (subtest) => {
+    const fixture = await createFixture(subtest);
+    const artifact = await previewFixture(fixture);
+    const verification = await fixture.storage.verifyCrmDuplicateConsolidationBackupPlan({
+      artifact,
+      backup: backupEvidence(fixture),
+    });
+    const first = await fixture.storage.applyCrmDuplicateConsolidation(
+      directStorageApplyInput(fixture, artifact, verification),
+    );
+    assert.equal(first.applied, true);
+    const afterFirst = logicalSnapshot(fixture.sqlitePath);
+    await assert.rejects(
+      fixture.storage.applyCrmDuplicateConsolidation(
+        directStorageApplyInput(fixture, artifact, verification),
+      ),
+      /non-forgeable|verified backup|verification evidence/i,
+    );
+    assert.deepEqual(logicalSnapshot(fixture.sqlitePath), afterFirst);
+  });
+
+  await t.test('expiry', async (subtest) => {
+    const fixture = await createFixture(subtest);
+    const artifact = await previewFixture(fixture);
+    const verification = await fixture.storage.verifyCrmDuplicateConsolidationBackupPlan({
+      artifact,
+      backup: backupEvidence(fixture),
+    });
+    const before = logicalSnapshot(fixture.sqlitePath);
+    const actualNow = Date.now;
+    Date.now = () => actualNow() + (5 * 60 * 1000) + 1;
+    try {
+      await assert.rejects(
+        fixture.storage.applyCrmDuplicateConsolidation(
+          directStorageApplyInput(fixture, artifact, verification),
+        ),
+        /stale|different authority/i,
+      );
+    } finally {
+      Date.now = actualNow;
+    }
+    assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
+  });
+
+  await t.test('changed backup file', async (subtest) => {
+    const fixture = await createFixture(subtest);
+    const artifact = await previewFixture(fixture);
+    const verification = await fixture.storage.verifyCrmDuplicateConsolidationBackupPlan({
+      artifact,
+      backup: backupEvidence(fixture),
+    });
+    const before = logicalSnapshot(fixture.sqlitePath);
+    fs.appendFileSync(fixture.backupPath, Buffer.from([0]));
+    await assert.rejects(
+      fixture.storage.applyCrmDuplicateConsolidation(
+        directStorageApplyInput(fixture, artifact, verification),
+      ),
+      /backup.*changed|evidence changed/i,
+    );
+    assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
+  });
+
+  for (const [name, rebind] of [
+    ['artifact', (fixture, artifact) => ({
+      artifact: { ...structuredClone(artifact), recoveryCheckpointPath: `${artifact.recoveryCheckpointPath}.other` },
+    })],
+    ['backup', (fixture) => ({
+      backup: { ...backupEvidence(fixture), manifestId: 'different-backup-manifest' },
+    })],
+  ]) {
+    await t.test(`${name} rebinding`, async (subtest) => {
+      const fixture = await createFixture(subtest);
+      const artifact = await previewFixture(fixture);
+      const verification = await fixture.storage.verifyCrmDuplicateConsolidationBackupPlan({
+        artifact,
+        backup: backupEvidence(fixture),
+      });
+      const before = logicalSnapshot(fixture.sqlitePath);
+      await assert.rejects(
+        fixture.storage.applyCrmDuplicateConsolidation(directStorageApplyInput(
+          fixture,
+          artifact,
+          verification,
+          rebind(fixture, artifact),
+        )),
+        /bound to different authority|stale/i,
+      );
       assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
     });
   }
