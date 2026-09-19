@@ -121,6 +121,17 @@ export async function previewCrmDuplicateConsolidation({
     if (error?.code === CRM_DUPLICATE_CONSOLIDATION_REFUSED) throw error;
     refuse(`CRM duplicate consolidation inspection failed: ${error.message}`, ['inspection-failed']);
   }
+  const connection = inspection?.connection;
+  if (!connection
+    || connection.readonly !== true
+    || connection.fileMustExist !== true
+    || connection.queryOnly !== true
+    || connection.consistentReadTransaction !== true) {
+    refuse(
+      'CRM duplicate consolidation preview requires proven read-only, file-existing, query-only, consistent-transaction inspection evidence.',
+      ['preview-inspection-evidence-invalid'],
+    );
+  }
   if (inspection?.blockers?.length) {
     refuse(
       `CRM duplicate consolidation preview found blocking state: ${inspection.blockers.join('; ')}.`,
@@ -250,6 +261,8 @@ export async function applyCrmDuplicateConsolidation({
     const result = await storage.applyCrmDuplicateConsolidation({
       artifact,
       backup: checkedBackupEvidence,
+      confirmation,
+      backupVerification: verification,
       actor: facts.actor,
       reason: facts.reason,
       executionRelease: facts.executionRelease,

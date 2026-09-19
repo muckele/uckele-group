@@ -46,6 +46,7 @@ import {
   buildCrmDuplicateConsolidationPlan,
   canonicalJsonSha256,
   classifyCrmDuplicateConsolidationReference,
+  CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
   CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR,
   CRM_DUPLICATE_CONSOLIDATION_EXPECTED_MUTATION_LEDGER,
   CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
@@ -54,7 +55,6 @@ import {
   crmDuplicateConsolidationManifestId,
   crmDuplicateConsolidationRelationId,
   findCrmDuplicateConsolidationUnclassifiedSchema,
-  isCrmDuplicateConsolidationRelationshipColumn,
   stableCanonicalJson as stableCrmDuplicateConsolidationJson,
   validateCrmDuplicateConsolidationReceipt,
 } from '../repairs/crmDuplicateConsolidation.js';
@@ -2441,6 +2441,25 @@ function validateCanonicalMergeFinalState(database, {
 
 const crmDuplicateConsolidationMaximumRows = 250000;
 
+const crmDuplicateConsolidationRequiredSchemaObjects = Object.freeze([
+  ['index', 'idx_crm_submission_supersessions_survivor'],
+  ['index', 'idx_crm_submission_supersessions_opportunity'],
+  ['index', 'uq_crm_submission_supersessions_active_loser'],
+  ['trigger', 'trg_crm_duplicate_consolidation_receipt_no_update'],
+  ['trigger', 'trg_crm_duplicate_consolidation_receipt_no_delete'],
+  ['trigger', 'trg_crm_submission_supersessions_validate_insert'],
+  ['trigger', 'trg_crm_submission_supersessions_no_active_chain_insert'],
+  ['trigger', 'trg_crm_submission_supersessions_no_active_chain_update'],
+  ['trigger', 'trg_crm_submission_supersessions_immutable_update'],
+  ['trigger', 'trg_crm_submission_supersessions_no_delete'],
+  ['trigger', 'trg_crm_submission_supersessions_guard_contact_owner_update'],
+  ['trigger', 'trg_crm_submission_supersessions_guard_opportunity_update'],
+  ['trigger', 'trg_deal_hunter_opportunities_reject_superseded_primary_insert'],
+  ['trigger', 'trg_deal_hunter_opportunities_reject_superseded_primary_update'],
+  ['trigger', 'trg_crm_submission_supersessions_guard_contact_delete'],
+  ['trigger', 'trg_crm_submission_supersessions_guard_opportunity_delete'],
+]);
+
 function quoteCrmDuplicateConsolidationIdentifier(identifier) {
   return `"${String(identifier).replaceAll('"', '""')}"`;
 }
@@ -2471,8 +2490,32 @@ function crmDuplicateConsolidationSchema(database) {
   }));
 }
 
+function crmDuplicateConsolidationRequiredObjects(database) {
+  return crmDuplicateConsolidationRequiredSchemaObjects.map(([type, name]) => {
+    const row = database.prepare(`
+      SELECT type, name, sql FROM sqlite_schema
+      WHERE type = ? AND name = ? LIMIT 1
+    `).get(type, name);
+    return row ? {
+      type,
+      name,
+      sqlDigest: createHash('sha256').update(String(row.sql || '')).digest('hex'),
+    } : { type, name, missing: true };
+  }).sort((left, right) => compareCrmDuplicateConsolidationText(left.name, right.name));
+}
+
+function assertCrmDuplicateConsolidationRequiredObjects(database, expected, phase) {
+  const actual = crmDuplicateConsolidationRequiredObjects(database);
+  if (actual.some((entry) => entry.missing)
+    || stableCrmDuplicateConsolidationJson(actual) !== stableCrmDuplicateConsolidationJson(expected)) {
+    throw new Error(`CRM duplicate consolidation ${phase} required schema object drift.`);
+  }
+  return actual;
+}
+
 function crmDuplicateConsolidationDatabaseState(database) {
   const schema = crmDuplicateConsolidationSchema(database);
+  const requiredObjects = crmDuplicateConsolidationRequiredObjects(database);
   let totalRows = 0;
   const rowsByTable = {};
   const tableDigests = {};
@@ -2496,7 +2539,8 @@ function crmDuplicateConsolidationDatabaseState(database) {
   }
   return {
     schema,
-    schemaDigest: canonicalJsonSha256(schema),
+    requiredObjects,
+    schemaDigest: canonicalJsonSha256({ tables: schema, requiredObjects }),
     rowsByTable,
     tableDigests,
     logicalDigest: canonicalJsonSha256(rowsByTable),
@@ -2566,45 +2610,146 @@ function crmDuplicateConsolidationFinancialMatches(row, pair) {
     && provenance.period === 'unknown';
 }
 
+const crmDuplicateConsolidationApprovedReferenceIdentifiers = Object.freeze([
+  ...CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.flatMap((pair) => [
+    pair.opportunityId,
+    pair.survivorSubmissionId,
+    pair.supersededSubmissionId,
+    pair.listingIdentity,
+  ]),
+  'b272125b030c6d097808fa82126b6afa0799fda456fc3465be51a0f0cea7a52e',
+  'aba23259c8a36685199482500aff468493221c0ff844966c2f6b9c148d72ad01',
+  '49e8541d-3463-44e9-b032-02563b47317f',
+  'a169ba9c-6b96-41f1-a18b-5c8521ebdc54',
+  'cde045b6667a459bb28891af4ee2ab4374f51620581522462349142efb1e7e31',
+  'fa231f927904b40a3ef6fd762f37b7830e9aab92c013d39ed740f51e3c84bfd0',
+  '42fefa5e5de8bba6676bf97ccb49a2c5364a469dc6da57b4af6ff9087141bede',
+  '4e2075ca935de95f09a80bdcdc51ac513c9ab5864f384d20f7ad123f139357ad',
+  CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id,
+]);
+
+function collectCrmDuplicateConsolidationEvidenceTokens(value, key = '', output = []) {
+  if (output.length >= 512 || value === null || value === undefined) return output;
+  if (Array.isArray(value)) {
+    for (const item of value) collectCrmDuplicateConsolidationEvidenceTokens(item, key, output);
+    return output;
+  }
+  if (value && typeof value === 'object') {
+    for (const [nestedKey, nestedValue] of Object.entries(value)) {
+      collectCrmDuplicateConsolidationEvidenceTokens(nestedValue, nestedKey, output);
+    }
+    return output;
+  }
+  if (typeof value === 'string'
+    && /(?:alias|evidence|listingIdentity|dealKey)/i.test(key)
+    && value.length >= 4
+    && value.length <= 500) {
+    output.push(value);
+  }
+  return output;
+}
+
+function crmDuplicateConsolidationReferenceTokens(state) {
+  const dynamic = [];
+  const scopedSubmissionIds = new Set(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.flatMap((pair) => [
+    pair.survivorSubmissionId,
+    pair.supersededSubmissionId,
+  ]));
+  for (const row of state.rowsByTable.contact_submissions || []) {
+    if (!scopedSubmissionIds.has(row.id)) continue;
+    collectCrmDuplicateConsolidationEvidenceTokens(
+      parseCrmDuplicateConsolidationMetadata(row.metadata)?.dealHunter,
+      'dealHunter',
+      dynamic,
+    );
+  }
+  const scopedOpportunityIds = new Set(
+    CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.opportunityId),
+  );
+  for (const row of state.rowsByTable.deal_hunter_opportunity_aliases || []) {
+    if (!scopedOpportunityIds.has(row.opportunity_id)) continue;
+    for (const [column, value] of Object.entries(row)) {
+      if (/(?:alias|evidence|listing|deal_key)/i.test(column)
+        && typeof value === 'string' && value.length >= 4 && value.length <= 500) {
+        dynamic.push(value);
+      }
+    }
+  }
+  const approved = [...new Set(crmDuplicateConsolidationApprovedReferenceIdentifiers)].sort(
+    compareCrmDuplicateConsolidationText,
+  );
+  const tokens = [...new Set([...approved, ...dynamic])]
+    .filter((token) => typeof token === 'string' && token.length >= 4 && token.length <= 500)
+    .sort(compareCrmDuplicateConsolidationText);
+  if (tokens.length > 512) throw new Error('CRM duplicate consolidation reference-token bound exceeded.');
+  return { approved, tokens };
+}
+
+function crmDuplicateConsolidationReferencePolicies(table, matchedRows) {
+  if (table === 'deal_hunter_cim_repair_manifests') return ['retained-historical-receipt'];
+  if (table === 'crm_submission_supersessions') return ['mutated-approved-relation'];
+  if (table === 'deal_hunter_crm_imports') {
+    const policies = [];
+    if (matchedRows.some((row) => row.id === CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id)) {
+      policies.push('mutated-berlin-import-only');
+    }
+    if (matchedRows.some((row) => row.id !== CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id)) {
+      policies.push('retained-preserved-import');
+    }
+    return policies;
+  }
+  return matchedRows.length ? ['retained-with-provenance'] : ['scanned-no-incident-reference'];
+}
+
 function crmDuplicateConsolidationReferenceInventory(state) {
-  const tokens = [
-    ...CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.flatMap((pair) => [
-      pair.opportunityId,
-      pair.survivorSubmissionId,
-      pair.supersededSubmissionId,
-      pair.listingIdentity,
-    ]),
-    CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id,
-  ];
+  const { approved, tokens } = crmDuplicateConsolidationReferenceTokens(state);
   const references = [];
   for (const table of state.schema) {
     const rows = state.rowsByTable[table.name] || [];
     for (const column of table.columns) {
-      if (!isCrmDuplicateConsolidationRelationshipColumn(column.name)) continue;
-      const classification = classifyCrmDuplicateConsolidationReference({
+      if (!/TEXT/i.test(String(column.type))) continue;
+      const configuredClassification = classifyCrmDuplicateConsolidationReference({
         table: table.name,
         column: column.name,
       });
-      if (!classification) continue;
-      const matched = rows.filter((row) => {
+      const matchedRows = [];
+      const matchedIdentifiers = new Set();
+      for (const row of rows) {
         const value = row[column.name];
-        if (value === null || value === undefined) return false;
+        if (value === null || value === undefined) continue;
         const serialized = String(value);
-        return tokens.some((token) => serialized.includes(token));
-      });
+        const rowMatches = tokens.filter((token) => serialized.includes(token));
+        if (rowMatches.length === 0) continue;
+        matchedRows.push(row);
+        for (const token of rowMatches) matchedIdentifiers.add(token);
+      }
+      const classification = configuredClassification
+        || (matchedRows.length ? 'retained-with-provenance' : 'scanned-no-incident-reference');
       references.push({
         table: table.name,
         column: column.name,
         classification,
-        matchedRowCount: matched.length,
-        matchedRowsDigest: canonicalJsonSha256(matched),
+        policies: crmDuplicateConsolidationReferencePolicies(table.name, matchedRows),
+        matchedRowCount: matchedRows.length,
+        matchedRowsDigest: canonicalJsonSha256(matchedRows),
+        matchedIdentifierCount: matchedIdentifiers.size,
+        matchedIdentifiersDigest: canonicalJsonSha256([...matchedIdentifiers].sort(
+          compareCrmDuplicateConsolidationText,
+        )),
       });
     }
   }
-  return references.sort((left, right) => (
-    compareCrmDuplicateConsolidationText(left.table, right.table)
-      || compareCrmDuplicateConsolidationText(left.column, right.column)
-  ));
+  return {
+    entries: references.sort((left, right) => (
+      compareCrmDuplicateConsolidationText(left.table, right.table)
+        || compareCrmDuplicateConsolidationText(left.column, right.column)
+    )),
+    identifiers: {
+      approvedCount: approved.length,
+      totalCount: tokens.length,
+      digest: canonicalJsonSha256(tokens),
+    },
+  };
 }
 
 function crmDuplicateConsolidationRowsForIds(database, table, column, ids) {
@@ -2619,10 +2764,7 @@ function crmDuplicateConsolidationRowsForIds(database, table, column, ids) {
 
 function crmDuplicateConsolidationSafety(database, blockers) {
   const loserIds = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.supersededSubmissionId);
-  const pairIds = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.flatMap((pair) => [
-    pair.survivorSubmissionId,
-    pair.supersededSubmissionId,
-  ]);
+  const survivorIds = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.survivorSubmissionId);
   const tableExists = (name) => Boolean(database.prepare(`
     SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ? LIMIT 1
   `).get(name));
@@ -2648,7 +2790,7 @@ function crmDuplicateConsolidationSafety(database, blockers) {
   if (!safety.outboundSafe) blockers.push('unsafe-outbound-control');
 
   const loserPlaceholders = placeholders(loserIds.length);
-  const pairPlaceholders = placeholders(pairIds.length);
+  const survivorPlaceholders = placeholders(survivorIds.length);
   safety.nonterminalLoserCommunications = count(`
     SELECT COUNT(*) AS count FROM crm_communications
     WHERE submission_id IN (${loserPlaceholders})
@@ -2661,21 +2803,14 @@ function crmDuplicateConsolidationSafety(database, blockers) {
       AND state NOT IN ('accepted', 'permanent_failed', 'cancelled')
   `, ...loserIds);
   if (safety.nonterminalLoserOutbox) blockers.push('nonterminal-loser-outbox');
-  safety.nonterminalLoserCimRequests = count(`
+  safety.loserCimRequests = count(`
     SELECT COUNT(*) AS count FROM deal_hunter_cim_requests
     WHERE submission_id IN (${loserPlaceholders})
-      AND NOT (
-        status = 'sent'
-        AND request_state IN ('provider_accepted', 'responded', 'stopped')
-        AND delivery_state IN ('accepted', 'delivered')
-        AND follow_up_state IN ('completed', 'stopped')
-        AND next_follow_up_at IS NULL
-      )
   `, ...loserIds);
-  if (safety.nonterminalLoserCimRequests) blockers.push('nonterminal-loser-cim-request');
-  safety.nonterminalPairCimRequests = count(`
+  if (safety.loserCimRequests) blockers.push('loser-cim-request');
+  safety.nonterminalSurvivorCimRequests = count(`
     SELECT COUNT(*) AS count FROM deal_hunter_cim_requests
-    WHERE submission_id IN (${pairPlaceholders})
+    WHERE submission_id IN (${survivorPlaceholders})
       AND NOT (
         status = 'sent'
         AND request_state IN ('provider_accepted', 'responded', 'stopped')
@@ -2683,8 +2818,8 @@ function crmDuplicateConsolidationSafety(database, blockers) {
         AND follow_up_state IN ('completed', 'stopped')
         AND next_follow_up_at IS NULL
       )
-  `, ...pairIds);
-  if (safety.nonterminalPairCimRequests) blockers.push('nonterminal-pair-cim-request');
+  `, ...survivorIds);
+  if (safety.nonterminalSurvivorCimRequests) blockers.push('nonterminal-survivor-cim-request');
   safety.actionableLoserRecommendations = count(`
     SELECT COUNT(*) AS count FROM crm_follow_up_recommendations
     WHERE submission_id IN (${loserPlaceholders}) AND status IN ('current', 'pending')
@@ -2710,7 +2845,7 @@ function crmDuplicateConsolidationSafety(database, blockers) {
   if (safety.activeLoserCleanupJobs) blockers.push('nonterminal-loser-cleanup');
   safety.activeStage2Activations = count(`
     SELECT COUNT(*) AS count FROM deal_hunter_cim_stage2_activations
-    WHERE status = 'active'
+    WHERE status = 'current' AND mode IN ('canary', 'active')
   `);
   if (safety.activeStage2Activations) blockers.push('active-stage2-activation');
   return safety;
@@ -2719,6 +2854,9 @@ function crmDuplicateConsolidationSafety(database, blockers) {
 function inspectCrmDuplicateConsolidationState(database, { connection } = {}) {
   const state = crmDuplicateConsolidationDatabaseState(database);
   const blockers = findCrmDuplicateConsolidationUnclassifiedSchema(state.schema);
+  for (const entry of state.requiredObjects.filter((object) => object.missing)) {
+    blockers.push(`required-${entry.type}-schema-object-missing:${entry.name}`);
+  }
   const submissions = new Map(crmDuplicateConsolidationRowsForIds(
     database,
     'contact_submissions',
@@ -2828,6 +2966,7 @@ function inspectCrmDuplicateConsolidationState(database, { connection } = {}) {
     compareCrmDuplicateConsolidationText(left.table, right.table)
       || compareCrmDuplicateConsolidationText(left.id, right.id)
   ));
+  const referenceInventory = crmDuplicateConsolidationReferenceInventory(state);
   return {
     provider: 'sqlite',
     connection: connection || {
@@ -2850,8 +2989,10 @@ function inspectCrmDuplicateConsolidationState(database, { connection } = {}) {
         sqlDigest: table.sqlDigest,
         columns: table.columns.map((column) => column.name),
       })),
+      requiredObjects: state.requiredObjects,
     },
-    relationshipInventory: crmDuplicateConsolidationReferenceInventory(state),
+    relationshipInventory: referenceInventory.entries,
+    referenceIdentifiers: referenceInventory.identifiers,
     tableDigests: state.tableDigests,
     rawRows,
     safety,
@@ -2888,6 +3029,11 @@ function inspectCrmDuplicateConsolidation(database, connection = null) {
 }
 
 function crmDuplicateConsolidationFinalState(database, { artifact, actor, reason, backup }) {
+  assertCrmDuplicateConsolidationRequiredObjects(
+    database,
+    artifact.plan.schema.requiredObjects,
+    'postcondition',
+  );
   const relations = database.prepare(`
     SELECT * FROM crm_submission_supersessions
     WHERE repair_manifest_id = ? ORDER BY id
@@ -3054,6 +3200,7 @@ export function createSqliteStorage(config) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
 
   const database = new Database(config.storage.sqlitePath);
+  const crmDuplicateConsolidationBackupVerifications = new WeakMap();
   database.function('deal_hunter_cim_authority_sort_key', { deterministic: true }, (updatedAt, createdAt) => {
     const authorityAt = firstStrictDetailAuthorityTimestamp(
       { updated_at: updatedAt, created_at: createdAt },
@@ -9744,11 +9891,27 @@ export function createSqliteStorage(config) {
           || inspection.schema.digest !== artifact.plan.schema.digest) {
           throw new Error('backup does not reproduce the reviewed plan and raw database digest');
         }
-        return {
+        const verification = Object.freeze({
           planChecksum: planned.planChecksum,
           databaseLogicalDigest: inspection.database.logicalDigest,
           schemaDigest: inspection.schema.digest,
-        };
+        });
+        crmDuplicateConsolidationBackupVerifications.set(verification, {
+          verifiedAtMs: Date.now(),
+          backupPath,
+          backupSha256: backup.sha256,
+          backupIdentity: stableCrmDuplicateConsolidationJson(backup),
+          artifactIdentity: stableCrmDuplicateConsolidationJson({
+            manifestId: artifact.manifestId,
+            planChecksum: artifact.planChecksum,
+            recoveryCheckpointPath: artifact.recoveryCheckpointPath,
+            recoveryCheckpoint: artifact.plan.recoveryCheckpoint,
+          }),
+          fileIdentity: Object.fromEntries(
+            ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].map((field) => [field, before[field]]),
+          ),
+        });
+        return verification;
       } finally {
         snapshot.close();
       }
@@ -9757,6 +9920,8 @@ export function createSqliteStorage(config) {
     async applyCrmDuplicateConsolidation({
       artifact,
       backup,
+      confirmation,
+      backupVerification,
       actor,
       reason,
       executionRelease,
@@ -9764,6 +9929,50 @@ export function createSqliteStorage(config) {
       nowIso,
       testHooks = null,
     } = {}) {
+      if (confirmation !== CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION) {
+        throw new Error('CRM duplicate consolidation transaction requires the exact confirmation phrase.');
+      }
+      const verifiedAuthority = backupVerification && typeof backupVerification === 'object'
+        ? crmDuplicateConsolidationBackupVerifications.get(backupVerification)
+        : null;
+      if (!verifiedAuthority) {
+        throw new Error('CRM duplicate consolidation transaction requires fresh non-forgeable verified backup evidence.');
+      }
+      crmDuplicateConsolidationBackupVerifications.delete(backupVerification);
+      const artifactIdentity = stableCrmDuplicateConsolidationJson({
+        manifestId: artifact?.manifestId,
+        planChecksum: artifact?.planChecksum,
+        recoveryCheckpointPath: artifact?.recoveryCheckpointPath,
+        recoveryCheckpoint: artifact?.plan?.recoveryCheckpoint,
+      });
+      if (verifiedAuthority.artifactIdentity !== artifactIdentity
+        || verifiedAuthority.backupIdentity !== stableCrmDuplicateConsolidationJson(backup)
+        || backupVerification.planChecksum !== artifact?.planChecksum
+        || Date.now() - verifiedAuthority.verifiedAtMs > 5 * 60 * 1000) {
+        throw new Error('CRM duplicate consolidation verified backup evidence is stale or bound to different authority.');
+      }
+      const backupPath = path.resolve(String(backup?.path || ''));
+      let backupBefore;
+      let backupBytes;
+      let backupAfter;
+      try {
+        backupBefore = fs.statSync(backupPath, { bigint: true });
+        backupBytes = fs.readFileSync(backupPath);
+        backupAfter = fs.statSync(backupPath, { bigint: true });
+      } catch (error) {
+        throw new Error(`CRM duplicate consolidation verified backup is unavailable: ${error.message}`);
+      }
+      const identityFields = ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'];
+      if (!backupBefore.isFile()
+        || backupPath !== verifiedAuthority.backupPath
+        || identityFields.some((field) => (
+          backupBefore[field] !== backupAfter[field]
+          || backupBefore[field] !== verifiedAuthority.fileIdentity[field]
+        ))
+        || createHash('sha256').update(backupBytes).digest('hex') !== verifiedAuthority.backupSha256
+        || ['-wal', '-shm', '-journal'].some((suffix) => fs.existsSync(`${backupPath}${suffix}`))) {
+        throw new Error('CRM duplicate consolidation verified backup evidence changed before transaction entry.');
+      }
       const transaction = database.transaction(() => {
         const existingReceipt = normalizeDealHunterRepairManifestRow(database.prepare(`
           SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ? LIMIT 1
@@ -9952,6 +10161,10 @@ export function createSqliteStorage(config) {
           throw new Error('Apply refused: Berlin import compare-and-set did not change exactly one row.');
         }
         if (testHooks?.failAfterWrite === 4) throw new Error('Injected failure after write 4.');
+
+        if (testHooks?.dropRequiredSchemaBeforePostconditions === true) {
+          database.exec('DROP TRIGGER trg_crm_duplicate_consolidation_receipt_no_update');
+        }
 
         const finalState = crmDuplicateConsolidationFinalState(database, {
           artifact, actor, reason, backup,

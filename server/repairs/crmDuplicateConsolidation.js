@@ -246,6 +246,7 @@ export function buildCrmDuplicateConsolidationPlan({
     database: inspection.database,
     schema: inspection.schema,
     relationshipInventory: inspection.relationshipInventory,
+    referenceIdentifiers: inspection.referenceIdentifiers,
     tableDigests: inspection.tableDigests,
     rawRows: inspection.rawRows,
     safety: inspection.safety,

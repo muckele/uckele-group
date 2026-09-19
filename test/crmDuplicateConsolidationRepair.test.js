@@ -60,6 +60,11 @@ const BERLIN = {
 };
 
 const BERLIN_IMPORT_ID = '508bcba0790b928551ab62282d5dcf894ba825886919daa6f54b7cd9b8ae0ea8';
+const BERLIN_CANONICAL_IMPORT_ID = '4e2075ca935de95f09a80bdcdc51ac513c9ab5864f384d20f7ad123f139357ad';
+const POOLER_IMPORT_IDS = [
+  'cde045b6667a459bb28891af4ee2ab4374f51620581522462349142efb1e7e31',
+  'fa231f927904b40a3ef6fd762f37b7830e9aab92c013d39ed740f51e3c84bfd0',
+];
 
 function canonicalDigest(value) {
   return createHash('sha256').update(stableCanonicalJson(value)).digest('hex');
@@ -231,15 +236,15 @@ async function createFixture(t) {
         updated_by = excluded.updated_by, metadata = excluded.metadata
     `).run(NOW, ACTOR);
     insertImport(database, {
-      id: 'pooler-legacy-import', pair: POOLER,
+      id: POOLER_IMPORT_IDS[0], pair: POOLER,
       submissionId: POOLER.survivorSubmissionId, listingIdentity: null,
     });
     insertImport(database, {
-      id: 'pooler-canonical-import', pair: POOLER,
+      id: POOLER_IMPORT_IDS[1], pair: POOLER,
       submissionId: POOLER.survivorSubmissionId, opportunityId: POOLER.opportunityId,
     });
     insertImport(database, {
-      id: 'berlin-canonical-import', pair: BERLIN,
+      id: BERLIN_CANONICAL_IMPORT_ID, pair: BERLIN,
       submissionId: BERLIN.survivorSubmissionId, opportunityId: BERLIN.opportunityId,
     });
     insertImport(database, {
@@ -395,6 +400,22 @@ test('read-only preview is one query-only snapshot, deterministic, privacy-safe,
   assert.deepEqual(alternatePath.plan, first.plan);
   const serialized = stableCanonicalJson(first);
   assert.doesNotMatch(serialized, /private note|private message|private metadata|private-broker@/i);
+});
+
+test('preview refuses inspection evidence from the ordinary writable SQLite storage', async (t) => {
+  const fixture = await createFixture(t);
+  await assert.rejects(
+    previewCrmDuplicateConsolidation({
+      storage: fixture.storage,
+      actor: ACTOR,
+      reason: REASON,
+      executionRelease: RELEASE,
+      toolingRevision: TOOLING,
+      recoveryCheckpoint: fixture.recoveryCheckpoint,
+    }),
+    (error) => error?.code === 'CRM_DUPLICATE_CONSOLIDATION_REFUSED'
+      && /read.?only|query.?only|inspection evidence/i.test(error.message),
+  );
 });
 
 test('reviewed artifact verification binds canonical bytes, checksum, manifest ID, schemas, and fixed tuples', async (t) => {
@@ -567,9 +588,11 @@ test('post-apply supersession audit and SQLite integrity are clean without chang
 export {
   ACTOR,
   BERLIN,
+  BERLIN_CANONICAL_IMPORT_ID,
   BERLIN_IMPORT_ID,
   NOW,
   POOLER,
+  POOLER_IMPORT_IDS,
   REASON,
   RELEASE,
   TOOLING,

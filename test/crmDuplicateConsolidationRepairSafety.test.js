@@ -7,9 +7,11 @@ import { createSqliteCrmDuplicateConsolidationReadOnlyStorage } from '../server/
 import {
   ACTOR,
   BERLIN,
+  BERLIN_CANONICAL_IMPORT_ID,
   BERLIN_IMPORT_ID,
   NOW,
   POOLER,
+  POOLER_IMPORT_IDS,
   REASON,
   RELEASE,
   TOOLING,
@@ -161,39 +163,253 @@ test('preview blocks active writers, unsafe outbound controls, and every nonterm
   }
 });
 
-test('preview retains terminal loser CIM and outbox provenance without treating it as active work', async (t) => {
+test('preview blocks every loser CIM request but only nonterminal survivor CIM work', async (t) => {
+  for (const [name, submissionId, state, shouldBlock] of [
+    ['terminal loser', BERLIN.supersededSubmissionId, 'terminal', true],
+    ['nonterminal survivor', BERLIN.survivorSubmissionId, 'nonterminal', true],
+    ['terminal survivor', BERLIN.survivorSubmissionId, 'terminal', false],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const fixture = await createFixture(subtest);
+      rawDatabase(fixture.sqlitePath, (database) => database.prepare(`
+        INSERT INTO deal_hunter_cim_requests (
+          id, created_at, updated_at, deal_key, recipient_email, status,
+          follow_up_count, attempt_count, submission_id, request_state,
+          delivery_state, follow_up_state, next_follow_up_at, metadata
+        ) VALUES (?, ?, ?, ?, 'fixture@invalid.example', ?, ?, 1, ?, ?, ?, ?, NULL, '{}')
+      `).run(
+        `cim-${name.replaceAll(' ', '-')}`,
+        NOW,
+        NOW,
+        `fixture-${name}`,
+        state === 'terminal' ? 'sent' : 'pending',
+        state === 'terminal' ? 3 : 0,
+        submissionId,
+        state === 'terminal' ? 'provider_accepted' : 'pending',
+        state === 'terminal' ? 'accepted' : 'pending',
+        state === 'terminal' ? 'completed' : 'pending',
+      ));
+      if (shouldBlock) {
+        const error = await refusedPreview(fixture);
+        assert.ok(error.blockers.some((blocker) => /cim-request/i.test(blocker)));
+      } else {
+        const artifact = await previewFixture(fixture);
+        assert.deepEqual(artifact.blockers, []);
+      }
+    });
+  }
+});
+
+test('preview retains terminal loser outbox provenance without treating it as active work', async (t) => {
   const fixture = await createFixture(t);
-  rawDatabase(fixture.sqlitePath, (database) => {
-    database.prepare(`
-      INSERT INTO deal_hunter_cim_requests (
-        id, created_at, updated_at, deal_key, recipient_email, status,
-        follow_up_count, attempt_count, submission_id, request_state,
-        delivery_state, follow_up_state, next_follow_up_at, metadata
-      ) VALUES ('terminal-loser-cim', ?, ?, 'terminal-fixture', 'fixture@invalid.example',
-        'sent', 3, 1, ?, 'provider_accepted', 'accepted', 'completed', NULL, '{}')
-    `).run(NOW, NOW, BERLIN.supersededSubmissionId);
-    database.prepare(`
-      INSERT INTO crm_email_outbox (
-        id, communication_id, submission_id, idempotency_key, client_request_key, state, provider,
-        attempt_count, expected_submission_version, actor, intended_follow_up_state,
-        created_at, updated_at, metadata
-      ) VALUES ('terminal-loser-outbox', 'missing-terminal-communication', ?,
-        'terminal-loser-outbox', 'terminal-loser-outbox-client', 'permanent_failed',
-        'fixture', 1, ?, ?, 'needs-response', ?, ?, '{}')
-    `).run(BERLIN.supersededSubmissionId, NOW, ACTOR, NOW, NOW);
-  });
+  rawDatabase(fixture.sqlitePath, (database) => database.prepare(`
+    INSERT INTO crm_email_outbox (
+      id, communication_id, submission_id, idempotency_key, client_request_key, state, provider,
+      attempt_count, expected_submission_version, actor, intended_follow_up_state,
+      created_at, updated_at, metadata
+    ) VALUES ('terminal-loser-outbox', 'missing-terminal-communication', ?,
+      'terminal-loser-outbox', 'terminal-loser-outbox-client', 'permanent_failed',
+      'fixture', 1, ?, ?, 'needs-response', ?, ?, '{}')
+  `).run(BERLIN.supersededSubmissionId, NOW, ACTOR, NOW, NOW));
   const artifact = await previewFixture(fixture);
   assert.deepEqual(artifact.blockers, []);
-  assert.ok(artifact.plan.relationshipInventory.some((entry) => (
-    entry.table === 'deal_hunter_cim_requests'
-      && entry.column === 'submission_id'
-      && entry.matchedRowCount === 1
-  )));
   assert.ok(artifact.plan.relationshipInventory.some((entry) => (
     entry.table === 'crm_email_outbox'
       && entry.column === 'submission_id'
       && entry.matchedRowCount === 1
   )));
+});
+
+test('preview blocks a real current active Stage 2 activation persisted through the storage contract', async (t) => {
+  const fixture = await createFixture(t);
+  await fixture.storage.createCimStage2Activation({
+    id: 'task-8-current-active-stage2', created_at: NOW, updated_at: NOW,
+    mode: 'active', actor: ACTOR, reason: 'Current active Stage 2 authority must block repair.',
+    confirmation_phrase: 'ACTIVATE CIM STAGE 2 ACTIVE', policy_hash: 'policy',
+    rule_version: 'rules', source_policy_version: 'source-v1', source_policy_hash: 'source-hash',
+    evidence_checksum: '1'.repeat(64), evidence_generated_at: NOW,
+    backup_reference: 'stage2-backup', backup_checksum: '2'.repeat(64),
+    identity_audit_reference: 'stage2-identity', identity_audit_checksum: '3'.repeat(64),
+    compliance_reference: 'stage2-compliance', sender_auth_reference: 'stage2-sender',
+    timezone: 'America/Los_Angeles', window_start: '08:00', window_end: '17:00',
+    weekdays_only: true, canary_daily_cap: 1, active_daily_cap: 3,
+    recipient_cap_24_hours: 1, recipient_cap_30_days: 4,
+    expires_at: '2027-01-01T00:00:00.000Z', metadata: { automaticTransmissionAuthorized: true },
+  });
+  const error = await refusedPreview(fixture);
+  assert.ok(error.blockers.includes('active-stage2-activation'));
+});
+
+test('preview inventories every application TEXT column with all approved and scoped identity tokens', async (t) => {
+  const fixture = await createFixture(t);
+  const knownIdentifiers = [
+    POOLER.opportunityId, POOLER.survivorSubmissionId, POOLER.supersededSubmissionId,
+    BERLIN.opportunityId, BERLIN.survivorSubmissionId, BERLIN.supersededSubmissionId,
+    POOLER.listingIdentity, BERLIN.listingIdentity,
+    'b272125b030c6d097808fa82126b6afa0799fda456fc3465be51a0f0cea7a52e',
+    'aba23259c8a36685199482500aff468493221c0ff844966c2f6b9c148d72ad01',
+    '49e8541d-3463-44e9-b032-02563b47317f',
+    'a169ba9c-6b96-41f1-a18b-5c8521ebdc54',
+    ...POOLER_IMPORT_IDS,
+    '42fefa5e5de8bba6676bf97ccb49a2c5364a469dc6da57b4af6ff9087141bede',
+    BERLIN_CANONICAL_IMPORT_ID,
+    BERLIN_IMPORT_ID,
+  ];
+  const scopedEvidenceAlias = 'fixture:pooler-approved-evidence-alias';
+  rawDatabase(fixture.sqlitePath, (database) => {
+    const submissionRow = database.prepare('SELECT metadata FROM contact_submissions WHERE id = ?')
+      .get(POOLER.survivorSubmissionId);
+    const metadata = JSON.parse(submissionRow.metadata);
+    metadata.dealHunter.evidenceAliases = [scopedEvidenceAlias];
+    database.prepare('UPDATE contact_submissions SET metadata = ? WHERE id = ?')
+      .run(JSON.stringify(metadata), POOLER.survivorSubmissionId);
+    database.prepare(`
+      INSERT INTO admin_audit_events (
+        id, created_at, actor, role, method, path, status_code, metadata
+      ) VALUES ('task-8-reference-audit', ?, ?, 'admin', 'GET', ?, 200, '{}')
+    `).run(NOW, ACTOR, `/admin/crm/${[...knownIdentifiers, scopedEvidenceAlias].join('/')}`);
+    database.prepare(`
+      INSERT INTO deal_hunter_cim_repair_manifests (
+        id, created_at, updated_at, mode, status, actor, checksum, manifest, metadata
+      ) VALUES ('task-8-historical-receipt', ?, ?, 'historical-fixture', 'applied', ?,
+        'historical', ?, '{}')
+    `).run(NOW, NOW, ACTOR, JSON.stringify({ submissionId: POOLER.supersededSubmissionId }));
+  });
+
+  const artifact = await previewFixture(fixture);
+  const expectedTextColumnCount = rawDatabase(fixture.sqlitePath, (database) => database.prepare(`
+    SELECT name FROM sqlite_schema
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    ORDER BY name
+  `).all().reduce((count, table) => (
+    count + database.pragma(`table_info(${JSON.stringify(table.name)})`)
+      .filter((column) => /TEXT/i.test(String(column.type))).length
+  ), 0), { readonly: true });
+  assert.equal(artifact.plan.relationshipInventory.length, expectedTextColumnCount);
+  const auditPath = artifact.plan.relationshipInventory.find((entry) => (
+    entry.table === 'admin_audit_events' && entry.column === 'path'
+  ));
+  assert.equal(auditPath.classification, 'retained-with-provenance');
+  assert.equal(auditPath.matchedRowCount, 1);
+  assert.equal(auditPath.matchedIdentifierCount, knownIdentifiers.length + 1);
+  const historicalManifest = artifact.plan.relationshipInventory.find((entry) => (
+    entry.table === 'deal_hunter_cim_repair_manifests' && entry.column === 'manifest'
+  ));
+  assert.ok(historicalManifest.policies.includes('retained-historical-receipt'));
+  const importId = artifact.plan.relationshipInventory.find((entry) => (
+    entry.table === 'deal_hunter_crm_imports' && entry.column === 'id'
+  ));
+  assert.ok(importId.policies.includes('mutated-berlin-import-only'));
+  assert.ok(importId.policies.includes('retained-preserved-import'));
+  assert.match(artifact.plan.referenceIdentifiers.digest, /^[a-f0-9]{64}$/);
+  assert.equal(artifact.plan.referenceIdentifiers.approvedCount, knownIdentifiers.length);
+  assert.ok(artifact.plan.referenceIdentifiers.totalCount > knownIdentifiers.length);
+  assert.doesNotMatch(JSON.stringify(artifact.plan.relationshipInventory), /private@|private note|private message/i);
+});
+
+test('plan binds every required supersession index and trigger and refuses schema-object drift', async (t) => {
+  const requiredNames = [
+    'idx_crm_submission_supersessions_survivor',
+    'idx_crm_submission_supersessions_opportunity',
+    'uq_crm_submission_supersessions_active_loser',
+    'trg_crm_duplicate_consolidation_receipt_no_update',
+    'trg_crm_duplicate_consolidation_receipt_no_delete',
+    'trg_crm_submission_supersessions_validate_insert',
+    'trg_crm_submission_supersessions_no_active_chain_insert',
+    'trg_crm_submission_supersessions_no_active_chain_update',
+    'trg_crm_submission_supersessions_immutable_update',
+    'trg_crm_submission_supersessions_no_delete',
+    'trg_crm_submission_supersessions_guard_contact_owner_update',
+    'trg_crm_submission_supersessions_guard_opportunity_update',
+    'trg_deal_hunter_opportunities_reject_superseded_primary_insert',
+    'trg_deal_hunter_opportunities_reject_superseded_primary_update',
+    'trg_crm_submission_supersessions_guard_contact_delete',
+    'trg_crm_submission_supersessions_guard_opportunity_delete',
+  ];
+  const fixture = await createFixture(t);
+  const artifact = await previewFixture(fixture);
+  assert.deepEqual(artifact.plan.schema.requiredObjects.map((entry) => entry.name), requiredNames.slice().sort());
+  assert.ok(artifact.plan.schema.requiredObjects.every((entry) => /^[a-f0-9]{64}$/.test(entry.sqlDigest)));
+
+  for (const [name, mutate] of [
+    ['drop index', (database) => database.exec('DROP INDEX uq_crm_submission_supersessions_active_loser')],
+    ['alter trigger', (database) => database.exec(`
+      DROP TRIGGER trg_crm_duplicate_consolidation_receipt_no_update;
+      CREATE TRIGGER trg_crm_duplicate_consolidation_receipt_no_update
+      BEFORE UPDATE ON deal_hunter_cim_repair_manifests BEGIN SELECT 1; END;
+    `)],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const scoped = await createFixture(subtest);
+      const reviewed = await previewFixture(scoped);
+      rawDatabase(scoped.sqlitePath, mutate);
+      const before = logicalSnapshot(scoped.sqlitePath);
+      await assert.rejects(
+        applyCrmDuplicateConsolidation(applyInput(scoped, reviewed)),
+        /schema|required.*object|trigger|index|drift/i,
+      );
+      assert.deepEqual(logicalSnapshot(scoped.sqlitePath), before);
+    });
+  }
+
+  await t.test('missing before preview', async (subtest) => {
+    const scoped = await createFixture(subtest);
+    rawDatabase(scoped.sqlitePath, (database) => (
+      database.exec('DROP TRIGGER trg_crm_duplicate_consolidation_receipt_no_delete')
+    ));
+    const error = await refusedPreview(scoped);
+    assert.ok(error.blockers.some((blocker) => /required.*trigger|schema.*object/i.test(blocker)));
+  });
+
+  await t.test('postcondition rollback', async (subtest) => {
+    const scoped = await createFixture(subtest);
+    const reviewed = await previewFixture(scoped);
+    const before = logicalSnapshot(scoped.sqlitePath);
+    await assert.rejects(
+      applyCrmDuplicateConsolidation(applyInput(scoped, reviewed, {
+        testHooks: { dropRequiredSchemaBeforePostconditions: true },
+      })),
+      /postcondition|required.*object|schema/i,
+    );
+    assert.deepEqual(logicalSnapshot(scoped.sqlitePath), before);
+    assert.equal(rawDatabase(scoped.sqlitePath, (database) => Boolean(database.prepare(`
+      SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
+        AND name = 'trg_crm_duplicate_consolidation_receipt_no_update'
+    `).get()), { readonly: true }), true);
+  });
+});
+
+test('SQLite apply sink independently rejects missing confirmation and forged backup verification', async (t) => {
+  for (const [name, authority] of [
+    ['no confirmation', { confirmation: undefined, backupVerification: undefined }],
+    ['forged verification', {
+      confirmation: 'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1',
+      backupVerification: { ok: true, planChecksum: 'forged' },
+    }],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const fixture = await createFixture(subtest);
+      const artifact = await previewFixture(fixture);
+      const before = logicalSnapshot(fixture.sqlitePath);
+      await assert.rejects(fixture.storage.applyCrmDuplicateConsolidation({
+        artifact,
+        backup: {
+          path: '/not/a/verified/backup',
+          manifestId: fixture.recoveryCheckpoint.backupManifestId,
+          sha256: fixture.recoveryCheckpoint.backupSha256,
+          flySnapshotId: fixture.recoveryCheckpoint.flySnapshotId,
+          flySnapshotDigest: fixture.recoveryCheckpoint.flySnapshotDigest,
+        },
+        actor: ACTOR,
+        reason: REASON,
+        executionRelease: RELEASE,
+        toolingRevision: TOOLING,
+        nowIso: NOW,
+        ...authority,
+      }), /confirmation|verified backup|verification evidence/i);
+      assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
+    });
+  }
 });
 
 test('apply refuses any raw-row drift after review and rolls back without mutation', async (t) => {
@@ -337,12 +553,17 @@ test('replay rejects a receipt whose stored JSON bytes are not the exact canonic
   const artifact = await previewFixture(fixture);
   await applyCrmDuplicateConsolidation(applyInput(fixture, artifact));
   rawDatabase(fixture.sqlitePath, (database) => {
+    const receiptGuardSql = database.prepare(`
+      SELECT sql FROM sqlite_schema WHERE type = 'trigger'
+        AND name = 'trg_crm_duplicate_consolidation_receipt_no_update'
+    `).get().sql;
     database.exec('DROP TRIGGER trg_crm_duplicate_consolidation_receipt_no_update');
     database.prepare(`
       UPDATE deal_hunter_cim_repair_manifests
       SET manifest = ' ' || manifest
       WHERE id = ?
     `).run(artifact.manifestId);
+    database.exec(receiptGuardSql);
   });
   await assert.rejects(
     applyCrmDuplicateConsolidation(applyInput(fixture, artifact)),
@@ -362,8 +583,8 @@ test('replay rejects exact-relation and unrelated allowed-table drift', async (t
     }],
     ['unrelated import', (database) => database.prepare(`
       UPDATE deal_hunter_crm_imports SET metadata = '{"tampered":true}'
-      WHERE id = 'pooler-legacy-import'
-    `).run()],
+      WHERE id = ?
+    `).run(POOLER_IMPORT_IDS[0])],
   ]) {
     await t.test(name, async (subtest) => {
       const fixture = await createFixture(subtest);
