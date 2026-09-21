@@ -27,6 +27,7 @@ import {
 
 const cliPath = path.resolve('scripts/repair-crm-duplicate-consolidation.js');
 const nodePath = process.env.TASK9_NODE_PATH || process.execPath;
+const SYNTHETIC_RESTRICTED_SENTINEL = 'UG_P7_SYNTHETIC_RESTRICTED_SENTINEL_NOT_PRODUCTION';
 const CHECKPOINT_SCHEMA = 'crm-duplicate-consolidation-checkpoint-v1';
 const CHECKPOINT_FIELDS = [
   'backupPath',
@@ -244,12 +245,36 @@ test('apply byte-validates the reviewed artifact before opening storage and dele
     environment,
     applyFn: async (input) => {
       delegated = input;
-      return { status: 'repair-required', applied: true, mutationCount: 4 };
+      return {
+        status: 'repair-required',
+        mode: 'apply',
+        applied: true,
+        mutationCount: 4,
+        manifestId: artifact.manifestId,
+        planChecksum: artifact.planChecksum,
+        finalState: {
+          valid: true,
+          quickCheck: 'ok',
+          foreignKeyViolationCount: 0,
+        },
+      };
     },
   });
 
   assert.equal(writableStorageCalls, 1);
-  assert.deepEqual(result, { status: 'repair-required', applied: true, mutationCount: 4 });
+  assert.deepEqual(result, {
+    status: 'repair-required',
+    mode: 'apply',
+    applied: true,
+    mutationCount: 4,
+    manifestId: artifact.manifestId,
+    planChecksum: artifact.planChecksum,
+    integrity: {
+      valid: true,
+      quickCheck: 'ok',
+      foreignKeyViolationCount: 0,
+    },
+  });
   assert.equal(delegated.storage, fakeStorage);
   assert.equal(delegated.reviewedArtifact, stableCanonicalJson(artifact));
   assert.equal(delegated.expectedPlanChecksum, artifact.planChecksum);
@@ -279,6 +304,161 @@ test('apply byte-validates the reviewed artifact before opening storage and dele
     /canonical JSON/i,
   );
   assert.equal(writableStorageCalls, 0);
+});
+
+test('operator apply and replay stdout expose only the closed safe projection', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  const artifactPath = path.join(fixture.root, 'reviewed-output-boundary.json');
+  fs.writeFileSync(artifactPath, stableCanonicalJson(artifact), { mode: 0o600 });
+  fixture.storage.close();
+
+  const childSource = `
+    const { runCrmDuplicateConsolidationCli } = await import('./scripts/repair-crm-duplicate-consolidation.js');
+    const { stableCanonicalJson } = await import('./server/repairs/crmDuplicateConsolidation.js');
+    const argv = JSON.parse(process.argv[1]);
+    const config = JSON.parse(process.argv[2]);
+    const internalResult = JSON.parse(process.argv[3]);
+    const result = await runCrmDuplicateConsolidationCli({
+      argv,
+      getConfigFn: () => config,
+      applyFn: async ({ storage }) => {
+        if (storage?.provider !== 'sqlite') throw new Error('expected real disposable SQLite storage');
+        return internalResult;
+      },
+      environment: {},
+    });
+    process.stderr.write('[crm-duplicate-consolidation] separately authorized operation completed\\n');
+    process.stdout.write(stableCanonicalJson(result));
+  `;
+  const reversibleSentinels = [
+    SYNTHETIC_RESTRICTED_SENTINEL,
+    Buffer.from(SYNTHETIC_RESTRICTED_SENTINEL).toString('base64'),
+    Buffer.from(SYNTHETIC_RESTRICTED_SENTINEL).toString('hex'),
+    encodeURIComponent(SYNTHETIC_RESTRICTED_SENTINEL),
+  ];
+
+  for (const expected of [
+    { status: 'repair-required', applied: true, mutationCount: 4 },
+    { status: 'verified-prior-apply', applied: false, mutationCount: 0 },
+  ]) {
+    await t.test(expected.status, () => {
+      const internalResult = {
+        ...expected,
+        mode: 'apply',
+        manifestId: artifact.manifestId,
+        planChecksum: artifact.planChecksum,
+        mutations: [{ metadata: { restricted: SYNTHETIC_RESTRICTED_SENTINEL } }],
+        finalState: {
+          valid: true,
+          quickCheck: 'ok',
+          foreignKeyViolationCount: 0,
+          berlinImport: { metadata: { restricted: SYNTHETIC_RESTRICTED_SENTINEL } },
+        },
+        futureInternalState: {
+          nested: SYNTHETIC_RESTRICTED_SENTINEL,
+        },
+      };
+      const result = spawnSync(nodePath, [
+        '--input-type=module',
+        '--eval',
+        childSource,
+        JSON.stringify(applyArgs(fixture, artifactPath, artifact)),
+        JSON.stringify(fixture.config),
+        JSON.stringify(internalResult),
+      ], {
+        cwd: path.resolve('.'),
+        encoding: 'utf8',
+      });
+
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.signal, null);
+      for (const sentinel of reversibleSentinels) {
+        assert.doesNotMatch(result.stdout, new RegExp(sentinel));
+        assert.doesNotMatch(result.stderr, new RegExp(sentinel));
+      }
+      assert.doesNotMatch(result.stdout, /finalState|mutations|futureInternalState|berlinImport/);
+      assert.deepEqual(JSON.parse(result.stdout), {
+        applied: expected.applied,
+        integrity: {
+          foreignKeyViolationCount: 0,
+          quickCheck: 'ok',
+          valid: true,
+        },
+        manifestId: artifact.manifestId,
+        mode: 'apply',
+        mutationCount: expected.mutationCount,
+        planChecksum: artifact.planChecksum,
+        status: expected.status,
+      });
+      assert.equal(
+        result.stderr,
+        '[crm-duplicate-consolidation] separately authorized operation completed\n',
+      );
+    });
+  }
+});
+
+test('operator apply output projection fails closed on malformed internal results', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  const artifactPath = path.join(fixture.root, 'reviewed-malformed-output.json');
+  fs.writeFileSync(artifactPath, stableCanonicalJson(artifact), { mode: 0o600 });
+  fixture.storage.close();
+  const validResult = {
+    status: 'repair-required',
+    mode: 'apply',
+    applied: true,
+    mutationCount: 4,
+    manifestId: artifact.manifestId,
+    planChecksum: artifact.planChecksum,
+    finalState: {
+      valid: true,
+      quickCheck: 'ok',
+      foreignKeyViolationCount: 0,
+    },
+  };
+  const cases = [
+    ['non-object', null],
+    ['unknown status', { ...validResult, status: 'complete' }],
+    ['wrong mode', { ...validResult, mode: 'preview' }],
+    ['non-boolean applied', { ...validResult, applied: 'true' }],
+    ['wrong first-apply mutation count', { ...validResult, mutationCount: 0 }],
+    ['malformed manifest ID', { ...validResult, manifestId: 'manifest' }],
+    ['different valid manifest ID', {
+      ...validResult,
+      manifestId: `crm-duplicate-consolidation:v2:${'b'.repeat(64)}`,
+    }],
+    ['malformed plan checksum', { ...validResult, planChecksum: 'a'.repeat(63) }],
+    ['different valid plan checksum', { ...validResult, planChecksum: 'c'.repeat(64) }],
+    ['missing final state', { ...validResult, finalState: null }],
+    ['invalid final state', { ...validResult, finalState: { ...validResult.finalState, valid: false } }],
+    ['failed quick check', { ...validResult, finalState: { ...validResult.finalState, quickCheck: 'corrupt' } }],
+    ['foreign-key violations', {
+      ...validResult,
+      finalState: { ...validResult.finalState, foreignKeyViolationCount: 1 },
+    }],
+    ['inconsistent replay state', {
+      ...validResult,
+      status: 'verified-prior-apply',
+      applied: false,
+      mutationCount: 4,
+    }],
+  ];
+
+  for (const [name, internalResult] of cases) {
+    await t.test(name, async () => {
+      await assert.rejects(
+        runCrmDuplicateConsolidationCli({
+          argv: applyArgs(fixture, artifactPath, artifact),
+          getConfigFn: () => fixture.config,
+          applyFn: async () => internalResult,
+          environment: {},
+        }),
+        /operator apply result/i,
+      );
+    });
+  }
 });
 
 test('every non-database apply assertion mismatch refuses before writable storage opens', async (t) => {

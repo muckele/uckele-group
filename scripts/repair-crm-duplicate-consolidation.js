@@ -27,6 +27,7 @@ import {
 const commandName = 'crm-duplicate-consolidation';
 const sha256Pattern = /^[a-f0-9]{64}$/;
 const toolingRevisionPattern = /^[a-f0-9]{40,64}$/;
+const manifestIdPattern = /^crm-duplicate-consolidation:v2:[a-f0-9]{64}$/;
 const checkpointEvidenceMaximumBytes = 64 * 1024;
 
 function assertSingleOccurrence(args, flag) {
@@ -233,6 +234,54 @@ function loadAndVerifyReviewedArtifact(options, suppliedCheckpointEvidence) {
   return { artifact, artifactBytes };
 }
 
+export function projectCrmDuplicateConsolidationApplyResult(result, {
+  expectedManifestId,
+  expectedPlanChecksum,
+} = {}) {
+  const expectedOutcome = result?.status === 'repair-required'
+    ? { applied: true, mutationCount: 4 }
+    : result?.status === 'verified-prior-apply'
+      ? { applied: false, mutationCount: 0 }
+      : null;
+  const finalState = result?.finalState;
+  if (!result
+    || typeof result !== 'object'
+    || Array.isArray(result)
+    || !expectedOutcome
+    || result.mode !== 'apply'
+    || result.applied !== expectedOutcome.applied
+    || !Number.isInteger(result.mutationCount)
+    || result.mutationCount !== expectedOutcome.mutationCount
+    || typeof result.manifestId !== 'string'
+    || !manifestIdPattern.test(result.manifestId)
+    || result.manifestId !== expectedManifestId
+    || typeof result.planChecksum !== 'string'
+    || !sha256Pattern.test(result.planChecksum)
+    || result.planChecksum !== expectedPlanChecksum
+    || !finalState
+    || typeof finalState !== 'object'
+    || Array.isArray(finalState)
+    || finalState.valid !== true
+    || finalState.quickCheck !== 'ok'
+    || !Number.isInteger(finalState.foreignKeyViolationCount)
+    || finalState.foreignKeyViolationCount !== 0) {
+    throw new Error('CRM duplicate consolidation operator apply result is invalid.');
+  }
+  return {
+    status: result.status,
+    mode: result.mode,
+    applied: result.applied,
+    mutationCount: result.mutationCount,
+    manifestId: result.manifestId,
+    planChecksum: result.planChecksum,
+    integrity: {
+      valid: finalState.valid,
+      quickCheck: finalState.quickCheck,
+      foreignKeyViolationCount: finalState.foreignKeyViolationCount,
+    },
+  };
+}
+
 export async function runCrmDuplicateConsolidationCli({
   argv = process.argv.slice(2),
   getConfigFn = getConfig,
@@ -325,7 +374,7 @@ export async function runCrmDuplicateConsolidationCli({
     if (storage?.provider !== 'sqlite') {
       throw new Error('CRM duplicate consolidation is SQLite-only and refused writable storage.');
     }
-    return await applyFn({
+    const result = await applyFn({
       apply: true,
       storage,
       reviewedArtifact: artifactBytes,
@@ -337,6 +386,10 @@ export async function runCrmDuplicateConsolidationCli({
       executionRelease: options.executionRelease,
       toolingRevision: options.toolingRevision,
       confirmation: options.confirmation,
+    });
+    return projectCrmDuplicateConsolidationApplyResult(result, {
+      expectedManifestId: options.manifestId,
+      expectedPlanChecksum: options.expectedPlanChecksum,
     });
   } finally {
     storage?.close?.();
