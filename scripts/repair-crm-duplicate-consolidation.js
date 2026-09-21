@@ -2,12 +2,14 @@ import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseArgs } from 'node:util';
+import { parseArgs, TextDecoder } from 'node:util';
 
 import { getConfig } from '../server/config.js';
 import {
   CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
+  CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA,
   stableCanonicalJson,
+  validateCrmDuplicateConsolidationCheckpointEvidence,
 } from '../server/repairs/crmDuplicateConsolidation.js';
 import {
   applyCrmDuplicateConsolidation,
@@ -20,6 +22,7 @@ import { createSqliteCrmDuplicateConsolidationReadOnlyStorage } from '../server/
 const commandName = 'crm-duplicate-consolidation';
 const sha256Pattern = /^[a-f0-9]{64}$/;
 const toolingRevisionPattern = /^[a-f0-9]{40,64}$/;
+const checkpointEvidenceMaximumBytes = 64 * 1024;
 
 function assertSingleOccurrence(args, flag) {
   const count = args.filter((value) => value === flag || value.startsWith(`${flag}=`)).length;
@@ -51,6 +54,7 @@ export function parseCrmDuplicateConsolidationArgs(args = []) {
     '--backup-path',
     '--backup-manifest-id',
     '--backup-sha256',
+    '--checkpoint-evidence',
     '--confirm',
   ];
   for (const flag of acceptedFlags) assertSingleOccurrence(args, flag);
@@ -71,6 +75,7 @@ export function parseCrmDuplicateConsolidationArgs(args = []) {
       'backup-path': { type: 'string', default: '' },
       'backup-manifest-id': { type: 'string', default: '' },
       'backup-sha256': { type: 'string', default: '' },
+      'checkpoint-evidence': { type: 'string', default: '' },
       confirm: { type: 'string', default: '' },
     },
   });
@@ -87,6 +92,11 @@ export function parseCrmDuplicateConsolidationArgs(args = []) {
     backupPath: path.resolve(required(values, 'backup-path', '--backup-path PATH')),
     backupManifestId: required(values, 'backup-manifest-id', '--backup-manifest-id ID'),
     backupSha256: String(values['backup-sha256'] || ''),
+    checkpointEvidencePath: path.resolve(required(
+      values,
+      'checkpoint-evidence',
+      '--checkpoint-evidence PATH',
+    )),
     confirmation: String(values.confirm || ''),
   };
   if (parsed.reason.length < 20) throw new Error('--reason requires at least 20 characters.');
@@ -102,42 +112,58 @@ export function parseCrmDuplicateConsolidationArgs(args = []) {
   }
   requireSha256(parsed.expectedPlanChecksum, '--expected-plan-checksum');
   if (!parsed.manifestId) throw new Error('Apply requires --manifest-id ID.');
-  if (parsed.confirmation !== CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION) {
-    throw new Error(`Apply requires exact confirmation ${CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION}.`);
-  }
+  if (!parsed.confirmation) throw new Error('Apply requires --confirm TEXT.');
   return parsed;
 }
 
-function requiredEnvironment(env, key) {
-  const value = String(env?.[key] || '').trim();
-  if (!value) throw new Error(`Preview requires ${key} from the separately verified recovery checkpoint.`);
-  return value;
-}
-
-function recoveryCheckpointFromPreviewInputs(options, env) {
-  const flySnapshotDigest = requiredEnvironment(
-    env,
-    'CRM_DUPLICATE_CONSOLIDATION_FLY_SNAPSHOT_DIGEST',
-  );
-  requireSha256(flySnapshotDigest, 'CRM_DUPLICATE_CONSOLIDATION_FLY_SNAPSHOT_DIGEST');
-  const createdAt = requiredEnvironment(env, 'CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_CREATED_AT');
-  const verifiedAt = requiredEnvironment(env, 'CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_VERIFIED_AT');
-  if (!Number.isFinite(Date.parse(createdAt)) || !Number.isFinite(Date.parse(verifiedAt))) {
-    throw new Error('Preview requires valid recovery-checkpoint created and verified timestamps.');
+function loadAndValidateCheckpointEvidence(options) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(options.checkpointEvidencePath, 'r');
+  } catch (error) {
+    throw new Error(`Checkpoint evidence could not be read or does not exist: ${error.message}`);
   }
-  return {
-    backupPath: options.backupPath,
-    backupManifestId: options.backupManifestId,
-    backupSha256: options.backupSha256,
-    flySnapshotId: requiredEnvironment(env, 'CRM_DUPLICATE_CONSOLIDATION_FLY_SNAPSHOT_ID'),
-    flySnapshotDigest,
-    flyRelease: options.executionRelease,
-    createdAt,
-    verifiedAt,
-  };
+  let bytes;
+  try {
+    const stats = fs.fstatSync(descriptor);
+    if (!stats.isFile()) throw new Error('Checkpoint evidence path must identify a regular file.');
+    if (stats.size === 0) throw new Error('Checkpoint evidence file is empty.');
+    if (stats.size > checkpointEvidenceMaximumBytes) {
+      throw new Error('Checkpoint evidence file is too large; maximum size is 64 KiB.');
+    }
+    bytes = fs.readFileSync(descriptor);
+    if (bytes.length === 0) throw new Error('Checkpoint evidence file is empty.');
+    if (bytes.length > checkpointEvidenceMaximumBytes) {
+      throw new Error('Checkpoint evidence file is too large; maximum size is 64 KiB.');
+    }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  let source;
+  try {
+    source = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error('Checkpoint evidence file is not valid UTF-8.');
+  }
+  let evidence;
+  try {
+    evidence = JSON.parse(source);
+  } catch {
+    throw new Error('Checkpoint evidence file is not valid JSON.');
+  }
+  return validateCrmDuplicateConsolidationCheckpointEvidence({
+    evidence,
+    expectedExecutionRelease: options.executionRelease,
+    expectedToolingRevision: options.toolingRevision,
+    expectedBackup: {
+      path: options.backupPath,
+      manifestId: options.backupManifestId,
+      sha256: options.backupSha256,
+    },
+  });
 }
 
-function loadAndVerifyReviewedArtifact(options) {
+function loadAndVerifyReviewedArtifact(options, suppliedCheckpointEvidence) {
   const artifactPath = path.resolve(options.reviewedManifestPath);
   let artifactBytes;
   try {
@@ -150,6 +176,21 @@ function loadAndVerifyReviewedArtifact(options) {
     expectedPlanChecksum: options.expectedPlanChecksum,
     expectedManifestId: options.manifestId,
   });
+  const reviewedCheckpointEvidence = validateCrmDuplicateConsolidationCheckpointEvidence({
+    evidence: {
+      schema: CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA,
+      checkpoint: {
+        ...artifact.plan.recoveryCheckpoint,
+        backupPath: artifact.recoveryCheckpointPath,
+      },
+    },
+    expectedExecutionRelease: artifact.plan.execution?.release,
+    expectedToolingRevision: artifact.plan.execution?.toolingRevision,
+  });
+  if (reviewedCheckpointEvidence.digest !== suppliedCheckpointEvidence.digest
+    || reviewedCheckpointEvidence.canonicalJson !== suppliedCheckpointEvidence.canonicalJson) {
+    throw new Error('Reviewed artifact checkpoint evidence does not exactly match the supplied evidence.');
+  }
   if (artifact.plan.actor !== options.actor) {
     throw new Error('Apply requires --actor to match the reviewed manifest exactly.');
   }
@@ -177,7 +218,6 @@ function loadAndVerifyReviewedArtifact(options) {
 
 export async function runCrmDuplicateConsolidationCli({
   argv = process.argv.slice(2),
-  env = process.env,
   getConfigFn = getConfig,
   getStorageFn = getStorage,
   createReadOnlyStorageFn = createSqliteCrmDuplicateConsolidationReadOnlyStorage,
@@ -185,35 +225,48 @@ export async function runCrmDuplicateConsolidationCli({
   applyFn = applyCrmDuplicateConsolidation,
 } = {}) {
   const options = parseCrmDuplicateConsolidationArgs(argv);
+  const checkpointEvidence = loadAndValidateCheckpointEvidence(options);
+  const reviewed = options.apply
+    ? loadAndVerifyReviewedArtifact(options, checkpointEvidence)
+    : null;
+  if (options.apply && options.confirmation !== CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION) {
+    throw new Error(`Apply requires exact confirmation ${CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION}.`);
+  }
   const config = getConfigFn();
   if (config?.storage?.provider !== 'sqlite') {
     throw new Error('CRM duplicate consolidation is SQLite-only and refused the active storage provider.');
   }
 
   if (!options.apply) {
-    const recoveryCheckpoint = recoveryCheckpointFromPreviewInputs(options, env);
     const storage = createReadOnlyStorageFn(config);
     try {
-      return await previewFn({
+      const result = await previewFn({
         storage,
         actor: options.actor,
         reason: options.reason,
         executionRelease: options.executionRelease,
         toolingRevision: options.toolingRevision,
-        recoveryCheckpoint,
+        recoveryCheckpoint: checkpointEvidence.checkpoint,
       });
+      return {
+        ...result,
+        checkpointEvidence: {
+          schema: CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA,
+          digest: checkpointEvidence.digest,
+        },
+      };
     } finally {
       storage?.close?.();
     }
   }
 
-  const { artifact, artifactBytes } = loadAndVerifyReviewedArtifact(options);
+  const { artifactBytes } = reviewed;
   const backup = {
-    path: options.backupPath,
-    manifestId: options.backupManifestId,
-    sha256: options.backupSha256,
-    flySnapshotId: artifact.plan.recoveryCheckpoint.flySnapshotId,
-    flySnapshotDigest: artifact.plan.recoveryCheckpoint.flySnapshotDigest,
+    path: checkpointEvidence.checkpoint.backupPath,
+    manifestId: checkpointEvidence.checkpoint.backupManifestId,
+    sha256: checkpointEvidence.checkpoint.backupSha256,
+    flySnapshotId: checkpointEvidence.checkpoint.flySnapshotId,
+    flySnapshotDigest: checkpointEvidence.checkpoint.flySnapshotDigest,
   };
   const storage = getStorageFn();
   try {

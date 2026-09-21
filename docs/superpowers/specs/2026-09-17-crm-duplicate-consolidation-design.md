@@ -652,3 +652,9 @@ Before any implementation plan:
 - Current backup and snapshot were only read-verified, not created or restored.
 - Ordinary canonical-opportunity merge fails closed when either merge subject has active or reversed CRM supersession history, while unrelated supersessions do not block it; no supersession tuple or receipt is retargeted or rewritten.
 - Production business mutation, cleanup execution, transmission, deployment, and reconciliation: none.
+
+## Task 9 owner-approved checkpoint-evidence correction
+
+Task 9's preview and separately authorized apply use exactly one explicit `--checkpoint-evidence <path>` as the operator-supplied recovery-checkpoint source. The file has the exact `crm-duplicate-consolidation-checkpoint-v1` envelope and the complete Task 8 recovery-checkpoint domain; direct checkpoint environment inputs are not part of the contract. One pure shared validator enforces exact keys, types, bounds, identifiers, hashes, canonical UTC timestamp ordering, backup and snapshot integrity/status, and release/tooling bindings without a wall-clock TTL.
+
+Apply must independently validate the bounded UTF-8 JSON checkpoint file and the reviewed artifact's nested checkpoint, canonicalize and hash both, prove exact equality, and validate all non-database operator facts and exact confirmation before writable SQLite storage is constructed. Preview requires the same evidence file but retains Task 8's read-only, file-existing, query-only, consistent-snapshot boundary. This correction changes neither the two approved pairs nor the four-row mutation ledger and grants no production authority.

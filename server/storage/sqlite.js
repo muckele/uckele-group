@@ -9890,7 +9890,10 @@ export function createSqliteStorage(config) {
           reason: artifact.plan.reason,
           executionRelease: artifact.plan.execution.release,
           toolingRevision: artifact.plan.execution.toolingRevision,
-          recoveryCheckpoint: artifact.plan.recoveryCheckpoint,
+          recoveryCheckpoint: {
+            ...artifact.plan.recoveryCheckpoint,
+            backupPath: artifact.recoveryCheckpointPath,
+          },
         });
         if (planned.planChecksum !== artifact.planChecksum
           || inspection.database.logicalDigest !== artifact.plan.database.logicalDigest
@@ -10027,7 +10030,10 @@ export function createSqliteStorage(config) {
           reason,
           executionRelease,
           toolingRevision,
-          recoveryCheckpoint: artifact.plan.recoveryCheckpoint,
+          recoveryCheckpoint: {
+            ...artifact.plan.recoveryCheckpoint,
+            backupPath: artifact.recoveryCheckpointPath,
+          },
         });
         if (planned.manifestId !== artifact.manifestId
           || planned.planChecksum !== artifact.planChecksum

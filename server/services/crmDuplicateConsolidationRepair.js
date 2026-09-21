@@ -1,12 +1,14 @@
 import {
   buildCrmDuplicateConsolidationPlan,
   CRM_DUPLICATE_CONSOLIDATION_APPROVAL_SCHEMA,
+  CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA,
   CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
   CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
   CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA,
   CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
   CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
   stableCanonicalJson,
+  validateCrmDuplicateConsolidationCheckpointEvidence,
   validateCrmDuplicateConsolidationArtifact,
 } from '../repairs/crmDuplicateConsolidation.js';
 
@@ -66,20 +68,22 @@ function checkedOperatorFacts({ actor, reason, executionRelease, toolingRevision
   return checked;
 }
 
-function checkedRecoveryCheckpoint(checkpoint) {
-  const value = checkpoint && typeof checkpoint === 'object' ? structuredClone(checkpoint) : null;
-  if (!value
-    || !String(value.backupPath || '').trim()
-    || !String(value.backupManifestId || '').trim()
-    || !/^[a-f0-9]{64}$/.test(String(value.backupSha256 || ''))
-    || !String(value.flySnapshotId || '').trim()
-    || !/^[a-f0-9]{64}$/.test(String(value.flySnapshotDigest || ''))
-    || !String(value.flyRelease || '').trim()
-    || !Number.isFinite(Date.parse(value.createdAt))
-    || !Number.isFinite(Date.parse(value.verifiedAt))) {
-    refuse('CRM duplicate consolidation requires a complete reviewed recovery checkpoint.', ['recovery-checkpoint-invalid']);
+function checkedRecoveryCheckpoint(checkpoint, facts) {
+  try {
+    return validateCrmDuplicateConsolidationCheckpointEvidence({
+      evidence: {
+        schema: CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA,
+        checkpoint,
+      },
+      expectedExecutionRelease: facts.executionRelease,
+      expectedToolingRevision: facts.toolingRevision,
+    }).checkpoint;
+  } catch (error) {
+    refuse(
+      `CRM duplicate consolidation requires a complete reviewed recovery checkpoint: ${error.message}`,
+      ['recovery-checkpoint-invalid'],
+    );
   }
-  return value;
 }
 
 export function verifyCrmDuplicateConsolidationReviewedArtifact({
@@ -113,7 +117,7 @@ export async function previewCrmDuplicateConsolidation({
     refuse('SQLite CRM duplicate consolidation inspection is unavailable.', ['inspection-unavailable']);
   }
   const facts = checkedOperatorFacts({ actor, reason, executionRelease, toolingRevision });
-  const checkpoint = checkedRecoveryCheckpoint(recoveryCheckpoint);
+  const checkpoint = checkedRecoveryCheckpoint(recoveryCheckpoint, facts);
   let inspection;
   try {
     inspection = await storage.inspectCrmDuplicateConsolidation();

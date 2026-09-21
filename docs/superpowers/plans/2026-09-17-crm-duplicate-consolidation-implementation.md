@@ -892,3 +892,9 @@ The implementation must not include:
 - [x] Reversal is representable but not callable as an ordinary operator action.
 - [x] Deferred owner-workflow items are absent from implementation tasks.
 - [x] The plan contains no unfinished-marker tokens, empty interface bodies, or generic arbitrary-pair operation.
+
+## Task 9 owner-approved checkpoint-evidence correction
+
+Task 9 requires exactly one `--checkpoint-evidence <path>` for preview and apply. Remove the four direct checkpoint environment inputs. Validate the nonempty, readable, regular UTF-8 JSON file at no more than 64 KiB with the shared complete Task 8 checkpoint validator; accept JSON whitespace/property ordering, then compare canonical representations and SHA-256 digests. Both the file and reviewed artifact checkpoint must independently satisfy the exact envelope, leaf, type, bound, identifier, hash, integrity/status, canonical UTC ordering, release, and tooling rules. No TTL is added.
+
+In apply mode, parse and validate flags; read, bound, decode, parse, validate, canonicalize, and hash checkpoint evidence; read and fully validate canonical reviewed-artifact bytes and its nested checkpoint; compare checkpoint canonical values/digests; validate actor, reason, release, tooling, backup assertions, manifest/checksum, and exact confirmation; only then construct writable storage and delegate to Task 8's existing atomic transaction. Every pre-storage failure must keep the writable constructor count at zero. The correction test matrix covers every checkpoint leaf and input class, legacy-environment refusal, the canonical-checksum malformed-nested-checkpoint regression, positive read-only preview, disposable apply, and exact zero-write replay. Task 10 remains a separate task.

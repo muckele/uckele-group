@@ -32,24 +32,43 @@ npm run crm:duplicate-consolidation -- <reviewed operator facts>
 
 It reads the database location only from the established application storage configuration (`STORAGE_PROVIDER=sqlite` and `SQLITE_PATH`). There is no database-path CLI option and no arbitrary record selector.
 
-Both preview and a later separately authorized apply require the operator facts `--actor`, `--reason`, `--execution-release`, `--tooling-revision`, `--backup-path`, `--backup-manifest-id`, and `--backup-sha256`. The reason must be at least 20 characters, the tooling revision must be an exact lowercase Git/SHA identifier, and the backup digest must be an exact lowercase SHA-256.
+Both preview and a later separately authorized apply require the operator facts `--actor`, `--reason`, `--execution-release`, `--tooling-revision`, `--backup-path`, `--backup-manifest-id`, `--backup-sha256`, and exactly one explicit `--checkpoint-evidence <path>`. The reason must be at least 20 characters, the tooling revision must be an exact lowercase Git/SHA identifier, and the backup digest must be an exact lowercase SHA-256.
 
-Preview also reads these already verified recovery-checkpoint facts from the environment; they are evidence inputs, not authority:
+The checkpoint-evidence file is the sole operator-supplied checkpoint source. The CLI never reads checkpoint facts from environment variables and never mixes the file with fallback facts. The file may contain ordinary JSON whitespace and property ordering, but must be an existing readable regular UTF-8 JSON file, nonempty, and no larger than 64 KiB. Its exact envelope is:
 
-- `CRM_DUPLICATE_CONSOLIDATION_FLY_SNAPSHOT_ID`;
-- `CRM_DUPLICATE_CONSOLIDATION_FLY_SNAPSHOT_DIGEST` (lowercase SHA-256);
-- `CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_CREATED_AT` (ISO timestamp);
-- `CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_VERIFIED_AT` (ISO timestamp).
+```json
+{
+  "schema": "crm-duplicate-consolidation-checkpoint-v1",
+  "checkpoint": {
+    "backupPath": "/absolute/path/to/verified-backup.sqlite",
+    "backupManifestId": "verified-backup-manifest-id",
+    "backupSha256": "lowercase-64-character-sha256",
+    "backupProvider": "sqlite",
+    "backupStatus": "verified",
+    "backupQuickCheck": "ok",
+    "backupForeignKeyViolationCount": 0,
+    "flySnapshotId": "verified-fly-snapshot-id",
+    "flySnapshotDigest": "lowercase-64-character-sha256",
+    "flySnapshotStatus": "created",
+    "flyRelease": "exact-deployed-release",
+    "toolingRevision": "exact-lowercase-40-to-64-character-sha",
+    "createdAt": "2026-09-19T17:00:00.000Z",
+    "verifiedAt": "2026-09-19T17:00:00.000Z"
+  }
+}
+```
 
-Do not put credentials, contacts, message bodies, notes, document paths, raw metadata, or secrets in any operator fact.
+Those are the only permitted top-level and checkpoint keys. All values are strictly typed and bounded. Timestamps must be canonical UTC ISO values with milliseconds, and `createdAt` must not follow `verifiedAt`; there is no wall-clock TTL. The backup status, SQLite `quick_check`, zero foreign-key violations, snapshot status, release, tooling revision, hashes, identifiers, and the three backup CLI assertions must all match. After validation, the CLI canonicalizes this envelope and binds its SHA-256 digest to the preview and reviewed apply.
+
+Do not put credentials, tokens, contacts, message bodies, notes, document contents, arbitrary environment dumps, raw metadata, or secrets in the checkpoint file or any operator fact. The file must not contain secondary file references that an operator expects the CLI to follow; it follows none.
 
 ## Preview artifact procedure
 
 Only after the production-preview gate has been separately authorized:
 
 1. Confirm the exact deployed release and tooling revision, the new current-format application backup and Fly volume snapshot, and all outbound/scheduler/follow-up pauses.
-2. Set the established database configuration and the four checkpoint environment values above.
-3. Run the package command without an apply mode flag. Redirect stdout directly to a new restricted artifact file. Diagnostics are written only to stderr.
+2. Set only the established database configuration, and prepare the bounded checkpoint-evidence file above as a restricted local file. Do not export checkpoint facts as environment variables.
+3. Run the package command without an apply mode flag and include `--checkpoint-evidence <path>`. Redirect stdout directly to a new restricted artifact file. Diagnostics are written only to stderr.
 4. Hash the captured bytes independently with SHA-256 and parse the captured file independently as one JSON document.
 5. Confirm the artifact reports `mode: "preview"`, `applied: false`, and connection evidence `readonly: true`, `fileMustExist: true`, `queryOnly: true`, and `consistentReadTransaction: true`.
 6. Independently prove the database logical digest did not change.
@@ -83,9 +102,10 @@ An apply is a later and separately authorized operation. It additionally require
 - `--expected-plan-checksum` with the reviewed lowercase SHA-256;
 - `--manifest-id` with the reviewed fixed-incident manifest ID;
 - the same actor, reason, execution release, tooling revision, backup path, backup manifest ID, and backup SHA-256 recorded in the artifact;
+- the same explicitly supplied `--checkpoint-evidence <path>` whose independently validated canonical value and digest exactly match the reviewed artifact checkpoint;
 - `--confirm APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1`.
 
-The CLI first reads and byte-validates the reviewed artifact, fixed incident, canonical JSON, checksum, manifest ID, operator facts, and backup facts. Only after those checks pass can it open the established writable SQLite storage and delegate to the Task 8 atomic service. Do not normalize, pretty-print, recreate, or edit the reviewed artifact.
+The CLI first validates the evidence file and its complete nested domain, then reads and byte-validates the reviewed artifact, independently validates the artifact checkpoint, compares the two canonical checkpoint representations and digests, and validates the fixed incident, canonical JSON, checksum, manifest ID, operator facts, backup facts, and exact confirmation. Any failure keeps writable-storage construction at zero. Only after all of those checks pass can it open the established writable SQLite storage and delegate to the Task 8 atomic service. Do not normalize, pretty-print, recreate, or edit the reviewed artifact.
 
 This runbook deliberately contains no ready-to-run production apply command. The owner must authorize the exact reviewed artifact and the exact operation separately; preview output alone is not authorization.
 

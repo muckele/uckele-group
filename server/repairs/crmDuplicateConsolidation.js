@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import path from 'node:path';
 import {
   CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY,
   isCanonicalOpportunityMergeRelationshipColumn,
@@ -15,6 +16,30 @@ export const CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA =
   'crm-duplicate-consolidation-manifest-v1';
 export const CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION =
   'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1';
+export const CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA =
+  'crm-duplicate-consolidation-checkpoint-v1';
+export const CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_FIELDS = Object.freeze([
+  'backupPath',
+  'backupManifestId',
+  'backupSha256',
+  'backupProvider',
+  'backupStatus',
+  'backupQuickCheck',
+  'backupForeignKeyViolationCount',
+  'flySnapshotId',
+  'flySnapshotDigest',
+  'flySnapshotStatus',
+  'flyRelease',
+  'toolingRevision',
+  'createdAt',
+  'verifiedAt',
+]);
+
+const checkpointTopLevelFields = Object.freeze(['schema', 'checkpoint']);
+const checkpointSha256Pattern = /^[a-f0-9]{64}$/;
+const checkpointToolingRevisionPattern = /^[a-f0-9]{40,64}$/;
+const checkpointIdentifierPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+const checkpointReleasePattern = /^[A-Za-z0-9][A-Za-z0-9._:+/-]{0,159}$/;
 
 function deeplyFreeze(value) {
   if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
@@ -39,6 +64,152 @@ export function sha256Hex(value) {
 
 export function canonicalJsonSha256(value) {
   return sha256Hex(stableCanonicalJson(value));
+}
+
+function exactObjectKeys(value, expected, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  if (stableCanonicalJson(actual) !== stableCanonicalJson(wanted)) {
+    const missing = wanted.filter((key) => !actual.includes(key));
+    const unknown = actual.filter((key) => !wanted.includes(key));
+    const details = [
+      ...missing.map((key) => `missing ${key}`),
+      ...unknown.map((key) => `unknown key ${key}`),
+    ].join(', ');
+    throw new Error(`${label} has invalid keys${details ? `: ${details}` : ''}.`);
+  }
+}
+
+function checkpointString(checkpoint, field, maximum, pattern = null) {
+  const value = checkpoint[field];
+  if (typeof value !== 'string') throw new Error(`Checkpoint ${field} must be a string.`);
+  if (!value || value.trim() !== value) {
+    throw new Error(`Checkpoint ${field} must be non-empty without surrounding whitespace.`);
+  }
+  if (value.length > maximum) throw new Error(`Checkpoint ${field} exceeds ${maximum} characters.`);
+  if (pattern && !pattern.test(value)) throw new Error(`Checkpoint ${field} is malformed.`);
+  return value;
+}
+
+function canonicalCheckpointTimestamp(checkpoint, field) {
+  const value = checkpointString(checkpoint, field, 24);
+  const parsed = new Date(value);
+  if (!Number.isFinite(parsed.valueOf()) || parsed.toISOString() !== value) {
+    throw new Error(`Checkpoint ${field} must be a canonical UTC timestamp with milliseconds.`);
+  }
+  return value;
+}
+
+export function validateCrmDuplicateConsolidationCheckpointEvidence({
+  evidence,
+  expectedExecutionRelease,
+  expectedToolingRevision,
+  expectedBackup,
+} = {}) {
+  exactObjectKeys(evidence, checkpointTopLevelFields, 'Checkpoint evidence envelope');
+  if (evidence.schema !== CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA) {
+    throw new Error('Checkpoint evidence schema is invalid.');
+  }
+  exactObjectKeys(
+    evidence.checkpoint,
+    CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_FIELDS,
+    'Checkpoint',
+  );
+  const checkpoint = evidence.checkpoint;
+  const normalized = {
+    backupPath: checkpointString(checkpoint, 'backupPath', 4096),
+    backupManifestId: checkpointString(
+      checkpoint,
+      'backupManifestId',
+      200,
+      checkpointIdentifierPattern,
+    ),
+    backupSha256: checkpointString(checkpoint, 'backupSha256', 64, checkpointSha256Pattern),
+    backupProvider: checkpointString(checkpoint, 'backupProvider', 32),
+    backupStatus: checkpointString(checkpoint, 'backupStatus', 32),
+    backupQuickCheck: checkpointString(checkpoint, 'backupQuickCheck', 32),
+    backupForeignKeyViolationCount: checkpoint.backupForeignKeyViolationCount,
+    flySnapshotId: checkpointString(
+      checkpoint,
+      'flySnapshotId',
+      200,
+      checkpointIdentifierPattern,
+    ),
+    flySnapshotDigest: checkpointString(
+      checkpoint,
+      'flySnapshotDigest',
+      64,
+      checkpointSha256Pattern,
+    ),
+    flySnapshotStatus: checkpointString(checkpoint, 'flySnapshotStatus', 32),
+    flyRelease: checkpointString(checkpoint, 'flyRelease', 160, checkpointReleasePattern),
+    toolingRevision: checkpointString(
+      checkpoint,
+      'toolingRevision',
+      64,
+      checkpointToolingRevisionPattern,
+    ),
+    createdAt: canonicalCheckpointTimestamp(checkpoint, 'createdAt'),
+    verifiedAt: canonicalCheckpointTimestamp(checkpoint, 'verifiedAt'),
+  };
+  if (!path.isAbsolute(normalized.backupPath)) {
+    throw new Error('Checkpoint backupPath must be absolute.');
+  }
+  if (normalized.backupProvider !== 'sqlite') {
+    throw new Error('Checkpoint backupProvider must be sqlite.');
+  }
+  if (normalized.backupStatus !== 'verified') {
+    throw new Error('Checkpoint backupStatus must be verified.');
+  }
+  if (normalized.backupQuickCheck !== 'ok') {
+    throw new Error('Checkpoint backupQuickCheck must be ok.');
+  }
+  if (!Number.isInteger(normalized.backupForeignKeyViolationCount)
+    || normalized.backupForeignKeyViolationCount !== 0) {
+    throw new Error('Checkpoint backupForeignKeyViolationCount must be the integer zero.');
+  }
+  if (normalized.flySnapshotStatus !== 'created') {
+    throw new Error('Checkpoint flySnapshotStatus must be created.');
+  }
+  if (normalized.createdAt > normalized.verifiedAt) {
+    throw new Error('Checkpoint createdAt must not be after verifiedAt.');
+  }
+  if (expectedExecutionRelease !== undefined
+    && normalized.flyRelease !== expectedExecutionRelease) {
+    throw new Error('Checkpoint flyRelease does not match the execution release.');
+  }
+  if (expectedToolingRevision !== undefined
+    && normalized.toolingRevision !== expectedToolingRevision) {
+    throw new Error('Checkpoint toolingRevision does not match the execution tooling revision.');
+  }
+  if (expectedBackup !== undefined) {
+    if (!expectedBackup || typeof expectedBackup !== 'object' || Array.isArray(expectedBackup)) {
+      throw new Error('Checkpoint expected backup facts are invalid.');
+    }
+    if (normalized.backupPath !== expectedBackup.path) {
+      throw new Error('Checkpoint backupPath does not match the operator backup path.');
+    }
+    if (normalized.backupManifestId !== expectedBackup.manifestId) {
+      throw new Error('Checkpoint backupManifestId does not match the operator backup manifest.');
+    }
+    if (normalized.backupSha256 !== expectedBackup.sha256) {
+      throw new Error('Checkpoint backupSha256 does not match the operator backup digest.');
+    }
+  }
+  const normalizedEvidence = {
+    schema: CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA,
+    checkpoint: normalized,
+  };
+  const canonicalJson = stableCanonicalJson(normalizedEvidence);
+  return {
+    evidence: normalizedEvidence,
+    checkpoint: normalized,
+    canonicalJson,
+    digest: sha256Hex(canonicalJson),
+  };
 }
 
 const pooler = {
@@ -235,9 +406,15 @@ export function buildCrmDuplicateConsolidationPlan({
     error.blockers = [...inspection.blockers];
     throw error;
   }
-  const recoveryReferences = recoveryCheckpoint && typeof recoveryCheckpoint === 'object'
-    ? structuredClone(recoveryCheckpoint)
-    : {};
+  const checkedRecovery = validateCrmDuplicateConsolidationCheckpointEvidence({
+    evidence: {
+      schema: CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA,
+      checkpoint: recoveryCheckpoint,
+    },
+    expectedExecutionRelease: normalizedRelease,
+    expectedToolingRevision: normalizedTooling,
+  });
+  const recoveryReferences = structuredClone(checkedRecovery.checkpoint);
   delete recoveryReferences.backupPath;
   const plan = {
     repairType: CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
@@ -282,6 +459,17 @@ export function validateCrmDuplicateConsolidationArtifact({
     || Object.hasOwn(artifact.plan?.recoveryCheckpoint || {}, 'backupPath')) {
     throw new Error('Reviewed CRM duplicate consolidation backup path must be outside the checksummed plan.');
   }
+  validateCrmDuplicateConsolidationCheckpointEvidence({
+    evidence: {
+      schema: CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA,
+      checkpoint: {
+        ...artifact.plan?.recoveryCheckpoint,
+        backupPath: artifact.recoveryCheckpointPath,
+      },
+    },
+    expectedExecutionRelease: artifact.plan?.execution?.release,
+    expectedToolingRevision: artifact.plan?.execution?.toolingRevision,
+  });
   const manifestId = crmDuplicateConsolidationManifestId();
   if (artifact.manifestId !== expectedManifestId || artifact.manifestId !== manifestId) {
     throw new Error('Reviewed CRM duplicate consolidation manifest ID does not match the fixed incident.');
