@@ -29,6 +29,7 @@ import {
   eventMatchesCimRequest,
   executeApprovedDealHunterCimRequest,
 } from './dealHunter.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 
 export const BROKER_MATERIALS_TEMPLATE_VERSION = 'deal-hunter-cim-manual-stage1-v1';
 
@@ -470,12 +471,15 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
   let communications = [];
   let materialsAuthorityAvailable = true;
   let communicationsAuthorityAvailable = true;
+  const submissionReadMethod = typeof storage?.getSubmissionStrict === 'function'
+    ? 'getSubmissionStrict'
+    : 'getSubmission';
   try {
     [aliases, facts, sourceRows, submission, opportunityClaim, safety, identityExceptions] = await Promise.all([
       requiredAuthorityRead(storage, 'listDealHunterOpportunityAliases', { opportunityIds: [id], limit: 500 }),
       requiredAuthorityRead(storage, 'listDealHunterOpportunityFacts', id, { limit: 100 }),
       requiredAuthorityRead(storage, 'listDealHunterOpportunitySourceObservations', id, { limit: 500 }),
-      opportunity.primary_submission_id ? requiredAuthorityRead(storage, 'getSubmission', opportunity.primary_submission_id) : null,
+      opportunity.primary_submission_id ? requiredAuthorityRead(storage, submissionReadMethod, opportunity.primary_submission_id) : null,
       requiredAuthorityRead(storage, 'getDealHunterCimOpportunityClaim', id),
       optionalRead(() => storage?.getDealHunterCimSafetySettings?.(), null),
       requiredAuthorityRead(storage, 'listDealHunterIdentityExceptions', { statuses: ['open'], limit: 5000 }),
@@ -802,6 +806,9 @@ export async function prepareDealHunterBrokerMaterials({
     return { success: false, status: 400, code: 'invalid_preparation_input', error: error.message };
   }
   const authority = await loadBrokerMaterialsAuthority({ opportunityId, storage, now });
+  if (authority.submission?.id) {
+    await assertCrmSubmissionWritable({ storage, submissionId: authority.submission.id });
+  }
   if (authority.preparationBlockers.length > 0) {
     const first = authority.preparationBlockers[0];
     return preparationError(authority, first.code, first.message, authority.authorityStatus || 409);
@@ -968,6 +975,9 @@ export async function approveDealHunterBrokerMaterials({
   const authority = await loadBrokerMaterialsAuthority({ opportunityId: canonicalOpportunityId, storage, now });
   if (authority.existingRequest) {
     return durableApprovalResult(canonicalOpportunityId, authority.existingRequest);
+  }
+  if (authority.submission?.id) {
+    await assertCrmSubmissionWritable({ storage, submissionId: authority.submission.id });
   }
   if (authority.preparationBlockers.length > 0) {
     return approvalFailure('preparation_stale', 'Current opportunity authority changed after preparation. Prepare and review it again.', 409);

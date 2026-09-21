@@ -30,11 +30,39 @@ function withMatchAuthority(storage) {
       return {
         rows: Array.isArray(result?.rows) ? result.rows : [],
         count: complete ? count : null,
+        submissionCount: complete ? count : null,
+        supersessions: Array.isArray(storage.supersessions) ? storage.supersessions : [],
+        supersessionCount: Array.isArray(storage.supersessions) ? storage.supersessions.length : 0,
         complete,
         revision: complete ? 'a'.repeat(64) : null,
-        revisionVersion: 'test-match-authority-v1',
+        revisionVersion: 'deal-hunter-crm-match-authority-v2',
       };
     },
+  };
+}
+
+function activeSupersession(id, loserId, survivorId, opportunityId = 'opp-current') {
+  return {
+    id,
+    createdAt: '2026-09-17T00:00:00.000Z',
+    updatedAt: '2026-09-17T00:00:00.000Z',
+    status: 'active',
+    survivorSubmissionId: survivorId,
+    supersededSubmissionId: loserId,
+    opportunityId,
+    reasonCode: 'confirmed-duplicate',
+    reasonText: 'Reviewed duplicate.',
+    approvedBy: 'owner@example.test',
+    approvedAt: '2026-09-17T00:00:00.000Z',
+    actor: 'operator',
+    repairVersion: 'crm-duplicate-consolidation-v1',
+    repairManifestId: `manifest-${id}`,
+    repairDigest: 'a'.repeat(64),
+    reversedAt: null,
+    reversedBy: null,
+    reversalReason: null,
+    reversalManifestId: null,
+    metadata: {},
   };
 }
 
@@ -77,6 +105,91 @@ function legacyCandidate(id, updatedAt) {
     },
   };
 }
+
+test('exact evidence on a loser selects its direct survivor while retaining the evidence origin', async () => {
+  const loser = {
+    ...legacyCandidate('loser-exact', '2026-09-01T00:00:00.000Z'),
+    listing_url: corroboratedDeal.listingUrl,
+  };
+  const survivor = {
+    ...legacyCandidate('survivor', '2026-09-02T00:00:00.000Z'),
+    company: 'Canonical survivor title',
+    metadata: { dealHunter: { opportunityId: 'opp-current', raw: { City: 'Berlin Township', State: 'NJ' } } },
+  };
+  const result = await findExistingDealHunterSubmission({
+    supersessions: [activeSupersession('relation-one', loser.id, survivor.id)],
+    async getCurrentDealHunterOpportunity() {
+      return { opportunity_id: 'opp-current', status: 'active', primary_submission_id: null };
+    },
+    async listSubmissions() { return { rows: [loser, survivor], total: 2 }; },
+  }, { ...corroboratedDeal, opportunityId: 'opp-current' });
+
+  assert.equal(result.status, 'unique-exact');
+  assert.equal(result.submission.id, survivor.id);
+  assert.deepEqual(result.candidateIds, [survivor.id]);
+  assert.deepEqual(result.candidates[0].evidenceOriginSubmissionIds, [loser.id]);
+});
+
+test('loser and survivor evidence deduplicate after canonicalization and retain both origins', async () => {
+  const loser = {
+    ...legacyCandidate('loser-exact', '2026-09-01T00:00:00.000Z'),
+    listing_url: corroboratedDeal.listingUrl,
+  };
+  const survivor = {
+    ...legacyCandidate('survivor-exact', '2026-09-02T00:00:00.000Z'),
+    listing_url: corroboratedDeal.listingUrl,
+  };
+  const result = await findExistingDealHunterSubmission({
+    supersessions: [activeSupersession('relation-one', loser.id, survivor.id)],
+    async listSubmissions() { return { rows: [loser, survivor], total: 2 }; },
+  }, corroboratedDeal);
+
+  assert.equal(result.status, 'unique-exact');
+  assert.equal(result.submission.id, survivor.id);
+  assert.deepEqual(result.candidateIds, [survivor.id]);
+  assert.deepEqual(result.candidates[0].evidenceOriginSubmissionIds, [loser.id, survivor.id].sort());
+});
+
+test('multiple losers canonicalize once to one survivor but distinct final survivors remain ambiguous', async () => {
+  const loserA = {
+    ...legacyCandidate('loser-a', '2026-09-01T00:00:00.000Z'),
+    listing_url: corroboratedDeal.listingUrl,
+  };
+  const loserB = {
+    ...legacyCandidate('loser-b', '2026-09-02T00:00:00.000Z'),
+    listing_url: corroboratedDeal.listingUrl,
+  };
+  const survivor = {
+    ...legacyCandidate('survivor', '2026-09-03T00:00:00.000Z'),
+    company: 'Canonical survivor title',
+  };
+  const oneSurvivor = await findExistingDealHunterSubmission({
+    supersessions: [
+      activeSupersession('relation-a', loserA.id, survivor.id),
+      activeSupersession('relation-b', loserB.id, survivor.id),
+    ],
+    async listSubmissions() { return { rows: [loserA, loserB, survivor], total: 3 }; },
+  }, corroboratedDeal);
+  assert.equal(oneSurvivor.status, 'unique-exact');
+  assert.equal(oneSurvivor.submission.id, survivor.id);
+  assert.deepEqual(oneSurvivor.candidates[0].evidenceOriginSubmissionIds, [loserA.id, loserB.id].sort());
+
+  const secondSurvivor = {
+    ...legacyCandidate('second-survivor', '2026-09-04T00:00:00.000Z'),
+    company: 'Second canonical survivor',
+  };
+  const distinctSurvivors = await findExistingDealHunterSubmission({
+    supersessions: [
+      activeSupersession('relation-a', loserA.id, survivor.id),
+      activeSupersession('relation-b', loserB.id, secondSurvivor.id),
+    ],
+    async listSubmissions() {
+      return { rows: [loserA, loserB, survivor, secondSurvivor], total: 4 };
+    },
+  }, corroboratedDeal);
+  assert.equal(distinctSurvivors.status, 'ambiguous');
+  assert.deepEqual(distinctSurvivors.candidateIds, [secondSurvivor.id, survivor.id].sort());
+});
 
 test('equally corroborated unlinked legacy CRM rows return ambiguity without selecting either row', async () => {
   const older = legacyCandidate('candidate-a', '2026-08-01T00:00:00.000Z');

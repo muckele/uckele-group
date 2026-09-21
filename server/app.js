@@ -117,6 +117,11 @@ import {
 } from './services/leadLifecycle.js';
 import { recordAnalyticsEvent } from './services/analytics.js';
 import {
+  assertCrmSubmissionWritable,
+  projectCrmSupersessionHttpError,
+} from './services/crmSubmissionSupersession.js';
+import { getCrmDuplicateReview } from './services/crmDuplicateReview.js';
+import {
   createCimStage2Activation,
   getCimAutomationStatus,
   recordCimResponseOutcome,
@@ -349,6 +354,12 @@ export function handleAppError(error, request, response, next) {
     return;
   }
 
+  const crmSupersessionError = projectCrmSupersessionHttpError(error);
+  if (crmSupersessionError) {
+    response.status(crmSupersessionError.status).json(crmSupersessionError.body);
+    return;
+  }
+
   const explicitStatus = Number(error?.status || error?.statusCode);
   const status = explicitStatus >= 400 && explicitStatus < 600 ? explicitStatus : 500;
   const message = status === 413
@@ -561,27 +572,20 @@ export function createApp({
     }
 
     try {
-      const result = await enforceSecureUploadBodyRateLimit(request);
+      const token = String(request.headers['x-secure-upload-token'] || '').trim();
+      let context = await getSecureUploadContext(token);
 
-      if (!result.ok) {
-        response.status(result.status || 429).json({ success: false, error: result.error });
+      if (!context.ok) {
+        response.status(400).json({ success: false, error: context.error });
         return;
       }
 
-      next();
-    } catch (error) {
-      next(error);
-    }
-  });
-  app.use('/api/secure-documents/upload', async (request, response, next) => {
-    if (request.method !== 'POST') {
-      next();
-      return;
-    }
+      await assertCrmSubmissionWritable({
+        storage: getStorage(),
+        submissionId: context.request.submission_id,
+      });
 
-    try {
-      const token = String(request.headers['x-secure-upload-token'] || '').trim();
-      const context = await getSecureUploadContext(token, { recoverStale: true });
+      context = await getSecureUploadContext(token, { recoverStale: true });
 
       if (!context.ok) {
         response.status(400).json({ success: false, error: context.error });
@@ -600,6 +604,25 @@ export function createApp({
 
       request.secureUploadToken = token;
       request.secureUploadContext = context;
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
+  app.use('/api/secure-documents/upload', async (request, response, next) => {
+    if (request.method !== 'POST') {
+      next();
+      return;
+    }
+
+    try {
+      const result = await enforceSecureUploadBodyRateLimit(request);
+
+      if (!result.ok) {
+        response.status(result.status || 429).json({ success: false, error: result.error });
+        return;
+      }
+
       next();
     } catch (error) {
       next(error);
@@ -1003,6 +1026,21 @@ export function createApp({
   );
 
   app.get(
+    '/api/admin/crm-duplicates',
+    asyncRoute(async (request, response) => {
+      if (!await requireAdminAccess(request)) {
+        response.status(401).json({ success: false, error: 'Unauthorized.' });
+        return;
+      }
+
+      response.json({
+        success: true,
+        report: await getCrmDuplicateReview(),
+      });
+    }),
+  );
+
+  app.get(
     '/api/admin/follow-ups',
     asyncRoute(async (request, response) => {
       if (!await requireAdminAccess(request)) {
@@ -1297,6 +1335,7 @@ export function createApp({
         .filter(Boolean);
       const events = await listCrmActivity({
         submissionId: request.params.id,
+        historySubmissionIds: submission.supersession?.historySubmissionIds || [request.params.id],
         eventTypes,
         limit: Number(request.query.limit) || 200,
         before: String(request.query.before || ''),
@@ -1322,6 +1361,7 @@ export function createApp({
 
       const result = await listCrmCommunications({
         submissionId: submission.id,
+        historySubmissionIds: submission.supersession?.historySubmissionIds || [submission.id],
         page: Number(request.query.page) || 1,
         pageSize: Number(request.query.pageSize) || 25,
         before: String(request.query.before || ''),
@@ -1961,6 +2001,7 @@ export function createApp({
 
       const result = await passTriageOpportunity({
         opportunityId,
+        submissionId: request.body?.submissionId || '',
         reason: request.body?.reason,
         note: request.body?.note,
         actor: session.username || 'admin',

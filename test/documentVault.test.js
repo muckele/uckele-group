@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
+import Database from 'better-sqlite3';
+import { createHash } from 'node:crypto';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-document-vault-'));
 
@@ -19,6 +21,7 @@ const {
   deleteSecureDocument,
   getSecureDocumentDownload,
   getSecureUploadContext,
+  listCrmDocumentHistory,
   revokeSecureUploadRequest,
   uploadSecureDocuments,
 } = await import('../server/services/documentVault.js');
@@ -30,6 +33,13 @@ const {
 } = await import('../server/services/secureDocumentCleanupState.js');
 const { getStorage } = await import('../server/storage/index.js');
 const { signPayload } = await import('../server/utils/security.js');
+const { CrmSubmissionSupersededError } = await import('../server/services/crmSubmissionSupersession.js');
+
+const writableSubmissionGuard = {
+  async assertCrmSubmissionWritable() {
+    return { isSuperseded: false };
+  },
+};
 
 after(() => {
   fs.rmSync(tempDir, { force: true, recursive: true });
@@ -58,12 +68,82 @@ function readCleanupSidecars() {
     });
 }
 
+function applicationTableDigest(sqlitePath = process.env.SQLITE_PATH) {
+  const database = new Database(sqlitePath, { readonly: true, fileMustExist: true });
+  try {
+    const tables = database.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `).all().map(({ name }) => name);
+    const snapshot = Object.fromEntries(tables.map((name) => [
+      name,
+      database.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all(),
+    ]));
+    return createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
+  } finally {
+    database.close();
+  }
+}
+
+function secureDocumentFilesystemDigest(root = process.env.SECURE_DOCUMENTS_STORAGE_DIR) {
+  if (!fs.existsSync(root)) return createHash('sha256').update('missing').digest('hex');
+  const entries = [];
+  const visit = (directory) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+      const entryPath = path.join(directory, entry.name);
+      const relative = path.relative(root, entryPath);
+      if (entry.isDirectory()) {
+        entries.push(['directory', relative, fs.statSync(entryPath).mode & 0o777]);
+        visit(entryPath);
+      } else {
+        entries.push([
+          'file',
+          relative,
+          fs.statSync(entryPath).mode & 0o777,
+          createHash('sha256').update(fs.readFileSync(entryPath)).digest('hex'),
+        ]);
+      }
+    }
+  };
+  visit(root);
+  return createHash('sha256').update(JSON.stringify(entries)).digest('hex');
+}
+
 function afterCleanupSettlement(options = {}) {
   return {
     ...options,
     now: new Date(Date.now() + secureDocumentCleanupSettlementMs + 1000).toISOString(),
   };
 }
+
+test('read-only document history preserves stored ownership while adding origin provenance', async () => {
+  const uploadRequests = [
+    { id: 'request-loser', submission_id: 'loser', created_at: '2026-09-17T11:00:00.000Z' },
+    { id: 'request-survivor', submission_id: 'survivor', created_at: '2026-09-17T10:00:00.000Z' },
+  ];
+  const documents = [
+    { id: 'document-loser', submission_id: 'loser', created_at: '2026-09-17T11:00:00.000Z' },
+    { id: 'document-survivor', submission_id: 'survivor', created_at: '2026-09-17T10:00:00.000Z' },
+  ];
+  const storage = {
+    async listLatestSecureUploadRequestsForSubmissions(ids) {
+      assert.deepEqual(ids, ['survivor', 'loser']);
+      return uploadRequests;
+    },
+    async listSecureDocumentsForSubmissions(ids) {
+      assert.deepEqual(ids, ['survivor', 'loser']);
+      return documents;
+    },
+  };
+  const result = await listCrmDocumentHistory({
+    submissionId: 'survivor', historySubmissionIds: ['survivor', 'loser'], storage,
+  });
+  assert.deepEqual(result.uploadRequests.map((row) => row.originSubmissionId), ['loser', 'survivor']);
+  assert.deepEqual(result.documents.map((row) => row.originSubmissionId), ['loser', 'survivor']);
+  assert.deepEqual(uploadRequests.map((row) => row.submission_id), ['loser', 'survivor']);
+  assert.deepEqual(documents.map((row) => row.submission_id), ['loser', 'survivor']);
+});
 
 async function createUploadToken(email = 'broker@example.com') {
   const submissionResult = await createManualSubmission(
@@ -294,6 +374,7 @@ test('dashboard submission delete keeps CRM record when secure file staging fail
   let cleanupJob = null;
   const result = await deleteDashboardSubmission('cleanup-failure-submission', {
     storage: {
+      ...writableSubmissionGuard,
       async getSubmission(id) {
         return { id };
       },
@@ -333,6 +414,7 @@ test('dashboard submission delete restores staged files when database deletion f
   fs.writeFileSync(documentPath, 'recoverable diligence document');
   let cleanupJob = null;
   const storage = {
+    ...writableSubmissionGuard,
     async getSubmission(id) {
       return { id };
     },
@@ -374,6 +456,7 @@ test('dashboard submission delete restores staged files when database deletion f
 test('dashboard submission delete reports a fresh CIM transmission lease as a retryable conflict', async () => {
   const result = await deleteDashboardSubmission('active-cim-delete-submission', {
     storage: {
+      ...writableSubmissionGuard,
       async getSubmission(id) {
         return { id };
       },
@@ -400,6 +483,7 @@ test('dashboard submission delete rejects secure document paths outside the vaul
   let unlinkCalled = false;
   const result = await deleteDashboardSubmission('outside-vault-submission', {
     storage: {
+      ...writableSubmissionGuard,
       async getSubmission(id) {
         return { id };
       },
@@ -431,6 +515,7 @@ test('failed post-delete purges are persisted and reconciled later', async () =>
   let submission = { id: 'queued-cleanup-submission' };
   let cleanupJob = null;
   const storage = {
+    ...writableSubmissionGuard,
     async getSubmission() {
       return submission;
     },
@@ -484,6 +569,7 @@ test('a missing secure file does not prevent later files from being staged and p
   let cleanupJob = null;
   const result = await deleteDashboardSubmission('missing-first-file-submission', {
     storage: {
+      ...writableSubmissionGuard,
       async getSubmission(id) {
         return { id };
       },
@@ -520,6 +606,7 @@ test('falsey database deletion reports a restore failure instead of a 404', asyn
   let cleanupJob = null;
   const result = await deleteDashboardSubmission('falsey-delete-submission', {
     storage: {
+      ...writableSubmissionGuard,
       async getSubmission(id) {
         return { id };
       },
@@ -854,10 +941,11 @@ test('ambiguous upload writes a private recovery sidecar when cleanup storage is
 });
 
 test('secure upload attempts are rate limited by token and source', async () => {
+  const { token } = await createUploadToken('rate-limited-valid-token@example.com');
   const request = requestFromIp('192.0.2.30');
   const body = {
-    token: 'not-a-real-token',
-    ndaAccepted: true,
+    token,
+    ndaAccepted: false,
     request,
     documents: [
       {
@@ -929,6 +1017,214 @@ test('admin can revoke an upload link and delete one secure document', async () 
   assert.equal(revoked.ok, true);
   assert.equal(revoked.request.status, 'revoked');
   assert.equal((await getSecureUploadContext(token)).ok, false);
+});
+
+test('individual document deletion refuses loser-owned history before cleanup staging or activity', async () => {
+  const storageDir = process.env.SECURE_DOCUMENTS_STORAGE_DIR;
+  const sourcePath = path.join(storageDir, 'historical-loser-document.txt');
+  fs.mkdirSync(storageDir, { recursive: true });
+  fs.writeFileSync(sourcePath, 'historical evidence');
+  const document = {
+    id: 'historical-loser-document',
+    submission_id: 'loser-id',
+    original_name: 'historical-loser-document.txt',
+    document_type: 'other',
+    storage_path: sourcePath,
+  };
+  let cleanupJobWrites = 0;
+  let activityMutations = 0;
+  const cleanupSidecarsBefore = readCleanupSidecars();
+  const storage = {
+    async getSecureDocument(id) {
+      return id === document.id ? document : null;
+    },
+    async assertCrmSubmissionWritable(submissionId) {
+      assert.equal(submissionId, 'loser-id');
+      throw new CrmSubmissionSupersededError({
+        submissionId,
+        survivorSubmissionId: 'survivor-id',
+        opportunityId: 'opportunity-id',
+      });
+    },
+    async insertSecureDocumentCleanupJob() {
+      cleanupJobWrites += 1;
+      throw new Error('cleanup intent must not be written');
+    },
+    async mutateWithCrmActivity() {
+      activityMutations += 1;
+      throw new Error('document/activity mutation must not run');
+    },
+  };
+
+  await assert.rejects(
+    deleteSecureDocument({ documentId: document.id, deletedBy: 'admin-test', storage }),
+    {
+      code: 'CRM_SUBMISSION_SUPERSEDED',
+      status: 409,
+      submissionId: 'loser-id',
+      survivorSubmissionId: 'survivor-id',
+      opportunityId: 'opportunity-id',
+    },
+  );
+  assert.equal(cleanupJobWrites, 0);
+  assert.equal(activityMutations, 0);
+  assert.equal(fs.existsSync(sourcePath), true);
+  assert.equal(fs.readFileSync(sourcePath, 'utf8'), 'historical evidence');
+  assert.deepEqual(readCleanupSidecars(), cleanupSidecarsBefore);
+});
+
+test('valid loser upload token refuses before rate-limit, database, or filesystem mutation while survivor upload remains enabled', async () => {
+  const storage = getStorage();
+  const survivorResult = await createManualSubmission({
+    company: 'Upload Survivor Control', seller_name: 'Survivor', seller_email: 'upload-survivor-control@example.com',
+  }, 'admin-test');
+  const loserResult = await createManualSubmission({
+    company: 'Upload Historical Duplicate', seller_name: 'Loser', seller_email: 'upload-historical-duplicate@example.com',
+  }, 'admin-test');
+  assert.equal(survivorResult.ok, true);
+  assert.equal(loserResult.ok, true);
+
+  const opportunityId = 'document-vault-supersession-opportunity';
+  await storage.updateSubmission(survivorResult.submission.id, {
+    updated_at: new Date().toISOString(),
+    deal_hunter_opportunity_id: opportunityId,
+  });
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: opportunityId,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    canonical_name: 'Upload Survivor Control',
+    canonical_recipient: 'upload-survivor-control@example.com',
+    canonical_location: null,
+    primary_submission_id: survivorResult.submission.id,
+    identity_version: 'document-vault-test-v1',
+    status: 'active',
+    metadata: {},
+  });
+
+  const loserRequest = await createSecureUploadRequest({
+    submissionId: loserResult.submission.id,
+    requestedBy: 'admin-test',
+    sendEmail: false,
+    request: requestFromIp('192.0.2.201'),
+  });
+  assert.equal(loserRequest.ok, true);
+  const loserToken = new URL(loserRequest.uploadUrl).searchParams.get('token');
+  const receiptDigest = 'd'.repeat(64);
+  await storage.upsertDealHunterCimRepairManifest({
+    id: 'document-vault-supersession-receipt',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    mode: 'crm-duplicate-consolidation',
+    status: 'applied',
+    actor: 'test',
+    backup_reference: 'fixture',
+    checksum: receiptDigest,
+    manifest: { version: 1 },
+    metadata: {},
+  });
+  const database = new Database(process.env.SQLITE_PATH);
+  database.prepare(`
+    INSERT INTO crm_submission_supersessions (
+      id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
+      opportunity_id, reason_code, reason_text, approved_by, approved_at, actor,
+      repair_version, repair_manifest_id, repair_digest, metadata
+    ) VALUES (?, ?, ?, 'active', ?, ?, ?, 'confirmed-duplicate', ?, ?, ?, ?, ?, ?, ?, '{}')
+  `).run(
+    'document-vault-supersession-relation',
+    new Date().toISOString(),
+    new Date().toISOString(),
+    survivorResult.submission.id,
+    loserResult.submission.id,
+    opportunityId,
+    'Reviewed duplicate upload test.',
+    'owner@example.test',
+    new Date().toISOString(),
+    'test',
+    'document-vault-test-v1',
+    'document-vault-supersession-receipt',
+    receiptDigest,
+  );
+  database.close();
+
+  const beforeDatabaseDigest = applicationTableDigest();
+  const beforeFilesystemDigest = secureDocumentFilesystemDigest();
+  const beforeRateLimitRows = new Database(process.env.SQLITE_PATH, { readonly: true, fileMustExist: true });
+  const rateLimitCount = Number(beforeRateLimitRows.prepare('SELECT COUNT(*) AS count FROM contact_rate_limit_events').get().count);
+  beforeRateLimitRows.close();
+
+  const historicalContext = await getSecureUploadContext(loserToken);
+  assert.equal(historicalContext.ok, true, 'access-token context remains a read-only historical projection');
+  assert.equal(historicalContext.request.submission_id, loserResult.submission.id);
+  assert.equal(applicationTableDigest(), beforeDatabaseDigest, 'read-only loser token context must not mutate business tables');
+  assert.equal(secureDocumentFilesystemDigest(), beforeFilesystemDigest);
+
+  await assert.rejects(
+    () => createSecureUploadRequest({
+      submissionId: loserResult.submission.id,
+      requestedBy: 'admin-test',
+      sendEmail: false,
+      request: requestFromIp('192.0.2.205'),
+    }),
+    {
+      code: 'CRM_SUBMISSION_SUPERSEDED',
+      submissionId: loserResult.submission.id,
+      survivorSubmissionId: survivorResult.submission.id,
+      opportunityId,
+    },
+  );
+  assert.equal(applicationTableDigest(), beforeDatabaseDigest, 'loser secure-request creation must refuse before durable mutation');
+  assert.equal(secureDocumentFilesystemDigest(), beforeFilesystemDigest);
+
+  await assert.rejects(
+    () => uploadSecureDocuments({
+      token: loserToken,
+      ndaAccepted: true,
+      request: requestFromIp('192.0.2.202'),
+      documents: [{
+        name: 'must-not-write.txt',
+        mimeType: 'text/plain',
+        contentBase64: Buffer.from('must not persist').toString('base64'),
+      }],
+    }),
+    {
+      code: 'CRM_SUBMISSION_SUPERSEDED',
+      status: 409,
+      submissionId: loserResult.submission.id,
+      survivorSubmissionId: survivorResult.submission.id,
+      opportunityId,
+    },
+  );
+
+  assert.equal(applicationTableDigest(), beforeDatabaseDigest, 'loser upload refusal must preserve every application table');
+  assert.equal(secureDocumentFilesystemDigest(), beforeFilesystemDigest, 'loser upload refusal must not create or change files');
+  const afterRateLimitRows = new Database(process.env.SQLITE_PATH, { readonly: true, fileMustExist: true });
+  assert.equal(
+    Number(afterRateLimitRows.prepare('SELECT COUNT(*) AS count FROM contact_rate_limit_events').get().count),
+    rateLimitCount,
+    'valid loser-token refusal must precede durable rate-limit bookkeeping',
+  );
+  afterRateLimitRows.close();
+
+  const survivorRequest = await createSecureUploadRequest({
+    submissionId: survivorResult.submission.id,
+    requestedBy: 'admin-test',
+    sendEmail: false,
+    request: requestFromIp('192.0.2.203'),
+  });
+  const survivorUpload = await uploadSecureDocuments({
+    token: new URL(survivorRequest.uploadUrl).searchParams.get('token'),
+    ndaAccepted: true,
+    request: requestFromIp('192.0.2.204'),
+    documents: [{
+      name: 'survivor-control.txt',
+      mimeType: 'text/plain',
+      contentBase64: Buffer.from('survivor write remains enabled').toString('base64'),
+    }],
+  });
+  assert.equal(survivorUpload.ok, true);
+  assert.equal(survivorUpload.documents.length, 1);
+  assert.equal(survivorUpload.documents[0].submission_id, survivorResult.submission.id);
 });
 
 test('individual deletion persists a write-ahead cleanup intent before staging the file', async () => {
@@ -1930,6 +2226,7 @@ test('dashboard deletion retains staged files whenever its commit response is am
   let cleanupJob = null;
   const storage = {
     provider: 'supabase',
+    ...writableSubmissionGuard,
     async getSubmissionStrict() {
       return { id: submissionId };
     },

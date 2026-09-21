@@ -13,9 +13,9 @@ import {
   fingerprintDealHunterCrmIntegrityF02RawRow,
 } from '../repairs/dealHunterCrmIntegrityF02.js';
 import { auditDealHunterCrmIntegrity } from './dealHunter.js';
+import { findUnsupportedCrmIntegrityRepairTargetTriggers } from './dealHunterCrmIntegrityRepairTargetTriggers.js';
 import { verifyBackupBundle } from './backups.js';
 
-const targetTables = ['contact_submissions', 'deal_hunter_crm_imports'];
 const requiredColumns = {
   contact_submissions: [
     'id', 'created_at', 'updated_at', 'status', 'source', 'company',
@@ -136,16 +136,6 @@ function validateSchema(database) {
     }
   }
   return blockers;
-}
-
-function targetTriggerBlockers(database) {
-  const triggers = database.prepare(`
-    SELECT name, tbl_name
-    FROM sqlite_schema
-    WHERE type = 'trigger' AND tbl_name IN (?, ?)
-    ORDER BY name
-  `).all(...targetTables);
-  return triggers.map((trigger) => `UNSUPPORTED_TARGET_TRIGGER:${trigger.tbl_name}:${trigger.name}`);
 }
 
 function selectAuthorityRows(database, authority) {
@@ -333,7 +323,10 @@ async function analyzeOpenDatabase(database, {
   generatedAt,
   receipt,
 }) {
-  const blockers = [...validateSchema(database), ...targetTriggerBlockers(database)];
+  const blockers = [
+    ...validateSchema(database),
+    ...findUnsupportedCrmIntegrityRepairTargetTriggers(database),
+  ];
   if (blockers.length > 0) return { status: 'refused', blockers };
 
   const selected = selectAuthorityRows(database, authority);

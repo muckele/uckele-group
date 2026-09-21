@@ -35,6 +35,7 @@ import {
   manualFollowUpPreviousAcceptedAt,
   manualFollowUpTerminalAuthority as authorityTerminal,
 } from './dealHunterManualFollowUpEligibility.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 import { buildDealHunterCimFollowUpEmail } from './delivery.js';
 import { getEmailReadiness } from './emailReadiness.js';
 
@@ -190,11 +191,17 @@ function defaultGreeting(authority) {
   return name ? `Hello ${name},` : 'Hello,';
 }
 
-function requestBelongsToRoute(authority, opportunityId, requestId) {
+function requestBelongsToStableRoute(authority, opportunityId, requestId) {
   return Boolean(
     authority.request
     && authority.request.id === requestId
-    && authority.request.opportunity_id === opportunityId
+    && authority.request.opportunity_id === opportunityId,
+  );
+}
+
+function requestBelongsToRoute(authority, opportunityId, requestId) {
+  return Boolean(
+    requestBelongsToStableRoute(authority, opportunityId, requestId)
     && authority.existingRequest?.id === requestId
     && text(authority.opportunity?.status, 80).toLowerCase() === 'active'
     && authority.submission
@@ -221,7 +228,7 @@ export async function loadDealHunterManualFollowUpAuthority({
   const submission = request?.submission_id === brokerAuthority.submission?.id
     ? brokerAuthority.submission
     : request?.submission_id
-      ? await storage.getSubmission?.(request.submission_id)
+      ? await (storage.getSubmissionStrict || storage.getSubmission)?.call(storage, request.submission_id)
       : null;
   const communications = (Array.isArray(brokerAuthority.communications) ? brokerAuthority.communications : [])
     .filter((item) => !request || item.cim_request_id === request.id);
@@ -332,6 +339,7 @@ export async function startDealHunterManualFollowUps({
   try { parseManualFollowUpStartInput(input); } catch (error) { return publicFailure('invalid_start_input', error.message, 400); }
   if (!isAdministrator(session)) return publicFailure('administrator_required', 'Administrator access is required.', 403);
   const authority = await loadDealHunterManualFollowUpAuthority({ opportunityId, requestId, storage, now, dependencies });
+  if (authority.submission?.id) await assertCrmSubmissionWritable({ storage, submissionId: authority.submission.id });
   const eligibility = evaluateManualFollowUpStartEligibility(authority);
   if (!eligibility.eligible) {
     return publicFailure(eligibility.failure.code, eligibility.failure.message, eligibility.failure.status);
@@ -369,12 +377,14 @@ export async function stopDealHunterManualFollowUps({
   try { parsed = parseManualFollowUpStopInput(input ?? (reason === undefined ? {} : { reason })); } catch (error) { return publicFailure('invalid_stop_input', error.message, 400); }
   if (!isAdministrator(session)) return publicFailure('administrator_required', 'Administrator access is required.', 403);
   const authority = await loadDealHunterManualFollowUpAuthority({ opportunityId, requestId, storage, now, dependencies });
-  if (!requestBelongsToRoute(authority, text(opportunityId, 200), text(requestId, 200))) return routeFailure(authority);
+  if (!requestBelongsToStableRoute(authority, text(opportunityId, 200), text(requestId, 200))) return routeFailure(authority);
   if (!isOperatorApprovedFollowUpRequest(authority.request)) return publicFailure('approval_required', 'This request is not enrolled in manual follow-ups.');
   if (authority.request.follow_up_state === 'completed' || Number(authority.request.follow_up_count) >= 5) return publicFailure('already_finalized', 'The follow-up sequence is complete.');
   if (authority.request.follow_up_state === 'stopped' || authority.request.metadata?.manualFollowUp?.stoppedAt) {
     return { success: true, status: 200, canonicalOpportunityId: authority.opportunityId, requestId: authority.request.id, followUps: projection(authority) };
   }
+  if (authority.submission?.id) await assertCrmSubmissionWritable({ storage, submissionId: authority.submission.id });
+  if (!requestBelongsToRoute(authority, text(opportunityId, 200), text(requestId, 200))) return routeFailure(authority);
   const stoppedAt = authority.now.toISOString();
   const actor = session.username || session.principal_id;
   const result = await storage.stopDealHunterManualFollowUps({
@@ -601,6 +611,7 @@ export async function prepareDealHunterManualFollowUp({
     return publicFailure('authenticated_access_required', 'Authenticated admin access is required.', 403);
   }
   const authority = await loadDealHunterManualFollowUpAuthority({ opportunityId, requestId, storage, now, dependencies });
+  if (authority.submission?.id) await assertCrmSubmissionWritable({ storage, submissionId: authority.submission.id });
   if (!requestBelongsToRoute(authority, text(opportunityId, 200), text(requestId, 200))) return routeFailure(authority);
   if (criticalAuthorityUnavailable(authority)) return publicFailure('authority_unavailable', 'Current follow-up authority could not be verified.', 503);
   if (!isOperatorApprovedFollowUpRequest(authority.request)) return publicFailure('approval_required', 'This request is not enrolled in human-approved follow-ups.');
@@ -713,7 +724,7 @@ export async function approveDealHunterManualFollowUp({
     return publicFailure('proposal_digest_mismatch', 'The approved proposal digest does not match the signed preparation.');
   }
   const authority = await loadDealHunterManualFollowUpAuthority({ opportunityId: canonicalOpportunityId, requestId: canonicalRequestId, storage, now: at, dependencies });
-  if (!requestBelongsToRoute(authority, canonicalOpportunityId, canonicalRequestId)) return routeFailure(authority);
+  if (!requestBelongsToStableRoute(authority, canonicalOpportunityId, canonicalRequestId)) return routeFailure(authority);
   if (!isOperatorApprovedFollowUpRequest(authority.request)) return publicFailure('approval_required', 'This request is not enrolled in human-approved follow-ups.');
   const reconciliation = await reconcileDealHunterApprovedFollowUp({
     storage,
@@ -738,6 +749,8 @@ export async function approveDealHunterManualFollowUp({
       durableResult: durableResult(authority, reconciliation.request || authority.request, at),
     });
   }
+  if (authority.submission?.id) await assertCrmSubmissionWritable({ storage, submissionId: authority.submission.id });
+  if (!requestBelongsToRoute(authority, canonicalOpportunityId, canonicalRequestId)) return routeFailure(authority);
   if (criticalAuthorityUnavailable(authority)) return publicFailure('authority_unavailable', 'Current follow-up authority could not be verified.', 503);
   if (authority.ambiguous) return publicFailure('outcome_unresolved', 'The provider outcome is unresolved. Check status; retransmission is prohibited.');
   if (authority.terminal) return publicFailure('blocked', authority.terminal.message);

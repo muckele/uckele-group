@@ -530,6 +530,7 @@ function recommendationStorage({ suppression = null, communications = [communica
   let communicationRows = communications;
   const fixtureSubmission = submission(submissionOverrides);
   return {
+    async assertCrmSubmissionWritable() {},
     get insertCount() { return insertCount; },
     setCommunications(rows) { communicationRows = rows; },
     async getSubmission() { return fixtureSubmission; },

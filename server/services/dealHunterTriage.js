@@ -900,6 +900,7 @@ function publicPassDisposition(disposition = {}) {
 
 export async function passTriageOpportunity({
   opportunityId = '',
+  submissionId = '',
   reason = '',
   note = '',
   actor = 'admin',
@@ -927,6 +928,7 @@ export async function passTriageOpportunity({
   const normalizedActor = normalizeText(actor, 160) || 'admin';
   const result = await storage.passDealHunterOpportunity({
     opportunityId: id,
+    submissionId: normalizeText(submissionId, 120),
     reason: normalizedReason,
     note: note?.trim() || '',
     actor: normalizedActor,
@@ -1084,7 +1086,14 @@ export async function dismissDealHunterOpportunityWithInboxAuthority({
   const authority = await resolveDealHunterDispositionAuthority({ dealKey, storage });
   if (!authority.ok) return authority;
   if (authority.canonical) {
-    return passTriageOpportunity({ opportunityId: authority.opportunityId, reason, note, actor, storage });
+    return passTriageOpportunity({
+      opportunityId: authority.opportunityId,
+      submissionId,
+      reason,
+      note,
+      actor,
+      storage,
+    });
   }
   return dismissDealHunterOpportunity({
     dealKey: authority.dealKey, listingUrl, dealName, reason, note, submissionId, actor, storage,

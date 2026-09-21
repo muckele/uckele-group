@@ -190,7 +190,9 @@ async function captureCollectorPrivateCompleteSheetAdmission(snapshot) {
 
 function withStorage(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-opportunity-facts-'));
-  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'facts.sqlite') } });
+  const sqlitePath = path.join(directory, 'facts.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  storage.testSqlitePath = sqlitePath;
   t.after(() => {
     storage.close();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -2327,6 +2329,19 @@ test('canonical-merge inspection classifies and preserves opportunity-owned fact
     inventory.get('deal_hunter_opportunity_source_observations.source_id')?.category,
     CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
   );
+  for (const column of [
+    'survivor_submission_id',
+    'superseded_submission_id',
+    'opportunity_id',
+    'repair_manifest_id',
+    'reversal_manifest_id',
+    'metadata',
+  ]) {
+    assert.equal(
+      inventory.get(`crm_submission_supersessions.${column}`)?.scannerPath,
+      'dependentState.records.crmSubmissionSupersessions',
+    );
+  }
 
   await assert.rejects(
     storage.inspectDealHunterCanonicalOpportunityMerge({

@@ -967,12 +967,12 @@ export async function authorizeCimStage2SendBoundary({
   storage = getStorage(), config = getConfig(), now = new Date(), statusCheck = getCimAutomationStatus,
 } = {}) {
   if (!decisionId || !runId || !activationId || !claimToken) return { ok: false, code: 'stage2_authorization_missing', error: 'A durable Stage 2 decision authorization is required.' };
-  const [decision, run, activation, status, currentOpportunity] = await Promise.all([
+  const [decision, run, activation, status, submissionAuthority] = await Promise.all([
     storage.getCimStage2Decision?.(decisionId),
     storage.getCimStage2Run?.({ id: runId }),
     storage.getCurrentCimStage2Activation?.(),
     statusCheck({ storage, config, now }),
-    storage.getCurrentDealHunterOpportunity?.(normalizeText(deal.opportunityId, 160)),
+    storage.getCimStage2SubmissionAuthority?.(normalizeText(deal.opportunityId, 160)),
   ]);
   const policy = getCimStage2Policy(config);
   const expectedSnapshot = cimStage2SnapshotDigest(deal);
@@ -995,8 +995,9 @@ export async function authorizeCimStage2SendBoundary({
     ['wrong_mode', ['canary', 'active'].includes(run?.mode) && run?.mode === activation?.mode],
     ['wrong_policy', decision?.policy_hash === policy.policyHash && run?.policy_hash === policy.policyHash && activation?.policy_hash === policy.policyHash],
     ['wrong_opportunity', decision?.opportunity_id === normalizeText(deal.opportunityId, 160)],
-    ['opportunity_not_current', currentOpportunity?.status === 'active'
-      && currentOpportunity?.opportunity_id === normalizeText(deal.opportunityId, 160)],
+    ['opportunity_not_current', submissionAuthority?.opportunity?.status === 'active'
+      && submissionAuthority?.opportunity?.opportunity_id === normalizeText(deal.opportunityId, 160)],
+    ['opportunity_primary_superseded', submissionAuthority?.primarySubmissionWritable === true],
     ['wrong_recipient', decision?.recipient_hash === hashCimStage2Recipient(deal.brokerEmail)],
     ['wrong_snapshot', decision?.snapshot_digest === expectedSnapshot && snapshotDigest === expectedSnapshot],
     ['wrong_source_snapshot', decision?.source_snapshot_digest === sourceSnapshotDigestForDeal(deal)],

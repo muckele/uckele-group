@@ -1,6 +1,47 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { buildCsv, diligenceReviewsEqual, normalizeCrmUrl, normalizeDiligenceReview } from '../server/services/submissions.js';
+import {
+  buildCsv,
+  deleteDashboardSubmission,
+  diligenceReviewsEqual,
+  normalizeCrmUrl,
+  normalizeDiligenceReview,
+  updateSubmissionWorkflow,
+} from '../server/services/submissions.js';
+import { CrmSubmissionSupersededError } from '../server/services/crmSubmissionSupersession.js';
+
+test('submission services refuse a superseded id before lookup, cleanup, or mutation', async () => {
+  let reads = 0;
+  let deletes = 0;
+  const storage = {
+    async assertCrmSubmissionWritable(submissionId) {
+      throw new CrmSubmissionSupersededError({
+        submissionId,
+        survivorSubmissionId: 'survivor-id',
+        opportunityId: 'opportunity-id',
+      });
+    },
+    async getSubmission() {
+      reads += 1;
+      return null;
+    },
+    async deleteSubmission() {
+      deletes += 1;
+      return null;
+    },
+  };
+
+  await assert.rejects(
+    updateSubmissionWorkflow('loser-id', { expected_updated_at: '2026-09-17T18:00:00.000Z' }, { storage }),
+    { code: 'CRM_SUBMISSION_SUPERSEDED', submissionId: 'loser-id', survivorSubmissionId: 'survivor-id' },
+  );
+  await assert.rejects(
+    deleteDashboardSubmission('loser-id', { storage }),
+    { code: 'CRM_SUBMISSION_SUPERSEDED', submissionId: 'loser-id', survivorSubmissionId: 'survivor-id' },
+  );
+  assert.equal(reads, 0);
+  assert.equal(deletes, 0);
+});
 
 test('diligence review normalizer whitelists fields and preserves existing partial state', () => {
   const normalized = normalizeDiligenceReview(

@@ -258,6 +258,26 @@ const relationshipInventoryEntries = [
     reason: redundantRelationshipReason,
   }),
   ...relationshipEntries({
+    table: 'crm_submission_supersessions',
+    columns: ['opportunity_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.crmSubmissionSupersessions',
+    reason: blockingRelationshipReason,
+  }),
+  ...relationshipEntries({
+    table: 'crm_submission_supersessions',
+    columns: [
+      'survivor_submission_id',
+      'superseded_submission_id',
+      'repair_manifest_id',
+      'reversal_manifest_id',
+      'metadata',
+    ],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+    scannerPath: 'dependentState.records.crmSubmissionSupersessions',
+    reason: redundantRelationshipReason,
+  }),
+  ...relationshipEntries({
     table: 'deal_hunter_automation_settings',
     columns: ['id', 'updated_at', 'paused', 'updated_by', 'metadata'],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.PRESERVED_GLOBAL_RECIPIENT_OPERATIONAL_STATE,
@@ -1161,7 +1181,17 @@ function validateManifestNamespace(inspection, approval) {
   }
 }
 
+function validateCrmSubmissionSupersessionState(dependentState = {}) {
+  if (!Array.isArray(dependentState?.records?.crmSubmissionSupersessions)) {
+    throw new Error('Canonical opportunity merge could not inspect CRM submission supersession history completely.');
+  }
+  if (dependentState.records.crmSubmissionSupersessions.length !== 0) {
+    throw new Error('Canonical opportunity merge found unexpected dependent state: crmSubmissionSupersessions.');
+  }
+}
+
 function validateDependentState(dependentState = {}, approval = {}) {
+  validateCrmSubmissionSupersessionState(dependentState);
   const expected = approval.expectedDependentCounts || {};
   const drifted = Object.entries(dependentState.counts || {}).filter(([name, count]) => (
     Number(count) !== Number(expected[name] || 0)
@@ -1445,6 +1475,7 @@ export function buildCanonicalOpportunityMergePlan({ approval, inspection, actor
   const opportunityById = new Map((inspection?.opportunities || []).map((item) => [item.opportunity_id, item]));
   const survivor = opportunityById.get(approval.survivorId);
   const superseded = opportunityById.get(approval.supersededId);
+  validateCrmSubmissionSupersessionState(inspection.dependentState);
   validateOpportunity(survivor, approval.survivorId, approval);
   validateOpportunity(superseded, approval.supersededId, approval);
   validateOpportunityPairCompatibility(survivor, superseded, approval);

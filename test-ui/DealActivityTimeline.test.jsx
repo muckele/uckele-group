@@ -58,4 +58,13 @@ describe('DealActivityTimeline', () => {
     expect(screen.getAllByText(/\[redacted\]/)).toHaveLength(2);
     expect(screen.queryByText(/sensitive-token/)).not.toBeInTheDocument();
   });
+
+  it('labels activity retained on a different origin submission only', () => {
+    render(<DealActivityTimeline currentSubmissionId="survivor" events={[
+      { ...events[0], id: 'survivor-event', originSubmissionId: 'survivor' },
+      { ...events[1], id: 'loser-event', originSubmissionId: 'loser' },
+    ]} />);
+    expect(screen.getByText('Historical origin: loser')).toBeVisible();
+    expect(screen.queryByText('Historical origin: survivor')).not.toBeInTheDocument();
+  });
 });

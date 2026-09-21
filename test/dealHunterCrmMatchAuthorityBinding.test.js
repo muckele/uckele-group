@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test, { after } from 'node:test';
+import Database from 'better-sqlite3';
 
 import { createManualSubmission } from '../server/services/submissions.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
@@ -42,11 +43,144 @@ function sharedSqliteStorages(t) {
     protection: { rateLimitRetentionMs: 0 },
   };
   const storages = [createSqliteStorage(config), createSqliteStorage(config)];
+  storages.sqlitePath = config.storage.sqlitePath;
   t.after(() => {
     for (const storage of storages) storage.close();
     fs.rmSync(directory, { recursive: true, force: true });
   });
   return storages;
+}
+
+const supersessionDigest = 'a'.repeat(64);
+
+function withRawDatabase(sqlitePath, callback) {
+  const database = new Database(sqlitePath);
+  try {
+    return callback(database);
+  } finally {
+    database.close();
+  }
+}
+
+async function seedActiveSupersession(storage, sqlitePath, {
+  id = 'relation-loser-survivor',
+  opportunityId = 'opp-supersession',
+  survivorCompany = 'Canonical Survivor',
+  survivorListingUrl = 'https://example.test/listing/canonical-survivor',
+  loserCompany = 'Historical Loser',
+  loserListingUrl = 'https://example.test/listing/historical-loser',
+  approvedBy = 'owner@example.test',
+  repairDigest = supersessionDigest,
+} = {}) {
+  await seedOpportunity(storage, opportunityId);
+  const survivor = await seedSubmission(storage, {
+    company: survivorCompany,
+    listingUrl: survivorListingUrl,
+    opportunityId,
+  });
+  const loser = await seedSubmission(storage, {
+    company: loserCompany,
+    listingUrl: loserListingUrl,
+    opportunityId: '',
+  });
+  const timestamp = '2026-09-16T08:10:00.000Z';
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: opportunityId,
+    created_at: '2026-09-16T08:00:00.000Z',
+    updated_at: timestamp,
+    canonical_name: `Authority ${opportunityId}`,
+    canonical_recipient: null,
+    canonical_location: 'Pooler, GA',
+    primary_submission_id: survivor.id,
+    identity_version: 'crm-match-authority-test-v1',
+    status: 'active',
+    metadata: {},
+  });
+  const manifestId = `manifest-${id}`;
+  await storage.upsertDealHunterCimRepairManifest({
+    id: manifestId,
+    created_at: timestamp,
+    updated_at: timestamp,
+    mode: 'crm-duplicate-consolidation',
+    status: 'applied',
+    actor: 'authority-test',
+    backup_reference: 'disposable-test-database',
+    checksum: repairDigest,
+    manifest: { schema: 'crm-duplicate-consolidation-plan-v1' },
+    metadata: {},
+  });
+  insertSupersessionRow(sqlitePath, {
+    id,
+    timestamp,
+    survivorId: survivor.id,
+    loserId: loser.id,
+    opportunityId,
+    approvedBy,
+    manifestId,
+    repairDigest,
+  });
+  return { id, opportunityId, survivor, loser, manifestId, timestamp };
+}
+
+function insertSupersessionRow(sqlitePath, {
+  id,
+  timestamp,
+  survivorId,
+  loserId,
+  opportunityId,
+  approvedBy = 'owner@example.test',
+  manifestId,
+  repairDigest = supersessionDigest,
+}) {
+  return withRawDatabase(sqlitePath, (database) => database.prepare(`
+    INSERT INTO crm_submission_supersessions (
+      id, created_at, updated_at, status, survivor_submission_id,
+      superseded_submission_id, opportunity_id, reason_code, reason_text,
+      approved_by, approved_at, actor, repair_version, repair_manifest_id,
+      repair_digest, reversed_at, reversed_by, reversal_reason,
+      reversal_manifest_id, metadata
+    ) VALUES (?, ?, ?, 'active', ?, ?, ?, 'confirmed-duplicate', ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)
+  `).run(
+    id, timestamp, timestamp, survivorId, loserId, opportunityId,
+    'Reviewed duplicate CRM representation.', approvedBy, timestamp,
+    'authority-test', 'crm-duplicate-consolidation-v1', manifestId,
+    repairDigest, JSON.stringify({ fixture: id }),
+  ));
+}
+
+async function reverseActiveSupersession(storage, sqlitePath, relation) {
+  const reversedAt = '2026-09-16T08:20:00.000Z';
+  const reversalManifestId = `reversal-${relation.id}`;
+  await storage.upsertDealHunterCimRepairManifest({
+    id: reversalManifestId,
+    created_at: reversedAt,
+    updated_at: reversedAt,
+    mode: 'crm-duplicate-consolidation',
+    status: 'applied',
+    actor: 'authority-test-reviewer',
+    backup_reference: 'disposable-test-database',
+    checksum: supersessionDigest,
+    manifest: {
+      schema: 'crm-duplicate-consolidation-reversal-manifest-v1',
+      operation: 'reverse',
+      relationId: relation.id,
+      applyManifestId: relation.manifestId,
+      repairDigest: supersessionDigest,
+      survivorSubmissionId: relation.survivor.id,
+      supersededSubmissionId: relation.loser.id,
+      opportunityId: relation.opportunityId,
+    },
+    metadata: {},
+  });
+  withRawDatabase(sqlitePath, (database) => database.prepare(`
+    UPDATE crm_submission_supersessions
+    SET status = 'reversed', updated_at = ?, reversed_at = ?, reversed_by = ?,
+      reversal_reason = ?, reversal_manifest_id = ?
+    WHERE id = ?
+  `).run(
+    reversedAt, reversedAt, 'authority-test-reviewer',
+    'Reviewed test reversal.', reversalManifestId, relation.id,
+  ));
 }
 
 async function seedOpportunity(storage, opportunityId = 'opp-authority') {
@@ -108,7 +242,11 @@ test('SQLite CRM match authority read is complete, deterministic, bounded, and i
 
   const initial = await reader.readDealHunterCrmMatchAuthority({ limit: 5000 });
   assert.equal(initial.complete, true);
+  assert.equal(initial.revisionVersion, 'deal-hunter-crm-match-authority-v2');
   assert.equal(initial.count, 1);
+  assert.equal(initial.submissionCount, 1);
+  assert.equal(initial.supersessionCount, 0);
+  assert.deepEqual(initial.supersessions, []);
   assert.deepEqual(initial.rows.map((row) => row.id), [first.id]);
   assert.match(initial.revision, /^[a-f0-9]{64}$/);
 
@@ -167,6 +305,261 @@ test('SQLite CRM match authority read is complete, deterministic, bounded, and i
   assert.equal(bounded.revision, null);
 });
 
+test('SQLite CRM match authority v2 binds the complete ordered active supersession projection and independent bounds', async (t) => {
+  const storages = sharedSqliteStorages(t);
+  const [reader] = storages;
+  const first = await seedActiveSupersession(reader, storages.sqlitePath, {
+    id: 'relation-z',
+    opportunityId: 'opp-z',
+    approvedBy: 'z-owner@example.test',
+  });
+  const beforeSecond = await reader.readDealHunterCrmMatchAuthority({ limit: 5000, supersessionLimit: 5000 });
+  assert.equal(beforeSecond.complete, true);
+  assert.equal(beforeSecond.submissionCount, 2);
+  assert.equal(beforeSecond.supersessionCount, 1);
+  assert.deepEqual(beforeSecond.supersessions.map((relation) => relation.id), ['relation-z']);
+  assert.equal(beforeSecond.supersessions[0].approvedBy, 'z-owner@example.test');
+  assert.equal(beforeSecond.supersessions[0].repairDigest, supersessionDigest);
+
+  withRawDatabase(storages.sqlitePath, (database) => {
+    database.exec('DROP TRIGGER trg_crm_submission_supersessions_immutable_update');
+    database.prepare(`
+      UPDATE crm_submission_supersessions SET approved_by = ? WHERE id = ?
+    `).run('changed-owner@example.test', first.id);
+  });
+  const approvalChanged = await reader.readDealHunterCrmMatchAuthority({ limit: 5000, supersessionLimit: 5000 });
+  assert.notEqual(approvalChanged.revision, beforeSecond.revision);
+  withRawDatabase(storages.sqlitePath, (database) => database.prepare(`
+    UPDATE crm_submission_supersessions SET repair_digest = ? WHERE id = ?
+  `).run('c'.repeat(64), first.id));
+  const digestChanged = await reader.readDealHunterCrmMatchAuthority({ limit: 5000, supersessionLimit: 5000 });
+  assert.notEqual(digestChanged.revision, approvalChanged.revision);
+  withRawDatabase(storages.sqlitePath, (database) => database.prepare(`
+    UPDATE crm_submission_supersessions
+    SET repair_digest = ?, reason_text = ?, metadata = ?
+    WHERE id = ?
+  `).run(
+    supersessionDigest,
+    'Changed reviewed tuple text.',
+    '{"fixture":"relation-z", "byteSensitive":true}',
+    first.id,
+  ));
+  const tupleAndMetadataChanged = await reader.readDealHunterCrmMatchAuthority({
+    limit: 5000,
+    supersessionLimit: 5000,
+  });
+  assert.notEqual(tupleAndMetadataChanged.revision, digestChanged.revision);
+
+  await seedActiveSupersession(reader, storages.sqlitePath, {
+    id: 'relation-a',
+    opportunityId: 'opp-a',
+    approvedBy: 'a-owner@example.test',
+    repairDigest: 'b'.repeat(64),
+  });
+  const withSecond = await reader.readDealHunterCrmMatchAuthority({ limit: 5000, supersessionLimit: 5000 });
+  assert.equal(withSecond.complete, true);
+  assert.equal(withSecond.submissionCount, 4);
+  assert.equal(withSecond.supersessionCount, 2);
+  assert.deepEqual(withSecond.supersessions.map((relation) => relation.id), ['relation-a', 'relation-z']);
+  assert.notEqual(withSecond.revision, beforeSecond.revision);
+
+  const contactBound = await reader.readDealHunterCrmMatchAuthority({ limit: 3, supersessionLimit: 5000 });
+  assert.equal(contactBound.complete, false);
+  assert.equal(contactBound.revision, null);
+  const supersessionBound = await reader.readDealHunterCrmMatchAuthority({ limit: 5000, supersessionLimit: 1 });
+  assert.equal(supersessionBound.complete, false);
+  assert.equal(supersessionBound.revision, null);
+
+  await reverseActiveSupersession(reader, storages.sqlitePath, first);
+  const afterReversal = await reader.readDealHunterCrmMatchAuthority({ limit: 5000, supersessionLimit: 5000 });
+  assert.equal(afterReversal.complete, true);
+  assert.equal(afterReversal.supersessionCount, 1);
+  assert.deepEqual(afterReversal.supersessions.map((relation) => relation.id), ['relation-a']);
+  assert.notEqual(afterReversal.revision, withSecond.revision);
+});
+
+test('SQLite CRM match authority refuses rather than hashing a 5,000-row contact prefix', async (t) => {
+  const storages = sharedSqliteStorages(t);
+  const [storage] = storages;
+  withRawDatabase(storages.sqlitePath, (database) => database.exec(`
+    WITH RECURSIVE sequence(value) AS (
+      VALUES(1)
+      UNION ALL
+      SELECT value + 1 FROM sequence WHERE value < 5001
+    )
+    INSERT INTO contact_submissions (
+      id, created_at, updated_at, status, delivery_provider, delivery_status,
+      crm_status, source, ip_hash, name, email, message, metadata
+    )
+    SELECT
+      printf('bounded-contact-%05d', value),
+      '2026-09-16T08:00:00.000Z', '2026-09-16T08:00:00.000Z', 'review',
+      'manual', 'not-applicable', 'not-applicable', 'authority-bound-test', '',
+      printf('Bounded contact %05d', value),
+      printf('bounded-%05d@example.test', value),
+      'Complete-set authority bound fixture.', '{}'
+    FROM sequence;
+  `));
+
+  const authority = await storage.readDealHunterCrmMatchAuthority({
+    limit: 5000,
+    supersessionLimit: 5000,
+  });
+  assert.equal(authority.complete, false);
+  assert.equal(authority.submissionCount, null);
+  assert.equal(authority.supersessionCount, null);
+  assert.deepEqual(authority.rows, []);
+  assert.equal(authority.revision, null);
+});
+
+test('SQLite CRM match authority succeeds at the exact 5,000-contact boundary', async (t) => {
+  const storages = sharedSqliteStorages(t);
+  const [storage] = storages;
+  withRawDatabase(storages.sqlitePath, (database) => database.exec(`
+    WITH RECURSIVE sequence(value) AS (
+      VALUES(1)
+      UNION ALL
+      SELECT value + 1 FROM sequence WHERE value < 5000
+    )
+    INSERT INTO contact_submissions (
+      id, created_at, updated_at, status, delivery_provider, delivery_status,
+      crm_status, source, ip_hash, name, email, message, metadata
+    )
+    SELECT
+      printf('boundary-contact-%05d', value),
+      '2026-09-16T08:00:00.000Z', '2026-09-16T08:00:00.000Z', 'review',
+      'manual', 'not-applicable', 'not-applicable', 'authority-bound-test', '',
+      printf('Boundary contact %05d', value),
+      printf('boundary-%05d@example.test', value),
+      'Exact complete-set authority boundary fixture.', '{}'
+    FROM sequence;
+  `));
+
+  const authority = await storage.readDealHunterCrmMatchAuthority({
+    limit: 5000,
+    supersessionLimit: 5000,
+  });
+  assert.equal(authority.complete, true);
+  assert.equal(authority.submissionCount, 5000);
+  assert.equal(authority.supersessionCount, 0);
+  assert.equal(authority.rows.length, 5000);
+  assert.match(authority.revision, /^[a-f0-9]{64}$/);
+});
+
+test('SQLite CRM match authority independently refuses a 5,001st active supersession', async (t) => {
+  const storages = sharedSqliteStorages(t);
+  const [storage] = storages;
+  withRawDatabase(storages.sqlitePath, (database) => {
+    database.exec(`
+      PRAGMA foreign_keys = OFF;
+      DROP TRIGGER trg_crm_submission_supersessions_validate_insert;
+      DROP TRIGGER trg_crm_submission_supersessions_no_active_chain_insert;
+      WITH RECURSIVE sequence(value) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT value + 1 FROM sequence WHERE value < 5001
+      )
+      INSERT INTO crm_submission_supersessions (
+        id, created_at, updated_at, status, survivor_submission_id,
+        superseded_submission_id, opportunity_id, reason_code, reason_text,
+        approved_by, approved_at, actor, repair_version, repair_manifest_id,
+        repair_digest, metadata
+      )
+      SELECT
+        printf('bounded-relation-%05d', value),
+        '2026-09-16T08:00:00.000Z', '2026-09-16T08:00:00.000Z', 'active',
+        printf('bounded-survivor-%05d', value),
+        printf('bounded-loser-%05d', value),
+        printf('bounded-opportunity-%05d', value),
+        'confirmed-duplicate', 'Complete-set authority bound fixture.',
+        'owner@example.test', '2026-09-16T08:00:00.000Z', 'authority-test',
+        'crm-duplicate-consolidation-v1', printf('bounded-manifest-%05d', value),
+        '${supersessionDigest}', '{}'
+      FROM sequence;
+    `);
+  });
+
+  const authority = await storage.readDealHunterCrmMatchAuthority({
+    limit: 5000,
+    supersessionLimit: 5000,
+  });
+  assert.equal(authority.complete, false);
+  assert.equal(authority.submissionCount, null);
+  assert.equal(authority.supersessionCount, null);
+  assert.deepEqual(authority.supersessions, []);
+  assert.equal(authority.revision, null);
+});
+
+test('SQLite CRM match authority succeeds at the exact 5,000-active-supersession boundary', async (t) => {
+  const storages = sharedSqliteStorages(t);
+  const [storage] = storages;
+  withRawDatabase(storages.sqlitePath, (database) => {
+    database.exec(`
+      PRAGMA foreign_keys = OFF;
+      DROP TRIGGER trg_crm_submission_supersessions_validate_insert;
+      DROP TRIGGER trg_crm_submission_supersessions_no_active_chain_insert;
+      WITH RECURSIVE sequence(value) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT value + 1 FROM sequence WHERE value < 5000
+      )
+      INSERT INTO crm_submission_supersessions (
+        id, created_at, updated_at, status, survivor_submission_id,
+        superseded_submission_id, opportunity_id, reason_code, reason_text,
+        approved_by, approved_at, actor, repair_version, repair_manifest_id,
+        repair_digest, metadata
+      )
+      SELECT
+        printf('boundary-relation-%05d', value),
+        '2026-09-16T08:00:00.000Z', '2026-09-16T08:00:00.000Z', 'active',
+        printf('boundary-survivor-%05d', value),
+        printf('boundary-loser-%05d', value),
+        printf('boundary-opportunity-%05d', value),
+        'confirmed-duplicate', 'Exact complete-set authority boundary fixture.',
+        'owner@example.test', '2026-09-16T08:00:00.000Z', 'authority-test',
+        'crm-duplicate-consolidation-v1', printf('boundary-manifest-%05d', value),
+        '${supersessionDigest}', '{}'
+      FROM sequence;
+    `);
+  });
+
+  const authority = await storage.readDealHunterCrmMatchAuthority({
+    limit: 5000,
+    supersessionLimit: 5000,
+  });
+  assert.equal(authority.complete, true);
+  assert.equal(authority.submissionCount, 0);
+  assert.equal(authority.supersessionCount, 5000);
+  assert.equal(authority.supersessions.length, 5000);
+  assert.match(authority.revision, /^[a-f0-9]{64}$/);
+});
+
+test('SQLite final linkage rejects an active loser directly and links its unchanged survivor control', async (t) => {
+  const storages = sharedSqliteStorages(t);
+  const [storage] = storages;
+  const relation = await seedActiveSupersession(storage, storages.sqlitePath);
+  const authority = await storage.readDealHunterCrmMatchAuthority({ limit: 5000, supersessionLimit: 5000 });
+
+  await assert.rejects(
+    storage.linkDealHunterCrmSubmissionIfAuthorityCurrent({
+      opportunityId: relation.opportunityId,
+      submissionId: relation.loser.id,
+      expectedAuthorityRevision: authority.revision,
+    }),
+    (error) => error?.code === 'CRM_SUBMISSION_SUPERSEDED'
+      && error?.survivorSubmissionId === relation.survivor.id,
+  );
+  assert.equal((await storage.getSubmission(relation.loser.id)).deal_hunter_opportunity_id, null);
+
+  const linked = await storage.linkDealHunterCrmSubmissionIfAuthorityCurrent({
+    opportunityId: relation.opportunityId,
+    submissionId: relation.survivor.id,
+    expectedAuthorityRevision: authority.revision,
+  });
+  assert.equal(linked.primary_submission_id, relation.survivor.id);
+  assert.equal((await storage.getSubmission(relation.survivor.id)).deal_hunter_opportunity_id, relation.opportunityId);
+});
+
 test('Supabase CRM match authority paths fail closed without querying or linking', async () => {
   const client = {
     from(table) { assert.fail(`fail-closed authority path queried ${table}`); },
@@ -176,6 +569,7 @@ test('Supabase CRM match authority paths fail closed without querying or linking
   assert.equal(storage.linkDealHunterCrmSubmission, undefined);
   const expected = (error) => error?.code === 'CRM_MATCH_LOOKUP_INCOMPLETE'
     && error?.status === 503
+    && error?.cause?.code === 'CRM_SUPERSESSION_UNAVAILABLE'
     && error?.candidateIds?.length === 0
     && error?.evidenceCategories?.includes('lookup-incomplete')
     && error?.evidenceCategories?.includes('provider-unsupported');
@@ -357,6 +751,84 @@ test('high-fit sync binds the real SQLite link to its last complete CRM match au
   assert.equal((await storage.listCrmCommunications({ limit: 100 })).rows.length, 0);
   assert.equal((await storage.listCrmEmailOutbox({ limit: 100 })).length, 0);
 });
+
+for (const authorityMutation of ['insert', 'reverse']) {
+  test(`high-fit sync refuses when an active supersession ${authorityMutation} occurs after the final service lookup`, async (t) => {
+    const storages = sharedSqliteStorages(t);
+    const [storage, writer] = storages;
+    const { reviewDailyDeals, syncDealHunterHighFitsToCrm } = await import('../server/services/dealHunter.js');
+    const unrelated = await seedActiveSupersession(storage, storages.sqlitePath, {
+      id: `unrelated-${authorityMutation}`,
+      opportunityId: `opp-unrelated-${authorityMutation}`,
+      survivorCompany: `Unrelated ${authorityMutation} survivor`,
+      survivorListingUrl: `https://example.test/unrelated-${authorityMutation}-survivor`,
+      loserCompany: `Unrelated ${authorityMutation} loser`,
+      loserListingUrl: `https://example.test/unrelated-${authorityMutation}-loser`,
+    });
+    if (authorityMutation === 'insert') {
+      await reverseActiveSupersession(storage, storages.sqlitePath, unrelated);
+    }
+
+    const reviewed = await reviewDailyDeals({ storage });
+    const [deal] = reviewed.qualified;
+    const selected = await seedSubmission(storage, { opportunityId: deal.opportunityId });
+    nonSourceFetchCount = 0;
+    let authorityReads = 0;
+    let concurrentMutationApplied = false;
+    const instrumentedStorage = new Proxy(storage, {
+      get(target, property) {
+        if (property === 'readDealHunterCrmMatchAuthority') {
+          return async (...args) => {
+            const authority = await target.readDealHunterCrmMatchAuthority(...args);
+            authorityReads += 1;
+            if (authorityReads === 2) {
+              if (authorityMutation === 'insert') {
+                insertSupersessionRow(storages.sqlitePath, {
+                  id: `${unrelated.id}-replacement`,
+                  timestamp: '2026-09-16T08:25:00.000Z',
+                  survivorId: unrelated.survivor.id,
+                  loserId: unrelated.loser.id,
+                  opportunityId: unrelated.opportunityId,
+                  manifestId: unrelated.manifestId,
+                });
+              } else {
+                await reverseActiveSupersession(writer, storages.sqlitePath, unrelated);
+              }
+              concurrentMutationApplied = true;
+            }
+            return authority;
+          };
+        }
+        const value = target[property];
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    const result = await syncDealHunterHighFitsToCrm({
+      confirmation: 'SYNC HIGH FITS',
+      expectedDealKeys: reviewed.qualified.map((item) => item.dealKey),
+      requestedBy: 'authority-test',
+      storage: instrumentedStorage,
+    });
+
+    assert.equal(concurrentMutationApplied, true);
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'CRM_MATCH_AUTHORITY_STALE');
+    const selectedAfter = await storage.getSubmission(selected.id);
+    assert.equal(selectedAfter.deal_hunter_opportunity_id, null);
+    assert.equal(selectedAfter.company, 'Authority HVAC Services');
+    assert.equal((await storage.getDealHunterOpportunity(deal.opportunityId)).primary_submission_id, null);
+    const importsAfter = await storage.listDealHunterCrmImports({ limit: 100 });
+    assert.equal(importsAfter.length, 1, 'only the explicitly permitted failed import-claim bookkeeping remains');
+    assert.equal(importsAfter[0].status, 'failed');
+    assert.equal(importsAfter[0].submission_id, '');
+    assert.equal((await storage.listDealHunterCimRequests({ limit: 100 })).length, 0);
+    assert.equal((await storage.listCrmCommunications({ limit: 100 })).rows.length, 0);
+    assert.equal((await storage.listCrmEmailOutbox({ limit: 100 })).length, 0);
+    assert.equal((await storage.listEmailEvents({ limit: 100 })).length, 0);
+    assert.equal(nonSourceFetchCount, 0, 'no provider or other non-source HTTP request is attempted');
+  });
+}
 
 test('unchanged high-fit authority performs exactly one conditional link and one CRM update', async (t) => {
   const [storage] = sharedSqliteStorages(t);

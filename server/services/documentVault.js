@@ -7,6 +7,7 @@ import { getClientIp, getRequestOrigin } from '../utils/http.js';
 import { hashIp, sha256, signPayload, verifySignedPayload } from '../utils/security.js';
 import { sendDocumentUploadNotificationEmail, sendSecureUploadInviteEmail } from './delivery.js';
 import { buildCrmActivityEvent, commitCrmActivityMutation } from './activity.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 import {
   persistSecureDocumentCleanupJob,
   registerSecureDocumentCleanupIntent,
@@ -37,6 +38,47 @@ const staleUploadingRequestMs = 15 * 60 * 1000;
 const secureUploadRateLimitEvents = new Map();
 const base64ExpansionRatio = 4 / 3;
 const jsonUploadEnvelopeBytes = 1024 * 1024;
+
+function boundedHistorySubmissionIds(submissionId, historySubmissionIds = []) {
+  const values = [submissionId, ...(Array.isArray(historySubmissionIds) ? historySubmissionIds : [])]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+  return [...new Set(values)].slice(0, 5000);
+}
+
+function compareCreatedAtDescending(left, right) {
+  return String(right?.created_at || '').localeCompare(String(left?.created_at || ''))
+    || String(right?.id || '').localeCompare(String(left?.id || ''));
+}
+
+export async function listCrmDocumentHistory({
+  submissionId = '',
+  historySubmissionIds = [],
+  storage = getStorage(),
+} = {}) {
+  const ids = boundedHistorySubmissionIds(submissionId, historySubmissionIds);
+  if (ids.length === 0) return { uploadRequests: [], documents: [], latestUploadRequest: null };
+
+  const [uploadRequests, documents] = await Promise.all([
+    storage.listLatestSecureUploadRequestsForSubmissions
+      ? storage.listLatestSecureUploadRequestsForSubmissions(ids)
+      : Promise.all(ids.map((id) => storage.getLatestSecureUploadRequestForSubmission(id))).then((rows) => rows.filter(Boolean)),
+    storage.listSecureDocumentsForSubmissions
+      ? storage.listSecureDocumentsForSubmissions(ids)
+      : Promise.all(ids.map((id) => storage.listSecureDocumentsForSubmission(id))).then((rows) => rows.flat()),
+  ]);
+  const projectedUploadRequests = uploadRequests
+    .map((request) => ({ ...request, originSubmissionId: request.submission_id }))
+    .sort(compareCreatedAtDescending);
+  const projectedDocuments = documents
+    .map((document) => ({ ...document, originSubmissionId: document.submission_id }))
+    .sort(compareCreatedAtDescending);
+  return {
+    uploadRequests: projectedUploadRequests,
+    documents: projectedDocuments,
+    latestUploadRequest: projectedUploadRequests[0] || null,
+  };
+}
 
 const mimeTypesByExtension = new Map([
   ['.pdf', 'application/pdf'],
@@ -520,6 +562,8 @@ export async function createSecureUploadRequest({ submissionId, requestedBy, not
     return { ok: false, error: 'Submission not found.' };
   }
 
+  await assertCrmSubmissionWritable({ storage, submissionId: submission.id });
+
   if (!submission.email) {
     return { ok: false, error: 'This submission does not include an email address.' };
   }
@@ -703,16 +747,18 @@ export async function getSecureDocumentDownload(documentId, storage = getStorage
 export async function uploadSecureDocuments({ token, ndaAccepted, note = '', documents, completeRequest = false, request }) {
   const config = getConfig();
   const storage = getStorage();
-  const rateLimitResult = await enforceSecureUploadAttemptRateLimit({ token, request });
-
-  if (!rateLimitResult.ok) {
-    return rateLimitResult;
-  }
-
   const context = await getSecureUploadContext(token);
 
   if (!context.ok) {
     return context;
+  }
+
+  await assertCrmSubmissionWritable({ storage, submissionId: context.request.submission_id });
+
+  const rateLimitResult = await enforceSecureUploadAttemptRateLimit({ token, request });
+
+  if (!rateLimitResult.ok) {
+    return rateLimitResult;
   }
 
   context.request = await recoverStaleUploadRequest(storage, context.request);
@@ -1035,6 +1081,7 @@ export async function revokeSecureUploadRequest({ requestId, revokedBy = 'admin'
   const requestRecord = await storage.getSecureUploadRequest(String(requestId || '').trim());
   if (!requestRecord) return { ok: false, status: 404, error: 'Secure upload request was not found.' };
   if (requestRecord.status === 'revoked') return { ok: true, request: requestRecord };
+  await assertCrmSubmissionWritable({ storage, submissionId: requestRecord.submission_id });
   const now = new Date().toISOString();
   const mutation = await commitCrmActivityMutation({
     storage,
@@ -1065,6 +1112,7 @@ export async function deleteSecureDocument({ documentId, deletedBy = 'admin', st
   const config = getConfig();
   const document = await storage.getSecureDocument(String(documentId || '').trim());
   if (!document) return { ok: false, status: 404, error: 'Secure document was not found.' };
+  await assertCrmSubmissionWritable({ storage, submissionId: document.submission_id });
   const sourcePath = resolveSecureStoragePath(document.storage_path, config.secureDocuments.storageDir);
   if (!sourcePath) return { ok: false, status: 500, error: 'Secure document path is invalid.' };
   const operationId = randomUUID();

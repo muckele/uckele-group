@@ -27,6 +27,8 @@ import {
   nextManualFollowUpAt,
 } from '../services/dealHunterManualFollowUpPolicy.js';
 import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
+import { normalizeDealHunterListingIdentity } from '../services/dealHunterListingIdentity.js';
+import { CrmSubmissionSupersededError } from '../services/crmSubmissionSupersession.js';
 import {
   buildCanonicalOpportunityMergePlan,
   canonicalOpportunityMergeManifestId,
@@ -41,6 +43,28 @@ import {
   stableCanonicalJson,
   validateCanonicalOpportunityMergeReplayManifest,
 } from '../repairs/canonicalOpportunityMerge.js';
+import {
+  buildCrmDuplicateConsolidationPlan,
+  buildCrmDuplicateConsolidationRuntimeSafetyAuthority,
+  canonicalJsonSha256,
+  classifyCrmDuplicateConsolidationTextReference,
+  CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
+  CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR,
+  CRM_DUPLICATE_CONSOLIDATION_EXPECTED_MUTATION_LEDGER,
+  CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
+  CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
+  CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+  crmDuplicateConsolidationFinancialEvidenceMatches,
+  crmDuplicateConsolidationManifestId,
+  crmDuplicateConsolidationRawStringMatchesSha256,
+  crmDuplicateConsolidationRelationId,
+  findCrmDuplicateConsolidationUnclassifiedSchema,
+  inspectCrmDuplicateConsolidationMarketplaceIdentity,
+  assertCrmDuplicateConsolidationRuntimeSafetyAuthorityMatches,
+  selectCrmDuplicateConsolidationConfigAuthority,
+  stableCanonicalJson as stableCrmDuplicateConsolidationJson,
+  validateCrmDuplicateConsolidationReceipt,
+} from '../repairs/crmDuplicateConsolidation.js';
 import { normalizeLeadType, normalizeSbaEligibility } from '../services/workflow.js';
 
 function parseJsonColumn(value, fallback) {
@@ -173,7 +197,7 @@ function normalizeSubmissionRow(row) {
   };
 }
 
-const dealHunterCrmMatchAuthorityVersion = 'deal-hunter-crm-match-authority-v1';
+const dealHunterCrmMatchAuthorityVersion = 'deal-hunter-crm-match-authority-v2';
 const dealHunterCrmMatchAuthorityMaximumRows = 5000;
 
 function dealHunterCrmMatchAuthorityError({ candidateIds = [] } = {}) {
@@ -185,38 +209,68 @@ function dealHunterCrmMatchAuthorityError({ candidateIds = [] } = {}) {
   return error;
 }
 
-function dealHunterCrmMatchAuthoritySnapshot(database, { limit = dealHunterCrmMatchAuthorityMaximumRows } = {}) {
+function dealHunterCrmMatchAuthoritySnapshot(database, {
+  limit = dealHunterCrmMatchAuthorityMaximumRows,
+  supersessionLimit = crmSubmissionSupersessionMaximumRows,
+} = {}) {
   const parsedLimit = Number(limit);
   const safeLimit = Number.isFinite(parsedLimit)
     ? Math.max(1, Math.min(Math.trunc(parsedLimit), dealHunterCrmMatchAuthorityMaximumRows))
     : dealHunterCrmMatchAuthorityMaximumRows;
+  const parsedSupersessionLimit = Number(supersessionLimit);
+  const safeSupersessionLimit = Number.isFinite(parsedSupersessionLimit)
+    ? Math.max(1, Math.min(Math.trunc(parsedSupersessionLimit), crmSubmissionSupersessionMaximumRows))
+    : crmSubmissionSupersessionMaximumRows;
   const rawRows = database.prepare(`
     SELECT * FROM contact_submissions
     ORDER BY id ASC
     LIMIT ?
   `).all(safeLimit + 1);
-  if (rawRows.length > safeLimit) {
+  const rawSupersessions = database.prepare(`
+    SELECT * FROM crm_submission_supersessions
+    WHERE status = 'active'
+    ORDER BY id ASC
+    LIMIT ?
+  `).all(safeSupersessionLimit + 1);
+  if (rawRows.length > safeLimit || rawSupersessions.length > safeSupersessionLimit) {
     return {
       rows: [],
       rawRows: [],
+      supersessions: [],
+      rawSupersessions: [],
       count: null,
+      submissionCount: null,
+      supersessionCount: null,
       complete: false,
       revision: null,
       revisionVersion: dealHunterCrmMatchAuthorityVersion,
     };
   }
-  const columns = database.pragma('table_info(contact_submissions)')
+  const submissionColumns = database.pragma('table_info(contact_submissions)')
+    .map((column) => String(column.name))
+    .sort();
+  const supersessionColumns = database.pragma('table_info(crm_submission_supersessions)')
     .map((column) => String(column.name))
     .sort();
   const revisionPayload = JSON.stringify({
     version: dealHunterCrmMatchAuthorityVersion,
-    columns,
-    rows: rawRows.map((row) => columns.map((column) => row[column])),
+    submissions: {
+      columns: submissionColumns,
+      rows: rawRows.map((row) => submissionColumns.map((column) => row[column])),
+    },
+    activeSupersessions: {
+      columns: supersessionColumns,
+      rows: rawSupersessions.map((row) => supersessionColumns.map((column) => row[column])),
+    },
   });
   return {
     rows: rawRows.map(normalizeSubmissionRow),
     rawRows,
+    supersessions: rawSupersessions.map(normalizeCrmSubmissionSupersessionRow),
+    rawSupersessions,
     count: rawRows.length,
+    submissionCount: rawRows.length,
+    supersessionCount: rawSupersessions.length,
     complete: true,
     revision: createHash('sha256').update(revisionPayload).digest('hex'),
     revisionVersion: dealHunterCrmMatchAuthorityVersion,
@@ -690,6 +744,136 @@ function normalizeDealHunterRepairManifestRow(row) {
     : null;
 }
 
+const crmSubmissionSupersessionMaximumRows = 5000;
+const crmSubmissionReversalManifestSchema = 'crm-duplicate-consolidation-reversal-manifest-v1';
+const crmSubmissionReversalTriggerSql = `
+  CREATE TRIGGER trg_crm_submission_supersessions_reverse_only
+  BEFORE UPDATE ON crm_submission_supersessions
+  WHEN (
+    NEW.updated_at IS NOT OLD.updated_at
+    OR NEW.status IS NOT OLD.status
+    OR NEW.reversed_at IS NOT OLD.reversed_at
+    OR NEW.reversed_by IS NOT OLD.reversed_by
+    OR NEW.reversal_reason IS NOT OLD.reversal_reason
+    OR NEW.reversal_manifest_id IS NOT OLD.reversal_manifest_id
+  ) AND NOT (
+    OLD.status = 'active'
+    AND NEW.status = 'reversed'
+    AND NEW.reversed_at IS NOT NULL AND TRIM(NEW.reversed_at) <> ''
+    AND NEW.reversed_by IS NOT NULL AND TRIM(NEW.reversed_by) <> ''
+    AND NEW.reversal_reason IS NOT NULL AND TRIM(NEW.reversal_reason) <> ''
+    AND NEW.reversal_manifest_id IS NOT NULL AND TRIM(NEW.reversal_manifest_id) <> ''
+    AND NEW.reversal_manifest_id <> NEW.repair_manifest_id
+    AND EXISTS (
+      SELECT 1 FROM deal_hunter_cim_repair_manifests
+      WHERE id = NEW.reversal_manifest_id
+        AND mode = 'crm-duplicate-consolidation'
+        AND status = 'applied'
+        AND json_extract(manifest, '$.schema') = '${crmSubmissionReversalManifestSchema}'
+        AND json_extract(manifest, '$.operation') = 'reverse'
+        AND json_extract(manifest, '$.relationId') = NEW.id
+        AND json_extract(manifest, '$.applyManifestId') = NEW.repair_manifest_id
+        AND json_extract(manifest, '$.repairDigest') = NEW.repair_digest
+        AND json_extract(manifest, '$.survivorSubmissionId') = NEW.survivor_submission_id
+        AND json_extract(manifest, '$.supersededSubmissionId') = NEW.superseded_submission_id
+        AND json_extract(manifest, '$.opportunityId') = NEW.opportunity_id
+    )
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'CRM supersession permits only reviewed active to reversed transition');
+  END;
+`;
+
+function normalizeCrmSubmissionSupersessionRow(row) {
+  return row
+    ? {
+        id: row.id,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        status: row.status,
+        survivorSubmissionId: row.survivor_submission_id,
+        supersededSubmissionId: row.superseded_submission_id,
+        opportunityId: row.opportunity_id,
+        reasonCode: row.reason_code,
+        reasonText: row.reason_text,
+        approvedBy: row.approved_by,
+        approvedAt: row.approved_at,
+        actor: row.actor,
+        repairVersion: row.repair_version,
+        repairManifestId: row.repair_manifest_id,
+        repairDigest: row.repair_digest,
+        reversedAt: row.reversed_at || null,
+        reversedBy: row.reversed_by || null,
+        reversalReason: row.reversal_reason || null,
+        reversalManifestId: row.reversal_manifest_id || null,
+        metadata: parseJsonColumn(row.metadata, {}),
+      }
+    : null;
+}
+
+function selectActiveCrmSubmissionSupersessions(database, {
+  submissionIds = [],
+  opportunityIds = [],
+  limit = crmSubmissionSupersessionMaximumRows,
+} = {}) {
+  const safeSubmissionIds = normalizeList(submissionIds, crmSubmissionSupersessionMaximumRows);
+  const safeOpportunityIds = normalizeList(opportunityIds, crmSubmissionSupersessionMaximumRows);
+  const parsedLimit = Number(limit);
+  const safeLimit = Number.isFinite(parsedLimit)
+    ? Math.max(1, Math.min(Math.trunc(parsedLimit), crmSubmissionSupersessionMaximumRows))
+    : crmSubmissionSupersessionMaximumRows;
+  const clauses = ["status = 'active'"];
+  const parameters = [];
+  if (safeSubmissionIds.length > 0) {
+    const placeholders = safeSubmissionIds.map(() => '?').join(', ');
+    clauses.push(`(survivor_submission_id IN (${placeholders}) OR superseded_submission_id IN (${placeholders}))`);
+    parameters.push(...safeSubmissionIds, ...safeSubmissionIds);
+  }
+  if (safeOpportunityIds.length > 0) {
+    clauses.push(`opportunity_id IN (${safeOpportunityIds.map(() => '?').join(', ')})`);
+    parameters.push(...safeOpportunityIds);
+  }
+  return database.prepare(`
+    SELECT * FROM crm_submission_supersessions
+    WHERE ${clauses.join(' AND ')}
+    ORDER BY opportunity_id ASC, survivor_submission_id ASC,
+      superseded_submission_id ASC, id ASC
+    LIMIT ?
+  `).all(...parameters, safeLimit).map(normalizeCrmSubmissionSupersessionRow);
+}
+
+function crmSubmissionMetadataOwner(submission) {
+  const owner = submission?.metadata?.dealHunter?.opportunityId;
+  return typeof owner === 'string' ? owner.trim() : '';
+}
+
+function crmSubmissionReversalReceiptMatches(relation, receipt) {
+  const manifest = parseJsonColumn(receipt?.manifest, {});
+  return Boolean(
+    receipt
+    && relation.reversalManifestId
+    && relation.reversalManifestId !== relation.repairManifestId
+    && receipt.id === relation.reversalManifestId
+    && receipt.mode === 'crm-duplicate-consolidation'
+    && receipt.status === 'applied'
+    && manifest.schema === crmSubmissionReversalManifestSchema
+    && manifest.operation === 'reverse'
+    && manifest.relationId === relation.id
+    && manifest.applyManifestId === relation.repairManifestId
+    && manifest.repairDigest === relation.repairDigest
+    && manifest.survivorSubmissionId === relation.survivorSubmissionId
+    && manifest.supersededSubmissionId === relation.supersededSubmissionId
+    && manifest.opportunityId === relation.opportunityId
+  );
+}
+
+function migrateCrmSubmissionReversalTrigger(database) {
+  database.transaction(() => {
+    database.exec('DROP TRIGGER IF EXISTS trg_crm_submission_supersessions_reverse_only');
+    database.exec(crmSubmissionReversalTriggerSql);
+  }).immediate();
+}
+
 function normalizeCimStage2ActivationRow(row) {
   return row
     ? {
@@ -1043,6 +1227,21 @@ function normalizePage(value, maxPage = 10000) {
     : 1;
 }
 
+const activeCrmProjectionAliases = new Set(['submission', 'submissions']);
+
+function activeCrmSubmissionPredicate(alias) {
+  if (!activeCrmProjectionAliases.has(alias)) {
+    throw new Error('Unsupported internal CRM projection alias.');
+  }
+
+  return `NOT EXISTS (
+    SELECT 1
+    FROM crm_submission_supersessions AS active_supersession
+    WHERE active_supersession.superseded_submission_id = ${alias}.id
+      AND active_supersession.status = 'active'
+  )`;
+}
+
 const sharedWebsiteDomains = [
   'facebook.com',
   'instagram.com',
@@ -1336,7 +1535,7 @@ export function inspectCanonicalMergeLegacyDealHunterCandidates(database, approv
   return { count, records };
 }
 
-function inspectCanonicalMergeDependentState(database, approval) {
+export function inspectCanonicalMergeDependentState(database, approval) {
   const opportunityIds = [approval.survivorId, approval.supersededId];
   const aliasValues = approval.expectedAliases.map((item) => item.aliasValue);
   const aliasKeys = approval.expectedAliases.map((item) => item.aliasKey);
@@ -1354,6 +1553,12 @@ function inspectCanonicalMergeDependentState(database, approval) {
   const referenceValues = uniqueCanonicalMergeValues([...opportunityIds, ...aliasValues, ...aliasKeys]);
   const metadataFilter = { column: 'metadata', values: referenceValues, contains: true };
   const legacyDealHunterCandidates = inspectCanonicalMergeLegacyDealHunterCandidates(database, approval);
+  const crmSubmissionSupersessions = database.prepare(`
+    SELECT * FROM crm_submission_supersessions
+    WHERE opportunity_id IN (${placeholders(opportunityIds.length)})
+    ORDER BY opportunity_id ASC, survivor_submission_id ASC,
+      superseded_submission_id ASC, id ASC
+  `).all(...opportunityIds);
 
   const opportunityScores = selectCanonicalMergeRows(database, 'deal_hunter_opportunity_scores', [
     { column: 'opportunity_id', values: opportunityIds },
@@ -1527,6 +1732,7 @@ function inspectCanonicalMergeDependentState(database, approval) {
   ];
 
   const records = {
+    crmSubmissionSupersessions,
     opportunityScores: canonicalMergeRecordIds('deal_hunter_opportunity_scores', opportunityScores, 'opportunity_id'),
     scoreEvidence: canonicalMergeRecordIds('deal_hunter_score_evidence', scoreEvidence),
     operatorFacts: canonicalMergeRecordIds('deal_hunter_opportunity_facts', operatorFacts),
@@ -1691,6 +1897,28 @@ function checkedCanonicalOpportunityMergeApproval(approval = {}) {
 }
 
 const canonicalOpportunityMergeRequiredSchema = Object.freeze({
+  crm_submission_supersessions: [
+    'id',
+    'created_at',
+    'updated_at',
+    'status',
+    'survivor_submission_id',
+    'superseded_submission_id',
+    'opportunity_id',
+    'reason_code',
+    'reason_text',
+    'approved_by',
+    'approved_at',
+    'actor',
+    'repair_version',
+    'repair_manifest_id',
+    'repair_digest',
+    'reversed_at',
+    'reversed_by',
+    'reversal_reason',
+    'reversal_manifest_id',
+    'metadata',
+  ],
   contact_submissions: ['id', 'deal_hunter_opportunity_id', 'listing_url', 'metadata'],
   secure_upload_requests: ['id', 'submission_id'],
   secure_documents: ['id', 'request_id', 'submission_id'],
@@ -2196,9 +2424,15 @@ function validateCanonicalMergeFinalState(database, {
     throw new Error('Canonical opportunity merge manifest failed typed final validation.');
   }
   const dependentState = inspectCanonicalMergeDependentState(database, approval);
+  if (!Array.isArray(dependentState?.records?.crmSubmissionSupersessions)) {
+    throw new Error('Canonical opportunity merge final state could not inspect CRM submission supersession history completely.');
+  }
   const unexpected = Object.entries(dependentState.counts).filter(([name, count]) => (
     count !== Number(approval.expectedDependentCounts?.[name] || 0)
   ));
+  if (dependentState.records.crmSubmissionSupersessions.length !== 0) {
+    throw new Error('Canonical opportunity merge final state acquired unexpected dependents: crmSubmissionSupersessions.');
+  }
   if (unexpected.length > 0) {
     throw new Error(`Canonical opportunity merge final state acquired unexpected dependents: ${unexpected.map(([name]) => name).join(', ')}.`);
   }
@@ -2210,6 +2444,900 @@ function validateCanonicalMergeFinalState(database, {
     throw new Error('Canonical opportunity merge final state changed approved preserved incident rows.');
   }
   return { survivor, superseded, identityException, aliases, manifest, dependentState };
+}
+
+const crmDuplicateConsolidationMaximumRows = 250000;
+
+const crmDuplicateConsolidationRequiredSchemaObjects = Object.freeze([
+  ['index', 'idx_crm_submission_supersessions_survivor'],
+  ['index', 'idx_crm_submission_supersessions_opportunity'],
+  ['index', 'uq_crm_submission_supersessions_active_loser'],
+  ['trigger', 'trg_crm_duplicate_consolidation_receipt_no_update'],
+  ['trigger', 'trg_crm_duplicate_consolidation_receipt_no_delete'],
+  ['trigger', 'trg_crm_submission_supersessions_validate_insert'],
+  ['trigger', 'trg_crm_submission_supersessions_no_active_chain_insert'],
+  ['trigger', 'trg_crm_submission_supersessions_no_active_chain_update'],
+  ['trigger', 'trg_crm_submission_supersessions_immutable_update'],
+  ['trigger', 'trg_crm_submission_supersessions_reverse_only'],
+  ['trigger', 'trg_crm_submission_supersessions_no_delete'],
+  ['trigger', 'trg_crm_submission_supersessions_guard_contact_owner_update'],
+  ['trigger', 'trg_crm_submission_supersessions_guard_opportunity_update'],
+  ['trigger', 'trg_deal_hunter_opportunities_reject_superseded_primary_insert'],
+  ['trigger', 'trg_deal_hunter_opportunities_reject_superseded_primary_update'],
+  ['trigger', 'trg_crm_submission_supersessions_guard_contact_delete'],
+  ['trigger', 'trg_crm_submission_supersessions_guard_opportunity_delete'],
+]);
+
+function quoteCrmDuplicateConsolidationIdentifier(identifier) {
+  return `"${String(identifier).replaceAll('"', '""')}"`;
+}
+
+function compareCrmDuplicateConsolidationText(left, right) {
+  const leftText = String(left);
+  const rightText = String(right);
+  return leftText < rightText ? -1 : leftText > rightText ? 1 : 0;
+}
+
+function crmDuplicateConsolidationSchema(database) {
+  return database.prepare(`
+    SELECT name, sql
+    FROM sqlite_schema
+    WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    ORDER BY name
+  `).all().map((table) => ({
+    name: table.name,
+    sqlDigest: createHash('sha256').update(String(table.sql || '')).digest('hex'),
+    columns: database.pragma(`table_info(${JSON.stringify(table.name)})`).map((column) => ({
+      cid: Number(column.cid),
+      name: column.name,
+      type: column.type,
+      notNull: Boolean(column.notnull),
+      defaultValue: column.dflt_value,
+      primaryKey: Number(column.pk),
+    })),
+  }));
+}
+
+function crmDuplicateConsolidationRequiredObjects(database) {
+  return crmDuplicateConsolidationRequiredSchemaObjects.map(([type, name]) => {
+    const row = database.prepare(`
+      SELECT type, name, sql FROM sqlite_schema
+      WHERE type = ? AND name = ? LIMIT 1
+    `).get(type, name);
+    return row ? {
+      type,
+      name,
+      sqlDigest: createHash('sha256').update(String(row.sql || '')).digest('hex'),
+    } : { type, name, missing: true };
+  }).sort((left, right) => compareCrmDuplicateConsolidationText(left.name, right.name));
+}
+
+function assertCrmDuplicateConsolidationRequiredObjects(database, expected, phase) {
+  const actual = crmDuplicateConsolidationRequiredObjects(database);
+  if (actual.some((entry) => entry.missing)
+    || stableCrmDuplicateConsolidationJson(actual) !== stableCrmDuplicateConsolidationJson(expected)) {
+    throw new Error(`CRM duplicate consolidation ${phase} required schema object drift.`);
+  }
+  return actual;
+}
+
+function crmDuplicateConsolidationDatabaseState(database) {
+  const schema = crmDuplicateConsolidationSchema(database);
+  const requiredObjects = crmDuplicateConsolidationRequiredObjects(database);
+  let totalRows = 0;
+  const rowsByTable = {};
+  const tableDigests = {};
+  for (const table of schema) {
+    const quotedTable = quoteCrmDuplicateConsolidationIdentifier(table.name);
+    const count = Number(database.prepare(`SELECT COUNT(*) AS count FROM ${quotedTable}`).get()?.count || 0);
+    totalRows += count;
+    if (totalRows > crmDuplicateConsolidationMaximumRows) {
+      throw new Error('CRM duplicate consolidation inspection row bound exceeded.');
+    }
+    const rows = database.prepare(`SELECT * FROM ${quotedTable}`).all()
+      .sort((left, right) => compareCrmDuplicateConsolidationText(
+        stableCrmDuplicateConsolidationJson(left),
+        stableCrmDuplicateConsolidationJson(right),
+      ));
+    rowsByTable[table.name] = rows;
+    tableDigests[table.name] = {
+      rowCount: rows.length,
+      digest: canonicalJsonSha256(rows),
+    };
+  }
+  return {
+    schema,
+    requiredObjects,
+    schemaDigest: canonicalJsonSha256({ tables: schema, requiredObjects }),
+    rowsByTable,
+    tableDigests,
+    logicalDigest: canonicalJsonSha256(rowsByTable),
+    totalRows,
+  };
+}
+
+function parseCrmDuplicateConsolidationMetadata(value) {
+  try {
+    const parsed = value ? JSON.parse(value) : {};
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function crmDuplicateConsolidationRawDigest(row) {
+  return canonicalJsonSha256(row || null);
+}
+
+function crmDuplicateConsolidationUnchangedMutationDigests(database) {
+  const exclusions = {
+    crm_submission_supersessions: new Set(
+      CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map(crmDuplicateConsolidationRelationId),
+    ),
+    deal_hunter_crm_imports: new Set([CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id]),
+    deal_hunter_cim_repair_manifests: new Set([crmDuplicateConsolidationManifestId()]),
+  };
+  return Object.fromEntries(Object.entries(exclusions).map(([table, excludedIds]) => {
+    const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
+      .filter((row) => !excludedIds.has(row.id))
+      .sort((left, right) => compareCrmDuplicateConsolidationText(
+        stableCrmDuplicateConsolidationJson(left),
+        stableCrmDuplicateConsolidationJson(right),
+      ));
+    return [table, { rowCount: rows.length, digest: canonicalJsonSha256(rows) }];
+  }));
+}
+
+function crmDuplicateConsolidationUnchangedBerlinColumns(row) {
+  return Object.fromEntries(Object.entries(row || {}).filter(([column]) => (
+    !['submission_id', 'updated_at', 'metadata'].includes(column)
+  )));
+}
+
+function crmDuplicateConsolidationListingMatches(row, pair, { allowMissing = false } = {}) {
+  const metadata = parseCrmDuplicateConsolidationMetadata(row?.metadata);
+  const dealHunter = metadata?.dealHunter || {};
+  return inspectCrmDuplicateConsolidationMarketplaceIdentity({
+    listingUrl: row?.listing_url,
+    listingAliases: Object.hasOwn(dealHunter, 'listingAliases')
+      ? dealHunter.listingAliases
+      : undefined,
+    identityAliases: Object.hasOwn(dealHunter, 'identityAliases')
+      ? dealHunter.identityAliases
+      : undefined,
+    expectedIdentity: pair.listingIdentity,
+    allowAllAbsent: allowMissing,
+  });
+}
+
+function crmDuplicateConsolidationFinancialMatches(row, pair) {
+  return crmDuplicateConsolidationFinancialEvidenceMatches(row, pair);
+}
+
+const crmDuplicateConsolidationApprovedReferenceIdentifiers = Object.freeze([
+  ...CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.flatMap((pair) => [
+    pair.opportunityId,
+    pair.survivorSubmissionId,
+    pair.supersededSubmissionId,
+    pair.listingIdentity,
+  ]),
+  'b272125b030c6d097808fa82126b6afa0799fda456fc3465be51a0f0cea7a52e',
+  'aba23259c8a36685199482500aff468493221c0ff844966c2f6b9c148d72ad01',
+  '49e8541d-3463-44e9-b032-02563b47317f',
+  'a169ba9c-6b96-41f1-a18b-5c8521ebdc54',
+  'cde045b6667a459bb28891af4ee2ab4374f51620581522462349142efb1e7e31',
+  'fa231f927904b40a3ef6fd762f37b7830e9aab92c013d39ed740f51e3c84bfd0',
+  '42fefa5e5de8bba6676bf97ccb49a2c5364a469dc6da57b4af6ff9087141bede',
+  '4e2075ca935de95f09a80bdcdc51ac513c9ab5864f384d20f7ad123f139357ad',
+  CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id,
+]);
+
+function collectCrmDuplicateConsolidationEvidenceTokens(value, key = '', output = []) {
+  if (output.length >= 512 || value === null || value === undefined) return output;
+  if (Array.isArray(value)) {
+    for (const item of value) collectCrmDuplicateConsolidationEvidenceTokens(item, key, output);
+    return output;
+  }
+  if (value && typeof value === 'object') {
+    for (const [nestedKey, nestedValue] of Object.entries(value)) {
+      collectCrmDuplicateConsolidationEvidenceTokens(nestedValue, nestedKey, output);
+    }
+    return output;
+  }
+  if (typeof value === 'string'
+    && /(?:alias|evidence|listingIdentity|dealKey)/i.test(key)
+    && value.length >= 4
+    && value.length <= 500) {
+    output.push(value);
+  }
+  return output;
+}
+
+function crmDuplicateConsolidationReferenceTokens(state) {
+  const dynamic = [];
+  const scopedSubmissionIds = new Set(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.flatMap((pair) => [
+    pair.survivorSubmissionId,
+    pair.supersededSubmissionId,
+  ]));
+  for (const row of state.rowsByTable.contact_submissions || []) {
+    if (!scopedSubmissionIds.has(row.id)) continue;
+    collectCrmDuplicateConsolidationEvidenceTokens(
+      parseCrmDuplicateConsolidationMetadata(row.metadata)?.dealHunter,
+      'dealHunter',
+      dynamic,
+    );
+  }
+  const scopedOpportunityIds = new Set(
+    CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.opportunityId),
+  );
+  for (const row of state.rowsByTable.deal_hunter_opportunity_aliases || []) {
+    if (!scopedOpportunityIds.has(row.opportunity_id)) continue;
+    for (const [column, value] of Object.entries(row)) {
+      if (/(?:alias|evidence|listing|deal_key)/i.test(column)
+        && typeof value === 'string' && value.length >= 4 && value.length <= 500) {
+        dynamic.push(value);
+      }
+    }
+  }
+  const approved = [...new Set(crmDuplicateConsolidationApprovedReferenceIdentifiers)].sort(
+    compareCrmDuplicateConsolidationText,
+  );
+  const tokens = [...new Set([...approved, ...dynamic])]
+    .filter((token) => typeof token === 'string' && token.length >= 4 && token.length <= 500)
+    .sort(compareCrmDuplicateConsolidationText);
+  if (tokens.length > 512) throw new Error('CRM duplicate consolidation reference-token bound exceeded.');
+  return { approved, tokens };
+}
+
+function crmDuplicateConsolidationReferencePolicies(table, matchedRows, classification) {
+  if (classification === 'unclassified-positive-reference') return ['blocked-unclassified-reference'];
+  if (table === 'deal_hunter_cim_repair_manifests') return ['retained-historical-receipt'];
+  if (table === 'crm_submission_supersessions') return ['mutated-approved-relation'];
+  if (table === 'deal_hunter_crm_imports') {
+    const policies = [];
+    if (matchedRows.some((row) => row.id === CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id)) {
+      policies.push('mutated-berlin-import-only');
+    }
+    if (matchedRows.some((row) => row.id !== CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id)) {
+      policies.push('retained-preserved-import');
+    }
+    return policies;
+  }
+  return matchedRows.length ? ['retained-with-provenance'] : ['scanned-no-incident-reference'];
+}
+
+function crmDuplicateConsolidationReferenceInventory(state) {
+  const { approved, tokens } = crmDuplicateConsolidationReferenceTokens(state);
+  const references = [];
+  for (const table of state.schema) {
+    const rows = state.rowsByTable[table.name] || [];
+    for (const column of table.columns) {
+      if (!/TEXT/i.test(String(column.type))) continue;
+      const configuredClassification = classifyCrmDuplicateConsolidationTextReference({
+        table: table.name,
+        column: column.name,
+      });
+      const matchedRows = [];
+      const matchedIdentifiers = new Set();
+      for (const row of rows) {
+        const value = row[column.name];
+        if (value === null || value === undefined) continue;
+        const serialized = String(value);
+        const rowMatches = tokens.filter((token) => serialized.includes(token));
+        if (rowMatches.length === 0) continue;
+        matchedRows.push(row);
+        for (const token of rowMatches) matchedIdentifiers.add(token);
+      }
+      const classification = configuredClassification
+        || (matchedRows.length ? 'unclassified-positive-reference' : 'scanned-no-incident-reference');
+      references.push({
+        table: table.name,
+        column: column.name,
+        classification,
+        policies: crmDuplicateConsolidationReferencePolicies(table.name, matchedRows, classification),
+        matchedRowCount: matchedRows.length,
+        matchedRowsDigest: canonicalJsonSha256(matchedRows),
+        matchedIdentifierCount: matchedIdentifiers.size,
+        matchedIdentifiersDigest: canonicalJsonSha256([...matchedIdentifiers].sort(
+          compareCrmDuplicateConsolidationText,
+        )),
+      });
+    }
+  }
+  return {
+    entries: references.sort((left, right) => (
+      compareCrmDuplicateConsolidationText(left.table, right.table)
+        || compareCrmDuplicateConsolidationText(left.column, right.column)
+    )),
+    identifiers: {
+      approvedCount: approved.length,
+      totalCount: tokens.length,
+      digest: canonicalJsonSha256(tokens),
+    },
+    blockers: references.filter((entry) => (
+      entry.matchedRowCount > 0 && entry.classification === 'unclassified-positive-reference'
+    )).map((entry) => `unclassified positive incident reference: ${entry.table}.${entry.column}`),
+  };
+}
+
+function crmDuplicateConsolidationRowsForIds(database, table, column, ids) {
+  const quotedTable = quoteCrmDuplicateConsolidationIdentifier(table);
+  const quotedColumn = quoteCrmDuplicateConsolidationIdentifier(column);
+  return database.prepare(`
+    SELECT * FROM ${quotedTable}
+    WHERE ${quotedColumn} IN (${placeholders(ids.length)})
+    ORDER BY ${quotedColumn}
+  `).all(...ids);
+}
+
+function crmDuplicateConsolidationBerlinIdentityBlockers(database, {
+  survivor,
+  superseded,
+  opportunity,
+} = {}) {
+  const blockers = [];
+  const pair = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.find((item) => item.key === 'berlin');
+  const survivorMetadata = parseCrmDuplicateConsolidationMetadata(survivor?.metadata);
+  const supersededMetadata = parseCrmDuplicateConsolidationMetadata(superseded?.metadata);
+  const survivorDealHunter = survivorMetadata?.dealHunter;
+  const supersededDealHunter = supersededMetadata?.dealHunter;
+
+  if (!opportunity
+    || opportunity.status !== 'active'
+    || opportunity.primary_submission_id !== pair.survivorSubmissionId
+    || opportunity.identity_version !== 'cim-opportunity-v1') {
+    blockers.push('berlin-canonical-opportunity-authority-drift');
+  }
+  if (!survivor
+    || (survivor.deal_hunter_opportunity_id !== null
+      && survivor.deal_hunter_opportunity_id !== pair.opportunityId)
+    || survivorDealHunter?.opportunityId !== pair.opportunityId) {
+    blockers.push('berlin-survivor-owner-drift');
+  }
+  const supersededPrimaryCount = Number(database.prepare(`
+    SELECT COUNT(*) AS count FROM deal_hunter_opportunities
+    WHERE primary_submission_id = ?
+  `).get(pair.supersededSubmissionId)?.count || 0);
+  if (!superseded
+    || superseded.deal_hunter_opportunity_id !== null
+    || Object.hasOwn(supersededDealHunter || {}, 'opportunityId')
+    || supersededPrimaryCount !== 0) {
+    blockers.push('berlin-superseded-owner-or-primary-drift');
+  }
+  if (superseded?.listing_url !== ''
+    || ['listingAliases', 'identityAliases', 'dealKeyAliases', 'sourceRecords']
+      .some((key) => Object.hasOwn(supersededDealHunter || {}, key))) {
+    blockers.push('berlin-superseded-missing-evidence-shape-drift');
+  }
+  if (!crmDuplicateConsolidationRawStringMatchesSha256(
+    supersededDealHunter?.dealKey,
+    pair.supersededDealKeySha256,
+  )) {
+    blockers.push('berlin-superseded-deal-key-digest-drift');
+  }
+  if (supersededDealHunter?.sourceId !== pair.supersededSource.sourceId
+    || supersededDealHunter?.sourceMode !== pair.supersededSource.sourceMode
+    || supersededDealHunter?.externalId !== pair.supersededSource.externalId) {
+    blockers.push('berlin-superseded-source-pointer-drift');
+  }
+  const survivorAliases = survivorDealHunter?.dealKeyAliases;
+  if (!Array.isArray(survivorAliases)
+    || survivorAliases.some((value) => typeof value !== 'string' || !value)
+    || survivorAliases.filter((value) => crmDuplicateConsolidationRawStringMatchesSha256(
+      value,
+      pair.supersededDealKeySha256,
+    )).length !== 1) {
+    blockers.push('berlin-survivor-deal-key-corroboration-drift');
+  }
+
+  const legacy = database.prepare(`
+    SELECT * FROM deal_hunter_crm_imports WHERE id = ? LIMIT 1
+  `).get(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id);
+  const legacyMetadata = parseCrmDuplicateConsolidationMetadata(legacy?.metadata);
+  if (!legacy
+    || legacy.submission_id !== pair.supersededSubmissionId
+    || legacy.opportunity_id !== null
+    || !crmDuplicateConsolidationRawStringMatchesSha256(
+      legacy.deal_key,
+      pair.supersededDealKeySha256,
+    )
+    || legacy.listing_url !== ''
+    || legacy.listing_identity !== ''
+    || legacyMetadata?.sourceId !== CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.sourceId
+    || legacyMetadata?.sourceMode !== CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.sourceMode
+    || Object.hasOwn(legacyMetadata || {}, 'opportunityId')) {
+    blockers.push('berlin-legacy-import-identity-drift');
+  }
+
+  const canonical = database.prepare(`
+    SELECT * FROM deal_hunter_crm_imports WHERE id = ? LIMIT 1
+  `).get(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinCanonicalImport.id);
+  const canonicalMetadata = parseCrmDuplicateConsolidationMetadata(canonical?.metadata);
+  const survivorListing = crmDuplicateConsolidationListingMatches(survivor, pair);
+  const canonicalListingIdentity = normalizeDealHunterListingIdentity(survivor?.listing_url);
+  if (!canonical
+    || canonical.submission_id !== pair.survivorSubmissionId
+    || canonical.opportunity_id !== pair.opportunityId
+    || typeof survivorDealHunter?.dealKey !== 'string'
+    || !survivorDealHunter.dealKey
+    || canonical.deal_key !== survivorDealHunter.dealKey
+    || canonical.listing_url !== survivor.listing_url
+    || !canonicalListingIdentity
+    || canonical.listing_identity !== canonicalListingIdentity
+    || canonicalMetadata?.sourceId !== pair.supersededSource.sourceId
+    || canonicalMetadata?.sourceMode !== pair.supersededSource.sourceMode
+    || Object.hasOwn(canonicalMetadata || {}, 'opportunityId')
+    || !survivorListing.valid) {
+    blockers.push('berlin-canonical-import-identity-drift');
+  }
+  return blockers;
+}
+
+function crmDuplicateConsolidationRuntimeSafety(database, configAuthority) {
+  const cimSafetyRow = database.prepare(`
+    SELECT * FROM deal_hunter_cim_safety_settings WHERE id = 'global' LIMIT 1
+  `).get();
+  const automationRow = database.prepare(`
+    SELECT * FROM deal_hunter_automation_settings
+    WHERE id = 'cim-initial-outreach' LIMIT 1
+  `).get();
+  return buildCrmDuplicateConsolidationRuntimeSafetyAuthority({
+    configAuthority,
+    cimSafetyRow,
+    automationRow,
+  });
+}
+
+function crmDuplicateConsolidationSafety(database, blockers, configAuthority) {
+  const loserIds = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.supersededSubmissionId);
+  const survivorIds = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.survivorSubmissionId);
+  const tableExists = (name) => Boolean(database.prepare(`
+    SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ? LIMIT 1
+  `).get(name));
+  const count = (sql, ...values) => Number(database.prepare(sql).get(...values)?.count || 0);
+  const safety = {};
+  const automation = tableExists('deal_hunter_automation_settings')
+    ? database.prepare(`
+      SELECT * FROM deal_hunter_automation_settings
+      WHERE id = 'cim-initial-outreach' LIMIT 1
+    `).get()
+    : null;
+  safety.activeWriterCount = !automation || Number(automation.paused) !== 1 ? 1 : 0;
+  if (safety.activeWriterCount) blockers.push('active-writer-or-scheduler-not-disabled');
+
+  const outbound = tableExists('deal_hunter_cim_safety_settings')
+    ? database.prepare("SELECT * FROM deal_hunter_cim_safety_settings WHERE id = 'global' LIMIT 1").get()
+    : null;
+  safety.outboundSafe = Boolean(outbound)
+    && Number(outbound.outreach_paused) === 1;
+  if (!safety.outboundSafe) blockers.push('unsafe-outbound-control');
+
+  let runtimeSafetyAuthority = null;
+  try {
+    runtimeSafetyAuthority = crmDuplicateConsolidationRuntimeSafety(database, configAuthority);
+  } catch (error) {
+    blockers.push(`runtime-safety-authority-invalid:${error.message}`);
+  }
+
+  const loserPlaceholders = placeholders(loserIds.length);
+  const survivorPlaceholders = placeholders(survivorIds.length);
+  safety.nonterminalLoserCommunications = count(`
+    SELECT COUNT(*) AS count FROM crm_communications
+    WHERE submission_id IN (${loserPlaceholders})
+      AND COALESCE(delivery_state, '') NOT IN ('accepted', 'delivered', 'failed', 'rejected', 'bounced', 'complained')
+  `, ...loserIds);
+  if (safety.nonterminalLoserCommunications) blockers.push('nonterminal-loser-communication');
+  safety.nonterminalLoserOutbox = count(`
+    SELECT COUNT(*) AS count FROM crm_email_outbox
+    WHERE submission_id IN (${loserPlaceholders})
+      AND state NOT IN ('accepted', 'permanent_failed', 'cancelled')
+  `, ...loserIds);
+  if (safety.nonterminalLoserOutbox) blockers.push('nonterminal-loser-outbox');
+  safety.loserCimRequests = count(`
+    SELECT COUNT(*) AS count FROM deal_hunter_cim_requests
+    WHERE submission_id IN (${loserPlaceholders})
+  `, ...loserIds);
+  if (safety.loserCimRequests) blockers.push('loser-cim-request');
+  safety.nonterminalSurvivorCimRequests = count(`
+    SELECT COUNT(*) AS count FROM deal_hunter_cim_requests
+    WHERE submission_id IN (${survivorPlaceholders})
+      AND NOT (
+        status = 'sent'
+        AND request_state IN ('provider_accepted', 'responded', 'stopped')
+        AND delivery_state IN ('accepted', 'delivered')
+        AND follow_up_state IN ('completed', 'stopped')
+        AND next_follow_up_at IS NULL
+      )
+  `, ...survivorIds);
+  if (safety.nonterminalSurvivorCimRequests) blockers.push('nonterminal-survivor-cim-request');
+  safety.actionableLoserRecommendations = count(`
+    SELECT COUNT(*) AS count FROM crm_follow_up_recommendations
+    WHERE submission_id IN (${loserPlaceholders}) AND status IN ('current', 'pending')
+  `, ...loserIds);
+  if (safety.actionableLoserRecommendations) blockers.push('nonterminal-loser-recommendation');
+  safety.activeLoserUploads = count(`
+    SELECT COUNT(*) AS count FROM secure_upload_requests
+    WHERE submission_id IN (${loserPlaceholders})
+      AND status NOT IN ('closed', 'revoked', 'expired', 'completed')
+  `, ...loserIds);
+  if (safety.activeLoserUploads) blockers.push('nonterminal-loser-upload');
+  safety.nonterminalLoserReconciliationItems = count(`
+    SELECT COUNT(*) AS count FROM deal_hunter_crm_reconciliation_items
+    WHERE submission_id IN (${loserPlaceholders})
+      AND status NOT IN ('completed', 'skipped', 'failed')
+  `, ...loserIds);
+  if (safety.nonterminalLoserReconciliationItems) blockers.push('nonterminal-loser-reconciliation');
+  safety.activeLoserCleanupJobs = count(`
+    SELECT COUNT(*) AS count FROM secure_document_cleanup_jobs
+    WHERE submission_id IN (${loserPlaceholders})
+      AND status NOT IN ('completed', 'restored')
+  `, ...loserIds);
+  if (safety.activeLoserCleanupJobs) blockers.push('nonterminal-loser-cleanup');
+  safety.activeStage2Activations = count(`
+    SELECT COUNT(*) AS count FROM deal_hunter_cim_stage2_activations
+    WHERE status = 'current'
+  `);
+  if (safety.activeStage2Activations) blockers.push('active-stage2-activation');
+  return { safety, runtimeSafetyAuthority };
+}
+
+function inspectCrmDuplicateConsolidationState(database, { connection, configAuthority } = {}) {
+  const state = crmDuplicateConsolidationDatabaseState(database);
+  const blockers = findCrmDuplicateConsolidationUnclassifiedSchema(state.schema);
+  for (const entry of state.requiredObjects.filter((object) => object.missing)) {
+    blockers.push(`required-${entry.type}-schema-object-missing:${entry.name}`);
+  }
+  const submissions = new Map(crmDuplicateConsolidationRowsForIds(
+    database,
+    'contact_submissions',
+    'id',
+    CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.flatMap((pair) => [
+      pair.survivorSubmissionId,
+      pair.supersededSubmissionId,
+    ]),
+  ).map((row) => [row.id, row]));
+  const opportunities = new Map(crmDuplicateConsolidationRowsForIds(
+    database,
+    'deal_hunter_opportunities',
+    'opportunity_id',
+    CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.opportunityId),
+  ).map((row) => [row.opportunity_id, row]));
+
+  const safePairs = [];
+  for (const pair of CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs) {
+    const survivor = submissions.get(pair.survivorSubmissionId);
+    const loser = submissions.get(pair.supersededSubmissionId);
+    const opportunity = opportunities.get(pair.opportunityId);
+    if (!survivor || !loser) blockers.push(`tuple-${pair.key}-submission-missing`);
+    if (!opportunity || opportunity.status !== 'active'
+      || opportunity.primary_submission_id !== pair.survivorSubmissionId) {
+      blockers.push(`primary-${pair.key}-authority-drift`);
+    }
+    const survivorOwner = parseCrmDuplicateConsolidationMetadata(survivor?.metadata)?.dealHunter?.opportunityId;
+    const loserOwner = parseCrmDuplicateConsolidationMetadata(loser?.metadata)?.dealHunter?.opportunityId;
+    if (survivorOwner !== pair.opportunityId
+      || (loserOwner && loserOwner !== pair.opportunityId)
+      || (survivor?.deal_hunter_opportunity_id && survivor.deal_hunter_opportunity_id !== pair.opportunityId)
+      || (loser?.deal_hunter_opportunity_id && loser.deal_hunter_opportunity_id !== pair.opportunityId)) {
+      blockers.push(`owner-${pair.key}-drift`);
+    }
+    const survivorListing = crmDuplicateConsolidationListingMatches(survivor, pair);
+    const loserListing = crmDuplicateConsolidationListingMatches(loser, pair, {
+        allowMissing: pair.key === 'berlin',
+      });
+    if (!survivorListing.valid || !loserListing.valid) {
+      blockers.push(`listing-${pair.key}-drift`);
+      blockers.push(...survivorListing.blockers.map((blocker) => `listing-${pair.key}-survivor:${blocker}`));
+      blockers.push(...loserListing.blockers.map((blocker) => `listing-${pair.key}-superseded:${blocker}`));
+    }
+    const survivorFinancial = crmDuplicateConsolidationFinancialMatches(survivor, pair);
+    const loserFinancial = crmDuplicateConsolidationFinancialMatches(loser, pair);
+    if (!survivorFinancial.valid || !loserFinancial.valid) {
+      const financialBlocker = [survivorFinancial.blocker, loserFinancial.blocker]
+        .find((blocker) => blocker === 'financial-label-or-source-value-drift');
+      blockers.push(financialBlocker
+        ? `financial-label-${pair.key}-drift`
+        : `financial-value-${pair.key}-drift`);
+    }
+    safePairs.push({
+      key: pair.key,
+      opportunityId: pair.opportunityId,
+      survivorSubmissionId: pair.survivorSubmissionId,
+      supersededSubmissionId: pair.supersededSubmissionId,
+      listingIdentity: pair.listingIdentity,
+      opportunityStatus: opportunity?.status || null,
+      primarySubmissionId: opportunity?.primary_submission_id || null,
+      survivorStatus: survivor?.status || null,
+      supersededStatus: loser?.status || null,
+    });
+  }
+
+  const berlinPair = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.find((pair) => pair.key === 'berlin');
+  blockers.push(...crmDuplicateConsolidationBerlinIdentityBlockers(database, {
+    survivor: submissions.get(berlinPair.survivorSubmissionId),
+    superseded: submissions.get(berlinPair.supersededSubmissionId),
+    opportunity: opportunities.get(berlinPair.opportunityId),
+  }));
+
+  const berlinImport = database.prepare(`
+    SELECT * FROM deal_hunter_crm_imports WHERE id = ? LIMIT 1
+  `).get(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id);
+  if (!berlinImport
+    || berlinImport.submission_id !== CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.beforeSubmissionId
+    || berlinImport.opportunity_id !== null) {
+    blockers.push('Berlin import tuple drift');
+  }
+  const existingRelations = database.prepare(`
+    SELECT * FROM crm_submission_supersessions
+    WHERE survivor_submission_id IN (${placeholders(2)})
+       OR superseded_submission_id IN (${placeholders(2)})
+       OR opportunity_id IN (${placeholders(2)})
+    ORDER BY id
+  `).all(
+    ...CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.survivorSubmissionId),
+    ...CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.supersededSubmissionId),
+    ...CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.opportunityId),
+  );
+  if (existingRelations.length) blockers.push('partial-or-independently-satisfied-supersession-state');
+  const { safety, runtimeSafetyAuthority } = crmDuplicateConsolidationSafety(
+    database,
+    blockers,
+    configAuthority,
+  );
+  const targetRows = [
+    ...submissions.values(),
+    ...opportunities.values(),
+    berlinImport,
+    database.prepare("SELECT * FROM deal_hunter_cim_safety_settings WHERE id = 'global'").get(),
+    database.prepare(`
+      SELECT * FROM deal_hunter_automation_settings
+      WHERE id = 'cim-initial-outreach'
+    `).get(),
+  ].filter(Boolean);
+  const rawRows = targetRows.map((row) => ({
+    table: row.opportunity_id && Object.hasOwn(row, 'primary_submission_id')
+      ? 'deal_hunter_opportunities'
+      : row.id === CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id
+        ? 'deal_hunter_crm_imports'
+        : row.id === 'global' && Object.hasOwn(row, 'outreach_paused')
+          ? 'deal_hunter_cim_safety_settings'
+          : row.id === 'cim-initial-outreach' && Object.hasOwn(row, 'paused')
+            ? 'deal_hunter_automation_settings'
+            : 'contact_submissions',
+    id: row.id || row.opportunity_id,
+    digest: crmDuplicateConsolidationRawDigest(row),
+  })).sort((left, right) => (
+    compareCrmDuplicateConsolidationText(left.table, right.table)
+      || compareCrmDuplicateConsolidationText(left.id, right.id)
+  ));
+  const referenceInventory = crmDuplicateConsolidationReferenceInventory(state);
+  blockers.push(...referenceInventory.blockers);
+  return {
+    provider: 'sqlite',
+    connection: connection || {
+      readonly: Boolean(database.readonly),
+      fileMustExist: true,
+      queryOnly: Number(database.pragma('query_only', { simple: true })) === 1,
+      consistentReadTransaction: Boolean(database.inTransaction),
+    },
+    blockers: [...new Set(blockers)].sort(),
+    database: {
+      logicalDigest: state.logicalDigest,
+      totalRows: state.totalRows,
+      quickCheck: String(database.pragma('quick_check', { simple: true }) || ''),
+      foreignKeyViolationCount: database.pragma('foreign_key_check').length,
+    },
+    schema: {
+      digest: state.schemaDigest,
+      tables: state.schema.map((table) => ({
+        name: table.name,
+        sqlDigest: table.sqlDigest,
+        columns: table.columns.map((column) => column.name),
+      })),
+      requiredObjects: state.requiredObjects,
+    },
+    relationshipInventory: referenceInventory.entries,
+    referenceIdentifiers: referenceInventory.identifiers,
+    tableDigests: state.tableDigests,
+    rawRows,
+    safety,
+    runtimeSafetyAuthority,
+    currentState: {
+      pairs: safePairs,
+      berlinImport: berlinImport ? {
+        id: berlinImport.id,
+        submissionId: berlinImport.submission_id,
+        opportunityId: berlinImport.opportunity_id,
+        updatedAt: berlinImport.updated_at,
+        metadataDigest: canonicalJsonSha256(berlinImport.metadata || '{}'),
+        metadataObjectDigest: canonicalJsonSha256(parseCrmDuplicateConsolidationMetadata(berlinImport.metadata)),
+        unchangedColumnsDigest: canonicalJsonSha256(
+          crmDuplicateConsolidationUnchangedBerlinColumns(berlinImport),
+        ),
+        rawDigest: crmDuplicateConsolidationRawDigest(berlinImport),
+      } : null,
+      existingRelationCount: existingRelations.length,
+      unchangedMutationTableDigests: crmDuplicateConsolidationUnchangedMutationDigests(database),
+    },
+  };
+}
+
+function inspectCrmDuplicateConsolidation(database, connection = null, configAuthority = null) {
+  const read = database.transaction(() => inspectCrmDuplicateConsolidationState(database, {
+    connection: connection || {
+      readonly: Boolean(database.readonly),
+      fileMustExist: true,
+      queryOnly: Number(database.pragma('query_only', { simple: true })) === 1,
+      consistentReadTransaction: true,
+    },
+    configAuthority,
+  }));
+  return read.deferred();
+}
+
+function inspectCrmDuplicateConsolidationRuntimeSafety(database, {
+  connection,
+  configAuthority,
+} = {}) {
+  const read = database.transaction(() => {
+    const blockers = [];
+    let runtimeSafetyAuthority = null;
+    try {
+      runtimeSafetyAuthority = crmDuplicateConsolidationRuntimeSafety(database, configAuthority);
+    } catch (error) {
+      blockers.push(`runtime-safety-authority-invalid:${error.message}`);
+    }
+    return {
+      provider: 'sqlite',
+      connection: connection || {
+        readonly: Boolean(database.readonly),
+        fileMustExist: true,
+        queryOnly: Number(database.pragma('query_only', { simple: true })) === 1,
+        consistentReadTransaction: true,
+      },
+      blockers,
+      runtimeSafetyAuthority,
+    };
+  });
+  return read.deferred();
+}
+
+function crmDuplicateConsolidationFinalState(database, { artifact, actor, reason, backup }) {
+  assertCrmDuplicateConsolidationRequiredObjects(
+    database,
+    artifact.plan.schema.requiredObjects,
+    'postcondition',
+  );
+  const relations = database.prepare(`
+    SELECT * FROM crm_submission_supersessions
+    WHERE repair_manifest_id = ? ORDER BY id
+  `).all(artifact.manifestId);
+  const berlinImport = database.prepare(`
+    SELECT * FROM deal_hunter_crm_imports WHERE id = ? LIMIT 1
+  `).get(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id);
+  const rawReceipt = database.prepare(`
+    SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ? LIMIT 1
+  `).get(artifact.manifestId);
+  const receipt = normalizeDealHunterRepairManifestRow(rawReceipt);
+  const expectedRelations = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => ({
+    id: crmDuplicateConsolidationRelationId(pair),
+    created_at: receipt?.created_at,
+    updated_at: receipt?.created_at,
+    status: 'active',
+    survivor_submission_id: pair.survivorSubmissionId,
+    superseded_submission_id: pair.supersededSubmissionId,
+    opportunity_id: pair.opportunityId,
+    reason_code: 'confirmed-duplicate',
+    reason_text: reason,
+    approved_by: CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.approvedBy,
+    approved_at: CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.approvedAt,
+    actor,
+    repair_version: CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+    repair_manifest_id: artifact.manifestId,
+    repair_digest: artifact.planChecksum,
+    reversed_at: null,
+    reversed_by: null,
+    reversal_reason: null,
+    reversal_manifest_id: null,
+    metadata: stableCrmDuplicateConsolidationJson({
+      schema: 'crm-submission-supersession-metadata-v1',
+      pairKey: pair.key,
+      listingIdentity: pair.listingIdentity,
+      manifestId: artifact.manifestId,
+    }),
+  })).sort((left, right) => compareCrmDuplicateConsolidationText(left.id, right.id));
+  const validRelations = stableCrmDuplicateConsolidationJson(relations)
+    === stableCrmDuplicateConsolidationJson(expectedRelations);
+  const berlinMetadata = parseCrmDuplicateConsolidationMetadata(berlinImport?.metadata);
+  const { crmDuplicateConsolidation: berlinProvenance, ...berlinPriorMetadata } = berlinMetadata;
+  const expectedBerlinProvenance = {
+    schema: 'crm-duplicate-consolidation-import-provenance-v1',
+    manifestId: artifact.manifestId,
+    planChecksum: artifact.planChecksum,
+    priorSubmissionId: CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.beforeSubmissionId,
+    priorUpdatedAt: artifact.plan.currentState.berlinImport.updatedAt,
+    priorMetadataDigest: artifact.plan.currentState.berlinImport.metadataDigest,
+  };
+  const validImport = berlinImport?.submission_id
+      === CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.afterSubmissionId
+    && berlinImport?.opportunity_id === null
+    && berlinImport?.updated_at === receipt?.created_at
+    && canonicalJsonSha256(crmDuplicateConsolidationUnchangedBerlinColumns(berlinImport))
+      === artifact.plan.currentState.berlinImport.unchangedColumnsDigest
+    && canonicalJsonSha256(berlinPriorMetadata)
+      === artifact.plan.currentState.berlinImport.metadataObjectDigest
+    && stableCrmDuplicateConsolidationJson(berlinProvenance)
+      === stableCrmDuplicateConsolidationJson(expectedBerlinProvenance);
+  const validUnchangedMutationTables = stableCrmDuplicateConsolidationJson(
+    crmDuplicateConsolidationUnchangedMutationDigests(database),
+  ) === stableCrmDuplicateConsolidationJson(
+    artifact.plan.currentState.unchangedMutationTableDigests,
+  );
+  const appliedState = { valid: validRelations && validImport && validUnchangedMutationTables };
+  validateCrmDuplicateConsolidationReceipt({
+    row: receipt,
+    rawRow: rawReceipt,
+    artifact,
+    actor,
+    reason,
+    backup,
+    appliedState,
+  });
+  if (!appliedState.valid) throw new Error('CRM duplicate consolidation final state is partial or conflicting.');
+  const quickCheck = String(database.pragma('quick_check', { simple: true }) || '');
+  const foreignKeyViolations = database.pragma('foreign_key_check');
+  if (quickCheck !== 'ok' || foreignKeyViolations.length) {
+    throw new Error('CRM duplicate consolidation postcondition integrity check failed.');
+  }
+  return { relations, berlinImport, receipt, quickCheck, foreignKeyViolationCount: 0, valid: true };
+}
+
+export function createSqliteCrmDuplicateConsolidationReadOnlyStorage(config, {
+  environment = process.env,
+} = {}) {
+  if (config?.storage?.provider && config.storage.provider !== 'sqlite') {
+    throw new Error('CRM duplicate consolidation is SQLite-only.');
+  }
+  const sqlitePath = String(config?.storage?.sqlitePath || '').trim();
+  if (!sqlitePath) throw new Error('CRM duplicate consolidation requires an existing SQLite database path.');
+  const configAuthority = selectCrmDuplicateConsolidationConfigAuthority({ config, environment });
+  const database = new Database(sqlitePath, { readonly: true, fileMustExist: true });
+  database.pragma('query_only = ON');
+  if (!database.readonly || Number(database.pragma('query_only', { simple: true })) !== 1) {
+    database.close();
+    throw new Error('CRM duplicate consolidation could not enforce read-only query-only preview.');
+  }
+  let closed = false;
+  return {
+    provider: 'sqlite',
+    close() {
+      if (closed) return;
+      closed = true;
+      database.close();
+    },
+    async inspectCrmDuplicateConsolidation() {
+      return inspectCrmDuplicateConsolidation(database, {
+        readonly: true,
+        fileMustExist: true,
+        queryOnly: true,
+        consistentReadTransaction: true,
+      }, configAuthority);
+    },
+    async inspectCrmDuplicateConsolidationRuntimeSafety() {
+      return inspectCrmDuplicateConsolidationRuntimeSafety(database, {
+        configAuthority,
+        connection: {
+          readonly: true,
+          fileMustExist: true,
+          queryOnly: true,
+          consistentReadTransaction: true,
+        },
+      });
+    },
+    getCrmDuplicateConsolidationConfigAuthority() {
+      return configAuthority;
+    },
+  };
 }
 
 export function createSqliteCanonicalOpportunityMergeReadOnlyStorage(config) {
@@ -2258,11 +3386,19 @@ export function createSqliteCanonicalOpportunityMergeReadOnlyStorage(config) {
   };
 }
 
-export function createSqliteStorage(config) {
+export function createSqliteStorage(config, options = {}) {
   const directory = path.dirname(config.storage.sqlitePath);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
 
   const database = new Database(config.storage.sqlitePath);
+  const crmDuplicateConsolidationBackupVerifications = new WeakMap();
+  const crmDuplicateConsolidationConfigAuthority = Object.hasOwn(
+    options,
+    'crmDuplicateConsolidationEnvironment',
+  ) ? selectCrmDuplicateConsolidationConfigAuthority({
+      config,
+      environment: options.crmDuplicateConsolidationEnvironment,
+    }) : null;
   database.function('deal_hunter_cim_authority_sort_key', { deterministic: true }, (updatedAt, createdAt) => {
     const authorityAt = firstStrictDetailAuthorityTimestamp(
       { updated_at: updatedAt, created_at: createdAt },
@@ -2961,6 +4097,252 @@ export function createSqliteStorage(config) {
         metadata TEXT NOT NULL DEFAULT '{}'
       );
 
+      CREATE TABLE IF NOT EXISTS crm_submission_supersessions (
+        id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('active', 'reversed')),
+        survivor_submission_id TEXT NOT NULL,
+        superseded_submission_id TEXT NOT NULL,
+        opportunity_id TEXT NOT NULL,
+        reason_code TEXT NOT NULL CHECK (reason_code = 'confirmed-duplicate'),
+        reason_text TEXT NOT NULL,
+        approved_by TEXT NOT NULL,
+        approved_at TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        repair_version TEXT NOT NULL,
+        repair_manifest_id TEXT NOT NULL,
+        repair_digest TEXT NOT NULL,
+        reversed_at TEXT,
+        reversed_by TEXT,
+        reversal_reason TEXT,
+        reversal_manifest_id TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        CHECK (survivor_submission_id <> superseded_submission_id),
+        CHECK (
+          (status = 'active' AND reversed_at IS NULL AND reversed_by IS NULL AND reversal_manifest_id IS NULL)
+          OR
+          (status = 'reversed' AND reversed_at IS NOT NULL AND reversed_by IS NOT NULL AND reversal_manifest_id IS NOT NULL)
+        ),
+        FOREIGN KEY (survivor_submission_id) REFERENCES contact_submissions(id) ON DELETE RESTRICT,
+        FOREIGN KEY (superseded_submission_id) REFERENCES contact_submissions(id) ON DELETE RESTRICT,
+        FOREIGN KEY (opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT,
+        FOREIGN KEY (repair_manifest_id) REFERENCES deal_hunter_cim_repair_manifests(id) ON DELETE RESTRICT,
+        FOREIGN KEY (reversal_manifest_id) REFERENCES deal_hunter_cim_repair_manifests(id) ON DELETE RESTRICT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_crm_submission_supersessions_survivor
+        ON crm_submission_supersessions(survivor_submission_id, status);
+      CREATE INDEX IF NOT EXISTS idx_crm_submission_supersessions_opportunity
+        ON crm_submission_supersessions(opportunity_id, status);
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_crm_submission_supersessions_active_loser
+        ON crm_submission_supersessions(superseded_submission_id)
+        WHERE status = 'active';
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_duplicate_consolidation_receipt_no_update
+      BEFORE UPDATE ON deal_hunter_cim_repair_manifests
+      WHEN OLD.mode = 'crm-duplicate-consolidation'
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM duplicate consolidation receipt is append-only and immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_duplicate_consolidation_receipt_no_delete
+      BEFORE DELETE ON deal_hunter_cim_repair_manifests
+      WHEN OLD.mode = 'crm-duplicate-consolidation'
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM duplicate consolidation receipt is append-only and immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_validate_insert
+      BEFORE INSERT ON crm_submission_supersessions
+      BEGIN
+        SELECT CASE WHEN NEW.survivor_submission_id = NEW.superseded_submission_id
+          THEN RAISE(ABORT, 'CRM supersession survivor and loser cannot be the same') END;
+        SELECT CASE WHEN NEW.status <> 'active'
+          THEN RAISE(ABORT, 'CRM supersession must begin active') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM contact_submissions WHERE id = NEW.survivor_submission_id
+        ) THEN RAISE(ABORT, 'CRM supersession survivor is missing') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM contact_submissions WHERE id = NEW.superseded_submission_id
+        ) THEN RAISE(ABORT, 'CRM supersession superseded loser is missing') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM deal_hunter_opportunities
+          WHERE opportunity_id = NEW.opportunity_id AND status = 'active'
+        ) THEN RAISE(ABORT, 'CRM supersession requires an active opportunity') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM deal_hunter_opportunities
+          WHERE opportunity_id = NEW.opportunity_id
+            AND primary_submission_id = NEW.survivor_submission_id
+        ) THEN RAISE(ABORT, 'CRM supersession opportunity primary must be the survivor') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM contact_submissions AS submission
+          WHERE submission.id = NEW.survivor_submission_id
+            AND COALESCE(NULLIF(TRIM(submission.deal_hunter_opportunity_id), ''), '') IN ('', NEW.opportunity_id)
+            AND COALESCE(NULLIF(TRIM(json_extract(submission.metadata, '$.dealHunter.opportunityId')), ''), '') IN ('', NEW.opportunity_id)
+            AND (
+              NULLIF(TRIM(submission.deal_hunter_opportunity_id), '') = NEW.opportunity_id
+              OR NULLIF(TRIM(json_extract(submission.metadata, '$.dealHunter.opportunityId')), '') = NEW.opportunity_id
+            )
+        ) THEN RAISE(ABORT, 'CRM supersession survivor owner is incompatible') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM contact_submissions AS submission
+          WHERE submission.id = NEW.superseded_submission_id
+            AND COALESCE(NULLIF(TRIM(submission.deal_hunter_opportunity_id), ''), '') IN ('', NEW.opportunity_id)
+            AND COALESCE(NULLIF(TRIM(json_extract(submission.metadata, '$.dealHunter.opportunityId')), ''), '') IN ('', NEW.opportunity_id)
+        ) THEN RAISE(ABORT, 'CRM supersession superseded owner is incompatible') END;
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM deal_hunter_opportunities
+          WHERE primary_submission_id = NEW.superseded_submission_id
+        ) THEN RAISE(ABORT, 'CRM supersession loser cannot be an opportunity primary') END;
+        SELECT CASE WHEN NOT EXISTS (
+          SELECT 1 FROM deal_hunter_cim_repair_manifests
+          WHERE id = NEW.repair_manifest_id
+            AND mode = 'crm-duplicate-consolidation'
+            AND status = 'applied'
+            AND checksum = NEW.repair_digest
+        ) THEN RAISE(ABORT, 'CRM supersession receipt or digest is invalid') END;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_no_active_chain_insert
+      BEFORE INSERT ON crm_submission_supersessions
+      WHEN NEW.status = 'active'
+      BEGIN
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM crm_submission_supersessions
+          WHERE status = 'active'
+            AND (
+              superseded_submission_id = NEW.survivor_submission_id
+              OR survivor_submission_id = NEW.superseded_submission_id
+            )
+        ) THEN RAISE(ABORT, 'CRM supersession active role would create a chain') END;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_no_active_chain_update
+      BEFORE UPDATE ON crm_submission_supersessions
+      WHEN NEW.status = 'active'
+      BEGIN
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM crm_submission_supersessions
+          WHERE status = 'active' AND id <> OLD.id
+            AND (
+              superseded_submission_id = NEW.survivor_submission_id
+              OR survivor_submission_id = NEW.superseded_submission_id
+            )
+        ) THEN RAISE(ABORT, 'CRM supersession active role would create a chain') END;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_immutable_update
+      BEFORE UPDATE ON crm_submission_supersessions
+      WHEN NEW.id IS NOT OLD.id
+        OR NEW.created_at IS NOT OLD.created_at
+        OR NEW.survivor_submission_id IS NOT OLD.survivor_submission_id
+        OR NEW.superseded_submission_id IS NOT OLD.superseded_submission_id
+        OR NEW.opportunity_id IS NOT OLD.opportunity_id
+        OR NEW.reason_code IS NOT OLD.reason_code
+        OR NEW.reason_text IS NOT OLD.reason_text
+        OR NEW.approved_by IS NOT OLD.approved_by
+        OR NEW.approved_at IS NOT OLD.approved_at
+        OR NEW.actor IS NOT OLD.actor
+        OR NEW.repair_version IS NOT OLD.repair_version
+        OR NEW.repair_manifest_id IS NOT OLD.repair_manifest_id
+        OR NEW.repair_digest IS NOT OLD.repair_digest
+        OR NEW.metadata IS NOT OLD.metadata
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM supersession core fields are immutable');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_no_delete
+      BEFORE DELETE ON crm_submission_supersessions
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM supersession physical delete is forbidden');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_guard_contact_owner_update
+      BEFORE UPDATE OF id, deal_hunter_opportunity_id, metadata ON contact_submissions
+      BEGIN
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM crm_submission_supersessions AS relation
+          WHERE relation.status = 'active'
+            AND relation.survivor_submission_id = OLD.id
+            AND (
+              NEW.id <> OLD.id
+              OR COALESCE(NULLIF(TRIM(NEW.deal_hunter_opportunity_id), ''), '') NOT IN ('', relation.opportunity_id)
+              OR COALESCE(NULLIF(TRIM(json_extract(NEW.metadata, '$.dealHunter.opportunityId')), ''), '') NOT IN ('', relation.opportunity_id)
+              OR (
+                COALESCE(NULLIF(TRIM(NEW.deal_hunter_opportunity_id), ''), '') <> relation.opportunity_id
+                AND COALESCE(NULLIF(TRIM(json_extract(NEW.metadata, '$.dealHunter.opportunityId')), ''), '') <> relation.opportunity_id
+              )
+            )
+        ) THEN RAISE(ABORT, 'CRM supersession survivor owner cannot be invalidated') END;
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM crm_submission_supersessions AS relation
+          WHERE relation.status = 'active'
+            AND relation.superseded_submission_id = OLD.id
+            AND (
+              NEW.id <> OLD.id
+              OR COALESCE(NULLIF(TRIM(NEW.deal_hunter_opportunity_id), ''), '') NOT IN ('', relation.opportunity_id)
+              OR COALESCE(NULLIF(TRIM(json_extract(NEW.metadata, '$.dealHunter.opportunityId')), ''), '') NOT IN ('', relation.opportunity_id)
+            )
+        ) THEN RAISE(ABORT, 'CRM supersession superseded owner cannot be invalidated') END;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_guard_opportunity_update
+      BEFORE UPDATE OF opportunity_id, status, primary_submission_id ON deal_hunter_opportunities
+      BEGIN
+        SELECT CASE WHEN EXISTS (
+          SELECT 1 FROM crm_submission_supersessions AS relation
+          WHERE relation.status = 'active'
+            AND relation.opportunity_id = OLD.opportunity_id
+            AND (
+              NEW.opportunity_id <> OLD.opportunity_id
+              OR NEW.status <> 'active'
+              OR NEW.primary_submission_id IS NOT relation.survivor_submission_id
+            )
+        ) THEN RAISE(ABORT, 'CRM supersession opportunity authority cannot be invalidated') END;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_opportunities_reject_superseded_primary_insert
+      BEFORE INSERT ON deal_hunter_opportunities
+      WHEN NEW.primary_submission_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM crm_submission_supersessions
+          WHERE status = 'active' AND superseded_submission_id = NEW.primary_submission_id
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM superseded primary is forbidden');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_opportunities_reject_superseded_primary_update
+      BEFORE UPDATE OF primary_submission_id ON deal_hunter_opportunities
+      WHEN NEW.primary_submission_id IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM crm_submission_supersessions
+          WHERE status = 'active' AND superseded_submission_id = NEW.primary_submission_id
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM superseded primary is forbidden');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_guard_contact_delete
+      BEFORE DELETE ON contact_submissions
+      WHEN EXISTS (
+        SELECT 1 FROM crm_submission_supersessions
+        WHERE survivor_submission_id = OLD.id OR superseded_submission_id = OLD.id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM supersession referenced contact delete is forbidden');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_crm_submission_supersessions_guard_opportunity_delete
+      BEFORE DELETE ON deal_hunter_opportunities
+      WHEN EXISTS (
+        SELECT 1 FROM crm_submission_supersessions WHERE opportunity_id = OLD.opportunity_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'CRM supersession referenced opportunity delete is forbidden');
+      END;
+
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_stage2_activations (
         id TEXT PRIMARY KEY,
         created_at TEXT NOT NULL,
@@ -3250,6 +4632,8 @@ export function createSqliteStorage(config) {
 		CREATE INDEX IF NOT EXISTS idx_admin_onboarding_progress_principal_updated
 		  ON admin_onboarding_progress(principal_id, updated_at DESC);
 	  `);
+
+  migrateCrmSubmissionReversalTrigger(database);
 
   ensureColumn(database, 'contact_submissions', 'lead_type', "TEXT NOT NULL DEFAULT 'owner'");
   ensureColumn(database, 'contact_submissions', 'priority', "TEXT NOT NULL DEFAULT 'normal'");
@@ -4133,6 +5517,7 @@ export function createSqliteStorage(config) {
   `);
 
   const claimDealHunterCimRequestTransaction = database.transaction(({ request, pendingCutoff }) => {
+    if (request.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
     const submission = request.submission_id
       ? database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1').get(request.submission_id)
       : null;
@@ -4271,6 +5656,8 @@ export function createSqliteStorage(config) {
 	    staleBefore,
 	    nowIso,
 	  }) => {
+	    const currentRequest = database.prepare('SELECT submission_id FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1').get(id);
+	    if (currentRequest?.submission_id) assertCrmSubmissionWritableInTransaction(currentRequest.submission_id);
 	    const current = database.prepare('SELECT * FROM deal_hunter_cim_requests WHERE id = ? LIMIT 1').get(id);
 	    if (isMarkedManualFollowUpRequest(normalizeDealHunterCimRequestRow(current))) {
 	      return {
@@ -4341,6 +5728,7 @@ export function createSqliteStorage(config) {
     nextFollowUpAt,
     activity,
   }) => {
+    assertCrmSubmissionWritableInTransaction(expectedSubmissionId);
     const authority = loadManualFollowUpAuthority(requestId);
     if (!authority.request) {
       return manualFollowUpResult({ reason: 'request-missing' });
@@ -4416,6 +5804,7 @@ export function createSqliteStorage(config) {
     reason,
     activity,
   }) => {
+    assertCrmSubmissionWritableInTransaction(expectedSubmissionId);
     const authority = loadManualFollowUpAuthority(requestId);
     if (!authority.request) return manualFollowUpResult({ reason: 'request-missing' });
     if (!authority.submission) {
@@ -4477,6 +5866,7 @@ export function createSqliteStorage(config) {
     expectedNextFollowUpAt,
     claimedAt,
   }) => {
+    assertCrmSubmissionWritableInTransaction(expectedSubmissionId);
     const authority = loadManualFollowUpAuthority(requestId);
     if (!authority.request) return manualFollowUpResult({ reason: 'request-missing' });
     if (!authority.submission) {
@@ -4844,6 +6234,110 @@ export function createSqliteStorage(config) {
 	    WHERE id = @id
 	  `);
 
+    function selectDealHunterCrmImportRow({ id = '', opportunityId = '', dealKey = '', listingIdentity = '' } = {}) {
+      const lookups = [
+        ['opportunity_id', opportunityId],
+        ['id', id],
+        ['deal_key', dealKey],
+        ['listing_identity', listingIdentity],
+      ];
+      for (const [field, value] of lookups) {
+        if (!value) continue;
+        const row = database.prepare(`SELECT * FROM deal_hunter_crm_imports WHERE ${field} = ? ORDER BY updated_at DESC LIMIT 1`).get(value);
+        if (row) return row;
+      }
+      return null;
+    }
+
+    const claimDealHunterCrmImportTransaction = database.transaction(({ record, pendingCutoff = '' }) => {
+      const serializedRecord = serializeDealHunterCrmImport(record);
+      let existing = selectDealHunterCrmImportRow({
+        id: record.id,
+        opportunityId: record.opportunity_id,
+        dealKey: record.deal_key,
+        listingIdentity: record.listing_identity,
+      });
+
+      if (existing?.submission_id) {
+        assertCrmSubmissionWritableInTransaction(existing.submission_id);
+      }
+
+      if (!existing) {
+        if (serializedRecord.submission_id) {
+          assertCrmSubmissionWritableInTransaction(serializedRecord.submission_id);
+        }
+        try {
+          insertDealHunterCrmImportStatement.run(serializedRecord);
+          return {
+            claimed: true,
+            importRecord: normalizeDealHunterCrmImportRow(selectDealHunterCrmImportRow({ id: record.id })),
+          };
+        } catch (error) {
+          if (error?.code !== 'SQLITE_CONSTRAINT_UNIQUE' && error?.code !== 'SQLITE_CONSTRAINT_PRIMARYKEY') {
+            throw error;
+          }
+          existing = selectDealHunterCrmImportRow({
+            id: record.id,
+            opportunityId: record.opportunity_id,
+            dealKey: record.deal_key,
+            listingIdentity: record.listing_identity,
+          });
+          if (existing?.submission_id) {
+            assertCrmSubmissionWritableInTransaction(existing.submission_id);
+          }
+        }
+      }
+
+      const claimTarget = existing
+        ? { ...serializedRecord, id: existing.id, pending_cutoff: pendingCutoff || '' }
+        : { ...serializedRecord, pending_cutoff: pendingCutoff || '' };
+      const updateResult = existing
+        ? claimDealHunterCrmImportStatement.run(claimTarget)
+        : { changes: 0 };
+      return {
+        claimed: updateResult.changes > 0,
+        importRecord: normalizeDealHunterCrmImportRow(selectDealHunterCrmImportRow({
+          id: existing?.id || record.id,
+          opportunityId: record.opportunity_id,
+          dealKey: record.deal_key,
+          listingIdentity: record.listing_identity,
+        })),
+      };
+    });
+
+    const updateDealHunterCrmImportTransaction = database.transaction(({ id, values = {} }) => {
+      const current = database.prepare('SELECT * FROM deal_hunter_crm_imports WHERE id = ? LIMIT 1').get(id);
+      if (!current) return null;
+
+      const sourceSubmissionId = String(current.submission_id || '').trim();
+      if (sourceSubmissionId) {
+        assertCrmSubmissionWritableInTransaction(sourceSubmissionId);
+      }
+
+      const targetSubmissionId = Object.hasOwn(values, 'submission_id')
+        ? String(values.submission_id || '').trim()
+        : '';
+      if (targetSubmissionId && targetSubmissionId !== sourceSubmissionId) {
+        assertCrmSubmissionWritableInTransaction(targetSubmissionId);
+      }
+
+      updateDealHunterCrmImportStatement.run({
+        id,
+        updated_at: values.updated_at || null,
+        opportunity_id: values.opportunity_id || null,
+        listing_identity: values.listing_identity || null,
+        listing_url: values.listing_url || null,
+        submission_id: values.submission_id || null,
+        status: values.status || null,
+        source_name: values.source_name || null,
+        metadata: values.metadata ? JSON.stringify(values.metadata) : null,
+      });
+
+      return normalizeDealHunterCrmImportRow(
+        database.prepare('SELECT * FROM deal_hunter_crm_imports WHERE id = ? LIMIT 1').get(id),
+      );
+    });
+
   const upsertDealHunterDispositionStatement = database.prepare(`
     INSERT INTO deal_hunter_dispositions (
       id, deal_key, submission_id, communication_id, listing_url, deal_name,
@@ -4944,6 +6438,7 @@ export function createSqliteStorage(config) {
   }
 
   function insertCrmActivityEvent(event) {
+    assertCrmSubmissionWritableInTransaction(event?.submission_id);
     insertCrmActivityEventStatement.run(serializeCrmActivityEvent(event));
     return normalizeCrmActivityEventRow(serializeCrmActivityEvent(event));
   }
@@ -5036,8 +6531,38 @@ export function createSqliteStorage(config) {
     `).get(submissionId, initialCutoff, followUpCutoff);
   }
 
+  function assertCrmSubmissionWritableInTransaction(submissionId) {
+    const requestedSubmissionId = String(submissionId || '').trim();
+    const relation = selectActiveCrmSubmissionSupersessions(database, {
+      submissionIds: requestedSubmissionId ? [requestedSubmissionId] : [],
+      limit: 1,
+    }).find((candidate) => candidate.supersededSubmissionId === requestedSubmissionId);
+    if (relation) {
+      throw new CrmSubmissionSupersededError({
+        submissionId: requestedSubmissionId,
+        survivorSubmissionId: relation.survivorSubmissionId,
+        opportunityId: relation.opportunityId,
+      });
+    }
+  }
+
   const mutateWithCrmActivityTransaction = database.transaction(({ operation, payload, activity }) => {
     let record = null;
+
+    if (activity?.submission_id) {
+      assertCrmSubmissionWritableInTransaction(activity.submission_id);
+    }
+
+    const mutatedSubmissionId = operation === 'update_submission'
+      ? payload.id
+      : operation === 'archive_submission'
+        ? payload.id || payload.submissionId
+        : operation === 'dismiss_deal_hunter_opportunity'
+          ? payload.submissionId
+          : '';
+    if (mutatedSubmissionId) {
+      assertCrmSubmissionWritableInTransaction(mutatedSubmissionId);
+    }
 
     if (operation === 'insert_submission') {
       const canonicalOpportunityId = payload.submission?.deal_hunter_opportunity_id || '';
@@ -5449,6 +6974,138 @@ export function createSqliteStorage(config) {
   return {
     provider: 'sqlite',
 
+    async listActiveCrmSubmissionSupersessions(filters = {}) {
+      return selectActiveCrmSubmissionSupersessions(database, filters);
+    },
+
+    async getCrmSubmissionSupersessionContext(submissionId) {
+      const requestedSubmissionId = String(submissionId || '').trim();
+      const relations = selectActiveCrmSubmissionSupersessions(database, {
+        submissionIds: requestedSubmissionId ? [requestedSubmissionId] : [],
+      });
+      const supersededRelation = relations.find(
+        (relation) => relation.supersededSubmissionId === requestedSubmissionId,
+      ) || null;
+      if (supersededRelation) {
+        return {
+          requestedSubmissionId,
+          canonicalSubmissionId: supersededRelation.survivorSubmissionId,
+          opportunityId: supersededRelation.opportunityId,
+          isSuperseded: true,
+          relation: supersededRelation,
+          supersededSubmissions: [],
+          historySubmissionIds: [
+            supersededRelation.survivorSubmissionId,
+            supersededRelation.supersededSubmissionId,
+          ],
+        };
+      }
+      const survivorRelations = relations.filter(
+        (relation) => relation.survivorSubmissionId === requestedSubmissionId,
+      );
+      return {
+        requestedSubmissionId,
+        canonicalSubmissionId: requestedSubmissionId,
+        opportunityId: survivorRelations[0]?.opportunityId || null,
+        isSuperseded: false,
+        relation: null,
+        supersededSubmissions: survivorRelations,
+        historySubmissionIds: [
+          requestedSubmissionId,
+          ...survivorRelations.map((relation) => relation.supersededSubmissionId),
+        ],
+      };
+    },
+
+    async assertCrmSubmissionWritable(submissionId) {
+      assertCrmSubmissionWritableInTransaction(submissionId);
+      return this.getCrmSubmissionSupersessionContext(submissionId);
+    },
+
+    async auditCrmSubmissionSupersessions() {
+      const rawRows = database.prepare(`
+        SELECT * FROM crm_submission_supersessions
+        ORDER BY opportunity_id ASC, survivor_submission_id ASC,
+          superseded_submission_id ASC, id ASC
+        LIMIT ?
+      `).all(crmSubmissionSupersessionMaximumRows + 1);
+      const violations = [];
+      if (rawRows.length > crmSubmissionSupersessionMaximumRows) {
+        violations.push({ code: 'supersession-audit-bound-exceeded' });
+      }
+      const activeRoles = new Map();
+      for (const rawRow of rawRows.slice(0, crmSubmissionSupersessionMaximumRows)) {
+        const relation = normalizeCrmSubmissionSupersessionRow(rawRow);
+        const survivor = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(
+          relation.survivorSubmissionId,
+        );
+        const superseded = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(
+          relation.supersededSubmissionId,
+        );
+        const opportunity = database.prepare(
+          'SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ?',
+        ).get(relation.opportunityId);
+        const receipt = database.prepare(
+          'SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ?',
+        ).get(relation.repairManifestId);
+        if (!survivor) violations.push({ code: 'survivor-missing', relationId: relation.id });
+        if (!superseded) violations.push({ code: 'superseded-missing', relationId: relation.id });
+        if (
+          !receipt
+          || receipt.mode !== 'crm-duplicate-consolidation'
+          || receipt.status !== 'applied'
+          || receipt.checksum !== relation.repairDigest
+        ) violations.push({ code: 'repair-receipt-invalid', relationId: relation.id });
+        if (relation.status === 'active') {
+          if (
+            !opportunity
+            || opportunity.status !== 'active'
+            || opportunity.primary_submission_id !== relation.survivorSubmissionId
+          ) violations.push({ code: 'opportunity-authority-invalid', relationId: relation.id });
+          const survivorRow = survivor ? normalizeSubmissionRow(survivor) : null;
+          const supersededRow = superseded ? normalizeSubmissionRow(superseded) : null;
+          const survivorDirectOwner = String(survivorRow?.deal_hunter_opportunity_id || '').trim();
+          const survivorMetadataOwner = crmSubmissionMetadataOwner(survivorRow);
+          const supersededDirectOwner = String(supersededRow?.deal_hunter_opportunity_id || '').trim();
+          const supersededMetadataOwner = crmSubmissionMetadataOwner(supersededRow);
+          if (
+            ![survivorDirectOwner, survivorMetadataOwner].includes(relation.opportunityId)
+            || [survivorDirectOwner, survivorMetadataOwner].some(
+              (owner) => owner && owner !== relation.opportunityId,
+            )
+          ) violations.push({ code: 'survivor-owner-invalid', relationId: relation.id });
+          if ([supersededDirectOwner, supersededMetadataOwner].some(
+            (owner) => owner && owner !== relation.opportunityId,
+          )) violations.push({ code: 'superseded-owner-invalid', relationId: relation.id });
+          const supersededIsPrimary = database.prepare(`
+            SELECT 1 FROM deal_hunter_opportunities
+            WHERE primary_submission_id = ? LIMIT 1
+          `).get(relation.supersededSubmissionId);
+          if (supersededIsPrimary) {
+            violations.push({ code: 'superseded-is-primary', relationId: relation.id });
+          }
+          if (
+            activeRoles.get(relation.survivorSubmissionId) === 'superseded'
+            || activeRoles.has(relation.supersededSubmissionId)
+          ) {
+            violations.push({ code: 'active-role-conflict', relationId: relation.id });
+          }
+          if (!activeRoles.has(relation.survivorSubmissionId)) {
+            activeRoles.set(relation.survivorSubmissionId, 'survivor');
+          }
+          activeRoles.set(relation.supersededSubmissionId, 'superseded');
+        } else {
+          const reversalReceipt = database.prepare(`
+            SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ?
+          `).get(relation.reversalManifestId);
+          if (!crmSubmissionReversalReceiptMatches(relation, reversalReceipt)) {
+            violations.push({ code: 'reversal-receipt-invalid', relationId: relation.id });
+          }
+        }
+      }
+      return { ok: violations.length === 0, violationCount: violations.length, violations };
+    },
+
     async createApplicationBackup(destination) {
       await database.backup(destination);
       return destination;
@@ -5473,28 +7130,37 @@ export function createSqliteStorage(config) {
     },
 
     async updateSubmission(id, values) {
-      updateRecord(
-        'contact_submissions',
-        id,
-        values,
-        submissionUpdateFields,
-        submissionJsonFields,
-      );
-
-      return this.getSubmission(id);
+      const transaction = database.transaction(() => {
+        assertCrmSubmissionWritableInTransaction(id);
+        updateRecord(
+          'contact_submissions',
+          id,
+          values,
+          submissionUpdateFields,
+          submissionJsonFields,
+        );
+        const row = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(id);
+        return row ? normalizeSubmissionRow(row) : null;
+      });
+      return transaction.immediate();
     },
 
     async updateSubmissionIfCurrent(id, expectedUpdatedAt, values) {
-      const result = updateRecord(
-        'contact_submissions',
-        id,
-        values,
-        submissionUpdateFields,
-        submissionJsonFields,
-        expectedUpdatedAt,
-      );
-
-      return result.changes > 0 ? this.getSubmission(id) : null;
+      const transaction = database.transaction(() => {
+        assertCrmSubmissionWritableInTransaction(id);
+        const result = updateRecord(
+          'contact_submissions',
+          id,
+          values,
+          submissionUpdateFields,
+          submissionJsonFields,
+          expectedUpdatedAt,
+        );
+        if (result.changes === 0) return null;
+        const row = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(id);
+        return row ? normalizeSubmissionRow(row) : null;
+      });
+      return transaction.immediate();
     },
 
     async getSubmission(id) {
@@ -5541,6 +7207,7 @@ export function createSqliteStorage(config) {
 
     async deleteSubmission(id, { deletedAt = '' } = {}) {
       const transaction = database.transaction((submissionId, requestedDeletedAt) => {
+        assertCrmSubmissionWritableInTransaction(submissionId);
         const existingRow = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(submissionId);
 
         if (!existingRow) {
@@ -5709,12 +7376,21 @@ export function createSqliteStorage(config) {
       return matchedRow ? normalizeSubmissionRow(matchedRow) : null;
     },
 
-    async readDealHunterCrmMatchAuthority({ limit = dealHunterCrmMatchAuthorityMaximumRows } = {}) {
-      const read = database.transaction(() => dealHunterCrmMatchAuthoritySnapshot(database, { limit }));
+    async readDealHunterCrmMatchAuthority({
+      limit = dealHunterCrmMatchAuthorityMaximumRows,
+      supersessionLimit = crmSubmissionSupersessionMaximumRows,
+    } = {}) {
+      const read = database.transaction(() => dealHunterCrmMatchAuthoritySnapshot(database, {
+        limit,
+        supersessionLimit,
+      }));
       const snapshot = read.deferred();
       return {
         rows: snapshot.rows,
+        supersessions: snapshot.supersessions,
         count: snapshot.count,
+        submissionCount: snapshot.submissionCount,
+        supersessionCount: snapshot.supersessionCount,
         complete: snapshot.complete,
         revision: snapshot.revision,
         revisionVersion: snapshot.revisionVersion,
@@ -5722,7 +7398,7 @@ export function createSqliteStorage(config) {
     },
 
     async listSubmissions({ limit = 50, page = 1, search = '', status = 'all', createdAfter = '', sort = 'created_at', direction = 'desc' } = {}) {
-      const clauses = [];
+      const clauses = [activeCrmSubmissionPredicate('submissions')];
       const params = [];
 
       if (status && status !== 'all') {
@@ -5755,7 +7431,7 @@ export function createSqliteStorage(config) {
         params.push(String(search).toLowerCase());
       }
 
-      const whereClause = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+      const whereClause = `WHERE ${clauses.join(' AND ')}`;
       const requestedLimit = Number(limit);
       const requestedPage = Number(page);
       const safeLimit = Number.isFinite(requestedLimit)
@@ -5780,7 +7456,7 @@ export function createSqliteStorage(config) {
       const rows = database
         .prepare(
           `
-            SELECT * FROM contact_submissions
+            SELECT submissions.* FROM contact_submissions AS submissions
             ${whereClause}
             ORDER BY ${sortExpression} ${sortDirection}, created_at DESC, id ASC
             LIMIT ?
@@ -5790,12 +7466,25 @@ export function createSqliteStorage(config) {
         .all(...params, safeLimit, offset)
         .map(normalizeSubmissionRow);
 
-      const totalRow = database.prepare(`SELECT COUNT(*) AS count FROM contact_submissions ${whereClause}`).get(...params);
+      // List and count remain separate SQLite statements. Both independently
+      // carry the same active-row predicate so pagination cannot count losers.
+      const totalRow = database.prepare(`
+        SELECT COUNT(*) AS count FROM contact_submissions AS submissions ${whereClause}
+      `).get(...params);
 
       return {
         rows,
         total: totalRow?.count || 0,
       };
+    },
+
+    async listHistoricalSubmissionsForAdminExport() {
+      return database.prepare(`
+        SELECT *
+        FROM contact_submissions
+        ORDER BY created_at DESC, id ASC
+        LIMIT 5000
+      `).all().map(normalizeSubmissionRow);
     },
 
     async listFollowUpSubmissions({
@@ -5816,7 +7505,10 @@ export function createSqliteStorage(config) {
       ]);
       const requestedView = normalizeList([view], 1)[0] || 'crm-actions';
       const safeView = allowedViews.has(requestedView) ? requestedView : 'crm-actions';
-      const clauses = ["submission.status NOT IN ('archived', 'spam')"];
+      const clauses = [
+        activeCrmSubmissionPredicate('submission'),
+        "submission.status NOT IN ('archived', 'spam')",
+      ];
       const params = [];
       const latestDirection = `(SELECT communication.direction FROM crm_communications AS communication
         WHERE communication.submission_id = submission.id
@@ -5952,19 +7644,38 @@ export function createSqliteStorage(config) {
     },
 
     async getSummary() {
-      const total = database.prepare('SELECT COUNT(*) AS count FROM contact_submissions').get()?.count || 0;
+      const activeSubmissionPredicate = activeCrmSubmissionPredicate('submission');
+      const total = database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM contact_submissions AS submission
+        WHERE ${activeSubmissionPredicate}
+      `).get()?.count || 0;
       const lastSevenDaysSince = new Date(Date.now() - 1000 * 60 * 60 * 24 * 7).toISOString();
       const lastSevenDays =
-        database.prepare('SELECT COUNT(*) AS count FROM contact_submissions WHERE created_at >= ?').get(lastSevenDaysSince)
+        database.prepare(`
+          SELECT COUNT(*) AS count
+          FROM contact_submissions AS submission
+          WHERE ${activeSubmissionPredicate} AND submission.created_at >= ?
+        `).get(lastSevenDaysSince)
           ?.count || 0;
       const dueToday =
         database
           .prepare(
-            `SELECT COUNT(*) AS count FROM contact_submissions WHERE next_action_at IS NOT NULL AND next_action_at <= ? AND status NOT IN ('archived', 'spam')`,
+            `SELECT COUNT(*) AS count
+             FROM contact_submissions AS submission
+             WHERE ${activeSubmissionPredicate}
+               AND submission.next_action_at IS NOT NULL
+               AND submission.next_action_at <= ?
+               AND submission.status NOT IN ('archived', 'spam')`,
           )
           .get(new Date().toISOString())?.count || 0;
       const grouped = database
-        .prepare('SELECT status, COUNT(*) AS count FROM contact_submissions GROUP BY status')
+        .prepare(`
+          SELECT submission.status, COUNT(*) AS count
+          FROM contact_submissions AS submission
+          WHERE ${activeSubmissionPredicate}
+          GROUP BY submission.status
+        `)
         .all()
         .reduce((accumulator, row) => {
           accumulator[row.status] = row.count;
@@ -6022,71 +7733,71 @@ export function createSqliteStorage(config) {
     },
 
     async insertSecureUploadRequest(requestRecord) {
-      insertSecureUploadRequestStatement.run(serializeUploadRequest(requestRecord));
-      return requestRecord;
+      return database.transaction(() => {
+        assertCrmSubmissionWritableInTransaction(requestRecord?.submission_id);
+        insertSecureUploadRequestStatement.run(serializeUploadRequest(requestRecord));
+        return requestRecord;
+      }).immediate();
     },
 
     async updateSecureUploadRequest(id, values) {
-      updateRecord(
-        'secure_upload_requests',
-        id,
-        serializeUploadRequestValues(values),
-        ['updated_at', 'status', 'expires_at', 'nda_required', 'nda_accepted_at', 'last_uploaded_at', 'note', 'requested_documents', 'revoked_at', 'closed_at', 'upload_batch_count'],
-      );
-
-      return this.getSecureUploadRequest(id);
+      return database.transaction(() => {
+        const request = database.prepare('SELECT submission_id FROM secure_upload_requests WHERE id = ?').get(id);
+        if (request?.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
+        updateRecord(
+          'secure_upload_requests',
+          id,
+          serializeUploadRequestValues(values),
+          ['updated_at', 'status', 'expires_at', 'nda_required', 'nda_accepted_at', 'last_uploaded_at', 'note', 'requested_documents', 'revoked_at', 'closed_at', 'upload_batch_count'],
+        );
+        return normalizeUploadRequestRow(database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(id));
+      }).immediate();
     },
 
     async resetSecureUploadRequestIfUploading(id, values) {
-      const updates = Object.entries(serializeUploadRequestValues(values)).filter(([key]) =>
-        ['updated_at', 'status'].includes(key),
-      );
-
-      if (updates.length === 0) {
-        return null;
-      }
-
-      const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
-      const payload = Object.fromEntries(updates);
-      payload.id = id;
-      const result = database
-        .prepare(`UPDATE secure_upload_requests SET ${fields} WHERE id = @id AND status = 'uploading'`)
-        .run(payload);
-
-      return result.changes > 0 ? this.getSecureUploadRequest(id) : null;
+      return database.transaction(() => {
+        const request = database.prepare('SELECT submission_id FROM secure_upload_requests WHERE id = ?').get(id);
+        if (request?.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
+        const updates = Object.entries(serializeUploadRequestValues(values)).filter(([key]) =>
+          ['updated_at', 'status'].includes(key),
+        );
+        if (updates.length === 0) return null;
+        const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
+        const payload = Object.fromEntries(updates);
+        payload.id = id;
+        const result = database
+          .prepare(`UPDATE secure_upload_requests SET ${fields} WHERE id = @id AND status = 'uploading'`)
+          .run(payload);
+        return result.changes > 0
+          ? normalizeUploadRequestRow(database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(id))
+          : null;
+      }).immediate();
     },
 
     async claimSecureUploadRequest(id, values, options = {}) {
       const updates = Object.entries(serializeUploadRequestValues(values)).filter(([key]) =>
         ['updated_at', 'status', 'nda_accepted_at', 'last_uploaded_at', 'note', 'closed_at', 'upload_batch_count'].includes(key),
       );
-
-      if (updates.length === 0) {
-        return null;
-      }
-
-      const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
-      const payload = updates.reduce((accumulator, [key, value]) => {
-        accumulator[key] = value;
-        return accumulator;
-      }, {});
-
-      payload.id = id;
-      payload.stale_before = options.staleBefore || '';
-      const result = database
-        .prepare(
-          `
-            UPDATE secure_upload_requests SET ${fields}
-            WHERE id = @id
-              AND (
-                status IN ('awaiting-documents', 'open', 'partially-received')
-                OR (status = 'uploading' AND @stale_before != '' AND updated_at <= @stale_before)
-              )
-          `,
-        )
-        .run(payload);
-
-      return result.changes > 0 ? this.getSecureUploadRequest(id) : null;
+      if (updates.length === 0) return null;
+      return database.transaction(() => {
+        const request = database.prepare('SELECT submission_id FROM secure_upload_requests WHERE id = ?').get(id);
+        if (request?.submission_id) assertCrmSubmissionWritableInTransaction(request.submission_id);
+        const fields = updates.map(([key]) => `${key} = @${key}`).join(', ');
+        const payload = Object.fromEntries(updates);
+        payload.id = id;
+        payload.stale_before = options.staleBefore || '';
+        const result = database.prepare(`
+          UPDATE secure_upload_requests SET ${fields}
+          WHERE id = @id
+            AND (
+              status IN ('awaiting-documents', 'open', 'partially-received')
+              OR (status = 'uploading' AND @stale_before != '' AND updated_at <= @stale_before)
+            )
+        `).run(payload);
+        return result.changes > 0
+          ? normalizeUploadRequestRow(database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(id))
+          : null;
+      }).immediate();
     },
 
     async getSecureUploadRequest(id) {
@@ -6121,27 +7832,33 @@ export function createSqliteStorage(config) {
     },
 
     async insertSecureDocument(document) {
-      insertSecureDocumentStatement.run(document);
-      if (document.submission_id) {
-        database.prepare(`
-          UPDATE crm_follow_up_recommendations
-          SET status = 'superseded', superseded_at = ?
-          WHERE submission_id = ? AND status = 'current'
-        `).run(document.created_at || new Date().toISOString(), document.submission_id);
-      }
-      return document;
+      return database.transaction(() => {
+        if (document?.submission_id) assertCrmSubmissionWritableInTransaction(document.submission_id);
+        insertSecureDocumentStatement.run(document);
+        if (document.submission_id) {
+          database.prepare(`
+            UPDATE crm_follow_up_recommendations
+            SET status = 'superseded', superseded_at = ?
+            WHERE submission_id = ? AND status = 'current'
+          `).run(document.created_at || new Date().toISOString(), document.submission_id);
+        }
+        return document;
+      }).immediate();
     },
 
     async deleteSecureDocument(id) {
-      const document = database.prepare('SELECT submission_id FROM secure_documents WHERE id = ? LIMIT 1').get(id);
-      deleteSecureDocumentStatement.run(id);
-      if (document?.submission_id) {
-        database.prepare(`
-          UPDATE crm_follow_up_recommendations
-          SET status = 'superseded', superseded_at = ?
-          WHERE submission_id = ? AND status = 'current'
-        `).run(new Date().toISOString(), document.submission_id);
-      }
+      return database.transaction(() => {
+        const document = database.prepare('SELECT submission_id FROM secure_documents WHERE id = ? LIMIT 1').get(id);
+        if (document?.submission_id) assertCrmSubmissionWritableInTransaction(document.submission_id);
+        deleteSecureDocumentStatement.run(id);
+        if (document?.submission_id) {
+          database.prepare(`
+            UPDATE crm_follow_up_recommendations
+            SET status = 'superseded', superseded_at = ?
+            WHERE submission_id = ? AND status = 'current'
+          `).run(new Date().toISOString(), document.submission_id);
+        }
+      }).immediate();
     },
 
     async getSecureDocument(id) {
@@ -6354,6 +8071,7 @@ export function createSqliteStorage(config) {
     async insertCrmCommunication(communication = {}) {
       const serialized = serializeCrmCommunication(communication);
       return database.transaction(() => {
+        if (serialized.submission_id) assertCrmSubmissionWritableInTransaction(serialized.submission_id);
         const result = insertCrmCommunicationStatement.run(serialized);
         if (result.changes === 0) return getExistingCrmCommunication(serialized);
         const stored = normalizeCrmCommunicationRow(
@@ -6368,7 +8086,7 @@ export function createSqliteStorage(config) {
           `).run(stored.occurred_at || stored.updated_at || new Date().toISOString(), stored.submission_id);
         }
         return stored;
-      })();
+      }).immediate();
     },
 
     async updateCrmCommunication(id, values = {}) {
@@ -6383,21 +8101,34 @@ export function createSqliteStorage(config) {
         'content_next_attempt_at', 'attachment_metadata', 'assigned_at', 'assigned_by', 'updated_by',
         'metadata',
       ];
-      updateRecord(
-        'crm_communications',
-        id,
-        serializeCrmCommunicationValues(values),
-        allowedFields,
-      );
-      const updated = await this.getCrmCommunication(id);
-      if (updated?.submission_id) {
-        database.prepare(`
-          UPDATE crm_follow_up_recommendations
-          SET status = 'superseded', superseded_at = ?
-          WHERE submission_id = ? AND status = 'current'
-        `).run(updated.updated_at || new Date().toISOString(), updated.submission_id);
-      }
-      return updated;
+      return database.transaction(() => {
+        const current = database.prepare('SELECT submission_id FROM crm_communications WHERE id = ? LIMIT 1').get(id);
+        const existingSubmissionId = String(current?.submission_id || '').trim();
+        const targetSubmissionId = Object.hasOwn(values, 'submission_id')
+          ? String(values.submission_id || '').trim()
+          : existingSubmissionId;
+        if (existingSubmissionId) assertCrmSubmissionWritableInTransaction(existingSubmissionId);
+        if (targetSubmissionId && targetSubmissionId !== existingSubmissionId) {
+          assertCrmSubmissionWritableInTransaction(targetSubmissionId);
+        }
+        updateRecord(
+          'crm_communications',
+          id,
+          serializeCrmCommunicationValues(values),
+          allowedFields,
+        );
+        const updated = normalizeCrmCommunicationRow(
+          database.prepare('SELECT * FROM crm_communications WHERE id = ? LIMIT 1').get(id),
+        );
+        if (updated?.submission_id) {
+          database.prepare(`
+            UPDATE crm_follow_up_recommendations
+            SET status = 'superseded', superseded_at = ?
+            WHERE submission_id = ? AND status = 'current'
+          `).run(updated.updated_at || new Date().toISOString(), updated.submission_id);
+        }
+        return updated;
+      }).immediate();
     },
 
     async createCrmEmailCommand({
@@ -6427,6 +8158,8 @@ export function createSqliteStorage(config) {
             ),
           };
         }
+
+        assertCrmSubmissionWritableInTransaction(serializedOutbox.submission_id);
 
         const submission = database.prepare('SELECT * FROM contact_submissions WHERE id = ? LIMIT 1')
           .get(serializedOutbox.submission_id);
@@ -6646,23 +8379,34 @@ export function createSqliteStorage(config) {
     },
 
     async claimCrmEmailOutbox({ id = '', claimToken = '', claimedAt = '', claimExpiresAt = '' } = {}) {
-      const row = database.prepare(`
-        UPDATE crm_email_outbox SET
-          state = 'sending',
-          attempt_count = attempt_count + 1,
-          claim_token = ?,
-          claimed_at = ?,
-          claim_expires_at = ?,
-          updated_at = ?
-        WHERE id = ?
-          AND (
-            state = 'queued'
-            OR (state = 'retryable_failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
-            OR (state = 'sending' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?)
-          )
-        RETURNING *
-      `).get(claimToken, claimedAt, claimExpiresAt, claimedAt, id, claimedAt, claimedAt);
-      return { claimed: Boolean(row), outbox: normalizeCrmEmailOutboxRow(row || database.prepare('SELECT * FROM crm_email_outbox WHERE id = ? LIMIT 1').get(id)) };
+      return database.transaction(() => {
+        const current = database.prepare('SELECT submission_id, state FROM crm_email_outbox WHERE id = ? LIMIT 1').get(id);
+        if (current?.submission_id && ['queued', 'retryable_failed', 'sending'].includes(current.state)) {
+          assertCrmSubmissionWritableInTransaction(current.submission_id);
+        }
+        const row = database.prepare(`
+          UPDATE crm_email_outbox SET
+            state = 'sending',
+            attempt_count = attempt_count + 1,
+            claim_token = ?,
+            claimed_at = ?,
+            claim_expires_at = ?,
+            updated_at = ?
+          WHERE id = ?
+            AND (
+              state = 'queued'
+              OR (state = 'retryable_failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+              OR (state = 'sending' AND claim_expires_at IS NOT NULL AND claim_expires_at <= ?)
+            )
+          RETURNING *
+        `).get(claimToken, claimedAt, claimExpiresAt, claimedAt, id, claimedAt, claimedAt);
+        return {
+          claimed: Boolean(row),
+          outbox: normalizeCrmEmailOutboxRow(
+            row || database.prepare('SELECT * FROM crm_email_outbox WHERE id = ? LIMIT 1').get(id),
+          ),
+        };
+      }).immediate();
     },
 
     async finishCrmEmailOutboxClaim(id, claimToken, values = {}) {
@@ -6821,12 +8565,15 @@ export function createSqliteStorage(config) {
 
     async insertCrmFollowUpRecommendation(recommendation = {}) {
       const serialized = serializeCrmFollowUpRecommendation(recommendation);
-      insertCrmFollowUpRecommendationStatement.run(serialized);
-      return normalizeCrmFollowUpRecommendationRow(database.prepare(`
-        SELECT * FROM crm_follow_up_recommendations
-        WHERE submission_id = ? AND input_fingerprint = ? AND engine_version = ?
-        LIMIT 1
-      `).get(serialized.submission_id, serialized.input_fingerprint, serialized.engine_version));
+      return database.transaction(() => {
+        assertCrmSubmissionWritableInTransaction(serialized.submission_id);
+        insertCrmFollowUpRecommendationStatement.run(serialized);
+        return normalizeCrmFollowUpRecommendationRow(database.prepare(`
+          SELECT * FROM crm_follow_up_recommendations
+          WHERE submission_id = ? AND input_fingerprint = ? AND engine_version = ?
+          LIMIT 1
+        `).get(serialized.submission_id, serialized.input_fingerprint, serialized.engine_version));
+      }).immediate();
     },
 
     async getCurrentCrmFollowUpRecommendation(submissionId) {
@@ -6845,24 +8592,31 @@ export function createSqliteStorage(config) {
     },
 
     async supersedeCrmFollowUpRecommendations(submissionId, supersededAt) {
-      return database.prepare(`
-        UPDATE crm_follow_up_recommendations
-        SET status = 'superseded', superseded_at = ?
-        WHERE submission_id = ? AND status = 'current'
-      `).run(supersededAt, submissionId).changes;
+      return database.transaction(() => {
+        assertCrmSubmissionWritableInTransaction(submissionId);
+        return database.prepare(`
+          UPDATE crm_follow_up_recommendations
+          SET status = 'superseded', superseded_at = ?
+          WHERE submission_id = ? AND status = 'current'
+        `).run(supersededAt, submissionId).changes;
+      }).immediate();
     },
 
     async updateCrmFollowUpRecommendation(id, values = {}) {
       const allowedFields = ['status', 'acted_on_at', 'superseded_at', 'acted_on_by', 'outcome', 'metadata'];
       const safeValues = Object.fromEntries(Object.entries(values).filter(([field]) => allowedFields.includes(field)));
       if (Object.hasOwn(safeValues, 'metadata')) safeValues.metadata = JSON.stringify(safeValues.metadata || {});
-      if (Object.keys(safeValues).length === 0) return normalizeCrmFollowUpRecommendationRow(
-        database.prepare('SELECT * FROM crm_follow_up_recommendations WHERE id = ? LIMIT 1').get(id),
-      );
-      const assignments = Object.keys(safeValues).map((field) => `${field} = @${field}`).join(', ');
-      return normalizeCrmFollowUpRecommendationRow(database.prepare(`
-        UPDATE crm_follow_up_recommendations SET ${assignments} WHERE id = @id RETURNING *
-      `).get({ ...safeValues, id }));
+      return database.transaction(() => {
+        const current = database.prepare('SELECT submission_id FROM crm_follow_up_recommendations WHERE id = ? LIMIT 1').get(id);
+        if (current?.submission_id) assertCrmSubmissionWritableInTransaction(current.submission_id);
+        if (Object.keys(safeValues).length === 0) return normalizeCrmFollowUpRecommendationRow(
+          database.prepare('SELECT * FROM crm_follow_up_recommendations WHERE id = ? LIMIT 1').get(id),
+        );
+        const assignments = Object.keys(safeValues).map((field) => `${field} = @${field}`).join(', ');
+        return normalizeCrmFollowUpRecommendationRow(database.prepare(`
+          UPDATE crm_follow_up_recommendations SET ${assignments} WHERE id = @id RETURNING *
+        `).get({ ...safeValues, id }));
+      }).immediate();
     },
 
     async getActiveEmailSuppression(email) {
@@ -7035,7 +8789,7 @@ export function createSqliteStorage(config) {
     },
 
     async insertCrmActivityEvent(event) {
-      return insertCrmActivityEvent(event);
+      return database.transaction(() => insertCrmActivityEvent(event)).immediate();
     },
 
     async listCrmActivityEvents({ submissionId = '', eventTypes = [], limit = 200, before = '' } = {}) {
@@ -7146,20 +8900,9 @@ export function createSqliteStorage(config) {
 	        return null;
 	      }
 
-        const lookups = [
-          ['opportunity_id', opportunityId],
-          ['id', id],
-          ['deal_key', dealKey],
-          ['listing_identity', listingIdentity],
-        ];
-        let row = null;
-        for (const [field, value] of lookups) {
-          if (!value) continue;
-          row = database.prepare(`SELECT * FROM deal_hunter_crm_imports WHERE ${field} = ? ORDER BY updated_at DESC LIMIT 1`).get(value);
-          if (row) break;
-        }
-
-	      return normalizeDealHunterCrmImportRow(row);
+	      return normalizeDealHunterCrmImportRow(selectDealHunterCrmImportRow({
+          id, opportunityId, dealKey, listingIdentity,
+        }));
 	    },
 
       async getDealHunterCanonicalCrmOwnershipHealth() {
@@ -7395,6 +9138,12 @@ export function createSqliteStorage(config) {
             SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
           `).get(opportunityId);
           if (!opportunity || opportunity.status !== 'active') return { applied: false, reason: 'not-current' };
+          if (command.submissionId) {
+            assertCrmSubmissionWritableInTransaction(command.submissionId);
+          }
+          if (opportunity.primary_submission_id) {
+            assertCrmSubmissionWritableInTransaction(opportunity.primary_submission_id);
+          }
 
           const score = database.prepare(`
             SELECT * FROM deal_hunter_opportunity_scores
@@ -7423,6 +9172,9 @@ export function createSqliteStorage(config) {
             return { applied: false, reason: 'linked-submission-missing' };
           }
           const archiveSubmission = Boolean(submission && submission.status !== 'archived');
+          if (archiveSubmission) {
+            assertCrmSubmissionWritableInTransaction(submission.id);
+          }
           if (archiveSubmission && activeCimClaimForSubmission(submission.id, occurredAt)) {
             return { applied: false, reason: 'cim-send-in-progress' };
           }
@@ -8279,49 +10031,7 @@ export function createSqliteStorage(config) {
 	      if (!canonicalCrmOwnershipHealthy) {
           throw new Error('Canonical CRM ownership has duplicate opportunity claims. Run the integrity audit before reconciliation.');
         }
-	      const serializedRecord = serializeDealHunterCrmImport(record);
-
-	      try {
-	        insertDealHunterCrmImportStatement.run(serializedRecord);
-	      } catch (error) {
-	        if (error?.code !== 'SQLITE_CONSTRAINT_UNIQUE' && error?.code !== 'SQLITE_CONSTRAINT_PRIMARYKEY') {
-	          throw error;
-	        }
-
-	        const existingImport = await this.getDealHunterCrmImport({
-	          id: record.id,
-	          opportunityId: record.opportunity_id,
-	          dealKey: record.deal_key,
-	          listingIdentity: record.listing_identity,
-	        });
-	        const claimTarget = existingImport
-	          ? { ...serializedRecord, id: existingImport.id, pending_cutoff: pendingCutoff || '' }
-	          : { ...serializedRecord, pending_cutoff: pendingCutoff || '' };
-	        const updateResult = existingImport
-	          ? claimDealHunterCrmImportStatement.run(claimTarget)
-	          : { changes: 0 };
-	        const currentImport = await this.getDealHunterCrmImport({
-	          id: existingImport?.id || record.id,
-	          opportunityId: record.opportunity_id,
-	          dealKey: record.deal_key,
-	          listingIdentity: record.listing_identity,
-	        });
-
-	        return {
-	          claimed: updateResult.changes > 0,
-	          importRecord: currentImport,
-	        };
-	      }
-
-	      return {
-	        claimed: true,
-	        importRecord: await this.getDealHunterCrmImport({
-	          id: record.id,
-	          opportunityId: record.opportunity_id,
-	          dealKey: record.deal_key,
-	          listingIdentity: record.listing_identity,
-	        }),
-	      };
+	      return claimDealHunterCrmImportTransaction.immediate({ record, pendingCutoff });
 	    },
 
 	    async updateDealHunterCrmImport(id, values = {}) {
@@ -8329,20 +10039,386 @@ export function createSqliteStorage(config) {
 	        return null;
 	      }
 
-	      updateDealHunterCrmImportStatement.run({
-	        id,
-	        updated_at: values.updated_at || null,
-	        opportunity_id: values.opportunity_id || null,
-	        listing_identity: values.listing_identity || null,
-	        listing_url: values.listing_url || null,
-	        submission_id: values.submission_id || null,
-	        status: values.status || null,
-	        source_name: values.source_name || null,
-	        metadata: values.metadata ? JSON.stringify(values.metadata) : null,
-	      });
-
-	      return this.getDealHunterCrmImport({ id });
+	      return updateDealHunterCrmImportTransaction.immediate({ id, values });
 	    },
+
+    async inspectCrmDuplicateConsolidation() {
+      return inspectCrmDuplicateConsolidation(database, null, crmDuplicateConsolidationConfigAuthority);
+    },
+
+    async inspectCrmDuplicateConsolidationRuntimeSafety() {
+      return inspectCrmDuplicateConsolidationRuntimeSafety(database, {
+        configAuthority: crmDuplicateConsolidationConfigAuthority,
+      });
+    },
+
+    getCrmDuplicateConsolidationConfigAuthority() {
+      return crmDuplicateConsolidationConfigAuthority;
+    },
+
+    async verifyCrmDuplicateConsolidationBackupPlan({ artifact, backup } = {}) {
+      const backupPath = path.resolve(String(backup?.path || ''));
+      const before = fs.statSync(backupPath, { bigint: true });
+      const bytes = fs.readFileSync(backupPath);
+      const after = fs.statSync(backupPath, { bigint: true });
+      if (!before.isFile()
+        || ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].some((field) => before[field] !== after[field])
+        || createHash('sha256').update(bytes).digest('hex') !== backup?.sha256) {
+        throw new Error('Apply refused: backup path or SHA changed during verification.');
+      }
+      for (const suffix of ['-wal', '-shm', '-journal']) {
+        if (fs.existsSync(`${backupPath}${suffix}`)) {
+          throw new Error('Apply refused: backup has an unverified SQLite sidecar.');
+        }
+      }
+      const snapshotBytes = Buffer.from(bytes);
+      snapshotBytes[18] = 1;
+      snapshotBytes[19] = 1;
+      const snapshot = new Database(snapshotBytes);
+      try {
+        snapshot.pragma('query_only = ON');
+        const inspection = inspectCrmDuplicateConsolidation(snapshot, {
+          readonly: true,
+          fileMustExist: true,
+          queryOnly: true,
+          consistentReadTransaction: true,
+        }, artifact.plan.runtimeSafetyAuthority?.config);
+        if (inspection.blockers.length) {
+          throw new Error(`backup inspection blockers: ${inspection.blockers.join(', ')}`);
+        }
+        const planned = buildCrmDuplicateConsolidationPlan({
+          inspection,
+          actor: artifact.plan.actor,
+          reason: artifact.plan.reason,
+          executionRelease: artifact.plan.execution.release,
+          toolingRevision: artifact.plan.execution.toolingRevision,
+          recoveryCheckpoint: {
+            ...artifact.plan.recoveryCheckpoint,
+            backupPath: artifact.recoveryCheckpointPath,
+          },
+        });
+        if (planned.planChecksum !== artifact.planChecksum
+          || inspection.database.logicalDigest !== artifact.plan.database.logicalDigest
+          || inspection.schema.digest !== artifact.plan.schema.digest) {
+          throw new Error('backup does not reproduce the reviewed plan and raw database digest');
+        }
+        const verification = Object.freeze({
+          planChecksum: planned.planChecksum,
+          databaseLogicalDigest: inspection.database.logicalDigest,
+          schemaDigest: inspection.schema.digest,
+        });
+        crmDuplicateConsolidationBackupVerifications.set(verification, {
+          verifiedAtMs: Date.now(),
+          backupPath,
+          backupSha256: backup.sha256,
+          backupIdentity: stableCrmDuplicateConsolidationJson(backup),
+          artifactIdentity: stableCrmDuplicateConsolidationJson({
+            manifestId: artifact.manifestId,
+            planChecksum: artifact.planChecksum,
+            recoveryCheckpointPath: artifact.recoveryCheckpointPath,
+            recoveryCheckpoint: artifact.plan.recoveryCheckpoint,
+          }),
+          fileIdentity: Object.fromEntries(
+            ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].map((field) => [field, before[field]]),
+          ),
+        });
+        return verification;
+      } finally {
+        snapshot.close();
+      }
+    },
+
+    async applyCrmDuplicateConsolidation({
+      artifact,
+      backup,
+      confirmation,
+      backupVerification,
+      actor,
+      reason,
+      executionRelease,
+      toolingRevision,
+      nowIso,
+      testHooks = null,
+    } = {}) {
+      if (confirmation !== CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION) {
+        throw new Error('CRM duplicate consolidation transaction requires the exact confirmation phrase.');
+      }
+      const verifiedAuthority = backupVerification && typeof backupVerification === 'object'
+        ? crmDuplicateConsolidationBackupVerifications.get(backupVerification)
+        : null;
+      if (!verifiedAuthority) {
+        throw new Error('CRM duplicate consolidation transaction requires fresh non-forgeable verified backup evidence.');
+      }
+      crmDuplicateConsolidationBackupVerifications.delete(backupVerification);
+      const artifactIdentity = stableCrmDuplicateConsolidationJson({
+        manifestId: artifact?.manifestId,
+        planChecksum: artifact?.planChecksum,
+        recoveryCheckpointPath: artifact?.recoveryCheckpointPath,
+        recoveryCheckpoint: artifact?.plan?.recoveryCheckpoint,
+      });
+      if (verifiedAuthority.artifactIdentity !== artifactIdentity
+        || verifiedAuthority.backupIdentity !== stableCrmDuplicateConsolidationJson(backup)
+        || backupVerification.planChecksum !== artifact?.planChecksum
+        || Date.now() - verifiedAuthority.verifiedAtMs > 5 * 60 * 1000) {
+        throw new Error('CRM duplicate consolidation verified backup evidence is stale or bound to different authority.');
+      }
+      const backupPath = path.resolve(String(backup?.path || ''));
+      let backupBefore;
+      let backupBytes;
+      let backupAfter;
+      try {
+        backupBefore = fs.statSync(backupPath, { bigint: true });
+        backupBytes = fs.readFileSync(backupPath);
+        backupAfter = fs.statSync(backupPath, { bigint: true });
+      } catch (error) {
+        throw new Error(`CRM duplicate consolidation verified backup is unavailable: ${error.message}`);
+      }
+      const identityFields = ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'];
+      if (!backupBefore.isFile()
+        || backupPath !== verifiedAuthority.backupPath
+        || identityFields.some((field) => (
+          backupBefore[field] !== backupAfter[field]
+          || backupBefore[field] !== verifiedAuthority.fileIdentity[field]
+        ))
+        || createHash('sha256').update(backupBytes).digest('hex') !== verifiedAuthority.backupSha256
+        || ['-wal', '-shm', '-journal'].some((suffix) => fs.existsSync(`${backupPath}${suffix}`))) {
+        throw new Error('CRM duplicate consolidation verified backup evidence changed before transaction entry.');
+      }
+      const transaction = database.transaction(() => {
+        const currentRuntimeSafetyAuthority = crmDuplicateConsolidationRuntimeSafety(
+          database,
+          crmDuplicateConsolidationConfigAuthority,
+        );
+        assertCrmDuplicateConsolidationRuntimeSafetyAuthorityMatches(
+          currentRuntimeSafetyAuthority,
+          artifact.plan.runtimeSafetyAuthority,
+        );
+        const existingReceipt = normalizeDealHunterRepairManifestRow(database.prepare(`
+          SELECT * FROM deal_hunter_cim_repair_manifests WHERE id = ? LIMIT 1
+        `).get(artifact.manifestId));
+        if (existingReceipt) {
+          const finalState = crmDuplicateConsolidationFinalState(database, {
+            artifact, actor, reason, backup,
+          });
+          for (const [table, expected] of Object.entries(artifact.plan.tableDigests)) {
+            if (['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests'].includes(table)) continue;
+            const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
+              .sort((left, right) => compareCrmDuplicateConsolidationText(
+                stableCrmDuplicateConsolidationJson(left),
+                stableCrmDuplicateConsolidationJson(right),
+              ));
+            if (rows.length !== expected.rowCount || canonicalJsonSha256(rows) !== expected.digest) {
+              throw new Error(`CRM duplicate consolidation replay protected-table drift: ${table}.`);
+            }
+          }
+          return {
+            status: 'verified-prior-apply',
+            mode: 'apply',
+            applied: false,
+            mutationCount: 0,
+            mutations: [],
+            manifestId: artifact.manifestId,
+            planChecksum: artifact.planChecksum,
+            finalState,
+          };
+        }
+
+        const inspection = inspectCrmDuplicateConsolidationState(database, {
+          connection: {
+            readonly: false,
+            fileMustExist: true,
+            queryOnly: false,
+            consistentReadTransaction: true,
+          },
+          configAuthority: crmDuplicateConsolidationConfigAuthority,
+        });
+        if (inspection.blockers.length) {
+          throw new Error(`Apply refused: partial, satisfied-without-receipt, or unsafe state (${inspection.blockers.join(', ')}).`);
+        }
+        const planned = buildCrmDuplicateConsolidationPlan({
+          inspection,
+          actor,
+          reason,
+          executionRelease,
+          toolingRevision,
+          recoveryCheckpoint: {
+            ...artifact.plan.recoveryCheckpoint,
+            backupPath: artifact.recoveryCheckpointPath,
+          },
+        });
+        if (planned.manifestId !== artifact.manifestId
+          || planned.planChecksum !== artifact.planChecksum
+          || inspection.database.logicalDigest !== artifact.plan.database.logicalDigest
+          || inspection.schema.digest !== artifact.plan.schema.digest
+          || stableCrmDuplicateConsolidationJson(inspection.rawRows)
+            !== stableCrmDuplicateConsolidationJson(artifact.plan.rawRows)) {
+          throw new Error('Apply refused: live raw-row, schema, database, or reviewed plan drift.');
+        }
+
+        const receiptManifest = {
+          repairType: CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
+          repairVersion: CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+          manifestSchema: CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
+          approvalSchema: artifact.approvalSchema,
+          manifestId: artifact.manifestId,
+          planChecksum: artifact.planChecksum,
+          actor,
+          reason,
+          backup,
+          artifact,
+          appliedAt: nowIso,
+          mutationCount: 4,
+        };
+        const receiptMetadata = {
+          repairType: CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
+          repairVersion: CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+          manifestSchema: CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
+          approvalSchema: artifact.approvalSchema,
+          planChecksum: artifact.planChecksum,
+          pairKeys: ['pooler', 'berlin'],
+          berlinPriorSubmissionId: CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.beforeSubmissionId,
+        };
+        const receiptInsert = database.prepare(`
+          INSERT INTO deal_hunter_cim_repair_manifests (
+            id, created_at, updated_at, mode, status, actor,
+            backup_reference, checksum, manifest, metadata
+          ) VALUES (?, ?, ?, ?, 'applied', ?, ?, ?, ?, ?)
+        `).run(
+          artifact.manifestId,
+          nowIso,
+          nowIso,
+          CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
+          actor,
+          backup.path,
+          artifact.planChecksum,
+          stableCrmDuplicateConsolidationJson(receiptManifest),
+          stableCrmDuplicateConsolidationJson(receiptMetadata),
+        );
+        if (receiptInsert.changes !== 1) throw new Error('CRM duplicate consolidation receipt insert was not exact.');
+        if (testHooks?.failAfterWrite === 1) throw new Error('Injected failure after write 1.');
+
+        let writeNumber = 1;
+        for (const pair of CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs) {
+          const relationInsert = database.prepare(`
+            INSERT INTO crm_submission_supersessions (
+              id, created_at, updated_at, status, survivor_submission_id,
+              superseded_submission_id, opportunity_id, reason_code, reason_text,
+              approved_by, approved_at, actor, repair_version, repair_manifest_id,
+              repair_digest, reversed_at, reversed_by, reversal_reason,
+              reversal_manifest_id, metadata
+            ) VALUES (
+              ?, ?, ?, 'active', ?, ?, ?, 'confirmed-duplicate', ?,
+              ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?
+            )
+          `).run(
+            crmDuplicateConsolidationRelationId(pair),
+            nowIso,
+            nowIso,
+            pair.survivorSubmissionId,
+            pair.supersededSubmissionId,
+            pair.opportunityId,
+            reason,
+            CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.approvedBy,
+            CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.approvedAt,
+            actor,
+            CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+            artifact.manifestId,
+            artifact.planChecksum,
+            stableCrmDuplicateConsolidationJson({
+              schema: 'crm-submission-supersession-metadata-v1',
+              pairKey: pair.key,
+              listingIdentity: pair.listingIdentity,
+              manifestId: artifact.manifestId,
+            }),
+          );
+          if (relationInsert.changes !== 1) {
+            throw new Error(`CRM duplicate consolidation ${pair.key} relation insert was not exact.`);
+          }
+          writeNumber += 1;
+          if (testHooks?.failAfterWrite === writeNumber) {
+            throw new Error(`Injected failure after write ${writeNumber}.`);
+          }
+        }
+
+        const berlinBefore = database.prepare(`
+          SELECT * FROM deal_hunter_crm_imports WHERE id = ? LIMIT 1
+        `).get(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id);
+        if (crmDuplicateConsolidationRawDigest(berlinBefore)
+          !== artifact.plan.currentState.berlinImport.rawDigest) {
+          throw new Error('Apply refused: Berlin import raw-row digest changed before compare-and-set.');
+        }
+        if (testHooks?.forceBerlinCasConflict === true) {
+          database.prepare('UPDATE deal_hunter_crm_imports SET submission_id = ? WHERE id = ?')
+            .run('__TASK8_TEST_CAS_CONFLICT__', CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id);
+        }
+        const priorMetadata = berlinBefore.metadata;
+        const nextMetadata = {
+          ...parseCrmDuplicateConsolidationMetadata(priorMetadata),
+          crmDuplicateConsolidation: {
+            schema: 'crm-duplicate-consolidation-import-provenance-v1',
+            manifestId: artifact.manifestId,
+            planChecksum: artifact.planChecksum,
+            priorSubmissionId: berlinBefore.submission_id,
+            priorUpdatedAt: berlinBefore.updated_at,
+            priorMetadataDigest: canonicalJsonSha256(priorMetadata || '{}'),
+          },
+        };
+        const berlinUpdate = database.prepare(`
+          UPDATE deal_hunter_crm_imports
+          SET submission_id = ?, updated_at = ?, metadata = ?
+          WHERE id = ?
+            AND submission_id = ?
+            AND opportunity_id IS NULL
+            AND updated_at = ?
+            AND metadata = ?
+        `).run(
+          CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.afterSubmissionId,
+          nowIso,
+          JSON.stringify(nextMetadata),
+          CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.id,
+          CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport.beforeSubmissionId,
+          berlinBefore.updated_at,
+          priorMetadata,
+        );
+        if (berlinUpdate.changes !== 1) {
+          throw new Error('Apply refused: Berlin import compare-and-set did not change exactly one row.');
+        }
+        if (testHooks?.failAfterWrite === 4) throw new Error('Injected failure after write 4.');
+
+        if (testHooks?.dropReversalGuardBeforePostconditions === true) {
+          database.exec('DROP TRIGGER trg_crm_submission_supersessions_reverse_only');
+        }
+
+        const finalState = crmDuplicateConsolidationFinalState(database, {
+          artifact, actor, reason, backup,
+        });
+        for (const [table, expected] of Object.entries(artifact.plan.tableDigests)) {
+          if (['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests'].includes(table)) continue;
+          const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
+            .sort((left, right) => compareCrmDuplicateConsolidationText(
+              stableCrmDuplicateConsolidationJson(left),
+              stableCrmDuplicateConsolidationJson(right),
+            ));
+          if (rows.length !== expected.rowCount || canonicalJsonSha256(rows) !== expected.digest) {
+            throw new Error(`CRM duplicate consolidation prohibited-table postcondition failed: ${table}.`);
+          }
+        }
+        if (testHooks?.forcePostconditionFailure === true) {
+          throw new Error('Injected postcondition failure.');
+        }
+        return {
+          status: 'repair-required',
+          mode: 'apply',
+          applied: true,
+          mutationCount: 4,
+          mutations: CRM_DUPLICATE_CONSOLIDATION_EXPECTED_MUTATION_LEDGER,
+          manifestId: artifact.manifestId,
+          planChecksum: artifact.planChecksum,
+          finalState,
+        };
+      });
+      return transaction.immediate();
+    },
 
     async inspectDealHunterCanonicalOpportunityMerge({ approval, actor = '', reason = '' } = {}) {
       return inspectCanonicalOpportunityMerge(database, { approval, actor, reason });
@@ -8687,6 +10763,34 @@ export function createSqliteStorage(config) {
         WHERE opportunity_id = ? AND status = 'active'
         LIMIT 1
       `).get(String(opportunityId).trim()));
+    },
+
+    async getCimStage2SubmissionAuthority(opportunityId) {
+      const normalizedOpportunityId = String(opportunityId || '').trim();
+      if (!normalizedOpportunityId) {
+        return { opportunity: null, primarySubmissionWritable: false, supersession: null };
+      }
+      const readAuthority = database.transaction(() => {
+        const opportunity = database.prepare(`
+          SELECT * FROM deal_hunter_opportunities
+          WHERE opportunity_id = ? AND status = 'active'
+          LIMIT 1
+        `).get(normalizedOpportunityId);
+        const primarySubmissionId = String(opportunity?.primary_submission_id || '').trim();
+        const supersession = primarySubmissionId
+          ? database.prepare(`
+            SELECT * FROM crm_submission_supersessions
+            WHERE status = 'active' AND superseded_submission_id = ?
+            LIMIT 1
+          `).get(primarySubmissionId)
+          : null;
+        return {
+          opportunity: normalizeDealHunterOpportunityRow(opportunity),
+          primarySubmissionWritable: Boolean(opportunity) && !supersession,
+          supersession: normalizeCrmSubmissionSupersessionRow(supersession),
+        };
+      });
+      return readAuthority.immediate();
     },
 
     async listDealHunterOpportunities({ opportunityIds = [], recipientEmails = [], limit = 1000 } = {}) {
@@ -9193,6 +11297,7 @@ export function createSqliteStorage(config) {
         const candidateIds = [submissionId];
         const authority = dealHunterCrmMatchAuthoritySnapshot(database, {
           limit: dealHunterCrmMatchAuthorityMaximumRows,
+          supersessionLimit: crmSubmissionSupersessionMaximumRows,
         });
         if (!authority.complete
           || typeof expectedAuthorityRevision !== 'string'
@@ -9200,6 +11305,7 @@ export function createSqliteStorage(config) {
           || authority.revision !== expectedAuthorityRevision) {
           throw dealHunterCrmMatchAuthorityError({ candidateIds });
         }
+        assertCrmSubmissionWritableInTransaction(submissionId);
 
         const opportunity = database.prepare(`
           SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
@@ -10036,6 +12142,7 @@ export function createSqliteStorage(config) {
 	    async upsertDealHunterCimRequest(request = {}) {
 	      const serialized = serializeDealHunterCimRequest(request);
 	      return database.transaction(() => {
+	        if (serialized.submission_id) assertCrmSubmissionWritableInTransaction(serialized.submission_id);
 	        runDealHunterCimRequestUpsert(serialized);
 	        const stored = database.prepare(`
 	          SELECT * FROM deal_hunter_cim_requests

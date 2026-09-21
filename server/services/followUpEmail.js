@@ -3,6 +3,7 @@ import { getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { sendPreparedMessage } from './delivery.js';
 import { hasVerifiedFollowUpReply } from './emailReadiness.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 
 const maxSubjectLength = 300;
 const maxBodyLength = 20_000;
@@ -259,6 +260,7 @@ async function loadReplyContext({ storage, submission, recipient, parentCommunic
 export async function previewCrmFollowUpEmail({
   submissionId = '', actor = 'admin', input = {}, storage = getStorage(), config = getConfig(), now = new Date(),
 } = {}) {
+  await assertCrmSubmissionWritable({ storage, submissionId: compactText(submissionId, 160) });
   const readiness = getFollowUpEmailReadiness(config);
   if (!readiness.ready) {
     return policyFailure(readiness.enabled ? 503 : 422, readiness.enabled ? 'email-unready' : 'email-disabled',
@@ -623,6 +625,7 @@ export async function processCrmEmailOutbox({
   if (terminalOutboxStates.has(outbox.state)) {
     return { ok: outbox.state === 'accepted', status: 200, replayed: true, outbox, communication };
   }
+  await assertCrmSubmissionWritable({ storage, submissionId: outbox.submission_id });
 
   const claimToken = randomUUID();
   const claimedAt = now.toISOString();
@@ -794,6 +797,17 @@ export async function sendCrmFollowUpEmail({
     `${scopedSubmissionId}:${scopedActor}:${clientToken}`,
   );
   if (existingCommand) {
+    if (terminalOutboxStates.has(existingCommand.state)) {
+      const replay = await processCrmEmailOutbox({
+        outboxId: existingCommand.id,
+        storage,
+        sender,
+        config,
+        now,
+      });
+      return { ...replay, replayedCommand: true };
+    }
+    await assertCrmSubmissionWritable({ storage, submissionId: scopedSubmissionId });
     if (!processImmediately) {
       return {
         ok: true,
@@ -813,6 +827,7 @@ export async function sendCrmFollowUpEmail({
     });
     return { ...replay, replayedCommand: true };
   }
+  await assertCrmSubmissionWritable({ storage, submissionId: scopedSubmissionId });
   const previewResult = await previewCrmFollowUpEmail({ submissionId, actor: scopedActor, input, storage, config, now });
   if (!previewResult.ok) return previewResult;
   const { submission, preview } = previewResult;

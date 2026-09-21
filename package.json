@@ -20,6 +20,7 @@
     "cim:canonical-merge": "node scripts/repair-canonical-opportunity-merge.js",
     "crm:source-fields:repair": "node scripts/repair-deal-hunter-crm-source-fields.js",
     "crm:integrity:audit": "node scripts/audit-deal-hunter-crm-integrity.js",
+    "crm:duplicate-consolidation": "node scripts/repair-crm-duplicate-consolidation.js",
     "cim:stage2:audit": "node scripts/audit-cim-stage2.js",
     "eval:follow-ups": "node scripts/run-follow-up-eval.js",
     "eval:follow-ups:live": "node scripts/run-follow-up-eval.js --live",

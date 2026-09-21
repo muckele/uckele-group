@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
+import { CrmSubmissionSupersededError } from '../server/services/crmSubmissionSupersession.js';
 
 process.env.DEAL_HUNTER_SHEET_CSV_URLS = 'https://example.test/archive-review.csv';
 process.env.DEAL_HUNTER_AIRTABLE_TOKEN = 'test-token';
@@ -62,6 +63,34 @@ async function createLead(storage, company = 'Lifecycle Services') {
   assert.equal(result.ok, true);
   return result.submission;
 }
+
+test('archive and restore refuse a superseded id before reading either historical record', async () => {
+  const { archiveLead, restoreLead } = await import('../server/services/leadLifecycle.js');
+  let reads = 0;
+  const storage = {
+    async assertCrmSubmissionWritable(submissionId) {
+      throw new CrmSubmissionSupersededError({
+        submissionId,
+        survivorSubmissionId: 'survivor-id',
+        opportunityId: 'opportunity-id',
+      });
+    },
+    async getSubmission() {
+      reads += 1;
+      return null;
+    },
+  };
+
+  await assert.rejects(
+    archiveLead({ submissionId: 'loser-id', reason: 'duplicate', storage }),
+    { code: 'CRM_SUBMISSION_SUPERSEDED', submissionId: 'loser-id', survivorSubmissionId: 'survivor-id' },
+  );
+  await assert.rejects(
+    restoreLead({ submissionId: 'loser-id', status: 'review', storage }),
+    { code: 'CRM_SUBMISSION_SUPERSEDED', submissionId: 'loser-id', survivorSubmissionId: 'survivor-id' },
+  );
+  assert.equal(reads, 0);
+});
 
 test('archive is explicit, audited, searchable, and stops linked CIM outreach; restore does not restart it', async (t) => {
   const storage = testStorage(t);
@@ -183,6 +212,7 @@ test('linked Deal Hunter dismissal archives and stores disposition in one CRM ac
   const mutations = [];
   let directDispositionWrites = 0;
   const storage = {
+    async assertCrmSubmissionWritable() {},
     async getSubmission(id) {
       assert.equal(id, linkedSubmission.id);
       return structuredClone(linkedSubmission);
@@ -360,6 +390,7 @@ test('a URL-derived deal key can authorize its matching stored CRM listing ident
   const dealKey = `url:${listingUrl}`;
   let mutationCalls = 0;
   const storage = {
+    async assertCrmSubmissionWritable() {},
     async getSubmission(id) {
       return {
         id,
@@ -432,6 +463,7 @@ test('linked Deal Hunter dismissal returns 409 on compound mutation conflict wit
   const { dismissDealHunterOpportunity } = await import('../server/services/leadLifecycle.js');
   let directDispositionWrites = 0;
   const storage = {
+    async assertCrmSubmissionWritable() {},
     async getSubmission() {
       return {
         id: 'conflicted-dismissal-submission',

@@ -4,6 +4,7 @@ import { getStorage } from '../storage/index.js';
 import { getFollowUpEmailReadiness } from './followUpEmail.js';
 import { hasVerifiedFollowUpReply } from './emailReadiness.js';
 import { buildFollowUpAiReadiness } from './followUpAiPolicy.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -263,6 +264,7 @@ export async function getCrmFollowUpOutboxResult({ submissionId = '', outboxId =
 export async function dismissCrmFollowUpRecommendation({
   submissionId = '', recommendationId = '', expectedSubmissionVersion = '', actor = 'admin', storage = getStorage(),
 } = {}) {
+  await assertCrmSubmissionWritable({ storage, submissionId: compactText(submissionId, 160) });
   const submission = await storage.getSubmission(compactText(submissionId, 160));
   if (!submission) return { ok: false, status: 404, error: 'CRM record not found.' };
   if (!expectedSubmissionVersion || expectedSubmissionVersion !== submission.updated_at) {
@@ -300,6 +302,7 @@ export async function createAdminEmailSuppression({
   submissionId = '', email = '', reason = '', confirmed = false, overrideReason = '', actor = 'admin',
   storage = getStorage(),
 } = {}) {
+  await assertCrmSubmissionWritable({ storage, submissionId: compactText(submissionId, 160) });
   const submission = await storage.getSubmission(compactText(submissionId, 160));
   if (!submission) return { ok: false, status: 404, error: 'CRM record not found.' };
   const normalizedEmail = normalizeEmail(email);
@@ -344,6 +347,7 @@ export async function createAdminEmailSuppression({
 export async function liftAdminEmailSuppression({
   submissionId = '', email = '', liftReason = '', confirmed = false, actor = 'admin', storage = getStorage(),
 } = {}) {
+  await assertCrmSubmissionWritable({ storage, submissionId: compactText(submissionId, 160) });
   const submission = await storage.getSubmission(compactText(submissionId, 160));
   if (!submission) return { ok: false, status: 404, error: 'CRM record not found.' };
   const normalizedEmail = normalizeEmail(email);

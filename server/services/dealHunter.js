@@ -15,6 +15,7 @@ import {
 } from './delivery.js';
 import { createManualSubmission } from './submissions.js';
 import { commitCrmActivityMutation } from './activity.js';
+import { assertCrmSubmissionWritable } from './crmSubmissionSupersession.js';
 import { getEmailReadiness } from './emailReadiness.js';
 import {
   buildOutboundCommunication,
@@ -55,6 +56,12 @@ import {
   nextManualFollowUpAt,
 } from './dealHunterManualFollowUpPolicy.js';
 import { consumeDealHunterManualFollowUpCapability } from './dealHunterManualFollowUps.js';
+import {
+  DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES,
+  dealHunterListingMarketplaceAliases as listingMarketplaceAliases,
+  normalizeDealHunterListingIdentity as normalizeListingIdentity,
+  normalizeDealHunterListingUrl as normalizeUrl,
+} from './dealHunterListingIdentity.js';
 
 const defaultTimeoutMs = 45000;
 const sheetWorkbookExpandedMaxBytes = 32 * 1024 * 1024;
@@ -572,50 +579,6 @@ function extractBrokerContacts(rawRow = {}, nameFallbacks = {}) {
 
 function normalizeKey(value = '') {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-function normalizeUrl(value = '') {
-  const normalized = normalizeText(value, 1000);
-
-  if (!normalized) {
-    return '';
-  }
-
-  const withProtocol = /^https?:\/\//i.test(normalized) ? normalized : `https://${normalized}`;
-
-  try {
-    const url = new URL(withProtocol);
-    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : '';
-  } catch {
-    return '';
-  }
-}
-
-function normalizeListingIdentity(value = '') {
-  const normalized = normalizeText(value, 1000).toLowerCase();
-
-  if (!normalized) {
-    return '';
-  }
-
-  const withProtocol = /^[a-z][a-z\d+\-.]*:\/\//i.test(normalized) ? normalized : `https://${normalized}`;
-
-  try {
-    const url = new URL(withProtocol);
-
-    if (!['http:', 'https:'].includes(url.protocol)) {
-      return '';
-    }
-
-    const params = Array.from(url.searchParams.entries())
-      .filter(([key]) => !/^utm_/i.test(key) && !['fbclid', 'gclid', 'mc_cid', 'mc_eid'].includes(key.toLowerCase()))
-      .sort(([left], [right]) => left.localeCompare(right));
-    const query = params.length > 0 ? `?${new URLSearchParams(params).toString()}` : '';
-
-    return `${url.hostname.replace(/^www\./i, '').toLowerCase()}${url.pathname.replace(/\/+$/, '') || '/'}${query}`;
-  } catch {
-    return normalized.replace(/^https?:\/\//, '').replace(/^www\./, '').replace(/#.*$/, '').replace(/[?&]utm_[^&]*/gi, '');
-  }
 }
 
 function normalizeIdentityPart(value = '', maxLength = 500) {
@@ -2763,26 +2726,6 @@ function tokenContainment(left = '', right = '') {
   return overlap / Math.min(leftTokens.size, rightTokens.size);
 }
 
-function listingMarketplaceAliases(listingUrl = '') {
-  const normalized = normalizeUrl(listingUrl);
-  if (!normalized) return [];
-
-  try {
-    const url = new URL(normalized);
-    const host = url.hostname.replace(/^www\./i, '').toLowerCase();
-    const pathname = decodeURIComponent(url.pathname).replace(/\/+$/, '').toLowerCase();
-    const aliases = [];
-    const numericAdId = pathname.match(/(?:\/|[-_])(\d{5,})(?:\.[a-z]+)?$/)?.[1];
-
-    if (numericAdId && /(bizbuysell|bizquest|loopnet)\./.test(host)) aliases.push(`costar:${numericAdId}`);
-    if (host.includes('dealstream.com') && pathname && pathname !== '/') aliases.push(`dealstream:${pathname}`);
-    if (numericAdId && host.includes('businessbroker.net')) aliases.push(`businessbroker:${numericAdId}`);
-    return aliases;
-  } catch {
-    return [];
-  }
-}
-
 function dealIdentityAliases(deal = {}) {
   const listingIdentity = normalizeListingIdentity(deal.listingUrl);
   const sourceIdentity = sourceExternalIdentity(deal.sourceId, deal.id, deal.stableExternalId);
@@ -3973,8 +3916,8 @@ function dealHunterCrmPayload(deal, options = {}) {
 
 const dealHunterCrmMatchMaximumRows = 5000;
 const dealHunterCrmMatchPublicCandidateLimit = 25;
-const dealHunterCrmMatchMaximumAliases = 500;
 const dealHunterCrmMatchAuthorityRevision = Symbol('dealHunterCrmMatchAuthorityRevision');
+const dealHunterCrmMatchSupersessionMap = Symbol('dealHunterCrmMatchSupersessionMap');
 
 function dealHunterCrmMatchError(code, message, { status = 409, candidateIds = [], evidenceCategories = [] } = {}) {
   const error = new Error(message);
@@ -4082,7 +4025,10 @@ async function listCompleteDealHunterCrmCandidates(storage) {
     );
   }
   try {
-    result = await storage.readDealHunterCrmMatchAuthority({ limit: dealHunterCrmMatchMaximumRows });
+    result = await storage.readDealHunterCrmMatchAuthority({
+      limit: dealHunterCrmMatchMaximumRows,
+      supersessionLimit: dealHunterCrmMatchMaximumRows,
+    });
   } catch (error) {
     if (normalizeText(error?.code, 120).startsWith('CRM_MATCH_')) throw error;
     throw dealHunterCrmMatchError(
@@ -4101,10 +4047,12 @@ async function listCompleteDealHunterCrmCandidates(storage) {
       { status: 503, candidateIds, evidenceCategories: ['lookup-incomplete'] },
     );
   }
-  const reportedTotal = Number(result?.count);
+  const reportedTotal = Number(result?.submissionCount ?? result?.count);
+  const supersessions = Array.isArray(result?.supersessions) ? result.supersessions : [];
+  const reportedSupersessionTotal = Number(result?.supersessionCount ?? supersessions.length);
   if (!result || !Array.isArray(result.rows)
-    || result.count === null || result.count === undefined
-    || !Number.isInteger(reportedTotal) || reportedTotal < 0) {
+    || !Number.isInteger(reportedTotal) || reportedTotal < 0
+    || !Number.isInteger(reportedSupersessionTotal) || reportedSupersessionTotal < 0) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_LOOKUP_FAILED',
       'CRM matching received an invalid candidate lookup result, so no record was selected.',
@@ -4115,9 +4063,35 @@ async function listCompleteDealHunterCrmCandidates(storage) {
   for (const row of result.rows) {
     if (row?.id) rowsById.set(row.id, row);
   }
+  const supersessionsById = new Map();
+  const survivorByLoser = new Map();
+  const activeLoserIds = new Set();
+  const activeSurvivorIds = new Set();
+  for (const relation of supersessions) {
+    const relationId = normalizeText(relation?.id, 300);
+    const loserId = normalizeText(relation?.supersededSubmissionId, 300);
+    const survivorId = normalizeText(relation?.survivorSubmissionId, 300);
+    if (!relationId || !loserId || !survivorId || loserId === survivorId
+      || relation?.status !== 'active' || supersessionsById.has(relationId)
+      || survivorByLoser.has(loserId) || !rowsById.has(loserId) || !rowsById.has(survivorId)) {
+      throw dealHunterCrmMatchError(
+        'CRM_MATCH_LOOKUP_INCOMPLETE',
+        'CRM matching received an invalid supersession authority snapshot, so no record was selected.',
+        { status: 503, candidateIds: [loserId, survivorId], evidenceCategories: ['lookup-incomplete'] },
+      );
+    }
+    supersessionsById.set(relationId, relation);
+    survivorByLoser.set(loserId, survivorId);
+    activeLoserIds.add(loserId);
+    activeSurvivorIds.add(survivorId);
+  }
   if (reportedTotal > dealHunterCrmMatchMaximumRows
+    || reportedSupersessionTotal > dealHunterCrmMatchMaximumRows
     || result.rows.length !== reportedTotal
     || rowsById.size !== reportedTotal
+    || supersessions.length !== reportedSupersessionTotal
+    || supersessionsById.size !== reportedSupersessionTotal
+    || [...activeSurvivorIds].some((submissionId) => activeLoserIds.has(submissionId))
     || !/^[a-f0-9]{64}$/.test(String(result.revision || ''))) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_LOOKUP_INCOMPLETE',
@@ -4125,14 +4099,21 @@ async function listCompleteDealHunterCrmCandidates(storage) {
       { status: 503, candidateIds: [...rowsById.keys()], evidenceCategories: ['lookup-incomplete'] },
     );
   }
-  return { rows: [...rowsById.values()], revision: result.revision };
+  return {
+    rows: [...rowsById.values()],
+    rowsById,
+    supersessions,
+    survivorByLoser,
+    revision: result.revision,
+  };
 }
 
-function dealHunterCrmMatchResult(status, submission = null, candidates = [], authorityRevision = '') {
+function dealHunterCrmMatchResult(status, submission = null, candidates = [], authorityRevision = '', survivorByLoser = new Map()) {
   const boundedCandidates = candidates
     .map((candidate) => ({
       submissionId: candidate.submission.id,
       evidenceCategories: [...candidate.evidenceCategories].sort(),
+      evidenceOriginSubmissionIds: [...(candidate.evidenceOriginSubmissionIds || [candidate.submission.id])].sort(),
     }))
     .sort((left, right) => left.submissionId.localeCompare(right.submissionId));
   const result = {
@@ -4146,6 +4127,10 @@ function dealHunterCrmMatchResult(status, submission = null, candidates = [], au
   };
   Object.defineProperty(result, dealHunterCrmMatchAuthorityRevision, {
     value: authorityRevision,
+    enumerable: false,
+  });
+  Object.defineProperty(result, dealHunterCrmMatchSupersessionMap, {
+    value: new Map(survivorByLoser),
     enumerable: false,
   });
   return result;
@@ -4216,6 +4201,7 @@ function assertDealHunterCrmMatchStable(before, after) {
 async function validatedCachedDealHunterCrmSubmission(deal, submissionId, match) {
   const selected = selectedDealHunterCrmSubmission(match);
   if (!submissionId) return selected;
+  const canonicalCachedSubmissionId = match?.[dealHunterCrmMatchSupersessionMap]?.get(submissionId) || submissionId;
   if (!selected) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_AUTHORITY_STALE',
@@ -4231,11 +4217,11 @@ async function validatedCachedDealHunterCrmSubmission(deal, submissionId, match)
       { candidateIds: [submissionId], evidenceCategories: ['cached-import', 'inactive-record'] },
     );
   }
-  if (selected.id !== submissionId) {
+  if (selected.id !== canonicalCachedSubmissionId) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_AUTHORITY_CONFLICT',
       'The cached CRM import owner conflicts with the strongest current identity match.',
-      { candidateIds: [submissionId, selected.id], evidenceCategories: ['cached-import-conflict'] },
+      { candidateIds: [canonicalCachedSubmissionId, selected.id], evidenceCategories: ['cached-import-conflict'] },
     );
   }
   return selected;
@@ -4271,6 +4257,19 @@ export async function findExistingDealHunterSubmission(storage, deal) {
 
   const authority = await listCompleteDealHunterCrmCandidates(storage);
   if (opportunity?.primary_submission_id) {
+      if (authority.survivorByLoser.has(opportunity.primary_submission_id)) {
+        throw dealHunterCrmMatchError(
+          'CRM_MATCH_AUTHORITY_CONFLICT',
+          'The canonical opportunity primary is an active historical CRM record and requires operator review.',
+          {
+            candidateIds: [
+              opportunity.primary_submission_id,
+              authority.survivorByLoser.get(opportunity.primary_submission_id),
+            ],
+            evidenceCategories: ['canonical-primary', 'supersession-conflict'],
+          },
+        );
+      }
       const primary = authority.rows.find((row) => row.id === opportunity.primary_submission_id);
       if (!primary) {
         throw dealHunterCrmMatchError(
@@ -4297,7 +4296,8 @@ export async function findExistingDealHunterSubmission(storage, deal) {
       return dealHunterCrmMatchResult('unique-exact', primary, [{
         submission: primary,
         evidenceCategories: new Set(['canonical-primary']),
-      }], authority.revision);
+        evidenceOriginSubmissionIds: new Set([primary.id]),
+      }], authority.revision, authority.survivorByLoser);
   }
   const listingAliases = uniqueStrings([
     deal.listingUrl,
@@ -4315,9 +4315,9 @@ export async function findExistingDealHunterSubmission(storage, deal) {
       ...listingMarketplaceAliases(listingUrl),
     ]),
   ]));
-  if (listingAliases.length > dealHunterCrmMatchMaximumAliases
-    || dealKeyAliases.length > dealHunterCrmMatchMaximumAliases
-    || identityAliases.size > dealHunterCrmMatchMaximumAliases) {
+  if (listingAliases.length > DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES
+    || dealKeyAliases.length > DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES
+    || identityAliases.size > DEAL_HUNTER_CRM_MATCH_MAXIMUM_ALIASES) {
     throw dealHunterCrmMatchError(
       'CRM_MATCH_LOOKUP_INCOMPLETE',
       'CRM matching received more identity aliases than its bounded authority review can safely evaluate.',
@@ -4331,7 +4331,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
 
   for (const row of authority.rows) addCandidate(row);
 
-  const classified = [];
+  const classifiedBySurvivor = new Map();
   for (const submission of candidates.values()) {
     const stored = crmSubmissionStoredDeal(submission);
     const listingMatch = stored.storedListings.some((listingUrl) => (
@@ -4365,10 +4365,36 @@ export async function findExistingDealHunterSubmission(storage, deal) {
         { candidateIds: [submission.id], evidenceCategories: ['identity-conflict', ...identityConflicts, ...evidenceCategories] },
       );
     }
-    classified.push({ submission, tier, evidenceCategories });
+    const survivorId = authority.survivorByLoser.get(submission.id) || submission.id;
+    const survivor = authority.rowsById.get(survivorId);
+    if (!survivor || authority.survivorByLoser.has(survivorId)) {
+      throw dealHunterCrmMatchError(
+        'CRM_MATCH_LOOKUP_INCOMPLETE',
+        'CRM matching could not resolve a direct current CRM survivor from its reviewed authority.',
+        {
+          status: 503,
+          candidateIds: [submission.id, survivorId],
+          evidenceCategories: ['lookup-incomplete', 'supersession-conflict'],
+        },
+      );
+    }
+    const existing = classifiedBySurvivor.get(survivorId);
+    if (!existing) {
+      classifiedBySurvivor.set(survivorId, {
+        submission: survivor,
+        tier,
+        evidenceCategories: new Set(evidenceCategories),
+        evidenceOriginSubmissionIds: new Set([submission.id]),
+      });
+      continue;
+    }
+    existing.tier = Math.min(existing.tier, tier);
+    for (const category of evidenceCategories) existing.evidenceCategories.add(category);
+    existing.evidenceOriginSubmissionIds.add(submission.id);
   }
 
-  if (classified.length === 0) return dealHunterCrmMatchResult('none', null, [], authority.revision);
+  const classified = [...classifiedBySurvivor.values()];
+  if (classified.length === 0) return dealHunterCrmMatchResult('none', null, [], authority.revision, authority.survivorByLoser);
   for (const candidate of classified) {
     assertDealHunterCrmSubmissionOwnership(candidate.submission, deal.opportunityId || '');
   }
@@ -4386,7 +4412,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
     );
   }
   if (actionable.length > 1) {
-    return dealHunterCrmMatchResult('ambiguous', null, actionable, authority.revision);
+    return dealHunterCrmMatchResult('ambiguous', null, actionable, authority.revision, authority.survivorByLoser);
   }
   const [selected] = actionable;
   return dealHunterCrmMatchResult(
@@ -4394,6 +4420,7 @@ export async function findExistingDealHunterSubmission(storage, deal) {
     selected.submission,
     [selected],
     authority.revision,
+    authority.survivorByLoser,
   );
 }
 
@@ -4917,6 +4944,9 @@ export async function repairDealHunterCrmSourceFields({
   if (!isDealHunterManagedSubmission(existing)) {
     throw new Error('Only Deal Hunter-managed CRM records can be repaired from the current source.');
   }
+  if (apply) {
+    await assertCrmSubmissionWritable({ storage, submissionId: existing.id });
+  }
 
   const resolvedSourceResults = sourceResults || await collectSources(getConfig(), storage);
   const failedSources = resolvedSourceResults
@@ -5086,6 +5116,9 @@ async function performHighFitDealsCrmSync(scoredDeals = [], storage = getStorage
         }
         const currentMatch = await findExistingDealHunterSubmission(storage, deal);
         assertDealHunterCrmMatchStable(preflightMatch, currentMatch);
+        if (importRecord?.submission_id) {
+          await assertCrmSubmissionWritable({ storage, submissionId: importRecord.submission_id });
+        }
         const claimedSubmission = await validatedCachedDealHunterCrmSubmission(
           deal,
           importRecord?.submission_id,
@@ -7152,11 +7185,17 @@ export async function executeDealHunterCimFollowUpRequest({
   if (request?.metadata?.manualFollowUp?.mode === 'operator-approved') {
     if (!consumeDealHunterManualFollowUpCapability(approvedContext)
       || !validApprovedManualFollowUpContext(request, approvedContext)) return { status: 'approval-required', request };
+    if (request?.submission_id) {
+      await assertCrmSubmissionWritable({ storage, submissionId: request.submission_id });
+    }
     // The approved branch performs persistPreparedCimCommunication before
     // sendPreparedMessage, with a final terminal-authority revalidation.
     return processApprovedManualCimFollowUp({ storage, request, now, approvedContext, dependencies });
   }
   if (approvedContext) return { status: 'invalid-approved-context', request };
+  if (request?.submission_id) {
+    await assertCrmSubmissionWritable({ storage, submissionId: request.submission_id });
+  }
   const at = now instanceof Date ? now : new Date(now);
   return processLegacyCimFollowUpRequest(storage, request, at.toISOString());
 }
@@ -8478,6 +8517,9 @@ async function applyDealOsCrmReconciliationItem({ deal, item, storage, requested
   try {
     const currentMatch = await findExistingDealHunterSubmission(storage, deal);
     assertDealHunterCrmMatchStable(preflightMatch, currentMatch);
+    if (importRecord?.submission_id) {
+      await assertCrmSubmissionWritable({ storage, submissionId: importRecord.submission_id });
+    }
     const existing = await validatedCachedDealHunterCrmSubmission(
       deal,
       importRecord.submission_id,
@@ -8536,6 +8578,35 @@ async function applyDealOsCrmReconciliationItem({ deal, item, storage, requested
       });
     }
     throw error;
+  }
+}
+
+async function assertDealOsCrmReconciliationWriteAuthority({ previewResult, storage }) {
+  const authorityBefore = await listCompleteDealHunterCrmCandidates(storage);
+  const checkedSubmissionIds = new Set();
+  const assertWritable = async (submissionId) => {
+    const normalizedSubmissionId = normalizeText(submissionId, 300);
+    if (!normalizedSubmissionId || checkedSubmissionIds.has(normalizedSubmissionId)) return;
+    await assertCrmSubmissionWritable({ storage, submissionId: normalizedSubmissionId });
+    checkedSubmissionIds.add(normalizedSubmissionId);
+  };
+
+  for (const item of previewResult.items) {
+    if (['create', 'update'].includes(item.action)) await assertWritable(item.submissionId);
+  }
+
+  for (const deal of previewResult.dealsByOpportunity.values()) {
+    const importRecord = await getDealHunterCrmImportAuthority(storage, deal);
+    await assertWritable(importRecord?.submission_id);
+  }
+
+  const authorityAfter = await listCompleteDealHunterCrmCandidates(storage);
+  if (authorityAfter.revision !== authorityBefore.revision) {
+    throw dealHunterCrmMatchError(
+      'CRM_MATCH_AUTHORITY_STALE',
+      'CRM match authority changed before reconciliation bookkeeping, so no reconciliation run was created.',
+      { candidateIds: [...checkedSubmissionIds], evidenceCategories: ['authority-stale'] },
+    );
   }
 }
 
@@ -8598,6 +8669,7 @@ export async function executeDealOsCrmReconciliation({
   if (normalizeText(confirmation, 120) !== previewResult.confirmationRequired) {
     return { ok: false, status: 400, error: `Type ${previewResult.confirmationRequired} to execute this exact canonical set.`, preview: previewResult };
   }
+  await assertDealOsCrmReconciliationWriteAuthority({ previewResult, storage });
   const requiredMethods = [
     'claimDealHunterCrmImport', 'startDealHunterCrmReconciliationRun',
     'listDealHunterCrmReconciliationItems',
@@ -9588,6 +9660,7 @@ async function sendCimRequestForScoredDeal({
         deal: publicDealWithUnavailableCim(deal, archivedCimUnavailableReason, retryOfRequest ? [retryOfRequest] : []),
       };
     }
+    await assertCrmSubmissionWritable({ storage, submissionId: submission.id });
 
     const activeSuppression = await storage.getActiveEmailSuppression?.(recipientEmail);
     if (activeSuppression) {
@@ -10271,6 +10344,9 @@ export async function executeApprovedDealHunterCimRequest({
     storage.listDealHunterOpportunityAliases?.({ opportunityIds: [opportunityId], limit: 500 }),
     storage.listDealHunterOpportunitySourceObservations?.(opportunityId, { limit: 500 }),
   ]);
+  if (opportunity?.primary_submission_id) {
+    await assertCrmSubmissionWritable({ storage, submissionId: opportunity.primary_submission_id });
+  }
   if (!opportunity || !score || !Array.isArray(aliases) || !Array.isArray(sourceRows)) {
     return { ok: false, status: 409, code: 'preparation_stale', error: 'Current canonical authority is unavailable for the approved request.' };
   }
@@ -10362,6 +10438,20 @@ export async function sendDealHunterCimRequest({ dealKey = '', snapshotToken = '
     return { ok: false, status: 400, error: 'The CIM request does not match the signed approval queue.' };
   }
 
+  try {
+    const opportunity = await storage.getCurrentDealHunterOpportunity?.(snapshotDeal.opportunityId);
+    if (opportunity?.primary_submission_id) {
+      await assertCrmSubmissionWritable({ storage, submissionId: opportunity.primary_submission_id });
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      status: Number(error?.status) || 500,
+      ...(error?.code ? publicDealHunterCrmMatchBlocker(error) : {}),
+      error: error?.message || 'Current CRM authority could not be verified before sending this CIM request.',
+    };
+  }
+
   let result = null;
 
   try {
@@ -10415,6 +10505,9 @@ export async function retryDealHunterCimRequestWithCorrectedRecipient({
 
   if (!original) {
     return { ok: false, status: 404, error: 'CIM request not found.' };
+  }
+  if (original.submission_id) {
+    await assertCrmSubmissionWritable({ storage, submissionId: original.submission_id });
   }
 
   const deliveryIssueStates = new Set(['bounced', 'failed', 'complained', 'suppressed']);

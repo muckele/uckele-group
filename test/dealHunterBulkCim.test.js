@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { after, before, beforeEach, test } from 'node:test';
+import Database from 'better-sqlite3';
 
 process.env.DELIVERY_PROVIDER = 'resend';
 delete process.env.RESEND_API_KEY;
@@ -48,6 +52,18 @@ function fakeCrmMatchAuthorityStale(submissionId, evidenceCategories = ['authori
   error.candidateIds = submissionId ? [submissionId] : [];
   error.evidenceCategories = evidenceCategories;
   return error;
+}
+
+function sqliteTableDigests(sqlitePath, tableNames) {
+  const database = new Database(sqlitePath, { readonly: true, fileMustExist: true });
+  try {
+    return Object.fromEntries([...tableNames].sort().map((name) => [
+      name,
+      createHash('sha256').update(JSON.stringify(database.prepare(`SELECT * FROM "${name}" ORDER BY rowid`).all())).digest('hex'),
+    ]));
+  } finally {
+    database.close();
+  }
 }
 
 before(() => {
@@ -111,6 +127,7 @@ function createCimStorage() {
     activities,
     opportunities,
     cimRequestReadCalls,
+    async assertCrmSubmissionWritable() {},
     async listDealHunterSeenDeals() {
       return [];
     },
@@ -1474,6 +1491,156 @@ test('high-fit CRM sync rechecks after its claim and blocks ambiguity introduced
   assert.equal(storage.activities.length, 0);
   assert.equal(storage.requests.size, 0);
   assert.equal(storage.communications.size, 0);
+});
+
+test('real SQLite high-fit sync refuses stale and failed claims cached to an active loser without business effects', async (t) => {
+  const { reviewDailyDeals, syncDealHunterHighFitsToCrm } = await import('../server/services/dealHunter.js');
+  const { createManualSubmission } = await import('../server/services/submissions.js');
+  const { createSqliteStorage } = await import('../server/storage/sqlite.js');
+  const protectedTables = [
+    'contact_submissions',
+    'deal_hunter_crm_imports',
+    'deal_hunter_opportunities',
+    'deal_hunter_cim_requests',
+    'crm_communications',
+    'crm_email_outbox',
+    'email_events',
+  ];
+
+  for (const claimStatus of ['failed', 'pending']) {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), `ug-high-fit-cached-loser-${claimStatus}-`));
+    const sqlitePath = path.join(directory, 'crm.sqlite');
+    const storage = createSqliteStorage({ storage: { sqlitePath } });
+    t.after(() => {
+      storage.close();
+      fs.rmSync(directory, { recursive: true, force: true });
+    });
+
+    const reviewed = await reviewDailyDeals({ storage });
+    const deal = reviewed.qualified.find((candidate) => candidate.opportunityId);
+    assert.ok(deal?.opportunityId, `expected a canonical high-fit deal for ${claimStatus} control`);
+    const survivorInput = {
+      company: deal.name,
+      seller_name: 'Cached Claim Broker',
+      seller_email: 'cached-claim-broker@example.test',
+      listing_url: deal.listingUrl,
+      asking_price: `$${Number(deal.askingPrice).toLocaleString('en-US')}`,
+      ttm_revenue: `$${Number(deal.annualRevenue).toLocaleString('en-US')}`,
+      ttm_ebitda: `$${Number(deal.annualProfit).toLocaleString('en-US')}`,
+      status: 'review',
+      metadata: { dealHunter: { managed: true, opportunityId: deal.opportunityId, dealKey: deal.dealKey } },
+    };
+    const survivor = await createManualSubmission(survivorInput, 'high-fit-test', { storage });
+    const loser = await createManualSubmission({
+      company: `Unrelated historical row ${claimStatus}`,
+      seller_email: `cached-loser-${claimStatus}@example.test`,
+      listing_url: `https://example.test/unrelated-${claimStatus}`,
+      status: 'review',
+      metadata: {},
+    }, 'high-fit-test', { storage });
+    assert.equal(survivor.ok, true);
+    assert.equal(loser.ok, true);
+    await storage.updateSubmission(survivor.submission.id, {
+      updated_at: new Date().toISOString(),
+      deal_hunter_opportunity_id: deal.opportunityId,
+    });
+    await storage.upsertDealHunterOpportunity({
+      opportunity_id: deal.opportunityId,
+      created_at: deal.createdAt || new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      canonical_name: deal.name,
+      canonical_recipient: deal.brokerEmail || null,
+      canonical_location: deal.location || null,
+      primary_submission_id: survivor.submission.id,
+      identity_version: 'high-fit-cached-loser-v1',
+      status: 'active',
+      metadata: {},
+    });
+    const receiptDigest = createHash('sha256').update(`high-fit-${claimStatus}`).digest('hex');
+    await storage.upsertDealHunterCimRepairManifest({
+      id: `high-fit-${claimStatus}-receipt`, created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+      mode: 'crm-duplicate-consolidation', status: 'applied', actor: 'test', backup_reference: 'fixture',
+      checksum: receiptDigest, manifest: { version: 1 }, metadata: {},
+    });
+    let database = new Database(sqlitePath);
+    const staleAt = claimStatus === 'pending'
+      ? new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString()
+      : new Date().toISOString();
+    database.prepare(`
+      INSERT INTO deal_hunter_crm_imports (
+        id, created_at, updated_at, opportunity_id, deal_key, listing_identity,
+        listing_url, submission_id, status, source_name, metadata
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'required-sheet', '{}')
+    `).run(
+      `high-fit-${claimStatus}-import`, staleAt, staleAt, deal.opportunityId, deal.dealKey,
+      `high-fit:${claimStatus}`, deal.listingUrl, survivor.submission.id, claimStatus,
+    );
+    database.close();
+
+    const survivorControl = await syncDealHunterHighFitsToCrm({
+      confirmation: 'SYNC HIGH FITS',
+      expectedDealKeys: reviewed.qualified.map((candidate) => candidate.dealKey),
+      requestedBy: 'test-admin',
+      storage,
+    });
+    assert.equal(survivorControl.ok, true, `real SQLite ${claimStatus} survivor claim remains writable`);
+    assert.equal(
+      survivorControl.crmSync.created + survivorControl.crmSync.enriched + survivorControl.crmSync.updated,
+      1,
+      'the survivor control must perform the intended high-fit CRM write',
+    );
+    database = new Database(sqlitePath);
+    database.prepare(`
+      UPDATE deal_hunter_crm_imports
+      SET submission_id = ?, status = ?, updated_at = ?
+      WHERE opportunity_id = ?
+    `).run(survivor.submission.id, claimStatus, staleAt, deal.opportunityId);
+    database.close();
+
+    const realClaim = storage.claimDealHunterCrmImport.bind(storage);
+    let authorityRaceDigest = null;
+    let claimCalls = 0;
+    storage.claimDealHunterCrmImport = async (...args) => {
+      claimCalls += 1;
+      database = new Database(sqlitePath);
+      database.prepare(`
+        UPDATE deal_hunter_crm_imports
+        SET submission_id = ?, status = ?, updated_at = ?
+        WHERE opportunity_id = ?
+      `).run(loser.submission.id, claimStatus, staleAt, deal.opportunityId);
+      database.prepare(`
+        INSERT INTO crm_submission_supersessions (
+          id, created_at, updated_at, status, survivor_submission_id, superseded_submission_id,
+          opportunity_id, reason_code, reason_text, approved_by, approved_at, actor,
+          repair_version, repair_manifest_id, repair_digest, metadata
+        ) VALUES (?, ?, ?, 'active', ?, ?, ?, 'confirmed-duplicate', 'Reviewed duplicate.',
+          'owner@example.test', ?, 'test', 'high-fit-cached-loser-v1', ?, ?, '{}')
+      `).run(
+        `high-fit-${claimStatus}-relation`, new Date().toISOString(), new Date().toISOString(),
+        survivor.submission.id, loser.submission.id, deal.opportunityId, new Date().toISOString(),
+        `high-fit-${claimStatus}-receipt`, receiptDigest,
+      );
+      database.close();
+      authorityRaceDigest = sqliteTableDigests(sqlitePath, protectedTables);
+      return realClaim(...args);
+    };
+
+    const result = await syncDealHunterHighFitsToCrm({
+      confirmation: 'SYNC HIGH FITS',
+      expectedDealKeys: reviewed.qualified.map((candidate) => candidate.dealKey),
+      requestedBy: 'test-admin',
+      storage,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.crmSync.created, 0);
+    assert.equal(result.crmSync.enriched, 0);
+    assert.equal(result.crmSync.updated, 0);
+    assert.equal(result.crmSync.failed, 1);
+    assert.equal(claimCalls, 1);
+    assert.ok(authorityRaceDigest);
+    const after = sqliteTableDigests(sqlitePath, protectedTables);
+    assert.deepEqual(after, authorityRaceDigest, `cached ${claimStatus} loser claim must preserve protected CRM/CIM tables after authority invalidation`);
+  }
 });
 
 test('high-fit CRM sync preserves a non-claimed crm-deleted tombstone despite matching residue', async () => {

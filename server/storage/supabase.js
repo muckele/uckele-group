@@ -9,6 +9,7 @@ import {
 } from '../services/dealHunterOpportunityFacts.js';
 import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
 import { requireCanonicalCimRequestId } from '../services/cimRequestIdPolicy.js';
+import { CrmSupersessionUnavailableError } from '../services/crmSubmissionSupersession.js';
 
 const dealHunterQueueSorts = new Set([
   'acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed',
@@ -20,6 +21,7 @@ function unsupportedDealHunterCrmMatchAuthorityError() {
   error.status = 503;
   error.candidateIds = [];
   error.evidenceCategories = ['lookup-incomplete', 'provider-unsupported'];
+  error.cause = new CrmSupersessionUnavailableError();
   return error;
 }
 
@@ -1061,6 +1063,22 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
   return {
     provider: 'supabase',
 
+    async getCrmSubmissionSupersessionContext() {
+      throw new CrmSupersessionUnavailableError();
+    },
+
+    async listActiveCrmSubmissionSupersessions() {
+      throw new CrmSupersessionUnavailableError();
+    },
+
+    async assertCrmSubmissionWritable() {
+      throw new CrmSupersessionUnavailableError();
+    },
+
+    async auditCrmSubmissionSupersessions() {
+      throw new CrmSupersessionUnavailableError();
+    },
+
     async createApplicationBackup() {
       throw new Error('Application-managed backups are only available for SQLite storage. Use Supabase managed backups for this provider.');
     },
@@ -1351,6 +1369,24 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         rows: (data?.rows || []).map(normalizeSubmissionRow),
         total: Number(data?.total || 0),
       };
+    },
+
+    async listHistoricalSubmissionsForAdminExport() {
+      const { data, error } = await client.rpc('list_submissions_page', {
+        p_limit: 5000,
+        p_page: 1,
+        p_search: '',
+        p_status: '',
+        p_created_after: '',
+        p_sort: 'created_at',
+        p_direction: 'desc',
+      });
+
+      if (error) {
+        throw error;
+      }
+
+      return (data?.rows || []).map(normalizeSubmissionRow);
     },
 
     async listFollowUpSubmissions({
@@ -2922,6 +2958,9 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     async passDealHunterOpportunity(command = {}) {
       const opportunityId = String(command.opportunityId || '').trim();
       if (!opportunityId) throw new Error('A canonical opportunity id is required for atomic Pass.');
+      if (String(command.submissionId || '').trim()) {
+        throw new CrmSupersessionUnavailableError();
+      }
       const { data, error } = await client.rpc('pass_deal_hunter_opportunity', {
         p_command: {
           opportunity_id: opportunityId,
@@ -3154,6 +3193,10 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         .maybeSingle();
       if (error) throw error;
       return normalizeDealHunterOpportunityRow(data);
+    },
+
+    async getCimStage2SubmissionAuthority() {
+      throw new CrmSupersessionUnavailableError();
     },
 
     async listDealHunterOpportunities({ opportunityIds = [], recipientEmails = [], limit = 1000 } = {}) {

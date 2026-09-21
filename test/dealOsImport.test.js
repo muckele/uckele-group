@@ -362,6 +362,7 @@ test('current SMB Deal OS financial fields update the matched CRM record', async
   };
   let updatedValues = null;
   const storage = {
+    async assertCrmSubmissionWritable() {},
     async getSubmission(id) {
       return id === existing.id ? existing : null;
     },
