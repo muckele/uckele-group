@@ -521,6 +521,7 @@ test('source-field repair safely enriches a stale syndicated CRM record', async 
   let currentLinkEstablished = false;
   let submissionMutationStarted = false;
   const storage = {
+    async assertCrmSubmissionWritable() {},
     async getSubmission(id) {
       return id === submission.id ? submission : null;
     },

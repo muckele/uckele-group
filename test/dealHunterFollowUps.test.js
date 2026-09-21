@@ -165,6 +165,7 @@ test('global suppression stops a due CIM follow-up before claim, persistence, or
   let claimed = false;
   let stored = request;
   const storage = {
+    async assertCrmSubmissionWritable() {},
     async listDealHunterCimRequests() { return [stored]; },
     async upsertDealHunterCimRequest(value) { stored = value; return value; },
     async getSubmission() { return { id: request.submission_id, status: 'review' }; },
@@ -349,6 +350,7 @@ test('unmarked legacy runner retains existing delays maximum and executor behavi
   };
   const result = await runDealHunterCimFollowUps({
     storage: {
+      async assertCrmSubmissionWritable() {},
       async getDealHunterCimSafetySettings() { return { outreach_paused: false, metadata: {} }; },
       async listDealHunterCimRequests() { return [request]; },
       async getActiveEmailSuppression() { return { id: 'legacy-suppression', reason: 'complaint' }; },
@@ -407,6 +409,7 @@ test('legacy follow-up runner exposes CRM match ambiguity before request claim o
   }));
   const effects = { requestClaims: 0, communicationWrites: 0, providerCalls: 0 };
   const storage = {
+    async assertCrmSubmissionWritable() {},
     async getDealHunterCimSafetySettings() { return { outreach_paused: false, metadata: {} }; },
     async listDealHunterCimRequests() { return [request]; },
     async upsertDealHunterCimRequest(value) { return value; },

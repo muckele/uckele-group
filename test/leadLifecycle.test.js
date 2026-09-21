@@ -212,6 +212,7 @@ test('linked Deal Hunter dismissal archives and stores disposition in one CRM ac
   const mutations = [];
   let directDispositionWrites = 0;
   const storage = {
+    async assertCrmSubmissionWritable() {},
     async getSubmission(id) {
       assert.equal(id, linkedSubmission.id);
       return structuredClone(linkedSubmission);
@@ -389,6 +390,7 @@ test('a URL-derived deal key can authorize its matching stored CRM listing ident
   const dealKey = `url:${listingUrl}`;
   let mutationCalls = 0;
   const storage = {
+    async assertCrmSubmissionWritable() {},
     async getSubmission(id) {
       return {
         id,
@@ -461,6 +463,7 @@ test('linked Deal Hunter dismissal returns 409 on compound mutation conflict wit
   const { dismissDealHunterOpportunity } = await import('../server/services/leadLifecycle.js');
   let directDispositionWrites = 0;
   const storage = {
+    async assertCrmSubmissionWritable() {},
     async getSubmission() {
       return {
         id: 'conflicted-dismissal-submission',

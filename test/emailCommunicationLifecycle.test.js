@@ -95,6 +95,7 @@ function createStorage({ submissions = [], communications = [], cimRequests = []
 
   const storage = {
     state,
+    async assertCrmSubmissionWritable() {},
     async getSubmission(id) {
       return clone(state.submissions.find((submission) => submission.id === id) || null);
     },
