@@ -317,12 +317,12 @@ function applyInput(fixture, reviewedArtifact, overrides = {}) {
 
 if (path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 test('descriptor freezes exactly the reviewed incident and four-row ledger', () => {
-  assert.equal(CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION, 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION, 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2');
   assert.equal(CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE, 'crm-duplicate-consolidation');
   assert.equal(CRM_DUPLICATE_CONSOLIDATION_APPROVAL_SCHEMA, 'crm-duplicate-consolidation-approval-v1');
-  assert.equal(CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA, 'crm-duplicate-consolidation-plan-v1');
-  assert.equal(CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA, 'crm-duplicate-consolidation-manifest-v1');
-  assert.equal(CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION, 'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA, 'crm-duplicate-consolidation-plan-v2');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA, 'crm-duplicate-consolidation-manifest-v2');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION, 'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2');
   assert.deepEqual(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs, [POOLER, BERLIN]);
   assert.deepEqual(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport, {
     id: BERLIN_IMPORT_ID,

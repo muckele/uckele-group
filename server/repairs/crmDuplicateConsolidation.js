@@ -4,20 +4,25 @@ import {
   CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY,
   isCanonicalOpportunityMergeRelationshipColumn,
 } from './canonicalOpportunityMerge.js';
+import { dealHunterListingMarketplaceAliases } from '../services/dealHunterListingIdentity.js';
 
 export const CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION =
-  'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1';
+  'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2';
 export const CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE = 'crm-duplicate-consolidation';
 export const CRM_DUPLICATE_CONSOLIDATION_APPROVAL_SCHEMA =
   'crm-duplicate-consolidation-approval-v1';
 export const CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA =
-  'crm-duplicate-consolidation-plan-v1';
+  'crm-duplicate-consolidation-plan-v2';
 export const CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA =
-  'crm-duplicate-consolidation-manifest-v1';
+  'crm-duplicate-consolidation-manifest-v2';
 export const CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION =
-  'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1';
+  'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2';
 export const CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA =
   'crm-duplicate-consolidation-checkpoint-v1';
+export const CRM_DUPLICATE_CONSOLIDATION_CONFIG_AUTHORITY_SCHEMA =
+  'crm-duplicate-consolidation-runtime-config-v1';
+export const CRM_DUPLICATE_CONSOLIDATION_RUNTIME_SAFETY_SCHEMA =
+  'crm-duplicate-consolidation-runtime-safety-v1';
 export const CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_FIELDS = Object.freeze([
   'backupPath',
   'backupManifestId',
@@ -64,6 +69,187 @@ export function sha256Hex(value) {
 
 export function canonicalJsonSha256(value) {
   return sha256Hex(stableCanonicalJson(value));
+}
+
+const crmDuplicateConsolidationConfigFacts = Object.freeze([
+  Object.freeze({
+    sourceId: 'dealHunter.cimFollowUp.enabled',
+    environmentVariable: 'DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED',
+    read(config) {
+      return config?.dealHunter?.cimFollowUp?.enabled;
+    },
+  }),
+  Object.freeze({
+    sourceId: 'dealHunter.cimAutomation.schedulerEnabled',
+    environmentVariable: 'DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED',
+    read(config) {
+      return config?.dealHunter?.cimAutomation?.schedulerEnabled;
+    },
+  }),
+]);
+
+const crmDuplicateConsolidationTrueTokens = new Set(['1', 'true', 'yes', 'on']);
+const crmDuplicateConsolidationFalseTokens = new Set(['0', 'false', 'no', 'off']);
+
+export function selectCrmDuplicateConsolidationConfigAuthority({
+  config,
+  environment = process.env,
+} = {}) {
+  if (!config || typeof config !== 'object' || Array.isArray(config)) {
+    throw new Error('CRM duplicate consolidation runtime configuration is incomplete.');
+  }
+  if (!environment || typeof environment !== 'object' || Array.isArray(environment)) {
+    throw new Error('CRM duplicate consolidation raw environment representation is incomplete.');
+  }
+  const facts = crmDuplicateConsolidationConfigFacts.map((definition) => {
+    const effective = definition.read(config);
+    if (typeof effective !== 'boolean') {
+      throw new Error(`CRM duplicate consolidation ${definition.sourceId} must be a complete boolean.`);
+    }
+    const hasRaw = Object.hasOwn(environment, definition.environmentVariable)
+      && environment[definition.environmentVariable] !== undefined;
+    const raw = hasRaw ? environment[definition.environmentVariable] : undefined;
+    if (hasRaw && typeof raw !== 'string') {
+      throw new Error(`CRM duplicate consolidation malformed explicit value for ${definition.environmentVariable}.`);
+    }
+    const token = hasRaw ? raw.trim().toLowerCase() : null;
+    let rawState = 'default-absent';
+    let lexicalValue = false;
+    if (hasRaw && token === '') {
+      rawState = 'default-empty';
+    } else if (hasRaw && crmDuplicateConsolidationTrueTokens.has(token)) {
+      rawState = 'explicit-true';
+      lexicalValue = true;
+    } else if (hasRaw && crmDuplicateConsolidationFalseTokens.has(token)) {
+      rawState = 'explicit-false';
+    } else if (hasRaw) {
+      throw new Error(`CRM duplicate consolidation malformed explicit value for ${definition.environmentVariable}.`);
+    }
+    if (lexicalValue !== effective) {
+      throw new Error(`CRM duplicate consolidation ${definition.environmentVariable} disagrees with ${definition.sourceId}.`);
+    }
+    if (effective !== false) {
+      throw new Error(`CRM duplicate consolidation ${definition.sourceId} must be false.`);
+    }
+    return {
+      sourceKind: 'effective-config',
+      sourceId: definition.sourceId,
+      environmentVariable: definition.environmentVariable,
+      value: false,
+      rawState,
+      rawToken: token,
+    };
+  });
+  const authority = {
+    schema: CRM_DUPLICATE_CONSOLIDATION_CONFIG_AUTHORITY_SCHEMA,
+    facts,
+  };
+  return deeplyFreeze({
+    ...authority,
+    digest: canonicalJsonSha256(authority),
+  });
+}
+
+export function crmDuplicateConsolidationRawStringMatchesSha256(value, expectedDigest) {
+  return typeof value === 'string'
+    && value.length > 0
+    && /^[a-f0-9]{64}$/.test(String(expectedDigest || ''))
+    && createHash('sha256').update(value, 'utf8').digest('hex') === expectedDigest;
+}
+
+function crmDuplicateConsolidationMarketplaceIdentity(value, label, blockers) {
+  if (typeof value !== 'string' || !value.trim()) {
+    blockers.push(`${label} must be a nonempty string.`);
+    return [];
+  }
+  const candidate = value.trim();
+  if (/^costar:\d+$/.test(candidate)) return [candidate];
+  const identities = dealHunterListingMarketplaceAliases(candidate);
+  if (identities.length === 0) blockers.push(`unsupported or malformed ${label} marketplace evidence.`);
+  return identities;
+}
+
+export function inspectCrmDuplicateConsolidationMarketplaceIdentity({
+  listingUrl,
+  listingAliases,
+  identityAliases,
+  expectedIdentity,
+  allowAllAbsent = false,
+} = {}) {
+  const blockers = [];
+  const identities = [];
+  const hasListingUrl = listingUrl !== undefined && listingUrl !== null && listingUrl !== '';
+  if (hasListingUrl) {
+    identities.push(...crmDuplicateConsolidationMarketplaceIdentity(
+      listingUrl,
+      'primary listing URL',
+      blockers,
+    ));
+  } else if (listingUrl !== undefined && listingUrl !== null && listingUrl !== '') {
+    blockers.push('primary listing URL is malformed.');
+  }
+  for (const [name, values] of [
+    ['listingAliases', listingAliases],
+    ['identityAliases', identityAliases],
+  ]) {
+    if (values === undefined) continue;
+    if (!Array.isArray(values)) {
+      blockers.push(`${name} must be an array when present.`);
+      continue;
+    }
+    for (const value of values) {
+      identities.push(...crmDuplicateConsolidationMarketplaceIdentity(
+        value,
+        `${name} entry`,
+        blockers,
+      ));
+    }
+  }
+  const unique = [...new Set(identities)].sort();
+  if (unique.length === 0) {
+    if (!allowAllAbsent || hasListingUrl
+      || (Array.isArray(listingAliases) && listingAliases.length > 0)
+      || (Array.isArray(identityAliases) && identityAliases.length > 0)) {
+      blockers.push('approved marketplace identity evidence is missing.');
+    }
+  } else if (unique.length > 1) {
+    blockers.push('conflicting marketplace identities were supplied.');
+  } else if (unique[0] !== expectedIdentity) {
+    blockers.push('unexpected marketplace identity was supplied.');
+  }
+  return {
+    identities: unique,
+    valid: blockers.length === 0,
+    blockers: [...new Set(blockers)].sort(),
+  };
+}
+
+function parsedCrmDuplicateConsolidationMetadata(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function crmDuplicateConsolidationFinancialEvidenceMatches(row, pair) {
+  const metadata = parsedCrmDuplicateConsolidationMetadata(row?.metadata);
+  const raw = metadata?.dealHunter?.raw;
+  const annualProfit = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw[pair?.financialLabel]
+    : undefined;
+  const valuesMatch = row?.asking_price === pair?.askingPrice
+    && row?.ttm_revenue === pair?.revenue
+    && row?.ttm_ebitda === pair?.financialValue;
+  if (typeof annualProfit !== 'string' || annualProfit !== pair?.financialValue) {
+    return { valid: false, blocker: 'financial-label-or-source-value-drift' };
+  }
+  return valuesMatch
+    ? { valid: true, blocker: null }
+    : { valid: false, blocker: 'financial-projection-value-drift' };
 }
 
 function exactObjectKeys(value, expected, label) {
@@ -350,7 +536,7 @@ export function crmDuplicateConsolidationApprovalTuple() {
 }
 
 export function crmDuplicateConsolidationManifestId() {
-  return `${CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE}:v1:${canonicalJsonSha256(crmDuplicateConsolidationApprovalTuple())}`;
+  return `${CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE}:v2:${canonicalJsonSha256(crmDuplicateConsolidationApprovalTuple())}`;
 }
 
 export function crmDuplicateConsolidationRelationId(pair) {

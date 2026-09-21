@@ -63,9 +63,12 @@ export function dealHunterListingMarketplaceAliases(listingUrl = '') {
     const aliases = [];
     const numericAdId = pathname.match(/(?:\/|[-_])(\d{5,})(?:\.[a-z]+)?$/)?.[1];
 
-    if (numericAdId && /(bizbuysell|bizquest|loopnet)\./.test(host)) aliases.push(`costar:${numericAdId}`);
-    if (host.includes('dealstream.com') && pathname && pathname !== '/') aliases.push(`dealstream:${pathname}`);
-    if (numericAdId && host.includes('businessbroker.net')) aliases.push(`businessbroker:${numericAdId}`);
+    const exactHost = (domain) => host === domain || host.endsWith(`.${domain}`);
+    if (numericAdId && ['bizbuysell.com', 'bizquest.com', 'loopnet.com'].some(exactHost)) {
+      aliases.push(`costar:${numericAdId}`);
+    }
+    if (exactHost('dealstream.com') && pathname && pathname !== '/') aliases.push(`dealstream:${pathname}`);
+    if (numericAdId && exactHost('businessbroker.net')) aliases.push(`businessbroker:${numericAdId}`);
     return aliases;
   } catch {
     return [];

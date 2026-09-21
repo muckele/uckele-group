@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
 
+import { CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION } from '../server/repairs/crmDuplicateConsolidation.js';
 import { applyCrmDuplicateConsolidation } from '../server/services/crmDuplicateConsolidationRepair.js';
 import {
   createSqliteCrmDuplicateConsolidationReadOnlyStorage,
@@ -67,7 +68,7 @@ function directStorageApplyInput(fixture, artifact, backupVerification, override
   return {
     artifact,
     backup: backupEvidence(fixture),
-    confirmation: 'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1',
+    confirmation: CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
     backupVerification,
     actor: ACTOR,
     reason: REASON,
@@ -464,7 +465,7 @@ test('SQLite apply sink independently rejects missing confirmation and forged ba
   for (const [name, authority] of [
     ['no confirmation', { confirmation: undefined, backupVerification: undefined }],
     ['forged verification', {
-      confirmation: 'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1',
+      confirmation: CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
       backupVerification: { ok: true, planChecksum: 'forged' },
     }],
   ]) {
