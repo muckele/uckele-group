@@ -182,3 +182,27 @@ The backup proves database state only. Backup reconstruction uses the reviewed c
 The raw Berlin deal-key preimage and its retained evidence are not CLI inputs and must never be copied into a reviewed artifact, repository fixture, log, PR comment, CI secret, or operator command. Ordinary CI deliberately uses synthetic data and must refuse the fixed production digest. Merge readiness additionally requires the privacy-reviewed external restricted acceptance gate against a disposable SQLite database. A passing hosted CI run without that attestation is insufficient.
 
 The restricted gate is a code-verification operation only. It does not authorize or constitute production preview/apply. Production remains split into the seven separate gates above, including a new deployment/checkpoint, exact read-only production preview, independent artifact review, and a separate explicit apply authorization.
+
+## Apply-output privacy correction
+
+The stronger UG-P7-01M recovery gate discovered that the historical restricted harness had not exercised a successful apply through the operator CLI. When that real boundary was exercised, the CLI serialized the repair service's intentionally rich internal result, including postcondition rows, to stdout. The historical acceptance package remains retained as evidence that the stronger gate failed closed, but its earlier CLI-output privacy conclusion is superseded by this correction.
+
+`runCrmDuplicateConsolidationCli` now establishes a structurally closed output boundary for successful apply and verified replay. Its stdout result contains only:
+
+```text
+status
+mode
+applied
+mutationCount
+manifestId
+planChecksum
+integrity.valid
+integrity.quickCheck
+integrity.foreignKeyViolationCount
+```
+
+The projector accepts only the two expected apply statuses, enforces their exact applied/mutation-count combinations, binds the returned manifest ID and plan checksum to the reviewed CLI inputs, and requires successful SQLite integrity fields. Malformed internal results fail with a static error. Unknown current or future internal properties are omitted by construction; there is no raw/debug escape hatch. Preview output and all storage, service, transaction, receipt, checkpoint, authority, and four-row mutation semantics are unchanged.
+
+The public regression first failed because a clearly synthetic restricted sentinel survived into successful apply and replay stdout. After the fix, the focused repair/CLI suite passed 202/202, including exact allowlist shape, plain/Base64/hex/URI absence, unknown nested-property exclusion, stderr privacy, malformed-result refusal, and exact manifest/checksum binding.
+
+At code candidate `849d51b4a4e4a3e50cf527302e26afd20b3dbf75`, an independently reviewed external harness (SHA-256 `d2b402837462dc05be5832af83945c90515f04262ab358a91c904ab49c2fb2ca`) then spawned the real CLI for preview, first apply, and verified replay against retained evidence reconstructed only into disposable local SQLite. Its report (SHA-256 `c8baf9f93cd44f2847d8049bbedafc927d2c566e1922bb41352b76135cefffdb`) recorded exact four-row first apply, zero-write/equal-digest replay, five complete rollback cases, immutable receipt refusal, three intended identity-drift refusals, zero-write authority/race refusals, clean SQLite and both audits, and no restricted value or reversible encoding in CLI stdout, stderr, new Git material, or the report. The fixed Berlin preimage was absolutely absent from tracked Git content. No production system was accessed.

@@ -259,3 +259,29 @@ The V2-delta privacy scan covered plain text plus Base64, hexadecimal, and URI e
 An independent read-only review covered the complete source-shape correction, fixed incident scope, Berlin proof, listing evidence behavior, real Annual Profit source, retained-import semantics, four-source authority, equivalent digest comparisons, lexical/config handoff, backup/runtime separation, zero-writable-open preflight, transaction recheck, state-independent replay, V2/V1 boundary, restricted harness authenticity/privacy, public/restricted coverage mapping, and unchanged supersession protections. It reviewed exact candidate `d350fc9b2588f0cdea4e4bc34c7f8abc620137ea`, ran 184/184 focused V2 tests, inspected the restricted proof, made no changes, and returned PASS with P0/P1/P2/P3 all zero.
 
 These results authorize no production action. No production preview/apply, database access, reconciliation, provider transmission, merge, deployment, Stage 2 change, or automation change occurred. A later production operation still requires separate owner authorization, current operational quiescence checks, a freshly reviewed artifact, and the established production checkpoint gates.
+
+## 2026-09-21 CLI apply-output privacy correction
+
+The later UG-P7-01M recovery gate strengthened the restricted acceptance composition by invoking successful apply through the real operator CLI. That stronger gate exposed a P1 boundary defect: `runCrmDuplicateConsolidationCli` returned the service's rich internal apply result and `main()` serialized it to stdout, including internal postcondition row data. The previously retained acceptance remains valid historical evidence for the checks it actually ran, and its failed recovery package demonstrates the stronger gate stopped safely; its earlier CLI-output privacy conclusion is superseded here.
+
+The correction is confined to `scripts/repair-crm-duplicate-consolidation.js` and its public CLI tests. Successful apply and `verified-prior-apply` replay now return only `status`, `mode`, `applied`, `mutationCount`, `manifestId`, `planChecksum`, and the three-field `integrity` object. The pure projector has no spread, fallback, raw/debug mode, or interpolated failure. It strictly validates status, mode, applied/mutation-count consistency, exact reviewed manifest/checksum binding, and successful integrity. Preview, service/storage internals, schema, transaction, receipt, fixed incident authority, confirmation, checkpoint, and four-write ledger are unchanged.
+
+TDD evidence at code candidate `849d51b4a4e4a3e50cf527302e26afd20b3dbf75`:
+
+- RED: successful synthetic first apply and replay exited normally but exposed `UG_P7_SYNTHETIC_RESTRICTED_SENTINEL_NOT_PRODUCTION` through stdout;
+- GREEN: 202/202 focused repair/CLI tests passed with exact safe schemas, no plain/Base64/hex/URI sentinel in stdout or stderr, structural exclusion of an unknown nested internal property, strict malformed-result refusal, and exact manifest/checksum binding;
+- independent read-only review returned PASS with P0/P1/P2/P3 all zero.
+
+The independently reviewed external harness (mode `0600`, SHA-256 `d2b402837462dc05be5832af83945c90515f04262ab358a91c904ab49c2fb2ca`) used the actual CLI subprocess, repair service and contract, read-only SQLite adapter, `createSqliteStorage`, fixed incident constants, and retained evidence in disposable local databases. The machine-readable report (mode `0600`, SHA-256 `c8baf9f93cd44f2847d8049bbedafc927d2c566e1922bb41352b76135cefffdb`) passed with:
+
+- exact four-row database-derived mutation ledger and zero protected-table changes;
+- Berlin legacy import `opportunity_id` remaining `NULL`;
+- real CLI replay returning `verified-prior-apply`, zero mutations, and an equal all-table digest;
+- receipt UPDATE/DELETE refusal and unchanged digest;
+- rollback after writes 1–4 and final postcondition failure, each with zero committed repair writes;
+- intended deal-key, source-pointer, and canonical-import drift refusal with zero writes;
+- configuration/durable/V1/incomplete-V2 preflight refusal plus a transaction-race refusal with zero committed repair writes;
+- `quick_check = ok`, zero foreign-key violations, clean supersession audit, and unchanged generic audit (`ok: true`, `safeToReconcile: true`);
+- zero restricted or reversibly encoded values in preview/apply/replay stdout or stderr, zero matches in new Git blobs, zero fixed-preimage matches in tracked Git, and zero report matches.
+
+The retained raw evidence was reused locally; no new production capture or any production database access occurred. This verification authorizes no production preview/apply, merge, deployment, reconciliation, or transmission. Final exact-head full-suite, restricted-package, archive-readback, and hosted-CI identities are recorded in the PR/handoff after the documentation commit so this record does not recursively invalidate them.
