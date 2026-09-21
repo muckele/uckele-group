@@ -310,7 +310,12 @@ function crmDuplicateConsolidationMarketplaceIdentity(value, label, blockers) {
   }
   const candidate = value.trim();
   if (/^costar:\d+$/.test(candidate)) return [candidate];
-  const identities = dealHunterListingMarketplaceAliases(candidate);
+  const listingCandidate = candidate.startsWith('url:') ? candidate.slice(4) : candidate;
+  if (!listingCandidate) {
+    blockers.push(`unsupported or malformed ${label} marketplace evidence.`);
+    return [];
+  }
+  const identities = dealHunterListingMarketplaceAliases(listingCandidate);
   if (identities.length === 0) blockers.push(`unsupported or malformed ${label} marketplace evidence.`);
   return identities;
 }

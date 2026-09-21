@@ -208,6 +208,18 @@ test('marketplace inspection accepts approved URL-only evidence and rejects malf
     valid: true,
     blockers: [],
   });
+  assert.deepEqual(inspectCrmDuplicateConsolidationMarketplaceIdentity({
+    listingUrl: approvedUrl,
+    identityAliases: [
+      'url:bizbuysell.com/business-opportunity/synthetic-pooler/2516010',
+      expectedIdentity,
+    ],
+    expectedIdentity,
+  }), {
+    identities: [expectedIdentity],
+    valid: true,
+    blockers: [],
+  });
 
   const badCases = [
     {
