@@ -150,6 +150,152 @@ export function selectCrmDuplicateConsolidationConfigAuthority({
   });
 }
 
+export function validateCrmDuplicateConsolidationConfigAuthority(authority) {
+  exactObjectKeys(authority, ['schema', 'facts', 'digest'], 'CRM duplicate consolidation config authority');
+  if (authority.schema !== CRM_DUPLICATE_CONSOLIDATION_CONFIG_AUTHORITY_SCHEMA) {
+    throw new Error('CRM duplicate consolidation config authority schema is invalid.');
+  }
+  if (!Array.isArray(authority.facts)
+    || authority.facts.length !== crmDuplicateConsolidationConfigFacts.length) {
+    throw new Error('CRM duplicate consolidation config authority facts are incomplete.');
+  }
+  const facts = authority.facts.map((fact, index) => {
+    exactObjectKeys(
+      fact,
+      ['sourceKind', 'sourceId', 'environmentVariable', 'value', 'rawState', 'rawToken'],
+      `CRM duplicate consolidation config authority fact ${index}`,
+    );
+    const definition = crmDuplicateConsolidationConfigFacts[index];
+    if (fact.sourceKind !== 'effective-config'
+      || fact.sourceId !== definition.sourceId
+      || fact.environmentVariable !== definition.environmentVariable
+      || fact.value !== false
+      || !['default-absent', 'default-empty', 'explicit-false'].includes(fact.rawState)
+      || (fact.rawState === 'default-absent' && fact.rawToken !== null)
+      || (fact.rawState === 'default-empty' && fact.rawToken !== '')
+      || (fact.rawState === 'explicit-false'
+        && !crmDuplicateConsolidationFalseTokens.has(fact.rawToken))) {
+      throw new Error(`CRM duplicate consolidation config authority fact ${definition.sourceId} is invalid.`);
+    }
+    return { ...fact };
+  });
+  const normalized = {
+    schema: CRM_DUPLICATE_CONSOLIDATION_CONFIG_AUTHORITY_SCHEMA,
+    facts,
+  };
+  const digest = canonicalJsonSha256(normalized);
+  if (authority.digest !== digest) {
+    throw new Error('CRM duplicate consolidation config authority digest is invalid.');
+  }
+  return deeplyFreeze({ ...normalized, digest });
+}
+
+const crmDuplicateConsolidationDurableSafetyFacts = Object.freeze([
+  Object.freeze({
+    sourceId: 'deal_hunter_cim_safety_settings/global/outreach_paused',
+    rowId: 'global',
+    valueColumn: 'outreach_paused',
+  }),
+  Object.freeze({
+    sourceId: 'deal_hunter_automation_settings/cim-initial-outreach/paused',
+    rowId: 'cim-initial-outreach',
+    valueColumn: 'paused',
+  }),
+]);
+
+export function buildCrmDuplicateConsolidationRuntimeSafetyAuthority({
+  configAuthority,
+  cimSafetyRow,
+  automationRow,
+} = {}) {
+  const config = validateCrmDuplicateConsolidationConfigAuthority(configAuthority);
+  const rows = [cimSafetyRow, automationRow];
+  const durable = crmDuplicateConsolidationDurableSafetyFacts.map((definition, index) => {
+    const row = rows[index];
+    if (!row || typeof row !== 'object' || Array.isArray(row) || row.id !== definition.rowId) {
+      throw new Error(`CRM duplicate consolidation requires durable row ${definition.sourceId}.`);
+    }
+    const rawValue = row[definition.valueColumn];
+    if (rawValue !== true && rawValue !== 1) {
+      throw new Error(`CRM duplicate consolidation ${definition.sourceId} must be true.`);
+    }
+    return {
+      sourceKind: 'sqlite-row',
+      sourceId: definition.sourceId,
+      value: true,
+      rawRowDigest: canonicalJsonSha256(row),
+    };
+  });
+  const authority = {
+    schema: CRM_DUPLICATE_CONSOLIDATION_RUNTIME_SAFETY_SCHEMA,
+    config,
+    durable,
+  };
+  return deeplyFreeze({
+    ...authority,
+    digest: canonicalJsonSha256(authority),
+  });
+}
+
+export function validateCrmDuplicateConsolidationRuntimeSafetyAuthority(authority) {
+  exactObjectKeys(
+    authority,
+    ['schema', 'config', 'durable', 'digest'],
+    'CRM duplicate consolidation runtime safety authority',
+  );
+  if (authority.schema !== CRM_DUPLICATE_CONSOLIDATION_RUNTIME_SAFETY_SCHEMA) {
+    throw new Error('CRM duplicate consolidation runtime safety authority schema is invalid.');
+  }
+  const config = validateCrmDuplicateConsolidationConfigAuthority(authority.config);
+  if (!Array.isArray(authority.durable)
+    || authority.durable.length !== crmDuplicateConsolidationDurableSafetyFacts.length) {
+    throw new Error('CRM duplicate consolidation runtime safety durable facts are incomplete.');
+  }
+  const durable = authority.durable.map((fact, index) => {
+    exactObjectKeys(
+      fact,
+      ['sourceKind', 'sourceId', 'value', 'rawRowDigest'],
+      `CRM duplicate consolidation runtime safety durable fact ${index}`,
+    );
+    const definition = crmDuplicateConsolidationDurableSafetyFacts[index];
+    if (fact.sourceKind !== 'sqlite-row'
+      || fact.sourceId !== definition.sourceId
+      || fact.value !== true
+      || !/^[a-f0-9]{64}$/.test(String(fact.rawRowDigest || ''))) {
+      throw new Error(`CRM duplicate consolidation runtime safety fact ${definition.sourceId} is invalid.`);
+    }
+    return { ...fact };
+  });
+  const normalized = {
+    schema: CRM_DUPLICATE_CONSOLIDATION_RUNTIME_SAFETY_SCHEMA,
+    config,
+    durable,
+  };
+  const digest = canonicalJsonSha256(normalized);
+  if (authority.digest !== digest) {
+    throw new Error('CRM duplicate consolidation runtime safety authority digest is invalid.');
+  }
+  return deeplyFreeze({ ...normalized, digest });
+}
+
+export function assertCrmDuplicateConsolidationConfigAuthorityMatches(current, reviewed) {
+  const checkedCurrent = validateCrmDuplicateConsolidationConfigAuthority(current);
+  const checkedReviewed = validateCrmDuplicateConsolidationConfigAuthority(reviewed);
+  if (stableCanonicalJson(checkedCurrent) !== stableCanonicalJson(checkedReviewed)) {
+    throw new Error('CRM duplicate consolidation current configuration authority differs from reviewed configuration authority.');
+  }
+  return checkedCurrent;
+}
+
+export function assertCrmDuplicateConsolidationRuntimeSafetyAuthorityMatches(current, reviewed) {
+  const checkedCurrent = validateCrmDuplicateConsolidationRuntimeSafetyAuthority(current);
+  const checkedReviewed = validateCrmDuplicateConsolidationRuntimeSafetyAuthority(reviewed);
+  if (stableCanonicalJson(checkedCurrent) !== stableCanonicalJson(checkedReviewed)) {
+    throw new Error('CRM duplicate consolidation current four-source authority differs from reviewed four-source authority.');
+  }
+  return checkedCurrent;
+}
+
 export function crmDuplicateConsolidationRawStringMatchesSha256(value, expectedDigest) {
   return typeof value === 'string'
     && value.length > 0
@@ -420,6 +566,12 @@ const berlin = {
   revenue: '$3,535,760',
   financialLabel: 'Annual Profit',
   financialValue: '$490,070',
+  supersededDealKeySha256: '3d9a1bfb64efd766a7bc3dd8c584a7fc0aab58a74cbcbd377893ed42bd65f733',
+  supersededSource: {
+    sourceId: 'sheet-0',
+    sourceMode: 'csv',
+    externalId: '18',
+  },
 };
 
 const berlinImport = {
@@ -427,6 +579,16 @@ const berlinImport = {
   beforeSubmissionId: berlin.supersededSubmissionId,
   afterSubmissionId: berlin.survivorSubmissionId,
   opportunityId: null,
+  dealKeySha256: berlin.supersededDealKeySha256,
+  sourceId: 'sheet-0',
+  sourceMode: 'csv',
+};
+
+const berlinCanonicalImport = {
+  id: '4e2075ca935de95f09a80bdcdc51ac513c9ab5864f384d20f7ad123f139357ad',
+  submissionId: berlin.survivorSubmissionId,
+  opportunityId: berlin.opportunityId,
+  listingIdentity: berlin.listingIdentity,
 };
 
 export const CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR = deeplyFreeze({
@@ -440,6 +602,7 @@ export const CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR = deeplyFreeze({
   approvedAt: '2026-09-17T00:00:00.000Z',
   pairs: [pooler, berlin],
   berlinImport,
+  berlinCanonicalImport,
 });
 
 export const CRM_DUPLICATE_CONSOLIDATION_EXPECTED_MUTATION_LEDGER = deeplyFreeze([
@@ -532,6 +695,7 @@ export function crmDuplicateConsolidationApprovalTuple() {
     repairVersion: CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
     pairs: CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs,
     berlinImport: CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport,
+    berlinCanonicalImport: CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinCanonicalImport,
   };
 }
 
@@ -592,6 +756,9 @@ export function buildCrmDuplicateConsolidationPlan({
     error.blockers = [...inspection.blockers];
     throw error;
   }
+  const runtimeSafetyAuthority = validateCrmDuplicateConsolidationRuntimeSafetyAuthority(
+    inspection.runtimeSafetyAuthority,
+  );
   const checkedRecovery = validateCrmDuplicateConsolidationCheckpointEvidence({
     evidence: {
       schema: CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA,
@@ -623,6 +790,7 @@ export function buildCrmDuplicateConsolidationPlan({
     tableDigests: inspection.tableDigests,
     rawRows: inspection.rawRows,
     safety: inspection.safety,
+    runtimeSafetyAuthority,
     currentState: inspection.currentState,
     expectedMutationLedger: CRM_DUPLICATE_CONSOLIDATION_EXPECTED_MUTATION_LEDGER,
   };
@@ -677,6 +845,9 @@ export function validateCrmDuplicateConsolidationArtifact({
   if (!exactDescriptor(artifact.plan?.approval)) {
     throw new Error('Reviewed CRM duplicate consolidation tuple is not the exact approved incident.');
   }
+  validateCrmDuplicateConsolidationRuntimeSafetyAuthority(
+    artifact.plan?.runtimeSafetyAuthority,
+  );
   if (stableCanonicalJson(artifact.plan?.expectedMutationLedger)
     !== stableCanonicalJson(CRM_DUPLICATE_CONSOLIDATION_EXPECTED_MUTATION_LEDGER)) {
     throw new Error('Reviewed CRM duplicate consolidation mutation ledger is invalid.');

@@ -9,11 +9,15 @@ import {
   CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA,
   CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
   CRM_DUPLICATE_CONSOLIDATION_RUNTIME_SAFETY_SCHEMA,
+  buildCrmDuplicateConsolidationRuntimeSafetyAuthority,
+  canonicalJsonSha256,
   crmDuplicateConsolidationFinancialEvidenceMatches,
   crmDuplicateConsolidationRawStringMatchesSha256,
   inspectCrmDuplicateConsolidationMarketplaceIdentity,
   selectCrmDuplicateConsolidationConfigAuthority,
 } from '../server/repairs/crmDuplicateConsolidation.js';
+import { createSqliteCrmDuplicateConsolidationReadOnlyStorage } from '../server/storage/sqlite.js';
+import { createFixture } from './crmDuplicateConsolidationRepair.test.js';
 
 const safeConfig = () => ({
   dealHunter: {
@@ -103,6 +107,83 @@ test('repair-specific config authority refuses malformed, enabled, mismatched, a
       item.pattern,
       item.name,
     );
+  }
+});
+
+test('four-source authority binds like-for-like config facts and exact durable rows without self-hashing', () => {
+  const configAuthority = selectCrmDuplicateConsolidationConfigAuthority({
+    config: safeConfig(),
+    environment: {},
+  });
+  const cimSafetyRow = {
+    id: 'global',
+    updated_at: '2026-09-20T00:00:00.000Z',
+    outreach_paused: 1,
+    updated_by: 'synthetic-test',
+    metadata: '{}',
+  };
+  const automationRow = {
+    id: 'cim-initial-outreach',
+    updated_at: '2026-09-20T00:00:00.000Z',
+    paused: 1,
+    updated_by: 'synthetic-test',
+    metadata: '{}',
+  };
+  const authority = buildCrmDuplicateConsolidationRuntimeSafetyAuthority({
+    configAuthority,
+    cimSafetyRow,
+    automationRow,
+  });
+  assert.equal(authority.schema, CRM_DUPLICATE_CONSOLIDATION_RUNTIME_SAFETY_SCHEMA);
+  assert.equal(authority.config.digest, configAuthority.digest);
+  assert.deepEqual(authority.durable.map((fact) => [fact.sourceId, fact.value]), [
+    ['deal_hunter_cim_safety_settings/global/outreach_paused', true],
+    ['deal_hunter_automation_settings/cim-initial-outreach/paused', true],
+  ]);
+  assert.ok(authority.durable.every((fact) => /^[a-f0-9]{64}$/.test(fact.rawRowDigest)));
+  assert.match(authority.digest, /^[a-f0-9]{64}$/);
+  const { digest, ...hashInput } = authority;
+  assert.equal(digest, canonicalJsonSha256(hashInput));
+
+  assert.throws(() => buildCrmDuplicateConsolidationRuntimeSafetyAuthority({
+    configAuthority,
+    cimSafetyRow: { ...cimSafetyRow, outreach_paused: 0 },
+    automationRow,
+  }), /outreach.*paused.*true/i);
+  assert.throws(() => buildCrmDuplicateConsolidationRuntimeSafetyAuthority({
+    configAuthority,
+    cimSafetyRow,
+    automationRow: { ...automationRow, id: 'global' },
+  }), /cim-initial-outreach/i);
+});
+
+test('real read-only SQLite preview binds the two real durable row IDs and selected config authority', async (t) => {
+  const fixture = await createFixture(t);
+  const config = {
+    ...fixture.config,
+    ...safeConfig(),
+  };
+  const storage = createSqliteCrmDuplicateConsolidationReadOnlyStorage(config, { environment: {} });
+  try {
+    const inspection = await storage.inspectCrmDuplicateConsolidation();
+    assert.equal(
+      inspection.runtimeSafetyAuthority.schema,
+      CRM_DUPLICATE_CONSOLIDATION_RUNTIME_SAFETY_SCHEMA,
+    );
+    assert.deepEqual(
+      inspection.runtimeSafetyAuthority.durable.map((fact) => fact.sourceId),
+      [
+        'deal_hunter_cim_safety_settings/global/outreach_paused',
+        'deal_hunter_automation_settings/cim-initial-outreach/paused',
+      ],
+    );
+    assert.equal(
+      inspection.runtimeSafetyAuthority.config.digest,
+      selectCrmDuplicateConsolidationConfigAuthority({ config, environment: {} }).digest,
+    );
+    assert.ok(inspection.blockers.includes('berlin-superseded-deal-key-digest-drift'));
+  } finally {
+    storage.close();
   }
 });
 

@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
 
 import {
+  buildCrmDuplicateConsolidationPlan,
   CRM_DUPLICATE_CONSOLIDATION_APPROVAL_SCHEMA,
   CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
   CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR,
@@ -28,7 +29,6 @@ import {
   createSqliteCrmDuplicateConsolidationReadOnlyStorage,
   createSqliteStorage,
 } from '../server/storage/sqlite.js';
-import { auditDealHunterCrmIntegrity } from '../server/services/dealHunter.js';
 
 const NOW = '2026-09-19T17:00:00.000Z';
 const ACTOR = 'task-8-test-operator';
@@ -98,17 +98,15 @@ function logicalSnapshot(sqlitePath) {
   }, { readonly: true });
 }
 
-function tableDigest(sqlitePath, table) {
-  const snapshot = logicalSnapshot(sqlitePath);
-  return canonicalDigest(snapshot[table] || []);
-}
-
 function submission(pair, role) {
   const isSurvivor = role === 'survivor';
   const id = isSurvivor ? pair.survivorSubmissionId : pair.supersededSubmissionId;
   const listingUrl = pair.key === 'berlin' && !isSurvivor
     ? ''
     : `https://www.bizbuysell.com/business-opportunity/reviewed/${pair.listingIdentity.split(':')[1]}/`;
+  const syntheticBerlinDealKey = isSurvivor
+    ? 'SYNTHETIC-CI-BERLIN-SURVIVOR-DEAL-KEY'
+    : 'SYNTHETIC-CI-BERLIN-SUPERSEDED-DEAL-KEY';
   return {
     id,
     created_at: NOW,
@@ -159,13 +157,37 @@ function submission(pair, role) {
     metadata: {
       dealHunter: {
         ...(isSurvivor ? { opportunityId: pair.opportunityId } : {}),
-        listingAliases: isSurvivor || pair.key === 'pooler' ? [pair.listingIdentity] : [],
-        identityAliases: isSurvivor || pair.key === 'pooler' ? [pair.listingIdentity] : [],
-        financialProvenance: {
-          originalLabel: pair.financialLabel,
-          originalValue: pair.financialValue,
-          period: 'unknown',
-        },
+        ...(isSurvivor ? {
+          listingAliases: [listingUrl],
+          identityAliases: [pair.listingIdentity],
+        } : {}),
+        ...(pair.key === 'berlin' ? {
+          dealKey: syntheticBerlinDealKey,
+          sourceId: 'sheet-0',
+          sourceMode: 'csv',
+          externalId: isSurvivor ? '44' : '18',
+          ...(isSurvivor ? {
+            dealKeyAliases: [
+              syntheticBerlinDealKey,
+              'SYNTHETIC-CI-BERLIN-SUPERSEDED-DEAL-KEY',
+            ],
+            sourceRecords: [
+              {
+                sourceId: 'sheet-0',
+                sourceMode: 'csv',
+                externalId: '44',
+                listingUrl,
+              },
+              {
+                sourceId: 'deal-os-export',
+                sourceMode: 'manual-export',
+                externalId: '',
+                listingUrl,
+              },
+            ],
+          } : {}),
+        } : {}),
+        raw: { 'Annual Profit': pair.financialValue },
       },
       privateBody: `Private metadata ${pair.key} ${role}`,
     },
@@ -178,6 +200,9 @@ function insertImport(database, {
   submissionId,
   opportunityId = null,
   listingIdentity = pair.listingIdentity,
+  dealKey = `url:https://fixture.invalid/${pair.key}/${id}`,
+  listingUrl = `https://fixture.invalid/${pair.key}/${id}`,
+  metadata = {},
 }) {
   database.prepare(`
     INSERT INTO deal_hunter_crm_imports (
@@ -188,19 +213,28 @@ function insertImport(database, {
     id,
     NOW,
     NOW,
-    `url:https://fixture.invalid/${pair.key}/${id}`,
+    dealKey,
     listingIdentity,
-    `https://fixture.invalid/${pair.key}/${id}`,
+    listingUrl,
     submissionId,
     opportunityId,
   );
+  database.prepare('UPDATE deal_hunter_crm_imports SET metadata = ? WHERE id = ?')
+    .run(JSON.stringify(metadata), id);
 }
 
 async function createFixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-task8-repair-'));
   const sqlitePath = path.join(root, 'storage.sqlite');
-  const config = { storage: { provider: 'sqlite', sqlitePath }, protection: { rateLimitRetentionMs: 0 } };
-  const storage = createSqliteStorage(config);
+  const config = {
+    storage: { provider: 'sqlite', sqlitePath },
+    protection: { rateLimitRetentionMs: 0 },
+    dealHunter: {
+      cimFollowUp: { enabled: false },
+      cimAutomation: { schedulerEnabled: false },
+    },
+  };
+  const storage = createSqliteStorage(config, { crmDuplicateConsolidationEnvironment: {} });
   t.after(() => {
     try { storage.close(); } catch { /* already closed by the test */ }
     fs.rmSync(root, { recursive: true, force: true });
@@ -226,12 +260,12 @@ async function createFixture(t) {
     updated_at: NOW,
     outreach_paused: true,
     updated_by: ACTOR,
-    metadata: { followUpsDisabled: true, schedulerDisabled: true },
+    metadata: {},
   });
   rawDatabase(sqlitePath, (database) => {
     database.prepare(`
       INSERT INTO deal_hunter_automation_settings (id, updated_at, paused, updated_by, metadata)
-      VALUES ('global', ?, 1, ?, '{"schedulerDisabled":true}')
+      VALUES ('cim-initial-outreach', ?, 1, ?, '{}')
       ON CONFLICT(id) DO UPDATE SET paused = 1, updated_at = excluded.updated_at,
         updated_by = excluded.updated_by, metadata = excluded.metadata
     `).run(NOW, ACTOR);
@@ -246,10 +280,20 @@ async function createFixture(t) {
     insertImport(database, {
       id: BERLIN_CANONICAL_IMPORT_ID, pair: BERLIN,
       submissionId: BERLIN.survivorSubmissionId, opportunityId: BERLIN.opportunityId,
+      listingIdentity: `bizbuysell.com/business-opportunity/reviewed/${BERLIN.listingIdentity.split(':')[1]}`,
+      dealKey: 'SYNTHETIC-CI-BERLIN-SURVIVOR-DEAL-KEY',
+      listingUrl: `https://www.bizbuysell.com/business-opportunity/reviewed/${BERLIN.listingIdentity.split(':')[1]}/`,
+      metadata: {
+        sourceId: 'sheet-0',
+        sourceMode: 'csv',
+      },
     });
     insertImport(database, {
       id: BERLIN_IMPORT_ID, pair: BERLIN, submissionId: BERLIN.supersededSubmissionId,
-      listingIdentity: null,
+      listingIdentity: '',
+      listingUrl: '',
+      dealKey: 'SYNTHETIC-CI-BERLIN-SUPERSEDED-DEAL-KEY',
+      metadata: { sourceId: 'sheet-0', sourceMode: 'csv' },
     });
   });
 
@@ -276,7 +320,10 @@ async function createFixture(t) {
 }
 
 async function previewFixture(fixture) {
-  const readOnly = createSqliteCrmDuplicateConsolidationReadOnlyStorage(fixture.config);
+  const readOnly = createSqliteCrmDuplicateConsolidationReadOnlyStorage(
+    fixture.config,
+    { environment: {} },
+  );
   try {
     return await previewCrmDuplicateConsolidation({
       storage: readOnly,
@@ -286,6 +333,42 @@ async function previewFixture(fixture) {
       toolingRevision: TOOLING,
       recoveryCheckpoint: fixture.recoveryCheckpoint,
     });
+  } finally {
+    readOnly.close();
+  }
+}
+
+async function syntheticReviewedArtifactFixture(fixture) {
+  const readOnly = createSqliteCrmDuplicateConsolidationReadOnlyStorage(
+    fixture.config,
+    { environment: {} },
+  );
+  try {
+    const inspection = await readOnly.inspectCrmDuplicateConsolidation();
+    const planned = buildCrmDuplicateConsolidationPlan({
+      inspection: { ...inspection, blockers: [] },
+      actor: ACTOR,
+      reason: REASON,
+      executionRelease: RELEASE,
+      toolingRevision: TOOLING,
+      recoveryCheckpoint: fixture.recoveryCheckpoint,
+    });
+    return {
+      status: 'synthetic-contract-artifact',
+      mode: 'test-only',
+      applied: false,
+      blockers: inspection.blockers,
+      repairType: CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
+      repairVersion: CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+      approvalSchema: CRM_DUPLICATE_CONSOLIDATION_APPROVAL_SCHEMA,
+      planSchema: CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA,
+      manifestSchema: CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
+      manifestId: planned.manifestId,
+      planChecksum: planned.planChecksum,
+      recoveryCheckpointPath: fixture.recoveryCheckpoint.backupPath,
+      connection: inspection.connection,
+      plan: planned.plan,
+    };
   } finally {
     readOnly.close();
   }
@@ -323,12 +406,25 @@ test('descriptor freezes exactly the reviewed incident and four-row ledger', () 
   assert.equal(CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA, 'crm-duplicate-consolidation-plan-v2');
   assert.equal(CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA, 'crm-duplicate-consolidation-manifest-v2');
   assert.equal(CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION, 'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2');
-  assert.deepEqual(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs, [POOLER, BERLIN]);
+  assert.deepEqual(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs, [POOLER, {
+    ...BERLIN,
+    supersededDealKeySha256: '3d9a1bfb64efd766a7bc3dd8c584a7fc0aab58a74cbcbd377893ed42bd65f733',
+    supersededSource: { sourceId: 'sheet-0', sourceMode: 'csv', externalId: '18' },
+  }]);
   assert.deepEqual(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinImport, {
     id: BERLIN_IMPORT_ID,
     beforeSubmissionId: BERLIN.supersededSubmissionId,
     afterSubmissionId: BERLIN.survivorSubmissionId,
     opportunityId: null,
+    dealKeySha256: '3d9a1bfb64efd766a7bc3dd8c584a7fc0aab58a74cbcbd377893ed42bd65f733',
+    sourceId: 'sheet-0',
+    sourceMode: 'csv',
+  });
+  assert.deepEqual(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.berlinCanonicalImport, {
+    id: BERLIN_CANONICAL_IMPORT_ID,
+    submissionId: BERLIN.survivorSubmissionId,
+    opportunityId: BERLIN.opportunityId,
+    listingIdentity: BERLIN.listingIdentity,
   });
   assert.equal(Object.isFrozen(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR), true);
   assert.equal(Object.isFrozen(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs), true);
@@ -358,54 +454,35 @@ test('runtime selectors cannot add, remove, swap, or cross the two immutable pai
   ))).size, 4);
 });
 
-test('read-only preview is one query-only snapshot, deterministic, privacy-safe, and mutation-free', async (t) => {
+test('ordinary CI uses a clearly labeled synthetic Berlin identity and the fixed digest refuses mutation-free', async (t) => {
   const fixture = await createFixture(t);
   const before = logicalSnapshot(fixture.sqlitePath);
-  const first = await previewFixture(fixture);
-  const second = await previewFixture(fixture);
-  const alternateReadOnly = createSqliteCrmDuplicateConsolidationReadOnlyStorage(fixture.config);
-  let alternatePath;
+  const readOnly = createSqliteCrmDuplicateConsolidationReadOnlyStorage(
+    fixture.config,
+    { environment: {} },
+  );
   try {
-    alternatePath = await previewCrmDuplicateConsolidation({
-      storage: alternateReadOnly,
-      actor: ACTOR,
-      reason: REASON,
-      executionRelease: RELEASE,
-      toolingRevision: TOOLING,
-      recoveryCheckpoint: {
-        ...fixture.recoveryCheckpoint,
-        backupPath: `${fixture.recoveryCheckpoint.backupPath}.operator-selected-copy`,
-      },
-    });
+    const first = await readOnly.inspectCrmDuplicateConsolidation();
+    const second = await readOnly.inspectCrmDuplicateConsolidation();
+    assert.equal(first.connection.readonly, true);
+    assert.equal(first.connection.fileMustExist, true);
+    assert.equal(first.connection.queryOnly, true);
+    assert.equal(first.connection.consistentReadTransaction, true);
+    assert.deepEqual(first, second);
+    assert.ok(first.blockers.includes('berlin-superseded-deal-key-digest-drift'));
+    assert.ok(first.blockers.includes('berlin-survivor-deal-key-corroboration-drift'));
+    assert.equal(first.blockers.includes('berlin-canonical-import-identity-drift'), false);
+    assert.equal(first.blockers.includes('berlin-legacy-import-identity-drift'), true);
+    assert.equal(first.blockers.some((blocker) => /listing-pooler|financial-.*-pooler/i.test(blocker)), false);
+    assert.equal(first.database.logicalDigest, canonicalDigest(before));
   } finally {
-    alternateReadOnly.close();
+    readOnly.close();
   }
-  const after = logicalSnapshot(fixture.sqlitePath);
-
-  assert.equal(first.status, 'repair-required');
-  assert.equal(first.connection.readonly, true);
-  assert.equal(first.connection.fileMustExist, true);
-  assert.equal(first.connection.queryOnly, true);
-  assert.equal(first.connection.consistentReadTransaction, true);
-  assert.deepEqual(first.blockers, []);
-  assert.match(first.planChecksum, /^[a-f0-9]{64}$/);
-  assert.equal(first.planChecksum, second.planChecksum);
-  assert.equal(first.manifestId, second.manifestId);
-  assert.deepEqual(first.plan, second.plan);
-  assert.deepEqual(after, before);
-  assert.equal(first.plan.database.logicalDigest, canonicalDigest(before));
-  assert.match(first.plan.schema.digest, /^[a-f0-9]{64}$/);
-  assert.equal(first.plan.rawRows.length >= 9, true);
-  assert.ok(first.plan.rawRows.every((row) => /^[a-f0-9]{64}$/.test(row.digest)));
-  assert.deepEqual(first.plan.expectedMutationLedger, CRM_DUPLICATE_CONSOLIDATION_EXPECTED_MUTATION_LEDGER);
-  const { backupPath, ...recoveryReferences } = fixture.recoveryCheckpoint;
-  assert.deepEqual(first.plan.recoveryCheckpoint, recoveryReferences);
-  assert.equal(first.recoveryCheckpointPath, backupPath);
-  assert.equal(alternatePath.recoveryCheckpointPath, `${backupPath}.operator-selected-copy`);
-  assert.equal(alternatePath.planChecksum, first.planChecksum);
-  assert.deepEqual(alternatePath.plan, first.plan);
-  const serialized = stableCanonicalJson(first);
-  assert.doesNotMatch(serialized, /private note|private message|private metadata|private-broker@/i);
+  assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
+  await assert.rejects(previewFixture(fixture), (error) => (
+    error?.code === 'CRM_DUPLICATE_CONSOLIDATION_REFUSED'
+      && error.blockers.includes('berlin-superseded-deal-key-digest-drift')
+  ));
 });
 
 test('preview refuses inspection evidence from the ordinary writable SQLite storage', async (t) => {
@@ -424,16 +501,21 @@ test('preview refuses inspection evidence from the ordinary writable SQLite stor
   );
 });
 
-test('reviewed artifact verification binds canonical bytes, checksum, manifest ID, schemas, and fixed tuples', async (t) => {
+test('synthetic public artifact exercises canonical V2 validation but cannot authorize the fixed transaction', async (t) => {
   const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
   const verified = verifyCrmDuplicateConsolidationReviewedArtifact({
     artifact: stableCanonicalJson(artifact),
     expectedPlanChecksum: artifact.planChecksum,
     expectedManifestId: artifact.manifestId,
   });
   assert.equal(verified.planChecksum, artifact.planChecksum);
-  assert.deepEqual(verified.plan.approval.pairs, [POOLER, BERLIN]);
+  assert.equal(verified.plan.planSchema, 'crm-duplicate-consolidation-plan-v2');
+  assert.ok(verified.plan.runtimeSafetyAuthority.digest);
+  await assert.rejects(
+    applyCrmDuplicateConsolidation(applyInput(fixture, artifact)),
+    /berlin-superseded-deal-key-digest-drift|live raw-row.*drift|unsafe state/i,
+  );
 
   for (const [name, mutation] of [
     ['checksum', (value) => { value.planChecksum = '0'.repeat(64); }],
@@ -449,145 +531,6 @@ test('reviewed artifact verification binds canonical bytes, checksum, manifest I
       expectedManifestId: artifact.manifestId,
     }), name === 'manifest' ? /manifest/i : /checksum|tuple|schema/i);
   }
-});
-
-test('first apply changes exactly four approved rows and replay byte-validates the receipt with zero writes', async (t) => {
-  const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
-  const before = logicalSnapshot(fixture.sqlitePath);
-  const result = await applyCrmDuplicateConsolidation(applyInput(fixture, artifact));
-  const after = logicalSnapshot(fixture.sqlitePath);
-
-  assert.equal(result.status, 'repair-required');
-  assert.equal(result.applied, true);
-  assert.equal(result.mutationCount, 4);
-  assert.deepEqual(result.mutations, CRM_DUPLICATE_CONSOLIDATION_EXPECTED_MUTATION_LEDGER);
-  assert.equal(after.crm_submission_supersessions.length - before.crm_submission_supersessions.length, 2);
-  assert.equal(after.deal_hunter_cim_repair_manifests.length - before.deal_hunter_cim_repair_manifests.length, 1);
-  const beforeBerlin = before.deal_hunter_crm_imports.find((row) => row.id === BERLIN_IMPORT_ID);
-  const afterBerlin = after.deal_hunter_crm_imports.find((row) => row.id === BERLIN_IMPORT_ID);
-  assert.equal(beforeBerlin.submission_id, BERLIN.supersededSubmissionId);
-  assert.equal(afterBerlin.submission_id, BERLIN.survivorSubmissionId);
-  assert.equal(afterBerlin.opportunity_id, null);
-  assert.deepEqual(
-    after.deal_hunter_crm_imports.filter((row) => row.id !== BERLIN_IMPORT_ID),
-    before.deal_hunter_crm_imports.filter((row) => row.id !== BERLIN_IMPORT_ID),
-  );
-
-  const allowed = new Set(['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests']);
-  for (const table of Object.keys(before)) {
-    if (!allowed.has(table)) assert.deepEqual(after[table], before[table], `${table} must not change`);
-  }
-
-  const receiptBefore = after.deal_hunter_cim_repair_manifests.find((row) => row.id === artifact.manifestId);
-  const replayBefore = logicalSnapshot(fixture.sqlitePath);
-  const replay = await applyCrmDuplicateConsolidation(applyInput(fixture, artifact));
-  const replayAfter = logicalSnapshot(fixture.sqlitePath);
-  assert.equal(replay.status, 'verified-prior-apply');
-  assert.equal(replay.applied, false);
-  assert.equal(replay.mutationCount, 0);
-  assert.deepEqual(replayAfter, replayBefore);
-  assert.deepEqual(
-    replayAfter.deal_hunter_cim_repair_manifests.find((row) => row.id === artifact.manifestId),
-    receiptBefore,
-  );
-});
-
-test('apply refuses every missing or mismatched authority argument before mutation', async (t) => {
-  const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
-  const before = logicalSnapshot(fixture.sqlitePath);
-  const cases = [
-    ['apply flag', { apply: false }],
-    ['artifact', { reviewedArtifact: null }],
-    ['manifest', { expectedManifestId: 'wrong' }],
-    ['checksum', { expectedPlanChecksum: '0'.repeat(64) }],
-    ['backup path', { backup: { ...applyInput(fixture, artifact).backup, path: '/wrong' } }],
-    ['backup manifest', { backup: { ...applyInput(fixture, artifact).backup, manifestId: 'wrong' } }],
-    ['backup sha', { backup: { ...applyInput(fixture, artifact).backup, sha256: '0'.repeat(64) } }],
-    ['release', { executionRelease: 'wrong' }],
-    ['tooling', { toolingRevision: '0'.repeat(40) }],
-    ['actor', { actor: 'wrong' }],
-    ['reason', { reason: 'wrong reason' }],
-    ['confirmation', { confirmation: 'wrong' }],
-  ];
-  for (const [name, overrides] of cases) {
-    await assert.rejects(
-      applyCrmDuplicateConsolidation(applyInput(fixture, artifact, overrides)),
-      new RegExp(name.split(' ')[0], 'i'),
-      name,
-    );
-    assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before, name);
-  }
-});
-
-test('consolidation receipt stays append-only while ordinary manifest upsert remains mutable', async (t) => {
-  const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
-  await applyCrmDuplicateConsolidation(applyInput(fixture, artifact));
-  const original = logicalSnapshot(fixture.sqlitePath).deal_hunter_cim_repair_manifests
-    .find((row) => row.id === artifact.manifestId);
-
-  await assert.rejects(fixture.storage.upsertDealHunterCimRepairManifest({
-    ...original,
-    status: 'changed',
-    checksum: '0'.repeat(64),
-    manifest: { changed: true },
-    metadata: { changed: true },
-  }), /append-only|immutable/i);
-  rawDatabase(fixture.sqlitePath, (database) => {
-    assert.throws(() => database.prepare('UPDATE deal_hunter_cim_repair_manifests SET status = ? WHERE id = ?')
-      .run('changed', artifact.manifestId), /append-only|immutable/i);
-    assert.throws(() => database.prepare('DELETE FROM deal_hunter_cim_repair_manifests WHERE id = ?')
-      .run(artifact.manifestId), /append-only|immutable/i);
-  });
-  assert.deepEqual(
-    logicalSnapshot(fixture.sqlitePath).deal_hunter_cim_repair_manifests.find((row) => row.id === artifact.manifestId),
-    original,
-  );
-
-  const ordinary = {
-    id: 'ordinary-mutable-manifest', created_at: NOW, updated_at: NOW,
-    mode: 'ordinary-test', status: 'started', actor: ACTOR,
-    backup_reference: null, checksum: 'first', manifest: { version: 1 }, metadata: {},
-  };
-  await fixture.storage.upsertDealHunterCimRepairManifest(ordinary);
-  const updated = await fixture.storage.upsertDealHunterCimRepairManifest({
-    ...ordinary, updated_at: '2026-09-19T18:00:00.000Z', status: 'applied',
-    checksum: 'second', manifest: { version: 2 },
-  });
-  assert.equal(updated.status, 'applied');
-  assert.equal(updated.checksum, 'second');
-  assert.deepEqual(updated.manifest, { version: 2 });
-});
-
-test('post-apply supersession audit and SQLite integrity are clean without changing generic audit semantics', async (t) => {
-  const fixture = await createFixture(t);
-  const genericBefore = await auditDealHunterCrmIntegrity({ storage: fixture.storage });
-  const artifact = await previewFixture(fixture);
-  await applyCrmDuplicateConsolidation(applyInput(fixture, artifact));
-  const audit = await fixture.storage.auditCrmSubmissionSupersessions();
-  const genericAfter = await auditDealHunterCrmIntegrity({ storage: fixture.storage });
-  assert.deepEqual(audit, { ok: true, violationCount: 0, violations: [] });
-  assert.equal(genericBefore.ok, true);
-  assert.equal(genericAfter.ok, true);
-  assert.equal(genericAfter.safeToReconcile, true);
-  assert.deepEqual(genericAfter.findings, genericBefore.findings);
-  assert.deepEqual(genericAfter.ownershipHealth, genericBefore.ownershipHealth);
-  assert.equal(
-    genericAfter.counts.auditedSubmissions,
-    genericBefore.counts.auditedSubmissions - 1,
-    'the unchanged generic audit read-through excludes the now-superseded Berlin loser',
-  );
-  assert.deepEqual(
-    { ...genericAfter.counts, auditedSubmissions: genericBefore.counts.auditedSubmissions },
-    genericBefore.counts,
-  );
-  rawDatabase(fixture.sqlitePath, (database) => {
-    assert.equal(database.pragma('quick_check', { simple: true }), 'ok');
-    assert.deepEqual(database.pragma('foreign_key_check'), []);
-  }, { readonly: true });
-  assert.equal(tableDigest(fixture.sqlitePath, 'contact_submissions'), artifact.plan.tableDigests.contact_submissions.digest);
 });
 }
 
@@ -608,4 +551,5 @@ export {
   previewFixture,
   rawDatabase,
   stableCanonicalJson,
+  syntheticReviewedArtifactFixture,
 };

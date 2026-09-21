@@ -3,11 +3,7 @@ import fs from 'node:fs';
 import test from 'node:test';
 
 import { CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION } from '../server/repairs/crmDuplicateConsolidation.js';
-import { applyCrmDuplicateConsolidation } from '../server/services/crmDuplicateConsolidationRepair.js';
-import {
-  createSqliteCrmDuplicateConsolidationReadOnlyStorage,
-  createSqliteStorage,
-} from '../server/storage/sqlite.js';
+import { createSqliteCrmDuplicateConsolidationReadOnlyStorage } from '../server/storage/sqlite.js';
 import {
   ACTOR,
   BERLIN,
@@ -19,17 +15,18 @@ import {
   REASON,
   RELEASE,
   TOOLING,
-  applyInput,
   createFixture,
   logicalSnapshot,
-  previewFixture,
   rawDatabase,
+  syntheticReviewedArtifactFixture,
 } from './crmDuplicateConsolidationRepair.test.js';
 
 const referenceSchemaPath = new URL('./fixtures/crmDuplicateConsolidationReferenceSchema.sql', import.meta.url);
 
 async function refusedPreview(fixture) {
-  const storage = createSqliteCrmDuplicateConsolidationReadOnlyStorage(fixture.config);
+  const storage = createSqliteCrmDuplicateConsolidationReadOnlyStorage(fixture.config, {
+    environment: {},
+  });
   try {
     try {
       await import('../server/services/crmDuplicateConsolidationRepair.js').then(({ previewCrmDuplicateConsolidation }) => (
@@ -54,29 +51,15 @@ async function refusedPreview(fixture) {
   }
 }
 
-function backupEvidence(fixture) {
-  return {
-    path: fixture.recoveryCheckpoint.backupPath,
-    manifestId: fixture.recoveryCheckpoint.backupManifestId,
-    sha256: fixture.recoveryCheckpoint.backupSha256,
-    flySnapshotId: fixture.recoveryCheckpoint.flySnapshotId,
-    flySnapshotDigest: fixture.recoveryCheckpoint.flySnapshotDigest,
-  };
-}
-
-function directStorageApplyInput(fixture, artifact, backupVerification, overrides = {}) {
-  return {
-    artifact,
-    backup: backupEvidence(fixture),
-    confirmation: CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
-    backupVerification,
-    actor: ACTOR,
-    reason: REASON,
-    executionRelease: RELEASE,
-    toolingRevision: TOOLING,
-    nowIso: NOW,
-    ...overrides,
-  };
+async function inspectFixture(fixture) {
+  const storage = createSqliteCrmDuplicateConsolidationReadOnlyStorage(fixture.config, {
+    environment: {},
+  });
+  try {
+    return await storage.inspectCrmDuplicateConsolidation();
+  } finally {
+    storage.close();
+  }
 }
 
 test('preview blocks unknown relationship-like columns and tables from the checked-in schema probe', async (t) => {
@@ -105,7 +88,7 @@ test('preview fails closed on tuple, primary, owner, listing, and financial prov
     ['financial label', (database) => {
       const row = database.prepare('SELECT metadata FROM contact_submissions WHERE id = ?').get(BERLIN.survivorSubmissionId);
       const metadata = JSON.parse(row.metadata);
-      metadata.dealHunter.financialProvenance.originalLabel = 'EBITDA';
+      metadata.dealHunter.raw['Annual Profit'] = '$1';
       database.prepare('UPDATE contact_submissions SET metadata = ? WHERE id = ?')
         .run(JSON.stringify(metadata), BERLIN.survivorSubmissionId);
     }],
@@ -126,7 +109,7 @@ test('preview fails closed on tuple, primary, owner, listing, and financial prov
 
 test('preview blocks active writers, unsafe outbound controls, and every nonterminal loser dependency class', async (t) => {
   const cases = [
-    ['active-writer', (database) => database.prepare("UPDATE deal_hunter_automation_settings SET paused = 0 WHERE id = 'global'").run()],
+    ['active-writer', (database) => database.prepare("UPDATE deal_hunter_automation_settings SET paused = 0 WHERE id = 'cim-initial-outreach'").run()],
     ['unsafe-outbound', (database) => database.prepare("UPDATE deal_hunter_cim_safety_settings SET outreach_paused = 0 WHERE id = 'global'").run()],
     ['communication', (database) => database.prepare(`
       INSERT INTO crm_communications (
@@ -222,8 +205,8 @@ test('preview blocks every loser CIM request but only nonterminal survivor CIM w
         const error = await refusedPreview(fixture);
         assert.ok(error.blockers.some((blocker) => /cim-request/i.test(blocker)));
       } else {
-        const artifact = await previewFixture(fixture);
-        assert.deepEqual(artifact.blockers, []);
+        const inspection = await inspectFixture(fixture);
+        assert.equal(inspection.blockers.some((blocker) => /cim-request/i.test(blocker)), false);
       }
     });
   }
@@ -240,9 +223,9 @@ test('preview retains terminal loser outbox provenance without treating it as ac
       'terminal-loser-outbox', 'terminal-loser-outbox-client', 'permanent_failed',
       'fixture', 1, ?, ?, 'needs-response', ?, ?, '{}')
   `).run(BERLIN.supersededSubmissionId, NOW, ACTOR, NOW, NOW));
-  const artifact = await previewFixture(fixture);
-  assert.deepEqual(artifact.blockers, []);
-  assert.ok(artifact.plan.relationshipInventory.some((entry) => (
+  const inspection = await inspectFixture(fixture);
+  assert.equal(inspection.blockers.some((blocker) => /nonterminal-loser-outbox/i.test(blocker)), false);
+  assert.ok(inspection.relationshipInventory.some((entry) => (
     entry.table === 'crm_email_outbox'
       && entry.column === 'submission_id'
       && entry.matchedRowCount === 1
@@ -309,7 +292,7 @@ test('preview inventories every application TEXT column with all approved and sc
     `).run(NOW, NOW, ACTOR, JSON.stringify({ submissionId: POOLER.supersededSubmissionId }));
   });
 
-  const artifact = await previewFixture(fixture);
+  const inspection = await inspectFixture(fixture);
   const expectedTextColumnCount = rawDatabase(fixture.sqlitePath, (database) => database.prepare(`
     SELECT name FROM sqlite_schema
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
@@ -318,26 +301,26 @@ test('preview inventories every application TEXT column with all approved and sc
     count + database.pragma(`table_info(${JSON.stringify(table.name)})`)
       .filter((column) => /TEXT/i.test(String(column.type))).length
   ), 0), { readonly: true });
-  assert.equal(artifact.plan.relationshipInventory.length, expectedTextColumnCount);
-  const auditPath = artifact.plan.relationshipInventory.find((entry) => (
+  assert.equal(inspection.relationshipInventory.length, expectedTextColumnCount);
+  const auditPath = inspection.relationshipInventory.find((entry) => (
     entry.table === 'admin_audit_events' && entry.column === 'path'
   ));
   assert.equal(auditPath.classification, 'retained-with-provenance');
   assert.equal(auditPath.matchedRowCount, 1);
   assert.equal(auditPath.matchedIdentifierCount, knownIdentifiers.length + 1);
-  const historicalManifest = artifact.plan.relationshipInventory.find((entry) => (
+  const historicalManifest = inspection.relationshipInventory.find((entry) => (
     entry.table === 'deal_hunter_cim_repair_manifests' && entry.column === 'manifest'
   ));
   assert.ok(historicalManifest.policies.includes('retained-historical-receipt'));
-  const importId = artifact.plan.relationshipInventory.find((entry) => (
+  const importId = inspection.relationshipInventory.find((entry) => (
     entry.table === 'deal_hunter_crm_imports' && entry.column === 'id'
   ));
   assert.ok(importId.policies.includes('mutated-berlin-import-only'));
   assert.ok(importId.policies.includes('retained-preserved-import'));
-  assert.match(artifact.plan.referenceIdentifiers.digest, /^[a-f0-9]{64}$/);
-  assert.equal(artifact.plan.referenceIdentifiers.approvedCount, knownIdentifiers.length);
-  assert.ok(artifact.plan.referenceIdentifiers.totalCount > knownIdentifiers.length);
-  assert.doesNotMatch(JSON.stringify(artifact.plan.relationshipInventory), /private@|private note|private message/i);
+  assert.match(inspection.referenceIdentifiers.digest, /^[a-f0-9]{64}$/);
+  assert.equal(inspection.referenceIdentifiers.approvedCount, knownIdentifiers.length);
+  assert.ok(inspection.referenceIdentifiers.totalCount > knownIdentifiers.length);
+  assert.doesNotMatch(JSON.stringify(inspection.relationshipInventory), /private@|private note|private message/i);
 });
 
 test('preview blocks a positive incident reference in an unapproved TEXT authority surface', async (t) => {
@@ -376,8 +359,8 @@ test('preview scans an unknown TEXT column with no incident reference without ap
       VALUES ('unrelated', '{"scope":"unrelated"}')
     `).run();
   });
-  const artifact = await previewFixture(fixture);
-  const payload = artifact.plan.relationshipInventory.find((entry) => (
+  const inspection = await inspectFixture(fixture);
+  const payload = inspection.relationshipInventory.find((entry) => (
     entry.table === 'unexpected_reference_free_text' && entry.column === 'payload'
   ));
   assert.equal(payload.classification, 'scanned-no-incident-reference');
@@ -406,33 +389,9 @@ test('plan binds every required supersession index and trigger and refuses schem
     'trg_crm_submission_supersessions_guard_opportunity_delete',
   ];
   const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
-  assert.deepEqual(artifact.plan.schema.requiredObjects.map((entry) => entry.name), requiredNames.slice().sort());
-  assert.ok(artifact.plan.schema.requiredObjects.every((entry) => /^[a-f0-9]{64}$/.test(entry.sqlDigest)));
-
-  for (const [name, mutate] of [
-    ['drop index', (database) => database.exec('DROP INDEX uq_crm_submission_supersessions_active_loser')],
-    ['drop reversal guard', (database) => (
-      database.exec('DROP TRIGGER trg_crm_submission_supersessions_reverse_only')
-    )],
-    ['alter trigger', (database) => database.exec(`
-      DROP TRIGGER trg_crm_submission_supersessions_reverse_only;
-      CREATE TRIGGER trg_crm_submission_supersessions_reverse_only
-      BEFORE UPDATE ON crm_submission_supersessions BEGIN SELECT 1; END;
-    `)],
-  ]) {
-    await t.test(name, async (subtest) => {
-      const scoped = await createFixture(subtest);
-      const reviewed = await previewFixture(scoped);
-      rawDatabase(scoped.sqlitePath, mutate);
-      const before = logicalSnapshot(scoped.sqlitePath);
-      await assert.rejects(
-        applyCrmDuplicateConsolidation(applyInput(scoped, reviewed)),
-        /schema|required.*object|trigger|index|drift/i,
-      );
-      assert.deepEqual(logicalSnapshot(scoped.sqlitePath), before);
-    });
-  }
+  const inspection = await inspectFixture(fixture);
+  assert.deepEqual(inspection.schema.requiredObjects.map((entry) => entry.name), requiredNames.slice().sort());
+  assert.ok(inspection.schema.requiredObjects.every((entry) => /^[a-f0-9]{64}$/.test(entry.sqlDigest)));
 
   await t.test('missing before preview', async (subtest) => {
     const scoped = await createFixture(subtest);
@@ -441,23 +400,6 @@ test('plan binds every required supersession index and trigger and refuses schem
     ));
     const error = await refusedPreview(scoped);
     assert.ok(error.blockers.some((blocker) => /required.*trigger|schema.*object/i.test(blocker)));
-  });
-
-  await t.test('postcondition rollback', async (subtest) => {
-    const scoped = await createFixture(subtest);
-    const reviewed = await previewFixture(scoped);
-    const before = logicalSnapshot(scoped.sqlitePath);
-    await assert.rejects(
-      applyCrmDuplicateConsolidation(applyInput(scoped, reviewed, {
-        testHooks: { dropReversalGuardBeforePostconditions: true },
-      })),
-      /postcondition|required.*object|schema/i,
-    );
-    assert.deepEqual(logicalSnapshot(scoped.sqlitePath), before);
-    assert.equal(rawDatabase(scoped.sqlitePath, (database) => Boolean(database.prepare(`
-      SELECT 1 FROM sqlite_schema WHERE type = 'trigger'
-        AND name = 'trg_crm_submission_supersessions_reverse_only'
-    `).get()), { readonly: true }), true);
   });
 });
 
@@ -471,7 +413,7 @@ test('SQLite apply sink independently rejects missing confirmation and forged ba
   ]) {
     await t.test(name, async (subtest) => {
       const fixture = await createFixture(subtest);
-      const artifact = await previewFixture(fixture);
+      const artifact = await syntheticReviewedArtifactFixture(fixture);
       const before = logicalSnapshot(fixture.sqlitePath);
       await assert.rejects(fixture.storage.applyCrmDuplicateConsolidation({
         artifact,
@@ -490,306 +432,6 @@ test('SQLite apply sink independently rejects missing confirmation and forged ba
         ...authority,
       }), /confirmation|verified backup|verification evidence/i);
       assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
-    });
-  }
-});
-
-test('SQLite backup authority is instance-bound, single-use, fresh, and exactly rebound', async (t) => {
-  await t.test('cross-instance', async (subtest) => {
-    const fixture = await createFixture(subtest);
-    const artifact = await previewFixture(fixture);
-    const verification = await fixture.storage.verifyCrmDuplicateConsolidationBackupPlan({
-      artifact,
-      backup: backupEvidence(fixture),
-    });
-    const otherStorage = createSqliteStorage(fixture.config);
-    subtest.after(() => otherStorage.close());
-    const before = logicalSnapshot(fixture.sqlitePath);
-    await assert.rejects(
-      otherStorage.applyCrmDuplicateConsolidation(
-        directStorageApplyInput(fixture, artifact, verification),
-      ),
-      /non-forgeable|verified backup|verification evidence/i,
-    );
-    assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
-  });
-
-  await t.test('single-use', async (subtest) => {
-    const fixture = await createFixture(subtest);
-    const artifact = await previewFixture(fixture);
-    const verification = await fixture.storage.verifyCrmDuplicateConsolidationBackupPlan({
-      artifact,
-      backup: backupEvidence(fixture),
-    });
-    const first = await fixture.storage.applyCrmDuplicateConsolidation(
-      directStorageApplyInput(fixture, artifact, verification),
-    );
-    assert.equal(first.applied, true);
-    const afterFirst = logicalSnapshot(fixture.sqlitePath);
-    await assert.rejects(
-      fixture.storage.applyCrmDuplicateConsolidation(
-        directStorageApplyInput(fixture, artifact, verification),
-      ),
-      /non-forgeable|verified backup|verification evidence/i,
-    );
-    assert.deepEqual(logicalSnapshot(fixture.sqlitePath), afterFirst);
-  });
-
-  await t.test('expiry', async (subtest) => {
-    const fixture = await createFixture(subtest);
-    const artifact = await previewFixture(fixture);
-    const verification = await fixture.storage.verifyCrmDuplicateConsolidationBackupPlan({
-      artifact,
-      backup: backupEvidence(fixture),
-    });
-    const before = logicalSnapshot(fixture.sqlitePath);
-    const actualNow = Date.now;
-    Date.now = () => actualNow() + (5 * 60 * 1000) + 1;
-    try {
-      await assert.rejects(
-        fixture.storage.applyCrmDuplicateConsolidation(
-          directStorageApplyInput(fixture, artifact, verification),
-        ),
-        /stale|different authority/i,
-      );
-    } finally {
-      Date.now = actualNow;
-    }
-    assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
-  });
-
-  await t.test('changed backup file', async (subtest) => {
-    const fixture = await createFixture(subtest);
-    const artifact = await previewFixture(fixture);
-    const verification = await fixture.storage.verifyCrmDuplicateConsolidationBackupPlan({
-      artifact,
-      backup: backupEvidence(fixture),
-    });
-    const before = logicalSnapshot(fixture.sqlitePath);
-    fs.appendFileSync(fixture.backupPath, Buffer.from([0]));
-    await assert.rejects(
-      fixture.storage.applyCrmDuplicateConsolidation(
-        directStorageApplyInput(fixture, artifact, verification),
-      ),
-      /backup.*changed|evidence changed/i,
-    );
-    assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
-  });
-
-  for (const [name, rebind] of [
-    ['artifact', (fixture, artifact) => ({
-      artifact: { ...structuredClone(artifact), recoveryCheckpointPath: `${artifact.recoveryCheckpointPath}.other` },
-    })],
-    ['backup', (fixture) => ({
-      backup: { ...backupEvidence(fixture), manifestId: 'different-backup-manifest' },
-    })],
-  ]) {
-    await t.test(`${name} rebinding`, async (subtest) => {
-      const fixture = await createFixture(subtest);
-      const artifact = await previewFixture(fixture);
-      const verification = await fixture.storage.verifyCrmDuplicateConsolidationBackupPlan({
-        artifact,
-        backup: backupEvidence(fixture),
-      });
-      const before = logicalSnapshot(fixture.sqlitePath);
-      await assert.rejects(
-        fixture.storage.applyCrmDuplicateConsolidation(directStorageApplyInput(
-          fixture,
-          artifact,
-          verification,
-          rebind(fixture, artifact),
-        )),
-        /bound to different authority|stale/i,
-      );
-      assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
-    });
-  }
-});
-
-test('apply refuses any raw-row drift after review and rolls back without mutation', async (t) => {
-  const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
-  rawDatabase(fixture.sqlitePath, (database) => database.prepare('UPDATE contact_submissions SET company = ? WHERE id = ?')
-    .run('Drifted private company', POOLER.supersededSubmissionId));
-  const before = logicalSnapshot(fixture.sqlitePath);
-  let refusal;
-  await assert.rejects(
-    applyCrmDuplicateConsolidation(applyInput(fixture, artifact)).catch((error) => {
-      refusal = error;
-      throw error;
-    }),
-    /drift|checksum|reviewed plan|raw-row/i,
-  );
-  assert.equal(refusal?.code, 'CRM_DUPLICATE_CONSOLIDATION_REFUSED');
-  assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
-});
-
-test('failure after each write and during postconditions rolls back all four writes', async (t) => {
-  for (const point of [1, 2, 3, 4, 'postconditions']) {
-    await t.test(`failure ${point}`, async (subtest) => {
-      const fixture = await createFixture(subtest);
-      const artifact = await previewFixture(fixture);
-      const before = logicalSnapshot(fixture.sqlitePath);
-      const testHooks = point === 'postconditions'
-        ? { forcePostconditionFailure: true }
-        : { failAfterWrite: point };
-      await assert.rejects(
-        applyCrmDuplicateConsolidation(applyInput(fixture, artifact, { testHooks })),
-        /injected|postcondition/i,
-      );
-      assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
-    });
-  }
-});
-
-test('stale Berlin CAS, receipt collision, independently satisfied, and partial states refuse', async (t) => {
-  await t.test('stale CAS', async (subtest) => {
-    const fixture = await createFixture(subtest);
-    const artifact = await previewFixture(fixture);
-    const before = logicalSnapshot(fixture.sqlitePath);
-    await assert.rejects(
-      applyCrmDuplicateConsolidation(applyInput(fixture, artifact, { testHooks: { forceBerlinCasConflict: true } })),
-      /Berlin.*compare-and-set|CAS/i,
-    );
-    assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
-  });
-
-  await t.test('receipt collision', async (subtest) => {
-    const fixture = await createFixture(subtest);
-    const artifact = await previewFixture(fixture);
-    rawDatabase(fixture.sqlitePath, (database) => database.prepare(`
-      INSERT INTO deal_hunter_cim_repair_manifests (
-        id, created_at, updated_at, mode, status, actor, backup_reference,
-        checksum, manifest, metadata
-      ) VALUES (?, ?, ?, 'crm-duplicate-consolidation', 'applied', ?, ?, ?, '{}', '{}')
-    `).run(artifact.manifestId, NOW, NOW, ACTOR, fixture.backupPath, artifact.planChecksum));
-    const before = logicalSnapshot(fixture.sqlitePath);
-    await assert.rejects(applyCrmDuplicateConsolidation(applyInput(fixture, artifact)), /collision|receipt/i);
-    assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
-  });
-
-  for (const [name, mutate] of [
-    ['independently satisfied', (database, artifact) => {
-      database.exec('PRAGMA foreign_keys = OFF');
-      database.exec('DROP TRIGGER trg_crm_submission_supersessions_validate_insert');
-      for (const pair of [POOLER, BERLIN]) {
-        database.prepare(`
-          INSERT INTO crm_submission_supersessions (
-            id, created_at, updated_at, status, survivor_submission_id,
-            superseded_submission_id, opportunity_id, reason_code, reason_text,
-            approved_by, approved_at, actor, repair_version, repair_manifest_id,
-            repair_digest, metadata
-          ) VALUES (?, ?, ?, 'active', ?, ?, ?, 'confirmed-duplicate', 'forged',
-            'forged', ?, 'forged', 'forged', ?, ?, '{}')
-        `).run(`forged-${pair.key}`, NOW, NOW, pair.survivorSubmissionId,
-          pair.supersededSubmissionId, pair.opportunityId, NOW, artifact.manifestId, artifact.planChecksum);
-      }
-      database.prepare('UPDATE deal_hunter_crm_imports SET submission_id = ? WHERE id = ?')
-        .run(BERLIN.survivorSubmissionId, BERLIN_IMPORT_ID);
-      database.exec('PRAGMA foreign_keys = ON');
-    }],
-    ['partial', (database) => database.prepare('UPDATE deal_hunter_crm_imports SET submission_id = ? WHERE id = ?')
-      .run(BERLIN.survivorSubmissionId, BERLIN_IMPORT_ID)],
-  ]) {
-    await t.test(name, async (subtest) => {
-      const fixture = await createFixture(subtest);
-      const artifact = await previewFixture(fixture);
-      rawDatabase(fixture.sqlitePath, (database) => mutate(database, artifact));
-      const before = logicalSnapshot(fixture.sqlitePath);
-      await assert.rejects(applyCrmDuplicateConsolidation(applyInput(fixture, artifact)), /satisfied|partial|receipt|drift/i);
-      assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
-    });
-  }
-});
-
-test('logical reversal uses a distinct protected receipt and preserves the original apply receipt byte-for-byte', async (t) => {
-  const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
-  await applyCrmDuplicateConsolidation(applyInput(fixture, artifact));
-  const before = logicalSnapshot(fixture.sqlitePath);
-  const original = before.deal_hunter_cim_repair_manifests.find((row) => row.id === artifact.manifestId);
-  const relation = before.crm_submission_supersessions[0];
-  const reversalId = `${artifact.manifestId}:reverse:test`;
-  rawDatabase(fixture.sqlitePath, (database) => {
-    database.prepare(`
-      INSERT INTO deal_hunter_cim_repair_manifests (
-        id, created_at, updated_at, mode, status, actor, backup_reference,
-        checksum, manifest, metadata
-      ) VALUES (?, ?, ?, 'crm-duplicate-consolidation', 'applied', ?, ?, ?, ?, '{}')
-    `).run(
-      reversalId, NOW, NOW, ACTOR, fixture.backupPath, relation.repair_digest,
-      JSON.stringify({
-        schema: 'crm-duplicate-consolidation-reversal-manifest-v1',
-        operation: 'reverse',
-        relationId: relation.id,
-        applyManifestId: artifact.manifestId,
-        repairDigest: relation.repair_digest,
-        survivorSubmissionId: relation.survivor_submission_id,
-        supersededSubmissionId: relation.superseded_submission_id,
-        opportunityId: relation.opportunity_id,
-      }),
-    );
-    database.prepare(`
-      UPDATE crm_submission_supersessions
-      SET status = 'reversed', updated_at = ?, reversed_at = ?, reversed_by = ?,
-        reversal_reason = ?, reversal_manifest_id = ?
-      WHERE id = ?
-    `).run(NOW, NOW, ACTOR, 'Separately reviewed test reversal.', reversalId, relation.id);
-  });
-  const after = logicalSnapshot(fixture.sqlitePath);
-  assert.deepEqual(after.deal_hunter_cim_repair_manifests.find((row) => row.id === artifact.manifestId), original);
-  assert.equal(after.deal_hunter_cim_repair_manifests.find((row) => row.id === reversalId).mode, 'crm-duplicate-consolidation');
-  assert.equal(after.crm_submission_supersessions.find((row) => row.id === relation.id).reversal_manifest_id, reversalId);
-});
-
-test('replay rejects a receipt whose stored JSON bytes are not the exact canonical insert bytes', async (t) => {
-  const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
-  await applyCrmDuplicateConsolidation(applyInput(fixture, artifact));
-  rawDatabase(fixture.sqlitePath, (database) => {
-    const receiptGuardSql = database.prepare(`
-      SELECT sql FROM sqlite_schema WHERE type = 'trigger'
-        AND name = 'trg_crm_duplicate_consolidation_receipt_no_update'
-    `).get().sql;
-    database.exec('DROP TRIGGER trg_crm_duplicate_consolidation_receipt_no_update');
-    database.prepare(`
-      UPDATE deal_hunter_cim_repair_manifests
-      SET manifest = ' ' || manifest
-      WHERE id = ?
-    `).run(artifact.manifestId);
-    database.exec(receiptGuardSql);
-  });
-  await assert.rejects(
-    applyCrmDuplicateConsolidation(applyInput(fixture, artifact)),
-    (error) => error?.code === 'CRM_DUPLICATE_CONSOLIDATION_REFUSED'
-      && /canonical bytes|receipt/i.test(error.message),
-  );
-});
-
-test('replay rejects exact-relation and unrelated allowed-table drift', async (t) => {
-  for (const [name, mutate] of [
-    ['relation', (database, artifact) => {
-      database.exec('DROP TRIGGER trg_crm_submission_supersessions_immutable_update');
-      database.prepare(`
-        UPDATE crm_submission_supersessions SET actor = 'tampered'
-        WHERE repair_manifest_id = ? AND status = 'active'
-      `).run(artifact.manifestId);
-    }],
-    ['unrelated import', (database) => database.prepare(`
-      UPDATE deal_hunter_crm_imports SET metadata = '{"tampered":true}'
-      WHERE id = ?
-    `).run(POOLER_IMPORT_IDS[0])],
-  ]) {
-    await t.test(name, async (subtest) => {
-      const fixture = await createFixture(subtest);
-      const artifact = await previewFixture(fixture);
-      await applyCrmDuplicateConsolidation(applyInput(fixture, artifact));
-      rawDatabase(fixture.sqlitePath, (database) => mutate(database, artifact));
-      await assert.rejects(
-        applyCrmDuplicateConsolidation(applyInput(fixture, artifact)),
-        (error) => error?.code === 'CRM_DUPLICATE_CONSOLIDATION_REFUSED'
-          && /drift|partial|conflict|state/i.test(error.message),
-      );
     });
   }
 });

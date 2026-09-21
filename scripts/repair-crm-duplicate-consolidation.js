@@ -6,9 +6,12 @@ import { parseArgs, TextDecoder } from 'node:util';
 
 import { getConfig } from '../server/config.js';
 import {
+  assertCrmDuplicateConsolidationConfigAuthorityMatches,
+  assertCrmDuplicateConsolidationRuntimeSafetyAuthorityMatches,
   CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
   CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA,
   stableCanonicalJson,
+  selectCrmDuplicateConsolidationConfigAuthority,
   validateCrmDuplicateConsolidationCheckpointEvidence,
 } from '../server/repairs/crmDuplicateConsolidation.js';
 import {
@@ -16,8 +19,10 @@ import {
   previewCrmDuplicateConsolidation,
   verifyCrmDuplicateConsolidationReviewedArtifact,
 } from '../server/services/crmDuplicateConsolidationRepair.js';
-import { getStorage } from '../server/storage/index.js';
-import { createSqliteCrmDuplicateConsolidationReadOnlyStorage } from '../server/storage/sqlite.js';
+import {
+  createSqliteCrmDuplicateConsolidationReadOnlyStorage,
+  createSqliteStorage,
+} from '../server/storage/sqlite.js';
 
 const commandName = 'crm-duplicate-consolidation';
 const sha256Pattern = /^[a-f0-9]{64}$/;
@@ -231,10 +236,11 @@ function loadAndVerifyReviewedArtifact(options, suppliedCheckpointEvidence) {
 export async function runCrmDuplicateConsolidationCli({
   argv = process.argv.slice(2),
   getConfigFn = getConfig,
-  getStorageFn = getStorage,
+  createWritableStorageFn = createSqliteStorage,
   createReadOnlyStorageFn = createSqliteCrmDuplicateConsolidationReadOnlyStorage,
   previewFn = previewCrmDuplicateConsolidation,
   applyFn = applyCrmDuplicateConsolidation,
+  environment = process.env,
 } = {}) {
   const options = parseCrmDuplicateConsolidationArgs(argv);
   const checkpointEvidence = loadAndValidateCheckpointEvidence(options);
@@ -248,9 +254,13 @@ export async function runCrmDuplicateConsolidationCli({
   if (config?.storage?.provider !== 'sqlite') {
     throw new Error('CRM duplicate consolidation is SQLite-only and refused the active storage provider.');
   }
+  const configAuthority = selectCrmDuplicateConsolidationConfigAuthority({
+    config,
+    environment,
+  });
 
   if (!options.apply) {
-    const storage = createReadOnlyStorageFn(config);
+    const storage = createReadOnlyStorageFn(config, { environment });
     try {
       const result = await previewFn({
         storage,
@@ -280,7 +290,37 @@ export async function runCrmDuplicateConsolidationCli({
     flySnapshotId: checkpointEvidence.checkpoint.flySnapshotId,
     flySnapshotDigest: checkpointEvidence.checkpoint.flySnapshotDigest,
   };
-  const storage = getStorageFn();
+  assertCrmDuplicateConsolidationConfigAuthorityMatches(
+    configAuthority,
+    reviewed.artifact.plan.runtimeSafetyAuthority?.config,
+  );
+  const safetyStorage = createReadOnlyStorageFn(config, { environment });
+  try {
+    if (typeof safetyStorage?.inspectCrmDuplicateConsolidationRuntimeSafety !== 'function') {
+      throw new Error('CRM duplicate consolidation pre-writable runtime safety inspection is unavailable.');
+    }
+    const safetyInspection = await safetyStorage.inspectCrmDuplicateConsolidationRuntimeSafety();
+    const connection = safetyInspection?.connection;
+    if (!connection
+      || connection.readonly !== true
+      || connection.fileMustExist !== true
+      || connection.queryOnly !== true
+      || connection.consistentReadTransaction !== true) {
+      throw new Error('CRM duplicate consolidation pre-writable runtime safety inspection evidence is invalid.');
+    }
+    if (safetyInspection.blockers?.length) {
+      throw new Error(`CRM duplicate consolidation pre-writable runtime safety refused: ${safetyInspection.blockers.join('; ')}.`);
+    }
+    assertCrmDuplicateConsolidationRuntimeSafetyAuthorityMatches(
+      safetyInspection.runtimeSafetyAuthority,
+      reviewed.artifact.plan.runtimeSafetyAuthority,
+    );
+  } finally {
+    safetyStorage?.close?.();
+  }
+  const storage = createWritableStorageFn(config, {
+    crmDuplicateConsolidationEnvironment: environment,
+  });
   try {
     if (storage?.provider !== 'sqlite') {
       throw new Error('CRM duplicate consolidation is SQLite-only and refused writable storage.');

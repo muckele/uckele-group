@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -22,9 +21,9 @@ import {
   TOOLING,
   createFixture,
   logicalSnapshot,
-  previewFixture,
+  rawDatabase,
+  syntheticReviewedArtifactFixture,
 } from './crmDuplicateConsolidationRepair.test.js';
-import { createSqliteStorage } from '../server/storage/sqlite.js';
 
 const cliPath = path.resolve('scripts/repair-crm-duplicate-consolidation.js');
 const nodePath = process.env.TASK9_NODE_PATH || process.execPath;
@@ -108,7 +107,7 @@ function applyArgs(
   ];
 }
 
-test('default CLI preview emits one canonical private JSON artifact on stdout and never mutates', async (t) => {
+test('default CLI preview refuses the clearly synthetic public fixture and never mutates', async (t) => {
   const fixture = await createFixture(t);
   fixture.storage.close();
   const before = logicalSnapshot(fixture.sqlitePath);
@@ -127,30 +126,13 @@ test('default CLI preview emits one canonical private JSON artifact on stdout an
     },
   });
 
-  assert.equal(result.status, 0, result.stderr);
-  assert.notEqual(result.stderr, '');
-  assert.match(result.stderr, /preview mode/i);
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /blocking state/i);
+  assert.match(result.stderr, /berlin-superseded-deal-key-digest-drift/i);
+  assert.match(result.stderr, /berlin-legacy-import-identity-drift/i);
   assert.doesNotMatch(result.stderr, /--apply|APPLY-UG-P7-01D/i);
-  const artifact = JSON.parse(result.stdout);
-  assert.equal(result.stdout, stableCanonicalJson(artifact));
-  assert.match(createHash('sha256').update(result.stdout).digest('hex'), /^[a-f0-9]{64}$/);
-  assert.equal(artifact.mode, 'preview');
-  assert.equal(artifact.applied, false);
-  assert.deepEqual(artifact.checkpointEvidence, {
-    schema: CHECKPOINT_SCHEMA,
-    digest: canonicalJsonSha256(checkpointEnvelope(fixture)),
-  });
-  assert.deepEqual(artifact.connection, {
-    readonly: true,
-    fileMustExist: true,
-    queryOnly: true,
-    consistentReadTransaction: true,
-  });
   assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
-  assert.doesNotMatch(
-    result.stdout,
-    /private note|private message|private metadata|private-broker@|document path|rawMetadata|password|secret/i,
-  );
 });
 
 test('CLI accepts only the fixed incident operator flags and rejects arbitrary selectors and actions', () => {
@@ -183,7 +165,7 @@ test('CLI accepts only the fixed incident operator flags and rejects arbitrary s
 
 test('apply requires every reviewed-artifact argument and exact confirmation before writable storage opens', async (t) => {
   const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
   const artifactPath = path.join(fixture.root, 'reviewed-artifact.json');
   fs.writeFileSync(artifactPath, stableCanonicalJson(artifact), { mode: 0o600 });
   const complete = applyArgs(fixture, artifactPath, artifact);
@@ -210,10 +192,11 @@ test('apply requires every reviewed-artifact argument and exact confirmation bef
       runCrmDuplicateConsolidationCli({
         argv,
         getConfigFn: () => fixture.config,
-        getStorageFn: () => {
+        createWritableStorageFn: () => {
           writableStorageCalls += 1;
           throw new Error('writable storage must not open');
         },
+        environment: {},
       }),
       /requires|provide|exact|missing|invalid/i,
       omitted,
@@ -228,10 +211,11 @@ test('apply requires every reviewed-artifact argument and exact confirmation bef
     runCrmDuplicateConsolidationCli({
       argv: wrongConfirmation,
       getConfigFn: () => fixture.config,
-      getStorageFn: () => {
+      createWritableStorageFn: () => {
         writableStorageCalls += 1;
         throw new Error('writable storage must not open');
       },
+      environment: {},
     }),
     /exact confirmation/i,
   );
@@ -240,20 +224,24 @@ test('apply requires every reviewed-artifact argument and exact confirmation bef
 
 test('apply byte-validates the reviewed artifact before opening storage and delegates only fixed authority', async (t) => {
   const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
   const artifactPath = path.join(fixture.root, 'reviewed-artifact.json');
   fs.writeFileSync(artifactPath, stableCanonicalJson(artifact), { mode: 0o600 });
   const argv = applyArgs(fixture, artifactPath, artifact);
   const fakeStorage = { provider: 'sqlite', close() {} };
+  const environment = {};
   let writableStorageCalls = 0;
   let delegated;
   const result = await runCrmDuplicateConsolidationCli({
     argv,
     getConfigFn: () => fixture.config,
-    getStorageFn: () => {
+    createWritableStorageFn: (config, options) => {
       writableStorageCalls += 1;
+      assert.equal(config, fixture.config);
+      assert.equal(options.crmDuplicateConsolidationEnvironment, environment);
       return fakeStorage;
     },
+    environment,
     applyFn: async (input) => {
       delegated = input;
       return { status: 'repair-required', applied: true, mutationCount: 4 };
@@ -281,10 +269,11 @@ test('apply byte-validates the reviewed artifact before opening storage and dele
     runCrmDuplicateConsolidationCli({
       argv,
       getConfigFn: () => fixture.config,
-      getStorageFn: () => {
+      createWritableStorageFn: () => {
         writableStorageCalls += 1;
         return fakeStorage;
       },
+      environment: {},
       applyFn: async () => assert.fail('noncanonical artifact must not delegate'),
     }),
     /canonical JSON/i,
@@ -294,7 +283,7 @@ test('apply byte-validates the reviewed artifact before opening storage and dele
 
 test('every non-database apply assertion mismatch refuses before writable storage opens', async (t) => {
   const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
   const artifactPath = path.join(fixture.root, 'reviewed-assertions.json');
   fs.writeFileSync(artifactPath, stableCanonicalJson(artifact), { mode: 0o600 });
   const mutations = [
@@ -318,16 +307,132 @@ test('every non-database apply assertion mismatch refuses before writable storag
         runCrmDuplicateConsolidationCli({
           argv,
           getConfigFn: () => fixture.config,
-          getStorageFn: () => {
+          createWritableStorageFn: () => {
             writableStorageOpenCount += 1;
             return { provider: 'sqlite', close() {} };
           },
+          environment: {},
         }),
         /match|mismatch|checkpoint|checksum|manifest|confirmation|evidence/i,
       );
       assert.equal(writableStorageOpenCount, 0);
     });
   }
+});
+
+test('V1 and malformed checksum-valid authority artifacts refuse before any storage construction', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  const cases = [
+    ['V1 artifact', (candidate) => {
+      candidate.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1';
+      candidate.planSchema = 'crm-duplicate-consolidation-plan-v1';
+      candidate.manifestSchema = 'crm-duplicate-consolidation-manifest-v1';
+      candidate.plan.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1';
+      candidate.plan.planSchema = 'crm-duplicate-consolidation-plan-v1';
+      candidate.plan.manifestSchema = 'crm-duplicate-consolidation-manifest-v1';
+    }, /schema|version/i],
+    ['missing authority', (candidate) => {
+      delete candidate.plan.runtimeSafetyAuthority;
+    }, /runtime safety|authority|object/i],
+    ['unknown authority field', (candidate) => {
+      candidate.plan.runtimeSafetyAuthority.unreviewed = true;
+    }, /authority.*invalid keys|unknown key/i],
+    ['corrupt authority digest', (candidate) => {
+      candidate.plan.runtimeSafetyAuthority.digest = '0'.repeat(64);
+    }, /authority digest/i],
+  ];
+
+  for (const [name, mutate, pattern] of cases) {
+    await t.test(name, async () => {
+      const candidate = structuredClone(artifact);
+      mutate(candidate);
+      candidate.planChecksum = canonicalJsonSha256(candidate.plan);
+      const artifactPath = path.join(fixture.root, `${name.replaceAll(' ', '-')}.json`);
+      fs.writeFileSync(artifactPath, stableCanonicalJson(candidate), { mode: 0o600 });
+      let readOnlyOpens = 0;
+      let writableOpens = 0;
+      await assert.rejects(runCrmDuplicateConsolidationCli({
+        argv: applyArgs(fixture, artifactPath, candidate),
+        getConfigFn: () => fixture.config,
+        createReadOnlyStorageFn: () => {
+          readOnlyOpens += 1;
+          throw new Error('read-only storage must not open');
+        },
+        createWritableStorageFn: () => {
+          writableOpens += 1;
+          throw new Error('writable storage must not open');
+        },
+        environment: {},
+      }), pattern);
+      assert.equal(readOnlyOpens, 0);
+      assert.equal(writableOpens, 0);
+    });
+  }
+});
+
+test('malformed or reviewed-current configuration mismatch refuses before storage construction', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  const artifactPath = path.join(fixture.root, 'reviewed-config-authority.json');
+  fs.writeFileSync(artifactPath, stableCanonicalJson(artifact), { mode: 0o600 });
+  const cases = [
+    ['malformed explicit value', fixture.config, {
+      DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED: 'disabled-ish',
+    }, /malformed.*DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED/i],
+    ['reviewed-current representation mismatch', fixture.config, {
+      DEAL_HUNTER_CIM_FOLLOW_UP_ENABLED: 'false',
+      DEAL_HUNTER_CIM_AUTOMATION_SCHEDULER_ENABLED: 'false',
+    }, /current configuration authority differs/i],
+    ['incomplete effective configuration', {
+      ...fixture.config,
+      dealHunter: { cimFollowUp: { enabled: false } },
+    }, {}, /schedulerEnabled.*boolean|incomplete/i],
+  ];
+  for (const [name, config, environment, pattern] of cases) {
+    await t.test(name, async () => {
+      let readOnlyOpens = 0;
+      let writableOpens = 0;
+      await assert.rejects(runCrmDuplicateConsolidationCli({
+        argv: applyArgs(fixture, artifactPath, artifact),
+        getConfigFn: () => config,
+        createReadOnlyStorageFn: () => {
+          readOnlyOpens += 1;
+          throw new Error('read-only storage must not open');
+        },
+        createWritableStorageFn: () => {
+          writableOpens += 1;
+          throw new Error('writable storage must not open');
+        },
+        environment,
+      }), pattern);
+      assert.equal(readOnlyOpens, 0);
+      assert.equal(writableOpens, 0);
+    });
+  }
+});
+
+test('current durable safety drift refuses after read-only preflight with zero writable opens', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  const artifactPath = path.join(fixture.root, 'reviewed-durable-authority.json');
+  fs.writeFileSync(artifactPath, stableCanonicalJson(artifact), { mode: 0o600 });
+  rawDatabase(fixture.sqlitePath, (database) => database.prepare(`
+    UPDATE deal_hunter_cim_safety_settings
+    SET outreach_paused = 0
+    WHERE id = 'global'
+  `).run());
+  let writableOpens = 0;
+  await assert.rejects(runCrmDuplicateConsolidationCli({
+    argv: applyArgs(fixture, artifactPath, artifact),
+    getConfigFn: () => fixture.config,
+    createWritableStorageFn: () => {
+      writableOpens += 1;
+      throw new Error('writable storage must not open');
+    },
+    environment: {},
+  }), /pre-writable runtime safety|outreach.*paused|four-source authority/i);
+  assert.equal(writableOpens, 0);
 });
 
 test('package preview command invokes the incident CLI without apply authority', () => {
@@ -507,7 +612,7 @@ test('checkpoint canonicalization accepts whitespace and property order and bind
 
 test('checkpoint evidence file failures refuse before writable storage construction', async (t) => {
   const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
   const artifactPath = path.join(fixture.root, 'reviewed-artifact.json');
   fs.writeFileSync(artifactPath, stableCanonicalJson(artifact), { mode: 0o600 });
   const validEvidencePath = writeCheckpointEvidence(fixture);
@@ -550,10 +655,11 @@ test('checkpoint evidence file failures refuse before writable storage construct
         runCrmDuplicateConsolidationCli({
           argv: applyArgs(fixture, artifactPath, artifact, evidencePath),
           getConfigFn: () => fixture.config,
-          getStorageFn: () => {
+          createWritableStorageFn: () => {
             writableStorageOpenCount += 1;
             throw new Error('writable storage must not open');
           },
+          environment: {},
         }),
         errorPattern,
       );
@@ -579,7 +685,7 @@ test('checkpoint evidence FIFO refuses promptly without constructing storage', a
           readOnlyStorageOpenCount += 1;
           throw new Error('read-only storage must not open');
         },
-        getStorageFn: () => {
+        createWritableStorageFn: () => {
           writableStorageOpenCount += 1;
           throw new Error('writable storage must not open');
         },
@@ -616,7 +722,7 @@ test('checkpoint evidence FIFO refuses promptly without constructing storage', a
 
 test('legacy checkpoint environment values are ignored and cannot replace required evidence', async (t) => {
   const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
   const artifactPath = path.join(fixture.root, 'reviewed-artifact.json');
   fs.writeFileSync(artifactPath, stableCanonicalJson(artifact), { mode: 0o600 });
   const argv = applyArgs(fixture, artifactPath, artifact);
@@ -626,9 +732,9 @@ test('legacy checkpoint environment values are ignored and cannot replace requir
   await assert.rejects(
     runCrmDuplicateConsolidationCli({
       argv,
-      env: checkpointEnvironment(fixture),
+      environment: checkpointEnvironment(fixture),
       getConfigFn: () => fixture.config,
-      getStorageFn: () => {
+      createWritableStorageFn: () => {
         writableStorageOpenCount += 1;
         return { provider: 'sqlite', close() {} };
       },
@@ -641,7 +747,7 @@ test('legacy checkpoint environment values are ignored and cannot replace requir
 
 test('canonical malformed reviewed checkpoint refuses before writable construction', async (t) => {
   const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
   const malformed = structuredClone(artifact);
   malformed.plan.recoveryCheckpoint.createdAt = 'not-a-canonical-timestamp';
   malformed.planChecksum = canonicalJsonSha256(malformed.plan);
@@ -652,10 +758,11 @@ test('canonical malformed reviewed checkpoint refuses before writable constructi
     runCrmDuplicateConsolidationCli({
       argv: applyArgs(fixture, artifactPath, malformed),
       getConfigFn: () => fixture.config,
-      getStorageFn: () => {
+      createWritableStorageFn: () => {
         writableStorageOpenCount += 1;
         return { provider: 'sqlite', close() {} };
       },
+      environment: {},
       applyFn: async () => {
         throw new Error('malformed checkpoint reached apply delegate');
       },
@@ -667,7 +774,7 @@ test('canonical malformed reviewed checkpoint refuses before writable constructi
 
 test('all malformed or mismatched reviewed-artifact checkpoint paths keep writable opens at zero', async (t) => {
   const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
   const evidencePath = writeCheckpointEvidence(fixture);
   const cases = [
     ['missing checkpoint leaf', (candidate) => {
@@ -698,10 +805,11 @@ test('all malformed or mismatched reviewed-artifact checkpoint paths keep writab
         runCrmDuplicateConsolidationCli({
           argv: applyArgs(fixture, artifactPath, candidate, evidencePath),
           getConfigFn: () => fixture.config,
-          getStorageFn: () => {
+          createWritableStorageFn: () => {
             writableStorageOpenCount += 1;
             return { provider: 'sqlite', close() {} };
           },
+          environment: {},
           applyFn: async () => assert.fail('malformed artifact must not delegate'),
         }),
         errorPattern,
@@ -722,42 +830,14 @@ test('all malformed or mismatched reviewed-artifact checkpoint paths keep writab
       runCrmDuplicateConsolidationCli({
         argv: applyArgs(fixture, artifactPath, artifact, mismatchedEvidencePath),
         getConfigFn: () => fixture.config,
-        getStorageFn: () => {
+        createWritableStorageFn: () => {
           writableStorageOpenCount += 1;
           return { provider: 'sqlite', close() {} };
         },
+        environment: {},
       }),
       /checkpoint.*(match|agree)|evidence/i,
     );
     assert.equal(writableStorageOpenCount, 0);
   });
-});
-
-test('valid checkpoint evidence permits disposable apply and exact zero-write replay at the intended boundary', async (t) => {
-  const fixture = await createFixture(t);
-  const artifact = await previewFixture(fixture);
-  const artifactPath = path.join(fixture.root, 'reviewed-artifact.json');
-  const evidencePath = writeCheckpointEvidence(fixture);
-  fs.writeFileSync(artifactPath, stableCanonicalJson(artifact), { mode: 0o600 });
-  fixture.storage.close();
-  let writableStorageOpenCount = 0;
-  const input = {
-    argv: applyArgs(fixture, artifactPath, artifact, evidencePath),
-    getConfigFn: () => fixture.config,
-    getStorageFn: () => {
-      writableStorageOpenCount += 1;
-      return createSqliteStorage(fixture.config);
-    },
-  };
-  const first = await runCrmDuplicateConsolidationCli(input);
-  const afterFirst = logicalSnapshot(fixture.sqlitePath);
-  const replay = await runCrmDuplicateConsolidationCli(input);
-  assert.equal(writableStorageOpenCount, 2);
-  assert.equal(first.status, 'repair-required');
-  assert.equal(first.applied, true);
-  assert.equal(first.mutationCount, 4);
-  assert.equal(replay.status, 'verified-prior-apply');
-  assert.equal(replay.applied, false);
-  assert.equal(replay.mutationCount, 0);
-  assert.deepEqual(logicalSnapshot(fixture.sqlitePath), afterFirst);
 });

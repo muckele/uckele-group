@@ -1,4 +1,5 @@
 import {
+  assertCrmDuplicateConsolidationConfigAuthorityMatches,
   buildCrmDuplicateConsolidationPlan,
   CRM_DUPLICATE_CONSOLIDATION_APPROVAL_SCHEMA,
   CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA,
@@ -239,6 +240,17 @@ export async function applyCrmDuplicateConsolidation({
     artifact.plan.recoveryCheckpoint,
     artifact.recoveryCheckpointPath,
   );
+  if (typeof storage.getCrmDuplicateConsolidationConfigAuthority !== 'function') {
+    refuse('Apply refused: SQLite runtime configuration authority is unavailable.', ['runtime-config-authority-unavailable']);
+  }
+  try {
+    assertCrmDuplicateConsolidationConfigAuthorityMatches(
+      storage.getCrmDuplicateConsolidationConfigAuthority(),
+      artifact.plan.runtimeSafetyAuthority?.config,
+    );
+  } catch (error) {
+    refuse(`Apply refused: ${error.message}`, ['runtime-config-authority-mismatch']);
+  }
   if (typeof storage.verifyCrmDuplicateConsolidationBackupPlan !== 'function') {
     refuse('Apply refused: SQLite backup-to-plan verification is unavailable.', ['backup-verification-unavailable']);
   }
