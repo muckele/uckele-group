@@ -562,6 +562,58 @@ test('checkpoint evidence file failures refuse before writable storage construct
   }
 });
 
+test('checkpoint evidence FIFO refuses promptly without constructing storage', async (t) => {
+  const fixture = await createFixture(t);
+  const fifoPath = path.join(fixture.root, 'checkpoint-evidence.fifo');
+  const mkfifo = spawnSync('mkfifo', [fifoPath], { encoding: 'utf8' });
+  assert.equal(mkfifo.status, 0, mkfifo.stderr);
+  const childSource = `
+    const { runCrmDuplicateConsolidationCli } = await import('./scripts/repair-crm-duplicate-consolidation.js');
+    let readOnlyStorageOpenCount = 0;
+    let writableStorageOpenCount = 0;
+    try {
+      await runCrmDuplicateConsolidationCli({
+        argv: JSON.parse(process.argv[1]),
+        getConfigFn: () => ({ storage: { provider: 'sqlite' } }),
+        createReadOnlyStorageFn: () => {
+          readOnlyStorageOpenCount += 1;
+          throw new Error('read-only storage must not open');
+        },
+        getStorageFn: () => {
+          writableStorageOpenCount += 1;
+          throw new Error('writable storage must not open');
+        },
+      });
+      process.exitCode = 2;
+    } catch (error) {
+      process.stderr.write('[fifo-regression] ' + error.message + '\\n');
+      process.stderr.write('[fifo-regression] ' + JSON.stringify({
+        readOnlyStorageOpenCount,
+        writableStorageOpenCount,
+      }) + '\\n');
+      process.exitCode = 1;
+    }
+  `;
+  const result = spawnSync(
+    nodePath,
+    ['--input-type=module', '--eval', childSource, JSON.stringify(previewArgs(fixture, fifoPath))],
+    {
+      cwd: path.resolve('.'),
+      encoding: 'utf8',
+      timeout: 1_000,
+      killSignal: 'SIGKILL',
+    },
+  );
+
+  assert.equal(result.error, undefined, result.error?.message);
+  assert.equal(result.signal, null);
+  assert.notEqual(result.status, 0);
+  assert.equal(result.stdout, '');
+  assert.match(result.stderr, /regular file/i);
+  assert.match(result.stderr, /"readOnlyStorageOpenCount":0/);
+  assert.match(result.stderr, /"writableStorageOpenCount":0/);
+});
+
 test('legacy checkpoint environment values are ignored and cannot replace required evidence', async (t) => {
   const fixture = await createFixture(t);
   const artifact = await previewFixture(fixture);

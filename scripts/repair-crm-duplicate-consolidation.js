@@ -117,9 +117,21 @@ export function parseCrmDuplicateConsolidationArgs(args = []) {
 }
 
 function loadAndValidateCheckpointEvidence(options) {
+  let pathStats;
+  try {
+    pathStats = fs.statSync(options.checkpointEvidencePath);
+  } catch (error) {
+    throw new Error(`Checkpoint evidence could not be read or does not exist: ${error.message}`);
+  }
+  if (!pathStats.isFile()) {
+    throw new Error('Checkpoint evidence path must identify a regular file.');
+  }
   let descriptor;
   try {
-    descriptor = fs.openSync(options.checkpointEvidencePath, 'r');
+    descriptor = fs.openSync(
+      options.checkpointEvidencePath,
+      fs.constants.O_RDONLY | fs.constants.O_NONBLOCK,
+    );
   } catch (error) {
     throw new Error(`Checkpoint evidence could not be read or does not exist: ${error.message}`);
   }
