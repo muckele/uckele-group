@@ -9,6 +9,10 @@ import { createSqliteStorage } from '../server/storage/sqlite.js';
 
 const timestamp = '2026-09-17T18:00:00.000Z';
 const digest = 'a'.repeat(64);
+const preSupersessionStartupSchema = fs.readFileSync(
+  new URL('./fixtures/preSupersessionStartupSchema.sql', import.meta.url),
+  'utf8',
+);
 
 function submission(id, { directOwner = null, metadataOwner = null } = {}) {
   return {
@@ -501,6 +505,24 @@ test('rejects direct assignment of an active loser as an opportunity primary', a
   `).run()), /superseded primary/i);
 });
 
+test('rejects direct insertion of an active loser as an opportunity primary', async (t) => {
+  const { sqlitePath } = await fixture(t);
+  insertRelation(sqlitePath);
+  assert.throws(() => rawDatabase(sqlitePath, (database) => database.prepare(`
+    INSERT INTO deal_hunter_opportunities (
+      opportunity_id, created_at, updated_at, canonical_name,
+      primary_submission_id, identity_version, status, metadata
+    ) VALUES (
+      'inserted-opportunity', '${timestamp}', '${timestamp}', 'Inserted opportunity',
+      'loser', 'supersession-test-v1', 'active', '{}'
+    )
+  `).run()), /superseded primary/i);
+  assert.equal(rawDatabase(sqlitePath, (database) => database.prepare(`
+    SELECT COUNT(*) AS count FROM deal_hunter_opportunities
+    WHERE opportunity_id = 'inserted-opportunity'
+  `).get().count), 0);
+});
+
 test('consolidation receipts are append-only while generic manifests retain upsert lifecycle behavior', async (t) => {
   const { sqlitePath, storage } = await fixture(t);
   const original = (await storage.listDealHunterCimRepairManifests({ limit: 10 }))
@@ -546,21 +568,32 @@ test('startup upgrades a pre-supersession database without losing existing rows'
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-crm-supersession-upgrade-'));
   const sqlitePath = path.join(directory, 'storage.sqlite');
   const config = { storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } };
-  let storage = createSqliteStorage(config);
-  await storage.insertSubmission(submission('existing-row'));
-  storage.close();
   rawDatabase(sqlitePath, (database) => {
-    for (const row of database.prepare(`
-      SELECT type, name FROM sqlite_master
-      WHERE name LIKE 'trg_crm_submission_supersessions_%'
+    database.exec(preSupersessionStartupSchema);
+    const existing = submission('existing-row');
+    database.prepare(`
+      INSERT INTO contact_submissions (
+        id, created_at, updated_at, status, spam_score, spam_reasons,
+        delivery_provider, delivery_status, crm_status, source, ip_hash,
+        name, email, message, status_updated_at, metadata
+      ) VALUES (
+        @id, @created_at, @updated_at, @status, @spam_score, @spam_reasons,
+        @delivery_provider, @delivery_status, @crm_status, @source, @ip_hash,
+        @name, @email, @message, @status_updated_at, @metadata
+      )
+    `).run({
+      ...existing,
+      spam_reasons: JSON.stringify(existing.spam_reasons),
+      metadata: JSON.stringify(existing.metadata),
+    });
+    assert.equal(database.prepare(`
+      SELECT COUNT(*) AS count FROM sqlite_master
+      WHERE name LIKE '%crm_submission_supersessions%'
          OR name LIKE 'trg_crm_duplicate_consolidation_%'
          OR name LIKE 'trg_deal_hunter_opportunities_reject_superseded_%'
-         OR name LIKE 'idx_crm_submission_supersessions_%'
-         OR name = 'uq_crm_submission_supersessions_active_loser'
-    `).all()) database.exec(`DROP ${row.type.toUpperCase()} IF EXISTS ${row.name}`);
-    database.exec('DROP TABLE IF EXISTS crm_submission_supersessions');
+    `).get().count, 0);
   });
-  storage = createSqliteStorage(config);
+  const storage = createSqliteStorage(config);
   t.after(() => {
     storage.close();
     fs.rmSync(directory, { recursive: true, force: true });

@@ -412,6 +412,40 @@ test('SQLite CRM match authority refuses rather than hashing a 5,000-row contact
   assert.equal(authority.revision, null);
 });
 
+test('SQLite CRM match authority succeeds at the exact 5,000-contact boundary', async (t) => {
+  const storages = sharedSqliteStorages(t);
+  const [storage] = storages;
+  withRawDatabase(storages.sqlitePath, (database) => database.exec(`
+    WITH RECURSIVE sequence(value) AS (
+      VALUES(1)
+      UNION ALL
+      SELECT value + 1 FROM sequence WHERE value < 5000
+    )
+    INSERT INTO contact_submissions (
+      id, created_at, updated_at, status, delivery_provider, delivery_status,
+      crm_status, source, ip_hash, name, email, message, metadata
+    )
+    SELECT
+      printf('boundary-contact-%05d', value),
+      '2026-09-16T08:00:00.000Z', '2026-09-16T08:00:00.000Z', 'review',
+      'manual', 'not-applicable', 'not-applicable', 'authority-bound-test', '',
+      printf('Boundary contact %05d', value),
+      printf('boundary-%05d@example.test', value),
+      'Exact complete-set authority boundary fixture.', '{}'
+    FROM sequence;
+  `));
+
+  const authority = await storage.readDealHunterCrmMatchAuthority({
+    limit: 5000,
+    supersessionLimit: 5000,
+  });
+  assert.equal(authority.complete, true);
+  assert.equal(authority.submissionCount, 5000);
+  assert.equal(authority.supersessionCount, 0);
+  assert.equal(authority.rows.length, 5000);
+  assert.match(authority.revision, /^[a-f0-9]{64}$/);
+});
+
 test('SQLite CRM match authority independently refuses a 5,001st active supersession', async (t) => {
   const storages = sharedSqliteStorages(t);
   const [storage] = storages;
@@ -454,6 +488,50 @@ test('SQLite CRM match authority independently refuses a 5,001st active superses
   assert.equal(authority.supersessionCount, null);
   assert.deepEqual(authority.supersessions, []);
   assert.equal(authority.revision, null);
+});
+
+test('SQLite CRM match authority succeeds at the exact 5,000-active-supersession boundary', async (t) => {
+  const storages = sharedSqliteStorages(t);
+  const [storage] = storages;
+  withRawDatabase(storages.sqlitePath, (database) => {
+    database.exec(`
+      PRAGMA foreign_keys = OFF;
+      DROP TRIGGER trg_crm_submission_supersessions_validate_insert;
+      DROP TRIGGER trg_crm_submission_supersessions_no_active_chain_insert;
+      WITH RECURSIVE sequence(value) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT value + 1 FROM sequence WHERE value < 5000
+      )
+      INSERT INTO crm_submission_supersessions (
+        id, created_at, updated_at, status, survivor_submission_id,
+        superseded_submission_id, opportunity_id, reason_code, reason_text,
+        approved_by, approved_at, actor, repair_version, repair_manifest_id,
+        repair_digest, metadata
+      )
+      SELECT
+        printf('boundary-relation-%05d', value),
+        '2026-09-16T08:00:00.000Z', '2026-09-16T08:00:00.000Z', 'active',
+        printf('boundary-survivor-%05d', value),
+        printf('boundary-loser-%05d', value),
+        printf('boundary-opportunity-%05d', value),
+        'confirmed-duplicate', 'Exact complete-set authority boundary fixture.',
+        'owner@example.test', '2026-09-16T08:00:00.000Z', 'authority-test',
+        'crm-duplicate-consolidation-v1', printf('boundary-manifest-%05d', value),
+        '${supersessionDigest}', '{}'
+      FROM sequence;
+    `);
+  });
+
+  const authority = await storage.readDealHunterCrmMatchAuthority({
+    limit: 5000,
+    supersessionLimit: 5000,
+  });
+  assert.equal(authority.complete, true);
+  assert.equal(authority.submissionCount, 0);
+  assert.equal(authority.supersessionCount, 5000);
+  assert.equal(authority.supersessions.length, 5000);
+  assert.match(authority.revision, /^[a-f0-9]{64}$/);
 });
 
 test('SQLite final linkage rejects an active loser directly and links its unchanged survivor control', async (t) => {
