@@ -157,3 +157,28 @@ Do not combine these gates:
 7. perform separately gated post-apply verification.
 
 None of these gates authorizes overdue-workflow cleanup, recommendation cleanup, reconciliation, source mutation, sending, Stage 2 activation, automation changes, reverse, restore, or general duplicate consolidation.
+
+## V2 correction is the current operator contract
+
+The UG-P7-01J source-shape and runtime-safety addendum supersedes the earlier V1 artifact assumptions in this runbook. It does not change the approved pairs or the four-row mutation ledger.
+
+Current versioned values are:
+
+- repair `UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2`;
+- plan `crm-duplicate-consolidation-plan-v2`;
+- manifest `crm-duplicate-consolidation-manifest-v2`;
+- approval `crm-duplicate-consolidation-approval-v1`;
+- checkpoint `crm-duplicate-consolidation-checkpoint-v1`;
+- confirmation `APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2`.
+
+Never use the V1 confirmation shown in the historical section above. Corrected code refuses V1 artifacts, V1 confirmation, missing/corrupt/unknown runtime-safety authority, and reviewed/current authority mismatch before writable storage construction; it does not upgrade an old artifact.
+
+Preview requires four independent safe facts: the durable global CIM pause, the durable `cim-initial-outreach` automation pause, disabled effective follow-ups, and disabled effective automation scheduling. The two selected environment representations must be absent/empty defaults or recognized false tokens and must agree with the effective config. Malformed explicit values refuse. The plan binds exact source identifiers, normalized values, durable-row digests, and the complete authority digest.
+
+For apply, the CLI first compares current config-only facts with reviewed config-only facts. It then uses a short-lived read-only, file-existing, query-only transaction to compare the complete current authority. That connection closes before the writable factory is called. The writable instance captures the same config/environment facts; the service checks them again; and the SQLite `BEGIN IMMEDIATE` transaction re-reads both durable rows and compares complete authority before checking an existing receipt or writing. Exact replay therefore also requires current safe authority and never rewrites its receipt.
+
+The backup proves database state only. Backup reconstruction uses the reviewed config facts as explicitly external authority and re-reads the two durable rows from the backup. It must not be described as proof of live process configuration or global writer quiescence.
+
+The raw Berlin deal-key preimage and its retained evidence are not CLI inputs and must never be copied into a reviewed artifact, repository fixture, log, PR comment, CI secret, or operator command. Ordinary CI deliberately uses synthetic data and must refuse the fixed production digest. Merge readiness additionally requires the privacy-reviewed external restricted acceptance gate against a disposable SQLite database. A passing hosted CI run without that attestation is insufficient.
+
+The restricted gate is a code-verification operation only. It does not authorize or constitute production preview/apply. Production remains split into the seven separate gates above, including a new deployment/checkpoint, exact read-only production preview, independent artifact review, and a separate explicit apply authorization.

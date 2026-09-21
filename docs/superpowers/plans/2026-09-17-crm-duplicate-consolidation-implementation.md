@@ -898,3 +898,47 @@ The implementation must not include:
 Task 9 requires exactly one `--checkpoint-evidence <path>` for preview and apply. Remove the four direct checkpoint environment inputs. Validate the nonempty, readable, regular UTF-8 JSON file at no more than 64 KiB with the shared complete Task 8 checkpoint validator; accept JSON whitespace/property ordering, then compare canonical representations and SHA-256 digests. Both the file and reviewed artifact checkpoint must independently satisfy the exact envelope, leaf, type, bound, identifier, hash, integrity/status, canonical UTC ordering, release, and tooling rules. No TTL is added.
 
 In apply mode, parse and validate flags; read, bound, decode, parse, validate, canonicalize, and hash checkpoint evidence; read and fully validate canonical reviewed-artifact bytes and its nested checkpoint; compare checkpoint canonical values/digests; validate actor, reason, release, tooling, backup assertions, manifest/checksum, and exact confirmation; only then construct writable storage and delegate to Task 8's existing atomic transaction. Every pre-storage failure must keep the writable constructor count at zero. The correction test matrix covers every checkpoint leaf and input class, legacy-environment refusal, the canonical-checksum malformed-nested-checkpoint regression, positive read-only preview, disposable apply, and exact zero-write replay. Task 10 remains a separate task.
+
+## 2026-09-20 bounded V2 correction execution checklist
+
+This is an append-only correction to Tasks 8–10, not a rewrite of their history. Authority is the UG-P7-01J addendum with SHA-256 `32973350304fd1e1ef5c1f4f0a9caab36cd293d0536d360af6155c935ae7b29a`, owner-approved under Option 2. The restricted raw evidence stays outside Git; its approved SHA-256 is recorded only in the verification record.
+
+### Runtime and source-shape work
+
+- [x] Introduce the V2 plan, manifest, repair, confirmation, and manifest-ID namespace while retaining approval/checkpoint V1 contracts.
+- [x] Accept supported Pooler URL-only evidence, inspect all listing representations independently, and preserve malformed/conflicting inputs as blockers.
+- [x] Replace synthetic financial provenance with exact `raw["Annual Profit"]` source validation and stored projection validation.
+- [x] Bind Berlin to the fixed raw loser digest, exact scalar source pointers, owner/primary state, survivor alias corroboration, exact legacy/canonical imports, and supported survivor marketplace identity.
+- [x] Model the canonical import relationship in its durable column while requiring the retained absence of a metadata owner and exact normalized listing agreement.
+- [x] Select and strictly validate the two effective config facts without changing application-wide boolean parsing.
+- [x] Bind the two real durable safety rows and their raw-row digests into one deterministic four-source authority.
+- [x] Compare config-only authority with config-only authority, then complete four-source authority with complete authority.
+- [x] Reconstruct backup plans using backup-observed durable rows plus reviewed external config facts.
+- [x] Refuse mismatched authority before writable construction, pass the same config/environment into writable storage, and revalidate complete authority in `BEGIN IMMEDIATE` before receipt lookup or mutation.
+- [x] Revalidate state-independent current safety before verified-prior-apply.
+
+### Public-versus-restricted coverage mapping
+
+| Contract | Ordinary repository suite | Mandatory restricted acceptance |
+| --- | --- | --- |
+| Parser, raw UTF-8 hash semantics, type checks | Synthetic pure tests | Exact approved preimage matches fixed digest |
+| Pooler URL-only and malformed/conflicting listing evidence | Synthetic real-adapter and helper tests | Faithful exact-identity preview control |
+| Annual Profit without invented provenance | Synthetic source-shape tests | Faithful exact-identity preview/apply |
+| Fixed Berlin positive predicate | Every missing/conflicting branch and fixed-digest refusal | Exact evidence succeeds with unchanged incident constants |
+| V2 artifact, malformed authority, V1 refusal | Canonical synthetic artifacts; zero storage opens | Exact preview artifact consumed by real CLI/service |
+| Config-only and complete authority comparison | Pure and real read-only SQLite tests | Pre-writable config/durable drift; real writable handoff |
+| Backup/runtime separation | Contract and refusal tests | Backup reconstruction against the exact fixture |
+| First four writes and replay | Public sink/ledger/refusal tests only | Real adapter first apply and exact zero-write replay |
+| Rollback, receipt immutability, transaction races | Schema/sink guards remain public | Exact fixture failures after writes/postconditions, immutable receipt, durable-row race |
+| SQLite and audit acceptance | Existing generic/supersession regressions | Quick check, foreign keys, supersession audit, generic CRM audit semantics |
+
+The exact positive transaction tests formerly possible with a fabricated Berlin identity are not skipped or deleted as acceptance evidence; they are moved to the required external restricted harness. That harness must import the final repository modules, seed a disposable database from the retained artifact, use `createSqliteStorage`, exercise real preview/apply/replay and transaction behavior, emit only privacy-safe assertions, and remain mode `0600` outside Git.
+
+### Completion gates
+
+- [ ] Run focused repair, CLI, listing identity, supersession, authority-binding, canonical-merge, and legacy F-02 regressions.
+- [ ] Run `npm ci`, production dependency audit, lint, server tests, UI tests, build, browser tests, and base-to-head `git diff --check` under Node v22.23.2.
+- [ ] Run the restricted exact-evidence harness on the final reviewed code identity and record the raw-artifact checksum, harness checksum, four-row/replay/rollback evidence, SQLite integrity, audits, and privacy scan without publishing raw values.
+- [ ] Obtain independent review of source fidelity, Berlin predicate, authority flow, backup/runtime separation, replay safety, V2/V1 boundary, restricted-gate authenticity, coverage mapping, and unchanged four-row contract.
+- [ ] Fix findings in normal additional commits and rerun every impacted public and restricted gate.
+- [ ] Push the existing branch normally, update PR #20, wait for exact-head CI, and stop for owner review. Do not merge, deploy, access production, or touch PR #21.
