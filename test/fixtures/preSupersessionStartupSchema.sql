@@ -1102,5 +1102,3 @@ CREATE TRIGGER deal_hunter_opportunity_facts_operator_boundary_update
       END;
 
 PRAGMA foreign_keys = ON;
-
-

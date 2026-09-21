@@ -1,10 +1,10 @@
 # CRM duplicate-consolidation implementation verification
 
-Date: 2026-09-20  
-Runtime: Node v22.23.2, npm 10.9.8  
-Original implementation head characterized: `e2e6d8097188ee0603f90895a14d134031ed194d`  
-Original runtime baseline: `cec88c5a37a5dc433896ee5fd737d606691a3f31`  
-Task 10 test/fix head before this record: `dcfb4cf81575c64a4c826e4fb4d011b004ba9c7c`  
+Date: 2026-09-20
+Runtime: Node v22.23.2, npm 10.9.8
+Original implementation head characterized: `e2e6d8097188ee0603f90895a14d134031ed194d`
+Original runtime baseline: `cec88c5a37a5dc433896ee5fd737d606691a3f31`
+Task 10 test/fix head before this record: `dcfb4cf81575c64a4c826e4fb4d011b004ba9c7c`
 
 ## Verdict and boundary
 
@@ -62,7 +62,7 @@ A fresh post-fix full run before adding the three acceptance tests was 2,029 tes
 
 All three previously deferred items are explicit requirements in the approved implementation plan, so commit `dcfb4cf81575c64a4c826e4fb4d011b004ba9c7c` adds only the missing tests/fixture:
 
-- exact pre-supersession upgrade: `test/fixtures/preSupersessionStartupSchema.sql` is the empty startup schema captured from baseline `cec88c5...` under Node v22.23.2. It contains 42 tables, 102 indexes, and 2 triggers; it contains no supersession object. Fixture SHA-256: `f5f1386354014769a9fd58a3dd34e2817f3558c19b140360b17989796b1bc407`;
+- exact pre-supersession upgrade: `test/fixtures/preSupersessionStartupSchema.sql` is the empty startup schema captured from baseline `cec88c5...` under Node v22.23.2. It contains 42 tables, 102 indexes, and 2 triggers; it contains no supersession object. Fixture SHA-256: `aebfa63ad280f319ac03c9f6e470d6c754561bc726bed6be287202ada3bae564`;
 - opportunity-primary INSERT: a separate raw-SQL INSERT regression proves the active loser is rejected and no opportunity row is inserted, independently of the existing UPDATE regression;
 - exact authority maximum: independent contact and active-supersession tests prove complete, non-null revision authority at exactly 5,000 rows; the existing 5,001 cases continue to refuse with `complete: false` and `revision: null`.
 
