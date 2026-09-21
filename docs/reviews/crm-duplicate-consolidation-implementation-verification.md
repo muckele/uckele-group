@@ -173,3 +173,89 @@ T10-6A additionally proves the canonical-merge boundary: active or reversed supe
 - `dcfb4cf81575c64a4c826e4fb4d011b004ba9c7c` — `test: close CRM consolidation acceptance gaps`
 
 No deployment or production gate is authorized by these results. The next permitted action is independent whole-branch review at the exact final local head.
+
+## 2026-09-21 coordinated V2 repair correction verification
+
+This section is the current verification record for repair planning and execution. It supersedes the V1 source-shape and runtime-safety assumptions above without rewriting the historical Task 1–10 record. The durable supersession schema, approval schema, checkpoint envelope, and four-row incident scope are unchanged; the repair plan, manifest, confirmation, manifest namespace, retained-evidence predicate, and runtime-safety authority are V2.
+
+### Approved authority and implementation identity
+
+- Approved source-shape/runtime-safety addendum SHA-256: `32973350304fd1e1ef5c1f4f0a9caab36cd293d0536d360af6155c935ae7b29a`.
+- Restricted raw-evidence artifact SHA-256: `e5a1e4e8383b03176485ed06a3aa98210e30da426289ff979830b19246a2e808`; the artifact remains outside Git with mode `0600`.
+- Sanitized evidence summary SHA-256: `5355e90d7fc4e43d64593019e19268e538b9baa1d42a2c6079470a5864986fa0`.
+- Starting PR #20 head: `477b2cacd5699aef5f74f9ac2e14ce72dc923283`.
+- Reviewed runtime/documentation candidate: `d350fc9b2588f0cdea4e4bc34c7f8abc620137ea`.
+- Correction commits through that candidate:
+  - `8e84d2e8294ddd020809a31c61b0c7f3a3f7621b` — V2 contracts and faithful retained-source predicates;
+  - `5803df5c90b96cfb5dc99f57697997b8b65bd212` — four-source runtime-safety authority and execution-stage binding;
+  - `cab45c53b9c95ef6e655ec87ea66005e95b163d6` — supported retained URL identity aliases;
+  - `d350fc9b2588f0cdea4e4bc34c7f8abc620137ea` — V2 design, plan, and runbook record.
+
+The V2 delta through the reviewed candidate changes 12 files with 1,418 additions and 741 deletions. It introduces no dependency, schema, migration, generic CRM-integrity audit, UI, deployment, or production-configuration change.
+
+### Corrected source shape and V2 boundary
+
+- Pooler marketplace authority may come from its retained supported listing URL with no manufactured aliases. Primary URL, listing aliases, and identity aliases are inspected independently; malformed, unsupported, and conflicting identity-bearing inputs remain blockers even when another input is valid.
+- Berlin remains fixed to the approved opportunity, survivor, loser, legacy import, and canonical import identifiers. Its duplicate must retain the exact scalar `sheet-0` / `csv` / external ID `18` source pointers, the approved raw UTF-8 deal-key digest, the documented missing URL/alias shape, no canonical ownership, and corroborating survivor alias/import evidence. The raw deal-key preimage is neither stored nor logged by the repository.
+- Financial authority comes from the retained `metadata.dealHunter.raw["Annual Profit"]` value plus the stored projections. The former synthetic `financialProvenance` object is not required or created.
+- The canonical retained import binds the durable `opportunity_id` column to the approved opportunity, requires metadata `opportunityId` to remain absent, and binds the normalized survivor listing identity and source fields. The legacy import remains unowned with its exact retained source/deal-key evidence.
+- The approval schema remains `crm-duplicate-consolidation-approval-v1` and the checkpoint envelope remains `crm-duplicate-consolidation-checkpoint-v1` by design. The active repair contract is `UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2`, plan `crm-duplicate-consolidation-plan-v2`, manifest `crm-duplicate-consolidation-manifest-v2`, confirmation `APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2`, and manifest namespace `crm-duplicate-consolidation:v2:`. V1 plans, manifests, and confirmation refuse before writable storage construction.
+
+### Four-source safety authority and execution flow
+
+The deterministic authority binds exactly two durable SQLite facts and two effective configuration facts:
+
+1. `deal_hunter_cim_safety_settings/global/outreach_paused = true`;
+2. `deal_hunter_automation_settings/cim-initial-outreach/paused = true`;
+3. `dealHunter.cimFollowUp.enabled = false`;
+4. `dealHunter.cimAutomation.schedulerEnabled = false`.
+
+Durable facts include raw-row digests. Configuration facts include their source paths, environment-variable identities, normalized booleans, and validated lexical representation. The repair first compares current configuration-only authority to reviewed configuration-only authority, then compares the complete current four-source authority to the complete reviewed authority. It never compares a configuration-only digest to a complete digest or hashes a digest into itself.
+
+Repair-specific validation accepts the application's supported true/false tokens and legitimate absent/empty false defaults, but refuses malformed explicit tokens, unsafe true values, incomplete effective configuration, or lexical/effective disagreement. This does not alter application-wide boolean parsing or impose repair authority on unrelated storage callers.
+
+Preview uses a file-existing, query-only, read-only connection and one consistent snapshot. Backup reconstruction combines backup-observed durable rows only with reviewed configuration facts; it does not claim the backup proves live configuration. Apply revalidates the same selected configuration and current durable rows before any writable constructor call, passes that same configuration/environment to writable storage, and independently rebuilds complete authority inside `BEGIN IMMEDIATE` before receipt lookup or any repair write. Replay performs the current safety inspection before `verified-prior-apply` and validates the exact corrected state rather than rerunning a pre-apply candidate predicate.
+
+### Public and restricted coverage
+
+Public tests use clearly labeled synthetic identity data for parsing, hashing, type boundaries, URL-only Pooler handling, malformed/conflicting evidence, raw Annual Profit authority, fixed-digest refusal, V2/V1 artifact boundaries, configuration normalization, durable/config comparison, CLI/checkpoint behavior, and zero-writable-open preflight refusal. Exact positive Berlin identity, first apply, replay, rollback, receipt immutability, and the transaction race remain in the mandatory restricted gate. No public skip substitutes for that gate.
+
+Fresh public verification under Node v22.23.2 at the reviewed candidate:
+
+| Gate | Result |
+| --- | --- |
+| `npm ci` | 538 packages installed from the lockfile |
+| `npm audit --omit=dev` | 0 production vulnerabilities |
+| `npm run lint` | pass; zero warnings |
+| `npm test` | 2,017 tests; 2,014 pass; 0 fail; 3 intentional skips |
+| `npm run test:ui` | 25 files; 240/240 pass |
+| `npm run build` | pass; 9 public routes pre-rendered |
+| `npm run test:browser` | Chromium 35/35 pass |
+| focused repair/CLI/identity/supersession/authority/canonical-merge/F-02 matrix | 679/679 pass |
+| `git diff --check` | pass |
+
+The first sandboxed full server run was unable to bind loopback ports and reported `EPERM` for listener-based tests. The authorized local-loopback rerun above passed with zero failures; this was an execution-environment restriction, not an application assertion failure.
+
+The external mode-`0600` harness (SHA-256 `536fdab9183ba325b41598714eeb44e93e09405396f2d9af1fe64720e7edf073`) imported the real CLI, service, repair, generic audit, read-only adapter, and `createSqliteStorage` implementation. Against the retained exact evidence and disposable SQLite databases, its reviewed-candidate report (SHA-256 `c2a073092695187de77c29f00d9cb2749459c48ebd544fd3b613e93290544e3`) recorded:
+
+- read-only preview with zero blockers and identical before/after logical digests;
+- exactly four first-apply mutations, affecting only `crm_submission_supersessions`, `deal_hunter_crm_imports`, and `deal_hunter_cim_repair_manifests`;
+- zero protected-table changes;
+- zero-write `verified-prior-apply` replay with equal state digest;
+- immutable receipt UPDATE and DELETE refusal with unchanged receipt digest;
+- complete rollback after mutation 1, 2, 3, 4, and postconditions;
+- intended blockers for deal-key, source-pointer, and canonical-import identity drift, with zero writes;
+- current durable and configuration safety drift refusal with zero writes;
+- zero writable opens for configuration and durable preflight mismatch;
+- a post-preflight transaction safety race with one writable open, zero repair writes, zero relations, and zero receipts;
+- `PRAGMA quick_check = ok`, zero foreign-key violations, a clean supersession audit, and unchanged generic CRM audit semantics (`ok: true`, `safeToReconcile: true`).
+
+The retained report is external because it is tied to restricted evidence. Final exact-head restricted identity, artifact hashes, and hosted-CI links belong in the PR/handoff so another documentation commit does not invalidate the recorded final head.
+
+### Privacy and independent review
+
+The V2-delta privacy scan covered plain text plus Base64, hexadecimal, and URI encodings of 27 retained identity-bearing values. It found no nonpublic value or reversible encoding in Git. The only matches were the already approved public literal `costar:2436873` in two evidence classifications. The restricted report records `restrictedValuePublished: false`; public tests contain no Berlin loser deal-key preimage.
+
+An independent read-only review covered the complete source-shape correction, fixed incident scope, Berlin proof, listing evidence behavior, real Annual Profit source, retained-import semantics, four-source authority, equivalent digest comparisons, lexical/config handoff, backup/runtime separation, zero-writable-open preflight, transaction recheck, state-independent replay, V2/V1 boundary, restricted harness authenticity/privacy, public/restricted coverage mapping, and unchanged supersession protections. It reviewed exact candidate `d350fc9b2588f0cdea4e4bc34c7f8abc620137ea`, ran 184/184 focused V2 tests, inspected the restricted proof, made no changes, and returned PASS with P0/P1/P2/P3 all zero.
+
+These results authorize no production action. No production preview/apply, database access, reconciliation, provider transmission, merge, deployment, Stage 2 change, or automation change occurred. A later production operation still requires separate owner authorization, current operational quiescence checks, a freshly reviewed artifact, and the established production checkpoint gates.
