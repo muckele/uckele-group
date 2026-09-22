@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import test from 'node:test';
 
 import { CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION } from '../server/repairs/crmDuplicateConsolidation.js';
+import { applyCrmDuplicateConsolidation } from '../server/services/crmDuplicateConsolidationRepair.js';
 import { createSqliteCrmDuplicateConsolidationReadOnlyStorage } from '../server/storage/sqlite.js';
 import {
   ACTOR,
@@ -61,6 +62,46 @@ async function inspectFixture(fixture) {
     storage.close();
   }
 }
+
+async function authorityAccounting(fixture) {
+  const inspection = await inspectFixture(fixture);
+  const counts = rawDatabase(fixture.sqlitePath, (database) => ({
+    analytics: database.prepare('SELECT COUNT(*) AS count FROM analytics_events').get().count,
+    rateLimit: database.prepare('SELECT COUNT(*) AS count FROM contact_rate_limit_events').get().count,
+    relations: database.prepare('SELECT COUNT(*) AS count FROM crm_submission_supersessions').get().count,
+    receipts: database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_repair_manifests
+      WHERE mode = 'crm-duplicate-consolidation'`).get().count,
+  }), { readonly: true });
+  return {
+    authorityDigest: inspection.database.authorityLogicalDigest,
+    rawRows: inspection.rawRows,
+    relations: counts.relations,
+    receipts: counts.receipts,
+    volatileDiagnostic: { analytics: counts.analytics, rateLimit: counts.rateLimit },
+  };
+}
+
+test('V3 replay accounting separates volatile diagnostics from authoritative rows', async (t) => {
+  const fixture = await createFixture(t);
+  const before = await authorityAccounting(fixture);
+  const allTablesBefore = logicalSnapshot(fixture.sqlitePath);
+  rawDatabase(fixture.sqlitePath, (database) => {
+    database.prepare(`INSERT INTO analytics_events (id, created_at, event_name, path)
+      VALUES ('v3-replay-accounting', ?, 'page_view', '/v3')`).run(NOW);
+    database.prepare(`INSERT INTO contact_rate_limit_events (bucket, created_at)
+      VALUES ('v3-replay-accounting', ?)`).run(NOW);
+  });
+  const after = await authorityAccounting(fixture);
+  assert.equal(after.authorityDigest, before.authorityDigest);
+  assert.deepEqual(after.rawRows, before.rawRows);
+  assert.equal(after.relations, before.relations);
+  assert.equal(after.receipts, before.receipts);
+  assert.deepEqual(after.volatileDiagnostic, {
+    analytics: before.volatileDiagnostic.analytics + 1,
+    rateLimit: before.volatileDiagnostic.rateLimit + 1,
+  });
+  assert.notDeepEqual(logicalSnapshot(fixture.sqlitePath), allTablesBefore);
+});
 
 test('preview blocks unknown relationship-like columns and tables from the checked-in schema probe', async (t) => {
   const fixture = await createFixture(t);
@@ -298,8 +339,9 @@ test('preview inventories every application TEXT column with all approved and sc
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
     ORDER BY name
   `).all().reduce((count, table) => (
-    count + database.pragma(`table_info(${JSON.stringify(table.name)})`)
+    count + (['analytics_events', 'contact_rate_limit_events'].includes(table.name) ? 0 : database.pragma(`table_info(${JSON.stringify(table.name)})`)
       .filter((column) => /TEXT/i.test(String(column.type))).length
+    )
   ), 0), { readonly: true });
   assert.equal(inspection.relationshipInventory.length, expectedTextColumnCount);
   const auditPath = inspection.relationshipInventory.find((entry) => (
@@ -339,10 +381,8 @@ test('preview blocks a positive incident reference in an unapproved TEXT authori
     `).run(JSON.stringify({ submissionId: POOLER.supersededSubmissionId }));
   });
   const error = await refusedPreview(fixture);
-  assert.ok(error.blockers.some((blocker) => (
-    /unclassified.*positive.*reference/i.test(blocker)
-      && /unexpected_live_authority\.payload/i.test(blocker)
-  )), JSON.stringify(error.blockers));
+  assert.ok(error.blockers.includes('unclassified positive incident reference: unexpected_live_authority.payload'),
+    JSON.stringify(error.blockers));
 });
 
 test('preview scans an unknown TEXT column with no incident reference without approving the surface', async (t) => {
@@ -434,4 +474,48 @@ test('SQLite apply sink independently rejects missing confirmation and forged ba
       assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
     });
   }
+});
+
+test('V3 service accepts authority-only backup verification shape before apply gate', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  const storage = {
+    provider: 'sqlite',
+    getCrmDuplicateConsolidationConfigAuthority: () => fixture.storage.getCrmDuplicateConsolidationConfigAuthority(),
+    verifyCrmDuplicateConsolidationBackupPlan: async () => ({
+      planChecksum: artifact.planChecksum,
+      databaseAuthorityLogicalDigest: artifact.plan.database.authorityLogicalDigest,
+    }),
+  };
+  const input = {
+    apply: true,
+    storage,
+    reviewedArtifact: artifact,
+    expectedPlanChecksum: artifact.planChecksum,
+    expectedManifestId: artifact.manifestId,
+    backup: {
+      path: fixture.recoveryCheckpoint.backupPath,
+      manifestId: fixture.recoveryCheckpoint.backupManifestId,
+      sha256: fixture.recoveryCheckpoint.backupSha256,
+      flySnapshotId: fixture.recoveryCheckpoint.flySnapshotId,
+      flySnapshotDigest: fixture.recoveryCheckpoint.flySnapshotDigest,
+    },
+    actor: ACTOR,
+    reason: REASON,
+    executionRelease: RELEASE,
+    toolingRevision: TOOLING,
+    confirmation: CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
+    now: new Date(NOW),
+  };
+  await assert.rejects(applyCrmDuplicateConsolidation(input), (error) => {
+    assert.deepEqual(error.blockers, ['apply-unavailable']);
+    return true;
+  });
+  storage.verifyCrmDuplicateConsolidationBackupPlan = async () => ({
+    planChecksum: artifact.planChecksum,
+  });
+  await assert.rejects(applyCrmDuplicateConsolidation(input), (error) => {
+    assert.deepEqual(error.blockers, ['backup-plan-mismatch']);
+    return true;
+  });
 });

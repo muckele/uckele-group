@@ -54,6 +54,7 @@ import {
   CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
   CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
   CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+  CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES,
   crmDuplicateConsolidationFinancialEvidenceMatches,
   crmDuplicateConsolidationManifestId,
   crmDuplicateConsolidationRawStringMatchesSha256,
@@ -2524,14 +2525,23 @@ function assertCrmDuplicateConsolidationRequiredObjects(database, expected, phas
 function crmDuplicateConsolidationDatabaseState(database) {
   const schema = crmDuplicateConsolidationSchema(database);
   const requiredObjects = crmDuplicateConsolidationRequiredObjects(database);
-  let totalRows = 0;
-  const rowsByTable = {};
-  const tableDigests = {};
-  for (const table of schema) {
+  const schemaNames = new Set(schema.map((table) => table.name));
+  for (const name of CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES) {
+    if (!schemaNames.has(name)) {
+      throw new Error(`CRM duplicate consolidation required schema table missing: ${name}.`);
+    }
+  }
+  const authoritativeTables = schema.filter((table) => (
+    !CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES.includes(table.name)
+  ));
+  let authorityTotalRows = 0;
+  const rowsByAuthoritativeTable = {};
+  const authorityTableDigests = {};
+  for (const table of authoritativeTables) {
     const quotedTable = quoteCrmDuplicateConsolidationIdentifier(table.name);
     const count = Number(database.prepare(`SELECT COUNT(*) AS count FROM ${quotedTable}`).get()?.count || 0);
-    totalRows += count;
-    if (totalRows > crmDuplicateConsolidationMaximumRows) {
+    authorityTotalRows += count;
+    if (authorityTotalRows > crmDuplicateConsolidationMaximumRows) {
       throw new Error('CRM duplicate consolidation inspection row bound exceeded.');
     }
     const rows = database.prepare(`SELECT * FROM ${quotedTable}`).all()
@@ -2539,8 +2549,8 @@ function crmDuplicateConsolidationDatabaseState(database) {
         stableCrmDuplicateConsolidationJson(left),
         stableCrmDuplicateConsolidationJson(right),
       ));
-    rowsByTable[table.name] = rows;
-    tableDigests[table.name] = {
+    rowsByAuthoritativeTable[table.name] = rows;
+    authorityTableDigests[table.name] = {
       rowCount: rows.length,
       digest: canonicalJsonSha256(rows),
     };
@@ -2549,10 +2559,10 @@ function crmDuplicateConsolidationDatabaseState(database) {
     schema,
     requiredObjects,
     schemaDigest: canonicalJsonSha256({ tables: schema, requiredObjects }),
-    rowsByTable,
-    tableDigests,
-    logicalDigest: canonicalJsonSha256(rowsByTable),
-    totalRows,
+    rowsByAuthoritativeTable,
+    authorityTableDigests,
+    authorityLogicalDigest: canonicalJsonSha256(rowsByAuthoritativeTable),
+    authorityTotalRows,
   };
 }
 
@@ -2659,7 +2669,7 @@ function crmDuplicateConsolidationReferenceTokens(state) {
     pair.survivorSubmissionId,
     pair.supersededSubmissionId,
   ]));
-  for (const row of state.rowsByTable.contact_submissions || []) {
+  for (const row of state.rowsByAuthoritativeTable.contact_submissions || []) {
     if (!scopedSubmissionIds.has(row.id)) continue;
     collectCrmDuplicateConsolidationEvidenceTokens(
       parseCrmDuplicateConsolidationMetadata(row.metadata)?.dealHunter,
@@ -2670,7 +2680,7 @@ function crmDuplicateConsolidationReferenceTokens(state) {
   const scopedOpportunityIds = new Set(
     CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.opportunityId),
   );
-  for (const row of state.rowsByTable.deal_hunter_opportunity_aliases || []) {
+  for (const row of state.rowsByAuthoritativeTable.deal_hunter_opportunity_aliases || []) {
     if (!scopedOpportunityIds.has(row.opportunity_id)) continue;
     for (const [column, value] of Object.entries(row)) {
       if (/(?:alias|evidence|listing|deal_key)/i.test(column)
@@ -2710,7 +2720,8 @@ function crmDuplicateConsolidationReferenceInventory(state) {
   const { approved, tokens } = crmDuplicateConsolidationReferenceTokens(state);
   const references = [];
   for (const table of state.schema) {
-    const rows = state.rowsByTable[table.name] || [];
+    if (CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES.includes(table.name)) continue;
+    const rows = state.rowsByAuthoritativeTable[table.name];
     for (const column of table.columns) {
       if (!/TEXT/i.test(String(column.type))) continue;
       const configuredClassification = classifyCrmDuplicateConsolidationTextReference({
@@ -3122,8 +3133,8 @@ function inspectCrmDuplicateConsolidationState(database, { connection, configAut
     },
     blockers: [...new Set(blockers)].sort(),
     database: {
-      logicalDigest: state.logicalDigest,
-      totalRows: state.totalRows,
+      authorityLogicalDigest: state.authorityLogicalDigest,
+      authorityTotalRows: state.authorityTotalRows,
       quickCheck: String(database.pragma('quick_check', { simple: true }) || ''),
       foreignKeyViolationCount: database.pragma('foreign_key_check').length,
     },
@@ -3138,7 +3149,7 @@ function inspectCrmDuplicateConsolidationState(database, { connection, configAut
     },
     relationshipInventory: referenceInventory.entries,
     referenceIdentifiers: referenceInventory.identifiers,
-    tableDigests: state.tableDigests,
+    authorityTableDigests: state.authorityTableDigests,
     rawRows,
     safety,
     runtimeSafetyAuthority,
@@ -3203,11 +3214,16 @@ function inspectCrmDuplicateConsolidationRuntimeSafety(database, {
 }
 
 function crmDuplicateConsolidationFinalState(database, { artifact, actor, reason, backup }) {
-  assertCrmDuplicateConsolidationRequiredObjects(
+  const currentSchema = crmDuplicateConsolidationSchema(database);
+  const currentRequiredObjects = assertCrmDuplicateConsolidationRequiredObjects(
     database,
     artifact.plan.schema.requiredObjects,
-    'postcondition',
+    'final-state',
   );
+  if (canonicalJsonSha256({ tables: currentSchema, requiredObjects: currentRequiredObjects })
+    !== artifact.plan.schema.digest) {
+    throw new Error('CRM duplicate consolidation final-state complete schema drift.');
+  }
   const relations = database.prepare(`
     SELECT * FROM crm_submission_supersessions
     WHERE repair_manifest_id = ? ORDER BY id
@@ -3290,6 +3306,20 @@ function crmDuplicateConsolidationFinalState(database, { artifact, actor, reason
     throw new Error('CRM duplicate consolidation postcondition integrity check failed.');
   }
   return { relations, berlinImport, receipt, quickCheck, foreignKeyViolationCount: 0, valid: true };
+}
+
+function assertCrmDuplicateConsolidationProtectedTables(database, authorityTableDigests, phase) {
+  for (const [table, expected] of Object.entries(authorityTableDigests)) {
+    if (['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests'].includes(table)) continue;
+    const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
+      .sort((left, right) => compareCrmDuplicateConsolidationText(
+        stableCrmDuplicateConsolidationJson(left),
+        stableCrmDuplicateConsolidationJson(right),
+      ));
+    if (rows.length !== expected.rowCount || canonicalJsonSha256(rows) !== expected.digest) {
+      throw new Error(`CRM duplicate consolidation ${phase}: ${table}.`);
+    }
+  }
 }
 
 export function createSqliteCrmDuplicateConsolidationReadOnlyStorage(config, {
@@ -10098,13 +10128,13 @@ export function createSqliteStorage(config, options = {}) {
           },
         });
         if (planned.planChecksum !== artifact.planChecksum
-          || inspection.database.logicalDigest !== artifact.plan.database.logicalDigest
+          || inspection.database.authorityLogicalDigest !== artifact.plan.database.authorityLogicalDigest
           || inspection.schema.digest !== artifact.plan.schema.digest) {
-          throw new Error('backup does not reproduce the reviewed plan and raw database digest');
+          throw new Error('backup does not reproduce the reviewed V3 plan and authoritative database digest');
         }
         const verification = Object.freeze({
           planChecksum: planned.planChecksum,
-          databaseLogicalDigest: inspection.database.logicalDigest,
+          databaseAuthorityLogicalDigest: inspection.database.authorityLogicalDigest,
           schemaDigest: inspection.schema.digest,
         });
         crmDuplicateConsolidationBackupVerifications.set(verification, {
@@ -10200,17 +10230,9 @@ export function createSqliteStorage(config, options = {}) {
           const finalState = crmDuplicateConsolidationFinalState(database, {
             artifact, actor, reason, backup,
           });
-          for (const [table, expected] of Object.entries(artifact.plan.tableDigests)) {
-            if (['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests'].includes(table)) continue;
-            const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
-              .sort((left, right) => compareCrmDuplicateConsolidationText(
-                stableCrmDuplicateConsolidationJson(left),
-                stableCrmDuplicateConsolidationJson(right),
-              ));
-            if (rows.length !== expected.rowCount || canonicalJsonSha256(rows) !== expected.digest) {
-              throw new Error(`CRM duplicate consolidation replay protected-table drift: ${table}.`);
-            }
-          }
+          assertCrmDuplicateConsolidationProtectedTables(
+            database, artifact.plan.authorityTableDigests, 'replay protected-table drift',
+          );
           return {
             status: 'verified-prior-apply',
             mode: 'apply',
@@ -10248,11 +10270,11 @@ export function createSqliteStorage(config, options = {}) {
         });
         if (planned.manifestId !== artifact.manifestId
           || planned.planChecksum !== artifact.planChecksum
-          || inspection.database.logicalDigest !== artifact.plan.database.logicalDigest
+          || inspection.database.authorityLogicalDigest !== artifact.plan.database.authorityLogicalDigest
           || inspection.schema.digest !== artifact.plan.schema.digest
           || stableCrmDuplicateConsolidationJson(inspection.rawRows)
             !== stableCrmDuplicateConsolidationJson(artifact.plan.rawRows)) {
-          throw new Error('Apply refused: live raw-row, schema, database, or reviewed plan drift.');
+          throw new Error('Apply refused: live raw-row, schema, authoritative database, or reviewed plan drift.');
         }
 
         const receiptManifest = {
@@ -10392,17 +10414,9 @@ export function createSqliteStorage(config, options = {}) {
         const finalState = crmDuplicateConsolidationFinalState(database, {
           artifact, actor, reason, backup,
         });
-        for (const [table, expected] of Object.entries(artifact.plan.tableDigests)) {
-          if (['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests'].includes(table)) continue;
-          const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
-            .sort((left, right) => compareCrmDuplicateConsolidationText(
-              stableCrmDuplicateConsolidationJson(left),
-              stableCrmDuplicateConsolidationJson(right),
-            ));
-          if (rows.length !== expected.rowCount || canonicalJsonSha256(rows) !== expected.digest) {
-            throw new Error(`CRM duplicate consolidation prohibited-table postcondition failed: ${table}.`);
-          }
-        }
+        assertCrmDuplicateConsolidationProtectedTables(
+          database, artifact.plan.authorityTableDigests, 'prohibited-table postcondition failed',
+        );
         if (testHooks?.forcePostconditionFailure === true) {
           throw new Error('Injected postcondition failure.');
         }

@@ -265,7 +265,7 @@ export async function applyCrmDuplicateConsolidation({
     refuse(`Apply refused: backup verification failed: ${error.message}`, ['backup-verification-failed']);
   }
   if (verification?.planChecksum !== expectedPlanChecksum
-    || verification?.databaseLogicalDigest !== artifact.plan.database.logicalDigest) {
+    || verification?.databaseAuthorityLogicalDigest !== artifact.plan.database.authorityLogicalDigest) {
     refuse('Apply refused: backup does not reproduce the reviewed plan.', ['backup-plan-mismatch']);
   }
   if (typeof storage.applyCrmDuplicateConsolidation !== 'function') {

@@ -27,10 +27,10 @@ const safeConfig = () => ({
 });
 
 test('V2 repair namespace is distinct while the approval and checkpoint contracts remain V1', () => {
-  assert.equal(CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION, 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2');
-  assert.equal(CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA, 'crm-duplicate-consolidation-plan-v2');
-  assert.equal(CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA, 'crm-duplicate-consolidation-manifest-v2');
-  assert.equal(CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION, 'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION, 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V3');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA, 'crm-duplicate-consolidation-plan-v3');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA, 'crm-duplicate-consolidation-manifest-v3');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION, 'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V3');
   assert.equal(CRM_DUPLICATE_CONSOLIDATION_CONFIG_AUTHORITY_SCHEMA, 'crm-duplicate-consolidation-runtime-config-v1');
   assert.equal(CRM_DUPLICATE_CONSOLIDATION_RUNTIME_SAFETY_SCHEMA, 'crm-duplicate-consolidation-runtime-safety-v1');
 });

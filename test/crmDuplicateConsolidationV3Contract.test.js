@@ -1,0 +1,506 @@
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import test from 'node:test';
+import Database from 'better-sqlite3';
+
+import {
+  CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR,
+  CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES,
+  CRM_DUPLICATE_CONSOLIDATION_ROW_AUTHORITY,
+  validateCrmDuplicateConsolidationRowAuthority,
+  crmDuplicateConsolidationManifestId,
+  CRM_DUPLICATE_CONSOLIDATION_APPROVAL_SCHEMA,
+  CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA,
+  CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA,
+  CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
+  CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+  CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
+  buildCrmDuplicateConsolidationPlan,
+  canonicalJsonSha256,
+} from '../server/repairs/crmDuplicateConsolidation.js';
+import { verifyCrmDuplicateConsolidationReviewedArtifact } from '../server/services/crmDuplicateConsolidationRepair.js';
+import { createSqliteCrmDuplicateConsolidationReadOnlyStorage } from '../server/storage/sqlite.js';
+import {
+  ACTOR,
+  createFixture,
+  NOW,
+  POOLER,
+  REASON,
+  RELEASE,
+  TOOLING,
+  rawDatabase,
+  syntheticReviewedArtifactFixture,
+} from './crmDuplicateConsolidationRepair.test.js';
+
+async function inspect(fixture) {
+  const storage = createSqliteCrmDuplicateConsolidationReadOnlyStorage(
+    fixture.config, { environment: {} },
+  );
+  try {
+    return await storage.inspectCrmDuplicateConsolidation();
+  } finally {
+    storage.close();
+  }
+}
+
+function growVolatile(fixture, { analytics = false, rateLimit = false } = {}) {
+  rawDatabase(fixture.sqlitePath, (db) => {
+    if (analytics) db.prepare(`INSERT INTO analytics_events
+      (id, created_at, event_name, path) VALUES (?, ?, 'page_view', ?)`).run(
+      'v3-analytics-event', NOW, '/v3/volatile',
+    );
+    if (rateLimit) db.prepare(`INSERT INTO contact_rate_limit_events (bucket, created_at)
+      VALUES (?, ?)`).run('v3-rate-limit', NOW);
+  });
+}
+
+function insertMany(db, table, count) {
+  db.prepare(`WITH RECURSIVE seq(n) AS (
+    SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?
+  ) INSERT INTO ${table} (value) SELECT n FROM seq`).run(count);
+}
+
+async function createVolatileParity(fixture) {
+  const parityBackupPath = path.join(fixture.root, 'v3-parity-backup.sqlite');
+  rawDatabase(fixture.sqlitePath, (db) => {
+    db.exec('DELETE FROM analytics_events; DELETE FROM contact_rate_limit_events;');
+    for (let i = 0; i < 137; i += 1) db.prepare(`INSERT INTO analytics_events
+      (id, created_at, event_name, path) VALUES (?, ?, 'page_view', '/fixture')`)
+      .run(`a-${i}`, NOW);
+    for (let i = 0; i < 105; i += 1) db.prepare(`INSERT INTO contact_rate_limit_events
+      (bucket, created_at) VALUES ('fixture', ?)`).run(NOW);
+  });
+  await fixture.storage.createApplicationBackup(parityBackupPath);
+  rawDatabase(fixture.sqlitePath, (db) => {
+    for (let i = 137; i < 140; i += 1) db.prepare(`INSERT INTO analytics_events
+      (id, created_at, event_name, path) VALUES (?, ?, 'page_view', '/fixture')`)
+      .run(`a-${i}`, NOW);
+    for (let i = 105; i < 107; i += 1) db.prepare(`INSERT INTO contact_rate_limit_events
+      (bucket, created_at) VALUES ('fixture', ?)`).run(NOW);
+  });
+  const backup = await inspect({ ...fixture, config: {
+    ...fixture.config, storage: { ...fixture.config.storage, sqlitePath: parityBackupPath },
+  } });
+  return { parityBackupPath, backup };
+}
+
+function plannedChecksum(fixture, inspection) {
+  return buildCrmDuplicateConsolidationPlan({
+    inspection: { ...inspection, blockers: [] },
+    actor: ACTOR,
+    reason: REASON,
+    executionRelease: RELEASE,
+    toolingRevision: TOOLING,
+    recoveryCheckpoint: fixture.recoveryCheckpoint,
+  }).planChecksum;
+}
+
+test('V3 keeps the fixed Berlin digest, raw Annual Profit authority, and unknown period', () => {
+  const berlin = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.find((pair) => pair.key === 'berlin');
+  assert.ok(berlin);
+  assert.equal(berlin.supersededDealKeySha256,
+    '3d9a1bfb64efd766a7bc3dd8c584a7fc0aab58a74cbcbd377893ed42bd65f733');
+  assert.equal(berlin.financialLabel, 'Annual Profit');
+  assert.equal(Object.hasOwn(berlin, 'financialPeriod'), false);
+});
+
+test('V3 sanitized 137/105 to 140/107 parity leaves reviewed authority equal', async (t) => {
+  const fixture = await createFixture(t);
+  const { parityBackupPath, backup } = await createVolatileParity(fixture);
+  const live = await inspect(fixture);
+  assert.equal(live.database.authorityLogicalDigest, backup.database.authorityLogicalDigest);
+  assert.deepEqual(live.authorityTableDigests, backup.authorityTableDigests);
+  assert.equal(live.schema.digest, backup.schema.digest);
+  assert.equal(live.database.authorityTotalRows, backup.database.authorityTotalRows);
+  assert.equal(plannedChecksum(fixture, live), plannedChecksum(fixture, backup));
+  const counts = (sqlitePath) => rawDatabase(sqlitePath, (db) => ({
+    analytics: db.prepare('SELECT COUNT(*) AS count FROM analytics_events').get().count,
+    rateLimit: db.prepare('SELECT COUNT(*) AS count FROM contact_rate_limit_events').get().count,
+  }), { readonly: true });
+  assert.deepEqual(counts(parityBackupPath), { analytics: 137, rateLimit: 105 });
+  assert.deepEqual(counts(fixture.sqlitePath), { analytics: 140, rateLimit: 107 });
+});
+
+test('V3 backup authoritative-row drift changes reviewed authority', async (t) => {
+  const fixture = await createFixture(t);
+  const { backup } = await createVolatileParity(fixture);
+  rawDatabase(fixture.sqlitePath, (db) => db.prepare(`UPDATE deal_hunter_opportunities
+    SET canonical_name = ? WHERE opportunity_id = ?`).run('changed', POOLER.opportunityId));
+  const live = await inspect(fixture);
+  assert.notEqual(live.database.authorityLogicalDigest, backup.database.authorityLogicalDigest);
+  assert.notEqual(plannedChecksum(fixture, live), plannedChecksum(fixture, backup));
+});
+
+test('V3 backup schema drift in excluded table changes reviewed schema', async (t) => {
+  const fixture = await createFixture(t);
+  const { backup } = await createVolatileParity(fixture);
+  rawDatabase(fixture.sqlitePath, (db) => db.exec('ALTER TABLE analytics_events ADD COLUMN v3_probe TEXT'));
+  const live = await inspect(fixture);
+  assert.equal(live.database.authorityLogicalDigest, backup.database.authorityLogicalDigest);
+  assert.notEqual(live.schema.digest, backup.schema.digest);
+  assert.notEqual(plannedChecksum(fixture, live), plannedChecksum(fixture, backup));
+});
+
+test('V3 authoritative digest and count ignore both volatile tables', async (t) => {
+  for (const variant of [{ analytics: true }, { rateLimit: true }, { analytics: true, rateLimit: true }]) {
+    await t.test(JSON.stringify(variant), async (subtest) => {
+      const fixture = await createFixture(subtest);
+      const before = await inspect(fixture);
+      growVolatile(fixture, variant);
+      const after = await inspect(fixture);
+      assert.equal(typeof before.database.authorityLogicalDigest, 'string');
+      assert.equal(typeof before.database.authorityTotalRows, 'number');
+      assert.equal(after.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
+      assert.equal(after.database.authorityTotalRows, before.database.authorityTotalRows);
+      assert.deepEqual(after.authorityTableDigests, before.authorityTableDigests);
+      assert.equal(after.schema.digest, before.schema.digest);
+      assert.equal(Object.hasOwn(after.authorityTableDigests, 'analytics_events'), false);
+      assert.equal(Object.hasOwn(after.authorityTableDigests, 'contact_rate_limit_events'), false);
+    });
+  }
+});
+
+test('V3 apply authority ignores analytics-only, rate-limit-only, and combined row growth', async (t) => {
+  for (const variant of [{ analytics: true }, { rateLimit: true }, { analytics: true, rateLimit: true }]) {
+    await t.test(JSON.stringify(variant), async (subtest) => {
+      const fixture = await createFixture(subtest);
+      const before = await inspect(fixture);
+      growVolatile(fixture, variant);
+      const after = await inspect(fixture);
+      assert.equal(after.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
+      assert.equal(after.schema.digest, before.schema.digest);
+      assert.deepEqual(after.rawRows, before.rawRows);
+      assert.equal(plannedChecksum(fixture, after), plannedChecksum(fixture, before));
+    });
+  }
+});
+
+test('V3 apply authority detects unrelated authoritative row drift', async (t) => {
+  const fixture = await createFixture(t);
+  rawDatabase(fixture.sqlitePath, (db) => db.prepare(`INSERT INTO deal_hunter_opportunity_source_observations
+    (id, opportunity_id, source_id, source_name, source_record_id, field, value,
+      observed_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'v3-apply-unrelated', POOLER.opportunityId, 'v3-test', 'V3 test', 'v3-record',
+    'name', 'unrelated', NOW, NOW, NOW,
+  ));
+  const before = await inspect(fixture);
+  rawDatabase(fixture.sqlitePath, (db) => db.prepare(`UPDATE deal_hunter_opportunity_source_observations
+    SET value = ? WHERE id = ?`).run('changed unrelated value', 'v3-apply-unrelated'));
+  const after = await inspect(fixture);
+  assert.notEqual(after.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
+  assert.deepEqual(after.rawRows, before.rawRows);
+  assert.notEqual(plannedChecksum(fixture, after), plannedChecksum(fixture, before));
+});
+
+test('V3 target drift remains visible even when volatile activity is ignored', async (t) => {
+  const fixture = await createFixture(t);
+  const before = await inspect(fixture);
+  growVolatile(fixture, { analytics: true, rateLimit: true });
+  rawDatabase(fixture.sqlitePath, (db) => db.prepare(`UPDATE contact_submissions
+    SET company = ? WHERE id = ?`).run('changed target', POOLER.survivorSubmissionId));
+  const after = await inspect(fixture);
+  assert.notEqual(after.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
+  assert.notDeepEqual(after.rawRows, before.rawRows);
+  assert.notEqual(plannedChecksum(fixture, after), plannedChecksum(fixture, before));
+});
+
+test('V3 reference inventory never scans volatile incident tokens', async (t) => {
+  const fixture = await createFixture(t);
+  const before = await inspect(fixture);
+  rawDatabase(fixture.sqlitePath, (db) => {
+    db.prepare(`INSERT INTO analytics_events (id, created_at, event_name, path)
+      VALUES ('v3-reference', ?, 'page_view', ?)`).run(NOW, `/${POOLER.supersededSubmissionId}`);
+    db.prepare(`INSERT INTO contact_rate_limit_events (bucket, created_at)
+      VALUES (?, ?)`).run(POOLER.supersededSubmissionId, NOW);
+  });
+  const after = await inspect(fixture);
+  assert.deepEqual(after.relationshipInventory, before.relationshipInventory);
+  assert.deepEqual(after.referenceIdentifiers, before.referenceIdentifiers);
+  assert.ok(after.relationshipInventory.every((entry) =>
+    !['analytics_events', 'contact_rate_limit_events'].includes(entry.table)));
+  assert.equal(after.blockers.some((value) => /analytics_events|contact_rate_limit_events/.test(value)), false);
+});
+
+test('V3 schema includes volatile tables and changes on each DDL', async (t) => {
+  for (const table of CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES) {
+    await t.test(table, async (subtest) => {
+      const fixture = await createFixture(subtest);
+      const before = await inspect(fixture);
+      assert.ok(before.schema.tables.some((entry) => entry.name === table));
+      rawDatabase(fixture.sqlitePath, (db) => db.exec(`ALTER TABLE ${table} ADD COLUMN v3_probe TEXT`));
+      const after = await inspect(fixture);
+      assert.notEqual(after.schema.digest, before.schema.digest);
+      assert.equal(after.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
+    });
+  }
+});
+
+test('V3 postcondition schema authority detects each excluded table DDL even when required objects and row authority agree', async (t) => {
+  for (const table of CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES) {
+    await t.test(table, async (subtest) => {
+      const fixture = await createFixture(subtest);
+      const before = await inspect(fixture);
+      rawDatabase(fixture.sqlitePath, (db) => db.exec(`ALTER TABLE ${table} ADD COLUMN v3_postcondition_probe TEXT`));
+      const after = await inspect(fixture);
+      assert.deepEqual(after.schema.requiredObjects, before.schema.requiredObjects);
+      assert.notEqual(after.schema.digest, before.schema.digest);
+      assert.equal(after.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
+      assert.deepEqual(after.authorityTableDigests, before.authorityTableDigests);
+      assert.deepEqual(after.rawRows, before.rawRows);
+    });
+  }
+});
+
+test('V3 unrelated authoritative row update and insert change authority', async (t) => {
+  const fixture = await createFixture(t);
+  const before = await inspect(fixture);
+  rawDatabase(fixture.sqlitePath, (db) => db.prepare(`UPDATE deal_hunter_opportunities
+    SET canonical_name = ? WHERE opportunity_id = ?`).run('changed', POOLER.opportunityId));
+  const updated = await inspect(fixture);
+  assert.notEqual(updated.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
+  rawDatabase(fixture.sqlitePath, (db) => db.prepare(`INSERT INTO deal_hunter_opportunity_source_observations
+    (id, opportunity_id, source_id, source_name, source_record_id, field, value,
+      observed_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'v3-authoritative-insert', POOLER.opportunityId, 'v3-test', 'V3 test', 'v3-record',
+    'name', 'unrelated', NOW, NOW, NOW,
+  ));
+  const inserted = await inspect(fixture);
+  assert.notEqual(inserted.database.authorityLogicalDigest, updated.database.authorityLogicalDigest);
+  assert.equal(inserted.database.authorityTotalRows, updated.database.authorityTotalRows + 1);
+});
+
+test('V3 authoritative new table defaults to row authority', async (t) => {
+  const fixture = await createFixture(t);
+  rawDatabase(fixture.sqlitePath, (db) => db.exec('CREATE TABLE v3_new_table (value INTEGER NOT NULL)'));
+  const before = await inspect(fixture);
+  assert.equal(before.authorityTableDigests.v3_new_table?.rowCount, 0);
+  rawDatabase(fixture.sqlitePath, (db) => db.prepare('INSERT INTO v3_new_table (value) VALUES (?)').run(1));
+  const after = await inspect(fixture);
+  assert.equal(after.database.authorityTotalRows, before.database.authorityTotalRows + 1);
+  assert.notEqual(after.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
+  assert.equal(after.schema.digest, before.schema.digest);
+  assert.equal(after.authorityTableDigests.v3_new_table.rowCount, 1);
+});
+
+test('V3 authoritative row bound rejects 250001 new-table rows before row read', async (t) => {
+  const fixture = await createFixture(t);
+  rawDatabase(fixture.sqlitePath, (db) => {
+    db.exec('CREATE TABLE v3_bound_probe (value INTEGER NOT NULL)');
+    insertMany(db, 'v3_bound_probe', 250001);
+  });
+  const prepared = [];
+  const original = Database.prototype.prepare;
+  Database.prototype.prepare = function observedPrepare(sql, ...args) {
+    prepared.push(String(sql));
+    return original.call(this, sql, ...args);
+  };
+  try {
+    await assert.rejects(inspect(fixture), /inspection row bound exceeded/);
+  } finally {
+    Database.prototype.prepare = original;
+  }
+  assert.equal(prepared.some((sql) => /SELECT\s+\*\s+FROM\s+"?v3_bound_probe"?/i.test(sql)), false);
+});
+
+test('V3 authoritative row bound ignores 250001 rate-limit rows', async (t) => {
+  const fixture = await createFixture(t);
+  rawDatabase(fixture.sqlitePath, (db) => db.prepare(`WITH RECURSIVE seq(n) AS (
+    SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?
+  ) INSERT INTO contact_rate_limit_events (bucket, created_at)
+    SELECT 'v3-rate-limit', ? FROM seq`).run(250001, NOW));
+  const inspection = await inspect(fixture);
+  assert.equal(typeof inspection.database.authorityLogicalDigest, 'string');
+  assert.equal(inspection.database.quickCheck, 'ok');
+});
+
+test('V3 schema refuses missing excluded table before row SQL', async (t) => {
+  for (const table of CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES) {
+    await t.test(table, async (subtest) => {
+      const fixture = await createFixture(subtest);
+      rawDatabase(fixture.sqlitePath, (db) => db.exec(`DROP TABLE ${table}`));
+      const prepared = [];
+      const original = Database.prototype.prepare;
+      Database.prototype.prepare = function observedPrepare(sql, ...args) {
+        prepared.push(String(sql));
+        return original.call(this, sql, ...args);
+      };
+      try {
+        await assert.rejects(inspect(fixture), new RegExp(`required schema table missing: ${table}`));
+      } finally {
+        Database.prototype.prepare = original;
+      }
+      assert.equal(prepared.some((sql) => /SELECT\s+(?:COUNT\(\*\)[\s\S]*?|\*)\s+FROM\s+"?[a-z_]+"?/i.test(sql)), false);
+    });
+  }
+});
+
+test('V3 authoritative inspection prepares no excluded-table row scan', async (t) => {
+  const fixture = await createFixture(t);
+  const prepared = [];
+  const original = Database.prototype.prepare;
+  Database.prototype.prepare = function observedPrepare(sql, ...args) {
+    prepared.push(String(sql));
+    return original.call(this, sql, ...args);
+  };
+  try {
+    await inspect(fixture);
+  } finally {
+    Database.prototype.prepare = original;
+  }
+  for (const table of CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES) {
+    assert.equal(prepared.some((sql) => new RegExp(`SELECT\\s+(?:COUNT\\(\\*\\)[\\s\\S]*?|\\*)\\s+FROM\\s+"?${table}"?`, 'i').test(sql)), false,
+      `unexpected row read on ${table}`);
+  }
+});
+
+test('V3 policy is closed, sorted, deeply frozen, and rejects recomputed-policy variants', () => {
+  assert.deepEqual(CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES,
+    ['analytics_events', 'contact_rate_limit_events']);
+  assert.equal(Object.isFrozen(CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES), true);
+  assert.equal(Object.isFrozen(CRM_DUPLICATE_CONSOLIDATION_ROW_AUTHORITY), true);
+  assert.deepEqual(CRM_DUPLICATE_CONSOLIDATION_ROW_AUTHORITY, {
+    schema: 'crm-duplicate-consolidation-row-authority-v1',
+    policy: 'schema-bound-row-content-excluded',
+    excludedRowTables: ['analytics_events', 'contact_rate_limit_events'],
+  });
+  for (const excludedRowTables of [
+    ['contact_rate_limit_events', 'analytics_events'],
+    ['analytics_events', 'contact_rate_limit_events', 'email_events'],
+    ['analytics_events'],
+  ]) {
+    assert.throws(() => validateCrmDuplicateConsolidationRowAuthority({
+      ...CRM_DUPLICATE_CONSOLIDATION_ROW_AUTHORITY, excludedRowTables,
+    }), /row.authority.*policy/i);
+  }
+  assert.throws(() => validateCrmDuplicateConsolidationRowAuthority({
+    ...CRM_DUPLICATE_CONSOLIDATION_ROW_AUTHORITY, override: true,
+  }), /row.authority.*policy/i);
+});
+
+test('V3 namespace changes only versioned repair contracts', () => {
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_APPROVAL_SCHEMA, 'crm-duplicate-consolidation-approval-v1');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA, 'crm-duplicate-consolidation-checkpoint-v1');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA, 'crm-duplicate-consolidation-plan-v3');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA, 'crm-duplicate-consolidation-manifest-v3');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION, 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V3');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION, 'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V3');
+  assert.match(crmDuplicateConsolidationManifestId(), /^crm-duplicate-consolidation:v3:[a-f0-9]{64}$/);
+});
+
+test('V3 pure validator refuses old or missing policy even with a valid checksum', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  for (const mutate of [
+    (item) => { item.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2'; },
+    (item) => { delete item.plan.rowAuthority; },
+    (item) => { item.plan.rowAuthority.policy = 'unreviewed'; },
+  ]) {
+    const candidate = structuredClone(artifact);
+    mutate(candidate);
+    candidate.planChecksum = canonicalJsonSha256(candidate.plan);
+    assert.throws(() => verifyCrmDuplicateConsolidationReviewedArtifact({
+      artifact: candidate, expectedPlanChecksum: candidate.planChecksum,
+      expectedManifestId: candidate.manifestId,
+    }), /version|row.authority.*policy/i);
+  }
+});
+
+function verifyRechecksummedArtifact(artifact) {
+  artifact.planChecksum = canonicalJsonSha256(artifact.plan);
+  return verifyCrmDuplicateConsolidationReviewedArtifact({
+    artifact,
+    expectedPlanChecksum: artifact.planChecksum,
+    expectedManifestId: artifact.manifestId,
+  });
+}
+
+test('V3 plan binds only authoritative rows and rejects checksum-valid policy forgery', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  assert.deepEqual(artifact.plan.rowAuthority, CRM_DUPLICATE_CONSOLIDATION_ROW_AUTHORITY);
+  assert.deepEqual(Object.keys(artifact.plan.database).sort(), [
+    'authorityLogicalDigest', 'authorityTotalRows', 'foreignKeyViolationCount', 'quickCheck',
+  ].sort());
+  assert.equal(Object.hasOwn(artifact.plan, 'tableDigests'), false);
+  assert.equal(Object.hasOwn(artifact.plan, 'authorityTableDigests'), true);
+  for (const excludedRowTables of [
+    ['contact_rate_limit_events', 'analytics_events'],
+    ['analytics_events', 'contact_rate_limit_events', 'email_events'],
+  ]) {
+    const forged = structuredClone(artifact);
+    forged.plan.rowAuthority.excludedRowTables = excludedRowTables;
+    assert.throws(() => verifyRechecksummedArtifact(forged), /row.authority.*policy/i);
+  }
+});
+
+test('V3 plan shape rejects malformed checksum-valid authority evidence', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  if (Object.hasOwn(artifact.plan, 'tableDigests')) {
+    artifact.plan.authorityTableDigests = artifact.plan.tableDigests;
+    delete artifact.plan.tableDigests;
+  }
+  const authoritativeName = Object.keys(artifact.plan.authorityTableDigests)[0];
+  assert.ok(authoritativeName);
+  assert.equal(verifyRechecksummedArtifact(structuredClone(artifact)).manifestId, artifact.manifestId);
+  const cases = [
+    ['missing policy', (item) => { delete item.plan.rowAuthority; }, /row.authority.*policy/i],
+    ['changed policy', (item) => { item.plan.rowAuthority.policy = 'unreviewed'; }, /row.authority.*policy/i],
+    ['changed policy schema', (item) => { item.plan.rowAuthority.schema = 'v2'; }, /row.authority.*policy/i],
+    ['extra policy key', (item) => { item.plan.rowAuthority.override = true; }, /row.authority.*policy/i],
+    ['legacy logical digest', (item) => { item.plan.database.logicalDigest = '0'.repeat(64); }, /database authority shape/i],
+    ['legacy total rows', (item) => { item.plan.database.totalRows = 0; }, /database authority shape/i],
+    ['legacy table digests', (item) => { item.plan.tableDigests = {}; }, /database authority shape/i],
+    ['missing excluded schema table', (item) => {
+      item.plan.schema.tables = item.plan.schema.tables.filter((table) => table.name !== 'analytics_events');
+    }, /schema lacks analytics_events/i],
+    ['missing second excluded schema table', (item) => {
+      item.plan.schema.tables = item.plan.schema.tables.filter((table) => table.name !== 'contact_rate_limit_events');
+    }, /schema lacks contact_rate_limit_events/i],
+    ['missing authoritative digest', (item) => { delete item.plan.authorityTableDigests[authoritativeName]; }, /authoritative table set/i],
+    ['extra authoritative digest', (item) => { item.plan.authorityTableDigests.analytics_events = { rowCount: 0, digest: '0'.repeat(64) }; }, /authoritative table set/i],
+    ['invalid authoritative row count', (item) => { item.plan.authorityTableDigests[authoritativeName].rowCount = -1; }, /authoritative table digest/i],
+    ['invalid authoritative digest', (item) => { item.plan.authorityTableDigests[authoritativeName].digest = 'bad'; }, /authoritative table digest/i],
+    ['mismatched authority total', (item) => { item.plan.database.authorityTotalRows += 1; }, /authoritative database digest or count/i],
+    ['invalid authority logical digest', (item) => { item.plan.database.authorityLogicalDigest = 'bad'; }, /authoritative database digest or count/i],
+  ];
+  for (const [name, mutate, expected] of cases) {
+    await t.test(name, () => {
+      const candidate = structuredClone(artifact);
+      mutate(candidate);
+      assert.throws(() => verifyRechecksummedArtifact(candidate), expected);
+    });
+  }
+});
+
+test('V3 old artifact versions refuse even with recomputed checksum', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  const cases = [
+    ['top-level V1 repair version', (item) => { item.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1'; }],
+    ['top-level V2 repair version', (item) => { item.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2'; }],
+    ['plan V1 repair version', (item) => { item.plan.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1'; }],
+    ['plan V2 repair version', (item) => { item.plan.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2'; }],
+    ['plan wrong repair type', (item) => { item.plan.repairType = 'other-repair'; }],
+    ['top-level V1 plan schema', (item) => { item.planSchema = 'crm-duplicate-consolidation-plan-v1'; }],
+    ['top-level V2 plan schema', (item) => { item.planSchema = 'crm-duplicate-consolidation-plan-v2'; }],
+    ['plan V1 plan schema', (item) => { item.plan.planSchema = 'crm-duplicate-consolidation-plan-v1'; }],
+    ['plan V2 plan schema', (item) => { item.plan.planSchema = 'crm-duplicate-consolidation-plan-v2'; }],
+    ['top-level V1 manifest schema', (item) => { item.manifestSchema = 'crm-duplicate-consolidation-manifest-v1'; }],
+    ['top-level V2 manifest schema', (item) => { item.manifestSchema = 'crm-duplicate-consolidation-manifest-v2'; }],
+    ['plan V1 manifest schema', (item) => { item.plan.manifestSchema = 'crm-duplicate-consolidation-manifest-v1'; }],
+    ['plan V2 manifest schema', (item) => { item.plan.manifestSchema = 'crm-duplicate-consolidation-manifest-v2'; }],
+    ['plan obsolete approval schema', (item) => { item.plan.approvalSchema = 'crm-duplicate-consolidation-approval-v0'; }],
+    ['V1 manifest ID', (item) => { item.manifestId = item.manifestId.replace(':v3:', ':v1:'); }],
+    ['V2 manifest ID', (item) => { item.manifestId = item.manifestId.replace(':v3:', ':v2:'); }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const candidate = structuredClone(artifact);
+      mutate(candidate);
+      assert.throws(() => verifyRechecksummedArtifact(candidate), /version|schema|manifest|plan/i);
+    });
+  }
+});

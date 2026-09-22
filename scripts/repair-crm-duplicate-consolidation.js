@@ -27,7 +27,7 @@ import {
 const commandName = 'crm-duplicate-consolidation';
 const sha256Pattern = /^[a-f0-9]{64}$/;
 const toolingRevisionPattern = /^[a-f0-9]{40,64}$/;
-const manifestIdPattern = /^crm-duplicate-consolidation:v2:[a-f0-9]{64}$/;
+const manifestIdPattern = /^crm-duplicate-consolidation:v3:[a-f0-9]{64}$/;
 const checkpointEvidenceMaximumBytes = 64 * 1024;
 
 function assertSingleOccurrence(args, flag) {

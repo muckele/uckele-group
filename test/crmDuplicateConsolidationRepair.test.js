@@ -17,6 +17,7 @@ import {
   CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA,
   CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
   CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+  CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES,
   getCrmDuplicateConsolidationDescriptor,
   stableCanonicalJson,
 } from '../server/repairs/crmDuplicateConsolidation.js';
@@ -400,12 +401,12 @@ function applyInput(fixture, reviewedArtifact, overrides = {}) {
 
 if (path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 test('descriptor freezes exactly the reviewed incident and four-row ledger', () => {
-  assert.equal(CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION, 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION, 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V3');
   assert.equal(CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE, 'crm-duplicate-consolidation');
   assert.equal(CRM_DUPLICATE_CONSOLIDATION_APPROVAL_SCHEMA, 'crm-duplicate-consolidation-approval-v1');
-  assert.equal(CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA, 'crm-duplicate-consolidation-plan-v2');
-  assert.equal(CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA, 'crm-duplicate-consolidation-manifest-v2');
-  assert.equal(CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION, 'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA, 'crm-duplicate-consolidation-plan-v3');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA, 'crm-duplicate-consolidation-manifest-v3');
+  assert.equal(CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION, 'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V3');
   assert.deepEqual(CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs, [POOLER, {
     ...BERLIN,
     supersededDealKeySha256: '3d9a1bfb64efd766a7bc3dd8c584a7fc0aab58a74cbcbd377893ed42bd65f733',
@@ -474,7 +475,9 @@ test('ordinary CI uses a clearly labeled synthetic Berlin identity and the fixed
     assert.equal(first.blockers.includes('berlin-canonical-import-identity-drift'), false);
     assert.equal(first.blockers.includes('berlin-legacy-import-identity-drift'), true);
     assert.equal(first.blockers.some((blocker) => /listing-pooler|financial-.*-pooler/i.test(blocker)), false);
-    assert.equal(first.database.logicalDigest, canonicalDigest(before));
+    assert.equal(first.database.authorityLogicalDigest, canonicalDigest(Object.fromEntries(
+      Object.entries(before).filter(([name]) => !CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES.includes(name)),
+    )));
   } finally {
     readOnly.close();
   }
@@ -501,7 +504,7 @@ test('preview refuses inspection evidence from the ordinary writable SQLite stor
   );
 });
 
-test('synthetic public artifact exercises canonical V2 validation but cannot authorize the fixed transaction', async (t) => {
+test('synthetic public artifact exercises canonical V3 validation but cannot authorize the fixed transaction', async (t) => {
   const fixture = await createFixture(t);
   const artifact = await syntheticReviewedArtifactFixture(fixture);
   const verified = verifyCrmDuplicateConsolidationReviewedArtifact({
@@ -510,7 +513,7 @@ test('synthetic public artifact exercises canonical V2 validation but cannot aut
     expectedManifestId: artifact.manifestId,
   });
   assert.equal(verified.planChecksum, artifact.planChecksum);
-  assert.equal(verified.plan.planSchema, 'crm-duplicate-consolidation-plan-v2');
+  assert.equal(verified.plan.planSchema, 'crm-duplicate-consolidation-plan-v3');
   assert.ok(verified.plan.runtimeSafetyAuthority.digest);
   await assert.rejects(
     applyCrmDuplicateConsolidation(applyInput(fixture, artifact)),
