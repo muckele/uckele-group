@@ -4,6 +4,7 @@ import test from 'node:test';
 import Database from 'better-sqlite3';
 
 import {
+  CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR,
   CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES,
   CRM_DUPLICATE_CONSOLIDATION_ROW_AUTHORITY,
   validateCrmDuplicateConsolidationRowAuthority,
@@ -93,6 +94,15 @@ function plannedChecksum(fixture, inspection) {
     recoveryCheckpoint: fixture.recoveryCheckpoint,
   }).planChecksum;
 }
+
+test('V3 keeps the fixed Berlin digest, raw Annual Profit authority, and unknown period', () => {
+  const berlin = CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.find((pair) => pair.key === 'berlin');
+  assert.ok(berlin);
+  assert.equal(berlin.supersededDealKeySha256,
+    '3d9a1bfb64efd766a7bc3dd8c584a7fc0aab58a74cbcbd377893ed42bd65f733');
+  assert.equal(berlin.financialLabel, 'Annual Profit');
+  assert.equal(Object.hasOwn(berlin, 'financialPeriod'), false);
+});
 
 test('V3 sanitized 137/105 to 140/107 parity leaves reviewed authority equal', async (t) => {
   const fixture = await createFixture(t);
