@@ -7,16 +7,16 @@ import {
 import { dealHunterListingMarketplaceAliases } from '../services/dealHunterListingIdentity.js';
 
 export const CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION =
-  'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2';
+  'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V3';
 export const CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE = 'crm-duplicate-consolidation';
 export const CRM_DUPLICATE_CONSOLIDATION_APPROVAL_SCHEMA =
   'crm-duplicate-consolidation-approval-v1';
 export const CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA =
-  'crm-duplicate-consolidation-plan-v2';
+  'crm-duplicate-consolidation-plan-v3';
 export const CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA =
-  'crm-duplicate-consolidation-manifest-v2';
+  'crm-duplicate-consolidation-manifest-v3';
 export const CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION =
-  'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2';
+  'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V3';
 export const CRM_DUPLICATE_CONSOLIDATION_CHECKPOINT_SCHEMA =
   'crm-duplicate-consolidation-checkpoint-v1';
 export const CRM_DUPLICATE_CONSOLIDATION_CONFIG_AUTHORITY_SCHEMA =
@@ -50,6 +50,22 @@ function deeplyFreeze(value) {
   if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
   for (const nested of Object.values(value)) deeplyFreeze(nested);
   return Object.freeze(value);
+}
+
+export const CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES = Object.freeze([
+  'analytics_events', 'contact_rate_limit_events',
+]);
+export const CRM_DUPLICATE_CONSOLIDATION_ROW_AUTHORITY = deeplyFreeze({
+  schema: 'crm-duplicate-consolidation-row-authority-v1',
+  policy: 'schema-bound-row-content-excluded',
+  excludedRowTables: CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES,
+});
+export function validateCrmDuplicateConsolidationRowAuthority(candidate) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)
+    || stableCanonicalJson(candidate) !== stableCanonicalJson(CRM_DUPLICATE_CONSOLIDATION_ROW_AUTHORITY)) {
+    throw new Error('CRM duplicate consolidation row-authority policy is invalid.');
+  }
+  return CRM_DUPLICATE_CONSOLIDATION_ROW_AUTHORITY;
 }
 
 export function stableCanonicalJson(value) {
@@ -705,7 +721,7 @@ export function crmDuplicateConsolidationApprovalTuple() {
 }
 
 export function crmDuplicateConsolidationManifestId() {
-  return `${CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE}:v2:${canonicalJsonSha256(crmDuplicateConsolidationApprovalTuple())}`;
+  return `crm-duplicate-consolidation:v3:${canonicalJsonSha256(crmDuplicateConsolidationApprovalTuple())}`;
 }
 
 export function crmDuplicateConsolidationRelationId(pair) {
@@ -781,6 +797,7 @@ export function buildCrmDuplicateConsolidationPlan({
     planSchema: CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA,
     manifestSchema: CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
     approval: crmDuplicateConsolidationApprovalTuple(),
+    rowAuthority: CRM_DUPLICATE_CONSOLIDATION_ROW_AUTHORITY,
     actor: normalizedActor,
     reason: normalizedReason,
     execution: {
@@ -847,6 +864,7 @@ export function validateCrmDuplicateConsolidationArtifact({
     || artifact.plan?.manifestSchema !== CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA) {
     throw new Error('Reviewed CRM duplicate consolidation schema or repair version is invalid.');
   }
+  validateCrmDuplicateConsolidationRowAuthority(artifact.plan?.rowAuthority);
   if (!exactDescriptor(artifact.plan?.approval)) {
     throw new Error('Reviewed CRM duplicate consolidation tuple is not the exact approved incident.');
   }
