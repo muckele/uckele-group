@@ -150,6 +150,51 @@ test('V3 authoritative digest and count ignore both volatile tables', async (t) 
   }
 });
 
+test('V3 apply authority ignores analytics-only, rate-limit-only, and combined row growth', async (t) => {
+  for (const variant of [{ analytics: true }, { rateLimit: true }, { analytics: true, rateLimit: true }]) {
+    await t.test(JSON.stringify(variant), async (subtest) => {
+      const fixture = await createFixture(subtest);
+      const before = await inspect(fixture);
+      growVolatile(fixture, variant);
+      const after = await inspect(fixture);
+      assert.equal(after.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
+      assert.equal(after.schema.digest, before.schema.digest);
+      assert.deepEqual(after.rawRows, before.rawRows);
+      assert.equal(plannedChecksum(fixture, after), plannedChecksum(fixture, before));
+    });
+  }
+});
+
+test('V3 apply authority detects unrelated authoritative row drift', async (t) => {
+  const fixture = await createFixture(t);
+  rawDatabase(fixture.sqlitePath, (db) => db.prepare(`INSERT INTO deal_hunter_opportunity_source_observations
+    (id, opportunity_id, source_id, source_name, source_record_id, field, value,
+      observed_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    'v3-apply-unrelated', POOLER.opportunityId, 'v3-test', 'V3 test', 'v3-record',
+    'name', 'unrelated', NOW, NOW, NOW,
+  ));
+  const before = await inspect(fixture);
+  rawDatabase(fixture.sqlitePath, (db) => db.prepare(`UPDATE deal_hunter_opportunity_source_observations
+    SET value = ? WHERE id = ?`).run('changed unrelated value', 'v3-apply-unrelated'));
+  const after = await inspect(fixture);
+  assert.notEqual(after.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
+  assert.deepEqual(after.rawRows, before.rawRows);
+  assert.notEqual(plannedChecksum(fixture, after), plannedChecksum(fixture, before));
+});
+
+test('V3 target drift remains visible even when volatile activity is ignored', async (t) => {
+  const fixture = await createFixture(t);
+  const before = await inspect(fixture);
+  growVolatile(fixture, { analytics: true, rateLimit: true });
+  rawDatabase(fixture.sqlitePath, (db) => db.prepare(`UPDATE contact_submissions
+    SET company = ? WHERE id = ?`).run('changed target', POOLER.survivorSubmissionId));
+  const after = await inspect(fixture);
+  assert.notEqual(after.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
+  assert.notDeepEqual(after.rawRows, before.rawRows);
+  assert.notEqual(plannedChecksum(fixture, after), plannedChecksum(fixture, before));
+});
+
 test('V3 reference inventory never scans volatile incident tokens', async (t) => {
   const fixture = await createFixture(t);
   const before = await inspect(fixture);

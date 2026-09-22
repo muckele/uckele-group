@@ -16,6 +16,7 @@ import {
   REASON,
   RELEASE,
   TOOLING,
+  applyInput,
   createFixture,
   logicalSnapshot,
   rawDatabase,
@@ -23,6 +24,41 @@ import {
 } from './crmDuplicateConsolidationRepair.test.js';
 
 const referenceSchemaPath = new URL('./fixtures/crmDuplicateConsolidationReferenceSchema.sql', import.meta.url);
+const sqliteSourcePath = new URL('../server/storage/sqlite.js', import.meta.url);
+
+test('V3 apply authority compares the live authoritative digest inside the immediate transaction', () => {
+  const source = fs.readFileSync(sqliteSourcePath, 'utf8');
+  const apply = source.slice(source.indexOf('async applyCrmDuplicateConsolidation({'));
+  const transaction = apply.slice(apply.indexOf('const transaction = database.transaction(() => {'),
+    apply.indexOf('const receiptManifest = {'));
+  assert.match(transaction, /assertCrmDuplicateConsolidationRuntimeSafetyAuthorityMatches\(/);
+  assert.match(transaction, /const inspection = inspectCrmDuplicateConsolidationState\(database,/);
+  assert.match(transaction, /inspection\.database\.authorityLogicalDigest !== artifact\.plan\.database\.authorityLogicalDigest/);
+  assert.doesNotMatch(transaction, /inspection\.database\.logicalDigest/);
+  assert.match(transaction, /inspection\.schema\.digest !== artifact\.plan\.schema\.digest/);
+  assert.match(transaction, /stableCrmDuplicateConsolidationJson\(inspection\.rawRows\)/);
+  assert.ok(transaction.indexOf('assertCrmDuplicateConsolidationRuntimeSafetyAuthorityMatches(')
+    < transaction.indexOf('const existingReceipt = '));
+  assert.ok(transaction.indexOf('const inspection = inspectCrmDuplicateConsolidationState(database,')
+    > transaction.indexOf('if (existingReceipt) {'));
+});
+
+test('V3 apply authority synthetic public fixture refuses fixed Berlin without repair writes', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  rawDatabase(fixture.sqlitePath, (database) => {
+    database.prepare(`INSERT INTO analytics_events (id, created_at, event_name, path)
+      VALUES ('v3-apply-negative', ?, 'page_view', '/negative')`).run(NOW);
+  });
+  const before = logicalSnapshot(fixture.sqlitePath);
+  const inspection = await inspectFixture(fixture);
+  assert.ok(inspection.blockers.some((blocker) => /berlin-superseded-deal-key-digest-drift/i.test(blocker)));
+  await assert.rejects(applyCrmDuplicateConsolidation(applyInput(fixture, artifact)), (error) => {
+    assert.equal(error?.code, 'CRM_DUPLICATE_CONSOLIDATION_REFUSED');
+    return true;
+  });
+  assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
+});
 
 async function refusedPreview(fixture) {
   const storage = createSqliteCrmDuplicateConsolidationReadOnlyStorage(fixture.config, {

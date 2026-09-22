@@ -10259,11 +10259,11 @@ export function createSqliteStorage(config, options = {}) {
         });
         if (planned.manifestId !== artifact.manifestId
           || planned.planChecksum !== artifact.planChecksum
-          || inspection.database.logicalDigest !== artifact.plan.database.logicalDigest
+          || inspection.database.authorityLogicalDigest !== artifact.plan.database.authorityLogicalDigest
           || inspection.schema.digest !== artifact.plan.schema.digest
           || stableCrmDuplicateConsolidationJson(inspection.rawRows)
             !== stableCrmDuplicateConsolidationJson(artifact.plan.rawRows)) {
-          throw new Error('Apply refused: live raw-row, schema, database, or reviewed plan drift.');
+          throw new Error('Apply refused: live raw-row, schema, authoritative database, or reviewed plan drift.');
         }
 
         const receiptManifest = {
