@@ -3150,7 +3150,6 @@ function inspectCrmDuplicateConsolidationState(database, { connection, configAut
     relationshipInventory: referenceInventory.entries,
     referenceIdentifiers: referenceInventory.identifiers,
     authorityTableDigests: state.authorityTableDigests,
-    tableDigests: state.authorityTableDigests,
     rawRows,
     safety,
     runtimeSafetyAuthority,
@@ -10212,7 +10211,7 @@ export function createSqliteStorage(config, options = {}) {
           const finalState = crmDuplicateConsolidationFinalState(database, {
             artifact, actor, reason, backup,
           });
-          for (const [table, expected] of Object.entries(artifact.plan.tableDigests)) {
+          for (const [table, expected] of Object.entries(artifact.plan.authorityTableDigests)) {
             if (['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests'].includes(table)) continue;
             const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
               .sort((left, right) => compareCrmDuplicateConsolidationText(
@@ -10404,7 +10403,7 @@ export function createSqliteStorage(config, options = {}) {
         const finalState = crmDuplicateConsolidationFinalState(database, {
           artifact, actor, reason, backup,
         });
-        for (const [table, expected] of Object.entries(artifact.plan.tableDigests)) {
+        for (const [table, expected] of Object.entries(artifact.plan.authorityTableDigests)) {
           if (['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests'].includes(table)) continue;
           const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
             .sort((left, right) => compareCrmDuplicateConsolidationText(

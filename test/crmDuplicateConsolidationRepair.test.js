@@ -504,7 +504,7 @@ test('preview refuses inspection evidence from the ordinary writable SQLite stor
   );
 });
 
-test('synthetic public artifact exercises canonical V2 validation but cannot authorize the fixed transaction', async (t) => {
+test('synthetic public artifact exercises canonical V3 validation but cannot authorize the fixed transaction', async (t) => {
   const fixture = await createFixture(t);
   const artifact = await syntheticReviewedArtifactFixture(fixture);
   const verified = verifyCrmDuplicateConsolidationReviewedArtifact({

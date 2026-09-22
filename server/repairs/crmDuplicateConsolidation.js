@@ -809,7 +809,7 @@ export function buildCrmDuplicateConsolidationPlan({
     schema: inspection.schema,
     relationshipInventory: inspection.relationshipInventory,
     referenceIdentifiers: inspection.referenceIdentifiers,
-    tableDigests: inspection.tableDigests,
+    authorityTableDigests: inspection.authorityTableDigests,
     rawRows: inspection.rawRows,
     safety: inspection.safety,
     runtimeSafetyAuthority,
@@ -865,6 +865,12 @@ export function validateCrmDuplicateConsolidationArtifact({
     throw new Error('Reviewed CRM duplicate consolidation schema or repair version is invalid.');
   }
   validateCrmDuplicateConsolidationRowAuthority(artifact.plan?.rowAuthority);
+  if (artifact.plan?.repairType !== CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE
+    || artifact.plan?.repairVersion !== CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION
+    || artifact.plan?.approvalSchema !== CRM_DUPLICATE_CONSOLIDATION_APPROVAL_SCHEMA) {
+    throw new Error('Reviewed CRM duplicate consolidation V3 plan version is invalid.');
+  }
+  validateCrmDuplicateConsolidationPlanAuthority(artifact.plan);
   if (!exactDescriptor(artifact.plan?.approval)) {
     throw new Error('Reviewed CRM duplicate consolidation tuple is not the exact approved incident.');
   }
@@ -876,6 +882,47 @@ export function validateCrmDuplicateConsolidationArtifact({
     throw new Error('Reviewed CRM duplicate consolidation mutation ledger is invalid.');
   }
   return artifact;
+}
+
+function validateCrmDuplicateConsolidationPlanAuthority(plan) {
+  const database = plan.database;
+  exactObjectKeys(database, [
+    'authorityLogicalDigest', 'authorityTotalRows', 'quickCheck', 'foreignKeyViolationCount',
+  ], 'Reviewed CRM duplicate consolidation V3 database authority shape');
+  if (Object.hasOwn(plan, 'tableDigests')) {
+    throw new Error('Reviewed CRM duplicate consolidation V3 database authority shape is invalid.');
+  }
+  const tables = plan.schema?.tables;
+  if (!Array.isArray(tables) || tables.some((table) => typeof table?.name !== 'string')) {
+    throw new Error('Reviewed V3 schema tables are invalid.');
+  }
+  const tableNames = tables.map((table) => table.name);
+  for (const name of CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES) {
+    if (!tableNames.includes(name)) throw new Error(`Reviewed V3 schema lacks ${name}.`);
+  }
+  const authoritativeNames = tableNames.filter((name) => (
+    !CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES.includes(name)
+  ));
+  exactObjectKeys(plan.authorityTableDigests, authoritativeNames, 'Reviewed V3 authoritative table set');
+  let authorityTotalRows = 0;
+  for (const name of authoritativeNames) {
+    const entry = plan.authorityTableDigests[name];
+    exactObjectKeys(entry, ['rowCount', 'digest'], 'Reviewed V3 authoritative table digest');
+    if (!Number.isSafeInteger(entry.rowCount) || entry.rowCount < 0
+      || typeof entry.digest !== 'string' || !/^[a-f0-9]{64}$/.test(entry.digest)) {
+      throw new Error('Reviewed V3 authoritative table digest is invalid.');
+    }
+    authorityTotalRows += entry.rowCount;
+  }
+  if (!Number.isSafeInteger(database.authorityTotalRows)
+    || database.authorityTotalRows !== authorityTotalRows
+    || typeof database.authorityLogicalDigest !== 'string'
+    || !/^[a-f0-9]{64}$/.test(database.authorityLogicalDigest)
+    || typeof database.quickCheck !== 'string'
+    || !Number.isSafeInteger(database.foreignKeyViolationCount)
+    || database.foreignKeyViolationCount < 0) {
+    throw new Error('Reviewed V3 authoritative database digest or count is invalid.');
+  }
 }
 
 export function validateCrmDuplicateConsolidationReceipt({

@@ -257,3 +257,101 @@ test('V3 pure validator refuses old or missing policy even with a valid checksum
     }), /version|row.authority.*policy/i);
   }
 });
+
+function verifyRechecksummedArtifact(artifact) {
+  artifact.planChecksum = canonicalJsonSha256(artifact.plan);
+  return verifyCrmDuplicateConsolidationReviewedArtifact({
+    artifact,
+    expectedPlanChecksum: artifact.planChecksum,
+    expectedManifestId: artifact.manifestId,
+  });
+}
+
+test('V3 plan binds only authoritative rows and rejects checksum-valid policy forgery', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  assert.deepEqual(artifact.plan.rowAuthority, CRM_DUPLICATE_CONSOLIDATION_ROW_AUTHORITY);
+  assert.deepEqual(Object.keys(artifact.plan.database).sort(), [
+    'authorityLogicalDigest', 'authorityTotalRows', 'foreignKeyViolationCount', 'quickCheck',
+  ].sort());
+  assert.equal(Object.hasOwn(artifact.plan, 'tableDigests'), false);
+  assert.equal(Object.hasOwn(artifact.plan, 'authorityTableDigests'), true);
+  for (const excludedRowTables of [
+    ['contact_rate_limit_events', 'analytics_events'],
+    ['analytics_events', 'contact_rate_limit_events', 'email_events'],
+  ]) {
+    const forged = structuredClone(artifact);
+    forged.plan.rowAuthority.excludedRowTables = excludedRowTables;
+    assert.throws(() => verifyRechecksummedArtifact(forged), /row.authority.*policy/i);
+  }
+});
+
+test('V3 plan shape rejects malformed checksum-valid authority evidence', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  if (Object.hasOwn(artifact.plan, 'tableDigests')) {
+    artifact.plan.authorityTableDigests = artifact.plan.tableDigests;
+    delete artifact.plan.tableDigests;
+  }
+  const authoritativeName = Object.keys(artifact.plan.authorityTableDigests)[0];
+  assert.ok(authoritativeName);
+  assert.equal(verifyRechecksummedArtifact(structuredClone(artifact)).manifestId, artifact.manifestId);
+  const cases = [
+    ['missing policy', (item) => { delete item.plan.rowAuthority; }, /row.authority.*policy/i],
+    ['changed policy', (item) => { item.plan.rowAuthority.policy = 'unreviewed'; }, /row.authority.*policy/i],
+    ['changed policy schema', (item) => { item.plan.rowAuthority.schema = 'v2'; }, /row.authority.*policy/i],
+    ['extra policy key', (item) => { item.plan.rowAuthority.override = true; }, /row.authority.*policy/i],
+    ['legacy logical digest', (item) => { item.plan.database.logicalDigest = '0'.repeat(64); }, /database authority shape/i],
+    ['legacy total rows', (item) => { item.plan.database.totalRows = 0; }, /database authority shape/i],
+    ['legacy table digests', (item) => { item.plan.tableDigests = {}; }, /database authority shape/i],
+    ['missing excluded schema table', (item) => {
+      item.plan.schema.tables = item.plan.schema.tables.filter((table) => table.name !== 'analytics_events');
+    }, /schema lacks analytics_events/i],
+    ['missing second excluded schema table', (item) => {
+      item.plan.schema.tables = item.plan.schema.tables.filter((table) => table.name !== 'contact_rate_limit_events');
+    }, /schema lacks contact_rate_limit_events/i],
+    ['missing authoritative digest', (item) => { delete item.plan.authorityTableDigests[authoritativeName]; }, /authoritative table set/i],
+    ['extra authoritative digest', (item) => { item.plan.authorityTableDigests.analytics_events = { rowCount: 0, digest: '0'.repeat(64) }; }, /authoritative table set/i],
+    ['invalid authoritative row count', (item) => { item.plan.authorityTableDigests[authoritativeName].rowCount = -1; }, /authoritative table digest/i],
+    ['invalid authoritative digest', (item) => { item.plan.authorityTableDigests[authoritativeName].digest = 'bad'; }, /authoritative table digest/i],
+    ['mismatched authority total', (item) => { item.plan.database.authorityTotalRows += 1; }, /authoritative database digest or count/i],
+    ['invalid authority logical digest', (item) => { item.plan.database.authorityLogicalDigest = 'bad'; }, /authoritative database digest or count/i],
+  ];
+  for (const [name, mutate, expected] of cases) {
+    await t.test(name, () => {
+      const candidate = structuredClone(artifact);
+      mutate(candidate);
+      assert.throws(() => verifyRechecksummedArtifact(candidate), expected);
+    });
+  }
+});
+
+test('V3 old artifact versions refuse even with recomputed checksum', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  const cases = [
+    ['top-level V1 repair version', (item) => { item.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1'; }],
+    ['top-level V2 repair version', (item) => { item.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2'; }],
+    ['plan V1 repair version', (item) => { item.plan.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1'; }],
+    ['plan V2 repair version', (item) => { item.plan.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2'; }],
+    ['plan wrong repair type', (item) => { item.plan.repairType = 'other-repair'; }],
+    ['top-level V1 plan schema', (item) => { item.planSchema = 'crm-duplicate-consolidation-plan-v1'; }],
+    ['top-level V2 plan schema', (item) => { item.planSchema = 'crm-duplicate-consolidation-plan-v2'; }],
+    ['plan V1 plan schema', (item) => { item.plan.planSchema = 'crm-duplicate-consolidation-plan-v1'; }],
+    ['plan V2 plan schema', (item) => { item.plan.planSchema = 'crm-duplicate-consolidation-plan-v2'; }],
+    ['top-level V1 manifest schema', (item) => { item.manifestSchema = 'crm-duplicate-consolidation-manifest-v1'; }],
+    ['top-level V2 manifest schema', (item) => { item.manifestSchema = 'crm-duplicate-consolidation-manifest-v2'; }],
+    ['plan V1 manifest schema', (item) => { item.plan.manifestSchema = 'crm-duplicate-consolidation-manifest-v1'; }],
+    ['plan V2 manifest schema', (item) => { item.plan.manifestSchema = 'crm-duplicate-consolidation-manifest-v2'; }],
+    ['plan obsolete approval schema', (item) => { item.plan.approvalSchema = 'crm-duplicate-consolidation-approval-v0'; }],
+    ['V1 manifest ID', (item) => { item.manifestId = item.manifestId.replace(':v3:', ':v1:'); }],
+    ['V2 manifest ID', (item) => { item.manifestId = item.manifestId.replace(':v3:', ':v2:'); }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, () => {
+      const candidate = structuredClone(artifact);
+      mutate(candidate);
+      assert.throws(() => verifyRechecksummedArtifact(candidate), /version|schema|manifest|plan/i);
+    });
+  }
+});
