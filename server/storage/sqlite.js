@@ -3214,11 +3214,16 @@ function inspectCrmDuplicateConsolidationRuntimeSafety(database, {
 }
 
 function crmDuplicateConsolidationFinalState(database, { artifact, actor, reason, backup }) {
-  assertCrmDuplicateConsolidationRequiredObjects(
+  const currentSchema = crmDuplicateConsolidationSchema(database);
+  const currentRequiredObjects = assertCrmDuplicateConsolidationRequiredObjects(
     database,
     artifact.plan.schema.requiredObjects,
-    'postcondition',
+    'final-state',
   );
+  if (canonicalJsonSha256({ tables: currentSchema, requiredObjects: currentRequiredObjects })
+    !== artifact.plan.schema.digest) {
+    throw new Error('CRM duplicate consolidation final-state complete schema drift.');
+  }
   const relations = database.prepare(`
     SELECT * FROM crm_submission_supersessions
     WHERE repair_manifest_id = ? ORDER BY id
@@ -3301,6 +3306,20 @@ function crmDuplicateConsolidationFinalState(database, { artifact, actor, reason
     throw new Error('CRM duplicate consolidation postcondition integrity check failed.');
   }
   return { relations, berlinImport, receipt, quickCheck, foreignKeyViolationCount: 0, valid: true };
+}
+
+function assertCrmDuplicateConsolidationProtectedTables(database, authorityTableDigests, phase) {
+  for (const [table, expected] of Object.entries(authorityTableDigests)) {
+    if (['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests'].includes(table)) continue;
+    const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
+      .sort((left, right) => compareCrmDuplicateConsolidationText(
+        stableCrmDuplicateConsolidationJson(left),
+        stableCrmDuplicateConsolidationJson(right),
+      ));
+    if (rows.length !== expected.rowCount || canonicalJsonSha256(rows) !== expected.digest) {
+      throw new Error(`CRM duplicate consolidation ${phase}: ${table}.`);
+    }
+  }
 }
 
 export function createSqliteCrmDuplicateConsolidationReadOnlyStorage(config, {
@@ -10211,17 +10230,9 @@ export function createSqliteStorage(config, options = {}) {
           const finalState = crmDuplicateConsolidationFinalState(database, {
             artifact, actor, reason, backup,
           });
-          for (const [table, expected] of Object.entries(artifact.plan.authorityTableDigests)) {
-            if (['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests'].includes(table)) continue;
-            const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
-              .sort((left, right) => compareCrmDuplicateConsolidationText(
-                stableCrmDuplicateConsolidationJson(left),
-                stableCrmDuplicateConsolidationJson(right),
-              ));
-            if (rows.length !== expected.rowCount || canonicalJsonSha256(rows) !== expected.digest) {
-              throw new Error(`CRM duplicate consolidation replay protected-table drift: ${table}.`);
-            }
-          }
+          assertCrmDuplicateConsolidationProtectedTables(
+            database, artifact.plan.authorityTableDigests, 'replay protected-table drift',
+          );
           return {
             status: 'verified-prior-apply',
             mode: 'apply',
@@ -10403,17 +10414,9 @@ export function createSqliteStorage(config, options = {}) {
         const finalState = crmDuplicateConsolidationFinalState(database, {
           artifact, actor, reason, backup,
         });
-        for (const [table, expected] of Object.entries(artifact.plan.authorityTableDigests)) {
-          if (['crm_submission_supersessions', 'deal_hunter_crm_imports', 'deal_hunter_cim_repair_manifests'].includes(table)) continue;
-          const rows = database.prepare(`SELECT * FROM ${quoteCrmDuplicateConsolidationIdentifier(table)}`).all()
-            .sort((left, right) => compareCrmDuplicateConsolidationText(
-              stableCrmDuplicateConsolidationJson(left),
-              stableCrmDuplicateConsolidationJson(right),
-            ));
-          if (rows.length !== expected.rowCount || canonicalJsonSha256(rows) !== expected.digest) {
-            throw new Error(`CRM duplicate consolidation prohibited-table postcondition failed: ${table}.`);
-          }
-        }
+        assertCrmDuplicateConsolidationProtectedTables(
+          database, artifact.plan.authorityTableDigests, 'prohibited-table postcondition failed',
+        );
         if (testHooks?.forcePostconditionFailure === true) {
           throw new Error('Injected postcondition failure.');
         }

@@ -226,6 +226,22 @@ test('V3 schema includes volatile tables and changes on each DDL', async (t) => 
   }
 });
 
+test('V3 postcondition schema authority detects each excluded table DDL even when required objects and row authority agree', async (t) => {
+  for (const table of CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES) {
+    await t.test(table, async (subtest) => {
+      const fixture = await createFixture(subtest);
+      const before = await inspect(fixture);
+      rawDatabase(fixture.sqlitePath, (db) => db.exec(`ALTER TABLE ${table} ADD COLUMN v3_postcondition_probe TEXT`));
+      const after = await inspect(fixture);
+      assert.deepEqual(after.schema.requiredObjects, before.schema.requiredObjects);
+      assert.notEqual(after.schema.digest, before.schema.digest);
+      assert.equal(after.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
+      assert.deepEqual(after.authorityTableDigests, before.authorityTableDigests);
+      assert.deepEqual(after.rawRows, before.rawRows);
+    });
+  }
+});
+
 test('V3 unrelated authoritative row update and insert change authority', async (t) => {
   const fixture = await createFixture(t);
   const before = await inspect(fixture);
