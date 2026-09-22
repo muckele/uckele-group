@@ -17,6 +17,7 @@ import {
   CRM_DUPLICATE_CONSOLIDATION_PLAN_SCHEMA,
   CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
   CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+  CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES,
   getCrmDuplicateConsolidationDescriptor,
   stableCanonicalJson,
 } from '../server/repairs/crmDuplicateConsolidation.js';
@@ -474,7 +475,9 @@ test('ordinary CI uses a clearly labeled synthetic Berlin identity and the fixed
     assert.equal(first.blockers.includes('berlin-canonical-import-identity-drift'), false);
     assert.equal(first.blockers.includes('berlin-legacy-import-identity-drift'), true);
     assert.equal(first.blockers.some((blocker) => /listing-pooler|financial-.*-pooler/i.test(blocker)), false);
-    assert.equal(first.database.logicalDigest, canonicalDigest(before));
+    assert.equal(first.database.authorityLogicalDigest, canonicalDigest(Object.fromEntries(
+      Object.entries(before).filter(([name]) => !CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES.includes(name)),
+    )));
   } finally {
     readOnly.close();
   }

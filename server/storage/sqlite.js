@@ -54,6 +54,7 @@ import {
   CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
   CRM_DUPLICATE_CONSOLIDATION_REPAIR_TYPE,
   CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
+  CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES,
   crmDuplicateConsolidationFinancialEvidenceMatches,
   crmDuplicateConsolidationManifestId,
   crmDuplicateConsolidationRawStringMatchesSha256,
@@ -2524,14 +2525,23 @@ function assertCrmDuplicateConsolidationRequiredObjects(database, expected, phas
 function crmDuplicateConsolidationDatabaseState(database) {
   const schema = crmDuplicateConsolidationSchema(database);
   const requiredObjects = crmDuplicateConsolidationRequiredObjects(database);
-  let totalRows = 0;
-  const rowsByTable = {};
-  const tableDigests = {};
-  for (const table of schema) {
+  const schemaNames = new Set(schema.map((table) => table.name));
+  for (const name of CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES) {
+    if (!schemaNames.has(name)) {
+      throw new Error(`CRM duplicate consolidation required schema table missing: ${name}.`);
+    }
+  }
+  const authoritativeTables = schema.filter((table) => (
+    !CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES.includes(table.name)
+  ));
+  let authorityTotalRows = 0;
+  const rowsByAuthoritativeTable = {};
+  const authorityTableDigests = {};
+  for (const table of authoritativeTables) {
     const quotedTable = quoteCrmDuplicateConsolidationIdentifier(table.name);
     const count = Number(database.prepare(`SELECT COUNT(*) AS count FROM ${quotedTable}`).get()?.count || 0);
-    totalRows += count;
-    if (totalRows > crmDuplicateConsolidationMaximumRows) {
+    authorityTotalRows += count;
+    if (authorityTotalRows > crmDuplicateConsolidationMaximumRows) {
       throw new Error('CRM duplicate consolidation inspection row bound exceeded.');
     }
     const rows = database.prepare(`SELECT * FROM ${quotedTable}`).all()
@@ -2539,8 +2549,8 @@ function crmDuplicateConsolidationDatabaseState(database) {
         stableCrmDuplicateConsolidationJson(left),
         stableCrmDuplicateConsolidationJson(right),
       ));
-    rowsByTable[table.name] = rows;
-    tableDigests[table.name] = {
+    rowsByAuthoritativeTable[table.name] = rows;
+    authorityTableDigests[table.name] = {
       rowCount: rows.length,
       digest: canonicalJsonSha256(rows),
     };
@@ -2549,10 +2559,11 @@ function crmDuplicateConsolidationDatabaseState(database) {
     schema,
     requiredObjects,
     schemaDigest: canonicalJsonSha256({ tables: schema, requiredObjects }),
-    rowsByTable,
-    tableDigests,
-    logicalDigest: canonicalJsonSha256(rowsByTable),
-    totalRows,
+    rowsByAuthoritativeTable,
+    rowsByTable: rowsByAuthoritativeTable,
+    authorityTableDigests,
+    authorityLogicalDigest: canonicalJsonSha256(rowsByAuthoritativeTable),
+    authorityTotalRows,
   };
 }
 
@@ -3122,8 +3133,8 @@ function inspectCrmDuplicateConsolidationState(database, { connection, configAut
     },
     blockers: [...new Set(blockers)].sort(),
     database: {
-      logicalDigest: state.logicalDigest,
-      totalRows: state.totalRows,
+      authorityLogicalDigest: state.authorityLogicalDigest,
+      authorityTotalRows: state.authorityTotalRows,
       quickCheck: String(database.pragma('quick_check', { simple: true }) || ''),
       foreignKeyViolationCount: database.pragma('foreign_key_check').length,
     },
@@ -3138,7 +3149,8 @@ function inspectCrmDuplicateConsolidationState(database, { connection, configAut
     },
     relationshipInventory: referenceInventory.entries,
     referenceIdentifiers: referenceInventory.identifiers,
-    tableDigests: state.tableDigests,
+    authorityTableDigests: state.authorityTableDigests,
+    tableDigests: state.authorityTableDigests,
     rawRows,
     safety,
     runtimeSafetyAuthority,
