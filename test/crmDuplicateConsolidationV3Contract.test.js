@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 
@@ -13,14 +14,19 @@ import {
   CRM_DUPLICATE_CONSOLIDATION_MANIFEST_SCHEMA,
   CRM_DUPLICATE_CONSOLIDATION_REPAIR_VERSION,
   CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
+  buildCrmDuplicateConsolidationPlan,
   canonicalJsonSha256,
 } from '../server/repairs/crmDuplicateConsolidation.js';
 import { verifyCrmDuplicateConsolidationReviewedArtifact } from '../server/services/crmDuplicateConsolidationRepair.js';
 import { createSqliteCrmDuplicateConsolidationReadOnlyStorage } from '../server/storage/sqlite.js';
 import {
+  ACTOR,
   createFixture,
   NOW,
   POOLER,
+  REASON,
+  RELEASE,
+  TOOLING,
   rawDatabase,
   syntheticReviewedArtifactFixture,
 } from './crmDuplicateConsolidationRepair.test.js';
@@ -52,6 +58,78 @@ function insertMany(db, table, count) {
     SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < ?
   ) INSERT INTO ${table} (value) SELECT n FROM seq`).run(count);
 }
+
+async function createVolatileParity(fixture) {
+  const parityBackupPath = path.join(fixture.root, 'v3-parity-backup.sqlite');
+  rawDatabase(fixture.sqlitePath, (db) => {
+    db.exec('DELETE FROM analytics_events; DELETE FROM contact_rate_limit_events;');
+    for (let i = 0; i < 137; i += 1) db.prepare(`INSERT INTO analytics_events
+      (id, created_at, event_name, path) VALUES (?, ?, 'page_view', '/fixture')`)
+      .run(`a-${i}`, NOW);
+    for (let i = 0; i < 105; i += 1) db.prepare(`INSERT INTO contact_rate_limit_events
+      (bucket, created_at) VALUES ('fixture', ?)`).run(NOW);
+  });
+  await fixture.storage.createApplicationBackup(parityBackupPath);
+  rawDatabase(fixture.sqlitePath, (db) => {
+    for (let i = 137; i < 140; i += 1) db.prepare(`INSERT INTO analytics_events
+      (id, created_at, event_name, path) VALUES (?, ?, 'page_view', '/fixture')`)
+      .run(`a-${i}`, NOW);
+    for (let i = 105; i < 107; i += 1) db.prepare(`INSERT INTO contact_rate_limit_events
+      (bucket, created_at) VALUES ('fixture', ?)`).run(NOW);
+  });
+  const backup = await inspect({ ...fixture, config: {
+    ...fixture.config, storage: { ...fixture.config.storage, sqlitePath: parityBackupPath },
+  } });
+  return { parityBackupPath, backup };
+}
+
+function plannedChecksum(fixture, inspection) {
+  return buildCrmDuplicateConsolidationPlan({
+    inspection: { ...inspection, blockers: [] },
+    actor: ACTOR,
+    reason: REASON,
+    executionRelease: RELEASE,
+    toolingRevision: TOOLING,
+    recoveryCheckpoint: fixture.recoveryCheckpoint,
+  }).planChecksum;
+}
+
+test('V3 sanitized 137/105 to 140/107 parity leaves reviewed authority equal', async (t) => {
+  const fixture = await createFixture(t);
+  const { parityBackupPath, backup } = await createVolatileParity(fixture);
+  const live = await inspect(fixture);
+  assert.equal(live.database.authorityLogicalDigest, backup.database.authorityLogicalDigest);
+  assert.deepEqual(live.authorityTableDigests, backup.authorityTableDigests);
+  assert.equal(live.schema.digest, backup.schema.digest);
+  assert.equal(live.database.authorityTotalRows, backup.database.authorityTotalRows);
+  assert.equal(plannedChecksum(fixture, live), plannedChecksum(fixture, backup));
+  const counts = (sqlitePath) => rawDatabase(sqlitePath, (db) => ({
+    analytics: db.prepare('SELECT COUNT(*) AS count FROM analytics_events').get().count,
+    rateLimit: db.prepare('SELECT COUNT(*) AS count FROM contact_rate_limit_events').get().count,
+  }), { readonly: true });
+  assert.deepEqual(counts(parityBackupPath), { analytics: 137, rateLimit: 105 });
+  assert.deepEqual(counts(fixture.sqlitePath), { analytics: 140, rateLimit: 107 });
+});
+
+test('V3 backup authoritative-row drift changes reviewed authority', async (t) => {
+  const fixture = await createFixture(t);
+  const { backup } = await createVolatileParity(fixture);
+  rawDatabase(fixture.sqlitePath, (db) => db.prepare(`UPDATE deal_hunter_opportunities
+    SET canonical_name = ? WHERE opportunity_id = ?`).run('changed', POOLER.opportunityId));
+  const live = await inspect(fixture);
+  assert.notEqual(live.database.authorityLogicalDigest, backup.database.authorityLogicalDigest);
+  assert.notEqual(plannedChecksum(fixture, live), plannedChecksum(fixture, backup));
+});
+
+test('V3 backup schema drift in excluded table changes reviewed schema', async (t) => {
+  const fixture = await createFixture(t);
+  const { backup } = await createVolatileParity(fixture);
+  rawDatabase(fixture.sqlitePath, (db) => db.exec('ALTER TABLE analytics_events ADD COLUMN v3_probe TEXT'));
+  const live = await inspect(fixture);
+  assert.equal(live.database.authorityLogicalDigest, backup.database.authorityLogicalDigest);
+  assert.notEqual(live.schema.digest, backup.schema.digest);
+  assert.notEqual(plannedChecksum(fixture, live), plannedChecksum(fixture, backup));
+});
 
 test('V3 authoritative digest and count ignore both volatile tables', async (t) => {
   for (const variant of [{ analytics: true }, { rateLimit: true }, { analytics: true, rateLimit: true }]) {

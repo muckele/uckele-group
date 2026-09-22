@@ -10109,13 +10109,13 @@ export function createSqliteStorage(config, options = {}) {
           },
         });
         if (planned.planChecksum !== artifact.planChecksum
-          || inspection.database.logicalDigest !== artifact.plan.database.logicalDigest
+          || inspection.database.authorityLogicalDigest !== artifact.plan.database.authorityLogicalDigest
           || inspection.schema.digest !== artifact.plan.schema.digest) {
-          throw new Error('backup does not reproduce the reviewed plan and raw database digest');
+          throw new Error('backup does not reproduce the reviewed V3 plan and authoritative database digest');
         }
         const verification = Object.freeze({
           planChecksum: planned.planChecksum,
-          databaseLogicalDigest: inspection.database.logicalDigest,
+          databaseAuthorityLogicalDigest: inspection.database.authorityLogicalDigest,
           schemaDigest: inspection.schema.digest,
         });
         crmDuplicateConsolidationBackupVerifications.set(verification, {

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import test from 'node:test';
 
 import { CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION } from '../server/repairs/crmDuplicateConsolidation.js';
+import { applyCrmDuplicateConsolidation } from '../server/services/crmDuplicateConsolidationRepair.js';
 import { createSqliteCrmDuplicateConsolidationReadOnlyStorage } from '../server/storage/sqlite.js';
 import {
   ACTOR,
@@ -433,4 +434,48 @@ test('SQLite apply sink independently rejects missing confirmation and forged ba
       assert.deepEqual(logicalSnapshot(fixture.sqlitePath), before);
     });
   }
+});
+
+test('V3 service accepts authority-only backup verification shape before apply gate', async (t) => {
+  const fixture = await createFixture(t);
+  const artifact = await syntheticReviewedArtifactFixture(fixture);
+  const storage = {
+    provider: 'sqlite',
+    getCrmDuplicateConsolidationConfigAuthority: () => fixture.storage.getCrmDuplicateConsolidationConfigAuthority(),
+    verifyCrmDuplicateConsolidationBackupPlan: async () => ({
+      planChecksum: artifact.planChecksum,
+      databaseAuthorityLogicalDigest: artifact.plan.database.authorityLogicalDigest,
+    }),
+  };
+  const input = {
+    apply: true,
+    storage,
+    reviewedArtifact: artifact,
+    expectedPlanChecksum: artifact.planChecksum,
+    expectedManifestId: artifact.manifestId,
+    backup: {
+      path: fixture.recoveryCheckpoint.backupPath,
+      manifestId: fixture.recoveryCheckpoint.backupManifestId,
+      sha256: fixture.recoveryCheckpoint.backupSha256,
+      flySnapshotId: fixture.recoveryCheckpoint.flySnapshotId,
+      flySnapshotDigest: fixture.recoveryCheckpoint.flySnapshotDigest,
+    },
+    actor: ACTOR,
+    reason: REASON,
+    executionRelease: RELEASE,
+    toolingRevision: TOOLING,
+    confirmation: CRM_DUPLICATE_CONSOLIDATION_CONFIRMATION,
+    now: new Date(NOW),
+  };
+  await assert.rejects(applyCrmDuplicateConsolidation(input), (error) => {
+    assert.deepEqual(error.blockers, ['apply-unavailable']);
+    return true;
+  });
+  storage.verifyCrmDuplicateConsolidationBackupPlan = async () => ({
+    planChecksum: artifact.planChecksum,
+  });
+  await assert.rejects(applyCrmDuplicateConsolidation(input), (error) => {
+    assert.deepEqual(error.blockers, ['backup-plan-mismatch']);
+    return true;
+  });
 });
