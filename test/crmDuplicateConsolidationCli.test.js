@@ -221,6 +221,24 @@ test('apply requires every reviewed-artifact argument and exact confirmation bef
     /exact confirmation/i,
   );
   assert.equal(writableStorageCalls, 0);
+
+  const oldV2Confirmation = [...complete];
+  oldV2Confirmation[oldV2Confirmation.indexOf('--confirm') + 1] =
+    'APPLY-UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2';
+  writableStorageCalls = 0;
+  await assert.rejects(
+    runCrmDuplicateConsolidationCli({
+      argv: oldV2Confirmation,
+      getConfigFn: () => fixture.config,
+      createWritableStorageFn: () => {
+        writableStorageCalls += 1;
+        throw new Error('writable storage must not open');
+      },
+      environment: {},
+    }),
+    /exact confirmation/i,
+  );
+  assert.equal(writableStorageCalls, 0);
 });
 
 test('apply byte-validates the reviewed artifact before opening storage and delegates only fixed authority', async (t) => {
@@ -306,9 +324,10 @@ test('apply byte-validates the reviewed artifact before opening storage and dele
   assert.equal(writableStorageCalls, 0);
 });
 
-test('operator apply and replay stdout expose only the closed safe projection', async (t) => {
+test('V3 CLI operator apply and replay stdout expose only the closed safe projection', async (t) => {
   const fixture = await createFixture(t);
   const artifact = await syntheticReviewedArtifactFixture(fixture);
+  assert.match(artifact.manifestId, /^crm-duplicate-consolidation:v3:[a-f0-9]{64}$/);
   const artifactPath = path.join(fixture.root, 'reviewed-output-boundary.json');
   fs.writeFileSync(artifactPath, stableCanonicalJson(artifact), { mode: 0o600 });
   fixture.storage.close();
@@ -504,6 +523,17 @@ test('V1 and malformed checksum-valid authority artifacts refuse before any stor
   const fixture = await createFixture(t);
   const artifact = await syntheticReviewedArtifactFixture(fixture);
   const cases = [
+    ['V2 manifest ID', (candidate) => {
+      candidate.manifestId = `crm-duplicate-consolidation:v2:${'a'.repeat(64)}`;
+    }, /manifest ID.*fixed incident/i],
+    ['V2 artifact', (candidate) => {
+      candidate.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2';
+      candidate.planSchema = 'crm-duplicate-consolidation-plan-v2';
+      candidate.manifestSchema = 'crm-duplicate-consolidation-manifest-v2';
+      candidate.plan.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V2';
+      candidate.plan.planSchema = 'crm-duplicate-consolidation-plan-v2';
+      candidate.plan.manifestSchema = 'crm-duplicate-consolidation-manifest-v2';
+    }, /schema|version/i],
     ['V1 artifact', (candidate) => {
       candidate.repairVersion = 'UG-P7-01D-CRM-DUPLICATE-CONSOLIDATION-V1';
       candidate.planSchema = 'crm-duplicate-consolidation-plan-v1';
@@ -512,6 +542,24 @@ test('V1 and malformed checksum-valid authority artifacts refuse before any stor
       candidate.plan.planSchema = 'crm-duplicate-consolidation-plan-v1';
       candidate.plan.manifestSchema = 'crm-duplicate-consolidation-manifest-v1';
     }, /schema|version/i],
+    ['missing row authority', (candidate) => {
+      delete candidate.plan.rowAuthority;
+    }, /row.authority.*policy/i],
+    ['reordered row exclusions', (candidate) => {
+      candidate.plan.rowAuthority.excludedRowTables.reverse();
+    }, /row.authority.*policy/i],
+    ['third row exclusion', (candidate) => {
+      candidate.plan.rowAuthority.excludedRowTables.push('email_events');
+    }, /row.authority.*policy/i],
+    ['legacy V2 logical digest', (candidate) => {
+      candidate.plan.database.logicalDigest = '0'.repeat(64);
+    }, /database authority shape/i],
+    ['legacy V2 total rows', (candidate) => {
+      candidate.plan.database.totalRows = 0;
+    }, /database authority shape/i],
+    ['legacy V2 table digests', (candidate) => {
+      candidate.plan.tableDigests = {};
+    }, /database authority shape/i],
     ['missing authority', (candidate) => {
       delete candidate.plan.runtimeSafetyAuthority;
     }, /runtime safety|authority|object/i],
