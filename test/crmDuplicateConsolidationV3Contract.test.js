@@ -72,6 +72,23 @@ test('V3 authoritative digest and count ignore both volatile tables', async (t) 
   }
 });
 
+test('V3 reference inventory never scans volatile incident tokens', async (t) => {
+  const fixture = await createFixture(t);
+  const before = await inspect(fixture);
+  rawDatabase(fixture.sqlitePath, (db) => {
+    db.prepare(`INSERT INTO analytics_events (id, created_at, event_name, path)
+      VALUES ('v3-reference', ?, 'page_view', ?)`).run(NOW, `/${POOLER.supersededSubmissionId}`);
+    db.prepare(`INSERT INTO contact_rate_limit_events (bucket, created_at)
+      VALUES (?, ?)`).run(POOLER.supersededSubmissionId, NOW);
+  });
+  const after = await inspect(fixture);
+  assert.deepEqual(after.relationshipInventory, before.relationshipInventory);
+  assert.deepEqual(after.referenceIdentifiers, before.referenceIdentifiers);
+  assert.ok(after.relationshipInventory.every((entry) =>
+    !['analytics_events', 'contact_rate_limit_events'].includes(entry.table)));
+  assert.equal(after.blockers.some((value) => /analytics_events|contact_rate_limit_events/.test(value)), false);
+});
+
 test('V3 schema includes volatile tables and changes on each DDL', async (t) => {
   for (const table of CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES) {
     await t.test(table, async (subtest) => {

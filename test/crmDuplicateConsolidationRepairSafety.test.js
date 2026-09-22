@@ -298,8 +298,9 @@ test('preview inventories every application TEXT column with all approved and sc
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
     ORDER BY name
   `).all().reduce((count, table) => (
-    count + database.pragma(`table_info(${JSON.stringify(table.name)})`)
+    count + (['analytics_events', 'contact_rate_limit_events'].includes(table.name) ? 0 : database.pragma(`table_info(${JSON.stringify(table.name)})`)
       .filter((column) => /TEXT/i.test(String(column.type))).length
+    )
   ), 0), { readonly: true });
   assert.equal(inspection.relationshipInventory.length, expectedTextColumnCount);
   const auditPath = inspection.relationshipInventory.find((entry) => (
@@ -339,10 +340,8 @@ test('preview blocks a positive incident reference in an unapproved TEXT authori
     `).run(JSON.stringify({ submissionId: POOLER.supersededSubmissionId }));
   });
   const error = await refusedPreview(fixture);
-  assert.ok(error.blockers.some((blocker) => (
-    /unclassified.*positive.*reference/i.test(blocker)
-      && /unexpected_live_authority\.payload/i.test(blocker)
-  )), JSON.stringify(error.blockers));
+  assert.ok(error.blockers.includes('unclassified positive incident reference: unexpected_live_authority.payload'),
+    JSON.stringify(error.blockers));
 });
 
 test('preview scans an unknown TEXT column with no incident reference without approving the surface', async (t) => {

@@ -2560,7 +2560,6 @@ function crmDuplicateConsolidationDatabaseState(database) {
     requiredObjects,
     schemaDigest: canonicalJsonSha256({ tables: schema, requiredObjects }),
     rowsByAuthoritativeTable,
-    rowsByTable: rowsByAuthoritativeTable,
     authorityTableDigests,
     authorityLogicalDigest: canonicalJsonSha256(rowsByAuthoritativeTable),
     authorityTotalRows,
@@ -2670,7 +2669,7 @@ function crmDuplicateConsolidationReferenceTokens(state) {
     pair.survivorSubmissionId,
     pair.supersededSubmissionId,
   ]));
-  for (const row of state.rowsByTable.contact_submissions || []) {
+  for (const row of state.rowsByAuthoritativeTable.contact_submissions || []) {
     if (!scopedSubmissionIds.has(row.id)) continue;
     collectCrmDuplicateConsolidationEvidenceTokens(
       parseCrmDuplicateConsolidationMetadata(row.metadata)?.dealHunter,
@@ -2681,7 +2680,7 @@ function crmDuplicateConsolidationReferenceTokens(state) {
   const scopedOpportunityIds = new Set(
     CRM_DUPLICATE_CONSOLIDATION_DESCRIPTOR.pairs.map((pair) => pair.opportunityId),
   );
-  for (const row of state.rowsByTable.deal_hunter_opportunity_aliases || []) {
+  for (const row of state.rowsByAuthoritativeTable.deal_hunter_opportunity_aliases || []) {
     if (!scopedOpportunityIds.has(row.opportunity_id)) continue;
     for (const [column, value] of Object.entries(row)) {
       if (/(?:alias|evidence|listing|deal_key)/i.test(column)
@@ -2721,7 +2720,8 @@ function crmDuplicateConsolidationReferenceInventory(state) {
   const { approved, tokens } = crmDuplicateConsolidationReferenceTokens(state);
   const references = [];
   for (const table of state.schema) {
-    const rows = state.rowsByTable[table.name] || [];
+    if (CRM_DUPLICATE_CONSOLIDATION_VOLATILE_ROW_TABLES.includes(table.name)) continue;
+    const rows = state.rowsByAuthoritativeTable[table.name];
     for (const column of table.columns) {
       if (!/TEXT/i.test(String(column.type))) continue;
       const configuredClassification = classifyCrmDuplicateConsolidationTextReference({
