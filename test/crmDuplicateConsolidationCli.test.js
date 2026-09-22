@@ -446,7 +446,7 @@ test('operator apply output projection fails closed on malformed internal result
     ['malformed manifest ID', { ...validResult, manifestId: 'manifest' }],
     ['different valid manifest ID', {
       ...validResult,
-      manifestId: `crm-duplicate-consolidation:v2:${'b'.repeat(64)}`,
+      manifestId: `${artifact.manifestId.slice(0, -1)}${artifact.manifestId.endsWith('a') ? 'b' : 'a'}`,
     }],
     ['malformed plan checksum', { ...validResult, planChecksum: 'a'.repeat(63) }],
     ['different valid plan checksum', { ...validResult, planChecksum: 'c'.repeat(64) }],
@@ -467,6 +467,10 @@ test('operator apply output projection fails closed on malformed internal result
 
   for (const [name, internalResult] of cases) {
     await t.test(name, async () => {
+      if (name === 'different valid manifest ID') {
+        assert.match(internalResult.manifestId, /^crm-duplicate-consolidation:v3:[a-f0-9]{64}$/);
+        assert.notEqual(internalResult.manifestId, artifact.manifestId);
+      }
       await assert.rejects(
         runCrmDuplicateConsolidationCli({
           argv: applyArgs(fixture, artifactPath, artifact),
