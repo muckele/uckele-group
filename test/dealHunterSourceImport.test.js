@@ -20,6 +20,27 @@ process.env.DEAL_HUNTER_AIRTABLE_VIEW_ID = 'viwTest';
 
 const originalFetch = globalThis.fetch;
 const { importDealOsExport, parseSheetCsvDeals, reviewDailyDeals } = await import('../server/services/dealHunter.js');
+
+test('source parsing retains bounded date and financial provenance before aliases collapse', () => {
+  const [deal] = parseSheetCsvDeals([
+    'Listing ID,Business Name,Listing URL,Posted Date,Annual Profit,Annual Revenue,Asking Price',
+    'PROVENANCE-1,Provenance Shop,https://example.test/provenance,2026-09-22,450000,900000,800000',
+  ].join('\n')).deals;
+  assert.equal(deal.freshnessEvidence.dateAdded.rawHeader, 'Posted Date');
+  assert.equal(deal.freshnessEvidence.dateAdded.rawValue, '2026-09-22');
+  assert.equal(deal.freshnessEvidence.dateAdded.precision, 'date');
+  assert.equal(deal.freshnessEvidence.dateAdded.meaning, 'unknown');
+  assert.equal(deal.freshnessEvidence.annualProfit.rawHeader, 'Annual Profit');
+  assert.equal(deal.freshnessEvidence.annualProfit.metric, 'unknown');
+  assert.equal(deal.freshnessEvidence.annualProfit.currency, 'unknown');
+  assert.equal(deal.freshnessEvidence.annualProfit.period, 'unknown');
+  assert.ok(JSON.stringify(deal.freshnessEvidence).length < 1500);
+  const snapshot = buildOpportunitySourceObservationSnapshot({
+    opportunityId: 'opp-provenance-1', deal, now: '2026-09-23T12:00:00.000Z',
+  });
+  assert.equal(snapshot.freshness_evidence.dateAdded.rawHeader, 'Posted Date');
+  assert.equal(snapshot.freshness_evidence.annualProfit.metric, 'unknown');
+});
 let sourceCsv;
 let sourceWorkbook;
 let airtableFetchCount;

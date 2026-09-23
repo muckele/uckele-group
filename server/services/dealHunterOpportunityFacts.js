@@ -187,6 +187,41 @@ function sourceObservationDigest(value) {
   return createHash('sha256').update(String(value)).digest('hex');
 }
 
+function normalizeFreshnessClaim(claim, kind) {
+  if (claim === null || claim === undefined) return null;
+  if (!claim || typeof claim !== 'object' || Array.isArray(claim)) throw new Error('Freshness source claim must be bounded.');
+  const rawHeader = normalizeText(claim.rawHeader, 'Freshness source header', { maxLength: 100 });
+  const rawValue = normalizeText(claim.rawValue, 'Freshness source value', { maxLength: 200 });
+  if (kind === 'date') {
+    const precision = normalizeText(claim.precision, 'Freshness date precision', { maxLength: 16 });
+    const meaning = normalizeText(claim.meaning, 'Freshness date meaning', { maxLength: 32 });
+    if (!['date', 'datetime', 'unknown'].includes(precision) || meaning !== 'unknown') {
+      throw new Error('Unsupported freshness publication interpretation.');
+    }
+    const offset = normalizeText(claim.offset, 'Freshness date offset', { required: false, maxLength: 16 });
+    return { rawHeader, rawValue, precision, offset, meaning };
+  }
+  const metric = normalizeText(claim.metric, 'Freshness financial metric', { maxLength: 80 });
+  const currency = normalizeText(claim.currency, 'Freshness financial currency', { maxLength: 16 });
+  const period = normalizeText(claim.period, 'Freshness financial period', { maxLength: 80 });
+  return { rawHeader, rawValue, metric, currency, period };
+}
+
+export function normalizeSourceFreshnessEvidence(evidence) {
+  if (evidence === null || evidence === undefined) return null;
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence) || Buffer.isBuffer(evidence)) {
+    throw new Error('Freshness evidence must be a bounded object.');
+  }
+  const allowed = new Set(['dateAdded', 'annualProfit', 'annualRevenue', 'askingPrice']);
+  if (Object.keys(evidence).some((key) => !allowed.has(key))) throw new Error('Unsupported freshness evidence field.');
+  return {
+    dateAdded: normalizeFreshnessClaim(evidence.dateAdded, 'date'),
+    annualProfit: normalizeFreshnessClaim(evidence.annualProfit, 'financial'),
+    annualRevenue: normalizeFreshnessClaim(evidence.annualRevenue, 'financial'),
+    askingPrice: normalizeFreshnessClaim(evidence.askingPrice, 'financial'),
+  };
+}
+
 function sourceObservationRecordId(deal = {}) {
   const sourceId = String(deal.sourceId || '').trim();
   const externalId = String(deal.id || '').trim();
@@ -228,6 +263,9 @@ export function normalizeOpportunitySourceObservationSnapshot(snapshot = {}) {
     source_record_id: normalizeText(snapshot.source_record_id, 'Opportunity source record id', { maxLength: 200 }),
     observations: (Array.isArray(snapshot.observations) ? snapshot.observations : []).map(normalizeOpportunitySourceObservation),
   };
+  if (snapshot.freshness_evidence !== undefined) {
+    normalized.freshness_evidence = normalizeSourceFreshnessEvidence(snapshot.freshness_evidence);
+  }
   if (normalized.observations.length > opportunitySourceObservationFields.length) {
     throw new Error('Opportunity source-observation snapshot has too many fields.');
   }
@@ -325,6 +363,7 @@ export function buildOpportunitySourceObservationSnapshot({ opportunityId, deal,
     source_name: sourceName,
     source_record_id: sourceRecordId,
     observations,
+    ...(deal?.freshnessEvidence ? { freshness_evidence: deal.freshnessEvidence } : {}),
   });
 }
 

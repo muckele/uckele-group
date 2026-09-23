@@ -539,7 +539,12 @@ function normalizeDealHunterOpportunityFactRow(row) {
 }
 
 function normalizeDealHunterOpportunitySourceObservationRow(row) {
-  return row ? { ...row } : null;
+  if (!row) return null;
+  const freshnessColumns = new Set([
+    'accepted_at', 'accepted_run_id', 'accepted_evidence_id', 'publication_raw_header',
+    'publication_raw_value', 'publication_precision', 'publication_offset', 'publication_meaning',
+  ]);
+  return Object.fromEntries(Object.entries(row).filter(([column, value]) => !freshnessColumns.has(column) || value !== null));
 }
 
 function normalizeDealHunterOpportunityRow(row) {

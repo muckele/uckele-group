@@ -716,7 +716,12 @@ function normalizeDealHunterOpportunityFactRow(row) {
 }
 
 function normalizeDealHunterOpportunitySourceObservationRow(row) {
-  return row ? { ...row } : null;
+  if (!row) return null;
+  const freshnessColumns = new Set([
+    'accepted_at', 'accepted_run_id', 'accepted_evidence_id', 'publication_raw_header',
+    'publication_raw_value', 'publication_precision', 'publication_offset', 'publication_meaning',
+  ]);
+  return Object.fromEntries(Object.entries(row).filter(([column, value]) => !freshnessColumns.has(column) || value !== null));
 }
 
 function normalizeDealHunterOpportunityAliasRow(row) {
@@ -1576,6 +1581,19 @@ export function inspectCanonicalMergeDependentState(database, approval) {
   const sourceObservations = selectCanonicalMergeRows(database, 'deal_hunter_opportunity_source_observations', [
     { column: 'opportunity_id', values: opportunityIds },
   ]);
+  const directFreshnessEvidence = selectCanonicalMergeRows(database, 'deal_hunter_freshness_evidence', [
+    { column: 'original_canonical_id', values: opportunityIds },
+    { column: 'current_canonical_id', values: opportunityIds },
+    { column: 'identity_exception_id', values: [approval.exceptionId] },
+    { column: 'binding_audit_id', values: [approval.exceptionId] },
+    { column: 'source_record_id', values: listingIdentities },
+  ]);
+  const referencedFreshnessEvidence = selectCanonicalMergeRows(database, 'deal_hunter_freshness_evidence', [
+    { column: 'before_evidence_id', values: directFreshnessEvidence.map((row) => row.id) },
+    { column: 'after_evidence_id', values: directFreshnessEvidence.map((row) => row.id) },
+  ]);
+  const freshnessEvidence = [...new Map([...directFreshnessEvidence, ...referencedFreshnessEvidence]
+    .map((row) => [row.id, row])).values()];
   const contactSubmissions = selectCanonicalMergeRows(database, 'contact_submissions', [
     { column: 'deal_hunter_opportunity_id', values: opportunityIds },
     { column: 'listing_url', values: listingUrls },
@@ -1738,6 +1756,7 @@ export function inspectCanonicalMergeDependentState(database, approval) {
     scoreEvidence: canonicalMergeRecordIds('deal_hunter_score_evidence', scoreEvidence),
     operatorFacts: canonicalMergeRecordIds('deal_hunter_opportunity_facts', operatorFacts),
     sourceObservations: canonicalMergeRecordIds('deal_hunter_opportunity_source_observations', sourceObservations),
+    freshnessEvidence: canonicalMergeRecordIds('deal_hunter_freshness_evidence', freshnessEvidence),
     contactSubmissions: canonicalMergeRecordIds('contact_submissions', contactSubmissions),
     crmImports: canonicalMergeRecordIds('deal_hunter_crm_imports', crmImports),
     crmReconciliationItems: canonicalMergeRecordIds('deal_hunter_crm_reconciliation_items', crmReconciliationItems),
@@ -3752,6 +3771,8 @@ export function createSqliteStorage(config, options = {}) {
       listing_url_count INTEGER NOT NULL DEFAULT 0,
       coverage_limit_reached INTEGER NOT NULL DEFAULT 0,
       records TEXT NOT NULL DEFAULT '[]',
+      freshness_generation INTEGER CHECK(freshness_generation IS NULL OR freshness_generation > 0),
+      freshness_projection_state TEXT CHECK(freshness_projection_state IS NULL OR freshness_projection_state IN ('pending', 'accepted', 'deferred', 'superseded')),
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
@@ -3871,6 +3892,8 @@ export function createSqliteStorage(config, options = {}) {
         reviewed_by TEXT,
         reviewed_fingerprint TEXT,
         reviewed_semantic_digest TEXT,
+        reviewed_discovery_revision INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_discovery_revision >= 0),
+        reviewed_material_revision INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_material_revision >= 0),
         operator_updated_at TEXT
       );
 
@@ -3941,7 +3964,14 @@ export function createSqliteStorage(config, options = {}) {
         primary_submission_id TEXT,
         identity_version TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'active',
-        metadata TEXT NOT NULL DEFAULT '{}'
+        first_accepted_at TEXT,
+        first_discovery_evidence_id TEXT,
+        discovery_state TEXT NOT NULL DEFAULT 'untracked_legacy' CHECK(discovery_state IN ('untracked_legacy', 'pending', 'known_prospective', 'known_recovered')),
+        discovery_revision INTEGER NOT NULL DEFAULT 0 CHECK(discovery_revision >= 0),
+        material_revision INTEGER NOT NULL DEFAULT 0 CHECK(material_revision >= 0),
+        last_material_change_at TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        FOREIGN KEY(first_discovery_evidence_id) REFERENCES deal_hunter_freshness_evidence(id) ON DELETE RESTRICT
       );
 
       -- Operator corrections create a new immutable revision ID so history
@@ -4018,6 +4048,14 @@ export function createSqliteStorage(config, options = {}) {
         field TEXT NOT NULL,
         value TEXT NOT NULL,
         observed_at TEXT NOT NULL,
+        accepted_at TEXT,
+        accepted_run_id TEXT CHECK(accepted_run_id IS NULL OR length(accepted_run_id) BETWEEN 1 AND 200),
+        accepted_evidence_id TEXT CHECK(accepted_evidence_id IS NULL OR length(accepted_evidence_id) BETWEEN 1 AND 240),
+        publication_raw_header TEXT CHECK(publication_raw_header IS NULL OR length(publication_raw_header) <= 100),
+        publication_raw_value TEXT CHECK(publication_raw_value IS NULL OR length(publication_raw_value) <= 200),
+        publication_precision TEXT CHECK(publication_precision IS NULL OR publication_precision IN ('unknown', 'date', 'instant')),
+        publication_offset TEXT CHECK(publication_offset IS NULL OR length(publication_offset) <= 16),
+        publication_meaning TEXT CHECK(publication_meaning IS NULL OR publication_meaning IN ('unknown', 'listing_publication')),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(opportunity_id, source_id, source_record_id, field),
@@ -4039,8 +4077,90 @@ export function createSqliteStorage(config, options = {}) {
           )
           AND length(trim(value)) BETWEEN 1 AND 5000 AND value = trim(value)
         ),
-        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE,
+        FOREIGN KEY(accepted_evidence_id) REFERENCES deal_hunter_freshness_evidence(id) ON DELETE RESTRICT
       );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_source_freshness_state (
+        source_id TEXT PRIMARY KEY CHECK(source_id = trim(source_id) AND length(source_id) BETWEEN 1 AND 160),
+        next_generation INTEGER NOT NULL DEFAULT 0 CHECK(next_generation >= 0),
+        accepted_generation INTEGER NOT NULL DEFAULT 0 CHECK(accepted_generation >= 0),
+        accepted_run_id TEXT CHECK(accepted_run_id IS NULL OR (accepted_run_id = trim(accepted_run_id) AND length(accepted_run_id) BETWEEN 1 AND 200)),
+        accepted_digest TEXT CHECK(accepted_digest IS NULL OR (length(accepted_digest) = 64 AND accepted_digest NOT GLOB '*[^0-9a-f]*')),
+        accepted_at TEXT,
+        projection_state TEXT NOT NULL DEFAULT 'idle' CHECK(projection_state IN ('idle', 'pending', 'accepted', 'deferred', 'superseded')),
+        CHECK(accepted_generation <= next_generation),
+        CHECK((accepted_generation = 0 AND accepted_run_id IS NULL AND accepted_digest IS NULL AND accepted_at IS NULL)
+          OR (accepted_generation > 0 AND accepted_run_id IS NOT NULL AND accepted_digest IS NOT NULL AND accepted_at IS NOT NULL))
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_freshness_evidence (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        source_id TEXT NOT NULL CHECK(source_id = trim(source_id) AND length(source_id) BETWEEN 1 AND 160),
+        source_name TEXT NOT NULL CHECK(source_name = trim(source_name) AND length(source_name) BETWEEN 1 AND 220),
+        source_record_id TEXT NOT NULL CHECK(source_record_id = trim(source_record_id) AND length(source_record_id) BETWEEN 1 AND 200),
+        run_id TEXT NOT NULL CHECK(run_id = trim(run_id) AND length(run_id) BETWEEN 1 AND 200),
+        generation INTEGER NOT NULL CHECK(generation > 0),
+        event_type TEXT NOT NULL CHECK(event_type IN ('accepted_source_record', 'publication_evidence', 'material_change', 'evidence_state_change')),
+        field_key TEXT NOT NULL DEFAULT '' CHECK(field_key = trim(field_key) AND length(field_key) <= 80),
+        event_ordinal INTEGER NOT NULL DEFAULT 0 CHECK(event_ordinal BETWEEN 0 AND 10000),
+        accepted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        original_canonical_id TEXT CHECK(original_canonical_id IS NULL OR length(original_canonical_id) BETWEEN 1 AND 200),
+        current_canonical_id TEXT CHECK(current_canonical_id IS NULL OR length(current_canonical_id) BETWEEN 1 AND 200),
+        identity_exception_id TEXT CHECK(identity_exception_id IS NULL OR length(identity_exception_id) BETWEEN 1 AND 240),
+        binding_audit_id TEXT CHECK(binding_audit_id IS NULL OR length(binding_audit_id) BETWEEN 1 AND 240),
+        provenance_version TEXT NOT NULL DEFAULT 'fl-01-v1' CHECK(provenance_version = trim(provenance_version) AND length(provenance_version) BETWEEN 1 AND 80),
+        raw_header TEXT CHECK(raw_header IS NULL OR length(raw_header) <= 100),
+        raw_value TEXT CHECK(raw_value IS NULL OR length(raw_value) <= 200),
+        publication_meaning TEXT NOT NULL DEFAULT 'unknown' CHECK(publication_meaning IN ('unknown', 'listing_publication')),
+        publication_date TEXT,
+        publication_instant TEXT,
+        publication_precision TEXT NOT NULL DEFAULT 'unknown' CHECK(publication_precision IN ('unknown', 'date', 'instant')),
+        publication_offset TEXT CHECK(publication_offset IS NULL OR length(publication_offset) <= 16),
+        publication_state TEXT NOT NULL DEFAULT 'unknown' CHECK(publication_state IN ('unknown', 'valid', 'invalid', 'future', 'conflict')),
+        before_value REAL,
+        after_value REAL,
+        before_evidence_id TEXT CHECK(before_evidence_id IS NULL OR length(before_evidence_id) BETWEEN 1 AND 240),
+        after_evidence_id TEXT CHECK(after_evidence_id IS NULL OR length(after_evidence_id) BETWEEN 1 AND 240),
+        metric TEXT NOT NULL DEFAULT 'unknown' CHECK(metric = trim(metric) AND length(metric) BETWEEN 1 AND 80),
+        currency TEXT NOT NULL DEFAULT 'unknown' CHECK(currency = trim(currency) AND length(currency) BETWEEN 1 AND 16),
+        period TEXT NOT NULL DEFAULT 'unknown' CHECK(period = trim(period) AND length(period) BETWEEN 1 AND 80),
+        classification TEXT CHECK(classification IS NULL OR classification IN ('new_evidence', 'conflict', 'selected_source_swap', 'disappearance', 'comparable_change')),
+        material_revision INTEGER CHECK(material_revision IS NULL OR material_revision >= 0),
+        UNIQUE(run_id, source_id, source_record_id, event_type, field_key, event_ordinal)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_freshness_evidence_canonical_time
+        ON deal_hunter_freshness_evidence(current_canonical_id, accepted_at DESC, id);
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_freshness_evidence_source_record_time
+        ON deal_hunter_freshness_evidence(source_id, source_record_id, accepted_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_freshness_evidence_run_source_record
+        ON deal_hunter_freshness_evidence(run_id, source_id, source_record_id);
+      CREATE TRIGGER IF NOT EXISTS deal_hunter_freshness_evidence_no_payload_update
+      BEFORE UPDATE OF id, source_id, source_name, source_record_id, run_id, generation,
+        event_type, field_key, event_ordinal, accepted_at, original_canonical_id,
+        identity_exception_id, provenance_version, raw_header, raw_value,
+        publication_meaning, publication_date, publication_instant, publication_precision,
+        publication_offset, publication_state, before_value, after_value,
+        before_evidence_id, after_evidence_id, metric, currency, period,
+        classification, material_revision
+      ON deal_hunter_freshness_evidence
+      BEGIN
+        SELECT RAISE(ABORT, 'freshness evidence payload is immutable');
+      END;
+      CREATE TRIGGER IF NOT EXISTS deal_hunter_freshness_evidence_guard_binding
+      BEFORE UPDATE OF current_canonical_id, binding_audit_id ON deal_hunter_freshness_evidence
+      WHEN NEW.current_canonical_id IS OLD.current_canonical_id
+        OR NEW.binding_audit_id IS NULL
+        OR NEW.binding_audit_id IS OLD.binding_audit_id
+      BEGIN
+        SELECT RAISE(ABORT, 'freshness binding requires a new audit reference');
+      END;
+      CREATE TRIGGER IF NOT EXISTS deal_hunter_freshness_evidence_no_delete
+      BEFORE DELETE ON deal_hunter_freshness_evidence
+      BEGIN
+        SELECT RAISE(ABORT, 'freshness evidence is retained');
+      END;
 
       CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_aliases (
         id TEXT PRIMARY KEY,
@@ -4775,6 +4895,48 @@ export function createSqliteStorage(config, options = {}) {
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'opportunity_id', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'semantic_digest', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_semantic_digest', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_discovery_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_discovery_revision >= 0)');
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_material_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_material_revision >= 0)');
+  ensureColumn(database, 'deal_hunter_opportunities', 'first_accepted_at', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunities', 'first_discovery_evidence_id', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunities', 'discovery_state', "TEXT NOT NULL DEFAULT 'untracked_legacy' CHECK(discovery_state IN ('untracked_legacy', 'pending', 'known_prospective', 'known_recovered'))");
+  ensureColumn(database, 'deal_hunter_opportunities', 'discovery_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(discovery_revision >= 0)');
+  ensureColumn(database, 'deal_hunter_opportunities', 'material_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(material_revision >= 0)');
+  ensureColumn(database, 'deal_hunter_opportunities', 'last_material_change_at', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'accepted_at', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'accepted_run_id', 'TEXT CHECK(accepted_run_id IS NULL OR length(accepted_run_id) BETWEEN 1 AND 200)');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'accepted_evidence_id', 'TEXT CHECK(accepted_evidence_id IS NULL OR length(accepted_evidence_id) BETWEEN 1 AND 240)');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'publication_raw_header', 'TEXT CHECK(publication_raw_header IS NULL OR length(publication_raw_header) <= 100)');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'publication_raw_value', 'TEXT CHECK(publication_raw_value IS NULL OR length(publication_raw_value) <= 200)');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'publication_precision', "TEXT CHECK(publication_precision IS NULL OR publication_precision IN ('unknown', 'date', 'instant'))");
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'publication_offset', 'TEXT CHECK(publication_offset IS NULL OR length(publication_offset) <= 16)');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'publication_meaning', "TEXT CHECK(publication_meaning IS NULL OR publication_meaning IN ('unknown', 'listing_publication'))");
+  ensureColumn(database, 'deal_hunter_deal_os_imports', 'freshness_generation', 'INTEGER CHECK(freshness_generation IS NULL OR freshness_generation > 0)');
+  ensureColumn(database, 'deal_hunter_deal_os_imports', 'freshness_projection_state', "TEXT CHECK(freshness_projection_state IS NULL OR freshness_projection_state IN ('pending', 'accepted', 'deferred', 'superseded'))");
+  // Older SQLite files cannot acquire an ALTER TABLE foreign key. These
+  // triggers enforce the same reference check for upgraded installations.
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS deal_hunter_first_discovery_evidence_insert_fk
+    BEFORE INSERT ON deal_hunter_opportunities
+    WHEN NEW.first_discovery_evidence_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM deal_hunter_freshness_evidence WHERE id = NEW.first_discovery_evidence_id
+    ) BEGIN SELECT RAISE(ABORT, 'unknown first discovery evidence'); END;
+    CREATE TRIGGER IF NOT EXISTS deal_hunter_first_discovery_evidence_update_fk
+    BEFORE UPDATE OF first_discovery_evidence_id ON deal_hunter_opportunities
+    WHEN NEW.first_discovery_evidence_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM deal_hunter_freshness_evidence WHERE id = NEW.first_discovery_evidence_id
+    ) BEGIN SELECT RAISE(ABORT, 'unknown first discovery evidence'); END;
+    CREATE TRIGGER IF NOT EXISTS deal_hunter_current_observation_evidence_insert_fk
+    BEFORE INSERT ON deal_hunter_opportunity_source_observations
+    WHEN NEW.accepted_evidence_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM deal_hunter_freshness_evidence WHERE id = NEW.accepted_evidence_id
+    ) BEGIN SELECT RAISE(ABORT, 'unknown current observation evidence'); END;
+    CREATE TRIGGER IF NOT EXISTS deal_hunter_current_observation_evidence_update_fk
+    BEFORE UPDATE OF accepted_evidence_id ON deal_hunter_opportunity_source_observations
+    WHEN NEW.accepted_evidence_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM deal_hunter_freshness_evidence WHERE id = NEW.accepted_evidence_id
+    ) BEGIN SELECT RAISE(ABORT, 'unknown current observation evidence'); END;
+  `);
   // Existing installations retain their last-good visible queue. Fresh tables
   // already declare DEFAULT 0 above, and score INSERTs explicitly use 0.
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'current_triage_eligible', 'INTEGER NOT NULL DEFAULT 1');

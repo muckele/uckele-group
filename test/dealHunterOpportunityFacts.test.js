@@ -200,6 +200,31 @@ function withStorage(t) {
   return storage;
 }
 
+test('legacy canonical rows remain unknown and freshness evidence has nonnullable duplicate identity', async (t) => {
+  const storage = withStorage(t);
+  await seedOpportunity(storage, 'legacy-freshness-1');
+  const db = new Database(storage.testSqlitePath);
+  t.after(() => db.close());
+  const legacyOpportunity = db.prepare('SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ?').get('legacy-freshness-1');
+  assert.equal(legacyOpportunity.discovery_state, 'untracked_legacy');
+  assert.equal(legacyOpportunity.first_accepted_at, null);
+  assert.equal(legacyOpportunity.discovery_revision, 0);
+  assert.equal(legacyOpportunity.material_revision, 0);
+  const state = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'deal_hunter_source_freshness_state'").get();
+  const evidence = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'deal_hunter_freshness_evidence'").get();
+  assert.ok(state);
+  assert.ok(evidence);
+  const insert = db.prepare(`INSERT INTO deal_hunter_freshness_evidence
+    (id, source_id, source_name, source_record_id, run_id, generation, event_type)
+    VALUES (?, 'sheet-0', 'Sheet', 'sheet-row:1', 'run-1', 1, 'accepted_source_record')`);
+  insert.run('evidence-1');
+  assert.throws(() => insert.run('evidence-2'), /UNIQUE constraint failed/);
+  assert.throws(() => db.prepare('UPDATE deal_hunter_freshness_evidence SET raw_value = ? WHERE id = ?').run('tampered', 'evidence-1'), /immutable/);
+  assert.throws(() => db.prepare('DELETE FROM deal_hunter_freshness_evidence WHERE id = ?').run('evidence-1'), /retained/);
+  assert.throws(() => db.prepare('UPDATE deal_hunter_opportunities SET first_discovery_evidence_id = ? WHERE opportunity_id = ?')
+    .run('not-an-event', 'legacy-freshness-1'), /unknown first discovery evidence/);
+});
+
 async function seedOpportunity(storage, id = opportunityId) {
   await storage.upsertDealHunterOpportunity({
     opportunity_id: id,

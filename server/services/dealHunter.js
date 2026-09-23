@@ -667,6 +667,28 @@ function getField(row, aliases) {
   return '';
 }
 
+// Keep only the source's scalar claim. The normalized date and financial
+// aliases below are useful for existing scoring, but they cannot establish
+// publication meaning or a comparable financial basis on their own.
+function boundedSourceField(row, aliases, kind) {
+  const keyed = new Map(Object.entries(row || {}).map(([header, value]) => [normalizeKey(header), { header, value }]));
+  for (const alias of aliases) {
+    const found = keyed.get(normalizeKey(alias));
+    if (!found || found.value === null || found.value === undefined || !normalizeText(found.value)) continue;
+    const rawHeader = normalizeText(found.header, 100);
+    const rawValue = normalizeText(found.value, 200);
+    if (kind === 'date') {
+      const precision = /^\d{4}-\d{2}-\d{2}$/.test(rawValue) ? 'date'
+        : /\d{1,2}:\d{2}/.test(rawValue) && Number.isFinite(Date.parse(rawValue)) ? 'datetime'
+          : 'unknown';
+      const offset = precision === 'datetime' ? (rawValue.match(/(?:Z|[+-]\d{2}:?\d{2})$/i)?.[0] || null) : null;
+      return { rawHeader, rawValue, precision, offset, meaning: 'unknown' };
+    }
+    return { rawHeader, rawValue, metric: 'unknown', currency: 'unknown', period: 'unknown' };
+  }
+  return null;
+}
+
 function containsAny(text, terms) {
   const normalized = String(text || '').toLowerCase();
   return terms.filter((term) => {
@@ -685,6 +707,12 @@ function formatLocation({ city, county, state, country }) {
 }
 
 function normalizeDealRecord(rawRow = {}, source = {}) {
+  const freshnessEvidence = {
+    dateAdded: boundedSourceField(rawRow, ['Date Added', 'Created', 'Created At', 'Added Date', 'Posted Date', 'Date Listed', 'Listing Date'], 'date'),
+    annualProfit: boundedSourceField(rawRow, ['Annual Profit', 'Cash Flow', 'SDE', 'EBITDA', 'TTM EBITDA', 'Earnings', 'Profit'], 'financial'),
+    annualRevenue: boundedSourceField(rawRow, ['Annual Revenue', 'Revenue', 'TTM Revenue', 'Sales', 'Gross Revenue'], 'financial'),
+    askingPrice: boundedSourceField(rawRow, ['Asking Price', 'Price', 'Purchase Price', 'List Price'], 'financial'),
+  };
   const listing = getField(rawRow, ['Original Broker Listing URL', 'View Listing URL', 'Listing URL', 'Deal URL', 'URL', 'Link', 'Deal Link', 'Business URL', 'View Listing', 'Listing']);
   const listingUrl = normalizeUrl(listing?.url || listing);
   const city = normalizeText(getField(rawRow, ['City']), 80);
@@ -769,6 +797,7 @@ function normalizeDealRecord(rawRow = {}, source = {}) {
     dateAdded,
     lastUpdated,
     fullText,
+    freshnessEvidence,
     raw: rawRow,
   };
 }
