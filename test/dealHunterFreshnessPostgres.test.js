@@ -174,6 +174,16 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     assert.equal(new Date(intermediate.first).toISOString(), historicalAcceptedAt);
     assert.equal(intermediate.state, 'known_recovered');
     assert.equal(intermediate.revision, 1);
+    psql(container, database, `insert into public.deal_hunter_opportunity_scores
+      (opportunity_id, scored_at, deal_key, name, fit_score, confidence,
+        score_fingerprint, engine_version, rules_version, profile_version,
+        completeness_policy_version, current_triage_eligible)
+      values ('${opportunityId}', now(), '${opportunityId}', 'Synthetic Deal OS', 86, 'high',
+        'bind-intermediate', 'test', 'test', 'test', 'test', true);`);
+    const intermediateReader = JSON.parse(psql(container, database,
+      "select public.list_deal_hunter_fresh_inbox_v1('all-active');"));
+    assert.equal(intermediateReader.areas[0].rows.find((row) => row.opportunity_id === opportunityId).new_to_ug,
+      false, 'the older accepted discovery is outside the seven-day window before A binds');
     const retrySql = `select public.bind_accepted_deal_hunter_freshness_v1(
       '${importIds[1]}'::uuid, '${opportunityId}', 'external:PG-FL01-1', 2,
       ${quoteJson(snapshot('Latest', 120))});`;
@@ -495,7 +505,14 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
       return JSON.parse(psql(container, database, `select public.accept_admitted_complete_google_sheet_freshness_v1(
         ${quote(captured.admission)}::jsonb, ${quote(captured.records)});`));
     };
+    await adapter.replaceDealHunterOpportunitySourceObservationSnapshot(record(100, '2026-09-22'));
+    const pending = JSON.parse(psql(container, database, `select jsonb_build_object(
+      'state', discovery_state, 'first', first_accepted_at) from public.deal_hunter_opportunities
+      where opportunity_id='${opportunityId}';`));
+    assert.deepEqual(pending, { state: 'pending', first: null });
     assert.equal((await accept(100, '2026-09-22')).projectionState, 'accepted');
+    assert.equal(psql(container, database, `select discovery_state from public.deal_hunter_opportunities
+      where opportunity_id='${opportunityId}';`), 'known_recovered');
     psql(container, database, `insert into public.deal_hunter_opportunity_scores
       (opportunity_id, scored_at, deal_key, name, fit_score, confidence,
         score_fingerprint, engine_version, rules_version, profile_version,
