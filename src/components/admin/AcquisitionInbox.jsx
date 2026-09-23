@@ -315,7 +315,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
     let live = true;
     async function checkOnReturn() {
       const current = queueQueryRef.current;
-      const params = new URLSearchParams({ view: 'inbox', area: current.area, pageSize: '25' });
+      const params = new URLSearchParams({ view: 'inbox', area: current.area, pageSize: '25', sort: current.sort });
       if (current.areaCursor) params.set('cursor', current.areaCursor);
       if (current.search.trim()) params.set('search', current.search.trim());
       if (current.confidence) params.set('confidence', current.confidence);

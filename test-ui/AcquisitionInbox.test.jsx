@@ -296,6 +296,48 @@ describe('Fresh-first Acquisition Inbox', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close opportunity detail' }));
     expect(sort).toHaveValue('newest-discovery');
   });
+  test.each(['newest-discovery', 'highest-fit'])(
+    '%s focus probe keeps the selected sort on first and continuation pages', async (selectedSort) => {
+      const requests = [];
+      const row = queueRow({ opportunityId: 'focus-row', name: 'Focus row' });
+      vi.stubGlobal('fetch', vi.fn(async (url) => {
+        const address = new URL(String(url), 'https://example.test');
+        requests.push(address);
+        const area = address.searchParams.get('area');
+        const sort = address.searchParams.get('sort');
+        const cursor = address.searchParams.get('cursor');
+        if (area === 'all-active' && sort !== selectedSort && requests.some((request) =>
+          request.searchParams.get('sort') === selectedSort)) {
+          return jsonResponse({ success: false }, { ok: false, status: 409 });
+        }
+        return jsonResponse(queueResponse({ view: 'inbox', areas: area === 'all-active'
+          ? [{ id: area, rows: [row], total: 2, revision: 'same', counts: {},
+            nextCursor: cursor ? null : 'sort-bound-cursor' }]
+          : [{ id: 'action-preview', rows: [], total: 0, revision: 'action', counts: {} },
+            { id: 'new-important', rows: [], total: 0, revision: 'discovery', counts: {} }] }));
+      }));
+      renderInbox({ initialView: 'inbox' });
+      const nav = await screen.findByRole('navigation', { name: 'Fresh Inbox areas' });
+      fireEvent.click(within(nav).getByRole('button', { name: 'All active' }));
+      const sort = await screen.findByRole('combobox', { name: 'Explore opportunities' });
+      fireEvent.change(sort, { target: { value: selectedSort } });
+      await waitFor(() => expect(requests.at(-1).searchParams.get('sort')).toBe(selectedSort));
+      const region = await screen.findByRole('region', { name: 'All active' });
+      let beforeFocus = requests.length;
+      fireEvent.focus(window);
+      await waitFor(() => expect(requests.length).toBeGreaterThan(beforeFocus));
+      expect(requests.at(-1).searchParams.get('sort')).toBe(selectedSort);
+      expect(screen.queryByText(/New Inbox results are available/)).not.toBeInTheDocument();
+      fireEvent.click(within(region).getByRole('button', { name: 'Next page' }));
+      await waitFor(() => expect(requests.at(-1).searchParams.get('cursor')).toBe('sort-bound-cursor'));
+      beforeFocus = requests.length;
+      fireEvent.focus(window);
+      await waitFor(() => expect(requests.length).toBeGreaterThan(beforeFocus));
+      expect(requests.at(-1).searchParams.get('sort')).toBe(selectedSort);
+      expect(requests.at(-1).searchParams.get('cursor')).toBe('sort-bound-cursor');
+      expect(screen.queryByText(/New Inbox results are available/)).not.toBeInTheDocument();
+    },
+  );
   test('due overflow and one dual-qualified canonical record stay visible in both contexts', async () => {
     const dual = queueRow({ opportunityId: 'dual', name: 'Fresh due opportunity',
       operatorPriority: 'urgent', freshness: { discoveryState: 'known_prospective',

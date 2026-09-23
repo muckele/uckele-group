@@ -634,7 +634,7 @@ test('a complete admitted Sheet run creates one prospective discovery and a no-o
     restoredScore.reviewed_material_revision], [1, 0]);
 });
 
-test('daily-first Sheet discovery stays pending until complete acceptance and is never called newly accepted', async (t) => {
+test('daily-first Sheet discovery stays unknown after complete acceptance without earlier retained proof', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-daily-first-'));
   const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'daily.sqlite') } });
   t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
@@ -649,8 +649,18 @@ test('daily-first Sheet discovery stays pending until complete acceptance and is
   assert.equal(daily.first_accepted_at, null);
   assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'fl01-r1' })).ok, true);
   const accepted = await storage.getDealHunterOpportunity(daily.opportunity_id);
-  assert.equal(accepted.discovery_state, 'known_recovered');
-  assert.ok(accepted.first_accepted_at);
+  assert.equal(accepted.discovery_state, 'untracked_legacy');
+  assert.equal(accepted.first_accepted_at, null);
+  assert.equal(accepted.first_discovery_evidence_id, null);
+  assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'fl01-r1' })).ok, true);
+  const repeated = await storage.getDealHunterOpportunity(daily.opportunity_id);
+  assert.equal(repeated.discovery_state, 'untracked_legacy');
+  assert.equal(repeated.first_accepted_at, null);
+  const inbox = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    asOf: '2026-09-23T18:00:00.000Z' });
+  const readerRow = inbox.areas[0].rows.find((row) => row.opportunity_id === daily.opportunity_id);
+  assert.ok(readerRow);
+  assert.equal(readerRow.new_to_ug, false);
 });
 
 test('real complete, daily changed, complete Sheet sequence detaches stale provenance and records the transition', async (t) => {

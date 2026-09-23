@@ -591,6 +591,27 @@ test('exploration sorts by accepted discovery or fit and refuses a cursor from a
     cursor: newest.areas[0].nextCursor, asOf }), /results changed/);
 });
 
+test('exploration ties use canonical ID after the selected key and discovery group', () => {
+  const asOf = '2026-09-23T18:00:00.000Z';
+  const rows = [
+    { opportunity_id: 'z-priority', fit_score: 88, confidence: 'high', operator_priority: 'urgent',
+      first_accepted_at: '2026-09-23T12:00:00.000Z', discovery_state: 'known_prospective', discovery_revision: 1 },
+    { opportunity_id: 'a-ordinary', fit_score: 88, confidence: 'high', operator_priority: 'normal',
+      first_accepted_at: '2026-09-23T12:00:00.000Z', discovery_state: 'known_prospective', discovery_revision: 1 },
+    { opportunity_id: 'b-older', fit_score: 88, confidence: 'high', operator_priority: 'high',
+      first_accepted_at: '2026-09-22T12:00:00.000Z', discovery_state: 'known_prospective', discovery_revision: 1 },
+  ];
+  for (const area of ['all-active', 'new-important']) {
+    for (const sort of ['newest-discovery', 'highest-fit']) {
+      const first = buildFreshInboxAreas(rows, { area, sort, limit: 1, asOf }).areas[0];
+      const second = buildFreshInboxAreas(rows, { area, sort, limit: 1,
+        cursor: first.nextCursor, asOf }).areas[0];
+      assert.deepEqual([first.rows[0].opportunity_id, second.rows[0].opportunity_id],
+        ['a-ordinary', sort === 'highest-fit' ? 'b-older' : 'z-priority']);
+    }
+  }
+});
+
 test('SQLite exploration reader retains server order, accepted earnings provenance, and sort-bound cursors', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-exploration-'));
   const sqlitePath = path.join(directory, 'exploration.sqlite');
@@ -599,9 +620,12 @@ test('SQLite exploration reader retains server order, accepted earnings provenan
   const db = new Database(sqlitePath);
   t.after(() => db.close());
   for (const [id, fit, accepted] of [
+    ['a-newest', 76, '2026-09-23T12:00:00.000Z'],
     ['newer', 80, '2026-09-23T12:00:00.000Z'],
     ['older-fit', 95, '2026-09-10T12:00:00.000Z'],
+    ['a-tie', 99, null],
     ['unknown-fit', 99, null],
+    ['z-tie', 99, '2026-09-20T12:00:00.000Z'],
   ]) {
     await seedOpportunity(storage, id);
     await storage.writeDealHunterOpportunityScore(queueScore(id, { fit_score: fit,
@@ -610,18 +634,26 @@ test('SQLite exploration reader retains server order, accepted earnings provenan
       discovery_state='known_recovered', discovery_revision=1 WHERE opportunity_id=?`)
       .run(accepted, id);
   }
-  await storage.reconcileDealHunterCurrentScoreEligibility(['newer', 'older-fit', 'unknown-fit']);
+  await storage.reconcileDealHunterCurrentScoreEligibility([
+    'a-newest', 'newer', 'older-fit', 'a-tie', 'unknown-fit', 'z-tie',
+  ]);
   const at = '2026-09-23T18:00:00.000Z';
   const newest = await storage.listDealHunterFreshInbox({ area: 'all-active',
     sort: 'newest-discovery', limit: 1, asOf: at });
-  assert.equal(newest.areas[0].rows[0].opportunity_id, 'newer');
+  assert.equal(newest.areas[0].rows[0].opportunity_id, 'a-newest');
   const second = await storage.listDealHunterFreshInbox({ area: 'all-active',
     sort: 'newest-discovery', limit: 1, cursor: newest.areas[0].nextCursor, asOf: at });
-  assert.equal(second.areas[0].rows[0].opportunity_id, 'older-fit');
+  assert.equal(second.areas[0].rows[0].opportunity_id, 'newer');
   const fit = await storage.listDealHunterFreshInbox({ area: 'all-active',
     sort: 'highest-fit', asOf: at });
   assert.deepEqual(fit.areas[0].rows.map((row) => row.opportunity_id),
-    ['unknown-fit', 'older-fit', 'newer']);
+    ['a-tie', 'unknown-fit', 'z-tie', 'older-fit', 'newer', 'a-newest']);
+  const discoveryFit = await storage.listDealHunterFreshInbox({ area: 'new-important',
+    sort: 'highest-fit', limit: 1, asOf: at });
+  const discoveryNext = await storage.listDealHunterFreshInbox({ area: 'new-important',
+    sort: 'highest-fit', limit: 1, cursor: discoveryFit.areas[0].nextCursor, asOf: at });
+  assert.deepEqual([discoveryFit.areas[0].rows[0].opportunity_id,
+    discoveryNext.areas[0].rows[0].opportunity_id], ['z-tie', 'newer']);
   await assert.rejects(storage.listDealHunterFreshInbox({ area: 'all-active',
     sort: 'highest-fit', cursor: newest.areas[0].nextCursor, asOf: at }), /results changed/);
   db.exec(`INSERT INTO deal_hunter_freshness_evidence

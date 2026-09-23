@@ -63,8 +63,11 @@ function compareAll(left, right) {
 }
 
 function compareHighestFit(left, right) {
-  return right.fit_score - left.fit_score
-    || Number(Boolean(right.first_accepted_at)) - Number(Boolean(left.first_accepted_at))
+  return right.fit_score - left.fit_score || compareId(left, right);
+}
+
+function compareNewestDiscovery(left, right) {
+  return Number(Boolean(right.first_accepted_at)) - Number(Boolean(left.first_accepted_at))
     || String(right.first_accepted_at || '').localeCompare(String(left.first_accepted_at || ''))
     || compareId(left, right);
 }
@@ -146,14 +149,14 @@ export function buildFreshInboxAreas(candidates, { area = 'inbox', cursor = null
       ? (left, right) => left.discovery_group - right.discovery_group || compareHighestFit(left, right)
       : area === 'new-important' && effectiveSort === 'newest-discovery'
         ? (left, right) => left.discovery_group - right.discovery_group
-          || String(right.first_accepted_at || '').localeCompare(String(left.first_accepted_at || ''))
-          || compareId(left, right)
+          || compareNewestDiscovery(left, right)
         : compareDiscovery);
   const updated = rows.filter((row) => row.updated_since_review).sort(compareUpdated);
   const research = rows.filter((row) => row.confidence === 'low'
     || row.contradiction_count > 0 || row.source_conflict_count > 0)
     .sort(compareAll);
-  const all = [...rows].sort(effectiveSort === 'highest-fit' ? compareHighestFit : compareAll);
+  const all = [...rows].sort(effectiveSort === 'highest-fit' ? compareHighestFit
+    : effectiveSort === 'newest-discovery' ? compareNewestDiscovery : compareAll);
   const sets = {
     'action-preview': preview,
     'due-actions': due,

@@ -512,7 +512,12 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     assert.deepEqual(pending, { state: 'pending', first: null });
     assert.equal((await accept(100, '2026-09-22')).projectionState, 'accepted');
     assert.equal(psql(container, database, `select discovery_state from public.deal_hunter_opportunities
-      where opportunity_id='${opportunityId}';`), 'known_recovered');
+      where opportunity_id='${opportunityId}';`), 'untracked_legacy');
+    assert.equal(psql(container, database, `select first_accepted_at is null and first_discovery_evidence_id is null
+      from public.deal_hunter_opportunities where opportunity_id='${opportunityId}';`), 't');
+    assert.equal((await accept(100, '2026-09-22')).projectionState, 'accepted');
+    assert.equal(psql(container, database, `select discovery_state from public.deal_hunter_opportunities
+      where opportunity_id='${opportunityId}';`), 'untracked_legacy');
     psql(container, database, `insert into public.deal_hunter_opportunity_scores
       (opportunity_id, scored_at, deal_key, name, fit_score, confidence,
         score_fingerprint, engine_version, rules_version, profile_version,
@@ -522,6 +527,7 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     const readerRow = () => JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('all-active');"))
       .areas[0].rows.find((row) => row.opportunity_id === opportunityId);
+    assert.equal(readerRow().new_to_ug, false);
     assert.deepEqual(readerRow().annual_profit_evidence,
       { metric: 'sde', currency: 'USD', period: 'annual' });
     const current = () => JSON.parse(psql(container, database, `select jsonb_build_object(
@@ -824,10 +830,24 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
         values ('${id}', now(), '${id}', 'Old priority', 90, 'high',
           'old-reader-fingerprint', 'test', 'test', 'test', 'test', true, 'high');`);
     }
+    for (const [suffix, priority] of [['a', 'normal'], ['z', 'urgent']]) {
+      const id = `${suffix}-explore-${database}`;
+      psql(container, database, `insert into public.deal_hunter_opportunities
+        (opportunity_id, created_at, updated_at, canonical_name, identity_version,
+          discovery_state, first_accepted_at, discovery_revision)
+        values ('${id}', now(), now(), 'Equal discovery', 'test',
+          'known_prospective', '2026-09-23T12:00:00Z', 1);
+        insert into public.deal_hunter_opportunity_scores
+        (opportunity_id, scored_at, deal_key, name, fit_score, confidence,
+          score_fingerprint, engine_version, rules_version, profile_version,
+          completeness_policy_version, current_triage_eligible, operator_priority)
+        values ('${id}', now(), '${id}', 'Equal discovery', 90, 'high',
+          'equal-discovery', 'test', 'test', 'test', 'test', true, '${priority}');`);
+    }
     const inbox = JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('inbox');"));
     assert.deepEqual(inbox.areas.map((area) => area.id), ['action-preview', 'new-important']);
-    assert.equal(inbox.areas[0].counts.ownerPriority, 15);
+    assert.equal(inbox.areas[0].counts.ownerPriority, 16);
     assert.equal(inbox.areas[0].rows.length, 3);
     assert.ok(inbox.areas[1].rows.some((row) => row.opportunity_id === freshId));
     const sorted = (sort, offset = 0, limit = 25) => JSON.parse(psql(container, database,
@@ -838,6 +858,15 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     assert.ok(newest.rows.findIndex((row) => row.opportunity_id === freshId)
       < newest.rows.findIndex((row) => row.opportunity_id === `old-priority-${database}-0`));
     assert.equal(highestFit.rows[0].fit_score, 90);
+    for (const sort of ['newest-discovery', 'highest-fit']) {
+      const ordered = sorted(sort, 0, 25).rows.map((row) => row.opportunity_id);
+      assert.ok(ordered.indexOf(`a-explore-${database}`)
+        < ordered.indexOf(`z-explore-${database}`), `${sort} ties use canonical ID`);
+      const firstTiePage = sorted(sort, ordered.indexOf(`a-explore-${database}`), 1);
+      const nextTiePage = sorted(sort, ordered.indexOf(`a-explore-${database}`) + 1, 1);
+      assert.equal(firstTiePage.rows[0].opportunity_id, `a-explore-${database}`);
+      assert.equal(nextTiePage.rows[0].opportunity_id, ordered[ordered.indexOf(`a-explore-${database}`) + 1]);
+    }
     const firstFitPage = sorted('highest-fit', 0, 5);
     const secondFitPage = sorted('highest-fit', 5, 5);
     assert.equal(secondFitPage.anchorId, firstFitPage.lastId);
@@ -846,13 +875,13 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     assert.equal(inbox.areas[1].rows.find((row) => row.opportunity_id === freshId).primary_submission_id, null);
     const allPriorities = JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('owner-priorities', 0, 10);"));
-    assert.equal(allPriorities.areas[0].total, 15);
+    assert.equal(allPriorities.areas[0].total, 16);
     assert.equal(allPriorities.areas[0].rows.length, 10);
     assert.equal(allPriorities.areas[0].nextOffset, 10);
     const morePriorities = JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('owner-priorities', 10, 10);"));
     assert.equal(morePriorities.areas[0].anchorId, allPriorities.areas[0].lastId);
-    assert.equal(morePriorities.areas[0].rows.length, 5);
+    assert.equal(morePriorities.areas[0].rows.length, 6);
     const priorityFreshId = `pg-priority-fresh-${database}`;
     psql(container, database, `insert into public.deal_hunter_opportunities
       (opportunity_id, created_at, updated_at, canonical_name, identity_version,
@@ -869,7 +898,15 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     const reordered = JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('new-important');"));
     const newIds = reordered.areas[0].rows.map((row) => row.opportunity_id);
-    assert.equal(newIds[0], priorityFreshId, 'owner priority wins within the same discovery group');
+    assert.equal(newIds[0], `z-explore-${database}`, 'urgent owner priority wins within the same discovery group');
+    const sortedDiscovery = (sort) => JSON.parse(psql(container, database,
+      `select public.list_deal_hunter_fresh_inbox_v1('new-important', 0, 10,
+        '', '', '', '', now(), '${sort}');`)).areas[0].rows.map((row) => row.opportunity_id);
+    for (const sort of ['newest-discovery', 'highest-fit']) {
+      const ids = sortedDiscovery(sort);
+      assert.ok(ids.indexOf(`a-explore-${database}`) < ids.indexOf(`z-explore-${database}`),
+        `${sort} discovery ties use canonical ID before owner priority`);
+    }
     assert.ok(newIds.includes(freshId), 'the unlinked fresh opportunity remains visible');
     for (let index = 0; index < 5; index += 1) {
       const id = `old-priority-${database}-${index}`;

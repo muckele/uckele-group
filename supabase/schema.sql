@@ -7880,19 +7880,27 @@ begin
             and run_id = v_recovered_run and current_canonical_id is null
             and identity_exception_id = v_recovered_exception_id;
       end if;
+      -- A prior daily observation with no accepted proof leaves early history
+      -- durably unknown. A later complete refresh must not invent a first date.
+      if v_recovered_id is null and exists (
+        select 1 from public.deal_hunter_opportunity_source_observations as prior
+        where prior.opportunity_id = v_record ->> 'opportunity_id'
+          and prior.source_id = v_source_id
+          and prior.source_record_id = v_record ->> 'source_record_id'
+          and prior.accepted_evidence_id is null
+      ) then
+        update public.deal_hunter_opportunities set discovery_state = 'untracked_legacy'
+          where opportunity_id = v_record ->> 'opportunity_id'
+            and discovery_state = 'pending' and first_accepted_at is null;
+      else
       update public.deal_hunter_opportunities set
         first_accepted_at = coalesce(v_recovered_at, v_accepted_at),
         first_discovery_evidence_id = coalesce(v_recovered_id, v_core_id),
-        discovery_state = case when v_recovered_id is not null
-          or exists (select 1 from public.deal_hunter_opportunity_source_observations as prior
-            where prior.opportunity_id = v_record ->> 'opportunity_id'
-              and prior.source_id = v_source_id
-              and prior.source_record_id = v_record ->> 'source_record_id'
-              and prior.accepted_evidence_id is null)
-          then 'known_recovered'
+        discovery_state = case when v_recovered_id is not null then 'known_recovered'
           else 'known_prospective' end, discovery_revision = discovery_revision + 1
         where opportunity_id = v_record ->> 'opportunity_id'
           and discovery_state = 'pending' and first_accepted_at is null;
+      end if;
     end if;
     v_event_ids := v_event_ids || pg_catalog.jsonb_build_object(v_record ->> 'source_record_id', v_core_id);
   end loop;
@@ -8503,12 +8511,16 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
   ), numbered as (
     select memberships.*,
       row_number() over (partition by area_id order by
+        case when area_id = 'all-active' and p_sort = 'newest-discovery'
+          then first_accepted_at end desc nulls last,
         case when area_id = 'all-active' and p_sort = 'highest-fit' then fit_score end desc,
         case when area_id = 'new-important' then discovery_group end,
         case when area_id = 'new-important' and p_area <> 'inbox'
           and p_sort = 'newest-discovery' then first_accepted_at end desc nulls last,
         case when area_id = 'new-important' and p_area <> 'inbox'
           and p_sort = 'highest-fit' then fit_score end desc,
+        case when area_id in ('all-active', 'new-important') and p_area <> 'inbox'
+          and p_sort in ('newest-discovery', 'highest-fit') then opportunity_id end,
         case when area_id = 'action-preview' then
           case when due_action and due_ordinal <= 2 then 0
             when owner_priority and priority_ordinal = first_remaining_priority then 1

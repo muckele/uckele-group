@@ -12332,13 +12332,21 @@ export function createSqliteStorage(config, options = {}) {
               ).run(revision, acceptedAt, record.opportunity_id);
             }
             evidenceByRecord.set(sourceRecordId, { coreId, changed: true });
-            database.prepare(`UPDATE deal_hunter_opportunities SET first_accepted_at = ?,
+            // A daily projection without accepted evidence proves the row existed, but not
+            // when UG first accepted this business. Mark the missing early history
+            // durably unknown so a later complete refresh cannot invent a first date.
+            const hasUnprovenEarlierObservation = current?.accepted_evidence_id === null
+              && current?.opportunity_id === record.opportunity_id;
+            if (!earlierProven && hasUnprovenEarlierObservation) database.prepare(`UPDATE deal_hunter_opportunities
+              SET discovery_state = 'untracked_legacy'
+              WHERE opportunity_id = ? AND discovery_state = 'pending' AND first_accepted_at IS NULL`
+            ).run(record.opportunity_id);
+            else database.prepare(`UPDATE deal_hunter_opportunities SET first_accepted_at = ?,
               first_discovery_evidence_id = ?, discovery_state = ?,
               discovery_revision = discovery_revision + 1
               WHERE opportunity_id = ? AND discovery_state = 'pending' AND first_accepted_at IS NULL`
             ).run(earlierProven?.accepted_at || acceptedAt, earlierProven?.id || coreId,
-              earlierProven || current?.accepted_evidence_id === null && current?.opportunity_id === record.opportunity_id
-                ? 'known_recovered' : 'known_prospective', record.opportunity_id);
+              earlierProven ? 'known_recovered' : 'known_prospective', record.opportunity_id);
           }
         }
         const desiredKeys = new Set();
