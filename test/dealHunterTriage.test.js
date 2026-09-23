@@ -568,6 +568,84 @@ test('discovery orders each supported group by owner priority, due time, fit, co
     ['urgent', 'high-due', 'high-no-due', 'normal-high', 'normal-medium']);
 });
 
+test('exploration sorts by accepted discovery or fit and refuses a cursor from another sort', () => {
+  const asOf = '2026-09-23T18:00:00.000Z';
+  const rows = [
+    { opportunity_id: 'old-fit', fit_score: 95, confidence: 'high',
+      first_accepted_at: '2026-09-10T12:00:00.000Z', discovery_state: 'known_recovered' },
+    { opportunity_id: 'new-low', fit_score: 60, confidence: 'medium',
+      first_accepted_at: '2026-09-23T12:00:00.000Z', discovery_state: 'known_prospective' },
+    { opportunity_id: 'unknown-fit', fit_score: 99, confidence: 'high',
+      first_accepted_at: null, discovery_state: 'untracked_legacy' },
+  ];
+  const newest = buildFreshInboxAreas(rows, { area: 'all-active', sort: 'newest-discovery',
+    limit: 1, asOf });
+  assert.equal(newest.areas[0].rows[0].opportunity_id, 'new-low');
+  const next = buildFreshInboxAreas(rows, { area: 'all-active', sort: 'newest-discovery',
+    limit: 1, cursor: newest.areas[0].nextCursor, asOf });
+  assert.equal(next.areas[0].rows[0].opportunity_id, 'old-fit');
+  const fit = buildFreshInboxAreas(rows, { area: 'all-active', sort: 'highest-fit', asOf });
+  assert.deepEqual(fit.areas[0].rows.map((row) => row.opportunity_id),
+    ['unknown-fit', 'old-fit', 'new-low']);
+  assert.throws(() => buildFreshInboxAreas(rows, { area: 'all-active', sort: 'highest-fit',
+    cursor: newest.areas[0].nextCursor, asOf }), /results changed/);
+});
+
+test('SQLite exploration reader retains server order, accepted earnings provenance, and sort-bound cursors', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-exploration-'));
+  const sqlitePath = path.join(directory, 'exploration.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const db = new Database(sqlitePath);
+  t.after(() => db.close());
+  for (const [id, fit, accepted] of [
+    ['newer', 80, '2026-09-23T12:00:00.000Z'],
+    ['older-fit', 95, '2026-09-10T12:00:00.000Z'],
+    ['unknown-fit', 99, null],
+  ]) {
+    await seedOpportunity(storage, id);
+    await storage.writeDealHunterOpportunityScore(queueScore(id, { fit_score: fit,
+      confidence: 'high' }), []);
+    if (accepted) db.prepare(`UPDATE deal_hunter_opportunities SET first_accepted_at=?,
+      discovery_state='known_recovered', discovery_revision=1 WHERE opportunity_id=?`)
+      .run(accepted, id);
+  }
+  await storage.reconcileDealHunterCurrentScoreEligibility(['newer', 'older-fit', 'unknown-fit']);
+  const at = '2026-09-23T18:00:00.000Z';
+  const newest = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'newest-discovery', limit: 1, asOf: at });
+  assert.equal(newest.areas[0].rows[0].opportunity_id, 'newer');
+  const second = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'newest-discovery', limit: 1, cursor: newest.areas[0].nextCursor, asOf: at });
+  assert.equal(second.areas[0].rows[0].opportunity_id, 'older-fit');
+  const fit = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'highest-fit', asOf: at });
+  assert.deepEqual(fit.areas[0].rows.map((row) => row.opportunity_id),
+    ['unknown-fit', 'older-fit', 'newer']);
+  await assert.rejects(storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'highest-fit', cursor: newest.areas[0].nextCursor, asOf: at }), /results changed/);
+  db.exec(`INSERT INTO deal_hunter_freshness_evidence
+    (id, source_id, source_name, source_record_id, run_id, generation, event_type,
+      field_key, current_canonical_id, after_value, metric, currency, period)
+    VALUES ('earnings-core', 'sheet-0', 'Sheet', 'earnings-1', 'earnings-run', 1,
+      'accepted_source_record', '', 'newer', NULL, 'unknown', 'unknown', 'unknown'),
+      ('earnings-field', 'sheet-0', 'Sheet', 'earnings-1', 'earnings-run', 1,
+      'accepted_source_record', 'annual_profit', 'newer', 425000, 'sde', 'USD', 'annual');
+    INSERT INTO deal_hunter_opportunity_source_observations
+    (id, opportunity_id, source_id, source_name, source_record_id, field,
+      value, observed_at, created_at, updated_at, accepted_evidence_id)
+    VALUES ('earnings-observation', 'newer', 'sheet-0', 'Sheet', 'earnings-1', 'annual_profit',
+      '425000', '2026-09-23T12:00:00.000Z', '2026-09-23T12:00:00.000Z',
+      '2026-09-23T12:00:00.000Z', 'earnings-core');`);
+  const supported = await storage.listDealHunterFreshInbox({ area: 'all-active', asOf: at });
+  const row = supported.areas[0].rows.find((item) => item.opportunity_id === 'newer');
+  assert.deepEqual(JSON.parse(row.annual_profit_evidence),
+    { metric: 'sde', period: 'annual', currency: 'USD' });
+  db.prepare("UPDATE deal_hunter_opportunity_source_observations SET value='450000', accepted_evidence_id=NULL WHERE id='earnings-observation'").run();
+  const unverified = await storage.listDealHunterFreshInbox({ area: 'all-active', asOf: at });
+  assert.equal(unverified.areas[0].rows.find((item) => item.opportunity_id === 'newer').annual_profit_evidence, null);
+});
+
 test('SQLite reader applies seven and thirty Pacific calendar-day boundaries to retained facts', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-calendar-boundary-'));
   const sqlitePath = path.join(directory, 'calendar.sqlite');
@@ -650,6 +728,31 @@ test('Supabase area cursor rejects changed revision or anchor before showing ano
   current = { ...current, revision, anchorId: 'other' };
   await assert.rejects(storage.listDealHunterFreshInbox({ area: 'owner-priorities', cursor }),
     (error) => error.status === 409);
+});
+
+test('Supabase exploration adapter forwards sort and refuses a cursor from another sort', async () => {
+  const seen = [];
+  const storage = createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid',
+      supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { async rpc(name, args) {
+      assert.equal(name, 'list_deal_hunter_fresh_inbox_v1');
+      seen.push(args.p_sort);
+      return { data: { areas: [{ id: 'all-active', rows: [{ opportunity_id: 'one' }],
+        total: 2, revision: 'c'.repeat(32), nextOffset: 1, lastId: 'one', anchorId: null }],
+      counts: {}, asOf: args.p_as_of }, error: null };
+    } } },
+  );
+  const asOf = '2026-09-23T18:00:00.000Z';
+  const newest = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'newest-discovery', asOf });
+  assert.equal(seen.at(-1), 'newest-discovery');
+  await assert.rejects(storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'highest-fit', cursor: newest.areas[0].nextCursor, asOf }), /results changed/);
+  const fit = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'highest-fit', asOf });
+  assert.equal(seen.at(-1), 'highest-fit');
+  assert.notEqual(fit.areas[0].nextCursor.filtersKey, newest.areas[0].nextCursor.filtersKey);
 });
 
 test('due overflow keeps complete access and dual-qualified actions use one preview slot', async (t) => {

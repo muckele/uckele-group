@@ -34,6 +34,21 @@ function money(value) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 }).format(Number(value));
 }
 
+function earningsPresentation(financials = {}) {
+  const evidence = financials.annualProfitEvidence || {};
+  const metric = evidence.metric && evidence.metric !== 'unknown'
+    ? ['sde', 'ebitda'].includes(evidence.metric.toLowerCase())
+      ? evidence.metric.toUpperCase() : formatLabel(evidence.metric)
+    : 'Earnings metric unverified';
+  const period = evidence.period && evidence.period !== 'unknown'
+    ? formatLabel(evidence.period).toLowerCase() : 'period unverified';
+  const value = financials.annualProfit;
+  const amount = value === null || value === undefined || value === '' ? '—'
+    : evidence.currency === 'USD' ? money(value)
+      : `${new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(Number(value))} ${evidence.currency && evidence.currency !== 'unknown' ? evidence.currency : 'currency unverified'}`;
+  return { label: `${metric} · ${period}`, amount };
+}
+
 function formatLabel(value) {
   return String(value || '').replace(/([a-z0-9])([A-Z])/g, '$1 $2').replace(/[-_]/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase());
 }
@@ -106,6 +121,7 @@ function MorningBriefing({ digest, error = '', loading = false }) {
 function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, row }) {
   const reviewState = row.changedSinceReview ? 'Changed Since Review' : row.reviewed ? 'Reviewed' : 'Needs Review';
   const observed = formatDate(row.observationFreshness);
+  const earnings = earningsPresentation(row.financials);
   return (
     <li className="grid gap-4 rounded-2xl border border-line bg-white p-4 shadow-sm md:grid-cols-[minmax(15rem,1.35fr)_repeat(4,minmax(6.5rem,.65fr))_minmax(10rem,.8fr)] md:items-center md:rounded-none md:border-x-0 md:border-b-0 md:p-3 md:shadow-none">
       <div className="min-w-0">
@@ -132,7 +148,7 @@ function OpportunityRow({ actionsAllowed, onAction, onOpen, pending, readOnly, r
         {row.freshness?.latestAcceptedObservationAt ? <p className="mt-1 text-[11px] text-ink/60">Latest accepted by UG {formatDate(row.freshness.latestAcceptedObservationAt)}</p> : null}
       </div>
       <div><p className="text-[10px] font-semibold uppercase text-ink/45 md:hidden">Fit</p><p className="text-xl font-semibold tabular-nums text-ink">{row.fitScore}</p><p className="text-[11px] font-semibold text-ink/58">{row.confidence} confidence</p></div>
-      <div><p className="text-[10px] font-semibold uppercase text-ink/45">SDE / Profit</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{money(row.financials?.annualProfit)}</p></div>
+      <div><p className="text-[10px] font-semibold uppercase text-ink/45">{earnings.label}</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{earnings.amount}</p></div>
       <div><p className="text-[10px] font-semibold uppercase text-ink/45">Revenue</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{money(row.financials?.annualRevenue)}</p></div>
       <div><p className="text-[10px] font-semibold uppercase text-ink/45">Ask / Multiple</p><p className="mt-1 text-sm font-semibold tabular-nums text-ink">{money(row.financials?.askingPrice)}</p>{row.financials?.profitMultiple !== null && row.financials?.profitMultiple !== undefined ? <p className="text-xs text-ink/58">{row.financials.profitMultiple.toFixed(2)}×</p> : null}</div>
       <div className="min-w-0">
@@ -973,7 +989,9 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
             <label className="relative"><span className="sr-only">Search opportunities</span><Search aria-hidden="true" className="absolute left-3 top-3 h-4 w-4 text-ink/40" /><input aria-label="Search opportunities" className="form-control pl-9" onChange={(event) => { setSearch(event.target.value); resetPaging(); }} placeholder="Business or deal key" ref={searchInputRef} type="search" value={search} /></label>
             <label className="text-xs font-semibold text-ink/58">Confidence<select className="form-control mt-1" onChange={(event) => { setConfidence(event.target.value); resetPaging(); }} value={confidence}><option value="">All</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label>
             <label className="text-xs font-semibold text-ink/58">Operator priority<select className="form-control mt-1" onChange={(event) => { setPriority(event.target.value); resetPaging(); }} value={priority}><option value="">All</option><option value="urgent">Urgent</option><option value="high">High</option><option value="normal">Normal</option><option value="watch">Watch</option></select></label>
-            {view !== 'inbox' ? <label className="text-xs font-semibold text-ink/58">Sort opportunities<select className="form-control mt-1" onChange={(event) => { setSort(event.target.value); resetPaging(); }} value={sort}><option value="acquisition-priority">Acquisition priority</option><option value="fit-score">Fit score</option><option value="confidence">Confidence</option><option value="scored-at">Newest score</option><option value="name">Name</option></select></label> : null}
+            {view === 'inbox' && ['all-active', 'new-important'].includes(area)
+              ? <label className="text-xs font-semibold text-ink/58">Explore opportunities<select aria-label="Explore opportunities" className="form-control mt-1" onChange={(event) => { setSort(event.target.value); resetPaging(); }} value={['newest-discovery', 'highest-fit'].includes(sort) ? sort : 'acquisition-priority'}><option value="acquisition-priority">Acquisition priority</option><option value="newest-discovery">Newest discovery</option><option value="highest-fit">Highest Fit</option></select></label>
+              : view !== 'inbox' ? <label className="text-xs font-semibold text-ink/58">Sort opportunities<select className="form-control mt-1" onChange={(event) => { setSort(event.target.value); resetPaging(); }} value={sort}><option value="acquisition-priority">Acquisition priority</option><option value="fit-score">Fit score</option><option value="confidence">Confidence</option><option value="scored-at">Newest score</option><option value="name">Name</option></select></label> : null}
           </div>
         </div>
 

@@ -235,6 +235,10 @@ async function requiredSourceMutationGate({ storage, getCachedSourceHealth }) {
 // there is deliberately no blended certainty number. Detail and decision
 // responses can explicitly retain the persisted operator note.
 export function publicTriageRow(row = {}, { includeOperatorNote = false } = {}) {
+  let annualProfitEvidence = row.annual_profit_evidence || null;
+  if (typeof annualProfitEvidence === 'string') {
+    try { annualProfitEvidence = JSON.parse(annualProfitEvidence); } catch { annualProfitEvidence = null; }
+  }
   return {
     opportunityId: row.opportunity_id,
     dealKey: row.deal_key || '',
@@ -253,6 +257,11 @@ export function publicTriageRow(row = {}, { includeOperatorNote = false } = {}) 
     industry: normalizeText(row.industry, 240),
     financials: {
       annualProfit: nullableNumber(row.annual_profit),
+      ...(annualProfitEvidence && typeof annualProfitEvidence === 'object'
+        ? { annualProfitEvidence: { metric: annualProfitEvidence.metric || 'unknown',
+          period: annualProfitEvidence.period || 'unknown',
+          currency: annualProfitEvidence.currency || 'unknown' } }
+        : {}),
       annualRevenue: nullableNumber(row.annual_revenue),
       askingPrice: nullableNumber(row.asking_price),
       profitMultiple: nullableNumber(row.profit_multiple),
@@ -359,7 +368,7 @@ export async function listTriageQueue({
     }
     try {
       const result = await storage.listDealHunterFreshInbox({ area, cursor: decoded,
-        limit: pageSize, search, confidence, priority, state });
+        limit: pageSize, search, confidence, priority, state, sort });
       const areas = result.areas.map((item) => ({ ...item,
         rows: item.rows.map(publicTriageRow),
         nextCursor: item.nextCursor

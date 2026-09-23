@@ -10,7 +10,7 @@ import {
 import { consumeCompleteGoogleSheetSourceSnapshotAdmission, normalizeCompleteGoogleSheetFreshnessSnapshot } from '../services/dealHunterSourceSnapshotAdmission.js';
 import { requireCanonicalCimRequestId } from '../services/cimRequestIdPolicy.js';
 import { CrmSupersessionUnavailableError } from '../services/crmSubmissionSupersession.js';
-import { freshInboxAreaIds, ownerBusinessDate } from '../services/dealHunterFreshInboxPolicy.js';
+import { freshInboxAreaIds, freshInboxExplorationSort, ownerBusinessDate } from '../services/dealHunterFreshInboxPolicy.js';
 
 const dealHunterQueueSorts = new Set([
   'acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed',
@@ -3212,14 +3212,16 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     async listDealHunterFreshInbox({ area = 'inbox', cursor = null, limit = null,
-      search = '', confidence = '', priority = '', state = '', asOf = new Date().toISOString() } = {}) {
+      search = '', confidence = '', priority = '', state = '', sort = 'acquisition-priority',
+      asOf = new Date().toISOString() } = {}) {
       if (area !== 'inbox' && !freshInboxAreaIds.includes(area)) {
         throw new Error('Unknown Acquisition Inbox area.');
       }
       const filters = { search: String(search || '').trim().toLowerCase().slice(0, 160),
         confidence: String(confidence || ''), priority: String(priority || ''),
         state: String(state || '').toUpperCase() };
-      const filtersKey = createHash('sha256').update(JSON.stringify(filters)).digest('hex');
+      const effectiveSort = freshInboxExplorationSort(area, sort);
+      const filtersKey = createHash('sha256').update(JSON.stringify({ ...filters, sort: effectiveSort })).digest('hex');
       const businessDate = ownerBusinessDate(asOf);
       const stale = () => {
         const error = new Error('Inbox results changed. Refresh this area before continuing.');
@@ -3233,6 +3235,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         p_area: area, p_offset: cursor?.lastOrdinal || 0, p_limit: limit,
         p_search: filters.search, p_confidence: filters.confidence,
         p_priority: filters.priority, p_state: filters.state, p_as_of: asOf,
+        p_sort: effectiveSort,
       });
       if (error) throw error;
       const areas = (data?.areas || []).map((item) => {

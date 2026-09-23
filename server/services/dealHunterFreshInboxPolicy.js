@@ -62,6 +62,18 @@ function compareAll(left, right) {
     || right.fit_score - left.fit_score || compareId(left, right);
 }
 
+function compareHighestFit(left, right) {
+  return right.fit_score - left.fit_score
+    || Number(Boolean(right.first_accepted_at)) - Number(Boolean(left.first_accepted_at))
+    || String(right.first_accepted_at || '').localeCompare(String(left.first_accepted_at || ''))
+    || compareId(left, right);
+}
+
+export function freshInboxExplorationSort(area, sort) {
+  return ['all-active', 'new-important'].includes(area)
+    && ['newest-discovery', 'highest-fit'].includes(sort) ? sort : 'acquisition-priority';
+}
+
 function foldRevision(rows, areaId, filtersKey, businessDate) {
   let state = createHash('md5').update(`${areaId}\u0000${filtersKey}\u0000${businessDate}\u0000${rows.length}`).digest('hex');
   for (const row of rows) {
@@ -110,9 +122,10 @@ export function classifyFreshInboxCandidate(row, asOf, currentBusinessDate = own
 }
 
 export function buildFreshInboxAreas(candidates, { area = 'inbox', cursor = null,
-  limit = null, asOf = new Date().toISOString(), filters = {} } = {}) {
+  limit = null, asOf = new Date().toISOString(), filters = {}, sort = 'acquisition-priority' } = {}) {
   const businessDate = ownerBusinessDate(asOf);
-  const filtersKey = createHash('sha256').update(JSON.stringify(filters)).digest('hex');
+  const effectiveSort = freshInboxExplorationSort(area, sort);
+  const filtersKey = createHash('sha256').update(JSON.stringify({ ...filters, sort: effectiveSort })).digest('hex');
   const rows = candidates.map((candidate) => classifyFreshInboxCandidate(candidate, asOf, businessDate));
   const due = rows.filter((row) => row.due_action).sort(compareDue);
   const priorities = rows.filter((row) => row.owner_priority).sort(comparePriority);
@@ -128,12 +141,19 @@ export function buildFreshInboxAreas(candidates, { area = 'inbox', cursor = null
   take(due, 2);
   take(priorities, preview.length < 3 ? 1 : 0);
   take([...due, ...priorities], 3 - preview.length);
-  const discovery = rows.filter((row) => row.discovery_group <= 2).sort(compareDiscovery);
+  const discovery = rows.filter((row) => row.discovery_group <= 2).sort(
+    area === 'new-important' && effectiveSort === 'highest-fit'
+      ? (left, right) => left.discovery_group - right.discovery_group || compareHighestFit(left, right)
+      : area === 'new-important' && effectiveSort === 'newest-discovery'
+        ? (left, right) => left.discovery_group - right.discovery_group
+          || String(right.first_accepted_at || '').localeCompare(String(left.first_accepted_at || ''))
+          || compareId(left, right)
+        : compareDiscovery);
   const updated = rows.filter((row) => row.updated_since_review).sort(compareUpdated);
   const research = rows.filter((row) => row.confidence === 'low'
     || row.contradiction_count > 0 || row.source_conflict_count > 0)
     .sort(compareAll);
-  const all = [...rows].sort(compareAll);
+  const all = [...rows].sort(effectiveSort === 'highest-fit' ? compareHighestFit : compareAll);
   const sets = {
     'action-preview': preview,
     'due-actions': due,

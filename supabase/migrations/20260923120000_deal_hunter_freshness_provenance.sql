@@ -674,6 +674,15 @@ begin
             and previous_field.event_type = 'accepted_source_record'
             and previous_field.field_key = v_field_key
           where previous_core.id = v_before_observation.accepted_evidence_id;
+        if v_before.id is null then
+          select * into v_before from public.deal_hunter_freshness_evidence
+            where source_id = v_source_id
+              and source_record_id = v_record ->> 'source_record_id'
+              and field_key = v_field_key and event_type = 'accepted_source_record'
+              and run_id <> v_run_id
+              and current_canonical_id = v_record ->> 'opportunity_id'
+            order by accepted_at desc, id desc limit 1;
+        end if;
         if v_before_observation.opportunity_id is distinct from v_record ->> 'opportunity_id'
           or v_before.after_value is not distinct from v_after_value then continue; end if;
         select exists (select 1 from public.deal_hunter_opportunity_source_observations
@@ -741,7 +750,13 @@ begin
       update public.deal_hunter_opportunities set
         first_accepted_at = coalesce(v_recovered_at, v_accepted_at),
         first_discovery_evidence_id = coalesce(v_recovered_id, v_core_id),
-        discovery_state = case when v_recovered_id is not null then 'known_recovered'
+        discovery_state = case when v_recovered_id is not null
+          or exists (select 1 from public.deal_hunter_opportunity_source_observations as prior
+            where prior.opportunity_id = v_record ->> 'opportunity_id'
+              and prior.source_id = v_source_id
+              and prior.source_record_id = v_record ->> 'source_record_id'
+              and prior.accepted_evidence_id is null)
+          then 'known_recovered'
           else 'known_prospective' end, discovery_revision = discovery_revision + 1
         where opportunity_id = v_record ->> 'opportunity_id'
           and discovery_state = 'pending' and first_accepted_at is null;
@@ -824,6 +839,10 @@ declare
   v_state public.deal_hunter_source_freshness_state%rowtype;
   v_opportunity public.deal_hunter_opportunities%rowtype;
   v_event public.deal_hunter_freshness_evidence%rowtype;
+  v_prior_event public.deal_hunter_freshness_evidence%rowtype;
+  v_current_listing text;
+  v_prior_listing text;
+  v_proven_earlier boolean;
   v_observation jsonb;
   v_publication jsonb;
   v_unbound integer;
@@ -878,13 +897,38 @@ begin
     current_canonical_id = p_opportunity_id, binding_audit_id = p_import_id::text
     where run_id = p_import_id::text and source_id = 'deal-os-export'
       and source_record_id = p_source_record_id and current_canonical_id is null;
+  select earlier.* into v_prior_event
+    from public.deal_hunter_freshness_evidence as earlier
+    where earlier.source_id = 'deal-os-export' and earlier.source_record_id = p_source_record_id
+      and earlier.event_type = 'accepted_source_record' and earlier.field_key = ''
+      and earlier.accepted_at < v_event.accepted_at
+    order by earlier.accepted_at, earlier.id limit 1;
+  select prior_import.row_accounting -> v_prior_event.event_ordinal::integer ->> 'listingIdentity'
+    into v_prior_listing from public.deal_hunter_deal_os_imports as prior_import
+    where prior_import.id::text = v_prior_event.run_id;
+  v_current_listing := v_import.row_accounting -> v_event.event_ordinal::integer ->> 'listingIdentity';
+  v_proven_earlier := v_prior_event.id is not null and nullif(v_current_listing, '') is not null
+    and v_prior_listing = v_current_listing;
+  if v_proven_earlier and v_prior_event.current_canonical_id is not null
+    and v_prior_event.current_canonical_id <> p_opportunity_id then
+    raise exception 'Earlier accepted Deal OS listing is bound to another canonical identity' using errcode = '23505';
+  end if;
+  if v_proven_earlier and v_prior_event.current_canonical_id is null then
+    update public.deal_hunter_freshness_evidence set
+      current_canonical_id = p_opportunity_id, binding_audit_id = p_import_id::text
+      where run_id = v_prior_event.run_id and source_id = 'deal-os-export'
+        and source_record_id = p_source_record_id and current_canonical_id is null;
+  end if;
   if v_opportunity.discovery_state = 'pending' and v_opportunity.first_accepted_at is null then
-    update public.deal_hunter_opportunities set
-      first_accepted_at = v_event.accepted_at, first_discovery_evidence_id = v_event.id,
-      discovery_state = case when v_state.accepted_generation = p_expected_generation
+    if v_prior_event.id is null or v_proven_earlier then
+      update public.deal_hunter_opportunities set
+      first_accepted_at = case when v_proven_earlier then v_prior_event.accepted_at else v_event.accepted_at end,
+      first_discovery_evidence_id = case when v_proven_earlier then v_prior_event.id else v_event.id end,
+      discovery_state = case when not v_proven_earlier and v_state.accepted_generation = p_expected_generation
         and v_state.accepted_run_id = p_import_id::text then 'known_prospective'
         else 'known_recovered' end, discovery_revision = discovery_revision + 1
       where opportunity_id = p_opportunity_id;
+    end if;
   elsif v_opportunity.discovery_state in ('known_prospective', 'known_recovered')
     and v_opportunity.first_accepted_at is not null
     and v_event.accepted_at < v_opportunity.first_accepted_at then
@@ -1120,10 +1164,13 @@ grant execute on function public.deal_hunter_fresh_inbox_hash_step_v1(text, text
 revoke all on function public.deal_hunter_fresh_inbox_hash_v1(text) from public, anon, authenticated;
 grant execute on function public.deal_hunter_fresh_inbox_hash_v1(text) to service_role;
 
+drop function if exists public.list_deal_hunter_fresh_inbox_v1(
+  text, integer, integer, text, text, text, text, timestamptz);
 create or replace function public.list_deal_hunter_fresh_inbox_v1(
   p_area text default 'inbox', p_offset integer default 0, p_limit integer default 25,
   p_search text default '', p_confidence text default '', p_priority text default '',
-  p_state text default '', p_as_of timestamptz default now()
+  p_state text default '', p_as_of timestamptz default now(),
+  p_sort text default 'acquisition-priority'
 ) returns jsonb language sql stable security definer set search_path = public as $$
   with parameters as (
     select (p_as_of at time zone 'America/Los_Angeles')::date as business_date,
@@ -1323,7 +1370,12 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
   ), numbered as (
     select memberships.*,
       row_number() over (partition by area_id order by
+        case when area_id = 'all-active' and p_sort = 'highest-fit' then fit_score end desc,
         case when area_id = 'new-important' then discovery_group end,
+        case when area_id = 'new-important' and p_area <> 'inbox'
+          and p_sort = 'newest-discovery' then first_accepted_at end desc nulls last,
+        case when area_id = 'new-important' and p_area <> 'inbox'
+          and p_sort = 'highest-fit' then fit_score end desc,
         case when area_id = 'action-preview' then
           case when due_action and due_ordinal <= 2 then 0
             when owner_priority and priority_ordinal = first_remaining_priority then 1
@@ -1402,6 +1454,19 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
         'annual_profit', (select source.value from public.deal_hunter_opportunity_source_observations as source
           where source.opportunity_id = numbered.opportunity_id and source.field = 'annual_profit'
           order by source.observed_at desc, source.id limit 1),
+        'annual_profit_evidence', (select pg_catalog.jsonb_build_object(
+            'metric', evidence.metric, 'period', evidence.period, 'currency', evidence.currency)
+          from public.deal_hunter_opportunity_source_observations as source
+          join public.deal_hunter_freshness_evidence as core on core.id = source.accepted_evidence_id
+          join public.deal_hunter_freshness_evidence as evidence on evidence.run_id = core.run_id
+            and evidence.source_id = core.source_id and evidence.source_record_id = core.source_record_id
+            and evidence.event_type = 'accepted_source_record' and evidence.field_key = 'annual_profit'
+            and evidence.current_canonical_id = numbered.opportunity_id
+          where source.id = (select chosen.id from public.deal_hunter_opportunity_source_observations as chosen
+            where chosen.opportunity_id = numbered.opportunity_id and chosen.field = 'annual_profit'
+            order by chosen.observed_at desc, chosen.id limit 1)
+            and source.value = evidence.after_value::text
+          limit 1),
         'annual_revenue', (select source.value from public.deal_hunter_opportunity_source_observations as source
           where source.opportunity_id = numbered.opportunity_id and source.field = 'annual_revenue'
           order by source.observed_at desc, source.id limit 1),
@@ -1525,6 +1590,165 @@ create or replace function public.list_deal_hunter_fresh_inbox_v1(
   from parameters;
 $$;
 revoke all on function public.list_deal_hunter_fresh_inbox_v1(
-  text, integer, integer, text, text, text, text, timestamptz) from public, anon, authenticated;
+  text, integer, integer, text, text, text, text, timestamptz, text) from public, anon, authenticated;
 grant execute on function public.list_deal_hunter_fresh_inbox_v1(
-  text, integer, integer, text, text, text, text, timestamptz) to service_role;
+  text, integer, integer, text, text, text, text, timestamptz, text) to service_role;
+
+-- Keep legacy per-record daily writers from retaining acceptance on changed values.
+create or replace function public.upsert_deal_hunter_opportunity_source_observation(
+  p_id text, p_opportunity_id text, p_source_id text, p_source_name text, p_source_record_id text,
+  p_field text, p_value text, p_observed_at timestamptz, p_created_at timestamptz, p_updated_at timestamptz
+)
+returns public.deal_hunter_opportunity_source_observations
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_observation public.deal_hunter_opportunity_source_observations;
+begin
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(p_source_id)::text,
+      0
+    )
+  );
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(p_opportunity_id, p_source_id)::text,
+      0
+    )
+  );
+  insert into public.deal_hunter_opportunity_source_observations (
+    id, opportunity_id, source_id, source_name, source_record_id, field, value,
+    observed_at, created_at, updated_at
+  ) values (
+    p_id, p_opportunity_id, p_source_id, p_source_name, p_source_record_id, p_field, p_value,
+    p_observed_at, p_created_at, p_updated_at
+  )
+  on conflict (opportunity_id, source_id, source_record_id, field) do update set
+    source_name = excluded.source_name, value = excluded.value, observed_at = excluded.observed_at,
+    updated_at = excluded.updated_at,
+    accepted_at = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.accepted_at end,
+    accepted_run_id = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.accepted_run_id end,
+    accepted_evidence_id = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.accepted_evidence_id end,
+    publication_raw_header = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.publication_raw_header end,
+    publication_raw_value = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.publication_raw_value end,
+    publication_precision = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.publication_precision end,
+    publication_offset = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.publication_offset end,
+    publication_meaning = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.publication_meaning end
+  returning * into v_observation;
+  return v_observation;
+end;
+$$;
+
+create or replace function public.replace_deal_hunter_opportunity_source_observation_snapshot(
+  p_opportunity_id text,
+  p_source_id text,
+  p_source_name text,
+  p_source_record_id text,
+  p_observations jsonb
+)
+returns setof public.deal_hunter_opportunity_source_observations
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if jsonb_typeof(p_observations) <> 'array' then
+    raise exception 'source observation snapshot must be a JSON array';
+  end if;
+
+  if exists (
+    select 1
+    from jsonb_to_recordset(p_observations) as incoming(
+      id text, opportunity_id text, source_id text, source_name text, source_record_id text,
+      field text, value text, observed_at timestamptz, created_at timestamptz, updated_at timestamptz
+    )
+    where incoming.opportunity_id is distinct from p_opportunity_id
+      or incoming.source_id is distinct from p_source_id
+      or incoming.source_name is distinct from p_source_name
+      or incoming.source_record_id is distinct from p_source_record_id
+  ) then
+    raise exception 'source observation snapshot rows must share one source record identity';
+  end if;
+
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(p_source_id)::text,
+      0
+    )
+  );
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(p_opportunity_id, p_source_id)::text,
+      0
+    )
+  );
+  perform pg_catalog.pg_advisory_xact_lock(
+    pg_catalog.hashtextextended(
+      pg_catalog.jsonb_build_array(p_opportunity_id, p_source_id, p_source_record_id)::text,
+      0
+    )
+  );
+
+  delete from public.deal_hunter_opportunity_source_observations as stored
+  where stored.opportunity_id = p_opportunity_id
+    and stored.source_id = p_source_id
+    and stored.source_record_id = p_source_record_id
+    and not exists (
+      select 1
+      from jsonb_to_recordset(p_observations) as incoming(field text)
+      where incoming.field = stored.field
+    );
+
+  insert into public.deal_hunter_opportunity_source_observations (
+    id, opportunity_id, source_id, source_name, source_record_id, field, value,
+    observed_at, created_at, updated_at
+  )
+  select
+    incoming.id, incoming.opportunity_id, incoming.source_id, incoming.source_name, incoming.source_record_id,
+    incoming.field, incoming.value, incoming.observed_at, incoming.created_at, incoming.updated_at
+  from jsonb_to_recordset(p_observations) as incoming(
+    id text, opportunity_id text, source_id text, source_name text, source_record_id text,
+    field text, value text, observed_at timestamptz, created_at timestamptz, updated_at timestamptz
+  )
+  on conflict (opportunity_id, source_id, source_record_id, field) do update set
+    source_name = excluded.source_name,
+    value = excluded.value,
+    observed_at = excluded.observed_at,
+    updated_at = excluded.updated_at,
+    accepted_at = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.accepted_at end,
+    accepted_run_id = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.accepted_run_id end,
+    accepted_evidence_id = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.accepted_evidence_id end,
+    publication_raw_header = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.publication_raw_header end,
+    publication_raw_value = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.publication_raw_value end,
+    publication_precision = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.publication_precision end,
+    publication_offset = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.publication_offset end,
+    publication_meaning = case when excluded.value is distinct from deal_hunter_opportunity_source_observations.value
+      then null else deal_hunter_opportunity_source_observations.publication_meaning end;
+
+  return query
+  select *
+  from public.deal_hunter_opportunity_source_observations
+  where opportunity_id = p_opportunity_id
+    and source_id = p_source_id
+    and source_record_id = p_source_record_id
+  order by observed_at desc, id asc;
+end;
+$$;

@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from '../server/services/dealHunterSourceSnapshotAdmission.js';
+import { createSupabaseStorage } from '../server/storage/supabase.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const integrationEnabled = process.env.DEAL_HUNTER_POSTGRES_INTEGRATION === '1';
@@ -124,7 +125,8 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
         file_name: 'fl01.csv', file_type: 'text/csv', file_size: 100, file_sha256: 'a'.repeat(64),
         scope: 'saved-search', coverage_label: 'Synthetic', expected_row_count: 1,
         row_count: 1, source_row_count: 1, accepted_row_count: 1, rejected_row_count: 0,
-        canonical_record_count: 1, parser_version: 'deal-os-export-v2', row_accounting: [{ sourceRowNumber: 2, status: 'accepted' }],
+        canonical_record_count: 1, parser_version: 'deal-os-export-v2', row_accounting: [{ sourceRowNumber: 2, status: 'accepted',
+          listingIdentity: 'https://example.test/fl01' }],
         duplicate_count: 0, stable_id_count: 1, listing_url_count: 1, coverage_limit_reached: false,
         records: [{ stableId: 'PG-FL01-1', name: 'Synthetic', listingUrl: 'https://example.test/fl01' }], metadata: {},
       };
@@ -154,10 +156,31 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
       }], freshness_evidence: sourceRows(price)[0].freshnessEvidence,
     });
     const quoteJson = (value) => `'${JSON.stringify(value).replaceAll("'", "''")}'::jsonb`;
+    const historicalAcceptedAt = '2026-09-14T12:00:00.000Z';
+    // Synthetic chronology only; the real acceptance trigger remains immutable.
+    psql(container, database, `alter table public.deal_hunter_freshness_evidence
+      disable trigger guard_deal_hunter_freshness_evidence;
+      update public.deal_hunter_freshness_evidence set accepted_at='${historicalAcceptedAt}'
+      where run_id='${importIds[0]}';
+      alter table public.deal_hunter_freshness_evidence
+      enable trigger guard_deal_hunter_freshness_evidence;`);
     const latest = JSON.parse(psql(container, database, `select public.bind_accepted_deal_hunter_freshness_v1(
       '${importIds[1]}'::uuid, '${opportunityId}', 'external:PG-FL01-1', 2,
       ${quoteJson(snapshot('Latest', 120))});`));
     assert.equal(latest.projectionState, 'accepted');
+    const intermediate = JSON.parse(psql(container, database, `select jsonb_build_object(
+      'first', first_accepted_at, 'state', discovery_state, 'revision', discovery_revision)
+      from public.deal_hunter_opportunities where opportunity_id='${opportunityId}';`));
+    assert.equal(new Date(intermediate.first).toISOString(), historicalAcceptedAt);
+    assert.equal(intermediate.state, 'known_recovered');
+    assert.equal(intermediate.revision, 1);
+    const retrySql = `select public.bind_accepted_deal_hunter_freshness_v1(
+      '${importIds[1]}'::uuid, '${opportunityId}', 'external:PG-FL01-1', 2,
+      ${quoteJson(snapshot('Latest', 120))});`;
+    const retries = await Promise.all([0, 1].map(() => psqlConcurrent(container, database, retrySql)));
+    assert.ok(retries.every((result) => result.status === 0), JSON.stringify(retries));
+    assert.equal(Number(psql(container, database, `select discovery_revision from public.deal_hunter_opportunities
+      where opportunity_id='${opportunityId}';`)), 1);
     const older = JSON.parse(psql(container, database, `select public.bind_accepted_deal_hunter_freshness_v1(
       '${importIds[0]}'::uuid, '${opportunityId}', 'external:PG-FL01-1', 1,
       ${quoteJson(snapshot('Old', 100))});`));
@@ -229,6 +252,58 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     }
     assert.equal(Number(psql(container, database, `select material_revision from public.deal_hunter_opportunities
       where opportunity_id='${opportunityId}';`)), 3);
+  }
+  for (const database of ['fl01_fresh', 'fl01_upgrade']) {
+    const opportunityId = `pg-ambiguous-${database}`;
+    const sourceRecordId = 'external:PG-AMBIG';
+    const importedAt = '2026-09-23T12:00:00.000Z';
+    const quote = (value) => `'${JSON.stringify(value).replaceAll("'", "''")}'::jsonb`;
+    psql(container, database, `insert into public.deal_hunter_opportunities
+      (opportunity_id, created_at, updated_at, canonical_name, identity_version, discovery_state)
+      values ('${opportunityId}', now(), now(), 'Ambiguous listing', 'test', 'pending');`);
+    const imports = [];
+    for (const [index, listingUrl] of ['https://example.test/ambiguous-a',
+      'https://example.test/ambiguous-b'].entries()) {
+      const id = randomUUID();
+      const run = JSON.parse(psql(container, database,
+        `select public.allocate_deal_hunter_source_generation('deal-os-export', '${id}');`));
+      const record = { id, created_at: importedAt, imported_by: 'synthetic-test',
+        exported_at: importedAt, file_name: 'ambiguous.csv', file_type: 'text/csv',
+        file_size: 100, file_sha256: String(index + 7).repeat(64), scope: 'saved-search',
+        coverage_label: 'Synthetic', expected_row_count: 1, row_count: 1, source_row_count: 1,
+        accepted_row_count: 1, rejected_row_count: 0, canonical_record_count: 1,
+        parser_version: 'deal-os-export-v2', row_accounting: [{ sourceRowNumber: 2,
+          status: 'accepted', listingIdentity: listingUrl }], duplicate_count: 0,
+        stable_id_count: 1, listing_url_count: 1, coverage_limit_reached: false,
+        records: [{ stableId: 'PG-AMBIG', name: 'Ambiguous listing', listingUrl }], metadata: {} };
+      psql(container, database, `select public.insert_deal_hunter_deal_os_import_freshness_v1(
+        ${quote(record)}, ${quote([{ sourceRecordId, eventOrdinal: 0,
+          freshnessEvidence: {} }])}, ${run.generation});`);
+      imports.push({ id, run });
+    }
+    psql(container, database, `alter table public.deal_hunter_freshness_evidence
+      disable trigger guard_deal_hunter_freshness_evidence;
+      update public.deal_hunter_freshness_evidence set accepted_at='2026-09-14T12:00:00.000Z'
+      where run_id='${imports[0].id}';
+      alter table public.deal_hunter_freshness_evidence
+      enable trigger guard_deal_hunter_freshness_evidence;`);
+    const snapshot = { opportunity_id: opportunityId, source_id: 'deal-os-export',
+      source_name: 'SMB Deal OS export', source_record_id: sourceRecordId,
+      observations: [{ id: `pg-ambiguous-observation-${database}`,
+        opportunity_id: opportunityId, source_id: 'deal-os-export',
+        source_name: 'SMB Deal OS export', source_record_id: sourceRecordId,
+        field: 'name', value: 'Ambiguous listing', observed_at: importedAt,
+        created_at: importedAt, updated_at: importedAt }] };
+    psql(container, database, `select public.bind_accepted_deal_hunter_freshness_v1(
+      '${imports[1].id}'::uuid, '${opportunityId}', '${sourceRecordId}',
+      ${imports[1].run.generation}, ${quote(snapshot)});`);
+    const uncertain = JSON.parse(psql(container, database, `select jsonb_build_object(
+      'state', discovery_state, 'first', first_accepted_at) from public.deal_hunter_opportunities
+      where opportunity_id='${opportunityId}';`));
+    assert.deepEqual(uncertain, { state: 'pending', first: null });
+    assert.equal(psql(container, database, `select coalesce(current_canonical_id, 'unbound')
+      from public.deal_hunter_freshness_evidence where run_id='${imports[0].id}'
+        and event_type='accepted_source_record' and field_key='';`), 'unbound');
   }
   for (const database of ['fl01_fresh', 'fl01_upgrade']) {
     const opportunityId = `pg-sheet-${database}`;
@@ -357,6 +432,111 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
       assert.equal(publication.meaning, 'listing_publication');
       if (expectedState === 'valid') assert.equal(publication.date, '2026-09-22');
     }
+  }
+  for (const database of ['fl01_fresh', 'fl01_upgrade']) {
+    const opportunityId = `pg-mixed-r1-${database}`;
+    const sourceId = 'sheet-8';
+    const sourceName = 'Synthetic Sheet';
+    const sourceRecordId = 'external:R1-PG';
+    const at = '2026-09-23T12:00:00.000Z';
+    const quote = (value) => `'${JSON.stringify(value).replaceAll("'", "''")}'`;
+    const observation = (value) => ({ id: `pg-r1-profit-${database}`,
+      opportunity_id: opportunityId, source_id: sourceId, source_name: sourceName,
+      source_record_id: sourceRecordId, field: 'annual_profit', value: String(value),
+      observed_at: at, created_at: at, updated_at: at });
+    const dateObservation = (value) => ({ id: `pg-r1-date-${database}`,
+      opportunity_id: opportunityId, source_id: sourceId, source_name: sourceName,
+      source_record_id: sourceRecordId, field: 'date_added', value,
+      observed_at: at, created_at: at, updated_at: at });
+    const record = (value, posted) => ({ opportunity_id: opportunityId, source_id: sourceId,
+      source_name: sourceName, source_record_id: sourceRecordId,
+      observations: [observation(value), dateObservation(posted)], freshness_evidence: {
+        dateAdded: { rawHeader: 'Posted Date', rawValue: posted,
+          precision: 'date', meaning: 'unknown' },
+        annualProfit: { rawHeader: 'SDE', rawValue: String(value),
+          metric: 'sde', currency: 'USD', period: 'annual' },
+      } });
+    psql(container, database, `insert into public.deal_hunter_opportunities
+      (opportunity_id, created_at, updated_at, canonical_name, identity_version, discovery_state)
+      values ('${opportunityId}', now(), now(), 'Mixed Sheet', 'test', 'pending');`);
+    const adapter = createSupabaseStorage({ storage: { supabaseUrl: 'https://synthetic.invalid',
+      supabaseServiceRoleKey: 'synthetic' } }, { client: { async rpc(name, args) {
+      if (name === 'replace_deal_hunter_opportunity_source_observation_snapshot') {
+        const data = JSON.parse(psql(container, database, `select coalesce(jsonb_agg(to_jsonb(value)),
+          '[]'::jsonb) from public.replace_deal_hunter_opportunity_source_observation_snapshot(
+          '${args.p_opportunity_id}', '${args.p_source_id}', '${args.p_source_name}',
+          '${args.p_source_record_id}', ${quote(args.p_observations)}::jsonb) as value;`));
+        return { data, error: null };
+      }
+      if (name === 'upsert_deal_hunter_opportunity_source_observation') {
+        const data = JSON.parse(psql(container, database, `select to_jsonb(value)
+          from public.upsert_deal_hunter_opportunity_source_observation(
+          '${args.p_id}', '${args.p_opportunity_id}', '${args.p_source_id}',
+          '${args.p_source_name}', '${args.p_source_record_id}', '${args.p_field}',
+          '${args.p_value}', '${args.p_observed_at}'::timestamptz,
+          '${args.p_created_at}'::timestamptz, '${args.p_updated_at}'::timestamptz) as value;`));
+        return { data, error: null };
+      }
+      throw new Error(`Unexpected RPC ${name}`);
+    } } });
+    const accept = async (value, posted) => {
+      const runId = randomUUID();
+      const run = JSON.parse(psql(container, database,
+        `select public.allocate_deal_hunter_source_generation('${sourceId}', '${runId}');`));
+      let captured;
+      await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
+        storage: { async replaceAdmittedCompleteGoogleSheetSourceSnapshot(item) { captured = item; } },
+        reviewMode: 'full-backfill', run,
+        sourceResult: { source: { id: sourceId, required: true, fetched: true,
+          sourceRowCount: 1, rowCount: 1, coverageLimitReached: false },
+        deals: [{ sourceId, sourceName, stableExternalId: true, id: 'R1-PG' }] },
+        records: [record(value, posted)],
+      });
+      return JSON.parse(psql(container, database, `select public.accept_admitted_complete_google_sheet_freshness_v1(
+        ${quote(captured.admission)}::jsonb, ${quote(captured.records)});`));
+    };
+    assert.equal((await accept(100, '2026-09-22')).projectionState, 'accepted');
+    psql(container, database, `insert into public.deal_hunter_opportunity_scores
+      (opportunity_id, scored_at, deal_key, name, fit_score, confidence,
+        score_fingerprint, engine_version, rules_version, profile_version,
+        completeness_policy_version, current_triage_eligible)
+      values ('${opportunityId}', now(), '${opportunityId}', 'Mixed Sheet', 82, 'high',
+        'mixed-r1', 'test', 'test', 'test', 'test', true);`);
+    const readerRow = () => JSON.parse(psql(container, database,
+      "select public.list_deal_hunter_fresh_inbox_v1('all-active');"))
+      .areas[0].rows.find((row) => row.opportunity_id === opportunityId);
+    assert.deepEqual(readerRow().annual_profit_evidence,
+      { metric: 'sde', currency: 'USD', period: 'annual' });
+    const current = () => JSON.parse(psql(container, database, `select jsonb_build_object(
+      'value', value, 'accepted', accepted_evidence_id) from public.deal_hunter_opportunity_source_observations
+      where opportunity_id='${opportunityId}' and field='annual_profit';`));
+    assert.ok(current().accepted);
+    await adapter.upsertDealHunterOpportunitySourceObservation(observation(110));
+    assert.deepEqual(current(), { value: '110', accepted: null });
+    await adapter.replaceDealHunterOpportunitySourceObservationSnapshot(record(120, '2026-09-23'));
+    assert.deepEqual(current(), { value: '120', accepted: null });
+    const publication = () => JSON.parse(psql(container, database, `select jsonb_build_object(
+      'accepted', accepted_evidence_id, 'header', publication_raw_header)
+      from public.deal_hunter_opportunity_source_observations
+      where opportunity_id='${opportunityId}' and field='date_added';`));
+    assert.deepEqual(publication(), { accepted: null, header: null });
+    assert.equal(readerRow().annual_profit_evidence, null);
+    assert.equal((await accept(120, '2026-09-23')).projectionState, 'accepted');
+    assert.ok(current().accepted);
+    assert.ok(publication().accepted);
+    assert.equal(publication().header, 'Posted Date');
+    assert.deepEqual(readerRow().annual_profit_evidence,
+      { metric: 'sde', currency: 'USD', period: 'annual' });
+    const transitions = () => JSON.parse(psql(container, database, `select coalesce(jsonb_agg(
+      jsonb_build_array(before_value, after_value) order by accepted_at), '[]'::jsonb)
+      from public.deal_hunter_freshness_evidence where source_id='${sourceId}'
+        and field_key='annual_profit' and event_type='material_change';`));
+    assert.deepEqual(transitions(), [[100, 120]]);
+    const acceptedEvidenceId = current().accepted;
+    await adapter.replaceDealHunterOpportunitySourceObservationSnapshot(record(120, '2026-09-23'));
+    assert.equal(current().accepted, acceptedEvidenceId);
+    assert.equal((await accept(120, '2026-09-23')).projectionState, 'accepted');
+    assert.deepEqual(transitions(), [[100, 120]]);
   }
   for (const database of ['fl01_fresh', 'fl01_upgrade']) {
     const resolvedDeferredId = `fl01-deferred-resolved-${database}`;
@@ -633,6 +813,19 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
     assert.equal(inbox.areas[0].counts.ownerPriority, 15);
     assert.equal(inbox.areas[0].rows.length, 3);
     assert.ok(inbox.areas[1].rows.some((row) => row.opportunity_id === freshId));
+    const sorted = (sort, offset = 0, limit = 25) => JSON.parse(psql(container, database,
+      `select public.list_deal_hunter_fresh_inbox_v1('all-active', ${offset}, ${limit},
+        '', '', '', '', now(), '${sort}');`)).areas[0];
+    const newest = sorted('newest-discovery');
+    const highestFit = sorted('highest-fit');
+    assert.ok(newest.rows.findIndex((row) => row.opportunity_id === freshId)
+      < newest.rows.findIndex((row) => row.opportunity_id === `old-priority-${database}-0`));
+    assert.equal(highestFit.rows[0].fit_score, 90);
+    const firstFitPage = sorted('highest-fit', 0, 5);
+    const secondFitPage = sorted('highest-fit', 5, 5);
+    assert.equal(secondFitPage.anchorId, firstFitPage.lastId);
+    assert.equal(new Set([...firstFitPage.rows, ...secondFitPage.rows]
+      .map((row) => row.opportunity_id)).size, 10);
     assert.equal(inbox.areas[1].rows.find((row) => row.opportunity_id === freshId).primary_submission_id, null);
     const allPriorities = JSON.parse(psql(container, database,
       "select public.list_deal_hunter_fresh_inbox_v1('owner-priorities', 0, 10);"));

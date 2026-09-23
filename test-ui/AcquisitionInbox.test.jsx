@@ -256,6 +256,46 @@ afterEach(() => {
 });
 
 describe('Fresh-first Acquisition Inbox', () => {
+  test('Inbox earnings labels state supported and unverified metric, period, and currency', async () => {
+    const unsupported = queueRow({ opportunityId: 'unknown-earnings', name: 'Unknown earnings' });
+    const supported = queueRow({ opportunityId: 'supported-sde', name: 'Supported SDE',
+      financials: { annualProfit: 425000, annualProfitEvidence: {
+        metric: 'sde', period: 'annual', currency: 'USD' } } });
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ view: 'inbox',
+      areas: [{ id: 'action-preview', rows: [], total: 0, counts: {} },
+        { id: 'new-important', rows: [unsupported, supported], total: 2, counts: {} }],
+      rows: [unsupported, supported] }))));
+    renderInbox({ initialView: 'inbox' });
+    const region = await screen.findByRole('region', { name: 'New & Important' });
+    expect(within(region).getByText(/Earnings metric unverified.*period unverified/)).toBeVisible();
+    expect(within(region).getByText(/SDE.*annual/)).toBeVisible();
+  });
+
+  test('All active exposes exploration sorts and preserves sort when returning from detail', async () => {
+    const row = queueRow({ opportunityId: 'sort-row', name: 'Sort row' });
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      const address = new URL(String(url), 'https://example.test');
+      if (address.pathname.endsWith('/triage/sort-row')) return jsonResponse({ success: true, ...detailResponse(row) });
+      requests.push(address);
+      const area = address.searchParams.get('area');
+      return jsonResponse(queueResponse({ view: 'inbox',
+        areas: area === 'inbox' ? [{ id: 'action-preview', rows: [], total: 0, counts: {} },
+          { id: 'new-important', rows: [], total: 0, counts: {} }]
+          : [{ id: area, rows: [row], total: 1, counts: {} }], rows: [row] }));
+    }));
+    renderInbox({ initialView: 'inbox' });
+    const nav = await screen.findByRole('navigation', { name: 'Fresh Inbox areas' });
+    fireEvent.click(within(nav).getByRole('button', { name: 'All active' }));
+    const sort = await screen.findByRole('combobox', { name: 'Explore opportunities' });
+    fireEvent.change(sort, { target: { value: 'newest-discovery' } });
+    await waitFor(() => expect(requests.at(-1).searchParams.get('sort')).toBe('newest-discovery'));
+    const region = await screen.findByRole('region', { name: 'All active' });
+    fireEvent.click(within(region).getByRole('button', { name: 'Open Sort row' }));
+    expect(await screen.findByRole('dialog', { name: /Sort row/ })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Close opportunity detail' }));
+    expect(sort).toHaveValue('newest-discovery');
+  });
   test('due overflow and one dual-qualified canonical record stay visible in both contexts', async () => {
     const dual = queueRow({ opportunityId: 'dual', name: 'Fresh due opportunity',
       operatorPriority: 'urgent', freshness: { discoveryState: 'known_prospective',
@@ -670,7 +710,7 @@ describe('Acquisition Inbox queue', () => {
     expect(screen.getByRole('tab', { name: /Needs Review/ })).toHaveAttribute('aria-selected', 'true');
     expect(screen.getByText(/Sacramento, CA/)).toBeVisible();
     expect(screen.getByText(/Fire protection services/)).toBeVisible();
-    expect(screen.getByText('$425,000')).toBeVisible();
+    expect(screen.getByText(/425,000 currency unverified/)).toBeVisible();
     expect(screen.getByText('$2,200,000')).toBeVisible();
     expect(screen.getByText('$1,800,000')).toBeVisible();
     expect(screen.getByText('4.24×')).toBeVisible();

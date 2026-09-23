@@ -5897,6 +5897,8 @@ async function attachCanonicalOpportunityIdentities(
       freshnessPending: sourceObservationDealsForDeal(deal).some((sourceDeal) => (
         Boolean(sourceDeal?.freshnessRun)
           || Boolean(deferredSourceScopes.get(String(sourceDeal?.sourceId || '').trim())?.freshnessRun)
+          || (typeof storage.markDealHunterOpportunityDiscoveryPending === 'function'
+            && String(sourceDeal?.sourceId || '').startsWith('sheet-'))
       )),
     });
     if (resolution.opportunity) {

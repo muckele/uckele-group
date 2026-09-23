@@ -10037,7 +10037,8 @@ export function createSqliteStorage(config, options = {}) {
       },
 
       async listDealHunterFreshInbox({ area = 'inbox', cursor = null, limit = null,
-        search = '', confidence = '', priority = '', state = '', asOf = new Date().toISOString() } = {}) {
+        search = '', confidence = '', priority = '', state = '', sort = 'acquisition-priority',
+        asOf = new Date().toISOString() } = {}) {
         const filters = { search: String(search || '').trim().toLowerCase().slice(0, 160),
           confidence: String(confidence || ''), priority: String(priority || ''),
           state: String(state || '').toUpperCase() };
@@ -10203,7 +10204,7 @@ export function createSqliteStorage(config, options = {}) {
             reviewed_discovery_revision: Number(row.reviewed_discovery_revision || 0),
             reviewed_material_revision: Number(row.reviewed_material_revision || 0),
           }));
-          const result = buildFreshInboxAreas(candidates, { area, cursor, limit, asOf, filters });
+          const result = buildFreshInboxAreas(candidates, { area, cursor, limit, asOf, filters, sort });
           const hydrate = database.prepare(`SELECT scores.*,
             opportunity.primary_submission_id,
             (SELECT MAX(source.accepted_at) FROM deal_hunter_opportunity_source_observations AS source
@@ -10260,6 +10261,21 @@ export function createSqliteStorage(config, options = {}) {
             (SELECT source.value FROM deal_hunter_opportunity_source_observations AS source
               WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'annual_profit'
               ORDER BY source.observed_at DESC, source.id LIMIT 1) AS annual_profit,
+            (SELECT json_object('metric', evidence.metric, 'period', evidence.period,
+                'currency', evidence.currency)
+              FROM deal_hunter_opportunity_source_observations AS source
+              JOIN deal_hunter_freshness_evidence AS core ON core.id = source.accepted_evidence_id
+              JOIN deal_hunter_freshness_evidence AS evidence ON evidence.run_id = core.run_id
+                AND evidence.source_id = core.source_id
+                AND evidence.source_record_id = core.source_record_id
+                AND evidence.event_type = 'accepted_source_record'
+                AND evidence.field_key = 'annual_profit'
+                AND evidence.current_canonical_id = scores.opportunity_id
+              WHERE source.id = (SELECT chosen.id FROM deal_hunter_opportunity_source_observations AS chosen
+                WHERE chosen.opportunity_id = scores.opportunity_id AND chosen.field = 'annual_profit'
+                ORDER BY chosen.observed_at DESC, chosen.id LIMIT 1)
+                AND CAST(source.value AS REAL) = evidence.after_value
+              LIMIT 1) AS annual_profit_evidence,
             (SELECT source.value FROM deal_hunter_opportunity_source_observations AS source
               WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'annual_revenue'
               ORDER BY source.observed_at DESC, source.id LIMIT 1) AS annual_revenue,
@@ -11826,12 +11842,41 @@ export function createSqliteStorage(config, options = {}) {
           WHERE run_id = ? AND source_id = 'deal-os-export' AND source_record_id = ?
             AND current_canonical_id IS NULL`
         ).run(canonicalId, runId, runId, recordId);
+        const priorAccepted = database.prepare(`SELECT earlier.id, earlier.run_id,
+            earlier.accepted_at, earlier.current_canonical_id,
+            json_extract(older_import.row_accounting,
+              '$[' || CAST(earlier.event_ordinal AS INTEGER) || '].listingIdentity') AS listing_identity
+          FROM deal_hunter_freshness_evidence AS earlier
+          JOIN deal_hunter_deal_os_imports AS older_import ON older_import.id = earlier.run_id
+          WHERE earlier.source_id = 'deal-os-export' AND earlier.source_record_id = ?
+            AND earlier.event_type = 'accepted_source_record' AND earlier.field_key = ''
+            AND earlier.accepted_at < ?
+          ORDER BY earlier.accepted_at, earlier.id LIMIT 1`
+        ).get(recordId, event.accepted_at);
+        const currentListingIdentity = database.prepare(`SELECT json_extract(row_accounting,
+          '$[' || CAST(? AS INTEGER) || '].listingIdentity') AS listing_identity
+          FROM deal_hunter_deal_os_imports WHERE id = ?`
+        ).get(event.event_ordinal, runId)?.listing_identity;
+        const provenEarlier = priorAccepted && currentListingIdentity
+          && priorAccepted.listing_identity === currentListingIdentity;
+        if (provenEarlier && priorAccepted.current_canonical_id
+          && priorAccepted.current_canonical_id !== canonicalId) {
+          throw new Error('Earlier accepted Deal OS listing is bound to another canonical identity.');
+        }
+        if (provenEarlier && !priorAccepted.current_canonical_id) {
+          database.prepare(`UPDATE deal_hunter_freshness_evidence
+            SET current_canonical_id = ?, binding_audit_id = ?
+            WHERE run_id = ? AND source_id = 'deal-os-export' AND source_record_id = ?
+              AND current_canonical_id IS NULL`
+          ).run(canonicalId, runId, priorAccepted.run_id, recordId);
+        }
         if (canonical.discovery_state === 'pending' && canonical.first_accepted_at === null) {
-          database.prepare(`UPDATE deal_hunter_opportunities SET first_accepted_at = ?,
+          if (!priorAccepted || provenEarlier) database.prepare(`UPDATE deal_hunter_opportunities SET first_accepted_at = ?,
             first_discovery_evidence_id = ?, discovery_state = ?,
             discovery_revision = discovery_revision + 1 WHERE opportunity_id = ?`
-          ).run(event.accepted_at, event.id,
-            state?.accepted_generation === expectedGeneration && state?.accepted_run_id === runId
+          ).run(provenEarlier ? priorAccepted.accepted_at : event.accepted_at,
+            provenEarlier ? priorAccepted.id : event.id,
+            !provenEarlier && state?.accepted_generation === expectedGeneration && state?.accepted_run_id === runId
               ? 'known_prospective' : 'known_recovered', canonicalId);
         } else if (['known_prospective', 'known_recovered'].includes(canonical.discovery_state)
           && canonical.first_accepted_at && event.accepted_at < canonical.first_accepted_at) {
@@ -11966,7 +12011,23 @@ export function createSqliteStorage(config, options = {}) {
           source_name = excluded.source_name,
           value = excluded.value,
           observed_at = excluded.observed_at,
-          updated_at = excluded.updated_at
+          updated_at = excluded.updated_at,
+          accepted_at = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.accepted_at END,
+          accepted_run_id = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.accepted_run_id END,
+          accepted_evidence_id = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.accepted_evidence_id END,
+          publication_raw_header = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_raw_header END,
+          publication_raw_value = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_raw_value END,
+          publication_precision = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_precision END,
+          publication_offset = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_offset END,
+          publication_meaning = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_meaning END
       `).run(normalizedObservation);
       return normalizeDealHunterOpportunitySourceObservationRow(database.prepare(`
         SELECT * FROM deal_hunter_opportunity_source_observations
@@ -11996,7 +12057,23 @@ export function createSqliteStorage(config, options = {}) {
               source_name = excluded.source_name,
               value = excluded.value,
               observed_at = excluded.observed_at,
-              updated_at = excluded.updated_at
+              updated_at = excluded.updated_at,
+              accepted_at = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.accepted_at END,
+              accepted_run_id = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.accepted_run_id END,
+              accepted_evidence_id = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.accepted_evidence_id END,
+              publication_raw_header = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_raw_header END,
+              publication_raw_value = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_raw_value END,
+              publication_precision = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_precision END,
+              publication_offset = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_offset END,
+              publication_meaning = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_meaning END
           `).run(observation);
         }
         const fields = value.observations.map((observation) => observation.field);
@@ -12208,9 +12285,15 @@ export function createSqliteStorage(config, options = {}) {
               const before = beforeCore ? database.prepare(`SELECT * FROM deal_hunter_freshness_evidence
                 WHERE run_id = ? AND source_id = ? AND source_record_id = ?
                   AND event_type = 'accepted_source_record' AND field_key = ? LIMIT 1`
-              ).get(beforeCore.run_id, value.source_id, sourceRecordId, fieldKey) : null;
+              ).get(beforeCore.run_id, value.source_id, sourceRecordId, fieldKey)
+                : database.prepare(`SELECT * FROM deal_hunter_freshness_evidence
+                  WHERE source_id = ? AND source_record_id = ? AND field_key = ?
+                    AND event_type = 'accepted_source_record' AND run_id <> ?
+                    AND current_canonical_id = ?
+                  ORDER BY accepted_at DESC, id DESC LIMIT 1`
+                ).get(value.source_id, sourceRecordId, fieldKey, run.runId, record.opportunity_id);
               if (beforeObservation?.opportunity_id !== record.opportunity_id
-                || beforeObservation?.value === String(afterValue) || before?.after_value === afterValue) continue;
+                || before?.after_value === afterValue) continue;
               const competing = database.prepare(`SELECT 1 FROM deal_hunter_opportunity_source_observations
                 WHERE opportunity_id = ? AND source_id <> ? AND field = ? AND value <> ? LIMIT 1`
               ).get(record.opportunity_id, value.source_id, fieldKey, String(afterValue));
@@ -12254,7 +12337,8 @@ export function createSqliteStorage(config, options = {}) {
               discovery_revision = discovery_revision + 1
               WHERE opportunity_id = ? AND discovery_state = 'pending' AND first_accepted_at IS NULL`
             ).run(earlierProven?.accepted_at || acceptedAt, earlierProven?.id || coreId,
-              earlierProven ? 'known_recovered' : 'known_prospective', record.opportunity_id);
+              earlierProven || current?.accepted_evidence_id === null && current?.opportunity_id === record.opportunity_id
+                ? 'known_recovered' : 'known_prospective', record.opportunity_id);
           }
         }
         const desiredKeys = new Set();

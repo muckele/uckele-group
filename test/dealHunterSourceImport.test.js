@@ -389,6 +389,132 @@ test('separate identical Deal OS uploads each accept bounded row evidence while 
   assert.equal(db.prepare("SELECT accepted_generation FROM deal_hunter_source_freshness_state WHERE source_id='deal-os-export'").get().accepted_generation, 2);
 });
 
+test('newer Deal OS binding first recovers proven older discovery before showing the Inbox', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-bind-order-'));
+  const sqlitePath = path.join(directory, 'bindings.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const opportunityId = 'bind-order-opportunity';
+  const sourceRecordId = 'external:BIND-1';
+  const listingUrl = 'https://broker.example/bind-1';
+  const at = new Date().toISOString();
+  await storage.upsertDealHunterOpportunity({ opportunity_id: opportunityId, created_at: at,
+    updated_at: at, canonical_name: 'Bind order HVAC', identity_version: 'test', status: 'active', metadata: {} });
+  await storage.markDealHunterOpportunityDiscoveryPending({ opportunityId, createdAt: at });
+  const imports = [];
+  for (const [index, price] of [100, 120].entries()) {
+    const id = `bind-order-${index}`;
+    const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'deal-os-export', runId: id });
+    await storage.insertDealHunterDealOsImport({
+      id, created_at: at, imported_by: 'synthetic-test', exported_at: at,
+      file_name: 'bind.csv', file_type: 'text/csv', file_size: 100,
+      file_sha256: String(index + 1).repeat(64), scope: 'saved-search', coverage_label: 'Synthetic',
+      expected_row_count: 1, row_count: 1, source_row_count: 1, accepted_row_count: 1,
+      rejected_row_count: 0, canonical_record_count: 1, parser_version: 'deal-os-export-v2',
+      row_accounting: [{ sourceRowNumber: 2, status: 'accepted',
+        listingIdentity: listingUrl }], duplicate_count: 0,
+      stable_id_count: 1, listing_url_count: 1, coverage_limit_reached: false,
+      records: [{ stableId: 'BIND-1', name: 'Bind order HVAC', listingUrl }], metadata: {},
+      freshnessRun: run, acceptedRowEvidence: [{ sourceRecordId, eventOrdinal: 0,
+        freshnessEvidence: { askingPrice: { rawHeader: 'Asking Price', rawValue: String(price),
+          metric: 'asking_price', currency: 'USD', period: 'total' } } }],
+    });
+    imports.push({ id, run, price });
+  }
+  const db = new Database(sqlitePath);
+  t.after(() => db.close());
+  const olderDate = '2026-09-14T12:00:00.000Z';
+  // Fixture chronology only: accepted_at is immutable in the real writer.
+  db.exec('DROP TRIGGER deal_hunter_freshness_evidence_no_payload_update');
+  db.prepare('UPDATE deal_hunter_freshness_evidence SET accepted_at = ? WHERE run_id = ?')
+    .run(olderDate, imports[0].id);
+  db.exec(`CREATE TRIGGER deal_hunter_freshness_evidence_no_payload_update
+    BEFORE UPDATE OF id, source_id, source_name, source_record_id, run_id, generation,
+      record_digest, event_type, field_key, event_ordinal, accepted_at, original_canonical_id,
+      identity_exception_id, provenance_version, raw_header, raw_value, publication_meaning,
+      publication_date, publication_instant, publication_precision, publication_offset,
+      publication_state, before_value, after_value, before_evidence_id, after_evidence_id,
+      metric, currency, period, classification, material_revision
+    ON deal_hunter_freshness_evidence BEGIN
+      SELECT RAISE(ABORT, 'freshness evidence payload is immutable');
+    END`);
+  const snapshot = (price) => ({ opportunity_id: opportunityId, source_id: 'deal-os-export',
+    source_name: 'SMB Deal OS Export', source_record_id: sourceRecordId,
+    observations: [{ id: 'bind-order-price', opportunity_id: opportunityId, source_id: 'deal-os-export',
+      source_name: 'SMB Deal OS Export', source_record_id: sourceRecordId, field: 'asking_price',
+      value: String(price), observed_at: at, created_at: at, updated_at: at }],
+    freshness_evidence: { askingPrice: { rawHeader: 'Asking Price', rawValue: String(price),
+      metric: 'asking_price', currency: 'USD', period: 'total' } } });
+  await storage.bindAcceptedDealHunterFreshness({ importId: imports[1].id, opportunityId,
+    sourceRecordId, expectedGeneration: imports[1].run.generation, snapshot: snapshot(120) });
+  const intermediate = await storage.getDealHunterOpportunity(opportunityId);
+  assert.equal(intermediate.first_accepted_at, olderDate);
+  assert.equal(intermediate.discovery_state, 'known_recovered');
+  await storage.writeDealHunterOpportunityScore({ opportunity_id: opportunityId, scored_at: at,
+    deal_key: opportunityId, name: 'Bind order HVAC', fit_score: 86, confidence: 'high',
+    score_fingerprint: 'bind-order', engine_version: 'test', rules_version: 'test',
+    profile_version: 'test', completeness_policy_version: 'test' }, []);
+  await storage.reconcileDealHunterCurrentScoreEligibility([opportunityId]);
+  const reader = await storage.listDealHunterFreshInbox({ area: 'all-active', asOf: at });
+  assert.equal(reader.areas[0].rows.find((row) => row.opportunity_id === opportunityId).new_to_ug, false);
+  assert.equal((await storage.listDealHunterOpportunitySourceObservations(opportunityId))
+    .find((row) => row.field === 'asking_price').value, '120');
+  await Promise.all([0, 1].map(() => storage.bindAcceptedDealHunterFreshness({
+    importId: imports[1].id, opportunityId, sourceRecordId,
+    expectedGeneration: imports[1].run.generation, snapshot: snapshot(120),
+  })));
+  assert.equal((await storage.getDealHunterOpportunity(opportunityId)).discovery_revision, 1);
+  await storage.bindAcceptedDealHunterFreshness({ importId: imports[0].id, opportunityId,
+    sourceRecordId, expectedGeneration: imports[0].run.generation, snapshot: snapshot(100) });
+  assert.equal((await storage.getDealHunterOpportunity(opportunityId)).first_accepted_at, olderDate);
+  assert.equal((await storage.listDealHunterOpportunitySourceObservations(opportunityId))
+    .find((row) => row.field === 'asking_price').value, '120');
+  const ambiguousId = 'bind-order-ambiguous';
+  const ambiguousRecordId = 'external:BIND-AMBIG';
+  await storage.upsertDealHunterOpportunity({ opportunity_id: ambiguousId, created_at: at,
+    updated_at: at, canonical_name: 'Ambiguous bind', identity_version: 'test', status: 'active', metadata: {} });
+  await storage.markDealHunterOpportunityDiscoveryPending({ opportunityId: ambiguousId, createdAt: at });
+  const ambiguousImports = [];
+  for (const [index, url] of ['https://broker.example/ambiguous-a',
+    'https://broker.example/ambiguous-b'].entries()) {
+    const id = `ambiguous-bind-${index}`;
+    const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'deal-os-export', runId: id });
+    await storage.insertDealHunterDealOsImport({
+      id, created_at: at, imported_by: 'synthetic-test', exported_at: at,
+      file_name: 'bind.csv', file_type: 'text/csv', file_size: 100,
+      file_sha256: String(index + 3).repeat(64), scope: 'saved-search', coverage_label: 'Synthetic',
+      expected_row_count: 1, row_count: 1, source_row_count: 1, accepted_row_count: 1,
+      rejected_row_count: 0, canonical_record_count: 1, parser_version: 'deal-os-export-v2',
+      row_accounting: [{ sourceRowNumber: 2, status: 'accepted', listingIdentity: url }],
+      duplicate_count: 0, stable_id_count: 1, listing_url_count: 1, coverage_limit_reached: false,
+      records: [{ stableId: 'BIND-AMBIG', name: 'Ambiguous bind', listingUrl: url }], metadata: {},
+      freshnessRun: run, acceptedRowEvidence: [{ sourceRecordId: ambiguousRecordId, eventOrdinal: 0,
+        freshnessEvidence: null }],
+    });
+    ambiguousImports.push({ id, run });
+  }
+  db.exec('DROP TRIGGER deal_hunter_freshness_evidence_no_payload_update');
+  db.prepare('UPDATE deal_hunter_freshness_evidence SET accepted_at = ? WHERE run_id = ?')
+    .run(olderDate, ambiguousImports[0].id);
+  db.exec(`CREATE TRIGGER deal_hunter_freshness_evidence_no_payload_update
+    BEFORE UPDATE OF accepted_at ON deal_hunter_freshness_evidence BEGIN
+      SELECT RAISE(ABORT, 'freshness evidence payload is immutable'); END`);
+  const ambiguousSnapshot = { opportunity_id: ambiguousId, source_id: 'deal-os-export',
+    source_name: 'SMB Deal OS Export', source_record_id: ambiguousRecordId,
+    observations: [{ id: 'ambiguous-observation', opportunity_id: ambiguousId,
+      source_id: 'deal-os-export', source_name: 'SMB Deal OS Export',
+      source_record_id: ambiguousRecordId, field: 'name', value: 'Ambiguous bind',
+      observed_at: at, created_at: at, updated_at: at }] };
+  await storage.bindAcceptedDealHunterFreshness({ importId: ambiguousImports[1].id,
+    opportunityId: ambiguousId, sourceRecordId: ambiguousRecordId,
+    expectedGeneration: ambiguousImports[1].run.generation, snapshot: ambiguousSnapshot });
+  const uncertain = await storage.getDealHunterOpportunity(ambiguousId);
+  assert.equal(uncertain.discovery_state, 'pending');
+  assert.equal(uncertain.first_accepted_at, null);
+  assert.equal(db.prepare(`SELECT current_canonical_id FROM deal_hunter_freshness_evidence
+    WHERE run_id = ? AND field_key = ''`).get(ambiguousImports[0].id).current_canonical_id, null);
+});
+
 test('accepted Deal OS price A to B to A to B retains three comparable transitions', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-dos-material-'));
   const sqlitePath = path.join(directory, 'deal-os.sqlite');
@@ -506,6 +632,69 @@ test('a complete admitted Sheet run creates one prospective discovery and a no-o
   const restoredScore = await storage.getDealHunterOpportunityScore(opportunity.opportunity_id);
   assert.deepEqual([restoredScore.reviewed_discovery_revision,
     restoredScore.reviewed_material_revision], [1, 0]);
+});
+
+test('daily-first Sheet discovery stays pending until complete acceptance and is never called newly accepted', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-daily-first-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'daily.sqlite') } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  sourceWorkbook = buildWorkbook([]);
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Annual Profit,Description',
+    'DAILY-NEW,Daily first HVAC,https://broker.example/daily-first,CA,450000,Commercial HVAC maintenance company',
+  ].join('\n');
+  assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'daily', actor: 'fl01-r1' })).ok, true);
+  const [daily] = await storage.listCurrentDealHunterOpportunities({ limit: 10 });
+  assert.equal(daily.discovery_state, 'pending');
+  assert.equal(daily.first_accepted_at, null);
+  assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'fl01-r1' })).ok, true);
+  const accepted = await storage.getDealHunterOpportunity(daily.opportunity_id);
+  assert.equal(accepted.discovery_state, 'known_recovered');
+  assert.ok(accepted.first_accepted_at);
+});
+
+test('real complete, daily changed, complete Sheet sequence detaches stale provenance and records the transition', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-mixed-sheet-'));
+  const sqlitePath = path.join(directory, 'mixed.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  sourceWorkbook = buildWorkbook([]);
+  const csv = (profit, posted) => [
+    'Listing ID,Business Name,Listing URL,State,Posted Date,Annual Profit,Description',
+    `MIXED-1,Mixed HVAC,https://broker.example/mixed-hvac,CA,${posted},${profit},Commercial HVAC maintenance company`,
+  ].join('\n');
+  sourceCsv = csv(450000, '2026-09-22');
+  assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'fl01-r1' })).ok, true);
+  const [opportunity] = await storage.listCurrentDealHunterOpportunities({ limit: 10 });
+  const profit = async () => (await storage.listDealHunterOpportunitySourceObservations(opportunity.opportunity_id))
+    .find((row) => row.source_id === 'sheet-0' && row.field === 'annual_profit');
+  const first = await profit();
+  assert.equal(first.value, '450000');
+  assert.ok(first.accepted_evidence_id);
+  sourceCsv = csv(475000, '2026-09-23');
+  assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'daily', actor: 'fl01-r1' })).ok, true);
+  const daily = await profit();
+  assert.equal(daily.value, '475000');
+  assert.equal(daily.accepted_evidence_id ?? null, null);
+  assert.equal(daily.accepted_run_id ?? null, null);
+  const dailyDate = (await storage.listDealHunterOpportunitySourceObservations(opportunity.opportunity_id))
+    .find((row) => row.source_id === 'sheet-0' && row.field === 'date_added');
+  assert.equal(dailyDate.accepted_evidence_id ?? null, null);
+  assert.equal(dailyDate.publication_raw_header ?? null, null);
+  assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'fl01-r1' })).ok, true);
+  const complete = await profit();
+  assert.equal(complete.value, '475000');
+  assert.ok(complete.accepted_evidence_id);
+  const completeDate = (await storage.listDealHunterOpportunitySourceObservations(opportunity.opportunity_id))
+    .find((row) => row.source_id === 'sheet-0' && row.field === 'date_added');
+  assert.ok(completeDate.accepted_evidence_id);
+  const db = new Database(sqlitePath, { readonly: true });
+  t.after(() => db.close());
+  assert.equal(db.prepare("SELECT count(*) AS n FROM deal_hunter_freshness_evidence WHERE source_id='sheet-0' AND field_key='annual_profit' AND event_type='evidence_state_change'").get().n, 1);
+  assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'daily', actor: 'fl01-r1' })).ok, true);
+  assert.equal((await profit()).accepted_evidence_id, complete.accepted_evidence_id);
+  assert.equal((await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'fl01-r1' })).ok, true);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM deal_hunter_freshness_evidence WHERE source_id='sheet-0' AND field_key='annual_profit' AND event_type='evidence_state_change'").get().n, 1);
 });
 
 test('a proven Sheet and Deal OS match binds accepted import evidence to one canonical opportunity', async (t) => {
