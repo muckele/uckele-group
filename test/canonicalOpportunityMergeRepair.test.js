@@ -838,7 +838,15 @@ test('Garage apply moves one alias and preserves observations, scores, evidence,
   });
   const survivor = opportunities.find(({ opportunity_id: id }) => id === garageSurvivorId);
   const loser = opportunities.find(({ opportunity_id: id }) => id === garageSupersededId);
-  assert.deepEqual(survivor, survivorBefore);
+  assert.deepEqual(survivor, {
+    ...survivorBefore,
+    first_accepted_at: null,
+    first_discovery_evidence_id: null,
+    discovery_state: 'untracked_legacy',
+    discovery_revision: 0,
+    material_revision: 0,
+    last_material_change_at: null,
+  });
   assert.equal(loser.status, 'superseded');
   assert.equal(loser.metadata.canonicalOpportunityMerge.mergedInto, garageSurvivorId);
   assert.equal(loser.metadata.canonicalOpportunityMerge.exceptionId, garageExceptionId);
@@ -3028,7 +3036,7 @@ test('relationship inventory classifies the exact supersession relationship surf
 test('relationship inventory classifies every reviewed omission exactly once in all four categories', () => {
   const entries = CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries;
   const keys = entries.map((entry) => `${entry.table}.${entry.column}`);
-  assert.equal(entries.length, 241);
+  assert.equal(entries.length, 256);
   assert.equal(new Set(keys).size, keys.length);
   assert.deepEqual(
     [...new Set(entries.map((entry) => entry.category))].sort(),
@@ -3040,10 +3048,10 @@ test('relationship inventory classifies every reviewed omission exactly once in 
       entries.filter((entry) => entry.category === category).length,
     ])),
     {
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 94,
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT]: 58,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 98,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT]: 66,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.PRESERVED_GLOBAL_RECIPIENT_OPERATIONAL_STATE]: 54,
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED]: 35,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED]: 38,
     },
   );
   assert.deepEqual(
@@ -3057,10 +3065,10 @@ test('relationship inventory classifies every reviewed omission exactly once in 
       entries.filter((entry) => entry.enforcement === enforcement).length,
     ])),
     {
-      [materialScannerPathEnforcement]: 196,
+      [materialScannerPathEnforcement]: 208,
       [independentGateEnforcement]: 10,
-      [approvalPreconditionEnforcement]: 11,
-      [explicitExclusionEnforcement]: 24,
+      [approvalPreconditionEnforcement]: 12,
+      [explicitExclusionEnforcement]: 26,
     },
   );
   const optionalLegacyEntries = entries.filter((entry) => (
@@ -3074,7 +3082,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
     [...new Set(optionalLegacyEntries.map((entry) => entry.table))].sort(),
     ['admin_magic_links_legacy_v1', 'deal_hunter_candidates', 'prospect_discoveries'],
   );
-  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 234);
+  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 249);
   for (const entry of entries) {
     assert.ok(entry.reason, `${entry.table}.${entry.column} must document its classification`);
     assert.ok(entry.enforcement, `${entry.table}.${entry.column} must declare its enforcement class`);
@@ -3145,8 +3153,8 @@ test('relationship inventory checksum is deterministic over the complete presenc
   const first = canonicalOpportunityMergeRelationshipInventorySummary();
   const second = canonicalOpportunityMergeRelationshipInventorySummary();
   assert.deepEqual(first, second);
-  assert.equal(first.entryCount, 241);
-  assert.equal(first.checksum, '6c7de82372753e688d054b905823f13fd2719aeff5fdb3c93c36d997bf91fbbd');
+  assert.equal(first.entryCount, 256);
+  assert.equal(first.checksum, '89fb2b0371ae9a1da518bfe09647a761f54eae47c7c0be7750f7665d9ecf1321');
   assert.equal(
     first.checksum,
     createHash('sha256')

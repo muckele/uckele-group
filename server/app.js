@@ -1595,7 +1595,9 @@ export function createApp({
       review.emailReadiness = await getEmailReadiness();
       await getSourceHealth(undefined, { persistSnapshot: true, refresh: true, review });
       const reviewWarning = review.scoringDeferred
-        ? 'Full-backfill scoring is deferred until every required Google Sheet is healthy. Existing persisted scores were left unchanged.'
+        ? Array.isArray(review.identityExceptions) && review.identityExceptions.length > 0
+          ? 'Full-backfill scoring is deferred until every canonical identity exception is resolved and the required Sheet snapshot is complete. Existing persisted scores were left unchanged.'
+          : 'Full-backfill scoring is deferred until every required Google Sheet is healthy. Existing persisted scores were left unchanged.'
         : '';
       const scoreRefresh = review.scoringDeferred
         ? null
@@ -1613,7 +1615,10 @@ export function createApp({
           review: deferredReview,
           summary: deferredReview.importSummary,
           scoreRefresh: null,
-          reviewWarning: 'Full-backfill scoring is deferred until every required Google Sheet is healthy. Existing persisted scores were left unchanged.',
+          reviewWarning: Array.isArray(deferredReview.identityExceptions)
+            && deferredReview.identityExceptions.length > 0
+            ? 'Full-backfill scoring is deferred until every canonical identity exception is resolved and the required Sheet snapshot is complete. Existing persisted scores were left unchanged.'
+            : 'Full-backfill scoring is deferred until every required Google Sheet is healthy. Existing persisted scores were left unchanged.',
         });
         return;
       }
@@ -1731,6 +1736,8 @@ export function createApp({
         confidence: request.query.confidence,
         priority: request.query.priority,
         state: request.query.state,
+        area: request.query.area,
+        cursor: request.query.cursor,
       });
       response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
     }),
@@ -1964,6 +1971,8 @@ export function createApp({
         priority: request.body?.priority,
         note: request.body?.note,
         markReviewed: Boolean(request.body?.markReviewed),
+        expectedDiscoveryRevision: request.body?.expectedDiscoveryRevision,
+        expectedMaterialRevision: request.body?.expectedMaterialRevision,
         actor: session.username || 'admin',
       });
       response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
@@ -1993,6 +2002,8 @@ export function createApp({
           opportunityId,
           priority: action === 'pursue' ? 'high' : 'watch',
           markReviewed: true,
+          expectedDiscoveryRevision: request.body?.expectedDiscoveryRevision,
+          expectedMaterialRevision: request.body?.expectedMaterialRevision,
           actor: session.username || 'admin',
         });
         response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), action, ...result });
@@ -2004,6 +2015,8 @@ export function createApp({
         submissionId: request.body?.submissionId || '',
         reason: request.body?.reason,
         note: request.body?.note,
+        expectedDiscoveryRevision: request.body?.expectedDiscoveryRevision,
+        expectedMaterialRevision: request.body?.expectedMaterialRevision,
         actor: session.username || 'admin',
       });
       response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), action, ...result });

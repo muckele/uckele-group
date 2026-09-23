@@ -3,14 +3,18 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 
 process.env.DEAL_HUNTER_AIRTABLE_ENABLED = 'false';
 process.env.DEAL_HUNTER_SHEET_CSV_URL = '';
 
 const { createSqliteStorage } = await import('../server/storage/sqlite.js');
+const { createSupabaseStorage } = await import('../server/storage/supabase.js');
 const { refreshOpportunityScores } = await import('../server/services/dealHunterScoreStore.js');
-const { getTriageOpportunityDetail, listTriageQueue, setTriageOperatorDecision } =
+const { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } = await import('../server/services/dealHunterSourceSnapshotAdmission.js');
+const { getTriageOpportunityDetail, listTriageQueue, passTriageOpportunity, setTriageOperatorDecision } =
   await import('../server/services/dealHunterTriage.js');
+const { buildFreshInboxAreas } = await import('../server/services/dealHunterFreshInboxPolicy.js');
 
 const briefingGeneratedAt = '2026-09-05T15:00:00.000Z';
 
@@ -474,6 +478,461 @@ test('search and filters narrow the queue', async (t) => {
 
   const byConfidence = await listTriageQueue({ view: 'all', confidence: 'low', storage });
   assert.ok(byConfidence.rows.every((row) => row.confidence === 'low'));
+});
+
+test('fresh discovery has its own first page despite more than a page of old priorities', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-inbox-areas-'));
+  const sqlitePath = path.join(directory, 'inbox.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const priorityIds = Array.from({ length: 15 }, (_, index) => `old-priority-${index}`);
+  for (const id of priorityIds) {
+    await seedOpportunity(storage, id);
+    await storage.writeDealHunterOpportunityScore(queueScore(id, { fit_score: 88,
+      confidence: 'high', high_fit: true }), []);
+    await storage.setDealHunterOpportunityOperatorDecision({ opportunityId: id, priority: 'high' });
+  }
+  const freshId = 'fresh-worthwhile-unlinked';
+  await seedOpportunity(storage, freshId);
+  await storage.markDealHunterOpportunityDiscoveryPending({
+    opportunityId: freshId, createdAt: '2026-08-16T10:00:00.000Z',
+  });
+  await storage.writeDealHunterOpportunityScore(queueScore(freshId, { fit_score: 92,
+    confidence: 'high', high_fit: true }), []);
+  await storage.reconcileDealHunterCurrentScoreEligibility([...priorityIds, freshId]);
+  const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId: 'fresh-area-run' });
+  const at = new Date().toISOString();
+  const accepted = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
+    storage, reviewMode: 'full-backfill', run,
+    sourceResult: { source: { id: 'sheet-0', required: true, fetched: true,
+      sourceRowCount: 1, rowCount: 1, coverageLimitReached: false },
+    deals: [{ sourceId: 'sheet-0', sourceName: 'Synthetic Sheet', stableExternalId: true, id: 'FRESH' }] },
+    records: [{ opportunity_id: freshId, source_id: 'sheet-0', source_name: 'Synthetic Sheet',
+      source_record_id: 'external:FRESH', observations: [{ id: 'fresh-inbox-observation',
+        opportunity_id: freshId, source_id: 'sheet-0', source_name: 'Synthetic Sheet',
+        source_record_id: 'external:FRESH', field: 'name', value: 'Fresh worthwhile',
+        observed_at: at, created_at: at, updated_at: at }], freshness_evidence: null }],
+  });
+  assert.equal(accepted.reconciled, true);
+  const inbox = await storage.listDealHunterFreshInbox({ area: 'inbox', asOf: new Date().toISOString() });
+  const actions = inbox.areas.find((area) => area.id === 'action-preview');
+  const discovery = inbox.areas.find((area) => area.id === 'new-important');
+  assert.equal(actions.total, 3);
+  assert.equal(actions.counts.ownerPriority, 15);
+  assert.equal(discovery.total, 1);
+  assert.deepEqual(discovery.rows.map((row) => row.opportunity_id), [freshId]);
+  assert.equal(discovery.rows[0].primary_submission_id, null, 'fresh discovery remains honestly unlinked');
+  const served = await listTriageQueue({ view: 'inbox', storage,
+    getCachedSourceHealth: async () => ({ healthy: false }) });
+  assert.equal(served.ok, true);
+  assert.deepEqual(served.areas.map((area) => area.id), ['action-preview', 'new-important']);
+  assert.equal(served.areas[1].rows[0].freshness.newToUs, true);
+  assert.equal(served.areas[1].rows[0].freshness.crmLinked, false);
+  const servedPriorities = await listTriageQueue({ view: 'inbox', area: 'owner-priorities',
+    pageSize: 5, storage, getCachedSourceHealth: async () => ({ healthy: false }) });
+  assert.equal(servedPriorities.areas[0].total, 15);
+  const servedSecondPage = await listTriageQueue({ view: 'inbox', area: 'owner-priorities',
+    cursor: servedPriorities.areas[0].nextCursor, pageSize: 5, storage,
+    getCachedSourceHealth: async () => ({ healthy: false }) });
+  assert.equal(servedSecondPage.areas[0].rows.length, 5);
+  const firstPage = await storage.listDealHunterFreshInbox({ area: 'owner-priorities', limit: 5,
+    asOf: inbox.asOf });
+  assert.equal(firstPage.areas[0].total, 15);
+  const secondPage = await storage.listDealHunterFreshInbox({ area: 'owner-priorities', limit: 5,
+    cursor: firstPage.areas[0].nextCursor, asOf: inbox.asOf });
+  assert.equal(new Set([...firstPage.areas[0].rows, ...secondPage.areas[0].rows]
+    .map((row) => row.opportunity_id)).size, 10);
+  await storage.setDealHunterOpportunityOperatorDecision({ opportunityId: priorityIds[0], priority: 'urgent' });
+  await assert.rejects(storage.listDealHunterFreshInbox({ area: 'owner-priorities', limit: 5,
+    cursor: firstPage.areas[0].nextCursor, asOf: inbox.asOf }), /results changed/);
+});
+
+test('discovery orders each supported group by owner priority, due time, fit, confidence, then acceptance', () => {
+  const common = { discovery_state: 'known_prospective', discovery_revision: 1,
+    reviewed_discovery_revision: 0, publication_state: 'unknown',
+    publication_distinct_count: 0, publication_unsupported_count: 0,
+    first_accepted_at: '2026-09-22T18:00:00.000Z', confidence: 'high', fit_score: 80 };
+  const rows = [
+    { ...common, opportunity_id: 'normal-high', operator_priority: 'normal', fit_score: 95 },
+    { ...common, opportunity_id: 'high-no-due', operator_priority: 'high', fit_score: 90 },
+    { ...common, opportunity_id: 'high-due', operator_priority: 'high', fit_score: 76,
+      due_at: '2026-09-23T17:00:00.000Z' },
+    { ...common, opportunity_id: 'urgent', operator_priority: 'urgent', fit_score: 76,
+      first_accepted_at: '2026-09-20T18:00:00.000Z' },
+    { ...common, opportunity_id: 'normal-medium', operator_priority: 'normal', fit_score: 95,
+      confidence: 'medium', first_accepted_at: '2026-09-23T17:00:00.000Z' },
+  ];
+  const result = buildFreshInboxAreas(rows, { area: 'new-important',
+    asOf: '2026-09-23T18:00:00.000Z' });
+  assert.deepEqual(result.areas[0].rows.map((row) => row.opportunity_id),
+    ['urgent', 'high-due', 'high-no-due', 'normal-high', 'normal-medium']);
+});
+
+test('exploration sorts by accepted discovery or fit and refuses a cursor from another sort', () => {
+  const asOf = '2026-09-23T18:00:00.000Z';
+  const rows = [
+    { opportunity_id: 'old-fit', fit_score: 95, confidence: 'high',
+      first_accepted_at: '2026-09-10T12:00:00.000Z', discovery_state: 'known_recovered' },
+    { opportunity_id: 'new-low', fit_score: 60, confidence: 'medium',
+      first_accepted_at: '2026-09-23T12:00:00.000Z', discovery_state: 'known_prospective' },
+    { opportunity_id: 'unknown-fit', fit_score: 99, confidence: 'high',
+      first_accepted_at: null, discovery_state: 'untracked_legacy' },
+  ];
+  const newest = buildFreshInboxAreas(rows, { area: 'all-active', sort: 'newest-discovery',
+    limit: 1, asOf });
+  assert.equal(newest.areas[0].rows[0].opportunity_id, 'new-low');
+  const next = buildFreshInboxAreas(rows, { area: 'all-active', sort: 'newest-discovery',
+    limit: 1, cursor: newest.areas[0].nextCursor, asOf });
+  assert.equal(next.areas[0].rows[0].opportunity_id, 'old-fit');
+  const fit = buildFreshInboxAreas(rows, { area: 'all-active', sort: 'highest-fit', asOf });
+  assert.deepEqual(fit.areas[0].rows.map((row) => row.opportunity_id),
+    ['unknown-fit', 'old-fit', 'new-low']);
+  assert.throws(() => buildFreshInboxAreas(rows, { area: 'all-active', sort: 'highest-fit',
+    cursor: newest.areas[0].nextCursor, asOf }), /results changed/);
+});
+
+test('exploration ties use canonical ID after the selected key and discovery group', () => {
+  const asOf = '2026-09-23T18:00:00.000Z';
+  const rows = [
+    { opportunity_id: 'z-priority', fit_score: 88, confidence: 'high', operator_priority: 'urgent',
+      first_accepted_at: '2026-09-23T12:00:00.000Z', discovery_state: 'known_prospective', discovery_revision: 1 },
+    { opportunity_id: 'a-ordinary', fit_score: 88, confidence: 'high', operator_priority: 'normal',
+      first_accepted_at: '2026-09-23T12:00:00.000Z', discovery_state: 'known_prospective', discovery_revision: 1 },
+    { opportunity_id: 'b-older', fit_score: 88, confidence: 'high', operator_priority: 'high',
+      first_accepted_at: '2026-09-22T12:00:00.000Z', discovery_state: 'known_prospective', discovery_revision: 1 },
+  ];
+  for (const area of ['all-active', 'new-important']) {
+    for (const sort of ['newest-discovery', 'highest-fit']) {
+      const first = buildFreshInboxAreas(rows, { area, sort, limit: 1, asOf }).areas[0];
+      const second = buildFreshInboxAreas(rows, { area, sort, limit: 1,
+        cursor: first.nextCursor, asOf }).areas[0];
+      assert.deepEqual([first.rows[0].opportunity_id, second.rows[0].opportunity_id],
+        ['a-ordinary', sort === 'highest-fit' ? 'b-older' : 'z-priority']);
+    }
+  }
+});
+
+test('SQLite exploration reader retains server order, accepted earnings provenance, and sort-bound cursors', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-exploration-'));
+  const sqlitePath = path.join(directory, 'exploration.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const db = new Database(sqlitePath);
+  t.after(() => db.close());
+  for (const [id, fit, accepted] of [
+    ['a-newest', 76, '2026-09-23T12:00:00.000Z'],
+    ['newer', 80, '2026-09-23T12:00:00.000Z'],
+    ['older-fit', 95, '2026-09-10T12:00:00.000Z'],
+    ['a-tie', 99, null],
+    ['unknown-fit', 99, null],
+    ['z-tie', 99, '2026-09-20T12:00:00.000Z'],
+  ]) {
+    await seedOpportunity(storage, id);
+    await storage.writeDealHunterOpportunityScore(queueScore(id, { fit_score: fit,
+      confidence: 'high' }), []);
+    if (accepted) db.prepare(`UPDATE deal_hunter_opportunities SET first_accepted_at=?,
+      discovery_state='known_recovered', discovery_revision=1 WHERE opportunity_id=?`)
+      .run(accepted, id);
+  }
+  await storage.reconcileDealHunterCurrentScoreEligibility([
+    'a-newest', 'newer', 'older-fit', 'a-tie', 'unknown-fit', 'z-tie',
+  ]);
+  const at = '2026-09-23T18:00:00.000Z';
+  const newest = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'newest-discovery', limit: 1, asOf: at });
+  assert.equal(newest.areas[0].rows[0].opportunity_id, 'a-newest');
+  const second = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'newest-discovery', limit: 1, cursor: newest.areas[0].nextCursor, asOf: at });
+  assert.equal(second.areas[0].rows[0].opportunity_id, 'newer');
+  const fit = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'highest-fit', asOf: at });
+  assert.deepEqual(fit.areas[0].rows.map((row) => row.opportunity_id),
+    ['a-tie', 'unknown-fit', 'z-tie', 'older-fit', 'newer', 'a-newest']);
+  const discoveryFit = await storage.listDealHunterFreshInbox({ area: 'new-important',
+    sort: 'highest-fit', limit: 1, asOf: at });
+  const discoveryNext = await storage.listDealHunterFreshInbox({ area: 'new-important',
+    sort: 'highest-fit', limit: 1, cursor: discoveryFit.areas[0].nextCursor, asOf: at });
+  assert.deepEqual([discoveryFit.areas[0].rows[0].opportunity_id,
+    discoveryNext.areas[0].rows[0].opportunity_id], ['z-tie', 'newer']);
+  await assert.rejects(storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'highest-fit', cursor: newest.areas[0].nextCursor, asOf: at }), /results changed/);
+  db.exec(`INSERT INTO deal_hunter_freshness_evidence
+    (id, source_id, source_name, source_record_id, run_id, generation, event_type,
+      field_key, current_canonical_id, after_value, metric, currency, period)
+    VALUES ('earnings-core', 'sheet-0', 'Sheet', 'earnings-1', 'earnings-run', 1,
+      'accepted_source_record', '', 'newer', NULL, 'unknown', 'unknown', 'unknown'),
+      ('earnings-field', 'sheet-0', 'Sheet', 'earnings-1', 'earnings-run', 1,
+      'accepted_source_record', 'annual_profit', 'newer', 425000, 'sde', 'USD', 'annual');
+    INSERT INTO deal_hunter_opportunity_source_observations
+    (id, opportunity_id, source_id, source_name, source_record_id, field,
+      value, observed_at, created_at, updated_at, accepted_evidence_id)
+    VALUES ('earnings-observation', 'newer', 'sheet-0', 'Sheet', 'earnings-1', 'annual_profit',
+      '425000', '2026-09-23T12:00:00.000Z', '2026-09-23T12:00:00.000Z',
+      '2026-09-23T12:00:00.000Z', 'earnings-core');`);
+  const supported = await storage.listDealHunterFreshInbox({ area: 'all-active', asOf: at });
+  const row = supported.areas[0].rows.find((item) => item.opportunity_id === 'newer');
+  assert.deepEqual(JSON.parse(row.annual_profit_evidence),
+    { metric: 'sde', period: 'annual', currency: 'USD' });
+  db.prepare("UPDATE deal_hunter_opportunity_source_observations SET value='450000', accepted_evidence_id=NULL WHERE id='earnings-observation'").run();
+  const unverified = await storage.listDealHunterFreshInbox({ area: 'all-active', asOf: at });
+  assert.equal(unverified.areas[0].rows.find((item) => item.opportunity_id === 'newer').annual_profit_evidence, null);
+});
+
+test('SQLite reader applies seven and thirty Pacific calendar-day boundaries to retained facts', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-calendar-boundary-'));
+  const sqlitePath = path.join(directory, 'calendar.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const id = 'calendar-boundary';
+  await seedOpportunity(storage, id);
+  await storage.writeDealHunterOpportunityScore(queueScore(id, { fit_score: 88,
+    confidence: 'high', high_fit: true }), []);
+  await storage.reconcileDealHunterCurrentScoreEligibility([id]);
+  const db = new Database(sqlitePath);
+  t.after(() => db.close());
+  db.prepare(`UPDATE deal_hunter_opportunities SET discovery_state = 'known_prospective',
+    first_accepted_at = '2026-09-23T18:00:00.000Z', discovery_revision = 1
+    WHERE opportunity_id = ?`).run(id);
+  db.exec(`INSERT INTO deal_hunter_freshness_evidence
+    (id, source_id, source_name, source_record_id, run_id, generation,
+      event_type, current_canonical_id)
+    VALUES ('calendar-core', 'synthetic-sheet', 'Synthetic Sheet', 'calendar-row',
+      'calendar-run', 1, 'accepted_source_record', 'calendar-boundary');
+    INSERT INTO deal_hunter_freshness_evidence
+    (id, source_id, source_name, source_record_id, run_id, generation,
+      event_type, field_key, current_canonical_id, publication_meaning,
+      publication_date, publication_precision, publication_state)
+    VALUES ('calendar-date', 'synthetic-sheet', 'Synthetic Sheet', 'calendar-row',
+      'calendar-run', 1, 'publication_evidence', 'date_added', 'calendar-boundary',
+      'listing_publication', '2026-09-22', 'date', 'valid');
+    INSERT INTO deal_hunter_opportunity_source_observations
+    (id, opportunity_id, source_id, source_name, source_record_id, field,
+      value, observed_at, created_at, updated_at, accepted_evidence_id)
+    VALUES ('calendar-observation', 'calendar-boundary', 'synthetic-sheet',
+      'Synthetic Sheet', 'calendar-row', 'date_added', '2026-09-22',
+      '2026-09-23T18:00:00.000Z', '2026-09-23T18:00:00.000Z',
+      '2026-09-23T18:00:00.000Z', 'calendar-core');`);
+  const atSeven = await storage.listDealHunterFreshInbox({ area: 'new-important',
+    asOf: '2026-09-30T18:00:00.000Z' });
+  const atEight = await storage.listDealHunterFreshInbox({ area: 'new-important',
+    asOf: '2026-10-01T18:00:00.000Z' });
+  assert.equal(atSeven.areas[0].total, 1);
+  assert.equal(atEight.areas[0].total, 0);
+  const atThirty = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    asOf: '2026-10-22T18:00:00.000Z' });
+  const atThirtyOne = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    asOf: '2026-10-23T18:00:00.000Z' });
+  assert.equal(atThirty.areas[0].rows[0].recently_listed, true);
+  assert.equal(atThirtyOne.areas[0].rows[0].recently_listed, false);
+  db.prepare('UPDATE deal_hunter_opportunity_scores SET reviewed_discovery_revision=1 WHERE opportunity_id=?')
+    .run(id);
+  const reviewed = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    asOf: '2026-09-23T18:00:00.000Z' });
+  assert.equal(reviewed.areas[0].rows[0].new_to_ug, false);
+  assert.equal(reviewed.areas[0].rows[0].recently_listed, true);
+  assert.equal((await storage.listDealHunterFreshInbox({ area: 'new-important',
+    asOf: '2026-09-23T18:00:00.000Z' })).areas[0].total, 0);
+});
+
+test('Supabase area cursor rejects changed revision or anchor before showing another page', async () => {
+  const revision = 'a'.repeat(32);
+  const returned = { id: 'owner-priorities', rows: [{ opportunity_id: 'one', fit_score: 90 }],
+    total: 2, revision, nextOffset: 1, lastId: 'one', anchorId: null };
+  let current = returned;
+  const storage = createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid',
+      supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { async rpc(name) {
+      assert.equal(name, 'list_deal_hunter_fresh_inbox_v1');
+      return { data: { areas: [current], counts: {}, asOf: new Date().toISOString() }, error: null };
+    } } },
+  );
+  const first = await storage.listDealHunterFreshInbox({ area: 'owner-priorities' });
+  const cursor = first.areas[0].nextCursor;
+  assert.equal(cursor.lastId, 'one');
+  current = { ...returned, rows: [{ opportunity_id: 'two', fit_score: 80 }],
+    nextOffset: null, lastId: null, anchorId: 'one' };
+  const second = await storage.listDealHunterFreshInbox({ area: 'owner-priorities', cursor });
+  assert.equal(second.areas[0].rows[0].opportunity_id, 'two');
+  current = { ...current, revision: 'b'.repeat(32) };
+  await assert.rejects(storage.listDealHunterFreshInbox({ area: 'owner-priorities', cursor }),
+    (error) => error.status === 409);
+  current = { ...current, revision, anchorId: 'other' };
+  await assert.rejects(storage.listDealHunterFreshInbox({ area: 'owner-priorities', cursor }),
+    (error) => error.status === 409);
+});
+
+test('Supabase exploration adapter forwards sort and refuses a cursor from another sort', async () => {
+  const seen = [];
+  const storage = createSupabaseStorage(
+    { storage: { supabaseUrl: 'https://project.supabase.invalid',
+      supabaseServiceRoleKey: 'service-role-key' } },
+    { client: { async rpc(name, args) {
+      assert.equal(name, 'list_deal_hunter_fresh_inbox_v1');
+      seen.push(args.p_sort);
+      return { data: { areas: [{ id: 'all-active', rows: [{ opportunity_id: 'one' }],
+        total: 2, revision: 'c'.repeat(32), nextOffset: 1, lastId: 'one', anchorId: null }],
+      counts: {}, asOf: args.p_as_of }, error: null };
+    } } },
+  );
+  const asOf = '2026-09-23T18:00:00.000Z';
+  const newest = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'newest-discovery', asOf });
+  assert.equal(seen.at(-1), 'newest-discovery');
+  await assert.rejects(storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'highest-fit', cursor: newest.areas[0].nextCursor, asOf }), /results changed/);
+  const fit = await storage.listDealHunterFreshInbox({ area: 'all-active',
+    sort: 'highest-fit', asOf });
+  assert.equal(seen.at(-1), 'highest-fit');
+  assert.notEqual(fit.areas[0].nextCursor.filtersKey, newest.areas[0].nextCursor.filtersKey);
+});
+
+test('due overflow keeps complete access and dual-qualified actions use one preview slot', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-due-preview-'));
+  const sqlitePath = path.join(directory, 'due.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const db = new Database(sqlitePath);
+  t.after(() => db.close());
+  const ids = Array.from({ length: 5 }, (_, index) => `due-${index}`);
+  const at = new Date().toISOString();
+  const dueAt = new Date(Date.now() - 86_400_000).toISOString();
+  for (const [index, id] of ids.entries()) {
+    await seedOpportunity(storage, id);
+    await storage.writeDealHunterOpportunityScore(queueScore(id, { fit_score: 85,
+      confidence: 'high', high_fit: true }), []);
+    const submissionId = `submission-${id}`;
+    db.prepare(`INSERT INTO contact_submissions
+      (id, created_at, updated_at, status, delivery_provider, delivery_status,
+        crm_status, source, ip_hash, name, email, message)
+      VALUES (?, ?, ?, 'active', 'test', 'delivered', 'not-synced', 'synthetic',
+        'hash', ?, 'broker@example.test', 'Synthetic')`
+    ).run(submissionId, at, at, id);
+    db.prepare('UPDATE deal_hunter_opportunities SET primary_submission_id = ? WHERE opportunity_id = ?')
+      .run(submissionId, id);
+    db.prepare(`INSERT INTO deal_hunter_cim_requests
+      (id, created_at, updated_at, opportunity_id, deal_key, recipient_email, status,
+        next_follow_up_at, submission_id, request_state, delivery_state,
+        follow_up_state, metadata)
+      VALUES (?, ?, ?, ?, ?, 'broker@example.test', 'sent', ?, ?, 'provider_accepted',
+        'accepted', 'scheduled', ?)`
+    ).run(`request-${id}`, at, at, id, `deal-${id}`,
+      new Date(Date.parse(dueAt) + index * 60_000).toISOString(), submissionId,
+      JSON.stringify({ manualFollowUp: { version: 'deal-hunter-manual-follow-up-v1',
+        mode: 'operator-approved', maximumFollowUps: 5,
+        cadencePolicy: 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1' } }));
+  }
+  await storage.reconcileDealHunterCurrentScoreEligibility(ids);
+  await storage.setDealHunterOpportunityOperatorDecision({ opportunityId: ids[0], priority: 'urgent' });
+  const inbox = await storage.listDealHunterFreshInbox({ area: 'inbox', asOf: at });
+  const preview = inbox.areas.find((area) => area.id === 'action-preview');
+  assert.equal(preview.rows.length, 3);
+  assert.equal(new Set(preview.rows.map((row) => row.opportunity_id)).size, 3);
+  assert.deepEqual([preview.counts.due, preview.counts.ownerPriority], [5, 1]);
+  assert.equal(preview.rows.find((row) => row.opportunity_id === ids[0])?.owner_priority, true);
+  const allDue = await storage.listDealHunterFreshInbox({ area: 'due-actions', limit: 10, asOf: at });
+  assert.equal(allDue.areas[0].total, 5);
+  assert.equal(allDue.areas[0].rows.length, 5);
+});
+
+test('current verified broker reply and received materials join due actions without false overdue counts', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-broker-actions-'));
+  const sqlitePath = path.join(directory, 'actions.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const db = new Database(sqlitePath);
+  t.after(() => db.close());
+  const at = new Date().toISOString();
+  const old = new Date(Date.now() - 3 * 86_400_000).toISOString();
+  for (const kind of ['reply', 'materials', 'nda']) {
+    const id = `action-${kind}`;
+    await seedOpportunity(storage, id);
+    await storage.writeDealHunterOpportunityScore(queueScore(id, { fit_score: 85,
+      confidence: 'high' }), []);
+    const submissionId = `submission-${kind}`;
+    db.prepare(`INSERT INTO contact_submissions
+      (id, created_at, updated_at, status, delivery_provider, delivery_status,
+        crm_status, source, ip_hash, name, email, message)
+      VALUES (?, ?, ?, 'active', 'test', 'delivered', 'not-synced', 'synthetic',
+        'hash', ?, 'broker@example.test', 'Synthetic')`).run(submissionId, at, at, id);
+    db.prepare('UPDATE deal_hunter_opportunities SET primary_submission_id = ? WHERE opportunity_id = ?')
+      .run(submissionId, id);
+  }
+  await storage.reconcileDealHunterCurrentScoreEligibility(['action-reply', 'action-materials', 'action-nda']);
+  db.prepare(`INSERT INTO crm_communications
+    (id, submission_id, direction, channel, source, kind, occurred_at, created_at,
+      updated_at, delivery_state) VALUES ('verified-reply', 'submission-reply', 'inbound',
+      'email', 'resend-webhook', 'broker-reply', ?, ?, ?, 'replied')`).run(old, old, old);
+  for (const [kind, requested] of [['materials', 'financials'], ['nda', 'nda']]) {
+    db.prepare(`INSERT INTO secure_upload_requests
+      (id, submission_id, created_at, updated_at, email, status, expires_at,
+        last_uploaded_at, requested_documents) VALUES (?, ?, ?, ?, 'broker@example.test',
+        'completed', ?, ?, ?)`).run(`upload-${kind}`, `submission-${kind}`, old, old, at, old,
+      JSON.stringify([{ category: requested }]));
+  }
+  db.prepare(`INSERT INTO contact_submissions
+    (id, created_at, updated_at, status, delivery_provider, delivery_status,
+      crm_status, source, ip_hash, name, email, message)
+    VALUES ('historical-submission', ?, ?, 'active', 'test', 'delivered',
+      'not-synced', 'synthetic', 'hash', 'Historical', 'broker@example.test', 'Synthetic')`
+  ).run(at, at);
+  db.prepare(`INSERT INTO deal_hunter_cim_requests
+    (id, created_at, updated_at, opportunity_id, deal_key, recipient_email, status,
+      next_follow_up_at, submission_id, request_state, delivery_state,
+      follow_up_state, metadata) VALUES ('historical-action', ?, ?, 'action-nda',
+      'deal-action-nda', 'broker@example.test', 'sent', ?, 'historical-submission',
+      'provider_accepted', 'accepted', 'scheduled', ?)`
+  ).run(at, at, old, JSON.stringify({ manualFollowUp: { mode: 'operator-approved',
+    version: 'deal-hunter-manual-follow-up-v1', maximumFollowUps: 5,
+    cadencePolicy: 'accepted-local-date-plus-2-weekend-forward-0900-pt-v1' } }));
+  const inbox = await storage.listDealHunterFreshInbox({ area: 'inbox', asOf: at });
+  const preview = inbox.areas[0];
+  assert.deepEqual([preview.counts.due, preview.counts.overdue], [2, 0]);
+  assert.deepEqual(new Set(preview.rows.map((row) => row.action_reason)),
+    new Set(['broker_reply', 'materials_ready']));
+  const all = await storage.listDealHunterFreshInbox({ area: 'due-actions', asOf: at });
+  assert.equal(all.areas[0].total, 2);
+  db.prepare(`INSERT INTO crm_communications
+    (id, submission_id, direction, channel, source, kind, occurred_at, created_at,
+      updated_at, delivery_state) VALUES ('later-outbound', 'submission-reply', 'outbound',
+      'email', 'synthetic', 'follow-up', ?, ?, ?, 'sent')`).run(at, at, at);
+  db.prepare("UPDATE contact_submissions SET follow_up_state='completed' WHERE id='submission-materials'").run();
+  const resolved = await storage.listDealHunterFreshInbox({ area: 'due-actions', asOf: at });
+  assert.equal(resolved.areas[0].total, 0);
+});
+
+test('freshness review and Pass compare both shown revisions atomically while legacy review leaves them alone', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-review-cas-'));
+  const sqlitePath = path.join(directory, 'review.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const id = 'op-fl01-review';
+  await seedOpportunity(storage, id);
+  await storage.writeDealHunterOpportunityScore(queueScore(id, { fit_score: 90, high_fit: true }), []);
+  await storage.reconcileDealHunterCurrentScoreEligibility([id]);
+  const db = new Database(sqlitePath);
+  t.after(() => db.close());
+  db.prepare('UPDATE deal_hunter_opportunities SET discovery_revision = 1, material_revision = 2 WHERE opportunity_id = ?').run(id);
+  const stale = await setTriageOperatorDecision({ opportunityId: id, markReviewed: true,
+    expectedDiscoveryRevision: 0, expectedMaterialRevision: 2, storage, getCachedSourceHealth: null });
+  assert.equal(stale.status, 409);
+  assert.equal((await storage.getDealHunterOpportunityScore(id)).reviewed_at, null);
+  const reviewed = await setTriageOperatorDecision({ opportunityId: id, markReviewed: true,
+    expectedDiscoveryRevision: 1, expectedMaterialRevision: 2, storage, getCachedSourceHealth: null });
+  assert.equal(reviewed.ok, true);
+  let score = await storage.getDealHunterOpportunityScore(id);
+  assert.deepEqual([score.reviewed_discovery_revision, score.reviewed_material_revision], [1, 2]);
+  db.prepare('UPDATE deal_hunter_opportunities SET discovery_revision = 2, material_revision = 3 WHERE opportunity_id = ?').run(id);
+  const stalePass = await passTriageOpportunity({ opportunityId: id, reason: 'not-a-fit',
+    expectedDiscoveryRevision: 1, expectedMaterialRevision: 2, storage, getCachedSourceHealth: null });
+  assert.equal(stalePass.status, 409);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM deal_hunter_dispositions WHERE deal_key = ?').get(`deal-${id}`).n, 0);
+  const passed = await passTriageOpportunity({ opportunityId: id, reason: 'not-a-fit',
+    expectedDiscoveryRevision: 2, expectedMaterialRevision: 3, storage, getCachedSourceHealth: null });
+  assert.equal(passed.ok, true);
+  score = await storage.getDealHunterOpportunityScore(id);
+  assert.deepEqual([score.reviewed_discovery_revision, score.reviewed_material_revision], [2, 3]);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM deal_hunter_dispositions WHERE deal_key = ?').get(`deal-${id}`).n, 1);
 });
 
 test('marking reviewed clears needs-review until the score actually moves', async (t) => {

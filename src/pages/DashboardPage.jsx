@@ -1408,7 +1408,7 @@ export default function DashboardPage() {
     eyebrow: 'Acquisition review',
     title: 'Deal Hunter',
     description: 'Work the authoritative current opportunity queue, understand the evidence, and record Pursue, Watch, or Pass decisions.',
-    guidance: 'Start with Needs Review, then open an opportunity to inspect the consolidated record without leaving the queue.',
+    guidance: 'Start with New & Important while due actions and owner priorities remain within reach. Open an opportunity to inspect the consolidated record without leaving the Inbox.',
   } : basePageMeta;
   const onboardingScope = isCrmDetailView ? 'crm-detail' : activeSection === 'crm' ? 'crm-index' : activeSection;
   const showNewRecordAction = !isReadOnly

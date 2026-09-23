@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import {
   normalizeDealHunterSourceSnapshot,
+  normalizeSourceFreshnessEvidence,
   normalizeOperatorOpportunityFactRecord,
   normalizeOpportunitySourceObservation,
   normalizeOpportunitySourceObservationSnapshot,
@@ -26,9 +27,59 @@ import {
   MANUAL_FOLLOW_UP_VERSION,
   nextManualFollowUpAt,
 } from '../services/dealHunterManualFollowUpPolicy.js';
-import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
+import { consumeCompleteGoogleSheetSourceSnapshotAdmission, normalizeCompleteGoogleSheetFreshnessSnapshot } from '../services/dealHunterSourceSnapshotAdmission.js';
 import { normalizeDealHunterListingIdentity } from '../services/dealHunterListingIdentity.js';
 import { CrmSubmissionSupersededError } from '../services/crmSubmissionSupersession.js';
+import { buildFreshInboxAreas, classifyFreshInboxCandidate } from '../services/dealHunterFreshInboxPolicy.js';
+
+function acceptedPublicationClaim(claim, acceptedAt) {
+  if (!claim || claim.meaning !== 'listing_publication') {
+    return { state: 'unknown', date: null, instant: null };
+  }
+  const raw = String(claim.rawValue || '').trim();
+  const acceptedDate = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date(acceptedAt)).map((part) => [part.type, part.value]));
+  const today = `${acceptedDate.year}-${acceptedDate.month}-${acceptedDate.day}`;
+  if (claim.precision === 'date' && /^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    const parsed = new Date(`${raw}T00:00:00.000Z`);
+    if (!Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === raw) {
+      return { state: raw > today ? 'future' : 'valid', date: raw, instant: null };
+    }
+  }
+  if (claim.precision === 'datetime' && /(?:Z|[+-]\d{2}:\d{2})$/i.test(raw)) {
+    const instant = new Date(raw);
+    if (!Number.isNaN(instant.getTime())) {
+      return { state: instant.getTime() > Date.parse(acceptedAt) ? 'future' : 'valid',
+        date: null, instant: instant.toISOString() };
+    }
+  }
+  return { state: 'invalid', date: null, instant: null };
+}
+
+function freshnessReviewExpectedPair(input = {}) {
+  const hasDiscovery = input.expectedDiscoveryRevision !== undefined;
+  const hasMaterial = input.expectedMaterialRevision !== undefined;
+  if (hasDiscovery !== hasMaterial) throw new Error('Freshness review requires both expected revisions.');
+  if (!hasDiscovery) return null;
+  const discovery = Number(input.expectedDiscoveryRevision);
+  const material = Number(input.expectedMaterialRevision);
+  if (!Number.isSafeInteger(discovery) || discovery < 0
+    || !Number.isSafeInteger(material) || material < 0) {
+    throw new Error('Freshness review revisions must be nonnegative integers.');
+  }
+  return { discovery, material };
+}
+
+function assertFreshnessReviewCurrent(opportunity, expected) {
+  if (!expected) return;
+  if (opportunity.discovery_revision === expected.discovery
+    && opportunity.material_revision === expected.material) return;
+  const error = new Error('Freshness changed since this opportunity was shown. Reload before acting.');
+  error.code = 'DEAL_HUNTER_FRESHNESS_STALE';
+  error.status = 409;
+  throw error;
+}
 import {
   buildCanonicalOpportunityMergePlan,
   canonicalOpportunityMergeManifestId,
@@ -716,7 +767,12 @@ function normalizeDealHunterOpportunityFactRow(row) {
 }
 
 function normalizeDealHunterOpportunitySourceObservationRow(row) {
-  return row ? { ...row } : null;
+  if (!row) return null;
+  const freshnessColumns = new Set([
+    'accepted_at', 'accepted_run_id', 'accepted_evidence_id', 'publication_raw_header',
+    'publication_raw_value', 'publication_precision', 'publication_offset', 'publication_meaning',
+  ]);
+  return Object.fromEntries(Object.entries(row).filter(([column, value]) => !freshnessColumns.has(column) || value !== null));
 }
 
 function normalizeDealHunterOpportunityAliasRow(row) {
@@ -1576,6 +1632,19 @@ export function inspectCanonicalMergeDependentState(database, approval) {
   const sourceObservations = selectCanonicalMergeRows(database, 'deal_hunter_opportunity_source_observations', [
     { column: 'opportunity_id', values: opportunityIds },
   ]);
+  const directFreshnessEvidence = selectCanonicalMergeRows(database, 'deal_hunter_freshness_evidence', [
+    { column: 'original_canonical_id', values: opportunityIds },
+    { column: 'current_canonical_id', values: opportunityIds },
+    { column: 'identity_exception_id', values: [approval.exceptionId] },
+    { column: 'binding_audit_id', values: [approval.exceptionId] },
+    { column: 'source_record_id', values: listingIdentities },
+  ]);
+  const referencedFreshnessEvidence = selectCanonicalMergeRows(database, 'deal_hunter_freshness_evidence', [
+    { column: 'before_evidence_id', values: directFreshnessEvidence.map((row) => row.id) },
+    { column: 'after_evidence_id', values: directFreshnessEvidence.map((row) => row.id) },
+  ]);
+  const freshnessEvidence = [...new Map([...directFreshnessEvidence, ...referencedFreshnessEvidence]
+    .map((row) => [row.id, row])).values()];
   const contactSubmissions = selectCanonicalMergeRows(database, 'contact_submissions', [
     { column: 'deal_hunter_opportunity_id', values: opportunityIds },
     { column: 'listing_url', values: listingUrls },
@@ -1738,6 +1807,7 @@ export function inspectCanonicalMergeDependentState(database, approval) {
     scoreEvidence: canonicalMergeRecordIds('deal_hunter_score_evidence', scoreEvidence),
     operatorFacts: canonicalMergeRecordIds('deal_hunter_opportunity_facts', operatorFacts),
     sourceObservations: canonicalMergeRecordIds('deal_hunter_opportunity_source_observations', sourceObservations),
+    freshnessEvidence: canonicalMergeRecordIds('deal_hunter_freshness_evidence', freshnessEvidence),
     contactSubmissions: canonicalMergeRecordIds('contact_submissions', contactSubmissions),
     crmImports: canonicalMergeRecordIds('deal_hunter_crm_imports', crmImports),
     crmReconciliationItems: canonicalMergeRecordIds('deal_hunter_crm_reconciliation_items', crmReconciliationItems),
@@ -3752,6 +3822,8 @@ export function createSqliteStorage(config, options = {}) {
       listing_url_count INTEGER NOT NULL DEFAULT 0,
       coverage_limit_reached INTEGER NOT NULL DEFAULT 0,
       records TEXT NOT NULL DEFAULT '[]',
+      freshness_generation INTEGER CHECK(freshness_generation IS NULL OR freshness_generation > 0),
+      freshness_projection_state TEXT CHECK(freshness_projection_state IS NULL OR freshness_projection_state IN ('pending', 'accepted', 'deferred', 'superseded')),
       metadata TEXT NOT NULL DEFAULT '{}'
     );
 
@@ -3871,6 +3943,8 @@ export function createSqliteStorage(config, options = {}) {
         reviewed_by TEXT,
         reviewed_fingerprint TEXT,
         reviewed_semantic_digest TEXT,
+        reviewed_discovery_revision INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_discovery_revision >= 0),
+        reviewed_material_revision INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_material_revision >= 0),
         operator_updated_at TEXT
       );
 
@@ -3941,7 +4015,14 @@ export function createSqliteStorage(config, options = {}) {
         primary_submission_id TEXT,
         identity_version TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'active',
-        metadata TEXT NOT NULL DEFAULT '{}'
+        first_accepted_at TEXT,
+        first_discovery_evidence_id TEXT,
+        discovery_state TEXT NOT NULL DEFAULT 'untracked_legacy' CHECK(discovery_state IN ('untracked_legacy', 'pending', 'known_prospective', 'known_recovered')),
+        discovery_revision INTEGER NOT NULL DEFAULT 0 CHECK(discovery_revision >= 0),
+        material_revision INTEGER NOT NULL DEFAULT 0 CHECK(material_revision >= 0),
+        last_material_change_at TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        FOREIGN KEY(first_discovery_evidence_id) REFERENCES deal_hunter_freshness_evidence(id) ON DELETE RESTRICT
       );
 
       -- Operator corrections create a new immutable revision ID so history
@@ -4018,6 +4099,14 @@ export function createSqliteStorage(config, options = {}) {
         field TEXT NOT NULL,
         value TEXT NOT NULL,
         observed_at TEXT NOT NULL,
+        accepted_at TEXT,
+        accepted_run_id TEXT CHECK(accepted_run_id IS NULL OR length(accepted_run_id) BETWEEN 1 AND 200),
+        accepted_evidence_id TEXT CHECK(accepted_evidence_id IS NULL OR length(accepted_evidence_id) BETWEEN 1 AND 240),
+        publication_raw_header TEXT CHECK(publication_raw_header IS NULL OR length(publication_raw_header) <= 100),
+        publication_raw_value TEXT CHECK(publication_raw_value IS NULL OR length(publication_raw_value) <= 200),
+        publication_precision TEXT CHECK(publication_precision IS NULL OR publication_precision IN ('unknown', 'date', 'instant')),
+        publication_offset TEXT CHECK(publication_offset IS NULL OR length(publication_offset) <= 16),
+        publication_meaning TEXT CHECK(publication_meaning IS NULL OR publication_meaning IN ('unknown', 'listing_publication')),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(opportunity_id, source_id, source_record_id, field),
@@ -4039,8 +4128,92 @@ export function createSqliteStorage(config, options = {}) {
           )
           AND length(trim(value)) BETWEEN 1 AND 5000 AND value = trim(value)
         ),
-        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE,
+        FOREIGN KEY(accepted_evidence_id) REFERENCES deal_hunter_freshness_evidence(id) ON DELETE RESTRICT
       );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_source_freshness_state (
+        source_id TEXT PRIMARY KEY CHECK(source_id = trim(source_id) AND length(source_id) BETWEEN 1 AND 160),
+        next_generation INTEGER NOT NULL DEFAULT 0 CHECK(next_generation >= 0),
+        accepted_generation INTEGER NOT NULL DEFAULT 0 CHECK(accepted_generation >= 0),
+        accepted_run_id TEXT CHECK(accepted_run_id IS NULL OR (accepted_run_id = trim(accepted_run_id) AND length(accepted_run_id) BETWEEN 1 AND 200)),
+        accepted_digest TEXT CHECK(accepted_digest IS NULL OR (length(accepted_digest) = 64 AND accepted_digest NOT GLOB '*[^0-9a-f]*')),
+        accepted_at TEXT,
+        projection_state TEXT NOT NULL DEFAULT 'idle' CHECK(projection_state IN ('idle', 'pending', 'accepted', 'deferred', 'superseded')),
+        CHECK(accepted_generation <= next_generation),
+        CHECK((accepted_generation = 0 AND accepted_run_id IS NULL AND accepted_digest IS NULL AND accepted_at IS NULL)
+          OR (accepted_generation > 0 AND accepted_run_id IS NOT NULL AND accepted_digest IS NOT NULL AND accepted_at IS NOT NULL))
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_freshness_evidence (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        source_id TEXT NOT NULL CHECK(source_id = trim(source_id) AND length(source_id) BETWEEN 1 AND 160),
+        source_name TEXT NOT NULL CHECK(source_name = trim(source_name) AND length(source_name) BETWEEN 1 AND 220),
+        source_record_id TEXT NOT NULL CHECK(source_record_id = trim(source_record_id) AND length(source_record_id) BETWEEN 1 AND 200),
+        run_id TEXT NOT NULL CHECK(run_id = trim(run_id) AND length(run_id) BETWEEN 1 AND 200),
+        record_digest TEXT CHECK(record_digest IS NULL OR (length(record_digest) = 64 AND record_digest NOT GLOB '*[^0-9a-f]*')),
+        generation INTEGER NOT NULL CHECK(generation > 0),
+        event_type TEXT NOT NULL CHECK(event_type IN ('accepted_source_record', 'publication_evidence', 'material_change', 'evidence_state_change')),
+        field_key TEXT NOT NULL DEFAULT '' CHECK(field_key = trim(field_key) AND length(field_key) <= 80),
+        event_ordinal INTEGER NOT NULL DEFAULT 0 CHECK(event_ordinal BETWEEN 0 AND 10000),
+        accepted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+        original_canonical_id TEXT CHECK(original_canonical_id IS NULL OR length(original_canonical_id) BETWEEN 1 AND 200),
+        current_canonical_id TEXT CHECK(current_canonical_id IS NULL OR length(current_canonical_id) BETWEEN 1 AND 200),
+        identity_exception_id TEXT CHECK(identity_exception_id IS NULL OR length(identity_exception_id) BETWEEN 1 AND 240),
+        binding_audit_id TEXT CHECK(binding_audit_id IS NULL OR length(binding_audit_id) BETWEEN 1 AND 240),
+        provenance_version TEXT NOT NULL DEFAULT 'fl-01-v1' CHECK(provenance_version = trim(provenance_version) AND length(provenance_version) BETWEEN 1 AND 80),
+        raw_header TEXT CHECK(raw_header IS NULL OR length(raw_header) <= 100),
+        raw_value TEXT CHECK(raw_value IS NULL OR length(raw_value) <= 200),
+        publication_meaning TEXT NOT NULL DEFAULT 'unknown' CHECK(publication_meaning IN ('unknown', 'listing_publication')),
+        publication_date TEXT,
+        publication_instant TEXT,
+        publication_precision TEXT NOT NULL DEFAULT 'unknown' CHECK(publication_precision IN ('unknown', 'date', 'instant')),
+        publication_offset TEXT CHECK(publication_offset IS NULL OR length(publication_offset) <= 16),
+        publication_state TEXT NOT NULL DEFAULT 'unknown' CHECK(publication_state IN ('unknown', 'valid', 'invalid', 'future', 'conflict')),
+        before_value REAL,
+        after_value REAL,
+        before_evidence_id TEXT CHECK(before_evidence_id IS NULL OR length(before_evidence_id) BETWEEN 1 AND 240),
+        after_evidence_id TEXT CHECK(after_evidence_id IS NULL OR length(after_evidence_id) BETWEEN 1 AND 240),
+        metric TEXT NOT NULL DEFAULT 'unknown' CHECK(metric = trim(metric) AND length(metric) BETWEEN 1 AND 80),
+        currency TEXT NOT NULL DEFAULT 'unknown' CHECK(currency = trim(currency) AND length(currency) BETWEEN 1 AND 16),
+        period TEXT NOT NULL DEFAULT 'unknown' CHECK(period = trim(period) AND length(period) BETWEEN 1 AND 80),
+        classification TEXT CHECK(classification IS NULL OR classification IN ('new_evidence', 'conflict', 'selected_source_swap', 'disappearance', 'comparable_change')),
+        material_revision INTEGER CHECK(material_revision IS NULL OR material_revision >= 0),
+        UNIQUE(run_id, source_id, source_record_id, event_type, field_key, event_ordinal)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_freshness_evidence_canonical_time
+        ON deal_hunter_freshness_evidence(current_canonical_id, accepted_at DESC, id);
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_freshness_evidence_source_record_time
+        ON deal_hunter_freshness_evidence(source_id, source_record_id, accepted_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_freshness_evidence_run_source_record
+        ON deal_hunter_freshness_evidence(run_id, source_id, source_record_id);
+      CREATE TRIGGER IF NOT EXISTS deal_hunter_freshness_evidence_no_payload_update
+      BEFORE UPDATE OF id, source_id, source_name, source_record_id, run_id, generation,
+        record_digest,
+        event_type, field_key, event_ordinal, accepted_at, original_canonical_id,
+        identity_exception_id, provenance_version, raw_header, raw_value,
+        publication_meaning, publication_date, publication_instant, publication_precision,
+        publication_offset, publication_state, before_value, after_value,
+        before_evidence_id, after_evidence_id, metric, currency, period,
+        classification, material_revision
+      ON deal_hunter_freshness_evidence
+      BEGIN
+        SELECT RAISE(ABORT, 'freshness evidence payload is immutable');
+      END;
+      CREATE TRIGGER IF NOT EXISTS deal_hunter_freshness_evidence_guard_binding
+      BEFORE UPDATE OF current_canonical_id, binding_audit_id ON deal_hunter_freshness_evidence
+      WHEN NEW.current_canonical_id IS OLD.current_canonical_id
+        OR NEW.binding_audit_id IS NULL
+        OR NEW.binding_audit_id IS OLD.binding_audit_id
+      BEGIN
+        SELECT RAISE(ABORT, 'freshness binding requires a new audit reference');
+      END;
+      CREATE TRIGGER IF NOT EXISTS deal_hunter_freshness_evidence_no_delete
+      BEFORE DELETE ON deal_hunter_freshness_evidence
+      BEGIN
+        SELECT RAISE(ABORT, 'freshness evidence is retained');
+      END;
 
       CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_aliases (
         id TEXT PRIMARY KEY,
@@ -4775,6 +4948,48 @@ export function createSqliteStorage(config, options = {}) {
 	  ensureColumn(database, 'deal_hunter_crm_imports', 'opportunity_id', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'semantic_digest', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_semantic_digest', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_discovery_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_discovery_revision >= 0)');
+  ensureColumn(database, 'deal_hunter_opportunity_scores', 'reviewed_material_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(reviewed_material_revision >= 0)');
+  ensureColumn(database, 'deal_hunter_opportunities', 'first_accepted_at', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunities', 'first_discovery_evidence_id', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunities', 'discovery_state', "TEXT NOT NULL DEFAULT 'untracked_legacy' CHECK(discovery_state IN ('untracked_legacy', 'pending', 'known_prospective', 'known_recovered'))");
+  ensureColumn(database, 'deal_hunter_opportunities', 'discovery_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(discovery_revision >= 0)');
+  ensureColumn(database, 'deal_hunter_opportunities', 'material_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(material_revision >= 0)');
+  ensureColumn(database, 'deal_hunter_opportunities', 'last_material_change_at', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'accepted_at', 'TEXT');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'accepted_run_id', 'TEXT CHECK(accepted_run_id IS NULL OR length(accepted_run_id) BETWEEN 1 AND 200)');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'accepted_evidence_id', 'TEXT CHECK(accepted_evidence_id IS NULL OR length(accepted_evidence_id) BETWEEN 1 AND 240)');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'publication_raw_header', 'TEXT CHECK(publication_raw_header IS NULL OR length(publication_raw_header) <= 100)');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'publication_raw_value', 'TEXT CHECK(publication_raw_value IS NULL OR length(publication_raw_value) <= 200)');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'publication_precision', "TEXT CHECK(publication_precision IS NULL OR publication_precision IN ('unknown', 'date', 'instant'))");
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'publication_offset', 'TEXT CHECK(publication_offset IS NULL OR length(publication_offset) <= 16)');
+  ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'publication_meaning', "TEXT CHECK(publication_meaning IS NULL OR publication_meaning IN ('unknown', 'listing_publication'))");
+  ensureColumn(database, 'deal_hunter_deal_os_imports', 'freshness_generation', 'INTEGER CHECK(freshness_generation IS NULL OR freshness_generation > 0)');
+  ensureColumn(database, 'deal_hunter_deal_os_imports', 'freshness_projection_state', "TEXT CHECK(freshness_projection_state IS NULL OR freshness_projection_state IN ('pending', 'accepted', 'deferred', 'superseded'))");
+  // Older SQLite files cannot acquire an ALTER TABLE foreign key. These
+  // triggers enforce the same reference check for upgraded installations.
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS deal_hunter_first_discovery_evidence_insert_fk
+    BEFORE INSERT ON deal_hunter_opportunities
+    WHEN NEW.first_discovery_evidence_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM deal_hunter_freshness_evidence WHERE id = NEW.first_discovery_evidence_id
+    ) BEGIN SELECT RAISE(ABORT, 'unknown first discovery evidence'); END;
+    CREATE TRIGGER IF NOT EXISTS deal_hunter_first_discovery_evidence_update_fk
+    BEFORE UPDATE OF first_discovery_evidence_id ON deal_hunter_opportunities
+    WHEN NEW.first_discovery_evidence_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM deal_hunter_freshness_evidence WHERE id = NEW.first_discovery_evidence_id
+    ) BEGIN SELECT RAISE(ABORT, 'unknown first discovery evidence'); END;
+    CREATE TRIGGER IF NOT EXISTS deal_hunter_current_observation_evidence_insert_fk
+    BEFORE INSERT ON deal_hunter_opportunity_source_observations
+    WHEN NEW.accepted_evidence_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM deal_hunter_freshness_evidence WHERE id = NEW.accepted_evidence_id
+    ) BEGIN SELECT RAISE(ABORT, 'unknown current observation evidence'); END;
+    CREATE TRIGGER IF NOT EXISTS deal_hunter_current_observation_evidence_update_fk
+    BEFORE UPDATE OF accepted_evidence_id ON deal_hunter_opportunity_source_observations
+    WHEN NEW.accepted_evidence_id IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM deal_hunter_freshness_evidence WHERE id = NEW.accepted_evidence_id
+    ) BEGIN SELECT RAISE(ABORT, 'unknown current observation evidence'); END;
+  `);
   // Existing installations retain their last-good visible queue. Fresh tables
   // already declare DEFAULT 0 above, and score INSERTs explicitly use 0.
   ensureColumn(database, 'deal_hunter_opportunity_scores', 'current_triage_eligible', 'INTEGER NOT NULL DEFAULT 1');
@@ -8881,24 +9096,133 @@ export function createSqliteStorage(config, options = {}) {
 		      return records;
 		    },
 
+    async allocateDealHunterSourceGeneration({ sourceId, runId } = {}) {
+      const source = String(sourceId || '').trim();
+      const run = String(runId || '').trim();
+      if (!source || source.length > 160 || !run || run.length > 200) {
+        throw new Error('Freshness source and run identities must be bounded.');
+      }
+      return database.transaction(() => {
+        const state = database.prepare('SELECT * FROM deal_hunter_source_freshness_state WHERE source_id = ?').get(source);
+        if (state?.accepted_run_id === run) return { sourceId: source, runId: run, generation: state.accepted_generation };
+        const generation = Number(state?.next_generation || 0) + 1;
+        if (!Number.isSafeInteger(generation)) throw new Error('Freshness source generation overflow.');
+        database.prepare(`INSERT INTO deal_hunter_source_freshness_state (source_id, next_generation)
+          VALUES (?, ?) ON CONFLICT(source_id) DO UPDATE SET next_generation = excluded.next_generation`
+        ).run(source, generation);
+        return { sourceId: source, runId: run, generation };
+      }).immediate();
+    },
+
     async insertDealHunterDealOsImport(record) {
       const serialized = serializeDealHunterDealOsImport(record);
-      database.prepare(`
+      const freshnessRun = record?.freshnessRun || (record?.freshness_generation
+        ? { sourceId: 'deal-os-export', runId: record.id, generation: record.freshness_generation }
+        : null);
+      const acceptedRows = Array.isArray(record?.acceptedRowEvidence) ? record.acceptedRowEvidence : [];
+      const insert = database.transaction(() => {
+        let generation = null;
+        let acceptedAt = null;
+        let digest = null;
+        if (freshnessRun) {
+          if (freshnessRun.sourceId !== 'deal-os-export' || freshnessRun.runId !== record.id
+            || !Number.isSafeInteger(freshnessRun.generation) || freshnessRun.generation < 1) {
+            throw new Error('Deal OS freshness run does not match the accepted import rows.');
+          }
+          generation = freshnessRun.generation;
+          digest = createHash('sha256').update(JSON.stringify({
+            file_sha256: record.file_sha256,
+            row_accounting: serialized.row_accounting,
+            records: serialized.records,
+            scope: record.scope,
+          })).digest('hex');
+          const state = database.prepare('SELECT * FROM deal_hunter_source_freshness_state WHERE source_id = ?').get('deal-os-export');
+          if (!state || generation > state.next_generation) throw new Error('Deal OS freshness generation was not allocated.');
+          if (generation <= state.accepted_generation) {
+            if (generation !== state.accepted_generation || state.accepted_run_id !== record.id || state.accepted_digest !== digest) {
+              throw new Error('Stale or conflicting Deal OS freshness run.');
+            }
+            const prior = database.prepare('SELECT * FROM deal_hunter_deal_os_imports WHERE id = ?').get(record.id);
+            if (!prior || prior.file_sha256 !== record.file_sha256 || prior.records !== serialized.records) {
+              throw new Error('Conflicting Deal OS import replay.');
+            }
+            return normalizeDealHunterDealOsImportRow(prior);
+          }
+          if (acceptedRows.length !== Number(record.accepted_row_count)) {
+            throw new Error('Deal OS freshness run does not match the accepted import rows.');
+          }
+          acceptedAt = database.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS at").get().at;
+        }
+        database.prepare(`
         INSERT INTO deal_hunter_deal_os_imports (
           id, created_at, imported_by, exported_at, file_name, file_type, file_size, file_sha256,
           scope, coverage_label, expected_row_count, row_count, source_row_count, accepted_row_count,
           rejected_row_count, canonical_record_count, parser_version, row_accounting,
-          duplicate_count, stable_id_count, listing_url_count, coverage_limit_reached, records, metadata
+          duplicate_count, stable_id_count, listing_url_count, coverage_limit_reached, records, metadata,
+          freshness_generation, freshness_projection_state
         ) VALUES (
           @id, @created_at, @imported_by, @exported_at, @file_name, @file_type, @file_size, @file_sha256,
           @scope, @coverage_label, @expected_row_count, @row_count, @source_row_count, @accepted_row_count,
           @rejected_row_count, @canonical_record_count, @parser_version, @row_accounting,
-          @duplicate_count, @stable_id_count, @listing_url_count, @coverage_limit_reached, @records, @metadata
+          @duplicate_count, @stable_id_count, @listing_url_count, @coverage_limit_reached, @records, @metadata,
+          @freshness_generation, @freshness_projection_state
         )
-      `).run(serialized);
-      return normalizeDealHunterDealOsImportRow(
+      `).run({ ...serialized, freshness_generation: generation, freshness_projection_state: generation ? 'pending' : null });
+        if (freshnessRun) {
+          const insertEvidence = database.prepare(`INSERT INTO deal_hunter_freshness_evidence
+            (id, source_id, source_name, source_record_id, run_id, generation,
+             event_type, field_key, event_ordinal, accepted_at, raw_header, raw_value,
+             publication_precision, publication_meaning, publication_date,
+             publication_instant, publication_state, after_value, metric, currency, period)
+            VALUES (@id, 'deal-os-export', 'SMB Deal OS Export', @source_record_id, @run_id, @generation,
+             @event_type, @field_key, @event_ordinal, @accepted_at, @raw_header, @raw_value,
+             @publication_precision, @publication_meaning, @publication_date,
+             @publication_instant, @publication_state, @after_value, @metric, @currency, @period)`);
+          for (const row of acceptedRows) {
+            const sourceRecordId = String(row.sourceRecordId || '').trim();
+            const ordinal = row.eventOrdinal;
+            if (!sourceRecordId || sourceRecordId.length > 200 || !Number.isSafeInteger(ordinal) || ordinal < 0 || ordinal > 10000) {
+              throw new Error('Deal OS accepted source-row identity is invalid.');
+            }
+            const evidence = normalizeSourceFreshnessEvidence(row.freshnessEvidence);
+            const writeEvent = (eventType, fieldKey, claim, afterValue = null) => {
+              const id = `fl01:${createHash('sha256').update([record.id, sourceRecordId, eventType, fieldKey, ordinal].join('\u0000')).digest('hex')}`;
+              insertEvidence.run({
+                id, source_record_id: sourceRecordId, run_id: record.id, generation,
+                event_type: eventType, field_key: fieldKey, event_ordinal: ordinal, accepted_at: acceptedAt,
+                raw_header: claim?.rawHeader || null, raw_value: claim?.rawValue || null,
+                publication_precision: eventType === 'publication_evidence'
+                  ? (claim?.precision === 'datetime' ? 'instant' : claim?.precision || 'unknown') : 'unknown',
+                publication_meaning: claim?.meaning || 'unknown',
+                publication_date: acceptedPublicationClaim(claim, acceptedAt).date,
+                publication_instant: acceptedPublicationClaim(claim, acceptedAt).instant,
+                publication_state: acceptedPublicationClaim(claim, acceptedAt).state,
+                after_value: afterValue, metric: claim?.metric || 'unknown',
+                currency: claim?.currency || 'unknown', period: claim?.period || 'unknown',
+              });
+            };
+            writeEvent('accepted_source_record', '', null);
+            if (evidence?.dateAdded) writeEvent('publication_evidence', 'date_added', evidence.dateAdded);
+            for (const [fieldKey, claim] of [
+              ['annual_profit', evidence?.annualProfit], ['annual_revenue', evidence?.annualRevenue],
+              ['asking_price', evidence?.askingPrice],
+            ]) {
+              if (!claim) continue;
+              const parsedValue = Number(String(claim.rawValue).replaceAll(/[$,]/g, ''));
+              writeEvent('accepted_source_record', fieldKey, claim, Number.isFinite(parsedValue) ? parsedValue : null);
+            }
+          }
+          database.prepare(`UPDATE deal_hunter_deal_os_imports SET freshness_projection_state = 'superseded'
+            WHERE id <> ? AND freshness_projection_state = 'pending'`).run(record.id);
+          database.prepare(`UPDATE deal_hunter_source_freshness_state SET accepted_generation = ?,
+            accepted_run_id = ?, accepted_digest = ?, accepted_at = ?, projection_state = 'pending'
+            WHERE source_id = ?`).run(generation, record.id, digest, acceptedAt, 'deal-os-export');
+        }
+        return normalizeDealHunterDealOsImportRow(
         database.prepare('SELECT * FROM deal_hunter_deal_os_imports WHERE id = ?').get(record.id),
       );
+      });
+      return insert.immediate();
     },
 
     async getLatestDealHunterDealOsImport() {
@@ -9158,6 +9482,7 @@ export function createSqliteStorage(config, options = {}) {
 
       async passDealHunterOpportunity(command = {}) {
         const opportunityId = String(command.opportunityId || '').trim();
+        const expectedFreshness = freshnessReviewExpectedPair(command);
         const actor = String(command.actor || 'admin').trim() || 'admin';
         const occurredAt = command.occurredAt || new Date().toISOString();
         if (!opportunityId || !command.dispositionId || !command.archiveActivityId || !command.triageActivityId) {
@@ -9168,6 +9493,7 @@ export function createSqliteStorage(config, options = {}) {
             SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
           `).get(opportunityId);
           if (!opportunity || opportunity.status !== 'active') return { applied: false, reason: 'not-current' };
+          assertFreshnessReviewCurrent(opportunity, expectedFreshness);
           if (command.submissionId) {
             assertCrmSubmissionWritableInTransaction(command.submissionId);
           }
@@ -9284,9 +9610,14 @@ export function createSqliteStorage(config, options = {}) {
               reviewed_by = ?,
               reviewed_fingerprint = score_fingerprint,
               reviewed_semantic_digest = semantic_digest,
+              reviewed_discovery_revision = CASE WHEN ? IS NULL THEN reviewed_discovery_revision ELSE ? END,
+              reviewed_material_revision = CASE WHEN ? IS NULL THEN reviewed_material_revision ELSE ? END,
               operator_updated_at = ?
             WHERE opportunity_id = ? AND current_triage_eligible = 1
-          `).run(occurredAt, actor, occurredAt, opportunityId);
+          `).run(occurredAt, actor,
+            expectedFreshness?.discovery ?? null, expectedFreshness?.discovery ?? null,
+            expectedFreshness?.material ?? null, expectedFreshness?.material ?? null,
+            occurredAt, opportunityId);
 
           if (submission) {
             if (archiveSubmission) {
@@ -9344,6 +9675,7 @@ export function createSqliteStorage(config, options = {}) {
 
       async setDealHunterOpportunityOperatorDecision(decision = {}) {
         const opportunityId = String(decision.opportunityId || '').trim();
+        const expectedFreshness = freshnessReviewExpectedPair(decision);
         if (!opportunityId) throw new Error('A canonical opportunity id is required to record an operator decision.');
         const assignments = [];
         const params = { opportunity_id: opportunityId, operator_updated_at: decision.updatedAt || new Date().toISOString() };
@@ -9365,16 +9697,23 @@ export function createSqliteStorage(config, options = {}) {
           params.reviewed_fingerprint = String(decision.reviewedFingerprint || '');
           params.reviewed_semantic_digest = decision.reviewedSemanticDigest
             ? String(decision.reviewedSemanticDigest) : null;
+          if (expectedFreshness) {
+            assignments.push('reviewed_discovery_revision = @reviewed_discovery_revision',
+              'reviewed_material_revision = @reviewed_material_revision');
+            params.reviewed_discovery_revision = expectedFreshness.discovery;
+            params.reviewed_material_revision = expectedFreshness.material;
+          }
         }
         if (assignments.length === 0) return this.getCurrentDealHunterOpportunityScore(opportunityId);
         const transaction = database.transaction(() => {
           const opportunity = database.prepare(`
-            SELECT status FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
+            SELECT status, discovery_revision, material_revision FROM deal_hunter_opportunities WHERE opportunity_id = ? LIMIT 1
           `).get(opportunityId);
           if (!opportunity) return false;
           if (opportunity?.status !== 'active') {
             throw new Error('A superseded or otherwise non-current opportunity cannot receive a triage decision.');
           }
+          assertFreshnessReviewCurrent(opportunity, expectedFreshness);
           const existing = database
             .prepare('SELECT opportunity_id, deal_key FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?')
             .get(opportunityId);
@@ -9695,6 +10034,281 @@ export function createSqliteStorage(config, options = {}) {
         `).all(...params, safePageSize, (safePage - 1) * safePageSize).map(normalizeDealHunterOpportunityScoreRow);
 
         return { rows, total, summary, page: safePage, pageSize: safePageSize, totalPages: Math.max(1, Math.ceil(total / safePageSize)) };
+      },
+
+      async listDealHunterFreshInbox({ area = 'inbox', cursor = null, limit = null,
+        search = '', confidence = '', priority = '', state = '', sort = 'acquisition-priority',
+        asOf = new Date().toISOString() } = {}) {
+        const filters = { search: String(search || '').trim().toLowerCase().slice(0, 160),
+          confidence: String(confidence || ''), priority: String(priority || ''),
+          state: String(state || '').toUpperCase() };
+        const clauses = ["scores.current_triage_eligible = 1", "scores.should_remove = 0",
+          "opportunity.status = 'active'", 'disposition.deal_key IS NULL'];
+        const params = [area === 'research' ? 1 : 0];
+        if (filters.search) {
+          clauses.push("(LOWER(COALESCE(scores.name, '')) LIKE ? OR LOWER(COALESCE(scores.deal_key, '')) LIKE ?)");
+          params.push(`%${filters.search}%`, `%${filters.search}%`);
+        }
+        if (filters.confidence) { clauses.push('scores.confidence = ?'); params.push(filters.confidence); }
+        if (filters.priority) { clauses.push('scores.operator_priority = ?'); params.push(filters.priority); }
+        if (filters.state) { clauses.push("UPPER(COALESCE(scores.state, '')) = ?"); params.push(filters.state); }
+        const publicationJoin = `FROM deal_hunter_opportunity_source_observations AS date_observation
+          JOIN deal_hunter_freshness_evidence AS core ON core.id = date_observation.accepted_evidence_id
+          JOIN deal_hunter_freshness_evidence AS publication
+            ON publication.run_id = core.run_id AND publication.source_id = core.source_id
+            AND publication.source_record_id = core.source_record_id
+            AND publication.event_type = 'publication_evidence' AND publication.field_key = 'date_added'
+          WHERE date_observation.opportunity_id = scores.opportunity_id
+            AND date_observation.field = 'date_added'
+            AND publication.current_canonical_id = scores.opportunity_id
+            AND publication.publication_meaning = 'listing_publication'`;
+        const query = database.prepare(`SELECT
+          scores.opportunity_id, scores.fit_score, scores.confidence,
+          scores.contradiction_count, scores.operator_priority,
+          scores.reviewed_at, scores.reviewed_discovery_revision,
+          scores.reviewed_material_revision, scores.score_fingerprint,
+          scores.semantic_digest,
+          (SELECT MAX(source.updated_at)
+            FROM deal_hunter_opportunity_source_observations AS source
+            WHERE source.opportunity_id = scores.opportunity_id) AS source_snapshot_updated_at,
+          opportunity.first_accepted_at, opportunity.discovery_state,
+          opportunity.discovery_revision, opportunity.material_revision,
+          opportunity.last_material_change_at,
+          NULL AS due_at,
+          CASE WHEN opportunity.first_accepted_at IS NOT NULL
+            AND opportunity.discovery_revision > scores.reviewed_discovery_revision
+            THEN (SELECT publication.publication_date ${publicationJoin}
+              ORDER BY publication.accepted_at DESC, publication.id LIMIT 1) END AS publication_date,
+          CASE WHEN opportunity.first_accepted_at IS NOT NULL
+            AND opportunity.discovery_revision > scores.reviewed_discovery_revision
+            THEN (SELECT publication.publication_instant ${publicationJoin}
+              ORDER BY publication.accepted_at DESC, publication.id LIMIT 1) END AS publication_instant,
+          CASE WHEN opportunity.first_accepted_at IS NOT NULL
+            AND opportunity.discovery_revision > scores.reviewed_discovery_revision
+            THEN (SELECT publication.publication_state ${publicationJoin}
+              ORDER BY publication.accepted_at DESC, publication.id LIMIT 1) END AS publication_state,
+          CASE WHEN opportunity.first_accepted_at IS NOT NULL
+            AND opportunity.discovery_revision > scores.reviewed_discovery_revision
+            THEN (SELECT publication.source_name ${publicationJoin}
+              ORDER BY publication.accepted_at DESC, publication.id LIMIT 1) END AS publication_source,
+          CASE WHEN opportunity.first_accepted_at IS NOT NULL
+            AND opportunity.discovery_revision > scores.reviewed_discovery_revision
+            THEN (SELECT publication.publication_precision ${publicationJoin}
+              ORDER BY publication.accepted_at DESC, publication.id LIMIT 1) END AS publication_precision,
+          CASE WHEN opportunity.first_accepted_at IS NOT NULL
+            AND opportunity.discovery_revision > scores.reviewed_discovery_revision
+            THEN (SELECT COUNT(DISTINCT COALESCE(publication.publication_date,
+              publication.publication_instant)) ${publicationJoin}
+              AND publication.publication_state = 'valid') END AS publication_distinct_count,
+          CASE WHEN opportunity.first_accepted_at IS NOT NULL
+            AND opportunity.discovery_revision > scores.reviewed_discovery_revision
+            THEN (SELECT COUNT(*) ${publicationJoin}
+              AND publication.publication_state <> 'valid') END AS publication_unsupported_count,
+          CASE WHEN ? = 1 THEN (SELECT COUNT(*) FROM (SELECT source.field
+            FROM deal_hunter_opportunity_source_observations AS source
+            WHERE source.opportunity_id = scores.opportunity_id
+              AND source.field IN ('annual_profit', 'annual_revenue', 'asking_price')
+            GROUP BY source.field HAVING COUNT(DISTINCT source.value) > 1))
+            ELSE 0 END AS source_conflict_count,
+          CASE WHEN opportunity.material_revision > scores.reviewed_material_revision
+            THEN (SELECT event.field_key FROM deal_hunter_freshness_evidence AS event
+            WHERE event.current_canonical_id = scores.opportunity_id
+              AND event.event_type = 'material_change'
+              AND event.material_revision = opportunity.material_revision
+            ORDER BY event.accepted_at DESC, event.id LIMIT 1) END AS material_field
+          FROM deal_hunter_opportunity_scores AS scores
+          JOIN deal_hunter_opportunities AS opportunity ON opportunity.opportunity_id = scores.opportunity_id
+          LEFT JOIN deal_hunter_dispositions AS disposition
+            ON disposition.deal_key = scores.deal_key AND disposition.disposition = 'dismissed'
+          WHERE ${clauses.join(' AND ')}`);
+        return database.transaction(() => {
+          const dueByOpportunity = new Map(database.prepare(`
+            SELECT request.opportunity_id, MIN(request.next_follow_up_at) AS due_at
+            FROM deal_hunter_cim_requests AS request
+            JOIN deal_hunter_opportunities AS opportunity
+              ON opportunity.opportunity_id = request.opportunity_id
+                AND opportunity.primary_submission_id = request.submission_id
+                AND opportunity.status = 'active'
+            JOIN contact_submissions AS submission ON submission.id = request.submission_id
+            WHERE request.follow_up_state = 'scheduled'
+              AND request.request_state = 'provider_accepted'
+              AND request.delivery_state = 'accepted'
+              AND request.responded_at IS NULL AND request.follow_up_count < 5
+              AND request.next_follow_up_at <= ? AND submission.status NOT IN ('archived', 'spam')
+              AND NOT EXISTS (SELECT 1 FROM crm_submission_supersessions AS supersession
+                WHERE supersession.superseded_submission_id = submission.id AND supersession.status = 'active')
+              AND json_extract(request.metadata, '$.manualFollowUp.mode') = 'operator-approved'
+              AND json_extract(request.metadata, '$.manualFollowUp.version') =
+                'deal-hunter-manual-follow-up-v1'
+              AND json_extract(request.metadata, '$.manualFollowUp.maximumFollowUps') = 5
+              AND json_extract(request.metadata, '$.manualFollowUp.cadencePolicy') =
+                'accepted-local-date-plus-2-weekend-forward-0900-pt-v1'
+              AND json_extract(request.metadata, '$.manualFollowUp.stoppedAt') IS NULL
+            GROUP BY request.opportunity_id
+          `).all(asOf).map((row) => [row.opportunity_id, row.due_at]));
+          const replyByOpportunity = new Map(database.prepare(`
+            SELECT opportunity.opportunity_id, communication.occurred_at AS action_at
+            FROM deal_hunter_opportunities AS opportunity
+            JOIN contact_submissions AS submission ON submission.id = opportunity.primary_submission_id
+            JOIN crm_communications AS communication ON communication.id = (
+              SELECT latest.id FROM crm_communications AS latest
+              WHERE latest.submission_id = submission.id
+              ORDER BY latest.occurred_at DESC, latest.id DESC LIMIT 1)
+            WHERE opportunity.status = 'active' AND submission.status NOT IN ('archived', 'spam')
+              AND submission.follow_up_state <> 'completed'
+              AND NOT EXISTS (SELECT 1 FROM crm_submission_supersessions AS supersession
+                WHERE supersession.superseded_submission_id = submission.id AND supersession.status = 'active')
+              AND communication.direction = 'inbound' AND communication.source = 'resend-webhook'
+              AND communication.kind = 'broker-reply' AND communication.delivery_state = 'replied'
+          `).all().map((row) => [row.opportunity_id, row.action_at]));
+          const materialsByOpportunity = new Map(database.prepare(`
+            SELECT opportunity.opportunity_id, MAX(material.action_at) AS action_at
+            FROM deal_hunter_opportunities AS opportunity
+            JOIN contact_submissions AS submission ON submission.id = opportunity.primary_submission_id
+            JOIN (
+              SELECT document.submission_id, document.created_at AS action_at
+              FROM secure_documents AS document
+              WHERE document.document_type IN ('cim','teaser','prospectus','offering_memorandum',
+                'offering_materials','data_room','broker_materials','financials','financial_package',
+                'financial_statements','p_and_l','tax_returns','balance_sheet')
+              UNION ALL
+              SELECT request.submission_id, COALESCE(request.last_uploaded_at, request.updated_at)
+              FROM secure_upload_requests AS request
+              WHERE request.status IN ('completed', 'documents-received')
+                AND EXISTS (SELECT 1 FROM json_each(request.requested_documents) AS requested
+                  WHERE (CASE WHEN requested.type = 'text' THEN requested.value
+                    ELSE COALESCE(json_extract(requested.value, '$.category'),
+                      json_extract(requested.value, '$.id')) END) IN
+                    ('cim','teaser','prospectus','offering_memorandum','offering_materials',
+                    'data_room','broker_materials','financials','financial_package',
+                    'financial_statements','p_and_l','tax_returns','balance_sheet'))
+            ) AS material ON material.submission_id = submission.id
+            WHERE opportunity.status = 'active' AND submission.status NOT IN ('archived', 'spam')
+              AND submission.follow_up_state <> 'completed'
+              AND NOT EXISTS (SELECT 1 FROM crm_submission_supersessions AS supersession
+                WHERE supersession.superseded_submission_id = submission.id AND supersession.status = 'active')
+              AND COALESCE(json_extract(submission.metadata, '$.diligence.stage'), '')
+                NOT IN ('financial-review','lender-review','loi-candidate')
+              AND COALESCE(json_extract(submission.metadata, '$.acquisitionCommand.pipelineStage'), '')
+                NOT IN ('diligence','loi-candidate')
+            GROUP BY opportunity.opportunity_id
+          `).all().map((row) => [row.opportunity_id, row.action_at]));
+          const candidateRows = query.all(...params);
+          const candidates = candidateRows.map((row) => ({ ...row,
+            due_at: replyByOpportunity.get(row.opportunity_id)
+              || materialsByOpportunity.get(row.opportunity_id)
+              || dueByOpportunity.get(row.opportunity_id) || null,
+            action_reason: replyByOpportunity.has(row.opportunity_id) ? 'broker_reply'
+              : materialsByOpportunity.has(row.opportunity_id) ? 'materials_ready'
+                : dueByOpportunity.has(row.opportunity_id) ? 'due_follow_up' : null,
+            reviewed_discovery_revision: Number(row.reviewed_discovery_revision || 0),
+            reviewed_material_revision: Number(row.reviewed_material_revision || 0),
+          }));
+          const result = buildFreshInboxAreas(candidates, { area, cursor, limit, asOf, filters, sort });
+          const hydrate = database.prepare(`SELECT scores.*,
+            opportunity.primary_submission_id,
+            (SELECT MAX(source.accepted_at) FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id) AS latest_accepted_observation_at,
+            (SELECT publication.publication_date ${publicationJoin}
+              ORDER BY publication.accepted_at DESC, publication.id LIMIT 1) AS publication_date,
+            (SELECT publication.publication_instant ${publicationJoin}
+              ORDER BY publication.accepted_at DESC, publication.id LIMIT 1) AS publication_instant,
+            (SELECT publication.publication_state ${publicationJoin}
+              ORDER BY publication.accepted_at DESC, publication.id LIMIT 1) AS publication_state,
+            (SELECT publication.source_name ${publicationJoin}
+              ORDER BY publication.accepted_at DESC, publication.id LIMIT 1) AS publication_source,
+            (SELECT publication.publication_precision ${publicationJoin}
+              ORDER BY publication.accepted_at DESC, publication.id LIMIT 1) AS publication_precision,
+            (SELECT COUNT(DISTINCT COALESCE(publication.publication_date,
+              publication.publication_instant)) ${publicationJoin}
+              AND publication.publication_state = 'valid') AS publication_distinct_count,
+            (SELECT COUNT(*) ${publicationJoin}
+              AND publication.publication_state <> 'valid') AS publication_unsupported_count,
+            (SELECT COUNT(*) FROM (SELECT source.field
+              FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id
+                AND source.field IN ('annual_profit', 'annual_revenue', 'asking_price')
+              GROUP BY source.field HAVING COUNT(DISTINCT source.value) > 1))
+              AS source_conflict_count,
+            (SELECT event.field_key FROM deal_hunter_freshness_evidence AS event
+              JOIN deal_hunter_opportunities AS opportunity
+                ON opportunity.opportunity_id = scores.opportunity_id
+              WHERE event.current_canonical_id = scores.opportunity_id
+                AND event.event_type = 'material_change'
+                AND event.material_revision = opportunity.material_revision
+              ORDER BY event.accepted_at DESC, event.id LIMIT 1) AS material_field,
+            (SELECT event.before_value FROM deal_hunter_freshness_evidence AS event
+              WHERE event.current_canonical_id = scores.opportunity_id
+                AND event.event_type = 'material_change'
+                AND event.material_revision = opportunity.material_revision
+              ORDER BY event.accepted_at DESC, event.id LIMIT 1) AS material_before_value,
+            (SELECT event.after_value FROM deal_hunter_freshness_evidence AS event
+              WHERE event.current_canonical_id = scores.opportunity_id
+                AND event.event_type = 'material_change'
+                AND event.material_revision = opportunity.material_revision
+              ORDER BY event.accepted_at DESC, event.id LIMIT 1) AS material_after_value,
+            (SELECT event.currency FROM deal_hunter_freshness_evidence AS event
+              WHERE event.current_canonical_id = scores.opportunity_id
+                AND event.event_type = 'material_change'
+                AND event.material_revision = opportunity.material_revision
+              ORDER BY event.accepted_at DESC, event.id LIMIT 1) AS material_currency,
+            (SELECT source.value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'industry'
+              ORDER BY source.observed_at DESC, source.id LIMIT 1) AS industry,
+            (SELECT source.value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'location'
+              ORDER BY source.observed_at DESC, source.id LIMIT 1) AS location,
+            (SELECT source.value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'annual_profit'
+              ORDER BY source.observed_at DESC, source.id LIMIT 1) AS annual_profit,
+            (SELECT json_object('metric', evidence.metric, 'period', evidence.period,
+                'currency', evidence.currency)
+              FROM deal_hunter_opportunity_source_observations AS source
+              JOIN deal_hunter_freshness_evidence AS core ON core.id = source.accepted_evidence_id
+              JOIN deal_hunter_freshness_evidence AS evidence ON evidence.run_id = core.run_id
+                AND evidence.source_id = core.source_id
+                AND evidence.source_record_id = core.source_record_id
+                AND evidence.event_type = 'accepted_source_record'
+                AND evidence.field_key = 'annual_profit'
+                AND evidence.current_canonical_id = scores.opportunity_id
+              WHERE source.id = (SELECT chosen.id FROM deal_hunter_opportunity_source_observations AS chosen
+                WHERE chosen.opportunity_id = scores.opportunity_id AND chosen.field = 'annual_profit'
+                ORDER BY chosen.observed_at DESC, chosen.id LIMIT 1)
+                AND CAST(source.value AS REAL) = evidence.after_value
+              LIMIT 1) AS annual_profit_evidence,
+            (SELECT source.value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'annual_revenue'
+              ORDER BY source.observed_at DESC, source.id LIMIT 1) AS annual_revenue,
+            (SELECT source.value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'asking_price'
+              ORDER BY source.observed_at DESC, source.id LIMIT 1) AS asking_price,
+            (SELECT source.value FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id AND source.field = 'profit_multiple'
+              ORDER BY source.observed_at DESC, source.id LIMIT 1) AS profit_multiple,
+            COALESCE((SELECT MAX(source.observed_at)
+              FROM deal_hunter_opportunity_source_observations AS source
+              WHERE source.opportunity_id = scores.opportunity_id), scores.scored_at)
+              AS observation_freshness,
+            COALESCE((SELECT submission.status FROM contact_submissions AS submission
+              JOIN deal_hunter_opportunities AS opportunity
+                ON opportunity.primary_submission_id = submission.id
+              WHERE opportunity.opportunity_id = scores.opportunity_id), 'not-started') AS crm_status
+            FROM deal_hunter_opportunity_scores AS scores
+            JOIN deal_hunter_opportunities AS opportunity
+              ON opportunity.opportunity_id = scores.opportunity_id
+            WHERE scores.opportunity_id = ?`);
+          const hydrated = new Map();
+          for (const row of result.areas.flatMap((item) => item.rows)) {
+            if (hydrated.has(row.opportunity_id)) continue;
+            const score = normalizeDealHunterOpportunityScoreRow(hydrate.get(row.opportunity_id));
+            hydrated.set(row.opportunity_id, { ...score,
+              top_strength: score.summary?.strengths?.[0] || '',
+              top_concern: score.summary?.concerns?.[0] || '' });
+          }
+          return { ...result, areas: result.areas.map((item) => ({ ...item,
+            rows: item.rows.map((row) => classifyFreshInboxCandidate(
+              { ...row, ...hydrated.get(row.opportunity_id) }, asOf)) })) };
+        }).deferred();
       },
 
       async listDealHunterCrmReconciliationItems(runId, { limit = 5000 } = {}) {
@@ -10779,6 +11393,31 @@ export function createSqliteStorage(config, options = {}) {
       `).get(String(opportunityId).trim()));
     },
 
+    async getLatestDealHunterMaterialChange({ opportunityId, materialRevision } = {}) {
+      if (!opportunityId || !Number.isSafeInteger(Number(materialRevision)) || Number(materialRevision) < 1) return null;
+      return database.prepare(`SELECT field_key, before_value, after_value, currency, period,
+        source_name, accepted_at FROM deal_hunter_freshness_evidence
+        WHERE current_canonical_id = ? AND event_type = 'material_change' AND material_revision = ?
+        ORDER BY accepted_at DESC, id LIMIT 1`).get(String(opportunityId), Number(materialRevision)) || null;
+    },
+
+    async markDealHunterOpportunityDiscoveryPending({ opportunityId, createdAt } = {}) {
+      const id = String(opportunityId || '').trim();
+      const timestamp = String(createdAt || '').trim();
+      return database.transaction(() => {
+        const current = database.prepare('SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ?').get(id);
+        if (!current || current.created_at !== timestamp || current.status !== 'active'
+          || current.first_accepted_at !== null || current.discovery_revision !== 0
+          || !['untracked_legacy', 'pending'].includes(current.discovery_state)) {
+          throw new Error('Freshness pending state requires a newly created active canonical identity.');
+        }
+        if (current.discovery_state === 'untracked_legacy') {
+          database.prepare("UPDATE deal_hunter_opportunities SET discovery_state = 'pending' WHERE opportunity_id = ?").run(id);
+        }
+        return normalizeDealHunterOpportunityRow(database.prepare('SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ?').get(id));
+      }).immediate();
+    },
+
     async getCimStage2SubmissionAuthority(opportunityId) {
       const normalizedOpportunityId = String(opportunityId || '').trim();
       if (!normalizedOpportunityId) {
@@ -11171,6 +11810,193 @@ export function createSqliteStorage(config, options = {}) {
       `).all(String(opportunityId || '').trim(), Number.isFinite(Number(limit)) ? Math.max(1, Math.min(Math.trunc(Number(limit)), 500)) : 500).map(normalizeDealHunterOpportunitySourceObservationRow);
     },
 
+    async bindAcceptedDealHunterFreshness({ importId, opportunityId, sourceRecordId, expectedGeneration, snapshot } = {}) {
+      const runId = String(importId || '').trim();
+      const canonicalId = String(opportunityId || '').trim();
+      const recordId = String(sourceRecordId || '').trim();
+      const normalizedSnapshot = normalizeOpportunitySourceObservationSnapshot(snapshot);
+      if (!runId || !canonicalId || !recordId || normalizedSnapshot.source_id !== 'deal-os-export'
+        || normalizedSnapshot.opportunity_id !== canonicalId || normalizedSnapshot.source_record_id !== recordId
+        || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
+        throw new Error('Deal OS freshness binding identity does not match the accepted source record.');
+      }
+      return database.transaction(() => {
+        const imported = database.prepare('SELECT * FROM deal_hunter_deal_os_imports WHERE id = ?').get(runId);
+        const state = database.prepare("SELECT * FROM deal_hunter_source_freshness_state WHERE source_id = 'deal-os-export'").get();
+        const event = database.prepare(`SELECT * FROM deal_hunter_freshness_evidence
+          WHERE run_id = ? AND source_id = 'deal-os-export' AND source_record_id = ?
+            AND event_type = 'accepted_source_record' AND field_key = ''
+          ORDER BY event_ordinal LIMIT 1`).get(runId, recordId);
+        const canonical = database.prepare('SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ?').get(canonicalId);
+        if (!imported || imported.freshness_generation !== expectedGeneration || !event
+          || event.generation !== expectedGeneration || !canonical || canonical.status !== 'active') {
+          throw new Error('Deal OS freshness binding lacks an accepted import and current canonical identity.');
+        }
+        const conflicting = database.prepare(`SELECT id FROM deal_hunter_freshness_evidence
+          WHERE run_id = ? AND source_id = 'deal-os-export' AND source_record_id = ?
+            AND current_canonical_id IS NOT NULL AND current_canonical_id <> ? LIMIT 1`
+        ).get(runId, recordId, canonicalId);
+        if (conflicting) throw new Error('Accepted Deal OS evidence is already bound to another canonical identity.');
+        database.prepare(`UPDATE deal_hunter_freshness_evidence
+          SET current_canonical_id = ?, binding_audit_id = ?
+          WHERE run_id = ? AND source_id = 'deal-os-export' AND source_record_id = ?
+            AND current_canonical_id IS NULL`
+        ).run(canonicalId, runId, runId, recordId);
+        const priorAccepted = database.prepare(`SELECT earlier.id, earlier.run_id,
+            earlier.accepted_at, earlier.current_canonical_id,
+            json_extract(older_import.row_accounting,
+              '$[' || CAST(earlier.event_ordinal AS INTEGER) || '].listingIdentity') AS listing_identity
+          FROM deal_hunter_freshness_evidence AS earlier
+          JOIN deal_hunter_deal_os_imports AS older_import ON older_import.id = earlier.run_id
+          WHERE earlier.source_id = 'deal-os-export' AND earlier.source_record_id = ?
+            AND earlier.event_type = 'accepted_source_record' AND earlier.field_key = ''
+            AND earlier.accepted_at < ?
+          ORDER BY earlier.accepted_at, earlier.id LIMIT 1`
+        ).get(recordId, event.accepted_at);
+        const currentListingIdentity = database.prepare(`SELECT json_extract(row_accounting,
+          '$[' || CAST(? AS INTEGER) || '].listingIdentity') AS listing_identity
+          FROM deal_hunter_deal_os_imports WHERE id = ?`
+        ).get(event.event_ordinal, runId)?.listing_identity;
+        const provenEarlier = priorAccepted && currentListingIdentity
+          && priorAccepted.listing_identity === currentListingIdentity;
+        if (provenEarlier && priorAccepted.current_canonical_id
+          && priorAccepted.current_canonical_id !== canonicalId) {
+          throw new Error('Earlier accepted Deal OS listing is bound to another canonical identity.');
+        }
+        if (provenEarlier && !priorAccepted.current_canonical_id) {
+          database.prepare(`UPDATE deal_hunter_freshness_evidence
+            SET current_canonical_id = ?, binding_audit_id = ?
+            WHERE run_id = ? AND source_id = 'deal-os-export' AND source_record_id = ?
+              AND current_canonical_id IS NULL`
+          ).run(canonicalId, runId, priorAccepted.run_id, recordId);
+        }
+        if (canonical.discovery_state === 'pending' && canonical.first_accepted_at === null) {
+          if (!priorAccepted || provenEarlier) database.prepare(`UPDATE deal_hunter_opportunities SET first_accepted_at = ?,
+            first_discovery_evidence_id = ?, discovery_state = ?,
+            discovery_revision = discovery_revision + 1 WHERE opportunity_id = ?`
+          ).run(provenEarlier ? priorAccepted.accepted_at : event.accepted_at,
+            provenEarlier ? priorAccepted.id : event.id,
+            !provenEarlier && state?.accepted_generation === expectedGeneration && state?.accepted_run_id === runId
+              ? 'known_prospective' : 'known_recovered', canonicalId);
+        } else if (['known_prospective', 'known_recovered'].includes(canonical.discovery_state)
+          && canonical.first_accepted_at && event.accepted_at < canonical.first_accepted_at) {
+          database.prepare(`UPDATE deal_hunter_opportunities SET first_accepted_at = ?,
+            first_discovery_evidence_id = ?, discovery_state = 'known_recovered',
+            discovery_revision = discovery_revision + 1 WHERE opportunity_id = ?`
+          ).run(event.accepted_at, event.id, canonicalId);
+        }
+        if (!state || state.accepted_generation !== expectedGeneration || state.accepted_run_id !== runId) {
+          database.prepare("UPDATE deal_hunter_deal_os_imports SET freshness_projection_state = 'superseded' WHERE id = ?")
+            .run(runId);
+          return { bound: true, projectionState: 'superseded' };
+        }
+        for (const [fieldKey, claim] of [
+          ['annual_profit', normalizedSnapshot.freshness_evidence?.annualProfit],
+          ['annual_revenue', normalizedSnapshot.freshness_evidence?.annualRevenue],
+          ['asking_price', normalizedSnapshot.freshness_evidence?.askingPrice],
+        ]) {
+          if (!claim) continue;
+          const after = database.prepare(`SELECT * FROM deal_hunter_freshness_evidence
+            WHERE run_id = ? AND source_id = 'deal-os-export' AND source_record_id = ?
+              AND event_type = 'accepted_source_record' AND field_key = ? AND event_ordinal = ?`
+          ).get(runId, recordId, fieldKey, event.event_ordinal);
+          if (!after) throw new Error('Deal OS financial projection lacks its accepted field evidence.');
+          const priorObservation = database.prepare(`SELECT * FROM deal_hunter_opportunity_source_observations
+            WHERE opportunity_id = ? AND source_id = 'deal-os-export'
+              AND source_record_id = ? AND field = ?`
+          ).get(canonicalId, recordId, fieldKey);
+          if (!priorObservation) continue;
+          const priorCore = priorObservation.accepted_evidence_id
+            ? database.prepare('SELECT run_id, event_ordinal FROM deal_hunter_freshness_evidence WHERE id = ?')
+              .get(priorObservation.accepted_evidence_id) : null;
+          const before = priorCore ? database.prepare(`SELECT * FROM deal_hunter_freshness_evidence
+            WHERE run_id = ? AND source_id = 'deal-os-export' AND source_record_id = ?
+              AND event_type = 'accepted_source_record' AND field_key = ? AND event_ordinal = ?`
+          ).get(priorCore.run_id, recordId, fieldKey, priorCore.event_ordinal) : null;
+          if (before?.after_value === after.after_value
+            || priorObservation.value === String(after.after_value)) continue;
+          const competing = database.prepare(`SELECT 1 FROM deal_hunter_opportunity_source_observations
+            WHERE opportunity_id = ? AND source_id <> 'deal-os-export'
+              AND field = ? AND value <> ? LIMIT 1`
+          ).get(canonicalId, fieldKey, String(after.after_value));
+          const comparable = Boolean(before && !competing && before.after_value !== null
+            && after.after_value !== null && after.metric !== 'unknown'
+            && after.currency !== 'unknown' && after.period !== 'unknown'
+            && before.metric === after.metric && before.currency === after.currency
+            && before.period === after.period && before.current_canonical_id === canonicalId);
+          const eventType = comparable ? 'material_change' : 'evidence_state_change';
+          const revision = comparable ? database.prepare(`SELECT material_revision
+            FROM deal_hunter_opportunities WHERE opportunity_id = ?`).get(canonicalId).material_revision + 1 : null;
+          database.prepare(`INSERT INTO deal_hunter_freshness_evidence
+            (id, source_id, source_name, source_record_id, run_id, generation,
+              event_type, field_key, event_ordinal, accepted_at, original_canonical_id,
+              current_canonical_id, before_value, after_value, before_evidence_id,
+              after_evidence_id, metric, currency, period, classification, material_revision)
+            VALUES (?, 'deal-os-export', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          ).run(`fl01:${createHash('sha256').update([runId, recordId, eventType,
+            fieldKey, event.event_ordinal].join('\u0000')).digest('hex')}`,
+            after.source_name, recordId, runId, expectedGeneration, eventType, fieldKey,
+            event.event_ordinal, event.accepted_at, canonicalId, canonicalId,
+            before?.after_value ?? null, after.after_value, before?.id || null, after.id,
+            after.metric, after.currency, after.period,
+            comparable ? 'comparable_change' : competing ? 'conflict' : 'new_evidence', revision);
+          if (comparable) database.prepare(`UPDATE deal_hunter_opportunities
+            SET material_revision = ?, last_material_change_at = ? WHERE opportunity_id = ?`
+          ).run(revision, event.accepted_at, canonicalId);
+        }
+        const upsert = database.prepare(`INSERT INTO deal_hunter_opportunity_source_observations (
+          id, opportunity_id, source_id, source_name, source_record_id, field, value,
+          observed_at, created_at, updated_at, accepted_at, accepted_run_id,
+          accepted_evidence_id, publication_raw_header, publication_raw_value,
+          publication_precision, publication_offset, publication_meaning
+        ) VALUES (
+          @id, @opportunity_id, @source_id, @source_name, @source_record_id, @field, @value,
+          @observed_at, @created_at, @updated_at, @accepted_at, @accepted_run_id,
+          @accepted_evidence_id, @publication_raw_header, @publication_raw_value,
+          @publication_precision, @publication_offset, @publication_meaning
+        ) ON CONFLICT(opportunity_id, source_id, source_record_id, field) DO UPDATE SET
+          source_name = excluded.source_name, value = excluded.value,
+          observed_at = excluded.observed_at, updated_at = excluded.updated_at,
+          accepted_at = excluded.accepted_at, accepted_run_id = excluded.accepted_run_id,
+          accepted_evidence_id = excluded.accepted_evidence_id,
+          publication_raw_header = excluded.publication_raw_header,
+          publication_raw_value = excluded.publication_raw_value,
+          publication_precision = excluded.publication_precision,
+          publication_offset = excluded.publication_offset,
+          publication_meaning = excluded.publication_meaning`);
+        const desiredFields = new Set(normalizedSnapshot.observations.map((observation) => observation.field));
+        for (const observation of normalizedSnapshot.observations) {
+          const publication = observation.field === 'date_added' ? normalizedSnapshot.freshness_evidence?.dateAdded : null;
+          upsert.run({
+            ...observation,
+            accepted_at: event.accepted_at,
+            accepted_run_id: runId,
+            accepted_evidence_id: event.id,
+            publication_raw_header: publication?.rawHeader || null,
+            publication_raw_value: publication?.rawValue || null,
+            publication_precision: publication?.precision === 'datetime' ? 'instant' : publication?.precision || null,
+            publication_offset: publication?.offset || null,
+            publication_meaning: publication?.meaning || null,
+          });
+        }
+        for (const observation of database.prepare(`SELECT id, field FROM deal_hunter_opportunity_source_observations
+          WHERE opportunity_id = ? AND source_id = 'deal-os-export' AND source_record_id = ?`).all(canonicalId, recordId)) {
+          if (!desiredFields.has(observation.field)) {
+            database.prepare('DELETE FROM deal_hunter_opportunity_source_observations WHERE id = ?').run(observation.id);
+          }
+        }
+        const unbound = database.prepare(`SELECT count(*) AS n FROM deal_hunter_freshness_evidence
+          WHERE run_id = ? AND source_id = 'deal-os-export' AND event_type = 'accepted_source_record'
+            AND field_key = '' AND current_canonical_id IS NULL`).get(runId).n;
+        const projectionState = unbound === 0 ? 'accepted' : 'pending';
+        database.prepare('UPDATE deal_hunter_deal_os_imports SET freshness_projection_state = ? WHERE id = ?')
+          .run(projectionState, runId);
+        database.prepare("UPDATE deal_hunter_source_freshness_state SET projection_state = ? WHERE source_id = 'deal-os-export'")
+          .run(projectionState);
+        return { bound: true, projectionState };
+      }).immediate();
+    },
+
     async upsertDealHunterOpportunitySourceObservation(observation = {}) {
       const normalizedObservation = normalizeOpportunitySourceObservation(observation);
       database.prepare(`
@@ -11185,7 +12011,23 @@ export function createSqliteStorage(config, options = {}) {
           source_name = excluded.source_name,
           value = excluded.value,
           observed_at = excluded.observed_at,
-          updated_at = excluded.updated_at
+          updated_at = excluded.updated_at,
+          accepted_at = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.accepted_at END,
+          accepted_run_id = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.accepted_run_id END,
+          accepted_evidence_id = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.accepted_evidence_id END,
+          publication_raw_header = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_raw_header END,
+          publication_raw_value = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_raw_value END,
+          publication_precision = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_precision END,
+          publication_offset = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_offset END,
+          publication_meaning = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+            THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_meaning END
       `).run(normalizedObservation);
       return normalizeDealHunterOpportunitySourceObservationRow(database.prepare(`
         SELECT * FROM deal_hunter_opportunity_source_observations
@@ -11215,7 +12057,23 @@ export function createSqliteStorage(config, options = {}) {
               source_name = excluded.source_name,
               value = excluded.value,
               observed_at = excluded.observed_at,
-              updated_at = excluded.updated_at
+              updated_at = excluded.updated_at,
+              accepted_at = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.accepted_at END,
+              accepted_run_id = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.accepted_run_id END,
+              accepted_evidence_id = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.accepted_evidence_id END,
+              publication_raw_header = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_raw_header END,
+              publication_raw_value = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_raw_value END,
+              publication_precision = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_precision END,
+              publication_offset = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_offset END,
+              publication_meaning = CASE WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value
+                THEN NULL ELSE deal_hunter_opportunity_source_observations.publication_meaning END
           `).run(observation);
         }
         const fields = value.observations.map((observation) => observation.field);
@@ -11246,36 +12104,305 @@ export function createSqliteStorage(config, options = {}) {
     },
 
     async replaceAdmittedCompleteGoogleSheetSourceSnapshot(snapshot = {}) {
-      consumeCompleteGoogleSheetSourceSnapshotAdmission({
+      const admission = consumeCompleteGoogleSheetSourceSnapshotAdmission({
         admission: snapshot.admission,
         snapshot,
       });
-      const normalizedSnapshot = normalizeDealHunterSourceSnapshot(snapshot);
+      const normalizedSnapshot = normalizeCompleteGoogleSheetFreshnessSnapshot(snapshot);
       const replace = database.transaction((value) => {
+        const run = admission.run || null;
+        let acceptedAt = null;
+        const evidenceByRecord = new Map();
+        const currentByRecord = new Map();
+        if (run) {
+          const state = database.prepare('SELECT * FROM deal_hunter_source_freshness_state WHERE source_id = ?').get(value.source_id);
+          if (!state || run.sourceId !== value.source_id || run.generation > state.next_generation) {
+            throw new Error('Complete Sheet freshness generation was not allocated.');
+          }
+          if (run.generation <= state.accepted_generation) {
+            if (run.generation !== state.accepted_generation || run.runId !== state.accepted_run_id
+              || admission.freshness_digest !== state.accepted_digest) {
+              throw new Error('Stale or conflicting complete Sheet freshness run.');
+            }
+            return database.prepare(`SELECT * FROM deal_hunter_opportunity_source_observations
+              WHERE source_id = ? ORDER BY observed_at DESC, id ASC`).all(value.source_id)
+              .map(normalizeDealHunterOpportunitySourceObservationRow);
+          }
+          acceptedAt = database.prepare("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS at").get().at;
+          for (const row of database.prepare(`SELECT * FROM deal_hunter_opportunity_source_observations
+            WHERE source_id = ?`).all(value.source_id)) {
+            const key = `${row.source_record_id}\u0000${row.field}`;
+            currentByRecord.set(key, row);
+          }
+          if (value.unresolved.length > 0) {
+            for (const item of value.unresolved) {
+              const exception = database.prepare(`SELECT id FROM deal_hunter_identity_exceptions
+                WHERE id = ? AND status = 'open'`).get(item.identity_exception_id);
+              if (!exception) throw new Error('Deferred Sheet evidence requires a current open identity exception.');
+            }
+            for (const item of [
+              ...value.records.map((record) => ({ ...record, identity_exception_id: null })),
+              ...value.unresolved,
+            ]) {
+              const evidence = normalizeSourceFreshnessEvidence(item.freshness_evidence);
+              const recordDigest = createHash('sha256').update(JSON.stringify(item)).digest('hex');
+              const common = {
+                source_id: value.source_id, source_name: value.source_name,
+                source_record_id: item.source_record_id, run_id: run.runId,
+                generation: run.generation, record_digest: recordDigest,
+                accepted_at: acceptedAt, original_canonical_id: item.opportunity_id || null,
+                current_canonical_id: item.opportunity_id || null,
+                identity_exception_id: item.identity_exception_id || null,
+              };
+              const add = (eventType, fieldKey, claim = null) => database.prepare(`
+                INSERT INTO deal_hunter_freshness_evidence (
+                  id, source_id, source_name, source_record_id, run_id, generation, record_digest,
+                  event_type, field_key, accepted_at, original_canonical_id, current_canonical_id,
+                  identity_exception_id, raw_header, raw_value, publication_meaning,
+                  publication_precision, publication_offset, publication_date,
+                  publication_instant, publication_state, metric, currency, period
+                ) VALUES (
+                  @id, @source_id, @source_name, @source_record_id, @run_id, @generation, @record_digest,
+                  @event_type, @field_key, @accepted_at, @original_canonical_id, @current_canonical_id,
+                  @identity_exception_id, @raw_header, @raw_value, @publication_meaning,
+                  @publication_precision, @publication_offset, @publication_date,
+                  @publication_instant, @publication_state, @metric, @currency, @period
+                )`).run({
+                ...common, event_type: eventType, field_key: fieldKey,
+                id: `fl01:${createHash('sha256').update([run.runId, value.source_id,
+                  item.source_record_id, eventType, fieldKey].join('\u0000')).digest('hex')}`,
+                raw_header: claim?.rawHeader || null, raw_value: claim?.rawValue || null,
+                publication_meaning: claim?.meaning || 'unknown',
+                publication_precision: eventType === 'publication_evidence'
+                  ? (claim?.precision === 'datetime' ? 'instant' : claim?.precision || 'unknown') : 'unknown',
+                publication_offset: claim?.offset || null, metric: claim?.metric || 'unknown',
+                publication_date: acceptedPublicationClaim(claim, acceptedAt).date,
+                publication_instant: acceptedPublicationClaim(claim, acceptedAt).instant,
+                publication_state: acceptedPublicationClaim(claim, acceptedAt).state,
+                currency: claim?.currency || 'unknown', period: claim?.period || 'unknown',
+              });
+              add('accepted_source_record', '');
+              if (evidence?.dateAdded) add('publication_evidence', 'date_added', evidence.dateAdded);
+              for (const [field, claim] of [
+                ['annual_profit', evidence?.annualProfit], ['annual_revenue', evidence?.annualRevenue],
+                ['asking_price', evidence?.askingPrice],
+              ]) if (claim) add('accepted_source_record', field, claim);
+            }
+            database.prepare(`UPDATE deal_hunter_source_freshness_state SET accepted_generation = ?,
+              accepted_run_id = ?, accepted_digest = ?, accepted_at = ?, projection_state = 'deferred'
+              WHERE source_id = ?`).run(run.generation, run.runId, admission.freshness_digest, acceptedAt, value.source_id);
+            return database.prepare(`SELECT * FROM deal_hunter_opportunity_source_observations
+              WHERE source_id = ? ORDER BY observed_at DESC, id ASC`).all(value.source_id)
+              .map(normalizeDealHunterOpportunitySourceObservationRow);
+          }
+          const insertEvidence = database.prepare(`INSERT INTO deal_hunter_freshness_evidence (
+            id, source_id, source_name, source_record_id, run_id, generation, record_digest,
+            event_type, field_key, accepted_at, original_canonical_id, current_canonical_id,
+            raw_header, raw_value, publication_meaning, publication_precision,
+            publication_offset, publication_date, publication_instant, publication_state,
+            after_value, metric, currency, period
+          ) VALUES (
+            @id, @source_id, @source_name, @source_record_id, @run_id, @generation, @record_digest,
+            @event_type, @field_key, @accepted_at, @canonical_id, @canonical_id,
+            @raw_header, @raw_value, @publication_meaning, @publication_precision,
+            @publication_offset, @publication_date, @publication_instant, @publication_state,
+            @after_value, @metric, @currency, @period
+          )`);
+          for (const record of value.records) {
+            const sourceRecordId = record.source_record_id;
+            const freshnessEvidence = normalizeSourceFreshnessEvidence(record.freshness_evidence);
+            const recordDigest = createHash('sha256').update(JSON.stringify({
+              sourceRecordId,
+              observations: record.observations.map(({ field, value: observedValue }) => [field, observedValue])
+                .sort(([left], [right]) => left.localeCompare(right)),
+              freshnessEvidence,
+            })).digest('hex');
+            const current = [...currentByRecord.values()].find((row) => row.source_record_id === sourceRecordId);
+            const priorEvidence = current?.accepted_evidence_id
+              ? database.prepare('SELECT * FROM deal_hunter_freshness_evidence WHERE id = ?').get(current.accepted_evidence_id)
+              : null;
+            if (priorEvidence?.record_digest === recordDigest && current.opportunity_id === record.opportunity_id) {
+              evidenceByRecord.set(sourceRecordId, { coreId: current.accepted_evidence_id, changed: false });
+              continue;
+            }
+            const eventId = (eventType, fieldKey = '') => `fl01:${createHash('sha256')
+              .update([run.runId, value.source_id, sourceRecordId, eventType, fieldKey].join('\u0000')).digest('hex')}`;
+            const writeEvent = (eventType, fieldKey, claim, afterValue = null) => {
+              const id = eventId(eventType, fieldKey);
+              insertEvidence.run({
+                id, source_id: value.source_id, source_name: value.source_name,
+                source_record_id: sourceRecordId, run_id: run.runId, generation: run.generation,
+                record_digest: recordDigest, event_type: eventType, field_key: fieldKey,
+                accepted_at: acceptedAt, canonical_id: record.opportunity_id,
+                raw_header: claim?.rawHeader || null, raw_value: claim?.rawValue || null,
+                publication_meaning: claim?.meaning || 'unknown',
+                publication_precision: eventType === 'publication_evidence'
+                  ? (claim?.precision === 'datetime' ? 'instant' : claim?.precision || 'unknown') : 'unknown',
+                publication_offset: claim?.offset || null,
+                publication_date: acceptedPublicationClaim(claim, acceptedAt).date,
+                publication_instant: acceptedPublicationClaim(claim, acceptedAt).instant,
+                publication_state: acceptedPublicationClaim(claim, acceptedAt).state,
+                after_value: afterValue, metric: claim?.metric || 'unknown',
+                currency: claim?.currency || 'unknown', period: claim?.period || 'unknown',
+              });
+              return id;
+            };
+            const coreId = writeEvent('accepted_source_record', '', null);
+            const earlierProven = database.prepare(`SELECT evidence.id, evidence.accepted_at,
+                evidence.run_id, evidence.source_record_id, evidence.identity_exception_id
+                FROM deal_hunter_freshness_evidence AS evidence
+              LEFT JOIN deal_hunter_identity_exceptions AS exception
+                ON exception.id = evidence.identity_exception_id
+              WHERE evidence.source_id = ?
+                AND evidence.run_id <> ?
+                AND evidence.event_type = 'accepted_source_record' AND evidence.field_key = ''
+                AND (evidence.current_canonical_id = ? OR (evidence.current_canonical_id IS NULL
+                  AND exception.status = 'resolved'
+                  AND json_extract(exception.metadata, '$.resolvedOpportunityId') = ?))
+              ORDER BY evidence.accepted_at, evidence.id LIMIT 1`
+            ).get(value.source_id, run.runId, record.opportunity_id, record.opportunity_id);
+            if (earlierProven?.identity_exception_id) {
+              database.prepare(`UPDATE deal_hunter_freshness_evidence
+                SET current_canonical_id = ?, binding_audit_id = ?
+                WHERE source_id = ? AND source_record_id = ? AND run_id = ?
+                  AND current_canonical_id IS NULL AND identity_exception_id = ?`
+              ).run(record.opportunity_id, run.runId, value.source_id,
+                earlierProven.source_record_id, earlierProven.run_id, earlierProven.identity_exception_id);
+            }
+            if (freshnessEvidence?.dateAdded) writeEvent('publication_evidence', 'date_added', freshnessEvidence.dateAdded);
+            for (const [fieldKey, claim] of [
+              ['annual_profit', freshnessEvidence?.annualProfit], ['annual_revenue', freshnessEvidence?.annualRevenue],
+              ['asking_price', freshnessEvidence?.askingPrice],
+            ]) {
+              if (!claim) continue;
+              const parsedValue = Number(String(claim.rawValue).replaceAll(/[$,]/g, ''));
+              const afterValue = Number.isFinite(parsedValue) ? parsedValue : null;
+              const afterId = writeEvent('accepted_source_record', fieldKey, claim, afterValue);
+              const beforeObservation = currentByRecord.get(`${sourceRecordId}\u0000${fieldKey}`);
+              const beforeCore = beforeObservation?.accepted_evidence_id
+                ? database.prepare('SELECT run_id FROM deal_hunter_freshness_evidence WHERE id = ?').get(beforeObservation.accepted_evidence_id)
+                : null;
+              const before = beforeCore ? database.prepare(`SELECT * FROM deal_hunter_freshness_evidence
+                WHERE run_id = ? AND source_id = ? AND source_record_id = ?
+                  AND event_type = 'accepted_source_record' AND field_key = ? LIMIT 1`
+              ).get(beforeCore.run_id, value.source_id, sourceRecordId, fieldKey)
+                : database.prepare(`SELECT * FROM deal_hunter_freshness_evidence
+                  WHERE source_id = ? AND source_record_id = ? AND field_key = ?
+                    AND event_type = 'accepted_source_record' AND run_id <> ?
+                    AND current_canonical_id = ?
+                  ORDER BY accepted_at DESC, id DESC LIMIT 1`
+                ).get(value.source_id, sourceRecordId, fieldKey, run.runId, record.opportunity_id);
+              if (beforeObservation?.opportunity_id !== record.opportunity_id
+                || before?.after_value === afterValue) continue;
+              const competing = database.prepare(`SELECT 1 FROM deal_hunter_opportunity_source_observations
+                WHERE opportunity_id = ? AND source_id <> ? AND field = ? AND value <> ? LIMIT 1`
+              ).get(record.opportunity_id, value.source_id, fieldKey, String(afterValue));
+              const comparable = before && !competing && before.after_value !== null && afterValue !== null
+                && claim.metric !== 'unknown' && claim.currency !== 'unknown' && claim.period !== 'unknown'
+                && before.metric === claim.metric && before.currency === claim.currency
+                && before.period === claim.period && before.current_canonical_id === record.opportunity_id;
+              const classification = comparable ? 'comparable_change' : competing ? 'conflict' : 'new_evidence';
+              const transitionType = comparable ? 'material_change' : 'evidence_state_change';
+              const revision = comparable
+                ? database.prepare('SELECT material_revision FROM deal_hunter_opportunities WHERE opportunity_id = ?')
+                  .get(record.opportunity_id).material_revision + 1
+                : null;
+              database.prepare(`INSERT INTO deal_hunter_freshness_evidence (
+                id, source_id, source_name, source_record_id, run_id, generation, record_digest,
+                event_type, field_key, accepted_at, original_canonical_id, current_canonical_id,
+                before_value, after_value, before_evidence_id, after_evidence_id,
+                metric, currency, period, classification, material_revision
+              ) VALUES (
+                @id, @source_id, @source_name, @source_record_id, @run_id, @generation, @record_digest,
+                @event_type, @field_key, @accepted_at, @canonical_id, @canonical_id,
+                @before_value, @after_value, @before_evidence_id, @after_evidence_id,
+                @metric, @currency, @period, @classification, @material_revision
+              )`).run({
+                id: eventId(transitionType, fieldKey), source_id: value.source_id,
+                source_name: value.source_name, source_record_id: sourceRecordId,
+                run_id: run.runId, generation: run.generation, record_digest: recordDigest,
+                event_type: transitionType, field_key: fieldKey, accepted_at: acceptedAt,
+                canonical_id: record.opportunity_id, before_value: before?.after_value ?? null,
+                after_value: afterValue, before_evidence_id: before?.id || null,
+                after_evidence_id: afterId, metric: claim.metric, currency: claim.currency,
+                period: claim.period, classification, material_revision: revision,
+              });
+              if (comparable) database.prepare(`UPDATE deal_hunter_opportunities
+                SET material_revision = ?, last_material_change_at = ? WHERE opportunity_id = ?`
+              ).run(revision, acceptedAt, record.opportunity_id);
+            }
+            evidenceByRecord.set(sourceRecordId, { coreId, changed: true });
+            // A daily projection without accepted evidence proves the row existed, but not
+            // when UG first accepted this business. Mark the missing early history
+            // durably unknown so a later complete refresh cannot invent a first date.
+            const hasUnprovenEarlierObservation = current?.accepted_evidence_id === null
+              && current?.opportunity_id === record.opportunity_id;
+            if (!earlierProven && hasUnprovenEarlierObservation) database.prepare(`UPDATE deal_hunter_opportunities
+              SET discovery_state = 'untracked_legacy'
+              WHERE opportunity_id = ? AND discovery_state = 'pending' AND first_accepted_at IS NULL`
+            ).run(record.opportunity_id);
+            else database.prepare(`UPDATE deal_hunter_opportunities SET first_accepted_at = ?,
+              first_discovery_evidence_id = ?, discovery_state = ?,
+              discovery_revision = discovery_revision + 1
+              WHERE opportunity_id = ? AND discovery_state = 'pending' AND first_accepted_at IS NULL`
+            ).run(earlierProven?.accepted_at || acceptedAt, earlierProven?.id || coreId,
+              earlierProven ? 'known_recovered' : 'known_prospective', record.opportunity_id);
+          }
+        }
         const desiredKeys = new Set();
         const upsert = database.prepare(`
           INSERT INTO deal_hunter_opportunity_source_observations (
             id, opportunity_id, source_id, source_name, source_record_id, field, value,
-            observed_at, created_at, updated_at
+            observed_at, created_at, updated_at, accepted_at, accepted_run_id,
+            accepted_evidence_id, publication_raw_header, publication_raw_value,
+            publication_precision, publication_offset, publication_meaning
           ) VALUES (
             @id, @opportunity_id, @source_id, @source_name, @source_record_id, @field, @value,
-            @observed_at, @created_at, @updated_at
+            @observed_at, @created_at, @updated_at, @accepted_at, @accepted_run_id,
+            @accepted_evidence_id, @publication_raw_header, @publication_raw_value,
+            @publication_precision, @publication_offset, @publication_meaning
           )
           ON CONFLICT(opportunity_id, source_id, source_record_id, field) DO UPDATE SET
             source_name = excluded.source_name,
             value = excluded.value,
             observed_at = excluded.observed_at,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            accepted_at = CASE WHEN excluded.accepted_run_id IS NOT NULL THEN excluded.accepted_at
+              WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value THEN NULL
+              ELSE deal_hunter_opportunity_source_observations.accepted_at END,
+            accepted_run_id = CASE WHEN excluded.accepted_run_id IS NOT NULL THEN excluded.accepted_run_id
+              WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value THEN NULL
+              ELSE deal_hunter_opportunity_source_observations.accepted_run_id END,
+            accepted_evidence_id = CASE WHEN excluded.accepted_run_id IS NOT NULL THEN excluded.accepted_evidence_id
+              WHEN excluded.value IS NOT deal_hunter_opportunity_source_observations.value THEN NULL
+              ELSE deal_hunter_opportunity_source_observations.accepted_evidence_id END,
+            publication_raw_header = excluded.publication_raw_header,
+            publication_raw_value = excluded.publication_raw_value,
+            publication_precision = excluded.publication_precision,
+            publication_offset = excluded.publication_offset,
+            publication_meaning = excluded.publication_meaning
         `);
         for (const record of value.records) {
           for (const observation of record.observations) {
             desiredKeys.add([observation.opportunity_id, observation.source_record_id, observation.field].join('\u0000'));
-            upsert.run(observation);
+            const evidence = evidenceByRecord.get(record.source_record_id);
+            const publication = observation.field === 'date_added' ? record.freshness_evidence?.dateAdded : null;
+            upsert.run({
+              ...observation,
+              accepted_at: acceptedAt,
+              accepted_run_id: run?.runId || null,
+              accepted_evidence_id: evidence?.coreId || null,
+              publication_raw_header: publication?.rawHeader || null,
+              publication_raw_value: publication?.rawValue || null,
+              publication_precision: publication?.precision === 'datetime' ? 'instant' : publication?.precision || null,
+              publication_offset: publication?.offset || null,
+              publication_meaning: publication?.meaning || null,
+            });
           }
         }
 
         const current = database.prepare(`
-          SELECT opportunity_id, source_record_id, field
+          SELECT opportunity_id, source_record_id, field, accepted_evidence_id
           FROM deal_hunter_opportunity_source_observations
           WHERE source_id = ?
         `).all(value.source_id);
@@ -11286,8 +12413,34 @@ export function createSqliteStorage(config, options = {}) {
         for (const observation of current) {
           const key = [observation.opportunity_id, observation.source_record_id, observation.field].join('\u0000');
           if (!desiredKeys.has(key)) {
+            if (run && ['asking_price', 'annual_profit', 'annual_revenue'].includes(observation.field)) {
+              const previousCore = observation.accepted_evidence_id
+                ? database.prepare('SELECT run_id FROM deal_hunter_freshness_evidence WHERE id = ?').get(observation.accepted_evidence_id)
+                : null;
+              const previousField = previousCore ? database.prepare(`SELECT * FROM deal_hunter_freshness_evidence
+                WHERE run_id = ? AND source_id = ? AND source_record_id = ?
+                  AND event_type = 'accepted_source_record' AND field_key = ? LIMIT 1`
+              ).get(previousCore.run_id, value.source_id, observation.source_record_id, observation.field) : null;
+              if (previousField) database.prepare(`INSERT INTO deal_hunter_freshness_evidence (
+                id, source_id, source_name, source_record_id, run_id, generation, event_type,
+                field_key, accepted_at, original_canonical_id, current_canonical_id,
+                before_value, before_evidence_id, metric, currency, period, classification
+              ) VALUES (?, ?, ?, ?, ?, ?, 'evidence_state_change', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'disappearance')`
+              ).run(`fl01:${createHash('sha256').update([run.runId, value.source_id,
+                observation.source_record_id, 'evidence_state_change', observation.field].join('\u0000')).digest('hex')}`,
+                value.source_id, value.source_name, observation.source_record_id, run.runId,
+                run.generation, observation.field, acceptedAt, observation.opportunity_id,
+                observation.opportunity_id, previousField.after_value, previousField.id,
+                previousField.metric, previousField.currency, previousField.period);
+            }
             remove.run(value.source_id, observation.opportunity_id, observation.source_record_id, observation.field);
           }
+        }
+
+        if (run) {
+          database.prepare(`UPDATE deal_hunter_source_freshness_state SET accepted_generation = ?,
+            accepted_run_id = ?, accepted_digest = ?, accepted_at = ?, projection_state = 'accepted'
+            WHERE source_id = ?`).run(run.generation, run.runId, admission.freshness_digest, acceptedAt, value.source_id);
         }
 
         return database.prepare(`

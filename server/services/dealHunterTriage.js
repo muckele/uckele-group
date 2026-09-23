@@ -10,6 +10,7 @@
 // acquisition progress stays owned by the command center.
 
 import { randomUUID } from 'node:crypto';
+import { freshInboxAreaIds } from './dealHunterFreshInboxPolicy.js';
 import { recordCrmActivity } from './activity.js';
 import { getStorage } from '../storage/index.js';
 import {
@@ -234,6 +235,10 @@ async function requiredSourceMutationGate({ storage, getCachedSourceHealth }) {
 // there is deliberately no blended certainty number. Detail and decision
 // responses can explicitly retain the persisted operator note.
 export function publicTriageRow(row = {}, { includeOperatorNote = false } = {}) {
+  let annualProfitEvidence = row.annual_profit_evidence || null;
+  if (typeof annualProfitEvidence === 'string') {
+    try { annualProfitEvidence = JSON.parse(annualProfitEvidence); } catch { annualProfitEvidence = null; }
+  }
   return {
     opportunityId: row.opportunity_id,
     dealKey: row.deal_key || '',
@@ -252,6 +257,11 @@ export function publicTriageRow(row = {}, { includeOperatorNote = false } = {}) 
     industry: normalizeText(row.industry, 240),
     financials: {
       annualProfit: nullableNumber(row.annual_profit),
+      ...(annualProfitEvidence && typeof annualProfitEvidence === 'object'
+        ? { annualProfitEvidence: { metric: annualProfitEvidence.metric || 'unknown',
+          period: annualProfitEvidence.period || 'unknown',
+          currency: annualProfitEvidence.currency || 'unknown' } }
+        : {}),
       annualRevenue: nullableNumber(row.annual_revenue),
       askingPrice: nullableNumber(row.asking_price),
       profitMultiple: nullableNumber(row.profit_multiple),
@@ -274,7 +284,59 @@ export function publicTriageRow(row = {}, { includeOperatorNote = false } = {}) 
     scoredAt: row.scored_at || '',
     scoreFingerprint: row.score_fingerprint || '',
     rulesVersion: row.rules_version || '',
+    freshness: row.discovery_state !== undefined ? {
+      discoveryState: row.discovery_state || 'untracked_legacy',
+      firstAcceptedAt: row.first_accepted_at || '',
+      latestAcceptedObservationAt: row.latest_accepted_observation_at || '',
+      discoveryRevision: Number(row.discovery_revision || 0),
+      materialRevision: Number(row.material_revision || 0),
+      reviewedDiscoveryRevision: Number(row.reviewed_discovery_revision || 0),
+      reviewedMaterialRevision: Number(row.reviewed_material_revision || 0),
+      lastMaterialChangeAt: row.last_material_change_at || '',
+      publicationState: row.publication_state || 'unknown',
+      publicationDate: row.publication_date || '',
+      publicationInstant: row.publication_instant || '',
+      publicationSource: row.publication_source || '',
+      publicationPrecision: row.publication_precision || 'unknown',
+      sourceConflictCount: Number(row.source_conflict_count || 0),
+      materialField: row.material_field || '',
+      materialBeforeValue: nullableNumber(row.material_before_value),
+      materialAfterValue: nullableNumber(row.material_after_value),
+      materialCurrency: row.material_currency || '',
+      discoveryGroup: Number(row.discovery_group || 6),
+      newToUs: Boolean(row.new_to_ug),
+      recentlyListed: Boolean(row.recently_listed),
+      updatedSinceReview: Boolean(row.updated_since_review),
+      ageUnknown: Boolean(row.age_unknown) || row.publication_state !== 'valid'
+        || Number(row.publication_distinct_count || 0) !== 1
+        || Number(row.publication_unsupported_count || 0) !== 0,
+      dueAction: Boolean(row.due_action),
+      dueAt: row.due_at || '',
+      actionReason: row.action_reason || '',
+      ownerPriority: Boolean(row.owner_priority),
+      crmLinked: Boolean(row.primary_submission_id),
+    } : null,
   };
+}
+
+function decodeFreshInboxCursor(value) {
+  if (!value) return null;
+  if (typeof value !== 'string' || value.length > 2048 || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new Error('Invalid Inbox cursor.');
+  }
+  let cursor;
+  try { cursor = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')); } catch {
+    throw new Error('Invalid Inbox cursor.');
+  }
+  if (!cursor || typeof cursor !== 'object' || Array.isArray(cursor)
+    || typeof cursor.revision !== 'string' || cursor.revision.length !== 32
+    || typeof cursor.businessDate !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(cursor.businessDate)
+    || typeof cursor.filtersKey !== 'string' || cursor.filtersKey.length !== 64
+    || !Number.isSafeInteger(cursor.lastOrdinal) || cursor.lastOrdinal < 1
+    || typeof cursor.lastId !== 'string' || cursor.lastId.length > 200) {
+    throw new Error('Invalid Inbox cursor.');
+  }
+  return cursor;
 }
 
 export async function listTriageQueue({
@@ -288,9 +350,47 @@ export async function listTriageQueue({
   confidence = '',
   priority = '',
   state = '',
+  area = 'inbox',
+  cursor = '',
   storage = getStorage(),
   getCachedSourceHealth = getSourceHealth,
 } = {}) {
+  if (view === 'inbox') {
+    if (typeof storage.listDealHunterFreshInbox !== 'function') {
+      return { ok: false, status: 503, error: 'Fresh Inbox storage is unavailable.' };
+    }
+    if (area !== 'inbox' && !freshInboxAreaIds.includes(area)) {
+      return { ok: false, status: 400, error: 'Unknown Inbox area.' };
+    }
+    let decoded;
+    try { decoded = decodeFreshInboxCursor(cursor); } catch {
+      return { ok: false, status: 400, error: 'Invalid Inbox cursor.' };
+    }
+    try {
+      const result = await storage.listDealHunterFreshInbox({ area, cursor: decoded,
+        limit: pageSize, search, confidence, priority, state, sort });
+      const areas = result.areas.map((item) => ({ ...item,
+        rows: item.rows.map(publicTriageRow),
+        nextCursor: item.nextCursor
+          ? Buffer.from(JSON.stringify(item.nextCursor)).toString('base64url') : null }));
+      const uniqueRows = [...new Map(areas.flatMap((item) => item.rows)
+        .map((row) => [row.opportunityId, row])).values()];
+      const sourceHealth = await getCachedSourceHealth(storage,
+        { persistSnapshot: false, refresh: false });
+      const dailyDigest = await buildTriageDailyDigest({ storage, sourceHealth,
+        visibleResult: { rows: result.areas.flatMap((item) => item.rows), summary: {} } });
+      return { ok: true, status: 200, view: 'inbox', asOf: result.asOf,
+        businessDate: result.businessDate, areas, counts: result.counts,
+        rows: uniqueRows, total: uniqueRows.length, summary: publicTriageSummary(),
+        sourceHealth, dailyDigest, views: triageViews, priorities: dealOperatorPriorities };
+    } catch (error) {
+      if (error.status === 409 || error.code === 'DEAL_HUNTER_STALE_PAGE') {
+        return { ok: false, status: 409, code: 'stale_inbox_page',
+          error: 'Inbox results changed. Refresh this area before continuing.' };
+      }
+      throw error;
+    }
+  }
   if (typeof storage.listDealHunterOpportunityScores !== 'function') {
     return { ok: false, status: 503, error: 'Opportunity scoring storage is unavailable.' };
   }
@@ -594,7 +694,7 @@ function currentDetailDisposition(records) {
     : { state: '', reason: '', note: '', dismissedAt: '', dismissedBy: '' };
 }
 
-function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceRows = [], submission = null, cimRequests = [], dispositions = [] } = {}) {
+function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceRows = [], submission = null, cimRequests = [], dispositions = [], materialEvent = null } = {}) {
   const row = publicTriageRow(score, { includeOperatorNote: true });
   const sources = currentDetailSourceRows(sourceRows);
   const sourceLocation = currentDetailSourceValue(sources, ['location'], 240);
@@ -614,6 +714,10 @@ function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceR
   const cimStatus = currentDetailCimStatus(cimRequests, detailText(row.workflow?.cimStatus, 80) || 'not-requested');
   const observationFreshness = sources.find((source) => source.observedAt)?.observedAt
     || detailText(row.observationFreshness, 80);
+  const latestAcceptedObservationAt = (Array.isArray(sourceRows) ? sourceRows : [])
+    .map((source) => source?.accepted_at || source?.acceptedAt || '')
+    .filter((value) => value && Number.isFinite(Date.parse(value)))
+    .sort((left, right) => Date.parse(right) - Date.parse(left))[0] || '';
   const disposition = currentDetailDisposition(dispositions);
   const dismissed = disposition.state === 'dismissed';
   const listingUrl = currentDetailSourceListingUrl(sources) || safeListingUrl(row.listingUrl);
@@ -623,6 +727,32 @@ function projectDetailOpportunity({ score = {}, currentOpportunity = {}, sourceR
     geography: { city: detailText(city, 160), state: detailText(state, 40), label: detailText(location, 240) }, industry: currentDetailSourceValue(sources, ['industry'], 240) || detailText(row.industry, 240),
     financials: { annualProfit: currentDetailSourceNumber(sources, ['annual_profit', 'ttm_ebitda'], row.financials?.annualProfit), annualRevenue: currentDetailSourceNumber(sources, ['annual_revenue', 'ttm_revenue'], row.financials?.annualRevenue), askingPrice: currentDetailSourceNumber(sources, ['asking_price'], row.financials?.askingPrice), profitMultiple: currentDetailSourceNumber(sources, ['profit_multiple', 'ebitda_multiple'], row.financials?.profitMultiple) },
     topStrength, topConcern, workflow: { crmStatus, cimStatus }, observationFreshness, operatorPriority: detailText(row.operatorPriority, 40) || 'normal', operatorNote: detailText(row.operatorNote, 2000), reviewed: Boolean(row.reviewed), reviewedAt: detailText(row.reviewedAt, 80), reviewedBy: detailText(row.reviewedBy, 160), changedSinceReview: Boolean(row.changedSinceReview), disposition, dismissed, dismissedReason: dismissed ? disposition.reason : '', scoredAt: detailText(row.scoredAt, 80), scoreFingerprint: detailText(row.scoreFingerprint, 200), rulesVersion: detailText(row.rulesVersion, 160),
+    freshness: { discoveryState: detailText(currentOpportunity?.discovery_state, 40) || 'untracked_legacy',
+      firstAcceptedAt: detailText(currentOpportunity?.first_accepted_at, 80),
+      latestAcceptedObservationAt,
+      discoveryRevision: detailNumber(currentOpportunity?.discovery_revision),
+      materialRevision: detailNumber(currentOpportunity?.material_revision),
+      reviewedDiscoveryRevision: detailNumber(score.reviewed_discovery_revision),
+      reviewedMaterialRevision: detailNumber(score.reviewed_material_revision),
+      lastMaterialChangeAt: detailText(currentOpportunity?.last_material_change_at, 80),
+      materialChange: materialEvent ? {
+        field: detailText(materialEvent.field_key, 80),
+        beforeValue: nullableNumber(materialEvent.before_value),
+        afterValue: nullableNumber(materialEvent.after_value),
+        currency: detailText(materialEvent.currency, 20),
+        period: detailText(materialEvent.period, 40),
+        source: detailText(materialEvent.source_name, 160),
+        acceptedAt: detailText(materialEvent.accepted_at, 80),
+      } : null,
+      crmLinked: Boolean(currentOpportunity?.primary_submission_id),
+      publicationClaims: (Array.isArray(sourceRows) ? sourceRows : [])
+        .filter((source) => source.field === 'date_added'
+          && source.publication_meaning === 'listing_publication')
+        .slice(0, 10).map((source) => ({
+          source: detailText(source.source_name, 160),
+          rawValue: detailText(source.publication_raw_value, 200),
+          precision: detailText(source.publication_precision, 20) || 'unknown',
+        })) },
   };
 }
 
@@ -704,7 +834,7 @@ export async function getTriageOpportunityDetail({
     byDimension.set(row.dimension, rows);
   }
 
-  const [operatorFacts, sourceRows, submission, cimRequests, activities, dispositions, crmCommunications] = await Promise.all([
+  const [operatorFacts, sourceRows, submission, cimRequests, activities, dispositions, crmCommunications, materialEvent] = await Promise.all([
     storage.listDealHunterOpportunityFacts?.(id, { limit: 100 }) || [],
     storage.listDealHunterOpportunitySourceObservations?.(id, { limit: 500 }) || [],
     currentOpportunity.primary_submission_id && storage.getSubmission
@@ -718,6 +848,9 @@ export async function getTriageOpportunityDetail({
     currentOpportunity.primary_submission_id && storage.listCrmCommunications
       ? storage.listCrmCommunications({ submissionId: currentOpportunity.primary_submission_id, page: 1, pageSize: 100 })
       : { rows: [] },
+    Number(currentOpportunity.material_revision || 0) > Number(score.reviewed_material_revision || 0)
+      ? storage.getLatestDealHunterMaterialChange?.({ opportunityId: id,
+        materialRevision: Number(currentOpportunity.material_revision) }) || null : null,
   ]);
   const sanitizedOperatorFacts = operatorFacts
     .filter((fact) => fact && typeof fact === 'object' && opportunityFactFields.includes(fact.field))
@@ -752,6 +885,7 @@ export async function getTriageOpportunityDetail({
     submission,
     cimRequests: canonicalCimRequests,
     dispositions,
+    materialEvent,
   });
   const projectedScore = projectScore(score, byDimension, unattributed);
   const communications = (crmCommunications?.rows || []).slice(0, 100).map((communication) => ({
@@ -808,12 +942,17 @@ export async function setTriageOperatorDecision({
   priority,
   note,
   markReviewed = false,
+  expectedDiscoveryRevision,
+  expectedMaterialRevision,
   actor = 'admin',
   storage = getStorage(),
   getCachedSourceHealth = storage === getStorage() ? getSourceHealth : null,
 } = {}) {
   const id = normalizeText(opportunityId, 200);
   if (!id) return { ok: false, status: 400, error: 'A canonical opportunity id is required.' };
+  if ((expectedDiscoveryRevision === undefined) !== (expectedMaterialRevision === undefined)) {
+    return { ok: false, status: 400, error: 'Both freshness review revisions are required together.' };
+  }
   if (
     typeof storage.setDealHunterOpportunityOperatorDecision !== 'function'
     || typeof storage.getCurrentDealHunterOpportunityScore !== 'function'
@@ -828,6 +967,10 @@ export async function setTriageOperatorDecision({
   if (!current) return { ok: false, status: 404, error: 'No score has been recorded for this opportunity.' };
 
   const decision = { opportunityId: id };
+  if (expectedDiscoveryRevision !== undefined) {
+    decision.expectedDiscoveryRevision = expectedDiscoveryRevision;
+    decision.expectedMaterialRevision = expectedMaterialRevision;
+  }
   if (priority !== undefined) {
     const normalized = normalizeDealOperatorPriority(priority, '');
     if (!normalized) {
@@ -855,6 +998,9 @@ export async function setTriageOperatorDecision({
   } catch (error) {
     if (error?.code === 'DEAL_HUNTER_OPPORTUNITY_DISMISSED' || /already been passed|durably dismissed/i.test(error?.message || '')) {
       return { ok: false, status: 409, error: 'This opportunity has already been passed. Restore it before recording another decision.' };
+    }
+    if (error?.code === 'DEAL_HUNTER_FRESHNESS_STALE') {
+      return { ok: false, status: 409, code: 'stale_freshness_review', error: error.message };
     }
     throw error;
   }
@@ -904,11 +1050,16 @@ export async function passTriageOpportunity({
   reason = '',
   note = '',
   actor = 'admin',
+  expectedDiscoveryRevision,
+  expectedMaterialRevision,
   storage = getStorage(),
   getCachedSourceHealth = storage === getStorage() ? getSourceHealth : null,
 } = {}) {
   const id = normalizeText(opportunityId, 200);
   if (!id) return { ok: false, status: 400, error: 'A canonical opportunity id is required.' };
+  if ((expectedDiscoveryRevision === undefined) !== (expectedMaterialRevision === undefined)) {
+    return { ok: false, status: 400, error: 'Both freshness review revisions are required together.' };
+  }
   if (typeof reason !== 'string' || !reason.trim() || reason.trim().length > 80) {
     return { ok: false, status: 400, error: 'A bounded disposition reason is required.' };
   }
@@ -926,7 +1077,8 @@ export async function passTriageOpportunity({
   if (!normalizedReason) return { ok: false, status: 400, error: 'A disposition reason is required.' };
   const now = new Date().toISOString();
   const normalizedActor = normalizeText(actor, 160) || 'admin';
-  const result = await storage.passDealHunterOpportunity({
+  let result;
+  try { result = await storage.passDealHunterOpportunity({
     opportunityId: id,
     submissionId: normalizeText(submissionId, 120),
     reason: normalizedReason,
@@ -936,7 +1088,13 @@ export async function passTriageOpportunity({
     dispositionId: randomUUID(),
     archiveActivityId: randomUUID(),
     triageActivityId: randomUUID(),
-  });
+    ...(expectedDiscoveryRevision !== undefined ? { expectedDiscoveryRevision, expectedMaterialRevision } : {}),
+  }); } catch (error) {
+    if (error?.code === 'DEAL_HUNTER_FRESHNESS_STALE') {
+      return { ok: false, status: 409, code: 'stale_freshness_review', error: error.message };
+    }
+    throw error;
+  }
 
   if (!result?.applied) {
     const failures = {

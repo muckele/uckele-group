@@ -556,6 +556,15 @@ function phase1QueueResponse(state, url) {
   const direction = url.searchParams.get('direction');
   const page = Number(url.searchParams.get('page'));
   const pageSize = Number(url.searchParams.get('pageSize'));
+  if (view === 'inbox') {
+    return { success: true, ok: true, view: 'inbox', rows: [], total: 0,
+      areas: [{ id: 'action-preview', rows: [], total: 0,
+        counts: { due: 0, overdue: 0, ownerPriority: 0, urgent: 0 }, revision: 'phase1-preview' },
+      { id: 'new-important', rows: [], total: 0, counts: {}, revision: 'phase1-discovery' }],
+      counts: { due: 0, ownerPriority: 0, newImportant: 0 },
+      summary: phase1Summary(state), sourceHealth: { healthy: true },
+      dailyDigest: phase4DailyDigestProjection(state) };
+  }
   if (!['needs-review', 'high-priority', 'watchlist', 'low-confidence', 'dismissed', 'all'].includes(view)) {
     throw new Error(`Phase 1 fixture received an invalid queue view: ${view}`);
   }
@@ -1014,12 +1023,13 @@ async function installPhase1AdminRoutes(page, state, { commandCenter = false, ro
 
 function phase1QueueQueryIsClosed(url) {
   const required = ['view', 'page', 'pageSize', 'sort', 'direction'];
-  const optional = ['search', 'confidence', 'priority'];
+  const optional = ['search', 'confidence', 'priority', 'area', 'cursor'];
   const keys = [...url.searchParams.keys()];
   const allowed = new Set([...required, ...optional]);
   if (keys.some((key) => !allowed.has(key))) return false;
   if (keys.some((key) => url.searchParams.getAll(key).length !== 1)) return false;
   if (required.some((key) => !url.searchParams.has(key))) return false;
+  if (url.searchParams.get('view') === 'inbox' && url.searchParams.get('area') !== 'inbox') return false;
   if (url.searchParams.has('confidence') && !['high', 'medium', 'low'].includes(url.searchParams.get('confidence'))) return false;
   if (url.searchParams.has('priority') && !['urgent', 'high', 'normal', 'watch'].includes(url.searchParams.get('priority'))) return false;
   return true;
@@ -1440,7 +1450,7 @@ async function installPhase1OperationsFixture(page) {
   await page.route('**/api/admin/deal-hunter/triage?*', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
-    const inboxSearch = '?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc';
+    const inboxSearch = '?view=inbox&page=1&pageSize=25&sort=acquisition-priority&direction=desc&area=inbox';
     const operationsSearch = '?view=needs-review&page=1&pageSize=25';
     if (request.method() !== 'GET' || ![inboxSearch, operationsSearch].includes(url.search)) {
       await rejectPhase1Request(route, state, `Unexpected Operations triage request: ${request.method()} ${url.pathname}${url.search}`);
@@ -1846,6 +1856,7 @@ function markBrokerOpportunityPursued(state, opportunityId = 'opp-cascade') {
 
 async function openBrokerOpportunity(page, name = 'Cascade Field Compliance') {
   await page.goto('/admin/deal-hunter');
+  await page.getByRole('tab', { name: 'Needs Review' }).click();
   await expect(page.getByRole('list', { name: 'Opportunity queue' })).toBeVisible();
   const trigger = page.getByRole('button', { name: `Open ${name}` });
   if (await trigger.count() === 0) {
@@ -1989,7 +2000,7 @@ test('Acquisition Inbox Phase 1 follows the real Operations destination under a 
   const expectedOperationsApiRequests = [
     'GET /api/admin/session',
     'GET /api/admin/onboarding',
-    'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
+    'GET /api/admin/deal-hunter/triage?view=inbox&page=1&pageSize=25&sort=acquisition-priority&direction=desc&area=inbox',
     'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25',
     'GET /api/admin/deal-hunter/review',
     'GET /api/admin/deal-hunter/cim-requests?page=1&pageSize=25&sort=first_requested_at&direction=desc',
@@ -2169,7 +2180,7 @@ test('Deal OS import completes preview and exact reconciliation through Operatio
   const expectedApiRequests = [
     'GET /api/admin/session',
     'GET /api/admin/onboarding',
-    'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
+    'GET /api/admin/deal-hunter/triage?view=inbox&page=1&pageSize=25&sort=acquisition-priority&direction=desc&area=inbox',
     'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25',
     'GET /api/admin/deal-hunter/review',
     'GET /api/admin/deal-hunter/cim-requests?page=1&pageSize=25&sort=first_requested_at&direction=desc',
@@ -2199,6 +2210,90 @@ test('Deal OS import completes preview and exact reconciliation through Operatio
   await expect(page.locator('vite-error-overlay, #webpack-dev-server-client-overlay, nextjs-portal')).toHaveCount(0);
 });
 
+test('Fresh-first Inbox keeps new unlinked discovery visible beside overflowing old priorities and due work', async ({ page }, testInfo) => {
+  const state = await installPhase1Fixture(page);
+  state.crmSubmissions = state.crmSubmissions.filter((row) => row.opportunityId !== 'opp-cascade');
+  const oldBase = phase1QueueRow(phase1CurrentOpportunity(state, 'opp-summit'));
+  const oldPriorities = Array.from({ length: 15 }, (_, index) => ({
+    ...oldBase, opportunityId: `old-priority-${index}`, name: `Older owner priority ${index + 1}`,
+    operatorPriority: 'high', freshness: { discoveryState: 'untracked_legacy',
+      discoveryRevision: 0, materialRevision: 0, ownerPriority: true, crmLinked: true },
+  }));
+  const fresh = { ...phase1QueueRow(phase1CurrentOpportunity(state, 'opp-cascade')),
+    name: 'Fresh worthwhile unlinked', fitScore: 84, confidence: 'high',
+    operatorPriority: 'urgent', freshness: { discoveryState: 'known_prospective',
+      firstAcceptedAt: '2026-09-23T12:00:00.000Z', discoveryRevision: 1,
+      materialRevision: 0, newToUs: true, dueAction: true, ownerPriority: true,
+      ageUnknown: true, crmLinked: false } };
+  const due = [fresh, ...oldPriorities.slice(0, 4).map((row) => ({ ...row,
+    freshness: { ...row.freshness, dueAction: true } }))];
+  const response = (areas) => ({ success: true, ok: true, view: 'inbox',
+    areas, rows: [...new Map(areas.flatMap((item) => item.rows).map((row) => [row.opportunityId, row])).values()],
+    summary: phase1Summary(state), sourceHealth: { healthy: true },
+    dailyDigest: phase4DailyDigestProjection(state) });
+  await page.route('**/api/admin/deal-hunter/triage?*', async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get('view') !== 'inbox') return route.fallback();
+    const area = url.searchParams.get('area');
+    const cursor = url.searchParams.get('cursor');
+    let areas;
+    if (area === 'owner-priorities') areas = [{ id: area,
+      rows: cursor ? oldPriorities.slice(10) : oldPriorities.slice(0, 10),
+      total: 15, nextCursor: cursor ? null : 'synthetic-owner-page-2', revision: 'owner-r1', counts: {} }];
+    else if (area === 'due-actions') areas = [{ id: area, rows: due,
+      total: 5, nextCursor: null, revision: 'due-r1', counts: {} }];
+    else areas = [{ id: 'action-preview', rows: due.slice(0, 2).concat(oldPriorities[5]),
+      total: 3, revision: 'action-r1',
+      counts: { due: 5, overdue: 5, ownerPriority: 15, urgent: 1 } },
+    { id: 'new-important', rows: [fresh], total: 1, revision: 'new-r1', counts: {} }];
+    await fulfillPhase1Json(route, response(areas));
+  });
+  await page.route('**/api/admin/deal-hunter/triage/opp-cascade', async (route) => {
+    const detail = phase1DetailResponse(state, 'opp-cascade');
+    await fulfillPhase1Json(route, { ...detail,
+      opportunity: { ...detail.opportunity, ...fresh },
+      crmSummary: { ...detail.crmSummary, submission: null } });
+  });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto('/admin/deal-hunter');
+  const action = page.getByRole('region', { name: 'Needs Your Action' });
+  const discovery = page.getByRole('region', { name: 'New & Important' });
+  await expect(action.getByRole('listitem')).toHaveCount(3);
+  await expect(action.getByRole('button', { name: 'View all due (5)' })).toBeVisible();
+  await expect(action.getByRole('button', { name: 'View all priorities (15)' })).toBeVisible();
+  await expect(discovery.getByRole('button', { name: 'Open Fresh worthwhile unlinked' })).toBeVisible();
+  await expect(discovery.getByText(/1 opportunity/)).toBeVisible();
+  await expect(discovery.getByText(/CRM handoff prerequisite/)).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath('fl01-fresh-first-desktop.png'), fullPage: true });
+
+  await action.getByRole('button', { name: 'View all priorities (15)' }).click();
+  const priorities = page.getByRole('region', { name: 'Owner priorities' });
+  await expect(priorities.getByRole('listitem')).toHaveCount(10);
+  await priorities.getByRole('button', { name: 'Next page' }).click();
+  await expect(priorities.getByRole('listitem')).toHaveCount(5);
+  await page.screenshot({ path: testInfo.outputPath('fl01-old-priority-page-2.png'), fullPage: true });
+  await priorities.getByRole('button', { name: 'Back to Inbox' }).click();
+  await expect(discovery.getByRole('button', { name: 'Open Fresh worthwhile unlinked' })).toBeVisible();
+  await action.getByRole('button', { name: 'View all due (5)' }).click();
+  await expect(page.getByRole('region', { name: 'Due actions' }).getByRole('listitem')).toHaveCount(5);
+  await page.getByRole('region', { name: 'Due actions' }).getByRole('button', { name: 'Back to Inbox' }).click();
+
+  await discovery.getByRole('button', { name: 'Open Fresh worthwhile unlinked' }).click();
+  await expect(page.getByRole('dialog', { name: /Fresh worthwhile unlinked/ })).toBeVisible();
+  await expect(page.getByText(/this opportunity is not linked to a CRM record/)).toBeVisible();
+  await page.getByRole('button', { name: 'Close opportunity detail' }).click();
+  await expect(discovery.getByRole('button', { name: 'Open Fresh worthwhile unlinked' })).toBeFocused();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(discovery.getByRole('button', { name: 'Open Fresh worthwhile unlinked' })).toBeVisible();
+  await page.getByRole('heading', { level: 2, name: 'Acquisition Inbox' }).click();
+  await page.screenshot({ path: testInfo.outputPath('fl01-fresh-first-narrow.png'), fullPage: true });
+  await discovery.screenshot({ path: testInfo.outputPath('fl01-fresh-first-narrow-discovery.png') });
+  expect(state.actionPayloads).toEqual([]);
+  expect(state.unexpectedRequests).toEqual([]);
+  expect(state.unexpectedApiRequests).toEqual([]);
+  expect(state.offOriginRequests).toEqual([]);
+});
+
 test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow', async ({ page }, testInfo) => {
   test.slow();
   const consoleErrors = [];
@@ -2225,6 +2320,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expectPhase1Summary(page, 'Low Confidence', 2);
   await expectPhase1Summary(page, 'Current Opportunities', 4);
 
+  await page.getByRole('tab', { name: 'Needs Review' }).click();
   const queue = page.getByRole('list', { name: 'Opportunity queue' });
   await page.getByRole('tab', { name: 'Watchlist' }).click();
   await expect(queue.getByRole('button', { name: /^Open / })).toHaveText(['Heritage Inspection Partners']);
@@ -2242,7 +2338,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await expect(page.getByRole('combobox', { name: 'Sort opportunities', exact: true })).toHaveValue('acquisition-priority');
   const initialQueueRead = state.requests.find((request) => request.method === 'GET' && request.path === '/api/admin/deal-hunter/triage');
   expect(initialQueueRead).toBeTruthy();
-  expect(new URLSearchParams(initialQueueRead.search).get('view')).toBe('needs-review');
+  expect(new URLSearchParams(initialQueueRead.search).get('view')).toBe('inbox');
   expect(new URLSearchParams(initialQueueRead.search).get('sort')).toBe('acquisition-priority');
 
   const search = page.getByRole('searchbox', { name: 'Search opportunities' });
@@ -2442,6 +2538,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   const mobileWidth = 375;
   await page.setViewportSize({ width: mobileWidth, height: 812 });
   await page.goto('/admin/deal-hunter');
+  await page.getByRole('tab', { name: 'Needs Review' }).click();
   await expect(page.getByRole('heading', { level: 2, name: 'Acquisition Inbox' })).toBeVisible();
   const mobileTablist = page.getByRole('tablist', { name: 'Opportunity queues' });
   const needsReviewTab = mobileTablist.getByRole('tab', { name: 'Needs Review' });
@@ -2514,6 +2611,8 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   await dialog.getByRole('button', { name: 'Close opportunity detail' }).click();
 
   const expectedDealHunterRequests = [
+    'GET /api/admin/deal-hunter/triage?view=inbox&page=1&pageSize=25&sort=acquisition-priority&direction=desc&area=inbox',
+    'GET /api/admin/deal-hunter/triage?view=inbox&page=1&pageSize=25&sort=acquisition-priority&direction=desc&area=inbox',
     'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
     'GET /api/admin/deal-hunter/triage?view=needs-review&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
     'GET /api/admin/deal-hunter/triage?view=watchlist&page=1&pageSize=25&sort=acquisition-priority&direction=desc',
@@ -2548,11 +2647,11 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
     'POST /api/admin/deal-hunter/triage/opp-evergreen/action',
     'PUT /api/admin/deal-hunter/opportunities/opp-evergreen/facts/seller_name',
   ].sort();
-  expect(state.requests).toHaveLength(33);
+  expect(state.requests).toHaveLength(35);
   expect(state.requests.map(phase1RequestSignature).sort()).toEqual(expectedDealHunterRequests);
   const independentlyObservedDealHunterRequests = state.apiRequests
     .filter(({ path }) => path.startsWith('/api/admin/deal-hunter/'));
-  expect(independentlyObservedDealHunterRequests).toHaveLength(33);
+  expect(independentlyObservedDealHunterRequests).toHaveLength(35);
   expect(independentlyObservedDealHunterRequests.map(phase1RequestSignature).sort()).toEqual(expectedDealHunterRequests);
   const expectedInboxApiRequests = [
     ...expectedDealHunterRequests,
@@ -2561,7 +2660,7 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
     'GET /api/admin/onboarding',
     'GET /api/admin/onboarding',
   ].sort();
-  expect(state.apiRequests).toHaveLength(37);
+  expect(state.apiRequests).toHaveLength(39);
   expect(state.apiRequests.map(phase1RequestSignature).sort()).toEqual(expectedInboxApiRequests);
   expect(state.actionPayloads).toEqual([
     { method: 'POST', path: '/api/admin/deal-hunter/triage/opp-evergreen/action', body: { action: 'pursue' }, machineScore: 92 },

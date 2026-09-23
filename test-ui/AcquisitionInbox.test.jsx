@@ -231,7 +231,7 @@ function queueRow(overrides = {}) {
 function renderInbox(props = {}) {
   return render(
     <MemoryRouter>
-      <AcquisitionInbox {...props} />
+      <AcquisitionInbox initialView="needs-review" {...props} />
     </MemoryRouter>,
   );
 }
@@ -253,6 +253,312 @@ afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+describe('Fresh-first Acquisition Inbox', () => {
+  test('Inbox earnings labels state supported and unverified metric, period, and currency', async () => {
+    const unsupported = queueRow({ opportunityId: 'unknown-earnings', name: 'Unknown earnings' });
+    const supported = queueRow({ opportunityId: 'supported-sde', name: 'Supported SDE',
+      financials: { annualProfit: 425000, annualProfitEvidence: {
+        metric: 'sde', period: 'annual', currency: 'USD' } } });
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ view: 'inbox',
+      areas: [{ id: 'action-preview', rows: [], total: 0, counts: {} },
+        { id: 'new-important', rows: [unsupported, supported], total: 2, counts: {} }],
+      rows: [unsupported, supported] }))));
+    renderInbox({ initialView: 'inbox' });
+    const region = await screen.findByRole('region', { name: 'New & Important' });
+    expect(within(region).getByText(/Earnings metric unverified.*period unverified/)).toBeVisible();
+    expect(within(region).getByText(/SDE.*annual/)).toBeVisible();
+  });
+
+  test('All active exposes exploration sorts and preserves sort when returning from detail', async () => {
+    const row = queueRow({ opportunityId: 'sort-row', name: 'Sort row' });
+    const requests = [];
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      const address = new URL(String(url), 'https://example.test');
+      if (address.pathname.endsWith('/triage/sort-row')) return jsonResponse({ success: true, ...detailResponse(row) });
+      requests.push(address);
+      const area = address.searchParams.get('area');
+      return jsonResponse(queueResponse({ view: 'inbox',
+        areas: area === 'inbox' ? [{ id: 'action-preview', rows: [], total: 0, counts: {} },
+          { id: 'new-important', rows: [], total: 0, counts: {} }]
+          : [{ id: area, rows: [row], total: 1, counts: {} }], rows: [row] }));
+    }));
+    renderInbox({ initialView: 'inbox' });
+    const nav = await screen.findByRole('navigation', { name: 'Fresh Inbox areas' });
+    fireEvent.click(within(nav).getByRole('button', { name: 'All active' }));
+    const sort = await screen.findByRole('combobox', { name: 'Explore opportunities' });
+    fireEvent.change(sort, { target: { value: 'newest-discovery' } });
+    await waitFor(() => expect(requests.at(-1).searchParams.get('sort')).toBe('newest-discovery'));
+    const region = await screen.findByRole('region', { name: 'All active' });
+    fireEvent.click(within(region).getByRole('button', { name: 'Open Sort row' }));
+    expect(await screen.findByRole('dialog', { name: /Sort row/ })).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Close opportunity detail' }));
+    expect(sort).toHaveValue('newest-discovery');
+  });
+  test.each(['newest-discovery', 'highest-fit'])(
+    '%s focus probe keeps the selected sort on first and continuation pages', async (selectedSort) => {
+      const requests = [];
+      const row = queueRow({ opportunityId: 'focus-row', name: 'Focus row' });
+      vi.stubGlobal('fetch', vi.fn(async (url) => {
+        const address = new URL(String(url), 'https://example.test');
+        requests.push(address);
+        const area = address.searchParams.get('area');
+        const sort = address.searchParams.get('sort');
+        const cursor = address.searchParams.get('cursor');
+        if (area === 'all-active' && sort !== selectedSort && requests.some((request) =>
+          request.searchParams.get('sort') === selectedSort)) {
+          return jsonResponse({ success: false }, { ok: false, status: 409 });
+        }
+        return jsonResponse(queueResponse({ view: 'inbox', areas: area === 'all-active'
+          ? [{ id: area, rows: [row], total: 2, revision: 'same', counts: {},
+            nextCursor: cursor ? null : 'sort-bound-cursor' }]
+          : [{ id: 'action-preview', rows: [], total: 0, revision: 'action', counts: {} },
+            { id: 'new-important', rows: [], total: 0, revision: 'discovery', counts: {} }] }));
+      }));
+      renderInbox({ initialView: 'inbox' });
+      const nav = await screen.findByRole('navigation', { name: 'Fresh Inbox areas' });
+      fireEvent.click(within(nav).getByRole('button', { name: 'All active' }));
+      const sort = await screen.findByRole('combobox', { name: 'Explore opportunities' });
+      fireEvent.change(sort, { target: { value: selectedSort } });
+      await waitFor(() => expect(requests.at(-1).searchParams.get('sort')).toBe(selectedSort));
+      const region = await screen.findByRole('region', { name: 'All active' });
+      let beforeFocus = requests.length;
+      fireEvent.focus(window);
+      await waitFor(() => expect(requests.length).toBeGreaterThan(beforeFocus));
+      expect(requests.at(-1).searchParams.get('sort')).toBe(selectedSort);
+      expect(screen.queryByText(/New Inbox results are available/)).not.toBeInTheDocument();
+      fireEvent.click(within(region).getByRole('button', { name: 'Next page' }));
+      await waitFor(() => expect(requests.at(-1).searchParams.get('cursor')).toBe('sort-bound-cursor'));
+      beforeFocus = requests.length;
+      fireEvent.focus(window);
+      await waitFor(() => expect(requests.length).toBeGreaterThan(beforeFocus));
+      expect(requests.at(-1).searchParams.get('sort')).toBe(selectedSort);
+      expect(requests.at(-1).searchParams.get('cursor')).toBe('sort-bound-cursor');
+      expect(screen.queryByText(/New Inbox results are available/)).not.toBeInTheDocument();
+    },
+  );
+  test('due overflow and one dual-qualified canonical record stay visible in both contexts', async () => {
+    const dual = queueRow({ opportunityId: 'dual', name: 'Fresh due opportunity',
+      operatorPriority: 'urgent', freshness: { discoveryState: 'known_prospective',
+        firstAcceptedAt: '2026-09-23T12:00:00.000Z', discoveryRevision: 1,
+        materialRevision: 0, newToUs: true, dueAction: true, ownerPriority: true,
+        crmLinked: false } });
+    const dueRows = [dual, ...Array.from({ length: 4 }, (_, index) => queueRow({
+      opportunityId: `due-${index}`, name: `Due opportunity ${index}`,
+      freshness: { discoveryState: 'untracked_legacy', discoveryRevision: 0,
+        materialRevision: 0, dueAction: true, crmLinked: true } }))];
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      const area = new URL(String(url), 'https://example.test').searchParams.get('area');
+      const areas = area === 'due-actions'
+        ? [{ id: 'due-actions', rows: dueRows, total: 5, counts: {}, nextCursor: null }]
+        : [{ id: 'action-preview', rows: dueRows.slice(0, 3), total: 3,
+          counts: { due: 5, overdue: 5, ownerPriority: 1, urgent: 1 } },
+        { id: 'new-important', rows: [dual], total: 1, counts: {} }];
+      return jsonResponse(queueResponse({ view: 'inbox', areas,
+        rows: [...new Map(areas.flatMap((item) => item.rows).map((row) => [row.opportunityId, row])).values()] }));
+    }));
+    renderInbox({ initialView: 'inbox' });
+    const action = await screen.findByRole('region', { name: 'Needs Your Action' });
+    const discovery = screen.getByRole('region', { name: 'New & Important' });
+    expect(within(action).getByText('Fresh due opportunity')).toBeVisible();
+    expect(within(discovery).getByRole('button', { name: 'Open Fresh due opportunity' })).toBeVisible();
+    expect(within(discovery).getByText(/1 opportunity/)).toBeVisible();
+    expect(within(action).getByRole('button', { name: 'View all due (5)' })).toBeVisible();
+    fireEvent.click(within(action).getByRole('button', { name: 'View all due (5)' }));
+    const allDue = await screen.findByRole('region', { name: 'Due actions' });
+    expect(within(allDue).getAllByRole('listitem')).toHaveLength(5);
+  });
+
+  test('default separates compact owner work from fresh unlinked discovery and retains full priority access', async () => {
+    const fresh = queueRow({ opportunityId: 'fresh-unlinked', name: 'Fresh worthwhile unlinked',
+      freshness: { discoveryState: 'known_prospective', firstAcceptedAt: '2026-09-23T12:00:00.000Z',
+        discoveryRevision: 1, materialRevision: 0, newToUs: true, ageUnknown: true,
+        crmLinked: false } });
+    const priorities = Array.from({ length: 15 }, (_, index) => queueRow({
+      opportunityId: `old-${index}`, name: `Old priority ${index}`, operatorPriority: 'high',
+      freshness: { discoveryState: 'untracked_legacy', discoveryRevision: 0,
+        materialRevision: 0, crmLinked: true } }));
+    const fetchMock = vi.fn(async (url) => {
+      const request = new URL(String(url), 'https://example.test');
+      if (request.pathname.endsWith('/triage/fresh-unlinked')) return jsonResponse({ success: true, ...detailResponse(fresh) });
+      const area = request.searchParams.get('area');
+      const cursor = request.searchParams.get('cursor');
+      const areas = area === 'owner-priorities' ? [{ id: area, rows: cursor ? priorities.slice(10) : priorities.slice(0, 10),
+        total: 15, nextCursor: cursor ? null : 'synthetic-cursor', counts: {}, revision: 'r' }]
+        : [{ id: 'action-preview', rows: priorities.slice(0, 3), total: 3,
+          counts: { due: 0, overdue: 0, ownerPriority: 15, urgent: 0 }, revision: 'a' },
+        { id: 'new-important', rows: [fresh], total: 1, counts: {}, revision: 'n' }];
+      return jsonResponse(queueResponse({ view: 'inbox', areas,
+        rows: [...new Map(areas.flatMap((item) => item.rows).map((row) => [row.opportunityId, row])).values()] }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    renderInbox({ initialView: 'inbox' });
+    const action = await screen.findByRole('region', { name: 'Needs Your Action' });
+    const discovery = screen.getByRole('region', { name: 'New & Important' });
+    expect(within(action).getAllByRole('listitem')).toHaveLength(3);
+    expect(within(discovery).getByRole('button', { name: 'Open Fresh worthwhile unlinked' })).toBeVisible();
+    expect(within(discovery).getByText(/CRM handoff prerequisite/)).toBeVisible();
+    expect(within(action).getByRole('button', { name: 'View all priorities (15)' })).toBeVisible();
+    fireEvent.click(within(action).getByRole('button', { name: 'View all priorities (15)' }));
+    const all = await screen.findByRole('region', { name: 'Owner priorities' });
+    expect(within(all).getAllByRole('listitem')).toHaveLength(10);
+    fireEvent.click(within(all).getByRole('button', { name: 'Next page' }));
+    await waitFor(() => expect(within(screen.getByRole('region', { name: 'Owner priorities' })).getAllByRole('listitem')).toHaveLength(5));
+    fireEvent.click(within(screen.getByRole('region', { name: 'Owner priorities' })).getByRole('button', { name: 'Back to Inbox' }));
+    const again = await screen.findByRole('region', { name: 'New & Important' });
+    fireEvent.click(within(again).getByRole('button', { name: 'Open Fresh worthwhile unlinked' }));
+    expect(await screen.findByRole('dialog', { name: /Fresh worthwhile unlinked/ })).toBeVisible();
+    expect(screen.getByText(/this opportunity is not linked to a CRM record/)).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Close opportunity detail' }));
+    expect(within(screen.getByRole('region', { name: 'New & Important' })).getByRole('button', { name: 'Open Fresh worthwhile unlinked' })).toHaveFocus();
+  });
+
+  test('Updated, Research, and All active remain reachable with retained material and acceptance evidence', async () => {
+    const changed = queueRow({ opportunityId: 'changed', name: 'Changed opportunity',
+      observationFreshness: '2026-09-20T12:00:00.000Z',
+      freshness: { discoveryState: 'known_prospective', updatedSinceReview: true,
+        materialField: 'asking_price', materialBeforeValue: 100, materialAfterValue: 120,
+        materialCurrency: 'USD', latestAcceptedObservationAt: '2026-09-23T12:00:00.000Z' } });
+    const detail = detailResponse({ ...changed, freshness: { ...changed.freshness,
+      materialRevision: 1, reviewedMaterialRevision: 0,
+      materialChange: { field: 'asking_price', beforeValue: 100, afterValue: 120,
+        currency: 'USD', source: 'Synthetic Sheet' } } });
+    vi.stubGlobal('fetch', vi.fn(async (url) => {
+      const address = new URL(String(url), 'https://example.test');
+      if (address.pathname.endsWith('/triage/changed')) return jsonResponse({ success: true, ...detail });
+      const area = address.searchParams.get('area');
+      const areas = area === 'inbox' ? [
+        { id: 'action-preview', rows: [], total: 0, counts: { due: 0, overdue: 0,
+          ownerPriority: 0, urgent: 0 }, revision: 'a' },
+        { id: 'new-important', rows: [], total: 0, counts: {}, revision: 'n' },
+      ] : [{ id: area, rows: [changed], total: 1, counts: {}, revision: area }];
+      return jsonResponse(queueResponse({ view: 'inbox', areas, rows: [changed] }));
+    }));
+    renderInbox({ initialView: 'inbox' });
+    const nav = await screen.findByRole('navigation', { name: 'Fresh Inbox areas' });
+    for (const [button, region] of [['Updated since review', 'Updated since review'],
+      ['Research', 'Research'], ['All active', 'All active']]) {
+      fireEvent.click(within(nav).getByRole('button', { name: button }));
+      expect(await screen.findByRole('region', { name: region })).toBeVisible();
+    }
+    fireEvent.click(within(nav).getByRole('button', { name: 'Updated since review' }));
+    const updated = await screen.findByRole('region', { name: 'Updated since review' });
+    expect(within(updated).getByText(/Asking Price changed since review: 100 → 120 USD/)).toBeVisible();
+    expect(within(updated).getByText(/Latest accepted by UG/)).toBeVisible();
+    fireEvent.click(within(updated).getByRole('button', { name: 'Open Changed opportunity' }));
+    const drawer = await screen.findByRole('dialog', { name: /Changed opportunity/ });
+    expect(within(drawer).getByText(/Asking Price changed from 100 to 120 USD/)).toBeVisible();
+    expect(within(drawer).getByText(/Latest accepted by UG/)).toBeVisible();
+  });
+
+  test('count-only action overflow announces new results on return', async () => {
+    let focusRead = false;
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse(queueResponse({ view: 'inbox',
+      areas: [{ id: 'action-preview', rows: [], total: 0, revision: 'same',
+        counts: { due: focusRead ? 5 : 4, overdue: 0, ownerPriority: 0, urgent: 0 } },
+      { id: 'new-important', rows: [], total: 0, revision: 'same-discovery', counts: {} }] }))));
+    renderInbox({ initialView: 'inbox' });
+    await screen.findByRole('region', { name: 'Needs Your Action' });
+    focusRead = true;
+    fireEvent.focus(window);
+    expect(await screen.findByText(/New Inbox results are available/)).toBeVisible();
+  });
+
+  test.each([false, true])('stale Pass review reloads current revisions and retains the draft (detail retry: %s)', async (detailFailsOnce) => {
+    let queueGets = 0;
+    let detailGets = 0;
+    const writes = [];
+    const revisedRow = (revision) => queueRow({ freshness: {
+      discoveryState: 'known_prospective', discoveryRevision: revision,
+      materialRevision: revision - 1, reviewedDiscoveryRevision: 0,
+      reviewedMaterialRevision: 0, newToUs: true, crmLinked: true,
+    } });
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1/action')) {
+        writes.push(JSON.parse(options.body));
+        return writes.length === 1
+          ? jsonResponse({ success: false, code: 'stale_freshness_review', error: 'Stale review' }, { ok: false, status: 409 })
+          : jsonResponse({ success: true, action: 'pass', opportunity: { ...revisedRow(2), dismissed: true } });
+      }
+      if (url.endsWith('/triage/opp-1')) {
+        detailGets += 1;
+        if (detailFailsOnce && detailGets === 2) return jsonResponse({ error: 'Detail temporarily unavailable' }, { ok: false, status: 503 });
+        return jsonResponse({ success: true, ...detailResponse(revisedRow(detailGets === 1 ? 1 : 2)) });
+      }
+      queueGets += 1;
+      return jsonResponse(queueResponse({ view: 'inbox', rows: [revisedRow(queueGets === 1 ? 1 : 2)],
+        areas: [{ id: 'action-preview', rows: [revisedRow(queueGets === 1 ? 1 : 2)], total: 1,
+          counts: { due: 0, overdue: 0, ownerPriority: 1, urgent: 0 }, revision: `action-${queueGets}` },
+        { id: 'new-important', rows: [revisedRow(queueGets === 1 ? 1 : 2)], total: 1,
+          counts: {}, revision: `new-${queueGets}` }] }));
+    }));
+    renderInbox({ initialView: 'inbox' });
+    const discovery = await screen.findByRole('region', { name: 'New & Important' });
+    fireEvent.click(within(discovery).getByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    const drawer = await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
+    fireEvent.click(within(drawer).getByRole('button', { name: 'Pass Evergreen Fire Protection' }));
+    const form = within(drawer).getByRole('form', { name: 'Pass Evergreen Fire Protection' });
+    fireEvent.change(within(form).getByLabelText('Pass reason'), { target: { value: 'valuation' } });
+    fireEvent.change(within(form).getByLabelText('Pass note (optional)'), { target: { value: 'Keep this note.' } });
+    fireEvent.click(within(form).getByRole('button', { name: 'Confirm Pass' }));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]).toEqual({ action: 'pass', reason: 'valuation', note: 'Keep this note.',
+      expectedDiscoveryRevision: 1, expectedMaterialRevision: 0 });
+    await waitFor(() => expect(queueGets).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(detailGets).toBeGreaterThanOrEqual(2));
+    expect(within(form).getByLabelText('Pass reason')).toHaveValue('valuation');
+    expect(within(form).getByLabelText('Pass note (optional)')).toHaveValue('Keep this note.');
+    if (detailFailsOnce) {
+      expect(await within(drawer).findByText('Detail temporarily unavailable')).toBeVisible();
+      expect(within(form).getByRole('button', { name: 'Confirm Pass' })).toBeDisabled();
+      expect(within(drawer).getByRole('button', { name: 'Watch Evergreen Fire Protection' })).toBeDisabled();
+      expect(within(drawer).getByRole('button', { name: 'Close opportunity detail' })).toBeEnabled();
+      expect(within(form).getByRole('button', { name: 'Cancel' })).toBeEnabled();
+      expect(within(drawer).getByText(/Current evidence could not be fully reloaded/)).toBeVisible();
+      fireEvent.click(within(drawer).getByRole('button', { name: 'Retry opportunity detail' }));
+      await waitFor(() => expect(detailGets).toBe(3));
+    } else {
+      expect(await within(drawer).findByText(/Current evidence and revisions have been reloaded/)).toBeVisible();
+    }
+    await waitFor(() => expect(within(form).getByRole('button', { name: 'Confirm Pass' })).toBeEnabled());
+    fireEvent.click(within(form).getByRole('button', { name: 'Confirm Pass' }));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes[1]).toEqual({ action: 'pass', reason: 'valuation', note: 'Keep this note.',
+      expectedDiscoveryRevision: 2, expectedMaterialRevision: 1 });
+  });
+
+  test('queue Pass retains its shown revision pair after a stale reload removes its row', async () => {
+    let queueGets = 0;
+    const writes = [];
+    const row = queueRow({ freshness: { discoveryState: 'known_prospective',
+      discoveryRevision: 3, materialRevision: 2, newToUs: true, crmLinked: true } });
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      if (String(input).endsWith('/action')) {
+        writes.push(JSON.parse(options.body));
+        return jsonResponse({ success: false, code: 'stale_freshness_review', error: 'Stale review' }, { ok: false, status: 409 });
+      }
+      queueGets += 1;
+      const rows = queueGets === 1 ? [row] : [];
+      return jsonResponse(queueResponse({ view: 'inbox', rows,
+        areas: [{ id: 'action-preview', rows, total: rows.length,
+          counts: { due: 0, overdue: 0, ownerPriority: rows.length, urgent: 0 }, revision: `a-${queueGets}` },
+        { id: 'new-important', rows, total: rows.length, counts: {}, revision: `n-${queueGets}` }] }));
+    }));
+    renderInbox({ initialView: 'inbox' });
+    const discovery = await screen.findByRole('region', { name: 'New & Important' });
+    fireEvent.click(within(discovery).getByRole('button', { name: 'Pass Evergreen Fire Protection' }));
+    const passDialog = screen.getByRole('dialog', { name: 'Pass Evergreen Fire Protection' });
+    fireEvent.change(within(passDialog).getByLabelText('Pass reason'), { target: { value: 'valuation' } });
+    fireEvent.click(within(passDialog).getByRole('button', { name: 'Confirm Pass' }));
+    await waitFor(() => expect(queueGets).toBe(2));
+    expect(within(passDialog).getByLabelText('Pass reason')).toHaveValue('valuation');
+    fireEvent.click(within(passDialog).getByRole('button', { name: 'Confirm Pass' }));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes.map((write) => [write.expectedDiscoveryRevision, write.expectedMaterialRevision]))
+      .toEqual([[3, 2], [3, 2]]);
+  });
 });
 
 describe('Acquisition Inbox dashboard entry', () => {
@@ -446,7 +752,7 @@ describe('Acquisition Inbox queue', () => {
     expect(screen.getByRole('tab', { name: /Needs Review/ })).toHaveAttribute('aria-selected', 'true');
     expect(screen.getByText(/Sacramento, CA/)).toBeVisible();
     expect(screen.getByText(/Fire protection services/)).toBeVisible();
-    expect(screen.getByText('$425,000')).toBeVisible();
+    expect(screen.getByText(/425,000 currency unverified/)).toBeVisible();
     expect(screen.getByText('$2,200,000')).toBeVisible();
     expect(screen.getByText('$1,800,000')).toBeVisible();
     expect(screen.getByText('4.24×')).toBeVisible();
@@ -1200,7 +1506,7 @@ describe('Acquisition Inbox queue', () => {
         screen.getByRole('combobox', { name: 'Operator priority' }),
         screen.getByRole('combobox', { name: 'Sort opportunities' }),
       ];
-      expect(within(tablist).getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['Needs Review', 'High Priority', 'Watchlist', 'Low Confidence', 'Passed', 'All Current']);
+      expect(within(tablist).getAllByRole('tab').map((tab) => tab.textContent)).toEqual(['Fresh-first Inbox', 'Needs Review', 'High Priority', 'Watchlist', 'Low Confidence', 'Passed', 'All Current']);
       for (const control of queueControls) {
         expectMobileReachable(control, tablist.closest('section'));
       }

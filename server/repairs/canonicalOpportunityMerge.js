@@ -487,6 +487,34 @@ const relationshipInventoryEntries = [
     reason: coreRelationshipReason,
   }),
   ...relationshipEntries({
+    table: 'deal_hunter_opportunities',
+    columns: ['first_discovery_evidence_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED,
+    scannerPath: 'approvalCore.opportunities',
+    reason: coreRelationshipReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_freshness_evidence',
+    columns: ['original_canonical_id', 'current_canonical_id', 'identity_exception_id', 'binding_audit_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.freshnessEvidence',
+    reason: blockingRelationshipReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_freshness_evidence',
+    columns: ['source_id', 'source_record_id', 'run_id', 'field_key', 'before_evidence_id', 'after_evidence_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
+    scannerPath: 'dependentState.records.freshnessEvidence',
+    reason: redundantRelationshipReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_source_freshness_state',
+    columns: ['source_id', 'accepted_run_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED,
+    scannerPath: 'excluded.sourceRunWatermark',
+    reason: excludedRelationshipReason,
+  }),
+  ...relationshipEntries({
     table: 'deal_hunter_opportunity_aliases',
     columns: ['opportunity_id', 'alias_type', 'alias_value', 'alias_key', 'metadata'],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED,
@@ -509,7 +537,7 @@ const relationshipInventoryEntries = [
   }),
   ...relationshipEntries({
     table: 'deal_hunter_opportunity_source_observations',
-    columns: ['source_id', 'source_record_id'],
+    columns: ['source_id', 'source_record_id', 'accepted_run_id', 'accepted_evidence_id'],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT,
     scannerPath: 'dependentState.records.sourceObservations',
     reason: redundantRelationshipReason,

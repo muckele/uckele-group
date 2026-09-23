@@ -95,6 +95,10 @@ const scheduledJobFencingMigrationUrl = new URL(
   '../supabase/migrations/20260904120000_daily_digest_scheduled_job_fencing.sql',
   import.meta.url,
 );
+const freshnessMigrationUrl = new URL(
+  '../supabase/migrations/20260923120000_deal_hunter_freshness_provenance.sql',
+  import.meta.url,
+);
 
 function dailyDigestScheduledJobMigration() {
   return fs.existsSync(scheduledJobFencingMigrationUrl)
@@ -442,7 +446,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const opportunityFactsMigration = fs.readFileSync(opportunityFactsMigrationUrl, 'utf8');
   const opportunityFactWriteBoundaryMigration = fs.readFileSync(opportunityFactWriteBoundaryMigrationUrl, 'utf8');
   const currentOperatorFactMigration = fs.readFileSync(currentOperatorFactMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}`;
+  const freshnessMigration = fs.readFileSync(freshnessMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
