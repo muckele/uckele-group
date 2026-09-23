@@ -1,0 +1,7 @@
+# Uckele Group roadmaps
+
+The [September 20 product roadmap](https://github.com/muckele/uckele-group/blob/f6b09a6c9c2e8ed2cca458da201038e4e7ae8e87/docs/roadmap/2026-09-20-uckele-group-product-vision-and-roadmap.md) remains the primary roadmap, unchanged. At this integration, it is on open draft [PR #21](https://github.com/muckele/uckele-group/pull/21), not `main`; the pinned link is intentional until that PR is separately reviewed and merged. Its active-task statements describe the September 20 research state, not today's execution instructions.
+
+The [September 22 fresh-lead MVP addendum](2026-09-22-uckele-group-fresh-lead-mvp-roadmap-addendum.md) adds acceptance goals for fresh worthwhile leads, complete lead detail, controlled editing, and searchable archives. It extends P7-Q1, P7-Q2, P7-W, and P8-01 without replacing the original provider, materials, automation, or diligence workstreams. Its research baseline and proposed numerical pilot defaults are planning context, not current runtime settings or evidence of implementation.
+
+For dated operating status, read the [current-system baseline](../operations/current-system-baseline.md). Roadmap adoption does not implement a feature, authorize contact, or establish the exact current production release. Obtain release and production facts from fresh, authorized evidence. The completed fixed-pair Pooler/Berlin repair must not be repeated from historical roadmap instructions.
