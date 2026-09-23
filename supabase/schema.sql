@@ -7337,6 +7337,8 @@ declare
   v_source_record_id text;
   v_ordinal integer;
   v_field text;
+  v_field_key text;
+  v_after_value numeric;
   v_stored public.deal_hunter_deal_os_imports%rowtype;
 begin
   if pg_catalog.jsonb_typeof(p_import) <> 'object' or pg_catalog.jsonb_typeof(p_rows) <> 'array'
@@ -7433,19 +7435,27 @@ begin
     end if;
     foreach v_field in array array['annualProfit', 'annualRevenue', 'askingPrice'] loop
       v_claim := v_row -> 'freshnessEvidence' -> v_field;
-      if pg_catalog.jsonb_typeof(v_claim) <> 'object' then continue; end if;
+      if pg_catalog.jsonb_typeof(v_claim) is distinct from 'object' then continue; end if;
       if char_length(v_claim ->> 'rawHeader') > 100 or char_length(v_claim ->> 'rawValue') > 200 then
         raise exception 'Deal OS financial evidence is unbounded' using errcode = '22023';
+      end if;
+      v_field_key := case v_field when 'annualProfit' then 'annual_profit'
+        when 'annualRevenue' then 'annual_revenue' else 'asking_price' end;
+      v_after_value := null;
+      if v_claim ->> 'rawValue' ~ '^\$?[0-9][0-9,]*(\.[0-9]+)?$' then
+        v_after_value := pg_catalog.regexp_replace(v_claim ->> 'rawValue', '[$,]', '', 'g')::numeric;
       end if;
       insert into public.deal_hunter_freshness_evidence (
         id, source_id, source_name, source_record_id, run_id, generation,
         event_type, field_key, event_ordinal, accepted_at, raw_header, raw_value,
-        metric, currency, period
+        after_value, metric, currency, period
       ) values (
-        'fl01:' || pg_catalog.md5(pg_catalog.concat_ws('|', v_import_id::text, v_source_record_id, 'accepted_source_record', v_field, v_ordinal::text)),
+        'fl01:' || pg_catalog.md5(pg_catalog.concat_ws('|', v_import_id::text, v_source_record_id, 'accepted_source_record', v_field_key, v_ordinal::text)),
         'deal-os-export', 'SMB Deal OS export', v_source_record_id, v_import_id::text, p_generation,
-        'accepted_source_record', v_field, v_ordinal, v_accepted_at,
-        v_claim ->> 'rawHeader', v_claim ->> 'rawValue', 'unknown', 'unknown', 'unknown'
+        'accepted_source_record', v_field_key, v_ordinal, v_accepted_at,
+        v_claim ->> 'rawHeader', v_claim ->> 'rawValue', v_after_value,
+        coalesce(v_claim ->> 'metric', 'unknown'), coalesce(v_claim ->> 'currency', 'unknown'),
+        coalesce(v_claim ->> 'period', 'unknown')
       );
     end loop;
   end loop;
@@ -7487,6 +7497,8 @@ declare
   v_recovered_id text;
   v_recovered_at timestamptz;
   v_recovered_run text;
+  v_recovered_source_record_id text;
+  v_recovered_exception_id text;
   v_before public.deal_hunter_freshness_evidence%rowtype;
   v_before_observation public.deal_hunter_opportunity_source_observations%rowtype;
   v_old_observation public.deal_hunter_opportunity_source_observations%rowtype;
@@ -7631,6 +7643,33 @@ begin
           (v_publication ->> 'instant')::timestamptz, v_publication ->> 'state'
         );
       end if;
+      foreach v_field in array array['annualProfit', 'annualRevenue', 'askingPrice'] loop
+        v_claim := v_record -> 'freshness_evidence' -> v_field;
+        if pg_catalog.jsonb_typeof(v_claim) is distinct from 'object' then continue; end if;
+        if char_length(v_claim ->> 'rawHeader') > 100 or char_length(v_claim ->> 'rawValue') > 200 then
+          raise exception 'deferred Sheet financial evidence is unbounded' using errcode = '22023';
+        end if;
+        v_field_key := case v_field when 'annualProfit' then 'annual_profit'
+          when 'annualRevenue' then 'annual_revenue' else 'asking_price' end;
+        v_after_value := null;
+        if v_claim ->> 'rawValue' ~ '^\$?[0-9][0-9,]*(\.[0-9]+)?$' then
+          v_after_value := pg_catalog.regexp_replace(v_claim ->> 'rawValue', '[$,]', '', 'g')::numeric;
+        end if;
+        insert into public.deal_hunter_freshness_evidence (
+          id, source_id, source_name, source_record_id, run_id, generation, record_digest,
+          event_type, field_key, accepted_at, original_canonical_id, current_canonical_id,
+          identity_exception_id, raw_header, raw_value, after_value, metric, currency, period
+        ) values (
+          'fl01:' || pg_catalog.md5(pg_catalog.concat_ws('|', v_run_id, v_source_id,
+            v_record ->> 'source_record_id', 'accepted_source_record', v_field_key)),
+          v_source_id, v_source_name, v_record ->> 'source_record_id', v_run_id,
+          v_generation, v_record_digest, 'accepted_source_record', v_field_key, v_accepted_at,
+          v_record ->> 'opportunity_id', v_record ->> 'opportunity_id',
+          v_record ->> 'identity_exception_id', v_claim ->> 'rawHeader', v_claim ->> 'rawValue',
+          v_after_value, coalesce(v_claim ->> 'metric', 'unknown'),
+          coalesce(v_claim ->> 'currency', 'unknown'), coalesce(v_claim ->> 'period', 'unknown')
+        );
+      end loop;
     end loop;
     update public.deal_hunter_source_freshness_state set
       accepted_generation = v_generation, accepted_run_id = v_run_id,
@@ -7700,7 +7739,7 @@ begin
       end if;
       foreach v_field in array array['annualProfit', 'annualRevenue', 'askingPrice'] loop
         v_claim := v_record -> 'freshness_evidence' -> v_field;
-        if pg_catalog.jsonb_typeof(v_claim) <> 'object' then continue; end if;
+        if pg_catalog.jsonb_typeof(v_claim) is distinct from 'object' then continue; end if;
         if char_length(v_claim ->> 'rawHeader') > 100 or char_length(v_claim ->> 'rawValue') > 200 then
           raise exception 'complete Sheet financial evidence is unbounded' using errcode = '22023';
         end if;
@@ -7780,28 +7819,32 @@ begin
             else 'new_evidence' end, v_revision
         );
       end loop;
-      select evidence.id, evidence.accepted_at, evidence.run_id
-        into v_recovered_id, v_recovered_at, v_recovered_run
+      select evidence.id, evidence.accepted_at, evidence.run_id,
+          evidence.source_record_id, evidence.identity_exception_id
+        into v_recovered_id, v_recovered_at, v_recovered_run,
+          v_recovered_source_record_id, v_recovered_exception_id
         from public.deal_hunter_freshness_evidence as evidence
-        join public.deal_hunter_identity_exceptions as exception
+        left join public.deal_hunter_identity_exceptions as exception
           on exception.id = evidence.identity_exception_id
         where evidence.source_id = v_source_id
-          and evidence.source_record_id = v_record ->> 'source_record_id'
+          and evidence.run_id <> v_run_id
           and evidence.event_type = 'accepted_source_record' and evidence.field_key = ''
-          and evidence.current_canonical_id is null and exception.status = 'resolved'
-          and exception.metadata ->> 'resolvedOpportunityId' = v_record ->> 'opportunity_id'
+          and (evidence.current_canonical_id = v_record ->> 'opportunity_id'
+            or (evidence.current_canonical_id is null and exception.status = 'resolved'
+              and exception.metadata ->> 'resolvedOpportunityId' = v_record ->> 'opportunity_id'))
         order by evidence.accepted_at, evidence.id limit 1;
-      if v_recovered_id is not null then
+      if v_recovered_exception_id is not null then
         update public.deal_hunter_freshness_evidence set
           current_canonical_id = v_record ->> 'opportunity_id', binding_audit_id = v_run_id
-          where source_id = v_source_id and source_record_id = v_record ->> 'source_record_id'
+          where source_id = v_source_id and source_record_id = v_recovered_source_record_id
             and run_id = v_recovered_run and current_canonical_id is null
-            and identity_exception_id is not null;
+            and identity_exception_id = v_recovered_exception_id;
       end if;
       update public.deal_hunter_opportunities set
         first_accepted_at = coalesce(v_recovered_at, v_accepted_at),
         first_discovery_evidence_id = coalesce(v_recovered_id, v_core_id),
-        discovery_state = 'known_prospective', discovery_revision = discovery_revision + 1
+        discovery_state = case when v_recovered_id is not null then 'known_recovered'
+          else 'known_prospective' end, discovery_revision = discovery_revision + 1
         where opportunity_id = v_record ->> 'opportunity_id'
           and discovery_state = 'pending' and first_accepted_at is null;
     end if;
@@ -7887,6 +7930,15 @@ declare
   v_publication jsonb;
   v_unbound integer;
   v_projection_state text;
+  v_field text;
+  v_field_key text;
+  v_after public.deal_hunter_freshness_evidence%rowtype;
+  v_before public.deal_hunter_freshness_evidence%rowtype;
+  v_prior_observation public.deal_hunter_opportunity_source_observations%rowtype;
+  v_competing boolean;
+  v_comparable boolean;
+  v_revision bigint;
+  v_transition_type text;
 begin
   if p_import_id is null or p_opportunity_id is null or p_source_record_id is null
     or char_length(p_opportunity_id) not between 1 and 200
@@ -7931,14 +7983,16 @@ begin
   if v_opportunity.discovery_state = 'pending' and v_opportunity.first_accepted_at is null then
     update public.deal_hunter_opportunities set
       first_accepted_at = v_event.accepted_at, first_discovery_evidence_id = v_event.id,
-      discovery_state = 'known_prospective', discovery_revision = discovery_revision + 1
+      discovery_state = case when v_state.accepted_generation = p_expected_generation
+        and v_state.accepted_run_id = p_import_id::text then 'known_prospective'
+        else 'known_recovered' end, discovery_revision = discovery_revision + 1
       where opportunity_id = p_opportunity_id;
   elsif v_opportunity.discovery_state in ('known_prospective', 'known_recovered')
     and v_opportunity.first_accepted_at is not null
     and v_event.accepted_at < v_opportunity.first_accepted_at then
     update public.deal_hunter_opportunities set
       first_accepted_at = v_event.accepted_at, first_discovery_evidence_id = v_event.id,
-      discovery_revision = discovery_revision + 1
+      discovery_state = 'known_recovered', discovery_revision = discovery_revision + 1
       where opportunity_id = p_opportunity_id;
   end if;
   if v_state.accepted_generation <> p_expected_generation
@@ -7959,6 +8013,68 @@ begin
   ) then
     raise exception 'Deal OS accepted binding observations do not share one source record' using errcode = '22023';
   end if;
+  foreach v_field in array array['annualProfit', 'annualRevenue', 'askingPrice'] loop
+    if pg_catalog.jsonb_typeof(p_snapshot -> 'freshness_evidence' -> v_field) is distinct from 'object' then
+      continue;
+    end if;
+    v_field_key := case v_field when 'annualProfit' then 'annual_profit'
+      when 'annualRevenue' then 'annual_revenue' else 'asking_price' end;
+    select * into v_after from public.deal_hunter_freshness_evidence
+      where run_id = p_import_id::text and source_id = 'deal-os-export'
+        and source_record_id = p_source_record_id and event_type = 'accepted_source_record'
+        and field_key = v_field_key and event_ordinal = v_event.event_ordinal;
+    if v_after.id is null then
+      raise exception 'Deal OS financial projection lacks its accepted field evidence' using errcode = '22023';
+    end if;
+    select * into v_prior_observation from public.deal_hunter_opportunity_source_observations
+      where opportunity_id = p_opportunity_id and source_id = 'deal-os-export'
+        and source_record_id = p_source_record_id and field = v_field_key limit 1;
+    if v_prior_observation.id is null then continue; end if;
+    select previous_field.* into v_before
+      from public.deal_hunter_freshness_evidence as previous_core
+      join public.deal_hunter_freshness_evidence as previous_field
+        on previous_field.run_id = previous_core.run_id
+        and previous_field.source_id = previous_core.source_id
+        and previous_field.source_record_id = previous_core.source_record_id
+        and previous_field.event_type = 'accepted_source_record'
+        and previous_field.field_key = v_field_key
+        and previous_field.event_ordinal = previous_core.event_ordinal
+      where previous_core.id = v_prior_observation.accepted_evidence_id;
+    if v_before.after_value is not distinct from v_after.after_value
+      or v_prior_observation.value = v_after.after_value::text then continue; end if;
+    select exists (select 1 from public.deal_hunter_opportunity_source_observations
+      where opportunity_id = p_opportunity_id and source_id <> 'deal-os-export'
+        and field = v_field_key and value is distinct from v_after.after_value::text)
+      into v_competing;
+    v_comparable := v_before.id is not null and not v_competing
+      and v_before.after_value is not null and v_after.after_value is not null
+      and v_after.metric <> 'unknown' and v_after.currency <> 'unknown'
+      and v_after.period <> 'unknown' and v_before.metric = v_after.metric
+      and v_before.currency = v_after.currency and v_before.period = v_after.period
+      and v_before.current_canonical_id = p_opportunity_id;
+    if v_comparable then
+      update public.deal_hunter_opportunities set material_revision = material_revision + 1,
+        last_material_change_at = v_event.accepted_at where opportunity_id = p_opportunity_id
+        returning material_revision into v_revision;
+    else
+      v_revision := null;
+    end if;
+    v_transition_type := case when v_comparable then 'material_change' else 'evidence_state_change' end;
+    insert into public.deal_hunter_freshness_evidence
+      (id, source_id, source_name, source_record_id, run_id, generation,
+        event_type, field_key, event_ordinal, accepted_at, original_canonical_id,
+        current_canonical_id, before_value, after_value, before_evidence_id,
+        after_evidence_id, metric, currency, period, classification, material_revision)
+    values ('fl01:' || pg_catalog.md5(pg_catalog.concat_ws('|', p_import_id::text,
+        p_source_record_id, v_transition_type, v_field_key, v_event.event_ordinal::text)),
+      'deal-os-export', v_after.source_name, p_source_record_id, p_import_id::text,
+      p_expected_generation, v_transition_type, v_field_key, v_event.event_ordinal,
+      v_event.accepted_at, p_opportunity_id, p_opportunity_id,
+      v_before.after_value, v_after.after_value, v_before.id, v_after.id,
+      v_after.metric, v_after.currency, v_after.period,
+      case when v_comparable then 'comparable_change' when v_competing then 'conflict'
+        else 'new_evidence' end, v_revision);
+  end loop;
   v_publication := p_snapshot -> 'freshness_evidence' -> 'dateAdded';
   for v_observation in select value from pg_catalog.jsonb_array_elements(p_snapshot -> 'observations') as observations(value) loop
     insert into public.deal_hunter_opportunity_source_observations (
@@ -8014,3 +8130,503 @@ revoke all on function public.bind_accepted_deal_hunter_freshness_v1(uuid, text,
   from public, anon, authenticated;
 grant execute on function public.bind_accepted_deal_hunter_freshness_v1(uuid, text, text, bigint, jsonb)
   to service_role;
+
+create or replace function public.set_deal_hunter_operator_decision_freshness_v1(
+  p_opportunity_id text, p_decision jsonb,
+  p_expected_discovery_revision bigint, p_expected_material_revision bigint
+) returns public.deal_hunter_opportunity_scores
+language plpgsql security definer set search_path = '' as $$
+declare
+  v_opportunity public.deal_hunter_opportunities%rowtype;
+  v_score public.deal_hunter_opportunity_scores%rowtype;
+begin
+  if p_expected_discovery_revision is null or p_expected_material_revision is null
+    or p_expected_discovery_revision < 0 or p_expected_material_revision < 0 then
+    raise exception 'freshness review requires two nonnegative revisions' using errcode = '22023';
+  end if;
+  select * into v_opportunity from public.deal_hunter_opportunities
+    where opportunity_id = p_opportunity_id for update;
+  if v_opportunity.opportunity_id is null then return null; end if;
+  if v_opportunity.discovery_revision <> p_expected_discovery_revision
+    or v_opportunity.material_revision <> p_expected_material_revision then
+    raise exception 'FL01_STALE_REVIEW' using errcode = 'P0001';
+  end if;
+  v_score := public.set_deal_hunter_opportunity_operator_decision(p_opportunity_id, p_decision);
+  if v_score.opportunity_id is null then return null; end if;
+  if p_decision ? 'reviewed_at' then
+    update public.deal_hunter_opportunity_scores set
+      reviewed_discovery_revision = p_expected_discovery_revision,
+      reviewed_material_revision = p_expected_material_revision
+      where opportunity_id = p_opportunity_id returning * into v_score;
+  end if;
+  return v_score;
+end;
+$$;
+revoke all on function public.set_deal_hunter_operator_decision_freshness_v1(text, jsonb, bigint, bigint)
+  from public, anon, authenticated;
+grant execute on function public.set_deal_hunter_operator_decision_freshness_v1(text, jsonb, bigint, bigint)
+  to service_role;
+
+create or replace function public.pass_deal_hunter_opportunity_freshness_v1(
+  p_command jsonb, p_expected_discovery_revision bigint, p_expected_material_revision bigint
+) returns jsonb language plpgsql security definer set search_path = '' as $$
+declare
+  v_opportunity public.deal_hunter_opportunities%rowtype;
+  v_result jsonb;
+  v_score public.deal_hunter_opportunity_scores%rowtype;
+begin
+  if p_expected_discovery_revision is null or p_expected_material_revision is null
+    or p_expected_discovery_revision < 0 or p_expected_material_revision < 0 then
+    raise exception 'freshness review requires two nonnegative revisions' using errcode = '22023';
+  end if;
+  select * into v_opportunity from public.deal_hunter_opportunities
+    where opportunity_id = p_command ->> 'opportunity_id' for update;
+  if v_opportunity.opportunity_id is not null and (
+    v_opportunity.discovery_revision <> p_expected_discovery_revision
+    or v_opportunity.material_revision <> p_expected_material_revision) then
+    raise exception 'FL01_STALE_REVIEW' using errcode = 'P0001';
+  end if;
+  v_result := public.pass_deal_hunter_opportunity(p_command);
+  if v_result ->> 'applied' = 'true' then
+    update public.deal_hunter_opportunity_scores set
+      reviewed_discovery_revision = p_expected_discovery_revision,
+      reviewed_material_revision = p_expected_material_revision
+      where opportunity_id = p_command ->> 'opportunity_id' returning * into v_score;
+    v_result := pg_catalog.jsonb_set(v_result, '{score}', to_jsonb(v_score), true);
+  end if;
+  return v_result;
+end;
+$$;
+revoke all on function public.pass_deal_hunter_opportunity_freshness_v1(jsonb, bigint, bigint)
+  from public, anon, authenticated;
+grant execute on function public.pass_deal_hunter_opportunity_freshness_v1(jsonb, bigint, bigint)
+  to service_role;
+
+-- Reader-only fixed-size revision state. The input is a compact tuple, never
+-- the full score or retained evidence payload.
+create or replace function public.deal_hunter_fresh_inbox_hash_step_v1(
+  p_state text, p_tuple text
+) returns text language sql immutable set search_path = public as $$
+  select md5(coalesce(p_state, '') || octet_length(coalesce(p_tuple, ''))::text
+    || ':' || coalesce(p_tuple, ''));
+$$;
+drop aggregate if exists public.deal_hunter_fresh_inbox_hash_v1(text);
+create aggregate public.deal_hunter_fresh_inbox_hash_v1(text) (
+  sfunc = public.deal_hunter_fresh_inbox_hash_step_v1,
+  stype = text,
+  initcond = ''
+);
+revoke all on function public.deal_hunter_fresh_inbox_hash_step_v1(text, text) from public, anon, authenticated;
+revoke all on function public.deal_hunter_fresh_inbox_hash_step_v1(text, text) from public;
+grant execute on function public.deal_hunter_fresh_inbox_hash_step_v1(text, text) to service_role;
+revoke all on function public.deal_hunter_fresh_inbox_hash_v1(text) from public, anon, authenticated;
+grant execute on function public.deal_hunter_fresh_inbox_hash_v1(text) to service_role;
+
+create or replace function public.list_deal_hunter_fresh_inbox_v1(
+  p_area text default 'inbox', p_offset integer default 0, p_limit integer default 25,
+  p_search text default '', p_confidence text default '', p_priority text default '',
+  p_state text default '', p_as_of timestamptz default now()
+) returns jsonb language sql stable security definer set search_path = public as $$
+  with parameters as (
+    select (p_as_of at time zone 'America/Los_Angeles')::date as business_date,
+      greatest(0, least(coalesce(p_offset, 0), 100000)) as page_offset,
+      greatest(1, least(coalesce(p_limit, 25), 100)) as page_limit
+  ), due_actions as materialized (
+    select request.opportunity_id, min(request.next_follow_up_at) as due_at
+    from public.deal_hunter_cim_requests as request
+    join public.deal_hunter_opportunities as opportunity
+      on opportunity.opportunity_id = request.opportunity_id
+        and opportunity.primary_submission_id = request.submission_id
+        and opportunity.status = 'active'
+    join public.contact_submissions as submission on submission.id = request.submission_id
+    where request.follow_up_state = 'scheduled'
+      and request.request_state = 'provider_accepted'
+      and request.delivery_state = 'accepted'
+      and request.responded_at is null and request.follow_up_count < 5
+      and request.next_follow_up_at <= p_as_of and submission.status not in ('archived', 'spam')
+      and request.metadata #>> '{manualFollowUp,mode}' = 'operator-approved'
+      and request.metadata #>> '{manualFollowUp,version}' = 'deal-hunter-manual-follow-up-v1'
+      and request.metadata #>> '{manualFollowUp,maximumFollowUps}' = '5'
+      and request.metadata #>> '{manualFollowUp,cadencePolicy}' =
+        'accepted-local-date-plus-2-weekend-forward-0900-pt-v1'
+      and request.metadata #>> '{manualFollowUp,stoppedAt}' is null
+    group by request.opportunity_id
+  ), action_evidence as materialized (
+    select opportunity.opportunity_id,
+      case when latest.direction = 'inbound' and latest.source = 'resend-webhook'
+        and latest.kind = 'broker-reply' and latest.delivery_state = 'replied'
+        then latest.occurred_at else null end as reply_at,
+      case when coalesce(submission.metadata #>> '{diligence,stage}', '')
+          not in ('financial-review','lender-review','loi-candidate')
+        and coalesce(submission.metadata #>> '{acquisitionCommand,pipelineStage}', '')
+          not in ('diligence','loi-candidate')
+        then greatest(document.action_at, upload.action_at) else null end as materials_at
+    from public.deal_hunter_opportunities as opportunity
+    join public.contact_submissions as submission on submission.id = opportunity.primary_submission_id
+    left join lateral (select direction, source, kind, delivery_state, occurred_at
+      from public.crm_communications as communication
+      where communication.submission_id = submission.id
+      order by occurred_at desc, id desc limit 1) as latest on true
+    left join lateral (select max(created_at) as action_at
+      from public.secure_documents as document
+      where document.submission_id = submission.id
+        and document.document_type in ('cim','teaser','prospectus','offering_memorandum',
+          'offering_materials','data_room','broker_materials','financials','financial_package',
+          'financial_statements','p_and_l','tax_returns','balance_sheet')) as document on true
+    left join lateral (select max(coalesce(last_uploaded_at, updated_at)) as action_at
+      from public.secure_upload_requests as request
+      where request.submission_id = submission.id
+        and request.status in ('completed','documents-received')
+        and exists (select 1 from pg_catalog.jsonb_array_elements(request.requested_documents) as requested(value)
+          where case when pg_catalog.jsonb_typeof(requested.value) = 'string'
+            then trim(both '"' from requested.value::text)
+            else coalesce(requested.value ->> 'category', requested.value ->> 'id') end
+            in ('cim','teaser','prospectus','offering_memorandum','offering_materials',
+              'data_room','broker_materials','financials','financial_package',
+              'financial_statements','p_and_l','tax_returns','balance_sheet'))
+    ) as upload on true
+    where opportunity.status = 'active' and submission.status not in ('archived','spam')
+      and submission.follow_up_state <> 'completed'
+  ), base as materialized (
+    select scores.opportunity_id, scores.fit_score, scores.confidence,
+      scores.contradiction_count, scores.score_fingerprint, scores.semantic_digest,
+      (select max(source.updated_at)
+        from public.deal_hunter_opportunity_source_observations as source
+        where source.opportunity_id = scores.opportunity_id) as source_snapshot_updated_at,
+      scores.operator_priority, scores.reviewed_at,
+      scores.reviewed_discovery_revision, scores.reviewed_material_revision,
+      opportunity.first_accepted_at, opportunity.discovery_state,
+      opportunity.discovery_revision, opportunity.material_revision,
+      opportunity.last_material_change_at,
+      coalesce(action.reply_at, action.materials_at, due.due_at) as due_at,
+      case when action.reply_at is not null then 'broker_reply'
+        when action.materials_at is not null then 'materials_ready'
+        when due.due_at is not null then 'due_follow_up' else null end as action_reason,
+      publication_latest.publication_date,
+      publication_latest.publication_instant, publication_latest.publication_state,
+      publication_latest.source_name as publication_source,
+      publication_latest.publication_precision,
+      publication_stats.publication_distinct_count,
+      publication_stats.publication_unsupported_count,
+      case when p_area = 'research' then (select count(*) from (select source.field
+        from public.deal_hunter_opportunity_source_observations as source
+        where source.opportunity_id = scores.opportunity_id
+          and source.field in ('annual_profit', 'annual_revenue', 'asking_price')
+        group by source.field having count(distinct source.value) > 1) as conflict_fields)
+        else 0 end
+        as source_conflict_count,
+      null::text as material_field
+    from public.deal_hunter_opportunity_scores as scores
+    join public.deal_hunter_opportunities as opportunity
+      on opportunity.opportunity_id = scores.opportunity_id and opportunity.status = 'active'
+    left join public.deal_hunter_dispositions as disposition
+      on disposition.deal_key = scores.deal_key and disposition.disposition = 'dismissed'
+    left join due_actions as due on due.opportunity_id = scores.opportunity_id
+    left join action_evidence as action on action.opportunity_id = scores.opportunity_id
+    left join lateral (
+      select evidence.publication_date, evidence.publication_instant,
+        evidence.publication_state, evidence.source_name, evidence.publication_precision
+      from public.deal_hunter_opportunity_source_observations as observation
+      join public.deal_hunter_freshness_evidence as core
+        on core.id = observation.accepted_evidence_id
+      join public.deal_hunter_freshness_evidence as evidence
+        on evidence.run_id = core.run_id and evidence.source_id = core.source_id
+        and evidence.source_record_id = core.source_record_id
+        and evidence.event_type = 'publication_evidence'
+        and evidence.field_key = 'date_added'
+      where observation.opportunity_id = scores.opportunity_id
+        and opportunity.first_accepted_at is not null
+        and opportunity.discovery_revision > scores.reviewed_discovery_revision
+        and observation.field = 'date_added'
+        and evidence.current_canonical_id = scores.opportunity_id
+        and evidence.publication_meaning = 'listing_publication'
+      order by evidence.accepted_at desc, evidence.id limit 1
+    ) as publication_latest on true
+    left join lateral (
+      select count(distinct coalesce(evidence.publication_date::text,
+          evidence.publication_instant::text)) filter
+          (where evidence.publication_state = 'valid') as publication_distinct_count,
+        count(*) filter (where evidence.publication_state <> 'valid')
+          as publication_unsupported_count
+      from public.deal_hunter_opportunity_source_observations as observation
+      join public.deal_hunter_freshness_evidence as core
+        on core.id = observation.accepted_evidence_id
+      join public.deal_hunter_freshness_evidence as evidence
+        on evidence.run_id = core.run_id and evidence.source_id = core.source_id
+        and evidence.source_record_id = core.source_record_id
+        and evidence.event_type = 'publication_evidence'
+        and evidence.field_key = 'date_added'
+      where observation.opportunity_id = scores.opportunity_id
+        and opportunity.first_accepted_at is not null
+        and opportunity.discovery_revision > scores.reviewed_discovery_revision
+        and observation.field = 'date_added'
+        and evidence.current_canonical_id = scores.opportunity_id
+        and evidence.publication_meaning = 'listing_publication'
+    ) as publication_stats on true
+    where scores.current_triage_eligible = true and scores.should_remove = false
+      and disposition.deal_key is null
+      and (coalesce(p_search, '') = '' or lower(coalesce(scores.name, '')) like
+        '%' || lower(p_search) || '%' or lower(coalesce(scores.deal_key, '')) like
+        '%' || lower(p_search) || '%')
+      and (coalesce(p_confidence, '') = '' or scores.confidence = p_confidence)
+      and (coalesce(p_priority, '') = '' or scores.operator_priority = p_priority)
+      and (coalesce(p_state, '') = '' or upper(coalesce(scores.state, '')) = upper(p_state))
+  ), classified as materialized (
+    select base.*,
+      (base.discovery_state = 'known_prospective'
+        or (base.discovery_state = 'known_recovered' and base.reviewed_at is null))
+        and base.first_accepted_at is not null
+        and base.discovery_revision > base.reviewed_discovery_revision
+        and parameters.business_date - (base.first_accepted_at at time zone 'America/Los_Angeles')::date
+          between 0 and 7 as new_to_ug,
+      base.publication_state = 'valid' and base.publication_distinct_count = 1
+        and base.publication_unsupported_count = 0
+        and parameters.business_date - coalesce(base.publication_date,
+          (base.publication_instant at time zone 'America/Los_Angeles')::date)
+          between 0 and 30 as recently_listed,
+      base.material_revision > base.reviewed_material_revision
+        and base.last_material_change_at is not null as updated_since_review,
+      base.due_at is not null as due_action,
+      base.operator_priority in ('urgent', 'high') as owner_priority
+    from base cross join parameters
+  ), eligible as materialized (
+    select classified.*,
+      case when new_to_ug and fit_score >= 75 and confidence <> 'low'
+        and discovery_revision > reviewed_discovery_revision then
+          case when recently_listed then 1 else 2 end else 6 end as discovery_group
+    from classified
+  ), ordered as materialized (
+    select eligible.*,
+      row_number() over (order by due_at asc nulls last, opportunity_id) as due_ordinal,
+      row_number() over (order by case operator_priority when 'urgent' then 0
+        when 'high' then 1 else 2 end, fit_score desc, opportunity_id) as priority_ordinal
+    from eligible
+  ), preview_candidates as (
+    select ordered.*,
+      min(priority_ordinal) filter (where owner_priority
+        and (not due_action or due_ordinal > 2)) over () as first_remaining_priority
+    from ordered
+  ), memberships as (
+    select 'due-actions'::text as area_id, ordered.*, null::bigint as first_remaining_priority
+      from ordered where p_area = 'due-actions' and due_action
+    union all select 'owner-priorities', ordered.*, null::bigint from ordered
+      where p_area = 'owner-priorities' and owner_priority
+    union all select 'new-important', ordered.*, null::bigint from ordered
+      where p_area in ('inbox', 'new-important') and discovery_group <= 2
+    union all select 'updated', ordered.*, null::bigint from ordered
+      where p_area = 'updated' and updated_since_review
+    union all select 'research', ordered.*, null::bigint from ordered
+      where p_area = 'research'
+        and (confidence = 'low' or contradiction_count > 0 or source_conflict_count > 0)
+    union all select 'all-active', ordered.*, null::bigint from ordered
+      where p_area = 'all-active'
+    union all select 'action-preview', preview_candidates.* from preview_candidates
+      where p_area in ('inbox', 'action-preview') and (due_action or owner_priority)
+  ), numbered as (
+    select memberships.*,
+      row_number() over (partition by area_id order by
+        case when area_id = 'new-important' then discovery_group end,
+        case when area_id = 'action-preview' then
+          case when due_action and due_ordinal <= 2 then 0
+            when owner_priority and priority_ordinal = first_remaining_priority then 1
+            when due_action then 2 else 3 end end,
+        case when area_id in ('action-preview', 'due-actions') then due_at end asc nulls last,
+        case when area_id = 'due-actions' then opportunity_id end,
+        case when area_id = 'action-preview' and due_action and due_ordinal <= 2
+          then due_ordinal end,
+        case when area_id = 'action-preview' and owner_priority
+          and priority_ordinal = first_remaining_priority then priority_ordinal end,
+        case when area_id in ('action-preview', 'owner-priorities', 'new-important') then
+          case operator_priority when 'urgent' then 0 when 'high' then 1 else 2 end end,
+        case when area_id = 'new-important' then due_at end asc nulls last,
+        case when area_id = 'new-important' then fit_score end desc,
+        case when area_id = 'new-important' then
+          case confidence when 'high' then 0 when 'medium' then 1 else 2 end end,
+        case when area_id in ('new-important', 'research', 'all-active')
+          then first_accepted_at end desc nulls last,
+        case when area_id = 'updated' then last_material_change_at end desc nulls last,
+        fit_score desc, opportunity_id
+      ) as ordinal
+    from memberships
+  ), selected as materialized (
+    select * from numbered where (p_area = 'inbox' and area_id in
+      ('action-preview', 'new-important')) or area_id = p_area
+  ), totals as (
+    select area_id, count(*)::integer as total,
+      public.deal_hunter_fresh_inbox_hash_v1(
+        opportunity_id || ':' || discovery_group || ':' || fit_score || ':' || confidence
+        || ':' || operator_priority || ':' || coalesce(due_at::text, '')
+        || ':' || coalesce(action_reason, '')
+        || ':' || coalesce(first_accepted_at::text, '') || ':' || discovery_revision
+        || ':' || material_revision || ':' || reviewed_discovery_revision
+        || ':' || reviewed_material_revision || ':' || score_fingerprint
+        || ':' || coalesce(semantic_digest, '') || ':' || coalesce(publication_state, '')
+        || ':' || coalesce(publication_date::text, '')
+        || ':' || source_conflict_count || ':' || coalesce(material_field, '')
+        || ':' || coalesce(source_snapshot_updated_at::text, '')
+        order by ordinal) as revision
+    from selected where area_id <> 'action-preview' or ordinal <= 3
+    group by area_id
+  ), pages as (
+    select area_id, jsonb_agg((to_jsonb(display_score) - 'operator_note')
+      || (to_jsonb(numbered) - 'ordinal' - 'area_id'
+        - 'due_ordinal' - 'priority_ordinal' - 'first_remaining_priority')
+      || jsonb_build_object(
+        'primary_submission_id', display_opp.primary_submission_id,
+        'publication_date', display_publication.publication_date,
+        'publication_instant', display_publication.publication_instant,
+        'publication_state', display_publication.publication_state,
+        'publication_source', display_publication.source_name,
+        'publication_precision', display_publication.publication_precision,
+        'publication_distinct_count', display_publication_stats.distinct_count,
+        'publication_unsupported_count', display_publication_stats.unsupported_count,
+        'recently_listed', display_publication.publication_state = 'valid'
+          and display_publication_stats.distinct_count = 1
+          and display_publication_stats.unsupported_count = 0
+          and parameters.business_date - coalesce(display_publication.publication_date,
+            (display_publication.publication_instant at time zone 'America/Los_Angeles')::date)
+            between 0 and 30,
+        'top_strength', display_score.summary->'strengths'->>0,
+        'top_concern', display_score.summary->'concerns'->>0,
+        'crm_status', coalesce((select submission.status
+          from public.contact_submissions as submission
+          where submission.id = display_opp.primary_submission_id), 'not-started'),
+        'cim_status', coalesce((select cim.status
+          from public.deal_hunter_cim_requests as cim
+          where cim.opportunity_id = numbered.opportunity_id
+          order by cim.updated_at desc, cim.id desc limit 1), 'not-requested'),
+        'industry', (select source.value from public.deal_hunter_opportunity_source_observations as source
+          where source.opportunity_id = numbered.opportunity_id and source.field = 'industry'
+          order by source.observed_at desc, source.id limit 1),
+        'location', (select source.value from public.deal_hunter_opportunity_source_observations as source
+          where source.opportunity_id = numbered.opportunity_id and source.field = 'location'
+          order by source.observed_at desc, source.id limit 1),
+        'annual_profit', (select source.value from public.deal_hunter_opportunity_source_observations as source
+          where source.opportunity_id = numbered.opportunity_id and source.field = 'annual_profit'
+          order by source.observed_at desc, source.id limit 1),
+        'annual_revenue', (select source.value from public.deal_hunter_opportunity_source_observations as source
+          where source.opportunity_id = numbered.opportunity_id and source.field = 'annual_revenue'
+          order by source.observed_at desc, source.id limit 1),
+        'asking_price', (select source.value from public.deal_hunter_opportunity_source_observations as source
+          where source.opportunity_id = numbered.opportunity_id and source.field = 'asking_price'
+          order by source.observed_at desc, source.id limit 1),
+        'profit_multiple', (select source.value from public.deal_hunter_opportunity_source_observations as source
+          where source.opportunity_id = numbered.opportunity_id and source.field = 'profit_multiple'
+          order by source.observed_at desc, source.id limit 1),
+        'observation_freshness', coalesce((select max(source.observed_at)
+          from public.deal_hunter_opportunity_source_observations as source
+          where source.opportunity_id = numbered.opportunity_id), display_score.scored_at),
+        'latest_accepted_observation_at', (select max(source.accepted_at)
+          from public.deal_hunter_opportunity_source_observations as source
+          where source.opportunity_id = numbered.opportunity_id),
+        'material_field', (select event.field_key from public.deal_hunter_freshness_evidence as event
+          where event.current_canonical_id = numbered.opportunity_id
+            and event.event_type = 'material_change'
+            and event.material_revision = numbered.material_revision
+          order by event.accepted_at desc, event.id limit 1),
+        'material_before_value', (select event.before_value from public.deal_hunter_freshness_evidence as event
+          where event.current_canonical_id = numbered.opportunity_id
+            and event.event_type = 'material_change'
+            and event.material_revision = numbered.material_revision
+          order by event.accepted_at desc, event.id limit 1),
+        'material_after_value', (select event.after_value from public.deal_hunter_freshness_evidence as event
+          where event.current_canonical_id = numbered.opportunity_id
+            and event.event_type = 'material_change'
+            and event.material_revision = numbered.material_revision
+          order by event.accepted_at desc, event.id limit 1),
+        'material_currency', (select event.currency from public.deal_hunter_freshness_evidence as event
+          where event.current_canonical_id = numbered.opportunity_id
+            and event.event_type = 'material_change'
+            and event.material_revision = numbered.material_revision
+          order by event.accepted_at desc, event.id limit 1),
+        'source_conflict_count', (select count(*) from (select source.field
+          from public.deal_hunter_opportunity_source_observations as source
+          where source.opportunity_id = numbered.opportunity_id
+            and source.field in ('annual_profit', 'annual_revenue', 'asking_price')
+          group by source.field having count(distinct source.value) > 1) as conflict_fields)
+      )
+      order by ordinal) as rows,
+      max(ordinal)::integer as last_ordinal,
+      (array_agg(numbered.opportunity_id order by ordinal desc))[1] as last_id
+    from numbered
+    join public.deal_hunter_opportunity_scores as display_score
+      on display_score.opportunity_id = numbered.opportunity_id
+    join public.deal_hunter_opportunities as display_opp
+      on display_opp.opportunity_id = numbered.opportunity_id
+    left join lateral (
+      select evidence.publication_date, evidence.publication_instant,
+        evidence.publication_state, evidence.source_name, evidence.publication_precision
+      from public.deal_hunter_opportunity_source_observations as observation
+      join public.deal_hunter_freshness_evidence as core
+        on core.id = observation.accepted_evidence_id
+      join public.deal_hunter_freshness_evidence as evidence
+        on evidence.run_id = core.run_id and evidence.source_id = core.source_id
+        and evidence.source_record_id = core.source_record_id
+        and evidence.event_type = 'publication_evidence'
+        and evidence.field_key = 'date_added'
+      where observation.opportunity_id = numbered.opportunity_id
+        and observation.field = 'date_added'
+        and evidence.current_canonical_id = numbered.opportunity_id
+        and evidence.publication_meaning = 'listing_publication'
+      order by evidence.accepted_at desc, evidence.id limit 1
+    ) as display_publication on true
+    left join lateral (
+      select count(distinct coalesce(evidence.publication_date::text,
+          evidence.publication_instant::text)) filter
+          (where evidence.publication_state = 'valid') as distinct_count,
+        count(*) filter (where evidence.publication_state <> 'valid') as unsupported_count
+      from public.deal_hunter_opportunity_source_observations as observation
+      join public.deal_hunter_freshness_evidence as core
+        on core.id = observation.accepted_evidence_id
+      join public.deal_hunter_freshness_evidence as evidence
+        on evidence.run_id = core.run_id and evidence.source_id = core.source_id
+        and evidence.source_record_id = core.source_record_id
+        and evidence.event_type = 'publication_evidence'
+        and evidence.field_key = 'date_added'
+      where observation.opportunity_id = numbered.opportunity_id
+        and observation.field = 'date_added'
+        and evidence.current_canonical_id = numbered.opportunity_id
+        and evidence.publication_meaning = 'listing_publication'
+    ) as display_publication_stats on true
+    cross join parameters
+    where ((p_area = 'inbox' and area_id in ('action-preview', 'new-important'))
+      or area_id = p_area)
+      and ordinal > case when p_area = 'inbox' then 0 else parameters.page_offset end
+      and ordinal <= case when area_id = 'action-preview' then 3
+        when p_area = 'inbox' then 10
+        else parameters.page_offset + parameters.page_limit end
+    group by area_id
+  ), requested as (
+    select id from (values ('action-preview'), ('new-important'), ('due-actions'),
+      ('owner-priorities'), ('updated'), ('research'), ('all-active')) as ids(id)
+    where (p_area = 'inbox' and id in ('action-preview', 'new-important')) or id = p_area
+  )
+  select jsonb_build_object('asOf', p_as_of, 'businessDate', parameters.business_date,
+    'areas', coalesce((select jsonb_agg(jsonb_build_object(
+      'id', requested.id, 'rows', coalesce(pages.rows, '[]'::jsonb),
+      'total', coalesce(totals.total, 0),
+      'revision', coalesce(totals.revision, md5('')),
+      'anchorId', (select anchor.opportunity_id from selected as anchor
+        where anchor.area_id = requested.id and anchor.ordinal = parameters.page_offset),
+      'nextOffset', case when pages.last_ordinal < totals.total then pages.last_ordinal else null end,
+      'lastId', case when pages.last_ordinal < totals.total then pages.last_id else null end,
+      'counts', case when requested.id = 'action-preview' then jsonb_build_object(
+        'due', (select count(*) from ordered where due_action),
+        'overdue', (select count(*) from ordered where due_action and action_reason = 'due_follow_up'
+          and (due_at at time zone 'America/Los_Angeles')::date < parameters.business_date),
+        'ownerPriority', (select count(*) from ordered where owner_priority),
+        'urgent', (select count(*) from ordered where operator_priority = 'urgent'))
+        else '{}'::jsonb end
+    ) order by case requested.id when 'action-preview' then 0 else 1 end)
+      from requested left join totals on totals.area_id = requested.id
+      left join pages on pages.area_id = requested.id), '[]'::jsonb),
+    'counts', jsonb_build_object(
+      'due', (select count(*) from ordered where due_action),
+      'ownerPriority', (select count(*) from ordered where owner_priority),
+      'newImportant', (select count(*) from ordered where discovery_group <= 2)))
+  from parameters;
+$$;
+revoke all on function public.list_deal_hunter_fresh_inbox_v1(
+  text, integer, integer, text, text, text, text, timestamptz) from public, anon, authenticated;
+grant execute on function public.list_deal_hunter_fresh_inbox_v1(
+  text, integer, integer, text, text, text, text, timestamptz) to service_role;

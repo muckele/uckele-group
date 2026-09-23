@@ -1611,7 +1611,7 @@ test('detail closes every nested projection and strips injected storage metadata
     topConcern: text(400), workflow: { type: 'object' }, observationFreshness: text(80), operatorPriority: text(40),
     operatorNote: text(2000), reviewed: boolean, reviewedAt: text(80), reviewedBy: text(160),
     changedSinceReview: boolean, disposition: { type: 'object' }, dismissed: boolean, dismissedReason: text(160), scoredAt: text(80),
-    scoreFingerprint: text(200), rulesVersion: text(160),
+    scoreFingerprint: text(200), rulesVersion: text(160), freshness: { type: 'object' },
   };
   const operatorFactContract = { id: text(200), field: text(80), value: text(4000), verified: boolean, actor: text(160), note: text(500), createdAt: text(80), updatedAt: text(80) };
   const evidenceContract = {
@@ -1624,6 +1624,25 @@ test('detail closes every nested projection and strips injected storage metadata
   assertRecordContract(detail.opportunity.geography, { city: text(160), state: text(40), label: text(240) }, 'opportunity.geography');
   assertRecordContract(detail.opportunity.financials, { annualProfit: nullableNumber, annualRevenue: nullableNumber, askingPrice: nullableNumber, profitMultiple: nullableNumber }, 'opportunity.financials');
   assertRecordContract(detail.opportunity.workflow, { crmStatus: text(80), cimStatus: text(80) }, 'opportunity.workflow');
+  assertRecordContract(detail.opportunity.freshness, {
+    discoveryState: text(40), firstAcceptedAt: text(80), discoveryRevision: number,
+    materialRevision: number, reviewedDiscoveryRevision: number,
+    reviewedMaterialRevision: number, lastMaterialChangeAt: text(80),
+    latestAcceptedObservationAt: text(80), materialChange: { type: 'object', nullable: true },
+    crmLinked: boolean, publicationClaims: { type: 'object' },
+  }, 'opportunity.freshness');
+  if (detail.opportunity.freshness.materialChange) {
+    assertRecordContract(detail.opportunity.freshness.materialChange, {
+      field: text(80), beforeValue: nullableNumber, afterValue: nullableNumber,
+      currency: text(20), period: text(40), source: text(160), acceptedAt: text(80),
+    }, 'opportunity.freshness.materialChange');
+  }
+  assert.ok(Array.isArray(detail.opportunity.freshness.publicationClaims));
+  assert.ok(detail.opportunity.freshness.publicationClaims.length <= 10);
+  for (const claim of detail.opportunity.freshness.publicationClaims) {
+    assertRecordContract(claim, { source: text(160), rawValue: text(200), precision: text(20) },
+      'opportunity.freshness.publicationClaim');
+  }
   assertRecordContract(detail.opportunity.disposition, { state: text(80), reason: text(160), note: text(500), dismissedAt: text(80), dismissedBy: text(160) }, 'opportunity.disposition');
   assert.equal(detail.opportunity.missingEvidenceCount, 52, 'persisted missing-evidence count remains exact');
   assert.equal(detail.opportunity.contradictionCount, 23, 'persisted contradiction count remains exact');

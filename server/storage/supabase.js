@@ -10,6 +10,7 @@ import {
 import { consumeCompleteGoogleSheetSourceSnapshotAdmission, normalizeCompleteGoogleSheetFreshnessSnapshot } from '../services/dealHunterSourceSnapshotAdmission.js';
 import { requireCanonicalCimRequestId } from '../services/cimRequestIdPolicy.js';
 import { CrmSupersessionUnavailableError } from '../services/crmSubmissionSupersession.js';
+import { freshInboxAreaIds, ownerBusinessDate } from '../services/dealHunterFreshInboxPolicy.js';
 
 const dealHunterQueueSorts = new Set([
   'acquisition-priority', 'fit-score', 'confidence', 'completeness', 'scored-at', 'name', 'changed',
@@ -2994,7 +2995,15 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       if (String(command.submissionId || '').trim()) {
         throw new CrmSupersessionUnavailableError();
       }
-      const { data, error } = await client.rpc('pass_deal_hunter_opportunity', {
+      const hasExpected = command.expectedDiscoveryRevision !== undefined
+        || command.expectedMaterialRevision !== undefined;
+      if (hasExpected && (!Number.isSafeInteger(command.expectedDiscoveryRevision)
+        || !Number.isSafeInteger(command.expectedMaterialRevision)
+        || command.expectedDiscoveryRevision < 0 || command.expectedMaterialRevision < 0)) {
+        throw new Error('Freshness review requires two nonnegative revisions.');
+      }
+      const { data, error } = await client.rpc(hasExpected
+        ? 'pass_deal_hunter_opportunity_freshness_v1' : 'pass_deal_hunter_opportunity', {
         p_command: {
           opportunity_id: opportunityId,
           reason: String(command.reason || '').trim(),
@@ -3005,8 +3014,16 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
           archive_activity_id: String(command.archiveActivityId || '').trim(),
           triage_activity_id: String(command.triageActivityId || '').trim(),
         },
+        ...(hasExpected ? { p_expected_discovery_revision: command.expectedDiscoveryRevision,
+          p_expected_material_revision: command.expectedMaterialRevision } : {}),
       });
-      if (error) throw error;
+      if (error) {
+        if (/FL01_STALE_REVIEW/.test(error.message || '')) {
+          const stale = new Error('Freshness changed since this opportunity was shown. Reload before acting.');
+          stale.code = 'DEAL_HUNTER_FRESHNESS_STALE'; stale.status = 409; throw stale;
+        }
+        throw error;
+      }
       return normalizeDealHunterPassResult(data);
     },
 
@@ -3023,11 +3040,28 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         payload.reviewed_semantic_digest = decision.reviewedSemanticDigest
           ? String(decision.reviewedSemanticDigest) : null;
       }
-      const { data, error } = await client.rpc('set_deal_hunter_opportunity_operator_decision', {
+      const hasExpected = decision.expectedDiscoveryRevision !== undefined
+        || decision.expectedMaterialRevision !== undefined;
+      if (hasExpected && (!Number.isSafeInteger(decision.expectedDiscoveryRevision)
+        || !Number.isSafeInteger(decision.expectedMaterialRevision)
+        || decision.expectedDiscoveryRevision < 0 || decision.expectedMaterialRevision < 0)) {
+        throw new Error('Freshness review requires two nonnegative revisions.');
+      }
+      const { data, error } = await client.rpc(hasExpected
+        ? 'set_deal_hunter_operator_decision_freshness_v1'
+        : 'set_deal_hunter_opportunity_operator_decision', {
         p_opportunity_id: opportunityId,
         p_decision: payload,
+        ...(hasExpected ? { p_expected_discovery_revision: decision.expectedDiscoveryRevision,
+          p_expected_material_revision: decision.expectedMaterialRevision } : {}),
       });
-      if (error) throw error;
+      if (error) {
+        if (/FL01_STALE_REVIEW/.test(error.message || '')) {
+          const stale = new Error('Freshness changed since this opportunity was shown. Reload before acting.');
+          stale.code = 'DEAL_HUNTER_FRESHNESS_STALE'; stale.status = 409; throw stale;
+        }
+        throw error;
+      }
       return normalizeDealHunterOpportunityScoreRow(data);
     },
 
@@ -3177,6 +3211,40 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       };
     },
 
+    async listDealHunterFreshInbox({ area = 'inbox', cursor = null, limit = null,
+      search = '', confidence = '', priority = '', state = '', asOf = new Date().toISOString() } = {}) {
+      if (area !== 'inbox' && !freshInboxAreaIds.includes(area)) {
+        throw new Error('Unknown Acquisition Inbox area.');
+      }
+      const filters = { search: String(search || '').trim().toLowerCase().slice(0, 160),
+        confidence: String(confidence || ''), priority: String(priority || ''),
+        state: String(state || '').toUpperCase() };
+      const filtersKey = createHash('sha256').update(JSON.stringify(filters)).digest('hex');
+      const businessDate = ownerBusinessDate(asOf);
+      const stale = () => {
+        const error = new Error('Inbox results changed. Refresh this area before continuing.');
+        error.code = 'DEAL_HUNTER_STALE_PAGE'; error.status = 409; return error;
+      };
+      if (cursor && (cursor.area !== area || cursor.businessDate !== businessDate
+        || cursor.filtersKey !== filtersKey || !Number.isSafeInteger(cursor.lastOrdinal)
+        || cursor.lastOrdinal < 1 || cursor.lastOrdinal > 100000
+        || typeof cursor.lastId !== 'string' || cursor.lastId.length > 200)) throw stale();
+      const { data, error } = await client.rpc('list_deal_hunter_fresh_inbox_v1', {
+        p_area: area, p_offset: cursor?.lastOrdinal || 0, p_limit: limit,
+        p_search: filters.search, p_confidence: filters.confidence,
+        p_priority: filters.priority, p_state: filters.state, p_as_of: asOf,
+      });
+      if (error) throw error;
+      const areas = (data?.areas || []).map((item) => {
+        if (cursor && (item.revision !== cursor.revision || item.anchorId !== cursor.lastId)) throw stale();
+        return { id: item.id, rows: (item.rows || []).map(normalizeDealHunterOpportunityScoreRow),
+          total: Number(item.total || 0), counts: item.counts || {}, revision: item.revision,
+          nextCursor: item.nextOffset ? { area: item.id, revision: item.revision,
+            businessDate, filtersKey, lastOrdinal: item.nextOffset, lastId: item.lastId } : null };
+      });
+      return { asOf: data?.asOf || asOf, businessDate, areas, counts: data?.counts || {} };
+    },
+
     async listDealHunterCrmReconciliationItems(runId, { limit = 5000 } = {}) {
       const { data, error } = await client.from('deal_hunter_crm_reconciliation_items').select('*')
         .eq('run_id', runId).order('opportunity_id').limit(Math.max(1, Math.min(Number(limit) || 5000, 100000)));
@@ -3226,6 +3294,18 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         .maybeSingle();
       if (error) throw error;
       return normalizeDealHunterOpportunityRow(data);
+    },
+
+    async getLatestDealHunterMaterialChange({ opportunityId, materialRevision } = {}) {
+      if (!opportunityId || !Number.isSafeInteger(Number(materialRevision)) || Number(materialRevision) < 1) return null;
+      const { data, error } = await client.from('deal_hunter_freshness_evidence')
+        .select('field_key,before_value,after_value,currency,period,source_name,accepted_at')
+        .eq('current_canonical_id', String(opportunityId))
+        .eq('event_type', 'material_change')
+        .eq('material_revision', Number(materialRevision))
+        .order('accepted_at', { ascending: false }).order('id').limit(1).maybeSingle();
+      if (error) throw error;
+      return data || null;
     },
 
     async getCimStage2SubmissionAuthority() {

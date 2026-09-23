@@ -7972,7 +7972,9 @@ async function buildDailyDealReview({
     stage2CoverageWarnings: coverage.stage2Warnings,
     scoringDeferred: ambiguousCompleteSheetIdentitySourceIds.length > 0,
     scoringDeferredReason: ambiguousCompleteSheetIdentitySourceIds.length > 0
-      ? 'Scoring and scored-opportunity actions are deferred until every required Google Sheet has a complete, uniquely identified source snapshot.'
+      ? identityExceptions.length > 0
+        ? 'Scoring and scored-opportunity actions are deferred until every canonical identity exception is resolved and the required Google Sheet has a complete source snapshot.'
+        : 'Scoring and scored-opportunity actions are deferred until every required Google Sheet has a complete, uniquely identified source snapshot.'
       : '',
     sourceSnapshotAdmissionDeferredSources: ambiguousCompleteSheetIdentitySourceIds,
     cimOutreachPause: outreachGate.status,
