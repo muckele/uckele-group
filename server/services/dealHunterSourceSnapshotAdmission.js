@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 import {
   getOpportunitySourceObservationRecordId,
   normalizeDealHunterSourceSnapshot,
+  normalizeOpportunitySourceObservationSnapshot,
+  normalizeSourceFreshnessEvidence,
 } from './dealHunterOpportunityFacts.js';
 
 // A source-wide replacement can delete every current observation for one
@@ -13,6 +15,34 @@ import {
 // which belongs in this Phase 1 boundary.
 const completeGoogleSheetSourceSnapshotPolicy = 'complete-google-sheet-source-snapshot-v1';
 const completeGoogleSheetSourceSnapshotAdmissions = new WeakMap();
+
+export function normalizeCompleteGoogleSheetFreshnessSnapshot(snapshot = {}) {
+  const unresolved = Array.isArray(snapshot.unresolved) ? snapshot.unresolved.map((item) => {
+    const source_record_id = String(item?.source_record_id || '').trim();
+    const identity_exception_id = String(item?.identity_exception_id || '').trim();
+    if (!source_record_id || source_record_id.length > 200
+      || !identity_exception_id || identity_exception_id.length > 240) {
+      throw new Error('Deferred Sheet record needs a bounded source record and identity exception.');
+    }
+    return { source_record_id, identity_exception_id,
+      freshness_evidence: normalizeSourceFreshnessEvidence(item.freshness_evidence) };
+  }) : [];
+  if (unresolved.length === 0) {
+    return { ...normalizeDealHunterSourceSnapshot(snapshot), unresolved };
+  }
+  const source_id = String(snapshot.source_id || '').trim();
+  const source_name = String(snapshot.source_name || '').trim();
+  const records = Array.isArray(snapshot.records)
+    ? snapshot.records.map(normalizeOpportunitySourceObservationSnapshot) : [];
+  if (!source_id || source_id.length > 160 || !source_name || source_name.length > 220
+    || records.length + unresolved.length > 10_000
+    || records.some((record) => record.source_id !== source_id || record.source_name !== source_name)) {
+    throw new Error('Deferred Sheet scope is malformed.');
+  }
+  const ids = [...records.map((record) => record.source_record_id), ...unresolved.map((item) => item.source_record_id)];
+  if (new Set(ids).size !== ids.length) throw new Error('Deferred Sheet scope has duplicate source records.');
+  return { source_id, source_name, records, unresolved };
+}
 
 function completeGoogleSheetSourceSlot(sourceId) {
   const match = /^sheet-(0|[1-9][0-9]*)$/.exec(String(sourceId || ''));
@@ -71,20 +101,47 @@ function completeGoogleSheetSourceSnapshotFingerprint(snapshot) {
       );
     }
   }
+  for (const item of snapshot.unresolved || []) {
+    parts.push('u', sourceSnapshotAdmissionText(item.source_record_id),
+      sourceSnapshotAdmissionText(item.identity_exception_id),
+      sourceSnapshotAdmissionText(JSON.stringify(item.freshness_evidence)));
+  }
   return parts.join('|');
 }
 
 function completeGoogleSheetSourceSnapshotAdmissionMetadata(snapshot) {
-  const source_record_ids = snapshot.records.map((record) => record.source_record_id).sort();
+  const source_record_ids = [
+    ...snapshot.records.map((record) => record.source_record_id),
+    ...(snapshot.unresolved || []).map((item) => item.source_record_id),
+  ].sort();
+  const run = snapshot.run || null;
+  if (run && (run.sourceId !== snapshot.source_id || typeof run.runId !== 'string'
+    || !run.runId || run.runId.length > 200 || !Number.isSafeInteger(run.generation)
+    || run.generation < 1)) {
+    throw new Error('Complete Sheet freshness run is not an allocated bounded source run.');
+  }
+  const freshnessPayloadHash = run
+    ? createHash('md5').update(JSON.stringify(snapshot.unresolved?.length
+      ? { records: snapshot.records, unresolved: snapshot.unresolved } : snapshot.records)).digest('hex')
+    : null;
   return Object.freeze({
     policy: completeGoogleSheetSourceSnapshotPolicy,
     source_id: snapshot.source_id,
     source_name: snapshot.source_name,
     source_slot: completeGoogleSheetSourceSlot(snapshot.source_id),
-    record_count: snapshot.records.length,
+    record_count: snapshot.records.length + (snapshot.unresolved?.length || 0),
+    ...(run ? {
+      resolved_count: snapshot.records.length,
+      deferred_count: snapshot.unresolved?.length || 0,
+    } : {}),
     observation_count: snapshot.records.reduce((count, record) => count + record.observations.length, 0),
     source_record_ids: Object.freeze(source_record_ids),
     snapshot_digest: createHash('md5').update(completeGoogleSheetSourceSnapshotFingerprint(snapshot)).digest('hex'),
+    ...(run ? {
+      run: Object.freeze({ sourceId: run.sourceId, runId: run.runId, generation: run.generation }),
+      freshness_digest: freshnessPayloadHash + createHash('md5')
+        .update(`${freshnessPayloadHash}${run.runId}${run.generation}`).digest('hex'),
+    } : {}),
   });
 }
 
@@ -94,7 +151,7 @@ function mintCompleteGoogleSheetSourceSnapshotAdmission(snapshot) {
   return admission;
 }
 
-function verifiedCompleteGoogleSheetSourceSnapshot({ reviewMode, sourceResult, records } = {}) {
+function verifiedCompleteGoogleSheetSourceSnapshot({ reviewMode, sourceResult, records, unresolved = [], run } = {}) {
   if (reviewMode !== 'full-backfill') return null;
   const source = sourceResult?.source || {};
   if (source.required !== true && source.sourceRole !== 'required-primary') return null;
@@ -142,29 +199,33 @@ function verifiedCompleteGoogleSheetSourceSnapshot({ reviewMode, sourceResult, r
 
   let snapshot;
   try {
-    snapshot = normalizeDealHunterSourceSnapshot({
+    snapshot = normalizeCompleteGoogleSheetFreshnessSnapshot({
       source_id: sourceId,
       source_name: sourceName,
       records,
+      unresolved,
     });
   } catch {
     return null;
   }
   if (
-    snapshot.records.length !== expectedRecordIds.size
+    snapshot.records.length + snapshot.unresolved.length !== expectedRecordIds.size
     || snapshot.source_id !== sourceId
     || snapshot.source_name !== sourceName
   ) {
     return null;
   }
-  const representedRecordIds = new Set(snapshot.records.map((record) => record.source_record_id));
+  const representedRecordIds = new Set([
+    ...snapshot.records.map((record) => record.source_record_id),
+    ...snapshot.unresolved.map((item) => item.source_record_id),
+  ]);
   if (
     representedRecordIds.size !== expectedRecordIds.size
     || [...expectedRecordIds].some((sourceRecordId) => !representedRecordIds.has(sourceRecordId))
   ) {
     return null;
   }
-  return snapshot;
+  return { ...snapshot, ...(run ? { run } : {}) };
 }
 
 /**
@@ -178,11 +239,13 @@ export async function reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
   reviewMode,
   sourceResult,
   records,
+  unresolved = [],
+  run,
 } = {}) {
   if (typeof storage?.replaceAdmittedCompleteGoogleSheetSourceSnapshot !== 'function') {
     return { reconciled: false };
   }
-  const snapshot = verifiedCompleteGoogleSheetSourceSnapshot({ reviewMode, sourceResult, records });
+  const snapshot = verifiedCompleteGoogleSheetSourceSnapshot({ reviewMode, sourceResult, records, unresolved, run });
   if (!snapshot) return { reconciled: false };
 
   const admission = mintCompleteGoogleSheetSourceSnapshotAdmission(snapshot);
@@ -206,16 +269,19 @@ export function consumeCompleteGoogleSheetSourceSnapshotAdmission({ admission, s
   // it reusable for a later source-wide mutation attempt.
   completeGoogleSheetSourceSnapshotAdmissions.delete(admission);
 
-  const normalizedSnapshot = normalizeDealHunterSourceSnapshot(snapshot);
-  const actual = completeGoogleSheetSourceSnapshotAdmissionMetadata(normalizedSnapshot);
+  const normalizedSnapshot = normalizeCompleteGoogleSheetFreshnessSnapshot(snapshot);
+  const actual = completeGoogleSheetSourceSnapshotAdmissionMetadata({ ...normalizedSnapshot, run: snapshot.run });
   const matches = (
     actual.policy === issued.policy
     && actual.source_id === issued.source_id
     && actual.source_name === issued.source_name
     && actual.source_slot === issued.source_slot
     && actual.record_count === issued.record_count
+    && actual.resolved_count === issued.resolved_count
+    && actual.deferred_count === issued.deferred_count
     && actual.observation_count === issued.observation_count
     && actual.snapshot_digest === issued.snapshot_digest
+    && actual.freshness_digest === issued.freshness_digest
     && actual.source_record_ids.length === issued.source_record_ids.length
     && actual.source_record_ids.every((sourceRecordId, index) => sourceRecordId === issued.source_record_ids[index])
   );
@@ -227,8 +293,10 @@ export function consumeCompleteGoogleSheetSourceSnapshotAdmission({ admission, s
     source_name: issued.source_name,
     source_slot: issued.source_slot,
     record_count: issued.record_count,
+    ...(issued.run ? { resolved_count: issued.resolved_count, deferred_count: issued.deferred_count } : {}),
     observation_count: issued.observation_count,
     source_record_ids: [...issued.source_record_ids],
     snapshot_digest: issued.snapshot_digest,
+    ...(issued.run ? { run: issued.run, freshness_digest: issued.freshness_digest } : {}),
   };
 }

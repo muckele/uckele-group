@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { after, beforeEach, test } from 'node:test';
+import Database from 'better-sqlite3';
 import { strToU8, zipSync } from 'fflate';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import {
@@ -11,6 +12,7 @@ import {
 } from '../server/services/dealHunterOpportunityFacts.js';
 import { refreshOpportunityScores } from '../server/services/dealHunterScoreStore.js';
 import { getTriageOpportunityDetail } from '../server/services/dealHunterTriage.js';
+import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from '../server/services/dealHunterSourceSnapshotAdmission.js';
 
 process.env.DEAL_HUNTER_SHEET_CSV_URL = 'https://docs.google.com/spreadsheets/d/test/gviz/tq?tqx=out:csv&gid=123';
 process.env.DEAL_HUNTER_AIRTABLE_TOKEN = 'test-token';
@@ -20,6 +22,172 @@ process.env.DEAL_HUNTER_AIRTABLE_VIEW_ID = 'viwTest';
 
 const originalFetch = globalThis.fetch;
 const { importDealOsExport, parseSheetCsvDeals, reviewDailyDeals } = await import('../server/services/dealHunter.js');
+
+test('an admitted complete Sheet with an identity exception retains evidence and defers current projection', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-deferred-sheet-'));
+  const sqlitePath = path.join(directory, 'deferred.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const at = '2026-09-23T12:00:00.000Z';
+  const [resolvedDeal, ambiguousDeal] = parseSheetCsvDeals([
+    'Listing ID,Business Name,Listing URL,Posted Date',
+    'DEFER-1,Resolved Shop,https://example.test/defer-1,2026-09-22',
+    'DEFER-2,Ambiguous Shop,https://example.test/defer-2,2026-09-22',
+  ].join('\n')).deals;
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: 'op-deferred-resolved', created_at: at, updated_at: at,
+    canonical_name: 'Resolved Shop', identity_version: 'test', status: 'active', metadata: {},
+  });
+  const prior = buildOpportunitySourceObservationSnapshot({
+    opportunityId: 'op-deferred-resolved', deal: resolvedDeal, now: at,
+  });
+  await storage.replaceDealHunterOpportunitySourceObservationSnapshot(prior);
+  await storage.upsertDealHunterIdentityException({
+    id: 'deferred-exception', created_at: at, updated_at: at, status: 'open',
+    reason: 'ambiguous', evidence_version: 'test', candidate_opportunity_ids: [], metadata: {},
+  });
+  const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId: 'deferred-run' });
+  const accepted = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
+    storage, reviewMode: 'full-backfill', run,
+    sourceResult: { source: { id: 'sheet-0', required: true, fetched: true,
+      sourceRowCount: 2, rowCount: 2, coverageLimitReached: false },
+    deals: [resolvedDeal, ambiguousDeal] },
+    records: [prior],
+    unresolved: [{ source_record_id: 'external:DEFER-2', identity_exception_id: 'deferred-exception',
+      freshness_evidence: ambiguousDeal.freshnessEvidence }],
+  });
+  assert.equal(accepted.reconciled, true);
+  const db = new Database(sqlitePath, { readonly: true });
+  t.after(() => db.close());
+  assert.equal(db.prepare("SELECT projection_state FROM deal_hunter_source_freshness_state WHERE source_id='sheet-0'").get().projection_state, 'deferred');
+  assert.equal(db.prepare("SELECT count(*) AS n FROM deal_hunter_freshness_evidence WHERE run_id='deferred-run' AND event_type='accepted_source_record' AND field_key=''").get().n, 2);
+  assert.equal(db.prepare("SELECT identity_exception_id FROM deal_hunter_freshness_evidence WHERE source_record_id='external:DEFER-2' AND event_type='accepted_source_record' AND field_key=''").get().identity_exception_id, 'deferred-exception');
+  assert.equal(db.prepare("SELECT count(*) AS n FROM deal_hunter_opportunity_source_observations WHERE source_id='sheet-0'").get().n, prior.observations.length);
+  assert.equal((await storage.getDealHunterOpportunity('op-deferred-resolved')).first_accepted_at, null);
+  const deferredProof = db.prepare("SELECT id, accepted_at FROM deal_hunter_freshness_evidence WHERE source_record_id='external:DEFER-2' AND event_type='accepted_source_record' AND field_key=''").get();
+  await storage.upsertDealHunterOpportunity({
+    opportunity_id: 'op-deferred-later', created_at: at, updated_at: at,
+    canonical_name: 'Ambiguous Shop', identity_version: 'test', status: 'active', metadata: {},
+  });
+  await storage.markDealHunterOpportunityDiscoveryPending({ opportunityId: 'op-deferred-later', createdAt: at });
+  await storage.upsertDealHunterIdentityException({
+    id: 'deferred-exception', created_at: at, updated_at: at, status: 'resolved',
+    reason: 'ambiguous', evidence_version: 'test', resolved_at: at,
+    resolved_by: 'synthetic-test', resolution_reason: 'proved listing identity',
+    candidate_opportunity_ids: [], metadata: { resolvedOpportunityId: 'op-deferred-later' },
+  });
+  const secondRun = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId: 'resolved-run' });
+  const resolved = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
+    storage, reviewMode: 'full-backfill', run: secondRun,
+    sourceResult: { source: { id: 'sheet-0', required: true, fetched: true,
+      sourceRowCount: 2, rowCount: 2, coverageLimitReached: false },
+    deals: [resolvedDeal, ambiguousDeal] },
+    records: [prior, buildOpportunitySourceObservationSnapshot({
+      opportunityId: 'op-deferred-later', deal: ambiguousDeal, now: at,
+    })],
+  });
+  assert.equal(resolved.reconciled, true);
+  const later = await storage.getDealHunterOpportunity('op-deferred-later');
+  assert.equal(later.first_discovery_evidence_id, deferredProof.id);
+  assert.equal(later.first_accepted_at, deferredProof.accepted_at);
+  assert.equal(later.discovery_revision, 1);
+  assert.equal(db.prepare('SELECT current_canonical_id FROM deal_hunter_freshness_evidence WHERE id = ?').get(deferredProof.id).current_canonical_id, 'op-deferred-later');
+});
+
+test('comparable Sheet price A to B to A to B creates three retained material transitions', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-material-'));
+  const sqlitePath = path.join(directory, 'material.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const at = '2026-09-23T12:00:00.000Z';
+  const opportunityId = 'op-price-transition';
+  await storage.upsertDealHunterOpportunity({ opportunity_id: opportunityId, created_at: at,
+    updated_at: at, canonical_name: 'Price Transition', identity_version: 'test',
+    status: 'active', metadata: {} });
+  await storage.markDealHunterOpportunityDiscoveryPending({ opportunityId, createdAt: at });
+  for (const [index, value] of [100, 120, 100, 120].entries()) {
+    const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId: `price-run-${index}` });
+    const record = { opportunity_id: opportunityId, source_id: 'sheet-0', source_name: 'Synthetic Sheet',
+      source_record_id: 'external:PRICE-1', observations: [{
+        id: 'price-observation', opportunity_id: opportunityId, source_id: 'sheet-0',
+        source_name: 'Synthetic Sheet', source_record_id: 'external:PRICE-1',
+        field: 'asking_price', value: String(value), observed_at: at, created_at: at, updated_at: at,
+      }], freshness_evidence: { askingPrice: { rawHeader: 'Asking Price', rawValue: String(value),
+        metric: 'asking_price', currency: 'USD', period: 'total' } } };
+    const accepted = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
+      storage, reviewMode: 'full-backfill', run,
+      sourceResult: { source: { id: 'sheet-0', required: true, fetched: true,
+        sourceRowCount: 1, rowCount: 1, coverageLimitReached: false },
+      deals: [{ sourceId: 'sheet-0', sourceName: 'Synthetic Sheet', stableExternalId: true, id: 'PRICE-1' }] },
+      records: [record],
+    });
+    assert.equal(accepted.reconciled, true);
+  }
+  const db = new Database(sqlitePath, { readonly: true });
+  t.after(() => db.close());
+  const events = db.prepare("SELECT before_value, after_value, before_evidence_id, after_evidence_id, material_revision FROM deal_hunter_freshness_evidence WHERE event_type='material_change' ORDER BY generation").all();
+  assert.deepEqual(events.map(({ before_value, after_value }) => [before_value, after_value]),
+    [[100, 120], [120, 100], [100, 120]]);
+  assert.deepEqual(events.map((event) => event.material_revision), [1, 2, 3]);
+  assert.equal(events.every((event) => event.before_evidence_id && event.after_evidence_id), true);
+  assert.equal((await storage.getDealHunterOpportunity(opportunityId)).material_revision, 3);
+  const removalRun = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId: 'price-removal' });
+  const removed = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
+    storage, reviewMode: 'full-backfill', run: removalRun,
+    sourceResult: { source: { id: 'sheet-0', required: true, fetched: true,
+      sourceRowCount: 1, rowCount: 1, coverageLimitReached: false },
+    deals: [{ sourceId: 'sheet-0', sourceName: 'Synthetic Sheet', stableExternalId: true, id: 'OTHER' }] },
+    records: [{ opportunity_id: opportunityId, source_id: 'sheet-0', source_name: 'Synthetic Sheet',
+      source_record_id: 'external:OTHER', observations: [{ id: 'other-observation',
+        opportunity_id: opportunityId, source_id: 'sheet-0', source_name: 'Synthetic Sheet',
+        source_record_id: 'external:OTHER', field: 'name', value: 'Price Transition',
+        observed_at: at, created_at: at, updated_at: at }], freshness_evidence: null }],
+  });
+  assert.equal(removed.reconciled, true);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM deal_hunter_opportunity_source_observations WHERE source_id='sheet-0' AND field='asking_price'").get().n, 0);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM deal_hunter_freshness_evidence WHERE event_type='evidence_state_change' AND classification='disappearance'").get().n, 1);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM deal_hunter_freshness_evidence WHERE event_type='material_change'").get().n, 3);
+  assert.equal((await storage.getDealHunterOpportunity(opportunityId)).material_revision, 3);
+});
+
+test('synthetic supported Sheet publication keeps date precision and rejects malformed or future recency', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-publication-'));
+  const sqlitePath = path.join(directory, 'publication.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const at = '2026-09-23T12:00:00.000Z';
+  await storage.upsertDealHunterOpportunity({ opportunity_id: 'op-publication', created_at: at,
+    updated_at: at, canonical_name: 'Publication Fixture', identity_version: 'test',
+    status: 'active', metadata: {} });
+  await storage.markDealHunterOpportunityDiscoveryPending({ opportunityId: 'op-publication', createdAt: at });
+  const db = new Database(sqlitePath, { readonly: true });
+  t.after(() => db.close());
+  for (const [index, rawValue, state] of [
+    [0, '2026-09-22', 'valid'], [1, '2026-02-30', 'invalid'], [2, '2099-01-01', 'future'],
+  ]) {
+    const runId = `publication-${index}`;
+    const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId });
+    const record = { opportunity_id: 'op-publication', source_id: 'sheet-0',
+      source_name: 'Synthetic Sheet', source_record_id: 'external:PUB-1',
+      observations: [{ id: 'pub-observation', opportunity_id: 'op-publication',
+        source_id: 'sheet-0', source_name: 'Synthetic Sheet', source_record_id: 'external:PUB-1',
+        field: 'date_added', value: rawValue, observed_at: at, created_at: at, updated_at: at }],
+      freshness_evidence: { dateAdded: { rawHeader: 'Posted Date', rawValue,
+        precision: 'date', offset: null, meaning: 'listing_publication' } } };
+    const accepted = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
+      storage, reviewMode: 'full-backfill', run,
+      sourceResult: { source: { id: 'sheet-0', required: true, fetched: true,
+        sourceRowCount: 1, rowCount: 1, coverageLimitReached: false },
+      deals: [{ sourceId: 'sheet-0', sourceName: 'Synthetic Sheet', stableExternalId: true, id: 'PUB-1' }] },
+      records: [record],
+    });
+    assert.equal(accepted.reconciled, true);
+    const event = db.prepare("SELECT publication_state, publication_precision, publication_date FROM deal_hunter_freshness_evidence WHERE run_id=? AND event_type='publication_evidence'").get(runId);
+    assert.equal(event.publication_state, state);
+    assert.equal(event.publication_precision, 'date');
+    if (state === 'valid') assert.equal(event.publication_date, rawValue);
+  }
+});
 
 test('source parsing retains bounded date and financial provenance before aliases collapse', () => {
   const [deal] = parseSheetCsvDeals([
@@ -40,6 +208,119 @@ test('source parsing retains bounded date and financial provenance before aliase
   });
   assert.equal(snapshot.freshness_evidence.dateAdded.rawHeader, 'Posted Date');
   assert.equal(snapshot.freshness_evidence.annualProfit.metric, 'unknown');
+});
+
+test('separate identical Deal OS uploads each accept bounded row evidence while a same-run retry is idempotent', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-import-evidence-'));
+  const sqlitePath = path.join(directory, 'imports.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const now = new Date();
+  const input = {
+    fileBuffer: Buffer.from([
+      'Listing ID,Business Name,View Listing URL,Annual Profit,Asking Price,Posted Date',
+      'FL01-1,Freshness Fixture,https://broker.example/fl01-1,450000,800000,2026-09-22',
+    ].join('\n')),
+    fileName: 'fl01.csv', mimeType: 'text/csv', exportedAt: now.toISOString(),
+    scope: 'saved-search', coverageLabel: 'Synthetic freshness upload', expectedRowCount: 1,
+    importedBy: 'synthetic-test', storage, now,
+  };
+  const first = await importDealOsExport(input);
+  assert.equal(first.ok, true);
+  const savedFirst = await storage.getDealHunterDealOsImport(first.import.id);
+  assert.equal(savedFirst.freshness_generation, 1);
+  assert.equal(savedFirst.freshness_projection_state, 'pending');
+  assert.equal(savedFirst.records[0].freshnessEvidence.dateAdded.rawHeader, 'Posted Date');
+  await storage.insertDealHunterDealOsImport(savedFirst);
+  const second = await importDealOsExport(input);
+  assert.equal(second.ok, true);
+  assert.notEqual(first.import.id, second.import.id);
+  const savedSecond = await storage.getDealHunterDealOsImport(second.import.id);
+  assert.equal(savedSecond.freshness_generation, 2);
+  const db = new Database(sqlitePath, { readonly: true });
+  t.after(() => db.close());
+  const events = db.prepare("SELECT * FROM deal_hunter_freshness_evidence WHERE source_id = 'deal-os-export' AND event_type = 'accepted_source_record' AND field_key = '' ORDER BY generation").all();
+  assert.equal(events.length, 2);
+  assert.deepEqual(events.map((event) => event.run_id), [first.import.id, second.import.id]);
+  assert.equal(events.every((event) => event.accepted_at && event.publication_meaning === 'unknown'), true);
+  const failedRun = await storage.allocateDealHunterSourceGeneration({ sourceId: 'deal-os-export', runId: 'fl01-rollback' });
+  await assert.rejects(storage.insertDealHunterDealOsImport({
+    ...savedSecond, id: 'fl01-rollback', accepted_row_count: 2,
+    freshnessRun: failedRun, acceptedRowEvidence: [
+      { sourceRecordId: 'external:SAFE', eventOrdinal: 0, freshnessEvidence: null },
+      { sourceRecordId: `external:${'X'.repeat(201)}`, eventOrdinal: 1, freshnessEvidence: null },
+    ],
+  }), /source-row identity is invalid/);
+  assert.equal(await storage.getDealHunterDealOsImport('fl01-rollback'), null);
+  assert.equal(db.prepare("SELECT count(*) AS n FROM deal_hunter_freshness_evidence WHERE run_id='fl01-rollback'").get().n, 0);
+  assert.equal(db.prepare("SELECT accepted_generation FROM deal_hunter_source_freshness_state WHERE source_id='deal-os-export'").get().accepted_generation, 2);
+});
+
+test('a complete admitted Sheet run creates one prospective discovery and a no-op run preserves its evidence', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-sheet-evidence-'));
+  const sqlitePath = path.join(directory, 'sheet.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const date = new Date().toISOString().slice(0, 10);
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Posted Date,Annual Profit,Annual Revenue,Asking Price,Description',
+    `FL01-SHEET-1,Synthetic Fresh Sheet,https://broker.example/fl01-sheet-1,CA,${date},450000,1200000,800000,Commercial HVAC maintenance company`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  const first = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'synthetic-test' });
+  assert.equal(first.ok, true);
+  const [opportunity] = await storage.listCurrentDealHunterOpportunities({ limit: 10 });
+  assert.equal(opportunity.discovery_state, 'known_prospective');
+  assert.equal(opportunity.discovery_revision, 1);
+  assert.ok(opportunity.first_accepted_at);
+  const firstEvidenceId = opportunity.first_discovery_evidence_id;
+  const second = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'synthetic-test' });
+  assert.equal(second.ok, true);
+  const refreshed = await storage.getDealHunterOpportunity(opportunity.opportunity_id);
+  assert.equal(refreshed.first_accepted_at, opportunity.first_accepted_at);
+  assert.equal(refreshed.first_discovery_evidence_id, firstEvidenceId);
+  assert.equal(refreshed.discovery_revision, 1);
+  const db = new Database(sqlitePath, { readonly: true });
+  t.after(() => db.close());
+  assert.equal(db.prepare("SELECT count(*) AS n FROM deal_hunter_freshness_evidence WHERE source_id = 'sheet-0' AND event_type = 'accepted_source_record' AND field_key = ''").get().n, 1);
+  assert.equal(db.prepare("SELECT accepted_generation FROM deal_hunter_source_freshness_state WHERE source_id = 'sheet-0'").get().accepted_generation, 2);
+});
+
+test('a proven Sheet and Deal OS match binds accepted import evidence to one canonical opportunity', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-fl01-cross-source-'));
+  const sqlitePath = path.join(directory, 'sources.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const now = new Date();
+  const url = 'https://broker.example/fl01-cross-source';
+  sourceCsv = [
+    'Listing ID,Business Name,Listing URL,State,Annual Profit,Annual Revenue,Asking Price,Description',
+    `SHEET-FL01,Cross Source HVAC,${url},CA,450000,1200000,800000,Commercial HVAC maintenance company`,
+  ].join('\n');
+  sourceWorkbook = buildWorkbook([]);
+  const imported = await importDealOsExport({
+    fileBuffer: Buffer.from([
+      'Listing ID,Business Name,View Listing URL,State,Annual Profit,Annual Revenue,Asking Price,Description',
+      `DOS-FL01,Cross Source HVAC,${url},CA,450000,1200000,800000,Commercial HVAC maintenance company`,
+    ].join('\n')),
+    fileName: 'cross-source.csv', exportedAt: now.toISOString(), scope: 'saved-search',
+    coverageLabel: 'Synthetic cross source', expectedRowCount: 1, importedBy: 'synthetic-test', storage, now,
+  });
+  assert.equal(imported.ok, true);
+  const refreshed = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'synthetic-test' });
+  assert.equal(refreshed.ok, true);
+  const opportunities = await storage.listCurrentDealHunterOpportunities({ limit: 10 });
+  assert.equal(opportunities.length, 1);
+  const opportunity = opportunities[0];
+  assert.equal(opportunity.discovery_state, 'known_prospective');
+  const db = new Database(sqlitePath, { readonly: true });
+  t.after(() => db.close());
+  const importEvent = db.prepare("SELECT * FROM deal_hunter_freshness_evidence WHERE run_id = ? AND event_type = 'accepted_source_record' AND field_key = ''").get(imported.import.id);
+  assert.equal(importEvent.current_canonical_id, opportunity.opportunity_id);
+  const current = db.prepare("SELECT * FROM deal_hunter_opportunity_source_observations WHERE source_id = 'deal-os-export' AND opportunity_id = ? LIMIT 1").get(opportunity.opportunity_id);
+  assert.equal(current.accepted_evidence_id, importEvent.id);
+  assert.equal(current.accepted_run_id, imported.import.id);
+  assert.equal((await storage.getDealHunterDealOsImport(imported.import.id)).freshness_projection_state, 'accepted');
 });
 let sourceCsv;
 let sourceWorkbook;

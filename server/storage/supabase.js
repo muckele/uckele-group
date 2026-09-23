@@ -7,7 +7,7 @@ import {
   normalizeOpportunitySourceObservation,
   normalizeOpportunitySourceObservationSnapshot,
 } from '../services/dealHunterOpportunityFacts.js';
-import { consumeCompleteGoogleSheetSourceSnapshotAdmission } from '../services/dealHunterSourceSnapshotAdmission.js';
+import { consumeCompleteGoogleSheetSourceSnapshotAdmission, normalizeCompleteGoogleSheetFreshnessSnapshot } from '../services/dealHunterSourceSnapshotAdmission.js';
 import { requireCanonicalCimRequestId } from '../services/cimRequestIdPolicy.js';
 import { CrmSupersessionUnavailableError } from '../services/crmSubmissionSupersession.js';
 
@@ -2522,15 +2522,43 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return safeRecords;
     },
 
+    async allocateDealHunterSourceGeneration({ sourceId, runId } = {}) {
+      const source = String(sourceId || '').trim();
+      const run = String(runId || '').trim();
+      if (!source || source.length > 160 || !run || run.length > 200) {
+        throw new Error('Freshness source and run identities must be bounded.');
+      }
+      const { data, error } = await client.rpc('allocate_deal_hunter_source_generation', {
+        p_source_id: source, p_run_id: run,
+      });
+      if (error) throw error;
+      return data;
+    },
+
     async insertDealHunterDealOsImport(record) {
+      const { freshnessRun, acceptedRowEvidence, ...importRecord } = record;
       const payload = {
-        ...record,
+        ...importRecord,
         expected_row_count: record.expected_row_count ?? null,
         records: Array.isArray(record.records) ? record.records : [],
         metadata: record.metadata && typeof record.metadata === 'object' && !Array.isArray(record.metadata)
           ? record.metadata
           : {},
       };
+      if (freshnessRun) {
+        if (freshnessRun.sourceId !== 'deal-os-export' || freshnessRun.runId !== record.id
+          || !Number.isSafeInteger(freshnessRun.generation) || freshnessRun.generation < 1
+          || !Array.isArray(acceptedRowEvidence) || acceptedRowEvidence.length !== Number(record.accepted_row_count)) {
+          throw new Error('Deal OS freshness run does not match the accepted import rows.');
+        }
+        const { data, error } = await client.rpc('insert_deal_hunter_deal_os_import_freshness_v1', {
+          p_import: payload,
+          p_rows: acceptedRowEvidence,
+          p_generation: freshnessRun.generation,
+        });
+        if (error) throw error;
+        return normalizeDealHunterDealOsImportRow(data);
+      }
       const { data, error } = await client.from('deal_hunter_deal_os_imports').insert(payload).select().single();
       if (error) throw error;
       return normalizeDealHunterDealOsImportRow(data);
@@ -3321,6 +3349,15 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       };
     },
 
+    async markDealHunterOpportunityDiscoveryPending({ opportunityId, createdAt } = {}) {
+      const { data, error } = await client.rpc('mark_deal_hunter_opportunity_discovery_pending', {
+        p_opportunity_id: String(opportunityId || '').trim(),
+        p_created_at: String(createdAt || '').trim(),
+      });
+      if (error) throw error;
+      return normalizeDealHunterOpportunityRow(data);
+    },
+
     async upsertDealHunterOpportunity(record = {}) {
       const payload = {
         ...record,
@@ -3379,6 +3416,27 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return (data || []).map(normalizeDealHunterOpportunitySourceObservationRow);
     },
 
+    async bindAcceptedDealHunterFreshness({ importId, opportunityId, sourceRecordId, expectedGeneration, snapshot } = {}) {
+      const normalizedSnapshot = normalizeOpportunitySourceObservationSnapshot(snapshot);
+      const runId = String(importId || '').trim();
+      const canonicalId = String(opportunityId || '').trim();
+      const recordId = String(sourceRecordId || '').trim();
+      if (!runId || !canonicalId || !recordId || normalizedSnapshot.source_id !== 'deal-os-export'
+        || normalizedSnapshot.opportunity_id !== canonicalId || normalizedSnapshot.source_record_id !== recordId
+        || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
+        throw new Error('Deal OS freshness binding identity does not match the accepted source record.');
+      }
+      const { data, error } = await client.rpc('bind_accepted_deal_hunter_freshness_v1', {
+        p_import_id: runId,
+        p_opportunity_id: canonicalId,
+        p_source_record_id: recordId,
+        p_expected_generation: expectedGeneration,
+        p_snapshot: normalizedSnapshot,
+      });
+      if (error) throw error;
+      return data;
+    },
+
     async upsertDealHunterOpportunitySourceObservation(observation = {}) {
       const normalizedObservation = normalizeOpportunitySourceObservation(observation);
       const { data, error } = await client
@@ -3426,11 +3484,21 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         admission: snapshot.admission,
         snapshot,
       });
-      const normalizedSnapshot = normalizeDealHunterSourceSnapshot(snapshot);
+      const normalizedSnapshot = normalizeCompleteGoogleSheetFreshnessSnapshot(snapshot);
+      if (admission.run) {
+        const { data, error } = await client.rpc('accept_admitted_complete_google_sheet_freshness_v1', {
+          p_admission: admission,
+          p_records_text: JSON.stringify(normalizedSnapshot.unresolved.length
+            ? { records: normalizedSnapshot.records, unresolved: normalizedSnapshot.unresolved }
+            : normalizedSnapshot.records),
+        });
+        if (error) throw error;
+        return data;
+      }
       const { data, error } = await client
         .rpc('replace_admitted_complete_google_sheet_source_snapshot', {
           p_admission: admission,
-          p_records: normalizedSnapshot.records,
+          p_records: normalizedSnapshot.records.map(({ freshness_evidence: _freshnessEvidence, ...record }) => record),
         });
       if (error) throw error;
       return (data || []).map(normalizeDealHunterOpportunitySourceObservationRow);

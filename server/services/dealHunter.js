@@ -2201,6 +2201,7 @@ function canonicalDealOsRecord(rawRow = {}) {
     listingSource: deal.listingSource,
     dateAdded: deal.dateAdded,
     lastUpdated: deal.lastUpdated,
+    freshnessEvidence: deal.freshnessEvidence,
   };
 }
 
@@ -2275,6 +2276,7 @@ function hydrateDealOsRecord(record = {}) {
 
   return {
     ...deal,
+    freshnessEvidence: record.freshnessEvidence || deal.freshnessEvidence,
     brokerContacts,
     brokerEmail: preferred?.email || deal.brokerEmail,
     brokerName: preferred?.name || deal.brokerName,
@@ -2497,6 +2499,7 @@ export async function importDealOsExport({
       identity,
       stableId: record.stableId || '',
       listingIdentity: normalizeListingIdentity(record.listingUrl),
+      freshnessEvidence: record.freshnessEvidence,
     });
   });
 
@@ -2561,7 +2564,20 @@ export async function importDealOsExport({
       fieldCoverage,
     },
   };
-  const saved = await storage.insertDealHunterDealOsImport(record);
+  const run = typeof storage.allocateDealHunterSourceGeneration === 'function'
+    ? await storage.allocateDealHunterSourceGeneration({ sourceId: dealOsSourceId, runId: record.id })
+    : null;
+  const acceptedRowEvidence = acceptedRows.map((row, eventOrdinal) => ({
+    sourceRecordId: getOpportunitySourceObservationRecordId(
+      hydrateDealOsRecord(records[canonicalIndexByIdentity.get(row.identity)]),
+    ),
+    eventOrdinal,
+    freshnessEvidence: row.freshnessEvidence,
+  }));
+  const saved = await storage.insertDealHunterDealOsImport({
+    ...record,
+    ...(run ? { freshnessRun: run, acceptedRowEvidence } : {}),
+  });
   return { ok: true, status: 201, import: publicDealOsImport(saved || record) };
 }
 
@@ -2620,11 +2636,16 @@ async function loadDealOsExportSource(config, storage, importId = '') {
 
   return {
     source,
-    deals: source.fetched ? records.map(hydrateDealOsRecord) : [],
+    deals: source.fetched ? records.map((record) => ({
+      ...hydrateDealOsRecord(record),
+      ...(imported.freshness_generation ? { freshnessRun: {
+        sourceId: dealOsSourceId, runId: imported.id, generation: imported.freshness_generation,
+      } } : {}),
+    })) : [],
   };
 }
 
-async function collectSources(config, storage, { dealOsImportId = '' } = {}) {
+async function collectSources(config, storage, { dealOsImportId = '', freshnessWrite = false } = {}) {
   const sourceResults = [];
 
   let dealOsSource = null;
@@ -2672,6 +2693,10 @@ async function collectSources(config, storage, { dealOsImportId = '' } = {}) {
 
   for (const [index, url] of config.dealHunter.sheetCsvUrls.entries()) {
     try {
+      const sourceId = `sheet-${index}`;
+      const run = freshnessWrite && typeof storage.allocateDealHunterSourceGeneration === 'function'
+        ? await storage.allocateDealHunterSourceGeneration({ sourceId, runId: randomUUID() })
+        : null;
       const sheetResult = await fetchSheetCsvDeals(url, index, config);
       sourceResults.push({
         ...sheetResult,
@@ -2679,6 +2704,7 @@ async function collectSources(config, storage, { dealOsImportId = '' } = {}) {
           ...sheetResult.source,
           required: true,
           sourceRole: 'required-primary',
+          ...(run ? { freshnessRun: run } : {}),
         },
       });
     } catch (error) {
@@ -2808,7 +2834,7 @@ function sourceObservationDeal(deal = {}) {
     'name', 'industry', 'description', 'city', 'county', 'state', 'country', 'location',
     'annualProfit', 'annualRevenue', 'askingPrice', 'profitMultiple', 'netMargin', 'yearsEstablished',
     'remoteFlag', 'franchiseFlag', 'fiveYearsFlag', 'brokerName', 'brokerCompany', 'brokerContact', 'brokerPhone',
-    'brokerEmail', 'listingUrl', 'listingSource', 'dateAdded', 'lastUpdated',
+    'brokerEmail', 'listingUrl', 'listingSource', 'dateAdded', 'lastUpdated', 'freshnessEvidence', 'freshnessRun',
   ];
   return Object.fromEntries(fields.map((field) => [field, deal[field]]));
 }
@@ -5775,9 +5801,11 @@ function buildCompleteSheetObservationScopes(sourceResults = [], reviewMode = 'd
       sourceId,
       sourceName: '',
       sourceResult: result,
+      freshnessRun: source.freshnessRun || null,
       expectedRecordIds: new Set(),
       representedRecordIds: new Set(),
       recordsByOpportunity: new Map(),
+      unresolved: [],
       complete: true,
       identityComplete: true,
     };
@@ -5866,6 +5894,10 @@ async function attachCanonicalOpportunityIdentities(
       storage,
       actor: 'deal-hunter-review',
       candidateOpportunities: candidates,
+      freshnessPending: sourceObservationDealsForDeal(deal).some((sourceDeal) => (
+        Boolean(sourceDeal?.freshnessRun)
+          || Boolean(deferredSourceScopes.get(String(sourceDeal?.sourceId || '').trim())?.freshnessRun)
+      )),
     });
     if (resolution.opportunity) {
       const candidateIndex = candidates.findIndex((item) => item.opportunity_id === resolution.opportunity.opportunity_id);
@@ -5877,12 +5909,28 @@ async function attachCanonicalOpportunityIdentities(
       if (!resolution.ok || !resolution.opportunityId) {
         for (const sourceDeal of sourceDeals) {
           const scope = deferredSourceScopes.get(String(sourceDeal?.sourceId || '').trim());
-          if (scope) scope.complete = false;
+          if (!scope) continue;
+          let sourceRecordId = '';
+          try { sourceRecordId = getOpportunitySourceObservationRecordId(sourceDeal); } catch { /* fail closed below */ }
+          if (!sourceRecordId || !scope.expectedRecordIds.has(sourceRecordId)
+            || scope.representedRecordIds.has(sourceRecordId)
+            || !resolution.identityException?.id) {
+            scope.complete = false;
+            continue;
+          }
+          scope.representedRecordIds.add(sourceRecordId);
+          scope.unresolved.push({
+            source_record_id: sourceRecordId,
+            identity_exception_id: resolution.identityException.id,
+            freshness_evidence: sourceDeal.freshnessEvidence || null,
+          });
+          scope.identityComplete = false;
         }
       } else {
         const now = new Date().toISOString();
         for (const sourceDeal of sourceDeals) {
           const snapshot = buildOpportunitySourceObservationSnapshot({ opportunityId: resolution.opportunityId, deal: sourceDeal, now });
+          if (snapshot && sourceDeal.freshnessRun) snapshot.freshness_run = sourceDeal.freshnessRun;
           const completeScope = deferredSourceScopes.get(String(sourceDeal?.sourceId || '').trim());
           if (!snapshot) {
             if (completeScope) completeScope.complete = false;
@@ -5925,7 +5973,18 @@ async function attachCanonicalOpportunityIdentities(
 
   if (!readOnly && typeof storage.replaceDealHunterOpportunitySourceObservationSnapshot === 'function') {
     for (const snapshot of perRecordSnapshots.values()) {
-      await storage.replaceDealHunterOpportunitySourceObservationSnapshot(snapshot);
+      if (snapshot.source_id === dealOsSourceId && snapshot.freshness_run
+        && typeof storage.bindAcceptedDealHunterFreshness === 'function') {
+        await storage.bindAcceptedDealHunterFreshness({
+          importId: snapshot.freshness_run.runId,
+          opportunityId: snapshot.opportunity_id,
+          sourceRecordId: snapshot.source_record_id,
+          expectedGeneration: snapshot.freshness_run.generation,
+          snapshot,
+        });
+      } else {
+        await storage.replaceDealHunterOpportunitySourceObservationSnapshot(snapshot);
+      }
     }
   }
   if (!readOnly && typeof storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot === 'function') {
@@ -5941,7 +6000,7 @@ async function attachCanonicalOpportunityIdentities(
         .every((sourceRecordId) => scope.representedRecordIds.has(sourceRecordId));
       if (!everyExpectedRecordIsRepresented) continue;
       const records = [...scope.recordsByOpportunity.values()].flat();
-      if (records.length !== scope.expectedRecordIds.size) continue;
+      if (records.length + scope.unresolved.length !== scope.expectedRecordIds.size) continue;
       const snapshot = {
         source_id: scope.sourceId,
         source_name: scope.sourceName,
@@ -5952,6 +6011,8 @@ async function attachCanonicalOpportunityIdentities(
         reviewMode: 'full-backfill',
         sourceResult: scope.sourceResult,
         records: snapshot.records,
+        unresolved: scope.unresolved,
+        run: scope.freshnessRun,
       });
     }
   }
@@ -7719,7 +7780,10 @@ async function buildDailyDealReview({
   const config = getConfig();
   const normalizedReviewMode = normalizeDealHunterReviewMode(reviewMode);
   const generatedAt = new Date().toISOString();
-  const sourceResults = await collectSources(config, storage, { dealOsImportId });
+  const sourceResults = await collectSources(config, storage, {
+    dealOsImportId,
+    freshnessWrite: !readOnly && normalizedReviewMode === 'full-backfill',
+  });
   const coverage = buildDealHunterCoverage(config, sourceResults);
   const sourceOnlyReview = {
     generatedAt,

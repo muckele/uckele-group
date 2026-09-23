@@ -195,7 +195,10 @@ function normalizeFreshnessClaim(claim, kind) {
   if (kind === 'date') {
     const precision = normalizeText(claim.precision, 'Freshness date precision', { maxLength: 16 });
     const meaning = normalizeText(claim.meaning, 'Freshness date meaning', { maxLength: 32 });
-    if (!['date', 'datetime', 'unknown'].includes(precision) || meaning !== 'unknown') {
+    // The bounded internal shape can carry a supported mapping. Production
+    // parsers still emit unknown until a source-specific contract is proven.
+    if (!['date', 'datetime', 'unknown'].includes(precision)
+      || !['unknown', 'listing_publication'].includes(meaning)) {
       throw new Error('Unsupported freshness publication interpretation.');
     }
     const offset = normalizeText(claim.offset, 'Freshness date offset', { required: false, maxLength: 16 });

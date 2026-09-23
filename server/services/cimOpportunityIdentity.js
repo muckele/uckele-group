@@ -431,6 +431,7 @@ export async function resolveDealHunterOpportunity({
   actor = 'system',
   allowCreate = true,
   candidateOpportunities = null,
+  freshnessPending = false,
 } = {}) {
   if (!deal || !identityStorageAvailable(storage)) {
     return { ok: false, status: 'unavailable', error: 'Canonical Deal Hunter identity storage is unavailable.' };
@@ -548,7 +549,10 @@ export async function resolveDealHunterOpportunity({
   }
 
   const opportunityId = `opp_${randomUUID()}`;
-  const proposedOpportunity = opportunityRecord(deal, opportunityId, now);
+  const proposedOpportunity = {
+    ...opportunityRecord(deal, opportunityId, now),
+    ...(freshnessPending ? { discovery_state: 'pending' } : {}),
+  };
   const aliasRecords = aliasRecordsForOpportunity(proposedOpportunity, aliases, {
     actor,
     method: 'new-opportunity',
@@ -571,6 +575,15 @@ export async function resolveDealHunterOpportunity({
     });
   }
   let opportunity = acquired.opportunity;
+  if (acquired.created && freshnessPending) {
+    if (typeof storage.markDealHunterOpportunityDiscoveryPending !== 'function') {
+      throw new Error('Freshness-aware identity creation requires guarded pending state.');
+    }
+    opportunity = await storage.markDealHunterOpportunityDiscoveryPending({
+      opportunityId: opportunity.opportunity_id,
+      createdAt: proposedOpportunity.created_at,
+    });
+  }
   if (!acquired.created) {
     opportunity = await storage.upsertDealHunterOpportunity(
       opportunityRecord(deal, opportunity.opportunity_id, now, opportunity),
