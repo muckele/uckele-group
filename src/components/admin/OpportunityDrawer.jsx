@@ -151,6 +151,7 @@ export default function OpportunityDrawer({
   const crmCimRef = useRef(null);
   const opportunity = detail?.opportunity;
   const name = opportunity?.name || 'Opportunity detail';
+  const linkedCrmId = detail?.crmSummary?.submission?.id;
   const safeUrls = [...new Set((detail?.listingUrls || []).map(safeListingUrl).filter(Boolean))];
   const actionable = Boolean(onAction && opportunity && !opportunity.dismissed && !readOnly);
   const strengths = (detail?.score?.summary?.strengths || []).filter(hasValue);
@@ -227,6 +228,7 @@ export default function OpportunityDrawer({
               {opportunity.dismissed ? <p className="mt-3 rounded-xl bg-red-50 p-3 text-sm font-semibold text-red-800">Passed: {formatLabel(opportunity.dismissedReason || 'dismissed')}</p> : null}
               <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} pending={pending} /></div>
               {passOpen && actionable ? <div className="mt-4"><PassForm error="" name={name} onCancel={() => setPassOpen(false)} onSubmit={(payload) => onAction('pass', payload)} pending={pending} /></div> : null}
+              {linkedCrmId ? <a className={`${secondaryButton} mt-4 gap-2`} href={`/admin/crm/${encodeURIComponent(linkedCrmId)}`}><ExternalLink aria-hidden="true" className="h-4 w-4" />Open linked CRM record</a> : null}
               <div className="mt-4"><BrokerMaterialsCard
                 brokerMaterials={detail.brokerMaterials}
                 businessName={name}

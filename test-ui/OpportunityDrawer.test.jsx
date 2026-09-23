@@ -143,6 +143,17 @@ afterEach(() => {
 });
 
 describe('Opportunity drawer', () => {
+  test('links a current CRM record to its existing conversation and documents without inventing a link for an unlinked opportunity', () => {
+    const linked = detailFixture();
+    render(<OpportunityDrawer detail={linked} onClose={vi.fn()} />);
+    expect(screen.getByRole('link', { name: 'Open linked CRM record' }))
+      .toHaveAttribute('href', '/admin/crm/crm-1');
+
+    cleanup();
+    render(<OpportunityDrawer detail={detailFixture({ crmSummary: { submission: null, communications: [], factObservations: [], conflicts: [] } })} onClose={vi.fn()} />);
+    expect(screen.queryByRole('link', { name: 'Open linked CRM record' })).not.toBeInTheDocument();
+  });
+
   test('consolidates the record into the exact acquisition sections with safe provenance-aware content', () => {
     render(<OpportunityDrawer detail={detailFixture()} onClose={vi.fn()} />);
 
