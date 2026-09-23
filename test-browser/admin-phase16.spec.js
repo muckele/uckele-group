@@ -2634,6 +2634,57 @@ test('Request Broker Materials desktop review sends the exact approved proposal 
   expectBrokerRouteAuditClean(state);
 });
 
+test('Acquisition Inbox exposes the linked CRM record from a broker-response opportunity on desktop and mobile', async ({ page }, testInfo) => {
+  const state = await installPhase1Fixture(page);
+  markBrokerOpportunityPursued(state);
+  state.brokerMaterialsByOpportunity['opp-cascade'].existingRequest = phase3ExistingRequest({
+    followUps: phase3FollowUps({ state: 'closed', terminalReason: 'reply_received', currentFollowUpNumber: null, nextFollowUpAt: '' }),
+  });
+  const crmId = 'crm-opp-cascade';
+  await page.route(`**/api/admin/submissions/${crmId}`, (route) => fulfillPhase1Json(route, {
+    success: true,
+    submission: {
+      id: crmId,
+      company: 'Cascade Field Compliance',
+      status: 'review',
+      created_at: '2026-09-14T12:00:00.000Z',
+      updated_at: '2026-09-14T12:00:00.000Z',
+      metadata: {},
+      secure_documents: [{ id: 'synthetic-document', original_name: 'synthetic-teaser.pdf', document_type: 'teaser' }],
+    },
+  }));
+  await page.route(`**/api/admin/submissions/${crmId}/activity`, (route) => fulfillPhase1Json(route, { success: true, events: [] }));
+  await page.route(`**/api/admin/submissions/${crmId}/communications?*`, (route) => fulfillPhase1Json(route, {
+    success: true,
+    rows: [{ id: 'synthetic-reply', direction: 'inbound', channel: 'email', subject: 'NDA prerequisite', body_text: 'Please review the NDA first.', occurred_at: '2026-09-14T12:00:00.000Z' }],
+    total: 1,
+    page: 1,
+    pageSize: 25,
+  }));
+
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const { dialog } = await openBrokerOpportunity(page);
+  const crmLink = dialog.getByRole('link', { name: 'Open linked CRM record' });
+  await expect(crmLink).toHaveAttribute('href', '/admin/crm/crm-opp-cascade');
+  await expect(crmLink).toBeVisible();
+  await crmLink.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath('owner-flow-linked-crm-desktop.png'), fullPage: false });
+
+  await page.setViewportSize({ width: 390, height: 844 });
+  await crmLink.scrollIntoViewIfNeeded();
+  await expect(crmLink).toBeVisible();
+  const box = await crmLink.boundingBox();
+  expect(box.x).toBeGreaterThanOrEqual(0);
+  expect(box.x + box.width).toBeLessThanOrEqual(390);
+  await page.screenshot({ path: testInfo.outputPath('owner-flow-linked-crm-mobile.png'), fullPage: false });
+  await crmLink.click();
+  await expect(page).toHaveURL(`/admin/crm/${crmId}`);
+  await expect(page.getByRole('heading', { name: 'CRM record detail', level: 1 })).toBeVisible();
+  await expect(page.getByText('Please review the NDA first.')).toBeVisible();
+  await expect(page.getByText('synthetic-teaser.pdf')).toBeVisible();
+  expectBrokerRouteAuditClean(state);
+});
+
 test('Request Broker Materials keeps global-pause review available while disabling approval with a reason', async ({ page }) => {
   const state = await installPhase1Fixture(page);
   markBrokerOpportunityPursued(state);
