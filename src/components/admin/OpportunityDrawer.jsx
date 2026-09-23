@@ -69,7 +69,7 @@ function MissingInformation({ fields }) {
   return <section aria-label="Missing Information" className="rounded-xl border border-amber-200 bg-amber-50 p-4"><h4 className="text-sm font-semibold text-amber-950">Missing Information</h4><div className="mt-3 grid gap-2 sm:grid-cols-2">{fields.map((field) => <div className="flex items-center justify-between gap-3 rounded-lg bg-white/70 px-3 py-2 text-sm" key={field}><span className="font-medium text-ink">{missingLabels[field] || formatLabel(field)}</span><span className="text-amber-800">Not provided</span></div>)}</div></section>;
 }
 
-export function PassForm({ error = '', initialFocusRef, name, onCancel, onSubmit, pending = false }) {
+export function PassForm({ error = '', initialFocusRef, name, onCancel, onSubmit, pending = false, submitDisabled = false }) {
   const [draft, setDraft] = useState({ reason: '', note: '' });
   function submit(event) {
     event.preventDefault();
@@ -84,7 +84,7 @@ export function PassForm({ error = '', initialFocusRef, name, onCancel, onSubmit
       {error ? <p className="mt-3 rounded-lg border border-red-200 bg-white/75 p-3 text-sm text-red-800" role="alert">{error}</p> : null}
       <label className="mt-3 block text-xs font-semibold text-ink/62">Pass reason<input aria-label="Pass reason" className="form-control mt-1" maxLength={80} onChange={(event) => setDraft((current) => ({ ...current, reason: event.target.value }))} ref={initialFocusRef} required value={draft.reason} /></label>
       <label className="mt-3 block text-xs font-semibold text-ink/62">Pass note (optional)<textarea aria-label="Pass note (optional)" className="form-control mt-1 min-h-24" maxLength={2000} onChange={(event) => setDraft((current) => ({ ...current, note: event.target.value }))} value={draft.note} /></label>
-      <div className="mt-3 flex flex-wrap gap-2"><button className={`${secondaryButton} text-red-700`} disabled={pending || !draft.reason.trim()} type="submit">Confirm Pass</button>{onCancel ? <button className={secondaryButton} disabled={pending} onClick={onCancel} type="button">Cancel</button> : null}</div>
+      <div className="mt-3 flex flex-wrap gap-2"><button className={`${secondaryButton} text-red-700`} disabled={pending || submitDisabled || !draft.reason.trim()} type="submit">Confirm Pass</button>{onCancel ? <button className={secondaryButton} disabled={pending} onClick={onCancel} type="button">Cancel</button> : null}</div>
     </form>
   );
 }
@@ -139,7 +139,7 @@ function conflictKey(observation) {
 }
 
 export default function OpportunityDrawer({
-  brokerMaterialsState = {}, detail, error = '', focusGuardRef, followUpState = {}, loading = false, mutationError = '', onAction,
+  actionsBlocked = false, brokerMaterialsState = {}, detail, error = '', focusGuardRef, followUpState = {}, loading = false, mutationError = '', onAction,
   onBrokerMaterialsApprove, onBrokerMaterialsCheckStatus, onBrokerMaterialsInvalidate, onBrokerMaterialsPrepare,
   onClose, onFollowUpApprove, onFollowUpCheckStatus, onFollowUpCloseReview, onFollowUpInvalidate,
   onFollowUpPrepare, onFollowUpStart, onFollowUpStop, onRetry, onSaveFact, pending = false, readOnly = false,
@@ -225,9 +225,12 @@ export default function OpportunityDrawer({
                 ['Evidence', `${opportunity.missingEvidenceCount} missing evidence · ${opportunity.contradictionCount} contradiction${opportunity.contradictionCount === 1 ? '' : 's'}`],
               ].map(([label, value]) => <div className="rounded-xl bg-fog/70 p-3" key={label}><p className="text-xs text-ink/48">{label}</p><p className="mt-1 text-sm font-semibold text-ink">{value}</p></div>)}</div>
               {opportunity.observationFreshness ? <p className="mt-3 text-xs text-ink/55">Observed {formatDate(opportunity.observationFreshness)}{opportunity.scoredAt ? ` · Scored ${formatDate(opportunity.scoredAt)}` : ''}{opportunity.rulesVersion ? ` · ${opportunity.rulesVersion}` : ''}</p> : null}
+              {opportunity.freshness?.latestAcceptedObservationAt ? <p className="mt-1 text-xs text-ink/65">Latest accepted by UG {formatDate(opportunity.freshness.latestAcceptedObservationAt)}</p> : null}
+              {opportunity.freshness ? <div className="mt-3 rounded-xl border border-line bg-fog/60 p-3 text-sm text-ink/70"><h4 className="font-semibold text-ink">Discovery and review</h4><p className="mt-1">{opportunity.freshness.firstAcceptedAt ? `First accepted by UG ${formatDate(opportunity.freshness.firstAcceptedAt)}.` : 'First seen date unknown for this existing record.'} {opportunity.freshness.materialRevision > opportunity.freshness.reviewedMaterialRevision ? 'Supported material change awaits review.' : ''}</p><p className="mt-1 text-xs">Discovery version {opportunity.freshness.discoveryRevision}, reviewed {opportunity.freshness.reviewedDiscoveryRevision} · Material version {opportunity.freshness.materialRevision}, reviewed {opportunity.freshness.reviewedMaterialRevision}</p>{opportunity.freshness.publicationClaims?.length ? <ul className="mt-2 space-y-1 text-xs">{opportunity.freshness.publicationClaims.map((claim, index) => <li key={`${claim.source}-${index}`}>Source publication claim: {claim.source || 'Source'} · {claim.rawValue || 'Unknown date'} · {formatLabel(claim.precision)} precision</li>)}</ul> : <p className="mt-2 text-xs">Listing age unknown: no supported publication claim is available.</p>}{!linkedCrmId ? <p className="mt-2 font-semibold text-amber-900">CRM handoff prerequisite: this opportunity is not linked to a CRM record. Create or link one through the existing workflow before outreach.</p> : null}</div> : null}
+              {opportunity.freshness?.materialChange && Number.isFinite(opportunity.freshness.materialChange.beforeValue) && Number.isFinite(opportunity.freshness.materialChange.afterValue) ? <p className="mt-3 rounded-xl bg-violet-50 p-3 text-sm text-violet-900">{formatLabel(opportunity.freshness.materialChange.field)} changed from {opportunity.freshness.materialChange.beforeValue} to {opportunity.freshness.materialChange.afterValue}{opportunity.freshness.materialChange.currency ? ` ${opportunity.freshness.materialChange.currency}` : ''} · {opportunity.freshness.materialChange.source || 'Accepted source'}</p> : null}
               {opportunity.dismissed ? <p className="mt-3 rounded-xl bg-red-50 p-3 text-sm font-semibold text-red-800">Passed: {formatLabel(opportunity.dismissedReason || 'dismissed')}</p> : null}
-              <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} pending={pending} /></div>
-              {passOpen && actionable ? <div className="mt-4"><PassForm error="" name={name} onCancel={() => setPassOpen(false)} onSubmit={(payload) => onAction('pass', payload)} pending={pending} /></div> : null}
+              <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} pending={pending || actionsBlocked} /></div>
+              {passOpen && actionable ? <div className="mt-4"><PassForm error="" name={name} onCancel={() => setPassOpen(false)} onSubmit={(payload) => onAction('pass', payload)} pending={pending} submitDisabled={actionsBlocked} /></div> : null}
               {linkedCrmId ? <a className={`${secondaryButton} mt-4 gap-2`} href={`/admin/crm/${encodeURIComponent(linkedCrmId)}`}><ExternalLink aria-hidden="true" className="h-4 w-4" />Open linked CRM record</a> : null}
               <div className="mt-4"><BrokerMaterialsCard
                 brokerMaterials={detail.brokerMaterials}

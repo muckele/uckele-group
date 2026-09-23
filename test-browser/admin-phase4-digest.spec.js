@@ -431,10 +431,11 @@ async function expectBriefingCounts(page) {
   }
 }
 
-test('healthy administrator sees the server briefing above usable filters and drawer at desktop and mobile widths', async ({ page }) => {
+test('healthy administrator can reach the legacy briefing and drawer at desktop and mobile widths', async ({ page }) => {
   const state = await installFixture(page);
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto('/admin/deal-hunter');
+  await page.getByRole('tab', { name: 'Needs Review' }).click();
 
   const briefing = page.getByRole('region', { name: 'Morning briefing' });
   const filters = page.getByRole('searchbox', { name: 'Search opportunities' });
@@ -444,7 +445,6 @@ test('healthy administrator sees the server briefing above usable filters and dr
     /Alpha Fire Systems/,
     /Beta Safety Services/,
   ]);
-  expect(await briefing.evaluate((node) => Boolean(node.compareDocumentPosition(document.querySelector('[aria-label="Search opportunities"]')) & Node.DOCUMENT_POSITION_FOLLOWING))).toBe(true);
   await expect(filters).toBeVisible();
   await page.getByRole('button', { name: 'Open Alpha Fire Systems' }).click();
   await expect(page.getByRole('dialog', { name: 'Alpha Fire Systems' })).toBeVisible();
@@ -452,6 +452,7 @@ test('healthy administrator sees the server briefing above usable filters and dr
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.reload();
+  await page.getByRole('tab', { name: 'Needs Review' }).click();
   await expect(briefing).toBeVisible();
   await expectBriefingCounts(page);
   await expect(filters).toBeVisible();
@@ -463,6 +464,7 @@ test('healthy administrator sees the server briefing above usable filters and dr
 test('optional Deal OS degradation stays bounded and leaves primary-backed review usable', async ({ page }) => {
   const state = await installFixture(page, { sourceMode: 'optional-degraded' });
   await page.goto('/admin/deal-hunter');
+  await page.getByRole('tab', { name: 'Needs Review' }).click();
 
   const briefing = page.getByRole('region', { name: 'Morning briefing' });
   await expectBriefingCounts(page);
@@ -479,6 +481,7 @@ test('optional Deal OS degradation stays bounded and leaves primary-backed revie
 test('required source failure suppresses current authority, rejects direct mutation, and recovers only after an authoritative reload', async ({ page }) => {
   const state = await installFixture(page, { sourceMode: 'required-failure' });
   await page.goto('/admin/deal-hunter');
+  await page.getByRole('tab', { name: 'Needs Review' }).click();
 
   const briefing = page.getByRole('region', { name: 'Morning briefing' });
   await expect(briefing.getByText('ACTION REQUIRED', { exact: true })).toBeVisible();
@@ -503,6 +506,7 @@ test('required source failure suppresses current authority, rejects direct mutat
 
   state.sourceMode = 'healthy';
   await page.reload();
+  await page.getByRole('tab', { name: 'Needs Review' }).click();
   await expect(briefing.getByText('ACTION REQUIRED', { exact: true })).toHaveCount(0);
   await expectBriefingCounts(page);
   await expect(page.getByRole('button', { name: 'Watch Alpha Fire Systems' })).toBeEnabled();
