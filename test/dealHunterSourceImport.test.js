@@ -181,7 +181,9 @@ test('synthetic supported Sheet publication keeps date precision and rejects mal
   const sqlitePath = path.join(directory, 'publication.sqlite');
   const storage = createSqliteStorage({ storage: { sqlitePath } });
   t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
-  const at = '2026-09-23T12:00:00.000Z';
+  const at = new Date().toISOString();
+  const recentPublicationDate = new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10);
+  const peerPublicationDate = new Date(Date.now() - 4 * 86_400_000).toISOString().slice(0, 10);
   await storage.upsertDealHunterOpportunity({ opportunity_id: 'op-publication', created_at: at,
     updated_at: at, canonical_name: 'Publication Fixture', identity_version: 'test',
     status: 'active', metadata: {} });
@@ -195,7 +197,7 @@ test('synthetic supported Sheet publication keeps date precision and rejects mal
     VALUES ('op-publication', ?, ?, 'op-publication', 'Publication Fixture', 90,
       'high', 'publication-score', 'test', 'test', 'test', 'test', 1)`).run(at, at);
   for (const [index, rawValue, state] of [
-    [0, '2026-09-22', 'valid'], [1, '2026-02-30', 'invalid'], [2, '2099-01-01', 'future'],
+    [0, recentPublicationDate, 'valid'], [1, '2026-02-30', 'invalid'], [2, '2099-01-01', 'future'],
   ]) {
     const runId = `publication-${index}`;
     const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId });
@@ -218,7 +220,7 @@ test('synthetic supported Sheet publication keeps date precision and rejects mal
     assert.equal(event.publication_state, state);
     assert.equal(event.publication_precision, 'date');
     if (state === 'valid') assert.equal(event.publication_date, rawValue);
-    const inbox = await storage.listDealHunterFreshInbox({ area: 'new-important', asOf: at });
+    const inbox = await storage.listDealHunterFreshInbox({ area: 'new-important', asOf: new Date().toISOString() });
     assert.equal(inbox.areas[0].rows[0].recently_listed, state === 'valid');
     assert.equal(inbox.areas[0].rows[0].age_unknown, state !== 'valid');
     if (index === 0) {
@@ -234,15 +236,15 @@ test('synthetic supported Sheet publication keeps date precision and rejects mal
           publication_date, publication_precision, publication_state)
         VALUES ('publication-peer-date', 'synthetic-peer', 'Synthetic peer',
           'external:PEER', 'publication-peer-run', 1, 'publication_evidence',
-          'date_added', 'op-publication', 'listing_publication', '2026-09-20',
+          'date_added', 'op-publication', 'listing_publication', '${peerPublicationDate}',
           'date', 'valid')`).run();
       db.prepare(`INSERT INTO deal_hunter_opportunity_source_observations
         (id, opportunity_id, source_id, source_name, source_record_id, field,
           value, observed_at, created_at, updated_at, accepted_evidence_id)
         VALUES ('publication-peer-observation', 'op-publication', 'synthetic-peer',
-          'Synthetic peer', 'external:PEER', 'date_added', '2026-09-20',
+          'Synthetic peer', 'external:PEER', 'date_added', '${peerPublicationDate}',
           ?, ?, ?, 'publication-peer-core')`).run(at, at, at);
-      const conflict = await storage.listDealHunterFreshInbox({ area: 'new-important', asOf: at });
+      const conflict = await storage.listDealHunterFreshInbox({ area: 'new-important', asOf: new Date().toISOString() });
       assert.equal(conflict.areas[0].rows[0].recently_listed, false);
       assert.equal(conflict.areas[0].rows[0].age_unknown, true);
     }
