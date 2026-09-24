@@ -1554,7 +1554,12 @@ export function createApp({
         } else {
           // Persist scores for the listings this import produced. Fingerprint
           // gating means unchanged opportunities cost nothing.
-          scoreRefresh = await refreshOpportunityScores({ deals: reviewed.scoredDeals, actor: session.username || 'admin' });
+          scoreRefresh = await refreshOpportunityScores({
+            deals: reviewed.scoredDeals,
+            authoritativeReview: reviewed.review,
+            reviewMode: requestedReviewMode,
+            actor: session.username || 'admin',
+          });
         }
       } catch (error) {
         reviewWarning = `The export was imported, but scoring could not be refreshed: ${error.message}`;

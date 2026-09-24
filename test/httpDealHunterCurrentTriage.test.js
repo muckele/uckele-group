@@ -82,15 +82,33 @@ test('operator full-backfill reconciles a stale supplemental score out of curren
         'X-Deal-OS-Scope': 'saved-search',
         'X-Deal-OS-Coverage-Label': encodeURIComponent('HTTP complete saved search'),
         'X-Deal-OS-Expected-Row-Count': '1',
+        'X-Deal-OS-Review-Mode': 'full-backfill',
       },
       body: [
         'Listing ID,Business Name,State,Earnings,Revenue,Asking Price,Date Added,View Listing URL,Description',
-        'HTTP-FRESH-001,HTTP Supplemental Deal OS Co,TX,$700000,$2800000,$1900000,2026-08-20,https://dealos.example.invalid/http-fresh-001,Recurring service contracts',
+        'HTTP-FRESH-001,HTTP Supplemental Deal OS Co,TX,$700000,$2800000,$1400000,2026-08-20,https://dealos.example.invalid/http-fresh-001,Recurring revenue from service contracts for commercial fire safety inspection with field service teams and management in place',
       ].join('\n'),
     });
     const imported = await importResponse.json();
     assert.equal(importResponse.status, 201, JSON.stringify(imported));
     assert.equal(imported.review.scoringDeferred, false);
+
+    const importedOpportunities = await getStorage().listDealHunterOpportunities({ limit: 100 });
+    const importedDeal = importedOpportunities.find((row) => row.canonical_name === 'HTTP Supplemental Deal OS Co');
+    assert.ok(importedDeal?.opportunity_id, JSON.stringify(importedOpportunities));
+    assert.ok(await getStorage().getDealHunterOpportunityScore(importedDeal.opportunity_id));
+    assert.ok(await getStorage().getCurrentDealHunterOpportunityScore(importedDeal.opportunity_id));
+    const importInboxResponse = await fetch(`${origin}/api/admin/deal-hunter/triage?view=inbox`, {
+      headers: { Cookie: adminCookie },
+    });
+    const importInbox = await importInboxResponse.json();
+    assert.equal(importInboxResponse.status, 200, JSON.stringify(importInbox));
+    assert.equal(importInbox.areas.find((area) => area.id === 'new-important')?.rows.some(
+      (row) => row.opportunityId === importedDeal.opportunity_id,
+    ), true, JSON.stringify(importInbox.areas.map((area) => ({ id: area.id, total: area.total }))));
+    assert.equal(await getStorage().getDealHunterOpportunity(importedDeal.opportunity_id).then(
+      (opportunity) => opportunity?.primary_submission_id || null,
+    ), null);
 
     const firstBackfill = await fetch(`${origin}/api/admin/deal-hunter/backfill-review`, {
       method: 'POST', headers: { Cookie: adminCookie },
@@ -248,5 +266,54 @@ test('operator full-backfill reconciles a stale supplemental score out of curren
       (await getStorage().listDealHunterScoreEvidence(supplemental.opportunityId)).length,
       historicalEvidence.length,
     );
+  });
+});
+
+test('daily Deal OS import scores new opportunities without claiming complete-set eligibility', async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init) => {
+    if (String(input) === sheetUrl) {
+      return new Response([
+        'Business Name,State,Earnings,Revenue,Asking Price,Date Added,View Listing URL,Description',
+        'Daily Required Sheet Co,CA,$450000,$1800000,$1250000,2026-09-20,https://listings.example.invalid/http-daily-sheet,Recurring commercial inspection contracts',
+      ].join('\n'), { status: 200, headers: { 'content-type': 'text/csv' } });
+    }
+    return originalFetch(input, init);
+  };
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  await withServer(async (origin) => {
+    const loginResponse = await fetch(`${origin}/api/admin/session`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Fly-Client-Ip': '203.0.113.145' },
+      body: JSON.stringify({ username: 'admin', password: 'change-me-now' }),
+    });
+    assert.equal(loginResponse.status, 200);
+    const adminCookie = loginResponse.headers.get('set-cookie').split(';')[0];
+    const response = await fetch(`${origin}/api/admin/deal-hunter/deal-os-import`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/csv', Cookie: adminCookie,
+        'X-Deal-OS-File-Name': encodeURIComponent('http-daily-deal-os.csv'),
+        'X-Deal-OS-Exported-At': new Date().toISOString(),
+        'X-Deal-OS-Scope': 'saved-search',
+        'X-Deal-OS-Coverage-Label': encodeURIComponent('HTTP daily saved search'),
+        'X-Deal-OS-Expected-Row-Count': '1',
+        'X-Deal-OS-Review-Mode': 'daily',
+      },
+      body: [
+        'Listing ID,Business Name,State,Earnings,Revenue,Asking Price,Date Added,View Listing URL,Description',
+        'HTTP-DAILY-001,HTTP Daily Deal OS Co,TX,$700000,$2800000,$1400000,2026-09-20,https://dealos.example.invalid/http-daily-001,Recurring revenue from service contracts for commercial fire safety inspection with field service teams and management in place',
+      ].join('\n'),
+    });
+    const imported = await response.json();
+    assert.equal(response.status, 201, JSON.stringify(imported));
+    assert.equal(imported.review.reviewMode, 'daily');
+    assert.equal(imported.scoreRefresh.ok, true);
+    const opportunities = await getStorage().listDealHunterOpportunities({ limit: 100 });
+    const deal = opportunities.find((row) => row.canonical_name === 'HTTP Daily Deal OS Co');
+    assert.ok(deal?.opportunity_id);
+    assert.ok(await getStorage().getDealHunterOpportunityScore(deal.opportunity_id));
+    assert.equal(await getStorage().getCurrentDealHunterOpportunityScore(deal.opportunity_id), null);
   });
 });

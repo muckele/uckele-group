@@ -72,6 +72,7 @@ const dealOsSourceName = 'SMB Deal OS export';
 const dealOsAllowedScopes = new Set(['saved-search', 'deal-radar']);
 const dealOsImportFutureToleranceMs = 15 * 60 * 1000;
 const dealOsImportMaxColumns = 200;
+const scoredSetAuthority = new WeakMap();
 const cimRequestScoreThreshold = 75;
 const highFitScoreThreshold = 75;
 const watchlistScoreThreshold = 60;
@@ -7773,6 +7774,29 @@ function normalizeDealHunterReviewMode(value = '') {
   return value === 'full-backfill' ? 'full-backfill' : 'daily';
 }
 
+function scoredSetReviewSignature(review) {
+  return JSON.stringify({
+    reviewMode: review.reviewMode,
+    scoringDeferred: review.scoringDeferred,
+    selectionStrategy: review.selection?.strategy,
+    reviewedDeals: review.totals?.reviewedDeals,
+    requiredSources: (review.sources || []).filter((source) => source?.required).map((source) => ({
+      id: source.id, sourceRole: source.sourceRole, fetched: source.fetched,
+      error: source.error, rowCount: source.rowCount,
+    })),
+  });
+}
+
+export function isBuilderProducedScoredSet(review, deals) {
+  const issued = review && scoredSetAuthority.get(review);
+  return Boolean(issued && issued.deals === deals
+    && issued.reviewSignature === scoredSetReviewSignature(review)
+    && issued.members.length === deals.length
+    && issued.members.every((member, index) => member.deal === deals[index]
+      && member.opportunityId === deals[index]?.opportunityId
+      && member.identityStatus === deals[index]?.identityStatus));
+}
+
 async function buildDailyDealReview({
   reviewMode = 'daily',
   dealOsImportId = '',
@@ -8020,6 +8044,13 @@ async function buildDailyDealReview({
 
   const latestDealOsImport = sourceResults.find((result) => result.source.id === dealOsSourceId)?.source?.latestImport || null;
   review.importSummary = buildDealHunterImportSummary(review, latestDealOsImport);
+
+  scoredSetAuthority.set(review, {
+    deals: scoredDeals,
+    reviewSignature: scoredSetReviewSignature(review),
+    members: scoredDeals.map((deal) => ({ deal, opportunityId: deal.opportunityId,
+      identityStatus: deal.identityStatus })),
+  });
 
   return { review, scoredDeals, storage };
 }
