@@ -15,7 +15,7 @@ globalThis.fetch = async () => {
 };
 
 const { createSqliteStorage } = await import('../server/storage/sqlite.js');
-const { importDealOsExport } = await import('../server/services/dealHunter.js');
+const { collectScoredOpportunities, importDealOsExport } = await import('../server/services/dealHunter.js');
 const {
   fullRebuildConfirmation,
   previewOpportunityScoreRefresh,
@@ -1179,6 +1179,163 @@ test('fresh Deal OS becomes current, scoped calls preserve it, and authoritative
   const eventsAfter = await storage.listCrmActivityEvents({ submissionId: created.submission.id, limit: 50 });
   assert.deepEqual(eventsAfter, eventsBefore, 'eligibility reconciliation must not fabricate a rescore event');
 });
+
+test('caller-supplied complete review activates newly scored Deal OS opportunities', async (t) => {
+  const storage = withStorage(t);
+  await seedFreshCanonicalSources(t, storage);
+  assert.equal((await refreshOpportunityScores({ storage, recordActivity: false })).ok, true);
+  const existing = await listTriageQueue({ view: 'all', pageSize: 100, storage });
+  const sheet = existing.rows.find((row) => row.name === 'Current Required Sheet Co');
+  const oldSupplemental = existing.rows.find((row) => row.name === 'Supplemental Deal OS Co');
+  assert.ok(sheet);
+  assert.ok(oldSupplemental);
+  assert.ok(await storage.getCurrentDealHunterOpportunityScore(sheet.opportunityId));
+  const ownerDecision = await setTriageOperatorDecision({
+    opportunityId: sheet.opportunityId,
+    priority: 'high',
+    note: 'Owner priority must survive import scoring.',
+    markReviewed: true,
+    actor: 'owner@example.invalid',
+    storage,
+  });
+  assert.equal(ownerDecision.ok, true, JSON.stringify(ownerDecision));
+
+  const imported = await importDealOsExport({
+    fileName: 'second-fresh-deal-os.csv',
+    fileBuffer: Buffer.from([
+      'Listing ID,Business Name,State,Earnings,Revenue,Asking Price,Date Added,View Listing URL,Description',
+      'FRESH-002,Second Fresh Deal OS Co,TX,$700000,$2800000,$1900000,2026-08-20,https://dealos.example.invalid/fresh-002,Recurring service contracts',
+    ].join('\n')),
+    exportedAt: new Date(Date.now() - (60 * 60 * 1000)).toISOString(),
+    scope: 'saved-search',
+    coverageLabel: 'Second complete fresh saved-search export',
+    importedBy: 'score-refresh-test',
+    storage,
+    now: new Date(),
+  });
+  assert.equal(imported.ok, true, JSON.stringify(imported));
+
+  const reviewed = await collectScoredOpportunities({ reviewMode: 'full-backfill', storage });
+  assert.equal(reviewed.review.scoringDeferred, false);
+  const newDeal = reviewed.scoredDeals.find((deal) => deal.name === 'Second Fresh Deal OS Co');
+  assert.ok(newDeal?.opportunityId);
+  const scorePayloads = [];
+  const writeScore = storage.writeDealHunterOpportunityScore.bind(storage);
+  storage.writeDealHunterOpportunityScore = async (row, evidence) => {
+    scorePayloads.push(row);
+    return writeScore(row, evidence);
+  };
+
+  const refreshed = await refreshOpportunityScores({
+    deals: reviewed.scoredDeals,
+    authoritativeReview: reviewed.review,
+    reviewMode: 'full-backfill',
+    storage,
+    recordActivity: false,
+  });
+  assert.equal(refreshed.ok, true, JSON.stringify(refreshed));
+  assert.ok(await storage.getDealHunterOpportunityScore(newDeal.opportunityId));
+  assert.ok(await storage.getCurrentDealHunterOpportunityScore(newDeal.opportunityId));
+  assert.ok(await storage.getCurrentDealHunterOpportunityScore(sheet.opportunityId));
+  assert.equal(await storage.getCurrentDealHunterOpportunityScore(oldSupplemental.opportunityId), null);
+  const sheetScore = await storage.getDealHunterOpportunityScore(sheet.opportunityId);
+  assert.equal(sheetScore.operator_priority, 'high');
+  assert.equal(sheetScore.operator_note, 'Owner priority must survive import scoring.');
+  assert.equal(sheetScore.reviewed_by, 'owner@example.invalid');
+  assert.ok(scorePayloads.length > 0);
+  assert.ok(scorePayloads.every((row) => !Object.hasOwn(row, 'current_triage_eligible')));
+});
+
+test('caller-supplied deals stay non-authoritative without the complete review contract', async (t) => {
+  const scenarios = [
+    { name: 'missing review', input: (reviewed) => ({ deals: reviewed.scoredDeals }) },
+    { name: 'daily mode', input: (reviewed) => ({ deals: reviewed.scoredDeals,
+      authoritativeReview: reviewed.review, reviewMode: 'daily' }) },
+    { name: 'requested subset', input: (reviewed) => ({ deals: reviewed.scoredDeals,
+      authoritativeReview: reviewed.review, opportunityIds: [reviewed.scoredDeals[0].opportunityId] }) },
+    { name: 'unhealthy required Sheet', input: (reviewed) => ({ deals: reviewed.scoredDeals,
+      authoritativeReview: { ...reviewed.review, sources: reviewed.review.sources.map((source) => (
+        source.required ? { ...source, fetched: false } : source)) } }) },
+    { name: 'deferred identity review', input: (reviewed) => ({ deals: reviewed.scoredDeals,
+      authoritativeReview: { ...reviewed.review, scoringDeferred: true } }) },
+    { name: 'incomplete candidate set', input: (reviewed) => ({ deals: reviewed.scoredDeals,
+      authoritativeReview: { ...reviewed.review, totals: { ...reviewed.review.totals, reviewedDeals: 0 } } }) },
+    { name: 'reconciliation storage unavailable', input: (reviewed) => ({ deals: reviewed.scoredDeals,
+      authoritativeReview: reviewed.review }), before: (storage) => {
+      storage.reconcileDealHunterCurrentScoreEligibility = undefined;
+    } },
+  ];
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async (subtest) => {
+      const storage = withStorage(subtest);
+      await seedFreshCanonicalSources(subtest, storage);
+      const reviewed = await collectScoredOpportunities({ reviewMode: 'full-backfill', storage });
+      scenario.before?.(storage);
+      const refreshed = await refreshOpportunityScores({ ...scenario.input(reviewed), storage, recordActivity: false });
+      assert.equal(refreshed.ok, true, JSON.stringify(refreshed));
+      assert.ok(refreshed.counts.scored > 0);
+      for (const deal of reviewed.scoredDeals) {
+        assert.equal(await storage.getCurrentDealHunterOpportunityScore(deal.opportunityId), null);
+      }
+    });
+  }
+});
+
+test('caller-supplied complete review does not reconcile after a score write fails', async (t) => {
+  const storage = withStorage(t);
+  await seedFreshCanonicalSources(t, storage);
+  const reviewed = await collectScoredOpportunities({ reviewMode: 'full-backfill', storage });
+  await seedOpportunity(storage, 'previously-current');
+  await refreshOpportunityScores({ deals: [scoredDeal({ opportunityId: 'previously-current',
+    dealKey: 'previously-current' })], storage, recordActivity: false });
+  await storage.reconcileDealHunterCurrentScoreEligibility(['previously-current']);
+
+  const writeScore = storage.writeDealHunterOpportunityScore.bind(storage);
+  let writes = 0;
+  storage.writeDealHunterOpportunityScore = async (...args) => {
+    writes += 1;
+    if (writes === 2) throw new Error('injected score write failure');
+    return writeScore(...args);
+  };
+  const refreshed = await refreshOpportunityScores({ deals: reviewed.scoredDeals,
+    authoritativeReview: reviewed.review, reviewMode: 'full-backfill', storage, recordActivity: false });
+  assert.equal(refreshed.ok, false);
+  assert.equal(refreshed.counts.failed, 1);
+  assert.ok(await storage.getCurrentDealHunterOpportunityScore('previously-current'));
+  for (const deal of reviewed.scoredDeals) {
+    assert.equal(await storage.getCurrentDealHunterOpportunityScore(deal.opportunityId), null);
+  }
+});
+
+test('a builder review cannot authorize a shortened or substituted scored set', async (t) => {
+  for (const mismatch of ['shortened', 'substituted']) {
+    await t.test(mismatch, async (subtest) => {
+      const storage = withStorage(subtest);
+      await seedFreshCanonicalSources(subtest, storage);
+      assert.equal((await refreshOpportunityScores({ storage, recordActivity: false })).ok, true);
+      const reviewed = await collectScoredOpportunities({ reviewMode: 'full-backfill', storage });
+      const originalIds = reviewed.scoredDeals.map((deal) => deal.opportunityId);
+      assert.equal(originalIds.length, 2);
+      let suppliedDeals = reviewed.scoredDeals.slice(0, 1);
+      if (mismatch === 'substituted') {
+        await seedOpportunity(storage, 'foreign-opportunity');
+        suppliedDeals = [reviewed.scoredDeals[0], scoredDeal({
+          opportunityId: 'foreign-opportunity', dealKey: 'foreign-opportunity',
+        })];
+      }
+
+      const refreshed = await refreshOpportunityScores({ deals: suppliedDeals,
+        authoritativeReview: reviewed.review, reviewMode: 'full-backfill',
+        storage, recordActivity: false });
+      assert.equal(refreshed.ok, true, JSON.stringify(refreshed));
+      for (const opportunityId of originalIds) {
+        assert.ok(await storage.getCurrentDealHunterOpportunityScore(opportunityId));
+      }
+      assert.equal(await storage.getCurrentDealHunterOpportunityScore('foreign-opportunity'), null);
+    });
+  }
+});
+
 
 test('a cross-source canonical opportunity stays current when its supplemental representation becomes stale', async (t) => {
   const storage = withStorage(t);

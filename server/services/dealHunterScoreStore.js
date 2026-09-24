@@ -8,7 +8,7 @@
 // no path in this module can touch an operator decision.
 
 import { recordCrmActivity } from './activity.js';
-import { collectScoredOpportunities } from './dealHunter.js';
+import { collectScoredOpportunities, isBuilderProducedScoredSet } from './dealHunter.js';
 import { getStorage } from '../storage/index.js';
 import {
   DEAL_SCORING_ENGINE_VERSION,
@@ -228,6 +228,7 @@ async function emitRescoreEvent({ storage, deal, previous, row, actor }) {
  */
 export async function refreshOpportunityScores({
   deals = null,
+  authoritativeReview = null,
   opportunityIds = [],
   force = false,
   reviewMode = 'full-backfill',
@@ -249,7 +250,6 @@ export async function refreshOpportunityScores({
   const requested = new Set(opportunityIds.map((id) => String(id || '').trim()).filter(Boolean));
   let candidates = callerSuppliedDeals ? deals : null;
   let authoritativeOpportunityIds = null;
-  let authoritativeReview = null;
   if (!candidates) {
     const collected = await collectScoredOpportunities({ reviewMode, storage });
     authoritativeReview = collected.review || null;
@@ -268,9 +268,12 @@ export async function refreshOpportunityScores({
       };
     }
     candidates = collected.scoredDeals || [];
-    if (reviewMode === 'full-backfill' && requested.size === 0) {
-      const authorityProblems = authoritativeFullBackfillProblems(collected.review, candidates);
-      if (authorityProblems.length > 0) {
+  }
+  if (reviewMode === 'full-backfill' && requested.size === 0
+    && (!callerSuppliedDeals || isBuilderProducedScoredSet(authoritativeReview, candidates))) {
+    const authorityProblems = authoritativeFullBackfillProblems(authoritativeReview, candidates);
+    if (authorityProblems.length > 0) {
+      if (!callerSuppliedDeals) {
         return {
           ok: false,
           status: 409,
@@ -284,7 +287,8 @@ export async function refreshOpportunityScores({
           profileVersion: DEAL_SCORING_PROFILE_VERSION,
         };
       }
-      if (typeof storage.reconcileDealHunterCurrentScoreEligibility !== 'function') {
+    } else if (typeof storage.reconcileDealHunterCurrentScoreEligibility !== 'function') {
+      if (!callerSuppliedDeals) {
         return {
           ok: false,
           status: 503,
@@ -293,6 +297,7 @@ export async function refreshOpportunityScores({
           review: authoritativeReview,
         };
       }
+    } else {
       // Capture the complete builder-owned set before the per-run score-write
       // batch limit. Existing scores outside this run's write slice must not be
       // deactivated merely because the scorer writes in bounded batches.
