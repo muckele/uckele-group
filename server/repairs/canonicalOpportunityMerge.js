@@ -141,6 +141,8 @@ const linkedProspectSubmissionBlockingReason =
   'A retired prospect discovery can join current CRM state only through submission_id; the linked CRM state scanner selects that discovery whenever its submission is related to the approved canonical pair.';
 const linkedProspectParentRedundancyReason =
   'Retired prospect discovery run, provider-source, and website identity cannot independently establish Deal Hunter canonical authority; any CRM-relevant row is already selected through its submission_id by the linked CRM state scanner.';
+const inertPursueCimAuthorityBlockingReason =
+  'Package 1A Pursue CIM authorities are inert and empty; any row blocks this legacy canonical merge until a later package adds relationship-specific repair semantics.';
 
 const relationshipInventoryEntries = [
   ...relationshipEntries({
@@ -310,6 +312,108 @@ const relationshipInventoryEntries = [
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
     scannerPath: 'dependentState.records.opportunityClaims',
     reason: blockingRelationshipReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_owner_decision_events',
+    columns: ['idempotency_key', 'opportunity_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_pursuit_enrollments',
+    columns: ['decision_event_id', 'opportunity_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_opportunity_timezone_revisions',
+    columns: ['evidence_id', 'opportunity_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_broker_conversations',
+    columns: ['recipient_authority_id', 'rfc_thread_key'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_cim_campaigns',
+    columns: [
+      'conversation_id', 'crm_submission_id', 'decision_event_id', 'enrollment_id',
+      'opportunity_id', 'recipient_authority_id',
+    ],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_cim_campaign_touches',
+    columns: ['campaign_id', 'opportunity_id', 'transmission_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_cim_transmissions',
+    columns: [
+      'bcc_addresses', 'cc_addresses', 'communication_id', 'conversation_id', 'from_address',
+      'outbox_id', 'provider_idempotency_key', 'provider_message_id', 'reply_to_address', 'to_addresses',
+    ],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_cim_transmission_touches',
+    columns: ['campaign_id', 'opportunity_id', 'touch_id', 'transmission_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_cim_terminal_events',
+    columns: ['campaign_id', 'conversation_id', 'evidence_id', 'scope_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_cim_safety_events',
+    columns: [
+      'evidence_id', 'opportunity_id', 'outcome_evidence_id', 'safety_run_id', 'source_run_id',
+    ],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_cim_audit_events',
+    columns: [
+      'activation_id', 'authorization_id', 'campaign_id', 'conversation_id', 'metadata',
+      'opportunity_id', 'touch_id', 'transmission_id',
+    ],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_cim_capability_activations',
+    columns: ['prerequisite_activation_id', 'prerequisite_evidence_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
+  }),
+  ...relationshipEntries({
+    table: 'deal_hunter_cim_live_provider_authorizations',
+    columns: ['activation_id', 'transmission_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: inertPursueCimAuthorityBlockingReason,
   }),
   ...relationshipEntries({
     table: 'deal_hunter_cim_recipient_claims',

@@ -3036,7 +3036,7 @@ test('relationship inventory classifies the exact supersession relationship surf
 test('relationship inventory classifies every reviewed omission exactly once in all four categories', () => {
   const entries = CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries;
   const keys = entries.map((entry) => `${entry.table}.${entry.column}`);
-  assert.equal(entries.length, 256);
+  assert.equal(entries.length, 308);
   assert.equal(new Set(keys).size, keys.length);
   assert.deepEqual(
     [...new Set(entries.map((entry) => entry.category))].sort(),
@@ -3048,7 +3048,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
       entries.filter((entry) => entry.category === category).length,
     ])),
     {
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 98,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 150,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT]: 66,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.PRESERVED_GLOBAL_RECIPIENT_OPERATIONAL_STATE]: 54,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED]: 38,
@@ -3065,7 +3065,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
       entries.filter((entry) => entry.enforcement === enforcement).length,
     ])),
     {
-      [materialScannerPathEnforcement]: 208,
+      [materialScannerPathEnforcement]: 260,
       [independentGateEnforcement]: 10,
       [approvalPreconditionEnforcement]: 12,
       [explicitExclusionEnforcement]: 26,
@@ -3082,7 +3082,33 @@ test('relationship inventory classifies every reviewed omission exactly once in 
     [...new Set(optionalLegacyEntries.map((entry) => entry.table))].sort(),
     ['admin_magic_links_legacy_v1', 'deal_hunter_candidates', 'prospect_discoveries'],
   );
-  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 249);
+  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 301);
+  const pursueCimTables = new Set([
+    'deal_hunter_owner_decision_events',
+    'deal_hunter_pursuit_enrollments',
+    'deal_hunter_opportunity_timezone_revisions',
+    'deal_hunter_broker_conversations',
+    'deal_hunter_cim_campaigns',
+    'deal_hunter_cim_campaign_touches',
+    'deal_hunter_cim_transmissions',
+    'deal_hunter_cim_transmission_touches',
+    'deal_hunter_cim_terminal_events',
+    'deal_hunter_cim_safety_events',
+    'deal_hunter_cim_audit_events',
+    'deal_hunter_cim_capability_activations',
+    'deal_hunter_cim_live_provider_authorizations',
+  ]);
+  const pursueCimEntries = entries.filter((entry) => pursueCimTables.has(entry.table));
+  assert.equal(pursueCimEntries.length, 52);
+  for (const entry of pursueCimEntries) {
+    assert.equal(
+      entry.category,
+      CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    );
+    assert.equal(entry.enforcement, materialScannerPathEnforcement);
+    assert.equal(entry.scannerPath, 'dependentState.records.pursueCimAuthorities');
+    assert.equal(entry.schemaPresence, 'required');
+  }
   for (const entry of entries) {
     assert.ok(entry.reason, `${entry.table}.${entry.column} must document its classification`);
     assert.ok(entry.enforcement, `${entry.table}.${entry.column} must declare its enforcement class`);
@@ -3153,8 +3179,8 @@ test('relationship inventory checksum is deterministic over the complete presenc
   const first = canonicalOpportunityMergeRelationshipInventorySummary();
   const second = canonicalOpportunityMergeRelationshipInventorySummary();
   assert.deepEqual(first, second);
-  assert.equal(first.entryCount, 256);
-  assert.equal(first.checksum, '89fb2b0371ae9a1da518bfe09647a761f54eae47c7c0be7750f7665d9ecf1321');
+  assert.equal(first.entryCount, 308);
+  assert.equal(first.checksum, 'e0f3204d5ec775d606dd061bb961eca9c435eeaf717ff2e15522ff1d5d540f7a');
   assert.equal(
     first.checksum,
     createHash('sha256')
@@ -3246,6 +3272,32 @@ test('relationship inventory validates real material paths and explicit independ
       inspection: dryRun.plan,
     }),
     /schema presence is missing or invalid/i,
+  );
+});
+
+test('Package 1A authority rows conservatively block the legacy canonical merge', async (t) => {
+  const fixture = repairStorage(t);
+  await seedApprovedRepair(fixture.storage);
+  withRawDatabase(fixture.sqlitePath, (database) => database.prepare(`
+    INSERT INTO deal_hunter_owner_decision_events (
+      id, idempotency_key, request_digest, opportunity_id, action, actor,
+      expected_discovery_revision, expected_material_revision,
+      observed_discovery_revision, observed_material_revision,
+      selected_contact_reference_digest, policy_version, created_at
+    ) VALUES (?, ?, ?, ?, 'pursue', ?, 1, 1, 1, 1, NULL, ?, ?)
+  `).run(
+    'pursue-cim-authority-blocker',
+    'pursue-cim-authority-blocker-key',
+    createHash('sha256').update('pursue-cim-authority-blocker').digest('hex'),
+    survivorId,
+    fixtureActor,
+    'pursue-cim-policy-v1',
+    fixtureNowIso,
+  ));
+
+  await assert.rejects(
+    runCanonicalOpportunityMergeRepair(repairInput({ storage: fixture.storage })),
+    /unexpected dependent state: pursueCimAuthorities/i,
   );
 });
 
