@@ -1489,6 +1489,30 @@ function canonicalMergeRecordIds(table, rows = [], idColumn = 'id') {
   return uniqueCanonicalMergeValues(rows.map((row) => `${table}:${row[idColumn]}`));
 }
 
+const inertPursueCimAuthorityIdentity = Object.freeze({
+  deal_hunter_owner_decision_events: ['id'],
+  deal_hunter_pursuit_enrollments: ['id'],
+  deal_hunter_opportunity_timezone_revisions: ['opportunity_id', 'revision'],
+  deal_hunter_broker_conversations: ['id'],
+  deal_hunter_cim_campaigns: ['id'],
+  deal_hunter_cim_campaign_touches: ['id'],
+  deal_hunter_cim_transmissions: ['id'],
+  deal_hunter_cim_transmission_touches: ['transmission_id', 'touch_id'],
+  deal_hunter_cim_terminal_events: ['id'],
+  deal_hunter_cim_safety_events: ['id'],
+  deal_hunter_cim_audit_events: ['id'],
+  deal_hunter_cim_capability_activations: ['id'],
+  deal_hunter_cim_live_provider_authorizations: ['id'],
+});
+
+function inspectInertPursueCimAuthorities(database) {
+  return Object.entries(inertPursueCimAuthorityIdentity).flatMap(([table, identityColumns]) => (
+    database.prepare(`SELECT ${identityColumns.join(', ')} FROM ${table}`).all().map((row) => (
+      `${table}:${identityColumns.map((column) => row[column]).join(':')}`
+    ))
+  )).sort();
+}
+
 function canonicalMergeRowsDigest(rows = []) {
   const canonicalRows = rows
     .map((row) => stableCanonicalJson(row))
@@ -1610,6 +1634,7 @@ export function inspectCanonicalMergeDependentState(database, approval) {
   const referenceValues = uniqueCanonicalMergeValues([...opportunityIds, ...aliasValues, ...aliasKeys]);
   const metadataFilter = { column: 'metadata', values: referenceValues, contains: true };
   const legacyDealHunterCandidates = inspectCanonicalMergeLegacyDealHunterCandidates(database, approval);
+  const pursueCimAuthorities = inspectInertPursueCimAuthorities(database);
   const crmSubmissionSupersessions = database.prepare(`
     SELECT * FROM crm_submission_supersessions
     WHERE opportunity_id IN (${placeholders(opportunityIds.length)})
@@ -1834,6 +1859,7 @@ export function inspectCanonicalMergeDependentState(database, approval) {
     scheduledJobs: canonicalMergeRecordIds('scheduled_job_runs', scheduledJobs, 'job_key'),
     linkedCrmState: uniqueCanonicalMergeValues(linkedCrmState),
     otherRepairManifests: canonicalMergeRecordIds('deal_hunter_cim_repair_manifests', otherRepairManifests),
+    pursueCimAuthorities,
   };
   const counts = Object.fromEntries(Object.entries(records).map(([category, ids]) => [category, ids.length]));
   counts.legacyDealHunterCandidates = legacyDealHunterCandidates.count;
