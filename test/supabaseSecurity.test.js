@@ -99,6 +99,10 @@ const freshnessMigrationUrl = new URL(
   '../supabase/migrations/20260923120000_deal_hunter_freshness_provenance.sql',
   import.meta.url,
 );
+const pursueCimAutopilotMigrationUrl = new URL(
+  '../supabase/migrations/20260925120000_pursue_cim_autopilot.sql',
+  import.meta.url,
+);
 
 function dailyDigestScheduledJobMigration() {
   return fs.existsSync(scheduledJobFencingMigrationUrl)
@@ -447,7 +451,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const opportunityFactWriteBoundaryMigration = fs.readFileSync(opportunityFactWriteBoundaryMigrationUrl, 'utf8');
   const currentOperatorFactMigration = fs.readFileSync(currentOperatorFactMigrationUrl, 'utf8');
   const freshnessMigration = fs.readFileSync(freshnessMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}`;
+  const pursueCimAutopilotMigration = fs.readFileSync(pursueCimAutopilotMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');
@@ -461,9 +466,51 @@ test('Supabase migration and fresh schema isolate every current app table to the
   assert.doesNotMatch(adminOnboardingMigration, /create\s+policy/i, 'onboarding preference table must not add public RLS policies');
   assert.doesNotMatch(cimIdentityMigration, /create\s+policy/i, 'canonical CIM identity tables must not add public RLS policies');
   assert.doesNotMatch(cimStage2Migration, /create\s+policy/i, 'Stage 2 authorization tables must not add public RLS policies');
+  assert.doesNotMatch(
+    pursueCimAutopilotMigration,
+    /create\s+policy/i,
+    'Pursue CIM Autopilot authorities must not add public RLS policies',
+  );
   assert.doesNotMatch(crmReconciliationMigration, /create\s+policy/i, 'CRM reconciliation tables must not add public RLS policies');
   assert.doesNotMatch(opportunityFactsMigration, /create\s+policy/i, 'opportunity fact tables must not add public RLS policies');
   assert.doesNotMatch(opportunityFactWriteBoundaryMigration, /create\s+policy/i, 'opportunity fact write boundary must not add public RLS policies');
+  const pursueCimRevokeBlock = pursueCimAutopilotMigration.match(
+    /revoke all privileges on table([\s\S]*?)from public, anon, authenticated;/i,
+  )?.[1] ?? '';
+  const pursueCimGrantBlock = pursueCimAutopilotMigration.match(
+    /grant select, insert, update, delete on table([\s\S]*?)to service_role;/i,
+  )?.[1] ?? '';
+  const pursueCimServiceRevokeBlock = pursueCimAutopilotMigration.match(
+    /revoke all privileges on table([\s\S]*?)from service_role;/i,
+  )?.[1] ?? '';
+  for (const tableName of [
+    'deal_hunter_owner_decision_events',
+    'deal_hunter_pursuit_enrollments',
+    'deal_hunter_opportunity_timezone_revisions',
+    'deal_hunter_broker_conversations',
+    'deal_hunter_cim_campaigns',
+    'deal_hunter_cim_campaign_touches',
+    'deal_hunter_cim_transmissions',
+    'deal_hunter_cim_transmission_touches',
+    'deal_hunter_cim_terminal_events',
+    'deal_hunter_cim_safety_events',
+    'deal_hunter_cim_audit_events',
+    'deal_hunter_cim_capability_activations',
+    'deal_hunter_cim_live_provider_authorizations',
+  ]) {
+    assert.match(
+      pursueCimRevokeBlock,
+      new RegExp(`public\\.${tableName}(?:,|\\s*$)`, 'i'),
+    );
+    assert.match(
+      pursueCimGrantBlock,
+      new RegExp(`public\\.${tableName}(?:,|\\s*$)`, 'i'),
+    );
+    assert.match(
+      pursueCimServiceRevokeBlock,
+      new RegExp(`public\\.${tableName}(?:,|\\s*$)`, 'i'),
+    );
+  }
   assertServerOnlyPrivileges(migration, 'forward migration');
   assert.match(analyticsMigration, /revoke all privileges on table public\.analytics_events from public, anon, authenticated;/i);
   assert.match(analyticsMigration, /grant all privileges on table public\.analytics_events to service_role;/i);
