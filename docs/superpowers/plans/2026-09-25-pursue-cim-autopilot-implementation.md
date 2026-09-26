@@ -19,7 +19,7 @@
 - `deal_hunter_cim_requests` stays intact for legacy reads, inbound correlation, audit, and later retirement metrics. New Pursue work never inserts a lifecycle row there and new scheduler code never claims it.
 - Source imports may append canonical/freshness evidence and an import-safety event. They may cause a stop/review/no-op through the safety consumer, but may never create an enrollment, campaign, touch, transmission, cadence advance, or provider call.
 - Preserve the existing exact canonical resolver, alias/exception model, FL-01 admitted-source boundaries, canonical CRM ownership/supersession checks, `evaluateAcquisitionMaterialsState`, signed contact-reference approach, signed webhook verification, communication/event retention, suppression, and central pause.
-- Change the opportunity-detail GET to a pure projection. Its current `reconcileAcceptedManualFollowUps: session.role === 'admin'` call is a write on read; move that reconciliation to an explicit internal reconciliation command/job before adding the new projection.
+- The existing opportunity-detail GET currently passes `reconcileAcceptedManualFollowUps: session.role === 'admin'`. Repository inspection shows that path only reads an already accepted legacy manual-follow-up communication and calls `finalizeDealHunterApprovedFollowUp`; it accepts no sender and makes no provider call. Package 6B therefore contains any later legacy writer at the private `sendMessage` boundary, and the new canary projection/final gate must never use this GET as authority. Package 7C still removes the write-on-read and moves reconciliation to an explicit internal command/job, but it may land immediately after first-canary proof so long as every new campaign/release read is side-effect-free and 7C completes before broad owner rollout.
 - Canonical intake safety, Pursue enrollment, FL-04B initial transmission, FL-04C follow-up, and FL-04C batching use five distinct durable capability activations with dependency edges `fl04a-safety → fl04b-enrollment → fl04b-initial → fl04c-followup → fl04c-batch`. Every capability is absent/off after migration. Environment configuration may make a capability harder-off, never turn it on without durable activation. Campaign allocation requires enrollment authority; claim/provider work additionally requires initial authority.
 - The checked-in default and deployment examples are not proof of effective production pause state: `.env.example` defaults the central pause on, `server/config.js` defaults it off, and `fly.toml` currently declares it off for an older manual flow. Before any shadow or live stage, inspect the effective durable and runtime pause independently. This plan does not infer or change production state.
 - No UI exposes Retry, Send Again, or Regenerate for provider-pending, ambiguous, or definitive-failure work. A definitive failure requires the explicit reviewed-new-generation command.
@@ -273,18 +273,18 @@ Each package is intended to be a roughly 1–3 hour reviewable unit for an exper
 
 ### Package 1D: Exact pre-feature binary compatibility (1–2h)
 
-**Dependencies:** Package 1C. **Outcome:** The actual rollback version tolerates the additive SQLite/PostgreSQL schema and never treats new rows as legacy work.
+**Dependencies:** Package 1C. It may proceed after or alongside Packages 2–7, but must pass before any production-shaped deployment, Checkpoint B, or real-canary readiness. **Outcome:** The actual rollback version tolerates the additive SQLite/PostgreSQL schema and never treats new rows as legacy work.
 
 - [ ] Build/run the exact pre-feature commit `b068696d485b4e34caf71a84f52debd8f0a0a8cb` from a separate temporary worktree/artifact against disposable SQLite and PostgreSQL databases upgraded by the new migration.
 - [ ] With durable/config pause proven active, execute startup/schema initialization, legacy reads, direct/cron scheduler discovery, and inbound recording; assert it neither schedules nor deserializes new campaign rows as legacy requests. Record old commit/tree, schema hash, commands, and row fingerprints in release evidence. A current-code mock with methods disabled is insufficient.
 
 **Commit:** `test: prove old-version CIM campaign compatibility`
 
-References to Package 1 below mean 1A–1D are complete.
+References to the storage foundation below mean Packages 1A–1C. Package 1D is a separately named, absolute deployment/rollback gate; deferring its execution does not make it optional, and any failure blocks deployment and canary work.
 
 ### Package 2: Canonical intake safety outbox and August regression (2–3h)
 
-**Dependencies:** Package 1; FL-01 admitted writer knowledge. **Outcome:** Imports can stop/review existing outreach but can never create/advance it.
+**Dependencies:** Packages 1A–1C; FL-01 admitted writer knowledge. **Outcome:** Imports can stop/review existing outreach but can never create/advance it.
 
 - [ ] Extend admitted complete Sheet and Deal OS commits to append deterministic bounded `deal_hunter_cim_safety_events` using their accepted run IDs; do not call campaign orchestration in the import transaction.
 - [ ] Implement the idempotent safety consumer in `cimCampaignSafety.js`; outcomes are stop, review-required, no-op, or still-pending with run-level accounting. Event emission itself is inert; shadow evaluates without terminal mutation, and stop/review consumption requires a current `fl04a-safety` activation.
@@ -298,7 +298,7 @@ References to Package 1 below mean 1A–1D are complete.
 
 ### Package 3: Timezone authority and pure cadence policy (2–3h)
 
-**Dependencies:** Package 1; selected resolver dataset only for derived-zone eligibility. **Outcome:** Deterministic local scheduling and action-required behavior exist without enabling any scheduler.
+**Dependencies:** Packages 1A–1C; selected resolver dataset only for derived-zone eligibility. **Outcome:** Deterministic local scheduling and action-required behavior exist without enabling any scheduler.
 
 - [ ] Implement IANA validation, explicit verified timezone revisions, versioned resolver adapter, local-window roll, DST gap/repetition behavior, accepted-at anchors, and local-calendar expiry in the two pure policy files.
 - [ ] Check in only the selected resolver's bounded generated mapping plus provenance/license/version/digest; do not add a runtime network call. If selection is not complete, keep derived resolution disabled and make explicit verified IANA facts the only eligible source.
@@ -311,7 +311,7 @@ References to Package 1 below mean 1A–1D are complete.
 
 ### Package 4A: Immutable owner commands and compatibility projections (2–3h)
 
-**Dependencies:** Packages 1 and 3. **Outcome:** Pursue/Watch/Pass have one idempotent, revision-bound event contract before any campaign orchestration.
+**Dependencies:** Packages 1A–1C and 3. **Outcome:** Pursue/Watch/Pass have one idempotent, revision-bound event contract before any campaign orchestration.
 
 - [ ] Extend the triage action route/service with required idempotency key and expected revisions for Pursue/Watch/Pass. Persist every immutable owner event; Pursue creates queued enrollment, while Watch/Pass atomically update compatibility projection/disposition, terminal revision, cancellations, and audit evidence.
 - [ ] Add same-key replay/conflict, concurrent duplicate commands, and Watch/Pass-versus-pre-provider transition tests in both adapters; preserve old Pass semantics.
@@ -327,26 +327,27 @@ References to Package 1 below mean 1A–1D are complete.
 - [ ] Extract a pure current-authority snapshot/digest from `dealHunterBrokerMaterials.js`; keep signed contact references opportunity-, provenance-, revision-, and expiry-bound.
 - [ ] Reuse exact canonical CRM owner/import claims; block ambiguity and superseded losers. Reuse recipient candidates, suppression, existing materials predicate, and prior provider-accepted/ambiguous detection.
 - [ ] Require a current `fl04b-enrollment` activation and accepted `fl04a-safety` prerequisite, then allocate campaign generation, conversation, and deterministic initial slot atomically. Initial claim/provider work remains impossible without separate `fl04b-initial` activation.
-- [ ] Cover ordinary Pursue/recipient/CRM scenarios 13–22 and prior-accepted blocker scenario 25 in service/storage/API tests; Package 4A owns Watch/Pass scenario 24 and Package 4C owns scenario 23/restart.
+- [ ] Cover ordinary Pursue/recipient/CRM scenarios 13–22 and the prior-accepted blocker half of scenario 25 in service/storage/API tests; Package 4A owns Watch/Pass scenario 24 and deferred Package 4C owns scenario 23 plus the reviewed-restart half of scenario 25.
 
 **Focused command:** `node --test test/pursueCimAutopilotService.test.js test/dealHunterBrokerMaterials.test.js test/httpDealHunterTriageActions.test.js`
 
 **Commit:** `feat: allocate Pursue CIM campaigns`
 
-### Package 4C: Historical-canary and reviewed-new-generation commands (1–2h)
+### Deferred Package 4C: Historical-canary and reviewed-new-generation commands (1–2h)
 
-**Dependencies:** Package 4B. **Outcome:** Historical enrollment and post-definitive-failure restart are explicit, separately authorized commands with new identities.
+**Dependencies:** Packages 4B, 6C, and 7B plus successful first-real-canary evidence; complete before either action is exposed or used. **Outcome:** Historical enrollment and post-definitive-failure restart are explicit, separately authorized commands with new identities.
 
 - [ ] Add historical-canary and reviewed-new-generation admin commands behind exact activations/confirmation/evidence. Neither is an ordinary Pursue replay; both use current recipient/CRM/timezone/terminal authority.
 - [ ] Prove historical rows remain inert, exact canary scope creates one generation, and restart atomically stops the old generation before allocating the next.
+- [ ] Until this package lands, historical Pursues remain inert and definitive failure remains terminal/action-required. No replay, retry, restart, or ordinary new-Pursue command may substitute for either reviewed action.
 
 **Commit:** `feat: add reviewed CIM generation commands`
 
-References to Package 4 below mean 4A–4C are complete.
+References to the ordinary new-Pursue path below mean Packages 4A–4B. Package 4C is named explicitly wherever its post-canary historical/restart actions are required.
 
 ### Package 5: Initial-touch claim and immutable transmission preparation (2–3h)
 
-**Dependencies:** Packages 1, 3, and 4. **Outcome:** One logical initial touch can be claimed and prepared exactly once without reaching a provider.
+**Dependencies:** Packages 1A–1C, 3, and 4A–4B. **Outcome:** One logical initial touch for an ordinary new post-cutover Pursue can be claimed and prepared exactly once without reaching a provider.
 
 - [ ] Implement initial-only due selection requiring the current `fl04b-initial` activation and its accepted enrollment prerequisite, claim/reclaim before provider-pending, deterministic transmission/membership, and same-payload replay.
 - [ ] Create the exact existing CRM communication and outbox rows in the preparation transaction. Mark new CIM outbox rows so generic retry workers cannot claim them.
@@ -385,7 +386,7 @@ References to Package 4 below mean 4A–4C are complete.
 
 - [ ] Add crash injection after claim, preparation, provider-pending, seam entry, provider invocation, response, and finalization. Assert observed calls are 0 or 1 as specified and recovery adds zero.
 - [ ] Add accepted/definitive/ambiguous finalization and exact reconciliation. Multiple provider IDs are high-severity ambiguity; never pick one.
-- [ ] Cover scenarios 41–48, 70–73, and 78 with SQLite/PostgreSQL parity. Scenario 44's signed-webhook half completes in Package 7A.
+- [ ] Cover scenarios 41–47, the definitive-failure/terminal half of scenario 48, scenarios 70–73, and 78 with SQLite/PostgreSQL parity. Deferred Package 4C owns scenario 48's reviewed-new-generation half; scenario 44's signed-webhook half completes in Package 7A.
 
 **Focused command:** `node --test test/pursueCimProviderBoundary.test.js test/cimCommunicationLifecycle.test.js test/dealHunterScheduler.test.js test/followUpEmail.test.js`
 
@@ -405,7 +406,7 @@ References to Package 6 below mean 6A–6D are complete.
 
 ### Package 7A: Conversation-first signed inbound (2–3h)
 
-**Dependencies:** Packages 4 and 6. **Outcome:** Exact reply evidence stops the conversation before content retrieval; weak sender evidence never auto-stops.
+**Dependencies:** Packages 4A–4B and 6A–6D. **Outcome:** Exact reply evidence stops the conversation before content retrieval; weak sender evidence never auto-stops.
 
 - [ ] Extend reply aliases/tags/communication metadata with conversation/transmission identity and protected membership references.
 - [ ] Resolve signed alias or RFC thread/provider evidence before content fetch; append conversation terminal/audit events and stop later slots. Sender-only matches remain unassigned/review-required.
@@ -425,39 +426,51 @@ References to Package 6 below mean 6A–6D are complete.
 
 **Commit:** `feat: converge CIM terminal authority writers`
 
-### Package 7C: Pure detail projection and explicit reconciliation (1–2h)
+### Deferred Package 7C: Pure detail projection and explicit reconciliation (1–2h)
 
-**Dependencies:** Packages 7A–7B. **Outcome:** Legacy/new lifecycle reads are side-effect-free and reconciliation has a named internal writer path.
+**Dependencies:** Packages 7A–7B and successful first-real-canary evidence; complete immediately after that proof or before broad Autopilot owner rollout, whichever comes first. **Outcome:** Legacy/new lifecycle reads are side-effect-free and reconciliation has a named internal writer path.
 
 - [ ] Remove reconciliation from detail GET and add an explicit internal reconciliation entry point/job. Project legacy and new lifecycle together without mutating either.
 - [ ] Extend broker-materials, detail, and read-only database-fingerprint tests; include all new business/audit tables in the fingerprint set.
+- [ ] Preserve the pre-7C canary constraint: every new campaign, release-report, provider, and final-gate read is side-effect-free; the current detail GET is never canary authority; and Package 6B contains any legacy/manual/scheduled writer before provider access.
 
 **Focused command:** `node --test test/dealHunterReviewReadOnly.test.js test/dealHunterTriageDetail.test.js test/dealHunterBrokerMaterials.test.js`
 
 **Commit:** `refactor: make CIM campaign projections read only`
 
-References to Package 7 below mean 7A–7C are complete.
+References to first-canary terminal handling below mean Packages 7A–7B. Package 7C is named explicitly for the post-canary read-path cleanup and broad-rollout gate.
 
-### Package 8: Owner-visible lifecycle and minimal actions (2–3h)
+### Package 8A: Canary-minimal projection and operator visibility (1–2h)
 
-**Dependencies:** Packages 4 and 7. **Outcome:** The mounted Inbox/detail explains queued, initial-pending, action-required, provider-pending, accepted, ambiguous, definitive-failure, terminal, and legacy states without offering unsafe actions.
+**Dependencies:** Packages 4A–4B, 5, 6A–6D, and 7A–7B. **Outcome:** A bounded server projection/release report, with minimal reuse of the existing Inbox/Drawer where useful, exposes enough durable state to select, review, authorize, observe, and stop one new post-cutover initial canary without offering an unsafe action.
 
-- [ ] Extend the existing triage response and detail projection; do not create a second frontend store or redesign the full Inbox.
-- [ ] Show selected recipient label/provenance, timezone basis, next safe window, campaign generation/policy, terminal reason, and legacy classification using bounded server projections.
-- [ ] Keep Pursue/Watch/Pass controls. Require a fresh contact reference when several candidates exist. Show explicit stop and separately permissioned historical/restart commands only when the server says they are available.
-- [ ] Never render raw signed references after use, nonces, permission evidence, message bodies in telemetry, provider payloads, or a resend action for pending/ambiguous/failure.
-- [ ] Extend `test-ui/AcquisitionInbox.test.jsx`, `test-ui/OpportunityDrawer.test.jsx`, and a new focused `test-browser/pursue-cim-autopilot.spec.js`, reusing `test-browser/admin-phase16.spec.js` setup.
+- [ ] Reuse the normal Pursue control and bounded server projection to show queued/action-required state, canonical opportunity, selected recipient/contact authority, timezone authority, exact blocker/status, and an explicit stop action.
+- [ ] Render the exact persisted held initial transmission/copy and immutable addressing/membership/expiry from the release report; never recompute a preview or make the current detail GET authoritative.
+- [ ] Never render raw signed references after use, nonces, permission evidence, message bodies in telemetry, provider payloads, or a retry/resend/restart action for pending, ambiguous, or definitive-failure work.
+- [ ] Add focused service/HTTP and minimal mounted UI/browser evidence for this canary flow without requiring full legacy/new lifecycle presentation.
 
-**Focused commands:** `npm run test:ui -- test-ui/AcquisitionInbox.test.jsx test-ui/OpportunityDrawer.test.jsx`; after build, `npm run test:browser -- test-browser/pursue-cim-autopilot.spec.js`
+**Focused commands:** `node --test test/pursueCimAutopilotService.test.js test/httpDealHunterTriageActions.test.js`; `npm run test:ui -- test-ui/AcquisitionInbox.test.jsx test-ui/OpportunityDrawer.test.jsx`; after build, the canary-minimal cases in `npm run test:browser -- test-browser/pursue-cim-autopilot.spec.js`
 
-**Commit:** `feat: show Pursue CIM campaign state`
+**Commit:** `feat: show CIM canary release state`
+
+### Deferred Package 8B: Full owner lifecycle UI (1–2h)
+
+**Dependencies:** Packages 4C, 7C, and 8A; complete before broad normal Autopilot owner rollout. FL-04C-specific follow-up UI remains owned by Package 11. **Outcome:** The mounted Inbox/detail explains the complete legacy/new initial lifecycle and exposes only separately permissioned historical/restart actions.
+
+- [ ] Show provider lifecycle, campaign generation/policy, terminal reasons, legacy classification, and the complete queued/initial-pending/action-required/provider-pending/accepted/ambiguous/definitive-failure/terminal presentation.
+- [ ] Expose historical/restart commands only when the corresponding Package 4C server action reports current permission; never expose retry, send-again, or regenerate for pending/ambiguous/failure work.
+- [ ] Complete mounted Vitest and Playwright coverage for the full lifecycle without creating a second frontend store or redesigning the Inbox.
+
+**Focused commands:** `npm run test:ui -- test-ui/AcquisitionInbox.test.jsx test-ui/OpportunityDrawer.test.jsx`; after build, the full-lifecycle cases in `npm run test:browser -- test-browser/pursue-cim-autopilot.spec.js`
+
+**Commit:** `feat: show full Pursue CIM lifecycle`
 
 ### Checkpoint A: Synthetic/adversarial FL-04A/B candidate
 
-**Dependencies:** Packages 0–8 on one unchanged candidate. **Gate:** No provider-capable environment and central pause on.
+**Dependencies:** Packages 0, 1A–1C, 2–3, 4A–4B, 5, 6A–6D, 7A–7B, and 8A on one unchanged candidate. Packages 1D, 4C, 7C, and 8B are not prerequisites for this local/synthetic gate. **Gate:** No provider-capable environment and central pause on.
 
-- [ ] Run scenarios 1–58 and 68–73, 77–80 that are applicable without a real mailbox; provider fake must report zero network calls in shadow/dry-run.
-- [ ] Run SQLite multiprocess and disposable PostgreSQL parity, migration-upgrade, old-version, crash, replay, and GET-read-only checks.
+- [ ] Run every first-canary-applicable portion of scenarios 1–58, 68–73, and 78–80 without a real mailbox; provider fake must report zero network calls in shadow/dry-run. Scenario 23 and the reviewed-restart halves of 25/48 remain mapped to Package 4C; scenario 77 remains mapped to Package 1D; full projection/UI evidence remains mapped to 7C/8B rather than disappearing.
+- [ ] Run SQLite multiprocess and disposable PostgreSQL parity, migration-upgrade, crash, replay, and new-projection read-only checks. Package 1D owns the exact old-version binary check before production-shaped deployment; Package 7C owns the existing legacy detail-GET cleanup before broad owner rollout.
 - [ ] Inspect the provider path inventory and prove every protected writer is default-denied without an exact envelope.
 - [ ] Stop for review if one provider call lacks a committed transmission/communication/outbox authority, if one provider-pending item can be re-invoked, or if import creates/advances outreach.
 
@@ -484,18 +497,21 @@ References to Package 7 below mean 7A–7C are complete.
 
 **Commit:** `feat: isolate the CIM controlled-mailbox profile`
 
-### Package 10B: Controlled-mailbox initial lifecycle evidence (2–3h)
+### Package 10B: Controlled-mailbox plumbing evidence (1–2h)
 
 **Dependencies:** Package 10A, external provider/contact-permission record, approved copy, and authenticated test sender/inbound profile. **Outcome:** One isolated initial transmission and signed inbound lifecycle prove the protocol with zero production-profile calls.
 
-- [ ] Inspect and time-bound the isolated process's local hard-off/durable pause transition, then exercise acceptance, sent/delivered replay and reordering, reply-before-content, materials, definitive rejection, ambiguous response, crash/restart, local-time behavior, and activation expiry.
-- [ ] Verify the deterministic next slot is derived once but remains nonclaimable/provider-inert because FL-04C is off. Record scenario 74 evidence with exact candidate, config/policy hashes, redacted provider IDs, one provider call maximum, and zero production-profile calls.
+- [ ] Inspect and time-bound the isolated process's local hard-off/durable pause transition, then perform exactly one real outbound transmission to the one allowlisted controlled recipient. Record the real provider acceptance/message identity and signed sent/delivered ingestion when the provider emits those events.
+- [ ] Send one real reply carrying the exact campaign/conversation evidence, prove it terminalizes future automated outreach, then deliberately run the later scheduler/final gate and observe zero additional provider calls. Verify the deterministic next slot is derived once but remains nonclaimable/provider-inert because FL-04C is off.
+- [ ] Prove the mailbox process cannot resolve production provider configuration/credentials and that production central pause/state remains untouched. Record scenario 74 evidence with exact candidate, config/policy hashes, redacted provider IDs, exactly one provider call, and zero production-profile calls.
+- [ ] Treat a real materials attachment as optional evidence when cheap and safe; it is not a blocker once the real reply hard-stop proves signed inbound association and terminalization.
+- [ ] Keep definitive rejection, provider ambiguity, crash boundaries, response loss, activation expiry, timezone/window edges, replay/reordering mechanics, concurrency, and rollback state transitions in the deterministic fake/disposable suites. Do not manufacture provider failures for live coverage.
 
 **Commit:** `test: prove isolated CIM initial lifecycle`
 
 ### Package 10C: Rollback and release-evidence rehearsal (1–2h)
 
-**Dependencies:** Package 10B. **Outcome:** Pause, expiry, withdrawal, rollback, inbound retention, and evidence capture are rehearsed without production access.
+**Dependencies:** Packages 10B and 1D. **Outcome:** Pause, expiry, withdrawal, rollback, inbound retention, and evidence capture are rehearsed without production access; exact old-version compatibility has already passed as an absolute deployment gate.
 
 - [ ] Rehearse local pause restoration, activation/authorization expiry and withdrawal, code rollback to the exact old artifact, and current-version return against the disposable/copy database.
 - [ ] Prove inbound/reconciliation evidence remains retained, old code ignores new rows, provider-pending is never retried, and the evidence packet records candidate/config/policy/schema hashes and commands.
@@ -506,7 +522,7 @@ References to Package 10 below mean 10A–10C are complete.
 
 ### Checkpoint B: Owner authorization packet for one real canary
 
-**Dependencies:** Package 10 evidence and all external prerequisites. **This checkpoint prepares evidence; it does not authorize or execute production changes.**
+**Dependencies:** Packages 1D and 10A–10C, Checkpoint A/P9 evidence, and all external prerequisites. **This checkpoint prepares evidence; it does not authorize or execute production changes.**
 
 - [ ] Confirm P8-00 provider/contact basis for the exact selected opportunity, approved initial copy/footer/opt-out treatment, current sender authentication, signed inbound health, storage/reconciliation health, canonical/CRM uniqueness, and selected explicit/derived timezone evidence.
 - [ ] Independently inspect the effective production central pause and every capability activation. Resolve the checked-in config discrepancy with observed evidence; do not infer state from `fly.toml`.
@@ -514,12 +530,13 @@ References to Package 10 below mean 10A–10C are complete.
 - [ ] Rehearse immediate containment: restore central pause, withdraw authorization, stop claims/scheduler, keep inbound/reconciliation on, and preserve evidence.
 - [ ] Require explicit audited release-owner authorization for the time-bounded production pause transition. Execute scenarios 75 and 80 only in separately authorized release work; restore the pause as part of completion.
 
-### Deferred Package 11: Activate FL-04C follow-up claiming and sending (2–3h)
+### Deferred Package 11: Activate FL-04C follow-up claiming, sending, and owner UI (3–4h)
 
 **Dependencies:** Package 6D, successful real FL-04B canary evidence, and separate FL-04C follow-up activation. **Outcome:** The already-proven accepted-at slot chain becomes claimable under the same one-shot provider protocol; no batching yet.
 
 - [ ] Admit follow-up slot claiming only when the exact `fl04c-followup` activation names the current accepted `fl04b-initial` prerequisite and policy/evidence hashes.
 - [ ] Reuse the same preparation, complete final gate, provider-pending, inbound stop, and reconciliation protocols for the dormant slot identities. Do not adapt the legacy scheduler.
+- [ ] Add the generalized follow-up lifecycle UI only with this separately activated capability; it must not expose retry/send-again for provider-pending, ambiguous, or definitive-failure work.
 - [ ] Prove scenarios 30–36, 41–58, 68–74, and follow-up portions of 80 in controlled mailbox before any bounded pilot.
 
 ### Deferred Package 12: FL-04C same-broker batching (2–3h)
@@ -552,20 +569,20 @@ Every spec scenario has an owning layer, focused evidence, and package. `PG` mea
 | 9 | Active campaign re-import evidence-only | Safety consumer + row fingerprint diff | P2 |
 | 10 | Receipt equations and safety run | SQ/PG run accounting to terminal/pending outcomes | P2/P9 |
 | 11 | All import paths create zero outreach | Provider counter + lifecycle table fingerprints | P2 |
-| 12 | August transition cannot create three generations | Incident fixture + generation uniqueness | P2/P4 |
-| 13 | Decision precedes orchestration | Inject CRM failure; decision/enrollment survive | P4 |
-| 14 | Missing recipient action-required | Svc/storage, zero transmission/provider | P4 |
-| 15 | Multiple recipients need opaque ref | Broker-authority/API negative and positive tests | P4 |
-| 16 | Stale/changed contact ref rejected | Signed ref revision/provenance test | P4 |
-| 17 | Exact canonical CRM owner reused | Existing CRM match + new campaign assertion | P4 |
-| 18 | CRM ambiguity/superseded loser blocks | Existing supersession fixtures + zero provider | P4 |
-| 19 | Two rapid identical Pursues | SQ/PG race: one decision/enrollment/generation | P4 |
-| 20 | Same key/different payload rejects | Storage/API digest conflict | P4 |
-| 21 | New key/current Pursue returns existing | Storage/API idempotency result | P4 |
-| 22 | Historical Pursue remains unenrolled | Upgrade fixture/table fingerprints | P1/P4 |
-| 23 | Historical canary exact activation | Svc activation/cohort + one generation | P4 |
-| 24 | Watch/Pass atomically stops/cancels | SQ/PG transition + existing Pass tests | P4/P7 |
-| 25 | Prior accepted request blocks/reviewed restart only | Legacy/new lifecycle fixture | P4 |
+| 12 | August transition cannot create three generations | Incident fixture + generation uniqueness | P2/P4B |
+| 13 | Decision precedes orchestration | Inject CRM failure; decision/enrollment survive | P4A/P4B |
+| 14 | Missing recipient action-required | Svc/storage, zero transmission/provider | P4B |
+| 15 | Multiple recipients need opaque ref | Broker-authority/API negative and positive tests | P4B |
+| 16 | Stale/changed contact ref rejected | Signed ref revision/provenance test | P4B |
+| 17 | Exact canonical CRM owner reused | Existing CRM match + new campaign assertion | P4B |
+| 18 | CRM ambiguity/superseded loser blocks | Existing supersession fixtures + zero provider | P4B |
+| 19 | Two rapid identical Pursues | SQ/PG race: one decision/enrollment/generation | P4A/P4B |
+| 20 | Same key/different payload rejects | Storage/API digest conflict | P4A/P4B |
+| 21 | New key/current Pursue returns existing | Storage/API idempotency result | P4A/P4B |
+| 22 | Historical Pursue remains unenrolled | Upgrade fixture/table fingerprints | P1A/P4B |
+| 23 | Historical canary exact activation | Svc activation/cohort + one generation; deferred until after first canary | P4C |
+| 24 | Watch/Pass atomically stops/cancels | SQ/PG transition + existing Pass tests | P4A/P7B |
+| 25 | Prior accepted request blocks/reviewed restart only | P4B proves the blocker; deferred P4C proves the separately reviewed restart | P4B/P4C |
 | 26 | CA/NY/AZ IANA behavior | Pure clock tests, including Phoenix DST | P3 |
 | 27 | Missing/ambiguous timezone blocks claim | Policy + claim/final-gate tests | P3/P6 |
 | 28 | Initial window roll | Pure clock table tests | P3 |
@@ -577,7 +594,7 @@ Every spec scenario has an owning layer, focused evidence, and package. `PG` mea
 | 34 | DST gap/repetition | Pure instant/local derivation fixtures | P3 |
 | 35 | 21-local-day expiry | Policy + dormant materialization/claim boundary | P3/P6D |
 | 36 | Ambiguity creates no next slot | Finalization/policy assertion | P3/P6D |
-| 37 | SQLite campaign race | Two worker processes, one generation | P4/P5 |
+| 37 | SQLite campaign race | Two worker processes, one generation | P4B/P5 |
 | 38 | PostgreSQL slot race | Concurrent transactions, normalized winner | P5 |
 | 39 | Pre-transmission lease reclaim | SQ/PG clock/claim test, same touch ID | P5 |
 | 40 | Post-preparation crash keeps payload | Restart/replay digest assertion | P5 |
@@ -588,7 +605,7 @@ Every spec scenario has an owning layer, focused evidence, and package. `PG` mea
 | 45 | Key with changed exact payload fails | Digest mutation table, zero provider | P5/P6 |
 | 46 | Multiple provider IDs ambiguous | Reconciliation test + containment alert | P6/P9 |
 | 47 | Legacy stale claim cannot authorize | Boundary negative test | P5/P6 |
-| 48 | Definitive failure/reviewed generation | Svc/SQ/PG state transition and API actions | P4/P6 |
+| 48 | Definitive failure/reviewed generation | P6C proves terminal failure; deferred P4C proves the reviewed new generation | P6C/P4C |
 | 49 | Reply after selection before gate | Barrier race; terminal rev wins; 0 provider | P6/P7 |
 | 50 | Materials after claim before gate | Barrier race; direct materials read; 0 provider | P6/P7 |
 | 51 | Pass/Watch/archive/etc. drift | Parameterized final-gate blockers, 0 calls | P6 |
@@ -608,33 +625,34 @@ Every spec scenario has an owning layer, focused evidence, and package. `PG` mea
 | 65 | Shared alias stops conversation | Signed inbound controlled fixture | P12 |
 | 66 | Labeled materials satisfy one member | Materials classification/member test | P12 |
 | 67 | Unclear attachment stops/reviews | Inbound/materials controlled fixture | P12 |
-| 68 | Legacy policy classifications distinct | Projection/classifier table tests | P1/P7 |
-| 69 | Legacy accepted/ambiguous blocks campaign | Enrollment authority fixture | P4 |
-| 70 | Migration changes no activation/pause | Upgrade DB fingerprints | P1 |
+| 68 | Legacy policy classifications distinct | Classifier tests first; full legacy/new projection after canary | P1A–P1C/P7C |
+| 69 | Legacy accepted/ambiguous blocks campaign | Enrollment authority fixture | P4B |
+| 70 | Migration changes no activation/pause | Upgrade DB fingerprints | P1A |
 | 71 | FL-04A shadow zero calls | Shadow report + unreachable provider fake | P9 |
 | 72 | FL-04B cannot authorize follow-ups | Five-capability dependency/path negative tests | P6B/P6D/P9 |
 | 73 | FL-04C cannot bypass central pause | Boundary negative tests | P6/P12 |
-| 74 | Isolated mailbox full initial lifecycle | Real isolated provider/inbound evidence | P10 |
+| 74 | Isolated mailbox full initial lifecycle | One real isolated outbound, provider identity/events, exact reply hard-stop, later zero calls; failure/crash edges remain synthetic | P10B |
 | 75 | One real canary exact selection/expiry | Prepare/hold/owner-authorize/resume plus separately authorized release evidence | Checkpoint B |
-| 76 | Rollback pause preserves inbound/reconcile | Disposable rollback rehearsal | P10 |
-| 77 | Old version ignores new campaigns | Old-code/additive-schema fixture | P1/P10 |
+| 76 | Rollback pause preserves inbound/reconcile | Disposable rollback rehearsal | P10C |
+| 77 | Old version ignores new campaigns | Old-code/additive-schema fixture and rehearsal | P1D/P10C |
 | 78 | Unknown policy is inert | Adapter/service/boundary negative test | P6/P7 |
-| 79 | Untouched evidence byte-for-byte | Pre/post upgrade checksums and row dumps | P1 |
+| 79 | Untouched evidence byte-for-byte | Pre/post upgrade checksums and row dumps | P1A/P1D |
 | 80 | Only exact selected canary reaches seam | Full writer matrix including CIM-linked CRM manual takeover; Mailbox then Release | P6B/P10/Checkpoint B |
 
 ## Critical path, prerequisites, and estimates
 
-These are implementation-owner estimates, not calendar promises. They assume the repository fixtures are healthy and exclude external approval latency.
+These are implementation-owner estimates, not calendar promises. They assume the repository fixtures are healthy and exclude external approval latency. The ranges are dependency-accounted revisions of the original plan: they remove P4C, P7C, and P8B from first-canary work; narrow live-mailbox evidence; and move P1D later without removing it from canary readiness.
 
 | Milestone | Required packages/checkpoints | Engineering critical path | External prerequisites |
 | --- | --- | ---: | --- |
-| Production-shaped FL-04A/B shadow | P0–P9 + Checkpoint A | ~38–52 hours | None for local/synthetic; effective production observation, if later requested, needs deployment authority |
-| Isolated controlled mailbox | Shadow + P10 | ~43–59 hours | P8-00/contact basis for test, approved copy, isolated authenticated sender/inbound credentials/domain, one allowed recipient |
-| One real initial canary | Controlled mailbox + Checkpoint B | ~45–63 engineering hours plus release work | Exact permission-approved opportunity, production sender/inbound/reconciliation health, timezone authority, owner copy acceptance, current pause inspection, audited time-bounded pause change, rollback authority |
-| FL-04C follow-up activation | Successful canary + P11 | +2–3 hours implementation, then mailbox evidence | Separate follow-up activation and extended scenario 80 |
+| Local/synthetic production-shaped FL-04A/B shadow | P0, P1A–P1C, P2–P3, P4A–P4B, P5, P6A–P6D, P7A–P7B, P8A, Checkpoint A, P9 | ~34–45 hours | None locally; any deployed production-shaped observation additionally requires P1D and deployment authority |
+| Isolated controlled mailbox | Shadow + P1D + P10A–P10C | ~38–53 hours | P8-00/contact basis for test, approved copy, isolated authenticated sender/inbound credentials/domain, one allowed recipient |
+| One real initial canary readiness | Controlled mailbox + Checkpoint B | ~41–58 engineering hours plus separately authorized release work | One new post-cutover permission-approved opportunity, production sender/inbound/reconciliation health, timezone authority, owner copy acceptance, current pause inspection, audited time-bounded pause change, rollback authority |
+| Deferred post-canary owner workflows | P4C + P7C + P8B | +3–6 hours before those commands/broad owner rollout | Successful first canary; separate authorization before historical/restart use |
+| FL-04C follow-up activation | Successful canary + P11 | +3–4 hours implementation, then mailbox evidence | Separate follow-up activation and extended scenario 80 |
 | FL-04C batching activation | Follow-up proof + P12 + Checkpoint C | +2–3 hours implementation, then mailbox evidence | Separate batching activation, bounded cohort, owner approval |
 
-The fastest sensible path to one real canary is P0–P10 with only the dormant, nonclaimable FL-04C slot derivation from Package 6D present. Repository review does not support a credible 16–28 hour estimate for the complete safety, dual-provider, inbound, UI, mailbox, and rollback scope; the earlier coarse estimate hid several multi-system packages. Do not recover schedule by adapting the legacy follow-up scheduler, treating Stage 2 activation as campaign authority, using provider idempotency as retry permission, weakening test/provider parity, or letting an import enroll work.
+The exact first-canary path is P0; P1A–P1C; P2–P3; P4A–P4B; P5; P6A–P6D; P7A–P7B; P8A; Checkpoint A; P9; P10A–P10C; P1D before any production-shaped deployment and as a prerequisite of P10C/Checkpoint B; then Checkpoint B. It selects one **new post-cutover Pursue** and retains only the dormant, nonclaimable FL-04C slot derivation from Package 6D. P4C, P7C, and P8B move after first-canary proof; deterministic provider-failure/crash/edge evidence stays in synthetic/disposable suites instead of being repeated live. The revised ~41–58-hour readiness range preserves safety, dual-provider parity, inbound hard-stop, containment, isolated-mailbox plumbing, exact rollback compatibility, and the release gate; repository evidence still does not support a credible 16–28-hour estimate. Do not recover schedule by adapting the legacy follow-up scheduler, treating Stage 2 activation as campaign authority, using provider idempotency as retry permission, weakening test/provider parity, or letting an import enroll work.
 
 ## Verification gates
 
@@ -663,7 +681,7 @@ Also run the full scenario manifest for the activated stage, SQLite multiprocess
 - More than one provider identity for one transmission, one touch accepted twice, or one opportunity with two active campaign generations.
 - A provider seam entry without committed transmission, communication, outbox, final-gate revisions, consumed invocation authority, and exact live authorization.
 - Any path able to invoke again after provider-pending, including lease expiry, restart, manual click, generic outbox retry, or Stage 2 reconciliation.
-- Import/read path creates or advances outreach; authenticated detail GET changes a business table.
+- An import or any new campaign/release read creates or advances outreach; the canary relies on the existing detail GET as authority; or the bounded pre-7C legacy reconciliation path does anything beyond finalizing existing accepted evidence. Package 7C still makes the entire detail GET side-effect-free before broad owner rollout.
 - SQLite/PostgreSQL disagreement in uniqueness, race result, state transition, or normalized error.
 - Reply/materials/Pass/source/permission/timezone/pause commits before the final gate but provider call count is nonzero.
 - Shadow/dry-run touches a provider; controlled mailbox can resolve production credentials/profile; nonselected path reaches the seam.
@@ -673,8 +691,8 @@ Also run the full scenario manifest for the activated stage, SQLite multiprocess
 
 Implementation and merge do not activate anything. A later authorized release follows these stages:
 
-1. Verify backup/recovery evidence, exact candidate commit/tree, migrations, storage health, signed inbound, reconciliation, canonical intake, CRM ownership, and effective central/capability pause.
-2. Apply additive schema with every new capability absent/off and central pause active. Run compatibility/readiness checks; no backfill.
+1. Verify backup/recovery evidence, exact candidate commit/tree, migrations, storage health, signed inbound, reconciliation, canonical intake, CRM ownership, effective central/capability pause, and successful Package 1D execution against the exact rollback artifact.
+2. Only after Package 1D passes, apply additive schema with every new capability absent/off and central pause active. Run compatibility/readiness checks; no backfill. A Package 1D failure blocks deployment absolutely even when Packages 2–10 are otherwise complete.
 3. Deploy dual-compatible code. Confirm every legacy/new protected CIM path is default-denied and ordinary non-CIM email still works.
 4. Activate FL-04A shadow only; then FL-04B shadow only. Require zero provider calls and accepted scenario evidence.
 5. In the separate non-production mailbox process/database, activate the structurally isolated profile for one test recipient and perform its separately audited local-pause transition. Keep the production process, configuration, credentials, database, and central pause unchanged.
