@@ -275,8 +275,10 @@ create table if not exists public.deal_hunter_cim_terminal_events (
   created_at timestamptz not null,
   unique(scope, scope_id, revision),
   check (
-    (scope = 'campaign' and campaign_id = scope_id and conversation_id is null)
-    or (scope = 'conversation' and conversation_id = scope_id and campaign_id is null)
+    (scope = 'campaign' and campaign_id is not null
+      and campaign_id = scope_id and conversation_id is null)
+    or (scope = 'conversation' and conversation_id is not null
+      and conversation_id = scope_id and campaign_id is null)
   )
 );
 
@@ -511,7 +513,23 @@ revoke all privileges on table
   public.deal_hunter_cim_audit_events
 from public, anon, authenticated;
 
-grant all privileges on table
+revoke all privileges on table
+  public.deal_hunter_owner_decision_events,
+  public.deal_hunter_pursuit_enrollments,
+  public.deal_hunter_opportunity_timezone_revisions,
+  public.deal_hunter_broker_conversations,
+  public.deal_hunter_cim_campaigns,
+  public.deal_hunter_cim_campaign_touches,
+  public.deal_hunter_cim_transmissions,
+  public.deal_hunter_cim_transmission_touches,
+  public.deal_hunter_cim_terminal_events,
+  public.deal_hunter_cim_safety_events,
+  public.deal_hunter_cim_capability_activations,
+  public.deal_hunter_cim_live_provider_authorizations,
+  public.deal_hunter_cim_audit_events
+from service_role;
+
+grant select, insert, update, delete on table
   public.deal_hunter_owner_decision_events,
   public.deal_hunter_pursuit_enrollments,
   public.deal_hunter_opportunity_timezone_revisions,

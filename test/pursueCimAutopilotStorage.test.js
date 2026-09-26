@@ -23,6 +23,11 @@ const expectedTables = [
   'deal_hunter_pursuit_enrollments',
 ];
 
+const singleIdTables = expectedTables.filter((table) => ![
+  'deal_hunter_cim_transmission_touches',
+  'deal_hunter_opportunity_timezone_revisions',
+].includes(table));
+
 const tableDropOrder = [
   'deal_hunter_cim_audit_events',
   'deal_hunter_cim_live_provider_authorizations',
@@ -66,6 +71,21 @@ function tableNames(database) {
 
 function fingerprintRows(database, table, orderBy) {
   return JSON.stringify(database.prepare(`SELECT * FROM ${table} ORDER BY ${orderBy}`).all());
+}
+
+function replaceAuthorityRow(database, table, where, whereParameters, overrides) {
+  const columns = database.prepare(`PRAGMA table_info(${table})`).all().map(({ name }) => name);
+  const overrideValues = [];
+  const select = columns.map((column) => {
+    if (!Object.hasOwn(overrides, column)) return `"${column}"`;
+    overrideValues.push(overrides[column]);
+    return `? AS "${column}"`;
+  }).join(', ');
+  const quotedColumns = columns.map((column) => `"${column}"`).join(', ');
+  return database.prepare(`
+    INSERT OR REPLACE INTO ${table} (${quotedColumns})
+    SELECT ${select} FROM ${table} WHERE ${where}
+  `).run(...overrideValues, ...whereParameters);
 }
 
 function seedOpportunity(database, id = 'opp-p1a') {
@@ -284,6 +304,11 @@ test('P1A SQLite fresh and upgrade databases expose every inert authority and pr
   initialize(freshPath);
   const fresh = new Database(freshPath, { readonly: true });
   assert.deepEqual(expectedTables.filter((name) => !tableNames(fresh).includes(name)), []);
+  for (const table of singleIdTables) {
+    const id = fresh.prepare(`PRAGMA table_info(${table})`).all().find((column) => column.name === 'id');
+    assert.equal(id?.notnull, 1, `${table}.id must be explicitly NOT NULL`);
+    assert.equal(id?.pk, 1, `${table}.id must be the primary key`);
+  }
   assert.equal(fresh.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_capability_activations').get().count, 0);
   assert.equal(fresh.prepare('SELECT COUNT(*) AS count FROM deal_hunter_pursuit_enrollments').get().count, 0);
   assert.equal(fresh.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns').get().count, 0);
@@ -326,6 +351,54 @@ test('P1A SQLite fresh and upgrade databases expose every inert authority and pr
   );
   assert.equal(upgraded.prepare("SELECT COUNT(*) AS count FROM deal_hunter_cim_requests WHERE id = 'legacy-request'").get().count, 1);
   upgraded.close();
+});
+
+test('P1A SQLite rejects null authority identities', (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-null-identities');
+  initialize(sqlitePath);
+  const database = new Database(sqlitePath);
+  database.pragma('foreign_keys = ON');
+  seedOpportunity(database);
+  assert.throws(() => database.prepare(`
+    INSERT INTO deal_hunter_owner_decision_events (
+      id, idempotency_key, request_digest, opportunity_id, action, actor,
+      expected_discovery_revision, expected_material_revision,
+      observed_discovery_revision, observed_material_revision, policy_version, created_at
+    ) VALUES (NULL, 'null-id', ?, 'opp-p1a', 'pursue', 'fixture-owner',
+      0, 0, 0, 0, 'owner-decision-v1', ?)
+  `).run(digest('a'), at), /NOT NULL constraint/i);
+  database.close();
+});
+
+test('P1A SQLite terminal evidence must reference the exact scoped authority', (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-terminal-scope');
+  initialize(sqlitePath);
+  const database = new Database(sqlitePath);
+  database.pragma('foreign_keys = ON');
+  const authority = insertBaseAuthority(database);
+  const terminalInsert = database.prepare(`
+    INSERT INTO deal_hunter_cim_terminal_events (
+      id, scope, scope_id, campaign_id, conversation_id, revision, reason_code,
+      evidence_type, evidence_id, observed_at, actor, source, metadata_digest, created_at
+    ) VALUES (?, 'campaign', ?, ?, NULL, 1, 'watch_selected', 'owner-decision',
+      ?, ?, 'fixture-owner', 'test', ?, ?)
+  `);
+  assert.throws(() => terminalInsert.run(
+    'terminal-missing', authority.campaignId, null, authority.decisionId, at, digest('8'), at,
+  ), /CHECK constraint/i);
+  assert.throws(() => terminalInsert.run(
+    'terminal-mismatch', authority.campaignId, 'campaign-other', authority.decisionId,
+    at, digest('8'), at,
+  ), /CHECK constraint/i);
+  assert.throws(() => terminalInsert.run(
+    'terminal-nonexistent', 'campaign-missing', 'campaign-missing', authority.decisionId,
+    at, digest('8'), at,
+  ), /FOREIGN KEY constraint/i);
+  terminalInsert.run(
+    'terminal-valid', authority.campaignId, authority.campaignId, authority.decisionId,
+    at, digest('8'), at,
+  );
+  database.close();
 });
 test('P1A SQLite accepts a valid authority graph and enforces foreign keys', (t) => {
   const sqlitePath = temporaryPath(t, 'pursue-cim-valid');
@@ -471,7 +544,9 @@ test('P1A SQLite rejects illegal states, duplicate identities, and unsafe invoca
       ?, from_address, to_addresses, cc_addresses, bcc_addresses, reply_to_address,
       subject, provider_idempotency_key, 'unused-communication', 'unused-outbox',
       'prepared', 'ordinary', 0, 1, ?, ? FROM deal_hunter_cim_transmissions WHERE id = ?
-  `).run(digest('2'), digest('3'), at, at, firstTransmission.transmissionId), /UNIQUE constraint/i);
+  `).run(
+    digest('2'), digest('3'), at, at, firstTransmission.transmissionId,
+  ), /UNIQUE constraint|immutable/i);
 
   const second = insertBaseAuthority(database, '-second');
   const secondTransmission = insertPreparedTransmission(database, second, '-second');
@@ -481,7 +556,7 @@ test('P1A SQLite rejects illegal states, duplicate identities, and unsafe invoca
     ) VALUES (?, ?, ?, ?, 1, ?)
   `).run(
     secondTransmission.transmissionId, first.touchId, first.opportunityId, first.campaignId, at,
-  ), /UNIQUE constraint/i);
+  ), /UNIQUE constraint|immutable/i);
   database.prepare(`
     UPDATE deal_hunter_cim_transmission_touches
     SET cancelled_at = ?, cancellation_reason = 'pre-provider-rebuild'
@@ -538,5 +613,84 @@ test('P1A SQLite retained evidence and prepared payload identity are immutable',
   ]) {
     assert.throws(() => database.prepare(sql).run(...parameters), /immutable|retained/i, sql);
   }
+  database.close();
+});
+
+test('P1A SQLite replacement writes cannot bypass retained authority guards', (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-no-replace');
+  initialize(sqlitePath);
+  const database = new Database(sqlitePath);
+  database.pragma('foreign_keys = ON');
+  assert.equal(database.pragma('recursive_triggers', { simple: true }), 0);
+  seedOpportunity(database, 'opp-replace-owner');
+  database.prepare(`
+    INSERT INTO deal_hunter_owner_decision_events (
+      id, idempotency_key, request_digest, opportunity_id, action, actor,
+      expected_discovery_revision, expected_material_revision,
+      observed_discovery_revision, observed_material_revision, policy_version, created_at
+    ) VALUES ('decision-replace', 'idem-replace', ?, 'opp-replace-owner', 'pursue',
+      'fixture-owner', 0, 0, 0, 0, 'owner-decision-v1', ?)
+  `).run(digest('a'), at);
+  assert.throws(
+    () => replaceAuthorityRow(
+      database, 'deal_hunter_owner_decision_events', 'id = ?', ['decision-replace'],
+      { actor: 'tampered' },
+    ),
+    /immutable|retained/i,
+  );
+  seedOpportunity(database, 'opp-replace-timezone');
+  database.prepare(`
+    INSERT INTO deal_hunter_opportunity_timezone_revisions (
+      opportunity_id, revision, state, iana_timezone, evidence_type, evidence_id,
+      evidence_digest, resolver_version, dataset_digest, actor, created_at
+    ) VALUES ('opp-replace-timezone', 1, 'verified', 'America/Los_Angeles',
+      'operator-verified', 'timezone-evidence', ?, 'explicit-v1', ?, 'fixture-owner', ?)
+  `).run(digest('c'), digest('d'), at);
+  assert.throws(
+    () => replaceAuthorityRow(
+      database, 'deal_hunter_opportunity_timezone_revisions',
+      'opportunity_id = ? AND revision = 1', ['opp-replace-timezone'], { actor: 'tampered' },
+    ),
+    /immutable|retained/i,
+  );
+  const authority = insertBaseAuthority(database);
+  const transmission = insertPreparedTransmission(database, authority);
+  database.prepare(`
+    INSERT INTO deal_hunter_cim_terminal_events (
+      id, scope, scope_id, campaign_id, revision, reason_code, evidence_type,
+      evidence_id, observed_at, actor, source, metadata_digest, created_at
+    ) VALUES ('terminal-replace', 'campaign', ?, ?, 1, 'watch_selected',
+      'owner-decision', ?, ?, 'fixture', 'test', ?, ?)
+  `).run(authority.campaignId, authority.campaignId, authority.decisionId, at, digest('c'), at);
+  database.prepare(`
+    INSERT INTO deal_hunter_cim_audit_events (
+      id, event_type, opportunity_id, campaign_id, actor, source, occurred_at, metadata
+    ) VALUES ('audit-replace', 'campaign-created', ?, ?, 'fixture', 'test', ?, '{}')
+  `).run(authority.opportunityId, authority.campaignId, at);
+
+  for (const [table, where, parameters, overrides] of [
+    ['deal_hunter_cim_terminal_events', 'id = ?', ['terminal-replace'], { reason_code: 'tampered' }],
+    ['deal_hunter_cim_audit_events', 'id = ?', ['audit-replace'], { actor: 'tampered' }],
+    ['deal_hunter_cim_transmissions', 'id = ?', [transmission.transmissionId], { payload_digest: digest('f') }],
+  ]) {
+    assert.throws(
+      () => replaceAuthorityRow(database, table, where, parameters, overrides),
+      /immutable|retained/i,
+      table,
+    );
+  }
+  database.prepare(`
+    INSERT INTO deal_hunter_cim_transmission_touches (
+      transmission_id, touch_id, opportunity_id, campaign_id, display_ordinal, created_at
+    ) VALUES (?, ?, ?, ?, 1, ?)
+  `).run(transmission.transmissionId, authority.touchId, authority.opportunityId, authority.campaignId, at);
+  assert.throws(
+    () => replaceAuthorityRow(
+      database, 'deal_hunter_cim_transmission_touches',
+      'transmission_id = ? AND touch_id = ?', [transmission.transmissionId, authority.touchId],
+      { display_ordinal: 2 },
+    ),
+    /immutable|retained/i,
+  );
   database.close();
 });

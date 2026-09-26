@@ -4327,7 +4327,7 @@ export function createSqliteStorage(config, options = {}) {
       );
 
       CREATE TABLE IF NOT EXISTS deal_hunter_owner_decision_events (
-        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
         idempotency_key TEXT NOT NULL UNIQUE
           CHECK(idempotency_key = trim(idempotency_key) AND length(idempotency_key) BETWEEN 1 AND 240),
         request_digest TEXT NOT NULL CHECK(length(request_digest) = 64),
@@ -4347,7 +4347,7 @@ export function createSqliteStorage(config, options = {}) {
       );
 
       CREATE TABLE IF NOT EXISTS deal_hunter_pursuit_enrollments (
-        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
         decision_event_id TEXT NOT NULL UNIQUE,
         opportunity_id TEXT NOT NULL,
         state TEXT NOT NULL CHECK(state IN (
@@ -4388,7 +4388,7 @@ export function createSqliteStorage(config, options = {}) {
       );
 
       CREATE TABLE IF NOT EXISTS deal_hunter_broker_conversations (
-        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
         recipient_authority_id TEXT NOT NULL
           CHECK(recipient_authority_id = trim(recipient_authority_id) AND length(recipient_authority_id) BETWEEN 1 AND 240),
         recipient_fingerprint TEXT NOT NULL CHECK(length(recipient_fingerprint) = 64),
@@ -4413,7 +4413,7 @@ export function createSqliteStorage(config, options = {}) {
       );
 
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_campaigns (
-        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
         opportunity_id TEXT NOT NULL,
         generation INTEGER NOT NULL CHECK(generation > 0),
         enrollment_id TEXT NOT NULL,
@@ -4464,7 +4464,7 @@ export function createSqliteStorage(config, options = {}) {
       );
 
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_campaign_touches (
-        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
         campaign_id TEXT NOT NULL,
         opportunity_id TEXT NOT NULL,
         logical_slot TEXT NOT NULL
@@ -4499,7 +4499,7 @@ export function createSqliteStorage(config, options = {}) {
       );
 
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_transmissions (
-        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
         conversation_id TEXT NOT NULL,
         member_digest TEXT NOT NULL CHECK(length(member_digest) = 64),
         preparation_generation INTEGER NOT NULL CHECK(preparation_generation > 0),
@@ -4567,7 +4567,7 @@ export function createSqliteStorage(config, options = {}) {
       );
 
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_terminal_events (
-        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
         scope TEXT NOT NULL CHECK(scope IN ('campaign', 'conversation')),
         scope_id TEXT NOT NULL CHECK(scope_id = trim(scope_id) AND length(scope_id) BETWEEN 1 AND 240),
         campaign_id TEXT,
@@ -4586,15 +4586,17 @@ export function createSqliteStorage(config, options = {}) {
         created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
         UNIQUE(scope, scope_id, revision),
         CHECK(
-          (scope = 'campaign' AND campaign_id = scope_id AND conversation_id IS NULL)
-          OR (scope = 'conversation' AND conversation_id = scope_id AND campaign_id IS NULL)
+          (scope = 'campaign' AND campaign_id IS NOT NULL
+            AND campaign_id = scope_id AND conversation_id IS NULL)
+          OR (scope = 'conversation' AND conversation_id IS NOT NULL
+            AND conversation_id = scope_id AND campaign_id IS NULL)
         ),
         FOREIGN KEY(campaign_id) REFERENCES deal_hunter_cim_campaigns(id) ON DELETE RESTRICT,
         FOREIGN KEY(conversation_id) REFERENCES deal_hunter_broker_conversations(id) ON DELETE RESTRICT
       );
 
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_safety_events (
-        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
         safety_run_id TEXT NOT NULL
           CHECK(safety_run_id = trim(safety_run_id) AND length(safety_run_id) BETWEEN 1 AND 240),
         opportunity_id TEXT NOT NULL,
@@ -4620,7 +4622,7 @@ export function createSqliteStorage(config, options = {}) {
       );
 
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_audit_events (
-        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
         event_type TEXT NOT NULL
           CHECK(event_type = trim(event_type) AND length(event_type) BETWEEN 1 AND 160),
         opportunity_id TEXT,
@@ -4649,7 +4651,7 @@ export function createSqliteStorage(config, options = {}) {
       );
 
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_capability_activations (
-        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
         capability TEXT NOT NULL CHECK(capability IN (
           'fl04a-safety', 'fl04b-enrollment', 'fl04b-initial', 'fl04c-followup', 'fl04c-batch'
         )),
@@ -4684,7 +4686,7 @@ export function createSqliteStorage(config, options = {}) {
       );
 
       CREATE TABLE IF NOT EXISTS deal_hunter_cim_live_provider_authorizations (
-        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        id TEXT NOT NULL PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
         activation_id TEXT NOT NULL,
         capability TEXT NOT NULL CHECK(capability IN (
           'fl04a-safety', 'fl04b-enrollment', 'fl04b-initial', 'fl04c-followup', 'fl04c-batch'
@@ -4742,24 +4744,50 @@ export function createSqliteStorage(config, options = {}) {
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_owner_decision_events_no_delete
       BEFORE DELETE ON deal_hunter_owner_decision_events
       BEGIN SELECT RAISE(ABORT, 'owner decision evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_owner_decision_events_no_replace
+      BEFORE INSERT ON deal_hunter_owner_decision_events
+      WHEN EXISTS (
+        SELECT 1 FROM deal_hunter_owner_decision_events
+        WHERE id = NEW.id OR idempotency_key = NEW.idempotency_key
+      )
+      BEGIN SELECT RAISE(ABORT, 'owner decision evidence is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_timezone_revisions_no_update
       BEFORE UPDATE ON deal_hunter_opportunity_timezone_revisions
       BEGIN SELECT RAISE(ABORT, 'timezone revision evidence is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_timezone_revisions_no_delete
       BEFORE DELETE ON deal_hunter_opportunity_timezone_revisions
       BEGIN SELECT RAISE(ABORT, 'timezone revision evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_timezone_revisions_no_replace
+      BEFORE INSERT ON deal_hunter_opportunity_timezone_revisions
+      WHEN EXISTS (
+        SELECT 1 FROM deal_hunter_opportunity_timezone_revisions
+        WHERE opportunity_id = NEW.opportunity_id AND revision = NEW.revision
+      )
+      BEGIN SELECT RAISE(ABORT, 'timezone revision evidence is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_terminal_events_no_update
       BEFORE UPDATE ON deal_hunter_cim_terminal_events
       BEGIN SELECT RAISE(ABORT, 'terminal evidence is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_terminal_events_no_delete
       BEFORE DELETE ON deal_hunter_cim_terminal_events
       BEGIN SELECT RAISE(ABORT, 'terminal evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_terminal_events_no_replace
+      BEFORE INSERT ON deal_hunter_cim_terminal_events
+      WHEN EXISTS (
+        SELECT 1 FROM deal_hunter_cim_terminal_events
+        WHERE id = NEW.id
+          OR (scope = NEW.scope AND scope_id = NEW.scope_id AND revision = NEW.revision)
+      )
+      BEGIN SELECT RAISE(ABORT, 'terminal evidence is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_audit_events_no_update
       BEFORE UPDATE ON deal_hunter_cim_audit_events
       BEGIN SELECT RAISE(ABORT, 'CIM audit evidence is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_audit_events_no_delete
       BEFORE DELETE ON deal_hunter_cim_audit_events
       BEGIN SELECT RAISE(ABORT, 'CIM audit evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_audit_events_no_replace
+      BEFORE INSERT ON deal_hunter_cim_audit_events
+      WHEN EXISTS (SELECT 1 FROM deal_hunter_cim_audit_events WHERE id = NEW.id)
+      BEGIN SELECT RAISE(ABORT, 'CIM audit evidence is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_safety_events_payload_immutable
       BEFORE UPDATE OF id, safety_run_id, opportunity_id, source_type, source_run_id,
         canonical_revision, identity_exception_revision, event_type, evidence_id, created_at
@@ -4768,6 +4796,16 @@ export function createSqliteStorage(config, options = {}) {
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_safety_events_no_delete
       BEFORE DELETE ON deal_hunter_cim_safety_events
       BEGIN SELECT RAISE(ABORT, 'CIM safety evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_safety_events_no_replace
+      BEFORE INSERT ON deal_hunter_cim_safety_events
+      WHEN EXISTS (
+        SELECT 1 FROM deal_hunter_cim_safety_events
+        WHERE id = NEW.id OR (
+          safety_run_id = NEW.safety_run_id AND opportunity_id = NEW.opportunity_id
+          AND event_type = NEW.event_type AND evidence_id = NEW.evidence_id
+        )
+      )
+      BEGIN SELECT RAISE(ABORT, 'CIM safety evidence payload is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_transmissions_payload_immutable
       BEFORE UPDATE OF id, conversation_id, member_digest, preparation_generation,
         payload_version, payload_digest, from_address, to_addresses, cc_addresses,
@@ -4778,6 +4816,20 @@ export function createSqliteStorage(config, options = {}) {
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_transmissions_no_delete
       BEFORE DELETE ON deal_hunter_cim_transmissions
       BEGIN SELECT RAISE(ABORT, 'prepared CIM transmission evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_transmissions_no_replace
+      BEFORE INSERT ON deal_hunter_cim_transmissions
+      WHEN EXISTS (
+        SELECT 1 FROM deal_hunter_cim_transmissions
+        WHERE id = NEW.id
+          OR provider_idempotency_key = NEW.provider_idempotency_key
+          OR communication_id = NEW.communication_id
+          OR outbox_id = NEW.outbox_id
+          OR (conversation_id = NEW.conversation_id AND member_digest = NEW.member_digest
+            AND preparation_generation = NEW.preparation_generation)
+          OR (NEW.provider IS NOT NULL AND NEW.provider_message_id IS NOT NULL
+            AND provider = NEW.provider AND provider_message_id = NEW.provider_message_id)
+      )
+      BEGIN SELECT RAISE(ABORT, 'prepared CIM transmission payload is immutable'); END;
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_transmission_touches_identity_immutable
       BEFORE UPDATE OF transmission_id, touch_id, opportunity_id, campaign_id,
         display_ordinal, created_at
@@ -4786,6 +4838,14 @@ export function createSqliteStorage(config, options = {}) {
       CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_transmission_touches_no_delete
       BEFORE DELETE ON deal_hunter_cim_transmission_touches
       BEGIN SELECT RAISE(ABORT, 'CIM transmission membership evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_transmission_touches_no_replace
+      BEFORE INSERT ON deal_hunter_cim_transmission_touches
+      WHEN EXISTS (
+        SELECT 1 FROM deal_hunter_cim_transmission_touches
+        WHERE (transmission_id = NEW.transmission_id AND touch_id = NEW.touch_id)
+          OR (NEW.cancelled_at IS NULL AND touch_id = NEW.touch_id AND cancelled_at IS NULL)
+      )
+      BEGIN SELECT RAISE(ABORT, 'CIM transmission membership identity is immutable'); END;
 
       CREATE TABLE IF NOT EXISTS crm_submission_supersessions (
         id TEXT PRIMARY KEY,

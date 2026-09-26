@@ -478,7 +478,10 @@ test('Supabase migration and fresh schema isolate every current app table to the
     /revoke all privileges on table([\s\S]*?)from public, anon, authenticated;/i,
   )?.[1] ?? '';
   const pursueCimGrantBlock = pursueCimAutopilotMigration.match(
-    /grant all privileges on table([\s\S]*?)to service_role;/i,
+    /grant select, insert, update, delete on table([\s\S]*?)to service_role;/i,
+  )?.[1] ?? '';
+  const pursueCimServiceRevokeBlock = pursueCimAutopilotMigration.match(
+    /revoke all privileges on table([\s\S]*?)from service_role;/i,
   )?.[1] ?? '';
   for (const tableName of [
     'deal_hunter_owner_decision_events',
@@ -501,6 +504,10 @@ test('Supabase migration and fresh schema isolate every current app table to the
     );
     assert.match(
       pursueCimGrantBlock,
+      new RegExp(`public\\.${tableName}(?:,|\\s*$)`, 'i'),
+    );
+    assert.match(
+      pursueCimServiceRevokeBlock,
       new RegExp(`public\\.${tableName}(?:,|\\s*$)`, 'i'),
     );
   }

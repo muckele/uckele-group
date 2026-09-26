@@ -25,6 +25,10 @@ const expectedTables = [
   'deal_hunter_owner_decision_events',
   'deal_hunter_pursuit_enrollments',
 ];
+const singleIdTables = expectedTables.filter((table) => ![
+  'deal_hunter_cim_transmission_touches',
+  'deal_hunter_opportunity_timezone_revisions',
+].includes(table));
 
 function run(command, args, input) {
   const result = spawnSync(command, args, {
@@ -186,6 +190,20 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
           from unnest(array[${expectedTables.map((name) => `'${name}'`).join(',')}]) as name),
         'service', (select bool_and(has_table_privilege('service_role', format('public.%I', name), 'SELECT'))
           from unnest(array[${expectedTables.map((name) => `'${name}'`).join(',')}]) as name),
+        'serviceWrite', (select bool_and(
+            has_table_privilege('service_role', format('public.%I', name), 'INSERT')
+            and has_table_privilege('service_role', format('public.%I', name), 'UPDATE')
+            and has_table_privilege('service_role', format('public.%I', name), 'DELETE')
+          ) from unnest(array[${expectedTables.map((name) => `'${name}'`).join(',')}]) as name),
+        'serviceTruncate', (select bool_or(
+            has_table_privilege('service_role', format('public.%I', name), 'TRUNCATE')
+          ) from unnest(array[${expectedTables.map((name) => `'${name}'`).join(',')}]) as name),
+        'idsNotNull', (select bool_and(a.attnotnull)
+          from pg_attribute as a
+          join pg_class as c on c.oid = a.attrelid
+          join pg_namespace as n on n.oid = c.relnamespace
+          where n.nspname = 'public' and a.attname = 'id' and not a.attisdropped
+            and c.relname = any(array[${singleIdTables.map((name) => `'${name}'`).join(',')}])),
         'activeIndex', to_regclass('public.uq_deal_hunter_cim_campaigns_active_opportunity') is not null,
         'membershipIndex', to_regclass('public.uq_deal_hunter_cim_transmission_touches_active_touch') is not null
       );
@@ -195,6 +213,9 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
     assert.equal(catalog.anon, false);
     assert.equal(catalog.authenticated, false);
     assert.equal(catalog.service, true);
+    assert.equal(catalog.serviceWrite, true);
+    assert.equal(catalog.serviceTruncate, false);
+    assert.equal(catalog.idsNotNull, true);
     assert.equal(catalog.activeIndex, true);
     assert.equal(catalog.membershipIndex, true);
     for (const table of [
@@ -209,6 +230,11 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
     }
   }
   assert.deepEqual(legacyFingerprint(container, 'pursue_cim_upgrade'), before);
+
+  assert.notEqual(rejectedSql(container, 'pursue_cim_upgrade', `
+    set role service_role;
+    truncate table public.deal_hunter_cim_audit_events;
+  `).status, 0);
 
   psql(container, 'pursue_cim_upgrade', `
     insert into public.deal_hunter_opportunities
@@ -252,6 +278,34 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
       'permission-v1', repeat('2',64), 1, 'synthetic-cohort', 1, 1,
       'recipient-authority', repeat('e',64), repeat('3',64), 0, 0, 1,
       'conversation-1', 'initial-pending', 'awaiting-window', 0, 1, now(), now());
+  `);
+  assert.notEqual(rejectedSql(container, 'pursue_cim_upgrade', `
+    insert into public.deal_hunter_owner_decision_events
+      (id,idempotency_key,request_digest,opportunity_id,action,actor,
+       expected_discovery_revision,expected_material_revision,
+       observed_discovery_revision,observed_material_revision,policy_version,created_at)
+    values (null,'null-id',repeat('a',64),'opp-p1a','pursue','fixture',
+      0,0,0,0,'v1',now());
+  `).status, 0);
+  for (const [label, campaignId, scopeId] of [
+    ['missing', 'null', "'campaign-1'"],
+    ['mismatch', "'campaign-2'", "'campaign-1'"],
+    ['nonexistent', "'campaign-missing'", "'campaign-missing'"],
+  ]) {
+    assert.notEqual(rejectedSql(container, 'pursue_cim_upgrade', `
+      insert into public.deal_hunter_cim_terminal_events
+        (id,scope,scope_id,campaign_id,revision,reason_code,evidence_type,evidence_id,
+         observed_at,actor,source,metadata_digest,created_at)
+      values ('terminal-${label}','campaign',${scopeId},${campaignId},1,'watch_selected',
+        'owner-decision','decision-1',now(),'fixture','test',repeat('8',64),now());
+    `).status, 0, label);
+  }
+  psql(container, 'pursue_cim_upgrade', `
+    insert into public.deal_hunter_cim_terminal_events
+      (id,scope,scope_id,campaign_id,revision,reason_code,evidence_type,evidence_id,
+       observed_at,actor,source,metadata_digest,created_at)
+    values ('terminal-valid','campaign','campaign-1','campaign-1',1,'watch_selected',
+      'owner-decision','decision-1',now(),'fixture','test',repeat('8',64),now());
   `);
   const duplicateActive = rejectedSql(container, 'pursue_cim_upgrade', `
     insert into public.deal_hunter_cim_campaigns
