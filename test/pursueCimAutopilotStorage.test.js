@@ -209,7 +209,7 @@ function insertBaseAuthority(database, suffix = '') {
       created_at, updated_at, row_version
     ) VALUES (?, 'recipient-authority', ?, 'broker@example.test', 'sender-v1',
       'reply-v1', ?, ?, 'open', 0, 'batching-off-v1', ?, ?, 1)
-  `).run(conversationId, digest('e'), digest('f'), `thread${suffix}`, at, at);
+  `).run(conversationId, digest('e'), digest(suffix ? '0' : 'f'), `thread${suffix}`, at, at);
   database.prepare(`
     INSERT INTO deal_hunter_cim_campaigns (
       id, opportunity_id, generation, enrollment_id, decision_event_id,
@@ -295,8 +295,11 @@ test('P1A SQLite fresh and upgrade databases expose every inert authority and pr
 
   const upgradePath = temporaryPath(t, 'pursue-cim-upgrade');
   initialize(upgradePath);
-  const legacy = new Database(upgradePath);
+  let legacy = new Database(upgradePath);
   seedLegacyEvidence(legacy);
+  legacy.close();
+  initialize(upgradePath);
+  legacy = new Database(upgradePath);
   legacy.pragma('foreign_keys = OFF');
   for (const table of tableDropOrder) legacy.exec(`DROP TABLE IF EXISTS ${table}`);
   legacy.pragma('foreign_keys = ON');
@@ -385,11 +388,12 @@ test('P1A SQLite accepts a valid authority graph and enforces foreign keys', (t)
   `).run(transmission.transmissionId, digest('6'), digest('e'), at);
 
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events').get().count, 1);
+  seedOpportunity(database, 'opp-orphan');
   assert.throws(() => database.prepare(`
     INSERT INTO deal_hunter_pursuit_enrollments (
       id, decision_event_id, opportunity_id, state, authority_digest, created_at, updated_at
     ) VALUES ('orphan', 'missing-decision', ?, 'queued', ?, ?, ?)
-  `).run(authority.opportunityId, digest('f'), at, at), /FOREIGN KEY/i);
+  `).run('opp-orphan', digest('f'), at, at), /FOREIGN KEY/i);
   database.close();
 });
 

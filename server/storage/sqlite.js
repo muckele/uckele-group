@@ -4300,6 +4300,467 @@ export function createSqliteStorage(config, options = {}) {
         metadata TEXT NOT NULL DEFAULT '{}'
       );
 
+      CREATE TABLE IF NOT EXISTS deal_hunter_owner_decision_events (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        idempotency_key TEXT NOT NULL UNIQUE
+          CHECK(idempotency_key = trim(idempotency_key) AND length(idempotency_key) BETWEEN 1 AND 240),
+        request_digest TEXT NOT NULL CHECK(length(request_digest) = 64),
+        opportunity_id TEXT NOT NULL,
+        action TEXT NOT NULL CHECK(action IN ('pursue', 'watch', 'pass')),
+        actor TEXT NOT NULL CHECK(actor = trim(actor) AND length(actor) BETWEEN 1 AND 200),
+        expected_discovery_revision INTEGER NOT NULL CHECK(expected_discovery_revision >= 0),
+        expected_material_revision INTEGER NOT NULL CHECK(expected_material_revision >= 0),
+        observed_discovery_revision INTEGER NOT NULL CHECK(observed_discovery_revision >= 0),
+        observed_material_revision INTEGER NOT NULL CHECK(observed_material_revision >= 0),
+        selected_contact_reference_digest TEXT
+          CHECK(selected_contact_reference_digest IS NULL OR length(selected_contact_reference_digest) = 64),
+        policy_version TEXT NOT NULL
+          CHECK(policy_version = trim(policy_version) AND length(policy_version) BETWEEN 1 AND 120),
+        created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_pursuit_enrollments (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        decision_event_id TEXT NOT NULL UNIQUE,
+        opportunity_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN (
+          'queued', 'waiting-on-eligibility', 'campaign-created', 'action-required', 'superseded'
+        )),
+        reason_code TEXT CHECK(reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 160),
+        authority_digest TEXT NOT NULL CHECK(length(authority_digest) = 64),
+        created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+        updated_at TEXT NOT NULL CHECK(julianday(updated_at) IS NOT NULL),
+        row_version INTEGER NOT NULL DEFAULT 1 CHECK(row_version >= 1),
+        FOREIGN KEY(decision_event_id) REFERENCES deal_hunter_owner_decision_events(id) ON DELETE RESTRICT,
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_opportunity_timezone_revisions (
+        opportunity_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        state TEXT NOT NULL CHECK(state IN ('verified', 'derived', 'missing', 'ambiguous')),
+        iana_timezone TEXT CHECK(iana_timezone IS NULL OR (
+          iana_timezone = trim(iana_timezone) AND length(iana_timezone) BETWEEN 1 AND 120
+        )),
+        evidence_type TEXT NOT NULL
+          CHECK(evidence_type = trim(evidence_type) AND length(evidence_type) BETWEEN 1 AND 120),
+        evidence_id TEXT NOT NULL
+          CHECK(evidence_id = trim(evidence_id) AND length(evidence_id) BETWEEN 1 AND 240),
+        evidence_digest TEXT NOT NULL CHECK(length(evidence_digest) = 64),
+        resolver_version TEXT NOT NULL
+          CHECK(resolver_version = trim(resolver_version) AND length(resolver_version) BETWEEN 1 AND 120),
+        dataset_digest TEXT NOT NULL CHECK(length(dataset_digest) = 64),
+        actor TEXT NOT NULL CHECK(actor = trim(actor) AND length(actor) BETWEEN 1 AND 200),
+        created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+        PRIMARY KEY(opportunity_id, revision),
+        CHECK(
+          (state IN ('verified', 'derived') AND iana_timezone IS NOT NULL)
+          OR (state IN ('missing', 'ambiguous') AND iana_timezone IS NULL)
+        ),
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_broker_conversations (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        recipient_authority_id TEXT NOT NULL
+          CHECK(recipient_authority_id = trim(recipient_authority_id) AND length(recipient_authority_id) BETWEEN 1 AND 240),
+        recipient_fingerprint TEXT NOT NULL CHECK(length(recipient_fingerprint) = 64),
+        recipient_address TEXT NOT NULL
+          CHECK(recipient_address = trim(recipient_address) AND length(recipient_address) BETWEEN 3 AND 320),
+        sender_policy_version TEXT NOT NULL
+          CHECK(sender_policy_version = trim(sender_policy_version) AND length(sender_policy_version) BETWEEN 1 AND 120),
+        reply_policy_version TEXT NOT NULL
+          CHECK(reply_policy_version = trim(reply_policy_version) AND length(reply_policy_version) BETWEEN 1 AND 120),
+        reply_alias_token_digest TEXT NOT NULL UNIQUE CHECK(length(reply_alias_token_digest) = 64),
+        rfc_thread_key TEXT NOT NULL UNIQUE
+          CHECK(rfc_thread_key = trim(rfc_thread_key) AND length(rfc_thread_key) BETWEEN 1 AND 500),
+        state TEXT NOT NULL CHECK(state IN (
+          'open', 'reply-review-required', 'responded', 'stopped', 'provider-ambiguous', 'closed'
+        )),
+        terminal_revision INTEGER NOT NULL DEFAULT 0 CHECK(terminal_revision >= 0),
+        batching_policy_version TEXT NOT NULL
+          CHECK(batching_policy_version = trim(batching_policy_version) AND length(batching_policy_version) BETWEEN 1 AND 120),
+        created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+        updated_at TEXT NOT NULL CHECK(julianday(updated_at) IS NOT NULL),
+        row_version INTEGER NOT NULL DEFAULT 1 CHECK(row_version >= 1)
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_campaigns (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        opportunity_id TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK(generation > 0),
+        enrollment_id TEXT NOT NULL,
+        decision_event_id TEXT NOT NULL,
+        policy_version TEXT NOT NULL
+          CHECK(policy_version = trim(policy_version) AND length(policy_version) BETWEEN 1 AND 120),
+        template_version TEXT NOT NULL
+          CHECK(template_version = trim(template_version) AND length(template_version) BETWEEN 1 AND 120),
+        template_digest TEXT NOT NULL CHECK(length(template_digest) = 64),
+        permission_version TEXT NOT NULL
+          CHECK(permission_version = trim(permission_version) AND length(permission_version) BETWEEN 1 AND 120),
+        permission_digest TEXT NOT NULL CHECK(length(permission_digest) = 64),
+        permission_revision INTEGER NOT NULL CHECK(permission_revision >= 0),
+        permission_scope TEXT NOT NULL
+          CHECK(permission_scope = trim(permission_scope) AND length(permission_scope) BETWEEN 1 AND 240),
+        canonical_revision INTEGER NOT NULL CHECK(canonical_revision >= 0),
+        crm_submission_id TEXT,
+        crm_ownership_revision INTEGER NOT NULL CHECK(crm_ownership_revision >= 0),
+        recipient_authority_id TEXT NOT NULL
+          CHECK(recipient_authority_id = trim(recipient_authority_id) AND length(recipient_authority_id) BETWEEN 1 AND 240),
+        recipient_fingerprint TEXT NOT NULL CHECK(length(recipient_fingerprint) = 64),
+        freshness_authority_digest TEXT NOT NULL CHECK(length(freshness_authority_digest) = 64),
+        discovery_revision INTEGER NOT NULL CHECK(discovery_revision >= 0),
+        material_revision INTEGER NOT NULL CHECK(material_revision >= 0),
+        timezone_revision INTEGER NOT NULL CHECK(timezone_revision > 0),
+        conversation_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN (
+          'queued', 'waiting-on-eligibility', 'initial-pending', 'active-follow-up',
+          'action-required', 'responded', 'materials-received', 'stopped', 'expired',
+          'provider-ambiguous'
+        )),
+        reason_code TEXT CHECK(reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 160),
+        initial_accepted_at TEXT CHECK(initial_accepted_at IS NULL OR julianday(initial_accepted_at) IS NOT NULL),
+        local_expiry_at TEXT CHECK(local_expiry_at IS NULL OR julianday(local_expiry_at) IS NOT NULL),
+        expiry_derivation TEXT NOT NULL DEFAULT '{}',
+        terminal_revision INTEGER NOT NULL DEFAULT 0 CHECK(terminal_revision >= 0),
+        row_version INTEGER NOT NULL DEFAULT 1 CHECK(row_version >= 1),
+        created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+        updated_at TEXT NOT NULL CHECK(julianday(updated_at) IS NOT NULL),
+        UNIQUE(opportunity_id, generation),
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT,
+        FOREIGN KEY(enrollment_id) REFERENCES deal_hunter_pursuit_enrollments(id) ON DELETE RESTRICT,
+        FOREIGN KEY(decision_event_id) REFERENCES deal_hunter_owner_decision_events(id) ON DELETE RESTRICT,
+        FOREIGN KEY(crm_submission_id) REFERENCES contact_submissions(id) ON DELETE RESTRICT,
+        FOREIGN KEY(opportunity_id, timezone_revision)
+          REFERENCES deal_hunter_opportunity_timezone_revisions(opportunity_id, revision) ON DELETE RESTRICT,
+        FOREIGN KEY(conversation_id) REFERENCES deal_hunter_broker_conversations(id) ON DELETE RESTRICT
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_campaign_touches (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        campaign_id TEXT NOT NULL,
+        opportunity_id TEXT NOT NULL,
+        logical_slot TEXT NOT NULL
+          CHECK(logical_slot = trim(logical_slot) AND length(logical_slot) BETWEEN 1 AND 160),
+        kind TEXT NOT NULL CHECK(kind IN (
+          'initial', 'follow-up-1', 'follow-up-2', 'follow-up-3', 'weekday-follow-up'
+        )),
+        ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+        due_at TEXT NOT NULL CHECK(julianday(due_at) IS NOT NULL),
+        due_local TEXT NOT NULL CHECK(due_local = trim(due_local) AND length(due_local) BETWEEN 1 AND 120),
+        timezone_revision INTEGER NOT NULL CHECK(timezone_revision > 0),
+        state TEXT NOT NULL CHECK(state IN (
+          'scheduled', 'claimed', 'provider-pending', 'accepted', 'definitive-failure',
+          'ambiguous', 'cancelled-before-provider'
+        )),
+        claim_token_digest TEXT CHECK(claim_token_digest IS NULL OR length(claim_token_digest) = 64),
+        claim_owner TEXT CHECK(claim_owner IS NULL OR length(claim_owner) BETWEEN 1 AND 200),
+        claimed_at TEXT CHECK(claimed_at IS NULL OR julianday(claimed_at) IS NOT NULL),
+        claim_expires_at TEXT CHECK(claim_expires_at IS NULL OR julianday(claim_expires_at) IS NOT NULL),
+        transmission_id TEXT,
+        outcome_code TEXT CHECK(outcome_code IS NULL OR length(outcome_code) BETWEEN 1 AND 160),
+        terminal_reason TEXT CHECK(terminal_reason IS NULL OR length(terminal_reason) BETWEEN 1 AND 160),
+        row_version INTEGER NOT NULL DEFAULT 1 CHECK(row_version >= 1),
+        created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+        updated_at TEXT NOT NULL CHECK(julianday(updated_at) IS NOT NULL),
+        UNIQUE(campaign_id, logical_slot),
+        FOREIGN KEY(campaign_id) REFERENCES deal_hunter_cim_campaigns(id) ON DELETE RESTRICT,
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT,
+        FOREIGN KEY(opportunity_id, timezone_revision)
+          REFERENCES deal_hunter_opportunity_timezone_revisions(opportunity_id, revision) ON DELETE RESTRICT,
+        FOREIGN KEY(transmission_id) REFERENCES deal_hunter_cim_transmissions(id) ON DELETE RESTRICT
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_transmissions (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        conversation_id TEXT NOT NULL,
+        member_digest TEXT NOT NULL CHECK(length(member_digest) = 64),
+        preparation_generation INTEGER NOT NULL CHECK(preparation_generation > 0),
+        payload_version TEXT NOT NULL
+          CHECK(payload_version = trim(payload_version) AND length(payload_version) BETWEEN 1 AND 120),
+        payload_digest TEXT NOT NULL CHECK(length(payload_digest) = 64),
+        from_address TEXT NOT NULL CHECK(length(from_address) BETWEEN 3 AND 320),
+        to_addresses TEXT NOT NULL,
+        cc_addresses TEXT NOT NULL DEFAULT '[]',
+        bcc_addresses TEXT NOT NULL DEFAULT '[]',
+        reply_to_address TEXT NOT NULL CHECK(length(reply_to_address) BETWEEN 3 AND 320),
+        subject TEXT NOT NULL CHECK(length(subject) BETWEEN 1 AND 998),
+        provider_idempotency_key TEXT NOT NULL UNIQUE
+          CHECK(provider_idempotency_key = trim(provider_idempotency_key) AND length(provider_idempotency_key) BETWEEN 1 AND 240),
+        communication_id TEXT NOT NULL UNIQUE,
+        outbox_id TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK(state IN (
+          'prepared', 'final-gate-blocked', 'provider-pending', 'accepted',
+          'definitive-failure', 'ambiguous', 'cancelled-before-provider'
+        )),
+        release_state TEXT NOT NULL CHECK(release_state IN (
+          'ordinary', 'awaiting-live-authorization', 'authorized'
+        )),
+        final_gate_authority_digest TEXT
+          CHECK(final_gate_authority_digest IS NULL OR length(final_gate_authority_digest) = 64),
+        campaign_terminal_revision INTEGER CHECK(campaign_terminal_revision IS NULL OR campaign_terminal_revision >= 0),
+        conversation_terminal_revision INTEGER CHECK(conversation_terminal_revision IS NULL OR conversation_terminal_revision >= 0),
+        invocation_authority_count INTEGER NOT NULL DEFAULT 0 CHECK(invocation_authority_count IN (0, 1)),
+        provider_invocation_authorized_at TEXT
+          CHECK(provider_invocation_authorized_at IS NULL OR julianday(provider_invocation_authorized_at) IS NOT NULL),
+        boundary_nonce_digest TEXT CHECK(boundary_nonce_digest IS NULL OR length(boundary_nonce_digest) = 64),
+        provider_seam_entered_at TEXT
+          CHECK(provider_seam_entered_at IS NULL OR julianday(provider_seam_entered_at) IS NOT NULL),
+        provider TEXT CHECK(provider IS NULL OR length(provider) BETWEEN 1 AND 80),
+        provider_message_id TEXT CHECK(provider_message_id IS NULL OR length(provider_message_id) BETWEEN 1 AND 240),
+        provider_result_code TEXT CHECK(provider_result_code IS NULL OR length(provider_result_code) BETWEEN 1 AND 160),
+        row_version INTEGER NOT NULL DEFAULT 1 CHECK(row_version >= 1),
+        created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+        updated_at TEXT NOT NULL CHECK(julianday(updated_at) IS NOT NULL),
+        UNIQUE(conversation_id, member_digest, preparation_generation),
+        FOREIGN KEY(conversation_id) REFERENCES deal_hunter_broker_conversations(id) ON DELETE RESTRICT,
+        FOREIGN KEY(communication_id) REFERENCES crm_communications(id) ON DELETE RESTRICT,
+        FOREIGN KEY(outbox_id) REFERENCES crm_email_outbox(id) ON DELETE RESTRICT
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_transmission_touches (
+        transmission_id TEXT NOT NULL,
+        touch_id TEXT NOT NULL,
+        opportunity_id TEXT NOT NULL,
+        campaign_id TEXT NOT NULL,
+        display_ordinal INTEGER NOT NULL CHECK(display_ordinal > 0),
+        cancelled_at TEXT CHECK(cancelled_at IS NULL OR julianday(cancelled_at) IS NOT NULL),
+        cancellation_reason TEXT
+          CHECK(cancellation_reason IS NULL OR length(cancellation_reason) BETWEEN 1 AND 160),
+        created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+        PRIMARY KEY(transmission_id, touch_id),
+        CHECK(
+          (cancelled_at IS NULL AND cancellation_reason IS NULL)
+          OR (cancelled_at IS NOT NULL AND cancellation_reason IS NOT NULL)
+        ),
+        FOREIGN KEY(transmission_id) REFERENCES deal_hunter_cim_transmissions(id) ON DELETE RESTRICT,
+        FOREIGN KEY(touch_id) REFERENCES deal_hunter_cim_campaign_touches(id) ON DELETE RESTRICT,
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT,
+        FOREIGN KEY(campaign_id) REFERENCES deal_hunter_cim_campaigns(id) ON DELETE RESTRICT
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_terminal_events (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        scope TEXT NOT NULL CHECK(scope IN ('campaign', 'conversation')),
+        scope_id TEXT NOT NULL CHECK(scope_id = trim(scope_id) AND length(scope_id) BETWEEN 1 AND 240),
+        campaign_id TEXT,
+        conversation_id TEXT,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        reason_code TEXT NOT NULL
+          CHECK(reason_code = trim(reason_code) AND length(reason_code) BETWEEN 1 AND 160),
+        evidence_type TEXT NOT NULL
+          CHECK(evidence_type = trim(evidence_type) AND length(evidence_type) BETWEEN 1 AND 120),
+        evidence_id TEXT NOT NULL
+          CHECK(evidence_id = trim(evidence_id) AND length(evidence_id) BETWEEN 1 AND 240),
+        observed_at TEXT NOT NULL CHECK(julianday(observed_at) IS NOT NULL),
+        actor TEXT NOT NULL CHECK(actor = trim(actor) AND length(actor) BETWEEN 1 AND 200),
+        source TEXT NOT NULL CHECK(source = trim(source) AND length(source) BETWEEN 1 AND 120),
+        metadata_digest TEXT NOT NULL CHECK(length(metadata_digest) = 64),
+        created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+        UNIQUE(scope, scope_id, revision),
+        CHECK(
+          (scope = 'campaign' AND campaign_id = scope_id AND conversation_id IS NULL)
+          OR (scope = 'conversation' AND conversation_id = scope_id AND campaign_id IS NULL)
+        ),
+        FOREIGN KEY(campaign_id) REFERENCES deal_hunter_cim_campaigns(id) ON DELETE RESTRICT,
+        FOREIGN KEY(conversation_id) REFERENCES deal_hunter_broker_conversations(id) ON DELETE RESTRICT
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_safety_events (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        safety_run_id TEXT NOT NULL
+          CHECK(safety_run_id = trim(safety_run_id) AND length(safety_run_id) BETWEEN 1 AND 240),
+        opportunity_id TEXT NOT NULL,
+        source_type TEXT NOT NULL
+          CHECK(source_type = trim(source_type) AND length(source_type) BETWEEN 1 AND 120),
+        source_run_id TEXT NOT NULL
+          CHECK(source_run_id = trim(source_run_id) AND length(source_run_id) BETWEEN 1 AND 240),
+        canonical_revision INTEGER NOT NULL CHECK(canonical_revision >= 0),
+        identity_exception_revision INTEGER NOT NULL CHECK(identity_exception_revision >= 0),
+        event_type TEXT NOT NULL
+          CHECK(event_type = trim(event_type) AND length(event_type) BETWEEN 1 AND 160),
+        evidence_id TEXT NOT NULL
+          CHECK(evidence_id = trim(evidence_id) AND length(evidence_id) BETWEEN 1 AND 240),
+        status TEXT NOT NULL CHECK(status IN ('pending', 'stopped', 'review-required', 'no-op')),
+        outcome_evidence_id TEXT
+          CHECK(outcome_evidence_id IS NULL OR length(outcome_evidence_id) BETWEEN 1 AND 240),
+        outcome_revision INTEGER CHECK(outcome_revision IS NULL OR outcome_revision >= 0),
+        created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+        consumed_at TEXT CHECK(consumed_at IS NULL OR julianday(consumed_at) IS NOT NULL),
+        updated_at TEXT NOT NULL CHECK(julianday(updated_at) IS NOT NULL),
+        UNIQUE(safety_run_id, opportunity_id, event_type, evidence_id),
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_audit_events (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        event_type TEXT NOT NULL
+          CHECK(event_type = trim(event_type) AND length(event_type) BETWEEN 1 AND 160),
+        opportunity_id TEXT,
+        campaign_id TEXT,
+        conversation_id TEXT,
+        touch_id TEXT,
+        transmission_id TEXT,
+        activation_id TEXT,
+        authorization_id TEXT,
+        prior_state TEXT CHECK(prior_state IS NULL OR length(prior_state) BETWEEN 1 AND 120),
+        next_state TEXT CHECK(next_state IS NULL OR length(next_state) BETWEEN 1 AND 120),
+        reason_code TEXT CHECK(reason_code IS NULL OR length(reason_code) BETWEEN 1 AND 160),
+        authority_digest TEXT CHECK(authority_digest IS NULL OR length(authority_digest) = 64),
+        payload_digest TEXT CHECK(payload_digest IS NULL OR length(payload_digest) = 64),
+        actor TEXT NOT NULL CHECK(actor = trim(actor) AND length(actor) BETWEEN 1 AND 200),
+        source TEXT NOT NULL CHECK(source = trim(source) AND length(source) BETWEEN 1 AND 120),
+        occurred_at TEXT NOT NULL CHECK(julianday(occurred_at) IS NOT NULL),
+        metadata TEXT NOT NULL DEFAULT '{}',
+        FOREIGN KEY(opportunity_id) REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE RESTRICT,
+        FOREIGN KEY(campaign_id) REFERENCES deal_hunter_cim_campaigns(id) ON DELETE RESTRICT,
+        FOREIGN KEY(conversation_id) REFERENCES deal_hunter_broker_conversations(id) ON DELETE RESTRICT,
+        FOREIGN KEY(touch_id) REFERENCES deal_hunter_cim_campaign_touches(id) ON DELETE RESTRICT,
+        FOREIGN KEY(transmission_id) REFERENCES deal_hunter_cim_transmissions(id) ON DELETE RESTRICT,
+        FOREIGN KEY(activation_id) REFERENCES deal_hunter_cim_capability_activations(id) ON DELETE RESTRICT,
+        FOREIGN KEY(authorization_id) REFERENCES deal_hunter_cim_live_provider_authorizations(id) ON DELETE RESTRICT
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_capability_activations (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        capability TEXT NOT NULL CHECK(capability IN (
+          'fl04a-safety', 'fl04b-enrollment', 'fl04b-initial', 'fl04c-followup', 'fl04c-batch'
+        )),
+        mode TEXT NOT NULL CHECK(mode IN ('off', 'shadow', 'mailbox', 'canary', 'active')),
+        status TEXT NOT NULL CHECK(status IN ('current', 'superseded', 'withdrawn')),
+        prerequisite_activation_id TEXT,
+        prerequisite_evidence_id TEXT
+          CHECK(prerequisite_evidence_id IS NULL OR length(prerequisite_evidence_id) BETWEEN 1 AND 240),
+        prerequisite_evidence_hash TEXT
+          CHECK(prerequisite_evidence_hash IS NULL OR length(prerequisite_evidence_hash) = 64),
+        policy_hash TEXT NOT NULL CHECK(length(policy_hash) = 64),
+        config_hash TEXT NOT NULL CHECK(length(config_hash) = 64),
+        cohort_digest TEXT CHECK(cohort_digest IS NULL OR length(cohort_digest) = 64),
+        permission_basis_digest TEXT
+          CHECK(permission_basis_digest IS NULL OR length(permission_basis_digest) = 64),
+        permission_revision INTEGER CHECK(permission_revision IS NULL OR permission_revision >= 0),
+        actor TEXT NOT NULL CHECK(actor = trim(actor) AND length(actor) BETWEEN 1 AND 200),
+        reason TEXT NOT NULL CHECK(reason = trim(reason) AND length(reason) BETWEEN 1 AND 1000),
+        confirmation TEXT NOT NULL
+          CHECK(confirmation = trim(confirmation) AND length(confirmation) BETWEEN 1 AND 240),
+        expires_at TEXT CHECK(expires_at IS NULL OR julianday(expires_at) IS NOT NULL),
+        daily_cap INTEGER CHECK(daily_cap IS NULL OR daily_cap >= 0),
+        recipient_cap INTEGER CHECK(recipient_cap IS NULL OR recipient_cap >= 0),
+        provider_profile TEXT NOT NULL
+          CHECK(provider_profile = trim(provider_profile) AND length(provider_profile) BETWEEN 1 AND 120),
+        superseded_at TEXT CHECK(superseded_at IS NULL OR julianday(superseded_at) IS NOT NULL),
+        withdrawn_at TEXT CHECK(withdrawn_at IS NULL OR julianday(withdrawn_at) IS NOT NULL),
+        created_at TEXT NOT NULL CHECK(julianday(created_at) IS NOT NULL),
+        updated_at TEXT NOT NULL CHECK(julianday(updated_at) IS NOT NULL),
+        FOREIGN KEY(prerequisite_activation_id)
+          REFERENCES deal_hunter_cim_capability_activations(id) ON DELETE RESTRICT
+      );
+
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_live_provider_authorizations (
+        id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
+        activation_id TEXT NOT NULL,
+        capability TEXT NOT NULL CHECK(capability IN (
+          'fl04a-safety', 'fl04b-enrollment', 'fl04b-initial', 'fl04c-followup', 'fl04c-batch'
+        )),
+        writer_path TEXT NOT NULL
+          CHECK(writer_path = trim(writer_path) AND length(writer_path) BETWEEN 1 AND 240),
+        transmission_id TEXT NOT NULL,
+        payload_digest TEXT NOT NULL CHECK(length(payload_digest) = 64),
+        recipient_authority_digest TEXT NOT NULL CHECK(length(recipient_authority_digest) = 64),
+        provider_profile TEXT NOT NULL
+          CHECK(provider_profile = trim(provider_profile) AND length(provider_profile) BETWEEN 1 AND 120),
+        maximum_calls INTEGER NOT NULL CHECK(maximum_calls = 1),
+        issued_at TEXT NOT NULL CHECK(julianday(issued_at) IS NOT NULL),
+        expires_at TEXT NOT NULL CHECK(julianday(expires_at) IS NOT NULL),
+        consumed_at TEXT CHECK(consumed_at IS NULL OR julianday(consumed_at) IS NOT NULL),
+        withdrawn_at TEXT CHECK(withdrawn_at IS NULL OR julianday(withdrawn_at) IS NOT NULL),
+        actor TEXT NOT NULL CHECK(actor = trim(actor) AND length(actor) BETWEEN 1 AND 200),
+        reason TEXT NOT NULL CHECK(reason = trim(reason) AND length(reason) BETWEEN 1 AND 1000),
+        FOREIGN KEY(activation_id) REFERENCES deal_hunter_cim_capability_activations(id) ON DELETE RESTRICT,
+        FOREIGN KEY(transmission_id) REFERENCES deal_hunter_cim_transmissions(id) ON DELETE RESTRICT
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_hunter_pursuit_enrollments_current_opportunity
+        ON deal_hunter_pursuit_enrollments(opportunity_id) WHERE state <> 'superseded';
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_hunter_cim_campaigns_active_opportunity
+        ON deal_hunter_cim_campaigns(opportunity_id)
+        WHERE state IN (
+          'queued', 'waiting-on-eligibility', 'initial-pending', 'active-follow-up',
+          'action-required', 'provider-ambiguous'
+        );
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_campaigns_conversation_state
+        ON deal_hunter_cim_campaigns(conversation_id, state, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_campaign_touches_due
+        ON deal_hunter_cim_campaign_touches(state, due_at, id);
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_hunter_cim_transmission_provider_message
+        ON deal_hunter_cim_transmissions(provider, provider_message_id)
+        WHERE provider IS NOT NULL AND provider_message_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_hunter_cim_transmission_touches_active_touch
+        ON deal_hunter_cim_transmission_touches(touch_id) WHERE cancelled_at IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_terminal_events_scope
+        ON deal_hunter_cim_terminal_events(scope, scope_id, revision DESC);
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_safety_events_run_status
+        ON deal_hunter_cim_safety_events(safety_run_id, status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_deal_hunter_cim_audit_events_opportunity_time
+        ON deal_hunter_cim_audit_events(opportunity_id, occurred_at DESC, id);
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_hunter_cim_capability_activations_current
+        ON deal_hunter_cim_capability_activations(capability) WHERE status = 'current';
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_deal_hunter_cim_live_authorizations_current
+        ON deal_hunter_cim_live_provider_authorizations(transmission_id, writer_path)
+        WHERE consumed_at IS NULL AND withdrawn_at IS NULL;
+
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_owner_decision_events_no_update
+      BEFORE UPDATE ON deal_hunter_owner_decision_events
+      BEGIN SELECT RAISE(ABORT, 'owner decision evidence is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_owner_decision_events_no_delete
+      BEFORE DELETE ON deal_hunter_owner_decision_events
+      BEGIN SELECT RAISE(ABORT, 'owner decision evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_timezone_revisions_no_update
+      BEFORE UPDATE ON deal_hunter_opportunity_timezone_revisions
+      BEGIN SELECT RAISE(ABORT, 'timezone revision evidence is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_timezone_revisions_no_delete
+      BEFORE DELETE ON deal_hunter_opportunity_timezone_revisions
+      BEGIN SELECT RAISE(ABORT, 'timezone revision evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_terminal_events_no_update
+      BEFORE UPDATE ON deal_hunter_cim_terminal_events
+      BEGIN SELECT RAISE(ABORT, 'terminal evidence is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_terminal_events_no_delete
+      BEFORE DELETE ON deal_hunter_cim_terminal_events
+      BEGIN SELECT RAISE(ABORT, 'terminal evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_audit_events_no_update
+      BEFORE UPDATE ON deal_hunter_cim_audit_events
+      BEGIN SELECT RAISE(ABORT, 'CIM audit evidence is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_audit_events_no_delete
+      BEFORE DELETE ON deal_hunter_cim_audit_events
+      BEGIN SELECT RAISE(ABORT, 'CIM audit evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_safety_events_payload_immutable
+      BEFORE UPDATE OF id, safety_run_id, opportunity_id, source_type, source_run_id,
+        canonical_revision, identity_exception_revision, event_type, evidence_id, created_at
+      ON deal_hunter_cim_safety_events
+      BEGIN SELECT RAISE(ABORT, 'CIM safety evidence payload is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_safety_events_no_delete
+      BEFORE DELETE ON deal_hunter_cim_safety_events
+      BEGIN SELECT RAISE(ABORT, 'CIM safety evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_transmissions_payload_immutable
+      BEFORE UPDATE OF id, conversation_id, member_digest, preparation_generation,
+        payload_version, payload_digest, from_address, to_addresses, cc_addresses,
+        bcc_addresses, reply_to_address, subject, provider_idempotency_key,
+        communication_id, outbox_id, created_at
+      ON deal_hunter_cim_transmissions
+      BEGIN SELECT RAISE(ABORT, 'prepared CIM transmission payload is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_transmissions_no_delete
+      BEFORE DELETE ON deal_hunter_cim_transmissions
+      BEGIN SELECT RAISE(ABORT, 'prepared CIM transmission evidence is retained'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_transmission_touches_identity_immutable
+      BEFORE UPDATE OF transmission_id, touch_id, opportunity_id, campaign_id,
+        display_ordinal, created_at
+      ON deal_hunter_cim_transmission_touches
+      BEGIN SELECT RAISE(ABORT, 'CIM transmission membership identity is immutable'); END;
+      CREATE TRIGGER IF NOT EXISTS trg_deal_hunter_cim_transmission_touches_no_delete
+      BEFORE DELETE ON deal_hunter_cim_transmission_touches
+      BEGIN SELECT RAISE(ABORT, 'CIM transmission membership evidence is retained'); END;
+
       CREATE TABLE IF NOT EXISTS crm_submission_supersessions (
         id TEXT PRIMARY KEY,
         created_at TEXT NOT NULL,
