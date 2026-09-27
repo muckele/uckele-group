@@ -31,6 +31,7 @@ import { consumeCompleteGoogleSheetSourceSnapshotAdmission, normalizeCompleteGoo
 import { normalizeDealHunterListingIdentity } from '../services/dealHunterListingIdentity.js';
 import { CrmSubmissionSupersededError } from '../services/crmSubmissionSupersession.js';
 import { buildFreshInboxAreas, classifyFreshInboxCandidate } from '../services/dealHunterFreshInboxPolicy.js';
+import { createPursueCimSqliteTransitions } from './pursueCimSqliteTransitions.js';
 
 function acceptedPublicationClaim(claim, acceptedAt) {
   if (!claim || claim.meaning !== 'listing_publication') {
@@ -7765,6 +7766,8 @@ export function createSqliteStorage(config, options = {}) {
 
   return {
     provider: 'sqlite',
+
+    ...createPursueCimSqliteTransitions(database),
 
     async listActiveCrmSubmissionSupersessions(filters = {}) {
       return selectActiveCrmSubmissionSupersessions(database, filters);
