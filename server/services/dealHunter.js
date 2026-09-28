@@ -49,6 +49,7 @@ import {
   getOpportunitySourceObservationRecordId,
 } from './dealHunterOpportunityFacts.js';
 import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from './dealHunterSourceSnapshotAdmission.js';
+import { importOutreachDelta, sourceSafetyRunId } from './cimSafetyIdentity.js';
 import { evaluateAcquisitionMaterialsState } from './acquisitionMaterials.js';
 import {
   buildManualFollowUpCommunicationId,
@@ -2575,11 +2576,22 @@ export async function importDealOsExport({
     eventOrdinal,
     freshnessEvidence: row.freshnessEvidence,
   }));
+  const beforeOutreach = typeof storage.readCimOutreachCounters === 'function'
+    ? await storage.readCimOutreachCounters() : null;
   const saved = await storage.insertDealHunterDealOsImport({
     ...record,
     ...(run ? { freshnessRun: run, acceptedRowEvidence } : {}),
   });
-  return { ok: true, status: 201, import: publicDealOsImport(saved || record) };
+  const afterOutreach = beforeOutreach ? await storage.readCimOutreachCounters() : null;
+  const safetyRunId = run ? sourceSafetyRunId(run.sourceId, run.runId) : null;
+  const safetyEvents = safetyRunId && typeof storage.listCimSafetyEvents === 'function'
+    ? await storage.listCimSafetyEvents({ safetyRunId }) : null;
+  return { ok: true, status: 201, import: publicDealOsImport(saved || record),
+    ...(safetyRunId ? { safetyRunId, safetyEventsEmitted: safetyEvents?.length ?? null,
+      safetyProjectionPending: saved?.freshness_projection_state === 'pending'
+        ? acceptedRows.length : 0 } : {}),
+    ...importOutreachDelta(beforeOutreach, afterOutreach),
+  };
 }
 
 async function loadDealOsExportSource(config, storage, importId = '') {
@@ -6009,7 +6021,7 @@ async function attachCanonicalOpportunityIdentities(
         source_name: scope.sourceName,
         records,
       };
-      await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
+      scope.safetyReceipt = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
         storage,
         reviewMode: 'full-backfill',
         sourceResult: scope.sourceResult,
@@ -7806,6 +7818,8 @@ async function buildDailyDealReview({
   const config = getConfig();
   const normalizedReviewMode = normalizeDealHunterReviewMode(reviewMode);
   const generatedAt = new Date().toISOString();
+  const beforeOutreach = !readOnly && typeof storage.readCimOutreachCounters === 'function'
+    ? await storage.readCimOutreachCounters() : null;
   const sourceResults = await collectSources(config, storage, {
     dealOsImportId,
     freshnessWrite: !readOnly && normalizedReviewMode === 'full-backfill',
@@ -7868,6 +7882,10 @@ async function buildDailyDealReview({
   if (reviewHasRequiredSourceFailures(sourceOnlyReview)) {
     const latestDealOsImport = sourceResults.find((result) => result.source.id === dealOsSourceId)?.source?.latestImport || null;
     sourceOnlyReview.importSummary = buildDealHunterImportSummary(sourceOnlyReview, latestDealOsImport);
+    sourceOnlyReview.safetyRuns = [];
+    sourceOnlyReview.safetyEventsEmitted = 0;
+    Object.assign(sourceOnlyReview, importOutreachDelta(beforeOutreach,
+      beforeOutreach ? await storage.readCimOutreachCounters() : null));
     return { review: sourceOnlyReview, scoredDeals: [], storage };
   }
 
@@ -8041,6 +8059,23 @@ async function buildDailyDealReview({
       comparisons: item.metadata?.comparisons || [],
     })),
   };
+
+  const safetyRuns = [...completeSheetObservationScopes.values()]
+    .map((scope) => scope.safetyReceipt)
+    .filter((receipt) => receipt?.reconciled && receipt.safetyRunId);
+  const latestDealOsRunId = sourceResults.find((result) => result.source.id === dealOsSourceId)
+    ?.source?.latestImport?.id;
+  if (latestDealOsRunId && !readOnly && typeof storage.listCimSafetyEvents === 'function') {
+    const safetyRunId = sourceSafetyRunId(dealOsSourceId, latestDealOsRunId);
+    const events = await storage.listCimSafetyEvents({ safetyRunId });
+    safetyRuns.push({ safetyRunId, safetyEventsEmitted: events.length,
+      safetyAsOf: events[0]?.created_at || null });
+  }
+  review.safetyRuns = safetyRuns;
+  review.safetyEventsEmitted = safetyRuns.reduce((count, receipt) => (
+    count + Number(receipt.safetyEventsEmitted || 0)), 0);
+  Object.assign(review, importOutreachDelta(beforeOutreach,
+    beforeOutreach ? await storage.readCimOutreachCounters() : null));
 
   const latestDealOsImport = sourceResults.find((result) => result.source.id === dealOsSourceId)?.source?.latestImport || null;
   review.importSummary = buildDealHunterImportSummary(review, latestDealOsImport);

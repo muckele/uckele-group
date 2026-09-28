@@ -398,6 +398,12 @@ export async function refreshOpportunityScores({
     ok: counts.failed === 0,
     status: counts.failed > 0 ? 207 : 200,
     ...(authoritativeReview ? { review: authoritativeReview } : {}),
+    ...(authoritativeReview?.outreachCreated !== undefined ? {
+      outreachCreated: authoritativeReview.outreachCreated,
+      touchesScheduled: authoritativeReview.touchesScheduled,
+      providerSeamEntries: authoritativeReview.providerSeamEntries,
+      providerCalls: authoritativeReview.providerCalls,
+    } : {}),
     counts,
     errors: errors.slice(0, 100),
     eligibilityReconciliation,

@@ -6,6 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from '../server/services/dealHunterSourceSnapshotAdmission.js';
+import { sourceSafetyRunId } from '../server/services/cimSafetyIdentity.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -67,9 +68,13 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
   const currentSchema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
   const previousSchema = execFileSync('git', ['show', '18a8645845be5c77c7422e0d20a49fa6003bef1b:supabase/schema.sql'], { cwd: root, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   const migration = fs.readFileSync(path.join(root, 'supabase/migrations/20260923120000_deal_hunter_freshness_provenance.sql'), 'utf8');
+  const campaignMigration = fs.readFileSync(path.join(root, 'supabase/migrations/20260925120000_pursue_cim_autopilot.sql'), 'utf8');
+  const safetyMigration = fs.readFileSync(path.join(root, 'supabase/migrations/20260928120000_pursue_cim_intake_safety.sql'), 'utf8');
   psql(container, 'fl01_fresh', currentSchema);
   psql(container, 'fl01_upgrade', previousSchema);
   psql(container, 'fl01_upgrade', migration);
+  psql(container, 'fl01_upgrade', campaignMigration);
+  psql(container, 'fl01_upgrade', safetyMigration);
   for (const database of ['fl01_fresh', 'fl01_upgrade']) {
     const catalog = psql(container, database, `
       select jsonb_build_object(
@@ -168,6 +173,8 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
       '${importIds[1]}'::uuid, '${opportunityId}', 'external:PG-FL01-1', 2,
       ${quoteJson(snapshot('Latest', 120))});`));
     assert.equal(latest.projectionState, 'accepted');
+    assert.equal(Number(psql(container, database, `select count(*) from public.deal_hunter_cim_safety_events
+      where source_run_id='${importIds[1]}' and opportunity_id='${opportunityId}'`)), 1);
     const intermediate = JSON.parse(psql(container, database, `select jsonb_build_object(
       'first', first_accepted_at, 'state', discovery_state, 'revision', discovery_revision)
       from public.deal_hunter_opportunities where opportunity_id='${opportunityId}';`));
@@ -189,6 +196,41 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
       ${quoteJson(snapshot('Latest', 120))});`;
     const retries = await Promise.all([0, 1].map(() => psqlConcurrent(container, database, retrySql)));
     assert.ok(retries.every((result) => result.status === 0), JSON.stringify(retries));
+    const crossSourceRunId = randomUUID();
+    const crossSourceRun = JSON.parse(psql(container, database,
+      `select public.allocate_deal_hunter_source_generation('sheet-9', '${crossSourceRunId}');`));
+    const sheetRecord = { opportunity_id: opportunityId, source_id: 'sheet-9',
+      source_name: 'Synthetic Sheet', source_record_id: 'external:CROSS-SOURCE',
+      observations: [{ id: `cross-source-observation-${database}`, opportunity_id: opportunityId,
+        source_id: 'sheet-9', source_name: 'Synthetic Sheet',
+        source_record_id: 'external:CROSS-SOURCE', field: 'name', value: 'Latest',
+        observed_at: importedAt, created_at: importedAt, updated_at: importedAt }],
+      freshness_evidence: null };
+    let crossSourceCapture;
+    await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
+      storage: { async replaceAdmittedCompleteGoogleSheetSourceSnapshot(value) { crossSourceCapture = value; } },
+      reviewMode: 'full-backfill', run: crossSourceRun,
+      sourceResult: { source: { id: 'sheet-9', required: true, fetched: true,
+        sourceRowCount: 1, rowCount: 1, coverageLimitReached: false },
+      deals: [{ sourceId: 'sheet-9', sourceName: 'Synthetic Sheet',
+        stableExternalId: true, id: 'CROSS-SOURCE' }] }, records: [sheetRecord],
+    });
+    const crossSourceRace = await Promise.all([
+      psqlConcurrent(container, database, `select public.accept_admitted_complete_google_sheet_freshness_v1(
+        ${quoteJson(crossSourceCapture.admission)},
+        '${JSON.stringify(crossSourceCapture.records).replaceAll("'", "''")}');`),
+      psqlConcurrent(container, database, retrySql),
+    ]);
+    assert.ok(crossSourceRace.every((outcome) => outcome.status === 0), JSON.stringify(crossSourceRace));
+    assert.equal(Number(psql(container, database, `select count(*) from public.deal_hunter_opportunities
+      where opportunity_id='${opportunityId}' and status='active';`)), 1);
+    assert.equal(Number(psql(container, database, `select count(*) from public.deal_hunter_cim_safety_events
+      where source_run_id='${crossSourceRunId}' and opportunity_id='${opportunityId}';`)), 1);
+    assert.equal(Number(psql(container, database, `select count(*) from public.deal_hunter_cim_campaigns
+      where opportunity_id='${opportunityId}';`)), 0);
+    assert.throws(() => psql(container, database, `select public.bind_accepted_deal_hunter_freshness_v1(
+      '${importIds[1]}'::uuid, '${opportunityId}', 'external:PG-FL01-1', 2,
+      ${quoteJson(snapshot('Conflicting replay', 120))});`), /Conflicting admitted source safety event/);
     assert.equal(Number(psql(container, database, `select discovery_revision from public.deal_hunter_opportunities
       where opportunity_id='${opportunityId}';`)), 1);
     const older = JSON.parse(psql(container, database, `select public.bind_accepted_deal_hunter_freshness_v1(
@@ -351,6 +393,14 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
       ${quoteText(JSON.stringify(captured.records))}
     );`));
     assert.equal(accepted.projectionState, 'accepted');
+    assert.equal(Number(psql(container, database, `select count(*) from public.deal_hunter_cim_safety_events
+      where source_run_id='${runId}' and opportunity_id='${opportunityId}'`)), 1);
+    assert.equal(psql(container, database, `select safety_run_id from public.deal_hunter_cim_safety_events
+      where source_run_id='${runId}' and opportunity_id='${opportunityId}'`),
+    sourceSafetyRunId('sheet-0', runId));
+    assert.throws(() => psql(container, database, `select public.pursue_cim_append_safety_events_v1(
+      '{"safetyRunId":"fake-run","sourceType":"sheet-import","sourceRunId":"${runId}",
+       "now":"${at}","events":[]}'::jsonb);`), /source commit/);
     const discovered = JSON.parse(psql(container, database, `select jsonb_build_object(
       'state', discovery_state, 'revision', discovery_revision, 'first', first_accepted_at,
       'evidenceId', first_discovery_evidence_id) from public.deal_hunter_opportunities
@@ -402,6 +452,36 @@ test('fresh and upgraded PostgreSQL preserve bounded freshness evidence and serv
         ${quoteText(JSON.stringify(captured.records))});`,
     });
     assert.notEqual(stale.status, 0, 'an older once-accepted Sheet run is stale after a later acceptance');
+    const boundedRunId = randomUUID();
+    const boundedRun = JSON.parse(psql(container, database,
+      `select public.allocate_deal_hunter_source_generation('sheet-0', '${boundedRunId}');`));
+    let boundedCapture;
+    await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
+      storage: { async replaceAdmittedCompleteGoogleSheetSourceSnapshot(value) { boundedCapture = value; } },
+      reviewMode: 'full-backfill', run: boundedRun,
+      sourceResult: { source: { id: 'sheet-0', required: true, fetched: true,
+        sourceRowCount: 1, rowCount: 1, coverageLimitReached: false },
+      deals: [{ sourceId: 'sheet-0', sourceName: 'SMB Deal Hunter Google Sheet',
+        stableExternalId: true, id: 'SHEET-PG-1' }] }, records: [record],
+    });
+    psql(container, database, `insert into public.deal_hunter_cim_safety_events
+      (id, safety_run_id, opportunity_id, source_type, source_run_id,
+       canonical_revision, identity_exception_revision, event_type, evidence_id,
+       status, created_at, updated_at)
+      select 'bounded-' || n, '${sourceSafetyRunId('sheet-0', boundedRunId)}',
+        '${opportunityId}', 'synthetic-test', '${boundedRunId}', 0, 0,
+        'seed-' || n, 'evidence-' || n, 'pending', '${at}', '${at}'
+      from pg_catalog.generate_series(1, 10000) as n;`);
+    const overBound = spawnSync(dockerCommand, ['exec', '-i', container, 'psql', '-X', '-qAt',
+      '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', database], {
+      cwd: root, encoding: 'utf8', input: `select public.accept_admitted_complete_google_sheet_freshness_v1(
+        ${quoteText(JSON.stringify(boundedCapture.admission))}::jsonb,
+        ${quoteText(JSON.stringify(boundedCapture.records))});`,
+    });
+    assert.notEqual(overBound.status, 0);
+    assert.match(overBound.stderr, /bounded reader/);
+    assert.equal(psql(container, database, `select accepted_run_id
+      from public.deal_hunter_source_freshness_state where source_id='sheet-0';`), secondRunId);
     for (const [rawValue, expectedState] of [
       ['2026-09-22', 'valid'], ['2026-02-30', 'invalid'], ['2099-01-01', 'future'],
     ]) {

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { importOutreachDelta, sourceSafetyRunId } from './cimSafetyIdentity.js';
 import {
   getOpportunitySourceObservationRecordId,
   normalizeDealHunterSourceSnapshot,
@@ -153,6 +154,7 @@ function mintCompleteGoogleSheetSourceSnapshotAdmission(snapshot) {
 
 function verifiedCompleteGoogleSheetSourceSnapshot({ reviewMode, sourceResult, records, unresolved = [], run } = {}) {
   if (reviewMode !== 'full-backfill') return null;
+  if (!run) return null;
   const source = sourceResult?.source || {};
   if (source.required !== true && source.sourceRole !== 'required-primary') return null;
   const sourceId = String(source.id || '').trim();
@@ -248,9 +250,22 @@ export async function reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
   const snapshot = verifiedCompleteGoogleSheetSourceSnapshot({ reviewMode, sourceResult, records, unresolved, run });
   if (!snapshot) return { reconciled: false };
 
+  const before = typeof storage.readCimOutreachCounters === 'function'
+    ? await storage.readCimOutreachCounters() : null;
   const admission = mintCompleteGoogleSheetSourceSnapshotAdmission(snapshot);
   await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...snapshot, admission });
-  return { reconciled: true };
+  const after = before ? await storage.readCimOutreachCounters() : null;
+  const safetyRunId = run ? sourceSafetyRunId(run.sourceId, run.runId) : null;
+  const events = safetyRunId && typeof storage.listCimSafetyEvents === 'function'
+    ? await storage.listCimSafetyEvents({ safetyRunId }) : null;
+  const states = safetyRunId && typeof storage.listDealHunterSourceFreshnessStates === 'function'
+    ? await storage.listDealHunterSourceFreshnessStates() : [];
+  const sourceState = states.find((state) => state.source_id === snapshot.source_id);
+  return { reconciled: true, identityExceptionsPending: snapshot.unresolved.length,
+    ...(safetyRunId ? { safetyRunId, safetyAsOf: sourceState?.accepted_at || null,
+      safetyEventsEmitted: events?.length ?? null } : {}),
+    ...importOutreachDelta(before, after),
+  };
 }
 
 /**

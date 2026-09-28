@@ -13,7 +13,209 @@ import {
 import { refreshOpportunityScores } from '../server/services/dealHunterScoreStore.js';
 import { getTriageOpportunityDetail, passTriageOpportunity } from '../server/services/dealHunterTriage.js';
 import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from '../server/services/dealHunterSourceSnapshotAdmission.js';
+import { runCimCampaignSafety } from '../server/services/cimCampaignSafety.js';
+import { sourceSafetyRunId } from '../server/services/cimSafetyIdentity.js';
 import { restoreDealHunterOpportunity } from '../server/services/leadLifecycle.js';
+
+test('P2 accepted Sheet run atomically emits inert canonical safety evidence', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p2-sheet-safety-'));
+  const sqlitePath = path.join(directory, 'sheet.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const at = '2026-09-23T12:00:00.000Z';
+  const opportunityId = 'op-p2-sheet';
+  await storage.upsertDealHunterOpportunity({ opportunity_id: opportunityId, created_at: at,
+    updated_at: at, canonical_name: 'Safety Shop', identity_version: 'test', status: 'active', metadata: {} });
+  const deal = { sourceId: 'sheet-0', sourceName: 'Synthetic Sheet', stableExternalId: true, id: 'P2-1' };
+  const record = { opportunity_id: opportunityId, source_id: 'sheet-0', source_name: 'Synthetic Sheet',
+    source_record_id: 'external:P2-1', observations: [{ id: 'p2-sheet-observation',
+      opportunity_id: opportunityId, source_id: 'sheet-0', source_name: 'Synthetic Sheet',
+      source_record_id: 'external:P2-1', field: 'name', value: 'Safety Shop',
+      observed_at: at, created_at: at, updated_at: at }], freshness_evidence: null };
+  const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId: 'p2-sheet-run' });
+  const outreachBefore = await storage.readCimOutreachCounters();
+  const accepted = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({ storage,
+    reviewMode: 'full-backfill', sourceResult: { source: { id: 'sheet-0', required: true,
+      fetched: true, sourceRowCount: 1, rowCount: 1, coverageLimitReached: false }, deals: [deal] },
+    records: [record], run });
+  assert.equal(accepted.reconciled, true);
+  assert.deepEqual(await storage.readCimOutreachCounters(), outreachBefore);
+  const db = new Database(sqlitePath, { readonly: true });
+  t.after(() => db.close());
+  const event = db.prepare('SELECT * FROM deal_hunter_cim_safety_events').get();
+  assert.equal(event.source_run_id, run.runId);
+  assert.equal(event.opportunity_id, opportunityId);
+  assert.equal(event.status, 'pending');
+  assert.deepEqual({ safetyRunId: accepted.safetyRunId,
+    safetyEventsEmitted: accepted.safetyEventsEmitted,
+    outreachCreated: accepted.outreachCreated, touchesScheduled: accepted.touchesScheduled,
+    providerSeamEntries: accepted.providerSeamEntries }, {
+    safetyRunId: event.safety_run_id, safetyEventsEmitted: 1,
+    outreachCreated: 0, touchesScheduled: 0, providerSeamEntries: 0,
+  });
+  assert.deepEqual((await storage.listCimSafetyEvents({ safetyRunId: event.safety_run_id }))
+    .map(({ id, status }) => ({ id, status })), [{ id: event.id, status: 'pending' }]);
+  assert.deepEqual((await storage.listDealHunterSourceFreshnessStates())
+    .map(({ source_id, accepted_run_id, projection_state }) => ({ source_id, accepted_run_id, projection_state })),
+  [{ source_id: 'sheet-0', accepted_run_id: run.runId, projection_state: 'accepted' }]);
+  const withoutRun = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({ storage,
+    reviewMode: 'full-backfill', sourceResult: { source: { id: 'sheet-0', required: true,
+      fetched: true, sourceRowCount: 1, rowCount: 1, coverageLimitReached: false }, deals: [deal] },
+    records: [record] });
+  assert.equal(withoutRun.reconciled, false);
+  for (const table of ['deal_hunter_owner_decision_events', 'deal_hunter_pursuit_enrollments',
+    'deal_hunter_cim_campaigns', 'deal_hunter_cim_campaign_touches', 'deal_hunter_cim_transmissions']) {
+    assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n, 0);
+  }
+});
+
+test('P2 archived CRM ownership stays archived through an admitted Sheet re-import', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p2-archived-crm-'));
+  const sqlitePath = path.join(directory, 'archived.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const at = '2026-09-23T12:00:00.000Z';
+  const opportunityId = 'op-p2-archived';
+  const db = new Database(sqlitePath);
+  t.after(() => db.close());
+  db.prepare(`INSERT INTO contact_submissions (id, created_at, updated_at, status,
+    delivery_provider, delivery_status, crm_status, source, ip_hash, name, email,
+    message, archived_at, archive_reason, deal_hunter_opportunity_id)
+    VALUES (?, ?, ?, 'archived', 'manual', 'not-applicable', 'not-applicable',
+    'synthetic-test', '', 'Archived Shop', 'archived@example.test', 'fixture', ?,
+    'operator-archive', ?)`).run('submission-p2-archived', at, at, at, opportunityId);
+  await storage.upsertDealHunterOpportunity({ opportunity_id: opportunityId,
+    primary_submission_id: 'submission-p2-archived', created_at: at, updated_at: at,
+    canonical_name: 'Archived Shop', identity_version: 'test', status: 'active', metadata: {} });
+  const record = { opportunity_id: opportunityId, source_id: 'sheet-0',
+    source_name: 'Synthetic Sheet', source_record_id: 'external:ARCHIVED-1',
+    observations: [{ id: 'p2-archived-observation', opportunity_id: opportunityId,
+      source_id: 'sheet-0', source_name: 'Synthetic Sheet',
+      source_record_id: 'external:ARCHIVED-1', field: 'name', value: 'Archived Shop',
+      observed_at: at, created_at: at, updated_at: at }], freshness_evidence: null };
+  const before = await storage.readCimOutreachCounters();
+  const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId: 'p2-archived-run' });
+  const accepted = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({ storage,
+    reviewMode: 'full-backfill', sourceResult: { source: { id: 'sheet-0', required: true,
+      fetched: true, sourceRowCount: 1, rowCount: 1, coverageLimitReached: false },
+    deals: [{ sourceId: 'sheet-0', sourceName: 'Synthetic Sheet',
+      stableExternalId: true, id: 'ARCHIVED-1' }] }, records: [record], run });
+  assert.equal(accepted.reconciled, true);
+  assert.equal(accepted.safetyEventsEmitted, 1);
+  assert.deepEqual(await storage.readCimOutreachCounters(), before);
+  assert.equal(db.prepare('SELECT status FROM contact_submissions WHERE id = ?')
+    .get('submission-p2-archived').status, 'archived');
+  assert.equal((await storage.getDealHunterOpportunity(opportunityId)).primary_submission_id,
+    'submission-p2-archived');
+});
+
+test('P2 complete Sheet replacement retains safety for a removed superseded canonical association', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p2-superseded-source-'));
+  const sqlitePath = path.join(directory, 'superseded.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const at = '2026-09-23T12:00:00.000Z';
+  const sourceId = 'sheet-0';
+  for (const opportunityId of ['op-p2-old', 'op-p2-survivor']) {
+    await storage.upsertDealHunterOpportunity({ opportunity_id: opportunityId,
+      created_at: at, updated_at: at, canonical_name: opportunityId,
+      identity_version: 'test', status: 'active', metadata: {} });
+  }
+  await storage.replaceDealHunterOpportunitySourceObservationSnapshot({
+    opportunity_id: 'op-p2-old', source_id: sourceId, source_name: 'Synthetic Sheet',
+    source_record_id: 'external:OLD', observations: [{ id: 'p2-old-observation',
+      opportunity_id: 'op-p2-old', source_id: sourceId, source_name: 'Synthetic Sheet',
+      source_record_id: 'external:OLD', field: 'name', value: 'Old',
+      observed_at: at, created_at: at, updated_at: at }],
+  });
+  await storage.upsertDealHunterOpportunity({ opportunity_id: 'op-p2-old',
+    created_at: at, updated_at: at, canonical_name: 'Old',
+    identity_version: 'test', status: 'superseded', metadata: {} });
+  const run = await storage.allocateDealHunterSourceGeneration({ sourceId, runId: 'p2-superseded-run' });
+  const accepted = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({ storage,
+    reviewMode: 'full-backfill', run,
+    sourceResult: { source: { id: sourceId, required: true, fetched: true,
+      sourceRowCount: 1, rowCount: 1, coverageLimitReached: false },
+    deals: [{ sourceId, sourceName: 'Synthetic Sheet', stableExternalId: true, id: 'NEW' }] },
+    records: [{ opportunity_id: 'op-p2-survivor', source_id: sourceId,
+      source_name: 'Synthetic Sheet', source_record_id: 'external:NEW',
+      observations: [{ id: 'p2-new-observation', opportunity_id: 'op-p2-survivor',
+        source_id: sourceId, source_name: 'Synthetic Sheet', source_record_id: 'external:NEW',
+        field: 'name', value: 'Survivor', observed_at: at, created_at: at, updated_at: at }],
+      freshness_evidence: null }],
+  });
+  assert.equal(accepted.reconciled, true);
+  assert.deepEqual((await storage.listCimSafetyEvents({ safetyRunId: accepted.safetyRunId }))
+    .map(({ opportunity_id, event_type }) => [opportunity_id, event_type.split('#')[0]]).sort(),
+  [['op-p2-old', 'source-record-removed'], ['op-p2-survivor', 'source-record-changed']]);
+});
+
+test('P2 admitted source commit rolls back when its safety run would exceed the bounded reader', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p2-bounded-outbox-'));
+  const sqlitePath = path.join(directory, 'bounded.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const at = '2026-09-23T12:00:00.000Z';
+  const opportunityId = 'op-p2-bound';
+  await storage.upsertDealHunterOpportunity({ opportunity_id: opportunityId,
+    created_at: at, updated_at: at, canonical_name: 'Bounded Shop',
+    identity_version: 'test', status: 'active', metadata: {} });
+  const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0', runId: 'p2-bound-run' });
+  const db = new Database(sqlitePath);
+  t.after(() => db.close());
+  db.prepare(`WITH RECURSIVE sequence(n) AS (
+    SELECT 1 UNION ALL SELECT n + 1 FROM sequence WHERE n < 10000
+  ) INSERT INTO deal_hunter_cim_safety_events
+    (id, safety_run_id, opportunity_id, source_type, source_run_id,
+     canonical_revision, identity_exception_revision, event_type, evidence_id,
+     status, created_at, updated_at)
+    SELECT 'seed-' || n, ?, ?, 'synthetic-test', ?, 0, 0,
+      'seed-' || n, 'evidence-' || n, 'pending', ?, ? FROM sequence`)
+    .run(sourceSafetyRunId('sheet-0', run.runId), opportunityId, run.runId, at, at);
+  const deal = { sourceId: 'sheet-0', sourceName: 'Synthetic Sheet',
+    stableExternalId: true, id: 'BOUND-1' };
+  const record = { opportunity_id: opportunityId, source_id: 'sheet-0',
+    source_name: 'Synthetic Sheet', source_record_id: 'external:BOUND-1',
+    observations: [{ id: 'p2-bound-observation', opportunity_id: opportunityId,
+      source_id: 'sheet-0', source_name: 'Synthetic Sheet',
+      source_record_id: 'external:BOUND-1', field: 'name', value: 'Bounded Shop',
+      observed_at: at, created_at: at, updated_at: at }], freshness_evidence: null };
+  await assert.rejects(reconcileVerifiedCompleteGoogleSheetSourceSnapshot({ storage,
+    reviewMode: 'full-backfill', run,
+    sourceResult: { source: { id: 'sheet-0', required: true, fetched: true,
+      sourceRowCount: 1, rowCount: 1, coverageLimitReached: false }, deals: [deal] },
+    records: [record] }), /bounded|exceeds/i);
+  assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM deal_hunter_opportunity_source_observations
+    WHERE source_record_id = 'external:BOUND-1'`).get().n, 0);
+});
+
+test('P2 zero-candidate identity exception leaves the safety run explicitly incomplete', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p2-empty-candidates-'));
+  const storage = createSqliteStorage({ storage: { sqlitePath: path.join(directory, 'deferred.sqlite') } });
+  t.after(() => { storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const at = '2026-09-23T12:00:00.000Z';
+  await storage.upsertDealHunterIdentityException({ id: 'p2-zero-candidate',
+    created_at: at, updated_at: at, status: 'open', reason: 'ambiguous',
+    evidence_version: 'test', candidate_opportunity_ids: [], metadata: {} });
+  const run = await storage.allocateDealHunterSourceGeneration({ sourceId: 'sheet-0',
+    runId: 'p2-zero-candidate-run' });
+  const accepted = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({ storage,
+    reviewMode: 'full-backfill', run,
+    sourceResult: { source: { id: 'sheet-0', required: true, fetched: true,
+      sourceRowCount: 1, rowCount: 1, coverageLimitReached: false },
+    deals: [{ sourceId: 'sheet-0', sourceName: 'Synthetic Sheet',
+      stableExternalId: true, id: 'AMBIGUOUS-1' }] },
+    records: [], unresolved: [{ source_record_id: 'external:AMBIGUOUS-1',
+      identity_exception_id: 'p2-zero-candidate' }],
+  });
+  assert.equal(accepted.reconciled, true);
+  assert.equal(accepted.identityExceptionsPending, 1);
+  assert.equal(accepted.safetyEventsEmitted, 0);
+  const result = await runCimCampaignSafety({ storage,
+    safetyRunId: accepted.safetyRunId, mode: 'shadow', now: at });
+  assert.deepEqual([result.safetyEventsEmitted, result.pending,
+    result.sourceProjectionPending, result.complete], [0, 0, true, false]);
+});
 
 process.env.DEAL_HUNTER_SHEET_CSV_URL = 'https://docs.google.com/spreadsheets/d/test/gviz/tq?tqx=out:csv&gid=123';
 process.env.DEAL_HUNTER_AIRTABLE_TOKEN = 'test-token';
@@ -67,6 +269,9 @@ test('an admitted complete Sheet with an identity exception retains evidence and
   assert.equal(accepted.reconciled, true);
   const db = new Database(sqlitePath, { readonly: true });
   t.after(() => db.close());
+  assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM deal_hunter_cim_safety_events
+    WHERE source_run_id = 'deferred-run' AND opportunity_id = 'op-deferred-resolved'`).get().n, 1);
+  assert.equal(accepted.identityExceptionsPending, 1);
   assert.equal(db.prepare("SELECT projection_state FROM deal_hunter_source_freshness_state WHERE source_id='sheet-0'").get().projection_state, 'deferred');
   assert.equal(db.prepare("SELECT count(*) AS n FROM deal_hunter_freshness_evidence WHERE run_id='deferred-run' AND event_type='accepted_source_record' AND field_key=''").get().n, 2);
   assert.equal(db.prepare("SELECT identity_exception_id FROM deal_hunter_freshness_evidence WHERE source_record_id='sheet-row:3' AND event_type='accepted_source_record' AND field_key=''").get().identity_exception_id, 'deferred-exception');
@@ -362,6 +567,10 @@ test('separate identical Deal OS uploads each accept bounded row evidence while 
   };
   const first = await importDealOsExport(input);
   assert.equal(first.ok, true);
+  assert.equal(unexpectedFetchCount, 0, 'Deal OS import must not reach an outbound provider');
+  assert.deepEqual([first.outreachCreated, first.touchesScheduled, first.providerSeamEntries,
+    first.safetyEventsEmitted], [0, 0, 0, 0]);
+  assert.match(first.safetyRunId, /^cim-source:[0-9a-f]{64}$/);
   const savedFirst = await storage.getDealHunterDealOsImport(first.import.id);
   assert.equal(savedFirst.freshness_generation, 1);
   assert.equal(savedFirst.freshness_projection_state, 'pending');
@@ -465,6 +674,13 @@ test('newer Deal OS binding first recovers proven older discovery before showing
     importId: imports[1].id, opportunityId, sourceRecordId,
     expectedGeneration: imports[1].run.generation, snapshot: snapshot(120),
   })));
+  await assert.rejects(storage.bindAcceptedDealHunterFreshness({
+    importId: imports[1].id, opportunityId, sourceRecordId,
+    expectedGeneration: imports[1].run.generation,
+    snapshot: { ...snapshot(120), observations: snapshot(120).observations.map((observation) => ({
+      ...observation, value: '121',
+    })) },
+  }), /Conflicting admitted source safety event/);
   assert.equal((await storage.getDealHunterOpportunity(opportunityId)).discovery_revision, 1);
   await storage.bindAcceptedDealHunterFreshness({ importId: imports[0].id, opportunityId,
     sourceRecordId, expectedGeneration: imports[0].run.generation, snapshot: snapshot(100) });
@@ -566,6 +782,10 @@ test('accepted Deal OS price A to B to A to B retains three comparable transitio
     [[100, 120], [120, 100], [100, 120]]);
   assert.deepEqual(events.map((event) => event.material_revision), [1, 2, 3]);
   assert.equal(events.every((event) => event.before_evidence_id && event.after_evidence_id), true);
+  const safety = db.prepare(`SELECT source_run_id, opportunity_id, status FROM deal_hunter_cim_safety_events
+    WHERE source_type = 'deal-os-import' ORDER BY source_run_id`).all();
+  assert.deepEqual(safety, [0, 1, 2, 3].map((index) => ({ source_run_id: `dos-price-${index}`,
+    opportunity_id: opportunityId, status: 'pending' })));
   assert.equal((await storage.getDealHunterOpportunity(opportunityId)).material_revision, 3);
   await storage.writeDealHunterOpportunityScore({ opportunity_id: opportunityId, scored_at: at,
     deal_key: opportunityId, name: 'Synthetic Deal OS', fit_score: 86, confidence: 'high',
@@ -600,6 +820,12 @@ test('a complete admitted Sheet run creates one prospective discovery and a no-o
   sourceWorkbook = buildWorkbook([]);
   const first = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'synthetic-test' });
   assert.equal(first.ok, true);
+  assert.equal(first.outreachCreated, 0);
+  assert.equal(first.touchesScheduled, 0);
+  assert.equal(first.providerSeamEntries, 0);
+  assert.equal(unexpectedFetchCount, 0, 'Sheet intake must not reach an outbound provider');
+  assert.equal(first.review.safetyRuns.length, 1);
+  assert.equal(first.review.safetyRuns[0].safetyEventsEmitted, 1);
   const [opportunity] = await storage.listCurrentDealHunterOpportunities({ limit: 10 });
   assert.equal(opportunity.discovery_state, 'known_prospective');
   assert.equal(opportunity.discovery_revision, 1);
@@ -624,6 +850,12 @@ test('a complete admitted Sheet run creates one prospective discovery and a no-o
   assert.equal(archived.areas[0].rows.some((row) => row.opportunity_id === opportunity.opportunity_id), false);
   const reimport = await refreshOpportunityScores({ storage, reviewMode: 'full-backfill', actor: 'synthetic-test' });
   assert.equal(reimport.ok, true);
+  assert.equal(reimport.outreachCreated, 0);
+  assert.equal(reimport.touchesScheduled, 0);
+  assert.equal(reimport.providerSeamEntries, 0);
+  assert.equal(unexpectedFetchCount, 0, 'Sheet re-import must not reach an outbound provider');
+  const passedDisposition = await storage.getDealHunterDisposition({ dealKey: currentScore.deal_key });
+  assert.equal(passedDisposition.disposition, 'dismissed');
   const restored = await restoreDealHunterOpportunity({ dealKey: currentScore.deal_key,
     actor: 'synthetic-test', storage });
   assert.equal(restored.ok, true);
@@ -748,6 +980,7 @@ test('a proven Sheet and Deal OS match binds accepted import evidence to one can
 let sourceCsv;
 let sourceWorkbook;
 let airtableFetchCount;
+let unexpectedFetchCount;
 let sheetFetchStatus;
 let dealOsImport;
 
@@ -838,6 +1071,7 @@ beforeEach(() => {
     { row: 4, name: 'Beta Plumbing', url: 'https://broker.example/beta' },
   ]);
   airtableFetchCount = 0;
+  unexpectedFetchCount = 0;
   sheetFetchStatus = 200;
   dealOsImport = null;
   globalThis.fetch = async (url) => {
@@ -848,6 +1082,7 @@ beforeEach(() => {
       airtableFetchCount += 1;
       return Response.json({ records: [] });
     }
+    unexpectedFetchCount += 1;
     return new Response('not found', { status: 404 });
   };
 });
