@@ -38,6 +38,92 @@ const scheduledJobTransitionDenialReasons = new Set([
 ]);
 const scheduledJobClaimTokenPattern = /^[A-Za-z0-9_-]{16,200}$/;
 const scheduledJobMetadataMaxBytes = 512 * 1024;
+const pursueCimNumericColumns = new Set([
+  'row_version', 'terminal_revision', 'revision', 'generation', 'ordinal',
+  'discovery_revision', 'material_revision', 'timezone_revision',
+  'permission_revision', 'canonical_revision', 'crm_ownership_revision',
+  'expected_discovery_revision', 'expected_material_revision',
+  'observed_discovery_revision', 'observed_material_revision',
+  'preparation_generation', 'invocation_authority_count', 'maximum_calls',
+  'attempt_count', 'daily_cap', 'recipient_cap', 'outcome_revision',
+  'display_ordinal', 'identity_exception_revision',
+]);
+const pursueCimJsonTextColumns = new Set([
+  'to_addresses', 'cc_addresses', 'bcc_addresses', 'expiry_derivation',
+]);
+
+function normalizePursueCimRpcResult(data, booleanFields, rowFields = [], {
+  requiredRows = {}, extraFields = [], requireOutcome = false,
+} = {}) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('Malformed Pursue CIM transition result');
+  }
+  for (const field of booleanFields) {
+    if (typeof data[field] !== 'boolean') {
+      throw new Error(`Malformed Pursue CIM transition result: ${field}`);
+    }
+  }
+  if (booleanFields.filter((field) => data[field]).length > 1) {
+    throw new Error('Malformed Pursue CIM transition result: contradictory outcomes');
+  }
+  if (requireOutcome && !booleanFields.some((field) => data[field])) {
+    throw new Error('Malformed Pursue CIM transition result: missing outcome');
+  }
+  const allowedFields = new Set([...booleanFields, ...rowFields, ...extraFields]);
+  if (Object.keys(data).some((field) => !allowedFields.has(field))) {
+    throw new Error('Malformed Pursue CIM transition result: unexpected field');
+  }
+  const result = { ...data };
+  for (const field of rowFields) {
+    const row = data[field];
+    if (row === null) {
+      if ((requiredRows[field] || []).some((flag) => data[flag])) {
+        throw new Error(`Malformed Pursue CIM transition result: ${field}`);
+      }
+      continue;
+    }
+    if (!row || typeof row !== 'object' || Array.isArray(row)) {
+      throw new Error(`Malformed Pursue CIM transition result: ${field}`);
+    }
+    if (field === 'timezoneRevision'
+      ? (typeof row.opportunity_id !== 'string' || !Number.isSafeInteger(Number(row.revision)))
+      : (typeof row.id !== 'string' || row.id.length === 0)) {
+      throw new Error(`Malformed Pursue CIM transition result: ${field}.id`);
+    }
+    result[field] = { ...row };
+    for (const [key, value] of Object.entries(row)) {
+      if (pursueCimNumericColumns.has(key)) {
+        if (value === null) continue;
+        const normalized = typeof value === 'string' ? Number(value) : value;
+        if (!Number.isSafeInteger(normalized)) {
+          throw new Error(`Malformed Pursue CIM transition result: ${field}.${key}`);
+        }
+        result[field][key] = normalized;
+      }
+      if (key.endsWith('_at') && value !== null) {
+        if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) {
+          throw new Error(`Malformed Pursue CIM transition result: ${field}.${key}`);
+        }
+        result[field][key] = new Date(value).toISOString();
+      }
+      if (pursueCimJsonTextColumns.has(key) && value !== null) {
+        let parsed = value;
+        if (typeof value === 'string') {
+          try { parsed = JSON.parse(value); } catch {
+            throw new Error(`Malformed Pursue CIM transition result: ${field}.${key}`);
+          }
+        }
+        if (key === 'expiry_derivation'
+          ? (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+          : (!Array.isArray(parsed) || parsed.some((item) => typeof item !== 'string'))) {
+          throw new Error(`Malformed Pursue CIM transition result: ${field}.${key}`);
+        }
+        result[field][key] = JSON.stringify(parsed);
+      }
+    }
+  }
+  return result;
+}
 
 function normalizeScheduledJobText(value, fieldName, maxLength, { required = true } = {}) {
   if (typeof value !== 'string' || value.trim() !== value || (required && value.length === 0) || value.length > maxLength) {
@@ -1068,6 +1154,248 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
 
   return {
     provider: 'supabase',
+
+    async transitionPursuitEnrollment(command) {
+      const { data, error } = await client.rpc('pursue_cim_transition_enrollment_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'staleRevision', 'conflict'], ['enrollment'],
+        { requiredRows: { enrollment: ['applied'] } });
+    },
+
+    async appendOpportunityTimezoneRevision(command) {
+      const { data, error } = await client.rpc('pursue_cim_append_timezone_revision_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'replay', 'staleRevision'], ['timezoneRevision'],
+        { requiredRows: { timezoneRevision: ['applied', 'replay'] } });
+    },
+
+    async recordCimCapabilityActivation(command) {
+      const { data, error } = await client.rpc('pursue_cim_record_capability_activation_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      if (data?.blockedReason !== null && data?.blockedReason !== 'prerequisite_missing') {
+        throw new Error('Malformed Pursue CIM activation result');
+      }
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'replay', 'conflict'], ['activation'],
+        { requiredRows: { activation: ['applied', 'replay'] }, extraFields: ['blockedReason'] });
+    },
+
+    async withdrawCimCapabilityActivation(command) {
+      const { data, error } = await client.rpc('pursue_cim_withdraw_capability_activation_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'replay', 'conflict'], ['activation'],
+        { requiredRows: { activation: ['applied', 'replay'] } });
+    },
+
+    async claimDueCimTouch(command) {
+      const { data, error } = await client.rpc('pursue_cim_claim_due_touch_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data,
+        ['claimed', 'alreadyOwned', 'staleAuthority', 'terminal', 'conflict'], ['touch'],
+        { requiredRows: { touch: ['claimed', 'alreadyOwned'] } });
+    },
+
+    async readPursueCimProjection(command) {
+      const { data, error } = await client.rpc('pursue_cim_read_projection_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      const result = normalizePursueCimRpcResult(data, [],
+        ['decision', 'enrollment', 'campaign', 'initialTouch', 'transmission'],
+        { extraFields: ['legacySummary', 'actions'] });
+      if (!result.legacySummary || typeof result.legacySummary !== 'object'
+        || Array.isArray(result.legacySummary) || !Array.isArray(result.actions)) {
+        throw new Error('Malformed Pursue CIM projection result');
+      }
+      const legacySummary = {};
+      for (const key of ['count', 'accepted', 'ambiguous']) {
+        const value = result.legacySummary[key];
+        const normalized = typeof value === 'string' ? Number(value) : value;
+        if (!Number.isSafeInteger(normalized) || normalized < 0) {
+          throw new Error(`Malformed Pursue CIM projection result: ${key}`);
+        }
+        legacySummary[key] = normalized;
+      }
+      return { ...result, legacySummary };
+    },
+
+    async appendCimSafetyEvents(run) {
+      const { data, error } = await client.rpc('pursue_cim_append_safety_events_v1', {
+        p_run: run,
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object' || Array.isArray(data)
+        || typeof data.conflict !== 'boolean') {
+        throw new Error('Malformed Pursue CIM safety emission result');
+      }
+      const result = { conflict: data.conflict };
+      for (const key of ['emitted', 'existing']) {
+        const value = typeof data[key] === 'string' ? Number(data[key]) : data[key];
+        if (!Number.isSafeInteger(value) || value < 0) {
+          throw new Error(`Malformed Pursue CIM safety emission result: ${key}`);
+        }
+        result[key] = value;
+      }
+      return result;
+    },
+
+    async recordOwnerDecision(command) {
+      const { data, error } = await client.rpc('pursue_cim_record_owner_decision_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'replay', 'conflict'], ['decision', 'enrollment'],
+        { requiredRows: { decision: ['applied', 'replay'] } });
+    },
+
+    async materializePursuitCampaign(command) {
+      const { data, error } = await client.rpc('pursue_cim_materialize_campaign_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'existing', 'actionRequired'], ['campaign', 'initialTouch'],
+        { requiredRows: { campaign: ['applied', 'existing'],
+          initialTouch: ['applied', 'existing'] } });
+    },
+
+    async prepareCimTransmission(command) {
+      const { data, error } = await client.rpc('pursue_cim_prepare_transmission_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data,
+        ['prepared', 'existing', 'payloadConflict', 'terminal'], ['transmission'],
+        { requiredRows: { transmission: ['prepared', 'existing'] } });
+    },
+
+    async issueCimLiveProviderAuthorization(command) {
+      const { data, error } = await client.rpc('pursue_cim_issue_live_authorization_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      if (data?.blockedReason !== null && !['authorization_exists',
+        'capability_inactive', 'transmission_invalid',
+        'recipient_authority_changed'].includes(data?.blockedReason)) {
+        throw new Error('Malformed Pursue CIM authorization result');
+      }
+      return normalizePursueCimRpcResult(data,
+        ['issued', 'replay', 'conflict'], ['authorization'],
+        { requiredRows: { authorization: ['issued', 'replay'] },
+          extraFields: ['blockedReason'] });
+    },
+
+    async authorizeCimProviderPending(command) {
+      const { data, error } = await client.rpc('pursue_cim_authorize_provider_pending_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      const result = normalizePursueCimRpcResult(data, ['authorized'], ['transmission'],
+        { requiredRows: { transmission: ['authorized'] },
+          extraFields: ['blockedReason', 'boundaryNonceDigest'] });
+      if (result.authorized !== (result.blockedReason === null)
+        || (result.authorized && (result.boundaryNonceDigest !== command.boundaryNonceDigest
+          || result.transmission?.state !== 'provider-pending'))
+        || (!result.authorized && result.boundaryNonceDigest !== null)) {
+        throw new Error('Malformed Pursue CIM provider-pending result');
+      }
+      return result;
+    },
+
+    async enterCimProviderSeam(command) {
+      const { data, error } = await client.rpc('pursue_cim_enter_provider_seam_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data,
+        ['entered', 'alreadyEntered', 'unauthorized'], [], { requireOutcome: true });
+    },
+
+    async finalizeCimTransmission(command) {
+      const { data, error } = await client.rpc('pursue_cim_finalize_transmission_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'existing', 'conflict'], ['transmission', 'nextTouch'],
+        { requiredRows: { transmission: ['applied', 'existing'] } });
+    },
+
+    async reconcileCimTransmission(command) {
+      const { data, error } = await client.rpc('pursue_cim_reconcile_transmission_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'unchanged', 'conflict'], ['transmission'],
+        { requiredRows: { transmission: ['applied', 'unchanged'] } });
+    },
+
+    async withdrawCimLiveProviderAuthorization(command) {
+      const { data, error } = await client.rpc('pursue_cim_withdraw_live_authorization_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      return normalizePursueCimRpcResult(data,
+        ['applied', 'replay', 'conflict'], ['authorization'],
+        { requiredRows: { authorization: ['applied', 'replay'] } });
+    },
+
+    async appendCimTerminalEvent(command) {
+      const { data, error } = await client.rpc('pursue_cim_append_terminal_event_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      const result = normalizePursueCimRpcResult(data,
+        ['applied', 'replay', 'conflict'], [],
+        { extraFields: ['cancelledTouchIds', 'campaignRevision', 'conversationRevision'] });
+      if (!Array.isArray(result.cancelledTouchIds)
+        || result.cancelledTouchIds.some((value) => typeof value !== 'string')) {
+        throw new Error('Malformed Pursue CIM terminal result');
+      }
+      for (const key of ['campaignRevision', 'conversationRevision']) {
+        if (result[key] === null) continue;
+        const number = typeof result[key] === 'string' ? Number(result[key]) : result[key];
+        if (!Number.isSafeInteger(number) || number < 0) {
+          throw new Error(`Malformed Pursue CIM terminal result: ${key}`);
+        }
+        result[key] = number;
+      }
+      return result;
+    },
+
+    async consumeCimSafetyEvents(command) {
+      const { data, error } = await client.rpc('pursue_cim_consume_safety_events_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw new Error('Malformed Pursue CIM safety consumption result');
+      }
+      const result = {};
+      for (const key of ['stopped', 'reviewRequired', 'noOp', 'pending']) {
+        const number = typeof data[key] === 'string' ? Number(data[key]) : data[key];
+        if (!Number.isSafeInteger(number) || number < 0) {
+          throw new Error(`Malformed Pursue CIM safety consumption result: ${key}`);
+        }
+        result[key] = number;
+      }
+      return result;
+    },
 
     async getCrmSubmissionSupersessionContext() {
       throw new CrmSupersessionUnavailableError();
