@@ -224,8 +224,14 @@ function queueRow(overrides = {}) {
     scoredAt: '2026-08-29T17:00:00.000Z',
     scoreFingerprint: 'fingerprint-1',
     rulesVersion: 'deal-hunter-fit-v2',
+    freshness: { discoveryRevision: 0, materialRevision: 0 },
     ...overrides,
   };
+}
+
+function expectOwnerCommand(action, fields = {}) {
+  return expect.objectContaining({ action, idempotencyKey: expect.stringMatching(/^[0-9a-f-]{36}$/),
+    expectedDiscoveryRevision: 0, expectedMaterialRevision: 0, ...fields });
 }
 
 function renderInbox(props = {}) {
@@ -504,8 +510,8 @@ describe('Fresh-first Acquisition Inbox', () => {
     fireEvent.change(within(form).getByLabelText('Pass note (optional)'), { target: { value: 'Keep this note.' } });
     fireEvent.click(within(form).getByRole('button', { name: 'Confirm Pass' }));
     await waitFor(() => expect(writes).toHaveLength(1));
-    expect(writes[0]).toEqual({ action: 'pass', reason: 'valuation', note: 'Keep this note.',
-      expectedDiscoveryRevision: 1, expectedMaterialRevision: 0 });
+    expect(writes[0]).toEqual(expectOwnerCommand('pass', { reason: 'valuation', note: 'Keep this note.',
+      expectedDiscoveryRevision: 1, expectedMaterialRevision: 0 }));
     await waitFor(() => expect(queueGets).toBeGreaterThanOrEqual(2));
     await waitFor(() => expect(detailGets).toBeGreaterThanOrEqual(2));
     expect(within(form).getByLabelText('Pass reason')).toHaveValue('valuation');
@@ -525,8 +531,8 @@ describe('Fresh-first Acquisition Inbox', () => {
     await waitFor(() => expect(within(form).getByRole('button', { name: 'Confirm Pass' })).toBeEnabled());
     fireEvent.click(within(form).getByRole('button', { name: 'Confirm Pass' }));
     await waitFor(() => expect(writes).toHaveLength(2));
-    expect(writes[1]).toEqual({ action: 'pass', reason: 'valuation', note: 'Keep this note.',
-      expectedDiscoveryRevision: 2, expectedMaterialRevision: 1 });
+    expect(writes[1]).toEqual(expectOwnerCommand('pass', { reason: 'valuation', note: 'Keep this note.',
+      expectedDiscoveryRevision: 2, expectedMaterialRevision: 1 }));
   });
 
   test('queue Pass retains its shown revision pair after a stale reload removes its row', async () => {
@@ -906,10 +912,13 @@ describe('Acquisition Inbox queue', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
     await waitFor(() => expect(writes).toHaveLength(2));
 
-    expect(writes).toEqual([
-      { url: '/api/admin/deal-hunter/triage/opp-1/action', method: 'POST', body: { action: 'pursue' } },
-      { url: '/api/admin/deal-hunter/triage/opp-1/action', method: 'POST', body: { action: 'watch' } },
-    ]);
+    expect(writes.map(({ body }) => body.action)).toEqual(['pursue', 'watch']);
+    for (const { url, method, body } of writes) {
+      expect(url).toBe('/api/admin/deal-hunter/triage/opp-1/action');
+      expect(method).toBe('POST');
+      expect(body).toEqual(expect.objectContaining({ expectedDiscoveryRevision: 0,
+        expectedMaterialRevision: 0, idempotencyKey: expect.stringMatching(/^[0-9a-f-]{36}$/) }));
+    }
     expect(writes.some(({ url }) => /send|cim|backfill|refresh|import/.test(url))).toBe(false);
   });
 
@@ -942,7 +951,7 @@ describe('Acquisition Inbox queue', () => {
 
     await waitFor(() => expect(writes).toEqual([{
       url: '/api/admin/deal-hunter/triage/opp-1/action',
-      body: { action: 'pass', reason: 'valuation', note: 'Price exceeds our return threshold.' },
+      body: expectOwnerCommand('pass', { reason: 'valuation', note: 'Price exceeds our return threshold.' }),
     }]));
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Evergreen Fire Protection' })).not.toBeInTheDocument());
   });
@@ -1029,7 +1038,7 @@ describe('Acquisition Inbox queue', () => {
 
     await waitFor(() => expect(writes).toEqual([{
       url: '/api/admin/deal-hunter/triage/opp-1/action',
-      body: { action: 'pass', reason: 'not strategic', note: '' },
+      body: expectOwnerCommand('pass', { reason: 'not strategic', note: '' }),
     }]));
     await act(async () => action.resolve(jsonResponse({ success: true, action: 'pass', disposition: { disposition: 'dismissed' } })));
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Pass Evergreen Fire Protection' })).not.toBeInTheDocument());
@@ -1130,7 +1139,7 @@ describe('Acquisition Inbox queue', () => {
     expect(screen.getByRole('button', { name: 'Open Evergreen Fire Protection' })).toBeEnabled();
     fireEvent.change(screen.getByRole('searchbox', { name: 'Search opportunities' }), { target: { value: 'evergreen' } });
     fireEvent.click(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
-    await waitFor(() => expect(writes).toEqual([{ action: 'watch' }]));
+    await waitFor(() => expect(writes).toEqual([expectOwnerCommand('watch')]));
     expect(requests.every((url) => url.startsWith('/api/admin/deal-hunter/triage'))).toBe(true);
     expect(requests.some((url) => /\/refresh|\/backfill|\/import|\/send|\/stage.?2|\/outreach|\/cim-/i.test(url))).toBe(false);
   });
@@ -1234,7 +1243,7 @@ describe('Acquisition Inbox queue', () => {
     const passForm = within(drawer).getByRole('form', { name: 'Pass Evergreen Fire Protection' });
     fireEvent.change(within(passForm).getByLabelText('Pass reason'), { target: { value: 'valuation' } });
     fireEvent.click(within(passForm).getByRole('button', { name: 'Confirm Pass' }));
-    expect(writes).toEqual([{ action: 'pass', reason: 'valuation', note: '' }]);
+    expect(writes).toEqual([expectOwnerCommand('pass', { reason: 'valuation', note: '' })]);
     expect(reads).toHaveLength(2);
     await act(async () => first.resolve(jsonResponse({ success: false, error: 'Drawer pass failed.' }, { ok: false, status: 409 })));
     expect(await within(drawer).findByRole('alert')).toHaveTextContent('Drawer pass failed.');
@@ -1249,6 +1258,7 @@ describe('Acquisition Inbox queue', () => {
     expect(reads).toHaveLength(2);
     fireEvent.click(within(passForm).getByRole('button', { name: 'Confirm Pass' }));
     expect(writes).toHaveLength(2);
+    expect(writes[1]).toEqual(writes[0]);
   });
 
   test('keeps verified-fact edit open with its prior durable value after a deferred save failure, then permits one retry', async () => {
@@ -1302,7 +1312,7 @@ describe('Acquisition Inbox queue', () => {
       expect(screen.getByRole('button', { name: action })).toBeEnabled();
     }
     fireEvent.click(watch);
-    expect(writes).toEqual([{ action: 'watch' }]);
+    expect(writes).toEqual([expectOwnerCommand('watch')]);
     await act(async () => first.resolve(jsonResponse({ success: false, error: 'Watch could not be saved.' }, { ok: false, status: 409 })));
     expect(await screen.findByRole('alert')).toHaveTextContent('Watch could not be saved.');
     expect(reads).toHaveLength(1);
@@ -1314,6 +1324,7 @@ describe('Acquisition Inbox queue', () => {
     }
     fireEvent.click(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
     expect(writes).toHaveLength(2);
+    expect(writes[1]).toEqual(writes[0]);
   });
 
   test('traps keyboard focus in drawer and queue Pass dialogs, closes by Escape or controls, and restores each triggering control', async () => {
@@ -1706,7 +1717,7 @@ describe('Acquisition Inbox queue', () => {
     await screen.findByRole('dialog', { name: 'Evergreen Fire Protection' });
     fireEvent.click(within(screen.getByRole('dialog', { name: 'Evergreen Fire Protection' })).getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
     await waitFor(() => expect(detailLoads).toBe(2));
-    expect(writes).toEqual([{ action: 'watch' }]);
+    expect(writes).toEqual([expectOwnerCommand('watch')]);
     expect(within(screen.getByRole('dialog', { name: 'Evergreen Fire Protection' })).getAllByText('Watch')).toHaveLength(2);
   });
 

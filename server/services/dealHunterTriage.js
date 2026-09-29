@@ -1044,6 +1044,99 @@ function publicPassDisposition(disposition = {}) {
   };
 }
 
+/** Immutable acquisition intent; the score row returned below is only a compatibility projection. */
+export async function recordAcquisitionOwnerCommand({
+  opportunityId, action, idempotencyKey, expectedDiscoveryRevision,
+  expectedMaterialRevision, reason, note, submissionId, actor,
+  storage = getStorage(),
+  getCachedSourceHealth = storage === getStorage() ? getSourceHealth : null,
+} = {}) {
+  if (typeof opportunityId !== 'string' || !opportunityId || opportunityId.length > 200
+    || opportunityId.trim() !== opportunityId) {
+    return { ok: false, status: 400, error: 'A canonical opportunity id is required.' };
+  }
+  if (typeof action !== 'string' || !['pursue', 'watch', 'pass'].includes(action)) {
+    return { ok: false, status: 400, error: 'Action must be pursue, watch, or pass.' };
+  }
+  if (typeof idempotencyKey !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(idempotencyKey)) {
+    return { ok: false, status: 400, error: 'A valid client idempotency key is required.' };
+  }
+  if (![expectedDiscoveryRevision, expectedMaterialRevision].every((value) =>
+    Number.isSafeInteger(value) && value >= 0)) {
+    return { ok: false, status: 400, error: 'Both current freshness revisions are required.' };
+  }
+  if (typeof actor !== 'string' || !actor.trim() || actor.length > 160) {
+    return { ok: false, status: 400, error: 'An authenticated actor is required.' };
+  }
+  if (action === 'pass') {
+    if (typeof reason !== 'string' || !reason.trim() || reason.trim().length > 80) {
+      return { ok: false, status: 400, error: 'A bounded disposition reason is required.' };
+    }
+    if (note !== undefined && (typeof note !== 'string' || note.length > maxNoteLength)) {
+      return { ok: false, status: 400, error: 'Disposition note must be a bounded string.' };
+    }
+    if (submissionId !== undefined && (typeof submissionId !== 'string'
+      || submissionId.length > 120 || submissionId.trim() !== submissionId)) {
+      return { ok: false, status: 400, error: 'Invalid linked submission context.' };
+    }
+  }
+  if (typeof storage.recordOwnerDecision !== 'function'
+    || typeof storage.getDealHunterOpportunityScore !== 'function') {
+    return { ok: false, status: 503, error: 'Owner command storage is unavailable.' };
+  }
+  const sourceGate = await requiredSourceMutationGate({ storage, getCachedSourceHealth });
+  if (sourceGate) return sourceGate;
+  const normalizedReason = action === 'pass' ? normalizeDealHunterDispositionReason(reason) : null;
+  if (action === 'pass' && !normalizedReason) {
+    return { ok: false, status: 400, error: 'A disposition reason is required.' };
+  }
+  let result;
+  try {
+    result = await storage.recordOwnerDecision({
+      opportunityId, action, idempotencyKey, expectedDiscoveryRevision,
+      expectedMaterialRevision, actor: actor.trim(), policyVersion: 'owner-decision-v1',
+      now: new Date().toISOString(),
+      ...(action === 'pass' ? { reason: normalizedReason, note: note?.trim() || '',
+        submissionId: submissionId || '' } : {}),
+    });
+  } catch (error) {
+    if (error?.code === 'DEAL_HUNTER_FRESHNESS_STALE') {
+      return { ok: false, status: 409, code: 'stale_freshness_review', error: error.message };
+    }
+    throw error;
+  }
+  if (result.conflict) {
+    const stale = result.reason === 'stale_revision';
+    return { ok: false, status: 409, code: stale ? 'stale_freshness_review' : 'owner_command_conflict',
+      error: stale ? 'Freshness changed since this opportunity was shown. Reload before acting.'
+        : result.reason === 'already-passed'
+          ? 'This opportunity has already been passed. Restore it before recording another decision.'
+          : 'Owner command conflicts with current or previously recorded authority.' };
+  }
+  const score = await storage.getDealHunterOpportunityScore(opportunityId);
+  const disposition = action === 'pass' && score?.deal_key
+    ? await storage.getDealHunterDisposition({ dealKey: score.deal_key }) : null;
+  let archived = Boolean(result.passResult?.archived);
+  if (action === 'pass' && result.replay && !archived
+    && typeof storage.getCurrentDealHunterOpportunity === 'function'
+    && typeof storage.getSubmission === 'function') {
+    const current = await storage.getCurrentDealHunterOpportunity(opportunityId);
+    if (current?.primary_submission_id) {
+      archived = (await storage.getSubmission(current.primary_submission_id))?.status === 'archived';
+    }
+  }
+  const opportunity = score ? publicTriageRow({ ...score,
+    dismissed_at: disposition?.dismissed_at, dismissed_reason: disposition?.reason,
+  }, { includeOperatorNote: true }) : null;
+  return { ok: true, status: 200, action, replay: Boolean(result.replay), opportunity,
+    ...(action === 'pass' ? { disposition: publicPassDisposition(disposition),
+      archived } : {}),
+    ...(action === 'pursue' && result.enrollment
+      ? { enrollment: { state: result.enrollment.state, createdAt: result.enrollment.created_at } } : {}),
+  };
+}
+
 export async function passTriageOpportunity({
   opportunityId = '',
   submissionId = '',

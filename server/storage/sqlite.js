@@ -7821,10 +7821,12 @@ export function createSqliteStorage(config, options = {}) {
     return { applied: true, record, activity: storedActivity };
   });
 
-  return {
+  const storageApi = {
     provider: 'sqlite',
 
-    ...createPursueCimSqliteTransitions(database),
+    ...createPursueCimSqliteTransitions(database, {
+      applyPass: (command) => storageApi._passDealHunterOpportunitySync(command),
+    }),
 
     async listActiveCrmSubmissionSupersessions(filters = {}) {
       return selectActiveCrmSubmissionSupersessions(database, filters);
@@ -10094,6 +10096,10 @@ export function createSqliteStorage(config, options = {}) {
       },
 
       async passDealHunterOpportunity(command = {}) {
+        return this._passDealHunterOpportunitySync(command);
+      },
+
+      _passDealHunterOpportunitySync(command = {}) {
         const opportunityId = String(command.opportunityId || '').trim();
         const expectedFreshness = freshnessReviewExpectedPair(command);
         const actor = String(command.actor || 'admin').trim() || 'admin';
@@ -14747,4 +14753,5 @@ export function createSqliteStorage(config, options = {}) {
         .map(normalizeSecureDocumentCleanupJobRow);
     },
 	  };
+  return storageApi;
 }

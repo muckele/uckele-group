@@ -160,7 +160,12 @@ const conversationTransitions = Object.freeze({
   responded: [], stopped: [], closed: [],
 });
 
-export function createPursueCimSqliteTransitions(database) {
+function deterministicUuid(...parts) {
+  const value = digest(...parts);
+  return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20, 32)}`;
+}
+
+export function createPursueCimSqliteTransitions(database, { applyPass } = {}) {
   return {
     async withdrawCimCapabilityActivation(command) {
       const id = requiredText(command.id, 'id');
@@ -1713,11 +1718,18 @@ export function createPursueCimSqliteTransitions(database) {
       const expectedMaterialRevision = requiredRevision(command.expectedMaterialRevision, 'expectedMaterialRevision');
       const selectedContactReferenceDigest = command.selectedContactReferenceDigest ?? null;
       const reason = action === 'pass' ? requiredText(command.reason, 'reason', 160) : null;
+      const note = action === 'pass' ? (command.note ?? '') : '';
+      const submissionId = action === 'pass' ? (command.submissionId ?? '') : '';
+      if (typeof note !== 'string' || note.length > 2000 || typeof submissionId !== 'string'
+        || submissionId.length > 120 || submissionId.trim() !== submissionId) {
+        throw new Error('Invalid Pass note or submission context');
+      }
       if (selectedContactReferenceDigest !== null && !/^[0-9a-f]{64}$/.test(selectedContactReferenceDigest)) {
         throw new Error('Invalid selected contact reference digest');
       }
       const requestDigest = digest('owner-decision-request:v1', action, opportunityId,
-        expectedDiscoveryRevision, expectedMaterialRevision, selectedContactReferenceDigest, idempotencyKey);
+        expectedDiscoveryRevision, expectedMaterialRevision, selectedContactReferenceDigest,
+        actor, policyVersion, reason, note, submissionId, idempotencyKey);
       return database.transaction(() => {
         const existing = database.prepare('SELECT * FROM deal_hunter_owner_decision_events WHERE idempotency_key = ?')
           .get(idempotencyKey);
@@ -1732,14 +1744,22 @@ export function createPursueCimSqliteTransitions(database) {
         if (!opportunity || opportunity.status !== 'active'
           || opportunity.discovery_revision !== expectedDiscoveryRevision
           || opportunity.material_revision !== expectedMaterialRevision) {
-          return { applied: false, replay: false, conflict: true, decision: null, enrollment: null };
+          return { applied: false, replay: false, conflict: true, reason: 'stale_revision',
+            decision: null, enrollment: null };
         }
-        const score = action === 'pursue' ? null : database.prepare(`
+        const score = database.prepare(`
           SELECT * FROM deal_hunter_opportunity_scores
           WHERE opportunity_id = ? AND current_triage_eligible = 1 AND should_remove = 0
         `).get(opportunityId);
         if (action !== 'pursue' && (!score || (action === 'pass' && !score.deal_key))) {
-          return { applied: false, replay: false, conflict: true, decision: null, enrollment: null };
+          return { applied: false, replay: false, conflict: true, reason: 'not-actionable',
+            decision: null, enrollment: null };
+        }
+        const disposition = score?.deal_key ? database.prepare(`SELECT disposition FROM deal_hunter_dispositions
+          WHERE deal_key = ?`).get(score.deal_key) : null;
+        if (disposition?.disposition === 'dismissed') {
+          return { applied: false, replay: false, conflict: true, reason: 'already-passed',
+            decision: null, enrollment: null };
         }
         const current = database.prepare(`
           SELECT e.*, d.id AS current_decision_id FROM deal_hunter_pursuit_enrollments e
@@ -1753,6 +1773,19 @@ export function createPursueCimSqliteTransitions(database) {
         }
         const decisionId = digest('owner-decision:v1', idempotencyKey);
         const enrollmentId = digest('pursuit-enrollment:v1', decisionId);
+        let passResult = null;
+        if (action === 'pass') {
+          if (typeof applyPass !== 'function') throw new Error('Atomic Pass authority is unavailable');
+          passResult = applyPass({ opportunityId, submissionId, reason, note, actor,
+            expectedDiscoveryRevision, expectedMaterialRevision, occurredAt: now,
+            dispositionId: deterministicUuid('owner-pass-disposition:v1', decisionId),
+            archiveActivityId: deterministicUuid('owner-pass-archive:v1', decisionId),
+            triageActivityId: deterministicUuid('owner-pass-triage:v1', decisionId) });
+          if (!passResult.applied) {
+            return { applied: false, replay: false, conflict: true,
+              reason: passResult.reason, decision: null, enrollment: null };
+          }
+        }
         database.prepare(`
           INSERT INTO deal_hunter_owner_decision_events (
             id, idempotency_key, request_digest, opportunity_id, action, actor,
@@ -1815,31 +1848,17 @@ export function createPursueCimSqliteTransitions(database) {
               opportunityId, campaignId: campaign.id, priorState: campaign.state,
               nextState: 'stopped', reasonCode: `${action}-selected`, actor, occurredAt: now });
           }
-          database.prepare(`UPDATE deal_hunter_opportunity_scores SET operator_priority = ?,
+          if (action === 'watch') database.prepare(`UPDATE deal_hunter_opportunity_scores SET operator_priority = ?,
             reviewed_at = ?, reviewed_by = ?, reviewed_fingerprint = score_fingerprint,
             reviewed_semantic_digest = semantic_digest, reviewed_discovery_revision = ?,
             reviewed_material_revision = ?, operator_updated_at = ? WHERE opportunity_id = ?`)
-            .run(action === 'watch' ? 'watch' : score.operator_priority, now, actor,
+            .run('watch', now, actor,
               expectedDiscoveryRevision, expectedMaterialRevision, now, opportunityId);
-          if (action === 'pass') {
-            const dispositionId = digest('owner-pass-disposition:v1', decisionId);
-            database.prepare(`INSERT INTO deal_hunter_dispositions (
-              id, deal_key, submission_id, listing_url, deal_name, created_at,
-              updated_at, disposition, reason, dismissed_at, dismissed_by,
-              created_by, updated_by, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'dismissed', ?, ?, ?, ?, ?, '{}')
-            ON CONFLICT(deal_key) DO UPDATE SET disposition = 'dismissed', reason = excluded.reason,
-              updated_at = excluded.updated_at, dismissed_at = excluded.dismissed_at,
-              dismissed_by = excluded.dismissed_by, updated_by = excluded.updated_by`)
-              .run(dispositionId, score.deal_key, opportunity.primary_submission_id,
-                score.listing_url, score.name ?? opportunity.canonical_name, now, now,
-                reason, now, actor, actor, actor);
-          }
           appendAudit(database, { eventType: 'owner-decision', authorityId: decisionId,
             opportunityId, nextState: action, authorityDigest: requestDigest, actor, occurredAt: now });
           return { applied: true, replay: false, conflict: false,
             decision: database.prepare('SELECT * FROM deal_hunter_owner_decision_events WHERE id = ?').get(decisionId),
-            enrollment: null };
+            enrollment: null, ...(passResult ? { passResult } : {}) };
         }
         database.prepare(`
           INSERT INTO deal_hunter_pursuit_enrollments (
@@ -1851,6 +1870,11 @@ export function createPursueCimSqliteTransitions(database) {
             opportunity.material_revision), now, now);
         appendAudit(database, { eventType: 'owner-decision', authorityId: decisionId,
           opportunityId, nextState: action, authorityDigest: requestDigest, actor, occurredAt: now });
+        if (score) database.prepare(`UPDATE deal_hunter_opportunity_scores SET operator_priority = 'high',
+          reviewed_at = ?, reviewed_by = ?, reviewed_fingerprint = score_fingerprint,
+          reviewed_semantic_digest = semantic_digest, reviewed_discovery_revision = ?,
+          reviewed_material_revision = ?, operator_updated_at = ? WHERE opportunity_id = ?`)
+          .run(now, actor, expectedDiscoveryRevision, expectedMaterialRevision, now, opportunityId);
         return {
           applied: true, replay: false, conflict: false,
           decision: database.prepare('SELECT * FROM deal_hunter_owner_decision_events WHERE id = ?').get(decisionId),

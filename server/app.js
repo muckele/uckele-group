@@ -46,7 +46,7 @@ import {
   dismissDealHunterOpportunityWithInboxAuthority,
   getTriageOpportunityDetail,
   listTriageQueue,
-  passTriageOpportunity,
+  recordAcquisitionOwnerCommand,
   restoreDealHunterOpportunityWithInboxAuthority,
   setTriageOperatorDecision,
 } from './services/dealHunterTriage.js';
@@ -2009,39 +2009,18 @@ export function createApp({
         response.status(401).json({ success: false, error: 'Administrator access is required.' });
         return;
       }
-      if (typeof request.body?.action !== 'string') {
-        response.status(400).json({ success: false, error: 'Action must be pursue, watch, or pass.' });
-        return;
-      }
-      const action = request.body.action.trim().toLowerCase();
-      if (!['pursue', 'watch', 'pass'].includes(action)) {
-        response.status(400).json({ success: false, error: 'Action must be pursue, watch, or pass.' });
-        return;
-      }
-      const opportunityId = request.params.opportunityId;
-      if (action === 'pursue' || action === 'watch') {
-        const result = await setTriageOperatorDecision({
-          opportunityId,
-          priority: action === 'pursue' ? 'high' : 'watch',
-          markReviewed: true,
-          expectedDiscoveryRevision: request.body?.expectedDiscoveryRevision,
-          expectedMaterialRevision: request.body?.expectedMaterialRevision,
-          actor: session.username || 'admin',
-        });
-        response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), action, ...result });
-        return;
-      }
-
-      const result = await passTriageOpportunity({
-        opportunityId,
-        submissionId: request.body?.submissionId || '',
+      const result = await recordAcquisitionOwnerCommand({
+        opportunityId: request.params.opportunityId,
+        action: request.body?.action,
+        idempotencyKey: request.body?.idempotencyKey,
+        submissionId: request.body?.submissionId,
         reason: request.body?.reason,
         note: request.body?.note,
         expectedDiscoveryRevision: request.body?.expectedDiscoveryRevision,
         expectedMaterialRevision: request.body?.expectedMaterialRevision,
         actor: session.username || 'admin',
       });
-      response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), action, ...result });
+      response.status(result.status).json({ success: result.ok, ...result });
     }),
   );
 

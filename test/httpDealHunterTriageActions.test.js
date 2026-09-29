@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -84,6 +85,11 @@ async function seedCurrentOpportunity(
   }, []);
   await storage.reconcileDealHunterCurrentScoreEligibility([opportunityId]);
   return { storage, opportunityId };
+}
+
+function ownerActionPayload(action, extra = {}) {
+  return { action, idempotencyKey: randomUUID(), expectedDiscoveryRevision: 0,
+    expectedMaterialRevision: 0, ...extra };
 }
 
 async function linkCanonicalDealKey(storage, { opportunityId, dealKey }) {
@@ -256,6 +262,112 @@ test('Pass rejects an array action with a valid reason without disposition or re
   });
 });
 
+test('P4A acquisition actions require client retry identity and both current revisions', async () => {
+  const { storage, opportunityId } = await seedCurrentOpportunity('opp-http-p4a-required-command');
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const url = `${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`;
+    for (const action of ['pursue', 'watch', 'pass']) {
+      for (const body of [
+        { action, reason: 'not-a-fit' },
+        { action, reason: 'not-a-fit', idempotencyKey: 'p4a-required-key' },
+        { action, reason: 'not-a-fit', idempotencyKey: 'p4a-required-key', expectedDiscoveryRevision: 0 },
+      ]) {
+        const response = await fetch(url, { method: 'POST',
+          headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify(body) });
+        assert.equal(response.status, 400, JSON.stringify(body));
+      }
+    }
+    for (const idempotencyKey of ['', '  a953b1f1-e128-408f-8265-2e49a16ba43c',
+      'malformed', 'a'.repeat(241), ['a953b1f1-e128-408f-8265-2e49a16ba43c'],
+      { key: 'a953b1f1-e128-408f-8265-2e49a16ba43c' }]) {
+      const response = await fetch(url, { method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify({ action: 'pursue', idempotencyKey,
+          expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 }),
+      });
+      assert.equal(response.status, 400);
+    }
+    for (const [discovery, material] of [[1, 0], [0, 1]]) {
+      const response = await fetch(url, { method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify(ownerActionPayload('pursue', {
+          expectedDiscoveryRevision: discovery, expectedMaterialRevision: material })),
+      });
+      assert.equal(response.status, 409);
+      assert.equal((await response.json()).code, 'stale_freshness_review');
+    }
+    assert.equal((await storage.getDealHunterOpportunityScore(opportunityId)).reviewed_at, null);
+    assert.equal((await storage.readPursueCimProjection({ opportunityId })).decision, null);
+    const database = new Database(process.env.SQLITE_PATH, { readonly: true });
+    try {
+      assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_pursuit_enrollments
+        WHERE opportunity_id = ?`).get(opportunityId).count, 0);
+      assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events
+        WHERE opportunity_id = ?`).get(opportunityId).count, 0);
+    } finally { database.close(); }
+  });
+});
+
+test('P4A generic triage edits never grant Pursue or Watch authority', async () => {
+  const { storage, opportunityId } = await seedCurrentOpportunity('opp-http-p4a-generic-boundary');
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const url = `${origin}/api/admin/deal-hunter/triage/${opportunityId}/decision`;
+    for (const priority of ['high', 'watch']) {
+      const response = await fetch(url, { method: 'POST',
+        headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify({ priority, markReviewed: true }),
+      });
+      assert.equal(response.status, 200);
+      assert.equal((await storage.readPursueCimProjection({ opportunityId })).decision, null);
+    }
+    const database = new Database(process.env.SQLITE_PATH, { readonly: true });
+    try {
+      assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_pursuit_enrollments
+        WHERE opportunity_id = ?`).get(opportunityId).count, 0);
+      assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns
+        WHERE opportunity_id = ?`).get(opportunityId).count, 0);
+    } finally { database.close(); }
+    const response = await fetch(url, { method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ note: 'Ordinary triage note', markReviewed: true }),
+    });
+    assert.equal(response.status, 200);
+  });
+});
+
+test('P4A owner command applies Pursue once, replays, conflicts, and never allocates outreach', async () => {
+  const { storage, opportunityId } = await seedCurrentOpportunity('opp-http-p4a-pursue');
+  const command = { action: 'pursue', idempotencyKey: 'a953b1f1-e128-408f-8265-2e49a16ba43c',
+    expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 };
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const url = `${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`;
+    const post = (body) => fetch(url, { method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify(body) });
+    const first = await post(command);
+    assert.equal(first.status, 200);
+    assert.deepEqual({ action: (await first.json()).action,
+      priority: (await storage.getDealHunterOpportunityScore(opportunityId)).operator_priority },
+    { action: 'pursue', priority: 'high' });
+    assert.equal((await post(command)).status, 200);
+    assert.equal((await (await post(command)).json()).replay, true);
+    assert.equal((await post({ ...command, action: 'watch' })).status, 409);
+    const database = new Database(process.env.SQLITE_PATH, { readonly: true });
+    try {
+      for (const [table, expected] of [
+        ['deal_hunter_owner_decision_events', 1], ['deal_hunter_pursuit_enrollments', 1],
+        ['deal_hunter_cim_campaigns', 0], ['deal_hunter_cim_campaign_touches', 0],
+      ]) assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE opportunity_id = ?`)
+        .get(opportunityId).count, expected, table);
+      assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_transmissions tr
+        JOIN deal_hunter_cim_transmission_touches m ON m.transmission_id = tr.id
+        WHERE m.opportunity_id = ?`).get(opportunityId).count, 0);
+    } finally { database.close(); }
+  });
+});
+
 test('Pass rolls back disposition when review persistence fails, retries once, and rejects every action until restore', async () => {
   // Break caught: the HTTP route commits disposition before it attempts the
   // review write, so an exception at the review boundary leaves a durable Pass
@@ -277,13 +389,19 @@ test('Pass rolls back disposition when review persistence fails, retries once, a
       const cookie = await login(origin, 'admin', 'change-me-now');
       const actionPath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/action`;
       const request = (body) => fetch(actionPath, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify(body),
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+        body: JSON.stringify({ idempotencyKey: body.action === 'pass'
+          ? 'ed532d60-3c18-43c9-a52b-30e2da084a0b'
+          : `fd532d60-3c18-43c9-a52b-30e2da084a0${body.action === 'watch' ? '1' : '2'}`,
+        expectedDiscoveryRevision: 0, expectedMaterialRevision: 0, ...body }),
       });
 
       const failed = await request({ action: 'pass', reason: 'valuation', note: 'Atomic failure injection.' });
       assert.equal(failed.status, 500);
       assert.equal((await storage.listDealHunterDispositions({ dealKeys: [dealKey], limit: 20 })).length, 0,
         'a failed Pass must not leave a durable dismissal');
+      assert.equal((await storage.readPursueCimProjection({ opportunityId })).decision, null,
+        'a failed Pass must not leave an immutable owner decision');
       const failedScore = await storage.getDealHunterOpportunityScore(opportunityId);
       assert.equal(failedScore.reviewed_at, null);
       assert.equal(failedScore.reviewed_semantic_digest, null);
@@ -307,7 +425,11 @@ test('Pass rolls back disposition when review persistence fails, retries once, a
         assert.equal(rejected.status, 409, `${action} must reject a durably Passed opportunity`);
       }
       const duplicate = await request({ action: 'pass', reason: 'valuation', note: 'Atomic failure injection.' });
-      assert.equal(duplicate.status, 409);
+      assert.equal(duplicate.status, 200);
+      assert.equal((await duplicate.json()).replay, true);
+      assert.equal((await request({ action: 'pass', reason: 'not-a-fit',
+        note: 'Atomic failure injection.' })).status, 409,
+      'the same Pass key cannot change its disposition reason');
       assert.equal((await storage.listDealHunterDispositions({ dealKeys: [dealKey], limit: 20 })).length, 1);
       assert.equal((await storage.getDealHunterDisposition({ dealKey })).updated_at, passedAt,
         'an identical repeat must not rewrite disposition time');
@@ -389,7 +511,8 @@ test('linked-CRM Pass rolls archive, CIM stop, disposition, review, and audit ba
       const actionPath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/action`;
       const request = () => fetch(actionPath, {
         method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
-        body: JSON.stringify({ action: 'pass', reason: 'valuation', note: 'Linked rollback.' }),
+        body: JSON.stringify(ownerActionPayload('pass', { idempotencyKey: '6b0dd595-2b3f-4d95-bdfc-2e9d303db35f',
+          reason: 'valuation', note: 'Linked rollback.' })),
       });
 
       assert.equal((await request()).status, 500);
@@ -419,7 +542,10 @@ test('linked-CRM Pass rolls archive, CIM stop, disposition, review, and audit ba
       assert.equal(activities.filter((event) => event.event_type === 'opportunity.triaged').length, 1);
       const disposition = await storage.getDealHunterDisposition({ dealKey });
       const duplicate = await request();
-      assert.equal(duplicate.status, 409);
+      assert.equal(duplicate.status, 200);
+      const duplicateBody = await duplicate.json();
+      assert.equal(duplicateBody.replay, true);
+      assert.equal(duplicateBody.archived, true);
       assert.equal((await storage.getDealHunterDisposition({ dealKey })).updated_at, disposition.updated_at);
       assert.equal((await storage.listCrmActivityEvents({ submissionId, limit: 100 })).length, activities.length);
     });
@@ -796,7 +922,7 @@ test('legacy alias restore resolves the canonical Inbox disposition and makes op
     for (const action of ['watch', 'pursue']) {
       const response = await fetch(actionPath, {
         method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
-        body: JSON.stringify({ action }),
+        body: JSON.stringify(ownerActionPayload(action)),
       });
       assert.equal(response.status, 200, `${action} must be actionable after alias restore`);
     }
@@ -852,7 +978,7 @@ test('triage detail remains readable while only administrators may enrich facts 
       });
       assert.equal(malformedAction.status, 400);
       const watch = await fetch(actionPath.replace(/^/, origin), {
-        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify({ action: 'watch' }),
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify(ownerActionPayload('watch')),
       });
       assert.equal(watch.status, 200);
       const afterWatch = await storage.getDealHunterOpportunityScore(opportunityId);
@@ -863,12 +989,12 @@ test('triage detail remains readable while only administrators may enrich facts 
       assert.equal(failedPass.status, 400);
       assert.equal((await storage.getDealHunterOpportunityScore(opportunityId)).reviewed_at, afterWatch.reviewed_at, 'failed dismissal must not alter the existing review acknowledgement');
       const pursue = await fetch(actionPath.replace(/^/, origin), {
-        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify({ action: 'pursue' }),
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify(ownerActionPayload('pursue')),
       });
       assert.equal(pursue.status, 200);
       const pass = await fetch(actionPath.replace(/^/, origin), {
         method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
-        body: JSON.stringify({ action: 'pass', reason: 'not-a-fit', note: 'Does not match the acquisition focus.' }),
+        body: JSON.stringify(ownerActionPayload('pass', { reason: 'not-a-fit', note: 'Does not match the acquisition focus.' })),
       });
       assert.equal(pass.status, 200);
       assert.equal((await pass.json()).disposition.disposition, 'dismissed');
@@ -902,7 +1028,7 @@ test('prepare Broker Materials enforces auth and the strict canonical input whil
     const actionPath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/action`;
     const preparePath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/prepare`;
     assert.equal((await fetch(actionPath, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify({ action: 'pursue' }),
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify(ownerActionPayload('pursue')),
     })).status, 200);
 
     const before = {
@@ -979,7 +1105,7 @@ test('approve Broker Materials requires admin, accepts only token plus digest, a
     const preparePath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/prepare`;
     const approvePath = `${origin}/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/broker-materials/approve`;
     assert.equal((await fetch(actionPath, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify({ action: 'pursue' }),
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: JSON.stringify(ownerActionPayload('pursue')),
     })).status, 200);
     const preparationResponse = await fetch(preparePath, {
       method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: adminCookie }, body: '{}',

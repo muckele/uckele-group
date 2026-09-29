@@ -1,5 +1,7 @@
 import { expect, test } from '@playwright/test';
 
+const ownerCommandUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
 const emptySummary = {
   total: 15,
   new: 0,
@@ -242,6 +244,7 @@ function phase1ScoreRow(overrides = {}) {
     evidenceObservedAt: '2026-08-29T15:30:00.000Z',
     scoreFingerprint: 'phase1-machine-score-default',
     rulesVersion: 'deal-hunter-fit-v2.1',
+    freshness: { discoveryState: 'untracked_legacy', discoveryRevision: 0, materialRevision: 0 },
     ...overrides,
   };
 }
@@ -490,6 +493,7 @@ function phase1QueueRow(opportunity) {
     scoredAt: opportunity.scoredAt,
     scoreFingerprint: opportunity.scoreFingerprint,
     rulesVersion: opportunity.rulesVersion,
+    freshness: { ...opportunity.freshness },
   };
 }
 
@@ -1353,8 +1357,14 @@ async function installPhase1Fixture(page, { role = 'admin' } = {}) {
       const score = state.scoreRows.find((item) => item.opportunityId === opportunityId);
       const body = phase1Body(request);
       if (!opportunity || !score || !['pursue', 'watch', 'pass'].includes(body.action)) throw new Error(`Malformed Phase 1 action target or action: ${path}`);
-      const expectedKeys = body.action === 'pass' ? ['action', 'note', 'reason'] : ['action'];
-      if (JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(expectedKeys)) {
+      const expectedKeys = ['action', 'expectedDiscoveryRevision', 'expectedMaterialRevision', 'idempotencyKey',
+        ...(body.action === 'pass' ? ['note', 'reason'] : [])];
+      if (JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(expectedKeys.sort())
+        || typeof body.idempotencyKey !== 'string' || !ownerCommandUuidPattern.test(body.idempotencyKey)
+        || !Number.isSafeInteger(body.expectedDiscoveryRevision)
+        || !Number.isSafeInteger(body.expectedMaterialRevision)
+        || body.expectedDiscoveryRevision !== score.freshness.discoveryRevision
+        || body.expectedMaterialRevision !== score.freshness.materialRevision) {
         throw new Error(`Malformed Phase 1 action payload keys: ${JSON.stringify(body)}`);
       }
       if (body.action === 'pass' && (body.reason !== 'valuation' || body.note !== 'Asking price exceeds the current acquisition valuation.')) {
@@ -2662,11 +2672,27 @@ test('Acquisition Inbox Phase 1 is a stateful, human-controlled default workflow
   ].sort();
   expect(state.apiRequests).toHaveLength(39);
   expect(state.apiRequests.map(phase1RequestSignature).sort()).toEqual(expectedInboxApiRequests);
-  expect(state.actionPayloads).toEqual([
-    { method: 'POST', path: '/api/admin/deal-hunter/triage/opp-evergreen/action', body: { action: 'pursue' }, machineScore: 92 },
-    { method: 'POST', path: '/api/admin/deal-hunter/triage/opp-evergreen/action', body: { action: 'watch' }, machineScore: 92 },
-    { method: 'POST', path: '/api/admin/deal-hunter/triage/opp-cascade/action', body: { action: 'pass', reason: 'valuation', note: 'Asking price exceeds the current acquisition valuation.' }, machineScore: 84 },
-  ]);
+  expect(state.actionPayloads).toHaveLength(3);
+  for (const [index, action, opportunityId, machineScore] of [
+    [0, 'pursue', 'opp-evergreen', 92],
+    [1, 'watch', 'opp-evergreen', 92],
+    [2, 'pass', 'opp-cascade', 84],
+  ]) {
+    const payload = state.actionPayloads[index];
+    const authority = state.scoreRows.find((score) => score.opportunityId === opportunityId).freshness;
+    expect(payload.method).toBe('POST');
+    expect(payload.path).toBe(`/api/admin/deal-hunter/triage/${opportunityId}/action`);
+    expect(payload.machineScore).toBe(machineScore);
+    expect(payload.body.action).toBe(action);
+    expect(payload.body.idempotencyKey).toMatch(ownerCommandUuidPattern);
+    expect(payload.body.expectedDiscoveryRevision).toBe(authority.discoveryRevision);
+    expect(payload.body.expectedMaterialRevision).toBe(authority.materialRevision);
+    expect(Object.keys(payload.body).sort()).toEqual(['action', 'expectedDiscoveryRevision',
+      'expectedMaterialRevision', 'idempotencyKey', ...(action === 'pass' ? ['note', 'reason'] : [])]);
+  }
+  expect(new Set(state.actionPayloads.map((payload) => payload.body.idempotencyKey)).size).toBe(3);
+  expect(state.actionPayloads[2].body).toMatchObject({ reason: 'valuation',
+    note: 'Asking price exceeds the current acquisition valuation.' });
   expect(state.factPayloads).toEqual([{
     method: 'PUT',
     path: '/api/admin/deal-hunter/opportunities/opp-evergreen/facts/seller_name',
