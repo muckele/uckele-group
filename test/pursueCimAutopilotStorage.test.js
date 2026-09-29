@@ -789,6 +789,14 @@ test('P1B timezone revisions append once and reject stale or changed replay', as
   assert.equal((await storage.appendOpportunityTimezoneRevision({ ...command, idempotencyKey: 'timezone-key-2' })).staleRevision, true);
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_opportunity_timezone_revisions').get().count, 1);
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events').get().count, 1);
+  database.prepare("UPDATE deal_hunter_opportunities SET status = 'superseded' WHERE opportunity_id = ?")
+    .run('opp-timezone');
+  assert.equal((await storage.appendOpportunityTimezoneRevision(command)).replay, true);
+  const afterSupersession = await storage.appendOpportunityTimezoneRevision({ ...command,
+    idempotencyKey: 'timezone-key-after-supersession', expectedPriorRevision: 1 });
+  assert.equal(afterSupersession.applied, false);
+  assert.equal(afterSupersession.staleRevision, true);
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_opportunity_timezone_revisions').get().count, 1);
 });
 
 test('P1B enrollment transition CAS accepts legal edges and rejects stale or illegal edges', async (t) => {

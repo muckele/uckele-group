@@ -193,6 +193,54 @@ test('Pass rejects non-primitive action and every invalid reason or note before 
   });
 });
 
+test('P3 protected timezone revision API is idempotent, revision-bound, and never exposes resolver authority', async () => {
+  const { opportunityId } = await seedCurrentOpportunity('opp-http-p3-timezone');
+  await withServer(async (origin) => {
+    const adminCookie = await login(origin, 'admin', 'change-me-now');
+    const viewerCookie = await login(origin, 'triage-viewer', 'triage-viewer-password');
+    const url = `${origin}/api/admin/deal-hunter/triage/${opportunityId}/timezone`;
+    const payload = { ianaTimezone: 'America/Phoenix', evidenceId: 'owner-checked-location',
+      expectedPriorRevision: 0, idempotencyKey: 'ad953b1f-e128-408f-8265-2e49a16ba43c' };
+    const post = (body, cookie = adminCookie, headers = {}) => fetch(url, { method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie, ...headers }, body: JSON.stringify(body) });
+    assert.equal((await post(payload, viewerCookie)).status, 401);
+    assert.equal((await post(payload, adminCookie, { Origin: 'https://evil.example' })).status, 403);
+    assert.equal((await post({ ...payload, state: 'derived' })).status, 400);
+    const first = await post(payload);
+    assert.equal(first.status, 200);
+    const firstBody = await first.json();
+    assert.equal(firstBody.timezone.revision, 1);
+    assert.equal(firstBody.timezone.ianaTimezone, 'America/Phoenix');
+    assert.equal(JSON.stringify(firstBody).includes('evidenceDigest'), false);
+    const replay = await post(payload);
+    assert.equal(replay.status, 200);
+    assert.equal((await replay.json()).replay, true);
+    assert.equal((await post({ ...payload, idempotencyKey: 'ab0c5d65-fce1-4555-a4a6-032e0439fdcc' })).status, 409);
+    const corrected = await post({ ...payload, ianaTimezone: 'America/New_York',
+      expectedPriorRevision: 1, idempotencyKey: 'ff532d60-3c18-43c9-a52b-30e2da084a0b' });
+    assert.equal(corrected.status, 200);
+    assert.equal((await corrected.json()).timezone.revision, 2);
+    const supersessionDatabase = new Database(process.env.SQLITE_PATH);
+    supersessionDatabase.prepare("UPDATE deal_hunter_opportunities SET status = 'superseded' WHERE opportunity_id = ?")
+      .run(opportunityId);
+    supersessionDatabase.close();
+    assert.equal((await post({ ...payload, ianaTimezone: 'America/New_York',
+      expectedPriorRevision: 1, idempotencyKey: 'ff532d60-3c18-43c9-a52b-30e2da084a0b' })).status, 200);
+    assert.equal((await post({ ...payload, expectedPriorRevision: 2,
+      idempotencyKey: '41d8923e-4baf-46f4-9e02-992ca8bdf95a' })).status, 409);
+    const database = new Database(process.env.SQLITE_PATH);
+    try {
+      const revisions = database.prepare(`SELECT revision, iana_timezone, evidence_digest FROM
+        deal_hunter_opportunity_timezone_revisions WHERE opportunity_id = ? ORDER BY revision`).all(opportunityId);
+      assert.deepEqual(revisions.map(({ revision, iana_timezone: zone }) => [revision, zone]),
+        [[1, 'America/Phoenix'], [2, 'America/New_York']]);
+      assert.notEqual(revisions[0].evidence_digest, revisions[1].evidence_digest);
+      assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns WHERE opportunity_id = ?')
+        .get(opportunityId).count, 0);
+    } finally { database.close(); }
+  });
+});
+
 test('Pass rejects an array action with a valid reason without disposition or review side effects', async () => {
   // Break caught: String(action) turns ["pass"] into a valid Pass command.
   const { storage, opportunityId } = await seedCurrentOpportunity('opp-http-triage-array-pass');
