@@ -214,7 +214,7 @@ function operatorContactCandidates(facts = []) {
   }];
 }
 
-function issueContactOptions({ opportunityId, contacts, secret }) {
+function issueContactOptions({ opportunityId, contacts, secret, now }) {
   const byEmail = new Map();
   for (const contact of contacts) {
     const current = byEmail.get(contact.email) || [];
@@ -228,6 +228,10 @@ function issueContactOptions({ opportunityId, contacts, secret }) {
     ));
     const primary = sorted.find((item) => item.primary) || sorted[0];
     const provenanceFingerprint = sha256(stableCanonicalJson(sorted.map((item) => ({ provenance: item.provenance, identity: item.identity }))));
+    const nonCrmProvenances = sorted.filter((item) => item.provenance !== 'crm');
+    const permissionProvenanceFingerprint = nonCrmProvenances.length
+      ? sha256(stableCanonicalJson(nonCrmProvenances.map((item) => ({ provenance: item.provenance, identity: item.identity }))))
+      : provenanceFingerprint;
     const contactAuthorityRevision = sha256(stableCanonicalJson({ recipientEmail, provenances: sorted.map((item) => item.identity) }));
     const recipientContactRef = signPayload({
       typ: contactReferenceType,
@@ -236,6 +240,7 @@ function issueContactOptions({ opportunityId, contacts, secret }) {
       provenanceFingerprint,
       contactAuthorityRevision,
       recipientIdentityHash: sha256(`${opportunityId}:${recipientEmail}`),
+      exp: now.getTime() + preparationLifetimeMs,
     }, secret);
     return {
       recipientContactRef,
@@ -247,9 +252,25 @@ function issueContactOptions({ opportunityId, contacts, secret }) {
       provenances: sorted.map((item) => ({ provenance: item.provenance, label: item.provenanceLabel })),
       primary: sorted.some((item) => item.primary),
       provenanceFingerprint,
+      permissionProvenanceFingerprint,
       contactAuthorityRevision,
     };
   }).sort((left, right) => left.email.localeCompare(right.email) || left.provenance.localeCompare(right.provenance));
+}
+
+export function resolveBrokerMaterialsRecipientContactRef(authority, contactRef, now = new Date()) {
+  if (typeof contactRef !== 'string' || !contactRef || contactRef.length > 2000) return null;
+  const claims = verifySignedPayload(contactRef, getConfig().admin.sessionSecret,
+    normalizedNow(now).getTime());
+  if (claims?.typ !== contactReferenceType || claims.version !== 1
+    || claims.canonicalOpportunityId !== authority?.opportunityId
+    || !Number.isFinite(claims.exp)) return null;
+  return authority.recipientOptions.find((candidate) => (
+    safeCompareText(claims.recipientIdentityHash,
+      sha256(`${authority.opportunityId}:${candidate.email}`))
+    && safeCompareText(claims.provenanceFingerprint, candidate.provenanceFingerprint)
+    && safeCompareText(claims.contactAuthorityRevision, candidate.contactAuthorityRevision)
+  )) || null;
 }
 
 function selectCurrentRequest(records = []) {
@@ -527,7 +548,8 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
     ...crmContactCandidates(submission),
     ...operatorContactCandidates(facts),
   ];
-  const recipientOptions = issueContactOptions({ opportunityId: id, contacts, secret: config.admin.sessionSecret });
+  const recipientOptions = issueContactOptions({ opportunityId: id, contacts,
+    secret: config.admin.sessionSecret, now: at });
   const state = pursuedState(score);
   const materialsState = evaluateAcquisitionMaterialsState({ submission, secureDocuments, latestUploadRequest });
   const currentRequest = selectCurrentRequest(requests);
@@ -585,6 +607,10 @@ export async function loadBrokerMaterialsAuthority({ opportunityId = '', storage
     policy: 'manual_stage_1',
   });
   const preparationBlockers = [];
+  if (facts.length >= 100 || sourceRows.length >= 500 || aliases.length >= 500) {
+    preparationBlockers.push(blocker('broker_materials_authority_unavailable',
+      'Broker Materials contact authority exceeds the bounded read. Review the complete record before continuing.'));
+  }
   if (text(opportunity.status, 80).toLowerCase() !== 'active') preparationBlockers.push(blocker('canonical_authority_unavailable', 'The canonical opportunity is no longer current.'));
   if (!state.pursued) preparationBlockers.push(blocker(state.changed ? 'pursue_not_current' : 'not_pursued', state.changed ? 'The Pursue review is no longer current.' : 'Explicit current Pursue is required.'));
   if (score.should_remove) preparationBlockers.push(blocker('opportunity_not_actionable', 'The opportunity is removed or otherwise non-actionable.'));
@@ -688,7 +714,7 @@ export async function projectDealHunterBrokerMaterials({ opportunityId = '', sto
     preparationBlockers: authority.preparationBlockers,
     sendBlockers,
     warnings: authority.warnings,
-    recipientOptions: authority.recipientOptions.map(({ provenanceFingerprint: _fingerprint, contactAuthorityRevision: _revision, firstName: _firstName, ...option }) => option),
+    recipientOptions: authority.recipientOptions.map(({ provenanceFingerprint: _fingerprint, permissionProvenanceFingerprint: _permissionFingerprint, contactAuthorityRevision: _revision, firstName: _firstName, ...option }) => option),
   };
 }
 
@@ -698,7 +724,7 @@ function preparationError(authority, code, message, status = 409) {
     status,
     code,
     error: message,
-    recipientOptions: authority.recipientOptions.map(({ provenanceFingerprint: _fingerprint, contactAuthorityRevision: _revision, firstName: _firstName, ...option }) => option),
+    recipientOptions: authority.recipientOptions.map(({ provenanceFingerprint: _fingerprint, permissionProvenanceFingerprint: _permissionFingerprint, contactAuthorityRevision: _revision, firstName: _firstName, ...option }) => option),
     warnings: authority.warnings,
     preparationBlockers: authority.preparationBlockers,
     sendBlockers: authority.sendBlockers,
@@ -706,7 +732,7 @@ function preparationError(authority, code, message, status = 409) {
 }
 
 function publicRecipientOptions(authority) {
-  return authority.recipientOptions.map(({ provenanceFingerprint: _fingerprint, contactAuthorityRevision: _revision, firstName: _firstName, ...option }) => option);
+  return authority.recipientOptions.map(({ provenanceFingerprint: _fingerprint, permissionProvenanceFingerprint: _permissionFingerprint, contactAuthorityRevision: _revision, firstName: _firstName, ...option }) => option);
 }
 
 function defaultGreeting(recipient) {
@@ -815,7 +841,8 @@ export async function prepareDealHunterBrokerMaterials({
   }
   let selectedRecipient = null;
   if (session.role === 'admin' && input.recipientContactRef) {
-    selectedRecipient = authority.recipientOptions.find((item) => item.recipientContactRef === input.recipientContactRef) || null;
+    selectedRecipient = resolveBrokerMaterialsRecipientContactRef(authority,
+      input.recipientContactRef, now);
     if (!selectedRecipient) return preparationError(authority, 'recipient_contact_stale', 'The selected recipient contact reference is stale or invalid.');
   } else if (authority.recipientOptions.length === 1) {
     selectedRecipient = authority.recipientOptions[0];
@@ -983,11 +1010,13 @@ export async function approveDealHunterBrokerMaterials({
     return approvalFailure('preparation_stale', 'Current opportunity authority changed after preparation. Prepare and review it again.', 409);
   }
   const signed = claims.approvalBoundPayload;
-  const selectedRecipient = authority.recipientOptions.find((candidate) => (
-    safeCompareText(candidate.recipientContactRef, signed.recipientContactRef)
-    && safeCompareText(candidate.email, signed.recipientEmail)
-    && safeCompareText(candidate.provenanceFingerprint, signed.recipientProvenanceFingerprint)
-  ));
+  const selectedRecipient = resolveBrokerMaterialsRecipientContactRef(authority,
+    signed.recipientContactRef, now);
+  if (selectedRecipient && (!safeCompareText(selectedRecipient.email, signed.recipientEmail)
+    || !safeCompareText(selectedRecipient.provenanceFingerprint,
+      signed.recipientProvenanceFingerprint))) {
+    return approvalFailure('preparation_stale', 'The approved broker recipient is no longer current. Prepare and review it again.', 409);
+  }
   if (!selectedRecipient) {
     return approvalFailure('preparation_stale', 'The approved broker recipient is no longer current. Prepare and review it again.', 409);
   }
@@ -995,7 +1024,7 @@ export async function approveDealHunterBrokerMaterials({
   try {
     currentProposal = buildCurrentApprovedProposal({
       authority,
-      selectedRecipient,
+      selectedRecipient: { ...selectedRecipient, recipientContactRef: signed.recipientContactRef },
       greeting: signed.greeting,
       requestedBy: session.username || 'admin',
     }).approvalBoundPayload;

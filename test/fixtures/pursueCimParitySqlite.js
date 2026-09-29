@@ -170,8 +170,16 @@ database.prepare(`insert into contact_submissions
 database.prepare(`update deal_hunter_opportunities set primary_submission_id =
   '11111111-1111-4111-8111-111111111111' where opportunity_id = 'opp-decision'`).run();
 const expectedCampaigns = [];
+const crmMatchAuthorityFingerprint = await storage.readPursuitCrmMatchAuthorityFingerprint();
 const resolvedCampaignCommands = campaignCommands.map((command) => ({ ...command,
-  enrollmentId: expectedOwnerDecisions[0].enrollmentId }));
+  enrollmentId: expectedOwnerDecisions[0].enrollmentId,
+  crmMatchAuthorityFingerprint,
+  crmOwnershipRevision: database.prepare(`select revision from deal_hunter_crm_ownership_revisions
+    where opportunity_id = 'opp-decision' order by revision desc limit 1`).get().revision,
+  campaignAuthorityRevision: database.prepare(`select campaign_authority_revision as revision
+    from deal_hunter_opportunities where opportunity_id = 'opp-decision'`).get().revision,
+  globalAuthorityRevision: database.prepare(`select revision from deal_hunter_cim_global_authority
+    where id = 'global'`).get().revision }));
 for (const command of resolvedCampaignCommands) {
   const outcome = await storage.materializePursuitCampaign(command);
   expectedCampaigns.push({ applied: outcome.applied, existing: outcome.existing,

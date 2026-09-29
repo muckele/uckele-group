@@ -4566,7 +4566,7 @@ async function assertNoDealHunterCrmTombstone(storage, deal) {
   }
 }
 
-async function ensureDealHunterSubmissionForCim(storage, deal, requestedBy = '') {
+export async function ensureDealHunterSubmissionForCim(storage, deal, requestedBy = '') {
   await assertNoDealHunterCrmTombstone(storage, deal);
   const preflightMatch = await findExistingDealHunterSubmission(storage, deal);
   const existing = selectedDealHunterCrmSubmission(preflightMatch);

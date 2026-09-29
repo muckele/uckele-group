@@ -334,6 +334,19 @@ test('contact references are opaque, stable across ordering, canonical/provenanc
   assert.equal(Object.hasOwn(stale, 'preparationToken'), false);
 });
 
+test('contact references expire before a later preparation even when contact authority is unchanged', async () => {
+  const storage = authorityStorage();
+  const issued = await loadBrokerMaterialsAuthority({ opportunityId, storage, now });
+  const expiredAt = new Date(now.getTime() + 16 * 60 * 1000);
+  const stale = await prepareDealHunterBrokerMaterials({
+    opportunityId,
+    recipientContactRef: issued.recipientOptions[0].recipientContactRef,
+    session: adminSession(), storage, now: expiredAt,
+  });
+  assert.equal(stale.code, 'recipient_contact_stale');
+  assert.equal(Object.hasOwn(stale, 'preparationToken'), false);
+});
+
 test('multiple contacts require explicit selection unless current authority marks one primary', async () => {
   const multiple = authorityStorage({ submission: { ...authorityStorage().state.submission, broker_email: 'crm@example.test' } });
   const required = await prepareDealHunterBrokerMaterials({ opportunityId, session: adminSession(), storage: multiple, now });

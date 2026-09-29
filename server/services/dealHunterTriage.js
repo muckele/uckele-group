@@ -10,6 +10,7 @@
 // acquisition progress stays owned by the command center.
 
 import { randomUUID } from 'node:crypto';
+import { sha256 } from '../utils/security.js';
 import { freshInboxAreaIds } from './dealHunterFreshInboxPolicy.js';
 import { recordCrmActivity } from './activity.js';
 import { getStorage } from '../storage/index.js';
@@ -32,6 +33,7 @@ import { firstStrictDetailAuthorityTimestamp } from './detailAuthorityTimestamp.
 import { normalizeCanonicalCimRequestId } from './cimRequestIdPolicy.js';
 import { getSourceHealth } from './acquisitionCommandCenter.js';
 import { projectDealHunterBrokerMaterials } from './dealHunterBrokerMaterials.js';
+import { orchestratePursuitEnrollment } from './pursueCimEnrollment.js';
 import { reconcileDealHunterApprovedFollowUp } from './dealHunter.js';
 
 export const triageViews = Object.freeze([
@@ -1047,7 +1049,7 @@ function publicPassDisposition(disposition = {}) {
 /** Immutable acquisition intent; the score row returned below is only a compatibility projection. */
 export async function recordAcquisitionOwnerCommand({
   opportunityId, action, idempotencyKey, expectedDiscoveryRevision,
-  expectedMaterialRevision, reason, note, submissionId, actor,
+  expectedMaterialRevision, reason, note, submissionId, recipientContactRef, actor,
   storage = getStorage(),
   getCachedSourceHealth = storage === getStorage() ? getSourceHealth : null,
 } = {}) {
@@ -1068,6 +1070,12 @@ export async function recordAcquisitionOwnerCommand({
   }
   if (typeof actor !== 'string' || !actor.trim() || actor.length > 160) {
     return { ok: false, status: 400, error: 'An authenticated actor is required.' };
+  }
+  if (recipientContactRef !== undefined && (action !== 'pursue'
+    || typeof recipientContactRef !== 'string' || !recipientContactRef
+    || recipientContactRef.length > 2000
+    || recipientContactRef.trim() !== recipientContactRef)) {
+    return { ok: false, status: 400, error: 'Invalid recipient contact reference.' };
   }
   if (action === 'pass') {
     if (typeof reason !== 'string' || !reason.trim() || reason.trim().length > 80) {
@@ -1096,6 +1104,8 @@ export async function recordAcquisitionOwnerCommand({
     result = await storage.recordOwnerDecision({
       opportunityId, action, idempotencyKey, expectedDiscoveryRevision,
       expectedMaterialRevision, actor: actor.trim(), policyVersion: 'owner-decision-v1',
+      ...(recipientContactRef !== undefined
+        ? { selectedContactReferenceDigest: sha256(recipientContactRef) } : {}),
       now: new Date().toISOString(),
       ...(action === 'pass' ? { reason: normalizedReason, note: note?.trim() || '',
         submissionId: submissionId || '' } : {}),
@@ -1113,6 +1123,14 @@ export async function recordAcquisitionOwnerCommand({
         : result.reason === 'already-passed'
           ? 'This opportunity has already been passed. Restore it before recording another decision.'
           : 'Owner command conflicts with current or previously recorded authority.' };
+  }
+  let enrollment = result.enrollment;
+  let recipientOptions = [];
+  if (action === 'pursue' && ['queued', 'waiting-on-eligibility'].includes(enrollment?.state)) {
+    const orchestration = await orchestratePursuitEnrollment({ storage, opportunityId,
+      enrollment, decision: result.decision, recipientContactRef, actor: actor.trim() });
+    enrollment = orchestration.enrollment;
+    recipientOptions = orchestration.recipientOptions;
   }
   const score = await storage.getDealHunterOpportunityScore(opportunityId);
   const disposition = action === 'pass' && score?.deal_key
@@ -1132,8 +1150,9 @@ export async function recordAcquisitionOwnerCommand({
   return { ok: true, status: 200, action, replay: Boolean(result.replay), opportunity,
     ...(action === 'pass' ? { disposition: publicPassDisposition(disposition),
       archived } : {}),
-    ...(action === 'pursue' && result.enrollment
-      ? { enrollment: { state: result.enrollment.state, createdAt: result.enrollment.created_at } } : {}),
+    ...(action === 'pursue' && enrollment
+      ? { enrollment: { state: enrollment.state, createdAt: enrollment.created_at },
+        recipientOptions } : {}),
   };
 }
 

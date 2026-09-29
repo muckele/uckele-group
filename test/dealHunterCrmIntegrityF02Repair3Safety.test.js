@@ -757,6 +757,23 @@ test('F-02 Repair3 apply changes exactly three cells and produces the real clean
   assert.equal(JSON.stringify(result.receipt).includes('@example.test'), false);
 });
 
+test('F-02 Repair3 backlink repair leaves canonical primary ownership revisions unchanged', async (t) => {
+  const fixture = await createIncidentFixture(t);
+  const revisions = () => {
+    const database = new Database(fixture.databasePath, { fileMustExist: true });
+    try {
+      return database.prepare(`SELECT opportunity_id, revision, submission_id
+        FROM deal_hunter_crm_ownership_revisions ORDER BY opportunity_id, revision`).all();
+    } finally { database.close(); }
+  };
+  const before = revisions();
+  const dryRun = await approvedDryRun(fixture);
+  const backup = await createFixtureBackup(fixture);
+  const result = await approvedApply(fixture, dryRun, backup);
+  assert.equal(result.receipt.mutationCount, 3);
+  assert.deepEqual(revisions(), before);
+});
+
 test('F-02 Repair3 corrected state distinguishes satisfaction from validated prior execution', async (t) => {
   const fixture = await createIncidentFixture(t);
   const dryRun = await approvedDryRun(fixture);

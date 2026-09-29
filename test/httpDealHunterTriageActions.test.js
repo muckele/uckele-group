@@ -49,7 +49,7 @@ const { createApp } = await import('../server/app.js');
 const { getConfig } = await import('../server/config.js');
 const { getStorage } = await import('../server/storage/index.js');
 const { createManualSubmission } = await import('../server/services/submissions.js');
-const { verifySignedPayload } = await import('../server/utils/security.js');
+const { sha256, verifySignedPayload } = await import('../server/utils/security.js');
 let loginSequence = 0;
 const authenticatedCookies = new Map();
 
@@ -365,6 +365,45 @@ test('P4A owner command applies Pursue once, replays, conflicts, and never alloc
         JOIN deal_hunter_cim_transmission_touches m ON m.transmission_id = tr.id
         WHERE m.opportunity_id = ?`).get(opportunityId).count, 0);
     } finally { database.close(); }
+  });
+});
+
+test('P4B Pursue binds the exact opaque contact reference into immutable idempotency', async () => {
+  const { opportunityId } = await seedCurrentOpportunity('opp-http-p4b-contact-selection');
+  const command = { action: 'pursue', idempotencyKey: randomUUID(),
+    expectedDiscoveryRevision: 0, expectedMaterialRevision: 0,
+    recipientContactRef: 'opaque-selected-contact-v1' };
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const url = `${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`;
+    const post = (body) => fetch(url, { method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify(body) });
+    assert.equal((await post(command)).status, 200);
+    const database = new Database(process.env.SQLITE_PATH, { readonly: true });
+    try {
+      const decision = database.prepare(`SELECT selected_contact_reference_digest AS digest
+        FROM deal_hunter_owner_decision_events WHERE opportunity_id = ?`).get(opportunityId);
+      assert.equal(decision.digest, sha256(command.recipientContactRef));
+    } finally { database.close(); }
+    assert.equal((await post(command)).status, 200);
+    assert.equal((await post({ ...command, recipientContactRef: 'opaque-selected-contact-v2' })).status, 409);
+  });
+});
+
+test('P4B missing recipient keeps the Pursue decision and marks enrollment action-required', async () => {
+  const { storage, opportunityId } = await seedCurrentOpportunity('opp-http-p4b-no-recipient');
+  await withServer(async (origin) => {
+    const cookie = await login(origin, 'admin', 'change-me-now');
+    const response = await fetch(`${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify(ownerActionPayload('pursue')),
+    });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).enrollment.state, 'action-required');
+    const projection = await storage.readPursueCimProjection({ opportunityId });
+    assert.equal(projection.decision.action, 'pursue');
+    assert.equal(projection.enrollment.reason_code, 'recipient_missing');
+    assert.equal(projection.campaign, null);
   });
 });
 

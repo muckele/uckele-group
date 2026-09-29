@@ -107,6 +107,10 @@ const crmAuthorityMigrationUrl = new URL(
   '../supabase/migrations/20261001120000_postgres_crm_authority_parity.sql',
   import.meta.url,
 );
+const pursueCimP4bMigrationUrl = new URL(
+  '../supabase/migrations/20261001130000_pursue_cim_p4b_authority.sql',
+  import.meta.url,
+);
 
 function dailyDigestScheduledJobMigration() {
   return fs.existsSync(scheduledJobFencingMigrationUrl)
@@ -457,7 +461,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const freshnessMigration = fs.readFileSync(freshnessMigrationUrl, 'utf8');
   const pursueCimAutopilotMigration = fs.readFileSync(pursueCimAutopilotMigrationUrl, 'utf8');
   const crmAuthorityMigration = fs.readFileSync(crmAuthorityMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}`;
+  const pursueCimP4bMigration = fs.readFileSync(pursueCimP4bMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}\n${pursueCimP4bMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');

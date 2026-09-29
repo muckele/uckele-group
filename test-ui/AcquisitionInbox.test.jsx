@@ -922,6 +922,34 @@ describe('Acquisition Inbox queue', () => {
     expect(writes.some(({ url }) => /send|cim|backfill|refresh|import/.test(url))).toBe(false);
   });
 
+  test('offers ambiguous Pursue recipients and retries with a new immutable choice', async () => {
+    const writes = [];
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1')) return jsonResponse(detailResponse());
+      if (url.endsWith('/action')) {
+        const body = JSON.parse(options.body);
+        writes.push(body);
+        return jsonResponse({ success: true, action: 'pursue',
+          enrollment: { state: body.recipientContactRef ? 'waiting-on-eligibility' : 'action-required' },
+          recipientOptions: body.recipientContactRef ? [] : [
+            { recipientContactRef: 'opaque-a', displayName: 'Jane Broker', provenanceLabel: 'Sheet row A' },
+            { recipientContactRef: 'opaque-b', displayName: 'Alex Broker', provenanceLabel: 'Sheet row B' },
+          ] });
+      }
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Pursue Evergreen Fire Protection' }));
+    const choice = await screen.findByLabelText('Choose Pursue recipient');
+    fireEvent.click(within(choice).getByRole('button', { name: /Alex Broker/ }));
+    await waitFor(() => expect(writes).toHaveLength(2));
+    expect(writes[0]).toEqual(expectOwnerCommand('pursue'));
+    expect(writes[1]).toEqual(expectOwnerCommand('pursue', { recipientContactRef: 'opaque-b' }));
+    expect(writes[1].idempotencyKey).not.toBe(writes[0].idempotencyKey);
+    await waitFor(() => expect(screen.queryByLabelText('Choose Pursue recipient')).not.toBeInTheDocument());
+  });
+
   test('collects a bounded Pass reason and optional note in-app, submits them, then closes the passed drawer', async () => {
     const writes = [];
     vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {

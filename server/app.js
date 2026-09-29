@@ -2014,6 +2014,7 @@ export function createApp({
         action: request.body?.action,
         idempotencyKey: request.body?.idempotencyKey,
         submissionId: request.body?.submissionId,
+        recipientContactRef: request.body?.recipientContactRef,
         reason: request.body?.reason,
         note: request.body?.note,
         expectedDiscoveryRevision: request.body?.expectedDiscoveryRevision,
