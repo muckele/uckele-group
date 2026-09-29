@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
+import { readCimCurrentAuthority, runCimCampaignSafety } from '../server/services/cimCampaignSafety.js';
+import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from '../server/services/dealHunterSourceSnapshotAdmission.js';
 import { processCrmEmailOutbox } from '../server/services/followUpEmail.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { createPursueCimProviderFake } from './fixtures/pursueCimHarness.js';
@@ -966,6 +968,95 @@ test('P1B safety emission and no-op consumption are idempotent and audited', asy
     actor: 'fixture-owner', now: at }), first);
   assert.equal(database.prepare('SELECT status FROM deal_hunter_cim_safety_events').get().status, 'no-op');
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events WHERE event_type = 'safety-consumed'").get().count, 1);
+});
+
+test('P2 unchanged source evidence is a no-op for an existing active campaign', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p2-unchanged');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = insertBaseAuthority(database, '-p2-unchanged');
+  await storage.appendCimSafetyEvents({ safetyRunId: 'p2-unchanged-run', sourceType: 'synthetic-import',
+    sourceRunId: 'p2-unchanged-source', now: at, events: [{ opportunityId: authority.opportunityId,
+      canonicalRevision: 1, identityExceptionRevision: 0, eventType: 'source-record-unchanged',
+      evidenceId: 'p2-unchanged-evidence' }] });
+  const shadow = await runCimCampaignSafety({ storage, safetyRunId: 'p2-unchanged-run', mode: 'shadow', now: at });
+  assert.equal(shadow.pending, 1);
+  assert.equal(shadow.proposed.noOp, 1);
+  const consumed = await runCimCampaignSafety({ storage, safetyRunId: 'p2-unchanged-run', mode: 'active', now: at });
+  assert.deepEqual(consumed, { safetyRunId: 'p2-unchanged-run', safetyEventsEmitted: 1,
+    stopped: 0, reviewRequired: 0, noOp: 1, pending: 0,
+    sourceProjectionPending: false, complete: true });
+  assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_campaigns WHERE id = ?')
+    .get(authority.campaignId).state, 'initial-pending');
+  assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_campaign_touches WHERE id = ?')
+    .get(authority.touchId).state, 'scheduled');
+});
+
+test('P2 admitted import is evidence-only for an active campaign until safety activation', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p2-active-import');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = insertBaseAuthority(database, '-p2-import');
+  const before = await storage.readCimOutreachCounters();
+  const campaignBefore = fingerprintRows(database, 'deal_hunter_cim_campaigns', 'id');
+  const touchBefore = fingerprintRows(database, 'deal_hunter_cim_campaign_touches', 'id');
+  const sourceId = 'sheet-0';
+  const sourceRecordId = 'external:P2-CAMPAIGN';
+  const run = await storage.allocateDealHunterSourceGeneration({ sourceId, runId: 'p2-active-import-run' });
+  const accepted = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({ storage,
+    reviewMode: 'full-backfill', run,
+    sourceResult: { source: { id: sourceId, required: true, fetched: true,
+      sourceRowCount: 1, rowCount: 1, coverageLimitReached: false },
+    deals: [{ sourceId, sourceName: 'Synthetic Sheet', stableExternalId: true, id: 'P2-CAMPAIGN' }] },
+    records: [{ opportunity_id: authority.opportunityId, source_id: sourceId,
+      source_name: 'Synthetic Sheet', source_record_id: sourceRecordId,
+      observations: [{ id: 'p2-campaign-observation', opportunity_id: authority.opportunityId,
+        source_id: sourceId, source_name: 'Synthetic Sheet', source_record_id: sourceRecordId,
+        field: 'name', value: 'Campaign Shop', observed_at: at, created_at: at, updated_at: at }],
+      freshness_evidence: null }],
+  });
+  assert.equal(accepted.reconciled, true);
+  assert.equal(accepted.safetyEventsEmitted, 1);
+  assert.deepEqual(await storage.readCimOutreachCounters(), before);
+  assert.equal(fingerprintRows(database, 'deal_hunter_cim_campaigns', 'id'), campaignBefore);
+  assert.equal(fingerprintRows(database, 'deal_hunter_cim_campaign_touches', 'id'), touchBefore);
+  const current = await readCimCurrentAuthority({ storage,
+    opportunityId: authority.opportunityId,
+    readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(current.blocked, true);
+  assert.ok(current.blockers.includes('campaign-source-authority-changed'));
+  const shadow = await runCimCampaignSafety({ storage, safetyRunId: accepted.safetyRunId, mode: 'shadow', now: at });
+  assert.deepEqual([shadow.pending, shadow.proposed.reviewRequired], [1, 1]);
+  const withoutActivation = await runCimCampaignSafety({ storage,
+    safetyRunId: accepted.safetyRunId, mode: 'active', now: at });
+  assert.equal(withoutActivation.pending, 1);
+  assert.equal(fingerprintRows(database, 'deal_hunter_cim_campaigns', 'id'), campaignBefore);
+  await seedSyntheticActivationChain(storage, 'fl04a-safety');
+  const consumed = await runCimCampaignSafety({ storage,
+    safetyRunId: accepted.safetyRunId, mode: 'active', now: at });
+  assert.deepEqual([consumed.reviewRequired, consumed.pending], [1, 0]);
+  assert.deepEqual(await runCimCampaignSafety({ storage,
+    safetyRunId: accepted.safetyRunId, mode: 'active', now: at }), consumed);
+  assert.equal((await storage.readCimOutreachCounters()).campaigns, before.campaigns);
+});
+
+test('P2 arbitrary safety append cannot impersonate an admitted source commit', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p2-source-impersonation');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  seedOpportunity(database, 'op-p2-impersonation');
+  await assert.rejects(storage.appendCimSafetyEvents({ safetyRunId: 'fake-import-run',
+    sourceType: 'sheet-import', sourceRunId: 'fake-run', now: at,
+    events: [{ opportunityId: 'op-p2-impersonation', canonicalRevision: 0,
+      identityExceptionRevision: 0, eventType: 'source-record-changed', evidenceId: 'fake-evidence' }] }),
+  /source commit/);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_safety_events').get().n, 0);
 });
 
 test('P1B safety stop stays pending without activation then terminalizes once', async (t) => {

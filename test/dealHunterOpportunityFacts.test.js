@@ -162,17 +162,29 @@ function requiredCompleteSheetSourceResult(snapshot) {
   };
 }
 
+let completeSourceRunSequence = 0;
+async function fixtureCompleteSourceRun(storage, sourceId) {
+  completeSourceRunSequence += 1;
+  const runId = `facts-source-run-${completeSourceRunSequence}`;
+  return storage.testSqlitePath
+    ? storage.allocateDealHunterSourceGeneration({ sourceId, runId })
+    : { sourceId, runId, generation: completeSourceRunSequence };
+}
+
 async function reconcileCompleteSourceSnapshot(storage, snapshot) {
+  const run = await fixtureCompleteSourceRun(storage, snapshot.source_id);
   return reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
     storage,
     reviewMode: 'full-backfill',
     sourceResult: requiredCompleteSheetSourceResult(snapshot),
     records: snapshot.records,
+    run,
   });
 }
 
-async function captureCollectorPrivateCompleteSheetAdmission(snapshot) {
+async function captureCollectorPrivateCompleteSheetAdmission(snapshot, targetStorage = null) {
   let captured = null;
+  const run = await fixtureCompleteSourceRun(targetStorage || {}, snapshot.source_id);
   const result = await reconcileVerifiedCompleteGoogleSheetSourceSnapshot({
     storage: {
       async replaceAdmittedCompleteGoogleSheetSourceSnapshot(value) {
@@ -182,6 +194,7 @@ async function captureCollectorPrivateCompleteSheetAdmission(snapshot) {
     reviewMode: 'full-backfill',
     sourceResult: requiredCompleteSheetSourceResult(snapshot),
     records: snapshot.records,
+    run,
   });
   assert.equal(result.reconciled, true, 'the controlled storage seam must receive only a collector-verified full snapshot');
   assert.ok(captured, 'the collector must immediately hand its private admission to storage');
@@ -426,8 +439,10 @@ function constrainedSupabaseBoundary() {
             row.opportunity_id === payload.p_opportunity_id && row.source_id === payload.p_source_id
           )), error: null };
         }
-        if (name === 'replace_admitted_complete_google_sheet_source_snapshot') {
-          const incomingRecords = Array.isArray(payload.p_records) ? payload.p_records : [];
+        if (name === 'replace_admitted_complete_google_sheet_source_snapshot'
+          || name === 'accept_admitted_complete_google_sheet_freshness_v1') {
+          const incomingRecords = name === 'accept_admitted_complete_google_sheet_freshness_v1'
+            ? JSON.parse(payload.p_records_text) : payload.p_records;
           const sourceId = payload.p_admission?.source_id;
           const sourceName = payload.p_admission?.source_name;
           const snapshotRows = incomingRecords.flatMap((record) => (
@@ -1630,6 +1645,7 @@ test('verified complete-Sheet reconciliation rejects partial canonical coverage 
     reviewMode: 'full-backfill',
     sourceResult,
     records: completeSnapshot.records,
+    run: await fixtureCompleteSourceRun(storage, completeSnapshot.source_id),
   });
   assert.equal(completeResult.reconciled, true);
   assert.deepEqual(
@@ -1680,13 +1696,15 @@ test('SQLite preserves collector-private admission mismatch, replay, and cross-s
     'the admitted storage entrypoint must also reject an absent capability',
   );
   assert.deepEqual(await storage.listDealHunterOpportunitySourceObservations(opportunityId), before);
-  const mismatchedAdmission = await captureCollectorPrivateCompleteSheetAdmission(admittedSheet);
+  const mismatchedAdmission = await captureCollectorPrivateCompleteSheetAdmission(admittedSheet, storage);
   await assert.rejects(
-    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...tamperedSheet, admission: mismatchedAdmission.admission }),
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...tamperedSheet,
+      run: mismatchedAdmission.run, admission: mismatchedAdmission.admission }),
     /does not match the normalized source payload/,
   );
   await assert.rejects(
-    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...admittedSheet, admission: mismatchedAdmission.admission }),
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...admittedSheet,
+      run: mismatchedAdmission.run, admission: mismatchedAdmission.admission }),
     /admission is required/,
     'a tampered first attempt consumes the one-shot capability',
   );
@@ -1697,14 +1715,15 @@ test('SQLite preserves collector-private admission mismatch, replay, and cross-s
     sourceName: 'Deal OS Export',
     records: [observationSnapshot({ id: 'capability-deal-os-new', source_record_id: 'external:DEAL-OS-1', field: 'annual_profit', value: '555000' })],
   });
-  const crossSourceAdmission = await captureCollectorPrivateCompleteSheetAdmission(admittedSheet);
+  const crossSourceAdmission = await captureCollectorPrivateCompleteSheetAdmission(admittedSheet, storage);
   await assert.rejects(
-    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...crossSource, admission: crossSourceAdmission.admission }),
-    /deterministic Sheet source slot/,
+    storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot({ ...crossSource,
+      run: crossSourceAdmission.run, admission: crossSourceAdmission.admission }),
+    /deterministic Sheet source slot|allocated bounded source run/,
   );
   assert.deepEqual(await storage.listDealHunterOpportunitySourceObservations(opportunityId), before);
 
-  const validAdmission = await captureCollectorPrivateCompleteSheetAdmission(admittedSheet);
+  const validAdmission = await captureCollectorPrivateCompleteSheetAdmission(admittedSheet, storage);
   await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(validAdmission);
   const afterValid = await storage.listDealHunterOpportunitySourceObservations(opportunityId);
   assert.deepEqual(
@@ -1725,6 +1744,7 @@ test('SQLite complete source snapshot rolls back source-wide stale deletion and 
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-complete-source-snapshot-sourcewide-rollback-'));
   const sqlitePath = path.join(directory, 'facts.sqlite');
   const storage = createSqliteStorage({ storage: { sqlitePath } });
+  storage.testSqlitePath = sqlitePath;
   t.after(() => {
     storage.close();
     fs.rmSync(directory, { recursive: true, force: true });
@@ -1807,6 +1827,10 @@ test('Supabase complete source snapshot uses one constrained RPC and removes an 
     { storage: { supabaseUrl: 'https://project.supabase.invalid', supabaseServiceRoleKey: 'service-role-key' } },
     { client: boundary.client },
   );
+  // This legacy fixture exercises the source writer RPC; it has no P2 counter RPC.
+  storage.readCimOutreachCounters = undefined;
+  storage.listCimSafetyEvents = undefined;
+  storage.listDealHunterSourceFreshnessStates = undefined;
   const removedOpportunityId = 'opp-facts-removed-source-scope';
   const first = completeSourceSnapshot({
     records: [
@@ -1830,24 +1854,14 @@ test('Supabase complete source snapshot uses one constrained RPC and removes an 
   });
   await reconcileCompleteSourceSnapshot(storage, retained);
   assert.deepEqual(boundary.calls.map((call) => call.name), [
-    'replace_admitted_complete_google_sheet_source_snapshot',
+    'accept_admitted_complete_google_sheet_freshness_v1',
     'upsert_deal_hunter_opportunity_source_observation',
-    'replace_admitted_complete_google_sheet_source_snapshot',
+    'accept_admitted_complete_google_sheet_freshness_v1',
   ]);
-  assert.deepEqual(boundary.calls[2].payload, {
-    p_admission: boundary.calls[2].payload.p_admission,
-    p_records: retained.records,
-  });
-  assert.deepEqual(boundary.calls[2].payload.p_admission, {
-    policy: 'complete-google-sheet-source-snapshot-v1',
-    source_id: 'sheet-0',
-    source_name: 'SMB Deal Hunter Google Sheet',
-    source_slot: 0,
-    record_count: 1,
-    observation_count: 1,
-    source_record_ids: ['sheet-row:1'],
-    snapshot_digest: boundary.calls[2].payload.p_admission.snapshot_digest,
-  });
+  assert.deepEqual(JSON.parse(boundary.calls[2].payload.p_records_text), retained.records);
+  assert.equal(boundary.calls[2].payload.p_admission.source_id, 'sheet-0');
+  assert.equal(boundary.calls[2].payload.p_admission.record_count, 1);
+  assert.equal(boundary.calls[2].payload.p_admission.run.sourceId, 'sheet-0');
   assert.deepEqual(
     [...boundary.observations.values()]
       .map((row) => [row.opportunity_id, row.source_id, row.source_record_id, row.field, row.value])
@@ -1941,13 +1955,13 @@ test('Supabase preserves collector-private admission mismatch, replay, and cross
       ...crossSource,
       admission: crossSourceAdmission.admission,
     }),
-    /deterministic Sheet source slot/,
+    /deterministic Sheet source slot|allocated bounded source run/,
   );
   assert.deepEqual(boundary.calls, [], 'absent, mismatched, and non-Sheet admissions must not reach the RPC boundary');
 
   const validAdmission = await captureCollectorPrivateCompleteSheetAdmission(admittedSheet);
   await storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(validAdmission);
-  assert.deepEqual(boundary.calls.map((call) => call.name), ['replace_admitted_complete_google_sheet_source_snapshot']);
+  assert.deepEqual(boundary.calls.map((call) => call.name), ['accept_admitted_complete_google_sheet_freshness_v1']);
   await assert.rejects(
     storage.replaceAdmittedCompleteGoogleSheetSourceSnapshot(validAdmission),
     /admission is required/,

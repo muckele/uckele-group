@@ -11,6 +11,7 @@ const integrationEnabled = process.env.DEAL_HUNTER_POSTGRES_INTEGRATION === '1';
 const dockerCommand = fs.existsSync('/usr/local/bin/docker') ? '/usr/local/bin/docker' : 'docker';
 const baseSha = '0361a178dbaa36847ca6235fc300df9e209687ef';
 const migrationPath = path.join(root, 'supabase/migrations/20260925120000_pursue_cim_autopilot.sql');
+const safetyMigrationPath = path.join(root, 'supabase/migrations/20260928120000_pursue_cim_intake_safety.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -41,12 +42,14 @@ const expectedP1cFunctions = [
   'pursue_cim_consume_safety_events_v1',
   'pursue_cim_current_activation_v1',
   'pursue_cim_digest_v1',
+  'pursue_cim_emit_admitted_import_safety_v1',
   'pursue_cim_enter_provider_seam_v1',
   'pursue_cim_finalize_transmission_v1',
   'pursue_cim_issue_live_authorization_v1',
   'pursue_cim_json_stringify_v1',
   'pursue_cim_materialize_campaign_v1',
   'pursue_cim_prepare_transmission_v1',
+  'pursue_cim_read_import_outreach_counters_v1',
   'pursue_cim_read_projection_v1',
   'pursue_cim_reconcile_transmission_v1',
   'pursue_cim_record_capability_activation_v1',
@@ -61,9 +64,13 @@ const expectedP1cFunctions = [
 
 test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
   const marker = '-- Package 1C: versioned Pursue CIM transition RPCs.';
+  const nextMarker = '-- Package 2: admitted source commits append inert campaign-safety evidence.';
   const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
   const migration = fs.readFileSync(migrationPath, 'utf8');
-  assert.equal(schema.slice(schema.indexOf(marker)), migration.slice(migration.indexOf(marker)));
+  assert.equal(schema.slice(schema.indexOf(marker), schema.indexOf(nextMarker)).trim(),
+    migration.slice(migration.indexOf(marker)).trim());
+  const safetyMigration = fs.readFileSync(safetyMigrationPath, 'utf8');
+  assert.equal(schema.slice(schema.indexOf(nextMarker)).trim(), safetyMigration.trim());
 });
 
 test('P1C Supabase adapter rejects contradictory transition authority', async () => {
@@ -269,6 +276,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   `);
   const before = legacyFingerprint(container, 'pursue_cim_upgrade');
   psql(container, 'pursue_cim_upgrade', migration);
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(safetyMigrationPath, 'utf8'));
 
   for (const database of ['pursue_cim_fresh', 'pursue_cim_upgrade']) {
     const catalog = JSON.parse(psql(container, database, `
@@ -494,6 +502,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_fresh', currentSchema);
   psql(container, 'pursue_cim_upgrade', baseSchema);
   psql(container, 'pursue_cim_upgrade', migration);
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(safetyMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const commands = [
@@ -670,7 +679,8 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         authenticated: rpc.authenticated, service: rpc.service,
         fixedSearchPath: rpc.fixedSearchPath },
       { public: false, anon: false, authenticated: false,
-        service: rpc.name !== 'pursue_cim_cancel_prepared_transmission_v1',
+        service: !['pursue_cim_cancel_prepared_transmission_v1',
+          'pursue_cim_emit_admitted_import_safety_v1'].includes(rpc.name),
         fixedSearchPath: true }, `${database}:${rpc.name}`);
       if (!['pursue_cim_assert_types_v1', 'pursue_cim_current_activation_v1', 'pursue_cim_digest_v1',
         'pursue_cim_json_stringify_v1', 'pursue_cim_required_revision_v1',
@@ -697,7 +707,12 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
           'pursue_cim_reconcile_transmission_v1',
           'pursue_cim_withdraw_live_authorization_v1',
           'pursue_cim_append_terminal_event_v1',
-          'pursue_cim_consume_safety_events_v1'].includes(name), name);
+          'pursue_cim_consume_safety_events_v1',
+          'pursue_cim_read_import_outreach_counters_v1'].includes(name), name);
+        if (name === 'pursue_cim_read_import_outreach_counters_v1') {
+          return { data: JSON.parse(psql(container, database, `set role service_role;
+            select public.pursue_cim_read_import_outreach_counters_v1();`)), error: null };
+        }
         const argument = JSON.stringify(payload.p_command ?? payload.p_run).replaceAll("'", "''");
         const data = JSON.parse(psql(container, database, `
           set role service_role;
@@ -706,6 +721,14 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         return { data, error: null };
       },
     } });
+    const outreach = await supabase.readCimOutreachCounters();
+    assert.equal(outreach.ownerDecisions, Number(psql(container, database,
+      'select count(*) from public.deal_hunter_owner_decision_events;')));
+    assert.equal(outreach.campaigns, Number(psql(container, database,
+      'select count(*) from public.deal_hunter_cim_campaigns;')));
+    assert.equal(outreach.providerSeamEntries, Number(psql(container, database,
+      `select count(*) from public.deal_hunter_cim_transmissions
+        where provider_seam_entered_at is not null;`)));
     const rejectAuditTransition = (eventType, name, command) => {
       psql(container, database, `
         create function public.p1c_reject_transition_audit() returns trigger
@@ -1285,6 +1308,25 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         'fixture', 'synthetic safety'
       from public.deal_hunter_cim_transmissions where id='trans-safety';
     `);
+    psql(container, database, `insert into public.deal_hunter_cim_safety_events
+      (id, safety_run_id, opportunity_id, source_type, source_run_id,
+       canonical_revision, identity_exception_revision, event_type, evidence_id,
+       status, created_at, updated_at)
+      values
+      ('p2-limit-changed', 'p2-limit-run', 'opp-safety', 'synthetic-test',
+       'p2-limit-source', 0, 0, 'source-record-changed', 'p2-evidence-changed',
+       'pending', '${now}', '${now}'),
+      ('p2-limit-unchanged', 'p2-limit-run', 'opp-safety', 'synthetic-test',
+       'p2-limit-source', 0, 0, 'source-record-unchanged', 'p2-evidence-unchanged',
+       'pending', '${now}'::timestamptz + interval '1 second',
+       '${now}'::timestamptz + interval '1 second');`);
+    const limitResult = rolledBackRpc('pursue_cim_consume_safety_events_v1', {
+      safetyRunId: 'p2-limit-run', limit: 1, actor: 'fixture', now,
+      outcomes: { 'p2-limit-changed': 'review-required',
+        'p2-limit-unchanged': 'no-op' },
+    });
+    assert.deepEqual({ reviewRequired: limitResult.reviewRequired, noOp: limitResult.noOp,
+      pending: limitResult.pending }, { reviewRequired: 1, noOp: 0, pending: 1 }, database);
     await supabase.appendCimSafetyEvents(reference.safetyStopRun);
     assert.equal(psql(container, database, `select id from public.deal_hunter_cim_safety_events
       where safety_run_id='safety-run-stop'`), reference.safetyStopEventId);

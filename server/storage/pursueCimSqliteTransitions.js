@@ -982,9 +982,38 @@ export function createPursueCimSqliteTransitions(database) {
         `).get(transmissionId));
       }).immediate();
     },
+    async readCimOutreachCounters() {
+      const counts = {};
+      for (const [key, table, where] of [
+        ['ownerDecisions', 'deal_hunter_owner_decision_events', ''],
+        ['enrollments', 'deal_hunter_pursuit_enrollments', ''],
+        ['campaigns', 'deal_hunter_cim_campaigns', ''],
+        ['touches', 'deal_hunter_cim_campaign_touches', ''],
+        ['transmissions', 'deal_hunter_cim_transmissions', ''],
+        ['memberships', 'deal_hunter_cim_transmission_touches', ''],
+        ['crmOutbound', 'crm_communications', "WHERE direction = 'outbound'"],
+        ['outbox', 'crm_email_outbox', ''],
+        ['providerAuthorizations', 'deal_hunter_cim_live_provider_authorizations', ''],
+        ['providerPending', 'deal_hunter_cim_transmissions', "WHERE state = 'provider-pending'"],
+        ['providerSeamEntries', 'deal_hunter_cim_transmissions', 'WHERE provider_seam_entered_at IS NOT NULL'],
+      ]) {
+        counts[key] = database.prepare(`SELECT COUNT(*) AS n FROM ${table} ${where}`).get().n;
+      }
+      return counts;
+    },
+    async listCimSafetyEvents({ safetyRunId }) {
+      const runId = requiredText(safetyRunId, 'safetyRunId');
+      const events = database.prepare(`SELECT * FROM deal_hunter_cim_safety_events
+        WHERE safety_run_id = ? ORDER BY created_at, id LIMIT 10001`).all(runId);
+      if (events.length > 10000) throw new Error('CIM safety run exceeds the bounded read.');
+      return events;
+    },
     async appendCimSafetyEvents(run) {
       const safetyRunId = requiredText(run.safetyRunId, 'safetyRunId');
       const sourceType = requiredText(run.sourceType, 'sourceType', 120);
+      if (['sheet-import', 'deal-os-import'].includes(sourceType)) {
+        throw new Error('Admitted import safety events require their source commit');
+      }
       const sourceRunId = requiredText(run.sourceRunId, 'sourceRunId');
       const now = requiredInstant(run.now);
       if (!Array.isArray(run.events) || run.events.length > 10000) throw new Error('Invalid safety event batch');
@@ -1045,6 +1074,17 @@ export function createPursueCimSqliteTransitions(database) {
           `).get(event.opportunity_id);
           if (active) {
             const disposition = command.outcomes?.[event.id];
+            if (disposition === 'no-op'
+              && ['source-record-unchanged', 'source-record-superseded']
+                .includes(event.event_type.split('#')[0])) {
+              database.prepare(`UPDATE deal_hunter_cim_safety_events SET status = 'no-op',
+                outcome_evidence_id = ?, consumed_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'pending'`).run(event.id, now, now, event.id);
+              appendAudit(database, { eventType: 'safety-consumed', authorityId: event.id,
+                opportunityId: event.opportunity_id, campaignId: active.id,
+                priorState: 'pending', nextState: 'no-op', actor, occurredAt: now });
+              continue;
+            }
             if (!['stopped', 'review-required'].includes(disposition)
               || !currentActivationChain(database, 'fl04a-safety', now)) continue;
             const nextState = disposition === 'stopped' ? 'stopped' : 'action-required';

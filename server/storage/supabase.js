@@ -1232,6 +1232,36 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       return { ...result, legacySummary };
     },
 
+    async readCimOutreachCounters() {
+      const { data, error } = await client.rpc('pursue_cim_read_import_outreach_counters_v1');
+      if (error) throw error;
+      const counts = {};
+      for (const key of ['ownerDecisions', 'enrollments', 'campaigns', 'touches',
+        'transmissions', 'memberships', 'crmOutbound', 'outbox',
+        'providerAuthorizations', 'providerPending', 'providerSeamEntries']) {
+        const value = typeof data?.[key] === 'string' ? Number(data[key]) : data?.[key];
+        if (!Number.isSafeInteger(value) || value < 0) {
+          throw new Error(`Malformed CIM outreach counter: ${key}`);
+        }
+        counts[key] = value;
+      }
+      return counts;
+    },
+
+    async listCimSafetyEvents({ safetyRunId }) {
+      const runId = String(safetyRunId || '').trim();
+      if (!runId || runId.length > 240 || runId !== safetyRunId) {
+        throw new Error('Invalid CIM safety run identity');
+      }
+      const { data, error } = await client.from('deal_hunter_cim_safety_events')
+        .select('*').eq('safety_run_id', runId).order('created_at').order('id').limit(10001);
+      if (error) throw error;
+      if (!Array.isArray(data) || data.length > 10000) {
+        throw new Error('CIM safety run exceeds the bounded read.');
+      }
+      return data;
+    },
+
     async appendCimSafetyEvents(run) {
       const { data, error } = await client.rpc('pursue_cim_append_safety_events_v1', {
         p_run: run,
@@ -2849,6 +2879,17 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
       }
 
       return safeRecords;
+    },
+
+    async listDealHunterSourceFreshnessStates() {
+      const { data, error } = await client.from('deal_hunter_source_freshness_state')
+        .select('source_id,next_generation,accepted_generation,accepted_run_id,accepted_digest,accepted_at,projection_state')
+        .order('source_id').limit(10001);
+      if (error) throw error;
+      if (!Array.isArray(data) || data.length > 10000) {
+        throw new Error('Source freshness state exceeds the bounded read.');
+      }
+      return data;
     },
 
     async allocateDealHunterSourceGeneration({ sourceId, runId } = {}) {

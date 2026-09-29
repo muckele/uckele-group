@@ -33,6 +33,63 @@ import { CrmSubmissionSupersededError } from '../services/crmSubmissionSupersess
 import { buildFreshInboxAreas, classifyFreshInboxCandidate } from '../services/dealHunterFreshInboxPolicy.js';
 import { createPursueCimSqliteTransitions } from './pursueCimSqliteTransitions.js';
 
+function cimSafetyDigest(...parts) {
+  const framed = parts.map((part) => {
+    const value = JSON.stringify(part);
+    return [Buffer.byteLength(value), value];
+  });
+  return createHash('sha256').update(JSON.stringify(framed)).digest('hex');
+}
+
+// Called only inside an accepted source transaction. It is deliberately not a
+// storage method: callers cannot supply an arbitrary import-shaped event.
+function appendAdmittedImportSafety(database, { sourceId, runId, opportunityId,
+  sourceRecordId, eventType: classification, evidenceDigest, acceptedAt }) {
+  const safetyRunId = `cim-source:${cimSafetyDigest(sourceId, runId)}`;
+  const recordKey = cimSafetyDigest('cim-source-record:v1', sourceId, sourceRecordId).slice(0, 32);
+  const eventType = `${classification}#${recordKey}`;
+  const evidenceFor = (type) => cimSafetyDigest('cim-source-evidence:v1', sourceId, runId,
+    sourceRecordId, type, evidenceDigest);
+  const evidenceId = evidenceFor(eventType);
+  const id = cimSafetyDigest('cim-safety:v1', safetyRunId, opportunityId, eventType, evidenceId);
+  const canonical = database.prepare(`SELECT material_revision, status FROM deal_hunter_opportunities
+    WHERE opportunity_id = ?`).get(opportunityId);
+  const admittedHistoricalRemoval = classification === 'source-record-removed'
+    && canonical?.status === 'superseded';
+  if (!canonical || (canonical.status !== 'active' && !admittedHistoricalRemoval)) {
+    throw new Error('Admitted safety evidence lacks a current canonical opportunity.');
+  }
+  const sourceType = sourceId === 'deal-os-export' ? 'deal-os-import' : 'sheet-import';
+  const prior = database.prepare(`SELECT * FROM deal_hunter_cim_safety_events
+    WHERE safety_run_id = ? AND opportunity_id = ? AND substr(event_type, -33) = ?`)
+    .get(safetyRunId, opportunityId, `#${recordKey}`);
+  if (prior) {
+    if (prior.safety_run_id !== safetyRunId || prior.opportunity_id !== opportunityId
+      || prior.source_type !== sourceType || prior.source_run_id !== runId
+      || prior.evidence_id !== evidenceFor(prior.event_type)) {
+      throw new Error('Conflicting admitted source safety event.');
+    }
+    return { id: prior.id, safetyRunId, emitted: false };
+  }
+  if (database.prepare(`SELECT COUNT(*) AS n FROM deal_hunter_cim_safety_events
+    WHERE safety_run_id = ?`).get(safetyRunId).n >= 10000) {
+    throw new Error('Admitted safety run exceeds its bounded reader.');
+  }
+  database.prepare(`INSERT INTO deal_hunter_cim_safety_events (
+    id, safety_run_id, opportunity_id, source_type, source_run_id,
+    canonical_revision, identity_exception_revision, event_type, evidence_id,
+    status, created_at, updated_at
+  ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 'pending', ?, ?)`).run(id, safetyRunId,
+    opportunityId, sourceType, runId, canonical.material_revision, eventType,
+    evidenceId, acceptedAt, acceptedAt);
+  database.prepare(`INSERT INTO deal_hunter_cim_audit_events (
+    id, event_type, opportunity_id, next_state, actor, source, occurred_at, metadata
+  ) VALUES (?, 'safety-emitted', ?, 'pending', ?, ?, ?, '{}')`).run(
+    cimSafetyDigest('cim-audit:v1', 'safety-emitted', id), opportunityId,
+    sourceType, runId, acceptedAt);
+  return { id, safetyRunId, emitted: true };
+}
+
 function acceptedPublicationClaim(claim, acceptedAt) {
   if (!claim || claim.meaning !== 'listing_publication') {
     return { state: 'unknown', date: null, instant: null };
@@ -9646,6 +9703,12 @@ export function createSqliteStorage(config, options = {}) {
 		      return records;
 		    },
 
+    async listDealHunterSourceFreshnessStates() {
+      return database.prepare(`SELECT source_id, next_generation, accepted_generation,
+        accepted_run_id, accepted_digest, accepted_at, projection_state
+        FROM deal_hunter_source_freshness_state ORDER BY source_id LIMIT 10001`).all();
+    },
+
     async allocateDealHunterSourceGeneration({ sourceId, runId } = {}) {
       const source = String(sourceId || '').trim();
       const run = String(runId || '').trim();
@@ -12382,6 +12445,18 @@ export function createSqliteStorage(config, options = {}) {
           || event.generation !== expectedGeneration || !canonical || canonical.status !== 'active') {
           throw new Error('Deal OS freshness binding lacks an accepted import and current canonical identity.');
         }
+        const previousSourceRows = database.prepare(`SELECT field, value
+          FROM deal_hunter_opportunity_source_observations
+          WHERE opportunity_id = ? AND source_id = 'deal-os-export' AND source_record_id = ?
+          ORDER BY field`).all(canonicalId, recordId);
+        const nextSourceRows = normalizedSnapshot.observations
+          .map(({ field, value }) => ({ field, value })).sort((left, right) => left.field.localeCompare(right.field));
+        const sourceChanged = JSON.stringify(previousSourceRows) !== JSON.stringify(nextSourceRows);
+        const emitBindingSafety = (eventType) => appendAdmittedImportSafety(database, {
+          sourceId: 'deal-os-export', runId, opportunityId: canonicalId,
+          sourceRecordId: recordId, eventType,
+          evidenceDigest: cimSafetyDigest(event.id, nextSourceRows), acceptedAt: event.accepted_at,
+        });
         const conflicting = database.prepare(`SELECT id FROM deal_hunter_freshness_evidence
           WHERE run_id = ? AND source_id = 'deal-os-export' AND source_record_id = ?
             AND current_canonical_id IS NOT NULL AND current_canonical_id <> ? LIMIT 1`
@@ -12438,6 +12513,7 @@ export function createSqliteStorage(config, options = {}) {
         if (!state || state.accepted_generation !== expectedGeneration || state.accepted_run_id !== runId) {
           database.prepare("UPDATE deal_hunter_deal_os_imports SET freshness_projection_state = 'superseded' WHERE id = ?")
             .run(runId);
+          emitBindingSafety('source-record-superseded');
           return { bound: true, projectionState: 'superseded' };
         }
         for (const [fieldKey, claim] of [
@@ -12543,6 +12619,7 @@ export function createSqliteStorage(config, options = {}) {
           .run(projectionState, runId);
         database.prepare("UPDATE deal_hunter_source_freshness_state SET projection_state = ? WHERE source_id = 'deal-os-export'")
           .run(projectionState);
+        emitBindingSafety(sourceChanged ? 'source-record-changed' : 'source-record-unchanged');
         return { bound: true, projectionState };
       }).immediate();
     },
@@ -12737,6 +12814,32 @@ export function createSqliteStorage(config, options = {}) {
                 ['annual_profit', evidence?.annualProfit], ['annual_revenue', evidence?.annualRevenue],
                 ['asking_price', evidence?.askingPrice],
               ]) if (claim) add('accepted_source_record', field, claim);
+            }
+            for (const record of value.records) {
+              appendAdmittedImportSafety(database, {
+                sourceId: value.source_id, runId: run.runId,
+                opportunityId: record.opportunity_id, sourceRecordId: record.source_record_id,
+                eventType: 'source-record-changed',
+                evidenceDigest: database.prepare(`SELECT id FROM deal_hunter_freshness_evidence
+                  WHERE run_id = ? AND source_id = ? AND source_record_id = ?
+                    AND event_type = 'accepted_source_record' AND field_key = '' LIMIT 1`)
+                  .get(run.runId, value.source_id, record.source_record_id).id,
+                acceptedAt,
+              });
+            }
+            for (const item of value.unresolved) {
+              const exception = database.prepare(`SELECT candidate_opportunity_ids
+                FROM deal_hunter_identity_exceptions WHERE id = ? AND status = 'open'`)
+                .get(item.identity_exception_id);
+              for (const opportunityId of JSON.parse(exception.candidate_opportunity_ids || '[]')) {
+                if (!database.prepare(`SELECT 1 FROM deal_hunter_opportunities
+                  WHERE opportunity_id = ? AND status = 'active'`).get(opportunityId)) continue;
+                appendAdmittedImportSafety(database, {
+                  sourceId: value.source_id, runId: run.runId, opportunityId,
+                  sourceRecordId: item.source_record_id, eventType: 'identity-exception',
+                  evidenceDigest: item.identity_exception_id, acceptedAt,
+                });
+              }
             }
             database.prepare(`UPDATE deal_hunter_source_freshness_state SET accepted_generation = ?,
               accepted_run_id = ?, accepted_digest = ?, accepted_at = ?, projection_state = 'deferred'
@@ -12988,6 +13091,30 @@ export function createSqliteStorage(config, options = {}) {
         }
 
         if (run) {
+          const represented = new Map(value.records.map((record) => [record.source_record_id,
+            record.opportunity_id]));
+          for (const record of value.records) {
+            appendAdmittedImportSafety(database, {
+              sourceId: value.source_id, runId: run.runId,
+              opportunityId: record.opportunity_id, sourceRecordId: record.source_record_id,
+              eventType: evidenceByRecord.get(record.source_record_id)?.changed
+                ? 'source-record-changed' : 'source-record-unchanged',
+              evidenceDigest: evidenceByRecord.get(record.source_record_id)?.coreId || '', acceptedAt,
+            });
+          }
+          const removedAssociations = new Set();
+          for (const previous of currentByRecord.values()) {
+            if (represented.get(previous.source_record_id) === previous.opportunity_id) continue;
+            const key = `${previous.opportunity_id}\u0000${previous.source_record_id}`;
+            if (removedAssociations.has(key)) continue;
+            removedAssociations.add(key);
+            appendAdmittedImportSafety(database, {
+              sourceId: value.source_id, runId: run.runId,
+              opportunityId: previous.opportunity_id, sourceRecordId: previous.source_record_id,
+              eventType: 'source-record-removed',
+              evidenceDigest: previous.accepted_evidence_id || '', acceptedAt,
+            });
+          }
           database.prepare(`UPDATE deal_hunter_source_freshness_state SET accepted_generation = ?,
             accepted_run_id = ?, accepted_digest = ?, accepted_at = ?, projection_state = 'accepted'
             WHERE source_id = ?`).run(run.generation, run.runId, admission.freshness_digest, acceptedAt, value.source_id);
