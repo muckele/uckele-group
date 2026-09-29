@@ -412,7 +412,7 @@ test('real PostgreSQL enforces Deal OS CRM reconciliation ownership and idempote
   });
 
   docker([
-    'run', '--pull=never', '--network=none', '--name', containerName,
+    'run', '--pull=never', '--network=none', '--tmpfs', '/var/lib/postgresql/data', '--name', containerName,
     '-e', 'POSTGRES_PASSWORD=synthetic', '-d', 'postgres:16',
   ]);
   containerStarted = true;

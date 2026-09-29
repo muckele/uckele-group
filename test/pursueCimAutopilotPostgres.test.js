@@ -77,7 +77,9 @@ test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
   const p3Marker = '-- Package 3: current canonical timezone revision guard.';
   assert.equal(schema.slice(schema.indexOf(nextMarker), schema.indexOf(p3Marker)).trim(), safetyMigration.trim());
   const p3Migration = fs.readFileSync(timezoneGuardMigrationPath, 'utf8');
-  assert.equal(schema.slice(schema.indexOf(p3Marker)).trim(), p3Migration.trim());
+  const crmAuthorityMarker = '-- Canonical CRM supersession authority.';
+  assert.equal(schema.slice(schema.indexOf(p3Marker), schema.indexOf(crmAuthorityMarker)).trim(),
+    p3Migration.trim());
   assert.match(p3Migration, /v_opportunity_status <> 'active'/);
 });
 
