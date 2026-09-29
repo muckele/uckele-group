@@ -1258,6 +1258,7 @@ describe('Acquisition Inbox queue', () => {
     expect(reads).toHaveLength(2);
     fireEvent.click(within(passForm).getByRole('button', { name: 'Confirm Pass' }));
     expect(writes).toHaveLength(2);
+    expect(writes[1]).toEqual(writes[0]);
   });
 
   test('keeps verified-fact edit open with its prior durable value after a deferred save failure, then permits one retry', async () => {
@@ -1323,6 +1324,7 @@ describe('Acquisition Inbox queue', () => {
     }
     fireEvent.click(screen.getByRole('button', { name: 'Watch Evergreen Fire Protection' }));
     expect(writes).toHaveLength(2);
+    expect(writes[1]).toEqual(writes[0]);
   });
 
   test('traps keyboard focus in drawer and queue Pass dialogs, closes by Escape or controls, and restores each triggering control', async () => {

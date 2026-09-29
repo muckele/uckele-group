@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test';
 import { getOperationsCenter, sanitizeViewerOperations } from '../server/services/operations.js';
 
 const appOrigin = 'http://127.0.0.1:4173';
+const ownerCommandUuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const privateSentinels = [
   'PRIVATE_RECIPIENT_phase4@example.test',
   'PRIVATE_SENDER_phase4@example.test',
@@ -47,6 +48,7 @@ function opportunity(overrides = {}) {
     scoredAt: '2026-09-05T14:30:00.000Z',
     scoreFingerprint: 'phase4-alpha-fingerprint',
     rulesVersion: 'deal-hunter-fit-v2',
+    freshness: { discoveryState: 'untracked_legacy', discoveryRevision: 0, materialRevision: 0 },
     ...overrides,
   };
 }
@@ -381,7 +383,18 @@ async function installFixture(page, options = {}) {
         return;
       }
       const row = state.rows.find((item) => item.opportunityId === attempt.opportunityId);
-      if (!row || !['pursue', 'watch', 'pass'].includes(body?.action)) {
+      const expectedKeys = ['action', 'expectedDiscoveryRevision', 'expectedMaterialRevision',
+        'idempotencyKey', ...(body?.action === 'pass' ? ['note', 'reason'] : [])];
+      if (!row || !['pursue', 'watch', 'pass'].includes(body?.action)
+        || JSON.stringify(Object.keys(body).sort()) !== JSON.stringify(expectedKeys)
+        || typeof body.idempotencyKey !== 'string'
+        || !ownerCommandUuidPattern.test(body.idempotencyKey)
+        || !Number.isSafeInteger(body.expectedDiscoveryRevision)
+        || !Number.isSafeInteger(body.expectedMaterialRevision)
+        || body.expectedDiscoveryRevision !== row.freshness.discoveryRevision
+        || body.expectedMaterialRevision !== row.freshness.materialRevision
+        || (body.action === 'pass' && (typeof body.reason !== 'string'
+          || !body.reason.trim() || typeof body.note !== 'string'))) {
         state.rejectedMutations.push({ ...attempt, reason: 'invalid' });
         await fulfillJson(route, state, { success: false, error: 'Invalid decision.' }, 400);
         return;
@@ -474,7 +487,13 @@ test('optional Deal OS degradation stays bounded and leaves primary-backed revie
   await expect(watch).toBeEnabled();
   await watch.click();
   await expect.poll(() => state.acceptedMutations.length).toBe(1);
-  expect(state.acceptedMutations[0].body).toEqual({ action: 'watch' });
+  const command = state.acceptedMutations[0].body;
+  expect(command.action).toBe('watch');
+  expect(command.idempotencyKey).toMatch(ownerCommandUuidPattern);
+  expect(command.expectedDiscoveryRevision).toBe(state.rows[0].freshness.discoveryRevision);
+  expect(command.expectedMaterialRevision).toBe(state.rows[0].freshness.materialRevision);
+  expect(Object.keys(command).sort()).toEqual(['action', 'expectedDiscoveryRevision',
+    'expectedMaterialRevision', 'idempotencyKey']);
   await assertNoOutreachOrAuthoritySideEffects(page, state);
 });
 
@@ -491,18 +510,21 @@ test('required source failure suppresses current authority, rejects direct mutat
   await expect(page.getByText(/Last known queue/)).toBeVisible();
   for (const action of ['Pursue', 'Watch', 'Pass']) await expect(page.getByRole('button', { name: `${action} Alpha Fire Systems` })).toBeDisabled();
 
-  const directResult = await page.evaluate(async () => {
+  const directCommand = { action: 'watch', idempotencyKey: globalThis.crypto.randomUUID(),
+    expectedDiscoveryRevision: state.rows[0].freshness.discoveryRevision,
+    expectedMaterialRevision: state.rows[0].freshness.materialRevision };
+  const directResult = await page.evaluate(async (command) => {
     const response = await fetch('/api/admin/deal-hunter/triage/opp-phase4-alpha/action', {
-      method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'watch' }),
+      method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(command),
     });
     return { status: response.status, body: await response.json() };
-  });
+  }, directCommand);
   expect(directResult).toEqual({
     status: 503,
     body: { success: false, error: 'Current required source authority is unavailable. Try again after source health recovers.' },
   });
   expect(state.acceptedMutations).toEqual([]);
-  expect(state.rejectedMutations).toEqual([{ opportunityId: 'opp-phase4-alpha', body: { action: 'watch' }, reason: 'required-source' }]);
+  expect(state.rejectedMutations).toEqual([{ opportunityId: 'opp-phase4-alpha', body: directCommand, reason: 'required-source' }]);
 
   state.sourceMode = 'healthy';
   await page.reload();
