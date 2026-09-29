@@ -560,25 +560,90 @@ test('SQLite final linkage rejects an active loser directly and links its unchan
   assert.equal((await storage.getSubmission(relation.survivor.id)).deal_hunter_opportunity_id, relation.opportunityId);
 });
 
-test('Supabase CRM match authority paths fail closed without querying or linking', async () => {
+test('Supabase CRM match authority uses only versioned authority RPCs and rejects malformed results', async () => {
+  const calls = [];
   const client = {
-    from(table) { assert.fail(`fail-closed authority path queried ${table}`); },
-    async rpc(name) { assert.fail(`fail-closed authority path called RPC ${name}`); },
+    from(table) { assert.fail(`authority path queried ${table}`); },
+    async rpc(name, args) {
+      calls.push([name, args]);
+      if (name === 'read_deal_hunter_crm_match_authority_v2') return { data: {
+        rows: [], supersessions: [], count: 0, submissionCount: 0,
+        supersessionCount: 0, complete: true, revision: 'a'.repeat(64),
+        revisionVersion: 'deal-hunter-crm-match-authority-v2',
+      }, error: null };
+      if (name === 'link_deal_hunter_crm_submission_if_authority_current_v2') return {
+        data: { opportunity_id: 'opp-authority', primary_submission_id: 'submission-authority', metadata: {} }, error: null,
+      };
+      assert.fail(`unexpected authority RPC ${name}`);
+    },
   };
   const storage = createSupabaseStorage({ storage: {} }, { client });
   assert.equal(storage.linkDealHunterCrmSubmission, undefined);
-  const expected = (error) => error?.code === 'CRM_MATCH_LOOKUP_INCOMPLETE'
-    && error?.status === 503
-    && error?.cause?.code === 'CRM_SUPERSESSION_UNAVAILABLE'
-    && error?.candidateIds?.length === 0
-    && error?.evidenceCategories?.includes('lookup-incomplete')
-    && error?.evidenceCategories?.includes('provider-unsupported');
-  await assert.rejects(storage.readDealHunterCrmMatchAuthority({ limit: 5000 }), expected);
-  await assert.rejects(storage.linkDealHunterCrmSubmissionIfAuthorityCurrent({
+  const authority = await storage.readDealHunterCrmMatchAuthority({ limit: 5000 });
+  assert.equal(authority.complete, true);
+  assert.equal(authority.revision, 'a'.repeat(64));
+  const linked = await storage.linkDealHunterCrmSubmissionIfAuthorityCurrent({
     opportunityId: 'opp-authority',
     submissionId: 'submission-authority',
     expectedAuthorityRevision: 'a'.repeat(64),
-  }), expected);
+  });
+  assert.equal(linked.opportunity_id, 'opp-authority');
+  assert.deepEqual(calls.map(([name]) => name), [
+    'read_deal_hunter_crm_match_authority_v2',
+    'link_deal_hunter_crm_submission_if_authority_current_v2',
+  ]);
+  const malformed = createSupabaseStorage({ storage: {} }, {
+    client: { rpc: async () => ({ data: { complete: true, rows: [] }, error: null }) },
+  });
+  await assert.rejects(malformed.readDealHunterCrmMatchAuthority(),
+    (error) => error?.code === 'CRM_MATCH_LOOKUP_INCOMPLETE' && error?.status === 503);
+  const survivor = '00000000-0000-4000-8000-000000000001';
+  const loserStorage = createSupabaseStorage({ storage: {} }, {
+    client: { rpc: async () => ({ data: null, error: {
+      message: `CRM_SUBMISSION_SUPERSEDED:${survivor}:opp-authority`,
+    } }) },
+  });
+  await assert.rejects(loserStorage.linkDealHunterCrmSubmissionIfAuthorityCurrent({
+    opportunityId: 'opp-authority', submissionId: '00000000-0000-4000-8000-000000000002',
+    expectedAuthorityRevision: 'a'.repeat(64),
+  }), (error) => error?.code === 'CRM_SUBMISSION_SUPERSEDED'
+    && error?.survivorSubmissionId === survivor
+    && error?.opportunityId === 'opp-authority');
+});
+
+test('Supabase active supersession context and writable guard preserve loser and survivor identity', async () => {
+  const survivor = '00000000-0000-4000-8000-000000000001';
+  const loser = '00000000-0000-4000-8000-000000000002';
+  const relation = {
+    id: 'relation-1', status: 'active', survivor_submission_id: survivor,
+    superseded_submission_id: loser, opportunity_id: 'opp-authority',
+    metadata: {},
+  };
+  const storage = createSupabaseStorage({ storage: {} }, {
+    client: { rpc: async (name) => {
+      assert.equal(name, 'read_deal_hunter_crm_match_authority_v2');
+      return { data: { rows: [{ id: survivor }, { id: loser }],
+        supersessions: [relation], count: 2, submissionCount: 2,
+        supersessionCount: 1, complete: true, revision: 'a'.repeat(64),
+        revisionVersion: 'deal-hunter-crm-match-authority-v2' }, error: null };
+    } },
+  });
+  const loserContext = await storage.getCrmSubmissionSupersessionContext(loser);
+  assert.equal(loserContext.isSuperseded, true);
+  assert.equal(loserContext.canonicalSubmissionId, survivor);
+  assert.equal(loserContext.opportunityId, 'opp-authority');
+  await assert.rejects(storage.assertCrmSubmissionWritable(loser),
+    (error) => error?.code === 'CRM_SUBMISSION_SUPERSEDED'
+      && error?.survivorSubmissionId === survivor);
+  const survivorContext = await storage.assertCrmSubmissionWritable(survivor);
+  assert.deepEqual(survivorContext.historySubmissionIds, [survivor, loser]);
+  assert.equal((await storage.listActiveCrmSubmissionSupersessions({ submissionIds: [loser] }))[0]
+    .survivorSubmissionId, survivor);
+  const failure = new Error('disposable database unavailable');
+  const failing = createSupabaseStorage({ storage: {} }, {
+    client: { rpc: async () => ({ data: null, error: failure }) },
+  });
+  await assert.rejects(failing.readDealHunterCrmMatchAuthority(), (error) => error === failure);
 });
 
 test('SQLite conditional CRM linkage rejects metadata, lifecycle, candidate-set, and unrelated authority drift without partial linkage', async (t) => {

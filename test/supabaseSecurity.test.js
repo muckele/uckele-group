@@ -103,6 +103,10 @@ const pursueCimAutopilotMigrationUrl = new URL(
   '../supabase/migrations/20260925120000_pursue_cim_autopilot.sql',
   import.meta.url,
 );
+const crmAuthorityMigrationUrl = new URL(
+  '../supabase/migrations/20261001120000_postgres_crm_authority_parity.sql',
+  import.meta.url,
+);
 
 function dailyDigestScheduledJobMigration() {
   return fs.existsSync(scheduledJobFencingMigrationUrl)
@@ -452,7 +456,8 @@ test('Supabase migration and fresh schema isolate every current app table to the
   const currentOperatorFactMigration = fs.readFileSync(currentOperatorFactMigrationUrl, 'utf8');
   const freshnessMigration = fs.readFileSync(freshnessMigrationUrl, 'utf8');
   const pursueCimAutopilotMigration = fs.readFileSync(pursueCimAutopilotMigrationUrl, 'utf8');
-  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}`;
+  const crmAuthorityMigration = fs.readFileSync(crmAuthorityMigrationUrl, 'utf8');
+  const forwardMigrations = `${migration}\n${analyticsMigration}\n${cimAutomationMigration}\n${communicationsLifecycleMigration}\n${followUpWorkspaceMigration}\n${followUpQueueMigration}\n${dealOsMigration}\n${adminOnboardingMigration}\n${cimIdentityMigration}\n${cimStage2Migration}\n${crmReconciliationMigration}\n${opportunityScoringMigration}\n${semanticScoringMigration}\n${currentTriageEligibilityMigration}\n${opportunityFactsMigration}\n${opportunityFactWriteBoundaryMigration}\n${freshnessMigration}\n${pursueCimAutopilotMigration}\n${crmAuthorityMigration}`;
   const appTables = currentAppTables(schema);
 
   assert.ok(appTables.length > 0, 'fresh schema must declare application tables');

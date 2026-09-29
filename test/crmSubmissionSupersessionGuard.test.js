@@ -292,7 +292,7 @@ test('submission-mutating CRM activity transactions cannot bypass the supersessi
   }
 });
 
-test('all Supabase supersession methods fail closed before touching the client', async () => {
+test('deferred Supabase supersession audit and Stage 2 authority remain fail closed', async () => {
   let calls = 0;
   const client = new Proxy({}, {
     get() {
@@ -302,9 +302,6 @@ test('all Supabase supersession methods fail closed before touching the client',
   });
   const storage = createSupabaseStorage({ storage: {} }, { client });
   const invocations = [
-    () => storage.getCrmSubmissionSupersessionContext('loser'),
-    () => storage.listActiveCrmSubmissionSupersessions({ submissionIds: ['loser'] }),
-    () => storage.assertCrmSubmissionWritable('loser'),
     () => storage.auditCrmSubmissionSupersessions(),
     () => storage.getCimStage2SubmissionAuthority('opportunity'),
   ];

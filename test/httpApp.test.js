@@ -7,10 +7,7 @@ import path from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { signPayload } from '../server/utils/security.js';
-import {
-  CRM_SUBMISSION_SUPERSEDED,
-  CRM_SUPERSESSION_UNAVAILABLE,
-} from '../server/services/crmSubmissionSupersession.js';
+import { CRM_SUBMISSION_SUPERSEDED } from '../server/services/crmSubmissionSupersession.js';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-http-app-'));
@@ -573,7 +570,7 @@ test('legacy canonical disposition route refuses a superseded caller submission 
   }), before, 'refusal must not change disposition, score, activity, contacts, or opportunity primary ownership');
 });
 
-test('provider supersession unavailability fails closed before mutation and unrelated errors stay generic', async () => {
+test('malformed provider supersession authority fails closed before mutation and unrelated errors stay generic', async () => {
   const storage = getStorage();
   const fixture = await createManualSubmission({
     company: `HTTP unavailable ${randomUUID()}`,
@@ -589,12 +586,13 @@ test('provider supersession unavailability fails closed before mutation and unre
   let mutationCalls = 0;
   let supabaseClientCalls = 0;
   const supabaseStorage = createSupabaseStorage({ storage: {} }, {
-    client: new Proxy({}, {
-      get() {
+    client: {
+      async rpc(name) {
+        assert.equal(name, 'read_deal_hunter_crm_match_authority_v2');
         supabaseClientCalls += 1;
-        throw new Error('Supabase client must not be invoked by the fail-closed guard.');
+        return { data: {}, error: null };
       },
-    }),
+    },
   });
   storage.mutateWithCrmActivity = async (...args) => {
     mutationCalls += 1;
@@ -613,11 +611,10 @@ test('provider supersession unavailability fails closed before mutation and unre
       assert.equal(unavailable.status, 503);
       assert.deepEqual(await unavailable.json(), {
         success: false,
-        code: CRM_SUPERSESSION_UNAVAILABLE,
-        error: 'CRM supersession authority is unavailable for this storage provider.',
+        error: 'Something went wrong while processing the request.',
       });
       assert.equal(mutationCalls, 0);
-      assert.equal(supabaseClientCalls, 0);
+      assert.equal(supabaseClientCalls, 1);
 
       storage.assertCrmSubmissionWritable = async () => {
         const error = new Error('private provider detail');
