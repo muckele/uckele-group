@@ -1283,13 +1283,22 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     async recordOwnerDecision(command) {
+      if (command?.action === 'pass' && String(command.submissionId || '').trim()) {
+        throw new CrmSupersessionUnavailableError();
+      }
       const { data, error } = await client.rpc('pursue_cim_record_owner_decision_v1', {
         p_command: command,
       });
-      if (error) throw error;
+      if (error) {
+        if (/FL01_STALE_REVIEW/.test(error.message || '')) {
+          const stale = new Error('Freshness changed since this opportunity was shown. Reload before acting.');
+          stale.code = 'DEAL_HUNTER_FRESHNESS_STALE'; stale.status = 409; throw stale;
+        }
+        throw error;
+      }
       return normalizePursueCimRpcResult(data,
         ['applied', 'replay', 'conflict'], ['decision', 'enrollment'],
-        { requiredRows: { decision: ['applied', 'replay'] } });
+        { requiredRows: { decision: ['applied', 'replay'] }, extraFields: ['reason', 'passResult'] });
     },
 
     async materializePursuitCampaign(command) {

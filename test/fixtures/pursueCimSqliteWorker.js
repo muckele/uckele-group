@@ -1,6 +1,32 @@
 import Database from 'better-sqlite3';
+import { createSqliteStorage } from '../../server/storage/sqlite.js';
 
-process.on('message', ({ sqlitePath }) => {
+process.on('message', async ({ sqlitePath, mode, command }) => {
+  if (mode === 'owner-command' || mode === 'pre-provider-transition') {
+    const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+    try {
+      if (mode === 'owner-command') {
+        const result = await storage.recordOwnerDecision(command);
+        process.send?.({ ok: true, result: { applied: result.applied, replay: result.replay,
+          conflict: result.conflict, decisionId: result.decision?.id ?? null } });
+      } else {
+        const { method, payload } = command;
+        if (!['claimDueCimTouch', 'prepareCimTransmission',
+          'issueCimLiveProviderAuthorization', 'authorizeCimProviderPending'].includes(method)) {
+          throw new Error('Unsupported pre-provider test transition');
+        }
+        const result = await storage[method](payload);
+        process.send?.({ ok: true, result: { claimed: result.claimed ?? false,
+          prepared: result.prepared ?? false, issued: result.issued ?? false,
+          authorized: result.authorized ?? false } });
+      }
+    } catch (error) {
+      process.send?.({ ok: false, error: error.message });
+    } finally {
+      storage.close();
+    }
+    return;
+  }
   const database = new Database(sqlitePath, { readonly: true, fileMustExist: true });
   try {
     const tables = database.prepare(`

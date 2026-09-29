@@ -222,6 +222,25 @@ function probeFromWorker(sqlitePath) {
   });
 }
 
+function ownerCommandFromWorker(sqlitePath, command) {
+  return transitionFromWorker(sqlitePath, 'owner-command', command);
+}
+
+function transitionFromWorker(sqlitePath, mode, command) {
+  return new Promise((resolve, reject) => {
+    const worker = fork(new URL('./fixtures/pursueCimSqliteWorker.js', import.meta.url), [], {
+      stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+    });
+    worker.once('error', reject);
+    worker.once('message', (message) => {
+      worker.disconnect();
+      if (message.ok) resolve(message.result);
+      else reject(new Error(message.error));
+    });
+    worker.send({ sqlitePath, mode, command });
+  });
+}
+
 function insertBaseAuthority(database, suffix = '') {
   const opportunityId = `opp-p1a${suffix}`;
   const decisionId = `decision${suffix}`;
@@ -766,6 +785,30 @@ test('P1B owner decision applies once, replays the same request, and rejects dig
   const conflict = await storage.recordOwnerDecision({ ...command, action: 'watch' });
   assert.equal(conflict.conflict, true);
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_owner_decision_events').get().count, 1);
+});
+
+test('P4A two SQLite processes converge duplicate Pursue on one event and enrollment', async (t) => {
+  const sqlitePath = temporaryPath(t, 'p4a-owner-race');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  seedOpportunity(database, 'opp-owner-race');
+  seedTriageScore(database, 'opp-owner-race');
+  const command = { opportunityId: 'opp-owner-race', action: 'pursue',
+    idempotencyKey: 'p4a-race-key', expectedDiscoveryRevision: 0,
+    expectedMaterialRevision: 0, actor: 'fixture-owner', policyVersion: 'owner-decision-v1', now: at };
+  const outcomes = await Promise.all([
+    ownerCommandFromWorker(sqlitePath, command), ownerCommandFromWorker(sqlitePath, command),
+  ]);
+  assert.deepEqual(outcomes.map((item) => [item.applied, item.replay]).sort(),
+    [[false, true], [true, false]]);
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_owner_decision_events
+    WHERE opportunity_id = ?`).get(command.opportunityId).count, 1);
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_pursuit_enrollments
+    WHERE opportunity_id = ?`).get(command.opportunityId).count, 1);
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns
+    WHERE opportunity_id = ?`).get(command.opportunityId).count, 0);
 });
 
 test('P1B timezone revisions append once and reject stale or changed replay', async (t) => {
@@ -1457,6 +1500,158 @@ test('P1B Watch supersedes pursuit and terminates prepared campaign atomically',
   assert.equal(database.prepare('SELECT operator_priority FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?')
     .get(authority.opportunityId).operator_priority, 'watch');
 });
+
+for (const action of ['watch', 'pass']) {
+  for (const stage of ['scheduled', 'claimed', 'prepared', 'authorized']) {
+    test(`P4A ${action} fences ${stage} SQLite work before provider-pending`, async (t) => {
+      let fixture;
+      if (['prepared', 'authorized'].includes(stage)) {
+        fixture = await createPreparedFixture(t, `p4a-${action}-${stage}`);
+      } else {
+        const sqlitePath = temporaryPath(t, `p4a-${action}-${stage}`);
+        const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+        t.after(() => storage.close());
+        const database = new Database(sqlitePath);
+        t.after(() => database.close());
+        fixture = { storage, database,
+          authority: insertBaseAuthority(database, `-p4a-${action}-${stage}`) };
+        if (stage === 'claimed') {
+          await seedSyntheticActivationChain(storage);
+          assert.equal((await storage.claimDueCimTouch({ touchId: fixture.authority.touchId,
+            expectedRowVersion: 1, expectedCampaignTerminalRevision: 0,
+            expectedConversationTerminalRevision: 0, claimTokenDigest: digest('a'),
+            claimOwner: 'worker-1', claimExpiresAt: '2026-09-25T19:10:00.000Z',
+            now: at })).claimed, true);
+        }
+      }
+      const { storage, database, authority, prepared } = fixture;
+      seedTriageScore(database, authority.opportunityId);
+      let authorization = null;
+      if (stage === 'authorized') {
+        const issued = await storage.issueCimLiveProviderAuthorization({
+          id: `p4a-${action}-authorization`, activationId: 'synthetic-fl04b-initial',
+          capability: 'fl04b-initial', writerPath: 'pursue-cim-initial',
+          transmissionId: prepared.id, payloadDigest: prepared.payload_digest,
+          recipientAuthorityDigest: digest('e'), providerProfile: 'synthetic-provider',
+          expiresAt: '2026-09-25T20:00:00.000Z', actor: 'fixture-owner',
+          reason: 'synthetic hold', now: at });
+        assert.equal(issued.issued, true);
+        authorization = issued.authorization;
+      }
+      const command = { opportunityId: authority.opportunityId, action,
+        idempotencyKey: `p4a-${action}-${stage}`, expectedDiscoveryRevision: 0,
+        expectedMaterialRevision: 0, actor: 'fixture-owner', policyVersion: 'owner-decision-v1',
+        ...(action === 'pass' ? { reason: 'not-a-fit', note: 'Owner declined.' } : {}), now: at };
+      assert.equal((await storage.recordOwnerDecision(command)).applied, true);
+      assert.equal((await storage.recordOwnerDecision(command)).replay, true);
+      assert.equal(database.prepare('SELECT terminal_revision FROM deal_hunter_cim_campaigns WHERE id = ?')
+        .get(authority.campaignId).terminal_revision, 1);
+      assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_campaign_touches WHERE id = ?')
+        .get(authority.touchId).state, 'cancelled-before-provider');
+      assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_terminal_events
+        WHERE campaign_id = ?`).get(authority.campaignId).count, 1);
+      if (prepared) assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_transmissions WHERE id = ?')
+        .get(prepared.id).state, 'cancelled-before-provider');
+      if (authorization) {
+        assert.ok(database.prepare(`SELECT withdrawn_at FROM deal_hunter_cim_live_provider_authorizations
+          WHERE id = ?`).get(authorization.id).withdrawn_at);
+        assert.equal((await storage.authorizeCimProviderPending({ transmissionId: prepared.id,
+          authorizationId: authorization.id, writerPath: 'pursue-cim-initial',
+          providerProfile: 'synthetic-provider', expectedRowVersion: 1,
+          expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+          claimTokenDigest: digest('a'), finalGateAuthorityDigest: digest('f'),
+          boundaryNonceDigest: digest('b'), actor: 'fixture-owner', now: at })).authorized, false);
+      }
+    });
+  }
+}
+
+for (const action of ['watch', 'pass']) {
+  for (const stage of ['scheduled', 'claimed', 'prepared', 'authorized']) {
+    test(`P4A ${action} races ${stage} SQLite work on independent connections`, async (t) => {
+      const sqlitePath = temporaryPath(t, `p4a-race-${action}-${stage}`);
+      const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+      t.after(() => storage.close());
+      const database = new Database(sqlitePath);
+      t.after(() => database.close());
+      const authority = insertBaseAuthority(database, `-race-${action}-${stage}`);
+      seedTriageScore(database, authority.opportunityId);
+      seedCrmOwner(database, authority.opportunityId, `submission-race-${action}-${stage}`);
+      await seedSyntheticActivationChain(storage);
+      const claim = { touchId: authority.touchId, expectedRowVersion: 1,
+        expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+        claimTokenDigest: digest('a'), claimOwner: 'race-worker',
+        claimExpiresAt: '2026-09-25T19:10:00.000Z', now: at };
+      const prepare = { touchIds: [authority.touchId], claimTokenDigest: digest('a'),
+        expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+        preparationGeneration: 1, payloadVersion: 'payload-v1',
+        fromAddress: 'sender@example.test', toAddresses: ['broker@example.test'],
+        ccAddresses: [], bccAddresses: [], replyToAddress: 'reply@example.test',
+        subject: 'Synthetic subject', bodyText: 'Synthetic body',
+        bodyHtmlSanitized: '<p>Synthetic body</p>', tags: ['cim-initial'],
+        actor: 'fixture-owner', now: at };
+      let prepared = null;
+      if (stage !== 'scheduled') assert.equal((await storage.claimDueCimTouch(claim)).claimed, true);
+      if (['prepared', 'authorized'].includes(stage)) {
+        const result = await storage.prepareCimTransmission(prepare);
+        assert.equal(result.prepared, true);
+        prepared = result.transmission;
+      }
+      const issue = prepared && { id: `race-${action}-${stage}-authorization`,
+        activationId: 'synthetic-fl04b-initial', capability: 'fl04b-initial',
+        writerPath: 'pursue-cim-initial', transmissionId: prepared.id,
+        payloadDigest: prepared.payload_digest, recipientAuthorityDigest: digest('e'),
+        providerProfile: 'synthetic-provider', expiresAt: '2026-09-25T20:00:00.000Z',
+        actor: 'fixture-owner', reason: 'synthetic race', now: at };
+      if (stage === 'authorized') {
+        assert.equal((await storage.issueCimLiveProviderAuthorization(issue)).issued, true);
+        database.prepare(`INSERT INTO deal_hunter_cim_safety_settings
+          (id, updated_at, outreach_paused, updated_by, metadata)
+          VALUES ('global', ?, 0, 'fixture-owner', '{}')`).run(at);
+      }
+      const transition = stage === 'scheduled'
+        ? { method: 'claimDueCimTouch', payload: claim }
+        : stage === 'claimed'
+          ? { method: 'prepareCimTransmission', payload: prepare }
+          : stage === 'prepared'
+            ? { method: 'issueCimLiveProviderAuthorization', payload: issue }
+            : { method: 'authorizeCimProviderPending', payload: {
+              transmissionId: prepared.id, authorizationId: issue.id,
+              writerPath: 'pursue-cim-initial', providerProfile: 'synthetic-provider',
+              expectedRowVersion: 1, expectedCampaignTerminalRevision: 0,
+              expectedConversationTerminalRevision: 0, claimTokenDigest: digest('a'),
+              finalGateAuthorityDigest: digest('f'), boundaryNonceDigest: digest('b'),
+              actor: 'fixture-owner', now: at } };
+      const owner = { opportunityId: authority.opportunityId, action,
+        idempotencyKey: `p4a-race-${action}-${stage}`, expectedDiscoveryRevision: 0,
+        expectedMaterialRevision: 0, actor: 'fixture-owner', policyVersion: 'owner-decision-v1',
+        ...(action === 'pass' ? { reason: 'not-a-fit', note: 'Owner declined.' } : {}), now: at };
+      const [ownerResult, transitionResult] = await Promise.all([
+        ownerCommandFromWorker(sqlitePath, owner),
+        transitionFromWorker(sqlitePath, 'pre-provider-transition', transition),
+      ]);
+      assert.equal(ownerResult.applied, true);
+      assert.equal(database.prepare(`SELECT terminal_revision FROM deal_hunter_cim_campaigns
+        WHERE id = ?`).get(authority.campaignId).terminal_revision, 1);
+      assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_terminal_events
+        WHERE campaign_id = ?`).get(authority.campaignId).count, 1);
+      assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events
+        WHERE event_type = 'owner-decision' AND opportunity_id = ?`)
+        .get(authority.opportunityId).count, 1);
+      const touch = database.prepare(`SELECT state FROM deal_hunter_cim_campaign_touches
+        WHERE id = ?`).get(authority.touchId);
+      const transmission = prepared && database.prepare(`SELECT state FROM deal_hunter_cim_transmissions
+        WHERE id = ?`).get(prepared.id);
+      if (stage === 'authorized' && transitionResult.authorized) {
+        assert.equal(transmission.state, 'provider-pending');
+        assert.equal(touch.state, 'provider-pending');
+      } else {
+        assert.equal(touch.state, 'cancelled-before-provider');
+        if (transmission) assert.equal(transmission.state, 'cancelled-before-provider');
+      }
+    });
+  }
+}
 
 test('P1B Pass records durable disposition and does not create enrollment', async (t) => {
   const sqlitePath = temporaryPath(t, 'pursue-cim-pass');

@@ -254,6 +254,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
   const selectionRef = useRef('');
   const mutationGenerationRef = useRef(0);
   const mutationPendingRef = useRef(false);
+  const pendingOwnerCommandRef = useRef(null);
   const detailFocusGuardRef = useRef(false);
   const passFocusGuardRef = useRef(false);
   const detailTriggerRef = useRef(null);
@@ -484,16 +485,23 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         ? detail.data?.opportunity?.freshness
         : queue.rows.find((row) => row.opportunityId === opportunityId)?.freshness
           || (passTarget?.opportunityId === opportunityId ? passTarget.freshness : null);
-      if (shownFreshness && Number.isSafeInteger(shownFreshness.discoveryRevision)
-        && Number.isSafeInteger(shownFreshness.materialRevision)) {
-        body.expectedDiscoveryRevision = shownFreshness.discoveryRevision;
-        body.expectedMaterialRevision = shownFreshness.materialRevision;
+      if (!shownFreshness || !Number.isSafeInteger(shownFreshness.discoveryRevision)
+        || !Number.isSafeInteger(shownFreshness.materialRevision)) {
+        throw new Error('Current opportunity revisions are unavailable. Reload before recording a decision.');
       }
+      body.expectedDiscoveryRevision = shownFreshness.discoveryRevision;
+      body.expectedMaterialRevision = shownFreshness.materialRevision;
+      const signature = JSON.stringify([opportunityId, body]);
+      if (pendingOwnerCommandRef.current?.signature !== signature) {
+        pendingOwnerCommandRef.current = { signature, key: globalThis.crypto.randomUUID() };
+      }
+      body.idempotencyKey = pendingOwnerCommandRef.current.key;
       const response = await fetch(`/api/admin/deal-hunter/triage/${encodeURIComponent(opportunityId)}/action`, {
         method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       });
       const result = await response.json();
       if (response.status === 409 && result.code === 'stale_freshness_review') {
+        pendingOwnerCommandRef.current = null;
         if (view === 'inbox') {
           queueQueryRef.current.areaCursor = '';
           setAreaCursor('');
@@ -510,6 +518,7 @@ export default function AcquisitionInbox({ readOnly = false, initialView = 'inbo
         return false;
       }
       if (!response.ok || !result.success) throw new Error(result.error || 'Unable to record this decision.');
+      pendingOwnerCommandRef.current = null;
       const authoritativeOpportunity = result?.opportunity?.opportunityId === opportunityId ? result.opportunity : null;
       if (authoritativeOpportunity) {
         setQueue((current) => ({

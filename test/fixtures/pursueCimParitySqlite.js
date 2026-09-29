@@ -112,13 +112,22 @@ const safetyEventId = database.prepare(`select id from deal_hunter_cim_safety_ev
 database.prepare(`insert into deal_hunter_opportunities
   (opportunity_id, created_at, updated_at, canonical_name, identity_version)
   values ('opp-decision', ?, ?, 'Synthetic decision', 'cim-identity-v1')`).run(now, now);
+database.prepare(`insert into deal_hunter_opportunity_scores
+  (opportunity_id, created_at, scored_at, deal_key, name, score_fingerprint,
+   engine_version, rules_version, profile_version, completeness_policy_version,
+   current_triage_eligible)
+  values ('opp-decision', ?, ?, 'deal:opp-decision', 'Synthetic decision',
+    'fingerprint:opp-decision', 'engine-v1', 'rules-v1', 'profile-v1', 'complete-v1', 1)`)
+  .run(now, now);
 const expectedOwnerDecisions = [];
 for (const command of ownerCommands) {
   const outcome = await storage.recordOwnerDecision(command);
   expectedOwnerDecisions.push({ applied: outcome.applied, replay: outcome.replay,
     conflict: outcome.conflict, decisionId: outcome.decision?.id ?? null,
     enrollmentId: outcome.enrollment?.id ?? null,
-    enrollmentState: outcome.enrollment?.state ?? null });
+    enrollmentState: outcome.enrollment?.state ?? null,
+    scorePriority: database.prepare(`select operator_priority from deal_hunter_opportunity_scores
+      where opportunity_id = 'opp-decision'`).get().operator_priority });
   global.gc?.();
 }
 database.prepare(`insert into deal_hunter_opportunity_scores

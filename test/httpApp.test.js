@@ -418,7 +418,8 @@ test('authenticated core CRM routes expose the bounded superseded-record conflic
         fixture: passFixture,
         path: `/api/admin/deal-hunter/triage/${passFixture.opportunityId}/action`,
         method: 'POST',
-        body: { action: 'pass', reason: 'not-a-fit', submissionId: passFixture.loser.id },
+        body: { action: 'pass', reason: 'not-a-fit', submissionId: passFixture.loser.id,
+          idempotencyKey: randomUUID(), expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
       },
       {
         fixture: deleteFixture,
@@ -2474,7 +2475,9 @@ test('required source authority blocks direct Acquisition Inbox decision mutatio
     const cookie = await signInForCookie(origin);
     const before = await storage.getCurrentDealHunterOpportunityScore(opportunityId);
     const response = await fetch(`${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ action: 'pursue' }),
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ action: 'pursue', idempotencyKey: randomUUID(),
+        expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 }),
     });
     const result = await response.json();
     const after = await storage.getCurrentDealHunterOpportunityScore(opportunityId);
@@ -2498,7 +2501,9 @@ test('optional Deal OS warning does not block a current primary-backed decision'
   await withServer(async (origin) => {
     const cookie = await signInForCookie(origin);
     const response = await fetch(`${origin}/api/admin/deal-hunter/triage/${opportunityId}/action`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({ action: 'watch' }),
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie },
+      body: JSON.stringify({ action: 'watch', idempotencyKey: randomUUID(),
+        expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 }),
     });
     const result = await response.json();
     const after = await storage.getCurrentDealHunterOpportunityScore(opportunityId);

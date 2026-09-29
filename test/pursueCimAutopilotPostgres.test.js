@@ -11,6 +11,8 @@ const integrationEnabled = process.env.DEAL_HUNTER_POSTGRES_INTEGRATION === '1';
 const dockerCommand = fs.existsSync('/usr/local/bin/docker') ? '/usr/local/bin/docker' : 'docker';
 const baseSha = '0361a178dbaa36847ca6235fc300df9e209687ef';
 const migrationPath = path.join(root, 'supabase/migrations/20260925120000_pursue_cim_autopilot.sql');
+const ownerCommandMigrationPath = path.join(root,
+  'supabase/migrations/20260930120000_pursue_cim_owner_commands.sql');
 const safetyMigrationPath = path.join(root, 'supabase/migrations/20260928120000_pursue_cim_intake_safety.sql');
 const timezoneGuardMigrationPath = path.join(root,
   'supabase/migrations/20260929120000_pursue_cim_timezone_current_guard.sql');
@@ -284,6 +286,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', migration);
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(safetyMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(timezoneGuardMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(ownerCommandMigrationPath, 'utf8'));
 
   for (const database of ['pursue_cim_fresh', 'pursue_cim_upgrade']) {
     const catalog = JSON.parse(psql(container, database, `
@@ -511,6 +514,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', migration);
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(safetyMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(timezoneGuardMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(ownerCommandMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const commands = [
@@ -645,6 +649,101 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     expectedProjection, expectedSafetyEmissions, expectedOwnerDecisions,
     expectedOwnerStops, expectedCampaigns, expectedWithdrawals } = reference;
   for (const database of ['pursue_cim_fresh', 'pursue_cim_upgrade']) {
+    const runCommittedOwnerRace = async ({ stage, opportunityId, campaignId, touchId,
+      transitionName, transitionCommand, transmissionId = null, authorizationId = null }) => {
+      for (const action of ['watch', 'pass']) {
+        const raceDatabase = `p4a_${database.endsWith('fresh') ? 'f' : 'u'}_${stage}_${action}`;
+        run(dockerCommand, ['exec', container, 'createdb', '-U', 'postgres',
+          '-T', database, raceDatabase]);
+        if (stage === 'authorized') psql(container, raceDatabase, `insert into
+          public.deal_hunter_cim_safety_settings
+          (id, updated_at, outreach_paused, updated_by, metadata)
+          values ('global', '${now}', false, 'fixture', '{}'::jsonb);`);
+        const ownerAuditsBefore = Number(psql(container, raceDatabase, `select count(*)
+          from public.deal_hunter_cim_audit_events
+          where event_type='owner-decision' and opportunity_id='${opportunityId}';`));
+        const ownerCommand = { opportunityId, action,
+          idempotencyKey: `p4a-race-${database}-${stage}-${action}`, actor: 'fixture-owner',
+          policyVersion: 'owner-v1', now, expectedDiscoveryRevision: 0,
+          expectedMaterialRevision: 0,
+          ...(action === 'pass' ? { reason: 'not a fit', note: 'Owner declined.' } : {}) };
+        const committedRpc = (name, command) => new Promise((resolve, reject) => {
+          const payload = JSON.stringify(command).replaceAll("'", "''");
+          const child = spawn(dockerCommand, ['exec', '-i', container, 'psql',
+            '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', raceDatabase,
+            '-c', `set role service_role;
+              select public.${name}('${payload}'::jsonb);`],
+          { stdio: ['ignore', 'pipe', 'pipe'] });
+          let stdout = '';
+          let stderr = '';
+          child.stdout.on('data', (chunk) => { stdout += chunk; });
+          child.stderr.on('data', (chunk) => { stderr += chunk; });
+          child.once('error', reject);
+          child.once('exit', (code) => code === 0 ? resolve(JSON.parse(stdout.trim()))
+            : reject(new Error(`${raceDatabase}:${name}: ${stderr}`)));
+        });
+        const [owner, transition] = await Promise.all([
+          committedRpc('pursue_cim_record_owner_decision_v1', ownerCommand),
+          committedRpc(transitionName, transitionCommand),
+        ]);
+        assert.equal(owner.applied, true, raceDatabase);
+        const state = JSON.parse(psql(container, raceDatabase, `select jsonb_build_object(
+          'revision', (select terminal_revision from public.deal_hunter_cim_campaigns
+            where id='${campaignId}'),
+          'terminalEvents', (select count(*) from public.deal_hunter_cim_terminal_events
+            where campaign_id='${campaignId}'),
+          'ownerAudits', (select count(*) from public.deal_hunter_cim_audit_events
+            where event_type='owner-decision' and opportunity_id='${opportunityId}'),
+          'touch', (select state from public.deal_hunter_cim_campaign_touches
+            where id='${touchId}'),
+          'transmission', (select state from public.deal_hunter_cim_transmissions
+            where id='${transmissionId || ''}'),
+          'authorizationWithdrawn', (select withdrawn_at is not null
+            from public.deal_hunter_cim_live_provider_authorizations
+            where id='${authorizationId || ''}'));`));
+        assert.equal(state.revision, 1, raceDatabase);
+        assert.equal(state.terminalEvents, 1, raceDatabase);
+        assert.equal(state.ownerAudits, ownerAuditsBefore + 1, raceDatabase);
+        if (stage === 'authorized' && transition.authorized) {
+          assert.equal(state.touch, 'provider-pending',
+            `${raceDatabase}: ${JSON.stringify({ transition, state })}`);
+          assert.equal(state.transmission, 'provider-pending',
+            `${raceDatabase}: ${JSON.stringify({ transition, state })}`);
+        } else {
+          assert.equal(state.touch, 'cancelled-before-provider', raceDatabase);
+          if (transmissionId) assert.equal(state.transmission, 'cancelled-before-provider', raceDatabase);
+          if (authorizationId) assert.equal(state.authorizationWithdrawn, true, raceDatabase);
+        }
+      }
+    };
+    const assertOwnerFencesStage = ({ stage, opportunityId, campaignId, touchId,
+      transmissionId = null, authorizationId = null }) => {
+      for (const action of ['watch', 'pass']) {
+        const command = { opportunityId, action,
+          idempotencyKey: `p4a-${database}-${stage}-${action}`, actor: 'fixture-owner',
+          policyVersion: 'owner-v1', now, expectedDiscoveryRevision: 0,
+          expectedMaterialRevision: 0,
+          ...(action === 'pass' ? { reason: 'not a fit', note: 'Owner declined.' } : {}) };
+        const payload = JSON.stringify(command).replaceAll("'", "''");
+        const output = psql(container, database, `begin; set local role service_role;
+          select public.pursue_cim_record_owner_decision_v1('${payload}'::jsonb);
+          reset role;
+          select jsonb_build_object(
+            'campaignState', (select state from public.deal_hunter_cim_campaigns where id='${campaignId}'),
+            'terminalRevision', (select terminal_revision from public.deal_hunter_cim_campaigns where id='${campaignId}'),
+            'touchState', (select state from public.deal_hunter_cim_campaign_touches where id='${touchId}'),
+            'transmissionState', (select state from public.deal_hunter_cim_transmissions where id='${transmissionId || ''}'),
+            'authorizationWithdrawn', (select withdrawn_at is not null from public.deal_hunter_cim_live_provider_authorizations where id='${authorizationId || ''}'));
+          rollback;`);
+        const [result, state] = output.split('\n').filter((line) => line.startsWith('{')).map(JSON.parse);
+        assert.equal(result.applied, true, `${database}:${stage}:${action}`);
+        assert.equal(state.campaignState, 'stopped');
+        assert.equal(state.terminalRevision, 1);
+        assert.equal(state.touchState, 'cancelled-before-provider');
+        if (transmissionId) assert.equal(state.transmissionState, 'cancelled-before-provider');
+        if (authorizationId) assert.equal(state.authorizationWithdrawn, true);
+      }
+    };
     psql(container, database, `
       insert into public.deal_hunter_opportunities
         (opportunity_id, created_at, updated_at, canonical_name, identity_version)
@@ -895,7 +994,18 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
          due_at, due_local, timezone_revision, state, created_at, updated_at)
       values ('touch-parity', 'campaign-parity', 'opp-parity', 'initial', 'initial', 0,
         '${now}', '2026-09-25T12:00:00-07:00', 1, 'scheduled', '${now}', '${now}');
+      insert into public.deal_hunter_opportunity_scores
+        (opportunity_id, created_at, scored_at, deal_key, name, score_fingerprint,
+         engine_version, rules_version, profile_version, completeness_policy_version,
+         current_triage_eligible)
+      values ('opp-parity', '${now}', '${now}', 'deal:opp-parity', 'Synthetic parity',
+        'fingerprint:opp-parity', 'engine-v1', 'rules-v1', 'profile-v1', 'complete-v1', true);
     `);
+    assertOwnerFencesStage({ stage: 'scheduled', opportunityId: 'opp-parity',
+      campaignId: 'campaign-parity', touchId: 'touch-parity' });
+    await runCommittedOwnerRace({ stage: 'scheduled', opportunityId: 'opp-parity',
+      campaignId: 'campaign-parity', touchId: 'touch-parity',
+      transitionName: 'pursue_cim_claim_due_touch_v1', transitionCommand: claimCommands[0] });
     for (const [index, command] of claimCommands.entries()) {
       const outcome = await supabase.claimDueCimTouch(command);
       assert.deepEqual({ claimed: outcome.claimed, alreadyOwned: outcome.alreadyOwned,
@@ -903,6 +1013,11 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         conflict: outcome.conflict, state: outcome.touch?.state ?? null,
         rowVersion: outcome.touch?.row_version ?? null }, expectedClaims[index], database);
     }
+    assertOwnerFencesStage({ stage: 'claimed', opportunityId: 'opp-parity',
+      campaignId: 'campaign-parity', touchId: 'touch-parity' });
+    await runCommittedOwnerRace({ stage: 'claimed', opportunityId: 'opp-parity',
+      campaignId: 'campaign-parity', touchId: 'touch-parity',
+      transitionName: 'pursue_cim_claim_due_touch_v1', transitionCommand: claimCommands[3] });
     psql(container, database, `insert into public.deal_hunter_cim_requests
       (id, created_at, updated_at, deal_key, recipient_email, status,
        provider_message_id, request_state, delivery_state, metadata, opportunity_id)
@@ -928,20 +1043,94 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     psql(container, database, `insert into public.deal_hunter_opportunities
       (opportunity_id, created_at, updated_at, canonical_name, identity_version)
       values ('opp-decision', '${now}', '${now}', 'Synthetic decision', 'cim-identity-v1');`);
+    psql(container, database, `insert into public.deal_hunter_opportunity_scores
+      (opportunity_id, created_at, scored_at, deal_key, name, score_fingerprint,
+       engine_version, rules_version, profile_version, completeness_policy_version,
+       current_triage_eligible)
+      values ('opp-decision', '${now}', '${now}', 'deal:opp-decision', 'Synthetic decision',
+        'fingerprint:opp-decision', 'engine-v1', 'rules-v1', 'profile-v1', 'complete-v1', true);`);
     for (const [index, command] of ownerCommands.entries()) {
       const outcome = await supabase.recordOwnerDecision(command);
       assert.deepEqual({ applied: outcome.applied, replay: outcome.replay,
         conflict: outcome.conflict, decisionId: outcome.decision?.id ?? null,
         enrollmentId: outcome.enrollment?.id ?? null,
-        enrollmentState: outcome.enrollment?.state ?? null },
+        enrollmentState: outcome.enrollment?.state ?? null,
+        scorePriority: psql(container, database, `select operator_priority from
+          public.deal_hunter_opportunity_scores where opportunity_id='opp-decision';`) },
       expectedOwnerDecisions[index], database);
     }
-    psql(container, database, `insert into public.deal_hunter_opportunity_scores
+    psql(container, database, `insert into public.deal_hunter_opportunities
+      (opportunity_id, created_at, updated_at, canonical_name, identity_version)
+      values ('opp-owner-race', '${now}', '${now}', 'Synthetic owner race', 'cim-identity-v1');`);
+    const concurrentOwnerCommand = { opportunityId: 'opp-owner-race', action: 'pursue',
+      idempotencyKey: 'p4a-postgres-owner-race', actor: 'fixture-owner', policyVersion: 'owner-v1',
+      now, expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 };
+    const runConcurrentOwner = () => new Promise((resolve, reject) => {
+      const payload = JSON.stringify(concurrentOwnerCommand).replaceAll("'", "''");
+      const child = spawn(dockerCommand, ['exec', '-i', container, 'psql',
+        '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', database,
+        '-c', `set role service_role;
+          select public.pursue_cim_record_owner_decision_v1('${payload}'::jsonb);`],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => { stdout += chunk; });
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.once('error', reject);
+      child.once('exit', (code) => code === 0 ? resolve(JSON.parse(stdout.trim()))
+        : reject(new Error(`Concurrent owner RPC failed: ${stderr}`)));
+    });
+    const concurrentOwners = await Promise.all([runConcurrentOwner(), runConcurrentOwner()]);
+    assert.deepEqual(concurrentOwners.map(({ applied, replay }) => [applied, replay]).sort(),
+      [[false, true], [true, false]], database);
+    assert.equal(Number(psql(container, database, `select count(*) from
+      public.deal_hunter_owner_decision_events where opportunity_id='opp-owner-race';`)), 1);
+    assert.equal(Number(psql(container, database, `select count(*) from
+      public.deal_hunter_pursuit_enrollments where opportunity_id='opp-owner-race';`)), 1);
+    psql(container, database, `insert into public.deal_hunter_opportunities
+      (opportunity_id, created_at, updated_at, canonical_name, identity_version)
+      values ('opp-pass-rollback', '${now}', '${now}', 'Synthetic rollback', 'cim-identity-v1');
+      insert into public.deal_hunter_opportunity_scores
       (opportunity_id, created_at, scored_at, deal_key, name, score_fingerprint,
        engine_version, rules_version, profile_version, completeness_policy_version,
        current_triage_eligible)
-      values ('opp-parity', '${now}', '${now}', 'deal:opp-parity', 'Synthetic parity',
-        'fingerprint:opp-parity', 'engine-v1', 'rules-v1', 'profile-v1', 'complete-v1', true);`);
+      values ('opp-pass-rollback', '${now}', '${now}', 'deal:opp-pass-rollback',
+        'Synthetic rollback', 'fingerprint:opp-pass-rollback', 'engine-v1',
+        'rules-v1', 'profile-v1', 'complete-v1', true);
+      create function public.p4a_fail_pass_review() returns trigger language plpgsql as $$
+      begin raise exception 'synthetic Pass review persistence failure'; end $$;
+      create trigger p4a_fail_pass_review before update of reviewed_at
+        on public.deal_hunter_opportunity_scores for each row
+        when (new.opportunity_id = 'opp-pass-rollback' and new.reviewed_at is not null)
+        execute function public.p4a_fail_pass_review();`);
+    const rollbackPass = { opportunityId: 'opp-pass-rollback', action: 'pass',
+      idempotencyKey: 'p4a-pass-rollback', actor: 'fixture-owner', policyVersion: 'owner-v1',
+      expectedDiscoveryRevision: 0, expectedMaterialRevision: 0,
+      reason: 'not a fit', now };
+    const rejectedPass = rejectedSql(container, database, `set role service_role;
+      select public.pursue_cim_record_owner_decision_v1(
+        '${JSON.stringify(rollbackPass).replaceAll("'", "''")}'::jsonb);`);
+    assert.notEqual(rejectedPass.status, 0);
+    assert.match(rejectedPass.stderr, /synthetic Pass review persistence failure/);
+    const rolledBackPass = JSON.parse(psql(container, database, `select jsonb_build_object(
+      'events', (select count(*) from public.deal_hunter_owner_decision_events
+        where opportunity_id='opp-pass-rollback'),
+      'dispositions', (select count(*) from public.deal_hunter_dispositions
+        where deal_key='deal:opp-pass-rollback'),
+      'audits', (select count(*) from public.deal_hunter_cim_audit_events
+        where opportunity_id='opp-pass-rollback'),
+      'reviewed', (select reviewed_at is not null from public.deal_hunter_opportunity_scores
+        where opportunity_id='opp-pass-rollback'));`));
+    assert.deepEqual(rolledBackPass,
+      { events: 0, dispositions: 0, audits: 0, reviewed: false }, database);
+    psql(container, database, `drop trigger p4a_fail_pass_review
+      on public.deal_hunter_opportunity_scores;
+      drop function public.p4a_fail_pass_review();`);
+    assert.equal((await supabase.recordOwnerDecision(rollbackPass)).applied, true);
+    assert.equal((await supabase.recordOwnerDecision(rollbackPass)).replay, true);
+    assert.equal(Number(psql(container, database, `select count(*)
+      from public.deal_hunter_owner_decision_events
+      where opportunity_id='opp-pass-rollback';`)), 1);
     for (const [index, command] of ownerStopCommands.entries()) {
       const outcome = await supabase.recordOwnerDecision(command);
       const state = JSON.parse(psql(container, database, `select jsonb_build_object(
@@ -992,6 +1181,16 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         generation: outcome.transmission?.preparation_generation ?? null },
       reference.expectedPreparations[index], database);
     }
+    assertOwnerFencesStage({ stage: 'prepared', opportunityId: 'opp-decision',
+      campaignId: reference.expectedCampaigns[0].campaignId,
+      touchId: reference.expectedCampaigns[0].touchId,
+      transmissionId: reference.expectedPreparations.at(-1).transmissionId });
+    await runCommittedOwnerRace({ stage: 'prepared', opportunityId: 'opp-decision',
+      campaignId: reference.expectedCampaigns[0].campaignId,
+      touchId: reference.expectedCampaigns[0].touchId,
+      transmissionId: reference.expectedPreparations.at(-1).transmissionId,
+      transitionName: 'pursue_cim_issue_live_authorization_v1',
+      transitionCommand: reference.issueCommands[0] });
     assert.equal(Number(psql(container, database, `select count(*)
       from public.deal_hunter_cim_transmission_touches where cancelled_at is null;`)), 1);
     const infiniteAuthorization = rejectedSql(container, database, `
@@ -1013,6 +1212,18 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         authorizationId: outcome.authorization?.id ?? null },
       reference.expectedIssues[index], database);
     }
+    assertOwnerFencesStage({ stage: 'authorized', opportunityId: 'opp-decision',
+      campaignId: reference.expectedCampaigns[0].campaignId,
+      touchId: reference.expectedCampaigns[0].touchId,
+      transmissionId: reference.expectedPreparations.at(-1).transmissionId,
+      authorizationId: reference.expectedIssues[0].authorizationId });
+    await runCommittedOwnerRace({ stage: 'authorized', opportunityId: 'opp-decision',
+      campaignId: reference.expectedCampaigns[0].campaignId,
+      touchId: reference.expectedCampaigns[0].touchId,
+      transmissionId: reference.expectedPreparations.at(-1).transmissionId,
+      authorizationId: reference.expectedIssues[0].authorizationId,
+      transitionName: 'pursue_cim_authorize_provider_pending_v1',
+      transitionCommand: reference.providerPendingCommands[2] });
     for (const [index, command] of reference.providerPendingCommands.entries()) {
       if (index === 2) assert.equal(reference.expectedProviderPending[index].authorized, true,
         'SQLite reference must authorize synthetic provider-pending storage transition');
