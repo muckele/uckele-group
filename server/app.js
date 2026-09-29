@@ -51,6 +51,7 @@ import {
   setTriageOperatorDecision,
 } from './services/dealHunterTriage.js';
 import { setCurrentOperatorOpportunityFact } from './services/dealHunterOpportunityFacts.js';
+import { appendExplicitOpportunityTimezoneRevision } from './services/opportunityTimezoneRevision.js';
 import {
   approveDealHunterBrokerMaterials,
   parseBrokerMaterialsApprovalInput,
@@ -1981,6 +1982,22 @@ export function createApp({
         actor: session.username || 'admin',
       });
       response.status(result.status || (result.ok ? 200 : 400)).json({ success: Boolean(result.ok), ...result });
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/timezone',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await appendExplicitOpportunityTimezoneRevision({
+        storage: getStorage(), opportunityId: request.params.opportunityId,
+        input: request.body, actor: session.username || 'admin', now: new Date().toISOString(),
+      });
+      response.status(result.status).json({ success: result.ok, ...result });
     }),
   );
 

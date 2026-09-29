@@ -1664,6 +1664,16 @@ export function createPursueCimSqliteTransitions(database) {
           return { applied: false, replay: priorAudit.authority_digest === requestDigest,
             staleRevision: priorAudit.authority_digest !== requestDigest, timezoneRevision };
         }
+        const currentOpportunity = database.prepare(`
+          SELECT status FROM deal_hunter_opportunities WHERE opportunity_id = ?
+        `).get(opportunityId);
+        if (!currentOpportunity || currentOpportunity.status !== 'active') {
+          const latest = database.prepare(`
+            SELECT * FROM deal_hunter_opportunity_timezone_revisions
+            WHERE opportunity_id = ? ORDER BY revision DESC LIMIT 1
+          `).get(opportunityId) ?? null;
+          return { applied: false, replay: false, staleRevision: true, timezoneRevision: latest };
+        }
         const current = database.prepare(`
           SELECT COALESCE(MAX(revision), 0) AS revision FROM deal_hunter_opportunity_timezone_revisions
           WHERE opportunity_id = ?

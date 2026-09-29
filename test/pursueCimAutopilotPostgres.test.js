@@ -12,6 +12,8 @@ const dockerCommand = fs.existsSync('/usr/local/bin/docker') ? '/usr/local/bin/d
 const baseSha = '0361a178dbaa36847ca6235fc300df9e209687ef';
 const migrationPath = path.join(root, 'supabase/migrations/20260925120000_pursue_cim_autopilot.sql');
 const safetyMigrationPath = path.join(root, 'supabase/migrations/20260928120000_pursue_cim_intake_safety.sql');
+const timezoneGuardMigrationPath = path.join(root,
+  'supabase/migrations/20260929120000_pursue_cim_timezone_current_guard.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -70,7 +72,11 @@ test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
   assert.equal(schema.slice(schema.indexOf(marker), schema.indexOf(nextMarker)).trim(),
     migration.slice(migration.indexOf(marker)).trim());
   const safetyMigration = fs.readFileSync(safetyMigrationPath, 'utf8');
-  assert.equal(schema.slice(schema.indexOf(nextMarker)).trim(), safetyMigration.trim());
+  const p3Marker = '-- Package 3: current canonical timezone revision guard.';
+  assert.equal(schema.slice(schema.indexOf(nextMarker), schema.indexOf(p3Marker)).trim(), safetyMigration.trim());
+  const p3Migration = fs.readFileSync(timezoneGuardMigrationPath, 'utf8');
+  assert.equal(schema.slice(schema.indexOf(p3Marker)).trim(), p3Migration.trim());
+  assert.match(p3Migration, /v_opportunity_status <> 'active'/);
 });
 
 test('P1C Supabase adapter rejects contradictory transition authority', async () => {
@@ -277,6 +283,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   const before = legacyFingerprint(container, 'pursue_cim_upgrade');
   psql(container, 'pursue_cim_upgrade', migration);
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(safetyMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(timezoneGuardMigrationPath, 'utf8'));
 
   for (const database of ['pursue_cim_fresh', 'pursue_cim_upgrade']) {
     const catalog = JSON.parse(psql(container, database, `
@@ -503,6 +510,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', baseSchema);
   psql(container, 'pursue_cim_upgrade', migration);
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(safetyMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(timezoneGuardMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const commands = [
@@ -842,6 +850,19 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       where event_type = 'timezone-revision';`), reference.timezoneAudit.id);
     assert.equal(psql(container, database, `select authority_digest from public.deal_hunter_cim_audit_events
       where event_type = 'timezone-revision';`), reference.timezoneAudit.authority_digest);
+    psql(container, database, `insert into public.deal_hunter_opportunities
+      (opportunity_id, created_at, updated_at, canonical_name, identity_version)
+      values ('opp-timezone-supersession', now(), now(), 'Timezone supersession', 'cim-identity-v1');`);
+    const supersessionCommand = { ...timezoneCommands[0],
+      opportunityId: 'opp-timezone-supersession', idempotencyKey: 'timezone-supersession' };
+    assert.equal((await supabase.appendOpportunityTimezoneRevision(supersessionCommand)).applied, true);
+    psql(container, database, `update public.deal_hunter_opportunities set status = 'superseded'
+      where opportunity_id = 'opp-timezone-supersession';`);
+    assert.equal((await supabase.appendOpportunityTimezoneRevision(supersessionCommand)).replay, true);
+    const blocked = await supabase.appendOpportunityTimezoneRevision({ ...supersessionCommand,
+      idempotencyKey: 'timezone-supersession-new', expectedPriorRevision: 1 });
+    assert.equal(blocked.applied, false);
+    assert.equal(blocked.staleRevision, true);
     for (const [index, command] of activationCommands.entries()) {
       const outcome = await supabase.recordCimCapabilityActivation(command);
       assert.deepEqual({ applied: outcome.applied, replay: outcome.replay,
