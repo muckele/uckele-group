@@ -142,7 +142,7 @@ export default function OpportunityDrawer({
   actionsBlocked = false, brokerMaterialsState = {}, detail, error = '', focusGuardRef, followUpState = {}, loading = false, mutationError = '', onAction,
   onBrokerMaterialsApprove, onBrokerMaterialsCheckStatus, onBrokerMaterialsInvalidate, onBrokerMaterialsPrepare,
   onClose, onFollowUpApprove, onFollowUpCheckStatus, onFollowUpCloseReview, onFollowUpInvalidate,
-  onFollowUpPrepare, onFollowUpStart, onFollowUpStop, onRetry, onSaveFact, pending = false, readOnly = false,
+  onFollowUpPrepare, onFollowUpStart, onFollowUpStop, onRetry, onSaveFact, pending = false, pursueChoice = null, readOnly = false,
 }) {
   const [passOpen, setPassOpen] = useState(false);
   const [brokerEmailFocusRequest, setBrokerEmailFocusRequest] = useState(0);
@@ -230,6 +230,16 @@ export default function OpportunityDrawer({
               {opportunity.freshness?.materialChange && Number.isFinite(opportunity.freshness.materialChange.beforeValue) && Number.isFinite(opportunity.freshness.materialChange.afterValue) ? <p className="mt-3 rounded-xl bg-violet-50 p-3 text-sm text-violet-900">{formatLabel(opportunity.freshness.materialChange.field)} changed from {opportunity.freshness.materialChange.beforeValue} to {opportunity.freshness.materialChange.afterValue}{opportunity.freshness.materialChange.currency ? ` ${opportunity.freshness.materialChange.currency}` : ''} · {opportunity.freshness.materialChange.source || 'Accepted source'}</p> : null}
               {opportunity.dismissed ? <p className="mt-3 rounded-xl bg-red-50 p-3 text-sm font-semibold text-red-800">Passed: {formatLabel(opportunity.dismissedReason || 'dismissed')}</p> : null}
               <div className="mt-4"><DetailActions name={name} onAction={actionable ? onAction : undefined} onPass={() => setPassOpen(true)} pending={pending || actionsBlocked} /></div>
+              {pursueChoice?.options?.length > 1 && actionable ? <div aria-label="Choose Pursue recipient" className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-4">
+                <p className="text-sm font-semibold text-amber-950">Choose the authoritative broker recipient to continue Pursue</p>
+                <p className="mt-1 text-xs text-amber-900">The choice is checked against current contact authority before a campaign can be created.</p>
+                <ul className="mt-3 space-y-2">{pursueChoice.options.map((option) => <li key={option.recipientContactRef}>
+                  <button className="w-full rounded-lg border border-amber-300 bg-white p-3 text-left text-sm text-ink hover:border-moss disabled:opacity-50" disabled={pending || actionsBlocked} onClick={() => onAction('pursue', { recipientContactRef: option.recipientContactRef })} type="button">
+                    <span className="font-semibold">{option.displayName || option.email || 'Broker contact'}</span>{option.email ? ` · ${option.email}` : ''}
+                    <span className="mt-1 block text-xs text-ink/60">{option.provenanceLabel || option.provenance || 'Authoritative contact source'}</span>
+                  </button>
+                </li>)}</ul>
+              </div> : null}
               {passOpen && actionable ? <div className="mt-4"><PassForm error="" name={name} onCancel={() => setPassOpen(false)} onSubmit={(payload) => onAction('pass', payload)} pending={pending} submitDisabled={actionsBlocked} /></div> : null}
               {linkedCrmId ? <a className={`${secondaryButton} mt-4 gap-2`} href={`/admin/crm/${encodeURIComponent(linkedCrmId)}`}><ExternalLink aria-hidden="true" className="h-4 w-4" />Open linked CRM record</a> : null}
               <div className="mt-4"><BrokerMaterialsCard

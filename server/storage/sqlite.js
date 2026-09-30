@@ -1551,6 +1551,7 @@ const inertPursueCimAuthorityIdentity = Object.freeze({
   deal_hunter_owner_decision_events: ['id'],
   deal_hunter_pursuit_enrollments: ['id'],
   deal_hunter_opportunity_timezone_revisions: ['opportunity_id', 'revision'],
+  deal_hunter_crm_ownership_revisions: ['opportunity_id', 'revision'],
   deal_hunter_broker_conversations: ['id'],
   deal_hunter_cim_campaigns: ['id'],
   deal_hunter_cim_campaign_touches: ['id'],
@@ -1563,9 +1564,13 @@ const inertPursueCimAuthorityIdentity = Object.freeze({
   deal_hunter_cim_live_provider_authorizations: ['id'],
 });
 
-function inspectInertPursueCimAuthorities(database) {
+function inspectInertPursueCimAuthorities(database, approval) {
   return Object.entries(inertPursueCimAuthorityIdentity).flatMap(([table, identityColumns]) => (
-    database.prepare(`SELECT ${identityColumns.join(', ')} FROM ${table}`).all().map((row) => (
+    database.prepare(`SELECT ${identityColumns.join(', ')} FROM ${table}
+      ${table === 'deal_hunter_crm_ownership_revisions'
+    ? 'WHERE opportunity_id IN (?, ?) AND (revision <> 1 OR submission_id IS NOT NULL)' : ''}`)
+      .all(...(table === 'deal_hunter_crm_ownership_revisions'
+        ? [approval.survivorId, approval.supersededId] : [])).map((row) => (
       `${table}:${identityColumns.map((column) => row[column]).join(':')}`
     ))
   )).sort();
@@ -1692,7 +1697,7 @@ export function inspectCanonicalMergeDependentState(database, approval) {
   const referenceValues = uniqueCanonicalMergeValues([...opportunityIds, ...aliasValues, ...aliasKeys]);
   const metadataFilter = { column: 'metadata', values: referenceValues, contains: true };
   const legacyDealHunterCandidates = inspectCanonicalMergeLegacyDealHunterCandidates(database, approval);
-  const pursueCimAuthorities = inspectInertPursueCimAuthorities(database);
+  const pursueCimAuthorities = inspectInertPursueCimAuthorities(database, approval);
   const crmSubmissionSupersessions = database.prepare(`
     SELECT * FROM crm_submission_supersessions
     WHERE opportunity_id IN (${placeholders(opportunityIds.length)})
@@ -4104,6 +4109,7 @@ export function createSqliteStorage(config, options = {}) {
         discovery_state TEXT NOT NULL DEFAULT 'untracked_legacy' CHECK(discovery_state IN ('untracked_legacy', 'pending', 'known_prospective', 'known_recovered')),
         discovery_revision INTEGER NOT NULL DEFAULT 0 CHECK(discovery_revision >= 0),
         material_revision INTEGER NOT NULL DEFAULT 0 CHECK(material_revision >= 0),
+        campaign_authority_revision INTEGER NOT NULL DEFAULT 1 CHECK(campaign_authority_revision > 0),
         last_material_change_at TEXT,
         metadata TEXT NOT NULL DEFAULT '{}',
         FOREIGN KEY(first_discovery_evidence_id) REFERENCES deal_hunter_freshness_evidence(id) ON DELETE RESTRICT
@@ -4228,6 +4234,12 @@ export function createSqliteStorage(config, options = {}) {
         CHECK((accepted_generation = 0 AND accepted_run_id IS NULL AND accepted_digest IS NULL AND accepted_at IS NULL)
           OR (accepted_generation > 0 AND accepted_run_id IS NOT NULL AND accepted_digest IS NOT NULL AND accepted_at IS NOT NULL))
       );
+      CREATE TABLE IF NOT EXISTS deal_hunter_cim_global_authority (
+        id TEXT PRIMARY KEY CHECK(id = 'global'),
+        revision INTEGER NOT NULL CHECK(revision > 0)
+      );
+      INSERT OR IGNORE INTO deal_hunter_cim_global_authority (id, revision)
+      VALUES ('global', 1);
 
       CREATE TABLE IF NOT EXISTS deal_hunter_freshness_evidence (
         id TEXT PRIMARY KEY CHECK(id = trim(id) AND length(id) BETWEEN 1 AND 240),
@@ -5560,7 +5572,142 @@ export function createSqliteStorage(config, options = {}) {
   ensureColumn(database, 'deal_hunter_opportunities', 'discovery_state', "TEXT NOT NULL DEFAULT 'untracked_legacy' CHECK(discovery_state IN ('untracked_legacy', 'pending', 'known_prospective', 'known_recovered'))");
   ensureColumn(database, 'deal_hunter_opportunities', 'discovery_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(discovery_revision >= 0)');
   ensureColumn(database, 'deal_hunter_opportunities', 'material_revision', 'INTEGER NOT NULL DEFAULT 0 CHECK(material_revision >= 0)');
+  ensureColumn(database, 'deal_hunter_opportunities', 'campaign_authority_revision',
+    'INTEGER NOT NULL DEFAULT 1 CHECK(campaign_authority_revision > 0)');
   ensureColumn(database, 'deal_hunter_opportunities', 'last_material_change_at', 'TEXT');
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS deal_hunter_crm_ownership_revisions (
+      opportunity_id TEXT NOT NULL REFERENCES deal_hunter_opportunities(opportunity_id) ON DELETE CASCADE,
+      revision INTEGER NOT NULL CHECK(revision > 0),
+      submission_id TEXT,
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      PRIMARY KEY (opportunity_id, revision)
+    );
+    INSERT INTO deal_hunter_crm_ownership_revisions (opportunity_id, revision, submission_id)
+      SELECT opportunity_id, 1, primary_submission_id FROM deal_hunter_opportunities
+      WHERE NOT EXISTS (SELECT 1 FROM deal_hunter_crm_ownership_revisions AS r
+        WHERE r.opportunity_id = deal_hunter_opportunities.opportunity_id);
+    CREATE TRIGGER IF NOT EXISTS trg_cim_crm_revision_opportunity_insert
+    AFTER INSERT ON deal_hunter_opportunities
+    BEGIN
+      INSERT INTO deal_hunter_crm_ownership_revisions (opportunity_id, revision, submission_id)
+      VALUES (NEW.opportunity_id, 1, NEW.primary_submission_id);
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_crm_revision_opportunity_update
+    AFTER UPDATE OF primary_submission_id ON deal_hunter_opportunities
+    WHEN OLD.primary_submission_id IS NOT NEW.primary_submission_id
+    BEGIN
+      INSERT INTO deal_hunter_crm_ownership_revisions (opportunity_id, revision, submission_id)
+      SELECT NEW.opportunity_id, MAX(revision) + 1, NEW.primary_submission_id
+      FROM deal_hunter_crm_ownership_revisions WHERE opportunity_id = NEW.opportunity_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_source_insert
+    AFTER INSERT ON deal_hunter_opportunity_source_observations
+    BEGIN
+      UPDATE deal_hunter_opportunities
+      SET campaign_authority_revision = campaign_authority_revision + 1
+      WHERE opportunity_id = NEW.opportunity_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_source_update
+    AFTER UPDATE ON deal_hunter_opportunity_source_observations
+    WHEN OLD.opportunity_id IS NOT NEW.opportunity_id OR OLD.source_id IS NOT NEW.source_id
+      OR OLD.source_record_id IS NOT NEW.source_record_id OR OLD.field IS NOT NEW.field
+      OR OLD.value IS NOT NEW.value OR OLD.accepted_at IS NOT NEW.accepted_at
+      OR OLD.accepted_run_id IS NOT NEW.accepted_run_id
+    BEGIN
+      UPDATE deal_hunter_opportunities
+      SET campaign_authority_revision = campaign_authority_revision + 1
+      WHERE opportunity_id IN (OLD.opportunity_id, NEW.opportunity_id);
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_source_delete
+    AFTER DELETE ON deal_hunter_opportunity_source_observations
+    BEGIN
+      UPDATE deal_hunter_opportunities
+      SET campaign_authority_revision = campaign_authority_revision + 1
+      WHERE opportunity_id = OLD.opportunity_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_fact_insert
+    AFTER INSERT ON deal_hunter_opportunity_facts
+    BEGIN
+      UPDATE deal_hunter_opportunities SET campaign_authority_revision = campaign_authority_revision + 1
+      WHERE opportunity_id = NEW.opportunity_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_fact_update
+    AFTER UPDATE ON deal_hunter_opportunity_facts
+    BEGIN
+      UPDATE deal_hunter_opportunities SET campaign_authority_revision = campaign_authority_revision + 1
+      WHERE opportunity_id IN (OLD.opportunity_id, NEW.opportunity_id);
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_fact_delete
+    AFTER DELETE ON deal_hunter_opportunity_facts
+    BEGIN
+      UPDATE deal_hunter_opportunities SET campaign_authority_revision = campaign_authority_revision + 1
+      WHERE opportunity_id = OLD.opportunity_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_alias_insert
+    AFTER INSERT ON deal_hunter_opportunity_aliases
+    BEGIN
+      UPDATE deal_hunter_opportunities SET campaign_authority_revision = campaign_authority_revision + 1
+      WHERE opportunity_id = NEW.opportunity_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_alias_update
+    AFTER UPDATE ON deal_hunter_opportunity_aliases
+    BEGIN
+      UPDATE deal_hunter_opportunities SET campaign_authority_revision = campaign_authority_revision + 1
+      WHERE opportunity_id IN (OLD.opportunity_id, NEW.opportunity_id);
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_campaign_revision_alias_delete
+    AFTER DELETE ON deal_hunter_opportunity_aliases
+    BEGIN
+      UPDATE deal_hunter_opportunities SET campaign_authority_revision = campaign_authority_revision + 1
+      WHERE opportunity_id = OLD.opportunity_id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_global_revision_source_insert
+    AFTER INSERT ON deal_hunter_source_freshness_state
+    BEGIN
+      UPDATE deal_hunter_cim_global_authority SET revision = revision + 1 WHERE id = 'global';
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_global_revision_source_update
+    AFTER UPDATE ON deal_hunter_source_freshness_state
+    WHEN OLD.accepted_generation IS NOT NEW.accepted_generation
+      OR OLD.accepted_run_id IS NOT NEW.accepted_run_id
+      OR OLD.accepted_digest IS NOT NEW.accepted_digest
+      OR OLD.projection_state IS NOT NEW.projection_state
+    BEGIN
+      UPDATE deal_hunter_cim_global_authority SET revision = revision + 1 WHERE id = 'global';
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_global_revision_source_delete
+    AFTER DELETE ON deal_hunter_source_freshness_state
+    BEGIN
+      UPDATE deal_hunter_cim_global_authority SET revision = revision + 1 WHERE id = 'global';
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_global_revision_identity_insert
+    AFTER INSERT ON deal_hunter_identity_exceptions
+    BEGIN
+      UPDATE deal_hunter_cim_global_authority SET revision = revision + 1 WHERE id = 'global';
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_global_revision_identity_update
+    AFTER UPDATE ON deal_hunter_identity_exceptions
+    WHEN OLD.status IS NOT NEW.status
+      OR OLD.candidate_opportunity_ids IS NOT NEW.candidate_opportunity_ids
+    BEGIN
+      UPDATE deal_hunter_cim_global_authority SET revision = revision + 1 WHERE id = 'global';
+    END;
+    CREATE TRIGGER IF NOT EXISTS trg_cim_global_revision_identity_delete
+    AFTER DELETE ON deal_hunter_identity_exceptions
+    BEGIN
+      UPDATE deal_hunter_cim_global_authority SET revision = revision + 1 WHERE id = 'global';
+    END;
+  `);
+  for (const table of ['email_suppressions', 'secure_documents', 'secure_upload_requests',
+    'crm_communications', 'deal_hunter_cim_requests', 'deal_hunter_cim_opportunity_claims']) {
+    for (const operation of ['INSERT', 'UPDATE', 'DELETE']) {
+      database.exec(`CREATE TRIGGER IF NOT EXISTS trg_cim_global_revision_${table}_${operation.toLowerCase()}
+        AFTER ${operation} ON ${table} BEGIN
+          UPDATE deal_hunter_cim_global_authority SET revision = revision + 1 WHERE id = 'global';
+        END;`);
+    }
+  }
   ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'accepted_at', 'TEXT');
   ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'accepted_run_id', 'TEXT CHECK(accepted_run_id IS NULL OR length(accepted_run_id) BETWEEN 1 AND 200)');
   ensureColumn(database, 'deal_hunter_opportunity_source_observations', 'accepted_evidence_id', 'TEXT CHECK(accepted_evidence_id IS NULL OR length(accepted_evidence_id) BETWEEN 1 AND 240)');
@@ -7826,6 +7973,10 @@ export function createSqliteStorage(config, options = {}) {
 
     ...createPursueCimSqliteTransitions(database, {
       applyPass: (command) => storageApi._passDealHunterOpportunitySync(command),
+      readCrmMatchAuthorityFingerprint: () => {
+        const authority = dealHunterCrmMatchAuthoritySnapshot(database);
+        return authority.complete ? authority.revision : null;
+      },
     }),
 
     async listActiveCrmSubmissionSupersessions(filters = {}) {
@@ -12010,6 +12161,17 @@ export function createSqliteStorage(config, options = {}) {
         WHERE opportunity_id = ? AND status = 'active'
         LIMIT 1
       `).get(String(opportunityId).trim()));
+    },
+
+    async readCanonicalCrmOwnershipRevision(opportunityId) {
+      if (!opportunityId) return null;
+      return database.prepare(`SELECT revision, submission_id FROM deal_hunter_crm_ownership_revisions
+        WHERE opportunity_id = ? ORDER BY revision DESC LIMIT 1`).get(String(opportunityId).trim()) || null;
+    },
+
+    async readPursuitCrmMatchAuthorityFingerprint() {
+      const authority = dealHunterCrmMatchAuthoritySnapshot(database);
+      return authority.complete ? authority.revision : null;
     },
 
     async getLatestDealHunterMaterialChange({ opportunityId, materialRevision } = {}) {

@@ -3,7 +3,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import Database from 'better-sqlite3';
 import { readCimCurrentAuthority, runCimCampaignSafety } from '../server/services/cimCampaignSafety.js';
+import { loadBrokerMaterialsAuthority } from '../server/services/dealHunterBrokerMaterials.js';
+import { orchestratePursuitEnrollment, pursuitPermissionBasisDigest,
+  pursuitPermissionCohortDigest } from '../server/services/pursueCimEnrollment.js';
 import { resolveDealHunterOpportunity } from '../server/services/cimOpportunityIdentity.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import {
@@ -24,6 +28,272 @@ function createIdentityStorage(t) {
   });
   return storage;
 }
+
+async function seedP4bEligibleFixture(t) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p4b-service-'));
+  const sqlitePath = path.join(directory, 'service.sqlite');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  const db = new Database(sqlitePath);
+  t.after(() => { db.close(); storage.close(); fs.rmSync(directory, { recursive: true, force: true }); });
+  const opportunityId = 'opp-p4b-service';
+  const now = '2026-09-29T16:00:00.000Z';
+  db.prepare(`INSERT INTO deal_hunter_opportunities
+    (opportunity_id, created_at, updated_at, canonical_name, identity_version, canonical_location)
+    VALUES (?, ?, ?, 'P4B Service Co', 'identity-v1', 'San Francisco, CA')`)
+    .run(opportunityId, now, now);
+  db.prepare(`INSERT INTO deal_hunter_opportunity_scores
+    (opportunity_id, created_at, scored_at, deal_key, name, listing_url,
+     score_fingerprint, engine_version, rules_version, profile_version,
+     completeness_policy_version, current_triage_eligible)
+    VALUES (?, ?, ?, 'deal:p4b-service', 'P4B Service Co',
+      'https://broker.example/p4b-service', 'score-p4b', 'test', 'test', 'test', 'test', 1)`)
+    .run(opportunityId, now, now);
+  for (const [field, value] of [
+    ['name', 'P4B Service Co'], ['broker_email', 'broker-p4b@example.test'],
+    ['listing_url', 'https://broker.example/p4b-service'],
+  ]) await storage.upsertDealHunterOpportunitySourceObservation({
+    id: `p4b-${field}`, opportunity_id: opportunityId, source_id: 'sheet-0',
+    source_name: 'Synthetic Sheet', source_record_id: 'row-p4b', field, value,
+    observed_at: now, created_at: now, updated_at: now,
+  });
+  db.prepare(`INSERT INTO contact_submissions
+    (id, created_at, updated_at, status, delivery_provider, delivery_status,
+     crm_status, source, ip_hash, name, email, message, deal_hunter_opportunity_id)
+    VALUES ('submission-p4b', ?, ?, 'open', 'none', 'not-attempted',
+      'active', 'synthetic', 'synthetic', 'P4B Service', 'owner@example.test',
+      'Synthetic owner', ?)`)
+    .run(now, now, opportunityId);
+  db.prepare(`UPDATE deal_hunter_opportunities SET primary_submission_id = 'submission-p4b'
+    WHERE opportunity_id = ?`).run(opportunityId);
+  const decision = await storage.recordOwnerDecision({ opportunityId, action: 'pursue',
+    idempotencyKey: 'p4b-service-owner', actor: 'fixture-owner',
+    policyVersion: 'owner-decision-v1', now,
+    expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 });
+  await storage.appendOpportunityTimezoneRevision({ opportunityId,
+    expectedPriorRevision: 0, idempotencyKey: 'p4b-timezone', state: 'verified',
+    ianaTimezone: 'America/Los_Angeles', evidenceType: 'operator-verified',
+    evidenceId: 'p4b-timezone-evidence', evidenceDigest: 'a'.repeat(64),
+    resolverVersion: 'explicit-v1', datasetDigest: 'b'.repeat(64),
+    actor: 'fixture-owner', now });
+  const authority = await loadBrokerMaterialsAuthority({ storage, opportunityId, now });
+  assert.equal(authority.recipientOptions.length, 1);
+  const recipient = authority.recipientOptions[0];
+  const activation = { mode: 'active', policyHash: 'c'.repeat(64),
+    configHash: 'd'.repeat(64), actor: 'fixture-owner', reason: 'synthetic only',
+    confirmation: 'synthetic-confirmation', providerProfile: 'synthetic', now };
+  await storage.recordCimCapabilityActivation({ ...activation,
+    id: 'p4b-safety', capability: 'fl04a-safety' });
+  await storage.recordCimCapabilityActivation({ ...activation,
+    id: 'p4b-enrollment', capability: 'fl04b-enrollment',
+    prerequisiteActivationId: 'p4b-safety', prerequisiteEvidenceId: 'p4b-evidence',
+    prerequisiteEvidenceHash: 'e'.repeat(64),
+    permissionBasisDigest: pursuitPermissionBasisDigest(authority, recipient),
+    cohortDigest: pursuitPermissionCohortDigest(authority, recipient), permissionRevision: 1 });
+  return { storage, db, opportunityId, now, decision, authority, recipient };
+}
+
+test('P4B current eligible Pursue allocates one scheduled initial touch without provider effects', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  const result = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(result.enrollment.state, 'campaign-created', result.enrollment.reason_code);
+  assert.equal(result.campaign.generation, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches').get().count, 1);
+  assert.equal(db.prepare(`SELECT state FROM deal_hunter_cim_campaign_touches`).get().state, 'scheduled');
+  for (const table of ['deal_hunter_cim_transmissions', 'deal_hunter_cim_live_provider_authorizations',
+    'crm_communications']) assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count, 0);
+});
+
+test('P4B downstream allocation failure preserves immutable Pursue and requires action', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  const failingStorage = new Proxy(storage, { get(target, property) {
+    if (property === 'materializePursuitCampaign') return async () => { throw new Error('injected allocation failure'); };
+    return Reflect.get(target, property);
+  } });
+  const result = await orchestratePursuitEnrollment({ storage: failingStorage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(result.enrollment.state, 'action-required');
+  assert.equal(result.enrollment.reason_code, 'allocation_failed');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_owner_decision_events').get().count, 1);
+  for (const table of ['deal_hunter_broker_conversations', 'deal_hunter_cim_campaigns',
+    'deal_hunter_cim_campaign_touches']) assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count, 0);
+});
+
+test('P4B ambiguous broker contacts expose opaque choices and create no campaign', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  await storage.upsertDealHunterOpportunitySourceObservation({
+    id: 'p4b-other-broker', opportunity_id: opportunityId, source_id: 'sheet-0',
+    source_name: 'Synthetic Sheet', source_record_id: 'row-other', field: 'broker_email',
+    value: 'other@example.test', observed_at: now, created_at: now, updated_at: now,
+  });
+  const result = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(result.enrollment.reason_code, 'recipient_ambiguous');
+  assert.equal(result.recipientOptions.length, 2);
+  assert.ok(result.recipientOptions.every((choice) => choice.recipientContactRef
+    && choice.email), 'the admin must be able to distinguish contact choices by address');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns').get().count, 0);
+});
+
+test('P4B refuses truncated source recipient authority before automatic allocation', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  const newer = new Date(Date.parse(now) + 1000).toISOString();
+  const older = new Date(Date.parse(now) - 1000).toISOString();
+  const insert = db.prepare(`INSERT INTO deal_hunter_opportunity_source_observations
+    (id, opportunity_id, source_id, source_name, source_record_id, field, value,
+     observed_at, created_at, updated_at)
+    VALUES (?, ?, 'sheet-0', 'Synthetic Sheet', ?, 'name', 'Filler', ?, ?, ?)`);
+  const batch = db.transaction(() => {
+    for (let index = 0; index < 499; index += 1) {
+      insert.run(`p4b-limit-${index}`, opportunityId, `limit-${index}`, newer, newer, newer);
+    }
+    db.prepare(`INSERT INTO deal_hunter_opportunity_source_observations
+      (id, opportunity_id, source_id, source_name, source_record_id, field, value,
+       observed_at, created_at, updated_at)
+      VALUES ('p4b-hidden-broker', ?, 'sheet-0', 'Synthetic Sheet', 'hidden',
+        'broker_email', 'hidden@example.test', ?, ?, ?)`).run(opportunityId, older, older, older);
+  });
+  batch();
+  const result = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(result.enrollment.state, 'waiting-on-eligibility');
+  assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns`).get().count, 0);
+});
+
+test('P4B refuses truncated operator-fact recipient authority before allocation', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  const newer = new Date(Date.parse(now) + 1000).toISOString();
+  const older = new Date(Date.parse(now) - 1000).toISOString();
+  const insert = db.prepare(`INSERT INTO deal_hunter_opportunity_facts
+    (id, opportunity_id, field, value, source, verified, actor, created_at, updated_at)
+    VALUES (?, ?, 'seller_name', 'Filler', 'operator', 1, 'fixture-owner', ?, ?)`);
+  db.transaction(() => {
+    for (let index = 0; index < 100; index += 1) {
+      insert.run(`p4b-fact-limit-${index}`, opportunityId, newer, newer);
+    }
+    db.prepare(`INSERT INTO deal_hunter_opportunity_facts
+      (id, opportunity_id, field, value, source, verified, actor, created_at, updated_at)
+      VALUES ('p4b-hidden-fact-broker', ?, 'broker_email', 'hidden@example.test',
+        'operator', 1, 'fixture-owner', ?, ?)`).run(opportunityId, older, older);
+  })();
+  const result = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(result.enrollment.state, 'waiting-on-eligibility');
+  assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns`).get().count, 0);
+});
+
+test('P4B expired opaque broker contact reference cannot allocate', async (t) => {
+  const { storage, db, opportunityId, now, decision, recipient } = await seedP4bEligibleFixture(t);
+  const result = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision,
+    recipientContactRef: recipient.recipientContactRef, actor: 'fixture-owner',
+    now: new Date(Date.parse(now) + 16 * 60 * 1000),
+    readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(result.enrollment.reason_code, 'recipient_changed');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns').get().count, 0);
+});
+
+test('P4B canonical CRM ambiguity prevents campaign creation', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  db.prepare(`UPDATE deal_hunter_opportunities SET primary_submission_id = NULL
+    WHERE opportunity_id = ?`).run(opportunityId);
+  db.prepare(`UPDATE contact_submissions SET deal_hunter_opportunity_id = NULL,
+    listing_url = 'https://broker.example/p4b-service' WHERE id = 'submission-p4b'`).run();
+  db.prepare(`INSERT INTO contact_submissions
+    (id, created_at, updated_at, status, delivery_provider, delivery_status,
+     crm_status, source, ip_hash, name, email, message, listing_url)
+    VALUES ('submission-p4b-other', ?, ?, 'open', 'none', 'not-attempted',
+      'active', 'synthetic', 'synthetic', 'Other owner', 'other-owner@example.test',
+      'Conflicting canonical owner', 'https://broker.example/p4b-service')`)
+    .run(now, now);
+  const result = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(result.enrollment.state, 'action-required');
+  assert.equal(result.enrollment.reason_code, 'crm_ambiguous');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns').get().count, 0);
+});
+
+test('P4B no CRM owner uses the durable import claim and links one exact owner', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  db.prepare(`UPDATE deal_hunter_opportunities SET primary_submission_id = NULL
+    WHERE opportunity_id = ?`).run(opportunityId);
+  db.prepare(`DELETE FROM contact_submissions WHERE id = 'submission-p4b'`).run();
+  const result = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(result.enrollment.state, 'campaign-created', result.enrollment.reason_code);
+  const current = db.prepare(`SELECT primary_submission_id AS submissionId FROM deal_hunter_opportunities
+    WHERE opportunity_id = ?`).get(opportunityId);
+  assert.ok(current.submissionId);
+  assert.equal(result.campaign.crm_submission_id, current.submissionId);
+  assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_crm_imports
+    WHERE opportunity_id = ?`).get(opportunityId).count, 1);
+  assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM contact_submissions
+    WHERE deal_hunter_opportunity_id = ?`).get(opportunityId).count, 1);
+});
+
+test('P4B prior provider acceptance blocks ordinary generation without removing Pursue', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  db.prepare(`INSERT INTO deal_hunter_cim_requests
+    (id, created_at, updated_at, deal_key, recipient_email, status,
+     request_state, delivery_state, first_provider_accepted_at, metadata,
+     opportunity_id)
+    VALUES ('prior-accepted', ?, ?, 'deal:p4b-service', 'broker-p4b@example.test',
+      'sent', 'provider_accepted', 'accepted', ?, '{}', ?)`)
+    .run(now, now, now, opportunityId);
+  const result = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(result.enrollment.state, 'action-required');
+  assert.equal(result.enrollment.reason_code, 'prior_provider_accepted');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_owner_decision_events').get().count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns').get().count, 0);
+});
+
+test('P4B absent current permission stays waiting and creates no campaign', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  await storage.withdrawCimCapabilityActivation({ id: 'p4b-enrollment',
+    actor: 'fixture-owner', reason: 'synthetic withdrawal', now });
+  const result = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(result.enrollment.state, 'waiting-on-eligibility');
+  assert.equal(result.enrollment.reason_code, 'contact_permission_missing');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns').get().count, 0);
+});
+
+test('P4B changed timezone blocks allocation', async (t) => {
+  const fixture = await seedP4bEligibleFixture(t);
+  const { storage, db, opportunityId, now, decision } = fixture;
+  await storage.appendOpportunityTimezoneRevision({ opportunityId,
+    expectedPriorRevision: 1, idempotencyKey: 'p4b-timezone-missing', state: 'missing',
+    evidenceType: 'operator-verified', evidenceId: 'p4b-timezone-missing-evidence',
+    evidenceDigest: 'a'.repeat(64), resolverVersion: 'explicit-v1',
+    datasetDigest: 'b'.repeat(64), actor: 'fixture-owner', now });
+  const timezoneResult = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(timezoneResult.enrollment.reason_code, 'timezone_missing');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns').get().count, 0);
+});
+
+test('P4B materials already received block ordinary allocation', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  db.prepare(`UPDATE contact_submissions SET prospectus_url = 'https://broker.example/prospectus'
+    WHERE id = 'submission-p4b'`).run();
+  const result = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(result.enrollment.state, 'action-required');
+  assert.equal(result.enrollment.reason_code, 'materials_received');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns').get().count, 0);
+});
 
 test('P2 safety shadow accounts for a run without consuming or mutating it', async () => {
   let consumptions = 0;

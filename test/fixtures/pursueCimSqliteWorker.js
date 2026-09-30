@@ -2,13 +2,18 @@ import Database from 'better-sqlite3';
 import { createSqliteStorage } from '../../server/storage/sqlite.js';
 
 process.on('message', async ({ sqlitePath, mode, command }) => {
-  if (mode === 'owner-command' || mode === 'pre-provider-transition') {
+  if (mode === 'owner-command' || mode === 'pre-provider-transition'
+    || mode === 'campaign-allocation') {
     const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
     try {
       if (mode === 'owner-command') {
         const result = await storage.recordOwnerDecision(command);
         process.send?.({ ok: true, result: { applied: result.applied, replay: result.replay,
           conflict: result.conflict, decisionId: result.decision?.id ?? null } });
+      } else if (mode === 'campaign-allocation') {
+        const result = await storage.materializePursuitCampaign(command);
+        process.send?.({ ok: true, result: { applied: result.applied,
+          existing: result.existing, actionRequired: result.actionRequired } });
       } else {
         const { method, payload } = command;
         if (!['claimDueCimTouch', 'prepareCimTransmission',

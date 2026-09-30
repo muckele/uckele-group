@@ -335,6 +335,13 @@ const relationshipInventoryEntries = [
     reason: inertPursueCimAuthorityBlockingReason,
   }),
   ...relationshipEntries({
+    table: 'deal_hunter_crm_ownership_revisions',
+    columns: ['opportunity_id', 'submission_id'],
+    category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,
+    scannerPath: 'dependentState.records.pursueCimAuthorities',
+    reason: 'Nonbaseline CRM ownership history blocks the legacy canonical merge; null-owner cutover baselines have no selected submission.',
+  }),
+  ...relationshipEntries({
     table: 'deal_hunter_broker_conversations',
     columns: ['recipient_authority_id', 'rfc_thread_key'],
     category: CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY,

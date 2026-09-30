@@ -876,6 +876,7 @@ test('P1B campaign allocation is atomic and admits one active generation', async
   const database = new Database(sqlitePath);
   t.after(() => database.close());
   seedOpportunity(database, 'opp-campaign');
+  seedTriageScore(database, 'opp-campaign');
   const decision = await storage.recordOwnerDecision({
     opportunityId: 'opp-campaign', action: 'pursue', idempotencyKey: 'campaign-decision',
     expectedDiscoveryRevision: 0, expectedMaterialRevision: 0,
@@ -891,9 +892,11 @@ test('P1B campaign allocation is atomic and admits one active generation', async
     opportunityId: 'opp-campaign', enrollmentId: decision.enrollment.id,
     expectedEnrollmentRowVersion: 1, generation: 1,
     policyVersion: 'campaign-v1', templateVersion: 'template-v1', templateDigest: digest('c'),
-    permissionVersion: 'permission-v1', permissionDigest: digest('d'),
-    permissionRevision: 1, permissionScope: 'synthetic-cohort', canonicalRevision: 1,
+    permissionVersion: 'campaign-enrollment-activation', permissionDigest: digest('d'),
+    permissionRevision: 1, permissionScope: digest('e'), policyHash: digest('a'), canonicalRevision: 1,
     crmOwnershipRevision: 0, recipientAuthorityId: 'recipient-1',
+    campaignAuthorityRevision: 1,
+    globalAuthorityRevision: 1,
     recipientFingerprint: digest('e'), recipientAddress: 'broker@example.test',
     senderPolicyVersion: 'sender-v1', replyPolicyVersion: 'reply-v1',
     replyAliasTokenDigest: digest('f'), rfcThreadKey: 'thread-1',
@@ -910,21 +913,257 @@ test('P1B campaign allocation is atomic and admits one active generation', async
     id: 'campaign-safety-activation', capability: 'fl04a-safety' });
   await storage.recordCimCapabilityActivation({ ...activation,
     id: 'campaign-enrollment-activation', capability: 'fl04b-enrollment',
+    cohortDigest: digest('e'), permissionBasisDigest: digest('d'), permissionRevision: 1,
     prerequisiteActivationId: 'campaign-safety-activation', prerequisiteEvidenceId: 'synthetic-evidence',
     prerequisiteEvidenceHash: digest('c') });
   assert.equal((await storage.materializePursuitCampaign(command)).actionRequired, true);
   seedCrmOwner(database, 'opp-campaign', 'submission-campaign');
-  const ownedCommand = { ...command, crmSubmissionId: 'submission-campaign', crmOwnershipRevision: 1 };
-  const first = await storage.materializePursuitCampaign(ownedCommand);
-  assert.equal(first.applied, true);
+  const ownershipRevision = database.prepare(`SELECT revision
+    FROM deal_hunter_crm_ownership_revisions WHERE opportunity_id = 'opp-campaign'
+    ORDER BY revision DESC LIMIT 1`).get().revision;
+  const ownedCommand = { ...command, crmSubmissionId: 'submission-campaign',
+    crmBrokerEmail: null,
+    crmMatchAuthorityFingerprint: (await storage.readPursuitCrmMatchAuthorityFingerprint()),
+    crmOwnershipRevision: ownershipRevision,
+    campaignAuthorityRevision: database.prepare(`SELECT campaign_authority_revision AS revision
+      FROM deal_hunter_opportunities WHERE opportunity_id = 'opp-campaign'`).get().revision };
+  assert.equal((await storage.materializePursuitCampaign({ ...ownedCommand,
+    permissionDigest: digest('b') })).actionRequired, true);
+  assert.equal((await storage.materializePursuitCampaign({ ...ownedCommand,
+    crmOwnershipRevision: ownershipRevision - 1 })).actionRequired, true);
+  database.prepare(`INSERT INTO deal_hunter_opportunity_source_observations
+    (id, opportunity_id, source_id, source_name, source_record_id, field, value,
+     observed_at, created_at, updated_at)
+    VALUES ('source-drift', 'opp-campaign', 'sheet-0', 'Synthetic', 'row-1',
+      'broker_email', 'changed@example.test', ?, ?, ?)`)
+    .run(at, at, at);
+  assert.equal((await storage.materializePursuitCampaign(ownedCommand)).actionRequired, true,
+    'a recipient provenance write after the service snapshot must reject allocation');
+  database.prepare(`INSERT INTO deal_hunter_source_freshness_state
+    (source_id, projection_state) VALUES ('sheet-drift', 'pending')`).run();
+  assert.equal((await storage.materializePursuitCampaign({ ...ownedCommand,
+    campaignAuthorityRevision: database.prepare(`SELECT campaign_authority_revision AS revision
+      FROM deal_hunter_opportunities WHERE opportunity_id = 'opp-campaign'`).get().revision
+  })).actionRequired, true, 'a source-state write after the snapshot must reject allocation');
+  database.prepare(`UPDATE deal_hunter_source_freshness_state SET projection_state = 'accepted'
+    WHERE source_id = 'sheet-drift'`).run();
+  const currentCommand = { ...ownedCommand,
+    campaignAuthorityRevision: database.prepare(`SELECT campaign_authority_revision AS revision
+      FROM deal_hunter_opportunities WHERE opportunity_id = 'opp-campaign'`).get().revision,
+    globalAuthorityRevision: database.prepare(`SELECT revision FROM deal_hunter_cim_global_authority
+      WHERE id = 'global'`).get().revision };
+  database.prepare(`INSERT INTO deal_hunter_opportunity_facts
+    (id, opportunity_id, field, value, source, verified, actor, created_at, updated_at)
+    VALUES ('fact-drift', 'opp-campaign', 'broker_email', 'fact@example.test',
+      'operator', 1, 'fixture-owner', ?, ?)`).run(at, at);
+  assert.equal((await storage.materializePursuitCampaign(currentCommand)).actionRequired, true,
+    'verified contact provenance must invalidate the earlier allocation snapshot');
+  database.prepare(`DELETE FROM deal_hunter_opportunity_facts WHERE id = 'fact-drift'`).run();
+  currentCommand.campaignAuthorityRevision = database.prepare(`SELECT campaign_authority_revision AS revision
+    FROM deal_hunter_opportunities WHERE opportunity_id = 'opp-campaign'`).get().revision;
+  database.prepare(`UPDATE contact_submissions SET broker_email = 'changed@example.test'
+    WHERE id = 'submission-campaign'`).run();
+  assert.equal((await storage.materializePursuitCampaign(currentCommand)).actionRequired, true,
+    'linked CRM recipient changes must invalidate the allocation snapshot');
+  currentCommand.crmBrokerEmail = 'changed@example.test';
+  currentCommand.crmMatchAuthorityFingerprint = await storage.readPursuitCrmMatchAuthorityFingerprint();
+  currentCommand.campaignAuthorityRevision = database.prepare(`SELECT campaign_authority_revision AS revision
+    FROM deal_hunter_opportunities WHERE opportunity_id = 'opp-campaign'`).get().revision;
+  database.prepare(`INSERT INTO email_suppressions
+    (id, normalized_email, reason, source, created_at, created_by)
+    VALUES ('suppression-drift', 'broker@example.test', 'admin-block',
+      'fixture', ?, 'fixture-owner')`).run(at);
+  assert.ok(database.prepare(`SELECT revision FROM deal_hunter_cim_global_authority
+    WHERE id = 'global'`).get().revision > currentCommand.globalAuthorityRevision,
+  'a suppression write must invalidate an already-read campaign authority');
+  assert.equal((await storage.materializePursuitCampaign(currentCommand)).actionRequired, true);
+  database.prepare(`DELETE FROM email_suppressions WHERE id = 'suppression-drift'`).run();
+  currentCommand.globalAuthorityRevision = database.prepare(`SELECT revision
+    FROM deal_hunter_cim_global_authority WHERE id = 'global'`).get().revision;
+  database.prepare(`INSERT INTO deal_hunter_cim_requests
+    (id, created_at, updated_at, deal_key, recipient_email, status,
+     request_state, delivery_state, metadata, opportunity_id)
+    VALUES ('uncertain-request', ?, ?, 'deal:opp-campaign', 'broker@example.test',
+      'ambiguous', 'provider_unknown', 'unknown', '{}', 'opp-campaign')`).run(at, at);
+  assert.equal((await storage.materializePursuitCampaign(currentCommand)).actionRequired, true,
+    'new ambiguous provider authority must block ordinary allocation');
+  database.prepare(`DELETE FROM deal_hunter_cim_requests WHERE id = 'uncertain-request'`).run();
+  currentCommand.globalAuthorityRevision = database.prepare(`SELECT revision
+    FROM deal_hunter_cim_global_authority WHERE id = 'global'`).get().revision;
+  const staleOwnershipRevision = currentCommand.crmOwnershipRevision;
+  database.prepare(`UPDATE deal_hunter_opportunities SET primary_submission_id = NULL
+    WHERE opportunity_id = 'opp-campaign'`).run();
+  assert.equal((await storage.materializePursuitCampaign(currentCommand)).actionRequired, true,
+    'a changed canonical primary must reject the stale ownership revision');
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns`).get().count, 0);
+  database.prepare(`UPDATE deal_hunter_opportunities SET primary_submission_id = 'submission-campaign'
+    WHERE opportunity_id = 'opp-campaign'`).run();
+  currentCommand.crmOwnershipRevision = database.prepare(`SELECT revision
+    FROM deal_hunter_crm_ownership_revisions WHERE opportunity_id = 'opp-campaign'
+    ORDER BY revision DESC LIMIT 1`).get().revision;
+  currentCommand.campaignAuthorityRevision = database.prepare(`SELECT campaign_authority_revision
+    FROM deal_hunter_opportunities WHERE opportunity_id = 'opp-campaign'`).get().campaign_authority_revision;
+  assert.ok(currentCommand.crmOwnershipRevision > staleOwnershipRevision);
+  database.prepare(`INSERT INTO contact_submissions
+    (id, created_at, updated_at, status, delivery_provider, delivery_status,
+     crm_status, source, ip_hash, name, email, message)
+    VALUES ('new-crm-candidate', ?, ?, 'open', 'none', 'not-attempted',
+      'active', 'synthetic', 'synthetic-ip', 'Other CRM candidate',
+      'other@example.test', 'Authority race')`).run(at, at);
+  assert.equal((await storage.materializePursuitCampaign(currentCommand)).actionRequired, true,
+    'a new CRM candidate after the match snapshot must reject allocation');
+  assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns`).get().count, 0);
+  database.prepare(`DELETE FROM contact_submissions WHERE id = 'new-crm-candidate'`).run();
+  currentCommand.crmMatchAuthorityFingerprint = await storage.readPursuitCrmMatchAuthorityFingerprint();
+  database.prepare(`UPDATE deal_hunter_opportunity_scores SET operator_priority = 'normal'
+    WHERE opportunity_id = 'opp-campaign'`).run();
+  assert.equal((await storage.materializePursuitCampaign(currentCommand)).actionRequired, true,
+    'an owner score changed after the final Broker Materials read must reject allocation');
+  database.prepare(`UPDATE deal_hunter_opportunity_scores SET operator_priority = 'high'
+    WHERE opportunity_id = 'opp-campaign'`).run();
+  for (const [name, table, condition] of [
+    ['conversation', 'deal_hunter_broker_conversations', '1 = 1'],
+    ['campaign', 'deal_hunter_cim_campaigns', '1 = 1'],
+    ['touch', 'deal_hunter_cim_campaign_touches', '1 = 1'],
+    ['audit', 'deal_hunter_cim_audit_events', "NEW.event_type = 'touch-created'"],
+  ]) {
+    database.exec(`CREATE TRIGGER p4b_abort_${name} BEFORE INSERT ON ${table}
+      WHEN ${condition} BEGIN SELECT RAISE(ABORT, 'injected ${name} failure'); END;`);
+    await assert.rejects(storage.materializePursuitCampaign(currentCommand), /injected/);
+    for (const affected of ['deal_hunter_broker_conversations', 'deal_hunter_cim_campaigns',
+      'deal_hunter_cim_campaign_touches']) assert.equal(database.prepare(`SELECT COUNT(*) AS count
+        FROM ${affected}`).get().count, 0, `${name} rollback left ${affected}`);
+    assert.equal(database.prepare(`SELECT state FROM deal_hunter_pursuit_enrollments WHERE id = ?`)
+      .get(decision.enrollment.id).state, 'queued');
+    database.exec(`DROP TRIGGER p4b_abort_${name}`);
+  }
+  const concurrent = await Promise.all([
+    transitionFromWorker(sqlitePath, 'campaign-allocation', currentCommand),
+    transitionFromWorker(sqlitePath, 'campaign-allocation', currentCommand),
+  ]);
+  assert.deepEqual(concurrent.map((result) => result.applied).sort(), [false, true]);
+  assert.equal(concurrent.filter((result) => result.existing).length, 1);
+  const first = await storage.materializePursuitCampaign(currentCommand);
+  assert.equal(first.existing, true);
   assert.equal(first.campaign.state, 'initial-pending');
   assert.equal(first.initialTouch.state, 'scheduled');
-  assert.equal((await storage.materializePursuitCampaign(ownedCommand)).existing, true);
-  assert.equal((await storage.materializePursuitCampaign({ ...ownedCommand, generation: 2 })).actionRequired, true);
+  assert.equal((await storage.materializePursuitCampaign(currentCommand)).existing, true);
+  assert.equal((await storage.materializePursuitCampaign({ ...currentCommand, generation: 2 })).actionRequired, true);
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaigns').get().count, 1);
   assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches').get().count, 1);
   assert.equal(database.prepare('SELECT state FROM deal_hunter_pursuit_enrollments WHERE id = ?').get(decision.enrollment.id).state,
     'campaign-created');
+  database.prepare(`INSERT INTO email_suppressions
+    (id, normalized_email, reason, source, created_at, created_by)
+    VALUES ('replay-suppression', 'broker@example.test', 'admin-block',
+      'fixture', ?, 'fixture-owner')`).run(at);
+  assert.equal((await storage.materializePursuitCampaign(currentCommand)).actionRequired, true,
+    'an existing campaign replay must revalidate non-CRM suppression authority');
+  database.prepare(`DELETE FROM email_suppressions WHERE id = 'replay-suppression'`).run();
+  currentCommand.globalAuthorityRevision = database.prepare(`SELECT revision
+    FROM deal_hunter_cim_global_authority WHERE id = 'global'`).get().revision;
+  assert.equal((await storage.materializePursuitCampaign(currentCommand)).existing, true);
+  database.prepare(`UPDATE contact_submissions SET status = 'archived'
+    WHERE id = 'submission-campaign'`).run();
+  assert.equal((await storage.materializePursuitCampaign(currentCommand)).actionRequired, true,
+    'an existing campaign replay cannot claim current CRM authority after archival');
+});
+
+test('P4B a new Pursue choice supersedes action-required enrollment with immutable selected digest', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-recipient-retry');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  seedOpportunity(database, 'opp-recipient-retry');
+  seedTriageScore(database, 'opp-recipient-retry');
+  const first = await storage.recordOwnerDecision({ opportunityId: 'opp-recipient-retry',
+    action: 'pursue', idempotencyKey: 'recipient-retry-first', actor: 'fixture-owner',
+    policyVersion: 'owner-v1', now: at, expectedDiscoveryRevision: 0,
+    expectedMaterialRevision: 0 });
+  const stopped = await storage.transitionPursuitEnrollment({ enrollmentId: first.enrollment.id,
+    expectedRowVersion: first.enrollment.row_version, nextState: 'action-required',
+    reasonCode: 'recipient_ambiguous', actor: 'fixture-owner', now: at });
+  assert.equal(stopped.applied, true);
+  const retry = await storage.recordOwnerDecision({ opportunityId: 'opp-recipient-retry',
+    action: 'pursue', idempotencyKey: 'recipient-retry-choice', actor: 'fixture-owner',
+    policyVersion: 'owner-v1', now: at, expectedDiscoveryRevision: 0,
+    expectedMaterialRevision: 0, selectedContactReferenceDigest: digest('a') });
+  assert.equal(retry.applied, true);
+  assert.notEqual(retry.decision.id, first.decision.id);
+  assert.equal(retry.decision.selected_contact_reference_digest, digest('a'));
+  assert.equal(retry.enrollment.state, 'queued');
+  assert.equal(database.prepare(`SELECT state FROM deal_hunter_pursuit_enrollments WHERE id = ?`)
+    .get(first.enrollment.id).state, 'superseded');
+});
+
+test('P4B a queued Pursue choice creates a new bound decision before orchestration', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-queued-choice');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  seedOpportunity(database, 'opp-queued-choice');
+  seedTriageScore(database, 'opp-queued-choice');
+  const first = await storage.recordOwnerDecision({ opportunityId: 'opp-queued-choice',
+    action: 'pursue', idempotencyKey: 'queued-choice-first', actor: 'fixture-owner',
+    policyVersion: 'owner-v1', now: at, expectedDiscoveryRevision: 0,
+    expectedMaterialRevision: 0 });
+  const chosen = await storage.recordOwnerDecision({ opportunityId: 'opp-queued-choice',
+    action: 'pursue', idempotencyKey: 'queued-choice-selected', actor: 'fixture-owner',
+    policyVersion: 'owner-v1', now: at, expectedDiscoveryRevision: 0,
+    expectedMaterialRevision: 0, selectedContactReferenceDigest: digest('a') });
+  assert.equal(chosen.applied, true);
+  assert.equal(chosen.decision.selected_contact_reference_digest, digest('a'));
+  assert.equal(chosen.enrollment.state, 'queued');
+  assert.equal(database.prepare(`SELECT state FROM deal_hunter_pursuit_enrollments
+    WHERE id = ?`).get(first.enrollment.id).state, 'superseded');
+});
+
+test('P4B CRM ownership revisions track only canonical primary selection', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-crm-ownership');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  seedOpportunity(database, 'opp-crm-ownership');
+  const readHistory = () => database.prepare(`SELECT revision, submission_id
+    FROM deal_hunter_crm_ownership_revisions WHERE opportunity_id = 'opp-crm-ownership'
+    ORDER BY revision`).all();
+  assert.deepEqual(readHistory(), [{ revision: 1, submission_id: null }]);
+  seedCrmOwner(database, 'opp-crm-ownership', 'submission-ownership');
+  assert.deepEqual(readHistory(), [{ revision: 1, submission_id: null },
+    { revision: 2, submission_id: 'submission-ownership' }]);
+  database.prepare(`UPDATE contact_submissions SET deal_hunter_opportunity_id = NULL
+    WHERE id = 'submission-ownership'`).run();
+  assert.equal(readHistory().length, 2, 'backlink drift does not select a new primary');
+  database.prepare(`UPDATE contact_submissions SET deal_hunter_opportunity_id = 'opp-crm-ownership',
+    metadata = '{"dealHunter":{"opportunityId":"wrong-opportunity"}}'
+    WHERE id = 'submission-ownership'`).run();
+  assert.equal(readHistory().length, 2, 'metadata drift does not select a new primary');
+  database.prepare(`UPDATE contact_submissions SET metadata =
+    '{"dealHunter":{"opportunityId":"opp-crm-ownership"}}'
+    WHERE id = 'submission-ownership'`).run();
+  assert.equal(readHistory().length, 2, 'metadata correction does not select a new primary');
+  database.prepare(`UPDATE contact_submissions SET status = 'archived'
+    WHERE id = 'submission-ownership'`).run();
+  assert.equal(readHistory().length, 2);
+  database.prepare(`UPDATE deal_hunter_opportunities SET primary_submission_id = primary_submission_id
+    WHERE opportunity_id = 'opp-crm-ownership'`).run();
+  assert.equal(readHistory().length, 2);
+  database.prepare(`UPDATE deal_hunter_opportunities SET primary_submission_id = NULL
+    WHERE opportunity_id = 'opp-crm-ownership'`).run();
+  assert.deepEqual(readHistory().at(-1), { revision: 3, submission_id: null });
+  database.prepare(`UPDATE contact_submissions SET deal_hunter_opportunity_id = NULL
+    WHERE id = 'submission-ownership'`).run();
+  assert.equal(readHistory().length, 3);
+  seedCrmOwner(database, 'opp-crm-ownership', 'submission-replacement');
+  assert.deepEqual(readHistory().at(-1),
+    { revision: 4, submission_id: 'submission-replacement' });
+  database.prepare(`UPDATE deal_hunter_opportunities SET primary_submission_id = 'submission-ownership'
+    WHERE opportunity_id = 'opp-crm-ownership'`).run();
+  assert.deepEqual(readHistory().at(-1),
+    { revision: 5, submission_id: 'submission-ownership' });
 });
 
 test('P1B capability activation requires the current prerequisite chain and audits once', async (t) => {

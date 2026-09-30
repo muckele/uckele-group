@@ -1215,6 +1215,30 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
   return {
     provider: 'supabase',
 
+    async readPursuitEnrollmentAuthority({ opportunityId, now }) {
+      const [timezoneResult, activationIdResult, globalResult] = await Promise.all([
+        client.from('deal_hunter_opportunity_timezone_revisions').select('*')
+          .eq('opportunity_id', opportunityId).order('revision', { ascending: false })
+          .limit(1).maybeSingle(),
+        client.rpc('pursue_cim_current_activation_v1', {
+          p_capability: 'fl04b-enrollment', p_now: now,
+        }),
+        client.from('deal_hunter_cim_global_authority').select('revision')
+          .eq('id', 'global').single(),
+      ]);
+      if (timezoneResult.error) throw timezoneResult.error;
+      if (activationIdResult.error) throw activationIdResult.error;
+      if (globalResult.error) throw globalResult.error;
+      const activationResult = activationIdResult.data
+        ? await client.from('deal_hunter_cim_capability_activations').select('*')
+          .eq('id', activationIdResult.data).single()
+        : { data: null, error: null };
+      if (activationResult.error) throw activationResult.error;
+      return { timezone: timezoneResult.data,
+        globalAuthorityRevision: Number(globalResult.data.revision),
+        activation: activationResult.data };
+    },
+
     async transitionPursuitEnrollment(command) {
       const { data, error } = await client.rpc('pursue_cim_transition_enrollment_v1', {
         p_command: command,
@@ -1362,7 +1386,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     async materializePursuitCampaign(command) {
-      const { data, error } = await client.rpc('pursue_cim_materialize_campaign_v1', {
+      const { data, error } = await client.rpc('pursue_cim_materialize_campaign_v2', {
         p_command: command,
       });
       if (error) throw error;
@@ -3789,6 +3813,21 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         .maybeSingle();
       if (error) throw error;
       return normalizeDealHunterOpportunityRow(data);
+    },
+
+    async readCanonicalCrmOwnershipRevision(opportunityId) {
+      if (!opportunityId) return null;
+      const { data, error } = await client.from('deal_hunter_crm_ownership_revisions')
+        .select('revision,submission_id').eq('opportunity_id', String(opportunityId).trim())
+        .order('revision', { ascending: false }).limit(1).maybeSingle();
+      if (error) throw error;
+      return data || null;
+    },
+
+    async readPursuitCrmMatchAuthorityFingerprint() {
+      const { data, error } = await client.rpc('pursue_cim_crm_match_fingerprint_v1');
+      if (error) throw error;
+      return typeof data === 'string' && /^[a-f0-9]{32}$/.test(data) ? data : null;
     },
 
     async getLatestDealHunterMaterialChange({ opportunityId, materialRevision } = {}) {

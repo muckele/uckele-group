@@ -189,7 +189,8 @@ test('V3 apply authority detects unrelated authoritative row drift', async (t) =
     SET value = ? WHERE id = ?`).run('changed unrelated value', 'v3-apply-unrelated'));
   const after = await inspect(fixture);
   assert.notEqual(after.database.authorityLogicalDigest, before.database.authorityLogicalDigest);
-  assert.deepEqual(after.rawRows, before.rawRows);
+  assert.notDeepEqual(after.rawRows, before.rawRows,
+    'source authority drift also advances the canonical opportunity campaign revision');
   assert.notEqual(plannedChecksum(fixture, after), plannedChecksum(fixture, before));
 });
 

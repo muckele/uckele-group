@@ -811,6 +811,8 @@ test('Garage apply moves one alias and preserves observations, scores, evidence,
   const dryRun = await runCanonicalOpportunityMergeRepair(garageRepairInput({ storage: fixture.storage }));
   const forbiddenBefore = snapshotGarageTables(fixture.sqlitePath);
   const survivorBefore = garageOpportunity(garageSurvivorId);
+  const campaignRevisionBefore = (await fixture.storage.getDealHunterOpportunity(garageSurvivorId))
+    .campaign_authority_revision;
 
   const applied = await runCanonicalOpportunityMergeRepair(
     garageApplyInput(fixture.storage, dryRun.planChecksum),
@@ -845,6 +847,7 @@ test('Garage apply moves one alias and preserves observations, scores, evidence,
     discovery_state: 'untracked_legacy',
     discovery_revision: 0,
     material_revision: 0,
+    campaign_authority_revision: campaignRevisionBefore + 1,
     last_material_change_at: null,
   });
   assert.equal(loser.status, 'superseded');
@@ -3036,7 +3039,7 @@ test('relationship inventory classifies the exact supersession relationship surf
 test('relationship inventory classifies every reviewed omission exactly once in all four categories', () => {
   const entries = CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_INVENTORY.entries;
   const keys = entries.map((entry) => `${entry.table}.${entry.column}`);
-  assert.equal(entries.length, 308);
+  assert.equal(entries.length, 310);
   assert.equal(new Set(keys).size, keys.length);
   assert.deepEqual(
     [...new Set(entries.map((entry) => entry.category))].sort(),
@@ -3048,7 +3051,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
       entries.filter((entry) => entry.category === category).length,
     ])),
     {
-      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 150,
+      [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.BLOCKING_ENTITY_DEPENDENCY]: 152,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.REDUNDANT_THROUGH_SCANNED_PARENT]: 66,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.PRESERVED_GLOBAL_RECIPIENT_OPERATIONAL_STATE]: 54,
       [CANONICAL_OPPORTUNITY_MERGE_RELATIONSHIP_CATEGORIES.EXPLICITLY_IRRELEVANT_EXCLUDED]: 38,
@@ -3065,7 +3068,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
       entries.filter((entry) => entry.enforcement === enforcement).length,
     ])),
     {
-      [materialScannerPathEnforcement]: 260,
+      [materialScannerPathEnforcement]: 262,
       [independentGateEnforcement]: 10,
       [approvalPreconditionEnforcement]: 12,
       [explicitExclusionEnforcement]: 26,
@@ -3082,11 +3085,12 @@ test('relationship inventory classifies every reviewed omission exactly once in 
     [...new Set(optionalLegacyEntries.map((entry) => entry.table))].sort(),
     ['admin_magic_links_legacy_v1', 'deal_hunter_candidates', 'prospect_discoveries'],
   );
-  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 301);
+  assert.equal(entries.filter((entry) => entry.schemaPresence === 'required').length, 303);
   const pursueCimTables = new Set([
     'deal_hunter_owner_decision_events',
     'deal_hunter_pursuit_enrollments',
     'deal_hunter_opportunity_timezone_revisions',
+    'deal_hunter_crm_ownership_revisions',
     'deal_hunter_broker_conversations',
     'deal_hunter_cim_campaigns',
     'deal_hunter_cim_campaign_touches',
@@ -3099,7 +3103,7 @@ test('relationship inventory classifies every reviewed omission exactly once in 
     'deal_hunter_cim_live_provider_authorizations',
   ]);
   const pursueCimEntries = entries.filter((entry) => pursueCimTables.has(entry.table));
-  assert.equal(pursueCimEntries.length, 52);
+  assert.equal(pursueCimEntries.length, 54);
   for (const entry of pursueCimEntries) {
     assert.equal(
       entry.category,
@@ -3179,8 +3183,8 @@ test('relationship inventory checksum is deterministic over the complete presenc
   const first = canonicalOpportunityMergeRelationshipInventorySummary();
   const second = canonicalOpportunityMergeRelationshipInventorySummary();
   assert.deepEqual(first, second);
-  assert.equal(first.entryCount, 308);
-  assert.equal(first.checksum, 'e0f3204d5ec775d606dd061bb961eca9c435eeaf717ff2e15522ff1d5d540f7a');
+  assert.equal(first.entryCount, 310);
+  assert.equal(first.checksum, 'd08924bb9a3c688ec3cb141d1bec911dc5371f7cc9f9d861458f3a3d77409d0e');
   assert.equal(
     first.checksum,
     createHash('sha256')

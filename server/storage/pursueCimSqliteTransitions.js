@@ -165,8 +165,19 @@ function deterministicUuid(...parts) {
   return `${value.slice(0, 8)}-${value.slice(8, 12)}-${value.slice(12, 16)}-${value.slice(16, 20)}-${value.slice(20, 32)}`;
 }
 
-export function createPursueCimSqliteTransitions(database, { applyPass } = {}) {
+export function createPursueCimSqliteTransitions(database, { applyPass, readCrmMatchAuthorityFingerprint } = {}) {
   return {
+    async readPursuitEnrollmentAuthority({ opportunityId, now }) {
+      const id = requiredText(opportunityId, 'opportunityId', 200);
+      const at = requiredInstant(now);
+      return {
+        timezone: database.prepare(`SELECT * FROM deal_hunter_opportunity_timezone_revisions
+          WHERE opportunity_id = ? ORDER BY revision DESC LIMIT 1`).get(id) ?? null,
+        activation: currentActivationChain(database, 'fl04b-enrollment', at),
+        globalAuthorityRevision: database.prepare(`SELECT revision FROM deal_hunter_cim_global_authority
+          WHERE id = 'global'`).get()?.revision,
+      };
+    },
     async withdrawCimCapabilityActivation(command) {
       const id = requiredText(command.id, 'id');
       const actor = requiredText(command.actor, 'actor', 200);
@@ -1470,10 +1481,11 @@ export function createPursueCimSqliteTransitions(database, { applyPass } = {}) {
       const actor = requiredText(command.actor, 'actor', 200);
       const now = requiredInstant(command.now);
       for (const name of ['templateDigest', 'permissionDigest', 'recipientFingerprint',
-        'replyAliasTokenDigest', 'freshnessAuthorityDigest']) {
+        'replyAliasTokenDigest', 'freshnessAuthorityDigest', 'policyHash']) {
         if (!/^[0-9a-f]{64}$/.test(command[name])) throw new Error(`Invalid ${name}`);
       }
       for (const name of ['permissionRevision', 'canonicalRevision', 'crmOwnershipRevision',
+        'campaignAuthorityRevision', 'globalAuthorityRevision',
         'expectedDiscoveryRevision', 'expectedMaterialRevision', 'timezoneRevision']) {
         requiredRevision(command[name], name);
       }
@@ -1491,7 +1503,76 @@ export function createPursueCimSqliteTransitions(database, { applyPass } = {}) {
             && current.permission_digest === command.permissionDigest
             && current.recipient_fingerprint === command.recipientFingerprint
             && current.timezone_revision === command.timezoneRevision;
-          return { applied: false, existing: same, actionRequired: !same,
+          const owner = database.prepare(`SELECT revision, submission_id
+            FROM deal_hunter_crm_ownership_revisions WHERE opportunity_id = ?
+            ORDER BY revision DESC LIMIT 1`).get(opportunityId);
+          const opportunity = database.prepare(`SELECT * FROM deal_hunter_opportunities
+            WHERE opportunity_id = ?`).get(opportunityId);
+          const crm = command.crmSubmissionId ? database.prepare(`SELECT * FROM contact_submissions
+            WHERE id = ?`).get(command.crmSubmissionId) : null;
+          const score = database.prepare(`SELECT * FROM deal_hunter_opportunity_scores
+            WHERE opportunity_id = ?`).get(opportunityId);
+          const activation = currentActivationChain(database, 'fl04b-enrollment', now);
+          const global = database.prepare(`SELECT revision FROM deal_hunter_cim_global_authority
+            WHERE id = 'global'`).get();
+          const timezone = database.prepare(`SELECT * FROM deal_hunter_opportunity_timezone_revisions
+            WHERE opportunity_id = ? ORDER BY revision DESC LIMIT 1`).get(opportunityId);
+          const enrollment = database.prepare(`SELECT * FROM deal_hunter_pursuit_enrollments
+            WHERE id = ?`).get(enrollmentId);
+          const decision = enrollment && database.prepare(`SELECT * FROM deal_hunter_owner_decision_events
+            WHERE id = ?`).get(enrollment.decision_event_id);
+          let metadataOwner;
+          try { metadataOwner = JSON.parse(crm?.metadata || '{}')?.dealHunter?.opportunityId; }
+          catch { metadataOwner = 'invalid'; }
+          const authorityStillCurrent = owner?.revision === command.crmOwnershipRevision
+            && owner?.submission_id === command.crmSubmissionId
+            && opportunity?.primary_submission_id === command.crmSubmissionId
+            && opportunity?.status === 'active' && crm?.deal_hunter_opportunity_id === opportunityId
+            && !crm?.archived_at && !['archived', 'spam'].includes(crm?.status)
+            && (crm?.broker_email ?? null) === command.crmBrokerEmail
+            && (!metadataOwner || metadataOwner === opportunityId)
+            && !database.prepare(`SELECT 1 FROM crm_submission_supersessions
+              WHERE superseded_submission_id = ? AND status = 'active' LIMIT 1`).get(crm?.id)
+            && command.crmMatchAuthorityFingerprint === readCrmMatchAuthorityFingerprint?.()
+            && opportunity.campaign_authority_revision === command.campaignAuthorityRevision
+            && opportunity.discovery_revision === command.expectedDiscoveryRevision
+            && opportunity.material_revision === command.expectedMaterialRevision
+            && global?.revision === command.globalAuthorityRevision
+            && score?.operator_priority === 'high' && Boolean(score.reviewed_at)
+            && !score.should_remove && Boolean(score.current_triage_eligible)
+            && (score.reviewed_semantic_digest
+              ? score.reviewed_semantic_digest === score.semantic_digest
+              : !score.reviewed_fingerprint || score.reviewed_fingerprint === score.score_fingerprint)
+            && activation?.id === permissionVersion
+            && activation.permission_basis_digest === command.permissionDigest
+            && activation.permission_revision === command.permissionRevision
+            && activation.cohort_digest === permissionScope
+            && activation.policy_hash === command.policyHash
+            && timezone?.revision === command.timezoneRevision
+            && ['verified', 'derived'].includes(timezone?.state)
+            && enrollment?.state === 'campaign-created'
+            && enrollment.opportunity_id === opportunityId && decision?.action === 'pursue'
+            && !database.prepare(`SELECT 1 FROM deal_hunter_source_freshness_state
+              WHERE projection_state IN ('pending', 'deferred', 'superseded') LIMIT 1`).get()
+            && !database.prepare(`SELECT 1 FROM deal_hunter_identity_exceptions
+              WHERE status = 'open' LIMIT 1`).get()
+            && !database.prepare(`SELECT 1 FROM deal_hunter_cim_requests
+              WHERE opportunity_id = ? OR deal_key IN (SELECT deal_key
+                FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?) LIMIT 1`)
+              .get(opportunityId, opportunityId)
+            && !database.prepare(`SELECT 1 FROM deal_hunter_cim_opportunity_claims
+              WHERE opportunity_id = ? LIMIT 1`).get(opportunityId)
+            && !database.prepare(`SELECT 1 FROM email_suppressions
+              WHERE normalized_email = lower(?) AND lifted_at IS NULL LIMIT 1`).get(recipientAddress)
+            && !crm.prospectus_url
+            && !database.prepare(`SELECT 1 FROM secure_documents
+              WHERE submission_id = ? LIMIT 1`).get(crm.id)
+            && !database.prepare(`SELECT 1 FROM secure_upload_requests
+              WHERE submission_id = ? AND status IN ('completed', 'documents-received') LIMIT 1`).get(crm.id)
+            && !database.prepare(`SELECT 1 FROM crm_communications
+              WHERE submission_id = ? AND direction = 'inbound' LIMIT 1`).get(crm.id);
+          return { applied: false, existing: same && authorityStillCurrent,
+            actionRequired: !same || !authorityStillCurrent,
             campaign: current, initialTouch: database.prepare(`
               SELECT * FROM deal_hunter_cim_campaign_touches
               WHERE campaign_id = ? AND logical_slot = 'initial'
@@ -1509,27 +1590,79 @@ export function createPursueCimSqliteTransitions(database, { applyPass } = {}) {
           SELECT * FROM deal_hunter_opportunity_timezone_revisions
           WHERE opportunity_id = ? ORDER BY revision DESC LIMIT 1
         `).get(opportunityId);
-        const legacyConflict = database.prepare(`
+        const priorOutreach = database.prepare(`
           SELECT 1 FROM deal_hunter_cim_requests WHERE opportunity_id = ?
-            AND (delivery_state IN ('accepted', 'ambiguous') OR request_state IN ('provider_pending', 'provider_accepted'))
+            OR deal_key IN (SELECT deal_key FROM deal_hunter_opportunity_scores
+              WHERE opportunity_id = ?)
           LIMIT 1
-        `).get(opportunityId);
+        `).get(opportunityId, opportunityId);
+        const priorClaim = database.prepare(`SELECT 1 FROM deal_hunter_cim_opportunity_claims
+          WHERE opportunity_id = ? LIMIT 1`).get(opportunityId);
+        const suppressed = database.prepare(`SELECT 1 FROM email_suppressions
+          WHERE normalized_email = lower(?) AND lifted_at IS NULL LIMIT 1`).get(recipientAddress);
         const crmOwner = command.crmSubmissionId ? database.prepare(`
           SELECT * FROM contact_submissions WHERE id = ?
         `).get(command.crmSubmissionId) : null;
-        if (!currentActivationChain(database, 'fl04b-enrollment', now)
+        const currentScore = database.prepare(`SELECT * FROM deal_hunter_opportunity_scores
+          WHERE opportunity_id = ?`).get(opportunityId);
+        const ownership = database.prepare(`SELECT revision, submission_id
+          FROM deal_hunter_crm_ownership_revisions WHERE opportunity_id = ?
+          ORDER BY revision DESC LIMIT 1`).get(opportunityId);
+        const activation = currentActivationChain(database, 'fl04b-enrollment', now);
+        const globalAuthority = database.prepare(`SELECT revision FROM deal_hunter_cim_global_authority
+          WHERE id = 'global'`).get();
+        if (!activation || activation.id !== permissionVersion
+          || activation.permission_basis_digest !== command.permissionDigest
+          || activation.permission_revision !== command.permissionRevision
+          || activation.cohort_digest !== permissionScope
+          || activation.policy_hash !== command.policyHash
           || !enrollment || enrollment.opportunity_id !== opportunityId
           || !['queued', 'waiting-on-eligibility'].includes(enrollment.state)
           || enrollment.row_version !== expectedEnrollmentRowVersion
           || !decision || decision.action !== 'pursue'
+          || !currentScore || currentScore.operator_priority !== 'high'
+          || !currentScore.reviewed_at || currentScore.should_remove
+          || !currentScore.current_triage_eligible
+          || (currentScore.reviewed_semantic_digest
+            ? currentScore.reviewed_semantic_digest !== currentScore.semantic_digest
+            : Boolean(currentScore.reviewed_fingerprint)
+              && currentScore.reviewed_fingerprint !== currentScore.score_fingerprint)
           || !opportunity || opportunity.status !== 'active'
+          || ownership?.revision !== command.crmOwnershipRevision
+          || ownership?.submission_id !== command.crmSubmissionId
+          || !command.crmMatchAuthorityFingerprint
+          || command.crmMatchAuthorityFingerprint !== readCrmMatchAuthorityFingerprint?.()
+          || opportunity.campaign_authority_revision !== command.campaignAuthorityRevision
+          || globalAuthority?.revision !== command.globalAuthorityRevision
+          || database.prepare(`SELECT 1 FROM deal_hunter_source_freshness_state
+            WHERE projection_state IN ('pending', 'deferred', 'superseded') LIMIT 1`).get()
+          || database.prepare(`SELECT 1 FROM deal_hunter_identity_exceptions
+            WHERE status = 'open' LIMIT 1`).get()
           || opportunity.discovery_revision !== command.expectedDiscoveryRevision
           || opportunity.material_revision !== command.expectedMaterialRevision
           || timezone?.revision !== command.timezoneRevision
           || !['verified', 'derived'].includes(timezone.state)
           || !crmOwner || crmOwner.deal_hunter_opportunity_id !== opportunityId
           || crmOwner.archived_at || opportunity.primary_submission_id !== crmOwner.id
-          || legacyConflict) {
+          || ['archived', 'spam'].includes(crmOwner.status)
+          || (crmOwner.broker_email ?? null) !== command.crmBrokerEmail
+          || (database.prepare(`SELECT 1 FROM crm_submission_supersessions
+            WHERE superseded_submission_id = ? AND status = 'active' LIMIT 1`)
+            .get(crmOwner.id))
+          || (() => {
+            try {
+              const metadataOwner = JSON.parse(crmOwner.metadata || '{}')?.dealHunter?.opportunityId;
+              return Boolean(metadataOwner && metadataOwner !== opportunityId);
+            } catch { return true; }
+          })()
+          || priorOutreach || priorClaim || suppressed
+          || crmOwner.prospectus_url
+          || database.prepare(`SELECT 1 FROM secure_documents WHERE submission_id = ? LIMIT 1`)
+            .get(crmOwner.id)
+          || database.prepare(`SELECT 1 FROM secure_upload_requests WHERE submission_id = ?
+            AND status IN ('completed', 'documents-received') LIMIT 1`).get(crmOwner.id)
+          || database.prepare(`SELECT 1 FROM crm_communications WHERE submission_id = ?
+            AND direction = 'inbound' LIMIT 1`).get(crmOwner.id)) {
           return { applied: false, existing: false, actionRequired: true,
             campaign: null, initialTouch: null };
         }
@@ -1766,13 +1899,29 @@ export function createPursueCimSqliteTransitions(database, { applyPass } = {}) {
           JOIN deal_hunter_owner_decision_events d ON d.id = e.decision_event_id
           WHERE e.opportunity_id = ? AND e.state <> 'superseded'
         `).get(opportunityId);
-        if (current && action === 'pursue') {
+        const priorDecision = current && database.prepare(`SELECT * FROM deal_hunter_owner_decision_events
+          WHERE id = ?`).get(current.current_decision_id);
+        const retryChoice = action === 'pursue' && current
+          && (current.state === 'action-required'
+            || (['queued', 'waiting-on-eligibility'].includes(current.state)
+              && selectedContactReferenceDigest
+              && selectedContactReferenceDigest !== priorDecision?.selected_contact_reference_digest));
+        if (current && action === 'pursue' && !retryChoice) {
           return { applied: false, replay: false, conflict: false,
-            decision: database.prepare('SELECT * FROM deal_hunter_owner_decision_events WHERE id = ?')
-              .get(current.current_decision_id), enrollment: current };
+            decision: priorDecision, enrollment: current };
         }
         const decisionId = digest('owner-decision:v1', idempotencyKey);
         const enrollmentId = digest('pursuit-enrollment:v1', decisionId);
+        if (retryChoice) {
+          database.prepare(`UPDATE deal_hunter_pursuit_enrollments
+            SET state = 'superseded', reason_code = 'pursue-retried',
+              row_version = row_version + 1, updated_at = ?
+            WHERE id = ? AND state = ?`).run(now, current.id, current.state);
+          appendAudit(database, { eventType: 'enrollment-transition',
+            authorityId: `${current.id}:${current.row_version + 1}`,
+            opportunityId, priorState: current.state, nextState: 'superseded',
+            reasonCode: 'pursue-retried', actor, occurredAt: now });
+        }
         let passResult = null;
         if (action === 'pass') {
           if (typeof applyPass !== 'function') throw new Error('Atomic Pass authority is unavailable');

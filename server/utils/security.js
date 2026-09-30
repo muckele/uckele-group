@@ -71,7 +71,7 @@ export function signPayload(payload, secret) {
   return `${encodedPayload}.${signature}`;
 }
 
-export function verifySignedPayload(token, secret) {
+export function verifySignedPayload(token, secret, now = Date.now()) {
   if (!token || !secret) {
     return null;
   }
@@ -103,7 +103,7 @@ export function verifySignedPayload(token, secret) {
 
     if (
       Object.hasOwn(payload, 'exp') &&
-      (!Number.isFinite(payload.exp) || payload.exp <= Date.now())
+      (!Number.isFinite(payload.exp) || payload.exp <= now)
     ) {
       return null;
     }
