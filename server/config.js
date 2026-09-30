@@ -172,6 +172,10 @@ export function getConfig() {
     dealHunter: {
       recipient: process.env.DEAL_HUNTER_EMAIL_RECIPIENT || adminEmail,
       cronSecret: process.env.DEAL_HUNTER_CRON_SECRET || '',
+      cimProvider: {
+        enabled: process.env.DEAL_HUNTER_CIM_PROVIDER_ENABLED === 'true',
+        profile: process.env.DEAL_HUNTER_CIM_PROVIDER_PROFILE || '',
+      },
       sheetCsvUrls: listFromEnv(process.env.DEAL_HUNTER_SHEET_CSV_URLS || process.env.DEAL_HUNTER_SHEET_CSV_URL),
       // Airtable is retired from Deal Hunter. Keep the public configuration
       // field pinned off so an obsolete deployment variable cannot silently

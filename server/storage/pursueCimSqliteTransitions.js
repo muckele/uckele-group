@@ -1,7 +1,17 @@
 import { createHash } from 'node:crypto';
 
 import { sha256, stableCanonicalJson } from '../utils/security.js';
+import { buildCimProviderPayloadDigest } from '../utils/cimProviderPayload.js';
 import { evaluateAcquisitionMaterialsState } from '../services/acquisitionMaterials.js';
+
+const cimWriterCapabilities = new Map([
+  ['pursue-cim-initial', 'fl04b-initial'],
+  ['pursue-cim-autopilot-initial', 'fl04b-initial'],
+  ['pursue-cim-follow-up', 'fl04c-followup'],
+  ['pursue-cim-autopilot-follow-up', 'fl04c-followup'],
+  ['pursue-cim-batch', 'fl04c-batch'],
+  ['pursue-cim-autopilot-batch', 'fl04c-batch'],
+]);
 
 function digest(...parts) {
   const framed = parts.map((part) => {
@@ -662,8 +672,12 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
       const authorizationId = requiredText(command.authorizationId, 'authorizationId');
       const writerPath = requiredText(command.writerPath, 'writerPath');
       const providerProfile = requiredText(command.providerProfile, 'providerProfile', 120);
+      const capability = requiredText(command.capability, 'capability', 40);
+      const payloadDigest = requiredText(command.payloadDigest, 'payloadDigest', 64);
       const boundaryNonceDigest = requiredText(command.boundaryNonceDigest, 'boundaryNonceDigest', 64);
-      if (!/^[0-9a-f]{64}$/.test(boundaryNonceDigest)) throw new Error('Invalid boundary nonce digest');
+      if (![payloadDigest, boundaryNonceDigest].every((value) => /^[0-9a-f]{64}$/.test(value))) {
+        throw new Error('Invalid provider seam digest');
+      }
       const expectedRowVersion = requiredRevision(command.expectedRowVersion, 'expectedRowVersion');
       const actor = requiredText(command.actor, 'actor', 200);
       const now = requiredInstant(command.now);
@@ -677,14 +691,48 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         const pause = database.prepare(`
           SELECT outreach_paused FROM deal_hunter_cim_safety_settings WHERE id = 'global'
         `).get();
+        const activation = authorization
+          ? database.prepare(`SELECT * FROM deal_hunter_cim_capability_activations WHERE id = ?`)
+            .get(authorization.activation_id)
+          : null;
+        const communication = transmission
+          ? database.prepare(`SELECT * FROM crm_communications WHERE id = ?`)
+            .get(transmission.communication_id)
+          : null;
+        const outbox = transmission
+          ? database.prepare(`SELECT * FROM crm_email_outbox WHERE id = ?`)
+            .get(transmission.outbox_id)
+          : null;
+        const memberKinds = transmission ? database.prepare(`
+          SELECT t.kind FROM deal_hunter_cim_transmission_touches m
+          JOIN deal_hunter_cim_campaign_touches t ON t.id = m.touch_id
+          WHERE m.transmission_id = ? AND m.cancelled_at IS NULL ORDER BY t.id
+        `).all(transmissionId).map(({ kind }) => kind) : [];
+        const capabilityMatchesWork = capability === 'fl04c-batch'
+          ? memberKinds.length > 1
+          : memberKinds.length === 1 && (capability === 'fl04b-initial'
+            ? memberKinds[0] === 'initial' : memberKinds[0] !== 'initial');
         const valid = transmission?.state === 'provider-pending'
           && transmission.invocation_authority_count === 1
+          && transmission.payload_digest === payloadDigest
           && transmission.boundary_nonce_digest === boundaryNonceDigest
           && authorization?.transmission_id === transmissionId
           && authorization.writer_path === writerPath
           && authorization.provider_profile === providerProfile
+          && authorization.capability === capability
+          && authorization.payload_digest === payloadDigest
+          && authorization.maximum_calls === 1
           && authorization.consumed_at && !authorization.withdrawn_at
-          && currentActivationChain(database, authorization.capability, now)?.id === authorization.activation_id;
+          && Date.parse(authorization.expires_at) > Date.parse(now)
+          && cimWriterCapabilities.get(writerPath) === capability
+          && activation?.provider_profile === providerProfile
+          && currentActivationChain(database, capability, now)?.id === authorization.activation_id
+          && capabilityMatchesWork
+          && communication?.id === transmission.communication_id
+          && communication.delivery_state === 'provider-pending'
+          && outbox?.id === transmission.outbox_id
+          && outbox.communication_id === communication.id
+          && outbox.state === 'provider-pending';
         if (!valid) return { entered: false, alreadyEntered: false, unauthorized: true };
         if (transmission.provider_seam_entered_at) {
           return { entered: false, alreadyEntered: true, unauthorized: false };
@@ -1079,12 +1127,22 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           || outboxMetadata.retryPolicy !== 'reconcile-only-after-provider-pending') {
           return blocked('outbox_changed');
         }
-        const payloadDigest = digest('cim-payload:v1', communication.from_address,
-          JSON.parse(communication.to_addresses), JSON.parse(communication.cc_addresses),
-          JSON.parse(communication.bcc_addresses), communication.reply_to_address,
-          communication.subject, communication.body_text, communication.body_html_sanitized,
-          metadata.tags, members.map(({ id }) => id), members.map(({ template_version }) => template_version),
-          transmission.payload_version);
+        const payloadDigest = buildCimProviderPayloadDigest({
+          message: {
+            from: communication.from_address,
+            to: JSON.parse(communication.to_addresses),
+            cc: JSON.parse(communication.cc_addresses),
+            bcc: JSON.parse(communication.bcc_addresses),
+            replyTo: communication.reply_to_address,
+            subject: communication.subject,
+            text: communication.body_text,
+            html: communication.body_html_sanitized,
+            tags: metadata.tags,
+          },
+          touchIds: members.map(({ id }) => id),
+          templateVersions: members.map(({ template_version: version }) => version),
+          payloadVersion: transmission.payload_version,
+        });
         if (payloadDigest !== transmission.payload_digest) return blocked('payload_changed');
         const transmissionChanged = database.prepare(`
           UPDATE deal_hunter_cim_transmissions SET state = 'provider-pending',
@@ -1271,10 +1329,22 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         `).get(conversationId);
         const capability = touchIds.length > 1 ? 'fl04c-batch'
           : touches[0].kind === 'initial' ? 'fl04b-initial' : 'fl04c-followup';
-        const payloadDigest = digest('cim-payload:v1', fromAddress, addresses.toAddresses,
-          addresses.ccAddresses, addresses.bccAddresses, replyToAddress, subject,
-          bodyText, bodyHtmlSanitized, command.tags, touchIds,
-          campaigns.map((campaign) => campaign.template_version), payloadVersion);
+        const payloadDigest = buildCimProviderPayloadDigest({
+          message: {
+            from: fromAddress,
+            to: addresses.toAddresses,
+            cc: addresses.ccAddresses,
+            bcc: addresses.bccAddresses,
+            replyTo: replyToAddress,
+            subject,
+            text: bodyText,
+            html: bodyHtmlSanitized,
+            tags: command.tags,
+          },
+          touchIds,
+          templateVersions: campaigns.map((campaign) => campaign.template_version),
+          payloadVersion,
+        });
         const currentMembership = database.prepare(`
           SELECT t.* FROM deal_hunter_cim_transmission_touches m
           JOIN deal_hunter_cim_transmissions t ON t.id = m.transmission_id

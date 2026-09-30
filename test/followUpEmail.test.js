@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
+import { sendPreparedMessage } from '../server/services/delivery.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import {
   buildFollowUpEmailContent,
@@ -104,6 +105,34 @@ function submission(overrides = {}) {
     follow_up_state: 'needs-response',
     next_action_at: sendAt.toISOString(),
     last_contacted_at: null,
+    metadata: {},
+    ...overrides,
+  };
+}
+
+function linkedCimRequest(overrides = {}) {
+  return {
+    id: 'manual-takeover-cim-request',
+    created_at: initialAt,
+    updated_at: initialAt,
+    deal_key: 'deal-key-manual-takeover',
+    recipient_email: 'avery@example.test',
+    requested_by: 'admin@example.test',
+    status: 'sent',
+    delivery_error: null,
+    provider_message_id: 'provider-cim-initial',
+    subject: 'CIM / NDA request for Example Manufacturing',
+    deal_name: 'Example Manufacturing',
+    source_name: 'Test marketplace',
+    listing_url: 'https://example.test/listing',
+    score: 88,
+    follow_up_count: 1,
+    next_follow_up_at: '2026-08-11T17:00:00.000Z',
+    submission_id: submission().id,
+    request_state: 'provider_accepted',
+    delivery_state: 'delivered',
+    delivery_state_at: '2026-08-10T16:30:00.000Z',
+    follow_up_state: 'scheduled',
     metadata: {},
     ...overrides,
   };
@@ -736,32 +765,59 @@ test('durable provider acceptance remains successful when communication reconcil
   assert.equal((await storage.getCrmEmailOutbox(result.outbox.id)).provider_message_id, 'accepted-needs-reconciliation');
 });
 
+test('real durable CRM records distinguish ordinary follow-up from CIM manual takeover at the private boundary', async (t) => {
+  const config = readyConfig({
+    server: { outboundRequestTimeoutMs: 100 },
+    dealHunter: { cimProvider: { enabled: true } },
+  });
+  let providerCalls = 0;
+  const sender = (message, options) => sendPreparedMessage(message, {
+    ...options,
+    configOverride: config,
+    fetcher: async () => {
+      providerCalls += 1;
+      return Response.json({ id: `crm-provider-${providerCalls}` });
+    },
+  });
+
+  const ordinaryStorage = await createStorage(t, submission({ id: 'ordinary-crm-follow-up' }));
+  const ordinary = await sendCrmFollowUpEmail({
+    submissionId: 'ordinary-crm-follow-up',
+    actor: 'admin@example.test',
+    input: sendInput(),
+    storage: ordinaryStorage,
+    sender,
+    config,
+    now: sendAt,
+  });
+  assert.equal(ordinary.ok, true);
+  assert.equal(providerCalls, 1);
+
+  const cimStorage = await createStorage(t);
+  const cimRequest = linkedCimRequest({ id: 'real-durable-takeover' });
+  await cimStorage.upsertDealHunterCimRequest(cimRequest);
+  const takeover = await sendCrmFollowUpEmail({
+    submissionId: submission().id,
+    actor: 'admin@example.test',
+    input: sendInput({
+      cimRequestId: cimRequest.id,
+      dealKey: cimRequest.deal_key,
+      manualTakeoverAcknowledged: true,
+    }),
+    storage: cimStorage,
+    sender,
+    config,
+    now: sendAt,
+  });
+  assert.equal(takeover.ok, false);
+  assert.equal(providerCalls, 1, 'the CIM-linked durable record must stop before provider work');
+  assert.equal(takeover.outbox.state, 'permanent_failed');
+  assert.equal(takeover.communication.cim_request_id, cimRequest.id);
+});
+
 test('linked manual send atomically takes over Deal Hunter automation and a scheduler claim conflicts before provider work', async (t) => {
   const storage = await createStorage(t);
-  const cimRequest = {
-    id: 'manual-takeover-cim-request',
-    created_at: initialAt,
-    updated_at: initialAt,
-    deal_key: 'deal-key-manual-takeover',
-    recipient_email: 'avery@example.test',
-    requested_by: 'admin@example.test',
-    status: 'sent',
-    delivery_error: null,
-    provider_message_id: 'provider-cim-initial',
-    subject: 'CIM / NDA request for Example Manufacturing',
-    deal_name: 'Example Manufacturing',
-    source_name: 'Test marketplace',
-    listing_url: 'https://example.test/listing',
-    score: 88,
-    follow_up_count: 1,
-    next_follow_up_at: '2026-08-11T17:00:00.000Z',
-    submission_id: submission().id,
-    request_state: 'provider_accepted',
-    delivery_state: 'delivered',
-    delivery_state_at: '2026-08-10T16:30:00.000Z',
-    follow_up_state: 'scheduled',
-    metadata: {},
-  };
+  const cimRequest = linkedCimRequest();
   await storage.upsertDealHunterCimRequest(cimRequest);
   const providerCalls = [];
   const accepted = await sendCrmFollowUpEmail({
@@ -773,7 +829,8 @@ test('linked manual send atomically takes over Deal Hunter automation and a sche
       manualTakeoverAcknowledged: true,
     }),
     storage,
-    sender: async (message) => {
+    sender: async (message, senderOptions) => {
+      assert.equal(senderOptions.storage, storage);
       providerCalls.push(message);
       return { status: 'sent', providerMessageId: 'provider-manual-takeover' };
     },

@@ -939,7 +939,7 @@ test('real SQLite Broker Materials prepare and approve refuse a drifted loser pr
   }
 });
 
-test('real SQLite Broker Materials prepare and approve retain a survivor execution control', async (t) => {
+test('real SQLite Broker Materials survivor remains durable but cannot mint P6B provider authority', async (t) => {
   const { storage, sqlitePath } = await fixture(t, { includeCimRequest: false });
   const database = new Database(sqlitePath);
   database.prepare(`
@@ -1012,6 +1012,8 @@ test('real SQLite Broker Materials prepare and approve retain a survivor executi
   assert.equal(executions, 1);
   const storedRequest = await storage.getDealHunterCimRequestById(approved.durableResult.cimRequest.id);
   assert.equal(storedRequest.submission_id, 'survivor');
+  assert.equal(storedRequest.status, 'failed');
+  assert.equal(storedRequest.provider_message_id, null);
 
   const dependencies = {
     getPause: async () => ({ paused: false }),
@@ -1023,26 +1025,9 @@ test('real SQLite Broker Materials prepare and approve retain a survivor executi
     opportunityId: 'opportunity', requestId: storedRequest.id, input: {}, session, storage,
     now: controlNow, dependencies,
   });
-  assert.equal(started.success, true, JSON.stringify(started));
-  const followUpNow = new Date(controlNow.getTime() + 10 * 24 * 60 * 60 * 1000);
-  const followUpPrepared = await prepareDealHunterManualFollowUp({
-    opportunityId: 'opportunity', requestId: storedRequest.id, session, storage,
-    now: followUpNow, dependencies,
-  });
-  assert.equal(followUpPrepared.success, true, JSON.stringify(followUpPrepared));
-  const followUpApproved = await approveDealHunterManualFollowUp({
-    opportunityId: 'opportunity', requestId: storedRequest.id,
-    preparationToken: followUpPrepared.preparationToken,
-    approvedProposalDigest: followUpPrepared.proposalDigest,
-    session, storage, now: followUpNow, dependencies,
-  });
-  assert.equal(followUpApproved.success, true, JSON.stringify(followUpApproved));
-  const stopped = await stopDealHunterManualFollowUps({
-    opportunityId: 'opportunity', requestId: storedRequest.id,
-    reason: 'Writer matrix survivor stop control.', session, storage,
-    now: followUpNow, dependencies,
-  });
-  assert.equal(stopped.success, true, JSON.stringify(stopped));
+  assert.equal(started.success, false, JSON.stringify(started));
+  assert.equal(started.code, 'blocked');
+  assert.match(started.error, /terminal delivery state/i);
 });
 
 test('real SQLite approved initial CIM execution refuses a drifted loser primary before provider or request work', async (t) => {

@@ -2040,7 +2040,7 @@ test('full-backfill scoring and explicit CRM sync require administrator access a
   });
 });
 
-test('communication assignment, corrected retry, and Deal Hunter disposition enforce HTTP authorization and replay safety', async () => {
+test('communication assignment, corrected retry default-deny, and Deal Hunter disposition enforce HTTP authorization', async () => {
   await withServer(async (origin) => {
     const adminCookie = lifecycleAdminCookie;
     const viewerCookie = lifecycleViewerCookie;
@@ -2221,9 +2221,11 @@ test('communication assignment, corrected retry, and Deal Hunter disposition enf
       body: JSON.stringify({ newRecipientEmail: 'corrected-boundary@example.com' }),
     });
     const retryResult = await retryResponse.json();
-    assert.equal(retryResponse.status, 201, JSON.stringify(retryResult));
-    assert.equal(retryResult.success, true);
-    assert.equal(retryResult.request.delivery_state, 'development-only');
+    assert.equal(retryResponse.status, 502, JSON.stringify(retryResult));
+    assert.equal(retryResult.success, false);
+    assert.equal(retryResult.request.delivery_state, 'failed');
+    assert.equal(retryResult.emailResult.errorCategory, 'cim-provider-hard-off');
+    assert.equal(retryResult.emailResult.providerMessageId, '');
     const communicationsAfterRetry = await storage.listCrmCommunications({
       submissionId: submission.id,
       page: 1,
@@ -2235,7 +2237,17 @@ test('communication assignment, corrected retry, and Deal Hunter disposition enf
       headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
       body: JSON.stringify({ newRecipientEmail: 'corrected-boundary@example.com' }),
     });
-    assert.equal(replayedRetry.status, 409);
+    const replayedRetryResult = await replayedRetry.json();
+    assert.equal(replayedRetry.status, 502);
+    assert.equal(replayedRetryResult.emailResult.errorCategory, 'cim-provider-hard-off');
+    const communicationsAfterReplay = await storage.listCrmCommunications({
+      submissionId: submission.id,
+      page: 1,
+      pageSize: 100,
+    });
+    assert.equal(communicationsAfterReplay.rows.filter(
+      (row) => row.cim_request_id === retryResult.request.id,
+    ).length, 1, 'retry replay remains one durable failed attempt with zero provider acceptance');
 
     const viewerDisposition = await fetch(`${origin}/api/admin/deal-hunter/dispositions`, {
       method: 'POST',
@@ -2331,7 +2343,7 @@ test('communication assignment, corrected retry, and Deal Hunter disposition enf
 
     for (const [requestId, expectedStatus] of [
       [assignRequestId, 200],
-      [retryRequestId, 201],
+      [retryRequestId, 502],
       [dispositionRequestId, 200],
     ]) {
       let events = [];

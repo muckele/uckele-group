@@ -256,13 +256,38 @@ test('production EmailJS CIM delivery fails closed before any provider call', ()
   assert.equal(child.status, 0, child.stderr);
   const output = JSON.parse(child.stdout);
   assert.equal(output.result.status, 'failed');
-  assert.match(output.result.error, /not eligible for CIM outreach/i);
+  assert.equal(output.result.errorCategory, 'cim-provider-hard-off');
   assert.equal(output.cimProviderCalls, 0);
   assert.equal(output.ordinaryResult.status, 'sent');
   assert.equal(output.providerCalls, 1, 'ordinary EmailJS application mail should remain available');
 });
 
-test('CIM send links CRM and persists the exact message before provider acceptance, then tracks delivery independently', async (t) => {
+test('direct/admin CIM initial persists durable no-send evidence and makes zero provider calls', async (t) => {
+  const storage = testStorage(t);
+  const { sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
+  const deal = await reviewedDeal(storage);
+  const result = await sendDealHunterCimRequest({
+    dealKey: deal.dealKey,
+    snapshotToken: deal.cimRequest.snapshotToken,
+    requestedBy: 'default-deny-admin',
+    storage,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.request.status, 'failed');
+  assert.equal(result.request.provider_message_id || '', '');
+  assert.equal(resendCalls.length, 0);
+  const communications = await storage.listCrmCommunications({
+    submissionId: result.request.submission_id,
+    page: 1,
+    pageSize: 25,
+  });
+  assert.equal(communications.total, 1);
+  assert.equal(communications.rows[0].kind, 'deal-hunter-cim-request');
+  assert.equal(communications.rows[0].provider_message_id, null);
+});
+
+test.skip('legacy CIM send provider-acceptance lifecycle is unreachable after the P6B default-deny boundary', async (t) => {
   const storage = testStorage(t);
   const {
     listDealHunterCimRequestHistory,
@@ -368,7 +393,7 @@ test('CIM send links CRM and persists the exact message before provider acceptan
   assert.equal(history.rows[0].communications[1].body_text, resendCalls[1].body.text);
 });
 
-test('direct CIM send preserves the signed approved copy when a later healthy review changes template fields', async (t) => {
+test.skip('legacy direct-send provider acceptance is unreachable after the P6B default-deny boundary', async (t) => {
   const storage = testStorage(t);
   const { sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
   const deal = await reviewedDeal(storage);
@@ -403,7 +428,7 @@ test('direct CIM send preserves the signed approved copy when a later healthy re
   assert.doesNotMatch(communication.body_html_sanitized, /changed after approval/i);
 });
 
-test('approved manual Stage 1 uses the existing durable executor once, persists exact signed copy, and never schedules follow-up', async (t) => {
+test('approved manual Stage 1 persists exact signed copy but cannot cross the P6B provider boundary', async (t) => {
   // Break caught: Task 2 has no trusted entry into the existing executor and
   // therefore cannot preserve exact approved copy or the manual no-follow-up policy.
   const storage = testStorage(t);
@@ -427,16 +452,7 @@ test('approved manual Stage 1 uses the existing durable executor once, persists 
   assert.equal(first.success, true);
   const request = first.durableResult.cimRequest;
   assert.equal(request.id, signedClaims.approvalBoundPayload.prospectiveRequestId);
-  assert.equal(resendCalls.length, 1);
-  assert.equal(
-    resendCalls[0].body.from,
-    `${preparation.review.sender.displayName} <${preparation.review.sender.email}>`,
-  );
-  assert.deepEqual(resendCalls[0].body.to, [preparation.review.recipient.email]);
-  assert.equal(resendCalls[0].body.reply_to, preparation.review.sender.replyTo);
-  assert.equal(resendCalls[0].body.subject, preparation.review.message.subject);
-  assert.equal(resendCalls[0].body.text, preparation.review.message.body);
-  assert.equal(resendCalls[0].body.html, preparation.review.message.html);
+  assert.equal(resendCalls.length, 0);
 
   assertBoundedCimRequest(request);
   assert.equal(request.recipient.email, preparation.review.recipient.email);
@@ -457,7 +473,7 @@ test('approved manual Stage 1 uses the existing durable executor once, persists 
   assert.equal(communication.body_text, preparation.review.message.body);
   assert.equal(communication.body_html_sanitized, preparation.review.message.html);
   assert.equal(communication.metadata?.templateVersion, preparation.review.message.templateVersion);
-  assert.equal(resendCalls[0].idempotencyKey, communication.idempotency_key);
+  assert.equal(communication.provider_message_id, null);
 
   const replay = await service.approveDealHunterBrokerMaterials({
     opportunityId: preparation.review.opportunity.canonicalOpportunityId,
@@ -470,7 +486,7 @@ test('approved manual Stage 1 uses the existing durable executor once, persists 
   assertBoundedCimRequest(replay.durableResult.cimRequest);
   assert.equal(replay.durableResult.cimRequest.id, request.id);
   assert.deepEqual(Object.keys(replay.durableResult.cimRequest).sort(), Object.keys(request).sort());
-  assert.equal(resendCalls.length, 1, 'replaying the approval must not call the provider twice');
+  assert.equal(resendCalls.length, 0, 'manual approval and replay cannot mint P6B provider authority');
 });
 
 test('manual approval fails closed when final disposition authority throws after approval revalidation', async (t) => {
@@ -549,7 +565,7 @@ test('manual approval blocks a late Pass returned after approval revalidation', 
   assert.match(storedRequest.delivery_error, /dismissed before provider work/i);
 });
 
-test('manual approval returns a durable failed request instead of an unsafe transport error', async (t) => {
+test('manual approval returns a durable failed request without crossing the P6B boundary', async (t) => {
   const storage = testStorage(t);
   const { preparation } = await preparedManualApproval(storage);
   const { approveDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
@@ -567,10 +583,10 @@ test('manual approval returns a durable failed request instead of an unsafe tran
   assert.equal(result.durableResult.cimRequest.status, 'failed');
   assert.equal(result.durableResult.cimRequest.followUpState, 'not-scheduled');
   assert.equal((await storage.getDealHunterCimRequestById(result.durableResult.cimRequest.id)).next_follow_up_at, null);
-  assert.equal(resendCalls.length, 1);
+  assert.equal(resendCalls.length, 0);
 });
 
-test('manual approval keeps an ambiguous provider outcome durable and replay cannot retransmit it', async (t) => {
+test.skip('legacy manual ambiguous-provider lifecycle is unreachable after the P6B default-deny boundary', async (t) => {
   const storage = testStorage(t);
   const { preparation } = await preparedManualApproval(storage);
   const { approveDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
@@ -646,7 +662,7 @@ test('manual approval final readiness drift persists one unscheduled durable fai
   assert.equal(page.total, 1, 'the exact communication remains durable for authoritative reconciliation');
 });
 
-test('manual approval reconciles a provider-accepted communication after final request persistence fails without retransmission', async (t) => {
+test.skip('legacy manual provider reconciliation is Package 6C scope after the P6B boundary', async (t) => {
   const storage = testStorage(t);
   const { preparation } = await preparedManualApproval(storage);
   const { approveDealHunterBrokerMaterials } = await import('../server/services/dealHunterBrokerMaterials.js');
@@ -809,7 +825,7 @@ test('an automation actor cannot use the direct-send fallback without the privat
   assert.equal(resendCalls.length, 0);
 });
 
-test('an initial provider failure retries the same exact persisted communication and idempotency key', async (t) => {
+test.skip('legacy provider retry is unreachable and forbidden after the P6B one-shot boundary', async (t) => {
   const storage = testStorage(t);
   const {
     listDealHunterCimRequestHistory,
@@ -862,7 +878,7 @@ test('an initial provider failure retries the same exact persisted communication
   assert.equal(afterRetry.rows[0].body_text, originalBody);
 });
 
-test('an ambiguous Resend transport outcome is durable and cannot be retransmitted', async (t) => {
+test.skip('legacy ambiguous-provider finalization is Package 6C scope after the P6B boundary', async (t) => {
   const storage = testStorage(t);
   const { sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
   const deal = await reviewedDeal(storage);
@@ -965,7 +981,7 @@ test('a Deal Hunter dismissal winning after review stops the persisted initial b
   assert.equal(result.request.status, 'failed');
 });
 
-test('an archived linked CRM record blocks corrected-recipient retry before a second communication or provider call', async (t) => {
+test.skip('legacy corrected-recipient provider retry cannot establish P6B authority', async (t) => {
   const storage = testStorage(t);
   const {
     retryDealHunterCimRequestWithCorrectedRecipient,
@@ -1271,7 +1287,7 @@ test('an exact inbound reply stops every sequence for the canonical opportunity 
   assert.ok(duplicateActivity.some((event) => event.event_type === 'cim.canonical-reply-stopped'));
 });
 
-test('provider-accepted communication is reconciled after request activity persistence fails without retransmission', async (t) => {
+test.skip('legacy accepted-provider reconciliation is Package 6C scope after the P6B boundary', async (t) => {
   const storage = testStorage(t);
   const { sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
   const deal = await reviewedDeal(storage);
@@ -1383,7 +1399,7 @@ test('legacy EmailJS acceptance with a blank provider ID reconciles after finali
   assert.equal(communication.delivery_state, 'accepted');
 });
 
-test('provider acceptance remains successful when the communication delivery-state write fails and retry does not resend', async (t) => {
+test.skip('legacy acceptance finalization is Package 6C scope after the P6B boundary', async (t) => {
   const storage = testStorage(t);
   const { sendDealHunterCimRequest } = await import('../server/services/dealHunter.js');
   const deal = await reviewedDeal(storage);
@@ -1452,7 +1468,7 @@ test('follow_up_failed request state cannot enter corrected-recipient retry even
   assert.equal(listedRequests, false);
 });
 
-test('a bounced request requires a different corrected recipient and audits snapshot or override evidence', async (t) => {
+test.skip('legacy corrected-recipient provider retry cannot establish P6B authority', async (t) => {
   const storage = testStorage(t);
   const {
     retryDealHunterCimRequestWithCorrectedRecipient,
@@ -1523,7 +1539,7 @@ test('a bounced request requires a different corrected recipient and audits snap
   assert.equal(retryAudit.metadata.selectedFromSignedSnapshot, true);
 });
 
-test('a manually entered corrected recipient requires and retains confirmed override evidence', async (t) => {
+test.skip('legacy corrected-recipient provider retry cannot establish P6B authority', async (t) => {
   const storage = testStorage(t);
   const {
     retryDealHunterCimRequestWithCorrectedRecipient,
@@ -1704,8 +1720,9 @@ test('follow-up processing does not assign a subject-only reply across a shared 
 
   assert.equal(result.reviewed, 2);
   assert.equal(result.responded, 0);
-  assert.equal(result.sent, 2);
-  assert.equal(resendCalls.length, 2);
+  assert.equal(result.sent, 0);
+  assert.equal(result.failed, 2);
+  assert.equal(resendCalls.length, 0);
   const firstAfter = await storage.getDealHunterCimRequestById(initial.request.id);
   const secondAfter = await storage.getDealHunterCimRequestById('shared-broker-second-request');
   assert.notEqual(firstAfter.request_state, 'responded');
@@ -1734,7 +1751,7 @@ test('CIM history preserves hyphenated delivery filters and maps display aliases
   assert.equal(captured.followUpState, 'not-scheduled');
 });
 
-test('manual executor persists exact communication before provider call and performs final terminal revalidation', async (t) => {
+test.skip('legacy manual follow-up provider outcomes are unreachable until a future exact P6B-capable writer exists', async (t) => {
   const dependencies = {
     async getPause() { return { paused: false }; },
     async getReadiness() { return { outboundConfigured: true, issues: [] }; },

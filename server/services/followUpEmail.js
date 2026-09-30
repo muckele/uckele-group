@@ -646,6 +646,7 @@ export async function processCrmEmailOutbox({
   const prepared = {
     kind: 'crm-follow-up',
     communicationId: communication.id,
+    outboxId: outbox.id,
     idempotencyKey: outbox.idempotency_key,
     from: communication.from_address,
     to: communication.to_addresses,
@@ -669,7 +670,7 @@ export async function processCrmEmailOutbox({
   let providerResult;
   let thrownError = '';
   try {
-    providerResult = await sender(prepared);
+    providerResult = await sender(prepared, { storage, configOverride: config });
   } catch (error) {
     thrownError = error?.message || 'Provider request failed.';
     providerResult = { status: 'failed', error: thrownError, providerMessageId: '' };
