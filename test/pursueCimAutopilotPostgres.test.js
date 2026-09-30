@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
+import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const integrationEnabled = process.env.DEAL_HUNTER_POSTGRES_INTEGRATION === '1';
@@ -22,6 +23,8 @@ const p4bMigrationPath = path.join(root,
   'supabase/migrations/20261001130000_pursue_cim_p4b_authority.sql');
 const p5MigrationPath = path.join(root,
   'supabase/migrations/20261002120000_pursue_cim_initial_preparation.sql');
+const p6aMigrationPath = path.join(root,
+  'supabase/migrations/20261003120000_pursue_cim_final_gate.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -47,10 +50,12 @@ const expectedP1cFunctions = [
   'pursue_cim_append_terminal_event_v1',
   'pursue_cim_append_timezone_revision_v1',
   'pursue_cim_assert_types_v1',
+  'pursue_cim_authorize_provider_pending_p5_v1',
   'pursue_cim_authorize_provider_pending_v1',
   'pursue_cim_bump_campaign_authority_revision_v1',
   'pursue_cim_bump_global_authority_revision_v1',
   'pursue_cim_cancel_prepared_transmission_v1',
+  'pursue_cim_canonical_json_v1',
   'pursue_cim_claim_due_touch_v1',
   'pursue_cim_consume_safety_events_v1',
   'pursue_cim_crm_match_fingerprint_v1',
@@ -64,6 +69,7 @@ const expectedP1cFunctions = [
   'pursue_cim_list_due_initial_touches_v1',
   'pursue_cim_materialize_campaign_v1',
   'pursue_cim_prepare_transmission_v1',
+  'pursue_cim_read_final_gate_context_v1',
   'pursue_cim_read_import_outreach_counters_v1',
   'pursue_cim_read_projection_v1',
   'pursue_cim_reconcile_transmission_v1',
@@ -87,6 +93,33 @@ test('P5 PostgreSQL preparation locks conversation and campaign before touch', (
     'deal_hunter_broker_conversations', 'deal_hunter_cim_campaigns',
     'deal_hunter_cim_campaign_touches',
   ]);
+});
+
+test('P6A PostgreSQL migration is mirrored and documents deterministic final-gate locking', () => {
+  const migration = fs.readFileSync(p6aMigrationPath, 'utf8').trim();
+  const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
+  assert.ok(schema.includes(migration), 'canonical schema must contain the exact additive P6A block');
+  const gate = migration.slice(migration.indexOf(
+    'create or replace function public.pursue_cim_authorize_provider_pending_v1'));
+  const positions = [
+    'from public.deal_hunter_cim_transmissions',
+    'from public.deal_hunter_cim_live_provider_authorizations',
+    'from public.deal_hunter_broker_conversations',
+    'from public.deal_hunter_cim_campaigns c',
+    'from public.deal_hunter_cim_transmission_touches m',
+    'from public.deal_hunter_cim_capability_activations',
+    "from public.deal_hunter_cim_global_authority\n      where id = 'global' for update",
+    'from public.deal_hunter_cim_safety_settings',
+    'from public.crm_communications',
+    'from public.crm_email_outbox',
+  ].map((fragment) => gate.indexOf(fragment));
+  assert.ok(positions.every((position) => position >= 0));
+  assert.deepEqual([...positions].sort((left, right) => left - right), positions);
+  assert.match(gate, /security definer\s+set search_path = ''/i);
+  assert.match(gate, /v_activation\.permission_basis_digest is distinct from v_member\.permission_digest/);
+  assert.match(gate, /v_expected_member #>> '\{campaign,permission_scope\}'[\s\S]*v_member\.permission_scope/);
+  assert.match(gate, /v_result := public\.pursue_cim_authorize_provider_pending_p5_v1[\s\S]*final-gate-blocked/);
+  assert.match(migration, /revoke all on function public\.pursue_cim_read_final_gate_context_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
 });
 
 test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
@@ -340,6 +373,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(crmAuthorityMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p4bMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p5MigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6aMigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -618,8 +652,17 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(crmAuthorityMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p4bMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p5MigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6aMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
+  const parityRecipient = { email: 'broker2@example.test',
+    provenanceFingerprint: 'd'.repeat(64),
+    permissionProvenanceFingerprint: 'e'.repeat(64),
+    contactAuthorityRevision: 'c'.repeat(64) };
+  const parityRecipientFingerprint = sha256(stableCanonicalJson({ opportunityId: 'opp-decision',
+    emailHash: sha256(parityRecipient.email),
+    provenanceFingerprint: parityRecipient.provenanceFingerprint,
+    contactAuthorityRevision: parityRecipient.contactAuthorityRevision }));
   const commands = [
     { enrollmentId: 'enrollment-parity', expectedRowVersion: 1, nextState: 'waiting-on-eligibility', actor: 'fixture', now },
     { enrollmentId: 'enrollment-parity', expectedRowVersion: 1, nextState: 'action-required', actor: 'fixture', now },
@@ -663,6 +706,8 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     { id: 'activation-initial', capability: 'fl04b-initial', mode: 'active',
       prerequisiteActivationId: 'activation-enrollment', prerequisiteEvidenceId: 'evidence-2',
       prerequisiteEvidenceHash: 'c'.repeat(64), policyHash: 'a'.repeat(64),
+      cohortDigest: '4'.repeat(64), permissionBasisDigest: '2'.repeat(64),
+      permissionRevision: 1,
       configHash: 'b'.repeat(64), actor: 'fixture', reason: 'disposable parity',
       confirmation: 'fixture-confirmation', providerProfile: 'synthetic-provider', now },
   ];
@@ -736,7 +781,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     crmBrokerEmail: null,
     campaignAuthorityRevision: 1,
     globalAuthorityRevision: 1,
-    recipientAuthorityId: 'recipient-materialize', recipientFingerprint: '8'.repeat(64),
+    recipientAuthorityId: 'recipient-materialize', recipientFingerprint: parityRecipientFingerprint,
     recipientAddress: 'broker2@example.test', senderPolicyVersion: 'sender-v1',
     replyPolicyVersion: 'reply-v1', replyAliasTokenDigest: '9'.repeat(64),
     rfcThreadKey: 'thread-materialize', batchingPolicyVersion: 'batching-off-v1',
@@ -752,7 +797,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     ['--expose-gc', 'test/fixtures/pursueCimParitySqlite.js'],
     JSON.stringify({ now, commands, timezoneCommands, activationCommands,
       claimCommands, safetyRuns, ownerCommands, ownerStopCommands,
-      campaignCommands, withdrawalCommand })));
+      campaignCommands, withdrawalCommand, parityRecipient })));
   const { expected, expectedTimezone, expectedActivations, expectedClaims,
     expectedProjection, expectedSafetyEmissions, expectedOwnerDecisions,
     expectedOwnerStops, expectedCampaigns, expectedWithdrawals } = reference;
@@ -895,9 +940,11 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         fixedSearchPath: rpc.fixedSearchPath },
       { public: false, anon: false, authenticated: false,
         service: !['pursue_cim_cancel_prepared_transmission_v1',
-          'pursue_cim_emit_admitted_import_safety_v1'].includes(rpc.name),
+          'pursue_cim_emit_admitted_import_safety_v1',
+          'pursue_cim_authorize_provider_pending_p5_v1'].includes(rpc.name),
         fixedSearchPath: true }, `${database}:${rpc.name}`);
-      if (!['pursue_cim_assert_types_v1', 'pursue_cim_current_activation_v1', 'pursue_cim_digest_v1',
+      if (!['pursue_cim_assert_types_v1', 'pursue_cim_canonical_json_v1',
+        'pursue_cim_current_activation_v1', 'pursue_cim_digest_v1',
         'pursue_cim_json_stringify_v1', 'pursue_cim_required_revision_v1',
         'pursue_cim_required_text_v1', 'pursue_cim_required_instant_v1'].includes(rpc.name)) {
         assert.equal(rpc.securityDefiner, true, `${database}:${rpc.name}`);
@@ -1724,6 +1771,20 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         authorizationId: outcome.authorization?.id ?? null },
       reference.expectedIssues[index], database);
     }
+    psql(container, database, `
+      update public.deal_hunter_opportunities set discovery_state = 'known_prospective'
+        where opportunity_id = 'opp-decision';
+      insert into public.deal_hunter_source_freshness_state
+        (source_id, next_generation, accepted_generation, accepted_run_id,
+         accepted_digest, accepted_at, projection_state)
+      values ('sheet-0', 1, 1, 'parity-run', repeat('5', 64), '${now}', 'accepted');
+      insert into public.deal_hunter_opportunity_source_observations
+        (id, opportunity_id, source_id, source_name, source_record_id, field, value,
+         observed_at, accepted_at, accepted_run_id, created_at, updated_at)
+      values ('parity-source-row', 'opp-decision', 'sheet-0', 'Synthetic Sheet',
+        'parity-record', 'broker_email', 'broker2@example.test', '${now}', '${now}',
+        'parity-run', '${now}', '${now}');
+    `);
     assertOwnerFencesStage({ stage: 'authorized', opportunityId: 'opp-decision',
       campaignId: reference.expectedCampaigns[0].campaignId,
       touchId: reference.expectedCampaigns[0].touchId,
@@ -1737,12 +1798,79 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       transitionName: 'pursue_cim_authorize_provider_pending_v1',
       transitionCommand: reference.providerPendingCommands[2] });
     for (const [index, command] of reference.providerPendingCommands.entries()) {
+      const postgresCanonical = psql(container, database,
+        `select public.pursue_cim_canonical_json_v1(
+          '${JSON.stringify(command.authoritySnapshot).replaceAll("'", "''")}'::jsonb);`);
+      const javascriptCanonical = stableCanonicalJson(command.authoritySnapshot);
+      if (postgresCanonical !== javascriptCanonical) {
+        const mismatch = [...javascriptCanonical].findIndex((value, offset) =>
+          value !== postgresCanonical[offset]);
+        assert.fail(`${database}: canonical mismatch at ${mismatch}; JS=${javascriptCanonical.slice(
+          Math.max(0, mismatch - 80), mismatch + 120)}; PG=${postgresCanonical.slice(
+          Math.max(0, mismatch - 80), mismatch + 120)}`);
+      }
+      const postgresGateDigest = sha256(postgresCanonical);
+      assert.equal(postgresGateDigest, command.finalGateAuthorityDigest,
+        `${database}: canonical final-gate digest parity`);
       if (index === 2) assert.equal(reference.expectedProviderPending[index].authorized, true,
         'SQLite reference must authorize synthetic provider-pending storage transition');
       if (index === 2) psql(container, database, `insert into public.deal_hunter_cim_safety_settings
         (id, updated_at, outreach_paused, updated_by, metadata)
         values ('global', '${now}', false, 'fixture', '{}'::jsonb);`);
       if (index === 2) {
+        const materialsRace = JSON.parse(psql(container, database, `begin;
+          update public.contact_submissions
+            set prospectus_url = 'https://example.test/prospectus'
+            where id = '11111111-1111-4111-8111-111111111111';
+          set role service_role;
+          select public.pursue_cim_authorize_provider_pending_v1(
+            '${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);
+          rollback;`).split('\n').find((line) => line.startsWith('{')));
+        assert.deepEqual({ authorized: materialsRace.authorized,
+          blockedReason: materialsRace.blockedReason },
+        { authorized: false, blockedReason: 'materials_received' },
+        `${database}: persisted materials must beat the final gate`);
+        const metadataMaterialsRace = JSON.parse(psql(container, database, `begin;
+          update public.contact_submissions set metadata =
+            '{"diligence":{"stage":"financial-review","checklist":{"cim":true}}}'::jsonb
+            where id = '11111111-1111-4111-8111-111111111111';
+          set role service_role;
+          select public.pursue_cim_authorize_provider_pending_v1(
+            '${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);
+          rollback;`).split('\n').find((line) => line.startsWith('{')));
+        assert.deepEqual({ authorized: metadataMaterialsRace.authorized,
+          blockedReason: metadataMaterialsRace.blockedReason },
+        { authorized: false, blockedReason: 'materials_received' },
+        `${database}: CRM diligence metadata must beat the final gate`);
+        const permissionRace = JSON.parse(psql(container, database, `begin;
+          update public.deal_hunter_cim_campaigns set permission_revision = permission_revision + 1
+            where id='${reference.expectedCampaigns[0].campaignId}';
+          set role service_role;
+          select public.pursue_cim_authorize_provider_pending_v1(
+            '${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);
+          rollback;`).split('\n').find((line) => line.startsWith('{')));
+        assert.deepEqual({ authorized: permissionRace.authorized,
+          blockedReason: permissionRace.blockedReason },
+        { authorized: false, blockedReason: 'permission_changed' },
+        `${database}: current campaign permission must beat snapshot permission`);
+        const delegatedBlockLines = psql(container, database, `begin;
+          update public.deal_hunter_cim_live_provider_authorizations
+            set expires_at='2026-09-25T18:59:00.000Z'::timestamptz
+            where id='${command.authorizationId}';
+          set role service_role;
+          select public.pursue_cim_authorize_provider_pending_v1(
+            '${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);
+          reset role;
+          select count(*) from public.deal_hunter_cim_audit_events
+            where event_type='final-gate-blocked'
+              and transmission_id='${command.transmissionId}'
+              and reason_code='live_authorization_invalid';
+          rollback;`).split('\n').filter(Boolean);
+        const delegatedBlock = JSON.parse(delegatedBlockLines[0]);
+        assert.equal(delegatedBlock.authorized, false, database);
+        assert.equal(delegatedBlock.blockedReason, 'live_authorization_invalid', database);
+        assert.equal(Number(delegatedBlockLines[1]), 1,
+          `${database}: retained P5 blockers require a transactional final-gate audit`);
         rejectAuditTransition('final-gate-authorized',
           'pursue_cim_authorize_provider_pending_v1', command);
         assert.deepEqual(JSON.parse(psql(container, database, `select jsonb_build_object(
@@ -1753,6 +1881,12 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
             where id='${command.authorizationId}'))`)),
         { transmission: 'prepared', authorizationConsumed: false }, database);
         if (database === 'pursue_cim_fresh') {
+          const parallelGates = await Promise.all([
+            concurrentRolledBackRpc('pursue_cim_authorize_provider_pending_v1', command),
+            concurrentRolledBackRpc('pursue_cim_authorize_provider_pending_v1', command),
+          ]);
+          assert.equal(parallelGates.every((result) => result.authorized), true,
+            `${database}: write-strength global locking must serialize successful gates`);
           const campaignVersion = JSON.parse(psql(container, database,
             `select jsonb_build_object('rowVersion',row_version,'revision',terminal_revision)
               from public.deal_hunter_cim_campaigns

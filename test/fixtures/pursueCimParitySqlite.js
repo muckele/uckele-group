@@ -2,10 +2,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
+import { authorizePreparedCimTransmission } from '../../server/services/pursueCimFinalGate.js';
 import { createSqliteStorage } from '../../server/storage/sqlite.js';
 
 const { now, commands, timezoneCommands, activationCommands, claimCommands,
-  safetyRuns, ownerCommands, ownerStopCommands, campaignCommands, withdrawalCommand } =
+  safetyRuns, ownerCommands, ownerStopCommands, campaignCommands, withdrawalCommand,
+  parityRecipient } =
   JSON.parse(fs.readFileSync(0, 'utf8'));
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ug-p1c-sqlite-parity-'));
 const sqlitePath = path.join(directory, 'storage.sqlite');
@@ -234,7 +236,8 @@ const authorizationBase = { id: 'authorization-materialize',
   activationId: 'activation-initial', capability: 'fl04b-initial',
   writerPath: 'synthetic-writer', transmissionId: preparedTransmission.id,
   payloadDigest: preparedTransmission.payload_digest,
-  recipientAuthorityDigest: '8'.repeat(64), providerProfile: 'synthetic-provider',
+  recipientAuthorityDigest: campaignCommands[0].recipientFingerprint,
+  providerProfile: 'synthetic-provider',
   actor: 'fixture', reason: 'disposable authorization', now,
   expiresAt: '2026-09-25T20:00:00.000Z' };
 const issueCommands = [authorizationBase, { ...authorizationBase },
@@ -248,21 +251,61 @@ for (const command of issueCommands) {
     authorizationId: outcome.authorization?.id ?? null });
   global.gc?.();
 }
-const providerPendingBase = { transmissionId: preparedTransmission.id,
-  authorizationId: authorizationBase.id, writerPath: authorizationBase.writerPath,
-  providerProfile: authorizationBase.providerProfile, expectedRowVersion: 1,
-  expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
-  claimTokenDigest: '6'.repeat(64), finalGateAuthorityDigest: '7'.repeat(64),
-  boundaryNonceDigest: '8'.repeat(64), actor: 'fixture', now };
-const providerPendingCommands = [providerPendingBase,
-  { ...providerPendingBase, expectedRowVersion: 0 }, providerPendingBase,
-  providerPendingBase];
+database.prepare(`update deal_hunter_opportunities set discovery_state = 'known_prospective'
+  where opportunity_id = 'opp-decision'`).run();
+database.prepare(`insert into deal_hunter_source_freshness_state
+  (source_id, next_generation, accepted_generation, accepted_run_id, accepted_digest,
+   accepted_at, projection_state)
+  values ('sheet-0', 1, 1, 'parity-run', ?, ?, 'accepted')`).run('5'.repeat(64), now);
+database.prepare(`insert into deal_hunter_opportunity_source_observations
+  (id, opportunity_id, source_id, source_name, source_record_id, field, value,
+   observed_at, accepted_at, accepted_run_id, created_at, updated_at)
+  values ('parity-source-row', 'opp-decision', 'sheet-0', 'Synthetic Sheet',
+    'parity-record', 'broker_email', 'broker2@example.test', ?, ?, 'parity-run', ?, ?)`)
+  .run(now, now, now, now);
+const providerPendingCommands = [];
+const finalGateStorage = { ...storage,
+  authorizeCimProviderPending: async (command) => {
+    providerPendingCommands.push(command);
+    return storage.authorizeCimProviderPending(command);
+  } };
+const loadMemberAuthority = async () => ({ opportunityId: 'opp-decision',
+  recipientOptions: [parityRecipient], materialsState: { materialsReceived: false,
+    advancedBeyondBrokerOutreach: false, evidenceCodes: [] }, preparationBlockers: [],
+  suppression: null, terminalReason: '', existingRequest: null, opportunityClaim: null,
+  currentDispositionState: 'pursued', pursued: true });
+const readCurrentAuthority = async () => ({ opportunityId: 'opp-decision', blocked: false,
+  blockers: [], opportunity: database.prepare(`select * from deal_hunter_opportunities
+    where opportunity_id = 'opp-decision'`).get(),
+  sourceRows: database.prepare(`select * from deal_hunter_opportunity_source_observations
+    where opportunity_id = 'opp-decision' order by id`).all(),
+  sourceStates: database.prepare(`select * from deal_hunter_source_freshness_state
+    order by source_id`).all(), sourceHealth: { healthy: true, issues: [],
+    requiredSources: ['sheet-0'] }, identityExceptions: [] });
+const readProviderReadiness = async () => ({ provider: 'resend',
+  providerProfile: 'synthetic-provider', outboundConfigured: true, senderConfigured: true,
+  senderAuthenticationAttested: true, webhookConfigured: true,
+  requestReplyRoutingVerified: true, replyTrackingVerified: true,
+  suppressionOperational: true, reconciliationOperational: true,
+  evidenceRevision: 'parity-readiness', generatedAt: now,
+  expiresAt: '2026-09-25T20:00:00.000Z' });
+const gate = () => authorizePreparedCimTransmission({ storage: finalGateStorage,
+  transmissionId: preparedTransmission.id, authorizationId: authorizationBase.id,
+  writerPath: authorizationBase.writerPath, providerProfile: authorizationBase.providerProfile,
+  actor: 'fixture', now, loadMemberAuthority, readCurrentAuthority, readProviderReadiness });
 const expectedProviderPending = [];
-for (const [index, command] of providerPendingCommands.entries()) {
-  if (index === 2) database.prepare(`insert into deal_hunter_cim_safety_settings
-    (id, updated_at, outreach_paused, updated_by, metadata)
-    values ('global', ?, 0, 'fixture', '{}')`).run(now);
-  const outcome = await storage.authorizeCimProviderPending(command);
+for (let index = 0; index < 4; index += 1) {
+  let outcome;
+  if (index === 1) {
+    const command = { ...providerPendingCommands[0], expectedRowVersion: 0 };
+    providerPendingCommands.push(command);
+    outcome = await storage.authorizeCimProviderPending(command);
+  } else {
+    if (index === 2) database.prepare(`insert into deal_hunter_cim_safety_settings
+      (id, updated_at, outreach_paused, updated_by, metadata)
+      values ('global', ?, 0, 'fixture', '{}')`).run(now);
+    outcome = await gate();
+  }
   expectedProviderPending.push({ authorized: outcome.authorized,
     blockedReason: outcome.blockedReason, transmissionState: outcome.transmission?.state ?? null,
     rowVersion: outcome.transmission?.row_version ?? null,
@@ -272,7 +315,7 @@ for (const [index, command] of providerPendingCommands.entries()) {
 const seamBase = { transmissionId: preparedTransmission.id,
   authorizationId: authorizationBase.id, writerPath: authorizationBase.writerPath,
   providerProfile: authorizationBase.providerProfile,
-  boundaryNonceDigest: '8'.repeat(64), expectedRowVersion: 2,
+  boundaryNonceDigest: providerPendingCommands[2].boundaryNonceDigest, expectedRowVersion: 2,
   actor: 'fixture', now };
 const seamCommands = [{ ...seamBase, boundaryNonceDigest: '9'.repeat(64) },
   seamBase, seamBase];
@@ -549,4 +592,3 @@ process.stdout.write(JSON.stringify({ expected, expectedTimezone, timezoneAudit,
   safetyStopRun, safetyStopEventId, safetyConsumeCommands,
   expectedSafetyConsumptions, expectedSafetyStopState,
   expectedWithdrawals }));
-process.exit(0);
