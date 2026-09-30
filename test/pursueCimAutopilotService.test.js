@@ -8,6 +8,7 @@ import { readCimCurrentAuthority, runCimCampaignSafety } from '../server/service
 import { loadBrokerMaterialsAuthority } from '../server/services/dealHunterBrokerMaterials.js';
 import { orchestratePursuitEnrollment, pursuitPermissionBasisDigest,
   pursuitPermissionCohortDigest } from '../server/services/pursueCimEnrollment.js';
+import { runDueCimInitialPreparations } from '../server/services/pursueCimInitialPreparation.js';
 import { resolveDealHunterOpportunity } from '../server/services/cimOpportunityIdentity.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import {
@@ -103,6 +104,91 @@ test('P4B current eligible Pursue allocates one scheduled initial touch without 
   assert.equal(db.prepare(`SELECT state FROM deal_hunter_cim_campaign_touches`).get().state, 'scheduled');
   for (const table of ['deal_hunter_cim_transmissions', 'deal_hunter_cim_live_provider_authorizations',
     'crm_communications']) assert.equal(db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count, 0);
+});
+
+test('P5 real Broker Materials authority prepares the Package 4B initial touch', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  const allocated = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(allocated.campaign.state, 'initial-pending');
+  const activated = await storage.recordCimCapabilityActivation({
+    id: 'p4b-initial', capability: 'fl04b-initial', mode: 'active',
+    policyHash: 'c'.repeat(64), configHash: 'd'.repeat(64),
+    actor: 'fixture-owner', reason: 'synthetic only',
+    confirmation: 'synthetic-confirmation', providerProfile: 'synthetic', now,
+    prerequisiteActivationId: 'p4b-enrollment',
+    prerequisiteEvidenceId: 'p5-initial-evidence',
+    prerequisiteEvidenceHash: 'e'.repeat(64),
+  });
+  assert.equal(activated.applied, true);
+  const outcomes = await runDueCimInitialPreparations({ storage, now });
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].prepared, true, JSON.stringify(outcomes[0]));
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmissions').get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM crm_communications').get().n, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM crm_email_outbox').get().n, 1);
+  assert.equal(db.prepare('SELECT state FROM deal_hunter_cim_transmissions').get().state, 'prepared');
+});
+
+test('P5 refuses preparation when the campaign leaves initial-pending after claim', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  const allocated = await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  assert.equal(allocated.campaign.state, 'initial-pending');
+  await storage.recordCimCapabilityActivation({
+    id: 'p5-state-initial', capability: 'fl04b-initial', mode: 'active',
+    policyHash: 'c'.repeat(64), configHash: 'd'.repeat(64),
+    actor: 'fixture-owner', reason: 'synthetic only',
+    confirmation: 'synthetic-confirmation', providerProfile: 'synthetic', now,
+    prerequisiteActivationId: 'p4b-enrollment',
+    prerequisiteEvidenceId: 'p5-initial-evidence',
+    prerequisiteEvidenceHash: 'e'.repeat(64),
+  });
+  const racedStorage = new Proxy(storage, {
+    get(target, key) {
+      if (key === 'claimDueCimTouch') return async (command) => {
+        const claim = await target.claimDueCimTouch(command);
+        if (claim.claimed) db.prepare(`UPDATE deal_hunter_cim_campaigns
+          SET state = 'active-follow-up' WHERE id = ?`).run(allocated.campaign.id);
+        return claim;
+      };
+      return target[key];
+    },
+  });
+  const outcomes = await runDueCimInitialPreparations({ storage: racedStorage, now });
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].prepared, false, JSON.stringify(outcomes[0]));
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmissions').get().n, 0);
+});
+
+test('P5 refuses a claim whose lease expires during payload construction', async (t) => {
+  const { storage, db, opportunityId, now, decision } = await seedP4bEligibleFixture(t);
+  await orchestratePursuitEnrollment({ storage, opportunityId,
+    enrollment: decision.enrollment, decision: decision.decision, actor: 'fixture-owner',
+    now, readSourceHealth: async () => ({ healthy: true, issues: [] }) });
+  await storage.recordCimCapabilityActivation({
+    id: 'p5-lease-initial', capability: 'fl04b-initial', mode: 'active',
+    policyHash: 'c'.repeat(64), configHash: 'd'.repeat(64),
+    actor: 'fixture-owner', reason: 'synthetic only',
+    confirmation: 'synthetic-confirmation', providerProfile: 'synthetic', now,
+    prerequisiteActivationId: 'p4b-enrollment',
+    prerequisiteEvidenceId: 'p5-initial-evidence',
+    prerequisiteEvidenceHash: 'e'.repeat(64),
+  });
+  let currentInstant = now;
+  const outcomes = await runDueCimInitialPreparations({ storage, now,
+    clock: () => new Date(currentInstant),
+    loadAuthority: async (args) => {
+      const authority = await loadBrokerMaterialsAuthority(args);
+      currentInstant = new Date(Date.parse(now) + 6 * 60 * 1000).toISOString();
+      return authority;
+    },
+  });
+  assert.equal(outcomes.length, 1);
+  assert.equal(outcomes[0].prepared, false, JSON.stringify(outcomes[0]));
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmissions').get().n, 0);
 });
 
 test('P4B downstream allocation failure preserves immutable Pursue and requires action', async (t) => {

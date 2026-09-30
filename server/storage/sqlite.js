@@ -9385,8 +9385,12 @@ export function createSqliteStorage(config, options = {}) {
 
     async claimCrmEmailOutbox({ id = '', claimToken = '', claimedAt = '', claimExpiresAt = '' } = {}) {
       return database.transaction(() => {
-        const current = database.prepare('SELECT submission_id, state FROM crm_email_outbox WHERE id = ? LIMIT 1').get(id);
-        if (current?.submission_id && ['queued', 'retryable_failed', 'sending'].includes(current.state)) {
+        const current = database.prepare(`SELECT o.submission_id, o.state, c.source
+          FROM crm_email_outbox AS o
+          LEFT JOIN crm_communications AS c ON c.id = o.communication_id
+          WHERE o.id = ? LIMIT 1`).get(id);
+        if (current?.source !== 'pursue-cim-autopilot' && current?.submission_id
+          && ['queued', 'retryable_failed', 'sending'].includes(current.state)) {
           assertCrmSubmissionWritableInTransaction(current.submission_id);
         }
         const row = database.prepare(`
@@ -9398,6 +9402,9 @@ export function createSqliteStorage(config, options = {}) {
             claim_expires_at = ?,
             updated_at = ?
           WHERE id = ?
+            AND NOT EXISTS (SELECT 1 FROM crm_communications AS communication
+              WHERE communication.id = crm_email_outbox.communication_id
+                AND communication.source = 'pursue-cim-autopilot')
             AND (
               state = 'queued'
               OR (state = 'retryable_failed' AND (next_attempt_at IS NULL OR next_attempt_at <= ?))

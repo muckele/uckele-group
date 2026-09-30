@@ -25,6 +25,10 @@ function requiredInstant(value) {
   return value;
 }
 
+function canonicalInstant(value) {
+  return new Date(requiredInstant(value)).toISOString();
+}
+
 function withinLocalSendWindow(now, timezone) {
   try {
     const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
@@ -858,7 +862,7 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
       const bodyText = requiredText(command.bodyText, 'bodyText', 100000);
       const bodyHtmlSanitized = requiredText(command.bodyHtmlSanitized, 'bodyHtmlSanitized', 100000);
       const actor = requiredText(command.actor, 'actor', 200);
-      const now = requiredInstant(command.now);
+      const now = canonicalInstant(command.now);
       const addresses = {};
       for (const key of ['toAddresses', 'ccAddresses', 'bccAddresses']) {
         if (!Array.isArray(command[key]) || command[key].length > 20) throw new Error(`Invalid ${key}`);
@@ -879,10 +883,17 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         const campaigns = touches.map((touch) => database.prepare(`
           SELECT * FROM deal_hunter_cim_campaigns WHERE id = ?
         `).get(touch.campaign_id));
+        if (campaigns.some((campaign, index) => !campaign
+          || touches[index].campaign_id !== campaign.id
+          || touches[index].opportunity_id !== campaign.opportunity_id)) {
+          return result({ terminal: true });
+        }
         const conversationId = campaigns[0].conversation_id;
         const conversation = database.prepare(`
           SELECT * FROM deal_hunter_broker_conversations WHERE id = ?
         `).get(conversationId);
+        const capability = touchIds.length > 1 ? 'fl04c-batch'
+          : touches[0].kind === 'initial' ? 'fl04b-initial' : 'fl04c-followup';
         const payloadDigest = digest('cim-payload:v1', fromAddress, addresses.toAddresses,
           addresses.ccAddresses, addresses.bccAddresses, replyToAddress, subject,
           bodyText, bodyHtmlSanitized, command.tags, touchIds,
@@ -904,15 +915,41 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
             return result({ existing: preparationGeneration === currentMembership.preparation_generation,
               payloadConflict: preparationGeneration !== currentMembership.preparation_generation }, currentMembership);
           }
-          if (preparationGeneration !== currentMembership.preparation_generation + 1
-            || !cancelPreparedTransmission(database, currentMembership,
-              { now, reasonCode: 'prepared-payload-changed', actor, preserveClaim: true })) {
+          if (preparationGeneration !== currentMembership.preparation_generation + 1) {
+            return result({ payloadConflict: true }, currentMembership);
+          }
+          const crmOwner = database.prepare(`SELECT s.id FROM contact_submissions AS s
+            JOIN deal_hunter_opportunities AS o ON o.opportunity_id = s.deal_hunter_opportunity_id
+            WHERE s.id = ? AND s.deal_hunter_opportunity_id = ?
+              AND s.archived_at IS NULL AND o.primary_submission_id = s.id
+          `).get(campaigns[0].crm_submission_id, campaigns[0].opportunity_id);
+          if (!currentActivationChain(database, capability, now) || !conversation
+            || conversation.state !== 'open'
+            || conversation.terminal_revision !== expectedConversationTerminalRevision
+            || conversation.recipient_address !== addresses.toAddresses[0]
+            || !crmOwner
+            || campaigns.some((campaign) => campaign.conversation_id !== conversationId
+              || campaign.terminal_revision !== expectedCampaignTerminalRevision
+              || !['initial-pending', 'active-follow-up'].includes(campaign.state)
+              || (touches[0].kind === 'initial' && (campaign.state !== 'initial-pending'
+                || campaign.generation !== 1
+                || campaign.policy_version !== 'deal-hunter-cim-autopilot-v1'))
+              || (campaign.local_expiry_at && Date.parse(campaign.local_expiry_at) <= Date.parse(now)))
+            || touches.some((touch) => (touch.kind === 'initial'
+              && (touch.logical_slot !== 'initial' || touch.ordinal !== 0))
+              || touch.state !== 'claimed'
+              || touch.claim_token_digest !== claimTokenDigest
+              || !touch.claim_expires_at
+              || Date.parse(touch.claim_expires_at) <= Date.parse(now)
+              || touch.transmission_id !== currentMembership.id)) {
+            return result({ terminal: true }, currentMembership);
+          }
+          if (!cancelPreparedTransmission(database, currentMembership,
+            { now, reasonCode: 'prepared-payload-changed', actor, preserveClaim: true })) {
             return result({ payloadConflict: true }, currentMembership);
           }
           for (const touch of touches) touch.transmission_id = null;
         }
-        const capability = touchIds.length > 1 ? 'fl04c-batch'
-          : touches[0].kind === 'initial' ? 'fl04b-initial' : 'fl04c-followup';
         if (!currentActivationChain(database, capability, now)
           || !conversation || conversation.state !== 'open'
           || conversation.terminal_revision !== expectedConversationTerminalRevision
@@ -920,17 +957,30 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           || campaigns.some((campaign) => campaign.conversation_id !== conversationId
             || campaign.terminal_revision !== expectedCampaignTerminalRevision
             || !['initial-pending', 'active-follow-up'].includes(campaign.state)
+            || (touches[0].kind === 'initial' && (campaign.state !== 'initial-pending'
+              || campaign.generation !== 1
+              || campaign.policy_version !== 'deal-hunter-cim-autopilot-v1'))
             || !campaign.crm_submission_id
             || (campaign.local_expiry_at && Date.parse(campaign.local_expiry_at) <= Date.parse(now)))
-          || touches.some((touch) => touch.state !== 'claimed'
-            || touch.claim_token_digest !== claimTokenDigest || touch.transmission_id)) {
+          || touches.some((touch) => (touch.kind === 'initial'
+            && (touch.logical_slot !== 'initial' || touch.ordinal !== 0))
+            || touch.state !== 'claimed'
+            || touch.claim_token_digest !== claimTokenDigest || touch.transmission_id
+            || !touch.claim_expires_at
+            || Date.parse(touch.claim_expires_at) <= Date.parse(now))) {
           return result({ terminal: true });
         }
         const crmOwner = database.prepare(`
           SELECT * FROM contact_submissions WHERE id = ?
         `).get(campaigns[0].crm_submission_id);
+        const currentOpportunity = database.prepare(`
+          SELECT primary_submission_id FROM deal_hunter_opportunities WHERE opportunity_id = ?
+        `).get(campaigns[0].opportunity_id);
         if (!crmOwner || crmOwner.deal_hunter_opportunity_id !== campaigns[0].opportunity_id
-          || crmOwner.archived_at) return result({ terminal: true });
+          || crmOwner.archived_at
+          || currentOpportunity?.primary_submission_id !== crmOwner.id) {
+          return result({ terminal: true });
+        }
         const memberDigest = digest('cim-members:v1', touchIds);
         const transmissionId = digest('cim-transmission:v1', campaigns[0].policy_version,
           conversation.recipient_fingerprint, touchIds, preparationGeneration,
@@ -1320,8 +1370,8 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
       const claimTokenDigest = requiredText(command.claimTokenDigest, 'claimTokenDigest', 64);
       if (!/^[0-9a-f]{64}$/.test(claimTokenDigest)) throw new Error('Invalid claim token digest');
       const claimOwner = requiredText(command.claimOwner, 'claimOwner', 200);
-      const claimExpiresAt = requiredInstant(command.claimExpiresAt);
-      const now = requiredInstant(command.now);
+      const claimExpiresAt = canonicalInstant(command.claimExpiresAt);
+      const now = canonicalInstant(command.now);
       const result = (flags, touch) => ({ claimed: false, alreadyOwned: false,
         staleAuthority: false, terminal: false, conflict: false, ...flags, touch });
       return database.transaction(() => {
@@ -1336,7 +1386,14 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           || touch.timezone_revision !== campaign.timezone_revision) {
           return result({ staleAuthority: true }, touch);
         }
+        if (touch.opportunity_id !== campaign.opportunity_id) {
+          return result({ terminal: true }, touch);
+        }
         if (!['initial-pending', 'active-follow-up'].includes(campaign.state)
+          || (touch.kind === 'initial' && (campaign.state !== 'initial-pending'
+            || campaign.generation !== 1
+            || campaign.policy_version !== 'deal-hunter-cim-autopilot-v1'
+            || touch.logical_slot !== 'initial' || touch.ordinal !== 0))
           || conversation.state !== 'open'
           || (campaign.local_expiry_at && Date.parse(campaign.local_expiry_at) <= Date.parse(now))
           || ['provider-pending', 'accepted', 'definitive-failure', 'ambiguous',
@@ -1347,15 +1404,23 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         if (!currentActivationChain(database, requiredCapability, now)) {
           return result({ staleAuthority: true }, touch);
         }
+        if (touch.transmission_id) return result({ conflict: true }, touch);
+        if (database.prepare(`SELECT 1 FROM deal_hunter_cim_transmission_touches
+          WHERE touch_id = ? LIMIT 1`).get(touchId)) {
+          return result({ conflict: true }, touch);
+        }
         if (touch.state === 'claimed' && touch.claim_token_digest === claimTokenDigest
-          && touch.claim_owner === claimOwner) return result({ alreadyOwned: true }, touch);
+          && touch.claim_owner === claimOwner) {
+          return result(touch.claim_expires_at && Date.parse(touch.claim_expires_at) > Date.parse(now)
+            ? { alreadyOwned: true } : { conflict: true }, touch);
+        }
         if (touch.state === 'claimed' && (!touch.claim_expires_at
           || Date.parse(touch.claim_expires_at) > Date.parse(now))) {
           return result({ conflict: true }, touch);
         }
         if (touch.row_version !== expectedRowVersion) return result({ staleAuthority: true }, touch);
         if (Date.parse(touch.due_at) > Date.parse(now)
-          || Date.parse(claimExpiresAt) <= Date.parse(now) || touch.transmission_id) {
+          || Date.parse(claimExpiresAt) <= Date.parse(now)) {
           return result({ conflict: true }, touch);
         }
         database.prepare(`
@@ -1372,6 +1437,36 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         return result({ claimed: true }, database.prepare('SELECT * FROM deal_hunter_cim_campaign_touches WHERE id = ?')
           .get(touchId));
       }).immediate();
+    },
+    async listDueCimInitialTouches({ now, limit = 25 } = {}) {
+      const at = canonicalInstant(now);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error('Invalid due touch limit');
+      }
+      if (!currentActivationChain(database, 'fl04b-initial', at)) return [];
+      return database.prepare(`
+        SELECT t.id AS touch_id, t.campaign_id, t.opportunity_id, t.kind,
+          t.state, t.due_at, t.row_version, t.claim_expires_at,
+          c.terminal_revision AS campaign_terminal_revision,
+          v.terminal_revision AS conversation_terminal_revision,
+          c.crm_submission_id, c.recipient_fingerprint AS campaign_recipient_fingerprint,
+          v.recipient_fingerprint AS conversation_recipient_fingerprint,
+          v.recipient_address
+        FROM deal_hunter_cim_campaign_touches AS t
+        JOIN deal_hunter_cim_campaigns AS c ON c.id = t.campaign_id
+        JOIN deal_hunter_broker_conversations AS v ON v.id = c.conversation_id
+        WHERE t.kind = 'initial' AND t.logical_slot = 'initial' AND t.ordinal = 0
+          AND c.generation = 1 AND c.policy_version = 'deal-hunter-cim-autopilot-v1'
+          AND c.state = 'initial-pending' AND v.state = 'open'
+          AND t.opportunity_id = c.opportunity_id
+          AND t.due_at <= ? AND (c.local_expiry_at IS NULL OR c.local_expiry_at > ?)
+          AND t.transmission_id IS NULL
+          AND (t.state = 'scheduled' OR (t.state = 'claimed'
+            AND t.claim_expires_at IS NOT NULL AND t.claim_expires_at <= ?))
+          AND t.timezone_revision = c.timezone_revision
+        ORDER BY t.due_at, t.id
+        LIMIT ?
+      `).all(at, at, at, limit);
     },
     async recordCimCapabilityActivation(command) {
       const id = requiredText(command.id, 'id');
