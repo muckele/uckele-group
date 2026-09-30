@@ -63,6 +63,17 @@ function requiredText(value, name, maximum = 240) {
   return value;
 }
 
+function requiredProvider(value) {
+  if (value !== 'resend') throw new Error('Provider outcome must use the approved Resend adapter');
+  return value;
+}
+
+function requiredProviderMessageId(value) {
+  const identity = requiredText(value, 'providerMessageId');
+  if (!/^[A-Za-z0-9_.:@-]+$/.test(identity)) throw new Error('Invalid providerMessageId');
+  return identity;
+}
+
 function requiredRevision(value, name) {
   if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${name} must be a nonnegative integer`);
   return value;
@@ -307,14 +318,20 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
     },
     async reconcileCimTransmission(command) {
       const transmissionId = requiredText(command.transmissionId, 'transmissionId');
+      const payloadDigest = requiredText(command.payloadDigest, 'payloadDigest', 64);
+      if (!/^[0-9a-f]{64}$/.test(payloadDigest)) throw new Error('Invalid reconciliation payload digest');
       const expectedRowVersion = requiredRevision(command.expectedRowVersion, 'expectedRowVersion');
       const outcomeState = requiredText(command.outcome, 'outcome', 40);
-      if (!['accepted', 'definitive-failure'].includes(outcomeState)) {
-        throw new Error('Reconciliation requires an exact terminal provider outcome');
+      if (!['accepted', 'definitive-failure', 'ambiguous'].includes(outcomeState)) {
+        throw new Error('Reconciliation requires a bounded provider outcome');
       }
-      const provider = requiredText(command.provider, 'provider', 80);
+      const provider = requiredProvider(command.provider);
       const providerMessageId = command.providerMessageId ?? null;
-      if (outcomeState === 'accepted') requiredText(providerMessageId, 'providerMessageId');
+      if (outcomeState === 'accepted') requiredProviderMessageId(providerMessageId);
+      else if (providerMessageId !== null) requiredProviderMessageId(providerMessageId);
+      if (outcomeState === 'ambiguous' && providerMessageId !== null) {
+        throw new Error('Ambiguous reconciliation cannot select a provider identity');
+      }
       const providerResultCode = requiredText(command.providerResultCode, 'providerResultCode', 160);
       const evidenceType = requiredText(command.evidenceType, 'evidenceType', 120);
       const evidenceId = requiredText(command.evidenceId, 'evidenceId');
@@ -322,6 +339,34 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
       if (!/^[0-9a-f]{64}$/.test(evidenceDigest)) throw new Error('Invalid reconciliation evidence digest');
       const actor = requiredText(command.actor, 'actor', 200);
       const now = requiredInstant(command.now);
+      const observedAt = canonicalInstant(command.observedAt ?? command.now);
+      const providerIdentities = command.providerIdentities ?? [];
+      if (!Array.isArray(providerIdentities) || providerIdentities.length > 20) {
+        throw new Error('Provider reconciliation identities must be a bounded array');
+      }
+      const normalizedIdentities = providerIdentities.map((identity) => {
+        if (!identity || typeof identity !== 'object' || Array.isArray(identity)
+          || Object.keys(identity).sort().join(',')
+            !== 'evidenceDigest,evidenceId,provider,providerMessageId'
+          || identity.provider !== 'resend') {
+          throw new Error('Invalid provider identity conflict evidence');
+        }
+        const providerMessageId = requiredProviderMessageId(identity?.providerMessageId);
+        const evidenceId = requiredText(identity?.evidenceId, 'providerIdentity.evidenceId');
+        const evidenceDigest = requiredText(identity?.evidenceDigest,
+          'providerIdentity.evidenceDigest', 64);
+        if (!/^[0-9a-f]{64}$/.test(evidenceDigest)) {
+          throw new Error('Invalid provider identity evidence digest');
+        }
+        return { providerMessageId, evidenceId, evidenceDigest };
+      }).sort((left, right) => stableCanonicalJson(left).localeCompare(stableCanonicalJson(right)));
+      const evidencePayloadDigest = canonicalDigest({ providerMessageId, observedAt,
+        providerIdentities: normalizedIdentities });
+      if (normalizedIdentities.length > 0
+        && (outcomeState !== 'ambiguous'
+          || new Set(normalizedIdentities.map(({ providerMessageId }) => providerMessageId)).size < 2)) {
+        throw new Error('Provider identity evidence requires a multiple-ID ambiguity');
+      }
       const result = (flags, transmission = null) => ({ applied: false, unchanged: false,
         conflict: false, ...flags, transmission });
       return database.transaction(() => {
@@ -329,11 +374,53 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?
         `).get(transmissionId);
         if (!transmission) return result({ conflict: true });
+        if (transmission.payload_digest !== payloadDigest) {
+          return result({ conflict: true }, transmission);
+        }
+        const evidenceAuthorityId = `${transmissionId}:${evidenceType}:${evidenceId}`;
+        const evidenceAuditId = digest('cim-audit:v1',
+          'transmission-reconciled', evidenceAuthorityId);
+        const priorEvidence = database.prepare(`
+          SELECT * FROM deal_hunter_cim_audit_events WHERE id = ?
+        `).get(evidenceAuditId);
+        if (priorEvidence) {
+          const unchanged = priorEvidence.transmission_id === transmissionId
+            && priorEvidence.authority_digest === evidenceDigest
+            && priorEvidence.source === evidenceType
+            && priorEvidence.next_state === outcomeState
+            && priorEvidence.reason_code === providerResultCode
+            && priorEvidence.payload_digest === evidencePayloadDigest;
+          return result({ unchanged, conflict: !unchanged }, transmission);
+        }
+        const appendEvidence = (priorState, nextState) => {
+          appendAudit(database, { eventType: 'transmission-reconciled',
+            authorityId: evidenceAuthorityId,
+            conversationId: transmission.conversation_id, transmissionId,
+            priorState, nextState, reasonCode: providerResultCode,
+            authorityDigest: evidenceDigest,
+            payloadDigest: evidencePayloadDigest,
+            actor, source: evidenceType, occurredAt: observedAt });
+          for (const identity of normalizedIdentities) {
+            appendAudit(database, { eventType: 'provider-identity-conflict',
+              authorityId: `${evidenceAuthorityId}:${identity.evidenceId}`,
+              conversationId: transmission.conversation_id, transmissionId,
+              priorState, nextState: 'ambiguous', reasonCode: 'multiple_provider_ids',
+              authorityDigest: identity.evidenceDigest,
+              payloadDigest: sha256(identity.providerMessageId), actor,
+              source: evidenceType, occurredAt: observedAt });
+          }
+        };
         if (['accepted', 'definitive-failure'].includes(transmission.state)) {
           const unchanged = transmission.state === outcomeState && transmission.provider === provider
-            && transmission.provider_message_id === providerMessageId
-            && transmission.provider_result_code === providerResultCode;
+            && transmission.provider_message_id === providerMessageId;
+          if (unchanged) appendEvidence(transmission.state, transmission.state);
           return result({ unchanged, conflict: !unchanged }, transmission);
+        }
+        if (transmission.state === 'ambiguous' && outcomeState === 'ambiguous'
+          && transmission.provider === provider
+          && transmission.provider_message_id === null) {
+          appendEvidence('ambiguous', 'ambiguous');
+          return result({ unchanged: true }, transmission);
         }
         if (!['provider-pending', 'ambiguous'].includes(transmission.state)
           || transmission.row_version !== expectedRowVersion
@@ -356,18 +443,6 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         const shouldAdvance = members.length === 1
           && members[0].campaign_terminal_revision === transmission.campaign_terminal_revision
           && ['provider-ambiguous', 'initial-pending', 'active-follow-up'].includes(members[0].campaign_state);
-        if (shouldAdvance && outcomeState === 'accepted' && members[0].kind === 'initial') {
-          const next = command.nextTouch;
-          if (!next || next.logicalSlot !== 'follow-up-1' || next.kind !== 'follow-up-1'
-            || next.ordinal !== 1) throw new Error('Accepted initial reconciliation requires next slot');
-          requiredInstant(next.dueAt);
-          requiredText(next.dueLocal, 'dueLocal', 120);
-          requiredText(next.cadencePolicyVersion, 'cadencePolicyVersion', 120);
-          requiredInstant(command.localExpiryAt);
-          if (!command.expiryDerivation || JSON.stringify(command.expiryDerivation).length > 1000) {
-            throw new Error('Invalid expiry derivation');
-          }
-        }
         database.prepare(`
           UPDATE deal_hunter_cim_transmissions SET state = ?, provider = ?,
             provider_message_id = ?, provider_result_code = ?, updated_at = ?,
@@ -387,19 +462,17 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
             touchId: member.id, transmissionId, priorState: member.state,
             nextState: outcomeState, authorityDigest: evidenceDigest, actor, occurredAt: now });
           if (shouldAdvance) {
-            const campaignNextState = outcomeState === 'accepted' ? 'active-follow-up' : 'action-required';
+            const campaignNextState = outcomeState === 'accepted' ? 'active-follow-up'
+              : outcomeState === 'definitive-failure' ? 'action-required' : 'provider-ambiguous';
             database.prepare(`
               UPDATE deal_hunter_cim_campaigns SET state = ?, reason_code = ?,
                 initial_accepted_at = COALESCE(initial_accepted_at, ?),
-                local_expiry_at = COALESCE(local_expiry_at, ?),
-                expiry_derivation = CASE WHEN initial_accepted_at IS NULL THEN ? ELSE expiry_derivation END,
                 updated_at = ?, row_version = row_version + 1
               WHERE id = ? AND row_version = ? AND terminal_revision = ?
             `).run(campaignNextState,
-              outcomeState === 'definitive-failure' ? 'provider_definitive_failure' : null,
-              outcomeState === 'accepted' ? now : null,
-              outcomeState === 'accepted' ? command.localExpiryAt ?? null : null,
-              outcomeState === 'accepted' ? JSON.stringify(command.expiryDerivation ?? {}) : '{}',
+              outcomeState === 'definitive-failure' ? 'provider_definitive_failure'
+                : outcomeState === 'ambiguous' ? 'provider_ambiguous' : null,
+              outcomeState === 'accepted' ? observedAt : null,
               now, member.campaign_id, member.campaign_row_version,
               member.campaign_terminal_revision);
             appendAudit(database, { eventType: 'campaign-transition',
@@ -407,38 +480,57 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
               opportunityId: member.opportunity_id, campaignId: member.campaign_id,
               priorState: member.campaign_state, nextState: campaignNextState,
               authorityDigest: evidenceDigest, actor, occurredAt: now });
-            if (outcomeState === 'accepted' && member.kind === 'initial') {
-              const next = command.nextTouch;
-              const nextTouchId = digest('cim-touch:v1', member.campaign_id,
-                next.logicalSlot, next.cadencePolicyVersion);
-              database.prepare(`
-                INSERT INTO deal_hunter_cim_campaign_touches (
-                  id, campaign_id, opportunity_id, logical_slot, kind, ordinal,
-                  due_at, due_local, timezone_revision, state, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)
-              `).run(nextTouchId, member.campaign_id, member.opportunity_id,
-                next.logicalSlot, next.kind, next.ordinal, next.dueAt, next.dueLocal,
-                member.campaign_timezone_revision, now, now);
-              appendAudit(database, { eventType: 'touch-created', authorityId: nextTouchId,
-                opportunityId: member.opportunity_id, campaignId: member.campaign_id,
-                touchId: nextTouchId, nextState: 'scheduled', actor, occurredAt: now });
-            }
           }
         }
-        const deliveryState = outcomeState === 'definitive-failure' ? 'failed' : 'accepted';
+        if (outcomeState === 'ambiguous') {
+          const conversation = database.prepare(`
+            SELECT * FROM deal_hunter_broker_conversations WHERE id = ?
+          `).get(transmission.conversation_id);
+          if (conversation?.state === 'open') {
+            database.prepare(`
+              UPDATE deal_hunter_broker_conversations SET state = 'provider-ambiguous',
+                terminal_revision = terminal_revision + 1, row_version = row_version + 1,
+                updated_at = ? WHERE id = ? AND state = 'open' AND row_version = ?
+            `).run(now, conversation.id, conversation.row_version);
+            appendAudit(database, { eventType: 'conversation-provider-ambiguous',
+              authorityId: `${conversation.id}:${conversation.terminal_revision + 1}`,
+              conversationId: conversation.id, transmissionId,
+              priorState: 'open', nextState: 'provider-ambiguous',
+              reasonCode: 'provider_ambiguous', authorityDigest: evidenceDigest,
+              actor, source: evidenceType, occurredAt: observedAt });
+          }
+        }
+        const unresolved = database.prepare(`
+          SELECT COUNT(*) AS count FROM deal_hunter_cim_transmissions
+          WHERE conversation_id = ? AND id <> ? AND state IN ('provider-pending', 'ambiguous')
+        `).get(transmission.conversation_id, transmissionId).count;
+        const conversation = database.prepare(`
+          SELECT * FROM deal_hunter_broker_conversations WHERE id = ?
+        `).get(transmission.conversation_id);
+        if (outcomeState !== 'ambiguous'
+          && conversation?.state === 'provider-ambiguous' && unresolved === 0) {
+          database.prepare(`
+            UPDATE deal_hunter_broker_conversations SET state = 'open',
+              terminal_revision = terminal_revision + 1, row_version = row_version + 1,
+              updated_at = ? WHERE id = ? AND state = 'provider-ambiguous' AND row_version = ?
+          `).run(now, conversation.id, conversation.row_version);
+          appendAudit(database, { eventType: 'conversation-provider-reconciled',
+            authorityId: `${conversation.id}:${conversation.terminal_revision + 1}`,
+            conversationId: conversation.id, priorState: 'provider-ambiguous',
+            nextState: 'open', authorityDigest: evidenceDigest, actor,
+            source: evidenceType, occurredAt: now });
+        }
+        const deliveryState = outcomeState === 'definitive-failure' ? 'failed' : outcomeState;
         database.prepare(`
           UPDATE crm_communications SET provider = ?, provider_message_id = ?,
             delivery_state = ?, delivery_state_at = ?, updated_at = ? WHERE id = ?
-        `).run(provider, providerMessageId, deliveryState, now, now, transmission.communication_id);
+        `).run(provider, providerMessageId, deliveryState, observedAt, now,
+          transmission.communication_id);
         database.prepare(`
           UPDATE crm_email_outbox SET provider = ?, provider_message_id = ?,
             state = ?, attempt_count = 1, updated_at = ? WHERE id = ?
         `).run(provider, providerMessageId, deliveryState, now, transmission.outbox_id);
-        appendAudit(database, { eventType: 'transmission-reconciled',
-          authorityId: `${transmissionId}:${evidenceType}:${evidenceId}`,
-          conversationId: transmission.conversation_id, transmissionId,
-          priorState: transmission.state, nextState: outcomeState,
-          authorityDigest: evidenceDigest, actor, source: evidenceType, occurredAt: now });
+        appendEvidence(transmission.state, outcomeState);
         return result({ applied: true }, database.prepare(`
           SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?
         `).get(transmissionId));
@@ -446,35 +538,35 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
     },
     async finalizeCimTransmission(command) {
       const transmissionId = requiredText(command.transmissionId, 'transmissionId');
+      const payloadDigest = requiredText(command.payloadDigest, 'payloadDigest', 64);
+      if (!/^[0-9a-f]{64}$/.test(payloadDigest)) throw new Error('Invalid finalization payload digest');
       const expectedRowVersion = requiredRevision(command.expectedRowVersion, 'expectedRowVersion');
       const outcomeState = requiredText(command.outcome, 'outcome', 40);
       if (!['accepted', 'definitive-failure', 'ambiguous'].includes(outcomeState)) {
         throw new Error('Invalid provider finalization outcome');
       }
-      const provider = requiredText(command.provider, 'provider', 80);
+      const provider = requiredProvider(command.provider);
       const providerMessageId = command.providerMessageId ?? null;
-      if (outcomeState === 'accepted') requiredText(providerMessageId, 'providerMessageId');
-      else if (providerMessageId !== null) requiredText(providerMessageId, 'providerMessageId');
+      if (outcomeState === 'accepted') requiredProviderMessageId(providerMessageId);
+      else if (providerMessageId !== null) requiredProviderMessageId(providerMessageId);
       const providerResultCode = requiredText(command.providerResultCode, 'providerResultCode', 160);
       const actor = requiredText(command.actor, 'actor', 200);
       const now = requiredInstant(command.now);
+      const observedAt = canonicalInstant(command.observedAt ?? command.now);
       const outcome = (flags, transmission = null, nextTouch = null) => ({ applied: false,
         existing: false, conflict: false, ...flags, transmission, nextTouch });
       return database.transaction(() => {
         const transmission = database.prepare('SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?')
           .get(transmissionId);
         if (!transmission) return outcome({ conflict: true });
+        if (transmission.payload_digest !== payloadDigest) {
+          return outcome({ conflict: true }, transmission, null);
+        }
         if (['accepted', 'definitive-failure', 'ambiguous'].includes(transmission.state)) {
           const existing = transmission.state === outcomeState && transmission.provider === provider
             && transmission.provider_message_id === providerMessageId
             && transmission.provider_result_code === providerResultCode;
-          const nextTouch = existing ? database.prepare(`
-            SELECT * FROM deal_hunter_cim_campaign_touches
-            WHERE campaign_id IN (
-              SELECT campaign_id FROM deal_hunter_cim_transmission_touches WHERE transmission_id = ?
-            ) AND ordinal = 1 ORDER BY id LIMIT 1
-          `).get(transmissionId) ?? null : null;
-          return outcome({ existing, conflict: !existing }, transmission, nextTouch);
+          return outcome({ existing, conflict: !existing }, transmission, null);
         }
         if (transmission.state !== 'provider-pending'
           || transmission.row_version !== expectedRowVersion
@@ -494,25 +586,6 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         }
         const nextState = outcomeState === 'accepted' ? 'active-follow-up'
           : outcomeState === 'definitive-failure' ? 'action-required' : 'provider-ambiguous';
-        let nextTouch = null;
-        if (outcomeState === 'accepted' && members.length === 1
-          && members[0].campaign_state === 'initial-pending'
-          && members[0].campaign_terminal_revision === transmission.campaign_terminal_revision) {
-          if (!command.nextTouch) throw new Error('Accepted initial finalization requires next slot');
-          const next = command.nextTouch;
-          const logicalSlot = requiredText(next.logicalSlot, 'logicalSlot', 160);
-          const kind = requiredText(next.kind, 'kind', 40);
-          if (logicalSlot !== 'follow-up-1' || kind !== 'follow-up-1' || next.ordinal !== 1) {
-            throw new Error('Invalid first follow-up slot');
-          }
-          requiredInstant(next.dueAt);
-          requiredText(next.dueLocal, 'dueLocal', 120);
-          requiredText(next.cadencePolicyVersion, 'cadencePolicyVersion', 120);
-          requiredInstant(command.localExpiryAt);
-          if (!command.expiryDerivation || JSON.stringify(command.expiryDerivation).length > 1000) {
-            throw new Error('Invalid expiry derivation');
-          }
-        }
         database.prepare(`
           UPDATE deal_hunter_cim_transmissions SET state = ?, provider = ?,
             provider_message_id = ?, provider_result_code = ?,
@@ -537,46 +610,43 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           database.prepare(`
             UPDATE deal_hunter_cim_campaigns SET state = ?, reason_code = ?,
               initial_accepted_at = COALESCE(initial_accepted_at, ?),
-              local_expiry_at = COALESCE(local_expiry_at, ?),
-              expiry_derivation = CASE WHEN initial_accepted_at IS NULL THEN ? ELSE expiry_derivation END,
               row_version = row_version + 1, updated_at = ?
             WHERE id = ? AND row_version = ? AND terminal_revision = ?
           `).run(nextState,
             outcomeState === 'definitive-failure' ? 'provider_definitive_failure'
               : outcomeState === 'ambiguous' ? 'provider_ambiguous' : null,
-            outcomeState === 'accepted' ? now : null,
-            outcomeState === 'accepted' ? command.localExpiryAt ?? null : null,
-            outcomeState === 'accepted' ? JSON.stringify(command.expiryDerivation ?? {}) : '{}',
+            outcomeState === 'accepted' ? observedAt : null,
             now, member.campaign_id, member.campaign_row_version,
             member.campaign_terminal_revision);
           appendAudit(database, { eventType: 'campaign-transition',
             authorityId: `${member.campaign_id}:${member.campaign_row_version + 1}`,
             opportunityId: member.opportunity_id, campaignId: member.campaign_id,
             priorState: member.campaign_state, nextState, actor, occurredAt: now });
-          if (outcomeState === 'accepted' && member.kind === 'initial') {
-            const next = command.nextTouch;
-            const nextTouchId = digest('cim-touch:v1', member.campaign_id,
-              next.logicalSlot, next.cadencePolicyVersion);
+        }
+        if (outcomeState === 'ambiguous') {
+          const conversation = database.prepare(`
+            SELECT * FROM deal_hunter_broker_conversations WHERE id = ?
+          `).get(transmission.conversation_id);
+          if (conversation?.state === 'open') {
             database.prepare(`
-              INSERT INTO deal_hunter_cim_campaign_touches (
-                id, campaign_id, opportunity_id, logical_slot, kind, ordinal,
-                due_at, due_local, timezone_revision, state, created_at, updated_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)
-            `).run(nextTouchId, member.campaign_id, member.opportunity_id,
-              next.logicalSlot, next.kind, next.ordinal, next.dueAt, next.dueLocal,
-              member.campaign_timezone_revision, now, now);
-            appendAudit(database, { eventType: 'touch-created', authorityId: nextTouchId,
-              opportunityId: member.opportunity_id, campaignId: member.campaign_id,
-              touchId: nextTouchId, nextState: 'scheduled', actor, occurredAt: now });
-            nextTouch = database.prepare('SELECT * FROM deal_hunter_cim_campaign_touches WHERE id = ?')
-              .get(nextTouchId);
+              UPDATE deal_hunter_broker_conversations SET state = 'provider-ambiguous',
+                terminal_revision = terminal_revision + 1, row_version = row_version + 1,
+                updated_at = ? WHERE id = ? AND state = 'open' AND row_version = ?
+            `).run(now, conversation.id, conversation.row_version);
+            appendAudit(database, { eventType: 'conversation-provider-ambiguous',
+              authorityId: `${conversation.id}:${conversation.terminal_revision + 1}`,
+              conversationId: conversation.id, transmissionId,
+              priorState: 'open', nextState: 'provider-ambiguous',
+              reasonCode: 'provider_ambiguous', payloadDigest: transmission.payload_digest,
+              actor, occurredAt: now });
           }
         }
         const deliveryState = outcomeState === 'definitive-failure' ? 'failed' : outcomeState;
         database.prepare(`
           UPDATE crm_communications SET provider = ?, provider_message_id = ?,
             delivery_state = ?, delivery_state_at = ?, updated_at = ? WHERE id = ?
-        `).run(provider, providerMessageId, deliveryState, now, now, transmission.communication_id);
+        `).run(provider, providerMessageId, deliveryState, observedAt, now,
+          transmission.communication_id);
         database.prepare(`
           UPDATE crm_email_outbox SET provider = ?, provider_message_id = ?,
             state = ?, attempt_count = 1, updated_at = ? WHERE id = ?
@@ -584,10 +654,10 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         appendAudit(database, { eventType: 'transmission-finalized', authorityId: transmissionId,
           conversationId: transmission.conversation_id, transmissionId,
           priorState: 'provider-pending', nextState: outcomeState,
-          payloadDigest: transmission.payload_digest, actor, occurredAt: now });
+          payloadDigest: transmission.payload_digest, actor, occurredAt: observedAt });
         return outcome({ applied: true }, database.prepare(`
           SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?
-        `).get(transmissionId), nextTouch);
+        `).get(transmissionId), null);
       }).immediate();
     },
     async readCimFinalGateContext(command) {

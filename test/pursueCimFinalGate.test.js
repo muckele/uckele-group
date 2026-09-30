@@ -16,14 +16,15 @@ function finalGateContext() {
       id: 'transmission-1', conversation_id: 'conversation-1', state: 'prepared',
       release_state: 'ordinary', row_version: 1, invocation_authority_count: 0,
       payload_digest: hex('a'), member_digest: hex('b'), preparation_generation: 1,
-      payload_version: 'payload-v1', communication_id: 'communication-1',
+      payload_version: 'deal-hunter-cim-manual-stage1-v1', communication_id: 'communication-1',
       outbox_id: 'outbox-1', provider_seam_entered_at: null,
     },
     conversation: {
       id: 'conversation-1', state: 'open', terminal_revision: 0, row_version: 1,
       recipient_authority_id: 'recipient-authority-1', recipient_fingerprint: hex('c'),
-      recipient_address: 'broker@example.test', sender_policy_version: 'sender-v1',
-      reply_policy_version: 'reply-v1',
+      recipient_address: 'broker@example.test',
+      sender_policy_version: 'deal-hunter-cim-autopilot-v1',
+      reply_policy_version: 'deal-hunter-cim-autopilot-v1',
     },
     authorization: {
       id: 'authorization-1', activation_id: 'activation-1', capability: 'fl04b-initial',
@@ -70,7 +71,9 @@ function finalGateContext() {
         canonical_revision: 0, discovery_revision: 0, material_revision: 0,
         timezone_revision: 1, permission_version: 'activation-1',
         permission_digest: hex('1'), permission_revision: 1, permission_scope: hex('f'),
-        policy_version: 'policy-v1', template_version: 'template-v1', local_expiry_at: null },
+        policy_version: 'deal-hunter-cim-autopilot-v1',
+        template_version: 'deal-hunter-cim-autopilot-v1',
+        local_expiry_at: null },
       decision: { id: 'decision-1', action: 'pursue', request_digest: hex('6') },
       enrollment: { id: 'enrollment-1', state: 'campaign-created', row_version: 2,
         authority_digest: hex('7'), decision_event_id: 'decision-1' },
@@ -206,4 +209,59 @@ test('P6A production readiness remains closed until request-specific signed inbo
   assert.equal(readiness.requestReplyRoutingVerified, false);
   assert.equal(readiness.ready, false);
   assert.deepEqual(readiness.blockers, ['request_reply_routing_unverified']);
+});
+
+test('P6C unknown transmission or policy tuple terminalizes before readiness or provider work', async () => {
+  for (const mutate of [
+    (context) => { context.transmission.payload_version = 'future-payload-v2'; },
+    (context) => { context.members[0].campaign.template_version = 'future-template-v2'; },
+    (context) => { context.conversation.sender_policy_version = 'future-sender-v2'; },
+  ]) {
+    const context = finalGateContext();
+    mutate(context);
+    let terminalCalls = 0;
+    let readinessCalls = 0;
+    let providerPendingCalls = 0;
+    const outcome = await authorizePreparedCimTransmission({
+      storage: {
+        async readCimFinalGateContext() { return context; },
+        async appendCimTerminalEvent() { terminalCalls += 1; return { applied: true }; },
+        async authorizeCimProviderPending() { providerPendingCalls += 1;
+          throw new Error('must not authorize'); },
+      },
+      transmissionId: 'transmission-1', authorizationId: 'authorization-1',
+      writerPath: 'pursue-cim-initial', providerProfile: 'synthetic-provider',
+      actor: 'final-gate-worker', now,
+      loadMemberAuthority: async () => memberAuthority(),
+      readCurrentAuthority: async () => currentAuthority(),
+      readProviderReadiness: async () => { readinessCalls += 1; return ready(); },
+    });
+    assert.equal(outcome.blockedReason, 'unknown_policy_version');
+    assert.equal(terminalCalls, 1);
+    assert.equal(readinessCalls, 0);
+    assert.equal(providerPendingCalls, 0);
+  }
+});
+
+test('P6C unknown-policy CAS conflict must re-read and prove a durable safe terminal state', async () => {
+  const unknown = finalGateContext();
+  unknown.members[0].campaign.policy_version = 'future-policy-v2';
+  const terminal = structuredClone(unknown);
+  terminal.members[0].campaign.state = 'action-required';
+  terminal.members[0].campaign.reason_code = 'unknown_policy_version';
+  terminal.members[0].campaign.row_version += 1;
+  terminal.members[0].campaign.terminal_revision += 1;
+  let reads = 0;
+  const outcome = await authorizePreparedCimTransmission({
+    storage: {
+      async readCimFinalGateContext() { reads += 1; return reads === 1 ? unknown : terminal; },
+      async appendCimTerminalEvent() { return { applied: false, replay: false, conflict: true }; },
+      async authorizeCimProviderPending() { throw new Error('must not authorize'); },
+    },
+    transmissionId: 'transmission-1', authorizationId: 'authorization-1',
+    writerPath: 'pursue-cim-initial', providerProfile: 'synthetic-provider',
+    actor: 'final-gate-worker', now,
+  });
+  assert.equal(outcome.blockedReason, 'unknown_policy_version');
+  assert.equal(reads, 2);
 });

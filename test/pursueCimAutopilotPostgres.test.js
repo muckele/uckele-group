@@ -27,6 +27,8 @@ const p6aMigrationPath = path.join(root,
   'supabase/migrations/20261003120000_pursue_cim_final_gate.sql');
 const p6bMigrationPath = path.join(root,
   'supabase/migrations/20261004120000_pursue_cim_provider_boundary.sql');
+const p6cMigrationPath = path.join(root,
+  'supabase/migrations/20261005120000_pursue_cim_provider_outcomes.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -137,6 +139,26 @@ test('P6B PostgreSQL seam requires exact payload capability work and service-rol
   assert.match(migration, /v_communication\.delivery_state is distinct from 'provider-pending'/);
   assert.match(migration, /v_outbox\.state is distinct from 'provider-pending'/);
   assert.match(migration, /revoke all on function public\.pursue_cim_enter_provider_seam_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
+});
+
+test('P6C PostgreSQL outcomes are mirrored, service-role-only, and create no cadence slot', () => {
+  const migration = fs.readFileSync(p6cMigrationPath, 'utf8').trim();
+  const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
+  assert.ok(schema.includes(migration), 'canonical schema must contain the exact additive P6C block');
+  assert.match(migration, /security definer set search_path = ''/i);
+  assert.match(migration, /v_provider <> 'resend'/);
+  assert.match(migration, /provider_seam_entered_at is null/);
+  assert.match(migration, /conversation-provider-ambiguous/);
+  assert.match(migration, /conversation-provider-reconciled/);
+  assert.match(migration, /provider-identity-conflict/);
+  assert.match(migration, /value - array\['provider','providerMessageId','evidenceId','evidenceDigest'\]/);
+  assert.match(migration, /value->>'provider' is distinct from 'resend'/);
+  assert.match(migration, /jsonb_array_length\(p_command->'providerIdentities'\) > 20/);
+  assert.match(migration, /v_evidence_payload_digest[\s\S]*pg_catalog\.to_jsonb\(v_observed\)[\s\S]*providerIdentities/);
+  assert.match(migration, /delivery_state=v_delivery_state,delivery_state_at=v_observed/);
+  assert.doesNotMatch(migration, /insert into public\.deal_hunter_cim_campaign_touches/);
+  assert.match(migration, /revoke all on function public\.pursue_cim_finalize_transmission_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
+  assert.match(migration, /revoke all on function public\.pursue_cim_reconcile_transmission_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
 });
 
 test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
@@ -392,6 +414,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p5MigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6aMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6bMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cMigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -672,6 +695,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p5MigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6aMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6bMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',
@@ -792,7 +816,8 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
   ];
   const campaignCommand = { opportunityId: 'opp-decision', expectedEnrollmentRowVersion: 1,
-    generation: 1, policyVersion: 'deal-hunter-cim-autopilot-v1', templateVersion: 'template-v1',
+    generation: 1, policyVersion: 'deal-hunter-cim-autopilot-v1',
+    templateVersion: 'deal-hunter-cim-autopilot-v1',
     templateDigest: '1'.repeat(64), permissionVersion: 'activation-enrollment',
     permissionDigest: '2'.repeat(64), permissionRevision: 1,
     permissionScope: '4'.repeat(64), policyHash: 'a'.repeat(64), canonicalRevision: 1,
@@ -801,8 +826,9 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     campaignAuthorityRevision: 1,
     globalAuthorityRevision: 1,
     recipientAuthorityId: 'recipient-materialize', recipientFingerprint: parityRecipientFingerprint,
-    recipientAddress: 'broker2@example.test', senderPolicyVersion: 'sender-v1',
-    replyPolicyVersion: 'reply-v1', replyAliasTokenDigest: '9'.repeat(64),
+    recipientAddress: 'broker2@example.test',
+    senderPolicyVersion: 'deal-hunter-cim-autopilot-v1',
+    replyPolicyVersion: 'deal-hunter-cim-autopilot-v1', replyAliasTokenDigest: '9'.repeat(64),
     rfcThreadKey: 'thread-materialize', batchingPolicyVersion: 'batching-off-v1',
     freshnessAuthorityDigest: '3'.repeat(64), expectedDiscoveryRevision: 0,
     expectedMaterialRevision: 0, timezoneRevision: 1,
@@ -1951,20 +1977,13 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       select public.${name}('${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);
       rollback;
     `));
-    const acceptedSlot = {
-      localExpiryAt: '2026-10-16T19:00:00.000Z',
-      expiryDerivation: { policy: 'synthetic-v1' },
-      nextTouch: { logicalSlot: 'follow-up-1', kind: 'follow-up-1', ordinal: 1,
-        dueAt: '2026-09-28T19:00:00.000Z', dueLocal: '2026-09-28T12:00:00-07:00',
-        cadencePolicyVersion: 'cadence-v1' },
-    };
     const acceptedFinalization = rolledBackRpc('pursue_cim_finalize_transmission_v1', {
-      ...reference.finalizeCommands[0], ...acceptedSlot, outcome: 'accepted',
+      ...reference.finalizeCommands[0], outcome: 'accepted',
       providerMessageId: 'accepted-proof', providerResultCode: 'accepted',
     });
     assert.equal(acceptedFinalization.applied, true, database);
     assert.equal(acceptedFinalization.transmission.state, 'accepted', database);
-    assert.equal(acceptedFinalization.nextTouch?.state, 'scheduled', database);
+    assert.equal(acceptedFinalization.nextTouch, null, database);
     const failedFinalization = rolledBackRpc('pursue_cim_finalize_transmission_v1', {
       ...reference.finalizeCommands[0], outcome: 'definitive-failure',
       providerResultCode: 'provider-rejected',
@@ -1973,7 +1992,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     assert.equal(failedFinalization.transmission.state, 'definitive-failure', database);
     assert.equal(failedFinalization.nextTouch, null, database);
     const acceptedReconciliation = rolledBackRpc('pursue_cim_reconcile_transmission_v1', {
-      ...reference.reconcileCommands[0], ...acceptedSlot, expectedRowVersion: 3,
+      ...reference.reconcileCommands[0], expectedRowVersion: 3,
       outcome: 'accepted', providerMessageId: 'reconciled-proof',
       evidenceId: 'direct-accepted-proof',
     });
@@ -1994,6 +2013,48 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     `).split('\n').at(-1);
     assert.equal(directPriorState, 'provider-pending',
       `${database}: direct provider-pending reconciliation audit must retain actual prior state`);
+    const multipleIdentityCommand = {
+      ...reference.reconcileCommands[0],
+      expectedRowVersion: 3,
+      outcome: 'ambiguous',
+      providerMessageId: null,
+      providerResultCode: 'multiple-provider-ids',
+      evidenceId: 'multiple-provider-ids',
+      observedAt: '2026-09-25T19:00:07.000Z',
+      providerIdentities: [
+        { provider: 'resend', providerMessageId: 'provider-a', evidenceId: 'candidate-a',
+          evidenceDigest: 'b'.repeat(64) },
+        { provider: 'resend', providerMessageId: 'provider-b', evidenceId: 'candidate-b',
+          evidenceDigest: 'c'.repeat(64) },
+      ],
+    };
+    const changedEvidenceCommand = { ...multipleIdentityCommand,
+      observedAt: '2026-09-25T19:00:08.000Z' };
+    const evidenceReplay = psql(container, database, `begin;
+      set role service_role;
+      select public.pursue_cim_reconcile_transmission_v1(
+        '${JSON.stringify(multipleIdentityCommand).replaceAll("'", "''")}'::jsonb);
+      select public.pursue_cim_reconcile_transmission_v1(
+        '${JSON.stringify(multipleIdentityCommand).replaceAll("'", "''")}'::jsonb);
+      select public.pursue_cim_reconcile_transmission_v1(
+        '${JSON.stringify(changedEvidenceCommand).replaceAll("'", "''")}'::jsonb);
+      rollback;`).split('\n').filter((line) => line.startsWith('{')).map(JSON.parse);
+    assert.deepEqual(evidenceReplay.map(({ applied, unchanged, conflict }) =>
+      ({ applied, unchanged, conflict })), [
+      { applied: true, unchanged: false, conflict: false },
+      { applied: false, unchanged: true, conflict: false },
+      { applied: false, unchanged: false, conflict: true },
+    ], `${database}: multiple-ID evidence must be bounded, replayable, and drift-sensitive`);
+    const invalidIdentity = rejectedSql(container, database, `begin;
+      set role service_role;
+      select public.pursue_cim_reconcile_transmission_v1(
+        '${JSON.stringify({ ...multipleIdentityCommand,
+          providerIdentities: [{ provider: 'resend', providerMessageId: 'bad id',
+            evidenceId: 'candidate-a', evidenceDigest: 'b'.repeat(64) },
+          multipleIdentityCommand.providerIdentities[1]] }).replaceAll("'", "''")}'::jsonb);
+      rollback;`);
+    assert.notEqual(invalidIdentity.status, 0,
+      `${database}: malformed provider identities must fail before mutation`);
     assert.equal(reference.expectedFinalizations[0].applied, true);
     for (const [index, command] of reference.finalizeCommands.entries()) {
       if (index === 0) {

@@ -5,9 +5,11 @@ import { evaluateAcquisitionMaterialsState } from './acquisitionMaterials.js';
 import { readCimCurrentAuthority as readCurrentCimAuthority } from './cimCampaignSafety.js';
 import { loadBrokerMaterialsAuthority } from './dealHunterBrokerMaterials.js';
 import { getEmailReadiness } from './emailReadiness.js';
+import { CIM_CAMPAIGN_POLICY_VERSION } from './cimCampaignPolicy.js';
 
 const READINESS_VERSION = 'cim-provider-readiness-v1';
 const SOURCE_AUTHORITY_VERSION = 'cim-source-health-authority-v1';
+const INITIAL_PAYLOAD_VERSION = 'deal-hunter-cim-manual-stage1-v1';
 
 function text(value, maximum = 240) {
   const normalized = String(value ?? '').trim();
@@ -236,6 +238,60 @@ export async function authorizePreparedCimTransmission({
     writerPath, providerProfile, now: gateInstant });
   if (!context?.transmission || !Array.isArray(context.members) || context.members.length < 1) {
     return failure('lifecycle_conflict');
+  }
+  const unknownTransmissionPolicy = context.transmission.payload_version !== INITIAL_PAYLOAD_VERSION
+    || context.conversation?.sender_policy_version !== CIM_CAMPAIGN_POLICY_VERSION
+    || context.conversation?.reply_policy_version !== CIM_CAMPAIGN_POLICY_VERSION;
+  const unknownPolicyCampaigns = [...new Map(context.members
+    .filter((member) => unknownTransmissionPolicy
+      || member?.campaign?.policy_version !== CIM_CAMPAIGN_POLICY_VERSION
+      || member?.campaign?.template_version !== CIM_CAMPAIGN_POLICY_VERSION)
+    .map((member) => [member.campaign?.id, member.campaign])).values()]
+    .filter((campaign) => campaign?.id);
+  if (unknownPolicyCampaigns.length > 0) {
+    if (typeof storage.appendCimTerminalEvent !== 'function') {
+      return failure('unknown_policy_version');
+    }
+    for (let campaign of unknownPolicyCampaigns) {
+      const evidence = {
+        campaignId: campaign.id,
+        policyVersion: String(campaign.policy_version ?? ''),
+        templateVersion: String(campaign.template_version ?? ''),
+        payloadVersion: String(context.transmission.payload_version ?? ''),
+        senderPolicyVersion: String(context.conversation?.sender_policy_version ?? ''),
+        replyPolicyVersion: String(context.conversation?.reply_policy_version ?? ''),
+        transmissionId: context.transmission.id,
+      };
+      let projected = false;
+      for (let attempt = 0; attempt < 2 && !projected; attempt += 1) {
+        try {
+          const terminal = await storage.appendCimTerminalEvent({
+            eventId: digest({ type: 'unknown-cim-policy', ...evidence }),
+            scope: 'campaign', scopeId: campaign.id,
+            expectedRevision: Number(campaign.terminal_revision),
+            expectedRowVersion: Number(campaign.row_version),
+            nextState: 'action-required', reasonCode: 'unknown_policy_version',
+            evidenceType: 'unknown-policy-version',
+            evidenceId: digest(evidence), metadataDigest: digest(evidence),
+            actor, source: 'pursue-cim-final-gate', observedAt: gateInstant, now: gateInstant,
+          });
+          projected = terminal?.applied === true || terminal?.replay === true;
+        } catch {
+          projected = false;
+        }
+        if (!projected) {
+          const refreshed = await storage.readCimFinalGateContext({ transmissionId,
+            authorizationId, writerPath, providerProfile, now: gateInstant });
+          const current = refreshed?.members?.find((member) =>
+            member?.campaign?.id === campaign.id)?.campaign;
+          if (current?.state === 'action-required'
+            && current?.reason_code === 'unknown_policy_version') projected = true;
+          else if (current) campaign = current;
+        }
+      }
+      if (!projected) return failure('unknown_policy_version');
+    }
+    return failure('unknown_policy_version');
   }
   const readinessInput = await readProviderReadiness({ storage, providerProfile, now: gateInstant,
     context });

@@ -189,7 +189,8 @@ export async function enterCimProviderBoundary({
   }
   if (seam?.alreadyEntered) return denied('cim-provider-seam-already-entered', true);
   if (!seam?.entered) return denied('cim-provider-seam-unauthorized');
-  return { allowed: true, payloadDigest };
+  return { allowed: true, payloadDigest,
+    providerFinalizationRowVersion: authorization.expectedRowVersion + 1 };
 }
 
 function metadata(value) {
