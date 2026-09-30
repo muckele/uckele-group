@@ -22,6 +22,12 @@ process.on('message', async ({ sqlitePath, mode, command }) => {
         }
         const result = await storage[method](payload);
         process.send?.({ ok: true, result: { claimed: result.claimed ?? false,
+          alreadyOwned: result.alreadyOwned ?? false,
+          staleAuthority: result.staleAuthority ?? false,
+          conflict: result.conflict ?? false,
+          terminal: result.terminal ?? false,
+          existing: result.existing ?? false,
+          payloadConflict: result.payloadConflict ?? false,
           prepared: result.prepared ?? false, issued: result.issued ?? false,
           authorized: result.authorized ?? false } });
       }

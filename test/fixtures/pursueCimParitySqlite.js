@@ -207,6 +207,15 @@ const prepareBase = { touchIds: [expectedCampaigns[0].touchId],
   tags: ['cim'], actor: 'fixture', now };
 const prepareCommands = [prepareBase, { ...prepareBase },
   { ...prepareBase, subject: 'Changed subject' },
+  { ...prepareBase, bodyText: 'Changed body' },
+  { ...prepareBase, bodyHtmlSanitized: '<p>Changed body</p>' },
+  { ...prepareBase, toAddresses: ['other@example.test'] },
+  { ...prepareBase, ccAddresses: ['cc@example.test'] },
+  { ...prepareBase, bccAddresses: ['bcc@example.test'] },
+  { ...prepareBase, replyToAddress: 'other-reply@example.test' },
+  { ...prepareBase, tags: ['changed=cim'] },
+  { ...prepareBase, fromAddress: 'other-sender@example.test' },
+  { ...prepareBase, payloadVersion: 'payload-v2' },
   { ...prepareBase, subject: 'Changed subject', preparationGeneration: 2 }];
 const expectedPreparations = [];
 for (const command of prepareCommands) {

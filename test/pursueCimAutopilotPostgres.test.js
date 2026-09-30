@@ -20,6 +20,8 @@ const crmAuthorityMigrationPath = path.join(root,
   'supabase/migrations/20261001120000_postgres_crm_authority_parity.sql');
 const p4bMigrationPath = path.join(root,
   'supabase/migrations/20261001130000_pursue_cim_p4b_authority.sql');
+const p5MigrationPath = path.join(root,
+  'supabase/migrations/20261002120000_pursue_cim_initial_preparation.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -59,6 +61,7 @@ const expectedP1cFunctions = [
   'pursue_cim_finalize_transmission_v1',
   'pursue_cim_issue_live_authorization_v1',
   'pursue_cim_json_stringify_v1',
+  'pursue_cim_list_due_initial_touches_v1',
   'pursue_cim_materialize_campaign_v1',
   'pursue_cim_prepare_transmission_v1',
   'pursue_cim_read_import_outreach_counters_v1',
@@ -73,6 +76,18 @@ const expectedP1cFunctions = [
   'pursue_cim_withdraw_capability_activation_v1',
   'pursue_cim_withdraw_live_authorization_v1',
 ];
+
+test('P5 PostgreSQL preparation locks conversation and campaign before touch', () => {
+  const migration = fs.readFileSync(p5MigrationPath, 'utf8');
+  const prepare = migration.slice(migration.indexOf(
+    'create or replace function public.pursue_cim_prepare_transmission_v1'));
+  const lockedTables = [...prepare.matchAll(/(?:select|perform)[^;]*?\bfrom public\.(deal_hunter_broker_conversations|deal_hunter_cim_campaigns|deal_hunter_cim_campaign_touches)[^;]*?\bfor update\b/gi)]
+    .map((match) => match[1]);
+  assert.deepEqual(lockedTables.slice(0, 3), [
+    'deal_hunter_broker_conversations', 'deal_hunter_cim_campaigns',
+    'deal_hunter_cim_campaign_touches',
+  ]);
+});
 
 test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
   const marker = '-- Package 1C: versioned Pursue CIM transition RPCs.';
@@ -324,6 +339,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(ownerCommandMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(crmAuthorityMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p4bMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p5MigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -601,6 +617,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(ownerCommandMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(crmAuthorityMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p4bMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p5MigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const commands = [
@@ -711,7 +728,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       expectedDiscoveryRevision: 0, expectedMaterialRevision: 0 },
   ];
   const campaignCommand = { opportunityId: 'opp-decision', expectedEnrollmentRowVersion: 1,
-    generation: 1, policyVersion: 'policy-v1', templateVersion: 'template-v1',
+    generation: 1, policyVersion: 'deal-hunter-cim-autopilot-v1', templateVersion: 'template-v1',
     templateDigest: '1'.repeat(64), permissionVersion: 'activation-enrollment',
     permissionDigest: '2'.repeat(64), permissionRevision: 1,
     permissionScope: '4'.repeat(64), policyHash: 'a'.repeat(64), canonicalRevision: 1,
@@ -893,6 +910,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
           'pursue_cim_record_capability_activation_v1',
           'pursue_cim_withdraw_capability_activation_v1',
           'pursue_cim_claim_due_touch_v1',
+          'pursue_cim_list_due_initial_touches_v1',
           'pursue_cim_read_projection_v1',
           'pursue_cim_append_safety_events_v1',
           'pursue_cim_record_owner_decision_v1',
@@ -911,6 +929,11 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         if (name === 'pursue_cim_read_import_outreach_counters_v1') {
           return { data: JSON.parse(psql(container, database, `set role service_role;
             select public.pursue_cim_read_import_outreach_counters_v1();`)), error: null };
+        }
+        if (name === 'pursue_cim_list_due_initial_touches_v1') {
+          return { data: JSON.parse(psql(container, database, `set role service_role;
+            select public.pursue_cim_list_due_initial_touches_v1(
+              '${payload.p_now}'::timestamptz, ${payload.p_limit});`)), error: null };
         }
         const argument = JSON.stringify(payload.p_command ?? payload.p_run).replaceAll("'", "''");
         const data = JSON.parse(psql(container, database, `
@@ -1432,6 +1455,123 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       'conversations', (select count(distinct conversation_id) from public.deal_hunter_cim_campaigns
         where opportunity_id='opp-decision'));`)),
       { campaigns: 1, touches: 1, conversations: 1 }, database);
+    const claimContenders = ['6'.repeat(64), '7'.repeat(64)].map((claimTokenDigest, index) => ({
+      ...reference.materializedClaimCommand, claimTokenDigest, claimOwner: `p5-racer-${index}`,
+    }));
+    const racedClaims = await Promise.all(claimContenders.map((command) =>
+      psqlIndependent(container, raceDatabase, `begin; select pg_sleep(0.1);
+        select public.pursue_cim_claim_due_touch_v1('${JSON.stringify(command)}'::jsonb);
+        commit;`)));
+    const claimResults = racedClaims.map((output) => JSON.parse(output.split('\n')
+      .find((line) => line.startsWith('{'))));
+    assert.deepEqual(claimResults.map((row) => row.claimed).sort(), [false, true], database);
+    assert.equal(claimResults.filter((row) => row.staleAuthority || row.conflict).length, 1,
+      `${database}: loser must receive a normalized claim result`);
+    const winningClaim = claimContenders[claimResults.findIndex((row) => row.claimed)];
+    const racePrepareCommand = JSON.stringify({ ...reference.prepareCommands[0],
+      claimTokenDigest: winningClaim.claimTokenDigest });
+    const racedPreparations = await Promise.all([0, 1].map(() =>
+      psqlIndependent(container, raceDatabase, `begin; select pg_sleep(0.1);
+        select public.pursue_cim_prepare_transmission_v1('${racePrepareCommand}'::jsonb);
+        commit;`)));
+    const preparationResults = racedPreparations.map((output) => JSON.parse(output.split('\n')
+      .find((line) => line.startsWith('{'))));
+    assert.deepEqual(preparationResults.map((row) => row.prepared).sort(),
+      [false, true], database);
+    assert.equal(preparationResults.filter((row) => row.existing).length, 1, database);
+    const raceCounts = JSON.parse(psql(container, raceDatabase, `select jsonb_build_object(
+      'transmissions', (select count(*) from public.deal_hunter_cim_transmissions),
+      'memberships', (select count(*) from public.deal_hunter_cim_transmission_touches
+        where cancelled_at is null),
+      'communications', (select count(*) from public.crm_communications),
+      'outbox', (select count(*) from public.crm_email_outbox));`));
+    assert.deepEqual(raceCounts,
+      { transmissions: 1, memberships: 1, communications: 1, outbox: 1 }, database);
+    const overlappingClaimCommand = { ...reference.materializedClaimCommand,
+      claimTokenDigest: '8'.repeat(64), claimOwner: 'p5-overlap' };
+    const campaignBlocker = psqlIndependent(container, raceDatabase, `begin;
+      select id from public.deal_hunter_cim_campaigns
+        where opportunity_id='opp-decision' for update;
+      select pg_sleep(12); commit;`);
+    let blockerReady = false;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      blockerReady = psql(container, raceDatabase, `select exists(select 1
+        from pg_stat_activity where datname='${raceDatabase}'
+          and pid <> pg_backend_pid() and wait_event='PgSleep');`) === 't';
+      if (blockerReady) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(blockerReady, true, `${database}: campaign blocker did not start`);
+    const overlappingClaim = psqlIndependent(container, raceDatabase, `begin;
+      set local deadlock_timeout='100ms';
+      /* p5_claim_overlap */ select public.pursue_cim_claim_due_touch_v1(
+        '${JSON.stringify(overlappingClaimCommand)}'::jsonb); commit;`)
+      .then((value) => ({ value }), (error) => ({ error }));
+    let claimBlocked = false;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      claimBlocked = psql(container, raceDatabase, `select exists(select 1
+        from pg_stat_activity where datname='${raceDatabase}'
+          and query like '%p5_claim_overlap%' and wait_event_type='Lock');`) === 't';
+      if (claimBlocked) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(claimBlocked, true, `${database}: claim did not reach the campaign lock`);
+    const overlappingPrepare = psqlIndependent(container, raceDatabase, `begin;
+      set local deadlock_timeout='100ms';
+      /* p5_prepare_overlap */ select public.pursue_cim_prepare_transmission_v1(
+        '${racePrepareCommand}'::jsonb); commit;`)
+      .then((value) => ({ value }), (error) => ({ error }));
+    let prepareBlocked = false;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      prepareBlocked = psql(container, raceDatabase, `select exists(select 1
+        from pg_stat_activity where datname='${raceDatabase}'
+          and query like '%p5_prepare_overlap%' and wait_event_type='Lock');`) === 't';
+      if (prepareBlocked) break;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(prepareBlocked, true, `${database}: prepare did not reach its next lock`);
+    const blockerStillActive = psql(container, raceDatabase, `select exists(select 1
+      from pg_stat_activity where datname='${raceDatabase}'
+        and pid <> pg_backend_pid() and wait_event='PgSleep');`) === 't';
+    const touchLockProbe = rejectedSql(container, raceDatabase, `begin;
+      select id from public.deal_hunter_cim_campaign_touches
+        where id='${reference.expectedCampaigns[0].touchId}' for update nowait;
+      rollback;`);
+    const [claimOverlap, prepareOverlap] = await Promise.all([overlappingClaim,
+      overlappingPrepare, campaignBlocker]);
+    assert.equal(blockerStillActive, true,
+      `${database}: campaign blocker released before touch-lock probe`);
+    assert.equal(touchLockProbe.status, 0,
+      `${database}: preparation must wait for conversation/campaign before locking touch`);
+    assert.equal(touchLockProbe.stdout.trim(), reference.expectedCampaigns[0].touchId,
+      `${database}: touch lock probe must address the raced touch`);
+    assert.equal(claimOverlap.error, undefined,
+      `${database}: claim/prepare overlap should normalize: ${claimOverlap.error}`);
+    assert.equal(prepareOverlap.error, undefined,
+      `${database}: claim/prepare overlap should normalize: ${prepareOverlap.error}`);
+    assert.equal(JSON.parse(claimOverlap.value.split('\n').find((line) => line.startsWith('{'))).conflict,
+      true, database);
+    assert.equal(JSON.parse(prepareOverlap.value.split('\n').find((line) => line.startsWith('{'))).existing,
+      true, database);
+    const rollbackPreparation = rejectedSql(container, raceDatabase, `begin;
+      create function public.p5_abort_preparation() returns trigger language plpgsql
+        as $$begin raise exception 'synthetic P5 preparation failure'; end$$;
+      create trigger p5_abort_preparation before insert on public.deal_hunter_cim_transmissions
+        for each row when (new.preparation_generation = 2)
+        execute function public.p5_abort_preparation();
+      select public.pursue_cim_prepare_transmission_v1(
+        '${JSON.stringify({ ...reference.prepareCommands.at(-1),
+          claimTokenDigest: winningClaim.claimTokenDigest })}'::jsonb);
+      commit;`);
+    assert.notEqual(rollbackPreparation.status, 0, database);
+    assert.match(rollbackPreparation.stderr, /synthetic P5 preparation failure/);
+    assert.deepEqual(JSON.parse(psql(container, raceDatabase, `select jsonb_build_object(
+      'transmissions', (select count(*) from public.deal_hunter_cim_transmissions),
+      'memberships', (select count(*) from public.deal_hunter_cim_transmission_touches
+        where cancelled_at is null),
+      'communications', (select count(*) from public.crm_communications),
+      'outbox', (select count(*) from public.crm_email_outbox));`)), raceCounts,
+    `${database}: aborted generation rebuild must retain the prior prepared identity`);
     for (const [index, command] of postgresCampaignCommands.entries()) {
       const outcome = await supabase.materializePursuitCampaign(command);
       assert.deepEqual({ applied: outcome.applied, existing: outcome.existing,
@@ -1450,6 +1590,57 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       rollback;`).split('\n').find((line) => line.startsWith('{'));
     assert.equal(JSON.parse(replaySuppression).actionRequired, true,
       `${database}: existing campaign replay must revalidate suppression authority`);
+    const dueInitial = await supabase.listDueCimInitialTouches({ now, limit: 10 });
+    assert.deepEqual(dueInitial.map((row) => row.touch_id),
+      [reference.expectedCampaigns[0].touchId], database);
+    const offsetDueInitial = await supabase.listDueCimInitialTouches({
+      now: '2026-09-25T12:00:00-07:00', limit: 10 });
+    assert.deepEqual(offsetDueInitial.map((row) => row.touch_id),
+      [reference.expectedCampaigns[0].touchId], database);
+    const staleCrmPreparation = psql(container, database, `begin;
+      select public.pursue_cim_claim_due_touch_v1(
+        '${JSON.stringify(reference.materializedClaimCommand)}'::jsonb);
+      update public.deal_hunter_opportunities set primary_submission_id=null
+        where opportunity_id='opp-decision';
+      select public.pursue_cim_prepare_transmission_v1(
+        '${JSON.stringify(reference.prepareCommands[0])}'::jsonb);
+      rollback;`).split('\n').filter((line) => line.startsWith('{')).map(JSON.parse);
+    assert.equal(staleCrmPreparation[0].claimed, true, database);
+    assert.equal(staleCrmPreparation[1].terminal, true,
+      `${database}: preparation must recheck the current CRM primary`);
+    const staleInitialState = psql(container, database, `begin;
+      select public.pursue_cim_claim_due_touch_v1(
+        '${JSON.stringify(reference.materializedClaimCommand)}'::jsonb);
+      update public.deal_hunter_cim_campaigns set state='active-follow-up'
+        where opportunity_id='opp-decision';
+      select public.pursue_cim_prepare_transmission_v1(
+        '${JSON.stringify(reference.prepareCommands[0])}'::jsonb);
+      rollback;`).split('\n').filter((line) => line.startsWith('{')).map(JSON.parse);
+    assert.equal(staleInitialState[0].claimed, true, database);
+    assert.equal(staleInitialState[1].terminal, true,
+      `${database}: initial preparation must recheck initial-pending state`);
+    const mismatchedMembership = psql(container, database, `begin;
+      select public.pursue_cim_claim_due_touch_v1(
+        '${JSON.stringify(reference.materializedClaimCommand)}'::jsonb);
+      update public.deal_hunter_cim_campaign_touches set opportunity_id='opp-parity'
+        where opportunity_id='opp-decision';
+      select public.pursue_cim_prepare_transmission_v1(
+        '${JSON.stringify(reference.prepareCommands[0])}'::jsonb);
+      rollback;`).split('\n').filter((line) => line.startsWith('{')).map(JSON.parse);
+    assert.equal(mismatchedMembership[0].claimed, true, database);
+    assert.equal(mismatchedMembership[1].terminal, true,
+      `${database}: mismatched touch opportunity cannot become a membership`);
+    const expiredPreparation = psql(container, database, `begin;
+      select public.pursue_cim_claim_due_touch_v1(
+        '${JSON.stringify({ ...reference.materializedClaimCommand,
+          claimExpiresAt: '2026-09-25T19:01:00.000Z' })}'::jsonb);
+      select public.pursue_cim_prepare_transmission_v1(
+        '${JSON.stringify({ ...reference.prepareCommands[0],
+          now: '2026-09-25T19:02:00.000Z' })}'::jsonb);
+      rollback;`).split('\n').filter((line) => line.startsWith('{')).map(JSON.parse);
+    assert.equal(expiredPreparation[0].claimed, true, database);
+    assert.equal(expiredPreparation[1].terminal, true,
+      `${database}: expired owner cannot persist an immutable transmission`);
     const materializedClaim = await supabase.claimDueCimTouch(reference.materializedClaimCommand);
     assert.deepEqual({ claimed: materializedClaim.claimed,
       state: materializedClaim.touch?.state ?? null }, reference.expectedMaterializedClaim);
@@ -1463,6 +1654,45 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         generation: outcome.transmission?.preparation_generation ?? null },
       reference.expectedPreparations[index], database);
     }
+    const activePreparedId = reference.expectedPreparations.at(-1).transmissionId;
+    const staleRebuild = await supabase.prepareCimTransmission({
+      ...reference.prepareCommands.at(-1), preparationGeneration: 3,
+      claimTokenDigest: '7'.repeat(64), bodyText: 'Unapproved replacement',
+    });
+    assert.equal(staleRebuild.prepared, false, database);
+    assert.equal(psql(container, database, `select state from public.deal_hunter_cim_transmissions
+      where id='${activePreparedId}';`), 'prepared',
+    `${database}: stale claim must not cancel the active immutable preparation`);
+    const boundVersion = Number(psql(container, database, `select row_version
+      from public.deal_hunter_cim_campaign_touches
+      where id='${reference.expectedCampaigns[0].touchId}';`));
+    const boundClaim = await supabase.claimDueCimTouch({
+      ...reference.materializedClaimCommand, expectedRowVersion: boundVersion,
+    });
+    assert.equal(boundClaim.conflict, true, `${database}: bound touch is no longer claimable`);
+    const historyClaim = JSON.parse(psql(container, database, `begin;
+      select public.pursue_cim_cancel_prepared_transmission_v1(
+        '${reference.expectedPreparations.at(-1).transmissionId}',
+        '${now}'::timestamptz, 'synthetic-pre-provider-cancel', 'fixture', true);
+      update public.deal_hunter_cim_campaign_touches
+        set claim_expires_at='2026-09-25T18:59:00.000Z'::timestamptz
+        where id='${reference.expectedCampaigns[0].touchId}';
+      select public.pursue_cim_claim_due_touch_v1(
+        '${JSON.stringify({ ...reference.materializedClaimCommand,
+          expectedRowVersion: boundVersion + 1, claimTokenDigest: '7'.repeat(64),
+          claimOwner: 'stale-history-worker' })}'::jsonb);
+      rollback;`).split('\n').find((line) => line.startsWith('{')));
+    assert.equal(historyClaim.conflict, true,
+      `${database}: retained immutable history must block lease reclaim`);
+    const preparedOutboxId = psql(container, database, `select outbox_id
+      from public.deal_hunter_cim_transmissions
+      where id='${reference.expectedPreparations.at(-1).transmissionId}';`);
+    const genericClaim = JSON.parse(psql(container, database, `begin;
+      update public.crm_email_outbox set state='queued' where id='${preparedOutboxId}';
+      select public.claim_crm_email_outbox('${preparedOutboxId}', 'generic-worker',
+        '${now}'::timestamptz, '2026-09-25T19:10:00.000Z'::timestamptz);
+      rollback;`).split('\n').find((line) => line.startsWith('{')));
+    assert.equal(genericClaim.claimed, false, `${database}: generic outbox claim must exclude CIM`);
     assertOwnerFencesStage({ stage: 'prepared', opportunityId: 'opp-decision',
       campaignId: reference.expectedCampaigns[0].campaignId,
       touchId: reference.expectedCampaigns[0].touchId,

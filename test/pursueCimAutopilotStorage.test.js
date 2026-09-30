@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { fork } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -9,6 +10,7 @@ import { readCimCurrentAuthority, runCimCampaignSafety } from '../server/service
 import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from '../server/services/dealHunterSourceSnapshotAdmission.js';
 import { processCrmEmailOutbox } from '../server/services/followUpEmail.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
+import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 import { createPursueCimProviderFake } from './fixtures/pursueCimHarness.js';
 
 const expectedTables = [
@@ -241,7 +243,7 @@ function transitionFromWorker(sqlitePath, mode, command) {
   });
 }
 
-function insertBaseAuthority(database, suffix = '') {
+function insertBaseAuthority(database, suffix = '', recipientFingerprint = digest('e')) {
   const opportunityId = `opp-p1a${suffix}`;
   const decisionId = `decision${suffix}`;
   const enrollmentId = `enrollment${suffix}`;
@@ -277,7 +279,9 @@ function insertBaseAuthority(database, suffix = '') {
       created_at, updated_at, row_version
     ) VALUES (?, 'recipient-authority', ?, 'broker@example.test', 'sender-v1',
       'reply-v1', ?, ?, 'open', 0, 'batching-off-v1', ?, ?, 1)
-  `).run(conversationId, digest('e'), digest(suffix ? '0' : 'f'), `thread${suffix}`, at, at);
+  `).run(conversationId, recipientFingerprint, suffix
+    ? createHash('sha256').update(`reply-alias:${suffix}`).digest('hex') : digest('f'),
+  `thread${suffix}`, at, at);
   database.prepare(`
     INSERT INTO deal_hunter_cim_campaigns (
       id, opportunity_id, generation, enrollment_id, decision_event_id,
@@ -294,7 +298,7 @@ function insertBaseAuthority(database, suffix = '') {
     )
   `).run(
     campaignId, opportunityId, enrollmentId, decisionId, digest('1'), digest('2'),
-    digest('e'), digest('3'), conversationId, at, at,
+    recipientFingerprint, digest('3'), conversationId, at, at,
   );
   database.prepare(`
     INSERT INTO deal_hunter_cim_campaign_touches (
@@ -1214,6 +1218,279 @@ test('P1B due touch claim has one winner and rejects stale terminal authority', 
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events WHERE event_type = 'touch-claimed'").get().count, 1);
 });
 
+test('P5 due selector returns only bounded current generation-one initial touches', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p5-due');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const first = insertBaseAuthority(database, '-p5-due-a');
+  const second = insertBaseAuthority(database, '-p5-due-b');
+  const future = insertBaseAuthority(database, '-p5-due-future');
+  database.prepare('UPDATE deal_hunter_cim_campaign_touches SET due_at = ? WHERE id = ?')
+    .run('2026-09-25T20:00:00.000Z', future.touchId);
+  assert.deepEqual(await storage.listDueCimInitialTouches({ now: at, limit: 1 }), []);
+  await seedSyntheticActivationChain(storage);
+  const due = await storage.listDueCimInitialTouches({ now: at, limit: 1 });
+  assert.deepEqual(due.map((row) => row.touch_id), [first.touchId]);
+  assert.equal(due[0].campaign_id, first.campaignId);
+  assert.equal(due[0].kind, 'initial');
+  assert.equal(due[0].row_version, 1);
+  assert.deepEqual((await storage.listDueCimInitialTouches({ now: at, limit: 10 }))
+    .map((row) => row.touch_id), [first.touchId, second.touchId]);
+  assert.deepEqual((await storage.listDueCimInitialTouches({
+    now: '2026-09-25T12:00:00-07:00', limit: 10,
+  })).map((row) => row.touch_id), [first.touchId, second.touchId]);
+  database.prepare("UPDATE deal_hunter_cim_campaign_touches SET kind = 'follow-up-1' WHERE id = ?")
+    .run(second.touchId);
+  assert.deepEqual((await storage.listDueCimInitialTouches({ now: at, limit: 10 }))
+    .map((row) => row.touch_id), [first.touchId]);
+  assert.equal((await storage.claimDueCimTouch({ touchId: first.touchId,
+    expectedRowVersion: 1, expectedCampaignTerminalRevision: 0,
+    expectedConversationTerminalRevision: 0, claimTokenDigest: digest('a'),
+    claimOwner: 'selector-worker', claimExpiresAt: '2026-09-25T19:01:00.000Z',
+    now: at })).claimed, true);
+  assert.deepEqual((await storage.listDueCimInitialTouches({
+    now: '2026-09-25T19:02:00.000Z', limit: 10,
+  })).map((row) => row.touch_id), [first.touchId]);
+  await storage.withdrawCimCapabilityActivation({ id: 'synthetic-fl04b-enrollment',
+    actor: 'fixture-owner', reason: 'synthetic prerequisite withdrawal', now: at });
+  assert.deepEqual(await storage.listDueCimInitialTouches({
+    now: '2026-09-25T19:02:00.000Z', limit: 10,
+  }), []);
+});
+
+test('P5 expired claim reclaims the same touch and excludes the prior owner from preparation', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p5-reclaim');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = insertBaseAuthority(database, '-p5-reclaim');
+  seedCrmOwner(database, authority.opportunityId, 'submission-p5-reclaim');
+  await seedSyntheticActivationChain(storage);
+  const claim = { touchId: authority.touchId, expectedRowVersion: 1,
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    claimTokenDigest: digest('a'), claimOwner: 'worker-a',
+    claimExpiresAt: '2026-09-25T19:01:00.000Z', now: at };
+  assert.equal((await storage.claimDueCimTouch(claim)).claimed, true);
+  const later = '2026-09-25T19:02:00.000Z';
+  const reclaimed = await storage.claimDueCimTouch({ ...claim, expectedRowVersion: 2,
+    claimTokenDigest: digest('b'), claimOwner: 'worker-b',
+    claimExpiresAt: '2026-09-25T19:07:00.000Z', now: later });
+  assert.equal(reclaimed.claimed, true);
+  assert.equal(reclaimed.touch.id, authority.touchId);
+  const prepare = { touchIds: [authority.touchId], claimTokenDigest: digest('a'),
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    preparationGeneration: 1, payloadVersion: 'payload-v1',
+    fromAddress: 'sender@example.test', toAddresses: ['broker@example.test'],
+    ccAddresses: [], bccAddresses: [], replyToAddress: 'reply@example.test',
+    subject: 'Synthetic subject', bodyText: 'Synthetic body',
+    bodyHtmlSanitized: '<p>Synthetic body</p>', tags: ['cim-initial'],
+    actor: 'fixture-owner', now: later };
+  assert.equal((await storage.prepareCimTransmission(prepare)).terminal, true);
+  const winner = await storage.prepareCimTransmission({ ...prepare, claimTokenDigest: digest('b') });
+  assert.equal(winner.prepared, true);
+  assert.equal((await storage.claimDueCimTouch({ ...claim, expectedRowVersion: 4,
+    claimTokenDigest: digest('b'), claimOwner: 'worker-b',
+    now: '2026-09-25T19:03:00.000Z' })).conflict, true);
+  assert.equal((await storage.claimDueCimTouch({ ...claim, expectedRowVersion: 4,
+    now: '2026-09-25T19:08:00.000Z' })).conflict, true);
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_campaign_touches').get().count, 1);
+  assert.equal(database.prepare('SELECT COUNT(*) AS count FROM deal_hunter_cim_transmissions').get().count, 1);
+});
+
+test('P5 expired claim token cannot prepare before a replacement owner arrives', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p5-expired-prepare');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = insertBaseAuthority(database, '-p5-expired-prepare');
+  seedCrmOwner(database, authority.opportunityId, 'submission-p5-expired-prepare');
+  await seedSyntheticActivationChain(storage);
+  const claimTokenDigest = digest('a');
+  assert.equal((await storage.claimDueCimTouch({ touchId: authority.touchId,
+    expectedRowVersion: 1, expectedCampaignTerminalRevision: 0,
+    expectedConversationTerminalRevision: 0, claimTokenDigest,
+    claimOwner: 'worker-a', claimExpiresAt: '2026-09-25T19:01:00.000Z',
+    now: at })).claimed, true);
+  const result = await storage.prepareCimTransmission({
+    touchIds: [authority.touchId], claimTokenDigest,
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    preparationGeneration: 1, payloadVersion: 'payload-v1',
+    fromAddress: 'sender@example.test', toAddresses: ['broker@example.test'],
+    ccAddresses: [], bccAddresses: [], replyToAddress: 'reply@example.test',
+    subject: 'Synthetic subject', bodyText: 'Synthetic body',
+    bodyHtmlSanitized: '<p>Synthetic body</p>', tags: ['cim-initial'],
+    actor: 'fixture-owner', now: '2026-09-25T19:02:00.000Z',
+  });
+  assert.equal(result.terminal, true);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmissions').get().n, 0);
+});
+
+test('P5 rejects a touch whose opportunity differs from its campaign', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p5-member-owner');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = insertBaseAuthority(database, '-p5-member-owner-a');
+  const other = insertBaseAuthority(database, '-p5-member-owner-b');
+  seedCrmOwner(database, authority.opportunityId, 'submission-p5-member-owner');
+  await seedSyntheticActivationChain(storage);
+  const claimTokenDigest = digest('a');
+  assert.equal((await storage.claimDueCimTouch({ touchId: authority.touchId,
+    expectedRowVersion: 1, expectedCampaignTerminalRevision: 0,
+    expectedConversationTerminalRevision: 0, claimTokenDigest,
+    claimOwner: 'worker-a', claimExpiresAt: '2026-09-25T19:05:00.000Z',
+    now: at })).claimed, true);
+  database.prepare('UPDATE deal_hunter_cim_campaign_touches SET opportunity_id = ? WHERE id = ?')
+    .run(other.opportunityId, authority.touchId);
+  const result = await storage.prepareCimTransmission({
+    touchIds: [authority.touchId], claimTokenDigest,
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    preparationGeneration: 1, payloadVersion: 'payload-v1',
+    fromAddress: 'sender@example.test', toAddresses: ['broker@example.test'],
+    ccAddresses: [], bccAddresses: [], replyToAddress: 'reply@example.test',
+    subject: 'Synthetic subject', bodyText: 'Synthetic body',
+    bodyHtmlSanitized: '<p>Synthetic body</p>', tags: ['cim-initial'],
+    actor: 'fixture-owner', now: at,
+  });
+  assert.equal(result.terminal, true);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmissions').get().n, 0);
+});
+
+test('P5 runner prepares one initial touch from server authority without provider work', async (t) => {
+  const { runDueCimInitialPreparations } = await import('../server/services/pursueCimInitialPreparation.js');
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p5-runner');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const opportunityId = 'opp-p1a-p5-runner';
+  const recipient = { email: 'broker@example.test', displayName: 'Broker',
+    firstName: 'Avery', provenance: 'operator_verified',
+    provenanceFingerprint: digest('d'), contactAuthorityRevision: digest('c') };
+  const fingerprint = sha256(stableCanonicalJson({ opportunityId,
+    emailHash: sha256(recipient.email),
+    provenanceFingerprint: recipient.provenanceFingerprint,
+    contactAuthorityRevision: recipient.contactAuthorityRevision }));
+  const authority = insertBaseAuthority(database, '-p5-runner', fingerprint);
+  seedCrmOwner(database, authority.opportunityId, 'submission-p5-runner');
+  await seedSyntheticActivationChain(storage);
+  const before = await storage.readCimOutreachCounters();
+  const fakeProvider = createPursueCimProviderFake();
+  const result = await runDueCimInitialPreparations({ storage, now: at, limit: 5,
+    loadAuthority: async ({ opportunityId }) => ({
+      opportunityId, opportunity: { canonical_name: 'Synthetic Service Co',
+        canonical_location: 'California' },
+      score: { deal_key: 'synthetic-service', fit_score: 85 },
+      sourceRows: [], preparationBlockers: [],
+      submission: { id: 'submission-p5-runner' },
+      recipientOptions: [recipient],
+    }) });
+  assert.equal(result.length, 1);
+  assert.equal(result[0].prepared, true);
+  const after = await storage.readCimOutreachCounters();
+  assert.deepEqual(Object.fromEntries(['campaigns', 'touches', 'transmissions',
+    'memberships', 'crmOutbound', 'outbox', 'providerAuthorizations', 'providerPending',
+    'providerSeamEntries'].map((key) => [key, after[key] - before[key]])), {
+    campaigns: 0, touches: 0, transmissions: 1, memberships: 1,
+    crmOutbound: 1, outbox: 1, providerAuthorizations: 0,
+    providerPending: 0, providerSeamEntries: 0,
+  });
+  assert.equal(fakeProvider.seamEntries.length, 0);
+  assert.equal(fakeProvider.providerCalls.length, 0);
+  const transmission = database.prepare('SELECT * FROM deal_hunter_cim_transmissions').get();
+  assert.equal(transmission.state, 'prepared');
+  assert.equal(transmission.invocation_authority_count, 0);
+  assert.equal(database.prepare('SELECT display_ordinal FROM deal_hunter_cim_transmission_touches')
+    .get().display_ordinal, 1);
+});
+
+test('P5 two SQLite processes claim one due touch and prepare one immutable transmission', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p5-race');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = insertBaseAuthority(database, '-p5-race');
+  seedCrmOwner(database, authority.opportunityId, 'submission-p5-race');
+  await seedSyntheticActivationChain(storage);
+  const base = { touchId: authority.touchId, expectedRowVersion: 1,
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    claimExpiresAt: '2026-09-25T19:05:00.000Z', now: at };
+  const contenders = [digest('a'), digest('b')].map((claimTokenDigest, index) => ({
+    ...base, claimTokenDigest, claimOwner: `worker-${index}`,
+  }));
+  const outcomes = await Promise.all(contenders.map((payload) =>
+    transitionFromWorker(sqlitePath, 'pre-provider-transition', {
+      method: 'claimDueCimTouch', payload,
+    })));
+  assert.deepEqual(outcomes.map((row) => row.claimed).sort(), [false, true]);
+  assert.equal(outcomes.filter((row) => row.staleAuthority || row.conflict).length, 1);
+  const winner = contenders[outcomes.findIndex((row) => row.claimed)];
+  const preparePayload = {
+      touchIds: [authority.touchId], claimTokenDigest: winner.claimTokenDigest,
+      expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+      preparationGeneration: 1, payloadVersion: 'payload-v1',
+      fromAddress: 'sender@example.test', toAddresses: ['broker@example.test'],
+      ccAddresses: [], bccAddresses: [], replyToAddress: 'reply@example.test',
+      subject: 'Synthetic subject', bodyText: 'Synthetic body',
+      bodyHtmlSanitized: '<p>Synthetic body</p>', tags: ['cim-initial'],
+      actor: 'fixture-owner', now: at,
+  };
+  const preparations = await Promise.all([0, 1].map(() =>
+    transitionFromWorker(sqlitePath, 'pre-provider-transition', {
+      method: 'prepareCimTransmission', payload: preparePayload,
+    })));
+  assert.deepEqual(preparations.map((row) => row.prepared).sort(), [false, true]);
+  assert.equal(preparations.filter((row) => row.existing).length, 1);
+  const counters = await storage.readCimOutreachCounters();
+  assert.equal(counters.campaigns, 1);
+  assert.equal(counters.touches, 1);
+  assert.equal(counters.transmissions, 1);
+  assert.equal(counters.memberships, 1);
+  assert.equal(counters.crmOutbound, 1);
+  assert.equal(counters.outbox, 1);
+  assert.equal(counters.providerAuthorizations, 0);
+  assert.equal(counters.providerSeamEntries, 0);
+});
+
+test('P5 scenario 47 legacy request claim cannot authorize initial preparation', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p5-legacy-claim');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = insertBaseAuthority(database, '-p5-legacy-claim');
+  seedCrmOwner(database, authority.opportunityId, 'submission-p5-legacy-claim');
+  await seedSyntheticActivationChain(storage);
+  database.prepare(`INSERT INTO deal_hunter_cim_requests
+    (id, created_at, updated_at, deal_key, recipient_email, status,
+      request_state, delivery_state, metadata, opportunity_id)
+    VALUES (?, ?, ?, 'synthetic-legacy', 'broker@example.test', 'pending',
+      'claimed', 'not-attempted', ?, ?)`)
+    .run('legacy-claim-p5', at, at,
+      JSON.stringify({ claimTokenDigest: digest('a'), claimOwner: 'legacy-worker' }),
+      authority.opportunityId);
+  const result = await storage.prepareCimTransmission({
+    touchIds: [authority.touchId], claimTokenDigest: digest('a'),
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    preparationGeneration: 1, payloadVersion: 'payload-v1',
+    fromAddress: 'sender@example.test', toAddresses: ['broker@example.test'],
+    ccAddresses: [], bccAddresses: [], replyToAddress: 'reply@example.test',
+    subject: 'Synthetic subject', bodyText: 'Synthetic body',
+    bodyHtmlSanitized: '<p>Synthetic body</p>', tags: ['cim-initial'],
+    actor: 'fixture-owner', now: at,
+  });
+  assert.equal(result.terminal, true);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmissions').get().n, 0);
+  assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_campaign_touches WHERE id = ?')
+    .get(authority.touchId).state, 'scheduled');
+});
+
 test('P1B terminal event increments authority and cancels pre-provider touch atomically', async (t) => {
   const sqlitePath = temporaryPath(t, 'pursue-cim-terminal');
   const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
@@ -1408,6 +1685,53 @@ test('P1B transmission preparation binds immutable copy, CRM rows, and one activ
   assert.equal(database.prepare("SELECT COUNT(*) AS count FROM deal_hunter_cim_audit_events WHERE event_type = 'transmission-prepared'").get().count, 1);
 });
 
+test('P5 CIM-owned outbox cannot enter the generic email claim path', async (t) => {
+  const { storage, database, prepared } = await createPreparedFixture(t, 'p5-outbox');
+  const outbox = database.prepare('SELECT * FROM crm_email_outbox WHERE id = ?').get(prepared.outbox_id);
+  assert.equal(outbox.state, 'prepared');
+  assert.equal(JSON.parse(outbox.metadata).retryPolicy, 'reconcile-only-after-provider-pending');
+  database.prepare("UPDATE crm_email_outbox SET state = 'queued' WHERE id = ?")
+    .run(outbox.id);
+  const claim = await storage.claimCrmEmailOutbox({ id: outbox.id,
+    claimToken: 'generic-worker-token', claimedAt: at,
+    claimExpiresAt: '2026-09-25T19:10:00.000Z' });
+  assert.equal(claim.claimed, false);
+  assert.equal(database.prepare('SELECT state FROM crm_email_outbox WHERE id = ?')
+    .get(outbox.id).state, 'queued');
+});
+
+test('P5 preparation rejects a CRM primary submission changed after claim', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p5-crm-current');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = insertBaseAuthority(database, '-p5-crm-current');
+  seedCrmOwner(database, authority.opportunityId, 'submission-p5-crm-current');
+  await seedSyntheticActivationChain(storage);
+  const claimTokenDigest = digest('a');
+  assert.equal((await storage.claimDueCimTouch({ touchId: authority.touchId,
+    expectedRowVersion: 1, expectedCampaignTerminalRevision: 0,
+    expectedConversationTerminalRevision: 0, claimTokenDigest,
+    claimOwner: 'worker', claimExpiresAt: '2026-09-25T19:10:00.000Z', now: at })).claimed, true);
+  database.prepare('UPDATE deal_hunter_opportunities SET primary_submission_id = NULL WHERE opportunity_id = ?')
+    .run(authority.opportunityId);
+  const result = await storage.prepareCimTransmission({
+    touchIds: [authority.touchId], claimTokenDigest,
+    expectedCampaignTerminalRevision: 0, expectedConversationTerminalRevision: 0,
+    preparationGeneration: 1, payloadVersion: 'payload-v1',
+    fromAddress: 'sender@example.test', toAddresses: ['broker@example.test'],
+    ccAddresses: [], bccAddresses: [], replyToAddress: 'reply@example.test',
+    subject: 'Synthetic subject', bodyText: 'Synthetic body',
+    bodyHtmlSanitized: '<p>Synthetic body</p>', tags: ['cim-initial'],
+    actor: 'fixture-owner', now: at,
+  });
+  assert.equal(result.terminal, true);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmissions').get().n, 0);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM crm_communications').get().n, 0);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM crm_email_outbox').get().n, 0);
+});
+
 async function createPreparedFixture(t, suffix) {
   const sqlitePath = temporaryPath(t, `pursue-cim-${suffix}`);
   const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
@@ -1434,6 +1758,175 @@ async function createPreparedFixture(t, suffix) {
   assert.equal(prepared.prepared, true);
   return { storage, database, authority, prepared: prepared.transmission, prepareCommand };
 }
+
+test('P5 process restart replays exact payload and conflicts on material send fields', async (t) => {
+  const { storage, database, authority, prepared, prepareCommand } =
+    await createPreparedFixture(t, 'p5-replay');
+  const other = insertBaseAuthority(database, '-p5-replay-z');
+  const replay = await transitionFromWorker(database.name, 'pre-provider-transition', {
+    method: 'prepareCimTransmission', payload: prepareCommand,
+  });
+  assert.equal(replay.existing, true);
+  for (const changed of [
+    { bodyText: 'Changed body' },
+    { toAddresses: ['other@example.test'] },
+    { replyToAddress: 'other-reply@example.test' },
+    { tags: ['changed=cim'] },
+    { touchIds: [authority.touchId, other.touchId] },
+  ]) {
+    const outcome = await storage.prepareCimTransmission({ ...prepareCommand, ...changed });
+    assert.equal(outcome.payloadConflict, true, JSON.stringify(changed));
+  }
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmissions').get().n, 1);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmission_touches WHERE cancelled_at IS NULL').get().n, 1);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM crm_communications').get().n, 1);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM crm_email_outbox').get().n, 1);
+  assert.equal(database.prepare('SELECT payload_digest FROM deal_hunter_cim_transmissions WHERE id = ?')
+    .get(prepared.id).payload_digest, prepared.payload_digest);
+});
+
+test('P5 claim lease cannot reclaim a touch with retained immutable history', async (t) => {
+  const { storage, database, authority, prepared } =
+    await createPreparedFixture(t, 'p5-history');
+  database.prepare(`UPDATE deal_hunter_cim_transmission_touches
+    SET cancelled_at = ?, cancellation_reason = 'synthetic-pre-provider-cancel'
+    WHERE transmission_id = ?`).run(at, prepared.id);
+  database.prepare(`UPDATE deal_hunter_cim_transmissions
+    SET state = 'cancelled-before-provider' WHERE id = ?`).run(prepared.id);
+  database.prepare(`UPDATE deal_hunter_cim_campaign_touches
+    SET transmission_id = NULL, claim_expires_at = ?, row_version = row_version + 1
+    WHERE id = ?`).run('2026-09-25T19:01:00.000Z', authority.touchId);
+  const result = await storage.claimDueCimTouch({ touchId: authority.touchId,
+    expectedRowVersion: 3, expectedCampaignTerminalRevision: 0,
+    expectedConversationTerminalRevision: 0, claimTokenDigest: digest('b'),
+    claimOwner: 'reclaimer', claimExpiresAt: '2026-09-25T19:10:00.000Z',
+    now: '2026-09-25T19:02:00.000Z' });
+  assert.equal(result.conflict, true);
+  assert.equal(database.prepare('SELECT claim_token_digest FROM deal_hunter_cim_campaign_touches WHERE id = ?')
+    .get(authority.touchId).claim_token_digest, digest('a'));
+});
+
+test('P5 crash before claim commit leaves no durable claim', async (t) => {
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p5-claim-rollback');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const authority = insertBaseAuthority(database, '-p5-claim-rollback');
+  await seedSyntheticActivationChain(storage);
+  database.exec(`CREATE TRIGGER p5_fail_claim_audit
+    BEFORE INSERT ON deal_hunter_cim_audit_events
+    WHEN NEW.event_type = 'touch-claimed'
+    BEGIN SELECT RAISE(ABORT, 'synthetic claim commit loss'); END`);
+  await assert.rejects(storage.claimDueCimTouch({ touchId: authority.touchId,
+    expectedRowVersion: 1, expectedCampaignTerminalRevision: 0,
+    expectedConversationTerminalRevision: 0, claimTokenDigest: digest('a'),
+    claimOwner: 'worker', claimExpiresAt: '2026-09-25T19:05:00.000Z', now: at }),
+  /synthetic claim commit loss/);
+  const touch = database.prepare('SELECT * FROM deal_hunter_cim_campaign_touches WHERE id = ?')
+    .get(authority.touchId);
+  assert.equal(touch.state, 'scheduled');
+  assert.equal(touch.claim_token_digest, null);
+  assert.equal(touch.row_version, 1);
+  assert.equal(database.prepare("SELECT COUNT(*) AS n FROM deal_hunter_cim_audit_events WHERE event_type='touch-claimed'").get().n, 0);
+});
+
+test('P5 payload construction crash leaves a reclaimable claim and no preparation', async (t) => {
+  const { runDueCimInitialPreparations } = await import('../server/services/pursueCimInitialPreparation.js');
+  const sqlitePath = temporaryPath(t, 'pursue-cim-p5-build-crash');
+  const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
+  t.after(() => storage.close());
+  const database = new Database(sqlitePath);
+  t.after(() => database.close());
+  const opportunityId = 'opp-p1a-p5-build-crash';
+  const recipient = { email: 'broker@example.test', displayName: 'Broker',
+    firstName: 'Avery', provenance: 'operator_verified',
+    provenanceFingerprint: digest('d'), contactAuthorityRevision: digest('c') };
+  const fingerprint = sha256(stableCanonicalJson({ opportunityId,
+    emailHash: sha256(recipient.email),
+    provenanceFingerprint: recipient.provenanceFingerprint,
+    contactAuthorityRevision: recipient.contactAuthorityRevision }));
+  const authority = insertBaseAuthority(database, '-p5-build-crash', fingerprint);
+  seedCrmOwner(database, authority.opportunityId, 'submission-p5-build-crash');
+  await seedSyntheticActivationChain(storage);
+  const crashed = await runDueCimInitialPreparations({ storage, now: at,
+    loadAuthority: async () => { throw new Error('synthetic payload construction crash'); } });
+  assert.equal(crashed[0].constructionFailed, true);
+  assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_campaign_touches WHERE id = ?')
+    .get(authority.touchId).state, 'claimed');
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmissions').get().n, 0);
+  const recovered = await runDueCimInitialPreparations({ storage,
+    now: '2026-09-25T19:06:00.000Z',
+    loadAuthority: async () => ({ opportunityId,
+      opportunity: { canonical_name: 'Synthetic Service Co', canonical_location: 'California' },
+      score: { deal_key: 'synthetic-service', fit_score: 85 },
+      sourceRows: [], preparationBlockers: [],
+      submission: { id: 'submission-p5-build-crash' }, recipientOptions: [recipient],
+    }) });
+  assert.equal(recovered[0].prepared, true);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmissions').get().n, 1);
+});
+
+test('P5 runner rejects a non-initial selector result before claim', async () => {
+  const { runDueCimInitialPreparations } = await import('../server/services/pursueCimInitialPreparation.js');
+  let claimCalls = 0;
+  await assert.rejects(runDueCimInitialPreparations({ storage: {
+    async listDueCimInitialTouches() { return [{ kind: 'follow-up-1', touch_id: 'synthetic-followup' }]; },
+    async claimDueCimTouch() { claimCalls += 1; },
+    async prepareCimTransmission() { throw new Error('unreachable'); },
+  }, now: at }), /Non-initial CIM touch/);
+  assert.equal(claimCalls, 0);
+});
+
+test('P5 failure inside preparation rolls back communication, outbox, membership, and binding', async (t) => {
+  const { storage, database, authority, prepared, prepareCommand } =
+    await createPreparedFixture(t, 'p5-rollback');
+  database.exec(`CREATE TRIGGER p5_fail_new_transmission
+    BEFORE INSERT ON deal_hunter_cim_transmissions
+    WHEN NEW.preparation_generation = 2
+    BEGIN SELECT RAISE(ABORT, 'synthetic P5 preparation failure'); END`);
+  await assert.rejects(storage.prepareCimTransmission({ ...prepareCommand,
+    preparationGeneration: 2, bodyText: 'Changed body' }),
+  /synthetic P5 preparation failure/);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmissions').get().n, 1);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM crm_communications').get().n, 1);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM crm_email_outbox').get().n, 1);
+  assert.equal(database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmission_touches WHERE cancelled_at IS NULL').get().n, 1);
+  assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_transmissions WHERE id = ?')
+    .get(prepared.id).state, 'prepared');
+  assert.equal(database.prepare('SELECT transmission_id FROM deal_hunter_cim_campaign_touches WHERE id = ?')
+    .get(authority.touchId).transmission_id, prepared.id);
+  database.exec('DROP TRIGGER p5_fail_new_transmission');
+});
+
+test('P5 stale claim cannot cancel a prepared transmission during generation rebuild', async (t) => {
+  const { storage, database, authority, prepared, prepareCommand } =
+    await createPreparedFixture(t, 'p5-stale-rebuild');
+  const attempt = await storage.prepareCimTransmission({ ...prepareCommand,
+    claimTokenDigest: digest('b'), preparationGeneration: 2,
+    bodyText: 'Unapproved replacement' });
+  assert.equal(attempt.prepared, false);
+  assert.equal(database.prepare('SELECT state FROM deal_hunter_cim_transmissions WHERE id = ?')
+    .get(prepared.id).state, 'prepared');
+  assert.equal(database.prepare('SELECT cancelled_at FROM deal_hunter_cim_transmission_touches WHERE transmission_id = ?')
+    .get(prepared.id).cancelled_at, null);
+  assert.equal(database.prepare('SELECT transmission_id FROM deal_hunter_cim_campaign_touches WHERE id = ?')
+    .get(authority.touchId).transmission_id, prepared.id);
+  assert.equal(database.prepare('SELECT state FROM crm_email_outbox WHERE id = ?')
+    .get(prepared.outbox_id).state, 'prepared');
+});
+
+test('P5 preparation identity is touch-specific across campaigns', async (t) => {
+  const first = await createPreparedFixture(t, 'p5-identity-a');
+  const second = await createPreparedFixture(t, 'p5-identity-b');
+  for (const field of ['id', 'provider_idempotency_key', 'communication_id', 'outbox_id']) {
+    assert.notEqual(first.prepared[field], second.prepared[field], field);
+  }
+  assert.equal(first.prepared.payload_digest === second.prepared.payload_digest, false,
+    'membership is part of each immutable payload digest');
+  assert.equal(first.database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmission_touches').get().n, 1);
+  assert.equal(second.database.prepare('SELECT COUNT(*) AS n FROM deal_hunter_cim_transmission_touches').get().n, 1);
+});
 
 test('P1B live authorization binds one exact persisted transmission and rejects duplicates', async (t) => {
   const { storage, database, prepared } = await createPreparedFixture(t, 'authorization');

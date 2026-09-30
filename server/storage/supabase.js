@@ -1292,6 +1292,19 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         { requiredRows: { touch: ['claimed', 'alreadyOwned'] } });
     },
 
+    async listDueCimInitialTouches({ now, limit = 25 } = {}) {
+      if (typeof now !== 'string' || !Number.isFinite(Date.parse(now))
+        || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        throw new Error('Invalid Pursue CIM due selection');
+      }
+      const { data, error } = await client.rpc('pursue_cim_list_due_initial_touches_v1', {
+        p_now: now, p_limit: limit,
+      });
+      if (error) throw error;
+      if (!Array.isArray(data)) throw new Error('Malformed Pursue CIM due selection');
+      return data;
+    },
+
     async readPursueCimProjection(command) {
       const { data, error } = await client.rpc('pursue_cim_read_projection_v1', {
         p_command: command,
