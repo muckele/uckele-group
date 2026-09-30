@@ -1435,6 +1435,17 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
           extraFields: ['blockedReason'] });
     },
 
+    async readCimFinalGateContext(command) {
+      const { data, error } = await client.rpc('pursue_cim_read_final_gate_context_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      if (data === null) return null;
+      if (!data || typeof data !== 'object' || !data.transmission
+        || !Array.isArray(data.members)) throw new Error('Malformed Pursue CIM final-gate context');
+      return data;
+    },
+
     async authorizeCimProviderPending(command) {
       const { data, error } = await client.rpc('pursue_cim_authorize_provider_pending_v1', {
         p_command: command,

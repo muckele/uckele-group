@@ -1,11 +1,49 @@
 import { createHash } from 'node:crypto';
 
+import { sha256, stableCanonicalJson } from '../utils/security.js';
+import { evaluateAcquisitionMaterialsState } from '../services/acquisitionMaterials.js';
+
 function digest(...parts) {
   const framed = parts.map((part) => {
     const value = JSON.stringify(part);
     return [Buffer.byteLength(value), value];
   });
   return createHash('sha256').update(JSON.stringify(framed)).digest('hex');
+}
+
+function canonicalDigest(value) {
+  return sha256(stableCanonicalJson(value));
+}
+
+function authorityDigestMatches(authority) {
+  if (!authority || typeof authority !== 'object'
+    || !/^[0-9a-f]{64}$/.test(authority.authorityDigest ?? '')) return false;
+  const { authorityDigest, ...canonical } = authority;
+  return canonicalDigest(canonical) === authorityDigest;
+}
+
+function brokerAuthorityBlockedReason(authority) {
+  const blockers = Array.isArray(authority?.preparationBlockerCodes)
+    ? authority.preparationBlockerCodes : [];
+  if (authority?.priorRequestPresent
+    || blockers.some((code) => ['existing_request', 'existing_request_claim'].includes(code))) {
+    return 'lifecycle_conflict';
+  }
+  if (authority?.pursued !== true || authority?.disposition === 'dismissed'
+    || blockers.some((code) => ['pursue_not_current', 'not_pursued',
+      'opportunity_passed'].includes(code))) return 'owner_intent_changed';
+  if (authority?.suppressionPresent
+    || blockers.some((code) => code === 'recipient_suppressed')) return 'recipient_suppressed';
+  if (authority?.materialsReceived || authority?.advancedBeyondBrokerOutreach
+    || blockers.some((code) => ['materials_received', 'already_received'].includes(code))) {
+    return 'materials_received';
+  }
+  if (authority?.terminalReason) return 'terminal_authority_changed';
+  return blockers.length > 0 ? 'source_authority_unavailable' : null;
+}
+
+function safeCanonicalDigest(value) {
+  try { return canonicalDigest(value); } catch { return ''; }
 }
 
 function requiredText(value, name, maximum = 240) {
@@ -44,8 +82,9 @@ function withinLocalSendWindow(now, timezone) {
 }
 
 function appendAudit(database, event) {
+  const conflict = event.ignore ? 'OR IGNORE ' : '';
   database.prepare(`
-    INSERT INTO deal_hunter_cim_audit_events (
+    INSERT ${conflict}INTO deal_hunter_cim_audit_events (
       id, event_type, opportunity_id, campaign_id, conversation_id, touch_id,
       transmission_id, activation_id, authorization_id, prior_state, next_state,
       reason_code, authority_digest, payload_digest, actor, source, occurred_at, metadata
@@ -541,6 +580,83 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         `).get(transmissionId), nextTouch);
       }).immediate();
     },
+    async readCimFinalGateContext(command) {
+      const transmissionId = requiredText(command.transmissionId, 'transmissionId');
+      const authorizationId = requiredText(command.authorizationId, 'authorizationId');
+      const transmission = database.prepare(`
+        SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?
+      `).get(transmissionId) ?? null;
+      if (!transmission) return null;
+      const conversation = database.prepare(`
+        SELECT * FROM deal_hunter_broker_conversations WHERE id = ?
+      `).get(transmission.conversation_id) ?? null;
+      const authorization = database.prepare(`
+        SELECT * FROM deal_hunter_cim_live_provider_authorizations WHERE id = ?
+      `).get(authorizationId) ?? null;
+      const activation = authorization ? database.prepare(`
+        SELECT * FROM deal_hunter_cim_capability_activations WHERE id = ?
+      `).get(authorization.activation_id) ?? null : null;
+      const safety = database.prepare(`
+        SELECT * FROM deal_hunter_cim_safety_settings WHERE id = 'global'
+      `).get() ?? null;
+      const globalAuthorityRevision = database.prepare(`
+        SELECT revision FROM deal_hunter_cim_global_authority WHERE id = 'global'
+      `).get()?.revision ?? null;
+      const communicationRow = database.prepare(`
+        SELECT * FROM crm_communications WHERE id = ?
+      `).get(transmission.communication_id) ?? null;
+      const outboxRow = database.prepare(`
+        SELECT * FROM crm_email_outbox WHERE id = ?
+      `).get(transmission.outbox_id) ?? null;
+      const parseJson = (value, fallback) => {
+        try { return JSON.parse(value ?? '') ?? fallback; } catch { return fallback; }
+      };
+      const communicationMetadata = parseJson(communicationRow?.metadata, {});
+      const outboxMetadata = parseJson(outboxRow?.metadata, {});
+      const communication = communicationRow ? {
+        ...communicationRow,
+        to_addresses: parseJson(communicationRow.to_addresses, []),
+        cc_addresses: parseJson(communicationRow.cc_addresses, []),
+        bcc_addresses: parseJson(communicationRow.bcc_addresses, []),
+        tags: Array.isArray(communicationMetadata.tags) ? communicationMetadata.tags : [],
+        body_text_digest: createHash('sha256').update(communicationRow.body_text ?? '').digest('hex'),
+        body_html_digest: createHash('sha256').update(
+          communicationRow.body_html_sanitized ?? '').digest('hex'),
+      } : null;
+      const outbox = outboxRow ? { ...outboxRow,
+        retry_policy: outboxMetadata.retryPolicy ?? null } : null;
+      const rows = database.prepare(`
+        SELECT m.transmission_id, m.touch_id, m.opportunity_id, m.campaign_id,
+          m.display_ordinal, m.cancelled_at, m.cancellation_reason
+        FROM deal_hunter_cim_transmission_touches m
+        WHERE m.transmission_id = ? ORDER BY m.touch_id
+      `).all(transmissionId);
+      const members = rows.map((membership) => {
+        const touch = database.prepare(`SELECT * FROM deal_hunter_cim_campaign_touches
+          WHERE id = ?`).get(membership.touch_id) ?? null;
+        const campaign = database.prepare(`SELECT * FROM deal_hunter_cim_campaigns
+          WHERE id = ?`).get(membership.campaign_id) ?? null;
+        const decision = campaign ? database.prepare(`SELECT * FROM deal_hunter_owner_decision_events
+          WHERE id = ?`).get(campaign.decision_event_id) ?? null : null;
+        const enrollment = campaign ? database.prepare(`SELECT * FROM deal_hunter_pursuit_enrollments
+          WHERE id = ?`).get(campaign.enrollment_id) ?? null : null;
+        const opportunity = database.prepare(`SELECT * FROM deal_hunter_opportunities
+          WHERE opportunity_id = ?`).get(membership.opportunity_id) ?? null;
+        const timezone = database.prepare(`SELECT * FROM deal_hunter_opportunity_timezone_revisions
+          WHERE opportunity_id = ? ORDER BY revision DESC LIMIT 1`)
+          .get(membership.opportunity_id) ?? null;
+        const crmOwnership = database.prepare(`SELECT revision, submission_id
+          FROM deal_hunter_crm_ownership_revisions WHERE opportunity_id = ?
+          ORDER BY revision DESC LIMIT 1`).get(membership.opportunity_id) ?? null;
+        const crmSubmission = campaign?.crm_submission_id ? database.prepare(`
+          SELECT * FROM contact_submissions WHERE id = ?
+        `).get(campaign.crm_submission_id) ?? null : null;
+        return { membership, touch, campaign, decision, enrollment, opportunity,
+          timezone, crmOwnership, crmSubmission };
+      });
+      return { transmission, conversation, authorization, activation, safety,
+        globalAuthorityRevision, communication, outbox, members };
+    },
     async enterCimProviderSeam(command) {
       const transmissionId = requiredText(command.transmissionId, 'transmissionId');
       const authorizationId = requiredText(command.authorizationId, 'authorizationId');
@@ -598,6 +714,8 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         command.expectedCampaignTerminalRevision, 'expectedCampaignTerminalRevision');
       const expectedConversationTerminalRevision = requiredRevision(
         command.expectedConversationTerminalRevision, 'expectedConversationTerminalRevision');
+      const expectedGlobalAuthorityRevision = requiredRevision(
+        command.expectedGlobalAuthorityRevision, 'expectedGlobalAuthorityRevision');
       const claimTokenDigest = requiredText(command.claimTokenDigest, 'claimTokenDigest', 64);
       const finalGateAuthorityDigest = requiredText(command.finalGateAuthorityDigest,
         'finalGateAuthorityDigest', 64);
@@ -606,17 +724,65 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         .every((value) => /^[0-9a-f]{64}$/.test(value))) throw new Error('Invalid provider-pending digest');
       const actor = requiredText(command.actor, 'actor', 200);
       const now = requiredInstant(command.now);
+      const authoritySnapshot = command.authoritySnapshot;
+      const snapshotDigest = safeCanonicalDigest(authoritySnapshot);
+      const snapshotMembers = Array.isArray(authoritySnapshot?.members)
+        ? authoritySnapshot.members : [];
       return database.transaction(() => {
         const transmission = database.prepare(`
           SELECT * FROM deal_hunter_cim_transmissions WHERE id = ?
         `).get(transmissionId);
-        const blocked = (blockedReason) => ({ authorized: false, blockedReason,
-          transmission: transmission ?? null, boundaryNonceDigest: null });
+        const blocked = (blockedReason) => {
+          if (transmission) appendAudit(database, { eventType: 'final-gate-blocked',
+            ignore: true,
+            id: digest('cim-final-gate-block:v1', transmission.id, transmission.row_version,
+              blockedReason, finalGateAuthorityDigest),
+            authorityId: transmission.id, conversationId: transmission.conversation_id,
+            transmissionId: transmission.id,
+            priorState: transmission.state, nextState: transmission.state,
+            reasonCode: blockedReason, authorityDigest: finalGateAuthorityDigest,
+            payloadDigest: transmission.payload_digest, actor, occurredAt: now });
+          return { authorized: false, blockedReason,
+            transmission: transmission ?? null, boundaryNonceDigest: null };
+        };
         if (!transmission) return blocked('lifecycle_conflict');
         if (transmission.state !== 'prepared' || transmission.invocation_authority_count !== 0) {
           return blocked('already_provider_pending');
         }
+        if (transmission.provider_seam_entered_at || transmission.provider
+          || transmission.provider_message_id || transmission.provider_result_code
+          || transmission.boundary_nonce_digest || transmission.final_gate_authority_digest
+          || transmission.release_state !== 'ordinary') return blocked('lifecycle_conflict');
         if (transmission.row_version !== expectedRowVersion) return blocked('stale_authority');
+        if (!authoritySnapshot || authoritySnapshot.version !== 'cim-final-gate-authority-v1'
+          || authoritySnapshot.gateInstant !== now || snapshotDigest !== finalGateAuthorityDigest
+          || snapshotMembers.length < 1) return blocked('lifecycle_conflict');
+        if (authoritySnapshot.transmission?.id !== transmission.id
+          || authoritySnapshot.transmission?.state !== transmission.state
+          || authoritySnapshot.transmission?.releaseState !== transmission.release_state
+          || authoritySnapshot.transmission?.rowVersion !== transmission.row_version
+          || authoritySnapshot.transmission?.payloadDigest !== transmission.payload_digest
+          || authoritySnapshot.transmission?.preparationGeneration
+            !== transmission.preparation_generation
+          || authoritySnapshot.transmission?.payloadVersion !== transmission.payload_version
+          || authoritySnapshot.transmission?.communicationId !== transmission.communication_id
+          || authoritySnapshot.transmission?.outboxId !== transmission.outbox_id) {
+          return blocked('lifecycle_conflict');
+        }
+        const readiness = authoritySnapshot.readiness;
+        if (!authorityDigestMatches(readiness) || readiness.ready !== true
+          || readiness.version !== 'cim-provider-readiness-v1'
+          || readiness.providerProfile !== providerProfile
+          || Date.parse(readiness.expiresAt) <= Date.parse(now)) {
+          return blocked('provider_readiness_unavailable');
+        }
+        const globalAuthorityRevision = database.prepare(`
+          SELECT revision FROM deal_hunter_cim_global_authority WHERE id = 'global'
+        `).get()?.revision;
+        if (globalAuthorityRevision !== expectedGlobalAuthorityRevision
+          || Number(authoritySnapshot.globalAuthorityRevision) !== globalAuthorityRevision) {
+          return blocked('freshness_changed');
+        }
         const pause = database.prepare(`
           SELECT outreach_paused FROM deal_hunter_cim_safety_settings WHERE id = 'global'
         `).get();
@@ -633,15 +799,36 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           || Date.parse(authorization.expires_at) <= Date.parse(now)) {
           return blocked('live_authorization_invalid');
         }
+        if (authoritySnapshot.authorization?.id !== authorization.id
+          || authoritySnapshot.authorization?.activation_id !== authorization.activation_id
+          || authoritySnapshot.authorization?.payload_digest !== authorization.payload_digest
+          || authoritySnapshot.authorization?.recipient_authority_digest
+            !== authorization.recipient_authority_digest) return blocked('live_authorization_invalid');
         const activation = currentActivationChain(database, authorization.capability, now);
         if (!activation || activation.id !== authorization.activation_id
           || activation.provider_profile !== providerProfile) return blocked('capability_inactive');
+        if (authorization.capability !== 'fl04b-initial'
+          || authoritySnapshot.activation?.id !== activation.id
+          || authoritySnapshot.activation?.policy_hash !== activation.policy_hash
+          || authoritySnapshot.activation?.config_hash !== activation.config_hash) {
+          return blocked('capability_inactive');
+        }
         const conversation = database.prepare(`
           SELECT * FROM deal_hunter_broker_conversations WHERE id = ?
         `).get(transmission.conversation_id);
         if (!conversation || conversation.state !== 'open'
           || conversation.terminal_revision !== expectedConversationTerminalRevision) {
           return blocked('terminal_authority_changed');
+        }
+        if (authoritySnapshot.conversation?.id !== conversation.id
+          || authoritySnapshot.conversation?.rowVersion !== conversation.row_version
+          || authoritySnapshot.conversation?.recipientAuthorityId !== conversation.recipient_authority_id
+          || authoritySnapshot.conversation?.recipientFingerprint !== conversation.recipient_fingerprint
+          || authoritySnapshot.conversation?.recipientAddressDigest
+            !== sha256(String(conversation.recipient_address).toLowerCase())
+          || authoritySnapshot.conversation?.senderPolicyVersion !== conversation.sender_policy_version
+          || authoritySnapshot.conversation?.replyPolicyVersion !== conversation.reply_policy_version) {
+          return blocked('recipient_authority_changed');
         }
         const members = database.prepare(`
           SELECT t.*, c.state AS campaign_state, c.terminal_revision AS campaign_terminal_revision,
@@ -653,14 +840,25 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           JOIN deal_hunter_cim_campaigns c ON c.id = m.campaign_id
           WHERE m.transmission_id = ? AND m.cancelled_at IS NULL ORDER BY t.id
         `).all(transmissionId);
-        if (!members.length || members.some((member) =>
+        if (!members.length) return blocked('membership_changed');
+        if (members.some((member) =>
           !['initial-pending', 'active-follow-up'].includes(member.campaign_state)
           || member.campaign_terminal_revision !== expectedCampaignTerminalRevision)) {
           return blocked('terminal_authority_changed');
         }
+        const memberIds = members.map(({ id }) => id).sort();
+        const snapshotMemberIds = snapshotMembers.map((member) => member.touch?.id).sort();
+        if (members.length !== snapshotMembers.length
+          || new Set(memberIds).size !== memberIds.length
+          || JSON.stringify(memberIds) !== JSON.stringify(snapshotMemberIds)
+          || transmission.member_digest !== digest('cim-members:v1', memberIds)
+          || authoritySnapshot.transmission?.memberDigest !== transmission.member_digest) {
+          return blocked('membership_changed');
+        }
         if (members.some((member) => member.state !== 'claimed'
           || member.claim_token_digest !== claimTokenDigest
           || member.transmission_id !== transmissionId
+          || member.kind !== 'initial' || member.logical_slot !== 'initial' || member.ordinal !== 0
           || !member.claim_expires_at
           || Date.parse(member.claim_expires_at) <= Date.parse(now)
           || Date.parse(member.due_at) > Date.parse(now))) return blocked('lifecycle_conflict');
@@ -669,13 +867,122 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           return blocked('recipient_authority_changed');
         }
         for (const member of members) {
+          const expectedMember = snapshotMembers.find((item) => item.touch?.id === member.id);
+          const campaign = database.prepare(`
+            SELECT * FROM deal_hunter_cim_campaigns WHERE id = ?
+          `).get(member.campaign_id);
+          if (!expectedMember || !campaign || campaign.generation !== 1
+            || campaign.policy_version !== 'deal-hunter-cim-autopilot-v1'
+            || campaign.state !== 'initial-pending' || campaign.terminal_reason
+            || campaign.conversation_id !== transmission.conversation_id
+            || campaign.crm_submission_id !== expectedMember.campaign?.crm_submission_id
+            || campaign.row_version !== expectedMember.campaign?.row_version
+            || member.row_version !== expectedMember.touch?.row_version
+            || member.timezone_revision !== campaign.timezone_revision) {
+            return blocked('lifecycle_conflict');
+          }
+          const recipientAuthority = expectedMember.recipientAuthority;
+          if (!authorityDigestMatches(recipientAuthority) || recipientAuthority.present !== true
+            || recipientAuthority.addressDigest
+              !== sha256(String(conversation.recipient_address).toLowerCase())
+            || recipientAuthority.derivedRecipientFingerprint !== campaign.recipient_fingerprint
+            || campaign.recipient_fingerprint !== authorization.recipient_authority_digest) {
+            return blocked('recipient_authority_changed');
+          }
+          if (activation.permission_basis_digest !== campaign.permission_digest
+            || activation.permission_revision !== campaign.permission_revision
+            || activation.cohort_digest !== campaign.permission_scope
+            || expectedMember.campaign?.permission_digest !== campaign.permission_digest
+            || expectedMember.campaign?.permission_revision !== campaign.permission_revision
+            || expectedMember.campaign?.permission_scope !== campaign.permission_scope) {
+            return blocked('permission_changed');
+          }
+          const latestDecision = database.prepare(`
+            SELECT * FROM deal_hunter_owner_decision_events WHERE opportunity_id = ?
+            ORDER BY created_at DESC, id DESC LIMIT 1
+          `).get(member.opportunity_id);
+          const currentEnrollment = database.prepare(`
+            SELECT * FROM deal_hunter_pursuit_enrollments
+            WHERE opportunity_id = ? AND state <> 'superseded' LIMIT 1
+          `).get(member.opportunity_id);
+          if (!latestDecision || latestDecision.id !== campaign.decision_event_id
+            || latestDecision.action !== 'pursue'
+            || expectedMember.decision?.id !== latestDecision.id
+            || !currentEnrollment || currentEnrollment.id !== campaign.enrollment_id
+            || currentEnrollment.decision_event_id !== latestDecision.id
+            || currentEnrollment.state !== 'campaign-created'
+            || expectedMember.enrollment?.row_version !== currentEnrollment.row_version) {
+            return blocked('owner_intent_changed');
+          }
           const opportunity = database.prepare(`
             SELECT * FROM deal_hunter_opportunities WHERE opportunity_id = ?
           `).get(member.opportunity_id);
-          if (!opportunity || opportunity.status !== 'active'
+          const sourceAuthority = expectedMember.sourceAuthority;
+          if (!opportunity || opportunity.status !== 'active') {
+            return blocked('identity_authority_changed');
+          }
+          if (!authorityDigestMatches(sourceAuthority) || sourceAuthority.ready !== true
+            || sourceAuthority.opportunityId !== opportunity.opportunity_id
+            || Number(sourceAuthority.globalAuthorityRevision) !== globalAuthorityRevision
+            || Number(sourceAuthority.opportunity?.campaignAuthorityRevision)
+              !== opportunity.campaign_authority_revision) {
+            return blocked('source_authority_unavailable');
+          }
+          if (opportunity.discovery_state === 'pending'
             || opportunity.discovery_revision !== member.campaign_discovery_revision
-            || opportunity.material_revision !== member.campaign_material_revision) {
+            || opportunity.material_revision !== member.campaign_material_revision
+            || Number(sourceAuthority.opportunity?.discoveryRevision) !== opportunity.discovery_revision
+            || Number(sourceAuthority.opportunity?.materialRevision) !== opportunity.material_revision) {
             return blocked('freshness_changed');
+          }
+          const currentSourceRows = database.prepare(`
+            SELECT COUNT(*) AS n FROM deal_hunter_opportunity_source_observations
+            WHERE opportunity_id = ? AND accepted_at IS NOT NULL
+          `).get(member.opportunity_id)?.n ?? 0;
+          const badSourceStates = database.prepare(`
+            SELECT COUNT(*) AS n FROM deal_hunter_source_freshness_state
+            WHERE projection_state <> 'accepted'
+          `).get()?.n ?? 0;
+          if (currentSourceRows < 1 || badSourceStates > 0) {
+            return blocked('source_authority_unavailable');
+          }
+          const openIdentityExceptions = database.prepare(`
+            SELECT candidate_opportunity_ids FROM deal_hunter_identity_exceptions
+            WHERE status = 'open'
+          `).all().some((row) => {
+            try { return JSON.parse(row.candidate_opportunity_ids).includes(member.opportunity_id); }
+            catch { return true; }
+          });
+          if (openIdentityExceptions) return blocked('identity_authority_changed');
+          const materialsAuthority = expectedMember.materialsAuthority;
+          if (!authorityDigestMatches(materialsAuthority)) return blocked('source_authority_unavailable');
+          const brokerBlock = brokerAuthorityBlockedReason(materialsAuthority);
+          if (brokerBlock) return blocked(brokerBlock);
+          const priorRequest = database.prepare(`SELECT 1 FROM deal_hunter_cim_requests
+            WHERE opportunity_id = ? OR deal_key IN (SELECT deal_key
+              FROM deal_hunter_opportunity_scores WHERE opportunity_id = ?) LIMIT 1`)
+            .get(member.opportunity_id, member.opportunity_id);
+          const priorClaim = database.prepare(`SELECT 1 FROM deal_hunter_cim_opportunity_claims
+            WHERE opportunity_id = ? LIMIT 1`).get(member.opportunity_id);
+          if (priorRequest || priorClaim) return blocked('lifecycle_conflict');
+          const crmOwner = database.prepare(`
+            SELECT * FROM contact_submissions WHERE id = ?
+          `).get(member.crm_submission_id);
+          let submissionMetadata = {};
+          try { submissionMetadata = JSON.parse(crmOwner?.metadata || '{}'); }
+          catch { return blocked('materials_received'); }
+          const secureDocuments = database.prepare(`SELECT * FROM secure_documents
+            WHERE submission_id = ? ORDER BY created_at, id`).all(campaign.crm_submission_id);
+          const latestUploadRequest = database.prepare(`SELECT * FROM secure_upload_requests
+            WHERE submission_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`)
+            .get(campaign.crm_submission_id) ?? null;
+          const currentMaterials = evaluateAcquisitionMaterialsState({
+            submission: { ...crmOwner, metadata: submissionMetadata },
+            secureDocuments,
+            latestUploadRequest,
+          });
+          if (currentMaterials.materialsReceived || currentMaterials.advancedBeyondBrokerOutreach) {
+            return blocked('materials_received');
           }
           const timezone = database.prepare(`
             SELECT revision, state, iana_timezone FROM deal_hunter_opportunity_timezone_revisions
@@ -686,31 +993,92 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           if (!timezone.iana_timezone || !withinLocalSendWindow(now, timezone.iana_timezone)) {
             return blocked('outside_send_window');
           }
-          const crmOwner = database.prepare(`
-            SELECT * FROM contact_submissions WHERE id = ?
+          const currentCrmOwnership = database.prepare(`
+            SELECT revision, submission_id FROM deal_hunter_crm_ownership_revisions
+            WHERE opportunity_id = ? ORDER BY revision DESC LIMIT 1
+          `).get(member.opportunity_id);
+          const activeSupersession = database.prepare(`
+            SELECT 1 FROM crm_submission_supersessions
+            WHERE superseded_submission_id = ? AND status = 'active' LIMIT 1
           `).get(member.crm_submission_id);
           if (!crmOwner || crmOwner.archived_at
-            || crmOwner.deal_hunter_opportunity_id !== member.opportunity_id) {
+            || crmOwner.deal_hunter_opportunity_id !== member.opportunity_id
+            || opportunity.primary_submission_id !== member.crm_submission_id
+            || currentCrmOwnership?.submission_id !== member.crm_submission_id
+            || currentCrmOwnership?.revision !== campaign.crm_ownership_revision
+            || expectedMember.crmOwnership?.revision !== currentCrmOwnership?.revision
+            || activeSupersession) {
             return blocked('crm_owner_changed');
           }
           if (member.local_expiry_at && Date.parse(member.local_expiry_at) <= Date.parse(now)) {
             return blocked('expired');
           }
         }
+        const reply = database.prepare(`
+          SELECT 1 FROM crm_communications
+          WHERE direction = 'inbound' AND (
+            thread_key = ? OR submission_id IN (
+              SELECT crm_submission_id FROM deal_hunter_cim_campaigns c
+              JOIN deal_hunter_cim_transmission_touches m ON m.campaign_id = c.id
+              WHERE m.transmission_id = ? AND m.cancelled_at IS NULL
+            )
+          ) LIMIT 1
+        `).get(conversation.rfc_thread_key, transmissionId);
+        if (reply) return blocked('reply_received');
         const suppression = database.prepare(`
           SELECT 1 FROM email_suppressions
           WHERE normalized_email = lower(?) AND lifted_at IS NULL
         `).get(conversation.recipient_address);
-        if (suppression) return blocked('recipient_suppressed');
+        const adverseDelivery = database.prepare(`
+          SELECT 1 FROM email_events WHERE lower(recipient_email) = lower(?)
+            AND event_type IN ('complained', 'complaint', 'bounced', 'hard_bounce',
+              'unsubscribe', 'unsubscribed', 'opt_out') LIMIT 1
+        `).get(conversation.recipient_address);
+        if (suppression || adverseDelivery) return blocked('recipient_suppressed');
         const communication = database.prepare('SELECT * FROM crm_communications WHERE id = ?')
           .get(transmission.communication_id);
         const outbox = database.prepare('SELECT * FROM crm_email_outbox WHERE id = ?')
           .get(transmission.outbox_id);
         if (!communication || communication.outbox_id !== transmission.outbox_id
-          || communication.delivery_state !== 'not-attempted') return blocked('communication_changed');
+          || communication.delivery_state !== 'not-attempted'
+          || communication.direction !== 'outbound' || communication.channel !== 'email'
+          || communication.source !== 'pursue-cim-autopilot'
+          || communication.kind !== 'cim-initial'
+          || communication.thread_key !== conversation.rfc_thread_key
+          || communication.from_address !== transmission.from_address
+          || communication.to_addresses !== transmission.to_addresses
+          || communication.cc_addresses !== transmission.cc_addresses
+          || communication.bcc_addresses !== transmission.bcc_addresses
+          || communication.reply_to_address !== transmission.reply_to_address
+          || communication.subject !== transmission.subject) return blocked('communication_changed');
         if (!outbox || outbox.communication_id !== transmission.communication_id
-          || outbox.state !== 'prepared' || outbox.attempt_count !== 0) return blocked('outbox_changed');
+          || outbox.id !== transmission.outbox_id || outbox.state !== 'prepared'
+          || outbox.attempt_count !== 0 || outbox.claim_token || outbox.claimed_at
+          || outbox.claim_expires_at || outbox.provider || outbox.provider_message_id
+          || outbox.next_attempt_at || outbox.last_error_category || outbox.last_error_message) {
+          return blocked('outbox_changed');
+        }
         const metadata = JSON.parse(communication.metadata || '{}');
+        const outboxMetadata = JSON.parse(outbox.metadata || '{}');
+        const communicationAuthority = authoritySnapshot.communication;
+        if (communicationAuthority?.id !== communication.id
+          || communicationAuthority?.outboxId !== communication.outbox_id
+          || communicationAuthority?.threadId !== communication.thread_key
+          || communicationAuthority?.fromAddressDigest !== sha256(communication.from_address ?? '')
+          || communicationAuthority?.replyToAddressDigest !== sha256(communication.reply_to_address ?? '')
+          || communicationAuthority?.subjectDigest !== sha256(communication.subject ?? '')
+          || communicationAuthority?.bodyTextDigest !== sha256(communication.body_text ?? '')
+          || communicationAuthority?.bodyHtmlDigest !== sha256(communication.body_html_sanitized ?? '')
+          || JSON.stringify(communicationAuthority?.tags ?? []) !== JSON.stringify(metadata.tags ?? [])) {
+          return blocked('communication_changed');
+        }
+        if (authoritySnapshot.outbox?.id !== outbox.id
+          || authoritySnapshot.outbox?.updated_at !== outbox.updated_at
+          || authoritySnapshot.outbox?.retry_policy !== outboxMetadata.retryPolicy
+          || outboxMetadata.transmissionId !== transmission.id
+          || outboxMetadata.retryPolicy !== 'reconcile-only-after-provider-pending') {
+          return blocked('outbox_changed');
+        }
         const payloadDigest = digest('cim-payload:v1', communication.from_address,
           JSON.parse(communication.to_addresses), JSON.parse(communication.cc_addresses),
           JSON.parse(communication.bcc_addresses), communication.reply_to_address,
@@ -718,7 +1086,7 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           metadata.tags, members.map(({ id }) => id), members.map(({ template_version }) => template_version),
           transmission.payload_version);
         if (payloadDigest !== transmission.payload_digest) return blocked('payload_changed');
-        database.prepare(`
+        const transmissionChanged = database.prepare(`
           UPDATE deal_hunter_cim_transmissions SET state = 'provider-pending',
             release_state = 'authorized', final_gate_authority_digest = ?,
             campaign_terminal_revision = ?, conversation_terminal_revision = ?,
@@ -728,23 +1096,32 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
             AND row_version = ?
         `).run(finalGateAuthorityDigest, expectedCampaignTerminalRevision,
           expectedConversationTerminalRevision, now, boundaryNonceDigest, now,
-          transmissionId, expectedRowVersion);
-        for (const member of members) database.prepare(`
+          transmissionId, expectedRowVersion).changes;
+        if (transmissionChanged !== 1) throw new Error('CIM final-gate transmission CAS failed');
+        for (const member of members) {
+          const touchChanged = database.prepare(`
           UPDATE deal_hunter_cim_campaign_touches SET state = 'provider-pending',
             row_version = row_version + 1, updated_at = ?
           WHERE id = ? AND state = 'claimed' AND transmission_id = ?
-        `).run(now, member.id, transmissionId);
-        database.prepare(`
+        `).run(now, member.id, transmissionId).changes;
+          if (touchChanged !== 1) throw new Error('CIM final-gate touch CAS failed');
+        }
+        const authorizationChanged = database.prepare(`
           UPDATE deal_hunter_cim_live_provider_authorizations SET consumed_at = ?
           WHERE id = ? AND consumed_at IS NULL AND withdrawn_at IS NULL
-        `).run(now, authorizationId);
-        database.prepare(`
+        `).run(now, authorizationId).changes;
+        if (authorizationChanged !== 1) throw new Error('CIM final-gate authorization CAS failed');
+        const communicationChanged = database.prepare(`
           UPDATE crm_communications SET delivery_state = 'provider-pending',
-            delivery_state_at = ?, updated_at = ? WHERE id = ?
-        `).run(now, now, transmission.communication_id);
-        database.prepare(`
-          UPDATE crm_email_outbox SET state = 'provider-pending', updated_at = ? WHERE id = ?
-        `).run(now, transmission.outbox_id);
+            delivery_state_at = ?, updated_at = ?
+          WHERE id = ? AND delivery_state = 'not-attempted'
+        `).run(now, now, transmission.communication_id).changes;
+        if (communicationChanged !== 1) throw new Error('CIM final-gate communication CAS failed');
+        const outboxChanged = database.prepare(`
+          UPDATE crm_email_outbox SET state = 'provider-pending', updated_at = ?
+          WHERE id = ? AND state = 'prepared' AND attempt_count = 0
+        `).run(now, transmission.outbox_id).changes;
+        if (outboxChanged !== 1) throw new Error('CIM final-gate outbox CAS failed');
         appendAudit(database, { eventType: 'final-gate-authorized', authorityId: transmissionId,
           conversationId: transmission.conversation_id, transmissionId,
           authorityDigest: finalGateAuthorityDigest, actor, occurredAt: now });

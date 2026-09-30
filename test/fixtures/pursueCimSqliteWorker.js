@@ -1,8 +1,10 @@
 import Database from 'better-sqlite3';
+import { authorizePreparedCimTransmission } from '../../server/services/pursueCimFinalGate.js';
 import { createSqliteStorage } from '../../server/storage/sqlite.js';
 
 process.on('message', async ({ sqlitePath, mode, command }) => {
   if (mode === 'owner-command' || mode === 'pre-provider-transition'
+    || mode === 'final-gate-service'
     || mode === 'campaign-allocation') {
     const storage = createSqliteStorage({ storage: { sqlitePath }, protection: { rateLimitRetentionMs: 0 } });
     try {
@@ -14,6 +16,20 @@ process.on('message', async ({ sqlitePath, mode, command }) => {
         const result = await storage.materializePursuitCampaign(command);
         process.send?.({ ok: true, result: { applied: result.applied,
           existing: result.existing, actionRequired: result.actionRequired } });
+      } else if (mode === 'final-gate-service') {
+        const result = await authorizePreparedCimTransmission({
+          storage,
+          ...command.args,
+          loadMemberAuthority: async () => command.memberAuthority,
+          readCurrentAuthority: async () => command.currentAuthority,
+          readProviderReadiness: async () => command.providerReadiness,
+        });
+        process.send?.({ ok: true, result: {
+          authorized: result.authorized,
+          blockedReason: result.blockedReason,
+          reconciliationOnly: result.reconciliationOnly,
+          hasBoundaryNonce: Object.hasOwn(result, 'boundaryNonce'),
+        } });
       } else {
         const { method, payload } = command;
         if (!['claimDueCimTouch', 'prepareCimTransmission',
