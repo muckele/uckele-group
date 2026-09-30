@@ -7,6 +7,9 @@ import path from 'node:path';
 import test from 'node:test';
 import Database from 'better-sqlite3';
 import { readCimCurrentAuthority, runCimCampaignSafety } from '../server/services/cimCampaignSafety.js';
+import { createCimProviderBoundaryAuthorization } from '../server/services/cimProviderBoundary.js';
+import { sendPreparedMessage } from '../server/services/delivery.js';
+import { sendAuthorizedCimTransmission } from '../server/services/pursueCimProvider.js';
 import { authorizePreparedCimTransmission } from '../server/services/pursueCimFinalGate.js';
 import { reconcileVerifiedCompleteGoogleSheetSourceSnapshot } from '../server/services/dealHunterSourceSnapshotAdmission.js';
 import { processCrmEmailOutbox } from '../server/services/followUpEmail.js';
@@ -1904,6 +1907,104 @@ test('P6A SQLite final gate consumes one authority, keeps the raw nonce ephemera
     WHERE provider_seam_entered_at IS NOT NULL`).get().n, 0);
 });
 
+test('P6B SQLite same-process final gate enters the common provider seam exactly once', async (t) => {
+  const { storage, authorization, gate } =
+    await createFinalGateFixture(t, 'p6b-same-process');
+  const finalGate = await gate();
+  assert.equal(finalGate.authorized, true, JSON.stringify(finalGate));
+  let providerCalls = 0;
+  const send = () => sendAuthorizedCimTransmission({
+    storage, finalGateResult: finalGate, authorizationId: authorization.id,
+    writerPath: 'pursue-cim-initial', providerProfile: 'synthetic-provider',
+    actor: 'fixture-owner',
+    now: new Date(at),
+    configOverride: {
+      isProduction: false,
+      server: { outboundRequestTimeoutMs: 100 },
+      delivery: {
+        provider: 'resend',
+        resendApiKey: 'synthetic-key',
+        resendFromEmail: 'sender@example.test',
+      },
+      dealHunter: { cimProvider: { enabled: true, profile: 'synthetic-provider' } },
+    },
+    fetcher: async () => {
+      providerCalls += 1;
+      return Response.json({ id: 'synthetic-resend-id' });
+    },
+  });
+
+  const first = await send();
+  const replay = await send();
+  assert.equal(first.status, 'sent');
+  assert.equal(replay.errorCategory, 'cim-provider-seam-already-entered');
+  assert.equal(replay.reconciliationOnly, true);
+  assert.equal(providerCalls, 1);
+  assert.equal((await storage.readCimOutreachCounters()).providerSeamEntries, 1);
+});
+
+test('P6B SQLite pause flip after final gate denies seam entry with consumed authority intact', async (t) => {
+  const { storage, database, prepared, authorization, gate } =
+    await createFinalGateFixture(t, 'p6b-pause-race');
+  const finalGate = await gate();
+  assert.equal(finalGate.authorized, true, JSON.stringify(finalGate));
+  database.prepare(`UPDATE deal_hunter_cim_safety_settings
+    SET outreach_paused = 1, updated_at = ? WHERE id = 'global'`).run(at);
+  const durable = await storage.readCimFinalGateContext({
+    transmissionId: prepared.id,
+    authorizationId: authorization.id,
+  });
+  const boundaryAuthorization = createCimProviderBoundaryAuthorization({
+    finalGateResult: finalGate,
+    authorizationId: authorization.id,
+    writerPath: 'pursue-cim-initial',
+    providerProfile: 'synthetic-provider',
+    actor: 'fixture-owner',
+  });
+  let providerCalls = 0;
+  const result = await sendPreparedMessage({
+    kind: 'cim-initial',
+    transmissionId: durable.transmission.id,
+    communicationId: durable.communication.id,
+    idempotencyKey: durable.transmission.provider_idempotency_key,
+    from: durable.communication.from_address,
+    to: durable.communication.to_addresses,
+    cc: durable.communication.cc_addresses,
+    bcc: durable.communication.bcc_addresses,
+    replyTo: durable.communication.reply_to_address,
+    subject: durable.communication.subject,
+    text: durable.communication.body_text,
+    html: durable.communication.body_html_sanitized,
+    tags: durable.communication.tags,
+  }, {
+    storage,
+    cimProviderAuthorization: boundaryAuthorization,
+    now: new Date(at),
+    configOverride: {
+      isProduction: false,
+      server: { outboundRequestTimeoutMs: 100 },
+      delivery: {
+        provider: 'resend',
+        resendApiKey: 'synthetic-key',
+        resendFromEmail: 'sender@example.test',
+      },
+      dealHunter: { cimProvider: { enabled: true, profile: 'synthetic-provider' } },
+    },
+    fetcher: async () => {
+      providerCalls += 1;
+      return Response.json({ id: 'must-not-send' });
+    },
+  });
+
+  assert.equal(result.errorCategory, 'cim-provider-seam-unauthorized');
+  assert.equal(providerCalls, 0);
+  assert.equal(database.prepare(`SELECT provider_seam_entered_at
+    FROM deal_hunter_cim_transmissions WHERE id = ?`).get(prepared.id).provider_seam_entered_at, null);
+  assert.equal(database.prepare(`SELECT consumed_at
+    FROM deal_hunter_cim_live_provider_authorizations WHERE id = ?`)
+    .get(authorization.id).consumed_at, at);
+});
+
 test('P6A SQLite final gate blocks every mutable authority without consuming call authority', async (t) => {
   const cases = [
     ['central-pause', 'central_pause', ({ database }) => database.prepare(`UPDATE
@@ -2240,10 +2341,12 @@ test('P1B provider seam admits one CAS winner and rechecks durable pause', async
   const nonceDigest = sha256(pending.boundaryNonce);
   const command = { transmissionId: prepared.id, authorizationId: authorization.id,
     writerPath: 'pursue-cim-initial', providerProfile: 'synthetic-provider',
+    capability: 'fl04b-initial', payloadDigest: prepared.payload_digest,
     boundaryNonceDigest: nonceDigest, expectedRowVersion: 2, actor: 'fixture-owner', now: at };
   database.prepare("UPDATE deal_hunter_cim_safety_settings SET outreach_paused = 1 WHERE id = 'global'").run();
   assert.equal((await storage.enterCimProviderSeam(command)).unauthorized, true);
   database.prepare("UPDATE deal_hunter_cim_safety_settings SET outreach_paused = 0 WHERE id = 'global'").run();
+  assert.equal((await storage.enterCimProviderSeam({ ...command, payloadDigest: digest('f') })).unauthorized, true);
   assert.equal((await storage.enterCimProviderSeam(command)).entered, true);
   assert.equal((await storage.enterCimProviderSeam(command)).alreadyEntered, true);
   assert.equal((await storage.enterCimProviderSeam({ ...command, boundaryNonceDigest: digest('c') })).unauthorized, true);
@@ -2263,7 +2366,8 @@ test('P1B accepted finalization updates one identity and creates one dormant nex
     await createProviderPendingFixture(t, 'finalize');
   assert.equal((await storage.enterCimProviderSeam({ transmissionId: pending.id,
     authorizationId: authorization.id, writerPath: 'pursue-cim-initial',
-    providerProfile: 'synthetic-provider', boundaryNonceDigest,
+    providerProfile: 'synthetic-provider', capability: 'fl04b-initial',
+    payloadDigest: pending.payload_digest, boundaryNonceDigest,
     expectedRowVersion: 2, actor: 'fixture-owner', now: at })).entered, true);
   const command = { transmissionId: pending.id, expectedRowVersion: 3,
     outcome: 'accepted', provider: 'synthetic-provider', providerMessageId: 'provider-message-1',
@@ -2292,7 +2396,8 @@ test('P1B exact reconciliation resolves ambiguity without another provider autho
     await createProviderPendingFixture(t, 'reconcile');
   assert.equal((await storage.enterCimProviderSeam({ transmissionId: pending.id,
     authorizationId: authorization.id, writerPath: 'pursue-cim-initial',
-    providerProfile: 'synthetic-provider', boundaryNonceDigest,
+    providerProfile: 'synthetic-provider', capability: 'fl04b-initial',
+    payloadDigest: pending.payload_digest, boundaryNonceDigest,
     expectedRowVersion: 2, actor: 'fixture-owner', now: at })).entered, true);
   assert.equal((await storage.finalizeCimTransmission({ transmissionId: pending.id,
     expectedRowVersion: 3, outcome: 'ambiguous', provider: 'synthetic-provider',
@@ -2716,7 +2821,8 @@ test('P1B conversation reply fences campaigns before in-flight finalization', as
   assert.equal(campaign.terminal_revision, 1);
   assert.equal((await storage.enterCimProviderSeam({ transmissionId: pending.id,
     authorizationId: authorization.id, writerPath: 'pursue-cim-initial',
-    providerProfile: 'synthetic-provider', boundaryNonceDigest,
+    providerProfile: 'synthetic-provider', capability: 'fl04b-initial',
+    payloadDigest: pending.payload_digest, boundaryNonceDigest,
     expectedRowVersion: 2, actor: 'fixture-owner', now: at })).entered, true);
   const finalized = await storage.finalizeCimTransmission({ transmissionId: pending.id,
     expectedRowVersion: 3, outcome: 'accepted', provider: 'synthetic-provider',

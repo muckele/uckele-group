@@ -25,6 +25,8 @@ const p5MigrationPath = path.join(root,
   'supabase/migrations/20261002120000_pursue_cim_initial_preparation.sql');
 const p6aMigrationPath = path.join(root,
   'supabase/migrations/20261003120000_pursue_cim_final_gate.sql');
+const p6bMigrationPath = path.join(root,
+  'supabase/migrations/20261004120000_pursue_cim_provider_boundary.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -120,6 +122,21 @@ test('P6A PostgreSQL migration is mirrored and documents deterministic final-gat
   assert.match(gate, /v_expected_member #>> '\{campaign,permission_scope\}'[\s\S]*v_member\.permission_scope/);
   assert.match(gate, /v_result := public\.pursue_cim_authorize_provider_pending_p5_v1[\s\S]*final-gate-blocked/);
   assert.match(migration, /revoke all on function public\.pursue_cim_read_final_gate_context_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
+});
+
+test('P6B PostgreSQL seam requires exact payload capability work and service-role security', () => {
+  const migration = fs.readFileSync(p6bMigrationPath, 'utf8').trim();
+  const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
+  assert.ok(schema.includes(migration), 'canonical schema must contain the exact additive P6B block');
+  assert.match(migration, /security definer\s+set search_path = ''/i);
+  assert.match(migration, /v_authorization\.payload_digest is distinct from v_payload_digest/);
+  assert.match(migration, /v_transmission\.payload_digest is distinct from v_payload_digest/);
+  assert.match(migration, /v_authorization\.capability is distinct from v_capability/);
+  assert.match(migration, /v_authorization\.maximum_calls is distinct from 1/);
+  assert.match(migration, /v_authorization\.expires_at <= v_now/);
+  assert.match(migration, /v_communication\.delivery_state is distinct from 'provider-pending'/);
+  assert.match(migration, /v_outbox\.state is distinct from 'provider-pending'/);
+  assert.match(migration, /revoke all on function public\.pursue_cim_enter_provider_seam_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
 });
 
 test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
@@ -374,6 +391,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p4bMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p5MigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6aMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6bMigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -653,6 +671,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p4bMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p5MigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6aMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6bMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',
@@ -1914,9 +1933,9 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         boundaryNonceDigest: outcome.boundaryNonceDigest },
       reference.expectedProviderPending[index], database);
     }
-    assert.equal(reference.expectedSeam[1].entered, true);
+    assert.equal(reference.expectedSeam[2].entered, true);
     for (const [index, command] of reference.seamCommands.entries()) {
-      if (index === 1) {
+      if (index === 2) {
         rejectAuditTransition('provider-seam-entered',
           'pursue_cim_enter_provider_seam_v1', command);
         assert.equal(psql(container, database, `select provider_seam_entered_at is null

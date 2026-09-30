@@ -1,11 +1,15 @@
 import { getConfig } from '../config.js';
 import { fetchWithTimeout } from '../utils/http.js';
+import { classifyCimProtectedWork, enterCimProviderBoundary } from './cimProviderBoundary.js';
 import { canonicalDailyDealHunterMailbox } from './dailyDealHunterDigest.js';
 import { recordEmailEvent } from './emailEvents.js';
 
 const cimMessageKinds = new Set([
   'deal-hunter-cim-request',
   'deal-hunter-cim-follow-up',
+  'cim-initial',
+  'cim-follow-up',
+  'cim-batch',
 ]);
 const dailyDealHunterMessageKind = 'daily-deal-hunter';
 const resendIdentityMessageKinds = new Set([...cimMessageKinds, dailyDealHunterMessageKind]);
@@ -313,6 +317,8 @@ async function sendViaResend(message, { config, fetcher } = {}) {
     body: JSON.stringify({
       from: message.from || config.delivery.resendFromEmail,
       to: normalizeRecipients(message.to),
+      cc: normalizeRecipients(message.cc).length ? normalizeRecipients(message.cc) : undefined,
+      bcc: normalizeRecipients(message.bcc).length ? normalizeRecipients(message.bcc) : undefined,
       subject: message.subject,
       html: message.html,
       text: message.text,
@@ -491,6 +497,12 @@ async function recordTrackedEmailDelivery(message, result) {
   if (!message.tracking || !['sent', 'logged'].includes(result.status)) {
     return;
   }
+  // Package 6C owns all provider-outcome evidence for transmission-backed CIM
+  // work. The generic tracker is safe for legacy and ordinary mail, but must
+  // not create an apparent sent event for a new one-shot transmission.
+  if (['cim-initial', 'cim-follow-up', 'cim-batch'].includes(message.kind)) {
+    return;
+  }
 
   const config = getConfig();
   const recipients = normalizeRecipients(message.to);
@@ -520,9 +532,70 @@ async function recordTrackedEmailDelivery(message, result) {
   }
 }
 
-async function sendMessage(message, { configOverride, fetcher } = {}) {
+async function sendMessage(message, {
+  configOverride, fetcher, cimProviderAuthorization, storage, now,
+} = {}) {
   const config = configOverride || getConfig();
   let result;
+  const cimClassification = await classifyCimProtectedWork(message, { storage });
+
+  if (cimClassification.protected) {
+    if (config.dealHunter?.cimProvider?.enabled !== true) {
+      return {
+        status: 'failed',
+        error: 'CIM provider invocation is disabled by the environment hard-off.',
+        errorCategory: 'cim-provider-hard-off',
+        definitiveFailure: true,
+        provider: config.delivery.provider,
+        providerMessageId: '',
+      };
+    }
+    if (!cimProviderAuthorization) {
+      return {
+        status: 'failed',
+        error: 'Exact CIM provider authorization is required.',
+        errorCategory: 'cim-provider-authorization-required',
+        definitiveFailure: true,
+        provider: config.delivery.provider,
+        providerMessageId: '',
+      };
+    }
+    if (config.delivery.provider !== 'resend') {
+      return {
+        status: 'failed',
+        error: 'The selected provider profile is not eligible for CIM outreach.',
+        errorCategory: 'cim-provider-profile-mismatch',
+        definitiveFailure: true,
+        provider: config.delivery.provider,
+        providerMessageId: '',
+      };
+    }
+    if (!config.dealHunter?.cimProvider?.profile
+      || cimProviderAuthorization.providerProfile !== config.dealHunter.cimProvider.profile) {
+      return {
+        status: 'failed',
+        error: 'The CIM authorization does not match the configured provider profile.',
+        errorCategory: 'cim-provider-profile-mismatch',
+        definitiveFailure: true,
+        provider: config.delivery.provider,
+        providerMessageId: '',
+      };
+    }
+    const boundary = await enterCimProviderBoundary({
+      message, storage, authorization: cimProviderAuthorization, now,
+    });
+    if (!boundary.allowed) {
+      return {
+        status: 'failed',
+        error: 'CIM provider boundary denied this invocation.',
+        errorCategory: boundary.errorCategory,
+        definitiveFailure: true,
+        reconciliationOnly: boundary.reconciliationOnly === true,
+        provider: config.delivery.provider,
+        providerMessageId: '',
+      };
+    }
+  }
 
   if (message.kind === dailyDealHunterMessageKind
     && (['emailjs', 'formspree'].includes(config.delivery.provider)

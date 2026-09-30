@@ -234,7 +234,7 @@ const preparedTransmission = database.prepare(`select * from deal_hunter_cim_tra
   where id = ?`).get(expectedPreparations.at(-1).transmissionId);
 const authorizationBase = { id: 'authorization-materialize',
   activationId: 'activation-initial', capability: 'fl04b-initial',
-  writerPath: 'synthetic-writer', transmissionId: preparedTransmission.id,
+  writerPath: 'pursue-cim-initial', transmissionId: preparedTransmission.id,
   payloadDigest: preparedTransmission.payload_digest,
   recipientAuthorityDigest: campaignCommands[0].recipientFingerprint,
   providerProfile: 'synthetic-provider',
@@ -315,10 +315,11 @@ for (let index = 0; index < 4; index += 1) {
 const seamBase = { transmissionId: preparedTransmission.id,
   authorizationId: authorizationBase.id, writerPath: authorizationBase.writerPath,
   providerProfile: authorizationBase.providerProfile,
+  capability: authorizationBase.capability, payloadDigest: preparedTransmission.payload_digest,
   boundaryNonceDigest: providerPendingCommands[2].boundaryNonceDigest, expectedRowVersion: 2,
   actor: 'fixture', now };
 const seamCommands = [{ ...seamBase, boundaryNonceDigest: '9'.repeat(64) },
-  seamBase, seamBase];
+  { ...seamBase, payloadDigest: '9'.repeat(64) }, seamBase, seamBase];
 const expectedSeam = [];
 for (const command of seamCommands) {
   expectedSeam.push(await storage.enterCimProviderSeam(command));
