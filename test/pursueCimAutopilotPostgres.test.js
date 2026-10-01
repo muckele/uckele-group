@@ -37,6 +37,8 @@ const p6dMigrationPath = path.join(root,
   'supabase/migrations/20261006120000_pursue_cim_dormant_followup_slots.sql');
 const p7aMigrationPath = path.join(root,
   'supabase/migrations/20261007120000_pursue_cim_conversation_first_inbound.sql');
+const p7bMigrationPath = path.join(root,
+  'supabase/migrations/20261008120000_pursue_cim_terminal_writer_convergence.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -72,6 +74,7 @@ const expectedP1cFunctions = [
   'pursue_cim_canonical_json_v1',
   'pursue_cim_claim_due_touch_v1',
   'pursue_cim_consume_safety_events_v1',
+  'pursue_cim_converge_terminal_authority_v1',
   'pursue_cim_crm_match_fingerprint_v1',
   'pursue_cim_current_activation_v1',
   'pursue_cim_digest_v1',
@@ -240,6 +243,32 @@ test('P7A PostgreSQL inbound resolver is additive, mirrored, read-only, and serv
     /new\.metadata - array\['conversationId','campaignIds','touchIds','memberDigest'\]\s*=\s*old\.metadata - array\['conversationId','campaignIds','touchIds','memberDigest'\]/);
   assert.match(migration, /after insert on public\.deal_hunter_cim_transmission_touches/);
   assert.match(migration, /grant execute on function public\.pursue_cim_resolve_inbound_v1\(jsonb\) to service_role/);
+});
+
+test('P7B PostgreSQL terminal convergence is additive, mirrored, and uses the common terminal RPC', () => {
+  assert.equal(fs.existsSync(p7bMigrationPath), true);
+  const migration = fs.readFileSync(p7bMigrationPath, 'utf8').trim();
+  const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
+  assert.ok(schema.includes(migration), 'canonical schema must contain the exact additive P7B block');
+  assert.match(migration, /create or replace function public\.pursue_cim_converge_terminal_authority_v1/);
+  assert.match(migration, /pursue_cim_append_terminal_event_v1/);
+  assert.match(migration, /terminal-in-flight-race/);
+  for (const table of ['contact_submissions', 'secure_documents', 'secure_upload_requests',
+    'crm_communications', 'email_suppressions', 'deal_hunter_identity_exceptions',
+    'crm_submission_supersessions', 'deal_hunter_owner_decision_events']) {
+    assert.match(migration, new RegExp(`on public\\.${table}`));
+  }
+  assert.match(migration,
+    /revoke all on function public\.pursue_cim_converge_terminal_authority_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
+  assert.match(migration, /pg_advisory_xact_lock\(17499,48146\)/);
+  assert.match(migration, /order by candidate\.created_at desc, candidate\.id desc limit 1/);
+  assert.match(migration, /pursue_cim_append_terminal_event_p7a/);
+  assert.match(migration, /pursue_cim_record_owner_decision_p7a/);
+  assert.match(migration, /pursue_cim_prepare_transmission_p7a/);
+  assert.match(migration, /pursue_cim_finalize_with_cadence_p7a/);
+  assert.match(migration, /pursue_cim_reconcile_with_cadence_p7a/);
+  assert.match(migration, /pursue_cim_material_filename_kind_p7b/);
+  assert.match(migration, /update of status, last_uploaded_at, requested_documents/);
 });
 
 test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
@@ -499,6 +528,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cPolicyTupleMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6dMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7aMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7bMigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -783,6 +813,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cPolicyTupleMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6dMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7aMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7bMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',
@@ -983,6 +1014,8 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
             where id='${touchId}'),
           'transmission', (select state from public.deal_hunter_cim_transmissions
             where id='${transmissionId || ''}'),
+          'inFlightRaces', (select count(*) from public.deal_hunter_cim_audit_events
+            where event_type='terminal-in-flight-race' and transmission_id='${transmissionId || ''}'),
           'authorizationWithdrawn', (select withdrawn_at is not null
             from public.deal_hunter_cim_live_provider_authorizations
             where id='${authorizationId || ''}'));`));
@@ -994,6 +1027,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
             `${raceDatabase}: ${JSON.stringify({ transition, state })}`);
           assert.equal(state.transmission, 'provider-pending',
             `${raceDatabase}: ${JSON.stringify({ transition, state })}`);
+          assert.equal(state.inFlightRaces, 1, raceDatabase);
         } else {
           assert.equal(state.touch, 'cancelled-before-provider', raceDatabase);
           if (transmissionId) assert.equal(state.transmission, 'cancelled-before-provider', raceDatabase);
@@ -1088,6 +1122,235 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         assert.equal(rpc.securityDefiner, true, `${database}:${rpc.name}`);
       }
     }
+    const terminalWriterDatabase = `p7b_writers_${database.endsWith('fresh') ? 'f' : 'u'}`;
+    run(dockerCommand, ['exec', container, 'createdb', '-U', 'postgres',
+      '-T', database, terminalWriterDatabase]);
+    const seedTerminalWriter = ({ suffix, submissionId, recipient }) => {
+      psql(container, terminalWriterDatabase, `
+        insert into public.deal_hunter_opportunities
+          (opportunity_id, created_at, updated_at, canonical_name, identity_version)
+        values ('opp-p7b-${suffix}', '${now}', '${now}', 'P7B ${suffix}', 'cim-identity-v1');
+        insert into public.contact_submissions
+          (id, created_at, updated_at, status, delivery_provider, delivery_status,
+           crm_status, source, ip_hash, name, email, message, deal_hunter_opportunity_id)
+        values ('${submissionId}', '${now}', '${now}', 'open', 'none', 'not-attempted',
+          'active', 'synthetic', 'synthetic-ip', 'P7B broker', '${recipient}',
+          'P7B fixture', 'opp-p7b-${suffix}');
+        update public.deal_hunter_opportunities set primary_submission_id='${submissionId}'
+          where opportunity_id='opp-p7b-${suffix}';
+        insert into public.deal_hunter_owner_decision_events
+          (id, idempotency_key, request_digest, opportunity_id, action, actor,
+           expected_discovery_revision, expected_material_revision,
+           observed_discovery_revision, observed_material_revision, policy_version, created_at)
+        values ('decision-p7b-${suffix}', 'idem-p7b-${suffix}', repeat('a',64),
+          'opp-p7b-${suffix}', 'pursue', 'fixture', 0, 0, 0, 0, 'v1', '${now}');
+        insert into public.deal_hunter_pursuit_enrollments
+          (id, decision_event_id, opportunity_id, state, reason_code, authority_digest,
+           created_at, updated_at)
+        values ('enrollment-p7b-${suffix}', 'decision-p7b-${suffix}',
+          'opp-p7b-${suffix}', 'campaign-created', 'fixture', repeat('b',64), '${now}', '${now}');
+        insert into public.deal_hunter_opportunity_timezone_revisions
+          (opportunity_id, revision, state, iana_timezone, evidence_type, evidence_id,
+           evidence_digest, resolver_version, dataset_digest, actor, created_at)
+        values ('opp-p7b-${suffix}', 1, 'verified', 'America/Los_Angeles',
+          'operator-verified', 'timezone-p7b-${suffix}', repeat('c',64), 'explicit-v1',
+          repeat('d',64), 'fixture', '${now}');
+        insert into public.deal_hunter_broker_conversations
+          (id, recipient_authority_id, recipient_fingerprint, recipient_address,
+           sender_policy_version, reply_policy_version, reply_alias_token_digest,
+           rfc_thread_key, state, batching_policy_version, created_at, updated_at)
+        values ('conversation-p7b-${suffix}', 'recipient-p7b-${suffix}', repeat('e',64),
+          '${recipient}', 'sender-v1', 'reply-v1', public.pursue_cim_digest_v1(
+            to_jsonb('reply-p7b'::text), to_jsonb('${suffix}'::text)), 'thread-p7b-${suffix}',
+          'open', 'batching-off-v1', '${now}', '${now}');
+        insert into public.deal_hunter_cim_campaigns
+          (id, opportunity_id, generation, enrollment_id, decision_event_id,
+           policy_version, template_version, template_digest, permission_version,
+           permission_digest, permission_revision, permission_scope, canonical_revision,
+           crm_ownership_revision, crm_submission_id, recipient_authority_id,
+           recipient_fingerprint, freshness_authority_digest, discovery_revision,
+           material_revision, timezone_revision, conversation_id, state, reason_code,
+           created_at, updated_at)
+        values ('campaign-p7b-${suffix}', 'opp-p7b-${suffix}', 1,
+          'enrollment-p7b-${suffix}', 'decision-p7b-${suffix}', 'policy-v1',
+          'template-v1', repeat('1',64), 'permission-v1', repeat('2',64), 1,
+          'synthetic-cohort', 1, 1, '${submissionId}', 'recipient-p7b-${suffix}',
+          repeat('e',64), repeat('3',64), 0, 0, 1, 'conversation-p7b-${suffix}',
+          'initial-pending', 'awaiting-window', '${now}', '${now}');
+        insert into public.deal_hunter_cim_campaign_touches
+          (id, campaign_id, opportunity_id, logical_slot, kind, ordinal, due_at,
+           due_local, timezone_revision, state, created_at, updated_at)
+        values ('touch-p7b-${suffix}', 'campaign-p7b-${suffix}', 'opp-p7b-${suffix}',
+          'initial', 'initial', 0, '${now}', '2026-09-25T12:00:00-07:00', 1,
+          'scheduled', '${now}', '${now}');
+      `);
+    };
+    const writerCases = [
+      { suffix: 'archive', submissionId: '70000000-0000-4000-8000-000000000001',
+        recipient: 'p7b-archive@example.test', reason: 'crm_archived', evidence: 'crm-archive',
+        mutate: `update public.contact_submissions set status='archived', archived_at='${now}',
+          archived_by='fixture', updated_at='${now}'
+          where id='70000000-0000-4000-8000-000000000001'` },
+      { suffix: 'diligence', submissionId: '70000000-0000-4000-8000-000000000002',
+        recipient: 'p7b-diligence@example.test', reason: 'advanced_beyond_broker_outreach',
+        evidence: 'diligence',
+        mutate: `update public.contact_submissions set metadata=
+          '{"diligence":{"stage":" financial review ","decision":"advance"}}'::jsonb,
+          updated_at='${now}' where id='70000000-0000-4000-8000-000000000002'` },
+      { suffix: 'materials', submissionId: '70000000-0000-4000-8000-000000000005',
+        recipient: 'p7b-materials@example.test', reason: 'materials_received',
+        evidence: 'materials',
+        preMutate: `insert into public.secure_upload_requests
+            (id, submission_id, created_at, updated_at, email, status, expires_at,
+             requested_documents)
+          values ('71000000-0000-4000-8000-000000000005',
+            '70000000-0000-4000-8000-000000000005', '${now}', '${now}',
+            'p7b-materials@example.test', 'open', '2026-09-26T19:00:00.000Z', '[]'::jsonb);
+          insert into public.secure_documents
+            (id, request_id, submission_id, created_at, document_type, file_name,
+             original_name, mime_type, size_bytes, storage_path)
+          values ('72000000-0000-4000-8000-000000000005',
+            '71000000-0000-4000-8000-000000000005',
+            '70000000-0000-4000-8000-000000000005', '${now}', 'nda', 'nda.pdf',
+            'Signed NDA.pdf', 'application/pdf', 100, '/synthetic/nda.pdf');
+          insert into public.secure_documents
+            (id, request_id, submission_id, created_at, document_type, file_name,
+             original_name, mime_type, size_bytes, storage_path)
+          values ('72000000-0000-4000-8000-000000000007',
+            '71000000-0000-4000-8000-000000000005',
+            '70000000-0000-4000-8000-000000000005', '${now}', 'nda', 'losses.pdf',
+            'Profit and losses.pdf', 'application/pdf', 100, '/synthetic/losses.pdf')`,
+        mutate: `insert into public.secure_documents
+            (id, request_id, submission_id, created_at, document_type, file_name,
+             original_name, mime_type, size_bytes, storage_path)
+          values ('72000000-0000-4000-8000-000000000006',
+            '71000000-0000-4000-8000-000000000005',
+            '70000000-0000-4000-8000-000000000005', '${now}', 'cim', 'cim.pdf',
+            'CIM.pdf', 'application/pdf', 100, '/synthetic/cim.pdf')` },
+      { suffix: 'suppression', submissionId: '70000000-0000-4000-8000-000000000003',
+        recipient: 'p7b-suppression@example.test', reason: 'recipient_suppressed',
+        evidence: 'email-suppression',
+        mutate: `insert into public.email_suppressions
+          (id, normalized_email, reason, source, created_at, created_by, metadata)
+          values ('suppression-p7b', 'p7b-suppression@example.test', 'hard-bounce',
+            'synthetic', '${now}', 'fixture', '{}'::jsonb)` },
+      { suffix: 'identity', submissionId: '70000000-0000-4000-8000-000000000004',
+        recipient: 'p7b-identity@example.test', reason: 'identity_ambiguous',
+        evidence: 'identity-exception',
+        mutate: `insert into public.deal_hunter_identity_exceptions
+          (id, created_at, updated_at, status, candidate_opportunity_ids, reason,
+           evidence_version, metadata)
+          values ('identity-p7b', '${now}', '${now}', 'open',
+            '["opp-p7b-identity"]'::jsonb, 'synthetic conflict', 'test-v1', '{}'::jsonb)` },
+    ];
+    for (const writer of writerCases) {
+      seedTerminalWriter(writer);
+      if (writer.preMutate) {
+        psql(container, terminalWriterDatabase, writer.preMutate);
+        const evidenceState = JSON.parse(psql(container, terminalWriterDatabase,
+          `select jsonb_build_object(
+            'prospectus', nullif(btrim(submission.prospectus_url), '') is not null,
+            'document', exists (select 1 from public.secure_documents document
+              where document.submission_id = submission.id and (
+                public.pursue_cim_material_token_p7b(document.document_type) in
+                  ('cim','teaser','prospectus','offering_memorandum','offering_materials',
+                    'data_room','broker_materials','financials','financial_package',
+                    'financial_statements','p_and_l','tax_returns','balance_sheet')
+                or public.pursue_cim_material_filename_kind_p7b(
+                  coalesce(document.original_name, document.file_name, '')) <> '')),
+            'metadata', submission.metadata)
+          from public.contact_submissions submission where submission.id='${writer.submissionId}';`));
+        assert.deepEqual(evidenceState, { prospectus: false, document: false, metadata: {} },
+          `${terminalWriterDatabase}:${writer.suffix}: unrelated evidence predicate`);
+        const preState = JSON.parse(psql(container, terminalWriterDatabase,
+          `select jsonb_build_object(
+            'campaignState', (select state from public.deal_hunter_cim_campaigns
+              where id='campaign-p7b-${writer.suffix}'),
+            'revision', (select terminal_revision from public.deal_hunter_cim_campaigns
+              where id='campaign-p7b-${writer.suffix}'),
+            'touchState', (select state from public.deal_hunter_cim_campaign_touches
+              where id='touch-p7b-${writer.suffix}'),
+            'eventEvidenceId', (select evidence_id from public.deal_hunter_cim_terminal_events
+              where campaign_id='campaign-p7b-${writer.suffix}' order by revision desc limit 1));`));
+        assert.deepEqual(preState, { campaignState: 'initial-pending', revision: 0,
+          touchState: 'scheduled', eventEvidenceId: null },
+        `${terminalWriterDatabase}:${writer.suffix}: unrelated evidence must not terminalize`);
+      }
+      psql(container, terminalWriterDatabase, writer.mutate);
+      const state = JSON.parse(psql(container, terminalWriterDatabase, `select jsonb_build_object(
+        'campaignState', (select state from public.deal_hunter_cim_campaigns
+          where id='campaign-p7b-${writer.suffix}'),
+        'reason', (select reason_code from public.deal_hunter_cim_campaigns
+          where id='campaign-p7b-${writer.suffix}'),
+        'revision', (select terminal_revision from public.deal_hunter_cim_campaigns
+          where id='campaign-p7b-${writer.suffix}'),
+        'touchState', (select state from public.deal_hunter_cim_campaign_touches
+          where id='touch-p7b-${writer.suffix}'),
+        'evidenceType', (select evidence_type from public.deal_hunter_cim_terminal_events
+          where campaign_id='campaign-p7b-${writer.suffix}' order by revision desc limit 1));`));
+      assert.deepEqual(state, {
+        campaignState: ['materials_received', 'advanced_beyond_broker_outreach']
+          .includes(writer.reason) ? 'materials-received' : writer.reason === 'identity_ambiguous'
+            ? 'action-required' : 'stopped',
+        reason: writer.reason, revision: 1,
+        touchState: 'cancelled-before-provider', evidenceType: writer.evidence,
+      }, `${terminalWriterDatabase}:${writer.suffix}`);
+    }
+    seedTerminalWriter({ suffix: 'upload-edit',
+      submissionId: '70000000-0000-4000-8000-000000000007',
+      recipient: 'p7b-upload-edit@example.test' });
+    psql(container, terminalWriterDatabase, `insert into public.secure_upload_requests
+      (id, submission_id, created_at, updated_at, email, status, expires_at,
+       requested_documents)
+      values ('71000000-0000-4000-8000-000000000007',
+        '70000000-0000-4000-8000-000000000007', '${now}', '${now}',
+        'p7b-upload-edit@example.test', 'documents-received',
+        '2026-09-26T19:00:00.000Z', '[]'::jsonb);`);
+    assert.equal(Number(psql(container, terminalWriterDatabase, `select terminal_revision
+      from public.deal_hunter_cim_campaigns where id='campaign-p7b-upload-edit';`)), 0);
+    psql(container, terminalWriterDatabase, `update public.secure_upload_requests
+      set requested_documents='["cim"]'::jsonb, updated_at='${now}'
+      where id='71000000-0000-4000-8000-000000000007';`);
+    assert.deepEqual(JSON.parse(psql(container, terminalWriterDatabase, `select jsonb_build_object(
+      'state', state, 'reason', reason_code, 'revision', terminal_revision)
+      from public.deal_hunter_cim_campaigns where id='campaign-p7b-upload-edit';`)),
+    { state: 'materials-received', reason: 'materials_received', revision: 1 },
+    `${terminalWriterDatabase}: requested-document edits must trigger convergence`);
+    psql(container, terminalWriterDatabase, `insert into public.deal_hunter_identity_exceptions
+      (id, created_at, updated_at, status, candidate_opportunity_ids, reason,
+       evidence_version, metadata)
+      values ('identity-p7b-repeat', '${now}', '${now}', 'open',
+        '["opp-p7b-identity"]'::jsonb, 'second synthetic conflict', 'test-v1', '{}'::jsonb)`);
+    assert.deepEqual(JSON.parse(psql(container, terminalWriterDatabase, `select jsonb_build_object(
+      'state', state, 'reason', reason_code, 'revision', terminal_revision,
+      'events', (select count(*) from public.deal_hunter_cim_terminal_events
+        where campaign_id='campaign-p7b-identity'))
+      from public.deal_hunter_cim_campaigns where id='campaign-p7b-identity';`)),
+    { state: 'action-required', reason: 'identity_ambiguous', revision: 2, events: 2 },
+    `${terminalWriterDatabase}: repeated identity evidence must remain append-only`);
+    seedTerminalWriter({ suffix: 'ambiguous',
+      submissionId: '70000000-0000-4000-8000-000000000006',
+      recipient: 'p7b-ambiguous@example.test' });
+    psql(container, terminalWriterDatabase, `
+      update public.deal_hunter_cim_campaigns
+        set state='provider-ambiguous', reason_code='provider_result_ambiguous',
+          row_version=row_version+1, updated_at='${now}'
+        where id='campaign-p7b-ambiguous';
+      insert into public.email_suppressions
+        (id, normalized_email, reason, source, created_at, created_by, metadata)
+      values ('suppression-p7b-ambiguous', 'p7b-ambiguous@example.test', 'hard-bounce',
+        'synthetic', '${now}', 'fixture', '{}'::jsonb);
+    `);
+    assert.deepEqual(JSON.parse(psql(container, terminalWriterDatabase, `select jsonb_build_object(
+      'state', state, 'reason', reason_code, 'revision', terminal_revision,
+      'events', (select count(*) from public.deal_hunter_cim_terminal_events
+        where campaign_id='campaign-p7b-ambiguous'),
+      'touch', (select state from public.deal_hunter_cim_campaign_touches
+        where id='touch-p7b-ambiguous'))
+      from public.deal_hunter_cim_campaigns where id='campaign-p7b-ambiguous';`)),
+    { state: 'stopped', reason: 'recipient_suppressed', revision: 1, events: 1,
+      touch: 'cancelled-before-provider' },
+    `${terminalWriterDatabase}: terminal evidence must dominate provider ambiguity`);
     for (const acceptedAt of ['2026-02-15T10:30:00.000Z',
       '2026-10-11T08:30:00.000Z']) {
       const expectedExpiry = calculateCampaignExpiry(acceptedAt, 'America/Los_Angeles');
@@ -1190,6 +1453,22 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       child.once('exit', (code) => {
         if (code !== 0) reject(new Error(`${name} concurrent transaction failed: ${stderr}`));
         else resolve(JSON.parse(stdout.trim()));
+      });
+    });
+    const concurrentRolledBackSql = (sql) => new Promise((resolve, reject) => {
+      const child = spawn(dockerCommand, ['exec', '-i', container, 'psql',
+        '-X', '-qAt', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', database,
+        '-c', `begin; set local deadlock_timeout='100ms';
+          set local statement_timeout='5s'; ${sql}; select pg_sleep(0.2); rollback;`],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => { stdout += chunk; });
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.once('error', reject);
+      child.once('exit', (code) => {
+        if (code !== 0) reject(new Error(`concurrent SQL transaction failed: ${stderr}`));
+        else resolve(stdout.split('\n').filter((line) => line.startsWith('{')).map(JSON.parse).at(-1));
       });
     });
     if (database === 'pursue_cim_fresh') {
@@ -2091,6 +2370,74 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         (id, updated_at, outreach_paused, updated_by, metadata)
         values ('global', '${now}', false, 'fixture', '{}'::jsonb);`);
       if (index === 2) {
+        const unrelatedDocumentGate = JSON.parse(psql(container, database, `begin;
+          insert into public.secure_upload_requests
+            (id, submission_id, created_at, updated_at, email, status, expires_at,
+             requested_documents)
+          values ('73000000-0000-4000-8000-000000000001',
+            '11111111-1111-4111-8111-111111111111', '${now}', '${now}',
+            'broker2@example.test', 'open', '2026-09-26T19:00:00.000Z', '[]'::jsonb);
+          insert into public.secure_documents
+            (id, request_id, submission_id, created_at, document_type, file_name,
+             original_name, mime_type, size_bytes, storage_path)
+          values ('74000000-0000-4000-8000-000000000001',
+            '73000000-0000-4000-8000-000000000001',
+            '11111111-1111-4111-8111-111111111111', '${now}', 'nda', 'nda.pdf',
+            'Signed NDA.pdf', 'application/pdf', 100, '/synthetic/nda-final-gate.pdf');
+          insert into public.secure_documents
+            (id, request_id, submission_id, created_at, document_type, file_name,
+             original_name, mime_type, size_bytes, storage_path)
+          values ('74000000-0000-4000-8000-000000000002',
+            '73000000-0000-4000-8000-000000000001',
+            '11111111-1111-4111-8111-111111111111', '${now}', 'nda', 'losses.pdf',
+            'Profit and losses.pdf', 'application/pdf', 100,
+            '/synthetic/losses-final-gate.pdf');
+          update public.deal_hunter_cim_global_authority
+            set revision=${command.expectedGlobalAuthorityRevision} where id='global';
+          set role service_role;
+          select public.pursue_cim_authorize_provider_pending_v1(
+            '${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);
+          rollback;`).split('\n').find((line) => line.startsWith('{')));
+        assert.deepEqual({ authorized: unrelatedDocumentGate.authorized,
+          blockedReason: unrelatedDocumentGate.blockedReason },
+        { authorized: true, blockedReason: null },
+        `${database}: unrelated NDA evidence must not block the final gate`);
+        const communicationLifecycle = JSON.parse(psql(container, database, `begin;
+          update public.crm_communications
+            set delivery_state='failed', delivery_state_at='${now}', updated_at='${now}',
+              updated_by='email-webhook', source_event_id='webhook-p7b-unsafe'
+            where id=(select communication_id from public.deal_hunter_cim_transmissions
+              where id='${command.transmissionId}');
+          select jsonb_build_object(
+            'state', (select state from public.deal_hunter_cim_campaigns
+              where id='${reference.expectedCampaigns[0].campaignId}'),
+            'reason', (select reason_code from public.deal_hunter_cim_campaigns
+              where id='${reference.expectedCampaigns[0].campaignId}'),
+            'revision', (select terminal_revision from public.deal_hunter_cim_campaigns
+              where id='${reference.expectedCampaigns[0].campaignId}'),
+            'evidenceType', (select evidence_type from public.deal_hunter_cim_terminal_events
+              where campaign_id='${reference.expectedCampaigns[0].campaignId}'
+              order by revision desc limit 1));
+          rollback;`).split('\n').find((line) => line.startsWith('{')));
+        assert.deepEqual(communicationLifecycle, { state: 'stopped', reason: 'unsafe_delivery',
+          revision: 1, evidenceType: 'delivery-lifecycle' },
+        `${database}: unsafe webhook lifecycle must converge in the communication transaction`);
+        if (database === 'pursue_cim_fresh') {
+          const [gateRace, suppressionRace] = await Promise.all([
+            concurrentRolledBackRpc('pursue_cim_authorize_provider_pending_v1', command),
+            concurrentRolledBackSql(`insert into public.email_suppressions
+              (id, normalized_email, reason, source, created_at, created_by, metadata)
+              values ('suppression-p7b-lock-race', 'broker2@example.test', 'hard-bounce',
+                'synthetic', '${now}', 'fixture', '{}'::jsonb);
+              select jsonb_build_object('state', state, 'revision', terminal_revision)
+                from public.deal_hunter_cim_campaigns
+                where id='${reference.expectedCampaigns[0].campaignId}'`),
+          ]);
+          assert.equal(gateRace.authorized, true,
+            `${database}: final gate must serialize with a direct domain writer`);
+          assert.deepEqual(suppressionRace, { state: 'stopped', revision: 1 },
+            `${database}: direct domain writer must complete without a lock-order deadlock`);
+        }
         const materialsRace = JSON.parse(psql(container, database, `begin;
           update public.contact_submissions
             set prospectus_url = 'https://example.test/prospectus'
@@ -2629,7 +2976,10 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       nextState: 'stopped', reasonCode: 'operator-stop',
       evidenceId: 'campaign-stop-proof',
     });
-    assert.equal(campaignTerminal.applied, true, database);
+    assert.equal(campaignTerminal.applied, true,
+      `${database}:${JSON.stringify({ campaignTerminal, campaignIdentity,
+        campaignState: psql(container, database, `select state || ':' || coalesce(reason_code, '') from public.deal_hunter_cim_campaigns
+          where id='${reference.expectedCampaigns[0].campaignId}'`) })}`);
     assert.ok(campaignTerminal.cancelledTouchIds.includes('touch-fence'), database);
     assert.equal(reference.expectedTerminals[0].applied, true);
     for (const [index, command] of reference.terminalCommands.entries()) {

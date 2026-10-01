@@ -7543,6 +7543,45 @@ export function createSqliteStorage(config, options = {}) {
     }
   }
 
+  let storageApi;
+  const cimTransitions = createPursueCimSqliteTransitions(database, {
+    applyPass: (command) => storageApi._passDealHunterOpportunitySync(command),
+    readCrmMatchAuthorityFingerprint: () => {
+      const authority = dealHunterCrmMatchAuthoritySnapshot(database);
+      return authority.complete ? authority.revision : null;
+    },
+  });
+  const convergeSubmissionTerminal = (submission, evidenceId = '') => {
+    if (!submission?.id) return;
+    const observedAt = submission.updated_at || submission.created_at || new Date().toISOString();
+    const archived = submission.archived_at || String(submission.status || '').toLowerCase() === 'archived';
+    cimTransitions.convergeCimTerminalAuthority({ submissionId: submission.id,
+      ...(archived ? { reasonCode: 'crm_archived' } : { evaluateMaterialsState: true }),
+      evidenceType: archived ? 'crm-archive' : 'diligence',
+      evidenceId: evidenceId || `${submission.id}:${observedAt}`,
+      actor: submission.archived_by || 'submission-writer', source: 'submission-transaction',
+      observedAt, now: observedAt });
+  };
+  const convergeUploadTerminal = (request) => {
+    if (!request?.id || !request.submission_id) return;
+    const observedAt = request.updated_at || request.created_at || new Date().toISOString();
+    cimTransitions.convergeCimTerminalAuthority({ submissionId: request.submission_id,
+      evaluateMaterialsState: true, evidenceType: 'materials', evidenceId: request.id,
+      actor: 'secure-upload-writer', source: 'secure-upload-transaction',
+      observedAt, now: observedAt });
+  };
+  const convergeUnsafeDelivery = (communication) => {
+    if (!communication?.id || !['failed', 'bounced', 'complained', 'suppressed']
+      .includes(communication.delivery_state)) return;
+    const observedAt = communication.delivery_state_at || communication.updated_at
+      || communication.occurred_at || new Date().toISOString();
+    cimTransitions.convergeCimTerminalAuthority({ communicationId: communication.id,
+      reasonCode: 'unsafe_delivery', evidenceType: 'delivery-lifecycle',
+      evidenceId: communication.source_event_id || `${communication.id}:${observedAt}`,
+      actor: communication.updated_by || 'email-webhook', source: 'communication-transaction',
+      observedAt, now: observedAt });
+  };
+
   const mutateWithCrmActivityTransaction = database.transaction(({ operation, payload, activity }) => {
     let record = null;
 
@@ -7964,20 +8003,35 @@ export function createSqliteStorage(config, options = {}) {
       `).run(activity.created_at || record.updated_at || new Date().toISOString(), record.submission_id);
     }
 
+    const materialOperation = ['insert_secure_upload_request',
+      'update_secure_upload_request', 'finalize_secure_document_upload'].includes(operation);
+    const terminalSubmissionId = operation === 'archive_submission'
+      ? payload.id || payload.submissionId
+      : operation === 'dismiss_deal_hunter_opportunity'
+        ? payload.submissionId
+        : operation === 'update_submission'
+          ? payload.id
+          : materialOperation
+            ? record?.submission_id || activity.submission_id
+          : '';
+    if (terminalSubmissionId) {
+      const archived = ['archive_submission', 'dismiss_deal_hunter_opportunity'].includes(operation);
+      cimTransitions.convergeCimTerminalAuthority({ submissionId: terminalSubmissionId,
+        ...(archived ? { reasonCode: 'crm_archived' } : { evaluateMaterialsState: true }),
+        evidenceType: archived ? 'crm-archive' : materialOperation ? 'materials' : 'diligence',
+        evidenceId: activity.id,
+        actor: activity.actor || 'system', source: 'crm-activity-transaction',
+        observedAt: activity.created_at, now: activity.created_at });
+    }
+
     const storedActivity = insertCrmActivityEvent(activity);
     return { applied: true, record, activity: storedActivity };
   });
 
-  const storageApi = {
+  storageApi = {
     provider: 'sqlite',
 
-    ...createPursueCimSqliteTransitions(database, {
-      applyPass: (command) => storageApi._passDealHunterOpportunitySync(command),
-      readCrmMatchAuthorityFingerprint: () => {
-        const authority = dealHunterCrmMatchAuthoritySnapshot(database);
-        return authority.complete ? authority.revision : null;
-      },
-    }),
+    ...cimTransitions,
 
     async listActiveCrmSubmissionSupersessions(filters = {}) {
       return selectActiveCrmSubmissionSupersessions(database, filters);
@@ -8145,6 +8199,7 @@ export function createSqliteStorage(config, options = {}) {
           submissionJsonFields,
         );
         const row = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(id);
+        if (row) convergeSubmissionTerminal(row);
         return row ? normalizeSubmissionRow(row) : null;
       });
       return transaction.immediate();
@@ -8163,6 +8218,7 @@ export function createSqliteStorage(config, options = {}) {
         );
         if (result.changes === 0) return null;
         const row = database.prepare('SELECT * FROM contact_submissions WHERE id = ?').get(id);
+        if (row) convergeSubmissionTerminal(row);
         return row ? normalizeSubmissionRow(row) : null;
       });
       return transaction.immediate();
@@ -8741,6 +8797,8 @@ export function createSqliteStorage(config, options = {}) {
       return database.transaction(() => {
         assertCrmSubmissionWritableInTransaction(requestRecord?.submission_id);
         insertSecureUploadRequestStatement.run(serializeUploadRequest(requestRecord));
+        convergeUploadTerminal(normalizeUploadRequestRow(database.prepare(
+          'SELECT * FROM secure_upload_requests WHERE id = ?').get(requestRecord.id)));
         return requestRecord;
       }).immediate();
     },
@@ -8755,7 +8813,10 @@ export function createSqliteStorage(config, options = {}) {
           serializeUploadRequestValues(values),
           ['updated_at', 'status', 'expires_at', 'nda_required', 'nda_accepted_at', 'last_uploaded_at', 'note', 'requested_documents', 'revoked_at', 'closed_at', 'upload_batch_count'],
         );
-        return normalizeUploadRequestRow(database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(id));
+        const updated = normalizeUploadRequestRow(database.prepare(
+          'SELECT * FROM secure_upload_requests WHERE id = ?').get(id));
+        convergeUploadTerminal(updated);
+        return updated;
       }).immediate();
     },
 
@@ -8773,9 +8834,11 @@ export function createSqliteStorage(config, options = {}) {
         const result = database
           .prepare(`UPDATE secure_upload_requests SET ${fields} WHERE id = @id AND status = 'uploading'`)
           .run(payload);
-        return result.changes > 0
-          ? normalizeUploadRequestRow(database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(id))
-          : null;
+        if (result.changes === 0) return null;
+        const updated = normalizeUploadRequestRow(database.prepare(
+          'SELECT * FROM secure_upload_requests WHERE id = ?').get(id));
+        convergeUploadTerminal(updated);
+        return updated;
       }).immediate();
     },
 
@@ -8799,9 +8862,11 @@ export function createSqliteStorage(config, options = {}) {
               OR (status = 'uploading' AND @stale_before != '' AND updated_at <= @stale_before)
             )
         `).run(payload);
-        return result.changes > 0
-          ? normalizeUploadRequestRow(database.prepare('SELECT * FROM secure_upload_requests WHERE id = ?').get(id))
-          : null;
+        if (result.changes === 0) return null;
+        const updated = normalizeUploadRequestRow(database.prepare(
+          'SELECT * FROM secure_upload_requests WHERE id = ?').get(id));
+        convergeUploadTerminal(updated);
+        return updated;
       }).immediate();
     },
 
@@ -8846,6 +8911,10 @@ export function createSqliteStorage(config, options = {}) {
             SET status = 'superseded', superseded_at = ?
             WHERE submission_id = ? AND status = 'current'
           `).run(document.created_at || new Date().toISOString(), document.submission_id);
+          cimTransitions.convergeCimTerminalAuthority({ submissionId: document.submission_id,
+            evaluateMaterialsState: true, evidenceType: 'materials', evidenceId: document.id,
+            actor: 'secure-document-writer', source: 'secure-document-transaction',
+            observedAt: document.created_at, now: document.created_at });
         }
         return document;
       }).immediate();
@@ -9090,6 +9159,7 @@ export function createSqliteStorage(config, options = {}) {
             WHERE submission_id = ? AND status = 'current'
           `).run(stored.occurred_at || stored.updated_at || new Date().toISOString(), stored.submission_id);
         }
+        convergeUnsafeDelivery(stored);
         return stored;
       }).immediate();
     },
@@ -9132,6 +9202,7 @@ export function createSqliteStorage(config, options = {}) {
             WHERE submission_id = ? AND status = 'current'
           `).run(updated.updated_at || new Date().toISOString(), updated.submission_id);
         }
+        convergeUnsafeDelivery(updated);
         return updated;
       }).immediate();
     },
@@ -9643,8 +9714,18 @@ export function createSqliteStorage(config, options = {}) {
 
     async upsertEmailSuppression(suppression = {}) {
       const serialized = serializeEmailSuppression(suppression);
-      upsertEmailSuppressionStatement.run(serialized);
-      return this.getActiveEmailSuppression(serialized.normalized_email);
+      return database.transaction(() => {
+        upsertEmailSuppressionStatement.run(serialized);
+        const row = database.prepare(`SELECT * FROM email_suppressions
+          WHERE normalized_email = ? AND lifted_at IS NULL LIMIT 1`)
+          .get(serialized.normalized_email);
+        cimTransitions.convergeCimTerminalAuthority({ recipientEmail: serialized.normalized_email,
+          reasonCode: 'recipient_suppressed', evidenceType: 'email-suppression',
+          evidenceId: row.id, actor: serialized.created_by || 'system',
+          source: serialized.source || 'email-suppression', observedAt: serialized.created_at,
+          now: serialized.created_at });
+        return normalizeEmailSuppressionRow(row);
+      }).immediate();
     },
 
     async liftEmailSuppression(email, { liftedAt = '', liftedBy = '', liftReason = '' } = {}) {
@@ -11747,6 +11828,12 @@ export function createSqliteStorage(config, options = {}) {
           if (relationInsert.changes !== 1) {
             throw new Error(`CRM duplicate consolidation ${pair.key} relation insert was not exact.`);
           }
+          cimTransitions.convergeCimTerminalAuthority({
+            submissionId: pair.supersededSubmissionId, reasonCode: 'crm_superseded',
+            evidenceType: 'crm-supersession',
+            evidenceId: crmDuplicateConsolidationRelationId(pair), actor,
+            source: 'crm-supersession-transaction', observedAt: nowIso, now: nowIso,
+          });
           writeNumber += 1;
           if (testHooks?.failAfterWrite === writeNumber) {
             throw new Error(`Injected failure after write ${writeNumber}.`);
@@ -13482,39 +13569,50 @@ export function createSqliteStorage(config, options = {}) {
     },
 
     async upsertDealHunterIdentityException(record = {}) {
-      database.prepare(`
-        INSERT INTO deal_hunter_identity_exceptions (
-          id, created_at, updated_at, status, observed_deal_key, observed_name,
-          observed_recipient, candidate_opportunity_ids, reason, evidence_version,
-          resolved_at, resolved_by, resolution_reason, metadata
-        ) VALUES (
-          @id, @created_at, @updated_at, @status, @observed_deal_key, @observed_name,
-          @observed_recipient, @candidate_opportunity_ids, @reason, @evidence_version,
-          @resolved_at, @resolved_by, @resolution_reason, @metadata
-        )
-        ON CONFLICT(id) DO UPDATE SET
-          updated_at = excluded.updated_at,
-          status = excluded.status,
-          candidate_opportunity_ids = excluded.candidate_opportunity_ids,
-          reason = excluded.reason,
-          resolved_at = excluded.resolved_at,
-          resolved_by = excluded.resolved_by,
-          resolution_reason = excluded.resolution_reason,
-          metadata = excluded.metadata
-      `).run({
-        ...record,
-        observed_deal_key: record.observed_deal_key || null,
-        observed_name: record.observed_name || null,
-        observed_recipient: record.observed_recipient || null,
-        candidate_opportunity_ids: JSON.stringify(record.candidate_opportunity_ids || []),
-        resolved_at: record.resolved_at || null,
-        resolved_by: record.resolved_by || null,
-        resolution_reason: record.resolution_reason || null,
-        metadata: JSON.stringify(record.metadata || {}),
-      });
-      return normalizeDealHunterIdentityExceptionRow(database.prepare(`
-        SELECT * FROM deal_hunter_identity_exceptions WHERE id = ? LIMIT 1
-      `).get(record.id));
+      return database.transaction(() => {
+        database.prepare(`
+          INSERT INTO deal_hunter_identity_exceptions (
+            id, created_at, updated_at, status, observed_deal_key, observed_name,
+            observed_recipient, candidate_opportunity_ids, reason, evidence_version,
+            resolved_at, resolved_by, resolution_reason, metadata
+          ) VALUES (
+            @id, @created_at, @updated_at, @status, @observed_deal_key, @observed_name,
+            @observed_recipient, @candidate_opportunity_ids, @reason, @evidence_version,
+            @resolved_at, @resolved_by, @resolution_reason, @metadata
+          )
+          ON CONFLICT(id) DO UPDATE SET
+            updated_at = excluded.updated_at,
+            status = excluded.status,
+            candidate_opportunity_ids = excluded.candidate_opportunity_ids,
+            reason = excluded.reason,
+            resolved_at = excluded.resolved_at,
+            resolved_by = excluded.resolved_by,
+            resolution_reason = excluded.resolution_reason,
+            metadata = excluded.metadata
+        `).run({
+          ...record,
+          observed_deal_key: record.observed_deal_key || null,
+          observed_name: record.observed_name || null,
+          observed_recipient: record.observed_recipient || null,
+          candidate_opportunity_ids: JSON.stringify(record.candidate_opportunity_ids || []),
+          resolved_at: record.resolved_at || null,
+          resolved_by: record.resolved_by || null,
+          resolution_reason: record.resolution_reason || null,
+          metadata: JSON.stringify(record.metadata || {}),
+        });
+        const stored = normalizeDealHunterIdentityExceptionRow(database.prepare(`
+          SELECT * FROM deal_hunter_identity_exceptions WHERE id = ? LIMIT 1
+        `).get(record.id));
+        if (stored.status === 'open' && stored.candidate_opportunity_ids.length > 0) {
+          cimTransitions.convergeCimTerminalAuthority({
+            opportunityIds: stored.candidate_opportunity_ids, reasonCode: 'identity_ambiguous',
+            evidenceType: 'identity-exception', evidenceId: stored.id,
+            actor: stored.resolved_by || 'identity-authority', source: 'identity-exception-transaction',
+            observedAt: stored.updated_at, now: stored.updated_at,
+          });
+        }
+        return stored;
+      }).immediate();
     },
 
     async listDealHunterIdentityExceptions({ statuses = [], limit = 1000 } = {}) {

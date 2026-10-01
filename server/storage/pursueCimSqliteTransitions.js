@@ -254,8 +254,8 @@ const campaignTransitions = Object.freeze({
   'active-follow-up': ['active-follow-up', 'action-required', 'responded',
     'materials-received', 'stopped', 'expired', 'provider-ambiguous'],
   'action-required': ['queued', 'waiting-on-eligibility', 'initial-pending',
-    'responded', 'materials-received', 'stopped'],
-  'provider-ambiguous': [],
+    'action-required', 'responded', 'materials-received', 'stopped'],
+  'provider-ambiguous': ['action-required', 'responded', 'materials-received', 'stopped'],
   responded: [], 'materials-received': [], stopped: [], expired: [],
 });
 
@@ -1090,6 +1090,24 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
             transmission: transmission ?? null, boundaryNonceDigest: null };
         };
         if (!transmission) return blocked('lifecycle_conflict');
+        if (transmission.state === 'cancelled-before-provider') {
+          const terminal = database.prepare(`SELECT event.reason_code
+            FROM deal_hunter_cim_terminal_events event
+            JOIN deal_hunter_cim_transmission_touches member
+              ON member.campaign_id = event.campaign_id
+            WHERE member.transmission_id = ? AND event.scope = 'campaign'
+            ORDER BY event.revision DESC, event.created_at DESC, event.id DESC LIMIT 1`)
+            .get(transmission.id);
+          const terminalReason = terminal?.reason_code;
+          const blockedReason = ['materials_received', 'advanced_beyond_broker_outreach']
+            .includes(terminalReason) ? 'materials_received'
+            : terminalReason === 'recipient_suppressed' ? 'recipient_suppressed'
+              : terminalReason === 'identity_ambiguous' ? 'identity_authority_changed'
+                : ['crm_archived', 'crm_superseded'].includes(terminalReason) ? 'crm_owner_changed'
+                  : ['watch-selected', 'pass-selected'].includes(terminalReason)
+                    ? 'owner_intent_changed' : 'terminal_authority_changed';
+          return blocked(blockedReason);
+        }
         if (transmission.state !== 'prepared' || transmission.invocation_authority_count !== 0) {
           return blocked('already_provider_pending');
         }
@@ -1327,10 +1345,23 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           const latestUploadRequest = database.prepare(`SELECT * FROM secure_upload_requests
             WHERE submission_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`)
             .get(campaign.crm_submission_id) ?? null;
+          let normalizedUploadRequest = null;
+          if (latestUploadRequest) {
+            try {
+              const requestedDocuments = JSON.parse(latestUploadRequest.requested_documents || '[]');
+              if (!Array.isArray(requestedDocuments)) return blocked('materials_received');
+              normalizedUploadRequest = {
+                ...latestUploadRequest,
+                requested_documents: requestedDocuments,
+              };
+            } catch {
+              return blocked('materials_received');
+            }
+          }
           const currentMaterials = evaluateAcquisitionMaterialsState({
             submission: { ...crmOwner, metadata: submissionMetadata },
             secureDocuments,
-            latestUploadRequest,
+            latestUploadRequest: normalizedUploadRequest,
           });
           if (currentMaterials.materialsReceived || currentMaterials.advancedBeyondBrokerOutreach) {
             return blocked('materials_received');
@@ -1977,6 +2008,106 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           noOp: byStatus['no-op'] ?? 0, pending: byStatus.pending ?? 0 };
       }).immediate();
     },
+    convergeCimTerminalAuthority(command) {
+      const opportunityIds = Array.isArray(command.opportunityIds)
+        ? command.opportunityIds.map((value) => requiredText(value, 'opportunityId', 200)) : [];
+      const opportunityId = command.opportunityId
+        ? requiredText(command.opportunityId, 'opportunityId', 200) : '';
+      if (opportunityId) opportunityIds.push(opportunityId);
+      const submissionId = command.submissionId
+        ? requiredText(command.submissionId, 'submissionId', 120) : '';
+      const recipientEmail = command.recipientEmail
+        ? requiredText(command.recipientEmail, 'recipientEmail', 320).toLowerCase() : '';
+      const communicationId = command.communicationId
+        ? requiredText(command.communicationId, 'communicationId', 120) : '';
+      if (opportunityIds.length > 50 || new Set(opportunityIds).size !== opportunityIds.length
+        || [opportunityIds.length > 0, Boolean(submissionId), Boolean(recipientEmail),
+          Boolean(communicationId)].filter(Boolean).length !== 1) {
+        throw new Error('Terminal convergence requires one bounded authority selector');
+      }
+      const evidenceType = requiredText(command.evidenceType, 'evidenceType', 120);
+      const evidenceId = requiredText(command.evidenceId, 'evidenceId');
+      const actor = requiredText(command.actor, 'actor', 200);
+      const source = requiredText(command.source, 'source', 120);
+      const observedAt = requiredInstant(command.observedAt);
+      const now = requiredInstant(command.now);
+      const requestedReason = command.evaluateMaterialsState === true
+        ? '' : requiredText(command.reasonCode, 'reasonCode', 160);
+      return database.transaction(() => {
+        let campaigns;
+        if (opportunityIds.length > 0) {
+          campaigns = database.prepare(`SELECT * FROM deal_hunter_cim_campaigns
+            WHERE opportunity_id IN (${opportunityIds.map(() => '?').join(',')})
+              AND state IN ('queued','waiting-on-eligibility','initial-pending',
+                'active-follow-up','action-required','provider-ambiguous') ORDER BY id`).all(...opportunityIds);
+        } else if (submissionId) {
+          campaigns = database.prepare(`SELECT * FROM deal_hunter_cim_campaigns
+            WHERE crm_submission_id = ? AND state IN ('queued','waiting-on-eligibility',
+              'initial-pending','active-follow-up','action-required','provider-ambiguous')
+            ORDER BY id`).all(submissionId);
+        } else if (recipientEmail) {
+          campaigns = database.prepare(`SELECT campaign.* FROM deal_hunter_cim_campaigns campaign
+            JOIN deal_hunter_broker_conversations conversation
+              ON conversation.id = campaign.conversation_id
+            WHERE lower(conversation.recipient_address) = ?
+              AND campaign.state IN ('queued','waiting-on-eligibility','initial-pending',
+                'active-follow-up','action-required','provider-ambiguous') ORDER BY campaign.id`).all(recipientEmail);
+        } else {
+          campaigns = database.prepare(`SELECT DISTINCT campaign.*
+            FROM deal_hunter_cim_campaigns campaign
+            JOIN deal_hunter_cim_transmission_touches member ON member.campaign_id = campaign.id
+            JOIN deal_hunter_cim_transmissions transmission
+              ON transmission.id = member.transmission_id
+            WHERE transmission.communication_id = ?
+              AND campaign.state IN ('queued','waiting-on-eligibility','initial-pending',
+                'active-follow-up','action-required','provider-ambiguous')
+            ORDER BY campaign.id`).all(communicationId);
+        }
+        const outcomes = [];
+        for (const campaign of campaigns) {
+          let reasonCode = requestedReason;
+          if (command.evaluateMaterialsState === true) {
+            const submission = database.prepare('SELECT * FROM contact_submissions WHERE id = ?')
+              .get(campaign.crm_submission_id);
+            let metadata = {};
+            try { metadata = JSON.parse(submission?.metadata || '{}'); } catch { metadata = {}; }
+            const secureDocuments = database.prepare(`SELECT * FROM secure_documents
+              WHERE submission_id = ? ORDER BY created_at, id`).all(campaign.crm_submission_id);
+            const latestUploadRequest = database.prepare(`SELECT * FROM secure_upload_requests
+              WHERE submission_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`)
+              .get(campaign.crm_submission_id) ?? null;
+            const materials = evaluateAcquisitionMaterialsState({
+              submission: submission ? { ...submission, metadata } : {},
+              secureDocuments,
+              latestUploadRequest: latestUploadRequest ? {
+                ...latestUploadRequest,
+                requested_documents: (() => {
+                  try { return JSON.parse(latestUploadRequest.requested_documents || '[]'); }
+                  catch { return []; }
+                })(),
+              } : null,
+            });
+            if (!materials.materialsReceived && !materials.advancedBeyondBrokerOutreach) continue;
+            reasonCode = materials.advancedBeyondBrokerOutreach
+              ? 'advanced_beyond_broker_outreach' : 'materials_received';
+          }
+          const nextState = reasonCode === 'identity_ambiguous' ? 'action-required'
+            : ['materials_received', 'advanced_beyond_broker_outreach'].includes(reasonCode)
+              && campaignTransitions[campaign.state]?.includes('materials-received')
+              ? 'materials-received' : 'stopped';
+          const eventId = digest('terminal-writer-event:v1', evidenceType, evidenceId,
+            campaign.id, reasonCode);
+          const outcome = transitions.appendCimTerminalEvent({ eventId, scope: 'campaign',
+            scopeId: campaign.id, expectedRevision: campaign.terminal_revision,
+            expectedRowVersion: campaign.row_version, nextState, reasonCode, evidenceType,
+            evidenceId, metadataDigest: digest('terminal-writer-metadata:v1', evidenceType,
+              evidenceId, reasonCode, campaign.id), actor, source, observedAt, now });
+          if (outcome.conflict) throw new Error('Concurrent Pursue CIM terminal convergence');
+          outcomes.push({ campaignId: campaign.id, eventId, reasonCode, ...outcome });
+        }
+        return { applied: outcomes.some((outcome) => outcome.applied), outcomes };
+      }).immediate();
+    },
     appendCimTerminalEvent(command) {
       const eventId = requiredText(command.eventId, 'eventId');
       const scope = requiredText(command.scope, 'scope', 20);
@@ -2013,7 +2144,6 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
         if (!current || current.terminal_revision !== expectedRevision
           || current.row_version !== expectedRowVersion
           || !legal[current.state]?.includes(nextState)
-          || (current.state === 'provider-ambiguous' && !command.reconciliationEvidenceId)
           || (current.state === 'action-required'
             && ['queued', 'waiting-on-eligibility', 'initial-pending'].includes(nextState)
             && !command.preProviderResolution)) {
@@ -2028,6 +2158,20 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
               AND state IN ('queued', 'waiting-on-eligibility', 'initial-pending',
                 'active-follow-up', 'action-required', 'provider-ambiguous')
           `).all(scopeId).map(({ id }) => id);
+        const inFlight = campaignIds.flatMap((campaignId) => database.prepare(`
+          SELECT transmission.id AS transmission_id, MIN(touch.id) AS touch_id,
+            campaign.opportunity_id, campaign.conversation_id
+          FROM deal_hunter_cim_campaign_touches touch
+          JOIN deal_hunter_cim_campaigns campaign ON campaign.id = touch.campaign_id
+          JOIN deal_hunter_cim_transmission_touches member ON member.touch_id = touch.id
+            AND member.cancelled_at IS NULL
+          JOIN deal_hunter_cim_transmissions transmission
+            ON transmission.id = member.transmission_id
+          WHERE touch.campaign_id = ? AND touch.state = 'provider-pending'
+            AND transmission.state = 'provider-pending'
+          GROUP BY transmission.id, campaign.opportunity_id, campaign.conversation_id
+          ORDER BY transmission.id
+        `).all(campaignId).map((row) => ({ ...row, campaign_id: campaignId })));
         for (const campaignId of campaignIds) {
           const prepared = database.prepare(`
             SELECT DISTINCT tr.* FROM deal_hunter_cim_transmissions tr
@@ -2107,6 +2251,14 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           conversationId: scope === 'conversation' ? scopeId : null,
           opportunityId: scope === 'campaign' ? current.opportunity_id : null,
           priorState: current.state, nextState, reasonCode, actor, source, occurredAt: now });
+        for (const race of inFlight) {
+          appendAudit(database, { eventType: 'terminal-in-flight-race',
+            authorityId: `${eventId}:${race.campaign_id}:${race.transmission_id}`,
+            opportunityId: race.opportunity_id, campaignId: race.campaign_id,
+            conversationId: race.conversation_id, touchId: race.touch_id,
+            transmissionId: race.transmission_id, priorState: 'provider-pending',
+            nextState, reasonCode, actor, source, occurredAt: now, ignore: true });
+        }
         return outcome({ applied: true }, scope === 'campaign' ? expectedRevision + 1 : null,
           scope === 'conversation' ? expectedRevision + 1 : null, cancelledTouchIds.sort());
       }).immediate();
@@ -2834,6 +2986,10 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           opportunity.discovery_revision, opportunity.material_revision,
           selectedContactReferenceDigest, policyVersion, now);
         if (action !== 'pursue') {
+          transitions.convergeCimTerminalAuthority({ opportunityId,
+            reasonCode: `${action}-selected`, evidenceType: 'owner-decision',
+            evidenceId: decisionId, actor, source: 'owner-decision-transaction',
+            observedAt: now, now });
           if (current) database.prepare(`
             UPDATE deal_hunter_pursuit_enrollments SET state = 'superseded',
               reason_code = ?, row_version = row_version + 1, updated_at = ?
