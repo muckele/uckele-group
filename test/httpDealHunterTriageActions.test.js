@@ -92,6 +92,66 @@ function ownerActionPayload(action, extra = {}) {
     expectedMaterialRevision: 0, ...extra };
 }
 
+function seedP8aReleaseCampaign(opportunityId) {
+  const database = new Database(process.env.SQLITE_PATH);
+  const at = '2026-10-01T15:00:00.000Z';
+  const ids = {
+    decisionId: `decision-${opportunityId}`,
+    enrollmentId: `enrollment-${opportunityId}`,
+    conversationId: `conversation-${opportunityId}`,
+    campaignId: `campaign-${opportunityId}`,
+    touchId: `touch-${opportunityId}`,
+  };
+  try {
+    database.prepare(`INSERT INTO deal_hunter_owner_decision_events (
+      id, idempotency_key, request_digest, opportunity_id, action, actor,
+      expected_discovery_revision, expected_material_revision,
+      observed_discovery_revision, observed_material_revision, policy_version, created_at
+    ) VALUES (?, ?, ?, ?, 'pursue', 'release-owner', 0, 0, 0, 0, 'owner-decision-v1', ?)`)
+      .run(ids.decisionId, `key-${opportunityId}`, '1'.repeat(64), opportunityId, at);
+    database.prepare(`INSERT INTO deal_hunter_pursuit_enrollments (
+      id, decision_event_id, opportunity_id, state, authority_digest, created_at, updated_at
+    ) VALUES (?, ?, ?, 'campaign-created', ?, ?, ?)`)
+      .run(ids.enrollmentId, ids.decisionId, opportunityId, '2'.repeat(64), at, at);
+    database.prepare(`INSERT INTO deal_hunter_opportunity_timezone_revisions (
+      opportunity_id, revision, state, iana_timezone, evidence_type, evidence_id,
+      evidence_digest, resolver_version, dataset_digest, actor, created_at
+    ) VALUES (?, 1, 'verified', 'America/Chicago', 'operator-verified',
+      'p8a-http-timezone', ?, 'explicit-v1', ?, 'release-owner', ?)`)
+      .run(opportunityId, '3'.repeat(64), '4'.repeat(64), at);
+    database.prepare(`INSERT INTO deal_hunter_broker_conversations (
+      id, recipient_authority_id, recipient_fingerprint, recipient_address,
+      sender_policy_version, reply_policy_version, reply_alias_token_digest,
+      rfc_thread_key, state, batching_policy_version, created_at, updated_at
+    ) VALUES (?, 'recipient-p8a-http', ?, 'broker@example.test',
+      'deal-hunter-cim-autopilot-v1', 'deal-hunter-cim-autopilot-v1', ?, ?,
+      'open', 'batching-off-v1', ?, ?)`)
+      .run(ids.conversationId, '5'.repeat(64), '6'.repeat(64),
+        `thread-${opportunityId}`, at, at);
+    database.prepare(`INSERT INTO deal_hunter_cim_campaigns (
+      id, opportunity_id, generation, enrollment_id, decision_event_id,
+      policy_version, template_version, template_digest, permission_version,
+      permission_digest, permission_revision, permission_scope, canonical_revision,
+      crm_ownership_revision, recipient_authority_id, recipient_fingerprint,
+      freshness_authority_digest, discovery_revision, material_revision,
+      timezone_revision, conversation_id, state, reason_code, created_at, updated_at
+    ) VALUES (?, ?, 1, ?, ?, 'deal-hunter-cim-autopilot-v1',
+      'deal-hunter-cim-autopilot-v1', ?, 'activation-p8a-http', ?, 1,
+      'cohort-p8a-http', 0, 0, 'recipient-p8a-http', ?, ?, 0, 0, 1, ?,
+      'initial-pending', 'awaiting_window', ?, ?)`)
+      .run(ids.campaignId, opportunityId, ids.enrollmentId, ids.decisionId,
+        '7'.repeat(64), '8'.repeat(64), '5'.repeat(64), '9'.repeat(64),
+        ids.conversationId, at, at);
+    database.prepare(`INSERT INTO deal_hunter_cim_campaign_touches (
+      id, campaign_id, opportunity_id, logical_slot, kind, ordinal, due_at,
+      due_local, timezone_revision, state, created_at, updated_at
+    ) VALUES (?, ?, ?, 'initial', 'initial', 0, ?,
+      '2026-10-01T10:00:00-05:00', 1, 'scheduled', ?, ?)`)
+      .run(ids.touchId, ids.campaignId, opportunityId, at, at, at);
+  } finally { database.close(); }
+  return ids;
+}
+
 async function linkCanonicalDealKey(storage, { opportunityId, dealKey }) {
   const observedAt = '2026-08-30T09:30:00.000Z';
   return storage.upsertDealHunterOpportunityAlias({
@@ -404,6 +464,45 @@ test('P4B missing recipient keeps the Pursue decision and marks enrollment actio
     assert.equal(projection.decision.action, 'pursue');
     assert.equal(projection.enrollment.reason_code, 'recipient_missing');
     assert.equal(projection.campaign, null);
+  });
+});
+
+test('P8A release report is admin-only and explicit stop terminalizes the exact revision without sending', async () => {
+  const { opportunityId } = await seedCurrentOpportunity('opp-http-p8a-release');
+  const ids = seedP8aReleaseCampaign(opportunityId);
+  await withServer(async (origin) => {
+    const adminCookie = await login(origin, 'admin', 'change-me-now');
+    const viewerCookie = await login(origin, 'triage-viewer', 'triage-viewer-password');
+    const url = `${origin}/api/admin/deal-hunter/triage/${opportunityId}/cim-release`;
+    assert.equal((await fetch(url, { headers: { Cookie: viewerCookie } })).status, 401);
+    const read = await fetch(url, { headers: { Cookie: adminCookie } });
+    assert.equal(read.status, 200);
+    const report = await read.json();
+    assert.equal(report.campaign.id, ids.campaignId);
+    assert.equal(report.recipientAuthority.address, 'broker@example.test');
+    assert.equal(report.status.code, 'initial_pending');
+    assert.equal(report.actions.canStop, true);
+    assert.equal(JSON.stringify(report).includes('boundary_nonce_digest'), false);
+    const stop = await fetch(`${url}/stop`, { method: 'POST',
+      headers: { 'Content-Type': 'application/json', Cookie: adminCookie },
+      body: JSON.stringify({ campaignId: ids.campaignId,
+        expectedRowVersion: report.actions.expectedRowVersion,
+        expectedTerminalRevision: report.actions.expectedTerminalRevision,
+        idempotencyKey: '7145375d-9055-4ad0-85cf-da3475e9a720',
+        reason: 'Owner stopped the canary.' }) });
+    assert.equal(stop.status, 200);
+    const stopped = await stop.json();
+    assert.equal(stopped.report.campaign.state, 'stopped');
+    assert.equal(stopped.report.actions.canStop, false);
+    assert.equal(stopped.report.transmission, null);
+    const database = new Database(process.env.SQLITE_PATH, { readonly: true });
+    try {
+      assert.deepEqual(database.prepare(`SELECT state, terminal_reason FROM
+        deal_hunter_cim_campaign_touches WHERE id = ?`).get(ids.touchId),
+      { state: 'cancelled-before-provider', terminal_reason: 'campaign_stopped' });
+      assert.equal(database.prepare(`SELECT COUNT(*) AS count FROM deal_hunter_cim_transmissions`)
+        .get().count, 0);
+    } finally { database.close(); }
   });
 });
 
@@ -981,7 +1080,7 @@ test('triage detail remains readable while only administrators may enrich facts 
     assert.equal(viewerDetail.status, 200);
     assert.deepEqual(Object.keys(await viewerDetail.json()).sort(), [
       'brokerMaterials', 'cimSummary', 'crmSummary', 'effectiveFacts', 'history', 'listingUrls', 'missingCriticalFields',
-      'operatorFacts', 'opportunity', 'score', 'sourceObservations',
+      'operatorFacts', 'opportunity', 'pursueCimReleaseAvailable', 'score', 'sourceObservations',
     ]);
     assert.equal((await fetch(factPath.replace(/^/, origin), {
       method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: viewerCookie },

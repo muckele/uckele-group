@@ -137,6 +137,46 @@ function brokerPreparation() {
   };
 }
 
+function cimReleaseFixture(overrides = {}) {
+  return {
+    projectedAt: '2026-10-01T15:05:00.000Z',
+    opportunity: { id: 'opp-1', name: 'Evergreen Fire Protection', state: 'active' },
+    status: { code: 'awaiting_live_authorization', reason: '', actionRequired: true },
+    enrollment: { state: 'campaign-created', reasonCode: '', createdAt: '2026-10-01T15:00:00.000Z' },
+    campaign: { id: 'campaign-p8a', generation: 1, state: 'initial-pending', reasonCode: '',
+      rowVersion: 4, terminalRevision: 0, policyVersion: 'deal-hunter-cim-autopilot-v1',
+      templateVersion: 'template-v1', localExpiryAt: '' },
+    recipientAuthority: { address: 'broker@example.test', authorityId: 'recipient-authority',
+      fingerprint: '2'.repeat(64), permissionVersion: 'activation-p8a',
+      permissionDigest: '3'.repeat(64), permissionRevision: 7, permissionScope: 'cohort-p8a' },
+    timezoneAuthority: { state: 'verified', ianaTimezone: 'America/Los_Angeles', revision: 3,
+      selectedRevision: 3, current: true },
+    initialTouch: { id: 'touch-p8a', state: 'prepared', dueAt: '2026-10-01T16:00:00.000Z',
+      dueLocal: '2026-10-01T09:00:00-07:00', rowVersion: 2 },
+    transmission: { id: 'transmission-p8a', state: 'prepared',
+      releaseState: 'awaiting-live-authorization', rowVersion: 2, preparationGeneration: 1,
+      payloadVersion: 'payload-v1', payloadDigest: '4'.repeat(64), memberDigest: '5'.repeat(64),
+      addressing: { from: 'buyer@example.test', to: ['broker@example.test'],
+        cc: ['observer@example.test'], bcc: ['audit@example.test'],
+        replyTo: 'reply@example.test' },
+      copy: { subject: 'Persisted CIM subject', text: 'Exact persisted body.',
+        html: '<p>Exact persisted body.</p>' },
+      membership: [{ opportunityId: 'opp-1', campaignId: 'campaign-p8a', touchId: 'touch-p8a' }],
+      createdAt: '2026-10-01T15:01:00.000Z', updatedAt: '2026-10-01T15:01:00.000Z',
+      providerOutcome: null },
+    activation: { id: 'activation-p8a', capability: 'fl04b-enrollment', mode: 'canary',
+      status: 'current', expiresAt: '2026-10-02T15:00:00.000Z', matchesCampaign: true },
+    liveAuthorization: { id: 'live-authorization-p8a', capability: 'fl04b-initial',
+      writerPath: 'pursue-cim-autopilot-initial', status: 'current',
+      issuedAt: '2026-10-01T15:02:00.000Z', expiresAt: '2026-10-01T15:17:00.000Z',
+      consumedAt: '', withdrawnAt: '' },
+    pause: { paused: true, source: 'operations-control', updatedAt: '2026-10-01T15:04:00.000Z' },
+    actions: { canStop: true, campaignId: 'campaign-p8a', expectedRowVersion: 4,
+      expectedTerminalRevision: 0 },
+    ...overrides,
+  };
+}
+
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
@@ -294,6 +334,53 @@ describe('Opportunity drawer', () => {
     expect(onAction.mock.calls.map(([action]) => action)).toEqual(['pursue', 'watch']);
     expect(screen.getByRole('form', { name: 'Pass Evergreen Fire Protection' })).toBeVisible();
     expect(screen.getByRole('dialog')).toHaveClass('h-full');
+  });
+
+  test('renders only persisted canary release evidence and one explicit stop control', () => {
+    const onCimReleaseStop = vi.fn();
+    render(<OpportunityDrawer cimRelease={cimReleaseFixture()} detail={detailFixture()}
+      onCimReleaseStop={onCimReleaseStop} onClose={vi.fn()} />);
+
+    const card = screen.getByRole('region', { name: 'Pursue CIM canary' });
+    expect(within(card).getAllByText('Awaiting Live Authorization')).toHaveLength(2);
+    expect(within(card).getByText('Persisted CIM subject')).toBeVisible();
+    expect(within(card).getByText('Exact persisted body.')).toBeVisible();
+    expect(within(card).getByText(/buyer@example\.test → broker@example\.test/)).toBeVisible();
+    expect(within(card).getByText(/CC observer@example\.test/)).toBeVisible();
+    expect(within(card).getByText(/BCC audit@example\.test/)).toBeVisible();
+    expect(within(card).getByText(/opp-1 · campaign-p8a · touch-p8a/)).toBeVisible();
+    expect(within(card).getByText(/America\/Los_Angeles/)).toBeVisible();
+    expect(within(card).getByText(/Payload 444444444444/)).toBeVisible();
+    expect(within(card).getByText(/Current · expires 2026-10-01T15:17:00.000Z/)).toBeVisible();
+    expect(within(card).getByText(/Campaign expiry is established after initial provider acceptance/)).toBeVisible();
+    fireEvent.click(within(card).getByRole('button', { name: 'Stop CIM campaign' }));
+    expect(onCimReleaseStop).toHaveBeenCalledWith(expect.objectContaining({
+      campaignId: 'campaign-p8a', expectedRowVersion: 4, expectedTerminalRevision: 0,
+    }));
+    expect(within(card).queryByRole('button', { name: /retry|send again|regenerate|authorize|resume/i }))
+      .not.toBeInTheDocument();
+  });
+
+  test('shows a durable provider outcome ahead of the earlier release state', () => {
+    const release = cimReleaseFixture();
+    release.status = { code: 'provider_accepted', reason: 'accepted', actionRequired: false };
+    release.transmission = { ...release.transmission, state: 'accepted',
+      releaseState: 'authorized', providerOutcome: { state: 'accepted', resultCode: 'accepted' } };
+    render(<OpportunityDrawer cimRelease={release} detail={detailFixture()} onClose={vi.fn()} />);
+
+    const card = screen.getByRole('region', { name: 'Pursue CIM canary' });
+    expect(within(card).getByText('Provider Accepted')).toBeVisible();
+    expect(within(card).getByText('Accepted', { exact: true })).toBeVisible();
+    expect(within(card).queryByText('Authorized', { exact: true })).not.toBeInTheDocument();
+  });
+
+  test('suppresses legacy send controls while the durable canary report is loading', () => {
+    render(<OpportunityDrawer cimReleaseLoading
+      detail={detailFixture({ pursueCimReleaseAvailable: true })} onClose={vi.fn()} />);
+
+    const card = screen.getByRole('region', { name: 'Pursue CIM canary' });
+    expect(within(card).getByRole('status')).toHaveTextContent('Loading durable canary state');
+    expect(screen.queryByRole('region', { name: 'Broker Materials' })).not.toBeInTheDocument();
   });
 
   test('places one Broker Materials card directly below decisions before strengths and keeps durable history in CRM/CIM', () => {

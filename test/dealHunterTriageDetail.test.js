@@ -1145,8 +1145,9 @@ test('consolidated detail returns the exact bounded view with authority, conflic
   assert.equal(detail.ok, true);
   assert.deepEqual(Object.keys(detail).sort(), [
     'brokerMaterials', 'cimSummary', 'crmSummary', 'effectiveFacts', 'history', 'listingUrls', 'missingCriticalFields',
-    'ok', 'operatorFacts', 'opportunity', 'score', 'sourceObservations', 'status',
+    'ok', 'operatorFacts', 'opportunity', 'pursueCimReleaseAvailable', 'score', 'sourceObservations', 'status',
   ]);
+  assert.equal(detail.pursueCimReleaseAvailable, false);
   assert.equal(detail.effectiveFacts.seller_name.value, 'Verified Operator Seller');
   assert.equal(detail.effectiveFacts.seller_name.provenance, 'operator');
   assert.equal(detail.effectiveFacts.broker_email.value, 'crm-broker@example.test');

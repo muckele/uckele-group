@@ -1239,6 +1239,29 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
         activation: activationResult.data };
     },
 
+    async getPursueCimBrokerConversation(id) {
+      if (typeof id !== 'string' || !id || id.length > 240 || id.trim() !== id) {
+        throw new Error('Invalid Pursue CIM conversation id');
+      }
+      const { data, error } = await client.from('deal_hunter_broker_conversations')
+        .select('*').eq('id', id).maybeSingle();
+      if (error) throw error;
+      return data ?? null;
+    },
+
+    async getPursueCimLiveProviderAuthorization(transmissionId) {
+      if (typeof transmissionId !== 'string' || !transmissionId
+        || transmissionId.length > 240 || transmissionId.trim() !== transmissionId) {
+        throw new Error('Invalid Pursue CIM transmission id');
+      }
+      const { data, error } = await client.from('deal_hunter_cim_live_provider_authorizations')
+        .select('*').eq('transmission_id', transmissionId)
+        .order('issued_at', { ascending: false }).order('id', { ascending: false })
+        .limit(1).maybeSingle();
+      if (error) throw error;
+      return data ?? null;
+    },
+
     async transitionPursuitEnrollment(command) {
       const { data, error } = await client.rpc('pursue_cim_transition_enrollment_v1', {
         p_command: command,

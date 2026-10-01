@@ -284,6 +284,16 @@ export function createPursueCimSqliteTransitions(database, { applyPass, readCrmM
           WHERE id = 'global'`).get()?.revision,
       };
     },
+    async getPursueCimBrokerConversation(id) {
+      const conversationId = requiredText(id, 'conversationId');
+      return database.prepare(`SELECT * FROM deal_hunter_broker_conversations
+        WHERE id = ?`).get(conversationId) ?? null;
+    },
+    async getPursueCimLiveProviderAuthorization(transmissionId) {
+      const id = requiredText(transmissionId, 'transmissionId');
+      return database.prepare(`SELECT * FROM deal_hunter_cim_live_provider_authorizations
+        WHERE transmission_id = ? ORDER BY issued_at DESC, id DESC LIMIT 1`).get(id) ?? null;
+    },
     async withdrawCimCapabilityActivation(command) {
       const id = requiredText(command.id, 'id');
       const actor = requiredText(command.actor, 'actor', 200);
