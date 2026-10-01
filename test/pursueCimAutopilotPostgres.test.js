@@ -1512,6 +1512,40 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       `select coalesce((select outreach_paused from public.deal_hunter_cim_safety_settings
         where id='global'), true);`) === 't', database);
     assert.ok(operationsSnapshot.shadowCandidates.length <= 100, database);
+    const chronologicalShadow = JSON.parse(psql(container, database, `begin;
+      insert into public.deal_hunter_opportunities
+        (opportunity_id,created_at,updated_at,canonical_name,identity_version)
+      values
+        ('p9-order-early','2026-09-25T19:00:01.000Z','2026-09-25T19:00:01.000Z',
+          'P9 early candidate','cim-identity-v1'),
+        ('p9-order-late','2026-09-25T19:00:03.000Z','2026-09-25T19:00:03.000Z',
+          'P9 late candidate','cim-identity-v1');
+      insert into public.deal_hunter_owner_decision_events
+        (id,idempotency_key,request_digest,opportunity_id,action,actor,
+         expected_discovery_revision,expected_material_revision,
+         observed_discovery_revision,observed_material_revision,policy_version,created_at)
+      values
+        ('p9-order-decision-early','p9-order-idem-early',repeat('1',64),
+          'p9-order-early','pursue','fixture',0,0,0,0,'owner-v1',
+          '2026-09-25T19:00:01.000Z'),
+        ('p9-order-decision-late','p9-order-idem-late',repeat('2',64),
+          'p9-order-late','pursue','fixture',0,0,0,0,'owner-v1',
+          '2026-09-25T19:00:03.000Z');
+      insert into public.deal_hunter_pursuit_enrollments
+        (id,decision_event_id,opportunity_id,state,authority_digest,created_at,updated_at)
+      values
+        ('z-p9-order-early','p9-order-decision-early','p9-order-early','queued',
+          repeat('3',64),'2026-09-25T19:00:01.000Z','2026-09-25T19:00:01.000Z'),
+        ('a-p9-order-late','p9-order-decision-late','p9-order-late','queued',
+          repeat('4',64),'2026-09-25T19:00:03.000Z','2026-09-25T19:00:03.000Z');
+      set role service_role;
+      select public.pursue_cim_read_operations_snapshot_v1('${now}'::timestamptz,100);
+      rollback;`));
+    const chronologicalIds = chronologicalShadow.shadowCandidates
+      .map((candidate) => candidate.subjectId);
+    assert.ok(chronologicalIds.indexOf('z-p9-order-early')
+      < chronologicalIds.indexOf('a-p9-order-late'),
+    `${database}: PostgreSQL shadow decisions must preserve SQLite sort_at ordering`);
     const rejectAuditTransition = (eventType, name, command) => {
       psql(container, database, `
         create function public.p1c_reject_transition_audit() returns trigger

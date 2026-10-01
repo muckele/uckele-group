@@ -143,7 +143,7 @@ begin
     ) candidates order by sort_at, kind, subject_id limit v_limit
   ),
   shadow_evaluated as (
-    select kind, subject_id, case
+    select kind, subject_id, sort_at, case
       when v_paused then 'central_outreach_pause'
       when kind='would-enroll'
         and public.pursue_cim_current_activation_v1('fl04b-enrollment',p_now) is null
@@ -166,13 +166,13 @@ begin
     from shadow_candidates
   ),
   shadow_rows as (
-    select kind, subject_id, reason='ready' eligible, reason
+    select kind, subject_id, sort_at, reason='ready' eligible, reason
     from shadow_evaluated
   ),
   shadow as (
     select coalesce(pg_catalog.jsonb_agg(pg_catalog.jsonb_build_object(
       'kind', kind, 'subjectId', subject_id, 'eligible', eligible, 'reason', reason)
-      order by kind, subject_id), '[]'::jsonb) value from shadow_rows
+      order by sort_at, kind, subject_id), '[]'::jsonb) value from shadow_rows
   ),
   invariants as (
     select pg_catalog.jsonb_build_object(
