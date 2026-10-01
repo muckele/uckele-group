@@ -5,6 +5,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { createSupabaseStorage } from '../server/storage/supabase.js';
+import { deriveAcceptedCimCadence } from '../server/services/pursueCimCadence.js';
+import { calculateCampaignExpiry } from '../server/services/cimCampaignPolicy.js';
 import { sha256, stableCanonicalJson } from '../server/utils/security.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -31,6 +33,8 @@ const p6cMigrationPath = path.join(root,
   'supabase/migrations/20261005120000_pursue_cim_provider_outcomes.sql');
 const p6cPolicyTupleMigrationPath = path.join(root,
   'supabase/migrations/20261005130000_pursue_cim_policy_tuple_guard.sql');
+const p6dMigrationPath = path.join(root,
+  'supabase/migrations/20261006120000_pursue_cim_dormant_followup_slots.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -55,6 +59,7 @@ const expectedP1cFunctions = [
   'pursue_cim_append_safety_events_v1',
   'pursue_cim_append_terminal_event_v1',
   'pursue_cim_append_timezone_revision_v1',
+  'pursue_cim_apply_accepted_cadence_v1',
   'pursue_cim_assert_types_v1',
   'pursue_cim_authorize_provider_pending_p5_v1',
   'pursue_cim_authorize_provider_pending_v1',
@@ -69,22 +74,28 @@ const expectedP1cFunctions = [
   'pursue_cim_digest_v1',
   'pursue_cim_emit_admitted_import_safety_v1',
   'pursue_cim_enter_provider_seam_v1',
+  'pursue_cim_expected_initial_expiry_v1',
   'pursue_cim_finalize_transmission_v1',
+  'pursue_cim_finalize_with_cadence_v1',
   'pursue_cim_issue_live_authorization_v1',
   'pursue_cim_json_stringify_v1',
   'pursue_cim_list_due_initial_touches_v1',
   'pursue_cim_materialize_campaign_v1',
   'pursue_cim_prepare_transmission_v1',
+  'pursue_cim_read_cadence_context_v1',
   'pursue_cim_read_final_gate_context_v1',
   'pursue_cim_read_import_outreach_counters_v1',
   'pursue_cim_read_projection_v1',
   'pursue_cim_reconcile_transmission_v1',
+  'pursue_cim_reconcile_with_cadence_v1',
   'pursue_cim_record_capability_activation_v1',
   'pursue_cim_record_owner_decision_v1',
   'pursue_cim_required_instant_v1',
   'pursue_cim_required_revision_v1',
   'pursue_cim_required_text_v1',
+  'pursue_cim_resolve_local_instant_v1',
   'pursue_cim_transition_enrollment_v1',
+  'pursue_cim_validate_accepted_cadence_v1',
   'pursue_cim_withdraw_capability_activation_v1',
   'pursue_cim_withdraw_live_authorization_v1',
 ];
@@ -183,6 +194,26 @@ test('P6C policy tuple correction is additive, mirrored, and enforced by the dur
     /\{campaign,permission_version\}[\s\S]*v_member\.permission_version/i);
   assert.match(migration,
     /revoke all on function public\.pursue_cim_authorize_provider_pending_v1\(jsonb\)[\s\S]*grant execute[\s\S]*to service_role/i);
+});
+
+test('P6D PostgreSQL cadence wrappers are additive, mirrored, and service-role constrained', () => {
+  assert.equal(fs.existsSync(p6dMigrationPath), true);
+  const migration = fs.readFileSync(p6dMigrationPath, 'utf8').trim();
+  const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
+  assert.ok(schema.includes(migration), 'canonical schema must contain the exact additive P6D block');
+  assert.match(migration, /security definer set search_path = ''/i);
+  assert.match(migration, /pursue_cim_validate_accepted_cadence_v1/);
+  assert.match(migration, /v_local_accepted\+interval '21 days'/);
+  assert.match(migration, /v_cadence->'expiryDerivation'<>v_expected_expiry->'expiryDerivation'/);
+  assert.match(migration, /v_campaign\.policy_version<>'deal-hunter-cim-autopilot-v1'/);
+  assert.match(migration,
+    /v_membership\.opportunity_id=v_campaign\.opportunity_id[\s\S]*v_touch\.opportunity_id=v_campaign\.opportunity_id/);
+  assert.match(migration,
+    /v_touch\.kind='weekday-follow-up'[\s\S]*v_touch\.ordinal>=4[\s\S]*\^weekday:/);
+  assert.match(migration, /v_due>=v_expiry/);
+  assert.match(migration, /insert into public\.deal_hunter_cim_campaign_touches/);
+  assert.match(migration, /revoke all on function public\.pursue_cim_finalize_transmission_v1\(jsonb\) from service_role/);
+  assert.match(migration, /grant execute on function public\.pursue_cim_finalize_with_cadence_v1\(jsonb\) to service_role/);
 });
 
 test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
@@ -440,6 +471,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6bMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cPolicyTupleMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6dMigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -722,6 +754,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6bMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6cPolicyTupleMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6dMigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',
@@ -1010,9 +1043,15 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         authenticated: rpc.authenticated, service: rpc.service,
         fixedSearchPath: rpc.fixedSearchPath },
       { public: false, anon: false, authenticated: false,
-        service: !['pursue_cim_cancel_prepared_transmission_v1',
+        service: !['pursue_cim_apply_accepted_cadence_v1',
+          'pursue_cim_cancel_prepared_transmission_v1',
           'pursue_cim_emit_admitted_import_safety_v1',
-          'pursue_cim_authorize_provider_pending_p5_v1'].includes(rpc.name),
+          'pursue_cim_authorize_provider_pending_p5_v1',
+          'pursue_cim_expected_initial_expiry_v1',
+          'pursue_cim_finalize_transmission_v1',
+          'pursue_cim_reconcile_transmission_v1',
+          'pursue_cim_resolve_local_instant_v1',
+          'pursue_cim_validate_accepted_cadence_v1'].includes(rpc.name),
         fixedSearchPath: true }, `${database}:${rpc.name}`);
       if (!['pursue_cim_assert_types_v1', 'pursue_cim_canonical_json_v1',
         'pursue_cim_current_activation_v1', 'pursue_cim_digest_v1',
@@ -1020,6 +1059,16 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         'pursue_cim_required_text_v1', 'pursue_cim_required_instant_v1'].includes(rpc.name)) {
         assert.equal(rpc.securityDefiner, true, `${database}:${rpc.name}`);
       }
+    }
+    for (const acceptedAt of ['2026-02-15T10:30:00.000Z',
+      '2026-10-11T08:30:00.000Z']) {
+      const expectedExpiry = calculateCampaignExpiry(acceptedAt, 'America/Los_Angeles');
+      const postgresExpiry = JSON.parse(psql(container, database, `
+        select public.pursue_cim_expected_initial_expiry_v1(
+          '${acceptedAt}'::timestamptz,'America/Los_Angeles');`));
+      assert.deepEqual(postgresExpiry, { localExpiryAt: expectedExpiry.expiresAt,
+        expiryDerivation: expectedExpiry },
+      `${database}: PostgreSQL expiry must match gap-forward/earlier-repeat service semantics`);
     }
     const supabase = createSupabaseStorage({ storage: {} }, { client: {
       async rpc(name, payload) {
@@ -1038,8 +1087,9 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
           'pursue_cim_issue_live_authorization_v1',
           'pursue_cim_authorize_provider_pending_v1',
           'pursue_cim_enter_provider_seam_v1',
-          'pursue_cim_finalize_transmission_v1',
-          'pursue_cim_reconcile_transmission_v1',
+          'pursue_cim_finalize_with_cadence_v1',
+          'pursue_cim_reconcile_with_cadence_v1',
+          'pursue_cim_read_cadence_context_v1',
           'pursue_cim_withdraw_live_authorization_v1',
           'pursue_cim_append_terminal_event_v1',
           'pursue_cim_consume_safety_events_v1',
@@ -1148,9 +1198,9 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       ['pursue_cim_record_owner_decision_v1', { ...ownerCommands[0], actor: 42 }],
       ['pursue_cim_prepare_transmission_v1',
         { ...reference.prepareCommands[0], touchIds: [42] }],
-      ['pursue_cim_finalize_transmission_v1',
+      ['pursue_cim_finalize_with_cadence_v1',
         { ...reference.finalizeCommands[0], providerMessageId: 42 }],
-      ['pursue_cim_reconcile_transmission_v1',
+      ['pursue_cim_reconcile_with_cadence_v1',
         { ...reference.reconcileCommands[0], providerMessageId: 42 }],
       ['pursue_cim_append_terminal_event_v1',
         { ...reference.terminalCommands[0], preProviderResolution: 'true' }],
@@ -2026,34 +2076,247 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       select public.${name}('${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);
       rollback;
     `));
-    const acceptedFinalization = rolledBackRpc('pursue_cim_finalize_transmission_v1', {
+    const acceptedObservedAt = reference.finalizeCommands[0].observedAt
+      ?? reference.finalizeCommands[0].now;
+    const cadence = deriveAcceptedCimCadence(
+      await supabase.readCimCadenceContext({
+        transmissionId: reference.finalizeCommands[0].transmissionId,
+      }), acceptedObservedAt);
+    const acceptedFinalizationCommand = {
       ...reference.finalizeCommands[0], outcome: 'accepted',
-      providerMessageId: 'accepted-proof', providerResultCode: 'accepted',
-    });
-    assert.equal(acceptedFinalization.applied, true, database);
-    assert.equal(acceptedFinalization.transmission.state, 'accepted', database);
-    assert.equal(acceptedFinalization.nextTouch, null, database);
-    const failedFinalization = rolledBackRpc('pursue_cim_finalize_transmission_v1', {
+      providerMessageId: 'accepted-proof', providerResultCode: 'accepted', cadence,
+    };
+    const acceptedFinalizationPayload = JSON.stringify(acceptedFinalizationCommand)
+      .replaceAll("'", "''");
+    const acceptedFinalizations = psql(container, database, `
+      begin;
+      set role service_role;
+      select public.pursue_cim_finalize_with_cadence_v1(
+        '${acceptedFinalizationPayload}'::jsonb);
+      select public.pursue_cim_finalize_with_cadence_v1(
+        '${acceptedFinalizationPayload}'::jsonb);
+      reset role;
+      select jsonb_build_object(
+        'slotCount', (select count(*) from public.deal_hunter_cim_campaign_touches
+          where campaign_id=(select campaign_id
+            from public.deal_hunter_cim_transmission_touches
+            where transmission_id='${acceptedFinalizationCommand.transmissionId}')
+            and ordinal=1),
+        'campaignRowVersion', (select row_version from public.deal_hunter_cim_campaigns
+          where id=(select campaign_id from public.deal_hunter_cim_transmission_touches
+            where transmission_id='${acceptedFinalizationCommand.transmissionId}')));
+      rollback;
+    `).split('\n').filter((line) => line.startsWith('{')).map(JSON.parse);
+    assert.equal(acceptedFinalizations[0].applied, true, database);
+    assert.equal(acceptedFinalizations[0].transmission.state, 'accepted', database);
+    assert.equal(acceptedFinalizations[0].nextTouch.kind, 'follow-up-1', database);
+    assert.equal(acceptedFinalizations[1].existing, true,
+      `${database}: exact accepted finalization must replay`);
+    assert.equal(acceptedFinalizations[1].nextTouch.id,
+      acceptedFinalizations[0].nextTouch.id, database);
+    assert.deepEqual(acceptedFinalizations[2], { slotCount: 1, campaignRowVersion: 2 },
+      `${database}: replay must not duplicate the slot or bump campaign authority`);
+    const forgedExpiryCadence = { ...cadence,
+      localExpiryAt: '2027-09-25T19:00:07.000Z',
+      expiryDerivation: { ...cadence.expiryDerivation,
+        localExpiry: '2027-09-25T12:00:07',
+        expiresAt: '2027-09-25T19:00:07.000Z' } };
+    assert.notEqual(rejectedSql(container, database, `
+      begin;
+      set role service_role;
+      select public.pursue_cim_finalize_with_cadence_v1(
+        '${JSON.stringify({ ...acceptedFinalizationCommand,
+          cadence: forgedExpiryCadence }).replaceAll("'", "''")}'::jsonb);
+      rollback;
+    `).status, 0, `${database}: caller cannot forge the 21-local-day expiry`);
+    const failedFinalization = rolledBackRpc('pursue_cim_finalize_with_cadence_v1', {
       ...reference.finalizeCommands[0], outcome: 'definitive-failure',
       providerResultCode: 'provider-rejected',
     });
     assert.equal(failedFinalization.applied, true, database);
     assert.equal(failedFinalization.transmission.state, 'definitive-failure', database);
     assert.equal(failedFinalization.nextTouch, null, database);
-    const acceptedReconciliation = rolledBackRpc('pursue_cim_reconcile_transmission_v1', {
+    const acceptedReconciliationCommand = {
       ...reference.reconcileCommands[0], expectedRowVersion: 3,
       outcome: 'accepted', providerMessageId: 'reconciled-proof',
-      evidenceId: 'direct-accepted-proof',
-    });
-    assert.equal(acceptedReconciliation.applied, true, database);
-    assert.equal(acceptedReconciliation.transmission.state, 'accepted', database);
+      evidenceId: 'direct-accepted-proof', cadence,
+    };
+    const acceptedReconciliationPayload = JSON.stringify(acceptedReconciliationCommand)
+      .replaceAll("'", "''");
+    const acceptedReconciliations = psql(container, database, `
+      begin;
+      set role service_role;
+      select public.pursue_cim_reconcile_with_cadence_v1(
+        '${acceptedReconciliationPayload}'::jsonb);
+      select public.pursue_cim_reconcile_with_cadence_v1(
+        '${acceptedReconciliationPayload}'::jsonb);
+      reset role;
+      select count(*) from public.deal_hunter_cim_campaign_touches
+        where campaign_id=(select campaign_id
+          from public.deal_hunter_cim_transmission_touches
+          where transmission_id='${acceptedReconciliationCommand.transmissionId}')
+          and ordinal=1;
+      rollback;
+    `).split('\n').filter(Boolean);
+    const acceptedReconciliation = acceptedReconciliations.slice(0, 2).map(JSON.parse);
+    assert.equal(acceptedReconciliation[0].applied, true, database);
+    assert.equal(acceptedReconciliation[0].transmission.state, 'accepted', database);
+    assert.equal(acceptedReconciliation[1].unchanged, true,
+      `${database}: exact accepted reconciliation must replay`);
+    assert.equal(acceptedReconciliation[1].nextTouch.id,
+      acceptedReconciliation[0].nextTouch.id, database);
+    assert.equal(Number(acceptedReconciliations[2]), 1,
+      `${database}: reconciliation replay must not duplicate the slot`);
+    const chainDatabase = `p6d_chain_${database.endsWith('fresh') ? 'f' : 'u'}_${process.pid}`;
+    run(dockerCommand, ['exec', container, 'createdb', '-U', 'postgres',
+      '-T', database, chainDatabase]);
+    const committedCadenceRpc = (name, command) => JSON.parse(psql(container,
+      chainDatabase, `set role service_role;
+        select public.${name}(
+          '${JSON.stringify(command).replaceAll("'", "''")}'::jsonb);`));
+    let chain = committedCadenceRpc('pursue_cim_finalize_with_cadence_v1',
+      acceptedFinalizationCommand);
+    const chainKinds = ['follow-up-1', 'follow-up-2', 'follow-up-3',
+      'weekday-follow-up'];
+    const chainObservedAt = [chain.nextTouch.due_at, '2026-10-01T15:00:07.000Z',
+      '2026-10-05T15:00:07.000Z', '2026-10-16T18:59:00.000Z'];
+    for (const [index, expectedKind] of chainKinds.entries()) {
+      assert.equal(chain.nextTouch.kind, expectedKind, `${chainDatabase}:${expectedKind}`);
+      const stageTransmissionId = `p6d-chain-transmission-${index + 1}`;
+      const stageCommunicationId = `p6d-chain-communication-${index + 1}`;
+      const stageOutboxId = `p6d-chain-outbox-${index + 1}`;
+      const primed = JSON.parse(psql(container, chainDatabase, `
+        insert into public.crm_communications select
+          (pg_catalog.jsonb_populate_record(null::public.crm_communications,
+            pg_catalog.to_jsonb(src)||pg_catalog.jsonb_build_object(
+              'id','${stageCommunicationId}','outbox_id','${stageOutboxId}',
+              'provider',null,'provider_message_id',null,
+              'idempotency_key','p6d-chain-communication-${index + 1}',
+              'delivery_state','provider-pending','delivery_state_at','${chainObservedAt[index]}',
+              'occurred_at','${chainObservedAt[index]}','created_at','${chainObservedAt[index]}',
+              'updated_at','${chainObservedAt[index]}'))).* from public.crm_communications src
+          where id=(select communication_id from public.deal_hunter_cim_transmissions
+            where id='${acceptedFinalizationCommand.transmissionId}');
+        insert into public.crm_email_outbox select
+          (pg_catalog.jsonb_populate_record(null::public.crm_email_outbox,
+            pg_catalog.to_jsonb(src)||pg_catalog.jsonb_build_object(
+              'id','${stageOutboxId}','communication_id','${stageCommunicationId}',
+              'idempotency_key','p6d-chain-outbox-${index + 1}',
+              'client_request_key','p6d-chain-client-${index + 1}',
+              'state','provider-pending','provider',null,'provider_message_id',null,
+              'attempt_count',0,'created_at','${chainObservedAt[index]}',
+              'updated_at','${chainObservedAt[index]}'))).* from public.crm_email_outbox src
+          where id=(select outbox_id from public.deal_hunter_cim_transmissions
+            where id='${acceptedFinalizationCommand.transmissionId}');
+        insert into public.deal_hunter_cim_transmissions select
+          (pg_catalog.jsonb_populate_record(null::public.deal_hunter_cim_transmissions,
+            pg_catalog.to_jsonb(src)||pg_catalog.jsonb_build_object(
+              'id','${stageTransmissionId}',
+              'member_digest',public.pursue_cim_digest_v1(
+                pg_catalog.to_jsonb('p6d-chain-member-${index + 1}'::text)),
+              'preparation_generation',src.preparation_generation+${index + 1},
+              'payload_digest',public.pursue_cim_digest_v1(
+                pg_catalog.to_jsonb('p6d-chain-payload-${index + 1}'::text)),
+              'provider_idempotency_key','p6d-chain-provider-${index + 1}',
+              'communication_id','${stageCommunicationId}','outbox_id','${stageOutboxId}',
+              'state','provider-pending','invocation_authority_count',1,
+              'provider_invocation_authorized_at','${chainObservedAt[index]}',
+              'boundary_nonce_digest',repeat('${index + 1}',64),
+              'provider_seam_entered_at','${chainObservedAt[index]}',
+              'provider',null,'provider_message_id',null,'provider_result_code',null,
+              'row_version',3,'created_at','${chainObservedAt[index]}',
+              'updated_at','${chainObservedAt[index]}'))).*
+          from public.deal_hunter_cim_transmissions src
+          where id='${acceptedFinalizationCommand.transmissionId}';
+        update public.deal_hunter_cim_campaign_touches set state='provider-pending',
+          transmission_id='${stageTransmissionId}',
+          row_version=row_version+1,updated_at='${chainObservedAt[index]}'
+          where id='${chain.nextTouch.id}';
+        insert into public.deal_hunter_cim_transmission_touches
+          (transmission_id,touch_id,opportunity_id,campaign_id,display_ordinal,created_at)
+        select '${stageTransmissionId}',id,opportunity_id,campaign_id,1,'${chainObservedAt[index]}'
+          from public.deal_hunter_cim_campaign_touches where id='${chain.nextTouch.id}';
+        select jsonb_build_object('transmissionId',id,
+          'rowVersion',row_version,'payloadDigest',payload_digest)
+          from public.deal_hunter_cim_transmissions
+          where id='${stageTransmissionId}';`));
+      const context = JSON.parse(psql(container, chainDatabase, `set role service_role;
+        select public.pursue_cim_read_cadence_context_v1(
+          '{"transmissionId":"${stageTransmissionId}"}'::jsonb);`));
+      const stageCadence = deriveAcceptedCimCadence(context, chainObservedAt[index]);
+      const stageCommand = {
+        ...acceptedFinalizationCommand, transmissionId: primed.transmissionId,
+        expectedRowVersion: primed.rowVersion,
+        payloadDigest: primed.payloadDigest,
+        providerMessageId: `p6d-chain-provider-${index + 1}`,
+        observedAt: chainObservedAt[index], now: chainObservedAt[index],
+        cadence: stageCadence,
+      };
+      if (index === 0) {
+        const fixedIdentityRejection = rejectedSql(container, chainDatabase, `begin;
+          update public.deal_hunter_cim_campaign_touches
+            set logical_slot='tampered-follow-up'
+            where id='${chain.nextTouch.id}';
+          set role service_role;
+          select public.pursue_cim_finalize_with_cadence_v1(
+            '${JSON.stringify(stageCommand).replaceAll("'", "''")}'::jsonb);
+          rollback;`);
+        assert.notEqual(fixedIdentityRejection.status, 0,
+        `${chainDatabase}: malformed durable follow-up identity must fail closed`);
+        assert.match(fixedIdentityRejection.stderr,
+          /Invalid current Pursue CIM cadence touch/);
+        const bindingRejection = rejectedSql(container, chainDatabase, `begin;
+          update public.deal_hunter_cim_campaign_touches touch
+            set opportunity_id=other.opportunity_id
+            from public.deal_hunter_opportunities other
+            where touch.id='${chain.nextTouch.id}'
+              and other.opportunity_id<>touch.opportunity_id;
+          set role service_role;
+          select public.pursue_cim_finalize_with_cadence_v1(
+            '${JSON.stringify(stageCommand).replaceAll("'", "''")}'::jsonb);
+          rollback;`);
+        assert.notEqual(bindingRejection.status, 0,
+        `${chainDatabase}: mismatched durable membership binding must fail closed`);
+        assert.match(bindingRejection.stderr,
+          /Ineligible Pursue CIM outcome cannot advance cadence/);
+      }
+      if (index === 3) {
+        const weekdayIdentityRejection = rejectedSql(container, chainDatabase, `begin;
+          update public.deal_hunter_cim_campaign_touches set ordinal=3
+            where id='${chain.nextTouch.id}';
+          set role service_role;
+          select public.pursue_cim_finalize_with_cadence_v1(
+            '${JSON.stringify(stageCommand).replaceAll("'", "''")}'::jsonb);
+          rollback;`);
+        assert.notEqual(weekdayIdentityRejection.status, 0,
+        `${chainDatabase}: malformed durable weekday identity must fail closed`);
+        assert.match(weekdayIdentityRejection.stderr,
+          /Invalid current Pursue CIM cadence touch/);
+      }
+      chain = committedCadenceRpc('pursue_cim_finalize_with_cadence_v1', stageCommand);
+      assert.equal(chain.applied, true, chainDatabase);
+    }
+    assert.equal(chain.nextTouch, null,
+      `${chainDatabase}: weekday progression must stop at local expiry`);
+    assert.deepEqual(JSON.parse(psql(container, chainDatabase, `select jsonb_build_object(
+      'kinds',(select jsonb_agg(kind order by ordinal)
+        from public.deal_hunter_cim_campaign_touches
+        where campaign_id=(select campaign_id
+          from public.deal_hunter_cim_transmission_touches
+          where transmission_id='${acceptedFinalizationCommand.transmissionId}')),
+      'expiry',(select local_expiry_at from public.deal_hunter_cim_campaigns
+        where id=(select campaign_id from public.deal_hunter_cim_transmission_touches
+          where transmission_id='${acceptedFinalizationCommand.transmissionId}')));`)), {
+      kinds: ['initial', 'follow-up-1', 'follow-up-2', 'follow-up-3', 'weekday-follow-up'],
+      expiry: '2026-10-16T19:00:00+00:00',
+    }, `${chainDatabase}: durable PostgreSQL cadence must match SQLite`);
     const directPendingReconciliation = { ...reference.reconcileCommands[0],
       expectedRowVersion: 3, evidenceId: 'direct-provider-pending' };
     const directPayload = JSON.stringify(directPendingReconciliation).replaceAll("'", "''");
     const directPriorState = psql(container, database, `
       begin;
       set role service_role;
-      select public.pursue_cim_reconcile_transmission_v1('${directPayload}'::jsonb);
+      select public.pursue_cim_reconcile_with_cadence_v1('${directPayload}'::jsonb);
       reset role;
       select prior_state from public.deal_hunter_cim_audit_events
         where event_type='transmission-reconciled' and source='operator-check'
@@ -2081,11 +2344,11 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
       observedAt: '2026-09-25T19:00:08.000Z' };
     const evidenceReplay = psql(container, database, `begin;
       set role service_role;
-      select public.pursue_cim_reconcile_transmission_v1(
+      select public.pursue_cim_reconcile_with_cadence_v1(
         '${JSON.stringify(multipleIdentityCommand).replaceAll("'", "''")}'::jsonb);
-      select public.pursue_cim_reconcile_transmission_v1(
+      select public.pursue_cim_reconcile_with_cadence_v1(
         '${JSON.stringify(multipleIdentityCommand).replaceAll("'", "''")}'::jsonb);
-      select public.pursue_cim_reconcile_transmission_v1(
+      select public.pursue_cim_reconcile_with_cadence_v1(
         '${JSON.stringify(changedEvidenceCommand).replaceAll("'", "''")}'::jsonb);
       rollback;`).split('\n').filter((line) => line.startsWith('{')).map(JSON.parse);
     assert.deepEqual(evidenceReplay.map(({ applied, unchanged, conflict }) =>
@@ -2096,7 +2359,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     ], `${database}: multiple-ID evidence must be bounded, replayable, and drift-sensitive`);
     const invalidIdentity = rejectedSql(container, database, `begin;
       set role service_role;
-      select public.pursue_cim_reconcile_transmission_v1(
+      select public.pursue_cim_reconcile_with_cadence_v1(
         '${JSON.stringify({ ...multipleIdentityCommand,
           providerIdentities: [{ provider: 'resend', providerMessageId: 'bad id',
             evidenceId: 'candidate-a', evidenceDigest: 'b'.repeat(64) },
@@ -2108,7 +2371,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     for (const [index, command] of reference.finalizeCommands.entries()) {
       if (index === 0) {
         rejectAuditTransition('transmission-finalized',
-          'pursue_cim_finalize_transmission_v1', command);
+          'pursue_cim_finalize_with_cadence_v1', command);
         assert.deepEqual(JSON.parse(psql(container, database, `select jsonb_build_object(
           'transmission', (select state from public.deal_hunter_cim_transmissions
             where id='${command.transmissionId}'),

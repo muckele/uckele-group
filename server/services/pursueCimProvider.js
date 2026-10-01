@@ -1,4 +1,5 @@
 import { createCimProviderBoundaryAuthorization } from './cimProviderBoundary.js';
+import { deriveAcceptedCimCadence } from './pursueCimCadence.js';
 import { sendPreparedMessage } from './delivery.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 
@@ -64,6 +65,14 @@ function denied() {
     definitiveFailure: true,
     providerMessageId: '',
   };
+}
+
+async function acceptedCadence(storage, transmissionId, observedAt) {
+  if (typeof storage?.readCimCadenceContext !== 'function') {
+    throw new Error('Durable CIM cadence context is unavailable');
+  }
+  const context = await storage.readCimCadenceContext({ transmissionId });
+  return deriveAcceptedCimCadence(context, observedAt);
 }
 
 // This is the only new-transmission orchestration entry. It accepts the
@@ -155,11 +164,21 @@ export async function finalizeAuthorizedCimTransmission({
         });
         const terminal = durable?.transmission;
         if (['accepted', 'definitive-failure', 'ambiguous'].includes(terminal?.state)) {
+          let nextTouch = null;
+          if (terminal.state === 'accepted'
+            && typeof storage?.readCimCadenceContext === 'function') {
+            try {
+              nextTouch = (await storage.readCimCadenceContext({ transmissionId: terminal.id }))
+                ?.nextTouch ?? null;
+            } catch {
+              nextTouch = null;
+            }
+          }
           return { providerResult, outcome: { category: terminal.state,
             provider: terminal.provider, providerMessageId: terminal.provider_message_id,
             providerResultCode: terminal.provider_result_code },
           durableResult: { applied: false, existing: true, conflict: false,
-            transmission: terminal, nextTouch: null } };
+            transmission: terminal, nextTouch } };
         }
       } catch {
         // A read failure cannot authorize a retry or invent a terminal outcome.
@@ -187,6 +206,8 @@ export async function finalizeAuthorizedCimTransmission({
     observedAt,
     actor,
     now: now instanceof Date ? now.toISOString() : new Date(now).toISOString(),
+    cadence: outcome.category === 'accepted'
+      ? await acceptedCadence(storage, transmission.id, observedAt) : null,
   };
   await testHooks.beforeFinalization?.({ command, providerResult, outcome });
   const durableResult = await storage.finalizeCimTransmission(command);
@@ -393,6 +414,8 @@ export async function reconcileCimProviderTransmission({
     providerIdentities: distinctIds.length > 1 ? candidates : [],
     actor,
     now: now instanceof Date ? now.toISOString() : new Date(now).toISOString(),
+    cadence: outcome === 'accepted'
+      ? await acceptedCadence(storage, transmission.id, exactEvidence.observedAt) : null,
   });
   return { resolved: outcome !== 'ambiguous' && !durableResult.conflict,
     reconciliationOnly: outcome === 'ambiguous', providerCalls: 0,

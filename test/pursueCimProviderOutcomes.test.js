@@ -22,6 +22,21 @@ function proofFor(transmission, overrides = {}) {
     candidates: [], ...overrides };
 }
 
+function cadenceContext() {
+  return { transmission: { id: 'transmission-1', campaign_terminal_revision: 0 },
+    members: [{ membership: { transmission_id: 'transmission-1', touch_id: 'touch-1',
+      campaign_id: 'campaign-1', cancelled_at: null },
+    touch: { id: 'touch-1', campaign_id: 'campaign-1', opportunity_id: 'opp-1',
+      logical_slot: 'initial', kind: 'initial', ordinal: 0, timezone_revision: 1,
+      row_version: 4 },
+    campaign: { id: 'campaign-1', opportunity_id: 'opp-1',
+      policy_version: 'deal-hunter-cim-autopilot-v1', timezone_revision: 1,
+      state: 'initial-pending', terminal_revision: 0, row_version: 8,
+      initial_accepted_at: null, local_expiry_at: null, expiry_derivation: '{}' },
+    timezone: { opportunity_id: 'opp-1', revision: 1,
+      iana_timezone: 'America/New_York' } }] };
+}
+
 test('P6C canonical normalizer distinguishes provider outcomes from local boundary denial', () => {
   assert.equal(typeof providerService.normalizeCimProviderOutcome, 'function');
   const normalize = providerService.normalizeCimProviderOutcome;
@@ -73,6 +88,7 @@ test('P6C provider outcome orchestration finalizes only an actual attempted prov
   assert.equal(typeof providerService.finalizeAuthorizedCimTransmission, 'function');
   const finalizeCalls = [];
   const storage = {
+    async readCimCadenceContext() { return cadenceContext(); },
     async finalizeCimTransmission(command) {
       finalizeCalls.push(command);
       return { applied: true, existing: false, conflict: false,
@@ -103,7 +119,10 @@ test('P6C provider outcome orchestration finalizes only an actual attempted prov
     providerResultCode: 'accepted', actor: 'fixture-owner',
     observedAt: '2026-09-25T19:00:01.000Z',
     now: '2026-09-25T19:00:00.000Z',
+    cadence: finalizeCalls[0].cadence,
   });
+  assert.equal(finalizeCalls[0].cadence.nextTouch.kind, 'follow-up-1');
+  assert.equal(finalizeCalls[0].cadence.acceptedAt, '2026-09-25T19:00:01.000Z');
 
   const pending = await providerService.finalizeAuthorizedCimTransmission({ ...common,
     sendAuthorized: async () => ({ status: 'failed', provider: 'resend',
@@ -117,7 +136,8 @@ test('P6C provider outcome orchestration finalizes only an actual attempted prov
 test('P6C reconciliation is read-only, absence is unresolved, and multiple IDs stay ambiguous', async () => {
   const calls = [];
   const transmission = reconciliationTransmission();
-  const storage = { async reconcileCimTransmission(command) {
+  const storage = { async readCimCadenceContext() { return cadenceContext(); },
+    async reconcileCimTransmission(command) {
     calls.push(command);
     return { applied: true, unchanged: false, conflict: false,
       transmission: { ...transmission, state: command.outcome } };
@@ -153,7 +173,8 @@ test('P6C reconciliation is read-only, absence is unresolved, and multiple IDs s
 test('P6C exact accepted and definitive reconciliation converge without provider calls', async () => {
   const calls = [];
   const transmission = reconciliationTransmission({ state: 'ambiguous', row_version: 4 });
-  const common = { storage: { async reconcileCimTransmission(command) {
+  const common = { storage: { async readCimCadenceContext() { return cadenceContext(); },
+    async reconcileCimTransmission(command) {
     calls.push(command);
     return { applied: true, unchanged: false, conflict: false,
       transmission: { ...transmission, state: command.outcome } };
@@ -180,7 +201,8 @@ test('P6C exact accepted and definitive reconciliation converge without provider
 test('P6C immediate finalization uses the provider-observed instant as the accepted anchor', async () => {
   const commands = [];
   const result = await providerService.finalizeAuthorizedCimTransmission({
-    storage: { async finalizeCimTransmission(command) {
+    storage: { async readCimCadenceContext() { return cadenceContext(); },
+      async finalizeCimTransmission(command) {
       commands.push(command);
       return { applied: true, transmission: { id: command.transmissionId,
         state: command.outcome } };
@@ -198,6 +220,7 @@ test('P6C immediate finalization uses the provider-observed instant as the accep
   assert.equal(result.outcome.category, 'accepted');
   assert.equal(commands[0].observedAt, '2026-09-25T19:00:07.000Z');
   assert.equal(commands[0].now, '2026-09-25T19:00:00.000Z');
+  assert.equal(commands[0].cadence.acceptedAt, '2026-09-25T19:00:07.000Z');
 });
 
 test('P6C restart reads through a seam denial to the exact durable terminal outcome', async () => {
@@ -238,7 +261,8 @@ test('P6C reconciliation accepts only provider evidence bound to the immutable t
     fromAddress: transmission.from_address, toAddresses: transmission.to_addresses,
     ccAddresses: [], bccAddresses: [], replyToAddress: transmission.reply_to_address,
     subject: transmission.subject };
-  const storage = { async reconcileCimTransmission(command) {
+  const storage = { async readCimCadenceContext() { return cadenceContext(); },
+    async reconcileCimTransmission(command) {
     calls.push(command);
     return { applied: true, conflict: false,
       transmission: { ...transmission, state: command.outcome } };

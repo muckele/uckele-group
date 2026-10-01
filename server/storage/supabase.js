@@ -1473,7 +1473,7 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     async finalizeCimTransmission(command) {
-      const { data, error } = await client.rpc('pursue_cim_finalize_transmission_v1', {
+      const { data, error } = await client.rpc('pursue_cim_finalize_with_cadence_v1', {
         p_command: command,
       });
       if (error) throw error;
@@ -1483,13 +1483,24 @@ export function createSupabaseStorage(config, { client: clientOverride } = {}) {
     },
 
     async reconcileCimTransmission(command) {
-      const { data, error } = await client.rpc('pursue_cim_reconcile_transmission_v1', {
+      const { data, error } = await client.rpc('pursue_cim_reconcile_with_cadence_v1', {
         p_command: command,
       });
       if (error) throw error;
       return normalizePursueCimRpcResult(data,
-        ['applied', 'unchanged', 'conflict'], ['transmission'],
+        ['applied', 'unchanged', 'conflict'], ['transmission', 'nextTouch'],
         { requiredRows: { transmission: ['applied', 'unchanged'] } });
+    },
+
+    async readCimCadenceContext(command) {
+      const { data, error } = await client.rpc('pursue_cim_read_cadence_context_v1', {
+        p_command: command,
+      });
+      if (error) throw error;
+      if (data === null) return null;
+      if (!data || typeof data !== 'object' || !data.transmission
+        || !Array.isArray(data.members)) throw new Error('Malformed Pursue CIM cadence context');
+      return data;
     },
 
     async withdrawCimLiveProviderAuthorization(command) {
