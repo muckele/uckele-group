@@ -4580,7 +4580,10 @@ export function createSqliteStorage(config, options = {}) {
         to_addresses TEXT NOT NULL,
         cc_addresses TEXT NOT NULL DEFAULT '[]',
         bcc_addresses TEXT NOT NULL DEFAULT '[]',
-        reply_to_address TEXT NOT NULL CHECK(length(reply_to_address) BETWEEN 3 AND 320),
+        reply_to_address TEXT NOT NULL CHECK(
+          length(reply_to_address) BETWEEN 3 AND 320
+          OR (reply_to_address = '' AND payload_version = 'p10b-limited-free-smoke-test-v1')
+        ),
         subject TEXT NOT NULL CHECK(length(subject) BETWEEN 1 AND 998),
         provider_idempotency_key TEXT NOT NULL UNIQUE
           CHECK(provider_idempotency_key = trim(provider_idempotency_key) AND length(provider_idempotency_key) BETWEEN 1 AND 240),

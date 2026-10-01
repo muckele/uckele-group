@@ -67,10 +67,10 @@ function proposal(candidate, authority, recipient, config) {
     payloadVersion: message.templateVersion,
     fromAddress,
     toAddresses: [recipient.email], ccAddresses: [], bccAddresses: [],
-    replyToAddress: buildCimReplyToAddress({
+    replyToAddress: message.replyTo ? buildCimReplyToAddress({
       requestId: candidate.conversation_id,
       replyTo: message.replyTo,
-    }),
+    }) : '',
     subject: message.subject,
     bodyText: message.text,
     bodyHtmlSanitized: message.html,

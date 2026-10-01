@@ -45,7 +45,10 @@ function numberListFromEnv(value, fallback = []) {
 }
 
 export const CONTROLLED_CIM_MAILBOX_PROFILE = 'controlled-mailbox-v1';
+export const CONTROLLED_CIM_LIMITED_SMOKE_PROFILE = 'controlled-mailbox-limited-smoke-v1';
 export const PRODUCTION_CIM_PROVIDER_PROFILE = 'production-resend-v1';
+export const P10B_LIMITED_SMOKE_RECIPIENT = 'mathew@uckelegroup.com';
+export const P10B_LIMITED_SMOKE_SENDING_DOMAIN = 'p10b.uckelegroup.com';
 
 function emailAddress(value) {
   const candidate = String(value || '').trim();
@@ -79,6 +82,26 @@ export function resolveCimProviderProfile(environment = process.env) {
       ),
     };
   }
+  if (profile === CONTROLLED_CIM_LIMITED_SMOKE_PROFILE) {
+    return {
+      enabled,
+      profile,
+      mode: 'controlled-mailbox-limited-smoke',
+      provider: 'resend',
+      resendApiKey: environment.DEAL_HUNTER_CIM_LIMITED_SMOKE_RESEND_API_KEY || '',
+      resendFromEmail: environment.DEAL_HUNTER_CIM_LIMITED_SMOKE_FROM_EMAIL || '',
+      resendReplyTo: '',
+      resendInboundDomain: '',
+      emailWebhookSecret: '',
+      reconciliationApiKey: '',
+      sendingDomain: environment.DEAL_HUNTER_CIM_LIMITED_SMOKE_SENDING_DOMAIN || '',
+      apiKeyPermission: environment.DEAL_HUNTER_CIM_LIMITED_SMOKE_KEY_PERMISSION || '',
+      apiKeyDomainRestriction: environment.DEAL_HUNTER_CIM_LIMITED_SMOKE_KEY_DOMAIN || '',
+      allowedRecipients: listFromEnv(
+        environment.DEAL_HUNTER_CIM_LIMITED_SMOKE_ALLOWED_RECIPIENTS,
+      ),
+    };
+  }
   if (profile === PRODUCTION_CIM_PROVIDER_PROFILE) {
     return {
       enabled,
@@ -102,7 +125,8 @@ export function resolveCimProviderProfile(environment = process.env) {
 
 export function getCimProviderDeliveryConfig(config) {
   const profile = config?.dealHunter?.cimProvider;
-  if (!['controlled-mailbox', 'production'].includes(profile?.mode)) return config;
+  if (!['controlled-mailbox', 'controlled-mailbox-limited-smoke', 'production']
+    .includes(profile?.mode)) return config;
   return {
     ...config,
     delivery: {
@@ -121,6 +145,10 @@ export function getCimWebhookAuthority(config) {
   const profile = config?.dealHunter?.cimProvider;
   if (profile?.mode === 'controlled-mailbox') {
     return { providerProfile: profile.profile, secret: profile.emailWebhookSecret,
+      requireSignedProviderEvent: true };
+  }
+  if (profile?.mode === 'controlled-mailbox-limited-smoke') {
+    return { providerProfile: profile.profile, secret: '',
       requireSignedProviderEvent: true };
   }
   return { providerProfile: profile?.profile || '',
@@ -142,8 +170,54 @@ export function validateCimProviderProfileBinding(config, binding = {}) {
   const profile = config?.dealHunter?.cimProvider;
   const selectedControlled = profile?.mode === 'controlled-mailbox';
   const requestedControlled = binding.providerProfile === CONTROLLED_CIM_MAILBOX_PROFILE;
-  if (!selectedControlled && !requestedControlled) return { ok: true, blockers: [] };
+  const selectedLimited = profile?.mode === 'controlled-mailbox-limited-smoke';
+  const requestedLimited = binding.providerProfile === CONTROLLED_CIM_LIMITED_SMOKE_PROFILE;
+  if (!selectedControlled && !requestedControlled && !selectedLimited && !requestedLimited) {
+    return { ok: true, blockers: [] };
+  }
   const blockers = [];
+  if (selectedLimited || requestedLimited) {
+    if (!selectedLimited || profile.profile !== CONTROLLED_CIM_LIMITED_SMOKE_PROFILE
+      || binding.providerProfile !== profile.profile || profile.provider !== 'resend') {
+      blockers.push('profile_mismatch');
+    }
+    const configuredRecipients = Array.isArray(profile?.allowedRecipients)
+      ? profile.allowedRecipients : [];
+    const allowedRecipients = Array.from(new Set(configuredRecipients
+      .map(emailAddress).filter(Boolean)));
+    const rawToAddresses = Array.isArray(binding.toAddresses) ? binding.toAddresses : [];
+    const rawCcAddresses = Array.isArray(binding.ccAddresses) ? binding.ccAddresses : [];
+    const rawBccAddresses = Array.isArray(binding.bccAddresses) ? binding.bccAddresses : [];
+    const toAddresses = rawToAddresses.map(emailAddress).filter(Boolean);
+    const sendingDomain = String(profile?.sendingDomain || '').trim().toLowerCase();
+    if (allowedRecipients.length !== 1 || configuredRecipients.length !== 1
+      || allowedRecipients[0] !== P10B_LIMITED_SMOKE_RECIPIENT) {
+      blockers.push('mailbox_recipient_allowlist_invalid');
+    }
+    if (toAddresses.length !== 1 || rawToAddresses.length !== 1
+      || toAddresses[0] !== P10B_LIMITED_SMOKE_RECIPIENT
+      || rawCcAddresses.length > 0 || rawBccAddresses.length > 0) {
+      blockers.push('mailbox_recipient_mismatch');
+    }
+    if (!emailAddress(binding.fromAddress)
+      || emailAddress(binding.fromAddress) !== emailAddress(profile?.resendFromEmail)) {
+      blockers.push('mailbox_sender_mismatch');
+    }
+    if (sendingDomain !== P10B_LIMITED_SMOKE_SENDING_DOMAIN
+      || emailDomain(binding.fromAddress) !== sendingDomain
+      || emailDomain(profile?.resendFromEmail) !== sendingDomain) {
+      blockers.push('limited_smoke_sender_domain_mismatch');
+    }
+    if (binding.replyToAddress || profile?.resendReplyTo) {
+      blockers.push('limited_smoke_reply_to_forbidden');
+    }
+    if (profile?.resendInboundDomain || profile?.emailWebhookSecret) {
+      blockers.push('limited_smoke_inbound_forbidden');
+    }
+    if (profile?.reconciliationApiKey) blockers.push('limited_smoke_reconciliation_forbidden');
+    const uniqueBlockers = Array.from(new Set(blockers));
+    return { ok: uniqueBlockers.length === 0, blockers: uniqueBlockers };
+  }
   if (!selectedControlled || profile.profile !== CONTROLLED_CIM_MAILBOX_PROFILE
     || binding.providerProfile !== profile.profile || profile.provider !== 'resend') {
     blockers.push('profile_mismatch');
@@ -209,7 +283,8 @@ export function getConfig() {
   const sqlitePath = process.env.SQLITE_PATH || path.join(rootDir, 'data', 'uckele-group.sqlite');
   const defaultDataDir = path.dirname(sqlitePath);
   const cimProvider = resolveCimProviderProfile();
-  const controlledMailbox = cimProvider.mode === 'controlled-mailbox';
+  const controlledMailbox = ['controlled-mailbox', 'controlled-mailbox-limited-smoke']
+    .includes(cimProvider.mode);
 
   cachedConfig = {
     rootDir,

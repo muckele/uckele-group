@@ -8,6 +8,7 @@ import { recordEmailEventsFromWebhook } from '../server/services/emailEvents.js'
 import { applyVerifiedPursueCimInbound } from '../server/services/pursueCimInbound.js';
 
 const mailboxProfile = 'controlled-mailbox-v1';
+const limitedSmokeProfile = 'controlled-mailbox-limited-smoke-v1';
 
 function mailboxEnvironment(overrides = {}) {
   return {
@@ -41,6 +42,120 @@ function mailboxConfig(overrides = {}) {
     dealHunter: { cimProvider: { ...resolve(mailboxEnvironment()), ...overrides } },
   };
 }
+
+function limitedSmokeEnvironment(overrides = {}) {
+  return {
+    DEAL_HUNTER_CIM_PROVIDER_ENABLED: 'false',
+    DEAL_HUNTER_CIM_PROVIDER_PROFILE: limitedSmokeProfile,
+    DEAL_HUNTER_CIM_LIMITED_SMOKE_RESEND_API_KEY: '',
+    DEAL_HUNTER_CIM_LIMITED_SMOKE_FROM_EMAIL:
+      'P10B Limited Smoke <sender@p10b.uckelegroup.com>',
+    DEAL_HUNTER_CIM_LIMITED_SMOKE_SENDING_DOMAIN: 'p10b.uckelegroup.com',
+    DEAL_HUNTER_CIM_LIMITED_SMOKE_KEY_PERMISSION: '',
+    DEAL_HUNTER_CIM_LIMITED_SMOKE_KEY_DOMAIN: '',
+    DEAL_HUNTER_CIM_LIMITED_SMOKE_ALLOWED_RECIPIENTS: 'mathew@uckelegroup.com',
+    ...overrides,
+  };
+}
+
+function limitedSmokeConfig(overrides = {}) {
+  return {
+    isProduction: false,
+    delivery: { provider: 'console', resendApiKey: '', resendFromEmail: '',
+      resendReplyTo: '', resendInboundDomain: '', emailWebhookSecret: '' },
+    dealHunter: { cimProvider: {
+      ...configModule.resolveCimProviderProfile(limitedSmokeEnvironment()), ...overrides,
+    } },
+  };
+}
+
+test('P10B limited-smoke resolver is keyless by default and ignores all shared namespaces', () => {
+  assert.equal(configModule.CONTROLLED_CIM_LIMITED_SMOKE_PROFILE, limitedSmokeProfile);
+  const forbidden = ['production-key', 'mailbox-key', 'production-secret', 'mailbox-secret'];
+  const profile = configModule.resolveCimProviderProfile(limitedSmokeEnvironment({
+    RESEND_API_KEY: forbidden[0],
+    DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY: forbidden[1],
+    EMAIL_WEBHOOK_SECRET: forbidden[2],
+    DEAL_HUNTER_CIM_MAILBOX_WEBHOOK_SECRET: forbidden[3],
+  }));
+  assert.equal(profile.profile, limitedSmokeProfile);
+  assert.equal(profile.mode, 'controlled-mailbox-limited-smoke');
+  assert.equal(profile.resendApiKey, '');
+  assert.equal(profile.resendReplyTo, '');
+  assert.equal(profile.resendInboundDomain, '');
+  assert.equal(profile.emailWebhookSecret, '');
+  assert.equal(profile.reconciliationApiKey, '');
+  assert.equal(profile.sendingDomain, 'p10b.uckelegroup.com');
+  assert.deepEqual(profile.allowedRecipients, ['mathew@uckelegroup.com']);
+  for (const value of forbidden) assert.equal(JSON.stringify(profile).includes(value), false);
+});
+
+test('P10B limited-smoke process erases production and full-mailbox credentials', () => {
+  const script = `import { getConfig } from './server/config.js';
+    const config = getConfig();
+    process.stdout.write(JSON.stringify({ delivery: config.delivery,
+      followUp: { senderEmail: config.followUp.senderEmail, replyTo: config.followUp.replyTo },
+      cimProvider: config.dealHunter.cimProvider }));`;
+  const output = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: new URL('..', import.meta.url), encoding: 'utf8', env: { PATH: process.env.PATH,
+      ...limitedSmokeEnvironment(), RESEND_API_KEY: 'must-not-resolve-production-key',
+      RESEND_FROM_EMAIL: 'must-not-resolve@production.example.test',
+      DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY: 'must-not-resolve-mailbox-key',
+      DEAL_HUNTER_CIM_MAILBOX_WEBHOOK_SECRET: 'must-not-resolve-mailbox-secret',
+      FOLLOW_UP_SENDER_EMAIL: 'must-not-resolve-followup@example.test' },
+  }));
+  assert.equal(output.delivery.provider, 'console');
+  assert.equal(output.delivery.resendApiKey, '');
+  assert.equal(output.delivery.resendFromEmail, '');
+  assert.deepEqual(output.followUp, { senderEmail: '', replyTo: '' });
+  assert.equal(output.cimProvider.resendApiKey, '');
+  assert.equal(JSON.stringify(output).includes('must-not-resolve'), false);
+});
+
+test('P10B limited-smoke binding permits keyless prepare but rejects reply and envelope drift', () => {
+  const binding = { providerProfile: limitedSmokeProfile,
+    fromAddress: 'P10B Limited Smoke <sender@p10b.uckelegroup.com>',
+    toAddresses: ['mathew@uckelegroup.com'], ccAddresses: [], bccAddresses: [],
+    replyToAddress: '' };
+  assert.deepEqual(configModule.validateCimProviderProfileBinding(
+    limitedSmokeConfig(), binding), { ok: true, blockers: [] });
+  for (const [label, config, candidate, blocker] of [
+    ['recipient', limitedSmokeConfig(), { ...binding, toAddresses: ['other@example.com'] },
+      'mailbox_recipient_mismatch'],
+    ['sender domain', limitedSmokeConfig(), { ...binding,
+      fromAddress: 'sender@other.example.com' }, 'limited_smoke_sender_domain_mismatch'],
+    ['reply to', limitedSmokeConfig(), { ...binding,
+      replyToAddress: 'reply@p10b.uckelegroup.com' }, 'limited_smoke_reply_to_forbidden'],
+    ['inbound config', limitedSmokeConfig({ resendInboundDomain: 'p10b.uckelegroup.com' }),
+      binding, 'limited_smoke_inbound_forbidden'],
+    ['webhook config', limitedSmokeConfig({ emailWebhookSecret: 'dummy' }), binding,
+      'limited_smoke_inbound_forbidden'],
+    ['reconciliation config', limitedSmokeConfig({ reconciliationApiKey: 'dummy' }), binding,
+      'limited_smoke_reconciliation_forbidden'],
+  ]) {
+    const result = configModule.validateCimProviderProfileBinding(config, candidate);
+    assert.equal(result.ok, false, label);
+    assert.ok(result.blockers.includes(blocker), `${label}: ${result.blockers.join(',')}`);
+  }
+});
+
+test('P10B limited-smoke composition exposes no inbound or reconciliation credential', () => {
+  const config = limitedSmokeConfig();
+  const scoped = configModule.getCimProviderDeliveryConfig(config);
+  assert.equal(scoped.delivery.provider, 'resend');
+  assert.equal(scoped.delivery.resendFromEmail,
+    'P10B Limited Smoke <sender@p10b.uckelegroup.com>');
+  assert.equal(scoped.delivery.resendApiKey, '');
+  assert.equal(scoped.delivery.resendReplyTo, '');
+  assert.equal(scoped.delivery.resendInboundDomain, '');
+  assert.equal(scoped.delivery.emailWebhookSecret, '');
+  assert.deepEqual(configModule.getCimWebhookAuthority(config), {
+    providerProfile: limitedSmokeProfile, secret: '', requireSignedProviderEvent: true,
+  });
+  assert.deepEqual(configModule.getCimProviderReconciliationConfig(config), {
+    providerProfile: limitedSmokeProfile, provider: 'resend', apiKey: '',
+  });
+});
 
 test('P10A controlled mailbox resolver ignores every production provider variable', () => {
   const resolve = configModule.resolveCimProviderProfile;

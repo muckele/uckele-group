@@ -1,4 +1,9 @@
-import { CONTROLLED_CIM_MAILBOX_PROFILE } from '../config.js';
+import {
+  CONTROLLED_CIM_LIMITED_SMOKE_PROFILE,
+  CONTROLLED_CIM_MAILBOX_PROFILE,
+  P10B_LIMITED_SMOKE_RECIPIENT,
+  P10B_LIMITED_SMOKE_SENDING_DOMAIN,
+} from '../config.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import {
   buildCimEmailIdempotencyKey,
@@ -16,6 +21,17 @@ export const P10B_CONTROLLED_MAILBOX_TEXT = [
   'Uckele Group',
 ].join('\n');
 export const P10B_CONTROLLED_MAILBOX_HTML = '<!doctype html><html><body><p>Hello,</p><p>This is a controlled, synthetic end-to-end mailbox test for Uckele Group. It is not a request concerning a real business or transaction. Please reply so the authorized test can verify inbound routing and reconciliation.</p><p>Best,</p><p>Uckele Group</p></body></html>';
+export const P10B_LIMITED_SMOKE_TEMPLATE_VERSION = 'p10b-limited-free-smoke-test-v1';
+export const P10B_LIMITED_SMOKE_SUBJECT = 'P10B limited outbound-only smoke test';
+export const P10B_LIMITED_SMOKE_TEXT = [
+  'Hello,',
+  '',
+  'This is a controlled, synthetic outbound-only smoke test for Uckele Group. It is not a request concerning a real business or transaction. No reply is requested or monitored.',
+  '',
+  'Best,',
+  'Uckele Group',
+].join('\n');
+export const P10B_LIMITED_SMOKE_HTML = '<!doctype html><html><body><p>Hello,</p><p>This is a controlled, synthetic outbound-only smoke test for Uckele Group. It is not a request concerning a real business or transaction. No reply is requested or monitored.</p><p>Best,</p><p>Uckele Group</p></body></html>';
 
 function address(value) {
   const candidate = String(value || '').trim();
@@ -56,8 +72,9 @@ function hasP10bMarker(candidate, authority) {
 
 export function requiresP10bControlledMailboxTemplate({ candidate, authority, config } = {}) {
   const profile = config?.dealHunter?.cimProvider;
-  return profile?.mode === 'controlled-mailbox'
+  return ['controlled-mailbox', 'controlled-mailbox-limited-smoke'].includes(profile?.mode)
     || profile?.profile === CONTROLLED_CIM_MAILBOX_PROFILE
+    || profile?.profile === CONTROLLED_CIM_LIMITED_SMOKE_PROFILE
     || hasP10bMarker(candidate, authority);
 }
 
@@ -106,10 +123,13 @@ function assertControlledProfile(config, deliveryConfig, recipient) {
   const profile = config?.dealHunter?.cimProvider;
   const allowed = Array.isArray(profile?.allowedRecipients)
     ? profile.allowedRecipients.map(address).filter(Boolean) : [];
+  const limited = profile?.profile === CONTROLLED_CIM_LIMITED_SMOKE_PROFILE;
   const inboundDomain = String(profile?.resendInboundDomain || '').trim().toLowerCase();
   if (config?.isProduction === true || profile?.enabled !== false
-    || profile?.profile !== CONTROLLED_CIM_MAILBOX_PROFILE
-    || profile?.mode !== 'controlled-mailbox' || profile?.provider !== 'resend') {
+    || ![CONTROLLED_CIM_MAILBOX_PROFILE, CONTROLLED_CIM_LIMITED_SMOKE_PROFILE]
+      .includes(profile?.profile)
+    || !['controlled-mailbox', 'controlled-mailbox-limited-smoke'].includes(profile?.mode)
+    || profile?.provider !== 'resend') {
     throw new Error('P10B controlled mailbox profile is required');
   }
   if (config?.delivery?.resendApiKey || config?.delivery?.resendFromEmail
@@ -121,6 +141,20 @@ function assertControlledProfile(config, deliveryConfig, recipient) {
     || address(recipient?.email) !== allowed[0]) {
     throw new Error('P10B controlled mailbox recipient is invalid');
   }
+  if (limited) {
+    const sendingDomain = String(profile?.sendingDomain || '').trim().toLowerCase();
+    if (allowed[0] !== P10B_LIMITED_SMOKE_RECIPIENT
+      || sendingDomain !== P10B_LIMITED_SMOKE_SENDING_DOMAIN
+      || domain(profile.resendFromEmail) !== sendingDomain
+      || address(deliveryConfig?.delivery?.resendFromEmail) !== address(profile.resendFromEmail)
+      || profile.resendReplyTo || deliveryConfig?.delivery?.resendReplyTo
+      || profile.resendInboundDomain || deliveryConfig?.delivery?.resendInboundDomain
+      || profile.emailWebhookSecret || deliveryConfig?.delivery?.emailWebhookSecret
+      || profile.reconciliationApiKey) {
+      throw new Error('P10B limited smoke no-reply envelope is invalid');
+    }
+    return;
+  }
   if (!inboundDomain || domain(profile.resendFromEmail) !== inboundDomain
     || domain(profile.resendReplyTo) !== inboundDomain
     || address(deliveryConfig?.delivery?.resendFromEmail) !== address(profile.resendFromEmail)
@@ -130,14 +164,32 @@ function assertControlledProfile(config, deliveryConfig, recipient) {
 }
 
 export function assertP10bControlledMailboxTemplate({ providerProfile, transmission } = {}) {
-  if (providerProfile !== CONTROLLED_CIM_MAILBOX_PROFILE) {
+  if (![CONTROLLED_CIM_MAILBOX_PROFILE, CONTROLLED_CIM_LIMITED_SMOKE_PROFILE]
+    .includes(providerProfile)) {
     throw new Error('P10B controlled mailbox profile is invalid');
   }
-  if (transmission?.payloadVersion !== P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION
-    || transmission?.copy?.subject !== P10B_CONTROLLED_MAILBOX_SUBJECT
-    || transmission?.copy?.text !== P10B_CONTROLLED_MAILBOX_TEXT
-    || transmission?.copy?.html !== P10B_CONTROLLED_MAILBOX_HTML) {
+  const expected = providerProfile === CONTROLLED_CIM_LIMITED_SMOKE_PROFILE
+    ? { version: P10B_LIMITED_SMOKE_TEMPLATE_VERSION, subject: P10B_LIMITED_SMOKE_SUBJECT,
+      text: P10B_LIMITED_SMOKE_TEXT, html: P10B_LIMITED_SMOKE_HTML }
+    : { version: P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION,
+      subject: P10B_CONTROLLED_MAILBOX_SUBJECT, text: P10B_CONTROLLED_MAILBOX_TEXT,
+      html: P10B_CONTROLLED_MAILBOX_HTML };
+  if (transmission?.payloadVersion !== expected.version
+    || transmission?.copy?.subject !== expected.subject
+    || transmission?.copy?.text !== expected.text
+    || transmission?.copy?.html !== expected.html
+    || (providerProfile === CONTROLLED_CIM_LIMITED_SMOKE_PROFILE
+      && transmission?.addressing?.replyTo)) {
     throw new Error('P10B controlled mailbox template is invalid');
+  }
+}
+
+export function isP10bControlledMailboxTemplate({ providerProfile, transmission } = {}) {
+  try {
+    assertP10bControlledMailboxTemplate({ providerProfile, transmission });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -150,17 +202,25 @@ export function buildP10bControlledMailboxTestEmail({
 } = {}) {
   assertSyntheticAuthority(candidate, authority);
   assertControlledProfile(config, deliveryConfig, recipient);
+  const limited = config?.dealHunter?.cimProvider?.profile
+    === CONTROLLED_CIM_LIMITED_SMOKE_PROFILE;
+  const selected = limited
+    ? { version: P10B_LIMITED_SMOKE_TEMPLATE_VERSION, subject: P10B_LIMITED_SMOKE_SUBJECT,
+      text: P10B_LIMITED_SMOKE_TEXT, html: P10B_LIMITED_SMOKE_HTML }
+    : { version: P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION,
+      subject: P10B_CONTROLLED_MAILBOX_SUBJECT, text: P10B_CONTROLLED_MAILBOX_TEXT,
+      html: P10B_CONTROLLED_MAILBOX_HTML };
   return {
-    templateVersion: P10B_CONTROLLED_MAILBOX_TEMPLATE_VERSION,
+    templateVersion: selected.version,
     kind: 'deal-hunter-cim-request',
     idempotencyKey: buildCimEmailIdempotencyKey({ requestId: candidate.touch_id }),
     to: recipient.email,
-    replyTo: buildCimReplyToAddress({ requestId: candidate.touch_id,
+    replyTo: limited ? '' : buildCimReplyToAddress({ requestId: candidate.touch_id,
       replyTo: deliveryConfig.delivery.resendReplyTo }),
-    subject: P10B_CONTROLLED_MAILBOX_SUBJECT,
-    headline: P10B_CONTROLLED_MAILBOX_SUBJECT,
-    text: P10B_CONTROLLED_MAILBOX_TEXT,
-    html: P10B_CONTROLLED_MAILBOX_HTML,
+    subject: selected.subject,
+    headline: selected.subject,
+    text: selected.text,
+    html: selected.html,
     tags: [
       { name: 'source', value: 'deal-hunter-cim-request' },
       { name: 'deal_key', value: authority.score?.deal_key || '' },

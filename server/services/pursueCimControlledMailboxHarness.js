@@ -1,4 +1,10 @@
-import { validateCimProviderProfileBinding } from '../config.js';
+import {
+  CONTROLLED_CIM_LIMITED_SMOKE_PROFILE,
+  CONTROLLED_CIM_MAILBOX_PROFILE,
+  P10B_LIMITED_SMOKE_RECIPIENT,
+  P10B_LIMITED_SMOKE_SENDING_DOMAIN,
+  validateCimProviderProfileBinding,
+} from '../config.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { setCimOutreachPaused } from './cimOpportunityIdentity.js';
 import { readCimCurrentAuthority } from './cimCampaignSafety.js';
@@ -19,10 +25,19 @@ import { finalizeAuthorizedCimTransmission } from './pursueCimProvider.js';
 import { getPursueCimReleaseReport } from './pursueCimRelease.js';
 import { assertP10bControlledMailboxTemplate } from './pursueCimControlledMailboxTemplate.js';
 
-const CONTROLLED_PROFILE = 'controlled-mailbox-v1';
+const CONTROLLED_PROFILE = CONTROLLED_CIM_MAILBOX_PROFILE;
+const LIMITED_PROFILE = CONTROLLED_CIM_LIMITED_SMOKE_PROFILE;
 const MAX_AUTHORIZATION_MS = 15 * 60 * 1000;
+const LIMITED_EVIDENCE_FIELDS = Object.freeze({
+  p10bComplete: false,
+  scenario74Passed: false,
+  signedInboundCovered: false,
+  reconciliationCovered: false,
+  providerTenantIsolated: false,
+});
 
 export const P10B_EXECUTION_CONFIRMATION = 'EXECUTE P10B CONTROLLED MAILBOX ONCE';
+export const P10B_LIMITED_SMOKE_CONFIRMATION = 'EXECUTE P10B LIMITED OUTBOUND SMOKE ONCE';
 
 function boundedText(value, name, maximum = 240) {
   if (typeof value !== 'string' || value.trim() !== value
@@ -37,6 +52,25 @@ function normalizedAddress(value) {
   const match = candidate.match(/^(?:[^<>\r\n,;]+\s)?<([^<>\s@,;]+@[^<>\s@,;]+\.[^<>\s@,;]+)>$/)
     || candidate.match(/^([^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+)$/);
   return String(match?.[1] || match?.[0] || '').toLowerCase();
+}
+
+function normalizedDomain(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function assertProductionNamespaceUnavailable(config) {
+  if (config?.delivery?.resendApiKey || config?.delivery?.resendFromEmail
+    || config?.delivery?.resendReplyTo || config?.delivery?.resendInboundDomain
+    || config?.delivery?.emailWebhookSecret) {
+    throw new Error('P10B cannot resolve the production delivery credential namespace');
+  }
+}
+
+function assertAutomationHardOff(config) {
+  if (config?.dealHunter?.cimAutomation?.schedulerEnabled === true
+    || config?.dealHunter?.cimFollowUp?.enabled === true) {
+    throw new Error('P10B scheduler and follow-up capabilities must remain hard-off');
+  }
 }
 
 function assertHardOffControlledConfig(config, recipient = '') {
@@ -59,19 +93,53 @@ function assertHardOffControlledConfig(config, recipient = '') {
     || !profile.reconciliationApiKey) {
     throw new Error('P10B controlled mailbox credentials and routing are incomplete');
   }
-  if (config?.delivery?.resendApiKey || config?.delivery?.resendFromEmail
-    || config?.delivery?.resendReplyTo || config?.delivery?.resendInboundDomain
-    || config?.delivery?.emailWebhookSecret) {
-    throw new Error('P10B cannot resolve the production delivery credential namespace');
-  }
-  if (config?.dealHunter?.cimAutomation?.schedulerEnabled === true
-    || config?.dealHunter?.cimFollowUp?.enabled === true) {
-    throw new Error('P10B scheduler and follow-up capabilities must remain hard-off');
-  }
+  assertProductionNamespaceUnavailable(config);
+  assertAutomationHardOff(config);
   return { profile, recipient: allowedRecipients[0] };
 }
 
-function exactReviewFields(report, providerProfile, initialActivationId) {
+function assertHardOffLimitedConfig(config, recipient = '', { execution = false } = {}) {
+  const profile = config?.dealHunter?.cimProvider;
+  const allowedRecipients = Array.isArray(profile?.allowedRecipients)
+    ? profile.allowedRecipients.map(normalizedAddress).filter(Boolean) : [];
+  if (config?.isProduction === true || profile?.profile !== LIMITED_PROFILE
+    || profile?.mode !== 'controlled-mailbox-limited-smoke' || profile?.provider !== 'resend') {
+    throw new Error('P10B limited smoke requires its isolated nonproduction profile');
+  }
+  if (profile.enabled !== false) throw new Error('P10B limited smoke must start hard-off');
+  if (allowedRecipients.length !== 1 || profile.allowedRecipients.length !== 1
+    || allowedRecipients[0] !== P10B_LIMITED_SMOKE_RECIPIENT
+    || (recipient && normalizedAddress(recipient) !== P10B_LIMITED_SMOKE_RECIPIENT)) {
+    throw new Error('P10B limited smoke requires the exact owner recipient');
+  }
+  if (!profile.resendFromEmail
+    || normalizedDomain(normalizedAddress(profile.resendFromEmail).split('@')[1])
+      !== P10B_LIMITED_SMOKE_SENDING_DOMAIN
+    || normalizedDomain(profile.sendingDomain) !== P10B_LIMITED_SMOKE_SENDING_DOMAIN) {
+    throw new Error('P10B limited smoke sender domain is invalid');
+  }
+  if (profile.resendReplyTo || profile.resendInboundDomain || profile.emailWebhookSecret) {
+    throw new Error('P10B limited smoke forbids Reply-To, inbound routing, and webhooks');
+  }
+  if (profile.reconciliationApiKey) {
+    throw new Error('P10B limited smoke forbids reconciliation credentials');
+  }
+  if (!execution && (profile.resendApiKey || profile.apiKeyPermission
+    || profile.apiKeyDomainRestriction)) {
+    throw new Error('P10B limited smoke prepare must remain keyless');
+  }
+  if (execution && (!profile.resendApiKey || profile.apiKeyPermission !== 'sending-access'
+    || normalizedDomain(profile.apiKeyDomainRestriction)
+      !== P10B_LIMITED_SMOKE_SENDING_DOMAIN)) {
+    throw new Error('P10B limited smoke requires a domain-restricted sending key scope');
+  }
+  assertProductionNamespaceUnavailable(config);
+  assertAutomationHardOff(config);
+  return { profile, recipient: allowedRecipients[0] };
+}
+
+function exactReviewFields(report, providerProfile, initialActivationId, databaseIdentityHash = '',
+  implementationHead = '') {
   const transmission = report?.transmission;
   const campaign = report?.campaign;
   const recipientAuthority = report?.recipientAuthority;
@@ -87,9 +155,18 @@ function exactReviewFields(report, providerProfile, initialActivationId) {
     throw new Error('P10B exact prepared transmission is unavailable for review');
   }
   assertP10bControlledMailboxTemplate({ providerProfile, transmission });
+  const limited = providerProfile === LIMITED_PROFILE;
+  if (limited && !/^[0-9a-f]{64}$/.test(databaseIdentityHash)) {
+    throw new Error('P10B limited smoke database identity hash is required');
+  }
+  if (limited && !/^[0-9a-f]{40}$/.test(implementationHead)) {
+    throw new Error('P10B limited smoke implementation head is required');
+  }
   return {
-    version: 'p10b-controlled-mailbox-review-v1',
+    version: limited ? 'p10b-limited-free-smoke-review-v1'
+      : 'p10b-controlled-mailbox-review-v1',
     providerProfile,
+    ...(limited ? { databaseIdentityHash, implementationHead, ...LIMITED_EVIDENCE_FIELDS } : {}),
     initialActivationId: boundedText(initialActivationId, 'initial activation id'),
     opportunity: {
       id: report.opportunity.id,
@@ -129,13 +206,18 @@ function exactReviewFields(report, providerProfile, initialActivationId) {
 export function buildP10bReviewArtifact(report, {
   providerProfile = CONTROLLED_PROFILE,
   initialActivationId,
+  databaseIdentityHash = '',
+  implementationHead = '',
 } = {}) {
-  const canonical = exactReviewFields(report, providerProfile, initialActivationId);
+  const canonical = exactReviewFields(report, providerProfile, initialActivationId,
+    databaseIdentityHash, implementationHead);
   return { ...canonical, digest: sha256(stableCanonicalJson(canonical)) };
 }
 
-function validateReviewBinding(review, config) {
-  const profile = assertHardOffControlledConfig(config);
+function validateReviewBinding(review, config, { execution = false } = {}) {
+  const profile = review?.providerProfile === LIMITED_PROFILE
+    ? assertHardOffLimitedConfig(config, '', { execution })
+    : assertHardOffControlledConfig(config);
   const binding = validateCimProviderProfileBinding(config, {
     providerProfile: profile.profile.profile,
     fromAddress: review.transmission.addressing.from,
@@ -199,6 +281,10 @@ export async function setupP10bSyntheticScenario({
   actor,
   now,
 } = {}) {
+  const providerProfile = config?.dealHunter?.cimProvider?.profile;
+  if (![CONTROLLED_PROFILE, LIMITED_PROFILE].includes(providerProfile)) {
+    throw new Error('P10B synthetic scenario provider profile is invalid');
+  }
   const requiredMethods = [
     'upsertDealHunterOpportunity', 'insertSubmission',
     'allocateDealHunterSourceGeneration', 'writeDealHunterOpportunityScore',
@@ -298,11 +384,11 @@ export async function setupP10bSyntheticScenario({
   if (recipients.length !== 1) throw new Error('P10B synthetic recipient authority is not unique');
   const selectedRecipient = recipients[0];
   const policyHash = setupDigest('campaign-policy', runId);
-  const configHash = sha256(stableCanonicalJson({ providerProfile: CONTROLLED_PROFILE,
+  const configHash = sha256(stableCanonicalJson({ providerProfile,
     recipientHash: sha256(recipient), schedulerEnabled: false, followUpEnabled: false }));
   const commonActivation = { mode: 'mailbox', policyHash, configHash, actor,
     reason: 'P10B isolated synthetic controlled-mailbox evidence',
-    confirmation: 'P10B SYNTHETIC CONTROLLED MAILBOX', providerProfile: CONTROLLED_PROFILE,
+    confirmation: 'P10B SYNTHETIC CONTROLLED MAILBOX', providerProfile,
     now: at };
   const safetyActivationId = `p10b-${setupDigest('safety-activation', runId).slice(0, 40)}`;
   const enrollmentActivationId = `p10b-${setupDigest('enrollment-activation', runId).slice(0, 40)}`;
@@ -380,6 +466,41 @@ export async function prepareP10bControlledMailbox({
     executionAuthorized: false, review };
 }
 
+export async function prepareP10bLimitedFreeSmoke({
+  storage,
+  config,
+  synthetic,
+  actor,
+  databaseIdentityHash,
+  implementationHead,
+  now = new Date().toISOString(),
+  services = {},
+} = {}) {
+  boundedText(actor, 'actor', 200);
+  const input = requiredSyntheticInput(synthetic);
+  const controlled = assertHardOffLimitedConfig(config, input.recipient);
+  if (!/^[0-9a-f]{64}$/.test(databaseIdentityHash || '')
+    || !/^[0-9a-f]{40}$/.test(implementationHead || '')) {
+    throw new Error('P10B limited smoke database identity and implementation head are required');
+  }
+  const setupSyntheticScenario = services.setupSyntheticScenario || setupP10bSyntheticScenario;
+  const setup = await setupSyntheticScenario({ storage, config, synthetic: input, actor, now });
+  const opportunityId = boundedText(setup?.opportunityId, 'opportunity id', 200);
+  boundedText(setup?.initialActivationId, 'initial activation id');
+  const preparedAt = new Date(setup?.effectiveNow || now).toISOString();
+  const getReleaseReport = services.getReleaseReport || getPursueCimReleaseReport;
+  const report = await getReleaseReport({ storage, opportunityId, now: preparedAt });
+  if (report?.pause?.paused !== true) {
+    throw new Error('P10B limited smoke preparation requires the durable central pause');
+  }
+  const review = buildP10bReviewArtifact(report, { providerProfile: controlled.profile.profile,
+    initialActivationId: setup.initialActivationId, databaseIdentityHash, implementationHead });
+  validateReviewBinding(review, config);
+  return { version: 'p10b-limited-free-smoke-preparation-v1', preparedAt,
+    opportunityId, initialActivationId: setup.initialActivationId,
+    executionAuthorized: false, ...LIMITED_EVIDENCE_FIELDS, review };
+}
+
 function authorizationWindow(now, expiresAt) {
   const nowMs = Date.parse(now);
   const expiryMs = Date.parse(expiresAt);
@@ -395,17 +516,87 @@ async function readP10bSyntheticCurrentAuthority({ storage, opportunityId }) {
     readSourceHealth: readP10bSyntheticSourceHealth });
 }
 
+function limitedReadinessInstant(value) {
+  const parsed = Date.parse(value || '');
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : '';
+}
+
+function normalizeLimitedSmokeReadiness(readiness = {}, { now } = {}) {
+  const generatedAt = limitedReadinessInstant(readiness.generatedAt);
+  const expiresAt = limitedReadinessInstant(readiness.expiresAt);
+  const canonical = {
+    version: 'cim-provider-readiness-v1',
+    limitedEvidenceVersion: 'p10b-limited-free-smoke-readiness-v1',
+    provider: String(readiness.provider || '').trim(),
+    providerProfile: String(readiness.providerProfile || '').trim(),
+    outboundConfigured: readiness.outboundConfigured === true,
+    senderConfigured: readiness.senderConfigured === true,
+    senderAuthenticationAttested: readiness.senderAuthenticationAttested === true,
+    sendingDomainVerified: readiness.sendingDomainVerified === true,
+    sendingDomain: normalizedDomain(readiness.sendingDomain),
+    apiKeyPermission: String(readiness.apiKeyPermission || '').trim(),
+    apiKeyDomainRestriction: normalizedDomain(readiness.apiKeyDomainRestriction),
+    suppressionOperational: readiness.suppressionOperational === true,
+    webhookConfigured: readiness.webhookConfigured === true,
+    requestReplyRoutingVerified: readiness.requestReplyRoutingVerified === true,
+    replyTrackingVerified: readiness.replyTrackingVerified === true,
+    reconciliationOperational: readiness.reconciliationOperational === true,
+    evidenceRevision: String(readiness.evidenceRevision || '').trim(),
+    generatedAt,
+    expiresAt,
+    ...LIMITED_EVIDENCE_FIELDS,
+  };
+  const blockerPairs = [
+    ['limited_readiness_version_invalid',
+      readiness.version === 'p10b-limited-free-smoke-readiness-v1'],
+    ['profile_mismatch', canonical.provider === 'resend'
+      && canonical.providerProfile === LIMITED_PROFILE],
+    ['provider_unavailable', canonical.outboundConfigured],
+    ['sender_unavailable', canonical.senderConfigured
+      && canonical.senderAuthenticationAttested],
+    ['limited_smoke_domain_unverified', canonical.sendingDomainVerified
+      && canonical.sendingDomain === P10B_LIMITED_SMOKE_SENDING_DOMAIN],
+    ['limited_smoke_key_scope_invalid', canonical.apiKeyPermission === 'sending-access'
+      && canonical.apiKeyDomainRestriction === P10B_LIMITED_SMOKE_SENDING_DOMAIN],
+    ['suppression_unavailable', canonical.suppressionOperational],
+    ['limited_smoke_inbound_claim_forbidden', !canonical.webhookConfigured
+      && !canonical.requestReplyRoutingVerified && !canonical.replyTrackingVerified],
+    ['limited_smoke_reconciliation_claim_forbidden', !canonical.reconciliationOperational],
+    ['readiness_evidence_unversioned', Boolean(canonical.evidenceRevision)],
+    ['readiness_evidence_time_invalid', Boolean(generatedAt && expiresAt)
+      && Date.parse(generatedAt) <= Date.parse(now)
+      && Date.parse(expiresAt) > Date.parse(now)],
+  ];
+  const blockers = blockerPairs.filter(([, passed]) => !passed).map(([code]) => code);
+  const authority = { ...canonical, blockers, ready: blockers.length === 0 };
+  return { ...authority, authorityDigest: sha256(stableCanonicalJson(authority)) };
+}
+
 function redactedEvidence({ review, finalization, cleanup, authorizationId, now, expiresAt,
-  readiness, finalizationStarted = false, executionError = null }) {
+  readiness, providerProfile = CONTROLLED_PROFILE, databaseIdentityHash = '',
+  implementationHead = '', finalizationStarted = false, executionError = null }) {
   const providerResult = finalization?.providerResult || {};
-  const outcome = finalization?.outcome?.category || (executionError ? 'execution-error' : 'authorization-denied');
+  const providerOutcome = finalization?.outcome?.category
+    || (executionError ? 'execution-error' : 'authorization-denied');
   const providerAttempted = providerResult.providerAttempted === true
     && providerResult.providerSeamEntered === true;
+  const limited = providerProfile === LIMITED_PROFILE;
+  const durableState = String(finalization?.durableResult?.transmission?.state || '');
+  const durableAcceptanceRecorded = providerOutcome === 'accepted'
+    && durableState === 'accepted' && finalization?.durableResult?.conflict !== true
+    && (finalization?.durableResult?.applied === true
+      || finalization?.durableResult?.existing === true);
+  const outcome = limited && providerOutcome === 'accepted' && !durableAcceptanceRecorded
+    ? 'ambiguous' : providerOutcome;
   return {
-    version: 'p10b-controlled-mailbox-evidence-v1',
+    version: limited ? 'p10b-limited-free-smoke-evidence-v1'
+      : 'p10b-controlled-mailbox-evidence-v1',
     observedAt: new Date(now).toISOString(),
     authorizationExpiresAt: expiresAt,
-    providerProfile: CONTROLLED_PROFILE,
+    providerProfile,
+    ...(limited ? { databaseIdentityHash, implementationHead, providerOutcome,
+      durableOutcome: durableState || 'unresolved', durableAcceptanceRecorded,
+      ...LIMITED_EVIDENCE_FIELDS } : {}),
     opportunityIdHash: sha256(review.opportunity.id),
     campaignIdHash: sha256(review.campaign.id),
     transmissionIdHash: sha256(review.transmission.id),
@@ -433,6 +624,7 @@ function redactedEvidence({ review, finalization, cleanup, authorizationId, now,
 async function cleanupExecution({ storage, services, authorizationId, initialActivationId,
   actor, now, armedConfig }) {
   armedConfig.dealHunter.cimProvider.enabled = false;
+  armedConfig.dealHunter.cimProvider.resendApiKey = '';
   const cleanup = { hardOffRestored: true, pauseRestored: false,
     authorizationClosed: false, authorizationWithdrawn: false,
     activationClosed: false, activationWithdrawn: false, errors: [] };
@@ -478,7 +670,7 @@ async function cleanupExecution({ storage, services, authorizationId, initialAct
   return cleanup;
 }
 
-export async function executeP10bControlledMailbox({
+async function executeP10b({
   storage,
   config,
   opportunityId,
@@ -489,6 +681,10 @@ export async function executeP10bControlledMailbox({
   actor,
   now = new Date().toISOString(),
   providerReadiness,
+  providerProfile = CONTROLLED_PROFILE,
+  expectedConfirmation = P10B_EXECUTION_CONFIRMATION,
+  databaseIdentityHash = '',
+  implementationHead = '',
   fetcher,
   testHooks,
   services = {},
@@ -496,18 +692,25 @@ export async function executeP10bControlledMailbox({
   boundedText(actor, 'actor', 200);
   boundedText(opportunityId, 'opportunity id', 200);
   boundedText(initialActivationId, 'initial activation id');
-  if (confirmation !== P10B_EXECUTION_CONFIRMATION) {
-    throw new Error(`P10B confirmation must equal ${P10B_EXECUTION_CONFIRMATION}`);
+  const limited = providerProfile === LIMITED_PROFILE;
+  if (confirmation !== expectedConfirmation) {
+    throw new Error(`P10B confirmation must equal ${expectedConfirmation}`);
   }
   if (!/^[0-9a-f]{64}$/.test(reviewDigest || '')) {
     throw new Error('P10B exact review digest is required');
   }
   const expiry = authorizationWindow(now, expiresAt);
-  const controlled = assertHardOffControlledConfig(config);
-  const readiness = normalizeCimProviderReadiness(providerReadiness, {
-    providerProfile: CONTROLLED_PROFILE, now,
-  });
-  if (!readiness.ready || readiness.providerProfile !== CONTROLLED_PROFILE) {
+  const controlled = limited
+    ? assertHardOffLimitedConfig(config, '', { execution: true })
+    : assertHardOffControlledConfig(config);
+  if (limited && (!/^[0-9a-f]{64}$/.test(databaseIdentityHash || '')
+    || !/^[0-9a-f]{40}$/.test(implementationHead || ''))) {
+    throw new Error('P10B limited smoke database identity and implementation head are required');
+  }
+  const readiness = limited
+    ? normalizeLimitedSmokeReadiness(providerReadiness, { now })
+    : normalizeCimProviderReadiness(providerReadiness, { providerProfile, now });
+  if (!readiness.ready || readiness.providerProfile !== providerProfile) {
     throw new Error(`P10B provider readiness is unavailable: ${readiness.blockers.join(',')
       || 'profile_mismatch'}`);
   }
@@ -517,8 +720,8 @@ export async function executeP10bControlledMailbox({
     throw new Error('P10B execution requires a paused, unauthorized prepared transmission');
   }
   const review = buildP10bReviewArtifact(report, { providerProfile: controlled.profile.profile,
-    initialActivationId });
-  validateReviewBinding(review, config);
+    initialActivationId, databaseIdentityHash, implementationHead });
+  validateReviewBinding(review, config, { execution: true });
   if (review.digest !== reviewDigest) throw new Error('P10B review digest does not match durable state');
   const authorizationId = `p10b-${sha256(stableCanonicalJson({ transmissionId: review.transmission.id,
     reviewDigest, expiresAt: expiry, actor })).slice(0, 48)}`;
@@ -545,7 +748,7 @@ export async function executeP10bControlledMailbox({
       writerPath: 'pursue-cim-initial', transmissionId: review.transmission.id,
       payloadDigest: review.transmission.payloadDigest,
       recipientAuthorityDigest: review.recipientAuthority.fingerprint,
-      providerProfile: CONTROLLED_PROFILE, expiresAt: expiry, actor,
+      providerProfile, expiresAt: expiry, actor,
       reason: `P10B exact reviewed transmission ${reviewDigest}`, now: new Date(now).toISOString() });
     if (issued?.issued !== true || issued.authorization?.maximum_calls !== 1
       || issued.authorization?.id !== authorizationId) {
@@ -555,7 +758,7 @@ export async function executeP10bControlledMailbox({
     await setPause({ paused: false, actor,
       reason: `P10B bounded authorization ${sha256(authorizationId)}`, storage });
     const gate = await authorizePrepared({ storage, transmissionId: review.transmission.id,
-      authorizationId, writerPath: 'pursue-cim-initial', providerProfile: CONTROLLED_PROFILE,
+      authorizationId, writerPath: 'pursue-cim-initial', providerProfile,
       actor, now: new Date(now).toISOString(), configOverride: armedConfig,
       readCurrentAuthority: readP10bSyntheticCurrentAuthority,
       readProviderReadiness: async () => readiness });
@@ -566,7 +769,7 @@ export async function executeP10bControlledMailbox({
     }
     finalizationStarted = true;
     finalization = await finalizeAuthorized({ storage, finalGateResult: gate,
-      authorizationId, writerPath: 'pursue-cim-initial', providerProfile: CONTROLLED_PROFILE,
+      authorizationId, writerPath: 'pursue-cim-initial', providerProfile,
       actor, now: new Date(now), configOverride: armedConfig, fetcher, testHooks });
   } catch (error) {
     executionError = error;
@@ -579,16 +782,110 @@ export async function executeP10bControlledMailbox({
     error.code = 'P10B_CLEANUP_FAILED';
     error.cause = executionError;
     error.p10bEvidence = redactedEvidence({ review, finalization, cleanup, authorizationId,
-      now, expiresAt: expiry, readiness, finalizationStarted,
+      now, expiresAt: expiry, readiness, providerProfile, databaseIdentityHash,
+      implementationHead, finalizationStarted,
       executionError: executionError || error });
     throw error;
   }
   if (executionError) {
     executionError.p10bEvidence = redactedEvidence({ review, finalization, cleanup,
-      authorizationId, now, expiresAt: expiry, readiness, finalizationStarted, executionError });
+      authorizationId, now, expiresAt: expiry, readiness, providerProfile,
+      databaseIdentityHash, implementationHead, finalizationStarted, executionError });
     throw executionError;
   }
-  return { version: 'p10b-controlled-mailbox-execution-v1',
+  return { version: limited ? 'p10b-limited-free-smoke-execution-v1'
+    : 'p10b-controlled-mailbox-execution-v1',
     evidence: redactedEvidence({ review, finalization, cleanup, authorizationId,
-      now, expiresAt: expiry, readiness, finalizationStarted }) };
+      now, expiresAt: expiry, readiness, providerProfile, databaseIdentityHash,
+      implementationHead, finalizationStarted }) };
+}
+
+export async function executeP10bControlledMailbox(options = {}) {
+  return executeP10b({ ...options, providerProfile: CONTROLLED_PROFILE,
+    expectedConfirmation: P10B_EXECUTION_CONFIRMATION });
+}
+
+export async function executeP10bLimitedFreeSmoke(options = {}) {
+  return executeP10b({ ...options, providerProfile: LIMITED_PROFILE,
+    expectedConfirmation: P10B_LIMITED_SMOKE_CONFIRMATION });
+}
+
+export function buildP10bLimitedSmokePostRunAttestation({
+  runEvidenceRaw,
+  review,
+  actor,
+  observedAt,
+  keyPermission,
+  keyDomainScope,
+  keyRevokedAt,
+  secretRemovedAt,
+  manualReceiptObserved = false,
+  manualReceiptObservedAt = '',
+} = {}) {
+  boundedText(actor, 'attestation actor', 200);
+  if (typeof runEvidenceRaw !== 'string' || runEvidenceRaw.length < 2) {
+    throw new Error('P10B limited smoke raw run evidence is required');
+  }
+  let evidence;
+  try { evidence = JSON.parse(runEvidenceRaw); }
+  catch { throw new Error('P10B limited smoke run evidence must be valid JSON'); }
+  const preparationReview = review?.review;
+  if (evidence?.version !== 'p10b-limited-free-smoke-evidence-v1'
+    || preparationReview?.version !== 'p10b-limited-free-smoke-review-v1'
+    || evidence.reviewDigest !== preparationReview.digest
+    || evidence.databaseIdentityHash !== preparationReview.databaseIdentityHash
+    || evidence.implementationHead !== preparationReview.implementationHead
+    || !/^[0-9a-f]{64}$/.test(evidence.authorizationIdHash || '')
+    || !/^[0-9a-f]{40}$/.test(evidence.implementationHead || '')
+    || typeof evidence.durableAcceptanceRecorded !== 'boolean'
+    || Object.entries(LIMITED_EVIDENCE_FIELDS)
+      .some(([name, value]) => evidence[name] !== value || preparationReview[name] !== value)) {
+    throw new Error('P10B limited smoke evidence binding is invalid');
+  }
+  const observed = limitedReadinessInstant(observedAt);
+  const revoked = limitedReadinessInstant(keyRevokedAt);
+  const removed = limitedReadinessInstant(secretRemovedAt);
+  const receiptAt = manualReceiptObserved
+    ? limitedReadinessInstant(manualReceiptObservedAt) : '';
+  if (!observed || !revoked || !removed || Date.parse(revoked) > Date.parse(observed)
+    || Date.parse(removed) > Date.parse(observed)
+    || (manualReceiptObserved && (!receiptAt || Date.parse(receiptAt) > Date.parse(observed)))
+    || (!manualReceiptObserved && manualReceiptObservedAt)) {
+    throw new Error('P10B limited smoke post-run attestation timestamps are invalid');
+  }
+  if (keyPermission !== 'sending-access'
+    || normalizedDomain(keyDomainScope) !== P10B_LIMITED_SMOKE_SENDING_DOMAIN) {
+    throw new Error('P10B limited smoke key-scope attestation is invalid');
+  }
+  const cleanup = evidence.cleanup || {};
+  const runCleanupComplete = cleanup.hardOffRestored === true
+    && cleanup.pauseRestored === true && cleanup.authorizationClosed === true
+    && cleanup.activationClosed === true && Array.isArray(cleanup.errors)
+    && cleanup.errors.length === 0;
+  return {
+    version: 'p10b-limited-free-smoke-post-run-attestation-v1',
+    observedAt: observed,
+    actor: boundedText(actor, 'attestation actor', 200),
+    runEvidenceDigest: sha256(runEvidenceRaw),
+    reviewDigest: evidence.reviewDigest,
+    databaseIdentityHash: evidence.databaseIdentityHash,
+    implementationHead: evidence.implementationHead,
+    authorizationIdHash: evidence.authorizationIdHash,
+    executionObservedAt: evidence.observedAt,
+    keyPermissionAttested: keyPermission,
+    keyDomainScopeAttested: normalizedDomain(keyDomainScope),
+    keyRevokedAt: revoked,
+    secretRemovedAt: removed,
+    manualReceiptObserved: manualReceiptObserved === true,
+    manualReceiptObservedAt: receiptAt,
+    manualReceiptObservedBy: manualReceiptObserved ? actor : '',
+    manualAttestation: true,
+    trustedLifecycleEvidence: false,
+    runCleanupComplete,
+    limitedSmokeSuccessful: evidence.providerCalls === 1
+      && evidence.outcome === 'accepted' && evidence.providerOutcome === 'accepted'
+      && evidence.durableOutcome === 'accepted'
+      && evidence.durableAcceptanceRecorded === true && runCleanupComplete,
+    ...LIMITED_EVIDENCE_FIELDS,
+  };
 }
