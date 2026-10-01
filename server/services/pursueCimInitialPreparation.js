@@ -1,6 +1,10 @@
 import { createHash, randomBytes } from 'node:crypto';
 
-import { getConfig } from '../config.js';
+import {
+  getCimProviderDeliveryConfig,
+  getConfig,
+  validateCimProviderProfileBinding,
+} from '../config.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { loadBrokerMaterialsAuthority } from './dealHunterBrokerMaterials.js';
 import {
@@ -18,9 +22,10 @@ function recipientFingerprint(opportunityId, recipient) {
     contactAuthorityRevision: recipient.contactAuthorityRevision }));
 }
 
-function proposal(candidate, authority, recipient) {
-  const config = getConfig();
-  const fromAddress = config.delivery.resendFromEmail || config.delivery.fallbackRecipient;
+function proposal(candidate, authority, recipient, config) {
+  const deliveryConfig = getCimProviderDeliveryConfig(config);
+  const fromAddress = deliveryConfig.delivery.resendFromEmail
+    || deliveryConfig.delivery.fallbackRecipient;
   if (!fromAddress || !recipient.email) throw new Error('CIM sender or recipient unavailable');
   const field = (name) => authority.sourceRows.find((row) => row.field === name)?.value || '';
   const message = buildDealHunterCimRequestEmail({
@@ -39,6 +44,7 @@ function proposal(candidate, authority, recipient) {
     cimRequestId: candidate.touch_id,
     submissionId: candidate.crm_submission_id,
     manualStage1: { greeting: recipient.firstName ? `Hi ${recipient.firstName},` : 'Hello,' },
+    configOverride: deliveryConfig,
   });
   const tags = normalizeResendTags([
     ...message.tags,
@@ -47,7 +53,7 @@ function proposal(candidate, authority, recipient) {
   ])
     .map(({ name, value }) => `${name}=${value}`);
   if (tags.some((tag) => tag.length > 120)) throw new Error('CIM tag exceeds storage bound');
-  return {
+  const payload = {
     payloadVersion: message.templateVersion,
     fromAddress,
     toAddresses: [recipient.email], ccAddresses: [], bccAddresses: [],
@@ -60,10 +66,23 @@ function proposal(candidate, authority, recipient) {
     bodyHtmlSanitized: message.html,
     tags,
   };
+  const profileBinding = validateCimProviderProfileBinding(config, {
+    providerProfile: config.dealHunter?.cimProvider?.profile,
+    fromAddress: payload.fromAddress,
+    toAddresses: payload.toAddresses,
+    ccAddresses: payload.ccAddresses,
+    bccAddresses: payload.bccAddresses,
+    replyToAddress: payload.replyToAddress,
+  });
+  if (!profileBinding.ok) {
+    throw new Error(`CIM provider profile invalid: ${profileBinding.blockers.join(',')}`);
+  }
+  return payload;
 }
 
 export async function runDueCimInitialPreparations({ storage, now, clock, limit = 25,
-  actor = 'pursue-cim-initial-preparer', loadAuthority = loadBrokerMaterialsAuthority } = {}) {
+  actor = 'pursue-cim-initial-preparer', loadAuthority = loadBrokerMaterialsAuthority,
+  configOverride } = {}) {
   if (!storage?.listDueCimInitialTouches || !storage?.claimDueCimTouch
     || !storage?.prepareCimTransmission) throw new Error('CIM storage transitions unavailable');
   const instant = () => {
@@ -73,6 +92,7 @@ export async function runDueCimInitialPreparations({ storage, now, clock, limit 
   };
   const candidates = await storage.listDueCimInitialTouches({
     now: instant().toISOString(), limit });
+  const config = configOverride || getConfig();
   const outcomes = [];
   for (const candidate of candidates) {
     if (candidate.kind !== 'initial') throw new Error('Non-initial CIM touch reached Package 5');
@@ -109,7 +129,7 @@ export async function runDueCimInitialPreparations({ storage, now, clock, limit 
           prepared: false, staleAuthority: true });
         continue;
       }
-      const payload = proposal(candidate, authority, recipient);
+      const payload = proposal(candidate, authority, recipient, config);
       const result = await storage.prepareCimTransmission({
         touchIds: [candidate.touch_id], claimTokenDigest,
         expectedCampaignTerminalRevision: Number(candidate.campaign_terminal_revision),

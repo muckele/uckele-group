@@ -1,4 +1,8 @@
-import { getConfig } from '../config.js';
+import {
+  getCimProviderDeliveryConfig,
+  getConfig,
+  validateCimProviderProfileBinding,
+} from '../config.js';
 import { fetchWithTimeout } from '../utils/http.js';
 import { classifyCimProtectedWork, enterCimProviderBoundary } from './cimProviderBoundary.js';
 import { canonicalDailyDealHunterMailbox } from './dailyDealHunterDigest.js';
@@ -537,6 +541,7 @@ async function sendMessage(message, {
   configOverride, fetcher, cimProviderAuthorization, storage, now, testHooks = {},
 } = {}) {
   const config = configOverride || getConfig();
+  let deliveryConfig = config;
   let result;
   let providerAttempted = false;
   let providerSeamEntered = false;
@@ -564,16 +569,6 @@ async function sendMessage(message, {
         providerMessageId: '',
       };
     }
-    if (config.delivery.provider !== 'resend') {
-      return {
-        status: 'failed',
-        error: 'The selected provider profile is not eligible for CIM outreach.',
-        errorCategory: 'cim-provider-profile-mismatch',
-        definitiveFailure: true,
-        provider: config.delivery.provider,
-        providerMessageId: '',
-      };
-    }
     if (!config.dealHunter?.cimProvider?.profile
       || cimProviderAuthorization.providerProfile !== config.dealHunter.cimProvider.profile) {
       return {
@@ -582,6 +577,36 @@ async function sendMessage(message, {
         errorCategory: 'cim-provider-profile-mismatch',
         definitiveFailure: true,
         provider: config.delivery.provider,
+        providerMessageId: '',
+      };
+    }
+    deliveryConfig = getCimProviderDeliveryConfig(config);
+    const profileBinding = validateCimProviderProfileBinding(config, {
+      providerProfile: cimProviderAuthorization.providerProfile,
+      fromAddress: message.from || deliveryConfig.delivery.resendFromEmail,
+      toAddresses: normalizeRecipients(message.to),
+      ccAddresses: normalizeRecipients(message.cc),
+      bccAddresses: normalizeRecipients(message.bcc),
+      replyToAddress: message.replyTo,
+    });
+    if (!profileBinding.ok) {
+      return {
+        status: 'failed',
+        error: 'The CIM message does not match the selected provider profile.',
+        errorCategory: 'cim-provider-profile-invalid',
+        profileBlockers: profileBinding.blockers,
+        definitiveFailure: true,
+        provider: deliveryConfig.delivery.provider,
+        providerMessageId: '',
+      };
+    }
+    if (deliveryConfig.delivery.provider !== 'resend') {
+      return {
+        status: 'failed',
+        error: 'The selected provider profile is not eligible for CIM outreach.',
+        errorCategory: 'cim-provider-profile-mismatch',
+        definitiveFailure: true,
+        provider: deliveryConfig.delivery.provider,
         providerMessageId: '',
       };
     }
@@ -595,7 +620,7 @@ async function sendMessage(message, {
         errorCategory: boundary.errorCategory,
         definitiveFailure: true,
         reconciliationOnly: boundary.reconciliationOnly === true,
-        provider: config.delivery.provider,
+        provider: deliveryConfig.delivery.provider,
         providerMessageId: '',
       };
     }
@@ -605,14 +630,14 @@ async function sendMessage(message, {
   }
 
   if (message.kind === dailyDealHunterMessageKind
-    && (['emailjs', 'formspree'].includes(config.delivery.provider)
-      || (config.delivery.provider === 'console' && config.isProduction))) {
+    && (['emailjs', 'formspree'].includes(deliveryConfig.delivery.provider)
+      || (deliveryConfig.delivery.provider === 'console' && deliveryConfig.isProduction))) {
     return {
       status: 'failed',
       error: 'Daily Deal Hunter delivery requires Resend acceptance identity and reconciliation support.',
       errorCategory: 'provider-ineligible',
       definitiveFailure: true,
-      provider: config.delivery.provider,
+      provider: deliveryConfig.delivery.provider,
       providerMessageId: '',
     };
   }
@@ -622,7 +647,7 @@ async function sendMessage(message, {
   // A process failure after acceptance could therefore make a retry duplicate
   // private broker outreach. Keep EmailJS available for ordinary application
   // mail, but fail closed before the network for every CIM send entry point.
-  if (config.delivery.provider === 'emailjs' && cimMessageKinds.has(message.kind)) {
+  if (deliveryConfig.delivery.provider === 'emailjs' && cimMessageKinds.has(message.kind)) {
     return {
       status: 'failed',
       error: 'EmailJS is not eligible for CIM outreach because provider acceptance cannot be reconciled idempotently. Configure Resend, or use the console provider for development-only verification.',
@@ -631,9 +656,9 @@ async function sendMessage(message, {
   }
 
   try {
-    switch (config.delivery.provider) {
+    switch (deliveryConfig.delivery.provider) {
       case 'resend':
-        result = await sendViaResend(message, { config, fetcher,
+        result = await sendViaResend(message, { config: deliveryConfig, fetcher,
           onProviderAttempt: () => { providerAttempted = true; } });
         break;
       case 'emailjs':
@@ -648,15 +673,15 @@ async function sendMessage(message, {
         break;
     }
   } catch (error) {
-    const providerOutcomeAmbiguous = config.delivery.provider === 'resend'
+    const providerOutcomeAmbiguous = deliveryConfig.delivery.provider === 'resend'
       && resendIdentityMessageKinds.has(message.kind);
     result = {
       status: providerOutcomeAmbiguous ? 'ambiguous' : 'failed',
       error: providerOutcomeAmbiguous
         ? `Resend delivery outcome is ambiguous: ${error.message}. Reconcile the persisted communication before any retry.`
-        : `${config.delivery.provider} delivery failed: ${error.message}`,
+        : `${deliveryConfig.delivery.provider} delivery failed: ${error.message}`,
       providerMessageId: '',
-      provider: config.delivery.provider,
+      provider: deliveryConfig.delivery.provider,
       errorCategory: providerOutcomeAmbiguous ? providerErrorCategory(error) : 'provider-error',
       definitiveFailure: !providerOutcomeAmbiguous,
       providerOutcomeAmbiguous,
@@ -1221,8 +1246,9 @@ export function buildDealHunterCimRequestEmail({
   submissionId = '',
   communicationId = '',
   manualStage1 = null,
+  configOverride,
 } = {}) {
-  const config = getConfig();
+  const config = configOverride || getConfig();
   const manualTemplate = manualStage1 !== null && manualStage1 !== undefined;
   let manualGreeting = '';
   if (manualTemplate) {

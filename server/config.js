@@ -44,6 +44,151 @@ function numberListFromEnv(value, fallback = []) {
   return values.length > 0 ? values : fallback;
 }
 
+export const CONTROLLED_CIM_MAILBOX_PROFILE = 'controlled-mailbox-v1';
+export const PRODUCTION_CIM_PROVIDER_PROFILE = 'production-resend-v1';
+
+function emailAddress(value) {
+  const candidate = String(value || '').trim();
+  const match = candidate.match(/^(?:[^<>\r\n,;]+\s)?<([^<>\s@,;]+@[^<>\s@,;]+\.[^<>\s@,;]+)>$/)
+    || candidate.match(/^([^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+)$/);
+  return String(match?.[1] || match?.[0] || '').toLowerCase();
+}
+
+function emailDomain(value) {
+  return emailAddress(value).split('@')[1] || '';
+}
+
+export function resolveCimProviderProfile(environment = process.env) {
+  const enabled = environment.DEAL_HUNTER_CIM_PROVIDER_ENABLED === 'true';
+  const profile = String(environment.DEAL_HUNTER_CIM_PROVIDER_PROFILE || '').trim();
+  if (profile === CONTROLLED_CIM_MAILBOX_PROFILE) {
+    return {
+      enabled,
+      profile,
+      mode: 'controlled-mailbox',
+      provider: 'resend',
+      resendApiKey: environment.DEAL_HUNTER_CIM_MAILBOX_RESEND_API_KEY || '',
+      resendFromEmail: environment.DEAL_HUNTER_CIM_MAILBOX_FROM_EMAIL || '',
+      resendReplyTo: environment.DEAL_HUNTER_CIM_MAILBOX_REPLY_TO || '',
+      resendInboundDomain: environment.DEAL_HUNTER_CIM_MAILBOX_INBOUND_DOMAIN || '',
+      emailWebhookSecret: environment.DEAL_HUNTER_CIM_MAILBOX_WEBHOOK_SECRET || '',
+      reconciliationApiKey:
+        environment.DEAL_HUNTER_CIM_MAILBOX_RECONCILIATION_API_KEY || '',
+      allowedRecipients: listFromEnv(
+        environment.DEAL_HUNTER_CIM_MAILBOX_ALLOWED_RECIPIENTS,
+      ),
+    };
+  }
+  if (profile === PRODUCTION_CIM_PROVIDER_PROFILE) {
+    return {
+      enabled,
+      profile,
+      mode: 'production',
+      provider: 'resend',
+      resendApiKey: environment.RESEND_API_KEY || '',
+      resendFromEmail: environment.RESEND_FROM_EMAIL || '',
+      resendReplyTo: environment.RESEND_REPLY_TO || '',
+      resendInboundDomain: environment.RESEND_INBOUND_DOMAIN || '',
+      emailWebhookSecret:
+        environment.EMAIL_WEBHOOK_SECRET || environment.RESEND_WEBHOOK_SECRET || '',
+      reconciliationApiKey: environment.RESEND_API_KEY || '',
+      allowedRecipients: [],
+    };
+  }
+  return { enabled, profile, mode: 'unknown', provider: '', resendApiKey: '',
+    resendFromEmail: '', resendReplyTo: '', resendInboundDomain: '',
+    emailWebhookSecret: '', reconciliationApiKey: '', allowedRecipients: [] };
+}
+
+export function getCimProviderDeliveryConfig(config) {
+  const profile = config?.dealHunter?.cimProvider;
+  if (!['controlled-mailbox', 'production'].includes(profile?.mode)) return config;
+  return {
+    ...config,
+    delivery: {
+      ...(config?.delivery || {}),
+      provider: profile.provider,
+      resendApiKey: profile.resendApiKey,
+      resendFromEmail: profile.resendFromEmail,
+      resendReplyTo: profile.resendReplyTo,
+      resendInboundDomain: profile.resendInboundDomain,
+      emailWebhookSecret: profile.emailWebhookSecret,
+    },
+  };
+}
+
+export function getCimWebhookAuthority(config) {
+  const profile = config?.dealHunter?.cimProvider;
+  if (profile?.mode === 'controlled-mailbox') {
+    return { providerProfile: profile.profile, secret: profile.emailWebhookSecret,
+      requireSignedProviderEvent: true };
+  }
+  return { providerProfile: profile?.profile || '',
+    secret: config?.delivery?.emailWebhookSecret || '', requireSignedProviderEvent: false };
+}
+
+export function getCimProviderReconciliationConfig(config) {
+  const profile = config?.dealHunter?.cimProvider;
+  if (profile?.mode === 'controlled-mailbox') {
+    return { providerProfile: profile.profile, provider: profile.provider,
+      apiKey: profile.reconciliationApiKey };
+  }
+  return { providerProfile: profile?.profile || '', provider: 'resend',
+    apiKey: profile?.mode === 'production'
+      ? profile.reconciliationApiKey : config?.delivery?.resendApiKey || '' };
+}
+
+export function validateCimProviderProfileBinding(config, binding = {}) {
+  const profile = config?.dealHunter?.cimProvider;
+  const selectedControlled = profile?.mode === 'controlled-mailbox';
+  const requestedControlled = binding.providerProfile === CONTROLLED_CIM_MAILBOX_PROFILE;
+  if (!selectedControlled && !requestedControlled) return { ok: true, blockers: [] };
+  const blockers = [];
+  if (!selectedControlled || profile.profile !== CONTROLLED_CIM_MAILBOX_PROFILE
+    || binding.providerProfile !== profile.profile || profile.provider !== 'resend') {
+    blockers.push('profile_mismatch');
+  }
+  if (!profile?.resendApiKey || !profile?.resendFromEmail) {
+    blockers.push('outbound_credentials_missing');
+  }
+  if (!profile?.emailWebhookSecret) blockers.push('signed_webhook_missing');
+  if (!profile?.reconciliationApiKey) blockers.push('reconciliation_credentials_missing');
+  const configuredRecipients = Array.isArray(profile?.allowedRecipients)
+    ? profile.allowedRecipients : [];
+  const allowedRecipients = Array.from(new Set(configuredRecipients
+    .map(emailAddress).filter(Boolean)));
+  if (allowedRecipients.length !== 1
+    || configuredRecipients.length !== 1) {
+    blockers.push('mailbox_recipient_allowlist_invalid');
+  }
+  const rawToAddresses = Array.isArray(binding.toAddresses) ? binding.toAddresses : [];
+  const rawCcAddresses = Array.isArray(binding.ccAddresses) ? binding.ccAddresses : [];
+  const rawBccAddresses = Array.isArray(binding.bccAddresses) ? binding.bccAddresses : [];
+  const toAddresses = rawToAddresses
+    .map(emailAddress).filter(Boolean);
+  const ccAddresses = rawCcAddresses
+    .map(emailAddress).filter(Boolean);
+  const bccAddresses = rawBccAddresses
+    .map(emailAddress).filter(Boolean);
+  if (allowedRecipients.length !== 1 || toAddresses.length !== 1
+    || rawToAddresses.length !== toAddresses.length
+    || rawCcAddresses.length !== ccAddresses.length
+    || rawBccAddresses.length !== bccAddresses.length
+    || toAddresses[0] !== allowedRecipients[0] || rawCcAddresses.length > 0
+    || rawBccAddresses.length > 0) blockers.push('mailbox_recipient_mismatch');
+  if (!emailAddress(binding.fromAddress)
+    || emailAddress(binding.fromAddress) !== emailAddress(profile?.resendFromEmail)) {
+    blockers.push('mailbox_sender_mismatch');
+  }
+  const inboundDomain = String(profile?.resendInboundDomain || '').trim().toLowerCase();
+  if (!inboundDomain || emailDomain(binding.replyToAddress) !== inboundDomain
+    || emailDomain(profile?.resendReplyTo) !== inboundDomain) {
+    blockers.push('mailbox_reply_domain_mismatch');
+  }
+  const uniqueBlockers = Array.from(new Set(blockers));
+  return { ok: uniqueBlockers.length === 0, blockers: uniqueBlockers };
+}
+
 let cachedConfig;
 
 export function getConfig() {
@@ -63,6 +208,8 @@ export function getConfig() {
   const viewerEmails = listFromEnv(process.env.ADMIN_VIEWER_EMAILS || process.env.SMB_DEAL_HUNTER_VIEWER_EMAILS);
   const sqlitePath = process.env.SQLITE_PATH || path.join(rootDir, 'data', 'uckele-group.sqlite');
   const defaultDataDir = path.dirname(sqlitePath);
+  const cimProvider = resolveCimProviderProfile();
+  const controlledMailbox = cimProvider.mode === 'controlled-mailbox';
 
   cachedConfig = {
     rootDir,
@@ -88,13 +235,14 @@ export function getConfig() {
       checkIntervalMs: Math.max(60_000, numberFromEnv(process.env.BACKUP_CHECK_INTERVAL_MS, 1000 * 60 * 15)),
     },
     delivery: {
-      provider: process.env.DELIVERY_PROVIDER || 'console',
+      provider: controlledMailbox ? 'console' : process.env.DELIVERY_PROVIDER || 'console',
       fallbackRecipient: process.env.LEAD_NOTIFICATION_EMAIL || (isProduction ? '' : 'mathew@example.com'),
-      resendApiKey: process.env.RESEND_API_KEY || '',
-      resendFromEmail: process.env.RESEND_FROM_EMAIL || '',
-      resendReplyTo: process.env.RESEND_REPLY_TO || '',
-      resendInboundDomain: process.env.RESEND_INBOUND_DOMAIN || '',
-      emailWebhookSecret: process.env.EMAIL_WEBHOOK_SECRET || process.env.RESEND_WEBHOOK_SECRET || '',
+      resendApiKey: controlledMailbox ? '' : process.env.RESEND_API_KEY || '',
+      resendFromEmail: controlledMailbox ? '' : process.env.RESEND_FROM_EMAIL || '',
+      resendReplyTo: controlledMailbox ? '' : process.env.RESEND_REPLY_TO || '',
+      resendInboundDomain: controlledMailbox ? '' : process.env.RESEND_INBOUND_DOMAIN || '',
+      emailWebhookSecret: controlledMailbox
+        ? '' : process.env.EMAIL_WEBHOOK_SECRET || process.env.RESEND_WEBHOOK_SECRET || '',
       formspreeEndpoint: process.env.FORMSPREE_ENDPOINT || '',
       emailjsServiceId: process.env.EMAILJS_SERVICE_ID || '',
       emailjsTemplateId: process.env.EMAILJS_TEMPLATE_ID || '',
@@ -161,8 +309,10 @@ export function getConfig() {
       maxTouches: Math.max(1, Math.min(numberFromEnv(process.env.FOLLOW_UP_MAX_TOUCHES, 3), 10)),
       cadenceHours: numberListFromEnv(process.env.FOLLOW_UP_CADENCE_HOURS, [48, 72, 96]).slice(0, 10),
       senderName: process.env.FOLLOW_UP_SENDER_NAME || process.env.EMAIL_BRAND_COMPANY_NAME || 'Uckele Group',
-      senderEmail: process.env.FOLLOW_UP_SENDER_EMAIL || process.env.RESEND_FROM_EMAIL || '',
-      replyTo: process.env.FOLLOW_UP_REPLY_TO || process.env.RESEND_REPLY_TO || '',
+      senderEmail: controlledMailbox
+        ? '' : process.env.FOLLOW_UP_SENDER_EMAIL || process.env.RESEND_FROM_EMAIL || '',
+      replyTo: controlledMailbox
+        ? '' : process.env.FOLLOW_UP_REPLY_TO || process.env.RESEND_REPLY_TO || '',
       requireSignedPreview: booleanFromEnv(process.env.FOLLOW_UP_REQUIRE_SIGNED_PREVIEW, true),
       requireVerifiedReply: booleanFromEnv(process.env.FOLLOW_UP_REQUIRE_VERIFIED_REPLY, isProduction),
       physicalPostalAddress: process.env.FOLLOW_UP_PHYSICAL_POSTAL_ADDRESS || process.env.EMAIL_BRAND_MAILING_ADDRESS || '',
@@ -173,8 +323,7 @@ export function getConfig() {
       recipient: process.env.DEAL_HUNTER_EMAIL_RECIPIENT || adminEmail,
       cronSecret: process.env.DEAL_HUNTER_CRON_SECRET || '',
       cimProvider: {
-        enabled: process.env.DEAL_HUNTER_CIM_PROVIDER_ENABLED === 'true',
-        profile: process.env.DEAL_HUNTER_CIM_PROVIDER_PROFILE || '',
+        ...cimProvider,
       },
       sheetCsvUrls: listFromEnv(process.env.DEAL_HUNTER_SHEET_CSV_URLS || process.env.DEAL_HUNTER_SHEET_CSV_URL),
       // Airtable is retired from Deal Hunter. Keep the public configuration

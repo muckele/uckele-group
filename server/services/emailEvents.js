@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from 'node:crypto';
-import { getConfig } from '../config.js';
+import { getCimWebhookAuthority, getConfig } from '../config.js';
 import { getStorage } from '../storage/index.js';
 import { safeCompareText } from '../utils/security.js';
 import { commitCrmActivityMutation } from './activity.js';
@@ -219,14 +219,16 @@ function verifySvixSignature(request, secret) {
   return signatures.some((item) => safeCompareText(item.signature, digest));
 }
 
-function authorizeWebhook(request) {
-  const config = getConfig();
-  const expectedSecret = config.delivery.emailWebhookSecret;
+function authorizeWebhook(request, configOverride) {
+  const config = configOverride || getConfig();
+  const authority = getCimWebhookAuthority(config);
+  const expectedSecret = authority.secret;
 
   if (!expectedSecret) {
     return {
-      ok: !config.isProduction,
+      ok: !config.isProduction && !authority.requireSignedProviderEvent,
       error: 'Email webhook events require EMAIL_WEBHOOK_SECRET or RESEND_WEBHOOK_SECRET in production.',
+      ...authority,
     };
   }
 
@@ -234,13 +236,19 @@ function authorizeWebhook(request) {
     return {
       ok: verifySvixSignature(request, expectedSecret),
       error: 'Invalid email webhook signature.',
+      ...authority,
     };
+  }
+
+  if (authority.requireSignedProviderEvent) {
+    return { ok: false, error: 'A signed provider event is required.', ...authority };
   }
 
   const providedSecret = extractWebhookSecret(request);
   return {
     ok: Boolean(providedSecret) && safeCompareText(providedSecret, expectedSecret),
     error: 'Invalid email webhook secret.',
+    ...authority,
   };
 }
 
@@ -569,8 +577,10 @@ export async function recordEmailEventsFromWebhook(request, {
   storage = getStorage(),
   fetcher,
   reconcileDailyDigestWebhook = reconcileDailyDealHunterWebhookEvent,
+  configOverride,
 } = {}) {
-  const authorization = authorizeWebhook(request);
+  const config = configOverride || getConfig();
+  const authorization = authorizeWebhook(request, config);
 
   if (!authorization.ok) {
     return {
@@ -616,14 +626,21 @@ export async function recordEmailEventsFromWebhook(request, {
       event_type: normalizeEmailEventType(eventInput.event_type),
       message_id: normalizeText(eventInput.message_id, 240) || null,
       created_at: normalizeEventDate(eventInput.created_at),
-      metadata: boundedEmailEventMetadata(eventInput.metadata),
+      metadata: boundedEmailEventMetadata({ ...eventInput.metadata,
+        cimProviderProfile: authorization.providerProfile,
+        signedProviderEvent: signedSvix }),
     };
     const internalDailyDigest = hasDailyDealHunterTagIdentity(authorityEvent);
     let inbound = null;
 
     if (!internalDailyDigest && storage.resolvePursueCimInboundEvidence) {
       try {
-        inbound = await applyVerifiedPursueCimInbound(authorityEvent, { storage });
+        inbound = await applyVerifiedPursueCimInbound(authorityEvent, { storage,
+          profileBinding: authorization.requireSignedProviderEvent ? {
+            providerProfile: authorization.providerProfile,
+            replyDomain: config.dealHunter?.cimProvider?.resendInboundDomain || '',
+            requireExactReplyAlias: true,
+          } : null });
       } catch {
         return {
           ok: false,
@@ -676,7 +693,8 @@ export async function recordEmailEventsFromWebhook(request, {
     if (normalizeText(eventInput.metadata?.rawType, 80).toLowerCase().replace(/_/g, '.') === 'email.received') {
       let result;
       try {
-        result = await ingestResendReceivedEmail({ event, storage, fetcher });
+        result = await ingestResendReceivedEmail({ event, storage, fetcher,
+          configOverride: config });
       } catch {
         return {
           ok: false,

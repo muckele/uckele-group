@@ -1,3 +1,5 @@
+import { getCimProviderReconciliationConfig } from '../config.js';
+import { fetchWithTimeout } from '../utils/http.js';
 import { createCimProviderBoundaryAuthorization } from './cimProviderBoundary.js';
 import { deriveAcceptedCimCadence } from './pursueCimCadence.js';
 import { sendPreparedMessage } from './delivery.js';
@@ -248,8 +250,8 @@ function normalizedAddresses(value, name) {
   return [...candidate];
 }
 
-function immutableTransmissionBinding(transmission) {
-  return {
+function immutableTransmissionBinding(transmission, providerProfile = '') {
+  const binding = {
     transmissionId: requiredEvidenceText(transmission?.id, 'transmission.id', 240),
     payloadDigest: requiredEvidenceText(transmission?.payload_digest,
       'transmission.payload_digest', 64),
@@ -263,13 +265,19 @@ function immutableTransmissionBinding(transmission) {
       'transmission.reply_to_address', 320),
     subject: requiredEvidenceText(transmission?.subject, 'transmission.subject', 998),
   };
+  return providerProfile
+    ? { ...binding, providerProfile: requiredEvidenceText(providerProfile, 'providerProfile', 120) }
+    : binding;
 }
 
-function normalizeProviderProof(proof, expectedBinding) {
+function normalizeProviderProof(proof, expectedBinding, providerProfile = '') {
   if (!proof || typeof proof !== 'object' || Array.isArray(proof)) return null;
   const evidence = normalizeReconciliationEvidence({ type: proof.type, id: proof.id,
     digest: '0'.repeat(64), observedAt: proof.observedAt });
   if (proof.provider !== 'resend') throw new Error('Reconciliation proof must come from Resend');
+  if (providerProfile && proof.providerProfile !== providerProfile) {
+    throw new Error('Reconciliation proof does not match the provider profile');
+  }
   if (!['accepted', 'definitive-failure', 'unresolved', 'ambiguous'].includes(proof.outcome)) {
     throw new Error('Invalid reconciliation proof outcome');
   }
@@ -280,6 +288,7 @@ function normalizeProviderProof(proof, expectedBinding) {
   const candidates = normalizeProviderCandidates(proof.candidates ?? []);
   const canonical = { version: 'cim-provider-reconciliation-evidence-v1',
     type: evidence.type, id: evidence.id, provider: 'resend', outcome: proof.outcome,
+    ...(providerProfile ? { providerProfile } : {}),
     observedAt: evidence.observedAt, binding: expectedBinding, candidates };
   return { ...canonical, digest: sha256(stableCanonicalJson(canonical)) };
 }
@@ -292,19 +301,42 @@ function canonicalProviderAddresses(value) {
 // Resend's sent-email list is a read-only reconciliation authority. The helper
 // deliberately performs one bounded read and matches every envelope field the
 // list endpoint exposes; absence is never treated as rejection.
-export function createCimResendReconciliationLookup({ listSentEmails, clock = () => new Date() } = {}) {
-  if (typeof listSentEmails !== 'function') {
+export function createCimResendReconciliationLookup({ listSentEmails, clock = () => new Date(),
+  configOverride, fetcher } = {}) {
+  let reader = listSentEmails;
+  const authority = configOverride ? getCimProviderReconciliationConfig(configOverride) : null;
+  if (typeof reader !== 'function' && configOverride) {
+    reader = async ({ limit }) => {
+      if (!authority.apiKey || authority.provider !== 'resend') {
+        throw new Error('CIM reconciliation profile is not configured');
+      }
+      const url = `https://api.resend.com/emails?limit=${limit}`;
+      const options = { method: 'GET', headers: { Authorization: `Bearer ${authority.apiKey}`,
+        Accept: 'application/json' } };
+      const response = typeof fetcher === 'function'
+        ? await fetcher(url, options)
+        : await fetchWithTimeout(url, { ...options,
+          timeoutMs: configOverride.server?.outboundRequestTimeoutMs || 10_000,
+          timeoutMessage: 'Resend reconciliation read timed out.' });
+      if (!response.ok) throw new Error(`Resend reconciliation read failed with ${response.status}`);
+      return response.json();
+    };
+  }
+  if (typeof reader !== 'function') {
     throw new Error('A read-only Resend sent-email reader is required');
   }
-  return async ({ transmission, binding } = {}) => {
-    const expected = immutableTransmissionBinding(transmission);
+  return async ({ transmission, binding, providerProfile = '' } = {}) => {
+    if (authority?.providerProfile && providerProfile !== authority.providerProfile) {
+      throw new Error('Reconciliation request does not match the configured provider profile');
+    }
+    const expected = immutableTransmissionBinding(transmission, providerProfile);
     if (stableCanonicalJson(binding) !== stableCanonicalJson(expected)) {
       throw new Error('Resend lookup does not match the immutable transmission');
     }
     const observedAt = new Date(clock()).toISOString();
     const seamAt = Date.parse(transmission.provider_seam_entered_at ?? '');
     if (!Number.isFinite(seamAt)) throw new Error('Durable provider seam time is required');
-    const response = await listSentEmails({ limit: 100 });
+    const response = await reader({ limit: 100 });
     const rows = Array.isArray(response?.data) ? response.data : [];
     if (rows.length > 100) throw new Error('Resend reconciliation read exceeded its bound');
     const matches = rows.filter((row) => {
@@ -326,7 +358,8 @@ export function createCimResendReconciliationLookup({ listSentEmails, clock = ()
       providerMessageId: row.id, evidenceId: `resend-email:${row.id}` }));
     return { type: 'provider-read',
       id: `resend-list:${sha256(stableCanonicalJson({ observedAt, candidates }))}`,
-      provider: 'resend', outcome: new Set(candidates.map((item) => item.providerMessageId)).size > 1
+      provider: 'resend', ...(providerProfile ? { providerProfile } : {}),
+      outcome: new Set(candidates.map((item) => item.providerMessageId)).size > 1
         ? 'ambiguous' : candidates.length === 1 ? 'accepted' : 'unresolved',
       observedAt, binding: expected, candidates };
   };
@@ -361,6 +394,7 @@ export async function reconcileCimProviderTransmission({
   storage,
   transmission,
   readProviderEvidence = async () => null,
+  providerProfile = '',
   actor,
   now = new Date(),
 } = {}) {
@@ -372,10 +406,11 @@ export async function reconcileCimProviderTransmission({
     || typeof storage?.reconcileCimTransmission !== 'function') {
     throw new Error('Exact durable CIM transmission context is required for reconciliation');
   }
-  const binding = immutableTransmissionBinding(transmission);
+  const binding = immutableTransmissionBinding(transmission, providerProfile);
   const exactEvidence = normalizeProviderProof(await readProviderEvidence({
     transmission: Object.freeze({ ...transmission }), binding: Object.freeze({ ...binding }),
-  }), binding);
+    providerProfile,
+  }), binding, providerProfile);
   if (!exactEvidence) {
     return { resolved: false, reconciliationOnly: true, providerCalls: 0,
       outcome: transmission.state, durableResult: null };

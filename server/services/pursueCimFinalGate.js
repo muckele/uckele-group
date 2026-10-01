@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 
+import { getConfig, validateCimProviderProfileBinding } from '../config.js';
 import { sha256, stableCanonicalJson } from '../utils/security.js';
 import { evaluateAcquisitionMaterialsState } from './acquisitionMaterials.js';
 import { readCimCurrentAuthority as readCurrentCimAuthority } from './cimCampaignSafety.js';
@@ -230,6 +231,7 @@ export async function authorizePreparedCimTransmission({
   loadMemberAuthority = loadBrokerMaterialsAuthority,
   readCurrentAuthority = readCurrentCimAuthority,
   readProviderReadiness = defaultProviderReadiness,
+  configOverride,
 } = {}) {
   if (!storage?.readCimFinalGateContext || !storage?.authorizeCimProviderPending) {
     throw new Error('CIM final-gate storage authority is unavailable');
@@ -241,6 +243,20 @@ export async function authorizePreparedCimTransmission({
   if (!context?.transmission || !Array.isArray(context.members) || context.members.length < 1) {
     return failure('lifecycle_conflict');
   }
+  const config = configOverride || getConfig();
+  if (context.authorization?.provider_profile !== providerProfile
+    || context.activation?.provider_profile !== providerProfile) {
+    return failure('profile_mismatch');
+  }
+  const profileBinding = validateCimProviderProfileBinding(config, {
+    providerProfile,
+    fromAddress: context.communication?.from_address,
+    toAddresses: context.communication?.to_addresses,
+    ccAddresses: context.communication?.cc_addresses,
+    bccAddresses: context.communication?.bcc_addresses,
+    replyToAddress: context.communication?.reply_to_address,
+  });
+  if (!profileBinding.ok) return failure(profileBinding.blockers[0] || 'profile_mismatch');
   const unknownTransmissionPolicy = context.transmission.payload_version !== INITIAL_PAYLOAD_VERSION
     || context.conversation?.sender_policy_version !== CIM_CAMPAIGN_POLICY_VERSION
     || context.conversation?.reply_policy_version !== CIM_CAMPAIGN_POLICY_VERSION
