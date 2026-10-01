@@ -39,6 +39,8 @@ const p7aMigrationPath = path.join(root,
   'supabase/migrations/20261007120000_pursue_cim_conversation_first_inbound.sql');
 const p7bMigrationPath = path.join(root,
   'supabase/migrations/20261008120000_pursue_cim_terminal_writer_convergence.sql');
+const p9MigrationPath = path.join(root,
+  'supabase/migrations/20261009120000_pursue_cim_shadow_operations.sql');
 const expectedTables = [
   'deal_hunter_broker_conversations',
   'deal_hunter_cim_audit_events',
@@ -65,6 +67,7 @@ const expectedP1cFunctions = [
   'pursue_cim_append_terminal_event_v1',
   'pursue_cim_append_timezone_revision_v1',
   'pursue_cim_apply_accepted_cadence_v1',
+  'pursue_cim_apply_automatic_containment_v1',
   'pursue_cim_assert_types_v1',
   'pursue_cim_authorize_provider_pending_p5_v1',
   'pursue_cim_authorize_provider_pending_v1',
@@ -91,9 +94,11 @@ const expectedP1cFunctions = [
   'pursue_cim_read_cadence_context_v1',
   'pursue_cim_read_final_gate_context_v1',
   'pursue_cim_read_import_outreach_counters_v1',
+  'pursue_cim_read_operations_snapshot_v1',
   'pursue_cim_read_projection_v1',
   'pursue_cim_reconcile_transmission_v1',
   'pursue_cim_reconcile_with_cadence_v1',
+  'pursue_cim_record_boundary_rejection_v1',
   'pursue_cim_record_capability_activation_v1',
   'pursue_cim_record_owner_decision_v1',
   'pursue_cim_refresh_inbound_binding_v1',
@@ -269,6 +274,84 @@ test('P7B PostgreSQL terminal convergence is additive, mirrored, and uses the co
   assert.match(migration, /pursue_cim_reconcile_with_cadence_p7a/);
   assert.match(migration, /pursue_cim_material_filename_kind_p7b/);
   assert.match(migration, /update of status, last_uploaded_at, requested_documents/);
+});
+
+test('P9 PostgreSQL operations and containment RPCs are additive, mirrored, and service-role-only', async () => {
+  const migration = fs.readFileSync(p9MigrationPath, 'utf8').trim();
+  const schema = fs.readFileSync(path.join(root, 'supabase/schema.sql'), 'utf8');
+  assert.ok(schema.includes(migration), 'canonical schema must contain the exact additive P9 block');
+  for (const name of ['pursue_cim_read_operations_snapshot_v1',
+    'pursue_cim_record_boundary_rejection_v1',
+    'pursue_cim_apply_automatic_containment_v1']) {
+    const start = migration.indexOf(`create or replace function public.${name}`);
+    assert.ok(start >= 0, name);
+    const body = migration.slice(start, migration.indexOf('\n$$;', start) + 4);
+    assert.match(body, /security definer/i, `${name}: security definer`);
+    assert.match(body, /set search_path = ''/i, `${name}: empty search path`);
+    assert.match(migration, new RegExp(`revoke all on function public\\.${name}\\(`, 'i'));
+    assert.match(migration, new RegExp(`grant execute on function public\\.${name}\\([^;]* to service_role`, 'i'));
+    assert.doesNotMatch(migration, new RegExp(`grant execute on function public\\.${name}\\([^;]* to (anon|authenticated)`, 'i'));
+  }
+  const containment = migration.slice(migration.indexOf(
+    'create or replace function public.pursue_cim_apply_automatic_containment_v1'));
+  const containmentLockOrder = [
+    'perform 1 from public.deal_hunter_cim_transmissions t',
+    'perform 1 from public.deal_hunter_cim_live_provider_authorizations',
+    'perform 1 from public.deal_hunter_cim_capability_activations',
+    "deal_hunter_cim_safety_settings where id='global' for update",
+    'lock table public.deal_hunter_cim_audit_events',
+  ].map((fragment) => containment.indexOf(fragment));
+  assert.ok(containmentLockOrder.every((position) => position >= 0));
+  assert.deepEqual([...containmentLockOrder].sort((left, right) => left - right),
+    containmentLockOrder,
+  'containment must match seam authorization/activation/safety order before audit');
+  assert.match(containment, /lock table public\.deal_hunter_cim_audit_events[\s\S]*v_replay := exists/i);
+  assert.match(migration, /reason_code='capability_inactive'/);
+  assert.match(migration, /reason_code='provider_readiness_unavailable'/);
+  assert.match(migration, /e\.created_at <= provider_pending\.occurred_at/);
+  assert.match(migration, /e\.reason_code in \('reply_received','materials_received'/);
+
+  const calls = [];
+  const storage = createSupabaseStorage({ storage: {} }, { client: {
+    async rpc(name, payload) {
+      calls.push({ name, payload });
+      if (name === 'pursue_cim_read_operations_snapshot_v1') return { data: {
+        counts: { ownerDecisions: 0, enrollments: 0, campaigns: 0, touches: 0,
+          transmissions: 0, memberships: 0, crmOutbound: 0, outbox: 0,
+          providerAuthorizations: 0, providerPending: 0, providerSeamEntries: 0 },
+        stateCounts: {}, reasonCounts: {}, providerPending: { count: 0, oldestAt: '', oldestAgeSeconds: 0 },
+        activations: {}, legacy: {}, boundary: {}, invariants: {},
+        pause: { paused: true, source: 'operations-control' }, shadowCandidates: [],
+      }, error: null };
+      if (name === 'pursue_cim_apply_automatic_containment_v1') return { data: {
+        applied: true, replay: false, paused: true,
+        withdrawnActivations: 1, withdrawnAuthorizations: 1,
+      }, error: null };
+      if (name === 'pursue_cim_record_boundary_rejection_v1') return { data: {
+        applied: true, replay: false,
+      }, error: null };
+      throw new Error(name);
+    },
+  } });
+  const snapshot = await storage.readPursueCimOperationsSnapshot({
+    now: '2026-10-01T17:00:00.000Z', limit: 100 });
+  assert.equal(snapshot.pause.paused, true);
+  const contained = await storage.applyPursueCimAutomaticContainment({
+    findingId: '7'.repeat(64), evidenceDigest: '8'.repeat(64),
+    findingCodes: ['shadow_provider_call'], actor: 'p9-shadow-containment',
+    now: '2026-10-01T17:01:00.000Z' });
+  assert.deepEqual(contained, { applied: true, replay: false, paused: true,
+    withdrawnActivations: 1, withdrawnAuthorizations: 1 });
+  assert.deepEqual(await storage.recordCimProviderBoundaryRejection({
+    transmissionId: 'transmission-1', authorizationId: 'authorization-1',
+    reasonCode: 'cim-provider-nonce-invalid', reconciliationOnly: false,
+    expectedRowVersion: 2, actor: 'fixture-owner', now: '2026-10-01T17:02:00.000Z',
+  }), { applied: true, replay: false });
+  assert.deepEqual(calls.map((call) => call.name), [
+    'pursue_cim_read_operations_snapshot_v1',
+    'pursue_cim_apply_automatic_containment_v1',
+    'pursue_cim_record_boundary_rejection_v1',
+  ]);
 });
 
 test('P1C fresh-schema RPC block exactly matches the upgrade migration', () => {
@@ -529,6 +612,7 @@ test('P1A PostgreSQL fresh and upgrade schemas enforce the inert catalog and sec
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6dMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7aMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7bMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p9MigrationPath, 'utf8'));
   assert.deepEqual(JSON.parse(psql(container, 'pursue_cim_upgrade', `select coalesce(jsonb_agg(
     jsonb_build_object('revision',revision,'submission_id',submission_id)
     order by revision), '[]'::jsonb) from public.deal_hunter_crm_ownership_revisions
@@ -814,6 +898,7 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p6dMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7aMigrationPath, 'utf8'));
   psql(container, 'pursue_cim_upgrade', fs.readFileSync(p7bMigrationPath, 'utf8'));
+  psql(container, 'pursue_cim_upgrade', fs.readFileSync(p9MigrationPath, 'utf8'));
 
   const now = '2026-09-25T19:00:00.000Z';
   const parityRecipient = { email: 'broker2@example.test',
@@ -1386,7 +1471,10 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
           'pursue_cim_withdraw_live_authorization_v1',
           'pursue_cim_append_terminal_event_v1',
           'pursue_cim_consume_safety_events_v1',
-          'pursue_cim_read_import_outreach_counters_v1'].includes(name), name);
+          'pursue_cim_read_import_outreach_counters_v1',
+          'pursue_cim_read_operations_snapshot_v1',
+          'pursue_cim_record_boundary_rejection_v1',
+          'pursue_cim_apply_automatic_containment_v1'].includes(name), name);
         if (name === 'pursue_cim_read_import_outreach_counters_v1') {
           return { data: JSON.parse(psql(container, database, `set role service_role;
             select public.pursue_cim_read_import_outreach_counters_v1();`)), error: null };
@@ -1394,6 +1482,11 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
         if (name === 'pursue_cim_list_due_initial_touches_v1') {
           return { data: JSON.parse(psql(container, database, `set role service_role;
             select public.pursue_cim_list_due_initial_touches_v1(
+              '${payload.p_now}'::timestamptz, ${payload.p_limit});`)), error: null };
+        }
+        if (name === 'pursue_cim_read_operations_snapshot_v1') {
+          return { data: JSON.parse(psql(container, database, `set role service_role;
+            select public.pursue_cim_read_operations_snapshot_v1(
               '${payload.p_now}'::timestamptz, ${payload.p_limit});`)), error: null };
         }
         const argument = JSON.stringify(
@@ -1413,6 +1506,12 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     assert.equal(outreach.providerSeamEntries, Number(psql(container, database,
       `select count(*) from public.deal_hunter_cim_transmissions
         where provider_seam_entered_at is not null;`)));
+    const operationsSnapshot = await supabase.readPursueCimOperationsSnapshot({ now, limit: 100 });
+    assert.equal(operationsSnapshot.counts.campaigns, outreach.campaigns, database);
+    assert.equal(operationsSnapshot.pause.paused, psql(container, database,
+      `select coalesce((select outreach_paused from public.deal_hunter_cim_safety_settings
+        where id='global'), true);`) === 't', database);
+    assert.ok(operationsSnapshot.shadowCandidates.length <= 100, database);
     const rejectAuditTransition = (eventType, name, command) => {
       psql(container, database, `
         create function public.p1c_reject_transition_audit() returns trigger
@@ -3151,5 +3250,106 @@ test('P1C enrollment RPC matches SQLite legal, stale, and illegal transition out
     }
     assert.equal(Number(psql(container, database, `select count(*) from public.deal_hunter_cim_audit_events
       where event_type in ('capability-activation', 'capability-withdrawn');`)), 4);
+    const boundaryRejectionCommand = { transmissionId: 'trans-safety',
+      authorizationId: 'authorization-safety', reasonCode: 'cim-provider-nonce-invalid',
+      reconciliationOnly: false, expectedRowVersion: 2, actor: 'fixture-owner', now };
+    assert.deepEqual(await supabase.recordCimProviderBoundaryRejection(boundaryRejectionCommand),
+      { applied: true, replay: false }, database);
+    assert.deepEqual(await supabase.recordCimProviderBoundaryRejection(boundaryRejectionCommand),
+      { applied: false, replay: true }, database);
+    const p9Operations = await supabase.readPursueCimOperationsSnapshot({ now, limit: 100 });
+    assert.equal(p9Operations.boundary.rejects >= 1, true, database);
+    assert.equal(p9Operations.boundary.byWriterPath['rejected:safety-writer'] >= 1,
+      true, database);
+    const beforeFailedContainment = JSON.parse(psql(container, database, `select jsonb_build_object(
+      'paused', (select outreach_paused from public.deal_hunter_cim_safety_settings where id='global'),
+      'activations', (select count(*) from public.deal_hunter_cim_capability_activations where status='current'),
+      'authorizations', (select count(*) from public.deal_hunter_cim_live_provider_authorizations
+        where consumed_at is null and withdrawn_at is null));`));
+    psql(container, database, `
+      create function public.p9_reject_containment_audit() returns trigger
+      language plpgsql set search_path = '' as $$
+      begin
+        if new.event_type = 'automatic-containment' then
+          raise exception 'synthetic P9 containment audit failure';
+        end if;
+        return new;
+      end;
+      $$;
+      create trigger p9_reject_containment_audit
+        before insert on public.deal_hunter_cim_audit_events
+        for each row execute function public.p9_reject_containment_audit();
+    `);
+    const failedContainment = rejectedSql(container, database, `set role service_role;
+      select public.pursue_cim_apply_automatic_containment_v1(
+        '{"findingId":"${'9'.repeat(64)}","evidenceDigest":"${'a'.repeat(64)}",
+          "findingCodes":["shadow_provider_call"],"actor":"p9-parity",
+          "now":"2026-09-25T19:01:00.000Z"}'::jsonb);`);
+    assert.notEqual(failedContainment.status, 0, database);
+    assert.match(failedContainment.stderr, /synthetic P9 containment audit failure/);
+    assert.deepEqual(JSON.parse(psql(container, database, `select jsonb_build_object(
+      'paused', (select outreach_paused from public.deal_hunter_cim_safety_settings where id='global'),
+      'activations', (select count(*) from public.deal_hunter_cim_capability_activations where status='current'),
+      'authorizations', (select count(*) from public.deal_hunter_cim_live_provider_authorizations
+        where consumed_at is null and withdrawn_at is null));`)), beforeFailedContainment, database);
+    psql(container, database, `drop trigger p9_reject_containment_audit
+      on public.deal_hunter_cim_audit_events;
+      drop function public.p9_reject_containment_audit();`);
+    const lockProbeId = `p9-lock-order-${database}`;
+    const seamLockHolder = psqlIndependent(container, database, `begin;
+      set local lock_timeout='3s';
+      select t.id from public.deal_hunter_cim_transmissions t
+        where exists (select 1 from public.deal_hunter_cim_live_provider_authorizations a
+          where a.transmission_id=t.id and a.consumed_at is null and a.withdrawn_at is null)
+        order by t.id for update;
+      select id from public.deal_hunter_cim_live_provider_authorizations
+        where consumed_at is null and withdrawn_at is null order by id for share;
+      select id from public.deal_hunter_cim_capability_activations
+        where status='current' order by id for share;
+      select pg_sleep(0.5);
+      select outreach_paused from public.deal_hunter_cim_safety_settings
+        where id='global' for share;
+      insert into public.deal_hunter_cim_audit_events
+        (id,event_type,actor,source,occurred_at,metadata)
+      values ('${lockProbeId}','p9-lock-order-probe','fixture','test','${now}','{}'::jsonb);
+      commit;`);
+    let seamLocksHeld = false;
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      seamLocksHeld = psql(container, database, `select exists(select 1
+        from pg_stat_activity where datname='${database}' and pid<>pg_backend_pid()
+          and wait_event='PgSleep');`) === 't';
+      if (seamLocksHeld) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.equal(seamLocksHeld, true, `${database}: seam lock probe did not reach sleep`);
+    const concurrentContainmentCommand = JSON.stringify({ findingId: '6'.repeat(64),
+      evidenceDigest: '5'.repeat(64), findingCodes: ['missing_live_envelope'],
+      actor: 'p9-lock-order', now: '2026-09-25T19:00:30.000Z' }).replaceAll("'", "''");
+    const concurrentContainment = psqlIndependent(container, database, `
+      set lock_timeout='3s'; set role service_role;
+      select public.pursue_cim_apply_automatic_containment_v1(
+        '${concurrentContainmentCommand}'::jsonb);`);
+    const [, concurrentContainmentResult] = await Promise.all([
+      seamLockHolder, concurrentContainment,
+    ]);
+    assert.equal(JSON.parse(concurrentContainmentResult).paused, true,
+      `${database}: containment must complete without an activation/safety/audit deadlock`);
+    const containmentCommand = { findingId: '7'.repeat(64), evidenceDigest: '8'.repeat(64),
+      findingCodes: ['shadow_provider_call'], actor: 'p9-parity',
+      now: '2026-09-25T19:01:00.000Z' };
+    const containment = await supabase.applyPursueCimAutomaticContainment(containmentCommand);
+    const containmentReplay = await supabase.applyPursueCimAutomaticContainment(containmentCommand);
+    assert.equal(containment.applied, true, database);
+    assert.equal(containment.paused, true, database);
+    assert.deepEqual(containmentReplay, { applied: false, replay: true, paused: true,
+      withdrawnActivations: 0, withdrawnAuthorizations: 0 }, database);
+    psql(container, database, `update public.deal_hunter_cim_safety_settings
+      set outreach_paused=false where id='global';`);
+    const containmentReasserted = await supabase.applyPursueCimAutomaticContainment(
+      containmentCommand);
+    assert.deepEqual(containmentReasserted, { applied: false, replay: true, paused: true,
+      withdrawnActivations: 0, withdrawnAuthorizations: 0 }, database);
+    assert.equal(psql(container, database, `select outreach_paused
+      from public.deal_hunter_cim_safety_settings where id='global';`), 't', database);
   }
 });

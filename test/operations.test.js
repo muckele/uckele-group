@@ -25,6 +25,8 @@ function completeOperationsChecks(sourceHealth = {
     async cimAutomation() { return { configuredStage: 1, effectiveStage: 1, paused: true, metrics: {}, policy: {} }; },
     async communications() { return { pending: 0, failed: 0, unassigned: 0 }; },
     async cimIdentity() { return { pause: { paused: true, source: 'configuration' }, storageHealthy: true }; },
+    async pursueCim() { return { counts: {}, alerts: [], containmentRequired: false,
+      providerPending: { count: 0, oldestAgeSeconds: 0 }, pause: { paused: true } }; },
   };
 }
 
@@ -579,4 +581,42 @@ test('operations reports marker mismatch without exposing marker content', async
   assert.equal(serialized.includes(markerSentinel), false);
   assert.equal(Object.hasOwn(operations.scheduler.runs[0], 'metadata'), false);
   assert.equal(Object.hasOwn(operations.dailyDigest, 'marker'), false);
+});
+
+test('P9 Operations exposes only bounded Pursue CIM accounting and isolates read failures', async () => {
+  const privateSentinel = 'broker-private@example.test';
+  const healthy = await getOperationsCenter({
+    now: operationsNow,
+    config: operationsConfig(),
+    storage: operationsStorage(),
+    checks: {
+      ...completeOperationsChecks(),
+      async pursueCim() {
+        return { counts: { campaigns: 2, transmissions: 1 },
+          stateCounts: { campaigns: { 'initial-pending': 2 } },
+          reasonCounts: { gateBlocks: { central_outreach_pause: 1 } },
+          providerPending: { count: 0, oldestAt: '', oldestAgeSeconds: 0 },
+          activations: { current: 2, expired: 0, nearestExpiryAt: '2026-10-02T17:00:00.000Z' },
+          legacy: { total: 0, active: 0, ambiguous: 0, writerInvocations: 0, classifications: {} },
+          boundary: { accepts: 0, rejects: 1, byWriterPath: { 'pursue-cim-initial': 1 } },
+          alerts: [{ code: 'shadow_provider_call', count: 1, severity: 'high',
+            evidenceDigest: '7'.repeat(64) }], containmentRequired: true,
+          pause: { paused: true },
+          privateSentinel };
+      },
+    },
+  });
+  assert.equal(healthy.pursueCim.counts.campaigns, 2);
+  assert.equal(healthy.pursueCim.containmentRequired, true);
+  assert.deepEqual(healthy.pursueCim.alerts, [{ code: 'shadow_provider_call',
+    count: 1, severity: 'high', evidenceDigest: '7'.repeat(64) }]);
+  assert.equal(JSON.stringify(healthy.pursueCim).includes(privateSentinel), false);
+
+  const failedChecks = completeOperationsChecks();
+  failedChecks.pursueCim = async () => { throw new Error(privateSentinel); };
+  const failed = await getOperationsCenter({ now: operationsNow,
+    config: operationsConfig(), storage: operationsStorage(), checks: failedChecks });
+  assert.equal(failed.pursueCim.error,
+    'Pursue CIM operations status is temporarily unavailable.');
+  assert.equal(JSON.stringify(failed).includes(privateSentinel), false);
 });

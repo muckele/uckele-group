@@ -10,6 +10,7 @@ import { getCommunicationOperationsStatus } from './communications.js';
 import { getCimIdentityOperationsStatus } from './cimOpportunityIdentity.js';
 import { readDailyDealHunterMarker } from './dailyDealHunterReconciliation.js';
 import { projectDailyDealHunterJobStatus, shouldRunDailyDealHunterEmail } from './dealHunterScheduler.js';
+import { getPursueCimOperations, projectPursueCimOperations } from './pursueCimOperations.js';
 
 function safeError(error) {
   return error?.message || 'Status check failed.';
@@ -410,6 +411,12 @@ export function sanitizeViewerOperations(operations = {}) {
     },
     cimAutomation: sanitizeViewerCimAutomation(operations.cimAutomation),
     cimIdentity: sanitizeViewerCimIdentity(operations.cimIdentity),
+    pursueCim: operations.pursueCim ? {
+      ...projectPursueCimOperations(operations.pursueCim, {
+        now: operations.pursueCim.projectedAt || new Date(0).toISOString(),
+      }),
+      error: operations.pursueCim.error || '',
+    } : operations.pursueCim,
     viewerAggregateOnly: true,
   };
 }
@@ -429,6 +436,7 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
   const cimAutomationCheck = checks.cimAutomation || getCimAutomationStatus;
   const communicationOperationsCheck = checks.communications || getCommunicationOperationsStatus;
   const cimIdentityCheck = checks.cimIdentity || getCimIdentityOperationsStatus;
+  const pursueCimCheck = checks.pursueCim || getPursueCimOperations;
   const tasks = [
     () => storage.listScheduledJobs?.({ limit: 50 }) || [],
     () => storage.listAdminAuditEvents?.({ limit: 100 }) || [],
@@ -442,6 +450,7 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
     () => cimAutomationCheck({ storage, config }),
     () => communicationOperationsCheck({ storage }),
     () => cimIdentityCheck({ storage, config }),
+    () => pursueCimCheck({ storage, now: now.toISOString() }),
   ];
   const results = await Promise.allSettled(tasks.map((task) => Promise.resolve().then(task)));
   const scheduledPanel = settledPanel(results[0], [], 'Scheduler history is temporarily unavailable.');
@@ -498,6 +507,14 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
     lastAudit: null,
     lastRepair: null,
   }, 'CIM identity and outreach safety status is temporarily unavailable.');
+  const pursueCimPanel = settledPanel(results[12], {
+    projectedAt: now.toISOString(), counts: {}, stateCounts: {}, reasonCounts: {},
+    providerPending: { count: 0, oldestAt: '', oldestAgeSeconds: 0 },
+    activations: { current: 0, expired: 0, nearestExpiryAt: '', modes: {} },
+    legacy: { total: 0, active: 0, ambiguous: 0, writerInvocations: 0, classifications: {} },
+    boundary: { accepts: 0, rejects: 0, byWriterPath: {} },
+    pause: { paused: true, source: 'status-unavailable' }, alerts: [], containmentRequired: true,
+  }, 'Pursue CIM operations status is temporarily unavailable.');
 
   const scheduledJobs = Array.isArray(scheduledPanel.value) ? scheduledPanel.value : [];
   const sanitizedScheduledJobs = scheduledJobs.map(sanitizeScheduledJob);
@@ -545,5 +562,8 @@ export async function getOperationsCenter({ storage = getStorage(), config = get
     cimAutomation: { ...cimAutomationPanel.value, error: cimAutomationPanel.error },
     communications: { ...communicationCounts, error: communicationsPanel.error },
     cimIdentity: { ...cimIdentityPanel.value, error: cimIdentityPanel.error },
+    pursueCim: { ...projectPursueCimOperations(pursueCimPanel.value, {
+      now: pursueCimPanel.value.projectedAt || now.toISOString(),
+    }), error: pursueCimPanel.error },
   };
 }

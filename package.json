@@ -22,6 +22,8 @@
     "crm:integrity:audit": "node scripts/audit-deal-hunter-crm-integrity.js",
     "crm:duplicate-consolidation": "node scripts/repair-crm-duplicate-consolidation.js",
     "cim:stage2:audit": "node scripts/audit-cim-stage2.js",
+    "cim:autopilot:evidence": "node scripts/audit-pursue-cim-autopilot.js",
+    "cim:autopilot:contain": "node scripts/contain-pursue-cim-autopilot.js",
     "eval:follow-ups": "node scripts/run-follow-up-eval.js",
     "eval:follow-ups:live": "node scripts/run-follow-up-eval.js --live",
     "check": "npm run eval:follow-ups && npm run lint && npm test && npm run test:ui && npm run build",

@@ -13,9 +13,17 @@ import {
   getPursueCimReleaseReport,
   stopPursueCimCampaign,
 } from '../server/services/pursueCimRelease.js';
+import {
+  buildPursueCimReleaseEvidence,
+  containPursueCimFindings,
+  getPursueCimOperations,
+  runPursueCimAutomaticContainment,
+  runPursueCimShadow,
+} from '../server/services/pursueCimOperations.js';
 import { resolveDealHunterOpportunity } from '../server/services/cimOpportunityIdentity.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { sha256 } from '../server/utils/security.js';
+import { createPursueCimReleaseEvidenceReport } from '../scripts/audit-pursue-cim-autopilot.js';
 import {
   augustLaterUrlListing,
   augustMateriallyDistinctLookalike,
@@ -820,4 +828,157 @@ test('P8A explicit stop is revision-bound, idempotent, and returns the durable s
     getPauseStatus: async () => ({ paused: true, source: 'operations-control' }) });
   assert.deepEqual({ ok: stale.ok, status: stale.status, code: stale.code },
     { ok: false, status: 409, code: 'stale_campaign' });
+});
+
+test('P9 shadow is a bounded read-only projection with provider work structurally unavailable', async () => {
+  let reads = 0;
+  const privateSentinels = ['broker@example.test', 'Private subject', 'Private body'];
+  const storage = {
+    async readPursueCimOperationsSnapshot({ now, limit }) {
+      reads += 1;
+      assert.equal(now, '2026-10-01T17:00:00.000Z');
+      assert.equal(limit, 100);
+      return {
+        counts: { ownerDecisions: 3, enrollments: 2, campaigns: 1, touches: 1,
+          transmissions: 1, memberships: 1, crmOutbound: 1, outbox: 1,
+          providerAuthorizations: 0, providerPending: 0, providerSeamEntries: 0 },
+        stateCounts: { enrollments: { queued: 1 }, campaigns: { 'initial-pending': 1 },
+          touches: { scheduled: 1 }, transmissions: { prepared: 1 } },
+        reasonCounts: { enrollments: { timezone_missing: 1 }, campaigns: {},
+          touches: {}, gateBlocks: { central_outreach_pause: 1 } },
+        providerPending: { count: 0, oldestAt: '', oldestAgeSeconds: 0 },
+        activations: { current: 2, expired: 0, nearestExpiryAt: '2026-10-02T17:00:00.000Z' },
+        legacy: { total: 1, active: 0, ambiguous: 0, writerInvocations: 0,
+          classifications: { terminal: 1 } },
+        boundary: { accepts: 0, rejects: 2, byWriterPath: { 'pursue-cim-initial': 2 } },
+        invariants: { duplicateProviderIdentities: 0, missingDurableAuthority: 0,
+          multipleActiveCampaigns: 0, duplicateAcceptedTouches: 0,
+          activeIdentityAmbiguities: 0, unexpectedLegacyInvocations: 0,
+          replyOrMaterialsBeforeGateProviderCalls: 0, invalidClaimedTimezones: 0,
+          expiredActivationAttempts: 0, missingEnvelopeAttempts: 0,
+          readinessLoss: 0, shadowProviderCalls: 0 },
+        pause: { paused: true, source: 'operations-control' },
+        shadowCandidates: [
+          { kind: 'would-enroll', subjectId: 'private-opportunity-1', eligible: true, reason: 'ready' },
+          { kind: 'would-claim', subjectId: 'private-touch-1', eligible: false, reason: 'central_outreach_pause' },
+          { kind: 'would-send', subjectId: 'private-transmission-1', eligible: false, reason: 'central_outreach_pause' },
+        ],
+        privateSentinels,
+      };
+    },
+  };
+  const operations = await getPursueCimOperations({ storage,
+    now: '2026-10-01T17:00:00.000Z' });
+  const shadow = await runPursueCimShadow({ storage,
+    now: '2026-10-01T17:00:00.000Z' });
+
+  assert.equal(reads, 2);
+  assert.equal(shadow.providerCalls, 0);
+  assert.deepEqual(shadow.counts, { wouldEnroll: 1, wouldClaim: 0, wouldSend: 0, blocked: 2 });
+  assert.deepEqual(shadow.blockedReasons, { central_outreach_pause: 2 });
+  assert.equal(shadow.decisions.length, 3);
+  assert.ok(shadow.decisions.every((decision) => /^[0-9a-f]{64}$/.test(decision.decisionDigest)));
+  assert.ok(shadow.decisions.every((decision) => !Object.hasOwn(decision, 'subjectId')));
+  assert.equal(operations.alerts.length, 0);
+  assert.equal(operations.containmentRequired, false);
+  const serialized = JSON.stringify({ operations, shadow });
+  for (const sentinel of [...privateSentinels, 'private-opportunity-1',
+    'private-touch-1', 'private-transmission-1']) assert.equal(serialized.includes(sentinel), false);
+});
+
+test('P9 high-severity findings invoke one deterministic idempotent containment command', async () => {
+  const commands = [];
+  const storage = {
+    async applyPursueCimAutomaticContainment(command) {
+      commands.push(command);
+      return { applied: commands.length === 1, replay: commands.length > 1,
+        paused: true, withdrawnActivations: 2, withdrawnAuthorizations: 1 };
+    },
+  };
+  const findings = [
+    { code: 'duplicate_provider_identity', count: 1, severity: 'high',
+      evidenceDigest: 'a'.repeat(64) },
+    { code: 'missing_live_envelope', count: 2, severity: 'high',
+      evidenceDigest: 'b'.repeat(64) },
+  ];
+  const first = await containPursueCimFindings({ storage, findings,
+    actor: 'p9-shadow-containment', now: '2026-10-01T17:05:00.000Z' });
+  const replay = await containPursueCimFindings({ storage, findings,
+    actor: 'p9-shadow-containment', now: '2026-10-01T17:05:00.000Z' });
+  assert.equal(first.applied, true);
+  assert.equal(replay.replay, true);
+  assert.equal(commands.length, 2);
+  assert.deepEqual(commands[0], commands[1]);
+  assert.ok(/^[0-9a-f]{64}$/.test(commands[0].findingId));
+  assert.ok(/^[0-9a-f]{64}$/.test(commands[0].evidenceDigest));
+  assert.deepEqual(commands[0].findingCodes,
+    ['duplicate_provider_identity', 'missing_live_envelope']);
+});
+
+test('P9 containment runner derives findings from durable operations without operator proof', async () => {
+  let reads = 0;
+  const commands = [];
+  const storage = {
+    async readPursueCimOperationsSnapshot() {
+      reads += 1;
+      return { counts: {}, stateCounts: {}, reasonCounts: {}, providerPending: {},
+        activations: {}, legacy: {}, boundary: {}, pause: { paused: false },
+        invariants: { missingEnvelopeAttempts: 1 }, shadowCandidates: [] };
+    },
+    async applyPursueCimAutomaticContainment(command) {
+      commands.push(command);
+      return { applied: true, replay: false, paused: true,
+        withdrawnActivations: 1, withdrawnAuthorizations: 0 };
+    },
+  };
+  const result = await runPursueCimAutomaticContainment({ storage,
+    actor: 'p9-automatic-containment', now: '2026-10-01T17:05:00.000Z' });
+  assert.equal(reads, 1);
+  assert.equal(commands.length, 1);
+  assert.deepEqual(commands[0].findingCodes, ['missing_live_envelope']);
+  assert.equal(result.containment.applied, true);
+});
+
+test('P9 release evidence is bound to commit/tree and excludes addresses and copy', () => {
+  const report = buildPursueCimReleaseEvidence({
+    candidate: { commit: '1'.repeat(40), tree: '2'.repeat(40), clean: true },
+    policy: { version: 'deal-hunter-cim-autopilot-v1', hash: '3'.repeat(64) },
+    config: { hash: '4'.repeat(64), providerEnabled: false, centralPaused: true },
+    scenarios: { attempted: 65, passed: 65, failed: 0, digest: '5'.repeat(64) },
+    operations: { alerts: [], counts: { transmissions: 1 } },
+    shadow: { providerCalls: 0, counts: { wouldEnroll: 1, wouldClaim: 0, wouldSend: 0, blocked: 2 },
+      decisions: [{ decisionDigest: '6'.repeat(64), action: 'would-enroll', eligible: true, reason: 'ready' }] },
+    generatedAt: '2026-10-01T17:10:00.000Z',
+  });
+  assert.equal(report.candidate.commit, '1'.repeat(40));
+  assert.equal(report.candidate.tree, '2'.repeat(40));
+  assert.equal(report.providerCalls, 0);
+  assert.ok(/^[0-9a-f]{64}$/.test(report.evidenceDigest));
+  const serialized = JSON.stringify(report);
+  assert.equal(serialized.includes('@'), false);
+  assert.equal(serialized.includes('subject'), false);
+  assert.equal(serialized.includes('body'), false);
+});
+
+test('P9 release-evidence command composes only read-only operations and shadow projections', async () => {
+  let reads = 0;
+  const storage = { async readPursueCimOperationsSnapshot() {
+    reads += 1;
+    return { counts: {}, stateCounts: {}, reasonCounts: {}, providerPending: {},
+      activations: { current: 2, expired: 0, modes: { active: 2 } }, legacy: {},
+      boundary: {}, invariants: {}, pause: { paused: true, source: 'operations-control' },
+      shadowCandidates: [] };
+  } };
+  const report = await createPursueCimReleaseEvidenceReport({ storage,
+    config: { delivery: { provider: 'console', resendApiKey: 'private-secret' },
+      dealHunter: { cimOutreach: { paused: true }, cimAutomation: { paused: true } } },
+    candidate: { commit: '1'.repeat(40), tree: '2'.repeat(40), clean: true },
+    scenarios: { attempted: 65, passed: 65, failed: 0, digest: '5'.repeat(64) },
+    now: '2026-10-01T17:10:00.000Z' });
+  assert.equal(reads, 2);
+  assert.equal(report.providerCalls, 0);
+  assert.equal(report.config.providerEnabled, false);
+  assert.equal(report.config.centralPaused, true);
+  assert.equal(report.operations.activations.current, 2);
+  assert.equal(JSON.stringify(report).includes('private-secret'), false);
 });
