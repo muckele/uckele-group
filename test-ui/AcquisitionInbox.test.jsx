@@ -229,6 +229,40 @@ function queueRow(overrides = {}) {
   };
 }
 
+function cimReleaseResponse(overrides = {}) {
+  return {
+    projectedAt: '2026-10-01T15:05:00.000Z',
+    opportunity: { id: 'opp-1', name: 'Evergreen Fire Protection', state: 'active' },
+    status: { code: 'awaiting_live_authorization', reason: '', actionRequired: true },
+    enrollment: { state: 'campaign-created', reasonCode: '' },
+    campaign: { id: 'campaign-p8a', generation: 1, state: 'initial-pending', reasonCode: '',
+      rowVersion: 4, terminalRevision: 0, policyVersion: 'deal-hunter-cim-autopilot-v1',
+      templateVersion: 'template-v1', localExpiryAt: '2026-10-22T17:00:00.000Z' },
+    recipientAuthority: { address: 'broker@example.test', authorityId: 'recipient-authority',
+      fingerprint: '2'.repeat(64), permissionVersion: 'activation-p8a',
+      permissionDigest: '3'.repeat(64), permissionRevision: 7, permissionScope: 'cohort-p8a' },
+    timezoneAuthority: { state: 'verified', ianaTimezone: 'America/Los_Angeles', revision: 3,
+      selectedRevision: 3, current: true },
+    initialTouch: { id: 'touch-p8a', state: 'prepared', dueAt: '2026-10-01T16:00:00.000Z',
+      dueLocal: '2026-10-01T09:00:00-07:00', rowVersion: 2 },
+    transmission: { id: 'transmission-p8a', state: 'prepared',
+      releaseState: 'awaiting-live-authorization', rowVersion: 2, preparationGeneration: 1,
+      payloadVersion: 'payload-v1', payloadDigest: '4'.repeat(64), memberDigest: '5'.repeat(64),
+      addressing: { from: 'buyer@example.test', to: ['broker@example.test'], cc: [], bcc: [],
+        replyTo: 'reply@example.test' },
+      copy: { subject: 'Persisted CIM subject', text: 'Exact persisted body.',
+        html: '<p>Exact persisted body.</p>' },
+      membership: [{ opportunityId: 'opp-1', campaignId: 'campaign-p8a', touchId: 'touch-p8a' }],
+      providerOutcome: null },
+    activation: { id: 'activation-p8a', capability: 'fl04b-enrollment', mode: 'canary',
+      status: 'current', expiresAt: '2026-10-02T15:00:00.000Z', matchesCampaign: true },
+    pause: { paused: true, source: 'operations-control' },
+    actions: { canStop: true, campaignId: 'campaign-p8a', expectedRowVersion: 4,
+      expectedTerminalRevision: 0 },
+    ...overrides,
+  };
+}
+
 function expectOwnerCommand(action, fields = {}) {
   return expect.objectContaining({ action, idempotencyKey: expect.stringMatching(/^[0-9a-f-]{36}$/),
     expectedDiscoveryRevision: 0, expectedMaterialRevision: 0, ...fields });
@@ -920,6 +954,74 @@ describe('Acquisition Inbox queue', () => {
         expectedMaterialRevision: 0, idempotencyKey: expect.stringMatching(/^[0-9a-f-]{36}$/) }));
     }
     expect(writes.some(({ url }) => /send|cim|backfill|refresh|import/.test(url))).toBe(false);
+  });
+
+  test('loads the separate canary release report and stops only through its revision-bound route', async () => {
+    const writes = [];
+    const detail = { ...detailResponse(), pursueCimReleaseAvailable: true };
+    const active = cimReleaseResponse();
+    const stopped = cimReleaseResponse({
+      status: { code: 'campaign_stopped', reason: 'campaign_stopped', actionRequired: false },
+      campaign: { ...active.campaign, state: 'stopped', reasonCode: 'campaign_stopped',
+        rowVersion: 5, terminalRevision: 1 },
+      initialTouch: { ...active.initialTouch, state: 'cancelled-before-provider' },
+      actions: { canStop: false },
+    });
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1/cim-release/stop')) {
+        writes.push({ url, method: options.method, body: JSON.parse(options.body) });
+        return jsonResponse({ success: true, ok: true, report: stopped });
+      }
+      if (url.endsWith('/triage/opp-1/cim-release')) return jsonResponse(active);
+      if (url.endsWith('/triage/opp-1')) return jsonResponse(detail);
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1 }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    const card = await screen.findByRole('region', { name: 'Pursue CIM canary' });
+    expect(within(card).getByText('Persisted CIM subject')).toBeVisible();
+    fireEvent.click(within(card).getByRole('button', { name: 'Stop CIM campaign' }));
+    await waitFor(() => expect(within(card).getByText('Campaign Stopped')).toBeVisible());
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toEqual({
+      url: '/api/admin/deal-hunter/triage/opp-1/cim-release/stop',
+      method: 'POST',
+      body: expect.objectContaining({ campaignId: 'campaign-p8a', expectedRowVersion: 4,
+        expectedTerminalRevision: 0, idempotencyKey: expect.stringMatching(/^[0-9a-f-]{36}$/) }),
+    });
+    expect(within(card).queryByRole('button', { name: 'Stop CIM campaign' })).not.toBeInTheDocument();
+    expect(writes.some(({ url }) => /send|retry|authorize|resume/.test(url))).toBe(false);
+  });
+
+  test('keeps the durable canary stop available when queue source actions are blocked', async () => {
+    const writes = [];
+    const detail = { ...detailResponse(), pursueCimReleaseAvailable: true };
+    vi.stubGlobal('fetch', vi.fn(async (input, options = {}) => {
+      const url = String(input);
+      if (url.endsWith('/triage/opp-1/cim-release/stop')) {
+        writes.push(JSON.parse(options.body));
+        const active = cimReleaseResponse();
+        return jsonResponse({ success: true, ok: true, report: cimReleaseResponse({
+          status: { code: 'campaign_stopped', reason: 'campaign_stopped', actionRequired: false },
+          campaign: { ...active.campaign, state: 'stopped', reasonCode: 'campaign_stopped' },
+          actions: { canStop: false },
+        }) });
+      }
+      if (url.endsWith('/triage/opp-1/cim-release')) return jsonResponse(cimReleaseResponse());
+      if (url.endsWith('/triage/opp-1')) return jsonResponse(detail);
+      return jsonResponse(queueResponse({ rows: [queueRow()], total: 1,
+        dailyDigest: digestProjection({ status: 'action-required', actionsAllowed: false,
+          sourceAuthority: { requiredHealthy: false, blockingIssues: [{ sourceId: 'sheet' }],
+            optionalWarnings: [] } }) }));
+    }));
+
+    renderInbox();
+    fireEvent.click(await screen.findByRole('button', { name: 'Open Evergreen Fire Protection' }));
+    const card = await screen.findByRole('region', { name: 'Pursue CIM canary' });
+    fireEvent.click(within(card).getByRole('button', { name: 'Stop CIM campaign' }));
+    await waitFor(() => expect(writes).toHaveLength(1));
   });
 
   test('offers ambiguous Pursue recipients and retries with a new immutable choice', async () => {

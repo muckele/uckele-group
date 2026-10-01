@@ -9,6 +9,10 @@ import { loadBrokerMaterialsAuthority } from '../server/services/dealHunterBroke
 import { orchestratePursuitEnrollment, pursuitPermissionBasisDigest,
   pursuitPermissionCohortDigest } from '../server/services/pursueCimEnrollment.js';
 import { runDueCimInitialPreparations } from '../server/services/pursueCimInitialPreparation.js';
+import {
+  getPursueCimReleaseReport,
+  stopPursueCimCampaign,
+} from '../server/services/pursueCimRelease.js';
 import { resolveDealHunterOpportunity } from '../server/services/cimOpportunityIdentity.js';
 import { createSqliteStorage } from '../server/storage/sqlite.js';
 import { sha256 } from '../server/utils/security.js';
@@ -583,4 +587,237 @@ test('P0 scenario 4: materially distinct August lookalike remains a separate can
   assert.equal(lookalike.ok, true);
   assert.notEqual(lookalike.opportunityId, original.opportunityId);
   assert.equal((await storage.listCurrentDealHunterOpportunities({ limit: 100 })).length, 2);
+});
+
+test('P8A release report exposes exact persisted canary copy and authority without provider secrets', async () => {
+  const opportunityId = 'opp-p8a-release';
+  const campaign = {
+    id: 'campaign-p8a', opportunity_id: opportunityId, generation: 1,
+    state: 'initial-pending', reason_code: 'awaiting_live_authorization',
+    policy_version: 'deal-hunter-cim-autopilot-v1', template_version: 'template-v1',
+    permission_version: 'activation-p8a', permission_digest: '1'.repeat(64),
+    permission_revision: 7, permission_scope: 'cohort-p8a',
+    recipient_authority_id: 'recipient-authority-p8a', recipient_fingerprint: '2'.repeat(64),
+    timezone_revision: 3, terminal_revision: 0, row_version: 4,
+    local_expiry_at: '2026-10-22T17:00:00.000Z', created_at: '2026-10-01T15:00:00.000Z',
+  };
+  const transmission = {
+    id: 'transmission-p8a', communication_id: 'communication-p8a',
+    state: 'prepared', release_state: 'awaiting-live-authorization', row_version: 2,
+    member_digest: '3'.repeat(64), payload_digest: '4'.repeat(64),
+    payload_version: 'payload-v1', preparation_generation: 1,
+    from_address: 'buyer@example.test', to_addresses: ['broker@example.test'],
+    cc_addresses: [], bcc_addresses: [], reply_to_address: 'reply@example.test',
+    subject: 'Persisted CIM subject', provider_idempotency_key: 'never-expose-provider-key',
+    boundary_nonce_digest: '5'.repeat(64), provider_message_id: 'never-expose-provider-id',
+    created_at: '2026-10-01T15:01:00.000Z', updated_at: '2026-10-01T15:01:00.000Z',
+  };
+  const storage = {
+    async readPursueCimProjection() {
+      return {
+        decision: { id: 'decision-p8a', action: 'pursue', created_at: '2026-10-01T14:59:00.000Z',
+          selected_contact_reference_digest: '6'.repeat(64) },
+        enrollment: { id: 'enrollment-p8a', state: 'campaign-created', reason_code: null,
+          created_at: '2026-10-01T15:00:00.000Z' },
+        campaign,
+        initialTouch: { id: 'touch-p8a', state: 'prepared', due_at: '2026-10-01T16:00:00.000Z',
+          due_local: '2026-10-01T09:00:00-07:00', row_version: 2 },
+        transmission,
+        legacySummary: { count: 0, accepted: 0, ambiguous: 0 }, actions: [],
+      };
+    },
+    async getCurrentDealHunterOpportunity() {
+      return { opportunity_id: opportunityId, canonical_name: 'P8A Durable Opportunity', status: 'active' };
+    },
+    async readPursuitEnrollmentAuthority() {
+      return {
+        timezone: { revision: 3, state: 'verified', iana_timezone: 'America/Los_Angeles',
+          evidence_digest: 'never-expose-timezone-evidence' },
+        activation: { id: 'activation-p8a', capability: 'fl04b-enrollment', mode: 'canary',
+          status: 'current', expires_at: '2026-10-02T15:00:00.000Z',
+          prerequisite_evidence_hash: 'never-expose-activation-evidence' },
+        globalAuthorityRevision: 9,
+      };
+    },
+    async getCrmCommunication() {
+      return {
+        id: 'communication-p8a', from_address: 'buyer@example.test',
+        to_addresses: ['broker@example.test'], cc_addresses: [], bcc_addresses: [],
+        reply_to_address: 'reply@example.test', subject: 'Persisted CIM subject',
+        body_text: 'Exact persisted body.', body_html_sanitized: '<p>Exact persisted body.</p>',
+        metadata: { signedContactRef: 'never-expose-signed-reference', providerPayload: { secret: true } },
+      };
+    },
+    async getPursueCimLiveProviderAuthorization() {
+      return { id: 'live-authorization-p8a', transmission_id: 'transmission-p8a',
+        capability: 'fl04b-initial', writer_path: 'pursue-cim-autopilot-initial',
+        payload_digest: '4'.repeat(64), recipient_authority_digest: '2'.repeat(64),
+        issued_at: '2026-10-01T15:02:00.000Z', expires_at: '2026-10-01T15:17:00.000Z',
+        consumed_at: null, withdrawn_at: null, boundary_nonce_digest: 'never-expose-auth-nonce' };
+    },
+    async readCimCadenceContext() {
+      return { transmission, nextTouch: null, members: [{ membership: {
+        transmission_id: 'transmission-p8a', touch_id: 'touch-p8a',
+        opportunity_id: opportunityId, campaign_id: 'campaign-p8a', display_ordinal: 0,
+        cancelled_at: null, cancellation_reason: null,
+      } }] };
+    },
+  };
+  const report = await getPursueCimReleaseReport({ storage, opportunityId,
+    now: '2026-10-01T15:05:00.000Z',
+    getPauseStatus: async () => ({ paused: true, source: 'operations-control',
+      updatedAt: '2026-10-01T15:04:00.000Z' }) });
+  assert.deepEqual(report.transmission.copy, { subject: 'Persisted CIM subject',
+    text: 'Exact persisted body.', html: '<p>Exact persisted body.</p>' });
+  assert.deepEqual(report.transmission.addressing, { from: 'buyer@example.test',
+    to: ['broker@example.test'], cc: [], bcc: [], replyTo: 'reply@example.test' });
+  assert.deepEqual(report.transmission.membership, [{ opportunityId,
+    campaignId: 'campaign-p8a', touchId: 'touch-p8a', displayOrdinal: 0,
+    cancelledAt: '', cancellationReason: '' }]);
+  assert.equal(report.status.code, 'awaiting_live_authorization');
+  assert.equal(report.recipientAuthority.address, 'broker@example.test');
+  assert.equal(report.timezoneAuthority.ianaTimezone, 'America/Los_Angeles');
+  assert.equal(report.actions.canStop, true);
+  assert.deepEqual(report.liveAuthorization, {
+    id: 'live-authorization-p8a', capability: 'fl04b-initial',
+    writerPath: 'pursue-cim-autopilot-initial', status: 'current',
+    issuedAt: '2026-10-01T15:02:00.000Z', expiresAt: '2026-10-01T15:17:00.000Z',
+    consumedAt: '', withdrawnAt: '',
+  });
+  const serialized = JSON.stringify(report);
+  for (const secret of ['never-expose-provider-key', 'never-expose-provider-id',
+    'never-expose-signed-reference', 'never-expose-timezone-evidence',
+    'never-expose-activation-evidence', 'never-expose-auth-nonce',
+    'boundaryNonceDigest', 'providerPayload']) {
+    assert.equal(serialized.includes(secret), false, secret);
+  }
+  const readCadenceContext = storage.readCimCadenceContext;
+  storage.readCimCadenceContext = async () => ({ transmission, nextTouch: null, members: [] });
+  await assert.rejects(() => getPursueCimReleaseReport({ storage, opportunityId,
+    now: '2026-10-01T15:05:00.000Z',
+    getPauseStatus: async () => ({ paused: true, source: 'operations-control' }) }),
+  /membership binding mismatch/);
+  storage.readCimCadenceContext = async () => ({ transmission, nextTouch: null, members: [{
+    membership: { transmission_id: 'different-transmission', touch_id: 'touch-p8a',
+      opportunity_id: opportunityId, campaign_id: 'campaign-p8a', display_ordinal: 0 },
+  }] });
+  await assert.rejects(() => getPursueCimReleaseReport({ storage, opportunityId,
+    now: '2026-10-01T15:05:00.000Z',
+    getPauseStatus: async () => ({ paused: true, source: 'operations-control' }) }),
+  /membership binding mismatch/);
+  storage.readCimCadenceContext = readCadenceContext;
+  transmission.state = 'accepted';
+  transmission.release_state = 'authorized';
+  transmission.provider_result_code = 'accepted';
+  const accepted = await getPursueCimReleaseReport({ storage, opportunityId,
+    now: '2026-10-01T15:06:00.000Z',
+    getPauseStatus: async () => ({ paused: true, source: 'operations-control' }) });
+  assert.deepEqual(accepted.status,
+    { code: 'provider_accepted', reason: 'accepted', actionRequired: false });
+});
+
+test('P8A queued release reads its selected recipient from the persisted campaign conversation', async () => {
+  const opportunityId = 'opp-p8a-queued';
+  const storage = {
+    async readPursueCimProjection() {
+      return {
+        decision: { action: 'pursue' },
+        enrollment: { state: 'campaign-created' },
+        campaign: { id: 'campaign-p8a-queued', opportunity_id: opportunityId, generation: 1,
+          conversation_id: 'conversation-p8a-queued', state: 'initial-pending', row_version: 1,
+          terminal_revision: 0, recipient_authority_id: 'recipient-p8a-queued',
+          recipient_fingerprint: '7'.repeat(64), permission_version: 'activation-p8a',
+          permission_digest: '8'.repeat(64), permission_revision: 2,
+          permission_scope: 'cohort-p8a' },
+        initialTouch: { id: 'touch-p8a-queued', state: 'scheduled', row_version: 1 },
+        transmission: null, legacySummary: { count: 0, accepted: 0, ambiguous: 0 }, actions: [],
+      };
+    },
+    async getCurrentDealHunterOpportunity() {
+      return { opportunity_id: opportunityId, canonical_name: 'Queued P8A', status: 'active' };
+    },
+    async readPursuitEnrollmentAuthority() {
+      return { timezone: null, activation: null, globalAuthorityRevision: 1 };
+    },
+    async getPursueCimBrokerConversation() {
+      return { id: 'conversation-p8a-queued', recipient_authority_id: 'recipient-p8a-queued',
+        recipient_fingerprint: '7'.repeat(64), recipient_address: 'queued-broker@example.test' };
+    },
+  };
+  const report = await getPursueCimReleaseReport({ storage, opportunityId,
+    now: '2026-10-01T15:05:00.000Z',
+    getPauseStatus: async () => ({ paused: true, source: 'operations-control' }) });
+  assert.equal(report.recipientAuthority.address, 'queued-broker@example.test');
+  assert.equal(report.transmission, null);
+});
+
+test('P8A explicit stop is revision-bound, idempotent, and returns the durable stopped report', async () => {
+  let stopped = false;
+  let appended;
+  let appliedCommand;
+  let appliedEventId = '';
+  const campaign = () => ({ id: 'campaign-stop-p8a', opportunity_id: 'opp-stop-p8a',
+    state: stopped ? 'stopped' : 'initial-pending', reason_code: stopped ? 'campaign_stopped' : null,
+    row_version: stopped ? 6 : 5, terminal_revision: stopped ? 3 : 2, generation: 1 });
+  const storage = {
+    async readPursueCimProjection() {
+      return { decision: { action: 'pursue' }, enrollment: { state: 'campaign-created' },
+        campaign: campaign(), initialTouch: { id: 'touch-stop-p8a', state: 'scheduled', row_version: 1 },
+        transmission: null, legacySummary: { count: 0, accepted: 0, ambiguous: 0 }, actions: [] };
+    },
+    async getCurrentDealHunterOpportunity() {
+      return { opportunity_id: 'opp-stop-p8a', canonical_name: 'Stop Fixture', status: 'active' };
+    },
+    async readPursuitEnrollmentAuthority() {
+      return { timezone: null, activation: null, globalAuthorityRevision: 1 };
+    },
+    async appendCimTerminalEvent(command) {
+      appended = command;
+      if (stopped) return command.eventId === appliedEventId
+        && command.metadataDigest === appliedCommand.metadataDigest
+        ? { applied: false, replay: true, conflict: false, cancelledTouchIds: ['touch-stop-p8a'] }
+        : { applied: false, replay: false, conflict: true, cancelledTouchIds: [] };
+      appliedEventId = command.eventId;
+      appliedCommand = command;
+      stopped = true;
+      return { applied: true, replay: false, conflict: false,
+        campaignRevision: 3, conversationRevision: null, cancelledTouchIds: ['touch-stop-p8a'] };
+    },
+  };
+  const result = await stopPursueCimCampaign({ storage, opportunityId: 'opp-stop-p8a',
+    campaignId: 'campaign-stop-p8a', expectedRowVersion: 5, expectedTerminalRevision: 2,
+    idempotencyKey: '252f9f52-8a03-4a7a-9c7b-51722474a4f0', reason: 'Owner stopped canary.',
+    actor: 'release-owner', now: '2026-10-01T15:10:00.000Z',
+    getPauseStatus: async () => ({ paused: true, source: 'operations-control' }) });
+  assert.equal(result.ok, true);
+  assert.equal(result.report.campaign.state, 'stopped');
+  assert.equal(result.report.actions.canStop, false);
+  assert.deepEqual({ scope: appended.scope, scopeId: appended.scopeId,
+    expectedRevision: appended.expectedRevision, expectedRowVersion: appended.expectedRowVersion,
+    nextState: appended.nextState, reasonCode: appended.reasonCode,
+    evidenceType: appended.evidenceType, actor: appended.actor },
+  { scope: 'campaign', scopeId: 'campaign-stop-p8a', expectedRevision: 2,
+    expectedRowVersion: 5, nextState: 'stopped', reasonCode: 'campaign_stopped',
+    evidenceType: 'operator-stop', actor: 'release-owner' });
+  const replay = await stopPursueCimCampaign({ storage, opportunityId: 'opp-stop-p8a',
+    campaignId: 'campaign-stop-p8a', expectedRowVersion: 5, expectedTerminalRevision: 2,
+    idempotencyKey: '252f9f52-8a03-4a7a-9c7b-51722474a4f0', reason: 'Owner stopped canary.',
+    actor: 'release-owner', now: '2026-10-01T15:10:00.000Z',
+    getPauseStatus: async () => ({ paused: true, source: 'operations-control' }) });
+  assert.equal(replay.ok, true);
+  assert.equal(replay.replay, true);
+  const rebound = await stopPursueCimCampaign({ storage, opportunityId: 'opp-stop-p8a',
+    campaignId: 'campaign-stop-p8a', expectedRowVersion: 6, expectedTerminalRevision: 3,
+    idempotencyKey: '252f9f52-8a03-4a7a-9c7b-51722474a4f0', reason: 'Owner stopped canary.',
+    actor: 'different-owner', now: '2026-10-01T15:11:00.000Z',
+    getPauseStatus: async () => ({ paused: true, source: 'operations-control' }) });
+  assert.deepEqual({ ok: rebound.ok, status: rebound.status, code: rebound.code },
+    { ok: false, status: 409, code: 'stale_campaign' });
+  const stale = await stopPursueCimCampaign({ storage, opportunityId: 'opp-stop-p8a',
+    campaignId: 'campaign-stop-p8a', expectedRowVersion: 6, expectedTerminalRevision: 3,
+    idempotencyKey: 'b781a49a-06a1-48a5-9ed0-9522af343c3b', reason: 'Different command.',
+    actor: 'release-owner', now: '2026-10-01T15:11:00.000Z',
+    getPauseStatus: async () => ({ paused: true, source: 'operations-control' }) });
+  assert.deepEqual({ ok: stale.ok, status: stale.status, code: stale.code },
+    { ok: false, status: 409, code: 'stale_campaign' });
 });

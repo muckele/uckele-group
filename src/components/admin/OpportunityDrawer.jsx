@@ -29,6 +29,11 @@ function formatDate(value) {
   return new Intl.DateTimeFormat('en-US', { dateStyle: 'medium' }).format(new Date(value));
 }
 
+function formatExactInstant(value) {
+  if (!value || !Number.isFinite(Date.parse(value))) return '';
+  return new Date(value).toISOString();
+}
+
 function safeListingUrl(value) {
   if (typeof value !== 'string' || [...value].some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)) return '';
   try {
@@ -134,13 +139,63 @@ function CommunicationList({ communications, title }) {
   return <div className="mt-4"><h4 className="text-sm font-semibold text-ink">{title}</h4><ul className="mt-2 space-y-2">{communications.map((item) => <li className="rounded-lg border border-line/70 bg-white p-3 text-sm text-ink/68" key={`${title}-${item.id}`}>{formatLabel(item.direction)} · {formatLabel(item.channel)} · {formatLabel(item.kind)}{item.occurredAt ? ` · ${formatDate(item.occurredAt)}` : ''}</li>)}</ul></div>;
 }
 
+function shortDigest(value) {
+  return typeof value === 'string' && value ? value.slice(0, 12) : 'Unavailable';
+}
+
+function CimReleaseCard({ error = '', loading = false, onStop, pending = false,
+  readOnly = false, release }) {
+  if (!release && !loading && !error) return null;
+  const transmission = release?.transmission;
+  const addressing = transmission?.addressing;
+  const transmissionDisplayState = transmission?.state && transmission.state !== 'prepared'
+    ? transmission.state : transmission?.releaseState || transmission?.state;
+  return (
+    <section aria-label="Pursue CIM canary" className="rounded-xl border border-sky-200 bg-sky-50/70 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div><h4 className="text-sm font-semibold text-sky-950">Pursue CIM canary</h4><p className="mt-1 text-xs leading-5 text-sky-900">Read-only release evidence from the persisted campaign and transmission. No preview is recomputed here.</p></div>
+        {release?.status?.code ? <span className="rounded-full bg-white px-2 py-1 text-xs font-semibold text-sky-900">{formatLabel(release.status.code)}</span> : null}
+      </div>
+      {loading ? <p className="mt-3 text-sm text-sky-900" role="status">Loading durable canary state…</p> : null}
+      {error ? <p className="mt-3 rounded-lg border border-red-200 bg-white p-3 text-sm text-red-800" role="alert">{error}</p> : null}
+      {release ? <>
+        <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+          <div><dt className="font-semibold text-sky-950">Campaign</dt><dd className="break-all text-sky-900">{release.campaign?.id || 'Not allocated'}{release.campaign ? ` · generation ${release.campaign.generation}` : ''}</dd></div>
+          <div><dt className="font-semibold text-sky-950">Campaign state</dt><dd className="text-sky-900">{formatLabel(release.campaign?.state || release.enrollment?.state || release.status?.code)}{release.status?.reason ? ` · ${formatLabel(release.status.reason)}` : ''}</dd></div>
+          <div><dt className="font-semibold text-sky-950">Timezone authority</dt><dd className="text-sky-900">{release.timezoneAuthority?.ianaTimezone || formatLabel(release.timezoneAuthority?.state || 'unavailable')}{release.timezoneAuthority?.revision !== null && release.timezoneAuthority?.revision !== undefined ? ` · revision ${release.timezoneAuthority.revision}` : ''}</dd></div>
+          <div><dt className="font-semibold text-sky-950">Outreach pause</dt><dd className="text-sky-900">{release.pause?.paused ? 'Paused' : 'Not paused'}{release.pause?.source ? ` · ${formatLabel(release.pause.source)}` : ''}</dd></div>
+          {release.activation ? <div><dt className="font-semibold text-sky-950">Permission activation</dt><dd className="break-all text-sky-900">{release.activation.id} · {formatLabel(release.activation.mode)}{release.activation.expiresAt ? ` · expires ${formatDate(release.activation.expiresAt)}` : ''}</dd></div> : null}
+          {transmission ? <div><dt className="font-semibold text-sky-950">Live authorization</dt><dd className="break-all text-sky-900">{release.liveAuthorization ? `${formatLabel(release.liveAuthorization.status)}${release.liveAuthorization.expiresAt ? ` · expires ${formatExactInstant(release.liveAuthorization.expiresAt)}` : ''}` : 'Not issued'}</dd></div> : null}
+          {release.recipientAuthority ? <div><dt className="font-semibold text-sky-950">Recipient authority</dt><dd className="break-all text-sky-900">{release.recipientAuthority.address || 'Persisted with transmission'} · revision {release.recipientAuthority.permissionRevision ?? 'unavailable'}</dd></div> : null}
+        </dl>
+        {transmission ? <div className="mt-4 rounded-xl border border-sky-200 bg-white p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2"><h5 className="text-sm font-semibold text-ink">Persisted initial transmission</h5><span className="text-xs font-semibold text-ink/60">{formatLabel(transmissionDisplayState)}</span></div>
+          <p className="mt-2 break-all text-xs text-ink/65">{addressing?.from || 'Unknown sender'} → {(addressing?.to || []).join(', ') || 'Unknown recipient'}{addressing?.replyTo ? ` · Reply-to ${addressing.replyTo}` : ''}</p>
+          {addressing?.cc?.length ? <p className="mt-1 break-all text-xs text-ink/65">CC {addressing.cc.join(', ')}</p> : null}
+          {addressing?.bcc?.length ? <p className="mt-1 break-all text-xs text-ink/65">BCC {addressing.bcc.join(', ')}</p> : null}
+          {transmission.copy ? <div className="mt-3"><p className="text-sm font-semibold text-ink">{transmission.copy.subject}</p><pre className="mt-2 whitespace-pre-wrap break-words rounded-lg bg-fog p-3 font-sans text-sm leading-6 text-ink/75">{transmission.copy.text}</pre></div> : <p className="mt-3 text-sm font-semibold text-red-800">Persisted copy is unavailable; release cannot be reviewed here.</p>}
+          {transmission.membership?.length ? <ul aria-label="Transmission membership" className="mt-3 space-y-1 text-[11px] text-ink/55">{transmission.membership.map((member) => <li className="break-all" key={`${member.opportunityId}:${member.campaignId}:${member.touchId}`}>{member.opportunityId} · {member.campaignId} · {member.touchId}{member.cancelledAt ? ` · cancelled ${formatDate(member.cancelledAt)}` : ''}</li>)}</ul> : null}
+          <p className="mt-3 break-all text-[11px] text-ink/55">Transmission {transmission.id} · Payload {shortDigest(transmission.payloadDigest)} · Membership {shortDigest(transmission.memberDigest)}</p>
+          {release.campaign?.localExpiryAt ? <p className="mt-1 text-[11px] text-ink/55">Campaign expiry {formatDate(release.campaign.localExpiryAt)}</p> : <p className="mt-1 text-[11px] text-ink/55">Campaign expiry is established after initial provider acceptance.</p>}
+        </div> : null}
+        {!readOnly && release.actions?.canStop && onStop ? <button className={`${secondaryButton} mt-4 text-red-700`} disabled={pending} onClick={() => onStop({
+          campaignId: release.actions.campaignId,
+          expectedRowVersion: release.actions.expectedRowVersion,
+          expectedTerminalRevision: release.actions.expectedTerminalRevision,
+        })} type="button">Stop CIM campaign</button> : null}
+      </> : null}
+    </section>
+  );
+}
+
 function conflictKey(observation) {
   return `${observation.sourceId || observation.sourceName}-${observation.sourceRecordId || ''}-${observation.value}`;
 }
 
 export default function OpportunityDrawer({
-  actionsBlocked = false, brokerMaterialsState = {}, detail, error = '', focusGuardRef, followUpState = {}, loading = false, mutationError = '', onAction,
+  actionsBlocked = false, brokerMaterialsState = {}, cimRelease = null, cimReleaseError = '', cimReleaseLoading = false, cimReleaseReadOnly = false, cimReleaseStopping = false, detail, error = '', focusGuardRef, followUpState = {}, loading = false, mutationError = '', onAction,
   onBrokerMaterialsApprove, onBrokerMaterialsCheckStatus, onBrokerMaterialsInvalidate, onBrokerMaterialsPrepare,
+  onCimReleaseStop,
   onClose, onFollowUpApprove, onFollowUpCheckStatus, onFollowUpCloseReview, onFollowUpInvalidate,
   onFollowUpPrepare, onFollowUpStart, onFollowUpStop, onRetry, onSaveFact, pending = false, pursueChoice = null, readOnly = false,
 }) {
@@ -242,7 +297,8 @@ export default function OpportunityDrawer({
               </div> : null}
               {passOpen && actionable ? <div className="mt-4"><PassForm error="" name={name} onCancel={() => setPassOpen(false)} onSubmit={(payload) => onAction('pass', payload)} pending={pending} submitDisabled={actionsBlocked} /></div> : null}
               {linkedCrmId ? <a className={`${secondaryButton} mt-4 gap-2`} href={`/admin/crm/${encodeURIComponent(linkedCrmId)}`}><ExternalLink aria-hidden="true" className="h-4 w-4" />Open linked CRM record</a> : null}
-              <div className="mt-4"><BrokerMaterialsCard
+              <div className="mt-4"><CimReleaseCard error={cimReleaseError} loading={cimReleaseLoading} onStop={onCimReleaseStop} pending={cimReleaseStopping} readOnly={cimReleaseReadOnly} release={cimRelease} /></div>
+              {!detail.pursueCimReleaseAvailable && !cimRelease?.campaign ? <div className="mt-4"><BrokerMaterialsCard
                 brokerMaterials={detail.brokerMaterials}
                 businessName={name}
                 checking={brokerMaterialsState.checking}
@@ -269,7 +325,7 @@ export default function OpportunityDrawer({
                 sending={brokerMaterialsState.sending}
                 stale={brokerMaterialsState.stale}
                 updating={brokerMaterialsState.updating}
-              /></div>
+              /></div> : null}
               {opportunity.topStrength ? <p className="mt-4 rounded-xl bg-moss/8 p-3 text-sm leading-6 text-moss">{opportunity.topStrength}</p> : null}{opportunity.topConcern ? <p className="mt-2 rounded-xl bg-amber-50 p-3 text-sm leading-6 text-amber-900">{opportunity.topConcern}</p> : null}{detail.missingCriticalFields?.length ? <div className="mt-4"><MissingInformation fields={detail.missingCriticalFields} /></div> : null}
             </Section>
 

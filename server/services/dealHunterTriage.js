@@ -836,7 +836,8 @@ export async function getTriageOpportunityDetail({
     byDimension.set(row.dimension, rows);
   }
 
-  const [operatorFacts, sourceRows, submission, cimRequests, activities, dispositions, crmCommunications, materialEvent] = await Promise.all([
+  const [operatorFacts, sourceRows, submission, cimRequests, activities, dispositions,
+    crmCommunications, materialEvent, pursueCimDiscovery] = await Promise.all([
     storage.listDealHunterOpportunityFacts?.(id, { limit: 100 }) || [],
     storage.listDealHunterOpportunitySourceObservations?.(id, { limit: 500 }) || [],
     currentOpportunity.primary_submission_id && storage.getSubmission
@@ -853,6 +854,9 @@ export async function getTriageOpportunityDetail({
     Number(currentOpportunity.material_revision || 0) > Number(score.reviewed_material_revision || 0)
       ? storage.getLatestDealHunterMaterialChange?.({ opportunityId: id,
         materialRevision: Number(currentOpportunity.material_revision) }) || null : null,
+    // Discovery only. The dedicated release report remains the sole UI authority
+    // for persisted canary copy, addressing, status, and stop revisions.
+    storage.readPursueCimProjection?.({ opportunityId: id }) || null,
   ]);
   const sanitizedOperatorFacts = operatorFacts
     .filter((fact) => fact && typeof fact === 'object' && opportunityFactFields.includes(fact.field))
@@ -907,6 +911,8 @@ export async function getTriageOpportunityDetail({
     status: 200,
     opportunity,
     brokerMaterials,
+    pursueCimReleaseAvailable: Boolean(pursueCimDiscovery?.decision
+      || pursueCimDiscovery?.enrollment || pursueCimDiscovery?.campaign),
     effectiveFacts,
     operatorFacts: sanitizedOperatorFacts.map(projectOperatorFact),
     sourceObservations,

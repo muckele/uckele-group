@@ -53,6 +53,10 @@ import {
 import { setCurrentOperatorOpportunityFact } from './services/dealHunterOpportunityFacts.js';
 import { appendExplicitOpportunityTimezoneRevision } from './services/opportunityTimezoneRevision.js';
 import {
+  getPursueCimReleaseReport,
+  stopPursueCimCampaign,
+} from './services/pursueCimRelease.js';
+import {
   approveDealHunterBrokerMaterials,
   parseBrokerMaterialsApprovalInput,
   parseBrokerMaterialsPreparationInput,
@@ -1768,6 +1772,41 @@ export function createApp({
       }
       const { ok: _ok, status: _status, ...detail } = result;
       response.status(200).json(detail);
+    }),
+  );
+
+  app.get(
+    '/api/admin/deal-hunter/triage/:opportunityId/cim-release',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const report = await getPursueCimReleaseReport({ storage: getStorage(),
+        opportunityId: request.params.opportunityId });
+      response.status(200).json(report);
+    }),
+  );
+
+  app.post(
+    '/api/admin/deal-hunter/triage/:opportunityId/cim-release/stop',
+    asyncRoute(async (request, response) => {
+      const session = await requireAdmin(request);
+      if (!session) {
+        response.status(401).json({ success: false, error: 'Administrator access is required.' });
+        return;
+      }
+      const result = await stopPursueCimCampaign({ storage: getStorage(),
+        opportunityId: request.params.opportunityId,
+        campaignId: request.body?.campaignId,
+        expectedRowVersion: request.body?.expectedRowVersion,
+        expectedTerminalRevision: request.body?.expectedTerminalRevision,
+        idempotencyKey: request.body?.idempotencyKey,
+        reason: request.body?.reason,
+        actor: session.username || session.principal_id,
+      });
+      response.status(result.status).json({ success: result.ok, ...result });
     }),
   );
 
